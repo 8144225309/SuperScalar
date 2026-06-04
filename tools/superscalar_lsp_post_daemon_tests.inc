@@ -24,6 +24,14 @@
         /* Broadcast revoked commitments for ALL channels so every client's
          * watchtower can detect the breach independently. */
         static const unsigned char client_fills[4] = { 0x22, 0x33, 0x44, 0x55 };
+        /* Scaffold-seckey contract: the 2-of-2 re-sign below uses client_fills
+           as the CLIENT key.  Daemon-launched clients MUST start with the
+           matching --seckey (32 bytes of client_fills[ci]) or the re-signed
+           commitment is an Invalid Schnorr and won't broadcast.  We count the
+           broadcasts that land and abort loudly with the exact required key if
+           none do, instead of silently falling through to a confusing
+           "watchtower did not detect breach". */
+        size_t breach_bcast_ok = 0;
         for (size_t ci = 0; ci < mgr->n_channels; ci++) {
             channel_t *chX = &mgr->entries[ci].channel;
             uint64_t saved_num = chX->commitment_number;
@@ -128,10 +136,36 @@
             tx_buf_free(&old_signed);
 
             if (!sent) {
-                fprintf(stderr, "BREACH TEST: failed to broadcast revoked commitment for channel %zu\n", ci);
+                unsigned char want = (ci < 4) ? client_fills[ci] : 0x22;
+                char wantkey[65];
+                for (int b = 0; b < 32; b++) snprintf(wantkey + b * 2, 3, "%02x", want);
+                fprintf(stderr,
+                    "BREACH TEST: failed to broadcast revoked commitment for channel %zu.\n"
+                    "  Almost always the scaffold-seckey contract: the breach re-signs the\n"
+                    "  2-of-2 with the CLIENT key = client_fills[%zu] (0x%02x).  Launch this\n"
+                    "  client daemon with --seckey %s\n"
+                    "  or the re-signed commitment is an Invalid Schnorr and cannot broadcast.\n",
+                    ci, ci, (unsigned)want, wantkey);
                 continue;
             }
+            breach_bcast_ok++;
             printf("Revoked commitment broadcast (ch %zu): %s\n", ci, old_txid_str);
+        }
+
+        if (breach_bcast_ok == 0) {
+            fprintf(stderr,
+                "BREACH TEST ABORTED: 0/%zu revoked commitments reached chain.\n"
+                "  The watchtower has nothing on-chain to detect — this is a LAUNCHER\n"
+                "  key mismatch (scaffold-seckey contract), NOT a watchtower/protocol\n"
+                "  failure.  See the per-channel --seckey hint(s) above.\n",
+                mgr->n_channels);
+            report_add_string(&rpt, "result", "breach_test_scaffold_seckey_mismatch");
+            report_close(&rpt);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
 
         /* Confirm all revoked commitments so watchtowers can detect them */
@@ -147,9 +181,16 @@
             }
         }
 
-        if (breach_test == 2) {
-            /* --cheat-daemon: LSP does NOT run watchtower — sleep so clients can detect */
-            printf("CHEAT DAEMON: revoked commitment broadcast, sleeping for clients...\n");
+        if (breach_test == 2 || breach_test == 3) {
+            /* --cheat-daemon (2): LSP broadcasts its OWN revoked commitment (a
+               CLIENT's watchtower must catch it).  --breach-standalone (3): the
+               CLIENT's revoked commitment is broadcast (built via the else branch
+               above, channel_build_commitment_tx_for_remote — matching the LSP's
+               own wt.db kind=2 watch) but the LSP does NOT run the in-process
+               watchtower, leaving the on-chain breach for an EXTERNAL standalone
+               WT (--wt-db only) to detect + penalize.  Either way: sleep. */
+            printf("%s: revoked commitment broadcast, sleeping for external watchtower...\n",
+                   breach_test == 3 ? "BREACH-STANDALONE" : "CHEAT DAEMON");
             if (is_regtest) {
                 for (int s = 0; s < 30 && !g_shutdown; s++)
                     sleep(1);

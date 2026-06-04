@@ -64,6 +64,7 @@ TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-sub.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_LOG="$TMPDIR/wt.log"
+WT_DB="$TMPDIR/wt.db"   # trustless WT db (no secrets); armed by the LSP's --wt-db
 
 PIDS=()
 
@@ -124,6 +125,7 @@ env $SS_ASAN_ENV "$LSP_BIN" \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET \
     --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --cli-path "$(which bitcoin-cli)" \
     --demo --lsp-balance-pct 50 --cheat-daemon-sub \
     > "$LSP_LOG" 2>&1 &
@@ -183,10 +185,19 @@ STALE_TXID=$(grep -E "Stale chain\[N-1\] broadcast" "$LSP_LOG" | head -1 | awk -
 echo "  Stale chain[N-1] sub-factory txid: ${STALE_TXID:-(unknown)}"
 
 echo
-echo "--- Standalone WT (binary --db $LSP_DB) ---"
+# Stop the cheating LSP gracefully so its wt.db (WAL) is checkpointed before the
+# standalone trustless WT reads it. The stale sub-factory state is already on-chain;
+# the WT must now defend WITHOUT the LSP (exactly the trustless scenario).
+echo "--- stopping cheating LSP so wt.db is flushed for the standalone WT ---"
+kill -TERM $LSP_PID 2>/dev/null || true
+for s in $(seq 1 30); do kill -0 $LSP_PID 2>/dev/null || { echo "  LSP exited (wt.db checkpointed)"; break; }; sleep 1; done
+WT_K1=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE watch_kind=1;" 2>/dev/null || echo 0)
+echo "  wt.db sub-factory (kind=1) watches available to the standalone WT: ${WT_K1:-0}"
+
+echo "--- Standalone trustless WT (--wt-db $WT_DB, NO secrets) ---"
 "$WT_BIN" \
     --network regtest \
-    --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 5 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \
