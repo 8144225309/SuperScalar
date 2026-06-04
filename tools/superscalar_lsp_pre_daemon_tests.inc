@@ -3896,9 +3896,32 @@
                        bc_entry_txid_disp, matches);
             }
 
-            /* Step 8: Mine block to confirm breach */
-            ADVANCE(1);
-            printf("[8] Mined 1 block — breach confirmed\n");
+            /* Step 8: confirm the breach BEFORE the secondary sweep.
+               On regtest, mine.  On any TRUC-enforcing network (signet/
+               testnet4/mainnet) the V2 HTLC/PTLC penalty CANNOT spend the V3
+               breach commit until it CONFIRMS — BIP-431 permits an unconfirmed
+               V3 tx exactly one V3 child (the main to_local penalty) and no V2
+               children.  ADVANCE() is regtest-only mining (a no-op elsewhere),
+               so on real networks we must wait for an actual confirmation;
+               otherwise the secondary PTLC penalty is rejected
+               (TRUC-violation) and ptlc_penalty stays 0. */
+            if (is_regtest) {
+                ADVANCE(1);
+                printf("[8] Mined 1 block — breach confirmed\n");
+            } else {
+                printf("[8] Waiting for breach %s to confirm "
+                       "(TRUC: the V2 PTLC penalty needs a confirmed parent)...\n",
+                       bc_breach_txid);
+                int bc_conf = 0;
+                int bc_budget = (confirm_timeout_secs > 0 ? confirm_timeout_secs : 3600);
+                for (int w = 0; w < bc_budget / 10; w++) {
+                    bc_conf = regtest_get_confirmations(&rt, bc_breach_txid);
+                    if (bc_conf >= 1) break;
+                    sleep(10);
+                }
+                printf("[8] breach confirmations=%d (>=1 means TRUC now permits "
+                       "the V2 secondary penalty)\n", bc_conf);
+            }
 
             /* Step 9: Run watchtower_check */
             /* Print current chain height before check for diagnosis. */
