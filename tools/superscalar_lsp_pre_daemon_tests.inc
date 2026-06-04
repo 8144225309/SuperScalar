@@ -2604,6 +2604,58 @@
                 return 1;
             }
 
+            /* === kind=3 standalone fire (#321 EVERY-PATH) ===
+             * SS_FC_ARM_KIND3: rather than the owner broadcasting the HTLC
+             * timeout sweep, arm a kind=3 wt_db force-close watch carrying the
+             * SAME pre-signed sweep + the on-chain commit txid, then exit.  A
+             * secret-less standalone WT (--wt-db only) must then broadcast the
+             * sweep itself — proving the force-close HTLC-sweep delegation
+             * works trustlessly (the last unfired penalty-matrix cell).
+             * superscalar_lsp.c doesn't include lsp_wt.h (LSP arms wt_db via
+             * watchtower.c), so declare the one helper we need locally. */
+            if (getenv("SS_FC_ARM_KIND3")) {
+                extern int64_t lsp_wt_register_force_close_watch(
+                    persist_wt_t *pwt, uint32_t channel_id,
+                    const unsigned char commit_txid32[32], uint32_t htlc_vout,
+                    uint64_t htlc_amount, const unsigned char *htlc_spk,
+                    size_t htlc_spk_len, uint32_t csv_delay,
+                    const unsigned char *signed_sweep_tx,
+                    size_t signed_sweep_tx_len,
+                    const unsigned char sweep_txid32[32]);
+                extern void sha256_double(const unsigned char *, size_t,
+                                          unsigned char *);
+                int k3_ok = 0;
+                if (mgr->watchtower && mgr->watchtower->wt_db &&
+                    mgr->watchtower->wt_db->db) {
+                    unsigned char k3_sweep_txid[32];
+                    sha256_double(timeout_tx.data, timeout_tx.len, k3_sweep_txid);
+                    int64_t k3wid = lsp_wt_register_force_close_watch(
+                        mgr->watchtower->wt_db, 0 /*peer_idx*/, commit_txid,
+                        htlc_vout, htlc_amount, htlc_spk, htlc_spk_len,
+                        (uint32_t)ch0->to_self_delay,
+                        timeout_tx.data, timeout_tx.len, k3_sweep_txid);
+                    k3_ok = (k3wid > 0);
+                    printf("KIND3-ARM: registered force-close HTLC watch_id="
+                           "%lld; commit on-chain, sweep pre-signed; owner "
+                           "will NOT broadcast (standalone WT must)\n",
+                           (long long)k3wid);
+                    printf("\n=== HTLC FORCE-CLOSE KIND3-ARM COMPLETE ===\n");
+                    report_add_string(&rpt, "result",
+                                      "htlc_force_close_kind3_armed");
+                } else {
+                    fprintf(stderr, "KIND3-ARM: no wt_db on watchtower — "
+                            "cannot arm (need --wt-db)\n");
+                    report_add_string(&rpt, "result", "kind3_arm_no_wtdb");
+                }
+                tx_buf_free(&timeout_tx);
+                report_close(&rpt);
+                jit_channels_cleanup(mgr);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return k3_ok ? 0 : 1;
+            }
+
             char *timeout_hex = malloc(timeout_tx.len * 2 + 1);
             hex_encode(timeout_tx.data, timeout_tx.len, timeout_hex);
             char timeout_txid_str[65];
