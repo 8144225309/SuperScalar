@@ -1192,6 +1192,7 @@ extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
 extern int test_persist_open_close(void);
+extern int test_persist_migration_ladder(void);
 extern int test_persist_ps_subfactory_chain_round_trip(void);
 extern int test_persist_ps_subfactory_chain_v21_round_trip(void);
 extern int test_persist_ps_leaf_chain_v22_poison_round_trip(void);
@@ -3070,6 +3071,7 @@ static void run_unit_tests(void) {
 
     printf("\n=== Persistence (Phase 13) ===\n");
     RUN_TEST(test_persist_open_close);
+    RUN_TEST(test_persist_migration_ladder);
     RUN_TEST(test_persist_ps_subfactory_chain_round_trip);
     RUN_TEST(test_persist_ps_subfactory_chain_v21_round_trip);
     RUN_TEST(test_persist_ps_leaf_chain_v22_poison_round_trip);
