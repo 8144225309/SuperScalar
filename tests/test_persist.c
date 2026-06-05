@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -146,6 +147,110 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
         tx_buf_free(&loaded_txs[i]);
 
     persist_close(&db);
+    return ok;
+}
+
+/* ---- §10 mainnet-gate: schema migration ladder is idempotent + data-preserving ----
+   Populate a file-backed DB at the current schema, force user_version back to 1
+   (simulating an old DB), then re-open to re-run migrations 2..PERSIST_SCHEMA_VERSION
+   over the populated data.  Assert: re-open succeeds, user_version reaches the
+   current version, and the populated rows survive byte-for-byte.  Catches any
+   migration that is destructive or non-idempotent when re-applied across the
+   full ladder (the high-risk class of upgrade bugs). */
+int test_persist_migration_ladder(void) {
+    const char *path = "/tmp/ss_test_migration_ladder.db";
+    unlink(path);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open file db at current schema");
+
+    const uint32_t factory_id = 7;
+    const uint32_t node_idx = 11;
+    unsigned char txids[3][32];
+    unsigned char signed_txs[3][64];
+    size_t signed_tx_lens[3] = { 32, 48, 64 };
+    uint64_t amounts[3] = { 50000, 40000, 30000 };
+    for (int i = 0; i < 3; i++) {
+        memset(txids[i], 0xA0 + i, 32);
+        memset(signed_txs[i], 0xB0 + i, signed_tx_lens[i]);
+        TEST_ASSERT(persist_save_ps_chain_entry(
+                        &db, factory_id, node_idx, i, /* epoch */ 0,
+                        txids[i], signed_txs[i], signed_tx_lens[i],
+                        amounts[i], /* poison_tx */ NULL, 0),
+                    "populate chain entry before migration");
+    }
+    persist_close(&db);
+
+    /* Force the on-disk schema version back to 1 so the binary believes this
+       is an old DB and re-runs the entire migration ladder.  persist tracks the
+       version in a schema_version TABLE (MAX(version)), not PRAGMA user_version. */
+    {
+        sqlite3 *raw = NULL;
+        TEST_ASSERT(sqlite3_open(path, &raw) == SQLITE_OK, "raw open to downgrade");
+        TEST_ASSERT(sqlite3_exec(raw,
+                        "DELETE FROM schema_version; "
+                        "INSERT INTO schema_version (version) VALUES (1);",
+                        NULL, NULL, NULL) == SQLITE_OK,
+                    "force schema_version back to 1");
+        sqlite3_close(raw);
+    }
+
+    /* Re-open: runs migrations 2..PERSIST_SCHEMA_VERSION over populated data. */
+    TEST_ASSERT(persist_open(&db, path), "re-open re-runs migration ladder");
+
+    /* Read post-migration version + surviving rows, THEN close + unlink, THEN
+       evaluate — so cleanup always runs regardless of pass/fail. */
+    int v_after = -1;
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db.db, "SELECT MAX(version) FROM schema_version;",
+                               -1, &st, NULL) == SQLITE_OK
+            && sqlite3_step(st) == SQLITE_ROW)
+            v_after = sqlite3_column_int(st, 0);
+        if (st) sqlite3_finalize(st);
+    }
+
+    tx_buf_t loaded_txs[3] = {0};
+    unsigned char loaded_txids[3][32];
+    uint64_t loaded_amounts[3];
+    int n = persist_load_ps_chain(&db, factory_id, node_idx,
+                                  loaded_txs, loaded_txids, loaded_amounts,
+                                  NULL, 3);
+    int ok = 1;
+    /* §10 key-at-rest (#327): persist_open must tighten the DB file to 0600
+       (no group/world bits) — it holds revocation secrets + the HD seed. */
+    {
+        struct stat mst;
+        if (stat(path, &mst) != 0) {
+            printf("  FAIL: stat(db) failed\n"); ok = 0;
+        } else if (mst.st_mode & (S_IRWXG | S_IRWXO)) {
+            printf("  FAIL: db not 0600 after persist_open (mode 0%o) — secrets exposed\n",
+                   (unsigned)(mst.st_mode & 0777)); ok = 0;
+        }
+    }
+    if (v_after != PERSIST_SCHEMA_VERSION) {
+        printf("  FAIL: migration reached v%d, expected v%d\n",
+               v_after, PERSIST_SCHEMA_VERSION); ok = 0;
+    }
+    if (n != 3) { printf("  FAIL: post-migration n=%d expected 3\n", n); ok = 0; }
+    for (int i = 0; i < n && i < 3; i++) {
+        if (memcmp(loaded_txids[i], txids[i], 32) != 0) {
+            printf("  FAIL: txid[%d] lost in migration\n", i); ok = 0;
+        }
+        if (loaded_txs[i].len != signed_tx_lens[i] ||
+            memcmp(loaded_txs[i].data, signed_txs[i], signed_tx_lens[i]) != 0) {
+            printf("  FAIL: signed_tx[%d] corrupted by migration\n", i); ok = 0;
+        }
+        if (loaded_amounts[i] != amounts[i]) {
+            printf("  FAIL: amount[%d] corrupted by migration\n", i); ok = 0;
+        }
+    }
+    for (int i = 0; i < n && i < 3; i++) tx_buf_free(&loaded_txs[i]);
+
+    persist_close(&db);
+    unlink(path);
+    if (ok) printf("  PASS: migration ladder idempotent + data-preserving (1 -> %d)\n",
+                   PERSIST_SCHEMA_VERSION);
     return ok;
 }
 

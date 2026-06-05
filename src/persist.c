@@ -447,6 +447,34 @@ int persist_open(persist_t *p, const char *path) {
         return 0;
     }
 
+    /* §10 key-at-rest hardening (#327): lsp.db stores revocation_secrets + the
+       HD wallet seed in PLAINTEXT (the DB itself is not encrypted), so it must
+       never be group/world-readable.  Tighten the file to 0600 and its directory
+       to 0700 (the latter also protects the later-created -wal/-shm sidecars).
+       In-memory (":memory:") DBs have no file to protect. */
+    if (db_path && strcmp(db_path, ":memory:") != 0) {
+        struct stat kst;
+        if (stat(db_path, &kst) == 0 && (kst.st_mode & (S_IRWXG | S_IRWXO))) {
+            fprintf(stderr, "persist_open: WARNING - %s was group/world-accessible "
+                    "(mode 0%o); tightening to 0600. If this host is shared, treat "
+                    "the funding seed + revocation secrets as exposed and rotate.\n",
+                    db_path, (unsigned)(kst.st_mode & 0777));
+        }
+        if (chmod(db_path, S_IRUSR | S_IWUSR) != 0)
+            fprintf(stderr, "persist_open: WARNING - could not chmod 0600 %s\n",
+                    db_path);
+        /* Best-effort: tighten the WAL/SHM sidecars too (they can hold
+           uncommitted secret pages).  Do NOT touch the parent directory — it
+           may be shared (e.g. /tmp); the runbook mandates a 0700 data dir. */
+        {
+            char kside[1100];
+            snprintf(kside, sizeof(kside), "%s-wal", db_path);
+            (void)chmod(kside, S_IRUSR | S_IWUSR);
+            snprintf(kside, sizeof(kside), "%s-shm", db_path);
+            (void)chmod(kside, S_IRUSR | S_IWUSR);
+        }
+    }
+
     /* Enable WAL mode for better concurrent performance */
     char *pragma_err = NULL;
     rc = sqlite3_exec(p->db, "PRAGMA journal_mode=WAL;", NULL, NULL, &pragma_err);

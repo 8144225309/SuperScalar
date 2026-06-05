@@ -1634,6 +1634,10 @@ int main(int argc, char *argv[]) {
             test_partial_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)
             breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
+        else if (strcmp(argv[i], "--breach-standalone") == 0)
+            breach_test = 3;  /* 3 = client-commitment breach + NO in-process WT;
+                                 leaves the on-chain breach for an external standalone
+                                 WT (--wt-db only) to detect + penalize (isolation test) */
         else if (strcmp(argv[i], "--test-rebalance") == 0)
             test_rebalance = 1;
         else if (strcmp(argv[i], "--test-wire-leaf-advance") == 0)

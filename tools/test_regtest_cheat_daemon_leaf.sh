@@ -55,6 +55,7 @@ TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-leaf-regtest.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_LOG="$TMPDIR/wt.log"
+WT_DB="$TMPDIR/wt.db"   # trustless WT db (no secrets); armed by the LSP's --wt-db
 
 PIDS=()
 
@@ -140,8 +141,9 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET \
     --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --demo --cheat-daemon-leaf $SIDE \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 PIDS+=($LSP_PID)
@@ -222,12 +224,23 @@ fi
 STALE_TXID=$(grep -E "Stale pre-advance leaf broadcast" "$LSP_LOG" | head -1 | awk '{print $5}' | cut -d' ' -f1)
 echo "  Stale broadcast txid: ${STALE_TXID:-(unknown)}"
 
-# --- Standalone Watchtower ---
+# Trustless: stop the (sleeping) cheating LSP so its wt.db WAL checkpoints before
+# the standalone WT reads it; the stale leaf is already on-chain. Then keep mining
+# so the WT's block-driven poll fires (the LSP's own miner stops when it exits).
+echo "  Stopping cheating LSP (SIGTERM) so wt.db flushes for the standalone WT..."
+kill -TERM $LSP_PID 2>/dev/null || true
+for s in $(seq 1 30); do kill -0 $LSP_PID 2>/dev/null || { echo "  LSP exited (wt.db checkpointed)"; break; }; sleep 1; done
+K0=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE watch_kind IN (0,1);" 2>/dev/null || echo 0)
+echo "  wt.db factory/sub-factory (kind 0/1) watches: ${K0:-0}"
+( for k in $(seq 1 80); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 3; done ) &
+WTMINE_PID=$!; PIDS+=($WTMINE_PID)
+
+# --- Standalone trustless WT (--wt-db only, NO secrets) ---
 echo
-echo "--- Standalone WT (binary --db $LSP_DB) ---"
+echo "--- Standalone trustless WT (--wt-db $WT_DB, no secrets) ---"
 "$WT_BIN" \
     --network regtest \
-    --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 5 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \

@@ -54,6 +54,7 @@ TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-leaf-late-wt.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_LOG="$TMPDIR/wt.log"
+WT_DB="$TMPDIR/wt.db"   # trustless WT db (no secrets); armed by the LSP's --wt-db
 
 PIDS=()
 
@@ -101,9 +102,9 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet $MINER_WALLET --db "$LSP_DB" \
+    --wallet $MINER_WALLET --db "$LSP_DB" --wt-db "$WT_DB" \
     --demo --cheat-daemon-leaf $SIDE \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 
@@ -160,12 +161,17 @@ done
 END_HEIGHT=$($BCLI getblockcount)
 echo "  Chain at height $END_HEIGHT — cheat is buried $((END_HEIGHT - CHEAT_HEIGHT)) blocks deep"
 
-# --- Standalone Watchtower — starting LATE ---
+# Trustless: stop the LSP so wt.db WAL checkpoints; keep mining for the WT poll.
+echo "  Stopping LSP (SIGTERM) so wt.db flushes for the standalone WT..."
+kill -TERM $LSP_PID 2>/dev/null || true
+for s in $(seq 1 30); do kill -0 $LSP_PID 2>/dev/null || break; sleep 1; done
+( for k in $(seq 1 80); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 3; done ) & PIDS+=($!)
+# --- Standalone trustless Watchtower (--wt-db) — starting LATE ---
 echo
-echo "--- LATE Standalone WT startup ---"
+echo "--- LATE Standalone trustless WT startup ---"
 "$WT_BIN" \
     --network regtest \
-    --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 5 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \
