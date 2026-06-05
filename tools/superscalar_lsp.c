@@ -4480,12 +4480,22 @@ accept_new_factory:
         printf("LSP: final close outputs to wallet address %s\n", final_wallet_addr);
     }
 
+    /* Cooperative-close fee scales with the TX vsize: 1 funding input plus
+       (n_total) P2TR outputs.  A flat 500 sats falls below the mempool
+       min-relay fee once the factory is large (N=127 -> ~5.6k vbytes -> the
+       close broadcast was rejected with "min relay fee not met").  Size it
+       from the configured --fee-rate (sat/kvB) with a 500-sat floor for small
+       factories so existing small-N behaviour is unchanged. */
+    uint64_t close_est_vbytes = 100 + (uint64_t)n_total * 44;
+    uint64_t close_fee = (close_est_vbytes * fee_rate) / 1000;
+    if (close_fee < 500) close_fee = 500;
+
     if (channels_active) {
         /* Pass NULL for close_spk so client outputs use per-client P2TR
            addresses derived from their factory pubkeys. LSP output uses
            factory funding SPK (or wallet SPK if needed). */
         n_close_outputs = lsp_channels_build_close_outputs(mgr, &lsp_p->factory,
-                                                            close_outputs, 500,
+                                                            close_outputs, close_fee,
                                                             NULL, 0);
         if (n_close_outputs == 0) {
             fprintf(stderr, "LSP: build close outputs failed\n");
@@ -4498,7 +4508,7 @@ accept_new_factory:
         /* No payments — equal split (original behavior) */
         const unsigned char *close_spk = final_close_spk ? final_close_spk : fund_spk;
         size_t close_spk_len = final_close_spk ? final_close_spk_len : 34;
-        uint64_t close_total = funding_amount - 500;  /* fee */
+        uint64_t close_total = funding_amount - close_fee;  /* size-scaled fee */
         uint64_t per_party = close_total / n_total;
         for (size_t i = 0; i < n_total; i++) {
             close_outputs[i].amount_sats = per_party;

@@ -290,6 +290,26 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
+/* After client_handle_commitment_signed sends OUR revoke, the LSP replies with
+   its OWN MSG_LSP_REVOKE_AND_ACK (0x50) to complete the bidirectional revocation
+   (BOLT-2).  The scripted --send/--recv flows must consume + apply it after EVERY
+   commitment, exactly like the daemon's client_recv_lsp_revocation — otherwise the
+   stray 0x50 desyncs the next recv (sender "expected FULFILL", receiver a leftover
+   commitment at close, and the LSP's handle_fulfill_htlc times out waiting for the
+   REVOKE and returns 0 → "event loop failed").  Deterministic: the LSP sends
+   exactly one revoke per commitment, so a single blocking recv is correct. */
+static void scripted_consume_lsp_revoke(int fd, channel_t *ch) {
+    wire_msg_t m;
+    if (!wire_recv(fd, &m)) return;
+    if (m.msg_type == MSG_LSP_REVOKE_AND_ACK && m.json) {
+        uint32_t cid; unsigned char rsec[32] = {0}, rpt[33];
+        if (wire_parse_revoke_and_ack(m.json, &cid, rsec, rpt))
+            channel_receive_revocation(ch, ch->commitment_number - 1, rsec);
+        secure_zero(rsec, 32);
+    }
+    if (m.json) cJSON_Delete(m.json);
+}
+
 /* Channel callback replicating multi_payment_client_cb from test harness */
 static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                    secp256k1_context *ctx,
@@ -326,6 +346,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
             } else {
                 fprintf(stderr, "Client %u: expected COMMIT_SIGNED, got 0x%02x\n",
                         my_index, msg.msg_type);
@@ -333,7 +354,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
 
-            /* Wait for FULFILL_HTLC */
+            /* Wait for FULFILL_HTLC (the LSP's revoke was already drained above). */
             if (!wire_recv(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
@@ -363,6 +384,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -397,6 +419,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -429,6 +452,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -527,6 +551,13 @@ typedef struct {
     uint64_t settled_fees_sats;     /* total share already received */
     uint64_t routing_fee_ppm;       /* fee rate from factory terms */
     uint16_t profit_share_bps;      /* client's share from factory terms */
+    /* Scripted test payments (--send/--recv) routed through this same daemon
+       loop instead of the old parallel standalone_channel_cb, which desynced on
+       every message type it didn't hand-roll (LSP_REVOKE_AND_ACK,
+       CREATE_INVOICE, CLOSE_PROPOSE). */
+    scripted_action_t *scripted_actions;
+    size_t  n_scripted_actions;
+    int     scripted_initiated;     /* 1 after sends fired + recvs registered */
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -897,6 +928,45 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             cJSON_Delete(req);
             printf("Client %u: sent lsps2.get_info request\n", my_index);
         }
+    }
+
+    /* Scripted test-payment kickoff (--send/--recv routed through this loop).
+       Receivers register their preimage so the loop's auto-fulfill path settles
+       the incoming HTLC from the invoice store; senders emit the initial
+       ADD_HTLC and the loop reactively drives COMMITMENT_SIGNED + bidirectional
+       revocation + FULFILL.  Fired once, here, immediately after CHANNEL_READY
+       (the LSP --demo loop is already "waiting for payments" by this point —
+       same timing the old standalone_channel_cb used successfully). */
+    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated) {
+        uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
+                                ? factory->cltv_timeout - 40 : 500;
+        for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
+            scripted_action_t *act = &cbd->scripted_actions[si];
+            if (act->type == ACTION_RECV) {
+                if (cbd->n_invoices < MAX_CLIENT_INVOICES) {
+                    client_invoice_t *inv = &cbd->invoices[cbd->n_invoices++];
+                    memcpy(inv->preimage, act->preimage, 32);
+                    memcpy(inv->payment_hash, act->payment_hash, 32);
+                    inv->amount_msat = act->amount_sats * 1000;
+                    inv->active = 1;
+                    if (cbd->db)
+                        persist_save_client_invoice(cbd->db, inv->payment_hash,
+                                                    inv->preimage, inv->amount_msat);
+                    printf("Client %u: RECV armed (auto-fulfill preimage registered)\n",
+                           my_index);
+                }
+            } else { /* ACTION_SEND */
+                printf("Client %u: SEND %llu sats to client %u\n",
+                       my_index, (unsigned long long)act->amount_sats,
+                       act->dest_client);
+                if (!client_send_payment(fd, ch, act->amount_sats,
+                                          act->payment_hash, sc_htlc_cltv,
+                                          act->dest_client))
+                    fprintf(stderr, "Client %u: scripted send_payment failed\n",
+                            my_index);
+            }
+        }
+        cbd->scripted_initiated = 1;
     }
 
     while (!g_shutdown) {
@@ -3331,8 +3401,7 @@ int main(int argc, char *argv[]) {
             }
         }
     } else if (n_actions > 0 || expect_channels) {
-        multi_payment_data_t data = { actions, n_actions, 0 };
-        /* Standalone mode also gets funding verification if RPC available */
+        /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
         client_verify_funding_fn sa_vfn = NULL;
         void *sa_vctx = NULL;
@@ -3348,8 +3417,36 @@ int main(int argc, char *argv[]) {
             sa_vfn = verify_funding_noop_regtest;
             sa_vctx = NULL;
         }
-        ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data,
-                                      sa_vfn, sa_vctx);
+
+        if (n_actions > 0) {
+            /* Scripted --send/--recv now run through the SAME proven daemon
+               message loop as production (daemon_channel_cb), driven by
+               cbd.scripted_actions.  The loop auto-fulfills received HTLCs from
+               the invoice store, settles sent HTLCs with full bidirectional
+               revocation, answers the demo's external-invoice step
+               (CREATE_INVOICE), and runs the cooperative close — exiting cleanly
+               (return 2) on CLOSE_PROPOSE.  This replaces standalone_channel_cb,
+               a parallel re-implementation that desynced on every message type
+               it didn't hand-roll (LSP_REVOKE_AND_ACK / CREATE_INVOICE /
+               CLOSE_PROPOSE). */
+            daemon_cb_data_t cbd;
+            memset(&cbd, 0, sizeof(cbd));
+            cbd.db  = use_db ? &db : NULL;
+            cbd.wt  = &client_wt;
+            cbd.fee = client_fee_ptr;
+            cbd.rt  = rt_ok ? &rt : NULL;
+            cbd.scripted_actions   = actions;
+            cbd.n_scripted_actions = n_actions;
+            ok = client_run_with_channels(ctx, &kp, host, port,
+                                          daemon_channel_cb, &cbd,
+                                          sa_vfn, sa_vctx);
+        } else {
+            /* Bare --channels (no scripted payment): unchanged legacy path. */
+            multi_payment_data_t data = { actions, n_actions, 0 };
+            ok = client_run_with_channels(ctx, &kp, host, port,
+                                          standalone_channel_cb, &data,
+                                          sa_vfn, sa_vctx);
+        }
     } else {
         ok = client_run_ceremony(ctx, &kp, host, port);
     }
