@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -216,6 +217,17 @@ int test_persist_migration_ladder(void) {
                                   loaded_txs, loaded_txids, loaded_amounts,
                                   NULL, 3);
     int ok = 1;
+    /* §10 key-at-rest (#327): persist_open must tighten the DB file to 0600
+       (no group/world bits) — it holds revocation secrets + the HD seed. */
+    {
+        struct stat mst;
+        if (stat(path, &mst) != 0) {
+            printf("  FAIL: stat(db) failed\n"); ok = 0;
+        } else if (mst.st_mode & (S_IRWXG | S_IRWXO)) {
+            printf("  FAIL: db not 0600 after persist_open (mode 0%o) — secrets exposed\n",
+                   (unsigned)(mst.st_mode & 0777)); ok = 0;
+        }
+    }
     if (v_after != PERSIST_SCHEMA_VERSION) {
         printf("  FAIL: migration reached v%d, expected v%d\n",
                v_after, PERSIST_SCHEMA_VERSION); ok = 0;
