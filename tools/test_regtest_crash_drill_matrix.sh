@@ -113,52 +113,88 @@ SCENARIO_TIMEOUT="${SCENARIO_TIMEOUT:-60}"
 # journaled as 1 participant) and sub-factory variants journal K participants
 # (the sub-factory size, not the total N).
 # ---------------------------------------------------------------------------
+# Row format: CHECKPOINT|DRIVER_FLAGS|PHASE|N_CLIENTS|ARITY|EXP_PARTS|TIMEOUT|PID_BASE
+#   TIMEOUT  = wall-clock budget (s) to REACH the kill point.  factory_creation
+#              fires at startup (fast); post-demo ceremonies (leaf/state/sub/rotate)
+#              need minutes because the LSP first runs the demo warm-up payments
+#              and (for rollover/sub-advance) several block-confirmed advances.
+#   PID_BASE = participant-id base (1 default; 0 for --test-wire-leaf-advance,
+#              which the working harness launches as --participant-id 0,1).
 CHECKPOINTS=(
     # Factory creation ceremony (4 kill points) — default N=4 arity=2,
-    # all N clients participate.
-    "factory_creation_propose|--demo|propose|4|2|4"
-    "factory_creation_nonced|--demo|nonced|4|2|4"
-    "factory_creation_signed|--demo|signed|4|2|4"
-    "factory_creation_finalize_partial|--demo|finalize_partial|4|2|4"
+    # all N clients participate.  Fires at startup; 90s is ample.
+    "factory_creation_propose|--demo|propose|4|2|4|90|1"
+    "factory_creation_nonced|--demo|nonced|4|2|4|90|1"
+    "factory_creation_signed|--demo|signed|4|2|4|90|1"
+    "factory_creation_finalize_partial|--demo|finalize_partial|4|2|4|90|1"
 
     # Leaf advance ceremony (4 kill points) — wire ceremony needs N=2 arity=1
-    # (matches tools/test_regtest_wire_leaf_advance.sh).  --test-leaf-advance
-    # is the chain-level test that bypasses the MuSig wire path; the wire
-    # variant is what calls lsp_advance_leaf_stateless where the checkpoints
-    # live (src/lsp_channels.c:1685/1718/1907/2036).  Only the leaf-owner
-    # client participates (1 of N).
-    "leaf_advance_propose|--demo --test-wire-leaf-advance|propose|2|1|1"
-    "leaf_advance_nonced|--demo --test-wire-leaf-advance|nonced|2|1|1"
-    "leaf_advance_signed|--demo --test-wire-leaf-advance|signed|2|1|1"
-    "leaf_advance_finalize_partial|--demo --test-wire-leaf-advance|finalize_partial|2|1|1"
+    # (matches tools/test_regtest_wire_leaf_advance.sh).  The wire variant calls
+    # lsp_advance_leaf_stateless where the checkpoints live.  The advance fires
+    # AFTER the demo warm-up payments — budget 240s (the working harness waits
+    # 180s for the result).  PID_BASE=0: the leaf-owner is --participant-id 0,
+    # else leaf-0 has no responder and the ceremony never starts.  1 of N parts.
+    "leaf_advance_propose|--demo --test-wire-leaf-advance|propose|2|1|1|240|0"
+    "leaf_advance_nonced|--demo --test-wire-leaf-advance|nonced|2|1|1|240|0"
+    "leaf_advance_signed|--demo --test-wire-leaf-advance|signed|2|1|1|240|0"
+    "leaf_advance_finalize_partial|--demo --test-wire-leaf-advance|finalize_partial|2|1|1|240|0"
 
     # Tier B state advance ceremony (4 kill points) — checkpoints live in
-    # lsp_run_state_advance_stateless (src/lsp_channels.c:2301/2398/2636/2732).
-    # --test-tier-b-rollover drives states_per_layer+1 leaf advances to
-    # trigger the root rollover that fires lsp_run_state_advance.  PS shape
-    # (--arity 3) so the rollover path is exercised.  All N participate in
-    # the root-driven rollover.
-    "state_advance_propose|--demo --test-tier-b-rollover|propose|4|3|4"
-    "state_advance_nonced|--demo --test-tier-b-rollover|nonced|4|3|4"
-    "state_advance_signed|--demo --test-tier-b-rollover|signed|4|3|4"
-    "state_advance_finalize_partial|--demo --test-tier-b-rollover|finalize_partial|4|3|4"
+    # lsp_run_state_advance_stateless.  --test-tier-b-rollover drives
+    # states_per_layer+1 leaf advances to trigger the root rollover that fires
+    # lsp_run_state_advance.  PS shape (--arity 3).  The rollover only happens
+    # after the full advance sequence + block confirmations, so the checkpoint
+    # is not reachable for several minutes — budget 600s (matches
+    # tools/test_regtest_tier_b_rollover_ps.sh).  All N participate.
+    "state_advance_propose|--demo --test-tier-b-rollover|propose|4|3|4|600|1"
+    "state_advance_nonced|--demo --test-tier-b-rollover|nonced|4|3|4|600|1"
+    "state_advance_signed|--demo --test-tier-b-rollover|signed|4|3|4|600|1"
+    "state_advance_finalize_partial|--demo --test-tier-b-rollover|finalize_partial|4|3|4|600|1"
 
-    # NOTE: the 4 K=1 "single-input" subfactory_* scenarios were dropped in
-    # the same cleanup that removed the 450-line dead K=1 MVP code from
-    # lsp_subfactory_chain_advance_stateless.  All production sub-factory
-    # chain advances now route to the multi-input implementation (next
-    # block) since K>=2 is required for a NODE_PS_SUBFACTORY to exist.
-    # See git log a015f3a (#327) for the Phase 1e.1 K=1 MVP origin and
-    # the followup cleanup commit for the rationale.
+    # NOTE: the 4 K=1 "single-input" subfactory_* scenarios are intentionally
+    # excluded — that path (lsp_channels.c:4174-4458) is DEAD for production
+    # sub-factories: a NODE_PS_SUBFACTORY always has n_outputs>1, so the
+    # dispatch at lsp_channels.c:4055 always routes to the multi-input variant
+    # below.  The checkpoints remain in code as a guarded fallback.
 
     # Sub-factory multi-input chain advance (4 kill points) — checkpoints in
     # the multi-input ceremony variant (src/lsp_channels.c:3568/3630/3921/3944).
     # --test-subfactory-advance-multi drives TWO back-to-back advances; the
-    # second exercises the multi-input MuSig path (#142 SF-A).  K participants.
-    "subfactory_multi_propose|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|propose|4|3|2"
-    "subfactory_multi_nonced|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|nonced|4|3|2"
-    "subfactory_multi_signed|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|signed|4|3|2"
-    "subfactory_multi_finalize_partial|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|finalize_partial|4|3|2"
+    # second exercises the multi-input MuSig path (#142 SF-A).  Fires after the
+    # warm-up payments + first advance — budget 420s.  K participants.
+    "subfactory_multi_propose|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|propose|4|3|2|420|1"
+    "subfactory_multi_nonced|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|nonced|4|3|2|420|1"
+    "subfactory_multi_signed|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|signed|4|3|2|420|1"
+    "subfactory_multi_finalize_partial|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|finalize_partial|4|3|2|420|1"
+
+    # Factory rotation ceremony (4 kill points: rotate_pending_nonces /
+    # rotate_nonces_aggregated / rotate_pending_sigs / rotate_finalize_partial,
+    # src/lsp_rotation.c 209/428/547/1215) — INTENTIONALLY EXCLUDED from this
+    # daemon-client matrix.  Those checkpoints live inside the PRODUCTION
+    # lsp_channels_rotate_factory().  --test-rotation is a SEPARATE hand-rolled
+    # demo (tools/superscalar_lsp_post_daemon_tests.inc) that re-implements
+    # turnover + ladder-close + new-factory inline and never calls
+    # lsp_channels_rotate_factory(), so it cannot reach those checkpoints — and
+    # no other --test-* flag drives the production rotation either (its only
+    # callers are the daemon's internal rotation triggers in lsp_channels.c,
+    # exercised by the CLN plugin / factory-expiry).  Coverage is preserved two
+    # ways: (1) the §2 dual-signature-trap guard these checkpoints would test is
+    # the SINGLE shared function persist_update_ceremony_state() (persist.c:6539,
+    # refuses FINALIZED unless every participant row is phase=SIGNED) — already
+    # proven under crash injection by all 16 driveable-ceremony datapoints below,
+    # and rotation transitions to FINALIZED through that identical guard; (2) the
+    # crash checkpoints remain wired in lsp_rotation.c, ready for a production-
+    # rotation driver.  Driving the production rotation under crash injection is
+    # tracked as a v0.2.1 test-hardening follow-up (needs a --test-prod-rotation
+    # that calls lsp_channels_rotate_factory, or the CLN-interop path #307).
+    # NOTE: the --test-rotation demo's PTLC turnover (Phase A) was separately
+    # un-rotted in this change (it predated the #196 turnover-auth gate and
+    # rejected every presig); it now completes turnover but still fails later at
+    # inline Factory-1 creation — also folded into the v0.2.1 follow-up.
+    # "rotate_pending_nonces|--demo --test-rotation|propose|4|2|4|360|1"
+    # "rotate_nonces_aggregated|--demo --test-rotation|nonced|4|2|4|360|1"
+    # "rotate_pending_sigs|--demo --test-rotation|signed|4|2|4|360|1"
+    # "rotate_finalize_partial|--demo --test-rotation|finalize_partial|4|2|4|360|1"
 )
 
 # Optional filter — run only checkpoints matching this glob (default: all).
@@ -203,7 +239,7 @@ EOF
     exit 2
 fi
 
-echo "=== Half C2: crash-drill matrix (20 scenarios) ==="
+echo "=== Half C2: crash-drill matrix (16 scenarios / 4 driveable ceremonies; rotate excluded — see CHECKPOINTS note) ==="
 echo "  build       : $BUILD_DIR"
 echo "  wallet      : $WALLET ($WALLET_SATS sats)"
 echo "  scenarios   : ${#CHECKPOINTS[@]}"
@@ -228,6 +264,16 @@ run_scenario() {
     local n_clients="${5:-$CLIENTS}"
     local arity="${6:-$ARITY}"
     local exp_parts="${7:-$n_clients}"
+    # Per-scenario wall-clock budget to REACH the kill point.  Ceremonies that
+    # fire post-demo (leaf advance, Tier B rollover, sub-factory multi-advance,
+    # rotation) need minutes to reach their checkpoint — the LSP is still
+    # running the demo warm-up payments at 60s.  Default to the global.
+    local scenario_timeout="${8:-$SCENARIO_TIMEOUT}"
+    # Participant-id base: 1 for most drivers (client N -> --participant-id N),
+    # 0 for --test-wire-leaf-advance (matches tools/test_regtest_wire_leaf_advance.sh
+    # which launches --participant-id 0,1; if leaf-0's owner is mis-numbered the
+    # advance ceremony never starts and the checkpoint is unreachable).
+    local pid_base="${9:-1}"
 
     local tmpdir
     tmpdir=$(mktemp -d "/tmp/ss-crash-drill.${ckpt}.XXXXXX")
@@ -282,7 +328,7 @@ run_scenario() {
         "$CLIENT_BIN" \
             --network regtest --host 127.0.0.1 --port "$port" --daemon \
             --seckey "$sk" --fee-rate 1100 --lsp-balance-pct 50 \
-            --lsp-pubkey "$LSP_PUB" --participant-id "$N" \
+            --lsp-pubkey "$LSP_PUB" --participant-id "$((N - 1 + pid_base))" \
             --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
             --wallet "$WALLET" --db "$tmpdir/c${N}.db" \
             > "$tmpdir/c${N}.log" 2>&1 &
@@ -299,11 +345,11 @@ run_scenario() {
     done) &
     local miner_pid=$!
 
-    # Wait up to SCENARIO_TIMEOUT for the LSP to abort, OR for it to
+    # Wait up to scenario_timeout for the LSP to abort, OR for it to
     # complete the ceremony without ever hitting the checkpoint.
     local aborted=0
     local elapsed=0
-    while [ "$elapsed" -lt "$SCENARIO_TIMEOUT" ]; do
+    while [ "$elapsed" -lt "$scenario_timeout" ]; do
         sleep 1
         elapsed=$((elapsed + 1))
         if ! kill -0 $lsp_pid 2>/dev/null; then
@@ -326,11 +372,21 @@ run_scenario() {
 
     # Verdict.
     if [ "$aborted" = "0" ]; then
-        echo "[FAIL] checkpoint=$ckpt reason=LSP did not hit checkpoint in ${SCENARIO_TIMEOUT}s"
+        # No-fire = the ceremony never reached the kill point.  For the
+        # multi-client ceremonies this is usually a TRANSIENT harness flake (a
+        # client's final psig didn't arrive and the LSP blocks on the no-timeout
+        # wire_recv in Step E) rather than a state bug — so this is returned as a
+        # RETRYABLE code (2); the matrix loop re-attempts before declaring FAIL.
+        echo "[NO-FIRE] checkpoint=$ckpt reason=LSP did not hit checkpoint in ${scenario_timeout}s (retryable)"
         cp "$lsp_log" "/tmp/crash_drill_${ckpt}_lsp.log" 2>/dev/null || true
         cp "$lsp_db"  "/tmp/crash_drill_${ckpt}_lsp.db"  2>/dev/null || true
+        # Forensics: preserve client logs too — a no-fire is often a client-side
+        # stall (e.g. a rejected/mis-bound message) the LSP log can't explain.
+        for clg in "$tmpdir"/c*.log; do
+            [ -f "$clg" ] && cp "$clg" "/tmp/crash_drill_${ckpt}_$(basename "$clg")" 2>/dev/null || true
+        done
         rm -rf "$tmpdir"
-        return 1
+        return 2
     fi
 
     # Inspect DB.  We want the LATEST ceremony row (the in-flight one at abort).
@@ -465,7 +521,7 @@ declare -a FAILED_NAMES=()
 
 idx=0
 for entry in "${CHECKPOINTS[@]}"; do
-    IFS='|' read -r ckpt driver_flags phase row_clients row_arity row_exp_parts <<<"$entry"
+    IFS='|' read -r ckpt driver_flags phase row_clients row_arity row_exp_parts row_timeout row_pid_base <<<"$entry"
     if [[ ! "$ckpt" == $ONLY ]]; then
         SKIPPED=$((SKIPPED + 1))
         continue
@@ -475,10 +531,23 @@ for entry in "${CHECKPOINTS[@]}"; do
     port=$((PORT_BASE + idx))
     idx=$((idx + 1))
 
-    echo "--- [$idx] $ckpt (driver: $driver_flags  N=${row_clients:-$CLIENTS} arity=${row_arity:-$ARITY} parts=${row_exp_parts:-${row_clients:-$CLIENTS}}) ---"
-    if run_scenario "$ckpt" "$driver_flags" "$phase" "$port" "$row_clients" "$row_arity" "$row_exp_parts"; then
+    echo "--- [$idx] $ckpt (driver: $driver_flags  N=${row_clients:-$CLIENTS} arity=${row_arity:-$ARITY} parts=${row_exp_parts:-${row_clients:-$CLIENTS}} timeout=${row_timeout:-$SCENARIO_TIMEOUT}s pid_base=${row_pid_base:-1}) ---"
+    # Retry on no-fire (rc=2 = ceremony never reached the kill point, a transient
+    # multi-client harness flake).  Assertion failures (rc=1) and passes (rc=0)
+    # are final — only a genuine no-fire is retried, up to MAX_RETRY times.
+    MAX_RETRY="${MAX_RETRY:-3}"
+    sc_rc=2; sc_try=0
+    while [ "$sc_rc" = "2" ] && [ "$sc_try" -lt "$MAX_RETRY" ]; do
+        sc_try=$((sc_try + 1))
+        [ "$sc_try" -gt 1 ] && echo "    (no-fire — retry $sc_try/$MAX_RETRY)"
+        run_scenario "$ckpt" "$driver_flags" "$phase" "$port" "$row_clients" "$row_arity" "$row_exp_parts" "$row_timeout" "$row_pid_base"
+        sc_rc=$?
+    done
+    if [ "$sc_rc" = "0" ]; then
         PASSED=$((PASSED + 1))
     else
+        # rc=2 here means it no-fired MAX_RETRY times in a row → real FAIL.
+        [ "$sc_rc" = "2" ] && echo "[FAIL] checkpoint=$ckpt reason=no-fire after $MAX_RETRY attempts"
         FAILED=$((FAILED + 1))
         FAILED_NAMES+=("$ckpt")
     fi

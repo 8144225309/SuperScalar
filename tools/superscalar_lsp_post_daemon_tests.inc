@@ -1742,8 +1742,25 @@
         musig_keyagg_t rot_ka;
         musig_aggregate_keys(ctx, &rot_ka, rot_pks, n_total);
 
+        /* SF-PTLC-TURNOVER-AUTH #196: the client's PTLC_PRESIG handler refuses
+           any presig whose turnover_msg was not authorized by a precursor
+           ROTATION_BEGIN (it recomputes wire_compute_turnover_msg() from the
+           ROTATION_BEGIN context and compares).  The old constant
+           sha256_tagged("turnover") here predates that gate, so every client
+           rejected the presig ("no matching ROTATION_BEGIN") and rotation
+           stalled before reaching the MuSig ceremony.  Mirror production
+           (lsp_rotation.c:260): bind the turnover to a real rotation context
+           and send ROTATION_BEGIN before each presig.  The values are fixed
+           TEST constants — only their consistency between the ROTATION_BEGIN
+           sent below and this turnover_msg binding matters. */
+        unsigned char rot_dying_txid[32];
+        memset(rot_dying_txid, 0xAB, sizeof(rot_dying_txid));
+        unsigned char rot_new_nonce[32];
+        memset(rot_new_nonce, 0xCD, sizeof(rot_new_nonce));
+        uint64_t rot_epoch = 1;
         unsigned char turnover_msg[32];
-        sha256_tagged("turnover", (const unsigned char *)"turnover", 8, turnover_msg);
+        wire_compute_turnover_msg(rot_dying_txid, rot_new_nonce, rot_epoch,
+                                  turnover_msg);
 
         for (int ci = 0; ci < n_clients; ci++) {
             uint32_t pidx = (uint32_t)(ci + 1);
@@ -1758,6 +1775,21 @@
                 fprintf(stderr, "ROTATION: presig failed client %d\n", ci);
                 lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
+            }
+
+            /* SF-PTLC-TURNOVER-AUTH #196: send the rotation context BEFORE the
+               presig so the client's turnover-auth gate accepts it (mirror
+               lsp_rotation.c:260-275). */
+            {
+                cJSON *rb = wire_build_rotation_begin(rot_dying_txid,
+                                                      rot_new_nonce, rot_epoch);
+                if (!wire_send(lsp_p->client_fds[ci], MSG_ROTATION_BEGIN, rb)) {
+                    cJSON_Delete(rb);
+                    fprintf(stderr, "ROTATION: send ROTATION_BEGIN failed client %d\n", ci);
+                    lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
+                }
+                cJSON_Delete(rb);
             }
 
             /* Send PTLC_PRESIG to client */
