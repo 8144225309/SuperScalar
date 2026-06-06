@@ -21,8 +21,8 @@ BUILD_DIR="${1:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
-REGTEST_CONF="${REGTEST_CONF:-/var/lib/bitcoind-regtest/bitcoin.conf}"
-BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
+REGTEST_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
+BCLI="bitcoin-cli -signet -conf=$REGTEST_CONF"
 
 N_CLIENTS="${N_CLIENTS:-64}"
 PAYMENTS="${PAYMENTS:-8}"
@@ -30,11 +30,11 @@ ARITY="${ARITY:-2,4,8}"
 STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-1}"
 # Funding scales with N so each channel is a realistic ~100k sats and stays
 # well above the fixed 5000-sat channel reserve at any client count.
-AMOUNT="${AMOUNT:-$(( N_CLIENTS * 100000 ))}"
+AMOUNT="${AMOUNT:-2750000}"
 FEE_RATE="${FEE_RATE:-1000}"   # sat/kvB; regtest mempool floor is generous
-PORT="${PORT:-9941}"
-WALLET="ss_n64_pay"
-TAG="regtest_n64_payments"
+PORT="${PORT:-9951}"
+WALLET="${WALLET:-ss_sig_n127}"
+TAG="signet_scale_payments"
 LSP_DB="/tmp/ss_${TAG}.db"
 LSP_LOG="/tmp/ss_${TAG}_lsp.log"
 LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
@@ -60,16 +60,15 @@ for n in $(seq 2 $((N_CLIENTS + 1))); do
     rm -f "/tmp/ss_${TAG}_c${HEX:60:4}.db"* "/tmp/ss_${TAG}_c${HEX:60:4}.log"
 done
 
-info "regtest bitcoind reachable?"
-$BCLI getblockcount >/dev/null || die "regtest bitcoind not reachable at $REGTEST_CONF"
+info "signet bitcoind reachable?"
+$BCLI getblockcount >/dev/null || die "signet bitcoind not reachable at $REGTEST_CONF"
 
-# --- Fund the LSP wallet ---
-info "preparing + funding LSP wallet '$WALLET'"
-$BCLI createwallet "$WALLET" 2>/dev/null || $BCLI loadwallet "$WALLET" 2>/dev/null || true
+# --- Signet: wallet is pre-funded + consolidated; NO mining on signet ---
+info "loading pre-funded signet wallet '$WALLET'"
+$BCLI loadwallet "$WALLET" 2>/dev/null || true
 FUND_ADDR=$($BCLI -rpcwallet="$WALLET" getnewaddress)
-# Mine 101 to make a coinbase spendable, then top up if balance is thin.
-$BCLI generatetoaddress 101 "$FUND_ADDR" >/dev/null
 BAL=$($BCLI -rpcwallet="$WALLET" getbalance)
+awk "BEGIN{exit !($BAL+0>0)}" || die "signet wallet '$WALLET' has no spendable balance ($BAL BTC) - is the consolidation confirmed?"
 info "LSP wallet balance: $BAL BTC"
 
 echo "=== regtest N=$N_CLIENTS PS payments E2E ==="
@@ -77,7 +76,7 @@ echo "  clients=$N_CLIENTS arity=$ARITY static=$STATIC_NEAR_ROOT amount=$AMOUNT 
 
 # --- Launch LSP (route payments, cooperative close; NOT --force-close) ---
 nohup "$LSP_BIN" \
-    --network regtest --port "$PORT" \
+    --network signet --port "$PORT" \
     --clients "$N_CLIENTS" --arity "$ARITY" \
     --static-near-root "$STATIC_NEAR_ROOT" \
     --amount "$AMOUNT" \
@@ -87,7 +86,7 @@ nohup "$LSP_BIN" \
     --confirm-timeout 86400 \
     --max-conn-rate 400 --max-handshakes 80 \
     --seckey "$LSP_SECKEY" \
-    --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
+    --rpcuser signetrpc --rpcpassword signetrpcpass123 --rpcport 38332 \
     --wallet "$WALLET" --db "$LSP_DB" \
     --demo --payments "$PAYMENTS" \
     > "$LSP_LOG" 2>&1 &
@@ -111,7 +110,7 @@ declare -A ROLE   # client idx -> "send:DEST:PRE" | "recv:PRE" | "idle"
 # Scripted payment = 1/10 of per-channel funding (10k at 100k/channel).
 # Always clears the 5000-sat reserve since the client half-channel is
 # ~AMOUNT/N/3 and AMOUNT/N/10 << that minus reserve.
-PAY_AMT=$(( (AMOUNT / N_CLIENTS) / 10 ))
+PAY_AMT="${PAY_AMT:-$(( (AMOUNT / N_CLIENTS) / 10 ))}"
 [ "$PAY_AMT" -lt 1000 ] && PAY_AMT=1000
 for j in $(seq 0 $((PAYMENTS - 1))); do
     S=$((2*j + 1)); R=$((2*j + 2))
@@ -129,10 +128,10 @@ info "launching $N_CLIENTS clients ($PAYMENTS sender/receiver pairs, rest idle).
 for i in $(seq 1 "$N_CLIENTS"); do
     SK=$(printf '%064x' $((i + 1)))   # 0x02 .. 0x(N+1)
     R="${ROLE[$i]:-idle}"
-    COMMON=(--network regtest --host 127.0.0.1 --port "$PORT"
+    COMMON=(--network signet --host 127.0.0.1 --port "$PORT"
             --seckey "$SK" --fee-rate "$FEE_RATE" --lsp-balance-pct 50
             --lsp-pubkey "$LSP_PUBKEY" --participant-id "$i"
-            --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443
+            --rpcuser signetrpc --rpcpassword signetrpcpass123 --rpcport 38332
             --wallet "$WALLET" --db "/tmp/ss_${TAG}_c${SK:60:4}.db")
     case "$R" in
         send:*) DEST="${R#send:}"; DEST="${DEST%%:*}"; PRE="${R##*:}"
@@ -145,14 +144,13 @@ for i in $(seq 1 "$N_CLIENTS"); do
     sleep 0.2
 done
 
-# Regtest needs blocks mined to confirm the funding TX + advance the lifecycle.
-# Mine periodically in the background while the LSP drives the ceremony.
-( for _ in $(seq 1 120); do sleep 5; $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$FUND_ADDR" >/dev/null 2>&1 || true; done ) &
-MINER_PID=$!
+# Signet: no mining - blocks arrive from the signet signer (~10 min). The LSP
+# waits for natural funding + close confirmations via --confirm-timeout.
+MINER_PID=""
 
 # --- Wait for the LSP to finish (creation -> payments -> close) ---
 info "waiting for ceremony + payments + close (up to ~10 min)..."
-DEADLINE=$(( $(date +%s) + 600 ))
+DEADLINE=$(( $(date +%s) + 3600 ))
 RESULT="TIMEOUT"
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     if ! kill -0 $LSP_PID 2>/dev/null; then RESULT="LSP_EXITED"; break; fi
@@ -161,7 +159,7 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     fi
     sleep 5
 done
-kill -9 "$MINER_PID" 2>/dev/null || true
+[ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null || true
 
 echo "=== result: $RESULT ==="
 echo "--- LSP lifecycle evidence ---"
@@ -226,7 +224,7 @@ else
 import sys, json, subprocess
 txid, conf = sys.argv[1], sys.argv[2]
 def rawtx(t):
-    r = subprocess.run(["bitcoin-cli","-regtest","-conf="+conf,"getrawtransaction",t,"1"],
+    r = subprocess.run(["bitcoin-cli","-signet","-conf="+conf,"getrawtransaction",t,"1"],
                        capture_output=True, text=True)
     return json.loads(r.stdout) if r.returncode == 0 else None
 d = rawtx(txid)
@@ -277,7 +275,7 @@ if [ -n "$CLOSE_TXID" ]; then
 import sys, json, subprocess, re
 from collections import Counter
 txid, conf, lsplog, ncli = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-r = subprocess.run(["bitcoin-cli","-regtest","-conf="+conf,"getrawtransaction",txid,"1"],
+r = subprocess.run(["bitcoin-cli","-signet","-conf="+conf,"getrawtransaction",txid,"1"],
                    capture_output=True, text=True)
 if r.returncode != 0:
     print("FAIL could-not-fetch-close-tx"); sys.exit(0)
