@@ -261,8 +261,7 @@ static int cb_rpc_send_raw_tx(chain_backend_t *self, const char *tx_hex,
     cJSON *result = rpc_call(rpc, "sendrawtransaction", params);
     if (!result) return 0;
     if (cJSON_IsString(result) && txid_out) {
-        strncpy(txid_out, result->valuestring, 64);
-        txid_out[64] = '\0';
+        snprintf(txid_out, 65, "%s", result->valuestring);
     }
     cJSON_Delete(result);
     return 1;
@@ -294,15 +293,25 @@ int chain_backend_rpc_init(chain_backend_t *backend,
 {
     if (!backend || !host || !rpcuser || !rpcpassword) return 0;
 
+    /* Reject non-loopback hosts: HTTP Basic Auth transmits credentials without
+     * encryption; allow only loopback to prevent credential interception. */
+    if (strcmp(host, "127.0.0.1") != 0 &&
+        strcmp(host, "::1")       != 0 &&
+        strcmp(host, "localhost") != 0) {
+        fprintf(stderr, "chain_backend_rpc: refusing non-loopback host '%s' "
+                        "(HTTP Basic Auth requires loopback or TLS)\n", host);
+        return 0;
+    }
+
     chain_backend_rpc_ctx_t *rpc = calloc(1, sizeof(chain_backend_rpc_ctx_t));
     if (!rpc) return 0;
 
-    strncpy(rpc->host, host, sizeof(rpc->host) - 1);
+    snprintf(rpc->host, sizeof(rpc->host), "%s", host);
     rpc->port = port;
-    strncpy(rpc->rpcuser, rpcuser, sizeof(rpc->rpcuser) - 1);
-    strncpy(rpc->rpcpassword, rpcpassword, sizeof(rpc->rpcpassword) - 1);
+    snprintf(rpc->rpcuser, sizeof(rpc->rpcuser), "%s", rpcuser);
+    snprintf(rpc->rpcpassword, sizeof(rpc->rpcpassword), "%s", rpcpassword);
     if (wallet)
-        strncpy(rpc->wallet, wallet, sizeof(rpc->wallet) - 1);
+        snprintf(rpc->wallet, sizeof(rpc->wallet), "%s", wallet);
 
     /* Auto-detect port from network if not specified */
     if (rpc->port <= 0) {
