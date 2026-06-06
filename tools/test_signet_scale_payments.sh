@@ -37,8 +37,7 @@ WALLET="${WALLET:-ss_sig_n127}"
 TAG="signet_scale_payments"
 LSP_DB="/tmp/ss_${TAG}.db"
 LSP_LOG="/tmp/ss_${TAG}_lsp.log"
-LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
-LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+# LSP keys are generated per-run below (STRONG, not weak) via the keygen eval.
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -62,6 +61,14 @@ done
 
 info "signet bitcoind reachable?"
 $BCLI getblockcount >/dev/null || die "signet bitcoind not reachable at $REGTEST_CONF"
+
+# --- Strong per-run keys (NEVER weak keys on shared signet) ---
+# Derive LSP + client seckeys from a random seed via signet_strong_keygen.py;
+# the seed is saved to RUN_SEED_FILE so we can recover/sweep our own outputs.
+eval "$(SIGNET_CONF="$REGTEST_CONF" python3 "$(dirname "$0")/signet_strong_keygen.py" "$N_CLIENTS" "$TAG")"
+[ -n "${LSP_PUBKEY:-}" ] && [ -s "${CLIENT_KEYS_FILE:-/nonexistent}" ] \
+    || die "signet_strong_keygen.py failed to produce keys"
+info "strong per-run keys generated (LSP pub ${LSP_PUBKEY:0:16}..., seed: $RUN_SEED_FILE)"
 
 # --- Signet: wallet is pre-funded + consolidated; NO mining on signet ---
 info "loading pre-funded signet wallet '$WALLET'"
@@ -126,13 +133,13 @@ done
 
 info "launching $N_CLIENTS clients ($PAYMENTS sender/receiver pairs, rest idle)..."
 for i in $(seq 1 "$N_CLIENTS"); do
-    SK=$(printf '%064x' $((i + 1)))   # 0x02 .. 0x(N+1)
+    SK=$(sed -n "${i}p" "$CLIENT_KEYS_FILE")   # strong per-run key (line i)
     R="${ROLE[$i]:-idle}"
     COMMON=(--network signet --host 127.0.0.1 --port "$PORT"
             --seckey "$SK" --fee-rate "$FEE_RATE" --lsp-balance-pct 50
             --lsp-pubkey "$LSP_PUBKEY" --participant-id "$i"
             --rpcuser signetrpc --rpcpassword signetrpcpass123 --rpcport 38332
-            --wallet "$WALLET" --db "/tmp/ss_${TAG}_c${SK:60:4}.db")
+            --wallet "$WALLET" --db "/tmp/ss_${TAG}_c${SK:0:8}.db")
     case "$R" in
         send:*) DEST="${R#send:}"; DEST="${DEST%%:*}"; PRE="${R##*:}"
                 EXTRA=(--channels --send "$DEST:$PAY_AMT:$PRE") ;;
@@ -140,7 +147,7 @@ for i in $(seq 1 "$N_CLIENTS"); do
         *)      EXTRA=(--daemon) ;;
     esac
     nohup "$CLIENT_BIN" "${COMMON[@]}" "${EXTRA[@]}" \
-        > "/tmp/ss_${TAG}_c${SK:60:4}.log" 2>&1 &
+        > "/tmp/ss_${TAG}_c${SK:0:8}.log" 2>&1 &
     sleep 0.2
 done
 
