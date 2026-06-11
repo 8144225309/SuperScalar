@@ -169,8 +169,9 @@ CHECKPOINTS=(
 
     # Factory rotation ceremony (4 kill points: rotate_pending_nonces /
     # rotate_nonces_aggregated / rotate_pending_sigs / rotate_finalize_partial,
-    # src/lsp_rotation.c 209/428/547/1215) — INTENTIONALLY EXCLUDED from this
-    # daemon-client matrix.  Those checkpoints live inside the PRODUCTION
+    # src/lsp_rotation.c 209/428/547/1215) — NOW DRIVEN (rows below) via the
+    # daemon DYING trigger; the historical exclusion rationale is kept for
+    # context.  Those checkpoints live inside the PRODUCTION
     # lsp_channels_rotate_factory().  --test-rotation is a SEPARATE hand-rolled
     # demo (tools/superscalar_lsp_post_daemon_tests.inc) that re-implements
     # turnover + ladder-close + new-factory inline and never calls
@@ -191,10 +192,21 @@ CHECKPOINTS=(
     # un-rotted in this change (it predated the #196 turnover-auth gate and
     # rejected every presig); it now completes turnover but still fails later at
     # inline Factory-1 creation — also folded into the v0.2.1 follow-up.
-    # "rotate_pending_nonces|--demo --test-rotation|propose|4|2|4|360|1"
-    # "rotate_nonces_aggregated|--demo --test-rotation|nonced|4|2|4|360|1"
-    # "rotate_pending_sigs|--demo --test-rotation|signed|4|2|4|360|1"
-    # "rotate_finalize_partial|--demo --test-rotation|finalize_partial|4|2|4|360|1"
+    # Factory rotation — PRODUCTION lsp_channels_rotate_factory(), driven by
+    # the daemon's own DYING trigger (NOT --test-rotation, which is a separate
+    # hand-rolled demo): --daemon sets rot_auto_rotate=1 and, with no
+    # --async-rotation, mgr->readiness is NULL so the LEGACY SYNCHRONOUS path
+    # calls lsp_channels_rotate_factory() directly on the ACTIVE->DYING
+    # transition.  --active-blocks 6 + the matrix's 2s miner reaches DYING in
+    # ~20s after funding; --dying-blocks 120 keeps the rotation window open.
+    # Participant rows are journaled DURING Phase A turnover, so the
+    # rotate_pending_nonces kill (which fires just after the ceremony row is
+    # saved, BEFORE Phase A) expects parts=0; later checkpoints expect all 4.
+    # Probe-verified: state=PENDING_NONCES(0) parts=0/0/0 at the first kill.
+    "rotate_pending_nonces|--daemon --active-blocks 6 --dying-blocks 120|propose|4|2|0|360|1"
+    "rotate_nonces_aggregated|--daemon --active-blocks 6 --dying-blocks 120|nonced|4|2|4|420|1"
+    "rotate_pending_sigs|--daemon --active-blocks 6 --dying-blocks 120|signed|4|2|4|420|1"
+    "rotate_finalize_partial|--daemon --active-blocks 6 --dying-blocks 120|finalize_partial|4|2|4|480|1"
 )
 
 # Optional filter — run only checkpoints matching this glob (default: all).
@@ -239,7 +251,7 @@ EOF
     exit 2
 fi
 
-echo "=== Half C2: crash-drill matrix (16 scenarios / 4 driveable ceremonies; rotate excluded — see CHECKPOINTS note) ==="
+echo "=== Half C2: crash-drill matrix (20 scenarios / 5 ceremonies incl. PRODUCTION rotation) ==="
 echo "  build       : $BUILD_DIR"
 echo "  wallet      : $WALLET ($WALLET_SATS sats)"
 echo "  scenarios   : ${#CHECKPOINTS[@]}"
@@ -408,10 +420,17 @@ run_scenario() {
 
     # ceremony_id is a BLOB; bypass the bind-parameter dance by joining
     # against the latest ceremony row directly inside sqlite.
+    # Rotation nests a complete new-factory creation ceremony in Phase C,
+    # whose INITIAL row legitimately FINALIZES after the ROTATE row. For
+    # rotate_* checkpoints the SS2-guard subject is the ROTATE row
+    # (ceremony_type=2), not the latest row overall.
+    local cer_filter=""
+    case "$ckpt" in rotate_*) cer_filter="WHERE ceremony_type = 2" ;; esac
+
     local row
     row=$(sqlite3 "$lsp_db" "
         WITH latest AS (
-            SELECT ceremony_id, state FROM ceremonies
+            SELECT ceremony_id, state FROM ceremonies $cer_filter
             ORDER BY rowid DESC LIMIT 1
         )
         SELECT l.state,

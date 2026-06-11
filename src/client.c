@@ -825,6 +825,13 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
 
 /* --- Factory rotation (condensed factory creation without HELLO) --- */
 
+/* Defined below (the initial-creation stateless signing engine).  The
+   rotation re-entry ceremony reuses it so both creation paths speak the
+   same (stateless, #272 default) protocol. */
+static int client_factory_creation_stateless_signing(
+        int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
+        factory_t *factory, uint32_t my_index);
+
 int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 uint32_t my_index,
@@ -969,6 +976,47 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         return 0;
     }
 
+    /* Verify distribution amounts BEFORE any ceremony round: if the LSP
+       provided per-client dist_amounts, this client's allocation must be at
+       least its old channel balance.  Prevents the LSP from silently reducing
+       the client's distribution output during rotation (balance theft).
+       Protocol-agnostic — applies to the stateless AND legacy paths. */
+    if (rot_n_dist_amounts > 0 && my_index >= 1) {
+        size_t ci = my_index - 1;  /* client index in dist_amounts array */
+        uint64_t offered = (ci < rot_n_dist_amounts) ? rot_dist_amounts[ci] : 0;
+        uint64_t expected = channel_out->local_amount;  /* client's balance */
+        if (offered < expected) {
+            fprintf(stderr, "Client %u: REFUSING rotation — distribution amount "
+                    "%llu < channel balance %llu (balance theft attempt)\n",
+                    my_index, (unsigned long long)offered,
+                    (unsigned long long)expected);
+            return 0;
+        }
+    }
+
+    /* #332 rotation crash-drill finding: this re-entry ceremony previously
+       spoke ONLY the legacy nonce-pool protocol (NONCE_BUNDLE 0x11 /
+       ALL_NONCES / PSIG_BUNDLE), which the stateless LSP rejects
+       ("LSP-stateless: expected CLIENT_PUBNONCES, got 0x11") — so production
+       rotation Phase C could never create the new factory against current
+       clients.  Mirror the initial-creation branch (client_run_with_channels):
+       stateless engine by default, legacy pool path only under
+       SS_MUSIG_LEGACY=1 (#272). */
+    int rot_stateless = 1;
+    {
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        rot_stateless = !(legacy && legacy[0] == '1');
+    }
+    /* Hoisted so the post-ceremony tail's error paths can free on either
+       path (the stateless arm leaves them NULL; free(NULL) is a no-op). */
+    secp256k1_musig_secnonce *secnonces = NULL;
+    wire_bundle_entry_t *nonce_entries = NULL;
+
+    if (rot_stateless) {
+        if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
+                                                        factory_out, my_index))
+            return 0;
+    } else {
     /* Generate nonces */
     unsigned char my_seckey[32];
     secp256k1_keypair_sec(ctx, my_seckey, keypair);
@@ -978,9 +1026,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (factory_find_signer_slot(factory_out, i, my_index) >= 0)
             my_node_count++;
 
-    secp256k1_musig_secnonce *secnonces =
+    secnonces =
         (secp256k1_musig_secnonce *)calloc(my_node_count, sizeof(secp256k1_musig_secnonce));
-    wire_bundle_entry_t *nonce_entries =
+    nonce_entries =
         (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
     if (my_node_count > 0 && (!secnonces || !nonce_entries)) {
         free(secnonces); free(nonce_entries);
@@ -1010,24 +1058,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         nonce_count++;
     }
 
-    /* Verify distribution amounts: if the LSP provided per-client dist_amounts,
-       check that this client's allocation is at least its old channel balance.
-       Prevents the LSP from silently reducing the client's distribution output
-       during rotation (balance theft). */
-    if (rot_n_dist_amounts > 0 && my_index >= 1) {
-        size_t ci = my_index - 1;  /* client index in dist_amounts array */
-        uint64_t offered = (ci < rot_n_dist_amounts) ? rot_dist_amounts[ci] : 0;
-        uint64_t expected = channel_out->local_amount;  /* client's balance */
-        if (offered < expected) {
-            fprintf(stderr, "Client %u: REFUSING rotation — distribution amount "
-                    "%llu < channel balance %llu (balance theft attempt)\n",
-                    my_index, (unsigned long long)offered,
-                    (unsigned long long)expected);
-            return 0;
-        }
-    }
-
-    /* Distribution TX: build unsigned TX and generate nonce (same as initial) */
+    /* Distribution TX: build unsigned TX and generate nonce (same as initial)
+       — legacy path only; the stateless engine covers dist via the same
+       mechanism as initial creation.  (Theft check moved above the branch.) */
     int rot_has_dist = 0;
     uint32_t rot_dist_node_idx = (uint32_t)factory_out->n_nodes;
     musig_signing_session_t rot_dist_session;
@@ -1162,6 +1195,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         cJSON_Delete(bundle); free(psig_entries);
         if (!ok) { free(secnonces); free(nonce_entries); return 0; }
     }
+    } /* end legacy (SS_MUSIG_LEGACY=1) rotation ceremony */
 
     /* Receive FACTORY_READY */
     if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
