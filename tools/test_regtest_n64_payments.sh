@@ -52,6 +52,7 @@ cleanup() {
 trap cleanup EXIT
 
 rm -f "$LSP_DB" "$LSP_DB"-shm "$LSP_DB"-wal "$LSP_LOG"
+[ -n "${WT_DB:-}" ] && rm -f "$WT_DB" "$WT_DB"-shm "$WT_DB"-wal
 # Clear ALL prior client logs/dbs for this TAG (not just the current N
 # range) so a previous larger-N run cannot inflate later grep counts.
 rm -f /tmp/ss_${TAG}_c*.log /tmp/ss_${TAG}_c*.db /tmp/ss_${TAG}_c*.db-shm /tmp/ss_${TAG}_c*.db-wal
@@ -89,6 +90,7 @@ nohup "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
     --wallet "$WALLET" --db "$LSP_DB" \
+    ${WT_DB:+--wt-db "$WT_DB"} \
     --demo --payments "$PAYMENTS" \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
@@ -264,6 +266,38 @@ fi
 CLOSE_PARTIES=$(cat /tmp/ss_${TAG}_c*.log 2>/dev/null | grep -ciE "received CLOSE_PROPOSE"); CLOSE_PARTIES=${CLOSE_PARTIES:-0}
 info "close participation: $CLOSE_PARTIES / $N_CLIENTS clients received CLOSE_PROPOSE"
 if [ "$CLOSE_PARTIES" -ge "$N_CLIENTS" ]; then note_ok "all $N_CLIENTS clients joined the close"; else note_fail "only $CLOSE_PARTIES/$N_CLIENTS clients joined the close"; fi
+
+# (8) Trustless watchtower at scale (env-gated: WT_DB). The LSP wrote watch
+#     rows to wt.db during the run (kind=2 commitment watches on every payment
+#     revocation; kind=0/1 on tree advances). Assert the DB is populated and
+#     that a STANDALONE secret-less watchtower hydrates EVERY row — the proof
+#     that trustless WT bookkeeping works at this channel count.
+if [ -n "${WT_DB:-}" ]; then
+    if [ ! -s "$WT_DB" ]; then
+        note_fail "WT_DB set but $WT_DB is missing/empty"
+    else
+        WT_ROWS=$(sqlite3 "$WT_DB" "SELECT COUNT(*) FROM wt_watches;" 2>/dev/null); WT_ROWS=${WT_ROWS:-0}
+        WT_BYKIND=$(sqlite3 "$WT_DB" "SELECT watch_kind||':'||COUNT(*) FROM wt_watches GROUP BY watch_kind;" 2>/dev/null | tr '\n' ' ')
+        WT_K2=$(sqlite3 "$WT_DB" "SELECT COUNT(*) FROM wt_watches WHERE watch_kind=2;" 2>/dev/null); WT_K2=${WT_K2:-0}
+        info "wt.db at scale: rows=$WT_ROWS by-kind=[$WT_BYKIND]"
+        if [ "$WT_ROWS" -gt 0 ] && [ "$WT_K2" -ge "$PAYMENTS" ]; then
+            note_ok "wt.db populated at scale ($WT_ROWS watches; kind=2 commitment watches $WT_K2 >= $PAYMENTS payments)"
+        else
+            note_fail "wt.db under-populated (rows=$WT_ROWS kind2=$WT_K2 < payments=$PAYMENTS)"
+        fi
+        WT_BIN="$BUILD_DIR/superscalar_watchtower"
+        WT_OUT=$(timeout 30 "$WT_BIN" --wt-db "$WT_DB" --network regtest \
+                   --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 2>&1 | head -40)
+        HYD=$(echo "$WT_OUT" | grep -oE "hydrated [0-9]+ watches" | grep -oE "[0-9]+" | head -1); HYD=${HYD:-0}
+        SKIP=$(echo "$WT_OUT" | grep -oE "\([0-9]+ skipped\)" | grep -oE "[0-9]+" | head -1); SKIP=${SKIP:-0}
+        info "standalone WT hydration: hydrated=$HYD skipped=$SKIP (db rows=$WT_ROWS)"
+        if [ "$HYD" -eq "$WT_ROWS" ] && [ "$SKIP" -eq 0 ] && [ "$HYD" -gt 0 ]; then
+            note_ok "standalone secret-less WT hydrated ALL $HYD watches at $N_CLIENTS-channel scale"
+        else
+            note_fail "standalone WT hydration incomplete (hydrated=$HYD skipped=$SKIP rows=$WT_ROWS)"
+        fi
+    fi
+fi
 
 # (7) Per-client balance reconciliation (line-item audit): every per-client
 #     close output the LSP computed must appear ON-CHAIN to the exact sat

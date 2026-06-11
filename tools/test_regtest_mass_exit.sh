@@ -145,7 +145,16 @@ echo "  Σ on-chain to_local (commitment out[0]) : $ACTUAL sats"
 echo "  NOTE: spending each to_local needs the client keyfile + CSV(144) — a standard P2TR CSV spend; on-chain presence here proves the funds are client-controlled and recoverable."
 
 echo
-if [ "$CONF_N" -eq "$N_CLIENTS" ] && [ "$ACTUAL" -gt 0 ] && [ "$ACTUAL" -le "$EXPECT" ] && [ "$ACTUAL" -ge $((EXPECT * 70 / 100)) ]; then
+# Upper bound: the DB channels.local_amount row can lag the LATEST signed
+# commitment by one balance-persist step per client (the demo persists the
+# balance AFTER the commitment is signed; the vanish kill can land between).
+# On-chain to_local is the commitment truth, so recovered can exceed the
+# stale row in the FUNDS-SAFE direction. Allow 1000 sats/client of persist
+# lag, and never more than the total funding.
+if [ "$CONF_N" -eq "$N_CLIENTS" ] && [ "$ACTUAL" -gt 0 ] \
+   && [ "$ACTUAL" -ge $((EXPECT * 70 / 100)) ] \
+   && [ "$ACTUAL" -le $((EXPECT + N_CLIENTS * 1000)) ] \
+   && [ "$ACTUAL" -le "$AMOUNT" ]; then
     green "PASS: all $N_CLIENTS clients self-exited with the LSP gone — simultaneous topological force-close landed every"
     green "      commitment + its to_local on-chain ($ACTUAL/$EXPECT sats). #313 fix verified end-to-end. [Frontier B regtest]"
     exit 0
