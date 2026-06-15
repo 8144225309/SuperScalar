@@ -16,6 +16,9 @@
 # Usage: bash tools/test_regtest_n64_payments.sh [BUILD_DIR]
 # Env:  N_CLIENTS (default 64)  PAYMENTS (default 8)  AMOUNT (default 3000000)
 set -uo pipefail
+# Pull the signet RPC password from the node conf so the live secret is
+# not hardcoded in the repo; override with SIGNET_RPCPASS if set.
+: "${SIGNET_RPCPASS:=$(sed -n 's/^rpcpassword=//p' /var/lib/bitcoind-signet/bitcoin.conf 2>/dev/null)}"
 
 BUILD_DIR="${1:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
@@ -93,7 +96,7 @@ nohup "$LSP_BIN" \
     --confirm-timeout 86400 \
     --max-conn-rate 400 --max-handshakes 80 \
     --seckey "$LSP_SECKEY" \
-    --rpcuser signetrpc --rpcpassword signetrpcpass123 --rpcport 38332 \
+    --rpcuser signetrpc --rpcpassword "$SIGNET_RPCPASS" --rpcport 38332 \
     --wallet "$WALLET" --db "$LSP_DB" \
     --demo --payments "$PAYMENTS" \
     > "$LSP_LOG" 2>&1 &
@@ -138,7 +141,7 @@ for i in $(seq 1 "$N_CLIENTS"); do
     COMMON=(--network signet --host 127.0.0.1 --port "$PORT"
             --seckey "$SK" --fee-rate "$FEE_RATE" --lsp-balance-pct 50
             --lsp-pubkey "$LSP_PUBKEY" --participant-id "$i"
-            --rpcuser signetrpc --rpcpassword signetrpcpass123 --rpcport 38332
+            --rpcuser signetrpc --rpcpassword "$SIGNET_RPCPASS" --rpcport 38332
             --wallet "$WALLET" --db "/tmp/ss_${TAG}_c${SK:0:8}.db")
     case "$R" in
         send:*) DEST="${R#send:}"; DEST="${DEST%%:*}"; PRE="${R##*:}"
