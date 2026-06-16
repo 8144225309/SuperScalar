@@ -4994,3 +4994,60 @@ int test_ceremony_helpers_aggregate_hard_guard(void) {
 }
 
 /* === End SF-CEREMONY-HELPERS tests ======================================== */
+
+/* === Revocation verification standard (Phase 1: durable committed-PCP) ===== */
+
+/* A committed remote per-commitment point must stay verifiable after it is
+   evicted from the 2-slot in-memory window — via the durable DB record — and a
+   wrong secret must NOT verify against it. This is the durability that lets
+   Phase 2 safely fail-closed. */
+int test_channel_revocation_durable_pcp_verify(void) {
+    const char *path = "/tmp/test_ss_revverify.db";
+    unlink(path);
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof ch);
+    ch.ctx = ctx;
+    ch.persist_db = &db;
+    ch.persist_channel_id = 7;
+
+    /* commitment 5: committed PCP = secret5*G */
+    unsigned char secret5[32]; memset(secret5, 0, 32); secret5[31] = 5;
+    secp256k1_pubkey pcp5;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pcp5, secret5), "pcp5");
+    channel_set_remote_pcp(&ch, 5, &pcp5);            /* in-memory + persisted */
+
+    /* evict 5 from the 2-slot window with two newer commitments */
+    unsigned char s6[32] = {0}, s7[32] = {0}; s6[31] = 6; s7[31] = 7;
+    secp256k1_pubkey p6, p7;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p6, s6), "p6");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p7, s7), "p7");
+    channel_set_remote_pcp(&ch, 6, &p6);
+    channel_set_remote_pcp(&ch, 7, &p7);              /* window {6,7}; 5 evicted */
+
+    /* durable fallback: PCP for 5 is still retrievable (from DB) and correct */
+    secp256k1_pubkey got;
+    TEST_ASSERT(channel_get_remote_pcp(&ch, 5, &got), "PCP 5 retrievable after eviction");
+    unsigned char a[33], b[33]; size_t al = 33, bl = 33;
+    secp256k1_ec_pubkey_serialize(ctx, a, &al, &got,  SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, b, &bl, &pcp5, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(a, b, 33) == 0, "durable PCP matches committed");
+
+    /* verification against the durable record: correct accepted, wrong rejected */
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 5, secret5) == 1,
+                "correct secret verifies against durable PCP");
+    unsigned char wrong[32]; memset(wrong, 0xab, 32);
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 5, wrong) == 0,
+                "wrong secret rejected (durable PCP present)");
+
+    persist_close(&db);
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* === End revocation verification standard tests =========================== */
