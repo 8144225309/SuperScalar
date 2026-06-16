@@ -1233,6 +1233,10 @@ extern int test_persist_htlc_round_trip(void);
 extern int test_persist_htlc_delete(void);
 extern int test_persist_factory_round_trip(void);
 extern int test_persist_multi_channel(void);
+/* #327 at-rest field encryption */
+extern int test_persist_hd_seed_encryption_round_trip(void);
+extern int test_persist_encryption_wrong_key_refused(void);
+extern int test_persist_encryption_disabled_is_plaintext(void);
 
 /* Phase 14: CLN Bridge */
 extern int test_bridge_msg_round_trip(void);
@@ -3072,6 +3076,9 @@ static void run_unit_tests(void) {
     printf("\n=== Persistence (Phase 13) ===\n");
     RUN_TEST(test_persist_open_close);
     RUN_TEST(test_persist_migration_ladder);
+    RUN_TEST(test_persist_hd_seed_encryption_round_trip);
+    RUN_TEST(test_persist_encryption_wrong_key_refused);
+    RUN_TEST(test_persist_encryption_disabled_is_plaintext);
     RUN_TEST(test_persist_ps_subfactory_chain_round_trip);
     RUN_TEST(test_persist_ps_subfactory_chain_v21_round_trip);
     RUN_TEST(test_persist_ps_leaf_chain_v22_poison_round_trip);

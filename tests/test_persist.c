@@ -5099,3 +5099,106 @@ int test_ceremony_helpers_aggregate_hard_guard(void) {
 }
 
 /* === End SF-CEREMONY-HELPERS tests ======================================== */
+
+/* === #327 at-rest field encryption (LND/Core model) ======================= */
+
+/* Crown-jewel: the HD seed must be sealed on disk, round-trip correctly, and
+   survive a close/reopen with the same key. */
+int test_persist_hd_seed_encryption_round_trip(void) {
+    const char *path = "/tmp/test_ss_enc_rt.db";
+    unlink(path);
+    unsigned char root[32]; memset(root, 0xA7, sizeof root);
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(i + 1);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(persist_set_encryption_key(&db, root), "set key");
+    TEST_ASSERT(persist_apply_encryption(&db), "apply enc (fresh)");
+    TEST_ASSERT(persist_db_is_encrypted(&db), "marker set after apply");
+    TEST_ASSERT(persist_save_hd_seed(&db, seed, sizeof seed), "save seed");
+
+    /* on-disk value must be sealed, not raw hex */
+    sqlite3_stmt *st = NULL;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT seed_hex FROM hd_wallet_state WHERE id=1;", -1, &st, NULL) == SQLITE_OK, "prep");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "seed row exists");
+    const char *stored = (const char *)sqlite3_column_text(st, 0);
+    TEST_ASSERT(stored && strncmp(stored, "ssenc1:", 7) == 0, "seed sealed at rest");
+    TEST_ASSERT(strlen(stored) > 7 + 64, "sealed value longer than raw 32B hex");
+    sqlite3_finalize(st);
+
+    unsigned char out[64]; size_t outlen = 0;
+    TEST_ASSERT(persist_load_hd_seed(&db, out, &outlen, sizeof out), "load seed");
+    TEST_ASSERT_EQ(outlen, sizeof seed, "seed len");
+    TEST_ASSERT(memcmp(out, seed, sizeof seed) == 0, "seed bytes match");
+    persist_close(&db);
+
+    /* reopen with the SAME key: token verifies, load still matches */
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen");
+    TEST_ASSERT(persist_set_encryption_key(&db2, root), "set key 2");
+    TEST_ASSERT(persist_apply_encryption(&db2), "apply enc (verify path)");
+    memset(out, 0, sizeof out); outlen = 0;
+    TEST_ASSERT(persist_load_hd_seed(&db2, out, &outlen, sizeof out), "load seed 2");
+    TEST_ASSERT(outlen == sizeof seed && memcmp(out, seed, sizeof seed) == 0,
+                "seed survives close/reopen");
+    persist_close(&db2);
+
+    unlink(path);
+    return 1;
+}
+
+/* Wrong key must FAIL CLOSED (refuse to open), never silently corrupt. */
+int test_persist_encryption_wrong_key_refused(void) {
+    const char *path = "/tmp/test_ss_enc_wrong.db";
+    unlink(path);
+    unsigned char root[32];  memset(root,  0x11, sizeof root);
+    unsigned char wrong[32]; memset(wrong, 0x22, sizeof wrong);
+    unsigned char seed[32];  memset(seed,  0x5e, sizeof seed);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(persist_set_encryption_key(&db, root), "set key");
+    TEST_ASSERT(persist_apply_encryption(&db), "apply");
+    TEST_ASSERT(persist_save_hd_seed(&db, seed, sizeof seed), "save");
+    persist_close(&db);
+
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen");
+    TEST_ASSERT(persist_set_encryption_key(&db2, wrong), "set wrong key");
+    TEST_ASSERT(persist_apply_encryption(&db2) == 0, "wrong key must be refused");
+    persist_close(&db2);
+
+    unlink(path);
+    return 1;
+}
+
+/* Keyless (regtest/tests): seed stays plaintext, round-trips — proves existing
+   suites are unaffected by the feature when no key is installed. */
+int test_persist_encryption_disabled_is_plaintext(void) {
+    const char *path = "/tmp/test_ss_enc_off.db";
+    unlink(path);
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0xF0 + i);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    /* no persist_set_encryption_key -> encryption off */
+    TEST_ASSERT(persist_save_hd_seed(&db, seed, sizeof seed), "save");
+    sqlite3_stmt *st = NULL;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT seed_hex FROM hd_wallet_state WHERE id=1;", -1, &st, NULL) == SQLITE_OK, "prep");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "row");
+    const char *stored = (const char *)sqlite3_column_text(st, 0);
+    TEST_ASSERT(stored && strncmp(stored, "ssenc1:", 7) != 0, "plaintext when keyless");
+    sqlite3_finalize(st);
+    unsigned char out[64]; size_t outlen = 0;
+    TEST_ASSERT(persist_load_hd_seed(&db, out, &outlen, sizeof out), "load");
+    TEST_ASSERT(outlen == 32 && memcmp(out, seed, 32) == 0, "plaintext round trip");
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* === End #327 at-rest field encryption tests ============================== */

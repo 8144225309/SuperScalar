@@ -1338,6 +1338,20 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v37 (#327): at-rest field-encryption marker + key-verification token.
+       Created unconditionally (idempotent) so both fresh and upgraded DBs carry
+       it; the actual data sealing happens later in persist_apply_encryption(),
+       once the operator key is available (persist_open runs before the key is
+       loaded, so it cannot encrypt here). */
+    sqlite3_exec(p->db,
+        "CREATE TABLE IF NOT EXISTS db_encryption ("
+        "  id      INTEGER PRIMARY KEY CHECK(id=1),"
+        "  enabled INTEGER NOT NULL DEFAULT 0,"
+        "  kdf     TEXT,"
+        "  verify  BLOB"
+        ");",
+        NULL, NULL, NULL);
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1367,6 +1381,12 @@ int persist_open_readonly(persist_t *p, const char *path) {
 }
 
 void persist_close(persist_t *p) {
+    if (p) {
+        /* #327: wipe the in-memory DEK on close (it never touches disk) */
+        volatile unsigned char *z = (volatile unsigned char *)p->dek;
+        for (size_t i = 0; i < sizeof p->dek; i++) z[i] = 0;
+        p->enc_enabled = 0;
+    }
     if (p && p->db) {
         sqlite3_close(p->db);
         p->db = NULL;
@@ -5568,9 +5588,17 @@ int persist_save_hd_seed(persist_t *p,
             "INSERT INTO hd_wallet_state (id, next_index, seed_hex) VALUES (1, 0, ?) "
             "ON CONFLICT(id) DO UPDATE SET seed_hex=excluded.seed_hex;",
             -1, &stmt, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_STATIC);
+    /* #327: seal the seed at rest. persist_seal_text returns strdup(hex) when no
+       key is installed (regtest/tests), so behaviour is unchanged there. */
+    char *stored = persist_seal_text(p, hex);
+    /* hex holds the cleartext seed — wipe our stack copy regardless of outcome */
+    { volatile unsigned char *z = (volatile unsigned char *)hex;
+      for (size_t zi = 0; zi < sizeof hex; zi++) z[zi] = 0; }
+    if (!stored) { sqlite3_finalize(stmt); return 0; }
+    sqlite3_bind_text(stmt, 1, stored, -1, SQLITE_TRANSIENT);
     int ok = sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
+    free(stored);
     return ok;
 }
 
@@ -5585,8 +5613,11 @@ int persist_load_hd_seed(persist_t *p,
             -1, &stmt, NULL) != SQLITE_OK) return 0;
     int found = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *hex = (const char *)sqlite3_column_text(stmt, 0);
-        if (hex) {
+        /* #327: the stored value may be sealed ("ssenc1:"); persist_open_text
+           transparently returns legacy plaintext unchanged when it is not. */
+        const char *stored = (const char *)sqlite3_column_text(stmt, 0);
+        char *hex = NULL;
+        if (stored && persist_open_text(p, stored, &hex) && hex) {
             size_t hex_len = strlen(hex);
             size_t byte_len = hex_len / 2;
             if (byte_len > 0 && byte_len <= seed_cap) {
@@ -5605,6 +5636,10 @@ int persist_load_hd_seed(persist_t *p,
                 *seed_len_out = byte_len;
                 found = 1;
             }
+            /* wipe + free the decrypted cleartext */
+            { volatile unsigned char *z = (volatile unsigned char *)hex;
+              for (size_t zi = 0; zi < hex_len; zi++) z[zi] = 0; }
+            free(hex);
         }
     }
     sqlite3_finalize(stmt);

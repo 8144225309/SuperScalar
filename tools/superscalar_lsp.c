@@ -1386,6 +1386,7 @@ int main(int argc, char *argv[]) {
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
+    int encrypt_db = 0;              /* --encrypt-db: at-rest field encryption (#327; auto-on for mainnet) */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     int test_bad_terms = 0;          /* --test-bad-terms: offer 0 bps profit to verify client rejects */
@@ -1542,6 +1543,8 @@ int main(int argc, char *argv[]) {
             db_path = argv[++i];
         else if (strcmp(argv[i], "--wt-db") == 0 && i + 1 < argc)
             wt_db_path = argv[++i];
+        else if (strcmp(argv[i], "--encrypt-db") == 0)
+            encrypt_db = 1;
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
             network = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
@@ -2321,6 +2324,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* #327a: refuse cmdline --seckey on mainnet. Process args are visible to
+       any local user via `ps` / /proc/<pid>/cmdline and persist in shell
+       history — an unacceptable key-exposure vector for a node holding real
+       funds. Mainnet operators must use the encrypted --keyfile (PBKDF2-600K
+       + AEAD at rest). Regtest/signet/testnet keep --seckey for convenience. */
+    if ((strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0) && seckey_hex) {
+        fprintf(stderr,
+            "Error: --seckey is refused on mainnet (visible via ps / shell history).\n"
+            "Use --keyfile PATH (encrypted at rest); create one with --generate-mnemonic\n"
+            "or --from-mnemonic, optionally protected by --passphrase.\n");
+        return 1;
+    }
+
     /* Mainnet requires --db for revocation secret persistence */
     if (strcmp(network, "mainnet") == 0 && !db_path) {
         fprintf(stderr,
@@ -2637,6 +2653,35 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < 33; i++) printf("%02x", bip39_pub33[i]);
         printf("\n  Proceeding with factory creation using HD-derived key...\n");
         fflush(stdout);
+    }
+
+    /* #327 at-rest field encryption. The DEK is derived from the (now-final) LSP
+       root key; encryption seals secret columns (HD seed today; revocation +
+       channel secrets next). Mainnet always encrypts; elsewhere it is opt-in via
+       --encrypt-db. This must run after the key is final and before any secret
+       column is read or written (recovery's channel init is later). */
+    if (use_db) {
+        int mainnet_db = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
+        if (mainnet_db) encrypt_db = 1;
+        if (encrypt_db) {
+            persist_set_encryption_key(&db, lsp_seckey);
+            if (!persist_apply_encryption(&db)) {
+                fprintf(stderr, "Error: at-rest DB encryption setup/verification failed "
+                                "(wrong --keyfile/passphrase, or corrupt DB).\n");
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("LSP: at-rest DB field encryption enabled\n");
+        } else if (persist_db_is_encrypted(&db)) {
+            fprintf(stderr, "Error: %s is encrypted at rest but encryption was not enabled.\n"
+                            "       Re-run with --encrypt-db and the matching --keyfile.\n", db_path);
+            persist_close(&db);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* Initialize bitcoin-cli connection */

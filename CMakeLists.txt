@@ -144,6 +144,7 @@ add_library(superscalar
     src/lsp_demo.c
     src/report.c
     src/persist.c
+    src/persist_crypto.c
     src/persist_wt.c
     src/lsp_wt.c
     src/bridge.c
