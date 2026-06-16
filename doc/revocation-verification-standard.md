@@ -109,3 +109,47 @@ the bogus secret and bounces — they keep money they shouldn't.
 mathematically verified against the exact state it claims to retire, using a record
 written durably to disk. If it doesn't verify, we refuse it and treat the channel as
 breached. A valid punishment can always be built; neither side can cheat the other.
+
+## 8. All three actors must verify at every step
+
+The shared verifier (`channel_verify_revocation_secret` in `channel.c`) + the choke point
+(`channel_receive_revocation_flat`) give **all three actors the capability** to verify.
+Status of each, as of this branch:
+
+| Step | LSP | Client (user) | Watchtower |
+|---|---|---|---|
+| Counterparty commitment signature | ✅ | ✅ `channel_verify_and_aggregate_commitment_sig` | n/a (pre-signed) |
+| **Counterparty revocation secret** | ✅ Phase 2, fail-closed | ❌ **drops `0x50`**, no LSP-PCP tracking past cn 0/1 | ✅ transitive — only ever reads secrets verified at store time; hydrate uses pre-signed penalty TXs, never raw secrets |
+| Funding on-chain | gated | warn + hard-gated on prod (#197) | (uses pre-signed) |
+| Ceremony / MuSig | ✅ | ✅ (participates) | n/a |
+
+**LSP — done.** Verifies client revocations at the choke point, fail-closed (Phases 1–2,
+tested green).
+
+**Watchtower — covered (transitive), no change needed.** Post-Phase-2 every secret in
+`received_revocations` was verified when stored; the standalone WT hydrate path
+(`wt_hydrate_row_cb`) loads pre-signed penalty TXs, so it never trusts a raw, unverified
+secret. (A belt-and-suspenders verify-on-ingest is a possible hardening, not a gap.)
+
+**Client — the remaining gap.** It holds the verification capability and verifies the LSP's
+commitment *signatures*, but it **discards the LSP's `revoke_and_ack` (`0x50`)** and tracks
+the LSP's per-commitment point only for commitments 0 and 1. So today the client cannot
+itself detect an LSP breach — that protection lives entirely in the standalone watchtower +
+self-exit.
+
+### Client implementation plan (focused next piece)
+1. Add `client_handle_lsp_revoke_and_ack(ch, ctx, msg)` mirroring the LSP handler:
+   parse → `channel_verify_revocation_secret(ch, cn-1, secret)` → on fail, reject + fail the
+   channel (BOLT-2) → `channel_receive_revocation` (store) → set the LSP's next per-commitment
+   point from the message (enabling ongoing tracking; the message already carries it — the
+   client currently throws it away).
+2. **Map the client's real payment commitment flow first.** `client_handle_commitment_signed`
+   is only called on reconnect (`client_reconnect.c:327`); the normal path is LSP-driven and
+   multi-loop, and `0x50` is intentionally skipped in the setup/ceremony loops. The handler
+   must be wired into the actual payment exchange, not the setup loops — this needs the client
+   message architecture mapped before touching it (delicate; mis-wiring risks breaking
+   payments).
+3. Tests: client rejects a garbage LSP revocation (fail-closed) and retains/verifies a correct
+   one across many commitments; existing client/reconnect suites stay green.
+4. Design note: the client retaining LSP revocations enables self-detection; whether it
+   self-penalizes or hands secrets to its watchtower is a separate (existing) concern.
