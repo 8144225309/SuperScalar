@@ -1228,6 +1228,7 @@ extern int test_persist_channel_round_trip(void);
 extern int test_persist_revocation_round_trip(void);
 extern int test_channel_revocation_durable_pcp_verify(void);  /* revocation-verify Phase 1 */
 extern int test_channel_revocation_failclosed(void);          /* revocation-verify Phase 2 */
+extern int test_client_verifies_lsp_revocation(void);         /* revocation-verify client side */
 extern int test_persist_watchtower_hydrate_round_trip(void);
 extern int test_persist_htlc_round_trip(void);
 extern int test_persist_htlc_delete(void);
@@ -3108,6 +3109,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_revocation_round_trip);
     RUN_TEST(test_channel_revocation_durable_pcp_verify);
     RUN_TEST(test_channel_revocation_failclosed);
+    RUN_TEST(test_client_verifies_lsp_revocation);
     RUN_TEST(test_persist_watchtower_hydrate_round_trip);
     RUN_TEST(test_persist_htlc_round_trip);
     RUN_TEST(test_persist_htlc_delete);

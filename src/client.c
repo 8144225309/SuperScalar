@@ -405,6 +405,45 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     return ok;
 }
 
+int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
+                                       const wire_msg_t *msg) {
+    if (!ch || !msg) return 0;
+    uint32_t cid;
+    unsigned char rev_secret[32], next_point[33];
+    if (!wire_parse_revoke_and_ack(msg->json, &cid, rev_secret, next_point))
+        return 0;
+
+    /* At commitment 0 there is no prior LSP commitment to revoke yet. */
+    if (ch->commitment_number == 0) {
+        volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+        for (int i = 0; i < 32; i++) z[i] = 0;
+        return 1;
+    }
+
+    uint64_t old_cn = ch->commitment_number - 1;
+    /* Verify the LSP's secret against the LSP's committed point (secret*G ==
+       committed_PCP). channel_verify_revocation_secret consults the durable
+       record, and the choke point re-verifies on store — fail closed. */
+    if (!channel_verify_revocation_secret(ch, old_cn, rev_secret)) {
+        fprintf(stderr, "Client: INVALID LSP revocation secret (commitment %llu) "
+                "— rejecting (fail-closed)\n", (unsigned long long)old_cn);
+        volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+        for (int i = 0; i < 32; i++) z[i] = 0;
+        return 0;
+    }
+    channel_receive_revocation(ch, old_cn, rev_secret);
+    { volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+      for (int i = 0; i < 32; i++) z[i] = 0; }
+
+    /* Track the LSP's NEXT per-commitment point (carried in this message) so
+       subsequent LSP revocations remain verifiable. The client used to discard
+       this. */
+    secp256k1_pubkey next_pcp;
+    if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_point, 33))
+        channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+    return 1;
+}
+
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
     uint64_t htlc_id, amount_msat;
     unsigned char payment_hash[32];

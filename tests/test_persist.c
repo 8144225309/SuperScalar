@@ -16,6 +16,8 @@
 #include "superscalar/channel.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/dw_state.h"
+#include "superscalar/client.h"   /* client_handle_lsp_revoke_and_ack (revocation-verify) */
+#include "superscalar/wire.h"     /* wire_build_revoke_and_ack, wire_msg_t */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5089,6 +5091,48 @@ int test_channel_revocation_failclosed(void) {
 
     free(ch.received_revocations);
     free(ch.received_revocation_valid);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The CLIENT (user) verifies the LSP's revocation at the revocation step:
+   a correct LSP secret is verified + retained; a garbage one is rejected and
+   never stored. Proves the user's side of "verify everything". */
+int test_client_verifies_lsp_revocation(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* LSP's committed point for commitment 0 = lsp_secret0 * G */
+    unsigned char lsp_secret0[32]; memset(lsp_secret0, 0, 32); lsp_secret0[31] = 9;
+    secp256k1_pubkey lsp_pcp0;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pcp0, lsp_secret0), "lsp_pcp0");
+    unsigned char nx[32]; memset(nx, 0, 32); nx[31] = 11;
+    secp256k1_pubkey next_pcp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &next_pcp, nx), "next_pcp");
+
+    /* (1) correct LSP revocation -> verified + retained */
+    channel_t ch; memset(&ch, 0, sizeof ch); ch.ctx = ctx; ch.commitment_number = 1;
+    channel_set_remote_pcp(&ch, 0, &lsp_pcp0);
+    cJSON *good = wire_build_revoke_and_ack(7, lsp_secret0, ctx, &next_pcp);
+    wire_msg_t m; m.msg_type = MSG_LSP_REVOKE_AND_ACK; m.json = good;
+    TEST_ASSERT(client_handle_lsp_revoke_and_ack(&ch, ctx, &m) == 1, "correct LSP revocation accepted");
+    cJSON_Delete(good);
+    unsigned char got[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 0, got) == 1 && memcmp(got, lsp_secret0, 32) == 0,
+                "LSP secret retained");
+
+    /* (2) garbage LSP revocation -> rejected (fail-closed), never stored */
+    channel_t ch2; memset(&ch2, 0, sizeof ch2); ch2.ctx = ctx; ch2.commitment_number = 1;
+    channel_set_remote_pcp(&ch2, 0, &lsp_pcp0);
+    unsigned char garbage[32]; memset(garbage, 0xde, 32);
+    cJSON *bad = wire_build_revoke_and_ack(7, garbage, ctx, &next_pcp);
+    wire_msg_t mb; mb.msg_type = MSG_LSP_REVOKE_AND_ACK; mb.json = bad;
+    TEST_ASSERT(client_handle_lsp_revoke_and_ack(&ch2, ctx, &mb) == 0, "garbage LSP revocation rejected");
+    cJSON_Delete(bad);
+    TEST_ASSERT(channel_get_received_revocation(&ch2, 0, got) == 0, "garbage not stored");
+
+    free(ch.received_revocations);  free(ch.received_revocation_valid);
+    free(ch2.received_revocations); free(ch2.received_revocation_valid);
     secp256k1_context_destroy(ctx);
     return 1;
 }

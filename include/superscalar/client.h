@@ -136,6 +136,16 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
                                       secp256k1_context *ctx,
                                       const wire_msg_t *msg);
 
+/* Revocation-verification standard (client side): verify the LSP's revealed
+   per-commitment secret against the LSP's committed per-commitment point, then
+   retain it (so the user can detect an LSP breach) and track the LSP's next
+   point. Mirrors the LSP-side handler. Returns 1 on success (verified+stored, or
+   nothing to revoke yet at commitment 0); 0 if the secret is invalid (caller
+   should fail the channel) or the message is malformed. See
+   doc/revocation-verification-standard.md. */
+int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
+                                       const wire_msg_t *msg);
+
 /* Handle incoming ADD_HTLC from LSP (we are the payee).
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
