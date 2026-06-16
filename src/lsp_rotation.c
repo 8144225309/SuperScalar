@@ -96,6 +96,50 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
     uint32_t dying_id = dying->factory_id;
+
+    /* #332 restart-resume idempotency guard.  On a crash mid-rotation AFTER the
+       Phase B cooperative close was broadcast but BEFORE the ROTATE ceremony
+       reached FINALIZED, a restart re-enters here via the daemon retry path
+       (the factory is still DYING and the in-memory retry/attempt state was
+       reset by the fresh process).  Re-running Phase B would rebuild a
+       DIFFERENT close (fresh wallet address) and rebroadcast it — a double-spend
+       the mempool rejects — and Phase C could re-fund a SECOND replacement
+       factory from the LSP wallet, stranding LSP liquidity.  If the dying
+       factory's funding outpoint is already spent, the close already happened:
+       complete idempotently (retire + clear retry state) instead of re-running
+       the ceremony.  Fail OPEN — act only on a DEFINITIVE spent (0); proceed
+       normally on unspent (1) or unknown/error/unimplemented (-1) so a transient
+       chain hiccup can never block a legitimate rotation. */
+    if (dying->is_funded) {
+        regtest_t *grt = mgr->watchtower ? mgr->watchtower->rt : NULL;
+        chain_backend_t *gchain = (chain_backend_t *)mgr->chain_be;
+        if (grt || (gchain && gchain->is_outpoint_unspent)) {
+            /* funding_txid is stored internal-order; the display txid that
+               gettxout expects is the byte-reverse (see factory_recovery.c). */
+            unsigned char rb[32];
+            char fund_disp[65];
+            memcpy(rb, dying->factory.funding_txid, 32);
+            for (int bi = 0; bi < 16; bi++) {
+                unsigned char tmp = rb[bi]; rb[bi] = rb[31 - bi]; rb[31 - bi] = tmp;
+            }
+            for (int bi = 0; bi < 32; bi++)
+                snprintf(fund_disp + bi * 2, 3, "%02x", rb[bi]);
+            int unspent = (gchain && gchain->is_outpoint_unspent)
+                ? gchain->is_outpoint_unspent(gchain, fund_disp, dying->factory.funding_vout)
+                : regtest_outpoint_unspent(grt, fund_disp, dying->factory.funding_vout);
+            if (unspent == 0) {
+                printf("LSP rotate: factory %u funding %s:%u already spent — a prior "
+                       "attempt already broadcast the close; completing rotation "
+                       "idempotently (no re-broadcast, no re-fund)\n",
+                       dying_id, fund_disp, dying->factory.funding_vout);
+                fflush(stdout);
+                dying->partial_rotation_done = 1;             /* drop from rotation candidates */
+                lsp_rotation_record_success(mgr, dying_id);   /* clear retry/attempt state */
+                return 1;                                     /* fund-safe idempotent success */
+            }
+        }
+    }
+
     printf("LSP rotate: starting rotation for factory %u\n", dying_id);
     fflush(stdout);
 
@@ -681,6 +725,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         printf("LSP rotate: factory %u closed: %s\n", dying_id, rc_txid);
         /* Mark as rotated so CLI "rotate" won't try to rotate it again */
         dying->partial_rotation_done = 1;
+        /* #332 restart-resume drill checkpoint: the close is broadcast +
+           confirmed (funding now spent on-chain) but the replacement factory
+           has NOT been created/persisted yet.  A crash here leaves the DB
+           showing this factory still DYING with its now-spent funding, so the
+           restart retry path re-enters rotation and MUST take the already-spent
+           idempotency guard above (no re-close, no re-fund). */
+        lsp_crash_checkpoint("rotate_close_broadcast");
         /* CL4-rollover (#250): the mid-window adversarial broadcast that
            used to live here was dead code on the regtest test path —
            lsp_channels_rotate_factory only runs under --daemon (mgr->
