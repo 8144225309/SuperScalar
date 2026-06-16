@@ -326,9 +326,9 @@ PARTICIPATED=0
 MISSING_CLIENTS=()
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     LOG="$TMPDIR/client_${i}.log"
-    # Each client logs "persisted factory + channel + basepoints to DB" once
+    # Each client logs "persisted factory + channel + basepoints ... to DB" once
     # the MuSig ceremony for the factory completes successfully on its side.
-    if grep -q "persisted factory + channel + basepoints to DB" "$LOG"; then
+    if grep -q "persisted factory + channel + basepoints" "$LOG"; then
         PARTICIPATED=$((PARTICIPATED + 1))
         # Pull the client's index as the LSP saw it (helpful for debugging).
         IDX=$(grep -oE "Client [0-9]+: persisted factory" "$LOG" | head -1 | \
