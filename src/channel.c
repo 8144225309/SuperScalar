@@ -602,8 +602,16 @@ int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_nu
         return 0;  /* not a valid scalar — always reject */
 
     secp256k1_pubkey committed;
-    if (!channel_get_remote_pcp(ch, commitment_num, &committed))
-        return 1;  /* PHASE 1: no committed PCP retrievable — accept on trust */
+    if (!channel_get_remote_pcp(ch, commitment_num, &committed)) {
+        /* PHASE 2 — fail closed: a revocation we cannot check against a committed
+           point is never trusted (storing it would arm a broken penalty). Phase 1
+           durable persistence ensures a legitimate revocation always has a
+           retrievable point, so this branch means a protocol desync or an attack. */
+        fprintf(stderr, "channel: revocation for commitment %llu has no retrievable "
+                "committed point — refusing (fail-closed)\n",
+                (unsigned long long)commitment_num);
+        return 0;
+    }
 
     unsigned char d_ser[33], c_ser[33];
     size_t dlen = 33, clen = 33;
@@ -616,6 +624,17 @@ int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_nu
 
 int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
                                       const unsigned char *secret32) {
+    /* Revocation-verification standard (choke point): EVERY received revocation
+       secret — via any path (LSP handlers, htlc_commit, client, bridge) — is
+       verified here against the peer's committed point before it is stored. A
+       secret that doesn't match is rejected and NOT stored, so a broken penalty
+       can never be armed and the caller can fail the channel (BOLT-2). */
+    if (!channel_verify_revocation_secret(ch, commitment_num, secret32)) {
+        fprintf(stderr, "channel: REJECTED revocation secret for commitment %llu "
+                "(does not match committed point) — not stored\n",
+                (unsigned long long)commitment_num);
+        return 0;
+    }
     if (!channel_ensure_revocations_cap(ch, (size_t)(commitment_num + 1))) return 0;
     memcpy(ch->received_revocations[commitment_num], secret32, 32);
     ch->received_revocation_valid[commitment_num] = 1;

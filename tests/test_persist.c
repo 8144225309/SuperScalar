@@ -5050,4 +5050,41 @@ int test_channel_revocation_durable_pcp_verify(void) {
     return 1;
 }
 
+/* Phase 2: verification is enforced at the choke point and fails closed —
+   unverifiable/mismatched secrets are rejected and never stored. */
+int test_channel_revocation_failclosed(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    memset(&ch, 0, sizeof ch);
+    ch.ctx = ctx;   /* no persist_db, no window — no committed point anywhere */
+
+    unsigned char any[32]; memset(any, 7, 32);
+    /* (1) no committed point -> verifier fails closed (was: accept-on-trust) */
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 0, any) == 0, "no PCP -> fail closed");
+    /* (2) choke point refuses to store an unverifiable secret */
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 0, any) == 0, "choke point rejects unverifiable");
+    TEST_ASSERT(channel_get_received_revocation(&ch, 0, any) == 0, "nothing stored");
+
+    /* (3) with a committed point for cn=3: wrong rejected (not stored), correct stored */
+    unsigned char s3[32]; memset(s3, 0, 32); s3[31] = 3;
+    secp256k1_pubkey p3;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p3, s3), "p3");
+    channel_set_remote_pcp(&ch, 3, &p3);
+
+    unsigned char wrong[32]; memset(wrong, 0xcd, 32);
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 3, wrong) == 0, "wrong secret rejected at choke point");
+    unsigned char got[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 3, got) == 0, "wrong secret NOT stored");
+
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 3, s3) == 1, "correct secret accepted");
+    TEST_ASSERT(channel_get_received_revocation(&ch, 3, got) == 1 && memcmp(got, s3, 32) == 0,
+                "correct secret stored");
+
+    free(ch.received_revocations);
+    free(ch.received_revocation_valid);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* === End revocation verification standard tests =========================== */

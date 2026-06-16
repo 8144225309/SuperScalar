@@ -149,8 +149,11 @@ static int recv_revoke_and_ack(peer_mgr_t *mgr, int peer_idx,
     const unsigned char *peer_pcs      = buf + 34; /* after type(2) + channel_id(32) */
     const unsigned char *next_pcp_wire = buf + 66; /* after + pcs(32) */
 
-    if (ch->commitment_number > 0)
-        channel_receive_revocation_flat(ch, ch->commitment_number - 1, peer_pcs);
+    if (ch->commitment_number > 0 &&
+        !channel_receive_revocation_flat(ch, ch->commitment_number - 1, peer_pcs)) {
+        fprintf(stderr, "htlc_commit: peer revocation failed verification — failing update\n");
+        return 0;
+    }
 
     secp256k1_pubkey next_pcp;
     if (!secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_pcp_wire, 33)) return 0;
@@ -661,9 +664,12 @@ int htlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
         const unsigned char *peer_pcs      = payload + 32;
         const unsigned char *next_pcp_wire = payload + 64;
 
-        if (ch->commitment_number > 0)
-            channel_receive_revocation_flat(ch, ch->commitment_number - 1,
-                                             peer_pcs);
+        if (ch->commitment_number > 0 &&
+            !channel_receive_revocation_flat(ch, ch->commitment_number - 1,
+                                             peer_pcs)) {
+            fprintf(stderr, "htlc_commit: peer revocation failed verification — failing update\n");
+            return -1;
+        }
 
         secp256k1_pubkey next_pcp;
         if (!secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_pcp_wire, 33))
