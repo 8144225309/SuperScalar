@@ -651,7 +651,13 @@ int test_persist_watchtower_hydrate_round_trip(void) {
     unsigned char rev0[32], rev1[32];
     memset(rev0, 0x55, 32);
     memset(rev1, 0x66, 32);
+    /* revocation-verify: committed points (secret*G) must match the secrets */
+    secp256k1_pubkey hvp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &hvp, rev0), "hvp0");
+    channel_set_remote_pcp(&ch, 0, &hvp);
     TEST_ASSERT(channel_receive_revocation(&ch, 0, rev0), "recv rev0");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &hvp, rev1), "hvp1");
+    channel_set_remote_pcp(&ch, 1, &hvp);
     TEST_ASSERT(channel_receive_revocation(&ch, 1, rev1), "recv rev1");
 
     /* persist_list_channel_ids finds our saved channel */

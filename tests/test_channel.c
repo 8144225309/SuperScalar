@@ -1774,6 +1774,10 @@ int test_htlc_penalty(void) {
     unsigned char secret0[32];
     TEST_ASSERT(channel_get_revocation_secret(&local_ch, 1, secret0),
                 "get revocation secret");  /* commitment #1 which was the HTLC commit */
+    /* revocation-verify: committed point for cn #1 (= secret0*G) must be in-window */
+    secp256k1_pubkey rvp1;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &rvp1, secret0), "rvp1");
+    channel_set_remote_pcp(&remote_ch, 1, &rvp1);
     TEST_ASSERT(channel_receive_revocation(&remote_ch, 1, secret0),
                 "remote receive revocation");
 
@@ -4299,6 +4303,10 @@ int test_channel_dynamic_growth(void) {
 
     /* Verify revocations grow too */
     unsigned char rev_secret[32] = { [0 ... 31] = 0xAA };
+    /* revocation-verify: committed point for cn 600 (= rev_secret*G) in-window */
+    secp256k1_pubkey rvp600;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &rvp600, rev_secret), "rvp600");
+    channel_set_remote_pcp(&ch, 600, &rvp600);
     TEST_ASSERT(channel_receive_revocation_flat(&ch, 600, rev_secret),
                 "receive revocation at 600");
     TEST_ASSERT(ch.revocations_cap >= 1024, "rev cap grew to >= 1024");

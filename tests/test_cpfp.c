@@ -130,7 +130,15 @@ int test_penalty_tx_has_anchor(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
+    /* revocation-verify: the committed point (secret*G) for cn #0 was evicted
+       from the 2-slot window by setting pcp #2 above; restore it so the receive
+       can verify. (Production attaches a DB and never needs this re-set.) */
+    secp256k1_pubkey rvp;
+    secp256k1_ec_pubkey_create(ctx, &rvp, client_secret0);
+    channel_set_remote_pcp(&lsp_ch, 0, &rvp);
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
+    secp256k1_ec_pubkey_create(ctx, &rvp, lsp_secret0);
+    channel_set_remote_pcp(&client_ch, 0, &rvp);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
     /* Build local commitment #0 to get to_local SPK */
@@ -247,7 +255,14 @@ int test_htlc_penalty_tx_has_anchor(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
+    /* revocation-verify: restore the committed point (secret*G) for cn #0,
+       evicted from the 2-slot window by pcp #2 above, so the receive verifies. */
+    secp256k1_pubkey rvp;
+    secp256k1_ec_pubkey_create(ctx, &rvp, client_secret0);
+    channel_set_remote_pcp(&lsp_ch, 0, &rvp);
     channel_receive_revocation(&lsp_ch, 0, client_secret0);
+    secp256k1_ec_pubkey_create(ctx, &rvp, lsp_secret0);
+    channel_set_remote_pcp(&client_ch, 0, &rvp);
     channel_receive_revocation(&client_ch, 0, lsp_secret0);
 
     /* Get the HTLC output info from the old commitment.
