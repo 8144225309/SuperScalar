@@ -18,6 +18,7 @@
 #include "superscalar/dw_state.h"
 #include "superscalar/client.h"   /* client_handle_lsp_revoke_and_ack (revocation-verify) */
 #include "superscalar/wire.h"     /* wire_build_revoke_and_ack, wire_msg_t */
+#include "superscalar/crash_inject.h"  /* #9 cheat-gate */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5134,6 +5135,18 @@ int test_client_verifies_lsp_revocation(void) {
     free(ch.received_revocations);  free(ch.received_revocation_valid);
     free(ch2.received_revocations); free(ch2.received_revocation_valid);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* #9 cheat-gate: defense-bypass cheats are inert by default (fail-safe) and
+   only allowed when the gate is set for regtest. */
+int test_cheat_gate(void) {
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "gate off -> cheats not allowed");
+    superscalar_set_cheat_gate(1);
+    TEST_ASSERT(superscalar_cheat_allowed() == 1, "gate on (regtest) -> cheats allowed");
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "gate reset -> cheats not allowed");
     return 1;
 }
 

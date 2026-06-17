@@ -14,6 +14,7 @@
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
 #include "superscalar/log.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #ifdef __linux__
 #include <syslog.h>
 #endif
@@ -2113,6 +2114,9 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+    /* #9 cheat-gate: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are inert
+       unless this is regtest, even if the env var is set directly. */
+    superscalar_set_cheat_gate(is_regtest);
 
     /* Redirect logs if requested */
     if (log_file_path) {
@@ -2315,6 +2319,20 @@ int main(int argc, char *argv[]) {
             "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
             "If you understand this risk, pass --i-accept-the-risk\n");
         return 1;
+    }
+
+    /* #9: refuse ALL test/cheat scaffolding flags on mainnet (footgun guard on
+       top of --i-accept-the-risk). Detection cheats are self-harming and
+       defense-bypass cheats are theft; neither belongs on a mainnet node. */
+    if (strcmp(network, "mainnet") == 0) {
+        for (int ci = 1; ci < argc; ci++) {
+            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
+                strncmp(argv[ci], "--test-", 7) == 0) {
+                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
+                        "refused on mainnet.\n", argv[ci]);
+                return 1;
+            }
+        }
     }
 
     /* Mainnet requires --db for revocation secret persistence */

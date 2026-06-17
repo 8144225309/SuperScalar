@@ -4,6 +4,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/factory.h"
 #include "superscalar/report.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/adaptor.h"
@@ -2393,6 +2394,20 @@ int main(int argc, char *argv[]) {
     }
     if (use_json_log)
         ss_log_set_json(1);
+
+    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
+       test/cheat scaffolding flags on mainnet (footgun guard). */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    if (strcmp(network, "mainnet") == 0) {
+        for (int ci = 1; ci < argc; ci++) {
+            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
+                strncmp(argv[ci], "--test-", 7) == 0) {
+                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
+                        "refused on mainnet.\n", argv[ci]);
+                return 1;
+            }
+        }
+    }
 
     /* --- Validate fee rate floor --- */
     if ((uint64_t)fee_rate < FEE_FLOOR_SAT_PER_KVB) {

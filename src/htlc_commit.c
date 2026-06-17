@@ -17,6 +17,7 @@
 
 #include "superscalar/htlc_commit.h"
 #include "superscalar/channel.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -368,7 +369,10 @@ int htlc_commit_recv_update_fee(channel_t *ch,
        the HTLC into commit fees at force-close. This MUST only fire in
        cheat-engine test runs (env var gated). Markers: LSP-CHEAT-DUST. */
     const char *cheat = getenv("SS_CHEAT_DUST_RACE");
-    int cheat_active = (cheat && cheat[0] && cheat[0] != '0');
+    /* #9 cheat-gate: this is a defense BYPASS (strands counterparty HTLC sweeps
+       below dust so the LSP absorbs them). Honor it ONLY on regtest — even a
+       directly-set env var is inert on signet/testnet/mainnet (gate default 0). */
+    int cheat_active = (cheat && cheat[0] && cheat[0] != '0') && superscalar_cheat_allowed();
 
     for (size_t i = 0; i < ch->n_htlcs; i++) {
         if (ch->htlcs[i].state != HTLC_STATE_ACTIVE) continue;
