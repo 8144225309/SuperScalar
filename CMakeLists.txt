@@ -296,6 +296,7 @@ add_executable(test_superscalar
     tests/test_economic_correctness.c
     tests/test_regtest_hybrid_cln.c
     tests/test_persist.c
+    tests/test_adversarial_verify.c
     tests/test_persist_wt.c
     tests/test_bridge.c
     tests/test_daemon.c

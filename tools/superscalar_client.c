@@ -4,6 +4,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/factory.h"
 #include "superscalar/report.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/adaptor.h"
@@ -744,16 +745,22 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         cJSON_Delete(rev_msg.json);
         return;
     }
-    uint32_t rev_chan_id;
-    unsigned char lsp_rev_secret[32], lsp_next_point[33];
-    if (wire_parse_revoke_and_ack(rev_msg.json, &rev_chan_id,
-                                    lsp_rev_secret, lsp_next_point)) {
+    /* Revocation-verification standard (client side): verify + retain the LSP's
+       revocation via the shared, tested handler (fail-closed). It checks
+       secret*G == the LSP's committed point, stores the secret, and tracks the
+       LSP's next per-commitment point. If verification fails we must NOT arm the
+       watchtower from a bad secret (it would build a penalty that can't spend). */
+    if (!client_handle_lsp_revoke_and_ack(ch, ctx, &rev_msg)) {
+        fprintf(stderr, "Client %u: LSP revocation FAILED verification "
+                "— refusing (penalty NOT armed)\n", my_index);
+        cJSON_Delete(rev_msg.json);
+        return;
+    }
+    if (ch->commitment_number > 0) {
         uint64_t old_cn = ch->commitment_number - 1;
-        channel_receive_revocation(ch, old_cn, lsp_rev_secret);
 
-        /* Register with client watchtower using the OLD commitment's amounts.
-           Use local channel index 0 (not the LSP's factory-wide rev_chan_id)
-           because the client watchtower has only one channel at index 0. */
+        /* Arm the client watchtower with the now-verified revoked commitment.
+           Local channel index 0 (the client watchtower has one channel). */
         if (cbd && cbd->wt) {
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 0, old_cn,
@@ -762,45 +769,31 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
                 /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
         }
 
-        /* Store LSP's next per-commitment point */
-        secp256k1_pubkey next_pcp;
-        if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, lsp_next_point, 33)) {
-            channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
-            /* Persist both current and next remote PCPs for crash recovery */
-            if (cbd && cbd->db) {
-                unsigned char ser[33];
-                size_t slen = 33;
-                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &next_pcp,
-                                               SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0,
-                    ch->commitment_number + 1, ser);
-                /* Also persist the current PCP (may have just been set) */
-                secp256k1_pubkey cur_pcp;
-                if (channel_get_remote_pcp(ch, ch->commitment_number, &cur_pcp)) {
-                    slen = 33;
-                    secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &cur_pcp,
-                                                   SECP256K1_EC_COMPRESSED);
-                    persist_save_remote_pcp(cbd->db, 0,
-                        ch->commitment_number, ser);
-                }
-            }
-        }
-
-        /* Persist our own local PCS so they survive crash/reconnect.
-           Without this, reconnect generates new random PCS that don't
-           match the PCPs the LSP has stored, breaking sig verification. */
+        /* Persist remote PCPs (handler set the next one in-memory) + local PCS
+           for crash recovery. */
         if (cbd && cbd->db) {
+            unsigned char ser[33];
+            size_t slen;
+            secp256k1_pubkey pcp;
+            if (channel_get_remote_pcp(ch, ch->commitment_number + 1, &pcp)) {
+                slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
+            }
+            if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
+                slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
+            }
             unsigned char pcs[32];
             if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
-                persist_save_local_pcs(cbd->db, 0,
-                    ch->commitment_number, pcs);
+                persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
             if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
-                persist_save_local_pcs(cbd->db, 0,
-                    ch->commitment_number + 1, pcs);
+                persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
             memset(pcs, 0, 32);
         }
-
-        memset(lsp_rev_secret, 0, 32);
     }
     cJSON_Delete(rev_msg.json);
 }
@@ -1138,6 +1131,32 @@ handle_message:
                         uint64_t fee_msat = (htlc_msat * cbd->routing_fee_ppm
                                               + 999999) / 1000000;
                         cbd->tracked_fees_sats += (fee_msat + 999) / 1000;
+                    }
+                }
+            }
+            /* ADV Phase 5a (defense-in-depth): for a RECEIVED payment HTLC (not a
+               settlement, not us-as-sender), the payment_hash should match an
+               invoice WE issued — otherwise we hold the preimage for nothing and
+               cannot claim it (it simply times back to the LSP; no fund risk to
+               us). Warn for observability; no refusal. */
+            {
+                cJSON *dest_j = cJSON_GetObjectItem(msg.json, "dest_client");
+                cJSON *hash_j = cJSON_GetObjectItem(msg.json, "payment_hash");
+                if (!dest_j && !is_settlement_htlc && hash_j && cJSON_IsString(hash_j) && cbd) {
+                    unsigned char hh[32];
+                    if (hex_decode(hash_j->valuestring, hh, 32) == 32) {
+                        int known = 0;
+                        for (size_t inv = 0; inv < cbd->n_invoices; inv++) {
+                            if (cbd->invoices[inv].active &&
+                                memcmp(cbd->invoices[inv].payment_hash, hh, 32) == 0) {
+                                known = 1; break;
+                            }
+                        }
+                        if (!known) {
+                            fprintf(stderr, "Client %u: WARNING — received add_htlc "
+                                    "payment_hash matches no invoice we issued; cannot "
+                                    "claim it (will time back to the LSP)\n", my_index);
+                        }
                     }
                 }
             }
@@ -2479,6 +2498,20 @@ int main(int argc, char *argv[]) {
     }
     if (use_json_log)
         ss_log_set_json(1);
+
+    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
+       test/cheat scaffolding flags on mainnet (footgun guard). */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    if (strcmp(network, "mainnet") == 0) {
+        for (int ci = 1; ci < argc; ci++) {
+            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
+                strncmp(argv[ci], "--test-", 7) == 0) {
+                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
+                        "refused on mainnet.\n", argv[ci]);
+                return 1;
+            }
+        }
+    }
 
     /* --- Validate fee rate floor --- */
     if ((uint64_t)fee_rate < FEE_FLOOR_SAT_PER_KVB) {

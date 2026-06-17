@@ -34,4 +34,16 @@ void lsp_crash_checkpoint(const char *name);
    THREAD UNSAFE -- for single-process test harness only. */
 void lsp_crash_set_target(const char *name);
 
+/* #9 cheat-gate: defense-BYPASS cheats (e.g. SS_CHEAT_DUST_RACE, which strands
+   counterparty HTLCs to absorb them at force-close) must NEVER fire on a real
+   network. The binary calls superscalar_set_cheat_gate(is_regtest) at startup;
+   library cheat sites call superscalar_cheat_allowed() IN ADDITION to their
+   env-var check, so a directly-set SS_CHEAT_* env var is inert unless the node
+   runs on regtest. Default (gate never set) is 0 = NOT allowed (fail-safe).
+   Detection-only cheats (broadcast-revoked-state, self-harming) are handled
+   separately by refusing the cheat/test scaffolding flags on mainnet at
+   arg-parse. */
+void superscalar_set_cheat_gate(int is_regtest);
+int  superscalar_cheat_allowed(void);
+
 #endif /* SUPERSCALAR_CRASH_INJECT_H */

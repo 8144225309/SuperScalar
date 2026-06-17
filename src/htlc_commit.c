@@ -17,6 +17,7 @@
 
 #include "superscalar/htlc_commit.h"
 #include "superscalar/channel.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -149,8 +150,11 @@ static int recv_revoke_and_ack(peer_mgr_t *mgr, int peer_idx,
     const unsigned char *peer_pcs      = buf + 34; /* after type(2) + channel_id(32) */
     const unsigned char *next_pcp_wire = buf + 66; /* after + pcs(32) */
 
-    if (ch->commitment_number > 0)
-        channel_receive_revocation_flat(ch, ch->commitment_number - 1, peer_pcs);
+    if (ch->commitment_number > 0 &&
+        !channel_receive_revocation_flat(ch, ch->commitment_number - 1, peer_pcs)) {
+        fprintf(stderr, "htlc_commit: peer revocation failed verification — failing update\n");
+        return 0;
+    }
 
     secp256k1_pubkey next_pcp;
     if (!secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_pcp_wire, 33)) return 0;
@@ -365,7 +369,10 @@ int htlc_commit_recv_update_fee(channel_t *ch,
        the HTLC into commit fees at force-close. This MUST only fire in
        cheat-engine test runs (env var gated). Markers: LSP-CHEAT-DUST. */
     const char *cheat = getenv("SS_CHEAT_DUST_RACE");
-    int cheat_active = (cheat && cheat[0] && cheat[0] != '0');
+    /* #9 cheat-gate: this is a defense BYPASS (strands counterparty HTLC sweeps
+       below dust so the LSP absorbs them). Honor it ONLY on regtest — even a
+       directly-set env var is inert on signet/testnet/mainnet (gate default 0). */
+    int cheat_active = (cheat && cheat[0] && cheat[0] != '0') && superscalar_cheat_allowed();
 
     for (size_t i = 0; i < ch->n_htlcs; i++) {
         if (ch->htlcs[i].state != HTLC_STATE_ACTIVE) continue;
@@ -661,9 +668,12 @@ int htlc_commit_dispatch(peer_mgr_t *mgr, int peer_idx,
         const unsigned char *peer_pcs      = payload + 32;
         const unsigned char *next_pcp_wire = payload + 64;
 
-        if (ch->commitment_number > 0)
-            channel_receive_revocation_flat(ch, ch->commitment_number - 1,
-                                             peer_pcs);
+        if (ch->commitment_number > 0 &&
+            !channel_receive_revocation_flat(ch, ch->commitment_number - 1,
+                                             peer_pcs)) {
+            fprintf(stderr, "htlc_commit: peer revocation failed verification — failing update\n");
+            return -1;
+        }
 
         secp256k1_pubkey next_pcp;
         if (!secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_pcp_wire, 33))

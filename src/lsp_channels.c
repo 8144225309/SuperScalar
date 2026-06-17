@@ -41,29 +41,9 @@
    The LSP caller passes its own pubkey as "my", the client's as "peer";
    the returned my_signer_idx indicates LSP's position in the keyagg. */
 
-/* Verify that a revocation secret matches the per-commitment point stored for
-   the given commitment number.  Returns 1 if valid (or if no stored PCP to
-   check against), 0 if the secret is demonstrably wrong. */
-static int verify_revocation_secret(const secp256k1_context *ctx,
-                                     const channel_t *ch,
-                                     uint64_t commitment_num,
-                                     const unsigned char *secret32) {
-    secp256k1_pubkey derived;
-    if (!secp256k1_ec_pubkey_create(ctx, &derived, secret32))
-        return 0;  /* not a valid scalar */
-
-    secp256k1_pubkey stored;
-    if (!channel_get_remote_pcp(ch, commitment_num, &stored))
-        return 1;  /* no PCP stored — can't verify, accept on trust */
-
-    unsigned char d_ser[33], s_ser[33];
-    size_t dlen = 33, slen = 33;
-    secp256k1_ec_pubkey_serialize(ctx, d_ser, &dlen, &derived,
-                                   SECP256K1_EC_COMPRESSED);
-    secp256k1_ec_pubkey_serialize(ctx, s_ser, &slen, &stored,
-                                   SECP256K1_EC_COMPRESSED);
-    return memcmp(d_ser, s_ser, 33) == 0;
-}
+/* Revocation-secret verification now lives in channel.c as the shared
+   channel_verify_revocation_secret() (used by both LSP and client) — see
+   doc/revocation-verification-standard.md. */
 
 /* Detect single-process mode: returns 1 only when f->keypairs[i] holds a
    real seckey for every signer in `node` (LSP + every non-LSP signer).
@@ -958,7 +938,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
-            if (!verify_revocation_secret(mgr->ctx, sender_ch, old_cn, rev_secret)) {
+            if (!channel_verify_revocation_secret(sender_ch, old_cn, rev_secret)) {
                 fprintf(stderr, "LSP: INVALID revocation secret from sender %zu "
                         "(commitment %lu) — rejecting\n",
                         sender_idx, (unsigned long)old_cn);
@@ -1237,7 +1217,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
-            if (!verify_revocation_secret(mgr->ctx, dest_ch, old_cn, rev_secret)) {
+            if (!channel_verify_revocation_secret(dest_ch, old_cn, rev_secret)) {
                 fprintf(stderr, "LSP: INVALID revocation secret from dest %zu "
                         "(commitment %lu) — rejecting\n",
                         dest_idx, (unsigned long)old_cn);
@@ -5352,7 +5332,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
-                    if (!verify_revocation_secret(mgr->ctx, dest_ch, old_cn, rev_secret)) {
+                    if (!channel_verify_revocation_secret(dest_ch, old_cn, rev_secret)) {
                         fprintf(stderr, "LSP: INVALID revocation secret from reconnected "
                                 "client %zu (commitment %lu)\n",
                                 reconnected_idx, (unsigned long)old_cn);

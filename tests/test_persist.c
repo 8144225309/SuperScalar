@@ -16,6 +16,9 @@
 #include "superscalar/channel.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/dw_state.h"
+#include "superscalar/client.h"   /* client_handle_lsp_revoke_and_ack (revocation-verify) */
+#include "superscalar/wire.h"     /* wire_build_revoke_and_ack, wire_msg_t */
+#include "superscalar/crash_inject.h"  /* #9 cheat-gate */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -756,7 +759,13 @@ int test_persist_watchtower_hydrate_round_trip(void) {
     unsigned char rev0[32], rev1[32];
     memset(rev0, 0x55, 32);
     memset(rev1, 0x66, 32);
+    /* revocation-verify: committed points (secret*G) must match the secrets */
+    secp256k1_pubkey hvp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &hvp, rev0), "hvp0");
+    channel_set_remote_pcp(&ch, 0, &hvp);
     TEST_ASSERT(channel_receive_revocation(&ch, 0, rev0), "recv rev0");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &hvp, rev1), "hvp1");
+    channel_set_remote_pcp(&ch, 1, &hvp);
     TEST_ASSERT(channel_receive_revocation(&ch, 1, rev1), "recv rev1");
 
     /* persist_list_channel_ids finds our saved channel */
@@ -5149,6 +5158,61 @@ int test_persist_hd_seed_encryption_round_trip(void) {
     return 1;
 }
 
+/* === Revocation verification standard (Phase 1: durable committed-PCP) ===== */
+
+/* A committed remote per-commitment point must stay verifiable after it is
+   evicted from the 2-slot in-memory window — via the durable DB record — and a
+   wrong secret must NOT verify against it. This is the durability that lets
+   Phase 2 safely fail-closed. */
+int test_channel_revocation_durable_pcp_verify(void) {
+    const char *path = "/tmp/test_ss_revverify.db";
+    unlink(path);
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof ch);
+    ch.ctx = ctx;
+    ch.persist_db = &db;
+    ch.persist_channel_id = 7;
+
+    /* commitment 5: committed PCP = secret5*G */
+    unsigned char secret5[32]; memset(secret5, 0, 32); secret5[31] = 5;
+    secp256k1_pubkey pcp5;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pcp5, secret5), "pcp5");
+    channel_set_remote_pcp(&ch, 5, &pcp5);            /* in-memory + persisted */
+
+    /* evict 5 from the 2-slot window with two newer commitments */
+    unsigned char s6[32] = {0}, s7[32] = {0}; s6[31] = 6; s7[31] = 7;
+    secp256k1_pubkey p6, p7;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p6, s6), "p6");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p7, s7), "p7");
+    channel_set_remote_pcp(&ch, 6, &p6);
+    channel_set_remote_pcp(&ch, 7, &p7);              /* window {6,7}; 5 evicted */
+
+    /* durable fallback: PCP for 5 is still retrievable (from DB) and correct */
+    secp256k1_pubkey got;
+    TEST_ASSERT(channel_get_remote_pcp(&ch, 5, &got), "PCP 5 retrievable after eviction");
+    unsigned char a[33], b[33]; size_t al = 33, bl = 33;
+    secp256k1_ec_pubkey_serialize(ctx, a, &al, &got,  SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, b, &bl, &pcp5, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(a, b, 33) == 0, "durable PCP matches committed");
+
+    /* verification against the durable record: correct accepted, wrong rejected */
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 5, secret5) == 1,
+                "correct secret verifies against durable PCP");
+    unsigned char wrong[32]; memset(wrong, 0xab, 32);
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 5, wrong) == 0,
+                "wrong secret rejected (durable PCP present)");
+
+    persist_close(&db);
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
 /* Wrong key must FAIL CLOSED (refuse to open), never silently corrupt. */
 int test_persist_encryption_wrong_key_refused(void) {
     const char *path = "/tmp/test_ss_enc_wrong.db";
@@ -5202,3 +5266,96 @@ int test_persist_encryption_disabled_is_plaintext(void) {
 }
 
 /* === End #327 at-rest field encryption tests ============================== */
+
+/* Phase 2: verification is enforced at the choke point and fails closed —
+   unverifiable/mismatched secrets are rejected and never stored. */
+int test_channel_revocation_failclosed(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    memset(&ch, 0, sizeof ch);
+    ch.ctx = ctx;   /* no persist_db, no window — no committed point anywhere */
+
+    unsigned char any[32]; memset(any, 7, 32);
+    /* (1) no committed point -> verifier fails closed (was: accept-on-trust) */
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 0, any) == 0, "no PCP -> fail closed");
+    /* (2) choke point refuses to store an unverifiable secret */
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 0, any) == 0, "choke point rejects unverifiable");
+    TEST_ASSERT(channel_get_received_revocation(&ch, 0, any) == 0, "nothing stored");
+
+    /* (3) with a committed point for cn=3: wrong rejected (not stored), correct stored */
+    unsigned char s3[32]; memset(s3, 0, 32); s3[31] = 3;
+    secp256k1_pubkey p3;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p3, s3), "p3");
+    channel_set_remote_pcp(&ch, 3, &p3);
+
+    unsigned char wrong[32]; memset(wrong, 0xcd, 32);
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 3, wrong) == 0, "wrong secret rejected at choke point");
+    unsigned char got[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 3, got) == 0, "wrong secret NOT stored");
+
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 3, s3) == 1, "correct secret accepted");
+    TEST_ASSERT(channel_get_received_revocation(&ch, 3, got) == 1 && memcmp(got, s3, 32) == 0,
+                "correct secret stored");
+
+    free(ch.received_revocations);
+    free(ch.received_revocation_valid);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The CLIENT (user) verifies the LSP's revocation at the revocation step:
+   a correct LSP secret is verified + retained; a garbage one is rejected and
+   never stored. Proves the user's side of "verify everything". */
+int test_client_verifies_lsp_revocation(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* LSP's committed point for commitment 0 = lsp_secret0 * G */
+    unsigned char lsp_secret0[32]; memset(lsp_secret0, 0, 32); lsp_secret0[31] = 9;
+    secp256k1_pubkey lsp_pcp0;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pcp0, lsp_secret0), "lsp_pcp0");
+    unsigned char nx[32]; memset(nx, 0, 32); nx[31] = 11;
+    secp256k1_pubkey next_pcp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &next_pcp, nx), "next_pcp");
+
+    /* (1) correct LSP revocation -> verified + retained */
+    channel_t ch; memset(&ch, 0, sizeof ch); ch.ctx = ctx; ch.commitment_number = 1;
+    channel_set_remote_pcp(&ch, 0, &lsp_pcp0);
+    cJSON *good = wire_build_revoke_and_ack(7, lsp_secret0, ctx, &next_pcp);
+    wire_msg_t m; m.msg_type = MSG_LSP_REVOKE_AND_ACK; m.json = good;
+    TEST_ASSERT(client_handle_lsp_revoke_and_ack(&ch, ctx, &m) == 1, "correct LSP revocation accepted");
+    cJSON_Delete(good);
+    unsigned char got[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 0, got) == 1 && memcmp(got, lsp_secret0, 32) == 0,
+                "LSP secret retained");
+
+    /* (2) garbage LSP revocation -> rejected (fail-closed), never stored */
+    channel_t ch2; memset(&ch2, 0, sizeof ch2); ch2.ctx = ctx; ch2.commitment_number = 1;
+    channel_set_remote_pcp(&ch2, 0, &lsp_pcp0);
+    unsigned char garbage[32]; memset(garbage, 0xde, 32);
+    cJSON *bad = wire_build_revoke_and_ack(7, garbage, ctx, &next_pcp);
+    wire_msg_t mb; mb.msg_type = MSG_LSP_REVOKE_AND_ACK; mb.json = bad;
+    TEST_ASSERT(client_handle_lsp_revoke_and_ack(&ch2, ctx, &mb) == 0, "garbage LSP revocation rejected");
+    cJSON_Delete(bad);
+    TEST_ASSERT(channel_get_received_revocation(&ch2, 0, got) == 0, "garbage not stored");
+
+    free(ch.received_revocations);  free(ch.received_revocation_valid);
+    free(ch2.received_revocations); free(ch2.received_revocation_valid);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* #9 cheat-gate: defense-bypass cheats are inert by default (fail-safe) and
+   only allowed when the gate is set for regtest. */
+int test_cheat_gate(void) {
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "gate off -> cheats not allowed");
+    superscalar_set_cheat_gate(1);
+    TEST_ASSERT(superscalar_cheat_allowed() == 1, "gate on (regtest) -> cheats allowed");
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "gate reset -> cheats not allowed");
+    return 1;
+}
+
+/* === End revocation verification standard tests =========================== */

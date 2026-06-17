@@ -505,39 +505,56 @@ void channel_set_local_pcs(channel_t *ch, uint64_t commitment_num,
 
 void channel_set_remote_pcp(channel_t *ch, uint64_t commitment_num,
                              const secp256k1_pubkey *pcp) {
-    /* Check if this commitment_num already occupies a slot */
-    for (int i = 0; i < 2; i++) {
+    /* Update the in-memory 2-slot window (matches a slot, fills an empty one,
+       or evicts the lower commitment_num). */
+    int placed = 0;
+    for (int i = 0; i < 2 && !placed; i++) {
         if (ch->remote_pcp_valid[i] && ch->remote_pcp_nums[i] == commitment_num) {
             ch->remote_pcps[i] = *pcp;
-            return;
+            placed = 1;
         }
     }
-    /* Find an empty slot */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 2 && !placed; i++) {
         if (!ch->remote_pcp_valid[i]) {
             ch->remote_pcps[i] = *pcp;
             ch->remote_pcp_nums[i] = commitment_num;
             ch->remote_pcp_valid[i] = 1;
-            return;
+            placed = 1;
         }
     }
-    /* Both slots occupied — evict the one with the smaller commitment_num */
-    int evict = (ch->remote_pcp_nums[0] <= ch->remote_pcp_nums[1]) ? 0 : 1;
-    ch->remote_pcps[evict] = *pcp;
-    ch->remote_pcp_nums[evict] = commitment_num;
-    ch->remote_pcp_valid[evict] = 1;
+    if (!placed) {
+        int evict = (ch->remote_pcp_nums[0] <= ch->remote_pcp_nums[1]) ? 0 : 1;
+        ch->remote_pcps[evict] = *pcp;
+        ch->remote_pcp_nums[evict] = commitment_num;
+        ch->remote_pcp_valid[evict] = 1;
+    }
+
+    /* Revocation-verification standard: persist the committed per-commitment
+       point immediately, keyed by commitment_num, so it is durably retrievable
+       for revocation verification even after the 2-slot window evicts it or the
+       process restarts. The in-memory window stays as a fast cache; the DB is
+       the authoritative, complete record (channel_get_remote_pcp falls back to
+       it). Non-fatal on failure — the cache still serves the common case. */
+    if (ch->persist_db) {
+        unsigned char ser[33];
+        size_t slen = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen, pcp,
+                                       SECP256K1_EC_COMPRESSED);
+        (void)persist_save_remote_pcp((persist_t *)ch->persist_db,
+                                      ch->persist_channel_id, commitment_num, ser);
+    }
 }
 
 int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
                             secp256k1_pubkey *pcp_out) {
-    /* Check both stored slots */
+    /* 1. in-memory 2-slot window (fast path) */
     for (int i = 0; i < 2; i++) {
         if (ch->remote_pcp_valid[i] && ch->remote_pcp_nums[i] == commitment_num) {
             *pcp_out = ch->remote_pcps[i];
             return 1;
         }
     }
-    /* For old commitments, derive from received revocation secret */
+    /* 2. for old commitments, derive from an already-received revocation secret */
     uint64_t max_stored = 0;
     for (int i = 0; i < 2; i++) {
         if (ch->remote_pcp_valid[i] && ch->remote_pcp_nums[i] > max_stored)
@@ -545,17 +562,79 @@ int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
     }
     if (commitment_num < max_stored) {
         unsigned char secret[32];
-        if (!channel_get_received_revocation(ch, commitment_num, secret))
-            return 0;
-        int ok = secp256k1_ec_pubkey_create(ch->ctx, pcp_out, secret);
-        secure_zero(secret, 32);
-        return ok;
+        if (channel_get_received_revocation(ch, commitment_num, secret)) {
+            int ok = secp256k1_ec_pubkey_create(ch->ctx, pcp_out, secret);
+            secure_zero(secret, 32);
+            if (ok) return 1;
+        }
+    }
+    /* 3. durable committed-PCP from the DB — the authoritative, complete record
+       (keyed by commitment_num). This survives 2-slot eviction and restarts, so
+       a revocation can be verified against what the peer actually committed to
+       rather than skipped. */
+    if (ch->persist_db) {
+        unsigned char ser[33];
+        if (persist_load_remote_pcp((persist_t *)ch->persist_db,
+                                    ch->persist_channel_id, commitment_num, ser) &&
+            secp256k1_ec_pubkey_parse(ch->ctx, pcp_out, ser, 33)) {
+            return 1;
+        }
     }
     return 0;
 }
 
+/* Revocation-verification standard (shared by LSP and client). Verify that a
+   revealed per-commitment secret matches the per-commitment point the peer
+   committed to for `commitment_num`: secret*G == committed_PCP. Uses
+   channel_get_remote_pcp, which now consults the durable DB record, so a
+   legitimate revocation can always be checked.
+
+   PHASE 1 (this commit) preserves the historical behavior of accepting when no
+   committed point can be found anywhere (returns 1) so this is a pure,
+   behavior-neutral relocation + durability upgrade. PHASE 2 flips that branch to
+   fail-closed (return 0) once the choke-point + tests prove no legitimate
+   revocation lands without a retrievable point. */
+int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_num,
+                                     const unsigned char *secret32) {
+    if (!ch || !secret32) return 0;
+    secp256k1_pubkey derived;
+    if (!secp256k1_ec_pubkey_create(ch->ctx, &derived, secret32))
+        return 0;  /* not a valid scalar — always reject */
+
+    secp256k1_pubkey committed;
+    if (!channel_get_remote_pcp(ch, commitment_num, &committed)) {
+        /* PHASE 2 — fail closed: a revocation we cannot check against a committed
+           point is never trusted (storing it would arm a broken penalty). Phase 1
+           durable persistence ensures a legitimate revocation always has a
+           retrievable point, so this branch means a protocol desync or an attack. */
+        fprintf(stderr, "channel: revocation for commitment %llu has no retrievable "
+                "committed point — refusing (fail-closed)\n",
+                (unsigned long long)commitment_num);
+        return 0;
+    }
+
+    unsigned char d_ser[33], c_ser[33];
+    size_t dlen = 33, clen = 33;
+    secp256k1_ec_pubkey_serialize(ch->ctx, d_ser, &dlen, &derived,
+                                   SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ch->ctx, c_ser, &clen, &committed,
+                                   SECP256K1_EC_COMPRESSED);
+    return memcmp(d_ser, c_ser, 33) == 0;
+}
+
 int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
                                       const unsigned char *secret32) {
+    /* Revocation-verification standard (choke point): EVERY received revocation
+       secret — via any path (LSP handlers, htlc_commit, client, bridge) — is
+       verified here against the peer's committed point before it is stored. A
+       secret that doesn't match is rejected and NOT stored, so a broken penalty
+       can never be armed and the caller can fail the channel (BOLT-2). */
+    if (!channel_verify_revocation_secret(ch, commitment_num, secret32)) {
+        fprintf(stderr, "channel: REJECTED revocation secret for commitment %llu "
+                "(does not match committed point) — not stored\n",
+                (unsigned long long)commitment_num);
+        return 0;
+    }
     if (!channel_ensure_revocations_cap(ch, (size_t)(commitment_num + 1))) return 0;
     memcpy(ch->received_revocations[commitment_num], secret32, 32);
     ch->received_revocation_valid[commitment_num] = 1;

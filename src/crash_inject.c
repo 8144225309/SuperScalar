@@ -59,3 +59,16 @@ void lsp_crash_checkpoint(const char *name) {
         abort();
     }
 }
+
+/* #9 cheat-gate. Default 0 = cheats NOT allowed (fail-safe: a binary that never
+   calls superscalar_set_cheat_gate, or runs on any non-regtest network, cannot
+   fire a defense-bypass cheat even if the SS_CHEAT_* env var is set). */
+static int g_cheat_gate_regtest = 0;
+
+void superscalar_set_cheat_gate(int is_regtest) {
+    g_cheat_gate_regtest = is_regtest ? 1 : 0;
+}
+
+int superscalar_cheat_allowed(void) {
+    return g_cheat_gate_regtest;
+}
