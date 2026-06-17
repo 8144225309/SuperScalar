@@ -204,3 +204,27 @@ revocation-gated) is a possible future refinement, not a current gap.
 | `close` | cheat + `close` | clients refuse + **force-close on the last verified state (4/4 clients)** via the #313 self-custody `factory_recovery_run` — `CLOSE policy force-close: factory 0 (state=active): broadcast 3 TXs (run=1)` |
 
 The refusal counts differ by design: `continue` processes all 24 forged revocations (it never stops), while `halt`/`close` stop at the first detection (≈1 per client) — both refuse every forgery they see, fail-closed, before acting.
+
+### 9.1 Refinements
+
+- **Config-file** — `on-lsp-forgery` (and `on-lsp-forgery-ps`) are honoured in the
+  JSON `--config` file; CLI overrides config.
+- **Poisoned-LSP marker** — on a `halt`/`close` detection the client writes a
+  sentinel (`<db>.lsp_poisoned`) and, on a later start, **refuses to reconnect** to
+  the proven-cheating LSP. `--force-close` still works (it is handled before the
+  connect path); deleting the marker re-enables connecting. (File sentinel — no
+  schema change.)
+- **Per-leaf-type response (`--on-lsp-forgery-ps`)** — PS leaves are CLTV-gated, so a
+  forged revocation *may* be less severe than on a revocation-gated leaf. The client
+  **detects + reports** the leaf type in the alert and lets an operator set a
+  *separate* PS-leaf policy. **It defaults to "inherit" (uniform) and never
+  auto-downgrades** — PS leaf *chaining* does not by itself prove the channel-level
+  revocation is non-load-bearing. **Open security-model question:** confirm whether a
+  PS leaf's channel commitments still depend on revocation before recommending a more
+  lenient PS policy; until then the safe default is to respond uniformly (over-respond
+  rather than under-respond).
+- **Surgical close** — already per-client: `close` runs `factory_recovery_run` for the
+  client's *own* factory + broadcasts only the client's *own* signed commitment. The
+  shared tree nodes (root/intermediates) are architecturally required to reach any
+  leaf; a client never publishes another client's leaf commitment. So the close is as
+  surgical as the factory construction allows.

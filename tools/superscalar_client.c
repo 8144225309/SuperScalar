@@ -571,8 +571,11 @@ typedef struct {
     int     scripted_initiated;     /* 1 after sends fired + recvs registered */
     /* Item-1 escalation: response policy + detection state (--on-lsp-forgery). */
     int     lsp_forgery_response;   /* lsp_forgery_response_t; default HALT */
+    int     lsp_forgery_response_ps;/* per-leaf-type override for PS leaves; -1 = inherit (#21) */
+    int     lsp_leaf_is_ps;         /* 1 if this factory uses PS (CLTV-gated) leaves (#21) */
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
+    const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -744,6 +747,8 @@ static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) 
    Call after each client_handle_commitment_signed in daemon mode.
    old_local/old_remote are the channel amounts at the OLD commitment being
    revoked (before the state-advancing add/fulfill that preceded this). */
+static void client_mark_lsp_poisoned(const char *db_path, const char *reason);  /* #20 fwd-decl */
+
 static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *cbd,
                                          secp256k1_context *ctx,
                                          uint64_t old_local, uint64_t old_remote,
@@ -772,22 +777,39 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
            keep building states it cannot protect against a proven-cheating LSP. */
         if (cbd) {
             cbd->lsp_forgery_detected = 1;
-            switch (cbd->lsp_forgery_response) {
+            /* #21 per-leaf-type: a PS (CLTV-gated) leaf MAY warrant a different
+               response than a revocation-gated leaf. We default to UNIFORM (the PS
+               override is "inherit" unless the operator explicitly set
+               --on-lsp-forgery-ps) and NEVER auto-downgrade: PS leaf *chaining*
+               does not by itself prove the channel-level revocation is non-load-
+               bearing (open security-model question — see revocation doc §9). The
+               leaf type is reported so the operator/auditor sees the severity. */
+            int mode = cbd->lsp_forgery_response;
+            if (cbd->lsp_leaf_is_ps && cbd->lsp_forgery_response_ps >= 0)
+                mode = cbd->lsp_forgery_response_ps;
+            fprintf(stderr, "Client %u: forgery on a %s leaf\n", my_index,
+                    cbd->lsp_leaf_is_ps ? "PS/CLTV-gated" : "revocation-gated");
+            switch (mode) {
             case LSP_FORGERY_HALT:
                 fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — HALT "
                         "policy: refusing all further commitments. Operator should "
                         "force-close (--force-close) on the last verified state.\n",
                         my_index);
+                client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (halt)");
                 break;
             case LSP_FORGERY_CLOSE:
                 fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — CLOSE "
                         "policy: force-closing on the last verified state.\n", my_index);
                 cbd->force_close_requested = 1;
+                client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (close)");
                 break;
             case LSP_FORGERY_CONTINUE:
             default:
                 break;  /* legacy: refuse + no-arm, keep the session */
             }
+            /* Collapse to the effective decision so the daemon-loop / reconnect
+               break (which reads lsp_forgery_response) honours the PS override. */
+            cbd->lsp_forgery_response = mode;
         }
         cJSON_Delete(rev_msg.json);
         return;
@@ -842,6 +864,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                size_t n_participants,
                                void *user_data) {
     daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
+
+    /* #21: record whether this factory uses PS (CLTV-gated) leaves, for the
+       per-leaf-type forgery response. Factory-level signal (any PS leaf present);
+       cheap + idempotent. */
+    if (cbd && factory) {
+        for (size_t ni = 0; ni < factory->n_nodes; ni++)
+            if (factory->nodes[ni].is_ps_leaf) { cbd->lsp_leaf_is_ps = 1; break; }
+    }
 
     /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
@@ -2252,6 +2282,8 @@ static void usage(const char *prog) {
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
         "                                      close    = refuse + force-close on last verified state\n"
+        "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
+        "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
@@ -2323,6 +2355,25 @@ static int client_force_close_from_db(const char *db_path, const char *network,
     return 1;
 }
 
+/* #20 poisoned-LSP marker: persist that THIS node's LSP was caught forging a
+   revocation, so a later restart does not silently reconnect to a proven-cheating
+   LSP. File sentinel next to the DB (no schema change); checked at startup. */
+static void client_mark_lsp_poisoned(const char *db_path, const char *reason) {
+    if (!db_path) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s.lsp_poisoned", db_path);
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "%s\n", reason ? reason : "lsp revocation forgery"); fclose(f); }
+}
+static int client_lsp_is_poisoned(const char *db_path) {
+    if (!db_path) return 0;
+    char path[1100];
+    snprintf(path, sizeof path, "%s.lsp_poisoned", db_path);
+    FILE *f = fopen(path, "r");
+    if (f) { fclose(f); return 1; }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     /* Line-buffered stdout so logs are visible even if process is killed */
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2362,6 +2413,7 @@ int main(int argc, char *argv[]) {
     const char *light_client_arg = NULL;
     const char *fee_estimator_arg = NULL;
     int lsp_forgery_mode = LSP_FORGERY_HALT;  /* --on-lsp-forgery: item-1 escalation policy */
+    int lsp_forgery_mode_ps = -1;             /* --on-lsp-forgery-ps: PS-leaf override; -1=inherit (#21) */
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
@@ -2411,6 +2463,16 @@ int main(int argc, char *argv[]) {
                     if ((v = cJSON_GetObjectItem(cfg, "rpcuser")) && cJSON_IsString(v)) rpcuser = strdup(v->valuestring);
                     if ((v = cJSON_GetObjectItem(cfg, "rpcpassword")) && cJSON_IsString(v)) rpcpassword = strdup(v->valuestring);
                     if ((v = cJSON_GetObjectItem(cfg, "rpcport")) && cJSON_IsNumber(v)) rpcport = (int)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "on-lsp-forgery")) && cJSON_IsString(v)) {
+                        int m = client_parse_forgery_response(v->valuestring);
+                        if (m >= 0) lsp_forgery_mode = m;
+                        else fprintf(stderr, "WARNING: config on-lsp-forgery invalid: %s\n", v->valuestring);
+                    }
+                    if ((v = cJSON_GetObjectItem(cfg, "on-lsp-forgery-ps")) && cJSON_IsString(v)) {
+                        int m = client_parse_forgery_response(v->valuestring);
+                        if (m >= 0) lsp_forgery_mode_ps = m;
+                        else fprintf(stderr, "WARNING: config on-lsp-forgery-ps invalid: %s\n", v->valuestring);
+                    }
                     printf("Loaded config from %s\n", argv[i + 1]);
                     cJSON_Delete(cfg);
                 } else {
@@ -2490,6 +2552,14 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             lsp_forgery_mode = m;
+        }
+        else if (strcmp(argv[i], "--on-lsp-forgery-ps") == 0 && i + 1 < argc) {
+            int m = client_parse_forgery_response(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "Error: --on-lsp-forgery-ps must be continue|halt|close\n");
+                return 1;
+            }
+            lsp_forgery_mode_ps = m;
         }
         else if (strcmp(argv[i], "--light-client") == 0 && i + 1 < argc)
             light_client_arg = argv[++i];
@@ -3411,6 +3481,16 @@ int main(int argc, char *argv[]) {
                                     hd_mnemonic, hd_passphrase, hd_lookahead);
     }
 
+    /* #20 poisoned-LSP marker: if a prior session caught this LSP forging a
+       revocation, refuse to reconnect. (--force-close is handled earlier, so the
+       operator can still recover; deleting the marker re-enables connecting.) */
+    if (db_path && client_lsp_is_poisoned(db_path)) {
+        fprintf(stderr, "Client: REFUSING to connect — this LSP was previously caught "
+                "forging a revocation (marker %s.lsp_poisoned). Force-close with "
+                "--force-close, then delete the marker to re-enable.\n", db_path);
+        return 1;
+    }
+
     int ok;
     if (daemon_mode) {
         daemon_cb_data_t cbd;
@@ -3420,6 +3500,8 @@ int main(int argc, char *argv[]) {
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
         cbd.lsp_forgery_response = lsp_forgery_mode;
+        cbd.lsp_forgery_response_ps = lsp_forgery_mode_ps;
+        cbd.poison_db_path = db_path;
         cbd.auto_accept_jit = auto_accept_jit;
         cbd.test_lsps2     = test_lsps2;
         cbd.test_lsps2_buy = test_lsps2_buy;
@@ -3603,6 +3685,8 @@ int main(int argc, char *argv[]) {
             cbd.fee = client_fee_ptr;
             cbd.rt  = rt_ok ? &rt : NULL;
             cbd.lsp_forgery_response = lsp_forgery_mode;
+            cbd.lsp_forgery_response_ps = lsp_forgery_mode_ps;
+            cbd.poison_db_path = db_path;
             cbd.scripted_actions   = actions;
             cbd.n_scripted_actions = n_actions;
             ok = client_run_with_channels(ctx, &kp, host, port,
