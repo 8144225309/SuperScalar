@@ -355,12 +355,23 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
         cJSON_Delete(msg.json);
 
-        /* Verify commitment_number matches (Gap 2B: client-side) */
+        /* Verify commitment_number matches (Gap 2B: client-side).
+           Revocation-verify Phase 3: the LSP's RECONNECT_ACK is UNTRUSTED. If it
+           claims a different commitment number than our own, we must NOT adopt
+           the LSP's claim — keep our own persisted state (fund-safe) and raise a
+           LOUD security alert. A claim AHEAD of our state is a possible forged/
+           stale-state injection (trying to induce us to sign/broadcast a state we
+           never reached, cf. #256); a claim BEHIND is a possible replay. Either
+           way the defense is the same: trust our DB, never the peer's word. */
         if (ack_commit != channel.commitment_number) {
-            fprintf(stderr, "Client %u: commitment mismatch after reconnect "
-                    "(ack=%llu, local=%llu) — reloading from DB\n",
+            fprintf(stderr, "Client %u: SECURITY: LSP RECONNECT_ACK commitment "
+                    "claim (%llu) != our state (%llu) — REFUSING to adopt the "
+                    "LSP's claim; keeping our own persisted state%s\n",
                     my_index, (unsigned long long)ack_commit,
-                    (unsigned long long)channel.commitment_number);
+                    (unsigned long long)channel.commitment_number,
+                    (ack_commit > channel.commitment_number)
+                        ? " [LSP claims AHEAD of us — possible forged/stale-state injection]"
+                        : " [LSP claims BEHIND us — possible replay]");
             if (db) {
                 uint64_t db_l, db_r, db_cn;
                 if (persist_load_channel_state(db, my_index - 1,
