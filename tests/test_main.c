@@ -1429,6 +1429,7 @@ extern int test_regtest_tcp_reconnect(void);
 extern int test_client_watchtower_init(void);
 extern int test_bidirectional_revocation(void);
 extern int test_client_watch_revoked_commitment(void);
+extern int test_adversarial_wt_no_false_penalty(void);        /* ADV Phase 2 */
 extern int test_lsp_revoke_and_ack_wire(void);
 extern int test_factory_node_watch(void);
 extern int test_subfactory_node_watch(void);
@@ -3298,6 +3299,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_watchtower_init);
     RUN_TEST(test_bidirectional_revocation);
     RUN_TEST(test_client_watch_revoked_commitment);
+    RUN_TEST(test_adversarial_wt_no_false_penalty);
     RUN_TEST(test_lsp_revoke_and_ack_wire);
     RUN_TEST(test_factory_node_watch);
     RUN_TEST(test_subfactory_node_watch);

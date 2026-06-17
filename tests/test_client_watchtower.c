@@ -19,6 +19,8 @@
 #include <secp256k1_extrakeys.h>
 
 #include "superscalar/sha256.h"
+#include "superscalar/chain_backend.h"   /* ADV Phase 2: WT false-positive mock */
+#include <stdbool.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -650,5 +652,91 @@ int test_persist_open_readonly(void) {
 
     persist_close(&rodb);
     remove(path);
+    return 1;
+}
+
+/* ── ADV Phase 2: watchtower false-positive (forgery rejection) ──────────────
+   A mock chain backend lets us assert the WT broadcasts a penalty ONLY when its
+   registered revoked commitment is actually on-chain — never spuriously. */
+typedef struct { int height; int mode; int send_count; int batch_called; } adv_mock_t;
+/* mode: 0 = nothing on-chain (-1 confs); 1 = confirmed (conf=6) */
+static int  adv_mock_height(chain_backend_t *s)               { return ((adv_mock_t *)s->ctx)->height; }
+static int  adv_mock_confs(chain_backend_t *s, const char *t) { (void)t; return ((adv_mock_t *)s->ctx)->mode == 1 ? 6 : -1; }
+static int  adv_mock_confs_batch(chain_backend_t *s, const char **t, size_t n, int *o) {
+    (void)t;
+    adv_mock_t *m = (adv_mock_t *)s->ctx;
+    m->batch_called++;
+    for (size_t i = 0; i < n; i++) {
+        o[i] = (m->mode == 1) ? 6 : -1;
+    }
+    return 1;
+}
+static bool adv_mock_in_mempool(chain_backend_t *s, const char *t) { (void)s; (void)t; return false; }
+static int  adv_mock_send(chain_backend_t *s, const char *hex, char *txid_out) {
+    (void)hex;
+    ((adv_mock_t *)s->ctx)->send_count++;
+    if (txid_out) { memset(txid_out, 'a', 64); txid_out[64] = '\0'; }
+    return 1;
+}
+
+int test_adversarial_wt_no_false_penalty(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    unsigned char lsp_sec[32], client_sec[32];
+    memset(lsp_sec, 0x11, 32); memset(client_sec, 0x22, 32);
+    channel_t lsp_ch, client_ch;
+    if (!setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec)) return 0;
+
+    watchtower_t wt;
+    fee_estimator_static_t fee;
+    fee_estimator_static_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
+
+    /* advance + revoke so the client holds the LSP's old revocation secret */
+    uint64_t old_cn = client_ch.commitment_number;
+    uint64_t old_local = client_ch.local_amount, old_remote = client_ch.remote_amount;
+    lsp_ch.commitment_number++;    channel_generate_local_pcs(&lsp_ch, lsp_ch.commitment_number);
+    client_ch.commitment_number++; channel_generate_local_pcs(&client_ch, client_ch.commitment_number);
+    unsigned char lsp_old_secret[32];
+    channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
+    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+    secp256k1_pubkey lsp_new_pcp;
+    channel_get_per_commitment_point(&lsp_ch, lsp_ch.commitment_number + 1, &lsp_new_pcp);
+    channel_set_remote_pcp(&client_ch, client_ch.commitment_number + 1, &lsp_new_pcp);
+    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+                                          old_local, old_remote, NULL, 0, NULL, 0);
+    TEST_ASSERT(wt.n_entries == 1, "one watched entry");
+
+    adv_mock_t ms = { .height = 500, .mode = 0, .send_count = 0, .batch_called = 0 };
+    chain_backend_t be; memset(&be, 0, sizeof be);
+    be.ctx = &ms; be.is_regtest = 1;
+    be.get_block_height        = adv_mock_height;
+    be.get_confirmations       = adv_mock_confs;
+    be.get_confirmations_batch = adv_mock_confs_batch;
+    be.is_in_mempool           = adv_mock_in_mempool;
+    be.send_raw_tx             = adv_mock_send;
+    watchtower_set_chain_backend(&wt, &be);
+
+    /* FALSE-POSITIVE GUARD: the WT queries the chain for its registered entry,
+       finds the revoked commitment is NOT on-chain, and does NOT penalize.
+       batch_called>0 proves the check actually ran (non-vacuous pass). */
+    ms.mode = 0; ms.send_count = 0; ms.batch_called = 0;
+    watchtower_check(&wt);
+    TEST_ASSERT(ms.batch_called > 0, "WT queried the chain for its entry");
+    TEST_ASSERT(ms.send_count == 0, "no penalty broadcast when revoked commitment is not on-chain");
+    TEST_ASSERT(wt.entries[0].penalty_broadcast == 0, "false-positive avoided");
+
+    /* Sanity: with the commitment 'on-chain' the WT still queries (no crash); the
+       penalty actually FIRING on a genuine breach is proven by the trustless
+       penalty matrix + the watchtower suite (30/30) — not re-asserted here because
+       this minimal channel fixture does not pre-build a broadcastable penalty. */
+    ms.mode = 1; ms.send_count = 0; ms.batch_called = 0;
+    watchtower_check(&wt);
+    TEST_ASSERT(ms.batch_called > 0, "WT re-queried the chain under breach mode");
+
+    watchtower_cleanup(&wt);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
