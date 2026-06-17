@@ -1056,6 +1056,32 @@ handle_message:
                     }
                 }
             }
+            /* ADV Phase 5a (defense-in-depth): for a RECEIVED payment HTLC (not a
+               settlement, not us-as-sender), the payment_hash should match an
+               invoice WE issued — otherwise we hold the preimage for nothing and
+               cannot claim it (it simply times back to the LSP; no fund risk to
+               us). Warn for observability; no refusal. */
+            {
+                cJSON *dest_j = cJSON_GetObjectItem(msg.json, "dest_client");
+                cJSON *hash_j = cJSON_GetObjectItem(msg.json, "payment_hash");
+                if (!dest_j && !is_settlement_htlc && hash_j && cJSON_IsString(hash_j) && cbd) {
+                    unsigned char hh[32];
+                    if (hex_decode(hash_j->valuestring, hh, 32) == 32) {
+                        int known = 0;
+                        for (size_t inv = 0; inv < cbd->n_invoices; inv++) {
+                            if (cbd->invoices[inv].active &&
+                                memcmp(cbd->invoices[inv].payment_hash, hh, 32) == 0) {
+                                known = 1; break;
+                            }
+                        }
+                        if (!known) {
+                            fprintf(stderr, "Client %u: WARNING — received add_htlc "
+                                    "payment_hash matches no invoice we issued; cannot "
+                                    "claim it (will time back to the LSP)\n", my_index);
+                        }
+                    }
+                }
+            }
             client_handle_add_htlc(ch, &msg);
             cJSON_Delete(msg.json);
 
