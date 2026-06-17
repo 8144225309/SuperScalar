@@ -5358,4 +5358,20 @@ int test_cheat_gate(void) {
     return 1;
 }
 
+/* Item-1 escalation policy: the --on-lsp-forgery parser maps exactly to the
+   documented enum and REJECTS unknown/typo values (so a misconfiguration can't
+   silently fall back to the least-safe response). */
+int test_lsp_forgery_response_parse(void) {
+    TEST_ASSERT(client_parse_forgery_response("continue") == LSP_FORGERY_CONTINUE, "continue");
+    TEST_ASSERT(client_parse_forgery_response("halt")     == LSP_FORGERY_HALT,     "halt");
+    TEST_ASSERT(client_parse_forgery_response("close")    == LSP_FORGERY_CLOSE,    "close");
+    TEST_ASSERT(client_parse_forgery_response("Continue") == -1, "case-sensitive reject");
+    TEST_ASSERT(client_parse_forgery_response("")         == -1, "empty reject");
+    TEST_ASSERT(client_parse_forgery_response("force")    == -1, "unknown reject");
+    TEST_ASSERT(client_parse_forgery_response(NULL)       == -1, "NULL reject");
+    /* The client's compiled-in default is HALT, NOT the legacy CONTINUE. */
+    TEST_ASSERT(LSP_FORGERY_HALT != LSP_FORGERY_CONTINUE, "default (halt) is not legacy (continue)");
+    return 1;
+}
+
 /* === End revocation verification standard tests =========================== */

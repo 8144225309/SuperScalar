@@ -146,6 +146,25 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
 int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
                                        const wire_msg_t *msg);
 
+/* Item-1 escalation policy: how the client responds once it DETECTS a forged LSP
+   revocation (i.e. client_handle_lsp_revoke_and_ack returned 0 — fail-closed). In
+   every mode the bad secret is refused and NO watchtower is armed from it; the
+   modes differ only in what the client does NEXT. A client that cannot obtain a
+   valid LSP revocation holds an un-penalizable old LSP state, so continuing to
+   build new states is the riskiest choice. Selectable via --on-lsp-forgery.
+   NOTE: PS (Pseudo-Spilman) leaves are CLTV-gated rather than revocation-gated,
+   so a forged LSP revocation is less severe on a PS leaf than on a revocation-
+   gated leaf; the policy is applied uniformly today (see doc). */
+typedef enum {
+    LSP_FORGERY_CONTINUE = 0,  /* refuse + no WT-arm, keep the session (legacy)   */
+    LSP_FORGERY_HALT     = 1,  /* + stop accepting new commitments, CRITICAL alert*/
+    LSP_FORGERY_CLOSE    = 2,  /* + force-close on the last fully-verified state   */
+} lsp_forgery_response_t;
+
+/* Parse an --on-lsp-forgery argument ("continue"|"halt"|"close") into the enum;
+   returns -1 on an unrecognised value. */
+int client_parse_forgery_response(const char *s);
+
 /* Handle incoming ADD_HTLC from LSP (we are the payee).
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);

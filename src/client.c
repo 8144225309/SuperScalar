@@ -444,6 +444,14 @@ int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
     return 1;
 }
 
+int client_parse_forgery_response(const char *s) {
+    if (!s) return -1;
+    if (strcmp(s, "continue") == 0) return LSP_FORGERY_CONTINUE;
+    if (strcmp(s, "halt")     == 0) return LSP_FORGERY_HALT;
+    if (strcmp(s, "close")    == 0) return LSP_FORGERY_CLOSE;
+    return -1;
+}
+
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
     uint64_t htlc_id, amount_msat;
     unsigned char payment_hash[32];

@@ -569,6 +569,10 @@ typedef struct {
     scripted_action_t *scripted_actions;
     size_t  n_scripted_actions;
     int     scripted_initiated;     /* 1 after sends fired + recvs registered */
+    /* Item-1 escalation: response policy + detection state (--on-lsp-forgery). */
+    int     lsp_forgery_response;   /* lsp_forgery_response_t; default HALT */
+    int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
+    int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -763,6 +767,28 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
     if (!client_handle_lsp_revoke_and_ack(ch, ctx, &rev_msg)) {
         fprintf(stderr, "Client %u: LSP revocation FAILED verification "
                 "— refusing (penalty NOT armed)\n", my_index);
+        /* Item-1 escalation: the bad secret is already refused and no watchtower
+           is armed from it. Apply the configured response so the client does not
+           keep building states it cannot protect against a proven-cheating LSP. */
+        if (cbd) {
+            cbd->lsp_forgery_detected = 1;
+            switch (cbd->lsp_forgery_response) {
+            case LSP_FORGERY_HALT:
+                fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — HALT "
+                        "policy: refusing all further commitments. Operator should "
+                        "force-close (--force-close) on the last verified state.\n",
+                        my_index);
+                break;
+            case LSP_FORGERY_CLOSE:
+                fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — CLOSE "
+                        "policy: force-closing on the last verified state.\n", my_index);
+                cbd->force_close_requested = 1;
+                break;
+            case LSP_FORGERY_CONTINUE:
+            default:
+                break;  /* legacy: refuse + no-arm, keep the session */
+            }
+        }
         cJSON_Delete(rev_msg.json);
         return;
     }
@@ -974,6 +1000,19 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
     while (!g_shutdown) {
         wire_msg_t msg;
+
+        /* Item-1 escalation: if a forged LSP revocation was detected and the policy
+           is HALT or CLOSE, stop here — refuse to accept any further commitment from
+           a proven-cheating LSP. The bad secret was already refused at detection;
+           this exits the message loop before the next commitment cycle. The actual
+           force-close (CLOSE policy) runs after the loop, from the persisted state. */
+        if (cbd && cbd->lsp_forgery_detected &&
+            cbd->lsp_forgery_response != LSP_FORGERY_CONTINUE) {
+            fprintf(stderr, "Client %u: halting daemon loop (LSP revocation forgery, "
+                    "policy=%s)\n", my_index,
+                    cbd->lsp_forgery_response == LSP_FORGERY_CLOSE ? "close" : "halt");
+            break;
+        }
 
         /* Drain messages queued by recv_or_handle_ptlc before blocking.
            MSG_COMMITMENT_SIGNED is handled inline (needs immediate revocation
@@ -2209,6 +2248,10 @@ static void usage(const char *prog) {
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
+        "                                      continue = refuse secret only (legacy)\n"
+        "                                      halt     = refuse + stop session + alert (default)\n"
+        "                                      close    = refuse + force-close on last verified state\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
@@ -2216,6 +2259,68 @@ static void usage(const char *prog) {
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
         prog);
+}
+
+/* Item-1 CLOSE policy: force-close on the last fully-verified state, reusing the
+   #313 self-custody recovery path from the client's persisted DB. Called after the
+   daemon loop exits on a detected LSP revocation forgery. Returns 1 if a recovery
+   run was executed, 0 if it could not (no DB / no chain backend). */
+static int client_force_close_from_db(const char *db_path, const char *network,
+                                      const char *cli_path, const char *rpcuser,
+                                      const char *rpcpassword, const char *datadir,
+                                      int rpcport) {
+    if (!db_path) {
+        fprintf(stderr, "Client: CLOSE policy needs --db to force-close; cannot proceed\n");
+        return 0;
+    }
+    persist_t db;
+    if (!persist_open(&db, db_path)) {
+        fprintf(stderr, "Client: CLOSE policy: cannot open DB %s\n", db_path);
+        return 0;
+    }
+    chain_backend_t chain;
+    int have_chain = 0;
+    regtest_t rt;
+    if (strcmp(network, "regtest") == 0) {
+        if (regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
+            extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
+            chain_backend_regtest_init(&chain, &rt);
+            have_chain = 1;
+        }
+    } else if (rpcuser && rpcpassword) {
+        if (chain_backend_rpc_init(&chain, "127.0.0.1", rpcport, rpcuser,
+                                    rpcpassword, NULL, network))
+            have_chain = 1;
+    }
+    if (!have_chain) {
+        fprintf(stderr, "Client: CLOSE policy: no chain backend (need regtest or "
+                "--rpcuser/--rpcpassword) — cannot force-close\n");
+        persist_close(&db);
+        return 0;
+    }
+    char fr_status[256] = {0};
+    int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+    fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
+    /* Broadcast the signed commitment TX (last verified state) if present. */
+    unsigned char signed_tx_data[4096];
+    size_t signed_tx_len = 0;
+    uint64_t sig_cn = 0;
+    if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL, signed_tx_data,
+                                    &signed_tx_len, sizeof(signed_tx_data)) &&
+        signed_tx_len > 0) {
+        char *tx_hex = malloc(signed_tx_len * 2 + 1);
+        if (tx_hex) {
+            extern void hex_encode(const unsigned char *, size_t, char *);
+            hex_encode(signed_tx_data, signed_tx_len, tx_hex);
+            char commit_txid[65];
+            if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
+                fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
+                        "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
+            free(tx_hex);
+        }
+    }
+    persist_close(&db);
+    return 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -2256,6 +2361,7 @@ int main(int argc, char *argv[]) {
     uint32_t hd_lookahead = HD_WALLET_LOOKAHEAD;
     const char *light_client_arg = NULL;
     const char *fee_estimator_arg = NULL;
+    int lsp_forgery_mode = LSP_FORGERY_HALT;  /* --on-lsp-forgery: item-1 escalation policy */
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
@@ -2377,6 +2483,14 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--fee-estimator") == 0 && i + 1 < argc)
             fee_estimator_arg = argv[++i];
+        else if (strcmp(argv[i], "--on-lsp-forgery") == 0 && i + 1 < argc) {
+            int m = client_parse_forgery_response(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "Error: --on-lsp-forgery must be continue|halt|close\n");
+                return 1;
+            }
+            lsp_forgery_mode = m;
+        }
         else if (strcmp(argv[i], "--light-client") == 0 && i + 1 < argc)
             light_client_arg = argv[++i];
         else if (strcmp(argv[i], "--light-client-fallback") == 0 && i + 1 < argc) {
@@ -3305,6 +3419,7 @@ int main(int argc, char *argv[]) {
         cbd.wt = &client_wt;
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
+        cbd.lsp_forgery_response = lsp_forgery_mode;
         cbd.auto_accept_jit = auto_accept_jit;
         cbd.test_lsps2     = test_lsps2;
         cbd.test_lsps2_buy = test_lsps2_buy;
@@ -3432,6 +3547,12 @@ int main(int argc, char *argv[]) {
                                             daemon_channel_cb, &cbd);
             }
             if (g_shutdown) break;
+            if (cbd.lsp_forgery_detected &&
+                cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
+                fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
+                        "to a proven-cheating LSP\n");
+                break;
+            }
             if (!ok) {
                 fprintf(stderr, "Client: disconnected, retrying in 1s...\n");
                 /* Run watchtower check between reconnect attempts so we can
@@ -3443,6 +3564,9 @@ int main(int argc, char *argv[]) {
                 break;  /* clean exit */
             }
         }
+        if (cbd.force_close_requested)
+            client_force_close_from_db(db_path, network, cli_path,
+                                       rpcuser, rpcpassword, datadir, rpcport);
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
@@ -3478,11 +3602,15 @@ int main(int argc, char *argv[]) {
             cbd.wt  = &client_wt;
             cbd.fee = client_fee_ptr;
             cbd.rt  = rt_ok ? &rt : NULL;
+            cbd.lsp_forgery_response = lsp_forgery_mode;
             cbd.scripted_actions   = actions;
             cbd.n_scripted_actions = n_actions;
             ok = client_run_with_channels(ctx, &kp, host, port,
                                           daemon_channel_cb, &cbd,
                                           sa_vfn, sa_vctx);
+            if (cbd.force_close_requested)
+                client_force_close_from_db(db_path, network, cli_path,
+                                           rpcuser, rpcpassword, datadir, rpcport);
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */
             multi_payment_data_t data = { actions, n_actions, 0 };

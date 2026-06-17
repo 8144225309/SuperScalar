@@ -136,6 +136,8 @@ for i in $(seq 1 "$N_CLIENTS"); do
             --lsp-pubkey "$LSP_PUBKEY" --participant-id "$i"
             --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443
             --wallet "$WALLET" --db "/tmp/ss_${TAG}_c${SK:60:4}.db")
+    # Item-1 escalation policy passthrough (continue|halt|close); unset = client default.
+    [ -n "${ON_LSP_FORGERY:-}" ] && COMMON+=(--on-lsp-forgery "$ON_LSP_FORGERY")
     case "$R" in
         send:*) DEST="${R#send:}"; DEST="${DEST%%:*}"; PRE="${R##*:}"
                 EXTRA=(--channels --send "$DEST:$PAY_AMT:$PRE") ;;
