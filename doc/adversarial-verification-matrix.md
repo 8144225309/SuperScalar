@@ -53,13 +53,18 @@ fail-open.
   (the harness clients run the daemon loop even under `--send`/`--recv`). The
   legacy bare-`--channels` consume (`scripted_consume_lsp_revoke`) was also
   hardened to verify (defense-in-depth; it previously stored blindly).
-- **Phase 4 follow-up — detect → ESCALATE** ⏳ (open hardening): the client
-  correctly DETECTS + REFUSES a cheating LSP's forged revocation, but currently
-  CONTINUES the session (payments still settle). A client that cannot obtain a
-  valid LSP revocation holds an un-penalizable old LSP state; the fund-safe
-  response is to halt + cooperatively/force-close on the last fully-verified
-  state rather than keep building states it cannot protect. Detection is wired;
-  response is the next layer. Tracked.
+- **Phase 4 follow-up — detect → ESCALATE** ✅: the client now has a selectable
+  response to a detected forgery (`--on-lsp-forgery continue|halt|close`,
+  default `halt`; see `doc/revocation-verification-standard.md` §9). Proven live
+  across all modes on the N=4 daemon harness (`ON_LSP_FORGERY` selects the mode):
+    - `continue` — 24/24 forged `0x50` refused, session continues, payments settle.
+    - `halt` (default) — refuse + **halt the daemon loop, 4/4 clients**, no reconnect.
+    - `close` — refuse + **force-close on the last verified state, 4/4 clients**
+      (`factory_recovery_run` "broadcast 3 TXs (run=1)").
+    - happy-path control (honest LSP, default `halt`) — **0** false halts, settles.
+  Parser unit-tested (`test_lsp_forgery_response_parse`). PS leaves are CLTV-gated
+  (less severe); the policy is applied uniformly today (per-leaf-type is a future
+  refinement, not a gap).
 - **Phase 5 — PTLC adaptor pre-sig + HTLC provenance** ⏳: PTLC (off-by-default)
   already verifies the turnover binding (#196); a cryptographic adaptor-pre-sig
   verify needs an adaptor-verify primitive. Client receiver-side HTLC invoice

@@ -119,7 +119,7 @@ Status of each, as of this branch:
 | Step | LSP | Client (user) | Watchtower |
 |---|---|---|---|
 | Counterparty commitment signature | ✅ | ✅ `channel_verify_and_aggregate_commitment_sig` | n/a (pre-signed) |
-| **Counterparty revocation secret** | ✅ Phase 2, fail-closed | ❌ **drops `0x50`**, no LSP-PCP tracking past cn 0/1 | ✅ transitive — only ever reads secrets verified at store time; hydrate uses pre-signed penalty TXs, never raw secrets |
+| **Counterparty revocation secret** | ✅ Phase 2, fail-closed | ✅ `client_handle_lsp_revoke_and_ack` — verifies `0x50` fail-closed + tracks the LSP's next PCP; on a detected forgery applies the **escalation policy** (§9) | ✅ transitive — only ever reads secrets verified at store time; hydrate uses pre-signed penalty TXs, never raw secrets |
 | Funding on-chain | gated | warn + hard-gated on prod (#197) | (uses pre-signed) |
 | Ceremony / MuSig | ✅ | ✅ (participates) | n/a |
 
@@ -131,11 +131,15 @@ tested green).
 (`wt_hydrate_row_cb`) loads pre-signed penalty TXs, so it never trusts a raw, unverified
 secret. (A belt-and-suspenders verify-on-ingest is a possible hardening, not a gap.)
 
-**Client — the remaining gap.** It holds the verification capability and verifies the LSP's
-commitment *signatures*, but it **discards the LSP's `revoke_and_ack` (`0x50`)** and tracks
-the LSP's per-commitment point only for commitments 0 and 1. So today the client cannot
-itself detect an LSP breach — that protection lives entirely in the standalone watchtower +
-self-exit.
+**Client — closed.** `client_handle_lsp_revoke_and_ack` now verifies the LSP's `0x50`
+fail-closed (`secret*G == committed PCP`), stores the secret only on success, and tracks the
+LSP's *next* per-commitment point so the chain stays verifiable past cn 0/1. Wired into the
+production daemon loop (`client_recv_lsp_revocation`) and the legacy bare-`--channels`
+consume. Proven live: an honest LSP's revocations are accepted (0 false-rejects across a
+routed-payment drill); a cheating LSP that forges every `0x50` is refused 24/24 fail-closed
+with no watchtower armed from a forgery (see `doc/adversarial-verification-matrix.md`). The
+client can now itself detect an LSP breach attempt at the revocation step — and respond to
+it per the policy in §9.
 
 ### Client implementation plan (focused next piece)
 1. Add `client_handle_lsp_revoke_and_ack(ch, ctx, msg)` mirroring the LSP handler:
@@ -153,3 +157,50 @@ self-exit.
    one across many commitments; existing client/reconnect suites stay green.
 4. Design note: the client retaining LSP revocations enables self-detection; whether it
    self-penalizes or hands secrets to its watchtower is a separate (existing) concern.
+
+## 9. Detection → Response: the escalation policy (`--on-lsp-forgery`)
+
+Verification (§5–§8) tells the client *that* the LSP forged a revocation. It does **not**
+by itself decide what to do next. Detection is necessary but not sufficient: a client that
+cannot obtain a *valid* LSP revocation is holding an **un-penalizable old LSP state** — if
+the LSP later broadcasts that revoked state, the client cannot build a valid penalty and is
+exposed (the receiver of a payment is most exposed, having gained balance). So continuing to
+build new states the client cannot protect is the riskiest choice.
+
+The client exposes a selectable response, applied at the detection point
+(`client_recv_lsp_revocation` → on a fail-closed verify), via `--on-lsp-forgery MODE`:
+
+| Mode | Behaviour on a detected forged `0x50` | When to use |
+|---|---|---|
+| `continue` | Refuse the bad secret, arm no watchtower from it, **keep the session** (legacy). | Testing / maximum tolerance; leaves the exposure open. |
+| `halt` (**default**) | Refuse + **stop accepting further commitments** + CRITICAL alert + do not reconnect to the proven-cheating LSP. No on-chain action. | Default: stops the exposure without surprise on-chain spends; operator decides whether to close. |
+| `close` | `halt` + **force-close on the last fully-verified state** (reuses the #313 self-custody `factory_recovery_run` from the persisted DB + broadcasts the last signed commitment). | Maximum fund-safety; accepts the on-chain cost. |
+
+In **every** mode the forged secret is refused and no watchtower is armed from it — the modes
+differ only in what happens *after* detection. The default is `halt`, **not** the legacy
+`continue`: it only ever triggers on a genuinely detected forgery (an honest LSP's
+revocations verify — proven by 0 false-rejects on the happy-path drill), so honest operation
+is unaffected while the exposure is closed by default.
+
+**Wiring.** `lsp_forgery_response_t` enum + `client_parse_forgery_response` (`src/client.c`,
+unit-tested by `test_lsp_forgery_response_parse`); `daemon_cb_data_t` carries the policy +
+`lsp_forgery_detected` + `force_close_requested`; the daemon loop breaks on detection (both
+the `--daemon` and scripted `--send`/`--recv` paths); `client_force_close_from_db` performs
+the `close`-mode recovery after the loop.
+
+**PS-leaf-type nuance.** Pseudo-Spilman (PS) leaves are **CLTV-gated**, not revocation-gated,
+so a forged LSP revocation is *less* severe on a PS leaf (funds are protected by the timeout,
+not by the ability to penalize) than on a revocation-gated leaf. The policy is applied
+**uniformly** today; a per-leaf-type response (e.g. tolerate on PS, force-close on
+revocation-gated) is a possible future refinement, not a current gap.
+
+**Live evidence (regtest, N=4 daemon payment harness; `ON_LSP_FORGERY` selects the mode):**
+
+| Drill | Config | Observed |
+|---|---|---|
+| happy-path control | no cheat, default (`halt`) | **PASS** — payments settle e2e, cooperative close confirmed on-chain, sats conserved; **0** forgery refusals, **0** halts (an honest LSP never trips the policy — the default is safe) |
+| `continue` | cheat + `continue` | **24/24** forged `0x50` refused fail-closed; session continues; payments still settle (legacy behaviour, exposure left open) |
+| `halt` (default) | cheat + `halt` | clients refuse the forgery, log `CRITICAL`, and **halt the daemon loop (4/4 clients)** without reconnecting — no further commitments accepted, no on-chain action |
+| `close` | cheat + `close` | clients refuse + **force-close on the last verified state (4/4 clients)** via the #313 self-custody `factory_recovery_run` — `CLOSE policy force-close: factory 0 (state=active): broadcast 3 TXs (run=1)` |
+
+The refusal counts differ by design: `continue` processes all 24 forged revocations (it never stops), while `halt`/`close` stop at the first detection (≈1 per client) — both refuse every forgery they see, fail-closed, before acting.
