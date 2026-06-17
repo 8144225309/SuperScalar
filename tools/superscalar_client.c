@@ -299,16 +299,26 @@ typedef struct {
    commitment at close, and the LSP's handle_fulfill_htlc times out waiting for the
    REVOKE and returns 0 → "event loop failed").  Deterministic: the LSP sends
    exactly one revoke per commitment, so a single blocking recv is correct. */
-static void scripted_consume_lsp_revoke(int fd, channel_t *ch) {
+static int scripted_consume_lsp_revoke(int fd, channel_t *ch, secp256k1_context *ctx) {
     wire_msg_t m;
-    if (!wire_recv(fd, &m)) return;
+    if (!wire_recv(fd, &m)) return 1;   /* nothing arrived to apply */
+    int ok = 1;
     if (m.msg_type == MSG_LSP_REVOKE_AND_ACK && m.json) {
-        uint32_t cid; unsigned char rsec[32] = {0}, rpt[33];
-        if (wire_parse_revoke_and_ack(m.json, &cid, rsec, rpt))
-            channel_receive_revocation(ch, ch->commitment_number - 1, rsec);
-        secure_zero(rsec, 32);
+        /* Revocation-verification standard: the scripted --send/--recv flows must
+           VERIFY the LSP's revocation exactly like the daemon path
+           (client_recv_lsp_revocation) — not blindly store it. Route through the
+           shared, tested, fail-closed handler: it checks secret*G == the LSP's
+           committed point, stores ONLY on success, and tracks the next PCP (which
+           this path previously discarded, so subsequent revokes were unverifiable). */
+        if (!client_handle_lsp_revoke_and_ack(ch, ctx, &m)) {
+            fprintf(stderr, "Client: SECURITY: LSP revocation FAILED verification "
+                    "(commitment %llu) — refusing, NOT stored (no WT-arm)\n",
+                    (unsigned long long)(ch->commitment_number ? ch->commitment_number - 1 : 0));
+            ok = 0;
+        }
     }
     if (m.json) cJSON_Delete(m.json);
+    return ok;
 }
 
 /* Channel callback replicating multi_payment_client_cb from test harness */
@@ -347,7 +357,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
-                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 fprintf(stderr, "Client %u: expected COMMIT_SIGNED, got 0x%02x\n",
                         my_index, msg.msg_type);
@@ -385,7 +395,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
-                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -420,7 +430,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
-                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -453,7 +463,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
-                scripted_consume_lsp_revoke(fd, ch);  /* LSP bidirectional revoke */
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 cJSON_Delete(msg.json);
             }

@@ -72,6 +72,22 @@ void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (!channel_get_revocation_secret(ch, old_cn, lsp_rev_secret))
         return;
 
+    /* ADV Phase 4 (adversarial item-1): a CHEATING LSP that hands the client a
+       valid-LOOKING but WRONG revocation secret, to prove the client's
+       fail-closed verifier rejects a forged 0x50 in a LIVE routed payment and
+       refuses to arm its watchtower from it. Defense-bypass class -> regtest-
+       gated: a directly-set env var is inert on signet/testnet/mainnet (gate
+       default 0). Marker: LSP-CHEAT-BADREV. */
+    {
+        const char *badrev = getenv("SS_CHEAT_LSP_BAD_REVOCATION");
+        if (badrev && badrev[0] && badrev[0] != '0' && superscalar_cheat_allowed()) {
+            fprintf(stderr, "LSP-CHEAT-BADREV: corrupting revocation secret for "
+                    "client %zu (commitment %llu) — client MUST reject + refuse "
+                    "WT-arm\n", client_idx, (unsigned long long)old_cn);
+            lsp_rev_secret[0] ^= 0xff;   /* secret*G now != the committed PCP */
+        }
+    }
+
     /* Get LSP's next per-commitment point */
     secp256k1_pubkey next_pcp;
     if (!channel_get_per_commitment_point(ch, ch->commitment_number + 1, &next_pcp)) {
