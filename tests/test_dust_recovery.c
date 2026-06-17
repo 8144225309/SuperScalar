@@ -37,6 +37,7 @@
 
 #include "superscalar/htlc_commit.h"
 #include "superscalar/channel.h"
+#include "superscalar/crash_inject.h"   /* #9 cheat-gate: cheats are inert unless armed */
 
 #include <string.h>
 #include <stdio.h>
@@ -148,6 +149,10 @@ int test_dust_race_defense_rejects_ptlc(void) {
 /* DR3 — SS_CHEAT_DUST_RACE=1 ACCEPTS the otherwise-rejected feerate   */
 /* ------------------------------------------------------------------ */
 int test_dust_race_cheat_bypass(void) {
+    /* #9: defense-bypass cheats require BOTH the env flag AND the regtest
+       cheat-gate. This test exercises the cheat's bypass behavior, so it must
+       arm the gate (as the regtest binary does); it is reset before return. */
+    superscalar_set_cheat_gate(1);
     setenv("SS_CHEAT_DUST_RACE", "1", 1);
 
     channel_t ch;
@@ -173,6 +178,7 @@ int test_dust_race_cheat_bypass(void) {
            "DR3: fee_rate updated to attacker-chosen ceiling");
 
     unsetenv("SS_CHEAT_DUST_RACE");
+    superscalar_set_cheat_gate(0);
     return 1;
 }
 
@@ -255,6 +261,10 @@ int test_dust_race_boundary_accept(void) {
 /* DR6 — cheat does NOT bypass floor/ceiling checks                    */
 /* ------------------------------------------------------------------ */
 int test_dust_race_cheat_does_not_bypass_floor(void) {
+    /* #9: arm the cheat-gate so the cheat is genuinely active — proving the
+       floor/ceiling bounds hold EVEN against an armed cheat (not trivially
+       because the cheat was inert). */
+    superscalar_set_cheat_gate(1);
     setenv("SS_CHEAT_DUST_RACE", "1", 1);
 
     channel_t ch;
@@ -290,6 +300,7 @@ int test_dust_race_cheat_does_not_bypass_floor(void) {
     ASSERT(ch.fee_rate_sat_per_kvb == 1000, "DR6: fee_rate unchanged");
 
     unsetenv("SS_CHEAT_DUST_RACE");
+    superscalar_set_cheat_gate(0);
     return 1;
 }
 
@@ -297,6 +308,8 @@ int test_dust_race_cheat_does_not_bypass_floor(void) {
 /* DR7 — cheat applies per-HTLC and still updates ch->fee_rate          */
 /* ------------------------------------------------------------------ */
 int test_dust_race_cheat_per_htlc(void) {
+    /* #9: arm the regtest cheat-gate so the bypass behavior is reachable. */
+    superscalar_set_cheat_gate(1);
     setenv("SS_CHEAT_DUST_RACE", "1", 1);
 
     channel_t ch;
@@ -327,5 +340,6 @@ int test_dust_race_cheat_per_htlc(void) {
            "DR7: fee_rate updated to attacker-chosen ceiling");
 
     unsetenv("SS_CHEAT_DUST_RACE");
+    superscalar_set_cheat_gate(0);
     return 1;
 }
