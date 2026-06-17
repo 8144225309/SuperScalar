@@ -713,16 +713,22 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         cJSON_Delete(rev_msg.json);
         return;
     }
-    uint32_t rev_chan_id;
-    unsigned char lsp_rev_secret[32], lsp_next_point[33];
-    if (wire_parse_revoke_and_ack(rev_msg.json, &rev_chan_id,
-                                    lsp_rev_secret, lsp_next_point)) {
+    /* Revocation-verification standard (client side): verify + retain the LSP's
+       revocation via the shared, tested handler (fail-closed). It checks
+       secret*G == the LSP's committed point, stores the secret, and tracks the
+       LSP's next per-commitment point. If verification fails we must NOT arm the
+       watchtower from a bad secret (it would build a penalty that can't spend). */
+    if (!client_handle_lsp_revoke_and_ack(ch, ctx, &rev_msg)) {
+        fprintf(stderr, "Client %u: LSP revocation FAILED verification "
+                "— refusing (penalty NOT armed)\n", my_index);
+        cJSON_Delete(rev_msg.json);
+        return;
+    }
+    if (ch->commitment_number > 0) {
         uint64_t old_cn = ch->commitment_number - 1;
-        channel_receive_revocation(ch, old_cn, lsp_rev_secret);
 
-        /* Register with client watchtower using the OLD commitment's amounts.
-           Use local channel index 0 (not the LSP's factory-wide rev_chan_id)
-           because the client watchtower has only one channel at index 0. */
+        /* Arm the client watchtower with the now-verified revoked commitment.
+           Local channel index 0 (the client watchtower has one channel). */
         if (cbd && cbd->wt) {
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 0, old_cn,
@@ -731,45 +737,31 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
                 /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
         }
 
-        /* Store LSP's next per-commitment point */
-        secp256k1_pubkey next_pcp;
-        if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, lsp_next_point, 33)) {
-            channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
-            /* Persist both current and next remote PCPs for crash recovery */
-            if (cbd && cbd->db) {
-                unsigned char ser[33];
-                size_t slen = 33;
-                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &next_pcp,
-                                               SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0,
-                    ch->commitment_number + 1, ser);
-                /* Also persist the current PCP (may have just been set) */
-                secp256k1_pubkey cur_pcp;
-                if (channel_get_remote_pcp(ch, ch->commitment_number, &cur_pcp)) {
-                    slen = 33;
-                    secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &cur_pcp,
-                                                   SECP256K1_EC_COMPRESSED);
-                    persist_save_remote_pcp(cbd->db, 0,
-                        ch->commitment_number, ser);
-                }
-            }
-        }
-
-        /* Persist our own local PCS so they survive crash/reconnect.
-           Without this, reconnect generates new random PCS that don't
-           match the PCPs the LSP has stored, breaking sig verification. */
+        /* Persist remote PCPs (handler set the next one in-memory) + local PCS
+           for crash recovery. */
         if (cbd && cbd->db) {
+            unsigned char ser[33];
+            size_t slen;
+            secp256k1_pubkey pcp;
+            if (channel_get_remote_pcp(ch, ch->commitment_number + 1, &pcp)) {
+                slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
+            }
+            if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
+                slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
+            }
             unsigned char pcs[32];
             if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
-                persist_save_local_pcs(cbd->db, 0,
-                    ch->commitment_number, pcs);
+                persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
             if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
-                persist_save_local_pcs(cbd->db, 0,
-                    ch->commitment_number + 1, pcs);
+                persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
             memset(pcs, 0, 32);
         }
-
-        memset(lsp_rev_secret, 0, 32);
     }
     cJSON_Delete(rev_msg.json);
 }
