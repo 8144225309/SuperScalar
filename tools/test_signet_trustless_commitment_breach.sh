@@ -93,9 +93,13 @@ done
 grep -q "hydrated" "$WT_LOG" || fail "WT did not hydrate from wt.db"
 [ "$FIRED" = 1 ] || { tail -30 "$WT_LOG"; fail "standalone WT did not broadcast a penalty"; }
 
-PEN_TXID=$(grep -oiE "penalty tx[^0-9a-f]*[0-9a-f]{64}|[0-9a-f]{64}" "$WT_LOG" | grep -oE "[0-9a-f]{64}" | head -1)
+PEN_TXID=$(grep -oiE "Latest state tx broadcast: *[0-9a-f]{64}|penalty tx[^0-9a-f]*[0-9a-f]{64}" "$WT_LOG" | grep -oE "[0-9a-f]{64}" | tail -1)
 echo "  [$(ts)] penalty txid: $PEN_TXID — waiting for it to relay + confirm at 0.1 sat/vB..."
 H_PEN=$(wait_confirm "$PEN_TXID" "$CONFIRM_TIMEOUT") || fail "penalty never confirmed (relay/mining at 0.1 sat/vB?)"
+PEN_OUT=$(bitcoin-cli -signet -rpcuser="$RU" -rpcpassword="$RP" -rpcport="${RPORT:-38332}" getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+PEN_SATS=$(awk "BEGIN{printf \"%d\", ($PEN_OUT+0)*100000000}")
+echo "  [$(ts)] penalty largest output: ${PEN_SATS:-0} sats (breached to_local ~30k)"
+[ "${PEN_SATS:-0}" -ge 20000 ] || fail "penalty payout ${PEN_SATS} sats too small -- not a real to_local recovery"
 
 echo
 echo "=== evidence ==="

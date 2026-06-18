@@ -21,6 +21,8 @@ cleanup(){ pkill -9 -f "superscalar_watchtower.*--wt-db $WT_DB" 2>/dev/null||tru
 trap cleanup EXIT
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }; red(){ printf '\033[31m%s\033[0m\n' "$*"; }; fail(){ red "FAIL: $*"; recov; exit 1; }
 ts(){ date -u +%H:%M:%S; }; tip(){ bitcoin-cli -signet -rpcuser=$RU -rpcpassword=$RP -rpcport=$RPORT getblockcount 2>/dev/null; }
+confirm_height(){ local txid="$1" bh; bh=$(bitcoin-cli -signet -rpcuser=$RU -rpcpassword=$RP -rpcport=$RPORT getrawtransaction "$txid" true 2>/dev/null | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE "[0-9a-f]{64}" | head -1); [ -z "$bh" ] && return 1; bitcoin-cli -signet -rpcuser=$RU -rpcpassword=$RP -rpcport=$RPORT getblockheader "$bh" 2>/dev/null | grep -oE '"height": *[0-9]+' | grep -oE "[0-9]+" | head -1; }
+wait_confirm(){ local txid="$1" budget="$2" waited=0 h; while [ "$waited" -lt "$budget" ]; do h=$(confirm_height "$txid") && { echo "$h"; return 0; }; sleep 60; waited=$((waited+60)); done; return 1; }
 recov(){ echo "--- RECOVERY: $AMOUNT sats from $WALLET; residual sub-factory/leaf outputs spendable via LSP/client keys — sweep manually (cf #309). dbs $TMPDIR (preserved /tmp/sub_signet_*.log) ---"; }
 echo "=== SIGNET: sub-factory breach x STANDALONE trustless WT (0.1 sat/vB) ==="
 echo "  [$(ts)] height $(tip), amount=$AMOUNT, k=$PS_SUB_ARITY, fee=$FEE_RATE. signet ~10min/block — multi-hour."
@@ -55,5 +57,8 @@ for i in $(seq 1 $((CONFIRM_TIMEOUT/15))); do sleep 15; grep -qE "penalty tx\(s\
 grep -q "hydrated" "$WT_LOG" || fail "WT did not hydrate from wt.db"
 echo; echo "=== evidence ==="; grep -aE "TRUSTLESS|hydrated|penalty tx|burn tx|Latest state" "$WT_LOG" 2>/dev/null | head -8
 echo
+SUB_PEN=$(grep -oiE "Latest state tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|penalty tx[^0-9a-f]*[0-9a-f]{64}" "$WT_LOG" | grep -oE "[0-9a-f]{64}" | tail -1)
+[ "$FIRED" = 1 ] && [ -n "$SUB_PEN" ] && { echo "  [$(ts)] sub-factory penalty txid: $SUB_PEN -- confirming..."; H_SPEN=$(wait_confirm "$SUB_PEN" "$CONFIRM_TIMEOUT") || fail "sub-factory penalty never confirmed"; echo "  [$(ts)] sub-factory penalty confirmed @ $H_SPEN"; }
+[ -n "$SUB_PEN" ] && { SP_OUT=$(bitcoin-cli -signet -rpcuser="$RU" -rpcpassword="$RP" -rpcport="${RPORT:-38332}" getrawtransaction "$SUB_PEN" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1); SP_SATS=$(awk "BEGIN{printf \"%d\", ($SP_OUT+0)*100000000}"); echo "  [$(ts)] sub-factory penalty largest output: ${SP_SATS:-0} sats"; [ "${SP_SATS:-0}" -ge 5000 ] || fail "sub-factory penalty payout ${SP_SATS} sats too small"; }
 if [ "$FIRED" = 1 ]; then green "PASS (signet): standalone trustless WT hydrated $K1 kind=1 watch(es) and penalized a sub-factory breach at 0.1 sat/vB."; recov; exit 0
 else red "FAIL (signet): standalone WT did not penalize the sub-factory breach"; tail -25 "$WT_LOG"; recov; exit 1; fi
