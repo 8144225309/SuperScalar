@@ -163,7 +163,7 @@ grep -q "hydrated" "$WT1_LOG" || fail "WT#1 did not hydrate from wt.db"
 [ "$FIRED" = 1 ] || { tail -30 "$WT1_LOG"; fail "cold-restarted WT did not broadcast the response"; }
 
 RESP_TXID=$(grep -E "Latest state tx broadcast:" "$WT1_LOG" | head -1 | grep -oE "[0-9a-f]{64}" | head -1)
-[ -n "$RESP_TXID" ] || RESP_TXID=$(grep -oE "[0-9a-f]{64}" "$WT1_LOG" | head -1)
+[ -n "$RESP_TXID" ] || fail "no response txid in WT log (refusing head-1 fallback that could false-pass on a stray hash)"
 echo "  [$(ts)] response txid: $RESP_TXID — waiting for it to relay + confirm at 0.1 sat/vB..."
 R_HEIGHT=$(wait_confirm "$RESP_TXID" "$CONFIRM_TIMEOUT") || fail "response tx never confirmed (relay/mining at 0.1 sat/vB?)"
 MARGIN=$((CLTV - R_HEIGHT))
