@@ -249,11 +249,19 @@ if [ "$WT_FIRED" -eq 1 ]; then
     echo "  WT response txid: $PEN_TXID — mining to confirm + verify payout"
     PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
     echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
-    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
-    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
-    echo "  WT response confirmed on-chain; largest output ${PSATS:-0} sats"
-    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
-    echo "  PASS: standalone WT detected sub-factory breach, broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just a log line"
+    # Finding-2 fix: a sub-factory penalty REDISTRIBUTES to N per-client P2TR outputs (verified on
+    # signet: 3 outputs 55416/44333/33051, no change). Assert the SMALLEST per-client output is
+    # above dust — checking only 'largest' would pass even if one client were shorted to dust.
+    PINFO=$(echo "$PRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); vs=[int(round(v["value"]*1e8)) for v in d["vout"] if v["scriptPubKey"].get("type")=="witness_v1_taproot"]
+ print(min(vs) if vs else 0, len(vs), sum(vs))
+except Exception: print("0 0 0")')
+    PMIN=$(echo "$PINFO" | awk "{print \$1}"); PNUM=$(echo "$PINFO" | awk "{print \$2}"); PTOT=$(echo "$PINFO" | awk "{print \$3}")
+    echo "  WT response confirmed on-chain; $PNUM per-client P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
+    [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: WT response has no P2TR recovery output"; exit 1; }
+    [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    echo "  PASS: standalone WT detected sub-factory breach, broadcast AND CONFIRMED its redistribution ($PEN_TXID; $PNUM clients, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     exit 0
 else
     echo "  FAIL: standalone WT did not broadcast penalty TXs"

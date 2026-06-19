@@ -218,11 +218,18 @@ if [ "$BREACH_DETECTED" -ge 1 ] && [ "$POISON_BROADCAST" -ge 1 ]; then
     echo "  defense (realloc/poison) txid: $PEN_TXID — mining to confirm + verify redistribution"
     PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
     echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: defense $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
-    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
-    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
-    echo "  defense confirmed on-chain; largest output ${PSATS:-0} sats"
-    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: defense output ${PSATS} sats <= dust — not a real redistribution"; exit 1; }
-    echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + broadcast AND CONFIRMED defense $PEN_TXID (${PSATS} sats) — outcome verified, not just a log line"
+    # Finding-2 fix: L-stock realloc REDISTRIBUTES to per-client P2TR outputs — assert the SMALLEST
+    # is above dust ('largest' alone would pass even if one client were shorted to dust).
+    PINFO=$(echo "$PRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); vs=[int(round(v["value"]*1e8)) for v in d["vout"] if v["scriptPubKey"].get("type")=="witness_v1_taproot"]
+ print(min(vs) if vs else 0, len(vs), sum(vs))
+except Exception: print("0 0 0")')
+    PMIN=$(echo "$PINFO" | awk "{print \$1}"); PNUM=$(echo "$PINFO" | awk "{print \$2}"); PTOT=$(echo "$PINFO" | awk "{print \$3}")
+    echo "  defense confirmed on-chain; $PNUM P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
+    [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: defense has no P2TR redistribution output"; exit 1; }
+    [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + CONFIRMED redistribution $PEN_TXID ($PNUM outs, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0
 fi

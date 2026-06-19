@@ -65,6 +65,20 @@ SUB_PEN=$(grep -oiE "Latest state tx broadcast: *[0-9a-f]{64}|L-stock burn tx br
 # confirmed only after the test's old budget elapsed (signet block timing is variable).
 SPEN_BUDGET=$CONFIRM_TIMEOUT; [ "$SPEN_BUDGET" -lt 10800 ] && SPEN_BUDGET=10800
 [ "$FIRED" = 1 ] && [ -n "$SUB_PEN" ] && { echo "  [$(ts)] sub-factory penalty txid: $SUB_PEN -- confirming (2-stage, budget ${SPEN_BUDGET}s)..."; H_SPEN=$(wait_confirm "$SUB_PEN" "$SPEN_BUDGET") || fail "sub-factory penalty $SUB_PEN broadcast but NOT confirmed within ${SPEN_BUDGET}s — 2-stage breach->penalty on signet's variable timing; re-check on-chain (getrawtransaction $SUB_PEN) before concluding the defense failed"; echo "  [$(ts)] sub-factory penalty confirmed @ $H_SPEN"; }
-[ -n "$SUB_PEN" ] && { SP_OUT=$(bitcoin-cli -signet -rpcuser="$RU" -rpcpassword="$RP" -rpcport="${RPORT:-38332}" getrawtransaction "$SUB_PEN" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1); SP_SATS=$(awk "BEGIN{printf \"%d\", ($SP_OUT+0)*100000000}"); echo "  [$(ts)] sub-factory penalty largest output: ${SP_SATS:-0} sats"; [ "${SP_SATS:-0}" -ge 5000 ] || fail "sub-factory penalty payout ${SP_SATS} sats too small"; }
+# Finding-2 fix: a sub-factory penalty REDISTRIBUTES to N per-client P2TR outputs (proven cf4e4bf:
+# 3 outputs 55416/44333/33051, no change). Assert the SMALLEST per-client output is above dust —
+# checking only 'largest' would pass even if one client were shorted to dust.
+if [ -n "$SUB_PEN" ]; then
+  SRAW=$(bitcoin-cli -signet -rpcuser="$RU" -rpcpassword="$RP" -rpcport="${RPORT:-38332}" getrawtransaction "$SUB_PEN" true 2>/dev/null)
+  SPINFO=$(echo "$SRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); vs=[int(round(v["value"]*1e8)) for v in d["vout"] if v["scriptPubKey"].get("type")=="witness_v1_taproot"]
+ print(min(vs) if vs else 0, len(vs), sum(vs))
+except Exception: print("0 0 0")')
+  SP_MIN=$(echo "$SPINFO" | awk "{print \$1}"); SP_NUM=$(echo "$SPINFO" | awk "{print \$2}"); SP_TOT=$(echo "$SPINFO" | awk "{print \$3}")
+  echo "  [$(ts)] sub-factory redistribution: $SP_NUM P2TR output(s), smallest ${SP_MIN:-0} sats, total ${SP_TOT:-0} sats"
+  [ "${SP_NUM:-0}" -ge 1 ] || fail "sub-factory penalty has no P2TR redistribution output"
+  [ "${SP_MIN:-0}" -ge 330 ] || fail "a per-client output ${SP_MIN} sats <= dust — redistribution shorted a client"
+fi
 if [ "$FIRED" = 1 ]; then green "PASS (signet): standalone trustless WT hydrated $K1 kind=1 watch(es) and penalized a sub-factory breach at 0.1 sat/vB."; recov; exit 0
 else red "FAIL (signet): standalone WT did not penalize the sub-factory breach"; tail -25 "$WT_LOG"; recov; exit 1; fi
