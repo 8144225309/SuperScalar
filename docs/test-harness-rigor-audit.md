@@ -268,14 +268,15 @@ in validate3 with the node up). Lesson for the matrix: assert the node is reacha
 test (a dead node silently fails every downstream test as "LSP died").
 
 **Status of follow-ups (2026-06-19, PR #385):**
-- **A-2 ratio check — IMPLEMENTED.** `regtest_test_helpers.sh::pen_recovers_most TXID [PCT]`
-  (sum(outputs) ≥ 90% of sum(input prevouts); param-robust, closes F1/F3) wired into the three
-  redistribution defenses (subfactory/realloc/lstock). Validating in `ss-rigor-validate8`.
+- **A-2 ratio check — IMPLEMENTED + VALIDATED.** `regtest_test_helpers.sh::pen_recovers_most
+  TXID [PCT]` (sum(outputs) ≥ 90% of sum(input prevouts); param-robust, closes F1/F3) wired into
+  the three redistribution defenses. **VALIDATED (validate8/9):** subfactory 99.85% (132800/133000),
+  realloc 98.5% (65534/66534), lstock 98.5% — all PASS, penalties pay out ~all they sweep.
 - **Node-up guard — IMPLEMENTED.** `regtest_test_helpers.sh::require_node_up` (exit 78 with a
   clear message; a dead node otherwise fails every test as "LSP died" — the validate4-6 trap).
-- **lstock funding — FIXED.** Pointed at the funded `ss_cheat_leaf_miner` (regtest is at block
-  ~1561 = ~10 subsidy halvings, so a fresh wallet's 101-blk mine is ~0.05 BTC — too little).
-  Validating in `ss-rigor-validate9`.
+- **lstock funding — FIXED + VALIDATED.** Pointed at the funded `ss_cheat_leaf_miner` (regtest at
+  block ~1561 = ~10 subsidy halvings, so a fresh wallet's 101-blk mine is ~0.05 BTC — too little).
+  **validate9 PASS** (rc=0; min 32767, A-2 98.5%).
 - **Still open (handed off):** Tier-4 reorg/rebroadcast/selfdrive (penalty re-fires post-reorg);
   rollover ASan-binary choice; signet re-validation of the signet-side fixes (multi-hour); taproot
   recovery #28/#29; wiring `pen_recovers_most`/`require_node_up` into the single-sweep + remaining
