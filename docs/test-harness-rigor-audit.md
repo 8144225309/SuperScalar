@@ -280,3 +280,40 @@ test (a dead node silently fails every downstream test as "LSP died").
   rollover ASan-binary choice; signet re-validation of the signet-side fixes (multi-hour); taproot
   recovery #28/#29; wiring `pen_recovers_most`/`require_node_up` into the single-sweep + remaining
   tests + the VPS matrix runner.
+
+## 9. Resume state (post-compaction continuation)
+
+**Branch/PR:** `test/harness-rigor-remediation` → PR **#385** → base `integration/security-e2e`
+(github 8144225309/SuperScalar). **Push from LOCAL** (Windows) — git creds are not on the VPS.
+
+**In-flight VPS runs (systemd transient units; poll the .output, don't reconnect to babysit):**
+- `ss-rigor-validate8` → `/root/_rigor_validate8.output` — A-2 ratio on subfactory (PASS, 99.85%) + realloc.
+- `ss-rigor-validate9` → `/root/_rigor_validate9.output` — lstock re-run (gated behind v8).
+- Re-launch pattern: `systemd-run --unit=ss-rigor-validateN --collect /root/_rigor_validateN.sh`;
+  each script does `git -C /root/SuperScalar fetch origin <branch>` + a detached `--force --detach`
+  worktree at `/root/SuperScalar-rigor`, runs tests against `/root/SuperScalar/build-release`,
+  passing `BUILD_DIR=$BD` env **and** `$BD` as `$1` (covers `${1:-}` and `${BUILD_DIR:-}` tests).
+
+**Regtest node (critical gotcha):** bitcoind-regtest is **not** a systemd unit and was found
+cleanly shut down once → every test then failed as a cryptic "LSP died". If down, restart as root:
+`/usr/local/bin/bitcoind-jaynet -conf=/var/lib/bitcoind-regtest/bitcoin.conf`. State when healthy:
+block ~1561, `ss_cheat_leaf_miner` ≈ 8393 BTC (NO faucet exhaustion — that earlier theory was
+wrong). The `require_node_up` helper now makes a dead node fail loudly.
+
+**Signet RPC** is starved by the recovery daemon's `scantxoutset` → `systemctl stop
+ss-recover-signet` before signet `bitcoin-cli`, then `systemctl start ss-recover-signet`. Decode
+helper used during Phase 1/2: getrawtransaction + python (plain quotes — heredoc is `'EOF'` literal).
+
+**Scoped pkill discipline:** `pkill -9 -f 'superscalar.*--network regtes[t]'` (the `[t]` avoids
+self-match) — verified to spare the testnet4 N=64 runner (`--network testnet4`).
+
+**Next coherent block (recommended order):**
+1. Confirm `ss-rigor-validate8`/`9` green (A-2 realloc + lstock). Then the PR's validated scope is complete.
+2. **Tier-4**: `test_regtest_adversarial_reorg.sh` / `test_regtest_same_height_reorg.sh` — after the
+   "REORG" log, assert a penalty RE-fires + confirms post-reorg (currently only logs "REORG").
+   `test_regtest_rebroadcast_recovery.sh` — reconfirm the resent tx. `test_signet_selfdrive.sh` — marker-only.
+3. **Wire** `pen_recovers_most`/`require_node_up` into single-sweep tests (commitment, ps_commitment,
+   kind3, htlc, cheat_client, leaf, leaf_late_wt) + the VPS matrix runner.
+4. **rollover**: run against the ASan `build` (not build-release+LD_PRELOAD) or stabilize.
+5. **Signet re-validation** + **taproot recovery #28/#29** — batch into one deliberate signet session
+   (sat budget, daemon-pause, strong keys per [feedback_no_weak_keys_signet]).
