@@ -108,10 +108,17 @@ echo; echo "=== WT log tail ==="; tail -30 "$WT_LOG"
 HYDRATED=$(grep -c "hydrated" "$WT_LOG" 2>/dev/null || echo 0)
 echo; echo "=== Final result ==="
 echo "  armed=$ARMED kind3=$K3 wt_hydrated=$HYDRATED wt_fired=$WT_FIRED sweep_txid=${SWEEP_TXID:-none} sweep_confirmed=$SWEEP_CONF"
-if [ "$ARMED" -eq 1 ] && [ "${K3:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ]; then
+# Tier-3 rigor: confirmation alone doesn't prove the sweep moved REAL value — assert amount.
+SWEEP_SATS=0
+if [ "$SWEEP_CONF" -eq 1 ]; then
+    SV=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    SWEEP_SATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
+    echo "  sweep largest output: ${SWEEP_SATS:-0} sats"
+fi
+if [ "$ARMED" -eq 1 ] && [ "${K3:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 1000 ]; then
     green "PASS: secret-less standalone WT (--wt-db only) swept the LSP's HTLC-timeout from wt.db (kind=3)"
-    green "      alone — pre-signed sweep $SWEEP_TXID broadcast + CONFIRMED on-chain, spending the"
-    green "      force-close commit. Force-close HTLC-sweep delegation PROVEN trustless (last matrix cell)."
+    green "      alone — pre-signed sweep $SWEEP_TXID broadcast + CONFIRMED on-chain ($SWEEP_SATS sats),"
+    green "      spending the force-close commit. Force-close HTLC-sweep delegation PROVEN trustless (last matrix cell)."
     exit 0
 fi
-red "FAIL: need armed + kind3>=1 + WT broadcast + sweep confirmed on-chain"; exit 1
+red "FAIL: need armed + kind3>=1 + WT broadcast + sweep confirmed + real amount (>=1000 sats)"; exit 1
