@@ -328,30 +328,37 @@ echo "=== reorg events ==="
 [ -s "$REORG_LOG" ] && cat "$REORG_LOG" || echo "  (none)"
 echo
 echo "=== Final result ==="
-# Two valid defense outcomes:
-#   (a) Standalone WT broadcast penalty TXs (the original pass criterion).
-#   (b) LSP-side Tier B advanced the chain BEFORE the cheat's stale state could
-#       land, making it unspendable. The cheat is neutralized without WT
-#       broadcast. The LSP log contains "Tier B made stale state unspendable"
-#       in that path.
-TIER_B_NEUTRALIZED=$(grep -cE "Tier B made stale state unspendable|stale broadcast failed" "$LSP_LOG" 2>/dev/null || echo 0)
+# This test validates the STANDALONE trustless WT. PASS requires the WT to have actually
+# defended AND for that defense to CONFIRM on-chain — not a broadcast log line, and NOT an
+# unrelated LSP-side Tier B rollover (a different mechanism that tells us nothing about the WT).
+# cf. sibling cheat_leaf_multistate.sh: "Tier B made stale unspendable by itself is NOT a
+# defense — counting it as PASS false-positives a broken WT."
+set +e
+TIER_B_NEUTRALIZED=$(grep -cE "Tier B made stale state unspendable|stale broadcast failed" "$LSP_LOG" 2>/dev/null | head -1)
 TIER_B_NEUTRALIZED="${TIER_B_NEUTRALIZED:-0}"
-if [ $WT_FIRED -eq 1 ]; then
+if [ "$WT_FIRED" -eq 1 ]; then
     BREACHES=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM breach_detections;" 2>/dev/null || echo 0)
-    if [ "${BREACHES:-0}" -ge 1 ]; then
-        echo "  PASS: standalone WT detected chain[$CHEAT_STATE] stale + broadcast penalty TXs (breach_detections=$BREACHES rows)"
-        exit 0
-    else
-        echo "  PARTIAL: WT broadcast penalty but no breach_detections row persisted"
-        echo "  (defense fired; persistence gap = separate concern)"
-        exit 0
-    fi
-elif [ "$TIER_B_NEUTRALIZED" -ge 1 ]; then
-    echo "  PASS: LSP-side Tier B made cheater's stale state unspendable before standalone WT could observe"
-    echo "  (alternative defense outcome: rollover beat the WT; cheater netted 0)"
+    # OUTCOME: confirm the WT's response/penalty txid ON-CHAIN + assert a real recapture amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}" "$WT_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: WT fired but no response/penalty txid found (breach_detections empty + no WT-log txid)"; tail -30 "$WT_LOG"; exit 1; }
+    echo "  WT response txid: $PEN_TXID (breach_detections=$BREACHES rows) — mining to confirm + verify payout"
+    $BCLI generatetoaddress 6 "$MINE_ADDR" >/dev/null 2>&1
+    PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null)
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  WT response confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture (dust/zero?)"; exit 1; }
+    echo "  PASS: standalone WT detected chain[$CHEAT_STATE] stale, broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just a log line"
     exit 0
+elif [ "$TIER_B_NEUTRALIZED" -ge 1 ]; then
+    echo "  SKIP: LSP-side Tier B neutralized the stale state before the standalone WT could observe it."
+    echo "  This run did NOT exercise the WT defense (a different valid mechanism won the race), so it is"
+    echo "  INCONCLUSIVE for this test's subject — NOT a PASS. Re-run with Tier-B rollover disabled to validate the WT."
+    exit 77
 else
-    echo "  FAIL: neither standalone WT broadcast penalty TXs nor LSP Tier B neutralized the stale state"
+    echo "  FAIL: standalone WT did NOT broadcast a penalty for the leaf-multistate breach"
     echo "  WT log tail:"
     tail -50 "$WT_LOG"
     exit 1
