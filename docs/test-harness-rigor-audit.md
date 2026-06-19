@@ -142,6 +142,33 @@ The fixed signet trio was re-run on real signet. Verdicts: **commitment_breach P
     defense failed. Also note the cosmetic WT log label ("FACTORY BREACH" printed for a
     kind=1 sub-factory watch — the LSP log correctly says "SUB-FACTORY BREACH").
 
+## 7. Remediation status
+
+### Tier 1 — COMPLETE (#34)
+All seven Tier-1 rows now assert the adversarial OUTCOME (real txid → on-chain confirm →
+amount/net-delta), not that machinery fired. Branch `test/harness-rigor-remediation`:
+| # | File | Fix | Commit |
+|---|------|-----|--------|
+| 1 | `cheat_client.sh` | net-delta(cheater)≤0 on-chain: real defense txids, confirm ≥1, amount ≥5k, cheater's stale tx yields no surviving value | b34a6c5 |
+| 2 | `ps_commitment_penalty.sh` | extract penalty txid, confirm, amount ≥5k | 77575ae |
+| 3 | `trustless_commitment_breach.sh` | port signet fix: anchored txid, mine-confirm, amount ≥5k | 1c1eb05 |
+| 4 | `cheat_daemon_{subfactory,leaf,leaf_late_wt,rollover}.sh` | response_txid (+log fallback), confirm (10-blk loop, 2-stage tolerant), amount >dust | 97b9fc1 |
+| 5 | `cheat_daemon_leaf_multistate.sh` | drop Tier-B false-PASS → SKIP(77); WT path now confirms response on-chain + amount | 70b7dc7 |
+| 6 | `cheat_realloc.sh` / `cheat_lstock_buy.sh` | defense txid, confirm, redistribution amount >dust | 5cff584 |
+| 7 | `crash_at_every_phase.sh` | escape-hatch `exit 0` → SKIP `exit 77` | f2108d4 |
+| (T4) | `wt_restart_race.sh` | drop head-1 fallback | f2108d4 |
+| (signet) | `subfactory_breach.sh` | 2-stage-aware confirm budget (proven cf4e4bf, 132,800 sats) | b5484d4 |
+
+**Idiom validated on VPS regtest (2026-06-19):** `trustless_commitment_breach` re-run with the
+fix → PASS, `broadcast AND CONFIRMED the penalty (1 conf, 11843 sats swept)`. getrawtransaction
+(txindex), mine-to-confirm loop, and amount extraction all work; 11843 ≥ 5000 floor. The
+remaining Tier-1 re-runs (cheat_client, multistate, ps_commitment, cheat_daemon×4, realloc,
+lstock) are queued on the VPS validation runner.
+
+### Tier 2/3/4 — OPEN (#35)
+kind3/k2 amount asserts; marker-only (htlc_force_close, ptlc_breach_chain, selfdrive, cheat_leaf);
+reorg/rebroadcast; overclaiming headers (watchtower_trustless). Next batch after Tier-1 re-runs go green.
+
 ## 5. Remediation plan
 1. **Tier 1** (#34): worst-first, each = extract real txid → `wait_confirm` → assert amount/net-delta. PR against `integration/security-e2e`.
 2. **Tier 3** (#35): add amount/distribution assertions (helpers exist).
