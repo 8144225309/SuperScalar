@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test_regtest_watchtower_trustless.sh — #248 SF-WT-TRUSTLESS Phase 4
-# end-to-end acceptance test.
+# trustless-ISOLATION + arming/hydration acceptance test (NOT a detect+react test).
 #
 # Validates the trustless-watchtower pipeline against a real regtest chain:
 #
@@ -10,9 +10,12 @@
 #      revocation secrets are inaccessible to the WT process.
 #   3. A cheat scenario (--cheat-realloc, the simplest CL2 path) triggers
 #      a stale leaf broadcast.
-#   4. The standalone WT hydrates a watch from wt.db.wt_watches, observes
-#      the cheat broadcast, and responds — proving the trustless pipeline
-#      detects + reacts end-to-end.
+#   4. The standalone WT hydrates a watch from wt.db.wt_watches (no secrets) —
+#      proving the trustless ARMING + HYDRATION + secret-ISOLATION pipeline.
+#      NB: this test asserts arming/hydration/isolation (criteria A-G below), NOT
+#      penalty detect+react. Detect+react — penalty broadcast AND CONFIRMED on-chain
+#      with a real amount — is proven by the dedicated breach tests
+#      (test_regtest_trustless_commitment_breach.sh, test_regtest_cheat_daemon_*.sh).
 #   5. Trustless invariant: dumping wt.db reveals zero secrets
 #      (no 32-byte BLOB matches a known revocation_secret from lsp.db,
 #      no column name contains 'secret'/'seckey'/'private').
