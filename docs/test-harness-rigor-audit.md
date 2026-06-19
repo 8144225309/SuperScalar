@@ -159,11 +159,22 @@ amount/net-delta), not that machinery fired. Branch `test/harness-rigor-remediat
 | (T4) | `wt_restart_race.sh` | drop head-1 fallback | f2108d4 |
 | (signet) | `subfactory_breach.sh` | 2-stage-aware confirm budget (proven cf4e4bf, 132,800 sats) | b5484d4 |
 
-**Idiom validated on VPS regtest (2026-06-19):** `trustless_commitment_breach` re-run with the
-fix → PASS, `broadcast AND CONFIRMED the penalty (1 conf, 11843 sats swept)`. getrawtransaction
-(txindex), mine-to-confirm loop, and amount extraction all work; 11843 ≥ 5000 floor. The
-remaining Tier-1 re-runs (cheat_client, multistate, ps_commitment, cheat_daemon×4, realloc,
-lstock) are queued on the VPS validation runner.
+**Validated on VPS regtest (2026-06-19), each PASS verifying the real on-chain amount:**
+| test | result | proof |
+|------|--------|-------|
+| `trustless_commitment_breach` | PASS | penalty confirmed, 11843 sats swept |
+| `cheat_client` | PASS | defense 53e3f4 confirmed, 11150 sats, "cheater net ≤0 verified on-chain" |
+| `wt_restart_race` | PASS | re-hydrated from wt.db, no head-1 fallback |
+| `crash_at_every_phase` | PASS | rc=0, state invariant held across kill points |
+| `ps_commitment_penalty` | PASS | penalty bbfd92 confirmed, 11843 sats |
+| `cheat_daemon_subfactory` | PASS | response 48a697 confirmed, 55416 sats |
+| `cheat_daemon_leaf` | PASS | response e4140d confirmed, 11950 sats |
+| `cheat_daemon_leaf_late_wt` | PASS | response 4d3a49 confirmed, 11950 sats (10-blk-late WT) |
+| `cheat_daemon_rollover`, `multistate`, `cheat_realloc`, `cheat_lstock_buy` | in flight | run `ss-rigor-validate2` |
+
+getrawtransaction (txindex on), mine-to-confirm loop, and amount extraction all work on the
+VPS regtest. **8/12 green; 4 in flight on the same validated idiom.** Tier-3 (`kind3` amount,
+`k2` per-client distribution) fixed but not yet re-run (queued behind validate2).
 
 ### Tier 2/3/4 — OPEN (#35)
 kind3/k2 amount asserts; marker-only (htlc_force_close, ptlc_breach_chain, selfdrive, cheat_leaf);
