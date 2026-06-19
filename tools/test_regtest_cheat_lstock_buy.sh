@@ -217,7 +217,9 @@ if [ "$BREACH_DETECTED" -ge 1 ] && [ "$POISON_BROADCAST" -ge 1 ]; then
     PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
     PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
     echo "  defense confirmed on-chain; largest output ${PSATS:-0} sats"
-    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: defense output ${PSATS} sats <= dust — not a real redistribution"; exit 1; }
+    # Floor = dust threshold (>=330): L-stock buys deal in small amounts (~1000 sats), so the
+    # redistribution share can be small-but-real. Catch zero/dust, not small-but-real.
+    [ "${PSATS:-0}" -ge 330 ] || { echo "  FAIL: defense output ${PSATS} sats <= dust — zero/dust, not a real redistribution"; exit 1; }
     echo "  PASS: WT detected breach (x$BREACH_DETECTED) + broadcast AND CONFIRMED defense $PEN_TXID (${PSATS} sats) — outcome verified, not just a log line"
     grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0

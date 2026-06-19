@@ -74,7 +74,9 @@ if grep -q "HTLC FORCE-CLOSE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
     SV=$(echo "$SRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
     SSATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
     echo "  HTLC sweep confirmed on-chain; largest output ${SSATS:-0} sats"
-    [ "${SSATS:-0}" -ge 1000 ] || { red "FAIL: HTLC sweep output ${SSATS} sats <= dust — not a real timeout recovery"; exit 1; }
+    # Floor = dust threshold (>=330): an HTLC-timeout sweep recovers the small in-flight HTLC
+    # value minus fee (819 sats observed), legitimately sub-1000. Catch zero/dust, not small-but-real.
+    [ "${SSATS:-0}" -ge 330 ] || { red "FAIL: HTLC sweep output ${SSATS} sats <= dust — zero/dust sweep, not a real timeout recovery"; exit 1; }
     green "PASS: the force-close HTLC timeout sweep $SWEEP_TXID was broadcast AND independently CONFIRMED on-chain ($SSATS sats)."
     green "      (wt.db kind=3 force-close watches armed: ${K3:-0})"
     exit 0
