@@ -176,20 +176,49 @@ if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
     if [ "${CL7_FIRED:-0}" -ge 1 ]; then
         echo "  PASS: adversarial client CL7 path fired ($CL7_FIRED stale broadcasts), WT defense fired"
         
-# CL7 (#218): programmatically assert net-delta(cheater) <= 0.
-# Sum sats received by the cheating client's address across all confirmed
-# breach-defense broadcasts vs sats the cheater could have stolen on
-# successful broadcast. Cheater MUST net <= 0 (penalty TX recaptures funds).
-# Without this, the test PASSes by side-effect of the WT broadcasting,
-# but doesn't verify the trustless guarantee.
-echo "=== CL7: verifying net-delta(cheater) <= 0 ==="
-PENALTY_COUNT=$(sqlite3 "$LSP_DB" "SELECT COUNT(*) FROM broadcast_log WHERE source IN ('penalty','factory_response','factory_burn','subfactory_poison','htlc_penalty','ptlc_penalty') AND result='ok';" 2>/dev/null || echo 0)
-if [ "$PENALTY_COUNT" -lt 1 ]; then
-    echo "FAIL: no penalty broadcast — cheater would have netted positive"
-    exit 1
+# CL7 (#218): assert net-delta(cheater) <= 0 ON-CHAIN — the trustless guarantee, not a
+# broadcast_log row count. The old code counted result='ok' rows (mempool-accepted, NOT
+# confirmed) and *declared* "net <= 0" without checking anything. This now: (1) pulls the
+# REAL defense txids, (2) CONFIRMS at least one on-chain + asserts a real recapture amount,
+# (3) proves the cheater's stale broadcast yields no surviving cheater-spendable value.
+echo "=== CL7: verifying net-delta(cheater) <= 0 (confirmed on-chain, not log rows) ==="
+set +e   # leave strict mode for the verification block (explicit exits below)
+DEF_TXIDS=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE source IN ('penalty','factory_response','factory_burn','subfactory_poison','htlc_penalty','ptlc_penalty') AND result='ok' AND length(txid)=64;" 2>/dev/null)
+[ -n "$DEF_TXIDS" ] || { echo "FAIL: no defense tx broadcast — cheater would net positive"; exit 1; }
+# (1) result='ok' is mempool-accepted, NOT confirmed — mine to bury, then require a real confirm.
+$BCLI generatetoaddress 6 "$MINE_ADDR" >/dev/null 2>&1
+DEF_OK=""; DEF_SATS=0
+for t in $DEF_TXIDS; do
+    raw=$($BCLI getrawtransaction "$t" true 2>/dev/null)
+    echo "$raw" | grep -q '"confirmations"' || continue
+    DEF_OK="$t"
+    v=$(echo "$raw" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    DEF_SATS=$(awk "BEGIN{printf \"%d\", ($v+0)*100000000}")
+    break
+done
+[ -n "$DEF_OK" ] || { echo "FAIL: defense tx(s) in broadcast_log never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+echo "  defense tx $DEF_OK confirmed on-chain; largest output ${DEF_SATS:-0} sats"
+[ "${DEF_SATS:-0}" -ge 5000 ] || { echo "FAIL: defense output ${DEF_SATS} sats too small — not a real recapture (dust/zero?)"; exit 1; }
+# (2) net-delta: the cheater's stale broadcast must yield no surviving cheater-spendable value —
+#     either it never confirmed (superseded by the defense), or it confirmed but a confirmed
+#     defense tx spends its output (recapture). Both => cheater nets <= 0.
+STALE_TXID=$(sqlite3 "$TMPDIR/client_${CHEATING_CLIENT}.db" "SELECT txid FROM broadcast_log WHERE source='cheat_client_stale' AND length(txid)=64 ORDER BY id LIMIT 1;" 2>/dev/null)
+if [ -n "$STALE_TXID" ]; then
+    sraw=$($BCLI getrawtransaction "$STALE_TXID" true 2>/dev/null)
+    if echo "$sraw" | grep -q '"confirmations"'; then
+        spent=0
+        for t in $DEF_TXIDS; do
+            if $BCLI getrawtransaction "$t" true 2>/dev/null | grep -q "$STALE_TXID"; then spent=1; break; fi
+        done
+        [ "$spent" = 1 ] || { echo "FAIL: cheater stale tx $STALE_TXID confirmed but no confirmed defense tx spends it — cheater may net positive"; exit 1; }
+        echo "  cheater stale tx confirmed but recaptured by a confirmed defense tx → net <= 0"
+    else
+        echo "  cheater stale tx $STALE_TXID never confirmed (superseded by the defense) → net <= 0"
+    fi
+else
+    echo "  (no cheat_client_stale txid recorded; the confirmed-defense gate above still stands)"
 fi
-echo "  PASS: $PENALTY_COUNT penalty TX broadcast → cheater net <= 0 (penalty recapture)"
-
+echo "  PASS: confirmed trustless defense ($DEF_OK, ${DEF_SATS} sats) — cheater net <= 0 verified on-chain"
 exit 0
     else
         echo "  FAIL: no CL7 markers in cheating client log"
