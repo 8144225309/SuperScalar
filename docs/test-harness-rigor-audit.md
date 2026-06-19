@@ -267,5 +267,16 @@ min-check fix is validated-by-sibling (realloc). **rollover** is genuinely ASan-
 in validate3 with the node up). Lesson for the matrix: assert the node is reachable before each
 test (a dead node silently fails every downstream test as "LSP died").
 
-**Remaining follow-ups:** A-2 ratio check (F1/F3); lstock LSP-startup funding; rollover ASan
-binary choice; the Tier-4 reorg/rebroadcast/selfdrive; investigate what stops bitcoind-regtest.
+**Status of follow-ups (2026-06-19, PR #385):**
+- **A-2 ratio check — IMPLEMENTED.** `regtest_test_helpers.sh::pen_recovers_most TXID [PCT]`
+  (sum(outputs) ≥ 90% of sum(input prevouts); param-robust, closes F1/F3) wired into the three
+  redistribution defenses (subfactory/realloc/lstock). Validating in `ss-rigor-validate8`.
+- **Node-up guard — IMPLEMENTED.** `regtest_test_helpers.sh::require_node_up` (exit 78 with a
+  clear message; a dead node otherwise fails every test as "LSP died" — the validate4-6 trap).
+- **lstock funding — FIXED.** Pointed at the funded `ss_cheat_leaf_miner` (regtest is at block
+  ~1561 = ~10 subsidy halvings, so a fresh wallet's 101-blk mine is ~0.05 BTC — too little).
+  Validating in `ss-rigor-validate9`.
+- **Still open (handed off):** Tier-4 reorg/rebroadcast/selfdrive (penalty re-fires post-reorg);
+  rollover ASan-binary choice; signet re-validation of the signet-side fixes (multi-hour); taproot
+  recovery #28/#29; wiring `pen_recovers_most`/`require_node_up` into the single-sweep + remaining
+  tests + the VPS matrix runner.
