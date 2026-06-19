@@ -85,9 +85,9 @@ REORG_LOG="$TMPDIR/reorg.log"
 REORG_PID=$(start_reorg_watcher "$REORG_LOG")
 PIDS+=($REORG_PID)
 echo "  reorg watcher PID=$REORG_PID"
-$BCLI -named createwallet wallet_name=ss_cheat_lstock_miner load_on_startup=false 2>&1 | head -2 || true
-$BCLI loadwallet ss_cheat_lstock_miner 2>/dev/null || true
-MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_lstock_miner -named getnewaddress address_type=bech32m)
+$BCLI -named createwallet wallet_name=ss_cheat_leaf_miner load_on_startup=false 2>&1 | head -2 || true
+$BCLI loadwallet ss_cheat_leaf_miner 2>/dev/null || true
+MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_leaf_miner -named getnewaddress address_type=bech32m)
 $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 echo "  miner wallet ready, 101 fresh blocks"
 
@@ -110,7 +110,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet ss_cheat_lstock_miner \
+    --wallet ss_cheat_leaf_miner \
     --db "$LSP_DB" \
     --demo --cheat-lstock-buy \
     --lsp-balance-pct 50 \
@@ -146,7 +146,7 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
         --daemon \
         --rpcuser ${RPCUSER:-rpcuser} \
         --rpcpassword ${RPCPASSWORD:-rpcpass} \
-        --wallet ss_cheat_lstock_miner \
+        --wallet ss_cheat_leaf_miner \
         --db "$TMPDIR/client_${i}.db" \
         > "$TMPDIR/client_${i}.log" 2>&1 &
     CLIENT_PID=$!
