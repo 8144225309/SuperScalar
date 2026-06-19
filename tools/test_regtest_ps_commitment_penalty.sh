@@ -66,9 +66,22 @@ echo "-- penalty markers --"; grep -aiE "penalty tx|punished|broadcast [0-9]+ pe
 K2=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE watch_kind=2;" 2>/dev/null || echo 0)
 echo "  wt.db channel-commitment (kind=2) watches armed for the trustless standalone WT: ${K2:-0}"
 echo
+set +e
 if [ "$PEN" = 1 ] && [ "${K2:-0}" -ge 1 ]; then
-    green "PASS: a PS channel-commitment breach was PUNISHED (penalty broadcast) AND the same penalty is armed in wt.db"
-    green "      ($K2 kind=2 watches). The PS commitment penalty path works in-process + is trustless-armed."
+    # OUTCOME (not just a broadcast log line): confirm the penalty ON-CHAIN + assert the swept amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE (source LIKE '%penalty%' OR source LIKE '%punish%') AND result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "penalty tx broadcast: *[0-9a-f]{64}|Latest state tx broadcast: *[0-9a-f]{64}|punished[^0-9a-f]*[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { red "FAIL: penalty was broadcast but no penalty txid found (broadcast_log + LSP log)"; tail -25 "$LSP_LOG"; exit 1; }
+    echo "  penalty txid: $PEN_TXID — mining to confirm + verify payout"
+    mine 6
+    PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null)
+    echo "$PRAW" | grep -q '"confirmations"' || { red "FAIL: penalty $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  penalty confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 5000 ] || { red "FAIL: penalty output ${PSATS} sats too small — not a real to_local recovery (dust/zero?)"; exit 1; }
+    green "PASS: a PS channel-commitment breach was PUNISHED — penalty $PEN_TXID CONFIRMED on-chain ($PSATS sats),"
+    green "      and the same penalty is armed in wt.db ($K2 kind=2 watches). Outcome verified, not just broadcast."
     exit 0
 elif [ "$PEN" = 1 ]; then
     red "PARTIAL: penalty fired but wt.db kind=2=$K2 — in-process works, trustless arming unconfirmed"; exit 1
