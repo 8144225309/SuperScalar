@@ -61,8 +61,21 @@ grep -aiE "HTLC FORCE-CLOSE|HTLC timeout|sweep|timeout TX|broadcast|PASSED" "$LS
 K3=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE watch_kind=3;" 2>/dev/null || echo 0)
 echo "  wt.db force-close-HTLC (kind=3) watches armed: ${K3:-0}"
 echo
+set +e
 if grep -q "HTLC FORCE-CLOSE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
-    green "PASS: the force-close HTLC timeout sweep was broadcast + confirmed on-chain."
+    # OUTCOME (not just the LSP's self-reported marker): independently confirm the HTLC
+    # timeout-sweep on-chain + assert it swept a real amount.
+    SWEEP_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE (source LIKE '%htlc%' OR source LIKE '%sweep%' OR source LIKE '%timeout%' OR source LIKE '%force%') AND result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$SWEEP_TXID" ] && SWEEP_TXID=$(grep -aoiE "HTLC timeout[^0-9a-f]*[0-9a-f]{64}|timeout sweep[^0-9a-f]*[0-9a-f]{64}|HTLC timeout TX broadcast: *[0-9a-f]{64}|Latest state tx broadcast: *[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$SWEEP_TXID" ] || { red "FAIL: PASSED marker present but no HTLC timeout-sweep txid found (broadcast_log + log)"; tail -25 "$LSP_LOG"; exit 1; }
+    echo "  HTLC timeout-sweep txid: $SWEEP_TXID — confirming on-chain"
+    SRAW=""; for n in $(seq 1 12); do mine 1; sleep 1; SRAW=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null); echo "$SRAW" | grep -q '"confirmations"' && break; done
+    echo "$SRAW" | grep -q '"confirmations"' || { red "FAIL: HTLC sweep $SWEEP_TXID never CONFIRMED on-chain (marker != confirmed)"; exit 1; }
+    SV=$(echo "$SRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    SSATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
+    echo "  HTLC sweep confirmed on-chain; largest output ${SSATS:-0} sats"
+    [ "${SSATS:-0}" -ge 1000 ] || { red "FAIL: HTLC sweep output ${SSATS} sats <= dust — not a real timeout recovery"; exit 1; }
+    green "PASS: the force-close HTLC timeout sweep $SWEEP_TXID was broadcast AND independently CONFIRMED on-chain ($SSATS sats)."
     green "      (wt.db kind=3 force-close watches armed: ${K3:-0})"
     exit 0
 else
