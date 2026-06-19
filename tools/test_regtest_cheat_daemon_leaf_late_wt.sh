@@ -207,8 +207,20 @@ if [ -s "$REORG_LOG" ]; then cat "$REORG_LOG"; else echo "  (none)"; fi
 
 echo
 echo "=== Final result ==="
-if [ $WT_FIRED -eq 1 ]; then
-    echo "  PASS: late-arriving WT defended after $EXTRA_BLOCKS-block delay"
+set +e
+if [ "$WT_FIRED" -eq 1 ]; then
+    # OUTCOME (not just a broadcast log line): confirm the WT's response/penalty txid ON-CHAIN + assert a real amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}" "$WT_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: late WT fired but no response/penalty txid found (breach_detections + WT log)"; tail -30 "$WT_LOG"; exit 1; }
+    echo "  late WT response txid: $PEN_TXID — mining to confirm + verify payout"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: late WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  late WT response confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: late WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+    echo "  PASS: late-arriving WT defended after $EXTRA_BLOCKS-block delay — broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats), outcome verified"
     exit 0
 else
     echo "  FAIL: late WT did not broadcast penalty TXs"
