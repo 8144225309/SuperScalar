@@ -301,6 +301,8 @@ if [ "$WT_FIRED" -eq 1 ]; then
     PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
     echo "  WT response confirmed on-chain; largest output ${PSATS:-0} sats"
     [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: WT response recovers <90% of swept value ($A2) — value leaked/burned"; exit 1;; esac
     echo "  PASS: standalone WT detected stale leaf state, broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just a log line"
     exit 0
 else

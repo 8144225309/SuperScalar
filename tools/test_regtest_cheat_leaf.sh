@@ -251,6 +251,8 @@ if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
         PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
         echo "  WT defense confirmed on-chain; largest output ${PSATS:-0} sats"
         [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT defense output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+        A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+        case "$A2" in LOW*) echo "  FAIL: WT defense recovers <90% of swept value ($A2) — value leaked/burned"; exit 1;; esac
         echo "  PASS: PS leaf cheat detected + WT defense $PEN_TXID CONFIRMED on-chain (${PSATS} sats) — outcome verified, not just a marker"
         exit 0
     fi
