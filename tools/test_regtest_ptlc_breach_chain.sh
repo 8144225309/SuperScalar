@@ -69,7 +69,25 @@ pkill -f "superscalar_client.*--port $PORT" 2>/dev/null || true
 echo "EXIT=$EXIT" > "$DONE"
 
 if [ "$EXIT" -eq 0 ] && grep -q "PTLC BREACH CHAIN TEST PASSED" "$LOG"; then
-    echo "=== PASS: PTLC BREACH CHAIN (#184 Stage A) ==="
+    set +e
+    B="bitcoin-cli -regtest -rpcuser=$RPCUSER -rpcpassword=$RPCPASS -rpcport=$RPCPORT"
+    # BIP-431 TRUC catch: a zero ptlc_penalty COUNT means the PTLC penalty never broadcast
+    # (exactly the failure mode where a marker-only test would still go green).
+    PCNT=$(grep -aoiE "ptlc_penalty=[0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+    echo "  ptlc_penalty count: ${PCNT:-0}"
+    [ "${PCNT:-0}" -ge 1 ] || { echo "=== FAIL: ptlc_penalty=0 — no PTLC penalty broadcast (BIP-431 TRUC zero-value risk) ==="; tail -40 "$LOG"; exit 1; }
+    # OUTCOME: confirm the PTLC penalty tx ON-CHAIN + assert real value (not just the marker).
+    PEN_TXID=$(grep -aoiE "PTLC penalty tx[^0-9a-f]*[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}" "$LOG" | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "=== FAIL: PASSED marker + ptlc_penalty>=1 but no penalty txid in log ==="; tail -40 "$LOG"; exit 1; }
+    echo "  PTLC penalty txid: $PEN_TXID — mining to confirm on-chain"
+    MA=$($B -rpcwallet="$WALLET" getnewaddress 2>/dev/null); PRAW=""
+    for n in $(seq 1 12); do $B generatetoaddress 1 "$MA" >/dev/null 2>&1; sleep 1; PRAW=$($B getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "=== FAIL: PTLC penalty $PEN_TXID never CONFIRMED on-chain (marker != confirmed) ==="; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  PTLC penalty confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 330 ] || { echo "=== FAIL: PTLC penalty output ${PSATS} sats <= dust — zero/dust-value penalty (TRUC) ==="; exit 1; }
+    echo "=== PASS: PTLC BREACH CHAIN (#184 Stage A) — ptlc_penalty=$PCNT, penalty $PEN_TXID CONFIRMED on-chain ($PSATS sats) ==="
     grep -E "PTLC BREACH CHAIN|^\[[0-9]+\]|broadcast_log|penalty=" "$LOG" | head -20
     exit 0
 else
