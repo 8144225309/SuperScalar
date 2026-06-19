@@ -224,3 +224,31 @@ pre-existing infra (ASan/faucet). Tier-2 (htlc_force_close, cheat_leaf, ptlc pai
 
 Every fix copies the standard in §3 and the models listed there. Re-run each fixed test
 (regtest is reliable + fast) to confirm it still PASSes for the *right* reason.
+
+## 8. Amount-floor deep-dive (phased verification, 2026-06-19)
+
+Scrutiny of the amount assertions themselves (do the sat floors hold "in all circumstances"?).
+Verified by decoding persisted **signet** penalty txs (recovery daemon paused for clean RPC).
+
+**Phase 1 — redistribution structure.** `cf4e4bf` (sub-factory) = 3 inputs → **3 per-client P2TR
+outputs** (55416/44333/33051), **no change/LSP output**. ⇒ the old `largest`-only amount check
+would PASS even if one client were shorted to dust (`[55416,44333,200]`). **Real false-pass.**
+**Phase 2 — single-sweep structure.** Commitment/leaf/HTLC-class sweeps = **exactly 1 P2TR output**
+(observed 30871 / 20871 / 5700), no change. ⇒ `largest` = the recovery there. **Sound.**
+
+**Findings & disposition:**
+- **F2 (redistribution `largest` masks a shorted client) — FIXED (9f27586).** subfactory / realloc /
+  lstock / signet-subfactory now parse all P2TR outputs and assert **MIN ≥ dust(330)** + report
+  count/min/total. (k2 already did this.)
+- **F4 (`largest` = change not recovery) — RESOLVED:** single-sweep penalties have no change output.
+- **F1 (floors prove "non-dust", not "correct amount") — OPEN, documented.** A *proportionate*
+  partial-theft (penalty pays 60% across all clients) still passes a dust floor. The clean,
+  **param-robust** upgrade (also closes **F3**, fragile absolute floors): a self-contained ratio
+  check — look up the penalty's input prevout values (each `vin` is the breach's stolen output),
+  and assert `Σ(outputs) ≥ ~0.9·Σ(input prevouts)` (the sweep recovers ~all it spends, minus a
+  bounded fee). Needs per-vin prevout lookups + a clean-funded regtest to validate ⇒ **follow-up**.
+- **F3 (absolute floors fragile to AMOUNT param changes) — OPEN,** subsumed by the F1 ratio check.
+
+**Net:** the one verified false-pass (F2) is fixed; single-sweep `largest` is proven safe; the
+residual (F1/F3) is "outcome-correct-amount" rigor, scoped as a documented follow-up (the ratio
+check), not a dust/shorted-client hole.
