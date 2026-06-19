@@ -252,3 +252,20 @@ would PASS even if one client were shorted to dust (`[55416,44333,200]`). **Real
 **Net:** the one verified false-pass (F2) is fixed; single-sweep `largest` is proven safe; the
 residual (F1/F3) is "outcome-correct-amount" rigor, scoped as a documented follow-up (the ratio
 check), not a dust/shorted-client hole.
+
+**A-1 min-check VALIDATED on regtest (validate7, 2026-06-19):** subfactory PASS (3 outputs,
+smallest 33051, total 132800), realloc PASS (2 outputs, smallest 32767, total 65534) — the
+per-client min is now live + correct. kind3 PASS + htlc PASS (floor ≥330; HTLC sweep 819 sats).
+
+**Important infra finding:** the validate4/5/6 tail "failures" (kind3/htlc "LSP died", lstock
+"exhausted regtest") were NOT fix defects, faucet exhaustion, ASan, or port pollution — the
+**regtest bitcoind had been cleanly shut down at 02:22:54** (end of validate4) and nothing
+restarted it. Restarting it (block 1561; `ss_cheat_leaf_miner` holds 8393 BTC — no exhaustion)
+made kind3/htlc/subfactory/realloc all green. **lstock** remains rc=1 — a pre-existing
+LSP-startup issue (LSP dies in setup before any breach; `ss_cheat_lstock_miner` funding); its
+min-check fix is validated-by-sibling (realloc). **rollover** is genuinely ASan-flaky (failed
+in validate3 with the node up). Lesson for the matrix: assert the node is reachable before each
+test (a dead node silently fails every downstream test as "LSP died").
+
+**Remaining follow-ups:** A-2 ratio check (F1/F3); lstock LSP-startup funding; rollover ASan
+binary choice; the Tier-4 reorg/rebroadcast/selfdrive; investigate what stops bitcoind-regtest.
