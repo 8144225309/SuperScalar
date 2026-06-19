@@ -16,6 +16,40 @@
 #                                          per vout, in order). Returns 0 on
 #                                          match, 1 on mismatch.
 #   sum_vouts TXID                       — print sum of vout amounts in sats.
+#   require_node_up                      — assert the node ($BCLI) is reachable; else exit 78
+#                                          with a clear message (a dead node otherwise fails
+#                                          every downstream test as a cryptic "LSP died").
+#   pen_recovers_most TXID [PCT]         — assert sum(outputs) >= PCT% (default 90) of
+#                                          sum(input prevout values): the penalty/sweep
+#                                          recovers ~all it spends (catches fee-burn/value
+#                                          loss). Echoes "OK|LOW|UNKNOWN <out> <in>".
+
+# --- require_node_up ---
+# A dead bitcoind makes every downstream test fail as a cryptic "LSP died". Call this right
+# after BCLI is set (post-source) to fail loudly + early instead.
+require_node_up() {
+    $BCLI getblockcount >/dev/null 2>&1 && return 0
+    echo "FATAL: regtest node not reachable via [$BCLI] — start bitcoind-regtest before running." >&2
+    exit 78
+}
+
+# --- pen_recovers_most TXID [PCT] ---
+# Outcome-amount check (audit F1/F3): the penalty/sweep must pay out ~all the value it sweeps.
+# Looks up each input's prevout value; asserts sum(outputs) >= PCT% of sum(inputs). Default 90
+# (regtest sweep fees are <2%, so 90% is generous + param-robust — it scales with the actual
+# swept value, unlike an absolute floor). Returns 1 on LOW/UNKNOWN.
+pen_recovers_most() {
+    local txid="${1:?usage: pen_recovers_most TXID [PCT]}" pct="${2:-90}" praw out insum=0 pair pt pv val
+    praw=$($BCLI getrawtransaction "$txid" true 2>/dev/null) || return 1
+    out=$(printf '%s' "$praw" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(sum(int(round(v["value"]*1e8)) for v in d["vout"]))' 2>/dev/null)
+    for pair in $(printf '%s' "$praw" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("\n".join(v["txid"]+":"+str(v["vout"]) for v in d["vin"]))' 2>/dev/null); do
+        pt=${pair%:*}; pv=${pair#*:}
+        val=$($BCLI getrawtransaction "$pt" true 2>/dev/null | python3 -c "import json,sys;print(int(round(json.load(sys.stdin)['vout'][$pv]['value']*1e8)))" 2>/dev/null)
+        insum=$((insum + ${val:-0}))
+    done
+    [ "${insum:-0}" -gt 0 ] || { echo "UNKNOWN ${out:-0} 0"; return 1; }
+    if [ "${out:-0}" -ge "$(( insum * pct / 100 ))" ]; then echo "OK ${out:-0} $insum"; return 0; else echo "LOW ${out:-0} $insum"; return 1; fi
+}
 
 # --- start_reorg_watcher LOG_PATH ---
 # Polls every 2s. Detects:

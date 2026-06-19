@@ -261,6 +261,8 @@ except Exception: print("0 0 0")')
     echo "  WT response confirmed on-chain; $PNUM per-client P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
     [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: WT response has no P2TR recovery output"; exit 1; }
     [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
     echo "  PASS: standalone WT detected sub-factory breach, broadcast AND CONFIRMED its redistribution ($PEN_TXID; $PNUM clients, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     exit 0
 else

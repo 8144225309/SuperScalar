@@ -229,6 +229,8 @@ except Exception: print("0 0 0")')
     echo "  defense confirmed on-chain; $PNUM P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
     [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: defense has no P2TR redistribution output"; exit 1; }
     [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
     echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + CONFIRMED redistribution $PEN_TXID ($PNUM outs, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0
