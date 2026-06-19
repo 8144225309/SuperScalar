@@ -196,6 +196,25 @@ subfactory, leaf, leaf_late_wt, realloc); multistate fixed (+x) + rollover (ASan
 (prove a penalty RE-fires post-reorg, not just that "REORG" was logged), `rebroadcast_recovery`
 (reconfirm the resent tx on a chain that retains it).
 
+### Validation run #3 (2026-06-19) — caught two of my OWN over-corrections + two infra issues
+Re-running the fixed tests directly (not via `bash x.sh`) exposed:
+- **k2 — PASS**: per-client min P2TR output 21,667 sats across 2 outputs. Distribution fix works.
+- **multistate +x bug**: the script was mode 100644; the runner execs directly → exit 126. Fixed (02f83d0).
+  Then a **SECOND Tier-B false-PASS** surfaced (EARLY_TIER_B path, lines 256–262) that my first
+  verdict-block fix missed — it `exit 0`'d before the fixed block. Fixed → SKIP (9f66fa9). NOTE: on
+  this VPS regtest Tier-B always wins the race, so multistate can now only SKIP (honest) — genuinely
+  exercising the WT for this scenario needs Tier-B rollover disabled (follow-up).
+- **kind3 — my floor was too strict** (1000): the HTLC-timeout sweep legitimately recovers the small
+  in-flight HTLC value (819 sats observed). Lowered to the dust threshold (≥330) (badc964). Lesson:
+  amount floors must catch zero/dust, not assert a magnitude the defense doesn't owe.
+- **rollover — pre-existing ASan flakiness** (test LD_PRELOADs libasan; LSP died before detection).
+- **lstock — pre-existing VPS faucet exhaustion** ("failed to fund wallet (exhausted regtest?)"; see
+  [feedback_regtest_faucet_exhausted]). Not a harness bug; my verdict fix is the same idiom as the
+  PASSING realloc. To validate, one-time pre-fund `ss_cheat_lstock_miner`.
+
+Net: of the rigor fixes, **10 validated PASS**, 2 self-caught over-corrections fixed, 2 blocked by
+pre-existing infra (ASan/faucet). Tier-2 (htlc_force_close, cheat_leaf, ptlc pair) validating in run #3.
+
 ## 5. Remediation plan
 1. **Tier 1** (#34): worst-first, each = extract real txid → `wait_confirm` → assert amount/net-delta. PR against `integration/security-e2e`.
 2. **Tier 3** (#35): add amount/distribution assertions (helpers exist).
