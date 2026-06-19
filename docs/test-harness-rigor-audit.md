@@ -170,15 +170,31 @@ amount/net-delta), not that machinery fired. Branch `test/harness-rigor-remediat
 | `cheat_daemon_subfactory` | PASS | response 48a697 confirmed, 55416 sats |
 | `cheat_daemon_leaf` | PASS | response e4140d confirmed, 11950 sats |
 | `cheat_daemon_leaf_late_wt` | PASS | response 4d3a49 confirmed, 11950 sats (10-blk-late WT) |
-| `cheat_daemon_rollover`, `multistate`, `cheat_realloc`, `cheat_lstock_buy` | in flight | run `ss-rigor-validate2` |
+| `cheat_realloc` | PASS | defense confirmed on-chain |
+| `cheat_lstock_buy` | rc=0 (re-confirm value in #3) | redistribution defense |
+| `cheat_daemon_rollover` | rc=1 — **pre-existing ASan flakiness** (test LD_PRELOADs libasan; LSP died before detection, so the 3-signal gate failed and my confirm code never ran). Re-run in #3. |
+| `cheat_daemon_leaf_multistate` | rc=126 — **real bug found**: script was mode 100644 (not +x). The matrix runs via `bash x.sh` so it was masked; the runner execs directly → 126. Fixed (02f83d0). Re-run in #3. |
 
 getrawtransaction (txindex on), mine-to-confirm loop, and amount extraction all work on the
-VPS regtest. **8/12 green; 4 in flight on the same validated idiom.** Tier-3 (`kind3` amount,
-`k2` per-client distribution) fixed but not yet re-run (queued behind validate2).
+VPS regtest. **9/12 Tier-1 green** (commitment, cheat_client, wt_restart, crash, ps_commitment,
+subfactory, leaf, leaf_late_wt, realloc); multistate fixed (+x) + rollover (ASan infra) re-running in #3.
 
-### Tier 2/3/4 — OPEN (#35)
-kind3/k2 amount asserts; marker-only (htlc_force_close, ptlc_breach_chain, selfdrive, cheat_leaf);
-reorg/rebroadcast; overclaiming headers (watchtower_trustless). Next batch after Tier-1 re-runs go green.
+### Tier 2 — DONE (validating in run #3)
+| File | Fix | Commit |
+|------|-----|--------|
+| `htlc_force_close.sh` | marker → independent HTLC timeout-sweep txid + on-chain confirm + amount | 69e2529 |
+| `cheat_leaf.sh` | marker → WT defense confirmed on-chain+amount, OR (CLTV-gated leaf) a real detection signal | 69e2529 |
+| `ptlc_breach_chain.sh` | marker → ptlc_penalty count≥1 (TRUC catch) + penalty txid confirmed on-chain + amount>dust | 46984d4 |
+| `ptlc_breach.sh` | marker → ptlc_penalty count≥1 OR built txid (in-process by design; message reconciled) | 46984d4 |
+
+### Tier 3 — DONE (validating in run #3)
+`kind3` swept-amount assert (480a6a3); `k2` per-client min-output >dust, inherited by k3–k6 wrappers (a472458).
+
+### Tier 4 — partial
+`watchtower_trustless.sh` overclaiming header reconciled (0c3d8f4). **Still OPEN:**
+`test_signet_selfdrive.sh` (signet marker-only), `adversarial_reorg`/`same_height_reorg`
+(prove a penalty RE-fires post-reorg, not just that "REORG" was logged), `rebroadcast_recovery`
+(reconfirm the resent tx on a chain that retains it).
 
 ## 5. Remediation plan
 1. **Tier 1** (#34): worst-first, each = extract real txid → `wait_confirm` → assert amount/net-delta. PR against `integration/security-e2e`.
