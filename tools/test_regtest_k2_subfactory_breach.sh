@@ -353,6 +353,20 @@ if [ "$N_OUTPUTS" -lt "$PS_SUB_ARITY" ]; then
     exit 1
 fi
 
+# Tier-3: not just the COUNT of outputs — each per-client P2TR output must carry REAL value
+# (a pro-rata redistribution share, not dust). A poison TX with k dust outputs passes the
+# count check but shorts every client; assert the smallest per-client output is above dust.
+MIN_OUT=$($BCLI getrawtransaction "$POISON_TXID" 1 2>/dev/null | \
+    python3 -c "import json,sys
+d=json.load(sys.stdin)
+vs=[int(round(v['value']*1e8)) for v in d['vout'] if v['scriptPubKey'].get('type')=='witness_v1_taproot']
+print(min(vs) if vs else 0)" 2>/dev/null || echo 0)
+echo "  poison TX smallest per-client P2TR output: ${MIN_OUT:-0} sats (across $N_OUTPUTS outputs)"
+if [ "${MIN_OUT:-0}" -lt 1000 ]; then
+    echo "FAIL: a per-client P2TR output is dust/zero ($MIN_OUT sats) — redistribution shorted a client"
+    exit 1
+fi
+
 echo ""
 echo "=== PASS: PS k² sub-factory breach detection end-to-end ==="
 echo "  - $((N_CLIENTS + 1)) distinct OS processes (1 LSP + $N_CLIENTS clients)"
