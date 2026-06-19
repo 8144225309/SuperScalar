@@ -83,10 +83,21 @@ echo "=== evidence ==="
 grep -aE "TRUSTLESS|hydrated|penalty tx|Latest state tx|commitment" "$WT_LOG" 2>/dev/null | head -10
 grep -q "hydrated" "$WT_LOG" || fail "WT did not hydrate from wt.db"
 echo
-if [ "$FIRED" = 1 ]; then
-    green "PASS: a STANDALONE trustless WT (wt.db only, no secrets) hydrated $K2 channel-commitment watch(es) and"
-    green "      broadcast the penalty for a revoked-commitment breach. Channel-commitment trustless defense PROVEN e2e."
-    exit 0
-else
-    red "FAIL: standalone WT did NOT broadcast a penalty for the channel-commitment breach"; tail -25 "$WT_LOG"; exit 1
-fi
+[ "$FIRED" = 1 ] || { red "FAIL: standalone WT did NOT broadcast a penalty for the channel-commitment breach"; tail -25 "$WT_LOG"; exit 1; }
+
+# OUTCOME check (not just broadcast): the penalty must CONFIRM on-chain and sweep a real amount.
+PEN_TXID=$(grep -oiE "Latest state tx broadcast: *[0-9a-f]{64}|penalty tx[^0-9a-f]*[0-9a-f]{64}" "$WT_LOG" | grep -oE "[0-9a-f]{64}" | tail -1)
+[ -n "$PEN_TXID" ] || { tail -25 "$WT_LOG"; fail "penalty broadcast but no penalty txid in WT log"; }
+echo "  penalty txid: $PEN_TXID — mining to confirm + verify payout"
+PCONF=0
+for i in $(seq 1 12); do mine 1; sleep 1; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
+[ "$PCONF" -ge 1 ] || fail "penalty $PEN_TXID never confirmed on-chain (broadcast != confirmed)"
+PEN_SATS=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+PEN_SATS=$(awk "BEGIN{printf \"%d\", ($PEN_SATS+0)*100000000}")
+echo "  penalty confirmed ($PCONF conf); largest output: ${PEN_SATS:-0} sats"
+[ "${PEN_SATS:-0}" -ge 5000 ] || fail "penalty payout ${PEN_SATS} sats too small — not a real to_local recovery (dust/zero?)"
+
+green "PASS: a STANDALONE trustless WT (wt.db only, no secrets) hydrated $K2 channel-commitment watch(es),"
+green "      broadcast AND CONFIRMED the penalty ($PCONF conf, $PEN_SATS sats swept) for a revoked-commitment"
+green "      breach — outcome verified, not just broadcast. Channel-commitment trustless defense PROVEN e2e."
+exit 0

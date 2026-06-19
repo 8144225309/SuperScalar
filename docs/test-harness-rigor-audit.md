@@ -112,6 +112,36 @@ Every breach/penalty/sweep test must assert the **adversarial outcome**:
 ### Daemon (operational, not a repo test, but same spirit)
 - `_recover_our_keys.py` taproot sweep — fixed to use `descriptorprocesspsbt` (was leaving taproot inputs unsigned → stranded 99,750 sats). Validation pending.
 
+## 6. Re-run findings (2026-06-18 signet matrix)
+
+The fixed signet trio was re-run on real signet. Verdicts: **commitment_breach PASS**,
+**wt_restart_race PASS**, **subfactory_breach reported FAIL** — investigated below.
+
+- **commitment_breach — PASS (proven at confirmation level).** Real penalty confirmed,
+  largest output **30,871 sats** ≈ breached `to_local`. This is the proof the old
+  broadcast-only check never gave.
+- **subfactory_breach — FALSE FAIL; the *defense* is proven on-chain.** The standalone WT
+  hydrated the kind=1 sub-factory watch, broadcast the latest-state penalty
+  `cf4e4bf…a79dcc`, and it **confirmed (24 confs)**: it spends the breach
+  `c79aeb…c1fb6c` (3 inputs) and redistributes **132,800 sats** to 3 honest outputs
+  (55,416 + 44,333 + 33,051). Sub-factory trustless defense **PROVEN on signet at the
+  confirmation level** — *not* a protocol gap.
+  - **Root cause of the FAIL:** the sub-factory breach is a **2-stage** confirmation —
+    the stale chain (`c79aeb`) must confirm *first*, then the latest-state penalty
+    (`cf4e4bf`) can spend it. That is ~2× the block-waits of the single-stage commitment
+    penalty (which spends an already-confirmed commitment). `wait_confirm`'s budget ran
+    out before signet's variable block timing produced *both* confirmations; the penalty
+    confirmed shortly after the test gave up.
+  - **Lesson (refines §3, not a regression of it):** a confirmation check is correct, but
+    its budget must cover the *longest confirmation chain* the defense requires. Multi-stage
+    breach→penalty paths (sub-factory, force-close) need a budget ≥ N sequential confirms.
+    The fix is a 2-stage-aware budget — **never** revert to broadcast-only to "make it green."
+  - **Fix:** give the sub-factory penalty confirm a budget sized for 2 sequential signet
+    confirmations, and make the timeout message say "not confirmed within budget — re-check
+    on-chain (signet 2-stage breach→penalty can exceed this)" instead of implying the
+    defense failed. Also note the cosmetic WT log label ("FACTORY BREACH" printed for a
+    kind=1 sub-factory watch — the LSP log correctly says "SUB-FACTORY BREACH").
+
 ## 5. Remediation plan
 1. **Tier 1** (#34): worst-first, each = extract real txid → `wait_confirm` → assert amount/net-delta. PR against `integration/security-e2e`.
 2. **Tier 3** (#35): add amount/distribution assertions (helpers exist).
