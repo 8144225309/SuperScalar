@@ -77,20 +77,19 @@ if ! $BCLI getblockchaininfo >/dev/null 2>&1; then
 fi
 
 # Set up miner wallet
-$BCLI -named createwallet wallet_name=ss_cheat_rollover_miner load_on_startup=false 2>&1 | head -2 || true
-$BCLI loadwallet ss_cheat_rollover_miner 2>/dev/null || true
-MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_rollover_miner -named getnewaddress address_type=bech32m)
+$BCLI -named createwallet wallet_name=ss_cheat_leaf_miner load_on_startup=false 2>&1 | head -2 || true
+$BCLI loadwallet ss_cheat_leaf_miner 2>/dev/null || true
+MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_leaf_miner -named getnewaddress address_type=bech32m)
 $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 
 # --- Standalone WT first (it will be authoritative) ---
 echo "--- Standalone WT (port $WT_PORT) ---"
-ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$WT_BIN" \
     --network regtest \
     --port $WT_PORT \
     --rpcuser ${RPCUSER:-rpcuser} \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet ss_cheat_rollover_miner \
+    --wallet ss_cheat_leaf_miner \
     --db "$WT_DB" \
     > "$WT_LOG" 2>&1 &
 WT_PID=$!
@@ -106,7 +105,6 @@ done
 
 # --- LSP: --test-tier-b-rollover + --cheat-daemon-rollover=mid-window ---
 echo "--- LSP daemon (--test-tier-b-rollover --cheat-daemon-rollover=mid-window) ---"
-ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$LSP_BIN" \
     --network regtest \
     --port $LSP_PORT \
@@ -124,7 +122,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet ss_cheat_rollover_miner \
+    --wallet ss_cheat_leaf_miner \
     --db "$LSP_DB" \
     --demo --test-tier-b-rollover --cheat-daemon-rollover mid-window \
     --lsp-balance-pct 50 \
@@ -152,7 +150,7 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
         --seckey "$CLIENT_SECKEY" \
         --rpcuser ${RPCUSER:-rpcuser} \
         --rpcpassword ${RPCPASSWORD:-rpcpass} \
-        --wallet ss_cheat_rollover_miner \
+        --wallet ss_cheat_leaf_miner \
         > "$TMPDIR/client_${i}.log" 2>&1 &
     CLIENT_PID=$!
     PIDS+=($CLIENT_PID)
