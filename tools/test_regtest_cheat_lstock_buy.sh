@@ -204,8 +204,21 @@ echo "=== Final result ==="
 BREACH_DETECTED=$(grep -E "FACTORY BREACH on node|CL\?-CHEAT-LSTOCK-BUY: BREACH DETECTED" "$LSP_LOG" 2>/dev/null | wc -l)
 POISON_BROADCAST=$(grep -E "L-stock burn tx broadcast|poison TX broadcast|penalty.*broadcast|response_tx.*broadcast" "$LSP_LOG" 2>/dev/null | wc -l)
 
+set +e
 if [ "$BREACH_DETECTED" -ge 1 ] && [ "$POISON_BROADCAST" -ge 1 ]; then
-    echo "  PASS: WT detected breach (x$BREACH_DETECTED) + broadcast poison (x$POISON_BROADCAST)"
+    # OUTCOME (not just log-greps): confirm the lstock-buy defense txid ON-CHAIN + assert a real redistributed amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE (source LIKE '%lstock%' OR source LIKE '%poison%' OR source LIKE '%penalty%' OR source LIKE '%response%' OR source LIKE '%burn%') AND result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "L-stock burn tx broadcast: *[0-9a-f]{64}|Latest state tx broadcast: *[0-9a-f]{64}|poison TX broadcast[^0-9a-f]*[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: breach detected + poison broadcast logged, but no defense txid found (broadcast_log/breach_detections/log)"; tail -25 "$LSP_LOG"; exit 1; }
+    echo "  defense (lstock/poison) txid: $PEN_TXID — mining to confirm + verify redistribution"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: defense $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  defense confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: defense output ${PSATS} sats <= dust — not a real redistribution"; exit 1; }
+    echo "  PASS: WT detected breach (x$BREACH_DETECTED) + broadcast AND CONFIRMED defense $PEN_TXID (${PSATS} sats) — outcome verified, not just a log line"
     grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0
 fi
