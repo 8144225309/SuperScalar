@@ -138,7 +138,7 @@ grep -q "hydrated" "$WT1_LOG" || fail "WT#1 did not hydrate from wt.db"
 [ "$FIRED" = 1 ] || { tail -30 "$WT1_LOG"; fail "cold-restarted WT did not broadcast the response"; }
 
 RESP_TXID=$(grep -E "Latest state tx broadcast:" "$WT1_LOG" | head -1 | grep -oE "[0-9a-f]{64}" | head -1)
-[ -n "$RESP_TXID" ] || RESP_TXID=$(grep -oE "[0-9a-f]{64}" "$WT1_LOG" | head -1)
+[ -n "$RESP_TXID" ] || { tail -20 "$WT1_LOG"; fail "no response txid in WT log (refusing head-1 fallback that could false-pass on a stray hash)"; }
 echo "  response txid: $RESP_TXID"
 
 # confirm the response and resolve its height (txindex=1)
