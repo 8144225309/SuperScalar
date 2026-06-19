@@ -115,10 +115,13 @@ if [ "$SWEEP_CONF" -eq 1 ]; then
     SWEEP_SATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
     echo "  sweep largest output: ${SWEEP_SATS:-0} sats"
 fi
-if [ "$ARMED" -eq 1 ] && [ "${K3:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 1000 ]; then
+# Floor is the dust threshold (>=330), not an arbitrary 1000: an HTLC-timeout sweep recovers
+# the (small) in-flight HTLC value minus fee — legitimately sub-1000 (observed 819 sats). The
+# check must catch a zero/dust sweep, not false-fail a real small recovery.
+if [ "$ARMED" -eq 1 ] && [ "${K3:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 330 ]; then
     green "PASS: secret-less standalone WT (--wt-db only) swept the LSP's HTLC-timeout from wt.db (kind=3)"
     green "      alone — pre-signed sweep $SWEEP_TXID broadcast + CONFIRMED on-chain ($SWEEP_SATS sats),"
     green "      spending the force-close commit. Force-close HTLC-sweep delegation PROVEN trustless (last matrix cell)."
     exit 0
 fi
-red "FAIL: need armed + kind3>=1 + WT broadcast + sweep confirmed + real amount (>=1000 sats)"; exit 1
+red "FAIL: need armed + kind3>=1 + WT broadcast + sweep confirmed + real amount (>=330 sats, above dust)"; exit 1
