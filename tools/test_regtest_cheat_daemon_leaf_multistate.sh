@@ -256,9 +256,11 @@ fi
 if [ $EARLY_TIER_B -eq 1 ]; then
     echo
     echo "=== Final result (Tier-B-neutralized path) ==="
-    echo "  PASS: LSP-side Tier B made stale state unspendable before cheat could broadcast"
-    echo "  (alternative defense outcome: rollover beat the cheater)"
-    exit 0
+    echo "  SKIP: LSP-side Tier B neutralized the stale state before the cheat broadcast — the"
+    echo "  standalone WT defense (this test's subject) was NOT exercised, so this run is"
+    echo "  INCONCLUSIVE, NOT a PASS. Re-run with Tier-B rollover disabled to validate the WT."
+    echo "  (cf. sibling cheat_leaf_multistate.sh: Tier-B-neutralized by itself is not a WT defense.)"
+    exit 77
 fi
 STALE_TXID=$(grep -E "Stale pre-advance leaf broadcast" "$LSP_LOG" | head -1 | awk -F'broadcast: ' '{print $2}' | awk '{print $1}')
 SNAPSHOT_AT=$(grep -E "CL3-K: snapshotted chain\[" "$LSP_LOG" | head -1 | sed -E 's/.*chain\[([0-9]+)\].*/\1/')
