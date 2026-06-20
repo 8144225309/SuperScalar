@@ -3003,7 +3003,7 @@ int factory_session_prepare_poison_tx_subfactory(
     if (!factory_build_l_stock_poison_tx_unsigned(
             f, sub, old_chain_txid32, old_sstock_vout,
             old_sstock_amount_sats, fee_sats,
-            &sub->poison_unsigned_tx, sub->poison_sighash)) {
+            &sub->poison_unsigned_tx, sub->poison_sighash, sub->poison_txid)) {
         factory_session_reset_poison(f, sub_node_idx);
         return 0;
     }
@@ -3023,7 +3023,7 @@ int factory_session_prepare_poison_tx_leaf(
     if (!factory_build_l_stock_poison_tx_unsigned(
             f, leaf, old_leaf_txid32, old_l_stock_vout,
             old_l_stock_amount_sats, fee_sats,
-            &leaf->poison_unsigned_tx, leaf->poison_sighash)) {
+            &leaf->poison_unsigned_tx, leaf->poison_sighash, leaf->poison_txid)) {
         factory_session_reset_poison(f, leaf_node_idx);
         return 0;
     }
@@ -3262,7 +3262,8 @@ int factory_build_l_stock_poison_tx_unsigned(
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
     tx_buf_t *poison_tx_out,
-    unsigned char *sighash_out32)
+    unsigned char *sighash_out32,
+    unsigned char *txid_out32)
 {
     if (!f || !leaf_node || !l_stock_txid32 || !poison_tx_out) return 0;
     /* leaf_node->n_signers includes LSP (signer_indices[0] == 0).  The
@@ -3308,11 +3309,18 @@ int factory_build_l_stock_poison_tx_unsigned(
        fee is paid by the input/output delta. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    if (!build_unsigned_tx(&unsigned_tx, NULL, l_stock_txid32, l_stock_vout,
+    unsigned char poison_display_txid[32];
+    if (!build_unsigned_tx(&unsigned_tx,
+                            txid_out32 ? poison_display_txid : NULL,
+                            l_stock_txid32, l_stock_vout,
                             0xFFFFFFFEu, outputs, n_clients)) {
         tx_buf_free(&unsigned_tx);
         free(outputs);
         return 0;
+    }
+    if (txid_out32) {   /* display-order -> internal byte order (mirror node->txid) */
+        memcpy(txid_out32, poison_display_txid, 32);
+        reverse_bytes(txid_out32, 32);
     }
 
     /* Compute the BIP-341 keypath sighash against the L-stock SPK.  This

@@ -3963,8 +3963,17 @@ static int lsp_subfactory_chain_advance_stateless_multi(
                 /* parent_value_sat */ wt_old_chain_amount,
                 wt_old_chain_spk, wt_old_chain_spk_len,
                 /* csv_delay        */ wt_old_csv_delay,
-                sub->signed_tx.data, sub->signed_tx.len,
-                sub->txid,
+                /* G1 #44: store the POISON as the trustless wt_db response when
+                   available — it spends chain[N-1]'s OWN sales-stock output, so it
+                   remediates a CONFIRMED sub-factory breach (chain[N] in wt_db only
+                   worked via pre-confirmation RBF and orphaned -25 once the breach
+                   confirmed, with no fallback). Falls back to chain[N] if degraded. */
+                (sub->poison_is_signed && sub->poison_signed_tx.len > 0)
+                    ? sub->poison_signed_tx.data : sub->signed_tx.data,
+                (sub->poison_is_signed && sub->poison_signed_tx.len > 0)
+                    ? sub->poison_signed_tx.len  : sub->signed_tx.len,
+                (sub->poison_is_signed && sub->poison_signed_tx.len > 0)
+                    ? sub->poison_txid : sub->txid,
                 /* fee_bump_budget  */ 0,
                 /* fee_bump_dline   */ 0);
             if (watch_id > 0) {
@@ -4528,8 +4537,17 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
                 /* parent_value_sat */ wt_old_chain_amount,
                 wt_old_chain_spk, wt_old_chain_spk_len,
                 /* csv_delay        */ wt_old_csv_delay,
-                sub->signed_tx.data, sub->signed_tx.len,
-                sub->txid,
+                /* G1 #44: store the POISON as the trustless wt_db response when
+                   available — it spends chain[N-1]'s OWN sales-stock output, so it
+                   remediates a CONFIRMED sub-factory breach (chain[N] in wt_db only
+                   worked via pre-confirmation RBF and orphaned -25 once the breach
+                   confirmed, with no fallback). Falls back to chain[N] if degraded. */
+                (sub->poison_is_signed && sub->poison_signed_tx.len > 0)
+                    ? sub->poison_signed_tx.data : sub->signed_tx.data,
+                (sub->poison_is_signed && sub->poison_signed_tx.len > 0)
+                    ? sub->poison_signed_tx.len  : sub->signed_tx.len,
+                (sub->poison_is_signed && sub->poison_signed_tx.len > 0)
+                    ? sub->poison_txid : sub->txid,
                 /* fee_bump_budget  */ 0,
                 /* fee_bump_dline   */ 0);
             if (watch_id > 0) {

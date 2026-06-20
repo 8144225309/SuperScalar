@@ -174,6 +174,10 @@ typedef struct {
     tx_buf_t poison_unsigned_tx;
     tx_buf_t poison_signed_tx;
     int poison_is_signed;
+    /* internal byte order; txid of the poison TX (signed txid == unsigned txid,
+       witness-stripped).  Captured at build time so the trustless wt_db response
+       can be keyed on the poison (G1 #44) without a txid-from-bytes helper. */
+    unsigned char poison_txid[32];
 
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
@@ -428,7 +432,8 @@ int factory_build_l_stock_poison_tx_unsigned(
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
     tx_buf_t *poison_tx_out,
-    unsigned char *sighash_out32);
+    unsigned char *sighash_out32,
+    unsigned char *txid_out32);
 
 /* Single-process variant: builds + N-of-N MuSig-co-signs + assembles
    the witness for the L-stock poison TX.  Requires that f->keypairs[]
