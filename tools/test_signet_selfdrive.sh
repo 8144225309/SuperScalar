@@ -54,5 +54,24 @@ for i in $(seq 1 $((CONFIRM_TIMEOUT/10))); do
 done
 echo; echo "=== evidence ==="; grep -aiE "PTLC|HTLC|penalty|sweep|broadcast|PASSED|ptlc_penalty|timeout TX|confirmed" "$LSP_LOG" 2>/dev/null | tail -16
 echo
-if [ "$SEEN" = 1 ]; then green "PASS (signet): $FLAG fired — '$MARKER' on REAL signet at 0.1 sat/vB."; recov; exit 0
-else red "FAIL (signet): '$MARKER' not observed for $FLAG"; tail -25 "$LSP_LOG"; recov; exit 1; fi
+btc(){ bitcoin-cli -signet -rpcuser=$RU -rpcpassword=$RP -rpcport=$RPORT "$@" 2>/dev/null; }
+if [ "$SEEN" != 1 ]; then red "FAIL (signet): '$MARKER' not observed for $FLAG"; tail -25 "$LSP_LOG"; recov; exit 1; fi
+
+# RIGOR (Tier-2, false-pass class): the MARKER is the LSP's SELF-REPORT. A self-driving test that
+# only greps its own "TEST PASSED" line asserts the machinery ran, NOT that the breach response
+# produced a real on-chain outcome. Independently verify: pull the sweep/penalty/timeout txid the
+# LSP actually broadcast (broadcast_log = ground truth, log = fallback), confirm it's ANCHORED, and
+# assert it recovered a non-dust amount. A marker without a confirmed funded tx is a false pass.
+SWEEP_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE result='ok' AND length(txid)=64 AND (source LIKE '%penal%' OR source LIKE '%sweep%' OR source LIKE '%ptlc%' OR source LIKE '%htlc%' OR source LIKE '%timeout%' OR source LIKE '%force%' OR source LIKE '%punish%') ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+[ -z "$SWEEP_TXID" ] && SWEEP_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+[ -z "$SWEEP_TXID" ] && SWEEP_TXID=$(grep -aoiE "(penal|sweep|timeout|ptlc|htlc|punish|broadcast)[^0-9a-f]{0,40}[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+[ -n "$SWEEP_TXID" ] || { red "FAIL (signet): marker '$MARKER' seen but NO sweep/penalty txid in broadcast_log or LSP log — cannot verify the on-chain outcome (marker != confirmed funded tx)"; tail -25 "$LSP_LOG"; recov; exit 1; }
+echo "  verifying breach-response tx on-chain: $SWEEP_TXID"
+RAW=$(btc getrawtransaction "$SWEEP_TXID" true)
+CONF=$(echo "$RAW" | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+{ [ -n "$CONF" ] && [ "${CONF:-0}" -ge 1 ]; } || { red "FAIL (signet): marker '$MARKER' seen but breach-response tx $SWEEP_TXID is NOT confirmed on-chain (self-report != outcome)"; recov; exit 1; }
+SVAL=$(echo "$RAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+SSATS=$(awk "BEGIN{printf \"%d\", ($SVAL+0)*100000000}")
+[ "${SSATS:-0}" -ge 330 ] || { red "FAIL (signet): breach-response $SWEEP_TXID confirmed but largest output ${SSATS} sats is dust — no real recovery"; recov; exit 1; }
+green "PASS (signet): $FLAG fired — '$MARKER' AND breach-response $SWEEP_TXID CONFIRMED on-chain (${CONF} confs, $SSATS sats recovered, 0.1 sat/vB). Outcome verified, not just self-reported."
+recov; exit 0
