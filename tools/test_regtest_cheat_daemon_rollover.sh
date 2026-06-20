@@ -76,6 +76,15 @@ if ! $BCLI getblockchaininfo >/dev/null 2>&1; then
     exit 1
 fi
 
+# Clear any leftover LSP/WT holding OUR ports — the chronic 'listen failed on port 29959' root
+# cause: a zombie from a prior run keeps the port bound, so this LSP can't bind and accept clients
+# (which surfaces as the clients' "noise handshake failed"). Scoped to our exact ports (NOT broad,
+# NOT --network — won't touch the testnet4 N=64 runner).
+pkill -9 -f "superscalar_(lsp|client) .*--port ${LSP_PORT}( |\$)" 2>/dev/null || true
+pkill -9 -f "superscalar_watchtower .*--port ${WT_PORT}( |\$)" 2>/dev/null || true
+pkill -9 -f "superscalar_lsp .*--watchtower-port ${WT_PORT}( |\$)" 2>/dev/null || true
+sleep 1
+
 # Set up miner wallet
 $BCLI -named createwallet wallet_name=ss_cheat_leaf_miner load_on_startup=false 2>&1 | head -2 || true
 $BCLI loadwallet ss_cheat_leaf_miner 2>/dev/null || true
