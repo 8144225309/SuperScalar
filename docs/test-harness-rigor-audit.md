@@ -318,3 +318,35 @@ self-match) — verified to spare the testnet4 N=64 runner (`--network testnet4`
 4. **rollover**: run against the ASan `build` (not build-release+LD_PRELOAD) or stabilize.
 5. **Signet re-validation** + **taproot recovery #28/#29** — batch into one deliberate signet session
    (sat budget, daemon-pause, strong keys per [feedback_no_weak_keys_signet]).
+
+## 10. In-flight runs + Tier-4 design (2026-06-20)
+
+**Running detached (poll the .output; results persist):**
+- `ss-rv12` → `/root/_rigor_validate12.output` — rollover re-run after its **3-layer fix**
+  (libasan-on-build-release destabilized the long run → removed; fresh low-balance wallet →
+  `ss_cheat_leaf_miner`; **no background miner during the 600s cheat-wait so the block-driven
+  DW rollover stalled** → added `(while kill -0 $LSP_PID; do generatetoaddress 1; sleep 2; done)&`).
+- `ss-signet-reval` → `/root/_signet_reval.output` — signet trio (commitment/subfactory/wt_restart)
+  with all fixes incl. signet-subfactory 2-stage budget + min-check. Multi-hour (real signet). Per
+  test logs `/tmp/sig_*.log`. **taproot #28/#29:** check `ss_sig_sweep` + the stranded ~99,750 sat
+  output after this (daemon-pause for RPC); the daemon's `descriptorprocesspsbt` sweep should have it.
+
+**Full regtest matrix result (ss-rigor-matrix):** PASS=16, SKIP=1 (multistate, correct), FAIL=1
+(rollover — now fixed, re-validating). Leaf-A-2 validated (91.8–98.4% recovery). Node-guard worked.
+
+**A-2 threshold note:** flat 90% is correct for redistributions/channel (fee <2%) and OK for
+leaf (cheat_leaf 91.8%), but **too tight for tiny-HTLC sweeps** (~819 sats, fee is a large %).
+For channel-commit/HTLC A-2, use a fee-bounded threshold (fee < max(2000 sats, 10% of input))
+rather than a flat 90% — or rely on the existing confirm+amount (single-sweep is already covered).
+
+**Tier-4 reorg re-fire — DESIGN (regtest, new test, the real trustless-robustness gap):**
+The current `adversarial_reorg`/`same_height_reorg` run an EMPTY wt.db (detection-only — they
+correctly prove the WT logs/handles 3 reorg kinds; NOT false-passes). The missing property is
+*does a penalty survive a reorg*. New test plan:
+1. Run the commitment-breach flow (arm kind=2 watch → breach → WT broadcasts penalty → mine → confirm).
+2. `invalidateblock` the penalty's block (+breach block) → penalty returns to mempool / is orphaned.
+3. Mine fresh blocks on the new chain → assert the penalty (same or a WT-rebroadcast one)
+   **re-confirms** and the cheater's to_local is still swept (amount intact).
+Prerequisite: confirm the WT re-broadcasts on reorg (or that Core's mempool re-mines it) — check
+the WT poll-loop's reorg handling before asserting. `rebroadcast_recovery` is the same shape
+(broadcast → reorg-drop → re-broadcast → re-confirm).
