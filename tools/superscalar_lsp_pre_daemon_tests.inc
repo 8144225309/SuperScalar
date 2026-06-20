@@ -1912,6 +1912,38 @@
                         printf("  iter %d/%d: lsp_channels_advance_ps_leaf(0)...\n",
                                it + 1, n_iters);
                         fflush(stdout);
+                        /* CL4-ROLLOVER: the Tier-B ceremony (Step 10, lsp_channels.c)
+                           arms the watchtower to watch the IMMEDIATELY-superseded leaf
+                           state (T_{n-1}), not older ones (WT watches the most-dangerous
+                           revoked state — smallest DW timelock — by design, see
+                           lsp_channels.c rehydrate note).  Re-snapshot the leaf node txs
+                           NOW (just before the final, rollover-triggering advance) so the
+                           cheat broadcasts exactly that stale state.  The parent path was
+                           captured pre-loop and is unchanged by leaf advances, so the
+                           re-captured T_{n-1} leaves stay consistent with it. */
+                        if (cl4r_cheat_enabled && it == n_iters - 1 && cl4r_node_snap) {
+                            for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
+                                size_t lni = lsp_p->factory.leaf_node_indices[li];
+                                factory_node_t *ln = &lsp_p->factory.nodes[lni];
+                                if (!ln->is_signed || ln->signed_tx.len == 0) continue;
+                                tx_buf_free(&cl4r_node_snap[lni]);
+                                tx_buf_init(&cl4r_node_snap[lni], ln->signed_tx.len);
+                                memcpy(cl4r_node_snap[lni].data, ln->signed_tx.data, ln->signed_tx.len);
+                                cl4r_node_snap[lni].len = ln->signed_tx.len;
+                                cl4r_node_signed[lni] = 1;
+                                memcpy(cl4r_node_txid[lni], ln->txid, 32);
+                                if (li < FACTORY_MAX_LEAVES) {
+                                    tx_buf_free(&cl4r_snap[li]);
+                                    tx_buf_init(&cl4r_snap[li], ln->signed_tx.len);
+                                    memcpy(cl4r_snap[li].data, ln->signed_tx.data, ln->signed_tx.len);
+                                    cl4r_snap[li].len = ln->signed_tx.len;
+                                    memcpy(cl4r_snap_txid[li], ln->txid, 32);
+                                }
+                            }
+                            fprintf(stderr, "CL4-ROLLOVER: re-snapshotted %d leaves at T_{n-1} "
+                                    "(the WT-armed immediately-superseded state) before final rollover\n",
+                                    lsp_p->factory.n_leaf_nodes);
+                        }
                         int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
                         if (rc != 1) {
                             printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
