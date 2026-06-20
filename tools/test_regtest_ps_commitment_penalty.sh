@@ -22,6 +22,7 @@ RU=$(awk -F= '/^[[:space:]]*rpcuser/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_C
 RP=$(awk -F= '/^[[:space:]]*rpcpassword/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_CONF"); RP=${RP:-rpcpass}
 RPORT=$(awk -F= '/^[[:space:]]*rpcport/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_CONF"); RPORT=${RPORT:-18443}
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"; WALLET="ss_cheat_leaf_miner"
+. "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh   # pen_recovers_most (A-2, fee-bounded)
 TMPDIR=$(mktemp -d /tmp/ss-ps-commit-penalty.XXXXXX); LSP_DB="$TMPDIR/lsp.db"; WT_DB="$TMPDIR/wt.db"; LSP_LOG="$TMPDIR/lsp.log"
 PIDS=(); MINER_PID=""
 cleanup(){ [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null||true; pkill -9 -f "superscalar_(lsp|client).*--port $PORT" 2>/dev/null||true; for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null||true; done; cp "$LSP_LOG" /tmp/ps_commit_penalty_lsp.log 2>/dev/null||true; }
@@ -80,6 +81,8 @@ if [ "$PEN" = 1 ] && [ "${K2:-0}" -ge 1 ]; then
     PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
     echo "  penalty confirmed on-chain; largest output ${PSATS:-0} sats"
     [ "${PSATS:-0}" -ge 5000 ] || { red "FAIL: penalty output ${PSATS} sats too small — not a real to_local recovery (dust/zero?)"; exit 1; }
+    RR=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery: $RR"
+    case "$RR" in LOW*) red "FAIL: penalty recovers too little of the swept to_local — value leaked/burned ($RR)"; exit 1;; esac
     green "PASS: a PS channel-commitment breach was PUNISHED — penalty $PEN_TXID CONFIRMED on-chain ($PSATS sats),"
     green "      and the same penalty is armed in wt.db ($K2 kind=2 watches). Outcome verified, not just broadcast."
     exit 0

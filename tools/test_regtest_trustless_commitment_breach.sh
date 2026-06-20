@@ -26,6 +26,7 @@ RU=$(awk -F= '/^[[:space:]]*rpcuser/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_C
 RP=$(awk -F= '/^[[:space:]]*rpcpassword/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_CONF"); RP=${RP:-rpcpass}
 RPORT=$(awk -F= '/^[[:space:]]*rpcport/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_CONF"); RPORT=${RPORT:-18443}
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"; WALLET="ss_cheat_leaf_miner"
+. "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh   # pen_recovers_most (A-2, fee-bounded)
 TMPDIR=$(mktemp -d /tmp/ss-tl-commit-breach.XXXXXX); LSP_DB="$TMPDIR/lsp.db"; WT_DB="$TMPDIR/wt.db"; LSP_LOG="$TMPDIR/lsp.log"; WT_LOG="$TMPDIR/wt.log"
 PIDS=(); MINER_PID=""
 cleanup(){ [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null||true; pkill -9 -f "superscalar_watchtower.*--wt-db $WT_DB" 2>/dev/null||true; pkill -9 -f "superscalar_(lsp|client).*--port $PORT" 2>/dev/null||true; for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null||true; done; cp "$WT_LOG" /tmp/tl_commit_breach_wt.log 2>/dev/null||true; cp "$LSP_LOG" /tmp/tl_commit_breach_lsp.log 2>/dev/null||true; }
@@ -96,6 +97,10 @@ PEN_SATS=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"val
 PEN_SATS=$(awk "BEGIN{printf \"%d\", ($PEN_SATS+0)*100000000}")
 echo "  penalty confirmed ($PCONF conf); largest output: ${PEN_SATS:-0} sats"
 [ "${PEN_SATS:-0}" -ge 5000 ] || fail "penalty payout ${PEN_SATS} sats too small — not a real to_local recovery (dust/zero?)"
+# A-2 (fee-bounded): the justice tx must recover ~all the breached to_local it sweeps (no value
+# burned/leaked). Fail only on a confirmed LOW; UNKNOWN (lookup miss) does not false-fail.
+RR=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery: $RR"
+case "$RR" in LOW*) fail "penalty recovers too little of the swept to_local — value leaked/burned ($RR)";; esac
 
 # Tier-4 reorg-robustness (opt-in: SS_REORG_REFIRE=1). The trustless model must survive a reorg:
 # orphan the penalty's block and verify the penalty RE-confirms (WT re-broadcasts on reorg via
