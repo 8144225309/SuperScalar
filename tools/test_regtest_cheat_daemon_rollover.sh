@@ -144,13 +144,17 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
     CLIENT_SECKEY=$(printf "%064x" $((0x02 + i)))
     "$CLIENT_BIN" \
         --network regtest \
-        --lsp-host 127.0.0.1 \
-        --lsp-port $LSP_PORT \
-        --lsp-pubkey "$LSP_PUBKEY" \
+        --host 127.0.0.1 --port $LSP_PORT \
+        --daemon \
         --seckey "$CLIENT_SECKEY" \
+        --fee-rate 1000 \
+        --lsp-balance-pct 50 \
+        --lsp-pubkey "$LSP_PUBKEY" \
+        --participant-id $((i + 1)) \
         --rpcuser ${RPCUSER:-rpcuser} \
         --rpcpassword ${RPCPASSWORD:-rpcpass} \
         --wallet ss_cheat_leaf_miner \
+        --db "$TMPDIR/client_${i}.db" \
         > "$TMPDIR/client_${i}.log" 2>&1 &
     CLIENT_PID=$!
     PIDS+=($CLIENT_PID)
