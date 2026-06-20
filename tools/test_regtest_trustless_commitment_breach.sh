@@ -97,6 +97,28 @@ PEN_SATS=$(awk "BEGIN{printf \"%d\", ($PEN_SATS+0)*100000000}")
 echo "  penalty confirmed ($PCONF conf); largest output: ${PEN_SATS:-0} sats"
 [ "${PEN_SATS:-0}" -ge 5000 ] || fail "penalty payout ${PEN_SATS} sats too small — not a real to_local recovery (dust/zero?)"
 
+# Tier-4 reorg-robustness (opt-in: SS_REORG_REFIRE=1). The trustless model must survive a reorg:
+# orphan the penalty's block and verify the penalty RE-confirms (WT re-broadcasts on reorg via
+# watchtower_on_reorg + poll-loop; Core also returns the tx to mempool). The cheater's to_local
+# must stay swept across the reorg. WT is still alive here (--poll-interval 3).
+if [ "${SS_REORG_REFIRE:-0}" = 1 ]; then
+    echo "=== REORG-REFIRE: orphan the penalty block, verify the penalty re-confirms ==="
+    PBLK=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
+    [ -n "$PBLK" ] || fail "reorg: could not find penalty block for $PEN_TXID"
+    echo "  invalidating penalty block $PBLK (orphans penalty $PEN_TXID)"
+    $BCLI invalidateblock "$PBLK" 2>/dev/null
+    sleep 6   # let the standalone WT poll-loop observe the vanished penalty + re-broadcast
+    RECONF=0
+    for i in $(seq 1 24); do mine 1; sleep 2; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
+    [ "$RECONF" -ge 1 ] || fail "REORG-REFIRE: penalty $PEN_TXID did NOT re-confirm after reorg — trustless defense LOST on reorg!"
+    RSATS=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    RSATS=$(awk "BEGIN{printf \"%d\", ($RSATS+0)*100000000}")
+    [ "${RSATS:-0}" -ge 5000 ] || fail "REORG-REFIRE: re-confirmed penalty output ${RSATS} sats too small"
+    grep -aiE "vanished.*reorg|re-watching|reorg detected" "$WT_LOG" 2>/dev/null | tail -2
+    green "REORG-REFIRE PASS: penalty re-confirmed after orphaning its block ($RECONF conf, $RSATS sats) —"
+    green "      the cheater's to_local stays swept across a reorg. Trustless defense is reorg-robust."
+fi
+
 green "PASS: a STANDALONE trustless WT (wt.db only, no secrets) hydrated $K2 channel-commitment watch(es),"
 green "      broadcast AND CONFIRMED the penalty ($PCONF conf, $PEN_SATS sats swept) for a revoked-commitment"
 green "      breach — outcome verified, not just broadcast. Channel-commitment trustless defense PROVEN e2e."
