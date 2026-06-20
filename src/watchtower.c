@@ -1047,6 +1047,38 @@ int watchtower_check(watchtower_t *wt) {
                 }
             }
 
+            /* #52: enqueue the factory-node response for CPFP fee-bump monitoring.
+               Hydrated wt_db entries all flatten to WATCH_FACTORY_NODE, and this
+               handler previously never enqueued — so a standalone WT broadcast its
+               response ONCE at the registration feerate and could never bump it,
+               losing the race under fee pressure (proven via SS_HIFEE_GAP). The
+               default RPC wallet (watchtower.c:95) + the existing deadline-aware
+               escalator (watchtower_build_cpfp_tx) do the rest. Mirrors the
+               WATCH_COMMITMENT enqueue; only when the response carries a P2A anchor. */
+            if (factory_resp_txid[0] &&
+                penalty_tx_has_p2a_anchor(e->response_tx, e->response_tx_len) &&
+                wt->anchor_spk_len == P2A_SPK_LEN &&
+                wt->n_pending < wt->pending_cap) {
+                uint32_t fn_cur_h = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+                watchtower_pending_t *fp = &wt->pending[wt->n_pending++];
+                memcpy(fp->txid, factory_resp_txid, 64); fp->txid[64] = '\0';
+                fp->anchor_vout = 1;
+                fp->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
+                fp->penalty_value = (e->sub_sales_stock_amount > 0)
+                                    ? e->sub_sales_stock_amount
+                                    : e->to_local_amount;
+                fp->csv_delay = (e->csv_delay > 0) ? e->csv_delay : CHANNEL_DEFAULT_CSV_DELAY;
+                fp->start_height = fn_cur_h;
+                fp->cycles_in_mempool = 0;
+                memset(&fp->fee_bump, 0, sizeof(fp->fee_bump));
+                if (wt->db && wt->db->db)
+                    persist_save_pending(wt->db, fp->txid, fp->anchor_vout,
+                                          fp->anchor_amount, 0, 0, fp->penalty_value,
+                                          fp->csv_delay, fp->start_height, 0, 0, 0, 0);
+                printf("  factory-node response %s enqueued for CPFP fee-bump (deadline csv=%u)\n",
+                       factory_resp_txid, fp->csv_delay);
+            }
+
             /* Also broadcast burn tx to destroy L-stock */
             if (e->burn_tx && e->burn_tx_len > 0) {
                 char *burn_hex = (char *)malloc(e->burn_tx_len * 2 + 1);
