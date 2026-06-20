@@ -108,6 +108,10 @@ if [ "${SS_REORG_REFIRE:-0}" = 1 ]; then
     echo "  invalidating penalty block $PBLK (orphans penalty $PEN_TXID)"
     $BCLI invalidateblock "$PBLK" 2>/dev/null
     sleep 6   # let the standalone WT poll-loop observe the vanished penalty + re-broadcast
+    # Verify the reorg ACTUALLY orphaned the penalty — else the re-confirm below is vacuous.
+    UC=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    { [ -z "$UC" ] || [ "$UC" -eq 0 ]; } || fail "REORG-REFIRE: invalidateblock left penalty at $UC confs — reorg ineffective, test would be vacuous"
+    echo "  penalty orphaned (confs now ${UC:-0}); mining new chain to verify re-confirm"
     RECONF=0
     for i in $(seq 1 24); do mine 1; sleep 2; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
     [ "$RECONF" -ge 1 ] || fail "REORG-REFIRE: penalty $PEN_TXID did NOT re-confirm after reorg — trustless defense LOST on reorg!"
