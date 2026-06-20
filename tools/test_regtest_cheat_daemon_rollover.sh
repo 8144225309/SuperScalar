@@ -157,6 +157,12 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
     echo "  client[$i] PID=$CLIENT_PID"
 done
 
+# The DW Tier-B rollover advances over BLOCKS — keep mining throughout so it reaches the
+# mid-window cheat point. Without this the chain stalls during the wait and CL4-ROLLOVER
+# never fires (the chronic rollover failure: libasan + funding + this missing miner).
+( while kill -0 $LSP_PID 2>/dev/null; do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 2; done ) &
+PIDS+=($!)
+
 # Wait for LSP to fire the cheat OR exit OR timeout
 echo
 echo "--- Waiting for CL4-ROLLOVER cheat broadcast (timeout 600s) ---"
