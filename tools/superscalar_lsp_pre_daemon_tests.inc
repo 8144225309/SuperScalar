@@ -1922,27 +1922,41 @@
                            captured pre-loop and is unchanged by leaf advances, so the
                            re-captured T_{n-1} leaves stay consistent with it. */
                         if (cl4r_cheat_enabled && it == n_iters - 1 && cl4r_node_snap) {
-                            for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
+                            /* Re-capture the FULL tree (parents too): the DW odometer
+                               can re-sign intermediate nodes across leaf advances, so
+                               parents-from-pre-loop + leaves-from-T_{n-1} would be an
+                               inconsistent, unbroadcastable tree (sent=0).  Capturing the
+                               whole tree at this instant yields a self-consistent
+                               pre-rollover tree whose leaf is exactly T_{n-1}. */
+                            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                                factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                                tx_buf_free(&cl4r_node_snap[ni]);
+                                tx_buf_init(&cl4r_node_snap[ni], 0);
+                                cl4r_node_signed[ni] = 0;
+                                memset(cl4r_node_txid[ni], 0, 32);
+                                if (nd->is_signed && nd->signed_tx.len > 0) {
+                                    tx_buf_init(&cl4r_node_snap[ni], nd->signed_tx.len);
+                                    memcpy(cl4r_node_snap[ni].data, nd->signed_tx.data, nd->signed_tx.len);
+                                    cl4r_node_snap[ni].len = nd->signed_tx.len;
+                                    cl4r_node_signed[ni] = 1;
+                                    memcpy(cl4r_node_txid[ni], nd->txid, 32);
+                                }
+                            }
+                            for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes && li < FACTORY_MAX_LEAVES; li++) {
                                 size_t lni = lsp_p->factory.leaf_node_indices[li];
                                 factory_node_t *ln = &lsp_p->factory.nodes[lni];
-                                if (!ln->is_signed || ln->signed_tx.len == 0) continue;
-                                tx_buf_free(&cl4r_node_snap[lni]);
-                                tx_buf_init(&cl4r_node_snap[lni], ln->signed_tx.len);
-                                memcpy(cl4r_node_snap[lni].data, ln->signed_tx.data, ln->signed_tx.len);
-                                cl4r_node_snap[lni].len = ln->signed_tx.len;
-                                cl4r_node_signed[lni] = 1;
-                                memcpy(cl4r_node_txid[lni], ln->txid, 32);
-                                if (li < FACTORY_MAX_LEAVES) {
-                                    tx_buf_free(&cl4r_snap[li]);
+                                tx_buf_free(&cl4r_snap[li]);
+                                tx_buf_init(&cl4r_snap[li], 0);
+                                if (ln->is_signed && ln->signed_tx.len > 0) {
                                     tx_buf_init(&cl4r_snap[li], ln->signed_tx.len);
                                     memcpy(cl4r_snap[li].data, ln->signed_tx.data, ln->signed_tx.len);
                                     cl4r_snap[li].len = ln->signed_tx.len;
                                     memcpy(cl4r_snap_txid[li], ln->txid, 32);
                                 }
                             }
-                            fprintf(stderr, "CL4-ROLLOVER: re-snapshotted %d leaves at T_{n-1} "
+                            fprintf(stderr, "CL4-ROLLOVER: re-snapshotted FULL tree (%zu nodes) at T_{n-1} "
                                     "(the WT-armed immediately-superseded state) before final rollover\n",
-                                    lsp_p->factory.n_leaf_nodes);
+                                    lsp_p->factory.n_nodes);
                         }
                         int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
                         if (rc != 1) {
