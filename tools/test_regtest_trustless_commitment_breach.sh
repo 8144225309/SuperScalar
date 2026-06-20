@@ -89,6 +89,28 @@ echo
 # OUTCOME check (not just broadcast): the penalty must CONFIRM on-chain and sweep a real amount.
 PEN_TXID=$(grep -oiE "Latest state tx broadcast: *[0-9a-f]{64}|penalty tx[^0-9a-f]*[0-9a-f]{64}" "$WT_LOG" | grep -oE "[0-9a-f]{64}" | tail -1)
 [ -n "$PEN_TXID" ] || { tail -25 "$WT_LOG"; fail "penalty broadcast but no penalty txid in WT log"; }
+
+# === #52 GAP DEMO (SS_HIFEE_GAP=1): prove the standalone WT cannot get its penalty
+# confirmed under fee pressure. stall_tx deprioritises the penalty (proxy for "below the
+# effective floor"); the WT has no wallet -> no CPFP child -> cannot bump it out. Mine past
+# the window: if it stays stuck, the cheater's to_self_delay would mature and win = the gap.
+# Sanity: unstall -> it confirms, proving the penalty is VALID and the gap is the missing bump. ===
+if [ "${SS_HIFEE_GAP:-0}" = 1 ]; then
+    . "$(dirname "$(realpath "$0")")"/regtest_hifee_helpers.sh
+    echo "=== #52 GAP DEMO: penalty $PEN_TXID under fee pressure (standalone WT, no fee-bump) ==="
+    stall_tx "$BCLI" "$PEN_TXID"
+    for i in $(seq 1 20); do mine 1; sleep 1; done
+    if assert_unconfirmed "$BCLI" "$PEN_TXID"; then
+        echo "  #52 GAP CONFIRMED on-chain: penalty STUCK under fee pressure — WT has no CPFP (superscalar_watchtower.c:153 no wallet). EXPECTED until #52 fix."
+        unstall_tx "$BCLI" "$PEN_TXID"
+        for i in $(seq 1 6); do mine 1; sleep 1; done
+        cc=$(tx_confs "$BCLI" "$PEN_TXID")
+        { [ -n "$cc" ] && [ "$cc" -ge 1 ]; } && echo "  SANITY OK: penalty confirms once unstalled ($cc confs) — penalty valid; the gap is purely the missing fee-bump." || echo "  WARN: penalty still stuck after unstall (investigate)"
+        echo "HIFEE_GAP_DEMO_DONE"; exit 0
+    else
+        echo "  #52 gap NOT reproduced (penalty confirmed despite stall) — harness/scenario issue"; exit 1
+    fi
+fi
 echo "  penalty txid: $PEN_TXID — mining to confirm + verify payout"
 PCONF=0
 for i in $(seq 1 12); do mine 1; sleep 1; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
