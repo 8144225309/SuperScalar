@@ -714,6 +714,32 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                         persist_save_old_commitment_htlc_sweep(
                             wt->db, channel_id, old_commit_num,
                             wh_h->htlc_vout, sweep.data, sweep.len);
+                        /* G2 #45: mirror the HTLC penalty sweep into wt_db so a
+                           SECRET-LESS standalone WT also sweeps in-flight HTLCs on
+                           a commitment breach (without this it penalizes to_local
+                           but leaks HTLC value).  Keyed on the breach commit txid;
+                           same pattern + sha256_double(resp) txid as the to_local
+                           mirror above. */
+                        if (wt->wt_db && wt->wt_db->db) {
+                            unsigned char h_resp_txid[32];
+                            sha256_double(sweep.data, sweep.len, h_resp_txid);
+                            char *h_hex = (char *)malloc(sweep.len * 2 + 1);
+                            if (h_hex) {
+                                hex_encode(sweep.data, sweep.len, h_hex);
+                                int64_t hwid = persist_wt_register_watch(
+                                    wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
+                                    channel_id, old_txid,
+                                    wh_h->htlc_vout, wh_h->htlc_amount,
+                                    wh_h->htlc_spk, 34,
+                                    ch->to_self_delay,
+                                    h_hex, h_resp_txid, 0, 0);
+                                free(h_hex);
+                                if (hwid <= 0)
+                                    fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                        "HTLC-sweep register failed (ch %u vout %u)\n",
+                                        channel_id, wh_h->htlc_vout);
+                            }
+                        }
                     } else {
                         fprintf(stderr,
                                 "watchtower: failed to build HTLC sweep TX "
