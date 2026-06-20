@@ -2034,6 +2034,7 @@
                             free(cl4r_node_txid);
                             free(cl4r_node_signed);
                             cl4r_node_snap = NULL; cl4r_node_txid = NULL; cl4r_node_signed = NULL;
+                        }
 
                         /* Verify every non-PS-leaf node is signed for the new epoch.
                            F1: for PS factories, also verify PS leaves are signed
