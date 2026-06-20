@@ -1812,6 +1812,14 @@
                 tx_buf_t cl4r_snap[FACTORY_MAX_LEAVES];
                 unsigned char cl4r_snap_txid[FACTORY_MAX_LEAVES][32];
                 int cl4r_cheat_enabled = (getenv("SS_CHEAT_ROLLOVER") != NULL);
+                /* Full pre-rollover tree snapshot (EVERY node, not just leaves) so
+                   the mid-window cheat can broadcast the OLD ancestor path with the
+                   OLD txids — the only way the OLD leaf 0 is spendable on-chain.
+                   malloc'd to keep the 512-node arrays off this already-deep stack;
+                   freed after the cheat fires. */
+                tx_buf_t *cl4r_node_snap = NULL;
+                unsigned char (*cl4r_node_txid)[32] = NULL;
+                int *cl4r_node_signed = NULL;
                 for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++) {
                     tx_buf_init(&cl4r_snap[li], 0);
                     memset(cl4r_snap_txid[li], 0, 32);
@@ -1840,6 +1848,27 @@
                             cl4r_snap[0].len > 5 ? cl4r_snap[0].data[5] : 0,
                             cl4r_snap[0].len > 6 ? cl4r_snap[0].data[6] : 0,
                             cl4r_snap[0].len > 7 ? cl4r_snap[0].data[7] : 0);
+
+                    /* Snapshot EVERY node's signed bytes + txid (not just leaves):
+                       the cheat broadcasts the whole pre-rollover tree so the OLD
+                       leaf 0's ancestors land on-chain with matching (old) txids. */
+                    cl4r_node_snap   = calloc(FACTORY_MAX_NODES, sizeof(tx_buf_t));
+                    cl4r_node_txid   = calloc(FACTORY_MAX_NODES, 32);
+                    cl4r_node_signed = calloc(FACTORY_MAX_NODES, sizeof(int));
+                    if (cl4r_node_snap && cl4r_node_txid && cl4r_node_signed) {
+                        for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                            factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                            tx_buf_init(&cl4r_node_snap[ni], 0);
+                            if (nd->is_signed && nd->signed_tx.len > 0) {
+                                tx_buf_init(&cl4r_node_snap[ni], nd->signed_tx.len);
+                                memcpy(cl4r_node_snap[ni].data, nd->signed_tx.data,
+                                       nd->signed_tx.len);
+                                cl4r_node_snap[ni].len = nd->signed_tx.len;
+                                cl4r_node_signed[ni] = 1;
+                                memcpy(cl4r_node_txid[ni], nd->txid, 32);
+                            }
+                        }
+                    }
                 }
 
                 uint32_t epoch_before = lsp_p->factory.counter.current_epoch;
@@ -1924,70 +1953,87 @@
                             const char *cl4r_phase = getenv("SS_CHEAT_ROLLOVER_PHASE");
                             if (cl4r_phase && strcmp(cl4r_phase, "mid-window") == 0 &&
                                 cl4r_snap[0].len > 0) {
-                                int saved_is_signed[FACTORY_MAX_NODES];
-                                memset(saved_is_signed, 0, sizeof(saved_is_signed));
-                                for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
-                                    size_t ni = lsp_p->factory.leaf_node_indices[li];
-                                    saved_is_signed[ni] = lsp_p->factory.nodes[ni].is_signed;
-                                    lsp_p->factory.nodes[ni].is_signed = 0;
+                                /* Swap the factory to the FULL pre-rollover tree, broadcast it,
+                                   then swap the current tree back.  Reusing the normal tree-broadcast
+                                   path (not a raw send of just the leaf) lands the OLD root -> ... ->
+                                   OLD leaf 0 in topological order AND respects the DW timelocks, so
+                                   the OLD leaf 0's ancestors exist on-chain with the OLD txids and it
+                                   is spendable.  The funding is still unspent (this is the first
+                                   on-chain tree broadcast), so the old root spends it.  The previous
+                                   code broadcast the post-rollover tree (new-epoch txids) and then a
+                                   raw OLD leaf 0 whose input never existed -> sent=0. */
+                                unsigned char txid_tmp[32];
+                                size_t nn = lsp_p->factory.n_nodes;
+                                int have_snap = (cl4r_node_snap && cl4r_node_txid && cl4r_node_signed);
+                                if (have_snap) {
+                                    for (size_t ni = 0; ni < nn; ni++) {
+                                        factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                                        tx_buf_t tb = nd->signed_tx; nd->signed_tx = cl4r_node_snap[ni]; cl4r_node_snap[ni] = tb;
+                                        int s = nd->is_signed; nd->is_signed = cl4r_node_signed[ni]; cl4r_node_signed[ni] = s;
+                                        memcpy(txid_tmp, nd->txid, 32); memcpy(nd->txid, cl4r_node_txid[ni], 32); memcpy(cl4r_node_txid[ni], txid_tmp, 32);
+                                    }
                                 }
                                 int parent_ok = broadcast_factory_tree_any_network(
                                     &lsp_p->factory, &rt, mine_addr, is_regtest,
                                     confirm_timeout_secs);
-                                for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
-                                    size_t ni = lsp_p->factory.leaf_node_indices[li];
-                                    lsp_p->factory.nodes[ni].is_signed = saved_is_signed[ni];
+                                /* old leaf-0 txid (display order) for the marker, read BEFORE swap-back */
+                                char cheat_txid_str[65] = {0};
+                                size_t leaf0_ni = lsp_p->factory.leaf_node_indices[0];
+                                for (int b = 0; b < 32; b++)
+                                    sprintf(cheat_txid_str + b * 2, "%02x",
+                                            lsp_p->factory.nodes[leaf0_ni].txid[31 - b]);
+                                if (have_snap) {   /* swap the current tree back */
+                                    for (size_t ni = 0; ni < nn; ni++) {
+                                        factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                                        tx_buf_t tb = nd->signed_tx; nd->signed_tx = cl4r_node_snap[ni]; cl4r_node_snap[ni] = tb;
+                                        int s = nd->is_signed; nd->is_signed = cl4r_node_signed[ni]; cl4r_node_signed[ni] = s;
+                                        memcpy(txid_tmp, nd->txid, 32); memcpy(nd->txid, cl4r_node_txid[ni], 32); memcpy(cl4r_node_txid[ni], txid_tmp, 32);
+                                    }
                                 }
-                                if (parent_ok) {
-                                    char *cheat_hex = malloc((size_t)cl4r_snap[0].len * 2 + 1);
-                                    char cheat_txid_str[65] = {0};
-                                    int sent = 0;
-                                    if (cheat_hex) {
-                                        hex_encode(cl4r_snap[0].data,
-                                                   (size_t)cl4r_snap[0].len,
-                                                   cheat_hex);
-                                        sent = regtest_send_raw_tx(&rt, cheat_hex,
-                                                                   cheat_txid_str);
-                                    }
-                                    fprintf(stderr,
-                                            "CL4-ROLLOVER: mid-window broadcast of "
-                                            "dying factory leaf 0 tx: sent=%d txid=%s "
-                                            "(severity=HIGH)\n",
-                                            sent, cheat_txid_str);
-                                    if (g_db) {
-                                        persist_log_broadcast(g_db,
-                                            sent ? cheat_txid_str : "?",
-                                            "cheat_rollover_stale",
-                                            cheat_hex ? cheat_hex : "",
-                                            sent ? "ok" : "failed");
-                                    }
-                                    if (sent && is_regtest) {
-                                        regtest_mine_blocks(&rt, 1, mine_addr);
-                                        watchtower_t *wt_cl4 = mgr->watchtower;
-                                        if (wt_cl4) {
-                                            int detected = watchtower_check(wt_cl4);
-                                            if (detected > 0) {
-                                                printf("CL4-ROLLOVER: BREACH DETECTED! "
-                                                       "Watchtower broadcast %d penalty tx(s)\n",
-                                                       detected);
-                                                regtest_mine_blocks(&rt, 1, mine_addr);
-                                            } else {
-                                                fprintf(stderr,
-                                                        "CL4-ROLLOVER: watchtower did NOT "
-                                                        "detect revoked broadcast (defense MISS)\n");
-                                            }
+                                int sent = parent_ok ? 1 : 0;
+                                fprintf(stderr,
+                                        "CL4-ROLLOVER: mid-window broadcast of "
+                                        "dying factory leaf 0 tx: sent=%d txid=%s "
+                                        "(severity=HIGH)\n",
+                                        sent, cheat_txid_str);
+                                if (g_db) {
+                                    persist_log_broadcast(g_db,
+                                        sent ? cheat_txid_str : "?",
+                                        "cheat_rollover_stale", "",
+                                        sent ? "ok" : "failed");
+                                }
+                                if (sent && is_regtest) {
+                                    regtest_mine_blocks(&rt, 1, mine_addr);
+                                    watchtower_t *wt_cl4 = mgr->watchtower;
+                                    if (wt_cl4) {
+                                        int detected = watchtower_check(wt_cl4);
+                                        if (detected > 0) {
+                                            printf("CL4-ROLLOVER: BREACH DETECTED! "
+                                                   "Watchtower broadcast %d penalty tx(s)\n",
+                                                   detected);
+                                            regtest_mine_blocks(&rt, 1, mine_addr);
+                                        } else {
+                                            fprintf(stderr,
+                                                    "CL4-ROLLOVER: watchtower did NOT "
+                                                    "detect revoked broadcast (defense MISS)\n");
                                         }
                                     }
-                                    free(cheat_hex);
-                                } else {
+                                } else if (!parent_ok) {
                                     fprintf(stderr,
-                                            "CL4-ROLLOVER: parent tree broadcast failed — "
+                                            "CL4-ROLLOVER: old-tree broadcast failed — "
                                             "cannot test stale broadcast\n");
                                 }
                             }
                             for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++)
                                 tx_buf_free(&cl4r_snap[li]);
-                        }
+                            if (cl4r_node_snap) {
+                                for (size_t ni = 0; ni < FACTORY_MAX_NODES; ni++)
+                                    tx_buf_free(&cl4r_node_snap[ni]);
+                                free(cl4r_node_snap);
+                            }
+                            free(cl4r_node_txid);
+                            free(cl4r_node_signed);
+                            cl4r_node_snap = NULL; cl4r_node_txid = NULL; cl4r_node_signed = NULL;
 
                         /* Verify every non-PS-leaf node is signed for the new epoch.
                            F1: for PS factories, also verify PS leaves are signed
