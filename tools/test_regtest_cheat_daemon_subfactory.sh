@@ -249,6 +249,21 @@ if [ "$WT_FIRED" -eq 1 ]; then
     echo "  WT response txid: $PEN_TXID — mining to confirm + verify payout"
     PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
     echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    # G1 #44 PROOF: the poison spends chain[N-1]'s OWN sales-stock output (vin[0].txid == breach),
+    # whereas chain[N] spends chain[N-1]'s PARENT. So vin==breach proves the trustless wt_db response
+    # is the POISON (valid pre- AND post-confirmation), not the RBF-only chain[N] that orphans (-25)
+    # once the breach confirms. Hard-FAIL otherwise — a green here means the poison is in wt_db.
+    if [ -n "$STALE_TXID" ]; then
+        RVIN=$(echo "$PRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); print(d["vin"][0]["txid"])
+except Exception: print("")')
+        if [ "$RVIN" = "$STALE_TXID" ]; then
+            echo "  G1 VERIFIED: WT response spends the breach chain[N-1] ($STALE_TXID) -> it IS the POISON (post-confirmation recourse), not chain[N]"
+        else
+            echo "  FAIL (G1): WT response spends $RVIN, expected the breach $STALE_TXID -> still chain[N] (RBF-only); poison NOT persisted to wt_db"; exit 1
+        fi
+    fi
     # Finding-2 fix: a sub-factory penalty REDISTRIBUTES to N per-client P2TR outputs (verified on
     # signet: 3 outputs 55416/44333/33051, no change). Assert the SMALLEST per-client output is
     # above dust — checking only 'largest' would pass even if one client were shorted to dust.
