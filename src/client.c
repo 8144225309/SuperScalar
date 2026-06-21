@@ -3643,9 +3643,14 @@ static int client_handle_leaf_advance_stateless(int fd,
        the LSP won'''t send poison fields back. */
     const uint64_t LEAF_POISON_FEE_SATS_C = 1000;
     int leaf_poison_prepared_c = 0;
-    if (had_old_signed_c && old_n_outputs_c >= 2 &&
+    /* #53 Phase 5: capture WHETHER a poison is economically required (the old
+       state has a protectable, non-dust L-stock output) so the fail-closed guard
+       below can tell "poison failed/degraded" (must abort) apart from "no poison
+       was ever needed" (dust / no old state -> safe to advance, do not abort). */
+    int poison_required_c = (had_old_signed_c && old_n_outputs_c >= 2 &&
         old_l_amount_c > LEAF_POISON_FEE_SATS_C +
-                         (uint64_t)(ps_node->n_signers - 1) * 330u) {
+                         (uint64_t)(ps_node->n_signers - 1) * 330u);
+    if (poison_required_c) {
         if (factory_session_prepare_poison_tx_leaf(
                 factory, node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs_c - 1),
@@ -3924,10 +3929,10 @@ static int client_handle_leaf_advance_stateless(int fd,
        (Scenario A/B) — the exact hole #53 closes.  Fail-closed: stay on the old,
        still-recourse-able state.  Subsumes every degrade site above + the case
        where prep never ran.  Non-hashlock leaves are unaffected. */
-    if (ps_node->has_l_stock_hash && !leaf_poison_prepared_c) {
-        fprintf(stderr, "Client-stateless %u: hashlock ON but L-stock poison NOT "
-                        "co-signed -- ABORTING advance (no revoke without recourse)\n",
-                my_index);
+    if (ps_node->has_l_stock_hash && poison_required_c && !leaf_poison_prepared_c) {
+        fprintf(stderr, "Client-stateless %u: hashlock ON + L-stock poison REQUIRED "
+                        "but NOT co-signed -- ABORTING advance (no revoke without "
+                        "recourse)\n", my_index);
         factory_session_reset_poison(factory, node_idx);
         return 0;
     }

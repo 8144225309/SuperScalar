@@ -1445,14 +1445,19 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Phase 1d.2: prep poison TX deterministically (both sides match). */
     const uint64_t LEAF_POISON_FEE_SATS = 1000;
     int leaf_poison_prepared = 0;
+    /* #53 Phase 5: economic requirement — the old state has a protectable,
+       non-dust L-stock output.  Captured independently of the operational prep
+       conditions (watchtower presence / the SS_CHEAT_OMIT_POISON test hook) so
+       the fail-closed guard below fires whenever a required poison was not
+       co-signed, but never when no poison was ever needed (dust / no old state). */
+    int poison_required = (had_old_signed && old_n_outputs >= 2 &&
+        old_l_amount > LEAF_POISON_FEE_SATS +
+                       (uint64_t)(f->nodes[pre_node_idx].n_signers - 1) * 330u);
     /* #53 Phase 5 test hook: SS_CHEAT_OMIT_POISON forces the LSP to skip poison
        prep so it co-signs the new state but NOT the Leaf-P poison — exercising
        the client's fail-closed "no revoke without recourse" abort.  Env-gated
        test path only (same pattern as SS_CHEAT_DAEMON_MODE). */
-    if (mgr->watchtower && had_old_signed && old_n_outputs >= 2 &&
-        !getenv("SS_CHEAT_OMIT_POISON") &&
-        old_l_amount > LEAF_POISON_FEE_SATS +
-                       (uint64_t)(f->nodes[pre_node_idx].n_signers - 1) * 330u) {
+    if (mgr->watchtower && poison_required && !getenv("SS_CHEAT_OMIT_POISON")) {
         if (factory_session_prepare_poison_tx_leaf(
                 f, pre_node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs - 1),
@@ -1813,10 +1818,16 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        This subsumes every degrade-and-continue site above (any of them leaves
        leaf_poison_prepared == 0) plus the case where prep never ran.  Legacy
        (flag off) keeps the prior degrade-and-continue behavior unchanged. */
-    if (f->use_hashlock_poison && !leaf_poison_prepared) {
-        fprintf(stderr, "LSP-stateless: hashlock ON but L-stock poison NOT "
-                        "co-signed -- ABORTING advance (would leave the client "
+    if (f->use_hashlock_poison && poison_required && !leaf_poison_prepared) {
+        fprintf(stderr, "LSP-stateless: hashlock ON + L-stock poison REQUIRED but "
+                        "NOT co-signed -- ABORTING advance (would leave the client "
                         "without recourse)\n");
+        /* Finding 2: the new state's signed_tx was finalized in memory
+           (is_signed=1) just above, but is NOT persisted / DONE-broadcast yet.
+           Clear it so a later factory-tree broadcast cannot ship this
+           incomplete-advance state; persist still holds the old state. */
+        node->is_signed = 0;
+        tx_buf_reset(&node->signed_tx);
         factory_session_reset_poison(f, node_idx);
         return 0;
     }
