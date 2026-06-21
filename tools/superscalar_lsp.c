@@ -2899,6 +2899,35 @@ int main(int argc, char *argv[]) {
             rec_f = NULL;
             lsp_rp->factory.fee = fee_est;
 
+            /* #59 restart-resume: a reloaded hashlock-poison factory (the persisted
+               use_hashlock_poison intent) must re-derive its DETERMINISTIC L-stock
+               seed (LSP key + funding outpoint — never stored) and re-enable, so the
+               LSP can keep revealing superseded secrets AND the next advance keeps
+               building hashlock-gated L-stock SPKs.  Without this a restarted LSP
+               would silently revert to un-gated (Scenario-B-vulnerable) L-stock on its
+               next advance.  Fail-closed: refuse to serve a hashlock factory we can't
+               re-protect. */
+            if (lsp_rp->factory.use_hashlock_poison) {
+                unsigned char lstock_seed[32];
+                factory_derive_lstock_seed(lsp_seckey,
+                                           lsp_rp->factory.funding_txid,
+                                           lsp_rp->factory.funding_vout,
+                                           lstock_seed);
+                factory_set_shachain_seed(&lsp_rp->factory, lstock_seed);
+                memset(lstock_seed, 0, sizeof(lstock_seed));
+                if (!factory_enable_hashlock_poison(&lsp_rp->factory)) {
+                    fprintf(stderr, "LSP recovery: failed to re-enable hashlock poison "
+                                    "for reloaded factory -- refusing to serve un-gated\n");
+                    persist_close(&db);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                lsp_rp->enable_hashlock_poison = 1;
+                printf("LSP recovery: hashlock L-stock poison RE-ENABLED "
+                       "(seed re-derived deterministically from LSP key)\n");
+            }
+
             /* Load DW counter state from DB */
             {
                 uint32_t epoch_out, n_layers_out;

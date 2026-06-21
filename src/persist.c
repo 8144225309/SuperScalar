@@ -1372,6 +1372,17 @@ int persist_open(persist_t *p, const char *path) {
         ");",
         NULL, NULL, NULL);
 
+    /* v39 (#59 restart-resume): persist the factory's hashlock-poison INTENT so a
+       reloaded LSP knows to re-derive the (deterministic) seed + re-enable — exactly
+       as leaf_arity persists the factory's arity.  This is a non-secret boolean: the
+       seed itself is never stored, only re-derived from the LSP key + funding outpoint
+       (factory_derive_lstock_seed).  Version-gated (ALTER is not idempotent). */
+    if (db_version < 39) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN use_hashlock_poison INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1541,8 +1552,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     const char *sql =
         "INSERT OR REPLACE INTO factories "
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
-        " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
+        " use_hashlock_poison) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1560,6 +1572,7 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 8, (int)f->cltv_timeout);
     sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
     sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
+    sqlite3_bind_int(stmt, 11, f->use_hashlock_poison ? 1 : 0);  /* #59 restart-resume */
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2260,7 +2273,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
-        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity "
+        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
+        "use_hashlock_poison "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2287,6 +2301,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         (leaf_arity_raw == (int)FACTORY_ARITY_1)  ? FACTORY_ARITY_1  :
         (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
                                                      FACTORY_ARITY_2;
+    int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
 
     /* Data validation (Phase 2: item 2.6) */
     if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
@@ -2401,6 +2416,14 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         factory_free(f);
         return 0;
     }
+
+    /* #59 restart-resume: record the persisted hashlock-poison intent.  build_tree
+       above necessarily used legacy L-stock SPKs (persist has no seed), but for a
+       PS factory the chain restore below overwrites the current state with the
+       persisted (hashlock) signed state, and the caller (LSP recovery) re-derives
+       the deterministic seed + re-enables before the next advance.  This flag is the
+       self-describing signal the caller checks. */
+    f->use_hashlock_poison = loaded_use_hashlock_poison ? 1 : 0;
 
     /* For PS factories: restore per-leaf chain state from ps_leaf_chains table.
        factory_build_tree produces chain[0] (unsigned). If any advances were
