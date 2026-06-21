@@ -6365,6 +6365,52 @@ int test_regtest_lstock_poison_ceremony(void) {
                 "INTERPRETER ACCEPTS the MULTI-PROCESS-ceremony Leaf-P poison");
     printf("  multi-process ceremony poison ACCEPTED (%zu clients)\n", n_clients);
 
+    /* #53 Phase 4a: the STANDALONE persist-driven assembly (raw template fields,
+       no live node) must produce a byte-identical, interpreter-accepted poison —
+       this is exactly the path a client/WT takes from its l_stock_poison_reveals
+       row after a crash/restart, with only the stored template + revealed secret. */
+    tx_buf_t poison_tmpl; tx_buf_init(&poison_tmpl, 256);
+    TEST_ASSERT(factory_assemble_poison_from_template(
+                    leaf->poison_unsigned_tx.data, leaf->poison_unsigned_tx.len,
+                    leaf->poison_agg_sig, secret, leaf->poison_l_stock_hash,
+                    leaf->poison_leaf_script, leaf->poison_leaf_script_len,
+                    leaf->poison_control_block, leaf->poison_control_block_len,
+                    &poison_tmpl),
+                "assemble poison from persisted template");
+    TEST_ASSERT(poison_tmpl.len == poison.len &&
+                memcmp(poison_tmpl.data, poison.data, poison.len) == 0,
+                "from_template byte-identical to with_secret");
+    {
+        char *thex = (char *)malloc(poison_tmpl.len * 2 + 1);
+        hex_encode(poison_tmpl.data, poison_tmpl.len, thex);
+        char *tp = (char *)malloc(poison_tmpl.len * 2 + 16);
+        snprintf(tp, poison_tmpl.len * 2 + 16, "[\"%s\"]", thex);
+        char *tma2 = regtest_exec(&rt, "testmempoolaccept", tp);
+        free(tp);
+        TEST_ASSERT(tma2 != NULL, "testmempoolaccept (template) ran");
+        cJSON *j2 = cJSON_Parse(tma2); free(tma2);
+        cJSON *r2 = j2 ? cJSON_GetArrayItem(j2, 0) : NULL;
+        cJSON *al2 = r2 ? cJSON_GetObjectItem(r2, "allowed") : NULL;
+        int ok2 = al2 && cJSON_IsTrue(al2);
+        if (j2) cJSON_Delete(j2);
+        TEST_ASSERT(ok2, "INTERPRETER ACCEPTS the PERSIST-TEMPLATE-assembled poison");
+        free(thex);
+    }
+    tx_buf_free(&poison_tmpl);
+    /* negative: from_template also refuses a wrong secret (same hash guard) */
+    {
+        unsigned char wrong_t[32]; memcpy(wrong_t, secret, 32); wrong_t[1] ^= 0x02;
+        tx_buf_t bad_t; tx_buf_init(&bad_t, 64);
+        TEST_ASSERT(factory_assemble_poison_from_template(
+                        leaf->poison_unsigned_tx.data, leaf->poison_unsigned_tx.len,
+                        leaf->poison_agg_sig, wrong_t, leaf->poison_l_stock_hash,
+                        leaf->poison_leaf_script, leaf->poison_leaf_script_len,
+                        leaf->poison_control_block, leaf->poison_control_block_len,
+                        &bad_t) == 0,
+                    "from_template REFUSES wrong secret");
+        tx_buf_free(&bad_t);
+    }
+
     /* negative: assembling with a wrong secret is refused */
     unsigned char wrong[32]; memcpy(wrong, secret, 32); wrong[0] ^= 0x01;
     tx_buf_t bad; tx_buf_init(&bad, 64);

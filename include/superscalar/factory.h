@@ -858,6 +858,24 @@ int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
                                         const unsigned char *secret32,
                                         tx_buf_t *out);
 
+/* #53 Phase 4a: standalone L-stock poison assembly from PERSISTED template fields
+   (no live factory_node needed) — the crash-resilient / standalone recourse entry
+   point.  A client (or the watchtower it feeds) loads its l_stock_poison_reveals
+   row (unsigned tx + aggregated Leaf-P sig + leaf script + control block + the
+   superseded state's committed hash + the LSP-revealed secret) and assembles the
+   broadcastable witness here.  Verifies SHA256(secret32)==target_hash32
+   (fail-closed) before building [agg_sig, secret, Leaf-P script, control block].
+   factory_assemble_poison_with_secret delegates to this.  Returns 1 on success,
+   0 on hash-mismatch / bad input. */
+int factory_assemble_poison_from_template(
+    const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+    const unsigned char *agg_sig64,
+    const unsigned char *secret32,
+    const unsigned char *target_hash32,
+    const unsigned char *leaf_script, size_t leaf_script_len,
+    const unsigned char *control_block, size_t control_block_len,
+    tx_buf_t *out);
+
 /* Reset poison state on a node (free the unsigned/signed tx buffers + clear
    sighash + reset received counter).  Safe to call on a never-prepared
    node.  Used during cleanup and after the poison TX is handed to the

@@ -3311,6 +3311,34 @@ int factory_session_complete_node_poison(factory_t *f, size_t node_idx) {
     return 1;
 }
 
+int factory_assemble_poison_from_template(
+    const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+    const unsigned char *agg_sig64,
+    const unsigned char *secret32,
+    const unsigned char *target_hash32,
+    const unsigned char *leaf_script, size_t leaf_script_len,
+    const unsigned char *control_block, size_t control_block_len,
+    tx_buf_t *out) {
+    if (!unsigned_tx || unsigned_tx_len == 0 || !agg_sig64 || !secret32 ||
+        !target_hash32 || !leaf_script || leaf_script_len == 0 ||
+        !control_block || control_block_len == 0 || !out)
+        return 0;
+
+    /* Defense-in-depth: the revealed secret must be the preimage of the hash THIS
+       poison targets (the superseded state's H_old), NOT any current hash.  Same
+       guard whether driven by a live node or a persisted row. */
+    unsigned char chk[32];
+    sha256(secret32, 32, chk);
+    if (memcmp(chk, target_hash32, 32) != 0) return 0;
+
+    /* Witness: [agg sig, preimage=secret, Leaf-P script, 2-leaf control block]. */
+    return finalize_script_path_tx_preimage(out,
+        unsigned_tx, unsigned_tx_len,
+        agg_sig64, secret32, 32,
+        leaf_script, leaf_script_len,
+        control_block, control_block_len);
+}
+
 int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
                                         const unsigned char *secret32,
                                         tx_buf_t *out) {
@@ -3319,19 +3347,13 @@ int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
     if (!node->poison_is_scriptpath || !node->poison_has_agg_sig) return 0;
     if (node->poison_unsigned_tx.len == 0) return 0;
 
-    /* Defense-in-depth: the revealed secret must be the preimage of the hash THIS
-       poison targets (poison_l_stock_hash = the superseded state's H_old), NOT the
-       node's current l_stock_hash, which may already have advanced. */
-    unsigned char chk[32];
-    sha256(secret32, 32, chk);
-    if (memcmp(chk, node->poison_l_stock_hash, 32) != 0) return 0;
-
-    /* Witness: [agg sig, preimage=secret, Leaf-P script, 2-leaf control block]. */
-    return finalize_script_path_tx_preimage(out,
+    /* Delegate to the standalone template path so the live-node and persisted
+       recourse routes assemble byte-identically (and share the hash guard). */
+    return factory_assemble_poison_from_template(
         node->poison_unsigned_tx.data, node->poison_unsigned_tx.len,
-        node->poison_agg_sig, secret32, 32,
+        node->poison_agg_sig, secret32, node->poison_l_stock_hash,
         node->poison_leaf_script, node->poison_leaf_script_len,
-        node->poison_control_block, node->poison_control_block_len);
+        node->poison_control_block, node->poison_control_block_len, out);
 }
 
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {

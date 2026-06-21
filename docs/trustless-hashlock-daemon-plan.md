@@ -73,6 +73,46 @@ unchanged when the flag is off).
 - Phase 4: the B6 e2e is the end-to-end proof of 1–3 (on-chain confirm + amount + anti-vacuity).
 - Phase 5: B6 (still green) + full regression (legacy untouched) + a degradation-abort assertion.
 
+## Phase 4 — CORRECTED by code review (the plan-doc above under-scoped it)
+
+Code review (2026-06-21) found `factory_assemble_poison_with_secret` is wired into **no
+broadcast path** — only unit tests.  The breach-response path (watchtower.c) still
+broadcasts a static pre-built `burn_tx`, which for the key-path poison was the whole TX
+but for the hashlock poison CANNOT exist at registration time (the secret isn't revealed
+yet).  So Phase 4 needs CODE before the e2e test, split:
+
+- **Phase 4a (primitive, DONE):** `factory_assemble_poison_from_template()` — standalone
+  assembly from the exact fields persisted in `l_stock_poison_reveals` (unsigned tx, agg
+  sig, leaf script, control block, target hash, revealed secret), with the
+  SHA256(secret)==hash fail-closed guard.  `factory_assemble_poison_with_secret` now
+  delegates to it (DRY).  Proven in the regtest ceremony test: from_template output is
+  byte-identical to with_secret AND `testmempoolaccept` ACCEPTS it, with wrong-secret
+  refused.  This is the persist-driven recourse primitive both the client and any
+  client-fed WT will call.
+
+- **Phase 4b (client recourse driver):** a client-side path that, on a superseded leaf
+  appearing on-chain, loads its persisted reveal row (`persist_load_l_stock_poison`),
+  assembles via `factory_assemble_poison_from_template`, and broadcasts.  For the e2e
+  PROOF this is a clearly-marked test driver (a `--test-*` flag / small tool), NOT yet
+  the production recourse loop — see the architecture note below.
+
+- **Phase 4c (daemon e2e):** LSP `--enable-hashlock-poison --cheat-daemon-leaf` + client
+  daemons advance over the wire (the LIVE Phase 1–2 reveal path fires: the client
+  persists a real `l_stock_poison_reveals` row); the LSP broadcasts the STALE superseded
+  leaf; the client recourse driver assembles-from-persist + broadcasts; assert CONFIRM +
+  L-stock redistribution (amount) + anti-vacuity (no reveal → unspendable).
+
+### ARCHITECTURE NOTE (surfaced for the user; default chosen to keep momentum)
+Who assembles the hashlock poison?  The standalone `superscalar_watchtower` reads a
+**secret-less** wt_db — by design it CANNOT hold the LSP-revealed preimage, so it cannot
+assemble a hashlock poison alone.  Only the party that received the reveal (the CLIENT, or
+a WT the client explicitly feeds revealed secrets) can.  This is the crux of #62 (WT
+operational model) and reshapes the "trustless WT" story for the L-stock poison
+specifically.  DEFAULT taken: the recourse is **client-driven** (the client holds its own
+revealed secrets); the secret-less third-party WT remains the recourse for the
+non-hashlock paths (factory/sub-factory/commitment penalties).  Feeding revealed secrets
+to a delegated WT is the explicit follow-on under #62 — NOT folded into this PR.
+
 ## #59 (crash-consistency) — tracked separately
 The reveal is the last LSP→client step; a crash between new-state-signed and secret-persisted is the residual
 window. Phase 2 persists the secret in-handler before returning success (verify-before-accept). The full
