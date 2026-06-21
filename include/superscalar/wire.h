@@ -205,6 +205,14 @@
    0x01 partial-close-only. */
 #define MSG_ROTATE 0x8B
 
+/* #53-B3b: LSP -> Client.  After an advance commits the new leaf state, the LSP
+   reveals the SUPERSEDED state's L-stock revocation secret(s) so the client (or its
+   watchtower) can spend the Leaf-P poison if the LSP later broadcasts that stale
+   state.  Carries an array of {node, revoked_state, secret} — one entry for the
+   single-leaf advance, N for a Tier-B rollover.  Verify-before-persist
+   (SHA256(secret)==committed H_old), mirroring channel revoke-and-ack. */
+#define MSG_LSTOCK_REVEAL 0x8C
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -938,6 +946,23 @@ int wire_parse_leaf_advance_psig(const cJSON *json,
 cJSON *wire_build_leaf_advance_done(int leaf_side);
 
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
+
+/* #53-B3b: MSG_LSTOCK_REVEAL.  LSP -> Client; reveals superseded-state L-stock
+   revocation secrets so the client can spend the Leaf-P poison on a later breach of
+   that state.  Carries n entries of {node, revoked_state, secret32} (n=1 for a
+   single-leaf advance, N for a Tier-B rollover).  Build from parallel arrays; parse
+   into caller arrays.  Build returns the cJSON (NULL on OOM); parse returns 1 on
+   success with *n_out set, 0 on malformed input. */
+cJSON *wire_build_lstock_reveal(const uint32_t *node_idx,
+                                const uint32_t *revoked_state,
+                                const unsigned char secrets[][32],
+                                size_t n);
+int wire_parse_lstock_reveal(const cJSON *json,
+                             uint32_t *node_idx_out,
+                             uint32_t *revoked_state_out,
+                             unsigned char secrets_out[][32],
+                             size_t max_entries,
+                             size_t *n_out);
 
 /* --- Tier B: state-advance ceremony (root rollover, MSG_PATH_*) ---
 

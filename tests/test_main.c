@@ -1120,6 +1120,7 @@ extern int test_regtest_ladder_distribution_fallback(void);
 /* Phase 9: Wire protocol */
 extern int test_wire_pubkey_only_factory(void);
 extern int test_wire_framing(void);
+extern int test_wire_lstock_reveal_round_trip(void);
 extern int test_wire_crypto_serialization(void);
 extern int test_wire_nonce_bundle(void);
 extern int test_wire_psig_bundle(void);
@@ -3071,6 +3072,7 @@ static void run_unit_tests(void) {
     printf("\n=== Wire Protocol (Phase 9) ===\n");
     RUN_TEST(test_wire_pubkey_only_factory);
     RUN_TEST(test_wire_framing);
+    RUN_TEST(test_wire_lstock_reveal_round_trip);
     RUN_TEST(test_wire_crypto_serialization);
     RUN_TEST(test_wire_nonce_bundle);
     RUN_TEST(test_wire_psig_bundle);

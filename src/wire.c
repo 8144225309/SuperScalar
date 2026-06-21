@@ -2475,6 +2475,54 @@ int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
     return 1;
 }
 
+/* #53-B3b: MSG_LSTOCK_REVEAL — reveal superseded-state L-stock revocation secrets. */
+cJSON *wire_build_lstock_reveal(const uint32_t *node_idx,
+                                const uint32_t *revoked_state,
+                                const unsigned char secrets[][32],
+                                size_t n) {
+    if ((n > 0) && (!node_idx || !revoked_state || !secrets)) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) { cJSON_Delete(j); return NULL; }
+    for (size_t i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        if (!e) { cJSON_Delete(arr); cJSON_Delete(j); return NULL; }
+        cJSON_AddNumberToObject(e, "node", (double)node_idx[i]);
+        cJSON_AddNumberToObject(e, "state", (double)revoked_state[i]);
+        wire_json_add_hex(e, "secret", secrets[i], 32);
+        cJSON_AddItemToArray(arr, e);
+    }
+    cJSON_AddItemToObject(j, "reveals", arr);
+    return j;
+}
+
+int wire_parse_lstock_reveal(const cJSON *json,
+                             uint32_t *node_idx_out,
+                             uint32_t *revoked_state_out,
+                             unsigned char secrets_out[][32],
+                             size_t max_entries,
+                             size_t *n_out) {
+    if (!json || !node_idx_out || !revoked_state_out || !secrets_out || !n_out)
+        return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "reveals");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    int an = cJSON_GetArraySize(arr);
+    size_t n = 0;
+    for (int i = 0; i < an && n < max_entries; i++) {
+        cJSON *e = cJSON_GetArrayItem(arr, i);
+        cJSON *no = e ? cJSON_GetObjectItem(e, "node") : NULL;
+        cJSON *st = e ? cJSON_GetObjectItem(e, "state") : NULL;
+        if (!no || !cJSON_IsNumber(no) || !st || !cJSON_IsNumber(st)) return 0;
+        if (wire_json_get_hex(e, "secret", secrets_out[n], 32) != 32) return 0;
+        node_idx_out[n] = (uint32_t)no->valuedouble;
+        revoked_state_out[n] = (uint32_t)st->valuedouble;
+        n++;
+    }
+    *n_out = n;
+    return 1;
+}
+
 /* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
 
 cJSON *wire_build_leaf_realloc_propose(int leaf_side,
