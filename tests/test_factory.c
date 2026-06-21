@@ -5975,6 +5975,13 @@ int test_regtest_lstock_hashlock_poison(void) {
     uint8_t arities[1] = {2};
     TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
                 "setup n3 {2}");
+    /* #53-B: enable revocation-gated poison so build_tree commits the per-(leaf,
+       state) hash into each leaf's L-stock SPK via the production path (not a
+       manual set). */
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0xA5 ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock poison");
     TEST_ASSERT(factory_build_tree(f), "build tree");
     TEST_ASSERT(factory_sign_all(f), "sign all");
     TEST_ASSERT_EQ(f->n_leaf_nodes, 1, "1 leaf");
@@ -5983,11 +5990,18 @@ int test_regtest_lstock_hashlock_poison(void) {
     size_t n_clients = leaf->n_signers - 1;
     TEST_ASSERT(n_clients == 2, "leaf has 2 clients (LSP + 2)");
 
-    /* Commit a per-state revocation hash H_s = SHA256(secret) into Leaf P. */
+    /* build_tree committed the state-0 hash via setup_leaf_outputs. */
+    TEST_ASSERT(leaf->has_l_stock_hash, "leaf carries the hashlock after build_tree");
+    TEST_ASSERT_EQ(leaf->l_stock_state_counter, 0, "initial L-stock state = 0");
+
+    /* The LSP-derived per-(leaf,state) secret must reproduce the committed hash. */
     unsigned char secret[32];
-    for (int i = 0; i < 32; i++) secret[i] = (unsigned char)(0x53 ^ i);
-    sha256(secret, 32, leaf->l_stock_hash);
-    leaf->has_l_stock_hash = 1;
+    TEST_ASSERT(factory_derive_l_stock_secret(f, leaf, leaf->l_stock_state_counter, secret),
+                "derive L-stock secret");
+    unsigned char h_check[32];
+    sha256(secret, 32, h_check);
+    TEST_ASSERT(memcmp(h_check, leaf->l_stock_hash, 32) == 0,
+                "derived secret reproduces the committed Leaf-P hash");
 
     /* The hashlock taptree must change the SPK vs the legacy single-leaf SPK. */
     unsigned char spk_hash[34], spk_plain[34];

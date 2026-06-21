@@ -301,6 +301,61 @@ int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
     return 1;
 }
 
+int factory_enable_hashlock_poison(factory_t *f) {
+    if (!f || !f->has_shachain) return 0;  /* need a seed to derive secrets from */
+    f->use_hashlock_poison = 1;
+    return 1;
+}
+
+int factory_derive_l_stock_secret(const factory_t *f,
+                                  const factory_node_t *leaf_node,
+                                  uint32_t state_counter,
+                                  unsigned char secret_out32[32]) {
+    if (!f || !leaf_node || !secret_out32 || !f->has_shachain) return 0;
+    unsigned char agg32[32];
+    if (!secp256k1_xonly_pubkey_serialize(f->ctx, agg32,
+                                          &leaf_node->keyagg.agg_pubkey))
+        return 0;
+    /* secret = tagged_hash(seed || leaf_agg_xonly || state_counter_le) — keyed on
+       BOTH the leaf identity and the per-leaf state index, so no cross-leaf or
+       cross-state secret reuse (fixes the old global-epoch index). */
+    unsigned char buf[32 + 32 + 4];
+    memcpy(buf, f->shachain_seed, 32);
+    memcpy(buf + 32, agg32, 32);
+    buf[64] = (unsigned char)(state_counter & 0xff);
+    buf[65] = (unsigned char)((state_counter >> 8) & 0xff);
+    buf[66] = (unsigned char)((state_counter >> 16) & 0xff);
+    buf[67] = (unsigned char)((state_counter >> 24) & 0xff);
+    sha256_tagged("SS/LStockPoison/v1", buf, sizeof(buf), secret_out32);
+    return 1;
+}
+
+/* #53-B: derive + commit the per-(leaf, state) revocation hash onto a leaf node
+   so its next-built L-stock SPK carries Leaf P (the hashlock-gated poison path).
+   No-op unless hashlock poison is enabled.  Must be called AFTER node->keyagg is
+   set and BEFORE build_l_stock_spk. */
+static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
+    if (!f->use_hashlock_poison) return 1;
+    unsigned char secret[32];
+    if (!factory_derive_l_stock_secret(f, node, node->l_stock_state_counter, secret))
+        return 0;
+    sha256(secret, 32, node->l_stock_hash);
+    node->has_l_stock_hash = 1;
+    memset(secret, 0, sizeof(secret));  /* LSP re-derives on demand; don't retain */
+    return 1;
+}
+
+/* Build a leaf's L-stock OUTPUT scriptPubKey, first committing the per-(leaf,state)
+   hashlock (#53-B) when enabled.  ALL leaf-output construction paths route through
+   this so no leaf type is left with an un-gated (Scenario-B-vulnerable) L-stock when
+   the factory has hashlock poison on.  The poison signers instead call the const
+   build_l_stock_spk directly — they READ the already-committed hash. */
+static int set_leaf_l_stock_output(factory_t *f, factory_node_t *node,
+                                   unsigned char *spk_out34) {
+    if (!apply_l_stock_hashlock(f, node)) return 0;
+    return build_l_stock_spk(f, node, spk_out34);
+}
+
 /* Update L-stock outputs on leaf state nodes after epoch change.
    Called by factory_advance() after counter advance.
    L-stock is always the last output of a leaf node. */
@@ -317,8 +372,12 @@ static int update_l_stock_outputs(factory_t *f) {
         if (node->n_outputs < 2)
             continue;
 
-        /* L-stock is always the last output */
-        if (!build_l_stock_spk(f, node, node->outputs[node->n_outputs - 1].script_pubkey))
+        /* #53-B: this leaf's L-stock state is advancing — bump its per-leaf
+           counter and re-commit the NEW state's hash before rebuilding the SPK.
+           The just-superseded state's secret (counter-1) is what the LSP reveals
+           to this leaf's clients for recourse against the old state. */
+        node->l_stock_state_counter++;
+        if (!set_leaf_l_stock_output(f, node, node->outputs[node->n_outputs - 1].script_pubkey))
             return 0;
     }
     return 1;
@@ -391,7 +450,7 @@ static int setup_leaf_outputs(
     }
 
     /* L-stock SPK: or(N-of-N keyagg, L&CSV) per ZmnSCPxj's t/1242 */
-    if (!build_l_stock_spk(f, node, node->outputs[2].script_pubkey))
+    if (!set_leaf_l_stock_output(f, node, node->outputs[2].script_pubkey))
         return 0;
     node->outputs[2].script_pubkey_len = 34;
     node->outputs[2].amount_sats = per_output + remainder;
@@ -984,7 +1043,7 @@ static int setup_single_leaf_outputs(
     }
 
     /* L-stock SPK: or(N-of-N keyagg, L&CSV) per ZmnSCPxj's t/1242 */
-    if (!build_l_stock_spk(f, node, node->outputs[1].script_pubkey))
+    if (!set_leaf_l_stock_output(f, node, node->outputs[1].script_pubkey))
         return 0;
     node->outputs[1].script_pubkey_len = 34;
     node->outputs[1].amount_sats = per_output + remainder;
@@ -1027,7 +1086,7 @@ static int setup_ps_leaf_outputs(
     node->outputs[0].amount_sats = per_output;
 
     /* vout 1: L-stock SPK = or(N-of-N keyagg, L&CSV) per t/1242 */
-    if (!build_l_stock_spk(f, node, node->outputs[1].script_pubkey))
+    if (!set_leaf_l_stock_output(f, node, node->outputs[1].script_pubkey))
         return 0;
     node->outputs[1].script_pubkey_len = 34;
     node->outputs[1].amount_sats = per_output + remainder;
@@ -1172,7 +1231,7 @@ static int setup_ps_leaf_with_subfactories(
     }
 
     /* Leaf-level L-stock at the LAST output. */
-    if (!build_l_stock_spk(f, leaf, leaf->outputs[k].script_pubkey))
+    if (!set_leaf_l_stock_output(f, leaf, leaf->outputs[k].script_pubkey))
         return 0;
     leaf->outputs[k].script_pubkey_len = 34;
     leaf->outputs[k].amount_sats = per_output + remainder;
@@ -1293,7 +1352,7 @@ static int setup_nway_leaf_outputs(
     }
 
     /* L-stock at LAST output: or(N-of-N keyagg, L&CSV) per t/1242 */
-    if (!build_l_stock_spk(f, node, node->outputs[n_client].script_pubkey))
+    if (!set_leaf_l_stock_output(f, node, node->outputs[n_client].script_pubkey))
         return 0;
     node->outputs[n_client].script_pubkey_len = 34;
     node->outputs[n_client].amount_sats = per_output + remainder;
@@ -2291,7 +2350,10 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
     if (node->n_outputs < 2)
         return 1;
 
-    return build_l_stock_spk(f, node, node->outputs[node->n_outputs - 1].script_pubkey);
+    /* #53-B: per-leaf advance — bump this leaf's L-stock state index so the new
+       state commits a fresh hash (the old state's secret becomes revealable). */
+    node->l_stock_state_counter++;
+    return set_leaf_l_stock_output(f, node, node->outputs[node->n_outputs - 1].script_pubkey);
 }
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {

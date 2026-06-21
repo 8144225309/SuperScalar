@@ -188,6 +188,13 @@ typedef struct {
        active; the secret_s itself stays LSP-private until revealed on advance. */
     unsigned char l_stock_hash[32];
     int has_l_stock_hash;
+    /* #53-B: per-leaf monotonic L-stock state index, bumped every time this
+       leaf's L-stock SPK is (re)built (initial setup + each epoch advance / JIT
+       L-stock change).  Combined with the leaf's agg pubkey it forms the unique
+       per-(leaf, state) secret index, so independently-advancing leaves never
+       collide.  state s's revealed secret is derived at the value this had when
+       state s's L-stock output was built. */
+    uint32_t l_stock_state_counter;
 
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
@@ -312,6 +319,16 @@ typedef struct {
        L-stock taptrees without sharing the actual secrets. */
     unsigned char l_stock_hashes[FACTORY_MAX_EPOCHS][32];
     size_t n_l_stock_hashes;
+
+    /* #53-B: revocation-gated (hashlock) L-stock poison.  When enabled, each
+       leaf state's L-stock output commits H_s = SHA256(secret(leaf, state)) into
+       Leaf P of its taptree (see build_l_stock_taptree).  The secret is derived
+       PER-(leaf, state) from shachain_seed — keyed on the leaf's agg pubkey AND a
+       per-leaf monotonic counter — so revealing one leaf's revoked-state secret
+       can NEVER unlock another leaf's (or a later state's) live poison (the
+       cross-leaf leak of the old global-epoch index).  LSP-private; revealed to
+       the leaf's clients only when the state is superseded (#53-B3). */
+    int use_hashlock_poison;
 
     /* Per-leaf DW layers (for independent leaf advance) */
     dw_layer_t leaf_layers[FACTORY_MAX_LEAVES];
@@ -458,6 +475,25 @@ int factory_sign_l_stock_poison_tx(
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
     tx_buf_t *signed_out);
+
+/* #53-B: enable revocation-gated (hashlock) L-stock poison.  Requires the
+   factory seed to be set first (factory_set_shachain_seed); thereafter every
+   leaf-state L-stock output (initial build + each advance) commits a per-(leaf,
+   state) hash and the key-path poison is refused in favour of the script-path
+   poison.  Returns 1 on success, 0 if no seed is set. */
+int factory_enable_hashlock_poison(factory_t *f);
+
+/* #53-B: derive the LSP-private per-(leaf, state) L-stock revocation secret.
+   secret = tagged_hash("SS/LStockPoison/v1", seed32 || leaf_agg_xonly32 ||
+   state_counter_le32).  Deterministic + crash-recoverable (re-derivable from the
+   persisted seed + the leaf's agg key + the state counter).  The matching hash
+   H_s = SHA256(secret) is what Leaf P commits to; the secret is revealed to the
+   leaf's clients only once state `state_counter` is superseded.  Returns 1 on
+   success, 0 if the factory has no seed. */
+int factory_derive_l_stock_secret(const factory_t *f,
+                                  const factory_node_t *leaf_node,
+                                  uint32_t state_counter,
+                                  unsigned char secret_out32[32]);
 
 /* Build the L-stock output scriptPubKey (P2TR) for a leaf state node — the
    2-leaf {poison, LSP-CSV} taptree when the node carries a per-state hash
