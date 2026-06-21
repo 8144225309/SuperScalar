@@ -314,6 +314,12 @@ static void usage(const char *prog) {
         "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
+        "  --enable-hashlock-poison  Build the factory with hashlock-gated L-stock\n"
+        "                      poison (#53): the L-stock output is spendable by the\n"
+        "                      poison only with an LSP-revealed per-(leaf,state)\n"
+        "                      secret, closing the co-signed-poison theft vector.\n"
+        "                      Installs a random shachain seed. Mutually exclusive\n"
+        "                      with --test-burn.\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-multi-htlc-force-close  After demo: add HTLCs on ALL channels, force-close, broadcast all timeout TXs\n"
         "  --test-full-settlement  After demo: force-close tree, broadcast ALL commitment TXs, verify cross-leaf balances\n"
@@ -1341,6 +1347,7 @@ int main(int argc, char *argv[]) {
                                         0 = disabled (default for backward compat) */
     int force_close = 0;
     int test_burn = 0;
+    int enable_hashlock_poison = 0;  /* #53 Phase 3: hashlock-gated L-stock poison */
     int test_ptlc_basic = 0;
     int test_ptlc_breach = 0;
     int test_ptlc_restart = 0;
@@ -1752,6 +1759,8 @@ int main(int argc, char *argv[]) {
             force_close = 1;
         else if (strcmp(argv[i], "--test-burn") == 0)
             test_burn = 1;
+        else if (strcmp(argv[i], "--enable-hashlock-poison") == 0)
+            enable_hashlock_poison = 1;
         else if (strcmp(argv[i], "--test-htlc-force-close") == 0)
             test_htlc_force_close = 1;
         else if (strcmp(argv[i], "--test-multi-htlc-force-close") == 0)
@@ -3894,6 +3903,42 @@ accept_new_factory:
         }
         printf("LSP: flat revocation secrets generated for burn test (%zu epochs)\n",
                lsp_p->factory.n_revocation_secrets);
+    }
+
+    /* #53 Phase 3: hashlock-gated L-stock poison.  Distinct from --test-burn's
+       flat secrets (the old global-epoch index): the hashlock poison derives a
+       per-(leaf,state) secret from a single shachain seed
+       (factory_derive_l_stock_secret reads f->shachain_seed).  Install a real
+       random seed here in SHACHAIN mode (factory_set_shachain_seed sets
+       has_shachain=1 and leaves use_flat_secrets=0, so lsp_run_factory_creation
+       _stateless's save/restore across factory_init_from_pubkeys preserves the
+       seed via the !use_flat_secrets branch), and flag the LSP so the creation
+       path calls factory_enable_hashlock_poison after the re-init.  Mutually
+       exclusive with --test-burn (flat secrets would clobber the shachain
+       save/restore path and strand the L-stock secret). */
+    if (enable_hashlock_poison) {
+        if (test_burn) {
+            fprintf(stderr, "LSP: --enable-hashlock-poison and --test-burn are "
+                            "mutually exclusive (shachain seed vs flat secrets)\n");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        unsigned char hl_seed[32];
+        FILE *uf = fopen("/dev/urandom", "rb");
+        if (!uf || fread(hl_seed, 1, sizeof(hl_seed), uf) != sizeof(hl_seed)) {
+            if (uf) fclose(uf);
+            fprintf(stderr, "LSP: failed to read random L-stock poison seed "
+                            "from /dev/urandom\n");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        fclose(uf);
+        factory_set_shachain_seed(&lsp_p->factory, hl_seed);
+        lsp_p->enable_hashlock_poison = 1;
+        printf("LSP: hashlock-gated L-stock poison ENABLED "
+               "(per-(leaf,state) shachain seed installed)\n");
     }
 
     printf("LSP: starting factory creation ceremony...\n");

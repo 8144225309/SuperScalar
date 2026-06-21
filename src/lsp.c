@@ -436,6 +436,25 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             factory_set_shachain_seed(f, saved_shachain_seed);
     }
     free(saved_secrets);
+
+    /* #53 Phase 3: re-enable hashlock-gated L-stock poison AFTER the
+       factory_init_from_pubkeys re-init above (which wiped
+       use_hashlock_poison).  The shachain seed was installed on the factory
+       by the binary before this call and preserved across the re-init by the
+       save/restore of saved_shachain_seed (use_flat_secrets==0 path).  Gated
+       on lsp->enable_hashlock_poison so the legacy L-stock key-path is the
+       default; fail-closed if the seed somehow didn't survive. */
+    if (lsp->enable_hashlock_poison) {
+        if (f->use_flat_secrets || !f->has_shachain ||
+            !factory_enable_hashlock_poison(f)) {
+            fprintf(stderr, "LSP-stateless factory creation: "
+                            "factory_enable_hashlock_poison failed "
+                            "(has_shachain=%d use_flat=%d)\n",
+                    f->has_shachain, f->use_flat_secrets);
+            return 0;
+        }
+    }
+
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                         funding_spk, funding_spk_len);
 

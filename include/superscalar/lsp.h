@@ -25,6 +25,15 @@ typedef struct {
     /* Factory (built after all clients connect) */
     factory_t factory;
 
+    /* #53 Phase 3: hashlock-gated L-stock poison.  When set, the binary
+       (tools/superscalar_lsp.c) has installed a real random shachain seed
+       on .factory and lsp_run_factory_creation_stateless calls
+       factory_enable_hashlock_poison(f) AFTER factory_init_from_pubkeys
+       re-init (which wipes use_hashlock_poison).  Default 0 (off / legacy
+       L-stock key-path).  The client needs no equivalent flag — it mirrors
+       each node's per-(leaf,state) hash off the wire. */
+    int enable_hashlock_poison;
+
     /* Bridge daemon connection (Phase 14) */
     int bridge_fd;
 
