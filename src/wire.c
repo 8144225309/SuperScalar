@@ -2523,6 +2523,51 @@ int wire_parse_lstock_reveal(const cJSON *json,
     return 1;
 }
 
+/* #59: MSG_LSTOCK_REVEAL_REQUEST (0x8D).  Client -> LSP after a restart/reconnect:
+   the (node, state) poison rows whose secret was never received, so the LSP
+   re-derives + re-reveals them.  Mirror of wire_build_lstock_reveal minus secrets. */
+cJSON *wire_build_lstock_reveal_request(const uint32_t *node_idx,
+                                        const uint32_t *state_counter,
+                                        size_t n) {
+    if ((n > 0) && (!node_idx || !state_counter)) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) { cJSON_Delete(j); return NULL; }
+    for (size_t i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        if (!e) { cJSON_Delete(arr); cJSON_Delete(j); return NULL; }
+        cJSON_AddNumberToObject(e, "node", (double)node_idx[i]);
+        cJSON_AddNumberToObject(e, "state", (double)state_counter[i]);
+        cJSON_AddItemToArray(arr, e);
+    }
+    cJSON_AddItemToObject(j, "requests", arr);
+    return j;
+}
+
+int wire_parse_lstock_reveal_request(const cJSON *json,
+                                     uint32_t *node_idx_out,
+                                     uint32_t *state_counter_out,
+                                     size_t max_entries,
+                                     size_t *n_out) {
+    if (!json || !node_idx_out || !state_counter_out || !n_out) return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "requests");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    int an = cJSON_GetArraySize(arr);
+    size_t n = 0;
+    for (int i = 0; i < an && n < max_entries; i++) {
+        cJSON *e = cJSON_GetArrayItem(arr, i);
+        cJSON *no = e ? cJSON_GetObjectItem(e, "node") : NULL;
+        cJSON *st = e ? cJSON_GetObjectItem(e, "state") : NULL;
+        if (!no || !cJSON_IsNumber(no) || !st || !cJSON_IsNumber(st)) return 0;
+        node_idx_out[n] = (uint32_t)no->valuedouble;
+        state_counter_out[n] = (uint32_t)st->valuedouble;
+        n++;
+    }
+    *n_out = n;
+    return 1;
+}
+
 /* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
 
 cJSON *wire_build_leaf_realloc_propose(int leaf_side,

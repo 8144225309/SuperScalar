@@ -212,6 +212,7 @@
    single-leaf advance, N for a Tier-B rollover.  Verify-before-persist
    (SHA256(secret)==committed H_old), mirroring channel revoke-and-ack. */
 #define MSG_LSTOCK_REVEAL 0x8C
+#define MSG_LSTOCK_REVEAL_REQUEST 0x8D  /* #59: Client -> LSP, re-request missing reveals */
 
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
@@ -963,6 +964,19 @@ int wire_parse_lstock_reveal(const cJSON *json,
                              unsigned char secrets_out[][32],
                              size_t max_entries,
                              size_t *n_out);
+
+/* #59: MSG_LSTOCK_REVEAL_REQUEST.  Client -> LSP after a restart/reconnect; lists
+   the (node, state) poison rows whose secret was never received so the LSP
+   re-derives + re-reveals (replies with MSG_LSTOCK_REVEAL).  Same array shape as
+   the reveal, minus the secret. */
+cJSON *wire_build_lstock_reveal_request(const uint32_t *node_idx,
+                                        const uint32_t *state_counter,
+                                        size_t n);
+int wire_parse_lstock_reveal_request(const cJSON *json,
+                                     uint32_t *node_idx_out,
+                                     uint32_t *state_counter_out,
+                                     size_t max_entries,
+                                     size_t *n_out);
 
 /* --- Tier B: state-advance ceremony (root rollover, MSG_PATH_*) ---
 

@@ -542,6 +542,45 @@ int test_wire_lstock_reveal_round_trip(void) {
     return 1;
 }
 
+/* #59: MSG_LSTOCK_REVEAL_REQUEST round-trip (the restart re-request). */
+int test_wire_lstock_reveal_request_round_trip(void) {
+    uint32_t nodes[3]  = { 2, 9, 99 };
+    uint32_t states[3] = { 0, 3, 500000 };
+    uint32_t pn[8], ps[8];
+    size_t n = 0;
+
+    cJSON *j = wire_build_lstock_reveal_request(nodes, states, 3);
+    TEST_ASSERT(j != NULL, "build request (3)");
+    TEST_ASSERT(wire_parse_lstock_reveal_request(j, pn, ps, 8, &n), "parse request (3)");
+    TEST_ASSERT(n == 3, "3 entries parsed");
+    for (size_t e = 0; e < 3; e++) {
+        TEST_ASSERT(pn[e] == nodes[e], "node matches");
+        TEST_ASSERT(ps[e] == states[e], "state matches");
+    }
+    cJSON_Delete(j);
+
+    cJSON *j1 = wire_build_lstock_reveal_request(nodes, states, 1);
+    n = 0;
+    TEST_ASSERT(j1 && wire_parse_lstock_reveal_request(j1, pn, ps, 8, &n), "parse request (1)");
+    TEST_ASSERT(n == 1 && pn[0] == nodes[0] && ps[0] == states[0], "single entry round-trips");
+    cJSON_Delete(j1);
+
+    cJSON *bad = cJSON_CreateObject();
+    cJSON_AddNumberToObject(bad, "x", 1);
+    TEST_ASSERT(wire_parse_lstock_reveal_request(bad, pn, ps, 8, &n) == 0,
+                "parse rejects missing requests array");
+    cJSON_Delete(bad);
+
+    cJSON *j3 = wire_build_lstock_reveal_request(nodes, states, 3);
+    n = 99;
+    TEST_ASSERT(wire_parse_lstock_reveal_request(j3, pn, ps, 2, &n) && n == 2,
+                "capped at max_entries");
+    cJSON_Delete(j3);
+
+    printf("  MSG_LSTOCK_REVEAL_REQUEST round-trips (single + multi + malformed + cap)\n");
+    return 1;
+}
+
 /* ---- Test 6: cooperative close unsigned ---- */
 
 int test_wire_close_unsigned(void) {
