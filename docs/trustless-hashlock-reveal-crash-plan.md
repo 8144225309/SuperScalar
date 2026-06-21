@@ -50,6 +50,18 @@ The "live pointer advances only on durable recourse" refinement, made recoverabl
    (assemble the poison via `superscalar_lstock_recover` + testmempoolaccept/confirm).
    Anti-vacuity: a crash where recovery is suppressed → no secret → tool refuses.
 
+## STATUS (2026-06-21)
+- Phase 1 (template-at-commit): DONE — build + 1507 unit + 4c e2e green (recourse intact).
+- Phase 2a (`persist_load_pending_l_stock_poison`): DONE — build + unit (pending scan) green.
+- Phase 2b (`MSG_LSTOCK_REVEAL_REQUEST` 0x8D codec): DONE — build + 1508 unit green.
+- Phase 2c (dispatch wiring): NEXT — LSP handles 0x8D -> `factory_derive_l_stock_secret`
+  -> reply MSG_LSTOCK_REVEAL (find the LSP per-client dispatch loop, ~lsp_channels.c:4990+);
+  client on startup/reconnect runs `persist_load_pending_l_stock_poison` -> sends 0x8D ->
+  recv reveal -> verify (SHA256==H_old) + `persist_update_l_stock_secret` (reuse the
+  client.c:3966 verify path; find the client connect/startup flow). Keystone — wires both
+  daemon message loops; do with fresh attention.
+- Phase 3 (crash matrix): after 2c.
+
 ## Reuse from #387
 `MSG_LSTOCK_REVEAL` (request can be a sibling opcode), `persist_save/update/load_l_stock_poison`
 (the template-only row is just save-without-update), `superscalar_lstock_recover`,
