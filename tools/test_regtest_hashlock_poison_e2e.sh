@@ -59,6 +59,13 @@ BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 
 . "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh
 
+# ASan preload only when the binaries are actually ASan-linked (build-rigor may
+# be a release build; preloading libasan before a non-ASan binary aborts it).
+ASAN_ENV="ASAN_OPTIONS=detect_leaks=0"
+if ldd "$LSP_BIN" 2>/dev/null | grep -q libasan; then
+    ASAN_ENV="ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8"
+fi
+
 TMPDIR=$(mktemp -d /tmp/ss-hashlock-e2e.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
@@ -102,7 +109,7 @@ echo "  miner wallet ready, 101 blocks mined"
 # --- LSP daemon (hashlock poison + cheat) ---
 echo
 echo "--- LSP daemon (--enable-hashlock-poison --cheat-daemon-leaf $SIDE) ---"
-ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
+env $ASAN_ENV \
 "$LSP_BIN" \
     --network regtest \
     --port $LSP_PORT \
@@ -139,7 +146,7 @@ echo "  hashlock poison ENABLED confirmed in LSP log"
 echo
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
-    ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
+    env $ASAN_ENV \
     "$CLIENT_BIN" \
         --network regtest \
         --host 127.0.0.1 --port $LSP_PORT \
