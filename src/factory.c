@@ -3573,28 +3573,26 @@ int factory_sign_l_stock_poison_tx(
     return ok;
 }
 
-int factory_build_l_stock_poison_scriptpath(
-    factory_t *f,
+int factory_build_l_stock_poison_scriptpath_unsigned(
+    const factory_t *f,
     const factory_node_t *leaf_node,
     const unsigned char *l_stock_txid32,
     uint32_t l_stock_vout,
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
-    const unsigned char *secret32,
-    tx_buf_t *signed_out,
-    unsigned char *poison_txid_out32)
+    tx_buf_t *unsigned_tx_out,
+    unsigned char *sighash_out32,
+    unsigned char *poison_txid_out32,
+    unsigned char *leaf_p_script_out,
+    size_t *leaf_p_script_len_out,
+    unsigned char *control_block_out,
+    size_t *control_block_len_out)
 {
-    if (!f || !leaf_node || !l_stock_txid32 || !secret32 || !signed_out) return 0;
+    if (!f || !leaf_node || !l_stock_txid32 || !unsigned_tx_out || !sighash_out32)
+        return 0;
     /* No hashlock poison without the per-state hash committed in the SPK. */
     if (!leaf_node->has_l_stock_hash) return 0;
     if (leaf_node->n_signers < 2) return 0;
-
-    /* Fail fast unless the supplied secret is the actual preimage of the leaf's
-       committed hash — otherwise we'd emit a tx whose Leaf-P witness can never
-       satisfy OP_SHA256 <H_s> OP_EQUALVERIFY. */
-    unsigned char chk[32];
-    sha256(secret32, 32, chk);
-    if (memcmp(chk, leaf_node->l_stock_hash, 32) != 0) return 0;
 
     size_t n_clients = leaf_node->n_signers - 1;
     uint64_t per_client = 0, last_extra = 0;
@@ -3602,8 +3600,8 @@ int factory_build_l_stock_poison_scriptpath(
                                             n_clients, &per_client, &last_extra))
         return 0;
 
-    /* Per-client key-path P2TR(client) outputs — same redistribution as the
-       key-path poison; each client sweeps (and can CPFP-bump) its own output. */
+    /* Per-client key-path P2TR(client) outputs — each client sweeps (and can
+       CPFP-bump) its own output. */
     tx_output_t *outputs = (tx_output_t *)calloc(n_clients, sizeof(tx_output_t));
     if (!outputs) return 0;
     for (size_t i = 0; i < n_clients; i++) {
@@ -3623,13 +3621,12 @@ int factory_build_l_stock_poison_scriptpath(
 
     /* Unsigned TX: single input from the L-stock outpoint, nSequence 0xFFFFFFFE
        (the CSV gate lives on Leaf L, not this spend). */
-    tx_buf_t unsigned_tx;
-    tx_buf_init(&unsigned_tx, 256);
+    tx_buf_reset(unsigned_tx_out);
     unsigned char disp_txid[32];
-    if (!build_unsigned_tx(&unsigned_tx, poison_txid_out32 ? disp_txid : NULL,
+    if (!build_unsigned_tx(unsigned_tx_out, poison_txid_out32 ? disp_txid : NULL,
                             l_stock_txid32, l_stock_vout, 0xFFFFFFFEu,
                             outputs, n_clients)) {
-        tx_buf_free(&unsigned_tx); free(outputs); return 0;
+        free(outputs); return 0;
     }
     free(outputs);
     if (poison_txid_out32) {
@@ -3642,62 +3639,94 @@ int factory_build_l_stock_poison_scriptpath(
     tapscript_leaf_t leaf_P, leaf_L;
     unsigned char merkle_root[32];
     int two = 0;
-    if (!build_l_stock_taptree(f, leaf_node, &leaf_P, &leaf_L, merkle_root, &two)
-        || !two) {
-        tx_buf_free(&unsigned_tx); return 0;
-    }
+    if (!build_l_stock_taptree(f, leaf_node, &leaf_P, &leaf_L, merkle_root, &two) || !two)
+        return 0;
 
     /* Prevout SPK the sighash commits to. */
     unsigned char l_stock_spk[34];
-    if (!build_l_stock_spk(f, leaf_node, l_stock_spk)) {
-        tx_buf_free(&unsigned_tx); return 0;
-    }
+    if (!build_l_stock_spk(f, leaf_node, l_stock_spk)) return 0;
 
     /* BIP-341 script-path sighash over Leaf P. */
+    if (!compute_tapscript_sighash(sighash_out32, unsigned_tx_out->data,
+                                    unsigned_tx_out->len, 0, l_stock_spk, 34,
+                                    l_stock_amount_sats, 0xFFFFFFFEu, &leaf_P))
+        return 0;
+
+    /* Leaf-P script + 2-leaf control block (sibling = Leaf L, parity from tweak) —
+       the witness components a holder later combines with [agg sig, revealed secret]. */
+    if (leaf_p_script_out && leaf_p_script_len_out) {
+        memcpy(leaf_p_script_out, leaf_P.script, leaf_P.script_len);
+        *leaf_p_script_len_out = leaf_P.script_len;
+    }
+    if (control_block_out && control_block_len_out) {
+        int parity = 0;
+        secp256k1_xonly_pubkey tweaked;
+        if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity, &internal_key, merkle_root))
+            return 0;
+        size_t cb_len = 0;
+        if (!tapscript_build_control_block_2leaf(control_block_out, &cb_len, parity,
+                                                  &internal_key, &leaf_L, f->ctx))
+            return 0;
+        *control_block_len_out = cb_len;
+    }
+    return 1;
+}
+
+int factory_build_l_stock_poison_scriptpath(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    const unsigned char *secret32,
+    tx_buf_t *signed_out,
+    unsigned char *poison_txid_out32)
+{
+    if (!f || !leaf_node || !secret32 || !signed_out) return 0;
+    if (!leaf_node->has_l_stock_hash) return 0;
+
+    /* Fail fast unless the supplied secret is the actual preimage of the leaf's
+       committed hash — otherwise we'd emit a tx whose Leaf-P witness can never
+       satisfy OP_SHA256 <H_s> OP_EQUALVERIFY. */
+    unsigned char chk[32];
+    sha256(secret32, 32, chk);
+    if (memcmp(chk, leaf_node->l_stock_hash, 32) != 0) return 0;
+
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
     unsigned char sighash[32];
-    if (!compute_tapscript_sighash(sighash, unsigned_tx.data, unsigned_tx.len, 0,
-                                    l_stock_spk, 34, l_stock_amount_sats,
-                                    0xFFFFFFFEu, &leaf_P)) {
-        tx_buf_free(&unsigned_tx); return 0;
+    unsigned char lp_script[TAPSCRIPT_MAX_SCRIPT]; size_t lp_len = 0;
+    unsigned char cb[65]; size_t cb_len = 0;
+    if (!factory_build_l_stock_poison_scriptpath_unsigned(
+            f, leaf_node, l_stock_txid32, l_stock_vout, l_stock_amount_sats,
+            fee_sats, &utx, sighash, poison_txid_out32,
+            lp_script, &lp_len, cb, &cb_len)) {
+        tx_buf_free(&utx); return 0;
     }
 
     /* N-of-N MuSig over the UNtweaked agg key (Leaf-P checksig verifies the raw
        agg key, not the taproot output key) — musig_sign_all_local applies no tweak. */
     secp256k1_keypair *kps = (secp256k1_keypair *)calloc(leaf_node->n_signers,
                                                           sizeof(secp256k1_keypair));
-    if (!kps) { tx_buf_free(&unsigned_tx); return 0; }
+    if (!kps) { tx_buf_free(&utx); return 0; }
     for (size_t i = 0; i < leaf_node->n_signers; i++) {
         uint32_t idx = leaf_node->signer_indices[i];
-        if (idx >= f->n_participants) { free(kps); tx_buf_free(&unsigned_tx); return 0; }
+        if (idx >= f->n_participants) { free(kps); tx_buf_free(&utx); return 0; }
         kps[i] = f->keypairs[idx];
     }
     unsigned char sig64[64];
     if (!musig_sign_all_local(f->ctx, sig64, sighash, kps,
                                leaf_node->n_signers, &leaf_node->keyagg)) {
-        free(kps); tx_buf_free(&unsigned_tx); return 0;
+        free(kps); tx_buf_free(&utx); return 0;
     }
     free(kps);
 
-    /* Control block for the Leaf-P script path (sibling = Leaf L, parity from tweak). */
-    int parity = 0;
-    secp256k1_xonly_pubkey tweaked;
-    if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity, &internal_key, merkle_root)) {
-        tx_buf_free(&unsigned_tx); return 0;
-    }
-    unsigned char control_block[65];
-    size_t cb_len = 0;
-    if (!tapscript_build_control_block_2leaf(control_block, &cb_len, parity,
-                                              &internal_key, &leaf_L, f->ctx)) {
-        tx_buf_free(&unsigned_tx); return 0;
-    }
-
     /* Witness: [sig, preimage=secret, Leaf-P script, control block]. */
-    int ok = finalize_script_path_tx_preimage(signed_out,
-                                              unsigned_tx.data, unsigned_tx.len,
+    int ok = finalize_script_path_tx_preimage(signed_out, utx.data, utx.len,
                                               sig64, secret32, 32,
-                                              leaf_P.script, leaf_P.script_len,
-                                              control_block, cb_len);
-    tx_buf_free(&unsigned_tx);
+                                              lp_script, lp_len, cb, cb_len);
+    tx_buf_free(&utx);
     return ok;
 }
 

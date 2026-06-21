@@ -523,6 +523,28 @@ int factory_build_l_stock_poison_scriptpath(
     tx_buf_t *signed_out,
     unsigned char *poison_txid_out32);
 
+/* #53-B3a: build the unsigned hashlock poison + its Leaf-P script-path sighash and
+   witness components (Leaf-P script, 2-leaf control block), WITHOUT signing.  Used by
+   the multi-process poison ceremony (which signs the sighash via the poison MuSig
+   session) and by the single-process builder above.  The aggregated 64-byte Schnorr
+   sig + the revealed secret are combined with these components at broadcast time via
+   finalize_script_path_tx_preimage.  leaf_p_script_out (>= TAPSCRIPT_MAX_SCRIPT) and
+   control_block_out (>= 65) are optional.  Requires has_l_stock_hash. */
+int factory_build_l_stock_poison_scriptpath_unsigned(
+    const factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    tx_buf_t *unsigned_tx_out,
+    unsigned char *sighash_out32,
+    unsigned char *poison_txid_out32,
+    unsigned char *leaf_p_script_out,
+    size_t *leaf_p_script_len_out,
+    unsigned char *control_block_out,
+    size_t *control_block_len_out);
+
 /* Cooperative N-of-N spend of an L-stock UTXO to a caller-specified
    output distribution.  The poison TX is a special case of this where
    outputs are the per-client equal split; the same helper is used for
