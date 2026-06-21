@@ -511,6 +511,20 @@ int factory_sign_l_stock_poison_tx(
    poison.  Returns 1 on success, 0 if no seed is set. */
 int factory_enable_hashlock_poison(factory_t *f);
 
+/* #59 / restart-resume: derive the per-factory L-stock poison MASTER seed
+   deterministically from the LSP's master secret + the factory's funding outpoint:
+   seed = tagged_hash("SS/LStockPoison/seed/v1", master32 || funding_txid32 ||
+   funding_vout_le32).  Deterministic => survives LSP restart + backup-restore
+   (re-derived, never stored as an independent secret — the elite "derive, don't
+   store" rule).  Domain-separated from signing-key use (the tag) and per-factory
+   (the funding outpoint binds it).  Trust-model-invisible: the client only verifies
+   SHA256(secret)==committed H, so the LSP's seed derivation is internal.  One-way:
+   leaking the derived seed never reveals `master32`. */
+void factory_derive_lstock_seed(const unsigned char *master32,
+                                const unsigned char *funding_txid32,
+                                uint32_t funding_vout,
+                                unsigned char *seed_out32);
+
 /* #53-B: derive the LSP-private per-(leaf, state) L-stock revocation secret.
    secret = tagged_hash("SS/LStockPoison/v1", seed32 || leaf_agg_xonly32 ||
    state_counter_le32).  Deterministic + crash-recoverable (re-derivable from the

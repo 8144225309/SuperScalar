@@ -3905,17 +3905,14 @@ accept_new_factory:
                lsp_p->factory.n_revocation_secrets);
     }
 
-    /* #53 Phase 3: hashlock-gated L-stock poison.  Distinct from --test-burn's
-       flat secrets (the old global-epoch index): the hashlock poison derives a
-       per-(leaf,state) secret from a single shachain seed
-       (factory_derive_l_stock_secret reads f->shachain_seed).  Install a real
-       random seed here in SHACHAIN mode (factory_set_shachain_seed sets
-       has_shachain=1 and leaves use_flat_secrets=0, so lsp_run_factory_creation
-       _stateless's save/restore across factory_init_from_pubkeys preserves the
-       seed via the !use_flat_secrets branch), and flag the LSP so the creation
-       path calls factory_enable_hashlock_poison after the re-init.  Mutually
-       exclusive with --test-burn (flat secrets would clobber the shachain
-       save/restore path and strand the L-stock secret). */
+    /* #53 + restart-resume: hashlock-gated L-stock poison.  Distinct from
+       --test-burn's flat secrets (the old global-epoch index): the hashlock poison
+       derives per-(leaf,state) secrets from a single per-factory seed.  We DO NOT
+       mint/store a random seed here — lsp_run_factory_creation_stateless DERIVES it
+       deterministically from the LSP master key + the funding outpoint
+       (factory_derive_lstock_seed), so it survives restart + backup-restore for free.
+       Here we only record the operator intent (the flag) + reject the test-burn
+       conflict.  Mutually exclusive with --test-burn (flat vs shachain mode). */
     if (enable_hashlock_poison) {
         if (test_burn) {
             fprintf(stderr, "LSP: --enable-hashlock-poison and --test-burn are "
@@ -3924,21 +3921,9 @@ accept_new_factory:
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        unsigned char hl_seed[32];
-        FILE *uf = fopen("/dev/urandom", "rb");
-        if (!uf || fread(hl_seed, 1, sizeof(hl_seed), uf) != sizeof(hl_seed)) {
-            if (uf) fclose(uf);
-            fprintf(stderr, "LSP: failed to read random L-stock poison seed "
-                            "from /dev/urandom\n");
-            lsp_cleanup(lsp_p);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        fclose(uf);
-        factory_set_shachain_seed(&lsp_p->factory, hl_seed);
         lsp_p->enable_hashlock_poison = 1;
         printf("LSP: hashlock-gated L-stock poison ENABLED "
-               "(per-(leaf,state) shachain seed installed)\n");
+               "(per-factory seed derived deterministically from LSP key)\n");
     }
 
     printf("LSP: starting factory creation ceremony...\n");

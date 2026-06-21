@@ -314,6 +314,24 @@ int factory_enable_hashlock_poison(factory_t *f) {
     return 1;
 }
 
+void factory_derive_lstock_seed(const unsigned char *master32,
+                                const unsigned char *funding_txid32,
+                                uint32_t funding_vout,
+                                unsigned char *seed_out32) {
+    /* seed = tagged_hash(master || funding_txid || funding_vout_le).  Deterministic
+       per (LSP master, factory), domain-separated by the tag from the signing key's
+       own use.  Re-derivable on every restart + backup-restore — never stored. */
+    unsigned char buf[32 + 32 + 4];
+    memcpy(buf, master32, 32);
+    memcpy(buf + 32, funding_txid32, 32);
+    buf[64] = (unsigned char)(funding_vout & 0xff);
+    buf[65] = (unsigned char)((funding_vout >> 8) & 0xff);
+    buf[66] = (unsigned char)((funding_vout >> 16) & 0xff);
+    buf[67] = (unsigned char)((funding_vout >> 24) & 0xff);
+    sha256_tagged("SS/LStockPoison/seed/v1", buf, sizeof(buf), seed_out32);
+    memset(buf, 0, sizeof(buf));  /* buf held master secret material */
+}
+
 int factory_derive_l_stock_secret(const factory_t *f,
                                   const factory_node_t *leaf_node,
                                   uint32_t state_counter,

@@ -5929,6 +5929,32 @@ int test_factory_ps_subfactory_poison_tx_k2_n4(void) {
     return 1;
 }
 
+/* restart-resume: the per-factory L-stock seed derivation must be deterministic
+   (same inputs -> same seed, so it survives LSP restart + backup-restore), unique
+   per funding outpoint and per LSP master, and one-way (seed != master). */
+int test_factory_lstock_seed_derivation(void) {
+    unsigned char master1[32], master2[32], txid1[32], txid2[32];
+    for (int i = 0; i < 32; i++) {
+        master1[i] = (unsigned char)(0x11 ^ i);
+        master2[i] = (unsigned char)(0x22 ^ i);
+        txid1[i]   = (unsigned char)(0x33 ^ i);
+        txid2[i]   = (unsigned char)(0x44 ^ i);
+    }
+    unsigned char s_a[32], s_b[32], s_c[32], s_d[32], s_e[32];
+    factory_derive_lstock_seed(master1, txid1, 0, s_a);
+    factory_derive_lstock_seed(master1, txid1, 0, s_b);
+    TEST_ASSERT(memcmp(s_a, s_b, 32) == 0, "deterministic: same inputs -> same seed");
+    factory_derive_lstock_seed(master1, txid1, 1, s_c);
+    TEST_ASSERT(memcmp(s_a, s_c, 32) != 0, "different vout -> different seed");
+    factory_derive_lstock_seed(master1, txid2, 0, s_d);
+    TEST_ASSERT(memcmp(s_a, s_d, 32) != 0, "different funding txid -> different seed");
+    factory_derive_lstock_seed(master2, txid1, 0, s_e);
+    TEST_ASSERT(memcmp(s_a, s_e, 32) != 0, "different LSP master -> different seed");
+    TEST_ASSERT(memcmp(s_a, master1, 32) != 0, "seed != master (one-way)");
+    printf("  factory_derive_lstock_seed: deterministic + per-factory + per-master\n");
+    return 1;
+}
+
 /* #53-B3b.2a (in-process, no regtest): the CLIENT MIRROR — given the LSP's per-node
    L-stock hashes over the (here simulated) wire, a seedless client builds the SAME
    2-leaf L-stock SPK as the hashlock-enabled LSP, so the leaf-state advance co-signs.
