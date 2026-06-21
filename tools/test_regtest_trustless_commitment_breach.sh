@@ -69,7 +69,7 @@ mine 1; sleep 1   # ensure the revoked commitment is confirmed on-chain
 
 echo "--- launch STANDALONE trustless WT (--wt-db only, NO secrets) ---"
 "$WT_BIN" --network regtest --wt-db "$WT_DB" --poll-interval 3 --cli-path bitcoin-cli \
-    --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" > "$WT_LOG" 2>&1 &
+    --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" ${SS_HIFEE_BUMP:+--bump-wallet "$WALLET"} > "$WT_LOG" 2>&1 &
 WT_PID=$!; PIDS+=($WT_PID)
 FIRED=0
 for i in $(seq 1 60); do
@@ -109,6 +109,31 @@ if [ "${SS_HIFEE_GAP:-0}" = 1 ]; then
         echo "HIFEE_GAP_DEMO_DONE"; exit 0
     else
         echo "  #52 gap NOT reproduced (penalty confirmed despite stall) — harness/scenario issue"; exit 1
+    fi
+fi
+# === #52 BUMP PROOF (SS_HIFEE_BUMP=1): the FUNDED WT (--bump-wallet) must CPFP a stalled penalty
+# to confirmation. Deprioritise the penalty by a MODERATE amount the CPFP child CAN overcome (unlike
+# the GAP mode's -10e9). The bare penalty can't get mined; the ONLY way it confirms is a CPFP child,
+# so confirmation == the funding fix works. Pre-funding (#52 gap) it stayed stuck. ===
+if [ "${SS_HIFEE_BUMP:-0}" = 1 ]; then
+    . "$(dirname "$(realpath "$0")")"/regtest_hifee_helpers.sh
+    echo "=== #52 BUMP PROOF: funded WT must CPFP stalled penalty $PEN_TXID to confirmation ==="
+    $BCLI prioritisetransaction "$PEN_TXID" 0 -3000 >/dev/null 2>&1
+    echo "  penalty deprioritised by 3000 sats — bare penalty unmineable; only a CPFP child can confirm it"
+    BUMPED=0
+    for i in $(seq 1 80); do
+        mine 1; sleep 2
+        c=$(tx_confs "$BCLI" "$PEN_TXID")
+        { [ -n "$c" ] && [ "$c" -ge 1 ]; } && { BUMPED=1; echo "  penalty CONFIRMED after ${i} blocks"; break; }
+    done
+    CPFP_SEEN=$(grep -ciE "CPFP child broadcast|cpfp.*broadcast|fee.?bump.*broadcast|bumped" "$WT_LOG" 2>/dev/null | head -1)
+    if [ "$BUMPED" = 1 ]; then
+        echo "  #52 BUMP PROOF PASS: funded WT CPFP-confirmed the stalled penalty (cpfp-child-log-lines=${CPFP_SEEN:-?})"
+        grep -aiE "CPFP|bump" "$WT_LOG" 2>/dev/null | tail -4
+        echo "HIFEE_BUMP_PROOF_DONE"; exit 0
+    else
+        echo "  #52 BUMP PROOF FAIL: penalty never confirmed despite --bump-wallet"
+        grep -aiE "CPFP|bump|wallet|UTXO|suitable" "$WT_LOG" 2>/dev/null | tail -10; exit 1
     fi
 fi
 echo "  penalty txid: $PEN_TXID — mining to confirm + verify payout"
