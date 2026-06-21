@@ -1912,6 +1912,30 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     cJSON_Delete(done);
 
+    /* #53-B3b Phase 2: reveal the SUPERSEDED state's L-stock revocation secret to the
+       advancing leaf's client (targeted, not broadcast).  The client verifies it +
+       persists it so it (or its WT) can spend the Leaf-P poison if we later broadcast
+       that stale state — closing Scenario B in the live protocol.  Gated on hashlock +
+       a poison having been co-signed; the secret is re-derived from the seed (the poison
+       session was already reset above). */
+    if (f->use_hashlock_poison && leaf_poison_prepared && have_old_l_hash) {
+        uint32_t old_counter = (f->nodes[node_idx].l_stock_state_counter > 0)
+                               ? f->nodes[node_idx].l_stock_state_counter - 1u : 0u;
+        unsigned char reveal_secret[1][32];
+        if (factory_derive_l_stock_secret(f, &f->nodes[node_idx], old_counter,
+                                          reveal_secret[0])) {
+            uint32_t rn = (uint32_t)node_idx;
+            cJSON *rev = wire_build_lstock_reveal(&rn, &old_counter, reveal_secret, 1);
+            if (rev) {
+                wire_send(lsp->client_fds[leaf_side], MSG_LSTOCK_REVEAL, rev);
+                cJSON_Delete(rev);
+                printf("LSP-stateless: revealed L-stock secret for node %d state %u\n",
+                       (int)node_idx, old_counter);
+            }
+            memset(reveal_secret, 0, sizeof(reveal_secret));
+        }
+    }
+
     lsp_crash_checkpoint("leaf_advance_finalize_partial");
 
     /* Step 11: persist leaf state (same shape as legacy path). */

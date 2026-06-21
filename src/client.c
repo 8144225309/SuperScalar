@@ -3935,6 +3935,48 @@ static int client_handle_leaf_advance_stateless(int fd,
     }
     if (done_msg.json) cJSON_Delete(done_msg.json);
 
+    /* #53-B3b Phase 2: receive + verify + persist the SUPERSEDED state's L-stock
+       revocation secret, so this client (or its standalone watchtower) can spend the
+       Leaf-P poison if the LSP later broadcasts that stale state.  Only when this
+       advance co-signed a script-path poison (hashlock on).  Verify-before-persist
+       (fail-closed), mirroring channel_receive_revocation_flat. */
+    if (ps_node->poison_is_scriptpath && ps_node->poison_has_agg_sig) {
+        wire_msg_t rev_msg;
+        if (wire_recv(fd, &rev_msg) && rev_msg.msg_type == MSG_LSTOCK_REVEAL) {
+            uint32_t rn[1], rs[1];
+            unsigned char rsec[1][32];
+            size_t rcount = 0;
+            if (wire_parse_lstock_reveal(rev_msg.json, rn, rs, rsec, 1, &rcount) &&
+                rcount == 1) {
+                unsigned char chk[32];
+                sha256(rsec[0], 32, chk);
+                if (memcmp(chk, ps_node->poison_l_stock_hash, 32) == 0) {
+                    persist_save_l_stock_poison(persist, /* factory_id */ 0,
+                        (uint32_t)node_idx, rs[0], ps_node->poison_l_stock_hash,
+                        ps_node->poison_agg_sig,
+                        ps_node->poison_unsigned_tx.data, ps_node->poison_unsigned_tx.len,
+                        ps_node->poison_leaf_script, ps_node->poison_leaf_script_len,
+                        ps_node->poison_control_block, ps_node->poison_control_block_len);
+                    persist_update_l_stock_secret(persist, 0, (uint32_t)node_idx, rs[0],
+                                                  rsec[0]);
+                    printf("Client-stateless %u: L-stock secret verified + persisted "
+                           "(node %zu state %u) -> poison recourse durable\n",
+                           my_index, node_idx, rs[0]);
+                } else {
+                    fprintf(stderr, "Client-stateless %u: L-stock reveal FAILED verify "
+                            "(SHA256 != committed H_old) -- rejecting (LSP misbehaving)\n",
+                            my_index);
+                }
+                memset(rsec, 0, sizeof(rsec));
+            }
+            if (rev_msg.json) cJSON_Delete(rev_msg.json);
+        } else {
+            if (rev_msg.json) cJSON_Delete(rev_msg.json);
+            fprintf(stderr, "Client-stateless %u: expected MSG_LSTOCK_REVEAL after DONE "
+                    "-- recourse for the superseded state NOT persisted\n", my_index);
+        }
+    }
+
     /* CL7: broadcast the snapshotted stale leaf state now that the
        advance is recorded.  LSP/standalone WT must respond with
        response_tx + L-stock poison TX.  Mirrors the legacy path. */
