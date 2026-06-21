@@ -42,6 +42,7 @@ static void usage(const char *prog) {
         "  --rpcport PORT      Bitcoin RPC port\n"
         "  --bump-budget-pct N CPFP fee budget as %% of penalty value (1-100, default 50)\n"
         "  --max-bump-fee SAT  Absolute fee ceiling per CPFP bump (default 50000)\n"
+        "  --bump-wallet NAME  Funded wallet the CPFP fee-bumper draws UTXOs from (#52)\n"
         "  --version           Show version and exit\n"
         "  --help              Show this help\n"
         "\n"
@@ -66,6 +67,7 @@ int main(int argc, char *argv[]) {
     const char *rpcpassword = NULL;
     const char *datadir = NULL;
     int rpcport = 0;
+    const char *bump_wallet = NULL;  /* #52: wallet the CPFP fee-bumper draws UTXOs from */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--db") == 0) {
@@ -102,6 +104,8 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bump-wallet") == 0 && i + 1 < argc)
+            bump_wallet = argv[++i];
         else if (strcmp(argv[i], "--max-bump-fee") == 0 && i + 1 < argc)
             max_bump_fee = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--bump-budget-pct") == 0 && i + 1 < argc) {
@@ -139,6 +143,19 @@ int main(int argc, char *argv[]) {
     if (!rt_ok) {
         fprintf(stderr, "Error: cannot connect to bitcoind\n");
         return 1;
+    }
+
+    /* #52: point the CPFP fee-bumper at a FUNDED wallet. Without this, regtest_exec
+       runs listunspent on the node's default wallet (empty for a standalone WT) ->
+       "no suitable wallet UTXO for bump" -> the penalty can't be fee-bumped and loses
+       the race under fee pressure. This is the operator/client-funded bumper wallet
+       (the design's "client-funded bumper" realized as the WT's own RPC wallet). The
+       WT still holds NO signing keys; it only spends this wallet's UTXOs to CPFP the
+       anyone-can-spend P2A anchor on a pre-signed penalty. */
+    if (bump_wallet) {
+        strncpy(rt.wallet, bump_wallet, sizeof(rt.wallet) - 1);
+        rt.wallet[sizeof(rt.wallet) - 1] = '\0';
+        printf("WT-TRUSTLESS: CPFP fee-bump wallet = %s\n", bump_wallet);
     }
 
     /* Initialize fee estimator */
