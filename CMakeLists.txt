@@ -447,6 +447,14 @@ if(ENABLE_SANITIZERS)
     target_link_libraries(recover_stranded_coop_output PRIVATE project_sanitizers)
 endif()
 
+# #53 Phase 4b: client-side hashlock L-stock poison recourse (assemble from persisted reveal)
+add_executable(superscalar_lstock_recover tools/superscalar_lstock_recover.c)
+target_include_directories(superscalar_lstock_recover PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(superscalar_lstock_recover PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(superscalar_lstock_recover PRIVATE project_sanitizers)
+endif()
+
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---
 if(ENABLE_FUZZING)
     set(FUZZ_SOURCES
