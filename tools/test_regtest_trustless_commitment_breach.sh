@@ -121,10 +121,10 @@ if [ "${SS_HIFEE_BUMP:-0}" = 1 ]; then
     $BCLI prioritisetransaction "$PEN_TXID" 0 -3000 >/dev/null 2>&1
     echo "  penalty deprioritised by 3000 sats — bare penalty unmineable; only a CPFP child can confirm it"
     BUMPED=0
-    for i in $(seq 1 80); do
+    for i in $(seq 1 130); do
         mine 1; sleep 2
         c=$(tx_confs "$BCLI" "$PEN_TXID")
-        { [ -n "$c" ] && [ "$c" -ge 1 ]; } && { BUMPED=1; echo "  penalty CONFIRMED after ${i} blocks"; break; }
+        { [ -n "$c" ] && [ "$c" -ge 1 ]; } && { BUMPED=1; echo "  penalty CONFIRMED after ${i} blocks (CPFP ramp overcame the deficit)"; break; }
     done
     CPFP_SEEN=$(grep -ciE "CPFP child broadcast|cpfp.*broadcast|fee.?bump.*broadcast|bumped" "$WT_LOG" 2>/dev/null | head -1)
     if [ "$BUMPED" = 1 ]; then

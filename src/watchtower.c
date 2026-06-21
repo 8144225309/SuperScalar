@@ -1968,8 +1968,8 @@ static int wt_hydrate_row_cb(uint32_t factory_id,
                               uint64_t fee_bump_budget_sat,
                               uint32_t fee_bump_deadline_height,
                               void *user) {
-    (void)parent_vout; (void)parent_value_sat;
-    (void)parent_spk;  (void)parent_spk_len; (void)csv_delay;
+    (void)parent_vout;
+    (void)parent_spk;  (void)parent_spk_len;
     (void)response_txid32;
     (void)fee_bump_budget_sat; (void)fee_bump_deadline_height;
     wt_hydrate_ctx_t *ctx = (wt_hydrate_ctx_t *)user;
@@ -2005,6 +2005,14 @@ static int wt_hydrate_row_cb(uint32_t factory_id,
     memcpy(parent_txid, parent_txid32, 32);
     if (watchtower_watch_factory_node(ctx->wt, factory_id, parent_txid,
                                         resp, resp_len, NULL, 0)) {
+        /* #52: carry the wt_db row's budget basis (parent value) + deadline (csv) onto
+           the just-created entry so the CPFP fee-bump escalator can RAMP. Without this a
+           hydrated entry has to_local_amount=0 -> budget_sat=0 -> max_feerate floors to
+           start_feerate -> the ramp is flat at 1 sat/vB and bumps can't overcome fee
+           pressure (proven: every CPFP child at feerate 1000). */
+        watchtower_entry_t *he = &ctx->wt->entries[ctx->wt->n_entries - 1];
+        he->to_local_amount = parent_value_sat;
+        he->csv_delay = csv_delay;
         ctx->n_loaded++;
     } else {
         fprintf(stderr,
