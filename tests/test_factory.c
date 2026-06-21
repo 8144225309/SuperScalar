@@ -6156,6 +6156,138 @@ int test_regtest_lstock_hashlock_poison(void) {
     return 1;
 }
 
+/* #53-B3a CONSENSUS PROOF: the MULTI-PROCESS poison ceremony (the production signing
+   path: prepare -> init -> per-signer nonce -> untweaked finalize -> per-signer
+   partial-sign -> complete -> assemble-with-secret) produces a Leaf-P poison that the
+   real Bitcoin Core interpreter accepts.  This is what the LSP + clients run over the
+   wire; here we drive both sides in-process with all keypairs. */
+int test_regtest_lstock_poison_ceremony(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
+                "setup n3 {2}");
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0x5C ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock poison");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    size_t n_clients = leaf->n_signers - 1;
+    TEST_ASSERT(leaf->has_l_stock_hash, "leaf carries hashlock");
+
+    unsigned char secret[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, leaf, leaf->l_stock_state_counter, secret),
+                "derive secret");
+
+    unsigned char spk[34];
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk), "build L-stock SPK");
+
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: no regtest node\n");
+        factory_free(f); secp256k1_context_destroy(ctx); free(f); return 1;
+    }
+    regtest_create_wallet(&rt, "ss_lstock_cer");
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)), "mine addr");
+    if (!regtest_fund_from_faucet(&rt, 0.05))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    char addr[128];
+    TEST_ASSERT(derive_p2tr_addr_from_outputkey(&rt, spk + 2, addr, sizeof(addr)),
+                "derive L-stock address");
+    char fund_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, addr, 0.001, fund_txid_hex), "fund L-stock");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    unsigned char fund_txid[32];
+    hex_decode(fund_txid_hex, fund_txid, 32);
+    reverse_bytes(fund_txid, 32);
+    int vout = -1; uint64_t amount = 0;
+    TEST_ASSERT(find_funding_vout(&rt, fund_txid_hex, spk, 34, &vout, &amount), "find vout");
+
+    /* --- drive the multi-process poison ceremony in-process --- */
+    const uint64_t fee = 1000;
+    TEST_ASSERT(factory_session_prepare_poison_tx_leaf(f, leaf_idx, fund_txid,
+                    (uint32_t)vout, amount, fee), "prepare poison (script-path)");
+    TEST_ASSERT(leaf->poison_is_scriptpath, "prepare set script-path mode");
+    TEST_ASSERT(factory_session_init_node_poison(f, leaf_idx), "init poison session");
+
+    secp256k1_musig_secnonce secnonces[FACTORY_MAX_SIGNERS];
+    for (size_t j = 0; j < leaf->n_signers; j++) {
+        uint32_t participant = leaf->signer_indices[j];
+        unsigned char sk[32]; secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, sk, &kps[participant]), "sk");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]), "pk");
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce, sk, &pk,
+                                           &leaf->keyagg.cache), "poison nonce gen");
+        memset(sk, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce_poison(f, leaf_idx, j, &pubnonce),
+                    "set poison nonce");
+    }
+    TEST_ASSERT(factory_session_finalize_node_poison(f, leaf_idx),
+                "finalize poison nonces (untweaked)");
+    for (size_t j = 0; j < leaf->n_signers; j++) {
+        uint32_t participant = leaf->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &leaf->poison_signing_session),
+                    "poison partial sig");
+        TEST_ASSERT(factory_session_set_partial_sig_poison(f, leaf_idx, j, &psig),
+                    "set poison partial sig");
+    }
+    TEST_ASSERT(factory_session_complete_node_poison(f, leaf_idx),
+                "complete poison ceremony");
+    TEST_ASSERT(leaf->poison_has_agg_sig, "ceremony produced an aggregated sig");
+
+    /* assemble with the revealed secret + prove the interpreter accepts it */
+    tx_buf_t poison; tx_buf_init(&poison, 256);
+    TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, secret, &poison),
+                "assemble poison with secret");
+    char *phex = (char *)malloc(poison.len * 2 + 1);
+    hex_encode(poison.data, poison.len, phex);
+    char *p = (char *)malloc(poison.len * 2 + 16);
+    snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
+    char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+    free(p);
+    TEST_ASSERT(tma != NULL, "testmempoolaccept ran");
+    cJSON *j = cJSON_Parse(tma); free(tma);
+    cJSON *r0 = j ? cJSON_GetArrayItem(j, 0) : NULL;
+    cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+    int ok_allowed = allowed && cJSON_IsTrue(allowed);
+    if (!ok_allowed && r0) {
+        cJSON *rr = cJSON_GetObjectItem(r0, "reject-reason");
+        printf("  ceremony poison rejected: %s\n",
+               rr && rr->valuestring ? rr->valuestring : "?");
+    }
+    if (j) cJSON_Delete(j);
+    TEST_ASSERT(ok_allowed,
+                "INTERPRETER ACCEPTS the MULTI-PROCESS-ceremony Leaf-P poison");
+    printf("  multi-process ceremony poison ACCEPTED (%zu clients)\n", n_clients);
+
+    /* negative: assembling with a wrong secret is refused */
+    unsigned char wrong[32]; memcpy(wrong, secret, 32); wrong[0] ^= 0x01;
+    tx_buf_t bad; tx_buf_init(&bad, 64);
+    TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, wrong, &bad) == 0,
+                "assemble REFUSES wrong secret");
+    tx_buf_free(&bad);
+
+    free(phex);
+    tx_buf_free(&poison);
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* Build, sign, verify, and advance a PS factory at N=64 (1 LSP + 63 clients).
  * This is the scale test — the existing PS tests use N=3 (2 clients), which
  * doesn't exercise the interior-tree layers or the 64-way MuSig ceremony.

@@ -1038,6 +1038,7 @@ extern int test_factory_burn_tx_construction(void);
 extern int test_factory_advance_with_shachain(void);
 extern int test_regtest_burn_tx(void);
 extern int test_regtest_lstock_hashlock_poison(void);
+extern int test_regtest_lstock_poison_ceremony(void);
 
 extern int test_channel_key_derivation(void);
 extern int test_channel_commitment_tx(void);
@@ -3904,6 +3905,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_timeout_spend);
     RUN_TEST(test_regtest_burn_tx);
     RUN_TEST(test_regtest_lstock_hashlock_poison);
+    RUN_TEST(test_regtest_lstock_poison_ceremony);
     RUN_TEST(test_regtest_channel_unilateral);
     RUN_TEST(test_regtest_channel_penalty);
     RUN_TEST(test_regtest_htlc_success);

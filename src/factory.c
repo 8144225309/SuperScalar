@@ -3080,6 +3080,12 @@ void factory_session_reset_poison(factory_t *f, size_t node_idx) {
     /* secp256k1_musig structures are POD-style; zeroing is safe. */
     memset(&node->poison_signing_session, 0, sizeof(node->poison_signing_session));
     memset(node->poison_partial_sigs, 0, sizeof(node->poison_partial_sigs));
+    /* #53-B3a script-path ceremony state */
+    node->poison_is_scriptpath = 0;
+    node->poison_has_agg_sig = 0;
+    memset(node->poison_agg_sig, 0, sizeof(node->poison_agg_sig));
+    node->poison_leaf_script_len = 0;
+    node->poison_control_block_len = 0;
 }
 
 int factory_session_prepare_poison_tx_subfactory(
@@ -3096,7 +3102,19 @@ int factory_session_prepare_poison_tx_subfactory(
        what the wire ceremony rounds do. */
     factory_session_reset_poison(f, sub_node_idx);
     tx_buf_init(&sub->poison_unsigned_tx, 256);
-    if (!factory_build_l_stock_poison_tx_unsigned(
+    if (sub->has_l_stock_hash) {
+        /* #53-B3a: hashlock poison — sign the Leaf-P script path (untweaked). */
+        sub->poison_is_scriptpath = 1;
+        if (!factory_build_l_stock_poison_scriptpath_unsigned(
+                f, sub, old_chain_txid32, old_sstock_vout,
+                old_sstock_amount_sats, fee_sats,
+                &sub->poison_unsigned_tx, sub->poison_sighash, sub->poison_txid,
+                sub->poison_leaf_script, &sub->poison_leaf_script_len,
+                sub->poison_control_block, &sub->poison_control_block_len)) {
+            factory_session_reset_poison(f, sub_node_idx);
+            return 0;
+        }
+    } else if (!factory_build_l_stock_poison_tx_unsigned(
             f, sub, old_chain_txid32, old_sstock_vout,
             old_sstock_amount_sats, fee_sats,
             &sub->poison_unsigned_tx, sub->poison_sighash, sub->poison_txid)) {
@@ -3116,7 +3134,19 @@ int factory_session_prepare_poison_tx_leaf(
 
     factory_session_reset_poison(f, leaf_node_idx);
     tx_buf_init(&leaf->poison_unsigned_tx, 256);
-    if (!factory_build_l_stock_poison_tx_unsigned(
+    if (leaf->has_l_stock_hash) {
+        /* #53-B3a: hashlock poison — sign the Leaf-P script path (untweaked). */
+        leaf->poison_is_scriptpath = 1;
+        if (!factory_build_l_stock_poison_scriptpath_unsigned(
+                f, leaf, old_leaf_txid32, old_l_stock_vout,
+                old_l_stock_amount_sats, fee_sats,
+                &leaf->poison_unsigned_tx, leaf->poison_sighash, leaf->poison_txid,
+                leaf->poison_leaf_script, &leaf->poison_leaf_script_len,
+                leaf->poison_control_block, &leaf->poison_control_block_len)) {
+            factory_session_reset_poison(f, leaf_node_idx);
+            return 0;
+        }
+    } else if (!factory_build_l_stock_poison_tx_unsigned(
             f, leaf, old_leaf_txid32, old_l_stock_vout,
             old_l_stock_amount_sats, fee_sats,
             &leaf->poison_unsigned_tx, leaf->poison_sighash, leaf->poison_txid)) {
@@ -3151,7 +3181,23 @@ int factory_session_finalize_node_poison(factory_t *f, size_t node_idx) {
     if (!f || node_idx >= f->n_nodes) return 0;
     factory_node_t *node = &f->nodes[node_idx];
 
-    /* The poison TX spends the OLD state's L-stock / sales-stock UTXO
+    /* #53-B3a: hashlock poison spends via the Leaf-P SCRIPT path, whose OP_CHECKSIG
+       verifies the UNTWEAKED agg key.  Finalize with no taptweak (mirrors
+       musig_sign_all_local) so LSP + clients sign the same raw-key message. */
+    if (node->poison_is_scriptpath) {
+        int ok = musig_session_finalize_nonces_untweaked(
+            f->ctx, &node->poison_signing_session, node->poison_sighash);
+        if (!ok)
+            fprintf(stderr,
+                    "finalize_node_poison %zu (script-path): "
+                    "musig_session_finalize_nonces_untweaked failed "
+                    "(n_signers=%zu, nonces_collected=%d)\n",
+                    node_idx, node->n_signers,
+                    node->poison_signing_session.nonces_collected);
+        return ok;
+    }
+
+    /* Legacy key-path poison: spends the OLD state's L-stock / sales-stock UTXO
        whose SPK is `or(N-of-N keyagg, L&CSV)` — the keypath spend uses
        the leaf-level taptree merkle root (single CSV leaf).  Match what
        sign_l_stock_spend_with_outputs does internally so the sighash
@@ -3210,6 +3256,17 @@ int factory_session_complete_node_poison(factory_t *f, size_t node_idx) {
                                         node->n_signers))
         return 0;
 
+    if (node->poison_is_scriptpath) {
+        /* #53-B3a: the broadcastable poison needs the revealed secret as the Leaf-P
+           witness preimage, which isn't available at ceremony time.  Store the
+           aggregated 64-byte Schnorr sig; factory_assemble_poison_with_secret builds
+           the full witness tx once the secret is revealed (#53-B3b). */
+        memcpy(node->poison_agg_sig, sig, 64);
+        node->poison_has_agg_sig = 1;
+        node->poison_is_signed = 1;
+        return 1;
+    }
+
     if (!finalize_signed_tx(&node->poison_signed_tx,
                               node->poison_unsigned_tx.data,
                               node->poison_unsigned_tx.len, sig))
@@ -3217,6 +3274,28 @@ int factory_session_complete_node_poison(factory_t *f, size_t node_idx) {
 
     node->poison_is_signed = 1;
     return 1;
+}
+
+int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
+                                        const unsigned char *secret32,
+                                        tx_buf_t *out) {
+    if (!f || node_idx >= f->n_nodes || !secret32 || !out) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->poison_is_scriptpath || !node->poison_has_agg_sig) return 0;
+    if (node->poison_unsigned_tx.len == 0) return 0;
+
+    /* Defense-in-depth: the revealed secret must be the committed hash's preimage,
+       else the assembled witness can't satisfy Leaf P (avoid emitting a dead tx). */
+    unsigned char chk[32];
+    sha256(secret32, 32, chk);
+    if (memcmp(chk, node->l_stock_hash, 32) != 0) return 0;
+
+    /* Witness: [agg sig, preimage=secret, Leaf-P script, 2-leaf control block]. */
+    return finalize_script_path_tx_preimage(out,
+        node->poison_unsigned_tx.data, node->poison_unsigned_tx.len,
+        node->poison_agg_sig, secret32, 32,
+        node->poison_leaf_script, node->poison_leaf_script_len,
+        node->poison_control_block, node->poison_control_block_len);
 }
 
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {

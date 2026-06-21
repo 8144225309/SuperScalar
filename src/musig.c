@@ -341,6 +341,35 @@ int musig_session_finalize_nonces(
     return 1;
 }
 
+int musig_session_finalize_nonces_untweaked(
+    const secp256k1_context *ctx,
+    musig_signing_session_t *session,
+    const unsigned char *msg32
+) {
+    if ((size_t)session->nonces_collected != session->n_signers)
+        return 0;
+
+    const secp256k1_musig_pubnonce *ptrs[MUSIG_SESSION_MAX_SIGNERS];
+    for (size_t i = 0; i < session->n_signers; i++)
+        ptrs[i] = &session->pubnonces[i];
+
+    if (!secp256k1_musig_nonce_agg(ctx, &session->aggnonce, ptrs, session->n_signers))
+        return 0;
+
+    memcpy(session->msg32, msg32, 32);
+
+    /* #53-B3a: NO taproot tweak — sign the RAW aggregate key (cache as initialized
+       by musig_session_init).  Matches musig_sign_all_local, required for tapscript
+       script-path spends whose OP_CHECKSIG verifies the untweaked agg key (Leaf-P
+       L-stock poison).  session->cache is the raw cache here (never tweaked). */
+    if (!secp256k1_musig_nonce_process(ctx, &session->session, &session->aggnonce,
+                                        msg32, &session->cache, NULL))
+        return 0;
+
+    session->session_ready = 1;
+    return 1;
+}
+
 int musig_create_partial_sig(
     const secp256k1_context *ctx,
     secp256k1_musig_partial_sig *partial_sig_out,

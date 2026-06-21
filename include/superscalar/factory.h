@@ -196,6 +196,19 @@ typedef struct {
        state s's L-stock output was built. */
     uint32_t l_stock_state_counter;
 
+    /* #53-B3a: script-path (Leaf-P) poison ceremony state.  When the leaf carries a
+       hashlock (has_l_stock_hash), the multi-process poison ceremony signs the Leaf-P
+       script path against the UNTWEAKED agg key (not the key path = Scenario B); the
+       aggregated 64-byte sig + these witness components are combined with the revealed
+       secret at broadcast via factory_assemble_poison_with_secret. */
+    int poison_is_scriptpath;
+    int poison_has_agg_sig;
+    unsigned char poison_agg_sig[64];
+    unsigned char poison_leaf_script[128];   /* TAPSCRIPT_MAX_SCRIPT; Leaf-P = 73 bytes */
+    size_t poison_leaf_script_len;
+    unsigned char poison_control_block[65];
+    size_t poison_control_block_len;
+
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
     int ps_chain_len;            /* number of state advances (0 = initial state) */
@@ -809,6 +822,14 @@ int factory_session_set_partial_sig_poison(factory_t *f, size_t node_idx,
                                              size_t signer_slot,
                                              const secp256k1_musig_partial_sig *psig);
 int factory_session_complete_node_poison(factory_t *f, size_t node_idx);
+
+/* #53-B3a: assemble the broadcastable hashlock poison from the ceremony-aggregated
+   sig + the revealed secret (Leaf-P witness preimage).  Only valid for a script-path
+   poison node (poison_is_scriptpath + poison_has_agg_sig) whose secret matches the
+   committed hash.  `out` receives the complete witness tx.  Returns 1 on success. */
+int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
+                                        const unsigned char *secret32,
+                                        tx_buf_t *out);
 
 /* Reset poison state on a node (free the unsigned/signed tx buffers + clear
    sighash + reset received counter).  Safe to call on a never-prepared
