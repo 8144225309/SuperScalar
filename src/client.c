@@ -3591,6 +3591,25 @@ static int client_handle_leaf_advance_stateless(int fd,
         }
     }
 
+    /* #53-B3b Phase 1: capture the OLD state's L-stock hash (H_old) BEFORE the local
+       advance rebuilds the SPK to H_new — used as the poison override so the poison
+       targets the SUPERSEDED state's output. */
+    unsigned char old_l_stock_hash_c[32];
+    int have_old_l_hash_c = ps_node->has_l_stock_hash;
+    if (have_old_l_hash_c)
+        memcpy(old_l_stock_hash_c, ps_node->l_stock_hash, 32);
+
+    /* #53-B3b Phase 1: mirror the advancing leaf's NEW-state hash from PROPOSE (the
+       client has no seed) so the local advance builds the IDENTICAL new leaf-state SPK
+       as the LSP — else the MuSig co-sign of the new state mismatches.  Absent field
+       (hashlock off) -> no-op. */
+    {
+        cJSON *lh = cJSON_GetObjectItem(propose_msg->json, "l_stock_hash");
+        unsigned char h_new[32];
+        if (lh && cJSON_IsString(lh) && hex_decode(lh->valuestring, h_new, 32) == 32)
+            factory_set_node_l_stock_hash(factory, node_idx, h_new);
+    }
+
     /* Step 1: advance local state to mirror the LSP. */
     int rc = factory_advance_leaf_unsigned(factory, leaf_side);
     if (rc <= 0) {
@@ -3630,7 +3649,9 @@ static int client_handle_leaf_advance_stateless(int fd,
         if (factory_session_prepare_poison_tx_leaf(
                 factory, node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs_c - 1),
-                old_l_amount_c, LEAF_POISON_FEE_SATS_C, NULL)) {
+                old_l_amount_c, LEAF_POISON_FEE_SATS_C,
+                /* #53-B3b Phase 1: target the SUPERSEDED state's output (H_old). */
+                have_old_l_hash_c ? old_l_stock_hash_c : NULL)) {
             leaf_poison_prepared_c = 1;
         }
     }

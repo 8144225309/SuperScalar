@@ -1414,6 +1414,16 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
      * inspection. */
     uint32_t old_csv_delay = (uint32_t)(f->nodes[pre_node_idx].nsequence & 0xFFFFu);
 
+    /* #53-B3b Phase 1: capture the OLD state's L-stock hash BEFORE the advance bumps
+       the per-leaf counter + rebuilds the SPK to H_new — so the poison co-signed below
+       targets the SUPERSEDED state's output (H_old), via override_hash32.  No-op unless
+       hashlock poison is enabled. */
+    unsigned char old_l_stock_hash[32];
+    int have_old_l_hash = (f->use_hashlock_poison &&
+                           f->nodes[pre_node_idx].has_l_stock_hash);
+    if (have_old_l_hash)
+        memcpy(old_l_stock_hash, f->nodes[pre_node_idx].l_stock_hash, 32);
+
     /* Step 1: advance leaf state to rebuild the unsigned TX. */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
     if (rc == 0) {
@@ -1442,11 +1452,9 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 f, pre_node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs - 1),
                 old_l_amount, LEAF_POISON_FEE_SATS,
-                /* #53-B3b: NULL while the daemon doesn't enable hashlock poison
-                   (has_l_stock_hash==0 -> key-path branch). When it does, this path
-                   advances BEFORE prepare, so capture H_old before
-                   factory_advance_leaf_unsigned and pass it here. */
-                NULL)) {
+                /* #53-B3b Phase 1: target the SUPERSEDED state's output (H_old captured
+                   before the advance); NULL = legacy key-path when hashlock is off. */
+                have_old_l_hash ? old_l_stock_hash : NULL)) {
             leaf_poison_prepared = 1;
         }
     }
@@ -1471,6 +1479,12 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             cer_persisted = 1;
     }
     cJSON *propose = wire_build_leaf_advance_propose(leaf_side, NULL, NULL);
+    /* #53-B3b Phase 1: ship the advancing leaf's NEW-state L-stock hash (H_new, rebuilt
+       by the advance @ factory_advance_leaf_unsigned) so the seedless client builds the
+       IDENTICAL new leaf-state SPK — else the MuSig co-sign of the new state mismatches.
+       Optional field; absent when hashlock poison is off (backward compatible). */
+    if (f->use_hashlock_poison && f->nodes[node_idx].has_l_stock_hash)
+        wire_json_add_hex(propose, "l_stock_hash", f->nodes[node_idx].l_stock_hash, 32);
     if (!wire_send(lsp->client_fds[leaf_side], MSG_LEAF_ADVANCE_PROPOSE, propose)) {
         cJSON_Delete(propose);
         fprintf(stderr, "LSP-stateless: send PROPOSE failed\n");
