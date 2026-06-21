@@ -6008,7 +6008,10 @@ int test_regtest_lstock_hashlock_poison(void) {
     regtest_create_wallet(&rt, "ss_lstock_poison");
     char mine_addr[128];
     TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)), "mine addr");
-    regtest_mine_blocks(&rt, 101, mine_addr);
+    /* Fund the test wallet from the shared faucet (robust on a tall chain where
+       fresh coinbases are 0-sat); fall back to mining on a fresh node. */
+    if (!regtest_fund_from_faucet(&rt, 0.05))
+        regtest_mine_blocks(&rt, 101, mine_addr);
 
     char lstock_addr[128];
     TEST_ASSERT(derive_p2tr_addr_from_outputkey(&rt, spk_hash + 2,
