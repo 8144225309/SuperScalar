@@ -2586,7 +2586,8 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
         if (factory_session_prepare_poison_tx_leaf(
                 factory, pre_node_idx_r,
                 pre_old_leaf_txid_r, (uint32_t)(pre_old_n_outputs_r - 1),
-                pre_old_l_amount_r, REALLOC_POISON_FEE_SATS)) {
+                pre_old_l_amount_r, REALLOC_POISON_FEE_SATS,
+                NULL /* #53-B3b: client mirrors LSP; daemon hashlock off -> key-path */)) {
             realloc_poison_prepared = 1;
         }
     }
@@ -2847,7 +2848,7 @@ static int client_handle_subfactory_advance_stateless_multi(
             memcpy(old_chain_txid, sub->txid, 32);
             if (factory_session_prepare_poison_tx_subfactory(
                     factory, sub_node_i, old_chain_txid, (uint32_t)old_n_chans,
-                    old_sstock, POISON_FEE_SATS))
+                    old_sstock, POISON_FEE_SATS, NULL))
                 poison_prepared_c = 1;
         }
     }
@@ -3239,7 +3240,7 @@ static int client_handle_subfactory_advance_stateless(int fd,
             memcpy(old_chain_txid, sub->txid, 32);
             if (factory_session_prepare_poison_tx_subfactory(
                     factory, sub_node_i, old_chain_txid, (uint32_t)old_n_chans,
-                    old_sstock, POISON_FEE_SATS)) {
+                    old_sstock, POISON_FEE_SATS, NULL)) {
                 poison_prepared_c = 1;  /* init_node_poison after state init */
             }
         }
@@ -3600,7 +3601,7 @@ static int client_handle_leaf_advance_stateless(int fd,
         if (factory_session_prepare_poison_tx_leaf(
                 factory, node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs_c - 1),
-                old_l_amount_c, LEAF_POISON_FEE_SATS_C)) {
+                old_l_amount_c, LEAF_POISON_FEE_SATS_C, NULL)) {
             leaf_poison_prepared_c = 1;
         }
     }
@@ -4034,7 +4035,7 @@ static int client_handle_state_advance_stateless(int fd,
             memcpy(old_txid, an->txid, 32);
             if (factory_session_prepare_poison_tx_leaf(
                     factory, affected[k], old_txid, (uint32_t)(old_no - 1),
-                    old_l, TIERB_POISON_FEE_SATS)) {
+                    old_l, TIERB_POISON_FEE_SATS, NULL)) {
                 poison_prepared_c[k] = 1;  /* init_node_poison after state init */
             }
         }
