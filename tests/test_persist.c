@@ -200,9 +200,27 @@ int test_persist_l_stock_poison_round_trip(void) {
                     lls, &lls_len, lcb, &lcb_len, lsec, &has_secret) == 0,
                 "missing (factory,node,state) row not found");
 
+    /* #59: the pending query lists ONLY rows still missing a secret.  Row
+       (nidx=7,state=3) now has a secret (updated above); add a second template-only
+       row and confirm the pending scan returns exactly the un-revealed one. */
+    TEST_ASSERT(persist_save_l_stock_poison(&db, fid, 9, 1, h, sig,
+                    utx, sizeof(utx), lscript, sizeof(lscript), cb, sizeof(cb)),
+                "save second poison (no secret yet)");
+    uint32_t pend_n[8], pend_s[8]; size_t pend_cnt = 99;
+    TEST_ASSERT(persist_load_pending_l_stock_poison(&db, fid, pend_n, pend_s, 8, &pend_cnt),
+                "pending query runs");
+    TEST_ASSERT(pend_cnt == 1, "exactly one pending row (secret'd row excluded)");
+    TEST_ASSERT(pend_n[0] == 9 && pend_s[0] == 1, "pending row is the un-revealed one");
+    /* once its secret lands, it drops out of the pending set */
+    TEST_ASSERT(persist_update_l_stock_secret(&db, fid, 9, 1, secret), "reveal second");
+    pend_cnt = 99;
+    TEST_ASSERT(persist_load_pending_l_stock_poison(&db, fid, pend_n, pend_s, 8, &pend_cnt),
+                "pending query reruns");
+    TEST_ASSERT(pend_cnt == 0, "no pending rows after both revealed");
+
     tx_buf_free(&lutx);
     persist_close(&db);
-    printf("  l_stock_poison_reveals save/load/update-secret round-trips\n");
+    printf("  l_stock_poison_reveals save/load/update-secret + #59 pending scan round-trips\n");
     return 1;
 }
 

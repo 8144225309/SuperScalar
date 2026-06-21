@@ -1819,6 +1819,30 @@ int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node
     return found;
 }
 
+/* #59: list (node_idx, state_counter) for poison rows still missing their secret. */
+int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
+                                        uint32_t *node_out, uint32_t *state_out,
+                                        size_t max, size_t *n_out) {
+    if (!p || !p->db || !node_out || !state_out || !n_out) return 0;
+    *n_out = 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT node_idx, state_counter FROM l_stock_poison_reveals "
+        "WHERE factory_id = ? AND revocation_secret IS NULL "
+        "ORDER BY node_idx, state_counter;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    size_t n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && n < max) {
+        node_out[n]  = (uint32_t)sqlite3_column_int(stmt, 0);
+        state_out[n] = (uint32_t)sqlite3_column_int(stmt, 1);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *n_out = n;
+    return 1;
+}
+
 /* Load PS leaf chain for a given leaf node.
    Fills chain_txs_out (caller-allocated array of tx_buf_t, size max_chain).
    txids_out: caller-allocated [max_chain][32] for internal-order txids.

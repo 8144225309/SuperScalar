@@ -171,6 +171,14 @@ int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node
                                 unsigned char *control_block_out, size_t *control_block_len_out,
                                 unsigned char *secret_out32, int *out_has_secret);
 
+/* #59: list (node_idx, state_counter) for poison rows still MISSING their revealed
+   secret (revocation_secret IS NULL).  The client scans these on restart/reconnect
+   and re-requests the reveal (the commit-without-reveal recovery).  Caller-allocated
+   node_out[max] + state_out[max]; fills *n_out (<= max).  Returns 1 on success. */
+int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
+                                        uint32_t *node_out, uint32_t *state_out,
+                                        size_t max, size_t *n_out);
+
 /* Load all PS chain entries for a leaf in chain_pos order.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).
    txids_out: caller-allocated [max_chain][32] internal-order txids.
