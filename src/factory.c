@@ -235,14 +235,24 @@ static int add_node(
    Caller passes the leaf state node — `leaf_node->keyagg.agg_pubkey` is
    the N-of-N internal key, `leaf_node->signer_indices[]` enumerates the
    clients that will receive equal shares in the poison TX. */
-static int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
-                              unsigned char *spk_out34) {
-    if (!f || !leaf_node || !spk_out34) return 0;
+/* #53: Build the L-stock taptree leaves + merkle root, used by BOTH the SPK
+   builder and every L-stock spender so the SPK and the taptweak can never drift.
+   - Leaf L (always) = <csv> CSV DROP <LSP_xonly> CHECKSIG — LSP unilateral fallback.
+   - Leaf P (iff leaf_node->has_l_stock_hash) = hashlock(H_s) + N-of-N agg checksig —
+     the revocation-gated poison path.
+   When the node carries no per-state hash the tree is the legacy single leaf {Leaf L}
+   (byte-identical to the pre-#53 SPK), so this change is a no-op until a state's hash
+   is wired (#53-B).  `leaf_P_out` may be NULL only when the caller knows the node has
+   no hash; `*is_2leaf_out` (optional) reports which tree was built. */
+static int build_l_stock_taptree(const factory_t *f,
+                                  const factory_node_t *leaf_node,
+                                  tapscript_leaf_t *leaf_P_out,
+                                  tapscript_leaf_t *leaf_L_out,
+                                  unsigned char *merkle_root_out32,
+                                  int *is_2leaf_out) {
+    if (!f || !leaf_node || !leaf_L_out || !merkle_root_out32) return 0;
 
-    /* Internal key = leaf's N-of-N MuSig agg pubkey (LSP + all leaf clients). */
-    secp256k1_xonly_pubkey internal_key = leaf_node->keyagg.agg_pubkey;
-
-    /* Script-leaf: <csv_blocks> CSV DROP <LSP_xonly> CHECKSIG. */
+    /* Leaf L: <csv_blocks> CSV DROP <LSP_xonly> CHECKSIG. */
     secp256k1_xonly_pubkey lsp_xonly;
     if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
                                               &f->pubkeys[0]))
@@ -250,12 +260,36 @@ static int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node
     uint32_t csv = f->l_stock_csv_blocks > 0
                    ? f->l_stock_csv_blocks
                    : L_STOCK_CSV_DEFAULT_BLOCKS;
-    tapscript_leaf_t csv_leaf;
-    if (!tapscript_build_csv_delay(&csv_leaf, csv, &lsp_xonly, f->ctx))
+    if (!tapscript_build_csv_delay(leaf_L_out, csv, &lsp_xonly, f->ctx))
         return 0;
 
+    int two = leaf_node->has_l_stock_hash ? 1 : 0;
+    if (two) {
+        if (!leaf_P_out) return 0;
+        if (!tapscript_build_l_stock_poison_leaf(leaf_P_out, leaf_node->l_stock_hash,
+                                                  &leaf_node->keyagg.agg_pubkey, f->ctx))
+            return 0;
+        tapscript_leaf_t leaves[2] = { *leaf_P_out, *leaf_L_out };
+        if (!tapscript_merkle_root(merkle_root_out32, leaves, 2))
+            return 0;
+    } else {
+        if (!tapscript_merkle_root(merkle_root_out32, leaf_L_out, 1))
+            return 0;
+    }
+    if (is_2leaf_out) *is_2leaf_out = two;
+    return 1;
+}
+
+static int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
+                              unsigned char *spk_out34) {
+    if (!f || !leaf_node || !spk_out34) return 0;
+
+    /* Internal key = leaf's N-of-N MuSig agg pubkey (LSP + all leaf clients). */
+    secp256k1_xonly_pubkey internal_key = leaf_node->keyagg.agg_pubkey;
+
+    tapscript_leaf_t leaf_P, leaf_L;
     unsigned char merkle_root[32];
-    if (!tapscript_merkle_root(merkle_root, &csv_leaf, 1))
+    if (!build_l_stock_taptree(f, leaf_node, &leaf_P, &leaf_L, merkle_root, NULL))
         return 0;
 
     secp256k1_xonly_pubkey tweaked;
@@ -3403,23 +3437,13 @@ static int sign_l_stock_spend_with_outputs(
         kps[i] = f->keypairs[idx];
     }
 
-    /* 4. Compute the L-stock SPK's script-tree merkle root (single leaf:
-       <csv> CSV DROP <LSP> CHECKSIG).  musig_sign_taproot needs this to
-       apply the BIP-341 taptweak that matches the SPK. */
-    secp256k1_xonly_pubkey lsp_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
-                                              &f->pubkeys[0])) {
-        free(kps); tx_buf_free(&unsigned_tx); return 0;
-    }
-    uint32_t csv = f->l_stock_csv_blocks > 0
-                   ? f->l_stock_csv_blocks
-                   : L_STOCK_CSV_DEFAULT_BLOCKS;
-    tapscript_leaf_t csv_leaf;
-    if (!tapscript_build_csv_delay(&csv_leaf, csv, &lsp_xonly, f->ctx)) {
-        free(kps); tx_buf_free(&unsigned_tx); return 0;
-    }
+    /* 4. Compute the L-stock SPK's taptree merkle root (2-leaf {poison, LSP-CSV}
+       when the state carries a hashlock, else legacy single {LSP-CSV} leaf) via the
+       shared builder so the key-path taptweak always matches the SPK (#53). */
+    tapscript_leaf_t coop_leaf_P, coop_leaf_L;
     unsigned char merkle_root[32];
-    if (!tapscript_merkle_root(merkle_root, &csv_leaf, 1)) {
+    if (!build_l_stock_taptree(f, leaf_node, &coop_leaf_P, &coop_leaf_L,
+                               merkle_root, NULL)) {
         free(kps); tx_buf_free(&unsigned_tx); return 0;
     }
 
@@ -3484,6 +3508,134 @@ int factory_sign_l_stock_poison_tx(
                                                l_stock_vout, l_stock_amount_sats,
                                                outs, n_clients, signed_out);
     free(outs);
+    return ok;
+}
+
+int factory_build_l_stock_poison_scriptpath(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    const unsigned char *secret32,
+    tx_buf_t *signed_out,
+    unsigned char *poison_txid_out32)
+{
+    if (!f || !leaf_node || !l_stock_txid32 || !secret32 || !signed_out) return 0;
+    /* No hashlock poison without the per-state hash committed in the SPK. */
+    if (!leaf_node->has_l_stock_hash) return 0;
+    if (leaf_node->n_signers < 2) return 0;
+
+    /* Fail fast unless the supplied secret is the actual preimage of the leaf's
+       committed hash — otherwise we'd emit a tx whose Leaf-P witness can never
+       satisfy OP_SHA256 <H_s> OP_EQUALVERIFY. */
+    unsigned char chk[32];
+    sha256(secret32, 32, chk);
+    if (memcmp(chk, leaf_node->l_stock_hash, 32) != 0) return 0;
+
+    size_t n_clients = leaf_node->n_signers - 1;
+    uint64_t per_client = 0, last_extra = 0;
+    if (!compute_l_stock_poison_per_client(l_stock_amount_sats, fee_sats,
+                                            n_clients, &per_client, &last_extra))
+        return 0;
+
+    /* Per-client key-path P2TR(client) outputs — same redistribution as the
+       key-path poison; each client sweeps (and can CPFP-bump) its own output. */
+    tx_output_t *outputs = (tx_output_t *)calloc(n_clients, sizeof(tx_output_t));
+    if (!outputs) return 0;
+    for (size_t i = 0; i < n_clients; i++) {
+        uint32_t signer_idx = leaf_node->signer_indices[1 + i];  /* skip LSP[0] */
+        if (signer_idx >= f->n_participants) { free(outputs); return 0; }
+        secp256k1_xonly_pubkey client_xonly, tw;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &client_xonly, NULL,
+                                                  &f->pubkeys[signer_idx]) ||
+            !taproot_tweak_pubkey(f->ctx, &tw, NULL, &client_xonly, NULL)) {
+            free(outputs); return 0;
+        }
+        build_p2tr_script_pubkey(outputs[i].script_pubkey, &tw);
+        outputs[i].script_pubkey_len = 34;
+        outputs[i].amount_sats = per_client;
+    }
+    outputs[n_clients - 1].amount_sats += last_extra;
+
+    /* Unsigned TX: single input from the L-stock outpoint, nSequence 0xFFFFFFFE
+       (the CSV gate lives on Leaf L, not this spend). */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char disp_txid[32];
+    if (!build_unsigned_tx(&unsigned_tx, poison_txid_out32 ? disp_txid : NULL,
+                            l_stock_txid32, l_stock_vout, 0xFFFFFFFEu,
+                            outputs, n_clients)) {
+        tx_buf_free(&unsigned_tx); free(outputs); return 0;
+    }
+    free(outputs);
+    if (poison_txid_out32) {
+        memcpy(poison_txid_out32, disp_txid, 32);
+        reverse_bytes(poison_txid_out32, 32);
+    }
+
+    /* Rebuild the 2-leaf taptree (must be 2-leaf since has_l_stock_hash). */
+    secp256k1_xonly_pubkey internal_key = leaf_node->keyagg.agg_pubkey;
+    tapscript_leaf_t leaf_P, leaf_L;
+    unsigned char merkle_root[32];
+    int two = 0;
+    if (!build_l_stock_taptree(f, leaf_node, &leaf_P, &leaf_L, merkle_root, &two)
+        || !two) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* Prevout SPK the sighash commits to. */
+    unsigned char l_stock_spk[34];
+    if (!build_l_stock_spk(f, leaf_node, l_stock_spk)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* BIP-341 script-path sighash over Leaf P. */
+    unsigned char sighash[32];
+    if (!compute_tapscript_sighash(sighash, unsigned_tx.data, unsigned_tx.len, 0,
+                                    l_stock_spk, 34, l_stock_amount_sats,
+                                    0xFFFFFFFEu, &leaf_P)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* N-of-N MuSig over the UNtweaked agg key (Leaf-P checksig verifies the raw
+       agg key, not the taproot output key) — musig_sign_all_local applies no tweak. */
+    secp256k1_keypair *kps = (secp256k1_keypair *)calloc(leaf_node->n_signers,
+                                                          sizeof(secp256k1_keypair));
+    if (!kps) { tx_buf_free(&unsigned_tx); return 0; }
+    for (size_t i = 0; i < leaf_node->n_signers; i++) {
+        uint32_t idx = leaf_node->signer_indices[i];
+        if (idx >= f->n_participants) { free(kps); tx_buf_free(&unsigned_tx); return 0; }
+        kps[i] = f->keypairs[idx];
+    }
+    unsigned char sig64[64];
+    if (!musig_sign_all_local(f->ctx, sig64, sighash, kps,
+                               leaf_node->n_signers, &leaf_node->keyagg)) {
+        free(kps); tx_buf_free(&unsigned_tx); return 0;
+    }
+    free(kps);
+
+    /* Control block for the Leaf-P script path (sibling = Leaf L, parity from tweak). */
+    int parity = 0;
+    secp256k1_xonly_pubkey tweaked;
+    if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity, &internal_key, merkle_root)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+    unsigned char control_block[65];
+    size_t cb_len = 0;
+    if (!tapscript_build_control_block_2leaf(control_block, &cb_len, parity,
+                                              &internal_key, &leaf_L, f->ctx)) {
+        tx_buf_free(&unsigned_tx); return 0;
+    }
+
+    /* Witness: [sig, preimage=secret, Leaf-P script, control block]. */
+    int ok = finalize_script_path_tx_preimage(signed_out,
+                                              unsigned_tx.data, unsigned_tx.len,
+                                              sig64, secret32, 32,
+                                              leaf_P.script, leaf_P.script_len,
+                                              control_block, cb_len);
+    tx_buf_free(&unsigned_tx);
     return ok;
 }
 

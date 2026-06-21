@@ -447,6 +447,18 @@ int tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
     return 1;
 }
 
+/* #53: L-stock poison "Leaf P" — hashlock(state_hash) + N-of-N agg checksig.
+   Byte-identical to the offered-HTLC success leaf; a thin named wrapper keeps the
+   L-stock poison construction self-documenting and routed through one audited
+   script builder. */
+int tapscript_build_l_stock_poison_leaf(tapscript_leaf_t *leaf,
+    const unsigned char *state_hash32,
+    const secp256k1_xonly_pubkey *agg_xonly,
+    const secp256k1_context *ctx)
+{
+    return tapscript_build_htlc_offered_success(leaf, state_hash32, agg_xonly, ctx);
+}
+
 int tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
     uint32_t cltv_expiry, uint32_t to_self_delay,
     const secp256k1_xonly_pubkey *local_htlcpubkey,

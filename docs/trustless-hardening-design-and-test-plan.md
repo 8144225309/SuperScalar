@@ -115,6 +115,35 @@ orphan-verification lesson).
 **regtest = primary** (rows 1-7 + INV-*; only regtest gives controllable fee/deadline). **signet =
 re-validate rows 1a + 7** (real fee market) with the 2-stage confirm budget + sat discipline.
 
+## 5b. #59 Reveal state machine (PINNED — the commit point that closes residual Scenario A)
+The advance leaf state s→s+1 is a **two-phase commit** whose commit point is the secret reveal:
+- **Phase 1 (recourse first):** exchange + per-partial-verify ALL psigs for BOTH (a) the new leaf tx s+1 AND
+  (b) poison_s over Leaf-P(H_s). UNIVERSAL ALL_PSIGS (no sole completer). Nothing observable changes yet.
+- **Phase 2 (commit = reveal):** LSP reveals secret_s; client checks `SHA256(secret_s)==H_s` (H_s baked into
+  state s's L-stock SPK), **fail-closed** (mismatch ⇒ ABORT, stay on s). Only on success does the client
+  advance its **live-state pointer** s→s+1.
+**The load-bearing invariant:** the client's live pointer advances **iff** it has durably persisted
+`(poison_s co-sig ∧ verified secret_s)`. Persist order = (1) write recourse-for-s, fsync, (2) then bump live
+pointer. Crash between ⇒ on restart live is still s, recourse-for-s present, re-drive Phase 2 idempotently.
+**Why no residual A:** during the Phase-1→reveal window the mutually-live state is STILL s, so the LSP
+broadcasting s is *honest* (not theft); broadcasting any r<s is covered by the already-held
+poison_r+secret_r. The LSP only gives away secret_s (its own punishment key) last, which can only hurt the
+LSP. So "committed-without-recourse" is unreachable: recourse (Phase 1) strictly precedes commit (Phase 2),
+and commit is exactly the moment the client gains the secret. Mirrors Poon-Dryja `revoke_and_ack` ordering
+and `channel_verify_revocation_secret` (channel.c:597). #46 makes Phase-1 ALL_PSIGS mandatory + deletes the
+"advance anyway" degradation so Phase 2 is never reachable without full recourse.
+
+## 5c. #53-A implementation map (the crypto core — purely additive until #53-B sets the hash)
+- `build_l_stock_spk` + the key-path signer both route through ONE `build_l_stock_taptree(f,node,&P,&L,root,&two)`
+  helper (no SPK/tweak drift). Tree = {Leaf P, Leaf L} iff `node->has_l_stock_hash`, else legacy {Leaf L}.
+- Leaf P = `tapscript_build_l_stock_poison_leaf` = the audited offered-HTLC-success bytes
+  (`OP_SIZE 0x20 OP_EQUALVERIFY OP_SHA256 <H_s> OP_EQUALVERIFY <agg_xonly> OP_CHECKSIG`).
+- Poison signs the **UNtweaked** agg key (`musig_sign_all_local`) over the **Leaf-P script-path** sighash
+  (`compute_tapscript_sighash`); witness = `[sig, secret, Leaf-P script, 2-leaf control block]`
+  (`finalize_script_path_tx_preimage`). nVersion=2 — bumpable via the client-owned poison outputs (no P2A
+  needed; #60 satisfied by output structure). REPLACES the key-path poison: `factory_sign_l_stock_poison_tx`
+  (key-path) refuses once `has_l_stock_hash` (so the B-vulnerable key-path sig is never produced; #53-B).
+
 ## 6. Sequencing (decided)
 1. **#53 revocation poison** (closes A+B at the root; unblocks rows 3/4 + INV-1/2/3) — wire up the bypassed infra.
 2. **#46 atomic 2-phase + delete degradation** (depends on #53's recourse-secret being the Phase-2 object).

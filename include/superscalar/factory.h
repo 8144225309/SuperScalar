@@ -179,6 +179,16 @@ typedef struct {
        can be keyed on the poison (G1 #44) without a txid-from-bytes helper. */
     unsigned char poison_txid[32];
 
+    /* #53 hashlock-gated poison: per-(leaf,state) revocation hash H_s = SHA256(secret_s)
+       committed into THIS leaf state's L-stock output (Leaf P of the taptree).  When
+       has_l_stock_hash==1 the L-stock SPK is the 2-leaf {poison, LSP-CSV} tree and the
+       poison must be spent via the Leaf-P script-path with the revealed secret_s as the
+       witness preimage — so a non-revoked (live) state's poison has no satisfying witness
+       (closes Scenario B).  Set during leaf-state construction when flat secrets are
+       active; the secret_s itself stays LSP-private until revealed on advance. */
+    unsigned char l_stock_hash[32];
+    int has_l_stock_hash;
+
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
     int ps_chain_len;            /* number of state advances (0 = initial state) */
@@ -448,6 +458,27 @@ int factory_sign_l_stock_poison_tx(
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
     tx_buf_t *signed_out);
+
+/* #53: hashlock-gated L-stock poison over the Leaf-P SCRIPT-path (replaces the
+   key-path poison, which is vulnerable to Scenario B).  Builds the per-client
+   redistribution outputs, N-of-N MuSig-signs the UNtweaked agg key over the
+   Leaf-P script-path sighash, and finalizes a complete consensus-valid witness
+   tx using `secret32` (= the revealed revocation secret) as the hashlock preimage.
+   Requires leaf_node->has_l_stock_hash; fails fast unless SHA256(secret32) equals
+   the leaf's committed l_stock_hash.  Single-process (needs f->keypairs[] for every
+   leaf signer); the multi-process wire ceremony co-signs the same Leaf-P sighash
+   and supplies the preimage at broadcast (#53-B).  `poison_txid_out32` (optional,
+   internal byte order) receives the poison txid. */
+int factory_build_l_stock_poison_scriptpath(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    const unsigned char *secret32,
+    tx_buf_t *signed_out,
+    unsigned char *poison_txid_out32);
 
 /* Cooperative N-of-N spend of an L-stock UTXO to a caller-specified
    output distribution.  The poison TX is a special case of this where

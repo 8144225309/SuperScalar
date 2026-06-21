@@ -128,6 +128,16 @@ int tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
     const secp256k1_xonly_pubkey *remote_htlcpubkey,
     const secp256k1_context *ctx);
 
+/* L-stock poison "Leaf P" (#53): hashlock(state_hash) + N-of-N agg checksig.
+   Identical bytes to the offered-HTLC success leaf; named for the L-stock context.
+   Spendable only with the revealed revocation secret (preimage) AND the N-of-N
+   poison signature, so a non-revoked (live) state's poison has no satisfying
+   witness (closes Scenario B). */
+int tapscript_build_l_stock_poison_leaf(tapscript_leaf_t *leaf,
+    const unsigned char *state_hash32,
+    const secp256k1_xonly_pubkey *agg_xonly,
+    const secp256k1_context *ctx);
+
 /* Build control block for script-path spend of a 2-leaf tree.
    out must be >= 65 bytes. Result: [leaf_version|parity] || internal_key(32) || sibling_hash(32) */
 int tapscript_build_control_block_2leaf(
