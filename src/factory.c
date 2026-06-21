@@ -243,9 +243,14 @@ static int add_node(
    When the node carries no per-state hash the tree is the legacy single leaf {Leaf L}
    (byte-identical to the pre-#53 SPK), so this change is a no-op until a state's hash
    is wired (#53-B).  `leaf_P_out` may be NULL only when the caller knows the node has
-   no hash; `*is_2leaf_out` (optional) reports which tree was built. */
+   no hash; `*is_2leaf_out` (optional) reports which tree was built.
+   `override_hash32` (optional): build Leaf P with this hash instead of the node's
+   current l_stock_hash — used by the poison builder to target a SUPERSEDED state's
+   output (whose SPK committed H_old) after the leaf has already advanced to H_new
+   (#53-B3b).  NULL = use the node's current hash. */
 static int build_l_stock_taptree(const factory_t *f,
                                   const factory_node_t *leaf_node,
+                                  const unsigned char *override_hash32,
                                   tapscript_leaf_t *leaf_P_out,
                                   tapscript_leaf_t *leaf_L_out,
                                   unsigned char *merkle_root_out32,
@@ -263,10 +268,12 @@ static int build_l_stock_taptree(const factory_t *f,
     if (!tapscript_build_csv_delay(leaf_L_out, csv, &lsp_xonly, f->ctx))
         return 0;
 
-    int two = leaf_node->has_l_stock_hash ? 1 : 0;
+    const unsigned char *h = override_hash32 ? override_hash32
+                                             : leaf_node->l_stock_hash;
+    int two = (override_hash32 != NULL) || leaf_node->has_l_stock_hash;
     if (two) {
         if (!leaf_P_out) return 0;
-        if (!tapscript_build_l_stock_poison_leaf(leaf_P_out, leaf_node->l_stock_hash,
+        if (!tapscript_build_l_stock_poison_leaf(leaf_P_out, h,
                                                   &leaf_node->keyagg.agg_pubkey, f->ctx))
             return 0;
         tapscript_leaf_t leaves[2] = { *leaf_P_out, *leaf_L_out };
@@ -289,7 +296,7 @@ int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
 
     tapscript_leaf_t leaf_P, leaf_L;
     unsigned char merkle_root[32];
-    if (!build_l_stock_taptree(f, leaf_node, &leaf_P, &leaf_L, merkle_root, NULL))
+    if (!build_l_stock_taptree(f, leaf_node, NULL, &leaf_P, &leaf_L, merkle_root, NULL))
         return 0;
 
     secp256k1_xonly_pubkey tweaked;
@@ -3086,12 +3093,14 @@ void factory_session_reset_poison(factory_t *f, size_t node_idx) {
     memset(node->poison_agg_sig, 0, sizeof(node->poison_agg_sig));
     node->poison_leaf_script_len = 0;
     node->poison_control_block_len = 0;
+    memset(node->poison_l_stock_hash, 0, sizeof(node->poison_l_stock_hash));
 }
 
 int factory_session_prepare_poison_tx_subfactory(
     factory_t *f, size_t sub_node_idx,
     const unsigned char *old_chain_txid32, uint32_t old_sstock_vout,
-    uint64_t old_sstock_amount_sats, uint64_t fee_sats)
+    uint64_t old_sstock_amount_sats, uint64_t fee_sats,
+    const unsigned char *override_hash32)
 {
     if (!f || sub_node_idx >= f->n_nodes || !old_chain_txid32) return 0;
     factory_node_t *sub = &f->nodes[sub_node_idx];
@@ -3102,12 +3111,15 @@ int factory_session_prepare_poison_tx_subfactory(
        what the wire ceremony rounds do. */
     factory_session_reset_poison(f, sub_node_idx);
     tx_buf_init(&sub->poison_unsigned_tx, 256);
-    if (sub->has_l_stock_hash) {
-        /* #53-B3a: hashlock poison — sign the Leaf-P script path (untweaked). */
+    if (override_hash32 || sub->has_l_stock_hash) {
+        /* #53-B3a/b: hashlock poison — Leaf-P script path (untweaked), targeting the
+           superseded state's H_old (override) or the node's current hash. */
         sub->poison_is_scriptpath = 1;
+        memcpy(sub->poison_l_stock_hash,
+               override_hash32 ? override_hash32 : sub->l_stock_hash, 32);
         if (!factory_build_l_stock_poison_scriptpath_unsigned(
                 f, sub, old_chain_txid32, old_sstock_vout,
-                old_sstock_amount_sats, fee_sats,
+                old_sstock_amount_sats, fee_sats, override_hash32,
                 &sub->poison_unsigned_tx, sub->poison_sighash, sub->poison_txid,
                 sub->poison_leaf_script, &sub->poison_leaf_script_len,
                 sub->poison_control_block, &sub->poison_control_block_len)) {
@@ -3127,19 +3139,23 @@ int factory_session_prepare_poison_tx_subfactory(
 int factory_session_prepare_poison_tx_leaf(
     factory_t *f, size_t leaf_node_idx,
     const unsigned char *old_leaf_txid32, uint32_t old_l_stock_vout,
-    uint64_t old_l_stock_amount_sats, uint64_t fee_sats)
+    uint64_t old_l_stock_amount_sats, uint64_t fee_sats,
+    const unsigned char *override_hash32)
 {
     if (!f || leaf_node_idx >= f->n_nodes || !old_leaf_txid32) return 0;
     factory_node_t *leaf = &f->nodes[leaf_node_idx];
 
     factory_session_reset_poison(f, leaf_node_idx);
     tx_buf_init(&leaf->poison_unsigned_tx, 256);
-    if (leaf->has_l_stock_hash) {
-        /* #53-B3a: hashlock poison — sign the Leaf-P script path (untweaked). */
+    if (override_hash32 || leaf->has_l_stock_hash) {
+        /* #53-B3a/b: hashlock poison — Leaf-P script path (untweaked), targeting the
+           superseded state's H_old (override) or the node's current hash. */
         leaf->poison_is_scriptpath = 1;
+        memcpy(leaf->poison_l_stock_hash,
+               override_hash32 ? override_hash32 : leaf->l_stock_hash, 32);
         if (!factory_build_l_stock_poison_scriptpath_unsigned(
                 f, leaf, old_leaf_txid32, old_l_stock_vout,
-                old_l_stock_amount_sats, fee_sats,
+                old_l_stock_amount_sats, fee_sats, override_hash32,
                 &leaf->poison_unsigned_tx, leaf->poison_sighash, leaf->poison_txid,
                 leaf->poison_leaf_script, &leaf->poison_leaf_script_len,
                 leaf->poison_control_block, &leaf->poison_control_block_len)) {
@@ -3284,11 +3300,12 @@ int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
     if (!node->poison_is_scriptpath || !node->poison_has_agg_sig) return 0;
     if (node->poison_unsigned_tx.len == 0) return 0;
 
-    /* Defense-in-depth: the revealed secret must be the committed hash's preimage,
-       else the assembled witness can't satisfy Leaf P (avoid emitting a dead tx). */
+    /* Defense-in-depth: the revealed secret must be the preimage of the hash THIS
+       poison targets (poison_l_stock_hash = the superseded state's H_old), NOT the
+       node's current l_stock_hash, which may already have advanced. */
     unsigned char chk[32];
     sha256(secret32, 32, chk);
-    if (memcmp(chk, node->l_stock_hash, 32) != 0) return 0;
+    if (memcmp(chk, node->poison_l_stock_hash, 32) != 0) return 0;
 
     /* Witness: [agg sig, preimage=secret, Leaf-P script, 2-leaf control block]. */
     return finalize_script_path_tx_preimage(out,
@@ -3583,7 +3600,7 @@ static int sign_l_stock_spend_with_outputs(
        shared builder so the key-path taptweak always matches the SPK (#53). */
     tapscript_leaf_t coop_leaf_P, coop_leaf_L;
     unsigned char merkle_root[32];
-    if (!build_l_stock_taptree(f, leaf_node, &coop_leaf_P, &coop_leaf_L,
+    if (!build_l_stock_taptree(f, leaf_node, NULL, &coop_leaf_P, &coop_leaf_L,
                                merkle_root, NULL)) {
         free(kps); tx_buf_free(&unsigned_tx); return 0;
     }
@@ -3659,6 +3676,7 @@ int factory_build_l_stock_poison_scriptpath_unsigned(
     uint32_t l_stock_vout,
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
+    const unsigned char *override_hash32,
     tx_buf_t *unsigned_tx_out,
     unsigned char *sighash_out32,
     unsigned char *poison_txid_out32,
@@ -3669,8 +3687,9 @@ int factory_build_l_stock_poison_scriptpath_unsigned(
 {
     if (!f || !leaf_node || !l_stock_txid32 || !unsigned_tx_out || !sighash_out32)
         return 0;
-    /* No hashlock poison without the per-state hash committed in the SPK. */
-    if (!leaf_node->has_l_stock_hash) return 0;
+    /* No hashlock poison without a committed per-state hash (the node's current
+       hash, or an explicit override for a superseded state's output). */
+    if (!override_hash32 && !leaf_node->has_l_stock_hash) return 0;
     if (leaf_node->n_signers < 2) return 0;
 
     size_t n_clients = leaf_node->n_signers - 1;
@@ -3713,17 +3732,26 @@ int factory_build_l_stock_poison_scriptpath_unsigned(
         reverse_bytes(poison_txid_out32, 32);
     }
 
-    /* Rebuild the 2-leaf taptree (must be 2-leaf since has_l_stock_hash). */
+    /* Build the 2-leaf taptree for the TARGET output's hash (override_hash32 when
+       spending a superseded state's output, else the node's current hash). */
     secp256k1_xonly_pubkey internal_key = leaf_node->keyagg.agg_pubkey;
     tapscript_leaf_t leaf_P, leaf_L;
     unsigned char merkle_root[32];
     int two = 0;
-    if (!build_l_stock_taptree(f, leaf_node, &leaf_P, &leaf_L, merkle_root, &two) || !two)
+    if (!build_l_stock_taptree(f, leaf_node, override_hash32, &leaf_P, &leaf_L,
+                               merkle_root, &two) || !two)
         return 0;
 
-    /* Prevout SPK the sighash commits to. */
+    /* Tweak once from THIS taptree's root: the prevout SPK the sighash commits to
+       AND the control block the witness reconstructs must both come from the target
+       output's hash — NOT build_l_stock_spk, which uses the node's (possibly already
+       advanced) current hash. */
+    int parity = 0;
+    secp256k1_xonly_pubkey tweaked;
+    if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity, &internal_key, merkle_root))
+        return 0;
     unsigned char l_stock_spk[34];
-    if (!build_l_stock_spk(f, leaf_node, l_stock_spk)) return 0;
+    build_p2tr_script_pubkey(l_stock_spk, &tweaked);
 
     /* BIP-341 script-path sighash over Leaf P. */
     if (!compute_tapscript_sighash(sighash_out32, unsigned_tx_out->data,
@@ -3731,17 +3759,13 @@ int factory_build_l_stock_poison_scriptpath_unsigned(
                                     l_stock_amount_sats, 0xFFFFFFFEu, &leaf_P))
         return 0;
 
-    /* Leaf-P script + 2-leaf control block (sibling = Leaf L, parity from tweak) —
-       the witness components a holder later combines with [agg sig, revealed secret]. */
+    /* Leaf-P script + 2-leaf control block (sibling = Leaf L) — the witness
+       components a holder later combines with [agg sig, revealed secret]. */
     if (leaf_p_script_out && leaf_p_script_len_out) {
         memcpy(leaf_p_script_out, leaf_P.script, leaf_P.script_len);
         *leaf_p_script_len_out = leaf_P.script_len;
     }
     if (control_block_out && control_block_len_out) {
-        int parity = 0;
-        secp256k1_xonly_pubkey tweaked;
-        if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity, &internal_key, merkle_root))
-            return 0;
         size_t cb_len = 0;
         if (!tapscript_build_control_block_2leaf(control_block_out, &cb_len, parity,
                                                   &internal_key, &leaf_L, f->ctx))
@@ -3779,7 +3803,7 @@ int factory_build_l_stock_poison_scriptpath(
     unsigned char cb[65]; size_t cb_len = 0;
     if (!factory_build_l_stock_poison_scriptpath_unsigned(
             f, leaf_node, l_stock_txid32, l_stock_vout, l_stock_amount_sats,
-            fee_sats, &utx, sighash, poison_txid_out32,
+            fee_sats, NULL, &utx, sighash, poison_txid_out32,
             lp_script, &lp_len, cb, &cb_len)) {
         tx_buf_free(&utx); return 0;
     }

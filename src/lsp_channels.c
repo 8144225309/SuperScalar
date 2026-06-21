@@ -1441,7 +1441,12 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (factory_session_prepare_poison_tx_leaf(
                 f, pre_node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs - 1),
-                old_l_amount, LEAF_POISON_FEE_SATS)) {
+                old_l_amount, LEAF_POISON_FEE_SATS,
+                /* #53-B3b: NULL while the daemon doesn't enable hashlock poison
+                   (has_l_stock_hash==0 -> key-path branch). When it does, this path
+                   advances BEFORE prepare, so capture H_old before
+                   factory_advance_leaf_unsigned and pass it here. */
+                NULL)) {
             leaf_poison_prepared = 1;
         }
     }
@@ -2101,7 +2106,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 (uint64_t)(an->n_signers - 1) * 330u) {
             if (factory_session_prepare_poison_tx_leaf(
                     f, affected[k], poison_old_txid[k], (uint32_t)(old_no - 1),
-                    poison_old_l_amount[k], TIERB_POISON_FEE_SATS)) {
+                    poison_old_l_amount[k], TIERB_POISON_FEE_SATS,
+                    NULL /* #53-B3b: capture per-node H_old when daemon hashlock on */)) {
                 poison_prepared[k] = 1;  /* init_node_poison after state init */
             }
         }
@@ -2883,7 +2889,10 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (factory_session_prepare_poison_tx_leaf(
                 f, node_idx,
                 realloc_old_leaf_txid, (uint32_t)(realloc_old_n_outputs - 1),
-                realloc_old_l_amount, REALLOC_POISON_FEE_SATS)) {
+                realloc_old_l_amount, REALLOC_POISON_FEE_SATS,
+                /* #53-B3b: this path prepares BEFORE the advance, so the node's
+                   current hash IS H_old — NULL is already correct here. */
+                NULL)) {
             realloc_poison_prepared = 1;
         }
     }
@@ -3437,7 +3446,8 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
         if (factory_session_prepare_poison_tx_subfactory(
                 f, sub_node_i, wt_old_chain_txid, (uint32_t)wt_old_n_chans,
-                wt_old_sstock_amount, POISON_FEE_SATS)) {
+                wt_old_sstock_amount, POISON_FEE_SATS,
+                NULL /* #53-B3b: capture sub H_old when daemon hashlock on */)) {
             poison_prepared = 1;
         } else {
             fprintf(stderr, "LSP-stateless subfactory MULTI: poison TX prep "
@@ -4101,7 +4111,8 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
         if (factory_session_prepare_poison_tx_subfactory(
                 f, sub_node_i, wt_old_chain_txid, (uint32_t)wt_old_n_chans,
-                wt_old_sstock_amount, POISON_FEE_SATS)) {
+                wt_old_sstock_amount, POISON_FEE_SATS,
+                NULL /* #53-B3b: capture sub H_old when daemon hashlock on */)) {
             poison_prepared = 1;  /* init_node_poison after state init */
         } else {
             fprintf(stderr,

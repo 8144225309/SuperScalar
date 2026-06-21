@@ -208,6 +208,10 @@ typedef struct {
     size_t poison_leaf_script_len;
     unsigned char poison_control_block[65];
     size_t poison_control_block_len;
+    /* The Leaf-P hash THIS poison was built to spend (the superseded state's H_old,
+       or the node's current hash when poisoning the live output).  assemble verifies
+       the revealed secret against THIS, not l_stock_hash, which may have advanced. */
+    unsigned char poison_l_stock_hash[32];
 
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
@@ -550,6 +554,8 @@ int factory_build_l_stock_poison_scriptpath_unsigned(
     uint32_t l_stock_vout,
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
+    const unsigned char *override_hash32,  /* NULL = node's current hash; else the
+                                              superseded state's H_old (#53-B3b) */
     tx_buf_t *unsigned_tx_out,
     unsigned char *sighash_out32,
     unsigned char *poison_txid_out32,
@@ -804,7 +810,8 @@ int factory_node_uses_multi_input(const factory_t *f, size_t node_idx);
 int factory_session_prepare_poison_tx_subfactory(
     factory_t *f, size_t sub_node_idx,
     const unsigned char *old_chain_txid32, uint32_t old_sstock_vout,
-    uint64_t old_sstock_amount_sats, uint64_t fee_sats);
+    uint64_t old_sstock_amount_sats, uint64_t fee_sats,
+    const unsigned char *override_hash32);  /* #53-B3b: superseded state's H_old; NULL = node's current */
 
 /* Same as the subfactory variant but for a DW / PS LEAF node — used by
    the lsp_advance_leaf wire ceremony to bundle a poison TX over the
@@ -812,7 +819,8 @@ int factory_session_prepare_poison_tx_subfactory(
 int factory_session_prepare_poison_tx_leaf(
     factory_t *f, size_t leaf_node_idx,
     const unsigned char *old_leaf_txid32, uint32_t old_l_stock_vout,
-    uint64_t old_l_stock_amount_sats, uint64_t fee_sats);
+    uint64_t old_l_stock_amount_sats, uint64_t fee_sats,
+    const unsigned char *override_hash32);  /* #53-B3b: superseded state's H_old; NULL = node's current */
 int factory_session_init_node_poison(factory_t *f, size_t node_idx);
 int factory_session_set_nonce_poison(factory_t *f, size_t node_idx,
                                        size_t signer_slot,
