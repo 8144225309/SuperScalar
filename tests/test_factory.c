@@ -5957,7 +5957,7 @@ int test_factory_lstock_client_mirror(void) {
     TEST_ASSERT(cli, "alloc cli");
     TEST_ASSERT(setup_variable_arity_factory(cli, ctx, kc, 3, arities, 1, 5000000),
                 "setup cli");
-    for (size_t li = 0; li < lsp->n_leaf_nodes; li++) {
+    for (size_t li = 0; li < (size_t)lsp->n_leaf_nodes; li++) {
         size_t idx = lsp->leaf_node_indices[li];
         TEST_ASSERT(lsp->nodes[idx].has_l_stock_hash, "lsp leaf has derived hash");
         factory_set_node_l_stock_hash(cli, idx, lsp->nodes[idx].l_stock_hash);
@@ -5967,7 +5967,7 @@ int test_factory_lstock_client_mirror(void) {
     TEST_ASSERT(cli->n_leaf_nodes == lsp->n_leaf_nodes, "same topology");
 
     /* Each leaf: client reproduced the hash AND the 2-leaf L-stock SPK. */
-    for (size_t li = 0; li < lsp->n_leaf_nodes; li++) {
+    for (size_t li = 0; li < (size_t)lsp->n_leaf_nodes; li++) {
         factory_node_t *ln = &lsp->nodes[lsp->leaf_node_indices[li]];
         factory_node_t *cn = &cli->nodes[cli->leaf_node_indices[li]];
         TEST_ASSERT(cn->has_l_stock_hash, "client leaf carries the hashlock");
