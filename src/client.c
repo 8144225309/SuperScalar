@@ -3948,6 +3948,24 @@ static int client_handle_leaf_advance_stateless(int fd,
     }
     cJSON_Delete(fin_json);
 
+    /* #59 Phase 1: FINAL is sent — the advance is committed and the old state is
+       superseded.  Persist the poison TEMPLATE now (revocation_secret stays NULL),
+       BEFORE we await DONE + the reveal that may never arrive (LSP crash / dropped
+       link).  Without this, a never-revealed advance leaves NO row, so a restart
+       cannot even detect the missing secret to re-request it (residual no-poison
+       window).  Saved AFTER the commit so an aborted advance never persists a
+       spurious poison.  Idempotent (INSERT OR REPLACE) with the reveal-time save. */
+    if (persist && ps_node->poison_is_scriptpath && ps_node->poison_has_agg_sig) {
+        uint32_t superseded_state = (ps_node->l_stock_state_counter > 0)
+                                    ? ps_node->l_stock_state_counter - 1u : 0u;
+        persist_save_l_stock_poison(persist, /* factory_id */ 0,
+            (uint32_t)node_idx, superseded_state, ps_node->poison_l_stock_hash,
+            ps_node->poison_agg_sig,
+            ps_node->poison_unsigned_tx.data, ps_node->poison_unsigned_tx.len,
+            ps_node->poison_leaf_script, ps_node->poison_leaf_script_len,
+            ps_node->poison_control_block, ps_node->poison_control_block_len);
+    }
+
     /* Step 9: wait for LEAF_ADVANCE_DONE (LSP's broadcast). */
     wire_msg_t done_msg;
     if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_LEAF_ADVANCE_DONE) {
