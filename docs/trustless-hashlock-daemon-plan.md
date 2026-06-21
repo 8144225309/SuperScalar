@@ -113,6 +113,43 @@ revealed secrets); the secret-less third-party WT remains the recourse for the
 non-hashlock paths (factory/sub-factory/commitment penalties).  Feeding revealed secrets
 to a delegated WT is the explicit follow-on under #62 — NOT folded into this PR.
 
+## STATUS — Phases 1-4 COMPLETE + PROVEN (2026-06-21)
+- Phase 1 (advance H plumbing), Phase 2 (reveal-on-advance), Phase 3 (daemon
+  `--enable-hashlock-poison`): committed; FULL BUILD + 1507/1507 unit + regtest
+  advance spot-checks green (inert with the flag off).
+- Phase 4a (`factory_assemble_poison_from_template` + DRY): regtest ceremony test
+  proves from_template == with_secret byte-for-byte AND `testmempoolaccept`
+  ACCEPTS; wrong-secret refused.
+- Phase 4b (`superscalar_lstock_recover`): builds; usage + anti-vacuity smokes.
+- Phase 4c (daemon e2e, `test_regtest_hashlock_poison_e2e.sh`): **GREEN on
+  regtest** — LSP `--enable-hashlock-poison --cheat-daemon-leaf` advances a PS
+  leaf over the live wire, client[0] PERSISTS the reveal (node=5 state=0), the
+  recourse tool assembles the poison from the persisted template+secret, it
+  CONFIRMS on-chain (txid ae6a4f62…, 11150 sats L-stock recaptured), and the
+  no-reveal control REFUSES (exit 5).  First live exercise of the reveal wire +
+  the assemble-from-persist recourse; no prevout/wire bug.
+
+## Phase 5 — B4 degrade->hard-abort — DONE + REVIEWED (2026-06-21)
+A degraded advance that revokes the old state WITHOUT co-signing the Leaf-P poison
+re-opens Scenario A/B.  Implemented as a single fail-closed guard per side, placed
+at the commit point, that subsumes every degrade-and-continue site:
+- client.c (security-critical): before shipping FINAL (the revocation commit),
+  refuse if `has_l_stock_hash && poison_required_c && !leaf_poison_prepared_c`.
+- lsp_channels.c: symmetric honest-LSP guard after poison verify/finalize, before
+  register/persist/DONE; also clears node->is_signed + signed_tx on abort.
+Self-review refinement (commit 914f9fc): gate on `poison_required` (old state has a
+protectable, non-dust L-stock) so the guard never false-aborts when no poison was
+ever needed (dust / no old state); still fail-closed on no-watchtower / cheat.
+Test hook `SS_CHEAT_OMIT_POISON` + `test_regtest_hashlock_poison_abort.sh` prove
+the client actually refuses (no reveal persisted, advance does not complete).
+
+## VALIDATION — full 5-gate run GREEN on 914f9fc (2026-06-21)
+FULL BUILD OK; 1507/1507 unit; legacy regtest advances 1/1 (flag off unchanged);
+4c happy-path e2e PASS (poison confirmed, 11150 sats recaptured, no-reveal exit 5);
+degradation-abort PASS (client refused, 0 reveals persisted).  Phases 1-5 done.
+Follow-ons (separate PRs): Tier-B rollover, sub-factory (blocked on multi-input
+keyagg bug), #59 reveal crash matrix, #62 delegated-WT secret feeding.
+
 ## #59 (crash-consistency) — tracked separately
 The reveal is the last LSP→client step; a crash between new-state-signed and secret-persisted is the residual
 window. Phase 2 persists the secret in-handler before returning success (verify-before-accept). The full
