@@ -17,6 +17,7 @@
 #include "superscalar/peer_mgr.h"
 #include "superscalar/wire.h"
 #include "superscalar/regtest.h"
+#include "superscalar/sha256.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -27,6 +28,59 @@ extern secp256k1_pubkey g_client_nk_server_pubkey;
 extern int g_client_nk_server_pubkey_set;
 #define g_nk_server_pubkey     g_client_nk_server_pubkey
 #define g_nk_server_pubkey_set g_client_nk_server_pubkey_set
+
+/* #59 Phase 2c: after reconnect, recover any L-stock poison secrets that were
+   never received because of a crash in the reveal window.  Scan the persisted
+   template-only rows (revocation_secret IS NULL), re-request them from the LSP
+   (which re-derives from its seed), verify SHA256(secret)==committed hash
+   (fail-closed — a malicious LSP cannot inject a bogus secret), and persist.
+   Best-effort + synchronous in the quiescent post-RECONNECT_ACK window: a failure
+   leaves the row pending for the next reconnect, with the DW/CLTV override as the
+   interim backstop.  No-op (no round trip) when nothing is pending. */
+static void client_recover_pending_lstock(secp256k1_context *ctx, int fd,
+                                          persist_t *db) {
+    (void)ctx;
+    if (!db) return;
+    uint32_t pn[128], ps[128]; size_t pcnt = 0;
+    if (!persist_load_pending_l_stock_poison(db, 0, pn, ps, 128, &pcnt) || pcnt == 0)
+        return;
+    cJSON *req = wire_build_lstock_reveal_request(pn, ps, pcnt);
+    if (!req) return;
+    int sent = wire_send(fd, MSG_LSTOCK_REVEAL_REQUEST, req);
+    cJSON_Delete(req);
+    if (!sent) return;
+    wire_msg_t rev;
+    if (!wire_recv(fd, &rev) || rev.msg_type != MSG_LSTOCK_REVEAL) {
+        if (rev.json) cJSON_Delete(rev.json);
+        fprintf(stderr, "Client reconnect: L-stock recovery — no reveal reply "
+                "(%zu still pending; override remains the backstop)\n", pcnt);
+        return;
+    }
+    uint32_t rn[128], rs[128]; unsigned char rsec[128][32]; size_t rc = 0;
+    int recovered = 0;
+    if (wire_parse_lstock_reveal(rev.json, rn, rs, rsec, 128, &rc)) {
+        for (size_t i = 0; i < rc; i++) {
+            unsigned char want[32];
+            if (!persist_load_l_stock_poison(db, 0, rn[i], rs[i], want,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
+                continue;  /* no matching local row */
+            unsigned char chk[32]; sha256(rsec[i], 32, chk);
+            if (memcmp(chk, want, 32) != 0) {
+                fprintf(stderr, "Client reconnect: re-revealed secret for node %u "
+                        "state %u FAILED verify (SHA256 != committed) — rejecting\n",
+                        rn[i], rs[i]);
+                continue;
+            }
+            if (persist_update_l_stock_secret(db, 0, rn[i], rs[i], rsec[i]))
+                recovered++;
+        }
+        memset(rsec, 0, sizeof(rsec));
+    }
+    if (rev.json) cJSON_Delete(rev.json);
+    if (recovered > 0)
+        printf("Client reconnect: recovered %d L-stock poison secret(s) "
+               "(crash-in-reveal-window recovery)\n", recovered);
+}
 
 int client_run_reconnect(secp256k1_context *ctx,
                            const secp256k1_keypair *keypair,
@@ -387,6 +441,11 @@ int client_run_reconnect(secp256k1_context *ctx,
                my_index, ack_channel_id,
                (unsigned long long)ack_commit);
     }
+
+    /* #59 Phase 2c: now in the quiescent post-RECONNECT_ACK window (client drives,
+       LSP is back in its event loop) — recover any L-stock poison secrets a crash
+       lost in the reveal window before handing control to the channel callback. */
+    client_recover_pending_lstock(ctx, fd, db);
 
     /* 10. Call channel callback */
     int cb_ret = 0;

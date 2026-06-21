@@ -5076,6 +5076,45 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
+    case MSG_LSTOCK_REVEAL_REQUEST: {
+        /* #59 Phase 2c: a client recovering from a crash in the reveal window
+           re-requests the L-stock secrets it never received.  Re-derive each from
+           the seed and reply with MSG_LSTOCK_REVEAL.  SECURITY: only reveal states
+           STRICTLY BEFORE the node's current L-stock counter — a superseded state.
+           Never reveal the current/future state's secret, or the client could
+           poison a legitimate (non-revoked) state of the LSP. */
+        if (!lsp->factory.use_hashlock_poison) return 1;
+        uint32_t req_n[128], req_s[128]; size_t req_cnt = 0;
+        if (!wire_parse_lstock_reveal_request(msg->json, req_n, req_s, 128, &req_cnt))
+            return 0;
+        uint32_t out_n[128], out_s[128];
+        unsigned char out_sec[128][32];
+        size_t out_cnt = 0;
+        for (size_t i = 0; i < req_cnt && out_cnt < 128; i++) {
+            uint32_t nidx = req_n[i];
+            if (nidx >= lsp->factory.n_nodes) continue;
+            factory_node_t *nd = &lsp->factory.nodes[nidx];
+            if (req_s[i] >= nd->l_stock_state_counter) continue;  /* not superseded -> refuse */
+            if (factory_derive_l_stock_secret(&lsp->factory, nd, req_s[i],
+                                              out_sec[out_cnt])) {
+                out_n[out_cnt] = nidx;
+                out_s[out_cnt] = req_s[i];
+                out_cnt++;
+            }
+        }
+        if (out_cnt > 0) {
+            cJSON *rev = wire_build_lstock_reveal(out_n, out_s, out_sec, out_cnt);
+            if (rev) {
+                wire_send(lsp->client_fds[client_idx], MSG_LSTOCK_REVEAL, rev);
+                cJSON_Delete(rev);
+            }
+            memset(out_sec, 0, sizeof(out_sec));
+            printf("LSP: re-revealed %zu L-stock secret(s) to client %zu (crash recovery)\n",
+                   out_cnt, client_idx);
+        }
+        return 1;
+    }
+
     case MSG_REGISTER_INVOICE: {
         unsigned char payment_hash[32];
         unsigned char preimage[32];
