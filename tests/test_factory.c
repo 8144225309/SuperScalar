@@ -4,6 +4,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/regtest.h"
 #include "superscalar/persist.h"
+#include "superscalar/wire.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -5957,11 +5958,26 @@ int test_factory_lstock_client_mirror(void) {
     TEST_ASSERT(cli, "alloc cli");
     TEST_ASSERT(setup_variable_arity_factory(cli, ctx, kc, 3, arities, 1, 5000000),
                 "setup cli");
-    for (size_t li = 0; li < (size_t)lsp->n_leaf_nodes; li++) {
-        size_t idx = lsp->leaf_node_indices[li];
-        TEST_ASSERT(lsp->nodes[idx].has_l_stock_hash, "lsp leaf has derived hash");
-        factory_set_node_l_stock_hash(cli, idx, lsp->nodes[idx].l_stock_hash);
+    /* Ship the per-node H over the REAL wire (FACTORY_PROPOSE) and mirror it —
+       exercises the serialize -> parse -> factory_set_node_l_stock_hash round-trip,
+       not a direct in-memory copy. */
+    cJSON *propose = wire_build_factory_propose(lsp);
+    TEST_ASSERT(propose, "build FACTORY_PROPOSE");
+    cJSON *nlsh = cJSON_GetObjectItem(propose, "node_l_stock_hashes");
+    TEST_ASSERT(nlsh && cJSON_IsArray(nlsh), "PROPOSE carries node_l_stock_hashes");
+    TEST_ASSERT(cJSON_GetArraySize(nlsh) == lsp->n_leaf_nodes,
+                "one per-node hash per leaf");
+    for (int i = 0; i < cJSON_GetArraySize(nlsh); i++) {
+        cJSON *o = cJSON_GetArrayItem(nlsh, i);
+        cJSON *no = cJSON_GetObjectItem(o, "node");
+        cJSON *hh = cJSON_GetObjectItem(o, "h");
+        TEST_ASSERT(no && cJSON_IsNumber(no) && hh && cJSON_IsString(hh),
+                    "node/h fields present");
+        unsigned char h[32];
+        TEST_ASSERT(hex_decode(hh->valuestring, h, 32) == 32, "decode wire h");
+        factory_set_node_l_stock_hash(cli, (size_t)no->valuedouble, h);
     }
+    cJSON_Delete(propose);
     TEST_ASSERT(cli->has_node_l_stock_hashes, "client is in mirror mode");
     TEST_ASSERT(factory_build_tree(cli), "build cli tree");
     TEST_ASSERT(cli->n_leaf_nodes == lsp->n_leaf_nodes, "same topology");

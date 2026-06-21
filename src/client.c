@@ -1902,6 +1902,28 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
 
+    /* #53-B3b: per-NODE L-stock hashes (present when the LSP runs hashlock poison).
+       Parsed here into temp arrays (survive cJSON_Delete); applied to the factory
+       after factory_init + before build_tree so the client builds the matching
+       2-leaf L-stock SPK without the (LSP-private) seed. */
+    uint32_t *parsed_node_h_idx = (uint32_t *)calloc(FACTORY_MAX_NODES, sizeof(uint32_t));
+    unsigned char (*parsed_node_h)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_NODES, 32);
+    size_t n_node_h = 0;
+    cJSON *nlsh_arr = cJSON_GetObjectItem(msg.json, "node_l_stock_hashes");
+    if (parsed_node_h_idx && parsed_node_h && nlsh_arr && cJSON_IsArray(nlsh_arr)) {
+        int nn = cJSON_GetArraySize(nlsh_arr);
+        for (int i = 0; i < nn && n_node_h < FACTORY_MAX_NODES; i++) {
+            cJSON *o = cJSON_GetArrayItem(nlsh_arr, i);
+            cJSON *no = o ? cJSON_GetObjectItem(o, "node") : NULL;
+            cJSON *hh = o ? cJSON_GetObjectItem(o, "h") : NULL;
+            if (no && cJSON_IsNumber(no) && hh && cJSON_IsString(hh) &&
+                hex_decode(hh->valuestring, parsed_node_h[n_node_h], 32) == 32) {
+                parsed_node_h_idx[n_node_h] = (uint32_t)no->valuedouble;
+                n_node_h++;
+            }
+        }
+    }
+
     cJSON_Delete(msg.json);
 
     /* Verify funding TX on-chain before signing anything.  If the caller
@@ -2000,6 +2022,13 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (n_parsed_hashes > 0)
         factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
     free(parsed_l_stock_hashes);
+    /* #53-B3b: mirror the LSP's per-node L-stock hashes onto our nodes BEFORE
+       build_tree, so the client builds the SAME 2-leaf L-stock SPK (it has no seed
+       to derive them).  Inert when the LSP didn't ship any (hashlock off). */
+    for (size_t nh = 0; nh < n_node_h; nh++)
+        factory_set_node_l_stock_hash(factory, parsed_node_h_idx[nh], parsed_node_h[nh]);
+    free(parsed_node_h_idx);
+    free(parsed_node_h);
     factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 

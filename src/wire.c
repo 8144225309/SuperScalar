@@ -667,6 +667,28 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
         cJSON_AddItemToObject(j, "l_stock_hashes", hashes);
     }
 
+    /* #53-B3b: per-(leaf,state) L-stock hashes keyed by NODE INDEX.  When the LSP
+       runs the revocation-gated poison (use_hashlock_poison), each leaf node's
+       L-stock output commits a distinct H = SHA256(secret(leaf,state)).  The client
+       has no seed and cannot derive these, so it receives them here and mirrors them
+       onto its nodes (factory_set_node_l_stock_hash) to build the SAME 2-leaf SPK —
+       otherwise the leaf-state tx bytes diverge and the MuSig co-sign fails.  Built
+       after factory_build_tree, so node->l_stock_hash is populated. */
+    {
+        cJSON *node_hashes = NULL;
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            if (!f->nodes[i].has_l_stock_hash) continue;
+            if (!node_hashes) node_hashes = cJSON_CreateArray();
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "node", (double)i);
+            char hex[65];
+            hex_encode(f->nodes[i].l_stock_hash, 32, hex);
+            cJSON_AddStringToObject(o, "h", hex);
+            cJSON_AddItemToArray(node_hashes, o);
+        }
+        if (node_hashes) cJSON_AddItemToObject(j, "node_l_stock_hashes", node_hashes);
+    }
+
     return j;
 }
 
