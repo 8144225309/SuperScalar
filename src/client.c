@@ -3914,6 +3914,24 @@ static int client_handle_leaf_advance_stateless(int fd,
         leaf_poison_prepared_c = 0;
     }
 
+    /* #53 Phase 5 (B4): SECURITY-CRITICAL.  Shipping FINAL hands the LSP a
+       complete new-state signature, revoking the old state.  When this leaf
+       carries a hashlock (has_l_stock_hash => hashlock poison is on), REFUSE to
+       ship FINAL unless the Leaf-P poison for the superseded state was fully
+       co-signed (leaf_poison_prepared_c still set after every co-sign step).
+       Revoking the old state without that poison would leave this client with NO
+       recourse against a cheating LSP that later broadcasts the superseded state
+       (Scenario A/B) — the exact hole #53 closes.  Fail-closed: stay on the old,
+       still-recourse-able state.  Subsumes every degrade site above + the case
+       where prep never ran.  Non-hashlock leaves are unaffected. */
+    if (ps_node->has_l_stock_hash && !leaf_poison_prepared_c) {
+        fprintf(stderr, "Client-stateless %u: hashlock ON but L-stock poison NOT "
+                        "co-signed -- ABORTING advance (no revoke without recourse)\n",
+                my_index);
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
     /* Step 8: ship FINAL with optional poison sig. */
     cJSON *fin_json = wire_build_leaf_advance_final(
         final_sig,

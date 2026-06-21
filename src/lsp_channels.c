@@ -1445,7 +1445,12 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Phase 1d.2: prep poison TX deterministically (both sides match). */
     const uint64_t LEAF_POISON_FEE_SATS = 1000;
     int leaf_poison_prepared = 0;
+    /* #53 Phase 5 test hook: SS_CHEAT_OMIT_POISON forces the LSP to skip poison
+       prep so it co-signs the new state but NOT the Leaf-P poison — exercising
+       the client's fail-closed "no revoke without recourse" abort.  Env-gated
+       test path only (same pattern as SS_CHEAT_DAEMON_MODE). */
     if (mgr->watchtower && had_old_signed && old_n_outputs >= 2 &&
+        !getenv("SS_CHEAT_OMIT_POISON") &&
         old_l_amount > LEAF_POISON_FEE_SATS +
                        (uint64_t)(f->nodes[pre_node_idx].n_signers - 1) * 330u) {
         if (factory_session_prepare_poison_tx_leaf(
@@ -1796,6 +1801,24 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             factory_session_reset_poison(f, node_idx);
             leaf_poison_prepared = 0;
         }
+    }
+
+    /* #53 Phase 5 (B4): when hashlock poison is ON, an advance that did NOT
+       co-sign the Leaf-P poison for the superseded state must NOT be finalized
+       (registered / persisted / DONE-broadcast).  Proceeding would revoke the
+       old state with NO recourse against a later LSP cheat (latent Scenario
+       A/B) — exactly what #53 closes.  Fail-closed: abort and stay on the old,
+       still-recourse-able state.  The new state is signed in memory only at this
+       point (not yet persisted / DONE), so returning 0 discards it cleanly.
+       This subsumes every degrade-and-continue site above (any of them leaves
+       leaf_poison_prepared == 0) plus the case where prep never ran.  Legacy
+       (flag off) keeps the prior degrade-and-continue behavior unchanged. */
+    if (f->use_hashlock_poison && !leaf_poison_prepared) {
+        fprintf(stderr, "LSP-stateless: hashlock ON but L-stock poison NOT "
+                        "co-signed -- ABORTING advance (would leave the client "
+                        "without recourse)\n");
+        factory_session_reset_poison(f, node_idx);
+        return 0;
     }
 
     /* Phase 1d.2: poison TX ceremony DONE.  Same atomic-signer flow as
