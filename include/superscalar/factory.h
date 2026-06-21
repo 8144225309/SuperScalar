@@ -347,6 +347,17 @@ typedef struct {
        the leaf's clients only when the state is superseded (#53-B3). */
     int use_hashlock_poison;
 
+    /* #53-B3b.2a: CLIENT MIRROR.  The client has no shachain_seed, so it cannot
+       DERIVE the per-(leaf,state) L-stock hash — it receives each leaf node's
+       committed H from the LSP over the wire and stores it here (indexed by node
+       index).  When has_node_l_stock_hashes is set, apply_l_stock_hashlock uses
+       node_l_stock_hashes[idx] (the shipped H) instead of deriving, so the client
+       builds the SAME 2-leaf L-stock SPK as the LSP (else the leaf-state tx bytes
+       diverge and the MuSig co-sign fails). */
+    unsigned char node_l_stock_hashes[FACTORY_MAX_NODES][32];
+    int node_l_stock_hash_valid[FACTORY_MAX_NODES];
+    int has_node_l_stock_hashes;
+
     /* Per-leaf DW layers (for independent leaf advance) */
     dw_layer_t leaf_layers[FACTORY_MAX_LEAVES];
     int n_leaf_nodes;              /* number of leaf state nodes */
@@ -511,6 +522,14 @@ int factory_derive_l_stock_secret(const factory_t *f,
                                   const factory_node_t *leaf_node,
                                   uint32_t state_counter,
                                   unsigned char secret_out32[32]);
+
+/* #53-B3b.2a: CLIENT-side — record the LSP-shipped per-node L-stock hash so the
+   client builds the matching 2-leaf L-stock SPK without the (LSP-private) seed.
+   Call once per leaf node BEFORE factory_build_tree (and update before each advance
+   when the new state's H arrives over the wire).  Sets the factory into mirror mode
+   (apply_l_stock_hashlock then uses these hashes instead of deriving). */
+void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
+                                   const unsigned char *h32);
 
 /* Build the L-stock output scriptPubKey (P2TR) for a leaf state node — the
    2-leaf {poison, LSP-CSV} taptree when the node carries a per-state hash

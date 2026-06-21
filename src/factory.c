@@ -342,6 +342,17 @@ int factory_derive_l_stock_secret(const factory_t *f,
    No-op unless hashlock poison is enabled.  Must be called AFTER node->keyagg is
    set and BEFORE build_l_stock_spk. */
 static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
+    /* #53-B3b.2a: CLIENT MIRROR — no seed locally, so use the LSP-shipped per-node
+       hash for this node index instead of deriving.  Lets the client build the SAME
+       2-leaf L-stock SPK as the LSP (else the leaf-state tx diverges + co-sign fails). */
+    if (f->has_node_l_stock_hashes) {
+        size_t idx = (size_t)(node - f->nodes);
+        if (idx < FACTORY_MAX_NODES && f->node_l_stock_hash_valid[idx]) {
+            memcpy(node->l_stock_hash, f->node_l_stock_hashes[idx], 32);
+            node->has_l_stock_hash = 1;
+        }
+        return 1;
+    }
     if (!f->use_hashlock_poison) return 1;
     unsigned char secret[32];
     if (!factory_derive_l_stock_secret(f, node, node->l_stock_state_counter, secret))
@@ -350,6 +361,14 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
     node->has_l_stock_hash = 1;
     memset(secret, 0, sizeof(secret));  /* LSP re-derives on demand; don't retain */
     return 1;
+}
+
+void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
+                                   const unsigned char *h32) {
+    if (!f || node_idx >= FACTORY_MAX_NODES || !h32) return;
+    memcpy(f->node_l_stock_hashes[node_idx], h32, 32);
+    f->node_l_stock_hash_valid[node_idx] = 1;
+    f->has_node_l_stock_hashes = 1;
 }
 
 /* Build a leaf's L-stock OUTPUT scriptPubKey, first committing the per-(leaf,state)

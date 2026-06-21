@@ -115,6 +115,54 @@ orphan-verification lesson).
 **regtest = primary** (rows 1-7 + INV-*; only regtest gives controllable fee/deadline). **signet =
 re-validate rows 1a + 7** (real fee market) with the 2-stage confirm budget + sat discipline.
 
+## 5d. #53-B3b-part-2 — DAEMON/WIRE INTEGRATION PLAN (researched 2026-06-21, 4 opus agents)
+The in-process poison construction+signing layer (#53-A/B1/B3a/B3b-1) is proven. Wiring it into the live
+LSP↔client daemon protocol is larger than first scoped — three research findings reshape it:
+
+**F1 (gating prerequisite). Enabling hashlock BREAKS the advance unless the client builds the matching
+2-leaf L-stock SPK.** The leaf STATE tx's last output IS the L-stock; if the LSP builds a 2-leaf {Leaf-P,Leaf-L}
+SPK and the client builds the legacy single-leaf SPK, the leaf tx bytes differ → MuSig co-sign mismatch →
+the whole advance fails (not just the poison). The client only gets H over the wire (it has no seed). The
+existing `l_stock_hashes` wire (wire.c:660 build / client.c:1894,2001 parse) is **per-EPOCH flat** — the WRONG
+shape; #53 H is **per-(leaf,state)** = SHA256(tagged(seed‖leaf_agg‖state_counter)). And `factory_set_l_stock_hashes`
+(factory.c:3366) only fills the flat array; it never sets node->l_stock_hash/has_l_stock_hash. So the client
+builds the single-leaf SPK and never enables the path.
+
+**F2. The leaf-advance ceremony (the PRIMARY 2-of-2 PS-leaf path) was NOT covered by B3a's retarget.** In
+`lsp_advance_leaf_stateless` (lsp_channels.c:1353-1933) the CLIENT aggregates the poison sig
+(`final_poison_sig`, client.c:3857) and returns it in FINAL; the LSP `finalize_signed_tx` at lsp_channels.c:1754
+builds a KEY-PATH witness. B3a only retargeted the Tier-B `complete_node_poison` path (lsp_channels.c:2511).
+So with hashlock on, the leaf-advance poison finalize must ALSO store the agg sig (script-path) + assemble
+-with-secret later, on BOTH the LSP finalize (1754) and the client aggregate (3857).
+
+**F3. Reveal carriers + timing.** DONE is broadcast to ALL clients (leaf-advance, lsp_channels.c:1880-1883) /
+epoch-only (Tier-B MSG_PATH_SIGN_DONE) — neither can carry a leaf-specific secret. Use NEW messages
+`MSG_LEAF_ADVANCE_REVEAL`(0x8C) {leaf_side, revoked_state, secret32} sent targeted to client_fds[leaf_side]
+just before DONE (1880); `MSG_STATE_ADV_REVEAL`(0x8D) {epoch, n, secrets_per_leaf flat blob} per-affected-leaf
+in/after the WT loop (2570-2630). Unifying rule: **old_counter = leaf->l_stock_state_counter − 1** at the reveal
+point (counter is always bumped by then). Encode via wire_json_add_hex (template: revoke_and_ack revocation_secret
+wire.c:844). Daemon enable goes in src/lsp.c between :437 (set_shachain_seed) and :442 (build_tree) — NOT in
+superscalar_lsp.c (factory_init_from_pubkeys lsp.c:413 wipes use_hashlock_poison); seed must be a REAL random
+seed (flat-secrets leaves shachain_seed zeroed). Client persist: new table `l_stock_poison_reveals` (schema
+v37→v38) {factory_id, leaf_node_idx, state_counter, l_stock_hash, secret(sealed), agg_sig, unsigned_tx,
+leaf_script, control_block}; verify-then-persist mirroring channel_receive_revocation_flat (channel.c:625);
+persist BEFORE adopting new state (#59). B4 degradation = ~80 "reset_poison+clear-flag+continue" sites across
+5 ceremony families × LSP+client → gated hard-abort (`return 0` + stay on old state) when use_hashlock_poison
+(LSP) / has_l_stock_hash (client).
+
+**SEQUENCED INCREMENTS (each built+tested before the next; in-process proof, then B6 flips the daemon flag):**
+- **B3b.2a (PREREQUISITE):** ship per-(leaf,state) H to the client + client maps it onto node->l_stock_hash/
+  has_l_stock_hash after factory_build_tree (creation + per-advance). Prove: client-built leaf L-stock SPK ==
+  LSP-built SPK (so the advance co-signs). Gates everything.
+- **B3b.2b:** retarget the leaf-advance poison finalize (LSP 1754 + client 3857) to script-path (store agg_sig).
+- **B3b.2c:** reveal — MSG_*_REVEAL; LSP derives secret(leaf, counter−1) + sends after poison-complete; gated.
+- **B3b.2d:** client verify (SHA256==H_old, fail-closed) + persist (v38 table) before adopting new state (#59);
+  LSP "reveal-owed" journal for restart re-send.
+- **B3b.2e:** daemon enable — `--enable-hashlock-poison` + random seed + factory_enable_hashlock_poison @ lsp.c.
+- **B4:** delete degradation (gated hard-abort) at the ~80 sites.
+- **B6:** e2e — hashlock factory, advance a leaf, LSP broadcasts the stale OLD state, client/WT assembles the
+  poison from the PERSISTED secret + broadcasts, poison confirms + redistributes, under high fee (the gold proof).
+
 ## 5b. #59 Reveal state machine (PINNED — the commit point that closes residual Scenario A)
 The advance leaf state s→s+1 is a **two-phase commit** whose commit point is the secret reveal:
 - **Phase 1 (recourse first):** exchange + per-partial-verify ALL psigs for BOTH (a) the new leaf tx s+1 AND

@@ -5928,6 +5928,82 @@ int test_factory_ps_subfactory_poison_tx_k2_n4(void) {
     return 1;
 }
 
+/* #53-B3b.2a (in-process, no regtest): the CLIENT MIRROR — given the LSP's per-node
+   L-stock hashes over the (here simulated) wire, a seedless client builds the SAME
+   2-leaf L-stock SPK as the hashlock-enabled LSP, so the leaf-state advance co-signs.
+   Without the mirror the client builds a different (single-leaf) SPK (control case).
+   setup_variable_arity_factory uses deterministic seckeys, so all three factories
+   share pubkeys — isolating the hash mirror. */
+int test_factory_lstock_client_mirror(void) {
+    secp256k1_context *ctx = test_ctx();
+    uint8_t arities[1] = {2};
+
+    /* LSP: hashlock ON — derives per-node H from its seed. */
+    secp256k1_keypair kl[3];
+    factory_t *lsp = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(lsp, "alloc lsp");
+    TEST_ASSERT(setup_variable_arity_factory(lsp, ctx, kl, 3, arities, 1, 5000000),
+                "setup lsp");
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0x90 ^ i);
+    factory_set_shachain_seed(lsp, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(lsp), "enable hashlock (lsp)");
+    TEST_ASSERT(factory_build_tree(lsp), "build lsp tree");
+    TEST_ASSERT(lsp->n_leaf_nodes >= 1, "lsp has leaves");
+
+    /* CLIENT: NO seed; mirror the LSP's per-node H (simulated FACTORY_PROPOSE). */
+    secp256k1_keypair kc[3];
+    factory_t *cli = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(cli, "alloc cli");
+    TEST_ASSERT(setup_variable_arity_factory(cli, ctx, kc, 3, arities, 1, 5000000),
+                "setup cli");
+    for (size_t li = 0; li < lsp->n_leaf_nodes; li++) {
+        size_t idx = lsp->leaf_node_indices[li];
+        TEST_ASSERT(lsp->nodes[idx].has_l_stock_hash, "lsp leaf has derived hash");
+        factory_set_node_l_stock_hash(cli, idx, lsp->nodes[idx].l_stock_hash);
+    }
+    TEST_ASSERT(cli->has_node_l_stock_hashes, "client is in mirror mode");
+    TEST_ASSERT(factory_build_tree(cli), "build cli tree");
+    TEST_ASSERT(cli->n_leaf_nodes == lsp->n_leaf_nodes, "same topology");
+
+    /* Each leaf: client reproduced the hash AND the 2-leaf L-stock SPK. */
+    for (size_t li = 0; li < lsp->n_leaf_nodes; li++) {
+        factory_node_t *ln = &lsp->nodes[lsp->leaf_node_indices[li]];
+        factory_node_t *cn = &cli->nodes[cli->leaf_node_indices[li]];
+        TEST_ASSERT(cn->has_l_stock_hash, "client leaf carries the hashlock");
+        TEST_ASSERT(memcmp(cn->l_stock_hash, ln->l_stock_hash, 32) == 0,
+                    "client H == LSP H");
+        unsigned char lspk[34], cspk[34];
+        TEST_ASSERT(build_l_stock_spk(lsp, ln, lspk), "lsp spk");
+        TEST_ASSERT(build_l_stock_spk(cli, cn, cspk), "cli spk");
+        TEST_ASSERT(memcmp(lspk, cspk, 34) == 0,
+                    "client L-stock SPK == LSP SPK (advance will co-sign)");
+        TEST_ASSERT(memcmp(cn->outputs[cn->n_outputs - 1].script_pubkey,
+                           ln->outputs[ln->n_outputs - 1].script_pubkey, 34) == 0,
+                    "leaf-tx L-stock output SPK matches");
+    }
+
+    /* CONTROL: a client WITHOUT the mirror builds a DIFFERENT (single-leaf) SPK. */
+    secp256k1_keypair kb[3];
+    factory_t *bare = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(bare, "alloc bare");
+    TEST_ASSERT(setup_variable_arity_factory(bare, ctx, kb, 3, arities, 1, 5000000),
+                "setup bare");
+    TEST_ASSERT(factory_build_tree(bare), "build bare tree");
+    {
+        unsigned char lspk[34], bspk[34];
+        build_l_stock_spk(lsp, &lsp->nodes[lsp->leaf_node_indices[0]], lspk);
+        build_l_stock_spk(bare, &bare->nodes[bare->leaf_node_indices[0]], bspk);
+        TEST_ASSERT(memcmp(lspk, bspk, 34) != 0,
+                    "WITHOUT the mirror the client SPK differs (mirror is required)");
+    }
+
+    factory_free(lsp); factory_free(cli); factory_free(bare);
+    free(lsp); free(cli); free(bare);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* Derive the bech32m address for a 32-byte taproot output key via a rawtr()
    descriptor (mirrors the funding path in test_tapscript.c). */
 static int derive_p2tr_addr_from_outputkey(regtest_t *rt,
