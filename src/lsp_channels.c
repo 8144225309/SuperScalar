@@ -1747,13 +1747,28 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (leaf_poison_prepared) {
         secp256k1_pubkey poison_output_pk;
         secp256k1_xonly_pubkey poison_output_xpub;
-        if (secp256k1_musig_pubkey_get(lsp->ctx, &poison_output_pk,
+        /* The verify works for BOTH paths: the session cache is the tweaked output
+           key for key-path poison, or the RAW agg key after the untweaked finalize
+           for script-path (#53-B3a), so musig_pubkey_get returns the correct key. */
+        int poison_verified =
+            secp256k1_musig_pubkey_get(lsp->ctx, &poison_output_pk,
                                          &node->poison_signing_session.cache) &&
             secp256k1_xonly_pubkey_from_pubkey(lsp->ctx, &poison_output_xpub, NULL,
                                                  &poison_output_pk) &&
             secp256k1_schnorrsig_verify(lsp->ctx, final_poison_sig,
                                           node->poison_signing_session.msg32, 32,
-                                          &poison_output_xpub) &&
+                                          &poison_output_xpub);
+        if (poison_verified && node->poison_is_scriptpath) {
+            /* #53-B3b.2b: script-path (Leaf-P) poison — the broadcastable witness
+               needs the revealed secret as the preimage, unavailable at ceremony
+               time.  Store the aggregated Leaf-P sig; factory_assemble_poison_with_secret
+               builds the full witness once the secret is revealed (#53-B3b). */
+            memcpy(node->poison_agg_sig, final_poison_sig, 64);
+            node->poison_has_agg_sig = 1;
+            node->poison_is_signed = 1;
+            printf("LSP-stateless: script-path poison agg sig stored (L-stock %llu sats)\n",
+                   (unsigned long long)old_l_amount);
+        } else if (poison_verified &&
             finalize_signed_tx(&node->poison_signed_tx,
                                 node->poison_unsigned_tx.data,
                                 node->poison_unsigned_tx.len,
