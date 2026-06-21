@@ -139,8 +139,8 @@ for i in $(seq 1 60); do
     grep -q "listening on port $LSP_PORT" "$LSP_LOG" 2>/dev/null && { echo "  LSP listening (PID=$LSP_PID)"; break; }
     kill -0 $LSP_PID 2>/dev/null || { echo "FAIL: LSP died before listening"; tail -20 "$LSP_LOG"; exit 1; }
 done
-grep -q "hashlock-gated L-stock poison ENABLED" "$LSP_LOG" || { echo "FAIL: hashlock poison not enabled in LSP"; tail -20 "$LSP_LOG"; exit 1; }
-echo "  hashlock poison ENABLED confirmed in LSP log"
+# NOTE: the "hashlock poison ENABLED" line prints during factory creation, which
+# only happens AFTER all clients connect — so it is asserted after the marker below.
 
 # --- Clients ---
 echo
@@ -180,6 +180,10 @@ for i in $(seq 1 180); do
     kill -0 $LSP_PID 2>/dev/null || { echo "  LSP exited at iter $i"; break; }
 done
 [ $READY -eq 1 ] || { echo "FAIL: no CHEAT DAEMON COMPLETE in 360s"; tail -50 "$LSP_LOG"; exit 1; }
+
+# Factory creation has run by now — assert the hashlock feature actually engaged.
+grep -q "hashlock-gated L-stock poison ENABLED" "$LSP_LOG" || { echo "FAIL: hashlock poison was NOT enabled (Phase 3 flag/seed path)"; tail -40 "$LSP_LOG"; exit 1; }
+echo "  hashlock poison ENABLED confirmed in LSP log"
 
 STALE_TXID=$(grep -E "Stale pre-advance leaf broadcast" "$LSP_LOG" | head -1 | grep -oE "[0-9a-f]{64}" | head -1)
 echo "  Stale (superseded) leaf broadcast txid: ${STALE_TXID:-(unknown)}"
