@@ -459,6 +459,13 @@ int factory_sign_l_stock_poison_tx(
     uint64_t fee_sats,
     tx_buf_t *signed_out);
 
+/* Build the L-stock output scriptPubKey (P2TR) for a leaf state node — the
+   2-leaf {poison, LSP-CSV} taptree when the node carries a per-state hash
+   (#53), else the legacy single LSP-CSV leaf.  Exposed for tests and the
+   reveal/recourse wiring; spk_out34 receives the 34-byte P2TR SPK. */
+int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
+                      unsigned char *spk_out34);
+
 /* #53: hashlock-gated L-stock poison over the Leaf-P SCRIPT-path (replaces the
    key-path poison, which is vulnerable to Scenario B).  Builds the per-client
    redistribution outputs, N-of-N MuSig-signs the UNtweaked agg key over the

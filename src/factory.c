@@ -280,8 +280,8 @@ static int build_l_stock_taptree(const factory_t *f,
     return 1;
 }
 
-static int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
-                              unsigned char *spk_out34) {
+int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
+                       unsigned char *spk_out34) {
     if (!f || !leaf_node || !spk_out34) return 0;
 
     /* Internal key = leaf's N-of-N MuSig agg pubkey (LSP + all leaf clients). */

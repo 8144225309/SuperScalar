@@ -5928,6 +5928,217 @@ int test_factory_ps_subfactory_poison_tx_k2_n4(void) {
     return 1;
 }
 
+/* Derive the bech32m address for a 32-byte taproot output key via a rawtr()
+   descriptor (mirrors the funding path in test_tapscript.c). */
+static int derive_p2tr_addr_from_outputkey(regtest_t *rt,
+                                           const unsigned char *outkey32,
+                                           char *addr_out, size_t addr_len) {
+    char keyhex[65];
+    hex_encode(outkey32, 32, keyhex);
+    char params[160];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", keyhex);
+    char *di = regtest_exec(rt, "getdescriptorinfo", params);
+    if (!di) return 0;
+    cJSON *dij = cJSON_Parse(di); free(di);
+    if (!dij) return 0;
+    cJSON *desc = cJSON_GetObjectItem(dij, "descriptor");
+    if (!desc || !cJSON_IsString(desc)) { cJSON_Delete(dij); return 0; }
+    char dparams[220];
+    snprintf(dparams, sizeof(dparams), "\"%s\"", desc->valuestring);
+    cJSON_Delete(dij);
+    char *da = regtest_exec(rt, "deriveaddresses", dparams);
+    if (!da) return 0;
+    cJSON *daj = cJSON_Parse(da); free(da);
+    if (!daj || !cJSON_IsArray(daj)) { if (daj) cJSON_Delete(daj); return 0; }
+    cJSON *a0 = cJSON_GetArrayItem(daj, 0);
+    if (!a0 || !cJSON_IsString(a0)) { cJSON_Delete(daj); return 0; }
+    strncpy(addr_out, a0->valuestring, addr_len - 1);
+    addr_out[addr_len - 1] = '\0';
+    cJSON_Delete(daj);
+    return 1;
+}
+
+/* #53-A CONSENSUS PROOF: the hashlock-gated L-stock poison (Leaf-P script-path)
+   is accepted by the real Bitcoin Core interpreter ONLY with the revealed secret.
+   - positive: poison built with the correct secret is ACCEPTED + CONFIRMED, and
+     actually redistributes the L-stock to the clients (economic outcome asserted);
+   - anti-vacuity: the same poison with a mangled witness preimage is REJECTED by
+     the interpreter (the hashlock genuinely gates -> a LIVE state whose secret is
+     unrevealed cannot be poisoned -> Scenario B closed on-chain, not just at the API);
+   - API: the builder refuses a secret that doesn't match the committed hash. */
+int test_regtest_lstock_hashlock_poison(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
+                "setup n3 {2}");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 1, "1 leaf");
+
+    factory_node_t *leaf = &f->nodes[f->leaf_node_indices[0]];
+    size_t n_clients = leaf->n_signers - 1;
+    TEST_ASSERT(n_clients == 2, "leaf has 2 clients (LSP + 2)");
+
+    /* Commit a per-state revocation hash H_s = SHA256(secret) into Leaf P. */
+    unsigned char secret[32];
+    for (int i = 0; i < 32; i++) secret[i] = (unsigned char)(0x53 ^ i);
+    sha256(secret, 32, leaf->l_stock_hash);
+    leaf->has_l_stock_hash = 1;
+
+    /* The hashlock taptree must change the SPK vs the legacy single-leaf SPK. */
+    unsigned char spk_hash[34], spk_plain[34];
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk_hash), "build 2-leaf L-stock SPK");
+    leaf->has_l_stock_hash = 0;
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk_plain), "build legacy L-stock SPK");
+    leaf->has_l_stock_hash = 1;
+    TEST_ASSERT(memcmp(spk_hash, spk_plain, 34) != 0,
+                "hashlock changes the L-stock SPK (taptree wired)");
+    TEST_ASSERT(spk_hash[0] == 0x51 && spk_hash[1] == 0x20, "P2TR SPK shape");
+
+    /* --- regtest: fund the real 2-leaf L-stock SPK, then spend via Leaf P --- */
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: no regtest node available\n");
+        factory_free(f); secp256k1_context_destroy(ctx); free(f); return 1;
+    }
+    regtest_create_wallet(&rt, "ss_lstock_poison");
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)), "mine addr");
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    char lstock_addr[128];
+    TEST_ASSERT(derive_p2tr_addr_from_outputkey(&rt, spk_hash + 2,
+                    lstock_addr, sizeof(lstock_addr)),
+                "derive L-stock address");
+
+    char fund_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, lstock_addr, 0.001, fund_txid_hex),
+                "fund L-stock SPK");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(fund_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+    int vout = -1; uint64_t amount = 0;
+    TEST_ASSERT(find_funding_vout(&rt, fund_txid_hex, spk_hash, 34, &vout, &amount),
+                "find L-stock vout");
+    TEST_ASSERT(amount > 10000, "L-stock funded");
+
+    const uint64_t fee = 1000;
+    uint64_t per_client = (amount - fee) / (uint64_t)n_clients;
+
+    /* Build the poison with the CORRECT secret. */
+    tx_buf_t poison; tx_buf_init(&poison, 256);
+    unsigned char ptxid[32];
+    TEST_ASSERT(factory_build_l_stock_poison_scriptpath(f, leaf, fund_txid_bytes,
+                    (uint32_t)vout, amount, fee, secret, &poison, ptxid),
+                "build script-path poison (correct secret)");
+
+    char *poison_hex = (char *)malloc(poison.len * 2 + 1);
+    TEST_ASSERT(poison_hex, "alloc poison hex");
+    hex_encode(poison.data, poison.len, poison_hex);
+
+    /* POSITIVE consensus: the interpreter accepts it. */
+    {
+        char *p = (char *)malloc(poison.len * 2 + 16);
+        snprintf(p, poison.len * 2 + 16, "[\"%s\"]", poison_hex);
+        char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+        free(p);
+        TEST_ASSERT(tma != NULL, "testmempoolaccept ran (positive)");
+        cJSON *j = cJSON_Parse(tma); free(tma);
+        TEST_ASSERT(j && cJSON_IsArray(j), "parse testmempoolaccept (positive)");
+        cJSON *r0 = cJSON_GetArrayItem(j, 0);
+        cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+        int ok_allowed = allowed && cJSON_IsTrue(allowed);
+        if (!ok_allowed) {
+            cJSON *rr = r0 ? cJSON_GetObjectItem(r0, "reject-reason") : NULL;
+            printf("  unexpected reject: %s\n",
+                   rr && rr->valuestring ? rr->valuestring : "?");
+        }
+        cJSON_Delete(j);
+        TEST_ASSERT(ok_allowed,
+                    "INTERPRETER ACCEPTS hashlock poison with the revealed secret");
+    }
+
+    /* ANTI-VACUITY negative: mangle the witness preimage -> interpreter REJECTS.
+       Proves the hashlock actually gates spendability on-chain (Scenario B). */
+    {
+        int off = -1;
+        for (size_t i = 0; i + 32 <= poison.len; i++)
+            if (memcmp(poison.data + i, secret, 32) == 0) { off = (int)i; break; }
+        TEST_ASSERT(off >= 0, "preimage present in poison witness");
+        unsigned char *mangled = (unsigned char *)malloc(poison.len);
+        memcpy(mangled, poison.data, poison.len);
+        mangled[off] ^= 0xFF;  /* break SHA256(preimage)==H_s, keep 32-byte length */
+        char *mhex = (char *)malloc(poison.len * 2 + 1);
+        hex_encode(mangled, poison.len, mhex);
+        char *p = (char *)malloc(poison.len * 2 + 16);
+        snprintf(p, poison.len * 2 + 16, "[\"%s\"]", mhex);
+        char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+        free(p); free(mhex); free(mangled);
+        TEST_ASSERT(tma != NULL, "testmempoolaccept ran (negative)");
+        cJSON *j = cJSON_Parse(tma); free(tma);
+        TEST_ASSERT(j && cJSON_IsArray(j), "parse testmempoolaccept (negative)");
+        cJSON *r0 = cJSON_GetArrayItem(j, 0);
+        cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+        int still_allowed = allowed && cJSON_IsTrue(allowed);
+        cJSON_Delete(j);
+        TEST_ASSERT(!still_allowed,
+                    "INTERPRETER REJECTS poison with a wrong preimage (hashlock gates)");
+    }
+
+    /* API negative: a secret that doesn't match H_s is refused at build time. */
+    {
+        unsigned char wrong[32]; memcpy(wrong, secret, 32); wrong[0] ^= 0x01;
+        tx_buf_t bad; tx_buf_init(&bad, 64);
+        TEST_ASSERT(factory_build_l_stock_poison_scriptpath(f, leaf, fund_txid_bytes,
+                        (uint32_t)vout, amount, fee, wrong, &bad, NULL) == 0,
+                    "builder REFUSES a secret that doesn't match the committed hash");
+        tx_buf_free(&bad);
+    }
+
+    /* ECONOMIC OUTCOME: broadcast + confirm + the L-stock is redistributed. */
+    {
+        char *p = (char *)malloc(poison.len * 2 + 16);
+        snprintf(p, poison.len * 2 + 16, "\"%s\"", poison_hex);
+        char *srt = regtest_exec(&rt, "sendrawtransaction", p);
+        free(p);
+        TEST_ASSERT(srt != NULL, "sendrawtransaction poison");
+        free(srt);
+        regtest_mine_blocks(&rt, 1, mine_addr);
+
+        unsigned char disp[32]; memcpy(disp, ptxid, 32); reverse_bytes(disp, 32);
+        char ptxid_hex[65]; hex_encode(disp, 32, ptxid_hex);
+        char go[96]; snprintf(go, sizeof(go), "\"%s\" 0", ptxid_hex);
+        char *gor = regtest_exec(&rt, "gettxout", go);
+        TEST_ASSERT(gor != NULL, "gettxout poison vout 0");
+        cJSON *gj = cJSON_Parse(gor); free(gor);
+        TEST_ASSERT(gj, "parse gettxout");
+        cJSON *conf = cJSON_GetObjectItem(gj, "confirmations");
+        cJSON *val = cJSON_GetObjectItem(gj, "value");
+        int confirmed = conf && conf->valueint >= 1;
+        /* value is BTC; per_client is sats. */
+        uint64_t got_sats = val ? (uint64_t)(val->valuedouble * 1e8 + 0.5) : 0;
+        cJSON_Delete(gj);
+        TEST_ASSERT(confirmed, "poison output 0 confirmed on-chain");
+        TEST_ASSERT(got_sats == per_client,
+                    "poison output 0 pays the client its redistributed share");
+        printf("  poison CONFIRMED: %s — %llu sats to each of %zu clients\n",
+               ptxid_hex, (unsigned long long)per_client, n_clients);
+    }
+
+    free(poison_hex);
+    tx_buf_free(&poison);
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* Build, sign, verify, and advance a PS factory at N=64 (1 LSP + 63 clients).
  * This is the scale test — the existing PS tests use N=3 (2 clients), which
  * doesn't exercise the interior-tree layers or the 64-way MuSig ceremony.
