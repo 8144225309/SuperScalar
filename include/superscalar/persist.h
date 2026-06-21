@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 37
+#define PERSIST_SCHEMA_VERSION 38
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -147,6 +147,29 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
                                  uint64_t chan_amount_sats,
                                  const unsigned char *poison_tx,
                                  size_t poison_tx_len);
+
+/* #53-B3b.2d: persisted script-path L-stock poison reveals (table l_stock_poison_reveals,
+   schema v38).  save: at ceremony-complete (secret NULL).  update_secret: when the reveal
+   verifies.  load: on restart -> rebuild + factory_assemble_poison_with_secret + broadcast. */
+int persist_save_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                const unsigned char *l_stock_hash32,
+                                const unsigned char *agg_sig64,
+                                const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+                                const unsigned char *leaf_script, size_t leaf_script_len,
+                                const unsigned char *control_block,
+                                size_t control_block_len);
+int persist_update_l_stock_secret(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                  uint32_t state_counter,
+                                  const unsigned char *secret32);
+int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                unsigned char *l_stock_hash_out32,
+                                unsigned char *agg_sig_out64,
+                                tx_buf_t *unsigned_tx_out,
+                                unsigned char *leaf_script_out, size_t *leaf_script_len_out,
+                                unsigned char *control_block_out, size_t *control_block_len_out,
+                                unsigned char *secret_out32, int *out_has_secret);
 
 /* Load all PS chain entries for a leaf in chain_pos order.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).

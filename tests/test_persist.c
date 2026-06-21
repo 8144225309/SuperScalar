@@ -153,6 +153,59 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
     return ok;
 }
 
+/* #53-B3b.2d: l_stock_poison_reveals save -> load -> update-secret -> reload round-trip.
+   Proves a restarted client/WT can recover the script-path poison witness components +
+   the revealed secret (so it can rebuild + broadcast the Leaf-P poison). */
+int test_persist_l_stock_poison_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t fid = 0, nidx = 7, state = 3;
+    unsigned char h[32], sig[64], lscript[73], cb[65], utx[80], secret[32];
+    for (int i = 0; i < 32; i++) h[i]      = (unsigned char)(0xA0 ^ i);
+    for (int i = 0; i < 64; i++) sig[i]    = (unsigned char)(0x10 + i);
+    for (size_t i = 0; i < sizeof(lscript); i++) lscript[i] = (unsigned char)(0x20 + i);
+    for (int i = 0; i < 65; i++) cb[i]     = (unsigned char)(0x30 + i);
+    for (size_t i = 0; i < sizeof(utx); i++) utx[i] = (unsigned char)(i & 0xff);
+    for (int i = 0; i < 32; i++) secret[i] = (unsigned char)(0x53 ^ i);
+
+    TEST_ASSERT(persist_save_l_stock_poison(&db, fid, nidx, state, h, sig,
+                    utx, sizeof(utx), lscript, sizeof(lscript), cb, sizeof(cb)),
+                "save l_stock poison");
+
+    unsigned char lh[32], lsig[64], lls[128], lcb[65], lsec[32];
+    size_t lls_len = 0, lcb_len = 0; int has_secret = -1;
+    tx_buf_t lutx; tx_buf_init(&lutx, 128);
+    TEST_ASSERT(persist_load_l_stock_poison(&db, fid, nidx, state, lh, lsig, &lutx,
+                    lls, &lls_len, lcb, &lcb_len, lsec, &has_secret), "load");
+    TEST_ASSERT(memcmp(lh, h, 32) == 0, "hash round-trips");
+    TEST_ASSERT(memcmp(lsig, sig, 64) == 0, "agg sig round-trips");
+    TEST_ASSERT(lutx.len == sizeof(utx) && memcmp(lutx.data, utx, sizeof(utx)) == 0,
+                "unsigned tx round-trips");
+    TEST_ASSERT(lls_len == sizeof(lscript) && memcmp(lls, lscript, sizeof(lscript)) == 0,
+                "leaf script round-trips");
+    TEST_ASSERT(lcb_len == sizeof(cb) && memcmp(lcb, cb, sizeof(cb)) == 0,
+                "control block round-trips");
+    TEST_ASSERT(has_secret == 0, "no secret before reveal");
+
+    TEST_ASSERT(persist_update_l_stock_secret(&db, fid, nidx, state, secret),
+                "update secret");
+    has_secret = -1;
+    TEST_ASSERT(persist_load_l_stock_poison(&db, fid, nidx, state, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, lsec, &has_secret), "reload");
+    TEST_ASSERT(has_secret == 1, "secret present after reveal");
+    TEST_ASSERT(memcmp(lsec, secret, 32) == 0, "secret round-trips");
+
+    TEST_ASSERT(persist_load_l_stock_poison(&db, fid, nidx, 999, lh, lsig, &lutx,
+                    lls, &lls_len, lcb, &lcb_len, lsec, &has_secret) == 0,
+                "missing (factory,node,state) row not found");
+
+    tx_buf_free(&lutx);
+    persist_close(&db);
+    printf("  l_stock_poison_reveals save/load/update-secret round-trips\n");
+    return 1;
+}
+
 /* ---- §10 mainnet-gate: schema migration ladder is idempotent + data-preserving ----
    Populate a file-backed DB at the current schema, force user_version back to 1
    (simulating an old DB), then re-open to re-run migrations 2..PERSIST_SCHEMA_VERSION

@@ -1198,6 +1198,7 @@ extern int test_regtest_lsp_restart_recovery(void);
 extern int test_persist_open_close(void);
 extern int test_persist_migration_ladder(void);
 extern int test_persist_ps_subfactory_chain_round_trip(void);
+extern int test_persist_l_stock_poison_round_trip(void);
 extern int test_persist_ps_subfactory_chain_v21_round_trip(void);
 extern int test_persist_ps_leaf_chain_v22_poison_round_trip(void);
 extern int test_ceremony_helpers_save_load(void);
@@ -3095,6 +3096,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_encryption_wrong_key_refused);
     RUN_TEST(test_persist_encryption_disabled_is_plaintext);
     RUN_TEST(test_persist_ps_subfactory_chain_round_trip);
+    RUN_TEST(test_persist_l_stock_poison_round_trip);
     RUN_TEST(test_persist_ps_subfactory_chain_v21_round_trip);
     RUN_TEST(test_persist_ps_leaf_chain_v22_poison_round_trip);
     /* SF-CEREMONY-HELPERS #199 (wallet team v34 API). */

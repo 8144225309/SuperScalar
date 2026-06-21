@@ -1352,6 +1352,26 @@ int persist_open(persist_t *p, const char *path) {
         ");",
         NULL, NULL, NULL);
 
+    /* v38 (#53-B3b): client-side persisted L-stock revocation-secret reveals — lets a
+       restarted client (or its standalone watchtower) rebuild + broadcast the Leaf-P
+       poison for a superseded leaf state.  Created unconditionally (idempotent).  The
+       revocation_secret column is sealed by persist_apply_encryption when at-rest
+       encryption is on (#327). */
+    sqlite3_exec(p->db,
+        "CREATE TABLE IF NOT EXISTS l_stock_poison_reveals ("
+        "  factory_id           INTEGER NOT NULL,"
+        "  node_idx             INTEGER NOT NULL,"
+        "  state_counter        INTEGER NOT NULL,"
+        "  l_stock_hash         BLOB NOT NULL,"
+        "  revocation_secret    BLOB,"
+        "  poison_agg_sig       BLOB NOT NULL,"
+        "  poison_unsigned_tx   BLOB NOT NULL,"
+        "  poison_leaf_script   BLOB NOT NULL,"
+        "  poison_control_block BLOB NOT NULL,"
+        "  PRIMARY KEY (factory_id, node_idx, state_counter)"
+        ");",
+        NULL, NULL, NULL);
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1674,6 +1694,129 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
     free(tx_hex);
     free(poison_hex);
     return ok;
+}
+
+/* #53-B3b.2d: persist a leaf's script-path L-stock poison so a restarted client (or
+   its standalone watchtower) can rebuild + broadcast it for a superseded state.  Save
+   at ceremony-complete (secret not yet revealed -> NULL); persist_update_l_stock_secret
+   fills the secret when the reveal lands + verifies.  Blobs stored as hex TEXT (the
+   codebase convention).  Returns 1 on success. */
+int persist_save_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                const unsigned char *l_stock_hash32,
+                                const unsigned char *agg_sig64,
+                                const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+                                const unsigned char *leaf_script, size_t leaf_script_len,
+                                const unsigned char *control_block,
+                                size_t control_block_len) {
+    if (!p || !p->db || !l_stock_hash32 || !agg_sig64 || !unsigned_tx ||
+        !leaf_script || !control_block) return 0;
+
+    char h_hex[65];   hex_encode(l_stock_hash32, 32, h_hex);
+    char sig_hex[129]; hex_encode(agg_sig64, 64, sig_hex);
+    char *utx_hex = malloc(unsigned_tx_len * 2 + 1);
+    char *ls_hex  = malloc(leaf_script_len * 2 + 1);
+    char *cb_hex  = malloc(control_block_len * 2 + 1);
+    if (!utx_hex || !ls_hex || !cb_hex) { free(utx_hex); free(ls_hex); free(cb_hex); return 0; }
+    hex_encode(unsigned_tx, unsigned_tx_len, utx_hex);
+    hex_encode(leaf_script, leaf_script_len, ls_hex);
+    hex_encode(control_block, control_block_len, cb_hex);
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO l_stock_poison_reveals "
+        "(factory_id, node_idx, state_counter, l_stock_hash, revocation_secret, "
+        " poison_agg_sig, poison_unsigned_tx, poison_leaf_script, poison_control_block) "
+        "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(utx_hex); free(ls_hex); free(cb_hex); return 0;
+    }
+    sqlite3_bind_int (stmt, 1, (int)factory_id);
+    sqlite3_bind_int (stmt, 2, (int)node_idx);
+    sqlite3_bind_int (stmt, 3, (int)state_counter);
+    sqlite3_bind_text(stmt, 4, h_hex,   -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, sig_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, utx_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, ls_hex,  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, cb_hex,  -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(utx_hex); free(ls_hex); free(cb_hex);
+    return ok;
+}
+
+/* #53-B3b.2d: record the revealed revocation secret for a persisted poison (call
+   AFTER verifying SHA256(secret)==l_stock_hash).  Returns 1 if a row was updated. */
+int persist_update_l_stock_secret(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                  uint32_t state_counter,
+                                  const unsigned char *secret32) {
+    if (!p || !p->db || !secret32) return 0;
+    char s_hex[65]; hex_encode(secret32, 32, s_hex);
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "UPDATE l_stock_poison_reveals SET revocation_secret = ? "
+        "WHERE factory_id = ? AND node_idx = ? AND state_counter = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, s_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 2, (int)factory_id);
+    sqlite3_bind_int (stmt, 3, (int)node_idx);
+    sqlite3_bind_int (stmt, 4, (int)state_counter);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(p->db) > 0);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* #53-B3b.2d: load a persisted poison for (factory, node, state) into caller buffers.
+   *out_has_secret = 1 if the secret has been revealed.  All out-pointers optional
+   except those needed to reconstruct the witness.  Returns 1 if the row exists. */
+int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                unsigned char *l_stock_hash_out32,
+                                unsigned char *agg_sig_out64,
+                                tx_buf_t *unsigned_tx_out,
+                                unsigned char *leaf_script_out, size_t *leaf_script_len_out,
+                                unsigned char *control_block_out, size_t *control_block_len_out,
+                                unsigned char *secret_out32, int *out_has_secret) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT l_stock_hash, poison_agg_sig, poison_unsigned_tx, poison_leaf_script, "
+        " poison_control_block, revocation_secret FROM l_stock_poison_reveals "
+        "WHERE factory_id = ? AND node_idx = ? AND state_counter = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_idx);
+    sqlite3_bind_int(stmt, 3, (int)state_counter);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        const char *h   = (const char *)sqlite3_column_text(stmt, 0);
+        const char *sig = (const char *)sqlite3_column_text(stmt, 1);
+        const char *utx = (const char *)sqlite3_column_text(stmt, 2);
+        const char *ls  = (const char *)sqlite3_column_text(stmt, 3);
+        const char *cb  = (const char *)sqlite3_column_text(stmt, 4);
+        const char *sec = (const char *)sqlite3_column_text(stmt, 5);
+        if (l_stock_hash_out32 && h) hex_decode(h, l_stock_hash_out32, 32);
+        if (agg_sig_out64 && sig)    hex_decode(sig, agg_sig_out64, 64);
+        if (unsigned_tx_out && utx) {
+            size_t n = strlen(utx) / 2;
+            tx_buf_reset(unsigned_tx_out);
+            unsigned char *buf = malloc(n);
+            if (buf) { hex_decode(utx, buf, n); tx_buf_write_bytes(unsigned_tx_out, buf, n); free(buf); }
+        }
+        if (leaf_script_out && leaf_script_len_out && ls) {
+            size_t n = strlen(ls) / 2;
+            hex_decode(ls, leaf_script_out, n); *leaf_script_len_out = n;
+        }
+        if (control_block_out && control_block_len_out && cb) {
+            size_t n = strlen(cb) / 2;
+            hex_decode(cb, control_block_out, n); *control_block_len_out = n;
+        }
+        if (out_has_secret) *out_has_secret = (sec != NULL);
+        if (sec && secret_out32) hex_decode(sec, secret_out32, 32);
+    }
+    sqlite3_finalize(stmt);
+    return found;
 }
 
 /* Load PS leaf chain for a given leaf node.
