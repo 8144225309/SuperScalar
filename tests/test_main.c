@@ -1764,6 +1764,7 @@ extern int test_factory_ps_subfactory_chain_tx_validity(void);
 extern int test_factory_ps_subfactory_poison_tx_k2_n4(void);
 extern int test_factory_lstock_client_mirror(void);
 extern int test_factory_lstock_seed_derivation(void);
+extern int test_factory_subfactory_lstock_per_state_hash(void);
 extern int test_factory_ps_leaf_build_n64(void);
 extern int test_factory_ps_build_n128(void);
 extern int test_factory_ps_leaf_advance(void);
@@ -3646,6 +3647,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_ps_subfactory_poison_tx_k2_n4);
     RUN_TEST(test_factory_lstock_client_mirror);
     RUN_TEST(test_factory_lstock_seed_derivation);
+    RUN_TEST(test_factory_subfactory_lstock_per_state_hash);
     RUN_TEST(test_factory_ps_leaf_build_n64);
     RUN_TEST(test_factory_ps_build_n128);
     RUN_TEST(test_factory_ps_leaf_advance);

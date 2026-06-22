@@ -6046,6 +6046,127 @@ int test_factory_lstock_client_mirror(void) {
     return 1;
 }
 
+/* #53 sub-factory Phase 0 (in-process, no regtest): each sub-factory state must commit a
+   DISTINCT per-(sub,state) L-stock (sales-stock) hash, so revealing one superseded state's
+   secret never compromises the hashlock of another sub state.  This is the per-state
+   revocation model the leaf path already has (update_l_stock_outputs); the sub path was
+   STATIC before this work.  Proves: (a) creation commits H0 = SHA256(secret(sub,0));
+   (b) each advance bumps the counter + re-commits H_n = SHA256(secret(sub,n)) != H_{n-1}
+   (and rewrites the sales-stock SPK); (c) a superseded secret stays seed-re-derivable so
+   the LSP's post-advance reveal verifies against the poison's H_old; (d) CONTROL — a
+   non-hashlock sub keeps a STATIC sales-stock SPK across advances (Phase 0 gated off). */
+int test_factory_subfactory_lstock_per_state_hash(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xEE;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[5];
+        for (int i = 0; i < 5; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 5);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xFE, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 5, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+
+    /* Hashlock ON: seed + enable BEFORE build so the sub sales-stock commits H0. */
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0xA5 ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock");
+    TEST_ASSERT(factory_build_tree(f), "build k^2 PS tree (hashlock)");
+
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    int sub0_node_idx = leaf->subfactory_node_indices[0];
+    factory_node_t *sub = &f->nodes[sub0_node_idx];
+
+    /* (a) creation committed H0 = SHA256(secret(sub,0)). */
+    TEST_ASSERT(sub->has_l_stock_hash, "sub carries the hashlock at creation");
+    TEST_ASSERT_EQ((int)sub->l_stock_state_counter, 0, "sub counter starts at 0");
+    unsigned char h0[32];
+    memcpy(h0, sub->l_stock_hash, 32);
+    unsigned char sec0[32], chk[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, sub, 0, sec0), "derive secret(sub,0)");
+    sha256(sec0, 32, chk);
+    TEST_ASSERT(memcmp(chk, h0, 32) == 0, "H0 == SHA256(secret(sub,0))");
+    unsigned char spk0[34];
+    memcpy(spk0, sub->outputs[sub->n_outputs - 1].script_pubkey, 34);
+
+    /* (b) advance #1 -> counter 1, H1 != H0, H1 == SHA256(secret(sub,1)), SPK rewritten. */
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, 50000), 1,
+                   "sub advance #1");
+    TEST_ASSERT_EQ((int)sub->l_stock_state_counter, 1, "counter -> 1");
+    unsigned char h1[32];
+    memcpy(h1, sub->l_stock_hash, 32);
+    TEST_ASSERT(memcmp(h1, h0, 32) != 0, "H1 != H0 (distinct per state)");
+    unsigned char sec1[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, sub, 1, sec1), "derive secret(sub,1)");
+    sha256(sec1, 32, chk);
+    TEST_ASSERT(memcmp(chk, h1, 32) == 0, "H1 == SHA256(secret(sub,1))");
+    TEST_ASSERT(memcmp(sub->outputs[sub->n_outputs - 1].script_pubkey, spk0, 34) != 0,
+                "sales-stock SPK rewritten across the advance");
+
+    /* (c) the SUPERSEDED secret(sub,0) is still seed-re-derivable -> the LSP can reveal it
+       and the client's poison (built vs H0) verifies. */
+    unsigned char sec0b[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, sub, 0, sec0b), "re-derive secret(sub,0)");
+    TEST_ASSERT(memcmp(sec0b, sec0, 32) == 0, "secret(sub,0) stable (reveal verifies)");
+
+    /* (b') advance #2 -> H2 distinct from H0 and H1. */
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, 50000), 1,
+                   "sub advance #2");
+    TEST_ASSERT_EQ((int)sub->l_stock_state_counter, 2, "counter -> 2");
+    unsigned char h2[32];
+    memcpy(h2, sub->l_stock_hash, 32);
+    TEST_ASSERT(memcmp(h2, h0, 32) != 0 && memcmp(h2, h1, 32) != 0, "H2 distinct from H0,H1");
+    factory_free(f); free(f);
+
+    /* (d) CONTROL: a non-hashlock sub keeps a STATIC sales-stock SPK across advances. */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g, "alloc control factory");
+    factory_init(g, ctx, kps, 5, 6, 10);
+    factory_set_arity(g, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(g, 2);
+    factory_set_funding(g, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(g), "build control tree (no hashlock)");
+    factory_node_t *gsub = &g->nodes[g->nodes[g->leaf_node_indices[0]].subfactory_node_indices[0]];
+    TEST_ASSERT(!gsub->has_l_stock_hash, "control sub has NO hashlock");
+    unsigned char gspk0[34];
+    memcpy(gspk0, gsub->outputs[gsub->n_outputs - 1].script_pubkey, 34);
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(g, 0, 0, 0, 50000), 1,
+                   "control sub advance");
+    TEST_ASSERT(memcmp(gsub->outputs[gsub->n_outputs - 1].script_pubkey, gspk0, 34) == 0,
+                "control sales-stock SPK STATIC across advance (Phase 0 gated off)");
+    factory_free(g); free(g);
+
+    secp256k1_context_destroy(ctx);
+    printf("  sub-factory per-state L-stock hash: distinct H per state + superseded reveal stable\n");
+    return 1;
+}
+
 /* Derive the bech32m address for a 32-byte taproot output key via a rawtr()
    descriptor (mirrors the funding path in test_tapscript.c). */
 static int derive_p2tr_addr_from_outputkey(regtest_t *rt,

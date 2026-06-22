@@ -2667,6 +2667,20 @@ int factory_subfactory_chain_advance_unsigned(
     sub->outputs[sstock_vout].amount_sats =
         sstock_amount - delta_sats - f->fee_per_tx;
 
+    /* #53 sub-factory hashlock: each sub state must commit a DISTINCT per-(sub,state)
+       L-stock hash, so revealing one superseded state's secret never compromises
+       another (the per-state revocation model; the leaf path does this via
+       update_l_stock_for_leaf, the sub path did not -> the hash was static).
+       Re-derive the sales-stock SPK BEFORE rebuild_node_tx so the new SPK lands in
+       the tx.  No-op unless hashlock poison is on (has_l_stock_hash is set at build
+       only then); LSP derives from the seed, client mirrors the wire-shipped H_new. */
+    if (sub->has_l_stock_hash) {
+        sub->l_stock_state_counter++;
+        if (!set_leaf_l_stock_output(f, sub, sub->outputs[sstock_vout].script_pubkey))
+            return 0;
+        sub->outputs[sstock_vout].script_pubkey_len = 34;
+    }
+
     if (!rebuild_node_tx(f, (size_t)sub_node_i)) {
         /* On failure, roll back the chain state (chain_len already bumped;
            leave it — the caller is expected to retry with a different
