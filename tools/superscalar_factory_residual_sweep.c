@@ -49,9 +49,12 @@ static int match_output(const factory_t *f, const unsigned char *spk34,
                         uint32_t *signers_out, size_t *n_signers_out,
                         unsigned char merkle_out[32], int *has_merkle_out,
                         char *what, size_t whatcap) {
+    /* Pass 1: node funding outputs (spending_spk) -- N-of-N, the node's own merkle.
+       Done across ALL nodes FIRST so a leaf's sub-funding output (which equals the sub
+       node's spending_spk) matches the SUB node's N-of-N here, instead of being
+       mis-classified as a channel by the leaf's output loop in pass 2. */
     for (size_t ni = 0; ni < f->n_nodes; ni++) {
         const factory_node_t *n = &f->nodes[ni];
-        /* node funding output (its spending_spk, as spent by the parent) */
         if (n->spending_spk_len == 34 && memcmp(spk34, n->spending_spk, 34) == 0) {
             memcpy(signers_out, n->signer_indices, n->n_signers * sizeof(uint32_t));
             *n_signers_out = n->n_signers;
@@ -60,7 +63,10 @@ static int match_output(const factory_t *f, const unsigned char *spk34,
             snprintf(what, whatcap, "node %zu funding (n_signers=%zu)", ni, n->n_signers);
             return 1;
         }
-        /* this node's own outputs (channels + L-stock for leaf/sub nodes) */
+    }
+    /* Pass 2: each node's own outputs -- channels (v<last) + L-stock (last). */
+    for (size_t ni = 0; ni < f->n_nodes; ni++) {
+        const factory_node_t *n = &f->nodes[ni];
         for (size_t v = 0; v < n->n_outputs; v++) {
             if (n->outputs[v].script_pubkey_len != 34 ||
                 memcmp(spk34, n->outputs[v].script_pubkey, 34) != 0) continue;
