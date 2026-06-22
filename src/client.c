@@ -3221,8 +3221,26 @@ static int client_handle_subfactory_advance_stateless_multi(
     if (sub->poison_is_scriptpath) {
         unsigned char agg64[64];
         if (wire_subfactory_done_get_poison_aggsig(done_msg.json, agg64)) {
-            memcpy(sub->poison_agg_sig, agg64, 64);
-            sub->poison_has_agg_sig = 1;
+            /* #53 verify-before-trust: the N-party sub poison agg-sig comes from the LSP
+               over the wire (the client can't aggregate it locally).  VERIFY it against
+               OUR own poison sighash + the untweaked sub agg key BEFORE persisting it as
+               recourse -- else a malicious LSP (or a bad co-signer partial that the LSP
+               aggregated) could hand us a WORTHLESS sig, silently neutering recourse for
+               the superseded state.  The poison session is finalized + un-reset here, so
+               its cache is the raw agg key and msg32 is the poison sighash (mirrors the
+               leaf LSP verify at lsp_channels.c ~1782). */
+            secp256k1_pubkey ppk; secp256k1_xonly_pubkey pxpk;
+            if (secp256k1_musig_pubkey_get(ctx, &ppk, &sub->poison_signing_session.cache) &&
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &pxpk, NULL, &ppk) &&
+                secp256k1_schnorrsig_verify(ctx, agg64,
+                                            sub->poison_signing_session.msg32, 32, &pxpk)) {
+                memcpy(sub->poison_agg_sig, agg64, 64);
+                sub->poison_has_agg_sig = 1;
+            } else {
+                fprintf(stderr, "Client-stateless MULTI %u: LSP-supplied sub poison agg-sig "
+                        "FAILED verify -- NOT persisting (recourse for the superseded sub "
+                        "state is unavailable; LSP or a co-signer misbehaved)\n", my_index);
+            }
         }
     }
     if (done_msg.json) cJSON_Delete(done_msg.json);

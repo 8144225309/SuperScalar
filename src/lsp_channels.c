@@ -3995,6 +3995,24 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         poison_prepared = 0;
     }
 
+    /* #53 verify-the-aggregate: before trusting (and shipping to clients) the poison
+       agg-sig, the LSP verifies it against the untweaked sub agg key + poison sighash --
+       catching a bad co-signer partial that aggregated into a worthless sig (BIP-327
+       identifiable-abort spirit; mirrors the leaf LSP verify at ~1782).  On failure
+       degrade -> the fail-closed guard below aborts (no revoke without VALID recourse). */
+    if (poison_prepared && sub->poison_is_scriptpath) {
+        secp256k1_pubkey ppk; secp256k1_xonly_pubkey pxpk;
+        if (!(secp256k1_musig_pubkey_get(lsp->ctx, &ppk, &sub->poison_signing_session.cache) &&
+              secp256k1_xonly_pubkey_from_pubkey(lsp->ctx, &pxpk, NULL, &ppk) &&
+              secp256k1_schnorrsig_verify(lsp->ctx, sub->poison_agg_sig,
+                                          sub->poison_signing_session.msg32, 32, &pxpk))) {
+            fprintf(stderr, "LSP-stateless MULTI: sub poison agg-sig FAILED self-verify "
+                            "(bad co-signer partial?) -- degrading\n");
+            factory_session_reset_poison(f, sub_node_i);
+            poison_prepared = 0;
+        }
+    }
+
     /* #53 Phase 3 fail-closed: hashlock ON + a sales-stock poison was economically
        REQUIRED but NOT co-signed -> ABORT before DONE.  Advancing would revoke the old
        sub state with no recourse (Scenario B at the sub level).  The new state is
