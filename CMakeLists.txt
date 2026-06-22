@@ -120,6 +120,7 @@ find_package(OpenSSL REQUIRED)
 add_library(superscalar
     src/dw_state.c
     src/tx_builder.c
+    src/cheat_guard.c
     src/musig.c
     src/regtest.c
     src/chain_backend_regtest.c
@@ -283,6 +284,7 @@ add_executable(test_superscalar
     tests/test_regtest.c
     tests/test_factory.c
     tests/test_factory_multi_input_keyagg.c
+    tests/test_cheat_guard.c
     tests/test_tapscript.c
     tests/test_shachain.c
     tests/test_channel.c

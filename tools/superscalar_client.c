@@ -5,6 +5,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/report.h"
 #include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
+#include "superscalar/cheat_guard.h"    /* #9 ss_find_mainnet_cheat() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/adaptor.h"
@@ -2696,14 +2697,16 @@ int main(int argc, char *argv[]) {
     /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
        test/cheat scaffolding flags on mainnet (footgun guard). */
     superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* #9 cheat-gate Layer 1: comprehensive mainnet refusal — covers every
+       dev/test/cheat arg prefix (--cheat-*/--test-*/--breach*/--kill-after*/--demo)
+       AND the SS_CHEAT*/SS_KILL* env vars (the prior inline check missed --breach,
+       --kill-after, --demo, and all env toggles). */
+    {
+        const char *cheat_opt = ss_find_mainnet_cheat(argc, argv, network);
+        if (cheat_opt) {
+            fprintf(stderr, "Error: '%s' is test/cheat scaffolding that bypasses the "
+                    "security model and is refused on mainnet.\n", cheat_opt);
+            return 1;
         }
     }
 

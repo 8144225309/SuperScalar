@@ -1457,7 +1457,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        prep so it co-signs the new state but NOT the Leaf-P poison — exercising
        the client's fail-closed "no revoke without recourse" abort.  Env-gated
        test path only (same pattern as SS_CHEAT_DAEMON_MODE). */
-    if (mgr->watchtower && poison_required && !getenv("SS_CHEAT_OMIT_POISON")) {
+    if (mgr->watchtower && poison_required &&
+        !(getenv("SS_CHEAT_OMIT_POISON") && superscalar_cheat_allowed())) {
         if (factory_session_prepare_poison_tx_leaf(
                 f, pre_node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs - 1),

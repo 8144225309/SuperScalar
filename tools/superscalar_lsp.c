@@ -15,6 +15,7 @@
 #include "superscalar/tapscript.h"
 #include "superscalar/log.h"
 #include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
+#include "superscalar/cheat_guard.h"    /* #9 ss_find_mainnet_cheat() */
 #ifdef __linux__
 #include <syslog.h>
 #endif
@@ -2130,9 +2131,23 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
-    /* #9 cheat-gate: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are inert
-       unless this is regtest, even if the env var is set directly. */
+    /* #9 cheat-gate Layer 2: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are
+       inert unless this is regtest, even if the env var is set directly. */
     superscalar_set_cheat_gate(is_regtest);
+    /* #9 cheat-gate Layer 1: refuse to start on mainnet with ANY dev/test/cheat
+       option (--cheat-*/--test-*/--breach*/--kill-after*/--demo or SS_CHEAT*/SS_KILL*
+       env).  Comprehensive + prefix-based — catches every cheat surface, incl.
+       future ones, so none is reachable on mainnet. */
+    {
+        const char *cheat_opt = ss_find_mainnet_cheat(argc, argv, network);
+        if (cheat_opt) {
+            fprintf(stderr, "FATAL: refusing to start on %s with dev/test/cheat "
+                            "option '%s' present -- it bypasses the security model "
+                            "and must never be reachable on mainnet.\n",
+                    network, cheat_opt);
+            return 1;
+        }
+    }
 
     /* Redirect logs if requested */
     if (log_file_path) {
