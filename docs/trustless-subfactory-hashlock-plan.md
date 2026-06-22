@@ -109,4 +109,12 @@ Validation: build OK + full unit suite 1510/1510 (incl. the new Phase-0 test). R
   21,667 sats sales-stock recaptured; anti-vacuity (no secret -> exit 5) enforced.
 The first e2e run caught a real N-party gap (only the LSP aggregates the sub poison; the
 client never had poison_agg_sig) -> fixed by shipping the agg-sig in SUBFACTORY_DONE (9e12d44).
+
+Adversarial-review hardening (736620f): the N-party agg-sig crosses the wire, so it is now
+VERIFIED before trust on BOTH sides (mirror of the leaf LSP verify at lsp_channels.c ~1782) --
+client verifies the LSP-supplied agg-sig vs its own poison sighash + untweaked sub agg key
+before persisting (a malicious LSP can't hand it worthless recourse); LSP self-verifies the
+aggregate before shipping (catches a bad co-signer partial -> degrade -> fail-closed abort).
+Honest flow unchanged; regtest T1+T2 RE-GREEN with the hardening.
+
 Signet to follow (cryptographic flow is network-independent; regtest is the gate).
