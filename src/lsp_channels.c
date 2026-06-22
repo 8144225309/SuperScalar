@@ -4037,8 +4037,21 @@ static int lsp_subfactory_chain_advance_stateless_multi(
        leaf).  The secret follows in the reveal below. */
     cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf, sub->ps_chain_len);
     if (f->use_hashlock_poison && poison_prepared && sub->poison_is_scriptpath &&
-        sub->poison_has_agg_sig)
-        wire_subfactory_done_set_poison_aggsig(done, sub->poison_agg_sig);
+        sub->poison_has_agg_sig) {
+        unsigned char aggsig_to_send[64];
+        memcpy(aggsig_to_send, sub->poison_agg_sig, 64);
+        /* P1 adversarial drill: a MALICIOUS LSP ships a CORRUPTED agg-sig so the client
+           would persist a worthless poison (neutering its recourse).  The client's
+           verify-before-trust (client.c ~3221) MUST reject it.  Env-gated + regtest-only
+           (superscalar_cheat_allowed); the #9 mainnet gate refuses any SS_CHEAT* env, so
+           this is unreachable on mainnet.  The LSP's own poison_agg_sig stays intact. */
+        if (superscalar_cheat_allowed() && getenv("SS_CHEAT_BAD_POISON_AGGSIG")) {
+            aggsig_to_send[0] ^= 0xff;
+            fprintf(stderr, "SS_CHEAT_BAD_POISON_AGGSIG: shipping a CORRUPTED poison agg-sig "
+                            "to sub clients (expect client verify to reject)\n");
+        }
+        wire_subfactory_done_set_poison_aggsig(done, aggsig_to_send);
+    }
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
