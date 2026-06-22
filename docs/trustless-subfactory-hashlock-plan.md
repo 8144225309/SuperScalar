@@ -59,3 +59,48 @@ MSG_LSTOCK_REVEAL[_REQUEST] array wire; persist l_stock_poison_reveals (keyed by
 - The multi-input poison signs the sales-stock input against the sub N-of-N keyagg (correct — the
   sales-stock IS the sub N-of-N output; the per-channel 2-of-2 keyaggs are for the CHANNEL inputs,
   already handled by #283).
+
+## Implementation status — DONE (commits 49383ba, 26dc6de, 6c6e2b9)
+
+What the build actually required, vs the plan above (some plan steps turned out to be no-ops
+because the existing infra was already generic):
+
+- **Phase 0 (49383ba):** `factory_subfactory_chain_advance_unsigned` bumps the counter +
+  re-derives the sales-stock SPK when `sub->has_l_stock_hash` (factory.c). Unit-proven by
+  `test_factory_subfactory_lstock_per_state_hash` (distinct H per state + superseded-secret
+  stability + a non-hashlock STATIC-SPK control).
+- **Phase 1 (26dc6de):** LSP ships H_new in `SUBFACTORY_PROPOSE_INTENT` (multi at
+  lsp_channels.c ~3605, single too); client mirrors at the parent-handler top (covers both
+  paths). The H_old-capture in the plan is UNNECESSARY: sub poison-prep runs BEFORE the advance,
+  so the NULL override already snapshots H_old (unlike the leaf, which preps after the advance and
+  must pass H_old explicitly). `factory_set_node_l_stock_hash` updates only `node_l_stock_hashes[]`,
+  not `sub->l_stock_hash`, so prep still sees H_old even with the mirror set first.
+- **Signing:** NO new code. `factory_session_finalize_node_poison` / `_complete_node_poison`
+  are node-generic + already scriptpath-aware (untweaked agg) from #387; once Phase 0 makes
+  prep set `poison_is_scriptpath`, the sub poison co-signs correctly.
+- **Phase 2 (26dc6de + 9e12d44):** LSP reveals secret_old to EVERY sub client after DONE
+  (sales-stock is N-of-N; all are beneficiaries). **N-party agg-sig gap (9e12d44):** unlike the
+  2-party leaf (whose client aggregates the poison locally), only the LSP aggregates the N-party
+  sub poison, so the client never had `poison_agg_sig`. Fix: the LSP ships the aggregated 64-byte
+  poison sig in `SUBFACTORY_DONE` (optional field). The client captures it on DONE, persists the
+  recourse TEMPLATE (agg-sig present, secret NULL), then verify-persists the secret from the
+  reveal; the poison-session reset is deferred past both. Crash recovery is then symmetric with
+  the leaf: template durable pre-reveal, 0x8D `MSG_LSTOCK_REVEAL_REQUEST` (#388, node-generic)
+  re-fetches the secret.
+- **Phase 3 (26dc6de):** LSP + client fail-closed abort when a poison was economically REQUIRED
+  (non-dust sales-stock) but NOT co-signed. `poison_required` is decoupled from the
+  watchtower/operational prep gate, mirroring the leaf guard.
+- **Phase 4:** folded into the client edits above (per-state hash is shared advance code; H_new
+  mirror, reveal recv+persist, guard all added to the client multi handler).
+- **Defense-in-depth:** the single-input sub paths are unreachable for real (k>=1) subs
+  (n_outputs>1 always dispatches multi). The LSP refuses single-input under hashlock; the client
+  refuses a single-input PROPOSE for a hashlock sub (closes a malicious-LSP downgrade vector).
+- **Phase 5 (6c6e2b9):** `test_regtest_hashlock_poison_subfactory_e2e.sh` — the existing
+  `--cheat-daemon-sub` already drives the stateless multi path (`lsp_subfactory_chain_advance`
+  forwards unconditionally to `..._stateless`), so combining it with `--enable-hashlock-poison`
+  exercises Phases 0-4 over the LIVE wire ceremony. Then client-driven recourse: assemble the sub
+  poison from the persisted reveal, broadcast vs the cheat's stale chain[N-1], assert CONFIRM +
+  non-dust sales-stock recapture + anti-vacuity.
+
+Validation: build OK + full unit suite 1510/1510 (incl. the new Phase-0 test). Regtest
+no-regression (non-hashlock multi sub advance) + the hashlock e2e run on the VPS. Signet to follow.
