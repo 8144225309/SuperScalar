@@ -66,3 +66,20 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
 
 - 2026-06-22: plan created. Baseline = #53 sub-factory hashlock proven (regtest +
   signet) + recovered; no known theft gap. Starting P1.
+- 2026-06-22: **P1 CODED** (awaiting validation) — `SS_CHEAT_BAD_POISON_AGGSIG` env
+  cheat (lsp_channels.c, regtest-only via superscalar_cheat_allowed; #9 gate refuses
+  SS_CHEAT* on mainnet) corrupts the agg-sig shipped in SUBFACTORY_DONE;
+  `tools/test_regtest_hashlock_aggsig_reject.sh` asserts the client D2-rejects + persists
+  no worthless reveal row. Committed locally.
+- 2026-06-22: **BLOCKED on local network outage** — GitHub HTTPS + VPS SSH both timing
+  out from this machine (`curl https://github.com` -> 000; ssh port 22 -> banner-exchange
+  abort). Can't push or build/test on the VPS until connectivity returns. All work is
+  committed locally on `trustless-completion`.
+- 2026-06-22: **P2 design note** (read-only investigation while blocked): the standalone
+  WT already carries a deadline-driven CPFP fee-bump escalator (watchtower.c +
+  htlc_fee_bump.h: `watchtower_build_cpfp_tx`, per-pending `fee_bump` = {start_block,
+  deadline_block, budget_sat, start_feerate, last_feerate}, `max_bump_fee_sat` ceiling).
+  So P2's harness = register a recourse/penalty at a LOW start feerate, apply fee pressure
+  (competing low-fee mempool or a manual high-feerate floor), and prove the escalator bumps
+  the package to CONFIRM before the CSV/CLTV `deadline_block`. The mechanism exists (#52);
+  P2 proves it WINS the contested race. Resume here when the network is back.
