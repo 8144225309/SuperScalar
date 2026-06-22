@@ -552,6 +552,11 @@ void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
 int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
                       unsigned char *spk_out34);
 
+/* Recovery helper: L-stock taptree merkle root for a leaf/sub node (the taptweak
+   to key-path-spend that L-stock output in an offline residual sweep). */
+int factory_l_stock_merkle(const factory_t *f, const factory_node_t *node,
+                           unsigned char merkle_out32[32]);
+
 /* #53: hashlock-gated L-stock poison over the Leaf-P SCRIPT-path (replaces the
    key-path poison, which is vulnerable to Scenario B).  Builds the per-client
    redistribution outputs, N-of-N MuSig-signs the UNtweaked agg key over the

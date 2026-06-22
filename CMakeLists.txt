@@ -455,6 +455,15 @@ if(ENABLE_SANITIZERS)
     target_link_libraries(superscalar_lstock_recover PRIVATE project_sanitizers)
 endif()
 
+# Offline factory-residual recovery: rebuild the tree in-process + MuSig key-path
+# co-sign the MuSig/CLTV/L-stock residual outputs (we hold all seckeys for test factories).
+add_executable(superscalar_factory_residual_sweep tools/superscalar_factory_residual_sweep.c)
+target_include_directories(superscalar_factory_residual_sweep PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(superscalar_factory_residual_sweep PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(superscalar_factory_residual_sweep PRIVATE project_sanitizers)
+endif()
+
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---
 if(ENABLE_FUZZING)
     set(FUZZ_SOURCES

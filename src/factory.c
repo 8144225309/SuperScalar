@@ -287,6 +287,17 @@ static int build_l_stock_taptree(const factory_t *f,
     return 1;
 }
 
+/* Recovery helper: return the L-stock taptree merkle root for a leaf/sub node
+   (the taptweak needed to key-path-spend that L-stock output).  Thin public
+   wrapper over build_l_stock_taptree so an offline residual-sweep tool can
+   reconstruct the exact taptweak without re-deriving the leaves itself. */
+int factory_l_stock_merkle(const factory_t *f, const factory_node_t *node,
+                           unsigned char merkle_out32[32]) {
+    if (!f || !node || !merkle_out32) return 0;
+    tapscript_leaf_t lp, ll;
+    return build_l_stock_taptree(f, node, NULL, &lp, &ll, merkle_out32, NULL);
+}
+
 int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
                        unsigned char *spk_out34) {
     if (!f || !leaf_node || !spk_out34) return 0;
