@@ -60,7 +60,32 @@ The "live pointer advances only on durable recourse" refinement, made recoverabl
   recv reveal -> verify (SHA256==H_old) + `persist_update_l_stock_secret` (reuse the
   client.c:3966 verify path; find the client connect/startup flow). Keystone — wires both
   daemon message loops; do with fresh attention.
-- Phase 3 (crash matrix): after 2c.
+- Phase 2c (dispatch wiring): DONE — LSP 0x8D handler (re-derive, superseded-only) + client
+  reconnect re-request; build + 1508 unit + 4c green.
+
+## ELITE SEED-DURABILITY + LSP RESTART-RESUME — DONE + PROVEN (2026-06-22)
+Root cause found while doing 2c: the LSP minted a RANDOM seed per run + never persisted it,
+so hashlock poison could not survive an LSP restart (a #387 daemon-model gap). Fixed the
+elite way — "derive, don't store" (mirrors LND/CLN/LDK commitment-secret derivation):
+- `factory_derive_lstock_seed(master, funding_txid, funding_vout)` = tagged_hash, deterministic
+  per (LSP key, factory). Survives restart + backup-restore for free; domain-separated;
+  one-way; trust-model-invisible (client verifies SHA256==H). Unit-proven deterministic.
+- lsp_run_factory_creation_stateless derives + installs it (creation + every rotation).
+- Schema v39: factories.use_hashlock_poison persisted like leaf_arity (self-describing reload).
+- LSP recovery path re-derives the seed + re-enables, fail-closed (never silently un-gate).
+- e2e `test_regtest_hashlock_restart_resume.sh` GREEN: run-1 advance persists the flag +
+  client reveal; run-2 restart RE-ENABLES (seed re-derived) + the client poison still assembles.
+
+## Mid-session dropped-reveal — handled, no extra guard needed
+A reveal dropped mid-session (no crash) is NOT a residual gap: P1 persists the template at
+commit, the reveal handler logs-and-continues (does not fail the committed advance), and P2c
+recovers the secret on the next reconnect (the LSP can always re-derive). The DW/CLTV override
+prevents the theft in the interim (degraded = no poison punishment, not fund loss). A "refuse
+to advance" guard would be a liveness hit for no safety gain, so it is deliberately NOT added.
+
+## Crash matrix (residual)
+The per-point crash matrix (crash at each reveal step) remains as optional extra coverage; the
+recovery is already proven by the client-restart (P2c) + LSP-restart (restart-resume) e2es.
 
 ## Reuse from #387
 `MSG_LSTOCK_REVEAL` (request can be a sibling opcode), `persist_save/update/load_l_stock_poison`
