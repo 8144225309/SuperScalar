@@ -2135,9 +2135,9 @@ int main(int argc, char *argv[]) {
        inert unless this is regtest, even if the env var is set directly. */
     superscalar_set_cheat_gate(is_regtest);
     /* #9 cheat-gate Layer 1: refuse to start on mainnet with ANY dev/test/cheat
-       option (--cheat-*/--test-*/--breach*/--kill-after*/--demo or SS_CHEAT*/SS_KILL*
-       env).  Comprehensive + prefix-based — catches every cheat surface, incl.
-       future ones, so none is reachable on mainnet. */
+       option (the --cheat, --test-, --breach, --kill-after, --demo arg families or
+       the SS_CHEAT / SS_KILL env families).  Comprehensive, prefix-based: catches
+       every cheat surface incl. future ones, so none is reachable on mainnet. */
     {
         const char *cheat_opt = ss_find_mainnet_cheat(argc, argv, network);
         if (cheat_opt) {

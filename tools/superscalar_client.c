@@ -2697,10 +2697,10 @@ int main(int argc, char *argv[]) {
     /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
        test/cheat scaffolding flags on mainnet (footgun guard). */
     superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
-    /* #9 cheat-gate Layer 1: comprehensive mainnet refusal — covers every
-       dev/test/cheat arg prefix (--cheat-*/--test-*/--breach*/--kill-after*/--demo)
-       AND the SS_CHEAT*/SS_KILL* env vars (the prior inline check missed --breach,
-       --kill-after, --demo, and all env toggles). */
+    /* #9 cheat-gate Layer 1: comprehensive mainnet refusal covering every
+       dev/test/cheat arg family (--cheat, --test-, --breach, --kill-after, --demo)
+       AND the SS_CHEAT / SS_KILL env families (the prior inline check missed
+       --breach, --kill-after, --demo, and all env toggles). */
     {
         const char *cheat_opt = ss_find_mainnet_cheat(argc, argv, network);
         if (cheat_opt) {
