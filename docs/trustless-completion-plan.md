@@ -35,7 +35,8 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
   DoD: a regtest test where the LSP ships a CORRUPTED poison agg-sig in
   SUBFACTORY_DONE (env-gated cheat); the client's verify-before-trust REJECTS it
   and does NOT persist a worthless reveal row; assert the loud abort. "Prove the
-  negative" on the N-party agg-sig verify. STATUS: pending.
+  negative" on the N-party agg-sig verify. STATUS: **DONE + PROVEN** (regtest green:
+  LSP shipped corrupt sig, 2 clients D2-rejected, 0 worthless rows).
 - **P2 — Layer 3: recourse WINS the fee-race (#60).** DoD: a regtest harness where
   after a breach the recourse must confirm despite a competing low-fee mempool /
   the LSP's L&CSV fallback; prove it confirms (fee-bumping via #52 if needed).
@@ -83,3 +84,6 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
   (competing low-fee mempool or a manual high-feerate floor), and prove the escalator bumps
   the package to CONFIRM before the CSV/CLTV `deadline_block`. The mechanism exists (#52);
   P2 proves it WINS the contested race. Resume here when the network is back.
+- 2026-06-22: network restored (fail2ban ban aged out). **P1 VALIDATED GREEN** on regtest
+  (LSP shipped corrupt agg-sig; 2 clients D2-rejected; 0 worthless reveal rows). P1 closed.
+  Starting **P2** (Layer-3 fee-race).
