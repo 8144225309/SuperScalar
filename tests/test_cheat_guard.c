@@ -49,7 +49,7 @@ int test_cheat_guard_mainnet_refusal(void) {
       TEST_ASSERT(ss_find_mainnet_cheat(2, a, "signet")  == NULL, "signet permits cheats");
       TEST_ASSERT(ss_find_mainnet_cheat(2, a, "testnet") == NULL, "testnet permits cheats"); }
 
-    /* --- env-var cheats (SS_CHEAT*/SS_KILL*) are caught on mainnet --- */
+    /* --- env-var cheats (SS_CHEAT and SS_KILL families) are caught on mainnet --- */
     setenv("SS_CHEAT_OMIT_POISON", "1", 1);
     { char *a[] = { prog, (char *)"--port", (char *)"9735" };
       TEST_ASSERT(ss_find_mainnet_cheat(3, a, "mainnet") != NULL, "mainnet refuses SS_CHEAT_* env");
