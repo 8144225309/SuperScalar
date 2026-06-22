@@ -3248,11 +3248,12 @@ static int client_handle_subfactory_advance_stateless_multi(
 
     /* #53 Phase 2: receive + verify + persist the SUPERSEDED sub state's sales-stock
        revocation secret, so this client (or its standalone WT) can spend the Leaf-P sub
-       poison if the LSP later broadcasts that stale sub state.  Only when this advance
-       co-signed a script-path poison (hashlock on).  Verify-before-persist (fail-closed),
-       mirroring the leaf path (client.c ~3999).  Always recv when scriptpath (even if
-       persist is NULL) so the wire stays in sync with the LSP's post-DONE reveal. */
-    if (sub->poison_is_scriptpath && sub->poison_has_agg_sig) {
+       poison if the LSP later broadcasts that stale sub state.  Recv whenever we prepped a
+       script-path poison (hashlock on) -- the EXACT mirror of the LSP's reveal-send gate
+       (use_hashlock_poison && poison_prepared) -- so the wire stays in sync even if the
+       agg-sig was somehow absent from DONE; the persist below additionally requires the
+       agg-sig.  Verify-before-persist (fail-closed), mirroring the leaf path (~3999). */
+    if (sub->poison_is_scriptpath) {
         wire_msg_t rev_msg;
         if (wire_recv(fd, &rev_msg) && rev_msg.msg_type == MSG_LSTOCK_REVEAL) {
             uint32_t rn[1], rs[1];
@@ -3262,7 +3263,8 @@ static int client_handle_subfactory_advance_stateless_multi(
                 rcount == 1) {
                 unsigned char chk[32];
                 sha256(rsec[0], 32, chk);
-                if (persist && memcmp(chk, sub->poison_l_stock_hash, 32) == 0) {
+                if (persist && sub->poison_has_agg_sig &&
+                    memcmp(chk, sub->poison_l_stock_hash, 32) == 0) {
                     persist_save_l_stock_poison(persist, /* factory_id */ 0,
                         (uint32_t)sub_node_i, rs[0], sub->poison_l_stock_hash,
                         sub->poison_agg_sig,

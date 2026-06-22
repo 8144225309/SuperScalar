@@ -102,5 +102,11 @@ because the existing infra was already generic):
   poison from the persisted reveal, broadcast vs the cheat's stale chain[N-1], assert CONFIRM +
   non-dust sales-stock recapture + anti-vacuity.
 
-Validation: build OK + full unit suite 1510/1510 (incl. the new Phase-0 test). Regtest
-no-regression (non-hashlock multi sub advance) + the hashlock e2e run on the VPS. Signet to follow.
+Validation: build OK + full unit suite 1510/1510 (incl. the new Phase-0 test). Regtest GREEN:
+- T1 no-regression (non-hashlock multi sub advance, k=2): PASS.
+- T2 hashlock e2e: PASS — live multi-input advance -> per-state H -> reveal -> client
+  verify-persist -> assemble -> broadcast vs the cheat's stale chain[N-1] -> CONFIRM,
+  21,667 sats sales-stock recaptured; anti-vacuity (no secret -> exit 5) enforced.
+The first e2e run caught a real N-party gap (only the LSP aggregates the sub poison; the
+client never had poison_agg_sig) -> fixed by shipping the agg-sig in SUBFACTORY_DONE (9e12d44).
+Signet to follow (cryptographic flow is network-independent; regtest is the gate).
