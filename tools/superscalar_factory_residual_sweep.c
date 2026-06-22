@@ -175,36 +175,39 @@ int main(int argc, char **argv) {
         int m = match_output(f, spk, signers, &n_sig, merkle, &has_merkle, what, sizeof(what));
         if (m != 1) { printf("[%s:%u] NO MATCH in tree (%d sats) -- skipping\n", p_txid, in_vout, (int)in_amt); free(d); continue; }
 
-        /* reconstruct SPK from (signers, merkle) and ASSERT == on-chain spk */
+        /* tweaked output key parsed from the matched on-chain SPK (P2TR 0x5120||xonly).
+           match_output already confirmed spk == a rebuilt tree output (identifies the
+           output); the MuSig self-verify below confirms our (participants,merkle)
+           reproduce a VALID key-path sig for it -> a wrong derivation fails the verify
+           and is NEVER broadcast (no wasted fee). */
         secp256k1_pubkey pks[64]; secp256k1_keypair sgn_kps[64];
         for (size_t k=0;k<n_sig;k++){ pks[k]=f->pubkeys[signers[k]]; sgn_kps[k]=kps[signers[k]]; }
         musig_keyagg_t ka; if (!musig_aggregate_keys(ctx,&ka,pks,n_sig)){fprintf(stderr,"keyagg fail\n");free(d);continue;}
-        secp256k1_xonly_pubkey tw; int par;
-        if (!taproot_tweak_pubkey(ctx,&tw,&par,&ka.agg_pubkey, has_merkle?merkle:NULL)){fprintf(stderr,"tweak fail\n");free(d);continue;}
-        unsigned char rspk[34]; build_p2tr_script_pubkey(rspk,&tw);
-        char a[69],b[69]; hex_encode(rspk,34,a); a[68]=0; hex_encode(spk,34,b); b[68]=0;
-        int spk_ok = (memcmp(rspk,spk,34)==0);
-        printf("[%s:%u] %s  signers=%zu merkle=%d  amount=%llu\n  on-chain spk: %s\n  rebuilt  spk: %s  -> %s\n",
-               p_txid, in_vout, what, n_sig, has_merkle, (unsigned long long)in_amt, b, a, spk_ok?"MATCH":"MISMATCH");
-        if (!spk_ok) { printf("  SPK MISMATCH -> NOT signing (reconstruction wrong)\n"); free(d); continue; }
-        n_ok++;
-        if (!do_broadcast) { free(d); continue; }
+        secp256k1_xonly_pubkey tw;
+        if (spk[0]!=0x51 || spk[1]!=0x20 || !secp256k1_xonly_pubkey_parse(ctx,&tw,spk+2)){fprintf(stderr,"  not a p2tr spk\n");free(d);continue;}
+        char b[69]; hex_encode(spk,34,b); b[68]=0;
+        printf("[%s:%u] %s  signers=%zu merkle=%d  amount=%llu  spk=%s\n",
+               p_txid,in_vout,what,n_sig,has_merkle,(unsigned long long)in_amt,b);
 
-        /* build sweep tx + key-path MuSig sign with the taptweak */
+        /* build sweep tx + key-path MuSig sign with the taptweak (always; the system()
+           broadcast at the end is gated by --broadcast, so dry-run = sign + self-verify). */
         unsigned char in_txid_le[32]; memcpy(in_txid_le,in_txid,32); reverse_bytes(in_txid_le,32);
         tx_output_t o; memset(&o,0,sizeof o); o.amount_sats = in_amt - fee;
         memcpy(o.script_pubkey,dest_spk,dest_len); o.script_pubkey_len=dest_len;
         tx_buf_t utx; tx_buf_init(&utx,256);
         if (!build_unsigned_tx(&utx,NULL,in_txid_le,in_vout,0xFFFFFFFEu,&o,1)){fprintf(stderr,"  build_unsigned fail\n");free(d);continue;}
         unsigned char sighash[32];
-        if (!compute_taproot_sighash(sighash,utx.data,utx.len,0,rspk,34,in_amt,0xFFFFFFFEu)){fprintf(stderr,"  sighash fail\n");free(d);continue;}
+        if (!compute_taproot_sighash(sighash,utx.data,utx.len,0,spk,34,in_amt,0xFFFFFFFEu)){fprintf(stderr,"  sighash fail\n");free(d);continue;}
         unsigned char sig[64];
         if (!musig_sign_taproot(ctx,sig,sighash,sgn_kps,n_sig,&ka, has_merkle?merkle:NULL)){fprintf(stderr,"  musig_sign fail\n");free(d);continue;}
-        if (!secp256k1_schnorrsig_verify(ctx,sig,sighash,32,&tw)){fprintf(stderr,"  self-verify FAIL -- not broadcasting\n");free(d);continue;}
+        if (!secp256k1_schnorrsig_verify(ctx,sig,sighash,32,&tw)){printf("  SELF-VERIFY FAIL -> (participants,merkle) wrong, NOT broadcasting\n");free(d);continue;}
+        printf("  self-verify OK\n");
+        n_ok++;
         tx_buf_t stx; tx_buf_init(&stx,256);
         if (!finalize_signed_tx(&stx,utx.data,utx.len,sig)){fprintf(stderr,"  finalize fail\n");free(d);continue;}
         char *txh = malloc(stx.len*2+1); hex_encode(stx.data,stx.len,txh); txh[stx.len*2]=0;
         printf("  signed (%zu B)\n  hex: %s\n", stx.len, txh);
+        if (!do_broadcast) { free(txh); free(d); continue; }
         char cmd[200000];
         const char *rpc = !strcmp(network,"signet") ? "-signet -rpcuser=signetrpc -stdinrpcpass -rpcport=38332"
                         : "-regtest -rpcuser=rpcuser -rpcpassword=rpcpass -rpcport=18443";
