@@ -1117,6 +1117,13 @@ int wire_parse_subfactory_psig(const cJSON *json,
 
 /* LSP → sub clients: SUBFACTORY_DONE {leaf_side, sub_idx, chain_len} */
 cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len);
+/* #53 sub-factory hashlock: optional aggregated poison Schnorr sig carried in DONE
+   (the N-party sub poison is aggregated only by the LSP; the client needs it for its
+   persisted recourse template).  No-op when poison_agg_sig64 is NULL / field absent. */
+void wire_subfactory_done_set_poison_aggsig(cJSON *done,
+                                            const unsigned char *poison_agg_sig64);
+int wire_subfactory_done_get_poison_aggsig(const cJSON *json,
+                                           unsigned char *poison_agg_sig64_out);
 int wire_parse_subfactory_done(const cJSON *json,
                                  int *leaf_side, int *sub_idx,
                                  uint32_t *chain_len);

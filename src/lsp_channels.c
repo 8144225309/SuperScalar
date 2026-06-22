@@ -4013,8 +4013,14 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         return 0;
     }
 
-    /* Step 9: DONE to each client. */
+    /* Step 9: DONE to each client.  #53: when the poison was co-signed, attach the
+       AGGREGATED poison Schnorr sig so each sub client can persist a complete recourse
+       template (it cannot aggregate the N-party poison locally, unlike the 2-party
+       leaf).  The secret follows in the reveal below. */
     cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf, sub->ps_chain_len);
+    if (f->use_hashlock_poison && poison_prepared && sub->poison_is_scriptpath &&
+        sub->poison_has_agg_sig)
+        wire_subfactory_done_set_poison_aggsig(done, sub->poison_agg_sig);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);

@@ -3205,13 +3205,35 @@ static int client_handle_subfactory_advance_stateless_multi(
     }
     cJSON_Delete(fp_json);
 
-    /* #59/#53 Phase 2: FINAL is sent -> the sub-advance is committed + the old sub state
-       superseded.  Persist the poison TEMPLATE now (revocation_secret NULL), BEFORE
-       awaiting DONE + a reveal that may never arrive (LSP crash / dropped link), so a
-       restart can detect the missing secret and re-request it.  Keyed by node_idx +
-       superseded state.  Do NOT reset the poison session yet -- the template persist, the
-       reveal verify, and the reveal persist below all read sub->poison_* (the next
-       advance's prep resets it, mirroring the leaf client). */
+    /* Wait for DONE.  #53: when this advance co-signed a script-path (hashlock) poison,
+       DONE carries the LSP's AGGREGATED poison Schnorr sig -- the client cannot aggregate
+       the N-party sub poison locally (unlike the 2-party leaf, which calls
+       factory_session_complete_node_poison itself).  Capture it BEFORE persisting the
+       recourse template; the secret follows in the reveal. */
+    wire_msg_t done_msg;
+    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_SUBFACTORY_DONE) {
+        fprintf(stderr, "Client-stateless MULTI %u: expected DONE, got 0x%02x\n",
+                my_index, done_msg.json ? done_msg.msg_type : 0);
+        if (done_msg.json) cJSON_Delete(done_msg.json);
+        if (poison_prepared_c) factory_session_reset_poison(factory, sub_node_i);
+        return 0;
+    }
+    if (sub->poison_is_scriptpath) {
+        unsigned char agg64[64];
+        if (wire_subfactory_done_get_poison_aggsig(done_msg.json, agg64)) {
+            memcpy(sub->poison_agg_sig, agg64, 64);
+            sub->poison_has_agg_sig = 1;
+        }
+    }
+    if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    /* #59/#53 Phase 2: the advance is committed + the old sub state superseded.  Persist
+       the poison TEMPLATE now (agg-sig from DONE; revocation_secret still NULL), BEFORE
+       awaiting the reveal that may never arrive (LSP crash / dropped link), so a restart
+       can detect the missing secret and re-request it (0x8D).  Keyed by node_idx +
+       superseded state.  Do NOT reset the poison session yet -- the template persist + the
+       reveal persist below read sub->poison_* (the next advance's prep resets it,
+       mirroring the leaf client). */
     persist_t *persist = g_client_persist;
     if (persist && sub->poison_is_scriptpath && sub->poison_has_agg_sig) {
         uint32_t superseded_state = (sub->l_stock_state_counter > 0)
@@ -3223,17 +3245,6 @@ static int client_handle_subfactory_advance_stateless_multi(
             sub->poison_leaf_script, sub->poison_leaf_script_len,
             sub->poison_control_block, sub->poison_control_block_len);
     }
-
-    /* Wait for DONE. */
-    wire_msg_t done_msg;
-    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_SUBFACTORY_DONE) {
-        fprintf(stderr, "Client-stateless MULTI %u: expected DONE, got 0x%02x\n",
-                my_index, done_msg.json ? done_msg.msg_type : 0);
-        if (done_msg.json) cJSON_Delete(done_msg.json);
-        if (poison_prepared_c) factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    if (done_msg.json) cJSON_Delete(done_msg.json);
 
     /* #53 Phase 2: receive + verify + persist the SUPERSEDED sub state's sales-stock
        revocation secret, so this client (or its standalone WT) can spend the Leaf-P sub

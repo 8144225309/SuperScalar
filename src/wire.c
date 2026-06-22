@@ -2873,6 +2873,25 @@ cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len
     return j;
 }
 
+/* #53 sub-factory hashlock: carry the LSP's AGGREGATED poison Schnorr sig in
+   SUBFACTORY_DONE.  Unlike the 2-party leaf (where the client aggregates the poison
+   locally), the N-party sub poison is aggregated ONLY by the LSP — so the LSP must
+   hand each sub client the 64-byte agg-sig for its persisted recourse template (the
+   client builds the rest of the template deterministically + receives the secret in
+   the reveal).  Optional field (absent when hashlock poison is off); mutator/getter
+   pattern mirrors wire_subfactory_propose_set_inputs (no DONE signature churn). */
+void wire_subfactory_done_set_poison_aggsig(cJSON *done,
+                                            const unsigned char *poison_agg_sig64) {
+    if (!done || !poison_agg_sig64) return;
+    wire_json_add_hex(done, "poison_agg_sig", poison_agg_sig64, 64);
+}
+
+int wire_subfactory_done_get_poison_aggsig(const cJSON *json,
+                                           unsigned char *poison_agg_sig64_out) {
+    if (!json || !poison_agg_sig64_out) return 0;
+    return wire_json_get_hex(json, "poison_agg_sig", poison_agg_sig64_out, 64) == 64;
+}
+
 /* --- Multi-input sub-factory chain advance helpers (#207 phase 2c) ---
    See include/superscalar/wire.h for the design rationale.  All these
    helpers MUTATE an existing PROPOSE/NONCE/ALL_NONCES/PSIG cJSON by
