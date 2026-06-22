@@ -3529,12 +3529,18 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         memcpy(wt_old_chain_spk, sub->outputs[0].script_pubkey,
                wt_old_chain_spk_len);
     uint32_t wt_old_csv_delay = (uint32_t)(sub->nsequence & 0xFFFFu);
-    if (mgr->watchtower &&
-        wt_old_sstock_amount > POISON_FEE_SATS + (uint64_t)wt_old_n_chans * 330u) {
+    /* #53 Phase 3: economic poison requirement, DECOUPLED from the watchtower/
+       operational prep gate — the OLD sub state has a protectable, non-dust
+       sales-stock.  The fail-closed guard below (before DONE) fires whenever a
+       required poison was not co-signed, but never when no poison was ever needed. */
+    int poison_required = (wt_old_sstock_amount > POISON_FEE_SATS +
+                           (uint64_t)wt_old_n_chans * 330u);
+    if (mgr->watchtower && poison_required) {
         if (factory_session_prepare_poison_tx_subfactory(
                 f, sub_node_i, wt_old_chain_txid, (uint32_t)wt_old_n_chans,
                 wt_old_sstock_amount, POISON_FEE_SATS,
-                NULL /* #53-B3b: capture sub H_old when daemon hashlock on */)) {
+                NULL /* prep-before-advance: sub->l_stock_hash is still H_old here,
+                        so NULL override naturally targets the superseded state */)) {
             poison_prepared = 1;
         } else {
             fprintf(stderr, "LSP-stateless subfactory MULTI: poison TX prep "
@@ -3592,6 +3598,12 @@ static int lsp_subfactory_chain_advance_stateless_multi(
     cJSON *propose = wire_build_subfactory_propose_intent(
         (uint32_t)sub_node_i, (uint32_t)n_inputs,
         leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
+    /* #53 sub-factory hashlock: ship the sub's NEW-state H (set by Phase 0 of the
+       advance above) so the seedless client mirrors it via factory_set_node_l_stock_hash
+       and builds the IDENTICAL sales-stock SPK before its own sub-advance. Absent when
+       hashlock poison off -> client no-ops. Mirrors the leaf path (lsp_channels.c ~1497). */
+    if (f->use_hashlock_poison && sub->has_l_stock_hash)
+        wire_json_add_hex(propose, "l_stock_hash", sub->l_stock_hash, 32);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_PROPOSE_INTENT, propose)) {
@@ -3983,6 +3995,24 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         poison_prepared = 0;
     }
 
+    /* #53 Phase 3 fail-closed: hashlock ON + a sales-stock poison was economically
+       REQUIRED but NOT co-signed -> ABORT before DONE.  Advancing would revoke the old
+       sub state with no recourse (Scenario B at the sub level).  The new state is
+       assembled in memory only (not persisted / DONE-sent yet), so resetting it here
+       keeps BOTH sides on the old, still-recourse-able state.  Subsumes every
+       degrade-and-continue site above (any leaves poison_prepared==0) plus the case
+       where prep never ran.  Mirrors the leaf guard (lsp_channels.c ~1821); legacy
+       (flag off) keeps the prior degrade-and-continue behavior unchanged. */
+    if (f->use_hashlock_poison && poison_required && !poison_prepared) {
+        fprintf(stderr, "LSP-stateless MULTI: hashlock ON + sales-stock poison REQUIRED "
+                        "but NOT co-signed -- ABORTING sub-advance (no revoke without "
+                        "recourse)\n");
+        sub->is_signed = 0;
+        tx_buf_reset(&sub->signed_tx);
+        factory_session_reset_poison(f, sub_node_i);
+        return 0;
+    }
+
     /* Step 9: DONE to each client. */
     cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf, sub->ps_chain_len);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
@@ -3990,6 +4020,34 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_DONE, done);
     }
     cJSON_Delete(done);
+
+    /* #53 Phase 2: reveal the SUPERSEDED sub state's sales-stock revocation secret to
+       EVERY sub client (targeted, not broadcast).  Each client verifies + persists it
+       so it (or its standalone WT) can spend the Leaf-P sub poison if the LSP later
+       broadcasts that stale sub state -- closing Scenario B at the sub level in the live
+       protocol.  Gated on hashlock + a poison having been co-signed; the secret is
+       re-derived from the seed, keyed by the sub node's agg xonly + the OLD state
+       counter (which Phase 0 bumped during this advance, so current-1 = superseded). */
+    if (f->use_hashlock_poison && poison_prepared && sub->has_l_stock_hash) {
+        uint32_t old_counter = (sub->l_stock_state_counter > 0)
+                               ? sub->l_stock_state_counter - 1u : 0u;
+        unsigned char reveal_secret[1][32];
+        if (factory_derive_l_stock_secret(f, sub, old_counter, reveal_secret[0])) {
+            uint32_t rn = (uint32_t)sub_node_i;
+            cJSON *rev = wire_build_lstock_reveal(&rn, &old_counter, reveal_secret, 1);
+            if (rev) {
+                for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
+                    size_t fd_idx = (size_t)(sub_clients[ci] - 1);
+                    wire_send(lsp->client_fds[fd_idx], MSG_LSTOCK_REVEAL, rev);
+                }
+                cJSON_Delete(rev);
+                printf("LSP-stateless MULTI: revealed sub sales-stock secret for "
+                       "node %zu state %u to %zu clients\n",
+                       sub_node_i, old_counter, n_clients_in_sub);
+            }
+            memset(reveal_secret, 0, sizeof(reveal_secret));
+        }
+    }
 
     lsp_crash_checkpoint("subfactory_multi_finalize_partial");
 
@@ -4162,6 +4220,19 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
             leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
     }
 
+    /* #53 fail-closed: the hashlock sales-stock poison (per-state H, reveal, fail-closed
+       guard) is wired ONLY in the multi-input ceremony above.  Any real sub-factory
+       (k>=1 channels -> n_outputs > 1) dispatches there; this single-input tail is only
+       reachable for a degenerate 0-channel sub (whose channel advance fails the bounds
+       check anyway).  Refuse rather than run a single-input advance that would revoke the
+       old sub state with no hashlock recourse.  Non-hashlock subs keep the legacy flow. */
+    if (f->use_hashlock_poison && sub->has_l_stock_hash) {
+        fprintf(stderr, "LSP-stateless subfactory advance: hashlock poison ON but reached "
+                        "the single-input path (n_outputs=%zu) -- REFUSING (hashlock sub "
+                        "poison is multi-input only)\n", sub->n_outputs);
+        return 0;
+    }
+
     /* Step 1.5 (poison prep): snapshot the soon-to-be-stale chain[N-1] state
        (txid + per-channel amounts + sales-stock) BEFORE advance_unsigned
        mutates sub->txid / sub->outputs[], then build the unsigned L-stock
@@ -4251,6 +4322,11 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
             cer_persisted = 1;
     }
     cJSON *propose = wire_build_subfactory_propose_intent((uint32_t)sub_node_i, 1, leaf_side, sub_idx_in_leaf, channel_idx_in_sub, delta_sats);
+    /* #53 sub-factory hashlock: ship the sub's NEW-state H (Phase 0 of the advance
+       above) so the seedless client mirrors it before its own sub-advance. No-op when
+       hashlock poison off. Mirrors the leaf path + the multi-input branch above. */
+    if (f->use_hashlock_poison && sub->has_l_stock_hash)
+        wire_json_add_hex(propose, "l_stock_hash", sub->l_stock_hash, 32);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
         if (!wire_send(lsp->client_fds[fd_idx], MSG_SUBFACTORY_PROPOSE_INTENT, propose)) {
