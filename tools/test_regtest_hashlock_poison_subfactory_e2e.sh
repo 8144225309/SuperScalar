@@ -278,7 +278,7 @@ if [ "${SS_POISON_CPFP_RACE:-0}" = 1 ]; then
     echo "  poison deprioritised by $DEPRIO sats (bare fixed-fee poison now unmineable)"
     # CONTROL: the bare poison must STAY unconfirmed, else the CPFP proof is vacuous.
     for i in $(seq 1 4); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; done
-    c0=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    c0=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
     { [ -z "$c0" ] || [ "$c0" -eq 0 ]; } || { echo "FAIL(control): poison confirmed despite -$DEPRIO deprioritise ($c0 confs) -- pressure not biting; CPFP proof vacuous"; exit 1; }
     echo "  CONTROL OK: bare poison STUCK unconfirmed under fee pressure (4 blocks, no CPFP)"
     # Locate the poison's client output in the pre-staged CPFP wallet (it ingested
@@ -290,11 +290,13 @@ except Exception: u=[]
 print(u[0]['vout'], format(u[0]['amount'],'.8f'), u[0]['scriptPubKey']) if u else print('')")
     [ -n "${CV:-}" ] || { echo "FAIL: CPFP wallet did not ingest the poison output (txid=$POISON_TXID)"; $BCLI -rpcwallet=$CPFP_WALLET listunspent 0 2>/dev/null | head -40; exit 1; }
     echo "  poison client output located: vout=$CV amount=$CA BTC"
-    # Build a fat-fee CPFP child: absolute 12000-sat fee (>> the $DEPRIO deficit) so the
-    # poison+child PACKAGE clears the floor.  Sweep the single explicit input to the miner.
+    # Build a fat-fee CPFP child whose absolute fee >> the $DEPRIO deficit so the
+    # poison+child PACKAGE clears the floor.  Adapt the fee down for a small output,
+    # but it must still exceed the deficit (else the package can't be mined at all).
     CA_SATS=$(python3 -c "print(int(round(float('$CA')*1e8)))")
     CHILD_FEE=12000
-    [ "$CA_SATS" -gt $((CHILD_FEE + 600)) ] || { echo "FAIL: poison output ${CA_SATS} sats too small to CPFP with a ${CHILD_FEE}-sat fee"; exit 1; }
+    [ "$CA_SATS" -gt $((CHILD_FEE + 1500)) ] || CHILD_FEE=$(( CA_SATS > 1500 ? CA_SATS - 1500 : 0 ))
+    [ "$CHILD_FEE" -gt $((DEPRIO + 2000)) ] || { echo "FAIL: poison output ${CA_SATS} sats too small to CPFP past the ${DEPRIO}-sat deficit"; exit 1; }
     OUT_SATS=$((CA_SATS - CHILD_FEE))
     OUT_BTC=$(python3 -c "print(format($OUT_SATS/1e8,'.8f'))")
     CHILD_DEST=$($BCLI -rpcwallet=$MINER_WALLET -named getnewaddress address_type=bech32m)
@@ -308,9 +310,9 @@ except Exception: print('')")
     echo "  CPFP child broadcast: $CHILD_TXID (absolute fee ${CHILD_FEE} sats >> ${DEPRIO}-sat deficit)"
     # The package (poison+child) must now confirm -- and the poison output stays swept.
     PCONF=0; PBLKS=0
-    for i in $(seq 1 8); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PBLKS=$i; c=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
+    for i in $(seq 1 8); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PBLKS=$i; c=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1 || true); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
     [ "$PCONF" -ge 1 ] || { echo "FAIL: poison did NOT confirm even after CPFP -- #60 race LOST"; exit 1; }
-    CC=$($BCLI getrawtransaction "$CHILD_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    CC=$($BCLI getrawtransaction "$CHILD_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
     echo "  poison CONFIRMED via CPFP after ${PBLKS} block(s) (${PCONF} confs); child confs=${CC:-0}"
     [ "$PBLKS" -lt 144 ] || { echo "FAIL: CPFP confirmation took $PBLKS blocks >= 144-block CSV head-start"; exit 1; }
     echo
