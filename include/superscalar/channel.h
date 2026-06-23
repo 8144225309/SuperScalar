@@ -123,6 +123,10 @@ typedef struct {
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
+    int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
+                             negotiated like option_anchors -- BOTH parties must set it
+                             identically or the co-signed commitment sighash diverges.
+                             Default 0 (raw channel_init); production sets it on. */
 
     /* Splicing state (Phase G) */
     int           channel_quiescent;       /* 1 if in quiescence for splice */

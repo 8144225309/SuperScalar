@@ -593,6 +593,56 @@ int test_htlc_commit_mixed_dust_counted(void) {
 }
 
 /* ================================================================== */
+/* HC13 — #56 P2A CPFP anchor: gated, appended last, funded by to_remote */
+/* ================================================================== */
+
+int test_htlc_commit_cpfp_anchor_present(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    channel_t ch;
+    ASSERT(hc_setup_channel(&ch, ctx, 1000000, 200000), "setup channel");
+
+    /* Non-anchor tx layout (no segwit marker in the unsigned tx):
+       nVersion(4)+in_count(1)+input(41)=46, out_count[46], then 43-byte P2TR
+       outputs (amount8+len1+spk34).  to_remote = output[1] amount at [90..97]. */
+    unsigned char txid[32];
+
+    /* Flag OFF: anchorless 2-output commitment (legacy/unit default). */
+    ch.use_cpfp_anchor = 0;
+    tx_buf_t tx0; tx_buf_init(&tx0, 512);
+    ASSERT(channel_build_commitment_tx(&ch, &tx0, txid), "build (anchor off)");
+    ASSERT(tx0.data[46] == 2, "anchor off: 2 outputs");
+    uint64_t to_remote_off = 0;
+    for (int i = 0; i < 8; i++) to_remote_off |= ((uint64_t)tx0.data[90 + i]) << (i * 8);
+    tx_buf_free(&tx0);
+
+    /* Flag ON: 3 outputs; output[2] is the keyless P2A (240 sats); the 240-sat
+       cost comes out of to_remote so the output sum (hence the miner fee) and
+       to_local are unchanged. */
+    ch.use_cpfp_anchor = 1;
+    tx_buf_t tx1; tx_buf_init(&tx1, 512);
+    ASSERT(channel_build_commitment_tx(&ch, &tx1, txid), "build (anchor on)");
+    ASSERT(tx1.data[46] == 3, "anchor on: 3 outputs (to_local, to_remote, P2A)");
+    uint64_t to_remote_on = 0;
+    for (int i = 0; i < 8; i++) to_remote_on |= ((uint64_t)tx1.data[90 + i]) << (i * 8);
+    ASSERT(to_remote_on == to_remote_off - ANCHOR_OUTPUT_AMOUNT,
+           "anchor cost (240) deducted from to_remote");
+    /* output[2] (anchor) at offset 46+1+43+43 = 133. */
+    uint64_t anchor_amt = 0;
+    for (int i = 0; i < 8; i++) anchor_amt |= ((uint64_t)tx1.data[133 + i]) << (i * 8);
+    ASSERT(anchor_amt == ANCHOR_OUTPUT_AMOUNT, "P2A anchor amount = 240");
+    ASSERT(tx1.data[141] == P2A_SPK_LEN, "P2A spk len = 4");
+    ASSERT(memcmp(&tx1.data[142], P2A_SPK, P2A_SPK_LEN) == 0, "P2A spk = OP_1 0x4e73");
+    tx_buf_free(&tx1);
+
+    secp256k1_context_destroy(ctx);
+    channel_cleanup(&ch);
+    return 1;
+}
+
+/* ================================================================== */
 /* HC12 — update_fee byte layout                                      */
 /* ================================================================== */
 

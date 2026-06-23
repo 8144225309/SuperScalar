@@ -927,8 +927,10 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
        untouched.  Presence + funding source are a pure function of the shared
        channel fee-rate + balances, so both co-signers build an identical tx
        (matching sighash).  Appended LAST: to_local[0]/to_remote[1]/HTLC indices
-       and the count-bounded watchtower output parsers are unaffected. */
-    if (ch->fee_rate_sat_per_kvb >= 1000) {
+       and the count-bounded watchtower output parsers are unaffected.  Gated on a
+       negotiated per-channel flag (option_anchors style) so both co-signers agree
+       and legacy/unit channels keep the anchorless format. */
+    if (ch->use_cpfp_anchor && ch->fee_rate_sat_per_kvb >= 1000) {
         uint64_t anchor = ANCHOR_OUTPUT_AMOUNT;
         int placed = 0;
         if (outputs[1].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {

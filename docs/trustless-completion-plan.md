@@ -54,7 +54,26 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
     poison provably beats the LSP's CSV fallback.
 - **P3 — Mass-exit thundering herd (#56).** DoD: N clients exit at the shared
   factory CLTV simultaneously; prove no client is stranded by the fee-race, or
-  document + implement the mitigation. STATUS: pending.
+  document + implement the mitigation. STATUS: **in progress** (baseline GREEN +
+  finding + fix underway).
+  - Baseline GREEN: `test_regtest_mass_exit.sh` N=4 on this branch -- LSP vanishes,
+    all 4 clients self-exit (topological root->leaf over ~17 CSV-maturation passes),
+    100%+ conservation. The #313 mechanism works.
+  - Block space is NOT the herd bottleneck: the whole unwind is ~127 commitments +
+    ~127 sweeps + ~tree-nodes ~= 57 kvB even at N=127 -> fits in 1-2 blocks (shared
+    tree dedups). The real risk is GENERAL fee pressure vs the pre-signed fixed fee.
+  - **FINDING (real):** the mass-exit cascade has NO unilateral CPFP path for a
+    force-closing client. Tree txs are nVersion=2 + no anchor (factory.c:2224);
+    the commitment is v3/TRUC but had NO anchor (channel.c, to_local CSV-locked);
+    the CPFP-able distribution-TX backstop (P2A anchor, factory.c:4083) is NOT
+    persisted in the daemon `--demo` flow (empirically distribution_txs=0). Mean-
+    while the LSP's cltv_timeout claim is live-signed (freely bumpable). So a client
+    exiting near cltv_timeout under sustained high fees could lose the race.
+  - **DECISION (user, 2026-06-23): add commitment + tree anchors** (the gold-standard
+    per-client unilateral CPFP). Increment 1 = commitment P2A anchor (commit d3005a9):
+    keyless P2A appended last, 240 sats moved out of to_remote (fee + to_local + WT
+    parsers unchanged), deterministic across co-signers. Validating unit suite, then
+    tree anchors (increment 2), then a regtest CPFP-the-commitment proof.
 - **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
   kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
   + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.

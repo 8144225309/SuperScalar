@@ -285,6 +285,7 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
         return 0;
     }
     ch->funder_is_local = 0;  /* LSP (remote) is the funder */
+    ch->use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor on commitments (matches LSP side) */
 
     /* Set local basepoints from caller-provided random secrets */
     channel_set_local_basepoints(ch, local_pay_sec32, local_delay_sec32, local_revoc_sec32);

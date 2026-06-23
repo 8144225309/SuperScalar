@@ -270,6 +270,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;  /* LSP is funder and local */
+        entry->channel.use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor (matches client side) */
         /* Attach persistence so revocation secrets land in revocation_secrets
            and a standalone watchtower can hydrate this channel. */
         channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);

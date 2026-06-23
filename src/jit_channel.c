@@ -371,6 +371,7 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
         return 0;
     }
     jit->channel.funder_is_local = 1;
+    jit->channel.use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor (matches client side) */
     if (jit_fe) channel_set_fee_rate(&jit->channel, jit_fe->get_rate(jit_fe, FEE_TARGET_NORMAL));
 
     /* Generate random basepoints */

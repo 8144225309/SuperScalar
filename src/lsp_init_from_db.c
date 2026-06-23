@@ -151,6 +151,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
         entry->channel.funder_is_local = 1;
+        entry->channel.use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor (matches client; restore parity) */
         /* Attach persistence (see lsp_channels_init for rationale). */
         channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
         /* fee_rate stays at channel_init default (1000); commit_fee above is

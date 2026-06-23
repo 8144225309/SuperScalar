@@ -920,6 +920,7 @@ extern int test_htlc_commit_dust_excluded_from_tx(void);
 extern int test_htlc_commit_dust_tx_output_count(void);
 extern int test_htlc_commit_above_dust_counted(void);
 extern int test_htlc_commit_mixed_dust_counted(void);
+extern int test_htlc_commit_cpfp_anchor_present(void);
 /* PR #21 Phase 5: update_fee */
 extern int test_htlc_commit_update_fee_layout(void);
 extern int test_htlc_commit_recv_update_fee_accepts(void);
@@ -2838,6 +2839,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_commit_dust_tx_output_count);
     RUN_TEST(test_htlc_commit_above_dust_counted);
     RUN_TEST(test_htlc_commit_mixed_dust_counted);
+    RUN_TEST(test_htlc_commit_cpfp_anchor_present);
     printf("\n=== PR #21 Phase 5: update_fee ===\n");
     RUN_TEST(test_htlc_commit_update_fee_layout);
     RUN_TEST(test_htlc_commit_recv_update_fee_accepts);
