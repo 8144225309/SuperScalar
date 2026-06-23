@@ -757,7 +757,8 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             n_active_ptlcs++;
     }
 
-    tx_output_t *outputs = calloc(2 + n_active_htlcs + n_active_ptlcs, sizeof(tx_output_t));
+    /* +1 slot for the optional P2A CPFP anchor (appended last, see step 7c). */
+    tx_output_t *outputs = calloc(3 + n_active_htlcs + n_active_ptlcs, sizeof(tx_output_t));
     if (!outputs) return 0;
 
     int ret = 0;
@@ -912,6 +913,33 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
                                      &ptlc_tweaked);
             outputs[out_idx].script_pubkey_len = 34;
             outputs[out_idx].amount_sats = ch->ptlcs[i].amount_sats;
+            out_idx++;
+        }
+    }
+
+    /* 7c. P2A anchor for CPFP fee-bumping the commitment (#56: trustless exit
+       under fee pressure).  The commitment is pre-signed at a fixed fee and is
+       not RBF-able once both parties sign; a keyless Pay-to-Anchor output lets
+       whoever force-closes attach a high-fee child to pull the commitment into a
+       block.  The 240-sat cost is moved OUT of the funder's (to_remote) output,
+       so the output sum -- and thus the implicit ~154-sat miner fee -- is
+       unchanged and to_local (the broadcaster's recoverable balance) is
+       untouched.  Presence + funding source are a pure function of the shared
+       channel fee-rate + balances, so both co-signers build an identical tx
+       (matching sighash).  Appended LAST: to_local[0]/to_remote[1]/HTLC indices
+       and the count-bounded watchtower output parsers are unaffected. */
+    if (ch->fee_rate_sat_per_kvb >= 1000) {
+        uint64_t anchor = ANCHOR_OUTPUT_AMOUNT;
+        int placed = 0;
+        if (outputs[1].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
+            outputs[1].amount_sats -= anchor; placed = 1;   /* funder (to_remote) funds it */
+        } else if (outputs[0].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
+            outputs[0].amount_sats -= anchor; placed = 1;   /* fallback: to_local funds it */
+        }
+        if (placed) {
+            memcpy(outputs[out_idx].script_pubkey, P2A_SPK, P2A_SPK_LEN);
+            outputs[out_idx].script_pubkey_len = P2A_SPK_LEN;
+            outputs[out_idx].amount_sats = anchor;
             out_idx++;
         }
     }
