@@ -76,6 +76,7 @@ LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_DB="$TMPDIR/wt.db"
 MINER_WALLET="ss_cheat_leaf_miner"
+CPFP_WALLET="ss_cpfp_race"        # #60: spends ANY client's poison output to CPFP-bump it
 
 PIDS=()
 cleanup() {
@@ -88,6 +89,7 @@ cleanup() {
     for i in $(seq 0 $((N_CLIENTS - 1))); do
         cp "$TMPDIR/client_${i}.log" "/tmp/hashlock_sub_e2e_last_client_${i}.log" 2>/dev/null || true
     done
+    $BCLI unloadwallet "$CPFP_WALLET" 2>/dev/null || true
     rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
@@ -111,6 +113,33 @@ $BCLI loadwallet $MINER_WALLET 2>/dev/null || true
 MINE_ADDR=$($BCLI -rpcwallet=$MINER_WALLET -named getnewaddress address_type=bech32m)
 $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 echo "  miner wallet ready, 101 blocks mined"
+
+# --- #60 CPFP fee-race pre-stage (SS_POISON_CPFP_RACE=1) ---
+# The poison is a pre-signed, FIXED-FEE tx: the N-of-N agg-sig binds its outputs,
+# so it is NOT RBF-able.  Its ONLY fee-bump is a CPFP child on a client's own
+# P2TR(client_key) output (factory.c:3581 "any client can trivially CPFP").  We
+# pre-stage a wallet over tr(<each client WIF>) BEFORE the poison broadcasts, so
+# it ingests the unconfirmed poison output from the mempool and can spend it.
+if [ "${SS_POISON_CPFP_RACE:-0}" = 1 ]; then
+    echo "--- #60 pre-staging CPFP wallet ($CPFP_WALLET) over $N_CLIENTS client keys ---"
+    $BCLI -named createwallet wallet_name=$CPFP_WALLET blank=true disable_private_keys=false load_on_startup=false 2>&1 | head -1 || true
+    $BCLI loadwallet $CPFP_WALLET 2>/dev/null || true
+    for sk in "${CLIENT_SECKEYS[@]:0:$N_CLIENTS}"; do
+        WIF=$(python3 - "$sk" <<'PY'
+import sys, hashlib
+A='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+sk=bytes.fromhex(sys.argv[1]); p=b'\xef'+sk+b'\x01'
+chk=hashlib.sha256(hashlib.sha256(p).digest()).digest()[:4]
+n=int.from_bytes(p+chk,'big'); s=''
+while n>0: n,r=divmod(n,58); s=A[r]+s
+print(s)
+PY
+)
+        CK=$($BCLI getdescriptorinfo "tr($WIF)" 2>/dev/null | grep -oE '"checksum": *"[0-9a-z]+"' | grep -oE '[0-9a-z]{8}' | head -1)
+        [ -n "$CK" ] && $BCLI -rpcwallet=$CPFP_WALLET importdescriptors "[{\"desc\":\"tr($WIF)#$CK\",\"timestamp\":\"now\",\"internal\":false}]" >/dev/null 2>&1
+    done
+    echo "  CPFP wallet staged (watching $N_CLIENTS client keys, ready to bump the poison)"
+fi
 
 # --- LSP daemon (hashlock poison + sub-factory cheat) ---
 echo
@@ -231,6 +260,66 @@ POISON_TXID=$($BCLI sendrawtransaction "$POISON_HEX" 2>/tmp/_sendsub.err) || {
     echo "FAIL: sub poison sendrawtransaction REJECTED"; cat /tmp/_sendsub.err
     echo "  (mempool reject means the persisted template/secret did not yield a spend of the stale sales-stock)"; exit 1; }
 echo "  SUB POISON broadcast txid: $POISON_TXID"
+
+# === #60 CPFP FEE-RACE (SS_POISON_CPFP_RACE=1) =============================
+# Prove the client WINS the L&CSV-fallback race under fee pressure.  The poison
+# is pre-signed at a FIXED fee and is NOT RBF-able (the agg-sig binds outputs);
+# under congestion its bare fee can be below the floor.  The trustless escape is
+# a CPFP child on the client's OWN P2TR output.  We (1) deprioritise the bare
+# poison so it cannot be mined alone, (2) CONTROL-prove it stays stuck, (3) the
+# client CPFPs via a fat-fee child on its poison output, (4) assert the poison
+# CONFIRMS -- well within the 144-block L_STOCK CSV head-start (Leaf-L can't
+# mature before then), so the poison beats the LSP's CSV fallback.
+if [ "${SS_POISON_CPFP_RACE:-0}" = 1 ]; then
+    echo
+    echo "=== #60 CPFP FEE-RACE: bump the FIXED-FEE pre-signed poison via a client-output CPFP ==="
+    DEPRIO=3000
+    $BCLI prioritisetransaction "$POISON_TXID" 0 -$DEPRIO >/dev/null 2>&1
+    echo "  poison deprioritised by $DEPRIO sats (bare fixed-fee poison now unmineable)"
+    # CONTROL: the bare poison must STAY unconfirmed, else the CPFP proof is vacuous.
+    for i in $(seq 1 4); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; done
+    c0=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    { [ -z "$c0" ] || [ "$c0" -eq 0 ]; } || { echo "FAIL(control): poison confirmed despite -$DEPRIO deprioritise ($c0 confs) -- pressure not biting; CPFP proof vacuous"; exit 1; }
+    echo "  CONTROL OK: bare poison STUCK unconfirmed under fee pressure (4 blocks, no CPFP)"
+    # Locate the poison's client output in the pre-staged CPFP wallet (it ingested
+    # the unconfirmed output because tr(client_key) was imported pre-broadcast).
+    read CV CA CSPK < <($BCLI -rpcwallet=$CPFP_WALLET listunspent 0 9999999 2>/dev/null | python3 -c "
+import sys,json
+try: u=[x for x in json.load(sys.stdin) if x['txid']=='$POISON_TXID']
+except Exception: u=[]
+print(u[0]['vout'], format(u[0]['amount'],'.8f'), u[0]['scriptPubKey']) if u else print('')")
+    [ -n "${CV:-}" ] || { echo "FAIL: CPFP wallet did not ingest the poison output (txid=$POISON_TXID)"; $BCLI -rpcwallet=$CPFP_WALLET listunspent 0 2>/dev/null | head -40; exit 1; }
+    echo "  poison client output located: vout=$CV amount=$CA BTC"
+    # Build a fat-fee CPFP child: absolute 12000-sat fee (>> the $DEPRIO deficit) so the
+    # poison+child PACKAGE clears the floor.  Sweep the single explicit input to the miner.
+    CA_SATS=$(python3 -c "print(int(round(float('$CA')*1e8)))")
+    CHILD_FEE=12000
+    [ "$CA_SATS" -gt $((CHILD_FEE + 600)) ] || { echo "FAIL: poison output ${CA_SATS} sats too small to CPFP with a ${CHILD_FEE}-sat fee"; exit 1; }
+    OUT_SATS=$((CA_SATS - CHILD_FEE))
+    OUT_BTC=$(python3 -c "print(format($OUT_SATS/1e8,'.8f'))")
+    CHILD_DEST=$($BCLI -rpcwallet=$MINER_WALLET -named getnewaddress address_type=bech32m)
+    RAWCHILD=$($BCLI -named createrawtransaction inputs="[{\"txid\":\"$POISON_TXID\",\"vout\":$CV}]" outputs="[{\"$CHILD_DEST\":$OUT_BTC}]")
+    SIGNED=$($BCLI -rpcwallet=$CPFP_WALLET signrawtransactionwithwallet "$RAWCHILD" "[{\"txid\":\"$POISON_TXID\",\"vout\":$CV,\"scriptPubKey\":\"$CSPK\",\"amount\":$CA}]" 2>/tmp/_cpfpsign.err)
+    SHEX=$(echo "$SIGNED" | python3 -c "import sys,json
+try: d=json.load(sys.stdin); print(d['hex'] if d.get('complete') else '')
+except Exception: print('')")
+    [ -n "$SHEX" ] || { echo "FAIL: CPFP child sign incomplete"; cat /tmp/_cpfpsign.err 2>/dev/null; echo "$SIGNED"; exit 1; }
+    CHILD_TXID=$($BCLI sendrawtransaction "$SHEX" 2>/tmp/_cpfpsend.err) || { echo "FAIL: CPFP child REJECTED"; cat /tmp/_cpfpsend.err; exit 1; }
+    echo "  CPFP child broadcast: $CHILD_TXID (absolute fee ${CHILD_FEE} sats >> ${DEPRIO}-sat deficit)"
+    # The package (poison+child) must now confirm -- and the poison output stays swept.
+    PCONF=0; PBLKS=0
+    for i in $(seq 1 8); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PBLKS=$i; c=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
+    [ "$PCONF" -ge 1 ] || { echo "FAIL: poison did NOT confirm even after CPFP -- #60 race LOST"; exit 1; }
+    CC=$($BCLI getrawtransaction "$CHILD_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    echo "  poison CONFIRMED via CPFP after ${PBLKS} block(s) (${PCONF} confs); child confs=${CC:-0}"
+    [ "$PBLKS" -lt 144 ] || { echo "FAIL: CPFP confirmation took $PBLKS blocks >= 144-block CSV head-start"; exit 1; }
+    echo
+    echo "=== PASS: #60 CPFP FEE-RACE -- the pre-signed, NON-RBF-able poison was BUMPED to"
+    echo "    confirmation by a client-output CPFP under fee pressure, in ${PBLKS} block(s) <<"
+    echo "    the 144-block L_STOCK CSV head-start.  The poison BEATS the LSP's Leaf-L CSV"
+    echo "    fallback => Layer-3 (win-the-fee-race) PROVEN for the #53 sub-factory poison."
+    exit 0
+fi
 
 # --- Confirm + amount ---
 echo

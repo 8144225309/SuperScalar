@@ -87,3 +87,19 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
 - 2026-06-22: network restored (fail2ban ban aged out). **P1 VALIDATED GREEN** on regtest
   (LSP shipped corrupt agg-sig; 2 clients D2-rejected; 0 worthless reveal rows). P1 closed.
   Starting **P2** (Layer-3 fee-race).
+- 2026-06-23: **P2a (WT-driven fee-bump) VALIDATED GREEN** on regtest. The #52 BUMP PROOF
+  (`SS_HIFEE_BUMP=1 test_regtest_trustless_commitment_breach.sh`): a standalone WT hydrated
+  24 commitment watches, the penalty was deprioritised -3000 sats (bare tx unmineable), and
+  the WT's deadline-driven CPFP escalator ramped feerates 5501->6898->9071->11399 until the
+  penalty CONFIRMED (69 blocks). WT-driven Layer-3 (factory/sub/commitment penalties) PROVEN.
+  (Infra note: the VPS regtest bitcoind was simply down — the commitment harness assumes it
+  is up; my hashlock harnesses start it. Runner now ensures bitcoind up before the test.)
+- 2026-06-23: **P2b (client-driven poison fee-race) CODED**. Key architectural finding: the
+  #53 poison is CLIENT-driven (the secret-less WT can't assemble it) and is a PRE-SIGNED,
+  FIXED-FEE tx -- the N-of-N agg-sig binds its outputs, so it is **NOT RBF-able**. Its only
+  fee-bump is **CPFP on a client's own P2TR output** (every poison output is `tr(client_key)`,
+  factory.c:3555-3585 -- Zmn: "any client can trivially CPFP the poisoning transaction"). The
+  first-line defense is the **144-block L_STOCK CSV head-start** (the LSP's Leaf-L fallback
+  can't mature before then). New gated branch `SS_POISON_CPFP_RACE=1` in the sub-factory e2e:
+  deprioritise the bare poison (control-prove it stuck), then the client CPFPs via a fat-fee
+  child on its poison output and the poison CONFIRMS << 144 blocks. Awaiting validation.
