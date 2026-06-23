@@ -124,6 +124,7 @@ if [ "${SS_POISON_CPFP_RACE:-0}" = 1 ]; then
     echo "--- #60 pre-staging CPFP wallet ($CPFP_WALLET) over $N_CLIENTS client keys ---"
     $BCLI -named createwallet wallet_name=$CPFP_WALLET blank=true disable_private_keys=false load_on_startup=false 2>&1 | head -1 || true
     $BCLI loadwallet $CPFP_WALLET 2>/dev/null || true
+    IMPORTED=0
     for sk in "${CLIENT_SECKEYS[@]:0:$N_CLIENTS}"; do
         WIF=$(python3 - "$sk" <<'PY'
 import sys, hashlib
@@ -135,10 +136,15 @@ while n>0: n,r=divmod(n,58); s=A[r]+s
 print(s)
 PY
 )
-        CK=$($BCLI getdescriptorinfo "tr($WIF)" 2>/dev/null | grep -oE '"checksum": *"[0-9a-z]+"' | grep -oE '[0-9a-z]{8}' | head -1)
-        [ -n "$CK" ] && $BCLI -rpcwallet=$CPFP_WALLET importdescriptors "[{\"desc\":\"tr($WIF)#$CK\",\"timestamp\":\"now\",\"internal\":false}]" >/dev/null 2>&1
+        # checksum from the JSON 'checksum' field (NOT a grep -- the literal word
+        # "checksum" is itself 8 lowercase chars and would mis-match a regex).
+        CK=$($BCLI getdescriptorinfo "tr($WIF)" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['checksum'])" 2>/dev/null || true)
+        [ -n "$CK" ] || { echo "  WARN: no checksum for a client descriptor"; continue; }
+        R=$($BCLI -rpcwallet=$CPFP_WALLET importdescriptors "[{\"desc\":\"tr($WIF)#$CK\",\"timestamp\":\"now\",\"internal\":false}]" 2>/dev/null | python3 -c "import sys,json;print(sum(1 for x in json.load(sys.stdin) if x.get('success')))" 2>/dev/null || echo 0)
+        IMPORTED=$((IMPORTED + ${R:-0}))
     done
-    echo "  CPFP wallet staged (watching $N_CLIENTS client keys, ready to bump the poison)"
+    echo "  CPFP wallet staged ($IMPORTED/$N_CLIENTS client keys imported, ready to bump the poison)"
+    [ "$IMPORTED" -ge 1 ] || { echo "FAIL: no client descriptors imported into the CPFP wallet"; exit 1; }
 fi
 
 # --- LSP daemon (hashlock poison + sub-factory cheat) ---
@@ -281,15 +287,46 @@ if [ "${SS_POISON_CPFP_RACE:-0}" = 1 ]; then
     c0=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
     { [ -z "$c0" ] || [ "$c0" -eq 0 ]; } || { echo "FAIL(control): poison confirmed despite -$DEPRIO deprioritise ($c0 confs) -- pressure not biting; CPFP proof vacuous"; exit 1; }
     echo "  CONTROL OK: bare poison STUCK unconfirmed under fee pressure (4 blocks, no CPFP)"
-    # Locate the poison's client output in the pre-staged CPFP wallet (it ingested
-    # the unconfirmed output because tr(client_key) was imported pre-broadcast).
-    read CV CA CSPK < <($BCLI -rpcwallet=$CPFP_WALLET listunspent 0 9999999 2>/dev/null | python3 -c "
+    # Locate the poison's client output by ADDRESS-MATCH in the decoded poison tx.
+    # The CPFP wallet holds the keys; signrawtransactionwithwallet needs only the key
+    # (not UTXO ownership), so we don't depend on wallet mempool-ingestion timing.
+    POISON_JSON=$($BCLI getrawtransaction "$POISON_TXID" true 2>/dev/null || true)
+    CV=""; CA=""; CSPK=""
+    for sk in "${CLIENT_SECKEYS[@]:0:$N_CLIENTS}"; do
+        WIF=$(python3 - "$sk" <<'PY'
+import sys, hashlib
+A='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+sk=bytes.fromhex(sys.argv[1]); p=b'\xef'+sk+b'\x01'
+chk=hashlib.sha256(hashlib.sha256(p).digest()).digest()[:4]
+n=int.from_bytes(p+chk,'big'); s=''
+while n>0: n,r=divmod(n,58); s=A[r]+s
+print(s)
+PY
+)
+        CK=$($BCLI getdescriptorinfo "tr($WIF)" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['checksum'])" 2>/dev/null || true)
+        [ -n "$CK" ] || continue
+        ADDR=$($BCLI deriveaddresses "tr($WIF)#$CK" 2>/dev/null | python3 -c "import sys,json;a=json.load(sys.stdin);print(a[0] if a else '')" 2>/dev/null || true)
+        [ -n "$ADDR" ] || continue
+        HIT=$(echo "$POISON_JSON" | python3 -c "
 import sys,json
-try: u=[x for x in json.load(sys.stdin) if x['txid']=='$POISON_TXID']
-except Exception: u=[]
-print(u[0]['vout'], format(u[0]['amount'],'.8f'), u[0]['scriptPubKey']) if u else print('')")
-    [ -n "${CV:-}" ] || { echo "FAIL: CPFP wallet did not ingest the poison output (txid=$POISON_TXID)"; $BCLI -rpcwallet=$CPFP_WALLET listunspent 0 2>/dev/null | head -40; exit 1; }
-    echo "  poison client output located: vout=$CV amount=$CA BTC"
+try: tx=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for v in tx.get('vout',[]):
+    spk=v.get('scriptPubKey',{})
+    if spk.get('address')=='$ADDR':
+        print(v['n'], format(v['value'],'.8f'), spk.get('hex','')); break
+" 2>/dev/null || true)
+        if [ -n "$HIT" ]; then CV=$(echo "$HIT"|awk '{print $1}'); CA=$(echo "$HIT"|awk '{print $2}'); CSPK=$(echo "$HIT"|awk '{print $3}'); break; fi
+    done
+    if [ -z "$CV" ]; then
+        echo "FAIL: no poison output matched any imported client address; poison vout addrs:"
+        echo "$POISON_JSON" | python3 -c "import sys,json
+try: tx=json.load(sys.stdin)
+except Exception: tx={}
+for v in tx.get('vout',[]): print('   vout',v['n'],v['scriptPubKey'].get('address'),v['value'])" 2>/dev/null || true
+        exit 1
+    fi
+    echo "  poison client output located: vout=$CV amount=$CA BTC (addr-matched an imported client key)"
     # Build a fat-fee CPFP child whose absolute fee >> the $DEPRIO deficit so the
     # poison+child PACKAGE clears the floor.  Adapt the fee down for a small output,
     # but it must still exceed the deficit (else the package can't be mined at all).
