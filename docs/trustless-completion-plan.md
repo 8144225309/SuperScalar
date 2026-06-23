@@ -22,7 +22,7 @@ rigor**, and the **external audit**.
 |---|---|---|
 | 1 Detect | Standalone WT sees the breach? | PROVEN (regtest + signet) |
 | 2 Respond | Builds + broadcasts recourse? | PROVEN — factory/sub/commitment/PTLC penalties + #53 hashlock poison fire, confirm, redistribute |
-| 3 **Win** | Recourse confirms BEFORE the attacker's tx, under fee pressure? | **FRONTIER** — fee-bump exists (#52), contested race UNPROVEN (P2/P3) |
+| 3 **Win** | Recourse confirms BEFORE the attacker's tx, under fee pressure? | **PROVEN for single-breach** (P2a WT-CPFP + P2b client-CPFP poison); mass-exit herd still open (P3) |
 | 4 Afford | Client with all funds in-factory can pay the exit/bump fee? | OPEN (P7 / #63) |
 | 5 Operate | Who runs the WT; secret backup; migration? | OPEN (P7 / #62,#64) |
 
@@ -40,7 +40,18 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
 - **P2 — Layer 3: recourse WINS the fee-race (#60).** DoD: a regtest harness where
   after a breach the recourse must confirm despite a competing low-fee mempool /
   the LSP's L&CSV fallback; prove it confirms (fee-bumping via #52 if needed).
-  Recourse that fires but loses the race isn't trustless. STATUS: pending.
+  Recourse that fires but loses the race isn't trustless. STATUS: **DONE + PROVEN**
+  (both halves green on regtest):
+  - P2a (WT-driven): `SS_HIFEE_BUMP=1` commitment breach — the standalone WT's
+    deadline CPFP escalator bumped a deprioritised penalty (feerates 5501->11399)
+    to CONFIRM at 69 blocks. Covers factory/sub/commitment penalties.
+  - P2b (client-driven #53 poison): `SS_POISON_CPFP_RACE=1` in the sub-factory e2e.
+    The poison is pre-signed/fixed-fee (agg-sig binds outputs => NOT RBF-able); its
+    only bump is CPFP on a client's own `tr(client_key)` poison output. Deprioritise
+    -3000 (control: bare poison STUCK), client CPFP child (12000-sat fee) -> poison
+    CONFIRMED in 1 block, << the 144-block Leaf-L CSV head-start (Leaf-L is a genuine
+    relative timelock, factory.c:240/268, so it can't even be broadcast first). The
+    poison provably beats the LSP's CSV fallback.
 - **P3 — Mass-exit thundering herd (#56).** DoD: N clients exit at the shared
   factory CLTV simultaneously; prove no client is stranded by the fee-race, or
   document + implement the mitigation. STATUS: pending.
@@ -103,3 +114,14 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
   can't mature before then). New gated branch `SS_POISON_CPFP_RACE=1` in the sub-factory e2e:
   deprioritise the bare poison (control-prove it stuck), then the client CPFPs via a fat-fee
   child on its poison output and the poison CONFIRMS << 144 blocks. Awaiting validation.
+- 2026-06-23: **P2b VALIDATED GREEN** on regtest (commit 3a12ae7). Poison broadcast, -3000
+  deprioritise => control proved the bare poison STUCK; client output located by address-match
+  (vout=0, 21,667 sats); client CPFP child (12000-sat fee) => poison CONFIRMED in 1 block
+  (<< 144-block head-start). signrawtransactionwithwallet signed the taproot key-path cleanly.
+  Two bugs found+fixed en route: (1) set -euo pipefail tripped on the no-match `getrawtransaction
+  | grep '"confirmations"'` in the EXPECTED-unconfirmed control state (added `|| true`); (2) the
+  descriptor checksum was extracted with `grep -oE '[0-9a-z]{8}'`, which matched the literal word
+  "checksum" -> tr(WIF)#checksum rejected -> empty wallet (now parses the JSON `checksum` field).
+  **P2 (Layer-3 fee-race) is DONE + PROVEN for single-breach.** Tasks #60 + #68 closed.
+  NEXT: P3 (mass-exit thundering herd, #56) -- the OTHER fee-race: N clients contending for
+  block space at the SHARED factory CLTV deadline simultaneously.
