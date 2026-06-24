@@ -84,10 +84,28 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
     so to_local == channel balance precisely). Increment 1 is production-safe + DONE.
     Remaining for full rigor: a CPFP-the-commitment e2e proof (deprioritise a force-closed
     commitment, bump via its P2A anchor + a funded input, confirm) -- analogous to P2b.
-  - **Increment 2 = tree anchors** -- harder: the 240-sat anchor can't come from a tree
-    node's child output (it would invalidate that child's pre-signed sig, which commits
-    to the full parent amount), so it needs a construction-level fee reservation that
-    ripples through conservation + re-signing. Scoped as a careful follow-up.
+  - **Increment 2 = tree anchors** -- branch `trustless-tree-anchors` (off trustless-completion).
+    INVESTIGATED; deferred to a careful dedicated effort because it is a major,
+    safety-critical change to core factory accounting:
+    * Mechanism (per node): each node builder does `output_total = input_amount -
+      f->fee_per_tx` then splits among children (factory.c:449 leaf, :1062/:1123 internal,
+      :1213 sub-factory). A tree anchor = reserve 240 MORE from output_total (carved from
+      the subtree, NOT the fee, since fee_per_tx may be < 240) + append a P2A output last.
+      Gate on a factory-level flag (deterministic across LSP+clients), default off for
+      unit/legacy.
+    * COUPLING RISK (why it's hard): the LEAF node's outputs (setup_leaf_outputs) ARE the
+      channel funding amounts -- carving 240 there changes the channel fundings, which the
+      channel COMMITMENTS are signed against (ch->funding_amount must track it). And the
+      v3 commitment can't CPFP-pull a v2 leaf-node ancestor (TRUC all-v3-ancestors rule),
+      so the leaf-node tx genuinely needs its OWN anchor. So increment 2 ripples through:
+      4+ node builders, the channel-funding coupling, conservation (must add Sigma anchors),
+      the recovery/WT tree parsers, the factory unit tests, and the full lifecycle.
+    * GUARDRAIL: the mass-exit conservation assert (must stay 100%) catches leaf-level
+      mis-allocation; re-validate factory unit + breach + mass-exit + lifecycle after.
+    * Recommended order: (1) factory-level `use_tree_anchor` flag + internal-node anchors
+      (root/intermediate, low coupling) first, validate; (2) then the leaf-node anchor with
+      the channel-funding coupling, validate conservation; (3) consider v3 for tree txs
+      (anti-pinning) as a follow-up. Do NOT rush -- a conservation bug mis-allocates funds.
 - **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
   kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
   + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.
