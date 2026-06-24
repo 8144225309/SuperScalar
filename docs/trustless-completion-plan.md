@@ -70,10 +70,24 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
     while the LSP's cltv_timeout claim is live-signed (freely bumpable). So a client
     exiting near cltv_timeout under sustained high fees could lose the race.
   - **DECISION (user, 2026-06-23): add commitment + tree anchors** (the gold-standard
-    per-client unilateral CPFP). Increment 1 = commitment P2A anchor (commit d3005a9):
-    keyless P2A appended last, 240 sats moved out of to_remote (fee + to_local + WT
-    parsers unchanged), deterministic across co-signers. Validating unit suite, then
-    tree anchors (increment 2), then a regtest CPFP-the-commitment proof.
+    per-client unilateral CPFP).
+  - **Increment 1 = commitment P2A anchor — CODED + VALIDATED** (commit c755d13). Made
+    it a negotiated per-channel feature `use_cpfp_anchor` (option_anchors style): keyless
+    P2A appended last, 240 sats moved out of to_remote (fee + to_local + the count-bounded
+    WT parsers unchanged), deterministic across co-signers; default OFF (legacy/unit
+    channels unchanged), set ON at all 4 production channel_init sites (client/lsp/jit/
+    db-restore). Validation ALL GREEN: **unit 1511/1511** (incl. a new differential test
+    proving the anchor is gated, P2A-shaped, to_remote-funded); **breach/penalty regtest**
+    -- a standalone WT confirms a penalty (11843 sats swept) against an ANCHORED revoked
+    commitment (anchor transparent to the penalty path); **mass-exit N=4** -- all clients
+    self-exit, conservation now EXACTLY 100.0% (46992/46992; anchor deducts from to_remote
+    so to_local == channel balance precisely). Increment 1 is production-safe + DONE.
+    Remaining for full rigor: a CPFP-the-commitment e2e proof (deprioritise a force-closed
+    commitment, bump via its P2A anchor + a funded input, confirm) -- analogous to P2b.
+  - **Increment 2 = tree anchors** -- harder: the 240-sat anchor can't come from a tree
+    node's child output (it would invalidate that child's pre-signed sig, which commits
+    to the full parent amount), so it needs a construction-level fee reservation that
+    ripples through conservation + re-signing. Scoped as a careful follow-up.
 - **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
   kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
   + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.
