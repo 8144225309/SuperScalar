@@ -426,6 +426,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     if (saved_fee_per_tx > 200)
         f->fee_per_tx = saved_fee_per_tx;
     f->cltv_timeout = cltv_timeout;
+    f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
     memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));

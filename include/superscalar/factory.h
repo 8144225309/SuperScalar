@@ -388,6 +388,14 @@ typedef struct {
        rationale and default. */
     uint32_t l_stock_csv_blocks;
 
+    /* #56: append a keyless P2A CPFP anchor to every tree node tx so the
+       force-close cascade can be fee-bumped under fee pressure (the shared
+       cascade txs are pre-signed at a fixed fee and otherwise unbumpable).
+       Negotiated like a feature bit -- BOTH the LSP and all clients must build
+       the factory with the SAME value or the tree's co-signed sighashes diverge.
+       Default 0 (raw factory_init / unit / legacy); production sets it on. */
+    int use_tree_anchor;
+
     /* PS sub-factory arity (k) for the canonical k² PS leaf shape from
        t/1242 (docs/ps-subfactories.md, Gap E followup, task #181).
 

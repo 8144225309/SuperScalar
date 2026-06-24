@@ -993,6 +993,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     factory_out->cltv_timeout = cltv_timeout;
+    factory_out->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory_out->fee_per_tx = fee_per_tx;
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
@@ -1966,6 +1967,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     factory->cltv_timeout = cltv_timeout;
+    factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory->fee_per_tx = fee_per_tx;
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;

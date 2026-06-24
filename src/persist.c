@@ -2402,6 +2402,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     factory_init_from_pubkeys(f, ctx, pubkeys, n_participants,
                                step_blocks, states_per_layer);
     f->cltv_timeout = cltv_timeout;
+    f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (restore parity) */
     f->fee_per_tx = fee_per_tx;
     if (leaf_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);

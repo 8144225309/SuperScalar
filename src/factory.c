@@ -438,6 +438,23 @@ static int update_l_stock_outputs(factory_t *f) {
     return 1;
 }
 
+/* #56 tree CPFP anchor.  FACTORY_ANCHOR_COST is reserved out of a node's
+   output_total (so the node's miner fee is unchanged), and factory_append_tree_anchor
+   appends the keyless P2A output LAST (child vout wiring + the count-bounded
+   recovery/WT parsers are unaffected).  Gated on f->use_tree_anchor; the channel
+   funding_amount tracks the node output (lsp_channels.c:221) so per-channel
+   conservation stays balanced automatically. */
+#define FACTORY_ANCHOR_COST(f) ((f)->use_tree_anchor ? (uint64_t)ANCHOR_OUTPUT_AMOUNT : 0)
+static void factory_append_tree_anchor(const factory_t *f, factory_node_t *node) {
+    if (!f->use_tree_anchor) return;
+    if (node->n_outputs >= FACTORY_MAX_OUTPUTS) return;  /* no room (max-arity) */
+    size_t i = node->n_outputs;
+    memcpy(node->outputs[i].script_pubkey, P2A_SPK, P2A_SPK_LEN);
+    node->outputs[i].script_pubkey_len = P2A_SPK_LEN;
+    node->outputs[i].amount_sats = ANCHOR_OUTPUT_AMOUNT;
+    node->n_outputs = i + 1;
+}
+
 /* Set up leaf outputs for a leaf state node. */
 static int setup_leaf_outputs(
     factory_t *f,
@@ -446,7 +463,7 @@ static int setup_leaf_outputs(
     uint32_t client_b_idx,
     uint64_t input_amount
 ) {
-    uint64_t output_total = input_amount - f->fee_per_tx;
+    uint64_t output_total = input_amount - f->fee_per_tx - FACTORY_ANCHOR_COST(f);
     uint64_t per_output = output_total / 3;
     uint64_t remainder = output_total - per_output * 3;
 
@@ -510,6 +527,7 @@ static int setup_leaf_outputs(
     node->outputs[2].script_pubkey_len = 34;
     node->outputs[2].amount_sats = per_output + remainder;
 
+    factory_append_tree_anchor(f, node);   /* #56: CPFP anchor for the cascade */
     return 1;
 }
 
@@ -1059,7 +1077,7 @@ static int setup_single_leaf_outputs(
     uint32_t client_idx,
     uint64_t input_amount
 ) {
-    uint64_t output_total = input_amount - f->fee_per_tx;
+    uint64_t output_total = input_amount - f->fee_per_tx - FACTORY_ANCHOR_COST(f);
     uint64_t per_output = output_total / 2;
     uint64_t remainder = output_total - per_output * 2;
 
@@ -1103,6 +1121,7 @@ static int setup_single_leaf_outputs(
     node->outputs[1].script_pubkey_len = 34;
     node->outputs[1].amount_sats = per_output + remainder;
 
+    factory_append_tree_anchor(f, node);   /* #56: CPFP anchor for the cascade */
     return 1;
 }
 
@@ -1120,8 +1139,8 @@ static int setup_ps_leaf_outputs(
 ) {
     (void)client_idx;  /* PS leaves use the factory consensus key for vout 0 */
 
-    uint64_t output_total = input_amount > f->fee_per_tx
-                            ? input_amount - f->fee_per_tx : 0;
+    uint64_t output_total = input_amount > f->fee_per_tx + FACTORY_ANCHOR_COST(f)
+                            ? input_amount - f->fee_per_tx - FACTORY_ANCHOR_COST(f) : 0;
     uint64_t per_output  = output_total / 2;
     uint64_t remainder   = output_total - per_output * 2;
 
@@ -1146,6 +1165,7 @@ static int setup_ps_leaf_outputs(
     node->outputs[1].script_pubkey_len = 34;
     node->outputs[1].amount_sats = per_output + remainder;
 
+    factory_append_tree_anchor(f, node);   /* #56: CPFP anchor for the cascade */
     node->is_ps_leaf = 1;
     node->ps_chain_len = 0;
     memset(node->ps_prev_txid, 0, 32);
