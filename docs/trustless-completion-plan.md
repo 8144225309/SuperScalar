@@ -106,6 +106,21 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
       (root/intermediate, low coupling) first, validate; (2) then the leaf-node anchor with
       the channel-funding coupling, validate conservation; (3) consider v3 for tree txs
       (anti-pinning) as a follow-up. Do NOT rush -- a conservation bug mis-allocates funds.
+  - **2026-06-24 — IMPLEMENTED (commits e4303b8 leaf + 09fb5c4 internal), VALIDATION PENDING.**
+    Coupling fear was UNFOUNDED: lsp_channels.c:221 reads funding_amount = the leaf node's
+    channel output, so per-channel conservation (lsp_channels.c:7831) auto-tracks any node-
+    output change. Uniform carve: every builder does `output_total -= FACTORY_ANCHOR_COST(f)`
+    + `factory_append_tree_anchor()` (P2A last), so output sum = input-fee is unchanged.
+    Done: factory.h flag; the helper+macro; all 3 leaf builders (setup_leaf/single/ps); all 3
+    internal builders (static kickoff, regular kickoff, state-with-children); the 4 production
+    setters (lsp.c, client.c x2, persist.c) -- default OFF for unit/legacy, ON in production
+    (deterministic across LSP+clients). FACTORY_MAX_OUTPUTS=16 has headroom; append helper
+    skips if full. NOT YET anchored: PS-subfactory builders (setup_ps_leaf_with_subfactories,
+    the k^2 shape) -- follow-up (basic factory / mass-exit / signet don't use them).
+    VALIDATION (pending -- VPS was fail2ban-blocked when implemented): unit suite (flag-off
+    tests unchanged), mass-exit N=4 conservation (the guardrail -- must stay ~100%), breach,
+    then REAL SIGNET fee-wave (deprioritise the cascade, CPFP each tree tx + commitment via
+    their P2A anchors, prove all funds recovered). Branch: trustless-tree-anchors.
 - **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
   kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
   + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.
