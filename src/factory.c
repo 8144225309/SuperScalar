@@ -1532,8 +1532,8 @@ static int build_subtree(
            branch — interior, non-leaf — but the contract is enforced
            defensively in case it changes). */
         uint64_t fee = f->fee_per_tx;
-        if (input_amount <= fee) return 0;
-        uint64_t kickoff_budget = input_amount - fee;
+        if (input_amount <= fee + FACTORY_ANCHOR_COST(f)) return 0;
+        uint64_t kickoff_budget = input_amount - fee - FACTORY_ANCHOR_COST(f);
 
         size_t n_actual = 0;
         for (size_t k = 0; k < n_parts; k++)
@@ -1579,6 +1579,7 @@ static int build_subtree(
                    f->nodes[child_ko_indices[k]].spending_spk, 34);
             f->nodes[ko_idx].outputs[k].script_pubkey_len = 34;
         }
+        factory_append_tree_anchor(f, &f->nodes[ko_idx]);   /* #56: CPFP anchor */
         return 1;
     }
 
@@ -1596,14 +1597,15 @@ static int build_subtree(
 
     /* Wire kickoff → state output */
     uint64_t fee = f->fee_per_tx;
-    if (input_amount <= fee) return 0;
-    uint64_t ko_out_amount = input_amount - fee;
+    if (input_amount <= fee + FACTORY_ANCHOR_COST(f)) return 0;
+    uint64_t ko_out_amount = input_amount - fee - FACTORY_ANCHOR_COST(f);
 
     f->nodes[ko_idx].n_outputs = 1;
     f->nodes[ko_idx].outputs[0].amount_sats = ko_out_amount;
     memcpy(f->nodes[ko_idx].outputs[0].script_pubkey,
            f->nodes[st_idx].spending_spk, 34);
     f->nodes[ko_idx].outputs[0].script_pubkey_len = 34;
+    factory_append_tree_anchor(f, &f->nodes[ko_idx]);   /* #56: CPFP anchor (after the ->state output) */
     f->nodes[ko_idx].input_amount = input_amount;
 
     if (is_leaf) {
@@ -1665,8 +1667,8 @@ static int build_subtree(
            if split_clients_for_arity ever returns an empty slot (it currently
            never does for shapes that reach this branch — interior, non-leaf —
            but the contract is enforced defensively in case it changes). */
-        if (ko_out_amount <= fee) return 0;
-        uint64_t state_budget = ko_out_amount - fee;
+        if (ko_out_amount <= fee + FACTORY_ANCHOR_COST(f)) return 0;
+        uint64_t state_budget = ko_out_amount - fee - FACTORY_ANCHOR_COST(f);
 
         size_t n_actual = 0;
         for (size_t k = 0; k < n_parts; k++)
@@ -1710,6 +1712,7 @@ static int build_subtree(
                    f->nodes[child_ko_indices[k]].spending_spk, 34);
             f->nodes[st_idx].outputs[k].script_pubkey_len = 34;
         }
+        factory_append_tree_anchor(f, &f->nodes[st_idx]);   /* #56: CPFP anchor */
     }
 
     return 1;
