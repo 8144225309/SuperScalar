@@ -244,7 +244,7 @@ static int migrate_text_col(persist_t *p, const secret_col_t *sc) {
     while (sqlite3_step(sel) == SQLITE_ROW) {
         const char *v = (const char *)sqlite3_column_text(sel, 1);
         if (!v) continue;
-        if (n == cap) { cap = cap ? cap * 2 : 16; rows = realloc(rows, cap * sizeof(row_t)); if (!rows) { ok = 0; break; } }
+        if (n == cap) { cap = cap ? cap * 2 : 16; row_t *tmp = realloc(rows, cap * sizeof(row_t)); if (!tmp) { ok = 0; break; } rows = tmp; }
         rows[n].id = sqlite3_column_int64(sel, 0);
         rows[n].val = strdup(v);
         n++;
@@ -283,7 +283,7 @@ static int migrate_blob_col(persist_t *p, const secret_col_t *sc) {
         if (!v || vl <= 0) continue;
         /* skip already-sealed */
         if (vl >= BLOB_MAGIC_LEN && memcmp(v, BLOB_MAGIC, BLOB_MAGIC_LEN) == 0) continue;
-        if (n == cap) { cap = cap ? cap * 2 : 16; rows = realloc(rows, cap * sizeof(row_t)); if (!rows) { ok = 0; break; } }
+        if (n == cap) { cap = cap ? cap * 2 : 16; row_t *tmp = realloc(rows, cap * sizeof(row_t)); if (!tmp) { ok = 0; break; } rows = tmp; }
         rows[n].id = sqlite3_column_int64(sel, 0);
         rows[n].val = malloc((size_t)vl);
         if (!rows[n].val) { ok = 0; break; }

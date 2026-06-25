@@ -3608,7 +3608,7 @@ int factory_build_l_stock_poison_tx_unsigned(
        fee is paid by the input/output delta. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
-    unsigned char poison_display_txid[32];
+    unsigned char poison_display_txid[32] = {0};
     if (!build_unsigned_tx(&unsigned_tx,
                             txid_out32 ? poison_display_txid : NULL,
                             l_stock_txid32, l_stock_vout,
@@ -3827,7 +3827,7 @@ int factory_build_l_stock_poison_scriptpath_unsigned(
     /* Unsigned TX: single input from the L-stock outpoint, nSequence 0xFFFFFFFE
        (the CSV gate lives on Leaf L, not this spend). */
     tx_buf_reset(unsigned_tx_out);
-    unsigned char disp_txid[32];
+    unsigned char disp_txid[32] = {0};
     if (!build_unsigned_tx(unsigned_tx_out, poison_txid_out32 ? disp_txid : NULL,
                             l_stock_txid32, l_stock_vout, 0xFFFFFFFEu,
                             outputs, n_clients)) {
