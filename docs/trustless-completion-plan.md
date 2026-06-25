@@ -139,9 +139,20 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
   - **#56 / P3 fee-wave defense: COMPLETE** -- commitment anchor (PR #391) + tree anchors
     (this branch), proven on regtest (unit + mass-exit conservation) AND real signet
     (presence + spendability). Every force-close cascade tx is CPFP-able. Open a PR.
-- **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
-  kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
-  + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.
+- **P4 — Remaining wt_db recourse paths (#55, R6). DONE + CONFIRMED (2026-06-25).**
+  Research conclusion (then empirically confirmed, per the kind-3 lesson "trust the
+  test over the grep"): NO real gap remained. (1) **kind=3 force-close CLTV**: standalone
+  test green — secret-less WT swept the HTLC-timeout from wt.db alone, sweep confirmed
+  on-chain (819 sats). (2) **JIT**: by design the defense is DETECTION via the factory-leaf
+  watch (JIT doesn't mutate the leaf, so there's no distinct response to broadcast) —
+  test_regtest_cheat_jit.sh green: cheat fired -> WT registered the OLD leaf -> FACTORY
+  BREACH detected (breach_detections row). (3) **L-stock burn kind0**: the standalone WT
+  fires the burn on a factory-node breach (watchtower.c:1083), and the modern recourse is
+  the wt_db-persisted POISON (standalone-proven via #53) -- the burn is legacy/single-process.
+  The factory-node response + poison are already standalone-matrix-proven. INFRA NOTE: the
+  JIT test first failed on regtest faucet-exhaustion (height>~4500 -> ~0-sat coinbases);
+  fixed by pre-funding ss_cheat_jit_miner from the accumulated ss_cheat_leaf_miner (9348 BTC)
+  -- applies to any fresh-miner-wallet test at high regtest height.
 - **P5 — Harness rigor Tier 2/3/4 (#35).** DoD: audit the back-catalog breach
   tests; upgrade machinery-asserts ("penalty broadcast") to economic-outcome
   asserts (real txid -> confirm -> amount/net-delta). Are our trustless PROOFS
