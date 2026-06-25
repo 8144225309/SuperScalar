@@ -1078,6 +1078,9 @@ int test_persist_factory_round_trip(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->use_tree_anchor = 1;  /* #56: mirror production — persist_load_factory rebuilds
+                                with anchors on (client-reconnect path), so the saved
+                                tree must be anchored too for the txid round-trip. */
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xDD;
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
