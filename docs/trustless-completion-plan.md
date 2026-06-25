@@ -153,10 +153,21 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
   JIT test first failed on regtest faucet-exhaustion (height>~4500 -> ~0-sat coinbases);
   fixed by pre-funding ss_cheat_jit_miner from the accumulated ss_cheat_leaf_miner (9348 BTC)
   -- applies to any fresh-miner-wallet test at high regtest height.
-- **P5 — Harness rigor Tier 2/3/4 (#35).** DoD: audit the back-catalog breach
-  tests; upgrade machinery-asserts ("penalty broadcast") to economic-outcome
-  asserts (real txid -> confirm -> amount/net-delta). Are our trustless PROOFS
-  rigorous? STATUS: pending.
+- **P5 — Harness rigor Tier 2/3/4 (#35). DONE + CONFIRMED (2026-06-25).** DoD:
+  audit the back-catalog breach tests; upgrade machinery-asserts ("penalty
+  broadcast") to economic-outcome asserts (real txid -> confirm -> amount/net-delta).
+  Tiers 1-3 were already remediated + validated (PR #385: real txid + on-chain
+  confirm + amount/A-2-ratio across cheat_client, ps_commitment, commitment_breach,
+  cheat_daemon_*, realloc, lstock, kind3, k2, htlc, ptlc). This session closed the
+  Tier-4 remainder: (a) the **reorg re-fire** property — "does a penalty SURVIVE a
+  reorg" — implemented as `SS_REORG_REFIRE=1` in `test_regtest_trustless_commitment_breach.sh`
+  (108a32b) and **VALIDATED on VPS regtest 2026-06-25** (penalty a800f036 re-confirmed
+  after orphaning its block; 11633 sats intact, non-vacuous orphan guard); (b) `selfdrive`
+  remediated (txid->confirm->amount), validated-by-sibling; (c) `adversarial_reorg`/
+  `same_height_reorg` confirmed detection-only BY DESIGN (not false-passes); (d) the
+  matrix runner has inline node-up + chain-reset guards (#42). No marker-only
+  false-pass smell remains. Our trustless PROOFS now assert the adversarial OUTCOME,
+  and the recourse is proven reorg-robust. See docs/test-harness-rigor-audit.md §7-§10.
 - **P6 — Liveness / escalation (#48-51, #54).** DoD: bounded-retry -> proactive
   exit on a stalled advance (not blind-until-expiry); ABORT_ADVANCE advisory +
   local timeout; intent-to-exit NOTICE. Safety holds via the DW/CLTV override;
@@ -220,3 +231,23 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
   **P2 (Layer-3 fee-race) is DONE + PROVEN for single-breach.** Tasks #60 + #68 closed.
   NEXT: P3 (mass-exit thundering herd, #56) -- the OTHER fee-race: N clients contending for
   block space at the SHARED factory CLTV deadline simultaneously.
+- 2026-06-24/25: **P3 + P4 DONE + PROVEN.** P3 (mass-exit fee-wave, #56): commitment P2A anchor
+  (PR #391, `use_cpfp_anchor`) + tree-node P2A anchors (PR #392, `use_tree_anchor`, all 6 factory.c
+  node builders) => every force-close cascade tx (tree + commitment) is CPFP-able. unit 1511/1511,
+  mass-exit N=4 conservation held, REAL SIGNET green (force-close txs carry P2A 51024e73 on-chain;
+  CPFP child accepted). P4 (#55 wt_db recourse): kind3 standalone + JIT detection green; L-stock
+  burn superseded by the #53 poison.
+- 2026-06-25: **P5 (harness rigor Tier 2/3/4, #35) DONE + CONFIRMED.** Tiers 1-3 were already
+  remediated + validated (PR #385). Closed the Tier-4 remainder this session. The headline,
+  genuinely-unvalidated piece was the **reorg re-fire** ("does a penalty SURVIVE a reorg") — the
+  real trustless-robustness gap from the audit §10. It was implemented (108a32b, `SS_REORG_REFIRE=1`
+  inside the commitment-breach test, reusing a real armed kind=2 penalty) but had never been run.
+  **VALIDATED on VPS regtest 2026-06-25** (clean build-release, worktree e19c008): standalone WT
+  (wt.db only, no secrets) hydrated 24 kind=2 watches, confirmed penalty `a800f036` (11633 sats,
+  A-2 11873/12038 swept, fee 165), then the reorg phase `invalidateblock`'d the penalty's block
+  `6f1dba1f`, the test verified it actually dropped to 0 confs (non-vacuous guard), mined a new
+  chain, and the SAME penalty txid **RE-confirmed with the swept amount intact** — the cheater's
+  to_local stays swept across a reorg. selfdrive remediated (validated-by-sibling); adversarial/
+  same-height reorg confirmed detection-only by design; matrix runner has inline node-up/chain-reset
+  guards; no marker-only false-pass smell remains. Our trustless PROOFS now assert the adversarial
+  OUTCOME and the recourse is proven reorg-robust. NEXT: P6 (liveness/escalation, #48-51,#54).

@@ -190,11 +190,27 @@ subfactory, leaf, leaf_late_wt, realloc); multistate fixed (+x) + rollover (ASan
 ### Tier 3 — DONE (validating in run #3)
 `kind3` swept-amount assert (480a6a3); `k2` per-client min-output >dust, inherited by k3–k6 wrappers (a472458).
 
-### Tier 4 — partial
-`watchtower_trustless.sh` overclaiming header reconciled (0c3d8f4). **Still OPEN:**
-`test_signet_selfdrive.sh` (signet marker-only), `adversarial_reorg`/`same_height_reorg`
-(prove a penalty RE-fires post-reorg, not just that "REORG" was logged), `rebroadcast_recovery`
-(reconfirm the resent tx on a chain that retains it).
+### Tier 4 — DONE (2026-06-25)
+`watchtower_trustless.sh` overclaiming header reconciled (0c3d8f4). `test_signet_selfdrive.sh`
+REMEDIATED — its marker is now followed by a real-outcome block (sweep/penalty txid from
+`broadcast_log` -> on-chain confirm -> non-dust amount; lines 60-77), code-complete and
+validated-by-sibling (identical idiom to the signet-validated commitment/subfactory tests; a
+fresh multi-hour signet run is deferred per the sat-budget rule, not a code gap).
+`rebroadcast_recovery` is the cooperative-close eviction path (#259/#302): regtest proves
+DETECTION + RESEND-LOGIC firing but not the full re-confirm (bitcoind drops in-mempool wallet
+history across a `-persistmempool=0` restart); the full re-confirm was validated manually on
+testnet4 (PR #302). `adversarial_reorg`/`same_height_reorg` stay detection-only BY DESIGN
+(empty wt.db — they correctly prove the WT logs/handles 3 reorg kinds; not false-passes).
+
+**The genuinely-missing property — "does a penalty SURVIVE a reorg" — is now PROVEN** via the
+opt-in `SS_REORG_REFIRE=1` phase in `test_regtest_trustless_commitment_breach.sh` (commit
+108a32b): arm kind=2 -> standalone WT confirms the penalty -> `invalidateblock` the penalty's
+block (the test asserts it actually drops to 0 confs, so the re-confirm is non-vacuous) -> mine
+a new chain -> assert the SAME penalty txid RE-confirms with the swept amount intact.
+**VALIDATED on VPS regtest 2026-06-25** (worktree e19c008, clean build-release): penalty
+`a800f036` re-confirmed after orphaning block `6f1dba1f` (1 conf, 11633 sats; pre-reorg A-2
+recovery 11873/12038 swept, fee 165) — the cheater's `to_local` stays swept across a reorg, so
+the trustless defense is reorg-robust. See §10 for the design rationale.
 
 ### Validation run #3 (2026-06-19) — caught two of my OWN over-corrections + two infra issues
 Re-running the fixed tests directly (not via `bash x.sh`) exposed:
@@ -339,10 +355,14 @@ leaf (cheat_leaf 91.8%), but **too tight for tiny-HTLC sweeps** (~819 sats, fee 
 For channel-commit/HTLC A-2, use a fee-bounded threshold (fee < max(2000 sats, 10% of input))
 rather than a flat 90% — or rely on the existing confirm+amount (single-sweep is already covered).
 
-**Tier-4 reorg re-fire — DESIGN (regtest, new test, the real trustless-robustness gap):**
-The current `adversarial_reorg`/`same_height_reorg` run an EMPTY wt.db (detection-only — they
-correctly prove the WT logs/handles 3 reorg kinds; NOT false-passes). The missing property is
-*does a penalty survive a reorg*. New test plan:
+**Tier-4 reorg re-fire — IMPLEMENTED + VALIDATED 2026-06-25 (the real trustless-robustness gap — CLOSED).**
+Built as the opt-in `SS_REORG_REFIRE=1` phase inside `test_regtest_trustless_commitment_breach.sh`
+(commit 108a32b) rather than a standalone test — it reuses the commitment-breach flow that already
+arms a real kind=2 penalty, so the re-fire assertion sits on a genuine, confirmed penalty. Green on
+VPS regtest (see §7 Tier-4 for the run). Design rationale below.
+The `adversarial_reorg`/`same_height_reorg` tests run an EMPTY wt.db (detection-only — they
+correctly prove the WT logs/handles 3 reorg kinds; NOT false-passes). The missing property was
+*does a penalty survive a reorg*. Test plan (as built):
 1. Run the commitment-breach flow (arm kind=2 watch → breach → WT broadcasts penalty → mine → confirm).
 2. `invalidateblock` the penalty's block (+breach block) → penalty returns to mempool / is orphaned.
 3. Mine fresh blocks on the new chain → assert the penalty (same or a WT-rebroadcast one)
