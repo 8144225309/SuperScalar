@@ -124,13 +124,21 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
     tree, conservation 104.3% (the fund-safety guardrail -- the uniform carve preserves
     conservation as predicted). So the tree anchors are PROVEN correct on regtest; combined
     with PR #391's commitment anchor, every force-close cascade tx is now CPFP-able.
-    SIGNET (in flight, commit 75a4282): tools/test_signet_tree_anchor_feewave.sh builds a
-    small anchored factory on REAL signet (strong keys), force-closes, verifies the on-chain
-    tree+commitment txs carry the keyless P2A output (51024e73), and CPFP-spends one anchor.
-    Signet has no congestion to contend (winning a contested race is the regtest P2a/P2b/
-    mass-exit proof); the signet test proves anchor PRESENCE + SPENDABILITY on a real public
-    chain. NOTE: pause ss-recover-signet during signet runs (it starves bitcoind RPC via
-    per-block rescans -- the runner does this + restarts it after). Branch: trustless-tree-anchors.
+    SIGNET (2026-06-25): **PASSED end-to-end** (tools/test_signet_tree_anchor_feewave.sh,
+    commit 75a4282). Built a small anchored factory on REAL signet (strong keys, 250k sats,
+    fee 110), force-closed; **PROOF 1**: 2 on-chain force-close txs (68f0a4f6, ffab493f)
+    each carry the keyless P2A output (51024e73), conf=1 -- anchors PRESENT + relay-standard
+    on a real public chain; **PROOF 2**: CPFP-spent a P2A anchor (child 27b7cbb7 accepted by
+    the signet network) -- anchor SPENDABLE for fee-bumping. Signet has no congestion to
+    contend (winning a contested race is the regtest P2a/P2b/mass-exit proof). NOTE: must
+    pause ss-recover-signet during signet runs (its per-block ss_recover_scav rescan holds
+    cs_main and starves ALL bitcoind RPC incl. getrpcinfo -- the runner stops it, waits for
+    the in-flight rescan to drain, then restarts it after). RECOVERY: strong-key seed at
+    /tmp/ss_signet_seed_feewave.txt; ~250k sats of force-close outputs (to_local/L-stock) are
+    CSV(144)-gated -- sweepable after maturation via the seed (scantxoutset + re-derive).
+  - **#56 / P3 fee-wave defense: COMPLETE** -- commitment anchor (PR #391) + tree anchors
+    (this branch), proven on regtest (unit + mass-exit conservation) AND real signet
+    (presence + spendability). Every force-close cascade tx is CPFP-able. Open a PR.
 - **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
   kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
   + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.
