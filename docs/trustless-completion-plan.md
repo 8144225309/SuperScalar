@@ -117,10 +117,20 @@ then the Layer-3 frontier, then coverage, rigor, liveness, ops, audit-prep.
     (deterministic across LSP+clients). FACTORY_MAX_OUTPUTS=16 has headroom; append helper
     skips if full. NOT YET anchored: PS-subfactory builders (setup_ps_leaf_with_subfactories,
     the k^2 shape) -- follow-up (basic factory / mass-exit / signet don't use them).
-    VALIDATION (pending -- VPS was fail2ban-blocked when implemented): unit suite (flag-off
-    tests unchanged), mass-exit N=4 conservation (the guardrail -- must stay ~100%), breach,
-    then REAL SIGNET fee-wave (deprioritise the cascade, CPFP each tree tx + commitment via
-    their P2A anchors, prove all funds recovered). Branch: trustless-tree-anchors.
+    REGTEST VALIDATION (2026-06-25): **ALL GREEN.** Build rc=0 (stage-2 compiles); **unit
+    1511/1511** (one fallout fixed: test_persist_factory_round_trip must build with
+    use_tree_anchor=1 since persist_load_factory rebuilds anchored on the client-reconnect
+    path -- commit e67948f); **mass-exit N=4** all clients self-exit with the fully-anchored
+    tree, conservation 104.3% (the fund-safety guardrail -- the uniform carve preserves
+    conservation as predicted). So the tree anchors are PROVEN correct on regtest; combined
+    with PR #391's commitment anchor, every force-close cascade tx is now CPFP-able.
+    SIGNET (in flight, commit 75a4282): tools/test_signet_tree_anchor_feewave.sh builds a
+    small anchored factory on REAL signet (strong keys), force-closes, verifies the on-chain
+    tree+commitment txs carry the keyless P2A output (51024e73), and CPFP-spends one anchor.
+    Signet has no congestion to contend (winning a contested race is the regtest P2a/P2b/
+    mass-exit proof); the signet test proves anchor PRESENCE + SPENDABILITY on a real public
+    chain. NOTE: pause ss-recover-signet during signet runs (it starves bitcoind RPC via
+    per-block rescans -- the runner does this + restarts it after). Branch: trustless-tree-anchors.
 - **P4 — Remaining wt_db recourse paths (#55, R6).** DoD: e2e the L-stock burn
   kind0 + JIT-channel recourse via the standalone (secret-less) WT — arm in wt_db
   + fire + confirm. (kind=3 force-close already corrected as NOT a gap.) STATUS: pending.
