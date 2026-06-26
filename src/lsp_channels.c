@@ -7271,6 +7271,35 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                            " — broadcasting distribution TX\n",
                                            mret, lf->factory_id);
                                     fflush(stdout);
+                                    /* #49/#51: notify all clients (best-effort) that
+                                       the rotation ceremony is aborted (retry limit)
+                                       and the LSP is proactively exiting via the
+                                       distribution TX before the factory CLTV.  The
+                                       clients' own persisted state + watchtower
+                                       protect their funds; this lets them stop
+                                       waiting and confirm their WT is live.  An
+                                       offline client simply won't receive it. */
+                                    {
+                                        unsigned char _cer_id[8] = {0};
+                                        _cer_id[0] = (unsigned char)(lf->factory_id & 0xff);
+                                        _cer_id[1] = (unsigned char)((lf->factory_id >> 8) & 0xff);
+                                        _cer_id[2] = (unsigned char)((lf->factory_id >> 16) & 0xff);
+                                        _cer_id[3] = (unsigned char)((lf->factory_id >> 24) & 0xff);
+                                        char _atext[200];
+                                        snprintf(_atext, sizeof(_atext),
+                                            "rotation retry limit (%u) reached at height %u; "
+                                            "LSP broadcasting distribution TX (proactive exit) "
+                                            "-- ensure your watchtower is live",
+                                            mret, (unsigned)height);
+                                        cJSON *_ab = wire_build_ceremony_abort(_cer_id,
+                                            CEREMONY_ABORT_RETRY_LIMIT_REACHED, _atext);
+                                        if (_ab) {
+                                            for (size_t _aci = 0; _aci < lsp->n_clients; _aci++)
+                                                wire_send(lsp->client_fds[_aci],
+                                                          MSG_CEREMONY_ABORT, _ab);
+                                            cJSON_Delete(_ab);
+                                        }
+                                    }
                                     if (lf->distribution_tx.len > 0 &&
                                         mgr->chain_be) {
                                         chain_backend_t *_cb =

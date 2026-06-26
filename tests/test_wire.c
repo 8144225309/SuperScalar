@@ -542,6 +542,48 @@ int test_wire_lstock_reveal_round_trip(void) {
     return 1;
 }
 
+/* #49/#51: MSG_CEREMONY_ABORT round-trip (the abort / intent-to-exit notice). */
+int test_wire_ceremony_abort_round_trip(void) {
+    unsigned char cid[8];
+    for (int i = 0; i < 8; i++) cid[i] = (unsigned char)(0xA0 + i);
+
+    /* With reason_text. */
+    cJSON *j = wire_build_ceremony_abort(cid, CEREMONY_ABORT_RETRY_LIMIT_REACHED,
+                                         "retry limit reached; proactive exit");
+    TEST_ASSERT(j != NULL, "build ceremony_abort (with text)");
+    unsigned char cid_out[8];
+    unsigned char reason_out = 0;
+    char *text_out = NULL;
+    TEST_ASSERT(wire_parse_ceremony_abort(j, cid_out, &reason_out, &text_out),
+                "parse ceremony_abort");
+    TEST_ASSERT(memcmp(cid_out, cid, 8) == 0, "ceremony_id round-trips");
+    TEST_ASSERT(reason_out == CEREMONY_ABORT_RETRY_LIMIT_REACHED, "reason round-trips");
+    TEST_ASSERT(text_out && strcmp(text_out, "retry limit reached; proactive exit") == 0,
+                "reason_text round-trips");
+    free(text_out);
+    cJSON_Delete(j);
+
+    /* Without reason_text (NULL) — parse still succeeds, text NULL. */
+    cJSON *j2 = wire_build_ceremony_abort(cid, CEREMONY_ABORT_CLIENT_TIMEOUT, NULL);
+    TEST_ASSERT(j2 != NULL, "build ceremony_abort (no text)");
+    reason_out = 0; text_out = NULL;
+    TEST_ASSERT(wire_parse_ceremony_abort(j2, cid_out, &reason_out, &text_out),
+                "parse ceremony_abort (no text)");
+    TEST_ASSERT(reason_out == CEREMONY_ABORT_CLIENT_TIMEOUT, "reason (no text) round-trips");
+    TEST_ASSERT(text_out == NULL, "reason_text absent -> NULL");
+    cJSON_Delete(j2);
+
+    /* Malformed: object missing ceremony_id -> parse fails. */
+    cJSON *bad = cJSON_CreateObject();
+    cJSON_AddNumberToObject(bad, "x", 1);
+    TEST_ASSERT(wire_parse_ceremony_abort(bad, cid_out, &reason_out, &text_out) == 0,
+                "parse rejects malformed (missing ceremony_id)");
+    cJSON_Delete(bad);
+
+    printf("  MSG_CEREMONY_ABORT round-trips (text + no-text + malformed)\n");
+    return 1;
+}
+
 /* #59: MSG_LSTOCK_REVEAL_REQUEST round-trip (the restart re-request). */
 int test_wire_lstock_reveal_request_round_trip(void) {
     uint32_t nodes[3]  = { 2, 9, 99 };

@@ -1122,6 +1122,7 @@ extern int test_regtest_ladder_distribution_fallback(void);
 extern int test_wire_pubkey_only_factory(void);
 extern int test_wire_framing(void);
 extern int test_wire_lstock_reveal_round_trip(void);
+extern int test_wire_ceremony_abort_round_trip(void);
 extern int test_wire_lstock_reveal_request_round_trip(void);
 extern int test_wire_crypto_serialization(void);
 extern int test_wire_nonce_bundle(void);
@@ -3079,6 +3080,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_pubkey_only_factory);
     RUN_TEST(test_wire_framing);
     RUN_TEST(test_wire_lstock_reveal_round_trip);
+    RUN_TEST(test_wire_ceremony_abort_round_trip);
     RUN_TEST(test_wire_lstock_reveal_request_round_trip);
     RUN_TEST(test_wire_crypto_serialization);
     RUN_TEST(test_wire_nonce_bundle);
