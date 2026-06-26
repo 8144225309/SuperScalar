@@ -83,12 +83,14 @@ jobs:
     name: Static Analysis
     # cppcheck on tools/superscalar_lsp.c can take 12-18 min on the
     # GitHub Actions runner under load; the rest of the corpus finishes
-    # in ~5 min.  Bumped from 20 to 35 to absorb worst-case runner
-    # variance.  --max-configs=1 caps preprocessor branch enumeration
-    # at 1 (default ~12) which dramatically reduces work on this file
+    # in ~5 min.  35 min was still occasionally hit — cppcheck was
+    # canceled mid-run (~35m) on a slow/loaded runner before emitting
+    # results; bumped to 50 to absorb worst-case variance.
+    # --max-configs=1 caps preprocessor branch enumeration at 1
+    # (default ~12) which dramatically reduces work on this file
     # without losing meaningful warnings (we don't ship multi-config
     # builds).
-    timeout-minutes: 35
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
