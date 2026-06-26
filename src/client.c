@@ -3716,8 +3716,18 @@ static int client_handle_leaf_advance_stateless(int fd,
     if (had_old_signed_c)
         memcpy(old_leaf_txid, ps_node->txid, 32);
     int old_n_outputs_c = ps_node->n_outputs;
-    uint64_t old_l_amount_c = (old_n_outputs_c >= 2)
-                              ? ps_node->outputs[old_n_outputs_c - 1].amount_sats
+    /* #53 x P3: a P2A tree anchor (4-byte SPK 0x51024e73) is appended as the LAST
+       output of every node when use_tree_anchor is on, shifting the L-stock to the
+       second-to-last output.  Detect it by SPK (a real L-stock is a 34-byte P2TR) so
+       the poison gate targets the L-stock, not the 240-sat anchor — else this client
+       omits its poison pubnonce and the LSP fail-closes the advance.  Mirrors the LSP. */
+    int old_anchor_outs_c = (old_n_outputs_c >= 2 &&
+        ps_node->outputs[old_n_outputs_c - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(ps_node->outputs[old_n_outputs_c - 1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0)
+        ? 1 : 0;
+    int old_l_vout_c = old_n_outputs_c - 1 - old_anchor_outs_c;
+    uint64_t old_l_amount_c = (old_l_vout_c >= 0 && (old_n_outputs_c - old_anchor_outs_c) >= 2)
+                              ? ps_node->outputs[old_l_vout_c].amount_sats
                               : 0;
 
     /* CL7: snapshot pre-advance leaf signed_tx for --cheat-client.
@@ -3800,7 +3810,7 @@ static int client_handle_leaf_advance_stateless(int fd,
     if (poison_required_c) {
         if (factory_session_prepare_poison_tx_leaf(
                 factory, node_idx,
-                old_leaf_txid, (uint32_t)(old_n_outputs_c - 1),
+                old_leaf_txid, (uint32_t)old_l_vout_c,
                 old_l_amount_c, LEAF_POISON_FEE_SATS_C,
                 /* #53-B3b Phase 1: target the SUPERSEDED state's output (H_old). */
                 have_old_l_hash_c ? old_l_stock_hash_c : NULL)) {
