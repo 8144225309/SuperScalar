@@ -3741,6 +3741,17 @@ int factory_sign_l_stock_poison_tx(
 {
     if (!f || !leaf_node || !signed_out) return 0;
     if (leaf_node->n_signers < 2) return 0;
+
+    /* #53-B2: defense against the Scenario B key-path bypass. When this leaf
+       carries a hashlock commitment (has_l_stock_hash), its L-stock poison
+       MUST be produced via the Leaf-P script path (which forces revealing the
+       per-(leaf,state) secret), never this key-path signer. build_l_stock_spk
+       sets the L-stock taproot internal key to the N-of-N agg pubkey, so a
+       co-signed KEY-PATH poison would spend the L-stock WITHOUT the secret --
+       exactly the co-signed-poison theft that #53 closes. Refuse loudly; the
+       caller must use the factory_*_l_stock_poison_scriptpath_* path. */
+    if (leaf_node->has_l_stock_hash) return 0;
+
     size_t n_clients = leaf_node->n_signers - 1;
 
     /* Compute per-client equal-split outputs (zmn's "10 to A, 10 to B"). */

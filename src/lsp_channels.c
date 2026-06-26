@@ -1804,7 +1804,11 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             node->poison_is_signed = 1;
             printf("LSP-stateless: script-path poison agg sig stored (L-stock %llu sats)\n",
                    (unsigned long long)old_l_amount);
-        } else if (poison_verified &&
+        } else if (poison_verified && !node->has_l_stock_hash &&
+            /* #53-B2: a key-path poison must NEVER be finalized for a hashlock
+               leaf (it would spend the L-stock without revealing the secret).
+               poison_is_scriptpath is already set from has_l_stock_hash at prep,
+               so this is the inconsistent-state backstop: degrade, don't sign. */
             finalize_signed_tx(&node->poison_signed_tx,
                                 node->poison_unsigned_tx.data,
                                 node->poison_unsigned_tx.len,
