@@ -8,6 +8,7 @@
 
 #include "superscalar/channel.h"
 #include "superscalar/watchtower.h"
+#include "superscalar/persist_wt.h"
 #include "superscalar/wire.h"
 #include "superscalar/fee.h"
 #include "superscalar/regtest.h"
@@ -493,6 +494,27 @@ int test_htlc_penalty_watch(void) {
    watchtower_watch_revoked_commitment PTLC feed populates entry->ptlc_outputs
    so the existing sweep loop at watchtower.c:1039+ can broadcast a PTLC
    penalty TX on breach. */
+/* G2 #45 probe: scan wt_db CHANNEL_COMMITMENT watches for one matching a target
+   (vout, amount) that carries response bytes — proves the PTLC sweep was mirrored
+   into wt_db for a secret-less standalone WT (not just the in-memory entry). */
+struct g2_ptlc_probe { uint32_t want_vout; uint64_t want_amt; int found; };
+static int g2_ptlc_probe_cb(uint32_t factory_id,
+        const unsigned char parent_txid32[32], uint32_t parent_vout,
+        uint64_t parent_value_sat, const unsigned char *parent_spk,
+        size_t parent_spk_len, uint32_t csv_delay,
+        const char *response_tx_hex, const unsigned char response_txid32[32],
+        uint64_t fee_bump_budget_sat, uint32_t fee_bump_deadline_height,
+        void *user) {
+    (void)factory_id; (void)parent_txid32; (void)parent_spk;
+    (void)parent_spk_len; (void)csv_delay; (void)response_txid32;
+    (void)fee_bump_budget_sat; (void)fee_bump_deadline_height;
+    struct g2_ptlc_probe *pr = (struct g2_ptlc_probe *)user;
+    if (parent_vout == pr->want_vout && parent_value_sat == pr->want_amt &&
+        response_tx_hex && response_tx_hex[0])
+        pr->found = 1;
+    return 1; /* continue */
+}
+
 int test_ptlc_penalty_watch(void) {
     extern void ptlc_safety_set_enabled(int);
     ptlc_safety_set_enabled(1);
@@ -514,6 +536,15 @@ int test_ptlc_penalty_watch(void) {
     fee_estimator_static_t fee;
     fee_estimator_static_init(&fee, 1000);
     watchtower_init(&wt, 1, NULL, (fee_estimator_t *)&fee, NULL);
+
+    /* G2 #45: attach a wt_db so the breach registration ALSO mirrors sweeps for a
+       secret-less standalone WT (the path this test now exercises for PTLCs). */
+    const char *g2_wtdb_path = "/tmp/test_g2_ptlc_wtdb.db";
+    remove(g2_wtdb_path);
+    persist_wt_t g2_pwt;
+    TEST_ASSERT(persist_wt_open(&g2_pwt, g2_wtdb_path) == 1,
+                "open wt_db for G2 PTLC mirror");
+    watchtower_set_wt_db(&wt, &g2_pwt);
 
     /* Build a payment_point from a known secret */
     secp256k1_pubkey payment_pt;
@@ -592,6 +623,22 @@ int test_ptlc_penalty_watch(void) {
         TEST_ASSERT(memcmp(entry->ptlc_outputs[0].payment_hash, expected_ser, 32) == 0,
                     "payment_hash should be xonly form of payment_point");
     }
+
+    /* G2 #45: the PTLC penalty sweep must ALSO be mirrored into wt_db (keyed on
+       the breach txid) so a SECRET-LESS standalone WT can rebroadcast it.  Before
+       this fix the PTLC block populated only the in-memory entry + legacy db, so
+       a standalone WT swept to_local + HTLCs but LEAKED in-flight PTLC value.
+       Assert a CHANNEL_COMMITMENT watch exists for the PTLC vout (2) with bytes. */
+    {
+        struct g2_ptlc_probe pr = { 2, 5000, 0 };
+        int nrows = persist_wt_list_watches_by_kind(&g2_pwt,
+                        WT_KIND_CHANNEL_COMMITMENT, g2_ptlc_probe_cb, &pr);
+        TEST_ASSERT(nrows >= 1, "wt_db holds >=1 CHANNEL_COMMITMENT watch");
+        TEST_ASSERT(pr.found == 1,
+                    "G2 #45: PTLC sweep mirrored to wt_db (vout 2, 5000 sat, has bytes)");
+    }
+    persist_wt_close(&g2_pwt);
+    remove(g2_wtdb_path);
 
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
