@@ -165,7 +165,12 @@ int wire_listen(const char *host, int port) {
         close(fd);
         return -1;
     }
-    if (listen(fd, 16) < 0) {
+    /* Backlog must cover a full factory's worth of near-simultaneous client
+     * connects.  16 was too small: at N>=64 a connect burst overflowed the
+     * accept queue and stalled lsp_accept_clients (surfaced by the
+     * single-process scale harness, #310).  512 comfortably covers the
+     * documented max client count (clamped by net.core.somaxconn). */
+    if (listen(fd, 512) < 0) {
         close(fd);
         return -1;
     }
@@ -660,6 +665,28 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
             cJSON_AddItemToArray(hashes, cJSON_CreateString(hex));
         }
         cJSON_AddItemToObject(j, "l_stock_hashes", hashes);
+    }
+
+    /* #53-B3b: per-(leaf,state) L-stock hashes keyed by NODE INDEX.  When the LSP
+       runs the revocation-gated poison (use_hashlock_poison), each leaf node's
+       L-stock output commits a distinct H = SHA256(secret(leaf,state)).  The client
+       has no seed and cannot derive these, so it receives them here and mirrors them
+       onto its nodes (factory_set_node_l_stock_hash) to build the SAME 2-leaf SPK —
+       otherwise the leaf-state tx bytes diverge and the MuSig co-sign fails.  Built
+       after factory_build_tree, so node->l_stock_hash is populated. */
+    {
+        cJSON *node_hashes = NULL;
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            if (!f->nodes[i].has_l_stock_hash) continue;
+            if (!node_hashes) node_hashes = cJSON_CreateArray();
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "node", (double)i);
+            char hex[65];
+            hex_encode(f->nodes[i].l_stock_hash, 32, hex);
+            cJSON_AddStringToObject(o, "h", hex);
+            cJSON_AddItemToArray(node_hashes, o);
+        }
+        if (node_hashes) cJSON_AddItemToObject(j, "node_l_stock_hashes", node_hashes);
     }
 
     return j;
@@ -2448,6 +2475,99 @@ int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
     return 1;
 }
 
+/* #53-B3b: MSG_LSTOCK_REVEAL — reveal superseded-state L-stock revocation secrets. */
+cJSON *wire_build_lstock_reveal(const uint32_t *node_idx,
+                                const uint32_t *revoked_state,
+                                const unsigned char secrets[][32],
+                                size_t n) {
+    if ((n > 0) && (!node_idx || !revoked_state || !secrets)) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) { cJSON_Delete(j); return NULL; }
+    for (size_t i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        if (!e) { cJSON_Delete(arr); cJSON_Delete(j); return NULL; }
+        cJSON_AddNumberToObject(e, "node", (double)node_idx[i]);
+        cJSON_AddNumberToObject(e, "state", (double)revoked_state[i]);
+        wire_json_add_hex(e, "secret", secrets[i], 32);
+        cJSON_AddItemToArray(arr, e);
+    }
+    cJSON_AddItemToObject(j, "reveals", arr);
+    return j;
+}
+
+int wire_parse_lstock_reveal(const cJSON *json,
+                             uint32_t *node_idx_out,
+                             uint32_t *revoked_state_out,
+                             unsigned char secrets_out[][32],
+                             size_t max_entries,
+                             size_t *n_out) {
+    if (!json || !node_idx_out || !revoked_state_out || !secrets_out || !n_out)
+        return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "reveals");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    int an = cJSON_GetArraySize(arr);
+    size_t n = 0;
+    for (int i = 0; i < an && n < max_entries; i++) {
+        cJSON *e = cJSON_GetArrayItem(arr, i);
+        cJSON *no = e ? cJSON_GetObjectItem(e, "node") : NULL;
+        cJSON *st = e ? cJSON_GetObjectItem(e, "state") : NULL;
+        if (!no || !cJSON_IsNumber(no) || !st || !cJSON_IsNumber(st)) return 0;
+        if (wire_json_get_hex(e, "secret", secrets_out[n], 32) != 32) return 0;
+        node_idx_out[n] = (uint32_t)no->valuedouble;
+        revoked_state_out[n] = (uint32_t)st->valuedouble;
+        n++;
+    }
+    *n_out = n;
+    return 1;
+}
+
+/* #59: MSG_LSTOCK_REVEAL_REQUEST (0x8D).  Client -> LSP after a restart/reconnect:
+   the (node, state) poison rows whose secret was never received, so the LSP
+   re-derives + re-reveals them.  Mirror of wire_build_lstock_reveal minus secrets. */
+cJSON *wire_build_lstock_reveal_request(const uint32_t *node_idx,
+                                        const uint32_t *state_counter,
+                                        size_t n) {
+    if ((n > 0) && (!node_idx || !state_counter)) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) { cJSON_Delete(j); return NULL; }
+    for (size_t i = 0; i < n; i++) {
+        cJSON *e = cJSON_CreateObject();
+        if (!e) { cJSON_Delete(arr); cJSON_Delete(j); return NULL; }
+        cJSON_AddNumberToObject(e, "node", (double)node_idx[i]);
+        cJSON_AddNumberToObject(e, "state", (double)state_counter[i]);
+        cJSON_AddItemToArray(arr, e);
+    }
+    cJSON_AddItemToObject(j, "requests", arr);
+    return j;
+}
+
+int wire_parse_lstock_reveal_request(const cJSON *json,
+                                     uint32_t *node_idx_out,
+                                     uint32_t *state_counter_out,
+                                     size_t max_entries,
+                                     size_t *n_out) {
+    if (!json || !node_idx_out || !state_counter_out || !n_out) return 0;
+    cJSON *arr = cJSON_GetObjectItem(json, "requests");
+    if (!arr || !cJSON_IsArray(arr)) return 0;
+    int an = cJSON_GetArraySize(arr);
+    size_t n = 0;
+    for (int i = 0; i < an && n < max_entries; i++) {
+        cJSON *e = cJSON_GetArrayItem(arr, i);
+        cJSON *no = e ? cJSON_GetObjectItem(e, "node") : NULL;
+        cJSON *st = e ? cJSON_GetObjectItem(e, "state") : NULL;
+        if (!no || !cJSON_IsNumber(no) || !st || !cJSON_IsNumber(st)) return 0;
+        node_idx_out[n] = (uint32_t)no->valuedouble;
+        state_counter_out[n] = (uint32_t)st->valuedouble;
+        n++;
+    }
+    *n_out = n;
+    return 1;
+}
+
 /* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
 
 cJSON *wire_build_leaf_realloc_propose(int leaf_side,
@@ -2751,6 +2871,25 @@ cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len
     cJSON_AddNumberToObject(j, "sub_idx", sub_idx);
     cJSON_AddNumberToObject(j, "chain_len", (double)chain_len);
     return j;
+}
+
+/* #53 sub-factory hashlock: carry the LSP's AGGREGATED poison Schnorr sig in
+   SUBFACTORY_DONE.  Unlike the 2-party leaf (where the client aggregates the poison
+   locally), the N-party sub poison is aggregated ONLY by the LSP — so the LSP must
+   hand each sub client the 64-byte agg-sig for its persisted recourse template (the
+   client builds the rest of the template deterministically + receives the secret in
+   the reveal).  Optional field (absent when hashlock poison is off); mutator/getter
+   pattern mirrors wire_subfactory_propose_set_inputs (no DONE signature churn). */
+void wire_subfactory_done_set_poison_aggsig(cJSON *done,
+                                            const unsigned char *poison_agg_sig64) {
+    if (!done || !poison_agg_sig64) return;
+    wire_json_add_hex(done, "poison_agg_sig", poison_agg_sig64, 64);
+}
+
+int wire_subfactory_done_get_poison_aggsig(const cJSON *json,
+                                           unsigned char *poison_agg_sig64_out) {
+    if (!json || !poison_agg_sig64_out) return 0;
+    return wire_json_get_hex(json, "poison_agg_sig", poison_agg_sig64_out, 64) == 64;
 }
 
 /* --- Multi-input sub-factory chain advance helpers (#207 phase 2c) ---

@@ -11,10 +11,15 @@ typedef struct {
     sqlite3 *db;
     char path[256];
     int in_transaction;  /* nonzero if BEGIN has been issued */
+    /* #327 at-rest field encryption (LND/Core model). dek is the HKDF-derived
+       Data Encryption Key; enc_enabled is set once a key is installed. Both stay
+       in memory only — never persisted. Zeroed at persist_close. */
+    unsigned char dek[32];
+    int enc_enabled;
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 36
+#define PERSIST_SCHEMA_VERSION 39
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -62,6 +67,26 @@ enum {
    Pass NULL or ":memory:" for in-memory database.
    Returns 1 on success, 0 on error. */
 int persist_open(persist_t *p, const char *path);
+
+/* --- #327 at-rest field encryption (persist_crypto.c) --- */
+/* Install the DB encryption key, derived (HKDF) from the LSP root secret. Call
+   AFTER persist_open and BEFORE any secret column is read/written. Idempotent. */
+int persist_set_encryption_key(persist_t *p, const unsigned char root_key[32]);
+/* Migrate existing plaintext secrets + write a key-verification token (fresh DB),
+   or verify the key against the stored token (already-encrypted DB; wrong key ->
+   returns 0, fail closed). No-op when no key is installed. */
+int persist_apply_encryption(persist_t *p);
+/* 1 if the on-disk DB carries the encryption marker (refuse keyless open). */
+int persist_db_is_encrypted(persist_t *p);
+/* Seal/open a single field. With no key installed these are plain copies, so
+   callers can use them unconditionally. Returns malloc'd output (caller frees);
+   open returns 0 on a real failure (sealed data + wrong/absent key, or tamper). */
+char *persist_seal_text(persist_t *p, const char *plain);
+int   persist_open_text(persist_t *p, const char *stored, char **out);
+int   persist_seal_blob(persist_t *p, const unsigned char *plain, size_t plain_len,
+                        unsigned char **out, size_t *out_len);
+int   persist_open_blob(persist_t *p, const unsigned char *stored, size_t stored_len,
+                        unsigned char **out, size_t *out_len);
 
 /* Open database read-only. No schema creation or migration.
    Writes will fail. For standalone watchtower / backup tools.
@@ -122,6 +147,37 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
                                  uint64_t chan_amount_sats,
                                  const unsigned char *poison_tx,
                                  size_t poison_tx_len);
+
+/* #53-B3b.2d: persisted script-path L-stock poison reveals (table l_stock_poison_reveals,
+   schema v38).  save: at ceremony-complete (secret NULL).  update_secret: when the reveal
+   verifies.  load: on restart -> rebuild + factory_assemble_poison_with_secret + broadcast. */
+int persist_save_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                const unsigned char *l_stock_hash32,
+                                const unsigned char *agg_sig64,
+                                const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+                                const unsigned char *leaf_script, size_t leaf_script_len,
+                                const unsigned char *control_block,
+                                size_t control_block_len);
+int persist_update_l_stock_secret(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                  uint32_t state_counter,
+                                  const unsigned char *secret32);
+int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                unsigned char *l_stock_hash_out32,
+                                unsigned char *agg_sig_out64,
+                                tx_buf_t *unsigned_tx_out,
+                                unsigned char *leaf_script_out, size_t *leaf_script_len_out,
+                                unsigned char *control_block_out, size_t *control_block_len_out,
+                                unsigned char *secret_out32, int *out_has_secret);
+
+/* #59: list (node_idx, state_counter) for poison rows still MISSING their revealed
+   secret (revocation_secret IS NULL).  The client scans these on restart/reconnect
+   and re-requests the reveal (the commit-without-reveal recovery).  Caller-allocated
+   node_out[max] + state_out[max]; fills *n_out (<= max).  Returns 1 on success. */
+int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
+                                        uint32_t *node_out, uint32_t *state_out,
+                                        size_t max, size_t *n_out);
 
 /* Load all PS chain entries for a leaf in chain_pos order.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).

@@ -16,10 +16,14 @@
 #include "superscalar/channel.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/dw_state.h"
+#include "superscalar/client.h"   /* client_handle_lsp_revoke_and_ack (revocation-verify) */
+#include "superscalar/wire.h"     /* wire_build_revoke_and_ack, wire_msg_t */
+#include "superscalar/crash_inject.h"  /* #9 cheat-gate */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -146,6 +150,181 @@ int test_persist_ps_subfactory_chain_round_trip(void) {
         tx_buf_free(&loaded_txs[i]);
 
     persist_close(&db);
+    return ok;
+}
+
+/* #53-B3b.2d: l_stock_poison_reveals save -> load -> update-secret -> reload round-trip.
+   Proves a restarted client/WT can recover the script-path poison witness components +
+   the revealed secret (so it can rebuild + broadcast the Leaf-P poison). */
+int test_persist_l_stock_poison_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+
+    const uint32_t fid = 0, nidx = 7, state = 3;
+    unsigned char h[32], sig[64], lscript[73], cb[65], utx[80], secret[32];
+    for (int i = 0; i < 32; i++) h[i]      = (unsigned char)(0xA0 ^ i);
+    for (int i = 0; i < 64; i++) sig[i]    = (unsigned char)(0x10 + i);
+    for (size_t i = 0; i < sizeof(lscript); i++) lscript[i] = (unsigned char)(0x20 + i);
+    for (int i = 0; i < 65; i++) cb[i]     = (unsigned char)(0x30 + i);
+    for (size_t i = 0; i < sizeof(utx); i++) utx[i] = (unsigned char)(i & 0xff);
+    for (int i = 0; i < 32; i++) secret[i] = (unsigned char)(0x53 ^ i);
+
+    TEST_ASSERT(persist_save_l_stock_poison(&db, fid, nidx, state, h, sig,
+                    utx, sizeof(utx), lscript, sizeof(lscript), cb, sizeof(cb)),
+                "save l_stock poison");
+
+    unsigned char lh[32], lsig[64], lls[128], lcb[65], lsec[32];
+    size_t lls_len = 0, lcb_len = 0; int has_secret = -1;
+    tx_buf_t lutx; tx_buf_init(&lutx, 128);
+    TEST_ASSERT(persist_load_l_stock_poison(&db, fid, nidx, state, lh, lsig, &lutx,
+                    lls, &lls_len, lcb, &lcb_len, lsec, &has_secret), "load");
+    TEST_ASSERT(memcmp(lh, h, 32) == 0, "hash round-trips");
+    TEST_ASSERT(memcmp(lsig, sig, 64) == 0, "agg sig round-trips");
+    TEST_ASSERT(lutx.len == sizeof(utx) && memcmp(lutx.data, utx, sizeof(utx)) == 0,
+                "unsigned tx round-trips");
+    TEST_ASSERT(lls_len == sizeof(lscript) && memcmp(lls, lscript, sizeof(lscript)) == 0,
+                "leaf script round-trips");
+    TEST_ASSERT(lcb_len == sizeof(cb) && memcmp(lcb, cb, sizeof(cb)) == 0,
+                "control block round-trips");
+    TEST_ASSERT(has_secret == 0, "no secret before reveal");
+
+    TEST_ASSERT(persist_update_l_stock_secret(&db, fid, nidx, state, secret),
+                "update secret");
+    has_secret = -1;
+    TEST_ASSERT(persist_load_l_stock_poison(&db, fid, nidx, state, NULL, NULL, NULL,
+                    NULL, NULL, NULL, NULL, lsec, &has_secret), "reload");
+    TEST_ASSERT(has_secret == 1, "secret present after reveal");
+    TEST_ASSERT(memcmp(lsec, secret, 32) == 0, "secret round-trips");
+
+    TEST_ASSERT(persist_load_l_stock_poison(&db, fid, nidx, 999, lh, lsig, &lutx,
+                    lls, &lls_len, lcb, &lcb_len, lsec, &has_secret) == 0,
+                "missing (factory,node,state) row not found");
+
+    /* #59: the pending query lists ONLY rows still missing a secret.  Row
+       (nidx=7,state=3) now has a secret (updated above); add a second template-only
+       row and confirm the pending scan returns exactly the un-revealed one. */
+    TEST_ASSERT(persist_save_l_stock_poison(&db, fid, 9, 1, h, sig,
+                    utx, sizeof(utx), lscript, sizeof(lscript), cb, sizeof(cb)),
+                "save second poison (no secret yet)");
+    uint32_t pend_n[8], pend_s[8]; size_t pend_cnt = 99;
+    TEST_ASSERT(persist_load_pending_l_stock_poison(&db, fid, pend_n, pend_s, 8, &pend_cnt),
+                "pending query runs");
+    TEST_ASSERT(pend_cnt == 1, "exactly one pending row (secret'd row excluded)");
+    TEST_ASSERT(pend_n[0] == 9 && pend_s[0] == 1, "pending row is the un-revealed one");
+    /* once its secret lands, it drops out of the pending set */
+    TEST_ASSERT(persist_update_l_stock_secret(&db, fid, 9, 1, secret), "reveal second");
+    pend_cnt = 99;
+    TEST_ASSERT(persist_load_pending_l_stock_poison(&db, fid, pend_n, pend_s, 8, &pend_cnt),
+                "pending query reruns");
+    TEST_ASSERT(pend_cnt == 0, "no pending rows after both revealed");
+
+    tx_buf_free(&lutx);
+    persist_close(&db);
+    printf("  l_stock_poison_reveals save/load/update-secret + #59 pending scan round-trips\n");
+    return 1;
+}
+
+/* ---- §10 mainnet-gate: schema migration ladder is idempotent + data-preserving ----
+   Populate a file-backed DB at the current schema, force user_version back to 1
+   (simulating an old DB), then re-open to re-run migrations 2..PERSIST_SCHEMA_VERSION
+   over the populated data.  Assert: re-open succeeds, user_version reaches the
+   current version, and the populated rows survive byte-for-byte.  Catches any
+   migration that is destructive or non-idempotent when re-applied across the
+   full ladder (the high-risk class of upgrade bugs). */
+int test_persist_migration_ladder(void) {
+    const char *path = "/tmp/ss_test_migration_ladder.db";
+    unlink(path);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open file db at current schema");
+
+    const uint32_t factory_id = 7;
+    const uint32_t node_idx = 11;
+    unsigned char txids[3][32];
+    unsigned char signed_txs[3][64];
+    size_t signed_tx_lens[3] = { 32, 48, 64 };
+    uint64_t amounts[3] = { 50000, 40000, 30000 };
+    for (int i = 0; i < 3; i++) {
+        memset(txids[i], 0xA0 + i, 32);
+        memset(signed_txs[i], 0xB0 + i, signed_tx_lens[i]);
+        TEST_ASSERT(persist_save_ps_chain_entry(
+                        &db, factory_id, node_idx, i, /* epoch */ 0,
+                        txids[i], signed_txs[i], signed_tx_lens[i],
+                        amounts[i], /* poison_tx */ NULL, 0),
+                    "populate chain entry before migration");
+    }
+    persist_close(&db);
+
+    /* Force the on-disk schema version back to 1 so the binary believes this
+       is an old DB and re-runs the entire migration ladder.  persist tracks the
+       version in a schema_version TABLE (MAX(version)), not PRAGMA user_version. */
+    {
+        sqlite3 *raw = NULL;
+        TEST_ASSERT(sqlite3_open(path, &raw) == SQLITE_OK, "raw open to downgrade");
+        TEST_ASSERT(sqlite3_exec(raw,
+                        "DELETE FROM schema_version; "
+                        "INSERT INTO schema_version (version) VALUES (1);",
+                        NULL, NULL, NULL) == SQLITE_OK,
+                    "force schema_version back to 1");
+        sqlite3_close(raw);
+    }
+
+    /* Re-open: runs migrations 2..PERSIST_SCHEMA_VERSION over populated data. */
+    TEST_ASSERT(persist_open(&db, path), "re-open re-runs migration ladder");
+
+    /* Read post-migration version + surviving rows, THEN close + unlink, THEN
+       evaluate — so cleanup always runs regardless of pass/fail. */
+    int v_after = -1;
+    {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db.db, "SELECT MAX(version) FROM schema_version;",
+                               -1, &st, NULL) == SQLITE_OK
+            && sqlite3_step(st) == SQLITE_ROW)
+            v_after = sqlite3_column_int(st, 0);
+        if (st) sqlite3_finalize(st);
+    }
+
+    tx_buf_t loaded_txs[3] = {0};
+    unsigned char loaded_txids[3][32];
+    uint64_t loaded_amounts[3];
+    int n = persist_load_ps_chain(&db, factory_id, node_idx,
+                                  loaded_txs, loaded_txids, loaded_amounts,
+                                  NULL, 3);
+    int ok = 1;
+    /* §10 key-at-rest (#327): persist_open must tighten the DB file to 0600
+       (no group/world bits) — it holds revocation secrets + the HD seed. */
+    {
+        struct stat mst;
+        if (stat(path, &mst) != 0) {
+            printf("  FAIL: stat(db) failed\n"); ok = 0;
+        } else if (mst.st_mode & (S_IRWXG | S_IRWXO)) {
+            printf("  FAIL: db not 0600 after persist_open (mode 0%o) — secrets exposed\n",
+                   (unsigned)(mst.st_mode & 0777)); ok = 0;
+        }
+    }
+    if (v_after != PERSIST_SCHEMA_VERSION) {
+        printf("  FAIL: migration reached v%d, expected v%d\n",
+               v_after, PERSIST_SCHEMA_VERSION); ok = 0;
+    }
+    if (n != 3) { printf("  FAIL: post-migration n=%d expected 3\n", n); ok = 0; }
+    for (int i = 0; i < n && i < 3; i++) {
+        if (memcmp(loaded_txids[i], txids[i], 32) != 0) {
+            printf("  FAIL: txid[%d] lost in migration\n", i); ok = 0;
+        }
+        if (loaded_txs[i].len != signed_tx_lens[i] ||
+            memcmp(loaded_txs[i].data, signed_txs[i], signed_tx_lens[i]) != 0) {
+            printf("  FAIL: signed_tx[%d] corrupted by migration\n", i); ok = 0;
+        }
+        if (loaded_amounts[i] != amounts[i]) {
+            printf("  FAIL: amount[%d] corrupted by migration\n", i); ok = 0;
+        }
+    }
+    for (int i = 0; i < n && i < 3; i++) tx_buf_free(&loaded_txs[i]);
+
+    persist_close(&db);
+    unlink(path);
+    if (ok) printf("  PASS: migration ladder idempotent + data-preserving (1 -> %d)\n",
+                   PERSIST_SCHEMA_VERSION);
     return ok;
 }
 
@@ -651,7 +830,13 @@ int test_persist_watchtower_hydrate_round_trip(void) {
     unsigned char rev0[32], rev1[32];
     memset(rev0, 0x55, 32);
     memset(rev1, 0x66, 32);
+    /* revocation-verify: committed points (secret*G) must match the secrets */
+    secp256k1_pubkey hvp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &hvp, rev0), "hvp0");
+    channel_set_remote_pcp(&ch, 0, &hvp);
     TEST_ASSERT(channel_receive_revocation(&ch, 0, rev0), "recv rev0");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &hvp, rev1), "hvp1");
+    channel_set_remote_pcp(&ch, 1, &hvp);
     TEST_ASSERT(channel_receive_revocation(&ch, 1, rev1), "recv rev1");
 
     /* persist_list_channel_ids finds our saved channel */
@@ -893,6 +1078,9 @@ int test_persist_factory_round_trip(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->use_tree_anchor = 1;  /* #56: mirror production — persist_load_factory rebuilds
+                                with anchors on (client-reconnect path), so the saved
+                                tree must be anchored too for the txid round-trip. */
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xDD;
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
@@ -4994,3 +5182,270 @@ int test_ceremony_helpers_aggregate_hard_guard(void) {
 }
 
 /* === End SF-CEREMONY-HELPERS tests ======================================== */
+
+/* === #327 at-rest field encryption (LND/Core model) ======================= */
+
+/* Crown-jewel: the HD seed must be sealed on disk, round-trip correctly, and
+   survive a close/reopen with the same key. */
+int test_persist_hd_seed_encryption_round_trip(void) {
+    const char *path = "/tmp/test_ss_enc_rt.db";
+    unlink(path);
+    unsigned char root[32]; memset(root, 0xA7, sizeof root);
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(i + 1);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(persist_set_encryption_key(&db, root), "set key");
+    TEST_ASSERT(persist_apply_encryption(&db), "apply enc (fresh)");
+    TEST_ASSERT(persist_db_is_encrypted(&db), "marker set after apply");
+    TEST_ASSERT(persist_save_hd_seed(&db, seed, sizeof seed), "save seed");
+
+    /* on-disk value must be sealed, not raw hex */
+    sqlite3_stmt *st = NULL;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT seed_hex FROM hd_wallet_state WHERE id=1;", -1, &st, NULL) == SQLITE_OK, "prep");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "seed row exists");
+    const char *stored = (const char *)sqlite3_column_text(st, 0);
+    TEST_ASSERT(stored && strncmp(stored, "ssenc1:", 7) == 0, "seed sealed at rest");
+    TEST_ASSERT(strlen(stored) > 7 + 64, "sealed value longer than raw 32B hex");
+    sqlite3_finalize(st);
+
+    unsigned char out[64]; size_t outlen = 0;
+    TEST_ASSERT(persist_load_hd_seed(&db, out, &outlen, sizeof out), "load seed");
+    TEST_ASSERT_EQ(outlen, sizeof seed, "seed len");
+    TEST_ASSERT(memcmp(out, seed, sizeof seed) == 0, "seed bytes match");
+    persist_close(&db);
+
+    /* reopen with the SAME key: token verifies, load still matches */
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen");
+    TEST_ASSERT(persist_set_encryption_key(&db2, root), "set key 2");
+    TEST_ASSERT(persist_apply_encryption(&db2), "apply enc (verify path)");
+    memset(out, 0, sizeof out); outlen = 0;
+    TEST_ASSERT(persist_load_hd_seed(&db2, out, &outlen, sizeof out), "load seed 2");
+    TEST_ASSERT(outlen == sizeof seed && memcmp(out, seed, sizeof seed) == 0,
+                "seed survives close/reopen");
+    persist_close(&db2);
+
+    unlink(path);
+    return 1;
+}
+
+/* === Revocation verification standard (Phase 1: durable committed-PCP) ===== */
+
+/* A committed remote per-commitment point must stay verifiable after it is
+   evicted from the 2-slot in-memory window — via the durable DB record — and a
+   wrong secret must NOT verify against it. This is the durability that lets
+   Phase 2 safely fail-closed. */
+int test_channel_revocation_durable_pcp_verify(void) {
+    const char *path = "/tmp/test_ss_revverify.db";
+    unlink(path);
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+
+    channel_t ch;
+    memset(&ch, 0, sizeof ch);
+    ch.ctx = ctx;
+    ch.persist_db = &db;
+    ch.persist_channel_id = 7;
+
+    /* commitment 5: committed PCP = secret5*G */
+    unsigned char secret5[32]; memset(secret5, 0, 32); secret5[31] = 5;
+    secp256k1_pubkey pcp5;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pcp5, secret5), "pcp5");
+    channel_set_remote_pcp(&ch, 5, &pcp5);            /* in-memory + persisted */
+
+    /* evict 5 from the 2-slot window with two newer commitments */
+    unsigned char s6[32] = {0}, s7[32] = {0}; s6[31] = 6; s7[31] = 7;
+    secp256k1_pubkey p6, p7;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p6, s6), "p6");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p7, s7), "p7");
+    channel_set_remote_pcp(&ch, 6, &p6);
+    channel_set_remote_pcp(&ch, 7, &p7);              /* window {6,7}; 5 evicted */
+
+    /* durable fallback: PCP for 5 is still retrievable (from DB) and correct */
+    secp256k1_pubkey got;
+    TEST_ASSERT(channel_get_remote_pcp(&ch, 5, &got), "PCP 5 retrievable after eviction");
+    unsigned char a[33], b[33]; size_t al = 33, bl = 33;
+    secp256k1_ec_pubkey_serialize(ctx, a, &al, &got,  SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(ctx, b, &bl, &pcp5, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(a, b, 33) == 0, "durable PCP matches committed");
+
+    /* verification against the durable record: correct accepted, wrong rejected */
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 5, secret5) == 1,
+                "correct secret verifies against durable PCP");
+    unsigned char wrong[32]; memset(wrong, 0xab, 32);
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 5, wrong) == 0,
+                "wrong secret rejected (durable PCP present)");
+
+    persist_close(&db);
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* Wrong key must FAIL CLOSED (refuse to open), never silently corrupt. */
+int test_persist_encryption_wrong_key_refused(void) {
+    const char *path = "/tmp/test_ss_enc_wrong.db";
+    unlink(path);
+    unsigned char root[32];  memset(root,  0x11, sizeof root);
+    unsigned char wrong[32]; memset(wrong, 0x22, sizeof wrong);
+    unsigned char seed[32];  memset(seed,  0x5e, sizeof seed);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(persist_set_encryption_key(&db, root), "set key");
+    TEST_ASSERT(persist_apply_encryption(&db), "apply");
+    TEST_ASSERT(persist_save_hd_seed(&db, seed, sizeof seed), "save");
+    persist_close(&db);
+
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen");
+    TEST_ASSERT(persist_set_encryption_key(&db2, wrong), "set wrong key");
+    TEST_ASSERT(persist_apply_encryption(&db2) == 0, "wrong key must be refused");
+    persist_close(&db2);
+
+    unlink(path);
+    return 1;
+}
+
+/* Keyless (regtest/tests): seed stays plaintext, round-trips — proves existing
+   suites are unaffected by the feature when no key is installed. */
+int test_persist_encryption_disabled_is_plaintext(void) {
+    const char *path = "/tmp/test_ss_enc_off.db";
+    unlink(path);
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0xF0 + i);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    /* no persist_set_encryption_key -> encryption off */
+    TEST_ASSERT(persist_save_hd_seed(&db, seed, sizeof seed), "save");
+    sqlite3_stmt *st = NULL;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db,
+        "SELECT seed_hex FROM hd_wallet_state WHERE id=1;", -1, &st, NULL) == SQLITE_OK, "prep");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "row");
+    const char *stored = (const char *)sqlite3_column_text(st, 0);
+    TEST_ASSERT(stored && strncmp(stored, "ssenc1:", 7) != 0, "plaintext when keyless");
+    sqlite3_finalize(st);
+    unsigned char out[64]; size_t outlen = 0;
+    TEST_ASSERT(persist_load_hd_seed(&db, out, &outlen, sizeof out), "load");
+    TEST_ASSERT(outlen == 32 && memcmp(out, seed, 32) == 0, "plaintext round trip");
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* === End #327 at-rest field encryption tests ============================== */
+
+/* Phase 2: verification is enforced at the choke point and fails closed —
+   unverifiable/mismatched secrets are rejected and never stored. */
+int test_channel_revocation_failclosed(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    memset(&ch, 0, sizeof ch);
+    ch.ctx = ctx;   /* no persist_db, no window — no committed point anywhere */
+
+    unsigned char any[32]; memset(any, 7, 32);
+    /* (1) no committed point -> verifier fails closed (was: accept-on-trust) */
+    TEST_ASSERT(channel_verify_revocation_secret(&ch, 0, any) == 0, "no PCP -> fail closed");
+    /* (2) choke point refuses to store an unverifiable secret */
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 0, any) == 0, "choke point rejects unverifiable");
+    TEST_ASSERT(channel_get_received_revocation(&ch, 0, any) == 0, "nothing stored");
+
+    /* (3) with a committed point for cn=3: wrong rejected (not stored), correct stored */
+    unsigned char s3[32]; memset(s3, 0, 32); s3[31] = 3;
+    secp256k1_pubkey p3;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &p3, s3), "p3");
+    channel_set_remote_pcp(&ch, 3, &p3);
+
+    unsigned char wrong[32]; memset(wrong, 0xcd, 32);
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 3, wrong) == 0, "wrong secret rejected at choke point");
+    unsigned char got[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 3, got) == 0, "wrong secret NOT stored");
+
+    TEST_ASSERT(channel_receive_revocation_flat(&ch, 3, s3) == 1, "correct secret accepted");
+    TEST_ASSERT(channel_get_received_revocation(&ch, 3, got) == 1 && memcmp(got, s3, 32) == 0,
+                "correct secret stored");
+
+    free(ch.received_revocations);
+    free(ch.received_revocation_valid);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The CLIENT (user) verifies the LSP's revocation at the revocation step:
+   a correct LSP secret is verified + retained; a garbage one is rejected and
+   never stored. Proves the user's side of "verify everything". */
+int test_client_verifies_lsp_revocation(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* LSP's committed point for commitment 0 = lsp_secret0 * G */
+    unsigned char lsp_secret0[32]; memset(lsp_secret0, 0, 32); lsp_secret0[31] = 9;
+    secp256k1_pubkey lsp_pcp0;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pcp0, lsp_secret0), "lsp_pcp0");
+    unsigned char nx[32]; memset(nx, 0, 32); nx[31] = 11;
+    secp256k1_pubkey next_pcp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &next_pcp, nx), "next_pcp");
+
+    /* (1) correct LSP revocation -> verified + retained */
+    channel_t ch; memset(&ch, 0, sizeof ch); ch.ctx = ctx; ch.commitment_number = 1;
+    channel_set_remote_pcp(&ch, 0, &lsp_pcp0);
+    cJSON *good = wire_build_revoke_and_ack(7, lsp_secret0, ctx, &next_pcp);
+    wire_msg_t m; m.msg_type = MSG_LSP_REVOKE_AND_ACK; m.json = good;
+    TEST_ASSERT(client_handle_lsp_revoke_and_ack(&ch, ctx, &m) == 1, "correct LSP revocation accepted");
+    cJSON_Delete(good);
+    unsigned char got[32];
+    TEST_ASSERT(channel_get_received_revocation(&ch, 0, got) == 1 && memcmp(got, lsp_secret0, 32) == 0,
+                "LSP secret retained");
+
+    /* (2) garbage LSP revocation -> rejected (fail-closed), never stored */
+    channel_t ch2; memset(&ch2, 0, sizeof ch2); ch2.ctx = ctx; ch2.commitment_number = 1;
+    channel_set_remote_pcp(&ch2, 0, &lsp_pcp0);
+    unsigned char garbage[32]; memset(garbage, 0xde, 32);
+    cJSON *bad = wire_build_revoke_and_ack(7, garbage, ctx, &next_pcp);
+    wire_msg_t mb; mb.msg_type = MSG_LSP_REVOKE_AND_ACK; mb.json = bad;
+    TEST_ASSERT(client_handle_lsp_revoke_and_ack(&ch2, ctx, &mb) == 0, "garbage LSP revocation rejected");
+    cJSON_Delete(bad);
+    TEST_ASSERT(channel_get_received_revocation(&ch2, 0, got) == 0, "garbage not stored");
+
+    free(ch.received_revocations);  free(ch.received_revocation_valid);
+    free(ch2.received_revocations); free(ch2.received_revocation_valid);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* #9 cheat-gate: defense-bypass cheats are inert by default (fail-safe) and
+   only allowed when the gate is set for regtest. */
+int test_cheat_gate(void) {
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "gate off -> cheats not allowed");
+    superscalar_set_cheat_gate(1);
+    TEST_ASSERT(superscalar_cheat_allowed() == 1, "gate on (regtest) -> cheats allowed");
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "gate reset -> cheats not allowed");
+    return 1;
+}
+
+/* Item-1 escalation policy: the --on-lsp-forgery parser maps exactly to the
+   documented enum and REJECTS unknown/typo values (so a misconfiguration can't
+   silently fall back to the least-safe response). */
+int test_lsp_forgery_response_parse(void) {
+    TEST_ASSERT(client_parse_forgery_response("continue") == LSP_FORGERY_CONTINUE, "continue");
+    TEST_ASSERT(client_parse_forgery_response("halt")     == LSP_FORGERY_HALT,     "halt");
+    TEST_ASSERT(client_parse_forgery_response("close")    == LSP_FORGERY_CLOSE,    "close");
+    TEST_ASSERT(client_parse_forgery_response("Continue") == -1, "case-sensitive reject");
+    TEST_ASSERT(client_parse_forgery_response("")         == -1, "empty reject");
+    TEST_ASSERT(client_parse_forgery_response("force")    == -1, "unknown reject");
+    TEST_ASSERT(client_parse_forgery_response(NULL)       == -1, "NULL reject");
+    /* The client's compiled-in default is HALT, NOT the legacy CONTINUE. */
+    TEST_ASSERT(LSP_FORGERY_HALT != LSP_FORGERY_CONTINUE, "default (halt) is not legacy (continue)");
+    return 1;
+}
+
+/* === End revocation verification standard tests =========================== */

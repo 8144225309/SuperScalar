@@ -49,7 +49,7 @@ CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
 NETWORK="testnet4"
 RPCUSER="${RPCUSER:-testnet4rpc}"
-RPCPASS="${RPCPASS:-testnet4rpcpass123}"
+RPCPASS="${RPCPASS:-$(sed -n 's/^rpcpassword=//p' /var/lib/bitcoind-testnet4/bitcoin.conf 2>/dev/null)}"
 RPCPORT="${RPCPORT:-48332}"
 WALLET="${WALLET:-superscalar_test}"
 PORT="${PORT:-9941}"  # 9940 is reserved for N=64; use 9941 for N=128

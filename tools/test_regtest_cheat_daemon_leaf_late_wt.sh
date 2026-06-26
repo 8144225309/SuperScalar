@@ -54,6 +54,7 @@ TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-leaf-late-wt.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_LOG="$TMPDIR/wt.log"
+WT_DB="$TMPDIR/wt.db"   # trustless WT db (no secrets); armed by the LSP's --wt-db
 
 PIDS=()
 
@@ -101,9 +102,9 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet $MINER_WALLET --db "$LSP_DB" \
+    --wallet $MINER_WALLET --db "$LSP_DB" --wt-db "$WT_DB" \
     --demo --cheat-daemon-leaf $SIDE \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 
@@ -160,12 +161,17 @@ done
 END_HEIGHT=$($BCLI getblockcount)
 echo "  Chain at height $END_HEIGHT — cheat is buried $((END_HEIGHT - CHEAT_HEIGHT)) blocks deep"
 
-# --- Standalone Watchtower — starting LATE ---
+# Trustless: stop the LSP so wt.db WAL checkpoints; keep mining for the WT poll.
+echo "  Stopping LSP (SIGTERM) so wt.db flushes for the standalone WT..."
+kill -TERM $LSP_PID 2>/dev/null || true
+for s in $(seq 1 30); do kill -0 $LSP_PID 2>/dev/null || break; sleep 1; done
+( for k in $(seq 1 80); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 3; done ) & PIDS+=($!)
+# --- Standalone trustless Watchtower (--wt-db) — starting LATE ---
 echo
-echo "--- LATE Standalone WT startup ---"
+echo "--- LATE Standalone trustless WT startup ---"
 "$WT_BIN" \
     --network regtest \
-    --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 5 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \
@@ -201,8 +207,22 @@ if [ -s "$REORG_LOG" ]; then cat "$REORG_LOG"; else echo "  (none)"; fi
 
 echo
 echo "=== Final result ==="
-if [ $WT_FIRED -eq 1 ]; then
-    echo "  PASS: late-arriving WT defended after $EXTRA_BLOCKS-block delay"
+set +e
+if [ "$WT_FIRED" -eq 1 ]; then
+    # OUTCOME (not just a broadcast log line): confirm the WT's response/penalty txid ON-CHAIN + assert a real amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}" "$WT_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: late WT fired but no response/penalty txid found (breach_detections + WT log)"; tail -30 "$WT_LOG"; exit 1; }
+    echo "  late WT response txid: $PEN_TXID — mining to confirm + verify payout"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: late WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  late WT response confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: late WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: late WT response recovers <90% of swept value ($A2) — value leaked/burned"; exit 1;; esac
+    echo "  PASS: late-arriving WT defended after $EXTRA_BLOCKS-block delay — broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats), outcome verified"
     exit 0
 else
     echo "  FAIL: late WT did not broadcast penalty TXs"

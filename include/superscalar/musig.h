@@ -61,7 +61,7 @@ typedef struct {
 } musig_nonce_pool_t;
 
 /* --- Signing session (one per transaction being signed) --- */
-#define MUSIG_SESSION_MAX_SIGNERS 128
+#define MUSIG_SESSION_MAX_SIGNERS 128  /* the factory signing group is the LSP + up to 127 clients = 128 signers; a 128th client would be the 129th signer, which is out of design (the LSP is one of the 128) */
 
 typedef struct {
     secp256k1_musig_pubnonce pubnonces[MUSIG_SESSION_MAX_SIGNERS];
@@ -158,6 +158,17 @@ int musig_session_finalize_nonces(
     const unsigned char *msg32,
     const unsigned char *merkle_root,
     const secp256k1_pubkey *adaptor       /* NULL for normal, non-NULL for PTLC */
+);
+
+/* #53-B3a: finalize a session signing the RAW aggregate key — NO taproot tweak
+   (not even BIP-86).  Matches musig_sign_all_local.  Use for tapscript SCRIPT-PATH
+   spends whose OP_CHECKSIG verifies the untweaked agg/internal key (e.g. the Leaf-P
+   L-stock poison).  Do NOT use for key-path spends (use musig_session_finalize_nonces
+   with the matching merkle_root). */
+int musig_session_finalize_nonces_untweaked(
+    const secp256k1_context *ctx,
+    musig_signing_session_t *session,
+    const unsigned char *msg32
 );
 
 /* Produce a partial signature. Uses secnonce (zeroed after -- single use!).

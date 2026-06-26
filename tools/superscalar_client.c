@@ -4,6 +4,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/factory.h"
 #include "superscalar/report.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/adaptor.h"
@@ -290,6 +291,36 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
+/* After client_handle_commitment_signed sends OUR revoke, the LSP replies with
+   its OWN MSG_LSP_REVOKE_AND_ACK (0x50) to complete the bidirectional revocation
+   (BOLT-2).  The scripted --send/--recv flows must consume + apply it after EVERY
+   commitment, exactly like the daemon's client_recv_lsp_revocation — otherwise the
+   stray 0x50 desyncs the next recv (sender "expected FULFILL", receiver a leftover
+   commitment at close, and the LSP's handle_fulfill_htlc times out waiting for the
+   REVOKE and returns 0 → "event loop failed").  Deterministic: the LSP sends
+   exactly one revoke per commitment, so a single blocking recv is correct. */
+static int scripted_consume_lsp_revoke(int fd, channel_t *ch, secp256k1_context *ctx) {
+    wire_msg_t m;
+    if (!wire_recv(fd, &m)) return 1;   /* nothing arrived to apply */
+    int ok = 1;
+    if (m.msg_type == MSG_LSP_REVOKE_AND_ACK && m.json) {
+        /* Revocation-verification standard: the scripted --send/--recv flows must
+           VERIFY the LSP's revocation exactly like the daemon path
+           (client_recv_lsp_revocation) — not blindly store it. Route through the
+           shared, tested, fail-closed handler: it checks secret*G == the LSP's
+           committed point, stores ONLY on success, and tracks the next PCP (which
+           this path previously discarded, so subsequent revokes were unverifiable). */
+        if (!client_handle_lsp_revoke_and_ack(ch, ctx, &m)) {
+            fprintf(stderr, "Client: SECURITY: LSP revocation FAILED verification "
+                    "(commitment %llu) — refusing, NOT stored (no WT-arm)\n",
+                    (unsigned long long)(ch->commitment_number ? ch->commitment_number - 1 : 0));
+            ok = 0;
+        }
+    }
+    if (m.json) cJSON_Delete(m.json);
+    return ok;
+}
+
 /* Channel callback replicating multi_payment_client_cb from test harness */
 static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                    secp256k1_context *ctx,
@@ -326,6 +357,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 fprintf(stderr, "Client %u: expected COMMIT_SIGNED, got 0x%02x\n",
                         my_index, msg.msg_type);
@@ -333,7 +365,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
 
-            /* Wait for FULFILL_HTLC */
+            /* Wait for FULFILL_HTLC (the LSP's revoke was already drained above). */
             if (!wire_recv(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
@@ -363,6 +395,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -397,6 +430,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -429,6 +463,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                scripted_consume_lsp_revoke(fd, ch, ctx);  /* LSP bidirectional revoke (verified) */
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -527,6 +562,20 @@ typedef struct {
     uint64_t settled_fees_sats;     /* total share already received */
     uint64_t routing_fee_ppm;       /* fee rate from factory terms */
     uint16_t profit_share_bps;      /* client's share from factory terms */
+    /* Scripted test payments (--send/--recv) routed through this same daemon
+       loop instead of the old parallel standalone_channel_cb, which desynced on
+       every message type it didn't hand-roll (LSP_REVOKE_AND_ACK,
+       CREATE_INVOICE, CLOSE_PROPOSE). */
+    scripted_action_t *scripted_actions;
+    size_t  n_scripted_actions;
+    int     scripted_initiated;     /* 1 after sends fired + recvs registered */
+    /* Item-1 escalation: response policy + detection state (--on-lsp-forgery). */
+    int     lsp_forgery_response;   /* lsp_forgery_response_t; default HALT */
+    int     lsp_forgery_response_ps;/* per-leaf-type override for PS leaves; -1 = inherit (#21) */
+    int     lsp_leaf_is_ps;         /* 1 if this factory uses PS (CLTV-gated) leaves (#21) */
+    int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
+    int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
+    const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -698,6 +747,8 @@ static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) 
    Call after each client_handle_commitment_signed in daemon mode.
    old_local/old_remote are the channel amounts at the OLD commitment being
    revoked (before the state-advancing add/fulfill that preceded this). */
+static void client_mark_lsp_poisoned(const char *db_path, const char *reason);  /* #20 fwd-decl */
+
 static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *cbd,
                                          secp256k1_context *ctx,
                                          uint64_t old_local, uint64_t old_remote,
@@ -713,16 +764,61 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         cJSON_Delete(rev_msg.json);
         return;
     }
-    uint32_t rev_chan_id;
-    unsigned char lsp_rev_secret[32], lsp_next_point[33];
-    if (wire_parse_revoke_and_ack(rev_msg.json, &rev_chan_id,
-                                    lsp_rev_secret, lsp_next_point)) {
+    /* Revocation-verification standard (client side): verify + retain the LSP's
+       revocation via the shared, tested handler (fail-closed). It checks
+       secret*G == the LSP's committed point, stores the secret, and tracks the
+       LSP's next per-commitment point. If verification fails we must NOT arm the
+       watchtower from a bad secret (it would build a penalty that can't spend). */
+    if (!client_handle_lsp_revoke_and_ack(ch, ctx, &rev_msg)) {
+        fprintf(stderr, "Client %u: LSP revocation FAILED verification "
+                "— refusing (penalty NOT armed)\n", my_index);
+        /* Item-1 escalation: the bad secret is already refused and no watchtower
+           is armed from it. Apply the configured response so the client does not
+           keep building states it cannot protect against a proven-cheating LSP. */
+        if (cbd) {
+            cbd->lsp_forgery_detected = 1;
+            /* #21 per-leaf-type: a PS (CLTV-gated) leaf MAY warrant a different
+               response than a revocation-gated leaf. We default to UNIFORM (the PS
+               override is "inherit" unless the operator explicitly set
+               --on-lsp-forgery-ps) and NEVER auto-downgrade: PS leaf *chaining*
+               does not by itself prove the channel-level revocation is non-load-
+               bearing (open security-model question — see revocation doc §9). The
+               leaf type is reported so the operator/auditor sees the severity. */
+            int mode = cbd->lsp_forgery_response;
+            if (cbd->lsp_leaf_is_ps && cbd->lsp_forgery_response_ps >= 0)
+                mode = cbd->lsp_forgery_response_ps;
+            fprintf(stderr, "Client %u: forgery on a %s leaf\n", my_index,
+                    cbd->lsp_leaf_is_ps ? "PS/CLTV-gated" : "revocation-gated");
+            switch (mode) {
+            case LSP_FORGERY_HALT:
+                fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — HALT "
+                        "policy: refusing all further commitments. Operator should "
+                        "force-close (--force-close) on the last verified state.\n",
+                        my_index);
+                client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (halt)");
+                break;
+            case LSP_FORGERY_CLOSE:
+                fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — CLOSE "
+                        "policy: force-closing on the last verified state.\n", my_index);
+                cbd->force_close_requested = 1;
+                client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (close)");
+                break;
+            case LSP_FORGERY_CONTINUE:
+            default:
+                break;  /* legacy: refuse + no-arm, keep the session */
+            }
+            /* Collapse to the effective decision so the daemon-loop / reconnect
+               break (which reads lsp_forgery_response) honours the PS override. */
+            cbd->lsp_forgery_response = mode;
+        }
+        cJSON_Delete(rev_msg.json);
+        return;
+    }
+    if (ch->commitment_number > 0) {
         uint64_t old_cn = ch->commitment_number - 1;
-        channel_receive_revocation(ch, old_cn, lsp_rev_secret);
 
-        /* Register with client watchtower using the OLD commitment's amounts.
-           Use local channel index 0 (not the LSP's factory-wide rev_chan_id)
-           because the client watchtower has only one channel at index 0. */
+        /* Arm the client watchtower with the now-verified revoked commitment.
+           Local channel index 0 (the client watchtower has one channel). */
         if (cbd && cbd->wt) {
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 0, old_cn,
@@ -731,45 +827,31 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
                 /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
         }
 
-        /* Store LSP's next per-commitment point */
-        secp256k1_pubkey next_pcp;
-        if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, lsp_next_point, 33)) {
-            channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
-            /* Persist both current and next remote PCPs for crash recovery */
-            if (cbd && cbd->db) {
-                unsigned char ser[33];
-                size_t slen = 33;
-                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &next_pcp,
-                                               SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0,
-                    ch->commitment_number + 1, ser);
-                /* Also persist the current PCP (may have just been set) */
-                secp256k1_pubkey cur_pcp;
-                if (channel_get_remote_pcp(ch, ch->commitment_number, &cur_pcp)) {
-                    slen = 33;
-                    secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &cur_pcp,
-                                                   SECP256K1_EC_COMPRESSED);
-                    persist_save_remote_pcp(cbd->db, 0,
-                        ch->commitment_number, ser);
-                }
-            }
-        }
-
-        /* Persist our own local PCS so they survive crash/reconnect.
-           Without this, reconnect generates new random PCS that don't
-           match the PCPs the LSP has stored, breaking sig verification. */
+        /* Persist remote PCPs (handler set the next one in-memory) + local PCS
+           for crash recovery. */
         if (cbd && cbd->db) {
+            unsigned char ser[33];
+            size_t slen;
+            secp256k1_pubkey pcp;
+            if (channel_get_remote_pcp(ch, ch->commitment_number + 1, &pcp)) {
+                slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
+            }
+            if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
+                slen = 33;
+                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                               SECP256K1_EC_COMPRESSED);
+                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
+            }
             unsigned char pcs[32];
             if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
-                persist_save_local_pcs(cbd->db, 0,
-                    ch->commitment_number, pcs);
+                persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
             if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
-                persist_save_local_pcs(cbd->db, 0,
-                    ch->commitment_number + 1, pcs);
+                persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
             memset(pcs, 0, 32);
         }
-
-        memset(lsp_rev_secret, 0, 32);
     }
     cJSON_Delete(rev_msg.json);
 }
@@ -782,6 +864,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                size_t n_participants,
                                void *user_data) {
     daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
+
+    /* #21: record whether this factory uses PS (CLTV-gated) leaves, for the
+       per-leaf-type forgery response. Factory-level signal (any PS leaf present);
+       cheap + idempotent. */
+    if (cbd && factory) {
+        for (size_t ni = 0; ni < factory->n_nodes; ni++)
+            if (factory->nodes[ni].is_ps_leaf) { cbd->lsp_leaf_is_ps = 1; break; }
+    }
 
     /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
@@ -808,6 +898,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         memset(pcs, 0, 32);
                     }
                 }
+                /* #313 self-custody: persist the INITIAL commitment here too, so a
+                   funded-but-never-transacted channel stays force-closeable when the
+                   LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
+                   to signed_commitments on the first payment, leaving a never-used
+                   channel unrecoverable in a cold mass-exit (Frontier B). */
+                client_persist_commitment_sig(ch, cbd);
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
@@ -817,7 +913,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     extern uint32_t g_routing_fee_ppm;  /* defined in client.c */
                     cbd->routing_fee_ppm = g_routing_fee_ppm;
                 }
-                printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
+                printf("Client %u: persisted factory + channel + basepoints%s to DB\n",
+                       my_index, ch->has_latest_commitment_sig ? " + initial commitment"
+                                                               : " (no commitment sig yet)");
             } else {
                 fprintf(stderr, "Client %u: initial persist failed, rolling back\n", my_index);
                 persist_rollback(cbd->db);
@@ -891,8 +989,60 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
     }
 
+    /* Scripted test-payment kickoff (--send/--recv routed through this loop).
+       Receivers register their preimage so the loop's auto-fulfill path settles
+       the incoming HTLC from the invoice store; senders emit the initial
+       ADD_HTLC and the loop reactively drives COMMITMENT_SIGNED + bidirectional
+       revocation + FULFILL.  Fired once, here, immediately after CHANNEL_READY
+       (the LSP --demo loop is already "waiting for payments" by this point —
+       same timing the old standalone_channel_cb used successfully). */
+    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated) {
+        uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
+                                ? factory->cltv_timeout - 40 : 500;
+        for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
+            scripted_action_t *act = &cbd->scripted_actions[si];
+            if (act->type == ACTION_RECV) {
+                if (cbd->n_invoices < MAX_CLIENT_INVOICES) {
+                    client_invoice_t *inv = &cbd->invoices[cbd->n_invoices++];
+                    memcpy(inv->preimage, act->preimage, 32);
+                    memcpy(inv->payment_hash, act->payment_hash, 32);
+                    inv->amount_msat = act->amount_sats * 1000;
+                    inv->active = 1;
+                    if (cbd->db)
+                        persist_save_client_invoice(cbd->db, inv->payment_hash,
+                                                    inv->preimage, inv->amount_msat);
+                    printf("Client %u: RECV armed (auto-fulfill preimage registered)\n",
+                           my_index);
+                }
+            } else { /* ACTION_SEND */
+                printf("Client %u: SEND %llu sats to client %u\n",
+                       my_index, (unsigned long long)act->amount_sats,
+                       act->dest_client);
+                if (!client_send_payment(fd, ch, act->amount_sats,
+                                          act->payment_hash, sc_htlc_cltv,
+                                          act->dest_client))
+                    fprintf(stderr, "Client %u: scripted send_payment failed\n",
+                            my_index);
+            }
+        }
+        cbd->scripted_initiated = 1;
+    }
+
     while (!g_shutdown) {
         wire_msg_t msg;
+
+        /* Item-1 escalation: if a forged LSP revocation was detected and the policy
+           is HALT or CLOSE, stop here — refuse to accept any further commitment from
+           a proven-cheating LSP. The bad secret was already refused at detection;
+           this exits the message loop before the next commitment cycle. The actual
+           force-close (CLOSE policy) runs after the loop, from the persisted state. */
+        if (cbd && cbd->lsp_forgery_detected &&
+            cbd->lsp_forgery_response != LSP_FORGERY_CONTINUE) {
+            fprintf(stderr, "Client %u: halting daemon loop (LSP revocation forgery, "
+                    "policy=%s)\n", my_index,
+                    cbd->lsp_forgery_response == LSP_FORGERY_CLOSE ? "close" : "halt");
+            break;
+        }
 
         /* Drain messages queued by recv_or_handle_ptlc before blocking.
            MSG_COMMITMENT_SIGNED is handled inline (needs immediate revocation
@@ -1060,6 +1210,32 @@ handle_message:
                         uint64_t fee_msat = (htlc_msat * cbd->routing_fee_ppm
                                               + 999999) / 1000000;
                         cbd->tracked_fees_sats += (fee_msat + 999) / 1000;
+                    }
+                }
+            }
+            /* ADV Phase 5a (defense-in-depth): for a RECEIVED payment HTLC (not a
+               settlement, not us-as-sender), the payment_hash should match an
+               invoice WE issued — otherwise we hold the preimage for nothing and
+               cannot claim it (it simply times back to the LSP; no fund risk to
+               us). Warn for observability; no refusal. */
+            {
+                cJSON *dest_j = cJSON_GetObjectItem(msg.json, "dest_client");
+                cJSON *hash_j = cJSON_GetObjectItem(msg.json, "payment_hash");
+                if (!dest_j && !is_settlement_htlc && hash_j && cJSON_IsString(hash_j) && cbd) {
+                    unsigned char hh[32];
+                    if (hex_decode(hash_j->valuestring, hh, 32) == 32) {
+                        int known = 0;
+                        for (size_t inv = 0; inv < cbd->n_invoices; inv++) {
+                            if (cbd->invoices[inv].active &&
+                                memcmp(cbd->invoices[inv].payment_hash, hh, 32) == 0) {
+                                known = 1; break;
+                            }
+                        }
+                        if (!known) {
+                            fprintf(stderr, "Client %u: WARNING — received add_htlc "
+                                    "payment_hash matches no invoice we issued; cannot "
+                                    "claim it (will time back to the LSP)\n", my_index);
+                        }
                     }
                 }
             }
@@ -2102,6 +2278,12 @@ static void usage(const char *prog) {
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
+        "                                      continue = refuse secret only (legacy)\n"
+        "                                      halt     = refuse + stop session + alert (default)\n"
+        "                                      close    = refuse + force-close on last verified state\n"
+        "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
+        "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
@@ -2109,6 +2291,87 @@ static void usage(const char *prog) {
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
         prog);
+}
+
+/* Item-1 CLOSE policy: force-close on the last fully-verified state, reusing the
+   #313 self-custody recovery path from the client's persisted DB. Called after the
+   daemon loop exits on a detected LSP revocation forgery. Returns 1 if a recovery
+   run was executed, 0 if it could not (no DB / no chain backend). */
+static int client_force_close_from_db(const char *db_path, const char *network,
+                                      const char *cli_path, const char *rpcuser,
+                                      const char *rpcpassword, const char *datadir,
+                                      int rpcport) {
+    if (!db_path) {
+        fprintf(stderr, "Client: CLOSE policy needs --db to force-close; cannot proceed\n");
+        return 0;
+    }
+    persist_t db;
+    if (!persist_open(&db, db_path)) {
+        fprintf(stderr, "Client: CLOSE policy: cannot open DB %s\n", db_path);
+        return 0;
+    }
+    chain_backend_t chain;
+    int have_chain = 0;
+    regtest_t rt;
+    if (strcmp(network, "regtest") == 0) {
+        if (regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
+            extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
+            chain_backend_regtest_init(&chain, &rt);
+            have_chain = 1;
+        }
+    } else if (rpcuser && rpcpassword) {
+        if (chain_backend_rpc_init(&chain, "127.0.0.1", rpcport, rpcuser,
+                                    rpcpassword, NULL, network))
+            have_chain = 1;
+    }
+    if (!have_chain) {
+        fprintf(stderr, "Client: CLOSE policy: no chain backend (need regtest or "
+                "--rpcuser/--rpcpassword) — cannot force-close\n");
+        persist_close(&db);
+        return 0;
+    }
+    char fr_status[256] = {0};
+    int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+    fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
+    /* Broadcast the signed commitment TX (last verified state) if present. */
+    unsigned char signed_tx_data[4096];
+    size_t signed_tx_len = 0;
+    uint64_t sig_cn = 0;
+    if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL, signed_tx_data,
+                                    &signed_tx_len, sizeof(signed_tx_data)) &&
+        signed_tx_len > 0) {
+        char *tx_hex = malloc(signed_tx_len * 2 + 1);
+        if (tx_hex) {
+            extern void hex_encode(const unsigned char *, size_t, char *);
+            hex_encode(signed_tx_data, signed_tx_len, tx_hex);
+            char commit_txid[65];
+            if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
+                fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
+                        "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
+            free(tx_hex);
+        }
+    }
+    persist_close(&db);
+    return 1;
+}
+
+/* #20 poisoned-LSP marker: persist that THIS node's LSP was caught forging a
+   revocation, so a later restart does not silently reconnect to a proven-cheating
+   LSP. File sentinel next to the DB (no schema change); checked at startup. */
+static void client_mark_lsp_poisoned(const char *db_path, const char *reason) {
+    if (!db_path) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s.lsp_poisoned", db_path);
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "%s\n", reason ? reason : "lsp revocation forgery"); fclose(f); }
+}
+static int client_lsp_is_poisoned(const char *db_path) {
+    if (!db_path) return 0;
+    char path[1100];
+    snprintf(path, sizeof path, "%s.lsp_poisoned", db_path);
+    FILE *f = fopen(path, "r");
+    if (f) { fclose(f); return 1; }
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -2149,6 +2412,8 @@ int main(int argc, char *argv[]) {
     uint32_t hd_lookahead = HD_WALLET_LOOKAHEAD;
     const char *light_client_arg = NULL;
     const char *fee_estimator_arg = NULL;
+    int lsp_forgery_mode = LSP_FORGERY_HALT;  /* --on-lsp-forgery: item-1 escalation policy */
+    int lsp_forgery_mode_ps = -1;             /* --on-lsp-forgery-ps: PS-leaf override; -1=inherit (#21) */
     const char *lc_fallbacks[BIP158_MAX_PEERS - 1];
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
@@ -2198,6 +2463,16 @@ int main(int argc, char *argv[]) {
                     if ((v = cJSON_GetObjectItem(cfg, "rpcuser")) && cJSON_IsString(v)) rpcuser = strdup(v->valuestring);
                     if ((v = cJSON_GetObjectItem(cfg, "rpcpassword")) && cJSON_IsString(v)) rpcpassword = strdup(v->valuestring);
                     if ((v = cJSON_GetObjectItem(cfg, "rpcport")) && cJSON_IsNumber(v)) rpcport = (int)v->valuedouble;
+                    if ((v = cJSON_GetObjectItem(cfg, "on-lsp-forgery")) && cJSON_IsString(v)) {
+                        int m = client_parse_forgery_response(v->valuestring);
+                        if (m >= 0) lsp_forgery_mode = m;
+                        else fprintf(stderr, "WARNING: config on-lsp-forgery invalid: %s\n", v->valuestring);
+                    }
+                    if ((v = cJSON_GetObjectItem(cfg, "on-lsp-forgery-ps")) && cJSON_IsString(v)) {
+                        int m = client_parse_forgery_response(v->valuestring);
+                        if (m >= 0) lsp_forgery_mode_ps = m;
+                        else fprintf(stderr, "WARNING: config on-lsp-forgery-ps invalid: %s\n", v->valuestring);
+                    }
                     printf("Loaded config from %s\n", argv[i + 1]);
                     cJSON_Delete(cfg);
                 } else {
@@ -2270,6 +2545,22 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--fee-estimator") == 0 && i + 1 < argc)
             fee_estimator_arg = argv[++i];
+        else if (strcmp(argv[i], "--on-lsp-forgery") == 0 && i + 1 < argc) {
+            int m = client_parse_forgery_response(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "Error: --on-lsp-forgery must be continue|halt|close\n");
+                return 1;
+            }
+            lsp_forgery_mode = m;
+        }
+        else if (strcmp(argv[i], "--on-lsp-forgery-ps") == 0 && i + 1 < argc) {
+            int m = client_parse_forgery_response(argv[++i]);
+            if (m < 0) {
+                fprintf(stderr, "Error: --on-lsp-forgery-ps must be continue|halt|close\n");
+                return 1;
+            }
+            lsp_forgery_mode_ps = m;
+        }
         else if (strcmp(argv[i], "--light-client") == 0 && i + 1 < argc)
             light_client_arg = argv[++i];
         else if (strcmp(argv[i], "--light-client-fallback") == 0 && i + 1 < argc) {
@@ -2402,6 +2693,20 @@ int main(int argc, char *argv[]) {
     if (use_json_log)
         ss_log_set_json(1);
 
+    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
+       test/cheat scaffolding flags on mainnet (footgun guard). */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    if (strcmp(network, "mainnet") == 0) {
+        for (int ci = 1; ci < argc; ci++) {
+            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
+                strncmp(argv[ci], "--test-", 7) == 0) {
+                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
+                        "refused on mainnet.\n", argv[ci]);
+                return 1;
+            }
+        }
+    }
+
     /* --- Validate fee rate floor --- */
     if ((uint64_t)fee_rate < FEE_FLOOR_SAT_PER_KVB) {
         fprintf(stderr, "ERROR: --fee-rate %d is below minimum %d sat/kvB (0.1 sat/vB)\n",
@@ -2466,8 +2771,14 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        int result = factory_recovery_scan(&db, &chain);
-        printf("Force-close scan: examined %d factories\n", result);
+        /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
+           signed factory tree is published root-down. factory_recovery_scan() is the
+           passive startup/reorg scan that never broadcasts. Call repeatedly (caller
+           mines between passes) so each tree level matures its CSV; the root spends
+           the funding directly, so no distribution TX is required. */
+        char fr_status[256] = {0};
+        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+        printf("Force-close: %s (run=%d)\n", fr_status, result);
 
         /* Broadcast signed commitment TX if available */
         {
@@ -3170,6 +3481,16 @@ int main(int argc, char *argv[]) {
                                     hd_mnemonic, hd_passphrase, hd_lookahead);
     }
 
+    /* #20 poisoned-LSP marker: if a prior session caught this LSP forging a
+       revocation, refuse to reconnect. (--force-close is handled earlier, so the
+       operator can still recover; deleting the marker re-enables connecting.) */
+    if (db_path && client_lsp_is_poisoned(db_path)) {
+        fprintf(stderr, "Client: REFUSING to connect — this LSP was previously caught "
+                "forging a revocation (marker %s.lsp_poisoned). Force-close with "
+                "--force-close, then delete the marker to re-enable.\n", db_path);
+        return 1;
+    }
+
     int ok;
     if (daemon_mode) {
         daemon_cb_data_t cbd;
@@ -3178,6 +3499,9 @@ int main(int argc, char *argv[]) {
         cbd.wt = &client_wt;
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
+        cbd.lsp_forgery_response = lsp_forgery_mode;
+        cbd.lsp_forgery_response_ps = lsp_forgery_mode_ps;
+        cbd.poison_db_path = db_path;
         cbd.auto_accept_jit = auto_accept_jit;
         cbd.test_lsps2     = test_lsps2;
         cbd.test_lsps2_buy = test_lsps2_buy;
@@ -3305,6 +3629,12 @@ int main(int argc, char *argv[]) {
                                             daemon_channel_cb, &cbd);
             }
             if (g_shutdown) break;
+            if (cbd.lsp_forgery_detected &&
+                cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
+                fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
+                        "to a proven-cheating LSP\n");
+                break;
+            }
             if (!ok) {
                 fprintf(stderr, "Client: disconnected, retrying in 1s...\n");
                 /* Run watchtower check between reconnect attempts so we can
@@ -3316,9 +3646,11 @@ int main(int argc, char *argv[]) {
                 break;  /* clean exit */
             }
         }
+        if (cbd.force_close_requested)
+            client_force_close_from_db(db_path, network, cli_path,
+                                       rpcuser, rpcpassword, datadir, rpcport);
     } else if (n_actions > 0 || expect_channels) {
-        multi_payment_data_t data = { actions, n_actions, 0 };
-        /* Standalone mode also gets funding verification if RPC available */
+        /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
         client_verify_funding_fn sa_vfn = NULL;
         void *sa_vctx = NULL;
@@ -3334,8 +3666,42 @@ int main(int argc, char *argv[]) {
             sa_vfn = verify_funding_noop_regtest;
             sa_vctx = NULL;
         }
-        ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data,
-                                      sa_vfn, sa_vctx);
+
+        if (n_actions > 0) {
+            /* Scripted --send/--recv now run through the SAME proven daemon
+               message loop as production (daemon_channel_cb), driven by
+               cbd.scripted_actions.  The loop auto-fulfills received HTLCs from
+               the invoice store, settles sent HTLCs with full bidirectional
+               revocation, answers the demo's external-invoice step
+               (CREATE_INVOICE), and runs the cooperative close — exiting cleanly
+               (return 2) on CLOSE_PROPOSE.  This replaces standalone_channel_cb,
+               a parallel re-implementation that desynced on every message type
+               it didn't hand-roll (LSP_REVOKE_AND_ACK / CREATE_INVOICE /
+               CLOSE_PROPOSE). */
+            daemon_cb_data_t cbd;
+            memset(&cbd, 0, sizeof(cbd));
+            cbd.db  = use_db ? &db : NULL;
+            cbd.wt  = &client_wt;
+            cbd.fee = client_fee_ptr;
+            cbd.rt  = rt_ok ? &rt : NULL;
+            cbd.lsp_forgery_response = lsp_forgery_mode;
+            cbd.lsp_forgery_response_ps = lsp_forgery_mode_ps;
+            cbd.poison_db_path = db_path;
+            cbd.scripted_actions   = actions;
+            cbd.n_scripted_actions = n_actions;
+            ok = client_run_with_channels(ctx, &kp, host, port,
+                                          daemon_channel_cb, &cbd,
+                                          sa_vfn, sa_vctx);
+            if (cbd.force_close_requested)
+                client_force_close_from_db(db_path, network, cli_path,
+                                           rpcuser, rpcpassword, datadir, rpcport);
+        } else {
+            /* Bare --channels (no scripted payment): unchanged legacy path. */
+            multi_payment_data_t data = { actions, n_actions, 0 };
+            ok = client_run_with_channels(ctx, &kp, host, port,
+                                          standalone_channel_cb, &data,
+                                          sa_vfn, sa_vctx);
+        }
     } else {
         ok = client_run_ceremony(ctx, &kp, host, port);
     }

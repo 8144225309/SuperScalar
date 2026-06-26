@@ -1812,6 +1812,14 @@
                 tx_buf_t cl4r_snap[FACTORY_MAX_LEAVES];
                 unsigned char cl4r_snap_txid[FACTORY_MAX_LEAVES][32];
                 int cl4r_cheat_enabled = (getenv("SS_CHEAT_ROLLOVER") != NULL);
+                /* Full pre-rollover tree snapshot (EVERY node, not just leaves) so
+                   the mid-window cheat can broadcast the OLD ancestor path with the
+                   OLD txids — the only way the OLD leaf 0 is spendable on-chain.
+                   malloc'd to keep the 512-node arrays off this already-deep stack;
+                   freed after the cheat fires. */
+                tx_buf_t *cl4r_node_snap = NULL;
+                unsigned char (*cl4r_node_txid)[32] = NULL;
+                int *cl4r_node_signed = NULL;
                 for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++) {
                     tx_buf_init(&cl4r_snap[li], 0);
                     memset(cl4r_snap_txid[li], 0, 32);
@@ -1840,6 +1848,27 @@
                             cl4r_snap[0].len > 5 ? cl4r_snap[0].data[5] : 0,
                             cl4r_snap[0].len > 6 ? cl4r_snap[0].data[6] : 0,
                             cl4r_snap[0].len > 7 ? cl4r_snap[0].data[7] : 0);
+
+                    /* Snapshot EVERY node's signed bytes + txid (not just leaves):
+                       the cheat broadcasts the whole pre-rollover tree so the OLD
+                       leaf 0's ancestors land on-chain with matching (old) txids. */
+                    cl4r_node_snap   = calloc(FACTORY_MAX_NODES, sizeof(tx_buf_t));
+                    cl4r_node_txid   = calloc(FACTORY_MAX_NODES, 32);
+                    cl4r_node_signed = calloc(FACTORY_MAX_NODES, sizeof(int));
+                    if (cl4r_node_snap && cl4r_node_txid && cl4r_node_signed) {
+                        for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                            factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                            tx_buf_init(&cl4r_node_snap[ni], 0);
+                            if (nd->is_signed && nd->signed_tx.len > 0) {
+                                tx_buf_init(&cl4r_node_snap[ni], nd->signed_tx.len);
+                                memcpy(cl4r_node_snap[ni].data, nd->signed_tx.data,
+                                       nd->signed_tx.len);
+                                cl4r_node_snap[ni].len = nd->signed_tx.len;
+                                cl4r_node_signed[ni] = 1;
+                                memcpy(cl4r_node_txid[ni], nd->txid, 32);
+                            }
+                        }
+                    }
                 }
 
                 uint32_t epoch_before = lsp_p->factory.counter.current_epoch;
@@ -1883,6 +1912,52 @@
                         printf("  iter %d/%d: lsp_channels_advance_ps_leaf(0)...\n",
                                it + 1, n_iters);
                         fflush(stdout);
+                        /* CL4-ROLLOVER: the Tier-B ceremony (Step 10, lsp_channels.c)
+                           arms the watchtower to watch the IMMEDIATELY-superseded leaf
+                           state (T_{n-1}), not older ones (WT watches the most-dangerous
+                           revoked state — smallest DW timelock — by design, see
+                           lsp_channels.c rehydrate note).  Re-snapshot the leaf node txs
+                           NOW (just before the final, rollover-triggering advance) so the
+                           cheat broadcasts exactly that stale state.  The parent path was
+                           captured pre-loop and is unchanged by leaf advances, so the
+                           re-captured T_{n-1} leaves stay consistent with it. */
+                        if (cl4r_cheat_enabled && it == n_iters - 1 && cl4r_node_snap) {
+                            /* Re-capture the FULL tree (parents too): the DW odometer
+                               can re-sign intermediate nodes across leaf advances, so
+                               parents-from-pre-loop + leaves-from-T_{n-1} would be an
+                               inconsistent, unbroadcastable tree (sent=0).  Capturing the
+                               whole tree at this instant yields a self-consistent
+                               pre-rollover tree whose leaf is exactly T_{n-1}. */
+                            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                                factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                                tx_buf_free(&cl4r_node_snap[ni]);
+                                tx_buf_init(&cl4r_node_snap[ni], 0);
+                                cl4r_node_signed[ni] = 0;
+                                memset(cl4r_node_txid[ni], 0, 32);
+                                if (nd->is_signed && nd->signed_tx.len > 0) {
+                                    tx_buf_init(&cl4r_node_snap[ni], nd->signed_tx.len);
+                                    memcpy(cl4r_node_snap[ni].data, nd->signed_tx.data, nd->signed_tx.len);
+                                    cl4r_node_snap[ni].len = nd->signed_tx.len;
+                                    cl4r_node_signed[ni] = 1;
+                                    memcpy(cl4r_node_txid[ni], nd->txid, 32);
+                                }
+                            }
+                            for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes && li < FACTORY_MAX_LEAVES; li++) {
+                                size_t lni = lsp_p->factory.leaf_node_indices[li];
+                                factory_node_t *ln = &lsp_p->factory.nodes[lni];
+                                tx_buf_free(&cl4r_snap[li]);
+                                tx_buf_init(&cl4r_snap[li], 0);
+                                if (ln->is_signed && ln->signed_tx.len > 0) {
+                                    tx_buf_init(&cl4r_snap[li], ln->signed_tx.len);
+                                    memcpy(cl4r_snap[li].data, ln->signed_tx.data, ln->signed_tx.len);
+                                    cl4r_snap[li].len = ln->signed_tx.len;
+                                    memcpy(cl4r_snap_txid[li], ln->txid, 32);
+                                }
+                            }
+                            fprintf(stderr, "CL4-ROLLOVER: re-snapshotted FULL tree (%zu nodes) at T_{n-1} "
+                                    "(the WT-armed immediately-superseded state) before final rollover\n",
+                                    lsp_p->factory.n_nodes);
+                        }
                         int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
                         if (rc != 1) {
                             printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
@@ -1924,69 +1999,87 @@
                             const char *cl4r_phase = getenv("SS_CHEAT_ROLLOVER_PHASE");
                             if (cl4r_phase && strcmp(cl4r_phase, "mid-window") == 0 &&
                                 cl4r_snap[0].len > 0) {
-                                int saved_is_signed[FACTORY_MAX_NODES];
-                                memset(saved_is_signed, 0, sizeof(saved_is_signed));
-                                for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
-                                    size_t ni = lsp_p->factory.leaf_node_indices[li];
-                                    saved_is_signed[ni] = lsp_p->factory.nodes[ni].is_signed;
-                                    lsp_p->factory.nodes[ni].is_signed = 0;
+                                /* Swap the factory to the FULL pre-rollover tree, broadcast it,
+                                   then swap the current tree back.  Reusing the normal tree-broadcast
+                                   path (not a raw send of just the leaf) lands the OLD root -> ... ->
+                                   OLD leaf 0 in topological order AND respects the DW timelocks, so
+                                   the OLD leaf 0's ancestors exist on-chain with the OLD txids and it
+                                   is spendable.  The funding is still unspent (this is the first
+                                   on-chain tree broadcast), so the old root spends it.  The previous
+                                   code broadcast the post-rollover tree (new-epoch txids) and then a
+                                   raw OLD leaf 0 whose input never existed -> sent=0. */
+                                unsigned char txid_tmp[32];
+                                size_t nn = lsp_p->factory.n_nodes;
+                                int have_snap = (cl4r_node_snap && cl4r_node_txid && cl4r_node_signed);
+                                if (have_snap) {
+                                    for (size_t ni = 0; ni < nn; ni++) {
+                                        factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                                        tx_buf_t tb = nd->signed_tx; nd->signed_tx = cl4r_node_snap[ni]; cl4r_node_snap[ni] = tb;
+                                        int s = nd->is_signed; nd->is_signed = cl4r_node_signed[ni]; cl4r_node_signed[ni] = s;
+                                        memcpy(txid_tmp, nd->txid, 32); memcpy(nd->txid, cl4r_node_txid[ni], 32); memcpy(cl4r_node_txid[ni], txid_tmp, 32);
+                                    }
                                 }
                                 int parent_ok = broadcast_factory_tree_any_network(
                                     &lsp_p->factory, &rt, mine_addr, is_regtest,
                                     confirm_timeout_secs);
-                                for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
-                                    size_t ni = lsp_p->factory.leaf_node_indices[li];
-                                    lsp_p->factory.nodes[ni].is_signed = saved_is_signed[ni];
+                                /* old leaf-0 txid (display order) for the marker, read BEFORE swap-back */
+                                char cheat_txid_str[65] = {0};
+                                size_t leaf0_ni = lsp_p->factory.leaf_node_indices[0];
+                                for (int b = 0; b < 32; b++)
+                                    sprintf(cheat_txid_str + b * 2, "%02x",
+                                            lsp_p->factory.nodes[leaf0_ni].txid[31 - b]);
+                                if (have_snap) {   /* swap the current tree back */
+                                    for (size_t ni = 0; ni < nn; ni++) {
+                                        factory_node_t *nd = &lsp_p->factory.nodes[ni];
+                                        tx_buf_t tb = nd->signed_tx; nd->signed_tx = cl4r_node_snap[ni]; cl4r_node_snap[ni] = tb;
+                                        int s = nd->is_signed; nd->is_signed = cl4r_node_signed[ni]; cl4r_node_signed[ni] = s;
+                                        memcpy(txid_tmp, nd->txid, 32); memcpy(nd->txid, cl4r_node_txid[ni], 32); memcpy(cl4r_node_txid[ni], txid_tmp, 32);
+                                    }
                                 }
-                                if (parent_ok) {
-                                    char *cheat_hex = malloc((size_t)cl4r_snap[0].len * 2 + 1);
-                                    char cheat_txid_str[65] = {0};
-                                    int sent = 0;
-                                    if (cheat_hex) {
-                                        hex_encode(cl4r_snap[0].data,
-                                                   (size_t)cl4r_snap[0].len,
-                                                   cheat_hex);
-                                        sent = regtest_send_raw_tx(&rt, cheat_hex,
-                                                                   cheat_txid_str);
-                                    }
-                                    fprintf(stderr,
-                                            "CL4-ROLLOVER: mid-window broadcast of "
-                                            "dying factory leaf 0 tx: sent=%d txid=%s "
-                                            "(severity=HIGH)\n",
-                                            sent, cheat_txid_str);
-                                    if (g_db) {
-                                        persist_log_broadcast(g_db,
-                                            sent ? cheat_txid_str : "?",
-                                            "cheat_rollover_stale",
-                                            cheat_hex ? cheat_hex : "",
-                                            sent ? "ok" : "failed");
-                                    }
-                                    if (sent && is_regtest) {
-                                        regtest_mine_blocks(&rt, 1, mine_addr);
-                                        watchtower_t *wt_cl4 = mgr->watchtower;
-                                        if (wt_cl4) {
-                                            int detected = watchtower_check(wt_cl4);
-                                            if (detected > 0) {
-                                                printf("CL4-ROLLOVER: BREACH DETECTED! "
-                                                       "Watchtower broadcast %d penalty tx(s)\n",
-                                                       detected);
-                                                regtest_mine_blocks(&rt, 1, mine_addr);
-                                            } else {
-                                                fprintf(stderr,
-                                                        "CL4-ROLLOVER: watchtower did NOT "
-                                                        "detect revoked broadcast (defense MISS)\n");
-                                            }
+                                int sent = parent_ok ? 1 : 0;
+                                fprintf(stderr,
+                                        "CL4-ROLLOVER: mid-window broadcast of "
+                                        "dying factory leaf 0 tx: sent=%d txid=%s "
+                                        "(severity=HIGH)\n",
+                                        sent, cheat_txid_str);
+                                if (g_db) {
+                                    persist_log_broadcast(g_db,
+                                        sent ? cheat_txid_str : "?",
+                                        "cheat_rollover_stale", "",
+                                        sent ? "ok" : "failed");
+                                }
+                                if (sent && is_regtest) {
+                                    regtest_mine_blocks(&rt, 1, mine_addr);
+                                    watchtower_t *wt_cl4 = mgr->watchtower;
+                                    if (wt_cl4) {
+                                        int detected = watchtower_check(wt_cl4);
+                                        if (detected > 0) {
+                                            printf("CL4-ROLLOVER: BREACH DETECTED! "
+                                                   "Watchtower broadcast %d penalty tx(s)\n",
+                                                   detected);
+                                            regtest_mine_blocks(&rt, 1, mine_addr);
+                                        } else {
+                                            fprintf(stderr,
+                                                    "CL4-ROLLOVER: watchtower did NOT "
+                                                    "detect revoked broadcast (defense MISS)\n");
                                         }
                                     }
-                                    free(cheat_hex);
-                                } else {
+                                } else if (!parent_ok) {
                                     fprintf(stderr,
-                                            "CL4-ROLLOVER: parent tree broadcast failed — "
+                                            "CL4-ROLLOVER: old-tree broadcast failed — "
                                             "cannot test stale broadcast\n");
                                 }
                             }
                             for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++)
                                 tx_buf_free(&cl4r_snap[li]);
+                            if (cl4r_node_snap) {
+                                for (size_t ni = 0; ni < FACTORY_MAX_NODES; ni++)
+                                    tx_buf_free(&cl4r_node_snap[ni]);
+                                free(cl4r_node_snap);
+                            }
+                            free(cl4r_node_txid);
+                            free(cl4r_node_signed);
+                            cl4r_node_snap = NULL; cl4r_node_txid = NULL; cl4r_node_signed = NULL;
                         }
 
                         /* Verify every non-PS-leaf node is signed for the new epoch.
@@ -2602,6 +2695,58 @@
                 memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx);
                 return 1;
+            }
+
+            /* === kind=3 standalone fire (#321 EVERY-PATH) ===
+             * SS_FC_ARM_KIND3: rather than the owner broadcasting the HTLC
+             * timeout sweep, arm a kind=3 wt_db force-close watch carrying the
+             * SAME pre-signed sweep + the on-chain commit txid, then exit.  A
+             * secret-less standalone WT (--wt-db only) must then broadcast the
+             * sweep itself — proving the force-close HTLC-sweep delegation
+             * works trustlessly (the last unfired penalty-matrix cell).
+             * superscalar_lsp.c doesn't include lsp_wt.h (LSP arms wt_db via
+             * watchtower.c), so declare the one helper we need locally. */
+            if (getenv("SS_FC_ARM_KIND3")) {
+                extern int64_t lsp_wt_register_force_close_watch(
+                    persist_wt_t *pwt, uint32_t channel_id,
+                    const unsigned char commit_txid32[32], uint32_t htlc_vout,
+                    uint64_t htlc_amount, const unsigned char *htlc_spk,
+                    size_t htlc_spk_len, uint32_t csv_delay,
+                    const unsigned char *signed_sweep_tx,
+                    size_t signed_sweep_tx_len,
+                    const unsigned char sweep_txid32[32]);
+                extern void sha256_double(const unsigned char *, size_t,
+                                          unsigned char *);
+                int k3_ok = 0;
+                if (mgr->watchtower && mgr->watchtower->wt_db &&
+                    mgr->watchtower->wt_db->db) {
+                    unsigned char k3_sweep_txid[32];
+                    sha256_double(timeout_tx.data, timeout_tx.len, k3_sweep_txid);
+                    int64_t k3wid = lsp_wt_register_force_close_watch(
+                        mgr->watchtower->wt_db, 0 /*peer_idx*/, commit_txid,
+                        htlc_vout, htlc_amount, htlc_spk, htlc_spk_len,
+                        (uint32_t)ch0->to_self_delay,
+                        timeout_tx.data, timeout_tx.len, k3_sweep_txid);
+                    k3_ok = (k3wid > 0);
+                    printf("KIND3-ARM: registered force-close HTLC watch_id="
+                           "%lld; commit on-chain, sweep pre-signed; owner "
+                           "will NOT broadcast (standalone WT must)\n",
+                           (long long)k3wid);
+                    printf("\n=== HTLC FORCE-CLOSE KIND3-ARM COMPLETE ===\n");
+                    report_add_string(&rpt, "result",
+                                      "htlc_force_close_kind3_armed");
+                } else {
+                    fprintf(stderr, "KIND3-ARM: no wt_db on watchtower — "
+                            "cannot arm (need --wt-db)\n");
+                    report_add_string(&rpt, "result", "kind3_arm_no_wtdb");
+                }
+                tx_buf_free(&timeout_tx);
+                report_close(&rpt);
+                jit_channels_cleanup(mgr);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return k3_ok ? 0 : 1;
             }
 
             char *timeout_hex = malloc(timeout_tx.len * 2 + 1);
@@ -3844,9 +3989,32 @@
                        bc_entry_txid_disp, matches);
             }
 
-            /* Step 8: Mine block to confirm breach */
-            ADVANCE(1);
-            printf("[8] Mined 1 block — breach confirmed\n");
+            /* Step 8: confirm the breach BEFORE the secondary sweep.
+               On regtest, mine.  On any TRUC-enforcing network (signet/
+               testnet4/mainnet) the V2 HTLC/PTLC penalty CANNOT spend the V3
+               breach commit until it CONFIRMS — BIP-431 permits an unconfirmed
+               V3 tx exactly one V3 child (the main to_local penalty) and no V2
+               children.  ADVANCE() is regtest-only mining (a no-op elsewhere),
+               so on real networks we must wait for an actual confirmation;
+               otherwise the secondary PTLC penalty is rejected
+               (TRUC-violation) and ptlc_penalty stays 0. */
+            if (is_regtest) {
+                ADVANCE(1);
+                printf("[8] Mined 1 block — breach confirmed\n");
+            } else {
+                printf("[8] Waiting for breach %s to confirm "
+                       "(TRUC: the V2 PTLC penalty needs a confirmed parent)...\n",
+                       bc_breach_txid);
+                int bc_conf = 0;
+                int bc_budget = (confirm_timeout_secs > 0 ? confirm_timeout_secs : 3600);
+                for (int w = 0; w < bc_budget / 10; w++) {
+                    bc_conf = regtest_get_confirmations(&rt, bc_breach_txid);
+                    if (bc_conf >= 1) break;
+                    sleep(10);
+                }
+                printf("[8] breach confirmations=%d (>=1 means TRUC now permits "
+                       "the V2 secondary penalty)\n", bc_conf);
+            }
 
             /* Step 9: Run watchtower_check */
             /* Print current chain height before check for diagnosis. */

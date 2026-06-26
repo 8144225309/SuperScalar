@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.14)
 # rejects.  This silences the error without patching the vendored dep.
 # Ignored on CMake < 3.31 (variable simply doesn't exist yet).
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-project(superscalar VERSION 0.1.13 LANGUAGES C)
+project(superscalar VERSION 0.2.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -144,6 +144,7 @@ add_library(superscalar
     src/lsp_demo.c
     src/report.c
     src/persist.c
+    src/persist_crypto.c
     src/persist_wt.c
     src/lsp_wt.c
     src/bridge.c
@@ -295,6 +296,7 @@ add_executable(test_superscalar
     tests/test_economic_correctness.c
     tests/test_regtest_hybrid_cln.c
     tests/test_persist.c
+    tests/test_adversarial_verify.c
     tests/test_persist_wt.c
     tests/test_bridge.c
     tests/test_daemon.c
@@ -445,6 +447,23 @@ if(ENABLE_SANITIZERS)
     target_link_libraries(recover_stranded_coop_output PRIVATE project_sanitizers)
 endif()
 
+# #53 Phase 4b: client-side hashlock L-stock poison recourse (assemble from persisted reveal)
+add_executable(superscalar_lstock_recover tools/superscalar_lstock_recover.c)
+target_include_directories(superscalar_lstock_recover PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(superscalar_lstock_recover PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(superscalar_lstock_recover PRIVATE project_sanitizers)
+endif()
+
+# Offline factory-residual recovery: rebuild the tree in-process + MuSig key-path
+# co-sign the MuSig/CLTV/L-stock residual outputs (we hold all seckeys for test factories).
+add_executable(superscalar_factory_residual_sweep tools/superscalar_factory_residual_sweep.c)
+target_include_directories(superscalar_factory_residual_sweep PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(superscalar_factory_residual_sweep PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(superscalar_factory_residual_sweep PRIVATE project_sanitizers)
+endif()
+
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---
 if(ENABLE_FUZZING)
     set(FUZZ_SOURCES
@@ -468,4 +487,13 @@ if(ENABLE_FUZZING)
         target_link_options(${fuzz_name} PRIVATE
             -fsanitize=fuzzer,address,undefined)
     endforeach()
+endif()
+
+# SF-INPROC-SCALE-HARNESS (#310): single-process N-client factory-creation harness.
+add_executable(test_inproc_scale tools/test_inproc_scale.c)
+target_include_directories(test_inproc_scale PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(test_inproc_scale PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(test_inproc_scale PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_inproc_scale PRIVATE project_sanitizers)
 endif()

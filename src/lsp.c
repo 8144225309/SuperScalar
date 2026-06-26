@@ -426,6 +426,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     if (saved_fee_per_tx > 200)
         f->fee_per_tx = saved_fee_per_tx;
     f->cltv_timeout = cltv_timeout;
+    f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
     memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
@@ -436,6 +437,34 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             factory_set_shachain_seed(f, saved_shachain_seed);
     }
     free(saved_secrets);
+
+    /* #53 + restart-resume: (re-)derive + install the hashlock L-stock poison seed
+       AFTER factory_init_from_pubkeys (which wiped use_hashlock_poison).  The seed is
+       DERIVED deterministically from the LSP master key + THIS factory's funding
+       outpoint (factory_derive_lstock_seed) — never randomly minted or persisted as an
+       independent secret — so it is identical on the initial ceremony, on every
+       rotation, and after any LSP restart/backup-restore (the "derive, don't store"
+       rule; both inputs are durable).  Gated on lsp->enable_hashlock_poison; the legacy
+       key-path L-stock remains the default. */
+    if (lsp->enable_hashlock_poison) {
+        unsigned char lsp_sk[32], lstock_seed[32];
+        if (!secp256k1_keypair_sec(lsp->ctx, lsp_sk, &lsp->lsp_keypair)) {
+            fprintf(stderr, "LSP-stateless factory creation: keypair_sec for "
+                            "L-stock seed failed\n");
+            return 0;
+        }
+        factory_derive_lstock_seed(lsp_sk, funding_txid, funding_vout, lstock_seed);
+        memset(lsp_sk, 0, sizeof(lsp_sk));
+        factory_set_shachain_seed(f, lstock_seed);
+        memset(lstock_seed, 0, sizeof(lstock_seed));
+        if (f->use_flat_secrets || !factory_enable_hashlock_poison(f)) {
+            fprintf(stderr, "LSP-stateless factory creation: "
+                            "factory_enable_hashlock_poison failed (use_flat=%d)\n",
+                    f->use_flat_secrets);
+            return 0;
+        }
+    }
+
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                         funding_spk, funding_spk_len);
 
@@ -517,7 +546,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        signer x node nonce matrix.  Filled from client pubnonces (Step B) and
        LSP pubnonces (Step C), forwarded to clients in LSP_RESPONSE so each
        client can set every co-signer's per-node nonce and finalize. */
-    size_t mtx_stride = (size_t)FACTORY_MAX_SIGNERS * 66;
+    size_t mtx_stride = (size_t)f->n_participants * 66;  /* tight stride = actual signers, not the 256 array max -- keeps LSP_RESPONSE under the 16MB wire frame at scale */
     unsigned char *all_pn = calloc(f->n_nodes, mtx_stride);
     if (!all_pn) goto fail_pre;
 
@@ -561,7 +590,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 free(client_pn); free(all_pn);
                 goto fail_pre;
             }
-            memcpy(all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + (size_t)slot) * 66,
+            memcpy(all_pn + (nidx * (size_t)f->n_participants + (size_t)slot) * 66,
                    client_pn + nidx * 66, 66);
         }
         free(client_pn);
@@ -599,7 +628,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 goto fail_pre;
             }
             musig_pubnonce_serialize(lsp->ctx, lsp_pn_per_node + nidx * 66, &lsp_pubnonce);
-            memcpy(all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + (size_t)slot) * 66,
+            memcpy(all_pn + (nidx * (size_t)f->n_participants + (size_t)slot) * 66,
                    lsp_pn_per_node + nidx * 66, 66);
             if (!factory_session_set_nonce(f, nidx, (size_t)slot, &lsp_pubnonce)) {
                 fprintf(stderr, "LSP-stateless: set LSP nonce node %zu failed\n", nidx);

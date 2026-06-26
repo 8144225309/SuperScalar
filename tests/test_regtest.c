@@ -8,6 +8,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
 #include "superscalar/factory.h"
+#include "superscalar/persist.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -736,6 +737,18 @@ int test_regtest_breach_penalty_cpfp(void) {
     channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
     channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
 
+    /* #8 revocation-verification-standard: the fail-closed verifier (and the penalty
+       builder it gates) must retrieve the committed per-commitment point for OLD
+       commitments after the 2-slot in-memory window evicts them. Production wires a
+       persist_db (lsp_channels.c / superscalar_client.c) so channel_set_remote_pcp
+       saves the point durably and channel_get_remote_pcp falls back to it; mirror that
+       here with an in-memory DB (distinct channel_ids) so this breach test exercises
+       the real durable-PCP path rather than failing closed on an evicted cn=0 point. */
+    persist_t pcp_db;
+    TEST_ASSERT(persist_open(&pcp_db, NULL), "open in-memory pcp db (#8 durable revocation verify)");
+    channel_set_persist(&lsp_ch, &pcp_db, 1);
+    channel_set_persist(&client_ch, &pcp_db, 2);
+
     /* Exchange per-commitment points for commitments 0 and 1 */
     secp256k1_pubkey lsp_pcp0, lsp_pcp1, client_pcp0, client_pcp1;
     channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
@@ -767,8 +780,8 @@ int test_regtest_breach_penalty_cpfp(void) {
     memcpy(to_local_spk, commit0_unsigned.data + 47 + 8 + 1, 34);
 
     /* --- Advance to commitment #1 --- */
-    channel_generate_local_pcs(&lsp_ch, 1);
-    channel_generate_local_pcs(&client_ch, 1);
+    channel_generate_local_pcs(&lsp_ch, 2);   /* incl cn=2: its per-commitment point is fetched + #8-persisted below; must be a valid point, not uninitialized */
+    channel_generate_local_pcs(&client_ch, 2);
 
     secp256k1_pubkey lsp_pcp2, client_pcp2;
     channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
@@ -876,6 +889,7 @@ int test_regtest_breach_penalty_cpfp(void) {
     TEST_ASSERT(wt.n_pending == 0, "pending cleared after penalty confirmed");
 
     /* Cleanup */
+    persist_close(&pcp_db);
     tx_buf_free(&commit0_unsigned);
     tx_buf_free(&commit0_signed);
     watchtower_cleanup(&wt);
@@ -964,6 +978,18 @@ int test_regtest_watchtower_mempool_detection(void) {
     channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
     channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
 
+    /* #8 revocation-verification-standard: the fail-closed verifier (and the penalty
+       builder it gates) must retrieve the committed per-commitment point for OLD
+       commitments after the 2-slot in-memory window evicts them. Production wires a
+       persist_db (lsp_channels.c / superscalar_client.c) so channel_set_remote_pcp
+       saves the point durably and channel_get_remote_pcp falls back to it; mirror that
+       here with an in-memory DB (distinct channel_ids) so this breach test exercises
+       the real durable-PCP path rather than failing closed on an evicted cn=0 point. */
+    persist_t pcp_db;
+    TEST_ASSERT(persist_open(&pcp_db, NULL), "open in-memory pcp db (#8 durable revocation verify)");
+    channel_set_persist(&lsp_ch, &pcp_db, 1);
+    channel_set_persist(&client_ch, &pcp_db, 2);
+
     /* Exchange per-commitment points */
     secp256k1_pubkey lsp_pcp0, lsp_pcp1, client_pcp0, client_pcp1;
     channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
@@ -989,8 +1015,8 @@ int test_regtest_watchtower_mempool_detection(void) {
                 "sign commitment #0");
 
     /* Advance to commitment #1, revoke #0 */
-    channel_generate_local_pcs(&lsp_ch, 1);
-    channel_generate_local_pcs(&client_ch, 1);
+    channel_generate_local_pcs(&lsp_ch, 2);   /* incl cn=2: its per-commitment point is fetched + #8-persisted below; must be a valid point, not uninitialized */
+    channel_generate_local_pcs(&client_ch, 2);
 
     secp256k1_pubkey lsp_pcp2, client_pcp2;
     channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
@@ -1068,6 +1094,7 @@ int test_regtest_watchtower_mempool_detection(void) {
     TEST_ASSERT(wt.n_pending == 0, "penalty confirmed and cleared");
     printf("  Mempool breach → penalty confirmed!\n");
 
+    persist_close(&pcp_db);
     tx_buf_free(&commit0_unsigned);
     tx_buf_free(&commit0_signed);
     watchtower_cleanup(&wt);
@@ -1156,6 +1183,18 @@ int test_regtest_watchtower_late_detection(void) {
     channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
     channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
 
+    /* #8 revocation-verification-standard: the fail-closed verifier (and the penalty
+       builder it gates) must retrieve the committed per-commitment point for OLD
+       commitments after the 2-slot in-memory window evicts them. Production wires a
+       persist_db (lsp_channels.c / superscalar_client.c) so channel_set_remote_pcp
+       saves the point durably and channel_get_remote_pcp falls back to it; mirror that
+       here with an in-memory DB (distinct channel_ids) so this breach test exercises
+       the real durable-PCP path rather than failing closed on an evicted cn=0 point. */
+    persist_t pcp_db;
+    TEST_ASSERT(persist_open(&pcp_db, NULL), "open in-memory pcp db (#8 durable revocation verify)");
+    channel_set_persist(&lsp_ch, &pcp_db, 1);
+    channel_set_persist(&client_ch, &pcp_db, 2);
+
     /* Exchange per-commitment points */
     secp256k1_pubkey lsp_pcp0, lsp_pcp1, client_pcp0, client_pcp1;
     channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
@@ -1181,8 +1220,8 @@ int test_regtest_watchtower_late_detection(void) {
                 "sign commitment #0");
 
     /* Advance to commitment #1, revoke #0 */
-    channel_generate_local_pcs(&lsp_ch, 1);
-    channel_generate_local_pcs(&client_ch, 1);
+    channel_generate_local_pcs(&lsp_ch, 2);   /* incl cn=2: its per-commitment point is fetched + #8-persisted below; must be a valid point, not uninitialized */
+    channel_generate_local_pcs(&client_ch, 2);
 
     secp256k1_pubkey lsp_pcp2, client_pcp2;
     channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
@@ -1258,6 +1297,7 @@ int test_regtest_watchtower_late_detection(void) {
     TEST_ASSERT(wt.n_pending == 0, "penalty confirmed and cleared");
     printf("  Late watchtower penalty confirmed!\n");
 
+    persist_close(&pcp_db);
     tx_buf_free(&commit0_unsigned);
     tx_buf_free(&commit0_signed);
     watchtower_cleanup(&wt);

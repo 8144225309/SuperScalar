@@ -136,6 +136,35 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
                                       secp256k1_context *ctx,
                                       const wire_msg_t *msg);
 
+/* Revocation-verification standard (client side): verify the LSP's revealed
+   per-commitment secret against the LSP's committed per-commitment point, then
+   retain it (so the user can detect an LSP breach) and track the LSP's next
+   point. Mirrors the LSP-side handler. Returns 1 on success (verified+stored, or
+   nothing to revoke yet at commitment 0); 0 if the secret is invalid (caller
+   should fail the channel) or the message is malformed. See
+   doc/revocation-verification-standard.md. */
+int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
+                                       const wire_msg_t *msg);
+
+/* Item-1 escalation policy: how the client responds once it DETECTS a forged LSP
+   revocation (i.e. client_handle_lsp_revoke_and_ack returned 0 — fail-closed). In
+   every mode the bad secret is refused and NO watchtower is armed from it; the
+   modes differ only in what the client does NEXT. A client that cannot obtain a
+   valid LSP revocation holds an un-penalizable old LSP state, so continuing to
+   build new states is the riskiest choice. Selectable via --on-lsp-forgery.
+   NOTE: PS (Pseudo-Spilman) leaves are CLTV-gated rather than revocation-gated,
+   so a forged LSP revocation is less severe on a PS leaf than on a revocation-
+   gated leaf; the policy is applied uniformly today (see doc). */
+typedef enum {
+    LSP_FORGERY_CONTINUE = 0,  /* refuse + no WT-arm, keep the session (legacy)   */
+    LSP_FORGERY_HALT     = 1,  /* + stop accepting new commitments, CRITICAL alert*/
+    LSP_FORGERY_CLOSE    = 2,  /* + force-close on the last fully-verified state   */
+} lsp_forgery_response_t;
+
+/* Parse an --on-lsp-forgery argument ("continue"|"halt"|"close") into the enum;
+   returns -1 on an unrecognised value. */
+int client_parse_forgery_response(const char *s);
+
 /* Handle incoming ADD_HTLC from LSP (we are the payee).
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);

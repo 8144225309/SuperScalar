@@ -30,7 +30,7 @@ WT_BIN="$BUILD_DIR/superscalar_watchtower"
 LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
 N_CLIENTS="${N_CLIENTS:-2}"
-FUNDING_SATS="${FUNDING_SATS:-200000}"
+FUNDING_SATS="${FUNDING_SATS:-10000000}"
 
 LSP_PORT=29959           # distinct from sibling tests
 WT_PORT=29969
@@ -76,21 +76,29 @@ if ! $BCLI getblockchaininfo >/dev/null 2>&1; then
     exit 1
 fi
 
+# Clear any leftover LSP/WT holding OUR ports — the chronic 'listen failed on port 29959' root
+# cause: a zombie from a prior run keeps the port bound, so this LSP can't bind and accept clients
+# (which surfaces as the clients' "noise handshake failed"). Scoped to our exact ports (NOT broad,
+# NOT --network — won't touch the testnet4 N=64 runner).
+pkill -9 -f "superscalar_(lsp|client) .*--port ${LSP_PORT}( |\$)" 2>/dev/null || true
+pkill -9 -f "superscalar_watchtower .*--port ${WT_PORT}( |\$)" 2>/dev/null || true
+pkill -9 -f "superscalar_lsp .*--watchtower-port ${WT_PORT}( |\$)" 2>/dev/null || true
+sleep 1
+
 # Set up miner wallet
-$BCLI -named createwallet wallet_name=ss_cheat_rollover_miner load_on_startup=false 2>&1 | head -2 || true
-$BCLI loadwallet ss_cheat_rollover_miner 2>/dev/null || true
-MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_rollover_miner -named getnewaddress address_type=bech32m)
+$BCLI -named createwallet wallet_name=ss_cheat_leaf_miner load_on_startup=false 2>&1 | head -2 || true
+$BCLI loadwallet ss_cheat_leaf_miner 2>/dev/null || true
+MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_leaf_miner -named getnewaddress address_type=bech32m)
 $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 
 # --- Standalone WT first (it will be authoritative) ---
 echo "--- Standalone WT (port $WT_PORT) ---"
-ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$WT_BIN" \
     --network regtest \
     --port $WT_PORT \
     --rpcuser ${RPCUSER:-rpcuser} \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet ss_cheat_rollover_miner \
+    --wallet ss_cheat_leaf_miner \
     --db "$WT_DB" \
     > "$WT_LOG" 2>&1 &
 WT_PID=$!
@@ -106,7 +114,6 @@ done
 
 # --- LSP: --test-tier-b-rollover + --cheat-daemon-rollover=mid-window ---
 echo "--- LSP daemon (--test-tier-b-rollover --cheat-daemon-rollover=mid-window) ---"
-ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$LSP_BIN" \
     --network regtest \
     --port $LSP_PORT \
@@ -124,7 +131,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --seckey "$LSP_SECKEY" \
     --rpcuser ${RPCUSER:-rpcuser} \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
-    --wallet ss_cheat_rollover_miner \
+    --wallet ss_cheat_leaf_miner \
     --db "$LSP_DB" \
     --demo --test-tier-b-rollover --cheat-daemon-rollover mid-window \
     --lsp-balance-pct 50 \
@@ -146,18 +153,28 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
     CLIENT_SECKEY=$(printf "%064x" $((0x02 + i)))
     "$CLIENT_BIN" \
         --network regtest \
-        --lsp-host 127.0.0.1 \
-        --lsp-port $LSP_PORT \
-        --lsp-pubkey "$LSP_PUBKEY" \
+        --host 127.0.0.1 --port $LSP_PORT \
+        --daemon \
         --seckey "$CLIENT_SECKEY" \
+        --fee-rate 1000 \
+        --lsp-balance-pct 50 \
+        --lsp-pubkey "$LSP_PUBKEY" \
+        --participant-id $((i + 1)) \
         --rpcuser ${RPCUSER:-rpcuser} \
         --rpcpassword ${RPCPASSWORD:-rpcpass} \
-        --wallet ss_cheat_rollover_miner \
+        --wallet ss_cheat_leaf_miner \
+        --db "$TMPDIR/client_${i}.db" \
         > "$TMPDIR/client_${i}.log" 2>&1 &
     CLIENT_PID=$!
     PIDS+=($CLIENT_PID)
     echo "  client[$i] PID=$CLIENT_PID"
 done
+
+# The DW Tier-B rollover advances over BLOCKS — keep mining throughout so it reaches the
+# mid-window cheat point. Without this the chain stalls during the wait and CL4-ROLLOVER
+# never fires (the chronic rollover failure: libasan + funding + this missing miner).
+( while kill -0 $LSP_PID 2>/dev/null; do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 2; done ) &
+PIDS+=($!)
 
 # Wait for LSP to fire the cheat OR exit OR timeout
 echo
@@ -204,8 +221,20 @@ WT_PENALTY=$(grep -cE "penalty.*broadcast|response_tx.*broadcast|Watchtower broa
 
 echo "  cheat_fired=$CHEAT_FIRED  wt_breach=$WT_BREACH  wt_penalty=$WT_PENALTY"
 
+set +e
 if [ "$CHEAT_FIRED" -ge 1 ] && [ "$WT_BREACH" -ge 1 ] && [ "$WT_PENALTY" -ge 1 ]; then
-    echo "  PASS: cheat fired + WT detected breach + WT broadcast penalty"
+    # OUTCOME (not just log-greps): confirm the WT's response/penalty txid ON-CHAIN + assert a real amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(cat "$LSP_LOG" "$WT_LOG" 2>/dev/null | grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}" | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: WT signals fired but no response/penalty txid found (breach_detections + logs)"; tail -20 "$WT_LOG"; exit 1; }
+    echo "  WT response txid: $PEN_TXID — mining to confirm + verify payout"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  WT response confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+    echo "  PASS: rollover cheat fired + WT detected breach + broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just log-greps"
     exit 0
 fi
 

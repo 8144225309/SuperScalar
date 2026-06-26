@@ -205,6 +205,15 @@
    0x01 partial-close-only. */
 #define MSG_ROTATE 0x8B
 
+/* #53-B3b: LSP -> Client.  After an advance commits the new leaf state, the LSP
+   reveals the SUPERSEDED state's L-stock revocation secret(s) so the client (or its
+   watchtower) can spend the Leaf-P poison if the LSP later broadcasts that stale
+   state.  Carries an array of {node, revoked_state, secret} — one entry for the
+   single-leaf advance, N for a Tier-B rollover.  Verify-before-persist
+   (SHA256(secret)==committed H_old), mirroring channel revoke-and-ack. */
+#define MSG_LSTOCK_REVEAL 0x8C
+#define MSG_LSTOCK_REVEAL_REQUEST 0x8D  /* #59: Client -> LSP, re-request missing reveals */
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -939,6 +948,36 @@ cJSON *wire_build_leaf_advance_done(int leaf_side);
 
 int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
 
+/* #53-B3b: MSG_LSTOCK_REVEAL.  LSP -> Client; reveals superseded-state L-stock
+   revocation secrets so the client can spend the Leaf-P poison on a later breach of
+   that state.  Carries n entries of {node, revoked_state, secret32} (n=1 for a
+   single-leaf advance, N for a Tier-B rollover).  Build from parallel arrays; parse
+   into caller arrays.  Build returns the cJSON (NULL on OOM); parse returns 1 on
+   success with *n_out set, 0 on malformed input. */
+cJSON *wire_build_lstock_reveal(const uint32_t *node_idx,
+                                const uint32_t *revoked_state,
+                                const unsigned char secrets[][32],
+                                size_t n);
+int wire_parse_lstock_reveal(const cJSON *json,
+                             uint32_t *node_idx_out,
+                             uint32_t *revoked_state_out,
+                             unsigned char secrets_out[][32],
+                             size_t max_entries,
+                             size_t *n_out);
+
+/* #59: MSG_LSTOCK_REVEAL_REQUEST.  Client -> LSP after a restart/reconnect; lists
+   the (node, state) poison rows whose secret was never received so the LSP
+   re-derives + re-reveals (replies with MSG_LSTOCK_REVEAL).  Same array shape as
+   the reveal, minus the secret. */
+cJSON *wire_build_lstock_reveal_request(const uint32_t *node_idx,
+                                        const uint32_t *state_counter,
+                                        size_t n);
+int wire_parse_lstock_reveal_request(const cJSON *json,
+                                     uint32_t *node_idx_out,
+                                     uint32_t *state_counter_out,
+                                     size_t max_entries,
+                                     size_t *n_out);
+
 /* --- Tier B: state-advance ceremony (root rollover, MSG_PATH_*) ---
 
    When factory_advance_leaf_unsigned() returns -1, the leaf's per-leaf
@@ -1078,6 +1117,13 @@ int wire_parse_subfactory_psig(const cJSON *json,
 
 /* LSP → sub clients: SUBFACTORY_DONE {leaf_side, sub_idx, chain_len} */
 cJSON *wire_build_subfactory_done(int leaf_side, int sub_idx, uint32_t chain_len);
+/* #53 sub-factory hashlock: optional aggregated poison Schnorr sig carried in DONE
+   (the N-party sub poison is aggregated only by the LSP; the client needs it for its
+   persisted recourse template).  No-op when poison_agg_sig64 is NULL / field absent. */
+void wire_subfactory_done_set_poison_aggsig(cJSON *done,
+                                            const unsigned char *poison_agg_sig64);
+int wire_subfactory_done_get_poison_aggsig(const cJSON *json,
+                                           unsigned char *poison_agg_sig64_out);
 int wire_parse_subfactory_done(const cJSON *json,
                                  int *leaf_side, int *sub_idx,
                                  uint32_t *chain_len);

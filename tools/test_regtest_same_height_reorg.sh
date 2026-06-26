@@ -64,7 +64,7 @@ sqlite3 "$WT_DB" "CREATE TABLE broadcast_log (id INTEGER PRIMARY KEY, txid TEXT,
 ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
 "$WT_BIN" \
     --network regtest \
-    --db "$WT_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 2 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \

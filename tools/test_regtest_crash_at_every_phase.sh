@@ -231,9 +231,11 @@ if [ "$CEREMONY_ROWS" = "0" ] || [ "$CEREMONY_ROWS" = "?" ]; then
     echo "        do not yet call persist_save_ceremony /"
     echo "        persist_save_participant_phase. Wiring those call-sites is"
     echo "        the next step before this scaffold can assert state."
-    echo "        Scaffold PASS criterion met: kill point reached, DB exists,"
-    echo "        framework is in place."
-    exit 0
+    echo "        Kill point reached + DB exists, but the persist call-sites"
+    echo "        are not wired, so there is nothing to assert."
+    echo "  SKIP (XFAIL): factory_propose persist not wired — NOT a PASS"
+    echo "                (this branch previously did exit 0 = a false GREEN)."
+    exit 77
 fi
 
 # Once helpers are wired, we expect these exact rows.

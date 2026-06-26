@@ -145,7 +145,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --wallet ss_cheat_leaf_miner \
     --db "$LSP_DB" \
     --demo --test-leaf-advance --cheat-leaf $SIDE \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 PIDS+=($LSP_PID)
@@ -237,9 +237,33 @@ else
 fi
 echo
 echo "=== Final result ==="
+set +e
 if grep -q "LEAF ADVANCE TEST PASSED" "$LSP_LOG" 2>/dev/null; then
-    echo "  PASS: PS leaf cheat detection end-to-end"
-    exit 0
+    # OUTCOME (not just the marker + an unasserted broadcast_log dump): require REAL evidence —
+    # either the WT defense tx CONFIRMED on-chain with a real amount, or (for a CLTV-gated PS
+    # leaf, where detection + the honest CLTV path is the defense) a persisted detection signal.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE (source LIKE '%poison%' OR source LIKE '%penalty%' OR source LIKE '%response%' OR source LIKE '%burn%' OR source LIKE 'factory_%') AND result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    if [ -n "$PEN_TXID" ]; then
+        echo "  WT defense txid: $PEN_TXID — confirming on-chain"
+        PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+        echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT defense $PEN_TXID never CONFIRMED on-chain (marker != confirmed)"; exit 1; }
+        PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+        PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+        echo "  WT defense confirmed on-chain; largest output ${PSATS:-0} sats"
+        [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT defense output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+        A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+        case "$A2" in LOW*) echo "  FAIL: WT defense recovers <90% of swept value ($A2) — value leaked/burned"; exit 1;; esac
+        echo "  PASS: PS leaf cheat detected + WT defense $PEN_TXID CONFIRMED on-chain (${PSATS} sats) — outcome verified, not just a marker"
+        exit 0
+    fi
+    # No on-chain defense tx (CLTV-gated PS leaf: detection is the defense) — require a real detection signal.
+    DET=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM breach_detections;" 2>/dev/null || echo 0)
+    WCHK=$(grep -acE "watchtower_check returned [1-9]|BREACH DETECTED|FACTORY BREACH" "$LSP_LOG" 2>/dev/null | head -1)
+    if [ "${DET:-0}" -ge 1 ] || [ "${WCHK:-0}" -ge 1 ]; then
+        echo "  PASS: PS leaf cheat DETECTED (breach_detections=$DET, detect-log=$WCHK) — CLTV-gated leaf, detection is the defense; verified beyond the bare marker"
+        exit 0
+    fi
+    echo "  FAIL: LEAF ADVANCE marker present but NO confirmed defense tx AND NO detection signal — marker-only false-pass"; tail -25 "$LSP_LOG"; exit 1
 else
     echo "  FAIL: LEAF ADVANCE TEST did not PASSED"
     echo "  LSP log tail:"

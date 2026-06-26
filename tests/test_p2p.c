@@ -550,8 +550,11 @@ int test_p2p_getcfheaders_payload(void)
        Total: 24 + 37 = 61 bytes */
     ASSERT(n == 61, "getcfheaders total length = 61");
 
-    /* Command "getcfheaders\0" — fits in 12 bytes with null pad */
-    char cmd_expected[12] = "getcfheaders";
+    /* Command "getcfheaders" is exactly 12 bytes (the P2P command field width).
+       Size [13] so the string literal's NUL fits — AppleClang 21's -Werror
+       -Wunterminated-string-initialization rejects a [12] array holding 12 chars.
+       memcmp below compares the 12 command bytes; the trailing NUL is unused. */
+    char cmd_expected[13] = "getcfheaders";
     ASSERT(memcmp(buf + 4, cmd_expected, 12) == 0, "command = getcfheaders");
 
     /* Payload length = 37 LE */

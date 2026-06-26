@@ -64,6 +64,7 @@ TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-sub.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_LOG="$TMPDIR/wt.log"
+WT_DB="$TMPDIR/wt.db"   # trustless WT db (no secrets); armed by the LSP's --wt-db
 
 PIDS=()
 
@@ -124,6 +125,7 @@ env $SS_ASAN_ENV "$LSP_BIN" \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET \
     --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --cli-path "$(which bitcoin-cli)" \
     --demo --lsp-balance-pct 50 --cheat-daemon-sub \
     > "$LSP_LOG" 2>&1 &
@@ -183,10 +185,19 @@ STALE_TXID=$(grep -E "Stale chain\[N-1\] broadcast" "$LSP_LOG" | head -1 | awk -
 echo "  Stale chain[N-1] sub-factory txid: ${STALE_TXID:-(unknown)}"
 
 echo
-echo "--- Standalone WT (binary --db $LSP_DB) ---"
+# Stop the cheating LSP gracefully so its wt.db (WAL) is checkpointed before the
+# standalone trustless WT reads it. The stale sub-factory state is already on-chain;
+# the WT must now defend WITHOUT the LSP (exactly the trustless scenario).
+echo "--- stopping cheating LSP so wt.db is flushed for the standalone WT ---"
+kill -TERM $LSP_PID 2>/dev/null || true
+for s in $(seq 1 30); do kill -0 $LSP_PID 2>/dev/null || { echo "  LSP exited (wt.db checkpointed)"; break; }; sleep 1; done
+WT_K1=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE watch_kind=1;" 2>/dev/null || echo 0)
+echo "  wt.db sub-factory (kind=1) watches available to the standalone WT: ${WT_K1:-0}"
+
+echo "--- Standalone trustless WT (--wt-db $WT_DB, NO secrets) ---"
 "$WT_BIN" \
     --network regtest \
-    --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 5 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \
@@ -229,8 +240,45 @@ if [ -s "$REORG_LOG" ]; then cat "$REORG_LOG"; else echo "  (none)"; fi
 
 echo
 echo "=== Final result ==="
-if [ $WT_FIRED -eq 1 ]; then
-    echo "  PASS: standalone WT detected sub-factory breach + broadcast penalty TXs"
+set +e
+if [ "$WT_FIRED" -eq 1 ]; then
+    # OUTCOME (not just a broadcast log line): confirm the WT's response/penalty txid ON-CHAIN + assert a real amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}" "$WT_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: WT fired but no response/penalty txid found (breach_detections + WT log)"; tail -30 "$WT_LOG"; exit 1; }
+    echo "  WT response txid: $PEN_TXID — mining to confirm + verify payout"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    # G1 #44 PROOF: the poison spends chain[N-1]'s OWN sales-stock output (vin[0].txid == breach),
+    # whereas chain[N] spends chain[N-1]'s PARENT. So vin==breach proves the trustless wt_db response
+    # is the POISON (valid pre- AND post-confirmation), not the RBF-only chain[N] that orphans (-25)
+    # once the breach confirms. Hard-FAIL otherwise — a green here means the poison is in wt_db.
+    if [ -n "$STALE_TXID" ]; then
+        RVIN=$(echo "$PRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); print(d["vin"][0]["txid"])
+except Exception: print("")')
+        if [ "$RVIN" = "$STALE_TXID" ]; then
+            echo "  G1 VERIFIED: WT response spends the breach chain[N-1] ($STALE_TXID) -> it IS the POISON (post-confirmation recourse), not chain[N]"
+        else
+            echo "  FAIL (G1): WT response spends $RVIN, expected the breach $STALE_TXID -> still chain[N] (RBF-only); poison NOT persisted to wt_db"; exit 1
+        fi
+    fi
+    # Finding-2 fix: a sub-factory penalty REDISTRIBUTES to N per-client P2TR outputs (verified on
+    # signet: 3 outputs 55416/44333/33051, no change). Assert the SMALLEST per-client output is
+    # above dust — checking only 'largest' would pass even if one client were shorted to dust.
+    PINFO=$(echo "$PRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); vs=[int(round(v["value"]*1e8)) for v in d["vout"] if v["scriptPubKey"].get("type")=="witness_v1_taproot"]
+ print(min(vs) if vs else 0, len(vs), sum(vs))
+except Exception: print("0 0 0")')
+    PMIN=$(echo "$PINFO" | awk "{print \$1}"); PNUM=$(echo "$PINFO" | awk "{print \$2}"); PTOT=$(echo "$PINFO" | awk "{print \$3}")
+    echo "  WT response confirmed on-chain; $PNUM per-client P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
+    [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: WT response has no P2TR recovery output"; exit 1; }
+    [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
+    echo "  PASS: standalone WT detected sub-factory breach, broadcast AND CONFIRMED its redistribution ($PEN_TXID; $PNUM clients, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     exit 0
 else
     echo "  FAIL: standalone WT did not broadcast penalty TXs"

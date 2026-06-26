@@ -14,6 +14,7 @@
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
 #include "superscalar/log.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #ifdef __linux__
 #include <syslog.h>
 #endif
@@ -313,6 +314,12 @@ static void usage(const char *prog) {
         "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
+        "  --enable-hashlock-poison  Build the factory with hashlock-gated L-stock\n"
+        "                      poison (#53): the L-stock output is spendable by the\n"
+        "                      poison only with an LSP-revealed per-(leaf,state)\n"
+        "                      secret, closing the co-signed-poison theft vector.\n"
+        "                      Installs a random shachain seed. Mutually exclusive\n"
+        "                      with --test-burn.\n"
         "  --test-htlc-force-close  After demo: add pending HTLC, force-close, broadcast HTLC timeout TX\n"
         "  --test-multi-htlc-force-close  After demo: add HTLCs on ALL channels, force-close, broadcast all timeout TXs\n"
         "  --test-full-settlement  After demo: force-close tree, broadcast ALL commitment TXs, verify cross-leaf balances\n"
@@ -1340,6 +1347,7 @@ int main(int argc, char *argv[]) {
                                         0 = disabled (default for backward compat) */
     int force_close = 0;
     int test_burn = 0;
+    int enable_hashlock_poison = 0;  /* #53 Phase 3: hashlock-gated L-stock poison */
     int test_ptlc_basic = 0;
     int test_ptlc_breach = 0;
     int test_ptlc_restart = 0;
@@ -1386,6 +1394,7 @@ int main(int argc, char *argv[]) {
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
+    int encrypt_db = 0;              /* --encrypt-db: at-rest field encryption (#327; auto-on for mainnet) */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
     int economic_mode_arg = 0;       /* 0=lsp-takes-all, 1=profit-shared */
     int test_bad_terms = 0;          /* --test-bad-terms: offer 0 bps profit to verify client rejects */
@@ -1542,6 +1551,8 @@ int main(int argc, char *argv[]) {
             db_path = argv[++i];
         else if (strcmp(argv[i], "--wt-db") == 0 && i + 1 < argc)
             wt_db_path = argv[++i];
+        else if (strcmp(argv[i], "--encrypt-db") == 0)
+            encrypt_db = 1;
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
             network = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
@@ -1634,6 +1645,10 @@ int main(int argc, char *argv[]) {
             test_partial_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)
             breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
+        else if (strcmp(argv[i], "--breach-standalone") == 0)
+            breach_test = 3;  /* 3 = client-commitment breach + NO in-process WT;
+                                 leaves the on-chain breach for an external standalone
+                                 WT (--wt-db only) to detect + penalize (isolation test) */
         else if (strcmp(argv[i], "--test-rebalance") == 0)
             test_rebalance = 1;
         else if (strcmp(argv[i], "--test-wire-leaf-advance") == 0)
@@ -1744,6 +1759,8 @@ int main(int argc, char *argv[]) {
             force_close = 1;
         else if (strcmp(argv[i], "--test-burn") == 0)
             test_burn = 1;
+        else if (strcmp(argv[i], "--enable-hashlock-poison") == 0)
+            enable_hashlock_poison = 1;
         else if (strcmp(argv[i], "--test-htlc-force-close") == 0)
             test_htlc_force_close = 1;
         else if (strcmp(argv[i], "--test-multi-htlc-force-close") == 0)
@@ -2113,6 +2130,9 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+    /* #9 cheat-gate: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are inert
+       unless this is regtest, even if the env var is set directly. */
+    superscalar_set_cheat_gate(is_regtest);
 
     /* Redirect logs if requested */
     if (log_file_path) {
@@ -2315,6 +2335,33 @@ int main(int argc, char *argv[]) {
             "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
             "If you understand this risk, pass --i-accept-the-risk\n");
         return 1;
+    }
+
+    /* #327a: refuse cmdline --seckey on mainnet. Process args are visible to
+       any local user via `ps` / /proc/<pid>/cmdline and persist in shell
+       history — an unacceptable key-exposure vector for a node holding real
+       funds. Mainnet operators must use the encrypted --keyfile (PBKDF2-600K
+       + AEAD at rest). Regtest/signet/testnet keep --seckey for convenience. */
+    if ((strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0) && seckey_hex) {
+        fprintf(stderr,
+            "Error: --seckey is refused on mainnet (visible via ps / shell history).\n"
+            "Use --keyfile PATH (encrypted at rest); create one with --generate-mnemonic\n"
+            "or --from-mnemonic, optionally protected by --passphrase.\n");
+        return 1;
+    }
+
+    /* #9: refuse ALL test/cheat scaffolding flags on mainnet (footgun guard on
+       top of --i-accept-the-risk). Detection cheats are self-harming and
+       defense-bypass cheats are theft; neither belongs on a mainnet node. */
+    if (strcmp(network, "mainnet") == 0) {
+        for (int ci = 1; ci < argc; ci++) {
+            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
+                strncmp(argv[ci], "--test-", 7) == 0) {
+                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
+                        "refused on mainnet.\n", argv[ci]);
+                return 1;
+            }
+        }
     }
 
     /* Mainnet requires --db for revocation secret persistence */
@@ -2635,6 +2682,35 @@ int main(int argc, char *argv[]) {
         fflush(stdout);
     }
 
+    /* #327 at-rest field encryption. The DEK is derived from the (now-final) LSP
+       root key; encryption seals secret columns (HD seed today; revocation +
+       channel secrets next). Mainnet always encrypts; elsewhere it is opt-in via
+       --encrypt-db. This must run after the key is final and before any secret
+       column is read or written (recovery's channel init is later). */
+    if (use_db) {
+        int mainnet_db = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
+        if (mainnet_db) encrypt_db = 1;
+        if (encrypt_db) {
+            persist_set_encryption_key(&db, lsp_seckey);
+            if (!persist_apply_encryption(&db)) {
+                fprintf(stderr, "Error: at-rest DB encryption setup/verification failed "
+                                "(wrong --keyfile/passphrase, or corrupt DB).\n");
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("LSP: at-rest DB field encryption enabled\n");
+        } else if (persist_db_is_encrypted(&db)) {
+            fprintf(stderr, "Error: %s is encrypted at rest but encryption was not enabled.\n"
+                            "       Re-run with --encrypt-db and the matching --keyfile.\n", db_path);
+            persist_close(&db);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
     /* Initialize bitcoin-cli connection */
     regtest_t rt;
     int rt_ok;
@@ -2822,6 +2898,35 @@ int main(int argc, char *argv[]) {
             free(rec_f);
             rec_f = NULL;
             lsp_rp->factory.fee = fee_est;
+
+            /* #59 restart-resume: a reloaded hashlock-poison factory (the persisted
+               use_hashlock_poison intent) must re-derive its DETERMINISTIC L-stock
+               seed (LSP key + funding outpoint — never stored) and re-enable, so the
+               LSP can keep revealing superseded secrets AND the next advance keeps
+               building hashlock-gated L-stock SPKs.  Without this a restarted LSP
+               would silently revert to un-gated (Scenario-B-vulnerable) L-stock on its
+               next advance.  Fail-closed: refuse to serve a hashlock factory we can't
+               re-protect. */
+            if (lsp_rp->factory.use_hashlock_poison) {
+                unsigned char lstock_seed[32];
+                factory_derive_lstock_seed(lsp_seckey,
+                                           lsp_rp->factory.funding_txid,
+                                           lsp_rp->factory.funding_vout,
+                                           lstock_seed);
+                factory_set_shachain_seed(&lsp_rp->factory, lstock_seed);
+                memset(lstock_seed, 0, sizeof(lstock_seed));
+                if (!factory_enable_hashlock_poison(&lsp_rp->factory)) {
+                    fprintf(stderr, "LSP recovery: failed to re-enable hashlock poison "
+                                    "for reloaded factory -- refusing to serve un-gated\n");
+                    persist_close(&db);
+                    memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx);
+                    return 1;
+                }
+                lsp_rp->enable_hashlock_poison = 1;
+                printf("LSP recovery: hashlock L-stock poison RE-ENABLED "
+                       "(seed re-derived deterministically from LSP key)\n");
+            }
 
             /* Load DW counter state from DB */
             {
@@ -3829,6 +3934,27 @@ accept_new_factory:
                lsp_p->factory.n_revocation_secrets);
     }
 
+    /* #53 + restart-resume: hashlock-gated L-stock poison.  Distinct from
+       --test-burn's flat secrets (the old global-epoch index): the hashlock poison
+       derives per-(leaf,state) secrets from a single per-factory seed.  We DO NOT
+       mint/store a random seed here — lsp_run_factory_creation_stateless DERIVES it
+       deterministically from the LSP master key + the funding outpoint
+       (factory_derive_lstock_seed), so it survives restart + backup-restore for free.
+       Here we only record the operator intent (the flag) + reject the test-burn
+       conflict.  Mutually exclusive with --test-burn (flat vs shachain mode). */
+    if (enable_hashlock_poison) {
+        if (test_burn) {
+            fprintf(stderr, "LSP: --enable-hashlock-poison and --test-burn are "
+                            "mutually exclusive (shachain seed vs flat secrets)\n");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        lsp_p->enable_hashlock_poison = 1;
+        printf("LSP: hashlock-gated L-stock poison ENABLED "
+               "(per-factory seed derived deterministically from LSP key)\n");
+    }
+
     printf("LSP: starting factory creation ceremony...\n");
     {
         int creation_ok = 0;
@@ -4476,12 +4602,22 @@ accept_new_factory:
         printf("LSP: final close outputs to wallet address %s\n", final_wallet_addr);
     }
 
+    /* Cooperative-close fee scales with the TX vsize: 1 funding input plus
+       (n_total) P2TR outputs.  A flat 500 sats falls below the mempool
+       min-relay fee once the factory is large (N=127 -> ~5.6k vbytes -> the
+       close broadcast was rejected with "min relay fee not met").  Size it
+       from the configured --fee-rate (sat/kvB) with a 500-sat floor for small
+       factories so existing small-N behaviour is unchanged. */
+    uint64_t close_est_vbytes = 100 + (uint64_t)n_total * 44;
+    uint64_t close_fee = (close_est_vbytes * fee_rate) / 1000;
+    if (close_fee < 500) close_fee = 500;
+
     if (channels_active) {
         /* Pass NULL for close_spk so client outputs use per-client P2TR
            addresses derived from their factory pubkeys. LSP output uses
            factory funding SPK (or wallet SPK if needed). */
         n_close_outputs = lsp_channels_build_close_outputs(mgr, &lsp_p->factory,
-                                                            close_outputs, 500,
+                                                            close_outputs, close_fee,
                                                             NULL, 0);
         if (n_close_outputs == 0) {
             fprintf(stderr, "LSP: build close outputs failed\n");
@@ -4494,7 +4630,7 @@ accept_new_factory:
         /* No payments — equal split (original behavior) */
         const unsigned char *close_spk = final_close_spk ? final_close_spk : fund_spk;
         size_t close_spk_len = final_close_spk ? final_close_spk_len : 34;
-        uint64_t close_total = funding_amount - 500;  /* fee */
+        uint64_t close_total = funding_amount - close_fee;  /* size-scaled fee */
         uint64_t per_party = close_total / n_total;
         for (size_t i = 0; i < n_total; i++) {
             close_outputs[i].amount_sats = per_party;

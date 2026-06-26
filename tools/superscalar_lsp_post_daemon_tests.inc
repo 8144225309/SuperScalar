@@ -24,6 +24,14 @@
         /* Broadcast revoked commitments for ALL channels so every client's
          * watchtower can detect the breach independently. */
         static const unsigned char client_fills[4] = { 0x22, 0x33, 0x44, 0x55 };
+        /* Scaffold-seckey contract: the 2-of-2 re-sign below uses client_fills
+           as the CLIENT key.  Daemon-launched clients MUST start with the
+           matching --seckey (32 bytes of client_fills[ci]) or the re-signed
+           commitment is an Invalid Schnorr and won't broadcast.  We count the
+           broadcasts that land and abort loudly with the exact required key if
+           none do, instead of silently falling through to a confusing
+           "watchtower did not detect breach". */
+        size_t breach_bcast_ok = 0;
         for (size_t ci = 0; ci < mgr->n_channels; ci++) {
             channel_t *chX = &mgr->entries[ci].channel;
             uint64_t saved_num = chX->commitment_number;
@@ -128,10 +136,36 @@
             tx_buf_free(&old_signed);
 
             if (!sent) {
-                fprintf(stderr, "BREACH TEST: failed to broadcast revoked commitment for channel %zu\n", ci);
+                unsigned char want = (ci < 4) ? client_fills[ci] : 0x22;
+                char wantkey[65];
+                for (int b = 0; b < 32; b++) snprintf(wantkey + b * 2, 3, "%02x", want);
+                fprintf(stderr,
+                    "BREACH TEST: failed to broadcast revoked commitment for channel %zu.\n"
+                    "  Almost always the scaffold-seckey contract: the breach re-signs the\n"
+                    "  2-of-2 with the CLIENT key = client_fills[%zu] (0x%02x).  Launch this\n"
+                    "  client daemon with --seckey %s\n"
+                    "  or the re-signed commitment is an Invalid Schnorr and cannot broadcast.\n",
+                    ci, ci, (unsigned)want, wantkey);
                 continue;
             }
+            breach_bcast_ok++;
             printf("Revoked commitment broadcast (ch %zu): %s\n", ci, old_txid_str);
+        }
+
+        if (breach_bcast_ok == 0) {
+            fprintf(stderr,
+                "BREACH TEST ABORTED: 0/%zu revoked commitments reached chain.\n"
+                "  The watchtower has nothing on-chain to detect — this is a LAUNCHER\n"
+                "  key mismatch (scaffold-seckey contract), NOT a watchtower/protocol\n"
+                "  failure.  See the per-channel --seckey hint(s) above.\n",
+                mgr->n_channels);
+            report_add_string(&rpt, "result", "breach_test_scaffold_seckey_mismatch");
+            report_close(&rpt);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(lsp_p);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
 
         /* Confirm all revoked commitments so watchtowers can detect them */
@@ -147,9 +181,16 @@
             }
         }
 
-        if (breach_test == 2) {
-            /* --cheat-daemon: LSP does NOT run watchtower — sleep so clients can detect */
-            printf("CHEAT DAEMON: revoked commitment broadcast, sleeping for clients...\n");
+        if (breach_test == 2 || breach_test == 3) {
+            /* --cheat-daemon (2): LSP broadcasts its OWN revoked commitment (a
+               CLIENT's watchtower must catch it).  --breach-standalone (3): the
+               CLIENT's revoked commitment is broadcast (built via the else branch
+               above, channel_build_commitment_tx_for_remote — matching the LSP's
+               own wt.db kind=2 watch) but the LSP does NOT run the in-process
+               watchtower, leaving the on-chain breach for an EXTERNAL standalone
+               WT (--wt-db only) to detect + penalize.  Either way: sleep. */
+            printf("%s: revoked commitment broadcast, sleeping for external watchtower...\n",
+                   breach_test == 3 ? "BREACH-STANDALONE" : "CHEAT DAEMON");
             if (is_regtest) {
                 for (int s = 0; s < 30 && !g_shutdown; s++)
                     sleep(1);
@@ -1701,8 +1742,25 @@
         musig_keyagg_t rot_ka;
         musig_aggregate_keys(ctx, &rot_ka, rot_pks, n_total);
 
+        /* SF-PTLC-TURNOVER-AUTH #196: the client's PTLC_PRESIG handler refuses
+           any presig whose turnover_msg was not authorized by a precursor
+           ROTATION_BEGIN (it recomputes wire_compute_turnover_msg() from the
+           ROTATION_BEGIN context and compares).  The old constant
+           sha256_tagged("turnover") here predates that gate, so every client
+           rejected the presig ("no matching ROTATION_BEGIN") and rotation
+           stalled before reaching the MuSig ceremony.  Mirror production
+           (lsp_rotation.c:260): bind the turnover to a real rotation context
+           and send ROTATION_BEGIN before each presig.  The values are fixed
+           TEST constants — only their consistency between the ROTATION_BEGIN
+           sent below and this turnover_msg binding matters. */
+        unsigned char rot_dying_txid[32];
+        memset(rot_dying_txid, 0xAB, sizeof(rot_dying_txid));
+        unsigned char rot_new_nonce[32];
+        memset(rot_new_nonce, 0xCD, sizeof(rot_new_nonce));
+        uint64_t rot_epoch = 1;
         unsigned char turnover_msg[32];
-        sha256_tagged("turnover", (const unsigned char *)"turnover", 8, turnover_msg);
+        wire_compute_turnover_msg(rot_dying_txid, rot_new_nonce, rot_epoch,
+                                  turnover_msg);
 
         for (int ci = 0; ci < n_clients; ci++) {
             uint32_t pidx = (uint32_t)(ci + 1);
@@ -1717,6 +1775,21 @@
                 fprintf(stderr, "ROTATION: presig failed client %d\n", ci);
                 lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
+            }
+
+            /* SF-PTLC-TURNOVER-AUTH #196: send the rotation context BEFORE the
+               presig so the client's turnover-auth gate accepts it (mirror
+               lsp_rotation.c:260-275). */
+            {
+                cJSON *rb = wire_build_rotation_begin(rot_dying_txid,
+                                                      rot_new_nonce, rot_epoch);
+                if (!wire_send(lsp_p->client_fds[ci], MSG_ROTATION_BEGIN, rb)) {
+                    cJSON_Delete(rb);
+                    fprintf(stderr, "ROTATION: send ROTATION_BEGIN failed client %d\n", ci);
+                    lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+                    secp256k1_context_destroy(ctx); return 1;
+                }
+                cJSON_Delete(rb);
             }
 
             /* Send PTLC_PRESIG to client */

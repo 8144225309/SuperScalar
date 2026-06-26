@@ -12,7 +12,10 @@ int spend_find_vout_by_spk(regtest_t *rt,
                             const unsigned char *spk, size_t spk_len,
                             uint64_t *amount_out) {
     if (!rt || !txid_hex || !spk || spk_len == 0) return -2;
-    for (uint32_t v = 0; v < 32; v++) {
+    /* Scan up to 256 vouts: a cooperative close at scale has N+1 outputs
+       (129 at N=128). The loop breaks early when outputs run out, so this is
+       safe for the small-N callers too. */
+    for (uint32_t v = 0; v < 256; v++) {
         uint64_t amount = 0;
         unsigned char out_spk[64];
         size_t out_spk_len = 0;

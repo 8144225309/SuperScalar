@@ -4,6 +4,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/regtest.h"
 #include "superscalar/persist.h"
+#include "superscalar/wire.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -5922,6 +5923,790 @@ int test_factory_ps_subfactory_poison_tx_k2_n4(void) {
     TEST_ASSERT(dust_ok == 0, "rejects when per-client share below dust");
     tx_buf_free(&poison_dust);
 
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* restart-resume: the per-factory L-stock seed derivation must be deterministic
+   (same inputs -> same seed, so it survives LSP restart + backup-restore), unique
+   per funding outpoint and per LSP master, and one-way (seed != master). */
+int test_factory_lstock_seed_derivation(void) {
+    unsigned char master1[32], master2[32], txid1[32], txid2[32];
+    for (int i = 0; i < 32; i++) {
+        master1[i] = (unsigned char)(0x11 ^ i);
+        master2[i] = (unsigned char)(0x22 ^ i);
+        txid1[i]   = (unsigned char)(0x33 ^ i);
+        txid2[i]   = (unsigned char)(0x44 ^ i);
+    }
+    unsigned char s_a[32], s_b[32], s_c[32], s_d[32], s_e[32];
+    factory_derive_lstock_seed(master1, txid1, 0, s_a);
+    factory_derive_lstock_seed(master1, txid1, 0, s_b);
+    TEST_ASSERT(memcmp(s_a, s_b, 32) == 0, "deterministic: same inputs -> same seed");
+    factory_derive_lstock_seed(master1, txid1, 1, s_c);
+    TEST_ASSERT(memcmp(s_a, s_c, 32) != 0, "different vout -> different seed");
+    factory_derive_lstock_seed(master1, txid2, 0, s_d);
+    TEST_ASSERT(memcmp(s_a, s_d, 32) != 0, "different funding txid -> different seed");
+    factory_derive_lstock_seed(master2, txid1, 0, s_e);
+    TEST_ASSERT(memcmp(s_a, s_e, 32) != 0, "different LSP master -> different seed");
+    TEST_ASSERT(memcmp(s_a, master1, 32) != 0, "seed != master (one-way)");
+    printf("  factory_derive_lstock_seed: deterministic + per-factory + per-master\n");
+    return 1;
+}
+
+/* #53-B3b.2a (in-process, no regtest): the CLIENT MIRROR — given the LSP's per-node
+   L-stock hashes over the (here simulated) wire, a seedless client builds the SAME
+   2-leaf L-stock SPK as the hashlock-enabled LSP, so the leaf-state advance co-signs.
+   Without the mirror the client builds a different (single-leaf) SPK (control case).
+   setup_variable_arity_factory uses deterministic seckeys, so all three factories
+   share pubkeys — isolating the hash mirror. */
+int test_factory_lstock_client_mirror(void) {
+    secp256k1_context *ctx = test_ctx();
+    uint8_t arities[1] = {2};
+
+    /* LSP: hashlock ON — derives per-node H from its seed. */
+    secp256k1_keypair kl[3];
+    factory_t *lsp = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(lsp, "alloc lsp");
+    TEST_ASSERT(setup_variable_arity_factory(lsp, ctx, kl, 3, arities, 1, 5000000),
+                "setup lsp");
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0x90 ^ i);
+    factory_set_shachain_seed(lsp, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(lsp), "enable hashlock (lsp)");
+    TEST_ASSERT(factory_build_tree(lsp), "build lsp tree");
+    TEST_ASSERT(lsp->n_leaf_nodes >= 1, "lsp has leaves");
+
+    /* CLIENT: NO seed; mirror the LSP's per-node H (simulated FACTORY_PROPOSE). */
+    secp256k1_keypair kc[3];
+    factory_t *cli = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(cli, "alloc cli");
+    TEST_ASSERT(setup_variable_arity_factory(cli, ctx, kc, 3, arities, 1, 5000000),
+                "setup cli");
+    /* Ship the per-node H over the REAL wire (FACTORY_PROPOSE) and mirror it —
+       exercises the serialize -> parse -> factory_set_node_l_stock_hash round-trip,
+       not a direct in-memory copy. */
+    cJSON *propose = wire_build_factory_propose(lsp);
+    TEST_ASSERT(propose, "build FACTORY_PROPOSE");
+    cJSON *nlsh = cJSON_GetObjectItem(propose, "node_l_stock_hashes");
+    TEST_ASSERT(nlsh && cJSON_IsArray(nlsh), "PROPOSE carries node_l_stock_hashes");
+    TEST_ASSERT(cJSON_GetArraySize(nlsh) == lsp->n_leaf_nodes,
+                "one per-node hash per leaf");
+    for (int i = 0; i < cJSON_GetArraySize(nlsh); i++) {
+        cJSON *o = cJSON_GetArrayItem(nlsh, i);
+        cJSON *no = cJSON_GetObjectItem(o, "node");
+        cJSON *hh = cJSON_GetObjectItem(o, "h");
+        TEST_ASSERT(no && cJSON_IsNumber(no) && hh && cJSON_IsString(hh),
+                    "node/h fields present");
+        unsigned char h[32];
+        TEST_ASSERT(hex_decode(hh->valuestring, h, 32) == 32, "decode wire h");
+        factory_set_node_l_stock_hash(cli, (size_t)no->valuedouble, h);
+    }
+    cJSON_Delete(propose);
+    TEST_ASSERT(cli->has_node_l_stock_hashes, "client is in mirror mode");
+    TEST_ASSERT(factory_build_tree(cli), "build cli tree");
+    TEST_ASSERT(cli->n_leaf_nodes == lsp->n_leaf_nodes, "same topology");
+
+    /* Each leaf: client reproduced the hash AND the 2-leaf L-stock SPK. */
+    for (size_t li = 0; li < (size_t)lsp->n_leaf_nodes; li++) {
+        factory_node_t *ln = &lsp->nodes[lsp->leaf_node_indices[li]];
+        factory_node_t *cn = &cli->nodes[cli->leaf_node_indices[li]];
+        TEST_ASSERT(cn->has_l_stock_hash, "client leaf carries the hashlock");
+        TEST_ASSERT(memcmp(cn->l_stock_hash, ln->l_stock_hash, 32) == 0,
+                    "client H == LSP H");
+        unsigned char lspk[34], cspk[34];
+        TEST_ASSERT(build_l_stock_spk(lsp, ln, lspk), "lsp spk");
+        TEST_ASSERT(build_l_stock_spk(cli, cn, cspk), "cli spk");
+        TEST_ASSERT(memcmp(lspk, cspk, 34) == 0,
+                    "client L-stock SPK == LSP SPK (advance will co-sign)");
+        TEST_ASSERT(memcmp(cn->outputs[cn->n_outputs - 1].script_pubkey,
+                           ln->outputs[ln->n_outputs - 1].script_pubkey, 34) == 0,
+                    "leaf-tx L-stock output SPK matches");
+    }
+
+    /* CONTROL: a client WITHOUT the mirror builds a DIFFERENT (single-leaf) SPK. */
+    secp256k1_keypair kb[3];
+    factory_t *bare = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(bare, "alloc bare");
+    TEST_ASSERT(setup_variable_arity_factory(bare, ctx, kb, 3, arities, 1, 5000000),
+                "setup bare");
+    TEST_ASSERT(factory_build_tree(bare), "build bare tree");
+    {
+        unsigned char lspk[34], bspk[34];
+        build_l_stock_spk(lsp, &lsp->nodes[lsp->leaf_node_indices[0]], lspk);
+        build_l_stock_spk(bare, &bare->nodes[bare->leaf_node_indices[0]], bspk);
+        TEST_ASSERT(memcmp(lspk, bspk, 34) != 0,
+                    "WITHOUT the mirror the client SPK differs (mirror is required)");
+    }
+
+    factory_free(lsp); factory_free(cli); factory_free(bare);
+    free(lsp); free(cli); free(bare);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* #53 sub-factory Phase 0 (in-process, no regtest): each sub-factory state must commit a
+   DISTINCT per-(sub,state) L-stock (sales-stock) hash, so revealing one superseded state's
+   secret never compromises the hashlock of another sub state.  This is the per-state
+   revocation model the leaf path already has (update_l_stock_outputs); the sub path was
+   STATIC before this work.  Proves: (a) creation commits H0 = SHA256(secret(sub,0));
+   (b) each advance bumps the counter + re-commits H_n = SHA256(secret(sub,n)) != H_{n-1}
+   (and rewrites the sales-stock SPK); (c) a superseded secret stays seed-re-derivable so
+   the LSP's post-advance reveal verifies against the poison's H_old; (d) CONTROL — a
+   non-hashlock sub keeps a STATIC sales-stock SPK across advances (Phase 0 gated off). */
+int test_factory_subfactory_lstock_per_state_hash(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xEE;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[5];
+        for (int i = 0; i < 5; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 5);
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xFE, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 5, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+
+    /* Hashlock ON: seed + enable BEFORE build so the sub sales-stock commits H0. */
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0xA5 ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock");
+    TEST_ASSERT(factory_build_tree(f), "build k^2 PS tree (hashlock)");
+
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    int sub0_node_idx = leaf->subfactory_node_indices[0];
+    factory_node_t *sub = &f->nodes[sub0_node_idx];
+
+    /* (a) creation committed H0 = SHA256(secret(sub,0)). */
+    TEST_ASSERT(sub->has_l_stock_hash, "sub carries the hashlock at creation");
+    TEST_ASSERT_EQ((int)sub->l_stock_state_counter, 0, "sub counter starts at 0");
+    unsigned char h0[32];
+    memcpy(h0, sub->l_stock_hash, 32);
+    unsigned char sec0[32], chk[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, sub, 0, sec0), "derive secret(sub,0)");
+    sha256(sec0, 32, chk);
+    TEST_ASSERT(memcmp(chk, h0, 32) == 0, "H0 == SHA256(secret(sub,0))");
+    unsigned char spk0[34];
+    memcpy(spk0, sub->outputs[sub->n_outputs - 1].script_pubkey, 34);
+
+    /* (b) advance #1 -> counter 1, H1 != H0, H1 == SHA256(secret(sub,1)), SPK rewritten. */
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, 50000), 1,
+                   "sub advance #1");
+    TEST_ASSERT_EQ((int)sub->l_stock_state_counter, 1, "counter -> 1");
+    unsigned char h1[32];
+    memcpy(h1, sub->l_stock_hash, 32);
+    TEST_ASSERT(memcmp(h1, h0, 32) != 0, "H1 != H0 (distinct per state)");
+    unsigned char sec1[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, sub, 1, sec1), "derive secret(sub,1)");
+    sha256(sec1, 32, chk);
+    TEST_ASSERT(memcmp(chk, h1, 32) == 0, "H1 == SHA256(secret(sub,1))");
+    TEST_ASSERT(memcmp(sub->outputs[sub->n_outputs - 1].script_pubkey, spk0, 34) != 0,
+                "sales-stock SPK rewritten across the advance");
+
+    /* (c) the SUPERSEDED secret(sub,0) is still seed-re-derivable -> the LSP can reveal it
+       and the client's poison (built vs H0) verifies. */
+    unsigned char sec0b[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, sub, 0, sec0b), "re-derive secret(sub,0)");
+    TEST_ASSERT(memcmp(sec0b, sec0, 32) == 0, "secret(sub,0) stable (reveal verifies)");
+
+    /* (b') advance #2 -> H2 distinct from H0 and H1. */
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, 50000), 1,
+                   "sub advance #2");
+    TEST_ASSERT_EQ((int)sub->l_stock_state_counter, 2, "counter -> 2");
+    unsigned char h2[32];
+    memcpy(h2, sub->l_stock_hash, 32);
+    TEST_ASSERT(memcmp(h2, h0, 32) != 0 && memcmp(h2, h1, 32) != 0, "H2 distinct from H0,H1");
+    factory_free(f); free(f);
+
+    /* (d) CONTROL: a non-hashlock sub keeps a STATIC sales-stock SPK across advances. */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g, "alloc control factory");
+    factory_init(g, ctx, kps, 5, 6, 10);
+    factory_set_arity(g, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(g, 2);
+    factory_set_funding(g, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(g), "build control tree (no hashlock)");
+    factory_node_t *gsub = &g->nodes[g->nodes[g->leaf_node_indices[0]].subfactory_node_indices[0]];
+    TEST_ASSERT(!gsub->has_l_stock_hash, "control sub has NO hashlock");
+    unsigned char gspk0[34];
+    memcpy(gspk0, gsub->outputs[gsub->n_outputs - 1].script_pubkey, 34);
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(g, 0, 0, 0, 50000), 1,
+                   "control sub advance");
+    TEST_ASSERT(memcmp(gsub->outputs[gsub->n_outputs - 1].script_pubkey, gspk0, 34) == 0,
+                "control sales-stock SPK STATIC across advance (Phase 0 gated off)");
+    factory_free(g); free(g);
+
+    secp256k1_context_destroy(ctx);
+    printf("  sub-factory per-state L-stock hash: distinct H per state + superseded reveal stable\n");
+    return 1;
+}
+
+/* Derive the bech32m address for a 32-byte taproot output key via a rawtr()
+   descriptor (mirrors the funding path in test_tapscript.c). */
+static int derive_p2tr_addr_from_outputkey(regtest_t *rt,
+                                           const unsigned char *outkey32,
+                                           char *addr_out, size_t addr_len) {
+    char keyhex[65];
+    hex_encode(outkey32, 32, keyhex);
+    char params[160];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", keyhex);
+    char *di = regtest_exec(rt, "getdescriptorinfo", params);
+    if (!di) return 0;
+    cJSON *dij = cJSON_Parse(di); free(di);
+    if (!dij) return 0;
+    cJSON *desc = cJSON_GetObjectItem(dij, "descriptor");
+    if (!desc || !cJSON_IsString(desc)) { cJSON_Delete(dij); return 0; }
+    char dparams[220];
+    snprintf(dparams, sizeof(dparams), "\"%s\"", desc->valuestring);
+    cJSON_Delete(dij);
+    char *da = regtest_exec(rt, "deriveaddresses", dparams);
+    if (!da) return 0;
+    cJSON *daj = cJSON_Parse(da); free(da);
+    if (!daj || !cJSON_IsArray(daj)) { if (daj) cJSON_Delete(daj); return 0; }
+    cJSON *a0 = cJSON_GetArrayItem(daj, 0);
+    if (!a0 || !cJSON_IsString(a0)) { cJSON_Delete(daj); return 0; }
+    strncpy(addr_out, a0->valuestring, addr_len - 1);
+    addr_out[addr_len - 1] = '\0';
+    cJSON_Delete(daj);
+    return 1;
+}
+
+/* #53-A CONSENSUS PROOF: the hashlock-gated L-stock poison (Leaf-P script-path)
+   is accepted by the real Bitcoin Core interpreter ONLY with the revealed secret.
+   - positive: poison built with the correct secret is ACCEPTED + CONFIRMED, and
+     actually redistributes the L-stock to the clients (economic outcome asserted);
+   - anti-vacuity: the same poison with a mangled witness preimage is REJECTED by
+     the interpreter (the hashlock genuinely gates -> a LIVE state whose secret is
+     unrevealed cannot be poisoned -> Scenario B closed on-chain, not just at the API);
+   - API: the builder refuses a secret that doesn't match the committed hash. */
+int test_regtest_lstock_hashlock_poison(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
+                "setup n3 {2}");
+    /* #53-B: enable revocation-gated poison so build_tree commits the per-(leaf,
+       state) hash into each leaf's L-stock SPK via the production path (not a
+       manual set). */
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0xA5 ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock poison");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+    TEST_ASSERT_EQ(f->n_leaf_nodes, 1, "1 leaf");
+
+    factory_node_t *leaf = &f->nodes[f->leaf_node_indices[0]];
+    size_t n_clients = leaf->n_signers - 1;
+    TEST_ASSERT(n_clients == 2, "leaf has 2 clients (LSP + 2)");
+
+    /* build_tree committed the state-0 hash via setup_leaf_outputs. */
+    TEST_ASSERT(leaf->has_l_stock_hash, "leaf carries the hashlock after build_tree");
+    TEST_ASSERT_EQ(leaf->l_stock_state_counter, 0, "initial L-stock state = 0");
+
+    /* The LSP-derived per-(leaf,state) secret must reproduce the committed hash. */
+    unsigned char secret[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, leaf, leaf->l_stock_state_counter, secret),
+                "derive L-stock secret");
+    unsigned char h_check[32];
+    sha256(secret, 32, h_check);
+    TEST_ASSERT(memcmp(h_check, leaf->l_stock_hash, 32) == 0,
+                "derived secret reproduces the committed Leaf-P hash");
+
+    /* The hashlock taptree must change the SPK vs the legacy single-leaf SPK. */
+    unsigned char spk_hash[34], spk_plain[34];
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk_hash), "build 2-leaf L-stock SPK");
+    leaf->has_l_stock_hash = 0;
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk_plain), "build legacy L-stock SPK");
+    leaf->has_l_stock_hash = 1;
+    TEST_ASSERT(memcmp(spk_hash, spk_plain, 34) != 0,
+                "hashlock changes the L-stock SPK (taptree wired)");
+    TEST_ASSERT(spk_hash[0] == 0x51 && spk_hash[1] == 0x20, "P2TR SPK shape");
+
+    /* --- regtest: fund the real 2-leaf L-stock SPK, then spend via Leaf P --- */
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: no regtest node available\n");
+        factory_free(f); secp256k1_context_destroy(ctx); free(f); return 1;
+    }
+    regtest_create_wallet(&rt, "ss_lstock_poison");
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)), "mine addr");
+    /* Fund the test wallet from the shared faucet (robust on a tall chain where
+       fresh coinbases are 0-sat); fall back to mining on a fresh node. */
+    if (!regtest_fund_from_faucet(&rt, 0.05))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    char lstock_addr[128];
+    TEST_ASSERT(derive_p2tr_addr_from_outputkey(&rt, spk_hash + 2,
+                    lstock_addr, sizeof(lstock_addr)),
+                "derive L-stock address");
+
+    char fund_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, lstock_addr, 0.001, fund_txid_hex),
+                "fund L-stock SPK");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(fund_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+    int vout = -1; uint64_t amount = 0;
+    TEST_ASSERT(find_funding_vout(&rt, fund_txid_hex, spk_hash, 34, &vout, &amount),
+                "find L-stock vout");
+    TEST_ASSERT(amount > 10000, "L-stock funded");
+
+    const uint64_t fee = 1000;
+    uint64_t per_client = (amount - fee) / (uint64_t)n_clients;
+
+    /* Build the poison with the CORRECT secret. */
+    tx_buf_t poison; tx_buf_init(&poison, 256);
+    unsigned char ptxid[32];
+    TEST_ASSERT(factory_build_l_stock_poison_scriptpath(f, leaf, fund_txid_bytes,
+                    (uint32_t)vout, amount, fee, secret, &poison, ptxid),
+                "build script-path poison (correct secret)");
+
+    char *poison_hex = (char *)malloc(poison.len * 2 + 1);
+    TEST_ASSERT(poison_hex, "alloc poison hex");
+    hex_encode(poison.data, poison.len, poison_hex);
+
+    /* POSITIVE consensus: the interpreter accepts it. */
+    {
+        char *p = (char *)malloc(poison.len * 2 + 16);
+        snprintf(p, poison.len * 2 + 16, "[\"%s\"]", poison_hex);
+        char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+        free(p);
+        TEST_ASSERT(tma != NULL, "testmempoolaccept ran (positive)");
+        cJSON *j = cJSON_Parse(tma); free(tma);
+        TEST_ASSERT(j && cJSON_IsArray(j), "parse testmempoolaccept (positive)");
+        cJSON *r0 = cJSON_GetArrayItem(j, 0);
+        cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+        int ok_allowed = allowed && cJSON_IsTrue(allowed);
+        if (!ok_allowed) {
+            cJSON *rr = r0 ? cJSON_GetObjectItem(r0, "reject-reason") : NULL;
+            printf("  unexpected reject: %s\n",
+                   rr && rr->valuestring ? rr->valuestring : "?");
+        }
+        cJSON_Delete(j);
+        TEST_ASSERT(ok_allowed,
+                    "INTERPRETER ACCEPTS hashlock poison with the revealed secret");
+    }
+
+    /* ANTI-VACUITY negative: mangle the witness preimage -> interpreter REJECTS.
+       Proves the hashlock actually gates spendability on-chain (Scenario B). */
+    {
+        int off = -1;
+        for (size_t i = 0; i + 32 <= poison.len; i++)
+            if (memcmp(poison.data + i, secret, 32) == 0) { off = (int)i; break; }
+        TEST_ASSERT(off >= 0, "preimage present in poison witness");
+        unsigned char *mangled = (unsigned char *)malloc(poison.len);
+        memcpy(mangled, poison.data, poison.len);
+        mangled[off] ^= 0xFF;  /* break SHA256(preimage)==H_s, keep 32-byte length */
+        char *mhex = (char *)malloc(poison.len * 2 + 1);
+        hex_encode(mangled, poison.len, mhex);
+        char *p = (char *)malloc(poison.len * 2 + 16);
+        snprintf(p, poison.len * 2 + 16, "[\"%s\"]", mhex);
+        char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+        free(p); free(mhex); free(mangled);
+        TEST_ASSERT(tma != NULL, "testmempoolaccept ran (negative)");
+        cJSON *j = cJSON_Parse(tma); free(tma);
+        TEST_ASSERT(j && cJSON_IsArray(j), "parse testmempoolaccept (negative)");
+        cJSON *r0 = cJSON_GetArrayItem(j, 0);
+        cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+        int still_allowed = allowed && cJSON_IsTrue(allowed);
+        cJSON_Delete(j);
+        TEST_ASSERT(!still_allowed,
+                    "INTERPRETER REJECTS poison with a wrong preimage (hashlock gates)");
+    }
+
+    /* API negative: a secret that doesn't match H_s is refused at build time. */
+    {
+        unsigned char wrong[32]; memcpy(wrong, secret, 32); wrong[0] ^= 0x01;
+        tx_buf_t bad; tx_buf_init(&bad, 64);
+        TEST_ASSERT(factory_build_l_stock_poison_scriptpath(f, leaf, fund_txid_bytes,
+                        (uint32_t)vout, amount, fee, wrong, &bad, NULL) == 0,
+                    "builder REFUSES a secret that doesn't match the committed hash");
+        tx_buf_free(&bad);
+    }
+
+    /* ECONOMIC OUTCOME: broadcast + confirm + the L-stock is redistributed. */
+    {
+        char *p = (char *)malloc(poison.len * 2 + 16);
+        snprintf(p, poison.len * 2 + 16, "\"%s\"", poison_hex);
+        char *srt = regtest_exec(&rt, "sendrawtransaction", p);
+        free(p);
+        TEST_ASSERT(srt != NULL, "sendrawtransaction poison");
+        free(srt);
+        regtest_mine_blocks(&rt, 1, mine_addr);
+
+        unsigned char disp[32]; memcpy(disp, ptxid, 32); reverse_bytes(disp, 32);
+        char ptxid_hex[65]; hex_encode(disp, 32, ptxid_hex);
+        char go[96]; snprintf(go, sizeof(go), "\"%s\" 0", ptxid_hex);
+        char *gor = regtest_exec(&rt, "gettxout", go);
+        TEST_ASSERT(gor != NULL, "gettxout poison vout 0");
+        cJSON *gj = cJSON_Parse(gor); free(gor);
+        TEST_ASSERT(gj, "parse gettxout");
+        cJSON *conf = cJSON_GetObjectItem(gj, "confirmations");
+        cJSON *val = cJSON_GetObjectItem(gj, "value");
+        int confirmed = conf && conf->valueint >= 1;
+        /* value is BTC; per_client is sats. */
+        uint64_t got_sats = val ? (uint64_t)(val->valuedouble * 1e8 + 0.5) : 0;
+        cJSON_Delete(gj);
+        TEST_ASSERT(confirmed, "poison output 0 confirmed on-chain");
+        TEST_ASSERT(got_sats == per_client,
+                    "poison output 0 pays the client its redistributed share");
+        printf("  poison CONFIRMED: %s — %llu sats to each of %zu clients\n",
+               ptxid_hex, (unsigned long long)per_client, n_clients);
+    }
+
+    free(poison_hex);
+    tx_buf_free(&poison);
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* #53-B3a CONSENSUS PROOF: the MULTI-PROCESS poison ceremony (the production signing
+   path: prepare -> init -> per-signer nonce -> untweaked finalize -> per-signer
+   partial-sign -> complete -> assemble-with-secret) produces a Leaf-P poison that the
+   real Bitcoin Core interpreter accepts.  This is what the LSP + clients run over the
+   wire; here we drive both sides in-process with all keypairs. */
+int test_regtest_lstock_poison_ceremony(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
+                "setup n3 {2}");
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0x5C ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock poison");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    size_t n_clients = leaf->n_signers - 1;
+    TEST_ASSERT(leaf->has_l_stock_hash, "leaf carries hashlock");
+
+    unsigned char secret[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, leaf, leaf->l_stock_state_counter, secret),
+                "derive secret");
+
+    unsigned char spk[34];
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk), "build L-stock SPK");
+
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: no regtest node\n");
+        factory_free(f); secp256k1_context_destroy(ctx); free(f); return 1;
+    }
+    regtest_create_wallet(&rt, "ss_lstock_cer");
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)), "mine addr");
+    if (!regtest_fund_from_faucet(&rt, 0.05))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    char addr[128];
+    TEST_ASSERT(derive_p2tr_addr_from_outputkey(&rt, spk + 2, addr, sizeof(addr)),
+                "derive L-stock address");
+    char fund_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, addr, 0.001, fund_txid_hex), "fund L-stock");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    unsigned char fund_txid[32];
+    hex_decode(fund_txid_hex, fund_txid, 32);
+    reverse_bytes(fund_txid, 32);
+    int vout = -1; uint64_t amount = 0;
+    TEST_ASSERT(find_funding_vout(&rt, fund_txid_hex, spk, 34, &vout, &amount), "find vout");
+
+    /* --- drive the multi-process poison ceremony in-process --- */
+    const uint64_t fee = 1000;
+    TEST_ASSERT(factory_session_prepare_poison_tx_leaf(f, leaf_idx, fund_txid,
+                    (uint32_t)vout, amount, fee, NULL), "prepare poison (script-path)");
+    TEST_ASSERT(leaf->poison_is_scriptpath, "prepare set script-path mode");
+    TEST_ASSERT(factory_session_init_node_poison(f, leaf_idx), "init poison session");
+
+    secp256k1_musig_secnonce secnonces[FACTORY_MAX_SIGNERS];
+    for (size_t j = 0; j < leaf->n_signers; j++) {
+        uint32_t participant = leaf->signer_indices[j];
+        unsigned char sk[32]; secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, sk, &kps[participant]), "sk");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]), "pk");
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce, sk, &pk,
+                                           &leaf->keyagg.cache), "poison nonce gen");
+        memset(sk, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce_poison(f, leaf_idx, j, &pubnonce),
+                    "set poison nonce");
+    }
+    TEST_ASSERT(factory_session_finalize_node_poison(f, leaf_idx),
+                "finalize poison nonces (untweaked)");
+    for (size_t j = 0; j < leaf->n_signers; j++) {
+        uint32_t participant = leaf->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &leaf->poison_signing_session),
+                    "poison partial sig");
+        TEST_ASSERT(factory_session_set_partial_sig_poison(f, leaf_idx, j, &psig),
+                    "set poison partial sig");
+    }
+    TEST_ASSERT(factory_session_complete_node_poison(f, leaf_idx),
+                "complete poison ceremony");
+    TEST_ASSERT(leaf->poison_has_agg_sig, "ceremony produced an aggregated sig");
+
+    /* assemble with the revealed secret + prove the interpreter accepts it */
+    tx_buf_t poison; tx_buf_init(&poison, 256);
+    TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, secret, &poison),
+                "assemble poison with secret");
+    char *phex = (char *)malloc(poison.len * 2 + 1);
+    hex_encode(poison.data, poison.len, phex);
+    char *p = (char *)malloc(poison.len * 2 + 16);
+    snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
+    char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+    free(p);
+    TEST_ASSERT(tma != NULL, "testmempoolaccept ran");
+    cJSON *j = cJSON_Parse(tma); free(tma);
+    cJSON *r0 = j ? cJSON_GetArrayItem(j, 0) : NULL;
+    cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+    int ok_allowed = allowed && cJSON_IsTrue(allowed);
+    if (!ok_allowed && r0) {
+        cJSON *rr = cJSON_GetObjectItem(r0, "reject-reason");
+        printf("  ceremony poison rejected: %s\n",
+               rr && rr->valuestring ? rr->valuestring : "?");
+    }
+    if (j) cJSON_Delete(j);
+    TEST_ASSERT(ok_allowed,
+                "INTERPRETER ACCEPTS the MULTI-PROCESS-ceremony Leaf-P poison");
+    printf("  multi-process ceremony poison ACCEPTED (%zu clients)\n", n_clients);
+
+    /* #53 Phase 4a: the STANDALONE persist-driven assembly (raw template fields,
+       no live node) must produce a byte-identical, interpreter-accepted poison —
+       this is exactly the path a client/WT takes from its l_stock_poison_reveals
+       row after a crash/restart, with only the stored template + revealed secret. */
+    tx_buf_t poison_tmpl; tx_buf_init(&poison_tmpl, 256);
+    TEST_ASSERT(factory_assemble_poison_from_template(
+                    leaf->poison_unsigned_tx.data, leaf->poison_unsigned_tx.len,
+                    leaf->poison_agg_sig, secret, leaf->poison_l_stock_hash,
+                    leaf->poison_leaf_script, leaf->poison_leaf_script_len,
+                    leaf->poison_control_block, leaf->poison_control_block_len,
+                    &poison_tmpl),
+                "assemble poison from persisted template");
+    TEST_ASSERT(poison_tmpl.len == poison.len &&
+                memcmp(poison_tmpl.data, poison.data, poison.len) == 0,
+                "from_template byte-identical to with_secret");
+    {
+        char *thex = (char *)malloc(poison_tmpl.len * 2 + 1);
+        hex_encode(poison_tmpl.data, poison_tmpl.len, thex);
+        char *tp = (char *)malloc(poison_tmpl.len * 2 + 16);
+        snprintf(tp, poison_tmpl.len * 2 + 16, "[\"%s\"]", thex);
+        char *tma2 = regtest_exec(&rt, "testmempoolaccept", tp);
+        free(tp);
+        TEST_ASSERT(tma2 != NULL, "testmempoolaccept (template) ran");
+        cJSON *j2 = cJSON_Parse(tma2); free(tma2);
+        cJSON *r2 = j2 ? cJSON_GetArrayItem(j2, 0) : NULL;
+        cJSON *al2 = r2 ? cJSON_GetObjectItem(r2, "allowed") : NULL;
+        int ok2 = al2 && cJSON_IsTrue(al2);
+        if (j2) cJSON_Delete(j2);
+        TEST_ASSERT(ok2, "INTERPRETER ACCEPTS the PERSIST-TEMPLATE-assembled poison");
+        free(thex);
+    }
+    tx_buf_free(&poison_tmpl);
+    /* negative: from_template also refuses a wrong secret (same hash guard) */
+    {
+        unsigned char wrong_t[32]; memcpy(wrong_t, secret, 32); wrong_t[1] ^= 0x02;
+        tx_buf_t bad_t; tx_buf_init(&bad_t, 64);
+        TEST_ASSERT(factory_assemble_poison_from_template(
+                        leaf->poison_unsigned_tx.data, leaf->poison_unsigned_tx.len,
+                        leaf->poison_agg_sig, wrong_t, leaf->poison_l_stock_hash,
+                        leaf->poison_leaf_script, leaf->poison_leaf_script_len,
+                        leaf->poison_control_block, leaf->poison_control_block_len,
+                        &bad_t) == 0,
+                    "from_template REFUSES wrong secret");
+        tx_buf_free(&bad_t);
+    }
+
+    /* negative: assembling with a wrong secret is refused */
+    unsigned char wrong[32]; memcpy(wrong, secret, 32); wrong[0] ^= 0x01;
+    tx_buf_t bad; tx_buf_init(&bad, 64);
+    TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, wrong, &bad) == 0,
+                "assemble REFUSES wrong secret");
+    tx_buf_free(&bad);
+
+    free(phex);
+    tx_buf_free(&poison);
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
+/* #53-B3b CONSENSUS PROOF (old-hash targeting): after a leaf advances to H_new, a
+   poison built for the SUPERSEDED state (override_hash32 = H_old) must spend the OLD
+   state's output validly — even though the node's current hash is now H_new.  This is
+   exactly the trustless recourse: the LSP broadcasts a stale state, the client poisons
+   THAT (old) output.  Proves the override threading + assemble-against-poison_l_stock_hash. */
+int test_regtest_lstock_poison_old_state(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
+                "setup n3 {2}");
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0x7E ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock poison");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    size_t leaf_idx = f->leaf_node_indices[0];
+    factory_node_t *leaf = &f->nodes[leaf_idx];
+    size_t n_clients = leaf->n_signers - 1;
+    TEST_ASSERT(leaf->has_l_stock_hash && leaf->l_stock_state_counter == 0,
+                "state 0 hashlock committed");
+
+    /* Capture the OLD (state 0) secret + hash, and the OLD output's SPK to fund. */
+    unsigned char secret0[32], h0[32], spk_old[34];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, leaf, 0, secret0), "derive secret0");
+    memcpy(h0, leaf->l_stock_hash, 32);
+    TEST_ASSERT(build_l_stock_spk(f, leaf, spk_old), "build old-state SPK");
+
+    /* Simulate the leaf advancing to state 1: counter++ and re-commit H_1. */
+    unsigned char secret1[32];
+    TEST_ASSERT(factory_derive_l_stock_secret(f, leaf, 1, secret1), "derive secret1");
+    leaf->l_stock_state_counter = 1;
+    sha256(secret1, 32, leaf->l_stock_hash);  /* node now at H_1 */
+    TEST_ASSERT(memcmp(h0, leaf->l_stock_hash, 32) != 0, "advance changed the hash");
+
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: no regtest node\n");
+        factory_free(f); secp256k1_context_destroy(ctx); free(f); return 1;
+    }
+    regtest_create_wallet(&rt, "ss_lstock_old");
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)), "mine addr");
+    if (!regtest_fund_from_faucet(&rt, 0.05))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    char addr[128];
+    TEST_ASSERT(derive_p2tr_addr_from_outputkey(&rt, spk_old + 2, addr, sizeof(addr)),
+                "derive OLD L-stock address");
+    char fund_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, addr, 0.001, fund_txid_hex), "fund OLD output");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    unsigned char fund_txid[32];
+    hex_decode(fund_txid_hex, fund_txid, 32);
+    reverse_bytes(fund_txid, 32);
+    int vout = -1; uint64_t amount = 0;
+    TEST_ASSERT(find_funding_vout(&rt, fund_txid_hex, spk_old, 34, &vout, &amount),
+                "find OLD vout");
+
+    /* Prepare the poison for the SUPERSEDED state via the override (H_old). */
+    const uint64_t fee = 1000;
+    TEST_ASSERT(factory_session_prepare_poison_tx_leaf(f, leaf_idx, fund_txid,
+                    (uint32_t)vout, amount, fee, h0 /* override = H_old */),
+                "prepare poison targeting OLD state");
+    TEST_ASSERT(leaf->poison_is_scriptpath, "script-path mode");
+    TEST_ASSERT(memcmp(leaf->poison_l_stock_hash, h0, 32) == 0,
+                "poison records the OLD target hash");
+    TEST_ASSERT(factory_session_init_node_poison(f, leaf_idx), "init poison session");
+
+    secp256k1_musig_secnonce secnonces[FACTORY_MAX_SIGNERS];
+    for (size_t j = 0; j < leaf->n_signers; j++) {
+        uint32_t participant = leaf->signer_indices[j];
+        unsigned char sk[32]; secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, sk, &kps[participant]), "sk");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[participant]), "pk");
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce, sk, &pk,
+                                           &leaf->keyagg.cache), "nonce gen");
+        memset(sk, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce_poison(f, leaf_idx, j, &pubnonce),
+                    "set nonce");
+    }
+    TEST_ASSERT(factory_session_finalize_node_poison(f, leaf_idx), "finalize (untweaked)");
+    for (size_t j = 0; j < leaf->n_signers; j++) {
+        uint32_t participant = leaf->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &leaf->poison_signing_session),
+                    "partial sig");
+        TEST_ASSERT(factory_session_set_partial_sig_poison(f, leaf_idx, j, &psig),
+                    "set partial sig");
+    }
+    TEST_ASSERT(factory_session_complete_node_poison(f, leaf_idx), "complete");
+
+    /* Assemble with the OLD secret (verified against poison_l_stock_hash = H_old). */
+    tx_buf_t poison; tx_buf_init(&poison, 256);
+    TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, secret0, &poison),
+                "assemble with OLD secret");
+    /* the CURRENT-state secret must NOT assemble an old-state poison. */
+    tx_buf_t bad; tx_buf_init(&bad, 64);
+    TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, secret1, &bad) == 0,
+                "current-state secret REFUSED for an old-state poison");
+    tx_buf_free(&bad);
+
+    char *phex = (char *)malloc(poison.len * 2 + 1);
+    hex_encode(poison.data, poison.len, phex);
+    char *p = (char *)malloc(poison.len * 2 + 16);
+    snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
+    char *tma = regtest_exec(&rt, "testmempoolaccept", p);
+    free(p);
+    TEST_ASSERT(tma != NULL, "testmempoolaccept ran");
+    cJSON *jj = cJSON_Parse(tma); free(tma);
+    cJSON *r0 = jj ? cJSON_GetArrayItem(jj, 0) : NULL;
+    cJSON *allowed = r0 ? cJSON_GetObjectItem(r0, "allowed") : NULL;
+    int ok_allowed = allowed && cJSON_IsTrue(allowed);
+    if (!ok_allowed && r0) {
+        cJSON *rr = cJSON_GetObjectItem(r0, "reject-reason");
+        printf("  old-state poison rejected: %s\n",
+               rr && rr->valuestring ? rr->valuestring : "?");
+    }
+    if (jj) cJSON_Delete(jj);
+    TEST_ASSERT(ok_allowed,
+                "INTERPRETER ACCEPTS the OLD-state poison after the leaf advanced");
+    printf("  old-state poison ACCEPTED (override H_old; node at H_1; %zu clients)\n",
+           n_clients);
+
+    free(phex);
+    tx_buf_free(&poison);
     factory_free(f);
     secp256k1_context_destroy(ctx);
     free(f);

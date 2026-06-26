@@ -75,7 +75,20 @@ pkill -f "superscalar_client.*--port $PORT" 2>/dev/null || true
 echo "EXIT=$EXIT" > "$DONE"
 
 if [ "$EXIT" -eq 0 ] && grep -q "PTLC BREACH TEST PASSED" "$LOG"; then
-    echo "=== PASS: TS-PTLC-BREACH ==="
+    set +e
+    # BIP-431 TRUC catch: this is an IN-PROCESS penalty builder (it does not depend on the
+    # penalty landing on-chain), but a zero ptlc_penalty COUNT with no penalty TX means nothing
+    # was actually built — the exact failure a marker-only check passes.
+    # The PTLC-penalty markers for this in-process test are emitted in the CLIENT logs, not the
+    # LSP log — grep both (LSP $LOG + /tmp/ss_rt_${TAG}_c*.log) so the TRUC count check is real.
+    PLOGS="$LOG"; for cl in /tmp/ss_rt_${TAG}_c*.log; do [ -f "$cl" ] && PLOGS="$PLOGS $cl"; done
+    PCNT=$(cat $PLOGS 2>/dev/null | grep -aoiE "ptlc_penalty=[0-9]+" | grep -oE "[0-9]+" | sort -rn | head -1)
+    PEN_TXID=$(cat $PLOGS 2>/dev/null | grep -aoiE "PTLC penalty tx[^0-9a-f]*[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}" | grep -oE "[0-9a-f]{64}" | tail -1)
+    echo "  ptlc_penalty count: ${PCNT:-0}; penalty txid: ${PEN_TXID:-none}"
+    if [ "${PCNT:-0}" -lt 1 ] && [ -z "$PEN_TXID" ]; then
+        echo "=== FAIL: PASSED marker but ptlc_penalty=0 AND no penalty TX built — marker-only false-pass (TRUC zero-value risk) ==="; tail -40 "$LOG"; exit 1
+    fi
+    echo "=== PASS: TS-PTLC-BREACH — ptlc_penalty=${PCNT:-?}, penalty TX ${PEN_TXID:-built} (in-process builder by design; not an on-chain-landing test) ==="
     grep -E "PTLC BREACH|PTLC added|entry registered|penalty TX|safety gate" "$LOG" | head -20
     exit 0
 else

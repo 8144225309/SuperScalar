@@ -208,8 +208,30 @@ echo "=== Final result ==="
 BREACH_DETECTED=$(grep -E "FACTORY BREACH on node|CL2 CHEAT-REALLOC: BREACH DETECTED" "$LSP_LOG" 2>/dev/null | wc -l)
 POISON_BROADCAST=$(grep -E "L-stock burn tx broadcast|poison TX broadcast|penalty.*broadcast" "$LSP_LOG" 2>/dev/null | wc -l)
 
+set +e
 if [ "$BREACH_DETECTED" -ge 1 ] && [ "$POISON_BROADCAST" -ge 1 ]; then
-    echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + broadcast poison (x$POISON_BROADCAST)"
+    # OUTCOME (not just log-greps): confirm the realloc/poison defense txid ON-CHAIN + assert a real redistributed amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE (source LIKE '%realloc%' OR source LIKE '%poison%' OR source LIKE '%penalty%' OR source LIKE '%burn%') AND result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "L-stock burn tx broadcast: *[0-9a-f]{64}|Latest state tx broadcast: *[0-9a-f]{64}|poison TX broadcast[^0-9a-f]*[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: breach detected + poison broadcast logged, but no defense txid found (broadcast_log/breach_detections/log)"; tail -25 "$LSP_LOG"; exit 1; }
+    echo "  defense (realloc/poison) txid: $PEN_TXID — mining to confirm + verify redistribution"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: defense $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    # Finding-2 fix: L-stock realloc REDISTRIBUTES to per-client P2TR outputs — assert the SMALLEST
+    # is above dust ('largest' alone would pass even if one client were shorted to dust).
+    PINFO=$(echo "$PRAW" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); vs=[int(round(v["value"]*1e8)) for v in d["vout"] if v["scriptPubKey"].get("type")=="witness_v1_taproot"]
+ print(min(vs) if vs else 0, len(vs), sum(vs))
+except Exception: print("0 0 0")')
+    PMIN=$(echo "$PINFO" | awk "{print \$1}"); PNUM=$(echo "$PINFO" | awk "{print \$2}"); PTOT=$(echo "$PINFO" | awk "{print \$3}")
+    echo "  defense confirmed on-chain; $PNUM P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
+    [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: defense has no P2TR redistribution output"; exit 1; }
+    [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
+    echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + CONFIRMED redistribution $PEN_TXID ($PNUM outs, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0
 fi

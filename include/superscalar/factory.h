@@ -174,6 +174,44 @@ typedef struct {
     tx_buf_t poison_unsigned_tx;
     tx_buf_t poison_signed_tx;
     int poison_is_signed;
+    /* internal byte order; txid of the poison TX (signed txid == unsigned txid,
+       witness-stripped).  Captured at build time so the trustless wt_db response
+       can be keyed on the poison (G1 #44) without a txid-from-bytes helper. */
+    unsigned char poison_txid[32];
+
+    /* #53 hashlock-gated poison: per-(leaf,state) revocation hash H_s = SHA256(secret_s)
+       committed into THIS leaf state's L-stock output (Leaf P of the taptree).  When
+       has_l_stock_hash==1 the L-stock SPK is the 2-leaf {poison, LSP-CSV} tree and the
+       poison must be spent via the Leaf-P script-path with the revealed secret_s as the
+       witness preimage — so a non-revoked (live) state's poison has no satisfying witness
+       (closes Scenario B).  Set during leaf-state construction when flat secrets are
+       active; the secret_s itself stays LSP-private until revealed on advance. */
+    unsigned char l_stock_hash[32];
+    int has_l_stock_hash;
+    /* #53-B: per-leaf monotonic L-stock state index, bumped every time this
+       leaf's L-stock SPK is (re)built (initial setup + each epoch advance / JIT
+       L-stock change).  Combined with the leaf's agg pubkey it forms the unique
+       per-(leaf, state) secret index, so independently-advancing leaves never
+       collide.  state s's revealed secret is derived at the value this had when
+       state s's L-stock output was built. */
+    uint32_t l_stock_state_counter;
+
+    /* #53-B3a: script-path (Leaf-P) poison ceremony state.  When the leaf carries a
+       hashlock (has_l_stock_hash), the multi-process poison ceremony signs the Leaf-P
+       script path against the UNTWEAKED agg key (not the key path = Scenario B); the
+       aggregated 64-byte sig + these witness components are combined with the revealed
+       secret at broadcast via factory_assemble_poison_with_secret. */
+    int poison_is_scriptpath;
+    int poison_has_agg_sig;
+    unsigned char poison_agg_sig[64];
+    unsigned char poison_leaf_script[128];   /* TAPSCRIPT_MAX_SCRIPT; Leaf-P = 73 bytes */
+    size_t poison_leaf_script_len;
+    unsigned char poison_control_block[65];
+    size_t poison_control_block_len;
+    /* The Leaf-P hash THIS poison was built to spend (the superseded state's H_old,
+       or the node's current hash when poisoning the live output).  assemble verifies
+       the revealed secret against THIS, not l_stock_hash, which may have advanced. */
+    unsigned char poison_l_stock_hash[32];
 
     /* Pseudo-Spilman leaf state (is_ps_leaf == 1 only) */
     int is_ps_leaf;              /* 1 if this leaf uses PS chaining instead of DW nSequence */
@@ -299,6 +337,27 @@ typedef struct {
     unsigned char l_stock_hashes[FACTORY_MAX_EPOCHS][32];
     size_t n_l_stock_hashes;
 
+    /* #53-B: revocation-gated (hashlock) L-stock poison.  When enabled, each
+       leaf state's L-stock output commits H_s = SHA256(secret(leaf, state)) into
+       Leaf P of its taptree (see build_l_stock_taptree).  The secret is derived
+       PER-(leaf, state) from shachain_seed — keyed on the leaf's agg pubkey AND a
+       per-leaf monotonic counter — so revealing one leaf's revoked-state secret
+       can NEVER unlock another leaf's (or a later state's) live poison (the
+       cross-leaf leak of the old global-epoch index).  LSP-private; revealed to
+       the leaf's clients only when the state is superseded (#53-B3). */
+    int use_hashlock_poison;
+
+    /* #53-B3b.2a: CLIENT MIRROR.  The client has no shachain_seed, so it cannot
+       DERIVE the per-(leaf,state) L-stock hash — it receives each leaf node's
+       committed H from the LSP over the wire and stores it here (indexed by node
+       index).  When has_node_l_stock_hashes is set, apply_l_stock_hashlock uses
+       node_l_stock_hashes[idx] (the shipped H) instead of deriving, so the client
+       builds the SAME 2-leaf L-stock SPK as the LSP (else the leaf-state tx bytes
+       diverge and the MuSig co-sign fails). */
+    unsigned char node_l_stock_hashes[FACTORY_MAX_NODES][32];
+    int node_l_stock_hash_valid[FACTORY_MAX_NODES];
+    int has_node_l_stock_hashes;
+
     /* Per-leaf DW layers (for independent leaf advance) */
     dw_layer_t leaf_layers[FACTORY_MAX_LEAVES];
     int n_leaf_nodes;              /* number of leaf state nodes */
@@ -328,6 +387,14 @@ typedef struct {
        script-path leaf, in blocks.  See L_STOCK_CSV_DEFAULT_BLOCKS for
        rationale and default. */
     uint32_t l_stock_csv_blocks;
+
+    /* #56: append a keyless P2A CPFP anchor to every tree node tx so the
+       force-close cascade can be fee-bumped under fee pressure (the shared
+       cascade txs are pre-signed at a fixed fee and otherwise unbumpable).
+       Negotiated like a feature bit -- BOTH the LSP and all clients must build
+       the factory with the SAME value or the tree's co-signed sighashes diverge.
+       Default 0 (raw factory_init / unit / legacy); production sets it on. */
+    int use_tree_anchor;
 
     /* PS sub-factory arity (k) for the canonical k² PS leaf shape from
        t/1242 (docs/ps-subfactories.md, Gap E followup, task #181).
@@ -428,7 +495,8 @@ int factory_build_l_stock_poison_tx_unsigned(
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
     tx_buf_t *poison_tx_out,
-    unsigned char *sighash_out32);
+    unsigned char *sighash_out32,
+    unsigned char *txid_out32);
 
 /* Single-process variant: builds + N-of-N MuSig-co-signs + assembles
    the witness for the L-stock poison TX.  Requires that f->keypairs[]
@@ -443,6 +511,104 @@ int factory_sign_l_stock_poison_tx(
     uint64_t l_stock_amount_sats,
     uint64_t fee_sats,
     tx_buf_t *signed_out);
+
+/* #53-B: enable revocation-gated (hashlock) L-stock poison.  Requires the
+   factory seed to be set first (factory_set_shachain_seed); thereafter every
+   leaf-state L-stock output (initial build + each advance) commits a per-(leaf,
+   state) hash and the key-path poison is refused in favour of the script-path
+   poison.  Returns 1 on success, 0 if no seed is set. */
+int factory_enable_hashlock_poison(factory_t *f);
+
+/* #59 / restart-resume: derive the per-factory L-stock poison MASTER seed
+   deterministically from the LSP's master secret + the factory's funding outpoint:
+   seed = tagged_hash("SS/LStockPoison/seed/v1", master32 || funding_txid32 ||
+   funding_vout_le32).  Deterministic => survives LSP restart + backup-restore
+   (re-derived, never stored as an independent secret — the elite "derive, don't
+   store" rule).  Domain-separated from signing-key use (the tag) and per-factory
+   (the funding outpoint binds it).  Trust-model-invisible: the client only verifies
+   SHA256(secret)==committed H, so the LSP's seed derivation is internal.  One-way:
+   leaking the derived seed never reveals `master32`. */
+void factory_derive_lstock_seed(const unsigned char *master32,
+                                const unsigned char *funding_txid32,
+                                uint32_t funding_vout,
+                                unsigned char *seed_out32);
+
+/* #53-B: derive the LSP-private per-(leaf, state) L-stock revocation secret.
+   secret = tagged_hash("SS/LStockPoison/v1", seed32 || leaf_agg_xonly32 ||
+   state_counter_le32).  Deterministic + crash-recoverable (re-derivable from the
+   persisted seed + the leaf's agg key + the state counter).  The matching hash
+   H_s = SHA256(secret) is what Leaf P commits to; the secret is revealed to the
+   leaf's clients only once state `state_counter` is superseded.  Returns 1 on
+   success, 0 if the factory has no seed. */
+int factory_derive_l_stock_secret(const factory_t *f,
+                                  const factory_node_t *leaf_node,
+                                  uint32_t state_counter,
+                                  unsigned char secret_out32[32]);
+
+/* #53-B3b.2a: CLIENT-side — record the LSP-shipped per-node L-stock hash so the
+   client builds the matching 2-leaf L-stock SPK without the (LSP-private) seed.
+   Call once per leaf node BEFORE factory_build_tree (and update before each advance
+   when the new state's H arrives over the wire).  Sets the factory into mirror mode
+   (apply_l_stock_hashlock then uses these hashes instead of deriving). */
+void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
+                                   const unsigned char *h32);
+
+/* Build the L-stock output scriptPubKey (P2TR) for a leaf state node — the
+   2-leaf {poison, LSP-CSV} taptree when the node carries a per-state hash
+   (#53), else the legacy single LSP-CSV leaf.  Exposed for tests and the
+   reveal/recourse wiring; spk_out34 receives the 34-byte P2TR SPK. */
+int build_l_stock_spk(const factory_t *f, const factory_node_t *leaf_node,
+                      unsigned char *spk_out34);
+
+/* Recovery helper: L-stock taptree merkle root for a leaf/sub node (the taptweak
+   to key-path-spend that L-stock output in an offline residual sweep). */
+int factory_l_stock_merkle(const factory_t *f, const factory_node_t *node,
+                           unsigned char merkle_out32[32]);
+
+/* #53: hashlock-gated L-stock poison over the Leaf-P SCRIPT-path (replaces the
+   key-path poison, which is vulnerable to Scenario B).  Builds the per-client
+   redistribution outputs, N-of-N MuSig-signs the UNtweaked agg key over the
+   Leaf-P script-path sighash, and finalizes a complete consensus-valid witness
+   tx using `secret32` (= the revealed revocation secret) as the hashlock preimage.
+   Requires leaf_node->has_l_stock_hash; fails fast unless SHA256(secret32) equals
+   the leaf's committed l_stock_hash.  Single-process (needs f->keypairs[] for every
+   leaf signer); the multi-process wire ceremony co-signs the same Leaf-P sighash
+   and supplies the preimage at broadcast (#53-B).  `poison_txid_out32` (optional,
+   internal byte order) receives the poison txid. */
+int factory_build_l_stock_poison_scriptpath(
+    factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    const unsigned char *secret32,
+    tx_buf_t *signed_out,
+    unsigned char *poison_txid_out32);
+
+/* #53-B3a: build the unsigned hashlock poison + its Leaf-P script-path sighash and
+   witness components (Leaf-P script, 2-leaf control block), WITHOUT signing.  Used by
+   the multi-process poison ceremony (which signs the sighash via the poison MuSig
+   session) and by the single-process builder above.  The aggregated 64-byte Schnorr
+   sig + the revealed secret are combined with these components at broadcast time via
+   finalize_script_path_tx_preimage.  leaf_p_script_out (>= TAPSCRIPT_MAX_SCRIPT) and
+   control_block_out (>= 65) are optional.  Requires has_l_stock_hash. */
+int factory_build_l_stock_poison_scriptpath_unsigned(
+    const factory_t *f,
+    const factory_node_t *leaf_node,
+    const unsigned char *l_stock_txid32,
+    uint32_t l_stock_vout,
+    uint64_t l_stock_amount_sats,
+    uint64_t fee_sats,
+    const unsigned char *override_hash32,  /* NULL = node's current hash; else the
+                                              superseded state's H_old (#53-B3b) */
+    tx_buf_t *unsigned_tx_out,
+    unsigned char *sighash_out32,
+    unsigned char *poison_txid_out32,
+    unsigned char *leaf_p_script_out,
+    size_t *leaf_p_script_len_out,
+    unsigned char *control_block_out,
+    size_t *control_block_len_out);
 
 /* Cooperative N-of-N spend of an L-stock UTXO to a caller-specified
    output distribution.  The poison TX is a special case of this where
@@ -690,7 +856,8 @@ int factory_node_uses_multi_input(const factory_t *f, size_t node_idx);
 int factory_session_prepare_poison_tx_subfactory(
     factory_t *f, size_t sub_node_idx,
     const unsigned char *old_chain_txid32, uint32_t old_sstock_vout,
-    uint64_t old_sstock_amount_sats, uint64_t fee_sats);
+    uint64_t old_sstock_amount_sats, uint64_t fee_sats,
+    const unsigned char *override_hash32);  /* #53-B3b: superseded state's H_old; NULL = node's current */
 
 /* Same as the subfactory variant but for a DW / PS LEAF node — used by
    the lsp_advance_leaf wire ceremony to bundle a poison TX over the
@@ -698,7 +865,8 @@ int factory_session_prepare_poison_tx_subfactory(
 int factory_session_prepare_poison_tx_leaf(
     factory_t *f, size_t leaf_node_idx,
     const unsigned char *old_leaf_txid32, uint32_t old_l_stock_vout,
-    uint64_t old_l_stock_amount_sats, uint64_t fee_sats);
+    uint64_t old_l_stock_amount_sats, uint64_t fee_sats,
+    const unsigned char *override_hash32);  /* #53-B3b: superseded state's H_old; NULL = node's current */
 int factory_session_init_node_poison(factory_t *f, size_t node_idx);
 int factory_session_set_nonce_poison(factory_t *f, size_t node_idx,
                                        size_t signer_slot,
@@ -708,6 +876,32 @@ int factory_session_set_partial_sig_poison(factory_t *f, size_t node_idx,
                                              size_t signer_slot,
                                              const secp256k1_musig_partial_sig *psig);
 int factory_session_complete_node_poison(factory_t *f, size_t node_idx);
+
+/* #53-B3a: assemble the broadcastable hashlock poison from the ceremony-aggregated
+   sig + the revealed secret (Leaf-P witness preimage).  Only valid for a script-path
+   poison node (poison_is_scriptpath + poison_has_agg_sig) whose secret matches the
+   committed hash.  `out` receives the complete witness tx.  Returns 1 on success. */
+int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
+                                        const unsigned char *secret32,
+                                        tx_buf_t *out);
+
+/* #53 Phase 4a: standalone L-stock poison assembly from PERSISTED template fields
+   (no live factory_node needed) — the crash-resilient / standalone recourse entry
+   point.  A client (or the watchtower it feeds) loads its l_stock_poison_reveals
+   row (unsigned tx + aggregated Leaf-P sig + leaf script + control block + the
+   superseded state's committed hash + the LSP-revealed secret) and assembles the
+   broadcastable witness here.  Verifies SHA256(secret32)==target_hash32
+   (fail-closed) before building [agg_sig, secret, Leaf-P script, control block].
+   factory_assemble_poison_with_secret delegates to this.  Returns 1 on success,
+   0 on hash-mismatch / bad input. */
+int factory_assemble_poison_from_template(
+    const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+    const unsigned char *agg_sig64,
+    const unsigned char *secret32,
+    const unsigned char *target_hash32,
+    const unsigned char *leaf_script, size_t leaf_script_len,
+    const unsigned char *control_block, size_t control_block_len,
+    tx_buf_t *out);
 
 /* Reset poison state on a node (free the unsigned/signed tx buffers + clear
    sighash + reset received counter).  Safe to call on a never-prepared

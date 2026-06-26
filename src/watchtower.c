@@ -714,6 +714,32 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                         persist_save_old_commitment_htlc_sweep(
                             wt->db, channel_id, old_commit_num,
                             wh_h->htlc_vout, sweep.data, sweep.len);
+                        /* G2 #45: mirror the HTLC penalty sweep into wt_db so a
+                           SECRET-LESS standalone WT also sweeps in-flight HTLCs on
+                           a commitment breach (without this it penalizes to_local
+                           but leaks HTLC value).  Keyed on the breach commit txid;
+                           same pattern + sha256_double(resp) txid as the to_local
+                           mirror above. */
+                        if (wt->wt_db && wt->wt_db->db) {
+                            unsigned char h_resp_txid[32];
+                            sha256_double(sweep.data, sweep.len, h_resp_txid);
+                            char *h_hex = (char *)malloc(sweep.len * 2 + 1);
+                            if (h_hex) {
+                                hex_encode(sweep.data, sweep.len, h_hex);
+                                int64_t hwid = persist_wt_register_watch(
+                                    wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
+                                    channel_id, old_txid,
+                                    wh_h->htlc_vout, wh_h->htlc_amount,
+                                    wh_h->htlc_spk, 34,
+                                    ch->to_self_delay,
+                                    h_hex, h_resp_txid, 0, 0);
+                                free(h_hex);
+                                if (hwid <= 0)
+                                    fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                        "HTLC-sweep register failed (ch %u vout %u)\n",
+                                        channel_id, wh_h->htlc_vout);
+                            }
+                        }
                     } else {
                         fprintf(stderr,
                                 "watchtower: failed to build HTLC sweep TX "
@@ -1019,6 +1045,38 @@ int watchtower_check(watchtower_t *wt) {
                     }
                     free(resp_hex);
                 }
+            }
+
+            /* #52: enqueue the factory-node response for CPFP fee-bump monitoring.
+               Hydrated wt_db entries all flatten to WATCH_FACTORY_NODE, and this
+               handler previously never enqueued — so a standalone WT broadcast its
+               response ONCE at the registration feerate and could never bump it,
+               losing the race under fee pressure (proven via SS_HIFEE_GAP). The
+               default RPC wallet (watchtower.c:95) + the existing deadline-aware
+               escalator (watchtower_build_cpfp_tx) do the rest. Mirrors the
+               WATCH_COMMITMENT enqueue; only when the response carries a P2A anchor. */
+            if (factory_resp_txid[0] &&
+                penalty_tx_has_p2a_anchor(e->response_tx, e->response_tx_len) &&
+                wt->anchor_spk_len == P2A_SPK_LEN &&
+                wt->n_pending < wt->pending_cap) {
+                uint32_t fn_cur_h = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
+                watchtower_pending_t *fp = &wt->pending[wt->n_pending++];
+                memcpy(fp->txid, factory_resp_txid, 64); fp->txid[64] = '\0';
+                fp->anchor_vout = 1;
+                fp->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
+                fp->penalty_value = (e->sub_sales_stock_amount > 0)
+                                    ? e->sub_sales_stock_amount
+                                    : e->to_local_amount;
+                fp->csv_delay = (e->csv_delay > 0) ? e->csv_delay : CHANNEL_DEFAULT_CSV_DELAY;
+                fp->start_height = fn_cur_h;
+                fp->cycles_in_mempool = 0;
+                memset(&fp->fee_bump, 0, sizeof(fp->fee_bump));
+                if (wt->db && wt->db->db)
+                    persist_save_pending(wt->db, fp->txid, fp->anchor_vout,
+                                          fp->anchor_amount, 0, 0, fp->penalty_value,
+                                          fp->csv_delay, fp->start_height, 0, 0, 0, 0);
+                printf("  factory-node response %s enqueued for CPFP fee-bump (deadline csv=%u)\n",
+                       factory_resp_txid, fp->csv_delay);
             }
 
             /* Also broadcast burn tx to destroy L-stock */
@@ -1910,8 +1968,8 @@ static int wt_hydrate_row_cb(uint32_t factory_id,
                               uint64_t fee_bump_budget_sat,
                               uint32_t fee_bump_deadline_height,
                               void *user) {
-    (void)parent_vout; (void)parent_value_sat;
-    (void)parent_spk;  (void)parent_spk_len; (void)csv_delay;
+    (void)parent_vout;
+    (void)parent_spk;  (void)parent_spk_len;
     (void)response_txid32;
     (void)fee_bump_budget_sat; (void)fee_bump_deadline_height;
     wt_hydrate_ctx_t *ctx = (wt_hydrate_ctx_t *)user;
@@ -1947,6 +2005,14 @@ static int wt_hydrate_row_cb(uint32_t factory_id,
     memcpy(parent_txid, parent_txid32, 32);
     if (watchtower_watch_factory_node(ctx->wt, factory_id, parent_txid,
                                         resp, resp_len, NULL, 0)) {
+        /* #52: carry the wt_db row's budget basis (parent value) + deadline (csv) onto
+           the just-created entry so the CPFP fee-bump escalator can RAMP. Without this a
+           hydrated entry has to_local_amount=0 -> budget_sat=0 -> max_feerate floors to
+           start_feerate -> the ramp is flat at 1 sat/vB and bumps can't overcome fee
+           pressure (proven: every CPFP child at feerate 1000). */
+        watchtower_entry_t *he = &ctx->wt->entries[ctx->wt->n_entries - 1];
+        he->to_local_amount = parent_value_sat;
+        he->csv_delay = csv_delay;
         ctx->n_loaded++;
     } else {
         fprintf(stderr,

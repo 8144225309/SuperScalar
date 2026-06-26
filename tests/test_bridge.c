@@ -1532,6 +1532,319 @@ static int invoice_flow_cb(int fd, channel_t *ch, uint32_t my_index,
     return 1;
 }
 
+/* ---- External-node OUT direction: a factory user pays a NON-factory node ----
+   Counterpart to test_regtest_bridge_payment (which proves IN: external -> user).
+   Here a factory client offers an HTLC tagged with a bolt11 (no dest_client), so
+   the LSP debits that client and forwards MSG_BRIDGE_SEND_PAY to the bridge (the
+   external world). The external side (the socketpair far end = the "65th node")
+   returns PAY_RESULT, the client's outbound HTLC settles, and its channel balance
+   is debited by exactly the amount. Driven entirely in-process via a socketpair;
+   no production code change. */
+
+typedef struct {
+    int active;                  /* 1 = this client is the OUT sender */
+    uint32_t sender_my_index;    /* 1-based slot of the OUT sender */
+    uint64_t amount_sats;
+    unsigned char payment_hash[32];
+    char bolt11[128];
+} bridge_out_data_t;
+
+static int bridge_out_sender_cb(int fd, channel_t *ch, uint32_t my_index,
+                                secp256k1_context *ctx,
+                                const secp256k1_keypair *keypair,
+                                factory_t *factory, size_t n_participants,
+                                void *user_data) {
+    bridge_out_data_t *d = (bridge_out_data_t *)user_data;
+    (void)keypair; (void)factory; (void)n_participants;
+    if (!d->active || my_index != d->sender_my_index)
+        return 1;  /* idle client: just participate in creation */
+
+    /* Offer an HTLC tagged with a bolt11 (and NO dest_client) so the LSP routes
+       it OUTBOUND to the bridge instead of to another factory leaf. Mirrors
+       client_send_payment but swaps dest_client -> bolt11. */
+    uint64_t htlc_id;
+    if (!channel_add_htlc(ch, HTLC_OFFERED, d->amount_sats, d->payment_hash,
+                           500, &htlc_id)) {
+        fprintf(stderr, "OUT sender %u: channel_add_htlc failed\n", my_index);
+        return 0;
+    }
+    cJSON *msg = wire_build_update_add_htlc(htlc_id, d->amount_sats * 1000,
+                                             d->payment_hash, 500);
+    cJSON_AddStringToObject(msg, "bolt11", d->bolt11);  /* the outbound marker */
+    int ok = wire_send(fd, MSG_UPDATE_ADD_HTLC, msg);
+    cJSON_Delete(msg);
+    if (!ok) { fprintf(stderr, "OUT sender %u: send add_htlc failed\n", my_index); return 0; }
+    printf("OUT sender %u: offered bolt11 HTLC (%llu sats) to bridge\n",
+           my_index, (unsigned long long)d->amount_sats);
+
+    /* COMMITMENT_SIGNED acknowledging the HTLC-bearing commitment. */
+    wire_msg_t m;
+    if (!recv_skip_revocations_bridge(fd, &m)) {
+        fprintf(stderr, "OUT sender %u: recv commit failed\n", my_index); return 0;
+    }
+    if (m.msg_type == MSG_COMMITMENT_SIGNED) {
+        client_handle_commitment_signed(fd, ch, ctx, &m);
+        cJSON_Delete(m.json);
+    } else {
+        fprintf(stderr, "OUT sender %u: expected COMMIT_SIGNED, got 0x%02x\n",
+                my_index, m.msg_type);
+        cJSON_Delete(m.json); return 0;
+    }
+
+    /* Wait for FULFILL (LSP fulfills our outbound HTLC once PAY_RESULT returns). */
+    if (!recv_skip_revocations_bridge(fd, &m)) {
+        fprintf(stderr, "OUT sender %u: recv fulfill failed\n", my_index); return 0;
+    }
+    if (m.msg_type == MSG_UPDATE_FULFILL_HTLC) {
+        uint64_t fid; unsigned char fpi[32];
+        if (wire_parse_update_fulfill_htlc(m.json, &fid, fpi))
+            channel_fulfill_htlc(ch, fid, fpi);
+        printf("OUT sender %u: outbound payment fulfilled by bridge\n", my_index);
+        cJSON_Delete(m.json);
+    } else {
+        fprintf(stderr, "OUT sender %u: expected FULFILL, got 0x%02x\n",
+                my_index, m.msg_type);
+        cJSON_Delete(m.json); return 0;
+    }
+
+    /* COMMITMENT_SIGNED for the fulfill. */
+    if (recv_skip_revocations_bridge(fd, &m)) {
+        if (m.msg_type == MSG_COMMITMENT_SIGNED)
+            client_handle_commitment_signed(fd, ch, ctx, &m);
+        cJSON_Delete(m.json);
+    }
+    return 1;
+}
+
+int test_regtest_bridge_out(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) { printf("  FAIL: regtest not available\n"); return 0; }
+    if (!regtest_create_wallet(&rt, "test_bridge_out")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_bridge_out\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_bridge_out", sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey  pks[5];
+    for (int i = 0; i < 5; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], bridge_seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char tweaked_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) return 0;
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    if (!desc_result) return 0;
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    if (!dstart) { free(desc_result); return 0; }
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen); checksummed_desc[dlen] = '\0';
+    free(desc_result);
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    if (!addr_result) return 0;
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen); fund_addr[alen] = '\0';
+    free(addr_result);
+
+    char mine_addr[128];
+    if (!regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr))) return 0;
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+    TEST_ASSERT(regtest_get_balance(&rt) >= 0.01, "factory setup for funding");
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, funding_txid_hex), "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256]; size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 2; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v, &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) { funding_vout = v; break; }
+    }
+    TEST_ASSERT(funding_amount > 0, "funding amount > 0");
+
+    /* OUT sender = client 0 (1-based my_index 1). It pays an external bolt11. */
+    unsigned char out_preimage[32] = { [0 ... 31] = 0x77 };
+    unsigned char out_hash[32];
+    sha256(out_preimage, 32, out_hash);
+    const uint64_t OUT_AMT = 4000;
+
+    int lsp_port = 19700 + (getpid() % 1000);
+
+    bridge_out_data_t out_data;
+    memset(&out_data, 0, sizeof(out_data));
+    out_data.active = 1;
+    out_data.sender_my_index = 1;       /* client 0 */
+    out_data.amount_sats = OUT_AMT;
+    memcpy(out_data.payment_hash, out_hash, 32);
+    strncpy(out_data.bolt11, "lnbcrt40u1pexternaldest0", sizeof(out_data.bolt11) - 1);
+    bridge_out_data_t idle_data;
+    memset(&idle_data, 0, sizeof(idle_data));
+
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t cpid = fork();
+        if (cpid == 0) {
+            usleep(100000 * (unsigned)(c + 1));
+            secp256k1_context *child_ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, bridge_seckeys[c + 1])) _exit(1);
+            void *cb_data = (c == 0) ? (void *)&out_data : (void *)&idle_data;
+            int ok = client_run_with_channels(child_ctx, &child_kp, "127.0.0.1", lsp_port,
+                                              bridge_out_sender_cb, cb_data, NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = cpid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], lsp_port, 4);
+    int lsp_ok = 1;
+    if (!lsp_accept_clients(lsp)) { fprintf(stderr, "LSP: accept failed\n"); lsp_ok = 0; }
+    if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
+                                            fund_spk, 34, 10, 4, 0)) {
+        fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
+    }
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (lsp_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp->factory, bridge_seckeys[0], 4)) {
+        fprintf(stderr, "LSP: channel init failed\n"); lsp_ok = 0;
+    }
+    if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) { fprintf(stderr, "LSP: basepoints failed\n"); lsp_ok = 0; }
+    if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) { fprintf(stderr, "LSP: send_ready failed\n"); lsp_ok = 0; }
+
+    if (lsp_ok) {
+        /* Socketpair = the bridge link. sv[1] is the EXTERNAL world (the 65th node). */
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { fprintf(stderr, "socketpair failed\n"); lsp_ok = 0; }
+        else {
+            ch_mgr.bridge_fd = sv[0];
+
+            channel_t *ch0 = &ch_mgr.entries[0].channel;
+            uint64_t before_local = ch0->local_amount;
+            uint64_t before_remote = ch0->remote_amount;
+            printf("OUT: client 0 before  local=%llu remote=%llu\n",
+                   (unsigned long long)before_local, (unsigned long long)before_remote);
+
+            /* Step 1: drive the LSP until it forwards the outbound pay to the
+               bridge. The sender's HTLC arrives, the LSP debits + emits
+               MSG_BRIDGE_SEND_PAY on sv[0]. */
+            if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 1)) {
+                fprintf(stderr, "LSP: event loop (emit send_pay) failed\n"); lsp_ok = 0;
+            }
+
+            /* Step 2: the external node receives the pay-out request. */
+            wire_msg_t sp;
+            if (lsp_ok && !wire_recv(sv[1], &sp)) { fprintf(stderr, "external: recv SEND_PAY failed\n"); lsp_ok = 0; }
+            else if (lsp_ok) {
+                TEST_ASSERT_EQ(sp.msg_type, MSG_BRIDGE_SEND_PAY, "external got SEND_PAY (pay-out)");
+                char rb[256]; unsigned char rph[32]; uint64_t rid = 0;
+                wire_parse_bridge_send_pay(sp.json, rb, sizeof(rb), rph, &rid);
+                printf("external (65th node): received pay-out request %llu for bolt11=%s\n",
+                       (unsigned long long)rid, rb);
+                cJSON_Delete(sp.json);
+
+                /* Step 3: external node pays it and returns PAY_RESULT(success). */
+                cJSON *res = wire_build_bridge_pay_result(rid, 1, out_preimage);
+                wire_send(sv[1], MSG_BRIDGE_PAY_RESULT, res);
+                cJSON_Delete(res);
+
+                /* Step 4: drive the LSP to consume PAY_RESULT + fulfill the
+                   sender's outbound HTLC. */
+                if (!lsp_channels_run_event_loop(&ch_mgr, lsp, 1)) {
+                    fprintf(stderr, "LSP: event loop (consume pay_result) failed\n"); lsp_ok = 0;
+                }
+
+                uint64_t after_local = ch0->local_amount;
+                uint64_t after_remote = ch0->remote_amount;
+                printf("OUT: client 0 after   local=%llu remote=%llu\n",
+                       (unsigned long long)after_local, (unsigned long long)after_remote);
+                /* Sender paid OUT_AMT to the external world: the sender's side of
+                   the channel must be debited by exactly OUT_AMT. */
+                int debited = (before_remote - after_remote == OUT_AMT) ||
+                              (before_local - after_local == OUT_AMT);
+                TEST_ASSERT(debited, "OUT sender debited by exactly the pay-out amount");
+                printf("OUT: pay-out accounting verified (-%llu sats left the factory)\n",
+                       (unsigned long long)OUT_AMT);
+            }
+            close(sv[0]); close(sv[1]);
+        }
+    }
+
+    /* Cooperative close (sanity: factory still closes after the pay-out). */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 500;
+        size_t n_total = 5;
+        uint64_t per = close_total / n_total;
+        tx_output_t co[5];
+        for (size_t i = 0; i < n_total; i++) {
+            co[i].amount_sats = per;
+            memcpy(co[i].script_pubkey, fund_spk, 34);
+            co[i].script_pubkey_len = 34;
+        }
+        co[n_total - 1].amount_sats = close_total - per * (n_total - 1);
+        tx_buf_t close_tx; tx_buf_init(&close_tx, 512);
+        if (lsp_run_cooperative_close(lsp, &close_tx, co, n_total, 0)) {
+            char close_hex[close_tx.len * 2 + 1];
+            hex_encode(close_tx.data, close_tx.len, close_hex);
+            char close_txid[65];
+            if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                printf("OUT: cooperative close confirmed (%s)\n", close_txid);
+            }
+        }
+        tx_buf_free(&close_tx);
+    }
+
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    int all_ok = 1;
+    for (int c = 0; c < 4; c++) {
+        int st; waitpid(child_pids[c], &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { fprintf(stderr, "client %d exited bad\n", c); all_ok = 0; }
+    }
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(lsp_ok, "bridge OUT: LSP operations");
+    TEST_ASSERT(all_ok, "bridge OUT: all clients completed");
+    return 1;
+}
+
 int test_regtest_bridge_invoice_flow(void) {
     /* Initialize regtest */
     regtest_t rt;

@@ -150,7 +150,7 @@ diag_on_lsp_death() {
         if command -v bitcoin-cli >/dev/null 2>&1; then
             for net_args in \
                 "-signet -datadir=/var/lib/bitcoind-signet" \
-                "-datadir=/var/lib/bitcoind-testnet4 -rpcuser=testnet4rpc -rpcpassword=testnet4rpcpass123 -rpcport=48332" \
+                "-datadir=/var/lib/bitcoind-testnet4 -rpcuser=testnet4rpc -rpcpassword=$(sed -n 's/^rpcpassword=//p' /var/lib/bitcoind-testnet4/bitcoin.conf 2>/dev/null) -rpcport=48332" \
             ; do
                 echo "=== bitcoin-cli $net_args ==="
                 bitcoin-cli $net_args getblockchaininfo 2>&1 | head -25

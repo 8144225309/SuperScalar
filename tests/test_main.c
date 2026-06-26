@@ -920,6 +920,7 @@ extern int test_htlc_commit_dust_excluded_from_tx(void);
 extern int test_htlc_commit_dust_tx_output_count(void);
 extern int test_htlc_commit_above_dust_counted(void);
 extern int test_htlc_commit_mixed_dust_counted(void);
+extern int test_htlc_commit_cpfp_anchor_present(void);
 /* PR #21 Phase 5: update_fee */
 extern int test_htlc_commit_update_fee_layout(void);
 extern int test_htlc_commit_recv_update_fee_accepts(void);
@@ -1037,6 +1038,9 @@ extern int test_factory_l_stock_with_burn_path(void);
 extern int test_factory_burn_tx_construction(void);
 extern int test_factory_advance_with_shachain(void);
 extern int test_regtest_burn_tx(void);
+extern int test_regtest_lstock_hashlock_poison(void);
+extern int test_regtest_lstock_poison_ceremony(void);
+extern int test_regtest_lstock_poison_old_state(void);
 
 extern int test_channel_key_derivation(void);
 extern int test_channel_commitment_tx(void);
@@ -1117,6 +1121,8 @@ extern int test_regtest_ladder_distribution_fallback(void);
 /* Phase 9: Wire protocol */
 extern int test_wire_pubkey_only_factory(void);
 extern int test_wire_framing(void);
+extern int test_wire_lstock_reveal_round_trip(void);
+extern int test_wire_lstock_reveal_request_round_trip(void);
 extern int test_wire_crypto_serialization(void);
 extern int test_wire_nonce_bundle(void);
 extern int test_wire_psig_bundle(void);
@@ -1138,6 +1144,7 @@ extern int test_regtest_intra_factory_payment(void);
 extern int test_regtest_multi_payment(void);
 extern int test_regtest_multi_payment_arity1(void);
 extern int test_regtest_multi_payment_arity_ps(void);
+extern int test_regtest_scale_payments(void);
 extern int test_regtest_coop_close_all_arities(void);
 extern int test_regtest_force_close_to_remote(void);
 extern int test_regtest_force_close_to_local(void);
@@ -1191,7 +1198,9 @@ extern int test_regtest_lsp_restart_recovery(void);
 
 /* Phase 13: Persistence (SQLite) */
 extern int test_persist_open_close(void);
+extern int test_persist_migration_ladder(void);
 extern int test_persist_ps_subfactory_chain_round_trip(void);
+extern int test_persist_l_stock_poison_round_trip(void);
 extern int test_persist_ps_subfactory_chain_v21_round_trip(void);
 extern int test_persist_ps_leaf_chain_v22_poison_round_trip(void);
 extern int test_ceremony_helpers_save_load(void);
@@ -1226,11 +1235,23 @@ extern int test_persist_wt_no_secrets_in_schema(void);
 extern int test_persist_old_commitment_ptlcs_round_trip(void);
 extern int test_persist_channel_round_trip(void);
 extern int test_persist_revocation_round_trip(void);
+extern int test_channel_revocation_durable_pcp_verify(void);  /* revocation-verify Phase 1 */
+extern int test_channel_revocation_failclosed(void);          /* revocation-verify Phase 2 */
+extern int test_client_verifies_lsp_revocation(void);         /* revocation-verify client side */
+extern int test_cheat_gate(void);                             /* #9 cheat-gate */
+extern int test_lsp_forgery_response_parse(void);             /* item-1 escalation policy parse */
+extern int test_adversarial_keyagg_substitution(void);        /* ADV matrix */
+extern int test_adversarial_final_sig_tamper(void);
+extern int test_adversarial_wrong_message_binding(void);
 extern int test_persist_watchtower_hydrate_round_trip(void);
 extern int test_persist_htlc_round_trip(void);
 extern int test_persist_htlc_delete(void);
 extern int test_persist_factory_round_trip(void);
 extern int test_persist_multi_channel(void);
+/* #327 at-rest field encryption */
+extern int test_persist_hd_seed_encryption_round_trip(void);
+extern int test_persist_encryption_wrong_key_refused(void);
+extern int test_persist_encryption_disabled_is_plaintext(void);
 
 /* Phase 14: CLN Bridge */
 extern int test_bridge_msg_round_trip(void);
@@ -1254,6 +1275,7 @@ extern int test_tor_parse_proxy_arg_edge_cases(void);
 extern int test_tor_socks5_mock(void);
 extern int test_regtest_bridge_nk_handshake(void);
 extern int test_regtest_bridge_payment(void);
+extern int test_regtest_bridge_out(void);
 extern int test_regtest_bridge_invoice_flow(void);
 extern int test_regtest_bridge_payment_n64_mixed_arity(void);
 extern int test_regtest_bridge_payment_n64_mixed_arity_client8(void);
@@ -1422,6 +1444,7 @@ extern int test_regtest_tcp_reconnect(void);
 extern int test_client_watchtower_init(void);
 extern int test_bidirectional_revocation(void);
 extern int test_client_watch_revoked_commitment(void);
+extern int test_adversarial_wt_no_false_penalty(void);        /* ADV Phase 2 */
 extern int test_lsp_revoke_and_ack_wire(void);
 extern int test_factory_node_watch(void);
 extern int test_subfactory_node_watch(void);
@@ -1740,6 +1763,9 @@ extern int test_factory_ps_subfactory_k2_n4(void);
 extern int test_factory_ps_subfactory_chain_extension(void);
 extern int test_factory_ps_subfactory_chain_tx_validity(void);
 extern int test_factory_ps_subfactory_poison_tx_k2_n4(void);
+extern int test_factory_lstock_client_mirror(void);
+extern int test_factory_lstock_seed_derivation(void);
+extern int test_factory_subfactory_lstock_per_state_hash(void);
 extern int test_factory_ps_leaf_build_n64(void);
 extern int test_factory_ps_build_n128(void);
 extern int test_factory_ps_leaf_advance(void);
@@ -2813,6 +2839,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_commit_dust_tx_output_count);
     RUN_TEST(test_htlc_commit_above_dust_counted);
     RUN_TEST(test_htlc_commit_mixed_dust_counted);
+    RUN_TEST(test_htlc_commit_cpfp_anchor_present);
     printf("\n=== PR #21 Phase 5: update_fee ===\n");
     RUN_TEST(test_htlc_commit_update_fee_layout);
     RUN_TEST(test_htlc_commit_recv_update_fee_accepts);
@@ -3051,6 +3078,8 @@ static void run_unit_tests(void) {
     printf("\n=== Wire Protocol (Phase 9) ===\n");
     RUN_TEST(test_wire_pubkey_only_factory);
     RUN_TEST(test_wire_framing);
+    RUN_TEST(test_wire_lstock_reveal_round_trip);
+    RUN_TEST(test_wire_lstock_reveal_request_round_trip);
     RUN_TEST(test_wire_crypto_serialization);
     RUN_TEST(test_wire_nonce_bundle);
     RUN_TEST(test_wire_psig_bundle);
@@ -3068,7 +3097,12 @@ static void run_unit_tests(void) {
 
     printf("\n=== Persistence (Phase 13) ===\n");
     RUN_TEST(test_persist_open_close);
+    RUN_TEST(test_persist_migration_ladder);
+    RUN_TEST(test_persist_hd_seed_encryption_round_trip);
+    RUN_TEST(test_persist_encryption_wrong_key_refused);
+    RUN_TEST(test_persist_encryption_disabled_is_plaintext);
     RUN_TEST(test_persist_ps_subfactory_chain_round_trip);
+    RUN_TEST(test_persist_l_stock_poison_round_trip);
     RUN_TEST(test_persist_ps_subfactory_chain_v21_round_trip);
     RUN_TEST(test_persist_ps_leaf_chain_v22_poison_round_trip);
     /* SF-CEREMONY-HELPERS #199 (wallet team v34 API). */
@@ -3104,6 +3138,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_old_commitment_ptlcs_round_trip);
     RUN_TEST(test_persist_channel_round_trip);
     RUN_TEST(test_persist_revocation_round_trip);
+    RUN_TEST(test_channel_revocation_durable_pcp_verify);
+    RUN_TEST(test_channel_revocation_failclosed);
+    RUN_TEST(test_client_verifies_lsp_revocation);
+    RUN_TEST(test_cheat_gate);
+    RUN_TEST(test_lsp_forgery_response_parse);
+    RUN_TEST(test_adversarial_keyagg_substitution);
+    RUN_TEST(test_adversarial_final_sig_tamper);
+    RUN_TEST(test_adversarial_wrong_message_binding);
     RUN_TEST(test_persist_watchtower_hydrate_round_trip);
     RUN_TEST(test_persist_htlc_round_trip);
     RUN_TEST(test_persist_htlc_delete);
@@ -3284,6 +3326,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_watchtower_init);
     RUN_TEST(test_bidirectional_revocation);
     RUN_TEST(test_client_watch_revoked_commitment);
+    RUN_TEST(test_adversarial_wt_no_false_penalty);
     RUN_TEST(test_lsp_revoke_and_ack_wire);
     RUN_TEST(test_factory_node_watch);
     RUN_TEST(test_subfactory_node_watch);
@@ -3604,6 +3647,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_ps_subfactory_chain_extension);
     RUN_TEST(test_factory_ps_subfactory_chain_tx_validity);
     RUN_TEST(test_factory_ps_subfactory_poison_tx_k2_n4);
+    RUN_TEST(test_factory_lstock_client_mirror);
+    RUN_TEST(test_factory_lstock_seed_derivation);
+    RUN_TEST(test_factory_subfactory_lstock_per_state_hash);
     RUN_TEST(test_factory_ps_leaf_build_n64);
     RUN_TEST(test_factory_ps_build_n128);
     RUN_TEST(test_factory_ps_leaf_advance);
@@ -3873,6 +3919,9 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_factory_tree);
     RUN_TEST(test_regtest_timeout_spend);
     RUN_TEST(test_regtest_burn_tx);
+    RUN_TEST(test_regtest_lstock_hashlock_poison);
+    RUN_TEST(test_regtest_lstock_poison_ceremony);
+    RUN_TEST(test_regtest_lstock_poison_old_state);
     RUN_TEST(test_regtest_channel_unilateral);
     RUN_TEST(test_regtest_channel_penalty);
     RUN_TEST(test_regtest_htlc_success);
@@ -3896,6 +3945,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_multi_payment);
     RUN_TEST(test_regtest_multi_payment_arity1);
     RUN_TEST(test_regtest_multi_payment_arity_ps);
+    RUN_TEST(test_regtest_scale_payments);
 
     printf("\n=== Spendability Gauntlet (All Close Paths × All Arities) ===\n");
     RUN_TEST(test_regtest_coop_close_all_arities);
@@ -3984,6 +4034,7 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Bridge (Phase 14) ===\n");
     RUN_TEST(test_regtest_bridge_nk_handshake);
     RUN_TEST(test_regtest_bridge_payment);
+    RUN_TEST(test_regtest_bridge_out);
     RUN_TEST(test_regtest_bridge_invoice_flow);
     RUN_TEST(test_regtest_bridge_payment_n64_mixed_arity);
     RUN_TEST(test_regtest_bridge_payment_n64_mixed_arity_client8);

@@ -285,6 +285,7 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
         return 0;
     }
     ch->funder_is_local = 0;  /* LSP (remote) is the funder */
+    ch->use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor on commitments (matches LSP side) */
 
     /* Set local basepoints from caller-provided random secrets */
     channel_set_local_basepoints(ch, local_pay_sec32, local_delay_sec32, local_revoc_sec32);
@@ -403,6 +404,53 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
         fprintf(stderr, "Client: wire_send REVOKE_AND_ACK failed (cn=%llu)\n",
                 (unsigned long long)ch->commitment_number);
     return ok;
+}
+
+int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
+                                       const wire_msg_t *msg) {
+    if (!ch || !msg) return 0;
+    uint32_t cid;
+    unsigned char rev_secret[32], next_point[33];
+    if (!wire_parse_revoke_and_ack(msg->json, &cid, rev_secret, next_point))
+        return 0;
+
+    /* At commitment 0 there is no prior LSP commitment to revoke yet. */
+    if (ch->commitment_number == 0) {
+        volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+        for (int i = 0; i < 32; i++) z[i] = 0;
+        return 1;
+    }
+
+    uint64_t old_cn = ch->commitment_number - 1;
+    /* Verify the LSP's secret against the LSP's committed point (secret*G ==
+       committed_PCP). channel_verify_revocation_secret consults the durable
+       record, and the choke point re-verifies on store — fail closed. */
+    if (!channel_verify_revocation_secret(ch, old_cn, rev_secret)) {
+        fprintf(stderr, "Client: INVALID LSP revocation secret (commitment %llu) "
+                "— rejecting (fail-closed)\n", (unsigned long long)old_cn);
+        volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+        for (int i = 0; i < 32; i++) z[i] = 0;
+        return 0;
+    }
+    channel_receive_revocation(ch, old_cn, rev_secret);
+    { volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+      for (int i = 0; i < 32; i++) z[i] = 0; }
+
+    /* Track the LSP's NEXT per-commitment point (carried in this message) so
+       subsequent LSP revocations remain verifiable. The client used to discard
+       this. */
+    secp256k1_pubkey next_pcp;
+    if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_point, 33))
+        channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+    return 1;
+}
+
+int client_parse_forgery_response(const char *s) {
+    if (!s) return -1;
+    if (strcmp(s, "continue") == 0) return LSP_FORGERY_CONTINUE;
+    if (strcmp(s, "halt")     == 0) return LSP_FORGERY_HALT;
+    if (strcmp(s, "close")    == 0) return LSP_FORGERY_CLOSE;
+    return -1;
 }
 
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
@@ -825,6 +873,13 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
 
 /* --- Factory rotation (condensed factory creation without HELLO) --- */
 
+/* Defined below (the initial-creation stateless signing engine).  The
+   rotation re-entry ceremony reuses it so both creation paths speak the
+   same (stateless, #272 default) protocol. */
+static int client_factory_creation_stateless_signing(
+        int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
+        factory_t *factory, uint32_t my_index);
+
 int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 uint32_t my_index,
@@ -938,6 +993,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     factory_out->cltv_timeout = cltv_timeout;
+    factory_out->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory_out->fee_per_tx = fee_per_tx;
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
@@ -969,6 +1025,47 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         return 0;
     }
 
+    /* Verify distribution amounts BEFORE any ceremony round: if the LSP
+       provided per-client dist_amounts, this client's allocation must be at
+       least its old channel balance.  Prevents the LSP from silently reducing
+       the client's distribution output during rotation (balance theft).
+       Protocol-agnostic — applies to the stateless AND legacy paths. */
+    if (rot_n_dist_amounts > 0 && my_index >= 1) {
+        size_t ci = my_index - 1;  /* client index in dist_amounts array */
+        uint64_t offered = (ci < rot_n_dist_amounts) ? rot_dist_amounts[ci] : 0;
+        uint64_t expected = channel_out->local_amount;  /* client's balance */
+        if (offered < expected) {
+            fprintf(stderr, "Client %u: REFUSING rotation — distribution amount "
+                    "%llu < channel balance %llu (balance theft attempt)\n",
+                    my_index, (unsigned long long)offered,
+                    (unsigned long long)expected);
+            return 0;
+        }
+    }
+
+    /* #332 rotation crash-drill finding: this re-entry ceremony previously
+       spoke ONLY the legacy nonce-pool protocol (NONCE_BUNDLE 0x11 /
+       ALL_NONCES / PSIG_BUNDLE), which the stateless LSP rejects
+       ("LSP-stateless: expected CLIENT_PUBNONCES, got 0x11") — so production
+       rotation Phase C could never create the new factory against current
+       clients.  Mirror the initial-creation branch (client_run_with_channels):
+       stateless engine by default, legacy pool path only under
+       SS_MUSIG_LEGACY=1 (#272). */
+    int rot_stateless = 1;
+    {
+        const char *legacy = getenv("SS_MUSIG_LEGACY");
+        rot_stateless = !(legacy && legacy[0] == '1');
+    }
+    /* Hoisted so the post-ceremony tail's error paths can free on either
+       path (the stateless arm leaves them NULL; free(NULL) is a no-op). */
+    secp256k1_musig_secnonce *secnonces = NULL;
+    wire_bundle_entry_t *nonce_entries = NULL;
+
+    if (rot_stateless) {
+        if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
+                                                        factory_out, my_index))
+            return 0;
+    } else {
     /* Generate nonces */
     unsigned char my_seckey[32];
     secp256k1_keypair_sec(ctx, my_seckey, keypair);
@@ -978,9 +1075,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (factory_find_signer_slot(factory_out, i, my_index) >= 0)
             my_node_count++;
 
-    secp256k1_musig_secnonce *secnonces =
+    secnonces =
         (secp256k1_musig_secnonce *)calloc(my_node_count, sizeof(secp256k1_musig_secnonce));
-    wire_bundle_entry_t *nonce_entries =
+    nonce_entries =
         (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
     if (my_node_count > 0 && (!secnonces || !nonce_entries)) {
         free(secnonces); free(nonce_entries);
@@ -1010,24 +1107,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         nonce_count++;
     }
 
-    /* Verify distribution amounts: if the LSP provided per-client dist_amounts,
-       check that this client's allocation is at least its old channel balance.
-       Prevents the LSP from silently reducing the client's distribution output
-       during rotation (balance theft). */
-    if (rot_n_dist_amounts > 0 && my_index >= 1) {
-        size_t ci = my_index - 1;  /* client index in dist_amounts array */
-        uint64_t offered = (ci < rot_n_dist_amounts) ? rot_dist_amounts[ci] : 0;
-        uint64_t expected = channel_out->local_amount;  /* client's balance */
-        if (offered < expected) {
-            fprintf(stderr, "Client %u: REFUSING rotation — distribution amount "
-                    "%llu < channel balance %llu (balance theft attempt)\n",
-                    my_index, (unsigned long long)offered,
-                    (unsigned long long)expected);
-            return 0;
-        }
-    }
-
-    /* Distribution TX: build unsigned TX and generate nonce (same as initial) */
+    /* Distribution TX: build unsigned TX and generate nonce (same as initial)
+       — legacy path only; the stateless engine covers dist via the same
+       mechanism as initial creation.  (Theft check moved above the branch.) */
     int rot_has_dist = 0;
     uint32_t rot_dist_node_idx = (uint32_t)factory_out->n_nodes;
     musig_signing_session_t rot_dist_session;
@@ -1162,6 +1244,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         cJSON_Delete(bundle); free(psig_entries);
         if (!ok) { free(secnonces); free(nonce_entries); return 0; }
     }
+    } /* end legacy (SS_MUSIG_LEGACY=1) rotation ceremony */
 
     /* Receive FACTORY_READY */
     if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
@@ -1459,7 +1542,7 @@ static int client_factory_creation_stateless_signing(
     }
     unsigned char *lsp_pn_per_node = calloc(nn, 66);
     unsigned char *lsp_psig_per_node = calloc(nn, 32);
-    size_t mtx_stride = (size_t)FACTORY_MAX_SIGNERS * 66;
+    size_t mtx_stride = (size_t)factory->n_participants * 66;  /* match LSP: tight stride = actual signer count */
     unsigned char *all_pn = calloc(nn, mtx_stride);
     uint32_t got_matrix_len = 0;
     if (!lsp_pn_per_node || !lsp_psig_per_node || !all_pn) {
@@ -1507,7 +1590,7 @@ static int client_factory_creation_stateless_signing(
             for (size_t snum = 0; snum < ns; snum++) {
                 if (snum == (size_t)my_slot[nidx] || snum == (size_t)lsp_slot) continue;
                 const unsigned char *pn_ser =
-                    all_pn + (nidx * (size_t)FACTORY_MAX_SIGNERS + snum) * 66;
+                    all_pn + (nidx * (size_t)factory->n_participants + snum) * 66;
                 secp256k1_musig_pubnonce pn_s;
                 if (!musig_pubnonce_parse(ctx, &pn_s, pn_ser) ||
                     !factory_session_set_nonce(factory, nidx, snum, &pn_s)) {
@@ -1821,6 +1904,28 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
 
+    /* #53-B3b: per-NODE L-stock hashes (present when the LSP runs hashlock poison).
+       Parsed here into temp arrays (survive cJSON_Delete); applied to the factory
+       after factory_init + before build_tree so the client builds the matching
+       2-leaf L-stock SPK without the (LSP-private) seed. */
+    uint32_t *parsed_node_h_idx = (uint32_t *)calloc(FACTORY_MAX_NODES, sizeof(uint32_t));
+    unsigned char (*parsed_node_h)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_NODES, 32);
+    size_t n_node_h = 0;
+    cJSON *nlsh_arr = cJSON_GetObjectItem(msg.json, "node_l_stock_hashes");
+    if (parsed_node_h_idx && parsed_node_h && nlsh_arr && cJSON_IsArray(nlsh_arr)) {
+        int nn = cJSON_GetArraySize(nlsh_arr);
+        for (int i = 0; i < nn && n_node_h < FACTORY_MAX_NODES; i++) {
+            cJSON *o = cJSON_GetArrayItem(nlsh_arr, i);
+            cJSON *no = o ? cJSON_GetObjectItem(o, "node") : NULL;
+            cJSON *hh = o ? cJSON_GetObjectItem(o, "h") : NULL;
+            if (no && cJSON_IsNumber(no) && hh && cJSON_IsString(hh) &&
+                hex_decode(hh->valuestring, parsed_node_h[n_node_h], 32) == 32) {
+                parsed_node_h_idx[n_node_h] = (uint32_t)no->valuedouble;
+                n_node_h++;
+            }
+        }
+    }
+
     cJSON_Delete(msg.json);
 
     /* Verify funding TX on-chain before signing anything.  If the caller
@@ -1862,6 +1967,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     factory->cltv_timeout = cltv_timeout;
+    factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory->fee_per_tx = fee_per_tx;
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
@@ -1919,6 +2025,13 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (n_parsed_hashes > 0)
         factory_set_l_stock_hashes(factory, parsed_l_stock_hashes, n_parsed_hashes);
     free(parsed_l_stock_hashes);
+    /* #53-B3b: mirror the LSP's per-node L-stock hashes onto our nodes BEFORE
+       build_tree, so the client builds the SAME 2-leaf L-stock SPK (it has no seed
+       to derive them).  Inert when the LSP didn't ship any (hashlock off). */
+    for (size_t nh = 0; nh < n_node_h; nh++)
+        factory_set_node_l_stock_hash(factory, parsed_node_h_idx[nh], parsed_node_h[nh]);
+    free(parsed_node_h_idx);
+    free(parsed_node_h);
     factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
@@ -2505,7 +2618,8 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
         if (factory_session_prepare_poison_tx_leaf(
                 factory, pre_node_idx_r,
                 pre_old_leaf_txid_r, (uint32_t)(pre_old_n_outputs_r - 1),
-                pre_old_l_amount_r, REALLOC_POISON_FEE_SATS)) {
+                pre_old_l_amount_r, REALLOC_POISON_FEE_SATS,
+                NULL /* #53-B3b: client mirrors LSP; daemon hashlock off -> key-path */)) {
             realloc_poison_prepared = 1;
         }
     }
@@ -2757,16 +2871,20 @@ static int client_handle_subfactory_advance_stateless_multi(
        Snapshot the OLD chain[N-1] state BEFORE advance_unsigned mutates it. */
     const uint64_t POISON_FEE_SATS = 1000;
     int poison_prepared_c = 0;
+    /* #53 Phase 3: economic poison requirement (decoupled from prep), used by the
+       fail-closed guard below — the OLD sub state has a non-dust sales-stock to protect. */
+    int poison_required_c = 0;
     {
         size_t old_n_chans = (sub->n_outputs > 0) ? sub->n_outputs - 1 : 0;
         uint64_t old_sstock = (sub->n_outputs > 0)
             ? sub->outputs[sub->n_outputs - 1].amount_sats : 0;
-        if (old_sstock > POISON_FEE_SATS + (uint64_t)old_n_chans * 330u) {
+        poison_required_c = (old_sstock > POISON_FEE_SATS + (uint64_t)old_n_chans * 330u);
+        if (poison_required_c) {
             unsigned char old_chain_txid[32];
             memcpy(old_chain_txid, sub->txid, 32);
             if (factory_session_prepare_poison_tx_subfactory(
                     factory, sub_node_i, old_chain_txid, (uint32_t)old_n_chans,
-                    old_sstock, POISON_FEE_SATS))
+                    old_sstock, POISON_FEE_SATS, NULL))
                 poison_prepared_c = 1;
         }
     }
@@ -3062,6 +3180,19 @@ static int client_handle_subfactory_advance_stateless_multi(
         }
     }
 
+    /* #53 Phase 3 fail-closed: hashlock ON + a sales-stock poison was economically
+       REQUIRED but NOT co-signed -> do NOT ship FINAL.  Shipping would revoke the old
+       sub state with no recourse against a cheating LSP that later broadcasts it
+       (Scenario B at the sub level).  Stay on the old, still-recourse-able state.
+       Mirrors the leaf client guard (client.c ~3947); non-hashlock subs unaffected.
+       goto fail handles every free + the poison reset cleanly. */
+    if (sub->has_l_stock_hash && poison_required_c && !poison_prepared_c) {
+        fprintf(stderr, "Client-stateless MULTI %u: hashlock ON + sales-stock poison "
+                        "REQUIRED but NOT co-signed -- ABORTING sub-advance (no revoke "
+                        "without recourse)\n", my_index);
+        goto fail;
+    }
+
     free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
     free(my_secnonces);  /* all entries already zeroed by create_partial_sig */
 
@@ -3076,17 +3207,112 @@ static int client_handle_subfactory_advance_stateless_multi(
         return 0;
     }
     cJSON_Delete(fp_json);
-    if (poison_prepared_c) factory_session_reset_poison(factory, sub_node_i);
 
-    /* Wait for DONE. */
+    /* Wait for DONE.  #53: when this advance co-signed a script-path (hashlock) poison,
+       DONE carries the LSP's AGGREGATED poison Schnorr sig -- the client cannot aggregate
+       the N-party sub poison locally (unlike the 2-party leaf, which calls
+       factory_session_complete_node_poison itself).  Capture it BEFORE persisting the
+       recourse template; the secret follows in the reveal. */
     wire_msg_t done_msg;
     if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_SUBFACTORY_DONE) {
         fprintf(stderr, "Client-stateless MULTI %u: expected DONE, got 0x%02x\n",
                 my_index, done_msg.json ? done_msg.msg_type : 0);
         if (done_msg.json) cJSON_Delete(done_msg.json);
+        if (poison_prepared_c) factory_session_reset_poison(factory, sub_node_i);
         return 0;
     }
+    if (sub->poison_is_scriptpath) {
+        unsigned char agg64[64];
+        if (wire_subfactory_done_get_poison_aggsig(done_msg.json, agg64)) {
+            /* #53 verify-before-trust: the N-party sub poison agg-sig comes from the LSP
+               over the wire (the client can't aggregate it locally).  VERIFY it against
+               OUR own poison sighash + the untweaked sub agg key BEFORE persisting it as
+               recourse -- else a malicious LSP (or a bad co-signer partial that the LSP
+               aggregated) could hand us a WORTHLESS sig, silently neutering recourse for
+               the superseded state.  The poison session is finalized + un-reset here, so
+               its cache is the raw agg key and msg32 is the poison sighash (mirrors the
+               leaf LSP verify at lsp_channels.c ~1782). */
+            secp256k1_pubkey ppk; secp256k1_xonly_pubkey pxpk;
+            if (secp256k1_musig_pubkey_get(ctx, &ppk, &sub->poison_signing_session.cache) &&
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &pxpk, NULL, &ppk) &&
+                secp256k1_schnorrsig_verify(ctx, agg64,
+                                            sub->poison_signing_session.msg32, 32, &pxpk)) {
+                memcpy(sub->poison_agg_sig, agg64, 64);
+                sub->poison_has_agg_sig = 1;
+            } else {
+                fprintf(stderr, "Client-stateless MULTI %u: LSP-supplied sub poison agg-sig "
+                        "FAILED verify -- NOT persisting (recourse for the superseded sub "
+                        "state is unavailable; LSP or a co-signer misbehaved)\n", my_index);
+            }
+        }
+    }
     if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    /* #59/#53 Phase 2: the advance is committed + the old sub state superseded.  Persist
+       the poison TEMPLATE now (agg-sig from DONE; revocation_secret still NULL), BEFORE
+       awaiting the reveal that may never arrive (LSP crash / dropped link), so a restart
+       can detect the missing secret and re-request it (0x8D).  Keyed by node_idx +
+       superseded state.  Do NOT reset the poison session yet -- the template persist + the
+       reveal persist below read sub->poison_* (the next advance's prep resets it,
+       mirroring the leaf client). */
+    persist_t *persist = g_client_persist;
+    if (persist && sub->poison_is_scriptpath && sub->poison_has_agg_sig) {
+        uint32_t superseded_state = (sub->l_stock_state_counter > 0)
+                                    ? sub->l_stock_state_counter - 1u : 0u;
+        persist_save_l_stock_poison(persist, /* factory_id */ 0,
+            (uint32_t)sub_node_i, superseded_state, sub->poison_l_stock_hash,
+            sub->poison_agg_sig,
+            sub->poison_unsigned_tx.data, sub->poison_unsigned_tx.len,
+            sub->poison_leaf_script, sub->poison_leaf_script_len,
+            sub->poison_control_block, sub->poison_control_block_len);
+    }
+
+    /* #53 Phase 2: receive + verify + persist the SUPERSEDED sub state's sales-stock
+       revocation secret, so this client (or its standalone WT) can spend the Leaf-P sub
+       poison if the LSP later broadcasts that stale sub state.  Recv whenever we prepped a
+       script-path poison (hashlock on) -- the EXACT mirror of the LSP's reveal-send gate
+       (use_hashlock_poison && poison_prepared) -- so the wire stays in sync even if the
+       agg-sig was somehow absent from DONE; the persist below additionally requires the
+       agg-sig.  Verify-before-persist (fail-closed), mirroring the leaf path (~3999). */
+    if (sub->poison_is_scriptpath) {
+        wire_msg_t rev_msg;
+        if (wire_recv(fd, &rev_msg) && rev_msg.msg_type == MSG_LSTOCK_REVEAL) {
+            uint32_t rn[1], rs[1];
+            unsigned char rsec[1][32];
+            size_t rcount = 0;
+            if (wire_parse_lstock_reveal(rev_msg.json, rn, rs, rsec, 1, &rcount) &&
+                rcount == 1) {
+                unsigned char chk[32];
+                sha256(rsec[0], 32, chk);
+                if (persist && sub->poison_has_agg_sig &&
+                    memcmp(chk, sub->poison_l_stock_hash, 32) == 0) {
+                    persist_save_l_stock_poison(persist, /* factory_id */ 0,
+                        (uint32_t)sub_node_i, rs[0], sub->poison_l_stock_hash,
+                        sub->poison_agg_sig,
+                        sub->poison_unsigned_tx.data, sub->poison_unsigned_tx.len,
+                        sub->poison_leaf_script, sub->poison_leaf_script_len,
+                        sub->poison_control_block, sub->poison_control_block_len);
+                    persist_update_l_stock_secret(persist, 0, (uint32_t)sub_node_i, rs[0],
+                                                  rsec[0]);
+                    printf("Client-stateless MULTI %u: sub L-stock secret verified + "
+                           "persisted (node %zu state %u) -> poison recourse durable\n",
+                           my_index, sub_node_i, rs[0]);
+                } else {
+                    fprintf(stderr, "Client-stateless MULTI %u: sub L-stock reveal FAILED "
+                            "verify (SHA256 != committed H_old) -- rejecting (LSP "
+                            "misbehaving)\n", my_index);
+                }
+                memset(rsec, 0, sizeof(rsec));
+            }
+            if (rev_msg.json) cJSON_Delete(rev_msg.json);
+        } else {
+            if (rev_msg.json) cJSON_Delete(rev_msg.json);
+            fprintf(stderr, "Client-stateless MULTI %u: expected MSG_LSTOCK_REVEAL after "
+                    "DONE -- recourse for the superseded sub state NOT persisted\n",
+                    my_index);
+        }
+    }
+    if (poison_prepared_c) factory_session_reset_poison(factory, sub_node_i);
 
     printf("Client-stateless subfactory MULTI-INPUT %u: advance done (sub_node=%zu, n_inputs=%zu)\n",
            my_index, sub_node_i, n_inputs);
@@ -3125,6 +3351,21 @@ static int client_handle_subfactory_advance_stateless(int fd,
     size_t sub_node_i = (size_t)sub_node_id;
     factory_node_t *sub = &factory->nodes[sub_node_i];
 
+    /* #53 sub-factory hashlock: mirror the sub's NEW-state H from PROPOSE_INTENT (the
+       client has no seed) BEFORE the local sub-advance.  Both single- and multi-input
+       paths route through factory_subfactory_chain_advance_unsigned -> Phase 0, which
+       reads this via apply_l_stock_hashlock's client-mirror branch to build the SAME
+       sales-stock SPK as the LSP (else the chain tx diverges + the co-sign fails).
+       Set here, not in poison-prep: factory_set_node_l_stock_hash updates only
+       f->node_l_stock_hashes[], NOT sub->l_stock_hash, so the poison-prep below still
+       snapshots H_old.  Absent field (hashlock off) -> no-op.  Mirrors leaf client.c ~3607. */
+    {
+        cJSON *lh = cJSON_GetObjectItem(propose_msg->json, "l_stock_hash");
+        unsigned char h_new[32];
+        if (lh && cJSON_IsString(lh) && hex_decode(lh->valuestring, h_new, 32) == 32)
+            factory_set_node_l_stock_hash(factory, sub_node_i, h_new);
+    }
+
     /* Phase 1e.1.e: MULTI-INPUT now runs through the STATELESS path too.
        Dispatch to the looped-per-input handler; single-input keeps the
        existing flow below. */
@@ -3132,6 +3373,23 @@ static int client_handle_subfactory_advance_stateless(int fd,
         return client_handle_subfactory_advance_stateless_multi(
             fd, ctx, keypair, factory, my_index, sub_node_i, sub,
             n_inputs, leaf_side, sub_idx, channel_idx, delta_sats);
+    }
+
+    /* #53 fail-closed downgrade guard: the hashlock sales-stock poison is wired ONLY in
+       the multi-input ceremony.  A real sub-advance is always multi-input, so an honest
+       LSP never sends a single-input PROPOSE_INTENT for a hashlock sub.  Refuse here so a
+       MALICIOUS LSP cannot force the single-input path (which has no fail-closed guard /
+       reveal) to make this client revoke the old sub state without recourse. */
+    /* NOTE: use sub->has_l_stock_hash, NOT factory->use_hashlock_poison -- the latter is
+       LSP-only (set by factory_enable_hashlock_poison); the client learns hashlock is on
+       purely from the LSP-shipped per-node hash that apply_l_stock_hashlock mirrored onto
+       sub->has_l_stock_hash at factory build.  This is also why the multi-input client
+       guard keys on has_l_stock_hash. */
+    if (sub->has_l_stock_hash) {
+        fprintf(stderr, "Client-stateless subfactory %u: hashlock poison ON but LSP sent a "
+                        "single-input PROPOSE_INTENT -- REFUSING (downgrade attempt; "
+                        "hashlock sub poison is multi-input only)\n", my_index);
+        return 0;
     }
 
     /* k>=2 (multi-client sub-factory) is supported: the LSP forwards the full
@@ -3158,7 +3416,7 @@ static int client_handle_subfactory_advance_stateless(int fd,
             memcpy(old_chain_txid, sub->txid, 32);
             if (factory_session_prepare_poison_tx_subfactory(
                     factory, sub_node_i, old_chain_txid, (uint32_t)old_n_chans,
-                    old_sstock, POISON_FEE_SATS)) {
+                    old_sstock, POISON_FEE_SATS, NULL)) {
                 poison_prepared_c = 1;  /* init_node_poison after state init */
             }
         }
@@ -3480,6 +3738,25 @@ static int client_handle_leaf_advance_stateless(int fd,
         }
     }
 
+    /* #53-B3b Phase 1: capture the OLD state's L-stock hash (H_old) BEFORE the local
+       advance rebuilds the SPK to H_new — used as the poison override so the poison
+       targets the SUPERSEDED state's output. */
+    unsigned char old_l_stock_hash_c[32];
+    int have_old_l_hash_c = ps_node->has_l_stock_hash;
+    if (have_old_l_hash_c)
+        memcpy(old_l_stock_hash_c, ps_node->l_stock_hash, 32);
+
+    /* #53-B3b Phase 1: mirror the advancing leaf's NEW-state hash from PROPOSE (the
+       client has no seed) so the local advance builds the IDENTICAL new leaf-state SPK
+       as the LSP — else the MuSig co-sign of the new state mismatches.  Absent field
+       (hashlock off) -> no-op. */
+    {
+        cJSON *lh = cJSON_GetObjectItem(propose_msg->json, "l_stock_hash");
+        unsigned char h_new[32];
+        if (lh && cJSON_IsString(lh) && hex_decode(lh->valuestring, h_new, 32) == 32)
+            factory_set_node_l_stock_hash(factory, node_idx, h_new);
+    }
+
     /* Step 1: advance local state to mirror the LSP. */
     int rc = factory_advance_leaf_unsigned(factory, leaf_side);
     if (rc <= 0) {
@@ -3513,13 +3790,20 @@ static int client_handle_leaf_advance_stateless(int fd,
        the LSP won'''t send poison fields back. */
     const uint64_t LEAF_POISON_FEE_SATS_C = 1000;
     int leaf_poison_prepared_c = 0;
-    if (had_old_signed_c && old_n_outputs_c >= 2 &&
+    /* #53 Phase 5: capture WHETHER a poison is economically required (the old
+       state has a protectable, non-dust L-stock output) so the fail-closed guard
+       below can tell "poison failed/degraded" (must abort) apart from "no poison
+       was ever needed" (dust / no old state -> safe to advance, do not abort). */
+    int poison_required_c = (had_old_signed_c && old_n_outputs_c >= 2 &&
         old_l_amount_c > LEAF_POISON_FEE_SATS_C +
-                         (uint64_t)(ps_node->n_signers - 1) * 330u) {
+                         (uint64_t)(ps_node->n_signers - 1) * 330u);
+    if (poison_required_c) {
         if (factory_session_prepare_poison_tx_leaf(
                 factory, node_idx,
                 old_leaf_txid, (uint32_t)(old_n_outputs_c - 1),
-                old_l_amount_c, LEAF_POISON_FEE_SATS_C)) {
+                old_l_amount_c, LEAF_POISON_FEE_SATS_C,
+                /* #53-B3b Phase 1: target the SUPERSEDED state's output (H_old). */
+                have_old_l_hash_c ? old_l_stock_hash_c : NULL)) {
             leaf_poison_prepared_c = 1;
         }
     }
@@ -3782,6 +4066,24 @@ static int client_handle_leaf_advance_stateless(int fd,
         leaf_poison_prepared_c = 0;
     }
 
+    /* #53 Phase 5 (B4): SECURITY-CRITICAL.  Shipping FINAL hands the LSP a
+       complete new-state signature, revoking the old state.  When this leaf
+       carries a hashlock (has_l_stock_hash => hashlock poison is on), REFUSE to
+       ship FINAL unless the Leaf-P poison for the superseded state was fully
+       co-signed (leaf_poison_prepared_c still set after every co-sign step).
+       Revoking the old state without that poison would leave this client with NO
+       recourse against a cheating LSP that later broadcasts the superseded state
+       (Scenario A/B) — the exact hole #53 closes.  Fail-closed: stay on the old,
+       still-recourse-able state.  Subsumes every degrade site above + the case
+       where prep never ran.  Non-hashlock leaves are unaffected. */
+    if (ps_node->has_l_stock_hash && poison_required_c && !leaf_poison_prepared_c) {
+        fprintf(stderr, "Client-stateless %u: hashlock ON + L-stock poison REQUIRED "
+                        "but NOT co-signed -- ABORTING advance (no revoke without "
+                        "recourse)\n", my_index);
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
     /* Step 8: ship FINAL with optional poison sig. */
     cJSON *fin_json = wire_build_leaf_advance_final(
         final_sig,
@@ -3793,6 +4095,24 @@ static int client_handle_leaf_advance_stateless(int fd,
     }
     cJSON_Delete(fin_json);
 
+    /* #59 Phase 1: FINAL is sent — the advance is committed and the old state is
+       superseded.  Persist the poison TEMPLATE now (revocation_secret stays NULL),
+       BEFORE we await DONE + the reveal that may never arrive (LSP crash / dropped
+       link).  Without this, a never-revealed advance leaves NO row, so a restart
+       cannot even detect the missing secret to re-request it (residual no-poison
+       window).  Saved AFTER the commit so an aborted advance never persists a
+       spurious poison.  Idempotent (INSERT OR REPLACE) with the reveal-time save. */
+    if (persist && ps_node->poison_is_scriptpath && ps_node->poison_has_agg_sig) {
+        uint32_t superseded_state = (ps_node->l_stock_state_counter > 0)
+                                    ? ps_node->l_stock_state_counter - 1u : 0u;
+        persist_save_l_stock_poison(persist, /* factory_id */ 0,
+            (uint32_t)node_idx, superseded_state, ps_node->poison_l_stock_hash,
+            ps_node->poison_agg_sig,
+            ps_node->poison_unsigned_tx.data, ps_node->poison_unsigned_tx.len,
+            ps_node->poison_leaf_script, ps_node->poison_leaf_script_len,
+            ps_node->poison_control_block, ps_node->poison_control_block_len);
+    }
+
     /* Step 9: wait for LEAF_ADVANCE_DONE (LSP's broadcast). */
     wire_msg_t done_msg;
     if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_LEAF_ADVANCE_DONE) {
@@ -3802,6 +4122,48 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
     if (done_msg.json) cJSON_Delete(done_msg.json);
+
+    /* #53-B3b Phase 2: receive + verify + persist the SUPERSEDED state's L-stock
+       revocation secret, so this client (or its standalone watchtower) can spend the
+       Leaf-P poison if the LSP later broadcasts that stale state.  Only when this
+       advance co-signed a script-path poison (hashlock on).  Verify-before-persist
+       (fail-closed), mirroring channel_receive_revocation_flat. */
+    if (ps_node->poison_is_scriptpath && ps_node->poison_has_agg_sig) {
+        wire_msg_t rev_msg;
+        if (wire_recv(fd, &rev_msg) && rev_msg.msg_type == MSG_LSTOCK_REVEAL) {
+            uint32_t rn[1], rs[1];
+            unsigned char rsec[1][32];
+            size_t rcount = 0;
+            if (wire_parse_lstock_reveal(rev_msg.json, rn, rs, rsec, 1, &rcount) &&
+                rcount == 1) {
+                unsigned char chk[32];
+                sha256(rsec[0], 32, chk);
+                if (memcmp(chk, ps_node->poison_l_stock_hash, 32) == 0) {
+                    persist_save_l_stock_poison(persist, /* factory_id */ 0,
+                        (uint32_t)node_idx, rs[0], ps_node->poison_l_stock_hash,
+                        ps_node->poison_agg_sig,
+                        ps_node->poison_unsigned_tx.data, ps_node->poison_unsigned_tx.len,
+                        ps_node->poison_leaf_script, ps_node->poison_leaf_script_len,
+                        ps_node->poison_control_block, ps_node->poison_control_block_len);
+                    persist_update_l_stock_secret(persist, 0, (uint32_t)node_idx, rs[0],
+                                                  rsec[0]);
+                    printf("Client-stateless %u: L-stock secret verified + persisted "
+                           "(node %zu state %u) -> poison recourse durable\n",
+                           my_index, node_idx, rs[0]);
+                } else {
+                    fprintf(stderr, "Client-stateless %u: L-stock reveal FAILED verify "
+                            "(SHA256 != committed H_old) -- rejecting (LSP misbehaving)\n",
+                            my_index);
+                }
+                memset(rsec, 0, sizeof(rsec));
+            }
+            if (rev_msg.json) cJSON_Delete(rev_msg.json);
+        } else {
+            if (rev_msg.json) cJSON_Delete(rev_msg.json);
+            fprintf(stderr, "Client-stateless %u: expected MSG_LSTOCK_REVEAL after DONE "
+                    "-- recourse for the superseded state NOT persisted\n", my_index);
+        }
+    }
 
     /* CL7: broadcast the snapshotted stale leaf state now that the
        advance is recorded.  LSP/standalone WT must respond with
@@ -3953,7 +4315,7 @@ static int client_handle_state_advance_stateless(int fd,
             memcpy(old_txid, an->txid, 32);
             if (factory_session_prepare_poison_tx_leaf(
                     factory, affected[k], old_txid, (uint32_t)(old_no - 1),
-                    old_l, TIERB_POISON_FEE_SATS)) {
+                    old_l, TIERB_POISON_FEE_SATS, NULL)) {
                 poison_prepared_c[k] = 1;  /* init_node_poison after state init */
             }
         }

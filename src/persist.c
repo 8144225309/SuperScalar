@@ -447,6 +447,34 @@ int persist_open(persist_t *p, const char *path) {
         return 0;
     }
 
+    /* §10 key-at-rest hardening (#327): lsp.db stores revocation_secrets + the
+       HD wallet seed in PLAINTEXT (the DB itself is not encrypted), so it must
+       never be group/world-readable.  Tighten the file to 0600 and its directory
+       to 0700 (the latter also protects the later-created -wal/-shm sidecars).
+       In-memory (":memory:") DBs have no file to protect. */
+    if (db_path && strcmp(db_path, ":memory:") != 0) {
+        struct stat kst;
+        if (stat(db_path, &kst) == 0 && (kst.st_mode & (S_IRWXG | S_IRWXO))) {
+            fprintf(stderr, "persist_open: WARNING - %s was group/world-accessible "
+                    "(mode 0%o); tightening to 0600. If this host is shared, treat "
+                    "the funding seed + revocation secrets as exposed and rotate.\n",
+                    db_path, (unsigned)(kst.st_mode & 0777));
+        }
+        if (chmod(db_path, S_IRUSR | S_IWUSR) != 0)
+            fprintf(stderr, "persist_open: WARNING - could not chmod 0600 %s\n",
+                    db_path);
+        /* Best-effort: tighten the WAL/SHM sidecars too (they can hold
+           uncommitted secret pages).  Do NOT touch the parent directory — it
+           may be shared (e.g. /tmp); the runbook mandates a 0700 data dir. */
+        {
+            char kside[1100];
+            snprintf(kside, sizeof(kside), "%s-wal", db_path);
+            (void)chmod(kside, S_IRUSR | S_IWUSR);
+            snprintf(kside, sizeof(kside), "%s-shm", db_path);
+            (void)chmod(kside, S_IRUSR | S_IWUSR);
+        }
+    }
+
     /* Enable WAL mode for better concurrent performance */
     char *pragma_err = NULL;
     rc = sqlite3_exec(p->db, "PRAGMA journal_mode=WAL;", NULL, NULL, &pragma_err);
@@ -1310,6 +1338,51 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v37 (#327): at-rest field-encryption marker + key-verification token.
+       Created unconditionally (idempotent) so both fresh and upgraded DBs carry
+       it; the actual data sealing happens later in persist_apply_encryption(),
+       once the operator key is available (persist_open runs before the key is
+       loaded, so it cannot encrypt here). */
+    sqlite3_exec(p->db,
+        "CREATE TABLE IF NOT EXISTS db_encryption ("
+        "  id      INTEGER PRIMARY KEY CHECK(id=1),"
+        "  enabled INTEGER NOT NULL DEFAULT 0,"
+        "  kdf     TEXT,"
+        "  verify  BLOB"
+        ");",
+        NULL, NULL, NULL);
+
+    /* v38 (#53-B3b): client-side persisted L-stock revocation-secret reveals — lets a
+       restarted client (or its standalone watchtower) rebuild + broadcast the Leaf-P
+       poison for a superseded leaf state.  Created unconditionally (idempotent).  The
+       revocation_secret column is sealed by persist_apply_encryption when at-rest
+       encryption is on (#327). */
+    sqlite3_exec(p->db,
+        "CREATE TABLE IF NOT EXISTS l_stock_poison_reveals ("
+        "  factory_id           INTEGER NOT NULL,"
+        "  node_idx             INTEGER NOT NULL,"
+        "  state_counter        INTEGER NOT NULL,"
+        "  l_stock_hash         BLOB NOT NULL,"
+        "  revocation_secret    BLOB,"
+        "  poison_agg_sig       BLOB NOT NULL,"
+        "  poison_unsigned_tx   BLOB NOT NULL,"
+        "  poison_leaf_script   BLOB NOT NULL,"
+        "  poison_control_block BLOB NOT NULL,"
+        "  PRIMARY KEY (factory_id, node_idx, state_counter)"
+        ");",
+        NULL, NULL, NULL);
+
+    /* v39 (#59 restart-resume): persist the factory's hashlock-poison INTENT so a
+       reloaded LSP knows to re-derive the (deterministic) seed + re-enable — exactly
+       as leaf_arity persists the factory's arity.  This is a non-secret boolean: the
+       seed itself is never stored, only re-derived from the LSP key + funding outpoint
+       (factory_derive_lstock_seed).  Version-gated (ALTER is not idempotent). */
+    if (db_version < 39) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN use_hashlock_poison INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1339,6 +1412,12 @@ int persist_open_readonly(persist_t *p, const char *path) {
 }
 
 void persist_close(persist_t *p) {
+    if (p) {
+        /* #327: wipe the in-memory DEK on close (it never touches disk) */
+        volatile unsigned char *z = (volatile unsigned char *)p->dek;
+        for (size_t i = 0; i < sizeof p->dek; i++) z[i] = 0;
+        p->enc_enabled = 0;
+    }
     if (p && p->db) {
         sqlite3_close(p->db);
         p->db = NULL;
@@ -1473,8 +1552,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     const char *sql =
         "INSERT OR REPLACE INTO factories "
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
-        " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
+        " use_hashlock_poison) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1492,6 +1572,7 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 8, (int)f->cltv_timeout);
     sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
     sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
+    sqlite3_bind_int(stmt, 11, f->use_hashlock_poison ? 1 : 0);  /* #59 restart-resume */
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -1626,6 +1707,153 @@ int persist_save_ps_chain_entry(persist_t *p, uint32_t factory_id,
     free(tx_hex);
     free(poison_hex);
     return ok;
+}
+
+/* #53-B3b.2d: persist a leaf's script-path L-stock poison so a restarted client (or
+   its standalone watchtower) can rebuild + broadcast it for a superseded state.  Save
+   at ceremony-complete (secret not yet revealed -> NULL); persist_update_l_stock_secret
+   fills the secret when the reveal lands + verifies.  Blobs stored as hex TEXT (the
+   codebase convention).  Returns 1 on success. */
+int persist_save_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                const unsigned char *l_stock_hash32,
+                                const unsigned char *agg_sig64,
+                                const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+                                const unsigned char *leaf_script, size_t leaf_script_len,
+                                const unsigned char *control_block,
+                                size_t control_block_len) {
+    if (!p || !p->db || !l_stock_hash32 || !agg_sig64 || !unsigned_tx ||
+        !leaf_script || !control_block) return 0;
+
+    char h_hex[65];   hex_encode(l_stock_hash32, 32, h_hex);
+    char sig_hex[129]; hex_encode(agg_sig64, 64, sig_hex);
+    char *utx_hex = malloc(unsigned_tx_len * 2 + 1);
+    char *ls_hex  = malloc(leaf_script_len * 2 + 1);
+    char *cb_hex  = malloc(control_block_len * 2 + 1);
+    if (!utx_hex || !ls_hex || !cb_hex) { free(utx_hex); free(ls_hex); free(cb_hex); return 0; }
+    hex_encode(unsigned_tx, unsigned_tx_len, utx_hex);
+    hex_encode(leaf_script, leaf_script_len, ls_hex);
+    hex_encode(control_block, control_block_len, cb_hex);
+
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "INSERT OR REPLACE INTO l_stock_poison_reveals "
+        "(factory_id, node_idx, state_counter, l_stock_hash, revocation_secret, "
+        " poison_agg_sig, poison_unsigned_tx, poison_leaf_script, poison_control_block) "
+        "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(utx_hex); free(ls_hex); free(cb_hex); return 0;
+    }
+    sqlite3_bind_int (stmt, 1, (int)factory_id);
+    sqlite3_bind_int (stmt, 2, (int)node_idx);
+    sqlite3_bind_int (stmt, 3, (int)state_counter);
+    sqlite3_bind_text(stmt, 4, h_hex,   -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, sig_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, utx_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, ls_hex,  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, cb_hex,  -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(utx_hex); free(ls_hex); free(cb_hex);
+    return ok;
+}
+
+/* #53-B3b.2d: record the revealed revocation secret for a persisted poison (call
+   AFTER verifying SHA256(secret)==l_stock_hash).  Returns 1 if a row was updated. */
+int persist_update_l_stock_secret(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                  uint32_t state_counter,
+                                  const unsigned char *secret32) {
+    if (!p || !p->db || !secret32) return 0;
+    char s_hex[65]; hex_encode(secret32, 32, s_hex);
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "UPDATE l_stock_poison_reveals SET revocation_secret = ? "
+        "WHERE factory_id = ? AND node_idx = ? AND state_counter = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(stmt, 1, s_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 2, (int)factory_id);
+    sqlite3_bind_int (stmt, 3, (int)node_idx);
+    sqlite3_bind_int (stmt, 4, (int)state_counter);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(p->db) > 0);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* #53-B3b.2d: load a persisted poison for (factory, node, state) into caller buffers.
+   *out_has_secret = 1 if the secret has been revealed.  All out-pointers optional
+   except those needed to reconstruct the witness.  Returns 1 if the row exists. */
+int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                                uint32_t state_counter,
+                                unsigned char *l_stock_hash_out32,
+                                unsigned char *agg_sig_out64,
+                                tx_buf_t *unsigned_tx_out,
+                                unsigned char *leaf_script_out, size_t *leaf_script_len_out,
+                                unsigned char *control_block_out, size_t *control_block_len_out,
+                                unsigned char *secret_out32, int *out_has_secret) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT l_stock_hash, poison_agg_sig, poison_unsigned_tx, poison_leaf_script, "
+        " poison_control_block, revocation_secret FROM l_stock_poison_reveals "
+        "WHERE factory_id = ? AND node_idx = ? AND state_counter = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_idx);
+    sqlite3_bind_int(stmt, 3, (int)state_counter);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        const char *h   = (const char *)sqlite3_column_text(stmt, 0);
+        const char *sig = (const char *)sqlite3_column_text(stmt, 1);
+        const char *utx = (const char *)sqlite3_column_text(stmt, 2);
+        const char *ls  = (const char *)sqlite3_column_text(stmt, 3);
+        const char *cb  = (const char *)sqlite3_column_text(stmt, 4);
+        const char *sec = (const char *)sqlite3_column_text(stmt, 5);
+        if (l_stock_hash_out32 && h) hex_decode(h, l_stock_hash_out32, 32);
+        if (agg_sig_out64 && sig)    hex_decode(sig, agg_sig_out64, 64);
+        if (unsigned_tx_out && utx) {
+            size_t n = strlen(utx) / 2;
+            tx_buf_reset(unsigned_tx_out);
+            unsigned char *buf = malloc(n);
+            if (buf) { hex_decode(utx, buf, n); tx_buf_write_bytes(unsigned_tx_out, buf, n); free(buf); }
+        }
+        if (leaf_script_out && leaf_script_len_out && ls) {
+            size_t n = strlen(ls) / 2;
+            hex_decode(ls, leaf_script_out, n); *leaf_script_len_out = n;
+        }
+        if (control_block_out && control_block_len_out && cb) {
+            size_t n = strlen(cb) / 2;
+            hex_decode(cb, control_block_out, n); *control_block_len_out = n;
+        }
+        if (out_has_secret) *out_has_secret = (sec != NULL);
+        if (sec && secret_out32) hex_decode(sec, secret_out32, 32);
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* #59: list (node_idx, state_counter) for poison rows still missing their secret. */
+int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
+                                        uint32_t *node_out, uint32_t *state_out,
+                                        size_t max, size_t *n_out) {
+    if (!p || !p->db || !node_out || !state_out || !n_out) return 0;
+    *n_out = 0;
+    sqlite3_stmt *stmt;
+    const char *sql =
+        "SELECT node_idx, state_counter FROM l_stock_poison_reveals "
+        "WHERE factory_id = ? AND revocation_secret IS NULL "
+        "ORDER BY node_idx, state_counter;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    size_t n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && n < max) {
+        node_out[n]  = (uint32_t)sqlite3_column_int(stmt, 0);
+        state_out[n] = (uint32_t)sqlite3_column_int(stmt, 1);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *n_out = n;
+    return 1;
 }
 
 /* Load PS leaf chain for a given leaf node.
@@ -2045,7 +2273,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
-        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity "
+        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
+        "use_hashlock_poison "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2072,6 +2301,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         (leaf_arity_raw == (int)FACTORY_ARITY_1)  ? FACTORY_ARITY_1  :
         (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
                                                      FACTORY_ARITY_2;
+    int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
 
     /* Data validation (Phase 2: item 2.6) */
     if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
@@ -2172,6 +2402,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     factory_init_from_pubkeys(f, ctx, pubkeys, n_participants,
                                step_blocks, states_per_layer);
     f->cltv_timeout = cltv_timeout;
+    f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (restore parity) */
     f->fee_per_tx = fee_per_tx;
     if (leaf_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);
@@ -2186,6 +2417,14 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         factory_free(f);
         return 0;
     }
+
+    /* #59 restart-resume: record the persisted hashlock-poison intent.  build_tree
+       above necessarily used legacy L-stock SPKs (persist has no seed), but for a
+       PS factory the chain restore below overwrites the current state with the
+       persisted (hashlock) signed state, and the caller (LSP recovery) re-derives
+       the deterministic seed + re-enables before the next advance.  This flag is the
+       self-describing signal the caller checks. */
+    f->use_hashlock_poison = loaded_use_hashlock_poison ? 1 : 0;
 
     /* For PS factories: restore per-leaf chain state from ps_leaf_chains table.
        factory_build_tree produces chain[0] (unsigned). If any advances were
@@ -5540,9 +5779,17 @@ int persist_save_hd_seed(persist_t *p,
             "INSERT INTO hd_wallet_state (id, next_index, seed_hex) VALUES (1, 0, ?) "
             "ON CONFLICT(id) DO UPDATE SET seed_hex=excluded.seed_hex;",
             -1, &stmt, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(stmt, 1, hex, -1, SQLITE_STATIC);
+    /* #327: seal the seed at rest. persist_seal_text returns strdup(hex) when no
+       key is installed (regtest/tests), so behaviour is unchanged there. */
+    char *stored = persist_seal_text(p, hex);
+    /* hex holds the cleartext seed — wipe our stack copy regardless of outcome */
+    { volatile unsigned char *z = (volatile unsigned char *)hex;
+      for (size_t zi = 0; zi < sizeof hex; zi++) z[zi] = 0; }
+    if (!stored) { sqlite3_finalize(stmt); return 0; }
+    sqlite3_bind_text(stmt, 1, stored, -1, SQLITE_TRANSIENT);
     int ok = sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
+    free(stored);
     return ok;
 }
 
@@ -5557,8 +5804,11 @@ int persist_load_hd_seed(persist_t *p,
             -1, &stmt, NULL) != SQLITE_OK) return 0;
     int found = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *hex = (const char *)sqlite3_column_text(stmt, 0);
-        if (hex) {
+        /* #327: the stored value may be sealed ("ssenc1:"); persist_open_text
+           transparently returns legacy plaintext unchanged when it is not. */
+        const char *stored = (const char *)sqlite3_column_text(stmt, 0);
+        char *hex = NULL;
+        if (stored && persist_open_text(p, stored, &hex) && hex) {
             size_t hex_len = strlen(hex);
             size_t byte_len = hex_len / 2;
             if (byte_len > 0 && byte_len <= seed_cap) {
@@ -5577,6 +5827,10 @@ int persist_load_hd_seed(persist_t *p,
                 *seed_len_out = byte_len;
                 found = 1;
             }
+            /* wipe + free the decrypted cleartext */
+            { volatile unsigned char *z = (volatile unsigned char *)hex;
+              for (size_t zi = 0; zi < hex_len; zi++) z[zi] = 0; }
+            free(hex);
         }
     }
     sqlite3_finalize(stmt);

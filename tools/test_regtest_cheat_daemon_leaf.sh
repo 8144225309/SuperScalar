@@ -55,6 +55,7 @@ TMPDIR=$(mktemp -d /tmp/ss-cheat-daemon-leaf-regtest.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
 LSP_LOG="$TMPDIR/lsp.log"
 WT_LOG="$TMPDIR/wt.log"
+WT_DB="$TMPDIR/wt.db"   # trustless WT db (no secrets); armed by the LSP's --wt-db
 
 PIDS=()
 
@@ -140,8 +141,9 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET \
     --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --demo --cheat-daemon-leaf $SIDE \
-    --lsp-balance-pct 100 \
+    --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 PIDS+=($LSP_PID)
@@ -222,12 +224,23 @@ fi
 STALE_TXID=$(grep -E "Stale pre-advance leaf broadcast" "$LSP_LOG" | head -1 | awk '{print $5}' | cut -d' ' -f1)
 echo "  Stale broadcast txid: ${STALE_TXID:-(unknown)}"
 
-# --- Standalone Watchtower ---
+# Trustless: stop the (sleeping) cheating LSP so its wt.db WAL checkpoints before
+# the standalone WT reads it; the stale leaf is already on-chain. Then keep mining
+# so the WT's block-driven poll fires (the LSP's own miner stops when it exits).
+echo "  Stopping cheating LSP (SIGTERM) so wt.db flushes for the standalone WT..."
+kill -TERM $LSP_PID 2>/dev/null || true
+for s in $(seq 1 30); do kill -0 $LSP_PID 2>/dev/null || { echo "  LSP exited (wt.db checkpointed)"; break; }; sleep 1; done
+K0=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE watch_kind IN (0,1);" 2>/dev/null || echo 0)
+echo "  wt.db factory/sub-factory (kind 0/1) watches: ${K0:-0}"
+( for k in $(seq 1 80); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 3; done ) &
+WTMINE_PID=$!; PIDS+=($WTMINE_PID)
+
+# --- Standalone trustless WT (--wt-db only, NO secrets) ---
 echo
-echo "--- Standalone WT (binary --db $LSP_DB) ---"
+echo "--- Standalone trustless WT (--wt-db $WT_DB, no secrets) ---"
 "$WT_BIN" \
     --network regtest \
-    --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --poll-interval 5 \
     --cli-path bitcoin-cli \
     --rpcuser ${RPCUSER:-rpcuser} \
@@ -275,8 +288,22 @@ else
 fi
 echo
 echo "=== Final result ==="
-if [ $WT_FIRED -eq 1 ]; then
-    echo "  PASS: standalone WT detected stale + broadcast penalty TXs"
+set +e
+if [ "$WT_FIRED" -eq 1 ]; then
+    # OUTCOME (not just a broadcast log line): confirm the WT's response/penalty txid ON-CHAIN + assert a real amount.
+    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -z "$PEN_TXID" ] && PEN_TXID=$(grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}" "$WT_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
+    [ -n "$PEN_TXID" ] || { echo "  FAIL: WT fired but no response/penalty txid found (breach_detections + WT log)"; tail -30 "$WT_LOG"; exit 1; }
+    echo "  WT response txid: $PEN_TXID — mining to confirm + verify payout"
+    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
+    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
+    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
+    echo "  WT response confirmed on-chain; largest output ${PSATS:-0} sats"
+    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
+    A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
+    case "$A2" in LOW*) echo "  FAIL: WT response recovers <90% of swept value ($A2) — value leaked/burned"; exit 1;; esac
+    echo "  PASS: standalone WT detected stale leaf state, broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just a log line"
     exit 0
 else
     echo "  FAIL: standalone WT did not broadcast penalty TXs"

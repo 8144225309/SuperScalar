@@ -13,7 +13,7 @@ Headline themes (one of many):
 - Sub-factory multi-input ceremonies (k≥2 first-class)
 - Factory scale validated to N=64 on signet + testnet4
 - R1–R6 reorg correctness with forensic tables
-- Crash-injection framework + 16/16 crash-drill matrix
+- Crash-injection framework + 20/20 crash-drill matrix (incl. production factory-rotation crash drills, #332)
 - Cheat-engine campaign (7 new adversarial drivers)
 - Trustless watchtower (one of many security improvements)
 - Native Prometheus exporter, pre-rotation auto-snapshot, mainnet runbook, BIP-157/158 lite client

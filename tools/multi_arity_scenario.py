@@ -30,6 +30,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+
+def _read_conf_pw(conf_path):
+    """Read rpcpassword from a bitcoind conf so the live secret is not
+    hardcoded in the repo. Returns '' if unreadable."""
+    try:
+        with open(conf_path) as _f:
+            for _ln in _f:
+                if _ln.startswith("rpcpassword="):
+                    return _ln.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
 import shutil
 import signal
 import subprocess
@@ -63,7 +75,7 @@ def bitcoin_cli_args(network: str) -> list:
             cli,
             "-signet",
             "-rpcuser=" + os.environ.get("SIGNET_RPCUSER", "signetrpc"),
-            "-rpcpassword=" + os.environ.get("SIGNET_RPCPASS", "signetrpcpass123"),
+            "-rpcpassword=" + (os.environ.get("SIGNET_RPCPASS") or _read_conf_pw("/var/lib/bitcoind-signet/bitcoin.conf")),
             "-rpcport=" + os.environ.get("SIGNET_RPCPORT", "38332"),
         ]
     if network == "regtest":

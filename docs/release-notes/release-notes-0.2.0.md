@@ -137,7 +137,7 @@ Link surgery: secret-reader functions moved into `superscalar_secrets` static li
 - `MSG_FORCE_OUT` + `MSG_ROTATE` wire ops for crash-drill matrix
 - Half A: journal SENT-phase participants at every ceremony PROPOSE
 - Half C1: crash_checkpoint at all stateless ceremony phases
-- Half C2: 16/16 crash-drill matrix tests pass on regtest
+- Half C2: 20/20 crash-drill matrix tests pass on regtest (incl. production factory rotation, #332)
 - ROTATE ceremony persistence + 4 checkpoints in `lsp_channels_rotate_factory`
 - LSP loadwallet auto-recovery hook
 - LSP self-rebroadcasts after mempool eviction

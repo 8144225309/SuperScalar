@@ -10,8 +10,11 @@
 #define BECH32M_MAX_HRP   83
 #define BECH32M_MAX_DATA5 1024
 
-/* bech32m charset */
-static const char CHARSET[32] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+/* bech32m charset. Sized by the compiler ([] not [32]) so the array includes the
+   string's null terminator: AppleClang 21's -Wunterminated-string-initialization
+   (with -Werror) rejects a [32] array holding exactly 32 chars + null. Used only as
+   an indexed lookup table (CHARSET[0..31]); the trailing null is never read. */
+static const char CHARSET[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 /* Reverse lookup: maps ASCII char → 5-bit value, or -1 for invalid */
 static int8_t charset_rev[128];

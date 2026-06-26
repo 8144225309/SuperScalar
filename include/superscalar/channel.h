@@ -123,6 +123,10 @@ typedef struct {
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
+    int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
+                             negotiated like option_anchors -- BOTH parties must set it
+                             identically or the co-signed commitment sighash diverges.
+                             Default 0 (raw channel_init); production sets it on. */
 
     /* Splicing state (Phase G) */
     int           channel_quiescent;       /* 1 if in quiescence for splice */
@@ -279,6 +283,15 @@ void channel_set_remote_pcp(channel_t *ch, uint64_t commitment_num,
    Returns 1 on success. */
 int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
                             secp256k1_pubkey *pcp_out);
+
+/* Revocation-verification standard (shared by LSP and client): verify a revealed
+   per-commitment secret matches the per-commitment point the peer committed to
+   (secret*G == committed_PCP), using channel_get_remote_pcp (which consults the
+   durable DB record). Returns 1 if valid, 0 if demonstrably wrong. NOTE: in the
+   current phase this still returns 1 when no committed point can be found at all
+   (legacy accept-on-trust); that branch flips to fail-closed in a later phase. */
+int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_num,
+                                     const unsigned char *secret32);
 
 /* Store a received revocation secret at flat index. */
 int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,

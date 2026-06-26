@@ -202,9 +202,16 @@ int main(int argc, char **argv) {
     /* Broadcast via bitcoin-cli if requested. */
     if (do_broadcast) {
         char cmd[8192];
+        char signet_args[256];
         const char *rpc_args = "";
         if (!strcmp(network, "signet")) {
-            rpc_args = "-signet -rpcuser=signetrpc -rpcpassword=signetrpcpass123 -rpcport=38332";
+            /* Read the signet RPC password from $SIGNET_RPCPASS so the
+               live secret is not hardcoded in the repo. */
+            const char *sig_pw = getenv("SIGNET_RPCPASS");
+            snprintf(signet_args, sizeof(signet_args),
+                     "-signet -rpcuser=signetrpc -rpcpassword=%s -rpcport=38332",
+                     sig_pw ? sig_pw : "");
+            rpc_args = signet_args;
         } else if (!strcmp(network, "regtest")) {
             rpc_args = "-regtest -rpcuser=rpcuser -rpcpassword=rpcpass -rpcport=18443";
         } else {

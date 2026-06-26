@@ -23,6 +23,7 @@
 
 #include "superscalar/factory.h"
 #include "superscalar/channel.h"
+#include "superscalar/persist.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
@@ -707,6 +708,14 @@ static int run_breach_penalty(regtest_t *rt, secp256k1_context *ctx,
     channel_get_per_commitment_point(&client_ch, 0, &client_pcp0);
     channel_get_per_commitment_point(&lsp_ch, 1, &lsp_pcp1);
     channel_get_per_commitment_point(&client_ch, 1, &client_pcp1);
+    /* #8 revocation-verification-standard: durable PCP store so the fail-closed verify
+       (channel_receive_revocation below) retrieves cn=0's committed point after the
+       2-slot in-memory window evicts it when cn=2 is set at the advance. Mirrors
+       production's persist_db wiring (lsp_channels.c / superscalar_client.c). */
+    persist_t pcp_db;
+    TEST_ASSERT(persist_open(&pcp_db, NULL), "breach: open in-memory pcp db (#8)");
+    channel_set_persist(&lsp_ch, &pcp_db, 1);
+    channel_set_persist(&client_ch, &pcp_db, 2);
     channel_set_remote_pcp(&lsp_ch, 0, &client_pcp0);
     channel_set_remote_pcp(&lsp_ch, 1, &client_pcp1);
     channel_set_remote_pcp(&client_ch, 0, &lsp_pcp0);
@@ -778,6 +787,7 @@ static int run_breach_penalty(regtest_t *rt, secp256k1_context *ctx,
     printf("  breach: client swept %llu sats via penalty %s ✓\n",
            (unsigned long long)tl_amt, pen_txid);
 
+    persist_close(&pcp_db);
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
     return 1;

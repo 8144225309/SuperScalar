@@ -13,7 +13,7 @@ while true; do
         --db "$WT_DB" \
         --poll-interval 30 \
         --rpcuser testnet4rpc \
-        --rpcpassword testnet4rpcpass123 \
+        --rpcpassword "$(sed -n 's/^rpcpassword=//p' /var/lib/bitcoind-testnet4/bitcoin.conf 2>/dev/null)" \
         --rpcport 48332 \
         2>&1 | tee -a "$WT_LOG" || true
     echo "[wrapper] WT exited after $(($(date +%s) - $(date -d '1 minute ago' +%s) )) iter, restarting in 10s" | tee -a "$WT_LOG"
