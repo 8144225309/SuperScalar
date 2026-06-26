@@ -5923,6 +5923,22 @@ int test_factory_ps_subfactory_poison_tx_k2_n4(void) {
     TEST_ASSERT(dust_ok == 0, "rejects when per-client share below dust");
     tx_buf_free(&poison_dust);
 
+    /* #53-B2: when this node carries a hashlock commitment, the key-path
+       poison signer MUST refuse — the poison has to go via the Leaf-P script
+       path (reveal-the-secret).  build_l_stock_spk uses the N-of-N agg as the
+       L-stock taproot internal key, so a co-signed key-path poison would burn
+       the L-stock WITHOUT the secret, reopening the Scenario-B co-signed-poison
+       theft.  The guard reads node->has_l_stock_hash, so set it directly. */
+    sub->has_l_stock_hash = 1;
+    tx_buf_t poison_hl;
+    tx_buf_init(&poison_hl, 64);
+    int hl_refused = factory_sign_l_stock_poison_tx(
+        f, sub, sub->txid, sstock_vout, sstock_amount, fee, &poison_hl);
+    TEST_ASSERT(hl_refused == 0,
+                "B2: key-path poison REFUSED when node has hashlock");
+    tx_buf_free(&poison_hl);
+    sub->has_l_stock_hash = 0;  /* restore before free */
+
     factory_free(f);
     secp256k1_context_destroy(ctx);
     free(f);
