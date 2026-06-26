@@ -780,8 +780,8 @@ int test_regtest_breach_penalty_cpfp(void) {
     memcpy(to_local_spk, commit0_unsigned.data + 47 + 8 + 1, 34);
 
     /* --- Advance to commitment #1 --- */
-    channel_generate_local_pcs(&lsp_ch, 1);
-    channel_generate_local_pcs(&client_ch, 1);
+    channel_generate_local_pcs(&lsp_ch, 2);   /* incl cn=2: its per-commitment point is fetched + #8-persisted below; must be a valid point, not uninitialized */
+    channel_generate_local_pcs(&client_ch, 2);
 
     secp256k1_pubkey lsp_pcp2, client_pcp2;
     channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
@@ -1015,8 +1015,8 @@ int test_regtest_watchtower_mempool_detection(void) {
                 "sign commitment #0");
 
     /* Advance to commitment #1, revoke #0 */
-    channel_generate_local_pcs(&lsp_ch, 1);
-    channel_generate_local_pcs(&client_ch, 1);
+    channel_generate_local_pcs(&lsp_ch, 2);   /* incl cn=2: its per-commitment point is fetched + #8-persisted below; must be a valid point, not uninitialized */
+    channel_generate_local_pcs(&client_ch, 2);
 
     secp256k1_pubkey lsp_pcp2, client_pcp2;
     channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
@@ -1220,8 +1220,8 @@ int test_regtest_watchtower_late_detection(void) {
                 "sign commitment #0");
 
     /* Advance to commitment #1, revoke #0 */
-    channel_generate_local_pcs(&lsp_ch, 1);
-    channel_generate_local_pcs(&client_ch, 1);
+    channel_generate_local_pcs(&lsp_ch, 2);   /* incl cn=2: its per-commitment point is fetched + #8-persisted below; must be a valid point, not uninitialized */
+    channel_generate_local_pcs(&client_ch, 2);
 
     secp256k1_pubkey lsp_pcp2, client_pcp2;
     channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
