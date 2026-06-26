@@ -205,6 +205,31 @@ static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
             msg->json = NULL;
             continue;  /* notification, wait for next real message */
         }
+        if (msg->msg_type == MSG_CEREMONY_ABORT) {
+            /* #49/#51: advisory abort/intent-to-exit notice.  The LSP sends this
+               when a rotation/advance ceremony is aborted -- notably
+               RETRY_LIMIT_REACHED, where the LSP then proactively broadcasts the
+               distribution TX (unilateral exit) before the factory CLTV.  The
+               client's own persisted state + watchtower already protect its funds
+               (it can self-exit), so this is informational: log it loudly so the
+               client app/operator can stop waiting on a ceremony that will never
+               complete and confirm its watchtower is live.  Best-effort -- a
+               client offline during the failed ceremony simply won't receive it. */
+            unsigned char cer_id[8];
+            unsigned char reason = CEREMONY_ABORT_OTHER;
+            char *rtext = NULL;
+            if (msg->json &&
+                wire_parse_ceremony_abort(msg->json, cer_id, &reason, &rtext)) {
+                fprintf(stderr, "Client: MSG_CEREMONY_ABORT reason=0x%02x%s%s\n",
+                        reason, rtext ? " -- " : "", rtext ? rtext : "");
+                free(rtext);
+            } else {
+                fprintf(stderr, "Client: MSG_CEREMONY_ABORT (unparseable)\n");
+            }
+            if (msg->json) cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;  /* advisory, wait for next real message */
+        }
         return 1;  /* real message */
     }
 }
