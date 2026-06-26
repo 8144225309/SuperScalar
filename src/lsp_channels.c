@@ -1386,8 +1386,19 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (had_old_signed)
         memcpy(old_leaf_txid, f->nodes[pre_node_idx].txid, 32);
     int old_n_outputs = f->nodes[pre_node_idx].n_outputs;
-    uint64_t old_l_amount = (old_n_outputs >= 2)
-                            ? f->nodes[pre_node_idx].outputs[old_n_outputs - 1].amount_sats
+    /* #53 x P3 interaction: when use_tree_anchor is on, factory_append_tree_anchor
+       appends a P2A anchor (ANCHOR_OUTPUT_AMOUNT, SPK 0x51024e73) as the LAST output
+       of every node — so the L-stock is the SECOND-to-last output, not outputs[n-1].
+       Detect the anchor (flag + SPK) and target the real L-stock; otherwise the poison
+       gate below reads the 240-sat anchor and never fires (poison_required=0), so the
+       advance degrades + never reveals the recourse secret (caught by the leaf e2e). */
+    int old_anchor_outs = (old_n_outputs >= 2 &&
+        f->nodes[pre_node_idx].outputs[old_n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(f->nodes[pre_node_idx].outputs[old_n_outputs - 1].script_pubkey,
+               P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+    int old_l_vout = old_n_outputs - 1 - old_anchor_outs;
+    uint64_t old_l_amount = (old_l_vout >= 0 && (old_n_outputs - old_anchor_outs) >= 2)
+                            ? f->nodes[pre_node_idx].outputs[old_l_vout].amount_sats
                             : 0;
     /* SF-WT-TRUSTLESS Phase 1b.4 (#248): also snapshot the OLD chain
      * output (vout=0)'s value + scriptpubkey + the nsequence-encoded
@@ -1461,7 +1472,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (mgr->watchtower && poison_required && !getenv("SS_CHEAT_OMIT_POISON")) {
         if (factory_session_prepare_poison_tx_leaf(
                 f, pre_node_idx,
-                old_leaf_txid, (uint32_t)(old_n_outputs - 1),
+                old_leaf_txid, (uint32_t)old_l_vout,
                 old_l_amount, LEAF_POISON_FEE_SATS,
                 /* #53-B3b Phase 1: target the SUPERSEDED state's output (H_old captured
                    before the advance); NULL = legacy key-path when hashlock is off. */
