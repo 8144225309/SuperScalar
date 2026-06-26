@@ -844,6 +844,79 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                         persist_rollback(wt->db);
                 }
             }
+
+            /* G2 #45 (PTLC): mirror the PTLC revocation-penalty sweep into
+               wt_db so a SECRET-LESS standalone WT also sweeps in-flight PTLCs
+               on a commitment breach (without this it penalizes to_local + HTLCs
+               but leaks PTLC value).  Mirror of the HTLC wt_db block above: build
+               the sweep now (ch still holds the received revocation secret) and
+               store the signed bytes keyed on the breach txid.  Uses the same
+               ch->ptlcs[0] shim the watchtower_check lazy-build path uses. */
+            if (wt->wt_db && wt->wt_db->db && entry->n_ptlc_outputs > 0 && ch) {
+                int use_anchor_p = fee_should_use_anchor(wt->fee);
+                size_t wt_saved_np = ch->n_ptlcs;
+                ptlc_t wt_saved_p0 = {0};
+                if (wt_saved_np > 0 && ch->ptlcs)
+                    wt_saved_p0 = ch->ptlcs[0];
+                if (!ch->ptlcs) {
+                    ch->ptlcs = (ptlc_t *)calloc(1, sizeof(ptlc_t));
+                    ch->ptlcs_cap = 1;
+                }
+                for (size_t p = 0; ch->ptlcs && p < entry->n_ptlc_outputs; p++) {
+                    watchtower_htlc_t *wp_p = &entry->ptlc_outputs[p];
+                    ch->n_ptlcs = 1;
+                    memset(&ch->ptlcs[0], 0, sizeof(ptlc_t));
+                    ch->ptlcs[0].direction = (ptlc_direction_t)wp_p->direction;
+                    ch->ptlcs[0].cltv_expiry = wp_p->cltv_expiry;
+                    ch->ptlcs[0].state = PTLC_STATE_ACTIVE;
+                    /* payment_hash[32] holds the xonly payment_point; prepend
+                       even-parity to parse a 33-byte pubkey (parity immaterial —
+                       channel_build_ptlc_penalty_tx uses the xonly form). */
+                    {
+                        unsigned char pp33[33];
+                        pp33[0] = 0x02;
+                        memcpy(pp33 + 1, wp_p->payment_hash, 32);
+                        secp256k1_ec_pubkey_parse(ch->ctx,
+                            &ch->ptlcs[0].payment_point, pp33, 33);
+                    }
+                    tx_buf_t psweep;
+                    tx_buf_init(&psweep, 512);
+                    if (channel_build_ptlc_penalty_tx(ch, &psweep,
+                            old_txid, wp_p->htlc_vout, wp_p->htlc_amount,
+                            wp_p->htlc_spk, 34, old_commit_num, 0,
+                            use_anchor_p ? wt->anchor_spk : NULL,
+                            use_anchor_p ? wt->anchor_spk_len : 0)) {
+                        unsigned char p_resp_txid[32];
+                        sha256_double(psweep.data, psweep.len, p_resp_txid);
+                        char *p_hex = (char *)malloc(psweep.len * 2 + 1);
+                        if (p_hex) {
+                            hex_encode(psweep.data, psweep.len, p_hex);
+                            int64_t pwid = persist_wt_register_watch(
+                                wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
+                                channel_id, old_txid,
+                                wp_p->htlc_vout, wp_p->htlc_amount,
+                                wp_p->htlc_spk, 34,
+                                ch->to_self_delay,
+                                p_hex, p_resp_txid, 0, 0);
+                            free(p_hex);
+                            if (pwid <= 0)
+                                fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                    "PTLC-sweep register failed (ch %u vout %u)\n",
+                                    channel_id, wp_p->htlc_vout);
+                        }
+                    } else {
+                        fprintf(stderr,
+                                "watchtower: failed to build PTLC sweep TX "
+                                "(vout %u) at registration time — standalone-WT "
+                                "PTLC recourse unavailable for this output\n",
+                                wp_p->htlc_vout);
+                    }
+                    tx_buf_free(&psweep);
+                }
+                ch->n_ptlcs = wt_saved_np;
+                if (wt_saved_np > 0 && ch->ptlcs)
+                    ch->ptlcs[0] = wt_saved_p0;
+            }
         }
     }
 
