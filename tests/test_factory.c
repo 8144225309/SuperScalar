@@ -1886,6 +1886,92 @@ int test_factory_distribution_tx(void) {
     return 1;
 }
 
+/* #54 G1: drive the DISTRIBUTED MuSig co-signing of the distribution TX (each
+   participant signs separately, as the multi-party stateless creation ceremony
+   does) via the new factory_session_*_dist helpers, and verify the resulting
+   signature is VALID against the funding output key.  Proves the offline-forever
+   recovery net can be co-signed in the stateless path (where it is currently
+   built unsigned). */
+int test_factory_distribution_tx_distributed(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    /* Build the UNSIGNED distribution TX exactly as stateless creation does
+       (lsp.c:521) — computes f->dist_unsigned_tx + f->dist_sighash. */
+    uint32_t nlocktime = 5000;
+    tx_output_t dist_outputs[6];
+    size_t n_dist = factory_compute_distribution_outputs_balanced(
+        f, dist_outputs, 6, 500, NULL, 0);
+    TEST_ASSERT(n_dist > 0, "compute balanced dist outputs");
+    TEST_ASSERT(factory_build_distribution_tx_unsigned(f, dist_outputs, n_dist,
+                                                       nlocktime),
+                "build unsigned dist tx");
+    TEST_ASSERT(f->dist_tx_ready == 1, "dist_tx_ready==1 (unsigned)");
+
+    /* Distributed co-signing: all 5 participants sign separately. */
+    TEST_ASSERT(factory_session_init_dist(f), "init dist session");
+    secp256k1_musig_secnonce dist_secnonces[5];
+    for (size_t j = 0; j < 5; j++) {
+        unsigned char sk[32];
+        secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, sk, &kps[j]), "keypair sec");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[j]), "keypair pub");
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &dist_secnonces[j], &pubnonce,
+                                          sk, &pk, &f->nodes[0].keyagg.cache),
+                    "dist nonce gen");
+        memset(sk, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce_dist(f, j, &pubnonce),
+                    "dist set nonce");
+    }
+    TEST_ASSERT(factory_session_finalize_dist(f), "finalize dist session");
+    for (size_t j = 0; j < 5; j++) {
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &dist_secnonces[j],
+                                              &kps[j], &f->dist_signing_session),
+                    "dist partial sig");
+        TEST_ASSERT(factory_session_set_partial_sig_dist(f, j, &psig),
+                    "dist set partial sig");
+    }
+    TEST_ASSERT(factory_session_complete_dist(f), "complete dist session");
+    TEST_ASSERT(f->dist_tx_ready == 2, "dist_tx_ready==2 (signed)");
+    TEST_ASSERT(f->dist_signed_tx.len >= 70, "signed dist tx long enough");
+
+    /* Extract the key-path witness sig (1 input -> witness = 0x01 0x40 <64 sig>
+       immediately before the 4-byte nLockTime) and verify it against the funding
+       output key + dist_sighash.  A wrong taptweak (e.g. signing the raw agg key
+       instead of the BIP-341-tweaked funding key) would fail this. */
+    size_t L = f->dist_signed_tx.len;
+    TEST_ASSERT(f->dist_signed_tx.data[L - 70] == 0x01 &&
+                f->dist_signed_tx.data[L - 69] == 0x40,
+                "key-path witness shape (1 item, 64 bytes)");
+    const unsigned char *sig64 = f->dist_signed_tx.data + (L - 68);
+    TEST_ASSERT(secp256k1_schnorrsig_verify(ctx, sig64, f->dist_sighash, 32,
+                                             &fund_tweaked) == 1,
+                "G1: distributed dist-TX sig VALID vs funding key + dist_sighash");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* Test: Distribution tx with 5 outputs: each gets (funding - fee) / 5 */
 int test_factory_distribution_tx_default(void) {
     secp256k1_context *ctx = test_ctx();

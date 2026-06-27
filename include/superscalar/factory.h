@@ -429,7 +429,17 @@ typedef struct {
        The "inverted timeout default": if nobody acts, clients get money. */
     tx_buf_t dist_unsigned_tx;     /* unsigned distribution TX */
     unsigned char dist_sighash[32]; /* BIP-341 sighash for distributed signing */
-    int dist_tx_ready;             /* 1 = unsigned TX built + sighash computed */
+    int dist_tx_ready;             /* 1 = unsigned TX built + sighash computed;
+                                      2 = fully co-signed (#54 G1) */
+    /* #54 G1: distributed MuSig co-signing of the distribution TX, so the
+       offline-forever recovery net (dist TX, nLockTime = cltv_timeout) exists in
+       the stateless creation path.  Key-path spend of the funding output over
+       nodes[0].keyagg (no taptree), message = dist_sighash.  Mirrors the per-node
+       session helpers but targets the funding output instead of a tree node. */
+    musig_signing_session_t dist_signing_session;
+    secp256k1_musig_partial_sig dist_partial_sigs[FACTORY_MAX_SIGNERS];
+    int dist_partial_sigs_received;
+    tx_buf_t dist_signed_tx;       /* fully-signed distribution TX (dist_tx_ready==2) */
 } factory_t;
 
 int factory_init(factory_t *f, secp256k1_context *ctx,
@@ -1125,6 +1135,27 @@ int factory_build_distribution_tx_unsigned(
     const tx_output_t *outputs,
     size_t n_outputs,
     uint32_t nlocktime);
+
+/* #54 G1: distributed MuSig co-signing of the distribution TX (the offline-forever
+   recovery net) so it exists in the stateless creation path.  The dist TX is a
+   key-path spend of the funding output over nodes[0].keyagg (same agg key as the
+   root kickoff, no taptree), message = f->dist_sighash.  Requires
+   factory_build_distribution_tx_unsigned() to have run first (dist_tx_ready>=1).
+   Usage (per signer, mirroring the per-node session helpers):
+     1. factory_session_init_dist          — init the all-N session
+     2. factory_session_set_nonce_dist      — set each signer's pubnonce (slot order)
+     3. factory_session_finalize_dist       — nonce_process over dist_sighash
+     4. factory_session_set_partial_sig_dist— set each signer's partial sig
+     5. factory_session_complete_dist       — aggregate -> finalize f->dist_signed_tx,
+                                              set dist_tx_ready=2
+   All return 1 on success, 0 on failure. */
+int factory_session_init_dist(factory_t *f);
+int factory_session_set_nonce_dist(factory_t *f, size_t signer_slot,
+                                   const secp256k1_musig_pubnonce *pubnonce);
+int factory_session_finalize_dist(factory_t *f);
+int factory_session_set_partial_sig_dist(factory_t *f, size_t signer_slot,
+                                         const secp256k1_musig_partial_sig *psig);
+int factory_session_complete_dist(factory_t *f);
 
 /* Compute distribution TX outputs: each participant gets P2TR(their_pubkey).
    LSP (pubkeys[0]) gets funding_amount - sum(client_amounts) - fee.
