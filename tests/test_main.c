@@ -1255,6 +1255,7 @@ extern int test_persist_multi_channel(void);
 extern int test_persist_hd_seed_encryption_round_trip(void);
 extern int test_persist_encryption_wrong_key_refused(void);
 extern int test_persist_encryption_disabled_is_plaintext(void);
+extern int test_persist_secret_columns_sealed(void);
 
 /* Phase 14: CLN Bridge */
 extern int test_bridge_msg_round_trip(void);
@@ -3106,6 +3107,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_hd_seed_encryption_round_trip);
     RUN_TEST(test_persist_encryption_wrong_key_refused);
     RUN_TEST(test_persist_encryption_disabled_is_plaintext);
+    RUN_TEST(test_persist_secret_columns_sealed);
     RUN_TEST(test_persist_ps_subfactory_chain_round_trip);
     RUN_TEST(test_persist_l_stock_poison_round_trip);
     RUN_TEST(test_persist_ps_subfactory_chain_v21_round_trip);

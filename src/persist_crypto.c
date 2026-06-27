@@ -216,17 +216,34 @@ int persist_open_blob(persist_t *p, const unsigned char *stored, size_t stored_l
 typedef struct { const char *table, *idcol, *col; int is_blob; } secret_col_t;
 static const secret_col_t SECRET_COLS[] = {
     /* The crown jewel: the HD wallet seed. A plaintext read of this row alone
-       lets an attacker derive every wallet key and drain all funds — so it is
-       sealed first and on its own (fully wrapped at runtime + tested).
+       lets an attacker derive every wallet key and drain all funds. */
+    { "hd_wallet_state",            "id",         "seed_hex",                0 },
 
-       FAST-FOLLOW (same pattern, each needs its runtime accessor wrapped +
-       an enc_version bump so existing rows re-migrate):
-         revocation_secrets.secret, factory_revocation_secrets.secret,
-         channels.local_{payment,delayed,revocation,htlc}_secret,
-         revocation_releases.revocation_secret (BLOB).
+    /* #327b fast-follow — the remaining at-rest secrets.  Per-commitment and
+       per-factory revocation secrets, the four per-channel basepoint secrets,
+       and received revocation releases.  The migrate id is `rowid` for the
+       composite-PK tables (revocation_secrets, factory_revocation_secrets,
+       revocation_releases are ordinary rowid tables — a single PK column would
+       not uniquely address a row); channel_basepoints keys on its channel_id
+       PK.  Runtime read/write accessors are sealed/opened to match (writers in
+       persist.c, readers in persist_secrets.c).  The migration pass is
+       idempotent (already-sealed rows are skipped) and runs on every keyed
+       open, so adding a column here auto-seals it on the next startup with no
+       schema/enc-version bump.
        v0.3 (payment-privacy tier): preimage / payment_secret / stateless_nonce
        across htlcs/ptlcs/ln_invoices/local_pcs. */
-    { "hd_wallet_state",            "id",         "seed_hex",                0 },
+    { "revocation_secrets",         "rowid",      "secret",                  0 },
+    { "factory_revocation_secrets", "rowid",      "secret",                  0 },
+    { "channel_basepoints",         "channel_id", "local_payment_secret",    0 },
+    { "channel_basepoints",         "channel_id", "local_delayed_secret",    0 },
+    { "channel_basepoints",         "channel_id", "local_revocation_secret", 0 },
+    { "channel_basepoints",         "channel_id", "local_htlc_secret",       0 },
+    { "revocation_releases",        "rowid",      "revocation_secret",       1 },
+    /* #53 revealed L-stock poison secret.  The column is declared BLOB but the
+       runtime accessors store/read it as a TEXT hex string, so it seals as text
+       (is_blob=0).  This is the column the l_stock_poison_reveals schema comment
+       promises is sealed at rest. */
+    { "l_stock_poison_reveals",     "rowid",      "revocation_secret",       0 },
 };
 static const size_t N_SECRET_COLS = sizeof(SECRET_COLS) / sizeof(SECRET_COLS[0]);
 
@@ -349,10 +366,15 @@ int persist_apply_encryption(persist_t *p) {
             fprintf(stderr, "persist: DB encryption verification token mismatch — refusing to open.\n");
             return 0;
         }
-        return 1;
+        /* DEK verified.  Fall through to the idempotent migration so that any
+           secret columns added to SECRET_COLS since this DB was first sealed
+           (#327b fast-follow) get sealed on this open. */
     }
 
-    /* No token yet: migrate existing plaintext rows + write the token, atomically. */
+    /* Seal any not-yet-sealed registered columns (idempotent — already-sealed
+       rows are skipped) and, on first encryption only, write the verify token.
+       Atomic.  Running on every keyed open auto-migrates newly-registered
+       columns without a schema/enc-version bump. */
     int own_txn = !persist_in_transaction(p);
     if (own_txn && !persist_begin(p)) return 0;
     int ok = 1;
@@ -362,7 +384,7 @@ int persist_apply_encryption(persist_t *p) {
         if (!ok) fprintf(stderr, "persist: encryption migration failed at %s.%s\n",
                          SECRET_COLS[i].table, SECRET_COLS[i].col);
     }
-    if (ok) {
+    if (ok && !have_token) {
         unsigned char *tok = NULL; size_t toklen = 0;
         ok = persist_seal_blob(p, (const unsigned char *)VERIFY_PLAINTEXT,
                                sizeof(VERIFY_PLAINTEXT) - 1, &tok, &toklen);
@@ -380,7 +402,8 @@ int persist_apply_encryption(persist_t *p) {
         free(tok);
     }
     if (own_txn) { if (ok) ok = persist_commit(p); else persist_rollback(p); }
-    if (ok) fprintf(stderr, "persist: at-rest field encryption active (%zu secret columns sealed).\n", N_SECRET_COLS);
+    if (ok) fprintf(stderr, "persist: at-rest field encryption active (%zu secret columns %s).\n",
+                    N_SECRET_COLS, have_token ? "verified" : "sealed");
     return ok;
 }
 
