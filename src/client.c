@@ -6,6 +6,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/shachain.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include "superscalar/regtest.h"  /* CL7: regtest_send_raw_tx + regtest_t */
 #include <stdio.h>
 #include <stdlib.h>
@@ -3879,7 +3880,9 @@ static int client_handle_leaf_advance_stateless(int fd,
     tx_buf_init(&cl7_cheat_tx, 0);
     {
         const char *cheat_env = getenv("SS_CHEAT_CLIENT_SIDE");
-        if (cheat_env && atoi(cheat_env) == leaf_side &&
+        /* #9: defense-bypass cheat (client broadcasts an OLD signed state).
+           Gate on superscalar_cheat_allowed() -> inert on non-regtest networks. */
+        if (superscalar_cheat_allowed() && cheat_env && atoi(cheat_env) == leaf_side &&
             had_old_signed_c && ps_node->signed_tx.len > 0) {
             tx_buf_init(&cl7_cheat_tx, (int)ps_node->signed_tx.len);
             memcpy(cl7_cheat_tx.data, ps_node->signed_tx.data,

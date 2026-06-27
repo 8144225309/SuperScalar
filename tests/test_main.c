@@ -1243,6 +1243,7 @@ extern int test_client_verifies_lsp_revocation(void);         /* revocation-veri
 extern int test_cheat_gate(void);                             /* #9 cheat-gate */
 extern int test_lsp_forgery_response_parse(void);             /* item-1 escalation policy parse */
 extern int test_adversarial_keyagg_substitution(void);        /* ADV matrix */
+extern int test_adversarial_cheat_gate_failsafe(void);        /* #9 cheat-gate */
 extern int test_adversarial_final_sig_tamper(void);
 extern int test_adversarial_wrong_message_binding(void);
 extern int test_persist_watchtower_hydrate_round_trip(void);
@@ -3148,6 +3149,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cheat_gate);
     RUN_TEST(test_lsp_forgery_response_parse);
     RUN_TEST(test_adversarial_keyagg_substitution);
+    RUN_TEST(test_adversarial_cheat_gate_failsafe);
     RUN_TEST(test_adversarial_final_sig_tamper);
     RUN_TEST(test_adversarial_wrong_message_binding);
     RUN_TEST(test_persist_watchtower_hydrate_round_trip);

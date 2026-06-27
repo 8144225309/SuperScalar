@@ -21,6 +21,7 @@
  */
 #include "superscalar/musig.h"
 #include "superscalar/sha256.h"
+#include "superscalar/crash_inject.h"   /* #9 cheat-gate */
 #include <secp256k1_musig.h>
 #include <stdio.h>
 #include <string.h>
@@ -71,6 +72,29 @@ int test_adversarial_keyagg_substitution(void) {
                 "FORGERY: AB sig must NOT verify under substituted keyagg[A,C]");
 
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* #9 CHEAT-GATE FAIL-SAFE: every library defense-bypass cheat (SS_CHEAT_* /
+   SS_KILL_*) calls superscalar_cheat_allowed() IN ADDITION to its env var, and
+   that gate is OFF unless a regtest binary explicitly opts in.  So on mainnet /
+   signet / testnet4 the cheat env vars are inert regardless of the environment.
+   This proves the gate's fail-safe default + network behaviour. */
+int test_adversarial_cheat_gate_failsafe(void) {
+    /* Default (no superscalar_set_cheat_gate call) = cheats NOT allowed. */
+    TEST_ASSERT(superscalar_cheat_allowed() == 0,
+                "cheat gate defaults to OFF (fail-safe)");
+    /* Non-regtest networks (is_regtest=0) keep it OFF -- mainnet/signet/testnet4. */
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0,
+                "cheat gate OFF on non-regtest (mainnet) network");
+    /* Only regtest opts in. */
+    superscalar_set_cheat_gate(1);
+    TEST_ASSERT(superscalar_cheat_allowed() == 1,
+                "cheat gate ON only when regtest opts in");
+    /* Restore OFF so the regtest state can't leak into other unit tests. */
+    superscalar_set_cheat_gate(0);
+    TEST_ASSERT(superscalar_cheat_allowed() == 0, "cheat gate restored OFF");
     return 1;
 }
 

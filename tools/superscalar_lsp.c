@@ -2362,6 +2362,22 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        /* #9: also refuse cheat/kill/crash ENV vars on mainnet (not just args).
+           The library gate (superscalar_cheat_allowed) already makes them inert,
+           but fail LOUD so a misconfigured mainnet node never starts with a
+           defense-bypass or crash-injection knob lurking in its environment. */
+        {
+            extern char **environ;
+            for (char **e = environ; e && *e; e++) {
+                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
+                    strncmp(*e, "SS_KILL", 7) == 0 ||
+                    strncmp(*e, "SUPERSCALAR_CRASH_AT", 20) == 0) {
+                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
+                            "on mainnet.\n", *e);
+                    return 1;
+                }
+            }
+        }
     }
 
     /* Mainnet requires --db for revocation secret persistence */

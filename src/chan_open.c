@@ -14,6 +14,7 @@
 #include "superscalar/sha256.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/wallet_source.h"
+#include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include <secp256k1.h>
 #include <string.h>
 #include <stdlib.h>
@@ -474,8 +475,12 @@ int chan_reestablish(peer_mgr_t *mgr, int peer_idx,
     {
         secp256k1_pubkey local_pcp;
         uint64_t pcp_cn = ch->commitment_number;
+        /* #9: defense-bypass cheat (restore an OLD state = broadcast a revoked
+           commitment).  Gate on superscalar_cheat_allowed() so it is inert on any
+           non-regtest network even if the env var is set. */
         const char *cheat_env = getenv("SS_CHEAT_SCB_RESTORE");
-        if (cheat_env && cheat_env[0] != '0' && ch->commitment_number > 0) {
+        if (superscalar_cheat_allowed() &&
+            cheat_env && cheat_env[0] != '0' && ch->commitment_number > 0) {
             uint64_t offset = 1;
             const char *off_env = getenv("SS_CHEAT_SCB_OFFSET");
             if (off_env && off_env[0] != '\0') {
