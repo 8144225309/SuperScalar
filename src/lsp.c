@@ -507,11 +507,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         return 0;
     }
 
-    /* Build unsigned distribution TX so the unsigned dist TX is attached to f
-       (legacy rotation re-signs it later).  Stateless MVP does NOT co-sign the
-       dist TX during creation -- matches the validated sub-factory / state-
-       advance stateless ceremonies which carry no dist TX.  FACTORY_READY
-       therefore omits distribution_tx_hex. */
+    /* Build the UNSIGNED distribution TX and attach it to f.  #54 G1a/G1b:
+       this dist TX is then CO-SIGNED below in the stateless creation ceremony
+       (the per-signer dist nonce + partial-sig exchange), so FACTORY_READY
+       ships a fully-signed distribution_tx_hex -- the offline-forever recovery
+       net that lets ANYONE broadcast at the factory CLTV to pay every client
+       when all parties go offline.  (Legacy rotation also re-signs it later.)
+       Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
     {
         tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
         size_t n_dist = factory_compute_distribution_outputs_balanced(f,
