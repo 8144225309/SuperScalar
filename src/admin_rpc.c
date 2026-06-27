@@ -993,7 +993,7 @@ static cJSON *method_exportrgs(admin_rpc_t *rpc)
     char *hex = (char *)malloc(blen * 2 + 1);
     if (!hex) return NULL;
     for (size_t i = 0; i < blen; i++)
-        sprintf(hex + i * 2, "%02x", blob[i]);
+        snprintf(hex + i * 2, 3, "%02x", blob[i]);
     hex[blen * 2] = 0;
 
     cJSON *result = cJSON_CreateObject();
@@ -1102,7 +1102,7 @@ static cJSON *method_payoffer(admin_rpc_t *rpc, const cJSON *params,
     /* Include payer key for debugging */
     char pk_hex[67];
     for (int i = 0; i < 33; i++)
-        sprintf(pk_hex + i * 2, "%02x", inv_req.payer_key[i]);
+        snprintf(pk_hex + i * 2, 3, "%02x", inv_req.payer_key[i]);
     pk_hex[66] = 0;
     cJSON_AddStringToObject(result, "payer_key", pk_hex);
 
@@ -1306,7 +1306,7 @@ int admin_rpc_init(admin_rpc_t *rpc, const char *socket_path)
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, socket_path, sizeof(sa.sun_path) - 1);
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", socket_path);
 
     if (bind(rpc->listen_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(rpc->listen_fd);
@@ -1321,7 +1321,7 @@ int admin_rpc_init(admin_rpc_t *rpc, const char *socket_path)
         rpc->listen_fd = -1;
         return 0;
     }
-    strncpy(rpc->socket_path, socket_path, sizeof(rpc->socket_path) - 1);
+    snprintf(rpc->socket_path, sizeof(rpc->socket_path), "%s", socket_path);
     return 1;
 #else
     /* Windows: socket support is optional; skip for now */
