@@ -1107,6 +1107,7 @@ extern int test_regtest_ptlc_turnover(void);
 extern int test_factory_lifecycle_states(void);
 extern int test_factory_lifecycle_queries(void);
 extern int test_factory_distribution_tx(void);
+extern int test_factory_distribution_tx_distributed(void);
 extern int test_factory_distribution_tx_default(void);
 
 /* Phase 8: Ladder manager */
@@ -3068,6 +3069,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_lifecycle_states);
     RUN_TEST(test_factory_lifecycle_queries);
     RUN_TEST(test_factory_distribution_tx);
+    RUN_TEST(test_factory_distribution_tx_distributed);
     RUN_TEST(test_factory_distribution_tx_default);
 
     printf("\n=== Ladder Manager (Phase 8d) ===\n");

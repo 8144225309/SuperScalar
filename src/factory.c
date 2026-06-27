@@ -4236,6 +4236,64 @@ int factory_build_distribution_tx_unsigned(
     return 1;
 }
 
+/* === #54 G1: distributed MuSig signing of the distribution TX ===
+   The dist TX is a key-path spend of the funding output (same N-of-N keyagg as
+   the root kickoff, nodes[0].keyagg) with message = f->dist_sighash.  These mirror
+   the per-node session helpers (factory_session_init_node etc.) but target the
+   funding output instead of a tree node, so the offline-forever recovery net can
+   be co-signed in the multi-party (stateless) creation ceremony.  Caller must run
+   factory_build_distribution_tx_unsigned() first. */
+int factory_session_init_dist(factory_t *f) {
+    if (!f || f->n_nodes == 0) return 0;
+    if (f->dist_tx_ready < 1 || f->dist_unsigned_tx.len == 0) return 0;
+    if (!f->nodes[0].is_built) return 0;
+    /* Same aggregate key as kickoff_root (factory_build_distribution_tx). */
+    musig_session_init(&f->dist_signing_session, &f->nodes[0].keyagg,
+                       f->n_participants);
+    f->dist_partial_sigs_received = 0;
+    return 1;
+}
+
+int factory_session_set_nonce_dist(factory_t *f, size_t signer_slot,
+                                   const secp256k1_musig_pubnonce *pubnonce) {
+    if (!f || !pubnonce) return 0;
+    return musig_session_set_pubnonce(&f->dist_signing_session, signer_slot,
+                                      pubnonce);
+}
+
+int factory_session_finalize_dist(factory_t *f) {
+    if (!f) return 0;
+    /* The funding output is key-path-only (no taptree), exactly like the root
+       kickoff node[0] — finalize with a NULL merkle root (no taptweak beyond the
+       BIP-341 empty-tree key tweak applied internally), matching the proven
+       single-process factory_build_distribution_tx (musig_sign_taproot ... NULL). */
+    return musig_session_finalize_nonces(f->ctx, &f->dist_signing_session,
+                                         f->dist_sighash, NULL, NULL);
+}
+
+int factory_session_set_partial_sig_dist(factory_t *f, size_t signer_slot,
+                                         const secp256k1_musig_partial_sig *psig) {
+    if (!f || !psig || signer_slot >= f->n_participants) return 0;
+    f->dist_partial_sigs[signer_slot] = *psig;
+    f->dist_partial_sigs_received++;
+    return 1;
+}
+
+int factory_session_complete_dist(factory_t *f) {
+    if (!f) return 0;
+    if (f->dist_partial_sigs_received != (int)f->n_participants) return 0;
+    unsigned char sig[64];
+    if (!musig_aggregate_partial_sigs(f->ctx, sig, &f->dist_signing_session,
+                                      f->dist_partial_sigs, f->n_participants))
+        return 0;
+    /* finalize_signed_tx resets the out buffer internally (tx_buf_reset). */
+    if (!finalize_signed_tx(&f->dist_signed_tx, f->dist_unsigned_tx.data,
+                            f->dist_unsigned_tx.len, sig))
+        return 0;
+    f->dist_tx_ready = 2;  /* fully co-signed */
+    return 1;
+}
+
 /* Inversion-of-timeout-default: the distribution TX spends the factory
    funding UTXO directly and pays everything to the clients, with nLockTime
    set to the factory's CLTV timeout. The LSP gets NOTHING — no output,
@@ -4676,6 +4734,7 @@ void factory_free(factory_t *f) {
        factory_build_distribution_tx_unsigned).  tx_buf_free is a no-op
        when never initialized. */
     tx_buf_free(&f->dist_unsigned_tx);
+    tx_buf_free(&f->dist_signed_tx);   /* #54 G1 */
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
 }
@@ -4698,4 +4757,5 @@ void factory_detach_txbufs(factory_t *f) {
         memset(&f->nodes[i].poison_signed_tx, 0, sizeof(tx_buf_t));
     }
     memset(&f->dist_unsigned_tx, 0, sizeof(tx_buf_t));
+    memset(&f->dist_signed_tx, 0, sizeof(tx_buf_t));   /* #54 G1 */
 }
