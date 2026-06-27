@@ -21,12 +21,18 @@ LSP_BIN="$BUILD_DIR/superscalar_lsp"; CLIENT_BIN="$BUILD_DIR/superscalar_client"
 N_CLIENTS="${N_CLIENTS:-2}"; AMOUNT="${AMOUNT:-250000}"; FEE_RATE="${FEE_RATE:-100}"   # 100 sat/kvB = 0.1 sat/vB
 LSP_PORT="${LSP_PORT:-29959}"; WALLET="${WALLET:-superscalar_lsp}"
 CONFIRM_TIMEOUT="${CONFIRM_TIMEOUT:-14400}"
-LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
-LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-# Canonical scaffold seckeys (client_fills 0x22/0x33/0x44/0x55) — REQUIRED: the
-# commitment re-sign in the breach path uses these; A's leaf-breach used
-# sequential keys (02..05) because it never re-signs a 2-of-2 commitment.
-sk(){ local b; b=$(printf "%02x" $((34 + $1 * 17))); printf "${b}%.0s" {1..32}; }
+# Strong per-run keys: signet is PUBLIC, so NO weak/deterministic keys (privkey
+# 1 / byte-fill are publicly sweepable). Keys are seed-derived (unpredictable to
+# outsiders, reproducible from the saved seed for our own recovery). The breach
+# goes through the normal ceremony + watchtower machinery using the launched
+# --seckey values, so strong keys work like the old byte-fill scaffold.
+# Seed saved to /tmp/ss_signet_seed_<TAG>.txt for residual recovery.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
+eval "$(python3 "$SCRIPT_DIR/signet_strong_keygen.py" "$N_CLIENTS" "commitbreach_$$")"
+[ -n "${LSP_SECKEY:-}" ] && [ -n "${LSP_PUBKEY:-}" ] && [ -f "${CLIENT_KEYS_FILE:-/nonexistent}" ] || { echo "FAIL: strong keygen failed"; exit 1; }
+mapfile -t CLIENT_SECKEYS < "$CLIENT_KEYS_FILE"
+sk(){ printf '%s' "${CLIENT_SECKEYS[$1]}"; }
 SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
 RU=$(awk -F= '/^[[:space:]]*rpcuser/{gsub(/ /,"",$2);print $2;exit}' "$SIGNET_CONF")
 RP=$(awk -F= '/^[[:space:]]*rpcpassword/{gsub(/ /,"",$2);print $2;exit}' "$SIGNET_CONF")

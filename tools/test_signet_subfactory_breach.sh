@@ -8,9 +8,15 @@ BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"; CLIENT_BIN="$BUILD_DIR/superscalar_client"; WT_BIN="$BUILD_DIR/superscalar_watchtower"
 N_CLIENTS="${N_CLIENTS:-4}"; PS_SUB_ARITY="${PS_SUB_ARITY:-2}"; AMOUNT="${AMOUNT:-400000}"; FEE_RATE="${FEE_RATE:-100}"
 LSP_PORT="${LSP_PORT:-29967}"; WALLET="${WALLET:-superscalar_lsp}"; CONFIRM_TIMEOUT="${CONFIRM_TIMEOUT:-21600}"
-LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
-LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-sk(){ local b; b=$(printf "%02x" $((34 + $1 * 17))); printf "${b}%.0s" {1..32}; }
+# Strong per-run keys (signet is PUBLIC — NO weak/deterministic keys). Seed-derived
+# + reproducible from the saved seed for recovery. Breach uses the launched
+# --seckey values via the normal ceremony, so strong keys work like the scaffold.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
+eval "$(python3 "$SCRIPT_DIR/signet_strong_keygen.py" "$N_CLIENTS" "subfactorybreach_$$")"
+[ -n "${LSP_SECKEY:-}" ] && [ -n "${LSP_PUBKEY:-}" ] && [ -f "${CLIENT_KEYS_FILE:-/nonexistent}" ] || { echo "FAIL: strong keygen failed"; exit 1; }
+mapfile -t CLIENT_SECKEYS < "$CLIENT_KEYS_FILE"
+sk(){ printf '%s' "${CLIENT_SECKEYS[$1]}"; }
 SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
 RU=$(awk -F= '/^[[:space:]]*rpcuser/{gsub(/ /,"",$2);print $2;exit}' "$SIGNET_CONF")
 RP=$(awk -F= '/^[[:space:]]*rpcpassword/{gsub(/ /,"",$2);print $2;exit}' "$SIGNET_CONF")

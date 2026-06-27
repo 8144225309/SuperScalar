@@ -35,14 +35,14 @@ WT_POLL="${WT_POLL:-30}"
 WALLET="${WALLET:-superscalar_lsp}"
 CONFIRM_TIMEOUT="${CONFIRM_TIMEOUT:-14400}"   # 4h budget for the LSP funding/lifecycle
 
-LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
-CLIENT_SECKEYS=(
-    "0000000000000000000000000000000000000000000000000000000000000002"
-    "0000000000000000000000000000000000000000000000000000000000000003"
-    "0000000000000000000000000000000000000000000000000000000000000004"
-    "0000000000000000000000000000000000000000000000000000000000000005"
-)
-LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+# Strong per-run keys (signet is PUBLIC — NO weak/deterministic keys). Seed-derived
+# + reproducible from the saved seed for recovery. Breach uses the launched
+# --seckey values via the normal ceremony, so strong keys work like the scaffold.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
+eval "$(python3 "$SCRIPT_DIR/signet_strong_keygen.py" "$N_CLIENTS" "wtrace_$$")"
+[ -n "${LSP_SECKEY:-}" ] && [ -n "${LSP_PUBKEY:-}" ] && [ -f "${CLIENT_KEYS_FILE:-/nonexistent}" ] || { echo "FAIL: strong keygen failed"; exit 1; }
+mapfile -t CLIENT_SECKEYS < "$CLIENT_KEYS_FILE"
 
 # --- signet RPC creds from the node conf (the bare -signet cookie path is wrong) ---
 SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
