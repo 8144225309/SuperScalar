@@ -65,6 +65,17 @@ jobs:
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           ./build/test_inproc_scale 4
+      - name: CLN-bridge secure-by-default (#5 finding 1)
+        # The bridge must REFUSE to start without --lsp-pubkey (unauthenticated NN
+        # is MITM-exposed) unless --insecure-no-auth is explicitly passed.
+        if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
+        run: |
+          if ./build/superscalar_bridge >/tmp/br.out 2>&1; then
+            echo "FAIL: bridge started WITHOUT --lsp-pubkey"; cat /tmp/br.out; exit 1
+          fi
+          grep -q "refusing to start without --lsp-pubkey" /tmp/br.out || {
+            echo "FAIL: missing secure-by-default refusal"; cat /tmp/br.out; exit 1; }
+          echo "OK: bridge refuses unauthenticated NN startup by default"
 
   arm64-build-test:
     runs-on: ubuntu-latest

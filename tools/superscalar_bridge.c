@@ -16,6 +16,8 @@ static void usage(const char *prog) {
             "  --lsp-port PORT       LSP port (default: 9735)\n"
             "  --plugin-port PORT    Plugin listen port (default: 9736)\n"
             "  --lsp-pubkey HEX      LSP static pubkey (33-byte hex) for NK authentication\n"
+            "  --insecure-no-auth    allow UNAUTHENTICATED NN transport (MITM-exposed;\n"
+            "                        testing only -- production MUST use --lsp-pubkey)\n"
             "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
             "  --version             Show version and exit\n"
             "  --help                Show this help\n", prog);
@@ -27,6 +29,7 @@ int main(int argc, char *argv[]) {
     int plugin_port = 9736;
     const char *lsp_pubkey_hex = NULL;
     const char *tor_proxy_arg = NULL;
+    int insecure_no_auth = 0;   /* #5: explicit opt-in to unauthenticated NN */
 
     static struct option long_options[] = {
         {"lsp-host",    required_argument, 0, 'h'},
@@ -34,6 +37,7 @@ int main(int argc, char *argv[]) {
         {"plugin-port", required_argument, 0, 'p'},
         {"lsp-pubkey",  required_argument, 0, 'k'},
         {"tor-proxy",   required_argument, 0, 't'},
+        {"insecure-no-auth", no_argument,  0, 'I'},
         {"version",     no_argument,       0, 'v'},
         {"help",        no_argument,       0, '?'},
         {0, 0, 0, 0}
@@ -47,6 +51,7 @@ int main(int argc, char *argv[]) {
         case 'p': plugin_port = atoi(optarg); break;
         case 'k': lsp_pubkey_hex = optarg; break;
         case 't': tor_proxy_arg = optarg; break;
+        case 'I': insecure_no_auth = 1; break;
         case 'v':
             printf("superscalar_bridge %s\n", SUPERSCALAR_VERSION);
             return 0;
@@ -95,6 +100,20 @@ int main(int argc, char *argv[]) {
         printf("Bridge: NK authentication enabled (pinned LSP pubkey)\n");
         lsp_pubkey_set = 1;
         secp256k1_context_destroy(ctx);
+    }
+
+    /* #5 (CLN-bridge audit, finding 1): secure-by-default transport.  Without a
+       pinned LSP pubkey the bridge<->LSP channel is unauthenticated NN, which is
+       MITM-exposed.  Refuse to start unless the operator explicitly opts into the
+       insecure mode -- production MUST pass --lsp-pubkey (the LSP prints it at
+       startup).  Mirrors the secure-by-default mainnet guards (#327a/#9). */
+    if (!lsp_pubkey_set && !insecure_no_auth) {
+        fprintf(stderr,
+            "Error: refusing to start without --lsp-pubkey -- unauthenticated NN\n"
+            "transport is MITM-exposed.  Pass --lsp-pubkey HEX (the LSP prints it at\n"
+            "startup) for authenticated NK transport, or --insecure-no-auth to override\n"
+            "for testing only.\n");
+        return 1;
     }
 
     /* Supervisor loop: restart bridge on failure with escalating backoff.
