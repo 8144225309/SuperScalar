@@ -56,6 +56,10 @@ jobs:
         # clients).  With a real CLTV it co-signs the distribution TX and asserts
         # dist_tx_ready==2 -- validating the G1b wire threading end-to-end (the
         # unit suite only covers the dist crypto, not the multi-party ceremony).
+        # Plain config only: the test fork()s, and fork + ASan/TSan can deadlock
+        # in the sanitizer allocator; the dist crypto still gets ASan/TSan coverage
+        # via the unit suite (test_factory_distribution_tx_distributed).
+        if: ${{ !matrix.sanitizers && !matrix.tsan }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           ./build/test_inproc_scale 4
