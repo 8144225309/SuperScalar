@@ -1540,12 +1540,33 @@ static int client_factory_creation_stateless_signing(
             return 0;
         }
     }
+    /* #54 G1b: speculatively gen this client's distribution-TX dist nonce (fresh;
+       independent of the per-node nonces).  Sent in CLIENT_PUBNONCES; ignored by
+       the LSP if it isn't running dist co-signing.  Needs my_seckey -> before the
+       wipe below. */
+    secp256k1_musig_secnonce my_dist_secnonce;
+    unsigned char my_dist_pn[66] = {0};
+    unsigned char my_dist_psig[32] = {0};
+    int my_dist_done = 0;
+    int my_dist_gen = 0;
+    {
+        secp256k1_musig_pubnonce my_dist_pubnonce;
+        if (factory->n_nodes > 0 &&
+            musig_generate_nonce(ctx, &my_dist_secnonce, &my_dist_pubnonce,
+                                 my_seckey, &my_pubkey,
+                                 &factory->nodes[0].keyagg.cache)) {
+            musig_pubnonce_serialize(ctx, my_dist_pn, &my_dist_pubnonce);
+            my_dist_gen = 1;
+        }
+    }
     memset(my_seckey, 0, 32);
 
     /* Send CLIENT_PUBNONCES (per-node; unsigned nodes carry zero nonce). */
     {
         cJSON *cpn = wire_build_factory_client_pubnonces(my_pn_per_node, (uint32_t)nn);
         free(my_pn_per_node);
+        if (cpn && my_dist_gen)   /* #54 G1b: include this client's dist pubnonce */
+            wire_json_add_hex(cpn, "dist_pubnonce", my_dist_pn, 66);
         if (!cpn || !wire_send(fd, MSG_FACTORY_CLIENT_PUBNONCES, cpn)) {
             fprintf(stderr, "Client-stateless %u: send CLIENT_PUBNONCES failed\n", my_index);
             if (cpn) cJSON_Delete(cpn);
@@ -1586,6 +1607,98 @@ static int client_factory_creation_stateless_signing(
         free(my_secnonces); free(my_slot);
         return 0;
     }
+    /* #54 G1b: distribution-TX dist co-signing (self-contained; runs only if the
+       LSP offered it via lsp_dist_pubnonce).  The client REBUILDS the dist TX from
+       the LSP-sent per-client amounts, VERIFIES its own output is not shorted vs
+       its channel balance, then co-signs.  Any mismatch/short -> skip (the factory
+       is still created; just no signed dist TX = today's behaviour). */
+    if (my_dist_gen) {
+        unsigned char lsp_dist_pn[66];
+        if (wire_json_get_hex(lr.json, "lsp_dist_pubnonce", lsp_dist_pn, 66) == 66) {
+            unsigned char *all_dist_pn = calloc((size_t)factory->n_participants, 66);
+            unsigned char *amt_le = calloc((size_t)factory->n_participants, 8);
+            uint64_t dist_amounts[FACTORY_MAX_SIGNERS];
+            int ok = (all_dist_pn && amt_le);
+            size_t n_amt = 0;
+            uint32_t dist_nlock = 0;
+            if (ok) {
+                cJSON *na = cJSON_GetObjectItem(lr.json, "dist_n_client_amounts");
+                if (na && cJSON_IsNumber(na)) n_amt = (size_t)na->valuedouble;
+                cJSON *nl = cJSON_GetObjectItem(lr.json, "dist_nlocktime");
+                if (nl && cJSON_IsNumber(nl)) dist_nlock = (uint32_t)nl->valuedouble;
+                if (wire_json_get_hex(lr.json, "all_dist_pubnonces", all_dist_pn,
+                        (size_t)factory->n_participants * 66) !=
+                    (int)((size_t)factory->n_participants * 66)) ok = 0;
+                if (ok && n_amt > 0) {
+                    if (n_amt > (size_t)factory->n_participants) ok = 0;
+                    else if (wire_json_get_hex(lr.json, "dist_client_amounts", amt_le,
+                                               n_amt * 8) != (int)(n_amt * 8)) ok = 0;
+                    else for (size_t a = 0; a < n_amt; a++) {
+                        uint64_t v = 0;
+                        for (int b = 0; b < 8; b++)
+                            v |= ((uint64_t)amt_le[a * 8 + b]) << (b * 8);
+                        dist_amounts[a] = v;
+                    }
+                }
+            }
+            /* SECURITY: this client must not co-sign a dist TX that shorts its own
+               payout.  Verify amounts[my client idx] >= its channel balance minus
+               a small fee/anchor tolerance. */
+            if (ok && n_amt > 0) {
+                size_t ci = (size_t)(my_index - 1);
+                uint64_t my_amt = (ci < n_amt) ? dist_amounts[ci] : 0;
+                uint64_t my_chan_bal = 0;
+                size_t lnode; uint32_t lvout;
+                if (factory_client_to_leaf(factory, ci, &lnode, &lvout) &&
+                    lnode < factory->n_nodes &&
+                    lvout < factory->nodes[lnode].n_outputs)
+                    my_chan_bal = factory->nodes[lnode].outputs[lvout].amount_sats;
+                const uint64_t DIST_VERIFY_TOL = 1500;  /* fee+anchor share slack */
+                if (my_amt == 0 ||
+                    (my_chan_bal > DIST_VERIFY_TOL &&
+                     my_amt + DIST_VERIFY_TOL < my_chan_bal)) {
+                    fprintf(stderr, "Client-stateless %u: dist output %llu shorts my "
+                            "channel balance %llu -- refusing to co-sign dist TX\n",
+                            my_index, (unsigned long long)my_amt,
+                            (unsigned long long)my_chan_bal);
+                    ok = 0;
+                }
+            }
+            /* Rebuild the IDENTICAL unsigned dist TX from the LSP-sent amounts,
+               then co-sign over our own computed sighash. */
+            if (ok) {
+                tx_output_t douts[FACTORY_MAX_SIGNERS + 1];
+                size_t nd = factory_compute_distribution_outputs_balanced(
+                    factory, douts, FACTORY_MAX_SIGNERS + 1, 500,
+                    (n_amt > 0) ? dist_amounts : NULL, n_amt);
+                if (nd > 0 && dist_nlock > 0 &&
+                    factory_build_distribution_tx_unsigned(factory, douts, nd,
+                                                           dist_nlock) &&
+                    factory_session_init_dist(factory)) {
+                    int set_ok = 1;
+                    secp256k1_musig_pubnonce pn0;
+                    if (!musig_pubnonce_parse(ctx, &pn0, lsp_dist_pn) ||
+                        !factory_session_set_nonce_dist(factory, 0, &pn0)) set_ok = 0;
+                    for (size_t s = 1; set_ok && s < (size_t)factory->n_participants; s++) {
+                        secp256k1_musig_pubnonce pns;
+                        if (!musig_pubnonce_parse(ctx, &pns, all_dist_pn + s * 66) ||
+                            !factory_session_set_nonce_dist(factory, s, &pns)) set_ok = 0;
+                    }
+                    if (set_ok && factory_session_finalize_dist(factory)) {
+                        secp256k1_musig_partial_sig dps;
+                        if (musig_create_partial_sig(ctx, &dps, &my_dist_secnonce,
+                                                     keypair,
+                                                     &factory->dist_signing_session)) {
+                            musig_partial_sig_serialize(ctx, my_dist_psig, &dps);
+                            my_dist_done = 1;
+                        }
+                    }
+                }
+            }
+            free(all_dist_pn); free(amt_le);
+        }
+    }
+
     cJSON_Delete(lr.json);
     (void)lsp_psig_per_node;  /* LSP psigs are aggregated LSP-side, not by client. */
 
@@ -1658,6 +1771,8 @@ static int client_factory_creation_stateless_signing(
     {
         cJSON *fp = wire_build_factory_client_final_psigs(my_psig_per_node, (uint32_t)nn);
         free(my_psig_per_node);
+        if (fp && my_dist_done)   /* #54 G1b: include this client's dist partial sig */
+            wire_json_add_hex(fp, "dist_psig", my_dist_psig, 32);
         if (!fp || !wire_send(fd, MSG_FACTORY_CLIENT_FINAL_PSIGS, fp)) {
             fprintf(stderr, "Client-stateless %u: send CLIENT_FINAL_PSIGS failed\n", my_index);
             if (fp) cJSON_Delete(fp);

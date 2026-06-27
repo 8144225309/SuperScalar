@@ -767,6 +767,13 @@ cJSON *wire_build_factory_ready(const factory_t *f) {
         cJSON_AddItemToArray(arr, item);
     }
     cJSON_AddItemToObject(j, "signed_txs", arr);
+    /* #54 G1b: ship the co-signed distribution TX (offline-forever recovery net)
+       when it was fully co-signed during this creation ceremony.  The client
+       applies it -> f->dist_tx_ready=2 (client.c).  Omitted otherwise (degrade). */
+    if (f->dist_tx_ready == 2 && f->dist_signed_tx.len > 0) {
+        wire_json_add_hex(j, "distribution_tx_hex",
+                          f->dist_signed_tx.data, f->dist_signed_tx.len);
+    }
     return j;
 }
 
