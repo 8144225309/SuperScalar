@@ -38,6 +38,12 @@ FEE_RATE="${FEE_RATE:-1000}"   # sat/kvB; regtest mempool floor is generous
 PORT="${PORT:-9951}"
 WALLET="${WALLET:-ss_sig_n127}"
 TAG="signet_scale_payments"
+# Each payment needs a sender+receiver pair, so 2*PAYMENTS must fit in N_CLIENTS.
+# The LSP is launched with --payments PAYMENTS and blocks until it sees that many;
+# if PAYMENTS exceeds floor(N/2) only floor(N/2) pairs are set up, the LSP waits
+# forever for the missing ones, and the event loop times out.  Clamp it.
+_MAXP=$(( N_CLIENTS / 2 )); [ "$_MAXP" -lt 1 ] && _MAXP=1
+[ "$PAYMENTS" -gt "$_MAXP" ] && { echo "[n64-pay] clamping PAYMENTS $PAYMENTS -> $_MAXP (need 2*PAYMENTS <= N_CLIENTS=$N_CLIENTS)"; PAYMENTS="$_MAXP"; }
 LSP_DB="/tmp/ss_${TAG}.db"
 LSP_LOG="/tmp/ss_${TAG}_lsp.log"
 # LSP keys are generated per-run below (STRONG, not weak) via the keygen eval.
@@ -159,7 +165,7 @@ done
 MINER_PID=""
 
 # --- Wait for the LSP to finish (creation -> payments -> close) ---
-info "waiting for ceremony + payments + close (up to ~10 min)..."
+info "waiting for ceremony + payments + close (signet: up to ~1h over real blocks)..."
 DEADLINE=$(( $(date +%s) + 3600 ))
 RESULT="TIMEOUT"
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
