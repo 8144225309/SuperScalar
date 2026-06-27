@@ -174,12 +174,24 @@ int main(int argc, char **argv) {
 
     if (!lsp_run_factory_creation(lsp, funding_txid, 0, funding_amount,
                                   fund_spk, 34, /*step*/10, /*states*/4,
-                                  /*cltv*/0)) {
+                                  /*cltv*/5000)) {
         fprintf(stderr, "[scale] lsp_run_factory_creation FAILED at N=%d\n", N);
         rc = 1; goto reap;
     }
     printf("[scale] factory creation ceremony complete: %zu nodes, %d leaves\n",
            lsp->factory.n_nodes, lsp->factory.n_leaf_nodes);
+
+    /* #54 G1b: with a real CLTV, the stateless creation ceremony now co-signs the
+       distribution TX (the offline-forever recovery net).  Assert it was fully
+       co-signed across the LSP + all N forked clients (dist_tx_ready==2). */
+    if (lsp->factory.dist_tx_ready != 2 || lsp->factory.dist_signed_tx.len == 0) {
+        fprintf(stderr, "[scale] G1b: distribution TX NOT co-signed at N=%d "
+                "(dist_tx_ready=%d, len=%zu)\n", N,
+                lsp->factory.dist_tx_ready, lsp->factory.dist_signed_tx.len);
+        rc = 1; goto reap;
+    }
+    printf("[scale] G1b: distribution TX co-signed (%zu bytes)\n",
+           lsp->factory.dist_signed_tx.len);
 
     if (!factory_verify_all(&lsp->factory)) {
         fprintf(stderr, "[scale] factory_verify_all FAILED\n");

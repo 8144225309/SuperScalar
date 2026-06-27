@@ -547,8 +547,17 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        LSP pubnonces (Step C), forwarded to clients in LSP_RESPONSE so each
        client can set every co-signer's per-node nonce and finalize. */
     size_t mtx_stride = (size_t)f->n_participants * 66;  /* tight stride = actual signers, not the 256 array max -- keeps LSP_RESPONSE under the 16MB wire frame at scale */
-    unsigned char *all_pn = calloc(f->n_nodes, mtx_stride);
+    /* #54 G1b: one EXTRA matrix row (index f->n_nodes) carries the distribution-TX
+       dist pubnonces (one per participant).  Riding all_pn means the existing
+       free(all_pn) covers it with no new alloc/leak on any fail_pre path.  The
+       dist co-signing rides the existing 2 ceremony rounds; if anything
+       dist-specific fails it degrades to "no signed dist TX" (today's behaviour),
+       never blocking factory creation. */
+    unsigned char *all_pn = calloc(f->n_nodes + 1, mtx_stride);
     if (!all_pn) goto fail_pre;
+    size_t dist_row = (size_t)f->n_nodes * mtx_stride;  /* byte offset of the dist row */
+    int dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
+                       factory_session_init_dist(f));
 
     lsp_crash_checkpoint("factory_creation_propose");
 
@@ -574,6 +583,19 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             free(client_pn); free(all_pn);
             fprintf(stderr, "LSP-stateless: parse CLIENT_PUBNONCES (client %zu) failed\n", c);
             goto fail_pre;
+        }
+        /* #54 G1b: extract this client's distribution-TX dist pubnonce (optional)
+           before the per-node loop consumes nmsg.json.  Missing/bad -> degrade. */
+        if (dist_active) {
+            unsigned char dpn[66];
+            secp256k1_musig_pubnonce dpn_p;
+            if (wire_json_get_hex(nmsg.json, "dist_pubnonce", dpn, 66) == 66 &&
+                musig_pubnonce_parse(lsp->ctx, &dpn_p, dpn) &&
+                factory_session_set_nonce_dist(f, (size_t)my_part, &dpn_p)) {
+                memcpy(all_pn + dist_row + (size_t)my_part * 66, dpn, 66);
+            } else {
+                dist_active = 0;  /* missing/bad dist nonce -> degrade gracefully */
+            }
         }
         cJSON_Delete(nmsg.json);
         for (size_t nidx = 0; nidx < f->n_nodes; nidx++) {
@@ -613,6 +635,23 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             memset(lsp_seckey, 0, 32);
             free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
             goto fail_pre;
+        }
+        /* #54 G1b: LSP's fresh distribution-TX dist nonce (independent of the
+           per-node nonces; MuSig2 forbids nonce reuse across messages). */
+        secp256k1_musig_secnonce lsp_dist_secnonce;
+        unsigned char lsp_dist_pn[66] = {0};
+        unsigned char lsp_dist_psig[32] = {0};
+        if (dist_active) {
+            secp256k1_musig_pubnonce lsp_dist_pubnonce;
+            if (musig_generate_nonce(lsp->ctx, &lsp_dist_secnonce, &lsp_dist_pubnonce,
+                                     lsp_seckey, &lsp->lsp_pubkey,
+                                     &f->nodes[0].keyagg.cache) &&
+                factory_session_set_nonce_dist(f, 0, &lsp_dist_pubnonce)) {
+                musig_pubnonce_serialize(lsp->ctx, lsp_dist_pn, &lsp_dist_pubnonce);
+                memcpy(all_pn + dist_row + 0 * 66, lsp_dist_pn, 66);
+            } else {
+                dist_active = 0;
+            }
         }
         for (size_t nidx = 0; nidx < f->n_nodes; nidx++) {
             int slot = factory_find_signer_slot(f, nidx, 0);
@@ -660,6 +699,20 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             }
             musig_partial_sig_serialize(lsp->ctx, lsp_psig_per_node + nidx * 32, &lsp_psig);
         }
+        /* #54 G1b: every dist nonce now set (clients' in Step B + LSP's above) ->
+           finalize the dist session + create the LSP dist partial sig. */
+        if (dist_active) {
+            secp256k1_musig_partial_sig lsp_dist_ps;
+            if (factory_session_finalize_dist(f) &&
+                musig_create_partial_sig(lsp->ctx, &lsp_dist_ps, &lsp_dist_secnonce,
+                                         &lsp->lsp_keypair,
+                                         &f->dist_signing_session) &&
+                factory_session_set_partial_sig_dist(f, 0, &lsp_dist_ps)) {
+                musig_partial_sig_serialize(lsp->ctx, lsp_dist_psig, &lsp_dist_ps);
+            } else {
+                dist_active = 0;
+            }
+        }
         memset(lsp_seckey, 0, 32);
 
         /* Step D: LSP_RESPONSE -- per-node LSP nonces + psigs + full matrix. */
@@ -668,6 +721,32 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             all_pn, (uint32_t)(f->n_nodes * mtx_stride));
         free(lsp_pn_per_node); free(lsp_psig_per_node);
         if (!response) { free(all_pn); goto fail_pre; }
+        /* #54 G1b: attach dist co-signing fields so clients verify + sign the
+           distribution TX this same round.  Omitted when !dist_active -> clients
+           see no dist fields and skip dist signing (graceful degrade). */
+        if (dist_active) {
+            wire_json_add_hex(response, "lsp_dist_pubnonce", lsp_dist_pn, 66);
+            wire_json_add_hex(response, "all_dist_pubnonces",
+                              all_pn + dist_row, (size_t)f->n_participants * 66);
+            wire_json_add_hex(response, "lsp_dist_psig", lsp_dist_psig, 32);
+            cJSON_AddNumberToObject(response, "dist_nlocktime",
+                                    (double)f->cltv_timeout);
+            size_t namt = lsp->dist_n_client_amounts;
+            if (namt > 0 && namt <= (size_t)f->n_participants) {
+                unsigned char *amt_le = calloc(namt, 8);
+                if (amt_le) {
+                    for (size_t a = 0; a < namt; a++) {
+                        uint64_t v = lsp->dist_client_amounts[a];
+                        for (int b = 0; b < 8; b++)
+                            amt_le[a * 8 + b] = (unsigned char)((v >> (b * 8)) & 0xff);
+                    }
+                    wire_json_add_hex(response, "dist_client_amounts", amt_le, namt * 8);
+                    cJSON_AddNumberToObject(response, "dist_n_client_amounts",
+                                            (double)namt);
+                    free(amt_le);
+                }
+            }
+        }
         for (size_t i = 0; i < lsp->n_clients; i++) {
             if (!wire_send(lsp->client_fds[i], MSG_FACTORY_LSP_RESPONSE, response)) {
                 fprintf(stderr, "LSP-stateless: send LSP_RESPONSE to client %zu failed\n", i);
@@ -701,6 +780,19 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             fprintf(stderr, "LSP-stateless: parse CLIENT_FINAL_PSIGS (client %zu) failed\n", c);
             goto fail_pre;
         }
+        /* #54 G1b: extract this client's dist partial sig (optional) before
+           pmsg.json is freed.  Missing/bad -> degrade (no signed dist TX). */
+        if (dist_active) {
+            unsigned char dps[32];
+            secp256k1_musig_partial_sig dps_p;
+            if (wire_json_get_hex(pmsg.json, "dist_psig", dps, 32) == 32 &&
+                musig_partial_sig_parse(lsp->ctx, &dps_p, dps) &&
+                factory_session_set_partial_sig_dist(f, (size_t)my_part, &dps_p)) {
+                /* collected */
+            } else {
+                dist_active = 0;
+            }
+        }
         cJSON_Delete(pmsg.json);
         for (size_t nidx = 0; nidx < f->n_nodes; nidx++) {
             int slot = factory_find_signer_slot(f, nidx, my_part);
@@ -726,6 +818,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         fprintf(stderr, "LSP-stateless: factory_sessions_complete failed\n");
         goto fail_pre;
     }
+
+    /* #54 G1b: aggregate the dist partial sigs into the signed distribution TX
+       (the offline-forever recovery net), setting dist_tx_ready=2 so
+       wire_build_factory_ready ships distribution_tx_hex.  NON-FATAL: the factory
+       is already fully created; on any dist failure we simply ship no signed dist
+       TX (degrades to today's behaviour, no fund risk). */
+    if (dist_active && !factory_session_complete_dist(f))
+        fprintf(stderr, "LSP-stateless: dist co-sign incomplete -- FACTORY_READY "
+                "omits the signed distribution TX (offline-recovery degraded)\n");
 
     {
         cJSON *ready = wire_build_factory_ready(f);
