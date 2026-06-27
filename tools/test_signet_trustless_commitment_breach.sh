@@ -57,7 +57,8 @@ pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null||true; sleep 1
     --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
     --amount $AMOUNT --fee-rate $FEE_RATE \
     --confirm-timeout $CONFIRM_TIMEOUT --seckey "$LSP_SECKEY" --wallet "$WALLET" \
-    --db "$LSP_DB" --wt-db "$WT_DB" --demo --breach-standalone --lsp-balance-pct 50 > "$LSP_LOG" 2>&1 &
+    --db "$LSP_DB" --wt-db "$WT_DB" --demo --breach-standalone \
+    --breach-client-keys-file "$CLIENT_KEYS_FILE" --lsp-balance-pct 50 > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 for i in $(seq 1 120); do sleep 2; grep -q "listening on port $LSP_PORT" "$LSP_LOG" 2>/dev/null && { echo "  [$(ts)] LSP listening + self-funding"; break; }; kill -0 $LSP_PID 2>/dev/null||{ tail -25 "$LSP_LOG"; fail "LSP died before listening"; }; done
 for i in $(seq 0 $((N_CLIENTS-1))); do

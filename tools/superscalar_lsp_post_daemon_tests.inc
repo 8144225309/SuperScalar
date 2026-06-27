@@ -100,9 +100,16 @@
                 continue;
             }
 
-            /* Sign with both LSP + client keys */
+            /* Sign with both LSP + client keys.  #38: prefer the REAL strong
+               per-run client key (loaded via --breach-client-keys-file) so the
+               commitment breach re-signs validly with strong keys on public
+               signet; fall back to the byte-fill scaffold for legacy/regtest
+               weak-key runs (channel ci <-> client seckey line ci). */
             unsigned char cli_sec[32];
-            memset(cli_sec, client_fills[ci], 32);
+            if (n_breach_client_seckeys > (int)ci)
+                memcpy(cli_sec, breach_client_seckeys[ci], 32);
+            else
+                memset(cli_sec, client_fills[ci], 32);
             secp256k1_keypair cli_kp;
             if (!secp256k1_keypair_create(ctx, &cli_kp, cli_sec)) {
                 fprintf(stderr, "BREACH TEST: keypair create failed for channel %zu\n", ci);

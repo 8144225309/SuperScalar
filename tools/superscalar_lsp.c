@@ -1327,6 +1327,12 @@ int main(int argc, char *argv[]) {
     const char *wallet_name = NULL;
     int64_t cltv_timeout_arg = -1;  /* -1 = auto */
     int breach_test = 0;
+    /* #38: strong per-run client seckeys for the breach re-sign, loaded from
+       --breach-client-keys-file.  Lets the commitment-breach cheat re-sign each
+       client's revoked 2-of-2 with the REAL client key (so it works with strong
+       keys on public signet) instead of the weak byte-fill scaffold. */
+    unsigned char breach_client_seckeys[128][32];
+    int n_breach_client_seckeys = 0;
     int test_expiry = 0;
     int test_distrib = 0;
     int test_turnover = 0;
@@ -1649,6 +1655,28 @@ int main(int argc, char *argv[]) {
             breach_test = 3;  /* 3 = client-commitment breach + NO in-process WT;
                                  leaves the on-chain breach for an external standalone
                                  WT (--wt-db only) to detect + penalize (isolation test) */
+        else if (strcmp(argv[i], "--breach-client-keys-file") == 0 && i + 1 < argc) {
+            /* #38: load strong per-run client seckeys (one 64-hex per line, line i =
+               channel i's client) so the breach re-sign uses the real client key,
+               not the byte-fill scaffold -> the commitment breach works with strong
+               keys on public signet.  No effect unless a breach mode is also set. */
+            FILE *bkf = fopen(argv[++i], "r");
+            if (!bkf) { fprintf(stderr, "Error: cannot open --breach-client-keys-file %s\n", argv[i]); return 1; }
+            char bkline[160];
+            while (n_breach_client_seckeys < 128 && fgets(bkline, sizeof bkline, bkf)) {
+                size_t bl = strlen(bkline);
+                while (bl > 0 && (bkline[bl-1] == '\n' || bkline[bl-1] == '\r' || bkline[bl-1] == ' ')) bkline[--bl] = '\0';
+                if (bl == 0) continue;
+                if (hex_decode(bkline, breach_client_seckeys[n_breach_client_seckeys], 32) != 32) {
+                    fprintf(stderr, "Error: --breach-client-keys-file line %d is not a 32-byte hex seckey\n",
+                            n_breach_client_seckeys + 1);
+                    fclose(bkf); return 1;
+                }
+                n_breach_client_seckeys++;
+            }
+            fclose(bkf);
+            printf("LSP: loaded %d strong client seckey(s) for the breach re-sign\n", n_breach_client_seckeys);
+        }
         else if (strcmp(argv[i], "--test-rebalance") == 0)
             test_rebalance = 1;
         else if (strcmp(argv[i], "--test-wire-leaf-advance") == 0)
