@@ -1469,7 +1469,10 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        prep so it co-signs the new state but NOT the Leaf-P poison — exercising
        the client's fail-closed "no revoke without recourse" abort.  Env-gated
        test path only (same pattern as SS_CHEAT_DAEMON_MODE). */
-    if (mgr->watchtower && poison_required && !getenv("SS_CHEAT_OMIT_POISON")) {
+    if (mgr->watchtower && poison_required &&
+        /* #9: the OMIT_POISON test hook (skip poison registration) only honoured
+           when cheats are allowed (regtest); on mainnet poison ALWAYS registers. */
+        !(superscalar_cheat_allowed() && getenv("SS_CHEAT_OMIT_POISON"))) {
         if (factory_session_prepare_poison_tx_leaf(
                 f, pre_node_idx,
                 old_leaf_txid, (uint32_t)old_l_vout,
@@ -2770,7 +2773,7 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        Mirrors the legacy lsp_run_state_advance hook so the stateless path
        honours the same test contract (clean rc=0 right after the first
        state-advance ceremony completes). */
-    if (getenv("SS_KILL_AFTER_STATE_ADVANCE")) {
+    if (superscalar_cheat_allowed() && getenv("SS_KILL_AFTER_STATE_ADVANCE")) {  /* #9: gated */
         printf("CL5: SS_KILL_AFTER_STATE_ADVANCE set — clean exit after ceremony\n");
         fflush(stdout);
         exit(0);
