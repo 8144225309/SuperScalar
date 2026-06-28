@@ -821,6 +821,18 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         goto fail_pre;
     }
 
+    /* #48 Phase B (detection): verify the aggregated factory signatures at
+       ceremony time.  Until now an invalid aggregate (e.g. a bad client partial
+       sig) surfaced only at broadcast; fail fast here so we can abort -- and, in
+       Phase D, retry with fresh nonces -- before shipping a dud FACTORY_READY.
+       A valid ceremony always passes (no behaviour change); only a genuinely
+       invalid aggregate aborts. */
+    if (!factory_verify_all(f)) {
+        fprintf(stderr, "LSP-stateless: factory aggregate signature INVALID at "
+                "ceremony time (bad client psig?) -- aborting before broadcast\n");
+        goto fail_pre;
+    }
+
     /* #54 G1b: aggregate the dist partial sigs into the signed distribution TX
        (the offline-forever recovery net), setting dist_tx_ready=2 so
        wire_build_factory_ready ships distribution_tx_hex.  NON-FATAL: the factory
