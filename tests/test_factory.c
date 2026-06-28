@@ -246,6 +246,50 @@ int test_factory_sign_all(void) {
     return 1;
 }
 
+/* ---- Unit test: #48 bounded fresh-nonce retry ---- */
+
+int test_factory_sign_all_retry(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked), "compute funding spk");
+    unsigned char fake_txid[32]; memset(fake_txid, 0xAA, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return 0;
+    factory_init(f, ctx, kps, 5, 2, 4);
+    factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+
+    /* 1. Normal: succeeds on the first attempt and verifies. */
+    TEST_ASSERT(factory_sign_all_with_retry(f, SS_NONCE_RETRY_MAX), "retry helper signs+verifies");
+    TEST_ASSERT(factory_verify_all(f), "result verifies");
+
+    /* 2. Re-callable: a second full call also succeeds — factory_sessions_init
+       re-inits each session + fresh nonces, so no stale state leaks from attempt 1. */
+    TEST_ASSERT(factory_sign_all_with_retry(f, SS_NONCE_RETRY_MAX), "retry helper is re-callable");
+
+    /* 3. Transient verify-fail on attempt 1 -> retry -> succeeds on attempt 2.
+       Attempt 2 succeeding is itself proof the retry re-signs with FRESH nonces
+       (a reused/stale session would fail identically). */
+    g_factory_test_force_verify_fail = 1;
+    TEST_ASSERT(factory_sign_all_with_retry(f, SS_NONCE_RETRY_MAX), "recovers from a transient verify-fail");
+    TEST_ASSERT(g_factory_test_force_verify_fail == 0, "exactly one forced fail consumed (it retried)");
+
+    /* 4. Persistent verify-fail beyond the bound -> bounded abort (no infinite loop). */
+    g_factory_test_force_verify_fail = SS_NONCE_RETRY_MAX + 2;
+    TEST_ASSERT(!factory_sign_all_with_retry(f, SS_NONCE_RETRY_MAX), "bounded: persistent fail aborts");
+    g_factory_test_force_verify_fail = 0;   /* reset global so sibling tests are unaffected */
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* ---- Unit test: advance DW counter ---- */
 
 int test_factory_advance(void) {

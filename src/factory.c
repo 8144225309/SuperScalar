@@ -2104,7 +2104,13 @@ int factory_advance_and_rebuild_path(factory_t *f, int leaf_side) {
 }
 
 
+/* TEST-ONLY seam (always 0 in production; set only by unit tests): forces the
+   next N aggregate verifications to fail, to exercise the bounded fresh-nonce
+   retry path in factory_sign_all_with_retry. */
+int g_factory_test_force_verify_fail = 0;
+
 int factory_verify_all(factory_t *f) {
+    if (g_factory_test_force_verify_fail > 0) { g_factory_test_force_verify_fail--; return 0; }
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_signed) continue;
@@ -2208,6 +2214,28 @@ fail:
     return 0;
 }
 
+/* Bounded fresh-nonce retry around factory_sign_all (#48).  factory_sign_all is
+   safely re-callable: factory_sessions_init re-initialises every node's signing
+   session and each nonce is freshly drawn from /dev/urandom (see musig.c), so
+   each attempt uses a brand-new, non-repeating nonce (no nonce-reuse key leak).
+   A transient sign/verify failure re-signs with fresh nonces up to max_attempts;
+   a persistent failure still aborts (bounded).  factory_verify_all runs only
+   when factory_sign_all reported success, so a partial sign short-circuits to a
+   retry rather than a misleading verify. */
+int factory_sign_all_with_retry(factory_t *f, int max_attempts) {
+    if (!f) return 0;
+    if (max_attempts < 1) max_attempts = 1;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        if (factory_sign_all(f) && factory_verify_all(f))
+            return 1;
+        if (attempt < max_attempts)
+            fprintf(stderr, "factory: sign+verify attempt %d/%d failed; "
+                            "retrying with fresh nonces\n", attempt, max_attempts);
+    }
+    fprintf(stderr, "factory: sign+verify failed after %d attempt(s)\n", max_attempts);
+    return 0;
+}
+
 int factory_advance(factory_t *f) {
     if (!dw_counter_advance(&f->counter))
         return 0;
@@ -2218,7 +2246,7 @@ int factory_advance(factory_t *f) {
     if (!build_all_unsigned_txs(f))
         return 0;
 
-    return factory_sign_all(f);
+    return factory_sign_all_with_retry(f, SS_NONCE_RETRY_MAX);
 }
 
 /* Rebuild unsigned tx for a single node.
@@ -2472,7 +2500,7 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
         /* Full rebuild needed when root advances */
         if (!update_l_stock_outputs(f)) return 0;
         if (!build_all_unsigned_txs(f)) return 0;
-        return factory_sign_all(f);
+        return factory_sign_all_with_retry(f, SS_NONCE_RETRY_MAX);
     }
 
     /* Only rebuild + re-sign the leaf node */

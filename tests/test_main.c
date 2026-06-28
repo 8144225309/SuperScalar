@@ -97,6 +97,7 @@ extern int test_regtest_nsequence_edge(void);
 
 extern int test_factory_build_tree(void);
 extern int test_factory_sign_all(void);
+extern int test_factory_sign_all_retry(void);
 extern int test_factory_advance(void);
 extern int test_factory_sign_split_round_step_by_step(void);
 extern int test_factory_split_round_with_pool(void);
@@ -2037,6 +2038,7 @@ static void run_unit_tests(void) {
     printf("\n=== Factory Tree ===\n");
     RUN_TEST(test_factory_build_tree);
     RUN_TEST(test_factory_sign_all);
+    RUN_TEST(test_factory_sign_all_retry);
     RUN_TEST(test_factory_advance);
 
     printf("\n=== Factory Split-Round ===\n");
