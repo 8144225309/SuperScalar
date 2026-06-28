@@ -5396,6 +5396,40 @@ int test_persist_secret_columns_sealed(void) {
                         NULL, NULL, back, &has), "load lstock");
         TEST_ASSERT(has && memcmp(back, lsec, 32) == 0, "lstock secret round-trip");
     }
+
+    /* departed_clients.extracted_key (#327b round-2): 32-byte client privkey.
+       seal-on-write -> sealed on disk -> accessor round-trip. */
+    {
+        unsigned char dk[32]; for (int i = 0; i < 32; i++) dk[i] = (unsigned char)(0x50 + i);
+        TEST_ASSERT(persist_save_departed_client(&db, 11, 2, dk), "save departed client");
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT extracted_key FROM departed_clients WHERE factory_id=11 AND client_idx=2;",
+            -1, &st, NULL) == SQLITE_OK, "prep dc");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "dc row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "departed_clients.extracted_key sealed on write");
+        sqlite3_finalize(st);
+        int dep[8] = {0}; unsigned char gk[8][32];
+        TEST_ASSERT(persist_load_departed_clients(&db, 11, dep, gk, 8) >= 1, "load departed");
+        TEST_ASSERT(dep[2] && memcmp(gk[2], dk, 32) == 0, "departed extracted_key round-trip");
+    }
+
+    /* watchtower_keys.key_hex ('anchor', #327b round-2): 32-byte WT anchor seckey. */
+    {
+        unsigned char ak[32]; for (int i = 0; i < 32; i++) ak[i] = (unsigned char)(0x90 + i);
+        TEST_ASSERT(persist_save_anchor_key(&db, ak), "save anchor key");
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT key_hex FROM watchtower_keys WHERE key_name='anchor';", -1, &st, NULL) == SQLITE_OK, "prep wk");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "wk row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "watchtower_keys.key_hex sealed on write");
+        sqlite3_finalize(st);
+        unsigned char gak[32];
+        TEST_ASSERT(persist_load_anchor_key(&db, gak), "load anchor key");
+        TEST_ASSERT(memcmp(gak, ak, 32) == 0, "anchor key round-trip");
+    }
     persist_close(&db);
     unlink(path);
 
@@ -5436,6 +5470,17 @@ int test_persist_secret_columns_sealed(void) {
         sqlite3_bind_blob(ri, 4, rrs, 32, SQLITE_STATIC);   /* plaintext (keyless) */
         TEST_ASSERT(sqlite3_step(ri) == SQLITE_DONE, "insert rr plaintext");
         sqlite3_finalize(ri);
+    }
+
+    /* #327b round-2: a legacy plaintext departed_clients privkey to migrate
+       (exercises the rowid + text migrate path the new columns rely on). */
+    unsigned char dm[32]; for (int i = 0; i < 32; i++) dm[i] = (unsigned char)(0x60 + i);
+    {
+        char dmh[65]; hex_encode(dm, 32, dmh);
+        char dins[200];
+        snprintf(dins, sizeof dins,
+            "INSERT INTO departed_clients(factory_id,client_idx,extracted_key) VALUES(22,1,'%s');", dmh);
+        TEST_ASSERT(sqlite3_exec(kdb.db, dins, NULL, NULL, NULL) == SQLITE_OK, "insert departed plaintext");
     }
     persist_close(&kdb);
 
@@ -5478,6 +5523,20 @@ int test_persist_secret_columns_sealed(void) {
         TEST_ASSERT(persist_load_basepoints(&kdb2, 1, loc, rem), "load basepoints");
         TEST_ASSERT(memcmp(loc[0], pay_b, 32) == 0, "basepoint local secret round-trip");
         TEST_ASSERT(memcmp(rem[0], rpb_b, 33) == 0, "remote basepoint round-trip (plaintext)");
+    }
+    /* departed_clients legacy plaintext sealed by migration (rowid+text path) + round-trip */
+    {
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(kdb2.db,
+            "SELECT extracted_key FROM departed_clients WHERE factory_id=22 AND client_idx=1;",
+            -1, &st, NULL) == SQLITE_OK, "prep dc-mig");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "dc-mig row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "departed_clients sealed by migration");
+        sqlite3_finalize(st);
+        int dep[8] = {0}; unsigned char gk[8][32];
+        TEST_ASSERT(persist_load_departed_clients(&kdb2, 22, dep, gk, 8) >= 1, "load departed migrated");
+        TEST_ASSERT(dep[1] && memcmp(gk[1], dm, 32) == 0, "departed migrated round-trip");
     }
     persist_close(&kdb2);
     unlink(path2);

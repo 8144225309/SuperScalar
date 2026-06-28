@@ -4514,21 +4514,26 @@ int persist_save_departed_client(persist_t *p, uint32_t factory_id,
 
     char key_hex[65];
     hex_encode(extracted_key32, 32, key_hex);
+    char *dc_sealed = persist_seal_text(p, key_hex);   /* #327b: seal at rest (client privkey) */
+    memset(key_hex, 0, sizeof key_hex);
+    if (!dc_sealed) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO departed_clients "
         "(factory_id, client_idx, extracted_key) VALUES (?, ?, ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        memset(dc_sealed, 0, strlen(dc_sealed)); free(dc_sealed); return 0;
+    }
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)client_idx);
-    sqlite3_bind_text(stmt, 3, key_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, dc_sealed, -1, SQLITE_TRANSIENT);
 
     int ok3 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(dc_sealed, 0, strlen(dc_sealed)); free(dc_sealed);
     return ok3;
 }
 
@@ -4551,12 +4556,17 @@ size_t persist_load_departed_clients(persist_t *p, uint32_t factory_id,
     size_t count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         uint32_t cidx = (uint32_t)sqlite3_column_int(stmt, 0);
-        const char *key_hex = (const char *)sqlite3_column_text(stmt, 1);
+        const char *stored = (const char *)sqlite3_column_text(stmt, 1);
 
         if (cidx < max_clients) {
             if (departed_out) departed_out[cidx] = 1;
-            if (keys_out && key_hex)
-                hex_decode(key_hex, keys_out[cidx], 32);
+            if (keys_out && stored) {
+                char *key_pt = NULL;                       /* #327b: open at rest */
+                if (persist_open_text(p, stored, &key_pt) && key_pt) {
+                    hex_decode(key_pt, keys_out[cidx], 32);
+                    memset(key_pt, 0, strlen(key_pt)); free(key_pt);
+                }
+            }
         }
         count++;
     }
@@ -4975,19 +4985,24 @@ int persist_save_anchor_key(persist_t *p, const unsigned char *seckey32) {
 
     char key_hex[65];
     hex_encode(seckey32, 32, key_hex);
+    char *ak_sealed = persist_seal_text(p, key_hex);   /* #327b: seal at rest (anchor seckey) */
+    memset(key_hex, 0, sizeof key_hex);
+    if (!ak_sealed) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO watchtower_keys (key_name, key_hex) "
         "VALUES ('anchor', ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        memset(ak_sealed, 0, strlen(ak_sealed)); free(ak_sealed); return 0;
+    }
 
-    sqlite3_bind_text(stmt, 1, key_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, ak_sealed, -1, SQLITE_TRANSIENT);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(ak_sealed, 0, strlen(ak_sealed)); free(ak_sealed);
     return ok;
 }
 
@@ -5006,10 +5021,13 @@ int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out) {
         return 0;
     }
 
-    const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+    const char *stored = (const char *)sqlite3_column_text(stmt, 0);
     int ok = 0;
-    if (hex && hex_decode(hex, seckey32_out, 32) == 32)
+    char *hex = NULL;                                  /* #327b: open at rest */
+    if (stored && persist_open_text(p, stored, &hex) && hex &&
+        hex_decode(hex, seckey32_out, 32) == 32)
         ok = 1;
+    if (hex) { memset(hex, 0, strlen(hex)); free(hex); }
 
     sqlite3_finalize(stmt);
     return ok;

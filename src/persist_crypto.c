@@ -244,6 +244,15 @@ static const secret_col_t SECRET_COLS[] = {
        (is_blob=0).  This is the column the l_stock_poison_reveals schema comment
        promises is sealed at rest. */
     { "l_stock_poison_reveals",     "rowid",      "revocation_secret",       0 },
+    /* #327b round-2 — two more at-rest PRIVATE KEYS flagged in review:
+       departed_clients.extracted_key is a 32-byte client privkey (fed to
+       secp256k1_keypair_create in ladder.c to sign a departed client's
+       cooperative close), and watchtower_keys.key_hex ('anchor') is the WT's
+       32-byte CPFP anchor seckey.  Both were hex-stored in the clear.  Both are
+       rowid tables (departed_clients has a composite PK, watchtower_keys a TEXT
+       PK), so the migrate id is `rowid`. */
+    { "departed_clients",           "rowid",      "extracted_key",           0 },
+    { "watchtower_keys",            "rowid",      "key_hex",                 0 },
 };
 static const size_t N_SECRET_COLS = sizeof(SECRET_COLS) / sizeof(SECRET_COLS[0]);
 
