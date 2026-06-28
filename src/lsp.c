@@ -1188,6 +1188,17 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         goto close_fail;
     }
 
+    /* #48 Phase B (detection): verify the aggregate close signature at ceremony
+       time, before CLOSE_DONE/broadcast.  Until now an invalid aggregate (e.g. a
+       bad client psig) surfaced only at broadcast; fail fast here so we can abort
+       (and, in Phase C, retry with fresh nonces).  factory_verify_close_sig never
+       false-fails a valid close (guards on the funding being key-path-only). */
+    if (!factory_verify_close_sig(f, sig64, sighash)) {
+        fprintf(stderr, "LSP: cooperative-close aggregate signature INVALID at "
+                "ceremony time -- aborting before CLOSE_DONE\n");
+        goto close_fail;
+    }
+
     /* Finalize signed close tx */
     if (!finalize_signed_tx(close_tx_out, unsigned_tx.data, unsigned_tx.len, sig64)) {
         fprintf(stderr, "LSP: close finalize_signed_tx failed\n");

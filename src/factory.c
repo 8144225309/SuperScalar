@@ -2133,6 +2133,22 @@ int factory_verify_all(factory_t *f) {
     return 1;
 }
 
+/* #48: verify a cooperative-close aggregate signature at ceremony time.  The
+   close spends the same funding output the root node spends, so it verifies
+   against the funding aggregate key (node[0].tweaked_pubkey) under the close
+   sighash.  Returns 1 (do NOT abort) when the signature is valid, OR when the
+   funding carries a taptree whose key-path tweak we cannot reconstruct here (the
+   close finalises with no taptree tweak) -- in that case the caller keeps
+   today's broadcast-time detection rather than risk false-failing a valid close.
+   Returns 0 only when the signature was definitively checked and is INVALID. */
+int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
+                             const unsigned char sighash[32]) {
+    if (!f || f->n_nodes == 0) return 0;
+    if (f->nodes[0].has_taptree) return 1;   /* mr=NULL close key can't be matched; skip */
+    return secp256k1_schnorrsig_verify(f->ctx, sig64, sighash, 32,
+                                       &f->nodes[0].tweaked_pubkey);
+}
+
 
 int factory_sign_all(factory_t *f) {
     /* Step 1: Initialize sessions */
