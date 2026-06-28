@@ -102,6 +102,46 @@ must handle `musig_nonce_pool_next == 0` (pool exhaustion) by regenerating.
 - No nonce-reuse: assert (in the retry harness) that each attempt's pubnonce
   differs from the prior attempt's.
 
+## Status + C/D two-sided-retry protocol design (2026-06-28)
+
+PROGRESS:
+- Phase A (all-local sign retry): DONE, green (#407).
+- Phase B (ceremony-time detection, factory-creation + coop-close): DONE, green
+  (both regtest jobs pass -> the new verifies do not false-fail a valid ceremony).
+- P6 DoD core was ALREADY MET pre-#48: the rotation/rollover "stalled advance"
+  does bounded-retry -> proactive-exit (lsp_channels.c:7240-7305 -
+  lsp_rotation_should_retry up to 3x, then distribution-TX exit +
+  CEREMONY_ABORT_RETRY_LIMIT_REACHED + "ensure your watchtower is live" NOTICE).
+- User chose "go all the way" -> implement the C/D two-sided retry below.
+
+C/D TWO-SIDED RETRY PROTOCOL (no new wire message; the retry signal is a re-sent
+CLOSE_PROPOSE / re-sent factory nonce-request -- the client distinguishes it from
+CLOSE_DONE/FACTORY_READY):
+- LSP coop-close (lsp_run_cooperative_close): wrap session-init -> LSP nonce ->
+  CLOSE_PROPOSE -> collect CLOSE_NONCE -> ALL_NONCES -> finalize -> LSP psig ->
+  collect CLOSE_PSIG -> aggregate -> verify in a `for (attempt < SS_NONCE_RETRY_MAX)`
+  loop. The close OUTPUTS + sighash are built once (unchanged across attempts);
+  only nonces/psigs are fresh. On verify/aggregate fail: ceremony_prepare_retry on
+  close_nonce_cer/close_psig_cer, re-init the musig session + fresh LSP nonce, loop
+  (re-send CLOSE_PROPOSE). On success: break -> CLOSE_DONE. On exhaustion:
+  close_fail + the CEREMONY_ABORT_RETRY_LIMIT_REACHED NOTICE (mirror rotation).
+- Client (client_do_close_ceremony): wrap NONCE->PSIG->wait in a loop; after
+  sending CLOSE_PSIG, branch on the next msg -- CLOSE_DONE -> success;
+  CLOSE_PROPOSE (same outputs) -> retry with a fresh nonce; CEREMONY_ABORT ->
+  fail. Bounded by the same max so a wedged peer can't loop forever.
+- D (factory-creation): analogous -- LSP re-runs the client nonce-request on a
+  factory_verify_all fail; client re-enters the nonce/psig round.
+- Fault injection (regtest-only via superscalar_cheat_allowed; refused on mainnet
+  per the cheat-guard): SS_CHEAT_CLOSE_BAD_PSIG / SS_CHEAT_CREATE_BAD_PSIG -> a
+  client emits a corrupt psig on attempt 1 only (transient) or every attempt
+  (persistent).
+- Tests (before/after each step): normal ceremony stays green (no regression --
+  Phase B's passing regtest is the guard) + transient -> retry -> success +
+  persistent -> bounded abort + proactive-exit NOTICE + a pubnonce-differs check.
+RISK: this restructures the working close/creation ceremonies. Mitigation: keep
+the OUTPUTS/sighash build outside the loop (only re-randomise nonces); run the
+normal-path regtest before and after every commit.
+
 ## Open items / follow-ups
 
 - Pool exhaustion handling on retry for the two pool paths.
