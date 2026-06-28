@@ -37,7 +37,7 @@ AMOUNT="${AMOUNT:-2750000}"
 FEE_RATE="${FEE_RATE:-1000}"   # sat/kvB; regtest mempool floor is generous
 PORT="${PORT:-9951}"
 WALLET="${WALLET:-ss_sig_n127}"
-TAG="signet_scale_payments"
+TAG="signet_scale_payments_$$"   # PID-suffixed: a re-run must NOT overwrite a prior run's seed file (the breach harnesses already do this). A fixed tag once clobbered a failed run's seed -> that factory's sats became unrecoverable on signet.
 # Each payment needs a sender+receiver pair, so 2*PAYMENTS must fit in N_CLIENTS.
 # The LSP is launched with --payments PAYMENTS and blocks until it sees that many;
 # if PAYMENTS exceeds floor(N/2) only floor(N/2) pairs are set up, the LSP waits
