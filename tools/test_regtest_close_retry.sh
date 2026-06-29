@@ -20,7 +20,7 @@ red(){ printf '\033[31m%s\033[0m\n' "$*"; }; green(){ printf '\033[32m%s\033[0m\
 echo "=== [1/2] transient (SS_CHEAT_CLOSE_BAD_PSIG=1): close must RETRY then SUCCEED ==="
 N_CLIENTS=$N PAYMENTS=$P SS_CHEAT_CLOSE_BAD_PSIG=1 bash "$DIR/test_regtest_n64_payments.sh" "$BUILD_DIR"
 rc1=$?
-nretry=$(grep -c "retrying with fresh nonces" "$LOG" 2>/dev/null || echo 0)
+nretry=$(grep -cE "re-running with fresh nonces|retrying with fresh nonces" "$LOG" 2>/dev/null || echo 0)
 ncheat=$(grep -c "CHEAT] corrupting close psig" "$LOG" 2>/dev/null || echo 0)   # LSP log won't have it; clients do
 [ "$rc1" -eq 0 ] || { red "FAIL transient: lifecycle rc=$rc1 (close did not recover)"; exit 1; }
 [ "$nretry" -ge 1 ] || { red "FAIL transient: LSP never logged a retry (nretry=$nretry)"; exit 1; }
