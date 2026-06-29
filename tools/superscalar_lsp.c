@@ -4708,10 +4708,30 @@ accept_new_factory:
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
 
-    if (!lsp_run_cooperative_close(lsp_p, &close_tx, close_outputs, n_close_outputs,
+    /* #48 Phase C: bounded fresh-nonce retry for the cooperative close. A
+       ceremony-time verify failure (Phase B) returns 0 after a SOFT abort
+       (MSG_ERROR; connections survive) that returns each client to its main loop;
+       re-invoking the ceremony re-sends CLOSE_PROPOSE and the clients re-enter
+       with FRESH nonces (their daemon loop re-dispatches CLOSE_PROPOSE -> a new
+       client_do_close_ceremony). Bounded so a persistently-faulty signer cannot
+       loop forever; on exhaustion we fall through to the no-broadcast path below
+       (safe: clients keep their pre-signed commitment + watchtower and can
+       force-close). */
+    int _close_ok = 0;
+    for (int _ca = 1; _ca <= SS_NONCE_RETRY_MAX; _ca++) {
+        if (lsp_run_cooperative_close(lsp_p, &close_tx, close_outputs, n_close_outputs,
                                       chain_be ? (uint32_t)chain_be->get_block_height(chain_be) :
                                       (uint32_t)regtest_get_block_height(&rt))) {
-        fprintf(stderr, "LSP: cooperative close failed\n");
+            _close_ok = 1;
+            break;
+        }
+        if (_ca < SS_NONCE_RETRY_MAX)
+            fprintf(stderr, "LSP: cooperative close attempt %d/%d failed; "
+                    "retrying with fresh nonces\n", _ca, SS_NONCE_RETRY_MAX);
+    }
+    if (!_close_ok) {
+        fprintf(stderr, "LSP: cooperative close failed after %d attempts "
+                "(clients fall back to force-close)\n", SS_NONCE_RETRY_MAX);
         tx_buf_free(&close_tx);
         lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);

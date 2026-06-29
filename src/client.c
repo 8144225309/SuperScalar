@@ -809,6 +809,26 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     unsigned char psig_ser[32];
     musig_partial_sig_serialize(ctx, psig_ser, &close_psig);
 
+    /* #48 Phase C test seam: fault-inject a bad close psig to exercise the LSP's
+       bounded fresh-nonce retry. Gated on superscalar_cheat_allowed() (regtest
+       only; #9 proves SS_CHEAT_* is inert on mainnet). =1 corrupts only the FIRST
+       close attempt (transient -> the retry must recover); =2 corrupts every
+       attempt (persistent -> the LSP must bound + abort). The static counter
+       distinguishes attempts because each retry is a fresh ceremony call. */
+    {
+        const char *_bp = getenv("SS_CHEAT_CLOSE_BAD_PSIG");
+        if (_bp && superscalar_cheat_allowed()) {
+            static int _close_cheat_uses = 0;
+            int _mode = atoi(_bp);
+            if (_mode == 2 || (_mode == 1 && _close_cheat_uses == 0)) {
+                psig_ser[31] ^= 0x01;   /* still a valid scalar, wrong value -> agg verify fails */
+                fprintf(stderr, "Client: [CHEAT] corrupting close psig "
+                        "(SS_CHEAT_CLOSE_BAD_PSIG=%d, use=%d)\n", _mode, _close_cheat_uses);
+            }
+            _close_cheat_uses++;
+        }
+    }
+
     cJSON *psig_msg = wire_build_close_psig(psig_ser);
     if (!wire_send(fd, MSG_CLOSE_PSIG, psig_msg)) {
         fprintf(stderr, "Client: send CLOSE_PSIG failed\n");
