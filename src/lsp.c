@@ -502,11 +502,6 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     fflush(stdout);
     cJSON_Delete(propose);
 
-    if (!factory_sessions_init(f)) {
-        fprintf(stderr, "LSP-stateless: factory_sessions_init failed\n");
-        return 0;
-    }
-
     /* Build the UNSIGNED distribution TX and attach it to f.  #54 G1a/G1b:
        this dist TX is then CO-SIGNED below in the stateless creation ceremony
        (the per-signer dist nonce + partial-sig exchange), so FACTORY_READY
@@ -525,6 +520,28 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     }
 
     /* ---- Reversed stateless signing exchange ---- */
+
+    /* #48 Phase D: bounded fresh-nonce retry.  The tree + FACTORY_PROPOSE are
+       built/sent ONCE (above); only the signing rounds (sessions_init ->
+       PROPOSE_INTENT -> client pubnonces -> LSP nonces/psigs -> client psigs ->
+       verify) repeat.  If factory_verify_all fails at ceremony time (e.g. a bad
+       client partial sig) we re-init sessions and re-send PROPOSE_INTENT so all
+       parties re-sign with FRESH nonces, up to SS_NONCE_RETRY_MAX times, before
+       aborting.  Every per-round buffer (all_pn / lsp_* / client_*) is freed
+       before the verify point, so a retry re-enters the loop with nothing to
+       clean up.  dist_active is hoisted so the post-loop dist completion sees the
+       final round's value. */
+    int dist_active = 0;
+    int verify_ok = 0;
+    for (int fc_attempt = 0; fc_attempt <= SS_NONCE_RETRY_MAX; fc_attempt++) {
+        if (fc_attempt > 0)
+            fprintf(stderr, "LSP-stateless: factory creation retry %d/%d "
+                    "(re-running with fresh nonces)\n",
+                    fc_attempt + 1, SS_NONCE_RETRY_MAX + 1);
+        if (!factory_sessions_init(f)) {
+            fprintf(stderr, "LSP-stateless: factory_sessions_init failed\n");
+            goto fail_pre;
+        }
 
     /* Step A: PROPOSE_INTENT(n_nodes) to all clients (begin reversed flow). */
     {
@@ -558,8 +575,8 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     unsigned char *all_pn = calloc(f->n_nodes + 1, mtx_stride);
     if (!all_pn) goto fail_pre;
     size_t dist_row = (size_t)f->n_nodes * mtx_stride;  /* byte offset of the dist row */
-    int dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
-                       factory_session_init_dist(f));
+    dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
+                   factory_session_init_dist(f));
 
     lsp_crash_checkpoint("factory_creation_propose");
 
@@ -827,9 +844,20 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        Phase D, retry with fresh nonces -- before shipping a dud FACTORY_READY.
        A valid ceremony always passes (no behaviour change); only a genuinely
        invalid aggregate aborts. */
-    if (!factory_verify_all(f)) {
+        if (factory_verify_all(f)) {
+            verify_ok = 1;
+            break;  /* aggregate valid -- exit the bounded retry loop */
+        }
         fprintf(stderr, "LSP-stateless: factory aggregate signature INVALID at "
-                "ceremony time (bad client psig?) -- aborting before broadcast\n");
+                "ceremony time (bad client psig?)%s\n",
+                fc_attempt < SS_NONCE_RETRY_MAX
+                    ? " -- re-running with fresh nonces"
+                    : " -- retry limit reached");
+    }  /* end #48 Phase D bounded retry loop */
+    if (!verify_ok) {
+        fprintf(stderr, "LSP-stateless: factory creation failed after %d attempts "
+                "(persistent bad psig) -- aborting before broadcast\n",
+                SS_NONCE_RETRY_MAX + 1);
         goto fail_pre;
     }
 

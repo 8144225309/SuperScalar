@@ -941,7 +941,7 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
    same (stateless, #272 default) protocol. */
 static int client_factory_creation_stateless_signing(
         int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
-        factory_t *factory, uint32_t my_index);
+        factory_t *factory, uint32_t my_index, int intent_already_recvd);
 
 int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
@@ -1126,7 +1126,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 
     if (rot_stateless) {
         if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
-                                                        factory_out, my_index))
+                                                        factory_out, my_index, 0))
             return 0;
     } else {
     /* Generate nonces */
@@ -1512,30 +1512,35 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
    Returns 1 on success, 0 on failure. */
 static int client_factory_creation_stateless_signing(
         int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
-        factory_t *factory, uint32_t my_index) {
+        factory_t *factory, uint32_t my_index, int intent_already_recvd) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    /* Recv PROPOSE_INTENT (0x85) -- begin reversed flow. */
-    wire_msg_t imsg;
-    if (!wire_recv_handle_ping(fd, &imsg, 0) || check_msg_error(&imsg) ||
-        imsg.msg_type != MSG_FACTORY_PROPOSE_INTENT) {
-        fprintf(stderr, "Client-stateless %u: expected PROPOSE_INTENT, got 0x%02x\n",
-                my_index, imsg.json ? imsg.msg_type : 0);
-        if (imsg.json) cJSON_Delete(imsg.json);
-        return 0;
-    }
-    uint32_t intent_n_nodes = 0;
-    if (!wire_parse_factory_propose_intent(imsg.json, &intent_n_nodes)) {
-        fprintf(stderr, "Client-stateless %u: parse PROPOSE_INTENT failed\n", my_index);
+    /* Recv PROPOSE_INTENT (0x85) -- begin reversed flow.  On a #48 Phase D
+       retry the caller has already consumed the re-sent PROPOSE_INTENT (to
+       detect the retry) and validated n_nodes, so it passes
+       intent_already_recvd=1 and we skip the recv here. */
+    if (!intent_already_recvd) {
+        wire_msg_t imsg;
+        if (!wire_recv_handle_ping(fd, &imsg, 0) || check_msg_error(&imsg) ||
+            imsg.msg_type != MSG_FACTORY_PROPOSE_INTENT) {
+            fprintf(stderr, "Client-stateless %u: expected PROPOSE_INTENT, got 0x%02x\n",
+                    my_index, imsg.json ? imsg.msg_type : 0);
+            if (imsg.json) cJSON_Delete(imsg.json);
+            return 0;
+        }
+        uint32_t intent_n_nodes = 0;
+        if (!wire_parse_factory_propose_intent(imsg.json, &intent_n_nodes)) {
+            fprintf(stderr, "Client-stateless %u: parse PROPOSE_INTENT failed\n", my_index);
+            cJSON_Delete(imsg.json);
+            return 0;
+        }
         cJSON_Delete(imsg.json);
-        return 0;
-    }
-    cJSON_Delete(imsg.json);
-    if (intent_n_nodes != (uint32_t)factory->n_nodes) {
-        fprintf(stderr, "Client-stateless %u: n_nodes mismatch (intent=%u local=%zu)\n",
-                my_index, intent_n_nodes, factory->n_nodes);
-        return 0;
+        if (intent_n_nodes != (uint32_t)factory->n_nodes) {
+            fprintf(stderr, "Client-stateless %u: n_nodes mismatch (intent=%u local=%zu)\n",
+                    my_index, intent_n_nodes, factory->n_nodes);
+            return 0;
+        }
     }
 
     size_t nn = factory->n_nodes;
@@ -2275,9 +2280,66 @@ int client_run_with_channels(secp256k1_context *ctx,
        The stateless path leaves it NULL (free(NULL) is a no-op). */
     wire_bundle_entry_t *nonce_entries = NULL;
     if (ss_stateless_creation) {
-        if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
-                                                        factory, my_index))
+        /* #48 Phase D: bounded fresh-nonce retry for factory creation.  If the
+           LSP's ceremony-time factory_verify_all fails (e.g. a bad client psig),
+           it re-inits sessions and re-sends PROPOSE_INTENT instead of aborting;
+           we mirror that -- re-init our sessions and re-sign with a FRESH nonce,
+           up to SS_NONCE_RETRY_MAX times, then give up.  The signing function
+           consumes the FIRST PROPOSE_INTENT itself; on a retry we have already
+           consumed the re-sent one (to detect it), so we pass
+           intent_already_recvd=1.  On success it also consumes + applies
+           FACTORY_READY, so the shared recv below is skipped for this path. */
+        int created = 0;
+        int intent_held = 0;
+        for (int fc_attempt = 0; fc_attempt <= SS_NONCE_RETRY_MAX; fc_attempt++) {
+            if (fc_attempt > 0 && !factory_sessions_init(factory)) {
+                fprintf(stderr, "Client %u: re-init sessions (creation retry) failed\n",
+                        my_index);
+                goto fail;
+            }
+            if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
+                                                            factory, my_index,
+                                                            intent_held))
+                goto fail;
+            intent_held = 0;
+            /* Result: FACTORY_READY (done) or a re-sent PROPOSE_INTENT (retry). */
+            if (!wire_recv(fd, &msg) || check_msg_error(&msg)) {
+                fprintf(stderr, "Client %u: recv after creation psigs failed\n", my_index);
+                if (msg.json) cJSON_Delete(msg.json);
+                goto fail;
+            }
+            if (msg.msg_type == MSG_FACTORY_READY) {
+                client_apply_factory_ready(factory, msg.json);
+                cJSON_Delete(msg.json);
+                created = 1;
+                break;
+            } else if (msg.msg_type == MSG_FACTORY_PROPOSE_INTENT &&
+                       fc_attempt < SS_NONCE_RETRY_MAX) {
+                uint32_t rn = 0;
+                if (!wire_parse_factory_propose_intent(msg.json, &rn) ||
+                    rn != (uint32_t)factory->n_nodes) {
+                    fprintf(stderr, "Client %u: bad retry PROPOSE_INTENT\n", my_index);
+                    cJSON_Delete(msg.json);
+                    goto fail;
+                }
+                cJSON_Delete(msg.json);
+                fprintf(stderr, "Client %u: factory creation retry %d/%d "
+                        "(LSP requested fresh nonces)\n",
+                        my_index, fc_attempt + 2, SS_NONCE_RETRY_MAX + 1);
+                intent_held = 1;
+                continue;
+            } else {
+                fprintf(stderr, "Client %u: expected FACTORY_READY, got 0x%02x\n",
+                        my_index, msg.msg_type);
+                if (msg.json) cJSON_Delete(msg.json);
+                goto fail;
+            }
+        }
+        if (!created) {
+            fprintf(stderr, "Client %u: factory creation failed after %d attempts\n",
+                    my_index, SS_NONCE_RETRY_MAX + 1);
             goto fail;
+        }
     } else {
     /* Generate nonces via pool */
     unsigned char my_seckey[32];
@@ -2514,14 +2576,18 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     }  /* end else (legacy round-1-first nonce/psig path) */
 
-    /* Receive FACTORY_READY */
-    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
-        fprintf(stderr, "Client: expected FACTORY_READY\n");
-        if (msg.json) cJSON_Delete(msg.json);
-        goto fail;
+    /* Receive FACTORY_READY.  The stateless creation path (above) already
+       consumed + applied FACTORY_READY inside its bounded retry loop, so only
+       the legacy path recvs it here. */
+    if (!ss_stateless_creation) {
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
+            fprintf(stderr, "Client: expected FACTORY_READY\n");
+            if (msg.json) cJSON_Delete(msg.json);
+            goto fail;
+        }
+        client_apply_factory_ready(factory, msg.json);
+        cJSON_Delete(msg.json);
     }
-    client_apply_factory_ready(factory, msg.json);
-    cJSON_Delete(msg.json);
 
     /* Log expected distribution amount.  The distribution TX is a fallback
        (used only if the factory expires without cooperative rotation), so
