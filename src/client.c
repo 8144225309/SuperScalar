@@ -1805,6 +1805,33 @@ static int client_factory_creation_stateless_signing(
     }
     free(my_secnonces); free(my_slot);
 
+    /* #48 Phase D test seam: fault-inject a bad CREATION psig to exercise the
+       LSP's factory-creation bounded retry. Gated on superscalar_cheat_allowed()
+       (regtest only; #9 proves SS_CHEAT_* is inert on mainnet). =1 corrupts only
+       the FIRST creation ceremony (transient); =2 every ceremony (persistent).
+       Corrupts the first signed node's psig (first non-zero 32B chunk). */
+    {
+        const char *_cp = getenv("SS_CHEAT_CREATE_BAD_PSIG");
+        if (_cp && superscalar_cheat_allowed()) {
+            static int _create_cheat_uses = 0;
+            int _mode = atoi(_cp);
+            if (_mode == 2 || (_mode == 1 && _create_cheat_uses == 0)) {
+                for (size_t _n = 0; _n < nn; _n++) {
+                    int _nz = 0;
+                    for (int _b = 0; _b < 32; _b++) if (my_psig_per_node[_n*32+_b]) { _nz = 1; break; }
+                    if (_nz) {
+                        my_psig_per_node[_n*32+31] ^= 0x01;
+                        fprintf(stderr, "Client-stateless %u: [CHEAT] corrupting creation psig "
+                                "node %zu (SS_CHEAT_CREATE_BAD_PSIG=%d, use=%d)\n",
+                                my_index, _n, _mode, _create_cheat_uses);
+                        break;
+                    }
+                }
+            }
+            _create_cheat_uses++;
+        }
+    }
+
     /* Send CLIENT_FINAL_PSIGS (per-node; unsigned nodes carry zero psig). */
     {
         cJSON *fp = wire_build_factory_client_final_psigs(my_psig_per_node, (uint32_t)nn);
