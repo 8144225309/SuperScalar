@@ -73,7 +73,7 @@ int ladder_create_factory(ladder_t *lad,
     for (uint32_t i = 0; i < lf->factory.counter.total_states - 1; i++)
         dw_counter_advance(&lf->factory.counter);
 
-    if (!factory_sign_all(&lf->factory)) {
+    if (!factory_sign_all_with_retry(&lf->factory, SS_NONCE_RETRY_MAX)) {
         tx_buf_free(&lf->distribution_tx);
         return 0;
     }

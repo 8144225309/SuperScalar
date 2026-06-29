@@ -809,6 +809,26 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     unsigned char psig_ser[32];
     musig_partial_sig_serialize(ctx, psig_ser, &close_psig);
 
+    /* #48 Phase C test seam: fault-inject a bad close psig to exercise the LSP's
+       bounded fresh-nonce retry. Gated on superscalar_cheat_allowed() (regtest
+       only; #9 proves SS_CHEAT_* is inert on mainnet). =1 corrupts only the FIRST
+       close attempt (transient -> the retry must recover); =2 corrupts every
+       attempt (persistent -> the LSP must bound + abort). The static counter
+       distinguishes attempts because each retry is a fresh ceremony call. */
+    {
+        const char *_bp = getenv("SS_CHEAT_CLOSE_BAD_PSIG");
+        if (_bp && superscalar_cheat_allowed()) {
+            static int _close_cheat_uses = 0;
+            int _mode = atoi(_bp);
+            if (_mode == 2 || (_mode == 1 && _close_cheat_uses == 0)) {
+                psig_ser[31] ^= 0x01;   /* still a valid scalar, wrong value -> agg verify fails */
+                fprintf(stderr, "Client: [CHEAT] corrupting close psig "
+                        "(SS_CHEAT_CLOSE_BAD_PSIG=%d, use=%d)\n", _mode, _close_cheat_uses);
+            }
+            _close_cheat_uses++;
+        }
+    }
+
     cJSON *psig_msg = wire_build_close_psig(psig_ser);
     if (!wire_send(fd, MSG_CLOSE_PSIG, psig_msg)) {
         fprintf(stderr, "Client: send CLOSE_PSIG failed\n");
@@ -818,12 +838,29 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     }
     cJSON_Delete(psig_msg);
 
-    /* Receive CLOSE_DONE */
+    /* Receive CLOSE_DONE -- or a re-CLOSE_PROPOSE if the LSP is re-running the
+       close with fresh nonces after an invalid aggregate (#48 Phase C). On a
+       re-PROPOSE, re-run the close ceremony fresh (fresh nonce) by recursing with
+       the new proposal; bounded by the LSP's retry cap (it sends finitely many
+       re-PROPOSEs, then CLOSE_DONE or a terminal error -> MSG_ERROR). */
     wire_msg_t done_msg;
-    if (!wire_recv(fd, &done_msg) || check_msg_error(&done_msg) ||
-        done_msg.msg_type != MSG_CLOSE_DONE) {
-        fprintf(stderr, "Client: expected CLOSE_DONE\n");
+    if (!wire_recv(fd, &done_msg) || check_msg_error(&done_msg)) {
+        fprintf(stderr, "Client: close failed (LSP error / no CLOSE_DONE)\n");
         if (done_msg.json) cJSON_Delete(done_msg.json);
+        tx_buf_free(&close_unsigned);
+        return 0;
+    }
+    if (done_msg.msg_type == MSG_CLOSE_PROPOSE) {
+        fprintf(stderr, "Client: LSP re-proposing cooperative close -- retrying with a fresh nonce\n");
+        tx_buf_free(&close_unsigned);
+        int _r = client_do_close_ceremony(fd, ctx, keypair, my_pubkey, factory,
+                                           n_participants, &done_msg, current_height, ch);
+        cJSON_Delete(done_msg.json);
+        return _r;
+    }
+    if (done_msg.msg_type != MSG_CLOSE_DONE) {
+        fprintf(stderr, "Client: expected CLOSE_DONE, got 0x%02x\n", done_msg.msg_type);
+        cJSON_Delete(done_msg.json);
         tx_buf_free(&close_unsigned);
         return 0;
     }
@@ -904,7 +941,7 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
    same (stateless, #272 default) protocol. */
 static int client_factory_creation_stateless_signing(
         int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
-        factory_t *factory, uint32_t my_index);
+        factory_t *factory, uint32_t my_index, int intent_already_recvd);
 
 int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
@@ -1089,7 +1126,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 
     if (rot_stateless) {
         if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
-                                                        factory_out, my_index))
+                                                        factory_out, my_index, 0))
             return 0;
     } else {
     /* Generate nonces */
@@ -1475,30 +1512,35 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
    Returns 1 on success, 0 on failure. */
 static int client_factory_creation_stateless_signing(
         int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
-        factory_t *factory, uint32_t my_index) {
+        factory_t *factory, uint32_t my_index, int intent_already_recvd) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    /* Recv PROPOSE_INTENT (0x85) -- begin reversed flow. */
-    wire_msg_t imsg;
-    if (!wire_recv_handle_ping(fd, &imsg, 0) || check_msg_error(&imsg) ||
-        imsg.msg_type != MSG_FACTORY_PROPOSE_INTENT) {
-        fprintf(stderr, "Client-stateless %u: expected PROPOSE_INTENT, got 0x%02x\n",
-                my_index, imsg.json ? imsg.msg_type : 0);
-        if (imsg.json) cJSON_Delete(imsg.json);
-        return 0;
-    }
-    uint32_t intent_n_nodes = 0;
-    if (!wire_parse_factory_propose_intent(imsg.json, &intent_n_nodes)) {
-        fprintf(stderr, "Client-stateless %u: parse PROPOSE_INTENT failed\n", my_index);
+    /* Recv PROPOSE_INTENT (0x85) -- begin reversed flow.  On a #48 Phase D
+       retry the caller has already consumed the re-sent PROPOSE_INTENT (to
+       detect the retry) and validated n_nodes, so it passes
+       intent_already_recvd=1 and we skip the recv here. */
+    if (!intent_already_recvd) {
+        wire_msg_t imsg;
+        if (!wire_recv_handle_ping(fd, &imsg, 0) || check_msg_error(&imsg) ||
+            imsg.msg_type != MSG_FACTORY_PROPOSE_INTENT) {
+            fprintf(stderr, "Client-stateless %u: expected PROPOSE_INTENT, got 0x%02x\n",
+                    my_index, imsg.json ? imsg.msg_type : 0);
+            if (imsg.json) cJSON_Delete(imsg.json);
+            return 0;
+        }
+        uint32_t intent_n_nodes = 0;
+        if (!wire_parse_factory_propose_intent(imsg.json, &intent_n_nodes)) {
+            fprintf(stderr, "Client-stateless %u: parse PROPOSE_INTENT failed\n", my_index);
+            cJSON_Delete(imsg.json);
+            return 0;
+        }
         cJSON_Delete(imsg.json);
-        return 0;
-    }
-    cJSON_Delete(imsg.json);
-    if (intent_n_nodes != (uint32_t)factory->n_nodes) {
-        fprintf(stderr, "Client-stateless %u: n_nodes mismatch (intent=%u local=%zu)\n",
-                my_index, intent_n_nodes, factory->n_nodes);
-        return 0;
+        if (intent_n_nodes != (uint32_t)factory->n_nodes) {
+            fprintf(stderr, "Client-stateless %u: n_nodes mismatch (intent=%u local=%zu)\n",
+                    my_index, intent_n_nodes, factory->n_nodes);
+            return 0;
+        }
     }
 
     size_t nn = factory->n_nodes;
@@ -1767,6 +1809,39 @@ static int client_factory_creation_stateless_signing(
         musig_partial_sig_serialize(ctx, my_psig_per_node + nidx * 32, &my_psig);
     }
     free(my_secnonces); free(my_slot);
+
+    /* #48 Phase D test seam: fault-inject a bad CREATION psig to exercise the
+       LSP's factory-creation bounded retry. Gated on superscalar_cheat_allowed()
+       (regtest only; #9 proves SS_CHEAT_* is inert on mainnet). =1 corrupts only
+       the FIRST creation ceremony (transient); =2 every ceremony (persistent).
+       Corrupts the first signed node's psig (first non-zero 32B chunk).
+
+       ONLY client my_index==1 corrupts.  If every client XORed the low bit of its
+       OWN node-0 partial, the per-signer deltas (each +-1) can sum to zero in the
+       MuSig2 aggregate (s_agg = sum of partials), leaving a VALID aggregate ~37%
+       of the time -- a flaky no-op.  A single bad partial cannot cancel, so the
+       aggregate is reliably invalid and the LSP's verify+retry always fires. */
+    {
+        const char *_cp = getenv("SS_CHEAT_CREATE_BAD_PSIG");
+        if (_cp && superscalar_cheat_allowed() && my_index == 1) {
+            static int _create_cheat_uses = 0;
+            int _mode = atoi(_cp);
+            if (_mode == 2 || (_mode == 1 && _create_cheat_uses == 0)) {
+                for (size_t _n = 0; _n < nn; _n++) {
+                    int _nz = 0;
+                    for (int _b = 0; _b < 32; _b++) if (my_psig_per_node[_n*32+_b]) { _nz = 1; break; }
+                    if (_nz) {
+                        my_psig_per_node[_n*32+31] ^= 0x01;
+                        fprintf(stderr, "Client-stateless %u: [CHEAT] corrupting creation psig "
+                                "node %zu (SS_CHEAT_CREATE_BAD_PSIG=%d, use=%d)\n",
+                                my_index, _n, _mode, _create_cheat_uses);
+                        break;
+                    }
+                }
+            }
+            _create_cheat_uses++;
+        }
+    }
 
     /* Send CLIENT_FINAL_PSIGS (per-node; unsigned nodes carry zero psig). */
     {
@@ -2211,9 +2286,66 @@ int client_run_with_channels(secp256k1_context *ctx,
        The stateless path leaves it NULL (free(NULL) is a no-op). */
     wire_bundle_entry_t *nonce_entries = NULL;
     if (ss_stateless_creation) {
-        if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
-                                                        factory, my_index))
+        /* #48 Phase D: bounded fresh-nonce retry for factory creation.  If the
+           LSP's ceremony-time factory_verify_all fails (e.g. a bad client psig),
+           it re-inits sessions and re-sends PROPOSE_INTENT instead of aborting;
+           we mirror that -- re-init our sessions and re-sign with a FRESH nonce,
+           up to SS_NONCE_RETRY_MAX times, then give up.  The signing function
+           consumes the FIRST PROPOSE_INTENT itself; on a retry we have already
+           consumed the re-sent one (to detect it), so we pass
+           intent_already_recvd=1.  On success it also consumes + applies
+           FACTORY_READY, so the shared recv below is skipped for this path. */
+        int created = 0;
+        int intent_held = 0;
+        for (int fc_attempt = 0; fc_attempt <= SS_NONCE_RETRY_MAX; fc_attempt++) {
+            if (fc_attempt > 0 && !factory_sessions_init(factory)) {
+                fprintf(stderr, "Client %u: re-init sessions (creation retry) failed\n",
+                        my_index);
+                goto fail;
+            }
+            if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
+                                                            factory, my_index,
+                                                            intent_held))
+                goto fail;
+            intent_held = 0;
+            /* Result: FACTORY_READY (done) or a re-sent PROPOSE_INTENT (retry). */
+            if (!wire_recv(fd, &msg) || check_msg_error(&msg)) {
+                fprintf(stderr, "Client %u: recv after creation psigs failed\n", my_index);
+                if (msg.json) cJSON_Delete(msg.json);
+                goto fail;
+            }
+            if (msg.msg_type == MSG_FACTORY_READY) {
+                client_apply_factory_ready(factory, msg.json);
+                cJSON_Delete(msg.json);
+                created = 1;
+                break;
+            } else if (msg.msg_type == MSG_FACTORY_PROPOSE_INTENT &&
+                       fc_attempt < SS_NONCE_RETRY_MAX) {
+                uint32_t rn = 0;
+                if (!wire_parse_factory_propose_intent(msg.json, &rn) ||
+                    rn != (uint32_t)factory->n_nodes) {
+                    fprintf(stderr, "Client %u: bad retry PROPOSE_INTENT\n", my_index);
+                    cJSON_Delete(msg.json);
+                    goto fail;
+                }
+                cJSON_Delete(msg.json);
+                fprintf(stderr, "Client %u: factory creation retry %d/%d "
+                        "(LSP requested fresh nonces)\n",
+                        my_index, fc_attempt + 2, SS_NONCE_RETRY_MAX + 1);
+                intent_held = 1;
+                continue;
+            } else {
+                fprintf(stderr, "Client %u: expected FACTORY_READY, got 0x%02x\n",
+                        my_index, msg.msg_type);
+                if (msg.json) cJSON_Delete(msg.json);
+                goto fail;
+            }
+        }
+        if (!created) {
+            fprintf(stderr, "Client %u: factory creation failed after %d attempts\n",
+                    my_index, SS_NONCE_RETRY_MAX + 1);
             goto fail;
+        }
     } else {
     /* Generate nonces via pool */
     unsigned char my_seckey[32];
@@ -2450,14 +2582,18 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     }  /* end else (legacy round-1-first nonce/psig path) */
 
-    /* Receive FACTORY_READY */
-    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
-        fprintf(stderr, "Client: expected FACTORY_READY\n");
-        if (msg.json) cJSON_Delete(msg.json);
-        goto fail;
+    /* Receive FACTORY_READY.  The stateless creation path (above) already
+       consumed + applied FACTORY_READY inside its bounded retry loop, so only
+       the legacy path recvs it here. */
+    if (!ss_stateless_creation) {
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
+            fprintf(stderr, "Client: expected FACTORY_READY\n");
+            if (msg.json) cJSON_Delete(msg.json);
+            goto fail;
+        }
+        client_apply_factory_ready(factory, msg.json);
+        cJSON_Delete(msg.json);
     }
-    client_apply_factory_ready(factory, msg.json);
-    cJSON_Delete(msg.json);
 
     /* Log expected distribution amount.  The distribution TX is a fallback
        (used only if the factory expires without cooperative rotation), so

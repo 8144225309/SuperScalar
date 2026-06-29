@@ -686,6 +686,17 @@ void factory_set_funding(factory_t *f,
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
 int factory_verify_all(factory_t *f);
+
+/* Bounded fresh-nonce retry (#48): max sign+verify attempts per ceremony before
+   abort. Each attempt re-draws fresh nonces (never reused — see
+   docs/p6-bounded-nonce-retry.md), so retry is nonce-reuse-safe. */
+#define SS_NONCE_RETRY_MAX 3
+int factory_sign_all_with_retry(factory_t *f, int max_attempts);
+/* #48: ceremony-time verify of a cooperative-close aggregate sig (see factory.c). */
+int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
+                             const unsigned char sighash[32]);
+extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in production */
+
 int factory_advance(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
