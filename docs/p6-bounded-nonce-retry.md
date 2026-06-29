@@ -142,6 +142,49 @@ RISK: this restructures the working close/creation ceremonies. Mitigation: keep
 the OUTPUTS/sighash build outside the loop (only re-randomise nonces); run the
 normal-path regtest before and after every commit.
 
+## Phase C + D RESULTS (2026-06-29) -- DONE + PROVEN on regtest
+
+**Phase C (coop-close)** -- two-sided protocol as designed. The LSP returns a
+distinct "retryable" code (no abort, no client disconnect) on a ceremony-time
+verify-fail; the daemon caller loops it bounded; `client_do_close_ceremony`
+recurses on a re-sent CLOSE_PROPOSE. Cheat-proof `tools/test_regtest_close_retry.sh`:
+=1 (transient) -> close RETRIES + the full lifecycle SUCCEEDS; =2 (persistent) ->
+close BOUNDS + aborts -> clients fall back to force-close. CLOSE_RETRY_TEST PASS.
+
+**Phase D (factory-creation)** -- implemented as a BUILD-ONCE INTERNAL LOOP, NOT
+the "caller re-invokes" sketch above. Rationale discovered during impl: the LSP
+re-invoke path rebuilds the whole tree (`factory_init_from_pubkeys` memsets f) and
+re-sends FACTORY_PROPOSE, and the old `fail_pre`'s `factory_free` is what silently
+broke the pre-existing 3x creation retry (config lost + clients disconnected). The
+clean design: build the tree + FACTORY_PROPOSE ONCE, then loop ONLY the signing
+rounds in `lsp_run_factory_creation_stateless` -- `factory_sessions_init`
+(re-callable; inline session structs; leak-free) -> PROPOSE_INTENT -> client
+pubnonces -> LSP nonces / LSP_RESPONSE -> client psigs -> `factory_sessions_complete`
+-> `factory_verify_all`. On verify-fail: re-init sessions + re-send PROPOSE_INTENT
+(NO abort, NO factory_free), up to SS_NONCE_RETRY_MAX, then `fail_pre`. Every
+per-round buffer (all_pn / lsp_* / client_*) is freed before the verify point, so
+the retry path is leak-free. The client mirrors it: build once, then a bounded loop
+calling `client_factory_creation_stateless_signing` with a new `intent_already_recvd`
+param so a retry (which already consumed the re-sent PROPOSE_INTENT to detect it)
+does not double-recv; on FACTORY_READY it applies + breaks, so the shared legacy
+FACTORY_READY recv is skipped for the stateless path. Cheat-proof
+`tools/test_regtest_create_retry.sh`: =1 (transient) -> creation RETRIES (2x) +
+lifecycle SUCCEEDS; =2 (persistent) -> creation BOUNDS + aborts before broadcast
+(nothing committed on-chain -> fallback is re-create). CREATE_RETRY_TEST PASS.
+
+**Test-design finding (flaky cheat, fixed 6dbb82b):** the creation cheat must
+corrupt EXACTLY ONE client. If every client XORs the low bit of its OWN node-0
+partial, the per-signer +-1 deltas can sum to zero in the MuSig2 aggregate
+(`s_agg = sum of partials`) ~37% of runs -> a VALID aggregate -> no failure to
+detect -> flaky no-op. A single bad partial cannot cancel; gated to my_index==1.
+
+**Regression (no-cutting-corners):** `client_factory_creation_stateless_signing`
+is shared with the rotation re-entry path (client.c, `rot_stateless`), which passes
+`intent_already_recvd=0` -> byte-identical to pre-#48 behavior (the new retry loop
+lives only in the initial-creation caller). Confirmed e2e by
+`test_regtest_rotation_restart_resume.sh` + a clean `test_regtest_n64_payments.sh`
++ the unit suite, all green on the integrated branch.
+
 ## Open items / follow-ups
 
 - Pool exhaustion handling on retry for the two pool paths.
