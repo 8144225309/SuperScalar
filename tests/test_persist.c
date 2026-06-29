@@ -5339,6 +5339,210 @@ int test_persist_encryption_disabled_is_plaintext(void) {
     return 1;
 }
 
+/* #327b: the fast-follow secret columns must seal at rest + round-trip through
+   their runtime accessors; the migration pass must seal legacy plaintext rows;
+   and the PUBLIC remote basepoints must stay plaintext (selective sealing). */
+int test_persist_secret_columns_sealed(void) {
+    const char *path = "/tmp/test_ss_enc_cols.db";
+    unlink(path);
+    unsigned char root[32]; memset(root, 0x3c, sizeof root);
+
+    /* ---- Part A: runtime write+read accessors on a keyed-from-start DB ---- */
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open keyed");
+    TEST_ASSERT(persist_set_encryption_key(&db, root), "set key");
+    TEST_ASSERT(persist_apply_encryption(&db), "apply (fresh)");
+
+    /* revocation_secrets: save (seal-on-write) -> sealed on disk -> load (open) */
+    unsigned char rsec[32]; for (int i = 0; i < 32; i++) rsec[i] = (unsigned char)(0x10 + i);
+    TEST_ASSERT(persist_save_revocation(&db, 7, 3, rsec), "save revocation secret");
+    {
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT secret FROM revocation_secrets WHERE channel_id=7 AND commit_num=3;",
+            -1, &st, NULL) == SQLITE_OK, "prep rs");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "rs row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "revocation_secrets sealed on write");
+        sqlite3_finalize(st);
+    }
+    {
+        unsigned char got[8][32]; uint8_t valid[8] = {0}; size_t cnt = 0;
+        TEST_ASSERT(persist_load_revocations_flat(&db, 7, got, valid, 8, &cnt), "load rev flat");
+        TEST_ASSERT(valid[3] && memcmp(got[3], rsec, 32) == 0, "revocation secret round-trip");
+    }
+
+    /* l_stock_poison_reveals: template (NULL secret) -> reveal via UPDATE
+       (seal-on-write) -> sealed on disk -> load (open).  Exercises the UPDATE
+       write path + the BLOB-column-stored-as-text seal. */
+    {
+        unsigned char h32[32], sig64[64], dummy[4] = {0xde, 0xad, 0xbe, 0xef};
+        memset(h32, 0xa1, 32); memset(sig64, 0xb2, 64);
+        TEST_ASSERT(persist_save_l_stock_poison(&db, 5, 2, 9, h32, sig64,
+                        dummy, sizeof dummy, dummy, sizeof dummy, dummy, sizeof dummy),
+                    "save lstock template");
+        unsigned char lsec[32]; for (int i = 0; i < 32; i++) lsec[i] = (unsigned char)(0x40 + i);
+        TEST_ASSERT(persist_update_l_stock_secret(&db, 5, 2, 9, lsec), "reveal lstock secret");
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT revocation_secret FROM l_stock_poison_reveals "
+            "WHERE factory_id=5 AND node_idx=2 AND state_counter=9;", -1, &st, NULL) == SQLITE_OK, "prep ls");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "ls row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "l_stock secret sealed on update");
+        sqlite3_finalize(st);
+        int has = 0; unsigned char back[32];
+        TEST_ASSERT(persist_load_l_stock_poison(&db, 5, 2, 9, NULL, NULL, NULL, NULL, NULL,
+                        NULL, NULL, back, &has), "load lstock");
+        TEST_ASSERT(has && memcmp(back, lsec, 32) == 0, "lstock secret round-trip");
+    }
+
+    /* departed_clients.extracted_key (#327b round-2): 32-byte client privkey.
+       seal-on-write -> sealed on disk -> accessor round-trip. */
+    {
+        unsigned char dk[32]; for (int i = 0; i < 32; i++) dk[i] = (unsigned char)(0x50 + i);
+        TEST_ASSERT(persist_save_departed_client(&db, 11, 2, dk), "save departed client");
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT extracted_key FROM departed_clients WHERE factory_id=11 AND client_idx=2;",
+            -1, &st, NULL) == SQLITE_OK, "prep dc");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "dc row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "departed_clients.extracted_key sealed on write");
+        sqlite3_finalize(st);
+        int dep[8] = {0}; unsigned char gk[8][32];
+        TEST_ASSERT(persist_load_departed_clients(&db, 11, dep, gk, 8) >= 1, "load departed");
+        TEST_ASSERT(dep[2] && memcmp(gk[2], dk, 32) == 0, "departed extracted_key round-trip");
+    }
+
+    /* watchtower_keys.key_hex ('anchor', #327b round-2): 32-byte WT anchor seckey. */
+    {
+        unsigned char ak[32]; for (int i = 0; i < 32; i++) ak[i] = (unsigned char)(0x90 + i);
+        TEST_ASSERT(persist_save_anchor_key(&db, ak), "save anchor key");
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT key_hex FROM watchtower_keys WHERE key_name='anchor';", -1, &st, NULL) == SQLITE_OK, "prep wk");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "wk row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "watchtower_keys.key_hex sealed on write");
+        sqlite3_finalize(st);
+        unsigned char gak[32];
+        TEST_ASSERT(persist_load_anchor_key(&db, gak), "load anchor key");
+        TEST_ASSERT(memcmp(gak, ak, 32) == 0, "anchor key round-trip");
+    }
+    persist_close(&db);
+    unlink(path);
+
+    /* ---- Part B: migration of legacy plaintext + selective sealing + BLOB ---- */
+    const char *path2 = "/tmp/test_ss_enc_cols_mig.db";
+    unlink(path2);
+    persist_t kdb;
+    TEST_ASSERT(persist_open(&kdb, path2), "open keyless");
+
+    /* build correctly-sized hex (32B locals, 33B remote pubkey) via hex_encode */
+    unsigned char pay_b[32], del_b[32], rev_b[32], htl_b[32], rpb_b[33];
+    memset(pay_b, 0x31, 32); memset(del_b, 0x32, 32);
+    memset(rev_b, 0x33, 32); memset(htl_b, 0x34, 32);
+    memset(rpb_b, 0xbb, 33); rpb_b[0] = 0x02;   /* 33B "pubkey" (public; stays plaintext) */
+    char pay[65], del[65], rev[65], htl[65], rpb[67];
+    hex_encode(pay_b, 32, pay); hex_encode(del_b, 32, del);
+    hex_encode(rev_b, 32, rev); hex_encode(htl_b, 32, htl);
+    hex_encode(rpb_b, 33, rpb);
+    char ins[1200];
+    snprintf(ins, sizeof ins,
+        "INSERT INTO channel_basepoints(channel_id,local_payment_secret,local_delayed_secret,"
+        "local_revocation_secret,local_htlc_secret,remote_payment_bp,remote_delayed_bp,"
+        "remote_revocation_bp,remote_htlc_bp) VALUES(1,'%s','%s','%s','%s','%s','%s','%s','%s');",
+        pay, del, rev, htl, rpb, rpb, rpb, rpb);
+    TEST_ASSERT(sqlite3_exec(kdb.db, ins, NULL, NULL, NULL) == SQLITE_OK, "insert basepoints plaintext");
+
+    unsigned char fii[32], sid[32], pp[33], rrs[32];
+    memset(fii, 0xaa, 32); memset(sid, 0xbb, 32); memset(pp, 0xcc, 33); pp[0] = 0x02;
+    for (int i = 0; i < 32; i++) rrs[i] = (unsigned char)(0x70 + i);
+    {
+        sqlite3_stmt *ri = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(kdb.db,
+            "INSERT INTO revocation_releases(factory_instance_id,state_id,participant_pubkey,"
+            "revocation_secret,received_at_block) VALUES(?,?,?,?,100);", -1, &ri, NULL) == SQLITE_OK, "prep rr");
+        sqlite3_bind_blob(ri, 1, fii, 32, SQLITE_STATIC);
+        sqlite3_bind_blob(ri, 2, sid, 32, SQLITE_STATIC);
+        sqlite3_bind_blob(ri, 3, pp, 33, SQLITE_STATIC);
+        sqlite3_bind_blob(ri, 4, rrs, 32, SQLITE_STATIC);   /* plaintext (keyless) */
+        TEST_ASSERT(sqlite3_step(ri) == SQLITE_DONE, "insert rr plaintext");
+        sqlite3_finalize(ri);
+    }
+
+    /* #327b round-2: a legacy plaintext departed_clients privkey to migrate
+       (exercises the rowid + text migrate path the new columns rely on). */
+    unsigned char dm[32]; for (int i = 0; i < 32; i++) dm[i] = (unsigned char)(0x60 + i);
+    {
+        char dmh[65]; hex_encode(dm, 32, dmh);
+        char dins[200];
+        snprintf(dins, sizeof dins,
+            "INSERT INTO departed_clients(factory_id,client_idx,extracted_key) VALUES(22,1,'%s');", dmh);
+        TEST_ASSERT(sqlite3_exec(kdb.db, dins, NULL, NULL, NULL) == SQLITE_OK, "insert departed plaintext");
+    }
+    persist_close(&kdb);
+
+    persist_t kdb2;
+    TEST_ASSERT(persist_open(&kdb2, path2), "reopen keyed");
+    TEST_ASSERT(persist_set_encryption_key(&kdb2, root), "set key 2");
+    TEST_ASSERT(persist_apply_encryption(&kdb2), "migrate seals legacy rows");
+
+    /* local basepoint secret sealed by migration; remote bp stays plaintext */
+    {
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(kdb2.db,
+            "SELECT local_payment_secret,remote_payment_bp FROM channel_basepoints WHERE channel_id=1;",
+            -1, &st, NULL) == SQLITE_OK, "prep bp");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "bp row");
+        const char *loc = (const char *)sqlite3_column_text(st, 0);
+        const char *rem = (const char *)sqlite3_column_text(st, 1);
+        TEST_ASSERT(loc && strncmp(loc, "ssenc1:", 7) == 0, "local basepoint sealed by migration");
+        TEST_ASSERT(rem && strncmp(rem, "ssenc1:", 7) != 0, "remote basepoint stays plaintext (public)");
+        sqlite3_finalize(st);
+    }
+    /* revocation_releases BLOB sealed (SSE1 magic) + opens back to the 32B secret */
+    {
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(kdb2.db,
+            "SELECT revocation_secret FROM revocation_releases;", -1, &st, NULL) == SQLITE_OK, "prep rr2");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "rr2 row");
+        const unsigned char *bv = sqlite3_column_blob(st, 0);
+        int bl = sqlite3_column_bytes(st, 0);
+        TEST_ASSERT(bv && bl >= 4 && memcmp(bv, "SSE1", 4) == 0, "revocation_releases blob sealed");
+        unsigned char *op = NULL; size_t opl = 0;
+        TEST_ASSERT(persist_open_blob(&kdb2, bv, (size_t)bl, &op, &opl) && opl == 32, "rr blob opens to 32B");
+        TEST_ASSERT(op && memcmp(op, rrs, 32) == 0, "rr blob round-trip");
+        free(op);
+        sqlite3_finalize(st);
+    }
+    /* read accessor opens the migrated basepoints (round-trip) */
+    {
+        unsigned char loc[4][32], rem[4][33];
+        TEST_ASSERT(persist_load_basepoints(&kdb2, 1, loc, rem), "load basepoints");
+        TEST_ASSERT(memcmp(loc[0], pay_b, 32) == 0, "basepoint local secret round-trip");
+        TEST_ASSERT(memcmp(rem[0], rpb_b, 33) == 0, "remote basepoint round-trip (plaintext)");
+    }
+    /* departed_clients legacy plaintext sealed by migration (rowid+text path) + round-trip */
+    {
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(kdb2.db,
+            "SELECT extracted_key FROM departed_clients WHERE factory_id=22 AND client_idx=1;",
+            -1, &st, NULL) == SQLITE_OK, "prep dc-mig");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "dc-mig row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "departed_clients sealed by migration");
+        sqlite3_finalize(st);
+        int dep[8] = {0}; unsigned char gk[8][32];
+        TEST_ASSERT(persist_load_departed_clients(&kdb2, 22, dep, gk, 8) >= 1, "load departed migrated");
+        TEST_ASSERT(dep[1] && memcmp(gk[1], dm, 32) == 0, "departed migrated round-trip");
+    }
+    persist_close(&kdb2);
+    unlink(path2);
+    return 1;
+}
+
 /* === End #327 at-rest field encryption tests ============================== */
 
 /* Phase 2: verification is enforced at the choke point and fails closed —

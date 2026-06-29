@@ -53,13 +53,15 @@ int persist_load_revocations_flat(persist_t *p, uint32_t channel_id,
     size_t count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         uint64_t commit_num = (uint64_t)sqlite3_column_int64(stmt, 0);
-        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
-        if (!hex || commit_num >= max) continue;
-
+        const char *stored = (const char *)sqlite3_column_text(stmt, 1);
+        if (!stored || commit_num >= max) continue;
+        char *hex = NULL;                                  /* #327b: open at rest */
+        if (!persist_open_text(p, stored, &hex) || !hex) continue;
         if (hex_decode(hex, secrets_out[commit_num], 32) == 32) {
             valid_out[commit_num] = 1;
             count++;
         }
+        memset(hex, 0, strlen(hex)); free(hex);
     }
 
     sqlite3_finalize(stmt);
@@ -89,13 +91,18 @@ int persist_load_basepoints(persist_t *p, uint32_t channel_id,
         return 0;
     }
 
-    /* Decode 4 local secrets */
+    /* Decode 4 local secrets (#327b: opened from at-rest sealing; legacy
+       plaintext passes through). */
     for (int i = 0; i < 4; i++) {
-        const char *hex = (const char *)sqlite3_column_text(stmt, i);
-        if (!hex || hex_decode(hex, local_secrets[i], 32) != 32) {
+        const char *stored = (const char *)sqlite3_column_text(stmt, i);
+        char *hex = NULL;
+        if (!stored || !persist_open_text(p, stored, &hex) || !hex ||
+            hex_decode(hex, local_secrets[i], 32) != 32) {
+            if (hex) { memset(hex, 0, strlen(hex)); free(hex); }
             sqlite3_finalize(stmt);
             return 0;
         }
+        memset(hex, 0, strlen(hex)); free(hex);
     }
 
     /* Decode 4 remote pubkeys */
@@ -256,10 +263,12 @@ size_t persist_load_flat_secrets(persist_t *p, uint32_t factory_id,
     size_t count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_secrets) {
         int epoch = sqlite3_column_int(stmt, 0);
-        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
-        if (!hex || epoch < 0 || (size_t)epoch >= max_secrets) continue;
-        if (hex_decode(hex, secrets_out[epoch], 32) != 32) continue;
-        count++;
+        const char *stored = (const char *)sqlite3_column_text(stmt, 1);
+        if (!stored || epoch < 0 || (size_t)epoch >= max_secrets) continue;
+        char *hex = NULL;                                  /* #327b: open at rest */
+        if (!persist_open_text(p, stored, &hex) || !hex) continue;
+        if (hex_decode(hex, secrets_out[epoch], 32) == 32) count++;
+        memset(hex, 0, strlen(hex)); free(hex);
     }
     sqlite3_finalize(stmt);
     return count;

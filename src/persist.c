@@ -1765,17 +1765,23 @@ int persist_update_l_stock_secret(persist_t *p, uint32_t factory_id, uint32_t no
                                   const unsigned char *secret32) {
     if (!p || !p->db || !secret32) return 0;
     char s_hex[65]; hex_encode(secret32, 32, s_hex);
+    char *ls_sealed = persist_seal_text(p, s_hex);   /* #327b: seal at rest */
+    memset(s_hex, 0, sizeof s_hex);
+    if (!ls_sealed) return 0;
     sqlite3_stmt *stmt;
     const char *sql =
         "UPDATE l_stock_poison_reveals SET revocation_secret = ? "
         "WHERE factory_id = ? AND node_idx = ? AND state_counter = ?;";
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(stmt, 1, s_hex, -1, SQLITE_TRANSIENT);
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        memset(ls_sealed, 0, strlen(ls_sealed)); free(ls_sealed); return 0;
+    }
+    sqlite3_bind_text(stmt, 1, ls_sealed, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int (stmt, 2, (int)factory_id);
     sqlite3_bind_int (stmt, 3, (int)node_idx);
     sqlite3_bind_int (stmt, 4, (int)state_counter);
     int ok = (sqlite3_step(stmt) == SQLITE_DONE) && (sqlite3_changes(p->db) > 0);
     sqlite3_finalize(stmt);
+    memset(ls_sealed, 0, strlen(ls_sealed)); free(ls_sealed);
     return ok;
 }
 
@@ -1826,7 +1832,13 @@ int persist_load_l_stock_poison(persist_t *p, uint32_t factory_id, uint32_t node
             hex_decode(cb, control_block_out, n); *control_block_len_out = n;
         }
         if (out_has_secret) *out_has_secret = (sec != NULL);
-        if (sec && secret_out32) hex_decode(sec, secret_out32, 32);
+        if (sec && secret_out32) {                          /* #327b: open at rest */
+            char *sec_pt = NULL;
+            if (persist_open_text(p, sec, &sec_pt) && sec_pt) {
+                hex_decode(sec_pt, secret_out32, 32);
+                memset(sec_pt, 0, strlen(sec_pt)); free(sec_pt);
+            }
+        }
     }
     sqlite3_finalize(stmt);
     return found;
@@ -2840,10 +2852,13 @@ int persist_save_revocation(persist_t *p, uint32_t channel_id,
 
     sqlite3_bind_int(stmt, 1, (int)channel_id);
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commitment_number);
-    sqlite3_bind_text(stmt, 3, secret_hex, -1, SQLITE_TRANSIENT);
+    char *rs_sealed = persist_seal_text(p, secret_hex);   /* #327b: seal at rest */
+    if (!rs_sealed) { sqlite3_finalize(stmt); return 0; }
+    sqlite3_bind_text(stmt, 3, rs_sealed, -1, SQLITE_TRANSIENT);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(rs_sealed, 0, strlen(rs_sealed)); free(rs_sealed);
     return ok;
 }
 
@@ -4499,21 +4514,26 @@ int persist_save_departed_client(persist_t *p, uint32_t factory_id,
 
     char key_hex[65];
     hex_encode(extracted_key32, 32, key_hex);
+    char *dc_sealed = persist_seal_text(p, key_hex);   /* #327b: seal at rest (client privkey) */
+    memset(key_hex, 0, sizeof key_hex);
+    if (!dc_sealed) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO departed_clients "
         "(factory_id, client_idx, extracted_key) VALUES (?, ?, ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        memset(dc_sealed, 0, strlen(dc_sealed)); free(dc_sealed); return 0;
+    }
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)client_idx);
-    sqlite3_bind_text(stmt, 3, key_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, dc_sealed, -1, SQLITE_TRANSIENT);
 
     int ok3 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(dc_sealed, 0, strlen(dc_sealed)); free(dc_sealed);
     return ok3;
 }
 
@@ -4536,12 +4556,17 @@ size_t persist_load_departed_clients(persist_t *p, uint32_t factory_id,
     size_t count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         uint32_t cidx = (uint32_t)sqlite3_column_int(stmt, 0);
-        const char *key_hex = (const char *)sqlite3_column_text(stmt, 1);
+        const char *stored = (const char *)sqlite3_column_text(stmt, 1);
 
         if (cidx < max_clients) {
             if (departed_out) departed_out[cidx] = 1;
-            if (keys_out && key_hex)
-                hex_decode(key_hex, keys_out[cidx], 32);
+            if (keys_out && stored) {
+                char *key_pt = NULL;                       /* #327b: open at rest */
+                if (persist_open_text(p, stored, &key_pt) && key_pt) {
+                    hex_decode(key_pt, keys_out[cidx], 32);
+                    memset(key_pt, 0, strlen(key_pt)); free(key_pt);
+                }
+            }
         }
         count++;
     }
@@ -4858,10 +4883,20 @@ int persist_save_basepoints(persist_t *p, uint32_t channel_id,
         return 0;
 
     sqlite3_bind_int(stmt, 1, (int)channel_id);
-    sqlite3_bind_text(stmt, 2, pay_hex, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, delay_hex, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, revoc_hex, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, htlc_hex, -1, SQLITE_TRANSIENT);
+    /* #327b: seal the four local basepoint secrets at rest (remote bps are public). */
+    char *bp_pay   = persist_seal_text(p, pay_hex);
+    char *bp_delay = persist_seal_text(p, delay_hex);
+    char *bp_revoc = persist_seal_text(p, revoc_hex);
+    char *bp_htlc  = persist_seal_text(p, htlc_hex);
+    if (!bp_pay || !bp_delay || !bp_revoc || !bp_htlc) {
+        free(bp_pay); free(bp_delay); free(bp_revoc); free(bp_htlc);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 2, bp_pay,   -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, bp_delay, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, bp_revoc, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, bp_htlc,  -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, rpay_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 7, rdelay_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 8, rrevoc_hex, -1, SQLITE_TRANSIENT);
@@ -4869,6 +4904,10 @@ int persist_save_basepoints(persist_t *p, uint32_t channel_id,
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(bp_pay,0,strlen(bp_pay));     free(bp_pay);
+    memset(bp_delay,0,strlen(bp_delay)); free(bp_delay);
+    memset(bp_revoc,0,strlen(bp_revoc)); free(bp_revoc);
+    memset(bp_htlc,0,strlen(bp_htlc));   free(bp_htlc);
 
 #if BASEPOINT_DIAG
     if (ok)
@@ -4946,19 +4985,24 @@ int persist_save_anchor_key(persist_t *p, const unsigned char *seckey32) {
 
     char key_hex[65];
     hex_encode(seckey32, 32, key_hex);
+    char *ak_sealed = persist_seal_text(p, key_hex);   /* #327b: seal at rest (anchor seckey) */
+    memset(key_hex, 0, sizeof key_hex);
+    if (!ak_sealed) return 0;
 
     const char *sql =
         "INSERT OR REPLACE INTO watchtower_keys (key_name, key_hex) "
         "VALUES ('anchor', ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        memset(ak_sealed, 0, strlen(ak_sealed)); free(ak_sealed); return 0;
+    }
 
-    sqlite3_bind_text(stmt, 1, key_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, ak_sealed, -1, SQLITE_TRANSIENT);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(ak_sealed, 0, strlen(ak_sealed)); free(ak_sealed);
     return ok;
 }
 
@@ -4977,10 +5021,13 @@ int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out) {
         return 0;
     }
 
-    const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+    const char *stored = (const char *)sqlite3_column_text(stmt, 0);
     int ok = 0;
-    if (hex && hex_decode(hex, seckey32_out, 32) == 32)
+    char *hex = NULL;                                  /* #327b: open at rest */
+    if (stored && persist_open_text(p, stored, &hex) && hex &&
+        hex_decode(hex, seckey32_out, 32) == 32)
         ok = 1;
+    if (hex) { memset(hex, 0, strlen(hex)); free(hex); }
 
     sqlite3_finalize(stmt);
     return ok;
@@ -5494,10 +5541,13 @@ int persist_save_flat_secrets(persist_t *p, uint32_t factory_id,
 
         sqlite3_bind_int(stmt, 1, (int)factory_id);
         sqlite3_bind_int(stmt, 2, (int)i);
-        sqlite3_bind_text(stmt, 3, hex, -1, SQLITE_TRANSIENT);
+        char *frs_sealed = persist_seal_text(p, hex);   /* #327b: seal at rest */
+        if (!frs_sealed) { sqlite3_finalize(stmt); if (own_txn) persist_rollback(p); return 0; }
+        sqlite3_bind_text(stmt, 3, frs_sealed, -1, SQLITE_TRANSIENT);
 
         int ok = (sqlite3_step(stmt) == SQLITE_DONE);
         sqlite3_finalize(stmt);
+        memset(frs_sealed, 0, strlen(frs_sealed)); free(frs_sealed);
         if (!ok) {
             if (own_txn) persist_rollback(p);
             return 0;
@@ -6945,10 +6995,15 @@ int persist_save_revocation_release(persist_t *p,
     sqlite3_bind_blob(st, 1, factory_instance_id32, 32, SQLITE_STATIC);
     sqlite3_bind_blob(st, 2, state_id32, 32, SQLITE_STATIC);
     sqlite3_bind_blob(st, 3, participant_pubkey33, 33, SQLITE_STATIC);
-    sqlite3_bind_blob(st, 4, revocation_secret32, 32, SQLITE_STATIC);
+    unsigned char *rr_sealed = NULL; size_t rr_slen = 0;   /* #327b: seal at rest */
+    if (!persist_seal_blob(p, revocation_secret32, 32, &rr_sealed, &rr_slen)) {
+        sqlite3_finalize(st); return 0;
+    }
+    sqlite3_bind_blob(st, 4, rr_sealed, (int)rr_slen, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 5, (int)received_at_block);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
+    memset(rr_sealed, 0, rr_slen); free(rr_sealed);
     return rc == SQLITE_DONE ? 1 : 0;
 }
 
