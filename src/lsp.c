@@ -1194,9 +1194,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
        (and, in Phase C, retry with fresh nonces).  factory_verify_close_sig never
        false-fails a valid close (guards on the funding being key-path-only). */
     if (!factory_verify_close_sig(f, sig64, sighash)) {
-        fprintf(stderr, "LSP: cooperative-close aggregate signature INVALID at "
-                "ceremony time -- aborting before CLOSE_DONE\n");
-        goto close_fail;
+        /* #48 Phase C: invalid aggregate (e.g. a transient bad client psig).
+           RETRYABLE -- do NOT abort (that disconnects the clients); free our tx
+           and return 2 so the caller re-invokes with a fresh CLOSE_PROPOSE. The
+           clients stay blocked on CLOSE_DONE and re-enter on the re-PROPOSE. */
+        fprintf(stderr, "LSP: cooperative-close aggregate signature INVALID -- "
+                "retryable (fresh-nonce re-run; clients kept)\n");
+        tx_buf_free(&unsigned_tx);
+        return 2;
     }
 
     /* Finalize signed close tx */

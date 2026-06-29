@@ -838,12 +838,29 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     }
     cJSON_Delete(psig_msg);
 
-    /* Receive CLOSE_DONE */
+    /* Receive CLOSE_DONE -- or a re-CLOSE_PROPOSE if the LSP is re-running the
+       close with fresh nonces after an invalid aggregate (#48 Phase C). On a
+       re-PROPOSE, re-run the close ceremony fresh (fresh nonce) by recursing with
+       the new proposal; bounded by the LSP's retry cap (it sends finitely many
+       re-PROPOSEs, then CLOSE_DONE or a terminal error -> MSG_ERROR). */
     wire_msg_t done_msg;
-    if (!wire_recv(fd, &done_msg) || check_msg_error(&done_msg) ||
-        done_msg.msg_type != MSG_CLOSE_DONE) {
-        fprintf(stderr, "Client: expected CLOSE_DONE\n");
+    if (!wire_recv(fd, &done_msg) || check_msg_error(&done_msg)) {
+        fprintf(stderr, "Client: close failed (LSP error / no CLOSE_DONE)\n");
         if (done_msg.json) cJSON_Delete(done_msg.json);
+        tx_buf_free(&close_unsigned);
+        return 0;
+    }
+    if (done_msg.msg_type == MSG_CLOSE_PROPOSE) {
+        fprintf(stderr, "Client: LSP re-proposing cooperative close -- retrying with a fresh nonce\n");
+        tx_buf_free(&close_unsigned);
+        int _r = client_do_close_ceremony(fd, ctx, keypair, my_pubkey, factory,
+                                           n_participants, &done_msg, current_height, ch);
+        cJSON_Delete(done_msg.json);
+        return _r;
+    }
+    if (done_msg.msg_type != MSG_CLOSE_DONE) {
+        fprintf(stderr, "Client: expected CLOSE_DONE, got 0x%02x\n", done_msg.msg_type);
+        cJSON_Delete(done_msg.json);
         tx_buf_free(&close_unsigned);
         return 0;
     }

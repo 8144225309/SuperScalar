@@ -4717,19 +4717,23 @@ accept_new_factory:
        loop forever; on exhaustion we fall through to the no-broadcast path below
        (safe: clients keep their pre-signed commitment + watchtower and can
        force-close). */
-    int _close_ok = 0;
+    int _close_ok = 0, _rc = 0;
     for (int _ca = 1; _ca <= SS_NONCE_RETRY_MAX; _ca++) {
-        if (lsp_run_cooperative_close(lsp_p, &close_tx, close_outputs, n_close_outputs,
-                                      chain_be ? (uint32_t)chain_be->get_block_height(chain_be) :
-                                      (uint32_t)regtest_get_block_height(&rt))) {
-            _close_ok = 1;
-            break;
-        }
+        _rc = lsp_run_cooperative_close(lsp_p, &close_tx, close_outputs, n_close_outputs,
+                                        chain_be ? (uint32_t)chain_be->get_block_height(chain_be) :
+                                        (uint32_t)regtest_get_block_height(&rt));
+        if (_rc == 1) { _close_ok = 1; break; }   /* success */
+        if (_rc != 2) break;                        /* terminal failure (clients already aborted) */
+        /* _rc == 2: retryable invalid aggregate -- clients are NOT aborted, still
+           blocked on CLOSE_DONE; re-invoking re-sends CLOSE_PROPOSE and they
+           re-enter with fresh nonces. */
         if (_ca < SS_NONCE_RETRY_MAX)
-            fprintf(stderr, "LSP: cooperative close attempt %d/%d failed; "
-                    "retrying with fresh nonces\n", _ca, SS_NONCE_RETRY_MAX);
+            fprintf(stderr, "LSP: cooperative close attempt %d/%d had an invalid "
+                    "aggregate; re-running with fresh nonces\n", _ca, SS_NONCE_RETRY_MAX);
     }
     if (!_close_ok) {
+        if (_rc == 2)   /* clients still waiting -- abort so they fall back to force-close */
+            lsp_abort_ceremony(lsp_p, "cooperative close failed after fresh-nonce retries");
         fprintf(stderr, "LSP: cooperative close failed after %d attempts "
                 "(clients fall back to force-close)\n", SS_NONCE_RETRY_MAX);
         tx_buf_free(&close_tx);
