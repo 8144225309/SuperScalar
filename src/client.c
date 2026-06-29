@@ -1814,10 +1814,16 @@ static int client_factory_creation_stateless_signing(
        LSP's factory-creation bounded retry. Gated on superscalar_cheat_allowed()
        (regtest only; #9 proves SS_CHEAT_* is inert on mainnet). =1 corrupts only
        the FIRST creation ceremony (transient); =2 every ceremony (persistent).
-       Corrupts the first signed node's psig (first non-zero 32B chunk). */
+       Corrupts the first signed node's psig (first non-zero 32B chunk).
+
+       ONLY client my_index==1 corrupts.  If every client XORed the low bit of its
+       OWN node-0 partial, the per-signer deltas (each +-1) can sum to zero in the
+       MuSig2 aggregate (s_agg = sum of partials), leaving a VALID aggregate ~37%
+       of the time -- a flaky no-op.  A single bad partial cannot cancel, so the
+       aggregate is reliably invalid and the LSP's verify+retry always fires. */
     {
         const char *_cp = getenv("SS_CHEAT_CREATE_BAD_PSIG");
-        if (_cp && superscalar_cheat_allowed()) {
+        if (_cp && superscalar_cheat_allowed() && my_index == 1) {
             static int _create_cheat_uses = 0;
             int _mode = atoi(_cp);
             if (_mode == 2 || (_mode == 1 && _create_cheat_uses == 0)) {
