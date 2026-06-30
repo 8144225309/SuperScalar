@@ -11,9 +11,13 @@ BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"; CLIENT_BIN="$BUILD_DIR/superscalar_client"
 N_CLIENTS="${N_CLIENTS:-2}"; AMOUNT="${AMOUNT:-250000}"; FEE_RATE="${FEE_RATE:-100}"
 WALLET="${WALLET:-superscalar_lsp}"; CONFIRM_TIMEOUT="${CONFIRM_TIMEOUT:-21600}"
-LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
-LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-sk(){ local b; b=$(printf "%02x" $((34 + $1 * 17))); printf "${b}%.0s" {1..32}; }
+# #11: strong-key signet runs override these via env (signet_strong_keygen.py) so
+# the ceremony keys are NOT publicly-sweepable weak keys on public signet.
+LSP_SECKEY="${LSP_SECKEY:-0000000000000000000000000000000000000000000000000000000000000001}"
+LSP_PUBKEY="${LSP_PUBKEY:-0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798}"
+# sk i: per-client seckey. When CLIENT_KEYS_FILE is set, read line (i+1) from it
+# (strong keys); else the regtest scaffold byte = 0x22 + i*0x11.
+sk(){ if [ -n "${CLIENT_KEYS_FILE:-}" ]; then sed -n "$(($1+1))p" "$CLIENT_KEYS_FILE"; else local b; b=$(printf "%02x" $((34 + $1 * 17))); printf "${b}%.0s" {1..32}; fi; }
 SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
 RU=$(awk -F= '/^[[:space:]]*rpcuser/{gsub(/ /,"",$2);print $2;exit}' "$SIGNET_CONF")
 RP=$(awk -F= '/^[[:space:]]*rpcpassword/{gsub(/ /,"",$2);print $2;exit}' "$SIGNET_CONF")
@@ -29,10 +33,15 @@ recov(){ echo "--- RECOVERY: $AMOUNT sats from $WALLET; residual factory/leaf/co
 echo "=== SIGNET self-drive: $FLAG (marker: '$MARKER') at 0.1 sat/vB ==="
 echo "  [$(ts)] height $(tip), amount=$AMOUNT, fee=$FEE_RATE sat/kvB. signet ~10min/block — multi-hour."
 pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null||true; sleep 1
+# #11: pass the STRONG per-run client seckeys to the breach re-sign (mirrors the
+# #406 commitment-breach harness) so the injected breach validates with strong
+# keys; without it the re-sign falls back to the scaffold byte-fill and the breach
+# is an Invalid Schnorr that cannot broadcast on a strong-key factory.
+BREACH_KEYS_ARG=""; [ -n "${CLIENT_KEYS_FILE:-}" ] && BREACH_KEYS_ARG="--breach-client-keys-file ${CLIENT_KEYS_FILE}"
 "$LSP_BIN" --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
     --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
     --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
-    --amount $AMOUNT --fee-rate $FEE_RATE \
+    --amount $AMOUNT --fee-rate $FEE_RATE $BREACH_KEYS_ARG \
     --confirm-timeout $CONFIRM_TIMEOUT --seckey "$LSP_SECKEY" --wallet "$WALLET" \
     --db "$LSP_DB" --wt-db "$WT_DB" --demo $FLAG --lsp-balance-pct 50 > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
