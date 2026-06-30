@@ -2,6 +2,36 @@
 
 All notable changes to SuperScalar are documented here.
 
+## v0.2.0 — DRAFT (final; pending release-gate sign-off + signed tag)
+
+The ~200 PRs since rc1 close the trustless-completion roadmap (P1–P6) and the
+mainnet release gates. Operator summary: `docs/release-notes/release-notes-0.2.0.md`.
+
+### Trustless completion
+- #52 standalone-watchtower fee-bump (CPFP penalties; recourse no longer fixed-feerate)
+- #53 hashlock-gated L-stock poison — leaf + sub-factory, revealed-secret model, N-party agg-sig verified both sides; + #59 crash / restart-resume (derive-don't-store seed)
+- #55 wt_db recourse coverage (kind=3 force-close, JIT)
+- #56 mass-exit fee-race: P2A CPFP tree-node + commitment anchors (signet-proven)
+- #48 bounded fresh-nonce retry across all signing ceremonies (creation/close/rotation/advance) (#407)
+- #8 revocation verification standard (durable, fail-closed) + item-1 client escalation (`--on-lsp-forgery`)
+- #399/#401 distribution-TX co-signing (offline-forever recovery net)
+- #396 PTLC revocation-penalty sweeps mirrored into wt_db
+- #67/#68 adversarial agg-sig drill + Layer-3 fee-race (recourse wins under pressure)
+
+### Key-at-rest + mainnet safety
+- #327/#405 at-rest secret encryption (HD seed + revocation/channel/WT/departed-key columns); `--encrypt-db`
+- #327a refuse command-line `--seckey` on mainnet
+- #9/#402 fail-safe cheat-gate allowlist (regtest-only; mainnet/signet/testnet4/unknown refuse)
+- #403/#330 CLN-bridge secure-by-default transport + security signoff
+
+### Operational release gates (mainnet runbook §10)
+- #329 force-close cost calculator validated vs on-chain replay (#408)
+- #331 restore-from-backup drill + 50-advance soak harness (#409)
+- #406 strong per-run signet keys (no publicly-sweepable weak keys on public signet)
+
+### Scale
+- Full payment + cooperative-close E2E proven N=4 / N=64 / N=127 (design max 127 channels; MuSig cap 128 = LSP + 127 clients)
+
 ## v0.2.0-rc1 — 2026-05-31
 
 See `docs/release-notes/release-notes-0.2.0.md` for the operator-facing summary of all v0.2.0 changes.  This section is the per-feature/per-PR detail log.

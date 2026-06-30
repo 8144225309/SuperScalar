@@ -1,10 +1,77 @@
 # SuperScalar v0.2.0 Release Notes
 
-*v0.2.0-rc1 — release candidate 1, 2026-05-31*
+*v0.2.0 — final (DRAFT: pending release-gate sign-off + signed tag). rc1 was 2026-05-31; the "Changes since rc1" section below covers the ~200 PRs that close the trustless-completion roadmap and the operational release gates.*
 
 v0.2.0 is the first release where SuperScalar is a credible mainnet candidate. It bundles ~265 merged PRs since v0.1.13 — a new canonical leaf shape (Pseudo-Spilman k² sub-factories), a top-to-bottom MuSig2 redesign, PTLC infrastructure, reorg-correctness pre-flight, crash-injection scaffolding, an adversarial cheat-engine campaign, and a trustless standalone watchtower.
 
 This document is the operator-facing summary. See `CHANGELOG.md` for the full per-PR log.
+
+---
+
+## Changes since rc1 (final v0.2.0)
+
+rc1 made SuperScalar a credible mainnet candidate. The ~200 PRs since then turn that
+into **trustless by construction + operationally drilled**: the standalone-watchtower
+recourse model is now gapless across the documented attack surface, secrets are
+encrypted at rest, and the mainnet release gates are validated.
+
+### Trustless completion (the security headline)
+
+- **Standalone-WT fee-bump (#52)** — the watchtower can now CPFP-bump its penalties;
+  recourse is no longer fixed-feerate-at-registration.
+- **Hashlock-gated L-stock poison (#53)** — adopts the canonical revealed-secret
+  (revocation-style) L-stock poison, closing the co-signed-poison theft vector at the
+  root for both leaves and sub-factories (N-party aggregate sig verified on *both*
+  sides; per-(leaf,state) secrets derived from one per-factory seed).
+- **Crash / restart-resume of the reveal step (#59)** — the poison template is
+  persisted at commit (before reveal) and the per-factory seed is *derived*, not
+  stored, so it survives restart + backup-restore.
+- **wt_db recourse coverage (#55)** — kind=3 force-close + JIT recourse paths mirrored
+  into wt_db for standalone post-confirmation recourse.
+- **Mass-exit fee-race + tree-anchor CPFP (#56)** — P2A CPFP anchors on tree nodes and
+  commitments (negotiated `use_tree_anchor` / `use_cpfp_anchor`) so recourse wins the
+  thundering-herd fee-race at the shared factory CLTV. Signet-proven.
+- **Bounded fresh-nonce retry (#48)** — every MuSig2 ceremony (creation, cooperative
+  close, rotation, leaf / sub-factory advance) retries with a FRESH nonce a bounded
+  number of times, then proactively exits — instead of aborting on first failure or
+  blocking until expiry. Verified nonce-reuse-safe. Liveness without weakening safety.
+- **Revocation verification standard (#8)** — durable, fail-closed, symmetric
+  revocation verification enforced at the channel choke point, plus a client-side LSP
+  revocation verifier. On detected forgery the client *escalates*
+  (`--on-lsp-forgery continue|halt|close`), per-leaf-type, with surgical close.
+- **Distribution-TX co-signing (#399/#401)** — the factory-creation ceremony co-signs a
+  distribution TX (the offline-forever recovery net): anyone can broadcast it at the
+  factory CLTV to pay every client if all parties vanish.
+
+### Key-at-rest + mainnet safety
+
+- **At-rest secret encryption (#327/#405)** — the HD seed and the remaining secret
+  columns (revocation / channel / watchtower keys, departed-client extracted keys) are
+  sealed at rest via app-level field encryption (no new dependency); `--encrypt-db`.
+- **Mainnet `--seckey` refusal (#327a)** — the LSP refuses a command-line `--seckey` on
+  mainnet (use a keyfile / BIP39 mnemonic).
+- **Cheat-gate hardening (#9/#402)** — every defense-bypass cheat (`SS_CHEAT_*` /
+  `--cheat-*` / `--test-*`) sits behind a fail-safe network allowlist: enabled ONLY on
+  regtest; mainnet / signet / testnet4 / unknown-or-null all refuse.
+- **CLN-bridge hardening (#403/#330)** — secure-by-default bridge transport; the three
+  open review findings are signed off.
+
+### Operational release gates (the mainnet runbook §10 pre-flight)
+
+- **Force-close cost calculator validated against on-chain replay (#329)** — the
+  dashboard projection (`treeTxCount × fee_per_tx`) matches the actual on-chain
+  tree-broadcast fees to the sat (regtest replay harness).
+- **Restore-from-backup drill (#331)** — automated: hot `sqlite3 .backup` → wipe →
+  restore → the LSP resumes the factory from the restored DB; plus a 50-advance soak
+  with the watchtower defending from the oldest stale state.
+- **No weak keys on public signet (#406)** — strong per-run ceremony keys
+  (`signet_strong_keygen.py`) across the breach trio + payment E2E, so test funds are
+  not publicly sweepable.
+
+### Scale
+
+Full payment + cooperative-close E2E rigorously proven at **N=4 / N=64 / N=127** (127
+channels is the design max; the MuSig signer cap of 128 = LSP + 127 clients).
 
 ---
 
