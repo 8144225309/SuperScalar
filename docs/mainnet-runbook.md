@@ -31,8 +31,10 @@ pre-mainnet ops checklist drafted under task #151.
 - [ ] Factory funding canonical-chain guard active (#125-#129); no
       open issues against `lsp_channels_revalidate_funding`
 - [ ] Watchtower restart audit complete for R1/R5 (tasks #135 and #161 — signoff in PR #287 commit body)
-- [ ] Force-close cost calculator validated against on-chain replay
-      (per #72 dashboard query and #136 confirmation-depth policy)
+- [x] Force-close cost calculator validated against on-chain replay
+      (per #72 dashboard query and #136 confirmation-depth policy) —
+      tools/test_regtest_fc_cost_replay.sh proves treeTxCount*fee_per_tx ==
+      actual on-chain tree-broadcast fees to the sat (regtest, 0% delta)
 - [ ] PTLC balance + chain-validation production threading merged
       (per #253, gates non-trivial routed payments)
 - [ ] SF-AUDIT prerequisites (#152) all green — see Section 10
@@ -531,8 +533,8 @@ gate for flipping the kill switch from `mainnet refused` to
       populated DB
 - [x] Watchtower restart audit (#135, #161) signed off (per PR #287 commit body)
 - [ ] Reorg correctness audit (#125-#129) signed off
-- [ ] Force-close cost calculator validated against on-chain replay
-      (#72)
+- [x] Force-close cost calculator validated against on-chain replay
+      (#72) — tools/test_regtest_fc_cost_replay.sh (regtest, 0% delta)
 - [ ] Confirmation depth policy (#136) enforced for every code path
       that depends on funding finality
 - [x] PTLC production threading merged (#253) — gates non-trivial
