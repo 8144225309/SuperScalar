@@ -38,6 +38,12 @@ pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null||true; sleep 1
 # keys; without it the re-sign falls back to the scaffold byte-fill and the breach
 # is an Invalid Schnorr that cannot broadcast on a strong-key factory.
 BREACH_KEYS_ARG=""; [ -n "${CLIENT_KEYS_FILE:-}" ] && BREACH_KEYS_ARG="--breach-client-keys-file ${CLIENT_KEYS_FILE}"
+# The #184 PTLC-breach-chain handler re-signs channel-0's revoked commit with the
+# CLIENT-0 key read from $SUPERSCALAR_TEST_CLIENT0_SECKEY (else 0x22 scaffold ->
+# Invalid Schnorr on a strong-key factory). The BREACH_KEYS_ARG above only feeds the
+# separate commitment-breach handler, so mirror the strong client-0 key into the LSP
+# env here too, or the PTLC breach broadcast fails on a strong-key signet factory.
+[ -n "${CLIENT_KEYS_FILE:-}" ] && export SUPERSCALAR_TEST_CLIENT0_SECKEY="$(sk 0)"
 "$LSP_BIN" --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
     --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
     --active-blocks 6 --dying-blocks 4 --step-blocks 1 --states-per-layer 2 \
@@ -75,10 +81,15 @@ SWEEP_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE result='ok'
 [ -z "$SWEEP_TXID" ] && SWEEP_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
 [ -z "$SWEEP_TXID" ] && SWEEP_TXID=$(grep -aoiE "(penal|sweep|timeout|ptlc|htlc|punish|broadcast)[^0-9a-f]{0,40}[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
 [ -n "$SWEEP_TXID" ] || { red "FAIL (signet): marker '$MARKER' seen but NO sweep/penalty txid in broadcast_log or LSP log — cannot verify the on-chain outcome (marker != confirmed funded tx)"; tail -25 "$LSP_LOG"; recov; exit 1; }
-echo "  verifying breach-response tx on-chain: $SWEEP_TXID"
-RAW=$(btc getrawtransaction "$SWEEP_TXID" true)
-CONF=$(echo "$RAW" | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
-{ [ -n "$CONF" ] && [ "${CONF:-0}" -ge 1 ]; } || { red "FAIL (signet): marker '$MARKER' seen but breach-response tx $SWEEP_TXID is NOT confirmed on-chain (self-report != outcome)"; recov; exit 1; }
+echo "  verifying breach-response tx on-chain (poll up to ~25min; the LAST-broadcast penalty needs its own signet block ~10min, so a single check right after the PASS marker races the block): $SWEEP_TXID"
+RAW=""; CONF=0
+for w in $(seq 1 25); do
+    RAW=$(btc getrawtransaction "$SWEEP_TXID" true)
+    CONF=$(echo "$RAW" | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    { [ -n "$CONF" ] && [ "${CONF:-0}" -ge 1 ]; } && { echo "  [$(ts)] breach-response confirmed (${CONF} conf)"; break; }
+    sleep 60
+done
+{ [ -n "$CONF" ] && [ "${CONF:-0}" -ge 1 ]; } || { red "FAIL (signet): marker '$MARKER' seen but breach-response tx $SWEEP_TXID did NOT confirm within ~25min (self-report != outcome)"; recov; exit 1; }
 SVAL=$(echo "$RAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
 SSATS=$(awk "BEGIN{printf \"%d\", ($SVAL+0)*100000000}")
 [ "${SSATS:-0}" -ge 330 ] || { red "FAIL (signet): breach-response $SWEEP_TXID confirmed but largest output ${SSATS} sats is dust — no real recovery"; recov; exit 1; }
