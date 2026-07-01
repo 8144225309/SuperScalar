@@ -44,6 +44,45 @@ static secp256k1_context *test_ctx(void) {
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 }
 
+/* Regression (fix/client-daemon-async-msg): the client daemon dispatch must
+   handle MSG_FUNDING_REORG + MSG_CEREMONY_ABORT via client_handle_async_msg
+   rather than treating them as "unexpected" -- which desynced the wire stream and
+   livelocked inbound bridge payments on reconnect.  Assert the shared helper
+   claims those two async notices and declines everything else. */
+int test_client_handle_async_msg(void) {
+    wire_msg_t m;
+
+    /* MSG_FUNDING_REORG {frozen:1} is claimed (handled) */
+    memset(&m, 0, sizeof m);
+    m.msg_type = MSG_FUNDING_REORG;
+    m.json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(m.json, "frozen", 1);
+    cJSON_AddStringToObject(m.json, "funding_txid",
+        "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff2233445566778899aa");
+    TEST_ASSERT_EQ(client_handle_async_msg(&m), 1,
+                   "MSG_FUNDING_REORG must be handled by client_handle_async_msg");
+    cJSON_Delete(m.json);
+
+    /* MSG_CEREMONY_ABORT is claimed (handled) even with an empty body */
+    memset(&m, 0, sizeof m);
+    m.msg_type = MSG_CEREMONY_ABORT;
+    m.json = cJSON_CreateObject();
+    TEST_ASSERT_EQ(client_handle_async_msg(&m), 1,
+                   "MSG_CEREMONY_ABORT must be handled by client_handle_async_msg");
+    cJSON_Delete(m.json);
+
+    /* A non-async message is NOT claimed (daemon falls through to "unexpected") */
+    memset(&m, 0, sizeof m);
+    m.msg_type = MSG_HELLO;
+    m.json = cJSON_CreateObject();
+    TEST_ASSERT_EQ(client_handle_async_msg(&m), 0,
+                   "non-async msg must NOT be claimed by client_handle_async_msg");
+    cJSON_Delete(m.json);
+
+    printf("  PASS: test_client_handle_async_msg\n");
+    return 1;
+}
+
 /* Test 1: MSG_RECONNECT and MSG_RECONNECT_ACK wire round-trip */
 int test_reconnect_wire(void) {
     secp256k1_context *ctx = test_ctx();

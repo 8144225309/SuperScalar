@@ -1329,6 +1329,7 @@ extern int test_client_persist_reload(void);
 extern int test_reconnect_commitment_mismatch_rollback(void);
 extern int test_reconnect_commitment_mismatch_reject(void);
 extern int test_reconnect_htlc_replay(void);
+extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
 /* Security hardening */
 extern int test_secure_zero_basic(void);
@@ -3230,6 +3231,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_commitment_mismatch_rollback);
     RUN_TEST(test_reconnect_commitment_mismatch_reject);
     RUN_TEST(test_reconnect_htlc_replay);
+    RUN_TEST(test_client_handle_async_msg);
 
     printf("\n=== Security Hardening ===\n");
     RUN_TEST(test_secure_zero_basic);
