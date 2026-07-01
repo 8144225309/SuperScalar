@@ -17,7 +17,7 @@
  *   superscalar_factory_residual_sweep \
  *     --lsp-seckey HEX64 --client-seckeys HEX64,HEX64,... \
  *     --funding-txid HEX64 --funding-vout N --funding-amount SATS \
- *     --cltv-timeout N --ps-sub-arity K \
+ *     --cltv-timeout N --ps-sub-arity K [--step-blocks S --states-per-layer L] \
  *     --dest-spk HEX --fee SATS \
  *     --sweep TXID:VOUT:AMOUNT:SPKHEX  [--sweep ...] \
  *     [--broadcast] [--network signet|regtest]
@@ -102,8 +102,9 @@ int main(int argc, char **argv) {
     const char *lsp_sk_hex = NULL, *clients_csv = NULL, *fund_txid_hex = NULL;
     const char *dest_spk_hex = NULL, *network = "signet";
     uint32_t fund_vout = 0, ps_sub_arity = 2; long cltv_timeout = 0;
+    uint16_t step_blocks_arg = 0; uint32_t states_per_layer_arg = 0;
     uint64_t fund_amount = 0, fee = 0;
-    int do_broadcast = 0;
+    int do_broadcast = 0, enable_hashlock = 0, do_dump = 0;
     char *sweeps[MAXSW]; size_t n_sweeps = 0;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i],"--lsp-seckey")    && i+1<argc) lsp_sk_hex = argv[++i];
@@ -113,10 +114,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--funding-amount")&& i+1<argc) fund_amount = strtoull(argv[++i],NULL,10);
         else if (!strcmp(argv[i],"--cltv-timeout")  && i+1<argc) cltv_timeout = strtol(argv[++i],NULL,10);
         else if (!strcmp(argv[i],"--ps-sub-arity")  && i+1<argc) ps_sub_arity = (uint32_t)strtoul(argv[++i],NULL,10);
+        else if (!strcmp(argv[i],"--step-blocks")   && i+1<argc) step_blocks_arg = (uint16_t)strtoul(argv[++i],NULL,10);
+        else if (!strcmp(argv[i],"--states-per-layer")&& i+1<argc) states_per_layer_arg = (uint32_t)strtoul(argv[++i],NULL,10);
         else if (!strcmp(argv[i],"--dest-spk")      && i+1<argc) dest_spk_hex = argv[++i];
         else if (!strcmp(argv[i],"--fee")           && i+1<argc) fee = strtoull(argv[++i],NULL,10);
         else if (!strcmp(argv[i],"--sweep")         && i+1<argc && n_sweeps<MAXSW) sweeps[n_sweeps++] = argv[++i];
         else if (!strcmp(argv[i],"--broadcast")) do_broadcast = 1;
+        else if (!strcmp(argv[i],"--hashlock")) enable_hashlock = 1;
+        else if (!strcmp(argv[i],"--dump")) do_dump = 1;
         else if (!strcmp(argv[i],"--network")       && i+1<argc) network = argv[++i];
         else { fprintf(stderr,"unknown arg %s\n", argv[i]); return 2; }
     }
@@ -148,18 +153,34 @@ int main(int argc, char **argv) {
     factory_t *f = calloc(1, sizeof(factory_t));
     factory_init(f, ctx, kps, n_part, 64, 16);
     factory_set_arity(f, FACTORY_ARITY_PS);
-    factory_set_ps_subfactory_arity(f, ps_sub_arity);
+    if (ps_sub_arity > 0) factory_set_ps_subfactory_arity(f, ps_sub_arity);
     unsigned char fund_spk_dummy[34] = {0x51,0x20};
     factory_set_funding(f, fund_txid, fund_vout, fund_amount, fund_spk_dummy, 34);
     f->cltv_timeout = (uint32_t)cltv_timeout;
+    /* DW tree shape: the LSP built the tree via lsp_run_factory_creation(step_blocks,
+       states_per_layer,...); factory_build_tree reads f->step_blocks + f->states_per_layer,
+       so set them here or the rebuilt tree has the wrong node count and NO output matches. */
+    if (step_blocks_arg > 0) f->step_blocks = step_blocks_arg;
+    if (states_per_layer_arg > 0) f->states_per_layer = states_per_layer_arg;
     /* hashlock: derive the per-factory seed from the LSP master key + funding (the
        same derivation the LSP used), enable, so L-stock SPKs reproduce. */
     unsigned char seed[32];
     factory_derive_lstock_seed(sk[0], fund_txid, fund_vout, seed);
     factory_set_shachain_seed(f, seed);
-    factory_enable_hashlock_poison(f);
+    if (enable_hashlock) factory_enable_hashlock_poison(f);
     if (!factory_build_tree(f)) { fprintf(stderr,"factory_build_tree failed\n"); return 1; }
     printf("rebuilt tree: %zu nodes, cltv_timeout=%u\n", f->n_nodes, f->cltv_timeout);
+    if (do_dump) {
+        for (size_t ni=0; ni<f->n_nodes; ni++){
+            const factory_node_t *nd=&f->nodes[ni];
+            char sb[69]; if(nd->spending_spk_len==34){hex_encode(nd->spending_spk,34,sb);sb[68]=0;} else {sb[0]=0;}
+            printf("  node %zu: n_signers=%zu n_outputs=%zu spending_spk=%.24s\n", ni, nd->n_signers, nd->n_outputs, sb[0]?sb:"(none)");
+            for (size_t v=0; v<nd->n_outputs; v++){
+                char ob[69]; if(nd->outputs[v].script_pubkey_len==34){hex_encode(nd->outputs[v].script_pubkey,34,ob);ob[68]=0;} else {strcpy(ob,"(non-p2tr)");}
+                printf("     out[%zu] %.24s\n", v, ob);
+            }
+        }
+    }
 
     size_t dest_len = strlen(dest_spk_hex)/2; unsigned char dest_spk[64];
     if (dest_len > 64 || !hex_decode(dest_spk_hex, dest_spk, dest_len)) { fprintf(stderr,"bad dest-spk\n"); return 2; }
@@ -179,7 +200,7 @@ int main(int argc, char **argv) {
 
         uint32_t signers[64]; size_t n_sig=0; unsigned char merkle[32]; int has_merkle=0; char what[64];
         int m = match_output(f, spk, signers, &n_sig, merkle, &has_merkle, what, sizeof(what));
-        if (m != 1) { printf("[%s:%u] NO MATCH in tree (%d sats) -- skipping\n", p_txid, in_vout, (int)in_amt); free(d); continue; }
+        if (m != 1) { printf("[%s:%u] NO MATCH in tree (%d sats) spk=%s -- skipping\n", p_txid, in_vout, (int)in_amt, p_spk); free(d); continue; }
 
         /* tweaked output key parsed from the matched on-chain SPK (P2TR 0x5120||xonly).
            match_output already confirmed spk == a rebuilt tree output (identifies the
