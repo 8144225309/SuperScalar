@@ -147,6 +147,12 @@ mkfifo "$LSP_FIFO"
 sleep infinity > "$LSP_FIFO" &
 FIFO_HOLDER_PID=$!
 
+# Trustless model: an inbound HTLC must expire BEFORE the factory CLTV
+# (lsp_channels.c:849) with > factory_delta (~144) of headroom to unwind the DW
+# tree on-chain. The regtest auto-CLTV is only current+35 -- too short for a
+# standard final_cltv_delta -- so pin the factory to a production-like lifetime
+# (matching --active-blocks 500 below). The CLTV safety check itself is unchanged.
+FACTORY_CLTV=$(( $($BCLI getblockcount) + 500 ))
 stdbuf -oL $LSP_BIN \
     --daemon \
     --cli \
@@ -160,6 +166,7 @@ stdbuf -oL $LSP_BIN \
     --rpcpassword rpcpass \
     --amount 100000 \
     --active-blocks 500 \
+    --cltv-timeout "$FACTORY_CLTV" \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
