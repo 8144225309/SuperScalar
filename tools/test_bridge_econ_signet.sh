@@ -31,21 +31,28 @@ LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 BRIDGE_BIN="$BUILD_DIR/superscalar_bridge"
 
-LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
-CLIENT0_SK="0000000000000000000000000000000000000000000000000000000000000002"
-CLIENT_SECKEYS=(
-    "$CLIENT0_SK"
-    "0000000000000000000000000000000000000000000000000000000000000003"
-    "0000000000000000000000000000000000000000000000000000000000000004"
-    "0000000000000000000000000000000000000000000000000000000000000005"
-)
+# Keys: env-overridable so signet runs use STRONG keys (tools/signet_strong_keygen.py).
+# The weak privkey defaults are regtest/dev ONLY -- never fund them on public signet.
+LSP_SECKEY="${LSP_SECKEY:-0000000000000000000000000000000000000000000000000000000000000001}"
+if [ -n "${CLIENT_KEYS_FILE:-}" ]; then
+    # One hex seckey per line (see signet_strong_keygen.py output).
+    CLIENT_SECKEYS=()
+    while IFS= read -r _k; do [ -n "$_k" ] && CLIENT_SECKEYS+=("$_k"); done < "$CLIENT_KEYS_FILE"
+else
+    CLIENT_SECKEYS=(
+        "0000000000000000000000000000000000000000000000000000000000000002"
+        "0000000000000000000000000000000000000000000000000000000000000003"
+        "0000000000000000000000000000000000000000000000000000000000000004"
+        "0000000000000000000000000000000000000000000000000000000000000005"
+    )
+fi
 
 # --- Signet bitcoind ---
 SIGNET_CONF="/var/lib/bitcoind-signet/bitcoin.conf"
 BCLI="bitcoin-cli -conf=$SIGNET_CONF"
 
 # --- Persistent CLN nodes ---
-PLUGIN_CLN_DIR="/var/lib/cln-signet"           # has SS plugin
+PLUGIN_CLN_DIR="${PLUGIN_CLN_DIR:-/var/lib/cln-signet}"           # has SS plugin (env-overridable)
 VANILLA_CLN_DIR="${VANILLA_DIR:-/var/lib/cln-signet-c}"
 CLN_NET="signet"
 LCLI_PLUGIN="lightning-cli --network=$CLN_NET --lightning-dir=$PLUGIN_CLN_DIR"
@@ -60,6 +67,7 @@ LSP_DB="$TMPDIR/lsp.db"
 PIDS=()
 cleanup() {
     echo "=== Cleaning up (signet state preserved) ==="
+    $LCLI_PLUGIN plugin stop "${SS_PLUGIN:-$PROJECT_DIR/tools/cln_plugin.py}" 2>/dev/null || true
     kill "${FIFO_HOLDER_PID:-}" 2>/dev/null || true
     for pid in "${PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
@@ -67,6 +75,7 @@ cleanup() {
     done
     cp "$TMPDIR/lsp.log" /tmp/bridge_signet_last_lsp.log 2>/dev/null || true
     cp "$TMPDIR/bridge.log" /tmp/bridge_signet_last_bridge.log 2>/dev/null || true
+    cp "$TMPDIR/lsp.db" /tmp/bridge_signet_last_lsp.db 2>/dev/null || true
     rm -rf "$TMPDIR"
     echo "  Preserved logs: /tmp/bridge_signet_last_{lsp,bridge}.log"
 }
@@ -155,11 +164,12 @@ for i in $(seq 1 30); do
     grep -q "listening on port" "$TMPDIR/lsp.log" 2>/dev/null && break
     sleep 1
 done
-LSP_PUBKEY="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+LSP_PUBKEY="${LSP_PUBKEY:-0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798}"
 
 # ---- Start 4 clients ----
 for i in 0 1 2 3; do
     stdbuf -oL $CLIENT_BIN --seckey "${CLIENT_SECKEYS[$i]}" \
+        --participant-id $((i + 1)) \
         --host 127.0.0.1 --port "$LSP_PORT" --network signet \
         --lsp-pubkey "$LSP_PUBKEY" --daemon \
         --db "$TMPDIR/client_${i}.db" \
@@ -195,6 +205,17 @@ for i in $(seq 1 30); do
     sleep 1
 done
 echo "Bridge: connected"
+
+# ---- Load the SS bridge plugin on the persistent plugin CLN ----
+# cln_plugin.py exits if it can't reach the bridge, so start it AFTER the bridge
+# is listening. Pin the plugin's bridge port to $BRIDGE_PORT via CLN's -k keyword
+# form (the plugin default 9736 collides with cln-grpc). "Extra parameters must be
+# in object" if you pass the option positionally -- must use -k.
+SS_PLUGIN="${SS_PLUGIN:-$PROJECT_DIR/tools/cln_plugin.py}"
+$LCLI_PLUGIN plugin stop "$SS_PLUGIN" 2>/dev/null || true
+sleep 1
+$LCLI_PLUGIN -k plugin subcommand=start plugin="$SS_PLUGIN" superscalar-bridge-port="$BRIDGE_PORT" 2>/dev/null && echo "Plugin: started on $PLUGIN_CLN_DIR (bridge-port $BRIDGE_PORT)" || echo "Plugin: start non-zero (may already be loaded)"
+sleep 3
 
 # ---- Wire the plugin CLN to the bridge ----
 # The persistent plugin CLN must be configured to talk to our ephemeral
