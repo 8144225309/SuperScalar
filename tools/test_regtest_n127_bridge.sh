@@ -24,6 +24,9 @@
 # Env:   N_CLIENTS (default 127)
 set -uo pipefail
 
+# systemd-run units have no HOME; everything below needs one.
+HOME="${HOME:-/root}"
+
 BUILD_DIR="${1:-/root/ss-p6-main/build}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
