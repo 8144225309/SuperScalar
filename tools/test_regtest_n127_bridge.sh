@@ -9,7 +9,9 @@
 #
 # Legs proven, with hard economic assertions on the EXTERNAL node:
 #   INBOUND  shallow: CLN2 pays a 600k msat invoice for factory client 0
-#   INBOUND  deep:    CLN2 pays a 500k msat invoice for factory client 100
+#   INBOUND  deep:    CLN2 pays a 700k msat invoice for factory client 100
+#                     (must stay above the 546-sat dust limit: 500k msat =
+#                      500 sats gets a correct channel_add_htlc dust refusal)
 #                     (high-index routing at scale — indexes past 64 were
 #                      exactly where the readiness/scale bugs lived)
 #   OUTBOUND:         factory client 0 pays a 400k msat CLN2 invoice
@@ -249,19 +251,19 @@ except: print('n')")
     else red "  FAIL: inbound(shallow) pay: $R"; FAIL=1; fi
 fi
 
-# --- Step 8: INBOUND deep — CLN2 pays factory client $DEEP_CLIENT (500k msat) ---
-info "INBOUND(deep): invoice for client $DEEP_CLIENT, 500000 msat"
-echo "invoice $DEEP_CLIENT 500000" > "$LSP_FIFO"; sleep 3
+# --- Step 8: INBOUND deep — CLN2 pays factory client $DEEP_CLIENT (700k msat) ---
+info "INBOUND(deep): invoice for client $DEEP_CLIENT, 700000 msat"
+echo "invoice $DEEP_CLIENT 700000" > "$LSP_FIFO"; sleep 3
 B11D=""
 for i in $(seq 1 30); do
     B11D=$($CLI1 listinvoices | python3 -c "
 import json,sys
 for inv in json.load(sys.stdin).get('invoices', []):
-    if inv.get('label','').startswith('superscalar-') and inv.get('status')=='unpaid' and int(inv.get('amount_msat',0))==500000:
+    if inv.get('label','').startswith('superscalar-') and inv.get('status')=='unpaid' and int(inv.get('amount_msat',0))==700000:
         print(inv.get('bolt11','')); break" 2>/dev/null)
     [ -n "$B11D" ] && break; sleep 1
 done
-if [ -z "$B11D" ]; then red "  FAIL: no 500k invoice appeared on CLN1 (deep client)"; FAIL=1
+if [ -z "$B11D" ]; then red "  FAIL: no 700k invoice appeared on CLN1 (deep client)"; FAIL=1
 else
     R=$($CLI2 pay "$B11D" 2>&1) || true
     OK=$(echo "$R" | python3 -c "import json,sys
@@ -273,10 +275,10 @@ fi
 
 MID=$(cln2_spendable)
 SPENT=$(( BASE - MID ))
-if [ "$SPENT" -ge 1100000 ]; then
-    green "  ok: CLN2 spent $SPENT msat (>= 1.1M inbound total, real sats left the external node)"
+if [ "$SPENT" -ge 1300000 ]; then
+    green "  ok: CLN2 spent $SPENT msat (>= 1.3M inbound total, real sats left the external node)"
 else
-    red "  FAIL: CLN2 only spent $SPENT msat (expected >= 1100000)"; FAIL=1
+    red "  FAIL: CLN2 only spent $SPENT msat (expected >= 1300000)"; FAIL=1
 fi
 
 # --- Step 9: OUTBOUND — factory client 0 pays a real CLN2 invoice (400k msat) ---
