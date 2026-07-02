@@ -283,7 +283,6 @@ v0.2.0 is feature-complete and proven end-to-end on regtest and public signet, i
 - **Third-party security audit** — not started; this is the dominant gate.
 - **CLN-bridge authentication** — the bridge's pubkey "pin" is not mutual authentication over the current Noise NK handshake; a peer that knows the (public) bridge key could inject bridge HTLCs. Run the bridge on a trusted/firewalled interface until Noise KK mutual auth lands.
 - **Reference-client at-rest encryption** — the LSP seals its secrets at rest; the reference *client* does not yet, so its HD seed is on disk in the clear. Use `--keyfile` and protect the client data directory.
-- **Post-rotation accounting** — a conservation-checker/init mismatch can freeze new HTLCs on channels immediately after a factory rotation (funds are safe; payments pause until restart). Fix in progress.
 - **Operational model** — watchtower + CPFP-bumper funding/ownership, client fee-reserve for self-exit, and construction migration/backup-restore are still being specified.
 
 Deploy on signet/testnet only until these close.

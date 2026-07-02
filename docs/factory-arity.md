@@ -77,7 +77,7 @@ multiple levels into one, capping total depth. Static-near-root removes
 state transitions from the levels closest to the root, eliminating
 their CSV contribution entirely.
 
-## Current implementation status (v0.1.x)
+## Current implementation status (v0.2.0)
 
 **As of this document's commit, the implementation has delivered the
 full canonical SuperScalar design — TRUE N-way mixed-arity interior
@@ -85,7 +85,7 @@ branching + static-near-root variant (Phases 0-4 of the mixed-arity
 plan, all merged):**
 
 - PS leaves at any N (proven on regtest at N=2-32 with full per-party
-  accounting; unit-tested at N=64 and N=128)
+  accounting; unit-tested at N=64 and at the 128-signer maximum = LSP + 127 clients)
 - DW arity-1 and arity-2 leaves (legacy, kept for migration)
 - **TRUE N-way interior branching (Phase 2 — merged in PR #104).**
   `--arity 2,4,8` produces an authentic 3-level fan-out: root arity-2 →
@@ -111,23 +111,24 @@ plan, all merged):**
   `factory_compute_ewt_for_shape()` (pure-math simulator); covered by
   `test_cli_arity_*` unit tests asserting the specific error strings.
 
-The supported deployment ceiling is now **N=128 clients per factory**
-with mixed arity `{2,4,8}` + `--static-near-root 2` (unit-tested with
-per-shape ewt assertion) — well within BOLT 2016. End-to-end regtest
-at N=64 with `{2,4,8}` and N=12 with `{2,4} + static-near-root=1` is
-also exercised.
+The supported deployment ceiling is **N=127 clients per factory** (128
+signers including the LSP, the MuSig session cap; the LSP CLI rejects
+`--clients` above 127) with mixed arity `{2,4,8}` + `--static-near-root 2`
+— well within BOLT 2016. The full lifecycle — creation, client↔client
+payments, factory rotation, cooperative close — is proven end-to-end at
+N=127 on regtest and public signet, and at N=64 on testnet4.
 
 ## Recommended shapes (canonical, all available today)
 
-All of these are implemented and unit-tested as of v0.1.14+:
+All of these are implemented and unit-tested as of v0.2.0:
 
 | Client count | Recommended shape | Leaf type | Notes |
 |---|---|---|---|
 | ≤ 16 | `--arity 3` (uniform PS) | PS | Depth ≤ 4, no mixed needed |
 | 17-32 | `--arity 3,4` (PS root, DW arity-4 leaves) | DW arity-4 | Adds one fan-out level |
 | 33-64 | `--arity 2,4,8` | DW arity-8 | ZmnSCPxj's canonical mid-tree shape |
-| 65-128 | `--arity 2,4,8 --static-near-root 1` | DW arity-8 | Static gate at root reduces depth contribution |
-| 65-128 | `--arity 2,4,8 --static-near-root 2` | DW arity-8 | The design target — only two DW layers remain |
+| 65-127 | `--arity 2,4,8 --static-near-root 1` | DW arity-8 | Static gate at root reduces depth contribution |
+| 65-127 | `--arity 2,4,8 --static-near-root 2` | DW arity-8 | The design target — only two DW layers remain |
 
 The CLI rejects any combination whose worst-path `ewt` would exceed BOLT
 2016 with a clear error pointing at this document.
@@ -145,12 +146,12 @@ CLI uses for validation.
 |  16 | `3` (uniform PS)              | 0 | PS  | 4 | 4 | 1728 | Under |
 |  32 | `3,4` (PS root, DW arity-4 leaves) | 0 | DW arity-4 | 2 | 3 | 1296 | Under |
 |  64 | `2,4,8` (DW arity-8 leaves)   | 0 | DW arity-8 | 3 | 4 | 1728 | Under |
-| 128 | `2,4,8` (DW arity-8 leaves)   | 0 | DW arity-8 | 3 | 4 | 1728 | Under |
-| 128 | `2,4,8`                       | 1 | DW arity-8 | 3 | 3 | 1296 | Generous slack |
-| 128 | `2,4,8`                       | 2 | DW arity-8 | 3 | 2 |  864 | The design target |
+| 127 | `2,4,8` (DW arity-8 leaves)   | 0 | DW arity-8 | 3 | 4 | 1728 | Under |
+| 127 | `2,4,8`                       | 1 | DW arity-8 | 3 | 3 | 1296 | Generous slack |
+| 127 | `2,4,8`                       | 2 | DW arity-8 | 3 | 2 |  864 | The design target |
 |  32 | `3` (uniform PS — too deep)   | 0 | PS  | 5 | 5 | 2160 | **EXCEEDS — rejected** |
 |  64 | `2` (uniform binary DW)       | 0 | DW arity-2 | 6 | 6 | 2592 | **EXCEEDS — rejected** |
-| 128 | `2` (uniform binary DW)       | 0 | DW arity-2 | 7 | 8 (capped) | 3456 | **EXCEEDS — rejected** |
+| 127 | `2` (uniform binary DW)       | 0 | DW arity-2 | 7 | 8 (capped) | 3456 | **EXCEEDS — rejected** |
 
 Regtest and testnet deployments use `step_blocks = 10` (not 144), so the
 CSV budget is non-binding at any client count — but that's a test

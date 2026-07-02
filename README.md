@@ -137,15 +137,15 @@ In a PS (Pseudo-Spilman) configuration, leaves chain advance by appending new st
 
 ## Known limitations
 
-- **Mainnet support** requires explicit `--accept-risk-mainnet` until v0.3.
-- **N=128** factory scale validated in regtest; testnet4 validation deferred to v0.3.
+- **Mainnet support** requires explicit `--i-accept-the-risk`; not recommended until the external audit + pre-mainnet hardening are complete (see the v0.2.0 release notes).
+- **N=127 clients** (128-signer aggregation) is the design max; full lifecycle — creation, client↔client payments, factory rotation, cooperative close — proven on regtest and public signet.
 - **Windows binaries** not built (POSIX-only paths in regtest + signal handling); contributions welcome.
 - **CLN bLIP-56 plugin** lives in a separate [`superscalar-cln`](https://github.com/8144225309/superscalar-cln) repo and is not built here.
 - **Splice support** has the BOLT-2 wire codec but the runtime state machine is a stub (`#210`).
 
 ## Security
 
-**SuperScalar is pre-1.0 software.** No external audit has been performed yet. An internal audit found 4 gaps — all fixed. Mainnet operation requires explicit `--accept-risk-mainnet` until v0.3.
+**SuperScalar is pre-1.0 software.** No external audit has been performed yet — that is the dominant gate for mainnet. Mainnet operation requires explicit `--i-accept-the-risk` and is not recommended until the audit and the pre-mainnet hardening items (see the v0.2.0 release notes) are complete.
 
 Found a vulnerability? See [`SECURITY.md`](SECURITY.md). Please **do not** open a public issue for security-sensitive matters.
 
