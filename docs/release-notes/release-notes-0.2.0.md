@@ -1,12 +1,23 @@
 # SuperScalar v0.2.0 Release Notes
 
-*v0.2.0-rc1 — release candidate 1, 2026-05-31*
+*v0.2.0 — 2026-07-02*
 
-v0.2.0 is the first release where SuperScalar is a credible mainnet candidate. It bundles ~265 merged PRs since v0.1.13 — a new canonical leaf shape (Pseudo-Spilman k² sub-factories), a top-to-bottom MuSig2 redesign, PTLC infrastructure, reorg-correctness pre-flight, crash-injection scaffolding, an adversarial cheat-engine campaign, and a trustless standalone watchtower.
+v0.2.0 is the largest SuperScalar release to date. It bundles a new canonical leaf shape (Pseudo-Spilman k² sub-factories), a top-to-bottom MuSig2 redesign, PTLC infrastructure, reorg-correctness pre-flight, crash-injection scaffolding, an adversarial cheat-engine campaign, a trustless standalone watchtower, and — since the rc1 candidate — at-rest secret encryption, revealed-secret poison recourse, and CLN-bridge interop with unmodified Lightning nodes proven at the factory design max on public signet.
 
-This document is the operator-facing summary. See `CHANGELOG.md` for the full per-PR log.
+**Read [Mainnet readiness](#not-yet-for-mainnet) before deploying real funds.** v0.2.0 is feature-complete and proven end-to-end on regtest and public signet; it is **not** yet cleared for mainnet — a third-party security audit and a small set of pre-mainnet hardening items are still open.
+
+This document is the operator-facing summary. See `CHANGELOG.md` for the full per-PR log. Bare `#N` references in that log are internal task IDs, not GitHub PR numbers.
 
 ---
+
+## Since v0.2.0-rc1
+
+Work landed after the rc1 candidate (2026-05-31), verified on the current release commit:
+
+- **At-rest secret encryption** — the LSP's HD seed and, subsequently, the remaining at-rest secret columns are sealed with an app-level field-encryption scheme (LND/Core model, no new dependency). `--encrypt-db` wiring plus a mainnet refusal of cmdline `--seckey`. Closes the plaintext-seed steal-all-funds hole for the LSP.
+- **Revealed-secret (revocation-style) L-stock poison (#53)** — closes the co-signed-poison theft class at the leaf *and* sub-factory level; proven on regtest and real signet (poison broadcast + multi-party redistribution confirmed on-chain).
+- **CLN-bridge interop** — an unmodified, non-bLIP-56 Core Lightning node pays into and out of a SuperScalar factory channel through the bridge. Proven both directions on regtest and real signet, and **at the factory design max (127 clients) on public signet** — inbound to a shallow and a deep-index client, outbound back out, with on-chain funding + cooperative close and net economics reconciled to the sat.
+- **Scale correctness at 127 clients** — full lifecycle (creation → client-to-client payments → cooperative close → sat-exact conservation) and async factory rotation both re-proven at the design max. Along the way: the readiness tracker's >64-client undefined shift was removed (derive from per-entry state), `--async-rotation` was fixed to actually gate on readiness rather than fire on a retry tick, and the LSP CLI now rejects `--clients` above 127 (the 128-signer MuSig cap) with a clear message instead of a deep signing failure.
 
 ## Headline: Pseudo-Spilman k² sub-factories
 
@@ -159,9 +170,9 @@ Seven new cheat drivers exercising worst-case adversary behavior end-to-end:
 - `superscalar_watchtower --inspect-wt-db` for forensic inspection
 - Per-cheat regtest script with breach-detection assertions
 
-### Schema migrations (v22 → v36)
+### Schema migrations (v22 → v39)
 
-Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS), version-gated, idempotent.
+Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS), version-gated, idempotent. `PERSIST_SCHEMA_VERSION` is 39; the persisted version lives in the `schema_version` table (not `PRAGMA user_version`).
 
 - v22: poison TX persist + rehydrate
 - v26: `signing_rounds` ceremony forensics journal
@@ -173,6 +184,8 @@ Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS
 - v34: ceremony tables for multi-party coordination (`ceremonies`, `ceremony_participants`, `revocation_releases`)
 - v35: per-output HTLC sweep TX persistence
 - v36: HTLC resolution TX + L-stock burn TX + agg hard guard
+- v37: at-rest HD-seed sealing (encrypted secret storage)
+- v38–v39: remaining at-rest secret columns sealed (revocation / channel secrets)
 - wt.db schema v2: `watch_kind` discriminant column
 
 ### Observability + dashboard
@@ -262,6 +275,18 @@ End-to-end PASS on three independent chains:
 Plus the per-feature regtest suites (PTLC × 5, cheat-engine × 7, crash-drill × 16, sub-factory × 4, watchtower trustless × 3).
 
 ---
+
+## Not yet for mainnet
+
+v0.2.0 is feature-complete and proven end-to-end on regtest and public signet, including at the 127-client design max. It is deliberately **not** marked mainnet-ready. Before real funds, the following are open:
+
+- **Third-party security audit** — not started; this is the dominant gate.
+- **CLN-bridge authentication** — the bridge's pubkey "pin" is not mutual authentication over the current Noise NK handshake; a peer that knows the (public) bridge key could inject bridge HTLCs. Run the bridge on a trusted/firewalled interface until Noise KK mutual auth lands.
+- **Reference-client at-rest encryption** — the LSP seals its secrets at rest; the reference *client* does not yet, so its HD seed is on disk in the clear. Use `--keyfile` and protect the client data directory.
+- **Post-rotation accounting** — a conservation-checker/init mismatch can freeze new HTLCs on channels immediately after a factory rotation (funds are safe; payments pause until restart). Fix in progress.
+- **Operational model** — watchtower + CPFP-bumper funding/ownership, client fee-reserve for self-exit, and construction migration/backup-restore are still being specified.
+
+Deploy on signet/testnet only until these close.
 
 ## Verifying your install
 
