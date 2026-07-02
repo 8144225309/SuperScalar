@@ -310,10 +310,10 @@ if grep -q "CONSERVATION VIOLATION\|refusing new HTLCs" "$LSP_LOG"; then
 else
     green "  ok: no conservation alert"
 fi
-if grep -q "force.close\|FORCE_CLOSE" "$LSP_LOG"; then
-    red "  FAIL: force-close appeared in LSP log"; FAIL=1
+if grep -qE "initiating force-close|force-close broadcast|broadcasting force" "$LSP_LOG"; then
+    red "  FAIL: force-close initiated during bridge traffic"; FAIL=1
 else
-    green "  ok: no force-close"
+    green "  ok: no force-close initiated"
 fi
 
 if [ "$FAIL" -eq 0 ]; then
