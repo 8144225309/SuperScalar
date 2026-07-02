@@ -169,6 +169,12 @@ int client_parse_forgery_response(const char *s);
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
 
+/* Handle async / unsolicited LSP->client notifications (MSG_FUNDING_REORG,
+   MSG_CEREMONY_ABORT).  Returns 1 if handled (caller still frees msg->json), 0
+   otherwise.  Shared by the ceremony recv path (wire_recv_handle_ping) and the
+   client daemon dispatch so both handle them identically. */
+int client_handle_async_msg(const wire_msg_t *msg);
+
 /* Send FULFILL_HTLC to LSP (reveal preimage for received HTLC).
    Returns 1 on success. */
 int client_fulfill_payment(int fd, channel_t *ch,

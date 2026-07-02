@@ -65,6 +65,9 @@ cleanup() {
     # Stop bitcoind
     $BCLI stop 2>/dev/null || true
 
+    # Preserve logs for diagnosis before removing temp dir
+    cp "$TMPDIR/bridge.log" /tmp/bridge_regtest_last_bridge.log 2>/dev/null || true
+    cp "$TMPDIR/lsp.log" /tmp/bridge_regtest_last_lsp.log 2>/dev/null || true
     # Remove temp dir
     rm -rf "$TMPDIR"
     echo "=== Cleanup complete ==="
@@ -147,6 +150,12 @@ mkfifo "$LSP_FIFO"
 sleep infinity > "$LSP_FIFO" &
 FIFO_HOLDER_PID=$!
 
+# Trustless model: an inbound HTLC must expire BEFORE the factory CLTV
+# (lsp_channels.c:849) with > factory_delta (~144) of headroom to unwind the DW
+# tree on-chain. The regtest auto-CLTV is only current+35 -- too short for a
+# standard final_cltv_delta -- so pin the factory to a production-like lifetime
+# (matching --active-blocks 500 below). The CLTV safety check itself is unchanged.
+FACTORY_CLTV=$(( $($BCLI getblockcount) + 500 ))
 stdbuf -oL $LSP_BIN \
     --daemon \
     --cli \
@@ -160,6 +169,7 @@ stdbuf -oL $LSP_BIN \
     --rpcpassword rpcpass \
     --amount 100000 \
     --active-blocks 500 \
+    --cltv-timeout "$FACTORY_CLTV" \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
@@ -437,7 +447,10 @@ for attempt in $(seq 1 30); do
 done
 
 lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" connect "$CLN_ID" 127.0.0.1 9738
-lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" fundchannel "$CLN_ID" 500000
+# push_msat gives CLN1 (the bridge's CLN) return liquidity so the SS->external
+# OUTBOUND leg (Step 13) can route. Without it, after a small inbound the bridge
+# side sits below the 1% channel reserve and can't pay out.
+lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" fundchannel -k id="$CLN_ID" amount=500000 push_msat=100000000
 
 # Mine blocks and wait for channel to reach NORMAL state
 echo "Mining blocks and waiting for channel to become NORMAL..."
@@ -525,6 +538,42 @@ except:
         echo "=== FAIL: Payment did not complete ==="
         echo "Result: $RESULT"
         FAIL=1
+    fi
+fi
+
+# --- Step 13: Outbound — SS client 0 pays a CLN2 invoice via the bridge ---
+# Proves the "sending" direction (SS -> non-bLIP-56 CLN2). After the inbound
+# payment, CLN1(bridge) holds outbound liquidity toward CLN2, so this can route.
+if [ "$FAIL" -eq 0 ]; then
+    echo ""
+    echo "--- Step 13: Outbound payment (SS client 0 -> CLN2 via bridge) ---"
+    OUT_LABEL="ss-out-$$"
+    OUT_INV=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" invoice 400000 "$OUT_LABEL" "SS client -> CLN2" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('bolt11',''))" 2>/dev/null)
+    if [ -z "$OUT_INV" ]; then
+        echo "=== FAIL: could not create CLN2 invoice for outbound ==="
+        FAIL=1
+    else
+        echo "CLN2 invoice: ${OUT_INV:0:40}..."
+        echo "pay_external 0 $OUT_INV" > "$LSP_FIFO"
+        OUT_PAID="false"
+        for attempt in $(seq 1 60); do
+            OUT_PAID=$(lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" listinvoices "$OUT_LABEL" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    invs = json.load(sys.stdin).get('invoices', [])
+    print('true' if invs and invs[0].get('status') == 'paid' else 'false')
+except:
+    print('false')
+" 2>/dev/null)
+            [ "$OUT_PAID" = "true" ] && break
+            sleep 1
+        done
+        if [ "$OUT_PAID" = "true" ]; then
+            echo "=== PASS: CLN Bridge Outbound Payment (CLN2 invoice paid) ==="
+        else
+            echo "=== FAIL: outbound payment did not settle (CLN2 invoice not paid) ==="
+            FAIL=1
+        fi
     fi
 fi
 

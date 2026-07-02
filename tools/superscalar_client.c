@@ -2227,6 +2227,15 @@ handle_message:
         }
 
         default:
+            /* Async / unsolicited LSP notifications (MSG_FUNDING_REORG,
+               MSG_CEREMONY_ABORT) can arrive here in daemon mode.  Route them
+               through the shared handler so we mirror the freeze state / log the
+               advisory instead of treating them as "unexpected", desyncing, and
+               livelocking on reconnect (the inbound-bridge-payment bug). */
+            if (client_handle_async_msg(&msg)) {
+                cJSON_Delete(msg.json);
+                break;
+            }
             fprintf(stderr, "Client %u: daemon got unexpected msg 0x%02x\n",
                     my_index, msg.msg_type);
             cJSON_Delete(msg.json);

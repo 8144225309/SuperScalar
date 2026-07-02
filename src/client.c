@@ -153,10 +153,67 @@ static int g_client_funding_pending_reorg = 0;
  * src/client_reconnect.c (extracted) can write it on reconnect. */
 factory_t *g_client_active_factory = NULL;
 
-/* Wrapper around wire_recv_timeout that transparently handles
-   MSG_PING (responds with MSG_PONG), MSG_PONG (discards), and
-   MSG_FUNDING_REORG (updates local freeze mirror, discards).
-   Returns 1 on a real (non-keepalive) message, 0 on failure. */
+/* Handle async / unsolicited LSP->client notifications that can arrive at any
+   time between (or during) request/response exchanges:
+     - MSG_FUNDING_REORG: mirror the LSP's funding freeze state + reset stale
+       sub-factory chains (SF-followup #145 / reorg PR #208).
+     - MSG_CEREMONY_ABORT: advisory abort / intent-to-exit notice (#49/#51).
+   Returns 1 if msg was one of these (caller treats it as consumed but must still
+   free msg->json), 0 otherwise.  Shared by wire_recv_handle_ping (ceremony recv
+   path) AND the client daemon dispatch in tools/superscalar_client.c so BOTH
+   handle them identically.  Before this the daemon loop hit its "unexpected msg"
+   default on FUNDING_REORG, desynced, and livelocked reconnecting -- breaking
+   inbound bridge payments whenever the LSP sent a routine funding-reorg notice. */
+int client_handle_async_msg(const wire_msg_t *msg) {
+    if (msg->msg_type == MSG_FUNDING_REORG) {
+        int frozen = 0;
+        const char *txid_hex = "?";
+        if (msg->json) {
+            cJSON *fr = cJSON_GetObjectItem(msg->json, "frozen");
+            if (fr && cJSON_IsNumber(fr)) frozen = fr->valueint;
+            cJSON *tx = cJSON_GetObjectItem(msg->json, "funding_txid");
+            if (tx && cJSON_IsString(tx)) txid_hex = tx->valuestring;
+        }
+        g_client_funding_pending_reorg = frozen ? 1 : 0;
+        fprintf(stderr, "Client: MSG_FUNDING_REORG funding=%.16s "
+                "frozen=%d (LSP says funding %s)\n",
+                txid_hex, frozen,
+                frozen ? "reorged out" : "back on chain");
+        /* SF-followup #145: on frozen=1 the LSP has reset its in-memory
+           ps_chain_len for advanced sub-factories; mirror that so recovery /
+           force-close paths don't reference invalid chain[N] state. */
+        if (frozen && g_client_active_factory) {
+            int n_reset = factory_reset_all_subfactory_chains(
+                g_client_active_factory);
+            if (n_reset > 0)
+                fprintf(stderr, "Client: reset ps_chain_len on %d "
+                        "sub-factor(ies) after funding reorg\n", n_reset);
+        }
+        return 1;
+    }
+    if (msg->msg_type == MSG_CEREMONY_ABORT) {
+        /* #49/#51: advisory abort / intent-to-exit notice.  The client's own
+           persisted state + watchtower already protect its funds; log it loudly
+           so the operator can stop waiting on a ceremony that will never finish. */
+        unsigned char cer_id[8];
+        unsigned char reason = CEREMONY_ABORT_OTHER;
+        char *rtext = NULL;
+        if (msg->json &&
+            wire_parse_ceremony_abort(msg->json, cer_id, &reason, &rtext)) {
+            fprintf(stderr, "Client: MSG_CEREMONY_ABORT reason=0x%02x%s%s\n",
+                    reason, rtext ? " -- " : "", rtext ? rtext : "");
+            free(rtext);
+        } else {
+            fprintf(stderr, "Client: MSG_CEREMONY_ABORT (unparseable)\n");
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Wrapper around wire_recv_timeout that transparently handles keepalives
+   (MSG_PING -> MSG_PONG, MSG_PONG discard) and async notifications (delegated to
+   client_handle_async_msg).  Returns 1 on a real message, 0 on failure. */
 static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
     for (;;) {
         if (!wire_recv_timeout(fd, msg, timeout_sec))
@@ -174,62 +231,10 @@ static int wire_recv_handle_ping(int fd, wire_msg_t *msg, int timeout_sec) {
             msg->json = NULL;
             continue;  /* discard pong, wait for real message */
         }
-        if (msg->msg_type == MSG_FUNDING_REORG) {
-            int frozen = 0;
-            const char *txid_hex = "?";
-            if (msg->json) {
-                cJSON *fr = cJSON_GetObjectItem(msg->json, "frozen");
-                if (fr && cJSON_IsNumber(fr)) frozen = fr->valueint;
-                cJSON *tx = cJSON_GetObjectItem(msg->json, "funding_txid");
-                if (tx && cJSON_IsString(tx)) txid_hex = tx->valuestring;
-            }
-            g_client_funding_pending_reorg = frozen ? 1 : 0;
-            fprintf(stderr, "Client: MSG_FUNDING_REORG funding=%.16s "
-                    "frozen=%d (LSP says funding %s)\n",
-                    txid_hex, frozen,
-                    frozen ? "reorged out" : "back on chain");
-            /* SF-followup #145: mirror LSP-side reset from PR #208.  When the
-               funding is reported reorged out, any in-memory sub-factory
-               chain advance state is stale and must not be referenced by
-               subsequent operations.  Reset only on frozen=1; the unfreeze
-               path (frozen=0, funding back on chain) leaves the now-empty
-               chain in place — caller can re-advance from chain[0] if
-               desired. */
-            if (frozen && g_client_active_factory) {
-                int n_reset = factory_reset_all_subfactory_chains(
-                    g_client_active_factory);
-                if (n_reset > 0)
-                    fprintf(stderr, "Client: reset ps_chain_len on %d "
-                            "sub-factor(ies) after funding reorg\n", n_reset);
-            }
+        if (client_handle_async_msg(msg)) {
             if (msg->json) cJSON_Delete(msg->json);
             msg->json = NULL;
-            continue;  /* notification, wait for next real message */
-        }
-        if (msg->msg_type == MSG_CEREMONY_ABORT) {
-            /* #49/#51: advisory abort/intent-to-exit notice.  The LSP sends this
-               when a rotation/advance ceremony is aborted -- notably
-               RETRY_LIMIT_REACHED, where the LSP then proactively broadcasts the
-               distribution TX (unilateral exit) before the factory CLTV.  The
-               client's own persisted state + watchtower already protect its funds
-               (it can self-exit), so this is informational: log it loudly so the
-               client app/operator can stop waiting on a ceremony that will never
-               complete and confirm its watchtower is live.  Best-effort -- a
-               client offline during the failed ceremony simply won't receive it. */
-            unsigned char cer_id[8];
-            unsigned char reason = CEREMONY_ABORT_OTHER;
-            char *rtext = NULL;
-            if (msg->json &&
-                wire_parse_ceremony_abort(msg->json, cer_id, &reason, &rtext)) {
-                fprintf(stderr, "Client: MSG_CEREMONY_ABORT reason=0x%02x%s%s\n",
-                        reason, rtext ? " -- " : "", rtext ? rtext : "");
-                free(rtext);
-            } else {
-                fprintf(stderr, "Client: MSG_CEREMONY_ABORT (unparseable)\n");
-            }
-            if (msg->json) cJSON_Delete(msg->json);
-            msg->json = NULL;
-            continue;  /* advisory, wait for next real message */
+            continue;  /* async notification consumed; wait for real message */
         }
         return 1;  /* real message */
     }
