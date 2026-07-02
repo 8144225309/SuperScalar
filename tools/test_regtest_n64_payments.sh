@@ -309,10 +309,10 @@ fi
 #     tree's rounding remainder on the last leaf. Combined with each client
 #     signing the close, this proves no client was credited/debited incorrectly.
 if [ -n "$CLOSE_TXID" ]; then
-    RECON=$(python3 - "$CLOSE_TXID" "$REGTEST_CONF" "$LSP_LOG" "$N_CLIENTS" <<'PYEOF'
+    RECON=$(python3 - "$CLOSE_TXID" "$REGTEST_CONF" "$LSP_LOG" "$N_CLIENTS" "$PAYMENTS" <<'PYEOF'
 import sys, json, subprocess, re
 from collections import Counter
-txid, conf, lsplog, ncli = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+txid, conf, lsplog, ncli, payments = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
 r = subprocess.run(["bitcoin-cli","-regtest","-conf="+conf,"getrawtransaction",txid,"1"],
                    capture_output=True, text=True)
 if r.returncode != 0:
@@ -331,16 +331,22 @@ if len(cli_amts) != ncli:
 if ledger != onchain:
     errs.append("ledger!=onchain(sum %d vs %d, n %d vs %d)" % (sum(ledger), sum(onchain), len(ledger), len(onchain)))
 base, base_n = Counter(cli_amts).most_common(1)[0] if cli_amts else (0, 0)
-# The idle baseline must dominate: a per-client skim (varying many clients'
-# balances individually) would destroy the shared baseline. Most clients are
-# idle, so >= half sharing one exact value proves no per-client drift.
-if cli_amts and base_n < (ncli // 2):
+# Baseline-dominance is a SPARSE-run anti-skim heuristic: when only a few
+# clients pay, the idle majority shares one exact value, so a per-client skim
+# (varying many balances) would destroy that shared baseline.  In a DENSE
+# (all-pairs) run most clients legitimately move, so there is no idle majority
+# and the heuristic is meaningless -- exact_ledger_match (every on-chain output
+# == the LSP's per-client ledger to the sat) + conservation + the per-payment
+# settlement checks carry the proof there instead.  Each scripted payment moves
+# 2 clients, so movers ~= 2*payments.
+dense = (2 * payments) >= (ncli // 2)
+if cli_amts and not dense and base_n < (ncli // 2):
     errs.append("baseline-not-dominant(%d/%d at mode %d - possible per-client skim)" % (base_n, ncli, base))
 surplus = sum(a - base for a in cli_amts if a > base)
 deficit = sum(base - a for a in cli_amts if a < base)
 print(("OK" if not errs else "FAIL") +
-      " clients=%d at_baseline=%d/%d baseline=%d movers=%d exact_ledger_match=%s ledger_sum=%d onchain_sum=%d info_surplus=%d info_deficit=%d" %
-      (len(cli_amts), base_n, ncli, base, len(cli_amts) - base_n, ledger == onchain, sum(ledger), sum(onchain), surplus, deficit) +
+      " clients=%d at_baseline=%d/%d baseline=%d movers=%d dense=%s exact_ledger_match=%s ledger_sum=%d onchain_sum=%d info_surplus=%d info_deficit=%d" %
+      (len(cli_amts), base_n, ncli, base, len(cli_amts) - base_n, dense, ledger == onchain, sum(ledger), sum(onchain), surplus, deficit) +
       ("" if not errs else " :: " + "; ".join(errs)))
 PYEOF
 )
