@@ -7187,8 +7187,19 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             persist_t *db = (persist_t *)mgr->persist;
                                             notify_t *nfy = (notify_t *)mgr->notify;
                                             for (size_t ci = 0; ci < lsp->n_clients; ci++) {
-                                                if (lsp->client_fds[ci] >= 0)
+                                                if (lsp->client_fds[ci] >= 0) {
                                                     readiness_set_connected(rt, (uint32_t)ci, 1);
+                                                    /* A live client takes part in the rotation
+                                                       ceremony over its open connection; the
+                                                       QUEUE_DONE ack exists for clients that must
+                                                       RECONNECT to learn about the rotation.
+                                                       Counting online clients as ready makes the
+                                                       fast path below real: an all-online fleet
+                                                       fires immediately, a partial fleet waits
+                                                       for reconnect acks. */
+                                                    readiness_set_ready(rt, (uint32_t)ci,
+                                                                        QUEUE_REQ_ROTATION);
+                                                }
                                                 if (db)
                                                     queue_push(db, (uint32_t)ci,
                                                                lf->factory_id,
@@ -7200,8 +7211,16 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                             NOTIFY_ROTATION_NEEDED,
                                                             QUEUE_URGENCY_NORMAL, NULL);
                                             }
-                                            /* Fast path: fire immediately if all already here */
-                                            lsp_check_rotation_readiness(mgr, lsp);
+                                            /* Fast path: fire immediately if all already here.
+                                               Record success when it fires — otherwise the
+                                               retry machinery keeps ticking against the old
+                                               factory id: spurious FAILED attempts ("no
+                                               DYING/EXPIRED factory found") and, after
+                                               max_retries of them, the distribution-TX
+                                               fallback for a factory that already rotated. */
+                                            if (lsp_check_rotation_readiness(mgr, lsp))
+                                                lsp_rotation_record_success(mgr,
+                                                                            lf->factory_id);
                                         } else {
                                             /* Legacy synchronous path */
                                             int ok = lsp_channels_rotate_factory(mgr, lsp);
@@ -7239,7 +7258,37 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                  lf->cached_state == FACTORY_EXPIRED)) {
                                 int retry_act = lsp_rotation_should_retry(
                                     mgr, lf->factory_id, (uint32_t)height);
-                                if (retry_act == 1) {
+                                if (retry_act == 1 && mgr->readiness &&
+                                    lf->cached_state == FACTORY_DYING) {
+                                    /* Async mode, factory still DYING: the retry tick
+                                       goes through the readiness gate instead of firing
+                                       the synchronous ceremony directly — the direct
+                                       call here used to bypass the gate entirely,
+                                       rotating before absent clients had reconnected
+                                       and acknowledged (the whole point of
+                                       --async-rotation).  should_retry() has no side
+                                       effects, so ungated ticks simply poll the gate.
+                                       Once the factory reaches EXPIRED the branches
+                                       below take over unchanged (partial rotation with
+                                       n_ready >= 2, direct attempts, and finally the
+                                       distribution-TX fallback) — waiting is only
+                                       correct while there is still time to wait. */
+                                    readiness_tracker_t *rrt =
+                                        (readiness_tracker_t *)mgr->readiness;
+                                    printf("LSP: rotation retry tick — async gate %zu/%zu "
+                                           "ready for factory %u\n",
+                                           readiness_count_ready(rrt), rrt->n_clients,
+                                           lf->factory_id);
+                                    fflush(stdout);
+                                    if (lsp_check_rotation_readiness(mgr, lsp)) {
+                                        time_t tnow = time(NULL);
+                                        for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                            mgr->entries[rc].last_message_time = tnow;
+                                            mgr->entries[rc].offline_detected = 0;
+                                        }
+                                        lsp_rotation_record_success(mgr, lf->factory_id);
+                                    }
+                                } else if (retry_act == 1) {
                                     uint32_t ridx = lf->factory_id % 8;
                                     uint32_t attempt = mgr->rot_retry_count[ridx] + 1;
                                     uint32_t mret = mgr->rot_max_retries > 0
