@@ -15,8 +15,8 @@ int test_readiness_init(void) {
     readiness_init(&rt, 42, 4, NULL);
     TEST_ASSERT(rt.factory_id == 42, "factory_id");
     TEST_ASSERT(rt.n_clients == 4, "n_clients");
-    TEST_ASSERT(rt.ready_bitmap == 0, "ready_bitmap zeroed");
-    TEST_ASSERT(rt.connected_bitmap == 0, "connected_bitmap zeroed");
+    TEST_ASSERT(readiness_count_ready(&rt) == 0, "no one ready");
+    TEST_ASSERT(readiness_count_connected(&rt) == 0, "no one connected");
     TEST_ASSERT(rt.db == NULL, "db NULL");
     for (size_t i = 0; i < 4; i++) {
         TEST_ASSERT(rt.clients[i].client_idx == (uint32_t)i, "client_idx");
@@ -30,10 +30,12 @@ int test_readiness_set_connected(void) {
     readiness_tracker_t rt;
     readiness_init(&rt, 1, 4, NULL);
     readiness_set_connected(&rt, 2, 1);
-    TEST_ASSERT(rt.connected_bitmap == (1ULL <<2), "bit 2 set");
+    TEST_ASSERT(readiness_count_connected(&rt) == 1, "one connected");
     TEST_ASSERT(rt.clients[2].is_connected == 1, "entry connected");
     readiness_set_connected(&rt, 0, 1);
-    TEST_ASSERT(rt.connected_bitmap == ((1ULL <<2) | (1ULL <<0)), "bits 0,2 set");
+    TEST_ASSERT(readiness_count_connected(&rt) == 2, "two connected");
+    TEST_ASSERT(rt.clients[0].is_connected == 1 && rt.clients[1].is_connected == 0,
+                "exactly clients 0 and 2");
     return 1;
 }
 
@@ -42,11 +44,12 @@ int test_readiness_set_ready(void) {
     readiness_init(&rt, 1, 4, NULL);
     /* Not connected — ready should be rejected */
     readiness_set_ready(&rt, 1, QUEUE_REQ_ROTATION);
-    TEST_ASSERT(rt.ready_bitmap == 0, "not ready without connection");
+    TEST_ASSERT(readiness_count_ready(&rt) == 0, "not ready without connection");
     /* Connect then set ready */
     readiness_set_connected(&rt, 1, 1);
     readiness_set_ready(&rt, 1, QUEUE_REQ_ROTATION);
-    TEST_ASSERT(rt.ready_bitmap == (1ULL <<1), "bit 1 ready");
+    TEST_ASSERT(readiness_count_ready(&rt) == 1, "client 1 ready");
+    TEST_ASSERT(rt.clients[1].is_ready == 1, "entry ready");
     TEST_ASSERT(rt.clients[1].ready_for == QUEUE_REQ_ROTATION, "ready_for type");
     return 1;
 }
@@ -80,10 +83,10 @@ int test_readiness_clear(void) {
     readiness_init(&rt, 1, 4, NULL);
     readiness_set_connected(&rt, 2, 1);
     readiness_set_ready(&rt, 2, QUEUE_REQ_ROTATION);
-    TEST_ASSERT(rt.ready_bitmap == (1ULL <<2), "ready before clear");
+    TEST_ASSERT(readiness_count_ready(&rt) == 1, "ready before clear");
     readiness_clear(&rt, 2);
-    TEST_ASSERT(rt.ready_bitmap == 0, "ready cleared");
-    TEST_ASSERT(rt.connected_bitmap == 0, "connected cleared");
+    TEST_ASSERT(readiness_count_ready(&rt) == 0, "ready cleared");
+    TEST_ASSERT(readiness_count_connected(&rt) == 0, "connected cleared");
     TEST_ASSERT(rt.clients[2].is_connected == 0, "entry disconnected");
     TEST_ASSERT(rt.clients[2].is_ready == 0, "entry not ready");
     return 1;
@@ -111,9 +114,8 @@ int test_readiness_persist_roundtrip(void) {
     TEST_ASSERT(rt2.clients[0].ready_for == QUEUE_REQ_ROTATION, "client 0 ready_for");
     TEST_ASSERT(rt2.clients[2].is_connected == 1, "client 2 connected");
     TEST_ASSERT(rt2.clients[2].is_ready == 0, "client 2 not ready");
-    TEST_ASSERT(rt2.ready_bitmap == (1ULL <<0), "ready bitmap restored");
-    TEST_ASSERT(rt2.connected_bitmap == ((1ULL <<0) | (1ULL <<2)),
-                "connected bitmap restored");
+    TEST_ASSERT(readiness_count_ready(&rt2) == 1, "ready count restored");
+    TEST_ASSERT(readiness_count_connected(&rt2) == 2, "connected count restored");
     persist_close(&db);
     return 1;
 }
@@ -166,8 +168,61 @@ int test_readiness_reset(void) {
     }
     TEST_ASSERT(readiness_all_ready(&rt) == 1, "all ready before reset");
     readiness_reset(&rt);
-    TEST_ASSERT(rt.ready_bitmap == 0, "ready zeroed");
-    TEST_ASSERT(rt.connected_bitmap == 0, "connected zeroed");
+    TEST_ASSERT(readiness_count_ready(&rt) == 0, "ready zeroed");
+    TEST_ASSERT(readiness_count_connected(&rt) == 0, "connected zeroed");
     TEST_ASSERT(readiness_all_ready(&rt) == 0, "not ready after reset");
+    return 1;
+}
+
+/* Regression for the >64-client undefined behaviour: the tracker used two
+ * uint64_t bitmaps with 1ULL << client_idx while n_clients can reach
+ * FACTORY_MAX_SIGNERS (256).  On x86 the shift wrapped (idx mod 64), so at
+ * 127 clients marking only clients 0..63 ready aliased to "all bits set"
+ * and readiness_all_ready returned TRUE with 63 clients still missing —
+ * i.e. an async rotation could fire prematurely.  State is now derived
+ * from the per-entry booleans, which are correct at any supported N. */
+int test_readiness_beyond_64(void) {
+    readiness_tracker_t rt;
+    readiness_init(&rt, 9, 127, NULL);
+    TEST_ASSERT(rt.n_clients == 127, "127 clients tracked");
+
+    /* Exactly the aliasing trap: first 64 ready, 63 NOT ready. */
+    for (uint32_t i = 0; i < 64; i++) {
+        readiness_set_connected(&rt, i, 1);
+        readiness_set_ready(&rt, i, QUEUE_REQ_ROTATION);
+    }
+    TEST_ASSERT(readiness_count_ready(&rt) == 64, "64 ready");
+    TEST_ASSERT(readiness_all_ready(&rt) == 0,
+                "NOT all ready with 63 clients missing (old bitmap said yes)");
+
+    /* High-index state must be tracked individually, not aliased mod 64. */
+    readiness_set_connected(&rt, 100, 1);
+    readiness_set_ready(&rt, 100, QUEUE_REQ_ROTATION);
+    TEST_ASSERT(readiness_count_ready(&rt) == 65, "client 100 counted once");
+    TEST_ASSERT(rt.clients[100].is_ready == 1, "entry 100 ready");
+    TEST_ASSERT(rt.clients[36].is_ready == 1 && rt.clients[36].client_idx == 36,
+                "client 36 (100 mod 64) unaffected by client 100");
+    readiness_clear(&rt, 100);
+    TEST_ASSERT(readiness_count_ready(&rt) == 64, "clear(100) removes only 100");
+    TEST_ASSERT(rt.clients[36].is_ready == 1, "client 36 survives clear(100)");
+
+    /* Fill everyone, then poke the boundary and top indices. */
+    for (uint32_t i = 64; i < 127; i++) {
+        readiness_set_connected(&rt, i, 1);
+        readiness_set_ready(&rt, i, QUEUE_REQ_ROTATION);
+    }
+    TEST_ASSERT(readiness_count_ready(&rt) == 127, "all 127 ready");
+    TEST_ASSERT(readiness_all_ready(&rt) == 1, "all ready at 127");
+
+    readiness_set_connected(&rt, 126, 0);
+    TEST_ASSERT(readiness_all_ready(&rt) == 0, "top index disconnect noticed");
+    TEST_ASSERT(readiness_count_ready(&rt) == 126, "126 ready");
+    uint32_t missing[4];
+    size_t n = readiness_get_missing(&rt, missing, 4);
+    TEST_ASSERT(n == 1 && missing[0] == 126, "missing is exactly client 126");
+
+    readiness_set_connected(&rt, 126, 1);
+    readiness_set_ready(&rt, 126, QUEUE_REQ_ROTATION);
+    TEST_ASSERT(readiness_all_ready(&rt) == 1, "all ready again");
     return 1;
 }

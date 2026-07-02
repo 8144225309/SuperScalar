@@ -16,12 +16,17 @@ typedef struct {
     int      ready_for;      /* QUEUE_REQ_* type acknowledged */
 } readiness_entry_t;
 
+/* Readiness is tracked ONLY in the per-entry booleans below.  There is
+ * deliberately no summary bitmap: n_clients can reach FACTORY_MAX_SIGNERS
+ * (256), a uint64_t bitmap made every shift for client_idx >= 64 undefined
+ * behaviour (x86 shift-wrap aliased bit i to bit i%64, so at 127 clients
+ * readiness_all_ready could report true with 63 clients still not ready),
+ * and the entries are the source of truth anyway — every query derives
+ * from them directly. */
 typedef struct {
     readiness_entry_t clients[FACTORY_MAX_SIGNERS];
     size_t   n_clients;
     uint32_t factory_id;
-    uint64_t ready_bitmap;      /* bit i = connected AND ready */
-    uint64_t connected_bitmap;  /* bit i = connected */
     persist_t *db;              /* may be NULL */
 } readiness_tracker_t;
 
@@ -46,10 +51,10 @@ void readiness_touch(readiness_tracker_t *rt, uint32_t client_idx);
 /* True when all n_clients are connected AND ready. */
 int readiness_all_ready(const readiness_tracker_t *rt);
 
-/* Count of ready clients (popcount of ready_bitmap). */
+/* Count of ready clients. */
 size_t readiness_count_ready(const readiness_tracker_t *rt);
 
-/* Count of connected clients (popcount of connected_bitmap). */
+/* Count of connected clients. */
 size_t readiness_count_connected(const readiness_tracker_t *rt);
 
 /* Fill out[] with indices of clients that are NOT ready. Returns count. */

@@ -1981,6 +1981,7 @@ extern int test_readiness_persist_roundtrip(void);
 extern int test_readiness_urgency_levels(void);
 extern int test_readiness_get_missing(void);
 extern int test_readiness_reset(void);
+extern int test_readiness_beyond_64(void);
 
 /* Async Signing: Rotation Readiness (lsp_check_rotation_readiness) */
 extern int test_rotation_readiness_null(void);
@@ -3894,6 +3895,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_readiness_urgency_levels);
     RUN_TEST(test_readiness_get_missing);
     RUN_TEST(test_readiness_reset);
+    RUN_TEST(test_readiness_beyond_64);
 
     printf("\n=== Async Signing: Rotation Readiness ===\n");
     RUN_TEST(test_rotation_readiness_null);

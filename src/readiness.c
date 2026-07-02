@@ -2,13 +2,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* popcount for uint64_t */
-static size_t popcount64(uint64_t x) {
-    size_t count = 0;
-    while (x) { count += x & 1; x >>= 1; }
-    return count;
-}
-
 void readiness_init(readiness_tracker_t *rt, uint32_t factory_id,
                     size_t n_clients, persist_t *db) {
     if (!rt) return;
@@ -26,14 +19,11 @@ void readiness_set_connected(readiness_tracker_t *rt, uint32_t client_idx,
     if (!rt || client_idx >= rt->n_clients) return;
     rt->clients[client_idx].is_connected = connected;
     if (connected) {
-        rt->connected_bitmap |= (1ULL << client_idx);
         rt->clients[client_idx].last_seen = time(NULL);
     } else {
-        rt->connected_bitmap &= ~(1ULL << client_idx);
         /* Disconnecting also clears ready */
         rt->clients[client_idx].is_ready = 0;
         rt->clients[client_idx].ready_for = 0;
-        rt->ready_bitmap &= ~(1ULL << client_idx);
     }
 }
 
@@ -45,7 +35,6 @@ void readiness_set_ready(readiness_tracker_t *rt, uint32_t client_idx,
     rt->clients[client_idx].is_ready = 1;
     rt->clients[client_idx].ready_for = ready_for;
     rt->clients[client_idx].last_seen = time(NULL);
-    rt->ready_bitmap |= (1ULL << client_idx);
 }
 
 void readiness_clear(readiness_tracker_t *rt, uint32_t client_idx) {
@@ -53,8 +42,6 @@ void readiness_clear(readiness_tracker_t *rt, uint32_t client_idx) {
     rt->clients[client_idx].is_connected = 0;
     rt->clients[client_idx].is_ready = 0;
     rt->clients[client_idx].ready_for = 0;
-    rt->connected_bitmap &= ~(1ULL << client_idx);
-    rt->ready_bitmap &= ~(1ULL << client_idx);
 }
 
 void readiness_touch(readiness_tracker_t *rt, uint32_t client_idx) {
@@ -64,19 +51,29 @@ void readiness_touch(readiness_tracker_t *rt, uint32_t client_idx) {
 
 int readiness_all_ready(const readiness_tracker_t *rt) {
     if (!rt || rt->n_clients == 0) return 0;
-    uint64_t full_mask = (rt->n_clients >= 64) ?
-                         0xFFFFFFFFFFFFFFFFULL : ((1ULL << rt->n_clients) - 1);
-    return (rt->ready_bitmap & full_mask) == full_mask;
+    for (size_t i = 0; i < rt->n_clients; i++) {
+        if (!rt->clients[i].is_ready)
+            return 0;
+    }
+    return 1;
 }
 
 size_t readiness_count_ready(const readiness_tracker_t *rt) {
     if (!rt) return 0;
-    return popcount64(rt->ready_bitmap);
+    size_t count = 0;
+    for (size_t i = 0; i < rt->n_clients; i++)
+        if (rt->clients[i].is_ready)
+            count++;
+    return count;
 }
 
 size_t readiness_count_connected(const readiness_tracker_t *rt) {
     if (!rt) return 0;
-    return popcount64(rt->connected_bitmap);
+    size_t count = 0;
+    for (size_t i = 0; i < rt->n_clients; i++)
+        if (rt->clients[i].is_connected)
+            count++;
+    return count;
 }
 
 size_t readiness_get_missing(const readiness_tracker_t *rt,
@@ -84,7 +81,7 @@ size_t readiness_get_missing(const readiness_tracker_t *rt,
     if (!rt || !out || max == 0) return 0;
     size_t count = 0;
     for (uint32_t i = 0; i < rt->n_clients && count < max; i++) {
-        if (!(rt->ready_bitmap & (1ULL << i)))
+        if (!rt->clients[i].is_ready)
             out[count++] = i;
     }
     return count;
@@ -134,9 +131,6 @@ int readiness_load(readiness_tracker_t *rt) {
     if (sqlite3_prepare_v2(rt->db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return 0;
     sqlite3_bind_int(stmt, 1, (int)rt->factory_id);
-    /* Clear bitmaps before loading */
-    rt->ready_bitmap = 0;
-    rt->connected_bitmap = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         uint32_t idx = (uint32_t)sqlite3_column_int(stmt, 0);
         if (idx >= rt->n_clients) continue;
@@ -145,10 +139,6 @@ int readiness_load(readiness_tracker_t *rt) {
         e->is_ready = sqlite3_column_int(stmt, 2);
         e->last_seen = (time_t)sqlite3_column_int64(stmt, 3);
         e->ready_for = sqlite3_column_int(stmt, 4);
-        if (e->is_connected)
-            rt->connected_bitmap |= (1ULL << idx);
-        if (e->is_ready)
-            rt->ready_bitmap |= (1ULL << idx);
     }
     sqlite3_finalize(stmt);
     return 1;
@@ -162,6 +152,4 @@ void readiness_reset(readiness_tracker_t *rt) {
         rt->clients[i].ready_for = 0;
         rt->clients[i].last_seen = 0;
     }
-    rt->ready_bitmap = 0;
-    rt->connected_bitmap = 0;
 }
