@@ -189,6 +189,18 @@ if [ "$DONE_COUNT" -eq "$N_CLIENTS" ]; then
     green "  ok: all $N_CLIENTS clients completed rotation"
 else PASS=0; red "  FAIL: only $DONE_COUNT/$N_CLIENTS clients completed rotation"; fi
 
+# Post-rotation accounting (#76): Phase D re-inits each channel's balance from
+# the old factory.  funding_amount is the GROSS on-chain amount, so it must
+# carry local+remote PLUS the base commit fee; setting it to the usable total
+# made the conservation checker see a base_commit_fee deficit on every channel
+# and freeze all new HTLCs.  Give the daemon loop a few poll ticks to run the
+# checker post-rotation, then assert it stayed quiet.
+sleep 20
+if grep -qE "CONSERVATION VIOLATION|refusing new HTLCs" "$LSP_LOG"; then
+    PASS=0; red "  FAIL: conservation alert AFTER rotation (post-rotation accounting freeze)"
+    grep -aE "CONSERVATION VIOLATION|refusing new HTLCs" "$LSP_LOG" | head -2
+else green "  ok: no post-rotation conservation alert (new HTLCs not frozen)"; fi
+
 if [ "$PASS" -eq 1 ]; then
     green "PASS: N=$N_CLIENTS async rotation — queued on DYING, gated on $N_CLIENTS/$N_CLIENTS readiness, fired once, new factory created, all clients rotated."
     exit 0
