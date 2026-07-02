@@ -186,6 +186,7 @@ Press **Ctrl+C**. The LSP will:
 |------|---------|-------------|
 | `--keyfile` | none | Encrypted keyfile path (alternative to --seckey) |
 | `--passphrase` | none | Keyfile decryption passphrase |
+| `--encrypt-db` | off (forced on mainnet) | Encrypt secret columns (HD seed, revocation/channel secrets) at rest |
 | `--tor-proxy` | none | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 | `--tor-control` | none | Tor control port for hidden service creation |
 | `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |

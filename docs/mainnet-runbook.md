@@ -5,6 +5,8 @@ This document expands the pre-launch checklist (task #151) into the full
 operational manual: deployment topology, backups, HSM, TLS, monitoring,
 and incident response.
 
+> **Reference convention:** "PR #N" is a GitHub pull request; a bare `#N` or "task #N" is an internal tracking ID (not resolvable outside the project). GitHub does not auto-link these in the rendered file view.
+
 For day-one setup mechanics (build, network selection, flag reference),
 see [lsp-operator-guide.md](lsp-operator-guide.md). This document assumes
 the operator has a working signet deployment and now needs to harden it

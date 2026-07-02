@@ -257,7 +257,7 @@ Full implementation of Pseudo-Spilman k² sub-factories — k clients per sub-fa
 - Phase 4c: persist load on LSP restart (PR #131)
 - Phase 5: signet campaign infra (PR #133)
 - Gap A followup: poison TX builder + watchtower wiring (PR #134)
-- Multi-input MuSig ceremony for sub-factory chain advance (PR #270, #142 SF-A)
+- Multi-input MuSig ceremony for sub-factory chain advance (PR #270)
 - Multi-input tx_builder + sighash + witness primitives (PRs #146, #147, #148)
 - Multi-input wire helpers (PR #150)
 - Force-close persist chain[0] + broadcast PS chain history — **CRITICAL** (PR #144)
@@ -280,7 +280,7 @@ Multi-process LSPs now produce a fully-signed L-stock / sales-stock poison TX vi
 - k² sub-factory breach end-to-end on regtest (PR #142)
 - Sanitizer regtest job catches leaks in wire-ceremony paths (PR #140)
 - Tier B no-SECURITY-GAP rotation log assertion (PR #153)
-- Realloc WT-register fix — registers pre-realloc leaf as stale-watch target (PR #258 via #298). Surfaced by the CL2 cheat-realloc test scaffold; before this fix, a malicious LSP could broadcast the pre-realloc leaf state to claim higher L-stock allocation and the watchtower had no recourse.
+- Realloc WT-register fix — registers pre-realloc leaf as stale-watch target (PR #298). Surfaced by the CL2 cheat-realloc test scaffold; before this fix, a malicious LSP could broadcast the pre-realloc leaf state to claim higher L-stock allocation and the watchtower had no recourse.
 
 ### Tier B / multi-leaf state-advance ceremony (Gap B + F)
 
@@ -312,7 +312,7 @@ All six reorg-detection classes wired with forensic table coverage:
 - Schema v29 forensic tables: `reorg_events`, `breach_detections` (PR #189)
 - Sub-factory chain reset on reorg (PR #208)
 - WT restart audit signoff (PRs #135, #161, signed off in PR #287)
-- CPFP child-broadcast / anchor mismatch fix — byte-inspection now authoritative (PR #287, closes #184)
+- CPFP child-broadcast / anchor mismatch fix — byte-inspection now authoritative (PR #287)
 
 ### Schema migrations v22–v36
 
@@ -332,13 +332,13 @@ Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS
 ### PTLC infrastructure (turnover, watchtower, gating, production)
 
 - Watchtower PTLC breach-defense feed + sweep parse bug fix (PR #242)
-- PTLC turnover ceremony journaled to `signing_rounds` (#217 via PR #280)
-- PTLC presig handler gated against blind-sign seckey extraction (PR #256, #196)
-- Factory tree sign refusal when no chain backend (PR #257, #197)
+- PTLC turnover ceremony journaled to `signing_rounds` (PR #280)
+- PTLC presig handler gated against blind-sign seckey extraction (PR #256)
+- Factory tree sign refusal when no chain backend (PR #257)
 - PTLC production threading + balance + chain validation consolidated (PR #253, resyncs #248+#249+#250)
 - Gate `channel_add_ptlc` until PTLC breach defense lands (PR #193)
-- PTLC commit-tx direction swap fix in `commit_tx_for_remote` (PR #269, completes #206)
-- Watchtower: remove eager remote-PCP overwrite + sync test scaffold (PR #268, #206)
+- PTLC commit-tx direction swap fix in `commit_tx_for_remote` (PR #269)
+- Watchtower: remove eager remote-PCP overwrite + sync test scaffold (PR #268)
 
 ### Cheat-engine campaign (CL1–CL7)
 
@@ -358,7 +358,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 ### Ceremony crash-injection (mainnet gate §10 #9)
 
 - Ceremony API helpers + finalization guard / dual-sig-trap (PRs #199, #259)
-- Wired into `lsp_run_factory_creation` (PR #205 via #266) — INITIAL ceremony
+- Wired into `lsp_run_factory_creation` (PR #266) — INITIAL ceremony
 - Crash-recovery drill scaffold (PR #262)
 - Crash scaffold timing softened to persistence-contract assertion (PR #277)
 - Gap C: `SUPERSCALAR_CRASH_AT` env var + 4 checkpoints in `lsp_run_factory_creation` (PR #297)
@@ -406,7 +406,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 - testnet4 quickstart procedure
 - Slow CSV-wait broadcast retry from 15s to 60s on non-regtest (PR #303)
 - Reject `update_fee` that would strand HTLC sweep outputs (PR #299)
-- Suppress wallet-RPC error noise in chain-state poll loops (PR #200 via #267)
+- Suppress wallet-RPC error noise in chain-state poll loops (PR #267)
 - Watchtower `csv_delay` persist on entry (PR #217 via #217)
 - Honest force-close HTLC sweep wiring (PR #218 via #218)
 - Channel auto-discover funding keyagg ordering for PS-leaf channels (PR #228)
@@ -423,7 +423,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 
 ### BIP-158 lite client (issue #264)
 
-- End-to-end + adversarial regtest scripts (PR #272, #216)
+- End-to-end + adversarial regtest scripts (PR #272)
 - Genesis-hash locator seed on initial header sync (PR #279)
 
 ### Splice
@@ -465,7 +465,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 
 ### Fixed
 
-- **CPFP child broadcast vs penalty-without-anchor mismatch** (PR #287, #184): broadcast-time `fee_should_use_anchor()` re-derivation could drift from build-time decision; replaced with authoritative byte-inspection of pre-built penalty TX (`penalty_tx_has_p2a_anchor`). Defensive `is_in_mempool()` pre-flight on broadcast.
+- **CPFP child broadcast vs penalty-without-anchor mismatch** (PR #287): broadcast-time `fee_should_use_anchor()` re-derivation could drift from build-time decision; replaced with authoritative byte-inspection of pre-built penalty TX (`penalty_tx_has_p2a_anchor`). Defensive `is_in_mempool()` pre-flight on broadcast.
 - **`persist_load_factory` leaked tx_bufs** on validation failure + on reuse (PR #74 etc.)
 - **Tree broadcast double-spend rejection** verified by `test_regtest_funding_double_spend_rejected`
 - **PS chain-advance bookkeeping** at sweep time
@@ -474,11 +474,11 @@ Adversarial-test infrastructure for the watchtower defense paths:
 - **Test_persist init memset** preserves `mgr->persist` (PR #200, #196)
 - **Ceremony recv timeouts bumped + clearer error messages** (PR #197)
 - **`%%s` → `%s` in 8 strftime DEFAULTs** — schema escaping bug (PR #198)
-- **Channel commit signing diag** (PR #220 / #154)
-- **Watchtower remote-PCP eager overwrite removed** (PR #268, #206)
-- **`watchtower_pending` retry chain-state guard** (PR #247, #150)
-- **Cheat-daemon subfactory cleanup checkpoints WAL before cp** (PR #246, #178)
-- **Reorg watcher records breach_detections in subfactory + commitment branches** (PR #245, #175, #176)
+- **Channel commit signing diag** (PR #220)
+- **Watchtower remote-PCP eager overwrite removed** (PR #268)
+- **`watchtower_pending` retry chain-state guard** (PR #247)
+- **Cheat-daemon subfactory cleanup checkpoints WAL before cp** (PR #246)
+- **Reorg watcher records breach_detections in subfactory + commitment branches** (PR #245)
 - **CHANGELOG**: this Unreleased section catches up ~140+ PRs since v0.1.13
 
 ### Test infrastructure
