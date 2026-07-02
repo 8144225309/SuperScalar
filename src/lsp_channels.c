@@ -7211,8 +7211,16 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                             NOTIFY_ROTATION_NEEDED,
                                                             QUEUE_URGENCY_NORMAL, NULL);
                                             }
-                                            /* Fast path: fire immediately if all already here */
-                                            lsp_check_rotation_readiness(mgr, lsp);
+                                            /* Fast path: fire immediately if all already here.
+                                               Record success when it fires — otherwise the
+                                               retry machinery keeps ticking against the old
+                                               factory id: spurious FAILED attempts ("no
+                                               DYING/EXPIRED factory found") and, after
+                                               max_retries of them, the distribution-TX
+                                               fallback for a factory that already rotated. */
+                                            if (lsp_check_rotation_readiness(mgr, lsp))
+                                                lsp_rotation_record_success(mgr,
+                                                                            lf->factory_id);
                                         } else {
                                             /* Legacy synchronous path */
                                             int ok = lsp_channels_rotate_factory(mgr, lsp);
