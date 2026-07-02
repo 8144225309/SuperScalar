@@ -19,11 +19,13 @@
  * 8 × tx_output_t to 16 × tx_output_t; at 506 nodes (max PS factory at
  * N=128) that's ~50KB extra per factory_t — acceptable. */
 #define FACTORY_MAX_OUTPUTS 16
-/* FACTORY_MAX_SIGNERS = max participants in a MuSig2 group = 1 LSP + up to
- * N clients.  Was 128 (= LSP + 127 clients).  Bumped to 256 in #303 fix
- * because N=128 clients + LSP = 129 signers overflowed the previous cap by
- * exactly one pubkey slot — release build's stack canary caught the overrun
- * on the all_pubkeys array in lsp.c:275.  256 gives headroom up to N=255. */
+/* FACTORY_MAX_SIGNERS = size of the keyagg/pubkey ARRAYS, not the signing
+ * cap.  Bumped 128 to 256 by the #303 fix only so the all_pubkeys array in
+ * lsp.c cannot overrun when misconfigured with 129 signers (release build's
+ * stack canary caught that overrun).  The actual signing limit is
+ * MUSIG_SESSION_MAX_SIGNERS (128) = the LSP + up to 127 clients; more than
+ * 128 signers is NOT signable, so N=255 is NOT a supported configuration
+ * and the LSP CLI rejects --clients above 127. */
 #define FACTORY_MAX_SIGNERS 256
 #define FACTORY_MAX_LEAVES  128
 

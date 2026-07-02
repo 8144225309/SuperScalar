@@ -2450,8 +2450,15 @@ int main(int argc, char *argv[]) {
     uint32_t dying_blocks = (dying_blocks_arg > 0) ? (uint32_t)dying_blocks_arg
                             : (is_regtest ? 10 : 432);
 
-    if (n_clients < 1 || n_clients > LSP_MAX_CLIENTS) {
-        fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
+    /* The factory signing group is the LSP plus every client, and a MuSig
+       session holds at most MUSIG_SESSION_MAX_SIGNERS (128) signers, so the
+       supported maximum is 127 clients.  Reject the 129th signer here with a
+       clear message instead of failing deep inside the root signing ceremony
+       (set_pubnonce rejects slot 128 and finalize_nonces never completes). */
+    if (n_clients < 1 || n_clients + 1 > MUSIG_SESSION_MAX_SIGNERS) {
+        fprintf(stderr, "Error: --clients must be 1..%d "
+                "(the LSP co-signs every factory: clients + 1 <= %d-signer MuSig cap)\n",
+                MUSIG_SESSION_MAX_SIGNERS - 1, MUSIG_SESSION_MAX_SIGNERS);
         return 1;
     }
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
