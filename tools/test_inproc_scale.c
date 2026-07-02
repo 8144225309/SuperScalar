@@ -23,6 +23,7 @@
  */
 
 #include "superscalar/lsp.h"
+#include "superscalar/wire.h"
 #include "superscalar/lsp_channels.h"
 #include "superscalar/client.h"
 #include "superscalar/factory.h"
@@ -71,8 +72,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     int N = atoi(argv[1]);
-    if (N < 1 || N > 255) {
-        fprintf(stderr, "N_CLIENTS must be 1..255 (got %d)\n", N);
+    if (N < 1 || N > 127) {
+        fprintf(stderr, "N_CLIENTS must be 1..127 (LSP + N clients <= 128-signer MuSig cap; got %d)\n", N);
         return 2;
     }
     size_t n_signers = (size_t)N + 1; /* LSP + N clients */
@@ -134,6 +135,20 @@ int main(int argc, char **argv) {
         free(lsp); return 1;
     }
     factory_set_arity(&lsp->factory, FACTORY_ARITY_PS);
+
+    /* Bind+listen NOW, before forking: lsp_accept_clients creates the listen
+     * socket lazily (lsp.c), and child 0 (usleep 0) can win the race to
+     * connect on a loaded box -- ECONNREFUSED, ceremony hangs at N-1 clients
+     * (proven by strace).  Also raise the per-IP connection rate limit: all N
+     * clients connect from 127.0.0.1 and the production default (10/min, from
+     * the #325 real-network hardening, which postdates the June N=127 proof)
+     * rejects an all-localhost N>10 harness.  Production defaults untouched. */
+    lsp->listen_fd = wire_listen(NULL, port);
+    if (lsp->listen_fd < 0) {
+        fprintf(stderr, "[scale] pre-listen on port %d failed\n", port);
+        return 1;
+    }
+    rate_limiter_init(&lsp->rate_limiter, 1000000, 60, 1000000);
 
     /* Fork N client children (the listen socket already exists). */
     pid_t *child = calloc((size_t)N, sizeof(pid_t));
