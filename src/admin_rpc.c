@@ -13,6 +13,7 @@
  */
 
 #include "superscalar/admin_rpc.h"
+#include "superscalar/version.h"
 #include "superscalar/wallet_source.h"
 #include "superscalar/wallet_source_hd.h"
 #include "superscalar/lsp.h"
@@ -158,7 +159,7 @@ static cJSON *method_getinfo(admin_rpc_t *rpc)
     int n_chan = rpc->channel_mgr ? (int)rpc->channel_mgr->n_channels : 0;
     cJSON_AddNumberToObject(r, "num_channels", (double)n_chan);
 
-    cJSON_AddStringToObject(r, "version", "superscalar-0.1.0");
+    cJSON_AddStringToObject(r, "version", "superscalar-" SUPERSCALAR_VERSION);
     return r;
 }
 
