@@ -1167,11 +1167,18 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->confirm_timeout_secs = saved_confirm_timeout;
 
     /* Restore channel balances from old factory (carry across rotation).
-       Only apply if the old balance fits within the new channel capacity.
-       Also update funding_amount to match the carried total — HTLC fees
-       consumed during the previous factory reduce local+remote below the
-       original funding_amount, and the conservation invariant checks
-       local + remote + htlc_sum == funding_amount. */
+       Only apply if the old (usable) balance fits within the new channel
+       capacity.  funding_amount is the GROSS on-chain amount; the base
+       commitment fee is reserved from it, so the conservation invariant
+       (lsp_channels.c) checks local + remote + htlc_sum == funding_amount -
+       base_commit_fee.  The carried local/remote is a usable total, so the
+       gross funding_amount must add the base commit fee back — otherwise the
+       checker sees a deficit of exactly base_commit_fee on every channel and
+       the LSP refuses all new HTLCs after a rotation.  Use the same fee rate
+       the channels are about to be set to below (and that the checker reads
+       from ch->fee_rate_sat_per_kvb). */
+    uint64_t rot_fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
+    uint64_t rot_base_commit_fee = (rot_fee_rate * 154 + 999) / 1000;
     for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
         channel_t *ch = &mgr->entries[c].channel;
         uint64_t old_total = saved_ch_local[c] + saved_ch_remote[c];
@@ -1179,7 +1186,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         if (old_total > 0 && old_total <= new_usable) {
             ch->local_amount = saved_ch_local[c];
             ch->remote_amount = saved_ch_remote[c];
-            ch->funding_amount = old_total;
+            ch->funding_amount = old_total + rot_base_commit_fee;
         }
         /* else: new factory has different capacity, keep default split */
     }
@@ -1189,10 +1196,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
-    /* Set fee rate on all new channels */
-    uint64_t fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
+    /* Set fee rate on all new channels — the same rate used above to size
+       the restored channels' gross funding_amount, so the conservation
+       checker reads a consistent base_commit_fee. */
     for (size_t c = 0; c < mgr->n_channels; c++)
-        mgr->entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
+        mgr->entries[c].channel.fee_rate_sat_per_kvb = rot_fee_rate;
 
     if (!lsp_channels_send_ready(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: send_ready failed\n");
