@@ -163,12 +163,16 @@ stdbuf -oL "$BRIDGE_BIN" \
     --plugin-port "$BRIDGE_PLUGIN_PORT" --lsp-pubkey "$LSP_PUBKEY" \
     > "$TMPDIR/bridge.log" 2>&1 &
 BRIDGE_PID=$!
-for j in $(seq 1 30); do
-    grep -q "connected to LSP" "$TMPDIR/bridge.log" 2>/dev/null && break; sleep 1
+# A signet LSP with 127 clients + chain RPC polling handshakes slowly; the
+# original 30s window killed run 1 mid-handshake.
+for j in $(seq 1 120); do
+    grep -q "connected to LSP" "$TMPDIR/bridge.log" 2>/dev/null && break
+    kill -0 $BRIDGE_PID 2>/dev/null || die "bridge process exited"
+    sleep 1
 done
-grep -q "connected to LSP" "$TMPDIR/bridge.log" || die "bridge never connected to LSP"
+grep -q "connected to LSP" "$TMPDIR/bridge.log" || die "bridge never connected to LSP (120s)"
 $CLI1 -k plugin subcommand=start plugin="$PLUGIN_PY" superscalar-bridge-port="$BRIDGE_PLUGIN_PORT" > /dev/null 2>&1 || die "plugin start"
-for j in $(seq 1 45); do
+for j in $(seq 1 90); do
     grep -q "plugin connected" "$TMPDIR/bridge.log" 2>/dev/null && break; sleep 1
 done
 green "  ok: bridge up (LSP + plugin on persistent signet CLN)"
