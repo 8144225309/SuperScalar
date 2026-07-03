@@ -2195,8 +2195,15 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         int had_old = (an->is_signed && an->signed_tx.len > 0);
         int old_no = an->n_outputs;
         if (had_old) memcpy(poison_old_txid[k], an->txid, 32);
-        poison_old_l_amount[k] = (old_no >= 2)
-            ? an->outputs[old_no - 1].amount_sats : 0;
+        /* MEDIUM-2: use_tree_anchor appends a P2A anchor as the LAST output, so the
+           L-stock is the SECOND-to-last (mirror the leaf-advance fix ~line 1400).
+           Reading outputs[old_no-1] would grab the 240-sat anchor -> gate skips. */
+        int an_anchor = (old_no >= 2 &&
+            an->outputs[old_no - 1].script_pubkey_len == P2A_SPK_LEN &&
+            memcmp(an->outputs[old_no - 1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+        int an_l_vout = old_no - 1 - an_anchor;
+        poison_old_l_amount[k] = (an_l_vout >= 0 && (old_no - an_anchor) >= 2)
+            ? an->outputs[an_l_vout].amount_sats : 0;
         /* Phase 1b.5: chain output (vout=0) snapshot for wt_db. */
         wt_had_old[k] = had_old;
         wt_old_chain_amount[k] = (old_no >= 1) ? an->outputs[0].amount_sats : 0;
@@ -2207,11 +2214,11 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                    an->outputs[0].script_pubkey,
                    wt_old_chain_spk_len[k]);
         wt_old_csv_delay[k] = (uint32_t)(an->nsequence & 0xFFFFu);
-        if (mgr->watchtower && !an->is_ps_leaf && had_old && old_no >= 2 &&
+        if (mgr->watchtower && !an->is_ps_leaf && had_old && (old_no - an_anchor) >= 2 &&
             poison_old_l_amount[k] > TIERB_POISON_FEE_SATS +
                 (uint64_t)(an->n_signers - 1) * 330u) {
             if (factory_session_prepare_poison_tx_leaf(
-                    f, affected[k], poison_old_txid[k], (uint32_t)(old_no - 1),
+                    f, affected[k], poison_old_txid[k], (uint32_t)an_l_vout,
                     poison_old_l_amount[k], TIERB_POISON_FEE_SATS,
                     NULL /* #53-B3b: capture per-node H_old when daemon hashlock on */)) {
                 poison_prepared[k] = 1;  /* init_node_poison after state init */
@@ -2968,8 +2975,17 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     unsigned char realloc_old_leaf_txid[32];
     memcpy(realloc_old_leaf_txid, node->txid, 32);
     int realloc_old_n_outputs = node->n_outputs;
-    uint64_t realloc_old_l_amount = (realloc_old_n_outputs >= 2)
-        ? node->outputs[realloc_old_n_outputs - 1].amount_sats : 0;
+    /* MEDIUM-2: use_tree_anchor appends a P2A anchor as the LAST output, so the
+       L-stock is the SECOND-to-last (mirror the leaf-advance fix ~line 1400).
+       Reading outputs[n-1] would grab the 240-sat anchor -> poison gate skips. */
+    int realloc_anchor = (realloc_old_n_outputs >= 2 &&
+        node->outputs[realloc_old_n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(node->outputs[realloc_old_n_outputs - 1].script_pubkey,
+               P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+    int realloc_l_vout = realloc_old_n_outputs - 1 - realloc_anchor;
+    uint64_t realloc_old_l_amount = (realloc_l_vout >= 0 &&
+        (realloc_old_n_outputs - realloc_anchor) >= 2)
+        ? node->outputs[realloc_l_vout].amount_sats : 0;
     int realloc_had_signed = (node->is_signed && node->signed_tx.len > 0);
     /* SF-WT-TRUSTLESS Phase 1b.5b (#248): snapshot OLD chain output for
      * wt_db register at the bottom of this function.  Same pattern as
@@ -2989,12 +3005,13 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     const uint64_t REALLOC_POISON_FEE_SATS = 1000;
     int realloc_poison_prepared = 0;
-    if (mgr->watchtower && realloc_had_signed && realloc_old_n_outputs >= 2 &&
+    if (mgr->watchtower && realloc_had_signed &&
+        (realloc_old_n_outputs - realloc_anchor) >= 2 &&
         realloc_old_l_amount > REALLOC_POISON_FEE_SATS +
                                (uint64_t)(node->n_signers - 1) * 330u) {
         if (factory_session_prepare_poison_tx_leaf(
                 f, node_idx,
-                realloc_old_leaf_txid, (uint32_t)(realloc_old_n_outputs - 1),
+                realloc_old_leaf_txid, (uint32_t)realloc_l_vout,
                 realloc_old_l_amount, REALLOC_POISON_FEE_SATS,
                 /* #53-B3b: this path prepares BEFORE the advance, so the node's
                    current hash IS H_old — NULL is already correct here. */

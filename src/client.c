@@ -531,6 +531,12 @@ int client_fulfill_payment(int fd, channel_t *ch,
 
 /* --- Cooperative close ceremony (extracted for reuse) --- */
 
+/* MEDIUM-1: cap on LSP-driven re-PROPOSE recursion depth. The LSP is untrusted;
+   without a cap a malicious/looping LSP that streams CLOSE_PROPOSE could exhaust
+   the client's stack. On exceed, the client aborts the coop close and can still
+   exit via --force-close. */
+#define MAX_CLOSE_REPROPOSE 16
+
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
                                const secp256k1_pubkey *my_pubkey,
@@ -538,7 +544,8 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                size_t n_participants,
                                const wire_msg_t *initial_msg,
                                uint32_t current_height,
-                               const channel_t *ch) {
+                               const channel_t *ch,
+                               int repropose_depth) {
     wire_msg_t msg;
     int got_propose = 0;
 
@@ -856,10 +863,18 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         return 0;
     }
     if (done_msg.msg_type == MSG_CLOSE_PROPOSE) {
+        if (repropose_depth + 1 > MAX_CLOSE_REPROPOSE) {
+            fprintf(stderr, "Client: LSP exceeded %d cooperative-close re-proposes -- "
+                    "aborting coop close (use --force-close to exit)\n", MAX_CLOSE_REPROPOSE);
+            cJSON_Delete(done_msg.json);
+            tx_buf_free(&close_unsigned);
+            return 0;
+        }
         fprintf(stderr, "Client: LSP re-proposing cooperative close -- retrying with a fresh nonce\n");
         tx_buf_free(&close_unsigned);
         int _r = client_do_close_ceremony(fd, ctx, keypair, my_pubkey, factory,
-                                           n_participants, &done_msg, current_height, ch);
+                                           n_participants, &done_msg, current_height, ch,
+                                           repropose_depth + 1);
         cJSON_Delete(done_msg.json);
         return _r;
     }
@@ -2836,7 +2851,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
                                     factory, n_participants, NULL, 0,
-                                    NULL)) {
+                                    NULL, 0)) {
         goto fail;
     }
 

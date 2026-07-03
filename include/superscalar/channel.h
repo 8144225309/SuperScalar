@@ -287,9 +287,10 @@ int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
 /* Revocation-verification standard (shared by LSP and client): verify a revealed
    per-commitment secret matches the per-commitment point the peer committed to
    (secret*G == committed_PCP), using channel_get_remote_pcp (which consults the
-   durable DB record). Returns 1 if valid, 0 if demonstrably wrong. NOTE: in the
-   current phase this still returns 1 when no committed point can be found at all
-   (legacy accept-on-trust); that branch flips to fail-closed in a later phase. */
+   durable DB record). Returns 1 if valid, 0 if demonstrably wrong. FAIL-CLOSED:
+   if no committed point can be retrieved anywhere (durable DB included) this
+   returns 0 -- a revocation that cannot be checked is never trusted (storing it
+   would arm a broken penalty). */
 int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_num,
                                      const unsigned char *secret32);
 

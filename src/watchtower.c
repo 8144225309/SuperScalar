@@ -876,8 +876,12 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                         unsigned char pp33[33];
                         pp33[0] = 0x02;
                         memcpy(pp33 + 1, wp_p->payment_hash, 32);
-                        secp256k1_ec_pubkey_parse(ch->ctx,
-                            &ch->ptlcs[0].payment_point, pp33, 33);
+                        if (!secp256k1_ec_pubkey_parse(ch->ctx,
+                                &ch->ptlcs[0].payment_point, pp33, 33)) {
+                            fprintf(stderr, "watchtower: PTLC mirror skipped -- "
+                                "invalid payment_point for output %zu\n", p);
+                            continue;
+                        }
                     }
                     tx_buf_t psweep;
                     tx_buf_init(&psweep, 512);
