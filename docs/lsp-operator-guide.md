@@ -296,11 +296,11 @@ Without `--db`, crash recovery is not possible — you'll need to wait for CLTV 
 
 ## 8. Standalone Watchtower
 
-For defense-in-depth, run `superscalar_watchtower` on a separate machine. It opens the LSP database read-only and independently monitors the blockchain:
+For defense-in-depth, run `superscalar_watchtower` on a separate machine. It opens a secret-less `wt.db` of pre-signed response transactions (penalty / sweep / poison TXs, **no secrets and no signing keys**) and independently monitors the blockchain:
 
 ```bash
 ./superscalar_watchtower \
-  --db /path/to/lsp.db \
+  --wt-db /path/to/wt.db \
   --network signet \
   --poll-interval 30 \
   --cli-path /path/to/bitcoin-cli \
@@ -308,13 +308,13 @@ For defense-in-depth, run `superscalar_watchtower` on a separate machine. It ope
   --rpcpassword YOUR_PASS
 ```
 
-The watchtower prints heartbeat messages and broadcasts penalty transactions automatically if a breach is detected. It has no write access to the database, so it cannot interfere with the LSP.
+The watchtower prints heartbeat messages and broadcasts the relevant pre-signed response automatically if a breach is detected. Because it holds no secrets and no keys, a compromised watchtower cannot construct any new transaction — verifiable with `nm` (see [`watchtower-trustless-schema.md`](watchtower-trustless-schema.md)). To fund CPFP fee-bumping of the anyone-can-spend P2A anchors under fee pressure, pass `--bump-wallet` (a wallet the bumper spends its own UTXOs from; the watchtower still signs nothing of the protocol).
 
 ### Watchtower flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db PATH` | **required** | Path to LSP SQLite database (opened read-only) |
+| `--wt-db PATH` | **required** | Path to the watchtower response DB (pre-signed penalty/sweep/poison TXs; contains **no secrets**) |
 | `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
 | `--poll-interval N` | 30 | Seconds between block scans |
 | `--cli-path PATH` | bitcoin-cli | Path to bitcoin-cli binary |
@@ -322,6 +322,7 @@ The watchtower prints heartbeat messages and broadcasts penalty transactions aut
 | `--rpcpassword PASS` | rpcpass | Bitcoin RPC password |
 | `--datadir PATH` | (default) | Bitcoin datadir |
 | `--rpcport PORT` | (auto) | Bitcoin RPC port override |
+| `--bump-wallet NAME` | — | Funded wallet the CPFP fee-bumper draws UTXOs from (to CPFP the P2A anchor; the WT holds no protocol keys) |
 | `--max-bump-fee SATS` | — | Cap on cumulative RBF fee bumps for the penalty broadcast |
 | `--bump-budget-pct N` | — | Percentage of channel value to budget for fee bumps |
 | `--inspect-db` | off | Diagnostic: dump factory state, breach detections, and chain-state assertions; exits without polling. Useful for forensics on a captured DB. |
