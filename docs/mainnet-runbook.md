@@ -206,6 +206,14 @@ least once per quarter:
 Document the time-to-recovery from each drill. The number is the SLO
 the operator can credibly offer clients.
 
+An automated, repeatable version of this drill is
+`tools/test_regtest_restore_drill.sh` (regtest): it performs the hot
+`sqlite3 .backup`, wipes the live DB, restores from the backup, asserts the
+restored DB is identical (same factory funding outpoint), and confirms the LSP
+resumes the factory from the restored DB (the `--daemon` recovery probe loads it,
+logging "found existing factory in DB, entering recovery mode"). Run it
+pre-release / in CI so the restore path cannot silently regress.
+
 ---
 
 ## 4. HSM integration
@@ -553,7 +561,11 @@ gate for flipping the kill switch from `mainnet refused` to
 
 ### Operational prereqs
 
-- [ ] At least one full restore drill completed in the last quarter
+- [x] At least one full restore drill completed in the last quarter
+      (automated + proven: tools/test_regtest_restore_drill.sh -- hot sqlite3
+      .backup -> wipe -> restore -> LSP resumes the factory from the restored DB;
+      regtest PASS. Soak validated via tools/test_regtest_soak_advances.sh: 50
+      advances persisted + WT defends from the oldest stale state.)
 - [ ] At least one full reorg drill (forced via regtest invalidate)
       completed in the last quarter
 - [ ] At least one full force-close drill (client-initiated breach
