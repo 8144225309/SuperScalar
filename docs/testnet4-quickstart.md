@@ -63,7 +63,7 @@ export SS_CLN_B_DIR=/path/to/cln-b
 Testnet4 blocks arrive every ~10 minutes. Use these to minimize BIP68 wait times:
 
 ```
---step-blocks 5         # 5 blocks per DW layer (vs 30 default = 50 min vs 5 hours)
+--step-blocks 5         # 5 blocks per DW layer (vs 10 default = ~50 min vs ~100 min per layer)
 --states-per-layer 2    # Fewer states = fewer layers = fewer waits
 --active-blocks 50      # Factory lifetime ~8 hours
 --dying-blocks 20       # Migration window ~3 hours

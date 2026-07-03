@@ -23,7 +23,7 @@ to the broadcast threshold (without burning multi-hour wall-clock):
 
 - `signet_setup.sh` parses cleanly with all canonical env-var combinations
   (`N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1`, `N_CLIENTS=64 ARITY=2,4,8 STATIC_NEAR_ROOT=1`,
-  `N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2`, `PS_SUBFACTORY_ARITY=2 N_CLIENTS=4 ARITY=3`)
+  `N_CLIENTS=127 ARITY=2,4,8 STATIC_NEAR_ROOT=2`, `PS_SUBFACTORY_ARITY=2 N_CLIENTS=4 ARITY=3`)
 - `superscalar_lsp` binary recognizes `--arity 3,4` and `--static-near-root 1`
   on `--network signet`
 - Signet bitcoind reachable at `/var/lib/bitcoind-signet`; `superscalar_lsp`
@@ -56,7 +56,7 @@ check enforces at LSP startup.
 | `N_CLIENTS=8 ARITY=3 STATIC_NEAR_ROOT=0`   | 3 | 4 | 1296 | 9 | small-N PS baseline (existing audit campaign) |
 | `N_CLIENTS=8 ARITY=3,4 STATIC_NEAR_ROOT=1` | 1 | 1 | 432  | 3 | mid-size mixed-arity (smallest live signet test) |
 | `N_CLIENTS=64 ARITY=2,4,8 STATIC_NEAR_ROOT=1` | 2 | 2 | 864  | 6 | scale-shape canonical (depth halved vs uniform) |
-| `N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2` | 3 | 2 | 864 | 6 | maximum-scale canonical (the design target) |
+| `N_CLIENTS=127 ARITY=2,4,8 STATIC_NEAR_ROOT=2` | 3 | 2 | 864 | 6 | maximum-scale canonical (the design target) |
 | `N_CLIENTS=4 ARITY=3 PS_SUBFACTORY_ARITY=2` | 1 | 1 | 432 | 3 | k² PS sub-factory canonical (Phase 4 durability target) |
 
 > **Note:** `N_CLIENTS=64 ARITY=3` (uniform PS at scale) computes to mainnet
@@ -134,7 +134,7 @@ ssh root@68.168.216.243 "cd /root/SuperScalar && N_CLIENTS=64 ARITY=2,4,8 STATIC
 #### 3d. N=128 mixed-arity (maximum-scale canonical, the design target)
 
 ```
-ssh root@68.168.216.243 "cd /root/SuperScalar && N_CLIENTS=128 ARITY=2,4,8 STATIC_NEAR_ROOT=2 bash tools/signet_setup.sh demo-force-close 2>&1 | tee /tmp/signet_n128_canonical_fc.log"
+ssh root@68.168.216.243 "cd /root/SuperScalar && N_CLIENTS=127 ARITY=2,4,8 STATIC_NEAR_ROOT=2 bash tools/signet_setup.sh demo-force-close 2>&1 | tee /tmp/signet_n128_canonical_fc.log"
 ```
 
 #### 3e. k² PS sub-factory canonical (Phase 4 durability target)

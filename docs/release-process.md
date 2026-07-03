@@ -129,7 +129,7 @@ gh release download vX.Y.Z --repo 8144225309/SuperScalar -D /tmp/artifacts
 
 # Generate SHA256SUMS in a deterministic order
 cd /tmp/artifacts
-sha256sum *.tar.gz *.zip > SHA256SUMS
+sha256sum *.tar.gz > SHA256SUMS
 
 # Sign with GPG
 gpg --detach-sign --armor SHA256SUMS  # produces SHA256SUMS.asc
@@ -156,10 +156,10 @@ platform automatically on Release publish. For v0.2.0 the supported set is:
 | Linux x86_64 | `build-linux` job |
 | Linux ARM64 | `build-linux-arm64` job (QEMU) |
 | macOS x86_64 / arm64 | `build-macos` job |
-| Windows x86_64 | `build-windows` job (added for v0.2.0) |
 
-Each job produces a tarball/zip named
-`superscalar-vX.Y.Z-<platform>.{tar.gz,zip}` containing the four release
+Windows binaries are **not** built (POSIX-only paths + signal handling; see
+README "Known limitations"). Each job produces a tarball named
+`superscalar-vX.Y.Z-<platform>.tar.gz` containing the four release
 binaries (`superscalar_lsp`, `superscalar_client`, `superscalar_bridge`,
 `superscalar_watchtower`) plus `README.md`, `LICENSE`, `CHANGELOG.md`, and
 `SECURITY.md`.

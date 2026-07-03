@@ -5,6 +5,8 @@ This document expands the pre-launch checklist (task #151) into the full
 operational manual: deployment topology, backups, HSM, TLS, monitoring,
 and incident response.
 
+> **Reference convention:** "PR #N" is a GitHub pull request; a bare `#N` or "task #N" is an internal tracking ID (not resolvable outside the project). GitHub does not auto-link these in the rendered file view.
+
 For day-one setup mechanics (build, network selection, flag reference),
 see [lsp-operator-guide.md](lsp-operator-guide.md). This document assumes
 the operator has a working signet deployment and now needs to harden it
@@ -26,7 +28,7 @@ pre-mainnet ops checklist drafted under task #151.
 
 ### Code / audit prerequisites
 
-- [ ] Schema migrations through v34 (ceremony_participants) applied
+- [ ] Schema migrations through v39 (at-rest secret encryption) applied
       and tested on a populated DB (per #185)
 - [ ] Factory funding canonical-chain guard active (#125-#129); no
       open issues against `lsp_channels_revalidate_funding`
@@ -127,7 +129,7 @@ rotation cadence.
 | 4 | 1 | ~50 MB |
 | 16 | 1 | ~200 MB |
 | 64 | 1-2 | ~1 GB |
-| 256 | 4+ | TODO: depends on factory scale work (`feat/factory-scale-128`) |
+| 127 (design max) | 4+ | ~2 GB (127 client daemons) |
 
 Growth drivers: `signing_rounds` (one row per signer per ceremony),
 `old_commitments` (one row per commitment per channel), and the
@@ -488,7 +490,7 @@ are starting points, not guarantees.
 | N=4, k=1 | < 100 MB | 1 core, ~5s | ~50 MB DB |
 | N=16, k=1 | < 250 MB | 1 core, ~20s | ~200 MB DB |
 | N=64, k=4 | < 1 GB | 2-4 cores, ~90s | ~1 GB DB |
-| N=128, k=8 | TODO (`feat/factory-scale-128`) | TODO | TODO |
+| N=127, k=8 | multi-GB (127 client daemons; fit a 15 GB host in testing) | 4+ cores | ~2 GB DB |
 | N=256+ | not supported | n/a | n/a |
 
 k = number of PS subfactories (see [superscalar.win](https://superscalar.win) for the design).
@@ -507,7 +509,7 @@ The `slow_signer` flag on `signing_rounds` (v26) identifies the
 laggard for forensic follow-up.
 
 At N=64 with healthy clients, expect signing rounds to complete in
-under 30 seconds end-to-end. At N=128 with one or more slow signers,
+under 30 seconds end-to-end. At N=127 with one or more slow signers,
 expect rounds to walk up to the 120s timeout.
 
 ### Disk projection
@@ -527,7 +529,7 @@ gate for flipping the kill switch from `mainnet refused` to
 
 ### Audit prereqs (#152 SF-AUDIT)
 
-- [ ] All schema migrations v1..v34 covered by upgrade tests on a
+- [ ] All schema migrations v1..v39 covered by upgrade tests on a
       populated DB
 - [x] Watchtower restart audit (#135, #161) signed off (per PR #287 commit body)
 - [ ] Reorg correctness audit (#125-#129) signed off

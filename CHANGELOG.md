@@ -2,6 +2,72 @@
 
 All notable changes to SuperScalar are documented here.
 
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
+
+## v0.2.0 — 2026-07-02
+
+Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
+
+### Trustless completion — five-layer recourse model (P1–P6)
+
+- **P1 — adversarial agg-sig drill:** a client refuses to co-sign a forged or corrupted L-stock poison aggregate signature instead of blindly co-signing it.
+- **P2 — Layer-3 fee-race:** both the watchtower CPFP bumper and the client-side CPFP poison spend win the fee-race under mempool pressure.
+- **P3 — P2A CPFP anchors** on commitment, leaf, and internal tree nodes (`use_cpfp_anchor` / `use_tree_anchor`); proven on regtest **and real signet**.
+- **P4 — secret-less watchtower recourse** (PR #396): a standalone `wt.db`-only watchtower stores sub-factory poison + PTLC HTLC penalty sweeps and remediates post-confirmation; kind=3 force-close + JIT covered.
+- **P5 — harness rigor:** breach tests now assert real txid → confirmation → amount / net-delta (not merely "machinery fired"); Tier 2/3/4 remediated; reorg-refire validated.
+- **P6 — liveness** (PR #407): bounded fresh-nonce retry across signing ceremonies so a transient nonce clash no longer aborts a ceremony.
+- **Shared revocation-secret verifier**, enforced fail-closed at the choke point, wired into the live client daemon path.
+- **Cheat-gating** (PR #402): every defense-bypass cheat is gated behind a regtest-only network flag and refused on mainnet.
+
+### Hashlock-gated L-stock poison — closes the co-signed-poison theft class (schema v38)
+
+- **Leaf** (PRs #387, #395): hashlock-gated L-stock poison crypto core, daemon `--enable-hashlock-poison`, client recourse tool `superscalar_lstock_recover`, fail-closed advance when the poison is not co-signed, and refusal to accept a key-path (rather than script-path) poison for hashlock leaves.
+- **Sub-factory** (PR #390): N-party poison aggregate distributed via `SUBFACTORY_DONE`, verified on both sides; proven on regtest + real signet.
+- **Crash / restart-resume:** persist the hashlock intent and re-derive the deterministic per-factory poison seed on LSP restart (`MSG_LSTOCK_REVEAL_REQUEST` 0x8D).
+- Anchor-aware L-stock vout on both LSP and client given the P2A tree anchor.
+
+### At-rest secret encryption + mainnet `--seckey` refusal (schema v37–v39)
+
+- **App-level field encryption of LSP secrets at rest** + refuse cmdline `--seckey` on mainnet (schema v37) — closes the plaintext-seed steal-all-funds hole (LND/Core model, no new dependency).
+- **Remaining at-rest secret columns** (revocation / channel secrets) sealed (PR #405, schema v39).
+- `lsp.db` (+WAL/SHM) tightened to `0600` on open; live signet/testnet4 RPC credentials removed from tracked files.
+
+### CLN-bridge interop
+
+- Secure-by-default bridge transport + CLN-bridge security signoff (PR #403).
+- Both payment directions proven on regtest and real signet (env-driven signet interop harness).
+- **Real-LN interop at the 127-client design max** (PR #417): an unmodified, non-bLIP-56 CLN node pays into and out of a factory through the bridge — inbound to shallow and deep-index clients, outbound back out, on-chain funding + cooperative close, net economics reconciled to the sat.
+
+### Distribution-TX MuSig co-signing (trustless cooperative-close recovery)
+
+- Distributed co-signing of the distribution TX (PR #399) + co-signing it inside the stateless factory-creation ceremony (PR #401).
+- All-offline distribution-TX recovery end-to-end — recovery works even if every client stays offline forever (PR #404).
+
+### Scale correctness at the 127-client design max
+
+- Client daemon handles `MSG_FUNDING_REORG` / `MSG_CEREMONY_ABORT` (previously dropped in the daemon dispatch → reconnect livelock) (PR #412).
+- LSP rejects `--clients` above **127** upfront (the 128-signer MuSig session cap) with a clear message instead of a deep signing failure; `FACTORY_MAX_SIGNERS = 256` documented as keyagg-array headroom, **not** a client cap (PR #414).
+- Readiness tracker derives state from per-entry booleans — removes a >64-client `uint64` bitmap undefined-shift (PR #415).
+- `--async-rotation` now gates on readiness (fixes a retry-path gate bypass + a dead DYING fast path); post-rotation channels carry **gross** `funding_amount` so the conservation checker no longer freezes new HTLCs after a rotation; a 127-client rotation drill was added (PR #416).
+- admin `getinfo` reports the built `SUPERSCALAR_VERSION` (was hardcoded `superscalar-0.1.0`) (PR #418).
+- Full lifecycle re-proven at N=127 on the release build — creation, client↔client payments (including the all-pairs shape), gated rotation, cooperative close, sat-exact per-client reconciliation; with test-harness fixes for the in-process scale listen-before-fork race and the sparse/dense reconciliation heuristic (PRs #413, #419, #420).
+
+### Client self-defense (adversarial verification)
+
+- Selectable LSP-forgery escalation policy `--on-lsp-forgery continue|halt|close`; scripted `--send`/`--recv` flows verify LSP revocation; forged-`0x50` refusal drill.
+- Loud alerts: reconnect commitment-claim mismatch, a received HTLC with no matching issued invoice, and a watchtower false-positive guard (penalty only on a genuine on-chain breach).
+- Notify clients on ceremony abort / proactive exit (PR #397).
+
+### Signet key hygiene
+
+- Strong per-run keys across the breach trio + payment E2E (PR #406): never weak/deterministic keys on public signet (`tools/signet_strong_keygen.py`).
+
+### Schema migrations v37–v39
+
+- **v37:** at-rest secret encryption marker / HD-seed seal
+- **v38:** `l_stock_poison_reveals` (client L-stock poison reveals)
+- **v39:** remaining at-rest secret columns sealed (PR #405)
+
 ## v0.2.0-rc1 — 2026-05-31
 
 See `docs/release-notes/release-notes-0.2.0.md` for the operator-facing summary of all v0.2.0 changes.  This section is the per-feature/per-PR detail log.
@@ -13,12 +79,12 @@ Headline themes (one of many):
 - Sub-factory multi-input ceremonies (k≥2 first-class)
 - Factory scale validated to N=64 on signet + testnet4
 - R1–R6 reorg correctness with forensic tables
-- Crash-injection framework + 20/20 crash-drill matrix (incl. production factory-rotation crash drills, #332)
+- Crash-injection framework + 20/20 crash-drill matrix (incl. production factory-rotation crash drills, commit 503c5e0)
 - Cheat-engine campaign (7 new adversarial drivers)
 - Trustless watchtower (one of many security improvements)
 - Native Prometheus exporter, pre-rotation auto-snapshot, mainnet runbook, BIP-157/158 lite client
 
-### MuSig2 Phase 3: legacy nonce-pool path deleted (#273)
+### MuSig2 Phase 3: legacy nonce-pool path deleted
 
 The legacy nonce-pool MuSig2 ceremony bodies have been **deleted permanently** in a 2-commit change set:
 
@@ -31,9 +97,9 @@ The `SS_MUSIG_LEGACY=1` opt-out env var introduced in Phase 2 is now a no-op (ke
 
 The `nonce-safety` unit test in `tests/test_musig.c` (`test_musig_stateless_no_secnonce_persisted`) was updated: previously it asserted the `nonce_pools` table existed and had zero rows; now it asserts the table **no longer exists** -- the strongest possible enforcement of the stateless invariant (no schema for any future refactor to accidentally write secnonces into).
 
-### MuSig2 Phase 2: stateless is now the default (#272)
+### MuSig2 Phase 2: stateless is now the default
 
-The BIP-327 stateless MuSig2 signer (introduced in #271 / #330 / #333 / #334 / #336 and validated through the full ceremony + breach + observability stack in #337-#341) is now the **default behavior**. The legacy nonce-pool path is opt-in via `SS_MUSIG_LEGACY=1`. The opt-in `SS_MUSIG_STATELESS=1` env var is now a no-op (the legacy path no longer reads it; test scripts that still set it continue to work but the variable has no effect).
+The BIP-327 stateless MuSig2 signer (introduced in PR #330 / #333 / #334 / #336 and validated through the full ceremony + breach + observability stack in #337-#341) is now the **default behavior**. The legacy nonce-pool path is opt-in via `SS_MUSIG_LEGACY=1`. The opt-in `SS_MUSIG_STATELESS=1` env var is now a no-op (the legacy path no longer reads it; test scripts that still set it continue to work but the variable has no effect).
 
 Migration:
 - **No action needed** if you want the new stateless behavior — it is the default.
@@ -191,7 +257,7 @@ Full implementation of Pseudo-Spilman k² sub-factories — k clients per sub-fa
 - Phase 4c: persist load on LSP restart (PR #131)
 - Phase 5: signet campaign infra (PR #133)
 - Gap A followup: poison TX builder + watchtower wiring (PR #134)
-- Multi-input MuSig ceremony for sub-factory chain advance (PR #270, #142 SF-A)
+- Multi-input MuSig ceremony for sub-factory chain advance (PR #270)
 - Multi-input tx_builder + sighash + witness primitives (PRs #146, #147, #148)
 - Multi-input wire helpers (PR #150)
 - Force-close persist chain[0] + broadcast PS chain history — **CRITICAL** (PR #144)
@@ -214,7 +280,7 @@ Multi-process LSPs now produce a fully-signed L-stock / sales-stock poison TX vi
 - k² sub-factory breach end-to-end on regtest (PR #142)
 - Sanitizer regtest job catches leaks in wire-ceremony paths (PR #140)
 - Tier B no-SECURITY-GAP rotation log assertion (PR #153)
-- Realloc WT-register fix — registers pre-realloc leaf as stale-watch target (PR #258 via #298). Surfaced by the CL2 cheat-realloc test scaffold; before this fix, a malicious LSP could broadcast the pre-realloc leaf state to claim higher L-stock allocation and the watchtower had no recourse.
+- Realloc WT-register fix — registers pre-realloc leaf as stale-watch target (PR #298). Surfaced by the CL2 cheat-realloc test scaffold; before this fix, a malicious LSP could broadcast the pre-realloc leaf state to claim higher L-stock allocation and the watchtower had no recourse.
 
 ### Tier B / multi-leaf state-advance ceremony (Gap B + F)
 
@@ -246,7 +312,7 @@ All six reorg-detection classes wired with forensic table coverage:
 - Schema v29 forensic tables: `reorg_events`, `breach_detections` (PR #189)
 - Sub-factory chain reset on reorg (PR #208)
 - WT restart audit signoff (PRs #135, #161, signed off in PR #287)
-- CPFP child-broadcast / anchor mismatch fix — byte-inspection now authoritative (PR #287, closes #184)
+- CPFP child-broadcast / anchor mismatch fix — byte-inspection now authoritative (PR #287)
 
 ### Schema migrations v22–v36
 
@@ -266,13 +332,13 @@ Each migration is additive (ALTER TABLE ADD COLUMN or CREATE TABLE IF NOT EXISTS
 ### PTLC infrastructure (turnover, watchtower, gating, production)
 
 - Watchtower PTLC breach-defense feed + sweep parse bug fix (PR #242)
-- PTLC turnover ceremony journaled to `signing_rounds` (#217 via PR #280)
-- PTLC presig handler gated against blind-sign seckey extraction (PR #256, #196)
-- Factory tree sign refusal when no chain backend (PR #257, #197)
+- PTLC turnover ceremony journaled to `signing_rounds` (PR #280)
+- PTLC presig handler gated against blind-sign seckey extraction (PR #256)
+- Factory tree sign refusal when no chain backend (PR #257)
 - PTLC production threading + balance + chain validation consolidated (PR #253, resyncs #248+#249+#250)
 - Gate `channel_add_ptlc` until PTLC breach defense lands (PR #193)
-- PTLC commit-tx direction swap fix in `commit_tx_for_remote` (PR #269, completes #206)
-- Watchtower: remove eager remote-PCP overwrite + sync test scaffold (PR #268, #206)
+- PTLC commit-tx direction swap fix in `commit_tx_for_remote` (PR #269)
+- Watchtower: remove eager remote-PCP overwrite + sync test scaffold (PR #268)
 
 ### Cheat-engine campaign (CL1–CL7)
 
@@ -292,7 +358,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 ### Ceremony crash-injection (mainnet gate §10 #9)
 
 - Ceremony API helpers + finalization guard / dual-sig-trap (PRs #199, #259)
-- Wired into `lsp_run_factory_creation` (PR #205 via #266) — INITIAL ceremony
+- Wired into `lsp_run_factory_creation` (PR #266) — INITIAL ceremony
 - Crash-recovery drill scaffold (PR #262)
 - Crash scaffold timing softened to persistence-contract assertion (PR #277)
 - Gap C: `SUPERSCALAR_CRASH_AT` env var + 4 checkpoints in `lsp_run_factory_creation` (PR #297)
@@ -340,7 +406,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 - testnet4 quickstart procedure
 - Slow CSV-wait broadcast retry from 15s to 60s on non-regtest (PR #303)
 - Reject `update_fee` that would strand HTLC sweep outputs (PR #299)
-- Suppress wallet-RPC error noise in chain-state poll loops (PR #200 via #267)
+- Suppress wallet-RPC error noise in chain-state poll loops (PR #267)
 - Watchtower `csv_delay` persist on entry (PR #217 via #217)
 - Honest force-close HTLC sweep wiring (PR #218 via #218)
 - Channel auto-discover funding keyagg ordering for PS-leaf channels (PR #228)
@@ -357,7 +423,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 
 ### BIP-158 lite client (issue #264)
 
-- End-to-end + adversarial regtest scripts (PR #272, #216)
+- End-to-end + adversarial regtest scripts (PR #272)
 - Genesis-hash locator seed on initial header sync (PR #279)
 
 ### Splice
@@ -399,7 +465,7 @@ Adversarial-test infrastructure for the watchtower defense paths:
 
 ### Fixed
 
-- **CPFP child broadcast vs penalty-without-anchor mismatch** (PR #287, #184): broadcast-time `fee_should_use_anchor()` re-derivation could drift from build-time decision; replaced with authoritative byte-inspection of pre-built penalty TX (`penalty_tx_has_p2a_anchor`). Defensive `is_in_mempool()` pre-flight on broadcast.
+- **CPFP child broadcast vs penalty-without-anchor mismatch** (PR #287): broadcast-time `fee_should_use_anchor()` re-derivation could drift from build-time decision; replaced with authoritative byte-inspection of pre-built penalty TX (`penalty_tx_has_p2a_anchor`). Defensive `is_in_mempool()` pre-flight on broadcast.
 - **`persist_load_factory` leaked tx_bufs** on validation failure + on reuse (PR #74 etc.)
 - **Tree broadcast double-spend rejection** verified by `test_regtest_funding_double_spend_rejected`
 - **PS chain-advance bookkeeping** at sweep time
@@ -408,11 +474,11 @@ Adversarial-test infrastructure for the watchtower defense paths:
 - **Test_persist init memset** preserves `mgr->persist` (PR #200, #196)
 - **Ceremony recv timeouts bumped + clearer error messages** (PR #197)
 - **`%%s` → `%s` in 8 strftime DEFAULTs** — schema escaping bug (PR #198)
-- **Channel commit signing diag** (PR #220 / #154)
-- **Watchtower remote-PCP eager overwrite removed** (PR #268, #206)
-- **`watchtower_pending` retry chain-state guard** (PR #247, #150)
-- **Cheat-daemon subfactory cleanup checkpoints WAL before cp** (PR #246, #178)
-- **Reorg watcher records breach_detections in subfactory + commitment branches** (PR #245, #175, #176)
+- **Channel commit signing diag** (PR #220)
+- **Watchtower remote-PCP eager overwrite removed** (PR #268)
+- **`watchtower_pending` retry chain-state guard** (PR #247)
+- **Cheat-daemon subfactory cleanup checkpoints WAL before cp** (PR #246)
+- **Reorg watcher records breach_detections in subfactory + commitment branches** (PR #245)
 - **CHANGELOG**: this Unreleased section catches up ~140+ PRs since v0.1.13
 
 ### Test infrastructure
