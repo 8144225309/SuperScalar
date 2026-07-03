@@ -277,6 +277,11 @@ void musig_session_init(
     memset(session, 0, sizeof(*session));
     memcpy(&session->cache, &keyagg->cache, sizeof(secp256k1_musig_keyagg_cache));
     memcpy(&session->agg_pubkey, &keyagg->agg_pubkey, sizeof(secp256k1_xonly_pubkey));
+    /* Defense-in-depth: pubnonces[]/partial_sigs[] are [MUSIG_SESSION_MAX_SIGNERS].
+       Clamp so a caller that passes more than the max can never drive an OOB read
+       in the finalize loop (design max is 128 = LSP + 127 clients). */
+    if (n_signers > MUSIG_SESSION_MAX_SIGNERS)
+        n_signers = MUSIG_SESSION_MAX_SIGNERS;
     session->n_signers = n_signers;
 }
 

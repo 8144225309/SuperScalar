@@ -589,11 +589,11 @@ int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
    channel_get_remote_pcp, which now consults the durable DB record, so a
    legitimate revocation can always be checked.
 
-   PHASE 1 (this commit) preserves the historical behavior of accepting when no
-   committed point can be found anywhere (returns 1) so this is a pure,
-   behavior-neutral relocation + durability upgrade. PHASE 2 flips that branch to
-   fail-closed (return 0) once the choke-point + tests prove no legitimate
-   revocation lands without a retrievable point. */
+   FAIL-CLOSED: if no committed point can be found anywhere (durable DB included),
+   this returns 0 -- a revocation that cannot be checked against a committed point
+   is never trusted (storing it would arm a broken penalty). Durable-PCP
+   persistence guarantees a legitimate revocation always has a retrievable point,
+   so a miss means a protocol desync or an attack. */
 int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_num,
                                      const unsigned char *secret32) {
     if (!ch || !secret32) return 0;

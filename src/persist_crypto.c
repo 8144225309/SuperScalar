@@ -411,6 +411,14 @@ int persist_apply_encryption(persist_t *p) {
         free(tok);
     }
     if (own_txn) { if (ok) ok = persist_commit(p); else persist_rollback(p); }
+    /* #327b LOW-4: on FIRST encryption (no prior verify token) the in-place seal
+       UPDATEs leave the previous plaintext secret pages in SQLite's freelist,
+       carvable from the raw file. VACUUM (outside any txn, after commit) reclaims
+       them. Fires once per DB at first-seal; already-tokened steady-state opens
+       skip it. Fresh encrypted DBs never wrote plaintext, so this is a cheap
+       no-op for them. Best-effort: a VACUUM failure does not fail the open. */
+    if (ok && own_txn && !have_token)
+        sqlite3_exec(p->db, "VACUUM;", NULL, NULL, NULL);
     if (ok) fprintf(stderr, "persist: at-rest field encryption active (%zu secret columns %s).\n",
                     N_SECRET_COLS, have_token ? "verified" : "sealed");
     return ok;
