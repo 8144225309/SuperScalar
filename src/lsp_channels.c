@@ -5981,11 +5981,30 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* 9. Send MSG_RECONNECT_ACK */
     {
+        uint64_t ack_cn = ch->commitment_number;
+        /* #94 adversarial: SS_CHEAT_RECONNECT_CN_OFFSET forges the commitment
+           number in RECONNECT_ACK -- a malicious LSP trying to induce a
+           recovering client to adopt a stale/forged state (cf. #256 SCB
+           stale-state injection).  The client MUST refuse and keep its own
+           persisted state (client_reconnect.c: "trust our DB, never the peer's
+           word").  Gated on superscalar_cheat_allowed() so it is inert on any
+           non-regtest network even if the env var is set. */
+        const char *rc_cheat = getenv("SS_CHEAT_RECONNECT_CN_OFFSET");
+        if (superscalar_cheat_allowed() && rc_cheat && rc_cheat[0]) {
+            long long off = atoll(rc_cheat);
+            ack_cn = (uint64_t)((long long)ch->commitment_number + off);
+            fprintf(stderr,
+                "LSP #94-CHEAT: forging RECONNECT_ACK cn=%llu (true=%llu, "
+                "offset=%lld) for channel %u -- client must refuse\n",
+                (unsigned long long)ack_cn,
+                (unsigned long long)ch->commitment_number, off,
+                mgr->entries[c].channel_id);
+        }
         cJSON *ack = wire_build_reconnect_ack(
             mgr->entries[c].channel_id,
             ch->local_amount * 1000,   /* sats → msat */
             ch->remote_amount * 1000,
-            ch->commitment_number);
+            ack_cn);
         if (!wire_send(new_fd, MSG_RECONNECT_ACK, ack)) {
             fprintf(stderr, "LSP reconnect: send RECONNECT_ACK failed\n");
             cJSON_Delete(ack);
