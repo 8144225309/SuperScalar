@@ -4016,6 +4016,29 @@
                        "the V2 secondary penalty)\n", bc_conf);
             }
 
+            /* #93: standalone-WT PTLC sweep. When SS_CHEAT_DAEMON_MODE is set, skip
+               the internal watchtower_check below -- the breach commit is on-chain and
+               the PTLC penalty was mirrored to wt_db at registration
+               (watchtower_watch_revoked_commitment above). Exit so a SECRET-LESS
+               standalone WT (--wt-db only) must detect the breach + hydrate + broadcast
+               the PTLC penalty itself, proving the standalone PTLC-sweep path. */
+            if (getenv("SS_CHEAT_DAEMON_MODE")) {
+                printf("[9-standalone] SS_CHEAT_DAEMON_MODE: skipping internal "
+                       "watchtower_check; a --wt-db standalone WT must sweep the PTLC "
+                       "penalty from wt_db (breach %s on-chain).\n", bc_breach_txid);
+                printf("\n=== PTLC BREACH CHAIN STANDALONE-ARM COMPLETE ===\n");
+                free(bc_old_htlcs); free(bc_old_ptlcs);
+                report_add_string(&rpt, "result",
+                                  "ptlc_breach_chain_standalone_armed");
+                report_close(&rpt);
+                jit_channels_cleanup(mgr);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 0;
+            }
+
             /* Step 9: Run watchtower_check */
             /* Print current chain height before check for diagnosis. */
             {
