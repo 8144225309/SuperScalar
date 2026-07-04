@@ -89,35 +89,53 @@ for i in $(seq 1 110); do
     [ $((i % 15)) -eq 0 ] && echo "  ... ${i}*2s ($(grep -c heartbeat "$WT_LOG" 2>/dev/null||echo 0) heartbeats)"
 done
 
-# Rigorous: the standalone WT sweeps BOTH the main penalty and the PTLC penalty; we
-# want to confirm a PTLC penalty specifically.  Prefer a wt.db ptlc_penalty row, else
-# fall back to any confirmed WT broadcast that spends the breach commit's PTLC output.
-PTLC_TXID=$(sqlite3 "$WT_DB" "SELECT txid FROM broadcast_log WHERE source='ptlc_penalty' AND result='ok' AND length(txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
-[ -n "$PTLC_TXID" ] && SWEEP_TXID="$PTLC_TXID"
+# Rigorous PROOF the standalone WT swept the PTLC specifically: the wt.db model is
+# generic (no 'ptlc_penalty' label -- every watch is parent_vout -> a pre-signed
+# response), so we prove it ON-CHAIN by the spent outpoint. Identify the breach
+# commitment's PTLC output (the SMALLEST witness_v1_taproot output; to_local/to_remote
+# are far larger, the anchor is a separate 'anchor' type), then find a CONFIRMED
+# WT-broadcast tx that spends breach:PTLC_VOUT.
+PTLC_VOUT=$($BCLI getrawtransaction "$BREACH_TXID" true 2>/dev/null | python3 -c '
+import json,sys
+try:
+ d=json.load(sys.stdin)
+ tr=sorted([(v["n"], int(round(v["value"]*1e8))) for v in d["vout"] if v["scriptPubKey"].get("type")=="witness_v1_taproot"], key=lambda x:x[1])
+ print(tr[0][0] if tr else -1)
+except Exception: print(-1)')
+echo "  breach PTLC output = vout ${PTLC_VOUT} of $BREACH_TXID"
+PTLC_SWEEP=""; SWEEP_SATS=0
+if [ "${PTLC_VOUT:--1}" -ge 0 ]; then
+  for txid in $(grep -aoE "[0-9a-f]{64}" "$WT_LOG" 2>/dev/null | sort -u); do
+    HIT=$($BCLI getrawtransaction "$txid" true 2>/dev/null | python3 -c "import json,sys
+try:
+ d=json.load(sys.stdin)
+ print(1 if any(vin.get('txid')=='$BREACH_TXID' and vin.get('vout')==$PTLC_VOUT for vin in d.get('vin',[])) else 0)
+except Exception: print(0)")
+    if [ "$HIT" = "1" ]; then PTLC_SWEEP="$txid"; break; fi
+  done
+fi
 SWEEP_CONF=0
-if [ -n "$SWEEP_TXID" ]; then
-    for k in $(seq 1 20); do
-        C=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null | grep -oE "\"confirmations\": [0-9]+" | grep -oE "[0-9]+" | head -1)
-        [ -n "$C" ] && [ "$C" -ge 1 ] && { SWEEP_CONF=1; echo "  sweep $SWEEP_TXID confirmed on-chain ($C confs)"; break; }
-        mine 1; sleep 2
-    done
+if [ -n "$PTLC_SWEEP" ]; then
+  for k in $(seq 1 20); do
+    C=$($BCLI getrawtransaction "$PTLC_SWEEP" true 2>/dev/null | grep -oE "\"confirmations\": [0-9]+" | grep -oE "[0-9]+" | head -1)
+    if [ -n "$C" ] && [ "$C" -ge 1 ]; then
+      SWEEP_CONF=1
+      SV=$($BCLI getrawtransaction "$PTLC_SWEEP" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+      SWEEP_SATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
+      echo "  PTLC sweep $PTLC_SWEEP confirmed on-chain ($C confs, ${SWEEP_SATS} sats)"; break
+    fi
+    mine 1; sleep 2
+  done
 fi
 
-echo; echo "=== WT log tail ==="; tail -30 "$WT_LOG"
-echo; echo "=== wt.db broadcast_log ==="; sqlite3 "$WT_DB" "SELECT id,source,result,substr(txid,1,20) FROM broadcast_log ORDER BY id;" 2>/dev/null || true
+echo; echo "=== WT log tail ==="; tail -25 "$WT_LOG"
 echo; echo "=== Final result ==="
-echo "  armed=$ARMED watches=$WATCHES wt_fired=$WT_FIRED ptlc_penalty_row=${PTLC_TXID:+yes} txid=${SWEEP_TXID:-none} confirmed=$SWEEP_CONF"
-SWEEP_SATS=0
-if [ "$SWEEP_CONF" -eq 1 ]; then
-    SV=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
-    SWEEP_SATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
-    echo "  sweep largest output: ${SWEEP_SATS:-0} sats"
-fi
-# A confirmed WT broadcast + a ptlc_penalty row in wt.db proves the standalone PTLC sweep.
-if [ "$ARMED" -eq 1 ] && [ "${WATCHES:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 330 ] && [ -n "$PTLC_TXID" ]; then
-    green "PASS: secret-less standalone WT (--wt-db only) swept a PTLC from wt.db on a"
-    green "      revoked-commitment breach -- PTLC penalty $SWEEP_TXID broadcast + CONFIRMED"
-    green "      on-chain ($SWEEP_SATS sats), LSP OFFLINE. Standalone PTLC-sweep PROVEN trustless."
+echo "  armed=$ARMED watches=$WATCHES wt_fired=$WT_FIRED ptlc_vout=$PTLC_VOUT ptlc_sweep=${PTLC_SWEEP:-none} confirmed=$SWEEP_CONF sats=$SWEEP_SATS"
+# PROVEN when a CONFIRMED WT tx spends the breach's PTLC output, LSP offline.
+if [ "$ARMED" -eq 1 ] && [ "${WATCHES:-0}" -ge 1 ] && [ -n "$PTLC_SWEEP" ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 330 ]; then
+    green "PASS: secret-less standalone WT (--wt-db only, LSP OFFLINE) swept the breach"
+    green "      commitment's PTLC output (vout $PTLC_VOUT) -- penalty $PTLC_SWEEP CONFIRMED"
+    green "      on-chain ($SWEEP_SATS sats) with NO secret. Standalone PTLC-sweep PROVEN trustless."
     exit 0
 fi
-red "FAIL: need armed + watch>=1 + WT broadcast + a CONFIRMED ptlc_penalty row (>=330 sats)"; exit 1
+red "FAIL: need armed + watch>=1 + a CONFIRMED WT tx spending the breach PTLC output (>=330 sats)"; exit 1
