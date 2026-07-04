@@ -115,10 +115,30 @@ if [ "$SWEEP_CONF" -eq 1 ]; then
     SWEEP_SATS=$(awk "BEGIN{printf \"%d\", ($SV+0)*100000000}")
     echo "  sweep largest output: ${SWEEP_SATS:-0} sats"
 fi
+# Tier-4 reorg-robustness (opt-in: SS_REORG_REFIRE=1, #95): orphan the sweep's block and
+# verify the standalone WT re-broadcasts + the kind=3 HTLC-timeout sweep RE-confirms. The WT
+# is still alive here (WT_PID, --poll-interval 5). Proves the force-close sweep survives a reorg.
+REORG_OK=1
+if [ "${SS_REORG_REFIRE:-0}" = 1 ] && [ "$SWEEP_CONF" -eq 1 ]; then
+    echo "=== REORG-REFIRE: orphan the kind=3 sweep block, verify re-confirm ==="
+    [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null||true; MINER_PID=""   # stop auto-miner so the invalidate sticks
+    SBLK=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
+    if [ -n "$SBLK" ]; then
+        echo "  invalidating sweep block $SBLK (orphans sweep $SWEEP_TXID)"; $BCLI invalidateblock "$SBLK" 2>/dev/null; sleep 6
+        UC=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+        if [ -z "$UC" ] || [ "$UC" -eq 0 ]; then
+            echo "  sweep orphaned (confs ${UC:-0}); mining new chain to verify re-confirm"
+            REORG_OK=0
+            for i in $(seq 1 24); do mine 1; sleep 2; c=$($BCLI getrawtransaction "$SWEEP_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { REORG_OK=1; green "  REORG-REFIRE PASS: kind=3 sweep re-confirmed after orphaning its block ($c conf)"; break; }; done
+            [ "$REORG_OK" -eq 1 ] || red "  REORG-REFIRE FAIL: kind=3 sweep did NOT re-confirm after reorg — force-close sweep LOST on reorg"
+        else echo "  (reorg ineffective: sweep still at $UC confs — vacuous, skipping)"; fi
+    else echo "  (could not find sweep block — skipping reorg check)"; fi
+    ( for k in $(seq 1 40); do mine 1; sleep 3; done ) & MINER_PID=$!
+fi
 # Floor is the dust threshold (>=330), not an arbitrary 1000: an HTLC-timeout sweep recovers
 # the (small) in-flight HTLC value minus fee — legitimately sub-1000 (observed 819 sats). The
 # check must catch a zero/dust sweep, not false-fail a real small recovery.
-if [ "$ARMED" -eq 1 ] && [ "${K3:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 330 ]; then
+if [ "$ARMED" -eq 1 ] && [ "${K3:-0}" -ge 1 ] && [ "$WT_FIRED" -eq 1 ] && [ "$SWEEP_CONF" -eq 1 ] && [ "${SWEEP_SATS:-0}" -ge 330 ] && [ "${REORG_OK:-1}" -eq 1 ]; then
     green "PASS: secret-less standalone WT (--wt-db only) swept the LSP's HTLC-timeout from wt.db (kind=3)"
     green "      alone — pre-signed sweep $SWEEP_TXID broadcast + CONFIRMED on-chain ($SWEEP_SATS sats),"
     green "      spending the force-close commit. Force-close HTLC-sweep delegation PROVEN trustless (last matrix cell)."
