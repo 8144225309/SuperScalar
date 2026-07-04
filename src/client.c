@@ -2902,19 +2902,27 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
     unsigned char pre_old_leaf_txid_r[32];
     memcpy(pre_old_leaf_txid_r, pre_leaf_r->txid, 32);
     int pre_old_n_outputs_r = pre_leaf_r->n_outputs;
-    uint64_t pre_old_l_amount_r = (pre_old_n_outputs_r >= 2)
-                                  ? pre_leaf_r->outputs[pre_old_n_outputs_r - 1].amount_sats
+    /* #81 mirror: use_tree_anchor makes the L-stock the SECOND-to-last output (the
+       240-sat P2A anchor is last). Read the real L-stock, not the anchor. */
+    int pre_anchor_r = (pre_old_n_outputs_r >= 2 &&
+        pre_leaf_r->outputs[pre_old_n_outputs_r - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(pre_leaf_r->outputs[pre_old_n_outputs_r - 1].script_pubkey,
+               P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+    int pre_l_vout_r = pre_old_n_outputs_r - 1 - pre_anchor_r;
+    uint64_t pre_old_l_amount_r = (pre_l_vout_r >= 0 &&
+                                   (pre_old_n_outputs_r - pre_anchor_r) >= 2)
+                                  ? pre_leaf_r->outputs[pre_l_vout_r].amount_sats
                                   : 0;
     int pre_had_signed_r = (pre_leaf_r->is_signed && pre_leaf_r->signed_tx.len > 0);
 
     const uint64_t REALLOC_POISON_FEE_SATS = 1000;
     int realloc_poison_prepared = 0;
-    if (wire_poison_offered && pre_had_signed_r && pre_old_n_outputs_r >= 2 &&
+    if (wire_poison_offered && pre_had_signed_r && (pre_old_n_outputs_r - pre_anchor_r) >= 2 &&
         pre_old_l_amount_r > REALLOC_POISON_FEE_SATS +
                              (uint64_t)(pre_leaf_r->n_signers - 1) * 330u) {
         if (factory_session_prepare_poison_tx_leaf(
                 factory, pre_node_idx_r,
-                pre_old_leaf_txid_r, (uint32_t)(pre_old_n_outputs_r - 1),
+                pre_old_leaf_txid_r, (uint32_t)pre_l_vout_r,
                 pre_old_l_amount_r, REALLOC_POISON_FEE_SATS,
                 NULL /* #53-B3b: client mirrors LSP; daemon hashlock off -> key-path */)) {
             realloc_poison_prepared = 1;
