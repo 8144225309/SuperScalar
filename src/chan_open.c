@@ -459,15 +459,16 @@ int chan_reestablish(peer_mgr_t *mgr, int peer_idx,
     /* my_current_per_commitment_point: OUR local PCP for current commitment (BOLT #2 §3).
      * This must be our own key — NOT the remote's. Used by peer for DLP detection.
      *
-     * CL?-CHEAT-SCB (#256 SF-CHEAT-BACKUP-RESTORE): when SS_CHEAT_SCB_RESTORE
-     * is set, send the PCP for a *revoked* older commitment_number instead of
-     * the current one.  Adversarial scenario: client lost state and is doing
-     * SCB-driven channel_reestablish.  An honest LSP must send its CURRENT
-     * PCP so the recovering client can rebuild the correct commitment.  A
-     * malicious LSP sends a stale PCP -- inducing the client to broadcast a
-     * revoked state -- and then races to publish penalty.  The defense is
-     * watchtower-side: register the revoked PCPs at revocation receive time
-     * (#208 A3.1b) and watch for any of them on-chain.
+     * CL?-CHEAT-SCB (#256): when SS_CHEAT_SCB_RESTORE is set, send the PCP for
+     * a *revoked* older commitment_number instead of the current one.  NB: this
+     * is the BOLT type-136 channel_reestablish path (peer_mgr reconnect /
+     * ln_dispatch:322).  SuperScalar CLIENTS reconnect over JSON MSG_RECONNECT,
+     * whose stale-state defense is the RECONNECT_ACK untrusted-claim path
+     * (client_reconnect.c:412, proven e2e by #94).  Adversarial scenario: a peer
+     * doing DLP channel_reestablish is fed a stale PCP -- inducing a revoked-state
+     * broadcast the LSP then races to penalize.  The defense is watchtower-side:
+     * register the revoked PCPs at revocation receive time (#208 A3.1b) and
+     * watch for any of them on-chain.
      *
      * Offset (default 1 = N-1, "oldest revoked") is read from
      * SS_CHEAT_SCB_OFFSET.  Falls back to honest behavior when no older

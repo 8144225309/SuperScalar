@@ -1488,8 +1488,6 @@ extern int test_watchtower_fee_bump_confirmed(void);
 extern int test_scb_dlp_with_watchtower(void);
 extern int test_scb_normal_reestablish(void);
 extern int test_scb_dlp_no_watchtower_no_crash(void);
-extern int test_scb_recovery_null_channel(void);
-extern int test_scb_recovery_no_dlp(void);
 extern int test_scb_cheat_backup_restore_offset_logic(void);  /* #256 */
 
 /* PR #57: BOLT #9 feature bit negotiation */
@@ -3367,8 +3365,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_scb_dlp_with_watchtower);
     RUN_TEST(test_scb_normal_reestablish);
     RUN_TEST(test_scb_dlp_no_watchtower_no_crash);
-    RUN_TEST(test_scb_recovery_null_channel);
-    RUN_TEST(test_scb_recovery_no_dlp);
     RUN_TEST(test_scb_cheat_backup_restore_offset_logic);  /* #256 */
     RUN_TEST(test_pending_persistence);
 

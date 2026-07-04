@@ -28,8 +28,12 @@
 #   (c) leaves a hook for the full ceremony once the SCB recovery
 #       wire flow lands on the client side.
 #
-# Until the SCB restore wire flow exists end-to-end on the client, the
-# unit-test coverage in tests/test_scb_recovery.c is authoritative.
+# NOTE (#92 finding, 2026-07): the client does NOT drive scb_recovery_channel /
+# type-136 channel_reestablish -- that path is LSP peer_mgr/ln_dispatch only, and
+# scb_recovery_channel was unreachable dead code (now deleted). The REAL client-side
+# SCB-restore/stale-state defense is the JSON MSG_RECONNECT untrusted-claim path
+# (client_reconnect.c:412), proven e2e by tools/test_regtest_reconnect_cheat.sh (#94).
+# This script remains a smoke check of the --cheat-backup-restore arg (type-136 DLP).
 
 set -euo pipefail
 
@@ -156,8 +160,9 @@ fi
 #   - test_scb_cheat_backup_restore_offset_logic  (NEW, #256)
 # ----------------------------------------------------------------------
 echo
-echo "--- Step 2: integration TODO (SCB restore wire flow not yet driven by CLI) ---"
-echo "  See tests/test_scb_recovery.c for unit coverage (#256: test_scb_cheat_backup_restore_offset_logic)."
+echo "--- Step 2: the REAL client-side defense is proven elsewhere ---"
+echo "  Client SCB-restore/stale-state defense: tools/test_regtest_reconnect_cheat.sh (#94)."
+echo "  type-136 DLP arithmetic unit: tests/test_scb_recovery.c (#256 offset logic)."
 
 echo
 echo "=== Result: PASS (arg-parse smoke) ==="

@@ -229,7 +229,6 @@ add_library(superscalar
     src/sweeper.c
     src/scb.c
     src/onion_message.c
-    src/scb_recovery.c
     src/cli_arity.c
 )
 target_include_directories(superscalar PUBLIC include)
