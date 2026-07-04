@@ -1135,7 +1135,10 @@
             /* Verify amounts updated (read from leaf node outputs) */
             if (realloc_pass) {
                 uint64_t post_total = 0;
-                for (size_t k = 0; k < leaf_node->n_outputs; k++)
+                /* #98: match orig_total's k<3 (the reallocatable channel+L-stock
+                   outputs) -- exclude the trailing P2A tree anchor (fixed 240 sats,
+                   present before + after the realloc, not part of the redistribution). */
+                for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++)
                     post_total += leaf_node->outputs[k].amount_sats;
                 if (post_total != orig_total) {
                     printf("  FAIL: total funding changed "

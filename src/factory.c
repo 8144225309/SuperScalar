@@ -2348,11 +2348,21 @@ int factory_set_leaf_amounts(factory_t *f, int leaf_side,
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
 
-    if (n_amounts != node->n_outputs) return 0;
+    /* #98: use_tree_anchor appends a fixed 240-sat P2A anchor as the LAST leaf
+       output; it is NOT part of the reallocatable channel/L-stock amounts. Callers
+       pass amounts for the non-anchor outputs only, so exclude the anchor from the
+       count + conservation and leave it untouched. */
+    int has_anchor = (node->n_outputs >= 1 &&
+        node->outputs[node->n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(node->outputs[node->n_outputs - 1].script_pubkey,
+               P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+    size_t n_realloc = node->n_outputs - (size_t)has_anchor;
 
-    /* Compute current output total */
+    if (n_amounts != n_realloc) return 0;
+
+    /* Compute current reallocatable (non-anchor) total */
     uint64_t current_total = 0;
-    for (size_t i = 0; i < node->n_outputs; i++)
+    for (size_t i = 0; i < n_realloc; i++)
         current_total += node->outputs[i].amount_sats;
 
     /* Validate new amounts sum = current total (conservation of funds) */
@@ -2363,7 +2373,7 @@ int factory_set_leaf_amounts(factory_t *f, int leaf_side,
     }
     if (new_total != current_total) return 0;
 
-    /* Update amounts */
+    /* Update amounts (anchor output, if present, is left untouched) */
     for (size_t i = 0; i < n_amounts; i++)
         node->outputs[i].amount_sats = amounts[i];
 
