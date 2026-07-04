@@ -229,6 +229,11 @@ except Exception: print("0 0 0")')
     echo "  defense confirmed on-chain; $PNUM P2TR output(s), smallest ${PMIN:-0} sats, total ${PTOT:-0} sats"
     [ "${PNUM:-0}" -ge 1 ] || { echo "  FAIL: defense has no P2TR redistribution output"; exit 1; }
     [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
+    # #91 anchor-vout regression guard (proves #81/#98): the poison MUST redistribute
+    # the REAL L-stock (thousands of sats), never the 240-sat P2A tree anchor. A
+    # regression in the anchor-vout handling would collapse the total toward ~240.
+    [ "${PTOT:-0}" -gt 5000 ] || { echo "  FAIL (#81/#98 anchor-vout regression): poison total ${PTOT} sats collapsed toward the 240-sat P2A anchor — read the anchor, not the L-stock"; exit 1; }
+    echo "  #91 anchor guard OK: poison total ${PTOT} sats >> 240 (P2A anchor) — targeted the real L-stock"
     A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
     case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
     echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + CONFIRMED redistribution $PEN_TXID ($PNUM outs, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
