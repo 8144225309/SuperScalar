@@ -10,7 +10,6 @@
  */
 
 #include "superscalar/ln_dispatch.h"
-#include "superscalar/scb_recovery.h"
 #include "superscalar/chan_open.h"
 #include "superscalar/channel.h"
 #include "superscalar/watchtower.h"
@@ -129,25 +128,17 @@ int test_scb_dlp_no_watchtower_no_crash(void)
 /* ================================================================== */
 /* SCB4 — scb_recovery_channel with ch=NULL → returns -1             */
 /* ================================================================== */
-int test_scb_recovery_null_channel(void)
-{
-    int r = scb_recovery_channel(NULL, NULL, NULL, NULL, 0);
-    ASSERT(r == -1, "SCB4: NULL ch returns -1");
-    return 1;
-}
+/* SCB4/SCB5 (scb_recovery_channel guard tests) removed: scb_recovery_channel
+   was unreachable dead code (0 production callers) and has been deleted. The
+   live client-side SCB-restore/stale-state defense is the JSON MSG_RECONNECT
+   untrusted-claim path (client_reconnect.c), proven e2e by
+   tools/test_regtest_reconnect_cheat.sh (#94). SCB1-3 below still exercise the
+   live type-136 ln_dispatch handler used by the LSP peer_mgr reconnect. */
 
 /* ================================================================== */
 /* SCB5 — scb_recovery_channel normal path → returns 0 or -1        */
 /* ================================================================== */
-int test_scb_recovery_no_dlp(void)
-{
-    /* With NULL pmgr, should return -1 (guard) */
-    channel_t ch;
-    memset(&ch, 0, sizeof(ch));
-    int r = scb_recovery_channel(NULL, NULL, &ch, NULL, 0);
-    ASSERT(r == -1, "SCB5: NULL pmgr returns -1");
-    return 1;
-}
+/* (SCB5 removed with SCB4 above.) */
 
 /* ================================================================== */
 /* SCB6 — #256 SF-CHEAT-BACKUP-RESTORE arg-parse + offset logic      */
