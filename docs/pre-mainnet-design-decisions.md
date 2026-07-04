@@ -209,6 +209,53 @@ pre-rotation snapshot's completeness.
 
 ---
 
+## Q6 — Rollover offline-tolerance (#54)
+
+**Question.** Our Tier-B (sub-factory) rollover/advance requires every
+participating signer online (strict all-N); the canonical design tolerates a few
+offline clients. Is strict-all-N a pre-mainnet safety gap?
+
+**Current state.** The system already degrades gracefully, and the residual
+strictness is inherent to MuSig — not a policy we chose:
+- **Factory rotation already degrades.** `src/lsp_rotation.c` detects offline
+  clients (`offline_detected`), skips them, and downgrades to a **partial
+  rotation** (`lsp_rotation.c:549` "only N/M online -> downgrading to partial
+  rotation"; the cooperative path requires only `n_online >= 2`). Offline clients
+  are never force-included.
+- **An N-of-N sub-factory advance needs its N signers by cryptography.** A MuSig2
+  aggregate signature over a sub-factory's N participants cannot be produced
+  without all N nonces + partial signatures. "Strict all-N" for a *specific*
+  N-of-N ceremony is not a design choice — it is what an N-of-N signature *is*.
+  The only meaningful degrade is advancing a **smaller** sub-factory, which is
+  exactly the partial-rotation path above.
+- **An offline client's funds are never at risk from an advance it did not
+  sign.** The LSP cannot move a client's balance without that client's signature
+  (it is one of the N-of-N). An offline client's last co-signed state stands, and
+  it holds a co-signed **distribution TX** (G1, `distribution_tx`) as offline
+  recourse — proven in the trustless-WT + mass-exit work (#44, #313/#380). The
+  worst case of "offline during a rollover" is a **liveness** delay for that
+  client's turnover, never a **safety** loss.
+
+**Decision.** **Strict-all-N for an N-of-N sub-factory advance is correct and is
+NOT a pre-mainnet safety gap** — it is inherent to MuSig, the rotation layer
+already degrades to partial rotation when clients are offline, and offline
+clients retain full recourse (G1 distribution TX). **Defer** finer-grained
+"auto-shrink the specific sub-factory around a transiently-offline client
+mid-advance" as a **liveness/UX enhancement**, not a security fix. It does **not**
+block the tag.
+
+**Residual risk.** Purely liveness: a persistently-offline client can delay *its
+own* turnover until it returns or the factory reaches its CLTV and everyone
+exits. No fund-safety exposure. Keep honest: the partial-rotation downgrade path
+must itself stay exercised (it is — #70 127-client rotation drill + crash matrix).
+
+**Audit scope.** Confirm the fund-safety framing — that no rollover/advance can
+move an offline client's balance without its signature, and that its G1
+distribution-TX recourse survives a rollover it did not participate in (overlaps
+Q1/Q5).
+
+---
+
 ## Consolidated external-audit scope
 
 1. **Fund-safety invariant (highest priority):** prove a client's channel funds
@@ -223,6 +270,9 @@ pre-rotation snapshot's completeness.
    defends/funds whom.
 5. **Backup/restore recourse-preservation (Q5):** a restored client/WT retains
    full recourse; forward-only construction policy.
+6. **Rollover offline-tolerance framing (Q6):** confirm strict-all-N is a MuSig
+   necessity, not a gap — no advance moves an offline client's funds without its
+   signature, and G1 recourse survives a rollover it did not participate in.
 
 ## Decision → task mapping
 
