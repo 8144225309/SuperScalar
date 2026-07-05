@@ -309,20 +309,26 @@ if [ "$WT_FIRED" -eq 1 ]; then
     # so the leaf-poison recourse must survive a reorg.
     if [ "${SS_REORG_REFIRE:-0}" = 1 ]; then
         echo "=== REORG-REFIRE: orphan the WT response block, verify re-confirm ==="
-        RBLK=$(echo "$PRAW" | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
-        if [ -n "$RBLK" ]; then
-            echo "  invalidating response block $RBLK (orphans $PEN_TXID)"; $BCLI invalidateblock "$RBLK" >/dev/null 2>&1; sleep 6
+        # Robustly orphan the response: invalidate its CURRENT confirming block, walking
+        # back until PEN_TXID is unconfirmed. A single invalidateblock on a stale/deep
+        # blockhash silently no-ops (= the old vacuous skip); loop on the FRESH block.
+        UC=""
+        for a in $(seq 1 8); do
             UC=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
-            if [ -z "$UC" ] || [ "$UC" -eq 0 ]; then
-                echo "  response orphaned (confs ${UC:-0}); mining to verify re-confirm"
-                RECONF=0
-                for i in $(seq 1 24); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 2; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
-                [ "$RECONF" -ge 1 ] || { echo "  FAIL: REORG-REFIRE — leaf poison $PEN_TXID did NOT re-confirm after reorg (recourse LOST on reorg)"; exit 1; }
-                echo "  REORG-REFIRE PASS: leaf poison re-confirmed after orphaning its block ($RECONF confs)"
-            else
-                echo "  (reorg ineffective: response still $UC confs — vacuous, skipping)"
-            fi
-        else echo "  (could not find response block — skipping reorg check)"; fi
+            { [ -z "$UC" ] || [ "$UC" -eq 0 ]; } && break
+            RBLK=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
+            [ -n "$RBLK" ] || break
+            echo "  invalidating response block $RBLK (confs=$UC)"; $BCLI invalidateblock "$RBLK" >/dev/null 2>&1; sleep 2
+        done
+        if [ -z "$UC" ] || [ "$UC" -eq 0 ]; then
+            echo "  response orphaned (confs ${UC:-0}); mining to verify re-confirm"
+            RECONF=0
+            for i in $(seq 1 24); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 2; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
+            [ "$RECONF" -ge 1 ] || { echo "  FAIL: REORG-REFIRE — leaf poison $PEN_TXID did NOT re-confirm after reorg (recourse LOST on reorg)"; exit 1; }
+            echo "  REORG-REFIRE PASS: leaf poison re-confirmed after orphaning its block ($RECONF confs)"
+        else
+            echo "  FAIL: REORG-REFIRE could not orphan the response after 8 invalidations (confs=$UC) — cannot exercise reorg-robustness"; exit 1
+        fi
     fi
     echo "  PASS: standalone WT detected stale leaf state, broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just a log line"
     exit 0
