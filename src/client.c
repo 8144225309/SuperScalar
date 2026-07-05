@@ -1348,8 +1348,15 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (msg.json) cJSON_Delete(msg.json);
         free(secnonces); free(nonce_entries); return 0;
     }
-    client_apply_factory_ready(factory_out, msg.json);
-    cJSON_Delete(msg.json);
+    {
+        int fr_apply = client_apply_factory_ready(factory_out, msg.json);
+        cJSON_Delete(msg.json);
+        if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse (fund-safety) */
+            fprintf(stderr, "Client: refusing rotation -- LSP factory tree failed "
+                            "signature verification\n");
+            free(secnonces); free(nonce_entries); return 0;
+        }
+    }
 
     /* Basepoint exchange: receive LSP's basepoints */
     secp256k1_pubkey rot_lsp_pay_bp, rot_lsp_delay_bp, rot_lsp_revoc_bp;
@@ -2349,8 +2356,13 @@ int client_run_with_channels(secp256k1_context *ctx,
                 goto fail;
             }
             if (msg.msg_type == MSG_FACTORY_READY) {
-                client_apply_factory_ready(factory, msg.json);
+                int fr_apply = client_apply_factory_ready(factory, msg.json);
                 cJSON_Delete(msg.json);
+                if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse */
+                    fprintf(stderr, "Client: refusing factory -- tree failed "
+                                    "signature verification\n");
+                    goto fail;
+                }
                 created = 1;
                 break;
             } else if (msg.msg_type == MSG_FACTORY_PROPOSE_INTENT &&
@@ -2625,8 +2637,15 @@ int client_run_with_channels(secp256k1_context *ctx,
             if (msg.json) cJSON_Delete(msg.json);
             goto fail;
         }
-        client_apply_factory_ready(factory, msg.json);
-        cJSON_Delete(msg.json);
+        {
+            int fr_apply = client_apply_factory_ready(factory, msg.json);
+            cJSON_Delete(msg.json);
+            if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse */
+                fprintf(stderr, "Client: refusing factory -- tree failed "
+                                "signature verification\n");
+                goto fail;
+            }
+        }
     }
 
     /* Log expected distribution amount.  The distribution TX is a fallback
