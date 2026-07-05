@@ -42,12 +42,19 @@ key-leak, or fund-theft gap.** One HIGH *robustness* gap + one real bug were fou
   abort mirroring the in-epoch leaf advance (lsp_channels.c:1840). Non-trivial restructure;
   do with a targeted Tier-B-boundary regression.
 - **MED — leaf/factory-node L-stock poison not mirrored to wt.db.** `lsp_channels.c:1924/2715/3366`
-  mirror only `signed_tx` (chain[N]) as the factory-node response, not the co-signed poison
-  (contrast sub-factory, which stores the poison). A standalone WT re-asserts client channel
-  balances (chain[N], ≥90% value proven) but does not fire the leaf L-stock poison — that leg
-  is client-driven by design (`superscalar_lstock_recover`, #62) or in-memory-WT only. **Fix
-  approach:** mirror the co-signed leaf poison into wt_db as the response (symmetry with
-  sub-factory) so the "run your own WT" story covers the L-stock leg.
+  mirror only `signed_tx` (chain[N]) as the factory-node response, not the co-signed poison.
+  **Deeper analysis (corrects an earlier "just mirror sub-factory" read):** unlike the
+  sub-factory — where chain[N] orphans `-25` once the breach confirms, so the poison *replaces*
+  it (`:4199`) — the **leaf's chain[N] is a VALID post-confirmation response**: it spends
+  `old_leaf_txid` directly and re-asserts the client channel balances (≥90% value, proven by
+  `test_regtest_cheat_daemon_leaf.sh`). So the client's **primary fund-recourse already works
+  standalone** via chain[N]; the L-stock poison is a *secondary deterrent* (redistribute the
+  LSP's over-claimed L-stock) that spends a DIFFERENT vout of `old_leaf_txid`. **Fix approach:**
+  register a SECOND wt_db watch for the poison (same parent `old_leaf_txid`, response =
+  `node->poison_signed_tx`, `response_txid = node->poison_txid`; the leaf node carries all three,
+  factory.h:177-182) — NOT a swap. The hydrating WT fires all rows sharing a parent txid, so
+  both chain[N] and the poison broadcast on breach (different vouts, no conflict). Needs a
+  standalone-WT-fires-leaf-poison regression to prove. Not fund-safety (chain[N] covers balances).
 - **LOW — WT completeness nuances.** (F4) force-close kind=3 is armed reactively (on a peer's
   BOLT ERROR), so a *pre-suppressed* LSP leaves no kind=3 row — pre-emptive arming would close
   it. (F5) `fee_bump_*` metadata is inert in every wt_db row; the WT only CPFPs if the
