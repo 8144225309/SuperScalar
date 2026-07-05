@@ -213,34 +213,45 @@ done
 echo
 echo "=== Final result ==="
 CHEAT_FIRED=$(grep -cE "CL4-ROLLOVER: mid-window broadcast" "$LSP_LOG" 2>/dev/null | head -1 || echo 0)
-# In-process WT lives in the LSP process — its detection lines go to LSP_LOG.
-# Standalone WT runs in a separate process with its own (empty) DB and only
-# acts as a redundant chain-scan observer.  Accept either as proof of detect.
+CHEAT_TXID=$(grep -aoE "mid-window broadcast of dying factory leaf 0 tx: sent=1 txid=[0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | tail -1)
 WT_BREACH=$(grep -cE "FACTORY BREACH|BREACH DETECTED|breach detected" "$LSP_LOG" "$WT_LOG" 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}')
-WT_PENALTY=$(grep -cE "penalty.*broadcast|response_tx.*broadcast|Watchtower broadcast.*penalty" "$LSP_LOG" "$WT_LOG" 2>/dev/null | awk -F: '{s+=$NF} END{print s+0}')
+echo "  cheat_fired=$CHEAT_FIRED  wt_detected_breach=$WT_BREACH  revoked_state=${CHEAT_TXID:-none}"
 
-echo "  cheat_fired=$CHEAT_FIRED  wt_breach=$WT_BREACH  wt_penalty=$WT_PENALTY"
-
+# THE CORRECT DEFENSE (proven 2026-07-04): the rollover stake-theft -- LSP broadcasts the
+# REVOKED old rollover state to over-claim its L-STOCK -- is defended by the #53 L-STOCK
+# POISON, which spends the revoked state's L-stock output and REDISTRIBUTES it away from the
+# LSP. The watchtower_check *penalty* path is the WRONG response for this breach type and
+# -25s ("bad-txns-inputs-missingorspent"); "Latest state tx broadcast failed" is the DW
+# override (a different layer). Empirically verified: cheat broadcast bccb7e (over-claim
+# L-stock at vout 1) -> poison 48ffb3 CONFIRMED spending bccb7e:1, redistributing 2,498,340
+# sats. So assert the ACTUAL defense: a CONFIRMED recourse tx that SPENDS the revoked state
+# and moves real value (poison/burn preferred; penalty/response accepted as fallback).
 set +e
-if [ "$CHEAT_FIRED" -ge 1 ] && [ "$WT_BREACH" -ge 1 ] && [ "$WT_PENALTY" -ge 1 ]; then
-    # OUTCOME (not just log-greps): confirm the WT's response/penalty txid ON-CHAIN + assert a real amount.
-    PEN_TXID=$(sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64 ORDER BY id DESC LIMIT 1;" 2>/dev/null)
-    [ -z "$PEN_TXID" ] && PEN_TXID=$(cat "$LSP_LOG" "$WT_LOG" 2>/dev/null | grep -aoiE "Latest state tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|L-stock burn tx broadcast: [0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}" | grep -oE "[0-9a-f]{64}" | tail -1)
-    [ -n "$PEN_TXID" ] || { echo "  FAIL: WT signals fired but no response/penalty txid found (breach_detections + logs)"; tail -20 "$WT_LOG"; exit 1; }
-    echo "  WT response txid: $PEN_TXID — mining to confirm + verify payout"
-    PRAW=""; for n in $(seq 1 10); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; PRAW=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null); echo "$PRAW" | grep -q '"confirmations"' && break; done
-    echo "$PRAW" | grep -q '"confirmations"' || { echo "  FAIL: WT response $PEN_TXID never CONFIRMED on-chain (broadcast != confirmed)"; exit 1; }
-    PV=$(echo "$PRAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
-    PSATS=$(awk "BEGIN{printf \"%d\", ($PV+0)*100000000}")
-    echo "  WT response confirmed on-chain; largest output ${PSATS:-0} sats"
-    [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
-    echo "  PASS: rollover cheat fired + WT detected breach + broadcast AND CONFIRMED its response ($PEN_TXID, ${PSATS} sats) — outcome verified, not just log-greps"
+if [ "$CHEAT_FIRED" -lt 1 ] || [ -z "$CHEAT_TXID" ]; then
+    echo "  FAIL: rollover cheat did not fire / no revoked-state txid"; tail -25 "$LSP_LOG"; exit 1
+fi
+DEF_OK=0; DEF_TXID=""; DEF_SATS=0
+CANDS=$( { cat "$LSP_LOG" "$WT_LOG" 2>/dev/null | grep -aoiE "L-stock (burn|poison) tx broadcast: *[0-9a-f]{64}|Sub-factory poison tx broadcast: *[0-9a-f]{64}|Penalty tx broadcast: *[0-9a-f]{64}|Latest state tx broadcast: *[0-9a-f]{64}" | grep -oE "[0-9a-f]{64}"; sqlite3 "$LSP_DB" "SELECT response_txid FROM breach_detections WHERE response_txid IS NOT NULL AND length(response_txid)=64;" 2>/dev/null; } | awk '!seen[$0]++')
+for cand in $CANDS; do
+    for n in $(seq 1 6); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 1; $BCLI getrawtransaction "$cand" true 2>/dev/null | grep -q '"confirmations"' && break; done
+    RAW=$($BCLI getrawtransaction "$cand" true 2>/dev/null)
+    echo "$RAW" | grep -q '"confirmations"' || continue
+    SPENDS=$(echo "$RAW" | python3 -c "import json,sys
+try:
+ d=json.load(sys.stdin); print(1 if any(vi.get('txid')=='$CHEAT_TXID' for vi in d.get('vin',[])) else 0)
+except Exception: print(0)")
+    [ "$SPENDS" = "1" ] || continue
+    V=$(echo "$RAW" | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    DEF_SATS=$(awk "BEGIN{printf \"%d\", ($V+0)*100000000}"); DEF_OK=1; DEF_TXID="$cand"; break
+done
+echo "  defense_confirmed_spending_revoked_state=$DEF_OK  txid=${DEF_TXID:-none}  redistributed=${DEF_SATS} sats"
+if [ "$DEF_OK" -eq 1 ] && [ "${DEF_SATS:-0}" -ge 1000 ]; then
+    echo "  PASS: rollover cheat fired -- the LSP broadcast the revoked old rollover state ($CHEAT_TXID) to"
+    echo "        over-claim its L-stock; the recourse ($DEF_TXID) CONFIRMED on-chain, SPENDING the revoked"
+    echo "        state and redistributing ${DEF_SATS} sats away from the LSP. Rollover stake-theft DEFENDED."
     exit 0
 fi
-
-echo "  FAIL: cheat_fired=$CHEAT_FIRED wt_breach=$WT_BREACH wt_penalty=$WT_PENALTY (need all >=1)"
-echo "  LSP log tail:"
-tail -30 "$LSP_LOG"
-echo "  WT log tail:"
-tail -30 "$WT_LOG"
+echo "  FAIL: cheat_fired=$CHEAT_FIRED but NO confirmed recourse spends the revoked state $CHEAT_TXID"
+echo "        (required: a confirmed defense that spends the revoked state -- else the LSP kept its over-claim)"
+tail -25 "$LSP_LOG"; echo "  --- WT ---"; tail -20 "$WT_LOG"
 exit 1
