@@ -932,6 +932,20 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
     if (count > 0)
         printf("Client: applied %d signed tree nodes from FACTORY_READY\n", count);
 
+    /* GAP-SCAN (fund-safety) FIX: verify the LSP-supplied tree aggregate signatures
+       before trusting them. The client's unilateral self-exit (factory_recovery)
+       broadcasts exactly these bytes root-down; an unverified INVALID tree would be
+       rejected on-chain, freezing the client's funds under a buggy or malicious LSP
+       (the documented "self-exit always available" invariant transitively assumes
+       tree-sig validity, which was never checked client-side). factory_verify_all is
+       secret-free -- it recomputes each node sighash and schnorr-verifies against
+       node->tweaked_pubkey (data the client already holds). Refuse on failure. */
+    if (count > 0 && !factory_verify_all(f)) {
+        fprintf(stderr, "Client: FACTORY_READY tree aggregate signatures INVALID "
+                        "-- REFUSING factory (would be unrecoverable via self-exit)\n");
+        return -1;
+    }
+
     /* Parse signed distribution TX if present */
     cJSON *dist_hex_j = cJSON_GetObjectItem(json, "distribution_tx_hex");
     if (dist_hex_j && cJSON_IsString(dist_hex_j)) {
