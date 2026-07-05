@@ -278,6 +278,26 @@ except Exception: print("0 0 0")')
     [ "${PMIN:-0}" -ge 330 ] || { echo "  FAIL: a per-client output ${PMIN} sats <= dust — redistribution shorted a client"; exit 1; }
     A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
     case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
+    # Tier-4 reorg-robustness (opt-in: SS_REORG_REFIRE=1, #95-b): orphan the WT's
+    # sub-factory poison/redistribution block and verify it RE-confirms. The standalone
+    # WT (WT_PID) is still polling; the recourse must survive a reorg.
+    if [ "${SS_REORG_REFIRE:-0}" = 1 ]; then
+        echo "=== REORG-REFIRE: orphan the WT redistribution block, verify re-confirm ==="
+        RBLK=$(echo "$PRAW" | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
+        if [ -n "$RBLK" ]; then
+            echo "  invalidating redistribution block $RBLK (orphans $PEN_TXID)"; $BCLI invalidateblock "$RBLK" >/dev/null 2>&1; sleep 6
+            UC=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+            if [ -z "$UC" ] || [ "$UC" -eq 0 ]; then
+                echo "  redistribution orphaned (confs ${UC:-0}); mining to verify re-confirm"
+                RECONF=0
+                for i in $(seq 1 24); do $BCLI generatetoaddress 1 "$MINE_ADDR" >/dev/null 2>&1; sleep 2; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
+                [ "$RECONF" -ge 1 ] || { echo "  FAIL: REORG-REFIRE — sub-factory poison $PEN_TXID did NOT re-confirm after reorg (recourse LOST on reorg)"; exit 1; }
+                echo "  REORG-REFIRE PASS: sub-factory poison re-confirmed after orphaning its block ($RECONF confs)"
+            else
+                echo "  (reorg ineffective: redistribution still $UC confs — vacuous, skipping)"
+            fi
+        else echo "  (could not find redistribution block — skipping reorg check)"; fi
+    fi
     echo "  PASS: standalone WT detected sub-factory breach, broadcast AND CONFIRMED its redistribution ($PEN_TXID; $PNUM clients, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     exit 0
 else
