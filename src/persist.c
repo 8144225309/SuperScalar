@@ -2885,10 +2885,14 @@ int persist_save_local_pcs(persist_t *p, uint32_t channel_id,
 
     sqlite3_bind_int(stmt, 1, (int)channel_id);
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
-    sqlite3_bind_text(stmt, 3, secret_hex, -1, SQLITE_TRANSIENT);
+    char *lp_sealed = persist_seal_text(p, secret_hex);   /* G3: seal at rest */
+    memset(secret_hex, 0, sizeof secret_hex);
+    if (!lp_sealed) { sqlite3_finalize(stmt); return 0; }
+    sqlite3_bind_text(stmt, 3, lp_sealed, -1, SQLITE_TRANSIENT);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    memset(lp_sealed, 0, strlen(lp_sealed)); free(lp_sealed);
     return ok;
 }
 
@@ -2910,11 +2914,14 @@ int persist_load_local_pcs(persist_t *p, uint32_t channel_id,
     size_t count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         uint64_t commit_num = (uint64_t)sqlite3_column_int64(stmt, 0);
-        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
-        if (!hex || commit_num >= max) continue;
+        const char *stored = (const char *)sqlite3_column_text(stmt, 1);
+        if (!stored || commit_num >= max) continue;
 
+        char *hex = NULL;                                  /* G3: open at rest */
+        if (!persist_open_text(p, stored, &hex) || !hex) continue;
         if (hex_decode(hex, secrets_out[commit_num], 32) == 32)
             count++;
+        memset(hex, 0, strlen(hex)); free(hex);
     }
 
     sqlite3_finalize(stmt);

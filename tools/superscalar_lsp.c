@@ -2381,6 +2381,16 @@ int main(int argc, char *argv[]) {
     /* #9: refuse ALL test/cheat scaffolding flags on mainnet (footgun guard on
        top of --i-accept-the-risk). Detection cheats are self-harming and
        defense-bypass cheats are theft; neither belongs on a mainnet node. */
+    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
+       silently defaults to the mainnet RPC port (chain_backend_rpc.c) while the
+       exact-"mainnet" guards would NOT fire. Allowlist the known chains. */
+    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
+        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
+        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
+        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                "testnet4|signet|mainnet).\n", network);
+        return 1;
+    }
     if (strcmp(network, "mainnet") == 0) {
         for (int ci = 1; ci < argc; ci++) {
             if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
@@ -2399,7 +2409,9 @@ int main(int argc, char *argv[]) {
             for (char **e = environ; e && *e; e++) {
                 if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
                     strncmp(*e, "SS_KILL", 7) == 0 ||
-                    strncmp(*e, "SUPERSCALAR_CRASH_AT", 20) == 0) {
+                    /* G1 (gap-scan): prefix, not exact, so SUPERSCALAR_CRASH_ALLOW
+                       (gates peer-sent MSG_FORCE_OUT/MSG_ROTATE) is caught too. */
+                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
                     fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
                             "on mainnet.\n", *e);
                     return 1;

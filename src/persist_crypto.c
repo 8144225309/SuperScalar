@@ -231,7 +231,7 @@ static const secret_col_t SECRET_COLS[] = {
        open, so adding a column here auto-seals it on the next startup with no
        schema/enc-version bump.
        v0.3 (payment-privacy tier): preimage / payment_secret / stateless_nonce
-       across htlcs/ptlcs/ln_invoices/local_pcs. */
+       across htlcs/ptlcs/ln_invoices. */
     { "revocation_secrets",         "rowid",      "secret",                  0 },
     { "factory_revocation_secrets", "rowid",      "secret",                  0 },
     { "channel_basepoints",         "channel_id", "local_payment_secret",    0 },
@@ -253,6 +253,11 @@ static const secret_col_t SECRET_COLS[] = {
        PK), so the migrate id is `rowid`. */
     { "departed_clients",           "rowid",      "extracted_key",           0 },
     { "watchtower_keys",            "rowid",      "key_hex",                 0 },
+    /* G3 (gap-scan): per-commitment secrets are a CHANNEL-security secret (were
+       mis-grouped with the payment-privacy tier). Seal them -- combined with the
+       already-sealed basepoint secrets they derive revocation keys. Composite PK
+       (channel_id,commit_num) -> migrate id = rowid. Writer/reader in persist.c. */
+    { "local_pcs",                  "rowid",      "secret",                  0 },
 };
 static const size_t N_SECRET_COLS = sizeof(SECRET_COLS) / sizeof(SECRET_COLS[0]);
 

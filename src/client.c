@@ -932,6 +932,20 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
     if (count > 0)
         printf("Client: applied %d signed tree nodes from FACTORY_READY\n", count);
 
+    /* GAP-SCAN (fund-safety) FIX: verify the LSP-supplied tree aggregate signatures
+       before trusting them. The client's unilateral self-exit (factory_recovery)
+       broadcasts exactly these bytes root-down; an unverified INVALID tree would be
+       rejected on-chain, freezing the client's funds under a buggy or malicious LSP
+       (the documented "self-exit always available" invariant transitively assumes
+       tree-sig validity, which was never checked client-side). factory_verify_all is
+       secret-free -- it recomputes each node sighash and schnorr-verifies against
+       node->tweaked_pubkey (data the client already holds). Refuse on failure. */
+    if (count > 0 && !factory_verify_all(f)) {
+        fprintf(stderr, "Client: FACTORY_READY tree aggregate signatures INVALID "
+                        "-- REFUSING factory (would be unrecoverable via self-exit)\n");
+        return -1;
+    }
+
     /* Parse signed distribution TX if present */
     cJSON *dist_hex_j = cJSON_GetObjectItem(json, "distribution_tx_hex");
     if (dist_hex_j && cJSON_IsString(dist_hex_j)) {
@@ -1334,8 +1348,15 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (msg.json) cJSON_Delete(msg.json);
         free(secnonces); free(nonce_entries); return 0;
     }
-    client_apply_factory_ready(factory_out, msg.json);
-    cJSON_Delete(msg.json);
+    {
+        int fr_apply = client_apply_factory_ready(factory_out, msg.json);
+        cJSON_Delete(msg.json);
+        if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse (fund-safety) */
+            fprintf(stderr, "Client: refusing rotation -- LSP factory tree failed "
+                            "signature verification\n");
+            free(secnonces); free(nonce_entries); return 0;
+        }
+    }
 
     /* Basepoint exchange: receive LSP's basepoints */
     secp256k1_pubkey rot_lsp_pay_bp, rot_lsp_delay_bp, rot_lsp_revoc_bp;
@@ -2335,8 +2356,13 @@ int client_run_with_channels(secp256k1_context *ctx,
                 goto fail;
             }
             if (msg.msg_type == MSG_FACTORY_READY) {
-                client_apply_factory_ready(factory, msg.json);
+                int fr_apply = client_apply_factory_ready(factory, msg.json);
                 cJSON_Delete(msg.json);
+                if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse */
+                    fprintf(stderr, "Client: refusing factory -- tree failed "
+                                    "signature verification\n");
+                    goto fail;
+                }
                 created = 1;
                 break;
             } else if (msg.msg_type == MSG_FACTORY_PROPOSE_INTENT &&
@@ -2611,8 +2637,15 @@ int client_run_with_channels(secp256k1_context *ctx,
             if (msg.json) cJSON_Delete(msg.json);
             goto fail;
         }
-        client_apply_factory_ready(factory, msg.json);
-        cJSON_Delete(msg.json);
+        {
+            int fr_apply = client_apply_factory_ready(factory, msg.json);
+            cJSON_Delete(msg.json);
+            if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse */
+                fprintf(stderr, "Client: refusing factory -- tree failed "
+                                "signature verification\n");
+                goto fail;
+            }
+        }
     }
 
     /* Log expected distribution amount.  The distribution TX is a fallback

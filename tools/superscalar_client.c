@@ -2705,6 +2705,16 @@ int main(int argc, char *argv[]) {
     /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
        test/cheat scaffolding flags on mainnet (footgun guard). */
     superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
+       silently defaults to the mainnet RPC port while the exact-"mainnet" guards
+       would not fire. Allowlist the known chains. */
+    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
+        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
+        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
+        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                "testnet4|signet|mainnet).\n", network);
+        return 1;
+    }
     if (strcmp(network, "mainnet") == 0) {
         for (int ci = 1; ci < argc; ci++) {
             if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
@@ -2712,6 +2722,21 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
                         "refused on mainnet.\n", argv[ci]);
                 return 1;
+            }
+        }
+        /* G2 (gap-scan): mirror the LSP -- also refuse cheat/kill/crash ENV vars on
+           mainnet (SS_CHEAT_* are gate-inert, but SUPERSCALAR_CRASH* -> abort() is
+           env-driven; fail LOUD rather than silently accept a crash knob). */
+        {
+            extern char **environ;
+            for (char **e = environ; e && *e; e++) {
+                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
+                    strncmp(*e, "SS_KILL", 7) == 0 ||
+                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
+                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
+                            "on mainnet.\n", *e);
+                    return 1;
+                }
             }
         }
     }

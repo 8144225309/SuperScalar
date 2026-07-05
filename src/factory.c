@@ -432,7 +432,14 @@ static int update_l_stock_outputs(factory_t *f) {
            The just-superseded state's secret (counter-1) is what the LSP reveals
            to this leaf's clients for recourse against the old state. */
         node->l_stock_state_counter++;
-        if (!set_leaf_l_stock_output(f, node, node->outputs[node->n_outputs - 1].script_pubkey))
+        /* #98-sibling fix: L-stock is the last NON-ANCHOR output (see
+           update_l_stock_for_leaf); outputs[n_outputs-1] is the P2A anchor when
+           use_tree_anchor is on. */
+        int ls_has_anchor = (node->n_outputs >= 1 &&
+            node->outputs[node->n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+            memcmp(node->outputs[node->n_outputs - 1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+        size_t ls_idx = node->n_outputs - 1 - (size_t)ls_has_anchor;
+        if (!set_leaf_l_stock_output(f, node, node->outputs[ls_idx].script_pubkey))
             return 0;
     }
     return 1;
@@ -2485,7 +2492,18 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
     /* #53-B: per-leaf advance — bump this leaf's L-stock state index so the new
        state commits a fresh hash (the old state's secret becomes revealable). */
     node->l_stock_state_counter++;
-    return set_leaf_l_stock_output(f, node, node->outputs[node->n_outputs - 1].script_pubkey);
+    /* #98-sibling fix: the L-stock is the last NON-ANCHOR output. With
+       use_tree_anchor on (production default), outputs[n_outputs-1] is the P2A
+       anchor -- writing the L-stock SPK there would corrupt the anchor (len stays
+       4 -> unspendable CPFP) AND freeze the real L-stock's hashlock (never rebuilt
+       on advance while l_stock_state_counter bumps). Target the pre-anchor index. */
+    {
+        int ls_has_anchor = (node->n_outputs >= 1 &&
+            node->outputs[node->n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+            memcmp(node->outputs[node->n_outputs - 1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+        size_t ls_idx = node->n_outputs - 1 - (size_t)ls_has_anchor;
+        return set_leaf_l_stock_output(f, node, node->outputs[ls_idx].script_pubkey);
+    }
 }
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {
