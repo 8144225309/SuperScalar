@@ -3009,6 +3009,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_l_stock_with_burn_path);
     RUN_TEST(test_factory_burn_tx_construction);
     RUN_TEST(test_factory_advance_with_shachain);
+    RUN_TEST(test_factory_anchor_lstock_advance);  /* anchor-fix regression (gap-scan) */
 
     printf("\n=== Channel (Poon-Dryja) ===\n");
     RUN_TEST(test_channel_key_derivation);
@@ -3933,7 +3934,6 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_lstock_hashlock_poison);
     RUN_TEST(test_regtest_lstock_poison_ceremony);
     RUN_TEST(test_regtest_lstock_poison_old_state);
-    RUN_TEST(test_factory_anchor_lstock_advance);  /* anchor-fix regression (gap-scan) */
     RUN_TEST(test_regtest_channel_unilateral);
     RUN_TEST(test_regtest_channel_penalty);
     RUN_TEST(test_regtest_htlc_success);
