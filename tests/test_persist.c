@@ -5430,6 +5430,25 @@ int test_persist_secret_columns_sealed(void) {
         TEST_ASSERT(persist_load_anchor_key(&db, gak), "load anchor key");
         TEST_ASSERT(memcmp(gak, ak, 32) == 0, "anchor key round-trip");
     }
+
+    /* G3 (gap-scan): local_pcs.secret (per-commitment secret) -- seal-on-write ->
+       sealed on disk -> accessor round-trip. */
+    {
+        unsigned char lp[32]; for (int i = 0; i < 32; i++) lp[i] = (unsigned char)(0xA0 + i);
+        TEST_ASSERT(persist_save_local_pcs(&db, 4, 6, lp), "save local_pcs");
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(db.db,
+            "SELECT secret FROM local_pcs WHERE channel_id=4 AND commit_num=6;",
+            -1, &st, NULL) == SQLITE_OK, "prep lp");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "lp row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "local_pcs.secret sealed on write");
+        sqlite3_finalize(st);
+        unsigned char lpgot[8][32]; size_t lpn = 0; memset(lpgot, 0, sizeof lpgot);
+        TEST_ASSERT(persist_load_local_pcs(&db, 4, lpgot, 8, &lpn), "load local_pcs");
+        TEST_ASSERT(memcmp(lpgot[6], lp, 32) == 0, "local_pcs round-trip");
+    }
+
     persist_close(&db);
     unlink(path);
 
@@ -5481,6 +5500,16 @@ int test_persist_secret_columns_sealed(void) {
         snprintf(dins, sizeof dins,
             "INSERT INTO departed_clients(factory_id,client_idx,extracted_key) VALUES(22,1,'%s');", dmh);
         TEST_ASSERT(sqlite3_exec(kdb.db, dins, NULL, NULL, NULL) == SQLITE_OK, "insert departed plaintext");
+    }
+
+    /* G3 (gap-scan): a legacy plaintext local_pcs.secret to migrate (rowid+text path). */
+    unsigned char lpm[32]; for (int i = 0; i < 32; i++) lpm[i] = (unsigned char)(0x80 + i);
+    {
+        char lph[65]; hex_encode(lpm, 32, lph);
+        char lpins[200];
+        snprintf(lpins, sizeof lpins,
+            "INSERT INTO local_pcs(channel_id,commit_num,secret) VALUES(9,2,'%s');", lph);
+        TEST_ASSERT(sqlite3_exec(kdb.db, lpins, NULL, NULL, NULL) == SQLITE_OK, "insert local_pcs plaintext");
     }
     persist_close(&kdb);
 
@@ -5537,6 +5566,20 @@ int test_persist_secret_columns_sealed(void) {
         int dep[8] = {0}; unsigned char gk[8][32];
         TEST_ASSERT(persist_load_departed_clients(&kdb2, 22, dep, gk, 8) >= 1, "load departed migrated");
         TEST_ASSERT(dep[1] && memcmp(gk[1], dm, 32) == 0, "departed migrated round-trip");
+    }
+    /* G3 (gap-scan): legacy plaintext local_pcs sealed by migration + round-trip */
+    {
+        sqlite3_stmt *st = NULL;
+        TEST_ASSERT(sqlite3_prepare_v2(kdb2.db,
+            "SELECT secret FROM local_pcs WHERE channel_id=9 AND commit_num=2;",
+            -1, &st, NULL) == SQLITE_OK, "prep lp-mig");
+        TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "lp-mig row");
+        const char *v = (const char *)sqlite3_column_text(st, 0);
+        TEST_ASSERT(v && strncmp(v, "ssenc1:", 7) == 0, "local_pcs sealed by migration");
+        sqlite3_finalize(st);
+        unsigned char lpg[8][32]; size_t lpc = 0; memset(lpg, 0, sizeof lpg);
+        TEST_ASSERT(persist_load_local_pcs(&kdb2, 9, lpg, 8, &lpc), "load migrated local_pcs");
+        TEST_ASSERT(memcmp(lpg[2], lpm, 32) == 0, "migrated local_pcs round-trip");
     }
     persist_close(&kdb2);
     unlink(path2);
