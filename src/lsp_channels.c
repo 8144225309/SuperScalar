@@ -2247,6 +2247,9 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                        the SUPERSEDED L-stock output (not the node's new hash). */
                     an->prev_epoch_has_l_hash ? an->prev_epoch_l_hash : NULL)) {
                 poison_prepared[k] = 1;  /* init_node_poison after state init */
+                printf("LSP-stateless Tier B: L-stock poison ARMED for node %zu "
+                       "(superseded state, %llu-sat L-stock) [#105]\n",
+                       affected[k], (unsigned long long)poison_old_l_amount[k]);
             }
         }
     }
