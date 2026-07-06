@@ -39,6 +39,10 @@
 set -uo pipefail
 
 BUILD_DIR="${1:-/root/SuperScalar/build-release}"
+# Robust sqlite reads: the LSP holds wt.db/lsp.db during the probe phases, so a plain
+# read intermittently hits "database is locked" (a flake that failed Phase D as a false
+# "no active rows"). Wait for the transient writer lock instead of failing immediately.
+sq() { sqlite3 -cmd "PRAGMA busy_timeout=20000;" "$@"; }
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 WT_BIN="$BUILD_DIR/superscalar_watchtower"
@@ -209,25 +213,25 @@ sleep 2
 # ---------------------------------------------------------------------------
 echo
 echo "--- Phase D: assert wt.db content + trustless invariant ---"
-N_WATCHES=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_watches WHERE superseded_at IS NULL;" 2>/dev/null || echo "?")
-N_RESPONSES=$(sqlite3 "$WT_DB" "SELECT count(*) FROM wt_responses;" 2>/dev/null || echo "?")
+N_WATCHES=$(sq "$WT_DB" "SELECT count(*) FROM wt_watches WHERE superseded_at IS NULL;" 2>/dev/null || echo "?")
+N_RESPONSES=$(sq "$WT_DB" "SELECT count(*) FROM wt_responses;" 2>/dev/null || echo "?")
 echo "  wt_watches (active)  : $N_WATCHES  (want >= 1)"
 echo "  wt_responses         : $N_RESPONSES  (want >= 1)"
 if [ "$N_WATCHES" = "?" ] || [ "$N_WATCHES" -lt 1 ]; then
     echo "FAIL: A — no active rows in wt_watches"
-    sqlite3 "$WT_DB" ".tables" 2>&1
+    sq "$WT_DB" ".tables" 2>&1
     exit 1
 fi
 echo "  ✓ A. wt_watches populated"
 
 # Trustless invariant: no secret-like columns in any wt_ table.
-SECRET_HITS=$(sqlite3 "$WT_DB" \
+SECRET_HITS=$(sq "$WT_DB" \
     "SELECT sql FROM sqlite_master WHERE type='table' AND name LIKE 'wt_%';" 2>/dev/null \
     | grep -iE "secret|seckey|private|revocation_secret" | wc -l)
 echo "  secret-like columns  : $SECRET_HITS  (want 0)"
 if [ "$SECRET_HITS" -gt 0 ]; then
     echo "FAIL: B — wt.db schema contains secret-like columns:"
-    sqlite3 "$WT_DB" \
+    sq "$WT_DB" \
         "SELECT sql FROM sqlite_master WHERE type='table' AND name LIKE 'wt_%';" \
         | grep -iE "secret|seckey|private|revocation_secret"
     exit 1
@@ -238,14 +242,14 @@ echo "  ✓ B. trustless invariant holds — no secret columns in wt.db"
 # known revocation_secret from lsp.db (defense-in-depth byte-level check).
 # We do this by extracting all revocation_secret BLOBs from lsp.db, then
 # scanning wt.db's BLOBs for any byte match.
-LSP_SECRETS=$(sqlite3 "$LSP_DB" \
+LSP_SECRETS=$(sq "$LSP_DB" \
     "SELECT hex(revocation_secret) FROM channels WHERE revocation_secret IS NOT NULL UNION SELECT hex(revocation_secret) FROM ceremony_participants WHERE revocation_secret IS NOT NULL;" \
     2>/dev/null | grep -v "^$" | sort -u)
 if [ -n "$LSP_SECRETS" ]; then
     LEAK_COUNT=0
     for secret_hex in $LSP_SECRETS; do
         # Search every BLOB column in every wt_ table for this byte sequence.
-        if sqlite3 "$WT_DB" \
+        if sq "$WT_DB" \
             "SELECT 1 FROM wt_watches WHERE instr(hex(parent_txid), '$secret_hex') > 0 OR instr(hex(parent_spk), '$secret_hex') > 0 LIMIT 1;" \
             2>/dev/null | grep -q 1; then
             LEAK_COUNT=$((LEAK_COUNT + 1))

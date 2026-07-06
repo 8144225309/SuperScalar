@@ -870,6 +870,24 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         fprintf(stderr, "LSP-stateless: dist co-sign incomplete -- FACTORY_READY "
                 "omits the signed distribution TX (offline-recovery degraded)\n");
 
+    /* Gap-scan efficacy cheat (mainnet-inert): simulate a malicious/buggy LSP shipping
+       an INVALID tree.  The LSP's own Phase-B factory_verify_all (above) already passed,
+       so this is a genuinely bad FACTORY_READY the honest path would never emit.  Proves
+       the client's own factory_verify_all REFUSES it (the HIGH gap-scan fix -- without
+       that fix the client would accept an unverifiable tree and be unable to self-exit).
+       Gated by superscalar_cheat_allowed() (regtest-only) + the env knob. */
+    if (superscalar_cheat_allowed() && getenv("SS_CHEAT_BAD_TREE_SIG")) {
+        for (size_t ni = 0; ni < f->n_nodes; ni++) {
+            factory_node_t *bn = &f->nodes[ni];
+            if (bn->parent_index < 0) continue;                    /* skip root */
+            if (!bn->is_signed || bn->signed_tx.len < 70) continue;
+            bn->signed_tx.data[bn->signed_tx.len - 68] ^= 0x01;    /* corrupt the 64-byte agg sig */
+            fprintf(stderr, "SS_CHEAT_BAD_TREE_SIG: corrupted node %zu aggregate sig in "
+                            "FACTORY_READY (client MUST refuse)\n", ni);
+            break;
+        }
+    }
+
     {
         cJSON *ready = wire_build_factory_ready(f);
         for (size_t i = 0; i < lsp->n_clients; i++) {

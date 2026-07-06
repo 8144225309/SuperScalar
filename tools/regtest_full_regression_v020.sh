@@ -21,6 +21,9 @@ RUNNERS=(
     test_regtest_tier_b_rollover_ps.sh
     test_regtest_cheat_daemon_subfactory.sh
 
+    # Gap-scan efficacy: client refuses a malicious LSP's invalid factory tree
+    test_regtest_bad_tree_verify.sh
+
     # Sub-factory + Tier B (additional)
     test_regtest_subfactory_chain_advance_multi.sh
     test_regtest_k2_subfactory_breach.sh
