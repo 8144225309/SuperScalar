@@ -6765,6 +6765,17 @@ int test_factory_anchor_lstock_advance(void) {
     size_t m = leaf->n_outputs;
     TEST_ASSERT(m >= 3, "leaf still has >=3 outputs after advance");
 
+    printf("  DBG anchor_lstock: n=%zu m=%zu ctr %llu->%llu | anchor[m-1] len=%u spk=%02x%02x%02x%02x"
+           " | lstock[m-2] spk=%02x%02x%02x%02x changed=%d\n",
+           n, m, (unsigned long long)counter_before,
+           (unsigned long long)leaf->l_stock_state_counter,
+           (unsigned)leaf->outputs[m-1].script_pubkey_len,
+           leaf->outputs[m-1].script_pubkey[0], leaf->outputs[m-1].script_pubkey[1],
+           leaf->outputs[m-1].script_pubkey[2], leaf->outputs[m-1].script_pubkey[3],
+           leaf->outputs[m-2].script_pubkey[0], leaf->outputs[m-2].script_pubkey[1],
+           leaf->outputs[m-2].script_pubkey[2], leaf->outputs[m-2].script_pubkey[3],
+           memcmp(leaf->outputs[m-2].script_pubkey, lstock_spk_before, 34) != 0);
+
     /* (a) The anchor (last output) STAYS the canonical P2A anchor -- the bug
        overwrote its 4-byte SPK with 34 bytes of L-stock SPK (len frozen at 4). */
     TEST_ASSERT(leaf->outputs[m-1].script_pubkey_len == P2A_SPK_LEN,
