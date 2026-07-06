@@ -303,6 +303,19 @@ if [ "$WT_FIRED" -eq 1 ]; then
     [ "${PSATS:-0}" -ge 1000 ] || { echo "  FAIL: WT response output ${PSATS} sats <= dust — not a real recapture"; exit 1; }
     A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
     case "$A2" in LOW*) echo "  FAIL: WT response recovers <90% of swept value ($A2) — value leaked/burned"; exit 1;; esac
+    # WT F2 (gap-scan): the standalone WT must now fire BOTH chain[N] (re-assert client
+    # balances) AND the co-signed L-stock POISON (redistribute the LSP over-claim) from
+    # wt.db ALONE. Pre-fix only chain[N] was mirrored, so the "+ poison" in this test's
+    # header was aspirational. Assert >=2 DISTINCT WT-broadcast responses confirm on-chain
+    # (the delta from the historical single response is precisely the mirrored poison).
+    F2_RESP=$(grep -aiE "broadcast" "$WT_LOG" 2>/dev/null | grep -aoiE "[0-9a-f]{64}" | sort -u)
+    F2_NCONF=0
+    for tx in $F2_RESP; do
+        $BCLI getrawtransaction "$tx" true 2>/dev/null | grep -q '"confirmations"' && F2_NCONF=$((F2_NCONF+1))
+    done
+    echo "  WT F2: $F2_NCONF distinct WT responses confirmed on-chain (want >=2: chain[N] + L-stock poison)"
+    [ "${F2_NCONF:-0}" -ge 2 ] || { echo "  FAIL: WT F2 — standalone WT fired <2 confirmed responses; the leaf L-stock poison did not fire from wt.db (secret-less)"; exit 1; }
+    echo "  WT F2 PASS: standalone WT fired chain[N] + L-stock poison ($F2_NCONF confirmed) from wt.db alone"
     # Tier-4 reorg-robustness (opt-in: SS_REORG_REFIRE=1, #95-b): orphan the WT's
     # leaf-poison/response block and verify it RE-confirms. The standalone WT (WT_PID)
     # is still polling — watchtower_on_reorg re-arms + Core returns the tx to mempool —

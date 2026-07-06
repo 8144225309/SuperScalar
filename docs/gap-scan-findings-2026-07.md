@@ -36,11 +36,21 @@ key-leak, or fund-theft gap.** One HIGH *robustness* gap + one real bug were fou
   inert. **Not principal loss** — client channel funds are PD-penalty-covered independently;
   this only affects the *deterrent* (burn/redistribute the LSP's own L-stock) for the
   epoch-boundary state, and the DW timelock override still applies. Distinct from the
-  leaf-advance poison, which IS armed + proven firing (#37, on-chain). **Fix approach**
-  (`docs/cl4-rollover-remediation-plan.md`): snapshot each affected node's old signed_tx +
-  txid BEFORE `build_all_unsigned_txs` (factory.c:569) overwrites them, and add a fail-closed
-  abort mirroring the in-epoch leaf advance (lsp_channels.c:1840). Non-trivial restructure;
-  do with a targeted Tier-B-boundary regression.
+  leaf-advance poison, which IS armed + proven firing (#37, on-chain). **Fix spec (traced
+  end-to-end):** the bug is deeper than the `had_old` gate — the entire per-affected-node
+  snapshot at lsp_channels.c:2223-2243 reads the ALREADY-REBUILT node (txid @2225, L-stock
+  amount @2233, chain amount/SPK @2237-2243), because `factory_advance_*` calls
+  `update_l_stock_outputs` (rewrites the L-stock SPK) then `build_all_unsigned_txs`
+  (overwrites `node->txid`, factory.c:569) BEFORE the caller `lsp_run_state_advance_stateless`
+  runs. So a valid poison spending the OLD L-stock output cannot be assembled from what's
+  left. Fix = have factory.c snapshot each node's old {txid, L-stock vout+amount+SPK, chain
+  amount+SPK} into `prev_epoch_*` fields BEFORE `update_l_stock_outputs`/`build_all_unsigned_txs`
+  overwrite them, at ALL FOUR advance paths (factory.c:2546/2593/2617/2699), then have the
+  ceremony read `prev_epoch_*` (mirrors how the leaf path snapshots pre-advance at
+  lsp_channels.c:1382-1418); add a fail-closed abort like the leaf advance (lsp_channels.c:1840).
+  A careful core-rollover restructure (high blast radius, 4 paths) needing a NEW Tier-B-boundary
+  poison regression (the existing rollover test exercises the leaf poison, not the epoch
+  boundary). Deferred as a focused follow-up rather than rushed — deterrent-only, not fund-safety.
 - **MED — leaf/factory-node L-stock poison not mirrored to wt.db.** `lsp_channels.c:1924/2715/3366`
   mirror only `signed_tx` (chain[N]) as the factory-node response, not the co-signed poison.
   **Deeper analysis (corrects an earlier "just mirror sub-factory" read):** unlike the
