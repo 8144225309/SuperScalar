@@ -1947,6 +1947,34 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
         }
 
+        /* WT F2 (gap-scan): also register the co-signed L-stock POISON as a SECOND
+           wt_db watch on the same breach parent (old_leaf_txid). Unlike the
+           sub-factory (where chain[N] orphans -25 so the poison REPLACES it), the
+           leaf's chain[N] above is a VALID post-confirmation response that re-asserts
+           client balances; the poison is a SECONDARY deterrent spending a DIFFERENT
+           vout of old_leaf_txid (the LSP's over-claimed L-stock). wt_watches has an
+           AUTOINCREMENT PK (no unique-parent constraint) and the hydrating standalone
+           WT fires every row sharing a parent txid, so both broadcast on breach. */
+        if (lsp && lsp->wt_db && had_old_signed && old_chain_spk_len > 0 &&
+            poison_data && poison_len > 0) {
+            int64_t p_watch_id = lsp_wt_register_factory_node_watch(
+                lsp->wt_db, (uint32_t)node_idx, old_leaf_txid,
+                /* parent_vout      */ 0,
+                /* parent_value_sat */ old_chain_amount,
+                old_chain_spk, old_chain_spk_len,
+                /* csv_delay        */ old_csv_delay,
+                poison_data, poison_len, node->poison_txid,
+                /* fee_bump_budget  */ 0,
+                /* fee_bump_dline   */ 0);
+            if (p_watch_id > 0)
+                printf("LSP-WT-TRUSTLESS: registered leaf-advance POISON "
+                       "watch_id=%lld for node %d\n",
+                       (long long)p_watch_id, (int)node_idx);
+            else
+                fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db POISON register "
+                        "failed for leaf-advance node %d\n", (int)node_idx);
+        }
+
         /* Snapshot poison bytes for Step 11 persist before reset frees them. */
         if (poison_data && poison_len > 0) {
             poison_snapshot = malloc(poison_len);
