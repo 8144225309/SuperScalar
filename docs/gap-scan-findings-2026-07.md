@@ -51,20 +51,22 @@ key-leak, or fund-theft gap.** One HIGH *robustness* gap + one real bug were fou
   A careful core-rollover restructure (high blast radius, 4 paths) needing a NEW Tier-B-boundary
   poison regression (the existing rollover test exercises the leaf poison, not the epoch
   boundary). Deferred as a focused follow-up rather than rushed — deterrent-only, not fund-safety.
-- **MED — leaf/factory-node L-stock poison not mirrored to wt.db.** `lsp_channels.c:1924/2715/3366`
-  mirror only `signed_tx` (chain[N]) as the factory-node response, not the co-signed poison.
-  **Deeper analysis (corrects an earlier "just mirror sub-factory" read):** unlike the
-  sub-factory — where chain[N] orphans `-25` once the breach confirms, so the poison *replaces*
-  it (`:4199`) — the **leaf's chain[N] is a VALID post-confirmation response**: it spends
-  `old_leaf_txid` directly and re-asserts the client channel balances (≥90% value, proven by
-  `test_regtest_cheat_daemon_leaf.sh`). So the client's **primary fund-recourse already works
-  standalone** via chain[N]; the L-stock poison is a *secondary deterrent* (redistribute the
-  LSP's over-claimed L-stock) that spends a DIFFERENT vout of `old_leaf_txid`. **Fix approach:**
-  register a SECOND wt_db watch for the poison (same parent `old_leaf_txid`, response =
-  `node->poison_signed_tx`, `response_txid = node->poison_txid`; the leaf node carries all three,
-  factory.h:177-182) — NOT a swap. The hydrating WT fires all rows sharing a parent txid, so
-  both chain[N] and the poison broadcast on breach (different vouts, no conflict). Needs a
-  standalone-WT-fires-leaf-poison regression to prove. Not fund-safety (chain[N] covers balances).
+- **MED — leaf L-stock poison not mirrored to wt.db — LEAF-ADVANCE FIXED + PROVEN (branch gapscan-meds).**
+  `lsp_channels.c:1924` (leaf-advance) mirrored only `signed_tx` (chain[N]), not the co-signed
+  poison. Unlike the sub-factory (chain[N] orphans `-25`, so the poison *replaces* it `:4199`),
+  the leaf's chain[N] is a VALID post-confirmation response that re-asserts client balances
+  (≥90%), so the poison is a *secondary deterrent* spending a DIFFERENT vout of `old_leaf_txid`.
+  **Fix (proven):** register the poison as a SECOND wt_db factory-node watch on the same parent
+  (leaf node carries `poison_signed_tx`/`poison_is_signed`/`poison_txid`, factory.h:177-182);
+  `wt_watches` has an AUTOINCREMENT PK and the hydrating WT fires every row sharing a parent, so
+  both broadcast. VALIDATED e2e: `test_regtest_cheat_daemon_leaf.sh` asserts the secret-less
+  standalone WT confirms BOTH chain[N] AND the poison (2 responses from wt.db alone). CAVEAT: the
+  cheat tests read BUILD_DIR from `$1` (default ASan `build/`) — validate with `build-release`
+  as `$1` or rebuild `build/`, else you test a stale binary (feedback_cheat_test_build_dir).
+  **Realloc variant (:3366) REVERTED — code-ready follow-up:** identical pattern, but no suite
+  test has BOTH `--wt-db` AND a prepared realloc poison (cheat_realloc has the poison, no
+  `--wt-db`; watchtower_trustless has `--wt-db`, no realloc poison), so it can't be e2e-validated
+  now. Follow-up: add `--wt-db` + standalone WT to cheat_realloc, then re-apply the 2nd-watch mirror.
 - **LOW — WT completeness nuances.** (F4) force-close kind=3 is armed reactively (on a peer's
   BOLT ERROR), so a *pre-suppressed* LSP leaves no kind=3 row — pre-emptive arming would close
   it. (F5) `fee_bump_*` metadata is inert in every wt_db row; the WT only CPFPs if the

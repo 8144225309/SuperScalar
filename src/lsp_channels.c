@@ -3415,30 +3415,6 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         "realloc node %zu\n", node_idx);
             }
         }
-
-        /* WT F2 (gap-scan): also mirror the realloc L-stock POISON as a 2nd wt_db
-           watch on the same parent (mirror the leaf-advance fix ~line 1950). chain[N]
-           above re-asserts client balances; the poison redistributes the LSP's
-           over-claimed L-stock. Second row on the same parent -> the hydrating
-           standalone WT fires both from wt.db alone. */
-        if (lsp && lsp->wt_db && realloc_had_signed && realloc_old_chain_spk_len > 0 &&
-            poison_data && poison_len > 0) {
-            int64_t p_watch_id = lsp_wt_register_factory_node_watch(
-                lsp->wt_db, (uint32_t)node_idx, realloc_old_leaf_txid,
-                /* parent_vout      */ 0,
-                /* parent_value_sat */ realloc_old_chain_amount,
-                realloc_old_chain_spk, realloc_old_chain_spk_len,
-                /* csv_delay        */ realloc_old_csv_delay,
-                poison_data, poison_len, node->poison_txid,
-                /* fee_bump_budget  */ 0,
-                /* fee_bump_dline   */ 0);
-            if (p_watch_id > 0)
-                printf("LSP-WT-TRUSTLESS: registered realloc POISON watch_id=%lld "
-                       "for node %zu\n", (long long)p_watch_id, node_idx);
-            else
-                fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db POISON register "
-                        "failed for realloc node %zu\n", node_idx);
-        }
     }
 
     /* Step 12: Update channel amounts in lsp_channel_entry_t.
