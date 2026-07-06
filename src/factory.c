@@ -427,6 +427,31 @@ static int update_l_stock_outputs(factory_t *f) {
         if (node->n_outputs < 2)
             continue;
 
+        /* Tier-B poison fix (gap-scan #105): snapshot the SUPERSEDED state BEFORE the
+           counter bump + hash re-commit below rewrite it (and before the caller's
+           build_all_unsigned_txs overwrites node->txid).  lsp_run_state_advance_stateless
+           reads these prev_epoch_* to arm the L-stock poison against the OLD output --
+           without them it read the already-rebuilt node (dead had_old, inert watch). */
+        {
+            int pe_anchor = (node->n_outputs >= 1 &&
+                node->outputs[node->n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+                memcmp(node->outputs[node->n_outputs - 1].script_pubkey, P2A_SPK,
+                       P2A_SPK_LEN) == 0) ? 1 : 0;
+            size_t pe_l = node->n_outputs - 1 - (size_t)pe_anchor;
+            node->prev_epoch_valid = (node->is_signed && node->signed_tx.len > 0) ? 1 : 0;
+            memcpy(node->prev_epoch_txid, node->txid, 32);
+            node->prev_epoch_l_vout = (uint32_t)pe_l;
+            node->prev_epoch_l_amount = node->outputs[pe_l].amount_sats;
+            node->prev_epoch_has_l_hash = node->has_l_stock_hash;
+            memcpy(node->prev_epoch_l_hash, node->l_stock_hash, 32);
+            node->prev_epoch_chain_amount = node->outputs[0].amount_sats;
+            node->prev_epoch_chain_spk_len = node->outputs[0].script_pubkey_len > 34
+                ? 34 : node->outputs[0].script_pubkey_len;
+            memcpy(node->prev_epoch_chain_spk, node->outputs[0].script_pubkey,
+                   node->prev_epoch_chain_spk_len);
+            node->prev_epoch_csv_delay = (uint32_t)(node->nsequence & 0xFFFFu);
+        }
+
         /* #53-B: this leaf's L-stock state is advancing — bump its per-leaf
            counter and re-commit the NEW state's hash before rebuilding the SPK.
            The just-superseded state's secret (counter-1) is what the LSP reveals
