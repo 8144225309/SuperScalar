@@ -6719,6 +6719,74 @@ int test_regtest_lstock_poison_ceremony(void) {
     return 1;
 }
 
+/* Anchor-fix regression (gap-scan 2026-07): a leaf advance with use_tree_anchor +
+   hashlock must rebuild the REAL L-stock output (second-to-last), NOT the P2A anchor
+   (last).  Guards the #98-class off-by-one in update_l_stock_for_leaf (factory.c) +
+   update_l_stock_outputs -- the bug wrote the L-stock SPK into outputs[n_outputs-1]
+   (the 240-sat P2A anchor), corrupting the CPFP anchor AND freezing the L-stock
+   hashlock (never rebuilt while l_stock_state_counter bumped).  It was symmetric
+   (LSP+client advance in lockstep) so invisible to conservation/poison-fires tests;
+   this asserts the observable invariant directly. */
+int test_factory_anchor_lstock_advance(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+
+    uint8_t arities[1] = {2};
+    TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 3, arities, 1, 5000000),
+                "setup n3 {2}");
+    f->use_tree_anchor = 1;   /* #56 P2A CPFP anchors (production default) */
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) seed[i] = (unsigned char)(0x5A ^ i);
+    factory_set_shachain_seed(f, seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(f), "enable hashlock poison");
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign all");
+
+    factory_node_t *leaf = &f->nodes[f->leaf_node_indices[0]];
+    size_t n = leaf->n_outputs;
+    TEST_ASSERT(n >= 3, "anchored+hashlock leaf has >=3 outputs (chan + L-stock + anchor)");
+
+    /* Precondition: the anchor must be the LAST output, else the bug is unreachable
+       and this test would be vacuous. */
+    TEST_ASSERT(leaf->outputs[n-1].script_pubkey_len == P2A_SPK_LEN &&
+                memcmp(leaf->outputs[n-1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0,
+                "leaf last output IS the P2A anchor (precondition)");
+    TEST_ASSERT(leaf->has_l_stock_hash, "leaf has an L-stock hashlock to advance");
+
+    unsigned char lstock_spk_before[34];
+    memcpy(lstock_spk_before, leaf->outputs[n-2].script_pubkey, 34);
+    uint64_t counter_before = leaf->l_stock_state_counter;
+
+    /* Advance -> update_l_stock_for_leaf/_outputs rebuilds the L-stock hashlock. */
+    TEST_ASSERT(factory_advance_leaf(f, 0), "advance leaf 0");
+    leaf = &f->nodes[f->leaf_node_indices[0]];  /* re-fetch (nodes may move) */
+    size_t m = leaf->n_outputs;
+    TEST_ASSERT(m >= 3, "leaf still has >=3 outputs after advance");
+
+    /* (a) The anchor (last output) STAYS the canonical P2A anchor -- the bug
+       overwrote its 4-byte SPK with 34 bytes of L-stock SPK (len frozen at 4). */
+    TEST_ASSERT(leaf->outputs[m-1].script_pubkey_len == P2A_SPK_LEN,
+                "anchor SPK len stayed 4 after advance");
+    TEST_ASSERT(memcmp(leaf->outputs[m-1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0,
+                "anchor SPK stayed canonical (51 02 4e 73), NOT overwritten by L-stock");
+    TEST_ASSERT(leaf->outputs[m-1].amount_sats == ANCHOR_OUTPUT_AMOUNT,
+                "anchor amount stayed 240 sats");
+
+    /* (b) The real L-stock (second-to-last) ADVANCED: counter bumped + SPK re-committed
+       to the new hashlock.  Without the fix it was frozen (the write hit the anchor). */
+    TEST_ASSERT(leaf->l_stock_state_counter == counter_before + 1,
+                "l_stock_state_counter bumped by the advance");
+    TEST_ASSERT(memcmp(leaf->outputs[m-2].script_pubkey, lstock_spk_before, 34) != 0,
+                "real L-stock SPK advanced (hashlock re-committed to new state)");
+
+    factory_free(f);
+    secp256k1_context_destroy(ctx);
+    free(f);
+    return 1;
+}
+
 /* #53-B3b CONSENSUS PROOF (old-hash targeting): after a leaf advances to H_new, a
    poison built for the SUPERSEDED state (override_hash32 = H_old) must spend the OLD
    state's output validly — even though the node's current hash is now H_new.  This is

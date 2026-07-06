@@ -1042,6 +1042,7 @@ extern int test_regtest_burn_tx(void);
 extern int test_regtest_lstock_hashlock_poison(void);
 extern int test_regtest_lstock_poison_ceremony(void);
 extern int test_regtest_lstock_poison_old_state(void);
+extern int test_factory_anchor_lstock_advance(void);  /* anchor-fix regression (gap-scan) */
 
 extern int test_channel_key_derivation(void);
 extern int test_channel_commitment_tx(void);
@@ -3932,6 +3933,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_lstock_hashlock_poison);
     RUN_TEST(test_regtest_lstock_poison_ceremony);
     RUN_TEST(test_regtest_lstock_poison_old_state);
+    RUN_TEST(test_factory_anchor_lstock_advance);  /* anchor-fix regression (gap-scan) */
     RUN_TEST(test_regtest_channel_unilateral);
     RUN_TEST(test_regtest_channel_penalty);
     RUN_TEST(test_regtest_htlc_success);
