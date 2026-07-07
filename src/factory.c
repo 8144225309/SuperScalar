@@ -415,49 +415,47 @@ static int set_leaf_l_stock_output(factory_t *f, factory_node_t *node,
    Called by factory_advance() after counter advance.
    L-stock is always the last output of a leaf node. */
 static int update_l_stock_outputs(factory_t *f) {
-    if (getenv("SS_DEBUG_TIERB_POISON"))
-        printf("ULSO entry: has_shachain=%d n_nodes=%zu\n",
-               f->has_shachain, f->n_nodes);
+    /* Tier-B poison snapshot (#105): capture each leaf's SUPERSEDED state BEFORE any
+       mutation, INDEPENDENT of has_shachain.  The legacy key-path L-stock poison has no
+       hashlock rotation (has_shachain=0 -> early return below), but the epoch-boundary
+       ceremony still needs the old {txid, L-stock vout/amount, chain amount/SPK} to arm a
+       poison spending the superseded output.  For the hashlock poison this ALSO runs
+       before the rotation loop re-commits the new hash, so prev_epoch_l_hash is H_old.
+       Without this the ceremony's had_old was dead and the wt watch inert. */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->type != NODE_STATE || node->n_children > 0) continue;
+        if (node->n_outputs < 2) continue;
+        int pe_anchor = (node->n_outputs >= 1 &&
+            node->outputs[node->n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
+            memcmp(node->outputs[node->n_outputs - 1].script_pubkey, P2A_SPK,
+                   P2A_SPK_LEN) == 0) ? 1 : 0;
+        size_t pe_l = node->n_outputs - 1 - (size_t)pe_anchor;
+        node->prev_epoch_valid = (node->is_signed && node->signed_tx.len > 0) ? 1 : 0;
+        memcpy(node->prev_epoch_txid, node->txid, 32);
+        node->prev_epoch_l_vout = (uint32_t)pe_l;
+        node->prev_epoch_l_amount = node->outputs[pe_l].amount_sats;
+        node->prev_epoch_has_l_hash = node->has_l_stock_hash;
+        memcpy(node->prev_epoch_l_hash, node->l_stock_hash, 32);
+        node->prev_epoch_chain_amount = node->outputs[0].amount_sats;
+        node->prev_epoch_chain_spk_len = node->outputs[0].script_pubkey_len > 34
+            ? 34 : node->outputs[0].script_pubkey_len;
+        memcpy(node->prev_epoch_chain_spk, node->outputs[0].script_pubkey,
+               node->prev_epoch_chain_spk_len);
+        node->prev_epoch_csv_delay = (uint32_t)(node->nsequence & 0xFFFFu);
+    }
+
     if (!f->has_shachain)
-        return 1;  /* nothing to update */
+        return 1;  /* no hashlock rotation for the legacy key-path L-stock */
 
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
-        if (getenv("SS_DEBUG_TIERB_POISON"))
-            printf("ULSO node %zu: type=%d nch=%zu nout=%d is_signed=%d\n",
-                   i, (int)node->type, node->n_children, (int)node->n_outputs,
-                   node->is_signed);
         /* Leaf state nodes: type == STATE and no children */
         if (node->type != NODE_STATE || node->n_children > 0)
             continue;
 
         if (node->n_outputs < 2)
             continue;
-
-        /* Tier-B poison fix (gap-scan #105): snapshot the SUPERSEDED state BEFORE the
-           counter bump + hash re-commit below rewrite it (and before the caller's
-           build_all_unsigned_txs overwrites node->txid).  lsp_run_state_advance_stateless
-           reads these prev_epoch_* to arm the L-stock poison against the OLD output --
-           without them it read the already-rebuilt node (dead had_old, inert watch). */
-        {
-            int pe_anchor = (node->n_outputs >= 1 &&
-                node->outputs[node->n_outputs - 1].script_pubkey_len == P2A_SPK_LEN &&
-                memcmp(node->outputs[node->n_outputs - 1].script_pubkey, P2A_SPK,
-                       P2A_SPK_LEN) == 0) ? 1 : 0;
-            size_t pe_l = node->n_outputs - 1 - (size_t)pe_anchor;
-            node->prev_epoch_valid = (node->is_signed && node->signed_tx.len > 0) ? 1 : 0;
-            memcpy(node->prev_epoch_txid, node->txid, 32);
-            node->prev_epoch_l_vout = (uint32_t)pe_l;
-            node->prev_epoch_l_amount = node->outputs[pe_l].amount_sats;
-            node->prev_epoch_has_l_hash = node->has_l_stock_hash;
-            memcpy(node->prev_epoch_l_hash, node->l_stock_hash, 32);
-            node->prev_epoch_chain_amount = node->outputs[0].amount_sats;
-            node->prev_epoch_chain_spk_len = node->outputs[0].script_pubkey_len > 34
-                ? 34 : node->outputs[0].script_pubkey_len;
-            memcpy(node->prev_epoch_chain_spk, node->outputs[0].script_pubkey,
-                   node->prev_epoch_chain_spk_len);
-            node->prev_epoch_csv_delay = (uint32_t)(node->nsequence & 0xFFFFu);
-        }
 
         /* #53-B: this leaf's L-stock state is advancing — bump its per-leaf
            counter and re-commit the NEW state's hash before rebuilding the SPK.
