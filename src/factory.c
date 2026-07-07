@@ -415,11 +415,18 @@ static int set_leaf_l_stock_output(factory_t *f, factory_node_t *node,
    Called by factory_advance() after counter advance.
    L-stock is always the last output of a leaf node. */
 static int update_l_stock_outputs(factory_t *f) {
+    if (getenv("SS_DEBUG_TIERB_POISON"))
+        printf("ULSO entry: has_shachain=%d n_nodes=%zu\n",
+               f->has_shachain, f->n_nodes);
     if (!f->has_shachain)
         return 1;  /* nothing to update */
 
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
+        if (getenv("SS_DEBUG_TIERB_POISON"))
+            printf("ULSO node %zu: type=%d nch=%zu nout=%d is_signed=%d\n",
+                   i, (int)node->type, node->n_children, (int)node->n_outputs,
+                   node->is_signed);
         /* Leaf state nodes: type == STATE and no children */
         if (node->type != NODE_STATE || node->n_children > 0)
             continue;
