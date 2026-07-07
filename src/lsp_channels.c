@@ -2232,7 +2232,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         if (getenv("SS_DEBUG_TIERB_POISON"))
             printf("TIERB-DBG node %zu: type=%d n_children=%d is_ps=%d prev_valid=%d "
                    "l_amt=%llu l_vout=%u has_hash=%d wt=%d\n",
-                   affected[k], an->type, an->n_children, an->is_ps_leaf, had_old,
+                   affected[k], (int)an->type, (int)an->n_children,
+                   (int)an->is_ps_leaf, had_old,
                    (unsigned long long)poison_old_l_amount[k], an->prev_epoch_l_vout,
                    an->prev_epoch_has_l_hash, mgr->watchtower ? 1 : 0);
         /* chain output (vout=0) snapshot for wt_db, from prev_epoch. */
