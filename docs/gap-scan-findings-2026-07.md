@@ -29,28 +29,25 @@ key-leak, or fund-theft gap.** One HIGH *robustness* gap + one real bug were fou
 
 ## DOCUMENTED (deterrent-gaps / design boundaries — pre-mainnet, not tag-blocking)
 
-- **MED — Tier-B rollover L-stock poison-arming is dead code.** In
-  `lsp_run_state_advance_stateless` (lsp_channels.c), `affected[]` skips `is_signed` nodes
-  (:2111), so `had_old = (an->is_signed && ...)` (:2195) is **always false** → the
-  epoch-boundary superseded state gets no freshly-armed L-stock poison; the wt_db watch is
-  inert. **Not principal loss** — client channel funds are PD-penalty-covered independently;
-  this only affects the *deterrent* (burn/redistribute the LSP's own L-stock) for the
-  epoch-boundary state, and the DW timelock override still applies. Distinct from the
-  leaf-advance poison, which IS armed + proven firing (#37, on-chain). **Fix spec (traced
-  end-to-end):** the bug is deeper than the `had_old` gate — the entire per-affected-node
-  snapshot at lsp_channels.c:2223-2243 reads the ALREADY-REBUILT node (txid @2225, L-stock
-  amount @2233, chain amount/SPK @2237-2243), because `factory_advance_*` calls
-  `update_l_stock_outputs` (rewrites the L-stock SPK) then `build_all_unsigned_txs`
-  (overwrites `node->txid`, factory.c:569) BEFORE the caller `lsp_run_state_advance_stateless`
-  runs. So a valid poison spending the OLD L-stock output cannot be assembled from what's
-  left. Fix = have factory.c snapshot each node's old {txid, L-stock vout+amount+SPK, chain
-  amount+SPK} into `prev_epoch_*` fields BEFORE `update_l_stock_outputs`/`build_all_unsigned_txs`
-  overwrite them, at ALL FOUR advance paths (factory.c:2546/2593/2617/2699), then have the
-  ceremony read `prev_epoch_*` (mirrors how the leaf path snapshots pre-advance at
-  lsp_channels.c:1382-1418); add a fail-closed abort like the leaf advance (lsp_channels.c:1840).
-  A careful core-rollover restructure (high blast radius, 4 paths) needing a NEW Tier-B-boundary
-  poison regression (the existing rollover test exercises the leaf poison, not the epoch
-  boundary). Deferred as a focused follow-up rather than rushed — deterrent-only, not fund-safety.
+- **MED — Tier-B rollover L-stock poison-arming was dead code — FIXED + PROVEN
+  (branch gapscan-tierb-poison).** In `lsp_run_state_advance_stateless`, `had_old =
+  (an->is_signed && ...)` was **always false**: by the time the ceremony runs,
+  `factory_advance_*` has already called `update_l_stock_outputs` + `build_all_unsigned_txs`,
+  so every affected node is the NEW rebuilt+unsigned state (is_signed=0, new txid/hash). The
+  epoch-boundary superseded state therefore got no freshly-armed L-stock poison (inert watch).
+  **Not principal loss** — client funds are PD-penalty-covered independently; this is the
+  *deterrent* (burn/redistribute the LSP's own L-stock) for the boundary state, and the DW
+  timelock override still applies. **Fix:** `update_l_stock_outputs` now snapshots each leaf's
+  `{txid, L-stock vout/amount/SPK, chain amount/SPK, H_old, valid}` into `prev_epoch_*` fields
+  BEFORE the rebuild — crucially **above** its `has_shachain` early-return, so it also covers
+  the *legacy key-path* poison. (That gate was the real root cause: the first attempt placed the
+  snapshot below it, and cheat_daemon_rollover runs with `has_shachain=0`, so the snapshot never
+  executed.) The ceremony reads `prev_epoch_*`, using `had_old = prev_epoch_valid` and passing
+  `H_old` as `override_hash32`. **PROVEN** via a with/without differential on
+  `cheat_daemon_rollover`: **0 boundary poisons armed before → 2 after** (leaf nodes 3+5,
+  2499340-sat L-stock each), now asserted permanently in that test; `tier_b_rollover_ps` +
+  units green (no regression). Fail-closed-abort hardening (mirror the leaf-advance
+  "no revoke without recourse") left as a documented follow-up — behavior change, deterrent-only.
 - **MED — leaf L-stock poison not mirrored to wt.db — LEAF-ADVANCE FIXED + PROVEN (branch gapscan-meds).**
   `lsp_channels.c:1924` (leaf-advance) mirrored only `signed_tx` (chain[N]), not the co-signed
   poison. Unlike the sub-factory (chain[N] orphans `-25`, so the poison *replaces* it `:4199`),
