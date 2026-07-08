@@ -19,6 +19,18 @@ Mass-exit / unilateral self-exit; keyless P2A anchors present + spendable for fe
 | `ecac2791a686e821c5ecb60560cbe8c62ebaca4bb99174c9f9caebcc7d3a6ab7` | anchored force-close #2 (P2A) — PROOF 1 | 312266 | 167 |
 | `4648fc2e7c122f227109eac285d804fa6d374832a7fabfb6e20359a7ae12d700` | CPFP child spending a P2A anchor — PROOF 2 | 312267 | 153 |
 
+## Exhibition B-legible — N=8 arity-2 PS-k=2 mid-schedule force-close cascade (PASS)
+The teaching-shaped legible exit: full cascade (kickoff → state → PS-leaf → close), **every force-close node carrying a P2A anchor**. Base force-close height **312339**; the CSV(144)-gated leaf/commitment sweep can only confirm at/after **height 312483** — the confirmation-height delta (144 blocks) is the on-chain proof of the timelock (sweep captured on a later pass).
+
+| txid | role | height | vsize | P2A |
+|---|---|---|---|---|
+| `2d054df38cecbec834c5c1ac3640faa7f981f86bf75700262c0717c0724b1839` | factory funding | 312339 | 269 | — |
+| `2b10e8d168c1f5af7963284116f832a2526f8b8415a9d4ca83a671ee9ff49961` | force-close cascade node | 312340 | 124 | P2A |
+| `1d96af3add57e8507a92b56215eea004c29a4783545c40948fbaa92e1fcd77ed` | force-close cascade node | 312342 | 167 | P2A |
+| `cba7274f26b6c88b08af84b9dfe71933da8e5d563404aa9520339e0992e68b05` | force-close cascade node | 312343 | 124 | P2A |
+| `b2f953974b6f20438cd29e57d7f4da926f7ca3452034ad3e877afbd6d884dba7` | force-close cascade node | 312345 | 167 | P2A |
+| `b2c97bbeb9f02bbecbed09c40ba6d4e65b8918b32e8d95baee3afb251ce342ed` | force-close cascade node | 312346 | 124 | P2A |
+
 ## Exhibition C — cheat → revealed-secret poison → redistribution (PASS)
 LSP broadcasts a stale sub-state (theft); client recourse assembles the revealed-secret
 poison and redistributes the sales-stock to clients (punishment).
