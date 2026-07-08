@@ -3,9 +3,11 @@
 All transactions are on **real signet**, built by **v0.2.0** (`main` @ `3c75c39`), at
 **0.1 sat/vB**. View any txid at `https://mempool.space/signet/tx/<txid>`.
 
-Status: **B (force-close) and C (cheat→poison) complete + PASS.** A's realistic factory
-lifecycle (LSP-side liquidity, no free sats) is on-chain; A's real-payment bridge layer
-hit an inbound integration bug (documented below) and is deferred.
+Status: **B (force-close) and C (cheat→poison) complete + PASS.** A (127-client flagship)
+is **running with real payments** — the earlier inbound "bug" turned out to be a harness
+stdout-pollution bug (fixed; real inbound proven end-to-end in Stage 0d, `in ok` ×3). A is
+soaking 24 h then cooperatively closes; its real-payment + close txids append here as they land.
+A second legible force-close (N=8, arity-2, PS-k=2) is running in parallel for the measured-exit numbers.
 
 ## Exhibition B — force-close cascade + P2A anchors + CPFP (PASS)
 Mass-exit / unilateral self-exit; keyless P2A anchors present + spendable for fee-bumping.
@@ -55,10 +57,11 @@ cooperative close both at 0.1 sat/vB. (Real client payments require the bridge �
 | `877800c08f3ddf51a30cac22b99d1072adbbb2e18379ceeadae41253a9288f8c` | cooperative close | 312255 | 111 |
 
 ## Notes
-- **A bridge inbound (deferred):** the vanilla→plugin channel + routing are proven (plain
-  and cltv=80 invoices pay `complete`); the SS invoice fails in the
-  `cln_plugin.py htlc_accepted → bridge → LSP → client` forward. Factory lifecycle above
-  is A's on-chain footprint; the real-payment layer needs a dedicated full-stack debug.
+- **A bridge inbound (RESOLVED):** the earlier failure was a harness bug — `get_bolt11`
+  printed log text to stdout, which was captured into the bolt11 string (`Invalid bolt11:
+  Bad bech32 string`); fixed by routing logs to stderr. Real inbound is now proven
+  end-to-end (Stage 0d: `in ok` ×3, plus real outbound + client-to-client + close). The
+  127-client flagship runs on this path.
 - **Recovery seeds** (strong keys): B `/tmp/ss_signet_seed_feewave.txt`, C
   `/tmp/ss_signet_seed_hashsub.txt`, A/0b/0c stage seeds. B's force-close outputs are
   CSV(144)-gated (~24 h) before sweep; C's poison per-client P2TR outputs are sweepable now.
