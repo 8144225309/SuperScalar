@@ -45,7 +45,15 @@ poison and redistributes the sales-stock to clients (punishment).
 
 ## Flagship A — realistic factory lifecycle (LSP-side liquidity, no free sats)
 No `--lsp-balance-pct`, no `--demo`: LSP holds all capacity, clients start at 0. Funding +
-cooperative close both at 0.1 sat/vB. (Real client payments require the bridge — see notes.)
+cooperative close both at 0.1 sat/vB.
+
+**A2 — the 127-client flagship (design maximum), running now:** LSP + 127 clients, 15M sat, no free sats. Real inbound payments flow from the vanilla (non-bLIP56) node through the bridge into factory clients (8+ `in ok` in the soak so far; the moves are Lightning HTLCs that settle off-chain, so A2's on-chain footprint is the funding + the eventual coop close). Now in a 24 h soak with periodic real activity, then a cooperative close.
+
+| txid | role | height | vsize |
+|---|---|---|---|
+| `143471b5d1ddc0eee3ea54d74ed17081f24d48f429bb826723c8b0897e55c0e6` | **127-client factory funding** (real payments; soaking → coop close pending) | 312349 | — |
+
+Earlier smaller runs (preliminary lifecycle validation):
 
 | txid | role | height | vsize |
 |---|---|---|---|
