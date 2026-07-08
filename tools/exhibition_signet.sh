@@ -191,7 +191,7 @@ pay_in(){  # $1 client $2 SATS  (vanilla pays -> client earns balance)
   local msat=$(( $2 * 1000 ))
   local b; b=$(get_bolt11 "$1" "$msat") || { red "no invoice for c$1"; return 1; }
   info "INBOUND: vanilla pays $2 sat -> client $1"
-  $LCLI_VANILLA pay "$b" >/dev/null 2>&1 && green "  in ok" || red "  in FAILED"
+  $LCLI_VANILLA pay "$b" > "$WORKDIR/payin_${1}.json" 2>&1 && green "  in ok" || { red "  in FAILED:"; head -c 320 "$WORKDIR/payin_${1}.json" | tr "\n" " "; echo; }
 }
 pay_out(){  # $1 client $2 SATS  (client -> vanilla)
   local msat=$(( $2 * 1000 ))
