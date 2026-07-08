@@ -86,7 +86,7 @@ With `--step-blocks 5 --states-per-layer 2` at ~10 min/block:
 |---|-----------|--------|----------|
 | 1 | Cooperative close | ~6 | ~1 hour |
 | 2 | Full DW tree (force close) | ~30 | ~5 hours |
-| 3 | L-stock burn | ~35 | ~6 hours |
+| 3 | L-stock poison (recourse) | ~35 | ~6 hours |
 | 4 | BOLT11 bridge payment | ~6 | ~1 hour |
 | 5 | Factory rotation | ~12 | ~2 hours |
 | 6 | DW advance + force close | ~40 | ~7 hours |
@@ -106,7 +106,7 @@ With `--step-blocks 5 --states-per-layer 2` at ~10 min/block:
 |---|-----------|-------------------|
 | 1 | Cooperative close | Single close TX spending funding output (key-path Taproot) |
 | 2 | Full DW tree | Complete kickoff + state node chain with BIP68 nSequence timelocks |
-| 3 | L-stock burn | Shachain-preimage reveal burning old state commitment |
+| 3 | L-stock poison (recourse) | Revealed-secret poison redistributes the LSP's over-claimed L-stock to clients on cheat detection (canonical #53 / t/1242 design; supersedes the older t/1143 OP_RETURN burn — see `docs/poison-tx.md`) |
 | 4 | BOLT11 bridge | HTLC routed: CLN-B -> CLN-A -> bridge -> factory client |
 | 5 | Rotation | Old factory close + new factory fund in one atomic flow |
 | 6 | DW advance | Re-signed tree with decremented nSequence values |
@@ -133,7 +133,7 @@ python3 tools/inspect_factory.py \
   --rpcuser $SS_RPCUSER --rpcpassword $SS_RPCPASS
 ```
 
-The inspector classifies each TX (funding, kickoff, state, leaf, close, burn, penalty, distribution), shows witness types, nSequence/nLockTime interpretation, and fee analysis.
+The inspector classifies each TX (funding, kickoff, state, leaf, close, poison/burn, penalty, distribution), shows witness types, nSequence/nLockTime interpretation, and fee analysis.
 
 ---
 
