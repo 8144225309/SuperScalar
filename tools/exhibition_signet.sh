@@ -123,7 +123,7 @@ launch_lsp(){  # $1 = fee rate
     --clients "$N_CLIENTS" --arity "$ARITY" --amount "$AMOUNT" \
     --active-blocks 500 --dying-blocks 100 --step-blocks 5 --states-per-layer 2 \
     --fee-rate "$1" --confirm-timeout 86400 \
-    --max-conn-rate 400 --max-handshakes 80 \
+    --max-conn-rate 1000 --max-handshakes 256 \
     --seckey "$LSP_SECKEY" \
     --rpcuser signetrpc --rpcpassword "$SIGNET_RPCPASS" --rpcport 38332 \
     --wallet "$WALLET" --db "$LSP_DB" \
