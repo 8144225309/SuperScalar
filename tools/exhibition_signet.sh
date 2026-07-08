@@ -56,9 +56,11 @@ MANIFEST="$WORKDIR/manifest.tsv"
 : > "$MANIFEST"
 LSP_FIFO="$WORKDIR/lsp_cmd"
 
-info(){ printf '\033[36m[exhib]\033[0m %s\n' "$*"; }
-green(){ printf '\033[32m%s\033[0m\n' "$*"; }
-red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+# Log to STDERR so command substitutions ($(get_bolt11 ...)) capture ONLY data,
+# not log text (the "Bad bech32 string" bug: cli/info printed into the captured bolt11).
+info(){ printf '\033[36m[exhib]\033[0m %s\n' "$*" >&2; }
+green(){ printf '\033[32m%s\033[0m\n' "$*" >&2; }
+red(){ printf '\033[31m%s\033[0m\n' "$*" >&2; }
 
 PIDS=()
 cleanup(){
