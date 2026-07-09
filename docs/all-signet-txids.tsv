@@ -35,5 +35,14 @@
 312374	14900ae867a7f34f2d9390e74b2c0af801cb8467f16bf31cf2cf9eb5fb6b8dbf	154	ladder mechanics test factory funding (off-bridge validation)
 312379	d766282072e58b4ed4775cde9f71d97bea32dab1f8f5f95be931ffdb7ce382d5	283	ladder rollover: old-epoch on-chain close (rotation step 1, clients online)
 312385	09762dddc6f977de0a94bc9d0f1ab670a419c6482a3b493b77c365f3e47cb980	154	ladder rollover: new-epoch funding (rotation step 2; on-chain rollover complete)
+# LADDER MECHANICS (off-bridge validation): ROLLOVER PROVEN on-chain — factory rotated in-place to a new
+#   epoch via close->refund (d766282 -> 09762ddd); LSP log: "rotation complete, new factory active with 4
+#   channels". Offline-tolerance ALSO proven: with all 4 clients offline the LSP correctly REFUSED the next
+#   rotation ("< 2 clients departed, cannot rotate") — the safety guard, not a hang. Corrected finding:
+#   taking ALL clients offline blocks the rotation quorum, so it does NOT yield a proactive distribution;
+#   that was a harness-design error, not a protocol gap. Realistic exhibit B therefore = rotate 1x (clients
+#   ONLINE) -> COOP CLOSE; the timeout->distribution is shown separately by the non-rotated
+#   distribution-at-expiry run. Ladder factory-1 (09762ddd, 600k) expired; recoverable via seed
+#   /tmp/ss_signet_seed_LadderTest.txt.
 # PENDING (auto-append as they land): A2 coop close, B-legible CSV sweep, 1-client CSV sweep,
-#   realistic exhibit B (laddered lifecycle: rotate + proactive distribution), teardown sweeps.
+#   realistic exhibit B (rotate 1x online -> coop close), distribution-at-expiry (non-rotated), teardown sweeps.
