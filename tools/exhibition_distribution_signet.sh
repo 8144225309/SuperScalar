@@ -13,7 +13,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-/root/SuperScalar/build-release}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"; CLIENT_BIN="$BUILD_DIR/superscalar_client"
-N_CLIENTS="${N_CLIENTS:-2}"; ARITY="${ARITY:-2}"; AMOUNT="${AMOUNT:-300000}"; FEE_RATE="${FEE_RATE:-100}"
+N_CLIENTS="${N_CLIENTS:-8}"; ARITY="${ARITY:-2}"; AMOUNT="${AMOUNT:-800000}"; FEE_RATE="${FEE_RATE:-100}"
 LSP_PORT="${LSP_PORT:-29980}"; WALLET="${WALLET:-ss_sig_n127}"
 DIST_SHORT="${DIST_SHORT:-24}"           # blocks from now until factory expiry (~4h @ 10min)
 CONFIRM_TIMEOUT="${CONFIRM_TIMEOUT:-36000}"   # 10h: covers the ~4h wait + confirmations
@@ -45,7 +45,7 @@ pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null || true; sleep 1
     --port $LSP_PORT --clients $N_CLIENTS --arity $ARITY \
     --step-blocks 1 --states-per-layer 2 --static-near-root 1 \
     --active-blocks $((DIST_SHORT/2)) --dying-blocks $((DIST_SHORT/2)) \
-    --cltv-timeout $CLTV --amount $AMOUNT --fee-rate $FEE_RATE \
+    --cltv-timeout $CLTV --amount $AMOUNT --fee-rate $FEE_RATE --lsp-balance-pct 50 \
     --confirm-timeout $CONFIRM_TIMEOUT --seckey "$LSP_SECKEY" --wallet "$WALLET" \
     --db "$LSP_DB" --demo --test-distrib > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
