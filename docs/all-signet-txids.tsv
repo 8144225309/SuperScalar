@@ -34,5 +34,6 @@
 312369	a28bb6f7de7949fe0aaacdbc561f09970592e4b35c3585c4f41d0f7f3b56a223	167	1-client exit force-close/commitment (P2A @1sat/vB) base h312366 CSV maturity h312510
 312374	14900ae867a7f34f2d9390e74b2c0af801cb8467f16bf31cf2cf9eb5fb6b8dbf	154	ladder mechanics test factory funding (off-bridge validation)
 312379	d766282072e58b4ed4775cde9f71d97bea32dab1f8f5f95be931ffdb7ce382d5	283	ladder rollover: old-epoch on-chain close (rotation step 1, clients online)
+312385	09762dddc6f977de0a94bc9d0f1ab670a419c6482a3b493b77c365f3e47cb980	154	ladder rollover: new-epoch funding (rotation step 2; on-chain rollover complete)
 # PENDING (auto-append as they land): A2 coop close, B-legible CSV sweep, 1-client CSV sweep,
 #   realistic exhibit B (laddered lifecycle: rotate + proactive distribution), teardown sweeps.
