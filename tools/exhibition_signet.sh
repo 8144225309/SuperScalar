@@ -121,7 +121,7 @@ launch_lsp(){  # $1 = fee rate
   stdbuf -oL "$LSP_BIN" --daemon --cli --clnbridge \
     --network signet --port "$PORT" \
     --clients "$N_CLIENTS" --arity "$ARITY" --amount "$AMOUNT" \
-    --active-blocks 500 --dying-blocks 100 --step-blocks 5 --states-per-layer 2 \
+    --active-blocks "${ACTIVE_BLOCKS:-500}" --dying-blocks "${DYING_BLOCKS:-100}" --step-blocks "${STEP_BLOCKS:-5}" --states-per-layer 2 ${CLTV_FLAGS:-} \
     --fee-rate "$1" --confirm-timeout 86400 \
     --max-conn-rate 1000 --max-handshakes 256 \
     --seckey "$LSP_SECKEY" \
@@ -130,6 +130,14 @@ launch_lsp(){  # $1 = fee rate
     < "$LSP_FIFO" > "$LSP_LOG" 2>&1 &
   LSP_PID=$!; PIDS+=("$LSP_PID")
 }
+EXPIRY_CLTV_BLOCKS="${EXPIRY_CLTV_BLOCKS:-0}"; CLTV_FLAGS=""; EXPIRY_H=0
+if [ "$EXPIRY_CLTV_BLOCKS" -gt 0 ]; then
+  CUR=$($BCLI getblockcount)
+  EXPIRY_H=$((CUR + EXPIRY_CLTV_BLOCKS))
+  CLTV_FLAGS="--cltv-timeout $EXPIRY_H --static-near-root 1"
+  export STEP_BLOCKS=1 ACTIVE_BLOCKS=$((EXPIRY_CLTV_BLOCKS/2)) DYING_BLOCKS=$((EXPIRY_CLTV_BLOCKS/2))
+  info "EXPIRY MODE: factory CLTV=$EXPIRY_H (now $CUR + $EXPIRY_CLTV_BLOCKS); realistic earned balances -> distribution at expiry (no coop close)"
+fi
 info "launching LSP at fee $FEE_RATE sat/kvB (0.1 sat/vB)..."
 launch_lsp "$FEE_RATE"
 for i in $(seq 1 60); do grep -q "listening on port $PORT" "$LSP_LOG" 2>/dev/null && break
@@ -231,6 +239,32 @@ if [ "$SOAK_SECONDS" -gt 0 ]; then
     [ $((r % 10)) -eq 0 ] && cli "status"
     sleep 120
   done
+fi
+
+# ---- Distribution at expiry (realistic: pays each client its EARNED balance from the one UTXO) ----
+if [ "${EXPIRY_CLTV_BLOCKS:-0}" -gt 0 ]; then
+  info "EXPIRY MODE: waiting for factory to expire at height $EXPIRY_H; the LSP then auto-broadcasts the distribution TX paying each client its earned balance..."
+  DIST_TXID=""
+  for i in $(seq 1 4320); do
+    DIST_TXID=$(grep -aoE "distribution TX broadcast: [0-9a-f]{64}" "$LSP_LOG" 2>/dev/null | grep -oE "[0-9a-f]{64}" | head -1)
+    [ -z "$DIST_TXID" ] && DIST_TXID=$(sqlite3 "$LSP_DB" "SELECT txid FROM broadcast_log WHERE source LIKE '%distrib%' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+    [ -n "$DIST_TXID" ] && break
+    sleep 10; [ $((i % 30)) -eq 0 ] && info "  ...expiry wait; height $($BCLI getblockcount 2>/dev/null)/$EXPIRY_H"
+  done
+  [ -n "$DIST_TXID" ] || { red "FAIL: no distribution TX at expiry"; tail -40 "$LSP_LOG"; exit 1; }
+  manifest_add "$DIST_TXID" "distribution_at_expiry"
+  info "waiting for distribution confirmation..."
+  for i in $(seq 1 360); do
+    C=$($BCLI getrawtransaction "$DIST_TXID" 1 2>/dev/null | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('confirmations',0))
+except: print(0)" 2>/dev/null)
+    [ "${C:-0}" -ge 1 ] 2>/dev/null && { green "distribution confirmed: $DIST_TXID ($C confs)"; break; }
+    sleep 10; [ $((i % 6)) -eq 0 ] && info "  ...dist confirm wait $((i/6)) min"
+  done
+  manifest_add "$DIST_TXID" "distribution_at_expiry_confirmed"
+  echo "=== MANIFEST ($TAG) ==="; column -t "$MANIFEST" 2>/dev/null || cat "$MANIFEST"
+  green "=== distribution-at-expiry exhibition complete: $TAG — $DIST_TXID ==="
+  exit 0
 fi
 
 # ---- Cooperative close ----
