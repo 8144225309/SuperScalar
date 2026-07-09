@@ -1,0 +1,37 @@
+# ALL SuperScalar exhibition signet txids (v0.2.0, 0.1 or 1 sat/vB).
+# View any at https://mempool.space/signet/tx/<txid>
+# Auto-swept from every exhibit log; full 215-incl-historical sweep is /root/ALL_SIGNET_TXIDS.tsv on the VPS.
+# height	txid	vsize	role
+312254	69a85e4fae23823078d879a0241fe662059791cd75d9c6a549c2ff555f776252	165	validation stage0 factory funding
+312255	877800c08f3ddf51a30cac22b99d1072adbbb2e18379ceeadae41253a9288f8c	111	validation stage0 coop close
+312256	ab54835768a4a6aac3b4a748d91de39b0ead425ec13472b21ea0436a5e7bcddc	130	bridge: vanilla node funding (8M) ss_sig_n127->cln-exhib-v
+312257	02a0ffda2de68becc2dfa6ae664d438d4ea41c6f63f95c9fee3b7d91c163fd93	165	bridge: 7M announced channel cln-exhib-v->cln-exhib-p
+312259	56c0b669305ba14e648be4355a9f8cca542cc46bc187c738376e184b16ae56fa	165	A stage0b factory funding
+312261	88d40da71587f60fc4393ebd239196f08384cdfcf56119885f3e005595290f06	111	A stage0b coop close
+312264	c7ad28faecc4a754eb5e9f2bffd2430129d69b9c200c41a654ea56ebb1b09fac	154	B(feewave) factory funding (250k)
+312265	bee9cbf5c44ef951b521832a703c1ed34432878d080e0848534130b7aa9fa84a	124	B(feewave) anchored force-close (P2A 51024e73)
+312266	ae4e99a0601fd9db4fc26ee02ae928d1793ee770fbadd5741f5de25391705b4a	154	C sub-factory funding (200k)
+312266	ecac2791a686e821c5ecb60560cbe8c62ebaca4bb99174c9f9caebcc7d3a6ab7	167	B(feewave) anchored force-close #2 (P2A) PROOF1
+312267	4648fc2e7c122f227109eac285d804fa6d374832a7fabfb6e20359a7ae12d700	153	B(feewave) CPFP child spending a P2A anchor PROOF2
+312267	97ee1aa1e37f17dc3a315b63fab2aa78556d086cb0f624b0cfa6c932c8d09e49	124	C tree node 0
+312268	577d7e32da5a6b82c83ebbead50fbef0294a9d74154780203473b609ba53eaf0	197	C tree node 1
+312269	e82035f2b724c0c16225fada682af20684a91bc04aa62f59718a1a2e3c4a53a2	197	C LSP CHEAT: stale/superseded sub chain[N-1]
+312272	d2ae19cf39547b7eb69930ef8ad92e3d7f51e683b02cd8643a74d45640d4a4f0	198	C POISON recourse: 2-way redistribution 21085 sats
+312321	2cc23def19a5cfcba5311a1709edc2ac84d6bdffbf2afa5342419d470fa9d512	154	A stage0c factory funding (bridge-debug)
+312322	9b12f83aa44512bd5bdc0a16bd4bcbcc241a3ba1089bfad67c6d438ef68c1622	111	A stage0c coop close
+312329	74a908e5a832a8c7a797fda0cc5da8ce59ec28cabee2b28e55bdbf97fdc92b96	154	A stage0d factory funding (realistic-flow validation)
+312330	5aec01091f381f95805c277b2e7e32c6266cbdea4e3edd84a716e435f2be8cef	111	A stage0d coop close (realistic in/out proven)
+312332	017cfd8dbc2e78958d7dc1694348ec966a242fd7faa20cfe937f900e2382bd90	154	stage/validation run
+312339	2d054df38cecbec834c5c1ac3640faa7f981f86bf75700262c0717c0724b1839	269	B-legible (N=8) factory funding
+312340	2b10e8d168c1f5af7963284116f832a2526f8b8415a9d4ca83a671ee9ff49961	124	B-legible force-close node (P2A)
+312342	1d96af3add57e8507a92b56215eea004c29a4783545c40948fbaa92e1fcd77ed	167	B-legible force-close node (P2A)
+312343	cba7274f26b6c88b08af84b9dfe71933da8e5d563404aa9520339e0992e68b05	124	B-legible force-close node (P2A)
+312345	b2f953974b6f20438cd29e57d7f4da926f7ca3452034ad3e877afbd6d884dba7	167	B-legible force-close node (P2A)
+312346	b2c97bbeb9f02bbecbed09c40ba6d4e65b8918b32e8d95baee3afb251ce342ed	124	B-legible force-close node (P2A) base h312339 CSV maturity h312483
+312349	143471b5d1ddc0eee3ea54d74ed17081f24d48f429bb826723c8b0897e55c0e6	154	A2 127-CLIENT FLAGSHIP factory funding (real payments, soaking)
+312366	978f62f662eb1c8180f7c617b4e7ef6a1d30eaf8fb3fb281cc21550a03fdd053	154	1-client exit factory funding (1 sat/vB)
+312367	1fbc8f2f7b1fcf470a239c6c8f0f88ef6ab5794c226eb554e17b67b023be1ee4	124	1-client exit force-close node (P2A @1sat/vB)
+312369	a28bb6f7de7949fe0aaacdbc561f09970592e4b35c3585c4f41d0f7f3b56a223	167	1-client exit force-close/commitment (P2A @1sat/vB) base h312366 CSV maturity h312510
+312374	14900ae867a7f34f2d9390e74b2c0af801cb8467f16bf31cf2cf9eb5fb6b8dbf	154	ladder mechanics test factory funding (off-bridge validation)
+# PENDING (auto-append as they land): A2 coop close, B-legible CSV sweep, 1-client CSV sweep,
+#   realistic exhibit B (laddered lifecycle: rotate + proactive distribution), teardown sweeps.
