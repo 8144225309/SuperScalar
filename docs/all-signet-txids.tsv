@@ -44,5 +44,13 @@
 #   ONLINE) -> COOP CLOSE; the timeout->distribution is shown separately by the non-rotated
 #   distribution-at-expiry run. Ladder factory-1 (09762ddd, 600k) expired; recoverable via seed
 #   /tmp/ss_signet_seed_LadderTest.txt.
-# PENDING (auto-append as they land): A2 coop close, B-legible CSV sweep, 1-client CSV sweep,
-#   realistic exhibit B (rotate 1x online -> coop close), distribution-at-expiry (non-rotated), teardown sweeps.
+# A2 FLAGSHIP OUTCOME: 127-client factory FUNDED (143471b5) + carried 99 real routed payments over ~24h soak
+#   (headline PROVEN). Clean 127-way COOP-CLOSE FAILED — soak attrition 127->97 clients; N-of-N coop needs all,
+#   correctly fell back to force-close (honest liveness result, not a bug). 15M recovered instead via ONE
+#   128-of-128 MuSig aggregate key-path spend of the funding output (below) = MuSig2 at design-max on real chain.
+mempool	0ca6b929e2d7a52633b33d3a0a36f531d6230f49ffccbac7486977d745aa1056	162	A2 flagship: 128-of-128 MuSig aggregate spend of factory funding (15M recovery; coop-close failed on attrition)
+# TIMELOCK (144-block CSV) — proven from HEIGHTS, not a live sweep: B-legible cascade 312339 -> maturity 312483;
+#   1-client commitment a28bb6f7 @312369, 2x149560 sats CSV-locked, unspent thru window, unlocked h312510.
+#   (residual_sweep tool needs >=2 clients so 1-client isn't tool-reconstructable; N=8 B-legible seed was
+#   overwritten by a harness tag collision -> 1,197,800 sats stranded/unrecoverable — signet, replenishable.)
+# PENDING: distribution-at-expiry (soaking, tag exhib_8_2210483, CLTV h312533), feewave #104 recovery, teardown sweeps.
