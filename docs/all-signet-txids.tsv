@@ -59,4 +59,12 @@
 #   to beat a congested-signet setup window (harness fixes factory CLTV at LAUNCH height, so a slow funding ate
 #   the margin) — a test-rig quirk, not a protocol need. Fee/timing matters ONLY on adversarial recourse races
 #   (force-close/penalty/poison vs a CSV/CLTV) — cf #52/#56/#97, mainnet-track; not these cooperative exhibits.
-# PENDING: distribution-at-expiry TX (at h312543), 15M-recovery 0ca6b929 confirmation, feewave #104, teardown sweeps.
+312543	c116878091ce0f5d5aa1b812edd119fd1408b9308579eda3ea2836ca687f3af7	111	clean cooperative close at N=8 (DYING factory -> rotation Phase A PTLC key-turnover 8/8 cooperated -> Phase B coop-close); 1,997,267 sats home to ss_sig_n127 — the graceful close A2 could NOT give at 127 (attrition)
+# GRACEFUL END-OF-LIFE (learned on signet): when clients cooperate, a DYING factory ROTATES / cooperatively
+#   closes (the better outcome) rather than expiring. Proven at N=8 (c116878, 8/8 cooperated) + ladder rollover
+#   (d766282->09762ddd). DISTRIBUTION-AT-EXPIRY is the FALLBACK for when rotation can't complete (clients gone);
+#   the LSP correctly PREFERS rotation, so pure expiry-distribution doesn't fire with cooperative clients — it's
+#   the documented safety-net (code lsp_channels.c:7182 + regtest), not the default path. Earned balances were
+#   minimal in the short congested window so the close returned to the LSP wallet — the CEREMONY (8/8 turnover +
+#   coop-close) is the proof, not the split.
+# PENDING (teardown): feewave #104 recovery, bridge close 02a0ffda, sweep residuals, restart recover daemon, FINAL manifest.
