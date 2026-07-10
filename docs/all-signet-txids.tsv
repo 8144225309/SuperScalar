@@ -67,4 +67,5 @@
 #   the documented safety-net (code lsp_channels.c:7182 + regtest), not the default path. Earned balances were
 #   minimal in the short congested window so the close returned to the LSP wallet — the CEREMONY (8/8 turnover +
 #   coop-close) is the proof, not the split.
-# PENDING (teardown): feewave #104 recovery, bridge close 02a0ffda, sweep residuals, restart recover daemon, FINAL manifest.
+mempool	f7b936d8a37fdbdffa386b27d8a0b45a9b7f1d1f14189faa594fbc6b06c0e76d	111	TEARDOWN: LadderTest 600k residual recovered (patched 128-cap tool, N=4 factory-funding root -> ss_sig_n127)
+# PENDING (teardown): feewave #104 (ecac2791:1 leaf likely un-sweepable), first-stalled-dist 2M, bridge close 02a0ffda + wallet sweeps, restart recover daemon, FINAL manifest.
