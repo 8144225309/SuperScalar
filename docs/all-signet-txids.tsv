@@ -67,9 +67,9 @@
 #   the documented safety-net (code lsp_channels.c:7182 + regtest), not the default path. Earned balances were
 #   minimal in the short congested window so the close returned to the LSP wallet — the CEREMONY (8/8 turnover +
 #   coop-close) is the proof, not the split.
-mempool	f7b936d8a37fdbdffa386b27d8a0b45a9b7f1d1f14189faa594fbc6b06c0e76d	111	TEARDOWN: LadderTest 600k residual recovered (patched 128-cap tool, N=4 factory-funding root -> ss_sig_n127)
-mempool	2c6e7442b71ea77d24b323db62d776063f388569406655bbfaf3248efe85edb0	-	TEARDOWN: bridge channel close (cln-exhib-v<->p, 02a0ffda) — now ONCHAIN
-mempool	bb2dcc9481849352707851b2d608ad4a4db1e68f7e50e4111f50e4acf17e36b0	-	TEARDOWN: cln-exhib-v wallet swept -> ss_sig_n127
-mempool	c1a28a9fc00e355f0f1c4dc56199fbf7902fd5149ca92ede70d5d3dffc5cf5eb	-	TEARDOWN: cln-exhib-p wallet swept -> ss_sig_n127
-mempool	1bb788d273c12a81fb0d09f74f5819a8b71f4a21664d8648b8163565a8b00c37	111	TEARDOWN: first-stalled-dist 2M residual recovered (patched tool, N=8 funding root -> ss_sig_n127)
+312549	f7b936d8a37fdbdffa386b27d8a0b45a9b7f1d1f14189faa594fbc6b06c0e76d	111	TEARDOWN: LadderTest 600k residual recovered (patched 128-cap tool, N=4 factory-funding root -> ss_sig_n127)
+312552	2c6e7442b71ea77d24b323db62d776063f388569406655bbfaf3248efe85edb0	-	TEARDOWN: bridge channel close (cln-exhib-v<->p, 02a0ffda) — now ONCHAIN
+312554	bb2dcc9481849352707851b2d608ad4a4db1e68f7e50e4111f50e4acf17e36b0	-	TEARDOWN: cln-exhib-v wallet swept -> ss_sig_n127
+312554	c1a28a9fc00e355f0f1c4dc56199fbf7902fd5149ca92ede70d5d3dffc5cf5eb	-	TEARDOWN: cln-exhib-p wallet swept -> ss_sig_n127
+312554	1bb788d273c12a81fb0d09f74f5819a8b71f4a21664d8648b8163565a8b00c37	111	TEARDOWN: first-stalled-dist 2M residual recovered (patched tool, N=8 funding root -> ss_sig_n127)
 # PENDING (teardown): feewave #104 (ecac2791:1 leaf likely un-sweepable), hashsub residual, restart recover daemon, FINAL manifest.
