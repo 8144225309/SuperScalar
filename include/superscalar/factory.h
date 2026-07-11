@@ -198,6 +198,22 @@ typedef struct {
        state s's L-stock output was built. */
     uint32_t l_stock_state_counter;
 
+    /* Tier-B poison fix (gap-scan #105): snapshot of the SUPERSEDED state, captured in
+       update_l_stock_outputs BEFORE the counter bump + hash re-commit (and before
+       build_all_unsigned_txs overwrites node->txid).  The epoch-boundary ceremony
+       (lsp_run_state_advance_stateless) reads these to arm the L-stock poison against
+       the OLD output -- without them it read the already-rebuilt node (dead had_old). */
+    int prev_epoch_valid;                  /* the superseded state was signed */
+    unsigned char prev_epoch_txid[32];     /* internal byte order */
+    uint32_t prev_epoch_l_vout;            /* anchor-aware L-stock output index */
+    uint64_t prev_epoch_l_amount;
+    unsigned char prev_epoch_l_hash[32];   /* H_old for the poison override_hash32 */
+    int prev_epoch_has_l_hash;
+    uint64_t prev_epoch_chain_amount;
+    unsigned char prev_epoch_chain_spk[34];
+    size_t prev_epoch_chain_spk_len;
+    uint32_t prev_epoch_csv_delay;
+
     /* #53-B3a: script-path (Leaf-P) poison ceremony state.  When the leaf carries a
        hashlock (has_l_stock_hash), the multi-process poison ceremony signs the Leaf-P
        script path against the UNTWEAKED agg key (not the key path = Scenario B); the

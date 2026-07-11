@@ -2220,36 +2220,36 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         memset(lsp_poison_pubnonces_per_node[k], 0, 66);
         memset(lsp_poison_psigs_per_node[k], 0, 32);
         factory_node_t *an = &f->nodes[affected[k]];
-        int had_old = (an->is_signed && an->signed_tx.len > 0);
-        int old_no = an->n_outputs;
-        if (had_old) memcpy(poison_old_txid[k], an->txid, 32);
-        /* MEDIUM-2: use_tree_anchor appends a P2A anchor as the LAST output, so the
-           L-stock is the SECOND-to-last (mirror the leaf-advance fix ~line 1400).
-           Reading outputs[old_no-1] would grab the 240-sat anchor -> gate skips. */
-        int an_anchor = (old_no >= 2 &&
-            an->outputs[old_no - 1].script_pubkey_len == P2A_SPK_LEN &&
-            memcmp(an->outputs[old_no - 1].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
-        int an_l_vout = old_no - 1 - an_anchor;
-        poison_old_l_amount[k] = (an_l_vout >= 0 && (old_no - an_anchor) >= 2)
-            ? an->outputs[an_l_vout].amount_sats : 0;
-        /* Phase 1b.5: chain output (vout=0) snapshot for wt_db. */
+        /* Tier-B poison fix (#105): the node is now the NEW (rebuilt, unsigned) state --
+           an->is_signed==0 and an->outputs/txid are the new epoch's, so the old
+           `had_old = an->is_signed && ...` was ALWAYS false (dead poison-arming, inert
+           watch).  Read the prev_epoch_* snapshot update_l_stock_outputs took BEFORE the
+           rebuild, so the poison targets the SUPERSEDED L-stock output with H_old. */
+        int had_old = an->prev_epoch_valid;
+        int an_l_vout = (int)an->prev_epoch_l_vout;
+        if (had_old) memcpy(poison_old_txid[k], an->prev_epoch_txid, 32);
+        poison_old_l_amount[k] = had_old ? an->prev_epoch_l_amount : 0;
+        /* chain output (vout=0) snapshot for wt_db, from prev_epoch. */
         wt_had_old[k] = had_old;
-        wt_old_chain_amount[k] = (old_no >= 1) ? an->outputs[0].amount_sats : 0;
-        wt_old_chain_spk_len[k] = (old_no >= 1) ? an->outputs[0].script_pubkey_len : 0;
-        if (wt_old_chain_spk_len[k] > 34) wt_old_chain_spk_len[k] = 34;
-        if (old_no >= 1)
-            memcpy(wt_old_chain_spk[k],
-                   an->outputs[0].script_pubkey,
-                   wt_old_chain_spk_len[k]);
-        wt_old_csv_delay[k] = (uint32_t)(an->nsequence & 0xFFFFu);
-        if (mgr->watchtower && !an->is_ps_leaf && had_old && (old_no - an_anchor) >= 2 &&
+        wt_old_chain_amount[k] = an->prev_epoch_chain_amount;
+        wt_old_chain_spk_len[k] = an->prev_epoch_chain_spk_len > 34
+            ? 34 : an->prev_epoch_chain_spk_len;
+        if (wt_old_chain_spk_len[k] > 0)
+            memcpy(wt_old_chain_spk[k], an->prev_epoch_chain_spk, wt_old_chain_spk_len[k]);
+        wt_old_csv_delay[k] = an->prev_epoch_csv_delay;
+        if (mgr->watchtower && !an->is_ps_leaf && had_old &&
             poison_old_l_amount[k] > TIERB_POISON_FEE_SATS +
                 (uint64_t)(an->n_signers - 1) * 330u) {
             if (factory_session_prepare_poison_tx_leaf(
                     f, affected[k], poison_old_txid[k], (uint32_t)an_l_vout,
                     poison_old_l_amount[k], TIERB_POISON_FEE_SATS,
-                    NULL /* #53-B3b: capture per-node H_old when daemon hashlock on */)) {
+                    /* #53-B3b: H_old from the pre-advance snapshot so the poison targets
+                       the SUPERSEDED L-stock output (not the node's new hash). */
+                    an->prev_epoch_has_l_hash ? an->prev_epoch_l_hash : NULL)) {
                 poison_prepared[k] = 1;  /* init_node_poison after state init */
+                printf("LSP-stateless Tier B: L-stock poison ARMED for node %zu "
+                       "(superseded state, %llu-sat L-stock) [#105]\n",
+                       affected[k], (unsigned long long)poison_old_l_amount[k]);
             }
         }
     }

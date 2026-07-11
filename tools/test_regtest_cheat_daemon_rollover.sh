@@ -245,6 +245,16 @@ except Exception: print(0)")
     DEF_SATS=$(awk "BEGIN{printf \"%d\", ($V+0)*100000000}"); DEF_OK=1; DEF_TXID="$cand"; break
 done
 echo "  defense_confirmed_spending_revoked_state=$DEF_OK  txid=${DEF_TXID:-none}  redistributed=${DEF_SATS} sats"
+
+# Tier-B poison-arming regression (#105): the epoch-boundary superseded state must arm its
+# OWN L-stock poison inside lsp_run_state_advance_stateless.  This was dead code -- had_old
+# was always false because the prev_epoch snapshot ran AFTER update_l_stock_outputs' early
+# return on has_shachain (the legacy key-path poison runs with has_shachain=0).  Assert the
+# boundary ceremony armed >=1 poison so a regression back to the dead path is caught here.
+ARMED=$(grep -ac "L-stock poison ARMED for node" "$LSP_LOG" 2>/dev/null || echo 0)
+echo "  tier-B epoch-boundary poisons armed (#105): $ARMED"
+[ "${ARMED:-0}" -ge 1 ] || { echo "  FAIL (#105): epoch-boundary Tier-B ceremony armed NO L-stock poison -- dead-had_old regression is back"; exit 1; }
+
 if [ "$DEF_OK" -eq 1 ] && [ "${DEF_SATS:-0}" -ge 1000 ]; then
     echo "  PASS: rollover cheat fired -- the LSP broadcast the revoked old rollover state ($CHEAT_TXID) to"
     echo "        over-claim its L-stock; the recourse ($DEF_TXID) CONFIRMED on-chain, SPENDING the revoked"
