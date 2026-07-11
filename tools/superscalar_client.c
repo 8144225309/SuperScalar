@@ -2031,9 +2031,16 @@ handle_message:
             /* LSP confirms leaf advance — the signed tx is now finalized.
                Client's factory already has the correct unsigned tx from PROPOSE. */
             int leaf_side;
-            if (wire_parse_leaf_advance_done(msg.json, &leaf_side))
+            if (wire_parse_leaf_advance_done(msg.json, &leaf_side)) {
                 printf("Client %u: leaf %d advance confirmed by LSP\n",
                        my_index, leaf_side);
+                /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
+                   recovers the CURRENT leaf state, not the last-rotation snapshot.
+                   The factory already holds the advanced tx from the PROPOSE ceremony. */
+                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
+                    fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
+                            "leaf advance failed\n", my_index);
+            }
             cJSON_Delete(msg.json);
             break;
         }

@@ -60,10 +60,10 @@ key-leak, or fund-theft gap.** One HIGH *robustness* gap + one real bug were fou
   standalone WT confirms BOTH chain[N] AND the poison (2 responses from wt.db alone). CAVEAT: the
   cheat tests read BUILD_DIR from `$1` (default ASan `build/`) — validate with `build-release`
   as `$1` or rebuild `build/`, else you test a stale binary (feedback_cheat_test_build_dir).
-  **Realloc variant (:3366) REVERTED — code-ready follow-up:** identical pattern, but no suite
-  test has BOTH `--wt-db` AND a prepared realloc poison (cheat_realloc has the poison, no
-  `--wt-db`; watchtower_trustless has `--wt-db`, no realloc poison), so it can't be e2e-validated
-  now. Follow-up: add `--wt-db` + standalone WT to cheat_realloc, then re-apply the 2nd-watch mirror.
+  **Realloc variant (:3366) DONE (branch gapscan-wt-bundle):** the 2nd-watch mirror is re-applied,
+  and cheat_realloc now arms `--wt-db` and asserts the realloc poison REGISTERS in wt_db (validated).
+  The standalone-WT FIRING rides the same mechanism the leaf-advance path proved e2e (2 factory-node
+  watches on one parent both broadcast).
 - **LOW — WT completeness nuances.** (F4) force-close kind=3 is armed reactively (on a peer's
   BOLT ERROR), so a *pre-suppressed* LSP leaves no kind=3 row — pre-emptive arming would close
   it. (F5) `fee_bump_*` metadata is inert in every wt_db row; the WT only CPFPs if the
@@ -74,10 +74,11 @@ key-leak, or fund-theft gap.** One HIGH *robustness* gap + one real bug were fou
 - **LOW — client-side.** Client's own watchtower handles only revoked channel commitments (no
   reactive factory/sub-factory WT — offline clients lean on the LSP-populated wt.db or
   `--force-close`; canonical model is "each client runs its own WT", `pre-mainnet-design-decisions.md`).
-  Client revoked-commitment watch is armed with `NULL` PTLCs (superscalar_client.c:827) — main
-  penalty sweeps to_local, but a PTLC output on that commitment wouldn't be swept by the
-  client's WT. Client does not re-persist `tree_nodes` after intra-factory advances (a crash
-  recovers the last-rotation tree, not principal-affecting).
+  Client `tree_nodes` re-persist after intra-factory advances is now **DONE** (MSG_LEAF_ADVANCE_DONE
+  handler, branch gapscan-wt-bundle). **REMAINING (scoped, LOW):** (a) client revoked-commitment
+  watch armed with `NULL` PTLCs (superscalar_client.c:827) — narrow (the standalone WT already
+  covers PTLC breaches; needs client-side PTLC snapshot tracking); (b) F4 kind3 pre-emptive arming
+  — needs pre-signing the timeout sweep at commitment time (pre-suppressed-LSP edge case).
 
 ## Verified-solid (no gap)
 Poon-Dryja channel-penalty recourse is client-secret-complete, persisted, and enforced by a

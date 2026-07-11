@@ -36,6 +36,7 @@ BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 
 TMPDIR=$(mktemp -d /tmp/ss-cheat-realloc.XXXXXX)
 LSP_DB="$TMPDIR/lsp.db"
+WT_DB="$TMPDIR/wt.db"
 LSP_LOG="$TMPDIR/lsp.log"
 
 PIDS=()
@@ -47,6 +48,7 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do kill -9 "$pid" 2>/dev/null || true; done
     cp "$LSP_LOG" /tmp/cheat_realloc_last_lsp.log 2>/dev/null || true
     cp "$LSP_DB"  /tmp/cheat_realloc_last_lsp.db  2>/dev/null || true
+    cp "$WT_DB"   /tmp/cheat_realloc_last_wt.db   2>/dev/null || true
     for i in $(seq 0 $((N_CLIENTS - 1))); do
         cp "$TMPDIR/client_${i}.log" "/tmp/cheat_realloc_last_client_${i}.log" 2>/dev/null || true
     done
@@ -111,6 +113,7 @@ ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
     --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet ss_cheat_leaf_miner \
     --db "$LSP_DB" \
+    --wt-db "$WT_DB" \
     --demo --test-realloc --cheat-realloc \
     --lsp-balance-pct 50 \
     > "$LSP_LOG" 2>&1 &
@@ -236,6 +239,12 @@ except Exception: print("0 0 0")')
     echo "  #91 anchor guard OK: poison total ${PTOT} sats >> 240 (P2A anchor) — targeted the real L-stock"
     A2=$(pen_recovers_most "$PEN_TXID"); echo "  A-2 recovery ratio: $A2 (OK=outputs>=90% of swept inputs)"
     case "$A2" in LOW*) echo "  FAIL: penalty recovers <90% of swept value ($A2) — value leaked/burned to fee"; exit 1;; esac
+    # WT F2 (gap-scan): with --wt-db armed, the realloc L-stock poison must ALSO mirror
+    # to wt_db as a 2nd factory-node watch so a standalone WT can fire it (same proven
+    # mechanism as the leaf-advance path). Assert the mirror registered.
+    grep -q "registered realloc POISON" "$LSP_LOG" || { echo "  FAIL: WT F2 — realloc poison NOT mirrored to wt_db (registration missing)"; exit 1; }
+    WTN=$(sqlite3 "$WT_DB" "PRAGMA busy_timeout=10000; SELECT count(*) FROM wt_watches;" 2>/dev/null || echo 0)
+    echo "  WT F2 OK: realloc poison mirrored to wt_db (${WTN} total watches — chain[N] + poison)"
     echo "  PASS: WT detected breach (FACTORY BREACH x$BREACH_DETECTED) + CONFIRMED redistribution $PEN_TXID ($PNUM outs, min ${PMIN}, total ${PTOT} sats) — outcome verified per-client"
     grep -E "FACTORY BREACH|L-stock burn|response_tx|watchtower registered OLD" "$LSP_LOG" | head -10
     exit 0
