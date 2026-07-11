@@ -73,3 +73,6 @@
 312554	c1a28a9fc00e355f0f1c4dc56199fbf7902fd5149ca92ede70d5d3dffc5cf5eb	-	TEARDOWN: cln-exhib-p wallet swept -> ss_sig_n127
 312554	1bb788d273c12a81fb0d09f74f5819a8b71f4a21664d8648b8163565a8b00c37	111	TEARDOWN: first-stalled-dist 2M residual recovered (patched tool, N=8 funding root -> ss_sig_n127)
 # PENDING (teardown): feewave #104 (ecac2791:1 leaf likely un-sweepable), hashsub residual, restart recover daemon, FINAL manifest.
+312656	b9af5534460dcbc1a33c1df6b7049bab367b3bbd440131e97ed0fd58b70c7e0f	-	EXHIBIT: JIT-run factory funding (300k, JitExhib4 strong keys)
+312657	6d580835f2913e68924c943c73771893b8dc49e1844e3157663f7d87ce6f1988	111	EXHIBIT: JIT channel funding signet (2-of-2 LSP+client, 50k, id 0x8000, --test-jit) - CONFIRMED JIT works e2e
+312659	9f3e082943b4133261525d6e98137317535365c8f49f0535c4ae059ac9050997	-	EXHIBIT: distribution-at-expiry co-signed TX (cltv 312659, 167vB, 3 outs) - dist-fix PROVEN (was --test-distrib demo-key Invalid Schnorr)
