@@ -615,59 +615,82 @@
     if (test_distrib && channels_active) {
         printf("\n=== DISTRIBUTION TX TEST ===\n");
 
-        /* Build distribution TX with demo keypairs (LSP has all keys in demo).
-           Heap-allocate factory copy: factory_t is multi-MB at MAX_SIGNERS=128.
-           Shallow copy — shares tx_buf heap pointers with lsp_p->factory; treat
-           as read-only-but-for-keypairs and do not factory_free(). */
-        factory_t *df = (factory_t *)calloc(1, sizeof(factory_t));
-        if (!df) { lsp_cleanup(lsp_p); secp256k1_context_destroy(ctx); return 1; }
-        memcpy(df, &lsp_p->factory, sizeof(factory_t));
-        secp256k1_keypair dk[FACTORY_MAX_SIGNERS];
-        dk[0] = lsp_kp;
-        {
-            static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
-            for (int ci = 0; ci < n_clients; ci++) {
-                unsigned char ds[32];
-                memset(ds, fill[ci], 32);
-                if (!secp256k1_keypair_create(ctx, &dk[ci + 1], ds)) {
-                    fprintf(stderr, "DISTRIB TEST: keypair create failed\n");
-                    return 1;
+        /* Prefer the REAL multi-party co-signed distribution TX produced by the
+           factory-creation ceremony (lsp.c: factory_session_complete_dist sets
+           dist_tx_ready==2 and finalizes f->dist_signed_tx).  On daemon runs with
+           real client daemons (regtest OR signet) the funding output is the
+           strong-key N-of-N aggregate, so ONLY the ceremony's co-signed TX spends
+           it validly.  The demo-key rebuild below is a single-process fallback
+           (no real clients / no ceremony) and CANNOT spend a strong-key funding --
+           broadcasting it yields "mempool-script-verify-flag-failed (Invalid
+           Schnorr signature)". */
+        factory_t *df = NULL;
+        tx_buf_t dist_tx;
+        unsigned char dist_txid[32] = {0};
+
+        if (lsp_p->factory.dist_tx_ready == 2 &&
+            lsp_p->factory.dist_signed_tx.len > 0) {
+            tx_buf_init(&dist_tx, lsp_p->factory.dist_signed_tx.len);
+            memcpy(dist_tx.data, lsp_p->factory.dist_signed_tx.data,
+                   lsp_p->factory.dist_signed_tx.len);
+            dist_tx.len = lsp_p->factory.dist_signed_tx.len;
+            printf("Using co-signed distribution TX from creation ceremony "
+                   "(%zu bytes, dist_tx_ready=2)\n", dist_tx.len);
+        } else {
+            /* --- single-process demo fallback: rebuild + sign with demo keys
+               (LSP holds all keys in demo).  Heap-allocate factory copy:
+               factory_t is multi-MB at MAX_SIGNERS=128.  Shallow copy — shares
+               tx_buf heap pointers with lsp_p->factory; treat as
+               read-only-but-for-keypairs and do not factory_free(). --- */
+            df = (factory_t *)calloc(1, sizeof(factory_t));
+            if (!df) { lsp_cleanup(lsp_p); secp256k1_context_destroy(ctx); return 1; }
+            memcpy(df, &lsp_p->factory, sizeof(factory_t));
+            secp256k1_keypair dk[FACTORY_MAX_SIGNERS];
+            dk[0] = lsp_kp;
+            {
+                static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
+                for (int ci = 0; ci < n_clients; ci++) {
+                    unsigned char ds[32];
+                    memset(ds, fill[ci], 32);
+                    if (!secp256k1_keypair_create(ctx, &dk[ci + 1], ds)) {
+                        fprintf(stderr, "DISTRIB TEST: keypair create failed\n");
+                        free(df);
+                        return 1;
+                    }
                 }
             }
-        }
-        memcpy(df->keypairs, dk, n_total * sizeof(secp256k1_keypair));
+            memcpy(df->keypairs, dk, n_total * sizeof(secp256k1_keypair));
 
-        /* Equal-split outputs */
-        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS];
-        uint64_t dist_per = (df->funding_amount_sats - 500) / n_total;
-        for (size_t di = 0; di < n_total; di++) {
-            dist_outputs[di].amount_sats = dist_per;
-            /* Derive per-participant P2TR from their keypair */
-            secp256k1_pubkey di_pub;
-            secp256k1_keypair_pub(ctx, &di_pub, &dk[di]);
-            secp256k1_xonly_pubkey di_xonly;
-            secp256k1_xonly_pubkey_from_pubkey(ctx, &di_xonly, NULL, &di_pub);
-            build_p2tr_script_pubkey(dist_outputs[di].script_pubkey, &di_xonly);
-            dist_outputs[di].script_pubkey_len = 34;
-        }
-        dist_outputs[n_total - 1].amount_sats =
-            df->funding_amount_sats - 500 - dist_per * (n_total - 1);
+            /* Equal-split outputs */
+            tx_output_t dist_outputs[FACTORY_MAX_SIGNERS];
+            uint64_t dist_per = (df->funding_amount_sats - 500) / n_total;
+            for (size_t di = 0; di < n_total; di++) {
+                dist_outputs[di].amount_sats = dist_per;
+                /* Derive per-participant P2TR from their keypair */
+                secp256k1_pubkey di_pub;
+                secp256k1_keypair_pub(ctx, &di_pub, &dk[di]);
+                secp256k1_xonly_pubkey di_xonly;
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &di_xonly, NULL, &di_pub);
+                build_p2tr_script_pubkey(dist_outputs[di].script_pubkey, &di_xonly);
+                dist_outputs[di].script_pubkey_len = 34;
+            }
+            dist_outputs[n_total - 1].amount_sats =
+                df->funding_amount_sats - 500 - dist_per * (n_total - 1);
 
-        tx_buf_t dist_tx;
-        tx_buf_init(&dist_tx, 512);
-        unsigned char dist_txid[32];
-        if (!factory_build_distribution_tx(df, &dist_tx, dist_txid,
-                                             dist_outputs, n_total,
-                                             lsp_p->factory.cltv_timeout)) {
-            fprintf(stderr, "DISTRIBUTION TX TEST: build failed\n");
-            tx_buf_free(&dist_tx);
-            free(df);
-            lsp_cleanup(lsp_p);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+            tx_buf_init(&dist_tx, 512);
+            if (!factory_build_distribution_tx(df, &dist_tx, dist_txid,
+                                                 dist_outputs, n_total,
+                                                 lsp_p->factory.cltv_timeout)) {
+                fprintf(stderr, "DISTRIBUTION TX TEST: build failed\n");
+                tx_buf_free(&dist_tx);
+                free(df);
+                lsp_cleanup(lsp_p);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("Distribution TX built (%zu bytes)\n", dist_tx.len);
         }
-        printf("Distribution TX built (%zu bytes)\n", dist_tx.len);
 
         /* Store in ladder slot */
         lad->factories[0].distribution_tx = dist_tx;
@@ -702,7 +725,7 @@
         }
         ADVANCE(1);
 
-        printf("Distribution TX broadcast: %s\n", dt_txid_str);
+        printf("LSP: distribution TX broadcast: %s\n", dt_txid_str);
         printf("=== DISTRIBUTION TX TEST PASSED ===\n\n");
 
         report_add_string(&rpt, "result", "distrib_test_complete");
