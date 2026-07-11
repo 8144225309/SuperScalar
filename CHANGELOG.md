@@ -8,6 +8,17 @@ All notable changes to SuperScalar are documented here.
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
 
+### Gap-scan hardening wave (defense-in-depth; no theft/key-leak/fund-loss gap)
+
+A post-rc1 code read-through ("gap scan", `docs/gap-scan-findings-2026-07.md`) closed a set of robustness / recourse-completeness items. None affect fund safety:
+
+- **Client factory-tree verification + L-stock advance anchor-fix + at-rest/mainnet guards** (PR #434).
+- **WT F2 (leaf):** mirror the leaf L-stock poison to `wt.db` so a secret-less standalone watchtower fires both `chain[N]` and the poison (PR #435).
+- **Gap-scan regression tests:** anchor-fix guard + tree-verify efficacy, both proven (PR #436).
+- **WT completeness bundle:** realloc L-stock poison → `wt.db` + client `tree_nodes` re-persist after intra-factory leaf advances (PR #437).
+- **Tier-B rollover poison-arming:** fix dead `had_old` so the epoch-boundary L-stock deterrent actually arms (was silently inert; deterrent-only — client funds are covered independently by the channel penalty) (PR #438).
+- **Test-harness — distribution-at-expiry:** `--test-distrib` now broadcasts the real multi-party co-signed `dist_signed_tx` instead of a demo-key rebuild (which could not spend a strong-key funding → `Invalid Schnorr`); adds a regtest regression guard. Proven end-to-end on real signet (distribution-at-expiry `9f3e0829`) (PR #439).
+
 ### Trustless completion — five-layer recourse model (P1–P6)
 
 - **P1 — adversarial agg-sig drill:** a client refuses to co-sign a forged or corrupted L-stock poison aggregate signature instead of blindly co-signing it.
