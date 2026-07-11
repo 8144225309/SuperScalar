@@ -294,6 +294,20 @@ jobs:
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           bash tools/test_multiprocess_musig_n8.sh build
+      # Regression guard: --test-distrib must broadcast the REAL co-signed
+      # dist_signed_tx (dist_tx_ready==2), not a demo-key rebuild.  Runs real
+      # client daemons (keys 0x02/0x03 != the scaffold fill) so the demo-key
+      # path would produce Invalid Schnorr; asserts the co-signed path + a
+      # confirmed distribution txid.  Catches the class that only surfaced on
+      # signet (strong-key funding).
+      - name: Multi-process distribution co-signed-path regression (under ASan+LSan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
+          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_regtest_distribution.sh build
       - name: Stop bitcoind
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true
