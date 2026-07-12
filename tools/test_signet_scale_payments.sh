@@ -33,7 +33,7 @@ ARITY="${ARITY:-2,4,8}"
 STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-1}"
 # Funding scales with N so each channel is a realistic ~100k sats and stays
 # well above the fixed 5000-sat channel reserve at any client count.
-AMOUNT="${AMOUNT:-2750000}"
+AMOUNT="${AMOUNT:-$(( N_CLIENTS * 100000 ))}"
 FEE_RATE="${FEE_RATE:-1000}"   # sat/kvB; regtest mempool floor is generous
 PORT="${PORT:-9951}"
 WALLET="${WALLET:-ss_sig_n127}"
@@ -157,22 +157,30 @@ for i in $(seq 1 "$N_CLIENTS"); do
     esac
     nohup "$CLIENT_BIN" "${COMMON[@]}" "${EXTRA[@]}" \
         > "/tmp/ss_${TAG}_c${SK:0:8}.log" 2>&1 &
-    sleep 0.2
+    sleep "${STAGGER:-0.2}"
 done
 
 # Signet: no mining - blocks arrive from the signet signer (~10 min). The LSP
 # waits for natural funding + close confirmations via --confirm-timeout.
 MINER_PID=""
 
-# --- Wait for the LSP to finish (creation -> payments -> close) ---
-info "waiting for ceremony + payments + close (signet: up to ~1h over real blocks)..."
-DEADLINE=$(( $(date +%s) + 3600 ))
+# --- Wait for the LSP to finish (creation -> payments -> close CONFIRMED) ---
+# A full signet lifecycle (127-party ceremony + payments + close confirmations
+# over ~10-min real blocks) can exceed an hour; the old fixed 3600s deadline
+# printed a false TIMEOUT on a close that in fact succeeded (e.g. the live
+# d1468287 close, which had to be confirmed by hand).  Wait for the close to
+# actually CONFIRM -- the same marker the strong verification below asserts on
+# -- with a generous, override-able budget (CLOSE_WAIT_SEC).  This only extends
+# patience; the success criteria (confirmed txid + conservation) are unchanged,
+# so it cannot turn a real failure into a pass.
+info "waiting for ceremony + payments + close CONFIRMED (up to ~$(( ${CLOSE_WAIT_SEC:-10800} / 60 )) min over real blocks; override CLOSE_WAIT_SEC)..."
+DEADLINE=$(( $(date +%s) + ${CLOSE_WAIT_SEC:-10800} ))
 RESULT="TIMEOUT"
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    if ! kill -0 $LSP_PID 2>/dev/null; then RESULT="LSP_EXITED"; break; fi
-    if grep -qE "demo complete|all payments|cooperative close.*complete|close.*broadcast|DEMO COMPLETE" "$LSP_LOG" 2>/dev/null; then
+    if grep -qE "cooperative close confirmed! txid:" "$LSP_LOG" 2>/dev/null; then
         RESULT="DONE"; break
     fi
+    if ! kill -0 $LSP_PID 2>/dev/null; then RESULT="LSP_EXITED"; break; fi
     sleep 5
 done
 [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null || true

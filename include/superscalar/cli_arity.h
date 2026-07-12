@@ -70,6 +70,18 @@ int cli_validate_shape_for_bolt2016(
 /* BOLT-2016 ceiling constant (HTLC final_cltv_expiry max). */
 #define CLI_ARITY_BOLT2016_CEILING 2016u
 
+/* Mainnet safety floor for the DW timeout-tree step (--step-blocks).  Below
+   this the CLTV/CSV ladder margin against reorgs / fee-races is too thin for
+   mainnet.  144 blocks (~1 day) is the canonical SuperScalar mainnet figure. */
+#define CLI_ARITY_MAINNET_MIN_STEP_BLOCKS 144u
+
+/* Reject a --step-blocks value below the mainnet floor.  Applies only to
+   network "mainnet"/"bitcoin"; all other chains (signet/testnet4/regtest)
+   always pass so fast tests keep working.  Returns 1 on success (writes
+   nothing); on rejection writes a clear error to err_buf and returns 0. */
+int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
+                                    char *err_buf, size_t err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif

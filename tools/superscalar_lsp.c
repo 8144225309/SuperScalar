@@ -2510,6 +2510,18 @@ int main(int argc, char *argv[]) {
                ewt, CLI_ARITY_BOLT2016_CEILING);
     }
 
+    /* Mainnet DW-step safety floor: reject a too-small --step-blocks on
+       mainnet (thin reorg / fee-race margin).  Non-mainnet chains pass so
+       fast signet/regtest tests keep using small steps. */
+    {
+        char sf_err[512];
+        if (!cli_validate_mainnet_step_floor(network, step_blocks,
+                                             sf_err, sizeof(sf_err))) {
+            fprintf(stderr, "%s\n", sf_err);
+            return 1;
+        }
+    }
+
     /* Initialize diagnostic report */
     report_t rpt;
     if (!report_init(&rpt, report_path)) {

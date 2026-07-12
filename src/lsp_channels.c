@@ -28,6 +28,7 @@
 #include <sys/time.h>
 #include <signal.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "superscalar/sha256.h"
 #include "superscalar/tapscript.h"
@@ -6435,12 +6436,33 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     size_t handled = 0;
 
+    /* Total patience for demo payment traffic to arrive.  Payments are near-
+       instant once channels are ready, but when many client daemons are still
+       settling under load the first message can lag well past a single poll
+       tick.  A lone 30s lull must NOT be fatal (that killed N=127 signet demo
+       runs before any sender fired); bound the TOTAL wait instead.  Override
+       with SS_EVENT_LOOP_WAIT_SEC for very slow/large runs. */
+    long ss_wait_budget = 300;
+    {
+        const char *wb = getenv("SS_EVENT_LOOP_WAIT_SEC");
+        if (wb) { long v = atol(wb); if (v > 0) ss_wait_budget = v; }
+    }
+    time_t loop_deadline = time(NULL) + ss_wait_budget;
+
     /* Allocate pollfd array: clients + optional bridge */
     size_t max_pfds = mgr->n_channels + 1;
     struct pollfd *pfds = (struct pollfd *)calloc(max_pfds, sizeof(struct pollfd));
     if (!pfds) return 0;
 
     while (handled < expected_msgs) {
+        if (time(NULL) >= loop_deadline) {
+            fprintf(stderr, "LSP event loop: no completion within %lds budget "
+                    "(handled %zu/%zu) -- giving up\n",
+                    ss_wait_budget, handled, expected_msgs);
+            free(pfds);
+            return 0;
+        }
+
         int nfds = 0;
 
         for (size_t c = 0; c < mgr->n_channels; c++) {
@@ -6459,12 +6481,15 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         int ret = poll(pfds, (nfds_t)nfds, 30000);
-        if (ret <= 0) {
-            fprintf(stderr, "LSP event loop: poll timeout/error (handled %zu/%zu)\n",
-                    handled, expected_msgs);
+        if (ret < 0) {
+            if (errno == EINTR) continue;  /* interrupted by a signal -- retry */
+            fprintf(stderr, "LSP event loop: poll error: %s (handled %zu/%zu)\n",
+                    strerror(errno), handled, expected_msgs);
             free(pfds);
             return 0;
         }
+        if (ret == 0)
+            continue;  /* idle tick -- stay patient; loop_deadline bounds the wait */
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
@@ -6483,24 +6508,32 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         for (size_t c = 0; c < mgr->n_channels; c++) {
-            if (!(pfds[c].revents & POLLIN)) continue;
+            if (pfds[c].revents & POLLIN) {
+                wire_msg_t msg;
+                if (!wire_recv(lsp->client_fds[c], &msg)) {
+                    fprintf(stderr, "LSP event loop: recv failed from client %zu\n", c);
+                    free(pfds);
+                    return 0;
+                }
 
-            wire_msg_t msg;
-            if (!wire_recv(lsp->client_fds[c], &msg)) {
-                fprintf(stderr, "LSP event loop: recv failed from client %zu\n", c);
-                free(pfds);
-                return 0;
-            }
-
-            if (!lsp_channels_handle_msg(mgr, lsp, c, &msg)) {
-                fprintf(stderr, "LSP event loop: handle_msg failed for client %zu "
-                        "msg 0x%02x\n", c, msg.msg_type);
+                if (!lsp_channels_handle_msg(mgr, lsp, c, &msg)) {
+                    fprintf(stderr, "LSP event loop: handle_msg failed for client %zu "
+                            "msg 0x%02x\n", c, msg.msg_type);
+                    cJSON_Delete(msg.json);
+                    free(pfds);
+                    return 0;
+                }
                 cJSON_Delete(msg.json);
+                handled++;
+            } else if (pfds[c].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                /* Peer closed with no pending data -- it can never deliver its
+                   message; fail cleanly instead of spinning the poll. */
+                fprintf(stderr, "LSP event loop: client %zu disconnected "
+                        "(revents=0x%x, handled %zu/%zu)\n",
+                        c, (unsigned)pfds[c].revents, handled, expected_msgs);
                 free(pfds);
                 return 0;
             }
-            cJSON_Delete(msg.json);
-            handled++;
         }
     }
 
