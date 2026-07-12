@@ -297,7 +297,7 @@ if [ "$CLOSE_PARTIES" -ge "$N_CLIENTS" ]; then note_ok "all $N_CLIENTS clients j
 if [ -n "$CLOSE_TXID" ]; then
     RECON=$(python3 - "$CLOSE_TXID" "$REGTEST_CONF" "$LSP_LOG" "$N_CLIENTS" <<'PYEOF'
 import sys, json, subprocess, re
-from collections import Counter
+from collections import Counter, defaultdict
 txid, conf, lsplog, ncli = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 r = subprocess.run(["bitcoin-cli","-signet","-conf="+conf,"getrawtransaction",txid,"1"],
                    capture_output=True, text=True)
@@ -309,24 +309,32 @@ txt = open(lsplog, errors="replace").read()
 i = txt.rfind("Close outputs:")
 block = txt[i:] if i >= 0 else ""
 lsp_amts = [int(m) for m in re.findall(r"LSP:\s+(\d+) sats", block)]
-cli_amts = [int(m) for m in re.findall(r"Client \d+:\s+(\d+) sats", block)]
+cli_map = {int(n): int(a) for n, a in re.findall(r"Client (\d+):\s+(\d+) sats", block)}
+cli_amts = [cli_map[k] for k in sorted(cli_map)]
 ledger = sorted(lsp_amts + cli_amts)
 errs = []
 if len(cli_amts) != ncli:
     errs.append("client-lines %d!=%d" % (len(cli_amts), ncli))
 if ledger != onchain:
     errs.append("ledger!=onchain(sum %d vs %d, n %d vs %d)" % (sum(ledger), sum(onchain), len(ledger), len(onchain)))
-base, base_n = Counter(cli_amts).most_common(1)[0] if cli_amts else (0, 0)
-# The idle baseline must dominate: a per-client skim (varying many clients'
-# balances individually) would destroy the shared baseline. Most clients are
-# idle, so >= half sharing one exact value proves no per-client drift.
-if cli_amts and base_n < (ncli // 2):
-    errs.append("baseline-not-dominant(%d/%d at mode %d - possible per-client skim)" % (base_n, ncli, base))
-surplus = sum(a - base for a in cli_amts if a > base)
-deficit = sum(base - a for a in cli_amts if a < base)
+# Per-client reconciliation, robust to any mover/idle mix. Each client's IMPLIED
+# initial baseline = final - net payment delta (parsed from the real routed-HTLC
+# and demo payment flows). All clients were funded to the same baseline, so these
+# must be uniform (allow one remainder leaf); a per-client skim breaks uniformity.
+# (Supersedes an earlier mode-of-all-balances check that false-failed when movers
+# outnumbered idle clients, e.g. N=8 with 3 payments -> 6 movers.)
+delta = defaultdict(int)
+for snd, rcv, amt in re.findall(r"(?:forwarded|Payment complete): client (\d+) -> client (\d+) \((\d+) sats\)", txt):
+    delta[int(snd)] -= int(amt); delta[int(rcv)] += int(amt)
+implied = {k: cli_map[k] - delta.get(k, 0) for k in cli_map}
+base, base_n = Counter(implied.values()).most_common(1)[0] if implied else (0, 0)
+if implied and base_n < max(1, len(implied) - 1):
+    off = {k: implied[k] for k in implied if implied[k] != base}
+    errs.append("implied-baseline-not-uniform(%d/%d at %d; off=%s - possible per-client skim)" % (base_n, len(implied), base, off))
+movers = sum(1 for k in delta if delta.get(k, 0) != 0)
 print(("OK" if not errs else "FAIL") +
-      " clients=%d at_baseline=%d/%d baseline=%d movers=%d exact_ledger_match=%s ledger_sum=%d onchain_sum=%d info_surplus=%d info_deficit=%d" %
-      (len(cli_amts), base_n, ncli, base, len(cli_amts) - base_n, ledger == onchain, sum(ledger), sum(onchain), surplus, deficit) +
+      " clients=%d movers=%d implied_baseline=%d uniform=%d/%d exact_ledger_match=%s ledger_sum=%d onchain_sum=%d" %
+      (len(cli_amts), movers, base, base_n, len(implied), ledger == onchain, sum(ledger), sum(onchain)) +
       ("" if not errs else " :: " + "; ".join(errs)))
 PYEOF
 )
