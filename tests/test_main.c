@@ -1313,6 +1313,11 @@ extern int test_cli_shape_uniform_arity2_n64_rejected(void);
 extern int test_cli_shape_mixed_248_n64_passes(void);
 extern int test_cli_shape_mixed_248_static2_n128_passes(void);
 extern int test_cli_shape_regtest_step10_always_passes(void);
+extern int test_cli_step_floor_mainnet_rejects_small(void);
+extern int test_cli_step_floor_mainnet_accepts_144(void);
+extern int test_cli_step_floor_bitcoin_alias_rejects_small(void);
+extern int test_cli_step_floor_regtest_allows_small(void);
+extern int test_cli_step_floor_signet_allows_small(void);
 /* SF-PROMETHEUS-EXPORTER: native /metrics endpoint */
 extern int test_prometheus_build_body_contains_all_metrics(void);
 extern int test_prometheus_handle_connection_metrics(void);
@@ -3214,6 +3219,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cli_shape_mixed_248_n64_passes);
     RUN_TEST(test_cli_shape_mixed_248_static2_n128_passes);
     RUN_TEST(test_cli_shape_regtest_step10_always_passes);
+    RUN_TEST(test_cli_step_floor_mainnet_rejects_small);
+    RUN_TEST(test_cli_step_floor_mainnet_accepts_144);
+    RUN_TEST(test_cli_step_floor_bitcoin_alias_rejects_small);
+    RUN_TEST(test_cli_step_floor_regtest_allows_small);
+    RUN_TEST(test_cli_step_floor_signet_allows_small);
 
     printf("\n=== Prometheus Exporter ===\n");
     RUN_TEST(test_prometheus_build_body_contains_all_metrics);

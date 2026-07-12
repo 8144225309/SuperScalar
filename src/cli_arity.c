@@ -170,3 +170,21 @@ int cli_validate_shape_for_bolt2016(
         ewt, ewt / 144);
     return 0;
 }
+
+int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
+                                    char *err_buf, size_t err_buf_len)
+{
+    int is_mainnet = network &&
+        (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
+    if (!is_mainnet) return 1;                     /* non-mainnet: always OK */
+    if (step_blocks >= CLI_ARITY_MAINNET_MIN_STEP_BLOCKS) return 1;
+    cli_set_err(err_buf, err_buf_len,
+        "Error: --step-blocks %u is below the mainnet safety floor of %u "
+        "(~1 day). The DW timeout-tree step sets the CLTV/CSV ladder spacing; "
+        "a small step shrinks the reorg / fee-race margin. Re-run with "
+        "--step-blocks %u (or higher) on mainnet.",
+        (unsigned)step_blocks,
+        (unsigned)CLI_ARITY_MAINNET_MIN_STEP_BLOCKS,
+        (unsigned)CLI_ARITY_MAINNET_MIN_STEP_BLOCKS);
+    return 0;
+}

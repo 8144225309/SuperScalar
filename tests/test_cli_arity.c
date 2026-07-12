@@ -281,4 +281,44 @@ int test_cli_shape_regtest_step10_always_passes(void) {
     return 1;
 }
 
+/* ---- cli_validate_mainnet_step_floor ---- */
+
+int test_cli_step_floor_mainnet_rejects_small(void) {
+    char err[512] = {0};
+    int ok = cli_validate_mainnet_step_floor("mainnet", 5, err, sizeof(err));
+    T_ASSERT(!ok, "mainnet --step-blocks 5 must be rejected");
+    T_ASSERT_SUBSTR(err, "below the mainnet safety floor");
+    T_ASSERT_SUBSTR(err, "144");
+    return 1;
+}
+
+int test_cli_step_floor_mainnet_accepts_144(void) {
+    char err[512] = {0};
+    int ok = cli_validate_mainnet_step_floor("mainnet", 144, err, sizeof(err));
+    T_ASSERT(ok, "mainnet --step-blocks 144 must pass the floor");
+    return 1;
+}
+
+int test_cli_step_floor_bitcoin_alias_rejects_small(void) {
+    char err[512] = {0};
+    int ok = cli_validate_mainnet_step_floor("bitcoin", 10, err, sizeof(err));
+    T_ASSERT(!ok, "network 'bitcoin' alias must also enforce the floor");
+    T_ASSERT_SUBSTR(err, "mainnet safety floor");
+    return 1;
+}
+
+int test_cli_step_floor_regtest_allows_small(void) {
+    char err[512] = {0};
+    int ok = cli_validate_mainnet_step_floor("regtest", 5, err, sizeof(err));
+    T_ASSERT(ok, "regtest --step-blocks 5 must pass (non-mainnet unaffected)");
+    return 1;
+}
+
+int test_cli_step_floor_signet_allows_small(void) {
+    char err[512] = {0};
+    int ok = cli_validate_mainnet_step_floor("signet", 1, err, sizeof(err));
+    T_ASSERT(ok, "signet --step-blocks 1 must pass (non-mainnet unaffected)");
+    return 1;
+}
+
 /* End-of-file public test list (referenced from test_main.c) */

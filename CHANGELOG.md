@@ -8,6 +8,14 @@ All notable changes to SuperScalar are documented here.
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
 
+### Cooperative-close robustness + mainnet `step_blocks` floor (PR #441)
+
+Robustness fixes surfaced while proving the live 127-client cooperative close on signet (`d1468287`) and regtest. No production consensus/fund-path behaviour changes:
+
+- **Patient LSP demo event-loop:** the demo/test-path event loop (`lsp_channels_run_event_loop` — used by `--demo` and the harnesses, *not* the production hot path) no longer treats a single 30-second `poll()` lull as fatal. A bounded total patience budget (`SS_EVENT_LOOP_WAIT_SEC`, default 300s) is what lets a 127-party create → pay → close complete under load instead of dying before the first payment fires.
+- **Mainnet `step_blocks` floor:** reject `step_blocks < 144` on mainnet (`cli_validate_mainnet_step_floor`, +5 unit tests); non-mainnet networks keep small values for fast tests.
+- **Signet scale-harness (`test_signet_scale_payments.sh`):** funding scales with N (`AMOUNT` defaults to `N_CLIENTS * 100_000`; the old fixed 2.75M under-funded large N below the 5000-sat channel reserve, so scripted sends never fired), a client-launch `STAGGER` knob, and the close-wait now keys on the *confirmed* close marker with an override-able `CLOSE_WAIT_SEC` budget (the old fixed 3600s printed a false TIMEOUT on a close that in fact succeeded).
+
 ### Gap-scan hardening wave (defense-in-depth; no theft/key-leak/fund-loss gap)
 
 A post-rc1 code read-through ("gap scan", `docs/gap-scan-findings-2026-07.md`) closed a set of robustness / recourse-completeness items. None affect fund safety:
