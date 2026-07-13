@@ -43,7 +43,7 @@ This produces four binaries in `build/`:
 
 For a regtest demo end-to-end in one command, see [`docs/demo-walkthrough.md`](docs/demo-walkthrough.md).
 
-For signet operation, see [`docs/signet-ps-n8-procedure.md`](docs/signet-ps-n8-procedure.md).
+For signet operation, see `tools/signet_setup.sh`.
 
 For mainnet operators, see [`docs/mainnet-runbook.md`](docs/mainnet-runbook.md).
 
@@ -162,7 +162,7 @@ See [`docs/watchtower-trustless-schema.md`](docs/watchtower-trustless-schema.md)
 
 SuperScalar needs real-world operators on signet and testnet4. Even a 2-client factory running for a few days produces useful evidence.
 
-- **Run a factory** — follow [`docs/signet-ps-n8-procedure.md`](docs/signet-ps-n8-procedure.md) (works for testnet4 too)
+- **Run a factory** — follow `tools/signet_setup.sh` (works for testnet4 too)
 - **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 36 multi-party scenarios
 - **Review the cryptography** — `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c` are the load-bearing crypto modules
 - **Discuss** — the [delvingbitcoin thread](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) is the canonical protocol-design venue; [GitHub Discussions](https://github.com/8144225309/SuperScalar/discussions) for project coordination
