@@ -49,7 +49,7 @@ CLIENT4DB="$DATADIR/client4.db"
 #
 # Defaults follow PS-first canonical positioning (PR #102): arity-3 (PS leaves)
 # at 4 clients with no static-near-root.  See docs/factory-arity.md and
-# docs/signet-ps-n8-procedure.md for the recommended canonical shapes.
+# --help for the recommended canonical shapes.
 #
 # PS_SUBFACTORY_ARITY: k for the canonical k² PS shape from t/1242.  k=1
 # (default) keeps the historical 1-client-per-PS-leaf layout; k>1 places
@@ -807,7 +807,7 @@ cmd_demo_force_close() {
     step "Starting force-close demo ($N_CLIENTS clients, arity-$ARITY, static-near-root=$STATIC_NEAR_ROOT, ps-subfactory-arity=$PS_SUBFACTORY_ARITY)..."
     detail "This will: connect $N_CLIENTS clients → create factory → run payments → broadcast tree → wait for confirmations"
     detail "On signet with step-blocks=1, each node needs ~10 min per block of relative timelock."
-    detail "Tree shape and ewt depend on \$ARITY, \$STATIC_NEAR_ROOT, and \$PS_SUBFACTORY_ARITY — see docs/signet-ps-n8-procedure.md."
+    detail "Tree shape and ewt depend on \$ARITY, \$STATIC_NEAR_ROOT, and \$PS_SUBFACTORY_ARITY — see --help."
 
     # Start LSP in background first
     "$SCBIN/superscalar_lsp" \
