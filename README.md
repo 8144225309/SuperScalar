@@ -165,13 +165,13 @@ SuperScalar needs real-world operators on signet and testnet4. Even a 2-client f
 - **Run a factory** — follow `tools/signet_setup.sh` (works for testnet4 too)
 - **Run the test orchestrator** — `python3 tools/test_orchestrator.py --scenario all` exercises 36 multi-party scenarios
 - **Review the cryptography** — `src/musig.c`, `src/tapscript.c`, `src/channel.c`, `src/noise.c` are the load-bearing crypto modules
-- **Discuss** — the [delvingbitcoin thread](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) is the canonical protocol-design venue; [GitHub Discussions](https://github.com/8144225309/SuperScalar/discussions) for project coordination
+- **Discuss** — [the implementation report](https://delvingbitcoin.org/t/superscalar-an-implementation-report/2705) for this implementation; [ZmnSCPxj's design thread](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) for protocol design; [GitHub Discussions](https://github.com/8144225309/SuperScalar/discussions) for project coordination
 
 ## Contributing
 
 PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow, code style, and review process. Releases follow the procedure in [`docs/release-process.md`](docs/release-process.md).
 
-For design discussion, the [delvingbitcoin thread](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) is the canonical venue.
+For design discussion, [ZmnSCPxj's thread](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories-with-pseudo-spilman-leaves/1242) remains the canonical venue; implementation discussion belongs on [the implementation report](https://delvingbitcoin.org/t/superscalar-an-implementation-report/2705) or in issues here.
 
 ## License
 
