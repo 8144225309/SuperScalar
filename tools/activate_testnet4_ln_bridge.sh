@@ -3,7 +3,7 @@
 # on the existing CLN-A testnet4 node and start the bridge daemon, so
 # the LSP can route real Lightning payments INTO/OUT OF factory clients.
 #
-# Prerequisites (already on VPS at 68.168.216.243):
+# Prerequisites (already on VPS at <SIGNET_VPS>):
 #   - CLN-A running with /var/lib/cln-testnet4/config
 #   - The config has the bridge plugin lines commented out
 #   - $BUILD_DIR/superscalar_bridge binary exists
