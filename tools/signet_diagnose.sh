@@ -20,7 +20,7 @@ fi
 BTCBIN="${BTCBIN:-$(dirname "$(command -v bitcoin-cli 2>/dev/null || echo /usr/local/bin/bitcoin-cli)")}"
 DATADIR="${DATADIR:-/tmp/superscalar-signet}"
 RPCUSER="${RPCUSER:-superscalar}"
-RPCPASS="${RPCPASS:-superscalar123}"
+RPCPASS="${RPCPASS:-CHANGEME}"
 RPCPORT="${RPCPORT:-38332}"
 LSPDB="$DATADIR/lsp.db"
 

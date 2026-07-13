@@ -162,7 +162,7 @@ echo "--- Step 4/6: waiting for tree-tx confirmations (timeout ${TREE_CONFIRM_TI
 # Use signet_setup.sh's defaults so the bitcoin-cli call matches the
 # config the demo just ran against.
 RPCUSER="${RPCUSER:-superscalar}"
-RPCPASS="${RPCPASS:-superscalar123}"
+RPCPASS="${RPCPASS:-CHANGEME}"
 RPCPORT="${RPCPORT:-38332}"
 BCLI="bitcoin-cli -signet -rpcuser=$RPCUSER -rpcpassword=$RPCPASS -rpcport=$RPCPORT"
 WAITED=0

@@ -27,7 +27,7 @@ fi
 
 DATADIR="${DATADIR:-/tmp/superscalar-signet}"
 RPCUSER="${RPCUSER:-superscalar}"
-RPCPASS="${RPCPASS:-superscalar123}"
+RPCPASS="${RPCPASS:-CHANGEME}"
 RPCPORT="${RPCPORT:-38332}"
 
 # Derived paths
