@@ -19,15 +19,22 @@
  * 8 × tx_output_t to 16 × tx_output_t; at 506 nodes (max PS factory at
  * N=128) that's ~50KB extra per factory_t — acceptable. */
 #define FACTORY_MAX_OUTPUTS 16
-/* FACTORY_MAX_SIGNERS = size of the keyagg/pubkey ARRAYS, not the signing
- * cap.  Bumped 128 to 256 by the #303 fix only so the all_pubkeys array in
- * lsp.c cannot overrun when misconfigured with 129 signers (release build's
- * stack canary caught that overrun).  The actual signing limit is
- * MUSIG_SESSION_MAX_SIGNERS (128) = the LSP + up to 127 clients; more than
- * 128 signers is NOT signable, so N=255 is NOT a supported configuration
- * and the LSP CLI rejects --clients above 127. */
+/* FACTORY_MAX_SIGNERS = size of the keyagg/pubkey ARRAYS and the upper bound
+ * on the MuSig2 signing group (LSP + clients).  The signing limit is
+ * MUSIG_SESSION_MAX_SIGNERS, now also 256 (LSP + up to 255 clients).  The old
+ * comment here claimed >128 signers was "NOT signable"; that was overly
+ * conservative — MuSig2/Schnorr aggregate + sign + verify cleanly to 2048
+ * signers, and the distributed session path is valgrind-clean at 256 (see
+ * tools/test_musig_scale.c, tools/test_musig_session_scale.c).  NOTE: running
+ * 255 client daemons is memory-heavy (~70 MB RSS each); a large-factory
+ * deployment is RAM-bound, and shrinking factory_t (dynamic leaf_layers) is a
+ * worthwhile follow-up. */
 #define FACTORY_MAX_SIGNERS 256
-#define FACTORY_MAX_LEAVES  128
+/* FACTORY_MAX_LEAVES: one channel (leaf) per client, so this bounds the client
+ * count.  Raised 128 -> 256 to support up to 255-client factories.  Cost:
+ * leaf_layers[FACTORY_MAX_LEAVES] is embedded in factory_t, so this enlarges
+ * factory_t for all factories (dynamic sizing is the future optimization). */
+#define FACTORY_MAX_LEAVES  256
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 

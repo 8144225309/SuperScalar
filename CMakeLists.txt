@@ -496,3 +496,19 @@ target_link_libraries(test_inproc_scale PRIVATE superscalar superscalar_secrets 
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_inproc_scale PRIVATE project_sanitizers)
 endif()
+
+# MuSig2 signer-scaling proofs (256-signer support): pure-crypto aggregation to
+# 2048 signers, and the distributed session path (factory close path) to 256.
+add_executable(test_musig_scale tools/test_musig_scale.c)
+target_include_directories(test_musig_scale PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(test_musig_scale PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_musig_scale PRIVATE project_sanitizers)
+endif()
+
+add_executable(test_musig_session_scale tools/test_musig_session_scale.c)
+target_include_directories(test_musig_session_scale PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(test_musig_session_scale PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_musig_session_scale PRIVATE project_sanitizers)
+endif()
