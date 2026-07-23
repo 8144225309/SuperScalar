@@ -512,3 +512,13 @@ target_link_libraries(test_musig_session_scale PRIVATE superscalar superscalar_s
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_musig_session_scale PRIVATE project_sanitizers)
 endif()
+
+# Conductor-lite cooperative-close SCALE harness (signet): builds+signs an
+# N-of-N key-path close to M funded outputs in one process (~6MB, 10k in ~1.5s).
+# Driven on real signet by tools/test_signet_close_scale.sh.
+add_executable(test_signet_close_scale tools/test_signet_close_scale.c)
+target_include_directories(test_signet_close_scale PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(test_signet_close_scale PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_signet_close_scale PRIVATE project_sanitizers)
+endif()
