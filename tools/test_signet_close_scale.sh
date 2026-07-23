@@ -23,7 +23,8 @@ bad(){ printf '\033[31m%s\033[0m\n' "$*"; }
 
 # 1. funding address = rawtr(agg output key)
 OUTKEY=$("$BIN" addr "$N" "$SEED"); [ ${#OUTKEY} -eq 64 ] || { bad "addr failed"; exit 1; }
-FUND_ADDR=$($CLI deriveaddresses "rawtr($OUTKEY)" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0])')
+DESC=$($CLI getdescriptorinfo "rawtr($OUTKEY)" | python3 -c 'import sys,json;print(json.load(sys.stdin)["descriptor"])')
+FUND_ADDR=$($CLI deriveaddresses "$DESC" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0])')
 info "N=$N M=$M funding addr=$FUND_ADDR outkey=$OUTKEY"
 
 # 2. fund it + wait 1 conf
@@ -50,7 +51,7 @@ info "confirmed; funding vout=$VOUT"
 # 5. broadcast
 info "broadcasting close ($(wc -c < /tmp/${TAG}_close.hex) hex chars)..."
 set +e
-CLOSE_TXID=$($CLI sendrawtransaction "$(cat /tmp/${TAG}_close.hex)" 2>/tmp/${TAG}_err.txt)
+CLOSE_TXID=$(cat /tmp/${TAG}_close.hex | $CLI -stdin sendrawtransaction 2>/tmp/${TAG}_err.txt)
 RC=$?
 set -e
 if [ "$EXPECT" = confirm ]; then
@@ -72,6 +73,6 @@ else
   # sweep the intact funding back home (N-of-N -> home)
   DEST_SPK=$($WCLI getaddressinfo "$($WCLI getnewaddress ${TAG}_sweep bech32m)" | python3 -c 'import sys,json;print(json.load(sys.stdin)["scriptPubKey"])')
   "$BIN" sweep "$N" "$SEED" "$FUND_TXID" "$VOUT" "$FUNDING_SATS" "$DEST_SPK" /tmp/${TAG}_sweep.hex "$FEE_RATE" || { bad "sweep build failed"; exit 1; }
-  SWEEP_TXID=$($CLI sendrawtransaction "$(cat /tmp/${TAG}_sweep.hex)") || { bad "sweep broadcast failed"; exit 1; }
+  SWEEP_TXID=$(cat /tmp/${TAG}_sweep.hex | $CLI -stdin sendrawtransaction) || { bad "sweep broadcast failed"; exit 1; }
   ok "funding swept home: $SWEEP_TXID"
 fi
