@@ -61,7 +61,13 @@ typedef struct {
 } musig_nonce_pool_t;
 
 /* --- Signing session (one per transaction being signed) --- */
-#define MUSIG_SESSION_MAX_SIGNERS 128  /* the factory signing group is the LSP + up to 127 clients = 128 signers; a 128th client would be the 129th signer, which is out of design (the LSP is one of the 128) */
+#define MUSIG_SESSION_MAX_SIGNERS 256  /* max signers in one MuSig2 signing
+   session = LSP + up to 255 clients.  Raised 128 -> 256: MuSig2/Schnorr has no
+   such limit (verified by aggregating + signing + BIP-340-verifying up to 2048
+   signers), and the distributed session path (set_pubnonce/finalize/partial/agg)
+   is valgrind-clean at 256 with clean rejection past it.  See the standalone
+   proofs tools/test_musig_scale.c and tools/test_musig_session_scale.c.
+   secp256k1's aggregation takes size_t; this fixed array is the only cap. */
 
 typedef struct {
     secp256k1_musig_pubnonce pubnonces[MUSIG_SESSION_MAX_SIGNERS];

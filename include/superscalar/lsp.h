@@ -8,7 +8,7 @@
 #include "persist_wt.h"
 #include <secp256k1.h>
 
-#define LSP_MAX_CLIENTS 128
+#define LSP_MAX_CLIENTS 256
 
 typedef struct {
     secp256k1_context *ctx;
