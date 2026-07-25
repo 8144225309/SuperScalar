@@ -522,3 +522,9 @@ target_link_libraries(test_signet_close_scale PRIVATE superscalar superscalar_se
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_signet_close_scale PRIVATE project_sanitizers)
 endif()
+
+# In-process single-process factory lifecycle manager (scale on a small box):
+# one factory_t (build_tree + sign_all + cooperative_close), no daemons.
+add_executable(test_inproc_factory_lifecycle tools/test_inproc_factory_lifecycle.c)
+target_include_directories(test_inproc_factory_lifecycle PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_link_libraries(test_inproc_factory_lifecycle PRIVATE superscalar superscalar_secrets project_warnings)

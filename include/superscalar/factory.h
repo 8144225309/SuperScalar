@@ -322,7 +322,12 @@ typedef struct {
     size_t n_participants;
 
     /* Flat node array */
-    factory_node_t nodes[FACTORY_MAX_NODES];
+    factory_node_t *nodes;   /* dynamic: calloc'd in factory_init to config.max_nodes,
+                                grown in factory_build_tree to the actual node count.
+                                Was inline nodes[FACTORY_MAX_NODES]; made dynamic so a
+                                single-process factory can exceed the 512-node cap
+                                (a 255-client PS factory needs ~1018 nodes) without
+                                bloating every factory_t. */
     size_t n_nodes;
 
     /* Funding UTXO */
@@ -379,8 +384,8 @@ typedef struct {
        node_l_stock_hashes[idx] (the shipped H) instead of deriving, so the client
        builds the SAME 2-leaf L-stock SPK as the LSP (else the leaf-state tx bytes
        diverge and the MuSig co-sign fails). */
-    unsigned char node_l_stock_hashes[FACTORY_MAX_NODES][32];
-    int node_l_stock_hash_valid[FACTORY_MAX_NODES];
+    unsigned char (*node_l_stock_hashes)[32];  /* dynamic, sized to config.max_nodes */
+    int *node_l_stock_hash_valid;               /* dynamic, sized to config.max_nodes */
     int has_node_l_stock_hashes;
 
     /* Per-leaf DW layers (for independent leaf advance) */

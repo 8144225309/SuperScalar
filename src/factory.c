@@ -394,7 +394,7 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
 
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32) {
-    if (!f || node_idx >= FACTORY_MAX_NODES || !h32) return;
+    if (!f || node_idx >= f->config.max_nodes || !h32) return;
     memcpy(f->node_l_stock_hashes[node_idx], h32, 32);
     f->node_l_stock_hash_valid[node_idx] = 1;
     f->has_node_l_stock_hashes = 1;
@@ -755,6 +755,12 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
        sub-factories — preserves all historical PS test behavior).
        Override with factory_set_ps_subfactory_arity() before build. */
     f->ps_subfactory_arity = 1;
+
+    /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
+       config cap; factory_build_tree grows them if the tree needs more nodes. */
+    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
+    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
     return 1;
 }
 
@@ -797,6 +803,12 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
        sub-factories — preserves all historical PS test behavior).
        Override with factory_set_ps_subfactory_arity() before build. */
     f->ps_subfactory_arity = 1;
+
+    /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
+       config cap; factory_build_tree grows them if the tree needs more nodes. */
+    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
+    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
@@ -1791,7 +1803,24 @@ int factory_build_tree(factory_t *f) {
     int n_dw_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
     int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
-    if (total_nodes_ub > (int)f->config.max_nodes) return 0;
+    /* Grow the dynamic node arrays if this tree needs more than the current cap
+       (a 255-client PS factory needs ~1018 nodes vs the 512 default). */
+    if (total_nodes_ub > (int)f->config.max_nodes) {
+        size_t nn = (size_t)total_nodes_ub, old = f->config.max_nodes;
+        factory_node_t *gn = realloc(f->nodes, nn * sizeof(factory_node_t));
+        if (!gn) return 0;
+        f->nodes = gn;
+        unsigned char (*gh)[32] = realloc(f->node_l_stock_hashes, nn * 32);
+        if (!gh) return 0;
+        f->node_l_stock_hashes = gh;
+        int *gv = realloc(f->node_l_stock_hash_valid, nn * sizeof(int));
+        if (!gv) return 0;
+        f->node_l_stock_hash_valid = gv;
+        memset(f->nodes + old, 0, (nn - old) * sizeof(factory_node_t));
+        memset(f->node_l_stock_hashes + old, 0, (nn - old) * 32);
+        memset(f->node_l_stock_hash_valid + old, 0, (nn - old) * sizeof(int));
+        f->config.max_nodes = (uint32_t)nn;
+    }
     if (n_leaves > (int)f->config.max_leaves) return 0;
     if (n_dw_layers > DW_MAX_LAYERS) return 0;
 
@@ -4839,6 +4868,11 @@ void factory_free(factory_t *f) {
     tx_buf_free(&f->dist_signed_tx);   /* #54 G1 */
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
+    /* Free the dynamic node arrays (were inline).  NULL after free so a second
+       factory_free / a detached copy is a no-op (free(NULL) is safe). */
+    free(f->nodes);                    f->nodes = NULL;
+    free(f->node_l_stock_hashes);      f->node_l_stock_hashes = NULL;
+    free(f->node_l_stock_hash_valid);  f->node_l_stock_hash_valid = NULL;
 }
 
 uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output_index) {
@@ -4847,6 +4881,23 @@ uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output
 }
 
 void factory_detach_txbufs(factory_t *f) {
+    /* This is called right after a factory_t struct copy (e.g. a ladder entry
+       ← lsp->factory).  The dynamic node arrays were shallow-shared by that
+       copy; give this copy its OWN arrays so (a) factory_free is independent
+       (no double-free) and (b) the txbuf-zeroing below touches only this copy,
+       not the original.  This reproduces the pre-dynamic inline-array copy
+       semantics (per-node txbuf POINTERS stay shared, then get zeroed below). */
+    if (f->nodes && f->config.max_nodes > 0) {
+        size_t mn = f->config.max_nodes;
+        factory_node_t *n2 = malloc(mn * sizeof(factory_node_t));
+        if (n2) { memcpy(n2, f->nodes, mn * sizeof(factory_node_t)); f->nodes = n2; }
+        unsigned char (*h2)[32] = malloc(mn * 32);
+        if (h2 && f->node_l_stock_hashes) { memcpy(h2, f->node_l_stock_hashes, mn * 32); f->node_l_stock_hashes = h2; }
+        else if (h2) { memset(h2, 0, mn * 32); f->node_l_stock_hashes = h2; }
+        int *v2 = malloc(mn * sizeof(int));
+        if (v2 && f->node_l_stock_hash_valid) { memcpy(v2, f->node_l_stock_hash_valid, mn * sizeof(int)); f->node_l_stock_hash_valid = v2; }
+        else if (v2) { memset(v2, 0, mn * sizeof(int)); f->node_l_stock_hash_valid = v2; }
+    }
     for (size_t i = 0; i < f->n_nodes; i++) {
         memset(&f->nodes[i].unsigned_tx, 0, sizeof(tx_buf_t));
         memset(&f->nodes[i].signed_tx, 0, sizeof(tx_buf_t));
