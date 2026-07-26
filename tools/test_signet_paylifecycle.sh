@@ -77,7 +77,9 @@ say "close testmempoolaccept allowed=$ACC"
 CTXID=$($CLI sendrawtransaction "$CLOSE_HEX") || { say "close broadcast FAILED"; exit 1; }
 say "close broadcast txid=$CTXID (waiting for confirmation)"
 wait_conf "$CTXID" >/dev/null || say "warn: close not confirmed within timeout (check later)"
-CH=$($CLI getrawtransaction "$CTXID" 1 2>/dev/null | jq -r '.blockheight // empty')
+# getrawtransaction has no blockheight field — derive it from the block hash.
+BH=$($CLI getrawtransaction "$CTXID" 1 2>/dev/null | jq -r '.blockhash // empty')
+CH=""; [ -n "$BH" ] && CH=$($CLI getblock "$BH" 2>/dev/null | jq -r '.height')
 say "close confirmed txid=$CTXID height=${CH:-pending}"
 
 # ---- 6. verify outputs on-chain ----
@@ -116,18 +118,24 @@ def dsum(s):
     c^=1
     return ''.join(CS[(c>>(5*(7-j)))&31] for j in range(8))
 keys=[l.split()[1] for l in open(sys.argv[1]) if l.strip()]
-ts=1
 descs=[]
 for h in keys:
     d="rawtr(%s)"%wif(h); d=d+"#"+dsum(d)
-    descs.append({"desc":d,"timestamp":ts,"active":False,"internal":False})
+    # timestamp "now" => no genesis rescan at import; we rescan the small
+    # [close_height, tip] range explicitly below (fast + reliable).
+    descs.append({"desc":d,"timestamp":"now","active":False,"internal":False})
 print(json.dumps(descs))
 PY
 SWEEPW="sweep_${TAG}"
 $CLI -named createwallet wallet_name="$SWEEPW" blank=true disable_private_keys=false >/dev/null 2>&1 || true
-$CLI -rpcwallet="$SWEEPW" importdescriptors "$(cat $AUDIT/import.json)" >/dev/null 2>&1
-RS_FROM=${CH:-1}
-$CLI -rpcwallet="$SWEEPW" rescanblockchain "$RS_FROM" >/dev/null 2>&1
+# importdescriptors via -stdin: the descriptor JSON is >ARG_MAX for large N
+# (1024 descriptors ~141 KB), so it cannot be passed as a command-line argument.
+IMPOK=$(printf '%s' "$(cat $AUDIT/import.json)" | $CLI -rpcwallet="$SWEEPW" -stdin importdescriptors | jq -c '[.[].success]|{ok:all,n:length}')
+say "importdescriptors: $IMPOK"
+TIP=$($CLI getblockcount)
+RS_FROM=$(( ${CH:-$((TIP-30))} - 3 ))    # small margin around the close block
+say "rescanning [$RS_FROM,$TIP] for close outputs"
+$CLI -rpcwallet="$SWEEPW" rescanblockchain "$RS_FROM" "$TIP" >/dev/null 2>&1
 SWBAL=$($CLI -rpcwallet="$SWEEPW" getbalance)
 say "sweep wallet holds $SWBAL BTC across $NOUT outputs"
 STXID=$($CLI -rpcwallet="$SWEEPW" -named sendall recipients="[\"$RET\"]" fee_rate="$FEE_RATE" 2>&1 | jq -r '.txid // empty')
