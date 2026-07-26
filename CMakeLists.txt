@@ -527,4 +527,5 @@ endif()
 # one factory_t (build_tree + sign_all + cooperative_close), no daemons.
 add_executable(test_inproc_factory_lifecycle tools/test_inproc_factory_lifecycle.c)
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(test_inproc_factory_lifecycle PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(test_inproc_factory_lifecycle PRIVATE superscalar superscalar_secrets project_warnings)
