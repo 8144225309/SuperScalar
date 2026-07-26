@@ -121,8 +121,13 @@ typedef enum {
 typedef struct {
     factory_node_type_t type;
 
-    /* Signers for this node's N-of-N */
-    uint32_t signer_indices[FACTORY_MAX_SIGNERS];
+    /* Signers for this node's N-of-N.  Dynamic: allocated in factory_build_tree
+       to n_signers (this node's SUBTREE signer count), not the global max.  This
+       is a local->global mapping (slot j in [0,n_signers) -> global participant
+       signer_indices[j]) so every per-node/per-session array can be subtree-sized,
+       keeping the whole tree O(N log N) rather than O(N^2).  Also lets the root
+       node (n_signers == N+1) exceed the old fixed FACTORY_MAX_SIGNERS cap. */
+    uint32_t *signer_indices;
     size_t n_signers;
     musig_keyagg_t keyagg;
 
@@ -162,9 +167,11 @@ typedef struct {
     unsigned char merkle_root[32];
     int output_parity;        /* parity of tweaked output key */
 
-    /* Split-round signing state */
+    /* Split-round signing state.  partial_sigs is dynamic (sized to n_signers in
+       factory_build_tree) — subtree-sized, and lets the root node exceed the old
+       fixed FACTORY_MAX_SIGNERS cap. */
     musig_signing_session_t signing_session;
-    secp256k1_musig_partial_sig partial_sigs[FACTORY_MAX_SIGNERS];
+    secp256k1_musig_partial_sig *partial_sigs;
     int partial_sigs_received;
 
     /* Wire-ceremony poison TX state — second MuSig session per node so a
@@ -177,7 +184,7 @@ typedef struct {
        broadcast the poison TX on breach detection.  Closes the SECURITY
        GAP documented in docs/poison-tx.md. */
     musig_signing_session_t poison_signing_session;
-    secp256k1_musig_partial_sig poison_partial_sigs[FACTORY_MAX_SIGNERS];
+    secp256k1_musig_partial_sig *poison_partial_sigs;  /* dynamic, sized to n_signers */
     int poison_partial_sigs_received;
     unsigned char poison_sighash[32];
     tx_buf_t poison_unsigned_tx;
@@ -316,9 +323,11 @@ typedef struct {
 typedef struct {
     secp256k1_context *ctx;
 
-    /* Participants: 0 = LSP, 1..N = clients */
-    secp256k1_keypair keypairs[FACTORY_MAX_SIGNERS];
-    secp256k1_pubkey pubkeys[FACTORY_MAX_SIGNERS];
+    /* Participants: 0 = LSP, 1..N = clients.  Dynamic (calloc'd in factory_init
+       to config.max_signers) so a single-process factory can exceed the old fixed
+       FACTORY_MAX_SIGNERS (256) cap.  These are O(N), one copy per factory. */
+    secp256k1_keypair *keypairs;
+    secp256k1_pubkey *pubkeys;
     size_t n_participants;
 
     /* Flat node array */
@@ -388,10 +397,14 @@ typedef struct {
     int *node_l_stock_hash_valid;               /* dynamic, sized to config.max_nodes */
     int has_node_l_stock_hashes;
 
-    /* Per-leaf DW layers (for independent leaf advance) */
-    dw_layer_t leaf_layers[FACTORY_MAX_LEAVES];
+    /* Per-leaf DW layers (for independent leaf advance).  Dynamic (calloc'd in
+       factory_init to config.max_leaves) — PS uses one leaf per client, so a
+       fixed [FACTORY_MAX_LEAVES]=256 capped the factory at 255 clients and (worse)
+       factory_set_arity's dw_layer_init loop silently overran it into adjacent
+       fields for N>=256.  Freed in factory_free, deep-copied in detach. */
+    dw_layer_t *leaf_layers;
     int n_leaf_nodes;              /* number of leaf state nodes */
-    size_t leaf_node_indices[FACTORY_MAX_LEAVES];
+    size_t *leaf_node_indices;
 
     int per_leaf_enabled;          /* activated after first leaf advance */
     factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
@@ -450,7 +463,7 @@ typedef struct {
     /* Placement + Economics */
     placement_mode_t placement_mode;  /* client ordering strategy */
     economic_mode_t  economic_mode;   /* fee distribution model */
-    participant_profile_t profiles[FACTORY_MAX_SIGNERS];
+    participant_profile_t *profiles;  /* dynamic, sized to config.max_signers */
 
     /* Runtime config (Mainnet Gap #6) — stored limits for this factory */
     factory_config_t config;
@@ -467,7 +480,7 @@ typedef struct {
        nodes[0].keyagg (no taptree), message = dist_sighash.  Mirrors the per-node
        session helpers but targets the funding output instead of a tree node. */
     musig_signing_session_t dist_signing_session;
-    secp256k1_musig_partial_sig dist_partial_sigs[FACTORY_MAX_SIGNERS];
+    secp256k1_musig_partial_sig *dist_partial_sigs;  /* dynamic, sized to config.max_signers */
     int dist_partial_sigs_received;
     tx_buf_t dist_signed_tx;       /* fully-signed distribution TX (dist_tx_ready==2) */
 } factory_t;

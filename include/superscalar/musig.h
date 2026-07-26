@@ -70,7 +70,11 @@ typedef struct {
    secp256k1's aggregation takes size_t; this fixed array is the only cap. */
 
 typedef struct {
-    secp256k1_musig_pubnonce pubnonces[MUSIG_SESSION_MAX_SIGNERS];
+    secp256k1_musig_pubnonce *pubnonces; /* dynamic: allocated in musig_session_init
+                                            to n_signers (subtree size), not the global
+                                            max — keeps a large factory's tree O(N log N)
+                                            instead of O(N^2).  Free with musig_session_free. */
+    size_t pubnonces_cap;                /* allocated capacity of pubnonces[] */
     secp256k1_musig_aggnonce aggnonce;
     secp256k1_musig_session session;
     secp256k1_musig_keyagg_cache cache;  /* working copy, potentially tweaked */
@@ -80,6 +84,10 @@ typedef struct {
     int nonces_collected;                /* count of pubnonces received */
     int session_ready;                   /* nonce_process completed */
 } musig_signing_session_t;
+
+/* Free the dynamic pubnonces of a session (idempotent; safe on a zero-inited
+   or already-freed session).  Does not touch the enclosing struct otherwise. */
+void musig_session_free(musig_signing_session_t *session);
 
 /* --- Nonce pool functions --- */
 

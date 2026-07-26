@@ -106,7 +106,18 @@ int main(int argc, char **argv) {
         /* --- REAL factory: init -> set_funding -> build_tree -> sign_all --- */
         factory_t *f = calloc(1, sizeof(factory_t));
         if (!f) { fprintf(stderr, "oom factory_t (%zu MB)\n", sizeof(factory_t) >> 20); return 1; }
-        factory_init(f, ctx, kps, ns, 1, 4);
+        /* Config sized to THIS factory: max_signers = ns.  The default cap is
+           FACTORY_MAX_SIGNERS (256), which would reject N>255 at factory_init /
+           factory_build_tree.  We raise the cap PER INSTANCE rather than bumping
+           the compile-time #define, so the daemon's fixed [FACTORY_MAX_SIGNERS]
+           arrays stay small — only this single-process manager grows.  max_nodes
+           is seeded generously for the PS shape (~4 nodes/client); build_tree
+           grows it by realloc if needed. */
+        factory_config_t cfg; factory_config_default(&cfg);
+        cfg.max_signers = (uint32_t)ns;
+        cfg.max_leaves  = (uint32_t)(N + 1);          /* PS: one leaf per client */
+        cfg.max_nodes   = (uint32_t)(ns * 8 + 64);
+        factory_init_with_config(f, ctx, kps, ns, 1, 4, &cfg);
         factory_set_arity(f, FACTORY_ARITY_PS);
         unsigned char txid_le[32];
         if (hex_decode(txid_hex, txid_le, 32) != 32) { fprintf(stderr, "bad txid\n"); return 1; }
