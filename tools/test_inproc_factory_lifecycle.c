@@ -164,6 +164,22 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (argc >= 4 && !strcmp(argv[1], "dumpkeys")) {
+        /* Emit one hex private key per close-output index (0 = LSP, 1..N = clients),
+           i.e. kps[j] for j=0..N.  Close output index == key index, so a sweep can
+           map each rawtr(key) output back to its spender.  Used only for signet
+           fund-recovery; never on mainnet. */
+        size_t N = strtoull(argv[2], NULL, 10);
+        const char *seed = argv[3];
+        for (size_t j = 0; j <= N; j++) {
+            unsigned char sk[32];
+            if (!derive_seckey(ctx, seed, j, sk)) { fprintf(stderr, "derive %zu failed\n", j); return 1; }
+            char hx[65]; hex_encode(sk, 32, hx); hx[64] = 0;
+            printf("%zu %s\n", j, hx);
+        }
+        return 0;
+    }
+
     if (argc >= 8 && !strcmp(argv[1], "paylifecycle")) {
         size_t N = strtoull(argv[2], NULL, 10);       /* clients (= channels) */
         const char *seed = argv[3];
@@ -173,6 +189,7 @@ int main(int argc, char **argv) {
         const char *outfile = argv[7];
         uint64_t fee_rate = (argc >= 9) ? strtoull(argv[8], NULL, 10) : 1;
         size_t P = (argc >= 10) ? strtoull(argv[9], NULL, 10) : 4;  /* payments/channel */
+        const char *audit_dir = (argc >= 11) ? argv[10] : NULL;     /* extra proof/audit records */
         size_t ns = N + 1;
 
         secp256k1_keypair *kps = calloc(ns, sizeof(*kps));
@@ -208,12 +225,27 @@ int main(int argc, char **argv) {
         printf("  channels: %zu real 2-of-2 LN channels wired to leaves\n", mgr.n_channels);
 
         uint64_t init_client_total = 0;
-        for (size_t c = 0; c < N; c++) init_client_total += mgr.entries[c].channel.remote_amount;
+        uint64_t *init_local  = audit_dir ? calloc(N, sizeof(uint64_t)) : NULL;
+        uint64_t *init_remote = audit_dir ? calloc(N, sizeof(uint64_t)) : NULL;
+        for (size_t c = 0; c < N; c++) {
+            init_client_total += mgr.entries[c].channel.remote_amount;
+            if (init_local)  init_local[c]  = mgr.entries[c].channel.local_amount;
+            if (init_remote) init_remote[c] = mgr.entries[c].channel.remote_amount;
+        }
 
         /* --- REAL HTLC payments: channel_add_htlc(SHA256 hash) -> channel_fulfill_htlc(preimage).
                These move real balance with reserve/dust/fee enforcement and bump the
                commitment number.  3-of-4 are LSP->client, 1-of-4 client->LSP, so a net
                flow of sats reaches the clients through genuine HTLCs. --- */
+        /* Audit: per-HTLC ledger (channel, direction, amount, hash, PREIMAGE, and
+           balances before/after) — an independently-verifiable record of every
+           real payment.  Only written when an audit dir is supplied. */
+        FILE *af = NULL;
+        if (audit_dir) {
+            char pth[600]; snprintf(pth, sizeof pth, "%s/payments.jsonl", audit_dir);
+            af = fopen(pth, "w");
+            if (!af) fprintf(stderr, "warn: cannot open %s\n", pth);
+        }
         uint64_t gross_moved = 0, commit_sum = 0;
         size_t n_pay = 0, n_skip = 0;
         for (size_t c = 0; c < N; c++) {
@@ -227,12 +259,25 @@ int main(int argc, char **argv) {
                 pre[0] = (unsigned char)c; pre[1] = (unsigned char)(c >> 8);
                 pre[2] = (unsigned char)p; pre[3] = 0xA5;
                 sha256(pre, 32, hash);
+                uint64_t lb = ch->local_amount, rb = ch->remote_amount;
                 uint64_t id;
                 if (!channel_add_htlc(ch, dir, amt, hash, 100, &id)) { n_skip++; continue; }
                 if (!channel_fulfill_htlc(ch, id, pre))              { n_skip++; continue; }
                 gross_moved += amt; n_pay++;
+                if (af) {
+                    char hh[65], ph[65]; hex_encode(hash, 32, hh); hh[64] = 0; hex_encode(pre, 32, ph); ph[64] = 0;
+                    fprintf(af, "{\"i\":%zu,\"channel\":%zu,\"dir\":\"%s\",\"amount\":%llu,"
+                                "\"payment_hash\":\"%s\",\"preimage\":\"%s\","
+                                "\"local_before\":%llu,\"remote_before\":%llu,"
+                                "\"local_after\":%llu,\"remote_after\":%llu}\n",
+                            n_pay, c, (dir == HTLC_OFFERED) ? "lsp->client" : "client->lsp",
+                            (unsigned long long)amt, hh, ph,
+                            (unsigned long long)lb, (unsigned long long)rb,
+                            (unsigned long long)ch->local_amount, (unsigned long long)ch->remote_amount);
+                }
             }
         }
+        if (af) fclose(af);
         uint64_t final_client_total = 0;
         for (size_t c = 0; c < N; c++) {
             final_client_total += mgr.entries[c].channel.remote_amount;
@@ -248,10 +293,56 @@ int main(int argc, char **argv) {
         size_t n_out = lsp_channels_build_close_outputs(&mgr, f, outs, close_fee, NULL, 0);
         if (n_out == 0) { fprintf(stderr, "build_close_outputs FAILED (funding < client_total+fee?)\n"); return 1; }
         tx_buf_t close_tx; tx_buf_init(&close_tx, 1u << 20);
-        if (!factory_build_cooperative_close(f, &close_tx, NULL, outs, n_out, 0)) {
+        unsigned char close_txid[32];
+        if (!factory_build_cooperative_close(f, &close_tx, close_txid, outs, n_out, 0)) {
             fprintf(stderr, "factory_build_cooperative_close FAILED\n"); return 1;
         }
         uint64_t out_sum = 0; for (size_t i = 0; i < n_out; i++) out_sum += outs[i].amount_sats;
+
+        /* Audit: per-channel balances + close-output map (output index j maps to
+           key kps[j]: output 0 = LSP, outputs 1..N = client j).  This is the
+           record a sweep/verifier reads to reconstruct + recover every output. */
+        if (audit_dir) {
+            char pth[600];
+            snprintf(pth, sizeof pth, "%s/channels.csv", audit_dir);
+            FILE *cf = fopen(pth, "w");
+            if (cf) {
+                fprintf(cf, "channel,client_pubkey,init_local,init_remote,final_local,final_remote,commitment_number\n");
+                for (size_t c = 0; c < N; c++) {
+                    const channel_t *ch = &mgr.entries[c].channel;
+                    unsigned char pkser[33]; size_t pl = 33; char pkhex[67];
+                    secp256k1_ec_pubkey_serialize(ctx, pkser, &pl, &pks[c + 1], SECP256K1_EC_COMPRESSED);
+                    hex_encode(pkser, 33, pkhex); pkhex[66] = 0;
+                    fprintf(cf, "%zu,%s,%llu,%llu,%llu,%llu,%llu\n", c, pkhex,
+                            (unsigned long long)(init_local ? init_local[c] : 0),
+                            (unsigned long long)(init_remote ? init_remote[c] : 0),
+                            (unsigned long long)ch->local_amount, (unsigned long long)ch->remote_amount,
+                            (unsigned long long)ch->commitment_number);
+                }
+                fclose(cf);
+            }
+            unsigned char ctxid_disp[32]; memcpy(ctxid_disp, close_txid, 32); reverse_bytes(ctxid_disp, 32);
+            char ctxhex[65]; hex_encode(ctxid_disp, 32, ctxhex); ctxhex[64] = 0;
+            snprintf(pth, sizeof pth, "%s/close.json", audit_dir);
+            FILE *jf = fopen(pth, "w");
+            if (jf) {
+                fprintf(jf, "{\"close_txid\":\"%s\",\"n_outputs\":%zu,\"funding\":%llu,"
+                            "\"close_fee\":%llu,\"out_sum\":%llu,\"conserves\":%s,\"outputs\":[",
+                        ctxhex, n_out, (unsigned long long)amount,
+                        (unsigned long long)close_fee, (unsigned long long)out_sum,
+                        (out_sum + close_fee == amount) ? "true" : "false");
+                for (size_t i = 0; i < n_out; i++) {
+                    char spkhex[69]; hex_encode(outs[i].script_pubkey, outs[i].script_pubkey_len, spkhex);
+                    spkhex[outs[i].script_pubkey_len * 2] = 0;
+                    fprintf(jf, "%s{\"index\":%zu,\"role\":\"%s\",\"key_index\":%zu,\"spk\":\"%s\",\"amount\":%llu}",
+                            i ? "," : "", i, i == 0 ? "lsp" : "client", i, spkhex,
+                            (unsigned long long)outs[i].amount_sats);
+                }
+                fprintf(jf, "]}\n");
+                fclose(jf);
+            }
+            free(init_local); free(init_remote);
+        }
 
         FILE *fp = fopen(outfile, "w"); if (!fp) { fprintf(stderr, "cannot write %s\n", outfile); return 1; }
         char *hx = malloc(close_tx.len * 2 + 1); hex_encode(close_tx.data, close_tx.len, hx); hx[close_tx.len * 2] = 0;
