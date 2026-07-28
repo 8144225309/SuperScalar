@@ -78,12 +78,24 @@ seed_amt(){ echo $(( SEED_MIN + RANDOM % (SEED_MAX - SEED_MIN + 1) )); }
 econ_amt(){ echo $(( ECON_MIN + RANDOM % (ECON_MAX - ECON_MIN + 1) )); }
 
 settle_wait(){  # wait for the "Payment complete" count to increase past $1
-    # PAY_POLL is the poll granularity.  It matters at scale: seeding is O(N)
-    # serialized payments, so every payment pays the average poll latency plus
-    # PAY_RECOVER.  At N=224 the defaults (0.5s poll + 1s recover) spend ~280s of
-    # the ~690s seed phase asleep while the protocol itself takes milliseconds.
-    # Defaults unchanged; large-N runs should lower both (PAY_POLL=0.1
-    # PAY_RECOVER=0.2 cuts the seed roughly 4x).
+    # PAY_POLL is the poll granularity -- ONE of THREE per-payment sleeps, and on
+    # its own the smallest of them.  Seeding is O(N) serialized, so each payment
+    # pays all three:
+    #     PAY_POLL    ~0.25s   avg latency to notice settle (0.5s granularity)
+    #     PAY_RECOVER  1.00s   unconditional, after settle is detected
+    #     PAY_GAP      1.00s   unconditional, in the seed loop itself
+    #     ---------------------
+    #                 ~2.25s   sleep, against ~0.8s of actual protocol work
+    # At N=224 that is ~504s of the ~690s seed asleep (73%).  An earlier version
+    # of this comment said ~280s and credited PAY_POLL+PAY_RECOVER only -- it
+    # omitted PAY_GAP, which is co-equal largest, so it pointed at the wrong
+    # knobs.  Lowering PAY_POLL alone buys ~1.1x; all three together
+    # (0.1 / 0.2 / 0.2) is ~2.4x.  Defaults unchanged -- they are what the green
+    # N=224 runs used, and this is test ergonomics, not a protocol limit.
+    # The real fix is not smaller sleeps but an event-driven wait: block on the
+    # log rather than re-grepping a file that grows all through the seed phase,
+    # and drop the two unconditional settles.  Worth doing only if seed
+    # wall-clock ever becomes the binding constraint.
     local before="$1" now _w
     for _w in $(seq 1 "$PAY_SETTLE_TRIES"); do
         now=$(grep -ac "Payment complete" "$LSP_LOG" 2>/dev/null); now=${now:-0}
