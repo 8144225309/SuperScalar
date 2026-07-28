@@ -789,6 +789,7 @@ int test_regtest_ladder_distribution_fallback(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid, (uint32_t)found_vout,
@@ -1004,6 +1005,7 @@ int test_rotation_context_save_restore(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
 
@@ -1179,6 +1181,7 @@ int test_regtest_ptlc_no_coop_close(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid, (uint32_t)found_vout,
@@ -1346,6 +1349,7 @@ int test_regtest_all_offline_recovery(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid, (uint32_t)found_vout,
@@ -2020,6 +2024,7 @@ int test_regtest_funding_double_spend_rejected(void) {
 
     /* Init factory, build tree, sign all (creates kickoff tx) */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,

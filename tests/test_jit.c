@@ -1094,6 +1094,7 @@ int test_regtest_jit_daemon_trigger(void) {
     /* Create minimal factory with short lifecycle */
     int base_height = regtest_get_block_height(&rt);
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     factory_set_lifecycle(f, (uint32_t)base_height, 5, 5);

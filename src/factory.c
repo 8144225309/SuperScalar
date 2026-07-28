@@ -168,6 +168,16 @@ static int add_node(
 
     node->type = type;
     node->n_signers = n_signers;
+    /* Per-node signer arrays are subtree-sized (n_signers), not the global max —
+       this is what makes the whole tree O(N log N) in memory and lets the root
+       node (n_signers == N+1) exceed the old fixed FACTORY_MAX_SIGNERS cap.
+       Freed in factory_free (the node is already counted in n_nodes, so a
+       mid-init error return still gets these reclaimed). */
+    node->signer_indices      = calloc(n_signers, sizeof(uint32_t));
+    node->partial_sigs        = calloc(n_signers, sizeof(secp256k1_musig_partial_sig));
+    node->poison_partial_sigs = calloc(n_signers, sizeof(secp256k1_musig_partial_sig));
+    if (!node->signer_indices || !node->partial_sigs || !node->poison_partial_sigs)
+        return -1;
     memcpy(node->signer_indices, signer_indices, n_signers * sizeof(uint32_t));
     node->parent_index = parent_index;
     node->parent_vout = parent_vout;
@@ -178,8 +188,11 @@ static int add_node(
     tx_buf_init(&node->unsigned_tx, 256);
     tx_buf_init(&node->signed_tx, 512);
 
-    /* Aggregate keys and compute tweaked pubkey + spending SPK */
-    secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+    /* Aggregate keys and compute tweaked pubkey + spending SPK.  Heap scratch
+       sized to n_signers (was a pks[FACTORY_MAX_SIGNERS] stack array, which would
+       overflow the stack for the root node at N>255).  Freed on every return. */
+    secp256k1_pubkey *pks = malloc(n_signers * sizeof(secp256k1_pubkey));
+    if (!pks) return -1;
     for (size_t i = 0; i < n_signers; i++)
         pks[i] = f->pubkeys[signer_indices[i]];
 
@@ -187,23 +200,24 @@ static int add_node(
         /* Build CLTV timeout script leaf using LSP pubkey (index 0) */
         secp256k1_xonly_pubkey lsp_xonly;
         if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]))
-            return -1;
+            { free(pks); return -1; }
 
         if (!tapscript_build_cltv_timeout(&node->timeout_leaf, node_cltv,
                                           &lsp_xonly, f->ctx))
-            return -1;
+            { free(pks); return -1; }
         tapscript_merkle_root(node->merkle_root, &node->timeout_leaf, 1);
 
         /* Tweak internal key with merkle root */
         if (!build_musig_p2tr_spk(f->ctx, node->spending_spk, &node->tweaked_pubkey,
                                    &node->output_parity, &node->keyagg, pks, n_signers,
                                    node->merkle_root))
-            return -1;
+            { free(pks); return -1; }
     } else {
         if (!build_musig_p2tr_spk(f->ctx, node->spending_spk, &node->tweaked_pubkey,
                                    NULL, &node->keyagg, pks, n_signers, NULL))
-            return -1;
+            { free(pks); return -1; }
     }
+    free(pks);
 
     node->spending_spk_len = 34;
 
@@ -394,7 +408,7 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
 
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32) {
-    if (!f || node_idx >= FACTORY_MAX_NODES || !h32) return;
+    if (!f || node_idx >= f->config.max_nodes || !h32) return;
     memcpy(f->node_l_stock_hashes[node_idx], h32, 32);
     f->node_l_stock_hash_valid[node_idx] = 1;
     f->has_node_l_stock_hashes = 1;
@@ -713,6 +727,32 @@ void factory_config_default(factory_config_t *cfg) {
     cfg->dust_limit_sats = 546;
 }
 
+int factory_alloc_default_arrays(factory_t *f) {
+    if (!f) return 0;
+    if (f->config.max_signers == 0) factory_config_default(&f->config);
+    if (!f->keypairs)
+        f->keypairs = calloc(f->config.max_signers, sizeof(secp256k1_keypair));
+    if (!f->pubkeys)
+        f->pubkeys = calloc(f->config.max_signers, sizeof(secp256k1_pubkey));
+    if (!f->profiles)
+        f->profiles = calloc(f->config.max_signers, sizeof(participant_profile_t));
+    if (!f->dist_partial_sigs)
+        f->dist_partial_sigs = calloc(f->config.max_signers, sizeof(secp256k1_musig_partial_sig));
+    if (!f->leaf_layers)
+        f->leaf_layers = calloc(f->config.max_leaves, sizeof(dw_layer_t));
+    if (!f->leaf_node_indices)
+        f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
+    if (!f->nodes)
+        f->nodes = calloc(f->config.max_nodes, sizeof(factory_node_t));
+    if (!f->node_l_stock_hashes)
+        f->node_l_stock_hashes = calloc(f->config.max_nodes, 32);
+    if (!f->node_l_stock_hash_valid)
+        f->node_l_stock_hash_valid = calloc(f->config.max_nodes, sizeof(int));
+    return f->keypairs && f->pubkeys && f->profiles && f->dist_partial_sigs &&
+           f->leaf_layers && f->leaf_node_indices && f->nodes &&
+           f->node_l_stock_hashes && f->node_l_stock_hash_valid;
+}
+
 int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
                               const secp256k1_keypair *keypairs, size_t n_participants,
                               uint16_t step_blocks, uint32_t states_per_layer,
@@ -731,6 +771,23 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
         factory_config_default(&f->config);
 
     if (n_participants > f->config.max_signers)
+        return 0;
+
+    /* Factory-level participant arrays sized to the config cap (were fixed
+       [FACTORY_MAX_SIGNERS]).  O(N), one copy per factory — this is what lets the
+       manager exceed 256 signers.  Freed in factory_free, deep-copied in
+       factory_detach_txbufs. */
+    f->keypairs          = calloc(f->config.max_signers, sizeof(secp256k1_keypair));
+    f->pubkeys           = calloc(f->config.max_signers, sizeof(secp256k1_pubkey));
+    f->profiles          = calloc(f->config.max_signers, sizeof(participant_profile_t));
+    f->dist_partial_sigs = calloc(f->config.max_signers, sizeof(secp256k1_musig_partial_sig));
+    /* Per-leaf arrays sized to config.max_leaves (were fixed [FACTORY_MAX_LEAVES]).
+       Allocated here — BEFORE the dw_layer_init loop below — because PS makes one
+       leaf per client and the loop indexes up to n_leaves. */
+    f->leaf_layers       = calloc(f->config.max_leaves, sizeof(dw_layer_t));
+    f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
+    if (!f->keypairs || !f->pubkeys || !f->profiles || !f->dist_partial_sigs ||
+        !f->leaf_layers || !f->leaf_node_indices)
         return 0;
 
     for (size_t i = 0; i < n_participants; i++) {
@@ -755,6 +812,12 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
        sub-factories — preserves all historical PS test behavior).
        Override with factory_set_ps_subfactory_arity() before build. */
     f->ps_subfactory_arity = 1;
+
+    /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
+       config cap; factory_build_tree grows them if the tree needs more nodes. */
+    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
+    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
     return 1;
 }
 
@@ -775,6 +838,15 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
     f->states_per_layer = states_per_layer;
     f->fee_per_tx = 200;  /* 1 sat/vB floor for ~200 vB tx; overridden by factory_build_tree */
     factory_config_default(&f->config);
+
+    /* Factory-level arrays sized to the config cap (were fixed
+       [FACTORY_MAX_SIGNERS]).  keypairs stays zeroed here (pubkey-only path). */
+    f->keypairs          = calloc(f->config.max_signers, sizeof(secp256k1_keypair));
+    f->pubkeys           = calloc(f->config.max_signers, sizeof(secp256k1_pubkey));
+    f->profiles          = calloc(f->config.max_signers, sizeof(participant_profile_t));
+    f->dist_partial_sigs = calloc(f->config.max_signers, sizeof(secp256k1_musig_partial_sig));
+    f->leaf_layers       = calloc(f->config.max_leaves, sizeof(dw_layer_t));
+    f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
 
     for (size_t i = 0; i < n_participants; i++)
         f->pubkeys[i] = pubkeys[i];
@@ -797,6 +869,12 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
        sub-factories — preserves all historical PS test behavior).
        Override with factory_set_ps_subfactory_arity() before build. */
     f->ps_subfactory_arity = 1;
+
+    /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
+       config cap; factory_build_tree grows them if the tree needs more nodes. */
+    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
+    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
@@ -1304,7 +1382,7 @@ static int setup_ps_leaf_with_subfactories(
         if (end_client > n_leaf_clients) end_client = n_leaf_clients;
         size_t n_in_sub = end_client - start_client;
 
-        uint32_t sub_signers[FACTORY_MAX_SIGNERS];
+        uint32_t sub_signers[n_in_sub + 1];   /* subtree-sized, not the global max */
         sub_signers[0] = 0;
         for (size_t ci = 0; ci < n_in_sub; ci++)
             sub_signers[ci + 1] = leaf_client_indices[start_client + ci];
@@ -1494,8 +1572,11 @@ static int build_subtree(
 ) {
     if (n_clients == 0) return 0;
 
-    /* Build signer set: {0 (LSP)} ∪ all client_indices in this subtree */
-    uint32_t signers[FACTORY_MAX_SIGNERS];
+    /* Build signer set: {0 (LSP)} ∪ all client_indices in this subtree.
+       VLA sized to this subtree's signer count (n_clients+1), not the global
+       max — the root's set is N+1, which the old fixed [FACTORY_MAX_SIGNERS]
+       stack array overflowed at N>255. */
+    uint32_t signers[n_clients + 1];
     size_t n_signers = 0;
     signers[n_signers++] = 0;  /* LSP always signs */
     for (size_t i = 0; i < n_clients; i++)
@@ -1686,8 +1767,9 @@ static int build_subtree(
                 return 0;
         }
 
-        /* Record leaf index */
-        if (*leaf_counter >= FACTORY_MAX_LEAVES) return 0;
+        /* Record leaf index (bound is the dynamic config cap, not the old
+           compile-time FACTORY_MAX_LEAVES — leaf_node_indices is sized to it). */
+        if (*leaf_counter >= (int)f->config.max_leaves) return 0;
         f->leaf_node_indices[*leaf_counter] = (size_t)st_idx;
         (*leaf_counter)++;
     } else {
@@ -1791,7 +1873,24 @@ int factory_build_tree(factory_t *f) {
     int n_dw_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
     int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
-    if (total_nodes_ub > (int)f->config.max_nodes) return 0;
+    /* Grow the dynamic node arrays if this tree needs more than the current cap
+       (a 255-client PS factory needs ~1018 nodes vs the 512 default). */
+    if (total_nodes_ub > (int)f->config.max_nodes) {
+        size_t nn = (size_t)total_nodes_ub, old = f->config.max_nodes;
+        factory_node_t *gn = realloc(f->nodes, nn * sizeof(factory_node_t));
+        if (!gn) return 0;
+        f->nodes = gn;
+        unsigned char (*gh)[32] = realloc(f->node_l_stock_hashes, nn * 32);
+        if (!gh) return 0;
+        f->node_l_stock_hashes = gh;
+        int *gv = realloc(f->node_l_stock_hash_valid, nn * sizeof(int));
+        if (!gv) return 0;
+        f->node_l_stock_hash_valid = gv;
+        memset(f->nodes + old, 0, (nn - old) * sizeof(factory_node_t));
+        memset(f->node_l_stock_hashes + old, 0, (nn - old) * 32);
+        memset(f->node_l_stock_hash_valid + old, 0, (nn - old) * sizeof(int));
+        f->config.max_nodes = (uint32_t)nn;
+    }
     if (n_leaves > (int)f->config.max_leaves) return 0;
     if (n_dw_layers > DW_MAX_LAYERS) return 0;
 
@@ -1810,8 +1909,9 @@ int factory_build_tree(factory_t *f) {
         return 0;
     }
 
-    /* Build client index array [1, 2, ..., n_clients] */
-    uint32_t clients[FACTORY_MAX_SIGNERS];
+    /* Build client index array [1, 2, ..., n_clients].  VLA sized to n_clients
+       (was fixed [FACTORY_MAX_SIGNERS], which capped the factory at 255 clients). */
+    uint32_t clients[n_clients ? n_clients : 1];
     for (size_t i = 0; i < n_clients; i++)
         clients[i] = (uint32_t)(i + 1);
 
@@ -1890,6 +1990,7 @@ int factory_sessions_init(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_built) return 0;
+        musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
         musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
         node->partial_sigs_received = 0;
     }
@@ -2027,6 +2128,7 @@ int factory_sessions_init_path(factory_t *f, int leaf_node_idx) {
     for (size_t i = 0; i < n; i++) {
         factory_node_t *node = &f->nodes[path[i]];
         if (!node->is_built) return 0;
+        musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
         musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
         node->partial_sigs_received = 0;
     }
@@ -3133,6 +3235,7 @@ int factory_session_init_node_input(factory_t *f, size_t node_idx, size_t input_
                 node_idx, input_idx);
         return 0;
     }
+    musig_session_free(&node->input_signing_sessions[input_idx]);   /* re-init: release first */
     musig_session_init(&node->input_signing_sessions[input_idx],
                         &node->input_keyaggs[input_idx],
                         node->input_n_signers[input_idx]);
@@ -3272,8 +3375,15 @@ void factory_session_reset_poison(factory_t *f, size_t node_idx) {
     node->poison_partial_sigs_received = 0;
     node->poison_is_signed = 0;
     /* secp256k1_musig structures are POD-style; zeroing is safe. */
+    /* poison_signing_session.pubnonces is dynamic — free before zeroing the
+       struct so the reset does not leak the old allocation. */
+    musig_session_free(&node->poison_signing_session);
     memset(&node->poison_signing_session, 0, sizeof(node->poison_signing_session));
-    memset(node->poison_partial_sigs, 0, sizeof(node->poison_partial_sigs));
+    /* poison_partial_sigs is now a heap pointer (sized to n_signers), so
+       sizeof() would only zero the pointer.  Zero the actual array. */
+    if (node->poison_partial_sigs)
+        memset(node->poison_partial_sigs, 0,
+               node->n_signers * sizeof(secp256k1_musig_partial_sig));
     /* #53-B3a script-path ceremony state */
     node->poison_is_scriptpath = 0;
     node->poison_has_agg_sig = 0;
@@ -3366,6 +3476,7 @@ int factory_session_init_node_poison(factory_t *f, size_t node_idx) {
     /* The poison TX is signed against the SAME keyagg as the state TX
        (LSP + leaf signers, N-of-N MuSig).  The SIGHASH differs (poison
        TX bytes vs new state TX bytes) and the NONCES MUST be fresh. */
+    musig_session_free(&node->poison_signing_session);   /* re-init: release first */
     musig_session_init(&node->poison_signing_session, &node->keyagg,
                         node->n_signers);
     node->poison_partial_sigs_received = 0;
@@ -4350,6 +4461,7 @@ int factory_session_init_dist(factory_t *f) {
     if (f->dist_tx_ready < 1 || f->dist_unsigned_tx.len == 0) return 0;
     if (!f->nodes[0].is_built) return 0;
     /* Same aggregate key as kickoff_root (factory_build_distribution_tx). */
+    musig_session_free(&f->dist_signing_session);   /* re-init: release first */
     musig_session_init(&f->dist_signing_session, &f->nodes[0].keyagg,
                        f->n_participants);
     f->dist_partial_sigs_received = 0;
@@ -4820,9 +4932,23 @@ void factory_free(factory_t *f) {
            (tx_buf_free is a no-op on zero-init). */
         tx_buf_free(&f->nodes[i].poison_unsigned_tx);
         tx_buf_free(&f->nodes[i].poison_signed_tx);
+        /* Free the two per-node signing sessions' dynamic pubnonces[] (sized to
+           node->n_signers in musig_session_init).  musig_session_free is a no-op
+           on a zero-inited/never-signed node (pubnonces == NULL). */
+        musig_session_free(&f->nodes[i].signing_session);
+        musig_session_free(&f->nodes[i].poison_signing_session);
+        /* Subtree-sized per-node signer arrays (allocated in add_node). */
+        free(f->nodes[i].signer_indices);      f->nodes[i].signer_indices = NULL;
+        free(f->nodes[i].partial_sigs);        f->nodes[i].partial_sigs = NULL;
+        free(f->nodes[i].poison_partial_sigs); f->nodes[i].poison_partial_sigs = NULL;
         /* Multi-input chain advance per-input session arrays (#207).
            free() is a no-op on NULL, so safe even when the multi-input
-           path was never exercised on this node. */
+           path was never exercised on this node.  Each per-input session also
+           owns a dynamic pubnonces[]; free those before the array itself. */
+        if (f->nodes[i].input_signing_sessions) {
+            for (size_t s = 0; s < f->nodes[i].n_input_sessions; s++)
+                musig_session_free(&f->nodes[i].input_signing_sessions[s]);
+        }
         free(f->nodes[i].input_signing_sessions);
         f->nodes[i].input_signing_sessions = NULL;
         free(f->nodes[i].input_partial_sigs);
@@ -4839,6 +4965,21 @@ void factory_free(factory_t *f) {
     tx_buf_free(&f->dist_signed_tx);   /* #54 G1 */
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
+    /* Factory-level distribution signing session's dynamic pubnonces. */
+    musig_session_free(&f->dist_signing_session);
+    /* Free the dynamic node arrays (were inline).  NULL after free so a second
+       factory_free / a detached copy is a no-op (free(NULL) is safe). */
+    free(f->nodes);                    f->nodes = NULL;
+    free(f->node_l_stock_hashes);      f->node_l_stock_hashes = NULL;
+    free(f->node_l_stock_hash_valid);  f->node_l_stock_hash_valid = NULL;
+    /* Factory-level participant arrays (were fixed [FACTORY_MAX_SIGNERS]). */
+    free(f->keypairs);          f->keypairs = NULL;
+    free(f->pubkeys);           f->pubkeys = NULL;
+    free(f->profiles);          f->profiles = NULL;
+    free(f->dist_partial_sigs); f->dist_partial_sigs = NULL;
+    /* Per-leaf arrays (were fixed [FACTORY_MAX_LEAVES]). */
+    free(f->leaf_layers);       f->leaf_layers = NULL;
+    free(f->leaf_node_indices); f->leaf_node_indices = NULL;
 }
 
 uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output_index) {
@@ -4847,6 +4988,23 @@ uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output
 }
 
 void factory_detach_txbufs(factory_t *f) {
+    /* This is called right after a factory_t struct copy (e.g. a ladder entry
+       ← lsp->factory).  The dynamic node arrays were shallow-shared by that
+       copy; give this copy its OWN arrays so (a) factory_free is independent
+       (no double-free) and (b) the txbuf-zeroing below touches only this copy,
+       not the original.  This reproduces the pre-dynamic inline-array copy
+       semantics (per-node txbuf POINTERS stay shared, then get zeroed below). */
+    if (f->nodes && f->config.max_nodes > 0) {
+        size_t mn = f->config.max_nodes;
+        factory_node_t *n2 = malloc(mn * sizeof(factory_node_t));
+        if (n2) { memcpy(n2, f->nodes, mn * sizeof(factory_node_t)); f->nodes = n2; }
+        unsigned char (*h2)[32] = malloc(mn * 32);
+        if (h2 && f->node_l_stock_hashes) { memcpy(h2, f->node_l_stock_hashes, mn * 32); f->node_l_stock_hashes = h2; }
+        else if (h2) { memset(h2, 0, mn * 32); f->node_l_stock_hashes = h2; }
+        int *v2 = malloc(mn * sizeof(int));
+        if (v2 && f->node_l_stock_hash_valid) { memcpy(v2, f->node_l_stock_hash_valid, mn * sizeof(int)); f->node_l_stock_hash_valid = v2; }
+        else if (v2) { memset(v2, 0, mn * sizeof(int)); f->node_l_stock_hash_valid = v2; }
+    }
     for (size_t i = 0; i < f->n_nodes; i++) {
         memset(&f->nodes[i].unsigned_tx, 0, sizeof(tx_buf_t));
         memset(&f->nodes[i].signed_tx, 0, sizeof(tx_buf_t));
@@ -4857,7 +5015,67 @@ void factory_detach_txbufs(factory_t *f) {
            lsp_cleanup, once via ladder_free) → double-free abort. */
         memset(&f->nodes[i].poison_unsigned_tx, 0, sizeof(tx_buf_t));
         memset(&f->nodes[i].poison_signed_tx, 0, sizeof(tx_buf_t));
+        /* The struct memcpy above aliased the two per-node sessions' dynamic
+           pubnonces[] pointers onto the original.  Sessions are transient signing
+           scratch (rebuilt by musig_session_init on the next sign), so detach the
+           COPY by nulling its pointers — the original keeps + frees them.  Same
+           shared-pointer / double-free logic as the txbufs zeroed above. */
+        f->nodes[i].signing_session.pubnonces = NULL;
+        f->nodes[i].signing_session.pubnonces_cap = 0;
+        f->nodes[i].poison_signing_session.pubnonces = NULL;
+        f->nodes[i].poison_signing_session.pubnonces_cap = 0;
+        /* The struct memcpy above also aliased the 3 subtree-sized signer arrays.
+           Unlike the sessions, these are read (signer_indices) and written
+           (partial_sigs) by factory_sign_node WITHOUT re-allocating, so the copy
+           needs its OWN — deep-copy rather than null.  Sized to this node's
+           n_signers, matching add_node. */
+        size_t ns = f->nodes[i].n_signers;
+        if (ns > 0) {
+            uint32_t *si = malloc(ns * sizeof(uint32_t));
+            if (si && f->nodes[i].signer_indices)
+                memcpy(si, f->nodes[i].signer_indices, ns * sizeof(uint32_t));
+            f->nodes[i].signer_indices = si;
+            secp256k1_musig_partial_sig *ps = malloc(ns * sizeof(*ps));
+            if (ps && f->nodes[i].partial_sigs)
+                memcpy(ps, f->nodes[i].partial_sigs, ns * sizeof(*ps));
+            f->nodes[i].partial_sigs = ps;
+            secp256k1_musig_partial_sig *pps = malloc(ns * sizeof(*pps));
+            if (pps && f->nodes[i].poison_partial_sigs)
+                memcpy(pps, f->nodes[i].poison_partial_sigs, ns * sizeof(*pps));
+            f->nodes[i].poison_partial_sigs = pps;
+        }
     }
     memset(&f->dist_unsigned_tx, 0, sizeof(tx_buf_t));
     memset(&f->dist_signed_tx, 0, sizeof(tx_buf_t));   /* #54 G1 */
+    /* The factory_t struct copy aliased the 4 dynamic factory-level arrays.
+       keypairs/pubkeys/profiles are structural (needed to sign the copy), so
+       deep-copy them; dist_partial_sigs is transient but copied too for
+       uniformity.  dist_signing_session.pubnonces is transient — null it. */
+    size_t ms = f->config.max_signers;
+    if (ms > 0) {
+        secp256k1_keypair *kp = malloc(ms * sizeof(*kp));
+        if (kp && f->keypairs) memcpy(kp, f->keypairs, ms * sizeof(*kp));
+        f->keypairs = kp;
+        secp256k1_pubkey *pk = malloc(ms * sizeof(*pk));
+        if (pk && f->pubkeys) memcpy(pk, f->pubkeys, ms * sizeof(*pk));
+        f->pubkeys = pk;
+        participant_profile_t *pr = malloc(ms * sizeof(*pr));
+        if (pr && f->profiles) memcpy(pr, f->profiles, ms * sizeof(*pr));
+        f->profiles = pr;
+        secp256k1_musig_partial_sig *dp = malloc(ms * sizeof(*dp));
+        if (dp && f->dist_partial_sigs) memcpy(dp, f->dist_partial_sigs, ms * sizeof(*dp));
+        f->dist_partial_sigs = dp;
+    }
+    f->dist_signing_session.pubnonces = NULL;
+    f->dist_signing_session.pubnonces_cap = 0;
+    /* Per-leaf arrays: structural DW state, deep-copy so the copy is independent. */
+    size_t ml = f->config.max_leaves;
+    if (ml > 0) {
+        dw_layer_t *ll = malloc(ml * sizeof(*ll));
+        if (ll && f->leaf_layers) memcpy(ll, f->leaf_layers, ml * sizeof(*ll));
+        f->leaf_layers = ll;
+        size_t *li = malloc(ml * sizeof(*li));
+        if (li && f->leaf_node_indices) memcpy(li, f->leaf_node_indices, ml * sizeof(*li));
+        f->leaf_node_indices = li;
+    }
 }
