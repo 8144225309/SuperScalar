@@ -6,6 +6,40 @@ at 127* — separate client instances, real sockets, real Noise handshakes, real
 wire protocol, real per-payment commitment ceremonies — on the hardware we have,
 without buying a bigger box.
 
+## 0. MEASURED RESULTS — read this before the projections below
+
+A falsification run (real `superscalar_lsp` + N × `superscalar_client`, real
+sockets, regtest, pct-100 lifecycle: onboard-at-zero → LN seed → c2c economy →
+(N+1)-output cooperative close with per-client reconciliation) produced:
+
+| N | outcome | wall | LSP RSS | per client | swarm total |
+|---|---|---|---|---|---|
+| 127 | **PASS** | 569 s | 46.4 MB | 21.0 MB | 2.65 GB |
+| 160 | **PASS** | 577 s | 50.3 MB | 22.3 MB | 3.55 GB |
+| 192 | **PASS** | 663 s | 54.4 MB | 26.5 MB | 4.49 GB |
+
+N=192 closed with 193 outputs (`a25d8541…`), RECONCILE PERFECT, sat-for-sat.
+
+**Three predictions in the earlier draft were wrong, and the measurements win:**
+
+1. **N=192 already works with real daemons, unchanged.** The "127 ceiling" was
+   never a limit anyone had hit — it was simply the largest N previously tried.
+   That is a free ~1.5× with no code change.
+2. **The wire-frame limit (§3b B1) did NOT fire** — zero frame errors at any N.
+   The dense `nodes × n_participants` matrix at `client.c:1675` is evidently not
+   what a pseudo-Spilman ceremony exercises: PS leaves are 2-of-2, so the
+   all-signer matrix is far smaller than the worst case computed there. **B1 is
+   NOT the gating blocker.** It may still bite for non-PS shapes; unverified.
+3. **The LSP is not a scaling factor** — 46→54 MB, essentially flat in N.
+
+**What survives:** per-client memory is the real wall, and it grows ~0.085 MB per
+added client from a ~21 MB floor. Extrapolating from measurement, not arithmetic:
+N=256 ≈ 8.2 GB, **N=512 ≈ 27 GB**. So §3 (path-only client) remains the
+load-bearing fix — but for the reason in §2, not §3b.
+
+Where it actually breaks is being measured (224/256); §3b's ordering claim
+("B1 gates everything above ~250") is **withdrawn**.
+
 ## 1. What is and is not proven today
 
 | level | fidelity | max N proven |
