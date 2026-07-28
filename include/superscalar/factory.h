@@ -485,6 +485,14 @@ typedef struct {
     tx_buf_t dist_signed_tx;       /* fully-signed distribution TX (dist_tx_ready==2) */
 } factory_t;
 
+/* Allocate the dynamic arrays (participants / per-leaf / per-node) at config
+   defaults for a factory_t that was built BY HAND — calloc'd or stack-zeroed and
+   then field-poked — instead of going through factory_init*().  Many tests and
+   recovery paths do that; before these arrays became dynamic they were inline, so
+   a zeroed struct was immediately usable.  NULL-safe and idempotent: passing NULL
+   or an already-initialized factory is a no-op.  Returns 1 on success. */
+int factory_alloc_default_arrays(factory_t *f);
+
 int factory_init(factory_t *f, secp256k1_context *ctx,
                   const secp256k1_keypair *keypairs, size_t n_participants,
                   uint16_t step_blocks, uint32_t states_per_layer);

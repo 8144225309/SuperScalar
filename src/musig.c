@@ -274,23 +274,22 @@ void musig_session_init(
     const musig_keyagg_t *keyagg,
     size_t n_signers
 ) {
-    /* pubnonces is a dynamic array sized to n_signers (the subtree signer count for
-       a factory node), not the global max — this is what keeps a large factory's
-       tree O(N log N) instead of O(N^2).  Preserve+reuse any existing allocation
-       across a re-init (retry/rotation) so we neither leak nor free garbage.
-       CONTRACT: the session must be zero-inited before its FIRST musig_session_init
-       (factory nodes are calloc'd; standalone sessions must be {0}/memset). */
-    secp256k1_musig_pubnonce *pn = session->pubnonces;
-    size_t cap = session->pubnonces_cap;
+    /* NEVER reads the incoming struct (an uninitialized stack session is safe).
+       Small sessions (<= MUSIG_SESSION_SMALL signers: channel 2-of-2, adaptor,
+       most factory nodes) use the inline buffer — no heap, no free needed, the
+       exact pre-refactor behavior.  Large sessions (big subtree nodes) heap-
+       allocate to n_signers, which is what keeps the whole tree O(N log N);
+       their owners must musig_session_free (factory_free does), and any RE-init
+       of a live large session must free first (factory sign sites do). */
     memset(session, 0, sizeof(*session));
-    if (n_signers == 0) n_signers = 1;   /* never calloc(0) */
-    if (cap < n_signers) {
-        free(pn);
-        pn = calloc(n_signers, sizeof(secp256k1_musig_pubnonce));
-        cap = pn ? n_signers : 0;
+    if (n_signers == 0) n_signers = 1;
+    if (n_signers <= MUSIG_SESSION_SMALL) {
+        session->pubnonces = session->pubnonces_small;
+        session->pubnonces_cap = MUSIG_SESSION_SMALL;
+    } else {
+        session->pubnonces = calloc(n_signers, sizeof(secp256k1_musig_pubnonce));
+        session->pubnonces_cap = session->pubnonces ? n_signers : 0;
     }
-    session->pubnonces = pn;
-    session->pubnonces_cap = cap;
     memcpy(&session->cache, &keyagg->cache, sizeof(secp256k1_musig_keyagg_cache));
     memcpy(&session->agg_pubkey, &keyagg->agg_pubkey, sizeof(secp256k1_xonly_pubkey));
     session->n_signers = n_signers;
@@ -299,7 +298,8 @@ void musig_session_init(
 void musig_session_free(musig_signing_session_t *session)
 {
     if (!session) return;
-    free(session->pubnonces);
+    if (session->pubnonces && session->pubnonces != session->pubnonces_small)
+        free(session->pubnonces);
     session->pubnonces = NULL;
     session->pubnonces_cap = 0;
 }

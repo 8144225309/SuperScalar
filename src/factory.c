@@ -727,6 +727,32 @@ void factory_config_default(factory_config_t *cfg) {
     cfg->dust_limit_sats = 546;
 }
 
+int factory_alloc_default_arrays(factory_t *f) {
+    if (!f) return 0;
+    if (f->config.max_signers == 0) factory_config_default(&f->config);
+    if (!f->keypairs)
+        f->keypairs = calloc(f->config.max_signers, sizeof(secp256k1_keypair));
+    if (!f->pubkeys)
+        f->pubkeys = calloc(f->config.max_signers, sizeof(secp256k1_pubkey));
+    if (!f->profiles)
+        f->profiles = calloc(f->config.max_signers, sizeof(participant_profile_t));
+    if (!f->dist_partial_sigs)
+        f->dist_partial_sigs = calloc(f->config.max_signers, sizeof(secp256k1_musig_partial_sig));
+    if (!f->leaf_layers)
+        f->leaf_layers = calloc(f->config.max_leaves, sizeof(dw_layer_t));
+    if (!f->leaf_node_indices)
+        f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
+    if (!f->nodes)
+        f->nodes = calloc(f->config.max_nodes, sizeof(factory_node_t));
+    if (!f->node_l_stock_hashes)
+        f->node_l_stock_hashes = calloc(f->config.max_nodes, 32);
+    if (!f->node_l_stock_hash_valid)
+        f->node_l_stock_hash_valid = calloc(f->config.max_nodes, sizeof(int));
+    return f->keypairs && f->pubkeys && f->profiles && f->dist_partial_sigs &&
+           f->leaf_layers && f->leaf_node_indices && f->nodes &&
+           f->node_l_stock_hashes && f->node_l_stock_hash_valid;
+}
+
 int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
                               const secp256k1_keypair *keypairs, size_t n_participants,
                               uint16_t step_blocks, uint32_t states_per_layer,
@@ -1964,6 +1990,7 @@ int factory_sessions_init(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_built) return 0;
+        musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
         musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
         node->partial_sigs_received = 0;
     }
@@ -2101,6 +2128,7 @@ int factory_sessions_init_path(factory_t *f, int leaf_node_idx) {
     for (size_t i = 0; i < n; i++) {
         factory_node_t *node = &f->nodes[path[i]];
         if (!node->is_built) return 0;
+        musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
         musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
         node->partial_sigs_received = 0;
     }
@@ -3207,6 +3235,7 @@ int factory_session_init_node_input(factory_t *f, size_t node_idx, size_t input_
                 node_idx, input_idx);
         return 0;
     }
+    musig_session_free(&node->input_signing_sessions[input_idx]);   /* re-init: release first */
     musig_session_init(&node->input_signing_sessions[input_idx],
                         &node->input_keyaggs[input_idx],
                         node->input_n_signers[input_idx]);
@@ -3447,6 +3476,7 @@ int factory_session_init_node_poison(factory_t *f, size_t node_idx) {
     /* The poison TX is signed against the SAME keyagg as the state TX
        (LSP + leaf signers, N-of-N MuSig).  The SIGHASH differs (poison
        TX bytes vs new state TX bytes) and the NONCES MUST be fresh. */
+    musig_session_free(&node->poison_signing_session);   /* re-init: release first */
     musig_session_init(&node->poison_signing_session, &node->keyagg,
                         node->n_signers);
     node->poison_partial_sigs_received = 0;
@@ -4431,6 +4461,7 @@ int factory_session_init_dist(factory_t *f) {
     if (f->dist_tx_ready < 1 || f->dist_unsigned_tx.len == 0) return 0;
     if (!f->nodes[0].is_built) return 0;
     /* Same aggregate key as kickoff_root (factory_build_distribution_tx). */
+    musig_session_free(&f->dist_signing_session);   /* re-init: release first */
     musig_session_init(&f->dist_signing_session, &f->nodes[0].keyagg,
                        f->n_participants);
     f->dist_partial_sigs_received = 0;

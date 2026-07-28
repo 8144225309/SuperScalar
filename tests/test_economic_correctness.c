@@ -137,6 +137,7 @@ static int run_factory_aware_baseline(secp256k1_context *ctx, regtest_t *rt,
 
     /* Build factory tree (arity-specific). */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, N, 2, 4);
     factory_set_arity(f, arity);
@@ -533,6 +534,7 @@ static int run_rotation_econ_for_arity(secp256k1_context *ctx, regtest_t *rt,
 
     /* Build B's tree, close B cooperatively. */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kpsB, N, 2, 4);
     factory_set_arity(f, arity);
@@ -756,6 +758,7 @@ int test_regtest_econ_ps_advance(void) {
     TEST_ASSERT(fund_vout != UINT32_MAX, "locate vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, N, 2, 4);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -1057,6 +1060,7 @@ int test_regtest_econ_buy_liquidity_arity2(void) {
            (unsigned long long)fund_amount);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, N, 2, 4);
     factory_set_arity(f, FACTORY_ARITY_2);

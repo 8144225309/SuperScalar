@@ -1643,6 +1643,7 @@ int test_regtest_ps_basic_close(void) {
         regtest_mine_blocks(&rt, 101, mine_addr);
 
     f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     TEST_ASSERT_GOTO(f, "alloc factory");
     secp256k1_keypair kps[3];
     char fund_txid[65];
@@ -1704,6 +1705,7 @@ int test_regtest_ps_chain_close(void) {
         regtest_mine_blocks(&rt, 101, mine_addr);
 
     f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     TEST_ASSERT_GOTO(f, "alloc factory");
     secp256k1_keypair kps[3];
     char fund_txid[65];
@@ -1808,6 +1810,7 @@ int test_regtest_ps_old_state_response(void) {
         regtest_mine_blocks(&rt, 101, mine_addr);
 
     f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     TEST_ASSERT_GOTO(f, "alloc factory");
     secp256k1_keypair kps[3];
     char fund_txid[65];

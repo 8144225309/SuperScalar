@@ -399,6 +399,7 @@ int test_ptlc_factory_coop_close_after_turnover(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -582,6 +583,7 @@ int test_regtest_ptlc_turnover(void) {
 
     /* Init factory */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
     for (int i = 0; i < 15; i++)

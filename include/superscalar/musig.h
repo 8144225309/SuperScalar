@@ -69,12 +69,21 @@ typedef struct {
    proofs tools/test_musig_scale.c and tools/test_musig_session_scale.c.
    secp256k1's aggregation takes size_t; this fixed array is the only cap. */
 
+#define MUSIG_SESSION_SMALL 8  /* sessions with <= this many signers use the inline
+                                  buffer: no heap, safe on uninitialized stack
+                                  sessions, no free needed (channel 2-of-2 etc.).
+                                  Larger sessions (big factory subtree nodes) are
+                                  heap-allocated to n_signers and MUST be released
+                                  with musig_session_free — factory_free does. */
+
 typedef struct {
-    secp256k1_musig_pubnonce *pubnonces; /* dynamic: allocated in musig_session_init
-                                            to n_signers (subtree size), not the global
-                                            max — keeps a large factory's tree O(N log N)
-                                            instead of O(N^2).  Free with musig_session_free. */
-    size_t pubnonces_cap;                /* allocated capacity of pubnonces[] */
+    secp256k1_musig_pubnonce *pubnonces; /* points at pubnonces_small when
+                                            n_signers <= MUSIG_SESSION_SMALL, else a
+                                            heap array sized to n_signers (subtree
+                                            size, not the global max — keeps a large
+                                            factory's tree O(N log N), not O(N^2)). */
+    size_t pubnonces_cap;                /* usable capacity of pubnonces[] */
+    secp256k1_musig_pubnonce pubnonces_small[MUSIG_SESSION_SMALL];
     secp256k1_musig_aggnonce aggnonce;
     secp256k1_musig_session session;
     secp256k1_musig_keyagg_cache cache;  /* working copy, potentially tweaked */
