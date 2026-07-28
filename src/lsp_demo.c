@@ -207,6 +207,15 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (old_dest_n_htlcs > 0)
         memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
+    /* CONTRACT (no rollback past this point): once the HTLC is added, our side
+       has committed the amount out of local_amount.  Every failure below returns
+       0 leaving that HTLC ACTIVE rather than unwinding it — deliberately, since
+       the peer may already have it and a unilateral local removal would desync
+       the channel worse than leaving it pending.  Resolution is the normal LN
+       path: the HTLC expires at htlc_cltv and channel_check_htlc_timeouts fails
+       it back, and a reconnect resyncs commitment state.  Callers must therefore
+       treat a 0 return as "payment did not settle, funds may be briefly pending",
+       not as "nothing happened". */
     uint64_t dest_htlc_id;
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
                            payment_hash, htlc_cltv, &dest_htlc_id)) {
@@ -354,8 +363,21 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (old_dest_ful_n_htlcs > 0)
             memcpy(old_dest_ful_htlcs, dest_ch->htlcs, old_dest_ful_n_htlcs * sizeof(htlc_t));
 
-        /* Fulfill on dest channel */
-        channel_fulfill_htlc(dest_ch, ful_htlc_id, preimage);
+        /* Fulfill on dest channel.  MUST check: channel_fulfill_htlc verifies
+           SHA256(preimage) == payment_hash and returns 0 on mismatch, leaving
+           balances untouched.  Ignoring it would let a client that sends a bad
+           preimage drive us on to sign a fresh commitment, arm a watchtower
+           entry and persist as though the payment settled — no fund loss (the
+           balances never moved) but our view of the channel would desync from
+           the client's.  Bail instead; the HTLC stays active and resolves via
+           the CLTV timeout path. */
+        if (!channel_fulfill_htlc(dest_ch, ful_htlc_id, preimage)) {
+            fprintf(stderr, "LSP lsppay: fulfill REJECTED for htlc %llu "
+                    "(preimage does not match payment_hash)\n",
+                    (unsigned long long)ful_htlc_id);
+            free(old_dest_ful_htlcs);
+            return 0;
+        }
 
         /* Send COMMITMENT_SIGNED to dest */
         {
@@ -368,8 +390,14 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             cJSON *cs = wire_build_commitment_signed(
                 mgr->entries[to_client].channel_id,
                 dest_ch->commitment_number, psig32, nonce_idx);
-            wire_send(lsp->client_fds[to_client], MSG_COMMITMENT_SIGNED, cs);
+            int cs_sent = wire_send(lsp->client_fds[to_client],
+                                    MSG_COMMITMENT_SIGNED, cs);
             cJSON_Delete(cs);
+            if (!cs_sent) {
+                fprintf(stderr, "LSP lsppay: send COMMITMENT_SIGNED (fulfill) failed\n");
+                free(old_dest_ful_htlcs);
+                return 0;
+            }
         }
 
         /* Wait for REVOKE_AND_ACK from dest */
