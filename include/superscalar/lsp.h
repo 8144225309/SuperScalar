@@ -8,7 +8,17 @@
 #include "persist_wt.h"
 #include <secp256k1.h>
 
+/* Default inbound-connection capacity; --max-connections overrides it and
+   client_fds/client_pubkeys are heap-allocated, so this is a default, not a cap. */
 #define LSP_MAX_CLIENTS 256
+
+/* Loose sanity bound on --clients.  NOT a capability limit: musig sessions and
+   factory_t arrays both size themselves to the actual participant count now, so
+   nothing in the crypto or the tree caps N.  What bounds N in practice is
+   wall-clock (serialized seeding), per-client RSS, and `ulimit -n` on the LSP.
+   This exists only to turn a typo'd --clients into a clear error instead of an
+   OOM twenty minutes later. */
+#define SS_MAX_SANE_CLIENTS 4096
 
 typedef struct {
     secp256k1_context *ctx;

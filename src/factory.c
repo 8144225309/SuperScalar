@@ -727,6 +727,28 @@ void factory_config_default(factory_config_t *cfg) {
     cfg->dust_limit_sats = 546;
 }
 
+/* Grow a config so it can actually hold n_participants signers.  The compile-time
+   FACTORY_MAX_* values are DEFAULTS, not limits — the arrays they size are heap
+   now.  Small factories keep the historical defaults byte-for-byte; only a
+   factory asked to hold more than the default grows.  This is what lets the
+   daemons run past 255 clients without every call site passing a config: the
+   factory sizes itself to what it was handed.
+   Leaves: pseudo-Spilman uses one leaf per client, so a PS factory needs
+   n_participants leaves even though arity-2 would need half that; size for the
+   worst case since factory_set_arity may be called after init.
+   Nodes: the PS shape is ~4 per client (kickoff+state per logical node);
+   factory_build_tree reallocs upward if a shape needs more. */
+static void factory_config_fit(factory_config_t *cfg, size_t n_participants) {
+    if (!cfg) return;
+    if (cfg->max_signers < n_participants)
+        cfg->max_signers = (uint32_t)n_participants;
+    if (cfg->max_leaves < n_participants)
+        cfg->max_leaves = (uint32_t)n_participants;
+    size_t want_nodes = 4 * n_participants + 64;
+    if (cfg->max_nodes < want_nodes)
+        cfg->max_nodes = (uint32_t)want_nodes;
+}
+
 int factory_alloc_default_arrays(factory_t *f) {
     if (!f) return 0;
     if (f->config.max_signers == 0) factory_config_default(&f->config);
@@ -764,14 +786,13 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
     f->states_per_layer = states_per_layer;
     f->fee_per_tx = 200;
 
-    /* Store config */
+    /* Store config, then grow it to fit n_participants (see factory_config_fit).
+       Callers that pass an explicit cfg still get at least what they asked for. */
     if (cfg)
         f->config = *cfg;
     else
         factory_config_default(&f->config);
-
-    if (n_participants > f->config.max_signers)
-        return 0;
+    factory_config_fit(&f->config, n_participants);
 
     /* Factory-level participant arrays sized to the config cap (were fixed
        [FACTORY_MAX_SIGNERS]).  O(N), one copy per factory — this is what lets the
@@ -838,6 +859,7 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
     f->states_per_layer = states_per_layer;
     f->fee_per_tx = 200;  /* 1 sat/vB floor for ~200 vB tx; overridden by factory_build_tree */
     factory_config_default(&f->config);
+    factory_config_fit(&f->config, n_participants);   /* grow to hold N (see above) */
 
     /* Factory-level arrays sized to the config cap (were fixed
        [FACTORY_MAX_SIGNERS]).  keypairs stays zeroed here (pubkey-only path). */

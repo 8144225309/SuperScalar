@@ -2551,15 +2551,24 @@ int main(int argc, char *argv[]) {
     uint32_t dying_blocks = (dying_blocks_arg > 0) ? (uint32_t)dying_blocks_arg
                             : (is_regtest ? 10 : 432);
 
-    /* The factory signing group is the LSP plus every client, and a MuSig
-       session holds at most MUSIG_SESSION_MAX_SIGNERS (128) signers, so the
-       supported maximum is 127 clients.  Reject the 129th signer here with a
-       clear message instead of failing deep inside the root signing ceremony
-       (set_pubnonce rejects slot 128 and finalize_nonces never completes). */
-    if (n_clients < 1 || n_clients + 1 > MUSIG_SESSION_MAX_SIGNERS) {
-        fprintf(stderr, "Error: --clients must be 1..%d "
-                "(the LSP co-signs every factory: clients + 1 <= %d-signer MuSig cap)\n",
-                MUSIG_SESSION_MAX_SIGNERS - 1, MUSIG_SESSION_MAX_SIGNERS);
+    /* Client-count sanity bound.
+       This used to reject clients+1 > MUSIG_SESSION_MAX_SIGNERS because a MuSig
+       session held a FIXED pubnonce array and slot N would be refused deep inside
+       the root ceremony.  That is no longer true: musig_signing_session_t sizes
+       its pubnonces to the actual signer count, and factory_t's arrays are heap
+       and auto-fit via factory_config_fit(), so neither imposes a ceiling.
+       Measured on regtest with real daemons: N=224 completes a full
+       onboard -> LN-seed -> economy -> 225-output cooperative close with exact
+       per-client reconciliation, using ~5.5 GB across the swarm.
+       What actually bounds N in practice, in order: wall-clock (the seed phase is
+       serialized, ~O(N) round-trips), then per-client RSS (~21 MB + ~0.085 MB/N),
+       then file descriptors on the LSP (~N+20 vs `ulimit -n`).  None is a
+       correctness limit, so this stays a loose sanity check that catches a typo'd
+       --clients rather than a real capability boundary. */
+    if (n_clients < 1 || n_clients > SS_MAX_SANE_CLIENTS) {
+        fprintf(stderr, "Error: --clients must be 1..%d (sanity bound; the real "
+                "limits are wall-clock, RSS and `ulimit -n`, not a signer cap)\n",
+                SS_MAX_SANE_CLIENTS);
         return 1;
     }
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
