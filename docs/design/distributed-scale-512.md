@@ -12,13 +12,48 @@ A falsification run (real `superscalar_lsp` + N × `superscalar_client`, real
 sockets, regtest, pct-100 lifecycle: onboard-at-zero → LN seed → c2c economy →
 (N+1)-output cooperative close with per-client reconciliation) produced:
 
-| N | outcome | wall | LSP RSS | per client | swarm total |
-|---|---|---|---|---|---|
-| 127 | **PASS** | 569 s | 46.4 MB | 21.0 MB | 2.65 GB |
-| 160 | **PASS** | 577 s | 50.3 MB | 22.3 MB | 3.55 GB |
-| 192 | **PASS** | 663 s | 54.4 MB | 26.5 MB | 4.49 GB |
+| N | outcome | wall | LSP RSS | per client | swarm total | close |
+|---|---|---|---|---|---|---|
+| 127 | **PASS** | 569 s | 46.4 MB | 21.0 MB | 2.65 GB | 128 outs |
+| 160 | **PASS** | 577 s | 50.3 MB | 22.3 MB | 3.55 GB | 161 outs |
+| 192 | **PASS** | 663 s | 54.4 MB | 26.5 MB | 4.49 GB | 193 outs (`a25d8541…`) |
+| **224** | **PASS** | 818 s | 107.1 MB | 24.7 MB | 5.52 GB | **225 outs** (`c9e4ee08…`) |
+| 256 | **FAIL** | 4 s | — | — | — | refused at startup |
 
-N=192 closed with 193 outputs (`a25d8541…`), RECONCILE PERFECT, sat-for-sat.
+Every PASS reconciled **sat-for-sat, no skim**, with clients onboarded at zero.
+
+### The actual wall is a compile-time cap, not a resource
+
+N=256 did not run out of anything. It was **refused before listening**:
+
+```
+Error: --clients must be 1..255 (the LSP co-signs every factory:
+       clients + 1 <= 256-signer MuSig cap)
+```
+
+That is `FACTORY_MAX_SIGNERS = 256`. The per-instance `factory_config` that lifts
+it already exists and is used by the in-process manager (which reaches 10,000) —
+**the daemon was simply never wired to use it.** At 224 the swarm used 5.5 GB of a
+9 GB budget with all 224 client processes healthy, so nothing was close to
+exhausted.
+
+### Revised, empirically-grounded staircase
+
+| range | status | what it needs |
+|---|---|---|
+| **N ≤ 255** | **works today, unmodified** (224 proven) | nothing |
+| 256 – 511 | blocked by one config cap | wire the daemon to a per-instance `factory_config` with raised `max_signers` (machinery already exists) |
+| ≥ 512 | blocked by memory (~27 GB extrapolated) | path-only client (§3) |
+
+The second row is a *small* change, not a project — which means the next real
+milestone after 255 is likely 384–511, well before any of the §3/§4 work.
+
+### Secondary finding: wall-clock is the next practical limit
+
+The seed phase is **sequential** — N `lsppay` calls × ~6 round-trips each. It grew
+127→224 as 569 s→818 s, with ~11.5 min of the 224 run spent seeding alone.
+Memory is not what will make N=512 painful to test; serialized onboarding is.
+Batching/pipelining the seed loop is cheap and should precede any large-N run.
 
 **Three predictions in the earlier draft were wrong, and the measurements win:**
 
