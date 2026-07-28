@@ -6574,6 +6574,28 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             printf("CLI: usage: %s <from> <to> <amount>\n", cmd_name);
         }
         fflush(stdout);
+    } else if (strncmp(line, "lsppay ", 7) == 0) {
+        /* lsppay <to> <amount>: LSP -> client inbound payment (final hop of a
+           real inbound LN payment; external payer simulated by the LSP).  For
+           the pct-100 realistic model where clients onboard with zero funds. */
+        unsigned int to;
+        unsigned long long amt;
+        if (sscanf(line + 7, "%u %llu", &to, &amt) == 2) {
+            if (to >= mgr->n_channels) {
+                printf("CLI: invalid client index (max %zu)\n",
+                       mgr->n_channels - 1);
+            } else {
+                printf("CLI: lsppay -> %u (%llu sats)\n", to, amt);
+                fflush(stdout);
+                if (lsp_channels_lsppay(mgr, lsp, (size_t)to, (uint64_t)amt))
+                    printf("CLI: lsppay succeeded\n");
+                else
+                    printf("CLI: lsppay FAILED\n");
+            }
+        } else {
+            printf("CLI: usage: lsppay <to> <amount>\n");
+        }
+        fflush(stdout);
     } else if (strcmp(line, "status") == 0) {
         printf("--- Factory Status ---\n");
         printf("  Channels: %zu\n", mgr->n_channels);

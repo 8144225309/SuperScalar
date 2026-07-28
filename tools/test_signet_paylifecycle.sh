@@ -9,11 +9,13 @@
 # Usage: test_signet_paylifecycle.sh <N> [P_PER_CH] [SATS_PER_LEAF] [FEE_RATE]
 set -uo pipefail
 
-N="${1:?usage: <N> [P] [SATS_PER_LEAF] [FEE_RATE]}"
+N="${1:?usage: <N> [P] [SATS_PER_LEAF] [FEE_KVB] [LSP_PCT]}"
 P="${2:-4}"
-PER_LEAF="${3:-15000}"        # >2*CHANNEL_RESERVE(5000) so payments have room
-FEE_RATE="${4:-1}"            # sat/vB for close + sweep (signet is cheap)
+PER_LEAF="${3:-60000}"        # sized so payments never skip (see sizing runs)
+FEE_KVB="${4:-1000}"          # sat/kvB: 100 = 0.1 sat/vB (node relay floor 0.01)
+LSP_PCT="${5:-50}"            # 100 => clients start at 0; all client sats payment-borne
 AMOUNT=$(( N * PER_LEAF ))
+FEE_VB=$(awk "BEGIN{printf \"%g\", $FEE_KVB/1000}")   # for wallet RPCs (may floor at 1)
 
 BIN=/root/SuperScalar-lsppay/build-lsppay/test_inproc_factory_lifecycle
 CONF=/var/lib/bitcoind-signet/bitcoin.conf
@@ -38,12 +40,12 @@ wait_conf(){ # txid -> block until >=1 confirmation (txindex=1, works for any tx
   return 1
 }
 
-say "RUN $TAG  N=$N P=$P per_leaf=$PER_LEAF amount=$AMOUNT fee_rate=$FEE_RATE"
+say "RUN $TAG  N=$N P=$P per_leaf=$PER_LEAF amount=$AMOUNT fee_kvb=$FEE_KVB (${FEE_VB} sat/vB) lsp_pct=$LSP_PCT"
 RET=$($CLI $W getnewaddress "${TAG}_ret" bech32m)
 git -C /root/SuperScalar-lsppay rev-parse HEAD > "$AUDIT/git_commit.txt" 2>/dev/null || true
 cat > "$AUDIT/manifest.json" <<EOF
 {"tag":"$TAG","seed":"$SEED","N":$N,"payments_per_channel":$P,"sats_per_leaf":$PER_LEAF,
- "funding_amount":$AMOUNT,"fee_rate":$FEE_RATE,"return_addr":"$RET"}
+ "funding_amount":$AMOUNT,"fee_kvb":$FEE_KVB,"lsp_pct":$LSP_PCT,"return_addr":"$RET"}
 EOF
 
 # ---- 1. factory funding address (tweaked N-of-N aggregate) ----
@@ -54,7 +56,8 @@ say "funding addr=$FADDR (xonly=$FX)"
 echo "$FADDR" > "$AUDIT/funding_addr.txt"
 
 # ---- 2. fund it ----
-FTXID=$($CLI -named $W sendtoaddress address="$FADDR" amount="$(sat2btc $AMOUNT)" fee_rate=$FEE_RATE) \
+FTXID=$($CLI -named $W sendtoaddress address="$FADDR" amount="$(sat2btc $AMOUNT)" fee_rate=$FEE_VB 2>/dev/null) \
+  || FTXID=$($CLI -named $W sendtoaddress address="$FADDR" amount="$(sat2btc $AMOUNT)" fee_rate=1) \
   || { say "fund send FAILED"; exit 1; }
 say "funding txid=$FTXID (waiting for confirmation)"
 wait_conf "$FTXID" >/dev/null || { say "funding not confirmed"; exit 1; }
@@ -64,7 +67,7 @@ echo "{\"funding_txid\":\"$FTXID\",\"vout\":$VOUT}" > "$AUDIT/funding.json"
 
 # ---- 3. real payments + cooperative close (in-process) ----
 say "running paylifecycle (real HTLC payments + close)"
-$BIN paylifecycle "$N" "$SEED" "$FTXID" "$VOUT" "$AMOUNT" "$AUDIT/close.hex" "$FEE_RATE" "$P" "$AUDIT" \
+$BIN paylifecycle "$N" "$SEED" "$FTXID" "$VOUT" "$AMOUNT" "$AUDIT/close.hex" "$FEE_KVB" "$P" "$AUDIT" "$LSP_PCT" \
   || { say "paylifecycle FAILED"; exit 1; }
 CLOSE_HEX=$(cat "$AUDIT/close.hex")
 
@@ -138,8 +141,9 @@ say "rescanning [$RS_FROM,$TIP] for close outputs"
 $CLI -rpcwallet="$SWEEPW" rescanblockchain "$RS_FROM" "$TIP" >/dev/null 2>&1
 SWBAL=$($CLI -rpcwallet="$SWEEPW" getbalance)
 say "sweep wallet holds $SWBAL BTC across $NOUT outputs"
-STXID=$($CLI -rpcwallet="$SWEEPW" -named sendall recipients="[\"$RET\"]" fee_rate="$FEE_RATE" 2>&1 | jq -r '.txid // empty')
-if [ -z "$STXID" ]; then say "sendall FAILED:"; $CLI -rpcwallet="$SWEEPW" -named sendall recipients="[\"$RET\"]" fee_rate="$FEE_RATE"; else
+STXID=$($CLI -rpcwallet="$SWEEPW" -named sendall recipients="[\"$RET\"]" fee_rate="$FEE_VB" 2>/dev/null | jq -r '.txid // empty')
+[ -z "$STXID" ] && STXID=$($CLI -rpcwallet="$SWEEPW" -named sendall recipients="[\"$RET\"]" fee_rate=1 2>&1 | jq -r '.txid // empty')
+if [ -z "$STXID" ]; then say "sendall FAILED:"; $CLI -rpcwallet="$SWEEPW" -named sendall recipients="[\"$RET\"]" fee_rate=1; else
   say "sweep broadcast txid=$STXID"; wait_conf "$STXID" >/dev/null 2>&1 || true
   say "sweep confirmed txid=$STXID"
 fi

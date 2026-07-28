@@ -878,6 +878,10 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
+    if (!f) return;
+    /* Callable BEFORE factory_init (see factory_set_level_arity). */
+    factory_alloc_default_arrays(f);
+    if (!f->leaf_layers) return;
     f->leaf_arity = arity;
     f->n_level_arity = 0;  /* clear variable arity */
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
@@ -1034,6 +1038,10 @@ void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k) {
     /* Cap at FACTORY_MAX_OUTPUTS - 1 so the leaf's k sub-factory entry
        outputs + 1 L-stock output fit within FACTORY_MAX_OUTPUTS.  k=0
        is treated as k=1 (no sub-factories). */
+    if (!f) return;
+    /* Callable BEFORE factory_init (see factory_set_level_arity). */
+    factory_alloc_default_arrays(f);
+    if (!f->leaf_layers) return;
     if (k == 0) k = 1;
     if (k > (uint32_t)(FACTORY_MAX_OUTPUTS - 1))
         k = (uint32_t)(FACTORY_MAX_OUTPUTS - 1);
@@ -1132,6 +1140,13 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
 }
 
 void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
+    if (!f) return;
+    /* The dynamic arrays (leaf_layers here) used to be inline storage, so a
+       zeroed factory_t was usable immediately and callers could shape the tree
+       BEFORE factory_init.  superscalar_lsp's main() does exactly that on its
+       embedded lsp->factory.  Restore that contract: NULL-safe + idempotent. */
+    factory_alloc_default_arrays(f);
+    if (!f->leaf_layers) return;
     if (n > FACTORY_MAX_LEVELS) n = FACTORY_MAX_LEVELS;
     memcpy(f->level_arity, arities, n);
     f->n_level_arity = n;
@@ -1150,6 +1165,10 @@ void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
 }
 
 void factory_set_static_near_root(factory_t *f, uint32_t threshold) {
+    if (!f) return;
+    /* Callable BEFORE factory_init (see factory_set_level_arity). */
+    factory_alloc_default_arrays(f);
+    if (!f->leaf_layers) return;
     f->static_threshold_depth = threshold;
     /* Recompute n_layers based on current arity/level configuration, since
        the threshold shrinks the DW counter shape. */
