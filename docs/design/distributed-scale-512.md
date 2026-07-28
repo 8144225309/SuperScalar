@@ -82,6 +82,58 @@ Two supporting trims:
 | path-only, own process | ~4–8 MB | 2.5–4 GB ✅ | 5–8 GB ⚠️ |
 | path-only, **thread** | ~0.3 MB | ~0.3 GB ✅ | ~0.5 GB ✅ |
 
+## 3b. Non-memory blockers (necessary in addition to §3)
+
+Fixing per-client memory is **necessary but not sufficient**. Four further limits
+bite between N=256 and N=1024, and the first is not a memory problem at all.
+
+### B1 — Ceremony matrices exceed the wire frame (the real ceiling)
+
+`WIRE_MAX_FRAME_SIZE = 16 MB`, commented "needed for ALL_NONCES at N=64+". A dense
+all-signers × all-nodes nonce matrix is `N × n_nodes × 66 B`:
+
+| N | dense matrix | vs 16 MB frame |
+|---|---|---|
+| 127 | **4.0 MB** | fits — *this is why 127 works* |
+| 512 | **65.9 MB** | ✗ 4× over |
+| 1024 | **263.6 MB** | ✗ 16× over |
+
+So even with perfect memory efficiency the **ceremony messages themselves** stop
+fitting somewhere around N≈250. The same applies to the partial-sig matrix.
+
+*Fix:* stride per participant — a client only needs **its own row**
+(`n_nodes × 66 B` = 135 KB at N=512, 270 KB at N=1024), which keeps every frame
+small regardless of N. A stride was reportedly introduced for the N≥127 abort;
+this design requires **re-verifying it applies to both the nonce (0x83) and
+partial-sig (0x89) matrices at 512/1024**, since a dense path anywhere reintroduces
+the ceiling. Treat as the highest-risk unknown in the whole plan.
+
+### B2 — `select()` breaks (and is UB) past fd 1023
+
+Four `select()` sites remain in `src/lsp_demo.c` (the CLI/demo path, including the
+`lsppay` drain loop). `FD_SETSIZE` is **1024**; `FD_SET(fd, …)` with `fd ≥ 1024`
+writes past the `fd_set` — a stack smash, not a graceful error. Fine at 512,
+**hard blocker at ~1024**. *Fix:* convert those four to `poll()` (the core loop
+already uses poll/epoll in 8 places).
+
+### B3 — File-descriptor ceiling
+
+`ulimit -n` is **1024**. The LSP needs ≈ N + ~20 (clients + listener + bitcoind
+RPC + sqlite + stdio): ~532 at N=512 (fits), **~1044 at N=1024 (does not)**.
+*Fix:* raise to 65536 in the harness/service unit.
+
+### B4 — `LSP_MAX_CLIENTS` default
+
+Defaults to **256**, overridable with `--max-connections`. Not a code change, but
+it will silently cap a 512 run if forgotten. *Fix:* set explicitly in the harness
+and assert the effective cap at startup.
+
+### Ordering consequence
+
+B1 gates everything above ~250 and is protocol-level, so it should be validated
+**before** the memory work — otherwise P1 could land, look successful, and still
+fail at 512 for an unrelated reason.
+
 ## 4. Harness tiers
 
 Each tier buys specific realism. They compose; none replaces the others.
@@ -114,7 +166,10 @@ running N clients in one address space.
 
 Each phase is independently mergeable and independently useful.
 
-**P0 — Baseline instrumentation.** Record actual per-process RSS for LSP and
+**P0 — Baseline + B1 spike (do FIRST).** Verify the nonce/psig matrices stride per participant at N=512/1024 (§3b B1) BEFORE the memory work — a dense path anywhere caps us near N≈250 regardless of RAM. Set `--max-connections`, raise `ulimit -n`, convert the four `lsp_demo.c` `select()` sites to `poll()`.
+*Accept:* a 512-client ceremony message trace with max frame < 16 MB, and a committed RSS baseline for N=8/64/127.
+
+**P0b — Baseline instrumentation.** Record actual per-process RSS for LSP and
 client at N=127 (not extrapolated). Add an RSS sample to the swarm harness so
 every later claim is measured.
 *Accept:* a committed baseline table for N=8/64/127.
