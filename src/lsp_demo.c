@@ -118,6 +118,341 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 }
 
+/* lsppay: LSP -> client inbound payment over the factory channel.
+   This is the final hop of a real inbound LN payment -- the same OFFERED-HTLC
+   leg the bridge drives (lsp_bridge.c) -- with the external payer simulated by
+   the LSP itself.  Exists for the pct-100 realistic onboarding model: clients
+   join with ZERO balance, so their first sats can only arrive over LN.
+   Flow = invoice steps of lsp_channels_initiate_payment + its dest leg
+   (OFFERED HTLC -> commitment -> fulfill -> commitment -> revocations), with
+   no sender client and no back-propagation.  Fragments are verbatim from that
+   proven path, including watchtower revocation registration + persistence. */
+int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                          size_t to_client, uint64_t amount_sats) {
+    if (!mgr || !lsp) return 0;
+    if (to_client >= mgr->n_channels) return 0;
+    if (lsp->client_fds[to_client] < 0) {
+        fprintf(stderr, "LSP lsppay: client %zu not connected\n", to_client);
+        return 0;
+    }
+
+    uint64_t amount_msat = amount_sats * 1000;
+    uint32_t htlc_cltv = lsp->factory.cltv_timeout > FACTORY_CLTV_DELTA_DEFAULT
+                        ? lsp->factory.cltv_timeout - FACTORY_CLTV_DELTA_DEFAULT
+                        : 500;  /* fallback for tests without cltv_timeout */
+
+    /* 1. Send MSG_CREATE_INVOICE to receiving client */
+    {
+        cJSON *inv_req = wire_build_create_invoice(amount_msat);
+        if (!wire_send(lsp->client_fds[to_client], MSG_CREATE_INVOICE, inv_req)) {
+            cJSON_Delete(inv_req);
+            fprintf(stderr, "LSP lsppay: send CREATE_INVOICE failed\n");
+            return 0;
+        }
+        cJSON_Delete(inv_req);
+    }
+
+    /* 2. Wait for MSG_INVOICE_CREATED from receiver */
+    unsigned char payment_hash[32];
+    {
+        wire_msg_t inv_resp;
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                            MSG_INVOICE_CREATED, &inv_resp, 60)) {
+            fprintf(stderr, "LSP lsppay: timeout waiting for INVOICE_CREATED\n");
+            return 0;
+        }
+        uint64_t resp_amount;
+        if (!wire_parse_invoice_created(inv_resp.json, payment_hash, &resp_amount)) {
+            cJSON_Delete(inv_resp.json);
+            fprintf(stderr, "LSP lsppay: bad INVOICE_CREATED\n");
+            return 0;
+        }
+        cJSON_Delete(inv_resp.json);
+    }
+
+    /* 3. Drain any pending MSG_REGISTER_INVOICE from receiver */
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[to_client], &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 }; /* 200ms */
+        while (select(lsp->client_fds[to_client] + 1, &rfds, NULL, NULL, &tv) > 0) {
+            wire_msg_t drain_msg;
+            if (!wire_recv_timeout(lsp->client_fds[to_client], &drain_msg, 2)) break;
+            if (drain_msg.msg_type == MSG_REGISTER_INVOICE) {
+                unsigned char ph[32], pre[32];
+                uint64_t am;
+                size_t dc;
+                if (wire_parse_register_invoice(drain_msg.json, ph, pre, &am, &dc))
+                    lsp_channels_register_invoice(mgr, ph, pre, dc, am);
+            }
+            cJSON_Delete(drain_msg.json);
+            FD_ZERO(&rfds);
+            FD_SET(lsp->client_fds[to_client], &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000;
+        }
+    }
+
+    /* 4. Offer the HTLC on the destination channel, funded from the LSP side */
+    channel_t *dest_ch = &mgr->entries[to_client].channel;
+
+    /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
+    uint64_t old_dest_local = dest_ch->local_amount;
+    uint64_t old_dest_remote = dest_ch->remote_amount;
+    size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+    htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
+        ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
+    if (old_dest_n_htlcs > 0 && !old_dest_htlcs) return 0;
+    if (old_dest_n_htlcs > 0)
+        memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
+
+    uint64_t dest_htlc_id;
+    if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
+                           payment_hash, htlc_cltv, &dest_htlc_id)) {
+        fprintf(stderr, "LSP lsppay: add_htlc failed (LSP-side balance/reserve?)\n");
+        free(old_dest_htlcs);
+        return 0;
+    }
+
+    {
+        cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
+                                                   payment_hash, htlc_cltv);
+        if (!wire_send(lsp->client_fds[to_client], MSG_UPDATE_ADD_HTLC, fwd)) {
+            cJSON_Delete(fwd);
+            free(old_dest_htlcs);
+            return 0;
+        }
+        cJSON_Delete(fwd);
+    }
+    {
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+            free(old_dest_htlcs);
+            return 0;
+        }
+        cJSON *cs = wire_build_commitment_signed(
+            mgr->entries[to_client].channel_id,
+            dest_ch->commitment_number, psig32, nonce_idx);
+        if (!wire_send(lsp->client_fds[to_client], MSG_COMMITMENT_SIGNED, cs)) {
+            cJSON_Delete(cs);
+            free(old_dest_htlcs);
+            return 0;
+        }
+        cJSON_Delete(cs);
+    }
+
+    /* 5. Wait for REVOKE_AND_ACK from dest */
+    {
+        wire_msg_t ack_msg;
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                            MSG_REVOKE_AND_ACK, &ack_msg, 60)) {
+            fprintf(stderr, "LSP lsppay: expected REVOKE_AND_ACK from dest\n");
+            free(old_dest_htlcs);
+            return 0;
+        }
+        uint32_t ack_chan_id;
+        unsigned char rev_secret[32], next_point[33];
+        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                        rev_secret, next_point)) {
+            uint64_t old_cn = dest_ch->commitment_number - 1;
+            channel_receive_revocation(dest_ch, old_cn, rev_secret);
+            /* PTLC snapshot for revocation registration (mirrors c2c path). */
+            size_t old_dest_n_ptlcs = dest_ch->n_ptlcs;
+            ptlc_t *old_dest_ptlcs = NULL;
+            if (old_dest_n_ptlcs > 0) {
+                old_dest_ptlcs = malloc(old_dest_n_ptlcs * sizeof(ptlc_t));
+                if (old_dest_ptlcs)
+                    memcpy(old_dest_ptlcs, dest_ch->ptlcs,
+                           old_dest_n_ptlcs * sizeof(ptlc_t));
+            }
+            watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
+                (uint32_t)to_client, old_cn,
+                old_dest_local, old_dest_remote,
+                old_dest_htlcs, old_dest_n_htlcs,
+                old_dest_ptlcs, old_dest_n_ptlcs);
+            free(old_dest_ptlcs);
+            secp256k1_pubkey next_pcp;
+            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+                channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+            /* Bidirectional: send LSP's own revocation to dest */
+            lsp_send_revocation(mgr, lsp, to_client, old_cn);
+        }
+        cJSON_Delete(ack_msg.json);
+    }
+    free(old_dest_htlcs);
+    old_dest_htlcs = NULL;
+
+    /* Persist dest channel balance + HTLC + PCS/PCP */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+
+        persist_update_channel_balance(db, (uint32_t)to_client,
+            dest_ch->local_amount, dest_ch->remote_amount,
+            dest_ch->commitment_number);
+
+        htlc_t dp;
+        memset(&dp, 0, sizeof(dp));
+        dp.id = dest_htlc_id;
+        dp.direction = HTLC_OFFERED;
+        dp.state = HTLC_STATE_ACTIVE;
+        dp.amount_sats = amount_sats;
+        memcpy(dp.payment_hash, payment_hash, 32);
+        dp.cltv_expiry = htlc_cltv;
+        persist_save_htlc(db, (uint32_t)to_client, &dp);
+
+        unsigned char pcs[32];
+        if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number, pcs))
+            persist_save_local_pcs(db, (uint32_t)to_client,
+                dest_ch->commitment_number, pcs);
+        if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number + 1, pcs))
+            persist_save_local_pcs(db, (uint32_t)to_client,
+                dest_ch->commitment_number + 1, pcs);
+        memset(pcs, 0, 32);
+
+        {
+            unsigned char ser[33];
+            size_t slen = 33;
+            secp256k1_pubkey saved_pcp;
+            if (channel_get_remote_pcp(dest_ch,
+                    dest_ch->commitment_number + 1, &saved_pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                    &saved_pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)to_client,
+                    dest_ch->commitment_number + 1, ser);
+        }
+
+        if (own_txn) persist_commit(db);
+    }
+
+    /* 6. Wait for FULFILL_HTLC from dest (client fulfills with real preimage) */
+    {
+        wire_msg_t ful_msg;
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                            MSG_UPDATE_FULFILL_HTLC, &ful_msg, 60)) {
+            fprintf(stderr, "LSP lsppay: expected FULFILL from dest\n");
+            return 0;
+        }
+        uint64_t ful_htlc_id;
+        unsigned char preimage[32];
+        if (!wire_parse_update_fulfill_htlc(ful_msg.json, &ful_htlc_id, preimage)) {
+            cJSON_Delete(ful_msg.json);
+            return 0;
+        }
+        cJSON_Delete(ful_msg.json);
+
+        /* Capture amounts and HTLC state before fulfill changes them (for watchtower) */
+        uint64_t old_dest_ful_local = dest_ch->local_amount;
+        uint64_t old_dest_ful_remote = dest_ch->remote_amount;
+        size_t old_dest_ful_n_htlcs = dest_ch->n_htlcs;
+        htlc_t *old_dest_ful_htlcs = old_dest_ful_n_htlcs > 0
+            ? malloc(old_dest_ful_n_htlcs * sizeof(htlc_t)) : NULL;
+        if (old_dest_ful_n_htlcs > 0 && !old_dest_ful_htlcs) return 0;
+        if (old_dest_ful_n_htlcs > 0)
+            memcpy(old_dest_ful_htlcs, dest_ch->htlcs, old_dest_ful_n_htlcs * sizeof(htlc_t));
+
+        /* Fulfill on dest channel */
+        channel_fulfill_htlc(dest_ch, ful_htlc_id, preimage);
+
+        /* Send COMMITMENT_SIGNED to dest */
+        {
+            unsigned char psig32[32];
+            uint32_t nonce_idx;
+            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+                free(old_dest_ful_htlcs);
+                return 0;
+            }
+            cJSON *cs = wire_build_commitment_signed(
+                mgr->entries[to_client].channel_id,
+                dest_ch->commitment_number, psig32, nonce_idx);
+            wire_send(lsp->client_fds[to_client], MSG_COMMITMENT_SIGNED, cs);
+            cJSON_Delete(cs);
+        }
+
+        /* Wait for REVOKE_AND_ACK from dest */
+        {
+            wire_msg_t ack;
+            if (wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                               MSG_REVOKE_AND_ACK, &ack, 60)) {
+                uint32_t ack_chan_id;
+                unsigned char rev_secret[32], next_point[33];
+                if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
+                                                rev_secret, next_point)) {
+                    uint64_t old_cn = dest_ch->commitment_number - 1;
+                    channel_receive_revocation(dest_ch, old_cn, rev_secret);
+                    /* PTLC snapshot for revocation registration (mirrors c2c path). */
+                    size_t old_dest_ful_n_ptlcs = dest_ch->n_ptlcs;
+                    ptlc_t *old_dest_ful_ptlcs = NULL;
+                    if (old_dest_ful_n_ptlcs > 0) {
+                        old_dest_ful_ptlcs = malloc(old_dest_ful_n_ptlcs * sizeof(ptlc_t));
+                        if (old_dest_ful_ptlcs)
+                            memcpy(old_dest_ful_ptlcs, dest_ch->ptlcs,
+                                   old_dest_ful_n_ptlcs * sizeof(ptlc_t));
+                    }
+                    watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
+                        (uint32_t)to_client, old_cn,
+                        old_dest_ful_local, old_dest_ful_remote,
+                        old_dest_ful_htlcs, old_dest_ful_n_htlcs,
+                        old_dest_ful_ptlcs, old_dest_ful_n_ptlcs);
+                    free(old_dest_ful_ptlcs);
+                    secp256k1_pubkey next_pcp;
+                    if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
+                        channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+                    /* Bidirectional: send LSP's own revocation to dest */
+                    lsp_send_revocation(mgr, lsp, to_client, old_cn);
+                }
+                cJSON_Delete(ack.json);
+            }
+        }
+        free(old_dest_ful_htlcs);
+        old_dest_ful_htlcs = NULL;
+
+        /* Persist dest channel after fulfill + PCS/PCP */
+        if (mgr->persist) {
+            persist_t *db = (persist_t *)mgr->persist;
+            int own_txn = !persist_in_transaction(db);
+            if (own_txn) persist_begin(db);
+
+            persist_update_channel_balance(db, (uint32_t)to_client,
+                dest_ch->local_amount, dest_ch->remote_amount,
+                dest_ch->commitment_number);
+            persist_delete_htlc(db, (uint32_t)to_client, ful_htlc_id);
+
+            unsigned char pcs[32];
+            if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number, pcs))
+                persist_save_local_pcs(db, (uint32_t)to_client,
+                    dest_ch->commitment_number, pcs);
+            if (channel_get_local_pcs(dest_ch, dest_ch->commitment_number + 1, pcs))
+                persist_save_local_pcs(db, (uint32_t)to_client,
+                    dest_ch->commitment_number + 1, pcs);
+            memset(pcs, 0, 32);
+
+            {
+                unsigned char ser[33];
+                size_t slen = 33;
+                secp256k1_pubkey saved_pcp;
+                if (channel_get_remote_pcp(dest_ch,
+                        dest_ch->commitment_number + 1, &saved_pcp) &&
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &slen,
+                        &saved_pcp, SECP256K1_EC_COMPRESSED))
+                    persist_save_remote_pcp(db, (uint32_t)to_client,
+                        dest_ch->commitment_number + 1, ser);
+            }
+
+            if (own_txn) persist_commit(db);
+        }
+    }
+
+    /* Same settle marker the harness counts for c2c payments. */
+    printf("  Payment complete: LSP -> client %zu (%llu sats)\n",
+           to_client, (unsigned long long)amount_sats);
+    fflush(stdout);
+    return 1;
+}
+
 int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     size_t from_client, size_t to_client,
                                     uint64_t amount_sats) {
