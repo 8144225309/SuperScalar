@@ -45,6 +45,7 @@ SEED_MAX="${SEED_MAX:-15000}"
 ECON_MIN="${ECON_MIN:-500}"             # economy c2c amounts: small vs seeds so senders usually have the balance
 ECON_MAX="${ECON_MAX:-2500}"
 PAY_SETTLE_TRIES="${PAY_SETTLE_TRIES:-40}"
+PAY_POLL="${PAY_POLL:-0.5}"                # settle poll granularity; lower it for large N
 PAY_RECOVER="${PAY_RECOVER:-1}"
 PAY_GAP="${PAY_GAP:-1}"
 CLOSE_WAIT_SEC="${CLOSE_WAIT_SEC:-900}"
@@ -77,11 +78,17 @@ seed_amt(){ echo $(( SEED_MIN + RANDOM % (SEED_MAX - SEED_MIN + 1) )); }
 econ_amt(){ echo $(( ECON_MIN + RANDOM % (ECON_MAX - ECON_MIN + 1) )); }
 
 settle_wait(){  # wait for the "Payment complete" count to increase past $1
+    # PAY_POLL is the poll granularity.  It matters at scale: seeding is O(N)
+    # serialized payments, so every payment pays the average poll latency plus
+    # PAY_RECOVER.  At N=224 the defaults (0.5s poll + 1s recover) spend ~280s of
+    # the ~690s seed phase asleep while the protocol itself takes milliseconds.
+    # Defaults unchanged; large-N runs should lower both (PAY_POLL=0.1
+    # PAY_RECOVER=0.2 cuts the seed roughly 4x).
     local before="$1" now _w
     for _w in $(seq 1 "$PAY_SETTLE_TRIES"); do
         now=$(grep -ac "Payment complete" "$LSP_LOG" 2>/dev/null); now=${now:-0}
         [ "$now" -gt "$before" ] && { sleep "$PAY_RECOVER"; return 0; }
-        sleep 0.5
+        sleep "$PAY_POLL"
     done
     sleep "$PAY_RECOVER"; return 1
 }

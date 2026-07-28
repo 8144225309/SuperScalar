@@ -41,12 +41,46 @@ exhausted.
 
 | range | status | what it needs |
 |---|---|---|
-| **N ≤ 255** | **works today, unmodified** (224 proven) | nothing |
-| 256 – 511 | blocked by one config cap | wire the daemon to a per-instance `factory_config` with raised `max_signers` (machinery already exists) |
-| ≥ 512 | blocked by memory (~27 GB extrapolated) | path-only client (§3) |
+| **N ≤ 255** | **works today, unmodified** (224 full lifecycle, 255 FACTORY LIVE) | nothing |
+| 256 – 511 | blocked by **53 fixed-size arrays**, many on the stack | convert them to heap sized to `n_participants` — see below |
+| ≥ 512 | additionally blocked by memory (~27 GB extrapolated) | path-only client (§3) |
 
-The second row is a *small* change, not a project — which means the next real
-milestone after 255 is likely 384–511, well before any of the §3/§4 work.
+### The 255 cap is LOAD-BEARING — tested, not assumed
+
+An earlier revision of this doc claimed row 2 was "one config cap … a *small*
+change, not a project." **That was wrong, and removing the cap proved it.**
+
+The library side genuinely does scale: musig sessions size their pubnonces to the
+actual signer count, and `factory_config_fit()` grows `factory_t`'s arrays to the
+participant count. So lifting `superscalar_lsp`'s `--clients` guard *looks* safe.
+It is not. Running N=256 with the guard removed produced:
+
+```
+*** stack smashing detected ***: terminated
+=== CRASH (signal 6) ===  ... main+0x4e49
+```
+
+Memory corruption during factory creation — because the daemon path still declares
+**53 fixed `[FACTORY_MAX_SIGNERS]` arrays**, many of them on the stack, and
+`n_participants = 257` runs off the end of every one:
+
+| file | count |
+|---|---|
+| `src/lsp_channels.c` | 12 |
+| `src/client.c` | 11 |
+| `src/lsp.c` | 7 |
+| `tools/superscalar_lsp.c` | 3 (the crash site) |
+| `src/ladder.c` | 3 |
+| `src/persist.c` | 1 |
+
+The guard is therefore **restored deliberately**, with a comment that says so, so
+an over-large `--clients` is a clear error rather than a smash. Lifting it is a
+real piece of work — 53 conversions, each needing correct free/error paths — and
+it must land *before* the cap moves, not after.
+
+**Lesson for sequencing:** the library scaling and the daemon scaling are separate
+problems. `factory_config_fit()` is necessary but nowhere near sufficient, and the
+cheap-looking config change was a trap that only an actual run at N=256 exposed.
 
 ### Secondary finding: wall-clock is the next practical limit
 
