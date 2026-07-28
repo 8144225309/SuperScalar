@@ -502,6 +502,95 @@ static int advance_chain(regtest_t *rt, int n, const char *mine_addr,
    the LSP's listen socket for client reconnections.  This prevents clients
    from disconnecting during long confirmation waits on signet/testnet.
    Returns 1 on confirmed, 0 on timeout. */
+/* Cooperative-close CONVERGENCE GATE (2026-07 N=127 flagship fix).
+   An N-of-N MuSig2 cooperative close needs a LIVE fd for EVERY client: the
+   CLOSE_PROPOSE send loop (src/lsp.c) fails the whole ceremony on the first dead
+   fd, and you cannot skip a client (its partial signature is required). Over a
+   daemon-mode soak clients transiently drop (the LSP sets client_fds[c] = -1) and
+   auto-reconnect every 1s (tools/superscalar_client.c). This gate, run right
+   before the ceremony, services the listen socket until every client fd is live,
+   so CLOSE_PROPOSE reaches all N. Bounded by timeout_secs; on timeout it returns
+   the count still down and the caller proceeds unchanged (the ceremony then fails
+   cleanly to the existing force-close fallback, i.e. never worse than today).
+   Mirrors wait_for_confirmation_servicing's accept/handshake/ping servicing. */
+static size_t wait_for_all_clients_reconnected(int timeout_secs, lsp_t *lsp,
+                                               lsp_channel_mgr_t *mgr) {
+    if (!lsp) return 0;
+    time_t t_start = time(NULL), last_ping = 0, last_log = 0;
+    while (1) {
+        size_t n_down = 0, first_down = (size_t)-1;
+        for (size_t i = 0; i < lsp->n_clients; i++)
+            if (lsp->client_fds[i] < 0) { n_down++; if (first_down == (size_t)-1) first_down = i; }
+        if (n_down == 0) {
+            printf("LSP: close convergence -- all %zu clients connected; proceeding to ceremony\n",
+                   lsp->n_clients);
+            fflush(stdout);
+            return 0;
+        }
+        time_t tnow = time(NULL);
+        if ((int)(tnow - t_start) >= timeout_secs) {
+            fprintf(stderr, "LSP: close convergence TIMEOUT after %ds -- %zu client(s) still "
+                    "disconnected (first: client %zu); ceremony may fall back to force-close\n",
+                    timeout_secs, n_down, first_down);
+            return n_down;
+        }
+        if (tnow - last_log >= 5) {
+            printf("LSP: close convergence -- waiting for %zu/%zu clients to reconnect "
+                   "(first down: client %zu, %ds/%ds)\n",
+                   n_down, lsp->n_clients, first_down, (int)(tnow - t_start), timeout_secs);
+            fflush(stdout);
+            last_log = tnow;
+        }
+        if (tnow - last_ping >= 20) {
+            cJSON *ping = cJSON_CreateObject();
+            for (size_t i = 0; i < lsp->n_clients; i++)
+                if (lsp->client_fds[i] >= 0) wire_send(lsp->client_fds[i], MSG_PING, ping);
+            cJSON_Delete(ping);
+            last_ping = tnow;
+        }
+        size_t pfds_cap = 1 + lsp->n_clients;
+        struct pollfd *pfds = (struct pollfd *)calloc(pfds_cap, sizeof(struct pollfd));
+        if (!pfds) { sleep(1); continue; }
+        int nfds = 0, listen_idx = -1;
+        if (lsp->listen_fd >= 0) {
+            listen_idx = nfds; pfds[nfds].fd = lsp->listen_fd; pfds[nfds].events = POLLIN; nfds++;
+        }
+        for (size_t i = 0; i < lsp->n_clients; i++)
+            if (lsp->client_fds[i] >= 0) { pfds[nfds].fd = lsp->client_fds[i]; pfds[nfds].events = POLLIN; nfds++; }
+        int pret = poll(pfds, (nfds_t)nfds, 2000);
+        if (pret > 0) {
+            for (int fi = 0; fi < nfds; fi++) {
+                if (!(pfds[fi].revents & POLLIN)) continue;
+                if (fi == listen_idx) {
+                    int new_fd = wire_accept(lsp->listen_fd);
+                    if (new_fd >= 0) {
+                        int hs_ok;
+                        if (lsp->use_nk)
+                            hs_ok = wire_noise_handshake_nk_responder(new_fd, mgr ? mgr->ctx : NULL, lsp->nk_seckey);
+                        else
+                            hs_ok = wire_noise_handshake_responder(new_fd, mgr ? mgr->ctx : NULL);
+                        if (hs_ok && mgr)
+                            lsp_channels_handle_reconnect(mgr, lsp, new_fd);
+                        else
+                            wire_close(new_fd);
+                    }
+                } else {
+                    wire_msg_t cmsg;
+                    if (wire_recv(pfds[fi].fd, &cmsg)) {
+                        if (cmsg.msg_type == MSG_PING) {
+                            cJSON *pong = cJSON_CreateObject();
+                            wire_send(pfds[fi].fd, MSG_PONG, pong);
+                            cJSON_Delete(pong);
+                        }
+                        if (cmsg.json) cJSON_Delete(cmsg.json);
+                    }
+                }
+            }
+        }
+        free(pfds);
+    }
+}
+
 static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
                                             int timeout_secs, lsp_t *lsp,
                                             lsp_channel_mgr_t *mgr) {
@@ -4738,6 +4827,16 @@ accept_new_factory:
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
+
+    /* SS close convergence gate: wait for every client fd to be live before the
+       all-N ceremony so CLOSE_PROPOSE reaches all N (see wait_for_all_clients_reconnected).
+       Bounded; override via SS_CLOSE_CONVERGE_SEC. Safe: on timeout we proceed as before. */
+    {
+        int _conv_to = 180;
+        const char *_ct = getenv("SS_CLOSE_CONVERGE_SEC");
+        if (_ct) { int _v = atoi(_ct); if (_v > 0) _conv_to = _v; }
+        wait_for_all_clients_reconnected(_conv_to, lsp_p, mgr);
+    }
 
     /* #48 Phase C: bounded fresh-nonce retry for the cooperative close. A
        ceremony-time verify failure (Phase B) returns 0 after a SOFT abort
