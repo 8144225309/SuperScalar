@@ -5,10 +5,19 @@
 #include "peer_mgr.h"
 #include <secp256k1.h>
 
-/* PTLC safety gate (task #104).
-   Default: disabled.  Tests that create real PTLCs (amount>0 or point!=NULL)
-   must call ptlc_safety_set_enabled(1) at start.  Production never sets
-   this until the Phase 0 audit (task #103) + breach-defense PR lands. */
+/* PTLC payment-kind flag (formerly the task 104 safety gate).
+   HTLC and PTLC are peer payment kinds; both constructors are always compiled
+   in.  Which kind a payment uses is a per-payment/per-factory SELECTOR
+   (default HTLC) once issue #192 P0 lands; retire this flag then.
+   Library default is 0, but the LSP/client binaries set it enabled at startup
+   (SF-W-PTLC 174, after the Phase 0 audit, task 103, and the breach-defense
+   feed, PR #242, landed).  Enabled is a no-op in practice: nothing in
+   production ORIGINATES a real PTLC today (origination is test-only), so all
+   production payments are HTLCs.
+   SAFETY (load-bearing rule): do not originate a real PTLC (amount>0 or
+   point!=NULL) on a real-value factory until force-close success/timeout
+   resolution is wired (issue #192 P2); the resolution builders currently have
+   no callers, so such an output would be unswept at unilateral close. */
 void ptlc_safety_set_enabled(int enabled);
 int  ptlc_safety_is_enabled(void);
 

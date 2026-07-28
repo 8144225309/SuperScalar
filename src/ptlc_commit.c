@@ -16,22 +16,33 @@
 /* Minimum capacity for PTLC array growth */
 #define PTLC_INIT_CAP 8
 
-/* PTLC safety gate (task #104).
+/* PTLC payment-kind flag (formerly the task 104 safety gate).
 
-   PTLC machinery (channel ops, wire protocol, watchtower sweep loop, ptlcs
-   persistence table) is built — but the breach-defense feed is incomplete:
-   nothing populates watchtower_entry_t.ptlc_outputs, so the sweep loop at
-   watchtower.c:947 is unreachable.  Until the Phase 0 audit (task #103)
-   confirms the full threat surface and the breach-defense PRs land, refuse
-   any production attempt to create a real PTLC output.
+   State as shipped (verified 2026-07-13, post PR #242): the PTLC machinery is
+   built AND breach-defended.  The watchtower rebuilds revoked commitments with
+   their PTLC outputs and sweeps them via channel_build_ptlc_penalty_tx (wired
+   and tested, including the standalone-WT PTLC sweep).  The old note here that
+   "nothing populates ptlc_outputs / the sweep loop is unreachable" is obsolete.
 
-   Today's call surface is benign — ptlc_commit_add_and_sign + the
-   meaningful overload of channel_add_ptlc are only invoked from tests.
-   This gate is defense in depth against future refactors accidentally
-   wiring a production callsite.
+   What remains open (tracked in issue #192): production ORIGINATION
+   (ptlc_commit_add_and_sign + the meaningful overload of channel_add_ptlc are
+   only invoked from tests), real-PTLC receive handling (the dispatch below
+   stores 0-amount placeholders for presig storage only), and force-close
+   success/timeout resolution (channel_build_ptlc_success_tx and
+   channel_build_ptlc_timeout_tx have no callers yet).
 
-   Tests opt in by setting ptlc_safety_set_enabled(1) at start of the test
-   that needs to exercise real PTLCs. */
+   Posture: HTLC and PTLC are peer payment kinds, both always compiled in;
+   selection is per-payment/per-factory (default HTLC) once the #192 P0
+   selector lands, and this flag retires then.  The LSP/client binaries set it
+   enabled at startup (SF-W-PTLC 174); that is a no-op in practice because
+   nothing originates a real PTLC.
+
+   SAFETY (load-bearing rule): do not originate a real PTLC (amount>0 or
+   point!=NULL) on a real-value factory until #192 P2 wires force-close
+   resolution; such an output would be unswept at unilateral close.
+
+   Unit tests that exercise real PTLCs without the binaries still opt in by
+   calling ptlc_safety_set_enabled(1) at test start. */
 static int g_ptlc_safety_enabled = 0;
 
 void ptlc_safety_set_enabled(int enabled) {
