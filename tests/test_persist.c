@@ -1076,6 +1076,7 @@ int test_persist_factory_round_trip(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->use_tree_anchor = 1;  /* #56: mirror production — persist_load_factory rebuilds
@@ -1091,6 +1092,7 @@ int test_persist_factory_round_trip(void) {
 
     /* Load factory into new struct */
     factory_t *f2 = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f2);
     if (!f2) return 0;
     TEST_ASSERT(persist_load_factory(&db, 0, f2, ctx), "load factory");
 
@@ -1490,6 +1492,7 @@ int test_lsp_recovery_round_trip(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;  /* Client 3 */
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
@@ -1590,6 +1593,7 @@ int test_lsp_recovery_round_trip(void) {
 
     /* Now recover: load factory from DB, init channels from DB */
     factory_t *rec_f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(rec_f);
     if (!rec_f) { lsp_channels_cleanup(&mgr); return 0; }
 
     TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "load factory");
@@ -1897,6 +1901,7 @@ int test_persist_validate_factory_load(void) {
     TEST_ASSERT(rc == SQLITE_OK, "insert invalid factory");
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     int loaded = persist_load_factory(&db, 10, f, ctx);
@@ -2004,6 +2009,7 @@ int test_persist_crash_stress(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
@@ -2096,6 +2102,7 @@ int test_persist_crash_stress(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c1 reopen");
         factory_t *rec_f = calloc(1, sizeof(factory_t));
+        factory_alloc_default_arrays(rec_f);
         if (!rec_f) return 0;
 
         TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c1 load factory");
@@ -2208,6 +2215,7 @@ int test_persist_crash_stress(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c2 reopen");
         factory_t *rec_f = calloc(1, sizeof(factory_t));
+        factory_alloc_default_arrays(rec_f);
         if (!rec_f) return 0;
 
         TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c2 load factory");
@@ -2318,6 +2326,7 @@ int test_persist_crash_stress(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c3 reopen");
         factory_t *rec_f = calloc(1, sizeof(factory_t));
+        factory_alloc_default_arrays(rec_f);
         if (!rec_f) return 0;
 
         TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c3 load factory");
@@ -2414,6 +2423,7 @@ int test_persist_crash_stress(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "c4 reopen");
         factory_t *rec_f = calloc(1, sizeof(factory_t));
+        factory_alloc_default_arrays(rec_f);
         if (!rec_f) return 0;
 
         TEST_ASSERT(persist_load_factory(&db, 0, rec_f, ctx), "c4 load factory");
@@ -2481,6 +2491,7 @@ int test_persist_crash_dw_state(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], s4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
 
@@ -2527,7 +2538,9 @@ int test_persist_crash_dw_state(void) {
     /* Zero factory DW state */
     memset(&f->counter, 0, sizeof(f->counter));
     f->per_leaf_enabled = 0;
-    memset(f->leaf_layers, 0, sizeof(f->leaf_layers));
+    /* leaf_layers is dynamic (sized to config.max_leaves) since the O(N log N)
+       refactor — sizeof(pointer) would zero 8 bytes. */
+    memset(f->leaf_layers, 0, f->config.max_leaves * sizeof(dw_layer_t));
     f->n_leaf_nodes = 0;
 
     /* Recover cycle 1 */

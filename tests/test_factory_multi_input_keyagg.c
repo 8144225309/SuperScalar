@@ -125,6 +125,7 @@ int test_factory_multi_input_keyagg(void)
     memset(fake_txid, 0xBE, 32);
 
     factory_t *f = (factory_t *)calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);

@@ -269,6 +269,7 @@ int test_factory_tree_with_timeout(void) {
 
     /* Build factory WITH cltv_timeout */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->cltv_timeout = 1000;  /* some block height */
@@ -294,6 +295,7 @@ int test_factory_tree_with_timeout(void) {
 
     /* Build factory WITHOUT cltv_timeout for comparison */
     factory_t *f2 = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f2);
     if (!f2) return 0;
     factory_init(f2, ctx, kps, 5, 2, 4);
     f2->cltv_timeout = 0;
@@ -542,6 +544,7 @@ int test_regtest_timeout_spend(void) {
     /* Init factory with timeout, build tree, then advance to max state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
     f->cltv_timeout = cltv_timeout;
@@ -759,6 +762,7 @@ int test_multi_level_timeout_unit(void) {
     memset(fake_txid, 0xCC, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->cltv_timeout = 1000;

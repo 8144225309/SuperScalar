@@ -206,6 +206,8 @@ int test_lsp_channel_init(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -1829,6 +1831,8 @@ int test_fee_policy_balance_split(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -2000,6 +2004,8 @@ int test_fee_estimator_wiring(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
@@ -2068,6 +2074,8 @@ int test_fee_estimator_null_fallback(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
@@ -2554,6 +2562,8 @@ int test_regtest_lsp_restart_recovery(void) {
 
     /* Phase 6: Recover from SQLite */
     factory_t *rec_f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(rec_f);
+    factory_alloc_default_arrays(rec_f);
     if (!rec_f) return 0;
     lsp_channel_mgr_t rec_mgr;
 
@@ -2712,6 +2722,8 @@ int test_profit_settlement_calculation(void) {
 
     /* Build a minimal factory with profit-shared economics */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     f->economic_mode = ECON_PROFIT_SHARED;
@@ -2766,6 +2778,8 @@ int test_settlement_trigger_at_interval(void) {
     mgr.entries[1].channel.remote_amount = 50000;
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     f->n_participants = 3;
@@ -2806,6 +2820,8 @@ int test_on_close_includes_unsettled(void) {
     mgr.economic_mode = ECON_PROFIT_SHARED;
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) { free(mgr.entries); return 0; }
 
     f->economic_mode = ECON_PROFIT_SHARED;
@@ -3110,6 +3126,8 @@ int test_regtest_crash_double_recovery(void) {
 
     /* Recover #1 */
     factory_t *rec_f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(rec_f);
+    factory_alloc_default_arrays(rec_f);
     if (!rec_f) return 0;
     lsp_channel_mgr_t rec_mgr;
 
@@ -3190,6 +3208,8 @@ int test_regtest_crash_double_recovery(void) {
     /* Recover #2 */
     lsp_channel_mgr_t rec_mgr2;
     factory_t *rec_f2 = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(rec_f2);
+    factory_alloc_default_arrays(rec_f2);
     if (!rec_f2) return 0;
 
     memset(&rec_mgr2, 0, sizeof(rec_mgr2));
@@ -3742,6 +3762,8 @@ int test_fee_accumulation_and_settlement(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     f->economic_mode = ECON_PROFIT_SHARED;
@@ -3847,6 +3869,8 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             factory_t *f = calloc(1, sizeof(factory_t));
+            factory_alloc_default_arrays(f);
+            factory_alloc_default_arrays(f);
             f->economic_mode = (economic_mode_t)configs[ci].econ;
             f->n_participants = 3;
             f->profiles[0].profit_share_bps = configs[ci].lsp_bps;
@@ -3989,6 +4013,8 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Factory with step_blocks=6, states_per_layer=2, 5 participants */
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     factory_init(f, ctx, kps, 5, 6, 2);
 
     uint32_t delta = lsp_compute_factory_cltv_delta(f);
@@ -4034,6 +4060,8 @@ int test_close_outputs_wallet_spk(void) {
     mgr.entries[1].channel.remote_amount = 2000;
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     f->funding_amount_sats = 5000 + 3000 + 4000 + 2000 + 500;  /* balances + fee */
@@ -4178,6 +4206,8 @@ int test_lsp_close_spk_derived(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -4448,6 +4478,8 @@ int test_client_ps_double_spend_defense_refuses(void) {
     memset(fake_fund_txid, 0x7A, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
+    factory_alloc_default_arrays(f);
+    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, N, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);

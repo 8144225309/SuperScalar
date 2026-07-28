@@ -428,6 +428,7 @@ int test_prop_persist_factory_roundtrip(void) {
         uint32_t states = 2 + (rand_r(&seed) % 6);  /* 2-7 */
 
         factory_t *f = calloc(1, sizeof(factory_t));
+        factory_alloc_default_arrays(f);
         if (!f) return 0;
 
         f->n_participants = n;
@@ -462,6 +463,7 @@ int test_prop_persist_factory_roundtrip(void) {
 
         /* Load and compare */
         factory_t *loaded = calloc(1, sizeof(factory_t));
+        factory_alloc_default_arrays(loaded);
         if (!loaded) return 0;
 
         int loaded_ok = persist_load_factory(&db, fid, loaded, ctx);
