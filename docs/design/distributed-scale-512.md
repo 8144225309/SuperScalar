@@ -101,12 +101,36 @@ all-signers × all-nodes nonce matrix is `N × n_nodes × 66 B`:
 So even with perfect memory efficiency the **ceremony messages themselves** stop
 fitting somewhere around N≈250. The same applies to the partial-sig matrix.
 
-*Fix:* stride per participant — a client only needs **its own row**
-(`n_nodes × 66 B` = 135 KB at N=512, 270 KB at N=1024), which keeps every frame
-small regardless of N. A stride was reportedly introduced for the N≥127 abort;
-this design requires **re-verifying it applies to both the nonce (0x83) and
-partial-sig (0x89) matrices at 512/1024**, since a dense path anywhere reintroduces
-the ceiling. Treat as the highest-risk unknown in the whole plan.
+**CONFIRMED IN CODE** (`src/client.c:1675`) — this is not an estimate:
+
+```c
+size_t mtx_stride = (size_t)factory->n_participants * 66;  /* tight stride = actual signer count */
+unsigned char *all_pn = calloc(nn, mtx_stride);
+...
+have_matrix = (got_matrix_len == (uint32_t)(nn * mtx_stride));   /* received over the wire */
+```
+
+The matrix is `n_nodes × n_participants × 66 B` **dense**, and `got_matrix_len`
+shows it crosses the wire whole. The stride fix introduced for the N≥127 abort
+narrowed the stride from `FACTORY_MAX_SIGNERS` (256) to the actual participant
+count — a **constant-factor** win, not a sparsity win.
+
+It is also a **memory** hit, not only a wire limit: that single `calloc` is
+~69 MB per client at N=512, on top of the 46.5 MB tree.
+
+*Fix — make it sparse, not merely strided.* A signer participates only in the
+nodes on its own root→leaf path (~11 at N=512), never in all 2,046. Sum over
+nodes of the **actual** signer-set size is **O(N log N)**:
+
+| N | dense (today) | sparse (O(N log N)) | reduction |
+|---|---|---|---|
+| 127 | 4.3 MB | ~150 KB | ~29× |
+| 512 | 69.3 MB | ~743 KB | ~93× |
+| 1024 | 277 MB | ~1.6 MB | ~173× |
+
+Every frame then stays far under 16 MB at any N, and the per-client transient
+allocation disappears with it. The same treatment is required for the partial-sig
+(`0x89`) matrix.
 
 ### B2 — `select()` breaks (and is UB) past fd 1023
 
