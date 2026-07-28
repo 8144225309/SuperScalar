@@ -74,6 +74,116 @@ static int build_keys(const secp256k1_context *ctx, const char *seed, size_t n_s
     return 1;
 }
 
+/* ---- Full BOLT-2 commitment ceremony (in-process mirror pair) ----
+   S initiated a state update (add/fulfill already applied to BOTH sides).
+   Runs the daemon's exact sequence from htlc_commit_add_and_sign, minus wire:
+     S: channel_create_commitment_partial_sig        (commitment_signed ->)
+     R: channel_verify_and_aggregate_commitment_sig  (verify partial + aggregate)
+     R: reveal pcs(cn-1) + advertise pcp(cn+1)       (revoke_and_ack ->)
+     S: channel_receive_revocation_flat + set_remote_pcp
+     ...then the symmetric R->S half.
+   Every partial sig is cryptographically verified (musig_verify_partial_sig
+   inside verify_and_aggregate) and every superseded state is revoked — the two
+   gaps flagged in the earlier realism audit. */
+static int bolt2_commit_round(channel_t *S, channel_t *R,
+                              size_t *n_aggsigs, size_t *n_revocations) {
+    unsigned char partial[32], full[64], pcs[32];
+    uint32_t nidx;
+    secp256k1_pubkey next_pcp;
+
+    /* S signs R's new commitment; R verifies the partial + aggregates */
+    if (!channel_create_commitment_partial_sig(S, partial, &nidx)) return 0;
+    if (!channel_verify_and_aggregate_commitment_sig(R, partial, nidx, full)) return 0;
+    (*n_aggsigs)++;
+    /* R revokes its previous state toward S */
+    if (R->commitment_number > 0) {
+        if (!channel_get_per_commitment_secret(R, R->commitment_number - 1, pcs)) return 0;
+        if (!channel_receive_revocation_flat(S, S->commitment_number - 1, pcs)) return 0;
+        if (!channel_get_per_commitment_point(R, R->commitment_number + 1, &next_pcp)) return 0;
+        channel_set_remote_pcp(S, S->commitment_number + 1, &next_pcp);
+        (*n_revocations)++;
+    }
+    /* R signs S's new commitment; S verifies + aggregates */
+    if (!channel_create_commitment_partial_sig(R, partial, &nidx)) return 0;
+    if (!channel_verify_and_aggregate_commitment_sig(S, partial, nidx, full)) return 0;
+    (*n_aggsigs)++;
+    /* S revokes its previous state toward R */
+    if (S->commitment_number > 0) {
+        if (!channel_get_per_commitment_secret(S, S->commitment_number - 1, pcs)) return 0;
+        if (!channel_receive_revocation_flat(R, R->commitment_number - 1, pcs)) return 0;
+        if (!channel_get_per_commitment_point(S, S->commitment_number + 1, &next_pcp)) return 0;
+        channel_set_remote_pcp(R, R->commitment_number + 1, &next_pcp);
+        (*n_revocations)++;
+    }
+    return 1;
+}
+
+/* Build the client-side mirror of an LSP channel entry: same funding outpoint
+   and 2-of-2 keyagg (signer_idx flipped), flipped balance perspective, its own
+   random basepoints + PCS chain + nonce pool; then exchange basepoints, initial
+   PCPs (cn 0 and 1), and the serialized pubnonce pools both ways — the same
+   material MSG_CHANNEL_BASEPOINTS / MSG_CHANNEL_NONCES carry over the wire. */
+static int setup_mirror_channel(secp256k1_context *ctx, channel_t *L, channel_t *C,
+                                const secp256k1_keypair *client_kp,
+                                const secp256k1_pubkey *client_pub,
+                                const secp256k1_pubkey *lsp_pub,
+                                size_t n_states) {
+    unsigned char csec[32];
+    if (!secp256k1_keypair_sec(ctx, csec, client_kp)) return 0;
+    int ok = channel_init(C, ctx, csec, client_pub, lsp_pub,
+                          L->funding_txid, L->funding_vout, L->funding_amount,
+                          L->funding_spk, L->funding_spk_len,
+                          L->remote_amount, L->local_amount,   /* flipped view */
+                          CHANNEL_DEFAULT_CSV_DELAY);
+    memset(csec, 0, 32);
+    if (!ok) return 0;
+    C->funder_is_local = 0;                   /* the LSP funded the channel */
+    C->use_cpfp_anchor = L->use_cpfp_anchor;  /* MUST match or the sighash diverges */
+    C->funding_keyagg = L->funding_keyagg;    /* same aggregate, opposite seat */
+    C->local_funding_signer_idx = 1 - L->local_funding_signer_idx;
+    C->has_chan_merkle_root = L->has_chan_merkle_root;
+    memcpy(C->chan_merkle_root, L->chan_merkle_root, 32);
+
+    if (!channel_generate_random_basepoints(C)) return 0;
+    /* basepoint exchange, both directions */
+    channel_set_remote_basepoints(L, &C->local_payment_basepoint,
+                                  &C->local_delayed_payment_basepoint,
+                                  &C->local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(L, &C->local_htlc_basepoint);
+    channel_set_remote_basepoints(C, &L->local_payment_basepoint,
+                                  &L->local_delayed_payment_basepoint,
+                                  &L->local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(C, &L->local_htlc_basepoint);
+
+    /* per-commitment secret chains on both sides */
+    for (size_t cn = L->n_local_pcs; cn < n_states; cn++)
+        if (!channel_generate_local_pcs(L, cn)) return 0;
+    for (size_t cn = C->n_local_pcs; cn < n_states; cn++)
+        if (!channel_generate_local_pcs(C, cn)) return 0;
+
+    /* initial per-commitment points (cn 0 and 1), both directions */
+    for (uint64_t cn = 0; cn <= 1; cn++) {
+        secp256k1_pubkey p;
+        if (!channel_get_per_commitment_point(L, cn, &p)) return 0;
+        channel_set_remote_pcp(C, cn, &p);
+        if (!channel_get_per_commitment_point(C, cn, &p)) return 0;
+        channel_set_remote_pcp(L, cn, &p);
+    }
+
+    /* nonce pools + full pubnonce exchange */
+    if (!channel_init_nonce_pool(C, MUSIG_NONCE_POOL_MAX)) return 0;
+    {
+        static unsigned char ser[MUSIG_NONCE_POOL_MAX][66];
+        for (size_t i = 0; i < L->local_nonce_pool.count; i++)
+            if (!musig_pubnonce_serialize(ctx, ser[i], &L->local_nonce_pool.nonces[i].pubnonce)) return 0;
+        if (!channel_set_remote_pubnonces(C, ser, L->local_nonce_pool.count)) return 0;
+        for (size_t i = 0; i < C->local_nonce_pool.count; i++)
+            if (!musig_pubnonce_serialize(ctx, ser[i], &C->local_nonce_pool.nonces[i].pubnonce)) return 0;
+        if (!channel_set_remote_pubnonces(L, ser, C->local_nonce_pool.count)) return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -187,9 +297,12 @@ int main(int argc, char **argv) {
         uint32_t vout = (uint32_t)strtoul(argv[5], NULL, 10);
         uint64_t amount = strtoull(argv[6], NULL, 10);
         const char *outfile = argv[7];
-        uint64_t fee_rate = (argc >= 9) ? strtoull(argv[8], NULL, 10) : 1;
+        uint64_t fee_kvb = (argc >= 9) ? strtoull(argv[8], NULL, 10) : 1000; /* sat/KILOvbyte: 100 = 0.1 sat/vB */
         size_t P = (argc >= 10) ? strtoull(argv[9], NULL, 10) : 4;  /* payments/channel */
         const char *audit_dir = (argc >= 11) ? argv[10] : NULL;     /* extra proof/audit records */
+        unsigned lsp_pct = (argc >= 12) ? (unsigned)strtoul(argv[11], NULL, 10) : 50;
+        /* lsp_pct = LSP's initial share per channel.  100 => clients start at ZERO:
+           every sat a client holds at close arrived via a real HTLC payment. */
         size_t ns = N + 1;
 
         secp256k1_keypair *kps = calloc(ns, sizeof(*kps));
@@ -220,9 +333,24 @@ int main(int argc, char **argv) {
         unsigned char lsp_sec[32];
         if (!secp256k1_keypair_sec(ctx, lsp_sec, &kps[0])) { fprintf(stderr, "lsp sec\n"); return 1; }
         lsp_channel_mgr_t mgr; memset(&mgr, 0, sizeof mgr);
-        mgr.lsp_balance_pct = 50;   /* 50/50 initial split per channel */
+        mgr.lsp_balance_pct = (uint16_t)lsp_pct;
         if (!lsp_channels_init(&mgr, ctx, f, lsp_sec, N)) { fprintf(stderr, "lsp_channels_init FAILED\n"); return 1; }
-        printf("  channels: %zu real 2-of-2 LN channels wired to leaves\n", mgr.n_channels);
+        printf("  channels: %zu real 2-of-2 LN channels wired to leaves (LSP share %u%%%s)\n",
+               mgr.n_channels, lsp_pct,
+               lsp_pct >= 100 ? " — clients start at 0, all client sats payment-borne" : "");
+
+        /* --- Client-side mirror channels: the full BOLT-2 ceremony needs BOTH
+               endpoints live (basepoints, PCS chains, PCPs, nonce pools). --- */
+        channel_t *cli = calloc(N, sizeof(channel_t));
+        if (!cli) { fprintf(stderr, "oom client mirrors\n"); return 1; }
+        size_t n_states = 2 * P + 4;   /* cn advances twice per payment */
+        for (size_t c = 0; c < N; c++) {
+            if (!setup_mirror_channel(ctx, &mgr.entries[c].channel, &cli[c],
+                                      &kps[c + 1], &pks[c + 1], &pks[0], n_states)) {
+                fprintf(stderr, "mirror channel %zu setup FAILED\n", c); return 1;
+            }
+        }
+        printf("  mirrors:  %zu client-side channels (basepoints+PCS+pubnonce pools exchanged)\n", N);
 
         uint64_t init_client_total = 0;
         uint64_t *init_local  = audit_dir ? calloc(N, sizeof(uint64_t)) : NULL;
@@ -247,37 +375,84 @@ int main(int argc, char **argv) {
             if (!af) fprintf(stderr, "warn: cannot open %s\n", pth);
         }
         uint64_t gross_moved = 0, commit_sum = 0;
-        size_t n_pay = 0, n_skip = 0;
+        size_t n_pay = 0, n_skip = 0, n_aggsigs = 0, n_revocations = 0;
+        uint64_t *paid_to_client = calloc(N, sizeof(uint64_t));
         for (size_t c = 0; c < N; c++) {
-            channel_t *ch = &mgr.entries[c].channel;
+            channel_t *L = &mgr.entries[c].channel;
+            channel_t *C = &cli[c];
             for (size_t p = 0; p < P; p++) {
-                htlc_direction_t dir = (p % 4 == 3) ? HTLC_RECEIVED : HTLC_OFFERED;
+                /* payment-borne mode: every payment flows LSP->client so each
+                   client's entire close balance came through real HTLCs.
+                   Mixed mode keeps the 3:1 bidirectional pattern. */
+                int lsp_to_client = (lsp_pct >= 100) ? 1 : (p % 4 != 3);
                 uint64_t amt = 1000 + (uint64_t)((c + p) % 400);
-                uint64_t offerer = (dir == HTLC_OFFERED) ? ch->local_amount : ch->remote_amount;
-                if (offerer < amt + CHANNEL_RESERVE_SATS + 500) { n_skip++; continue; }
+                uint64_t offerer = lsp_to_client ? L->local_amount : L->remote_amount;
+                if (offerer < amt + CHANNEL_RESERVE_SATS + 500) {
+                    if (lsp_pct >= 100) { fprintf(stderr, "ch %zu p %zu unaffordable — sizing bug\n", c, p); return 1; }
+                    n_skip++; continue;
+                }
                 unsigned char pre[32] = {0}, hash[32];
                 pre[0] = (unsigned char)c; pre[1] = (unsigned char)(c >> 8);
                 pre[2] = (unsigned char)p; pre[3] = 0xA5;
                 sha256(pre, 32, hash);
-                uint64_t lb = ch->local_amount, rb = ch->remote_amount;
-                uint64_t id;
-                if (!channel_add_htlc(ch, dir, amt, hash, 100, &id)) { n_skip++; continue; }
-                if (!channel_fulfill_htlc(ch, id, pre))              { n_skip++; continue; }
+                uint64_t lb = L->local_amount, rb = L->remote_amount;
+                channel_t *S = lsp_to_client ? L : C;   /* update initiator */
+                channel_t *R = lsp_to_client ? C : L;
+                uint64_t idS, idR;
+                /* update_add_htlc: offered on the sender, mirrored received on the peer */
+                if (!channel_add_htlc(S, HTLC_OFFERED,  amt, hash, 100, &idS) ||
+                    !channel_add_htlc(R, HTLC_RECEIVED, amt, hash, 100, &idR)) {
+                    fprintf(stderr, "add_htlc FAILED ch %zu p %zu\n", c, p); return 1;
+                }
+                /* commitment_signed / revoke_and_ack round for the HTLC-pending state */
+                if (!bolt2_commit_round(S, R, &n_aggsigs, &n_revocations)) {
+                    fprintf(stderr, "BOLT2 round (add) FAILED ch %zu p %zu\n", c, p); return 1;
+                }
+                /* update_fulfill_htlc: recipient reveals the preimage; both books settle */
+                if (!channel_fulfill_htlc(R, idR, pre) ||
+                    !channel_fulfill_htlc(S, idS, pre)) {
+                    fprintf(stderr, "fulfill FAILED ch %zu p %zu\n", c, p); return 1;
+                }
+                /* second signed round for the settled state, initiated by the fulfiller */
+                if (!bolt2_commit_round(R, S, &n_aggsigs, &n_revocations)) {
+                    fprintf(stderr, "BOLT2 round (fulfill) FAILED ch %zu p %zu\n", c, p); return 1;
+                }
                 gross_moved += amt; n_pay++;
+                if (lsp_to_client) paid_to_client[c] += amt;
                 if (af) {
                     char hh[65], ph[65]; hex_encode(hash, 32, hh); hh[64] = 0; hex_encode(pre, 32, ph); ph[64] = 0;
                     fprintf(af, "{\"i\":%zu,\"channel\":%zu,\"dir\":\"%s\",\"amount\":%llu,"
                                 "\"payment_hash\":\"%s\",\"preimage\":\"%s\","
                                 "\"local_before\":%llu,\"remote_before\":%llu,"
-                                "\"local_after\":%llu,\"remote_after\":%llu}\n",
-                            n_pay, c, (dir == HTLC_OFFERED) ? "lsp->client" : "client->lsp",
+                                "\"local_after\":%llu,\"remote_after\":%llu,"
+                                "\"cn\":%llu,\"aggsigs\":4,\"revocations\":4}\n",
+                            n_pay, c, lsp_to_client ? "lsp->client" : "client->lsp",
                             (unsigned long long)amt, hh, ph,
                             (unsigned long long)lb, (unsigned long long)rb,
-                            (unsigned long long)ch->local_amount, (unsigned long long)ch->remote_amount);
+                            (unsigned long long)L->local_amount, (unsigned long long)L->remote_amount,
+                            (unsigned long long)L->commitment_number);
                 }
             }
         }
         if (af) fclose(af);
+
+        /* HARD verification: (a) both endpoints' books agree exactly;
+           (b) in payment-borne mode each client's balance equals the sum of
+           its received payments — no other source of client sats exists. */
+        {
+            size_t bad_mirror = 0, bad_borne = 0;
+            for (size_t c = 0; c < N; c++) {
+                channel_t *L = &mgr.entries[c].channel, *C = &cli[c];
+                if (L->local_amount != C->remote_amount ||
+                    L->remote_amount != C->local_amount) bad_mirror++;
+                if (lsp_pct >= 100 && L->remote_amount != paid_to_client[c]) bad_borne++;
+            }
+            if (bad_mirror || bad_borne) {
+                fprintf(stderr, "VERIFY FAILED: mirror_mismatch=%zu payment_borne_mismatch=%zu\n",
+                        bad_mirror, bad_borne);
+                return 1;
+            }
+        }
         uint64_t final_client_total = 0;
         for (size_t c = 0; c < N; c++) {
             final_client_total += mgr.entries[c].channel.remote_amount;
@@ -289,7 +464,7 @@ int main(int argc, char **argv) {
                remote_amount).  NULL close_spk => real per-client + LSP close addresses. --- */
         tx_output_t *outs = calloc(N + 1, sizeof(tx_output_t));
         uint64_t est_vsize = 11 + 58 + (uint64_t)(N + 1) * 43;
-        uint64_t close_fee = est_vsize * fee_rate;
+        uint64_t close_fee = (est_vsize * fee_kvb + 999) / 1000;   /* sat/kvB, round up */
         size_t n_out = lsp_channels_build_close_outputs(&mgr, f, outs, close_fee, NULL, 0);
         if (n_out == 0) { fprintf(stderr, "build_close_outputs FAILED (funding < client_total+fee?)\n"); return 1; }
         tx_buf_t close_tx; tx_buf_init(&close_tx, 1u << 20);
@@ -350,6 +525,9 @@ int main(int argc, char **argv) {
 
         printf("inproc-pay: N=%zu channels=%zu payments=%zu (skipped %zu) gross_moved=%llu sats\n",
                N, mgr.n_channels, n_pay, n_skip, (unsigned long long)gross_moved);
+        printf("inproc-pay: BOLT2: aggsigs_verified=%zu revocations_exchanged=%zu mirror_books=exact%s\n",
+               n_aggsigs, n_revocations,
+               lsp_pct >= 100 ? "  payment_borne=VERIFIED (every client sat arrived via HTLC)" : "");
         printf("inproc-pay: client_total %llu -> %llu (net %+lld to clients)  commitment_bumps=%llu\n",
                (unsigned long long)init_client_total, (unsigned long long)final_client_total,
                (long long)final_client_total - (long long)init_client_total,
@@ -358,6 +536,8 @@ int main(int argc, char **argv) {
                n_out, close_tx.len, (unsigned long long)out_sum, (unsigned long long)amount,
                (unsigned long long)close_fee, (out_sum + close_fee == amount) ? "yes" : "NO");
         printf("  hex -> %s\n", outfile);
+        for (size_t c = 0; c < N; c++) channel_cleanup(&cli[c]);
+        free(cli); free(paid_to_client);
         lsp_channels_cleanup(&mgr);
         return 0;
     }
@@ -365,8 +545,10 @@ int main(int argc, char **argv) {
     fprintf(stderr,
         "usage:\n"
         "  %s addr         <N> <SEED>\n"
+        "  %s dumpkeys     <N> <SEED>\n"
         "  %s lifecycle    <N> <M_FUNDED> <SEED> <FUND_TXID> <VOUT> <AMOUNT> <OUTFILE> [FEE_RATE]\n"
-        "  %s paylifecycle <N> <SEED> <FUND_TXID> <VOUT> <AMOUNT> <OUTFILE> [FEE_RATE] [PAYMENTS_PER_CH]\n",
-        argv[0], argv[0], argv[0]);
+        "  %s paylifecycle <N> <SEED> <FUND_TXID> <VOUT> <AMOUNT> <OUTFILE> [FEE_KVB] [P] [AUDIT_DIR] [LSP_PCT]\n"
+        "                  FEE_KVB in sat/kvB (100 = 0.1 sat/vB); LSP_PCT=100 => clients start at 0\n",
+        argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }
