@@ -5724,7 +5724,7 @@ int test_factory_ps_subfactory_chain_extension(void) {
                         "init per-input session");
             size_t this_n = sub->input_n_signers[i];
             for (size_t s = 0; s < this_n; s++) {
-                uint32_t participant = sub->input_signer_indices[i][s];
+                uint32_t participant = factory_node_input_signers(sub, i)[s];
                 unsigned char seckey[32];
                 secp256k1_pubkey pk;
                 TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]),
@@ -5747,7 +5747,7 @@ int test_factory_ps_subfactory_chain_extension(void) {
         for (size_t i = 0; i < n_inp; i++) {
             size_t this_n = sub->input_n_signers[i];
             for (size_t s = 0; s < this_n; s++) {
-                uint32_t participant = sub->input_signer_indices[i][s];
+                uint32_t participant = factory_node_input_signers(sub, i)[s];
                 secp256k1_musig_partial_sig psig;
                 TEST_ASSERT(musig_create_partial_sig(
                                 ctx, &psig, &secnonces[i][s], &kps[participant],
@@ -5799,7 +5799,7 @@ int test_factory_ps_subfactory_chain_extension(void) {
                         "chain[2] init per-input");
             size_t this_n = sub->input_n_signers[i];
             for (size_t s = 0; s < this_n; s++) {
-                uint32_t participant = sub->input_signer_indices[i][s];
+                uint32_t participant = factory_node_input_signers(sub, i)[s];
                 unsigned char seckey[32];
                 secp256k1_pubkey pk;
                 secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
@@ -5820,7 +5820,7 @@ int test_factory_ps_subfactory_chain_extension(void) {
         for (size_t i = 0; i < n_inp2; i++) {
             size_t this_n = sub->input_n_signers[i];
             for (size_t s = 0; s < this_n; s++) {
-                uint32_t participant = sub->input_signer_indices[i][s];
+                uint32_t participant = factory_node_input_signers(sub, i)[s];
                 secp256k1_musig_partial_sig psig;
                 TEST_ASSERT(musig_create_partial_sig(
                                 ctx, &psig, &secnonces2[i][s], &kps[participant],
@@ -5940,7 +5940,7 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
                         "init input");
             size_t this_n = sub->input_n_signers[i];
             for (size_t s = 0; s < this_n; s++) {
-                uint32_t participant = sub->input_signer_indices[i][s];
+                uint32_t participant = factory_node_input_signers(sub, i)[s];
                 unsigned char seckey[32];
                 secp256k1_pubkey pk;
                 secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
@@ -5961,7 +5961,7 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
         for (size_t i = 0; i < n_inp; i++) {
             size_t this_n = sub->input_n_signers[i];
             for (size_t s = 0; s < this_n; s++) {
-                uint32_t participant = sub->input_signer_indices[i][s];
+                uint32_t participant = factory_node_input_signers(sub, i)[s];
                 secp256k1_musig_partial_sig psig;
                 TEST_ASSERT(musig_create_partial_sig(
                                 ctx, &psig, &secnonces[i][s], &kps[participant],

@@ -288,7 +288,23 @@ typedef struct {
        for input k.  These arrays are allocated by ensure_input_sessions_alloc
        alongside input_signing_sessions and parallel-indexed by input_idx. */
     musig_keyagg_t   *input_keyaggs;          /* length n_input_sessions */
-    uint32_t          input_signer_indices[FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS];
+
+    /* Per-input signer sets.  WAS a fixed
+       [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS] = 16 x 256 x 4 = 16 KB carried
+       by EVERY node, whether or not that node had any input sessions at all --
+       and only multi-input PS sub-factory chain-advance nodes ever use it.
+       Since nodes[] is sized to the participant count, that made this single
+       field the dominant per-client cost: at N=224 it was 960 nodes x 16 KB =
+       15.7 MB, essentially the entire measured 15.9 MB client footprint, and it
+       is what made a co-located swarm scale as O(N^2).
+       Now allocated only for nodes that actually have input sessions, sized to
+       that node's own signer count, in ensure_input_sessions_alloc next to the
+       siblings above (which were already dynamic -- this one was simply never
+       converted with them).
+       Index it via factory_node_input_signers(node, input_idx)[j]; never with
+       [i][j], and never sizeof() it -- it is a pointer now. */
+    uint32_t         *input_signer_indices;   /* n_input_sessions * input_signers_stride */
+    size_t            input_signers_stride;   /* = n_signers at alloc time */
     size_t            input_n_signers[FACTORY_MAX_OUTPUTS];
     unsigned char     input_merkle_root[FACTORY_MAX_OUTPUTS][32];
     int               input_has_merkle_root[FACTORY_MAX_OUTPUTS];
@@ -319,6 +335,21 @@ typedef struct {
        (nsequence == 0xFFFFFFFE, no BIP-68 CSV). */
     int is_static_only;
 } factory_node_t;
+
+/* Signer set for one input of a multi-input chain advance.
+   Returns NULL when the node has no input sessions allocated (the common case --
+   only PS sub-factory chain-advance nodes do), so callers must NULL-check.
+   Valid entries are [0, node->input_n_signers[input_idx]). */
+static inline uint32_t *factory_node_input_signers(factory_node_t *node,
+                                                     size_t input_idx) {
+    if (!node || !node->input_signer_indices) return NULL;
+    return node->input_signer_indices + input_idx * node->input_signers_stride;
+}
+static inline const uint32_t *factory_node_input_signers_const(
+        const factory_node_t *node, size_t input_idx) {
+    if (!node || !node->input_signer_indices) return NULL;
+    return node->input_signer_indices + input_idx * node->input_signers_stride;
+}
 
 typedef struct {
     secp256k1_context *ctx;

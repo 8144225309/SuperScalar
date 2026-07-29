@@ -2012,7 +2012,7 @@ int factory_session_get_input_signer_slot(const factory_t *f,
     size_t n = node->input_n_signers[input_idx];
     if (n == 0 || n > (size_t)FACTORY_MAX_SIGNERS) return -1;
     for (size_t i = 0; i < n; i++) {
-        if (node->input_signer_indices[input_idx][i] == participant_idx)
+        if (factory_node_input_signers_const(node, input_idx)[i] == participant_idx)
             return (int)i;
     }
     return -1;
@@ -3101,9 +3101,12 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
     free(node->input_signing_sessions);
     free(node->input_partial_sigs);
     free(node->input_keyaggs);
+    free(node->input_signer_indices);
     node->input_signing_sessions = NULL;
     node->input_partial_sigs = NULL;
     node->input_keyaggs = NULL;
+    node->input_signer_indices = NULL;
+    node->input_signers_stride = 0;
     node->n_input_sessions = 0;
 
     node->input_signing_sessions =
@@ -3131,10 +3134,32 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
         node->input_partial_sigs = NULL;
         return 0;
     }
+
+    /* Per-input signer sets, sized to THIS node's signer count rather than a
+       fixed [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS] carried by every node.
+       Stride is n_signers (the node's full set is the widest any one input can
+       need: derive_input_keyagg either copies signer_indices wholesale for the
+       sales-stock input, or writes 2 entries for a channel input). */
+    node->input_signers_stride = node->n_signers ? node->n_signers : 2;
+    node->input_signer_indices =
+        (uint32_t *)calloc(node->ps_n_prev_outputs * node->input_signers_stride,
+                             sizeof(uint32_t));
+    if (!node->input_signer_indices) {
+        free(node->input_signing_sessions);
+        free(node->input_partial_sigs);
+        free(node->input_keyaggs);
+        node->input_signing_sessions = NULL;
+        node->input_partial_sigs = NULL;
+        node->input_keyaggs = NULL;
+        node->input_signers_stride = 0;
+        return 0;
+    }
+
     memset(node->input_partial_sigs_received, 0,
            sizeof(node->input_partial_sigs_received));
     memset(node->input_n_signers, 0, sizeof(node->input_n_signers));
-    memset(node->input_signer_indices, 0, sizeof(node->input_signer_indices));
+    /* input_signer_indices is calloc'd above -- do NOT memset it with
+       sizeof(), which is now sizeof(pointer). */
     memset(node->input_merkle_root, 0, sizeof(node->input_merkle_root));
     memset(node->input_has_merkle_root, 0, sizeof(node->input_has_merkle_root));
     node->n_input_sessions = node->ps_n_prev_outputs;
@@ -3228,7 +3253,7 @@ static int derive_input_keyagg(const factory_t *f,
         node->input_keyaggs[input_idx] = node->keyagg;
         node->input_n_signers[input_idx] = node->n_signers;
         for (size_t i = 0; i < node->n_signers; i++)
-            node->input_signer_indices[input_idx][i] = node->signer_indices[i];
+            factory_node_input_signers(node, input_idx)[i] = node->signer_indices[i];
         if (!compute_factory_lstock_merkle(f,
                                             node->input_merkle_root[input_idx]))
             return 0;
@@ -3247,8 +3272,8 @@ static int derive_input_keyagg(const factory_t *f,
     if (!musig_aggregate_keys(f->ctx, &node->input_keyaggs[input_idx], pks, 2))
         return 0;
     node->input_n_signers[input_idx] = 2;
-    node->input_signer_indices[input_idx][0] = client_participant;
-    node->input_signer_indices[input_idx][1] = 0;
+    factory_node_input_signers(node, input_idx)[0] = client_participant;
+    factory_node_input_signers(node, input_idx)[1] = 0;
 
     int has_merkle = 0;
     if (!compute_factory_chan_cltv_merkle(f,
@@ -4997,6 +5022,11 @@ void factory_free(factory_t *f) {
         /* SF-MULTI-KEYAGG (#283): free per-input keyagg cache. */
         free(f->nodes[i].input_keyaggs);
         f->nodes[i].input_keyaggs = NULL;
+        /* Per-input signer sets: heap since the fixed 16 KB/node version was
+           the dominant per-client cost (see factory.h). */
+        free(f->nodes[i].input_signer_indices);
+        f->nodes[i].input_signer_indices = NULL;
+        f->nodes[i].input_signers_stride = 0;
         f->nodes[i].n_input_sessions = 0;
     }
     /* F4: factory-level distribution TX buffer (populated by
