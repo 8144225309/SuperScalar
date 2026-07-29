@@ -3851,18 +3851,66 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
     const char *dir_str = direction ? "recv" : "sent";
     const char *msg_name = wire_msg_type_name(msg_type);
 
-    /* Truncated payload summary */
+    /* Truncated payload summary, built WITHOUT serializing the whole message.
+     *
+     * This used to be cJSON_PrintUnformatted(json) followed by "keep the first
+     * 500 bytes, free the rest".  cJSON_PrintUnformatted allocates the ENTIRE
+     * tree as one heap string, and a ceremony message carries an O(N) nonce or
+     * partial-sig matrix -- so at scale this allocated megabytes per message
+     * purely to throw ~all of it away, on every message, in both the client and
+     * the LSP.  massif at N=160 named it the largest single allocation site in
+     * the client: 6.16 MB peak, via
+     *     wire_recv -> cJSON_PrintUnformatted -> print_value -> print_string_ptr
+     * and it scaled with N, which is what made a co-located swarm quadratic.
+     *
+     * We now walk only the top-level fields and stop as soon as the 500-byte
+     * budget is spent, so the cost is bounded by the summary size rather than
+     * by the message size.  Nested arrays/objects are rendered as a shape
+     * ("[512 items]"), which is what an audit trail actually wants from a
+     * matrix anyway -- the full payload was never readable in 500 bytes. */
     char summary[501];
     summary[0] = '\0';
     if (json) {
-        char *printed = cJSON_PrintUnformatted((cJSON *)json);
-        if (printed) {
-            size_t len = strlen(printed);
-            if (len > 500) len = 500;
-            memcpy(summary, printed, len);
-            summary[len] = '\0';
-            free(printed);
+        size_t used = 0;
+        const cJSON *child = ((const cJSON *)json)->child;
+        int first = 1;
+        if (used < sizeof(summary) - 1) summary[used++] = '{';
+        for (; child && used < sizeof(summary) - 8; child = child->next) {
+            char field[160];
+            int n;
+            const char *nm = child->string ? child->string : "?";
+            if (cJSON_IsArray(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":[%d items]",
+                             first ? "" : ",", nm, cJSON_GetArraySize((cJSON *)child));
+            } else if (cJSON_IsObject(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":{%d fields}",
+                             first ? "" : ",", nm, cJSON_GetArraySize((cJSON *)child));
+            } else if (cJSON_IsString(child)) {
+                /* Long hex blobs (pubkeys, nonces) get head-truncated. */
+                const char *v = child->valuestring ? child->valuestring : "";
+                n = snprintf(field, sizeof(field), "%s\"%s\":\"%.48s%s\"",
+                             first ? "" : ",", nm, v, strlen(v) > 48 ? "..." : "");
+            } else if (cJSON_IsNumber(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":%.10g",
+                             first ? "" : ",", nm, child->valuedouble);
+            } else if (cJSON_IsBool(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":%s",
+                             first ? "" : ",", nm, cJSON_IsTrue(child) ? "true" : "false");
+            } else {
+                n = snprintf(field, sizeof(field), "%s\"%s\":null", first ? "" : ",", nm);
+            }
+            if (n < 0) break;
+            if (used + (size_t)n >= sizeof(summary) - 8) {
+                /* Budget spent — mark truncation rather than silently stopping. */
+                used += (size_t)snprintf(summary + used, sizeof(summary) - used, ",...");
+                break;
+            }
+            memcpy(summary + used, field, (size_t)n);
+            used += (size_t)n;
+            first = 0;
         }
+        if (used < sizeof(summary) - 1) summary[used++] = '}';
+        summary[used < sizeof(summary) ? used : sizeof(summary) - 1] = '\0';
     }
 
     const char *sql =
