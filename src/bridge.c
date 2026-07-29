@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <time.h>
 
 void bridge_init(bridge_t *br) {
@@ -384,27 +384,37 @@ int bridge_run(bridge_t *br) {
     if (br->lsp_fd < 0) return 0;
 
     while (1) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        int max_fd = br->lsp_fd;
-        FD_SET(br->lsp_fd, &rfds);
-
+        /* poll(), not select(): FD_SET(fd,&set) indexes bit `fd` in a fixed
+           1024-bit fd_set, so any descriptor >= FD_SETSIZE overflows it.  Only
+           two or three descriptors are watched here, but that was never the
+           issue -- the descriptor VALUE is, and the bridge shares a process
+           whose descriptors run past 1024 at large client counts.
+           Slots are fixed: 0 = LSP, 1 = plugin or plugin listener. */
+        struct pollfd pfds[2];
+        nfds_t nfds = 0;
+        pfds[nfds].fd = br->lsp_fd; pfds[nfds].events = POLLIN; nfds++;
+        int plugin_slot = -1, listen_slot = -1;
         if (br->plugin_fd >= 0) {
-            FD_SET(br->plugin_fd, &rfds);
-            if (br->plugin_fd > max_fd) max_fd = br->plugin_fd;
+            plugin_slot = (int)nfds;
+            pfds[nfds].fd = br->plugin_fd; pfds[nfds].events = POLLIN; nfds++;
         } else if (br->plugin_listen_fd >= 0) {
-            FD_SET(br->plugin_listen_fd, &rfds);
-            if (br->plugin_listen_fd > max_fd) max_fd = br->plugin_listen_fd;
+            listen_slot = (int)nfds;
+            pfds[nfds].fd = br->plugin_listen_fd; pfds[nfds].events = POLLIN; nfds++;
         }
 
-        /* Use heartbeat interval as select timeout (or 60s if no heartbeat) */
+        /* Use heartbeat interval as poll timeout (or 60s if no heartbeat) */
         int timeout_sec = (br->heartbeat_interval > 0) ? br->heartbeat_interval : 60;
-        struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        int ret = poll(pfds, nfds, timeout_sec * 1000);
         if (ret < 0) {
-            perror("Bridge: select");
+            perror("Bridge: poll");
             return 0;
         }
+        /* Readiness flags for the FD_ISSET sites below. */
+        int lsp_ready    = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR|POLLNVAL)) != 0;
+        int plugin_ready = plugin_slot >= 0 &&
+            (pfds[plugin_slot].revents & (POLLIN|POLLHUP|POLLERR|POLLNVAL)) != 0;
+        int listen_ready = listen_slot >= 0 &&
+            (pfds[listen_slot].revents & POLLIN) != 0;
 
         /* Heartbeat: check for stale LSP connection on timeout */
         if (ret == 0) {
@@ -436,12 +446,12 @@ int bridge_run(bridge_t *br) {
 
         /* Accept pending plugin connection */
         if (br->plugin_listen_fd >= 0 && br->plugin_fd < 0 &&
-            FD_ISSET(br->plugin_listen_fd, &rfds)) {
+            listen_ready) {
             bridge_accept_plugin(br);
         }
 
         /* Handle LSP messages */
-        if (FD_ISSET(br->lsp_fd, &rfds)) {
+        if (lsp_ready) {
             wire_msg_t msg;
             if (!wire_recv(br->lsp_fd, &msg)) {
                 fprintf(stderr, "Bridge: LSP connection lost\n");
@@ -468,7 +478,7 @@ int bridge_run(bridge_t *br) {
         }
 
         /* Handle plugin messages */
-        if (br->plugin_fd >= 0 && FD_ISSET(br->plugin_fd, &rfds)) {
+        if (br->plugin_fd >= 0 && plugin_ready) {
             char *line = bridge_read_plugin_line(br);
             if (!line) {
                 fprintf(stderr, "Bridge: plugin connection lost\n");

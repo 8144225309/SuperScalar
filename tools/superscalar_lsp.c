@@ -43,6 +43,7 @@
 #include <inttypes.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <poll.h>
@@ -2598,6 +2599,48 @@ int main(int argc, char *argv[]) {
                 "dynamic — see docs/design/distributed-scale-512.md)\n",
                 FACTORY_MAX_SIGNERS - 1);
         return 1;
+    }
+
+    /* File-descriptor budget.  One socket per client, plus the listener, bridge,
+       admin RPC, SQLite handles, logs and stdio.  Raise our own soft limit
+       rather than depending on the operator's shell: a swarm launcher that
+       forgets `ulimit -n` otherwise fails deep inside the ceremony as accept()
+       starts returning EMFILE, which reads like a client-side bug.
+       We only raise the SOFT limit toward the existing hard limit -- no
+       privilege is required for that, and the hard limit still governs. */
+    {
+        struct rlimit rl;
+        rlim_t want = (rlim_t)n_clients + 64;   /* clients + headroom */
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur < want) {
+                rlim_t target = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > want)
+                                ? want : rl.rlim_max;
+                /* Only attempt (and only announce) a real increase: when the
+                   hard limit already caps us, target == rlim_cur and claiming
+                   we "raised 128 -> 128" is just noise in front of the error. */
+                if (target > rl.rlim_cur) {
+                    struct rlimit nrl = rl;
+                    nrl.rlim_cur = target;
+                    if (setrlimit(RLIMIT_NOFILE, &nrl) == 0) {
+                        printf("LSP: raised fd soft limit %llu -> %llu for %d clients\n",
+                               (unsigned long long)rl.rlim_cur,
+                               (unsigned long long)target, n_clients);
+                        rl.rlim_cur = target;
+                    }
+                }
+            }
+            if (rl.rlim_cur < want) {
+                fprintf(stderr,
+                    "Error: fd limit too low — %d clients need ~%llu descriptors "
+                    "but the limit is %llu (hard limit %llu).\n"
+                    "Raise it before launching: ulimit -n %llu\n",
+                    n_clients, (unsigned long long)want,
+                    (unsigned long long)rl.rlim_cur,
+                    (unsigned long long)rl.rlim_max,
+                    (unsigned long long)want);
+                return 1;
+            }
+        }
     }
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
        in mixed mode the LAST entry can be any 1..15 since interior arities

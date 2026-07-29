@@ -1683,6 +1683,7 @@ extern int test_arity2_leaf_advance(void);
 /* Production Hardening tests */
 extern int test_distribution_tx_has_anchor(void);
 extern int test_ceremony_retry_excludes_timeout(void);
+extern int test_ceremony_select_high_fds(void);
 extern int test_funding_reserve_check(void);
 
 /* SF-CRASH-INJECT-WIRE #245 Half B: crash injection wire opcodes + runtime target. */
@@ -3580,6 +3581,7 @@ static void run_unit_tests(void) {
     printf("\n=== Production Hardening ===\n");
     RUN_TEST(test_distribution_tx_has_anchor);
     RUN_TEST(test_ceremony_retry_excludes_timeout);
+    RUN_TEST(test_ceremony_select_high_fds);
     RUN_TEST(test_funding_reserve_check);
 
     printf("\n=== Crash Injection (#245 Half B) ===\n");

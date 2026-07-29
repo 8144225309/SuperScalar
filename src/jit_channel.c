@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -155,11 +155,13 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     wire_msg_t accept_msg;
     int got_accept = 0;
     for (int attempt = 0; attempt < 30; attempt++) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(lsp->client_fds[client_idx], &rfds);
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int ret = select(lsp->client_fds[client_idx] + 1, &rfds, NULL, NULL, &tv);
+        /* poll(), not select(): FD_SET(fd,&set) indexes bit `fd` in a fixed
+           1024-bit fd_set, so a single client socket numbered >= FD_SETSIZE
+           overflows it.  Watching just one descriptor is no protection -- the
+           descriptor VALUE is what matters, and an LSP with ~1000 clients hands
+           out values past 1024.  See src/ceremony.c for the same conversion. */
+        struct pollfd pfd = { .fd = lsp->client_fds[client_idx], .events = POLLIN };
+        int ret = poll(&pfd, 1, 1000);
         if (ret <= 0) continue;  /* 1s timeout, retry */
         if (!wire_recv(lsp->client_fds[client_idx], &accept_msg)) {
             fprintf(stderr, "LSP JIT: wire_recv failed waiting for JIT_ACCEPT\n");
