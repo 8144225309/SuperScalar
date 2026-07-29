@@ -2551,15 +2551,52 @@ int main(int argc, char *argv[]) {
     uint32_t dying_blocks = (dying_blocks_arg > 0) ? (uint32_t)dying_blocks_arg
                             : (is_regtest ? 10 : 432);
 
-    /* The factory signing group is the LSP plus every client, and a MuSig
-       session holds at most MUSIG_SESSION_MAX_SIGNERS (128) signers, so the
-       supported maximum is 127 clients.  Reject the 129th signer here with a
-       clear message instead of failing deep inside the root signing ceremony
-       (set_pubnonce rejects slot 128 and finalize_nonces never completes). */
-    if (n_clients < 1 || n_clients + 1 > MUSIG_SESSION_MAX_SIGNERS) {
+    /* Client-count cap.  LOAD-BEARING — do not lift without the work below.
+       The signing group is the LSP plus every client, so n_participants =
+       n_clients + 1.  The crypto no longer caps that: musig sessions size their
+       pubnonces to the actual signer count, and factory_t's arrays auto-fit via
+       factory_config_fit().  BUT the daemon path still declares 51 FIXED
+       [FACTORY_MAX_SIGNERS] arrays.  With n_participants = 257 those overflow:
+       removing this check produced `*** stack smashing detected ***` (SIGABRT)
+       during factory creation at N=256 on regtest — a memory-corruption crash,
+       not a clean refusal.
+
+       The 51, counted (an earlier revision of this comment said "~53" with a
+       file list that actually summed to 37 and omitted lsp_rotation.c entirely
+       — do not trust it, re-count with:
+         grep -rnE '\[FACTORY_MAX_SIGNERS *\]' --include=*.c --include=*.h \
+              src/ tools/ include/          # minus the ~9 comment-only hits):
+
+         46 STACK LOCALS  — lsp_channels.c 12, client.c 11, lsp_rotation.c 8,
+                            lsp.c 7, ladder.c 3, superscalar_lsp.c 3,
+                            persist.c 1, superscalar_client.c 1
+          5 STRUCT MEMBERS in shared headers — the harder half, since these
+                            change sizeof() for every user of the type:
+                            ceremony.h:29, readiness.h:27, ladder.h:19+20, and
+                            factory.h:291 input_signer_indices, which is 2-D
+                            [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS].  Only
+                            the second dimension scales with the signer count:
+                            FACTORY_MAX_OUTPUTS is a fixed 16, so this is
+                            16*N*4 bytes — 16 KB today, 64 KB at N=1024.
+                            Linear, and not a blocker; convert it for
+                            consistency, not for size.
+
+       So this bound is what makes an over-large --clients a clear error instead
+       of a smash.  Lifting it requires converting those 51 sites to heap
+       allocations sized to n_participants (see
+       docs/design/distributed-scale-512.md); it is NOT just a config change.
+       Measured today with real daemons: N=224 completes a full onboard ->
+       LN-seed -> economy -> 225-output cooperative close with exact per-client
+       reconciliation (~5.5 GB swarm); N=255 reaches FACTORY LIVE. Beyond the
+       array work, the next limits in order are wall-clock (seeding is serialized,
+       ~O(N) round-trips), per-client RSS (~21 MB + ~0.085 MB/N), and `ulimit -n`
+       on the LSP (~N+20). */
+    if (n_clients < 1 || n_clients + 1 > FACTORY_MAX_SIGNERS) {
         fprintf(stderr, "Error: --clients must be 1..%d "
-                "(the LSP co-signs every factory: clients + 1 <= %d-signer MuSig cap)\n",
-                MUSIG_SESSION_MAX_SIGNERS - 1, MUSIG_SESSION_MAX_SIGNERS);
+                "(the LSP co-signs every factory, and the daemon still has fixed "
+                "[FACTORY_MAX_SIGNERS] arrays; lifting this needs those made "
+                "dynamic — see docs/design/distributed-scale-512.md)\n",
+                FACTORY_MAX_SIGNERS - 1);
         return 1;
     }
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;

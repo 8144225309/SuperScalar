@@ -44,9 +44,27 @@ SEED_MIN="${SEED_MIN:-5000}"            # LN seed amounts: big enough that clien
 SEED_MAX="${SEED_MAX:-15000}"
 ECON_MIN="${ECON_MIN:-500}"             # economy c2c amounts: small vs seeds so senders usually have the balance
 ECON_MAX="${ECON_MAX:-2500}"
-PAY_SETTLE_TRIES="${PAY_SETTLE_TRIES:-40}"
+# FAST=1 selects the event-driven timings in one switch.  The settle marker is
+# emitted after persist_commit()+fflush() (see await_marker), so PAY_RECOVER and
+# PAY_GAP are pure padding; this is the intended setting for large N.  Set BEFORE
+# the defaults below so an explicit PAY_* in the environment still wins.
+if [ "${FAST:-0}" = 1 ]; then
+    : "${PAY_POLL:=0.05}"; : "${PAY_RECOVER:=0}"; : "${PAY_GAP:=0}"
+fi
+PAY_SETTLE_TRIES="${PAY_SETTLE_TRIES:-40}"  # superseded by PAY_TIMEOUT; kept for back-compat
+PAY_POLL="${PAY_POLL:-0.5}"                # settle poll granularity; lower it for large N
 PAY_RECOVER="${PAY_RECOVER:-1}"
 PAY_GAP="${PAY_GAP:-1}"
+# Wall-clock settle budget in SECONDS -- was PAY_SETTLE_TRIES x PAY_POLL, i.e.
+# 40 x 0.5 = 20s at the old defaults, which is what this preserves.
+#
+# Decoupling these two matters: in the old form the timeout was a PRODUCT of the
+# poll granularity, so "lower PAY_POLL for large N" -- the advice this file used
+# to give -- silently cut the timeout by the same factor (0.1 => 40 x 0.1 = 4s).
+# That turns a slow-but-healthy payment into a spurious failure, and it would
+# have bitten hardest at exactly the large N the advice was aimed at.  Detection
+# granularity and patience are now independent knobs.
+PAY_TIMEOUT="${PAY_TIMEOUT:-20}"
 CLOSE_WAIT_SEC="${CLOSE_WAIT_SEC:-900}"
 
 TAG="pct100_$$"
@@ -76,17 +94,75 @@ cli(){ printf '%s\n' "$1" >&3 2>/dev/null || true; }
 seed_amt(){ echo $(( SEED_MIN + RANDOM % (SEED_MAX - SEED_MIN + 1) )); }
 econ_amt(){ echo $(( ECON_MIN + RANDOM % (ECON_MAX - ECON_MIN + 1) )); }
 
-settle_wait(){  # wait for the "Payment complete" count to increase past $1
-    local before="$1" now _w
-    for _w in $(seq 1 "$PAY_SETTLE_TRIES"); do
-        now=$(grep -ac "Payment complete" "$LSP_LOG" 2>/dev/null); now=${now:-0}
-        [ "$now" -gt "$before" ] && { sleep "$PAY_RECOVER"; return 0; }
-        sleep 0.5
+# ---- settle detection --------------------------------------------------------
+# The LSP gives the harness no synchronous "payment done" reply, so we watch its
+# log for the settle marker.  Two things were wrong with doing that by counting:
+#
+#  1. WHICH payment.  The old settle_wait counted TOTAL "Payment complete" lines
+#     and waited for the count to rise.  That is only correct while exactly one
+#     payment is in flight -- it cannot tell WHOSE payment finished.  We now wait
+#     on the specific marker (the same string the seed retry pass at the bottom
+#     of SEED already greps), so a wait can never be satisfied by an unrelated
+#     payment, and concurrent seeding stays available as an option later.
+#
+#  2. HOW MUCH LOG.  The old version re-grepped the WHOLE log on every poll.  The
+#     log grows all through an N-client seed, so each successive wait re-read
+#     more of it: polling harder made the scan cost worse, exactly backwards.
+#     We keep a byte offset and scan only what is new, so a wait costs O(bytes
+#     for this payment) rather than O(log) -- flat in N instead of quadratic.
+#
+# On the sleeps.  Each payment pays PAY_POLL (avg ~half the granularity) plus
+# PAY_RECOVER, and the seed/economy loops add PAY_GAP on top -- ~2.25s at the
+# 0.5/1/1 defaults.  PAY_RECOVER is padding for work that is ALREADY DONE:
+# src/lsp_demo.c prints the marker after persist_commit() and fflush(), as the
+# payment's last statement, so the marker means settled AND durable.
+#
+# MEASURED -- regtest N=64, same freshly-built binary, back-to-back, 2026-07-28:
+#     defaults   seed 225s  (3.52 s/payment)   65-output close, reconcile perfect
+#     FAST=1     seed  85s  (1.33 s/payment)   65-output close, reconcile perfect
+# 2.65x on the seed phase.  2.19 s/payment removed against 2.25s of predicted
+# sleep, so the sleep model above is sound and the residual 1.33s is real
+# protocol work plus this script's own fork cost.  BOTH runs PASSED sat-for-sat:
+# all 64 client outputs equalled net LN flow, no skim.  Dropping the pads did NOT
+# expose a client-side revoke_and_ack race at this N -- that was the standing
+# risk in removing them, and it did not materialise.  (It is evidence at N=64,
+# not a proof for all N; re-check if the pads are dropped at much larger N.)
+#
+# Defaults stay as-is -- they are what the green N=224 runs used.  FAST=1 is the
+# validated setting for large N.  Either way this is test ergonomics: seed
+# wall-clock is a harness artifact, not a protocol limit.
+LOG_OFF=0
+
+# Block until $1 (fixed string) appears in LSP_LOG at/after LOG_OFF.
+# 0 = matched, 1 = timed out.
+#
+# On a NON-match the offset is deliberately left alone.  Advancing it would risk
+# stepping past a marker line that was still mid-write, losing it permanently;
+# not advancing costs only a re-scan of this one payment's output, which is
+# bounded and small.  The offset jumps forward only on a confirmed match.
+await_marker(){
+    local pat="$1" sz t_end
+    # SECONDS (bash builtin) rather than $(date +%s): the deadline is checked on
+    # every poll, and at PAY_POLL=0.05 a forked `date` per iteration doubles the
+    # per-poll process cost for nothing.  An idle poll now spawns only `stat`;
+    # the tail|grep pair runs solely when the file has actually grown.
+    t_end=$(( SECONDS + PAY_TIMEOUT ))
+    while :; do
+        sz=$(stat -c %s "$LSP_LOG" 2>/dev/null || echo 0); sz=${sz:-0}
+        if [ "$sz" -gt "$LOG_OFF" ] \
+           && tail -c "+$((LOG_OFF+1))" "$LSP_LOG" 2>/dev/null | grep -qaF "$pat"; then
+            LOG_OFF="$sz"
+            if [ "$PAY_RECOVER" != 0 ]; then sleep "$PAY_RECOVER"; fi
+            return 0
+        fi
+        [ "$SECONDS" -ge "$t_end" ] && break
+        sleep "$PAY_POLL"
     done
-    sleep "$PAY_RECOVER"; return 1
+    if [ "$PAY_RECOVER" != 0 ]; then sleep "$PAY_RECOVER"; fi
+    return 1
 }
-lsppay_cli(){ local b; b=$(grep -ac "Payment complete" "$LSP_LOG" 2>/dev/null); cli "lsppay $1 $2"; settle_wait "${b:-0}"; }
-pay_cli(){    local b; b=$(grep -ac "Payment complete" "$LSP_LOG" 2>/dev/null); cli "pay $1 $2 $3"; settle_wait "${b:-0}"; }
+lsppay_cli(){ cli "lsppay $1 $2";  await_marker "Payment complete: LSP -> client $1 ("; }
+pay_cli(){    cli "pay $1 $2 $3";  await_marker "Payment complete: client $1 -> client $2 ("; }
 
 # ---- preflight ----
 [ -x "$LSP_BIN" ] && [ -x "$CLIENT_BIN" ] || die "binaries not found in $BUILD_DIR"

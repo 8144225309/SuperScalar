@@ -8,7 +8,10 @@
 #include "persist_wt.h"
 #include <secp256k1.h>
 
+/* Default inbound-connection capacity; --max-connections overrides it and
+   client_fds/client_pubkeys are heap-allocated, so this is a default, not a cap. */
 #define LSP_MAX_CLIENTS 256
+
 
 typedef struct {
     secp256k1_context *ctx;
