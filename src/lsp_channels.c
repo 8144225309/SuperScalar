@@ -7325,9 +7325,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                are already present. */
                                             readiness_tracker_t *rt =
                                                 (readiness_tracker_t *)mgr->readiness;
-                                            readiness_init(rt, lf->factory_id,
-                                                           lsp->n_clients,
-                                                           (persist_t *)mgr->persist);
+                                            /* Re-init on a LIVE tracker: readiness_init
+                                               treats *rt as uninitialized and memsets it,
+                                               so without this free the previous rotation's
+                                               per-client array leaks once per rotation.
+                                               Safe on a zeroed/never-init'd tracker too. */
+                                            readiness_free(rt);
+                                            if (!readiness_init(rt, lf->factory_id,
+                                                                lsp->n_clients,
+                                                                (persist_t *)mgr->persist)) {
+                                                fprintf(stderr,
+                                                    "LSP: readiness tracker alloc failed for "
+                                                    "%zu clients — rotation readiness will "
+                                                    "report NOT ready (fail closed)\n",
+                                                    lsp->n_clients);
+                                            }
                                             persist_t *db = (persist_t *)mgr->persist;
                                             notify_t *nfy = (notify_t *)mgr->notify;
                                             for (size_t ci = 0; ci < lsp->n_clients; ci++) {

@@ -1,17 +1,47 @@
 #include "superscalar/readiness.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-void readiness_init(readiness_tracker_t *rt, uint32_t factory_id,
-                    size_t n_clients, persist_t *db) {
-    if (!rt) return;
+int readiness_init(readiness_tracker_t *rt, uint32_t factory_id,
+                   size_t n_clients, persist_t *db) {
+    if (!rt) return 0;
+    /* Must not read any field of *rt before this memset: callers pass
+       uninitialized stack memory (see the header note). */
     memset(rt, 0, sizeof(*rt));
     rt->factory_id = factory_id;
-    rt->n_clients = (n_clients > FACTORY_MAX_SIGNERS) ?
-                    FACTORY_MAX_SIGNERS : n_clients;
     rt->db = db;
+
+    if (n_clients <= READINESS_SMALL) {
+        rt->clients = rt->clients_small;
+        rt->clients_cap = READINESS_SMALL;
+    } else {
+        rt->clients = calloc(n_clients, sizeof(*rt->clients));
+        if (!rt->clients) {
+            /* Stay valid-but-empty rather than half-initialized: every accessor
+               bounds-checks against n_clients, so 0 makes them all safe no-ops
+               and readiness_all_ready() reports NOT ready -- fail closed. */
+            rt->clients = rt->clients_small;
+            rt->clients_cap = READINESS_SMALL;
+            rt->n_clients = 0;
+            return 0;
+        }
+        rt->clients_cap = n_clients;
+    }
+
+    rt->n_clients = n_clients;
     for (size_t i = 0; i < rt->n_clients; i++)
         rt->clients[i].client_idx = (uint32_t)i;
+    return 1;
+}
+
+void readiness_free(readiness_tracker_t *rt) {
+    if (!rt) return;
+    if (rt->clients && rt->clients != rt->clients_small)
+        free(rt->clients);
+    rt->clients = NULL;
+    rt->clients_cap = 0;
+    rt->n_clients = 0;
 }
 
 void readiness_set_connected(readiness_tracker_t *rt, uint32_t client_idx,
