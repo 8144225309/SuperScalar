@@ -2574,9 +2574,12 @@ int main(int argc, char *argv[]) {
                             change sizeof() for every user of the type:
                             ceremony.h:29, readiness.h:27, ladder.h:19+20, and
                             factory.h:291 input_signer_indices, which is 2-D
-                            [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS] and so
-                            grows quadratically — size it before assuming the
-                            per-struct cost is small.
+                            [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS].  Only
+                            the second dimension scales with the signer count:
+                            FACTORY_MAX_OUTPUTS is a fixed 16, so this is
+                            16*N*4 bytes — 16 KB today, 64 KB at N=1024.
+                            Linear, and not a blocker; convert it for
+                            consistency, not for size.
 
        So this bound is what makes an over-large --clients a clear error instead
        of a smash.  Lifting it requires converting those 51 sites to heap
