@@ -148,6 +148,40 @@ static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     return dw_current_nsequence(&f->counter.layers[node->dw_layer_index]);
 }
 
+/* Ensure nodes[] and its two parallel node-indexed arrays hold at least `want`
+   entries, growing geometrically.  Returns 1 on success, 0 on OOM or cap.
+   Callers must not hold a factory_node_t* across this -- realloc may move it.
+   New tail entries are zeroed so callers keep the calloc semantics they had. */
+int factory_grow_nodes(factory_t *f, size_t want) {
+    if (!f) return 0;
+    if (want > f->config.max_nodes) return 0;   /* hard cap unchanged */
+    if (want <= f->nodes_cap) return 1;
+
+    size_t ncap = f->nodes_cap ? f->nodes_cap * 2 : 32;
+    if (ncap < want) ncap = want;
+    if (ncap > f->config.max_nodes) ncap = f->config.max_nodes;
+
+    factory_node_t *nn = (factory_node_t *)realloc(f->nodes, ncap * sizeof(*nn));
+    if (!nn) return 0;
+    memset(nn + f->nodes_cap, 0, (ncap - f->nodes_cap) * sizeof(*nn));
+    f->nodes = nn;
+
+    unsigned char (*nh)[32] = (unsigned char (*)[32])
+        realloc(f->node_l_stock_hashes, ncap * 32);
+    if (!nh) return 0;                 /* nodes[] already grown; cap not bumped
+                                          yet, so state stays consistent */
+    memset(nh + f->nodes_cap, 0, (ncap - f->nodes_cap) * 32);
+    f->node_l_stock_hashes = nh;
+
+    int *nv = (int *)realloc(f->node_l_stock_hash_valid, ncap * sizeof(int));
+    if (!nv) return 0;
+    memset(nv + f->nodes_cap, 0, (ncap - f->nodes_cap) * sizeof(int));
+    f->node_l_stock_hash_valid = nv;
+
+    f->nodes_cap = ncap;
+    return 1;
+}
+
 /* Add a node to the factory. Returns node index or -1 on error.
    node_cltv: if > 0, build CLTV timeout taptree for this node's spending_spk. */
 static int add_node(
@@ -161,6 +195,11 @@ static int add_node(
     uint32_t node_cltv
 ) {
     if (f->n_nodes >= f->config.max_nodes) return -1;
+    /* Grow the three parallel node-indexed arrays on demand.  MUST happen before
+       any factory_node_t* is taken below, because realloc may move the block;
+       build_subtree and the other callers index through f->nodes[i] rather than
+       caching a pointer across add_node calls, which is what makes this safe. */
+    if (!factory_grow_nodes(f, f->n_nodes + 1)) return -1;
 
     int idx = (int)f->n_nodes++;
     factory_node_t *node = &f->nodes[idx];
@@ -409,6 +448,13 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32) {
     if (!f || node_idx >= f->config.max_nodes || !h32) return;
+    /* The client mirrors per-(leaf,state) hashes off the wire, possibly for
+       nodes it has not built yet, so node_idx can run ahead of what is
+       allocated.  max_nodes is only the growth CAP now -- grow to fit before
+       writing.  The old check was sufficient purely because the arrays were
+       always allocated at max_nodes; ASan flagged this the moment they were
+       not (WRITE of size 32, 0 bytes after a 32-byte region). */
+    if (!factory_grow_nodes(f, node_idx + 1)) return;
     memcpy(f->node_l_stock_hashes[node_idx], h32, 32);
     f->node_l_stock_hash_valid[node_idx] = 1;
     f->has_node_l_stock_hashes = 1;
@@ -765,11 +811,13 @@ int factory_alloc_default_arrays(factory_t *f) {
     if (!f->leaf_node_indices)
         f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
     if (!f->nodes)
-        f->nodes = calloc(f->config.max_nodes, sizeof(factory_node_t));
+        f->nodes = calloc(FACTORY_NODES_INITIAL, sizeof(factory_node_t));
     if (!f->node_l_stock_hashes)
-        f->node_l_stock_hashes = calloc(f->config.max_nodes, 32);
+        f->node_l_stock_hashes = calloc(FACTORY_NODES_INITIAL, 32);
     if (!f->node_l_stock_hash_valid)
-        f->node_l_stock_hash_valid = calloc(f->config.max_nodes, sizeof(int));
+        f->node_l_stock_hash_valid = calloc(FACTORY_NODES_INITIAL, sizeof(int));
+    if (f->nodes && f->node_l_stock_hashes && f->node_l_stock_hash_valid)
+        f->nodes_cap = FACTORY_NODES_INITIAL;
     return f->keypairs && f->pubkeys && f->profiles && f->dist_partial_sigs &&
            f->leaf_layers && f->leaf_node_indices && f->nodes &&
            f->node_l_stock_hashes && f->node_l_stock_hash_valid;
@@ -836,9 +884,10 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
 
     /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
        config cap; factory_build_tree grows them if the tree needs more nodes. */
-    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
-    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
-    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
+    f->nodes                  = calloc(FACTORY_NODES_INITIAL, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(FACTORY_NODES_INITIAL, 32);
+    f->node_l_stock_hash_valid= calloc(FACTORY_NODES_INITIAL, sizeof(int));
+    f->nodes_cap              = FACTORY_NODES_INITIAL;
     return 1;
 }
 
@@ -894,9 +943,10 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 
     /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
        config cap; factory_build_tree grows them if the tree needs more nodes. */
-    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
-    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
-    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
+    f->nodes                  = calloc(FACTORY_NODES_INITIAL, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(FACTORY_NODES_INITIAL, 32);
+    f->node_l_stock_hash_valid= calloc(FACTORY_NODES_INITIAL, sizeof(int));
+    f->nodes_cap              = FACTORY_NODES_INITIAL;
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
@@ -1437,6 +1487,12 @@ static int setup_ps_leaf_with_subfactories(
             fprintf(stderr, "Factory: add sub-factory node %u failed\n", si);
             return 0;
         }
+        /* REFRESH: add_node above may have grown nodes[] via realloc, which can
+           move the whole block.  `leaf` was taken before the loop, so without
+           this every write through it after the first growth lands in freed
+           memory.  This is the one place in factory.c that caches a node
+           pointer across an add_node call -- the rest index f->nodes[i]. */
+        leaf = &f->nodes[leaf_node_idx];
         leaf->subfactory_node_indices[si] = sub_idx;
 
         /* Wire leaf's vout[si] → sub-factory's spending_spk. */
@@ -1914,24 +1970,19 @@ int factory_build_tree(factory_t *f) {
     int n_dw_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
     int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
-    /* Grow the dynamic node arrays if this tree needs more than the current cap
-       (a 255-client PS factory needs ~1018 nodes vs the 512 default). */
-    if (total_nodes_ub > (int)f->config.max_nodes) {
-        size_t nn = (size_t)total_nodes_ub, old = f->config.max_nodes;
-        factory_node_t *gn = realloc(f->nodes, nn * sizeof(factory_node_t));
-        if (!gn) return 0;
-        f->nodes = gn;
-        unsigned char (*gh)[32] = realloc(f->node_l_stock_hashes, nn * 32);
-        if (!gh) return 0;
-        f->node_l_stock_hashes = gh;
-        int *gv = realloc(f->node_l_stock_hash_valid, nn * sizeof(int));
-        if (!gv) return 0;
-        f->node_l_stock_hash_valid = gv;
-        memset(f->nodes + old, 0, (nn - old) * sizeof(factory_node_t));
-        memset(f->node_l_stock_hashes + old, 0, (nn - old) * 32);
-        memset(f->node_l_stock_hash_valid + old, 0, (nn - old) * sizeof(int));
-        f->config.max_nodes = (uint32_t)nn;
-    }
+    /* Raise the CAP if this tree could need more than the current one (a
+       255-client PS factory needs ~1018 nodes vs the 512 default).  Nothing is
+       allocated here any more: add_node grows on demand up to the cap, so a
+       tree that ends up far below this upper bound never pays for it.
+       total_nodes_ub is exactly that -- an upper bound, 2*(2*n_leaves-1) -- and
+       the measured trees come in well under it.
+       This used to realloc to total_nodes_ub and zero from old =
+       config.max_nodes.  Once the arrays stopped being allocated at max_nodes,
+       that left [nodes_cap, max_nodes) uninitialised in the middle of the
+       array, because realloc does not zero.  Raising the cap and letting
+       factory_grow_nodes do the allocating keeps one zeroing path. */
+    if (total_nodes_ub > (int)f->config.max_nodes)
+        f->config.max_nodes = (uint32_t)total_nodes_ub;
     if (n_leaves > (int)f->config.max_leaves) return 0;
     if (n_dw_layers > DW_MAX_LAYERS) return 0;
 
@@ -1971,7 +2022,9 @@ int factory_build_tree(factory_t *f) {
         g_sort_factory = NULL;
     }
 
-    /* Build the tree recursively */
+    /* Build the tree recursively.  Reset the COUNT only -- nodes_cap tracks what
+       is still allocated, so a rebuild reuses the existing block instead of
+       shrinking to FACTORY_NODES_INITIAL and re-growing back up. */
     f->n_nodes = 0;
     int leaf_counter = 0;
     if (!build_subtree(f, clients, n_clients,
@@ -5036,6 +5089,7 @@ void factory_free(factory_t *f) {
     tx_buf_free(&f->dist_signed_tx);   /* #54 G1 */
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
+    f->nodes_cap = 0;
     /* Factory-level distribution signing session's dynamic pubnonces. */
     musig_session_free(&f->dist_signing_session);
     /* Free the dynamic node arrays (were inline).  NULL after free so a second
@@ -5065,8 +5119,17 @@ void factory_detach_txbufs(factory_t *f) {
        (no double-free) and (b) the txbuf-zeroing below touches only this copy,
        not the original.  This reproduces the pre-dynamic inline-array copy
        semantics (per-node txbuf POINTERS stay shared, then get zeroed below). */
-    if (f->nodes && f->config.max_nodes > 0) {
-        size_t mn = f->config.max_nodes;
+    /* Copy exactly what is ALLOCATED (nodes_cap), not config.max_nodes.
+       max_nodes is the growth CAP, not the current extent: since nodes[] grows
+       on demand it is usually far smaller, and copying max_nodes reads off the
+       end.  ASan caught this the moment growth was forced on every add_node:
+         READ of size 3813376 (= 512 * sizeof(factory_node_t)) in
+         factory_detach_txbufs -> heap-buffer-overflow
+       Before grow-on-demand the array really was max_nodes entries, so this
+       was merely wasteful rather than wrong -- which is why it survived until
+       the allocation strategy changed underneath it. */
+    if (f->nodes && f->nodes_cap > 0) {
+        size_t mn = f->nodes_cap;
         factory_node_t *n2 = malloc(mn * sizeof(factory_node_t));
         if (n2) { memcpy(n2, f->nodes, mn * sizeof(factory_node_t)); f->nodes = n2; }
         unsigned char (*h2)[32] = malloc(mn * 32);

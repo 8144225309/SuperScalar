@@ -12,6 +12,10 @@
 #include <secp256k1_extrakeys.h>
 
 #define FACTORY_MAX_NODES   512
+/* Initial nodes[] capacity; factory_grow_nodes() doubles from here up to
+   config.max_nodes.  Small on purpose: the point of growing on demand is that a
+   factory costs what its own tree costs, not what the worst-case config would. */
+#define FACTORY_NODES_INITIAL 32
 /* FACTORY_MAX_OUTPUTS: max outputs per tree node. Sized for arity-15 leaves
  * (15 client channels + 1 L-stock = 16 outputs) under the upcoming N-way
  * mixed-arity work (Phase 2 of mixed-arity implementation plan). Internal
@@ -369,6 +373,17 @@ typedef struct {
                                 (a 255-client PS factory needs ~1018 nodes) without
                                 bloating every factory_t. */
     size_t n_nodes;
+    /* Entries currently ALLOCATED in nodes[] / node_l_stock_hashes[] /
+       node_l_stock_hash_valid[] -- the three are parallel and grow together.
+       add_node() grows them geometrically and config.max_nodes is the hard cap.
+       Previously all three were allocated at config.max_nodes up front, which
+       factory_config_fit sets to 4N+64.  That is NOT an over-estimate in
+       general -- PS-uniform and ARITY_1 really do build 3.98 nodes per
+       participant, so the constant cannot simply be lowered -- but the common
+       PS + level-arity configuration plateaus around 150 nodes, so at N=1024 it
+       reserved ~31 MB of factory_node_t per client to use ~1 MB.  Growing on
+       demand sizes each factory to the tree its own config actually builds. */
+    size_t nodes_cap;
 
     /* Funding UTXO */
     unsigned char funding_txid[32];  /* internal byte order */
@@ -764,6 +779,12 @@ void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
                          const unsigned char *spk, size_t spk_len);
+
+/* Grow nodes[] and its two parallel node-indexed arrays to hold `want` entries.
+   1 on success, 0 on OOM or when `want` exceeds config.max_nodes.
+   INVALIDATES any factory_node_t* the caller is holding -- index via
+   f->nodes[i] across calls that may add nodes. */
+int factory_grow_nodes(factory_t *f, size_t want);
 
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
