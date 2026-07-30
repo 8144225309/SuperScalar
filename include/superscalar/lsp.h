@@ -106,7 +106,29 @@ typedef struct {
      * follow in Phase 1b.2.  See docs/watchtower-trustless-schema.md
      * for the trust model. */
     persist_wt_t *wt_db;
+
+    /* Ceremony scratch, sized to expected_clients+1 by lsp_ensure_scratch() and
+       released in lsp_cleanup().
+       These were fixed [FACTORY_MAX_SIGNERS] STACK arrays, which is what capped
+       the daemon at 255 clients: at n_participants = 257 they overflow, and
+       lifting the --clients guard without converting them produced
+       `*** stack smashing detected ***`, not a clean refusal (ASan named
+       src/lsp.c:238 'seen' as the first to go).
+       They live on the struct rather than as heap locals because the functions
+       using them have several early returns; a local would need a free() on
+       every one, which is where leaks and double-frees get introduced. One
+       allocation, one free, no per-return bookkeeping.
+       Capacity is +1 because 'seen' is indexed by SLOT (1..n_clients), not by
+       client index, and pubkeys carries the LSP at [0]. */
+    int              *scratch_slot_hints;  /* [scratch_cap] by client index */
+    int              *scratch_seen;        /* [scratch_cap] by slot number */
+    secp256k1_pubkey *scratch_pubkeys;     /* [scratch_cap]: LSP then clients */
+    size_t            scratch_cap;
 } lsp_t;
+
+/* Ensure the ceremony scratch holds `want` entries. 1 on success, 0 on OOM.
+   Idempotent and safe on a zeroed lsp_t; grows, never shrinks. */
+int lsp_ensure_scratch(lsp_t *lsp, size_t want);
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */
 int lsp_init(lsp_t *lsp, secp256k1_context *ctx,

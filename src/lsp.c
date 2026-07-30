@@ -103,6 +103,30 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
     return 1;
 }
 
+/* Grow the ceremony scratch to `want` entries (see lsp.h for why it lives on
+   the struct).  Grows only; a later ceremony with fewer clients reuses the
+   larger block rather than reallocating down. */
+int lsp_ensure_scratch(lsp_t *lsp, size_t want) {
+    if (!lsp) return 0;
+    if (want <= lsp->scratch_cap) return 1;
+
+    int *sh = (int *)realloc(lsp->scratch_slot_hints, want * sizeof(int));
+    if (!sh) return 0;
+    lsp->scratch_slot_hints = sh;
+
+    int *sn = (int *)realloc(lsp->scratch_seen, want * sizeof(int));
+    if (!sn) return 0;
+    lsp->scratch_seen = sn;
+
+    secp256k1_pubkey *pk = (secp256k1_pubkey *)
+        realloc(lsp->scratch_pubkeys, want * sizeof(secp256k1_pubkey));
+    if (!pk) return 0;
+    lsp->scratch_pubkeys = pk;
+
+    lsp->scratch_cap = want;
+    return 1;
+}
+
 int lsp_accept_clients(lsp_t *lsp) {
     if ((int)lsp->expected_clients > lsp->max_connections) {
         fprintf(stderr, "ERROR: --clients %d exceeds --max-connections %d\n",
@@ -119,8 +143,15 @@ int lsp_accept_clients(lsp_t *lsp) {
     }
 
     lsp->n_clients = 0;
-    int hello_slot_hints[FACTORY_MAX_SIGNERS];
-    for (size_t k = 0; k < FACTORY_MAX_SIGNERS; k++) hello_slot_hints[k] = 0;
+    /* +1: 'seen' below is indexed by SLOT (1..n_clients), and the pubkey array
+       carries the LSP at [0].  Sized to the participant count, not a fixed 256. */
+    if (!lsp_ensure_scratch(lsp, lsp->expected_clients + 1)) {
+        fprintf(stderr, "LSP: out of memory sizing ceremony scratch for %zu clients\n",
+                lsp->expected_clients);
+        return 0;
+    }
+    int *hello_slot_hints = lsp->scratch_slot_hints;
+    for (size_t k = 0; k < lsp->scratch_cap; k++) hello_slot_hints[k] = 0;
 
     for (size_t i = 0; i < lsp->expected_clients; i++) {
         /* Timeout: wait for incoming connection with select() */
@@ -232,7 +263,8 @@ int lsp_accept_clients(lsp_t *lsp) {
        stranded on every restart. */
     {
         int all_hinted = 1;
-        int seen[FACTORY_MAX_SIGNERS] = {0};
+        int *seen = lsp->scratch_seen;
+        memset(seen, 0, lsp->scratch_cap * sizeof(int));
         for (size_t i = 0; i < lsp->n_clients; i++) {
             int s = hello_slot_hints[i];
             if (s < 1 || (size_t)s > lsp->n_clients || seen[s]) { all_hinted = 0; break; }
@@ -272,7 +304,7 @@ int lsp_accept_clients(lsp_t *lsp) {
 
     /* Build all_pubkeys array: [LSP, client0, client1, ...] */
     size_t n_total = 1 + lsp->n_clients;
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    secp256k1_pubkey *all_pubkeys = lsp->scratch_pubkeys;
     all_pubkeys[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < lsp->n_clients; i++)
         all_pubkeys[i + 1] = lsp->client_pubkeys[i];
@@ -1358,6 +1390,15 @@ void lsp_cleanup(lsp_t *lsp) {
     free(lsp->client_pubkeys);
     lsp->client_fds = NULL;
     lsp->client_pubkeys = NULL;
+    /* Ceremony scratch: the single free point for what used to be three fixed
+       stack arrays.  Safe on a zeroed lsp_t and safe to call twice. */
+    free(lsp->scratch_slot_hints);
+    free(lsp->scratch_seen);
+    free(lsp->scratch_pubkeys);
+    lsp->scratch_slot_hints = NULL;
+    lsp->scratch_seen = NULL;
+    lsp->scratch_pubkeys = NULL;
+    lsp->scratch_cap = 0;
     if (lsp->bridge_fd >= 0) {
         wire_close(lsp->bridge_fd);
         lsp->bridge_fd = -1;
