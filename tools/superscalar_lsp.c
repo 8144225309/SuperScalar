@@ -3343,11 +3343,23 @@ int main(int argc, char *argv[]) {
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                /* Heap, sized to the participant count: this block sits inside
+                   main()'s already-huge frame and the array is dead right after
+                   the aggregate, so it is freed immediately -- before any of the
+                   later returns in this scope, which is why no cleanup label is
+                   needed. */
+                secp256k1_pubkey *all_pks = (secp256k1_pubkey *)calloc(
+                    lsp_rp->factory.n_participants, sizeof(secp256k1_pubkey));
+                if (!all_pks) {
+                    fprintf(stderr, "LSP recovery: out of memory for %zu participant keys\n",
+                            lsp_rp->factory.n_participants);
+                    return 1;
+                }
                 for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
                     all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
                                        lsp_rp->factory.n_participants);
+                free(all_pks);   /* dead from here; no later path uses it */
                 unsigned char is2[32];
                 if (!secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey)) {
                     fprintf(stderr, "LSP recovery: xonly serialize failed\n");
@@ -3846,7 +3858,21 @@ accept_new_factory:
 
     /* === Phase 2: Compute funding address === */
     size_t n_total = 1 + lsp_p->n_clients;
-    secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+    /* Reuse the LSP's ceremony scratch rather than a fixed stack array: this is
+       the site ASan named once lsp_accept_clients was converted
+         WRITE of size 64 (= secp256k1_pubkey) at superscalar_lsp.c:3852
+         stack-buffer-overflow, frame main() with 524 objects
+       main()'s frame is already ~287 KB, so a [FACTORY_MAX_SIGNERS] array here
+       is the worst possible place for one.  scratch_pubkeys is sized to
+       expected_clients+1 by lsp_accept_clients (which has already run) and is
+       freed in lsp_cleanup, so there is nothing to free on main's many exits. */
+    if (!lsp_ensure_scratch(lsp_p, n_total)) {
+        fprintf(stderr, "LSP: out of memory sizing keyagg scratch for %zu participants\n",
+                n_total);
+        lsp_cleanup(lsp_p);
+        return 1;
+    }
+    secp256k1_pubkey *all_pks = lsp_p->scratch_pubkeys;
     all_pks[0] = lsp_p->lsp_pubkey;
     for (size_t i = 0; i < lsp_p->n_clients; i++)
         all_pks[i + 1] = lsp_p->client_pubkeys[i];
@@ -4828,7 +4854,19 @@ accept_new_factory:
     }
     printf("LSP: starting cooperative close...\n");
 
-    tx_output_t close_outputs[FACTORY_MAX_SIGNERS];
+    /* Heap: the close builds one output per participant, so a fixed
+       [FACTORY_MAX_SIGNERS] array here caps the cooperative close at 255 parties
+       independently of everything else.  Sized to n_clients+1 (every client plus
+       the LSP).  Lives until process exit -- this is main()'s terminal path and
+       the buffer is in use right through the close ceremony, so freeing it early
+       would be wrong and freeing it late buys nothing. */
+    tx_output_t *close_outputs = (tx_output_t *)calloc(lsp_p->n_clients + 1,
+                                                         sizeof(tx_output_t));
+    if (!close_outputs) {
+        fprintf(stderr, "LSP: out of memory for %zu close outputs\n",
+                lsp_p->n_clients + 1);
+        return 1;
+    }
     size_t n_close_outputs;
 
     /* Get wallet-controlled address for close outputs (UTXO recycling) */
