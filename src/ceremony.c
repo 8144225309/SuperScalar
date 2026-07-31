@@ -3,15 +3,48 @@
 #include <stdlib.h>
 #include <poll.h>
 
-void ceremony_init(ceremony_t *c, size_t n_clients,
-                   int per_client_timeout_sec, int min_clients) {
+int ceremony_init(ceremony_t *c, size_t n_clients,
+                  int per_client_timeout_sec, int min_clients) {
+    if (!c) return 0;
+    /* Must not read *c first: callers pass uninitialized stack ceremony_t. */
     memset(c, 0, sizeof(*c));
     c->state = CEREMONY_INIT;
-    c->n_clients = n_clients;
     c->per_client_timeout_sec = per_client_timeout_sec;
     c->min_clients = min_clients > 0 ? min_clients : 2;
-    for (size_t i = 0; i < n_clients && i < FACTORY_MAX_SIGNERS; i++)
+
+    if (n_clients <= CEREMONY_SMALL) {
+        c->clients = c->clients_small;
+        c->clients_cap = CEREMONY_SMALL;
+    } else {
+        c->clients = (client_ceremony_state_t *)
+            calloc(n_clients, sizeof(client_ceremony_state_t));
+        if (!c->clients) {
+            /* Valid-but-empty: accessors bound by n_clients become safe no-ops
+               and has_quorum reports false -- fail closed. */
+            c->clients = c->clients_small;
+            c->clients_cap = CEREMONY_SMALL;
+            c->n_clients = 0;
+            return 0;
+        }
+        c->clients_cap = n_clients;
+    }
+
+    /* No `&& i < FACTORY_MAX_SIGNERS` clamp any more.  The old clamp bounded
+       only this write while n_clients stayed untruncated, so the array was
+       under-filled AND every later read ran off the end. */
+    c->n_clients = n_clients;
+    for (size_t i = 0; i < n_clients; i++)
         c->clients[i] = CLIENT_WAITING;
+    return 1;
+}
+
+void ceremony_free(ceremony_t *c) {
+    if (!c) return;
+    if (c->clients && c->clients != c->clients_small)
+        free(c->clients);
+    c->clients = NULL;
+    c->clients_cap = 0;
+    c->n_clients = 0;
 }
 
 /* poll(), not select().

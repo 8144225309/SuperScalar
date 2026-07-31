@@ -1969,20 +1969,39 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     uint32_t my_index = (uint32_t)pi_item->valuedouble;
     size_t n_participants = (size_t)cJSON_GetArraySize(all_pk_arr);
-    if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
-        fprintf(stderr, "Client: bad participant count %zu\n", n_participants);
+    /* Validate against the ABSOLUTE ceiling, not a buffer size.  This is the
+       check that refused every factory above 256 participants: the LSP would
+       build a 300-client factory, every client rejected the HELLO_ACK with
+       "bad participant count" and hung up, and the LSP then reported
+       "send FACTORY_PROPOSE to client 0 failed" -- which reads like a wire bug
+       and is not.  n_participants is PEER-SUPPLIED, so it is bounded by
+       SS_MAX_PARTICIPANTS and then used to size a HEAP (never stack)
+       allocation -- a wire-sized VLA here would be a remote stack-clash. */
+    if (n_participants < 2 || n_participants > SS_MAX_PARTICIPANTS) {
+        fprintf(stderr, "Client: bad participant count %zu (max %d)\n",
+                n_participants, SS_MAX_PARTICIPANTS);
         cJSON_Delete(msg.json);
         wire_close(fd);
         return 0;
     }
 
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    secp256k1_pubkey *all_pubkeys =
+        (secp256k1_pubkey *)calloc(n_participants, sizeof(secp256k1_pubkey));
+    if (!all_pubkeys) {
+        fprintf(stderr, "Client: out of memory for %zu participant keys\n",
+                n_participants);
+        cJSON_Delete(msg.json);
+        wire_close(fd);
+        free(all_pubkeys);
+        return 0;
+    }
     for (size_t i = 0; i < n_participants; i++) {
         cJSON *pk_hex = cJSON_GetArrayItem(all_pk_arr, (int)i);
         if (!pk_hex || !cJSON_IsString(pk_hex)) {
             fprintf(stderr, "Client: bad pubkey entry %zu\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
         unsigned char pk_buf[33];
@@ -1991,6 +2010,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client: invalid pubkey %zu\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     }
@@ -2003,6 +2023,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: participant_index %u out of range (%zu)\n",
                 my_index, n_participants);
         wire_close(fd);
+        free(all_pubkeys);
         return 0;
     }
     {
@@ -2017,6 +2038,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client: REFUSING — pubkey at index %u does not "
                     "match our key (identity mismatch)\n", my_index);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     }
@@ -2027,6 +2049,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: expected FACTORY_PROPOSE\n");
         if (msg.json) cJSON_Delete(msg.json);
         wire_close(fd);
+        free(all_pubkeys);
         return 0;
     }
 
@@ -2044,6 +2067,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client: malformed FACTORY_PROPOSE\n");
             cJSON_Delete(msg.json);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     }
@@ -2060,6 +2084,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (!fv_item || !fa_item || !sb_item || !spl_item || !ct_item || !fpt_item) {
         fprintf(stderr, "Client: FACTORY_PROPOSE missing required fields\n");
         cJSON_Delete(msg.json);
+        free(all_pubkeys);
         return 0;
     }
     uint32_t funding_vout = (uint32_t)fv_item->valuedouble;
@@ -2199,6 +2224,7 @@ int client_run_with_channels(secp256k1_context *ctx,
                     (unsigned long long)funding_amount);
             client_send_error(fd, "funding_tx_verification_failed");
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     } else {
@@ -2223,6 +2249,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
+    free(all_pubkeys);   /* copied into the factory above */
     factory->cltv_timeout = cltv_timeout;
     factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory->fee_per_tx = fee_per_tx;

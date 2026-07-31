@@ -406,6 +406,87 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
     return ok;
 }
 
+/* Broadcast one message to many peers, serializing the JSON ONCE.
+ *
+ * wire_send() calls cJSON_PrintUnformatted() per call.  Broadcasting a large
+ * ceremony message in a loop therefore re-serializes the whole tree once per
+ * client -- at N=301 that is a 5.6 MB LSP_RESPONSE printed 300 times, ~1.6 GB
+ * of pure serialization the LSP does not need to do.  It was slow enough that
+ * clients waiting on the 120s receive timeout hung up mid-broadcast, the first
+ * EPIPE aborted the attempt, and the whole ceremony failed -- looking like a
+ * wire bug rather than an O(N^2) cost.
+ *
+ * The plaintext is identical for every peer; only the AEAD layer differs
+ * (per-connection key and nonce), so encryption still happens per fd.
+ *
+ * Returns 1 if every peer was written.  On the first failure returns 0 and, if
+ * first_fail is non-NULL, stores that peer's index -- callers report which
+ * client dropped.  Negative fds are skipped, not treated as failures. */
+int wire_send_many(const int *fds, size_t n_fds, uint8_t msg_type, cJSON *json,
+                   size_t *first_fail) {
+    if (!fds || !json) return 0;
+
+    char *payload = cJSON_PrintUnformatted(json);   /* ONCE, not per peer */
+    if (!payload) return 0;
+    uint32_t payload_len = (uint32_t)strlen(payload);
+    uint32_t pt_len = 1 + payload_len;
+
+    unsigned char *plaintext = (unsigned char *)malloc(pt_len);
+    if (!plaintext) { free(payload); return 0; }
+    plaintext[0] = msg_type;
+    memcpy(plaintext + 1, payload, payload_len);
+    free(payload);
+
+    unsigned char *ciphertext = (unsigned char *)malloc(pt_len);
+    if (!ciphertext) { free(plaintext); return 0; }
+
+    int all_ok = 1;
+    for (size_t i = 0; i < n_fds; i++) {
+        int fd = fds[i];
+        if (fd < 0) continue;
+
+        noise_state_t *ns = wire_get_encryption(fd);
+        if (!ns) {
+            /* Unencrypted peer: fall back to the per-peer path so the refusal
+               and framing rules stay in one place. */
+            if (!wire_send(fd, msg_type, json)) {
+                if (first_fail) *first_fail = i;
+                all_ok = 0; break;
+            }
+            continue;
+        }
+
+        unsigned char tag[16], nonce[12];
+        make_nonce(nonce, ns->send_nonce);
+        if (!aead_encrypt(ciphertext, tag, plaintext, pt_len, NULL, 0,
+                          ns->send_key, nonce)) {
+            if (first_fail) *first_fail = i;
+            all_ok = 0; break;
+        }
+
+        uint32_t frame_len = pt_len + 16;
+        unsigned char header[4];
+        header[0] = (unsigned char)(frame_len >> 24);
+        header[1] = (unsigned char)(frame_len >> 16);
+        header[2] = (unsigned char)(frame_len >> 8);
+        header[3] = (unsigned char)(frame_len);
+
+        if (!(write_all(fd, header, 4) &&
+              write_all(fd, ciphertext, pt_len) &&
+              write_all(fd, tag, 16))) {
+            if (first_fail) *first_fail = i;
+            all_ok = 0; break;
+        }
+        ns->send_nonce++;   /* only after a fully successful transmission */
+        if (g_wire_log_cb)
+            g_wire_log_cb(0, msg_type, json, wire_get_peer_label(fd), g_wire_log_ud);
+    }
+
+    free(plaintext);
+    free(ciphertext);
+    return all_ok;
+}
+
 int wire_recv(int fd, wire_msg_t *msg) {
     msg->json = NULL;
     unsigned char header[4];

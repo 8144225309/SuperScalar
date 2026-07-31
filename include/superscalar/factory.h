@@ -34,6 +34,22 @@
  * deployment is RAM-bound, and shrinking factory_t (dynamic leaf_layers) is a
  * worthwhile follow-up. */
 #define FACTORY_MAX_SIGNERS 256
+
+/* Absolute ceiling on participants in ONE factory, for validating counts that
+   arrive over the wire.
+ *
+ * FACTORY_MAX_SIGNERS is a DEFAULT (what factory_config_fit starts from and
+ * grows past); this is a HARD sanity bound.  The distinction matters because a
+ * client sizes buffers from the participant count in the LSP's HELLO_ACK, which
+ * is peer-supplied: without a ceiling a malicious LSP could name a huge count
+ * and make the client allocate arbitrarily.  Validate wire-supplied counts
+ * against THIS, never against a buffer size, and never let a wire value size a
+ * stack allocation.
+ *
+ * 4096 is far above any realistic factory (the DW tree and the close TX both
+ * become impractical long before it) while keeping the worst-case client
+ * allocation bounded and small. */
+#define SS_MAX_PARTICIPANTS 4096
 /* FACTORY_MAX_LEAVES: one channel (leaf) per client, so this bounds the client
  * count.  Raised 128 -> 256 to support up to 255-client factories.  Cost:
  * leaf_layers[FACTORY_MAX_LEAVES] is embedded in factory_t, so this enlarges
