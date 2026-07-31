@@ -1888,7 +1888,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Collect channel indices that live on this leaf node. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[mgr->n_channels ? mgr->n_channels : 1];
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;
@@ -2722,7 +2722,7 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                        "(%zu bytes, L-stock %llu sats)\n", affected[k], poison_len,
                        (unsigned long long)poison_old_l_amount[k]);
             }
-            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            uint32_t leaf_ch_ids[mgr->n_channels ? mgr->n_channels : 1];
             size_t n_leaf_ch = 0;
             for (size_t cc = 0; cc < mgr->n_channels; cc++) {
                 size_t c_node; uint32_t c_vout;
@@ -2989,9 +2989,9 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     /* Get all client participant indices on this leaf (may be 1..N-1). */
-    uint32_t clients[FACTORY_MAX_SIGNERS];
+    uint32_t clients[node->n_signers ? node->n_signers : 1];
     size_t n_clients = factory_get_subtree_clients(f, (int)node_idx, clients,
-                                                     FACTORY_MAX_SIGNERS);
+                                                     node->n_signers ? node->n_signers : 1);
     if (n_clients != node->n_signers - 1) {
         fprintf(stderr, "LSP realloc: leaf %zu has %zu signers but %zu clients found\n",
                 node_idx, node->n_signers, n_clients);
@@ -3147,8 +3147,8 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     cJSON_Delete(propose);
 
     /* Step 6: Recv REALLOC_NONCE from each client, set their nonces (state + poison). */
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
+    unsigned char all_pubnonces[node->n_signers ? node->n_signers : 1][66];
+    unsigned char all_poison_pubnonces[node->n_signers ? node->n_signers : 1][66];
     memcpy(all_pubnonces[lsp_slot], lsp_pubnonce_ser, 66);
     if (realloc_poison_prepared)
         memcpy(all_poison_pubnonces[lsp_slot], lsp_poison_pn_ser, 66);
@@ -3362,7 +3362,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        (#258), reproduced end-to-end by tools/test_regtest_cheat_realloc.sh. */
     if (mgr->watchtower && realloc_had_signed && node->is_signed &&
         node->signed_tx.len > 0) {
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[mgr->n_channels ? mgr->n_channels : 1];
         size_t n_leaf_ch = 0;
         for (size_t cc = 0; cc < mgr->n_channels; cc++) {
             size_t c_node;
@@ -3725,7 +3725,7 @@ static int lsp_subfactory_chain_advance_stateless_multi(
     unsigned char *all_pn_per_input = calloc(sub->n_signers * n_inputs, 66);
     if (!all_pn_per_input) { factory_session_reset_poison(f, sub_node_i); return 0; }
     /* Poison side-channel is single-input: one poison nonce per signer. */
-    unsigned char all_poison_pn[FACTORY_MAX_SIGNERS][66];
+    unsigned char all_poison_pn[sub->n_signers ? sub->n_signers : 1][66];
     memset(all_poison_pn, 0, sizeof(all_poison_pn));
 
     /* Step 4: collect each client's n_inputs pubnonces (+ 1 poison nonce). */
@@ -4312,7 +4312,7 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
 
     /* Sub-factory clients (one client per output != L-stock + LSP).
        Build sub_clients[] -- same shape as legacy. */
-    uint32_t sub_clients[FACTORY_MAX_SIGNERS];
+    uint32_t sub_clients[sub->n_signers ? sub->n_signers : 1];
     size_t n_clients_in_sub = 0;
     for (size_t s = 1; s < sub->n_signers; s++) {
         sub_clients[n_clients_in_sub++] = sub->signer_indices[s];
@@ -4480,8 +4480,8 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
     lsp_crash_checkpoint("subfactory_propose");
 
     /* Step 4: collect CLIENT_PUBNONCES from each client (state + poison). */
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
+    unsigned char all_pubnonces[sub->n_signers ? sub->n_signers : 1][66];
+    unsigned char all_poison_pubnonces[sub->n_signers ? sub->n_signers : 1][66];
     memset(all_poison_pubnonces, 0, sizeof(all_poison_pubnonces));
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
         size_t fd_idx = (size_t)(sub_clients[ci] - 1);
@@ -7704,9 +7704,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 &lf->factory, (uint32_t)bh);
                             int urgency = readiness_compute_urgency(
                                 blocks_left, lf->factory.dying_blocks);
-                            uint32_t missing[FACTORY_MAX_SIGNERS];
+                            uint32_t missing[rt->n_clients ? rt->n_clients : 1];
                             size_t n_missing = readiness_get_missing(
-                                rt, missing, FACTORY_MAX_SIGNERS);
+                                rt, missing, rt->n_clients ? rt->n_clients : 1);
                             persist_t *db = (persist_t *)mgr->persist;
                             notify_t *nfy = (notify_t *)mgr->notify;
                             for (size_t mi = 0; mi < n_missing; mi++) {
@@ -8225,7 +8225,7 @@ int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
            what watchtower wants for old_txid32. */
 
         /* Collect channel ids on this leaf. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[mgr->n_channels ? mgr->n_channels : 1];
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;
