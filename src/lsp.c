@@ -123,6 +123,11 @@ int lsp_ensure_scratch(lsp_t *lsp, size_t want) {
     if (!pk) return 0;
     lsp->scratch_pubkeys = pk;
 
+    participant_profile_t *pr = (participant_profile_t *)
+        realloc(lsp->scratch_profiles, want * sizeof(participant_profile_t));
+    if (!pr) return 0;
+    lsp->scratch_profiles = pr;
+
     lsp->scratch_cap = want;
     return 1;
 }
@@ -415,7 +420,16 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
 
     /* ---- Setup: identical to legacy lsp_run_factory_creation ---- */
     size_t n_total = 1 + lsp->n_clients;
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    /* ASan named this frame once the main() arrays were converted:
+         WRITE of size 64  src/lsp.c:421  in lsp_run_factory_creation_stateless
+       Scratch is sized by lsp_accept_clients; re-assert for callers that reach
+       creation by another route. */
+    if (!lsp_ensure_scratch(lsp, n_total)) {
+        fprintf(stderr, "LSP: out of memory sizing creation scratch for %zu participants\n",
+                n_total);
+        return 0;
+    }
+    secp256k1_pubkey *all_pubkeys = lsp->scratch_pubkeys;
     all_pubkeys[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < lsp->n_clients; i++)
         all_pubkeys[i + 1] = lsp->client_pubkeys[i];
@@ -431,8 +445,11 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     uint64_t saved_fee_per_tx = f->fee_per_tx;
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
-    participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
-    memcpy(saved_profiles, f->profiles, sizeof(saved_profiles));
+    /* Explicit count: sizeof(saved_profiles) was the whole fixed array; as a
+       pointer that silently becomes sizeof(void*).  Copy exactly the
+       participants that exist, which is also all f->profiles is sized for. */
+    participant_profile_t *saved_profiles = lsp->scratch_profiles;
+    memcpy(saved_profiles, f->profiles, n_total * sizeof(participant_profile_t));
     int saved_has_shachain = f->has_shachain;
     int saved_use_flat = f->use_flat_secrets;
     size_t saved_n_secrets = f->n_revocation_secrets;
@@ -461,7 +478,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
-    memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
+    memcpy(f->profiles, saved_profiles, n_total * sizeof(participant_profile_t));
     if (saved_has_shachain) {
         if (saved_use_flat && saved_secrets)
             factory_set_flat_secrets(f, saved_secrets, saved_n_secrets);
@@ -1395,6 +1412,8 @@ void lsp_cleanup(lsp_t *lsp) {
     free(lsp->scratch_slot_hints);
     free(lsp->scratch_seen);
     free(lsp->scratch_pubkeys);
+    free(lsp->scratch_profiles);
+    lsp->scratch_profiles = NULL;
     lsp->scratch_slot_hints = NULL;
     lsp->scratch_seen = NULL;
     lsp->scratch_pubkeys = NULL;

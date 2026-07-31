@@ -123,6 +123,11 @@ typedef struct {
     int              *scratch_slot_hints;  /* [scratch_cap] by client index */
     int              *scratch_seen;        /* [scratch_cap] by slot number */
     secp256k1_pubkey *scratch_pubkeys;     /* [scratch_cap]: LSP then clients */
+    /* Save/restore buffer for factory.profiles across the stateless-creation
+       re-init.  Was participant_profile_t[FACTORY_MAX_SIGNERS] on the stack and
+       copied with sizeof(the array) -- as a pointer that would silently become
+       sizeof(void*), so the two memcpys now carry explicit element counts. */
+    participant_profile_t *scratch_profiles; /* [scratch_cap] */
     size_t            scratch_cap;
 } lsp_t;
 
