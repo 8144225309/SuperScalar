@@ -1089,7 +1089,25 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     clients_notified = 1;
 
     /* Collect CLOSE_NONCE from all clients */
-    unsigned char all_pubnonces[lsp->n_clients + 1][66];
+    /* Heap, not VLA.  This ceremony uses `goto close_fail` and C forbids a jump
+       into the scope of a variably-modified type ("jump into scope of identifier
+       with variably modified type"), so the VLA idiom used elsewhere in the LSP
+       is unavailable here.  Allocated once above the first goto and released at
+       the single cleanup label -- which is also why the inner wait_fds/ready are
+       hoisted out of their loops rather than allocated per iteration. */
+    unsigned char (*all_pubnonces)[66] =
+        calloc(lsp->n_clients + 1, 66);
+    int *close_wait_fds = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
+    int *close_ready    = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
+    secp256k1_musig_partial_sig *all_psigs =
+        calloc(lsp->n_clients + 1, sizeof(secp256k1_musig_partial_sig));
+    if (!all_pubnonces || !close_wait_fds || !close_ready || !all_psigs) {
+        fprintf(stderr, "LSP close: out of memory for %zu-participant ceremony\n",
+                lsp->n_clients + 1);
+        free(all_pubnonces); free(close_wait_fds); free(close_ready); free(all_psigs);
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
     musig_pubnonce_serialize(lsp->ctx, all_pubnonces[0], &lsp_pubnonce);
 
     {
@@ -1098,13 +1116,13 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         size_t close_nonces_received = 0;
 
         while (close_nonces_received < lsp->n_clients) {
-            int wait_fds[lsp->n_clients ? lsp->n_clients : 1];
+            int *wait_fds = close_wait_fds;
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_nonce_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
             }
 
-            int ready[lsp->n_clients ? lsp->n_clients : 1];
+            int *ready = close_ready;
             int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_nonce_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -1205,7 +1223,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         goto close_fail;
     }
 
-    secp256k1_musig_partial_sig all_psigs[lsp->n_clients + 1];
+
     all_psigs[0] = lsp_psig;
 
     /* Collect CLOSE_PSIG from all clients (parallel select) */
@@ -1215,13 +1233,13 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         size_t close_psigs_received = 0;
 
         while (close_psigs_received < lsp->n_clients) {
-            int wait_fds[lsp->n_clients ? lsp->n_clients : 1];
+            int *wait_fds = close_wait_fds;
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_psig_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
             }
 
-            int ready[lsp->n_clients ? lsp->n_clients : 1];
+            int *ready = close_ready;
             int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_psig_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -1334,10 +1352,12 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         cJSON_Delete(done);
     }
 
+    free(all_pubnonces); free(close_wait_fds); free(close_ready); free(all_psigs);
     tx_buf_free(&unsigned_tx);
     return 1;
 
 close_fail:
+    free(all_pubnonces); free(close_wait_fds); free(close_ready); free(all_psigs);
     if (clients_notified)
         lsp_abort_ceremony(lsp, "cooperative close failed");
     tx_buf_free(&unsigned_tx);
