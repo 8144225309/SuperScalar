@@ -1089,7 +1089,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     clients_notified = 1;
 
     /* Collect CLOSE_NONCE from all clients */
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    unsigned char all_pubnonces[lsp->n_clients + 1][66];
     musig_pubnonce_serialize(lsp->ctx, all_pubnonces[0], &lsp_pubnonce);
 
     {
@@ -1098,13 +1098,13 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         size_t close_nonces_received = 0;
 
         while (close_nonces_received < lsp->n_clients) {
-            int wait_fds[LSP_MAX_CLIENTS];
+            int wait_fds[lsp->n_clients ? lsp->n_clients : 1];
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_nonce_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
             }
 
-            int ready[LSP_MAX_CLIENTS];
+            int ready[lsp->n_clients ? lsp->n_clients : 1];
             int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_nonce_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -1205,7 +1205,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         goto close_fail;
     }
 
-    secp256k1_musig_partial_sig all_psigs[FACTORY_MAX_SIGNERS];
+    secp256k1_musig_partial_sig all_psigs[lsp->n_clients + 1];
     all_psigs[0] = lsp_psig;
 
     /* Collect CLOSE_PSIG from all clients (parallel select) */
@@ -1215,13 +1215,13 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         size_t close_psigs_received = 0;
 
         while (close_psigs_received < lsp->n_clients) {
-            int wait_fds[LSP_MAX_CLIENTS];
+            int wait_fds[lsp->n_clients ? lsp->n_clients : 1];
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_psig_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
             }
 
-            int ready[LSP_MAX_CLIENTS];
+            int ready[lsp->n_clients ? lsp->n_clients : 1];
             int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_psig_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
