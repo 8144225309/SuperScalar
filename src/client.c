@@ -1985,6 +1985,22 @@ int client_run_with_channels(secp256k1_context *ctx,
         return 0;
     }
 
+    /* Scale patience with the factory size we just agreed to join.
+       The LSP fans ceremony messages out SERIALLY, so the k-th client waits for
+       the k-1 sends ahead of it; with a flat 120s timeout the tail of a large
+       factory always times out first, drops, and its EPIPE aborts the whole
+       ceremony for everyone. Observed exactly that at N=300: the broadcast died
+       at client 113, then 227 once serialization was fixed -- the index moved
+       with throughput, which is the signature of a deadline, not a bound.
+       n_participants is peer-supplied but already bounded by
+       SS_MAX_PARTICIPANTS above, so the worst case is a bounded wait, and a
+       client that waits too long is merely slow -- one that gives up too early
+       breaks the factory for all N. */
+    {
+        int scaled = WIRE_DEFAULT_TIMEOUT_SEC + (int)n_participants;
+        wire_set_timeout(fd, scaled);
+    }
+
     secp256k1_pubkey *all_pubkeys =
         (secp256k1_pubkey *)calloc(n_participants, sizeof(secp256k1_pubkey));
     if (!all_pubkeys) {
