@@ -446,10 +446,22 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
     /* Explicit count: sizeof(saved_profiles) was the whole fixed array; as a
-       pointer that silently becomes sizeof(void*).  Copy exactly the
-       participants that exist, which is also all f->profiles is sized for. */
+       pointer that silently becomes sizeof(void*).
+       Bound by BOTH allocations.  f->profiles is sized to f->config.max_signers,
+       which at this point is still the pre-init default (256) -- the factory has
+       not been re-inited yet, so factory_config_fit has not grown it to
+       n_participants.  An earlier version of this copied n_total and ASan caught
+       it at N=520:
+           READ of size 16672 (= 521 * sizeof(participant_profile_t))
+           heap-buffer-overflow  src/lsp.c:452
+       i.e. reading 521 profiles out of a 256-entry array.  The comment here
+       previously asserted n_total was "all f->profiles is sized for", which was
+       simply untrue and untested -- the unit suite cannot see it because below
+       256 the two counts coincide. */
     participant_profile_t *saved_profiles = lsp->scratch_profiles;
-    memcpy(saved_profiles, f->profiles, n_total * sizeof(participant_profile_t));
+    size_t n_prof = f->config.max_signers;
+    if (n_prof > lsp->scratch_cap) n_prof = lsp->scratch_cap;
+    memcpy(saved_profiles, f->profiles, n_prof * sizeof(participant_profile_t));
     int saved_has_shachain = f->has_shachain;
     int saved_use_flat = f->use_flat_secrets;
     size_t saved_n_secrets = f->n_revocation_secrets;
@@ -478,7 +490,11 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
-    memcpy(f->profiles, saved_profiles, n_total * sizeof(participant_profile_t));
+    /* Restore exactly what was saved.  f->profiles may now be LARGER than it was
+       (the re-init above ran factory_config_fit, which grows max_signers to
+       n_participants); the surplus stays zeroed from calloc, which is the same
+       state the old fixed-256 save/restore left it in. */
+    memcpy(f->profiles, saved_profiles, n_prof * sizeof(participant_profile_t));
     if (saved_has_shachain) {
         if (saved_use_flat && saved_secrets)
             factory_set_flat_secrets(f, saved_secrets, saved_n_secrets);
