@@ -571,9 +571,26 @@ int wire_recv(int fd, wire_msg_t *msg) {
 }
 
 int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec) {
+    /* Restore the socket's PREVIOUS deadline, not the compile-time default.
+       Restoring WIRE_DEFAULT_TIMEOUT_SEC silently discarded any per-connection
+       deadline a caller had set: the client scales its receive timeout with the
+       participant count (the LSP fans ceremony messages out serially, so client
+       k waits behind k-1 sends), and a single wire_recv_timeout() anywhere in
+       the flow reset it to 120s before the message that needed the longer wait
+       ever arrived. The scaled timeout was therefore never in effect -- which is
+       why raising it changed nothing at N=300 and the failure index wandered
+       (113 -> 227 -> 198) with throughput instead of moving with the setting. */
+    struct timeval prev;
+    socklen_t plen = sizeof(prev);
+    int have_prev = (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &prev, &plen) == 0);
+
     wire_set_timeout(fd, timeout_sec);
     int ok = wire_recv(fd, msg);
-    wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+
+    if (have_prev && (prev.tv_sec > 0 || prev.tv_usec > 0))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &prev, sizeof(prev));
+    else
+        wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
     return ok;
 }
 
