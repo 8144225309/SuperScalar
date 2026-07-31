@@ -212,14 +212,20 @@ for i in $(seq 1 "$N_CLIENTS"); do
 done
 ( while kill -0 "$LSP_PID" 2>/dev/null; do mine 1; sleep 2; done ) & MINER_PID=$!
 
-CDEAD=$(( $(date +%s) + 420 )); CREATED=0
+# Creation is an O(N)-round ceremony, so the budget must scale with N.  A fixed
+# 420s silently became a spurious "factory not created" at large N: measured
+# ~150s at N=224, so 512 lands near the old ceiling and 1024 sails past it --
+# a harness artifact that reads exactly like a code bug.  ~1.2s/client + 120s
+# floor, overridable.
+CREATE_WAIT_SEC="${CREATE_WAIT_SEC:-$(( 120 + (N_CLIENTS * 12 + 9) / 10 ))}"
+CDEAD=$(( $(date +%s) + CREATE_WAIT_SEC )); CREATED=0
 while [ "$(date +%s)" -lt "$CDEAD" ]; do
     grep -q "entering daemon mode" "$LSP_LOG" 2>/dev/null && { CREATED=1; break; }
     grep -qE "event loop failed|channel init failed|ceremony failed|FATAL" "$LSP_LOG" 2>/dev/null && { tail -30 "$LSP_LOG"; die "LSP creation failure"; }
     kill -0 "$LSP_PID" 2>/dev/null || { tail -30 "$LSP_LOG"; die "LSP died during creation"; }
     sleep 3
 done
-[ "$CREATED" = 1 ] || { tail -30 "$LSP_LOG"; die "factory not created in 420s"; }
+[ "$CREATED" = 1 ] || { tail -30 "$LSP_LOG"; die "factory not created in ${CREATE_WAIT_SEC}s"; }
 green "$(ts) FACTORY LIVE — $N_CLIENTS clients onboarded with ZERO balance (pct-100)"
 
 # ---- SEED: every client's first sats arrive over LN ----
