@@ -1018,6 +1018,16 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     size_t n_total = 1 + lsp->n_clients;
     int clients_notified = 0;  /* set after CLOSE_PROPOSE sent */
 
+    /* Declared NULL up here, allocated further down.  close_fail frees all four,
+       and several `goto close_fail` fire BEFORE the allocation point -- gcc
+       rightly rejected freeing them uninitialised
+       (-Werror=maybe-uninitialized).  free(NULL) is a no-op, so a NULL start
+       makes every path through the label safe. */
+    unsigned char (*all_pubnonces)[66] = NULL;
+    int *close_wait_fds = NULL;
+    int *close_ready = NULL;
+    secp256k1_musig_partial_sig *all_psigs = NULL;
+
     /* Build unsigned close tx + sighash */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
@@ -1095,12 +1105,10 @@ int lsp_run_cooperative_close(lsp_t *lsp,
        is unavailable here.  Allocated once above the first goto and released at
        the single cleanup label -- which is also why the inner wait_fds/ready are
        hoisted out of their loops rather than allocated per iteration. */
-    unsigned char (*all_pubnonces)[66] =
-        calloc(lsp->n_clients + 1, 66);
-    int *close_wait_fds = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
-    int *close_ready    = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
-    secp256k1_musig_partial_sig *all_psigs =
-        calloc(lsp->n_clients + 1, sizeof(secp256k1_musig_partial_sig));
+    all_pubnonces   = calloc(lsp->n_clients + 1, 66);
+    close_wait_fds  = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
+    close_ready     = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
+    all_psigs       = calloc(lsp->n_clients + 1, sizeof(secp256k1_musig_partial_sig));
     if (!all_pubnonces || !close_wait_fds || !close_ready || !all_psigs) {
         fprintf(stderr, "LSP close: out of memory for %zu-participant ceremony\n",
                 lsp->n_clients + 1);
