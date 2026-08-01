@@ -2415,9 +2415,24 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    /* Release any prior tree state (caller may reuse f across loads).
-       factory_init_from_pubkeys memsets f, which would leak existing tx_bufs. */
-    if (f->n_nodes > 0)
+    /* Release any prior state (caller may reuse f across loads).
+       factory_init_from_pubkeys memsets f, so anything f already owns must be
+       freed FIRST or it is orphaned.
+
+       The guard used to be `f->n_nodes > 0`, which tests TREE state -- but the
+       thing that needs freeing is the ARRAY SET, and factory_alloc_default_arrays
+       allocates all of it (nodes, keypairs, pubkeys, profiles,
+       dist_partial_sigs, leaf_layers, leaf_node_indices, the l_stock arrays)
+       while leaving n_nodes == 0.  So the common "pre-allocate, then load into
+       it" pattern skipped the free entirely and leaked the whole set on every
+       load -- ~260KB a time.  Harmless when factory_t carried those as fixed
+       members; a real leak now that they are heap.
+
+       Test with the ARRAYS, not the tree.  factory_free is safe here: its node
+       loop runs zero times when n_nodes == 0, and every free is NULL-safe. */
+    if (f->n_nodes > 0 || f->nodes || f->keypairs || f->pubkeys ||
+        f->profiles || f->dist_partial_sigs || f->leaf_layers ||
+        f->leaf_node_indices)
         factory_free(f);
 
     /* Reconstruct factory */
