@@ -1287,7 +1287,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     {
         cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
-        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        /* Real dimensions, not the compile-time product.  512*256 =
+           131072 entries is at once a large over-allocation for a small
+           factory AND too small for a big one: at N=512 the tree can
+           carry ~2046 nodes x 513 signers, roughly 8x this bound. */
+        size_t cap = (size_t)factory_out->n_nodes *
+                     ((size_t)factory_out->n_participants + 1);
         wire_bundle_entry_t *all_entries = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!all_entries) {
             cJSON_Delete(msg.json); free(secnonces); free(nonce_entries); return 0;
@@ -2611,7 +2616,12 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     {
         cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
-        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        /* Real dimensions, not the compile-time product.  512*256 =
+           131072 entries is at once a large over-allocation for a small
+           factory AND too small for a big one: at N=512 the tree can
+           carry ~2046 nodes x 513 signers, roughly 8x this bound. */
+        size_t cap = (size_t)factory->n_nodes *
+                     ((size_t)factory->n_participants + 1);
         wire_bundle_entry_t *all_entries = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!all_entries) {
             cJSON_Delete(msg.json);
@@ -3162,13 +3172,19 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
         return 0;
     }
 
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
+    /* Sized to THIS node's signer set, not a compile-time 256.  Two wins:
+       the pair stops costing ~34KB of stack on every call for a node that
+       usually has 2 signers, and passing the real count as the parse capacity
+       means an over-long nonce list is REJECTED rather than truncated. */
+    size_t poison_cap = factory->nodes[node_idx].n_signers;
+    if (poison_cap == 0) poison_cap = 1;
+    unsigned char all_pubnonces[poison_cap][66];
+    unsigned char all_poison_pubnonces[poison_cap][66];
     size_t n_signers;
     int an_parse_rc = wire_parse_leaf_realloc_all_nonces(
         all_msg.json, all_pubnonces,
         realloc_poison_prepared ? all_poison_pubnonces : NULL,
-        FACTORY_MAX_SIGNERS, &n_signers);
+        poison_cap, &n_signers);
     cJSON_Delete(all_msg.json);
     if (an_parse_rc == 0) {
         fprintf(stderr, "Client %u: realloc parse all_nonces failed\n", my_index);
@@ -3462,7 +3478,11 @@ static int client_handle_subfactory_advance_stateless_multi(
         free(my_secnonces);
         return 0;
     }
-    unsigned char all_poison_pn_sub[FACTORY_MAX_SIGNERS][66];
+    /* Sized to the sub-factory node's own signer set — see the note in
+       client_handle_leaf_realloc. */
+    size_t poison_cap = factory->nodes[sub_node_i].n_signers;
+    if (poison_cap == 0) poison_cap = 1;
+    unsigned char all_poison_pn_sub[poison_cap][66];
     unsigned char lsp_poison_psig_ser[32];
     uint32_t got_all_len = 0, got_poison_len = 0;
     memset(all_poison_pn_sub, 0, sizeof(all_poison_pn_sub));
@@ -3956,8 +3976,13 @@ static int client_handle_subfactory_advance_stateless(int fd,
         return 0;
     }
     unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
-    unsigned char all_pn_sub[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pn_sub[FACTORY_MAX_SIGNERS][66];
+    /* Sized to the sub-factory node's own signer set — see the note in
+       client_handle_leaf_realloc.  sizeof() on these VLAs is evaluated at
+       runtime, so the capacity passed to the parser below stays correct. */
+    size_t poison_cap = factory->nodes[sub_node_i].n_signers;
+    if (poison_cap == 0) poison_cap = 1;
+    unsigned char all_pn_sub[poison_cap][66];
+    unsigned char all_poison_pn_sub[poison_cap][66];
     unsigned char lsp_poison_psig_ser[32];
     uint32_t got_all_pn_len = 0, got_poison_len = 0;
     memset(all_poison_pn_sub, 0, sizeof(all_poison_pn_sub));

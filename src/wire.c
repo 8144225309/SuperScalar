@@ -3235,8 +3235,16 @@ size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
         if (!ni || !cJSON_IsNumber(ni) ||
             !sl || !cJSON_IsNumber(sl) ||
             !d || !cJSON_IsString(d)) continue;
-        if (ni->valuedouble < 0 || ni->valuedouble >= FACTORY_MAX_NODES) continue;
-        if (sl->valuedouble < 0 || sl->valuedouble >= FACTORY_MAX_SIGNERS) continue;
+        /* Sanity ceilings on peer-supplied indices, NOT capacity limits --
+           the real bound is `count < max` against the caller's array.  These
+           were FACTORY_MAX_NODES/FACTORY_MAX_SIGNERS, both of which are now
+           merely defaults, so a large factory had its bundle entries silently
+           DROPPED here (a bare `continue`, no diagnostic): at N=512 the tree
+           carries ~2046 nodes and 513 signers, so most entries vanished and
+           the ceremony failed far downstream with missing nonces.
+           SS_MAX_NODE_INDEX tracks the ~4N node count of the tree shape. */
+        if (ni->valuedouble < 0 || ni->valuedouble >= SS_MAX_NODE_INDEX) continue;
+        if (sl->valuedouble < 0 || sl->valuedouble >= SS_MAX_PARTICIPANTS) continue;
 
         entries[count].node_idx = (uint32_t)ni->valuedouble;
         entries[count].signer_slot = (uint32_t)sl->valuedouble;

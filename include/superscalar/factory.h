@@ -50,6 +50,13 @@
  * become impractical long before it) while keeping the worst-case client
  * allocation bounded and small. */
 #define SS_MAX_PARTICIPANTS 4096
+
+/* Hard ceiling on a peer-supplied NODE index, the tree-shaped counterpart to
+   SS_MAX_PARTICIPANTS.  The DW tree carries roughly 4N nodes (a kickoff and a
+   state node per level), so this bounds the shape SS_MAX_PARTICIPANTS implies
+   with headroom.  Like SS_MAX_PARTICIPANTS this is a validation ceiling for
+   untrusted input, NOT an allocation size -- f->nodes grows on demand. */
+#define SS_MAX_NODE_INDEX (4 * SS_MAX_PARTICIPANTS + 64)
 /* FACTORY_MAX_LEAVES: one channel (leaf) per client, so this bounds the client
  * count.  Raised 128 -> 256 to support up to 255-client factories.  Cost:
  * leaf_layers[FACTORY_MAX_LEAVES] is embedded in factory_t, so this enlarges

@@ -32,7 +32,10 @@ int ladder_create_factory(ladder_t *lad,
 {
     if (lad->n_factories >= LADDER_MAX_FACTORIES)
         return 0;
-    if (n_clients + 1 > FACTORY_MAX_SIGNERS)
+    /* Bound by the turnover arrays in ladder_factory_t, which are indexed by
+       n_participants -- see LADDER_MAX_PARTICIPANTS in ladder.h. Fails closed:
+       an oversized factory gets no ladder entry rather than a partial one. */
+    if (n_clients + 1 > LADDER_MAX_PARTICIPANTS)
         return 0;
 
     size_t idx = lad->n_factories;
@@ -44,7 +47,7 @@ int ladder_create_factory(ladder_t *lad,
 
     /* Build combined keypair array: LSP + clients */
     size_t n_participants = n_clients + 1;
-    secp256k1_keypair all_keypairs[FACTORY_MAX_SIGNERS];
+    secp256k1_keypair all_keypairs[n_participants];
     all_keypairs[0] = lad->lsp_keypair;
     for (size_t i = 0; i < n_clients; i++)
         all_keypairs[i + 1] = client_keypairs[i];
@@ -179,7 +182,7 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
 
     /* Build a keypair array using extracted keys for departed clients */
     factory_t *f = &lf->factory;
-    secp256k1_keypair close_keypairs[FACTORY_MAX_SIGNERS];
+    secp256k1_keypair close_keypairs[f->n_participants ? f->n_participants : 1];
 
     for (size_t i = 0; i < f->n_participants; i++) {
         if (i == 0) {
@@ -197,7 +200,7 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
     }
 
     /* Temporarily swap keypairs in factory for signing */
-    secp256k1_keypair saved_keypairs[FACTORY_MAX_SIGNERS];
+    secp256k1_keypair saved_keypairs[f->n_participants ? f->n_participants : 1];
     memcpy(saved_keypairs, f->keypairs,
            f->n_participants * sizeof(secp256k1_keypair));
     /* cppcheck-suppress uninitvar ; loop above initializes all [0..n_participants) elements */

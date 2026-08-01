@@ -7,6 +7,23 @@
 
 #define LADDER_MAX_FACTORIES 8  /* demo: 3-4 overlapping is sufficient */
 
+/* Participant capacity of the per-client turnover arrays below.
+ *
+ * This is a REAL cap on the PTLC ladder, unlike FACTORY_MAX_SIGNERS elsewhere
+ * in the tree, which is now only a default.  client_departed[] and
+ * extracted_keys[] are fixed members of ladder_factory_t, which is itself a
+ * fixed member of ladder_t, and both are indexed by factory n_participants --
+ * so ladder_add_factory MUST refuse anything larger or those writes run off
+ * the end of the struct.  The refusal and the array bound are expressed with
+ * this one constant precisely so they cannot drift apart.
+ *
+ * Lifting it means converting both members to pointers with an owning
+ * alloc/free on ladder_factory_t.  Not done here: the assisted-exit PTLC flow
+ * that drives client turnover is built but not yet originated, so the ladder
+ * caps out well below the sizes the rest of the stack now supports.  A factory
+ * larger than this simply does not get a ladder entry; nothing truncates. */
+#define LADDER_MAX_PARTICIPANTS FACTORY_MAX_SIGNERS
+
 typedef struct {
     factory_t factory;
     uint32_t factory_id;           /* sequential: 0, 1, 2, ... */
@@ -16,8 +33,8 @@ typedef struct {
     tx_buf_t distribution_tx;      /* pre-signed nLockTime fallback */
 
     /* Per-client key turnover state */
-    int client_departed[FACTORY_MAX_SIGNERS];     /* 1 if PTLC complete */
-    unsigned char extracted_keys[FACTORY_MAX_SIGNERS][32]; /* revealed scalars */
+    int client_departed[LADDER_MAX_PARTICIPANTS];     /* 1 if PTLC complete */
+    unsigned char extracted_keys[LADDER_MAX_PARTICIPANTS][32]; /* revealed scalars */
     size_t n_departed;
 
     int partial_rotation_done;   /* 1 = old factory retired via partial rotation */

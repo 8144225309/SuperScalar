@@ -2316,7 +2316,12 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
 
     /* Data validation (Phase 2: item 2.6) */
-    if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
+    /* Sanity ceiling on a value read back from the DB, not a capacity limit --
+       everything downstream is sized from n_participants.  At
+       FACTORY_MAX_SIGNERS this refused to load any factory over 256
+       participants, so such a factory could be created and persisted but
+       never restored after a restart. */
+    if (n_participants < 2 || n_participants > (size_t)SS_MAX_PARTICIPANTS) {
         fprintf(stderr, "persist_load_factory: invalid n_participants %zu\n",
                 n_participants);
         sqlite3_finalize(stmt);
@@ -2367,9 +2372,14 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     sqlite3_bind_int(pk_stmt, 1, (int)factory_id);
 
-    secp256k1_pubkey pubkeys[FACTORY_MAX_SIGNERS];
+    /* Sized to n_participants, which is what the check below demands anyway.
+       As a fixed [FACTORY_MAX_SIGNERS] this truncated the pubkeys LOADED FROM
+       THE DB at 256, so `pk_count != n_participants` then failed and a
+       factory with more than 256 participants could never be restored. Fails
+       closed, but it makes restore impossible rather than wrong. */
+    secp256k1_pubkey pubkeys[n_participants ? n_participants : 1];
     size_t pk_count = 0;
-    while (sqlite3_step(pk_stmt) == SQLITE_ROW && pk_count < FACTORY_MAX_SIGNERS) {
+    while (sqlite3_step(pk_stmt) == SQLITE_ROW && pk_count < n_participants) {
         const char *pk_hex = (const char *)sqlite3_column_text(pk_stmt, 1);
         if (!pk_hex) continue;
         unsigned char pk_ser[33];

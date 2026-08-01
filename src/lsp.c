@@ -601,9 +601,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        when all parties go offline.  (Legacy rotation also re-signs it later.)
        Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
     {
-        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+        /* N+1 outputs: one per client plus the LSP.  Fixed at 257 this could
+           not express the payout set past 256 clients -- and this is the
+           all-offline safety-net TX, so a short one means the fallback that
+           pays everyone at the factory CLTV silently covers fewer clients. */
+        tx_output_t dist_outputs[(size_t)f->n_participants + 1];
         size_t n_dist = factory_compute_distribution_outputs_balanced(f,
-            dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+            dist_outputs, (size_t)f->n_participants + 1, 500,
             lsp->dist_client_amounts, lsp->dist_n_client_amounts);
         if (n_dist > 0 && f->cltv_timeout > 0)
             (void)factory_build_distribution_tx_unsigned(
