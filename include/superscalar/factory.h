@@ -297,7 +297,7 @@ typedef struct {
        Length equals ps_n_prev_outputs (= n_inputs).  Only used by
        advanced PS sub-factory nodes per #207. */
     musig_signing_session_t *input_signing_sessions;        /* length n_input_sessions */
-    secp256k1_musig_partial_sig *input_partial_sigs;        /* length n_input_sessions * FACTORY_MAX_SIGNERS */
+    secp256k1_musig_partial_sig *input_partial_sigs;        /* length n_input_sessions * input_signers_stride */
     int input_partial_sigs_received[FACTORY_MAX_OUTPUTS];   /* per-input count */
     size_t n_input_sessions;
 

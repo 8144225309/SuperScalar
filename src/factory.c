@@ -2063,7 +2063,10 @@ int factory_session_get_input_signer_slot(const factory_t *f,
     if (!node->input_signing_sessions) return -1;
     if (input_idx >= node->n_input_sessions) return -1;
     size_t n = node->input_n_signers[input_idx];
-    if (n == 0 || n > (size_t)FACTORY_MAX_SIGNERS) return -1;
+    /* Bound by the allocation's stride, not the old compile-time cap: the
+       loop below reads factory_node_input_signers_const(node, input_idx)[i]
+       for i < n, and that row is input_signers_stride wide. */
+    if (n == 0 || n > node->input_signers_stride) return -1;
     for (size_t i = 0; i < n; i++) {
         if (factory_node_input_signers_const(node, input_idx)[i] == participant_idx)
             return (int)i;
@@ -3167,13 +3170,22 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
                                             sizeof(musig_signing_session_t));
     if (!node->input_signing_sessions) return 0;
 
+    /* ONE stride for BOTH per-input signer arrays, computed before either
+       allocation so they are indexed identically.  input_partial_sigs used a
+       fixed FACTORY_MAX_SIGNERS stride, which (a) hard-capped a node at 256
+       signers -- factory_session_set_partial_sig_input refused any slot at or
+       above it -- and (b) allocated 256 partial-sig slots per input on every
+       multi-input node regardless of the real signer count. */
+    node->input_signers_stride = node->n_signers ? node->n_signers : 2;
+
     node->input_partial_sigs =
         (secp256k1_musig_partial_sig *)calloc(
-            node->ps_n_prev_outputs * (size_t)FACTORY_MAX_SIGNERS,
+            node->ps_n_prev_outputs * node->input_signers_stride,
             sizeof(secp256k1_musig_partial_sig));
     if (!node->input_partial_sigs) {
         free(node->input_signing_sessions);
         node->input_signing_sessions = NULL;
+        node->input_signers_stride = 0;
         return 0;
     }
     /* SF-MULTI-KEYAGG (#283): per-input keyagg cache. */
@@ -3185,6 +3197,7 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
         free(node->input_partial_sigs);
         node->input_signing_sessions = NULL;
         node->input_partial_sigs = NULL;
+        node->input_signers_stride = 0;
         return 0;
     }
 
@@ -3192,8 +3205,8 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
        fixed [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS] carried by every node.
        Stride is n_signers (the node's full set is the widest any one input can
        need: derive_input_keyagg either copies signer_indices wholesale for the
-       sales-stock input, or writes 2 entries for a channel input). */
-    node->input_signers_stride = node->n_signers ? node->n_signers : 2;
+       sales-stock input, or writes 2 entries for a channel input).  Set above,
+       shared with input_partial_sigs. */
     node->input_signer_indices =
         (uint32_t *)calloc(node->ps_n_prev_outputs * node->input_signers_stride,
                              sizeof(uint32_t));
@@ -3417,10 +3430,14 @@ int factory_session_set_partial_sig_input(factory_t *f, size_t node_idx, size_t 
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->input_signing_sessions) return 0;
     if (input_idx >= node->n_input_sessions) return 0;
-    if (signer_slot >= (size_t)FACTORY_MAX_SIGNERS) return 0;
+    /* Bound by the ALLOCATION, not by the old compile-time cap.  The
+       input_n_signers check below is the semantic one; this is the memory
+       bound, and both now track input_signers_stride. */
+    if (node->input_signers_stride == 0) return 0;
+    if (signer_slot >= node->input_signers_stride) return 0;
     if (signer_slot >= node->input_n_signers[input_idx]) return 0;
     secp256k1_musig_partial_sig *slot =
-        &node->input_partial_sigs[input_idx * (size_t)FACTORY_MAX_SIGNERS + signer_slot];
+        &node->input_partial_sigs[input_idx * node->input_signers_stride + signer_slot];
     *slot = *psig;
     node->input_partial_sigs_received[input_idx]++;
     return 1;
@@ -3462,7 +3479,7 @@ int factory_session_assemble_signed_tx_multi(factory_t *f, size_t node_idx) {
     if (!sigs64) return 0;
     for (size_t i = 0; i < node->n_input_sessions; i++) {
         secp256k1_musig_partial_sig *psigs =
-            &node->input_partial_sigs[i * (size_t)FACTORY_MAX_SIGNERS];
+            &node->input_partial_sigs[i * node->input_signers_stride];
         /* SF-MULTI-KEYAGG (#283): aggregate with the per-input signer count
            (not the node-level n_signers). */
         if (!musig_aggregate_partial_sigs(f->ctx, sigs64 + 64 * i,
@@ -3666,8 +3683,15 @@ int factory_session_set_partial_sig_poison(factory_t *f, size_t node_idx,
                                              size_t signer_slot,
                                              const secp256k1_musig_partial_sig *psig) {
     if (!f || node_idx >= f->n_nodes || !psig) return 0;
-    if (signer_slot >= FACTORY_MAX_SIGNERS) return 0;
     factory_node_t *node = &f->nodes[node_idx];
+    /* Bound by the ALLOCATION.  poison_partial_sigs is calloc'd to this node's
+       n_signers, but the guard here was the old fixed FACTORY_MAX_SIGNERS --
+       so any slot in [n_signers, 256) was accepted and written past the end of
+       the array.  signer_slot arrives over the wire, so on a small node (a
+       2-of-2 leaf) a peer could write ~254 partial-sig structs of heap beyond
+       the allocation.  Nothing legitimate ever sends such a slot. */
+    if (!node->poison_partial_sigs) return 0;
+    if (signer_slot >= node->n_signers) return 0;
     memcpy(&node->poison_partial_sigs[signer_slot], psig,
            sizeof(secp256k1_musig_partial_sig));
     node->poison_partial_sigs_received++;
