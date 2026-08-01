@@ -318,6 +318,20 @@ eval "$RES"
 [ "${nout:-0}" -eq $((N_CLIENTS+1)) ] && green "  ok: exactly $((N_CLIENTS+1)) outputs (every onboarded-at-zero client got an LN-earned payout)" \
                                        || { red "  CHECK FAIL: nout=${nout:-?} != $((N_CLIENTS+1))"; FAILED=1; }
 
+# ---- DIST-TX: the all-offline safety net must actually have been co-signed ----
+# Checked because this is precisely what degraded silently before.  Each client
+# REBUILDS the distribution TX from the LSP-sent per-client amounts and refuses
+# to co-sign on any mismatch -- and that refusal is a graceful skip: the factory
+# still comes up and every other phase still passes.  At N=300 a truncated
+# amounts list made every client past index 255 skip, so the run reported
+# success while the CLTV fallback (the TX anyone can broadcast to pay everyone
+# if all parties vanish) covered nobody.  Nothing here was looking.
+# Counted after the close so every client log is flushed.
+DIST_OK=$(grep -al "stored signed distribution TX" /tmp/ss_${TAG}_c*.log 2>/dev/null | wc -l)
+DIST_OK=${DIST_OK:-0}
+[ "$DIST_OK" -ge "$N_CLIENTS" ] && green "  ok: dist-TX co-signed by $DIST_OK/$N_CLIENTS clients (all-offline CLTV fallback covers everyone)" \
+                                || { red "  CHECK FAIL: dist-TX co-signed by only $DIST_OK/$N_CLIENTS — CLTV fallback does not cover every client"; FAILED=1; }
+
 info "=== EXACT accounting: output_i == received_i - sent_i (baseline 0) ==="
 python3 - "$LSP_LOG" "$N_CLIENTS" <<'PYEOF'
 import sys, re
