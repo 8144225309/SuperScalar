@@ -1938,6 +1938,7 @@ int test_persist_validate_factory_load(void) {
     loaded = persist_load_factory(&db, 13, f, ctx);
     TEST_ASSERT(loaded == 0, "step_blocks=0 rejected");
 
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);

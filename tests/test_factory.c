@@ -4240,6 +4240,7 @@ int test_economic_mode_validation(void) {
     TEST_ASSERT_EQ((long)f->profiles[1].profit_share_bps, 2000, "client 1 bps");
     TEST_ASSERT_EQ((long)f->profiles[4].profit_share_bps, 1000, "client 4 bps");
 
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }

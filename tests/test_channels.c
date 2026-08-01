@@ -2691,6 +2691,7 @@ int test_regtest_lsp_restart_recovery(void) {
         }
     }
 
+    factory_free(rec_f);   /* heap arrays: free(rec_f) alone orphans them */
     free(rec_f);
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
@@ -2752,6 +2753,7 @@ int test_profit_settlement_calculation(void) {
 
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -2792,6 +2794,7 @@ int test_settlement_trigger_at_interval(void) {
     TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -2827,6 +2830,7 @@ int test_on_close_includes_unsettled(void) {
     TEST_ASSERT_EQ(share1, 900, "client 1 unsettled share (per-channel)");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -3302,7 +3306,9 @@ int test_regtest_crash_double_recovery(void) {
         }
     }
 
+    factory_free(rec_f);   /* heap arrays: free(rec_f) alone orphans them */
     free(rec_f);
+    factory_free(rec_f2);   /* heap arrays: free(rec_f2) alone orphans them */
     free(rec_f2);
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
@@ -3816,6 +3822,7 @@ int test_fee_accumulation_and_settlement(void) {
                    "LSP local decreased by per-channel share");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -4159,6 +4166,7 @@ int test_close_outputs_wallet_spk(void) {
                 "override beats lsp_close_spk: client 0 uses override");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }

@@ -1191,6 +1191,7 @@ int test_regtest_jit_daemon_trigger(void) {
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
     free(lsp);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     close(sv[0]);
     close(sv[1]);

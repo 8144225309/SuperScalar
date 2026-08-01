@@ -1789,6 +1789,7 @@ int test_factory_lifecycle_daemon_check(void) {
     s = factory_get_state(f, 200);
     TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 200 = EXPIRED");
 
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -1966,6 +1967,7 @@ int test_ladder_daemon_integration(void) {
     TEST_ASSERT_EQ(lf->cached_state, FACTORY_EXPIRED, "EXPIRED at 130");
 
     tx_buf_free(&lf->distribution_tx);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     free(lad);
     secp256k1_context_destroy(ctx);
