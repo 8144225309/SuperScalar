@@ -205,16 +205,34 @@ int test_ceremony_select_high_fds(void) {
         if (setrlimit(RLIMIT_NOFILE, &rl) != 0) { printf("  SKIP: setrlimit\n"); return 1; }
     }
 
-    int sp[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) { printf("  SKIP: socketpair\n"); return 1; }
+    /* Two SEPARATE pairs, deliberately.  An earlier version of this test put
+       the same fd in two slots and asserted both reported ready.  That passes
+       on Linux and fails on macOS, because POSIX does not actually pin down
+       how poll() treats a repeated fd within one array.  It was also testing
+       something that cannot happen: production client_fds[] are distinct
+       sockets, and a slot with no connection holds -1, not a duplicate.
 
-    /* Relocate the read end ABOVE FD_SETSIZE — the value select() cannot hold. */
-    int hi = FD_SETSIZE + 7;
-    if (dup2(sp[0], hi) < 0) { close(sp[0]); close(sp[1]); printf("  SKIP: dup2 high\n"); return 1; }
-    close(sp[0]);
-    TEST_ASSERT(hi >= FD_SETSIZE, "test fd is above FD_SETSIZE");
+       The property worth protecting is the one that blocks N=1024 -- that
+       these paths work with fd VALUES above FD_SETSIZE, which select() cannot
+       represent and which FD_SET would smash the stack on.  Distinct high fds
+       test that directly and portably. */
+    int sp1[2], sp2[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp1) != 0) { printf("  SKIP: socketpair\n"); return 1; }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp2) != 0) {
+        close(sp1[0]); close(sp1[1]); printf("  SKIP: socketpair\n"); return 1;
+    }
 
-    int fds[3]  = { hi, -1, hi };   /* -1 must still be skipped, as before */
+    /* Relocate both read ends ABOVE FD_SETSIZE — values select() cannot hold. */
+    int hi1 = FD_SETSIZE + 7;
+    int hi2 = FD_SETSIZE + 8;
+    if (dup2(sp1[0], hi1) < 0 || dup2(sp2[0], hi2) < 0) {
+        close(sp1[0]); close(sp1[1]); close(sp2[0]); close(sp2[1]);
+        printf("  SKIP: dup2 high\n"); return 1;
+    }
+    close(sp1[0]); close(sp2[0]);
+    TEST_ASSERT(hi1 >= FD_SETSIZE && hi2 >= FD_SETSIZE, "test fds are above FD_SETSIZE");
+
+    int fds[3]  = { hi1, -1, hi2 };   /* -1 must still be skipped, as before */
     int ready[3];
 
     /* Nothing written yet -> timeout, all clear. */
@@ -223,17 +241,18 @@ int test_ceremony_select_high_fds(void) {
     TEST_ASSERT_EQ(ready[0], 0, "slot0 not ready");
     TEST_ASSERT_EQ(ready[2], 0, "slot2 not ready");
 
-    /* Make it readable -> both slots referencing that fd report ready. */
-    TEST_ASSERT(write(sp[1], "x", 1) == 1, "write to peer");
+    /* Make both readable -> both high-fd slots report ready. */
+    TEST_ASSERT(write(sp1[1], "x", 1) == 1, "write to peer 1");
+    TEST_ASSERT(write(sp2[1], "x", 1) == 1, "write to peer 2");
     n = ceremony_select_all(fds, 3, 1, ready);
-    TEST_ASSERT_EQ(n, 2, "both slots holding the high fd are ready");
+    TEST_ASSERT_EQ(n, 2, "both high fds are ready");
     TEST_ASSERT_EQ(ready[0], 1, "slot0 ready");
     TEST_ASSERT_EQ(ready[1], 0, "slot1 (-1) skipped");
     TEST_ASSERT_EQ(ready[2], 1, "slot2 ready");
 
     /* Peer hangup counts as ready, matching select(), so callers see EOF. */
-    close(sp[1]);
-    { char b[8]; while (read(hi, b, sizeof(b)) > 0) {} }
+    close(sp1[1]);
+    { char b[8]; while (read(hi1, b, sizeof(b)) > 0) {} }
     n = ceremony_select_all(fds, 3, 1, ready);
     TEST_ASSERT(n >= 1, "hangup reported ready (select parity)");
 
@@ -242,6 +261,6 @@ int test_ceremony_select_high_fds(void) {
     int nready[2];
     TEST_ASSERT_EQ(ceremony_select_all(none, 2, 0, nready), -1, "no usable fd -> -1");
 
-    close(hi);
+    close(hi1); close(hi2); close(sp2[1]);
     return 1;
 }
