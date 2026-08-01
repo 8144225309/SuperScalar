@@ -6,7 +6,41 @@
 
 #include "superscalar/sha256.h"
 
+/* Fill buf with len bytes of entropy, or return 0 having filled nothing the
+   caller may rely on.  The fail-closed contract is load-bearing: every caller
+   aborts the ceremony on 0, and a partial fill here would mean a reused or
+   guessable MuSig secnonce.
+ *
+ * getrandom(2) is preferred purely to avoid the open/read/close triple.
+ * musig_generate_nonce calls this TWICE per nonce inside a loop, so at N=300
+ * the creation ceremony did ~13.5k syscall triples per participant set -- it
+ * showed up as 3-6% of total CPU in a perf profile.  getrandom() is one
+ * syscall, holds no state, and is thread-safe, so nothing needs a cached fd
+ * or a lock.  Same kernel CSPRNG as /dev/urandom; no change in entropy
+ * quality.  The stdio path stays as the fallback for kernels/libcs without
+ * it. */
+#if defined(__linux__) && defined(__GLIBC__) && \
+    (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
+#define SS_HAVE_GETRANDOM 1
+#include <sys/random.h>
+#include <errno.h>
+#endif
+
 static int fill_random(unsigned char *buf, size_t len) {
+#ifdef SS_HAVE_GETRANDOM
+    size_t got = 0;
+    while (got < len) {
+        /* Short reads are legal (>256 bytes, or a signal); EINTR is retryable.
+           Anything else is a hard failure -- fall through to the stdio path
+           rather than returning partially-filled entropy. */
+        ssize_t r = getrandom(buf + got, len - got, 0);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (got == len) return 1;
+    /* else: fall through and try /dev/urandom */
+#endif
     FILE *f = fopen("/dev/urandom", "rb");
     if (!f) return 0;
     size_t n = fread(buf, 1, len, f);
