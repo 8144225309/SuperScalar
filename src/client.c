@@ -1094,7 +1094,19 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_out->fee_per_tx = fee_per_tx;
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
-    memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
+    /* Bound by the DESTINATION allocation, not by sizeof(source).
+       factory_out->profiles used to be a fixed participant_profile_t
+       [FACTORY_MAX_SIGNERS] inside factory_t, so copying sizeof(rot_profiles)
+       matched exactly.  It is now heap, calloc'd to config.max_signers, which
+       factory_config_default_for() sets to the actual participant count -- so
+       for any factory smaller than FACTORY_MAX_SIGNERS this was writing past
+       the end of the allocation (at N=127: 129 profiles, ~3KB of heap). */
+    {
+        size_t np = factory_out->config.max_signers;
+        if (np > FACTORY_MAX_SIGNERS) np = FACTORY_MAX_SIGNERS;
+        memcpy(factory_out->profiles, rot_profiles,
+               np * sizeof(participant_profile_t));
+    }
     if (rot_n_level_arity > 0)
         factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
     else if (rot_leaf_arity == 1)
@@ -2271,7 +2283,15 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory->fee_per_tx = fee_per_tx;
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
-    memcpy(factory->profiles, profiles, sizeof(profiles));
+    /* Bound by the destination allocation — see the note on the identical
+       copy in the rotation path.  factory->profiles is heap, sized to
+       config.max_signers; profiles[] here is still a fixed
+       [FACTORY_MAX_SIGNERS] stack array. */
+    {
+        size_t np = factory->config.max_signers;
+        if (np > FACTORY_MAX_SIGNERS) np = FACTORY_MAX_SIGNERS;
+        memcpy(factory->profiles, profiles, np * sizeof(participant_profile_t));
+    }
     /* SF-followup #145: register active factory so MSG_FUNDING_REORG handler
        can reset sub-factory chain state.  Cleared at all factory_free paths
        below. */
