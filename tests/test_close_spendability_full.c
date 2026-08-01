@@ -184,12 +184,12 @@ static int run_coop_close_for_arity(regtest_t *rt,
     if (!build_unsigned_tx(&unsigned_close, NULL,
                             f->funding_txid, f->funding_vout,
                             0xFFFFFFFEu, outs, N)) {
-        tx_buf_factory_free(f); free(&unsigned_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); factory_free(f); free(f); return 0;
     }
     unsigned char sighash[32];
     if (!compute_taproot_sighash(sighash, unsigned_close.data, unsigned_close.len,
                                    0, fund_spk, 34, fund_amount, 0xFFFFFFFEu)) {
-        tx_buf_factory_free(f); free(&unsigned_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); factory_free(f); free(f); return 0;
     }
 
     /* Offline N-party MuSig2 ceremony (we have all keypairs locally). */
@@ -201,13 +201,13 @@ static int run_coop_close_for_arity(regtest_t *rt,
 
     unsigned char sig64[64];
     if (!musig_sign_taproot(ctx, sig64, sighash, kps, N, &ka, NULL)) {
-        tx_buf_factory_free(f); free(&unsigned_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); factory_free(f); free(f); return 0;
     }
 
     tx_buf_t signed_close;
     tx_buf_init(&signed_close, 256);
     if (!finalize_signed_tx(&signed_close, unsigned_close.data, unsigned_close.len, sig64)) {
-        tx_buf_factory_free(f); free(&unsigned_close); tx_buf_free(&signed_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); tx_buf_free(&signed_close); factory_free(f); free(f); return 0;
     }
     tx_buf_free(&unsigned_close);
 
@@ -218,7 +218,7 @@ static int run_coop_close_for_arity(regtest_t *rt,
     char close_txid[65];
     if (!regtest_send_raw_tx(rt, close_hex, close_txid)) {
         fprintf(stderr, "  coop close broadcast failed\n");
-        tx_buf_factory_free(f); free(&signed_close); free(f); return 0;
+        tx_buf_free(&signed_close); factory_free(f); free(f); return 0;
     }
     regtest_mine_blocks(rt, 1, mine_addr);
     tx_buf_free(&signed_close);
@@ -844,7 +844,7 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     unsigned char sh[32];
     if (!compute_taproot_sighash(sh, uc.data, uc.len, 0,
                                   fund_spk, 34, fund_amount, 0xFFFFFFFEu)) {
-        tx_buf_factory_free(f); free(&uc); free(f); return 0;
+        tx_buf_free(&uc); factory_free(f); free(f); return 0;
     }
     musig_keyagg_t ka;
     secp256k1_pubkey pks[3];
@@ -852,7 +852,7 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     musig_aggregate_keys(ctx, &ka, pks, N);
     unsigned char sig[64];
     if (!musig_sign_taproot(ctx, sig, sh, kps, N, &ka, NULL)) {
-        tx_buf_factory_free(f); free(&uc); free(f); return 0;
+        tx_buf_free(&uc); factory_free(f); free(f); return 0;
     }
     tx_buf_t sc;
     tx_buf_init(&sc, 256);
@@ -1103,7 +1103,7 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     unsigned char shA[32];
     if (!compute_taproot_sighash(shA, ucA.data, ucA.len, 0, spkA, 34,
                                   amtA, 0xFFFFFFFEu)) {
-        tx_buf_factory_free(fA); factory_free(fB); free(&ucA); free(fA); free(fB); return 0;
+        tx_buf_free(&ucA); factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     musig_keyagg_t kaA;
     secp256k1_pubkey pksA[5];
@@ -1111,7 +1111,7 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     musig_aggregate_keys(ctx, &kaA, pksA, N);
     unsigned char sigA[64];
     if (!musig_sign_taproot(ctx, sigA, shA, kpsA, N, &kaA, NULL)) {
-        tx_buf_factory_free(fA); factory_free(fB); free(&ucA); free(fA); free(fB); return 0;
+        tx_buf_free(&ucA); factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     tx_buf_t scA;
     tx_buf_init(&scA, 256);
