@@ -2592,12 +2592,33 @@ int main(int argc, char *argv[]) {
        array work, the next limits in order are wall-clock (seeding is serialized,
        ~O(N) round-trips), per-client RSS (~21 MB + ~0.085 MB/N), and `ulimit -n`
        on the LSP (~N+20). */
-    if (n_clients < 1 || n_clients + 1 > FACTORY_MAX_SIGNERS) {
-        fprintf(stderr, "Error: --clients must be 1..%d "
-                "(the LSP co-signs every factory, and the daemon still has fixed "
-                "[FACTORY_MAX_SIGNERS] arrays; lifting this needs those made "
-                "dynamic — see docs/design/distributed-scale-512.md)\n",
-                FACTORY_MAX_SIGNERS - 1);
+    /* The ordinary lifecycle is no longer capped at FACTORY_MAX_SIGNERS. The
+       library's participant-indexed state is now sized to the real count, and
+       both daemon-side arrays that used to bound this are dynamic: the keyagg
+       scratch (lsp_ensure_scratch) and the cooperative-close outputs
+       (calloc n_clients+1). SS_MAX_PARTICIPANTS is the hard ceiling on any
+       peer- or operator-supplied count. */
+    if (n_clients < 1 || n_clients + 1 > SS_MAX_PARTICIPANTS) {
+        fprintf(stderr, "Error: --clients must be 1..%d\n",
+                SS_MAX_PARTICIPANTS - 1);
+        return 1;
+    }
+
+    /* The adversarial/demo blocks are a different story. superscalar_lsp_
+       {pre,post}_daemon_tests.inc are #included into main() and still declare
+       31 fixed [FACTORY_MAX_SIGNERS] arrays (keypair sets, dist/close output
+       arrays, rotation snapshots). They are only reachable behind these flags,
+       so gate on the flags rather than capping every operator. Converting them
+       is mechanical but unnecessary for a production-shaped run. */
+    if (n_clients + 1 > FACTORY_MAX_SIGNERS &&
+        (breach_test || cheat_leaf_side >= 0 || cheat_realloc ||
+         cheat_jit || cheat_lstock_buy)) {
+        fprintf(stderr,
+                "Error: --clients %d exceeds %d, and the embedded "
+                "--cheat-*/--test-* blocks still use fixed "
+                "[FACTORY_MAX_SIGNERS] arrays. Run the adversarial modes at "
+                "<= %d clients, or convert those arrays first.\n",
+                n_clients, FACTORY_MAX_SIGNERS - 1, FACTORY_MAX_SIGNERS - 1);
         return 1;
     }
 

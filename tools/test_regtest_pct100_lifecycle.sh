@@ -220,7 +220,7 @@ nohup "$LSP_BIN" --network regtest --port "$PORT" \
     --amount "$AMOUNT" \
     --active-blocks 500 --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
     --fee-rate 1000 --lsp-balance-pct 100 --confirm-timeout 600 \
-    --max-conn-rate 100000 --max-handshakes 256 \
+    --max-conn-rate 100000 --max-handshakes "$(( N_CLIENTS + 16 ))" \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
     --wallet "$MINERW" --db "$LSP_DB" \
