@@ -175,7 +175,13 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(lsp->client_fds[to_client], &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 }; /* 200ms */
+        /* Non-blocking: drain what has ALREADY arrived, never wait for more.
+           This loop can only exit on a select() timeout, so a 200ms tv was an
+           unconditional 200ms of dead time on every single payment -- 13% of
+           the per-payment cost, 60s across an N=300 seed.  Waiting buys
+           nothing: a REGISTER_INVOICE that arrives later is absorbed by
+           wait_for_msg inline (see above) or by the daemon loop. */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
         while (select(lsp->client_fds[to_client] + 1, &rfds, NULL, NULL, &tv) > 0) {
             wire_msg_t drain_msg;
             if (!wire_recv_timeout(lsp->client_fds[to_client], &drain_msg, 2)) break;
@@ -190,7 +196,7 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             FD_ZERO(&rfds);
             FD_SET(lsp->client_fds[to_client], &rfds);
             tv.tv_sec = 0;
-            tv.tv_usec = 200000;
+            tv.tv_usec = 0;
         }
     }
 
@@ -531,7 +537,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(lsp->client_fds[to_client], &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 }; /* 200ms */
+        /* Non-blocking: drain what has ALREADY arrived, never wait for more.
+           This loop can only exit on a select() timeout, so a 200ms tv was an
+           unconditional 200ms of dead time on every single payment -- 13% of
+           the per-payment cost, 60s across an N=300 seed.  Waiting buys
+           nothing: a REGISTER_INVOICE that arrives later is absorbed by
+           wait_for_msg inline (see above) or by the daemon loop. */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
         while (select(lsp->client_fds[to_client] + 1, &rfds, NULL, NULL, &tv) > 0) {
             wire_msg_t drain_msg;
             if (!wire_recv_timeout(lsp->client_fds[to_client], &drain_msg, 2)) break;
@@ -546,7 +558,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             FD_ZERO(&rfds);
             FD_SET(lsp->client_fds[to_client], &rfds);
             tv.tv_sec = 0;
-            tv.tv_usec = 200000;
+            tv.tv_usec = 0;
         }
     }
 
@@ -1104,7 +1116,8 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(lsp->client_fds[client_idx], &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+        /* Non-blocking drain — see the note on the identical loop above. */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
         while (select(lsp->client_fds[client_idx] + 1, &rfds, NULL, NULL, &tv) > 0) {
             wire_msg_t drain_msg;
             if (!wire_recv(lsp->client_fds[client_idx], &drain_msg)) break;
@@ -1119,7 +1132,7 @@ int lsp_channels_create_external_invoice(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             FD_ZERO(&rfds);
             FD_SET(lsp->client_fds[client_idx], &rfds);
             tv.tv_sec = 0;
-            tv.tv_usec = 200000;
+            tv.tv_usec = 0;
         }
     }
 

@@ -719,7 +719,26 @@ char *regtest_exec(const regtest_t *rt, const char *method, const char *params) 
                 return result;
             }
         }
-        /* HTTP failed — fall through to fork+exec */
+        /* Distinguish "bitcoind answered, and the answer was an error" from
+           "bitcoind did not answer".  regtest_http_rpc returns NULL for both,
+           but only the second is worth a fork+exec retry.
+
+           A JSON-RPC error IS a valid answer: -5 "no such transaction" is the
+           normal negative reply when polling for a tx that was never
+           broadcast.  Re-asking via bitcoin-cli gets the identical -5, having
+           paid a fork+execvp for it.  That is the hot path -- the watchtower
+           polls revoked commitments that by construction are NOT on chain, so
+           EVERY entry cost a process spawn on EVERY check, from every client
+           and the LSP daemon loop.  Entries grow with payments, so the waste
+           grew as O(N^2) over a seed and starved the real work of CPU.
+
+           -18 keeps the old behaviour on purpose: the fork path is how a
+           persistent wallet-missing failure gets surfaced to the operator
+           (task #298). */
+        if (g_regtest_last_http_error != 0 &&
+            g_regtest_last_http_error != -18)
+            return NULL;
+        /* No answer at all (transport failure) — fall through to fork+exec */
     }
 
     /* Fork+exec bitcoin-cli (used when rpcport==0 or HTTP unavailable) */
