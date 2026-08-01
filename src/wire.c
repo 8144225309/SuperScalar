@@ -338,6 +338,22 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
     uint32_t payload_len = (uint32_t)strlen(payload);
     uint32_t pt_len = 1 + payload_len;  /* type byte + JSON */
 
+    /* Refuse oversize frames HERE, where we know the message type and can say
+       so.  Only the receiver checked WIRE_MAX_FRAME_SIZE (see wire_recv), so an
+       over-limit send previously went out and the peer rejected it as an opaque
+       recv failure -- the sender, which has all the context, said nothing.
+       This is not hypothetical: the creation LSP_RESPONSE carries the full
+       n_nodes x n_participants nonce matrix, and the tree gains a level past
+       512 clients, so at N=1024 it is ~158 MB against a 16 MB limit. */
+    if (pt_len > WIRE_MAX_FRAME_SIZE - 16) {
+        fprintf(stderr,
+                "wire_send: msg 0x%02x is %u bytes, over the %d-byte frame limit "
+                "— refusing to send (peer would reject it as a malformed frame)\n",
+                msg_type, pt_len, WIRE_MAX_FRAME_SIZE);
+        free(payload);
+        return 0;
+    }
+
     noise_state_t *ns = wire_get_encryption(fd);
     if (ns) {
         /* Encrypt: plaintext = [type][JSON] */
@@ -430,6 +446,20 @@ int wire_send_many(const int *fds, size_t n_fds, uint8_t msg_type, cJSON *json,
     if (!payload) return 0;
     uint32_t payload_len = (uint32_t)strlen(payload);
     uint32_t pt_len = 1 + payload_len;
+
+    /* Same frame-limit refusal as wire_send -- see the note there.  Broadcast
+       is where this actually bites: the oversize message is the creation
+       LSP_RESPONSE, and failing here reports it once instead of N peers each
+       reporting a malformed frame. */
+    if (pt_len > WIRE_MAX_FRAME_SIZE - 16) {
+        fprintf(stderr,
+                "wire_send_many: msg 0x%02x is %u bytes, over the %d-byte frame "
+                "limit — refusing to broadcast to %zu peers\n",
+                msg_type, pt_len, WIRE_MAX_FRAME_SIZE, n_fds);
+        free(payload);
+        if (first_fail) *first_fail = 0;
+        return 0;
+    }
 
     unsigned char *plaintext = (unsigned char *)malloc(pt_len);
     if (!plaintext) { free(payload); return 0; }
