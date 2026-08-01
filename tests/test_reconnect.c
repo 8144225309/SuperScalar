@@ -180,7 +180,6 @@ int test_reconnect_pubkey_match(void) {
         all_pks[i + 1] = client_pks[i];
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) { free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp); return 0; }
     factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
 
@@ -397,7 +396,6 @@ int test_client_persist_reload(void) {
 
     /* Build factory */
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -567,7 +565,6 @@ int test_balance_reporting(void) {
     }
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -1992,7 +1989,6 @@ int test_distribution_tx_amounts(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 

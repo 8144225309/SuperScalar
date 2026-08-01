@@ -5356,7 +5356,6 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8}. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);  /* step_blocks=4, states_per_layer=4 */
     /* Wider N-way state nodes are larger TXs than the binary builder's;
@@ -6672,7 +6671,6 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -6979,7 +6977,6 @@ int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -7294,7 +7291,6 @@ int test_regtest_nway_n64_dw_advance_resign_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -7623,7 +7619,6 @@ int test_regtest_static_near_root_lifecycle(void) {
 
     /* Build factory: arity {2,4}, static_threshold=1 (root kickoff-only) */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* PR #104 bumped fee_per_tx to 1000 sats for N-way regtest mempool floor. */
@@ -7923,7 +7918,6 @@ int test_regtest_static_near_root_unilateral_exit(void) {
     TEST_ASSERT(fund_vout != UINT32_MAX, "find fund vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     f->fee_per_tx = 1000;
