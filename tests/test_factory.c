@@ -4893,7 +4893,6 @@ int test_factory_variable_arity_backward_compat(void) {
     factory_t *f1 = calloc(1, sizeof(factory_t));
     if (!f1) return 0;
     factory_t *f2 = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f2);
     if (!f2) { free(f1); return 0; }
 
     TEST_ASSERT(setup_n_factory(f1, ctx, kps1, 5, FACTORY_ARITY_2, 2000000), "setup f1");
@@ -8008,7 +8007,6 @@ int test_factory_static_near_root_basic(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[12];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
 
     uint8_t arities[2] = {2, 4};
@@ -8094,7 +8092,6 @@ int test_factory_static_near_root_n128_arity_2_4_8_static_2(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair *kps = calloc(128, sizeof(secp256k1_keypair));
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(kps && f, "alloc n128");
 
     /* {2,4,8}: depth 0 arity-2, depth 1 arity-4, depth 2+ arity-8 */
@@ -8196,7 +8193,6 @@ int test_factory_static_near_root_node_nsequence(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[12];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
 
     uint8_t arities[2] = {2, 4};
