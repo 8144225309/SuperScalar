@@ -48,6 +48,16 @@ static const char *test_filter = NULL;  /* if non-NULL, only run tests whose
             printf(" OK\n"); \
         } else { \
             tests_failed++; \
+            /* Say WHICH test failed.  This branch used to only bump the
+               counter and print nothing, so the summary reported
+               "1 FAILED" without ever naming it -- a failing test was
+               visible only as the ABSENCE of " OK" after its name, and
+               tests print their own output in between, so in a 6600-line
+               CI log it is effectively unfindable.  Print an unambiguous
+               marker on its own line and flush, so it survives truncation
+               and interleaving. */ \
+            printf("\n  *** FAILED: %s\n", #fn); \
+            fflush(stdout); \
         } \
     } \
 } while(0)
