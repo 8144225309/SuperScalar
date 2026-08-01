@@ -76,6 +76,35 @@ red(){   printf '\033[31m%s\033[0m\n' "$*"; }
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 info(){  printf '\033[36m[pct100]\033[0m %s\n' "$*"; }
 ts(){ date -u +%H:%M:%S; }
+
+# ---- phase timing ------------------------------------------------------------
+# Every run self-reports where its wall-clock went, so an ETA at a new N is a
+# regression on measured phases rather than a guess, and a slow phase is visible
+# without re-deriving it from scattered log timestamps.
+# Measured N=300 (release, regtest): creation 166s, seed 449s -- i.e. the seed,
+# which is N strictly-serial independent payments, dominates creation 2.7:1.
+# That is the sort of thing this table is meant to make obvious.
+PHASE_NAMES=(); PHASE_SECS=(); _PH_T0=$(date +%s); _PH_CUR=""
+phase_begin(){ phase_end; _PH_CUR="$1"; _PH_T0=$(date +%s); }
+phase_end(){
+    [ -z "$_PH_CUR" ] && return 0
+    local d=$(( $(date +%s) - _PH_T0 ))
+    PHASE_NAMES+=("$_PH_CUR"); PHASE_SECS+=("$d"); _PH_CUR=""
+}
+phase_report(){
+    phase_end
+    local total=0 i
+    for i in "${!PHASE_NAMES[@]}"; do total=$(( total + PHASE_SECS[i] )); done
+    [ "$total" -eq 0 ] && total=1
+    printf '\n\033[36m[pct100]\033[0m PHASE TIMING  (N=%s, total %ds)\n' "$N_CLIENTS" "$total"
+    for i in "${!PHASE_NAMES[@]}"; do
+        printf '   %-26s %6ds  %5.1f%%  %s\n' \
+            "${PHASE_NAMES[i]}" "${PHASE_SECS[i]}" \
+            "$(awk -v a="${PHASE_SECS[i]}" -v b="$total" 'BEGIN{printf "%.1f", 100*a/b}')" \
+            "$(awk -v a="${PHASE_SECS[i]}" -v n="$N_CLIENTS" 'BEGIN{if(n>0)printf "%.2fs/client", a/n}')"
+    done
+    printf '   %-26s %6ds\n' "TOTAL" "$total"
+}
 die(){ red "FAIL: $*"; exit 1; }
 
 declare -A CPID CDB CSK
@@ -89,7 +118,7 @@ cleanup(){
     rm -f "$FIFO" 2>/dev/null || true
     cp "$LSP_LOG" /tmp/pct100_last_lsp.log 2>/dev/null || true
 }
-trap cleanup EXIT
+trap 'phase_report; cleanup' EXIT
 cli(){ printf '%s\n' "$1" >&3 2>/dev/null || true; }
 seed_amt(){ echo $(( SEED_MIN + RANDOM % (SEED_MAX - SEED_MIN + 1) )); }
 econ_amt(){ echo $(( ECON_MIN + RANDOM % (ECON_MAX - ECON_MIN + 1) )); }
@@ -199,6 +228,7 @@ nohup "$LSP_BIN" --network regtest --port "$PORT" \
 LSP_PID=$!
 for i in $(seq 1 60); do sleep 1; grep -q "listening on port $PORT" "$LSP_LOG" 2>/dev/null && break; kill -0 "$LSP_PID" 2>/dev/null || { tail -25 "$LSP_LOG"; die "LSP died before listening"; }; done
 grep -q "listening on port $PORT" "$LSP_LOG" || { tail -25 "$LSP_LOG"; die "LSP never listened"; }
+phase_begin "launch+connect"
 info "$(ts) LSP listening; launching $N_CLIENTS zero-balance clients + block miner..."
 for i in $(seq 1 "$N_CLIENTS"); do
     nohup "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port "$PORT" \
@@ -229,6 +259,7 @@ done
 green "$(ts) FACTORY LIVE — $N_CLIENTS clients onboarded with ZERO balance (pct-100)"
 
 # ---- SEED: every client's first sats arrive over LN ----
+phase_begin "seed"
 info "$(ts) SEED: LSP pays each of the $N_CLIENTS clients over LN (lsppay, random $SEED_MIN..$SEED_MAX sats)..."
 for i in $(seq 0 $((N_CLIENTS-1))); do
     lsppay_cli "$i" "$(seed_amt)" || red "$(ts)   seed of client $i did not settle (retry pass follows)"
@@ -242,6 +273,7 @@ SEEDED=$(grep -aoE "Payment complete: LSP -> client [0-9]+ \(" "$LSP_LOG" 2>/dev
                                 || red   "$(ts) SEED INCOMPLETE: $SEEDED/$N_CLIENTS (close will have $((SEEDED+1)) outputs)"
 
 # ---- ECONOMY: bounded random c2c circulation (auto-stop on conservation violation) ----
+phase_begin "economy"
 info "$(ts) ECONOMY: up to $MAX_PAYS random client->client payments..."
 ECON_OK=0; ECON_FAIL=0
 for _k in $(seq 1 "$MAX_PAYS"); do
@@ -257,6 +289,7 @@ info "$(ts) economy done: $ECON_OK settled, $ECON_FAIL not settled (insufficient
 
 # ---- CLOSE ----
 sleep 10
+phase_begin "close"
 info "$(ts) issuing CLI close -> $((N_CLIENTS+1))-output cooperative payout..."
 cli "close"
 CLOSE_TXID=""; CDEAD=$(( $(date +%s) + CLOSE_WAIT_SEC ))
