@@ -1110,7 +1110,6 @@ void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k) {
     /* Cap at FACTORY_MAX_OUTPUTS - 1 so the leaf's k sub-factory entry
        outputs + 1 L-stock output fit within FACTORY_MAX_OUTPUTS.  k=0
        is treated as k=1 (no sub-factories). */
-    if (!f) return;
     /* Callable BEFORE factory_init (see factory_set_level_arity). */
     factory_alloc_default_arrays(f);
     if (!f->leaf_layers) return;
