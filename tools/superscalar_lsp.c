@@ -4183,8 +4183,14 @@ accept_new_factory:
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* Populate default profiles from CLI config */
-    for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
+    /* Populate default profiles from CLI config.
+       Bound by the ALLOCATION (config.max_signers, which factory_config_fit
+       sets to the participant count), not the compile-time FACTORY_MAX_SIGNERS.
+       With the 255-client CLI wall lifted, clamping at 256 here would leave
+       participants 256+ with profit_share_bps = 0 and contribution_sats = 0 --
+       silently offering them nothing. */
+    for (size_t pi = 0; pi < (size_t)(1 + n_clients) &&
+                        pi < lsp_p->factory.config.max_signers; pi++) {
         lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
             /* LSP gets remainder of profit share */
@@ -4203,7 +4209,8 @@ accept_new_factory:
        The test PASSES if factory creation fails (client rejection). */
     if (test_bad_terms) {
         lsp_p->factory.economic_mode = ECON_PROFIT_SHARED;
-        for (size_t pi = 1; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++)
+        for (size_t pi = 1; pi < (size_t)(1 + n_clients) &&
+                            pi < lsp_p->factory.config.max_signers; pi++)
             lsp_p->factory.profiles[pi].profit_share_bps = 0;
         lsp_p->factory.profiles[0].profit_share_bps = 10000; /* LSP takes 100% */
         printf("LSP: --test-bad-terms: offering 0 bps profit to all clients\n");
