@@ -1969,6 +1969,12 @@ int test_ladder_daemon_integration(void) {
     tx_buf_free(&lf->distribution_tx);
     factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
+    /* ladder_free, not just free(lad): `lf->factory = *f` is a shallow struct
+       copy, and factory_detach_txbufs then DEEP-COPIES the nine participant
+       arrays so the detached factory owns its own (see factory.c:848).  Those
+       copies belong to lad->factories[0] and only ladder_free releases them --
+       free(lad) drops the struct and orphans 238KB of nodes[]. */
+    ladder_free(lad);
     free(lad);
     secp256k1_context_destroy(ctx);
     return 1;
