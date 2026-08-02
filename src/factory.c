@@ -429,7 +429,14 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
        2-leaf L-stock SPK as the LSP (else the leaf-state tx diverges + co-sign fails). */
     if (f->has_node_l_stock_hashes) {
         size_t idx = (size_t)(node - f->nodes);
-        if (idx < FACTORY_MAX_NODES && f->node_l_stock_hash_valid[idx]) {
+        /* Bound by the ALLOCATION (nodes_cap), not FACTORY_MAX_NODES.  These
+           two arrays are calloc'd to FACTORY_NODES_INITIAL and grown by
+           factory_grow_nodes, so nodes_cap -- not the compile-time 512 -- is
+           how many entries exist.  Today idx cannot exceed it (it is derived
+           from a pointer into nodes[]), so this is not currently reachable,
+           but it is the same wrong-bound shape that WAS a live out-of-bounds
+           write in factory_session_set_partial_sig_poison. */
+        if (idx < f->nodes_cap && f->node_l_stock_hash_valid[idx]) {
             memcpy(node->l_stock_hash, f->node_l_stock_hashes[idx], 32);
             node->has_l_stock_hash = 1;
         }
@@ -856,13 +863,20 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
     f->leaf_layers       = calloc(f->config.max_leaves, sizeof(dw_layer_t));
     f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
     if (!f->keypairs || !f->pubkeys || !f->profiles || !f->dist_partial_sigs ||
-        !f->leaf_layers || !f->leaf_node_indices)
+        !f->leaf_layers || !f->leaf_node_indices) {
+        /* Partial allocation: release whatever DID succeed rather than
+           orphaning it.  f was memset at entry, so the failed ones are NULL
+           and factory_free is NULL-safe. */
+        factory_free(f);
         return 0;
+    }
 
     for (size_t i = 0; i < n_participants; i++) {
         f->keypairs[i] = keypairs[i];
-        if (!secp256k1_keypair_pub(ctx, &f->pubkeys[i], &keypairs[i]))
+        if (!secp256k1_keypair_pub(ctx, &f->pubkeys[i], &keypairs[i])) {
+            factory_free(f);     /* all nine arrays are live by now */
             return 0;
+        }
     }
 
     f->leaf_arity = FACTORY_ARITY_2;

@@ -2353,6 +2353,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client %u: REFUSING — profit_share %u bps < "
                     "minimum %u bps (use --min-profit-bps to adjust)\n",
                     my_index, my_bps, g_min_profit_bps);
+            factory_free(factory);   /* nine heap arrays; free() alone orphans them */
             free(factory);
             client_send_error(fd, "profit_share_too_low");
             wire_close(fd);
