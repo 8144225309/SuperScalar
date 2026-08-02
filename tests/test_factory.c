@@ -1788,6 +1788,7 @@ int test_factory_lifecycle_states(void) {
     TEST_ASSERT(factory_is_expired(f, 4852), "is_expired at 4852");
 
     secp256k1_context_destroy(ctx);
+    factory_free(f);   /* heap arrays -- free() alone orphans them */
     free(f);
     return 1;
 }
@@ -1829,6 +1830,7 @@ int test_factory_lifecycle_queries(void) {
     TEST_ASSERT_EQ(factory_blocks_until_expired(f, 130), 0, "until expired at 130");
 
     secp256k1_context_destroy(ctx);
+    factory_free(f);   /* heap arrays -- free() alone orphans them */
     free(f);
     return 1;
 }

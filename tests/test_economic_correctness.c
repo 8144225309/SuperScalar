@@ -845,6 +845,7 @@ int test_regtest_econ_ps_advance(void) {
     econ_snap_post(&ectx);
     econ_print_summary(&ectx);
 
+    factory_free(f);   /* heap arrays -- free() alone orphans them */
     free(f);
     lsp_channels_cleanup(&mgr);
     secp256k1_context_destroy(ctx);
@@ -1160,6 +1161,7 @@ int test_regtest_econ_buy_liquidity_arity2(void) {
     TEST_ASSERT(expected[1] == c0_expected,
                 "client 0 close output == pre_remote − bought");
 
+    factory_free(f);   /* heap arrays -- free() alone orphans them */
     free(f);
     lsp_channels_cleanup(&mgr);
     secp256k1_context_destroy(ctx);

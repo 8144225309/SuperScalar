@@ -2634,6 +2634,7 @@ int test_persist_crash_dw_state(void) {
         persist_close(&db);
     }
 
+    factory_free(f);   /* heap arrays -- free() alone orphans them */
     free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);
