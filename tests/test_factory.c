@@ -7919,7 +7919,6 @@ int test_factory_nway_backward_compat(void) {
     secp256k1_keypair kps_legacy[8], kps_nway[8];
     factory_t *f_legacy = calloc(1, sizeof(factory_t));
     factory_t *f_nway = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_nway);
     TEST_ASSERT(f_legacy && f_nway, "alloc");
 
     /* Legacy: factory_set_arity(FACTORY_ARITY_2) — uniform arity-2 */
@@ -8251,7 +8250,6 @@ int test_factory_static_near_root_backward_compat(void) {
     secp256k1_keypair kps_a[12], kps_b[12];
     factory_t *f_a = calloc(1, sizeof(factory_t));
     factory_t *f_b = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_b);
     TEST_ASSERT(f_a && f_b, "alloc");
 
     uint8_t arities[2] = {2, 4};

@@ -1408,7 +1408,6 @@ static int run_k2_ps_subfactory_force_close(regtest_t *rt,
     const size_t N = 5;  /* 1 LSP + 4 clients */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -1665,7 +1664,6 @@ int test_regtest_k2_ps_subfactory_per_client_sweep(void) {
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
     secp256k1_pubkey pks[5];
     for (size_t i = 0; i < N; i++) {

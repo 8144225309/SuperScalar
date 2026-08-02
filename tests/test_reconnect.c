@@ -2584,7 +2584,6 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2654,7 +2653,6 @@ int test_reconnect_commitment_mismatch_reject(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2729,7 +2727,6 @@ int test_reconnect_htlc_replay(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
