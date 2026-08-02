@@ -54,6 +54,9 @@ int ladder_create_factory(ladder_t *lad,
 
     /* Initialize factory */
     if (!factory_init(&lf->factory, lad->ctx, all_keypairs, n_participants, 1, 4)) {
+        /* factory_init memsets then allocates, so a mid-way failure can leave
+           some pointers live.  factory_free is NULL-safe. */
+        factory_free(&lf->factory);
         tx_buf_free(&lf->distribution_tx);
         return 0;
     }
@@ -68,6 +71,11 @@ int ladder_create_factory(ladder_t *lad,
 
     /* Build tree and sign */
     if (!factory_build_tree(&lf->factory)) {
+        /* factory_init succeeded, so the factory owns nine heap arrays; the
+           slot is abandoned WITHOUT n_factories++, so ladder_free will never
+           see it.  Releasing only the tx_buf here leaked ~303KB per failed
+           create. */
+        factory_free(&lf->factory);
         tx_buf_free(&lf->distribution_tx);
         return 0;
     }
@@ -77,6 +85,7 @@ int ladder_create_factory(ladder_t *lad,
         dw_counter_advance(&lf->factory.counter);
 
     if (!factory_sign_all_with_retry(&lf->factory, SS_NONCE_RETRY_MAX)) {
+        factory_free(&lf->factory);      /* same as the build_tree path above */
         tx_buf_free(&lf->distribution_tx);
         return 0;
     }
