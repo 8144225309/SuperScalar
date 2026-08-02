@@ -48,6 +48,16 @@ static const char *test_filter = NULL;  /* if non-NULL, only run tests whose
             printf(" OK\n"); \
         } else { \
             tests_failed++; \
+            /* Say WHICH test failed.  This branch used to only bump the
+               counter and print nothing, so the summary reported
+               "1 FAILED" without ever naming it -- a failing test was
+               visible only as the ABSENCE of " OK" after its name, and
+               tests print their own output in between, so in a 6600-line
+               CI log it is effectively unfindable.  Print an unambiguous
+               marker on its own line and flush, so it survives truncation
+               and interleaving. */ \
+            printf("\n  *** FAILED: %s\n", #fn); \
+            fflush(stdout); \
         } \
     } \
 } while(0)
@@ -1683,6 +1693,7 @@ extern int test_arity2_leaf_advance(void);
 /* Production Hardening tests */
 extern int test_distribution_tx_has_anchor(void);
 extern int test_ceremony_retry_excludes_timeout(void);
+extern int test_ceremony_select_high_fds(void);
 extern int test_funding_reserve_check(void);
 
 /* SF-CRASH-INJECT-WIRE #245 Half B: crash injection wire opcodes + runtime target. */
@@ -1986,6 +1997,7 @@ extern int test_readiness_urgency_levels(void);
 extern int test_readiness_get_missing(void);
 extern int test_readiness_reset(void);
 extern int test_readiness_beyond_64(void);
+extern int test_readiness_beyond_max_signers(void);
 
 /* Async Signing: Rotation Readiness (lsp_check_rotation_readiness) */
 extern int test_rotation_readiness_null(void);
@@ -3579,6 +3591,7 @@ static void run_unit_tests(void) {
     printf("\n=== Production Hardening ===\n");
     RUN_TEST(test_distribution_tx_has_anchor);
     RUN_TEST(test_ceremony_retry_excludes_timeout);
+    RUN_TEST(test_ceremony_select_high_fds);
     RUN_TEST(test_funding_reserve_check);
 
     printf("\n=== Crash Injection (#245 Half B) ===\n");
@@ -3904,6 +3917,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_readiness_get_missing);
     RUN_TEST(test_readiness_reset);
     RUN_TEST(test_readiness_beyond_64);
+    RUN_TEST(test_readiness_beyond_max_signers);
 
     printf("\n=== Async Signing: Rotation Readiness ===\n");
     RUN_TEST(test_rotation_readiness_null);

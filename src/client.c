@@ -632,8 +632,15 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     uint32_t close_height = (ht && cJSON_IsNumber(ht))
                             ? (uint32_t)ht->valuedouble : current_height;
 
+    /* A cooperative close has one output per client plus the LSP, so this
+       bound IS the factory size limit for closing.  It was FACTORY_MAX_SIGNERS
+       (256), which meant a 512-client factory could be created and funded but
+       never cooperatively closed -- the client would refuse the CLOSE_PROPOSE
+       as malformed.  close_outputs below is already calloc'd to n_outputs, so
+       this is purely a sanity ceiling on peer-supplied input, not a capacity
+       limit; use the same hard ceiling as every other peer-supplied count. */
     size_t n_outputs = (size_t)cJSON_GetArraySize(outputs_arr);
-    if (n_outputs == 0 || n_outputs > FACTORY_MAX_SIGNERS) {
+    if (n_outputs == 0 || n_outputs > (size_t)SS_MAX_PARTICIPANTS + 1) {
         fprintf(stderr, "Client: bad output count %zu\n", n_outputs);
         if (!initial_msg) cJSON_Delete(msg.json);
         return 0;
@@ -1037,12 +1044,14 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     int rot_econ = (rem_item && cJSON_IsNumber(rem_item)) ? (int)rem_item->valuedouble : 0;
 
     /* Parse participant profiles (optional) */
-    participant_profile_t rot_profiles[FACTORY_MAX_SIGNERS];
+    /* Sized to n_participants (a parameter of this function) rather than a
+       compile-time 256 -- see the matching note in client_run_with_channels. */
+    participant_profile_t rot_profiles[n_participants ? n_participants : 1];
     memset(rot_profiles, 0, sizeof(rot_profiles));
     cJSON *rprof_arr = cJSON_GetObjectItem(pj, "profiles");
     if (rprof_arr && cJSON_IsArray(rprof_arr)) {
         int n_prof = cJSON_GetArraySize(rprof_arr);
-        for (int rpi = 0; rpi < n_prof && rpi < FACTORY_MAX_SIGNERS; rpi++) {
+        for (int rpi = 0; rpi < n_prof && (size_t)rpi < n_participants; rpi++) {
             cJSON *rpe = cJSON_GetArrayItem(rprof_arr, rpi);
             if (!rpe) continue;
             cJSON *rv;
@@ -1060,12 +1069,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
 
     /* Parse per-client distribution amounts (optional, for rotation) */
-    uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
+    uint64_t rot_dist_amounts[n_participants ? n_participants : 1];
     size_t rot_n_dist_amounts = 0;
     cJSON *rda_arr = cJSON_GetObjectItem(pj, "dist_amounts");
     if (rda_arr && cJSON_IsArray(rda_arr)) {
         int rda_n = cJSON_GetArraySize(rda_arr);
-        for (int rdi = 0; rdi < rda_n && rdi < FACTORY_MAX_SIGNERS; rdi++) {
+        for (int rdi = 0; rdi < rda_n && (size_t)rdi < n_participants; rdi++) {
             cJSON *rda = cJSON_GetArrayItem(rda_arr, rdi);
             if (rda && cJSON_IsNumber(rda))
                 rot_dist_amounts[rot_n_dist_amounts++] = (uint64_t)rda->valuedouble;
@@ -1094,7 +1103,19 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_out->fee_per_tx = fee_per_tx;
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
-    memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
+    /* Bound by the DESTINATION allocation, not by sizeof(source).
+       factory_out->profiles used to be a fixed participant_profile_t
+       [FACTORY_MAX_SIGNERS] inside factory_t, so copying sizeof(rot_profiles)
+       matched exactly.  It is now heap, calloc'd to config.max_signers, which
+       factory_config_default_for() sets to the actual participant count -- so
+       for any factory smaller than FACTORY_MAX_SIGNERS this was writing past
+       the end of the allocation (at N=127: 129 profiles, ~3KB of heap). */
+    {
+        size_t np = factory_out->config.max_signers;
+        if (np > n_participants) np = n_participants;
+        memcpy(factory_out->profiles, rot_profiles,
+               np * sizeof(participant_profile_t));
+    }
     if (rot_n_level_arity > 0)
         factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
     else if (rot_leaf_arity == 1)
@@ -1215,9 +1236,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     {
         int dist_slot = factory_find_signer_slot(factory_out, 0, my_index);
         if (dist_slot >= 0 && factory_out->cltv_timeout > 0) {
-            tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+            /* N+1: one output per client plus the LSP.  Fixed at 257 this
+               could not express the payout set of a factory past 256. */
+            tx_output_t dist_outputs[(size_t)factory_out->n_participants + 1];
             size_t n_dist = factory_compute_distribution_outputs_balanced(
-                factory_out, dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+                factory_out, dist_outputs,
+                (size_t)factory_out->n_participants + 1, 500,
                 rot_n_dist_amounts > 0 ? rot_dist_amounts : NULL,
                 rot_n_dist_amounts);
             if (n_dist > 0 &&
@@ -1263,7 +1287,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     {
         cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
-        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        /* Real dimensions, not the compile-time product.  512*256 =
+           131072 entries is at once a large over-allocation for a small
+           factory AND too small for a big one: at N=512 the tree can
+           carry ~2046 nodes x 513 signers, roughly 8x this bound. */
+        size_t cap = (size_t)factory_out->n_nodes *
+                     ((size_t)factory_out->n_participants + 1);
         wire_bundle_entry_t *all_entries = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!all_entries) {
             cJSON_Delete(msg.json); free(secnonces); free(nonce_entries); return 0;
@@ -1701,7 +1730,12 @@ static int client_factory_creation_stateless_signing(
         if (wire_json_get_hex(lr.json, "lsp_dist_pubnonce", lsp_dist_pn, 66) == 66) {
             unsigned char *all_dist_pn = calloc((size_t)factory->n_participants, 66);
             unsigned char *amt_le = calloc((size_t)factory->n_participants, 8);
-            uint64_t dist_amounts[FACTORY_MAX_SIGNERS];
+            /* VLA sized to the real participant count, matching its two
+               calloc'd siblings above.  As a fixed [FACTORY_MAX_SIGNERS] it
+               could not hold the amounts for a factory past 256, and the
+               n_amt bound below would reject the message outright. */
+            uint64_t dist_amounts[factory->n_participants ?
+                                  (size_t)factory->n_participants : 1];
             int ok = (all_dist_pn && amt_le);
             size_t n_amt = 0;
             uint32_t dist_nlock = 0;
@@ -1751,9 +1785,9 @@ static int client_factory_creation_stateless_signing(
             /* Rebuild the IDENTICAL unsigned dist TX from the LSP-sent amounts,
                then co-sign over our own computed sighash. */
             if (ok) {
-                tx_output_t douts[FACTORY_MAX_SIGNERS + 1];
+                tx_output_t douts[(size_t)factory->n_participants + 1];
                 size_t nd = factory_compute_distribution_outputs_balanced(
-                    factory, douts, FACTORY_MAX_SIGNERS + 1, 500,
+                    factory, douts, (size_t)factory->n_participants + 1, 500,
                     (n_amt > 0) ? dist_amounts : NULL, n_amt);
                 if (nd > 0 && dist_nlock > 0 &&
                     factory_build_distribution_tx_unsigned(factory, douts, nd,
@@ -1969,20 +2003,55 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     uint32_t my_index = (uint32_t)pi_item->valuedouble;
     size_t n_participants = (size_t)cJSON_GetArraySize(all_pk_arr);
-    if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
-        fprintf(stderr, "Client: bad participant count %zu\n", n_participants);
+    /* Validate against the ABSOLUTE ceiling, not a buffer size.  This is the
+       check that refused every factory above 256 participants: the LSP would
+       build a 300-client factory, every client rejected the HELLO_ACK with
+       "bad participant count" and hung up, and the LSP then reported
+       "send FACTORY_PROPOSE to client 0 failed" -- which reads like a wire bug
+       and is not.  n_participants is PEER-SUPPLIED, so it is bounded by
+       SS_MAX_PARTICIPANTS and then used to size a HEAP (never stack)
+       allocation -- a wire-sized VLA here would be a remote stack-clash. */
+    if (n_participants < 2 || n_participants > SS_MAX_PARTICIPANTS) {
+        fprintf(stderr, "Client: bad participant count %zu (max %d)\n",
+                n_participants, SS_MAX_PARTICIPANTS);
         cJSON_Delete(msg.json);
         wire_close(fd);
         return 0;
     }
 
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    /* Scale patience with the factory size we just agreed to join.
+       The LSP fans ceremony messages out SERIALLY, so the k-th client waits for
+       the k-1 sends ahead of it; with a flat 120s timeout the tail of a large
+       factory always times out first, drops, and its EPIPE aborts the whole
+       ceremony for everyone. Observed exactly that at N=300: the broadcast died
+       at client 113, then 227 once serialization was fixed -- the index moved
+       with throughput, which is the signature of a deadline, not a bound.
+       n_participants is peer-supplied but already bounded by
+       SS_MAX_PARTICIPANTS above, so the worst case is a bounded wait, and a
+       client that waits too long is merely slow -- one that gives up too early
+       breaks the factory for all N. */
+    {
+        int scaled = WIRE_DEFAULT_TIMEOUT_SEC + (int)n_participants;
+        wire_set_timeout(fd, scaled);
+    }
+
+    secp256k1_pubkey *all_pubkeys =
+        (secp256k1_pubkey *)calloc(n_participants, sizeof(secp256k1_pubkey));
+    if (!all_pubkeys) {
+        fprintf(stderr, "Client: out of memory for %zu participant keys\n",
+                n_participants);
+        cJSON_Delete(msg.json);
+        wire_close(fd);
+        free(all_pubkeys);
+        return 0;
+    }
     for (size_t i = 0; i < n_participants; i++) {
         cJSON *pk_hex = cJSON_GetArrayItem(all_pk_arr, (int)i);
         if (!pk_hex || !cJSON_IsString(pk_hex)) {
             fprintf(stderr, "Client: bad pubkey entry %zu\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
         unsigned char pk_buf[33];
@@ -1991,6 +2060,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client: invalid pubkey %zu\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     }
@@ -2003,6 +2073,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: participant_index %u out of range (%zu)\n",
                 my_index, n_participants);
         wire_close(fd);
+        free(all_pubkeys);
         return 0;
     }
     {
@@ -2017,6 +2088,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client: REFUSING — pubkey at index %u does not "
                     "match our key (identity mismatch)\n", my_index);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     }
@@ -2027,6 +2099,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: expected FACTORY_PROPOSE\n");
         if (msg.json) cJSON_Delete(msg.json);
         wire_close(fd);
+        free(all_pubkeys);
         return 0;
     }
 
@@ -2044,6 +2117,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client: malformed FACTORY_PROPOSE\n");
             cJSON_Delete(msg.json);
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     }
@@ -2060,6 +2134,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (!fv_item || !fa_item || !sb_item || !spl_item || !ct_item || !fpt_item) {
         fprintf(stderr, "Client: FACTORY_PROPOSE missing required fields\n");
         cJSON_Delete(msg.json);
+        free(all_pubkeys);
         return 0;
     }
     uint32_t funding_vout = (uint32_t)fv_item->valuedouble;
@@ -2110,12 +2185,17 @@ int client_run_with_channels(secp256k1_context *ctx,
     int economic_mode = (em_item && cJSON_IsNumber(em_item)) ? (int)em_item->valuedouble : 0;
 
     /* Parse participant profiles (optional) */
-    participant_profile_t profiles[FACTORY_MAX_SIGNERS];
+    /* Sized to the actual participant count, not a compile-time 256.  As a
+       fixed array this silently DROPPED every participant at index >= 256:
+       the loop clamped rather than overflowed, so an N=300 factory simply
+       lost profiles 256..299 with no error.  A VLA keeps sizeof() correct at
+       runtime and needs no free on the many return paths below. */
+    participant_profile_t profiles[n_participants ? n_participants : 1];
     memset(profiles, 0, sizeof(profiles));
     cJSON *prof_arr = cJSON_GetObjectItem(msg.json, "profiles");
     if (prof_arr && cJSON_IsArray(prof_arr)) {
         int n_prof = cJSON_GetArraySize(prof_arr);
-        for (int pi = 0; pi < n_prof && pi < FACTORY_MAX_SIGNERS; pi++) {
+        for (int pi = 0; pi < n_prof && (size_t)pi < n_participants; pi++) {
             cJSON *pe = cJSON_GetArrayItem(prof_arr, pi);
             if (!pe) continue;
             cJSON *v;
@@ -2132,13 +2212,19 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
     /* Parse per-client distribution amounts (optional, for rotation) */
-    uint64_t init_dist_amounts[FACTORY_MAX_SIGNERS];
+    /* Sized to the participant count -- see the note on profiles above.  This
+       one had teeth: dist_amounts feeds the distribution TX the client
+       REBUILDS and checks its own payout against, so dropping entries >= 256
+       made every such client compute a mismatched dist TX and fall back to
+       "no signed dist TX".  At N=300 that silently disabled dist-TX
+       co-signing rather than reporting anything. */
+    uint64_t init_dist_amounts[n_participants ? n_participants : 1];
     size_t init_n_dist_amounts = 0;
     {
         cJSON *ida_arr = cJSON_GetObjectItem(msg.json, "dist_amounts");
         if (ida_arr && cJSON_IsArray(ida_arr)) {
             int ida_n = cJSON_GetArraySize(ida_arr);
-            for (int idi = 0; idi < ida_n && idi < FACTORY_MAX_SIGNERS; idi++) {
+            for (int idi = 0; idi < ida_n && (size_t)idi < n_participants; idi++) {
                 cJSON *ida = cJSON_GetArrayItem(ida_arr, idi);
                 if (ida && cJSON_IsNumber(ida))
                     init_dist_amounts[init_n_dist_amounts++] = (uint64_t)ida->valuedouble;
@@ -2199,6 +2285,7 @@ int client_run_with_channels(secp256k1_context *ctx,
                     (unsigned long long)funding_amount);
             client_send_error(fd, "funding_tx_verification_failed");
             wire_close(fd);
+            free(all_pubkeys);
             return 0;
         }
     } else {
@@ -2223,12 +2310,22 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
+    free(all_pubkeys);   /* copied into the factory above */
     factory->cltv_timeout = cltv_timeout;
     factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory->fee_per_tx = fee_per_tx;
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
-    memcpy(factory->profiles, profiles, sizeof(profiles));
+    /* Bound by the SMALLER of source and destination.  Both are now sized to
+       the participant count (profiles[] is a VLA of n_participants;
+       factory->profiles is calloc'd to config.max_signers), so these should
+       agree -- but they are set on different paths, and this copy is exactly
+       where a mismatch turns into heap corruption. */
+    {
+        size_t np = factory->config.max_signers;
+        if (np > n_participants) np = n_participants;
+        memcpy(factory->profiles, profiles, np * sizeof(participant_profile_t));
+    }
     /* SF-followup #145: register active factory so MSG_FUNDING_REORG handler
        can reset sub-factory chain state.  Cleared at all factory_free paths
        below. */
@@ -2244,7 +2341,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         printf("Client %u: factory terms — economic_mode=%s",
                my_index, econ_str);
         uint16_t my_bps = 0;
-        if (my_index >= 1 && my_index < FACTORY_MAX_SIGNERS)
+        if (my_index >= 1 && my_index < n_participants)
             my_bps = profiles[my_index].profit_share_bps;
         if (economic_mode == 1)
             printf(", my profit_share=%u bps (%.2f%%)", my_bps, my_bps / 100.0);
@@ -2256,6 +2353,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client %u: REFUSING — profit_share %u bps < "
                     "minimum %u bps (use --min-profit-bps to adjust)\n",
                     my_index, my_bps, g_min_profit_bps);
+            factory_free(factory);   /* nine heap arrays; free() alone orphans them */
             free(factory);
             client_send_error(fd, "profit_share_too_low");
             wire_close(fd);
@@ -2460,9 +2558,10 @@ int client_run_with_channels(secp256k1_context *ctx,
     {
         int dist_slot = factory_find_signer_slot(factory, 0, my_index);
         if (dist_slot >= 0 && factory->cltv_timeout > 0) {
-            tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+            tx_output_t dist_outputs[(size_t)factory->n_participants + 1];
             size_t n_dist = factory_compute_distribution_outputs_balanced(
-                factory, dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+                factory, dist_outputs,
+                (size_t)factory->n_participants + 1, 500,
                 init_n_dist_amounts > 0 ? init_dist_amounts : NULL,
                 init_n_dist_amounts);
             if (n_dist > 0 &&
@@ -2518,7 +2617,12 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     {
         cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
-        size_t cap = (size_t)FACTORY_MAX_NODES * FACTORY_MAX_SIGNERS;
+        /* Real dimensions, not the compile-time product.  512*256 =
+           131072 entries is at once a large over-allocation for a small
+           factory AND too small for a big one: at N=512 the tree can
+           carry ~2046 nodes x 513 signers, roughly 8x this bound. */
+        size_t cap = (size_t)factory->n_nodes *
+                     ((size_t)factory->n_participants + 1);
         wire_bundle_entry_t *all_entries = calloc(cap, sizeof(wire_bundle_entry_t));
         if (!all_entries) {
             cJSON_Delete(msg.json);
@@ -3069,13 +3173,19 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
         return 0;
     }
 
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
+    /* Sized to THIS node's signer set, not a compile-time 256.  Two wins:
+       the pair stops costing ~34KB of stack on every call for a node that
+       usually has 2 signers, and passing the real count as the parse capacity
+       means an over-long nonce list is REJECTED rather than truncated. */
+    size_t poison_cap = factory->nodes[node_idx].n_signers;
+    if (poison_cap == 0) poison_cap = 1;
+    unsigned char all_pubnonces[poison_cap][66];
+    unsigned char all_poison_pubnonces[poison_cap][66];
     size_t n_signers;
     int an_parse_rc = wire_parse_leaf_realloc_all_nonces(
         all_msg.json, all_pubnonces,
         realloc_poison_prepared ? all_poison_pubnonces : NULL,
-        FACTORY_MAX_SIGNERS, &n_signers);
+        poison_cap, &n_signers);
     cJSON_Delete(all_msg.json);
     if (an_parse_rc == 0) {
         fprintf(stderr, "Client %u: realloc parse all_nonces failed\n", my_index);
@@ -3369,7 +3479,11 @@ static int client_handle_subfactory_advance_stateless_multi(
         free(my_secnonces);
         return 0;
     }
-    unsigned char all_poison_pn_sub[FACTORY_MAX_SIGNERS][66];
+    /* Sized to the sub-factory node's own signer set — see the note in
+       client_handle_leaf_realloc. */
+    size_t poison_cap = factory->nodes[sub_node_i].n_signers;
+    if (poison_cap == 0) poison_cap = 1;
+    unsigned char all_poison_pn_sub[poison_cap][66];
     unsigned char lsp_poison_psig_ser[32];
     uint32_t got_all_len = 0, got_poison_len = 0;
     memset(all_poison_pn_sub, 0, sizeof(all_poison_pn_sub));
@@ -3863,8 +3977,13 @@ static int client_handle_subfactory_advance_stateless(int fd,
         return 0;
     }
     unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
-    unsigned char all_pn_sub[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pn_sub[FACTORY_MAX_SIGNERS][66];
+    /* Sized to the sub-factory node's own signer set — see the note in
+       client_handle_leaf_realloc.  sizeof() on these VLAs is evaluated at
+       runtime, so the capacity passed to the parser below stays correct. */
+    size_t poison_cap = factory->nodes[sub_node_i].n_signers;
+    if (poison_cap == 0) poison_cap = 1;
+    unsigned char all_pn_sub[poison_cap][66];
+    unsigned char all_poison_pn_sub[poison_cap][66];
     unsigned char lsp_poison_psig_ser[32];
     uint32_t got_all_pn_len = 0, got_poison_len = 0;
     memset(all_poison_pn_sub, 0, sizeof(all_poison_pn_sub));

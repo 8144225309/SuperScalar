@@ -12,6 +12,10 @@
 #include <secp256k1_extrakeys.h>
 
 #define FACTORY_MAX_NODES   512
+/* Initial nodes[] capacity; factory_grow_nodes() doubles from here up to
+   config.max_nodes.  Small on purpose: the point of growing on demand is that a
+   factory costs what its own tree costs, not what the worst-case config would. */
+#define FACTORY_NODES_INITIAL 32
 /* FACTORY_MAX_OUTPUTS: max outputs per tree node. Sized for arity-15 leaves
  * (15 client channels + 1 L-stock = 16 outputs) under the upcoming N-way
  * mixed-arity work (Phase 2 of mixed-arity implementation plan). Internal
@@ -30,6 +34,29 @@
  * deployment is RAM-bound, and shrinking factory_t (dynamic leaf_layers) is a
  * worthwhile follow-up. */
 #define FACTORY_MAX_SIGNERS 256
+
+/* Absolute ceiling on participants in ONE factory, for validating counts that
+   arrive over the wire.
+ *
+ * FACTORY_MAX_SIGNERS is a DEFAULT (what factory_config_fit starts from and
+ * grows past); this is a HARD sanity bound.  The distinction matters because a
+ * client sizes buffers from the participant count in the LSP's HELLO_ACK, which
+ * is peer-supplied: without a ceiling a malicious LSP could name a huge count
+ * and make the client allocate arbitrarily.  Validate wire-supplied counts
+ * against THIS, never against a buffer size, and never let a wire value size a
+ * stack allocation.
+ *
+ * 4096 is far above any realistic factory (the DW tree and the close TX both
+ * become impractical long before it) while keeping the worst-case client
+ * allocation bounded and small. */
+#define SS_MAX_PARTICIPANTS 4096
+
+/* Hard ceiling on a peer-supplied NODE index, the tree-shaped counterpart to
+   SS_MAX_PARTICIPANTS.  The DW tree carries roughly 4N nodes (a kickoff and a
+   state node per level), so this bounds the shape SS_MAX_PARTICIPANTS implies
+   with headroom.  Like SS_MAX_PARTICIPANTS this is a validation ceiling for
+   untrusted input, NOT an allocation size -- f->nodes grows on demand. */
+#define SS_MAX_NODE_INDEX (4 * SS_MAX_PARTICIPANTS + 64)
 /* FACTORY_MAX_LEAVES: one channel (leaf) per client, so this bounds the client
  * count.  Raised 128 -> 256 to support up to 255-client factories.  Cost:
  * leaf_layers[FACTORY_MAX_LEAVES] is embedded in factory_t, so this enlarges
@@ -277,7 +304,7 @@ typedef struct {
        Length equals ps_n_prev_outputs (= n_inputs).  Only used by
        advanced PS sub-factory nodes per #207. */
     musig_signing_session_t *input_signing_sessions;        /* length n_input_sessions */
-    secp256k1_musig_partial_sig *input_partial_sigs;        /* length n_input_sessions * FACTORY_MAX_SIGNERS */
+    secp256k1_musig_partial_sig *input_partial_sigs;        /* length n_input_sessions * input_signers_stride */
     int input_partial_sigs_received[FACTORY_MAX_OUTPUTS];   /* per-input count */
     size_t n_input_sessions;
 
@@ -288,7 +315,23 @@ typedef struct {
        for input k.  These arrays are allocated by ensure_input_sessions_alloc
        alongside input_signing_sessions and parallel-indexed by input_idx. */
     musig_keyagg_t   *input_keyaggs;          /* length n_input_sessions */
-    uint32_t          input_signer_indices[FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS];
+
+    /* Per-input signer sets.  WAS a fixed
+       [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS] = 16 x 256 x 4 = 16 KB carried
+       by EVERY node, whether or not that node had any input sessions at all --
+       and only multi-input PS sub-factory chain-advance nodes ever use it.
+       Since nodes[] is sized to the participant count, that made this single
+       field the dominant per-client cost: at N=224 it was 960 nodes x 16 KB =
+       15.7 MB, essentially the entire measured 15.9 MB client footprint, and it
+       is what made a co-located swarm scale as O(N^2).
+       Now allocated only for nodes that actually have input sessions, sized to
+       that node's own signer count, in ensure_input_sessions_alloc next to the
+       siblings above (which were already dynamic -- this one was simply never
+       converted with them).
+       Index it via factory_node_input_signers(node, input_idx)[j]; never with
+       [i][j], and never sizeof() it -- it is a pointer now. */
+    uint32_t         *input_signer_indices;   /* n_input_sessions * input_signers_stride */
+    size_t            input_signers_stride;   /* = n_signers at alloc time */
     size_t            input_n_signers[FACTORY_MAX_OUTPUTS];
     unsigned char     input_merkle_root[FACTORY_MAX_OUTPUTS][32];
     int               input_has_merkle_root[FACTORY_MAX_OUTPUTS];
@@ -320,6 +363,21 @@ typedef struct {
     int is_static_only;
 } factory_node_t;
 
+/* Signer set for one input of a multi-input chain advance.
+   Returns NULL when the node has no input sessions allocated (the common case --
+   only PS sub-factory chain-advance nodes do), so callers must NULL-check.
+   Valid entries are [0, node->input_n_signers[input_idx]). */
+static inline uint32_t *factory_node_input_signers(factory_node_t *node,
+                                                     size_t input_idx) {
+    if (!node || !node->input_signer_indices) return NULL;
+    return node->input_signer_indices + input_idx * node->input_signers_stride;
+}
+static inline const uint32_t *factory_node_input_signers_const(
+        const factory_node_t *node, size_t input_idx) {
+    if (!node || !node->input_signer_indices) return NULL;
+    return node->input_signer_indices + input_idx * node->input_signers_stride;
+}
+
 typedef struct {
     secp256k1_context *ctx;
 
@@ -338,6 +396,17 @@ typedef struct {
                                 (a 255-client PS factory needs ~1018 nodes) without
                                 bloating every factory_t. */
     size_t n_nodes;
+    /* Entries currently ALLOCATED in nodes[] / node_l_stock_hashes[] /
+       node_l_stock_hash_valid[] -- the three are parallel and grow together.
+       add_node() grows them geometrically and config.max_nodes is the hard cap.
+       Previously all three were allocated at config.max_nodes up front, which
+       factory_config_fit sets to 4N+64.  That is NOT an over-estimate in
+       general -- PS-uniform and ARITY_1 really do build 3.98 nodes per
+       participant, so the constant cannot simply be lowered -- but the common
+       PS + level-arity configuration plateaus around 150 nodes, so at N=1024 it
+       reserved ~31 MB of factory_node_t per client to use ~1 MB.  Growing on
+       demand sizes each factory to the tree its own config actually builds. */
+    size_t nodes_cap;
 
     /* Funding UTXO */
     unsigned char funding_txid[32];  /* internal byte order */
@@ -733,6 +802,12 @@ void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
                          const unsigned char *spk, size_t spk_len);
+
+/* Grow nodes[] and its two parallel node-indexed arrays to hold `want` entries.
+   1 on success, 0 on OOM or when `want` exceeds config.max_nodes.
+   INVALIDATES any factory_node_t* the caller is holding -- index via
+   f->nodes[i] across calls that may add nodes. */
+int factory_grow_nodes(factory_t *f, size_t want);
 
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);

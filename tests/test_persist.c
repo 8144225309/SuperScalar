@@ -1076,7 +1076,6 @@ int test_persist_factory_round_trip(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->use_tree_anchor = 1;  /* #56: mirror production — persist_load_factory rebuilds
@@ -1492,7 +1491,6 @@ int test_lsp_recovery_round_trip(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;  /* Client 3 */
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
@@ -1940,6 +1938,7 @@ int test_persist_validate_factory_load(void) {
     loaded = persist_load_factory(&db, 13, f, ctx);
     TEST_ASSERT(loaded == 0, "step_blocks=0 rejected");
 
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
@@ -2009,7 +2008,6 @@ int test_persist_crash_stress(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
@@ -2491,7 +2489,6 @@ int test_persist_crash_dw_state(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], s4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
 
@@ -2637,6 +2634,7 @@ int test_persist_crash_dw_state(void) {
         persist_close(&db);
     }
 
+    factory_free(f);   /* heap arrays -- free() alone orphans them */
     free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);

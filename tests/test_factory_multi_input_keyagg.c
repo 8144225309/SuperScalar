@@ -125,7 +125,6 @@ int test_factory_multi_input_keyagg(void)
     memset(fake_txid, 0xBE, 32);
 
     factory_t *f = (factory_t *)calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -172,16 +171,16 @@ int test_factory_multi_input_keyagg(void)
                             "channel n_signers = 2-of-2");
             /* Slot 0 = client_i (signer_indices[i+1]); slot 1 = LSP. */
             TEST_ASSERT_EQ(
-                (long)sub->input_signer_indices[i][0],
+                (long)factory_node_input_signers(sub, i)[0],
                 (long)sub->signer_indices[i + 1],
                 "channel slot 0 = client_i");
-            TEST_ASSERT_EQ((long)sub->input_signer_indices[i][1], 0,
+            TEST_ASSERT_EQ((long)factory_node_input_signers(sub, i)[1], 0,
                             "channel slot 1 = LSP");
         }
 
         size_t this_n = sub->input_n_signers[i];
         for (size_t s = 0; s < this_n; s++) {
-            uint32_t participant = sub->input_signer_indices[i][s];
+            uint32_t participant = factory_node_input_signers(sub, i)[s];
             unsigned char seckey[32];
             secp256k1_pubkey pk;
             TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[participant]),
@@ -207,7 +206,7 @@ int test_factory_multi_input_keyagg(void)
     for (size_t i = 0; i < n_inp; i++) {
         size_t this_n = sub->input_n_signers[i];
         for (size_t s = 0; s < this_n; s++) {
-            uint32_t participant = sub->input_signer_indices[i][s];
+            uint32_t participant = factory_node_input_signers(sub, i)[s];
             secp256k1_musig_partial_sig psig;
             TEST_ASSERT(musig_create_partial_sig(
                             ctx, &psig, &secnonces[i][s], &kps[participant],

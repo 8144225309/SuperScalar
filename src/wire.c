@@ -338,6 +338,22 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
     uint32_t payload_len = (uint32_t)strlen(payload);
     uint32_t pt_len = 1 + payload_len;  /* type byte + JSON */
 
+    /* Refuse oversize frames HERE, where we know the message type and can say
+       so.  Only the receiver checked WIRE_MAX_FRAME_SIZE (see wire_recv), so an
+       over-limit send previously went out and the peer rejected it as an opaque
+       recv failure -- the sender, which has all the context, said nothing.
+       This is not hypothetical: the creation LSP_RESPONSE carries the full
+       n_nodes x n_participants nonce matrix, and the tree gains a level past
+       512 clients, so at N=1024 it is ~158 MB against a 16 MB limit. */
+    if (pt_len > WIRE_MAX_FRAME_SIZE - 16) {
+        fprintf(stderr,
+                "wire_send: msg 0x%02x is %u bytes, over the %d-byte frame limit "
+                "— refusing to send (peer would reject it as a malformed frame)\n",
+                msg_type, pt_len, WIRE_MAX_FRAME_SIZE);
+        free(payload);
+        return 0;
+    }
+
     noise_state_t *ns = wire_get_encryption(fd);
     if (ns) {
         /* Encrypt: plaintext = [type][JSON] */
@@ -404,6 +420,101 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
     if (ok && g_wire_log_cb)
         g_wire_log_cb(0, msg_type, json, wire_get_peer_label(fd), g_wire_log_ud);
     return ok;
+}
+
+/* Broadcast one message to many peers, serializing the JSON ONCE.
+ *
+ * wire_send() calls cJSON_PrintUnformatted() per call.  Broadcasting a large
+ * ceremony message in a loop therefore re-serializes the whole tree once per
+ * client -- at N=301 that is a 5.6 MB LSP_RESPONSE printed 300 times, ~1.6 GB
+ * of pure serialization the LSP does not need to do.  It was slow enough that
+ * clients waiting on the 120s receive timeout hung up mid-broadcast, the first
+ * EPIPE aborted the attempt, and the whole ceremony failed -- looking like a
+ * wire bug rather than an O(N^2) cost.
+ *
+ * The plaintext is identical for every peer; only the AEAD layer differs
+ * (per-connection key and nonce), so encryption still happens per fd.
+ *
+ * Returns 1 if every peer was written.  On the first failure returns 0 and, if
+ * first_fail is non-NULL, stores that peer's index -- callers report which
+ * client dropped.  Negative fds are skipped, not treated as failures. */
+int wire_send_many(const int *fds, size_t n_fds, uint8_t msg_type, cJSON *json,
+                   size_t *first_fail) {
+    if (!fds || !json) return 0;
+
+    char *payload = cJSON_PrintUnformatted(json);   /* ONCE, not per peer */
+    if (!payload) return 0;
+    uint32_t payload_len = (uint32_t)strlen(payload);
+    uint32_t pt_len = 1 + payload_len;
+
+    /* Same frame-limit refusal as wire_send -- see the note there.  Broadcast
+       is where this actually bites: the oversize message is the creation
+       LSP_RESPONSE, and failing here reports it once instead of N peers each
+       reporting a malformed frame. */
+    if (pt_len > WIRE_MAX_FRAME_SIZE - 16) {
+        fprintf(stderr,
+                "wire_send_many: msg 0x%02x is %u bytes, over the %d-byte frame "
+                "limit — refusing to broadcast to %zu peers\n",
+                msg_type, pt_len, WIRE_MAX_FRAME_SIZE, n_fds);
+        free(payload);
+        if (first_fail) *first_fail = 0;
+        return 0;
+    }
+
+    unsigned char *plaintext = (unsigned char *)malloc(pt_len);
+    if (!plaintext) { free(payload); return 0; }
+    plaintext[0] = msg_type;
+    memcpy(plaintext + 1, payload, payload_len);
+    free(payload);
+
+    unsigned char *ciphertext = (unsigned char *)malloc(pt_len);
+    if (!ciphertext) { free(plaintext); return 0; }
+
+    int all_ok = 1;
+    for (size_t i = 0; i < n_fds; i++) {
+        int fd = fds[i];
+        if (fd < 0) continue;
+
+        noise_state_t *ns = wire_get_encryption(fd);
+        if (!ns) {
+            /* Unencrypted peer: fall back to the per-peer path so the refusal
+               and framing rules stay in one place. */
+            if (!wire_send(fd, msg_type, json)) {
+                if (first_fail) *first_fail = i;
+                all_ok = 0; break;
+            }
+            continue;
+        }
+
+        unsigned char tag[16], nonce[12];
+        make_nonce(nonce, ns->send_nonce);
+        if (!aead_encrypt(ciphertext, tag, plaintext, pt_len, NULL, 0,
+                          ns->send_key, nonce)) {
+            if (first_fail) *first_fail = i;
+            all_ok = 0; break;
+        }
+
+        uint32_t frame_len = pt_len + 16;
+        unsigned char header[4];
+        header[0] = (unsigned char)(frame_len >> 24);
+        header[1] = (unsigned char)(frame_len >> 16);
+        header[2] = (unsigned char)(frame_len >> 8);
+        header[3] = (unsigned char)(frame_len);
+
+        if (!(write_all(fd, header, 4) &&
+              write_all(fd, ciphertext, pt_len) &&
+              write_all(fd, tag, 16))) {
+            if (first_fail) *first_fail = i;
+            all_ok = 0; break;
+        }
+        ns->send_nonce++;   /* only after a fully successful transmission */
+        if (g_wire_log_cb)
+            g_wire_log_cb(0, msg_type, json, wire_get_peer_label(fd), g_wire_log_ud);
+    }
+
+    free(plaintext);
+    free(ciphertext);
+    return all_ok;
 }
 
 int wire_recv(int fd, wire_msg_t *msg) {
@@ -490,9 +601,26 @@ int wire_recv(int fd, wire_msg_t *msg) {
 }
 
 int wire_recv_timeout(int fd, wire_msg_t *msg, int timeout_sec) {
+    /* Restore the socket's PREVIOUS deadline, not the compile-time default.
+       Restoring WIRE_DEFAULT_TIMEOUT_SEC silently discarded any per-connection
+       deadline a caller had set: the client scales its receive timeout with the
+       participant count (the LSP fans ceremony messages out serially, so client
+       k waits behind k-1 sends), and a single wire_recv_timeout() anywhere in
+       the flow reset it to 120s before the message that needed the longer wait
+       ever arrived. The scaled timeout was therefore never in effect -- which is
+       why raising it changed nothing at N=300 and the failure index wandered
+       (113 -> 227 -> 198) with throughput instead of moving with the setting. */
+    struct timeval prev;
+    socklen_t plen = sizeof(prev);
+    int have_prev = (getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &prev, &plen) == 0);
+
     wire_set_timeout(fd, timeout_sec);
     int ok = wire_recv(fd, msg);
-    wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
+
+    if (have_prev && (prev.tv_sec > 0 || prev.tv_usec > 0))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &prev, sizeof(prev));
+    else
+        wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
     return ok;
 }
 
@@ -3107,8 +3235,16 @@ size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
         if (!ni || !cJSON_IsNumber(ni) ||
             !sl || !cJSON_IsNumber(sl) ||
             !d || !cJSON_IsString(d)) continue;
-        if (ni->valuedouble < 0 || ni->valuedouble >= FACTORY_MAX_NODES) continue;
-        if (sl->valuedouble < 0 || sl->valuedouble >= FACTORY_MAX_SIGNERS) continue;
+        /* Sanity ceilings on peer-supplied indices, NOT capacity limits --
+           the real bound is `count < max` against the caller's array.  These
+           were FACTORY_MAX_NODES/FACTORY_MAX_SIGNERS, both of which are now
+           merely defaults, so a large factory had its bundle entries silently
+           DROPPED here (a bare `continue`, no diagnostic): at N=512 the tree
+           carries ~2046 nodes and 513 signers, so most entries vanished and
+           the ceremony failed far downstream with missing nonces.
+           SS_MAX_NODE_INDEX tracks the ~4N node count of the tree shape. */
+        if (ni->valuedouble < 0 || ni->valuedouble >= SS_MAX_NODE_INDEX) continue;
+        if (sl->valuedouble < 0 || sl->valuedouble >= SS_MAX_PARTICIPANTS) continue;
 
         entries[count].node_idx = (uint32_t)ni->valuedouble;
         entries[count].signer_slot = (uint32_t)sl->valuedouble;

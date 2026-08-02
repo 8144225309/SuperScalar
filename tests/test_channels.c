@@ -206,8 +206,6 @@ int test_lsp_channel_init(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -1831,8 +1829,6 @@ int test_fee_policy_balance_split(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -2004,8 +2000,6 @@ int test_fee_estimator_wiring(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
@@ -2074,8 +2068,6 @@ int test_fee_estimator_null_fallback(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
@@ -2563,7 +2555,6 @@ int test_regtest_lsp_restart_recovery(void) {
     /* Phase 6: Recover from SQLite */
     factory_t *rec_f = calloc(1, sizeof(factory_t));
     factory_alloc_default_arrays(rec_f);
-    factory_alloc_default_arrays(rec_f);
     if (!rec_f) return 0;
     lsp_channel_mgr_t rec_mgr;
 
@@ -2700,6 +2691,7 @@ int test_regtest_lsp_restart_recovery(void) {
         }
     }
 
+    factory_free(rec_f);   /* heap arrays: free(rec_f) alone orphans them */
     free(rec_f);
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
@@ -2722,7 +2714,6 @@ int test_profit_settlement_calculation(void) {
 
     /* Build a minimal factory with profit-shared economics */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     factory_alloc_default_arrays(f);
     if (!f) return 0;
 
@@ -2762,6 +2753,7 @@ int test_profit_settlement_calculation(void) {
 
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -2778,7 +2770,6 @@ int test_settlement_trigger_at_interval(void) {
     mgr.entries[1].channel.remote_amount = 50000;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     factory_alloc_default_arrays(f);
     if (!f) return 0;
 
@@ -2803,6 +2794,7 @@ int test_settlement_trigger_at_interval(void) {
     TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -2821,7 +2813,6 @@ int test_on_close_includes_unsettled(void) {
 
     factory_t *f = calloc(1, sizeof(factory_t));
     factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) { free(mgr.entries); return 0; }
 
     f->economic_mode = ECON_PROFIT_SHARED;
@@ -2839,6 +2830,7 @@ int test_on_close_includes_unsettled(void) {
     TEST_ASSERT_EQ(share1, 900, "client 1 unsettled share (per-channel)");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -3127,7 +3119,6 @@ int test_regtest_crash_double_recovery(void) {
     /* Recover #1 */
     factory_t *rec_f = calloc(1, sizeof(factory_t));
     factory_alloc_default_arrays(rec_f);
-    factory_alloc_default_arrays(rec_f);
     if (!rec_f) return 0;
     lsp_channel_mgr_t rec_mgr;
 
@@ -3208,7 +3199,6 @@ int test_regtest_crash_double_recovery(void) {
     /* Recover #2 */
     lsp_channel_mgr_t rec_mgr2;
     factory_t *rec_f2 = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(rec_f2);
     factory_alloc_default_arrays(rec_f2);
     if (!rec_f2) return 0;
 
@@ -3316,7 +3306,9 @@ int test_regtest_crash_double_recovery(void) {
         }
     }
 
+    factory_free(rec_f);   /* heap arrays: free(rec_f) alone orphans them */
     free(rec_f);
+    factory_free(rec_f2);   /* heap arrays: free(rec_f2) alone orphans them */
     free(rec_f2);
     secp256k1_context_destroy(ctx);
     return lsp_ok && all_children_ok;
@@ -3763,7 +3755,6 @@ int test_fee_accumulation_and_settlement(void) {
 
     factory_t *f = calloc(1, sizeof(factory_t));
     factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     f->economic_mode = ECON_PROFIT_SHARED;
@@ -3831,6 +3822,7 @@ int test_fee_accumulation_and_settlement(void) {
                    "LSP local decreased by per-channel share");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -3869,7 +3861,6 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             factory_t *f = calloc(1, sizeof(factory_t));
-            factory_alloc_default_arrays(f);
             factory_alloc_default_arrays(f);
             f->economic_mode = (economic_mode_t)configs[ci].econ;
             f->n_participants = 3;
@@ -3942,6 +3933,10 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             free(mgr.entries);
+            /* factory_free before free: the struct's nine arrays are heap now,
+               so free(f) alone orphans them -- 302,976 bytes per iteration,
+               15 iterations, 4.5 MB. */
+            factory_free(f);
             free(f);
         }
     }
@@ -4013,8 +4008,6 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Factory with step_blocks=6, states_per_layer=2, 5 participants */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     factory_init(f, ctx, kps, 5, 6, 2);
 
     uint32_t delta = lsp_compute_factory_cltv_delta(f);
@@ -4060,7 +4053,6 @@ int test_close_outputs_wallet_spk(void) {
     mgr.entries[1].channel.remote_amount = 2000;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     factory_alloc_default_arrays(f);
     if (!f) return 0;
 
@@ -4174,6 +4166,7 @@ int test_close_outputs_wallet_spk(void) {
                 "override beats lsp_close_spk: client 0 uses override");
 
     free(mgr.entries);
+    factory_free(f);   /* heap arrays: free(f) alone orphans them */
     free(f);
     return 1;
 }
@@ -4206,8 +4199,6 @@ int test_lsp_close_spk_derived(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -4478,8 +4469,6 @@ int test_client_ps_double_spend_defense_refuses(void) {
     memset(fake_fund_txid, 0x7A, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, N, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);

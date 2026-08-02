@@ -148,6 +148,40 @@ static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     return dw_current_nsequence(&f->counter.layers[node->dw_layer_index]);
 }
 
+/* Ensure nodes[] and its two parallel node-indexed arrays hold at least `want`
+   entries, growing geometrically.  Returns 1 on success, 0 on OOM or cap.
+   Callers must not hold a factory_node_t* across this -- realloc may move it.
+   New tail entries are zeroed so callers keep the calloc semantics they had. */
+int factory_grow_nodes(factory_t *f, size_t want) {
+    if (!f) return 0;
+    if (want > f->config.max_nodes) return 0;   /* hard cap unchanged */
+    if (want <= f->nodes_cap) return 1;
+
+    size_t ncap = f->nodes_cap ? f->nodes_cap * 2 : 32;
+    if (ncap < want) ncap = want;
+    if (ncap > f->config.max_nodes) ncap = f->config.max_nodes;
+
+    factory_node_t *nn = (factory_node_t *)realloc(f->nodes, ncap * sizeof(*nn));
+    if (!nn) return 0;
+    memset(nn + f->nodes_cap, 0, (ncap - f->nodes_cap) * sizeof(*nn));
+    f->nodes = nn;
+
+    unsigned char (*nh)[32] = (unsigned char (*)[32])
+        realloc(f->node_l_stock_hashes, ncap * 32);
+    if (!nh) return 0;                 /* nodes[] already grown; cap not bumped
+                                          yet, so state stays consistent */
+    memset(nh + f->nodes_cap, 0, (ncap - f->nodes_cap) * 32);
+    f->node_l_stock_hashes = nh;
+
+    int *nv = (int *)realloc(f->node_l_stock_hash_valid, ncap * sizeof(int));
+    if (!nv) return 0;
+    memset(nv + f->nodes_cap, 0, (ncap - f->nodes_cap) * sizeof(int));
+    f->node_l_stock_hash_valid = nv;
+
+    f->nodes_cap = ncap;
+    return 1;
+}
+
 /* Add a node to the factory. Returns node index or -1 on error.
    node_cltv: if > 0, build CLTV timeout taptree for this node's spending_spk. */
 static int add_node(
@@ -161,6 +195,11 @@ static int add_node(
     uint32_t node_cltv
 ) {
     if (f->n_nodes >= f->config.max_nodes) return -1;
+    /* Grow the three parallel node-indexed arrays on demand.  MUST happen before
+       any factory_node_t* is taken below, because realloc may move the block;
+       build_subtree and the other callers index through f->nodes[i] rather than
+       caching a pointer across add_node calls, which is what makes this safe. */
+    if (!factory_grow_nodes(f, f->n_nodes + 1)) return -1;
 
     int idx = (int)f->n_nodes++;
     factory_node_t *node = &f->nodes[idx];
@@ -390,7 +429,14 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
        2-leaf L-stock SPK as the LSP (else the leaf-state tx diverges + co-sign fails). */
     if (f->has_node_l_stock_hashes) {
         size_t idx = (size_t)(node - f->nodes);
-        if (idx < FACTORY_MAX_NODES && f->node_l_stock_hash_valid[idx]) {
+        /* Bound by the ALLOCATION (nodes_cap), not FACTORY_MAX_NODES.  These
+           two arrays are calloc'd to FACTORY_NODES_INITIAL and grown by
+           factory_grow_nodes, so nodes_cap -- not the compile-time 512 -- is
+           how many entries exist.  Today idx cannot exceed it (it is derived
+           from a pointer into nodes[]), so this is not currently reachable,
+           but it is the same wrong-bound shape that WAS a live out-of-bounds
+           write in factory_session_set_partial_sig_poison. */
+        if (idx < f->nodes_cap && f->node_l_stock_hash_valid[idx]) {
             memcpy(node->l_stock_hash, f->node_l_stock_hashes[idx], 32);
             node->has_l_stock_hash = 1;
         }
@@ -409,6 +455,13 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32) {
     if (!f || node_idx >= f->config.max_nodes || !h32) return;
+    /* The client mirrors per-(leaf,state) hashes off the wire, possibly for
+       nodes it has not built yet, so node_idx can run ahead of what is
+       allocated.  max_nodes is only the growth CAP now -- grow to fit before
+       writing.  The old check was sufficient purely because the arrays were
+       always allocated at max_nodes; ASan flagged this the moment they were
+       not (WRITE of size 32, 0 bytes after a 32-byte region). */
+    if (!factory_grow_nodes(f, node_idx + 1)) return;
     memcpy(f->node_l_stock_hashes[node_idx], h32, 32);
     f->node_l_stock_hash_valid[node_idx] = 1;
     f->has_node_l_stock_hashes = 1;
@@ -765,11 +818,13 @@ int factory_alloc_default_arrays(factory_t *f) {
     if (!f->leaf_node_indices)
         f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
     if (!f->nodes)
-        f->nodes = calloc(f->config.max_nodes, sizeof(factory_node_t));
+        f->nodes = calloc(FACTORY_NODES_INITIAL, sizeof(factory_node_t));
     if (!f->node_l_stock_hashes)
-        f->node_l_stock_hashes = calloc(f->config.max_nodes, 32);
+        f->node_l_stock_hashes = calloc(FACTORY_NODES_INITIAL, 32);
     if (!f->node_l_stock_hash_valid)
-        f->node_l_stock_hash_valid = calloc(f->config.max_nodes, sizeof(int));
+        f->node_l_stock_hash_valid = calloc(FACTORY_NODES_INITIAL, sizeof(int));
+    if (f->nodes && f->node_l_stock_hashes && f->node_l_stock_hash_valid)
+        f->nodes_cap = FACTORY_NODES_INITIAL;
     return f->keypairs && f->pubkeys && f->profiles && f->dist_partial_sigs &&
            f->leaf_layers && f->leaf_node_indices && f->nodes &&
            f->node_l_stock_hashes && f->node_l_stock_hash_valid;
@@ -808,13 +863,20 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
     f->leaf_layers       = calloc(f->config.max_leaves, sizeof(dw_layer_t));
     f->leaf_node_indices = calloc(f->config.max_leaves, sizeof(size_t));
     if (!f->keypairs || !f->pubkeys || !f->profiles || !f->dist_partial_sigs ||
-        !f->leaf_layers || !f->leaf_node_indices)
+        !f->leaf_layers || !f->leaf_node_indices) {
+        /* Partial allocation: release whatever DID succeed rather than
+           orphaning it.  f was memset at entry, so the failed ones are NULL
+           and factory_free is NULL-safe. */
+        factory_free(f);
         return 0;
+    }
 
     for (size_t i = 0; i < n_participants; i++) {
         f->keypairs[i] = keypairs[i];
-        if (!secp256k1_keypair_pub(ctx, &f->pubkeys[i], &keypairs[i]))
+        if (!secp256k1_keypair_pub(ctx, &f->pubkeys[i], &keypairs[i])) {
+            factory_free(f);     /* all nine arrays are live by now */
             return 0;
+        }
     }
 
     f->leaf_arity = FACTORY_ARITY_2;
@@ -836,9 +898,10 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
 
     /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
        config cap; factory_build_tree grows them if the tree needs more nodes. */
-    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
-    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
-    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
+    f->nodes                  = calloc(FACTORY_NODES_INITIAL, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(FACTORY_NODES_INITIAL, 32);
+    f->node_l_stock_hash_valid= calloc(FACTORY_NODES_INITIAL, sizeof(int));
+    f->nodes_cap              = FACTORY_NODES_INITIAL;
     return 1;
 }
 
@@ -894,9 +957,10 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 
     /* Dynamic node arrays (were inline [FACTORY_MAX_NODES]).  Allocate to the
        config cap; factory_build_tree grows them if the tree needs more nodes. */
-    f->nodes                  = calloc(f->config.max_nodes, sizeof(factory_node_t));
-    f->node_l_stock_hashes    = calloc(f->config.max_nodes, 32);
-    f->node_l_stock_hash_valid= calloc(f->config.max_nodes, sizeof(int));
+    f->nodes                  = calloc(FACTORY_NODES_INITIAL, sizeof(factory_node_t));
+    f->node_l_stock_hashes    = calloc(FACTORY_NODES_INITIAL, 32);
+    f->node_l_stock_hash_valid= calloc(FACTORY_NODES_INITIAL, sizeof(int));
+    f->nodes_cap              = FACTORY_NODES_INITIAL;
 }
 
 void factory_set_arity(factory_t *f, factory_arity_t arity) {
@@ -1060,7 +1124,6 @@ void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k) {
     /* Cap at FACTORY_MAX_OUTPUTS - 1 so the leaf's k sub-factory entry
        outputs + 1 L-stock output fit within FACTORY_MAX_OUTPUTS.  k=0
        is treated as k=1 (no sub-factories). */
-    if (!f) return;
     /* Callable BEFORE factory_init (see factory_set_level_arity). */
     factory_alloc_default_arrays(f);
     if (!f->leaf_layers) return;
@@ -1437,6 +1500,12 @@ static int setup_ps_leaf_with_subfactories(
             fprintf(stderr, "Factory: add sub-factory node %u failed\n", si);
             return 0;
         }
+        /* REFRESH: add_node above may have grown nodes[] via realloc, which can
+           move the whole block.  `leaf` was taken before the loop, so without
+           this every write through it after the first growth lands in freed
+           memory.  This is the one place in factory.c that caches a node
+           pointer across an add_node call -- the rest index f->nodes[i]. */
+        leaf = &f->nodes[leaf_node_idx];
         leaf->subfactory_node_indices[si] = sub_idx;
 
         /* Wire leaf's vout[si] → sub-factory's spending_spk. */
@@ -1914,24 +1983,19 @@ int factory_build_tree(factory_t *f) {
     int n_dw_layers = dw_n_layers_for(tree_depth, f->static_threshold_depth);
     int total_nodes_ub = 2 * (2 * n_leaves - 1);  /* kickoff+state per logical node */
 
-    /* Grow the dynamic node arrays if this tree needs more than the current cap
-       (a 255-client PS factory needs ~1018 nodes vs the 512 default). */
-    if (total_nodes_ub > (int)f->config.max_nodes) {
-        size_t nn = (size_t)total_nodes_ub, old = f->config.max_nodes;
-        factory_node_t *gn = realloc(f->nodes, nn * sizeof(factory_node_t));
-        if (!gn) return 0;
-        f->nodes = gn;
-        unsigned char (*gh)[32] = realloc(f->node_l_stock_hashes, nn * 32);
-        if (!gh) return 0;
-        f->node_l_stock_hashes = gh;
-        int *gv = realloc(f->node_l_stock_hash_valid, nn * sizeof(int));
-        if (!gv) return 0;
-        f->node_l_stock_hash_valid = gv;
-        memset(f->nodes + old, 0, (nn - old) * sizeof(factory_node_t));
-        memset(f->node_l_stock_hashes + old, 0, (nn - old) * 32);
-        memset(f->node_l_stock_hash_valid + old, 0, (nn - old) * sizeof(int));
-        f->config.max_nodes = (uint32_t)nn;
-    }
+    /* Raise the CAP if this tree could need more than the current one (a
+       255-client PS factory needs ~1018 nodes vs the 512 default).  Nothing is
+       allocated here any more: add_node grows on demand up to the cap, so a
+       tree that ends up far below this upper bound never pays for it.
+       total_nodes_ub is exactly that -- an upper bound, 2*(2*n_leaves-1) -- and
+       the measured trees come in well under it.
+       This used to realloc to total_nodes_ub and zero from old =
+       config.max_nodes.  Once the arrays stopped being allocated at max_nodes,
+       that left [nodes_cap, max_nodes) uninitialised in the middle of the
+       array, because realloc does not zero.  Raising the cap and letting
+       factory_grow_nodes do the allocating keeps one zeroing path. */
+    if (total_nodes_ub > (int)f->config.max_nodes)
+        f->config.max_nodes = (uint32_t)total_nodes_ub;
     if (n_leaves > (int)f->config.max_leaves) return 0;
     if (n_dw_layers > DW_MAX_LAYERS) return 0;
 
@@ -1971,7 +2035,9 @@ int factory_build_tree(factory_t *f) {
         g_sort_factory = NULL;
     }
 
-    /* Build the tree recursively */
+    /* Build the tree recursively.  Reset the COUNT only -- nodes_cap tracks what
+       is still allocated, so a rebuild reuses the existing block instead of
+       shrinking to FACTORY_NODES_INITIAL and re-growing back up. */
     f->n_nodes = 0;
     int leaf_counter = 0;
     if (!build_subtree(f, clients, n_clients,
@@ -2010,9 +2076,12 @@ int factory_session_get_input_signer_slot(const factory_t *f,
     if (!node->input_signing_sessions) return -1;
     if (input_idx >= node->n_input_sessions) return -1;
     size_t n = node->input_n_signers[input_idx];
-    if (n == 0 || n > (size_t)FACTORY_MAX_SIGNERS) return -1;
+    /* Bound by the allocation's stride, not the old compile-time cap: the
+       loop below reads factory_node_input_signers_const(node, input_idx)[i]
+       for i < n, and that row is input_signers_stride wide. */
+    if (n == 0 || n > node->input_signers_stride) return -1;
     for (size_t i = 0; i < n; i++) {
-        if (node->input_signer_indices[input_idx][i] == participant_idx)
+        if (factory_node_input_signers_const(node, input_idx)[i] == participant_idx)
             return (int)i;
     }
     return -1;
@@ -3101,9 +3170,12 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
     free(node->input_signing_sessions);
     free(node->input_partial_sigs);
     free(node->input_keyaggs);
+    free(node->input_signer_indices);
     node->input_signing_sessions = NULL;
     node->input_partial_sigs = NULL;
     node->input_keyaggs = NULL;
+    node->input_signer_indices = NULL;
+    node->input_signers_stride = 0;
     node->n_input_sessions = 0;
 
     node->input_signing_sessions =
@@ -3111,13 +3183,22 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
                                             sizeof(musig_signing_session_t));
     if (!node->input_signing_sessions) return 0;
 
+    /* ONE stride for BOTH per-input signer arrays, computed before either
+       allocation so they are indexed identically.  input_partial_sigs used a
+       fixed FACTORY_MAX_SIGNERS stride, which (a) hard-capped a node at 256
+       signers -- factory_session_set_partial_sig_input refused any slot at or
+       above it -- and (b) allocated 256 partial-sig slots per input on every
+       multi-input node regardless of the real signer count. */
+    node->input_signers_stride = node->n_signers ? node->n_signers : 2;
+
     node->input_partial_sigs =
         (secp256k1_musig_partial_sig *)calloc(
-            node->ps_n_prev_outputs * (size_t)FACTORY_MAX_SIGNERS,
+            node->ps_n_prev_outputs * node->input_signers_stride,
             sizeof(secp256k1_musig_partial_sig));
     if (!node->input_partial_sigs) {
         free(node->input_signing_sessions);
         node->input_signing_sessions = NULL;
+        node->input_signers_stride = 0;
         return 0;
     }
     /* SF-MULTI-KEYAGG (#283): per-input keyagg cache. */
@@ -3129,12 +3210,35 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
         free(node->input_partial_sigs);
         node->input_signing_sessions = NULL;
         node->input_partial_sigs = NULL;
+        node->input_signers_stride = 0;
         return 0;
     }
+
+    /* Per-input signer sets, sized to THIS node's signer count rather than a
+       fixed [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS] carried by every node.
+       Stride is n_signers (the node's full set is the widest any one input can
+       need: derive_input_keyagg either copies signer_indices wholesale for the
+       sales-stock input, or writes 2 entries for a channel input).  Set above,
+       shared with input_partial_sigs. */
+    node->input_signer_indices =
+        (uint32_t *)calloc(node->ps_n_prev_outputs * node->input_signers_stride,
+                             sizeof(uint32_t));
+    if (!node->input_signer_indices) {
+        free(node->input_signing_sessions);
+        free(node->input_partial_sigs);
+        free(node->input_keyaggs);
+        node->input_signing_sessions = NULL;
+        node->input_partial_sigs = NULL;
+        node->input_keyaggs = NULL;
+        node->input_signers_stride = 0;
+        return 0;
+    }
+
     memset(node->input_partial_sigs_received, 0,
            sizeof(node->input_partial_sigs_received));
     memset(node->input_n_signers, 0, sizeof(node->input_n_signers));
-    memset(node->input_signer_indices, 0, sizeof(node->input_signer_indices));
+    /* input_signer_indices is calloc'd above -- do NOT memset it with
+       sizeof(), which is now sizeof(pointer). */
     memset(node->input_merkle_root, 0, sizeof(node->input_merkle_root));
     memset(node->input_has_merkle_root, 0, sizeof(node->input_has_merkle_root));
     node->n_input_sessions = node->ps_n_prev_outputs;
@@ -3228,7 +3332,7 @@ static int derive_input_keyagg(const factory_t *f,
         node->input_keyaggs[input_idx] = node->keyagg;
         node->input_n_signers[input_idx] = node->n_signers;
         for (size_t i = 0; i < node->n_signers; i++)
-            node->input_signer_indices[input_idx][i] = node->signer_indices[i];
+            factory_node_input_signers(node, input_idx)[i] = node->signer_indices[i];
         if (!compute_factory_lstock_merkle(f,
                                             node->input_merkle_root[input_idx]))
             return 0;
@@ -3247,8 +3351,8 @@ static int derive_input_keyagg(const factory_t *f,
     if (!musig_aggregate_keys(f->ctx, &node->input_keyaggs[input_idx], pks, 2))
         return 0;
     node->input_n_signers[input_idx] = 2;
-    node->input_signer_indices[input_idx][0] = client_participant;
-    node->input_signer_indices[input_idx][1] = 0;
+    factory_node_input_signers(node, input_idx)[0] = client_participant;
+    factory_node_input_signers(node, input_idx)[1] = 0;
 
     int has_merkle = 0;
     if (!compute_factory_chan_cltv_merkle(f,
@@ -3339,10 +3443,14 @@ int factory_session_set_partial_sig_input(factory_t *f, size_t node_idx, size_t 
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->input_signing_sessions) return 0;
     if (input_idx >= node->n_input_sessions) return 0;
-    if (signer_slot >= (size_t)FACTORY_MAX_SIGNERS) return 0;
+    /* Bound by the ALLOCATION, not by the old compile-time cap.  The
+       input_n_signers check below is the semantic one; this is the memory
+       bound, and both now track input_signers_stride. */
+    if (node->input_signers_stride == 0) return 0;
+    if (signer_slot >= node->input_signers_stride) return 0;
     if (signer_slot >= node->input_n_signers[input_idx]) return 0;
     secp256k1_musig_partial_sig *slot =
-        &node->input_partial_sigs[input_idx * (size_t)FACTORY_MAX_SIGNERS + signer_slot];
+        &node->input_partial_sigs[input_idx * node->input_signers_stride + signer_slot];
     *slot = *psig;
     node->input_partial_sigs_received[input_idx]++;
     return 1;
@@ -3384,7 +3492,7 @@ int factory_session_assemble_signed_tx_multi(factory_t *f, size_t node_idx) {
     if (!sigs64) return 0;
     for (size_t i = 0; i < node->n_input_sessions; i++) {
         secp256k1_musig_partial_sig *psigs =
-            &node->input_partial_sigs[i * (size_t)FACTORY_MAX_SIGNERS];
+            &node->input_partial_sigs[i * node->input_signers_stride];
         /* SF-MULTI-KEYAGG (#283): aggregate with the per-input signer count
            (not the node-level n_signers). */
         if (!musig_aggregate_partial_sigs(f->ctx, sigs64 + 64 * i,
@@ -3588,8 +3696,15 @@ int factory_session_set_partial_sig_poison(factory_t *f, size_t node_idx,
                                              size_t signer_slot,
                                              const secp256k1_musig_partial_sig *psig) {
     if (!f || node_idx >= f->n_nodes || !psig) return 0;
-    if (signer_slot >= FACTORY_MAX_SIGNERS) return 0;
     factory_node_t *node = &f->nodes[node_idx];
+    /* Bound by the ALLOCATION.  poison_partial_sigs is calloc'd to this node's
+       n_signers, but the guard here was the old fixed FACTORY_MAX_SIGNERS --
+       so any slot in [n_signers, 256) was accepted and written past the end of
+       the array.  signer_slot arrives over the wire, so on a small node (a
+       2-of-2 leaf) a peer could write ~254 partial-sig structs of heap beyond
+       the allocation.  Nothing legitimate ever sends such a slot. */
+    if (!node->poison_partial_sigs) return 0;
+    if (signer_slot >= node->n_signers) return 0;
     memcpy(&node->poison_partial_sigs[signer_slot], psig,
            sizeof(secp256k1_musig_partial_sig));
     node->poison_partial_sigs_received++;
@@ -4997,6 +5112,11 @@ void factory_free(factory_t *f) {
         /* SF-MULTI-KEYAGG (#283): free per-input keyagg cache. */
         free(f->nodes[i].input_keyaggs);
         f->nodes[i].input_keyaggs = NULL;
+        /* Per-input signer sets: heap since the fixed 16 KB/node version was
+           the dominant per-client cost (see factory.h). */
+        free(f->nodes[i].input_signer_indices);
+        f->nodes[i].input_signer_indices = NULL;
+        f->nodes[i].input_signers_stride = 0;
         f->nodes[i].n_input_sessions = 0;
     }
     /* F4: factory-level distribution TX buffer (populated by
@@ -5006,6 +5126,7 @@ void factory_free(factory_t *f) {
     tx_buf_free(&f->dist_signed_tx);   /* #54 G1 */
     /* Zero node count so a second factory_free is a no-op (idempotent). */
     f->n_nodes = 0;
+    f->nodes_cap = 0;
     /* Factory-level distribution signing session's dynamic pubnonces. */
     musig_session_free(&f->dist_signing_session);
     /* Free the dynamic node arrays (were inline).  NULL after free so a second
@@ -5035,8 +5156,17 @@ void factory_detach_txbufs(factory_t *f) {
        (no double-free) and (b) the txbuf-zeroing below touches only this copy,
        not the original.  This reproduces the pre-dynamic inline-array copy
        semantics (per-node txbuf POINTERS stay shared, then get zeroed below). */
-    if (f->nodes && f->config.max_nodes > 0) {
-        size_t mn = f->config.max_nodes;
+    /* Copy exactly what is ALLOCATED (nodes_cap), not config.max_nodes.
+       max_nodes is the growth CAP, not the current extent: since nodes[] grows
+       on demand it is usually far smaller, and copying max_nodes reads off the
+       end.  ASan caught this the moment growth was forced on every add_node:
+         READ of size 3813376 (= 512 * sizeof(factory_node_t)) in
+         factory_detach_txbufs -> heap-buffer-overflow
+       Before grow-on-demand the array really was max_nodes entries, so this
+       was merely wasteful rather than wrong -- which is why it survived until
+       the allocation strategy changed underneath it. */
+    if (f->nodes && f->nodes_cap > 0) {
+        size_t mn = f->nodes_cap;
         factory_node_t *n2 = malloc(mn * sizeof(factory_node_t));
         if (n2) { memcpy(n2, f->nodes, mn * sizeof(factory_node_t)); f->nodes = n2; }
         unsigned char (*h2)[32] = malloc(mn * 32);
