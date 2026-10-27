@@ -1931,8 +1931,14 @@ handle_message:
             /* LSP initiates factory rotation — create new factory */
             printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
 
-            /* Save pubkeys from current factory */
-            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS];
+            /* Save pubkeys from current factory.
+               Sized to n_participants: this was a fixed [FACTORY_MAX_SIGNERS]
+               written by an UNCLAMPED `pi < n_participants` loop, i.e. a stack
+               buffer overflow for any factory over 256 participants -- not a
+               truncation. It never fired only because this is the rotation
+               path, which the lifecycle harness does not drive; a 300-client
+               factory that rotated would have smashed main's frame. */
+            secp256k1_pubkey saved_pubkeys[n_participants ? n_participants : 1];
             for (size_t pi = 0; pi < n_participants; pi++)
                 saved_pubkeys[pi] = factory->pubkeys[pi];
 

@@ -174,8 +174,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     /* Build combined keypair/pubkey arrays for adaptor protocol */
     size_t n_total = 1 + lsp->n_clients;
-    secp256k1_keypair rot_kps[FACTORY_MAX_SIGNERS];
-    secp256k1_pubkey rot_pks[FACTORY_MAX_SIGNERS];
+    secp256k1_keypair rot_kps[n_total];
+    secp256k1_pubkey rot_pks[n_total];
 
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(mgr->ctx, &lsp_kp, mgr->rot_lsp_seckey))
@@ -618,7 +618,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                     "using factory funding SPK (funds may strand)\n");
         }
 
-        tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
+        tx_output_t rot_outputs[n_total];
         size_t close_vsize = 68 + 43 * n_total;
         uint64_t close_fee = fee_estimate(fe, close_vsize);
         if (close_fee == 0) {
@@ -876,8 +876,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
            (unsigned long long)fund_amount, fund_txid_hex, fund_vout);
 
     /* For partial rotation: remap client arrays to cooperative subset */
-    int saved_client_fds[LSP_MAX_CLIENTS];
-    secp256k1_pubkey saved_client_pks[LSP_MAX_CLIENTS];
+    int saved_client_fds[lsp->n_clients ? lsp->n_clients : 1];
+    secp256k1_pubkey saved_client_pks[lsp->n_clients ? lsp->n_clients : 1];
     size_t n_coop = 0;
 
     memset(saved_client_fds, -1, sizeof(saved_client_fds));
@@ -887,9 +887,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         memcpy(saved_client_fds, lsp->client_fds, sizeof(saved_client_fds));
         memcpy(saved_client_pks, lsp->client_pubkeys, sizeof(saved_client_pks));
 
-        uint32_t coop[FACTORY_MAX_SIGNERS];
+        uint32_t coop[lsp->n_clients + 1];
         n_coop = ladder_get_cooperative_clients(lad, dying_id,
-                                                 coop, FACTORY_MAX_SIGNERS);
+                                                 coop, lsp->n_clients + 1);
 
         /* Remap to contiguous indices, skipping clients whose fd went stale */
         size_t n_online = 0;
@@ -978,8 +978,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
        For the current homogeneous-capacity design, funding_amount is the
        same across all channels; kept as a per-client array to prepare for
        heterogeneous-capacity factories. */
-    uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
-    for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
+    uint64_t rot_dist_amounts[mgr->n_channels ? mgr->n_channels : 1];
+    for (size_t c = 0; c < mgr->n_channels; c++)
         rot_dist_amounts[c] = mgr->entries[c].channel.funding_amount;
     lsp->dist_client_amounts = rot_dist_amounts;
     lsp->dist_n_client_amounts = mgr->n_channels;
@@ -1069,9 +1069,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     /* Close fds for uncooperative clients (partial rotation only) */
     if (partial) {
-        uint32_t uncoop[FACTORY_MAX_SIGNERS];
+        uint32_t uncoop[lsp->n_clients + 1];
         size_t n_uncoop = ladder_get_uncooperative_clients(lad, dying_id,
-                                                            uncoop, FACTORY_MAX_SIGNERS);
+                                                            uncoop, lsp->n_clients + 1);
         for (size_t i = 0; i < n_uncoop; i++) {
             int fd = saved_client_fds[uncoop[i] - 1];
             if (fd >= 0) wire_close(fd);
@@ -1121,9 +1121,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     /* Save channel balances so rotation preserves them (not reset to 50/50) */
     size_t saved_n_channels = mgr->n_channels;
-    uint64_t saved_ch_local[FACTORY_MAX_SIGNERS];
-    uint64_t saved_ch_remote[FACTORY_MAX_SIGNERS];
-    for (size_t c = 0; c < saved_n_channels && c < FACTORY_MAX_SIGNERS; c++) {
+    uint64_t saved_ch_local[saved_n_channels ? saved_n_channels : 1];
+    uint64_t saved_ch_remote[saved_n_channels ? saved_n_channels : 1];
+    for (size_t c = 0; c < saved_n_channels; c++) {
         saved_ch_local[c] = mgr->entries[c].channel.local_amount;
         saved_ch_remote[c] = mgr->entries[c].channel.remote_amount;
     }

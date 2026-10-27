@@ -45,9 +45,15 @@ jobs:
         env:
           # ASan: leaks fail the job (exitcode=23). Suppressions in test/sanitizer_suppressions/lsan.supp.
           # TSan: data races fail the job (halt_on_error=1). Suppressions in test/sanitizer_suppressions/tsan.supp.
+          # Suppressions paths MUST be absolute.  The test step below does
+          # `cd build`, and the sanitizers resolve a relative suppressions path
+          # against the process cwd -- so `test/sanitizer_suppressions/...`
+          # became `build/test/sanitizer_suppressions/...`, which does not
+          # exist.  LSan then aborted with "failed to read suppressions file"
+          # and exited 23, failing the job AFTER every test had already passed.
           ASAN_OPTIONS: ${{ matrix.sanitizers && 'detect_leaks=1' || 'detect_leaks=0' }}
-          LSAN_OPTIONS: ${{ matrix.sanitizers && 'exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0' || '' }}
-          TSAN_OPTIONS: ${{ matrix.tsan && 'halt_on_error=1:second_deadlock_stack=1:suppressions=test/sanitizer_suppressions/tsan.supp:print_suppressions=0' || '' }}
+          LSAN_OPTIONS: ${{ matrix.sanitizers && format('exitcode=23:suppressions={0}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0', github.workspace) || '' }}
+          TSAN_OPTIONS: ${{ matrix.tsan && format('halt_on_error=1:second_deadlock_stack=1:suppressions={0}/test/sanitizer_suppressions/tsan.supp:print_suppressions=0', github.workspace) || '' }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           cd build && ./test_superscalar --unit
@@ -265,7 +271,7 @@ jobs:
           # which preloads libstdbuf.so via LD_PRELOAD before the ASan
           # runtime — without the override ASan aborts at libinit.
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -278,7 +284,7 @@ jobs:
       - name: Multi-process k² sub-factory BREACH (under ASan+LSan)
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -289,7 +295,7 @@ jobs:
           # which preloads libstdbuf.so via LD_PRELOAD before the ASan
           # runtime — without the override ASan aborts at libinit.
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -303,7 +309,7 @@ jobs:
       - name: Multi-process distribution co-signed-path regression (under ASan+LSan)
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true

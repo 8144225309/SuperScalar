@@ -529,3 +529,14 @@ add_executable(test_inproc_factory_lifecycle tools/test_inproc_factory_lifecycle
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(test_inproc_factory_lifecycle PRIVATE superscalar superscalar_secrets project_warnings)
+# Every other executable here links project_sanitizers under ENABLE_SANITIZERS;
+# this target was added without it, so the sanitizer CI job compiled its deps
+# with -fsanitize=undefined and then linked without the runtime:
+#     undefined reference to `__ubsan_handle_*'   (build/_deps/cjson-src/cJSON.c)
+#     collect2: error: ld returned 1 exit status
+# That is a LINK failure ~40s in, so the sanitizer job never ran a single test --
+# and because it is a build-config fault it reproduces on any branch, which is
+# why a PR adding only shell scripts was also red.
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_inproc_factory_lifecycle PRIVATE project_sanitizers)
+endif()

@@ -224,5 +224,58 @@ int test_readiness_beyond_64(void) {
     readiness_set_connected(&rt, 126, 1);
     readiness_set_ready(&rt, 126, QUEUE_REQ_ROTATION);
     TEST_ASSERT(readiness_all_ready(&rt) == 1, "all ready again");
+    readiness_free(&rt);   /* 127 > READINESS_SMALL, so this one is heap-backed */
+    return 1;
+}
+
+/* Regression for the SILENT CLAMP.  readiness_init used to do
+ *     rt->n_clients = (n_clients > FACTORY_MAX_SIGNERS) ? FACTORY_MAX_SIGNERS
+ *                                                       : n_clients;
+ * so asking for more than 256 clients quietly tracked only the first 256 and
+ * dropped the rest with no error.  Every accessor bounds-checks against
+ * n_clients, so the surplus clients did not merely go unread -- they became
+ * INVISIBLE: readiness_all_ready() would return TRUE once the tracked prefix
+ * was ready, while the untracked clients were still missing.  That is the same
+ * premature-rotation failure as the uint64_t bitmap bug above, just at a higher
+ * N, and it would have appeared exactly when the daemon cap was lifted.
+ *
+ * The array is now sized to the request, so nothing is dropped. */
+int test_readiness_beyond_max_signers(void) {
+    const size_t N = 300;   /* > FACTORY_MAX_SIGNERS (256) */
+    readiness_tracker_t rt;
+    TEST_ASSERT(readiness_init(&rt, 11, N, NULL) == 1, "init 300 succeeds");
+    TEST_ASSERT(rt.n_clients == N, "all 300 tracked, not clamped to 256");
+
+    /* Ready everyone the OLD code would have tracked (0..255).  If the clamp
+       were still there this would read as "all ready" -- the exact bug. */
+    for (uint32_t i = 0; i < 256; i++) {
+        readiness_set_connected(&rt, i, 1);
+        readiness_set_ready(&rt, i, QUEUE_REQ_ROTATION);
+    }
+    TEST_ASSERT(readiness_count_ready(&rt) == 256, "256 ready");
+    TEST_ASSERT(readiness_all_ready(&rt) == 0,
+                "NOT all ready — 44 clients above the old clamp are still missing");
+
+    /* Clients past the old ceiling must be individually addressable. */
+    readiness_set_connected(&rt, 299, 1);
+    readiness_set_ready(&rt, 299, QUEUE_REQ_ROTATION);
+    TEST_ASSERT(rt.clients[299].is_ready == 1, "entry 299 ready");
+    TEST_ASSERT(rt.clients[299].client_idx == 299, "entry 299 has its own idx");
+    TEST_ASSERT(readiness_count_ready(&rt) == 257, "299 counted once");
+
+    for (uint32_t i = 256; i < (uint32_t)N; i++) {
+        readiness_set_connected(&rt, i, 1);
+        readiness_set_ready(&rt, i, QUEUE_REQ_ROTATION);
+    }
+    TEST_ASSERT(readiness_all_ready(&rt) == 1, "all ready once all 300 are in");
+
+    /* Out-of-range stays a safe no-op, as before. */
+    readiness_set_ready(&rt, (uint32_t)N, QUEUE_REQ_ROTATION);
+    TEST_ASSERT(readiness_count_ready(&rt) == N, "index N ignored");
+
+    readiness_free(&rt);
+    TEST_ASSERT(rt.n_clients == 0, "free empties the tracker");
+    TEST_ASSERT(readiness_all_ready(&rt) == 0, "freed tracker fails closed");
+    readiness_free(&rt);   /* double free must be safe */
     return 1;
 }

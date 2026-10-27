@@ -24,17 +24,41 @@ typedef enum {
     CLIENT_ERROR,
 } client_ceremony_state_t;
 
+/* Ceremonies with <= this many clients use the inline buffer: no heap, safe on
+   an uninitialized stack ceremony_t, and nothing to free.  Unit tests all sit
+   below it; real ceremonies take the heap path. */
+#define CEREMONY_SMALL 8
+
 typedef struct {
     ceremony_state_t state;
-    client_ceremony_state_t clients[FACTORY_MAX_SIGNERS];
+    /* Points at clients_small or heap.  SELF-REFERENTIAL in the small case, so a
+       ceremony_t must never be copied by value.
+       Was client_ceremony_state_t[FACTORY_MAX_SIGNERS].  The fixed array was an
+       overread waiting to happen: ceremony_init clamped only the WRITE loop
+       (`i < n_clients && i < FACTORY_MAX_SIGNERS`) while setting n_clients to the
+       untruncated count, so every later query -- ceremony_count_in_state,
+       ceremony_has_quorum, ceremony_get_active_clients -- loops to n_clients and
+       reads past the end once n_clients > 256.  Clamping the write made it look
+       guarded while leaving the reads unbounded. */
+    client_ceremony_state_t *clients;
+    size_t clients_cap;
+    client_ceremony_state_t clients_small[CEREMONY_SMALL];
     size_t n_clients;
     int per_client_timeout_sec;  /* per-client response deadline (seconds) */
     int min_clients;             /* minimum for viable factory (default: 2) */
 } ceremony_t;
 
-/* Initialize ceremony for n_clients with given timeout and minimum. */
-void ceremony_init(ceremony_t *c, size_t n_clients,
-                   int per_client_timeout_sec, int min_clients);
+/* Initialize ceremony for n_clients.  1 on success, 0 if the per-client array
+   could not be allocated (ceremony left valid but empty, so every accessor is
+   still safe).  Was void; ignoring the result still compiles.
+   TREATS *c AS UNINITIALIZED -- callers pass stack ceremony_t.  Call
+   ceremony_free() before re-initializing an existing one. */
+int ceremony_init(ceremony_t *c, size_t n_clients,
+                  int per_client_timeout_sec, int min_clients);
+
+/* Release the per-client array.  Safe on a zeroed ceremony, safe twice, no-op
+   for ceremonies that fit the inline buffer. */
+void ceremony_free(ceremony_t *c);
 
 /* Parallel select: wait for any of the given fds to become readable.
    client_fds[n_clients], timeout in seconds.

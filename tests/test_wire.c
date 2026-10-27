@@ -71,7 +71,6 @@ int test_wire_pubkey_only_factory(void) {
 
     /* Build factory with keypairs (reference) */
     factory_t *f_ref = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_ref);
     if (!f_ref) return 0;
     factory_init(f_ref, ctx, kps, 5, 10, 4);
 
@@ -88,7 +87,6 @@ int test_wire_pubkey_only_factory(void) {
     }
 
     factory_t *f_pk = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_pk);
     if (!f_pk) return 0;
     factory_init_from_pubkeys(f_pk, ctx, pks, 5, 10, 4);
     factory_set_funding(f_pk, fake_txid, 0, 10000000, fake_spk, 34);
@@ -634,7 +632,6 @@ int test_wire_close_unsigned(void) {
 
     /* Build reference factory */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 10, 4);
 
@@ -702,7 +699,6 @@ int test_wire_distributed_signing(void) {
 
     /* Build reference factory with all keypairs, sign it the old way */
     factory_t *f_ref = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_ref);
     if (!f_ref) return 0;
     factory_init(f_ref, ctx, kps, 5, 10, 4);
 
@@ -924,7 +920,6 @@ int test_basepoint_independence(void) {
 
     /* Build a factory for testing */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32];
@@ -1751,7 +1746,6 @@ int test_placement_profiles_wire_round_trip(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     unsigned char fake_txid[32];

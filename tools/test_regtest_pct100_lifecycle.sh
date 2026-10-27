@@ -76,6 +76,35 @@ red(){   printf '\033[31m%s\033[0m\n' "$*"; }
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 info(){  printf '\033[36m[pct100]\033[0m %s\n' "$*"; }
 ts(){ date -u +%H:%M:%S; }
+
+# ---- phase timing ------------------------------------------------------------
+# Every run self-reports where its wall-clock went, so an ETA at a new N is a
+# regression on measured phases rather than a guess, and a slow phase is visible
+# without re-deriving it from scattered log timestamps.
+# Measured N=300 (release, regtest): creation 166s, seed 449s -- i.e. the seed,
+# which is N strictly-serial independent payments, dominates creation 2.7:1.
+# That is the sort of thing this table is meant to make obvious.
+PHASE_NAMES=(); PHASE_SECS=(); _PH_T0=$(date +%s); _PH_CUR=""
+phase_begin(){ phase_end; _PH_CUR="$1"; _PH_T0=$(date +%s); }
+phase_end(){
+    [ -z "$_PH_CUR" ] && return 0
+    local d=$(( $(date +%s) - _PH_T0 ))
+    PHASE_NAMES+=("$_PH_CUR"); PHASE_SECS+=("$d"); _PH_CUR=""
+}
+phase_report(){
+    phase_end
+    local total=0 i
+    for i in "${!PHASE_NAMES[@]}"; do total=$(( total + PHASE_SECS[i] )); done
+    [ "$total" -eq 0 ] && total=1
+    printf '\n\033[36m[pct100]\033[0m PHASE TIMING  (N=%s, total %ds)\n' "$N_CLIENTS" "$total"
+    for i in "${!PHASE_NAMES[@]}"; do
+        printf '   %-26s %6ds  %5.1f%%  %s\n' \
+            "${PHASE_NAMES[i]}" "${PHASE_SECS[i]}" \
+            "$(awk -v a="${PHASE_SECS[i]}" -v b="$total" 'BEGIN{printf "%.1f", 100*a/b}')" \
+            "$(awk -v a="${PHASE_SECS[i]}" -v n="$N_CLIENTS" 'BEGIN{if(n>0)printf "%.2fs/client", a/n}')"
+    done
+    printf '   %-26s %6ds\n' "TOTAL" "$total"
+}
 die(){ red "FAIL: $*"; exit 1; }
 
 declare -A CPID CDB CSK
@@ -89,7 +118,7 @@ cleanup(){
     rm -f "$FIFO" 2>/dev/null || true
     cp "$LSP_LOG" /tmp/pct100_last_lsp.log 2>/dev/null || true
 }
-trap cleanup EXIT
+trap 'phase_report; cleanup' EXIT
 cli(){ printf '%s\n' "$1" >&3 2>/dev/null || true; }
 seed_amt(){ echo $(( SEED_MIN + RANDOM % (SEED_MAX - SEED_MIN + 1) )); }
 econ_amt(){ echo $(( ECON_MIN + RANDOM % (ECON_MAX - ECON_MIN + 1) )); }
@@ -191,7 +220,7 @@ nohup "$LSP_BIN" --network regtest --port "$PORT" \
     --amount "$AMOUNT" \
     --active-blocks 500 --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
     --fee-rate 1000 --lsp-balance-pct 100 --confirm-timeout 600 \
-    --max-conn-rate 100000 --max-handshakes 256 \
+    --max-conn-rate 100000 --max-handshakes "$(( N_CLIENTS + 16 ))" \
     --seckey "$LSP_SECKEY" \
     --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
     --wallet "$MINERW" --db "$LSP_DB" \
@@ -199,6 +228,7 @@ nohup "$LSP_BIN" --network regtest --port "$PORT" \
 LSP_PID=$!
 for i in $(seq 1 60); do sleep 1; grep -q "listening on port $PORT" "$LSP_LOG" 2>/dev/null && break; kill -0 "$LSP_PID" 2>/dev/null || { tail -25 "$LSP_LOG"; die "LSP died before listening"; }; done
 grep -q "listening on port $PORT" "$LSP_LOG" || { tail -25 "$LSP_LOG"; die "LSP never listened"; }
+phase_begin "launch+connect"
 info "$(ts) LSP listening; launching $N_CLIENTS zero-balance clients + block miner..."
 for i in $(seq 1 "$N_CLIENTS"); do
     nohup "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port "$PORT" \
@@ -212,17 +242,24 @@ for i in $(seq 1 "$N_CLIENTS"); do
 done
 ( while kill -0 "$LSP_PID" 2>/dev/null; do mine 1; sleep 2; done ) & MINER_PID=$!
 
-CDEAD=$(( $(date +%s) + 420 )); CREATED=0
+# Creation is an O(N)-round ceremony, so the budget must scale with N.  A fixed
+# 420s silently became a spurious "factory not created" at large N: measured
+# ~150s at N=224, so 512 lands near the old ceiling and 1024 sails past it --
+# a harness artifact that reads exactly like a code bug.  ~1.2s/client + 120s
+# floor, overridable.
+CREATE_WAIT_SEC="${CREATE_WAIT_SEC:-$(( 120 + (N_CLIENTS * 12 + 9) / 10 ))}"
+CDEAD=$(( $(date +%s) + CREATE_WAIT_SEC )); CREATED=0
 while [ "$(date +%s)" -lt "$CDEAD" ]; do
     grep -q "entering daemon mode" "$LSP_LOG" 2>/dev/null && { CREATED=1; break; }
     grep -qE "event loop failed|channel init failed|ceremony failed|FATAL" "$LSP_LOG" 2>/dev/null && { tail -30 "$LSP_LOG"; die "LSP creation failure"; }
     kill -0 "$LSP_PID" 2>/dev/null || { tail -30 "$LSP_LOG"; die "LSP died during creation"; }
     sleep 3
 done
-[ "$CREATED" = 1 ] || { tail -30 "$LSP_LOG"; die "factory not created in 420s"; }
+[ "$CREATED" = 1 ] || { tail -30 "$LSP_LOG"; die "factory not created in ${CREATE_WAIT_SEC}s"; }
 green "$(ts) FACTORY LIVE — $N_CLIENTS clients onboarded with ZERO balance (pct-100)"
 
 # ---- SEED: every client's first sats arrive over LN ----
+phase_begin "seed"
 info "$(ts) SEED: LSP pays each of the $N_CLIENTS clients over LN (lsppay, random $SEED_MIN..$SEED_MAX sats)..."
 for i in $(seq 0 $((N_CLIENTS-1))); do
     lsppay_cli "$i" "$(seed_amt)" || red "$(ts)   seed of client $i did not settle (retry pass follows)"
@@ -236,6 +273,7 @@ SEEDED=$(grep -aoE "Payment complete: LSP -> client [0-9]+ \(" "$LSP_LOG" 2>/dev
                                 || red   "$(ts) SEED INCOMPLETE: $SEEDED/$N_CLIENTS (close will have $((SEEDED+1)) outputs)"
 
 # ---- ECONOMY: bounded random c2c circulation (auto-stop on conservation violation) ----
+phase_begin "economy"
 info "$(ts) ECONOMY: up to $MAX_PAYS random client->client payments..."
 ECON_OK=0; ECON_FAIL=0
 for _k in $(seq 1 "$MAX_PAYS"); do
@@ -251,6 +289,7 @@ info "$(ts) economy done: $ECON_OK settled, $ECON_FAIL not settled (insufficient
 
 # ---- CLOSE ----
 sleep 10
+phase_begin "close"
 info "$(ts) issuing CLI close -> $((N_CLIENTS+1))-output cooperative payout..."
 cli "close"
 CLOSE_TXID=""; CDEAD=$(( $(date +%s) + CLOSE_WAIT_SEC ))
@@ -278,6 +317,20 @@ eval "$RES"
 [ "${nin:-0}" -eq 1 ] || { red "  CHECK FAIL: nin=${nin:-?} != 1"; FAILED=1; }
 [ "${nout:-0}" -eq $((N_CLIENTS+1)) ] && green "  ok: exactly $((N_CLIENTS+1)) outputs (every onboarded-at-zero client got an LN-earned payout)" \
                                        || { red "  CHECK FAIL: nout=${nout:-?} != $((N_CLIENTS+1))"; FAILED=1; }
+
+# ---- DIST-TX: the all-offline safety net must actually have been co-signed ----
+# Checked because this is precisely what degraded silently before.  Each client
+# REBUILDS the distribution TX from the LSP-sent per-client amounts and refuses
+# to co-sign on any mismatch -- and that refusal is a graceful skip: the factory
+# still comes up and every other phase still passes.  At N=300 a truncated
+# amounts list made every client past index 255 skip, so the run reported
+# success while the CLTV fallback (the TX anyone can broadcast to pay everyone
+# if all parties vanish) covered nobody.  Nothing here was looking.
+# Counted after the close so every client log is flushed.
+DIST_OK=$(grep -al "stored signed distribution TX" /tmp/ss_${TAG}_c*.log 2>/dev/null | wc -l)
+DIST_OK=${DIST_OK:-0}
+[ "$DIST_OK" -ge "$N_CLIENTS" ] && green "  ok: dist-TX co-signed by $DIST_OK/$N_CLIENTS clients (all-offline CLTV fallback covers everyone)" \
+                                || { red "  CHECK FAIL: dist-TX co-signed by only $DIST_OK/$N_CLIENTS — CLTV fallback does not cover every client"; FAILED=1; }
 
 info "=== EXACT accounting: output_i == received_i - sent_i (baseline 0) ==="
 python3 - "$LSP_LOG" "$N_CLIENTS" <<'PYEOF'

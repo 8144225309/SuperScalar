@@ -6,6 +6,7 @@
 #include "superscalar/crash_inject.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/select.h>
@@ -103,6 +104,35 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
     return 1;
 }
 
+/* Grow the ceremony scratch to `want` entries (see lsp.h for why it lives on
+   the struct).  Grows only; a later ceremony with fewer clients reuses the
+   larger block rather than reallocating down. */
+int lsp_ensure_scratch(lsp_t *lsp, size_t want) {
+    if (!lsp) return 0;
+    if (want <= lsp->scratch_cap) return 1;
+
+    int *sh = (int *)realloc(lsp->scratch_slot_hints, want * sizeof(int));
+    if (!sh) return 0;
+    lsp->scratch_slot_hints = sh;
+
+    int *sn = (int *)realloc(lsp->scratch_seen, want * sizeof(int));
+    if (!sn) return 0;
+    lsp->scratch_seen = sn;
+
+    secp256k1_pubkey *pk = (secp256k1_pubkey *)
+        realloc(lsp->scratch_pubkeys, want * sizeof(secp256k1_pubkey));
+    if (!pk) return 0;
+    lsp->scratch_pubkeys = pk;
+
+    participant_profile_t *pr = (participant_profile_t *)
+        realloc(lsp->scratch_profiles, want * sizeof(participant_profile_t));
+    if (!pr) return 0;
+    lsp->scratch_profiles = pr;
+
+    lsp->scratch_cap = want;
+    return 1;
+}
+
 int lsp_accept_clients(lsp_t *lsp) {
     if ((int)lsp->expected_clients > lsp->max_connections) {
         fprintf(stderr, "ERROR: --clients %d exceeds --max-connections %d\n",
@@ -119,8 +149,15 @@ int lsp_accept_clients(lsp_t *lsp) {
     }
 
     lsp->n_clients = 0;
-    int hello_slot_hints[FACTORY_MAX_SIGNERS];
-    for (size_t k = 0; k < FACTORY_MAX_SIGNERS; k++) hello_slot_hints[k] = 0;
+    /* +1: 'seen' below is indexed by SLOT (1..n_clients), and the pubkey array
+       carries the LSP at [0].  Sized to the participant count, not a fixed 256. */
+    if (!lsp_ensure_scratch(lsp, lsp->expected_clients + 1)) {
+        fprintf(stderr, "LSP: out of memory sizing ceremony scratch for %zu clients\n",
+                lsp->expected_clients);
+        return 0;
+    }
+    int *hello_slot_hints = lsp->scratch_slot_hints;
+    for (size_t k = 0; k < lsp->scratch_cap; k++) hello_slot_hints[k] = 0;
 
     for (size_t i = 0; i < lsp->expected_clients; i++) {
         /* Timeout: wait for incoming connection with select() */
@@ -232,7 +269,8 @@ int lsp_accept_clients(lsp_t *lsp) {
        stranded on every restart. */
     {
         int all_hinted = 1;
-        int seen[FACTORY_MAX_SIGNERS] = {0};
+        int *seen = lsp->scratch_seen;
+        memset(seen, 0, lsp->scratch_cap * sizeof(int));
         for (size_t i = 0; i < lsp->n_clients; i++) {
             int s = hello_slot_hints[i];
             if (s < 1 || (size_t)s > lsp->n_clients || seen[s]) { all_hinted = 0; break; }
@@ -272,7 +310,7 @@ int lsp_accept_clients(lsp_t *lsp) {
 
     /* Build all_pubkeys array: [LSP, client0, client1, ...] */
     size_t n_total = 1 + lsp->n_clients;
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    secp256k1_pubkey *all_pubkeys = lsp->scratch_pubkeys;
     all_pubkeys[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < lsp->n_clients; i++)
         all_pubkeys[i + 1] = lsp->client_pubkeys[i];
@@ -383,7 +421,16 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
 
     /* ---- Setup: identical to legacy lsp_run_factory_creation ---- */
     size_t n_total = 1 + lsp->n_clients;
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    /* ASan named this frame once the main() arrays were converted:
+         WRITE of size 64  src/lsp.c:421  in lsp_run_factory_creation_stateless
+       Scratch is sized by lsp_accept_clients; re-assert for callers that reach
+       creation by another route. */
+    if (!lsp_ensure_scratch(lsp, n_total)) {
+        fprintf(stderr, "LSP: out of memory sizing creation scratch for %zu participants\n",
+                n_total);
+        return 0;
+    }
+    secp256k1_pubkey *all_pubkeys = lsp->scratch_pubkeys;
     all_pubkeys[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < lsp->n_clients; i++)
         all_pubkeys[i + 1] = lsp->client_pubkeys[i];
@@ -399,8 +446,37 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     uint64_t saved_fee_per_tx = f->fee_per_tx;
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
-    participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
-    memcpy(saved_profiles, f->profiles, sizeof(saved_profiles));
+    /* Explicit count: sizeof(saved_profiles) was the whole fixed array; as a
+       pointer that silently becomes sizeof(void*).
+       Bound by BOTH allocations.  f->profiles is sized to f->config.max_signers,
+       which at this point is still the pre-init default (256) -- the factory has
+       not been re-inited yet, so factory_config_fit has not grown it to
+       n_participants.  An earlier version of this copied n_total and ASan caught
+       it at N=520:
+           READ of size 16672 (= 521 * sizeof(participant_profile_t))
+           heap-buffer-overflow  src/lsp.c:452
+       i.e. reading 521 profiles out of a 256-entry array.  The comment here
+       previously asserted n_total was "all f->profiles is sized for", which was
+       simply untrue and untested -- the unit suite cannot see it because below
+       256 the two counts coincide. */
+    participant_profile_t *saved_profiles = lsp->scratch_profiles;
+    size_t n_prof = 0;
+    /* RETRY SAFETY: a failed creation attempt can leave the factory with its
+       dynamic arrays released, so f->profiles is NULL when attempt 2 re-enters
+       here.  This crashed the LSP outright at N=300:
+           === CRASH (signal 11) ===  lsp_run_factory_creation_stateless
+           src/lsp.c:465   (this memcpy)
+       after attempt 1 failed on "send LSP_RESPONSE to client 108 failed".
+       Pre-existing rather than new -- the old fixed-array version read from
+       f->profiles just the same -- but unreachable in practice because below
+       256 clients an attempt essentially never failed, so the retry path was
+       never exercised. A failed attempt must degrade to a retry, not kill the
+       daemon. Nothing to save when there are no profiles yet. */
+    if (f->profiles && lsp->scratch_profiles) {
+        n_prof = f->config.max_signers;
+        if (n_prof > lsp->scratch_cap) n_prof = lsp->scratch_cap;
+        memcpy(saved_profiles, f->profiles, n_prof * sizeof(participant_profile_t));
+    }
     int saved_has_shachain = f->has_shachain;
     int saved_use_flat = f->use_flat_secrets;
     size_t saved_n_secrets = f->n_revocation_secrets;
@@ -429,7 +505,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
-    memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
+    /* Restore exactly what was saved.  f->profiles may now be LARGER than it was
+       (the re-init above ran factory_config_fit, which grows max_signers to
+       n_participants); the surplus stays zeroed from calloc, which is the same
+       state the old fixed-256 save/restore left it in. */
+    /* n_prof == 0 means nothing was saved (see the guard above), so there is
+       nothing to put back -- and f->profiles is freshly calloc'd by the re-init
+       either way, which is the correct state to leave it in. */
+    if (n_prof && f->profiles)
+        memcpy(f->profiles, saved_profiles, n_prof * sizeof(participant_profile_t));
     if (saved_has_shachain) {
         if (saved_use_flat && saved_secrets)
             factory_set_flat_secrets(f, saved_secrets, saved_n_secrets);
@@ -481,9 +565,16 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             cJSON_AddItemToArray(da, cJSON_CreateNumber((double)lsp->dist_client_amounts[i]));
         cJSON_AddItemToObject(propose, "dist_amounts", da);
     }
-    for (size_t i = 0; i < lsp->n_clients; i++) {
-        if (!wire_send(lsp->client_fds[i], MSG_FACTORY_PROPOSE, propose)) {
-            fprintf(stderr, "LSP-stateless: send FACTORY_PROPOSE to client %zu failed\n", i);
+    {
+        size_t fail_i = 0;
+        /* Serialize once for the whole fan-out (see wire_send_many). */
+        if (!wire_send_many(lsp->client_fds, lsp->n_clients,
+                            MSG_FACTORY_PROPOSE, propose, &fail_i)) {
+            fprintf(stderr,
+                    "LSP-stateless: send FACTORY_PROPOSE to client %zu failed "
+                    "(fd=%d errno=%d %s, %zu/%zu sent)\n",
+                    fail_i, lsp->client_fds[fail_i], errno, strerror(errno),
+                    fail_i, lsp->n_clients);
             cJSON_Delete(propose);
             return 0;
         }
@@ -510,9 +601,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        when all parties go offline.  (Legacy rotation also re-signs it later.)
        Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
     {
-        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+        /* N+1 outputs: one per client plus the LSP.  Fixed at 257 this could
+           not express the payout set past 256 clients -- and this is the
+           all-offline safety-net TX, so a short one means the fallback that
+           pays everyone at the factory CLTV silently covers fewer clients. */
+        tx_output_t dist_outputs[(size_t)f->n_participants + 1];
         size_t n_dist = factory_compute_distribution_outputs_balanced(f,
-            dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+            dist_outputs, (size_t)f->n_participants + 1, 500,
             lsp->dist_client_amounts, lsp->dist_n_client_amounts);
         if (n_dist > 0 && f->cltv_timeout > 0)
             (void)factory_build_distribution_tx_unsigned(
@@ -766,9 +861,26 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 }
             }
         }
-        for (size_t i = 0; i < lsp->n_clients; i++) {
-            if (!wire_send(lsp->client_fds[i], MSG_FACTORY_LSP_RESPONSE, response)) {
-                fprintf(stderr, "LSP-stateless: send LSP_RESPONSE to client %zu failed\n", i);
+        {
+            size_t fail_i = 0;
+            /* Serialize once, not once per client: this message carries the
+               whole nonce matrix (5.6 MB at N=301) and the per-peer loop was
+               re-printing it for every one of them. */
+            if (!wire_send_many(lsp->client_fds, lsp->n_clients,
+                                MSG_FACTORY_LSP_RESPONSE, response, &fail_i)) {
+                size_t i = fail_i;
+                /* Report WHY.  LSP_RESPONSE carries the whole nonce matrix and is
+                   the largest message in the protocol, so at scale this is the
+                   first send that can block: with N clients the LSP pushes
+                   N x (matrix bytes) and a slow reader stalls write_all.  Without
+                   errno and the fd state, "send failed to client 108" is
+                   indistinguishable between a dead peer, a full socket buffer and
+                   an oversize frame -- which cost a full diagnosis cycle. */
+                fprintf(stderr,
+                        "LSP-stateless: send LSP_RESPONSE to client %zu failed "
+                        "(fd=%d errno=%d %s, %zu/%zu sent)\n",
+                        i, lsp->client_fds[i], errno, strerror(errno),
+                        i, lsp->n_clients);
                 cJSON_Delete(response);
                 free(all_pn);
                 goto fail_pre;
@@ -953,6 +1065,22 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     size_t n_total = 1 + lsp->n_clients;
     int clients_notified = 0;  /* set after CLOSE_PROPOSE sent */
 
+    /* Declared NULL up here, allocated further down.  close_fail frees all four,
+       and several `goto close_fail` fire BEFORE the allocation point -- gcc
+       rightly rejected freeing them uninitialised
+       (-Werror=maybe-uninitialized).  free(NULL) is a no-op, so a NULL start
+       makes every path through the label safe. */
+    unsigned char (*all_pubnonces)[66] = NULL;
+    int *close_wait_fds = NULL;
+    int *close_ready = NULL;
+    secp256k1_musig_partial_sig *all_psigs = NULL;
+    /* Hoisted for the same reason: ceremony_t now heap-allocates its per-client
+       state above CEREMONY_SMALL, and both ceremonies sit in blocks containing
+       `goto close_fail`.  Zero-initialised so ceremony_free is safe on every
+       path, including the ones that jump out before either is initialised. */
+    ceremony_t close_nonce_cer = {0};
+    ceremony_t close_psig_cer = {0};
+
     /* Build unsigned close tx + sighash */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 256);
@@ -1024,22 +1152,37 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     clients_notified = 1;
 
     /* Collect CLOSE_NONCE from all clients */
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
+    /* Heap, not VLA.  This ceremony uses `goto close_fail` and C forbids a jump
+       into the scope of a variably-modified type ("jump into scope of identifier
+       with variably modified type"), so the VLA idiom used elsewhere in the LSP
+       is unavailable here.  Allocated once above the first goto and released at
+       the single cleanup label -- which is also why the inner wait_fds/ready are
+       hoisted out of their loops rather than allocated per iteration. */
+    all_pubnonces   = calloc(lsp->n_clients + 1, 66);
+    close_wait_fds  = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
+    close_ready     = calloc(lsp->n_clients ? lsp->n_clients : 1, sizeof(int));
+    all_psigs       = calloc(lsp->n_clients + 1, sizeof(secp256k1_musig_partial_sig));
+    if (!all_pubnonces || !close_wait_fds || !close_ready || !all_psigs) {
+        fprintf(stderr, "LSP close: out of memory for %zu-participant ceremony\n",
+                lsp->n_clients + 1);
+        free(all_pubnonces); free(close_wait_fds); free(close_ready); free(all_psigs);
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
     musig_pubnonce_serialize(lsp->ctx, all_pubnonces[0], &lsp_pubnonce);
 
     {
-        ceremony_t close_nonce_cer;
         ceremony_init(&close_nonce_cer, lsp->n_clients, 300, (int)lsp->n_clients);
         size_t close_nonces_received = 0;
 
         while (close_nonces_received < lsp->n_clients) {
-            int wait_fds[LSP_MAX_CLIENTS];
+            int *wait_fds = close_wait_fds;
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_nonce_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
             }
 
-            int ready[LSP_MAX_CLIENTS];
+            int *ready = close_ready;
             int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_nonce_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -1140,23 +1283,22 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         goto close_fail;
     }
 
-    secp256k1_musig_partial_sig all_psigs[FACTORY_MAX_SIGNERS];
+
     all_psigs[0] = lsp_psig;
 
     /* Collect CLOSE_PSIG from all clients (parallel select) */
     {
-        ceremony_t close_psig_cer;
         ceremony_init(&close_psig_cer, lsp->n_clients, 300, (int)lsp->n_clients);
         size_t close_psigs_received = 0;
 
         while (close_psigs_received < lsp->n_clients) {
-            int wait_fds[LSP_MAX_CLIENTS];
+            int *wait_fds = close_wait_fds;
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_psig_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
             }
 
-            int ready[LSP_MAX_CLIENTS];
+            int *ready = close_ready;
             int n_ready = ceremony_select_all(wait_fds, lsp->n_clients, close_psig_cer.per_client_timeout_sec, ready);
             if (n_ready <= 0) {
                 for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -1269,10 +1411,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         cJSON_Delete(done);
     }
 
+    ceremony_free(&close_nonce_cer); ceremony_free(&close_psig_cer);
+    free(all_pubnonces); free(close_wait_fds); free(close_ready); free(all_psigs);
     tx_buf_free(&unsigned_tx);
     return 1;
 
 close_fail:
+    ceremony_free(&close_nonce_cer); ceremony_free(&close_psig_cer);
+    free(all_pubnonces); free(close_wait_fds); free(close_ready); free(all_psigs);
     if (clients_notified)
         lsp_abort_ceremony(lsp, "cooperative close failed");
     tx_buf_free(&unsigned_tx);
@@ -1358,6 +1504,17 @@ void lsp_cleanup(lsp_t *lsp) {
     free(lsp->client_pubkeys);
     lsp->client_fds = NULL;
     lsp->client_pubkeys = NULL;
+    /* Ceremony scratch: the single free point for what used to be three fixed
+       stack arrays.  Safe on a zeroed lsp_t and safe to call twice. */
+    free(lsp->scratch_slot_hints);
+    free(lsp->scratch_seen);
+    free(lsp->scratch_pubkeys);
+    free(lsp->scratch_profiles);
+    lsp->scratch_profiles = NULL;
+    lsp->scratch_slot_hints = NULL;
+    lsp->scratch_seen = NULL;
+    lsp->scratch_pubkeys = NULL;
+    lsp->scratch_cap = 0;
     if (lsp->bridge_fd >= 0) {
         wire_close(lsp->bridge_fd);
         lsp->bridge_fd = -1;

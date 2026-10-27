@@ -280,6 +280,15 @@ int wire_connect_direct_internal(const char *host, int port);
 /* Send: writes [4-byte big-endian length][1-byte type][JSON bytes]. Returns 1 on success. */
 int wire_send(int fd, uint8_t msg_type, cJSON *json);
 
+/* Broadcast to many peers, serializing the JSON once instead of once per peer.
+   Use this for ceremony fan-out: wire_send() in a loop re-prints the whole tree
+   per client, which is O(N * message) and became the dominant cost of factory
+   creation at scale.  Negative fds are skipped.  1 if all peers were written;
+   on failure returns 0 and stores the failing peer's index in *first_fail
+   (may be NULL). */
+int wire_send_many(const int *fds, size_t n_fds, uint8_t msg_type, cJSON *json,
+                   size_t *first_fail);
+
 /* Recv: reads one frame. Caller must cJSON_Delete(msg->json). Returns 1 on success, 0 on EOF/error. */
 int wire_recv(int fd, wire_msg_t *msg);
 

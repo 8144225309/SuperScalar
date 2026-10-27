@@ -36,6 +36,15 @@ static inline bool regtest_err_is_expected_poll_miss(int code) {
    a one-shot reload + retry. See task #298. */
 static __thread int g_regtest_last_http_error = 0;
 
+/* Text of that error, so regtest_exec can hand callers the same diagnostic the
+   fork+exec path used to give them.  bitcoin-cli writes its error to stderr and
+   run_command_exec captures it as output, so callers historically received a
+   STRING containing e.g. "bad-txns-inputs-missingorspent" -- and some inspect
+   it (test_close_spendability_full.c asserts the message names the reason a
+   stale broadcast was rejected).  Skipping the fork must not silently downgrade
+   that to a bare NULL. */
+static __thread char g_regtest_last_http_errmsg[512] = {0};
+
 /* Auto-recovery rate limit. bitcoind's "wallet not loaded" state can drive
    long polling loops, so we coalesce concurrent -18 errors into at most one
    loadwallet attempt per second across all callers. */
@@ -624,11 +633,20 @@ static char *regtest_http_rpc(const regtest_t *rt,
            answer (tx not in mempool/chain; wallet path wrong because tx not
            in this wallet). Real errors (-32700 parse, -32601 method missing,
            etc.) still surface. See task #200. */
-        if (!(g_regtest_poll_quiet && regtest_err_is_expected_poll_miss(code))) {
+        {
             char *errstr = cJSON_PrintUnformatted(err);
             if (errstr) {
-                fprintf(stderr, "HTTP RPC %s error: %s\n", method, errstr);
+                /* Record it ALWAYS -- poll-quiet governs whether we PRINT the
+                   error, not whether regtest_exec can hand it back. */
+                snprintf(g_regtest_last_http_errmsg,
+                         sizeof(g_regtest_last_http_errmsg),
+                         "error: %s", errstr);
+                if (!(g_regtest_poll_quiet &&
+                      regtest_err_is_expected_poll_miss(code)))
+                    fprintf(stderr, "HTTP RPC %s error: %s\n", method, errstr);
                 free(errstr);
+            } else {
+                g_regtest_last_http_errmsg[0] = '\0';
             }
         }
         cJSON_Delete(jresp);
@@ -719,7 +737,36 @@ char *regtest_exec(const regtest_t *rt, const char *method, const char *params) 
                 return result;
             }
         }
-        /* HTTP failed — fall through to fork+exec */
+        /* Distinguish "bitcoind answered, and the answer was an error" from
+           "bitcoind did not answer".  regtest_http_rpc returns NULL for both,
+           but only the second is worth a fork+exec retry.
+
+           A JSON-RPC error IS a valid answer: -5 "no such transaction" is the
+           normal negative reply when polling for a tx that was never
+           broadcast.  Re-asking via bitcoin-cli gets the identical -5, having
+           paid a fork+execvp for it.  That is the hot path -- the watchtower
+           polls revoked commitments that by construction are NOT on chain, so
+           EVERY entry cost a process spawn on EVERY check, from every client
+           and the LSP daemon loop.  Entries grow with payments, so the waste
+           grew as O(N^2) over a seed and starved the real work of CPU.
+
+           -18 keeps the old behaviour on purpose: the fork path is how a
+           persistent wallet-missing failure gets surfaced to the operator
+           (task #298). */
+        if (g_regtest_last_http_error != 0 &&
+            g_regtest_last_http_error != -18) {
+            /* Return the error AS TEXT, not NULL.  The fork+exec path handed
+               callers bitcoin-cli's stderr, so an RPC error historically
+               arrived as a STRING they could inspect -- and callers do:
+               test_close_spendability_full.c asserts the message names why a
+               stale broadcast was rejected ("missingorspent"/"spent"/...).
+               Skipping the fork is the optimisation; dropping the diagnostic
+               was an accident, and it broke exactly that assertion. */
+            if (g_regtest_last_http_errmsg[0])
+                return strdup(g_regtest_last_http_errmsg);
+            return NULL;
+        }
+        /* No answer at all (transport failure) — fall through to fork+exec */
     }
 
     /* Fork+exec bitcoin-cli (used when rpcport==0 or HTTP unavailable) */

@@ -2316,7 +2316,12 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
 
     /* Data validation (Phase 2: item 2.6) */
-    if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
+    /* Sanity ceiling on a value read back from the DB, not a capacity limit --
+       everything downstream is sized from n_participants.  At
+       FACTORY_MAX_SIGNERS this refused to load any factory over 256
+       participants, so such a factory could be created and persisted but
+       never restored after a restart. */
+    if (n_participants < 2 || n_participants > (size_t)SS_MAX_PARTICIPANTS) {
         fprintf(stderr, "persist_load_factory: invalid n_participants %zu\n",
                 n_participants);
         sqlite3_finalize(stmt);
@@ -2367,9 +2372,14 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     sqlite3_bind_int(pk_stmt, 1, (int)factory_id);
 
-    secp256k1_pubkey pubkeys[FACTORY_MAX_SIGNERS];
+    /* Sized to n_participants, which is what the check below demands anyway.
+       As a fixed [FACTORY_MAX_SIGNERS] this truncated the pubkeys LOADED FROM
+       THE DB at 256, so `pk_count != n_participants` then failed and a
+       factory with more than 256 participants could never be restored. Fails
+       closed, but it makes restore impossible rather than wrong. */
+    secp256k1_pubkey pubkeys[n_participants ? n_participants : 1];
     size_t pk_count = 0;
-    while (sqlite3_step(pk_stmt) == SQLITE_ROW && pk_count < FACTORY_MAX_SIGNERS) {
+    while (sqlite3_step(pk_stmt) == SQLITE_ROW && pk_count < n_participants) {
         const char *pk_hex = (const char *)sqlite3_column_text(pk_stmt, 1);
         if (!pk_hex) continue;
         unsigned char pk_ser[33];
@@ -2405,9 +2415,24 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    /* Release any prior tree state (caller may reuse f across loads).
-       factory_init_from_pubkeys memsets f, which would leak existing tx_bufs. */
-    if (f->n_nodes > 0)
+    /* Release any prior state (caller may reuse f across loads).
+       factory_init_from_pubkeys memsets f, so anything f already owns must be
+       freed FIRST or it is orphaned.
+
+       The guard used to be `f->n_nodes > 0`, which tests TREE state -- but the
+       thing that needs freeing is the ARRAY SET, and factory_alloc_default_arrays
+       allocates all of it (nodes, keypairs, pubkeys, profiles,
+       dist_partial_sigs, leaf_layers, leaf_node_indices, the l_stock arrays)
+       while leaving n_nodes == 0.  So the common "pre-allocate, then load into
+       it" pattern skipped the free entirely and leaked the whole set on every
+       load -- ~260KB a time.  Harmless when factory_t carried those as fixed
+       members; a real leak now that they are heap.
+
+       Test with the ARRAYS, not the tree.  factory_free is safe here: its node
+       loop runs zero times when n_nodes == 0, and every free is NULL-safe. */
+    if (f->n_nodes > 0 || f->nodes || f->keypairs || f->pubkeys ||
+        f->profiles || f->dist_partial_sigs || f->leaf_layers ||
+        f->leaf_node_indices)
         factory_free(f);
 
     /* Reconstruct factory */
@@ -3851,18 +3876,66 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
     const char *dir_str = direction ? "recv" : "sent";
     const char *msg_name = wire_msg_type_name(msg_type);
 
-    /* Truncated payload summary */
+    /* Truncated payload summary, built WITHOUT serializing the whole message.
+     *
+     * This used to be cJSON_PrintUnformatted(json) followed by "keep the first
+     * 500 bytes, free the rest".  cJSON_PrintUnformatted allocates the ENTIRE
+     * tree as one heap string, and a ceremony message carries an O(N) nonce or
+     * partial-sig matrix -- so at scale this allocated megabytes per message
+     * purely to throw ~all of it away, on every message, in both the client and
+     * the LSP.  massif at N=160 named it the largest single allocation site in
+     * the client: 6.16 MB peak, via
+     *     wire_recv -> cJSON_PrintUnformatted -> print_value -> print_string_ptr
+     * and it scaled with N, which is what made a co-located swarm quadratic.
+     *
+     * We now walk only the top-level fields and stop as soon as the 500-byte
+     * budget is spent, so the cost is bounded by the summary size rather than
+     * by the message size.  Nested arrays/objects are rendered as a shape
+     * ("[512 items]"), which is what an audit trail actually wants from a
+     * matrix anyway -- the full payload was never readable in 500 bytes. */
     char summary[501];
     summary[0] = '\0';
     if (json) {
-        char *printed = cJSON_PrintUnformatted((cJSON *)json);
-        if (printed) {
-            size_t len = strlen(printed);
-            if (len > 500) len = 500;
-            memcpy(summary, printed, len);
-            summary[len] = '\0';
-            free(printed);
+        size_t used = 0;
+        const cJSON *child = ((const cJSON *)json)->child;
+        int first = 1;
+        if (used < sizeof(summary) - 1) summary[used++] = '{';
+        for (; child && used < sizeof(summary) - 8; child = child->next) {
+            char field[160];
+            int n;
+            const char *nm = child->string ? child->string : "?";
+            if (cJSON_IsArray(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":[%d items]",
+                             first ? "" : ",", nm, cJSON_GetArraySize((cJSON *)child));
+            } else if (cJSON_IsObject(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":{%d fields}",
+                             first ? "" : ",", nm, cJSON_GetArraySize((cJSON *)child));
+            } else if (cJSON_IsString(child)) {
+                /* Long hex blobs (pubkeys, nonces) get head-truncated. */
+                const char *v = child->valuestring ? child->valuestring : "";
+                n = snprintf(field, sizeof(field), "%s\"%s\":\"%.48s%s\"",
+                             first ? "" : ",", nm, v, strlen(v) > 48 ? "..." : "");
+            } else if (cJSON_IsNumber(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":%.10g",
+                             first ? "" : ",", nm, child->valuedouble);
+            } else if (cJSON_IsBool(child)) {
+                n = snprintf(field, sizeof(field), "%s\"%s\":%s",
+                             first ? "" : ",", nm, cJSON_IsTrue(child) ? "true" : "false");
+            } else {
+                n = snprintf(field, sizeof(field), "%s\"%s\":null", first ? "" : ",", nm);
+            }
+            if (n < 0) break;
+            if (used + (size_t)n >= sizeof(summary) - 8) {
+                /* Budget spent — mark truncation rather than silently stopping. */
+                used += (size_t)snprintf(summary + used, sizeof(summary) - used, ",...");
+                break;
+            }
+            memcpy(summary + used, field, (size_t)n);
+            used += (size_t)n;
+            first = 0;
         }
+        if (used < sizeof(summary) - 1) summary[used++] = '}';
+        summary[used < sizeof(summary) ? used : sizeof(summary) - 1] = '\0';
     }
 
     const char *sql =

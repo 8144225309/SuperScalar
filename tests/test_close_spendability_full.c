@@ -148,7 +148,6 @@ static int run_coop_close_for_arity(regtest_t *rt,
     const size_t N = 5;  /* 1 LSP + 4 clients */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -157,7 +156,7 @@ static int run_coop_close_for_arity(regtest_t *rt,
     uint64_t fund_amount = 0;
     if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kps, f,
                                fund_spk, fund_txid, &fund_vout, &fund_amount)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  [arity=%d] factory funded: %s:%u  %llu sats  %zu nodes\n",
            (int)arity, fund_txid, fund_vout, (unsigned long long)fund_amount,
@@ -171,9 +170,9 @@ static int run_coop_close_for_arity(regtest_t *rt,
 
     for (size_t i = 0; i < N; i++) {
         secp256k1_pubkey pk;
-        if (!secp256k1_keypair_pub(ctx, &pk, &kps[i])) { free(f); return 0; }
+        if (!secp256k1_keypair_pub(ctx, &pk, &kps[i])) { factory_free(f); free(f); return 0; }
         secp256k1_xonly_pubkey xo;
-        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk)) { free(f); return 0; }
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk)) { factory_free(f); free(f); return 0; }
         build_p2tr_script_pubkey(outs[i].script_pubkey, &xo);
         outs[i].script_pubkey_len = 34;
         outs[i].amount_sats = (i == 0) ? lsp_amt : per_client;
@@ -185,12 +184,12 @@ static int run_coop_close_for_arity(regtest_t *rt,
     if (!build_unsigned_tx(&unsigned_close, NULL,
                             f->funding_txid, f->funding_vout,
                             0xFFFFFFFEu, outs, N)) {
-        tx_buf_free(&unsigned_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); factory_free(f); free(f); return 0;
     }
     unsigned char sighash[32];
     if (!compute_taproot_sighash(sighash, unsigned_close.data, unsigned_close.len,
                                    0, fund_spk, 34, fund_amount, 0xFFFFFFFEu)) {
-        tx_buf_free(&unsigned_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); factory_free(f); free(f); return 0;
     }
 
     /* Offline N-party MuSig2 ceremony (we have all keypairs locally). */
@@ -198,17 +197,17 @@ static int run_coop_close_for_arity(regtest_t *rt,
     secp256k1_pubkey pks[5];
     for (size_t i = 0; i < N; i++)
         secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
-    if (!musig_aggregate_keys(ctx, &ka, pks, N)) { free(f); return 0; }
+    if (!musig_aggregate_keys(ctx, &ka, pks, N)) { factory_free(f); free(f); return 0; }
 
     unsigned char sig64[64];
     if (!musig_sign_taproot(ctx, sig64, sighash, kps, N, &ka, NULL)) {
-        tx_buf_free(&unsigned_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); factory_free(f); free(f); return 0;
     }
 
     tx_buf_t signed_close;
     tx_buf_init(&signed_close, 256);
     if (!finalize_signed_tx(&signed_close, unsigned_close.data, unsigned_close.len, sig64)) {
-        tx_buf_free(&unsigned_close); tx_buf_free(&signed_close); free(f); return 0;
+        tx_buf_free(&unsigned_close); tx_buf_free(&signed_close); factory_free(f); free(f); return 0;
     }
     tx_buf_free(&unsigned_close);
 
@@ -219,25 +218,25 @@ static int run_coop_close_for_arity(regtest_t *rt,
     char close_txid[65];
     if (!regtest_send_raw_tx(rt, close_hex, close_txid)) {
         fprintf(stderr, "  coop close broadcast failed\n");
-        tx_buf_free(&signed_close); free(f); return 0;
+        tx_buf_free(&signed_close); factory_free(f); free(f); return 0;
     }
     regtest_mine_blocks(rt, 1, mine_addr);
     tx_buf_free(&signed_close);
     if (regtest_get_confirmations(rt, close_txid) < 1) {
         fprintf(stderr, "  close not confirmed\n");
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  [arity=%d] coop close confirmed: %s\n", (int)arity, close_txid);
 
     /* Spendability gauntlet: each party sweeps its P2TR(xonly(pk_i)). */
     if (!spend_coop_close_gauntlet(ctx, rt, close_txid, N_PARTY_SECKEYS, N - 1)) {
         fprintf(stderr, "  gauntlet failed\n");
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  [arity=%d] all %zu parties swept their outputs  ✓\n",
            (int)arity, N);
 
-    free(f);
+    factory_free(f); free(f);
     return 1;
 }
 
@@ -810,7 +809,6 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     const size_t N = 3;  /* 1 LSP + 2 clients (minimum for PS MuSig) */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -819,7 +817,7 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     uint64_t fund_amount = 0;
     if (!fund_n_party_factory(rt, ctx, N, FACTORY_ARITY_PS, mine_addr, kps, f,
                                 fund_spk, fund_txid, &fund_vout, &fund_amount)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  PS chain: factory funded %s:%u (%zu nodes, %d leaves)\n",
            fund_txid, fund_vout, f->n_nodes, f->n_leaf_nodes);
@@ -842,11 +840,11 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     tx_buf_t uc;
     tx_buf_init(&uc, 256);
     if (!build_unsigned_tx(&uc, NULL, f->funding_txid, f->funding_vout,
-                            0xFFFFFFFEu, outs, N)) { free(f); return 0; }
+                            0xFFFFFFFEu, outs, N)) { factory_free(f); free(f); return 0; }
     unsigned char sh[32];
     if (!compute_taproot_sighash(sh, uc.data, uc.len, 0,
                                   fund_spk, 34, fund_amount, 0xFFFFFFFEu)) {
-        tx_buf_free(&uc); free(f); return 0;
+        tx_buf_free(&uc); factory_free(f); free(f); return 0;
     }
     musig_keyagg_t ka;
     secp256k1_pubkey pks[3];
@@ -854,7 +852,7 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     musig_aggregate_keys(ctx, &ka, pks, N);
     unsigned char sig[64];
     if (!musig_sign_taproot(ctx, sig, sh, kps, N, &ka, NULL)) {
-        tx_buf_free(&uc); free(f); return 0;
+        tx_buf_free(&uc); factory_free(f); free(f); return 0;
     }
     tx_buf_t sc;
     tx_buf_init(&sc, 256);
@@ -872,11 +870,11 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
 
     /* Gauntlet sweep: 3 parties each spend their P2TR(xonly(pk_i)). */
     if (!spend_coop_close_gauntlet(ctx, rt, close_txid, N_PARTY_SECKEYS, N - 1)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  PS chain: all %zu parties swept final outputs ✓\n", N);
 
-    free(f);
+    factory_free(f); free(f);
     return 1;
 }
 
@@ -1061,10 +1059,8 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     const size_t N = 5;
     secp256k1_keypair kpsA[5], kpsB[5];
     factory_t *fA = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(fA);
     factory_t *fB = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(fB);
-    if (!fA || !fB) { free(fA); free(fB); return 0; }
+    if (!fA || !fB) { factory_free(fA); factory_free(fB); free(fA); free(fB); return 0; }
 
     unsigned char spkA[34], spkB[34];
     char txidA[65], txidB[65];
@@ -1074,7 +1070,7 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     /* Build factory A. */
     if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kpsA, fA,
                                 spkA, txidA, &voutA, &amtA)) {
-        free(fA); free(fB); return 0;
+        factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     printf("  rotation[arity=%d]: factory A funded %s:%u  %llu sats\n",
            (int)arity, txidA, voutA, (unsigned long long)amtA);
@@ -1084,7 +1080,7 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
         secp256k1_keypair_create(ctx, &kpsB[i], N_PARTY_SECKEYS[i]);
     if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kpsB, fB,
                                 spkB, txidB, &voutB, &amtB)) {
-        free(fA); free(fB); return 0;
+        factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     printf("  rotation[arity=%d]: factory B funded %s:%u  %llu sats\n",
            (int)arity, txidB, voutB, (unsigned long long)amtB);
@@ -1103,11 +1099,11 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     tx_buf_t ucA;
     tx_buf_init(&ucA, 256);
     if (!build_unsigned_tx(&ucA, NULL, fA->funding_txid, fA->funding_vout,
-                            0xFFFFFFFEu, &rot_out, 1)) { free(fA); free(fB); return 0; }
+                            0xFFFFFFFEu, &rot_out, 1)) { factory_free(fA); factory_free(fB); free(fA); free(fB); return 0; }
     unsigned char shA[32];
     if (!compute_taproot_sighash(shA, ucA.data, ucA.len, 0, spkA, 34,
                                   amtA, 0xFFFFFFFEu)) {
-        tx_buf_free(&ucA); free(fA); free(fB); return 0;
+        tx_buf_free(&ucA); factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     musig_keyagg_t kaA;
     secp256k1_pubkey pksA[5];
@@ -1115,7 +1111,7 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     musig_aggregate_keys(ctx, &kaA, pksA, N);
     unsigned char sigA[64];
     if (!musig_sign_taproot(ctx, sigA, shA, kpsA, N, &kaA, NULL)) {
-        tx_buf_free(&ucA); free(fA); free(fB); return 0;
+        tx_buf_free(&ucA); factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     tx_buf_t scA;
     tx_buf_init(&scA, 256);
@@ -1150,7 +1146,7 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     tx_buf_t ucB;
     tx_buf_init(&ucB, 256);
     if (!build_unsigned_tx(&ucB, NULL, fB->funding_txid, fB->funding_vout,
-                            0xFFFFFFFEu, outs, N)) { free(fA); free(fB); return 0; }
+                            0xFFFFFFFEu, outs, N)) { factory_free(fA); factory_free(fB); free(fA); free(fB); return 0; }
     unsigned char shB[32];
     compute_taproot_sighash(shB, ucB.data, ucB.len, 0, spkB, 34,
                              amtB, 0xFFFFFFFEu);
@@ -1177,12 +1173,12 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
 
     /* Gauntlet: each party sweeps their B-close output. */
     if (!spend_coop_close_gauntlet(ctx, rt, cB_txid, N_PARTY_SECKEYS, N - 1)) {
-        free(fA); free(fB); return 0;
+        factory_free(fA); factory_free(fB); free(fA); free(fB); return 0;
     }
     printf("  rotation[arity=%d]: balance carried A→B, all 5 parties swept ✓\n",
            (int)arity);
 
-    free(fA); free(fB);
+    factory_free(fA); factory_free(fB); free(fA); free(fB);
     return 1;
 }
 
@@ -1316,7 +1312,6 @@ static int run_full_tree_force_close_for_arity(regtest_t *rt,
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -1325,7 +1320,7 @@ static int run_full_tree_force_close_for_arity(regtest_t *rt,
     uint64_t fund_amount = 0;
     if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kps, f,
                                fund_spk, fund_txid, &fund_vout, &fund_amount)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  [arity=%d] factory funded: %s:%u  %llu sats  %zu nodes\n",
            (int)arity, fund_txid, fund_vout,
@@ -1413,7 +1408,6 @@ static int run_k2_ps_subfactory_force_close(regtest_t *rt,
     const size_t N = 5;  /* 1 LSP + 4 clients */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -1426,37 +1420,37 @@ static int run_k2_ps_subfactory_force_close(regtest_t *rt,
     secp256k1_pubkey pks[5];
     for (size_t i = 0; i < N; i++) {
         if (!secp256k1_keypair_create(ctx, &kps[i], N_PARTY_SECKEYS[i])) {
-            free(f); return 0;
+            factory_free(f); free(f); return 0;
         }
-        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) { free(f); return 0; }
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) { factory_free(f); free(f); return 0; }
     }
     musig_keyagg_t ka;
-    if (!musig_aggregate_keys(ctx, &ka, pks, N)) { free(f); return 0; }
+    if (!musig_aggregate_keys(ctx, &ka, pks, N)) { factory_free(f); free(f); return 0; }
     unsigned char agg_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ctx, agg_ser, &ka.agg_pubkey)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     unsigned char tweak[32];
     sha256_tagged("TapTweak", agg_ser, 32, tweak);
     musig_keyagg_t ka_spk = ka;
     secp256k1_pubkey tw_pk;
     if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka_spk.cache, tweak)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     secp256k1_xonly_pubkey tw_xonly;
     if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xonly, NULL, &tw_pk)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     build_p2tr_script_pubkey(fund_spk, &tw_xonly);
     unsigned char tw_ser[32];
     if (!secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &tw_xonly)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     char fund_addr[128];
     if (!regtest_derive_p2tr_address(rt, tw_ser, fund_addr, sizeof(fund_addr))) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
-    if (!regtest_fund_address(rt, fund_addr, 0.005, fund_txid)) { free(f); return 0; }
+    if (!regtest_fund_address(rt, fund_addr, 0.005, fund_txid)) { factory_free(f); free(f); return 0; }
     regtest_mine_blocks(rt, 1, mine_addr);
     fund_vout = UINT32_MAX;
     for (uint32_t v = 0; v < 4; v++) {
@@ -1470,10 +1464,10 @@ static int run_k2_ps_subfactory_force_close(regtest_t *rt,
             break;
         }
     }
-    if (fund_vout == UINT32_MAX) { free(f); return 0; }
+    if (fund_vout == UINT32_MAX) { factory_free(f); free(f); return 0; }
 
     unsigned char txid_bytes[32];
-    if (!hex_decode(fund_txid, txid_bytes, 32)) { free(f); return 0; }
+    if (!hex_decode(fund_txid, txid_bytes, 32)) { factory_free(f); free(f); return 0; }
     reverse_bytes(txid_bytes, 32);
     factory_init(f, ctx, kps, N, 2, 4);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -1670,7 +1664,6 @@ int test_regtest_k2_ps_subfactory_per_client_sweep(void) {
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
     secp256k1_pubkey pks[5];
     for (size_t i = 0; i < N; i++) {
@@ -2419,7 +2412,6 @@ int test_regtest_inversion_of_timeout_default(void) {
     const size_t N = 5;  /* LSP + 4 clients */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -2552,7 +2544,7 @@ int test_regtest_inversion_of_timeout_default(void) {
     printf("  invariant holds: LSP output=0, Σclients=funding-fee ✓\n");
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2595,7 +2587,6 @@ int test_regtest_old_state_poisoning(void) {
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -2709,7 +2700,7 @@ int test_regtest_old_state_poisoning(void) {
     free(old_signed);
     free(new_signed);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2760,7 +2751,6 @@ int test_regtest_kickoff_paired_with_latest_state(void) {
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -2839,7 +2829,7 @@ int test_regtest_kickoff_paired_with_latest_state(void) {
            "                   signed state tx; no orphan kickoff possible ✓\n");
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2903,7 +2893,6 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
     const size_t N = 2;  /* LSP + 1 client (smallest arity-1 factory) */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -3122,7 +3111,7 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
     econ_print_summary(&econ);
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -3162,7 +3151,6 @@ int test_regtest_full_force_close_and_sweep_arity2(void) {
     const size_t N = 5;  /* LSP + 4 clients → 2 arity-2 leaves */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -3381,7 +3369,7 @@ int test_regtest_full_force_close_and_sweep_arity2(void) {
     econ_print_summary(&econ);
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -3423,7 +3411,6 @@ int test_regtest_full_force_close_and_sweep_arityPS(void) {
     const size_t N = 3;  /* LSP + 2 clients → 2 PS leaves */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -3635,7 +3622,7 @@ int test_regtest_full_force_close_and_sweep_arityPS(void) {
     econ_print_summary(&econ);
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -3676,7 +3663,6 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
     const size_t N = 3;  /* LSP + 2 clients -> 2 PS leaves of 1 client each */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -4056,7 +4042,7 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
     econ_print_summary(&econ);
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     return 1;
 }
 
@@ -4136,7 +4122,6 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     const size_t N = n_participants;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -4145,7 +4130,7 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     uint64_t fund_amount = 0;
     if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kps, f,
                                fund_spk, fund_txid, &fund_vout, &fund_amount)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  [arity=%d N=%zu] factory funded: %llu sats, %zu nodes, %d leaves\n",
            (int)arity, N, (unsigned long long)fund_amount, f->n_nodes,
@@ -4569,7 +4554,7 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     return 1;
 }
 
@@ -4605,7 +4590,6 @@ static int run_htlc_breach_for_arity(regtest_t *rt,
     const size_t N = n_participants;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -4614,7 +4598,7 @@ static int run_htlc_breach_for_arity(regtest_t *rt,
     uint64_t fund_amount = 0;
     if (!fund_n_party_factory(rt, ctx, N, arity, mine_addr, kps, f,
                                fund_spk, fund_txid, &fund_vout, &fund_amount)) {
-        free(f); return 0;
+        factory_free(f); free(f); return 0;
     }
     printf("  [arity=%d N=%zu] factory funded: %llu sats, %zu nodes, %d leaves\n",
            (int)arity, N, (unsigned long long)fund_amount, f->n_nodes,
@@ -5081,7 +5065,7 @@ static int run_htlc_breach_for_arity(regtest_t *rt,
     channel_cleanup(&lsp_ch);
     channel_cleanup(&client_ch);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     return 1;
 }
 
@@ -5356,7 +5340,6 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8}. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);  /* step_blocks=4, states_per_layer=4 */
     /* Wider N-way state nodes are larger TXs than the binary builder's;
@@ -5638,7 +5621,7 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
     econ_print_summary(&econ);
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -6000,7 +5983,6 @@ static int run_ps_full_lifecycle(regtest_t *rt,
     secp256k1_keypair kps[32];
     secp256k1_pubkey  pks[32];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -6175,7 +6157,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
 
     for (int li = 0; li < n_leaves; li++) ps_leaf_chain_free(&leaf_chains[li]);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     return 1;
 }
 
@@ -6446,7 +6428,6 @@ int test_regtest_ps_old_state_broadcast_fails_n8(void) {
     secp256k1_keypair kps[16];
     secp256k1_pubkey  pks[16];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -6580,7 +6561,7 @@ int test_regtest_ps_old_state_broadcast_fails_n8(void) {
 
     free(chain0_bytes); free(chain1_bytes); free(chain2_bytes);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -6672,7 +6653,6 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -6898,7 +6878,7 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
     free(kps);
     free(pks);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -6979,7 +6959,6 @@ int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -7213,7 +7192,7 @@ int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void) {
     free(kps);
     free(pks);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -7294,7 +7273,6 @@ int test_regtest_nway_n64_dw_advance_resign_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -7539,7 +7517,7 @@ int test_regtest_nway_n64_dw_advance_resign_lifecycle(void) {
     free(kps);
     free(pks);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -7623,7 +7601,6 @@ int test_regtest_static_near_root_lifecycle(void) {
 
     /* Build factory: arity {2,4}, static_threshold=1 (root kickoff-only) */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* PR #104 bumped fee_per_tx to 1000 sats for N-way regtest mempool floor. */
@@ -7852,7 +7829,7 @@ int test_regtest_static_near_root_lifecycle(void) {
 
     free(txids);
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -7923,7 +7900,6 @@ int test_regtest_static_near_root_unilateral_exit(void) {
     TEST_ASSERT(fund_vout != UINT32_MAX, "find fund vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     f->fee_per_tx = 1000;
@@ -7960,7 +7936,7 @@ int test_regtest_static_near_root_unilateral_exit(void) {
            "1-block confirm — proves nsequence=0xFFFFFFFE eliminates BIP-68 CSV\n");
 
     factory_free(f);
-    free(f);
+    factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }

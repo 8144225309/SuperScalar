@@ -43,6 +43,7 @@
 #include <inttypes.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <poll.h>
@@ -2591,13 +2592,76 @@ int main(int argc, char *argv[]) {
        array work, the next limits in order are wall-clock (seeding is serialized,
        ~O(N) round-trips), per-client RSS (~21 MB + ~0.085 MB/N), and `ulimit -n`
        on the LSP (~N+20). */
-    if (n_clients < 1 || n_clients + 1 > FACTORY_MAX_SIGNERS) {
-        fprintf(stderr, "Error: --clients must be 1..%d "
-                "(the LSP co-signs every factory, and the daemon still has fixed "
-                "[FACTORY_MAX_SIGNERS] arrays; lifting this needs those made "
-                "dynamic — see docs/design/distributed-scale-512.md)\n",
-                FACTORY_MAX_SIGNERS - 1);
+    /* The ordinary lifecycle is no longer capped at FACTORY_MAX_SIGNERS. The
+       library's participant-indexed state is now sized to the real count, and
+       both daemon-side arrays that used to bound this are dynamic: the keyagg
+       scratch (lsp_ensure_scratch) and the cooperative-close outputs
+       (calloc n_clients+1). SS_MAX_PARTICIPANTS is the hard ceiling on any
+       peer- or operator-supplied count. */
+    if (n_clients < 1 || n_clients + 1 > SS_MAX_PARTICIPANTS) {
+        fprintf(stderr, "Error: --clients must be 1..%d\n",
+                SS_MAX_PARTICIPANTS - 1);
         return 1;
+    }
+
+    /* The adversarial/demo blocks are a different story. superscalar_lsp_
+       {pre,post}_daemon_tests.inc are #included into main() and still declare
+       31 fixed [FACTORY_MAX_SIGNERS] arrays (keypair sets, dist/close output
+       arrays, rotation snapshots). They are only reachable behind these flags,
+       so gate on the flags rather than capping every operator. Converting them
+       is mechanical but unnecessary for a production-shaped run. */
+    if (n_clients + 1 > FACTORY_MAX_SIGNERS &&
+        (breach_test || cheat_leaf_side >= 0 || cheat_realloc ||
+         cheat_jit || cheat_lstock_buy)) {
+        fprintf(stderr,
+                "Error: --clients %d exceeds %d, and the embedded "
+                "--cheat-*/--test-* blocks still use fixed "
+                "[FACTORY_MAX_SIGNERS] arrays. Run the adversarial modes at "
+                "<= %d clients, or convert those arrays first.\n",
+                n_clients, FACTORY_MAX_SIGNERS - 1, FACTORY_MAX_SIGNERS - 1);
+        return 1;
+    }
+
+    /* File-descriptor budget.  One socket per client, plus the listener, bridge,
+       admin RPC, SQLite handles, logs and stdio.  Raise our own soft limit
+       rather than depending on the operator's shell: a swarm launcher that
+       forgets `ulimit -n` otherwise fails deep inside the ceremony as accept()
+       starts returning EMFILE, which reads like a client-side bug.
+       We only raise the SOFT limit toward the existing hard limit -- no
+       privilege is required for that, and the hard limit still governs. */
+    {
+        struct rlimit rl;
+        rlim_t want = (rlim_t)n_clients + 64;   /* clients + headroom */
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur < want) {
+                rlim_t target = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > want)
+                                ? want : rl.rlim_max;
+                /* Only attempt (and only announce) a real increase: when the
+                   hard limit already caps us, target == rlim_cur and claiming
+                   we "raised 128 -> 128" is just noise in front of the error. */
+                if (target > rl.rlim_cur) {
+                    struct rlimit nrl = rl;
+                    nrl.rlim_cur = target;
+                    if (setrlimit(RLIMIT_NOFILE, &nrl) == 0) {
+                        printf("LSP: raised fd soft limit %llu -> %llu for %d clients\n",
+                               (unsigned long long)rl.rlim_cur,
+                               (unsigned long long)target, n_clients);
+                        rl.rlim_cur = target;
+                    }
+                }
+            }
+            if (rl.rlim_cur < want) {
+                fprintf(stderr,
+                    "Error: fd limit too low — %d clients need ~%llu descriptors "
+                    "but the limit is %llu (hard limit %llu).\n"
+                    "Raise it before launching: ulimit -n %llu\n",
+                    n_clients, (unsigned long long)want,
+                    (unsigned long long)rl.rlim_cur,
+                    (unsigned long long)rl.rlim_max,
+                    (unsigned long long)want);
+                return 1;
+            }
+        }
     }
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
        in mixed mode the LAST entry can be any 1..15 since interior arities
@@ -3300,11 +3364,23 @@ int main(int argc, char *argv[]) {
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                /* Heap, sized to the participant count: this block sits inside
+                   main()'s already-huge frame and the array is dead right after
+                   the aggregate, so it is freed immediately -- before any of the
+                   later returns in this scope, which is why no cleanup label is
+                   needed. */
+                secp256k1_pubkey *all_pks = (secp256k1_pubkey *)calloc(
+                    lsp_rp->factory.n_participants, sizeof(secp256k1_pubkey));
+                if (!all_pks) {
+                    fprintf(stderr, "LSP recovery: out of memory for %zu participant keys\n",
+                            lsp_rp->factory.n_participants);
+                    return 1;
+                }
                 for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
                     all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
                                        lsp_rp->factory.n_participants);
+                free(all_pks);   /* dead from here; no later path uses it */
                 unsigned char is2[32];
                 if (!secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey)) {
                     fprintf(stderr, "LSP recovery: xonly serialize failed\n");
@@ -3803,7 +3879,21 @@ accept_new_factory:
 
     /* === Phase 2: Compute funding address === */
     size_t n_total = 1 + lsp_p->n_clients;
-    secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+    /* Reuse the LSP's ceremony scratch rather than a fixed stack array: this is
+       the site ASan named once lsp_accept_clients was converted
+         WRITE of size 64 (= secp256k1_pubkey) at superscalar_lsp.c:3852
+         stack-buffer-overflow, frame main() with 524 objects
+       main()'s frame is already ~287 KB, so a [FACTORY_MAX_SIGNERS] array here
+       is the worst possible place for one.  scratch_pubkeys is sized to
+       expected_clients+1 by lsp_accept_clients (which has already run) and is
+       freed in lsp_cleanup, so there is nothing to free on main's many exits. */
+    if (!lsp_ensure_scratch(lsp_p, n_total)) {
+        fprintf(stderr, "LSP: out of memory sizing keyagg scratch for %zu participants\n",
+                n_total);
+        lsp_cleanup(lsp_p);
+        return 1;
+    }
+    secp256k1_pubkey *all_pks = lsp_p->scratch_pubkeys;
     all_pks[0] = lsp_p->lsp_pubkey;
     for (size_t i = 0; i < lsp_p->n_clients; i++)
         all_pks[i + 1] = lsp_p->client_pubkeys[i];
@@ -4093,8 +4183,14 @@ accept_new_factory:
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* Populate default profiles from CLI config */
-    for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
+    /* Populate default profiles from CLI config.
+       Bound by the ALLOCATION (config.max_signers, which factory_config_fit
+       sets to the participant count), not the compile-time FACTORY_MAX_SIGNERS.
+       With the 255-client CLI wall lifted, clamping at 256 here would leave
+       participants 256+ with profit_share_bps = 0 and contribution_sats = 0 --
+       silently offering them nothing. */
+    for (size_t pi = 0; pi < (size_t)(1 + n_clients) &&
+                        pi < lsp_p->factory.config.max_signers; pi++) {
         lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
             /* LSP gets remainder of profit share */
@@ -4113,7 +4209,8 @@ accept_new_factory:
        The test PASSES if factory creation fails (client rejection). */
     if (test_bad_terms) {
         lsp_p->factory.economic_mode = ECON_PROFIT_SHARED;
-        for (size_t pi = 1; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++)
+        for (size_t pi = 1; pi < (size_t)(1 + n_clients) &&
+                            pi < lsp_p->factory.config.max_signers; pi++)
             lsp_p->factory.profiles[pi].profit_share_bps = 0;
         lsp_p->factory.profiles[0].profit_share_bps = 10000; /* LSP takes 100% */
         printf("LSP: --test-bad-terms: offering 0 bps profit to all clients\n");
@@ -4785,7 +4882,19 @@ accept_new_factory:
     }
     printf("LSP: starting cooperative close...\n");
 
-    tx_output_t close_outputs[FACTORY_MAX_SIGNERS];
+    /* Heap: the close builds one output per participant, so a fixed
+       [FACTORY_MAX_SIGNERS] array here caps the cooperative close at 255 parties
+       independently of everything else.  Sized to n_clients+1 (every client plus
+       the LSP).  Lives until process exit -- this is main()'s terminal path and
+       the buffer is in use right through the close ceremony, so freeing it early
+       would be wrong and freeing it late buys nothing. */
+    tx_output_t *close_outputs = (tx_output_t *)calloc(lsp_p->n_clients + 1,
+                                                         sizeof(tx_output_t));
+    if (!close_outputs) {
+        fprintf(stderr, "LSP: out of memory for %zu close outputs\n",
+                lsp_p->n_clients + 1);
+        return 1;
+    }
     size_t n_close_outputs;
 
     /* Get wallet-controlled address for close outputs (UTXO recycling) */
