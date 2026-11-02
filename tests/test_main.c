@@ -3383,6 +3383,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_commit_busy_retried_once);
     extern int test_restart_commit_failure_rolls_back(void);
     RUN_TEST(test_restart_commit_failure_rolls_back);
+    extern int test_restart_client_reconnect_attaches_db(void);
+    RUN_TEST(test_restart_client_reconnect_attaches_db);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");
