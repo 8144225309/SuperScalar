@@ -2077,6 +2077,103 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     return lsp_advance_leaf_stateless(mgr, lsp, leaf_side);
 }
 
+/* Per-affected-node working buffers for the LSP side of the Tier B ceremony.
+   A root rollover rebuilds the whole tree, so the affected count can be every
+   node: these hold f->n_nodes entries.  They were fixed [FACTORY_MAX_NODES]
+   (512) stack arrays, which an arity-1 tree (4N-2 nodes) overflows from N=129.
+   Owned by the wrapper below so every early return of the body frees them. */
+typedef struct {
+    size_t cap;
+    size_t *affected;
+    int *poison_prepared;
+    unsigned char (*poison_old_txid)[32];
+    uint64_t *poison_old_l_amount;
+    int *poison_client_slot;
+    unsigned char (*lsp_poison_pubnonces)[66];
+    unsigned char (*lsp_poison_psigs)[32];
+    int *wt_had_old;
+    uint64_t *wt_old_chain_amount;
+    unsigned char (*wt_old_chain_spk)[34];
+    size_t *wt_old_chain_spk_len;
+    uint32_t *wt_old_csv_delay;
+    unsigned char (*client_pubnonces)[66];
+    int *client_slot;
+    unsigned char (*this_client_pn)[66];
+    unsigned char (*this_client_poison_pn)[66];
+    int *lsp_slot;
+    unsigned char (*lsp_pubnonces)[66];
+    unsigned char (*lsp_psigs)[32];
+    unsigned char (*this_client_psigs)[32];
+    unsigned char (*this_client_poison_psigs)[32];
+    /* The state-nonce pool, on the heap so tierb_lsp_bufs_free can wipe any
+       secnonces an early return leaves unconsumed. */
+    musig_nonce_pool_t *nonce_pool;
+} tierb_lsp_bufs_t;
+
+static int tierb_lsp_bufs_alloc(tierb_lsp_bufs_t *b, size_t n) {
+    if (n == 0) n = 1;
+    b->cap = n;
+    b->affected                 = calloc(n, sizeof(*b->affected));
+    b->poison_prepared          = calloc(n, sizeof(*b->poison_prepared));
+    b->poison_old_txid          = calloc(n, sizeof(*b->poison_old_txid));
+    b->poison_old_l_amount      = calloc(n, sizeof(*b->poison_old_l_amount));
+    b->poison_client_slot       = calloc(n, sizeof(*b->poison_client_slot));
+    b->lsp_poison_pubnonces     = calloc(n, sizeof(*b->lsp_poison_pubnonces));
+    b->lsp_poison_psigs         = calloc(n, sizeof(*b->lsp_poison_psigs));
+    b->wt_had_old               = calloc(n, sizeof(*b->wt_had_old));
+    b->wt_old_chain_amount      = calloc(n, sizeof(*b->wt_old_chain_amount));
+    b->wt_old_chain_spk         = calloc(n, sizeof(*b->wt_old_chain_spk));
+    b->wt_old_chain_spk_len     = calloc(n, sizeof(*b->wt_old_chain_spk_len));
+    b->wt_old_csv_delay         = calloc(n, sizeof(*b->wt_old_csv_delay));
+    b->client_pubnonces         = calloc(n, sizeof(*b->client_pubnonces));
+    b->client_slot              = calloc(n, sizeof(*b->client_slot));
+    b->this_client_pn           = calloc(n, sizeof(*b->this_client_pn));
+    b->this_client_poison_pn    = calloc(n, sizeof(*b->this_client_poison_pn));
+    b->lsp_slot                 = calloc(n, sizeof(*b->lsp_slot));
+    b->lsp_pubnonces            = calloc(n, sizeof(*b->lsp_pubnonces));
+    b->lsp_psigs                = calloc(n, sizeof(*b->lsp_psigs));
+    b->this_client_psigs        = calloc(n, sizeof(*b->this_client_psigs));
+    b->this_client_poison_psigs = calloc(n, sizeof(*b->this_client_poison_psigs));
+    b->nonce_pool               = calloc(1, sizeof(*b->nonce_pool));
+    return b->nonce_pool && b->affected && b->poison_prepared && b->poison_old_txid &&
+           b->poison_old_l_amount && b->poison_client_slot &&
+           b->lsp_poison_pubnonces && b->lsp_poison_psigs && b->wt_had_old &&
+           b->wt_old_chain_amount && b->wt_old_chain_spk &&
+           b->wt_old_chain_spk_len && b->wt_old_csv_delay &&
+           b->client_pubnonces && b->client_slot && b->this_client_pn &&
+           b->this_client_poison_pn && b->lsp_slot && b->lsp_pubnonces &&
+           b->lsp_psigs && b->this_client_psigs && b->this_client_poison_psigs;
+}
+
+static void tierb_lsp_bufs_free(tierb_lsp_bufs_t *b) {
+    if (b->nonce_pool) {
+        secure_zero(b->nonce_pool, sizeof(*b->nonce_pool));
+        free(b->nonce_pool);
+    }
+    free(b->affected);
+    free(b->poison_prepared);
+    free(b->poison_old_txid);
+    free(b->poison_old_l_amount);
+    free(b->poison_client_slot);
+    free(b->lsp_poison_pubnonces);
+    free(b->lsp_poison_psigs);
+    free(b->wt_had_old);
+    free(b->wt_old_chain_amount);
+    free(b->wt_old_chain_spk);
+    free(b->wt_old_chain_spk_len);
+    free(b->wt_old_csv_delay);
+    free(b->client_pubnonces);
+    free(b->client_slot);
+    free(b->this_client_pn);
+    free(b->this_client_poison_pn);
+    free(b->lsp_slot);
+    free(b->lsp_pubnonces);
+    free(b->lsp_psigs);
+    free(b->this_client_psigs);
+    free(b->this_client_poison_psigs);
+    memset(b, 0, sizeof(*b));
+}
+
 /* Tier B state-advance ceremony driver (Gap B + F).
 
    Triggered when factory_advance_leaf_unsigned() returns -1 — the
@@ -2118,10 +2215,10 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
 
    Returns: 1 on success, 0 on failure, -1 if the stateless function cannot
    handle this case (caller falls through to legacy). */
-static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
-                                             lsp_t *lsp,
-                                             int trigger_leaf_side) {
-    if (!mgr || !lsp) return 0;
+static int lsp_run_state_advance_stateless_body(lsp_channel_mgr_t *mgr,
+                                                  lsp_t *lsp,
+                                                  int trigger_leaf_side,
+                                                  tierb_lsp_bufs_t *bufs) {
     factory_t *f = &lsp->factory;
 
     /* Phase 1e.2.e (Tier B poison wiring): the watchtower is configured in
@@ -2131,7 +2228,13 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        poison_prepared[k]; a degraded leaf simply registers without poison. */
 
     /* Step 1: Build affected[] (same logic as legacy at line ~2725). */
-    size_t affected[FACTORY_MAX_NODES];
+    if (!tierb_lsp_bufs_alloc(bufs, f->n_nodes)) {
+        fprintf(stderr,
+            "LSP-stateless Tier B: alloc per-node buffers (%zu nodes) failed\n",
+            f->n_nodes);
+        return 0;
+    }
+    size_t *affected = bufs->affected;
     size_t n_affected = 0;
     for (size_t i = 0; i < f->n_nodes; i++) {
         const factory_node_t *n = &f->nodes[i];
@@ -2199,20 +2302,20 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        PS leaves carry no L-stock poison (it lives in their sub-factory chain).
        Per-affected-node arrays indexed by affected[] order (k). */
     const uint64_t TIERB_POISON_FEE_SATS = 1000;
-    int poison_prepared[FACTORY_MAX_NODES];
-    unsigned char poison_old_txid[FACTORY_MAX_NODES][32];
-    uint64_t poison_old_l_amount[FACTORY_MAX_NODES];
-    int poison_client_slot[FACTORY_MAX_NODES];
-    unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    int *poison_prepared = bufs->poison_prepared;
+    unsigned char (*poison_old_txid)[32] = bufs->poison_old_txid;
+    uint64_t *poison_old_l_amount = bufs->poison_old_l_amount;
+    int *poison_client_slot = bufs->poison_client_slot;
+    unsigned char (*lsp_poison_pubnonces_per_node)[66] = bufs->lsp_poison_pubnonces;
+    unsigned char (*lsp_poison_psigs_per_node)[32] = bufs->lsp_poison_psigs;
     /* SF-WT-TRUSTLESS Phase 1b.5 (#248): per-affected-node snapshot of
      * the OLD chain output (vout=0) value + SPK + BIP-68 CSV.  Indexed
      * by affected[] order (k), mirrors the per-k poison_* arrays. */
-    int wt_had_old[FACTORY_MAX_NODES];
-    uint64_t wt_old_chain_amount[FACTORY_MAX_NODES];
-    unsigned char wt_old_chain_spk[FACTORY_MAX_NODES][34];
-    size_t wt_old_chain_spk_len[FACTORY_MAX_NODES];
-    uint32_t wt_old_csv_delay[FACTORY_MAX_NODES];
+    int *wt_had_old = bufs->wt_had_old;
+    uint64_t *wt_old_chain_amount = bufs->wt_old_chain_amount;
+    unsigned char (*wt_old_chain_spk)[34] = bufs->wt_old_chain_spk;
+    size_t *wt_old_chain_spk_len = bufs->wt_old_chain_spk_len;
+    uint32_t *wt_old_csv_delay = bufs->wt_old_csv_delay;
     for (size_t k = 0; k < n_affected; k++) {
         poison_prepared[k] = 0;
         poison_client_slot[k] = -1;
@@ -2316,8 +2419,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        Wire format is per-leaf array (66 bytes each) indexed by affected[] order.
        Client must produce nonces only for affected nodes where they sign;
        non-participating slots get all-zero buffers (skip those). */
-    unsigned char client_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    int client_slot_per_node[FACTORY_MAX_NODES];
+    unsigned char (*client_pubnonces_per_node)[66] = bufs->client_pubnonces;
+    int *client_slot_per_node = bufs->client_slot;
     (void)client_slot_per_node; /* recorded for future audit; unused in MVP */
     for (size_t k = 0; k < n_affected; k++) client_slot_per_node[k] = -1;
 
@@ -2332,9 +2435,9 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             if (nmsg.json) cJSON_Delete(nmsg.json);
             return 0;
         }
-        unsigned char this_client_pn[FACTORY_MAX_NODES][66];
-        unsigned char this_client_poison_pn[FACTORY_MAX_NODES][66];
-        memset(this_client_poison_pn, 0, sizeof(this_client_poison_pn));
+        unsigned char (*this_client_pn)[66] = bufs->this_client_pn;
+        unsigned char (*this_client_poison_pn)[66] = bufs->this_client_poison_pn;
+        memset(this_client_poison_pn, 0, bufs->cap * sizeof(*this_client_poison_pn));
         if (!wire_parse_state_adv_client_path_nonces(nmsg.json,
                                                        (unsigned char *)this_client_pn,
                                                        (uint32_t)n_affected,
@@ -2421,10 +2524,10 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         return 0;
     }
 
-    musig_nonce_pool_t lsp_pool;
+    musig_nonce_pool_t *lsp_pool = bufs->nonce_pool;
     unsigned char lsp_seckey[32];
     if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) return 0;
-    if (!musig_nonce_pool_generate(lsp->ctx, &lsp_pool, lsp_node_count,
+    if (!musig_nonce_pool_generate(lsp->ctx, lsp_pool, lsp_node_count,
                                     lsp_seckey, &lsp->lsp_pubkey, NULL)) {
         memset(lsp_seckey, 0, 32);
         fprintf(stderr, "LSP-stateless Tier B: nonce pool gen failed\n");
@@ -2432,10 +2535,10 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     }
     memset(lsp_seckey, 0, 32);
 
-    int lsp_slot_per_node[FACTORY_MAX_NODES];
+    int *lsp_slot_per_node = bufs->lsp_slot;
     (void)lsp_slot_per_node; /* recorded for future audit; unused in MVP */
-    unsigned char lsp_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    unsigned char lsp_psigs_per_node[FACTORY_MAX_NODES][32];
+    unsigned char (*lsp_pubnonces_per_node)[66] = bufs->lsp_pubnonces;
+    unsigned char (*lsp_psigs_per_node)[32] = bufs->lsp_psigs;
     for (size_t k = 0; k < n_affected; k++) {
         lsp_slot_per_node[k] = -1;
         memset(lsp_pubnonces_per_node[k], 0, 66);
@@ -2448,7 +2551,7 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         if (slot < 0) continue;
         secp256k1_musig_secnonce *sec;
         secp256k1_musig_pubnonce pub;
-        if (!musig_nonce_pool_next(&lsp_pool, &sec, &pub)) {
+        if (!musig_nonce_pool_next(lsp_pool, &sec, &pub)) {
             fprintf(stderr,
                 "LSP-stateless Tier B: pool exhausted at node %zu\n", affected[k]);
             return 0;
@@ -2591,9 +2694,9 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
             if (pmsg.json) cJSON_Delete(pmsg.json);
             return 0;
         }
-        unsigned char this_client_psigs[FACTORY_MAX_NODES][32];
-        unsigned char this_client_poison_psigs[FACTORY_MAX_NODES][32];
-        memset(this_client_poison_psigs, 0, sizeof(this_client_poison_psigs));
+        unsigned char (*this_client_psigs)[32] = bufs->this_client_psigs;
+        unsigned char (*this_client_poison_psigs)[32] = bufs->this_client_poison_psigs;
+        memset(this_client_poison_psigs, 0, bufs->cap * sizeof(*this_client_poison_psigs));
         if (!wire_parse_state_adv_client_final_psigs(pmsg.json,
                                                        (unsigned char *)this_client_psigs,
                                                        (uint32_t)n_affected,
@@ -2815,6 +2918,17 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
         exit(0);
     }
     return 1;
+}
+
+static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
+                                             lsp_t *lsp,
+                                             int trigger_leaf_side) {
+    if (!mgr || !lsp) return 0;
+    tierb_lsp_bufs_t bufs;
+    memset(&bufs, 0, sizeof(bufs));
+    int rc = lsp_run_state_advance_stateless_body(mgr, lsp, trigger_leaf_side, &bufs);
+    tierb_lsp_bufs_free(&bufs);
+    return rc;
 }
 
 int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,

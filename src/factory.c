@@ -1074,15 +1074,28 @@ static size_t split_clients_for_arity(int a, size_t nc, size_t out[]) {
 }
 
 /* Simulate the variable-arity tree to compute leaf count and max depth.
-   Returns leaf count via *leaves_out and max depth via *depth_out. */
+   Returns leaf count via *leaves_out and max depth via *depth_out.
+   Returns 1 on success, 0 if the DFS stack could not be allocated (outputs
+   are then 0 and must not be used). */
 typedef struct { size_t nc; int depth; } simulate_frame_t;
 
-static void simulate_tree(const factory_t *f, size_t n_clients,
-                           int *depth_out, int *leaves_out) {
-    /* Recursive simulation via stack */
+static int simulate_tree(const factory_t *f, size_t n_clients,
+                          int *depth_out, int *leaves_out) {
+    /* Recursive simulation via stack.  Every pending frame holds a disjoint,
+       non-empty share of the clients (a non-leaf split never yields an empty
+       child), so the stack never holds more than n_clients frames.  Bounded
+       by that rather than FACTORY_MAX_NODES, which is only the seed for
+       config.max_nodes. */
     int leaves = 0;
     int max_depth = 0;
-    simulate_frame_t stack[FACTORY_MAX_NODES];
+    size_t stack_cap = n_clients ? n_clients : 1;
+    simulate_frame_t *stack = calloc(stack_cap, sizeof(*stack));
+    if (!stack) {
+        fprintf(stderr, "simulate_tree: alloc %zu frames failed\n", stack_cap);
+        *depth_out = 0;
+        *leaves_out = 0;
+        return 0;
+    }
     int sp = 0;
     stack[sp].nc = n_clients;
     stack[sp].depth = 0;
@@ -1100,7 +1113,7 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
             size_t parts[FACTORY_MAX_OUTPUTS];
             size_t n_parts = split_clients_for_arity(a, nc, parts);
             for (size_t k = 0; k < n_parts; k++) {
-                if (sp + 1 > FACTORY_MAX_NODES) {
+                if ((size_t)sp + 1 > stack_cap) {
                     fprintf(stderr, "simulate_tree: stack overflow (sp=%d)\n", sp);
                     break;
                 }
@@ -1110,8 +1123,10 @@ static void simulate_tree(const factory_t *f, size_t n_clients,
             }
         }
     }
+    free(stack);
     *depth_out = max_depth;
     *leaves_out = leaves;
+    return 1;
 }
 
 void factory_set_l_stock_csv(factory_t *f, uint32_t csv_blocks) {
@@ -1240,7 +1255,9 @@ void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
 
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
     int depth, n_leaves;
-    simulate_tree(f, nc, &depth, &n_leaves);
+    /* On failure leave the DW counter / leaf layers as they were;
+       factory_build_tree re-simulates and fails the same way. */
+    if (!simulate_tree(f, nc, &depth, &n_leaves)) return;
     int n_layers = dw_n_layers_for(depth, f->static_threshold_depth);
     f->n_leaf_nodes = n_leaves;
     dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
@@ -1260,7 +1277,7 @@ void factory_set_static_near_root(factory_t *f, uint32_t threshold) {
     size_t nc = (f->n_participants > 1) ? f->n_participants - 1 : 1;
     int depth, n_leaves;
     if (f->n_level_arity > 0) {
-        simulate_tree(f, nc, &depth, &n_leaves);
+        if (!simulate_tree(f, nc, &depth, &n_leaves)) return;  /* see set_level_arity */
     } else {
         size_t cap = ps_leaf_capacity(f);
         depth = compute_tree_depth_psk(nc, f->leaf_arity, cap);
@@ -1972,7 +1989,7 @@ int factory_build_tree(factory_t *f) {
     /* Compute tree metrics (variable arity uses simulation) */
     int tree_depth, n_leaves;
     if (f->n_level_arity > 0) {
-        simulate_tree(f, n_clients, &tree_depth, &n_leaves);
+        if (!simulate_tree(f, n_clients, &tree_depth, &n_leaves)) return 0;
     } else {
         size_t cap = ps_leaf_capacity(f);
         tree_depth = compute_tree_depth_psk(n_clients, f->leaf_arity, cap);
@@ -2231,8 +2248,8 @@ size_t factory_count_nodes_for_participant(const factory_t *f,
 /* --- Path-scoped signing implementation --- */
 
 int factory_sessions_init_path(factory_t *f, int leaf_node_idx) {
-    int path[FACTORY_MAX_NODES];
-    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    int path[f->n_nodes ? f->n_nodes : 1];   /* a path visits each node at most once */
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, f->n_nodes);
     if (n == 0) return 0;
 
     for (size_t i = 0; i < n; i++) {
@@ -2246,8 +2263,8 @@ int factory_sessions_init_path(factory_t *f, int leaf_node_idx) {
 }
 
 int factory_sessions_finalize_path(factory_t *f, int leaf_node_idx) {
-    int path[FACTORY_MAX_NODES];
-    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    int path[f->n_nodes ? f->n_nodes : 1];   /* a path visits each node at most once */
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, f->n_nodes);
     if (n == 0) return 0;
 
     for (size_t i = 0; i < n; i++) {
@@ -2266,8 +2283,8 @@ int factory_sessions_finalize_path(factory_t *f, int leaf_node_idx) {
 }
 
 int factory_sessions_complete_path(factory_t *f, int leaf_node_idx) {
-    int path[FACTORY_MAX_NODES];
-    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    int path[f->n_nodes ? f->n_nodes : 1];   /* a path visits each node at most once */
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, f->n_nodes);
     if (n == 0) return 0;
 
     for (size_t i = 0; i < n; i++) {
@@ -2292,8 +2309,8 @@ int factory_sessions_complete_path(factory_t *f, int leaf_node_idx) {
 }
 
 int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx) {
-    int path[FACTORY_MAX_NODES];
-    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, FACTORY_MAX_NODES);
+    int path[f->n_nodes ? f->n_nodes : 1];   /* a path visits each node at most once */
+    size_t n = factory_collect_path_to_root(f, leaf_node_idx, path, f->n_nodes);
     if (n == 0) return 0;
 
     /* Rebuild unsigned txs for path nodes only (root-first order) */
@@ -4884,19 +4901,25 @@ size_t factory_collect_path_to_root(const factory_t *f, int start_idx,
     if (!f || start_idx < 0 || (size_t)start_idx >= f->n_nodes || max_path == 0)
         return 0;
 
-    /* Walk parent chain, storing in reverse order */
-    int tmp[FACTORY_MAX_NODES];
+    /* Measure the parent chain, then fill path_out root-first.  A path visits
+       distinct nodes, so n_nodes bounds it (and stops a cyclic chain).  Was a
+       tmp[FACTORY_MAX_NODES] copy bounded by the 512 seed value. */
     size_t count = 0;
     int idx = start_idx;
-    while (idx >= 0 && count < FACTORY_MAX_NODES) {
-        tmp[count++] = idx;
+    while (idx >= 0 && (size_t)idx < f->n_nodes && count < f->n_nodes) {
+        count++;
         idx = f->nodes[idx].parent_index;
     }
 
-    /* Reverse into path_out (root-first) */
+    /* The node `d` steps above start_idx lands at position count-1-d; keep
+       the root-first prefix that fits in max_path. */
     size_t written = count < max_path ? count : max_path;
-    for (size_t i = 0; i < written; i++)
-        path_out[i] = tmp[count - 1 - i];
+    idx = start_idx;
+    for (size_t d = 0; d < count; d++) {
+        size_t pos = count - 1 - d;
+        if (pos < written) path_out[pos] = idx;
+        idx = f->nodes[idx].parent_index;
+    }
     return written;
 }
 
@@ -5058,9 +5081,14 @@ uint32_t factory_compute_ewt_for_shape(
     if (n_clients == 0) return 0;
 
     /* Walk the tree to find max depth. Same algorithm as simulate_tree
-       but without needing a factory_t. Stack-based DFS. */
+       but without needing a factory_t. Stack-based DFS; same n_clients
+       bound on the stack as simulate_tree (pending frames are disjoint,
+       non-empty client shares). */
     typedef struct { size_t nc; int depth; } frame_t;
-    frame_t stack[FACTORY_MAX_NODES];
+    size_t stack_cap = n_clients;
+    frame_t *stack = calloc(stack_cap, sizeof(*stack));
+    /* Fail closed: an unknown ewt must read as "exceeds every ceiling". */
+    if (!stack) return UINT32_MAX;
     int sp = 0;
     int max_depth = 0;
     int has_ps_leaf = 0;
@@ -5113,12 +5141,13 @@ uint32_t factory_compute_ewt_for_shape(
             n_parts = children;
         }
         for (size_t k = 0; k < n_parts; k++) {
-            if (sp + 1 > FACTORY_MAX_NODES) break;
+            if ((size_t)sp + 1 > stack_cap) break;
             stack[sp].nc = parts[k];
             stack[sp].depth = d + 1;
             sp++;
         }
     }
+    free(stack);
 
     /* dw_n_layers_for logic */
     int t = (int)static_threshold;

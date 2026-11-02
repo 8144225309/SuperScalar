@@ -1904,6 +1904,9 @@ extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
+extern int test_client_tier_b_state_advance_above_512_nodes(void);
+extern int test_tier_b_state_advance_real_lsp_and_clients(void);
+extern int test_tier_b_state_advance_lsp_above_512_nodes_fails_cleanly(void);
 extern int test_sweep_persist_roundtrip(void);
 
 /* Mainnet Audit: Shell Injection Fix */
@@ -3804,6 +3807,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
+    RUN_TEST(test_client_tier_b_state_advance_above_512_nodes);
+    RUN_TEST(test_tier_b_state_advance_real_lsp_and_clients);
+    RUN_TEST(test_tier_b_state_advance_lsp_above_512_nodes_fails_cleanly);
     RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
