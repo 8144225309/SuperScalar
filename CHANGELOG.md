@@ -30,6 +30,7 @@ All notable changes to SuperScalar are documented here.
 - PS chains load only the current epoch's linked rows.
 - Before releasing a signature on an advance, the LSP and the client record the TX (the LSP also does so at factory creation); after a restart only the identical TX can be signed in that position. A root advance whose signatures went out but was not stored freezes leaf operations until that same advance completes.
 - On-request L-stock reveals stop at the stored state.
+- A client that crashed after signing a root advance catches up on reconnect (`MSG_TREE_CATCHUP`). The LSP records clients that withhold a root advance, re-drives it at most once per block, and escalates after `--freeze-max-blocks` (CRITICAL, `listfactories`); `--freeze-force-close` (off by default) also starts the force-close.
 - **Upgrading:** schema v43; older builds refuse the DB. Factories that advanced under a build without this change (no stored L-stock rows) reload with advances refused. Never restore an old DB backup of a live factory.
 
 ## v0.2.0 — 2026-07-02
