@@ -3157,6 +3157,10 @@ int main(int argc, char *argv[]) {
             if (!mgr) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(lsp_rp); return 1; }
             g_channel_mgr = mgr;
             mgr->fee = fee_est;
+            /* Before init: lsp_channels_init_from_db attaches it to every
+               restored channel, so revocations and remote PCPs received
+               after the restart are written to the DB. */
+            mgr->persist = &db;
             if (!lsp_channels_init_from_db(mgr, ctx, &lsp_rp->factory, lsp_seckey,
                                              rec_n_clients, &db)) {
                 fprintf(stderr, "LSP recovery: channel init from DB failed\n");
@@ -3167,7 +3171,6 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
-            mgr->persist = &db;
             mgr->confirm_timeout_secs = confirm_timeout_secs;
             mgr->heartbeat_interval = heartbeat_interval;
 

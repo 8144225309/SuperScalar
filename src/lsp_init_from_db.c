@@ -35,13 +35,23 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
     if (n_clients == 0) return 0;
 
+    /* Each restored channel writes received revocations and remote PCPs
+       back to the DB it was restored from (channel_set_persist below), so
+       mgr->persist is set to pdb here rather than trusted from the caller:
+       the LSP restart path used to assign it only after this call, which
+       left every restored channel with no DB.  A different handle is
+       refused. */
+    if (mgr->persist && mgr->persist != pdb) {
+        fprintf(stderr, "LSP recovery: mgr->persist is not the DB being "
+                "restored from; refusing\n");
+        return 0;
+    }
+
     /* Preserve fields set before init (caller may configure these).
-       Mirror of lsp_channels_init — see comment there for why mgr->persist
-       must survive the memset. */
+       Mirror of lsp_channels_init. */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     void *saved_fee2 = mgr->fee;
-    void *saved_persist = mgr->persist;
     economic_mode_t saved_econ = mgr->economic_mode;
     uint16_t saved_profit_bps = mgr->default_profit_bps;
     uint32_t saved_settle_interval = mgr->settlement_interval_blocks;
@@ -49,7 +59,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
     mgr->fee = saved_fee2;
-    mgr->persist = saved_persist;
+    mgr->persist = pdb;
     mgr->economic_mode = saved_econ;
     mgr->default_profit_bps = saved_profit_bps;
     mgr->settlement_interval_blocks = saved_settle_interval;

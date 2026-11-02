@@ -3343,6 +3343,12 @@ static void run_unit_tests(void) {
     printf("\n=== Persistence Stress ===\n");
     RUN_TEST(test_persist_crash_stress);
     RUN_TEST(test_persist_crash_dw_state);
+
+    /* LSP restart / reconnect persistence */
+    extern int test_restart_lsp_revocation_persisted_after_restore(void);
+    RUN_TEST(test_restart_lsp_revocation_persisted_after_restore);
+    extern int test_restart_init_from_db_refuses_other_db(void);
+    RUN_TEST(test_restart_init_from_db_refuses_other_db);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");
