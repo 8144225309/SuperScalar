@@ -106,6 +106,12 @@ typedef struct {
      * follow in Phase 1b.2.  See docs/watchtower-trustless-schema.md
      * for the trust model. */
     persist_wt_t *wt_db;
+
+    /* Set by lsp_run_cooperative_close once the fully signed close exists and
+       is about to go to the clients (after it is persisted as 'closing').
+       From then on any client can publish that close, so this factory is not
+       served again: the daemon loop stops and no HTLC is accepted. */
+    int closing;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */
@@ -133,6 +139,32 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                                tx_buf_t *close_tx_out,
                                const tx_output_t *outputs, size_t n_outputs,
                                uint32_t current_height);
+
+/* Start-up handling of a factory whose cooperative close was signed and handed
+   to the clients ('closing', persisted before CLOSE_DONE).  Any client can
+   publish that close, so the factory must never be served again.
+
+   Re-broadcasts the queued close.  If it confirmed, marks the factory closed.
+   Otherwise the factory stays 'closing'; with force_close set, the signed
+   factory tree is also published from the DB (factory_recovery_run, one
+   pass): the operator's way out when the close cannot confirm, e.g. its fee
+   is too low.  The close and the tree both spend the funding output, so
+   whichever confirms first wins; once the tree's root confirms the close can
+   no longer confirm and later runs keep publishing the tree until it is
+   settled (factory_recovery_run then marks the factory closed).
+
+   status (optional) receives a one-line explanation for the operator. */
+enum {
+    LSP_CLOSING_NOT     = -1,  /* not 'closing': serve normally */
+    LSP_CLOSING_DONE    =  0,  /* the close confirmed; factory marked closed */
+    LSP_CLOSING_PENDING =  1,  /* still 'closing': do not serve; run again */
+    LSP_CLOSING_FAILED  =  2   /* force_close: part of the tree cannot be
+                                  published (see status) */
+};
+struct chain_backend;
+int lsp_resume_closing_factory(persist_t *db, struct chain_backend *chain,
+                               uint32_t factory_id, int force_close,
+                               char *status, size_t status_cap);
 
 /* Accept a bridge daemon connection (Phase 14).
    Expects MSG_BRIDGE_HELLO, sends MSG_BRIDGE_HELLO_ACK.

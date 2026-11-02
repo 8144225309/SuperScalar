@@ -26,12 +26,36 @@
 #include <stddef.h>
 
 /*
- * Scan all non-closed factories on daemon startup.
+ * Per-pass outcome of factory_recovery_run.  Counts are over publishable TXs:
+ * one per tree node, plus every Pseudo-Spilman chain entry (chain[0..N]).
+ */
+typedef struct {
+    int n_tree_nodes;   /* tree_nodes rows loaded for the factory */
+    int n_txs;          /* publishable TXs (tree nodes + PS chain entries) */
+    int n_confirmed;
+    int n_in_mempool;   /* already in the mempool before this pass */
+    int n_broadcast;    /* accepted this pass (dry run: would broadcast) */
+    int n_waiting;      /* parent unpublished, or a relative / absolute
+                           timelock not yet reached: retry after more blocks */
+    int n_failed;       /* needed but impossible: bytes missing, history
+                           incomplete, nodes not loaded, or rejected although
+                           every input and timelock was satisfied */
+    int settled;        /* every leaf's current TX confirmed at safe depth */
+    int dry_run;
+    int first_fail_node;        /* -1 when not tied to one node */
+    int first_fail_chain_pos;   /* -1 = plain tree TX */
+    char first_fail_why[96];
+} factory_recovery_result_t;
+
+/*
+ * Scan all non-closed factories on daemon startup (and after a reorg).
  *
- * For each factory whose funding TX is confirmed:
- *   - Find tree nodes with signed_tx_hex but not yet confirmed on chain.
- *   - Broadcast any node whose parent is confirmed (topological order).
- *   - Mark factory 'closed' in DB if all leaf nodes are confirmed.
+ * This NEVER broadcasts: an active factory's tree must not be published just
+ * because its funding confirmed.  It refreshes confirmations and marks a
+ * factory 'closed' once every leaf's current TX is confirmed.  It is not a
+ * rebroadcast path: Core re-mempools reorged-out transactions itself, and
+ * persist_retry_pending_broadcasts / persist_service_queued_broadcasts retry
+ * queued ones.  Publishing a tree is always an explicit factory_recovery_run.
  *
  * chain may be NULL — in that case the scan is a no-op (returns 0).
  * Returns number of factories examined.
@@ -44,7 +68,7 @@ int factory_recovery_scan(persist_t *p, chain_backend_t *chain);
  *
  * Each element: {factory_id, funding_txid, funding_vout,
  *                funding_amount_sats, state, created_at,
- *                n_tree_nodes, n_confirmed, n_leaf, n_leaf_confirmed,
+ *                n_tree_nodes, n_txs, n_confirmed, n_leaf, n_leaf_confirmed,
  *                funding_confs}
  *
  * chain may be NULL (omits confirmation counts).
@@ -53,13 +77,30 @@ int factory_recovery_scan(persist_t *p, chain_backend_t *chain);
 cJSON *factory_recovery_list(persist_t *p, chain_backend_t *chain);
 
 /*
- * Run recovery for one factory: broadcast broadcastable tree nodes.
- * Writes a human-readable result string to status_out (up to cap bytes).
- * Returns 1 if any broadcast succeeded, 0 otherwise.
+ * Run one force-close pass for one factory: publish every TX (tree nodes and
+ * full PS chains, root down) whose inputs and timelocks allow it now.  Call
+ * again after more blocks until res->settled; TXs waiting on a timelock are
+ * not failures.
+ *
+ * Writes a human-readable summary to status_out (up to cap bytes).
+ * Returns 1 when the pass had no failure (it may still be waiting), 0 when
+ * anything needed could not be published: no DB / chain / factory, tree
+ * nodes not all loaded, a node or chain entry without signed bytes, or a TX
+ * rejected although everything it depends on was available.
  */
 int factory_recovery_run(persist_t *p, chain_backend_t *chain,
                          uint32_t factory_id,
                          char *status_out, size_t cap);
+
+/*
+ * As factory_recovery_run, with a per-pass result.  dry_run = 1 reports what
+ * a pass would broadcast (n_broadcast) without sending anything or marking
+ * the factory closed.  res may be NULL.
+ */
+int factory_recovery_run_ex(persist_t *p, chain_backend_t *chain,
+                            uint32_t factory_id, int dry_run,
+                            factory_recovery_result_t *res,
+                            char *status_out, size_t cap);
 
 /*
  * Sweep unspent leaf outputs of a specific factory.

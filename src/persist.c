@@ -6,6 +6,7 @@
 #include "superscalar/jit_channel.h"
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <time.h>
 #include <limits.h>
@@ -1654,6 +1655,39 @@ int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
     return rc == SQLITE_DONE ? 1 : 0;
 }
 
+int persist_set_factory_state(persist_t *p, uint32_t factory_id,
+                              const char *state) {
+    if (!p || !p->db || !state) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, "UPDATE factories SET state=? WHERE id=?;",
+                           -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, state, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)factory_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_get_factory_state(persist_t *p, uint32_t factory_id,
+                              char *out, size_t cap) {
+    if (!p || !p->db || !out || cap == 0) return 0;
+    out[0] = '\0';
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, "SELECT state FROM factories WHERE id=?;",
+                           -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *s = (const char *)sqlite3_column_text(stmt, 0);
+        snprintf(out, cap, "%s", s ? s : "");
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 /* SF-WAL #157: force a passive WAL checkpoint so external readers (dashboard)
    see committed writes within heartbeat granularity instead of waiting for
    sqlite's autocheckpoint to fire.  PASSIVE mode never blocks writers; it
@@ -2165,6 +2199,23 @@ int persist_save_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
     sqlite3_finalize(stmt);
     free(tx_hex);
     return ok;
+}
+
+int persist_load_ps_initial_epoch(persist_t *p, uint32_t factory_id,
+                                  uint32_t node_idx, uint32_t *epoch_out) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT epoch FROM ps_initial_signed_states "
+            "WHERE factory_id=? AND node_idx=? LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_idx);
+    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    if (found && epoch_out) *epoch_out = (uint32_t)sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return found;
 }
 
 int persist_load_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
@@ -4040,13 +4091,9 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 
 /* --- Factory tree nodes (Phase 22) --- */
 
-int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id) {
-    if (!p || !p->db || !f) return 0;
-
-    /* Use internal transaction if caller hasn't started one */
-    int own_txn = !p->in_transaction;
-    if (own_txn && !persist_begin(p)) return 0;
-
+/* Upsert one tree_nodes row from the in-memory node. */
+static int tree_node_upsert(persist_t *p, const factory_node_t *node,
+                            uint32_t factory_id, size_t i) {
     const char *sql =
         "INSERT OR REPLACE INTO tree_nodes "
         "(factory_id, node_index, type, parent_index, parent_vout, "
@@ -4055,92 +4102,98 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
         " signed_tx_hex) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
-    for (size_t i = 0; i < f->n_nodes; i++) {
-        const factory_node_t *node = &f->nodes[i];
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
 
-        sqlite3_stmt *stmt;
-        if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-            if (own_txn) persist_rollback(p);
-            return 0;
-        }
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)i);
+    sqlite3_bind_text(stmt, 3, node->type == NODE_KICKOFF ? "kickoff" : "state",
+                      -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 4, node->parent_index);
+    sqlite3_bind_int(stmt, 5, (int)node->parent_vout);
+    sqlite3_bind_int(stmt, 6, node->dw_layer_index);
+    sqlite3_bind_int(stmt, 7, (int)node->n_signers);
 
-        sqlite3_bind_int(stmt, 1, (int)factory_id);
-        sqlite3_bind_int(stmt, 2, (int)i);
-        sqlite3_bind_text(stmt, 3, node->type == NODE_KICKOFF ? "kickoff" : "state",
-                          -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 4, node->parent_index);
-        sqlite3_bind_int(stmt, 5, (int)node->parent_vout);
-        sqlite3_bind_int(stmt, 6, node->dw_layer_index);
-        sqlite3_bind_int(stmt, 7, (int)node->n_signers);
+    /* signer_indices as comma-separated */
+    char signers_buf[128];
+    signers_buf[0] = '\0';
+    for (size_t s = 0; s < node->n_signers; s++) {
+        char tmp[16];
+        snprintf(tmp, sizeof(tmp), "%s%u", s > 0 ? "," : "",
+                 node->signer_indices[s]);
+        strncat(signers_buf, tmp, sizeof(signers_buf) - strlen(signers_buf) - 1);
+    }
+    sqlite3_bind_text(stmt, 8, signers_buf, -1, SQLITE_TRANSIENT);
 
-        /* signer_indices as comma-separated */
-        char signers_buf[128];
-        signers_buf[0] = '\0';
-        for (size_t s = 0; s < node->n_signers; s++) {
-            char tmp[16];
-            snprintf(tmp, sizeof(tmp), "%s%u", s > 0 ? "," : "",
-                     node->signer_indices[s]);
-            strncat(signers_buf, tmp, sizeof(signers_buf) - strlen(signers_buf) - 1);
-        }
-        sqlite3_bind_text(stmt, 8, signers_buf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 9, (int)node->n_outputs);
 
-        sqlite3_bind_int(stmt, 9, (int)node->n_outputs);
+    /* output_amounts as comma-separated sats */
+    char amounts_buf[256];
+    amounts_buf[0] = '\0';
+    for (size_t o = 0; o < node->n_outputs; o++) {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%s%llu", o > 0 ? "," : "",
+                 (unsigned long long)node->outputs[o].amount_sats);
+        strncat(amounts_buf, tmp, sizeof(amounts_buf) - strlen(amounts_buf) - 1);
+    }
+    sqlite3_bind_text(stmt, 10, amounts_buf, -1, SQLITE_TRANSIENT);
 
-        /* output_amounts as comma-separated sats */
-        char amounts_buf[256];
-        amounts_buf[0] = '\0';
-        for (size_t o = 0; o < node->n_outputs; o++) {
-            char tmp[32];
-            snprintf(tmp, sizeof(tmp), "%s%llu", o > 0 ? "," : "",
-                     (unsigned long long)node->outputs[o].amount_sats);
-            strncat(amounts_buf, tmp, sizeof(amounts_buf) - strlen(amounts_buf) - 1);
-        }
-        sqlite3_bind_text(stmt, 10, amounts_buf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 11, (sqlite3_int64)node->nsequence);
+    sqlite3_bind_int64(stmt, 12, (sqlite3_int64)node->input_amount);
 
-        sqlite3_bind_int64(stmt, 11, (sqlite3_int64)node->nsequence);
-        sqlite3_bind_int64(stmt, 12, (sqlite3_int64)node->input_amount);
+    /* txid in display order */
+    if (node->is_built) {
+        unsigned char display_txid[32];
+        memcpy(display_txid, node->txid, 32);
+        reverse_bytes(display_txid, 32);
+        char txid_hex[65];
+        hex_encode(display_txid, 32, txid_hex);
+        sqlite3_bind_text(stmt, 13, txid_hex, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 13);
+    }
 
-        /* txid in display order */
-        if (node->is_built) {
-            unsigned char display_txid[32];
-            memcpy(display_txid, node->txid, 32);
-            reverse_bytes(display_txid, 32);
-            char txid_hex[65];
-            hex_encode(display_txid, 32, txid_hex);
-            sqlite3_bind_text(stmt, 13, txid_hex, -1, SQLITE_TRANSIENT);
-        } else {
-            sqlite3_bind_null(stmt, 13);
-        }
+    sqlite3_bind_int(stmt, 14, node->is_built);
+    sqlite3_bind_int(stmt, 15, node->is_signed);
 
-        sqlite3_bind_int(stmt, 14, node->is_built);
-        sqlite3_bind_int(stmt, 15, node->is_signed);
+    /* spending_spk as hex */
+    if (node->spending_spk_len > 0) {
+        char spk_hex[69];
+        hex_encode(node->spending_spk, node->spending_spk_len, spk_hex);
+        sqlite3_bind_text(stmt, 16, spk_hex, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 16);
+    }
 
-        /* spending_spk as hex */
-        if (node->spending_spk_len > 0) {
-            char spk_hex[69];
-            hex_encode(node->spending_spk, node->spending_spk_len, spk_hex);
-            sqlite3_bind_text(stmt, 16, spk_hex, -1, SQLITE_TRANSIENT);
-        } else {
-            sqlite3_bind_null(stmt, 16);
-        }
-
-        /* signed_tx_hex — persist the signed transaction for crash recovery */
-        if (node->is_signed && node->signed_tx.len > 0) {
-            char *stx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
-            if (stx_hex) {
-                hex_encode(node->signed_tx.data, node->signed_tx.len, stx_hex);
-                sqlite3_bind_text(stmt, 17, stx_hex, -1, SQLITE_TRANSIENT);
-                free(stx_hex);
-            } else {
-                sqlite3_bind_null(stmt, 17);
-            }
+    /* signed_tx_hex — persist the signed transaction for crash recovery */
+    if (node->is_signed && node->signed_tx.len > 0) {
+        char *stx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+        if (stx_hex) {
+            hex_encode(node->signed_tx.data, node->signed_tx.len, stx_hex);
+            sqlite3_bind_text(stmt, 17, stx_hex, -1, SQLITE_TRANSIENT);
+            free(stx_hex);
         } else {
             sqlite3_bind_null(stmt, 17);
         }
+    } else {
+        sqlite3_bind_null(stmt, 17);
+    }
 
-        int ok = (sqlite3_step(stmt) == SQLITE_DONE);
-        sqlite3_finalize(stmt);
-        if (!ok) {
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id) {
+    if (!p || !p->db || !f) return 0;
+
+    /* Use internal transaction if caller hasn't started one */
+    int own_txn = !p->in_transaction;
+    if (own_txn && !persist_begin(p)) return 0;
+
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (!tree_node_upsert(p, &f->nodes[i], factory_id, i)) {
             if (own_txn) persist_rollback(p);
             return 0;
         }
@@ -4148,6 +4201,50 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
 
     if (own_txn && !persist_commit(p)) return 0;
     return 1;
+}
+
+static int tn_spends_stored_parent(persist_t *p, const factory_node_t *node,
+                                   uint32_t factory_id, size_t i);
+
+/* Exit-path persistence: write the CURRENT signed state of the given nodes.
+   Unsigned nodes are skipped, never written: after a restart the in-memory
+   tree is rebuilt unsigned, and overwriting a stored signature with NULL
+   would leave factory_recovery_run nothing to publish.  A node whose TX does
+   not spend the stored parent is refused (see tn_spends_stored_parent); the
+   whole call then fails and writes nothing. */
+static int tree_nodes_save_signed(persist_t *p, const factory_t *f,
+                                  uint32_t factory_id,
+                                  const size_t *idx, size_t n_idx) {
+    if (!p || !p->db || !f) return -1;
+    int own_txn = !p->in_transaction;
+    if (own_txn && !persist_begin(p)) return -1;
+    int saved = 0;
+    size_t n = idx ? n_idx : f->n_nodes;
+    for (size_t k = 0; k < n; k++) {
+        size_t i = idx ? idx[k] : k;
+        if (i >= f->n_nodes) continue;
+        const factory_node_t *node = &f->nodes[i];
+        if (!node->is_signed || node->signed_tx.len == 0) continue;
+        if (!tn_spends_stored_parent(p, node, factory_id, i) ||
+            !tree_node_upsert(p, node, factory_id, i)) {
+            if (own_txn) persist_rollback(p);
+            return -1;
+        }
+        saved++;
+    }
+    if (own_txn && !persist_commit(p)) return -1;
+    return saved;
+}
+
+int persist_save_tree_node(persist_t *p, const factory_t *f,
+                           uint32_t factory_id, size_t node_idx) {
+    if (!f || node_idx >= f->n_nodes) return 0;
+    return tree_nodes_save_signed(p, f, factory_id, &node_idx, 1) == 1;
+}
+
+int persist_save_signed_tree_nodes(persist_t *p, const factory_t *f,
+                                   uint32_t factory_id) {
+    return tree_nodes_save_signed(p, f, factory_id, NULL, 0);
 }
 
 /* --- Broadcast audit log --- */
@@ -4308,6 +4405,380 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
     }
     sqlite3_finalize(stmt);
     return retried;
+}
+
+/* --- Broadcast-until-confirmed queue ---
+
+   For pre-signed transactions that must eventually confirm and may not be
+   valid yet (the factory distribution TX carries an nLockTime).  Rows live
+   in broadcast_log with result='queued'; every attempt is logged as its own
+   row.  The queue entry is closed only when the TX is confirmed at the
+   close depth ('confirmed') or an input was spent by something else
+   ('input_spent').  Nothing is sent before a height-based nLockTime. */
+
+#define PQ_MAX_INPUTS 64
+
+typedef struct {
+    char     txid[65];
+    uint32_t locktime;
+    int      non_final;                 /* some nSequence != 0xFFFFFFFF */
+    size_t   n_inputs;
+    char     prev_txid[PQ_MAX_INPUTS][65];
+    uint32_t prev_vout[PQ_MAX_INPUTS];
+} pq_tx_info_t;
+
+static uint32_t pq_le32(const unsigned char *b) {
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static int pq_varint(const unsigned char *b, size_t len, size_t *pos, uint64_t *v) {
+    if (*pos >= len) return 0;
+    unsigned char c = b[(*pos)++];
+    size_t n = c < 0xFD ? 0 : c == 0xFD ? 2 : c == 0xFE ? 4 : 8;
+    if (n == 0) { *v = c; return 1; }
+    if (*pos + n > len) return 0;
+    uint64_t x = 0;
+    for (size_t i = 0; i < n; i++) x |= (uint64_t)b[*pos + i] << (8 * i);
+    *pos += n;
+    *v = x;
+    return 1;
+}
+
+static void pq_display_hex(const unsigned char *b32, char *out65) {
+    unsigned char r[32];
+    for (int i = 0; i < 32; i++) r[i] = b32[31 - i];
+    hex_encode(r, 32, out65);
+}
+
+/* Parse txid (non-witness double-SHA256), nLockTime and prevouts. */
+static int pq_parse_tx(const char *hex, pq_tx_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    size_t hl = hex ? strlen(hex) : 0;
+    if (hl < 20 || (hl & 1)) return 0;
+    size_t len = hl / 2;
+    unsigned char *b = malloc(len);
+    if (!b) return 0;
+    if (hex_decode(hex, b, len) != (int)len) { free(b); return 0; }
+    int ok = 0;
+    size_t pos = 4;
+    do {
+        int segwit = (len > 6 && b[4] == 0x00 && b[5] == 0x01);
+        if (segwit) pos += 2;
+        size_t body = pos;
+        uint64_t nin, nout, v;
+        if (!pq_varint(b, len, &pos, &nin) || nin == 0 || nin > 100000) break;
+        int bad = 0;
+        for (uint64_t i = 0; i < nin && !bad; i++) {
+            if (pos + 36 > len) { bad = 1; break; }
+            if (i < PQ_MAX_INPUTS) {
+                pq_display_hex(b + pos, out->prev_txid[i]);
+                out->prev_vout[i] = pq_le32(b + pos + 32);
+            }
+            pos += 36;
+            if (!pq_varint(b, len, &pos, &v) || pos + v + 4 > len) { bad = 1; break; }
+            pos += (size_t)v;
+            if (pq_le32(b + pos) != 0xFFFFFFFFu) out->non_final = 1;
+            pos += 4;
+        }
+        if (bad) break;
+        out->n_inputs = nin < PQ_MAX_INPUTS ? (size_t)nin : PQ_MAX_INPUTS;
+        if (!pq_varint(b, len, &pos, &nout)) break;
+        for (uint64_t o = 0; o < nout && !bad; o++) {
+            if (pos + 8 > len) { bad = 1; break; }
+            pos += 8;
+            if (!pq_varint(b, len, &pos, &v) || pos + v > len) { bad = 1; break; }
+            pos += (size_t)v;
+        }
+        if (bad) break;
+        size_t body_end = pos;
+        if (segwit) {
+            for (uint64_t i = 0; i < nin && !bad; i++) {
+                uint64_t items;
+                if (!pq_varint(b, len, &pos, &items)) { bad = 1; break; }
+                for (uint64_t k = 0; k < items; k++) {
+                    if (!pq_varint(b, len, &pos, &v) || pos + v > len) { bad = 1; break; }
+                    pos += (size_t)v;
+                }
+            }
+            if (bad) break;
+        }
+        if (pos + 4 != len) break;
+        out->locktime = pq_le32(b + pos);
+        size_t sl = 8 + (body_end - body);
+        unsigned char *s = malloc(sl);
+        if (!s) break;
+        memcpy(s, b, 4);
+        memcpy(s + 4, b + body, body_end - body);
+        memcpy(s + 4 + (body_end - body), b + pos, 4);
+        unsigned char h[32];
+        sha256_double(s, sl, h);
+        free(s);
+        pq_display_hex(h, out->txid);
+        ok = 1;
+    } while (0);
+    free(b);
+    return ok;
+}
+
+/* Stored txid (display hex) of one tree node.  Returns 1 if the row has one,
+   0 if there is no row or no txid, -1 on a query error. */
+static int tn_stored_txid(persist_t *p, uint32_t factory_id, int node_index,
+                          char out[65]) {
+    out[0] = '\0';
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid FROM tree_nodes WHERE factory_id=? AND node_index=?;",
+            -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int(st, 2, node_index);
+    int rc = 0, step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        if (t && strlen(t) == 64) {
+            memcpy(out, t, 65);
+            rc = 1;
+        }
+    } else if (step != SQLITE_DONE) {
+        rc = -1;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+/* Defence against advancing on a stale in-memory tree (e.g. after a
+   restart): a signed node may replace its stored row only if its TX spends
+   what the DB holds for its parent, or (a chained PS / sub-factory state)
+   the node's own stored state, or is that very TX.  Anything else would
+   leave the DB pointing at a TX that can never confirm, so it is refused and
+   the stored row is kept.  Nodes without a parent spend the funding output
+   and are not checked; a parent with no stored txid gives nothing to check
+   against.  Returns 1 if the write may proceed. */
+static int tn_spends_stored_parent(persist_t *p, const factory_node_t *node,
+                                   uint32_t factory_id, size_t i) {
+    if (node->parent_index < 0) return 1;
+    char parent_txid[65], own_txid[65];
+    int have_parent = tn_stored_txid(p, factory_id, node->parent_index,
+                                     parent_txid);
+    int have_own = tn_stored_txid(p, factory_id, (int)i, own_txid);
+    if (have_parent < 0 || have_own < 0) {
+        fprintf(stderr, "persist: CRITICAL - cannot read the stored tree for "
+                "node %zu of factory %u; refusing to write it\n", i, factory_id);
+        return 0;
+    }
+    if (!have_parent) return 1;
+
+    char *hex = malloc(node->signed_tx.len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(node->signed_tx.data, node->signed_tx.len, hex);
+    pq_tx_info_t info;
+    int parsed = pq_parse_tx(hex, &info);
+    free(hex);
+    if (!parsed) {
+        fprintf(stderr, "persist: CRITICAL - node %zu of factory %u: its signed "
+                "TX does not parse; refusing to write it\n", i, factory_id);
+        return 0;
+    }
+    if (have_own && strcasecmp(info.txid, own_txid) == 0) return 1;
+    for (size_t k = 0; k < info.n_inputs; k++) {
+        if (strcasecmp(info.prev_txid[k], parent_txid) == 0) return 1;
+        if (have_own && strcasecmp(info.prev_txid[k], own_txid) == 0) return 1;
+    }
+    fprintf(stderr, "persist: CRITICAL - refusing to store node %zu of factory "
+            "%u: its TX %s spends neither the stored parent (node %d, %s) nor "
+            "the node's own stored state.  The in-memory tree is stale (was the "
+            "LSP restarted?); the stored row is kept.\n",
+            i, factory_id, info.txid, node->parent_index, parent_txid);
+    return 0;
+}
+
+/* Broadcast-queue throttle: 1 if row_id may be sent at this height (and
+   records it), 0 if it was already tried at this height. */
+static int pq_attempt_due(persist_t *p, int row_id, int height) {
+    unsigned n = p->pq_attempt_n;
+    if (n > PERSIST_PQ_ATTEMPT_SLOTS) n = p->pq_attempt_n = 0;
+    for (unsigned k = 0; k < n; k++) {
+        if (p->pq_attempt[k].row_id != row_id) continue;
+        if (p->pq_attempt[k].height == height) return 0;
+        p->pq_attempt[k].height = height;
+        return 1;
+    }
+    unsigned slot = n < PERSIST_PQ_ATTEMPT_SLOTS ? n
+                    : (unsigned)row_id % PERSIST_PQ_ATTEMPT_SLOTS;
+    p->pq_attempt[slot].row_id = row_id;
+    p->pq_attempt[slot].height = height;
+    if (n < PERSIST_PQ_ATTEMPT_SLOTS) p->pq_attempt_n = n + 1;
+    return 1;
+}
+
+/* One attempt row per queued TX, updated in place (result + time), so a TX
+   that keeps being rejected does not grow broadcast_log. */
+static void pq_log_attempt(persist_t *p, const char *txid, const char *source,
+                           const char *result) {
+    sqlite3_stmt *u;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE broadcast_log SET result=?, "
+            "broadcast_time=strftime('%s','now') WHERE id=("
+            "SELECT id FROM broadcast_log WHERE txid=? AND source=? AND "
+            "raw_hex IS NULL AND result IN ('ok','failed') "
+            "ORDER BY id DESC LIMIT 1);", -1, &u, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_text(u, 1, result, -1, SQLITE_STATIC);
+    sqlite3_bind_text(u, 2, txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(u, 3, source, -1, SQLITE_TRANSIENT);
+    int done = (sqlite3_step(u) == SQLITE_DONE) && sqlite3_changes(p->db) > 0;
+    sqlite3_finalize(u);
+    if (!done)
+        persist_log_broadcast(p, txid, source, NULL, result);
+}
+
+int persist_queue_broadcast(persist_t *p, const char *source, const char *raw_hex,
+                            char *txid_out) {
+    if (!p || !p->db || !raw_hex) return 0;
+    pq_tx_info_t info;
+    if (!pq_parse_tx(raw_hex, &info)) return 0;
+    if (txid_out) memcpy(txid_out, info.txid, 65);
+
+    /* Idempotent: one open (or completed) queue entry per txid. */
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT 1 FROM broadcast_log WHERE txid=? AND "
+            "result IN ('queued','confirmed','input_spent') LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, info.txid, -1, SQLITE_TRANSIENT);
+    int exists = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    if (exists) return 1;
+    return persist_log_broadcast(p, info.txid, source ? source : "queued",
+                                 raw_hex, "queued");
+}
+
+static void pq_set_result(persist_t *p, int row_id, const char *result) {
+    sqlite3_stmt *u;
+    if (sqlite3_prepare_v2(p->db, "UPDATE broadcast_log SET result=? WHERE id=?;",
+                           -1, &u, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(u, 1, result, -1, SQLITE_STATIC);
+        sqlite3_bind_int(u, 2, row_id);
+        sqlite3_step(u);
+        sqlite3_finalize(u);
+    }
+}
+
+int persist_service_queued_broadcasts(persist_t *p, struct chain_backend *chain) {
+    if (!p || !p->db || !chain) return 0;
+
+    /* Collect first: the loop below writes to broadcast_log. */
+    typedef struct { int id; char *hex; char *source; } pq_row_t;
+    pq_row_t *rows = NULL;
+    size_t n = 0, cap = 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT id, raw_hex, source FROM broadcast_log "
+            "WHERE result='queued' AND raw_hex IS NOT NULL ORDER BY id ASC;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            pq_row_t *nr = realloc(rows, nc * sizeof(*nr));
+            if (!nr) break;
+            rows = nr;
+            cap = nc;
+        }
+        const char *hx = (const char *)sqlite3_column_text(st, 1);
+        const char *sr = (const char *)sqlite3_column_text(st, 2);
+        rows[n].id = sqlite3_column_int(st, 0);
+        rows[n].hex = hx ? strdup(hx) : NULL;
+        rows[n].source = strdup(sr ? sr : "queued");
+        n++;
+    }
+    sqlite3_finalize(st);
+
+    int tip = chain->get_block_height ? chain->get_block_height(chain) : -1;
+    int done_depth = chain_close_confs(chain, chain->is_regtest);
+    int pending = 0;
+
+    for (size_t r = 0; r < n; r++) {
+        pq_tx_info_t info;
+        if (!rows[r].hex || !pq_parse_tx(rows[r].hex, &info)) {
+            pq_set_result(p, rows[r].id, "unparseable");
+            continue;
+        }
+        int confs = chain->get_confirmations
+                    ? chain->get_confirmations(chain, info.txid) : -1;
+        if (confs >= done_depth) {
+            printf("broadcast queue: %s %s confirmed (%d)\n",
+                   rows[r].source, info.txid, confs);
+            pq_set_result(p, rows[r].id, "confirmed");
+            continue;
+        }
+        pending++;
+        if (confs >= 0) continue;           /* in mempool or shallow: wait */
+
+        /* Not final before its height lock: do not send, do not give up. */
+        if (info.non_final && info.locktime != 0 && info.locktime < 500000000u &&
+            (tip < 0 || (uint32_t)tip < info.locktime))
+            continue;
+
+        /* Gone for good if an input was spent by another transaction. */
+        int spent = 0;
+        if (chain->is_outpoint_unspent) {
+            for (size_t i = 0; i < info.n_inputs && !spent; i++)
+                if (chain->is_outpoint_unspent(chain, info.prev_txid[i],
+                                               info.prev_vout[i]) == 0)
+                    spent = 1;
+        }
+        if (spent) {
+            fprintf(stderr, "broadcast queue: %s %s: an input is already spent "
+                    "(by this TX or a conflicting one); dropping from the queue\n",
+                    rows[r].source, info.txid);
+            pq_set_result(p, rows[r].id, "input_spent");
+            pending--;
+            continue;
+        }
+
+        /* At most one send per entry per block: a TX the node keeps
+           rejecting is not re-sent on every daemon tick. */
+        if (!pq_attempt_due(p, rows[r].id, tip)) continue;
+
+        char txid_out[65] = {0};
+        int ok = chain->send_raw_tx(chain, rows[r].hex, txid_out);
+        pq_log_attempt(p, info.txid, rows[r].source, ok ? "ok" : "failed");
+        if (ok)
+            printf("broadcast queue: %s %s broadcast (waiting for %d conf)\n",
+                   rows[r].source, info.txid, done_depth);
+        else
+            fprintf(stderr, "broadcast queue: %s %s broadcast rejected at height %d "
+                    "(nLockTime %u); will retry next block\n",
+                    rows[r].source, info.txid, tip, info.locktime);
+    }
+
+    for (size_t r = 0; r < n; r++) { free(rows[r].hex); free(rows[r].source); }
+    free(rows);
+    return pending;
+}
+
+int persist_get_queued_broadcast_result(persist_t *p, const char *source,
+                                        char *out, size_t cap) {
+    if (!p || !p->db || !source || !out || cap == 0) return 0;
+    out[0] = '\0';
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT result FROM broadcast_log WHERE source=? AND raw_hex IS NOT "
+            "NULL AND result IN ('queued','confirmed','input_spent','unparseable') "
+            "ORDER BY id DESC LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, source, -1, SQLITE_TRANSIENT);
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *r = (const char *)sqlite3_column_text(st, 0);
+        snprintf(out, cap, "%s", r ? r : "");
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
 }
 
 /* --- Reorg staleness tracking --- */

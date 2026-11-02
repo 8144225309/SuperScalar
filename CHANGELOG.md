@@ -14,6 +14,15 @@ All notable changes to SuperScalar are documented here.
 - **Upgrading a client:** once this build has opened a client DB, don't go back to an older client build; it looks for the moved rows under the old id and refuses to reconnect. A client DB created by an older build, and restarted before its first payment, still has no stored LSP first points and will still reject the LSP's first revocation; make one payment before restarting such a client.
 - **Failure handling:** a failed restore or `channel_init` frees what it allocated, the client reconnect frees its channel, and `persist_commit` retries a busy COMMIT once, then rolls back with a CRITICAL log instead of leaving the transaction open.
 
+### Exit paths
+
+- Force-close (`recoverfactory`, the client's `--force-close`) publishes the whole signed tree, not just its first 128 nodes, and the current state of every node: full Pseudo-Spilman chains and the state after each DW/PS advance, realloc, Tier B or sub-factory advance. A pass fails when part of the exit path cannot be published, and `--force-close` then exits 1.
+- A fully confirmed tree marks the factory closed.
+- The distribution TX is queued and re-sent, at most once per block, from its nLockTime until it confirms.
+- `recoverfactory` requires `factory_id` and is a dry run unless `dry_run:false`.
+- **Upgrading operator scripts:** `recoverfactory` now defaults to a dry run and broadcasts nothing; a script that uses it to publish a factory tree must pass `"dry_run": false` (and the now-required `factory_id`).
+- The signed cooperative close is persisted (`closing`) before `CLOSE_DONE`. A `closing` factory is never served again; `--force-close-from-db` publishes its tree if the close does not confirm.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.

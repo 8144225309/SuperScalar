@@ -313,6 +313,9 @@ static void usage(const char *prog) {
         "                       128-client deployment is --arity 2,4,8 --static-near-root 2\n"
         "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
+        "  --force-close-from-db  With --db, for a factory stuck in 'closing' (its signed\n"
+        "                      cooperative close does not confirm): publish the signed\n"
+        "                      factory tree from the DB (one pass; re-run each block)\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --enable-hashlock-poison  Build the factory with hashlock-gated L-stock\n"
         "                      poison (#53): the L-stock output is spendable by the\n"
@@ -1441,6 +1444,7 @@ int main(int argc, char *argv[]) {
     uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only.
                                         0 = disabled (default for backward compat) */
     int force_close = 0;
+    int force_close_from_db = 0;   /* 'closing' factory: publish the tree */
     int test_burn = 0;
     int enable_hashlock_poison = 0;  /* #53 Phase 3: hashlock-gated L-stock poison */
     int test_ptlc_basic = 0;
@@ -1874,6 +1878,8 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
+        else if (strcmp(argv[i], "--force-close-from-db") == 0)
+            force_close_from_db = 1;
         else if (strcmp(argv[i], "--test-burn") == 0)
             test_burn = 1;
         else if (strcmp(argv[i], "--enable-hashlock-poison") == 0)
@@ -3027,6 +3033,36 @@ int main(int argc, char *argv[]) {
         printf("LSP: confirmation depths — funding=%d close=%d penalty=%d sweep=%d\n",
                chain_be->conf.funding, chain_be->conf.close,
                chain_be->conf.penalty, chain_be->conf.sweep);
+    }
+
+    /* A cooperative close was fully signed and handed to the clients but is
+       not known to be confirmed ('closing' is persisted before CLOSE_DONE).
+       Any client can publish that close at will, so this factory must not be
+       served again: re-broadcast the queued close and stop.  With
+       --force-close-from-db the signed tree is published as well (the way out
+       when the close cannot confirm). */
+    if (force_close_from_db && !use_db) {
+        fprintf(stderr, "LSP: --force-close-from-db requires --db\n");
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    if (use_db) {
+        char cstatus[768];
+        int cr = lsp_resume_closing_factory(&db, chain_be, 0, force_close_from_db,
+                                            cstatus, sizeof(cstatus));
+        if (cr != LSP_CLOSING_NOT || force_close_from_db) {
+            if (cr == LSP_CLOSING_NOT)
+                fprintf(stderr, "LSP: --force-close-from-db applies only to a factory "
+                        "in state 'closing'; for an active factory use the "
+                        "recoverfactory admin RPC\n");
+            else
+                fprintf(cr == LSP_CLOSING_DONE ? stdout : stderr, "LSP: %s\n", cstatus);
+            persist_close(&db);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return cr == LSP_CLOSING_DONE ? 0 : 1;
+        }
     }
 
     /* === Recovery probe: skip ceremony if factory exists in DB === */
@@ -4889,6 +4925,31 @@ accept_new_factory:
             fprintf(stderr, "LSP: cooperative close attempt %d/%d had an invalid "
                     "aggregate; re-running with fresh nonces\n", _ca, SS_NONCE_RETRY_MAX);
     }
+    if (!_close_ok && lsp_p->closing) {
+        /* The close was fully signed and persisted ('closing'), then a
+           CLOSE_DONE send failed; clients served before it hold the close and
+           may publish it.  Broadcast it now; a restart re-sends the queued
+           close until it confirms and never serves this factory. */
+        fprintf(stderr, "LSP: cooperative close signed but CLOSE_DONE failed; "
+                "broadcasting the close (the factory stays 'closing')\n");
+        if (g_db && chain_be) {
+            persist_service_queued_broadcasts(g_db, chain_be);
+        } else if (close_tx.len > 0) {
+            char *chx = malloc(close_tx.len * 2 + 1);
+            char ctxid[65];
+            if (chx) {
+                hex_encode(close_tx.data, close_tx.len, chx);
+                int sent = chain_be ? chain_be->send_raw_tx(chain_be, chx, ctxid)
+                                    : regtest_send_raw_tx(&rt, chx, ctxid);
+                fprintf(stderr, "LSP: close broadcast %s\n", sent ? ctxid : "failed");
+                free(chx);
+            }
+        }
+        tx_buf_free(&close_tx);
+        lsp_cleanup(lsp_p);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     if (!_close_ok) {
         if (_rc == 2)   /* clients still waiting -- abort so they fall back to force-close */
             lsp_abort_ceremony(lsp_p, "cooperative close failed after fresh-nonce retries");
@@ -4909,7 +4970,9 @@ accept_new_factory:
         if (g_db)
             persist_log_broadcast(g_db, "?", "cooperative_close",
                 close_hex, "failed");
-        fprintf(stderr, "LSP: broadcast close tx failed\n");
+        fprintf(stderr, "LSP: broadcast close tx failed%s\n",
+                g_db ? " (factory stays 'closing'; the queued close is "
+                       "re-broadcast on the next start)" : "");
         tx_buf_free(&close_tx);
         lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
@@ -4942,6 +5005,12 @@ accept_new_factory:
     }
 
     printf("LSP: cooperative close confirmed! txid: %s\n", close_txid);
+    /* The factory itself is closed now (not just its ladder row); this also
+       clears the 'closing' state and closes the queued close entry. */
+    if (g_db) {
+        if (chain_be) persist_service_queued_broadcasts(g_db, chain_be);
+        persist_mark_factory_closed(g_db, 0);
+    }
     printf("LSP: SUCCESS — factory created and closed with %d clients\n", n_clients);
     if (test_bip39)
         printf("=== BIP39 HD WALLET TEST PASSED ===\n");
