@@ -211,6 +211,8 @@ int client_run_reconnect(secp256k1_context *ctx,
         return 0;
     }
     memset(local_secs, 0, sizeof(local_secs));
+    /* From here on, every return frees the channel (channel_cleanup
+       also zeroes its per-commitment secrets). */
 
     /* 7. Overwrite channel state with persisted values */
     if (local_amount > 0 || remote_amount > 0) {
@@ -311,6 +313,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
 
@@ -324,6 +327,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         cJSON_Delete(msg.json);
@@ -333,6 +337,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: nonce pool init failed\n");
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
 
@@ -343,6 +348,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         if (!my_pubnonces_ser) {
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         for (size_t i = 0; i < my_nonce_count; i++) {
@@ -361,6 +367,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             free(my_pubnonces_ser);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         cJSON_Delete(nonce_reply);
@@ -383,6 +390,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             fprintf(stderr, "Client reconnect: recv failed expecting RECONNECT_ACK\n");
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
@@ -394,6 +402,7 @@ int client_run_reconnect(secp256k1_context *ctx,
                 fprintf(stderr, "Client reconnect: recv failed after CS retransmit\n");
                 wire_close(fd);
                 factory_free(factory); free(factory);
+                channel_cleanup(&channel);
                 return 0;
             }
         }
@@ -403,6 +412,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
 
@@ -414,6 +424,7 @@ int client_run_reconnect(secp256k1_context *ctx,
             cJSON_Delete(msg.json);
             wire_close(fd);
             factory_free(factory); free(factory);
+            channel_cleanup(&channel);
             return 0;
         }
         cJSON_Delete(msg.json);
@@ -467,6 +478,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         /* Callback handled close */
         factory_free(factory); free(factory);
         wire_close(fd);
+        channel_cleanup(&channel);
         return 1;
     }
     if (cb_ret == 1) {
@@ -476,11 +488,13 @@ int client_run_reconnect(secp256k1_context *ctx,
                                                   NULL, 0, &channel, 0);
         factory_free(factory); free(factory);
         wire_close(fd);
+        channel_cleanup(&channel);
         return close_ok;
     }
 
     /* cb_ret == 0: error or disconnect */
     factory_free(factory); free(factory);
     wire_close(fd);
+    channel_cleanup(&channel);
     return 0;
 }
