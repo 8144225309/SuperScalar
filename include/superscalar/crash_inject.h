@@ -21,6 +21,14 @@
  *   "finalize_partial"   — before persist_update_ceremony_state(FINALIZED)
  *                          (catches the N-1-SIGNED dual-sig-trap path)
  *
+ * Client-side names (src/client.c, client_handle_leaf_advance_stateless --
+ * the pseudo-Spilman record-and-refuse path; the client process honours the
+ * same env var / runtime target):
+ *   "ps_record_pre_save"   — our partial sig exists, before the
+ *                            client_ps_signed_inputs INSERT
+ *   "ps_record_post_save"  — the INSERT is durable, before FINAL is sent
+ *   "ps_record_post_final" — MSG_LEAF_ADVANCE_FINAL has left the process
+ *
  * The same naming convention extends to ROTATE / FORCE_OUT once those
  * ceremonies wire their own persist transitions (Gaps A + B of #245).  No
  * conditional logic, no flag persistence — pure env check + abort.

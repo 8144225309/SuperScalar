@@ -1882,6 +1882,7 @@ extern int test_b12_po1_payoffer_missing_offer(void);
 extern int test_wt_ptlc1_entry_fields(void);
 extern int test_wt_ptlc2_metadata_store(void);
 extern int test_persist_ps_signed_input_roundtrip(void);
+extern int test_persist_ps_signed_input_arbiter(void);
 extern int test_persist_ps_defense_persists_across_reopen(void);
 extern int test_persist_ps_defense_distinct_parent_txids(void);
 extern int test_persist_ps_defense_independent_inputs(void);
@@ -1892,6 +1893,13 @@ extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
+extern int test_ps_refusal_check_error_refuses(void);
+extern int test_ps_refusal_save_error_aborts_before_final(void);
+extern int test_ps_refusal_sighash_failure_aborts(void);
+extern int test_ps_refusal_conflicting_record_refuses(void);
+extern int test_ps_refusal_same_sighash_record_is_idempotent(void);
+extern int test_ps_refusal_concurrent_record_race_one_signature(void);
+extern int test_ps_refusal_crash_drill_restart_semantics(void);
 extern int test_sweep_persist_roundtrip(void);
 
 /* Mainnet Audit: Shell Injection Fix */
@@ -3779,6 +3787,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wt_ptlc1_entry_fields);
     RUN_TEST(test_wt_ptlc2_metadata_store);
     RUN_TEST(test_persist_ps_signed_input_roundtrip);
+    RUN_TEST(test_persist_ps_signed_input_arbiter);
     RUN_TEST(test_persist_ps_defense_persists_across_reopen);
     RUN_TEST(test_persist_ps_defense_distinct_parent_txids);
     RUN_TEST(test_persist_ps_defense_independent_inputs);
@@ -3789,6 +3798,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
+    RUN_TEST(test_ps_refusal_check_error_refuses);
+    RUN_TEST(test_ps_refusal_save_error_aborts_before_final);
+    RUN_TEST(test_ps_refusal_sighash_failure_aborts);
+    RUN_TEST(test_ps_refusal_conflicting_record_refuses);
+    RUN_TEST(test_ps_refusal_same_sighash_record_is_idempotent);
+    RUN_TEST(test_ps_refusal_concurrent_record_race_one_signature);
+    RUN_TEST(test_ps_refusal_crash_drill_restart_semantics);
     RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
