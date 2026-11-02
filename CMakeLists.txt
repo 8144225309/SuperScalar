@@ -289,6 +289,7 @@ add_executable(test_superscalar
     tests/test_ladder.c
     tests/test_wire.c
     tests/test_channels.c
+    tests/test_ps_refusal.c
     tests/spend_helpers.c
     tests/test_close_spendability_full.c
     tests/econ_helpers.c

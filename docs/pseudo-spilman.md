@@ -107,30 +107,134 @@ This is a deliberate ZmnSCPxj design choice, not a missing feature.
       parent_txid BLOB NOT NULL,        -- 32 bytes
       parent_vout INTEGER NOT NULL,
       sighash BLOB NOT NULL,            -- 32 bytes BIP-341 sighash
-      partial_sig BLOB NOT NULL,        -- 36 bytes (32 wire + pad)
+      partial_sig BLOB NOT NULL,        -- our 32-byte partial sig, zero-padded to 36
       created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
       PRIMARY KEY (factory_id, parent_txid, parent_vout)
   );
   ```
 
-  The header comment at persist.c:815-819 documents the three-state
-  consultation: no row = sign fresh, matching sighash = idempotent
-  retry, conflicting sighash = double-spend attempt, refuse.
+  The v20 migration comment in persist.c states the rule: no row = sign
+  and record, matching sighash = idempotent retry, conflicting sighash =
+  double-spend attempt, refuse; any lookup or insert error = refuse.
 
-- `client_handle_leaf_advance` (client.c:2620-2638) calls
-  `persist_check_ps_signed_input` BEFORE generating any nonce. If a row
-  already exists for this `(factory_id, parent_txid, parent_vout)`, it
-  refuses with an explicit log line naming the conflicting prev txid.
-  The header comment at client.c:2615-2618 explains why we do not
-  attempt replay-based idempotency: that risks MuSig nonce-reuse
-  footguns, so refusal is the conservative choice.
+- `client_handle_leaf_advance_stateless` (src/client.c) computes the
+  BIP-341 sighash of the proposed spend and calls
+  `persist_check_ps_signed_input` BEFORE generating any nonce.  A row
+  with a different sighash for this `(factory_id, parent_txid,
+  parent_vout)` is refused with a log line naming the parent; a row
+  with the same sighash is an idempotent retry and is re-signed; a
+  lookup error is refused.
 
-- After signing succeeds, `persist_save_ps_signed_input`
-  (client.c:2715-2734) records the partial sig BEFORE the
-  `LEAF_ADVANCE_PSIG` wire send. A crash between record and send is
-  safe — the retry will see the row and refuse to sign anew, leaving
-  the counterparty to either complete from the recorded sig or abort
-  the leaf.
+- After signing, `persist_save_ps_signed_input` INSERTs the record
+  BEFORE the `MSG_LEAF_ADVANCE_FINAL` wire send, and the ceremony aborts
+  if that insert does not succeed.  The full rule, including every
+  failure and crash point, is the next section.
+
+### Record-and-refuse: ordering and failure semantics
+
+The record is the whole defense, so the path that writes and reads it
+fails closed.  Everything below is `client_handle_leaf_advance_stateless`
+in `src/client.c` plus `persist_check_ps_signed_input` /
+`persist_save_ps_signed_input` in `src/persist.c`.  The client holds no
+open transaction during the ceremony (no `persist_begin` in client.c),
+so each statement is its own autocommit transaction.
+
+**Order.** For a PS leaf with `ps_chain_len > 0` and a persist handle
+installed (`client_set_persist`):
+
+1. **sighash** — compute the BIP-341 sighash of the proposed spend of
+   `(ps_prev_txid, 0)` from the unsigned tx and the prev output, both
+   known right after the local advance.  This is the value the record is
+   compared on.
+2. **check** — `persist_check_ps_signed_input`, three-way: error / not
+   found / found (+ the stored sighash).
+3. **nonces** — generate our secnonce, send `CLIENT_PUBNONCE`, receive
+   `LSP_RESPONSE`.
+4. **bind** — the session's message (`signing_session.msg32`, fixed by
+   `factory_session_finalize_node`) must equal the sighash from step 1,
+   or the client refuses.  The record always describes what is signed.
+5. **partial sig** — `musig_create_partial_sig` (consumes and zeroes the
+   state secnonce).
+6. **durable INSERT** — `persist_save_ps_signed_input`: a plain `INSERT`
+   under the table's PRIMARY KEY, never `INSERT OR REPLACE`.  The
+   connection runs `journal_mode=WAL` with `synchronous=FULL`, so when
+   the call returns `PS_SAVE_RECORDED` the row has been fsync'd.  Our
+   partial sig has not entered the signing session yet.
+7. **complete** — put both partial sigs into the session and aggregate
+   them into the final signature.
+8. **send** — `MSG_LEAF_ADVANCE_FINAL`.  This is the first point at which
+   anything derived from our partial signature leaves the process.
+
+Nothing between steps 6 and 8 touches the database, so the record is on
+disk before the signature can be observed by anyone else.  Both
+secnonces and both of our partial sigs live in one struct owned by a
+wrapper around the ceremony, which zeroes it on every exit.  That matters
+for the poison secnonce: it is not consumed when the poison degrades
+before signing.
+
+**Rule for each outcome.**
+
+| Step | Outcome | Action |
+|---|---|---|
+| 1 sighash | cannot be computed | refuse, before any nonce exists |
+| 2 check | database error (prepare/step failure, malformed row) | refuse — "unknown" is never read as "not found" |
+| 2 check | no row | proceed |
+| 2 check | row with the same sighash | proceed: idempotent retry, re-sign the same message with a fresh nonce |
+| 2 check | row with a different sighash | refuse (double-spend attempt) |
+| 4 bind | session message differs from the sighash checked in step 2 | refuse, before signing |
+| 6 insert | `PS_SAVE_RECORDED` — inserted, or an identical row was already there | proceed to complete + send |
+| 6 insert | `PS_SAVE_CONFLICT` — key conflict and the existing row has a different sighash | abort: our partial sig never entered the session and is zeroed; no complete, no send |
+| 6 insert | `PS_SAVE_ERROR` — any other SQLite failure, or an ambiguous conflict re-read | abort, as above |
+
+Two ceremonies on the same parent can both pass step 2 (there is no row
+yet when either of them looks).  Step 6 is the arbiter: the PRIMARY KEY
+lets exactly one `INSERT` through; the other re-reads the row and lands
+on the same-sighash or different-sighash rule above.  The first record
+is never overwritten.
+
+**Why re-sign instead of replaying the stored partial sig.** A MuSig2
+partial signature is bound to the session's aggregate nonce.  On a retry
+the LSP generates a fresh nonce, so the stored partial sig would not
+verify against the new session, and it is never replayed.  Signing the
+same message twice with two fresh nonces is safe — what MuSig2 forbids is
+reusing a secnonce, and `musig_create_partial_sig` zeroes it on use.
+
+The `partial_sig` column is therefore only a record of what was released
+the first time: our 32-byte partial sig, zero-padded to 36 bytes, from
+the first signing of that parent.  A same-sighash retry does not update
+it, and it cannot be verified on its own because the session's nonces are
+not stored.
+
+**What an abort leaves behind.** Every refusal and abort above returns
+after `factory_advance_leaf_unsigned` has already advanced the client's
+in-memory leaf (as every other failure return in this handler always
+has).  The client's factory is then one state ahead of anything signed,
+so the LSP's retry of the same advance only lines up once the client
+reloads its factory from persist, i.e. after a restart.  The
+record-and-refuse rules hold across that reload because they are keyed on
+the parent outpoint and sighash in the database, not on in-memory state.
+This change removes the case where the record itself blocked the identical
+retry; it does not make a failed advance resumable in place.
+
+**Crash points and what a restart does.** Client-side
+`lsp_crash_checkpoint` names, reachable through `SUPERSCALAR_CRASH_AT`
+or `lsp_crash_set_target`:
+
+| Checkpoint | Where | State after the crash | Restart, LSP retries the same tx | Restart, LSP proposes a different spend of the same parent |
+|---|---|---|---|---|
+| `ps_record_pre_save` | partial sig exists (not yet in the session), before the INSERT | no row, nothing sent | signs and records normally | signs and records normally — nothing was recorded, and the first partial sig never left the process |
+| `ps_record_post_save` | INSERT durable, before FINAL | row present, LSP never received FINAL | same sighash → idempotent, succeeds | refused |
+| `ps_record_post_final` | after FINAL left | row present, LSP holds the signature | same sighash → idempotent | refused |
+
+**Tests.** `tests/test_ps_refusal.c` drives the real handler in a forked
+client over a socketpair against an on-disk DB, with the parent playing
+the LSP, and asserts on whether `MSG_LEAF_ADVANCE_FINAL` was sent for: an
+injected check error, an injected insert error, a sighash failure, a
+conflicting record, an identical record, the concurrent-insert race, and
+the three crash checkpoints with restart.
+`tests/test_persist.c::test_persist_ps_signed_input_arbiter` covers the
+persist layer.  The fault hook is `persist_test_set_ps_hook`
+(test-only; a NULL check in production).
 
 ### Watchtower
 
@@ -170,8 +274,11 @@ Cross-references for the test cases that pin this contract:
   (test_factory.c:5008) — PS leaf chain scales to N=64 (250 nodes, 63
   leaves), exercising the same-key, chained-spend topology at width.
 - `tests/test_channels.c::test_client_ps_double_spend_defense_refuses`
-  (test_channels.c:4048) — defense blocks a second-sign attempt against
-  the same `(parent_txid, parent_vout)`.
+  — defense blocks a second-sign attempt against the same
+  `(parent_txid, parent_vout)` with a different sighash.
+- `tests/test_ps_refusal.c` — failure semantics of the record-and-refuse
+  path: check error, insert error, sighash failure, conflicting and
+  identical records, the concurrent-insert race, crash + restart.
 - `tests/test_close_spendability_full.c::test_regtest_ps_chain_close_spendability`
   (test_close_spendability_full.c:1197) — final state of a PS chain is
   spendable on regtest, end to end.
@@ -179,8 +286,8 @@ Cross-references for the test cases that pin this contract:
   `client_ps_signed_inputs` table.
 
 If you change PS leaf construction, the double-spend check, or the
-persist schema, run all four. They are the contract test suite for this
-doc.
+persist schema, run all of them. They are the contract test suite for
+this doc.
 
 ## See also
 
