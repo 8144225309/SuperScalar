@@ -283,12 +283,28 @@ Backup format (v2): `[magic][version][salt][iterations][nonce][ciphertext][tag]`
 
 Schedule regular backups in production. Keep backups on a separate machine.
 
+**Never restore an old backup of the DB of a live factory.** A backup holds
+the factory's states as of the moment it was taken. Every advance since then
+superseded one of them and revealed the L-stock secret of the superseded
+state to the clients. A restored DB passes the restart checks (each stored
+node is consistent with the others, just old), so the LSP serves it, and a
+force-close from it publishes states whose secrets the clients hold: they can
+spend the LSP's L-stock outputs and publish the newer states they have. Use a
+backup only for a factory that never advanced after it was taken, or to
+recover keys and settled funds; never to resume a factory's tree state.
+
 ## 7. Crash Recovery
 
 If the LSP process crashes (power failure, OOM, etc.):
 
 1. Restart with the **same `--seckey`** (or `--keyfile`) and **same `--db`** path
-2. The LSP loads factory state, channel balances, and pending HTLCs from the database
+2. The LSP loads factory state, channel balances, and pending HTLCs from the database.
+   It rebuilds the factory's signed tree from the stored rows and checks it
+   (every node signed and spending its stored parent, the DW counter matching
+   every node's nSequence, Pseudo-Spilman chains of the current epoch, the
+   L-stock state counters). If a check fails, the log says so and leaf
+   advances, reallocs and root advances stay refused for that factory;
+   payments still settle and force-close still works from the DB.
 3. Clients detect the disconnect and reconnect automatically (5s retry loop)
 4. After reconnection, pending HTLCs are replayed and normal operation resumes
 

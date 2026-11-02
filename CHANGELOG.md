@@ -2,7 +2,7 @@
 
 All notable changes to SuperScalar are documented here.
 
-> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **43**.
 
 ## Unreleased
 
@@ -22,7 +22,16 @@ All notable changes to SuperScalar are documented here.
 - `recoverfactory` requires `factory_id` and is a dry run unless `dry_run:false`.
 - **Upgrading operator scripts:** `recoverfactory` now defaults to a dry run and broadcasts nothing; a script that uses it to publish a factory tree must pass `"dry_run": false` (and the now-required `factory_id`).
 - The signed cooperative close is persisted (`closing`) before `CLOSE_DONE`. A `closing` factory is never served again; `--force-close-from-db` publishes its tree if the close does not confirm.
-- Stacked on the restart-persistence branch: every advance now re-saves the signed tree and the DW counter in one transaction before DONE, so a factory loaded from the DB rebuilds its signed tree and is verified (each node spends its stored parent, the counter matches every node's nSequence, PS epochs line up) before advances resume, replacing that branch's blanket post-restart refusal. A client DB, which has no `dw_counter_state` row, recovers its epoch from the PS chain rows, so a restarted client no longer blocks the factory's next Tier B.
+
+### Tree reload after a restart
+
+- A factory loaded from the DB rebuilds its signed tree from the stored rows and is checked before advances resume (every node signed and spending its stored parent, the DW counter matching every node's nSequence, each PS node's chain of the current epoch), replacing the blanket post-restart refusal. A client DB, which has no `dw_counter_state` row, recovers its epoch from the PS chain rows.
+- **L-stock secret reuse:** the per-node L-stock state counter was not stored and came back as 0, so the next advance committed the LSP's new L-stock to a secret already revealed. It is now stored with each tree row (with the current hash, which a client cannot derive) and restored; a node that advanced without a stored counter keeps the factory refused, and the LSP checks the restored counters against its seed.
+- **PS chains across a rollover:** chain loads take only the rows of the current epoch, contiguous and each spending the previous one, with chain[0] of that epoch. After a root rollover from a longer chain, the old epoch's rows were read as the tip.
+- **Signature before storage:** before the LSP releases its partial signature in an advance (leaf advance, Tier B, both sub-factory paths), and before a client releases its signature (leaf advance, realloc, Tier B), the TX is recorded in the DB. After a restart that reloads the previous state, only that identical TX can be signed in its position (a DW node's nSequence, a PS chain output); a different one is refused.
+- On-request L-stock reveals stop at the stored state after a reload, and after a ceremony that moved the counter but stored nothing.
+- A seedless client now rebuilds a DW leaf's hashlocked L-stock with the hash the LSP sends, so it can follow a hashlock DW leaf advance.
+- **Upgrading:** schema v43 (`tree_node_lstock`, `signed_state_reservations`); older builds refuse the DB. A factory that advanced under a build without these rows reloads with advances refused. Never restore an old DB backup of a live factory (operator guide, Backup & Restore).
 
 ## v0.2.0 — 2026-07-02
 

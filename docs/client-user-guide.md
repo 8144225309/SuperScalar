@@ -148,6 +148,10 @@ If your connection drops:
 
 This happens automatically in `--daemon` mode. With `--db`, your channel state survives client restarts too.
 
+Do not restore an old copy of your client DB while the factory is live. It
+holds older factory states, and your client would reload and use them; a
+force-close from it publishes states the LSP has since superseded.
+
 ## 7. Tor Support
 
 Connect to an LSP running as a Tor hidden service:
