@@ -2139,6 +2139,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_open_cb_wires);
     RUN_TEST(test_jit_open_cb_on_cost_covered);
     RUN_TEST(test_jit_open_cb_null_guard);
+    extern int test_jit_revalidate_rpc_outage_keeps_open(void);
+    extern int test_jit_force_close_rpc_outage_keeps_open(void);
+    RUN_TEST(test_jit_revalidate_rpc_outage_keeps_open);
+    RUN_TEST(test_jit_force_close_rpc_outage_keeps_open);
+    extern int test_regtest_conf_stops_at_first_unreachable(void);
+    extern int test_regtest_conf_conflicted_wallet_tx(void);
+    RUN_TEST(test_regtest_conf_stops_at_first_unreachable);
+    RUN_TEST(test_regtest_conf_conflicted_wallet_tx);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
@@ -3934,6 +3942,8 @@ static void run_unit_tests(void) {
     extern int test_reorg_funding_freeze_reloaded_on_restart(void);
     RUN_TEST(test_reorg_funding_recheck_due);
     RUN_TEST(test_reorg_funding_freeze_reloaded_on_restart);
+    extern int test_reorg_revalidate_rpc_outage_no_change(void);
+    RUN_TEST(test_reorg_revalidate_rpc_outage_no_change);
 }
 
 extern int regtest_init_faucet(void);

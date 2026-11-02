@@ -3021,6 +3021,7 @@ typedef enum {
     REVAL_PENDING,     /* in the mempool, younger than the freeze threshold */
     REVAL_STALE,       /* in the mempool past regtest_network_mempool_freeze_seconds() */
     REVAL_GONE,        /* neither confirmed nor in the mempool */
+    REVAL_UNKNOWN,     /* bitcoind could not be reached: no state change */
 } reval_state_t;
 
 /* State of one funding TX.  conf == 0 alone does not mean "in the mempool":
@@ -3033,9 +3034,11 @@ static reval_state_t reval_funding_state(regtest_t *rt, const char *txid_hex,
                                          int *conf_out) {
     int conf = regtest_get_confirmations(rt, txid_hex);
     *conf_out = conf;
+    if (conf == REGTEST_CONF_RPC_ERROR) return REVAL_UNKNOWN;
     if (conf >= 1) return REVAL_CONFIRMED;
     if (conf < 0) return REVAL_GONE;
     int age = regtest_get_mempool_entry_seconds_ago(rt, txid_hex);
+    if (age < 0 && regtest_last_rpc_unreachable()) return REVAL_UNKNOWN;
     if (age < 0) return REVAL_GONE;
     return age >= regtest_network_mempool_freeze_seconds(rt) ? REVAL_STALE
                                                              : REVAL_PENDING;
@@ -3073,6 +3076,8 @@ int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr) {
      - GONE (not confirmed, not in the mempool) or STALE (in the mempool past
        the per-network threshold): channels are frozen.
      - PENDING: no change.
+     - UNKNOWN (bitcoind unreachable): no change at all, including
+       mgr->funding_anchor_unconfirmed.
    mgr->funding_anchor_unconfirmed is set when the result was not CONFIRMED;
    while it (or any freeze) is set the daemon loop calls this again on every
    new block (lsp_channels_funding_recheck_due), so PENDING turns into a
@@ -3091,6 +3096,7 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     regtest_t *rt = mgr->watchtower->rt;
     int changed = 0;
     int any_unconfirmed = 0;
+    int any_unknown = 0;
 
     static const unsigned char zero32[32] = {0};
     const factory_t *f = lsp ? &lsp->factory : NULL;
@@ -3117,6 +3123,10 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             reval_txid_hex(ch->funding_txid, own_hex);
             txid_hex = own_hex;
             st = reval_funding_state(rt, own_hex, &conf);
+        }
+        if (st == REVAL_UNKNOWN) {
+            any_unknown = 1;
+            continue;
         }
         if (st != REVAL_CONFIRMED) any_unconfirmed = 1;
 
@@ -3162,7 +3172,11 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             }
         }
     }
-    mgr->funding_anchor_unconfirmed = any_unconfirmed;
+    if (any_unknown)
+        fprintf(stderr, "LSP revalidate: bitcoind unreachable, funding state "
+                "unknown — no change\n");
+    else
+        mgr->funding_anchor_unconfirmed = any_unconfirmed;
     return changed;
 }
 

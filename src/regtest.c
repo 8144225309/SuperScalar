@@ -36,6 +36,16 @@ static inline bool regtest_err_is_expected_poll_miss(int code) {
    a one-shot reload + retry. See task #298. */
 static __thread int g_regtest_last_http_error = 0;
 
+/* Thread-local: 1 when the most recent regtest_exec() got no answer from
+   bitcoind at all (connection refused / reset, timeout, bitcoin-cli could
+   not connect or could not run), as opposed to an answer that may be an
+   RPC error such as -5 "not found".  See regtest_last_rpc_unreachable(). */
+static __thread int g_regtest_last_unreachable = 0;
+
+/* Thread-local: exit status of the last bitcoin-cli child (-1 = killed or
+   timed out, 127 = could not be executed). */
+static __thread int g_regtest_last_cli_status = 0;
+
 /* Auto-recovery rate limit. bitcoind's "wallet not loaded" state can drive
    long polling loops, so we coalesce concurrent -18 errors into at most one
    loadwallet attempt per second across all callers. */
@@ -48,18 +58,23 @@ static time_t g_regtest_last_wallet_reload = 0;
 #define REGTEST_CMD_TIMEOUT_SECS 30
 #endif
 
-/* Wait for child with timeout. Returns 0 on normal exit, -1 on timeout (child killed). */
+/* Wait for child with timeout. Returns 0 on normal exit, -1 on timeout (child killed).
+   Records the child's exit status in g_regtest_last_cli_status. */
 static int waitpid_timeout(pid_t pid, int timeout_secs) {
     time_t deadline = time(NULL) + timeout_secs;
     while (time(NULL) < deadline) {
         int status;
         pid_t ret = waitpid(pid, &status, WNOHANG);
-        if (ret == pid) return 0;    /* child exited */
-        if (ret < 0) return 0;       /* error (already exited) */
+        if (ret == pid) {            /* child exited */
+            g_regtest_last_cli_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            return 0;
+        }
+        if (ret < 0) { g_regtest_last_cli_status = 0; return 0; }  /* already reaped */
         usleep(50000);               /* 50ms poll interval */
     }
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);  /* reap zombie */
+    g_regtest_last_cli_status = -1;
     return -1;
 }
 
@@ -692,7 +707,25 @@ static int regtest_try_reload_wallet(const regtest_t *rt) {
 
 #endif /* _POSIX_VERSION (HTTP RPC) */
 
+int regtest_last_rpc_unreachable(void) {
+    return g_regtest_last_unreachable;
+}
+
+/* bitcoin-cli output for a call that never reached bitcoind: it prints
+   "error: <reason>" (connect failure, timeout, auth) and exits non-zero,
+   whereas an RPC error from bitcoind prints "error code: N".  An exit
+   status of 127 means the binary could not be run. */
+static int regtest_cli_unreachable(const char *out) {
+    if (g_regtest_last_cli_status == 127 || g_regtest_last_cli_status == -1)
+        return 1;
+    if (g_regtest_last_cli_status != 0 && out &&
+        strncmp(out, "error: ", 7) == 0)
+        return 1;
+    return 0;
+}
+
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params) {
+    g_regtest_last_unreachable = 0;
     /* Reject shell metacharacters in method and params */
     if (!sanitize_rpc_param(method) || !sanitize_rpc_param(params))
         return NULL;
@@ -727,8 +760,15 @@ char *regtest_exec(const regtest_t *rt, const char *method, const char *params) 
     char **argv = build_argv(rt, method, params, &argc_n);
     if (!argv) return NULL;
 
+    g_regtest_last_cli_status = 0;
     char *result = run_command_exec(argv);
     free_argv(argv, argc_n);
+    /* Unreachable only when neither path got an answer from bitcoind: the
+       HTTP attempt (if any) produced no JSON-RPC response and bitcoin-cli
+       could not connect either. */
+    if ((rt->rpcport <= 0 || g_regtest_last_http_error == 0) &&
+        (!result || regtest_cli_unreachable(result)))
+        g_regtest_last_unreachable = 1;
     return result;
 #else
     /* Fallback: popen (non-POSIX systems) */
@@ -1074,6 +1114,16 @@ int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
     return 1;
 }
 
+/* Each lookup below stops at the first call bitcoind did not answer: the
+   answer is then unknown, and the remaining calls would only wait on the
+   same outage. */
+#define REGTEST_CONF_RETURN_IF_UNREACHABLE(res) do { \
+    if (regtest_last_rpc_unreachable()) {           \
+        free(res);                                  \
+        return REGTEST_CONF_RPC_ERROR;              \
+    }                                               \
+} while (0)
+
 /* Inner worker — flag-clearing wrapper below ensures g_regtest_poll_quiet
    is reset on every return path (poll-loop quiet scope, task #200). */
 static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
@@ -1082,6 +1132,7 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
     /* Try gettransaction (wallet txs) */
     snprintf(params, sizeof(params), "\"%s\" true", txid);
     char *result = regtest_exec(rt, "gettransaction", params);
+    REGTEST_CONF_RETURN_IF_UNREACHABLE(result);
     if (result) {
         cJSON *json = cJSON_Parse(result);
         free(result);
@@ -1090,7 +1141,11 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
             if (conf && cJSON_IsNumber(conf)) {
                 int val = conf->valueint;
                 cJSON_Delete(json);
-                return val;
+                /* The wallet reports a TX that conflicts with a confirmed
+                   one as minus the conflict's depth (-1, -2, ...), which
+                   would read as "not found" or as REGTEST_CONF_RPC_ERROR.
+                   Such a TX can never confirm. */
+                return val < 0 ? REGTEST_CONF_CONFLICTED : val;
             }
             cJSON_Delete(json);
         }
@@ -1103,6 +1158,7 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
        are invisible to gettransaction. */
     snprintf(params, sizeof(params), "\"%s\" true", txid);
     result = regtest_exec(rt, "getrawtransaction", params);
+    REGTEST_CONF_RETURN_IF_UNREACHABLE(result);
     if (result) {
         cJSON *json = cJSON_Parse(result);
         free(result);
@@ -1121,6 +1177,7 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
 
     /* Fallback: scan recent blocks with getrawtransaction + blockhash */
     result = regtest_exec(rt, "getblockcount", "");
+    REGTEST_CONF_RETURN_IF_UNREACHABLE(result);
     if (!result) return -1;
     int height = atoi(result);
     free(result);
@@ -1129,6 +1186,7 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
     for (int i = 0; i < depth && i <= height; i++) {
         snprintf(params, sizeof(params), "%d", height - i);
         char *hash_result = regtest_exec(rt, "getblockhash", params);
+        REGTEST_CONF_RETURN_IF_UNREACHABLE(hash_result);
         if (!hash_result) continue;
 
         /* Trim whitespace */
@@ -1144,6 +1202,7 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
 
         snprintf(params, sizeof(params), "\"%s\" true \"%s\"", txid, blockhash);
         char *tx_result = regtest_exec(rt, "getrawtransaction", params);
+        REGTEST_CONF_RETURN_IF_UNREACHABLE(tx_result);
         if (!tx_result) continue;
 
         cJSON *json = cJSON_Parse(tx_result);
@@ -1161,6 +1220,7 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
 
     return -1;
 }
+#undef REGTEST_CONF_RETURN_IF_UNREACHABLE
 
 int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     /* Poll-loop quiet scope: suppress -5/-19 noise. Task #200. */

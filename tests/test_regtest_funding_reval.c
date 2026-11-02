@@ -7,6 +7,9 @@
  *                                           a persisted freeze is loaded by
  *                                           lsp_channels_init_from_db and
  *                                           makes the re-check due
+ *   test_reorg_revalidate_rpc_outage_no_change
+ *                                           bitcoind unreachable during
+ *                                           revalidation: nothing changes
  * Regtest:
  *   test_regtest_reorg_revalidate_factory_funding
  *     5-party arity-2 factory funded on regtest; lsp_channels_revalidate_
@@ -217,6 +220,79 @@ done:
     if (mgr_ok) lsp_channels_cleanup(&mgr);
     if (db_ok) persist_close(&db);
     if (f) { factory_free(f); free(f); }
+    secp256k1_context_destroy(ctx);
+    return rc;
+}
+
+/* A chain handle that cannot reach any node: nothing listens on port 1
+   and the bitcoin-cli fallback path does not exist. */
+static void unreachable_rt(regtest_t *rt) {
+    memset(rt, 0, sizeof(*rt));
+    snprintf(rt->cli_path, sizeof(rt->cli_path), "/nonexistent/ss-test-bitcoin-cli");
+    snprintf(rt->rpcuser, sizeof(rt->rpcuser), "rpcuser");
+    snprintf(rt->rpcpassword, sizeof(rt->rpcpassword), "rpcpass");
+    snprintf(rt->network, sizeof(rt->network), "regtest");
+    rt->rpcport = 1;
+    rt->scan_depth = 10;
+}
+
+int test_reorg_revalidate_rpc_outage_no_change(void) {
+    int rc = 0;
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    int mgr_ok = 0;
+    unsigned char sk[5][32], spk[34], xo[32], txid[32];
+    secp256k1_pubkey pks[5];
+    regtest_t dead;
+    watchtower_t wt;
+
+    TEST_ASSERT_GOTO(lsp, "alloc lsp");
+    TEST_ASSERT_GOTO(make_keys(ctx, sk, pks, spk, xo), "keys");
+    memset(txid, 0xCD, 32);
+    TEST_ASSERT_GOTO(build_factory(ctx, &lsp->factory, pks, txid, 0, 200000,
+                                   spk, 500), "build factory");
+    TEST_ASSERT_GOTO(lsp_channels_init(&mgr, ctx, &lsp->factory, sk[0], 4),
+                     "init");
+    mgr_ok = 1;
+    unreachable_rt(&dead);
+    memset(&wt, 0, sizeof(wt));
+    wt.rt = &dead;
+    mgr.watchtower = &wt;
+
+    /* Live channels: an outage must not freeze them. */
+    int changed = lsp_channels_revalidate_funding(&mgr, lsp);
+    printf("\n    outage, live channels: changed=%d frozen=%d/4", changed,
+           count_frozen(&mgr));
+    TEST_ASSERT_GOTO(changed == 0 && count_frozen(&mgr) == 0,
+                     "outage does not freeze live channels");
+    TEST_ASSERT_GOTO(mgr.funding_anchor_unconfirmed == 0,
+                     "outage does not mark the funding unconfirmed");
+
+    /* Frozen channel and a pending re-check: both stay as they are. */
+    mgr.entries[1].channel.funding_pending_reorg = 1;
+    mgr.funding_anchor_unconfirmed = 1;
+    changed = lsp_channels_revalidate_funding(&mgr, lsp);
+    printf("\n    outage, channel 1 frozen: changed=%d frozen=%d/4 "
+           "recheck_due=%d", changed, count_frozen(&mgr),
+           lsp_channels_funding_recheck_due(&mgr));
+    TEST_ASSERT_GOTO(changed == 0 && count_frozen(&mgr) == 1 &&
+                     mgr.entries[1].channel.funding_pending_reorg,
+                     "outage leaves the freeze in place");
+    TEST_ASSERT_GOTO(mgr.funding_anchor_unconfirmed == 1,
+                     "outage leaves the pending re-check in place");
+
+    int conf = regtest_get_confirmations(&dead,
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+    printf("\n    regtest_get_confirmations while unreachable: %d\n   ", conf);
+    TEST_ASSERT_GOTO(conf == REGTEST_CONF_RPC_ERROR,
+                     "unreachable node reported as RPC error, not not-found");
+    rc = 1;
+done:
+    if (mgr_ok) { mgr.watchtower = NULL; lsp_channels_cleanup(&mgr); }
+    if (lsp) { factory_free(&lsp->factory); free(lsp); }
     secp256k1_context_destroy(ctx);
     return rc;
 }

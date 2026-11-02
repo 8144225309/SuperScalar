@@ -106,7 +106,23 @@ int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 int   regtest_outpoint_unspent(regtest_t *rt,
                                  const char *txid_hex_display,
                                  uint32_t vout);
+/* Confirmations of txid: >= 1 confirmed in the active chain, 0 known but
+   unconfirmed (mempool; with -txindex also a TX whose block was
+   disconnected), -1 not found, REGTEST_CONF_RPC_ERROR (-2) when bitcoind
+   could not be reached, so the answer is unknown (the lookup stops at the
+   first call that got no answer), REGTEST_CONF_CONFLICTED (-3) for a
+   wallet TX that conflicts with a confirmed TX (the wallet's negative
+   confirmations), which can never confirm.
+   Without -txindex a non-wallet TX deeper than rt->scan_depth blocks is
+   reported as not found. */
+#define REGTEST_CONF_RPC_ERROR (-2)
+#define REGTEST_CONF_CONFLICTED (-3)
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
+
+/* 1 when the most recent regtest_exec() on this thread got no answer from
+   bitcoind (connection failure, timeout, bitcoin-cli unable to connect or
+   to run); 0 when bitcoind answered, even with an RPC error. */
+int   regtest_last_rpc_unreachable(void);
 /*
  * Batch confirmations for n_txids display-order hex txids.
  * Fetches each block only once (getblock hash 1), O(scan_depth) RPCs total.
