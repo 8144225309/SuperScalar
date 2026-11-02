@@ -1,4 +1,5 @@
 #include "superscalar/regtest.h"
+#include "superscalar/tx_builder.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -2351,4 +2352,168 @@ int regtest_scan_block_txs(regtest_t *rt, const char *block_hash,
 
     cJSON_Delete(block);
     return tx_count;
+}
+
+/* --- Build a wallet payment without broadcasting it; find a wallet send --- */
+
+int regtest_unlock_tx_inputs(regtest_t *rt, const char *tx_hex) {
+    if (!rt || !tx_hex) return -1;
+    size_t n = strlen(tx_hex) / 2;
+    unsigned char *bytes = malloc(n ? n : 1);
+    if (!bytes || hex_decode(tx_hex, bytes, n) != (int)n) { free(bytes); return -1; }
+    size_t n_in = 0;
+    unsigned char (*prev)[32] = calloc(256, 32);
+    uint32_t *vouts = calloc(256, sizeof(uint32_t));
+    int ok = prev && vouts && tx_parse_inputs(bytes, n, prev, vouts, 256, &n_in);
+    free(bytes);
+    if (!ok) { free(prev); free(vouts); return -1; }
+    /* One call per input: bitcoind refuses the whole call if any outpoint is
+       already spent or not locked, and only the still-locked ones matter. */
+    int unlocked = 0;
+    for (size_t i = 0; i < n_in && i < 256; i++) {
+        unsigned char rb[32];
+        char disp[65], params[192];
+        for (int k = 0; k < 32; k++) rb[k] = prev[i][31 - k];
+        hex_encode(rb, 32, disp);
+        snprintf(params, sizeof(params), "true '[{\"txid\":\"%s\",\"vout\":%u}]'",
+                 disp, (unsigned)vouts[i]);
+        char *res = regtest_exec(rt, "lockunspent", params);
+        if (res && strstr(res, "true") && !strstr(res, "error")) unlocked++;
+        free(res);
+    }
+    free(prev);
+    free(vouts);
+    return unlocked;
+}
+
+int regtest_abandon_tx(regtest_t *rt, const char *txid) {
+    if (!rt || !txid) return 0;
+    char params[80];
+    snprintf(params, sizeof(params), "\"%s\"", txid);
+    char *res = regtest_exec(rt, "abandontransaction", params);
+    int ok = res && !strstr(res, "error");
+    free(res);
+    return ok;
+}
+
+int regtest_wallet_conflict_depth(regtest_t *rt, const char *txid) {
+    if (!rt || !txid) return -1;
+    char params[80];
+    snprintf(params, sizeof(params), "\"%s\"", txid);
+    char *res = regtest_exec(rt, "gettransaction", params);
+    if (!res) return -1;
+    cJSON *j = cJSON_Parse(res);
+    free(res);
+    cJSON *c = j ? cJSON_GetObjectItem(j, "confirmations") : NULL;
+    int out = -1;
+    if (c && cJSON_IsNumber(c)) out = c->valueint < 0 ? -c->valueint : 0;
+    cJSON_Delete(j);
+    return out;
+}
+
+int regtest_outpoint_spent_in_chain(regtest_t *rt, const char *txid_hex_display,
+                                    uint32_t vout) {
+    if (!rt || !txid_hex_display) return -1;
+    char params[128];
+    snprintf(params, sizeof(params), "%s %u false", txid_hex_display, (unsigned)vout);
+    char *result = regtest_exec(rt, "gettxout", params);
+    if (!result) return -1;
+    int gone = (result[0] == '\0' || strncmp(result, "null", 4) == 0);
+    free(result);
+    return gone ? 1 : 0;
+}
+
+char *regtest_build_signed_payment(regtest_t *rt, const char *address,
+                                   double btc_amount, char *txid_out65) {
+    if (!rt || !address || btc_amount <= 0) return NULL;
+    char params[512];
+    snprintf(params, sizeof(params), "'[]' '[{\"%s\":%.8f}]'", address, btc_amount);
+    char *raw = regtest_exec(rt, "createrawtransaction", params);
+    if (!raw) return NULL;
+    char *s = raw;
+    while (*s == '"' || *s == ' ' || *s == '\n') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == '"' || e[-1] == ' ' || e[-1] == '\n' || e[-1] == '\r')) *--e = '\0';
+    size_t plen = strlen(s) + 64;
+    char *fparams = malloc(plen);
+    if (!fparams) { free(raw); return NULL; }
+    /* lockUnspents: the wallet must not spend these inputs elsewhere before
+       the caller broadcasts this TX. */
+    snprintf(fparams, plen, "\"%s\" '{\"lockUnspents\":true}'", s);
+    free(raw);
+    char *funded = regtest_exec(rt, "fundrawtransaction", fparams);
+    free(fparams);
+    if (!funded) return NULL;
+    cJSON *fj = cJSON_Parse(funded);
+    free(funded);
+    cJSON *fh = fj ? cJSON_GetObjectItem(fj, "hex") : NULL;
+    if (!fh || !cJSON_IsString(fh)) {
+        fprintf(stderr, "regtest_build_signed_payment: fundrawtransaction failed\n");
+        cJSON_Delete(fj);
+        return NULL;
+    }
+    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, fh->valuestring, NULL, 1);
+    if (!signed_hex) {
+        /* fundrawtransaction locked the inputs: release them again. */
+        regtest_unlock_tx_inputs(rt, fh->valuestring);
+        cJSON_Delete(fj);
+        return NULL;
+    }
+    size_t n = strlen(signed_hex) / 2;
+    unsigned char *bytes = malloc(n ? n : 1);
+    unsigned char txid[32];
+    if (!bytes || hex_decode(signed_hex, bytes, n) != (int)n ||
+        !tx_txid_from_bytes(bytes, n, txid)) {
+        regtest_unlock_tx_inputs(rt, fh->valuestring);
+        cJSON_Delete(fj);
+        free(bytes);
+        free(signed_hex);
+        return NULL;
+    }
+    cJSON_Delete(fj);
+    free(bytes);
+    if (txid_out65) {
+        unsigned char rb[32];
+        for (int i = 0; i < 32; i++) rb[i] = txid[31 - i];
+        hex_encode(rb, 32, txid_out65);
+    }
+    return signed_hex;
+}
+
+int regtest_find_wallet_send(regtest_t *rt, const char *address, uint64_t amount_sats,
+                             int min_height, const char (*exclude)[65], size_t n_exclude,
+                             char *txid_out65) {
+    if (!rt || !address || !txid_out65) return 0;
+    char *res = regtest_exec(rt, "listtransactions", "\"*\" 1000 0 true");
+    if (!res) return 0;
+    cJSON *arr = cJSON_Parse(res);
+    free(res);
+    if (!arr || !cJSON_IsArray(arr)) { cJSON_Delete(arr); return 0; }
+    int found = 0;
+    int n = cJSON_GetArraySize(arr);
+    for (int i = n - 1; i >= 0 && !found; i--) {           /* newest first */
+        cJSON *t = cJSON_GetArrayItem(arr, i);
+        cJSON *cat = cJSON_GetObjectItem(t, "category");
+        cJSON *adr = cJSON_GetObjectItem(t, "address");
+        cJSON *amt = cJSON_GetObjectItem(t, "amount");
+        cJSON *txid = cJSON_GetObjectItem(t, "txid");
+        cJSON *conf = cJSON_GetObjectItem(t, "confirmations");
+        cJSON *bh = cJSON_GetObjectItem(t, "blockheight");
+        if (!cJSON_IsString(cat) || strcmp(cat->valuestring, "send") != 0) continue;
+        if (!cJSON_IsString(adr) || strcmp(adr->valuestring, address) != 0) continue;
+        if (!cJSON_IsNumber(amt) || !cJSON_IsString(txid)) continue;
+        double sats = -amt->valuedouble * 100000000.0;
+        if ((uint64_t)(sats + 0.5) != amount_sats) continue;
+        int confs = cJSON_IsNumber(conf) ? conf->valueint : 0;
+        if (confs < 0) continue;                           /* conflicted */
+        if (confs > 0 && (!cJSON_IsNumber(bh) || bh->valueint < min_height)) continue;
+        int skip = 0;
+        for (size_t k = 0; k < n_exclude && !skip; k++)
+            if (strcmp(exclude[k], txid->valuestring) == 0) skip = 1;
+        if (skip) continue;
+        snprintf(txid_out65, 65, "%s", txid->valuestring);
+        found = 1;
+    }
+    cJSON_Delete(arr);
+    return found;
 }

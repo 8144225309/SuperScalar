@@ -9,6 +9,7 @@ All notable changes to SuperScalar are documented here.
 ### Factory rotation
 
 - **Fixed: rotation crashed the LSP right after closing the old factory.** The crash came in Phase C, after the cooperative close had paid every client's balance to the LSP wallet and the replacement factory had been funded but not yet signed, so the clients' funds had no signed tree and no distribution TX behind them. A retry after a failed initial factory creation crashed the same way. Factory creation now keeps the factory's shape and participant profiles across the ceremony and across a failed attempt, and rotation no longer frees the old factory before creating the new one.
+- **Rotation checks before its irreversible close and survives a crash after it.** The replacement factory's setup is dry-run before the clients hand over their factory keys and again before the old factory is closed. After the close, each step (close, funding, signing) is recorded before it happens, so a restarted LSP finishes the rotation without closing or funding twice, signs again only over a byte-identical replacement, and otherwise holds for the operator. Not yet covered: a timeout while waiting for clients, and partial rotations.
 - **Fixed: the LSP's broadcast of the initial factory's distribution TX at EXPIRED was rejected** ("Witness program was passed an empty witness"): the LSP stored the unsigned TX. It now stores only the co-signed TX. Clients were unaffected; they keep their own signed copy.
 
 ## v0.2.0 — 2026-07-02

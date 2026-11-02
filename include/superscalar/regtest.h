@@ -229,4 +229,39 @@ int regtest_create_funded_tx(regtest_t *rt, const tx_output_t *outputs,
                               char *txid_hex_out, char *signed_hex_out,
                               size_t hex_max);
 
+/* Build and wallet-sign -- WITHOUT broadcasting -- a TX paying BTC_AMOUNT to
+   ADDRESS (createrawtransaction + fundrawtransaction with the inputs locked
+   until broadcast + signrawtransactionwithwallet).  Returns the signed hex
+   (malloc'd) and its display txid in TXID_OUT65, or NULL. */
+char *regtest_build_signed_payment(regtest_t *rt, const char *address,
+                                   double btc_amount, char *txid_out65);
+
+/* Release the wallet locks on the inputs of TX_HEX (lockunspent true, one
+   input at a time): for a TX built by regtest_build_signed_payment that will
+   NOT be broadcast, or whose record was dropped.  Inputs already spent or not
+   locked are skipped.  Returns how many were unlocked, -1 if TX_HEX does not
+   parse. */
+int regtest_unlock_tx_inputs(regtest_t *rt, const char *tx_hex);
+
+/* abandontransaction: the wallet stops rebroadcasting TXID (only possible
+   while it is neither confirmed nor in the mempool).  Returns 1 on success. */
+int regtest_abandon_tx(regtest_t *rt, const char *txid);
+
+/* For a wallet TX conflicted by a confirmed TX: that TX's depth (bitcoind
+   reports it as negative confirmations).  0 if not conflicted, -1 if the
+   wallet does not know TXID. */
+int regtest_wallet_conflict_depth(regtest_t *rt, const char *txid);
+
+/* 1 if TXID:VOUT is not an unspent output of the CHAIN (spent by a confirmed
+   TX, ignoring the mempool), 0 if it is unspent there, -1 on error. */
+int regtest_outpoint_spent_in_chain(regtest_t *rt, const char *txid_hex_display,
+                                    uint32_t vout);
+
+/* The newest wallet send of exactly AMOUNT_SATS to ADDRESS that is unconfirmed
+   or confirmed at height >= MIN_HEIGHT, skipping the N_EXCLUDE display-hex
+   txids in EXCLUDE.  Returns 1 with its txid in TXID_OUT65. */
+int regtest_find_wallet_send(regtest_t *rt, const char *address, uint64_t amount_sats,
+                             int min_height, const char (*exclude)[65], size_t n_exclude,
+                             char *txid_out65);
+
 #endif /* SUPERSCALAR_REGTEST_H */

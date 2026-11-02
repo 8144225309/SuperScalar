@@ -7208,6 +7208,29 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         }
                     }
 
+                    /* Resume a rotation that is past its irreversible close
+                       (replacement factory not yet signed): after a restart,
+                       or after a failure.  lsp_rotation_resume takes one step
+                       per block. */
+                    /* Not gated on rot_auto_rotate: a rotation past its close
+                       (started automatically or by hand) must always finish. */
+                    if (lsp_rotation_progress_pending(mgr) &&
+                        (uint32_t)height != mgr->rot_progress.last_attempt_height) {
+                        /* Steps that need no client (confirming or
+                           rebroadcasting the recorded close / funding) run
+                           whenever a rotation is pending; Phase C waits for
+                           every client inside lsp_rotation_resume. */
+                        if (lsp_rotation_resume(mgr, lsp)) {
+                            printf("LSP: auto-rotation complete — new factory active\n");
+                            fflush(stdout);
+                            time_t rs_now = time(NULL);
+                            for (size_t rc = 0; rc < mgr->n_channels; rc++) {
+                                mgr->entries[rc].last_message_time = rs_now;
+                                mgr->entries[rc].offline_detected = 0;
+                            }
+                        }
+                    }
+
                     /* Profit settlement: handled above via chain_be (works
                        without watchtower). Removed from watchtower block. */
                     /* Factory lifecycle monitoring */
@@ -7307,8 +7330,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 if (mgr->rot_auto_rotate &&
                                     (lf->cached_state == FACTORY_DYING ||
                                      lf->cached_state == FACTORY_EXPIRED)) {
-                                    /* First attempt: ACTIVE → DYING transition */
+                                    /* First attempt: ACTIVE → DYING transition.
+                                       Never for a slot that was already rotated:
+                                       after a restart the recovered old factory's
+                                       lifecycle restarts at ACTIVE, and re-arming
+                                       it would end in the retry-limit fallback
+                                       (CEREMONY_ABORT to every client). */
                                     if (old_states[fi] == FACTORY_ACTIVE &&
+                                        !lf->partial_rotation_done &&
                                         !(mgr->rot_attempted_mask & (1u << (lf->factory_id & 31)))) {
                                         printf("LSP: factory %u DYING — starting auto-rotation\n",
                                                lf->factory_id);
@@ -7459,7 +7488,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         fprintf(stderr, "LSP: retry rotation FAILED "
                                                 "(attempt %u)\n", attempt);
                                     }
-                                } else if (retry_act == -1) {
+                                } else if (retry_act == -1 &&
+                                           !lsp_rotation_progress_pending(mgr)) {
+                                    /* (Skipped while a rotation is past its close:
+                                       the old funding is spent and the resume
+                                       path owns completing the replacement.) */
                                     /* Max retries exhausted — distribution TX fallback */
                                     uint32_t mret = mgr->rot_max_retries > 0
                                                     ? mgr->rot_max_retries : 3;

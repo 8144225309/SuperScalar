@@ -11,6 +11,7 @@
    (the ceremony itself needs no chain). */
 #include "superscalar/factory.h"
 #include "superscalar/lsp.h"
+#include "superscalar/lsp_channels.h"
 #include "superscalar/client.h"
 #include "superscalar/ladder.h"
 #include "superscalar/musig.h"
@@ -23,6 +24,9 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -95,6 +99,22 @@ static int rc_profiles_match(const factory_t *f, size_t n, uint16_t client_bps) 
 #define RC_AFTER_FREE      1   /* configured, then factory_free'd (old rotation) */
 #define RC_PREALLOCATED    2   /* configured, arrays live */
 #define RC_REFUSED         3   /* clients refuse the terms: the failed attempt */
+#define RC_DIGEST          4   /* dry-run digest == the delivered tree's digest */
+#define RC_HOOK_REFUSES    5   /* before_factory_ready refuses: no FACTORY_READY */
+#define RC_READY_SEND_FAILS 6  /* hook ran, the first FACTORY_READY send fails */
+
+static int rc_hook_calls;
+static unsigned char rc_hook_digest[32];
+static int rc_hook_refuse;
+static int rc_hook_break_ready;
+static int rc_hook(void *lsp, const factory_t *f, void *ctx) {
+    (void)ctx;
+    rc_hook_calls++;
+    if (!lsp_factory_tree_digest(f, rc_hook_digest)) return 0;
+    if (rc_hook_break_ready)            /* the first FACTORY_READY send will fail */
+        shutdown(((lsp_t *)lsp)->client_fds[0], SHUT_RDWR);
+    return !rc_hook_refuse;
+}
 
 static int rc_port(int mode) {
     return 21000 + (int)(getpid() % 2000) * 4 + mode;
@@ -160,12 +180,46 @@ static int rc_run_creation(int mode) {
         }
     }
 
+    unsigned char dry_digest[32], dry_again[32];
+    rc_hook_calls = 0;
+    rc_hook_refuse = (mode == RC_HOOK_REFUSES);
+    rc_hook_break_ready = (mode == RC_READY_SEND_FAILS);
+    if (!fail && (mode == RC_DIGEST || mode == RC_HOOK_REFUSES ||
+                  mode == RC_READY_SEND_FAILS)) {
+        /* The digest of the tree the ceremony WILL build, from a dry run --
+           twice, to show two in-process builds are byte-identical. */
+        if (!lsp_factory_creation_digest(lsp, lsp->client_pubkeys, 4, fake_txid, 0,
+                                         amount, spk, 34, 10, 4, 500, dry_digest) ||
+            !lsp_factory_creation_digest(lsp, lsp->client_pubkeys, 4, fake_txid, 0,
+                                         amount, spk, 34, 10, 4, 500, dry_again))
+            fail = "dry-run digest";
+        else if (memcmp(dry_digest, dry_again, 32) != 0)
+            fail = "two in-process builds differ";
+        lsp->before_factory_ready = rc_hook;
+    }
+
     int created = 0;
     if (!fail)
         created = lsp_run_factory_creation(lsp, fake_txid, 0, amount, spk, 34,
                                            10, 4, /*cltv*/ 500);
     factory_t *f = lsp ? &lsp->factory : NULL;
-    if (!fail && mode == RC_REFUSED) {
+    if (!fail && mode == RC_READY_SEND_FAILS) {
+        /* The hook ran (a caller would have recorded SIGNING_READY), then the
+           very first FACTORY_READY send failed: the ceremony fails with
+           ceremony_ready_sent == 0 -- rotation must still not lower its marker
+           (lsp_rotation_ceremony_failed). */
+        if (created) fail = "a failed FACTORY_READY send must fail the ceremony";
+        else if (rc_hook_calls != 1) fail = "hook not called exactly once";
+        else if (lsp->ceremony_ready_sent != 0) fail = "ceremony_ready_sent";
+    } else if (!fail && mode == RC_HOOK_REFUSES) {
+        /* Refused right before delivery: the ceremony fails and no client
+           ever received FACTORY_READY. */
+        if (created) fail = "a refusing hook must abort the ceremony";
+        else if (rc_hook_calls != 1) fail = "hook not called exactly once";
+        else if (lsp->ceremony_ready_sent != 0) fail = "FACTORY_READY was sent";
+        else if (memcmp(rc_hook_digest, dry_digest, 32) != 0)
+            fail = "hook saw a different tree than the dry run";
+    } else if (!fail && mode == RC_REFUSED) {
         /* The ceremony must fail (clients refuse 0 bps) and leave the
            caller's template behind -- arrays allocated, same shape and
            profiles -- so the caller's retry rebuilds the same factory. */
@@ -190,6 +244,15 @@ static int rc_run_creation(int mode) {
             fail = "participant profiles not carried across creation";
         else if (mode == RC_NEVER_ALLOCATED && f->profiles[1].profit_share_bps != 0)
             fail = "fresh profiles must start zeroed";
+        else if (mode == RC_DIGEST) {
+            unsigned char built[32];
+            if (rc_hook_calls != 1) fail = "hook not called exactly once";
+            else if (lsp->ceremony_ready_sent != 4) fail = "FACTORY_READY not sent to all 4";
+            else if (memcmp(rc_hook_digest, dry_digest, 32) != 0)
+                fail = "delivered tree differs from the dry run";
+            else if (!lsp_factory_tree_digest(f, built) || memcmp(built, dry_digest, 32) != 0)
+                fail = "created factory differs from the dry run";
+        }
         if (!fail) {
             /* Let the clients finish: sign (not broadcast) a cooperative close. */
             uint64_t per = (amount - 500) / 5;
@@ -216,7 +279,8 @@ static int rc_run_creation(int mode) {
         int st = 0;
         if (fail) kill(kids[c], SIGKILL);
         waitpid(kids[c], &st, 0);
-        int want_ok = (mode != RC_REFUSED);
+        int want_ok = (mode != RC_REFUSED && mode != RC_HOOK_REFUSES &&
+                       mode != RC_READY_SEND_FAILS);
         int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
         if (!fail && want_ok && !ok) kids_ok = 0;
     }
@@ -250,6 +314,133 @@ int test_rotation_creation_carries_profiles(void) {
    creation retry loop, a rotation retry) neither crashes nor loses them. */
 int test_rotation_creation_failure_keeps_template(void) {
     return rc_run_creation(RC_REFUSED);
+}
+
+/* The tree a dry run predicts is exactly the one the real ceremony signs and
+   hands to the before_factory_ready hook (shape: level arity 2,4 +
+   static-near-root 1), and two in-process builds are byte-identical. */
+int test_rotation_creation_digest_matches_ceremony(void) {
+    return rc_run_creation(RC_DIGEST);
+}
+
+/* The hook ran and then the first FACTORY_READY send failed. */
+int test_rotation_creation_ready_send_fails(void) {
+    return rc_run_creation(RC_READY_SEND_FAILS);
+}
+
+/* before_factory_ready refusing aborts the ceremony with no FACTORY_READY sent. */
+int test_rotation_creation_hook_refusal_aborts(void) {
+    return rc_run_creation(RC_HOOK_REFUSES);
+}
+
+/* lsp_factory_creation_digest: byte-identical across builds with the same
+   inputs, different with any recorded parameter changed.  Across an LSP
+   restart the template comes from the DB, so identity there also needs the
+   factory shape restored as it was -- reloading a factory from the DB does not
+   restore its per-level arity or static-near-root today. */
+int test_rotation_creation_digest_stable(void) {
+    secp256k1_context *ctx = rc_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], rc_seckeys[i]), "keypair");
+    unsigned char spk[34];
+    TEST_ASSERT(rc_funding_spk(ctx, kps, spk, NULL), "funding spk");
+    secp256k1_pubkey cpks[4];
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &cpks[i], &kps[i + 1]), "pub");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp && lsp_init(lsp, ctx, &kps[0], 0, 4), "lsp_init");
+    uint8_t arities[2] = { 2, 4 };
+    factory_set_level_arity(&lsp->factory, arities, 2);
+    factory_set_static_near_root(&lsp->factory, 1);
+    unsigned char txid[32], txid2[32];
+    memset(txid, 0xC3, 32);
+    memset(txid2, 0xC4, 32);
+    uint64_t amounts[4] = { 200000, 200000, 200000, 200000 };
+    lsp->dist_client_amounts = amounts;
+    lsp->dist_n_client_amounts = 4;
+    unsigned char d1[32], d2[32], d3[32], d4[32], d5[32];
+    TEST_ASSERT(lsp_factory_creation_digest(lsp, cpks, 4, txid, 0, 1000000, spk, 34,
+                                            10, 4, 500, d1), "build 1");
+    TEST_ASSERT(lsp_factory_creation_digest(lsp, cpks, 4, txid, 0, 1000000, spk, 34,
+                                            10, 4, 500, d2), "build 2");
+    TEST_ASSERT(memcmp(d1, d2, 32) == 0, "same inputs: byte-identical tree");
+    TEST_ASSERT(lsp_factory_creation_digest(lsp, cpks, 4, txid, 0, 1000000, spk, 34,
+                                            10, 4, 501, d3) && memcmp(d1, d3, 32) != 0,
+                "a different CLTV is a different tree");
+    TEST_ASSERT(lsp_factory_creation_digest(lsp, cpks, 4, txid2, 0, 1000000, spk, 34,
+                                            10, 4, 500, d4) && memcmp(d1, d4, 32) != 0,
+                "a different funding outpoint is a different tree");
+    amounts[2] = 150000;
+    TEST_ASSERT(lsp_factory_creation_digest(lsp, cpks, 4, txid, 0, 1000000, spk, 34,
+                                            10, 4, 500, d5) && memcmp(d1, d5, 32) != 0,
+                "different distribution amounts are a different tree");
+    lsp->dist_client_amounts = NULL;
+    lsp->dist_n_client_amounts = 0;
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* lsp_rotation_signed_tree_matches: the SIGNING_READY gate.  A ceremony may
+   run again only if the tree rebuilt from the recorded funding, CLTV and
+   amounts has the recorded digest. */
+int test_rotation_signed_tree_matches(void) {
+    secp256k1_context *ctx = rc_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], rc_seckeys[i]), "keypair");
+    unsigned char spk[34];
+    TEST_ASSERT(rc_funding_spk(ctx, kps, spk, NULL), "funding spk");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp && lsp_init(lsp, ctx, &kps[0], 0, 4), "lsp_init");
+    TEST_ASSERT(lsp->client_pubkeys, "client key array");
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &lsp->client_pubkeys[i], &kps[i + 1]), "pub");
+    lsp->n_clients = 4;
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    TEST_ASSERT(mgr, "mgr");
+    memcpy(mgr->rot_fund_spk, spk, 34);
+    mgr->rot_fund_spk_len = 34;
+    mgr->rot_step_blocks = 10;
+    mgr->rot_states_per_layer = 4;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    unsigned char txid[32];
+    memset(txid, 0xC3, 32);
+    unsigned char rb[32];
+    for (int i = 0; i < 32; i++) rb[i] = txid[31 - i];
+    hex_encode(rb, 32, rp->new_funding_txid);
+    rp->new_funding_vout = 0;
+    rp->new_funding_amount = 1000000;
+    rp->new_cltv = 500;
+    rp->n_dist_amounts = 4;
+    for (int i = 0; i < 4; i++) rp->dist_amounts[i] = 200000;
+
+    TEST_ASSERT(lsp_rotation_signed_tree_matches(mgr, lsp) == -1, "no digest recorded");
+    unsigned char d[32];
+    lsp->dist_client_amounts = rp->dist_amounts;
+    lsp->dist_n_client_amounts = 4;
+    TEST_ASSERT(lsp_factory_creation_digest(lsp, lsp->client_pubkeys, 4, txid, 0, 1000000,
+                                            spk, 34, 10, 4, 500, d), "digest");
+    lsp->dist_client_amounts = NULL;
+    lsp->dist_n_client_amounts = 0;
+    hex_encode(d, 32, rp->tree_digest);
+    TEST_ASSERT(lsp_rotation_signed_tree_matches(mgr, lsp) == 1,
+                "the recorded parameters rebuild the delivered tree");
+    rp->new_cltv = 501;
+    TEST_ASSERT(lsp_rotation_signed_tree_matches(mgr, lsp) == 0,
+                "a different CLTV must not pass (it would be a second, different tree)");
+    rp->new_cltv = 500;
+    uint8_t arities[2] = { 2, 4 };
+    factory_set_level_arity(&lsp->factory, arities, 2);
+    TEST_ASSERT(lsp_rotation_signed_tree_matches(mgr, lsp) == 0,
+                "a different factory shape must not pass");
+    free(mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    return 1;
 }
 
 /* lsp_factory_creation_preflight: the dry run rotation performs before its

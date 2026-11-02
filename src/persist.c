@@ -24,6 +24,35 @@ static const char *SCHEMA_VERSION_SQL =
     "  applied_at INTEGER DEFAULT (strftime('%s','now'))"
     ");";
 
+/* v42: rotation progress (lsp_rotation.c).  rotation_progress: one row per
+   dying factory, each irreversible rotation step recorded before it happens.
+   rotation_closes: every rotation close TX ever built for a dying funding.
+   Part of SCHEMA_SQL and created by the v42 step whenever missing. */
+#define PERSIST_V42_TABLES_SQL                                \
+    "CREATE TABLE IF NOT EXISTS rotation_progress ("         \
+    "  dying_funding_txid TEXT PRIMARY KEY,"                 \
+    "  dying_funding_vout INTEGER NOT NULL,"                 \
+    "  dying_factory_id INTEGER NOT NULL,"                   \
+    "  phase INTEGER NOT NULL,"                              \
+    "  close_txid TEXT,"                                     \
+    "  new_funding_txid TEXT,"                               \
+    "  new_funding_hex TEXT,"                                \
+    "  new_funding_vout INTEGER,"                            \
+    "  new_funding_amount INTEGER,"                          \
+    "  new_cltv INTEGER,"                                    \
+    "  dist_amounts BLOB,"                                   \
+    "  tree_digest TEXT,"                                    \
+    "  dist_tx_hex TEXT,"                                    \
+    "  updated_at INTEGER"                                   \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS rotation_closes ("           \
+    "  dying_funding_txid TEXT NOT NULL,"                    \
+    "  close_txid TEXT NOT NULL,"                            \
+    "  close_hex TEXT NOT NULL,"                             \
+    "  created_at INTEGER,"                                  \
+    "  PRIMARY KEY (dying_funding_txid, close_txid)"         \
+    ");"
+
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS factories ("
     "  id INTEGER PRIMARY KEY,"
@@ -236,6 +265,7 @@ static const char *SCHEMA_SQL =
     "  partial_rotation INTEGER DEFAULT 0,"
     "  updated_at INTEGER"
     ");"
+    PERSIST_V42_TABLES_SQL
     /* Phase 23: Persistence Hardening */
     "CREATE TABLE IF NOT EXISTS dw_counter_state ("
     "  factory_id INTEGER PRIMARY KEY,"
@@ -1381,6 +1411,23 @@ int persist_open(persist_t *p, const char *path) {
         sqlite3_exec(p->db,
             "ALTER TABLE factories ADD COLUMN use_hashlock_poison INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
+    }
+
+    /* v42: rotation_progress + rotation_closes (lsp_rotation.c).  Created
+       whenever missing rather than by version number, so the step does not
+       depend on the order in which schema bumps are merged (v40 = #459,
+       v41 = #462).  Later column changes to these tables are numbered steps
+       after this one. */
+    {
+        char *merr42 = NULL;
+        if (sqlite3_exec(p->db, PERSIST_V42_TABLES_SQL, NULL, NULL, &merr42) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v42 failed: %s\n",
+                    merr42 ? merr42 : "unknown");
+            sqlite3_free(merr42);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
     }
 
     /* Record the current version if not already present */
@@ -7208,3 +7255,177 @@ int persist_scan_ceremonies_by_factory(persist_t *p,
 }
 
 /* === End SF-CEREMONY-HELPERS ============================================== */
+
+/* === Rotation progress (lsp_rotation.c) ================================== */
+
+int persist_save_rotation_progress(persist_t *p,
+                                   const char *dying_funding_txid_hex,
+                                   const persist_rotation_progress_t *r) {
+    if (!p || !p->db || !dying_funding_txid_hex || !r) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO rotation_progress "
+        "(dying_funding_txid, dying_funding_vout, dying_factory_id, phase, "
+        " close_txid, new_funding_txid, new_funding_hex, new_funding_vout, "
+        " new_funding_amount, new_cltv, dist_amounts, tree_digest, dist_tx_hex, "
+        " updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'));";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, dying_funding_txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)r->dying_funding_vout);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)r->dying_factory_id);
+    sqlite3_bind_int(stmt, 4, r->phase);
+    if (r->close_txid[0])
+        sqlite3_bind_text(stmt, 5, r->close_txid, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 5);
+    if (r->new_funding_txid[0])
+        sqlite3_bind_text(stmt, 6, r->new_funding_txid, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 6);
+    if (r->new_funding_hex && r->new_funding_hex[0])
+        sqlite3_bind_text(stmt, 7, r->new_funding_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 7);
+    sqlite3_bind_int64(stmt, 8, (sqlite3_int64)r->new_funding_vout);
+    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)r->new_funding_amount);
+    sqlite3_bind_int64(stmt, 10, (sqlite3_int64)r->new_cltv);
+    unsigned char *blob = NULL;
+    if (r->dist_amounts && r->n_dist_amounts > 0) {
+        blob = malloc(r->n_dist_amounts * 8);
+        if (!blob) { sqlite3_finalize(stmt); return 0; }
+        for (size_t i = 0; i < r->n_dist_amounts; i++)
+            for (int b = 0; b < 8; b++)
+                blob[i * 8 + b] = (unsigned char)(r->dist_amounts[i] >> (8 * b));
+        sqlite3_bind_blob(stmt, 11, blob, (int)(r->n_dist_amounts * 8), SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 11);
+    }
+    if (r->tree_digest[0])
+        sqlite3_bind_text(stmt, 12, r->tree_digest, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 12);
+    if (r->dist_tx_hex && r->dist_tx_hex[0])
+        sqlite3_bind_text(stmt, 13, r->dist_tx_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 13);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    free(blob);
+    return ok;
+}
+
+int persist_load_rotation_progress(persist_t *p,
+                                   const char *dying_funding_txid_hex,
+                                   persist_rotation_progress_t *r,
+                                   size_t dist_max) {
+    if (!p || !p->db || !dying_funding_txid_hex || !r) return 0;
+    uint64_t *dist_buf = r->dist_amounts;
+    memset(r, 0, sizeof(*r));
+    r->dist_amounts = dist_buf;
+    const char *sql =
+        "SELECT dying_funding_vout, dying_factory_id, phase, close_txid, "
+        "new_funding_txid, new_funding_hex, new_funding_vout, new_funding_amount, "
+        "new_cltv, dist_amounts, tree_digest, dist_tx_hex "
+        "FROM rotation_progress WHERE dying_funding_txid = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, dying_funding_txid_hex, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    r->dying_funding_vout = (uint32_t)sqlite3_column_int64(stmt, 0);
+    r->dying_factory_id = (uint32_t)sqlite3_column_int64(stmt, 1);
+    r->phase = sqlite3_column_int(stmt, 2);
+    const unsigned char *ct = sqlite3_column_text(stmt, 3);
+    const unsigned char *nt = sqlite3_column_text(stmt, 4);
+    const unsigned char *nh = sqlite3_column_text(stmt, 5);
+    if (ct) snprintf(r->close_txid, sizeof(r->close_txid), "%s", (const char *)ct);
+    if (nt) snprintf(r->new_funding_txid, sizeof(r->new_funding_txid), "%s", (const char *)nt);
+    if (nh) r->new_funding_hex = strdup((const char *)nh);
+    r->new_funding_vout = (uint32_t)sqlite3_column_int64(stmt, 6);
+    r->new_funding_amount = (uint64_t)sqlite3_column_int64(stmt, 7);
+    r->new_cltv = (uint32_t)sqlite3_column_int64(stmt, 8);
+    const unsigned char *blob = sqlite3_column_blob(stmt, 9);
+    int blen = sqlite3_column_bytes(stmt, 9);
+    if (blob && blen > 0 && dist_buf) {
+        size_t n = (size_t)blen / 8;
+        if (n > dist_max) n = dist_max;
+        for (size_t i = 0; i < n; i++) {
+            uint64_t v = 0;
+            for (int b = 0; b < 8; b++) v |= (uint64_t)blob[i * 8 + b] << (8 * b);
+            dist_buf[i] = v;
+        }
+        r->n_dist_amounts = n;
+    }
+    const unsigned char *td = sqlite3_column_text(stmt, 10);
+    const unsigned char *dh = sqlite3_column_text(stmt, 11);
+    if (td) snprintf(r->tree_digest, sizeof(r->tree_digest), "%s", (const char *)td);
+    if (dh) r->dist_tx_hex = strdup((const char *)dh);
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
+int persist_add_rotation_close(persist_t *p, const char *dying_funding_txid_hex,
+                               const char *close_txid_hex, const char *close_tx_hex) {
+    if (!p || !p->db || !dying_funding_txid_hex || !close_txid_hex || !close_tx_hex)
+        return 0;
+    const char *sql =
+        "INSERT OR IGNORE INTO rotation_closes "
+        "(dying_funding_txid, close_txid, close_hex, created_at) "
+        "VALUES (?, ?, ?, strftime('%s','now'));";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, dying_funding_txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, close_txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, close_tx_hex, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_list_rotation_closes(persist_t *p, const char *dying_funding_txid_hex,
+                                    char (*close_txids_out)[65], size_t max) {
+    if (!p || !p->db || !dying_funding_txid_hex || !close_txids_out || max == 0)
+        return 0;
+    const char *sql =
+        "SELECT close_txid FROM rotation_closes WHERE dying_funding_txid = ? "
+        "ORDER BY created_at, rowid;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, dying_funding_txid_hex, -1, SQLITE_TRANSIENT);
+    size_t n = 0;
+    while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *t = sqlite3_column_text(stmt, 0);
+        if (!t) continue;
+        snprintf(close_txids_out[n], 65, "%s", (const char *)t);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+char *persist_load_rotation_close_hex(persist_t *p, const char *dying_funding_txid_hex,
+                                      const char *close_txid_hex) {
+    if (!p || !p->db || !dying_funding_txid_hex || !close_txid_hex) return NULL;
+    const char *sql =
+        "SELECT close_hex FROM rotation_closes "
+        "WHERE dying_funding_txid = ? AND close_txid = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return NULL;
+    sqlite3_bind_text(stmt, 1, dying_funding_txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, close_txid_hex, -1, SQLITE_TRANSIENT);
+    char *out = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(stmt, 0);
+        if (h) out = strdup((const char *)h);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}

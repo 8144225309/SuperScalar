@@ -27,6 +27,21 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
                  char *txid_out_65);
 
 /*
+ * Build and sign -- WITHOUT broadcasting -- the TX lsp_fund_spk would send.
+ * Returns the signed hex (malloc'd, caller frees) and its display-order txid
+ * in txid_out_65, or NULL.  Lets a caller record the TX before it exists on
+ * the network (rotation: never fund twice across a crash).  The broadcast is
+ * the caller's chain->send_raw_tx.  The selected wallet UTXO stays reserved
+ * (returned in reserved_txid_out65 / reserved_vout_out): the caller releases it
+ * with wallet->release_utxo once the TX is broadcast or abandoned.
+ */
+char *lsp_fund_spk_build(wallet_source_t *wallet,
+                         const unsigned char *target_spk, size_t target_spk_len,
+                         uint64_t amount_sats, uint64_t fee_rate_kvb,
+                         char *txid_out_65,
+                         char *reserved_txid_out65, uint32_t *reserved_vout_out);
+
+/*
  * Poll chain backend until txid has >= min_confs confirmations or timeout.
  * min_confs: use chain_safe_confs(backend, is_regtest) for the runtime-
  *            configurable threshold. On regtest, pass 1 directly.

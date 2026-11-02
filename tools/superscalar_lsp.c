@@ -3347,6 +3347,16 @@ int main(int argc, char *argv[]) {
             mgr->rot_funding_sats = funding_sats;
             mgr->rot_auto_rotate = 1;
             mgr->rot_attempted_mask = 0;
+            /* A rotation interrupted after its cooperative close (this
+               factory's funding is spent, every client's balance sits in this
+               wallet, the replacement was never signed) resumes Phase C once
+               all clients reconnect -- see lsp_rotation_resume. */
+            if (lsp_rotation_load_progress(mgr, lsp_rp->factory.funding_txid,
+                                           lsp_rp->factory.funding_vout))
+                printf("LSP recovery: rotation of this factory was interrupted after "
+                       "its cooperative close (%s, phase %d) — Phase C resumes once "
+                       "all %zu clients reconnect\n", mgr->rot_progress.close_txid,
+                       mgr->rot_progress.phase, rec_n_clients);
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
             mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;

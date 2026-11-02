@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+#define PERSIST_SCHEMA_VERSION 42
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -720,6 +720,51 @@ size_t persist_load_departed_clients(persist_t *p, uint32_t factory_id,
                                       int *departed_out,
                                       unsigned char (*keys_out)[32],
                                       size_t max_clients);
+
+/* Rotation progress marker (lsp_rotation.c, LSP_ROT_PROGRESS_*): one row per
+   dying factory, keyed by its funding txid (display hex).  No secrets: the
+   TX hex fields hold signed, broadcastable transactions.
+
+   save: writes R (dist_amounts: n_dist_amounts entries).  A single statement,
+   so it joins a transaction the caller has open.
+   load: R->dist_amounts must point at a caller buffer of DIST_MAX entries (or
+   be NULL); sets n_dist_amounts; new_funding_hex and dist_tx_hex come back
+   malloc'd (caller frees) or NULL.  Returns 1 if a row exists. */
+typedef struct {
+    uint32_t dying_funding_vout;
+    uint32_t dying_factory_id;
+    int phase;
+    char close_txid[65];          /* display hex, "" if none */
+    char new_funding_txid[65];    /* display hex, "" if none */
+    char *new_funding_hex;        /* signed replacement funding TX, or NULL */
+    uint32_t new_funding_vout;    /* UINT32_MAX until known */
+    uint64_t new_funding_amount;
+    uint32_t new_cltv;            /* ceremony parameters, fixed once funded */
+    uint64_t *dist_amounts;
+    size_t n_dist_amounts;
+    char tree_digest[65];         /* delivered tree's digest (hex), "" if none */
+    char *dist_tx_hex;            /* its signed distribution TX, or NULL
+                                     (load: malloc'd, caller frees) */
+} persist_rotation_progress_t;
+
+int persist_save_rotation_progress(persist_t *p,
+                                   const char *dying_funding_txid_hex,
+                                   const persist_rotation_progress_t *r);
+int persist_load_rotation_progress(persist_t *p,
+                                   const char *dying_funding_txid_hex,
+                                   persist_rotation_progress_t *r,
+                                   size_t dist_max);
+
+/* Every rotation close TX ever built for a dying funding (recorded BEFORE its
+   broadcast; a re-close after an eviction adds another).  add is idempotent;
+   list returns the close txids oldest first (up to MAX); load_hex returns the
+   signed close TX hex, malloc'd, or NULL. */
+int persist_add_rotation_close(persist_t *p, const char *dying_funding_txid_hex,
+                               const char *close_txid_hex, const char *close_tx_hex);
+size_t persist_list_rotation_closes(persist_t *p, const char *dying_funding_txid_hex,
+                                    char (*close_txids_out)[65], size_t max);
+char *persist_load_rotation_close_hex(persist_t *p, const char *dying_funding_txid_hex,
+                                      const char *close_txid_hex);
 
 /* --- Invoice registry (Phase 23) --- */
 
