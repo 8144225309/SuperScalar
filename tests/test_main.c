@@ -3349,6 +3349,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_lsp_revocation_persisted_after_restore);
     extern int test_restart_init_from_db_refuses_other_db(void);
     RUN_TEST(test_restart_init_from_db_refuses_other_db);
+    extern int test_restart_channel_init_failure_owns_nothing(void);
+    RUN_TEST(test_restart_channel_init_failure_owns_nothing);
+    extern int test_restart_restore_failure_frees_mgr(void);
+    RUN_TEST(test_restart_restore_failure_frees_mgr);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");
