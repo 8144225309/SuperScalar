@@ -2106,3 +2106,88 @@ int test_exit_client_reload_then_tierb(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* The chain loaders (leaf and sub-factory) skip other epochs' rows and stop
+   at a row that does not spend the previous entry. */
+int test_reload_ps_chain_loaders_filter_epoch(void) {
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_loaders");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "db");
+    unsigned char p0[32];
+    memset(p0, 0x11, 32);
+    char c0hex[256], c0id[65];
+    ex_dummy_tx(p0, 0, c0hex);
+    TEST_ASSERT(ex_txid_of_hex(c0hex, c0id), "chain[0] txid");
+    unsigned char c0b[128], c0disp[32], c0int[32];
+    size_t c0len = strlen(c0hex) / 2;
+    hex_decode(c0hex, c0b, c0len);
+    hex_decode(c0id, c0disp, 32);
+    memcpy(c0int, c0disp, 32);
+    reverse_bytes(c0int, 32);
+    /* row 0 of epoch 1 spends chain[0]; rows 1-2 are a longer epoch-0 chain */
+    char r0hex[256], r0id[65], s1hex[256], s1id[65], s2hex[256], s2id[65];
+    ex_dummy_tx(c0int, 0, r0hex);
+    ex_txid_of_hex(r0hex, r0id);
+    unsigned char junk[32];
+    memset(junk, 0x22, 32);
+    ex_dummy_tx(junk, 1, s1hex);
+    ex_txid_of_hex(s1hex, s1id);
+    memset(junk, 0x23, 32);
+    ex_dummy_tx(junk, 2, s2hex);
+    ex_txid_of_hex(s2hex, s2id);
+    for (int table = 0; table < 2; table++) {
+        uint32_t node = table ? 9 : 5;
+        TEST_ASSERT(persist_save_ps_initial_signed_state(&db, 0, node, 1, c0disp,
+                                                         c0b, c0len), "chain[0] row");
+        const char *hx[3] = { r0hex, s1hex, s2hex };
+        const char *id[3] = { r0id, s1id, s2id };
+        uint32_t ep[3] = { 1, 0, 0 };
+        for (int k = 0; k < 3; k++) {
+            unsigned char b[128], d[32];
+            size_t bl = strlen(hx[k]) / 2;
+            hex_decode(hx[k], b, bl);
+            hex_decode(id[k], d, 32);
+            uint64_t ch[1] = { 5000 };
+            int ok = table
+                ? persist_save_subfactory_chain_entry(&db, 0, node, k, ep[k], d, b, bl,
+                                                      1000, ch, 1, NULL, 0)
+                : persist_save_ps_chain_entry(&db, 0, node, k, ep[k], d, b, bl,
+                                              5000, NULL, 0);
+            TEST_ASSERT(ok, "chain row");
+        }
+        tx_buf_t txs[8];
+        unsigned char ids[8][32];
+        uint64_t a1[8], a16[8][16];
+        int nch[8];
+        memset(txs, 0, sizeof(txs));
+        int n = table
+            ? persist_load_subfactory_chain(&db, 0, node, txs, ids, a1, a16, nch, NULL, 8)
+            : persist_load_ps_chain(&db, 0, node, txs, ids, a1, NULL, 8);
+        printf("  %s chain: 1 row of the current epoch + 2 older rows -> loaded %d\n",
+               table ? "sub-factory" : "leaf", n);
+        for (int k = 0; k < n; k++) tx_buf_free(&txs[k]);
+        TEST_ASSERT(n == 1, "only the current epoch's linked rows");
+
+        /* a same-epoch row that does not spend the previous entry ends it */
+        unsigned char b1[128], d1[32];
+        size_t bl1 = strlen(s1hex) / 2;
+        hex_decode(s1hex, b1, bl1);
+        hex_decode(s1id, d1, 32);
+        uint64_t ch1[1] = { 5000 };
+        TEST_ASSERT(table
+            ? persist_save_subfactory_chain_entry(&db, 0, node, 1, 1, d1, b1, bl1,
+                                                  1000, ch1, 1, NULL, 0)
+            : persist_save_ps_chain_entry(&db, 0, node, 1, 1, d1, b1, bl1, 5000,
+                                          NULL, 0), "unlinked row");
+        memset(txs, 0, sizeof(txs));
+        n = table
+            ? persist_load_subfactory_chain(&db, 0, node, txs, ids, a1, a16, nch, NULL, 8)
+            : persist_load_ps_chain(&db, 0, node, txs, ids, a1, NULL, 8);
+        for (int k = 0; k < n; k++) tx_buf_free(&txs[k]);
+        TEST_ASSERT(n == 1, "an unlinked row is not part of the chain");
+    }
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}

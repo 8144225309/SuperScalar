@@ -195,7 +195,13 @@ int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
                                         uint32_t *node_out, uint32_t *state_out,
                                         size_t max, size_t *n_out);
 
-/* Load all PS chain entries for a leaf in chain_pos order.
+/* Load the PS chain entries of a leaf's CURRENT epoch in chain_pos order.
+   The epoch is that of the leaf's chain[0] row in ps_initial_signed_states
+   Rows of other epochs (left over from before a root rollover) are skipped,
+   and the chain stops at the first row that is not contiguous or does not
+   spend the previous entry (chain[0] for the first), so a stale tail is
+   never taken as the tip.  With no such row (a DB from before that table)
+   the rows are taken as stored, contiguous from position 0.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).
    txids_out: caller-allocated [max_chain][32] internal-order txids.
    amounts_out: caller-allocated uint64_t[max_chain] channel amounts; may be NULL.
@@ -228,7 +234,8 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
                                           const unsigned char *poison_tx,
                                           size_t poison_tx_len);
 
-/* Load all sub-factory chain entries for a sub-factory node in chain_pos order.
+/* Load the sub-factory chain entries of the node's CURRENT epoch in chain_pos
+   order, with the same epoch filter and linkage rule as persist_load_ps_chain.
    chain_txs_out: caller-allocated tx_buf_t[max_chain].
    txids_out: caller-allocated [max_chain][32] internal-order txids.
    sales_stock_out: caller-allocated uint64_t[max_chain] sales-stock amounts.

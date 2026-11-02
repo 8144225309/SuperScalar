@@ -20,6 +20,30 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
+/* Minimal transaction parse (persist.c only): txid, nLockTime, prevouts with
+   their nSequence, and the outputs.  See pq_parse_tx_bytes. */
+#define PQ_MAX_INPUTS 64
+#define PQ_MAX_OUTPUTS 64
+
+typedef struct {
+    char     txid[65];
+    uint32_t locktime;
+    int      non_final;                 /* some nSequence != 0xFFFFFFFF */
+    size_t   n_inputs;
+    char     prev_txid[PQ_MAX_INPUTS][65];
+    uint32_t prev_vout[PQ_MAX_INPUTS];
+    uint32_t prev_nseq[PQ_MAX_INPUTS];
+    size_t   n_outputs;                 /* all outputs (only the first
+                                           PQ_MAX_OUTPUTS are kept) */
+    uint64_t out_amount[PQ_MAX_OUTPUTS];
+    unsigned char out_spk[PQ_MAX_OUTPUTS][34];
+    size_t   out_spk_len[PQ_MAX_OUTPUTS];  /* 0 if longer than 34 bytes */
+} pq_tx_info_t;
+
+static int pq_parse_tx_bytes(const unsigned char *b, size_t len,
+                             pq_tx_info_t *out);
+static int pq_parse_tx(const char *hex, pq_tx_info_t *out);
+
 static const char *SCHEMA_VERSION_SQL =
     "CREATE TABLE IF NOT EXISTS schema_version ("
     "  version INTEGER NOT NULL,"
@@ -1929,20 +1953,73 @@ int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
    poison_txs_out: optional per-entry poison TX bytes (v22).  Entries with
    no persisted poison are left zeroed (data=NULL, len=0).
    Returns number of chain entries loaded (0 = no PS chain or error). */
+/* The chain[0] of a PS node's current epoch, as ps_initial_signed_states
+   holds it: its epoch and txid (display hex).  Returns 1 if there is a row,
+   0 if not, -1 on a query error. */
+static int ps_chain0_row(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                         uint32_t *epoch_out, char txid_out[65]) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT epoch, txid FROM ps_initial_signed_states "
+            "WHERE factory_id=? AND node_idx=? LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int(st, 2, (int)node_idx);
+    int rc = 0, step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 1);
+        if (t && strlen(t) == 64) {
+            *epoch_out = (uint32_t)sqlite3_column_int64(st, 0);
+            memcpy(txid_out, t, 65);
+            rc = 1;
+        } else {
+            rc = -1;
+        }
+    } else if (step != SQLITE_DONE) {
+        rc = -1;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+/* 1 if the TX spends some output of the TX whose display txid is prev_hex. */
+static int ps_tx_spends(const unsigned char *tx, size_t len, const char *prev_hex) {
+    pq_tx_info_t *info = malloc(sizeof(*info));
+    if (!info) return 0;
+    int ok = 0;
+    if (pq_parse_tx_bytes(tx, len, info))
+        for (size_t k = 0; k < info->n_inputs; k++)
+            if (strcasecmp(info->prev_txid[k], prev_hex) == 0) { ok = 1; break; }
+    free(info);
+    return ok;
+}
+
 int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_idx,
                            tx_buf_t *chain_txs_out, unsigned char (*txids_out)[32],
                            uint64_t *amounts_out,
                            tx_buf_t *poison_txs_out, int max_chain) {
     if (!p || !p->db || !chain_txs_out || !txids_out || max_chain <= 0) return 0;
 
+    /* Only the rows of the epoch of the leaf's current chain[0]: a root
+       rollover starts a new chain at position 0 and does not delete the
+       previous epoch's rows, which would otherwise be read as the tip when
+       the old chain was the longer one. */
+    uint32_t c0_epoch = 0;
+    char prev_hex[65] = {0};
+    int have_c0 = ps_chain0_row(p, factory_id, leaf_node_idx, &c0_epoch, prev_hex);
+    if (have_c0 < 0) return 0;
+
     sqlite3_stmt *stmt;
     const char *sql =
         "SELECT chain_pos, txid, signed_tx_hex, chan_amount_sats, poison_tx_hex "
         "FROM ps_leaf_chains "
-        "WHERE factory_id=? AND leaf_node_idx=? ORDER BY chain_pos ASC;";
+        "WHERE factory_id=? AND leaf_node_idx=? AND (?=0 OR epoch=?) "
+        "ORDER BY chain_pos ASC;";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)leaf_node_idx);
+    sqlite3_bind_int(stmt, 3, have_c0 ? 1 : 0);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)c0_epoch);
 
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_chain) {
@@ -1951,7 +2028,7 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
 
         const char *txid_hex = (const char *)sqlite3_column_text(stmt, 1);
         const char *tx_hex   = (const char *)sqlite3_column_text(stmt, 2);
-        if (!txid_hex || !tx_hex) break;
+        if (!txid_hex || !tx_hex || strlen(txid_hex) != 64) break;
 
         /* Decode txid (display → internal) */
         unsigned char txid_display[32];
@@ -1968,6 +2045,17 @@ int persist_load_ps_chain(persist_t *p, uint32_t factory_id, uint32_t leaf_node_
             break;
         }
         chain_txs_out[count].len = tx_len;
+
+        /* With chain[0] known, each entry spends the previous one (chain[0]
+           for the first); a row that does not is a stale tail and ends the
+           chain.  (Without a chain[0] row the rows are taken as they are, as
+           before that table existed.) */
+        if (have_c0 &&
+            !ps_tx_spends(chain_txs_out[count].data, tx_len, prev_hex)) {
+            tx_buf_free(&chain_txs_out[count]);
+            break;
+        }
+        memcpy(prev_hex, txid_hex, 65);
 
         if (amounts_out)
             amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 3);
@@ -2081,15 +2169,24 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
         !channel_amounts_out || !n_channels_out || max_chain <= 0)
         return 0;
 
+    /* Current epoch only, linked to chain[0] (see persist_load_ps_chain). */
+    uint32_t c0_epoch = 0;
+    char prev_hex[65] = {0};
+    int have_c0 = ps_chain0_row(p, factory_id, sub_node_idx, &c0_epoch, prev_hex);
+    if (have_c0 < 0) return 0;
+
     sqlite3_stmt *stmt;
     const char *sql =
         "SELECT chain_pos, txid, signed_tx_hex, sales_stock_amount_sats, "
         "       channel_amounts_csv, poison_tx_hex "
         "FROM ps_subfactory_chains "
-        "WHERE factory_id=? AND sub_node_idx=? ORDER BY chain_pos ASC;";
+        "WHERE factory_id=? AND sub_node_idx=? AND (?=0 OR epoch=?) "
+        "ORDER BY chain_pos ASC;";
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)sub_node_idx);
+    sqlite3_bind_int(stmt, 3, have_c0 ? 1 : 0);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)c0_epoch);
 
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_chain) {
@@ -2098,7 +2195,7 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
 
         const char *txid_hex = (const char *)sqlite3_column_text(stmt, 1);
         const char *tx_hex   = (const char *)sqlite3_column_text(stmt, 2);
-        if (!txid_hex || !tx_hex) break;
+        if (!txid_hex || !tx_hex || strlen(txid_hex) != 64) break;
 
         unsigned char txid_display[32];
         if (!hex_decode(txid_hex, txid_display, 32)) break;
@@ -2113,6 +2210,13 @@ int persist_load_subfactory_chain(persist_t *p, uint32_t factory_id, uint32_t su
             break;
         }
         chain_txs_out[count].len = tx_len;
+
+        if (have_c0 &&
+            !ps_tx_spends(chain_txs_out[count].data, tx_len, prev_hex)) {
+            tx_buf_free(&chain_txs_out[count]);
+            break;
+        }
+        memcpy(prev_hex, txid_hex, 65);
 
         sales_stock_out[count] = (uint64_t)sqlite3_column_int64(stmt, 3);
 
@@ -2354,6 +2458,20 @@ size_t persist_list_active_factory_ids(persist_t *p,
 static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
                                       factory_t *f);
 
+/* chain[0] of a PS node as stored for its current epoch: internal txid and
+   the parsed TX.  Returns 1 if found. */
+static int ps_chain0_load(persist_t *p, uint32_t factory_id, uint32_t node_idx,
+                          unsigned char txid_internal[32], pq_tx_info_t *info) {
+    tx_buf_t tx;
+    memset(&tx, 0, sizeof(tx));
+    if (!persist_load_ps_initial_signed_state(p, factory_id, node_idx, &tx,
+                                              txid_internal))
+        return 0;
+    int ok = pq_parse_tx_bytes(tx.data, tx.len, info);
+    tx_buf_free(&tx);
+    return ok;
+}
+
 int persist_load_factory(persist_t *p, uint32_t factory_id,
                           factory_t *f, secp256k1_context *ctx) {
     if (!p || !p->db || !f || !ctx) return 0;
@@ -2559,11 +2677,22 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                     leaf_poisons, PS_RESTORE_MAX);
 
                 if (count > 0) {
-                    /* chain[0] txid is node->txid as set by factory_build_tree
+                    /* chain[0] of the chain's epoch: the stored row (a root
+                       rollover replaces it), else the creation tree's
                        (segwit txid excludes witness, so unsigned == signed txid). */
                     unsigned char chain0_txid[32];
                     memcpy(chain0_txid, node->txid, 32);
                     uint64_t chain0_amount = node->outputs[0].amount_sats;
+                    {
+                        pq_tx_info_t *c0 = malloc(sizeof(*c0));
+                        unsigned char c0_id[32];
+                        if (c0 && ps_chain0_load(p, factory_id, (uint32_t)node_idx,
+                                                 c0_id, c0) && c0->n_outputs >= 1) {
+                            memcpy(chain0_txid, c0_id, 32);
+                            chain0_amount = c0->out_amount[0];
+                        }
+                        free(c0);
+                    }
 
                     node->ps_chain_len = count;
                     node->n_outputs    = 1;
@@ -2633,10 +2762,28 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                         sub_poisons, PS_RESTORE_MAX);
                     if (sub_count <= 0) continue;
 
-                    /* Linkage parents (chain[0] is the sub's existing
-                       node->txid built by factory_build_tree). */
+                    /* Linkage parents: chain[0] of the chain's epoch (the
+                       stored row, else the sub's node->txid built by
+                       factory_build_tree). */
                     unsigned char sub_chain0_txid[32];
                     memcpy(sub_chain0_txid, sub->txid, 32);
+                    uint64_t sub_chain0_sstock = 0;
+                    int have_sub_c0 = 0;
+                    {
+                        pq_tx_info_t *c0 = malloc(sizeof(*c0));
+                        unsigned char c0_id[32];
+                        if (c0 && ps_chain0_load(p, factory_id, (uint32_t)sub_node_i,
+                                                 c0_id, c0)) {
+                            memcpy(sub_chain0_txid, c0_id, 32);
+                            int nc0 = sub_n_chans[0];
+                            if (nc0 >= 0 && (size_t)nc0 < c0->n_outputs &&
+                                nc0 < PQ_MAX_OUTPUTS) {
+                                sub_chain0_sstock = c0->out_amount[nc0];
+                                have_sub_c0 = 1;
+                            }
+                        }
+                        free(c0);
+                    }
 
                     sub->ps_chain_len = sub_count;
 
@@ -2654,7 +2801,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                        latest chain TX (mirrors lsp_subfactory_chain_advance). */
                     if (sub_count == 1) {
                         memcpy(sub->ps_prev_txid, sub_chain0_txid, 32);
-                        sub->ps_prev_chan_amount = sub->outputs[nc].amount_sats;
+                        sub->ps_prev_chan_amount = have_sub_c0
+                            ? sub_chain0_sstock : sub->outputs[nc].amount_sats;
                     } else {
                         memcpy(sub->ps_prev_txid, chain_ids[last - 1], 32);
                         sub->ps_prev_chan_amount = sub_sstock[last - 1];
@@ -4430,16 +4578,6 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
    close depth ('confirmed') or an input was spent by something else
    ('input_spent').  Nothing is sent before a height-based nLockTime. */
 
-#define PQ_MAX_INPUTS 64
-
-typedef struct {
-    char     txid[65];
-    uint32_t locktime;
-    int      non_final;                 /* some nSequence != 0xFFFFFFFF */
-    size_t   n_inputs;
-    char     prev_txid[PQ_MAX_INPUTS][65];
-    uint32_t prev_vout[PQ_MAX_INPUTS];
-} pq_tx_info_t;
 
 static uint32_t pq_le32(const unsigned char *b) {
     return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
@@ -4465,15 +4603,18 @@ static void pq_display_hex(const unsigned char *b32, char *out65) {
     hex_encode(r, 32, out65);
 }
 
-/* Parse txid (non-witness double-SHA256), nLockTime and prevouts. */
-static int pq_parse_tx(const char *hex, pq_tx_info_t *out) {
+static uint64_t pq_le64(const unsigned char *b) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | b[i];
+    return v;
+}
+
+/* Parse txid (non-witness double-SHA256), nLockTime, prevouts (with their
+   nSequence) and outputs from raw bytes.  Returns 1 on success. */
+static int pq_parse_tx_bytes(const unsigned char *b, size_t len,
+                             pq_tx_info_t *out) {
     memset(out, 0, sizeof(*out));
-    size_t hl = hex ? strlen(hex) : 0;
-    if (hl < 20 || (hl & 1)) return 0;
-    size_t len = hl / 2;
-    unsigned char *b = malloc(len);
-    if (!b) return 0;
-    if (hex_decode(hex, b, len) != (int)len) { free(b); return 0; }
+    if (!b || len < 10) return 0;
     int ok = 0;
     size_t pos = 4;
     do {
@@ -4492,16 +4633,27 @@ static int pq_parse_tx(const char *hex, pq_tx_info_t *out) {
             pos += 36;
             if (!pq_varint(b, len, &pos, &v) || pos + v + 4 > len) { bad = 1; break; }
             pos += (size_t)v;
-            if (pq_le32(b + pos) != 0xFFFFFFFFu) out->non_final = 1;
+            uint32_t nseq = pq_le32(b + pos);
+            if (i < PQ_MAX_INPUTS) out->prev_nseq[i] = nseq;
+            if (nseq != 0xFFFFFFFFu) out->non_final = 1;
             pos += 4;
         }
         if (bad) break;
         out->n_inputs = nin < PQ_MAX_INPUTS ? (size_t)nin : PQ_MAX_INPUTS;
-        if (!pq_varint(b, len, &pos, &nout)) break;
+        if (!pq_varint(b, len, &pos, &nout) || nout > 100000) break;
+        out->n_outputs = (size_t)nout;
         for (uint64_t o = 0; o < nout && !bad; o++) {
             if (pos + 8 > len) { bad = 1; break; }
+            uint64_t amt = pq_le64(b + pos);
             pos += 8;
             if (!pq_varint(b, len, &pos, &v) || pos + v > len) { bad = 1; break; }
+            if (o < PQ_MAX_OUTPUTS) {
+                out->out_amount[o] = amt;
+                if (v <= 34) {
+                    memcpy(out->out_spk[o], b + pos, (size_t)v);
+                    out->out_spk_len[o] = (size_t)v;
+                }
+            }
             pos += (size_t)v;
         }
         if (bad) break;
@@ -4520,17 +4672,30 @@ static int pq_parse_tx(const char *hex, pq_tx_info_t *out) {
         if (pos + 4 != len) break;
         out->locktime = pq_le32(b + pos);
         size_t sl = 8 + (body_end - body);
-        unsigned char *s = malloc(sl);
-        if (!s) break;
-        memcpy(s, b, 4);
-        memcpy(s + 4, b + body, body_end - body);
-        memcpy(s + 4 + (body_end - body), b + pos, 4);
+        unsigned char *sbuf = malloc(sl);
+        if (!sbuf) break;
+        memcpy(sbuf, b, 4);
+        memcpy(sbuf + 4, b + body, body_end - body);
+        memcpy(sbuf + 4 + (body_end - body), b + pos, 4);
         unsigned char h[32];
-        sha256_double(s, sl, h);
-        free(s);
+        sha256_double(sbuf, sl, h);
+        free(sbuf);
         pq_display_hex(h, out->txid);
         ok = 1;
     } while (0);
+    return ok;
+}
+
+/* Same, from hex. */
+static int pq_parse_tx(const char *hex, pq_tx_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    size_t hl = hex ? strlen(hex) : 0;
+    if (hl < 20 || (hl & 1)) return 0;
+    size_t len = hl / 2;
+    unsigned char *b = malloc(len);
+    if (!b) return 0;
+    if (hex_decode(hex, b, len) != (int)len) { free(b); return 0; }
+    int ok = pq_parse_tx_bytes(b, len, out);
     free(b);
     return ok;
 }
