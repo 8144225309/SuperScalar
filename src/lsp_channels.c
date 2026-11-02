@@ -5539,9 +5539,13 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t nidx = req_n[i];
             if (nidx >= lsp->factory.n_nodes) continue;
             factory_node_t *nd = &lsp->factory.nodes[nidx];
-            uint32_t cap = nd->l_stock_state_counter;
-            if (nd->l_stock_durable_set && nd->l_stock_durable_counter < cap)
-                cap = nd->l_stock_durable_counter;
+            /* Only states superseded on disk.  Unset: no advance of this node
+               has been written since the factory was created, so the stored
+               state is still the creation one (state 0) -- even when the
+               in-memory counter moved in a ceremony that did not complete
+               (the client may hold that state, the DB does not). */
+            uint32_t cap = nd->l_stock_durable_set ? nd->l_stock_durable_counter : 0;
+            if (cap > nd->l_stock_state_counter) cap = nd->l_stock_state_counter;
             if (req_s[i] >= cap) {
                 if (req_s[i] < nd->l_stock_state_counter)
                     fprintf(stderr, "LSP: not re-revealing L-stock secret for node "

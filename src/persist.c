@@ -458,6 +458,25 @@ static const char *SCHEMA_SQL =
     "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
     ");";
 
+/* v43: per-node L-stock state counter.
+
+   tree_node_lstock: the L-stock state counter (and the L-stock hash) that
+   goes with each node's stored tree_nodes row.  The counter cannot be derived
+   from the tree (it counts every rebuild of the L-stock output), and the
+   client has no seed to re-derive the hash.  Written in the same statement
+   group as the tree row (tree_node_upsert).
+
+   Created whenever missing, independent of the version number, so the step
+   works in any merge order with the other schema bumps. */
+#define PERSIST_V43_TABLES_SQL                                       \
+    "CREATE TABLE IF NOT EXISTS tree_node_lstock ("                 \
+    "  factory_id    INTEGER NOT NULL,"                             \
+    "  node_index    INTEGER NOT NULL,"                             \
+    "  state_counter INTEGER NOT NULL,"                             \
+    "  l_stock_hash  TEXT,"                                         \
+    "  PRIMARY KEY (factory_id, node_index)"                        \
+    ");"
+
 int persist_open(persist_t *p, const char *path) {
     if (!p) return 0;
     memset(p, 0, sizeof(*p));
@@ -1407,6 +1426,20 @@ int persist_open(persist_t *p, const char *path) {
         sqlite3_exec(p->db,
             "ALTER TABLE factories ADD COLUMN use_hashlock_poison INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
+    }
+
+    /* v43: tree_node_lstock, created whenever missing (see
+       PERSIST_V43_TABLES_SQL). */
+    {
+        char *merr43 = NULL;
+        if (sqlite3_exec(p->db, PERSIST_V43_TABLES_SQL, NULL, NULL, &merr43) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v43 failed: %s\n",
+                    merr43 ? merr43 : "unknown");
+            sqlite3_free(merr43);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
     }
 
     /* Record the current version if not already present */
@@ -4253,6 +4286,32 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 
 /* --- Factory tree nodes (Phase 22) --- */
 
+/* The L-stock state counter (and hash) that go with a node's tree row.  Every
+   tree-row write goes through tree_node_upsert, which calls this, so the
+   stored counter always belongs to the stored state. */
+static int tree_node_lstock_upsert(persist_t *p, const factory_node_t *node,
+                                   uint32_t factory_id, size_t i) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO tree_node_lstock "
+            "(factory_id, node_index, state_counter, l_stock_hash) "
+            "VALUES (?, ?, ?, ?);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int(st, 2, (int)i);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)node->l_stock_state_counter);
+    if (node->has_l_stock_hash) {
+        char hx[65];
+        hex_encode(node->l_stock_hash, 32, hx);
+        sqlite3_bind_text(st, 4, hx, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(st, 4);
+    }
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
 /* Upsert one tree_nodes row from the in-memory node. */
 static int tree_node_upsert(persist_t *p, const factory_node_t *node,
                             uint32_t factory_id, size_t i) {
@@ -4344,6 +4403,7 @@ static int tree_node_upsert(persist_t *p, const factory_node_t *node,
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    if (ok) ok = tree_node_lstock_upsert(p, node, factory_id, i);
     return ok;
 }
 
@@ -4848,27 +4908,194 @@ static uint32_t reload_ps_max_epoch(persist_t *p, uint32_t factory_id) {
     return e;
 }
 
-/* persist_load_factory rebuilds the tree at its creation state; this reads
-   the stored signed rows that every advance keeps current and rebuilds the
-   in-memory tree to the real state the factory had reached.
+/* 1 if the factory has a dw_counter_state row (an LSP DB; a client never
+   writes one). */
+static int reload_has_dw_row(persist_t *p, uint32_t factory_id) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT 1 FROM dw_counter_state WHERE "
+                           "factory_id=?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    int have = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    return have;
+}
 
-   It then verifies, before clearing the refusal:
-     - every node has a signed row (none missing);
+/* A node that carries an L-stock (sales-stock for a sub-factory) output whose
+   SPK is rebuilt on advances, bumping l_stock_state_counter: a leaf state
+   node with at least two outputs, or a PS sub-factory node.  Judged on the
+   tree as factory_build_tree built it. */
+static int reload_carries_l_stock(const factory_node_t *node) {
+    if (node->type == NODE_PS_SUBFACTORY) return 1;
+    return node->type == NODE_STATE && node->n_children == 0 &&
+           node->n_outputs >= 2;
+}
+
+/* Read every tree_node_lstock row of the factory.  have[i] is set for the
+   nodes that have one.  Returns 1, or 0 on a query error (a DB without the
+   table reads as no rows). */
+static int reload_l_stock_rows(persist_t *p, uint32_t factory_id, size_t n,
+                               uint32_t *counter, unsigned char (*hash)[32],
+                               int *have, int *have_hash) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT node_index, state_counter, l_stock_hash FROM tree_node_lstock "
+            "WHERE factory_id=?;", -1, &st, NULL) != SQLITE_OK)
+        return 1;   /* no table: no rows */
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    int ok = 1, step;
+    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+        int i = sqlite3_column_int(st, 0);
+        if (i < 0 || (size_t)i >= n) continue;
+        sqlite3_int64 c = sqlite3_column_int64(st, 1);
+        if (c < 0 || c > (sqlite3_int64)UINT32_MAX) { ok = 0; break; }
+        counter[i] = (uint32_t)c;
+        have[i] = 1;
+        const char *h = (const char *)sqlite3_column_text(st, 2);
+        if (h) {
+            if (strlen(h) != 64 || hex_decode(h, hash[i], 32) != 32) { ok = 0; break; }
+            have_hash[i] = 1;
+        }
+    }
+    if (step != SQLITE_DONE && ok) ok = 0;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* Verify one PS node (leaf or sub-factory) against its stored chain: chain[0]
+   of the current epoch (ps_initial_signed_states, which must be of the epoch
+   the reload derived and spend the stored parent), the chain rows of that
+   epoch (contiguous, each spending the previous one; persist_load_ps_chain),
+   and the stored tree row, which is the tip and must be one of them.
+   Outputs the chain length and the txid / parsed TX of the entry the tip
+   spends (chain[len-1], or nothing for len 0).  Returns 1 if consistent. */
+static int reload_ps_node(persist_t *p, uint32_t factory_id, factory_t *f,
+                          size_t i, uint32_t epoch, char (*txid)[65],
+                          const unsigned char creation_txid[32],
+                          int *len_out, unsigned char prev_internal[32],
+                          pq_tx_info_t *prev_info) {
+    factory_node_t *node = &f->nodes[i];
+    int is_sub = (node->type == NODE_PS_SUBFACTORY);
+    *len_out = 0;
+
+    pq_tx_info_t *c0 = malloc(sizeof(*c0));
+    if (!c0) return 0;
+    unsigned char c0_id[32];
+    char c0_hex[65];
+    uint32_t c0_epoch = 0;
+    int have_c0 = ps_chain0_load(p, factory_id, (uint32_t)i, c0_id, c0) &&
+                  ps_chain0_row(p, factory_id, (uint32_t)i, &c0_epoch, c0_hex) == 1;
+    if (!have_c0) {
+        /* No chain[0] row (a DB from before that table): only a node still
+           at its creation state, in the first epoch, can be trusted. */
+        char cr[65];
+        pq_display_hex(creation_txid, cr);
+        free(c0);
+        if (epoch != 0 || strcasecmp(cr, txid[i]) != 0) {
+            fprintf(stderr, "persist reload: PS node %zu has no stored chain[0] "
+                    "and is not at its creation state\n", i);
+            return 0;
+        }
+        return 1;
+    }
+    if (c0_epoch != epoch) {
+        fprintf(stderr, "persist reload: PS node %zu chain[0] is of epoch %u, "
+                "the factory is at epoch %u\n", i, c0_epoch, epoch);
+        free(c0);
+        return 0;
+    }
+    if (strcasecmp(c0->txid, c0_hex) != 0) {
+        fprintf(stderr, "persist reload: PS node %zu chain[0] txid does not "
+                "match its bytes\n", i);
+        free(c0);
+        return 0;
+    }
+    if (node->parent_index >= 0 && (size_t)node->parent_index < f->n_nodes) {
+        int spends = 0;
+        for (size_t k = 0; k < c0->n_inputs; k++)
+            if (strcasecmp(c0->prev_txid[k], txid[node->parent_index]) == 0 &&
+                c0->prev_vout[k] == node->parent_vout) { spends = 1; break; }
+        if (!spends) {
+            fprintf(stderr, "persist reload: PS node %zu chain[0] does not spend "
+                    "the stored parent (node %d)\n", i, node->parent_index);
+            free(c0);
+            return 0;
+        }
+    }
+
+    if (strcasecmp(c0_hex, txid[i]) == 0) {   /* tip is chain[0] */
+        free(c0);
+        return 1;
+    }
+
+    /* chain[1..N] of this epoch */
+    enum { RELOAD_PS_MAX = 4096 };
+    tx_buf_t *txs = calloc(RELOAD_PS_MAX, sizeof(tx_buf_t));
+    unsigned char (*ids)[32] = calloc(RELOAD_PS_MAX, 32);
+    uint64_t *a1 = calloc(RELOAD_PS_MAX, sizeof(uint64_t));
+    uint64_t (*a16)[16] = is_sub ? calloc(RELOAD_PS_MAX, sizeof(uint64_t[16])) : NULL;
+    int *nch = is_sub ? calloc(RELOAD_PS_MAX, sizeof(int)) : NULL;
+    int ok = txs && ids && a1 && (!is_sub || (a16 && nch));
+    int count = 0;
+    if (ok)
+        count = is_sub
+            ? persist_load_subfactory_chain(p, factory_id, (uint32_t)i, txs, ids,
+                                            a1, a16, nch, NULL, RELOAD_PS_MAX)
+            : persist_load_ps_chain(p, factory_id, (uint32_t)i, txs, ids, a1,
+                                    NULL, RELOAD_PS_MAX);
+    int tip = -1;
+    for (int k = 0; ok && k < count; k++) {
+        char h[65];
+        pq_display_hex(ids[k], h);
+        if (strcasecmp(h, txid[i]) == 0) { tip = k; break; }
+    }
+    if (ok && tip < 0) {
+        fprintf(stderr, "persist reload: PS node %zu: its stored tip %s is not "
+                "chain[0] or an entry of the epoch-%u chain (%d linked entries)\n",
+                i, txid[i], epoch, count);
+        ok = 0;
+    }
+    if (ok) {
+        *len_out = tip + 1;
+        if (tip == 0) {
+            memcpy(prev_internal, c0_id, 32);
+            *prev_info = *c0;
+        } else {
+            memcpy(prev_internal, ids[tip - 1], 32);
+            ok = pq_parse_tx_bytes(txs[tip - 1].data, txs[tip - 1].len, prev_info);
+        }
+    }
+    for (int k = 0; k < count; k++) tx_buf_free(&txs[k]);
+    free(txs); free(ids); free(a1); free(a16); free(nch); free(c0);
+    return ok;
+}
+
+/* Rebuild the in-memory signed tree from the stored rows that every advance
+   keeps current (the tree rows, the PS chain rows and chain[0] of each PS
+   node, and each node's L-stock counter), on top of the tree
+   persist_load_factory built at the creation state.
+
+   It verifies, before the caller allows advances:
+     - every node has a signed row whose txid matches its bytes;
      - the DW counter derived from the stored tree (leaf states from each leaf
-       node's nSequence, root-layer states from the internal nodes, epoch from
-       the PS chain rows or the restored dw_counter_state) matches every
-       stored node's nSequence;
+       node's nSequence, root-layer states from the internal nodes, the epoch
+       from the PS chain rows or the restored dw_counter_state) reproduces
+       every stored node's nSequence;
      - each non-PS node's TX spends its stored parent (the root spends the
-       funding output) -- the funding -> every leaf txid chain.
-   PS chain rows are validated (and the chain tips restored) by the PS restore
-   block above and re-checked by force-close; here they only contribute the
-   epoch and are left as that block restored them.
+       funding output);
+     - each PS node's chain[0] is of that epoch and spends its stored parent,
+       and its stored tip is chain[0] or an entry of that epoch's contiguous,
+       linked chain (reload_ps_node);
+     - every node that carries an L-stock has its stored L-stock state
+       counter, unless it is still at its creation state.  The counter cannot
+       be derived from the tree, and defaulting it to 0 would commit the next
+       state's L-stock to a secret already revealed.
 
    Returns 1 only if the whole tree reloaded and every check passed; the
-   caller then allows advances.  On any failure it returns 0 and the caller
-   stays fail-closed.  Leaf/counter states set here are correct regardless, so
-   leaving them on a failed reload is harmless (advances are refused anyway).
-   Never frees f. */
+   caller then allows advances.  On any failure it returns 0, the caller stays
+   fail-closed, and the in-memory nodes are left as they were (the DW leaf
+   and layer states may have been set; advances are refused anyway).  Never
+   frees f. */
 static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
                                       factory_t *f) {
     if (!p || !p->db || !f || f->n_nodes == 0) return 0;
@@ -4877,17 +5104,32 @@ static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
     char     (*txid)[65] = calloc(n, 65);
     char     **sig       = calloc(n, sizeof(char *));
     uint32_t *nseq       = calloc(n, sizeof(uint32_t));
-    uint64_t (*amt)[FACTORY_MAX_OUTPUTS] =
-        calloc(n, sizeof(uint64_t[FACTORY_MAX_OUTPUTS]));
-    int      *n_amt      = calloc(n, sizeof(int));
     int      *seen       = calloc(n, sizeof(int));
-    int ok = txid && sig && nseq && amt && n_amt && seen;
+    pq_tx_info_t *info   = calloc(n, sizeof(pq_tx_info_t));
+    uint32_t *lsc        = calloc(n, sizeof(uint32_t));
+    unsigned char (*lsh)[32] = calloc(n, 32);
+    int      *have_lsc   = calloc(n, sizeof(int));
+    int      *have_lsh   = calloc(n, sizeof(int));
+    int      *carries    = calloc(n, sizeof(int));
+    int      *ps_len     = calloc(n, sizeof(int));
+    unsigned char (*ps_prev)[32] = calloc(n, 32);
+    uint64_t *ps_prev_amt = calloc(n, sizeof(uint64_t));
+    unsigned char (*creation)[32] = calloc(n, 32);
+    pq_tx_info_t *prev_info = malloc(sizeof(pq_tx_info_t));
+    int ok = txid && sig && nseq && seen && info && lsc && lsh && have_lsc &&
+             have_lsh && carries && ps_len && ps_prev && ps_prev_amt &&
+             creation && prev_info;
+
+    for (size_t i = 0; ok && i < n; i++) {
+        carries[i] = reload_carries_l_stock(&f->nodes[i]);
+        memcpy(creation[i], f->nodes[i].txid, 32);
+    }
 
     /* ---- gather every node's stored row ---- */
     sqlite3_stmt *st = NULL;
     if (ok && sqlite3_prepare_v2(p->db,
-            "SELECT node_index, is_signed, nsequence, txid, signed_tx_hex, "
-            "output_amounts FROM tree_nodes WHERE factory_id=?;",
+            "SELECT node_index, is_signed, nsequence, txid, signed_tx_hex "
+            "FROM tree_nodes WHERE factory_id=?;",
             -1, &st, NULL) != SQLITE_OK)
         ok = 0;
     if (ok) {
@@ -4896,56 +5138,74 @@ static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
             int i = sqlite3_column_int(st, 0);
             if (i < 0 || (size_t)i >= n) continue;
             const unsigned char *t = sqlite3_column_text(st, 3);
-            const unsigned char *s = sqlite3_column_text(st, 4);
+            const unsigned char *sx = sqlite3_column_text(st, 4);
             if (!sqlite3_column_int(st, 1) || !t ||
-                strlen((const char *)t) != 64 || !s || !s[0]) { ok = 0; break; }
+                strlen((const char *)t) != 64 || !sx || !sx[0]) { ok = 0; break; }
             memcpy(txid[i], t, 65);
             nseq[i] = (uint32_t)sqlite3_column_int64(st, 2);
-            sig[i] = strdup((const char *)s);
+            sig[i] = strdup((const char *)sx);
             if (!sig[i]) { ok = 0; break; }
-            const unsigned char *oa = sqlite3_column_text(st, 5);
-            int c = 0;
-            if (oa) {
-                const char *q = (const char *)oa;
-                while (*q && c < FACTORY_MAX_OUTPUTS) {
-                    amt[i][c++] = strtoull(q, NULL, 10);
-                    const char *comma = strchr(q, ',');
-                    if (!comma) break;
-                    q = comma + 1;
-                }
-            }
-            n_amt[i] = c;
             seen[i] = 1;
         }
     }
     if (st) sqlite3_finalize(st);
-    for (size_t i = 0; ok && i < n; i++) if (!seen[i]) ok = 0;
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!seen[i]) {
+            fprintf(stderr, "persist reload: node %zu has no signed row\n", i);
+            ok = 0;
+            break;
+        }
+        if (!pq_parse_tx(sig[i], &info[i]) ||
+            strcasecmp(info[i].txid, txid[i]) != 0) {
+            fprintf(stderr, "persist reload: node %zu: stored TX does not parse "
+                    "or does not match its txid\n", i);
+            ok = 0;
+        }
+    }
 
-    /* ---- derive the DW counter from the stored tree (leaf states from
-           the signed nodes, not the ambiguous dw_counter_state) ---- */
+    /* ---- derive the DW counter from the stored tree (leaf states from the
+           signed nodes, not the ambiguous dw_counter_state) ---- */
     uint32_t epoch = f->counter.current_epoch;
     uint32_t pse = ok ? reload_ps_max_epoch(p, factory_id) : 0;
     if (pse > epoch) epoch = pse;
     int any_leaf_moved = 0;
+    int *leaf_slot = ok ? calloc(n, sizeof(int)) : NULL;
+    if (ok && !leaf_slot) ok = 0;
+    for (size_t i = 0; ok && i < n; i++) leaf_slot[i] = -1;
+    for (int li = 0; ok && li < f->n_leaf_nodes; li++)
+        if ((size_t)f->leaf_node_indices[li] < n)
+            leaf_slot[f->leaf_node_indices[li]] = li;
     for (size_t i = 0; ok && i < n; i++) {
         factory_node_t *node = &f->nodes[i];
         if (node->type == NODE_KICKOFF || node->is_static_only ||
             node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY ||
             node->dw_layer_index < 0)
             continue;
-        int leaf_slot = -1;
-        for (int li = 0; li < f->n_leaf_nodes; li++)
-            if ((int)f->leaf_node_indices[li] == (int)i) { leaf_slot = li; break; }
-        dw_layer_t *layer = (leaf_slot >= 0)
-            ? &f->leaf_layers[leaf_slot]
+        int ls = leaf_slot[i];
+        dw_layer_t *layer = (ls >= 0)
+            ? &f->leaf_layers[ls]
             : &f->counter.layers[node->dw_layer_index];
         uint32_t state;
         if (!dw_state_from_nseq(layer->config.step_blocks,
                                 layer->config.max_states, nseq[i], &state)) {
+            fprintf(stderr, "persist reload: node %zu: stored nSequence %u is "
+                    "not a DW state\n", i, nseq[i]);
             ok = 0; break;
         }
         layer->current_state = state;
-        if (leaf_slot >= 0 && state > 0) any_leaf_moved = 1;
+        if (ls >= 0 && state > 0) any_leaf_moved = 1;
+    }
+    /* Without a dw_counter_state row (a client DB) and without PS chain rows
+       of a later epoch, nothing records the epoch: after a root rollover it
+       cannot be told from the tree, so the factory stays refused. */
+    if (ok && pse == 0 && !reload_has_dw_row(p, factory_id)) {
+        for (uint32_t L = 0; L < f->counter.n_layers; L++)
+            if (f->counter.layers[L].current_state > 0) {
+                fprintf(stderr, "persist reload: the root rolled over but this DB "
+                        "does not record the epoch (a DW-only client DB)\n");
+                ok = 0;
+                break;
+            }
     }
     if (ok) {
         f->counter.current_epoch = epoch;
@@ -4955,61 +5215,126 @@ static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
 
     /* ---- the derived counter must reproduce every stored nSequence ---- */
     for (size_t i = 0; ok && i < n; i++)
-        if (factory_node_nsequence(f, i) != nseq[i]) ok = 0;
+        if (factory_node_nsequence(f, i) != nseq[i]) {
+            fprintf(stderr, "persist reload: node %zu: stored nSequence %u, the "
+                    "counter derived from the tree gives %u\n", i, nseq[i],
+                    factory_node_nsequence(f, i));
+            ok = 0;
+        }
 
     /* ---- input chain: each non-PS node spends its stored parent ---- */
-    unsigned char fund_disp[32];
-    memcpy(fund_disp, f->funding_txid, 32);
-    reverse_bytes(fund_disp, 32);
     char fund_hex[65];
-    hex_encode(fund_disp, 32, fund_hex);
+    pq_display_hex(f->funding_txid, fund_hex);
     for (size_t i = 0; ok && i < n; i++) {
         factory_node_t *node = &f->nodes[i];
         if (node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY) continue;
-        pq_tx_info_t info;
-        if (!pq_parse_tx(sig[i], &info) ||
-            strcasecmp(info.txid, txid[i]) != 0) { ok = 0; break; }
-        char expect[65];
-        if (node->parent_index >= 0 && (size_t)node->parent_index < n)
-            memcpy(expect, txid[node->parent_index], 65);
-        else
-            memcpy(expect, fund_hex, 65);
+        const char *expect = (node->parent_index >= 0 &&
+                              (size_t)node->parent_index < n)
+                             ? txid[node->parent_index] : fund_hex;
         int spends = 0;
-        for (size_t k = 0; k < info.n_inputs; k++)
-            if (strcasecmp(info.prev_txid[k], expect) == 0) { spends = 1; break; }
-        if (!spends) ok = 0;
+        for (size_t k = 0; k < info[i].n_inputs; k++)
+            if (strcasecmp(info[i].prev_txid[k], expect) == 0) { spends = 1; break; }
+        if (!spends) {
+            fprintf(stderr, "persist reload: node %zu does not spend its stored "
+                    "parent (%s)\n", i, expect);
+            ok = 0;
+        }
     }
+    for (size_t i = 0; ok && i < n; i++)
+        if (info[i].n_outputs == 0 || info[i].n_outputs > FACTORY_MAX_OUTPUTS ||
+            info[i].n_outputs > PQ_MAX_OUTPUTS)
+            ok = 0;
 
-    /* ---- apply the reloaded state to the non-PS in-memory nodes (the PS
-           restore block above already set the PS nodes) ---- */
-    if (ok) {
-        for (size_t i = 0; i < n; i++) {
-            factory_node_t *node = &f->nodes[i];
-            if (node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY) continue;
-            unsigned char internal[32];
-            if (hex_decode(txid[i], internal, 32) == 32) {
-                reverse_bytes(internal, 32);
-                memcpy(node->txid, internal, 32);
-            }
-            size_t blen = strlen(sig[i]) / 2;
-            unsigned char *b = malloc(blen ? blen : 1);
-            if (b && hex_decode(sig[i], b, (int)blen) == (int)blen) {
-                tx_buf_free(&node->signed_tx);
-                tx_buf_init(&node->signed_tx, (int)blen);
-                memcpy(node->signed_tx.data, b, blen);
-                node->signed_tx.len = blen;
-                node->is_signed = 1;
-                node->is_built = 1;
-            }
-            free(b);
-            for (int c = 0; c < n_amt[i] && (size_t)c < node->n_outputs; c++)
-                node->outputs[c].amount_sats = amt[i][c];
-            node->nsequence = nseq[i];
+    /* ---- PS nodes: chain[0], the epoch's chain, the tip ---- */
+    for (size_t i = 0; ok && i < n; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (!node->is_ps_leaf && node->type != NODE_PS_SUBFACTORY) continue;
+        if (!reload_ps_node(p, factory_id, f, i, epoch, txid, creation[i],
+                            &ps_len[i], ps_prev[i], prev_info)) {
+            ok = 0;
+            break;
+        }
+        if (ps_len[i] > 0) {
+            /* amount of the output the tip spends */
+            uint32_t v = info[i].n_inputs ? info[i].prev_vout[0] : 0;
+            ps_prev_amt[i] = (v < prev_info->n_outputs && v < PQ_MAX_OUTPUTS)
+                             ? prev_info->out_amount[v] : 0;
         }
     }
 
-    for (size_t i = 0; i < n; i++) free(sig[i]);
-    free(txid); free(sig); free(nseq); free(amt); free(n_amt); free(seen);
+    /* ---- L-stock state counters ---- */
+    if (ok && !reload_l_stock_rows(p, factory_id, n, lsc, lsh, have_lsc, have_lsh))
+        ok = 0;
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!carries[i] || have_lsc[i]) continue;
+        int ls = leaf_slot[i];
+        int advanced = epoch > 0 || ps_len[i] > 0 ||
+                       (ls >= 0 && f->leaf_layers[ls].current_state > 0);
+        if (advanced) {
+            fprintf(stderr, "persist reload: node %zu has advanced but its "
+                    "L-stock state counter is not stored (a DB written by an "
+                    "older build); its next L-stock could reuse a revealed "
+                    "secret\n", i);
+            ok = 0;
+        }
+    }
+
+    /* ---- apply ---- */
+    for (size_t i = 0; ok && i < n; i++) {
+        size_t blen = strlen(sig[i]) / 2;
+        unsigned char *b = malloc(blen ? blen : 1);
+        if (!b || hex_decode(sig[i], b, blen) != (int)blen) { free(b); ok = 0; break; }
+        factory_node_t *node = &f->nodes[i];
+        unsigned char internal[32];
+        if (hex_decode(txid[i], internal, 32) != 32) { free(b); ok = 0; break; }
+        reverse_bytes(internal, 32);
+        memcpy(node->txid, internal, 32);
+        tx_buf_free(&node->signed_tx);
+        tx_buf_init(&node->signed_tx, (int)blen);
+        memcpy(node->signed_tx.data, b, blen);
+        node->signed_tx.len = blen;
+        free(b);
+        node->is_signed = 1;
+        node->is_built = 1;
+        node->nsequence = nseq[i];
+        /* outputs (count, amounts and scripts) of the stored state, which
+           is the truth: the tree rebuilt at load can differ in layout (a P2A
+           anchor appended under the current settings) */
+        node->n_outputs = info[i].n_outputs;
+        for (size_t c = 0; c < info[i].n_outputs; c++) {
+            node->outputs[c].amount_sats = info[i].out_amount[c];
+            if (info[i].out_spk_len[c] > 0) {
+                memcpy(node->outputs[c].script_pubkey, info[i].out_spk[c],
+                       info[i].out_spk_len[c]);
+                node->outputs[c].script_pubkey_len = info[i].out_spk_len[c];
+            }
+        }
+        if (node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY) {
+            node->ps_chain_len = ps_len[i];
+            if (ps_len[i] > 0) {
+                memcpy(node->ps_prev_txid, ps_prev[i], 32);
+                node->ps_prev_chan_amount = ps_prev_amt[i];
+            }
+        }
+        if (have_lsc[i]) {
+            node->l_stock_state_counter = lsc[i];
+            node->has_l_stock_hash = have_lsh[i];
+            if (have_lsh[i]) memcpy(node->l_stock_hash, lsh[i], 32);
+            else memset(node->l_stock_hash, 0, 32);
+        } else if (carries[i]) {
+            node->l_stock_state_counter = 0;   /* creation state (checked above) */
+        }
+        /* the stored L-stock state: the on-request reveal hands out only
+           states below it until the next advance is written */
+        node->l_stock_durable_set = 1;
+        node->l_stock_durable_counter = node->l_stock_state_counter;
+    }
+
+    for (size_t i = 0; sig && i < n; i++) free(sig[i]);
+    free(txid); free(sig); free(nseq); free(seen); free(info);
+    free(lsc); free(lsh); free(have_lsc); free(have_lsh); free(carries);
+    free(ps_len); free(ps_prev); free(ps_prev_amt); free(creation);
+    free(prev_info); free(leaf_slot);
     return ok;
 }
 

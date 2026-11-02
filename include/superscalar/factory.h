@@ -213,10 +213,11 @@ typedef struct {
     uint32_t l_stock_state_counter;
     /* LSP side: l_stock_state_counter as of the newest state known to be in
        the DB.  An on-request reveal (MSG_LSTOCK_REVEAL_REQUEST) hands out only
-       states below it, so after a failed write the superseded state, which the
-       DB still holds, is never revealed.  Unset (0) means "the in-memory state
-       is the stored one" (creation, load).  Set by the exit-path writes in
-       lsp_channels.c. */
+       states below it, so after a failed write, or a ceremony that stopped
+       after the counter moved, the state the DB still holds is never
+       revealed.  Unset (0) means no advance has been written since creation
+       (the stored state is state 0); a reload from the DB sets it to the
+       stored counter.  Set by the exit-path writes in lsp_channels.c. */
     int l_stock_durable_set;
     uint32_t l_stock_durable_counter;
 
@@ -626,6 +627,14 @@ int factory_derive_l_stock_secret(const factory_t *f,
    Call once per leaf node BEFORE factory_build_tree (and update before each advance
    when the new state's H arrives over the wire).  Sets the factory into mirror mode
    (apply_l_stock_hashlock then uses these hashes instead of deriving). */
+/* After a restart, once the hashlock seed is set again (LSP only): check every
+   node's restored L-stock state against the seed.  A stored L-stock hash must
+   be the hash of the secret for the stored state counter, and a DW leaf's
+   stored L-stock output must commit to it; a node without a stored hash gets
+   the one derived from its counter.  Returns 1 if all agree (or the factory
+   has no hashlock), 0 otherwise; the caller then refuses advances. */
+int factory_verify_l_stock_state(factory_t *f);
+
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32);
 

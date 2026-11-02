@@ -3163,15 +3163,26 @@ int main(int argc, char *argv[]) {
                 lsp_rp->enable_hashlock_poison = 1;
                 printf("LSP recovery: hashlock L-stock poison RE-ENABLED "
                        "(seed re-derived deterministically from LSP key)\n");
+                /* The reloaded L-stock state counters must agree with the
+                   seed and with the stored L-stock outputs; otherwise the
+                   next advance could commit to a secret already revealed. */
+                if (!lsp_rp->factory.tree_rebuilt_on_load &&
+                    !factory_verify_l_stock_state(&lsp_rp->factory)) {
+                    lsp_rp->factory.tree_rebuilt_on_load = 1;
+                    fprintf(stderr, "LSP recovery: the reloaded L-stock state "
+                            "does not match the seed; advances are refused\n");
+                }
             }
 
-            /* persist_load_factory restored the DW counter (layer states,
-               epoch, per-leaf states) from dw_counter_state. */
             printf("LSP recovery: DW counter at epoch %u\n",
                    dw_counter_epoch(&lsp_rp->factory.counter));
-            fprintf(stderr, "LSP recovery: the factory tree is rebuilt at its "
-                    "initial state, not reloaded: leaf advances, reallocs and "
-                    "root advances on it are refused (payments still settle)\n");
+            if (lsp_rp->factory.tree_rebuilt_on_load)
+                fprintf(stderr, "LSP recovery: the signed tree could not be "
+                        "reloaded and verified: leaf advances, reallocs and "
+                        "root advances are refused (payments still settle)\n");
+            else
+                printf("LSP recovery: signed tree reloaded and verified; "
+                       "advances allowed\n");
 
             /* Set factory lifecycle from current block height */
             {

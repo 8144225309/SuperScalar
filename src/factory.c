@@ -414,6 +414,52 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
     return 1;
 }
 
+int factory_verify_l_stock_state(factory_t *f) {
+    if (!f) return 0;
+    if (!f->use_hashlock_poison || !f->has_shachain) return 1;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        int dw_leaf = (node->type == NODE_STATE && node->n_children == 0 &&
+                       !node->is_ps_leaf && node->n_outputs >= 2);
+        if (!node->has_l_stock_hash && !dw_leaf) continue;
+        unsigned char secret[32], h[32];
+        if (!factory_derive_l_stock_secret(f, node, node->l_stock_state_counter,
+                                           secret))
+            return 0;
+        sha256(secret, 32, h);
+        memset(secret, 0, sizeof(secret));
+        if (node->has_l_stock_hash) {
+            if (memcmp(h, node->l_stock_hash, 32) != 0) {
+                fprintf(stderr, "factory: node %zu: the stored L-stock hash is not "
+                        "the hash of state %u's secret\n", i,
+                        node->l_stock_state_counter);
+                return 0;
+            }
+        } else {
+            memcpy(node->l_stock_hash, h, 32);
+            node->has_l_stock_hash = 1;
+        }
+        if (dw_leaf) {
+            /* the stored state's L-stock output must commit to that hash */
+            int anchor = (node->outputs[node->n_outputs - 1].script_pubkey_len ==
+                              P2A_SPK_LEN &&
+                          memcmp(node->outputs[node->n_outputs - 1].script_pubkey,
+                                 P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+            size_t ls = node->n_outputs - 1 - (size_t)anchor;
+            unsigned char spk[34];
+            if (!build_l_stock_spk(f, node, spk) ||
+                node->outputs[ls].script_pubkey_len != 34 ||
+                memcmp(spk, node->outputs[ls].script_pubkey, 34) != 0) {
+                fprintf(stderr, "factory: node %zu: the stored L-stock output does "
+                        "not commit to state %u's hash\n", i,
+                        node->l_stock_state_counter);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32) {
     if (!f || node_idx >= f->config.max_nodes || !h32) return;
@@ -2686,7 +2732,9 @@ fail:
 /* Update L-stock output for a specific leaf node after per-leaf advance.
    L-stock is always the last output. */
 static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
-    if (!f->has_shachain)
+    /* A seedless client mirroring the LSP's hashes has no shachain but must
+       rebuild the L-stock the same way, with the hash it was sent. */
+    if (!f->has_shachain && !f->has_node_l_stock_hashes)
         return 1;  /* nothing to update */
 
     factory_node_t *node = &f->nodes[node_idx];

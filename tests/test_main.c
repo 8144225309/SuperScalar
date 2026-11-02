@@ -1193,7 +1193,12 @@ extern int test_exit_reload_consistent_and_corrupted(void);
 extern int test_exit_dw_advance_reload_then_advance(void);
 extern int test_exit_tierb_reload_then_advance(void);
 extern int test_exit_client_reload_then_tierb(void);
+extern int test_reload_lstock_counter_dw(void);
+extern int test_reload_lstock_counter_client(void);
+extern int test_reload_ps_chain_after_rollover(void);
 extern int test_reload_ps_chain_loaders_filter_epoch(void);
+extern int test_reload_reveal_cap_after_reload(void);
+extern int test_reload_dw_client_epoch_unknown(void);
 extern int test_regtest_exit_client_path_past_128(void);
 extern int test_regtest_exit_after_dw_leaf_advance(void);
 extern int test_regtest_exit_after_ps_leaf_advance(void);
@@ -2480,7 +2485,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_exit_dw_advance_reload_then_advance);
     RUN_TEST(test_exit_tierb_reload_then_advance);
     RUN_TEST(test_exit_client_reload_then_tierb);
+    RUN_TEST(test_reload_lstock_counter_dw);
+    RUN_TEST(test_reload_lstock_counter_client);
+    RUN_TEST(test_reload_ps_chain_after_rollover);
     RUN_TEST(test_reload_ps_chain_loaders_filter_epoch);
+    RUN_TEST(test_reload_reveal_cap_after_reload);
+    RUN_TEST(test_reload_dw_client_epoch_unknown);
     RUN_TEST(test_admin_rpc_sweepfactory_no_persist);
     RUN_TEST(test_admin_rpc_sweepfactory_missing_dest);
 

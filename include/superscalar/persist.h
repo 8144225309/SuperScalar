@@ -24,8 +24,12 @@ typedef struct {
     unsigned pq_attempt_n;
 } persist_t;
 
-/* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+/* Current schema version. Bump when adding migrations.
+   43 adds tree_node_lstock (persist.c, the v43 step).  Versions 40-42 are taken by changes on other branches; every one of
+   those steps, and this one, creates its tables whenever they are missing, so
+   the steps run correctly in any merge order.  When the branches are merged
+   the version is the maximum of the bumps (43). */
+#define PERSIST_SCHEMA_VERSION 43
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).

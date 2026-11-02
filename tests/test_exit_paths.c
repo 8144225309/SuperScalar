@@ -1616,9 +1616,8 @@ int test_exit_ps_realloc_refused_leaf_unchanged(void) {
 /* A PS realloc writes its chain entry: a force-close from the DB publishes
    the reallocated state, and persist_load_factory restores the chain at its
    full length with the reallocated tip, so the next chain TX is built on
-   chain[1] rather than being a second, conflicting chain[1].  (A factory
-   restored from the DB refuses advances for now, so only the restored chain
-   is checked here.) */
+   chain[1] rather than being a second, conflicting chain[1].  (Advancing a
+   reloaded factory is covered by the test_reload_* tests.) */
 int test_exit_ps_realloc_persists_chain_entry(void) {
     ex_rig_t r;
     TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_PS, "psrealloc", 0), "rig");
@@ -2107,6 +2106,370 @@ int test_exit_client_reload_then_tierb(void) {
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* Tree reload: the L-stock state counter and PS chains across a root  */
+/* rollover                                                             */
+/* ------------------------------------------------------------------ */
+
+static const unsigned char g_rl_seed[32] = {
+    0x7a, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+    0xbb, 0xcc, 0xdd, 0xee, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56,
+    0x67, 0x78, 0x89, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf1 };
+
+/* "Sign" a node for a persistence-only test: the stored bytes are the
+   unsigned TX (same txid), which is all the reload checks look at. */
+static void rl_fake_sign(factory_node_t *n) {
+    tx_buf_free(&n->signed_tx);
+    tx_buf_init(&n->signed_tx, (int)n->unsigned_tx.len);
+    memcpy(n->signed_tx.data, n->unsigned_tx.data, n->unsigned_tx.len);
+    n->signed_tx.len = n->unsigned_tx.len;
+    n->is_signed = 1;
+}
+
+/* A factory with the hashlock L-stock: the seed and the flag are set before
+   the tree is built, so every L-stock commits to H(secret(node, state)). */
+static int rl_build_hashlock(secp256k1_context *ctx, factory_t *f,
+                             const secp256k1_keypair *kps, size_t n,
+                             factory_arity_t arity, uint32_t sub_arity,
+                             const unsigned char fund_txid[32],
+                             const unsigned char spk[34], uint32_t states) {
+    if (!factory_init(f, ctx, kps, n, 2, states)) return 0;
+    factory_set_shachain_seed(f, g_rl_seed);
+    if (!factory_enable_hashlock_poison(f)) return 0;
+    factory_set_arity(f, arity);
+    if (sub_arity > 1) factory_set_ps_subfactory_arity(f, sub_arity);
+    f->fee_per_tx = 1000;
+    factory_set_funding(f, fund_txid, 0, 2000000, spk, 34);
+    if (!factory_build_tree(f)) return 0;
+    if (!factory_sign_all(f)) return 0;
+    /* factory_sign_all leaves the k^2 sub-factory nodes to their own
+       ceremony; for these persistence tests their bytes are enough */
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (f->nodes[i].is_built && !f->nodes[i].is_signed)
+            rl_fake_sign(&f->nodes[i]);
+    return 1;
+}
+
+static int rl_lstock_hash_of(factory_t *f, size_t idx, uint32_t state,
+                             unsigned char out[32]) {
+    unsigned char sec[32];
+    if (!factory_derive_l_stock_secret(f, &f->nodes[idx], state, sec)) return 0;
+    sha256(sec, 32, out);
+    memset(sec, 0, 32);
+    return 1;
+}
+
+/* Persist one advanced node the way the LSP does before DONE: the tree row
+   (which carries the L-stock counter) and the DW counter in one transaction. */
+static int rl_persist_node(persist_t *db, factory_t *f, size_t idx) {
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_tree_node(db, f, 0, idx) &&
+             persist_save_factory_dw_state(db, 0, f);
+    if (ok) return persist_commit(db);
+    persist_rollback(db);
+    return 0;
+}
+
+/* Hashlock DW leaf, three advances, restart: the reloaded L-stock state
+   counter is the stored one, so the next state's L-stock commits to a fresh
+   secret, not to one of the superseded states' secrets the LSP has revealed.
+   A missing counter row fails the reload closed; a tampered one fails the
+   LSP's post-seed check. */
+int test_reload_lstock_counter_dw(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x61, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && rl_build_hashlock(ctx, f, kps, 3, FACTORY_ARITY_1, 0, fund,
+                                       spk, 8), "hashlock factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_lstock");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw state");
+    size_t leaf = f->leaf_node_indices[0];
+    TEST_ASSERT(f->nodes[leaf].has_l_stock_hash, "leaf L-stock is hashlocked");
+
+    for (int a = 0; a < 3; a++) {
+        TEST_ASSERT(factory_advance_leaf(f, 0) == 1, "leaf advance");
+        TEST_ASSERT(rl_persist_node(&db, f, leaf), "persist the advance");
+    }
+    uint32_t c = f->nodes[leaf].l_stock_state_counter;
+    TEST_ASSERT(c == 3, "three L-stock states superseded");
+    /* the LSP reveals the secret of every superseded state 0..c-1 */
+    unsigned char revealed[3][32];
+    for (uint32_t s = 0; s < c; s++)
+        TEST_ASSERT(rl_lstock_hash_of(f, leaf, s, revealed[s]), "revealed hash");
+
+    /* restart */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload");
+    factory_set_shachain_seed(g, g_rl_seed);       /* LSP recovery re-derives it */
+    TEST_ASSERT(factory_enable_hashlock_poison(g), "re-enable hashlock");
+    int verified = factory_verify_l_stock_state(g);
+    factory_node_t *gl = &g->nodes[leaf];
+    printf("  reload: flag=%d, L-stock counter %u (stored %u), verified=%d\n",
+           g->tree_rebuilt_on_load, gl->l_stock_state_counter, c, verified);
+    uint32_t restored = gl->l_stock_state_counter;
+    int adv = factory_advance_leaf_unsigned(g, 0);
+    int reused = -1;
+    for (uint32_t s = 0; s < c; s++)
+        if (memcmp(gl->l_stock_hash, revealed[s], 32) == 0) reused = (int)s;
+    printf("  next state: counter %u, its L-stock hash %s", gl->l_stock_state_counter,
+           reused >= 0 ? "IS the hash of revealed state " : "is fresh\n");
+    if (reused >= 0) printf("%d's secret\n", reused);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "reload verified");
+    TEST_ASSERT(restored == c, "L-stock counter restored");
+    TEST_ASSERT(verified, "restored counter agrees with the seed and the L-stock output");
+    TEST_ASSERT(adv == 1, "next advance");
+    TEST_ASSERT(reused < 0, "the new L-stock is not hashlocked to a revealed secret");
+    unsigned char want[32];
+    TEST_ASSERT(rl_lstock_hash_of(g, leaf, c + 1, want), "hash of the next state");
+    TEST_ASSERT(memcmp(gl->l_stock_hash, want, 32) == 0,
+                "the new L-stock commits to the next state's secret");
+    factory_free(g); free(g);
+
+    /* a DB without the counter rows (written by an older build) */
+    TEST_ASSERT(sqlite3_exec(db.db, "DELETE FROM tree_node_lstock", NULL, NULL,
+                             NULL) == SQLITE_OK, "drop counter rows");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload without counters");
+    printf("  no counter rows: flag=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "advanced node without its counter -> refused");
+    factory_free(g); free(g);
+
+    /* a tampered counter */
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "rewrite the rows");
+    char sql[160];
+    snprintf(sql, sizeof(sql), "UPDATE tree_node_lstock SET state_counter=1 "
+             "WHERE factory_id=0 AND node_index=%zu", leaf);
+    TEST_ASSERT(sqlite3_exec(db.db, sql, NULL, NULL, NULL) == SQLITE_OK, "tamper");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload tampered");
+    factory_set_shachain_seed(g, g_rl_seed);
+    factory_enable_hashlock_poison(g);
+    verified = factory_verify_l_stock_state(g);
+    printf("  tampered counter: verified=%d\n", verified);
+    TEST_ASSERT(!verified, "a counter that does not match the stored hash is caught");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Hashlock DW leaf on the LSP and on a seedless client that mirrors the
+   LSP's per-node hashes (as it is sent them in PROPOSE): two advances, both
+   persisted (the client through client_persist_exit_state), both restarted.
+   Each restores the leaf's L-stock counter and current hash, the LSP's next
+   state commits to a fresh secret, and the restarted client builds the
+   identical TX. */
+int test_reload_lstock_counter_client(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x62, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && rl_build_hashlock(ctx, f, kps, 3, FACTORY_ARITY_1, 0, fund,
+                                       spk, 8), "LSP factory");
+    size_t leaf = f->leaf_node_indices[0];
+
+    /* the client: no seed, mirrors the per-node hashes it was sent */
+    factory_t *c = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(c && factory_init(c, ctx, kps, 3, 2, 8), "client init");
+    factory_set_arity(c, FACTORY_ARITY_1);
+    c->fee_per_tx = 1000;
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (f->nodes[i].has_l_stock_hash)
+            factory_set_node_l_stock_hash(c, i, f->nodes[i].l_stock_hash);
+    factory_set_funding(c, fund, 0, 2000000, spk, 34);
+    TEST_ASSERT(factory_build_tree(c) && factory_sign_all(c), "client tree");
+    TEST_ASSERT(memcmp(c->nodes[leaf].txid, f->nodes[leaf].txid, 32) == 0,
+                "client and LSP agree at creation");
+
+    char path[256], cpath[256];
+    ex_db_path(path, sizeof(path), "rl_lsc");
+    ex_db_path(cpath, sizeof(cpath), "rl_lscc");
+    persist_t db, cdb;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "LSP persist");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw");
+    TEST_ASSERT(persist_open(&cdb, cpath) && persist_save_factory(&cdb, c, ctx, 0) &&
+                client_persist_exit_state(&cdb, c), "client persist");
+
+    for (int a = 0; a < 2; a++) {
+        TEST_ASSERT(factory_advance_leaf_unsigned(f, 0) == 1, "LSP advance");
+        factory_set_node_l_stock_hash(c, leaf, f->nodes[leaf].l_stock_hash);
+        TEST_ASSERT(factory_advance_leaf_unsigned(c, 0) == 1, "client advance");
+        int same = memcmp(c->nodes[leaf].txid, f->nodes[leaf].txid, 32) == 0;
+        printf("  advance %d: client builds the same state as the LSP: %s\n", a + 1,
+               same ? "yes" : "NO");
+        TEST_ASSERT(same, "same leaf state");
+        TEST_ASSERT(factory_sign_node(f, leaf) && factory_sign_node(c, leaf), "sign");
+        TEST_ASSERT(rl_persist_node(&db, f, leaf), "LSP persists the advance");
+        TEST_ASSERT(client_persist_exit_state(&cdb, c), "client persists the advance");
+    }
+    uint32_t cnt = f->nodes[leaf].l_stock_state_counter;
+    TEST_ASSERT(cnt == 2, "two L-stock states superseded");
+    unsigned char revealed[3][32];
+    for (uint32_t s2 = 0; s2 <= cnt; s2++)
+        TEST_ASSERT(rl_lstock_hash_of(f, leaf, s2, revealed[s2]), "hashes");
+
+    /* both restart */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    factory_t *h = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "LSP reload");
+    TEST_ASSERT(h && persist_load_factory(&cdb, 0, h, ctx), "client reload");
+    factory_set_shachain_seed(g, g_rl_seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(g), "LSP re-enables hashlock");
+    int verified = factory_verify_l_stock_state(g);
+    printf("  reload: LSP flag=%d counter=%u verified=%d; client flag=%d counter=%u\n",
+           g->tree_rebuilt_on_load, g->nodes[leaf].l_stock_state_counter, verified,
+           h->tree_rebuilt_on_load, h->nodes[leaf].l_stock_state_counter);
+    TEST_ASSERT(!g->tree_rebuilt_on_load && !h->tree_rebuilt_on_load, "both reloads verified");
+    TEST_ASSERT(verified, "LSP counter agrees with the seed");
+    TEST_ASSERT(g->nodes[leaf].l_stock_state_counter == cnt &&
+                h->nodes[leaf].l_stock_state_counter == cnt, "both counters restored");
+    TEST_ASSERT(h->nodes[leaf].has_l_stock_hash &&
+                memcmp(h->nodes[leaf].l_stock_hash, revealed[cnt], 32) == 0,
+                "client restored the current state's hash (the next poison's target)");
+
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "LSP advance after restart");
+    int reused = -1;
+    for (uint32_t s2 = 0; s2 <= cnt; s2++)
+        if (memcmp(g->nodes[leaf].l_stock_hash, revealed[s2], 32) == 0) reused = (int)s2;
+    printf("  LSP next state: counter %u, hash %s\n", g->nodes[leaf].l_stock_state_counter,
+           reused >= 0 ? "REUSES an earlier state's hash" : "fresh");
+    TEST_ASSERT(reused < 0, "new L-stock hash is not an earlier (revealed) one");
+    factory_set_node_l_stock_hash(h, leaf, g->nodes[leaf].l_stock_hash);
+    TEST_ASSERT(factory_advance_leaf_unsigned(h, 0) == 1, "client advance after restart");
+    int agree = memcmp(h->nodes[leaf].txid, g->nodes[leaf].txid, 32) == 0;
+    printf("  client after restart: counter %u, same TX as the LSP: %s\n",
+           h->nodes[leaf].l_stock_state_counter, agree ? "yes" : "NO");
+    TEST_ASSERT(agree, "the restarted client builds the identical TX");
+    TEST_ASSERT(h->nodes[leaf].l_stock_state_counter == cnt + 1, "client counter agrees");
+
+    factory_free(g); free(g); factory_free(h); free(h);
+    persist_close(&db); persist_close(&cdb);
+    unlink(path); unlink(cpath);
+    factory_free(f); free(f); factory_free(c); free(c);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Persist one PS leaf chain advance the way the LSP does before DONE. */
+static int rl_persist_ps_leaf(persist_t *db, factory_t *f, size_t leaf) {
+    factory_node_t *n = &f->nodes[leaf];
+    unsigned char disp[32];
+    memcpy(disp, n->txid, 32);
+    reverse_bytes(disp, 32);
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_ps_chain_entry(db, 0, (uint32_t)leaf,
+                 n->ps_chain_len - 1, f->counter.current_epoch, disp,
+                 n->signed_tx.data, n->signed_tx.len,
+                 n->outputs[0].amount_sats, NULL, 0) &&
+             persist_save_tree_node(db, f, 0, leaf) &&
+             persist_save_factory_dw_state(db, 0, f);
+    if (ok) return persist_commit(db);
+    persist_rollback(db);
+    return 0;
+}
+
+/* A root rollover after a PS chain longer than the new epoch's: the old
+   epoch's rows at higher positions stay in ps_leaf_chains.  The reload must
+   take the new epoch's tip (and chain[0] of the new epoch), and the next
+   advance must spend it. */
+int test_reload_ps_chain_after_rollover(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x63, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_PS, fund, 0,
+                                      1000000, spk, 2, 3, 1), "PS factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_psroll");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist");
+    TEST_ASSERT(lsp_persist_ps_chain0_all(&db, f) > 0, "chain[0]");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw");
+    size_t leaf = f->leaf_node_indices[0];
+
+    /* epoch 0: chain[1..3], then the rollover */
+    int rolled = 0, n_old = 0;
+    for (int a = 0; a < 10 && !rolled; a++) {
+        int rc = factory_advance_leaf_unsigned(f, 0);
+        if (rc == -1) {
+            TEST_ASSERT(factory_sign_all(f), "re-sign the new epoch");
+            TEST_ASSERT(ex_persist_tierb(&db, f, 1), "persist the Tier B");
+            rolled = 1;
+            break;
+        }
+        TEST_ASSERT(rc == 1 && factory_sign_node(f, leaf), "chain advance");
+        TEST_ASSERT(rl_persist_ps_leaf(&db, f, leaf), "persist chain entry");
+        n_old++;
+    }
+    TEST_ASSERT(rolled && f->counter.current_epoch == 1, "rolled over to epoch 1");
+    /* epoch 1: one advance */
+    TEST_ASSERT(factory_advance_leaf_unsigned(f, 0) == 1 && factory_sign_node(f, leaf),
+                "epoch-1 chain advance");
+    TEST_ASSERT(rl_persist_ps_leaf(&db, f, leaf), "persist epoch-1 entry");
+    char tip[65], prev[65];
+    ex_txid_hex(f->nodes[leaf].txid, tip);
+    ex_txid_hex(f->nodes[leaf].ps_prev_txid, prev);
+    printf("  epoch 0 chain had %d entries; epoch 1 chain has 1 (tip %.16s...); "
+           "ps_leaf_chains rows: %d\n", n_old, tip,
+           ex_sql_int(&db, "SELECT COUNT(*) FROM ps_leaf_chains"));
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload");
+    factory_node_t *gl = &g->nodes[leaf];
+    char gtip[65], gprev[65];
+    ex_txid_hex(gl->txid, gtip);
+    ex_txid_hex(gl->ps_prev_txid, gprev);
+    printf("  reload: flag=%d epoch=%u chain_len=%d tip %.16s... (%s)\n",
+           g->tree_rebuilt_on_load, g->counter.current_epoch, gl->ps_chain_len,
+           gtip, strcmp(gtip, tip) == 0 ? "the epoch-1 tip" : "WRONG");
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "reload verified");
+    TEST_ASSERT(gl->ps_chain_len == 1, "chain length of the current epoch");
+    TEST_ASSERT(strcmp(gtip, tip) == 0, "tip is the epoch-1 entry");
+    TEST_ASSERT(strcmp(gprev, prev) == 0, "it spends the epoch-1 chain[0]");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "next advance");
+    char nprev[65];
+    ex_txid_hex(gl->ps_prev_txid, nprev);
+    TEST_ASSERT(strcmp(nprev, tip) == 0, "the next chain TX spends the epoch-1 tip");
+    factory_free(g); free(g);
+
+    /* chain[0] row of the wrong epoch -> fail closed */
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE ps_initial_signed_states SET epoch=0",
+                             NULL, NULL, NULL) == SQLITE_OK, "tamper epoch");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload tampered");
+    printf("  chain[0] of the old epoch: flag=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "epoch mismatch -> refused");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* The chain loaders (leaf and sub-factory) skip other epochs' rows and stop
    at a row that does not spend the previous entry. */
 int test_reload_ps_chain_loaders_filter_epoch(void) {
@@ -2189,5 +2552,125 @@ int test_reload_ps_chain_loaders_filter_epoch(void) {
     }
     persist_close(&db);
     unlink(path);
+    return 1;
+}
+
+/* Fresh LSP <-> client socketpair for the rig (the old one may be shut). */
+static int rl_rig_reconnect(ex_rig_t *r) {
+    if (r->sv[0] >= 0) close(r->sv[0]);
+    if (r->sv[1] >= 0) close(r->sv[1]);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, r->sv) != 0) return 0;
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(r->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(r->sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    r->lsp->client_fds[0] = r->sv[0];
+    return 1;
+}
+
+/* LSP restart: the factory is reloaded from the LSP DB. */
+static int rl_rig_restart_lsp(ex_rig_t *r) {
+    factory_free(&r->lsp->factory);
+    memset(&r->lsp->factory, 0, sizeof(r->lsp->factory));
+    return persist_load_factory(&r->db, 0, &r->lsp->factory, r->ctx) &&
+           !r->lsp->factory.tree_rebuilt_on_load;
+}
+
+/* After a reload the on-request reveal is capped at the stored L-stock state:
+   superseded states are still handed out, the stored one is not, and a
+   ceremony that moved the in-memory counter but stored nothing (the client
+   stopped answering) does not raise the cap. */
+int test_reload_reveal_cap_after_reload(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "rl_cap", 1), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    int client_ok = 0;
+    for (int a = 0; a < 2; a++) {
+        size_t na = ex_realloc_amounts(&r.lsp->factory.nodes[leaf], 1000, amts);
+        TEST_ASSERT(ex_rig_realloc(&r, amts, na, &client_ok) == 1 && client_ok,
+                    "durable realloc");
+        TEST_ASSERT(client_persist_exit_state(&r.cdb, r.cf), "client persists");
+    }
+    uint32_t c = r.lsp->factory.nodes[leaf].l_stock_state_counter;
+    TEST_ASSERT(c == 2, "two states superseded");
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    {   /* the rig's L-stock seed, re-set as LSP recovery does */
+        unsigned char seed[32] = { 0x5e, 0xed };
+        for (int i = 2; i < 32; i++) seed[i] = (unsigned char)(i - 1);
+        factory_set_shachain_seed(&r.lsp->factory, seed);
+    }
+    factory_node_t *ln = &r.lsp->factory.nodes[leaf];
+    TEST_ASSERT(ln->l_stock_state_counter == c, "counter restored");
+    r.lsp->factory.use_hashlock_poison = 1;   /* only the reveal handler reads it */
+    int a1 = ex_request_reveal(&r, (uint32_t)leaf, c - 1);
+    int a2 = ex_request_reveal(&r, (uint32_t)leaf, c);
+    r.lsp->factory.use_hashlock_poison = 0;
+    printf("  after reload (stored state %u): state %u revealed %d, state %u revealed %d\n",
+           c, c - 1, a1, c, a2);
+    TEST_ASSERT(a1 == 1, "a superseded state is still revealed");
+    TEST_ASSERT(a2 == 0, "the stored state is not");
+
+    /* a realloc the client never answers: the counter moves, nothing is stored */
+    shutdown(r.sv[1], SHUT_RDWR);
+    size_t na = ex_realloc_amounts(ln, 1000, amts);
+    int rc = lsp_realloc_leaf(r.mgr, r.lsp, 0, amts, na);
+    TEST_ASSERT(rc == 0 && ln->l_stock_state_counter == c + 1,
+                "ceremony stopped after the counter moved");
+    TEST_ASSERT(rl_rig_reconnect(&r), "reconnect");
+    r.lsp->factory.use_hashlock_poison = 1;
+    int a3 = ex_request_reveal(&r, (uint32_t)leaf, c);
+    r.lsp->factory.use_hashlock_poison = 0;
+    printf("  after a ceremony that stored nothing (in memory %u): state %u revealed %d\n",
+           ln->l_stock_state_counter, c, a3);
+    alarm(0);
+    TEST_ASSERT(a3 == 0, "the state still in the DB is not revealed");
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A DW-only (arity-1) client DB records no epoch: no dw_counter_state row and
+   no PS chain rows.  After a root rollover the reload cannot tell the epoch
+   and must stay refused rather than reload it as 0. */
+int test_reload_dw_client_epoch_unknown(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x64, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_1, fund, 0,
+                                      1000000, spk, 2, 2, 1), "DW factory");
+    char cpath[256];
+    ex_db_path(cpath, sizeof(cpath), "rl_dwcli");
+    persist_t cdb;
+    TEST_ASSERT(persist_open(&cdb, cpath) && persist_save_factory(&cdb, f, ctx, 0) &&
+                client_persist_exit_state(&cdb, f), "client DB");
+
+    /* before any rollover the client reloads normally */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&cdb, 0, g, ctx), "reload");
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "epoch 0: reload verified");
+    factory_free(g); free(g);
+
+    uint32_t epoch = ex_local_rollover(f, 10);
+    TEST_ASSERT(epoch > 0, "rolled over");
+    TEST_ASSERT(ex_persist_tierb(&cdb, f, 0), "client persists the new epoch");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&cdb, 0, g, ctx), "reload after rollover");
+    printf("  DW-only client DB after a rollover to epoch %u: flag=%d (epoch reloaded as %u)\n",
+           epoch, g->tree_rebuilt_on_load, g->counter.current_epoch);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "epoch unknown -> refused, not reloaded as 0");
+    factory_free(g); free(g);
+
+    persist_close(&cdb);
+    unlink(cpath);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
