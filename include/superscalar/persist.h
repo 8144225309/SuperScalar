@@ -16,6 +16,12 @@ typedef struct {
        in memory only — never persisted. Zeroed at persist_close. */
     unsigned char dek[32];
     int enc_enabled;
+    /* Broadcast queue: height of the last send attempt per queued row, so
+       persist_service_queued_broadcasts tries each entry at most once per
+       block.  In memory only. */
+#define PERSIST_PQ_ATTEMPT_SLOTS 32
+    struct { int row_id; int height; } pq_attempt[PERSIST_PQ_ATTEMPT_SLOTS];
+    unsigned pq_attempt_n;
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
@@ -118,6 +124,14 @@ int persist_in_transaction(const persist_t *p);
 /* Mark a factory as closed (all on-chain outputs settled).
    Called by factory_recovery_scan() when all leaf TXs are confirmed. */
 int persist_mark_factory_closed(persist_t *p, uint32_t factory_id);
+
+/* Set / read factories.state ('active', 'closing', 'closed').  'closing' is
+   written before CLOSE_DONE hands the clients a fully signed cooperative
+   close; a restarted LSP refuses to serve a 'closing' factory. */
+int persist_set_factory_state(persist_t *p, uint32_t factory_id,
+                              const char *state);
+int persist_get_factory_state(persist_t *p, uint32_t factory_id,
+                              char *out, size_t cap);
 
 /* SF-WAL #157: force a passive WAL checkpoint so external SQLite readers
    (dashboard) see committed writes within heartbeat-tick granularity.
@@ -667,6 +681,28 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 /* Save all tree nodes for a factory (includes signed_tx_hex if available). */
 int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id);
 
+/* Re-persist the CURRENT signed state of one node after an advance (DW leaf
+   advance, realloc, PS / sub-factory chain advance) so factory_recovery_run publishes the
+   latest state, not the creation-era one.  Writes nothing and returns 0 when
+   the node is not signed in memory (a stored signature is never replaced by
+   NULL) or when its TX spends neither the stored parent nor the node's own
+   stored state (a stale in-memory tree; logged as CRITICAL, row kept).
+   Returns 1 on success. */
+int persist_save_tree_node(persist_t *p, const factory_t *f,
+                           uint32_t factory_id, size_t node_idx);
+
+/* Epoch of the stored chain[0] (ps_initial_signed_states) for a PS node.
+   Returns 1 and sets *epoch_out if a row exists, 0 otherwise. */
+int persist_load_ps_initial_epoch(persist_t *p, uint32_t factory_id,
+                                  uint32_t node_idx, uint32_t *epoch_out);
+
+/* Same for every node that is signed in memory (after Tier B, which re-signs
+   the whole tree).  Unsigned nodes are skipped.  If any node fails the
+   stored-parent check above, nothing is written.  Returns the number of rows
+   written, or -1 on error. */
+int persist_save_signed_tree_nodes(persist_t *p, const factory_t *f,
+                                   uint32_t factory_id);
+
 /* --- Broadcast audit log --- */
 
 /* Log a broadcast attempt (txid, source label, raw hex, result).
@@ -680,6 +716,27 @@ int persist_log_broadcast(persist_t *p, const char *txid,
    Returns count of successfully re-broadcast transactions. */
 struct chain_backend;
 int persist_retry_pending_broadcasts(persist_t *p, struct chain_backend *chain);
+
+/* Queue a pre-signed TX that must eventually confirm but may not be valid yet
+   (e.g. the factory distribution TX with its nLockTime).  Stored in
+   broadcast_log with result='queued'; idempotent per txid.  Writes the txid
+   (display hex) to txid_out (65 bytes) if non-NULL.  Returns 1 on success. */
+int persist_queue_broadcast(persist_t *p, const char *source, const char *raw_hex,
+                            char *txid_out);
+
+/* Service the queue: broadcast each queued TX once its height nLockTime has
+   passed, re-broadcast while it is neither in the mempool nor confirmed, and
+   close the entry when it is confirmed at the close depth ('confirmed') or an
+   input was spent by another transaction ('input_spent').  Each entry is sent
+   at most once per block; its attempts update one broadcast_log row in place
+   (result 'ok' / 'failed').  There is no fee bump.  Returns the number of
+   entries still pending. */
+int persist_service_queued_broadcasts(persist_t *p, struct chain_backend *chain);
+
+/* State of the newest queue entry with this source label: 'queued',
+   'confirmed', 'input_spent' or 'unparseable'.  Returns 1 if there is one. */
+int persist_get_queued_broadcast_result(persist_t *p, const char *source,
+                                        char *out, size_t cap);
 
 /* --- Reorg staleness tracking --- */
 
