@@ -1536,12 +1536,47 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
    When SS_MUSIG_STATELESS is unset the caller takes the legacy path
    instead and this function is unreachable. */
+int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                          int trigger_leaf_side);
+
+/* Re-drive a pending root advance (factory_t.root_advance_pending_epoch):
+   the same advance, with the same trigger.  After a restart the factory is
+   still at the previous epoch, so the trigger rolls it over again (the only
+   step the freeze allows); in memory after a failed ceremony it already has.
+   The signed-state reservations make the identical TXs the only ones that
+   can be signed.  Returns 1 when the root advance completed. */
+int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp) return 0;
+    factory_t *f = &lsp->factory;
+    if (!factory_root_advance_frozen(f)) return 0;
+    int trig = f->root_advance_pending_trigger;
+    printf("LSP: re-driving the pending root advance to epoch %u (trigger %d)\n",
+           f->root_advance_pending_epoch, trig);
+    if (f->counter.current_epoch < f->root_advance_pending_epoch) {
+        int rc = (trig < 0) ? factory_tick_root(f)
+                            : factory_advance_leaf_unsigned(f, trig);
+        if (rc != -1 || f->counter.current_epoch != f->root_advance_pending_epoch) {
+            fprintf(stderr, "LSP: cannot roll over to the pending epoch %u "
+                    "(rc=%d, epoch %u); leaf operations stay refused\n",
+                    f->root_advance_pending_epoch, rc, f->counter.current_epoch);
+            return 0;
+        }
+    }
+    return lsp_run_state_advance(mgr, lsp, trig);
+}
+
 static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         int leaf_side) {
     factory_t *f = &lsp->factory;
 
     if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    /* A root advance we signed but did not store is pending: nothing is
+       signed at the current epoch; a leaf-advance request re-drives that
+       same root advance instead. */
+    if (factory_root_advance_frozen(f))
+        return lsp_redrive_root_advance(mgr, lsp);
 
     /* PS k>=2: same refusal as legacy path (see lsp_advance_leaf header). */
     if (f->leaf_arity == FACTORY_ARITY_PS && f->ps_subfactory_arity >= 2) {
@@ -1623,8 +1658,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 1: advance leaf state to rebuild the unsigned TX. */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
-    if (rc == FACTORY_ADVANCE_REFUSED)
-        return 0;  /* restored from the DB; factory.c logged it */
+    if (rc == FACTORY_ADVANCE_REFUSED || rc == FACTORY_ADVANCE_FROZEN)
+        return 0;  /* factory.c logged it */
     if (rc == 0) {
         fprintf(stderr, "LSP-stateless: leaf %d advance exhausted\n", leaf_side);
         return 0;
@@ -2737,6 +2772,21 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
 
+    /* Mark the root advance pending, durably, before our partial sigs go
+       out: from then on a client may hold the new epoch, so nothing more is
+       signed at the old one until this advance is stored as complete. */
+    if (mgr->persist &&
+        !persist_set_root_advance_pending((persist_t *)mgr->persist, 0,
+                                          f->counter.current_epoch,
+                                          trigger_leaf_side)) {
+        fprintf(stderr, "LSP-stateless Tier B: could not record the pending "
+                "root advance; not signing\n");
+        for (size_t j = 0; j < n_affected; j++)
+            if (poison_prepared[j]) factory_session_reset_poison(f, affected[j]);
+        return 0;
+    }
+    factory_set_root_advance_pending(f, f->counter.current_epoch, trigger_leaf_side);
+
     /* Reserve every re-signed node durably before our partial sigs go out
        (see lsp_reserve_node_tx). */
     for (size_t k = 0; k < n_affected; k++) {
@@ -3012,6 +3062,10 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                         "the re-signed tree; a force-close from the DB would "
                         "publish the previous epoch\n");
             }
+            /* stored as complete: no longer pending (same transaction) */
+            if (tierb_durable &&
+                !persist_clear_root_advance_pending(tdb, 0, f->counter.current_epoch))
+                tierb_durable = 0;
             if (towntxn) {
                 if (tierb_durable) tierb_durable = persist_commit(tdb);
                 else               persist_rollback(tdb);
@@ -3020,6 +3074,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     }
     for (size_t ni = 0; ni < f->n_nodes; ni++)
         lsp_note_l_stock_durable(&f->nodes[ni], tierb_durable);
+    if (tierb_durable)
+        factory_clear_root_advance_pending(f);
 
     /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
     if (mgr->persist && c3_round_id > 0) {
@@ -3308,8 +3364,8 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 1: Advance DW counter + rebuild unsigned tx */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
-    if (rc == FACTORY_ADVANCE_REFUSED)
-        return 0;  /* restored from the DB; factory.c logged it */
+    if (rc == FACTORY_ADVANCE_REFUSED || rc == FACTORY_ADVANCE_FROZEN)
+        return 0;  /* factory.c logged it */
     if (rc == 0) {
         fprintf(stderr, "LSP realloc: leaf %d DW fully exhausted\n", leaf_side);
         return 0;
@@ -8447,6 +8503,8 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
 int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
+    if (factory_root_advance_frozen(f))
+        return lsp_redrive_root_advance(mgr, lsp) ? 1 : -1;
     int rc = factory_tick_root(f);
     if (rc != -1) {
         return 0;

@@ -468,6 +468,9 @@ static const char *SCHEMA_SQL =
 
    signed_state_reservations: see persist_reserve_signed_tx.
 
+   root_advance_pending: a root advance whose signatures were released but
+   that is not stored as complete (persist_set_root_advance_pending).
+
    Created whenever missing, independent of the version number, so the step
    works in any merge order with the other schema bumps. */
 #define PERSIST_V43_TABLES_SQL                                       \
@@ -487,6 +490,11 @@ static const char *SCHEMA_SQL =
     "  txid        TEXT NOT NULL,"                                  \
     "  created_at  INTEGER DEFAULT (strftime('%s','now')),"         \
     "  PRIMARY KEY (factory_id, input_txid, input_vout, nsequence)" \
+    ");"                                                            \
+    "CREATE TABLE IF NOT EXISTS root_advance_pending ("             \
+    "  factory_id   INTEGER PRIMARY KEY,"                           \
+    "  epoch        INTEGER NOT NULL,"                              \
+    "  trigger_leaf INTEGER NOT NULL"                               \
     ");"
 
 int persist_open(persist_t *p, const char *path) {
@@ -1440,8 +1448,9 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
-    /* v43: tree_node_lstock + signed_state_reservations, created whenever
-       missing (see PERSIST_V43_TABLES_SQL). */
+    /* v43: tree_node_lstock, signed_state_reservations and
+       root_advance_pending, created whenever missing (see
+       PERSIST_V43_TABLES_SQL). */
     {
         char *merr43 = NULL;
         if (sqlite3_exec(p->db, PERSIST_V43_TABLES_SQL, NULL, NULL, &merr43) != SQLITE_OK) {
@@ -2553,6 +2562,61 @@ int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
     return rc;
 }
 
+int persist_set_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                     uint32_t epoch, int trigger_leaf) {
+    if (!p || !p->db || epoch == 0) return 0;
+    if (p->in_transaction) {
+        fprintf(stderr, "persist_set_root_advance_pending: called inside a "
+                "transaction; refusing\n");
+        return 0;
+    }
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "INSERT OR REPLACE INTO root_advance_pending "
+            "(factory_id, epoch, trigger_leaf) VALUES (?, ?, ?);",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)epoch);
+    sqlite3_bind_int(st, 3, trigger_leaf);
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_clear_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                       uint32_t upto_epoch) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "DELETE FROM root_advance_pending "
+            "WHERE factory_id=? AND epoch<=?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)upto_epoch);
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_load_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                      uint32_t *epoch_out, int *trigger_out) {
+    if (!p || !p->db) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT epoch, trigger_leaf FROM "
+            "root_advance_pending WHERE factory_id=?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;   /* no table (read-only open of an older DB): none */
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    int rc = 0, step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        if (epoch_out) *epoch_out = (uint32_t)sqlite3_column_int64(st, 0);
+        if (trigger_out) *trigger_out = sqlite3_column_int(st, 1);
+        rc = 1;
+    } else if (step != SQLITE_DONE) {
+        rc = -1;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
@@ -3006,6 +3070,23 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         fprintf(stderr, "persist_load_factory: could not reload the signed tree "
                 "of factory %u; advances stay refused until it can be reloaded "
                 "(force-close still reads the DB directly)\n", factory_id);
+    }
+
+    /* A root advance this side signed but did not store as complete: until
+       the same advance completes, nothing is signed at the stored epoch. */
+    {
+        uint32_t pe = 0;
+        int pt = 0;
+        int prc = persist_load_root_advance_pending(p, factory_id, &pe, &pt);
+        if (prc < 0) {
+            f->tree_rebuilt_on_load = 1;
+        } else if (prc == 1 && pe > f->counter.current_epoch) {
+            factory_set_root_advance_pending(f, pe, pt);
+            fprintf(stderr, "persist_load_factory: factory %u has a root advance "
+                    "to epoch %u that was signed but not stored as complete; "
+                    "leaf operations stay refused until it completes\n",
+                    factory_id, pe);
+        }
     }
     return 1;
 }

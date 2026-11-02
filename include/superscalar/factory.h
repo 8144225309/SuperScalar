@@ -423,6 +423,18 @@ typedef struct {
        build on it.  Cleared when the factory is initialised again. */
     int tree_rebuilt_on_load;
     int tree_refusal_logged;       /* the CRITICAL refusal line was printed */
+    /* A root advance (Tier B) to this epoch had its signatures released
+       (the LSP's partial sigs, or this client's final psigs) but is not
+       stored as the signed tree yet; 0 = none.  A counterparty may hold that
+       newer epoch fully signed, and it would supersede anything signed at the
+       current epoch, so until the same root advance completes every leaf
+       advance, realloc and sub-factory chain advance is refused
+       (FACTORY_ADVANCE_FROZEN).  The only way forward is the identical root
+       advance (same trigger), which the reservations make the only one
+       signable.  Persisted in root_advance_pending. */
+    uint32_t root_advance_pending_epoch;
+    int root_advance_pending_trigger;  /* trigger_leaf_side of that advance */
+    int root_freeze_logged;
     factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
 
     /* Variable arity per tree level (4A): overrides leaf_arity when set.
@@ -782,6 +794,15 @@ extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in pr
    tells the cases apart.  The refusal is logged once per factory. */
 #define FACTORY_ADVANCE_REFUSED (-3)
 int factory_advance_refused(const factory_t *f);
+
+/* Returned by factory_advance_leaf_unsigned and factory_tick_root while a
+   root advance is pending (root_advance_pending_epoch), unless the call is
+   the one that rolls the root over to that epoch.  The boolean advance
+   functions return 0 for it.  Logged once per pending advance. */
+#define FACTORY_ADVANCE_FROZEN (-4)
+int factory_root_advance_frozen(const factory_t *f);
+void factory_set_root_advance_pending(factory_t *f, uint32_t epoch, int trigger);
+void factory_clear_root_advance_pending(factory_t *f);
 
 int factory_advance(factory_t *f);
 

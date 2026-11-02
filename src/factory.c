@@ -2325,7 +2325,7 @@ int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx) {
 
 int factory_advance_and_rebuild_path(factory_t *f, int leaf_side) {
     int ret = factory_advance_leaf_unsigned(f, leaf_side);
-    if (ret == FACTORY_ADVANCE_REFUSED) return ret;
+    if (ret == FACTORY_ADVANCE_REFUSED || ret == FACTORY_ADVANCE_FROZEN) return ret;
     if (ret == 0) return -2;  /* fully exhausted */
     if (ret < 0) {
         /* Leaf exhausted, root layer advanced — rebuild path */
@@ -2509,6 +2509,44 @@ int factory_advance_refused(const factory_t *f) {
     return f && f->tree_rebuilt_on_load;
 }
 
+int factory_root_advance_frozen(const factory_t *f) {
+    return f && f->root_advance_pending_epoch != 0;
+}
+
+void factory_set_root_advance_pending(factory_t *f, uint32_t epoch, int trigger) {
+    if (!f) return;
+    if (f->root_advance_pending_epoch != epoch) f->root_freeze_logged = 0;
+    f->root_advance_pending_epoch = epoch;
+    f->root_advance_pending_trigger = trigger;
+}
+
+void factory_clear_root_advance_pending(factory_t *f) {
+    if (!f) return;
+    f->root_advance_pending_epoch = 0;
+    f->root_advance_pending_trigger = 0;
+    f->root_freeze_logged = 0;
+}
+
+/* Refuse an operation at the current epoch while a root advance is pending
+   (see root_advance_pending_epoch).  Logged once per pending advance. */
+static int refuse_frozen(factory_t *f, const char *what) {
+    if (!factory_root_advance_frozen(f)) return 0;
+    if (!f->root_freeze_logged) {
+        fprintf(stderr, "factory: refusing %s: a root advance to epoch %u was "
+                "signed by this side but is not stored as complete; a "
+                "counterparty may hold it, so nothing at epoch %u is signed "
+                "until that same root advance completes (logged once)\n", what,
+                f->root_advance_pending_epoch, f->counter.current_epoch);
+        f->root_freeze_logged = 1;
+    }
+    return 1;
+}
+
+/* While frozen, the one allowed step is the rollover to the pending epoch. */
+static int frozen_allows_rollover(const factory_t *f, int rolls_over) {
+    return rolls_over && f->counter.current_epoch < f->root_advance_pending_epoch;
+}
+
 int factory_advance(factory_t *f) {
     if (refuse_rebuilt_tree(f, "a root advance")) return 0;
     if (!dw_counter_advance(&f->counter))
@@ -2603,6 +2641,7 @@ int factory_rebuild_node_tx(factory_t *f, size_t node_idx) {
 int factory_set_leaf_amounts(factory_t *f, int leaf_side,
                               const uint64_t *amounts, size_t n_amounts) {
     if (refuse_rebuilt_tree(f, "a leaf realloc")) return 0;
+    if (refuse_frozen(f, "a leaf realloc")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
@@ -2762,6 +2801,7 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {
     if (refuse_rebuilt_tree(f, "a leaf advance")) return 0;
+    if (refuse_frozen(f, "a leaf advance")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
@@ -2811,6 +2851,14 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     if (refuse_rebuilt_tree(f, "a leaf advance")) return FACTORY_ADVANCE_REFUSED;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    if (factory_root_advance_frozen(f)) {
+        const factory_node_t *ln = &f->nodes[f->leaf_node_indices[leaf_side]];
+        int rolls = ln->is_ps_leaf
+            ? ((uint32_t)ln->ps_chain_len + 1 > f->states_per_layer)
+            : dw_is_exhausted(&f->leaf_layers[leaf_side]);
+        if (!frozen_allows_rollover(f, rolls) && refuse_frozen(f, "a leaf advance"))
+            return FACTORY_ADVANCE_FROZEN;
+    }
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
@@ -2904,6 +2952,11 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
 int factory_tick_root(factory_t *f) {
     if (!f) return 0;
     if (refuse_rebuilt_tree(f, "a root tick")) return FACTORY_ADVANCE_REFUSED;
+    if (factory_root_advance_frozen(f) &&
+        !frozen_allows_rollover(f, f->counter.n_layers > 0 &&
+                                   dw_is_exhausted(&f->counter.layers[0])) &&
+        refuse_frozen(f, "a root tick"))
+        return FACTORY_ADVANCE_FROZEN;
     /* F7: invert the trigger semantics.  A "tick" represents one step_blocks
        worth of block-height progression.  Two cases:
 
@@ -2982,6 +3035,7 @@ int factory_subfactory_chain_advance_unsigned(
 {
     if (!f) return 0;
     if (refuse_rebuilt_tree(f, "a sub-factory chain advance")) return 0;
+    if (refuse_frozen(f, "a sub-factory chain advance")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
     if (sub_idx_in_leaf < 0) return 0;
 

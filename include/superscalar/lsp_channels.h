@@ -539,6 +539,13 @@ int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
 int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
 
+/* Re-drive a root advance (Tier B) whose signatures were released but that
+   was not stored as complete (factory_t.root_advance_pending_epoch), e.g.
+   after an LSP restart.  While it is pending, every leaf operation is
+   refused; a leaf-advance request or a root tick calls this instead.
+   Returns 1 when the root advance completed. */
+int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).
    On rollover, drives Tier B ceremony to re-sign every non-PS-leaf node

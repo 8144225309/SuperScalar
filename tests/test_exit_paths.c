@@ -2912,3 +2912,254 @@ int test_reload_dw_client_epoch_unknown(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ------------------------------------------------------------------ */
+/* Root advance (Tier B) with both clients connected                    */
+/* ------------------------------------------------------------------ */
+
+/* The rig's second client: its own tree copy, DB and connection. */
+typedef struct {
+    factory_t *cf;
+    persist_t cdb;
+    int cdb_open;
+    char cpath[256];
+    int sv[2];
+} rl_cli2_t;
+
+static int rl_cli2_init(ex_rig_t *r, rl_cli2_t *c, const char *tag, uint32_t states) {
+    memset(c, 0, sizeof(*c));
+    c->sv[0] = c->sv[1] = -1;
+    c->cf = calloc(1, sizeof(factory_t));
+    if (!c->cf || !ex_build_factory(r->ctx, c->cf, r->kps, 3, r->lsp->factory.leaf_arity,
+                                    r->fund_txid, 0, 1000000, r->spk, 2, states, 1))
+        return 0;
+    ex_db_path(c->cpath, sizeof(c->cpath), tag);
+    if (!persist_open(&c->cdb, c->cpath) ||
+        !persist_save_factory(&c->cdb, c->cf, r->ctx, 0) ||
+        !client_persist_exit_state(&c->cdb, c->cf))
+        return 0;
+    c->cdb_open = 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, c->sv) != 0) return 0;
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(c->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    r->lsp->client_fds[1] = c->sv[0];
+    return 1;
+}
+
+static int rl_cli2_reconnect(ex_rig_t *r, rl_cli2_t *c) {
+    if (c->sv[0] >= 0) close(c->sv[0]);
+    if (c->sv[1] >= 0) close(c->sv[1]);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, c->sv) != 0) return 0;
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(c->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    r->lsp->client_fds[1] = c->sv[0];
+    return 1;
+}
+
+static void rl_cli2_free(rl_cli2_t *c) {
+    if (c->sv[0] >= 0) close(c->sv[0]);
+    if (c->sv[1] >= 0) close(c->sv[1]);
+    if (c->cf) { factory_free(c->cf); free(c->cf); }
+    if (c->cdb_open) persist_close(&c->cdb);
+    if (c->cpath[0]) unlink(c->cpath);
+}
+
+/* Like rl_proxy_thread, plus a gate between the two clients: the two
+   in-process clients share one client DB handle (client_set_persist is
+   global), so client 2 is given the LSP's Tier B response only after client
+   1 has sent its final psigs (and so finished writing).  drop_type 0 drops
+   nothing. */
+typedef struct {
+    int lsp_fd, cli_fd;
+    uint8_t drop_type;
+    int dropped;
+    uint8_t signal_type;            /* from the client: set *gate */
+    uint8_t hold_type;              /* from the LSP: wait for *gate */
+    volatile int *gate;
+} rl_gproxy_t;
+
+static void *rl_gproxy_thread(void *arg) {
+    rl_gproxy_t *x = (rl_gproxy_t *)arg;
+    for (;;) {
+        struct pollfd pf[2] = { { .fd = x->lsp_fd, .events = POLLIN },
+                                { .fd = x->cli_fd, .events = POLLIN } };
+        if (poll(pf, 2, 130000) <= 0) break;
+        int from_cli = (pf[1].revents & (POLLIN | POLLHUP)) ? 1 : 0;
+        int src = from_cli ? x->cli_fd : x->lsp_fd;
+        int dst = from_cli ? x->lsp_fd : x->cli_fd;
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        if (!wire_recv(src, &m)) break;
+        if (from_cli && x->signal_type && m.msg_type == x->signal_type && x->gate)
+            *x->gate = 1;
+        if (!from_cli && x->hold_type && m.msg_type == x->hold_type && x->gate)
+            for (int w = 0; w < 12000 && !*x->gate; w++) usleep(10000);
+        if (from_cli && x->drop_type && m.msg_type == x->drop_type) {
+            x->dropped = 1;
+            if (m.json) cJSON_Delete(m.json);
+            break;
+        }
+        int sent = wire_send(dst, m.msg_type, m.json);
+        if (m.json) cJSON_Delete(m.json);
+        if (!sent) break;
+    }
+    shutdown(x->lsp_fd, SHUT_RDWR);
+    shutdown(x->cli_fd, SHUT_RDWR);
+    return NULL;
+}
+
+/* A leaf advance of leaf 0 with both clients listening: client 1 runs the
+   ceremony; client 2 only gets DONE, or, on a rollover, both run Tier B
+   (through gated proxies; drop_c1 swallows a message of client 1's).  Each
+   client stores its view afterwards when it completed.  The connections
+   are replaced afterwards. */
+static int rl_advance2_ex(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
+                          uint8_t drop_c1, int *dropped) {
+    int roll = dw_is_exhausted(&r->lsp->factory.leaf_layers[0]) ||
+               factory_root_advance_frozen(&r->lsp->factory);
+    volatile int gate = 0;
+    int q1[2], q2[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, q1) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, q2) != 0) return 0;
+    rl_gproxy_t p1 = { .lsp_fd = r->sv[1], .cli_fd = q1[0], .drop_type = drop_c1,
+                       .signal_type = MSG_STATE_ADV_CLIENT_FINAL_PSIGS, .gate = &gate };
+    rl_gproxy_t p2 = { .lsp_fd = c2->sv[1], .cli_fd = q2[0],
+                       .hold_type = MSG_STATE_ADV_LSP_RESPONSE, .gate = &gate };
+    ex_client_t a = { .fd = q1[1], .ctx = r->ctx, .kp = r->kps[1],
+                      .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    ex_client_t b = { .fd = q2[1], .ctx = r->ctx, .kp = r->kps[2],
+                      .f = c2->cf, .my_index = 2, .n_expected = 1, .ok = 0 };
+    pthread_t t1, t2, ta, tb;
+    if (pthread_create(&t1, NULL, rl_gproxy_thread, &p1) != 0 ||
+        pthread_create(&t2, NULL, rl_gproxy_thread, &p2) != 0 ||
+        pthread_create(&ta, NULL, ex_client_thread, &a) != 0) return 0;
+    if (roll && pthread_create(&tb, NULL, ex_client_thread, &b) != 0) return 0;
+    int rc = lsp_channels_advance_ps_leaf(r->mgr, r->lsp, 0);
+    if (!roll) {
+        /* client 2 only gets DONE; let it arrive, then hang up */
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        struct pollfd pf = { .fd = q2[1], .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 500) > 0 && wire_recv(q2[1], &m) && m.json)
+            cJSON_Delete(m.json);
+    }
+    if (rc != 1 || !roll) shutdown(q2[1], SHUT_RDWR);
+    pthread_join(ta, NULL);
+    if (roll) pthread_join(tb, NULL);
+    shutdown(r->sv[0], SHUT_RDWR);
+    shutdown(c2->sv[0], SHUT_RDWR);
+    shutdown(q1[1], SHUT_RDWR);
+    shutdown(q2[1], SHUT_RDWR);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    close(q1[0]); close(q1[1]); close(q2[0]); close(q2[1]);
+    *c1_ok = a.ok;
+    *c2_ok = roll ? b.ok : 1;
+    if (dropped) *dropped = p1.dropped;
+    if (rc == 1 && a.ok) client_persist_exit_state(&r->cdb, r->cf);
+    if (rc == 1 && roll && b.ok) client_persist_exit_state(&c2->cdb, c2->cf);
+    if (!rl_rig_reconnect(r) || !rl_cli2_reconnect(r, c2)) return 0;
+    return rc;
+}
+
+static int rl_advance2(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok) {
+    return rl_advance2_ex(r, c2, c1_ok, c2_ok, 0, NULL);
+}
+
+/* Tier B to epoch 1 in which client 1's final partial sigs never reach the
+   LSP: both sides have released their signatures for epoch 1, nobody stored
+   it.  After restarts the LSP and client 1 are frozen at epoch 0: a leaf
+   advance or realloc is refused on both sides.  A leaf-advance request
+   re-drives the identical Tier B, which completes, and leaf operations
+   resume. */
+int test_reload_tierb_freeze(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_frz", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_frz2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    TEST_ASSERT(dw_is_exhausted(&r.lsp->factory.leaf_layers[0]), "leaf 0 exhausted");
+
+    /* Tier B, client 1's CLIENT_FINAL_PSIGS swallowed */
+    int dropped = 0;
+    int rc = rl_advance2_ex(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    uint32_t pe = 0; int pt = 0;
+    int lsp_mark = persist_load_root_advance_pending(&r.db, 0, &pe, &pt);
+    int cli_mark = persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL);
+    printf("  Tier B with client 1's final psigs withheld: rc=%d dropped=%d; "
+           "pending mark: LSP %d (epoch %u, trigger %d), client 1 %d\n",
+           rc, dropped, lsp_mark, pe, pt, cli_mark);
+    TEST_ASSERT(rc == 0 && dropped, "the root advance did not complete");
+    TEST_ASSERT(lsp_mark == 1 && pe == 1 && pt == 0, "LSP marked epoch 1 pending");
+    TEST_ASSERT(cli_mark == 1, "client 1 marked it pending");
+
+    /* restarts */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    TEST_ASSERT(rl_rig_restart_client(&r), "client 1 reload");
+    factory_free(c2.cf); memset(c2.cf, 0, sizeof(*c2.cf));
+    TEST_ASSERT(persist_load_factory(&c2.cdb, 0, c2.cf, r.ctx), "client 2 reload");
+    factory_t *lf = &r.lsp->factory;
+    printf("  after restarts: LSP epoch %u frozen=%d, client 1 frozen=%d, "
+           "client 2 frozen=%d\n", lf->counter.current_epoch,
+           factory_root_advance_frozen(lf), factory_root_advance_frozen(r.cf),
+           factory_root_advance_frozen(c2.cf));
+    TEST_ASSERT(lf->counter.current_epoch == 0 && factory_root_advance_frozen(lf),
+                "LSP at epoch 0, frozen");
+    TEST_ASSERT(factory_root_advance_frozen(r.cf), "client 1 frozen");
+
+    /* leaf operations at epoch 0 are refused on both sides */
+    int lrc = factory_advance_leaf_unsigned(lf, 1);
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    size_t na = ex_realloc_amounts(&lf->nodes[lf->leaf_node_indices[1]], 1000, amts);
+    int rrc = lsp_realloc_leaf(r.mgr, r.lsp, 1, amts, na);
+    int crc = factory_advance_leaf_unsigned(r.cf, 1);
+    int z[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, z) == 0, "pair");
+    cJSON *prop = wire_build_leaf_advance_propose(1, NULL, NULL);
+    wire_msg_t pm = { .msg_type = MSG_LEAF_ADVANCE_PROPOSE, .json = prop };
+    int hrc = client_handle_leaf_advance(z[0], r.ctx, &r.kps[1], r.cf, 1, &pm);
+    cJSON_Delete(prop);
+    close(z[0]); close(z[1]);
+    printf("  at epoch 0: LSP leaf advance rc=%d, LSP realloc rc=%d; client 1 "
+           "leaf advance rc=%d, PROPOSE handled=%d\n", lrc, rrc, crc, hrc);
+    TEST_ASSERT(lrc == FACTORY_ADVANCE_FROZEN, "LSP leaf advance refused (frozen)");
+    TEST_ASSERT(rrc == 0, "LSP realloc refused");
+    TEST_ASSERT(crc == FACTORY_ADVANCE_FROZEN && hrc == 0, "client refuses a leaf advance");
+
+    /* a leaf-advance request re-drives the identical root advance */
+    char before[65];
+    ex_txid_hex(lf->nodes[0].txid, before);
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    int lsp_mark2 = persist_load_root_advance_pending(&r.db, 0, NULL, NULL);
+    int cli_mark2 = persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL);
+    printf("  re-driven root advance: rc=%d clients %d/%d, epoch %u, frozen LSP %d "
+           "client %d, marks LSP %d client %d\n", rc, ok1, ok2,
+           lf->counter.current_epoch, factory_root_advance_frozen(lf),
+           factory_root_advance_frozen(r.cf), lsp_mark2, cli_mark2);
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "identical Tier B completed");
+    TEST_ASSERT(lf->counter.current_epoch == 1, "epoch 1");
+    TEST_ASSERT(!factory_root_advance_frozen(lf) && !factory_root_advance_frozen(r.cf),
+                "freeze lifted");
+    TEST_ASSERT(lsp_mark2 == 0 && cli_mark2 == 0, "marks cleared with the stored tree");
+
+    /* leaf operations resume */
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  leaf advance at epoch 1: rc=%d\n", rc);
+    TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 1");
+    TEST_ASSERT(rl_rig_restart_lsp(&r) && !factory_root_advance_frozen(&r.lsp->factory) &&
+                r.lsp->factory.counter.current_epoch == 1, "reload: epoch 1, not frozen");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}

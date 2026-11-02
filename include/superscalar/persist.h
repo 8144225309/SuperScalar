@@ -25,8 +25,8 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations.
-   43 adds tree_node_lstock and signed_state_reservations (persist.c, the v43
-   step).  Versions 40-42 are taken by changes on other branches; every one of
+   43 adds tree_node_lstock, signed_state_reservations and
+   root_advance_pending (persist.c, the v43 step).  Versions 40-42 are taken by changes on other branches; every one of
    those steps, and this one, creates its tables whenever they are missing, so
    the steps run correctly in any merge order.  When the branches are merged
    the version is the maximum of the bumps (43). */
@@ -327,6 +327,18 @@ int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
    was already recorded, PERSIST_RESERVE_CONFLICT when a different TX holds
    one of its positions (nothing is written), PERSIST_RESERVE_ERROR on any
    other failure.  Callers must not sign unless the result is OK. */
+/* A root advance (Tier B) to `epoch` whose signatures this side released
+   before storing it (see factory_t.root_advance_pending_epoch).  Set
+   outside a transaction (durable before the signatures leave); cleared, in
+   the transaction that stores the completed epoch, for epochs <= upto.
+   Load: 1 found, 0 none, -1 error. */
+int persist_set_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                     uint32_t epoch, int trigger_leaf);
+int persist_clear_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                       uint32_t upto_epoch);
+int persist_load_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                      uint32_t *epoch_out, int *trigger_out);
+
 #define PERSIST_RESERVE_ERROR    (-1)
 #define PERSIST_RESERVE_CONFLICT   0
 #define PERSIST_RESERVE_OK         1

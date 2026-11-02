@@ -4587,6 +4587,9 @@ int client_persist_exit_state(persist_t *db, const factory_t *f) {
     int own_txn = !persist_in_transaction(db);
     if (own_txn && !persist_begin(db)) return 0;
     int ok = persist_save_signed_tree_nodes(db, f, 0) >= 0;
+    /* a root advance completed in memory is stored with this tree */
+    if (ok && !factory_root_advance_frozen(f))
+        ok = persist_clear_root_advance_pending(db, 0, f->counter.current_epoch);
     for (size_t i = 0; ok && i < f->n_nodes; i++) {
         const factory_node_t *n = &f->nodes[i];
         if (!n->is_ps_leaf || !n->is_signed || n->signed_tx.len == 0) continue;
@@ -4672,8 +4675,9 @@ static int client_handle_state_advance_stateless(int fd,
         if (trigger_leaf_side < 0) {
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_tick_root(factory);
-                if (adv_rc == FACTORY_ADVANCE_REFUSED)
-                    return 0;  /* restored from the DB; factory.c logged it */
+                if (adv_rc == FACTORY_ADVANCE_REFUSED ||
+                    adv_rc == FACTORY_ADVANCE_FROZEN)
+                    return 0;  /* factory.c logged it */
                 if (adv_rc == -1) break;
                 if (adv_rc != 0) {
                     fprintf(stderr, "Client-stateless Tier B %u: root tick step %d "
@@ -4684,8 +4688,9 @@ static int client_handle_state_advance_stateless(int fd,
         } else {
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_advance_leaf_unsigned(factory, trigger_leaf_side);
-                if (adv_rc == FACTORY_ADVANCE_REFUSED)
-                    return 0;  /* restored from the DB; factory.c logged it */
+                if (adv_rc == FACTORY_ADVANCE_REFUSED ||
+                    adv_rc == FACTORY_ADVANCE_FROZEN)
+                    return 0;  /* factory.c logged it */
                 if (adv_rc == -1) break;
                 if (adv_rc != 1) {
                     fprintf(stderr, "Client-stateless Tier B %u: advance step %d "
@@ -5014,6 +5019,22 @@ static int client_handle_state_advance_stateless(int fd,
     /* INVARIANT: own state + poison secnonces zeroed by musig_create_partial_sig. */
     free(all_pn_flat_c);  /* all-signer nonce matrix no longer needed */
 
+    /* From here the LSP can complete the new epoch: mark it pending,
+       durably, so nothing more is signed at the old epoch until it is stored
+       as complete here (a restarted client reloads the old epoch). */
+    if (g_client_persist &&
+        !persist_set_root_advance_pending(g_client_persist, 0,
+                                          factory->counter.current_epoch,
+                                          trigger_leaf_side)) {
+        fprintf(stderr, "Client-stateless Tier B %u: could not record the pending "
+                "root advance; not signing\n", my_index);
+        for (size_t j = 0; j < n_affected; j++)
+            if (poison_prepared_c[j]) factory_session_reset_poison(factory, affected[j]);
+        return 0;
+    }
+    factory_set_root_advance_pending(factory, factory->counter.current_epoch,
+                                     trigger_leaf_side);
+
     /* Our partial sigs let the LSP complete every node we sign: reserve
        them first. */
     for (size_t k = 0; k < n_affected; k++) {
@@ -5115,6 +5136,9 @@ static int client_handle_state_advance_stateless(int fd,
 
     printf("Client-stateless Tier B %u: %zu affected nodes signed\n",
            my_index, n_affected);
+    /* complete; client_persist_exit_state clears the stored mark with the
+       new epoch's tree */
+    factory_clear_root_advance_pending(factory);
     return 1;
 }
 
