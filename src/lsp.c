@@ -2,6 +2,8 @@
 #include "superscalar/ceremony.h"
 #include "superscalar/lsps.h"
 #include "superscalar/persist.h"
+#include "superscalar/factory_recovery.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/sha256.h"
 #include "superscalar/crash_inject.h"
 #include <stdio.h>
@@ -1215,15 +1217,13 @@ int lsp_run_cooperative_close(lsp_t *lsp,
             }
         }
 
+        /* N-of-N: the close needs every client's partial signature (the
+           former "quorum met" branch was unreachable: min_clients is
+           n_clients, and aggregation fails with any signature missing). */
         if (close_psigs_received < lsp->n_clients) {
-            if (ceremony_has_quorum(&close_psig_cer)) {
-                fprintf(stderr, "LSP: %zu/%zu clients sent close psigs (quorum met)\n",
-                        close_psigs_received, lsp->n_clients);
-            } else {
-                fprintf(stderr, "LSP: only %zu/%zu clients sent close psigs (quorum requires %d)\n",
-                        close_psigs_received, lsp->n_clients, close_psig_cer.min_clients);
-                goto close_fail;
-            }
+            fprintf(stderr, "LSP: only %zu/%zu clients sent close psigs (all required)\n",
+                    close_psigs_received, lsp->n_clients);
+            goto close_fail;
         }
     }
 
@@ -1256,6 +1256,40 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         goto close_fail;
     }
 
+    /* Persist 'closing' and queue the signed close BEFORE CLOSE_DONE.  Once a
+       client holds the fully signed close it can publish it at any time, so
+       the LSP must never serve this factory again, even if its own broadcast
+       fails or it crashes: a restarted LSP sees 'closing', refuses to serve,
+       and the queued close is re-broadcast until it confirms. */
+    if (lsp->db) {
+        int durable = 0;
+        char *chex = malloc(close_tx_out->len * 2 + 1);
+        if (chex) {
+            hex_encode(close_tx_out->data, close_tx_out->len, chex);
+            int own_txn = !persist_in_transaction(lsp->db);
+            if (!own_txn || persist_begin(lsp->db)) {
+                durable = persist_queue_broadcast(lsp->db, "cooperative_close",
+                                                  chex, NULL) &&
+                          persist_set_factory_state(lsp->db, 0, "closing");
+                if (own_txn) {
+                    if (durable) durable = persist_commit(lsp->db);
+                    else         persist_rollback(lsp->db);
+                }
+            }
+            free(chex);
+        }
+        if (!durable) {
+            fprintf(stderr, "LSP: could not persist the signed cooperative close; "
+                    "not sending CLOSE_DONE\n");
+            goto close_fail;
+        }
+    }
+
+    /* From here on the clients get a close they can publish at will: stop
+       serving this factory (daemon loop, HTLC intake), even if a CLOSE_DONE
+       send below fails. */
+    lsp->closing = 1;
+
     /* Send CLOSE_DONE to all clients */
     {
         cJSON *done = wire_build_close_done(close_tx_out->data, close_tx_out->len);
@@ -1277,6 +1311,60 @@ close_fail:
         lsp_abort_ceremony(lsp, "cooperative close failed");
     tx_buf_free(&unsigned_tx);
     return 0;
+}
+
+int lsp_resume_closing_factory(persist_t *db, struct chain_backend *chain,
+                               uint32_t factory_id, int force_close,
+                               char *status, size_t status_cap) {
+    char scratch[8];
+    if (!status || status_cap == 0) { status = scratch; status_cap = sizeof(scratch); }
+    status[0] = '\0';
+    char fstate[16] = {0};
+    if (!db || !persist_get_factory_state(db, factory_id, fstate, sizeof(fstate)) ||
+        strcmp(fstate, "closing") != 0)
+        return LSP_CLOSING_NOT;
+
+    if (!chain) {
+        snprintf(status, status_cap, "factory %u is 'closing' (a signed cooperative "
+                 "close is out) and no chain backend is available; not serving it",
+                 factory_id);
+        return LSP_CLOSING_PENDING;
+    }
+
+    persist_service_queued_broadcasts(db, chain);
+    char qres[32] = {0};
+    int have = persist_get_queued_broadcast_result(db, "cooperative_close",
+                                                   qres, sizeof(qres));
+    if (have && strcmp(qres, "confirmed") == 0) {
+        persist_mark_factory_closed(db, factory_id);
+        snprintf(status, status_cap, "factory %u: the cooperative close confirmed; "
+                 "marked closed", factory_id);
+        return LSP_CLOSING_DONE;
+    }
+    int superseded = have && strcmp(qres, "input_spent") == 0;
+    const char *why = !have ? "no copy of the signed close is queued"
+                    : superseded ? "the funding output was spent by another "
+                                   "transaction (the factory tree?), so the close "
+                                   "can no longer confirm"
+                    : "the cooperative close is not confirmed yet";
+
+    if (!force_close) {
+        snprintf(status, status_cap, "factory %u is 'closing': %s; not serving it. %s",
+                 factory_id, why,
+                 (superseded || !have)
+                     ? "Publish the factory tree with --force-close-from-db."
+                     : "Run again to keep re-broadcasting the close, or publish "
+                       "the signed factory tree instead with --force-close-from-db.");
+        return LSP_CLOSING_PENDING;
+    }
+
+    factory_recovery_result_t res;
+    char fr[384] = {0};
+    int ok = factory_recovery_run_ex(db, chain, factory_id, 0, &res, fr, sizeof(fr));
+    snprintf(status, status_cap, "factory %u is 'closing': %s; published the signed "
+             "tree from the DB: %s%s", factory_id, why, fr,
+             !ok ? "" : res.settled ? "" : " - run again after the next block(s)");
+    return ok ? LSP_CLOSING_PENDING : LSP_CLOSING_FAILED;
 }
 
 int lsp_accept_bridge(lsp_t *lsp) {

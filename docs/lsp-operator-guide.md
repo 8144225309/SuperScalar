@@ -321,6 +321,26 @@ cannot be published; `status` says why), `status`, `broadcasts_made`,
 `n_in_mempool`, `n_waiting` (parent unpublished or a timelock not reached yet),
 `n_failed`, `settled` (every leaf's current TX is confirmed).
 
+### A cooperative close that does not confirm (`closing`)
+
+Before the LSP sends the signed cooperative close to the clients (CLOSE_DONE)
+it queues that close and marks the factory `closing`. From then on any client
+can publish the close, so the LSP stops serving the factory: the daemon loop
+stops and no HTLC is accepted.
+
+On every start with `--db`, a `closing` factory is not served. The LSP
+re-broadcasts the queued close and exits: with 0 once the close has confirmed
+(the factory is then marked `closed`), with 1 while it has not.
+
+The LSP does not fee-bump the close. If it never confirms (for example its
+fee is too low and it was evicted from mempools), start the LSP with
+`--db ... --force-close-from-db`. That publishes the signed factory tree from
+the DB (one pass per run, like `recoverfactory`; run it again after each
+block). The close and the tree both spend the funding output, so whichever
+confirms first wins. Once the tree's root has confirmed the close can no
+longer confirm; keep running `--force-close-from-db` until it reports the tree
+settled, and the factory is marked `closed`.
+
 ## 8. Standalone Watchtower
 
 For defense-in-depth, run `superscalar_watchtower` on a separate machine. It opens a secret-less `wt.db` of pre-signed response transactions (penalty / sweep / poison TXs, **no secrets and no signing keys**) and independently monitors the blockchain:

@@ -5487,6 +5487,14 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     mgr->entries[client_idx].last_message_time = time(NULL);
     mgr->entries[client_idx].offline_detected = 0;
 
+    /* A fully signed cooperative close is out (lsp_run_cooperative_close set
+       lsp->closing): any client can publish it, so no new payment is taken. */
+    if (lsp->closing && msg->msg_type == MSG_UPDATE_ADD_HTLC) {
+        fprintf(stderr, "LSP: refusing an HTLC from client %zu: the factory is "
+                "closing (a signed cooperative close is out)\n", client_idx);
+        return 0;
+    }
+
     switch (msg->msg_type) {
     case MSG_UPDATE_ADD_HTLC:
         return handle_add_htlc(mgr, lsp, client_idx, msg->json);
@@ -7077,6 +7085,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     while (!(*shutdown_flag)) {
+        if (lsp->closing) {
+            printf("LSP: a signed cooperative close is out; the daemon loop "
+                   "stops serving this factory\n");
+            break;
+        }
         /* Drain any connections queued during ceremonies */
         while (mgr->n_pending_reconnects > 0) {
             mgr->n_pending_reconnects--;
