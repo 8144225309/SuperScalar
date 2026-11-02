@@ -1427,6 +1427,7 @@ extern int test_regtest_penalty_with_htlcs(void);
 extern int test_regtest_multi_htlc_unilateral(void);
 extern int test_regtest_watchtower_mempool_detection(void);
 extern int test_regtest_watchtower_late_detection(void);
+extern int test_regtest_watchtower_breach_beyond_128(void);
 extern int test_regtest_fee_estimation_parsing(void);
 extern int test_regtest_ptlc_no_coop_close(void);
 extern int test_regtest_all_offline_recovery(void);
@@ -4076,6 +4077,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_multi_htlc_unilateral);
     RUN_TEST(test_regtest_watchtower_mempool_detection);
     RUN_TEST(test_regtest_watchtower_late_detection);
+    RUN_TEST(test_regtest_watchtower_breach_beyond_128);
     RUN_TEST(test_regtest_ptlc_no_coop_close);
     RUN_TEST(test_regtest_all_offline_recovery);
     RUN_TEST(test_regtest_tree_ordering);
