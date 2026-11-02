@@ -211,6 +211,19 @@ typedef struct {
        with its own seckey, instead of the N-of-N factory funding SPK. */
     unsigned char lsp_close_spk[34];
     size_t lsp_close_spk_len;       /* 34 when populated, 0 if unset */
+
+    /* Pending root advance (factory_t.root_advance_pending_epoch): the
+       freeze limit.  After freeze_max_blocks (0 = half the dying window, or
+       144 blocks without one) the LSP logs CRITICAL with the clients that
+       withheld their final psigs, and records the escalation (listfactories
+       shows it).  With freeze_force_close it then starts the factory's
+       force-close; off by default, because otherwise any one client could
+       push the whole factory on-chain just by withholding. */
+    uint32_t freeze_max_blocks;
+    int freeze_force_close;
+    int freeze_escalated;              /* escalated (in memory) */
+    uint32_t freeze_redrive_attempts;  /* re-drives actually started */
+    uint32_t freeze_last_redrive_height;
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -551,6 +564,12 @@ int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    advance.  NULL unless the LSP has stored that epoch as complete (no
    pending root advance of its own) and it is the current epoch. */
 cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch);
+
+/* Freeze limit check, called from the daemon loop each pass (and by the
+   re-drive).  Returns 0 nothing to do, 1 escalated now (CRITICAL logged),
+   2 escalated and the force-close was started. */
+int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  uint32_t height);
 
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).

@@ -339,6 +339,28 @@ int persist_clear_root_advance_pending(persist_t *p, uint32_t factory_id,
 int persist_load_root_advance_pending(persist_t *p, uint32_t factory_id,
                                       uint32_t *epoch_out, int *trigger_out);
 
+/* Bookkeeping of a pending root advance (LSP), kept with its mark (all reset
+   when a new epoch is marked): the clients whose final psigs did not arrive
+   (comma-separated participant indices), the height the freeze was first
+   seen at, the height of the last re-drive, and whether the freeze limit was
+   escalated.  Load returns 1 found, 0 none, -1 error. */
+typedef struct {
+    uint32_t epoch;
+    int trigger_leaf;
+    char withholders[256];
+    uint32_t since_height;
+    uint32_t last_redrive_height;
+    int escalated;
+} persist_root_advance_status_t;
+int persist_load_root_advance_status(persist_t *p, uint32_t factory_id,
+                                     persist_root_advance_status_t *out);
+int persist_set_root_advance_withholders(persist_t *p, uint32_t factory_id,
+                                         const char *csv);
+int persist_set_root_advance_heights(persist_t *p, uint32_t factory_id,
+                                     uint32_t since_height,
+                                     uint32_t last_redrive_height);
+int persist_set_root_advance_escalated(persist_t *p, uint32_t factory_id);
+
 /* The signed tree of the last completed root advance, for a client that
    signed it but did not store it (MSG_TREE_CATCHUP).  Saved in the
    transaction that stores the advance; only a tree with every node signed is

@@ -3429,3 +3429,93 @@ int test_reload_tree_catchup_after_crash(void) {
     ex_rig_free(&r);
     return 1;
 }
+
+/* A client withholds its final psigs for a root advance: the LSP records the
+   withholder, re-drives at most once per block, and after the freeze limit
+   logs CRITICAL and shows the escalation in listfactories.  The force-close
+   starts only with --freeze-force-close; without it nothing is broadcast. */
+int test_reload_freeze_limit_and_escalation(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_flim", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_flim2", 2), "second client");
+    alarm(600);
+    chain_backend_t cb;
+    mk_init(&cb, r.fund_txid);
+    g_mk.height = 100;
+    r.mgr->chain_be = &cb;
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    int rc = rl_advance2_ex(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    TEST_ASSERT(rc == 0 && dropped && factory_root_advance_frozen(&r.lsp->factory),
+                "root advance withheld; LSP frozen");
+    persist_root_advance_status_t st;
+    TEST_ASSERT(persist_load_root_advance_status(&r.db, 0, &st) == 1, "status");
+    printf("  withheld: mark epoch %u, withholders \"%s\"\n", st.epoch, st.withholders);
+    TEST_ASSERT(strcmp(st.withholders, "1") == 0, "client 1 recorded as withholding");
+
+    /* nobody answers now: a re-drive fails at once */
+    shutdown(r.sv[1], SHUT_RDWR);
+    shutdown(c2.sv[1], SHUT_RDWR);
+    g_mk.height = 101;
+    uint32_t a0 = r.mgr->freeze_redrive_attempts;
+    lsp_redrive_root_advance(r.mgr, r.lsp);
+    uint32_t a1 = r.mgr->freeze_redrive_attempts;
+    lsp_redrive_root_advance(r.mgr, r.lsp);
+    uint32_t a2 = r.mgr->freeze_redrive_attempts;
+    g_mk.height = 102;
+    lsp_redrive_root_advance(r.mgr, r.lsp);
+    uint32_t a3 = r.mgr->freeze_redrive_attempts;
+    printf("  re-drive attempts: height 101: %u, again at 101: %u, at 102: %u\n",
+           a1 - a0, a2 - a1, a3 - a2);
+    TEST_ASSERT(a1 - a0 == 1 && a2 - a1 == 0 && a3 - a2 == 1, "at most one re-drive per block");
+
+    /* the limit, force-close off */
+    r.mgr->freeze_max_blocks = 10;
+    TEST_ASSERT(persist_load_root_advance_status(&r.db, 0, &st) == 1, "status 2");
+    uint32_t since = st.since_height;
+    g_mk.height = (int)since + 5;
+    int sends0 = g_mk.n_send_calls;
+    int e1 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height);
+    g_mk.height = (int)since + 10;
+    int e2 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height);
+    int e3 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height + 1);
+    cJSON *lf = factory_recovery_list(&r.db, &cb);
+    cJSON *ra = NULL;
+    for (int i = 0; lf && i < cJSON_GetArraySize(lf); i++) {
+        cJSON *o = cJSON_GetArrayItem(lf, i);
+        if (cJSON_GetObjectItem(o, "root_advance_pending"))
+            ra = cJSON_GetObjectItem(o, "root_advance_pending");
+    }
+    int esc = ra && cJSON_IsTrue(cJSON_GetObjectItem(ra, "escalated"));
+    const cJSON *wh = ra ? cJSON_GetObjectItem(ra, "withholders") : NULL;
+    printf("  frozen since %u, limit 10: at +5 -> %d, at +10 -> %d, again -> %d; "
+           "listfactories escalated=%d withholders=%s; sends %d\n", since, e1, e2, e3,
+           esc, wh && cJSON_IsString(wh) ? wh->valuestring : "-",
+           g_mk.n_send_calls - sends0);
+    TEST_ASSERT(e1 == 0 && e2 == 1 && e3 == 0, "escalated once, at the limit");
+    TEST_ASSERT(esc && wh && strcmp(wh->valuestring, "1") == 0,
+                "listfactories shows the escalation and the withholder");
+    TEST_ASSERT(g_mk.n_send_calls == sends0, "flag off: nothing broadcast");
+    cJSON_Delete(lf);
+
+    /* the same with --freeze-force-close */
+    TEST_ASSERT(sqlite3_exec(r.db.db, "UPDATE root_advance_pending SET escalated=0",
+                             NULL, NULL, NULL) == SQLITE_OK, "reset escalation");
+    r.mgr->freeze_escalated = 0;
+    r.mgr->freeze_force_close = 1;
+    int e4 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height + 2);
+    printf("  with --freeze-force-close: -> %d, sends %d\n", e4,
+           g_mk.n_send_calls - sends0);
+    TEST_ASSERT(e4 == 2 && g_mk.n_send_calls > sends0, "flag on: force-close started");
+
+    r.mgr->chain_be = NULL;
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}

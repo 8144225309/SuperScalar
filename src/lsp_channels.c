@@ -1545,6 +1545,63 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    step the freeze allows); in memory after a failed ceremony it already has.
    The signed-state reservations make the identical TXs the only ones that
    can be signed.  Returns 1 when the root advance completed. */
+/* Current height from the chain backend, 0 if unknown. */
+static uint32_t lsp_chain_height(lsp_channel_mgr_t *mgr) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!cb && mgr->watchtower) cb = mgr->watchtower->chain;
+    if (!cb || !cb->get_block_height) return 0;
+    int h = cb->get_block_height(cb);
+    return h > 0 ? (uint32_t)h : 0;
+}
+
+int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  uint32_t height) {
+    if (!mgr || !lsp || height == 0) return 0;
+    factory_t *f = &lsp->factory;
+    if (!factory_root_advance_frozen(f)) {
+        mgr->freeze_escalated = 0;
+        return 0;
+    }
+    persist_t *db = (persist_t *)mgr->persist;
+    persist_root_advance_status_t st;
+    memset(&st, 0, sizeof(st));
+    if (db) persist_load_root_advance_status(db, 0, &st);
+    if (st.since_height == 0) {
+        /* first sight of this freeze with a known height */
+        if (db) persist_set_root_advance_heights(db, 0, height, st.last_redrive_height);
+        st.since_height = height;
+    }
+    if (st.escalated || mgr->freeze_escalated) {
+        mgr->freeze_escalated = 1;
+        return 0;
+    }
+    uint32_t limit = mgr->freeze_max_blocks;
+    if (limit == 0) limit = f->dying_blocks > 1 ? f->dying_blocks / 2 : 144;
+    if (height < st.since_height || height - st.since_height < limit) return 0;
+
+    uint32_t left = factory_blocks_until_expired(f, height);
+    fprintf(stderr, "LSP: CRITICAL - factory frozen for %u blocks (limit %u) on "
+            "a root advance to epoch %u that client(s) %s did not complete; "
+            "%u blocks to expiry.  Payments still settle and the distribution "
+            "TX pays everyone at the CLTV; %s\n",
+            height - st.since_height, limit, f->root_advance_pending_epoch,
+            st.withholders[0] ? st.withholders : "(unknown)", left,
+            mgr->freeze_force_close ? "starting the force-close (--freeze-force-close)"
+                                    : "force-close is left to the operator "
+                                      "(--freeze-force-close is off)");
+    mgr->freeze_escalated = 1;
+    if (db) persist_set_root_advance_escalated(db, 0);
+    if (!mgr->freeze_force_close) return 1;
+
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!cb && mgr->watchtower) cb = mgr->watchtower->chain;
+    char status[512] = {0};
+    int ok = factory_recovery_run(db, cb, 0, status, sizeof(status));
+    fprintf(stderr, "LSP: freeze force-close %s: %s\n",
+            ok ? "started" : "pass failed", status);
+    return 2;
+}
+
 cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch) {
     if (!mgr || !mgr->persist || !lsp) return NULL;
     persist_t *db = (persist_t *)mgr->persist;
@@ -1581,6 +1638,30 @@ int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     factory_t *f = &lsp->factory;
     if (!factory_root_advance_frozen(f)) return 0;
     int trig = f->root_advance_pending_trigger;
+    /* At most one re-drive per block: a client that keeps withholding cannot
+       make the LSP spin. */
+    uint32_t h = lsp_chain_height(mgr);
+    if (h) {
+        lsp_check_root_advance_freeze(mgr, lsp, h);
+        persist_root_advance_status_t st;
+        uint32_t last = mgr->freeze_last_redrive_height;
+        uint32_t since = 0;
+        if (mgr->persist &&
+            persist_load_root_advance_status((persist_t *)mgr->persist, 0, &st) == 1) {
+            if (st.last_redrive_height > last) last = st.last_redrive_height;
+            since = st.since_height;
+        }
+        if (last == h) {
+            fprintf(stderr, "LSP: the pending root advance was already re-driven "
+                    "at height %u; next attempt at the next block\n", h);
+            return 0;
+        }
+        mgr->freeze_last_redrive_height = h;
+        if (mgr->persist)
+            persist_set_root_advance_heights((persist_t *)mgr->persist, 0,
+                                             since ? since : h, h);
+    }
+    mgr->freeze_redrive_attempts++;
     printf("LSP: re-driving the pending root advance to epoch %u (trigger %d)\n",
            f->root_advance_pending_epoch, trig);
     if (f->counter.current_epoch < f->root_advance_pending_epoch) {
@@ -2868,9 +2949,14 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     }
     cJSON_Delete(response);
 
-    /* Step 8: Collect CLIENT_FINAL_PSIGS from each client. */
+    /* Step 8: Collect CLIENT_FINAL_PSIGS from each client.  A client that
+       does not deliver is recorded as withholding; the others are still
+       read, so every withholder of this root advance is known. */
+    char withheld_csv[256] = {0};
+    int n_withheld = 0;
     for (size_t c = 0; c < lsp->n_clients; c++) {
         wire_msg_t pmsg;
+        memset(&pmsg, 0, sizeof(pmsg));
         if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg,
                                           WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC) ||
             pmsg.msg_type != MSG_STATE_ADV_CLIENT_FINAL_PSIGS) {
@@ -2878,7 +2964,11 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 "LSP-stateless Tier B: expected CLIENT_FINAL_PSIGS from client %zu, "
                 "got 0x%02x\n", c, pmsg.msg_type);
             if (pmsg.json) cJSON_Delete(pmsg.json);
-            return 0;
+            size_t wl = strlen(withheld_csv);
+            snprintf(withheld_csv + wl, sizeof(withheld_csv) - wl, "%s%zu",
+                     n_withheld ? "," : "", c + 1);
+            n_withheld++;
+            continue;
         }
         unsigned char this_client_psigs[FACTORY_MAX_NODES][32];
         unsigned char this_client_poison_psigs[FACTORY_MAX_NODES][32];
@@ -2931,6 +3021,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 }
             }
         }
+    }
+
+    if (n_withheld) {
+        fprintf(stderr, "LSP-stateless Tier B: root advance to epoch %u stopped; "
+                "final psigs withheld by client(s) %s\n",
+                f->counter.current_epoch, withheld_csv);
+        if (mgr->persist)
+            persist_set_root_advance_withholders((persist_t *)mgr->persist, 0,
+                                                 withheld_csv);
+        return 0;
     }
 
     lsp_crash_checkpoint("state_advance_signed");
@@ -8087,6 +8187,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     }
                     mgr->last_rebalance_block = (uint32_t)rh;
                 }
+            }
+
+            /* Pending root advance: freeze limit / escalation */
+            if (factory_root_advance_frozen(&lsp->factory)) {
+                uint32_t fh = lsp_chain_height(mgr);
+                if (fh) lsp_check_root_advance_freeze(mgr, lsp, fh);
             }
 
             /* Check bridge HTLC timeouts */

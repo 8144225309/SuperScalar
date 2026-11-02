@@ -497,7 +497,11 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS root_advance_pending ("             \
     "  factory_id   INTEGER PRIMARY KEY,"                           \
     "  epoch        INTEGER NOT NULL,"                              \
-    "  trigger_leaf INTEGER NOT NULL"                               \
+    "  trigger_leaf INTEGER NOT NULL,"                              \
+    "  withholders  TEXT NOT NULL DEFAULT '',"                      \
+    "  since_height INTEGER NOT NULL DEFAULT 0,"                    \
+    "  last_redrive_height INTEGER NOT NULL DEFAULT 0,"             \
+    "  escalated    INTEGER NOT NULL DEFAULT 0"                     \
     ");"                                                            \
     "CREATE TABLE IF NOT EXISTS root_advance_trees ("               \
     "  factory_id    INTEGER NOT NULL,"                             \
@@ -506,6 +510,24 @@ static const char *SCHEMA_SQL =
     "  signed_tx_hex TEXT NOT NULL,"                                \
     "  PRIMARY KEY (factory_id, node_index)"                        \
     ");"
+
+/* Add a column to a table if it does not have it yet. */
+static int persist_ensure_column(sqlite3 *db, const char *table,
+                                 const char *col, const char *decl) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int have = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, col) == 0) { have = 1; break; }
+    }
+    sqlite3_finalize(st);
+    if (have) return 1;
+    snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;", table, col, decl);
+    return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+}
 
 int persist_open(persist_t *p, const char *path) {
     if (!p) return 0;
@@ -1460,7 +1482,8 @@ int persist_open(persist_t *p, const char *path) {
 
     /* v43: tree_node_lstock, signed_state_reservations and
        root_advance_pending, created whenever missing (see
-       PERSIST_V43_TABLES_SQL). */
+       PERSIST_V43_TABLES_SQL); columns added to root_advance_pending after
+       it was first created are added whenever missing too. */
     {
         char *merr43 = NULL;
         if (sqlite3_exec(p->db, PERSIST_V43_TABLES_SQL, NULL, NULL, &merr43) != SQLITE_OK) {
@@ -1470,6 +1493,22 @@ int persist_open(persist_t *p, const char *path) {
             sqlite3_close(p->db);
             p->db = NULL;
             return 0;
+        }
+        static const char *rap_cols[][2] = {
+            { "withholders", "TEXT NOT NULL DEFAULT ''" },
+            { "since_height", "INTEGER NOT NULL DEFAULT 0" },
+            { "last_redrive_height", "INTEGER NOT NULL DEFAULT 0" },
+            { "escalated", "INTEGER NOT NULL DEFAULT 0" },
+        };
+        for (size_t c = 0; c < sizeof(rap_cols) / sizeof(rap_cols[0]); c++) {
+            if (!persist_ensure_column(p->db, "root_advance_pending",
+                                       rap_cols[c][0], rap_cols[c][1])) {
+                fprintf(stderr, "persist_open: migration v43 (column %s) failed\n",
+                        rap_cols[c][0]);
+                sqlite3_close(p->db);
+                p->db = NULL;
+                return 0;
+            }
         }
     }
 
@@ -2694,8 +2733,16 @@ int persist_set_root_advance_pending(persist_t *p, uint32_t factory_id,
         return 0;
     }
     sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(p->db, "INSERT OR REPLACE INTO root_advance_pending "
-            "(factory_id, epoch, trigger_leaf) VALUES (?, ?, ?);",
+    /* Re-marking the same epoch (a re-drive) keeps its bookkeeping; a new
+       epoch starts afresh. */
+    if (sqlite3_prepare_v2(p->db, "INSERT INTO root_advance_pending "
+            "(factory_id, epoch, trigger_leaf) VALUES (?, ?, ?) "
+            "ON CONFLICT(factory_id) DO UPDATE SET "
+            "withholders = CASE WHEN epoch = excluded.epoch THEN withholders ELSE '' END, "
+            "since_height = CASE WHEN epoch = excluded.epoch THEN since_height ELSE 0 END, "
+            "last_redrive_height = CASE WHEN epoch = excluded.epoch THEN last_redrive_height ELSE 0 END, "
+            "escalated = CASE WHEN epoch = excluded.epoch THEN escalated ELSE 0 END, "
+            "trigger_leaf = excluded.trigger_leaf, epoch = excluded.epoch;",
             -1, &st, NULL) != SQLITE_OK)
         return 0;
     sqlite3_bind_int(st, 1, (int)factory_id);
@@ -2738,6 +2785,67 @@ int persist_load_root_advance_pending(persist_t *p, uint32_t factory_id,
     }
     sqlite3_finalize(st);
     return rc;
+}
+
+int persist_load_root_advance_status(persist_t *p, uint32_t factory_id,
+                                     persist_root_advance_status_t *out) {
+    if (!p || !p->db || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT epoch, trigger_leaf, withholders, "
+            "since_height, last_redrive_height, escalated FROM root_advance_pending "
+            "WHERE factory_id=?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    int rc = 0, step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        out->epoch = (uint32_t)sqlite3_column_int64(st, 0);
+        out->trigger_leaf = sqlite3_column_int(st, 1);
+        const char *w = (const char *)sqlite3_column_text(st, 2);
+        if (w) snprintf(out->withholders, sizeof(out->withholders), "%s", w);
+        out->since_height = (uint32_t)sqlite3_column_int64(st, 3);
+        out->last_redrive_height = (uint32_t)sqlite3_column_int64(st, 4);
+        out->escalated = sqlite3_column_int(st, 5);
+        rc = 1;
+    } else if (step != SQLITE_DONE) {
+        rc = -1;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+static int rap_update(persist_t *p, const char *sql, uint32_t factory_id,
+                      const char *text, int64_t a, int64_t b) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int k = 1;
+    if (text) sqlite3_bind_text(st, k++, text, -1, SQLITE_TRANSIENT);
+    if (a >= 0) sqlite3_bind_int64(st, k++, a);
+    if (b >= 0) sqlite3_bind_int64(st, k++, b);
+    sqlite3_bind_int(st, k, (int)factory_id);
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_set_root_advance_withholders(persist_t *p, uint32_t factory_id,
+                                         const char *csv) {
+    return rap_update(p, "UPDATE root_advance_pending SET withholders=? "
+                      "WHERE factory_id=?;", factory_id, csv ? csv : "", -1, -1);
+}
+
+int persist_set_root_advance_heights(persist_t *p, uint32_t factory_id,
+                                     uint32_t since_height,
+                                     uint32_t last_redrive_height) {
+    return rap_update(p, "UPDATE root_advance_pending SET since_height=?, "
+                      "last_redrive_height=? WHERE factory_id=?;", factory_id,
+                      NULL, (int64_t)since_height, (int64_t)last_redrive_height);
+}
+
+int persist_set_root_advance_escalated(persist_t *p, uint32_t factory_id) {
+    return rap_update(p, "UPDATE root_advance_pending SET escalated=1 "
+                      "WHERE factory_id=?;", factory_id, NULL, -1, -1);
 }
 
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
