@@ -296,6 +296,15 @@ int client_run_reconnect(secp256k1_context *ctx,
         memset(sig64, 0, 64);
     }
 
+    /* 7c. Attach the DB, under the same channel id as the first run (the
+       daemon's channel callback attaches it only on that first run).
+       Without it, revocation secrets and per-commitment points the LSP
+       sends after a reconnect or restart are never written to
+       revocation_secrets / the remote PCP table, which the standalone
+       watchtower reads.  Attached after the restore above, so restoring
+       writes nothing back. */
+    channel_set_persist(&channel, db, client_idx);
+
     /* 8. Nonce exchange — LSP sends CHANNEL_NONCES before RECONNECT_ACK */
     /* Receive LSP's pubnonces */
     {

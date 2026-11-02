@@ -3745,6 +3745,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_dw_state_save_writes_current_state);
     extern int test_restart_dw_counter_many_leaves_round_trip(void);
     RUN_TEST(test_restart_dw_counter_many_leaves_round_trip);
+    extern int test_restart_client_reconnect_attaches_db(void);
+    RUN_TEST(test_restart_client_reconnect_attaches_db);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

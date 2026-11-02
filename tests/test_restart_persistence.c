@@ -10,11 +10,15 @@
 #include "superscalar/wire.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
+#include "superscalar/client.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -750,3 +754,167 @@ int test_restart_dw_counter_many_leaves_round_trip(void) {
     return 1;
 }
 
+/* ---- A client reconnect attaches the DB ---- */
+
+#define RS_CLIENT_IDX 1   /* client 2: a channel id other than 0 */
+#define RS_CLIENT_CN  3
+
+/* The LSP side of a reconnect, in a child process: accept, noise
+   handshake, MSG_RECONNECT, CHANNEL_NONCES both ways, RECONNECT_ACK, then
+   wait for the client to hang up.  The exit code says where it stopped. */
+static void rs_fake_lsp(int listen_fd) {
+    alarm(30);
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    int fd = wire_accept(listen_fd);
+    if (fd < 0) _exit(2);
+    if (!wire_noise_handshake_responder(fd, ctx)) _exit(3);
+    wire_msg_t m;
+    if (!wire_recv(fd, &m) || m.msg_type != MSG_RECONNECT) _exit(4);
+    cJSON_Delete(m.json);
+
+    /* Real pubnonces, from a throwaway channel's pool. */
+    secp256k1_pubkey lpk, cpk;
+    if (!secp256k1_ec_pubkey_create(ctx, &lpk, rs_seckeys[0]) ||
+        !secp256k1_ec_pubkey_create(ctx, &cpk, rs_seckeys[RS_CLIENT_IDX + 1]))
+        _exit(5);
+    unsigned char txid[32] = {0}, spk[34] = {0};
+    channel_t nch;
+    if (!channel_init(&nch, ctx, rs_seckeys[0], &lpk, &cpk, txid, 0, 100000,
+                      spk, sizeof(spk), 50000, 50000, CHANNEL_DEFAULT_CSV_DELAY) ||
+        !channel_init_nonce_pool(&nch, 4))
+        _exit(6);
+    size_t n = nch.local_nonce_pool.count;
+    unsigned char (*pn)[66] = calloc(n, 66);
+    if (!pn) _exit(6);
+    for (size_t i = 0; i < n; i++)
+        musig_pubnonce_serialize(ctx, pn[i], &nch.local_nonce_pool.nonces[i].pubnonce);
+    cJSON *nm = wire_build_channel_nonces(RS_CLIENT_IDX,
+                                          (const unsigned char (*)[66])pn, n);
+    if (!wire_send(fd, MSG_CHANNEL_NONCES, nm)) _exit(7);
+    cJSON_Delete(nm);
+    if (!wire_recv(fd, &m) || m.msg_type != MSG_CHANNEL_NONCES) _exit(8);
+    cJSON_Delete(m.json);
+
+    cJSON *ack = wire_build_reconnect_ack(RS_CLIENT_IDX, 45000000, 40000000,
+                                          RS_CLIENT_CN);
+    if (!wire_send(fd, MSG_RECONNECT_ACK, ack)) _exit(9);
+    cJSON_Delete(ack);
+    while (wire_recv(fd, &m))
+        if (m.json) cJSON_Delete(m.json);
+    _exit(0);
+}
+
+typedef struct {
+    int called;
+    void *persist_db;
+    uint32_t persist_channel_id;
+    int revocation_ok;
+} rs_client_cb_t;
+
+/* Stands in for the daemon's channel callback on a reconnect: records how
+   the restored channel is attached, then receives the LSP's revocation of
+   commitment RS_CLIENT_CN - 1 (its PCP, then the secret). */
+static int rs_client_cb(int fd, channel_t *ch, uint32_t my_index,
+                        secp256k1_context *ctx, const secp256k1_keypair *kp,
+                        factory_t *f, size_t n_participants, void *ud) {
+    (void)fd; (void)my_index; (void)kp; (void)f; (void)n_participants;
+    rs_client_cb_t *c = ud;
+    c->called = 1;
+    c->persist_db = ch->persist_db;
+    c->persist_channel_id = ch->persist_channel_id;
+    unsigned char secret[32];
+    memset(secret, 0x5a, sizeof(secret));
+    secp256k1_pubkey pcp;
+    if (secp256k1_ec_pubkey_create(ctx, &pcp, secret)) {
+        channel_set_remote_pcp(ch, RS_CLIENT_CN - 1, &pcp);
+        c->revocation_ok = channel_receive_revocation_flat(ch, RS_CLIENT_CN - 1,
+                                                           secret);
+    }
+    return 2;  /* handled; client_run_reconnect returns 1 */
+}
+
+/* The daemon attaches the client's DB to its channel only on the first
+   run; client_run_reconnect rebuilt the channel without it, so after any
+   reconnect or client restart the LSP's revocation secrets were no longer
+   written to revocation_secrets (the standalone watchtower's source).
+   Reconnect from a client DB to a fake LSP and check that a revocation
+   received afterwards reaches the DB, under the client's channel id. */
+int test_restart_client_reconnect_attaches_db(void) {
+    extern factory_t *g_client_active_factory;
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");  /* for the factory and keys */
+
+    /* The client DB as the client's first run left it. */
+    persist_t cdb;
+    TEST_ASSERT(persist_open(&cdb, NULL), "client db");
+    const uint32_t my_index = RS_CLIENT_IDX + 1;
+    secp256k1_keypair kp;
+    TEST_ASSERT(secp256k1_keypair_create(fx.ctx, &kp, rs_seckeys[my_index]),
+                "client keypair");
+    secp256k1_pubkey lsp_bp[4];
+    unsigned char s[32], csec[4][32];
+    for (int i = 0; i < 4; i++) {
+        memset(s, 0x70 + i, sizeof(s));
+        TEST_ASSERT(secp256k1_ec_pubkey_create(fx.ctx, &lsp_bp[i], s),
+                    "LSP basepoint");
+        memset(csec[i], 0x80 + i, sizeof(csec[i]));
+    }
+    channel_t cch;
+    TEST_ASSERT(client_init_channel(&cch, fx.ctx, fx.f, &kp, my_index,
+                                    &lsp_bp[0], &lsp_bp[1], &lsp_bp[2], &lsp_bp[3],
+                                    csec[0], csec[1], csec[2], csec[3], NULL),
+                "client channel");
+    TEST_ASSERT(persist_begin(&cdb), "begin");
+    TEST_ASSERT(persist_save_factory(&cdb, fx.f, fx.ctx, 0) &&
+                persist_save_tree_nodes(&cdb, fx.f, 0), "save factory");
+    TEST_ASSERT(persist_save_channel(&cdb, &cch, 0, RS_CLIENT_IDX), "save channel");
+    TEST_ASSERT(persist_save_basepoints(&cdb, RS_CLIENT_IDX, &cch), "save basepoints");
+    TEST_ASSERT(persist_update_channel_balance(&cdb, RS_CLIENT_IDX, 40000, 45000,
+                                               RS_CLIENT_CN), "save balance");
+    TEST_ASSERT(persist_commit(&cdb), "commit");
+    channel_cleanup(&cch);
+
+    int lfd = wire_listen("127.0.0.1", 0);
+    TEST_ASSERT(lfd >= 0, "listen");
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof(sa);
+    TEST_ASSERT(getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0, "port");
+    fflush(stdout);
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) rs_fake_lsp(lfd);
+    close(lfd);
+
+    rs_client_cb_t cb = { 0, NULL, 0, 0 };
+    int ok = client_run_reconnect(fx.ctx, &kp, "127.0.0.1", ntohs(sa.sin_port),
+                                  &cdb, rs_client_cb, &cb);
+    g_client_active_factory = NULL;  /* client_run_reconnect freed it */
+    int status = 0;
+    TEST_ASSERT(waitpid(pid, &status, 0) == pid, "wait for the fake LSP");
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "fake LSP ran the whole reconnect");
+    TEST_ASSERT(ok, "client_run_reconnect");
+    TEST_ASSERT(cb.called, "channel callback ran");
+    TEST_ASSERT(cb.persist_db == &cdb, "restored channel attached to the DB");
+    TEST_ASSERT_EQ(cb.persist_channel_id, RS_CLIENT_IDX,
+                   "under the client's channel id, as on the first run");
+    TEST_ASSERT(cb.revocation_ok, "revocation accepted");
+
+    unsigned char secrets[16][32], want[32];
+    uint8_t valid[16];
+    size_t n_rev = 0;
+    memset(want, 0x5a, sizeof(want));
+    TEST_ASSERT(persist_load_revocations_flat(&cdb, RS_CLIENT_IDX, secrets, valid,
+                                              16, &n_rev), "load revocations");
+    TEST_ASSERT(valid[RS_CLIENT_CN - 1], "revocation secret written after the reconnect");
+    TEST_ASSERT(memcmp(secrets[RS_CLIENT_CN - 1], want, 32) == 0,
+                "persisted secret matches");
+    unsigned char pcp_ser[33];
+    TEST_ASSERT(persist_load_remote_pcp(&cdb, RS_CLIENT_IDX, RS_CLIENT_CN - 1,
+                                        pcp_ser), "remote PCP written after the reconnect");
+
+    persist_close(&cdb);
+    rs_teardown(&fx);
+    return 1;
+}
