@@ -890,8 +890,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     if (cbd && cbd->db && !cbd->saved_initial) {
         if (persist_begin(cbd->db)) {
             /* Factory, channel, basepoints, tree, local secrets and the
-               LSP's first points; also attaches the DB to the channel. */
-            if (client_persist_initial_state(cbd->db, factory, ch, ctx)) {
+               LSP's first points; also attaches the DB to the channel.  The
+               exit-path state (full signed tree + PS chain[0]) is written too,
+               so a client that force-closes before any advance can publish it. */
+            if (client_persist_initial_state(cbd->db, factory, ch, ctx) &&
+                client_persist_exit_state(cbd->db, factory)) {
                 /* #313 self-custody: persist the INITIAL commitment here too, so a
                    funded-but-never-transacted channel stays force-closeable when the
                    LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
@@ -1957,7 +1960,8 @@ handle_message:
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, CLIENT_DB_CHANNEL_ID) &&
                         persist_save_basepoints(cbd->db, CLIENT_DB_CHANNEL_ID, ch) &&
-                        persist_save_tree_nodes(cbd->db, factory, 0)) {
+                        persist_save_tree_nodes(cbd->db, factory, 0) &&
+                        client_persist_exit_state(cbd->db, factory)) {
                         /* Save signed distribution TX if available */
                         if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
                             persist_save_distribution_tx(cbd->db, 0,
@@ -2029,8 +2033,11 @@ handle_message:
                        my_index, leaf_side);
                 /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
                    recovers the CURRENT leaf state, not the last-rotation snapshot.
-                   The factory already holds the advanced tx from the PROPOSE ceremony. */
-                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
+                   The factory already holds the advanced tx from the PROPOSE ceremony.
+                   Exit-path persistence: signed nodes only (a stored signature is
+                   never wiped) plus the PS chain entry, so the self-exit can
+                   publish chain[0..N]. */
+                if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory))
                     fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
                             "leaf advance failed\n", my_index);
             }
@@ -2045,6 +2052,9 @@ handle_message:
             if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
+            } else if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory)) {
+                fprintf(stderr, "Client %u: WARN — exit state persist after "
+                        "realloc failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2060,6 +2070,9 @@ handle_message:
             if (!client_handle_state_advance(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: state advance failed\n", my_index);
+            } else if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory)) {
+                fprintf(stderr, "Client %u: WARN — exit state persist after "
+                        "state advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2076,6 +2089,9 @@ handle_message:
             if (!client_handle_subfactory_advance(fd, ctx, keypair, factory,
                                                     my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: sub-factory advance failed\n", my_index);
+            } else if (cbd && cbd->db && !client_persist_exit_state(cbd->db, factory)) {
+                fprintf(stderr, "Client %u: WARN — exit state persist after "
+                        "sub-factory advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;

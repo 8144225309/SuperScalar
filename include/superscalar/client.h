@@ -213,6 +213,17 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    is the only thing preventing an LSP double-spend. When no persist is
    set, the defense is skipped (tests / in-process usage only — real
    clients must call client_set_persist at startup). */
+/* Exit-path persistence for the client's own unilateral exit
+   (factory_recovery_run on the client DB).  Writes every node's CURRENT
+   signed TX to tree_nodes (unsigned nodes are skipped, so a stored signature
+   is never wiped), the current tip of each advanced PS leaf / sub-factory
+   chain to ps_leaf_chains / ps_subfactory_chains, and chain[0] of each PS
+   node to ps_initial_signed_states when none is stored for the current
+   epoch.  Call after factory creation / rotation and after every advance;
+   each advance adds its own chain entry, so the DB holds chain[0..N].
+   Joins the caller's transaction if one is open.  Returns 1 on success. */
+int client_persist_exit_state(persist_t *db, const factory_t *f);
+
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory,

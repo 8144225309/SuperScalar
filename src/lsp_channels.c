@@ -140,6 +140,120 @@ void client_to_leaf(size_t client_idx, const factory_t *factory,
     }
 }
 
+/* Exit-path persistence shared by the advance ceremonies.  factory_recovery_run
+   publishes what is in the DB, so every advance must write its NEW signed
+   state before DONE goes out and before the superseded state's L-stock
+   secret is revealed: once that secret is out, publishing the old state
+   would let the counterparty poison the LSP's L-stock.  The later
+   "Step 10/11" writes of the same chain row are left in place (INSERT OR
+   REPLACE, so the second write is a no-op).  Return 1 when durable (or when
+   running without a DB), 0 on a write failure. */
+/* Record whether the state just written (or not) is in the DB, for the
+   on-request reveal check.  On success every state below the current
+   L-stock counter is superseded on disk too.  On failure the DB still holds
+   the state from before this advance (counter - 1), so the cap never rises
+   above it until a later write succeeds. */
+static void lsp_note_l_stock_durable(factory_node_t *node, int durable) {
+    if (durable) {
+        node->l_stock_durable_counter = node->l_stock_state_counter;
+        node->l_stock_durable_set = 1;
+    } else if (!node->l_stock_durable_set) {
+        node->l_stock_durable_counter = node->l_stock_state_counter > 0
+                                        ? node->l_stock_state_counter - 1u : 0u;
+        node->l_stock_durable_set = 1;
+    }
+}
+
+/* Persist the advanced state of one leaf node (DW leaf, realloc'd leaf, or PS
+   chain tip) before DONE.  The tree row, the PS chain entry and the DW counter
+   are written in ONE transaction, so a crash can never leave the tree row at
+   state k with the DW counter at k-1: a restart reads either the new pair or
+   the pre-advance pair, never a split one. */
+static int lsp_persist_advanced_leaf(lsp_channel_mgr_t *mgr, factory_t *f,
+                                     size_t node_idx, int save_chain_entry,
+                                     int save_dw_counter,
+                                     const unsigned char *poison,
+                                     size_t poison_len) {
+    if (!f || node_idx >= f->n_nodes) return 1;
+    if (!mgr || !mgr->persist) {
+        lsp_note_l_stock_durable(&f->nodes[node_idx], 1);
+        return 1;
+    }
+    persist_t *db = (persist_t *)mgr->persist;
+    factory_node_t *node = &f->nodes[node_idx];
+    int own_txn = !persist_in_transaction(db);
+    if (own_txn && !persist_begin(db)) own_txn = 0;
+    int ok = 1;
+    if (save_chain_entry && node->is_ps_leaf && node->ps_chain_len > 0) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char txid_display[32];
+        memcpy(txid_display, node->txid, 32);
+        reverse_bytes(txid_display, 32);
+        ok = persist_save_ps_chain_entry(db, 0, (uint32_t)node_idx,
+                node->ps_chain_len - 1, f->counter.current_epoch, txid_display,
+                node->signed_tx.data, node->signed_tx.len,
+                node->outputs[0].amount_sats, poison, poison_len);
+    }
+    if (ok) ok = persist_save_tree_node(db, f, 0, node_idx);
+    /* Same transaction as the tree row: the counter the restart reads can
+       never be behind the tree row it goes with. */
+    if (ok && save_dw_counter) ok = persist_save_factory_dw_state(db, 0, f);
+    if (own_txn) {
+        if (ok) ok = persist_commit(db);
+        else    persist_rollback(db);
+    }
+    if (!ok)
+        fprintf(stderr, "LSP: ERROR - could not persist the advanced state of "
+                "node %zu; a force-close from the DB would publish a superseded state\n", node_idx);
+    lsp_note_l_stock_durable(node, ok);
+    return ok;
+}
+
+static int lsp_persist_advanced_subfactory(lsp_channel_mgr_t *mgr, factory_t *f,
+                                           size_t sub_node_i, int poison_ok) {
+    if (!f || sub_node_i >= f->n_nodes) return 1;
+    factory_node_t *sub = &f->nodes[sub_node_i];
+    if (!mgr || !mgr->persist || sub->ps_chain_len <= 0 || sub->n_outputs < 1) {
+        lsp_note_l_stock_durable(sub, 1);
+        return 1;
+    }
+    persist_t *db = (persist_t *)mgr->persist;
+    extern void reverse_bytes(unsigned char *, size_t);
+    unsigned char txid_display[32];
+    memcpy(txid_display, sub->txid, 32);
+    reverse_bytes(txid_display, 32);
+    size_t sstock_vout = sub->n_outputs - 1;
+    uint64_t chan_amounts[16] = {0};
+    int n_chans = (int)sstock_vout;
+    if (n_chans > 16) n_chans = 16;
+    for (int ci = 0; ci < n_chans; ci++)
+        chan_amounts[ci] = sub->outputs[ci].amount_sats;
+    const unsigned char *poison_bytes = NULL;
+    size_t poison_bytes_len = 0;
+    if (poison_ok && sub->poison_is_signed && sub->poison_signed_tx.len > 0) {
+        poison_bytes     = sub->poison_signed_tx.data;
+        poison_bytes_len = sub->poison_signed_tx.len;
+    }
+    int own_txn = !persist_in_transaction(db);
+    if (own_txn && !persist_begin(db)) own_txn = 0;
+    int ok = persist_save_subfactory_chain_entry(db, 0, (uint32_t)sub_node_i,
+                sub->ps_chain_len - 1, f->counter.current_epoch, txid_display,
+                sub->signed_tx.data, sub->signed_tx.len,
+                sub->outputs[sstock_vout].amount_sats,
+                chan_amounts, n_chans, poison_bytes, poison_bytes_len);
+    if (ok) ok = persist_save_tree_node(db, f, 0, sub_node_i);
+    if (own_txn) {
+        if (ok) ok = persist_commit(db);
+        else    persist_rollback(db);
+    }
+    if (!ok)
+        fprintf(stderr, "LSP: ERROR - could not persist the advanced state of "
+                "sub-factory node %zu; a force-close from the DB would publish a superseded state\n",
+                sub_node_i);
+    lsp_note_l_stock_durable(sub, ok);
+    return ok;
+}
+
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
                        const factory_t *factory,
@@ -1854,6 +1968,16 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
+    /* Exit-path persistence: the new signed leaf state (and, for a PS leaf,
+       its chain entry) is written now, before DONE and before the reveal
+       below, so a force-close from the DB publishes this state, never the
+       superseded one. */
+    int adv_durable = lsp_persist_advanced_leaf(mgr, f, node_idx, 1, 1,
+        (leaf_poison_prepared && node->poison_is_signed &&
+         node->poison_signed_tx.len > 0) ? node->poison_signed_tx.data : NULL,
+        (leaf_poison_prepared && node->poison_is_signed &&
+         node->poison_signed_tx.len > 0) ? node->poison_signed_tx.len : 0);
+
     /* Phase 1d.2: poison TX ceremony DONE.  Same atomic-signer flow as
        state TX, with optional poison fields in CLIENT_PUBNONCE,
        LSP_RESPONSE, and FINAL.  lsp_poison_secnonce zeroed by
@@ -2002,7 +2126,12 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        that stale state — closing Scenario B in the live protocol.  Gated on hashlock +
        a poison having been co-signed; the secret is re-derived from the seed (the poison
        session was already reset above). */
-    if (f->use_hashlock_poison && leaf_poison_prepared && have_old_l_hash) {
+    if (!adv_durable && f->use_hashlock_poison && leaf_poison_prepared &&
+        have_old_l_hash)
+        fprintf(stderr, "LSP-stateless: NOT revealing the superseded L-stock "
+                "secret for node %zu: the new state is not persisted\n", node_idx);
+    if (adv_durable && f->use_hashlock_poison && leaf_poison_prepared &&
+        have_old_l_hash) {
         uint32_t old_counter = (f->nodes[node_idx].l_stock_state_counter > 0)
                                ? f->nodes[node_idx].l_stock_state_counter - 1u : 0u;
         unsigned char reveal_secret[1][32];
@@ -2022,27 +2151,24 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     lsp_crash_checkpoint("leaf_advance_finalize_partial");
 
-    /* Step 11: persist leaf state (same shape as legacy path). */
-    if (mgr->persist) {
-        if (node->is_ps_leaf) {
-            extern void reverse_bytes(unsigned char *, size_t);
-            unsigned char txid_display[32];
-            memcpy(txid_display, node->txid, 32);
-            reverse_bytes(txid_display, 32);
-            persist_save_ps_chain_entry(
-                (persist_t *)mgr->persist, 0,
-                (uint32_t)node_idx,
-                node->ps_chain_len - 1,
-                f->counter.current_epoch,
-                txid_display,
-                node->signed_tx.data, node->signed_tx.len,
-                node->outputs[0].amount_sats,
-                /* poison_tx */ poison_snapshot, poison_snapshot_len);
-        } else if (!persist_save_factory_dw_state((persist_t *)mgr->persist,
-                                                  0, f)) {
-            fprintf(stderr, "LSP-stateless: failed to persist DW state after "
-                    "leaf %d advance\n", leaf_side);
-        }
+    /* Step 11: the advanced tree row, PS chain entry and DW counter were all
+       written together in lsp_persist_advanced_leaf above, before DONE.  The
+       PS chain entry is re-written here only to carry poison_snapshot (the
+       watchtower-registered poison bytes), an idempotent INSERT OR REPLACE. */
+    if (mgr->persist && node->is_ps_leaf && poison_snapshot) {
+        extern void reverse_bytes(unsigned char *, size_t);
+        unsigned char txid_display[32];
+        memcpy(txid_display, node->txid, 32);
+        reverse_bytes(txid_display, 32);
+        persist_save_ps_chain_entry(
+            (persist_t *)mgr->persist, 0,
+            (uint32_t)node_idx,
+            node->ps_chain_len - 1,
+            f->counter.current_epoch,
+            txid_display,
+            node->signed_tx.data, node->signed_tx.len,
+            node->outputs[0].amount_sats,
+            /* poison_tx */ poison_snapshot, poison_snapshot_len);
     }
 
     if (node->is_ps_leaf)
@@ -2768,23 +2894,45 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
 
     lsp_crash_checkpoint("state_advance_finalize_partial");
 
-    /* Step 11.5 (F1): persist new-epoch chain[0] for every PS leaf + sub-factory
-       node, mirroring the legacy lsp_run_state_advance.  Only fires on
-       root-driven Tier B (the only path that re-signs PS leaves).  Without this
-       the DB keeps the OLD epoch chain[0] and force-close after rollover cannot
+    /* Tier B moved the root layer and epoch on, reset the leaf layers, and
+       re-signed the affected nodes.  The new-epoch chain[0] rows, the DW
+       counter and the whole re-signed tree are written in ONE transaction,
+       before PATH_SIGN_DONE, so a restart reads the new epoch's tree and
+       counter together or neither, never a tree row at the new epoch with the
+       counter behind it.  Force-close after a rollover needs the new-epoch
+       chain[0] of every PS leaf and sub-factory node; without it, it cannot
        reconstruct the new signed state ("persisted bytes differ"). */
-    if (trigger_leaf_side == -1 && mgr->persist) {
-        int saved = lsp_persist_ps_chain0_all(mgr->persist, f);
-        if (saved > 0)
-            printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d PS node(s)\n",
-                   saved);
+    int tierb_durable = 1;
+    if (mgr->persist) {
+        persist_t *tdb = (persist_t *)mgr->persist;
+        int towntxn = !persist_in_transaction(tdb);
+        if (towntxn && !persist_begin(tdb)) { towntxn = 0; tierb_durable = 0; }
+        if (tierb_durable) {
+            if (trigger_leaf_side == -1) {
+                int saved = lsp_persist_ps_chain0_all(tdb, f);
+                if (saved > 0)
+                    printf("LSP: Tier B F1: persisted new-epoch chain[0] for %d "
+                           "PS node(s)\n", saved);
+            }
+            if (!persist_save_factory_dw_state(tdb, 0, f)) {
+                tierb_durable = 0;
+                fprintf(stderr, "LSP-stateless Tier B: failed to persist DW state\n");
+            }
+            if (tierb_durable &&
+                persist_save_signed_tree_nodes(tdb, f, 0) < 0) {
+                tierb_durable = 0;
+                fprintf(stderr, "LSP-stateless Tier B: ERROR - could not persist "
+                        "the re-signed tree; a force-close from the DB would "
+                        "publish the previous epoch\n");
+            }
+            if (towntxn) {
+                if (tierb_durable) tierb_durable = persist_commit(tdb);
+                else               persist_rollback(tdb);
+            }
+        }
     }
-
-    /* The ceremony moved the root layer and epoch on (and reset the leaf
-       layers); persist that so a restart resumes from this state. */
-    if (mgr->persist &&
-        !persist_save_factory_dw_state((persist_t *)mgr->persist, 0, f))
-        fprintf(stderr, "LSP-stateless Tier B: failed to persist DW state\n");
+    for (size_t ni = 0; ni < f->n_nodes; ni++)
+        lsp_note_l_stock_durable(&f->nodes[ni], tierb_durable);
 
     /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
     if (mgr->persist && c3_round_id > 0) {
@@ -2968,6 +3116,27 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
+
+    /* A PS leaf's realloc is a chain advance: chain[N+1] spends only the
+       channel output, so it has one output worth that channel minus the chain
+       fee, and the L-stock cannot move into it.  Check this before anything
+       changes: factory_advance_leaf_unsigned bumps ps_chain_len, and a
+       realloc that failed after that (as one shaped like buy_liquidity's, with
+       a channel and an L-stock amount, always did) left the leaf a chain
+       entry ahead of the client with nothing signed. */
+    if (node->is_ps_leaf) {
+        uint64_t chan = node->outputs[0].amount_sats;
+        if (n_amounts != 1 || chan <= f->fee_per_tx ||
+            amounts[0] != chan - f->fee_per_tx) {
+            fprintf(stderr, "LSP realloc: PS leaf node %zu: the next chain TX has "
+                    "a single output of %llu sats (channel minus fee); got %zu "
+                    "amount(s) - refusing, leaf unchanged\n", node_idx,
+                    (unsigned long long)(chan > f->fee_per_tx
+                                         ? chan - f->fee_per_tx : 0),
+                    n_amounts);
+            return 0;
+        }
+    }
 
     /* C3 (Tier 1): journal the ceremony.  Error returns leave the row in
        flight for the startup sweep to mark aborted_crash. */
@@ -3482,17 +3651,28 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         entry->channel.remote_amount = usable_ra - entry->channel.local_amount;
     }
 
+    /* Exit-path persistence: the reallocated leaf state is durable before
+       REALLOC_DONE.  For a PS leaf the realloc is a chain advance, so its
+       chain entry is written too: without it a restart restores the chain one
+       entry short and the next advance signs a second, conflicting chain[N].
+       A failed write keeps the superseded state's L-stock secret from being
+       revealed on request (lsp_note_l_stock_durable). */
+    int realloc_has_poison = (realloc_poison_prepared && node->poison_is_signed &&
+                              node->poison_signed_tx.len > 0);
+    if (!lsp_persist_advanced_leaf(mgr, f, node_idx, 1, 1,
+            realloc_has_poison ? node->poison_signed_tx.data : NULL,
+            realloc_has_poison ? node->poison_signed_tx.len : 0))
+        fprintf(stderr, "LSP realloc: the reallocated state of node %zu is not "
+                "persisted\n", node_idx);
+
     /* Step 13: Send REALLOC_DONE to both clients */
     cJSON *done = wire_build_leaf_realloc_done(leaf_side, amounts, n_amounts);
     for (size_t i = 0; i < lsp->n_clients; i++)
         wire_send(lsp->client_fds[i], MSG_LEAF_REALLOC_DONE, done);
     cJSON_Delete(done);
 
-    /* Step 14: Persist per-leaf DW state */
-    if (mgr->persist &&
-        !persist_save_factory_dw_state((persist_t *)mgr->persist, 0, f))
-        fprintf(stderr, "LSP: failed to persist DW state after leaf %d "
-                "realloc\n", leaf_side);
+    /* Step 14: the DW counter was persisted with the reallocated tree row in
+       lsp_persist_advanced_leaf above, before REALLOC_DONE. */
 
     printf("LSP: leaf %d realloc complete (node %zu), amounts=[", leaf_side, node_idx);
     for (size_t i = 0; i < n_amounts; i++)
@@ -4116,6 +4296,10 @@ static int lsp_subfactory_chain_advance_stateless_multi(
         return 0;
     }
 
+    /* Exit-path persistence: chain row + tree row before DONE and the reveal. */
+    int sub_durable = lsp_persist_advanced_subfactory(mgr, f, sub_node_i,
+                                                      poison_prepared);
+
     /* Step 9: DONE to each client.  #53: when the poison was co-signed, attach the
        AGGREGATED poison Schnorr sig so each sub client can persist a complete recourse
        template (it cannot aggregate the N-party poison locally, unlike the 2-party
@@ -4150,7 +4334,13 @@ static int lsp_subfactory_chain_advance_stateless_multi(
        protocol.  Gated on hashlock + a poison having been co-signed; the secret is
        re-derived from the seed, keyed by the sub node's agg xonly + the OLD state
        counter (which Phase 0 bumped during this advance, so current-1 = superseded). */
-    if (f->use_hashlock_poison && poison_prepared && sub->has_l_stock_hash) {
+    if (!sub_durable && f->use_hashlock_poison && poison_prepared &&
+        sub->has_l_stock_hash)
+        fprintf(stderr, "LSP-stateless MULTI: NOT revealing the superseded "
+                "sales-stock secret for node %zu: the new state is not "
+                "persisted\n", sub_node_i);
+    if (sub_durable && f->use_hashlock_poison && poison_prepared &&
+        sub->has_l_stock_hash) {
         uint32_t old_counter = (sub->l_stock_state_counter > 0)
                                ? sub->l_stock_state_counter - 1u : 0u;
         unsigned char reveal_secret[1][32];
@@ -4748,6 +4938,9 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         poison_prepared = 0;
     }
 
+    /* Exit-path persistence: chain row + tree row before DONE. */
+    (void)lsp_persist_advanced_subfactory(mgr, f, sub_node_i, poison_prepared);
+
     /* Step 9: send DONE to each client. */
     cJSON *done = wire_build_subfactory_done(leaf_side, sub_idx_in_leaf, sub->ps_chain_len);
     for (size_t ci = 0; ci < n_clients_in_sub; ci++) {
@@ -5280,7 +5473,10 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            the seed and reply with MSG_LSTOCK_REVEAL.  SECURITY: only reveal states
            STRICTLY BEFORE the node's current L-stock counter — a superseded state.
            Never reveal the current/future state's secret, or the client could
-           poison a legitimate (non-revoked) state of the LSP. */
+           poison a legitimate (non-revoked) state of the LSP.  The state must
+           also be superseded in the DB: after a failed exit-path write the DB
+           still holds the state the in-memory counter calls superseded, and a
+           force-close from the DB would publish it. */
         if (!lsp->factory.use_hashlock_poison) return 1;
         uint32_t req_n[128], req_s[128]; size_t req_cnt = 0;
         if (!wire_parse_lstock_reveal_request(msg->json, req_n, req_s, 128, &req_cnt))
@@ -5292,7 +5488,16 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t nidx = req_n[i];
             if (nidx >= lsp->factory.n_nodes) continue;
             factory_node_t *nd = &lsp->factory.nodes[nidx];
-            if (req_s[i] >= nd->l_stock_state_counter) continue;  /* not superseded -> refuse */
+            uint32_t cap = nd->l_stock_state_counter;
+            if (nd->l_stock_durable_set && nd->l_stock_durable_counter < cap)
+                cap = nd->l_stock_durable_counter;
+            if (req_s[i] >= cap) {
+                if (req_s[i] < nd->l_stock_state_counter)
+                    fprintf(stderr, "LSP: not re-revealing L-stock secret for node "
+                            "%u state %u: that state is still the one in the DB\n",
+                            nidx, req_s[i]);
+                continue;  /* not superseded (in memory and on disk) -> refuse */
+            }
             if (factory_derive_l_stock_secret(&lsp->factory, nd, req_s[i],
                                               out_sec[out_cnt])) {
                 out_n[out_cnt] = nidx;

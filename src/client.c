@@ -4546,6 +4546,55 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
+int client_persist_exit_state(persist_t *db, const factory_t *f) {
+    if (!db || !f) return 0;
+    int own_txn = !persist_in_transaction(db);
+    if (own_txn && !persist_begin(db)) return 0;
+    int ok = persist_save_signed_tree_nodes(db, f, 0) >= 0;
+    for (size_t i = 0; ok && i < f->n_nodes; i++) {
+        const factory_node_t *n = &f->nodes[i];
+        if (!n->is_ps_leaf || !n->is_signed || n->signed_tx.len == 0) continue;
+        unsigned char txid_display[32];
+        memcpy(txid_display, n->txid, 32);
+        reverse_bytes(txid_display, 32);
+        uint32_t epoch = f->counter.current_epoch;
+        if (n->ps_chain_len == 0) {
+            /* chain[0]: at creation, and as the first state of a new epoch.
+               An existing row of this epoch is kept (a reorg reset can zero
+               ps_chain_len while signed_tx still holds chain[N]). */
+            uint32_t stored = 0;
+            if (persist_load_ps_initial_epoch(db, 0, (uint32_t)i, &stored) &&
+                stored >= epoch)
+                continue;
+            ok = persist_save_ps_initial_signed_state(db, 0, (uint32_t)i, epoch,
+                     txid_display, n->signed_tx.data, n->signed_tx.len);
+        } else if (n->type == NODE_PS_SUBFACTORY) {
+            if (n->n_outputs < 1) continue;
+            size_t sstock_vout = n->n_outputs - 1;
+            uint64_t chan_amounts[16] = {0};
+            int n_chans = (int)sstock_vout;
+            if (n_chans > 16) n_chans = 16;
+            for (int c = 0; c < n_chans; c++)
+                chan_amounts[c] = n->outputs[c].amount_sats;
+            ok = persist_save_subfactory_chain_entry(db, 0, (uint32_t)i,
+                     n->ps_chain_len - 1, epoch, txid_display,
+                     n->signed_tx.data, n->signed_tx.len,
+                     n->outputs[sstock_vout].amount_sats,
+                     chan_amounts, n_chans, NULL, 0);
+        } else {
+            ok = persist_save_ps_chain_entry(db, 0, (uint32_t)i,
+                     n->ps_chain_len - 1, epoch, txid_display,
+                     n->signed_tx.data, n->signed_tx.len,
+                     n->outputs[0].amount_sats, NULL, 0);
+        }
+    }
+    if (own_txn) {
+        if (ok) ok = persist_commit(db);
+        else    persist_rollback(db);
+    }
+    return ok;
+}
+
 /* Phase 1e.2.d: client-side stateless Tier B handler.  Dispatched from
    client_handle_state_advance when the LSP sends PROPOSE_INTENT (0x81)
    instead of legacy STATE_ADVANCE_PROPOSE.  Mirrors lsp_run_state_advance_stateless
