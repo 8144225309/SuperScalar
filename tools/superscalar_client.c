@@ -907,7 +907,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
-                if (factory && my_index >= 1 && my_index < FACTORY_MAX_SIGNERS) {
+                /* Bound by the profiles ALLOCATION (config.max_signers), not
+                   FACTORY_MAX_SIGNERS: that is only the default, so clients
+                   256+ silently kept profit_share_bps = 0. */
+                if (factory && factory->profiles && my_index >= 1 &&
+                    (size_t)my_index < factory->config.max_signers) {
                     cbd->profit_share_bps = factory->profiles[my_index].profit_share_bps;
                     /* routing_fee_ppm was captured from SCID_ASSIGN */
                     extern uint32_t g_routing_fee_ppm;  /* defined in client.c */

@@ -111,8 +111,16 @@ plan, all merged):**
   `factory_compute_ewt_for_shape()` (pure-math simulator); covered by
   `test_cli_arity_*` unit tests asserting the specific error strings.
 
-The supported deployment ceiling is **N=127 clients per factory** (128
-signers including the LSP, the MuSig session cap; the LSP CLI rejects
+Factories have been tested at **N=512 clients** (513 signers on one
+factory UTXO): creation, Lightning payments and cooperative close, on
+regtest and public signet. The practical upper limit is not yet
+established; current constraints are distributed coordination, memory and
+N-of-N liveness rather than a fixed MuSig2 signer limit (session buffers
+are allocated to `n_signers`; `MUSIG_SESSION_MAX_SIGNERS` is advisory and
+unenforced).
+
+Earlier releases capped factories at N=127 (128
+signers including the LSP, the MuSig session cap; the LSP CLI rejected
 `--clients` above 127) with mixed arity `{2,4,8}` + `--static-near-root 2`
 — well within BOLT 2016. The full lifecycle — creation, client↔client
 payments, factory rotation, cooperative close — is proven end-to-end at

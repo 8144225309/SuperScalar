@@ -2942,6 +2942,37 @@ int factory_tick_root(factory_t *f) {
     return -1;
 }
 
+/* Per-input prev-output cache for multi-input PS sub-factory chain advances.
+   Heap rather than [FACTORY_MAX_OUTPUTS] arrays on every node: at 800 B x
+   (4N-2) nodes those three fields were pure O(N^2) overhead on clients that
+   never advance a sub-factory chain.  Same treatment input_signer_indices
+   already got.  Grows only; ps_n_prev_outputs tracks live usage, ps_prev_cap
+   the allocation, so the reset paths can zero usage without churning malloc. */
+static int ensure_ps_prev_alloc(factory_node_t *node, size_t n) {
+    if (n == 0) return 1;
+    if (node->ps_prev_cap >= n) return 1;
+
+    uint64_t *a = (uint64_t *)calloc(n, sizeof(*a));
+    unsigned char (*s)[34] = (unsigned char (*)[34])calloc(n, sizeof(*s));
+    size_t *l = (size_t *)calloc(n, sizeof(*l));
+    if (!a || !s || !l) { free(a); free(s); free(l); return 0; }
+
+    /* Preserve anything already captured -- a chain advance may re-enter. */
+    if (node->ps_prev_cap) {
+        memcpy(a, node->ps_prev_amounts,  node->ps_prev_cap * sizeof(*a));
+        memcpy(s, node->ps_prev_spks,     node->ps_prev_cap * sizeof(*s));
+        memcpy(l, node->ps_prev_spk_lens, node->ps_prev_cap * sizeof(*l));
+    }
+    free(node->ps_prev_amounts);
+    free(node->ps_prev_spks);
+    free(node->ps_prev_spk_lens);
+    node->ps_prev_amounts  = a;
+    node->ps_prev_spks     = s;
+    node->ps_prev_spk_lens = l;
+    node->ps_prev_cap      = n;
+    return 1;
+}
+
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242).
 
    "Buy liquidity from sales-stock" operation: client at
@@ -3000,6 +3031,7 @@ int factory_subfactory_chain_advance_unsigned(
        chain[N+1] consumes ALL k+1 outputs of chain[N], not just sales-stock,
        so each prev output's (amount, scriptpubkey) is needed for the BIP-341
        sighash computation per input.  Capture BEFORE we mutate sub->outputs[]. */
+    if (!ensure_ps_prev_alloc(sub, sub->n_outputs)) return 0;
     sub->ps_n_prev_outputs = sub->n_outputs;
     for (size_t i = 0; i < sub->n_outputs; i++) {
         sub->ps_prev_amounts[i] = sub->outputs[i].amount_sats;
@@ -3171,10 +3203,15 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
     free(node->input_partial_sigs);
     free(node->input_keyaggs);
     free(node->input_signer_indices);
+    /* Re-entry frees these too, or every re-alloc leaks 576 B x n_inputs. */
+    free(node->input_merkle_root);
+    free(node->input_has_merkle_root);
     node->input_signing_sessions = NULL;
     node->input_partial_sigs = NULL;
     node->input_keyaggs = NULL;
     node->input_signer_indices = NULL;
+    node->input_merkle_root = NULL;
+    node->input_has_merkle_root = NULL;
     node->input_signers_stride = 0;
     node->n_input_sessions = 0;
 
@@ -3234,13 +3271,43 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
         return 0;
     }
 
+    /* Per-input merkle roots: heap for the same O(N^2) reason as
+       input_signer_indices (576 B/node fixed -> on demand).  calloc zeroes,
+       so the old memsets are gone -- with a pointer, sizeof() would have been
+       8 and silently cleared almost nothing. */
+    node->input_merkle_root =
+        (unsigned char (*)[32])calloc(node->ps_n_prev_outputs,
+                                        sizeof(*node->input_merkle_root));
+    if (!node->input_merkle_root) {
+        free(node->input_signing_sessions);
+        free(node->input_partial_sigs);
+        free(node->input_keyaggs);
+        free(node->input_signer_indices);
+        node->input_signing_sessions = NULL; node->input_partial_sigs = NULL;
+        node->input_keyaggs = NULL; node->input_signer_indices = NULL;
+        node->input_signers_stride = 0;
+        return 0;
+    }
+    node->input_has_merkle_root =
+        (int *)calloc(node->ps_n_prev_outputs, sizeof(*node->input_has_merkle_root));
+    if (!node->input_has_merkle_root) {
+        free(node->input_signing_sessions);
+        free(node->input_partial_sigs);
+        free(node->input_keyaggs);
+        free(node->input_signer_indices);
+        free(node->input_merkle_root);
+        node->input_signing_sessions = NULL; node->input_partial_sigs = NULL;
+        node->input_keyaggs = NULL; node->input_signer_indices = NULL;
+        node->input_merkle_root = NULL;
+        node->input_signers_stride = 0;
+        return 0;
+    }
+
     memset(node->input_partial_sigs_received, 0,
            sizeof(node->input_partial_sigs_received));
     memset(node->input_n_signers, 0, sizeof(node->input_n_signers));
-    /* input_signer_indices is calloc'd above -- do NOT memset it with
-       sizeof(), which is now sizeof(pointer). */
-    memset(node->input_merkle_root, 0, sizeof(node->input_merkle_root));
-    memset(node->input_has_merkle_root, 0, sizeof(node->input_has_merkle_root));
+    /* input_signer_indices / input_merkle_root / input_has_merkle_root are
+       calloc'd -- do NOT memset them with sizeof(), which is sizeof(pointer). */
     node->n_input_sessions = node->ps_n_prev_outputs;
     return 1;
 }
@@ -5118,6 +5185,21 @@ void factory_free(factory_t *f) {
         f->nodes[i].input_signer_indices = NULL;
         f->nodes[i].input_signers_stride = 0;
         f->nodes[i].n_input_sessions = 0;
+        /* Per-input prev-output cache: heap for the same O(N^2) reason as
+           input_signer_indices above (800 B/node fixed -> on demand). */
+        free(f->nodes[i].ps_prev_amounts);
+        f->nodes[i].ps_prev_amounts = NULL;
+        free(f->nodes[i].ps_prev_spks);
+        f->nodes[i].ps_prev_spks = NULL;
+        free(f->nodes[i].ps_prev_spk_lens);
+        f->nodes[i].ps_prev_spk_lens = NULL;
+        f->nodes[i].ps_prev_cap = 0;
+        f->nodes[i].ps_n_prev_outputs = 0;
+        /* Per-input merkle roots: heap for the same reason (576 B/node). */
+        free(f->nodes[i].input_merkle_root);
+        f->nodes[i].input_merkle_root = NULL;
+        free(f->nodes[i].input_has_merkle_root);
+        f->nodes[i].input_has_merkle_root = NULL;
     }
     /* F4: factory-level distribution TX buffer (populated by
        factory_build_distribution_tx_unsigned).  tx_buf_free is a no-op
@@ -5215,6 +5297,49 @@ void factory_detach_txbufs(factory_t *f) {
                 memcpy(pps, f->nodes[i].poison_partial_sigs, ns * sizeof(*pps));
             f->nodes[i].poison_partial_sigs = pps;
         }
+        /* Multi-input PS prev-output cache (ps_prev_*): structural -- the next
+           sub-factory chain advance builds its per-input sighashes from it --
+           so the copy gets its own.  ensure_ps_prev_alloc frees and replaces
+           these on regrow, which on an aliased copy would free the original's. */
+        factory_node_t *nd = &f->nodes[i];
+        if (nd->ps_prev_cap > 0) {
+            size_t pc = nd->ps_prev_cap;
+            uint64_t *pa = malloc(pc * sizeof(*pa));
+            unsigned char (*psp)[34] = malloc(pc * sizeof(*psp));
+            size_t *pl = malloc(pc * sizeof(*pl));
+            if (pa && psp && pl) {
+                memcpy(pa, nd->ps_prev_amounts, pc * sizeof(*pa));
+                memcpy(psp, nd->ps_prev_spks, pc * sizeof(*psp));
+                memcpy(pl, nd->ps_prev_spk_lens, pc * sizeof(*pl));
+            } else {
+                fprintf(stderr, "factory_detach_txbufs: node %zu: ps_prev_* copy "
+                        "allocation failed; the copy drops its prev-output cache\n", i);
+                free(pa); free(psp); free(pl);
+                pa = NULL; psp = NULL; pl = NULL;
+                pc = 0;
+                nd->ps_n_prev_outputs = 0;
+            }
+            nd->ps_prev_amounts = pa;
+            nd->ps_prev_spks = psp;
+            nd->ps_prev_spk_lens = pl;
+            nd->ps_prev_cap = pc;
+        }
+        /* Per-input signing state (input_signing_sessions / partial_sigs /
+           keyaggs / signer_indices / merkle roots) is per-ceremony scratch:
+           factory_session_init_node_input rebuilds all of it via
+           ensure_input_sessions_alloc, which FREES the previous arrays first --
+           on an aliased copy, the original's.  Detach the copy by nulling them,
+           as for the per-node sessions above; the original keeps and frees them. */
+        nd->input_signing_sessions = NULL;
+        nd->input_partial_sigs = NULL;
+        nd->input_keyaggs = NULL;
+        nd->input_signer_indices = NULL;
+        nd->input_signers_stride = 0;
+        nd->input_merkle_root = NULL;
+        nd->input_has_merkle_root = NULL;
+        nd->n_input_sessions = 0;
+        memset(nd->input_partial_sigs_received, 0, sizeof(nd->input_partial_sigs_received));
+        memset(nd->input_n_signers, 0, sizeof(nd->input_n_signers));
     }
     memset(&f->dist_unsigned_tx, 0, sizeof(tx_buf_t));
     memset(&f->dist_signed_tx, 0, sizeof(tx_buf_t));   /* #54 G1 */

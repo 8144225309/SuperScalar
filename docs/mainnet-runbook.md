@@ -131,7 +131,7 @@ rotation cadence.
 | 4 | 1 | ~50 MB |
 | 16 | 1 | ~200 MB |
 | 64 | 1-2 | ~1 GB |
-| 127 (design max) | 4+ | ~2 GB (127 client daemons) |
+| 127 | 4+ | ~2 GB (127 client daemons) |
 
 Growth drivers: `signing_rounds` (one row per signer per ceremony),
 `old_commitments` (one row per commitment per channel), and the
@@ -501,7 +501,7 @@ are starting points, not guarantees.
 | N=16, k=1 | < 250 MB | 1 core, ~20s | ~200 MB DB |
 | N=64, k=4 | < 1 GB | 2-4 cores, ~90s | ~1 GB DB |
 | N=127, k=8 | multi-GB (127 client daemons; fit a 15 GB host in testing) | 4+ cores | ~2 GB DB |
-| N=256+ | not supported | n/a | n/a |
+| N=512 (tested) | 512 client daemons on one host: 14.5 GiB peak (cgroup RSS + swap, ~29 MiB per client; regtest, measured before the 17.8% `factory_node_t` shrink). In-process manager, full workload (factory + 512 channels + 2,048 payments + close: `test_inproc_factory_lifecycle paylifecycle 512`): ~147 MiB peak RSS | 4+ cores | not measured |
 
 k = number of PS subfactories (see [superscalar.win](https://superscalar.win) for the design).
 
