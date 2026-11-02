@@ -3725,6 +3725,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_channel_init_failure_owns_nothing);
     extern int test_restart_restore_failure_frees_mgr(void);
     RUN_TEST(test_restart_restore_failure_frees_mgr);
+    extern int test_restart_reconnect_skips_settled_htlcs(void);
+    RUN_TEST(test_restart_reconnect_skips_settled_htlcs);
+    extern int test_restart_restore_more_than_64_htlcs(void);
+    RUN_TEST(test_restart_restore_more_than_64_htlcs);
+    extern int test_restart_restore_too_many_htlcs_fails_closed(void);
+    RUN_TEST(test_restart_restore_too_many_htlcs_fails_closed);
+    extern int test_restart_reconnect_rollback_more_than_64_htlcs(void);
+    RUN_TEST(test_restart_reconnect_rollback_more_than_64_htlcs);
+    extern int test_restart_reconnect_too_many_htlcs_fails_closed(void);
+    RUN_TEST(test_restart_reconnect_too_many_htlcs_fails_closed);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

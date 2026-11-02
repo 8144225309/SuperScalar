@@ -295,3 +295,253 @@ int test_restart_restore_failure_frees_mgr(void) {
     return 1;
 }
 
+/* ---- HTLCs restored on restart ---- */
+
+static void rs_make_htlc(htlc_t *h, uint64_t id, htlc_state_t state) {
+    memset(h, 0, sizeof(*h));
+    h->id = id;
+    h->direction = (id & 1) ? HTLC_RECEIVED : HTLC_OFFERED;
+    h->state = state;
+    h->amount_sats = 1000 + id;
+    memset(h->payment_hash, (unsigned char)(id & 0xff), 32);
+    h->payment_hash[0] = (unsigned char)(id >> 8);
+    h->cltv_expiry = 500 + (uint32_t)id;
+}
+
+/* Store HTLC rows with ids [first, first + n). */
+static int rs_save_htlcs(persist_t *db, uint32_t ch, uint64_t first, size_t n,
+                         htlc_state_t state) {
+    if (!persist_begin(db)) return 0;
+    for (size_t i = 0; i < n; i++) {
+        htlc_t h;
+        rs_make_htlc(&h, first + i, state);
+        if (!persist_save_htlc(db, ch, &h)) { persist_rollback(db); return 0; }
+    }
+    return persist_commit(db);
+}
+
+/* ch holds exactly the active HTLCs with ids [first, first + n), in order. */
+static int rs_check_htlcs(const channel_t *ch, uint64_t first, size_t n) {
+    if (ch->n_htlcs != n || ch->htlcs_cap < ch->n_htlcs) return 0;
+    for (size_t i = 0; i < n; i++) {
+        htlc_t want;
+        rs_make_htlc(&want, first + i, HTLC_STATE_ACTIVE);
+        const htlc_t *got = &ch->htlcs[i];
+        if (got->id != want.id || got->amount_sats != want.amount_sats ||
+            got->direction != want.direction || got->state != HTLC_STATE_ACTIVE ||
+            got->cltv_expiry != want.cltv_expiry ||
+            memcmp(got->payment_hash, want.payment_hash, 32) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* channel_init allocates DEFAULT_HTLCS_CAP (64) HTLC slots and the restore
+   copied every stored HTLC into them.  100 active HTLCs (a channel can hold
+   up to MAX_HTLCS) must all come back, in a large enough array. */
+int test_restart_restore_more_than_64_htlcs(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 0, 100, HTLC_STATE_ACTIVE), "save active");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 1000, 3, HTLC_STATE_FULFILLED), "save settled");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load factory");
+    lsp_channel_mgr_t *rec_mgr = calloc(1, sizeof(*rec_mgr));
+    TEST_ASSERT(rec_mgr, "alloc");
+    TEST_ASSERT(lsp_channels_init_from_db(rec_mgr, fx.ctx, rec_f,
+                                          rs_seckeys[0], 4, &fx.db),
+                "init from db");
+    TEST_ASSERT(rs_check_htlcs(&rec_mgr->entries[0].channel, 0, 100),
+                "all 100 active HTLCs restored (settled ones skipped)");
+    TEST_ASSERT_EQ(rec_mgr->entries[1].channel.n_htlcs, 0, "other channels empty");
+
+    lsp_channels_cleanup(rec_mgr);
+    free(rec_mgr);
+    factory_free(rec_f);
+    free(rec_f);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* More active HTLCs than a channel can hold: refuse the restore (it used
+   to keep the first MAX_HTLCS, after overflowing the array) and free
+   everything. */
+int test_restart_restore_too_many_htlcs_fails_closed(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 1, 0, MAX_HTLCS + 1, HTLC_STATE_ACTIVE),
+                "save MAX_HTLCS + 1 active");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load factory");
+    lsp_channel_mgr_t *rec_mgr = calloc(1, sizeof(*rec_mgr));
+    TEST_ASSERT(rec_mgr, "alloc");
+    TEST_ASSERT(!lsp_channels_init_from_db(rec_mgr, fx.ctx, rec_f,
+                                           rs_seckeys[0], 4, &fx.db),
+                "restore refused");
+    TEST_ASSERT(rec_mgr->entries == NULL, "entries freed");
+    TEST_ASSERT_EQ(rec_mgr->n_channels, 0, "no channels left");
+
+    lsp_channels_cleanup(rec_mgr);
+    free(rec_mgr);
+    factory_free(rec_f);
+    free(rec_f);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* ---- HTLCs restored on a reconnect with a commitment-number gap ---- */
+
+static lsp_t *rs_make_lsp(rs_fixture_t *fx) {
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return NULL;
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    if (!lsp->client_fds || !lsp->client_pubkeys) return NULL;
+    lsp->clients_cap = LSP_MAX_CLIENTS;
+    lsp->ctx = fx->ctx;
+    lsp->lsp_pubkey = fx->pks[0];
+    lsp->n_clients = 4;
+    lsp->listen_fd = -1;
+    lsp->bridge_fd = -1;
+    for (int i = 0; i < 4; i++) {
+        lsp->client_pubkeys[i] = fx->pks[i + 1];
+        lsp->client_fds[i] = -1;
+    }
+    return lsp;
+}
+
+static void rs_free_lsp(lsp_t *lsp) {
+    if (!lsp) return;
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+}
+
+/* Client 0 reconnects claiming claimed_cn.  The peer sends MSG_RECONNECT
+   and stops writing, so the handler runs the commitment-number
+   reconciliation under test and then fails at the nonce exchange (EOF);
+   its return value is not what these tests check.  Returns 1 if the
+   handler got past the reconciliation and took the connection, 0 if it
+   refused it, -1 if the test could not send. */
+static int rs_reconnect(rs_fixture_t *fx, lsp_t *lsp, uint64_t claimed_cn) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    cJSON *m = wire_build_reconnect(fx->ctx, &fx->pks[1], claimed_cn);
+    int sent = m && wire_send(sv[1], MSG_RECONNECT, m);
+    cJSON_Delete(m);
+    if (!sent) {
+        close(sv[0]);
+        close(sv[1]);
+        return -1;
+    }
+    shutdown(sv[1], SHUT_WR);
+    (void)lsp_channels_handle_reconnect(&fx->mgr, lsp, sv[0]);
+    int kept = (lsp->client_fds[0] == sv[0]);
+    if (kept) {
+        wire_close(sv[0]);       /* the refused path closed it itself */
+        lsp->client_fds[0] = -1;
+    }
+    close(sv[1]);
+    return kept;
+}
+
+/* The reconnect branches loaded every stored row, so fulfilled and failed
+   rows counted towards MAX_HTLCS: MAX_HTLCS active HTLCs plus three settled
+   rows were refused as too many.  Like the restart, they now load only the
+   active rows.  (Today every settle and fail deletes its row, so such rows
+   should not exist, but nothing enforces that.) */
+int test_restart_reconnect_skips_settled_htlcs(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 0, MAX_HTLCS, HTLC_STATE_ACTIVE),
+                "save MAX_HTLCS active");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 1000, 2, HTLC_STATE_FULFILLED),
+                "save fulfilled");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 2000, 1, HTLC_STATE_FAILED), "save failed");
+    lsp_t *lsp = rs_make_lsp(&fx);
+    TEST_ASSERT(lsp, "lsp");
+    channel_t *ch = &fx.mgr.entries[0].channel;
+
+    ch->commitment_number = RS_CH0_CN + 1;
+    ch->n_htlcs = 0;
+    TEST_ASSERT_EQ(rs_reconnect(&fx, lsp, RS_CH0_CN), 1, "rollback taken");
+    TEST_ASSERT(rs_check_htlcs(ch, 0, MAX_HTLCS),
+                "rollback loaded the active HTLCs only");
+
+    ch->n_htlcs = 0;
+    TEST_ASSERT_EQ(rs_reconnect(&fx, lsp, RS_CH0_CN + 1), 1, "reload taken");
+    TEST_ASSERT(rs_check_htlcs(ch, 0, MAX_HTLCS),
+                "reload loaded the active HTLCs only");
+
+    rs_free_lsp(lsp);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* The LSP is one commitment ahead (rolls back to the DB) and then one
+   behind (accepts the client's number, reloads from the DB).  Both reload
+   the HTLCs into the channel; with 100 stored they no longer fit in the
+   64 slots channel_init allocated. */
+int test_restart_reconnect_rollback_more_than_64_htlcs(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 0, 100, HTLC_STATE_ACTIVE), "save htlcs");
+    lsp_t *lsp = rs_make_lsp(&fx);
+    TEST_ASSERT(lsp, "lsp");
+    channel_t *ch = &fx.mgr.entries[0].channel;
+
+    /* LSP one ahead of the client and of the DB: roll back. */
+    ch->commitment_number = RS_CH0_CN + 1;
+    ch->local_amount = 1;
+    ch->remote_amount = 2;
+    ch->n_htlcs = 0;
+    TEST_ASSERT_EQ(rs_reconnect(&fx, lsp, RS_CH0_CN), 1, "reconnect taken");
+    TEST_ASSERT_EQ(ch->commitment_number, RS_CH0_CN, "rolled back to DB commitment");
+    TEST_ASSERT_EQ(ch->local_amount, RS_CH0_LOCAL, "DB local balance");
+    TEST_ASSERT_EQ(ch->remote_amount, RS_CH0_REMOTE, "DB remote balance");
+    TEST_ASSERT(rs_check_htlcs(ch, 0, 100), "rollback restored all 100 HTLCs");
+
+    /* Client one ahead: take its number, reload the rest from the DB. */
+    ch->n_htlcs = 0;
+    TEST_ASSERT_EQ(rs_reconnect(&fx, lsp, RS_CH0_CN + 1), 1, "reconnect taken");
+    TEST_ASSERT_EQ(ch->commitment_number, RS_CH0_CN + 1, "accepted client commitment");
+    TEST_ASSERT(rs_check_htlcs(ch, 0, 100), "reload restored all 100 HTLCs");
+
+    rs_free_lsp(lsp);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* More stored HTLCs than a channel can hold: both reconnect branches
+   refuse and leave the channel as it was. */
+int test_restart_reconnect_too_many_htlcs_fails_closed(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");
+    TEST_ASSERT(rs_save_htlcs(&fx.db, 0, 0, MAX_HTLCS + 1, HTLC_STATE_ACTIVE),
+                "save MAX_HTLCS + 1 htlcs");
+    lsp_t *lsp = rs_make_lsp(&fx);
+    TEST_ASSERT(lsp, "lsp");
+    channel_t *ch = &fx.mgr.entries[0].channel;
+
+    ch->commitment_number = RS_CH0_CN + 1;
+    ch->local_amount = 1;
+    ch->remote_amount = 2;
+    ch->n_htlcs = 0;
+    TEST_ASSERT_EQ(rs_reconnect(&fx, lsp, RS_CH0_CN), 0, "rollback refused");
+    TEST_ASSERT_EQ(ch->commitment_number, RS_CH0_CN + 1, "rollback refused: cn kept");
+    TEST_ASSERT_EQ(ch->local_amount, 1, "rollback refused: balance kept");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "rollback refused: HTLCs kept");
+
+    ch->commitment_number = RS_CH0_CN - 1;
+    TEST_ASSERT_EQ(rs_reconnect(&fx, lsp, RS_CH0_CN), 0, "reload refused");
+    TEST_ASSERT_EQ(ch->commitment_number, RS_CH0_CN - 1, "reload refused: cn kept");
+    TEST_ASSERT_EQ(ch->local_amount, 1, "reload refused: balance kept");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "reload refused: HTLCs kept");
+
+    rs_free_lsp(lsp);
+    rs_teardown(&fx);
+    return 1;
+}
+
