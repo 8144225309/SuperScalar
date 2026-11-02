@@ -4,6 +4,13 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
 
+## Unreleased
+
+### Revocations must verify; every revoked commitment stays watched
+
+- **Invalid revocations fail the channel.** A peer could answer a commitment update with a revocation that does not verify and keep an older commitment that can never be penalised. Such a revocation now fails the channel: nothing on it is watched, revealed or forwarded, the peer is disconnected and refused, and the failure is persisted unless it arrived on a session opened by an (unauthenticated) reconnect; the client applies its `--on-lsp-forgery` policy to an LSP revocation that does not verify.
+- **Every revoked commitment is watched.** Revoked commitments beyond the watchtower's first 128 were dropped silently, so a breach of one went unpunished. The watch table now grows as needed and is fully reloaded on restart, and a revoked commitment that cannot be watched fails the channel.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
