@@ -24,6 +24,7 @@
 #include "superscalar/sha256.h"
 #include "superscalar/lsp.h"
 #include "superscalar/crash_inject.h"
+#include "superscalar/tx_builder.h"
 extern void hex_encode(const unsigned char *, size_t, char *);
 extern int hex_decode(const char *, unsigned char *, size_t);
 extern void reverse_bytes(unsigned char *, size_t);
@@ -68,7 +69,554 @@ void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id) {
     mgr->rot_attempted_mask &= ~(1u << (factory_id & 31));
 }
 
+/* --- Rotation progress past the irreversible Phase B close ---
+
+   Phase B (the dying factory's cooperative close) is the point of no return:
+   the close pays every client's channel balance to the LSP wallet, so until
+   Phase C has created AND signed the replacement factory, the clients' funds
+   exist only in the LSP's wallet and books.  mgr->rot_progress (mirrored in
+   the rotation_progress table) records how far such a rotation got, so a
+   failure -- or a crash and restart -- after the close resumes Phase C
+   (re-using an already-broadcast replacement funding TX, never funding twice)
+   instead of re-running Phase A/B or reporting the spent funding as
+   "already rotated". */
+
+static regtest_t *rot_rt(const lsp_channel_mgr_t *mgr) {
+    return mgr->watchtower ? mgr->watchtower->rt : NULL;
+}
+
+static void rot_txid_display(const unsigned char *txid32, char out[65]) {
+    unsigned char rb[32];
+    for (int i = 0; i < 32; i++) rb[i] = txid32[31 - i];
+    hex_encode(rb, 32, out);
+}
+
+static int rot_chain_height(lsp_channel_mgr_t *mgr) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb && cb->get_block_height) return cb->get_block_height(cb);
+    regtest_t *rt = rot_rt(mgr);
+    return rt ? regtest_get_block_height(rt) : -1;
+}
+
+static int rot_tx_confirmations(lsp_channel_mgr_t *mgr, const char *txid) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb && cb->get_confirmations) return cb->get_confirmations(cb, txid);
+    regtest_t *rt = rot_rt(mgr);
+    return rt ? regtest_get_confirmations(rt, txid) : -1;
+}
+
+static int rot_tx_in_mempool(lsp_channel_mgr_t *mgr, const char *txid) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb && cb->is_in_mempool) return cb->is_in_mempool(cb, txid) ? 1 : 0;
+    regtest_t *rt = rot_rt(mgr);
+    return (rt && regtest_is_in_mempool(rt, txid)) ? 1 : 0;
+}
+
+/* 1 = unspent, 0 = spent, -1 = unknown. */
+static int rot_outpoint_unspent(lsp_channel_mgr_t *mgr, const char *txid_disp,
+                                uint32_t vout) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb && cb->is_outpoint_unspent) return cb->is_outpoint_unspent(cb, txid_disp, vout);
+    regtest_t *rt = rot_rt(mgr);
+    return rt ? regtest_outpoint_unspent(rt, txid_disp, vout) : -1;
+}
+
+static void rot_progress_to_row(lsp_rotation_progress_t *rp,
+                                persist_rotation_progress_t *row) {
+    memset(row, 0, sizeof(*row));
+    row->dying_funding_vout = rp->dying_funding_vout;
+    row->dying_factory_id = rp->dying_factory_id;
+    row->phase = rp->phase;
+    memcpy(row->close_txid, rp->close_txid, sizeof(row->close_txid));
+    memcpy(row->new_funding_txid, rp->new_funding_txid, sizeof(row->new_funding_txid));
+    row->new_funding_hex = rp->new_funding_hex;          /* borrowed */
+    row->new_funding_vout = rp->new_funding_vout;
+    row->new_funding_amount = rp->new_funding_amount;
+    row->new_cltv = rp->new_cltv;
+    row->dist_amounts = rp->dist_amounts;
+    row->n_dist_amounts = rp->n_dist_amounts;
+    memcpy(row->tree_digest, rp->tree_digest, sizeof(row->tree_digest));
+    row->dist_tx_hex = rp->dist_tx_hex;                  /* borrowed */
+}
+
+/* Write mgr->rot_progress.  Returns 0 if it could not be recorded: every
+   caller treats that as a failed rotation step (a marker that is not on disk
+   cannot guard the irreversible step that follows it).
+
+   Marker writes are standalone statements on mgr->persist.  No caller
+   transaction may be open: a later rollback of that transaction would
+   silently undo the marker.  (SIGNED is the one exception, written on
+   purpose inside the factory-persist transaction -- not through here.) */
+static int rot_progress_persist(lsp_channel_mgr_t *mgr) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    persist_t *db = (persist_t *)mgr->persist;
+    if (!db) return 1;                       /* no DB: in-memory marker only */
+    if (persist_in_transaction(db)) {
+        fprintf(stderr, "LSP rotate: BUG: rotation marker write (phase %d) inside an "
+                "open transaction -- refusing\n", rp->phase);
+        return 0;
+    }
+    char dtx[65];
+    rot_txid_display(rp->dying_funding_txid, dtx);
+    persist_rotation_progress_t row;
+    rot_progress_to_row(rp, &row);
+    if (!persist_save_rotation_progress(db, dtx, &row)) {
+        fprintf(stderr, "LSP rotate: could not persist rotation progress (phase %d) "
+                "-- stopping this rotation step\n", rp->phase);
+        return 0;
+    }
+    return 1;
+}
+
+/* Move to PHASE and record it; on failure the in-memory phase is unchanged. */
+static int rot_progress_set_phase(lsp_channel_mgr_t *mgr, int phase) {
+    int old = mgr->rot_progress.phase;
+    mgr->rot_progress.phase = phase;
+    if (!rot_progress_persist(mgr)) {
+        mgr->rot_progress.phase = old;
+        return 0;
+    }
+    return 1;
+}
+
+/* Light client: release a funding input still reserved in the wallet. */
+static void rot_release_reservation(lsp_channel_mgr_t *mgr) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+    if (rp->fund_reserved && ws && ws->release_utxo)
+        ws->release_utxo(ws, rp->fund_reserved_txid, rp->fund_reserved_vout);
+    rp->fund_reserved = 0;
+}
+
+void lsp_rotation_progress_clear(lsp_channel_mgr_t *mgr) {
+    if (!mgr) return;
+    rot_release_reservation(mgr);
+    free(mgr->rot_progress.new_funding_hex);
+    free(mgr->rot_progress.dist_tx_hex);
+    memset(&mgr->rot_progress, 0, sizeof(mgr->rot_progress));
+}
+
+int lsp_rotation_progress_pending(const lsp_channel_mgr_t *mgr) {
+    return mgr && mgr->rot_progress.phase >= LSP_ROT_PROGRESS_CLOSING &&
+           mgr->rot_progress.phase <= LSP_ROT_PROGRESS_SIGNING_READY;
+}
+
+int lsp_rotation_load_progress(lsp_channel_mgr_t *mgr,
+                               const unsigned char *dying_funding_txid32,
+                               uint32_t dying_funding_vout) {
+    if (!mgr || !mgr->persist || !dying_funding_txid32) return 0;
+    char dtx[65];
+    rot_txid_display(dying_funding_txid32, dtx);
+    lsp_rotation_progress_t *rp = malloc(sizeof(*rp));
+    if (!rp) return 0;
+    memset(rp, 0, sizeof(*rp));
+    persist_rotation_progress_t row;
+    memset(&row, 0, sizeof(row));
+    row.dist_amounts = rp->dist_amounts;
+    if (!persist_load_rotation_progress((persist_t *)mgr->persist, dtx, &row,
+                                        FACTORY_MAX_SIGNERS)) {
+        free(rp);
+        return 0;
+    }
+    if (row.dying_funding_vout != dying_funding_vout ||
+        row.phase < LSP_ROT_PROGRESS_CLOSING || row.phase > LSP_ROT_PROGRESS_SIGNING_READY) {
+        free(row.new_funding_hex);
+        free(row.dist_tx_hex);
+        free(rp);
+        return 0;
+    }
+    rp->phase = row.phase;
+    rp->dying_factory_id = row.dying_factory_id;
+    memcpy(rp->dying_funding_txid, dying_funding_txid32, 32);
+    rp->dying_funding_vout = row.dying_funding_vout;
+    memcpy(rp->close_txid, row.close_txid, sizeof(rp->close_txid));
+    memcpy(rp->new_funding_txid, row.new_funding_txid, sizeof(rp->new_funding_txid));
+    rp->new_funding_hex = row.new_funding_hex;           /* ownership moves */
+    rp->new_funding_vout = row.new_funding_vout;
+    rp->new_funding_amount = row.new_funding_amount;
+    rp->new_cltv = row.new_cltv;
+    rp->n_dist_amounts = row.n_dist_amounts;
+    memcpy(rp->tree_digest, row.tree_digest, sizeof(rp->tree_digest));
+    rp->dist_tx_hex = row.dist_tx_hex;                   /* ownership moves */
+    lsp_rotation_progress_clear(mgr);
+    mgr->rot_progress = *rp;
+    free(rp);
+    return 1;
+}
+
+int lsp_rotation_find_logged_close(lsp_channel_mgr_t *mgr,
+                                   const unsigned char *dying_funding_txid32,
+                                   char *close_txid_out65) {
+    if (!mgr || !mgr->persist || !dying_funding_txid32) return 0;
+    char dtx[65];
+    rot_txid_display(dying_funding_txid32, dtx);
+    char closes[16][65];
+    size_t n = persist_list_rotation_closes((persist_t *)mgr->persist, dtx, closes, 16);
+    int best = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (rot_tx_confirmations(mgr, closes[i]) >= 1) {
+            if (close_txid_out65) memcpy(close_txid_out65, closes[i], 65);
+            return 2;
+        }
+        if (!best && rot_tx_in_mempool(mgr, closes[i])) {
+            if (close_txid_out65) memcpy(close_txid_out65, closes[i], 65);
+            best = 1;
+        }
+    }
+    return best;
+}
+
+/* Broadcast a signed TX (hex) through the configured chain. */
+static int rot_send_hex(lsp_channel_mgr_t *mgr, const char *hex, char *txid_out65) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb && cb->send_raw_tx) return cb->send_raw_tx(cb, hex, txid_out65);
+    regtest_t *rt = rot_rt(mgr);
+    return rt ? regtest_send_raw_tx(rt, hex, txid_out65) : 0;
+}
+
+/* A replacement funding TX built and signed but not (yet) broadcast, and
+   what holds its wallet inputs: bitcoind locks them (fundrawtransaction
+   lockUnspents); a light-client wallet keeps one UTXO reserved. */
+typedef struct {
+    char *hex;
+    char txid[65];
+    int light;
+    char res_txid[65];
+    uint32_t res_vout;
+} rot_funding_tx_t;
+
+static int rot_build_funding_tx(lsp_channel_mgr_t *mgr, rot_funding_tx_t *b) {
+    memset(b, 0, sizeof(*b));
+    regtest_t *rt = rot_rt(mgr);
+    if (rt) {
+        b->hex = regtest_build_signed_payment(rt, mgr->rot_fund_addr,
+                                              (double)mgr->rot_funding_sats / 100000000.0,
+                                              b->txid);
+        return b->hex != NULL;
+    }
+    wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+    if (!ws || !mgr->chain_be) {
+        fprintf(stderr, "LSP rotate: no wallet/chain for light-client funding\n");
+        return 0;
+    }
+    b->hex = lsp_fund_spk_build(ws, mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                                mgr->rot_funding_sats, 0, b->txid,
+                                b->res_txid, &b->res_vout);
+    b->light = b->hex != NULL;
+    return b->hex != NULL;
+}
+
+/* The TX will never be broadcast: give its wallet inputs back. */
+static void rot_funding_abandon(lsp_channel_mgr_t *mgr, rot_funding_tx_t *b) {
+    wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+    regtest_t *rt = rot_rt(mgr);
+    if (b->light) {
+        if (ws && ws->release_utxo) ws->release_utxo(ws, b->res_txid, b->res_vout);
+    } else if (b->hex && rt && regtest_unlock_tx_inputs(rt, b->hex) < 0) {
+        fprintf(stderr, "LSP rotate: WARNING: could not unlock the abandoned funding "
+                "TX's wallet inputs (lockunspent)\n");
+    }
+    free(b->hex);
+    memset(b, 0, sizeof(*b));
+}
+
+/* 1 if TXID:VOUT -- an output of a CONFIRMED TX -- is spent in the chain,
+   0 if not, -1 if unknown. */
+static int rot_input_spent_confirmed(lsp_channel_mgr_t *mgr, const char *txid,
+                                     uint32_t vout) {
+    if (rot_tx_confirmations(mgr, txid) < 1) return -1;
+    regtest_t *rt = rot_rt(mgr);
+    if (rt) return regtest_outpoint_spent_in_chain(rt, txid, vout);
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb && cb->is_outpoint_unspent) {
+        int u = cb->is_outpoint_unspent(cb, txid, vout);
+        return u == 0 ? 1 : (u == 1 ? 0 : -1);
+    }
+    return -1;
+}
+
+/* 1 if an input of the recorded funding is spent in the chain (its TX
+   confirmed), 0 if none is. */
+static int rot_funding_input_spent(lsp_channel_mgr_t *mgr) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    if (!rp->new_funding_hex) return 0;
+    size_t n = strlen(rp->new_funding_hex) / 2;
+    unsigned char *bytes = malloc(n ? n : 1);
+    unsigned char (*prev)[32] = calloc(64, 32);
+    uint32_t vouts[64];
+    size_t n_in = 0;
+    int ok = bytes && prev && hex_decode(rp->new_funding_hex, bytes, n) == (int)n &&
+             tx_parse_inputs(bytes, n, prev, vouts, 64, &n_in);
+    int spent = 0;
+    for (size_t i = 0; ok && !spent && i < n_in && i < 64; i++) {
+        char disp[65];
+        rot_txid_display(prev[i], disp);
+        if (rot_input_spent_confirmed(mgr, disp, vouts[i]) == 1) spent = 1;
+    }
+    free(bytes);
+    free(prev);
+    return spent;
+}
+
+/* Depth a spend that conflicts with the recorded funding must reach before
+   the record is dropped: the network's funding / close confirmation setting
+   (regtest 1). */
+static int rot_conflict_safe_depth(lsp_channel_mgr_t *mgr) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (cb) {
+        int r = cb->is_regtest || mgr->rot_is_regtest;
+        int f = chain_funding_confs(cb, r), c = chain_close_confs(cb, r);
+        return f > c ? f : c;
+    }
+    regtest_t *rt = rot_rt(mgr);
+    if (rt) return regtest_network_safe_confirmation_depth(rt);
+    return CONF_DEFAULT_CLOSE;
+}
+
+/* Depth of the confirmed TX that spends an input of the recorded funding:
+   from the bitcoind wallet when it knows the funding (conflicted = negative
+   confirmations), otherwise how many blocks the spend has been seen in the
+   chain.  0 = no such spend (a reorg that undid it resets the count). */
+static int rot_funding_conflict_depth(lsp_channel_mgr_t *mgr) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    regtest_t *rt = rot_rt(mgr);
+    if (rt && rp->new_funding_txid[0]) {
+        int d = regtest_wallet_conflict_depth(rt, rp->new_funding_txid);
+        if (d > 0) return d;
+    }
+    if (!rot_funding_input_spent(mgr)) {
+        rp->conflict_seen_height = 0;
+        return 0;
+    }
+    int h = rot_chain_height(mgr);
+    if (h <= 0) return 0;
+    if (rp->conflict_seen_height == 0 || (uint32_t)h < rp->conflict_seen_height)
+        rp->conflict_seen_height = (uint32_t)h;
+    return h - (int)rp->conflict_seen_height + 1;
+}
+
+/* Called by the creation ceremony right before the first FACTORY_READY:
+   record SIGNING_READY with the tree's digest and its signed distribution
+   TX.  Refusing (the marker cannot be written) aborts the ceremony while no
+   client holds the tree. */
+static int rot_before_factory_ready(void *lsp_v, const factory_t *f, void *ctx) {
+    (void)lsp_v;
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)ctx;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    /* Restart drill: every signature is aggregated, no client has
+       FACTORY_READY yet. */
+    lsp_crash_checkpoint("rotate_ceremony_before_ready");
+    unsigned char d[32];
+    if (!lsp_factory_tree_digest(f, d)) {
+        fprintf(stderr, "LSP rotate: could not digest the replacement tree -- not "
+                "delivering it\n");
+        return 0;
+    }
+    char dh[65];
+    hex_encode(d, 32, dh);
+    char *dist = NULL;
+    if (f->dist_tx_ready == 2 && f->dist_signed_tx.len > 0) {
+        dist = malloc(f->dist_signed_tx.len * 2 + 1);
+        if (!dist) return 0;
+        hex_encode(f->dist_signed_tx.data, f->dist_signed_tx.len, dist);
+    }
+    char saved_digest[65];
+    memcpy(saved_digest, rp->tree_digest, sizeof(saved_digest));
+    char *saved_dist = rp->dist_tx_hex;
+    int saved_phase = rp->phase;
+    memcpy(rp->tree_digest, dh, sizeof(rp->tree_digest));
+    rp->dist_tx_hex = dist;
+    if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_SIGNING_READY)) {
+        memcpy(rp->tree_digest, saved_digest, sizeof(rp->tree_digest));
+        rp->dist_tx_hex = saved_dist;
+        rp->phase = saved_phase;
+        free(dist);
+        return 0;
+    }
+    free(saved_dist);
+    printf("LSP rotate: replacement tree %s recorded (SIGNING_READY); delivering "
+           "FACTORY_READY\n", dh);
+    fflush(stdout);
+    return 1;
+}
+
+int lsp_rotation_signed_tree_matches(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp) return -1;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    if (strlen(rp->tree_digest) != 64 || !rp->new_funding_txid[0] ||
+        rp->new_funding_vout == UINT32_MAX)
+        return -1;
+    unsigned char ftxid[32];
+    if (hex_decode(rp->new_funding_txid, ftxid, 32) != 32) return -1;
+    reverse_bytes(ftxid, 32);
+    const uint64_t *sa = lsp->dist_client_amounts;
+    size_t sn = lsp->dist_n_client_amounts;
+    lsp->dist_client_amounts = rp->dist_amounts;
+    lsp->dist_n_client_amounts = rp->n_dist_amounts;
+    unsigned char d[32];
+    int ok = lsp_factory_creation_digest(lsp, lsp->client_pubkeys, lsp->n_clients,
+                                         ftxid, rp->new_funding_vout,
+                                         rp->new_funding_amount,
+                                         mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                                         mgr->rot_step_blocks,
+                                         mgr->rot_states_per_layer, rp->new_cltv, d);
+    lsp->dist_client_amounts = sa;
+    lsp->dist_n_client_amounts = sn;
+    if (!ok) return -1;
+    char dh[65];
+    hex_encode(d, 32, dh);
+    return strcmp(dh, rp->tree_digest) == 0 ? 1 : 0;
+}
+
+int lsp_rotation_ceremony_failed(lsp_channel_mgr_t *mgr, size_t delivered,
+                                 int delivered_before) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    if (delivered == 0 && !delivered_before &&
+        rp->phase != LSP_ROT_PROGRESS_SIGNING_READY) {
+        /* The hook never recorded SIGNING_READY and nothing was sent: no
+           client can hold the signed tree, so the ceremony may run again. */
+        fprintf(stderr, "LSP rotate: new factory creation failed before its signed tree "
+                "could reach any client (rotation stays resumable over the recorded "
+                "funding)\n");
+        if (rp->phase != LSP_ROT_PROGRESS_FUNDED &&
+            !rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_FUNDED))
+            fprintf(stderr, "LSP rotate: could not record FUNDED; the restart "
+                    "re-runs the ceremony from the marker on disk\n");
+    } else {
+        /* SIGNING_READY was recorded: a FACTORY_READY may have reached a client
+           (even a failed first send can deliver bytes).  Never lowered; any
+           further ceremony goes through the byte-identical-tree gate. */
+        fprintf(stderr, "LSP rotate: new factory creation failed after SIGNING_READY "
+                "(%zu FACTORY_READY sent%s) -- held at SIGNING_READY: a ceremony runs "
+                "again only over a byte-identical tree\n", delivered,
+                delivered_before ? ", an earlier ceremony may have delivered" : "");
+    }
+    return rp->phase;
+}
+
+/* SIGNING_READY and the tree cannot be rebuilt byte-identically: hold, and
+   tell the operator exactly what is recorded and what to do. */
+static void rot_report_signing_hold(lsp_channel_mgr_t *mgr, int why) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    if (rp->hold_reported) return;
+    rp->hold_reported = 1;
+    char dtx[65], dist_txid[65] = "(none recorded)";
+    rot_txid_display(rp->dying_funding_txid, dtx);
+    if (rp->dist_tx_hex) {
+        size_t n = strlen(rp->dist_tx_hex) / 2;
+        unsigned char *b = malloc(n ? n : 1);
+        unsigned char t[32];
+        if (b && hex_decode(rp->dist_tx_hex, b, n) == (int)n && tx_txid_from_bytes(b, n, t))
+            rot_txid_display(t, dist_txid);
+        free(b);
+    }
+    fprintf(stderr,
+        "LSP rotate: HOLD: FACTORY_READY for the replacement over %s:%u was (or may "
+        "have been) delivered -- recorded tree digest %s -- and the tree rebuilt now %s: "
+        "NOT signing a different tree over that output.\n"
+        "LSP rotate: operator: (1) keep the DB: rotation_progress row of dying funding "
+        "%s holds the funding, CLTV %u, the distribution amounts and the tree digest.\n"
+        "LSP rotate: operator: (2) if the mismatch is configuration (factory shape, the "
+        "client set or order, step blocks, states per layer), restart with the "
+        "configuration the rotation ran with; a multi-level shape is not restored from "
+        "the DB on restart (known gap). The resume runs the ceremony again as soon as "
+        "the rebuilt tree matches.\n"
+        "LSP rotate: operator: (3) otherwise broadcast the recorded signed distribution "
+        "TX %s (rotation_progress.dist_tx_hex, sendrawtransaction) after block %u: it "
+        "pays every client its recorded amount from the replacement funding.\n",
+        rp->new_funding_txid, rp->new_funding_vout, rp->tree_digest,
+        why == 0 ? "differs" : "could not be rebuilt", dtx, rp->new_cltv,
+        dist_txid, rp->new_cltv);
+}
+
+/* The replacement funding output (rot_fund_spk) of TXID. */
+static int rot_find_funding_output(lsp_channel_mgr_t *mgr, const char *txid,
+                                   uint32_t *vout, uint64_t *amount) {
+    regtest_t *rt = rot_rt(mgr);
+    if (rt) {
+        for (uint32_t v = 0; v < 4; v++) {
+            uint64_t amt = 0;
+            unsigned char spk[256];
+            size_t spk_len = 0;
+            regtest_get_tx_output(rt, txid, v, &amt, spk, &spk_len);
+            if (amt > 0 && spk_len == mgr->rot_fund_spk_len &&
+                memcmp(spk, mgr->rot_fund_spk, mgr->rot_fund_spk_len) == 0) {
+                *vout = v;
+                *amount = amt;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    /* Light client: lsp_fund_spk_build puts the target at vout 0. */
+    *vout = 0;
+    *amount = mgr->rot_funding_sats;
+    return 1;
+}
+
+/* Fix the ceremony parameters once, when the replacement funding is
+   confirmed: every ceremony over that funding (first run or after a restart)
+   then builds byte-identical transactions.  (The hashlock-poison seed is
+   derived from the LSP key + the funding outpoint, so it is fixed too.) */
+static void rot_fix_ceremony_params(lsp_channel_mgr_t *mgr) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    int h = rot_chain_height(mgr);
+    rp->new_cltv = h > 0 ? (uint32_t)h + (mgr->rot_is_regtest ? 35u : 1008u) : 0;
+    rp->n_dist_amounts = 0;
+    for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
+        rp->dist_amounts[rp->n_dist_amounts++] = mgr->entries[c].channel.funding_amount;
+}
+
+static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       ladder_t *lad, uint32_t dying_id,
+                                       int partial, persist_t *rot_db,
+                                       const unsigned char *rot_cer_id,
+                                       int rot_cer_persisted);
+
 /* --- Factory rotation --- */
+
+
+/* Dry-run the replacement factory's setup over PKS (the clients that will be
+   in it): allocation, tree shape, hashlock poison -- the exact code
+   lsp_run_factory_creation runs, via lsp_factory_creation_preflight -- and,
+   on a bitcoind wallet that does not auto-mine, whether the wallet can fund
+   it (CLOSE_INFLOW_SATS: what a full close pays back to it first).  Changes
+   nothing.  Returns 1 when Phase C would build. */
+static int rotation_preflight(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                              const secp256k1_pubkey *pks, size_t n_pks,
+                              size_t min_pks, uint64_t close_inflow_sats) {
+    uint64_t pf_amounts[FACTORY_MAX_SIGNERS];
+    size_t pf_n_amounts = 0;
+    for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
+        pf_amounts[pf_n_amounts++] = mgr->entries[c].channel.funding_amount;
+    int pf_h = rot_chain_height(mgr);
+    uint32_t pf_cltv = pf_h > 0
+        ? (uint32_t)pf_h + (mgr->rot_is_regtest ? 35u : 1008u) : 0;
+    const uint64_t *pf_saved_amts = lsp->dist_client_amounts;
+    size_t pf_saved_n = lsp->dist_n_client_amounts;
+    lsp->dist_client_amounts = pf_amounts;
+    lsp->dist_n_client_amounts = pf_n_amounts;
+    int pf_ok = n_pks >= min_pks &&
+        lsp_factory_creation_preflight(lsp, pks, n_pks, mgr->rot_funding_sats,
+                                       mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                                       mgr->rot_step_blocks,
+                                       mgr->rot_states_per_layer, pf_cltv);
+    lsp->dist_client_amounts = pf_saved_amts;
+    lsp->dist_n_client_amounts = pf_saved_n;
+    regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
+    if (pf_ok && rt && !mgr->rot_is_regtest) {
+        double pf_bal = regtest_get_balance(rt);
+        double pf_in = (double)close_inflow_sats / 100000000.0;
+        double pf_need = (double)mgr->rot_funding_sats / 100000000.0;
+        if (pf_bal + pf_in < pf_need) {
+            fprintf(stderr, "LSP rotate: preflight: wallet %.8f + close inflow %.8f "
+                    "< %.8f needed for the replacement factory\n",
+                    pf_bal, pf_in, pf_need);
+            pf_ok = 0;
+        }
+    }
+    return pf_ok;
+}
 
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp || !mgr->ladder) return 0;
@@ -76,6 +624,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     ladder_t *lad = (ladder_t *)mgr->ladder;
     fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
     if (!fe) return 0;
+
+    /* A rotation that already crossed its irreversible Phase B close is
+       resumed, never restarted: re-running Phase A/B would try to close a
+       funding output that is already spent. */
+    if (lsp_rotation_progress_pending(mgr))
+        return lsp_rotation_resume(mgr, lsp);
 
     /* Find the DYING (or EXPIRED) factory to rotate from.
        Factory may skip DYING if blocks mine faster than the daemon polls. */
@@ -105,9 +659,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
        DIFFERENT close (fresh wallet address) and rebroadcast it — a double-spend
        the mempool rejects — and Phase C could re-fund a SECOND replacement
        factory from the LSP wallet, stranding LSP liquidity.  If the dying
-       factory's funding outpoint is already spent, the close already happened:
-       complete idempotently (retire + clear retry state) instead of re-running
-       the ceremony.  Fail OPEN — act only on a DEFINITIVE spent (0); proceed
+       factory's funding outpoint is already spent AND the rotation-progress
+       marker shows it was this LSP's own rotation close, the replacement
+       factory still has to be created: resume Phase C (lsp_rotation_resume;
+       no re-close, never a second funding).  Spent with no marker (e.g. by the
+       distribution TX, or a DB from before the marker existed): nothing to
+       rotate -- retire idempotently (clear retry state).  Fail OPEN — act only on a DEFINITIVE spent (0); proceed
        normally on unspent (1) or unknown/error/unimplemented (-1) so a transient
        chain hiccup can never block a legitimate rotation. */
     if (dying->is_funded) {
@@ -127,6 +684,44 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             int unspent = (gchain && gchain->is_outpoint_unspent)
                 ? gchain->is_outpoint_unspent(gchain, fund_disp, dying->factory.funding_vout)
                 : regtest_outpoint_unspent(grt, fund_disp, dying->factory.funding_vout);
+            if (unspent == 0 &&
+                lsp_rotation_load_progress(mgr, dying->factory.funding_txid,
+                                           dying->factory.funding_vout)) {
+                printf("LSP rotate: factory %u funding %s:%u already spent by this "
+                       "LSP's rotation close %s — resuming Phase C (no re-close)\n",
+                       dying_id, fund_disp, dying->factory.funding_vout,
+                       mgr->rot_progress.close_txid);
+                fflush(stdout);
+                return lsp_rotation_resume(mgr, lsp);
+            }
+            if (unspent == 0) {
+                /* No pending marker, but the spender may still be one of this
+                   LSP's recorded rotation closes (a marker cleared after an
+                   eviction, then that close confirmed after all): resume. */
+                char logged[65];
+                int lc = lsp_rotation_find_logged_close(mgr, dying->factory.funding_txid,
+                                                        logged);
+                if (lc > 0) {
+                    printf("LSP rotate: factory %u funding %s:%u was spent by this LSP's "
+                           "recorded rotation close %s (%s) — resuming (no re-close)\n",
+                           dying_id, fund_disp, dying->factory.funding_vout, logged,
+                           lc == 2 ? "confirmed" : "in the mempool");
+                    fflush(stdout);
+                    lsp_rotation_progress_clear(mgr);
+                    mgr->rot_progress.dying_factory_id = dying_id;
+                    memcpy(mgr->rot_progress.dying_funding_txid,
+                           dying->factory.funding_txid, 32);
+                    mgr->rot_progress.dying_funding_vout = dying->factory.funding_vout;
+                    snprintf(mgr->rot_progress.close_txid,
+                             sizeof(mgr->rot_progress.close_txid), "%s", logged);
+                    mgr->rot_progress.new_funding_vout = UINT32_MAX;
+                    if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CLOSING)) {
+                        lsp_rotation_progress_clear(mgr);
+                        return 0;
+                    }
+                    return lsp_rotation_resume(mgr, lsp);
+                }
+            }
             if (unspent == 0) {
                 printf("LSP rotate: factory %u funding %s:%u already spent — a prior "
                        "attempt already broadcast the close; completing rotation "
@@ -142,6 +737,34 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     printf("LSP rotate: starting rotation for factory %u\n", dying_id);
     fflush(stdout);
+
+    /* Preflight BEFORE Phase A.  Phase A hands each cooperating client's
+       factory key to this LSP, so a deterministic Phase C failure must be
+       caught while no key has left a client and the old factory needs nothing
+       from them.  Checked over the clients online now (the set Phase A will
+       ask); the pre-close preflight below re-checks the final, possibly
+       partial, set. */
+    {
+        secp256k1_pubkey *pre_pks = calloc(lsp->n_clients ? lsp->n_clients : 1,
+                                           sizeof(secp256k1_pubkey));
+        if (!pre_pks) return 0;
+        size_t n_pre = 0;
+        for (size_t i = 0; i < lsp->n_clients; i++)
+            if (lsp->client_fds[i] >= 0)
+                pre_pks[n_pre++] = lsp->client_pubkeys[i];
+        int all_online = (n_pre == lsp->n_clients);
+        int pre_ok = rotation_preflight(mgr, lsp, pre_pks, n_pre,
+                                        all_online ? 1u : 2u,
+                                        all_online ? dying->factory.funding_amount_sats : 0);
+        free(pre_pks);
+        if (!pre_ok) {
+            fprintf(stderr, "LSP rotate: preflight FAILED — aborting BEFORE key "
+                    "turnover; factory %u is untouched and no client key was "
+                    "requested (%zu/%zu clients online)\n",
+                    dying_id, n_pre, lsp->n_clients);
+            return 0;
+        }
+    }
 
     /* Drain any in-flight HTLCs before rotation.
        If HTLCs are mid-flight during rotation, they get stranded because
@@ -579,6 +1202,51 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
+    /* --- Pre-close preflight: nothing irreversible has happened yet ---
+       Everything after Phase B that can fail deterministically is checked
+       HERE, while the old factory is still live: the replacement factory's
+       participants are online, its setup builds (allocation, tree shape,
+       hashlock poison -- the exact code lsp_run_factory_creation runs, via
+       lsp_factory_creation_preflight), and a bitcoind wallet that does not
+       auto-mine will be able to fund it.  A failure aborts with the old
+       factory untouched; the retry path tries again later. */
+    {
+        size_t n_pf = 0;
+        secp256k1_pubkey *pf_pks = calloc(lsp->n_clients ? lsp->n_clients : 1,
+                                          sizeof(secp256k1_pubkey));
+        if (!pf_pks) return 0;
+        if (partial) {
+            uint32_t pf_coop[FACTORY_MAX_SIGNERS];
+            size_t pf_n_coop = ladder_get_cooperative_clients(lad, dying_id,
+                                                              pf_coop, FACTORY_MAX_SIGNERS);
+            for (size_t i = 0; i < pf_n_coop; i++) {
+                uint32_t ci = pf_coop[i];
+                if (ci >= 1 && ci <= lsp->n_clients && lsp->client_fds[ci - 1] >= 0)
+                    pf_pks[n_pf++] = lsp->client_pubkeys[ci - 1];
+            }
+        } else {
+            for (size_t i = 0; i < lsp->n_clients; i++)
+                pf_pks[n_pf++] = lsp->client_pubkeys[i];
+        }
+        /* A full close pays the old factory's funds back to this wallet
+           before Phase C funds the replacement. */
+        int pf_ok = rotation_preflight(mgr, lsp, pf_pks, n_pf, partial ? 2u : 1u,
+                                       full_close ? dying->factory.funding_amount_sats : 0);
+        free(pf_pks);
+        if (!pf_ok) {
+            fprintf(stderr, "LSP rotate: preflight FAILED — aborting BEFORE the close; "
+                    "factory %u is untouched\n", dying_id);
+            if (rot_cer_persisted) {
+                persist_update_ceremony_state(rot_db, rot_cer_id,
+                                               PERSIST_CEREMONY_STATE_ABORTED);
+                persist_update_ceremony_artifacts(rot_db, rot_cer_id, NULL, NULL, NULL,
+                                                   /*has_abort_reason*/ 1,
+                                                   PERSIST_CEREMONY_PHASE_REFUSED);
+            }
+            return 0;
+        }
+    }
+
     /* #245 Gap A: Phase B is about to commit the close/partial-retire TX.
        Bump state to PENDING_SIGS so a crash here re-enters with the right
        context — we no longer need to redo Phase A turnover, but we DO need
@@ -664,18 +1332,66 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
         char rc_txid[65];
-        int rc_sent = chain_be ? chain_be->send_raw_tx(chain_be, rc_hex, rc_txid) :
-                                 regtest_send_raw_tx(rt, rc_hex, rc_txid);
+        {
+            unsigned char rc_txid32[32];
+            if (!tx_txid_from_bytes(rot_close_tx.data, rot_close_tx.len, rc_txid32)) {
+                fprintf(stderr, "LSP rotate: could not compute the close TX's txid\n");
+                free(rc_hex);
+                tx_buf_free(&rot_close_tx);
+                return 0;
+            }
+            rot_txid_display(rc_txid32, rc_txid);
+        }
+        tx_buf_free(&rot_close_tx);
+
+        /* Point of no return: once on the network the close pays every
+           client's balance to this wallet.  Record it (txid + signed hex, in
+           rotation_closes too) BEFORE broadcasting, so a crash right after the
+           broadcast still finds it and resumes Phase C. */
+        lsp_rotation_progress_clear(mgr);
+        mgr->rot_progress.dying_factory_id = dying_id;
+        memcpy(mgr->rot_progress.dying_funding_txid, dying->factory.funding_txid, 32);
+        mgr->rot_progress.dying_funding_vout = dying->factory.funding_vout;
+        snprintf(mgr->rot_progress.close_txid, sizeof(mgr->rot_progress.close_txid),
+                 "%s", rc_txid);
+        mgr->rot_progress.new_funding_vout = UINT32_MAX;
         if (mgr->persist) {
-            persist_log_broadcast((persist_t *)mgr->persist,
-                                  rc_sent ? rc_txid : "?", "rotation_close",
+            char dtx[65];
+            rot_txid_display(dying->factory.funding_txid, dtx);
+            if (persist_in_transaction((persist_t *)mgr->persist) ||
+                !persist_add_rotation_close((persist_t *)mgr->persist, dtx, rc_txid, rc_hex)) {
+                fprintf(stderr, "LSP rotate: could not record the close TX -- NOT "
+                        "broadcasting it (factory %u untouched)\n", dying_id);
+                free(rc_hex);
+                lsp_rotation_progress_clear(mgr);
+                return 0;
+            }
+        }
+        if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CLOSING)) {
+            fprintf(stderr, "LSP rotate: NOT broadcasting the close (factory %u "
+                    "untouched)\n", dying_id);
+            free(rc_hex);
+            lsp_rotation_progress_clear(mgr);
+            return 0;
+        }
+        printf("LSP rotate: rotation close %s recorded; broadcasting\n", rc_txid);
+        fflush(stdout);
+        char rc_sent_txid[65] = {0};
+        int rc_sent = rot_send_hex(mgr, rc_hex, rc_sent_txid);
+        if (mgr->persist) {
+            persist_log_broadcast((persist_t *)mgr->persist, rc_txid, "rotation_close",
                                   rc_hex, rc_sent ? "ok" : "failed");
         }
         free(rc_hex);
-        tx_buf_free(&rot_close_tx);
-
-        if (!rc_sent) {
-            fprintf(stderr, "LSP rotate: close TX broadcast failed\n");
+        /* Restart drill: the close is on the network (or at least recorded),
+           not yet confirmed. */
+        lsp_crash_checkpoint("rotate_close_sent");
+        if (!rc_sent && !rot_tx_in_mempool(mgr, rc_txid) &&
+            rot_tx_confirmations(mgr, rc_txid) < 1) {
+            fprintf(stderr, "LSP rotate: close TX broadcast failed -- factory %u stays "
+                    "open; the recorded close stays known\n", dying_id);
+            (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_NONE);
+            lsp_rotation_progress_clear(mgr);
             return 0;
         }
 
@@ -725,12 +1441,19 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         printf("LSP rotate: factory %u closed: %s\n", dying_id, rc_txid);
         /* Mark as rotated so CLI "rotate" won't try to rotate it again */
         dying->partial_rotation_done = 1;
+        if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CLOSED)) {
+            /* Stays CLOSING on disk: the resume sees the close confirmed. */
+            return 0;
+        }
+        /* The dying factory's funding is spent: its distribution TX can never
+           confirm.  Drop it so the EXPIRED auto-broadcast does not try. */
+        tx_buf_free(&dying->distribution_tx);
         /* #332 restart-resume drill checkpoint: the close is broadcast +
-           confirmed (funding now spent on-chain) but the replacement factory
-           has NOT been created/persisted yet.  A crash here leaves the DB
-           showing this factory still DYING with its now-spent funding, so the
-           restart retry path re-enters rotation and MUST take the already-spent
-           idempotency guard above (no re-close, no re-fund). */
+           confirmed (funding now spent on-chain, every client balance now in
+           this wallet) but the replacement factory has NOT been created yet.
+           A crash here leaves the CLOSED progress marker, so the restarted LSP
+           resumes Phase C (lsp_rotation_resume): no re-close, exactly one
+           replacement funding. */
         lsp_crash_checkpoint("rotate_close_broadcast");
         /* CL4-rollover (#250): the mid-window adversarial broadcast that
            used to live here was dead code on the regtest test path —
@@ -761,119 +1484,233 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
+    return rotation_create_replacement(mgr, lsp, lad, dying_id, partial,
+                                       rot_db, rot_cer_id, rot_cer_persisted);
+}
+
+/* Phase C + D: fund the replacement factory (unless a recorded earlier
+   attempt already did), create + sign it over that output, store + persist
+   it, and reinitialize the channels with the carried balances.  Shared by a
+   fresh rotation (right after Phase B) and lsp_rotation_resume.  A full
+   rotation (close recorded in mgr->rot_progress) records each step so any
+   failure here stays resumable. */
+static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       ladder_t *lad, uint32_t dying_id,
+                                       int partial, persist_t *rot_db,
+                                       const unsigned char *rot_cer_id,
+                                       int rot_cer_persisted) {
+    fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
+    regtest_t *rt = rot_rt(mgr);
+    chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    /* Full rotation whose close is recorded: every step is resumable. */
+    int track = !partial && rp->phase >= LSP_ROT_PROGRESS_CLOSED;
+    if (!fe || (!rt && !chain_be)) return 0;
+
     /* --- Phase C: Create new factory --- */
     printf("LSP rotate: Phase C — creating new factory\n");
 
-    /* Fund new factory */
-    if (mgr->rot_is_regtest) {
-        /* Ensure wallet has funds */
-        double bal = regtest_get_balance(rt);
-        if (bal < 0.01) {
-            regtest_mine_blocks(rt, 10, mgr->rot_mine_addr);
+    /* Participants must be online BEFORE funding (this used to be checked
+       only after the funding confirmed, stranding the new funding output
+       whenever a client had dropped). */
+    {
+        size_t need = 0, on = 0;
+        if (partial) {
+            uint32_t pc[FACTORY_MAX_SIGNERS];
+            size_t npc = ladder_get_cooperative_clients(lad, dying_id, pc,
+                                                        FACTORY_MAX_SIGNERS);
+            for (size_t i = 0; i < npc; i++)
+                if (pc[i] >= 1 && pc[i] <= lsp->n_clients &&
+                    lsp->client_fds[pc[i] - 1] >= 0)
+                    on++;
+            need = 2;
+        } else {
+            for (size_t i = 0; i < lsp->n_clients; i++)
+                if (lsp->client_fds[i] >= 0) on++;
+            need = lsp->n_clients;
         }
-    } else if (rt) {
-        double bal = regtest_get_balance(rt);
-        double needed = (double)mgr->rot_funding_sats / 100000000.0;
-        if (bal < needed) {
-            fprintf(stderr, "LSP rotate: insufficient balance %.8f (need %.8f)\n",
-                    bal, needed);
+        if (on < need) {
+            fprintf(stderr, "LSP rotate: only %zu participant(s) online (need %zu) — "
+                    "not funding the replacement factory%s\n", on, need,
+                    track ? " (rotation stays resumable)" : "");
             return 0;
         }
     }
-    /* In light-client mode: skip balance check; lsp_fund_spk will fail if no UTXO */
 
     char fund_txid_hex[65];
-    if (rt) {
-        double funding_btc = (double)mgr->rot_funding_sats / 100000000.0;
-        if (!regtest_fund_address(rt, mgr->rot_fund_addr, funding_btc, fund_txid_hex)) {
-            fprintf(stderr, "LSP rotate: fund new factory failed\n");
-            return 0;
-        }
+    uint64_t fund_amount = 0;
+    uint32_t fund_vout = 0;
+    if (track && (rp->phase == LSP_ROT_PROGRESS_FUNDED ||
+                  rp->phase == LSP_ROT_PROGRESS_SIGNING_READY) &&
+        rp->new_funding_txid[0] && rp->new_funding_vout != UINT32_MAX) {
+        /* Resume: the replacement funding is recorded and confirmed.  NEVER
+           fund a second time -- create the factory over it. */
+        snprintf(fund_txid_hex, sizeof(fund_txid_hex), "%s", rp->new_funding_txid);
+        fund_vout = rp->new_funding_vout;
+        fund_amount = rp->new_funding_amount;
+        printf("LSP rotate: replacement factory already funded by an earlier "
+               "attempt (%s:%u, %d conf) — not re-funding\n", fund_txid_hex, fund_vout,
+               rot_tx_confirmations(mgr, fund_txid_hex));
+    } else if (track && rp->phase != LSP_ROT_PROGRESS_CLOSED) {
+        fprintf(stderr, "LSP rotate: rotation is at phase %d, not CLOSED -- not "
+                "funding a replacement\n", rp->phase);
+        return 0;
     } else {
-        if (!wallet_src || !chain_be) {
-            fprintf(stderr, "LSP rotate: no wallet/chain for light-client funding\n");
-            return 0;
-        }
-        if (!lsp_fund_spk(wallet_src, chain_be,
-                          mgr->rot_fund_spk, mgr->rot_fund_spk_len,
-                          mgr->rot_funding_sats, 0, fund_txid_hex)) {
-            fprintf(stderr, "LSP rotate: light-client fund new factory failed\n");
-            return 0;
-        }
-    }
-    if (mgr->rot_is_regtest) {
-        regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
-    } else {
-        int rot_timeout = mgr->confirm_timeout_secs > 0 ?
-                          mgr->confirm_timeout_secs : 7200;
-        printf("LSP rotate: waiting for funding confirmation...\n");
-        int confirmed = 0;
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (chain_be) {
-                if (lsp_wait_for_confirmation_service(chain_be, fund_txid_hex, rot_timeout,
-                                                       chain_funding_confs(chain_be, chain_be->is_regtest), mgr, lsp)) {
-                    confirmed = 1; break;
-                }
-                if (chain_be->is_in_mempool(chain_be, fund_txid_hex)) {
-                    fprintf(stderr, "LSP rotate: funding TX still in mempool, "
-                            "extending wait (attempt %d)\n", attempt + 1);
-                    continue;
-                }
-            } else {
-                /* R2 + R3 (mainnet pre-flight): reorg-resilient + network-safe
-                   confirmation depth (regtest=1, signet/testnet4=3, mainnet=6). */
-                int safe_depth_fund = regtest_network_safe_confirmation_depth(rt);
-                if (regtest_wait_for_stable_confirmation(rt, fund_txid_hex,
-                                                          safe_depth_fund,
-                                                          /*max_reorg_depth=*/3,
-                                                          rot_timeout) >= 1) {
-                    confirmed = 1; break;
-                }
-                if (regtest_is_in_mempool(rt, fund_txid_hex)) {
-                    fprintf(stderr, "LSP rotate: funding TX still in mempool, "
-                            "extending wait (attempt %d)\n", attempt + 1);
-                    continue;
-                }
+        /* Fund new factory */
+        if (mgr->rot_is_regtest) {
+            /* Ensure wallet has funds */
+            double bal = regtest_get_balance(rt);
+            if (bal < 0.01) {
+                regtest_mine_blocks(rt, 10, mgr->rot_mine_addr);
             }
-            fprintf(stderr, "LSP rotate: funding TX dropped from mempool\n");
-            break;
+        } else if (rt) {
+            double bal = regtest_get_balance(rt);
+            double needed = (double)mgr->rot_funding_sats / 100000000.0;
+            if (bal < needed) {
+                fprintf(stderr, "LSP rotate: insufficient balance %.8f (need %.8f)\n",
+                        bal, needed);
+                return 0;
+            }
         }
-        if (!confirmed) {
-            fprintf(stderr, "LSP rotate: funding TX not confirmed after retries\n");
+        /* In light-client mode: skip balance check; the build fails if no UTXO */
+
+        /* Build + sign the funding TX, record it (txid + hex), THEN broadcast:
+           a crash after the broadcast finds the recorded funding and never
+           funds a second replacement. */
+        rot_funding_tx_t fb;
+        if (!rot_build_funding_tx(mgr, &fb)) {
+            fprintf(stderr, "LSP rotate: fund new factory failed (could not build the "
+                    "funding TX)\n");
             return 0;
+        }
+        snprintf(fund_txid_hex, sizeof(fund_txid_hex), "%s", fb.txid);
+        if (track) {
+            snprintf(rp->new_funding_txid, sizeof(rp->new_funding_txid), "%s",
+                     fund_txid_hex);
+            free(rp->new_funding_hex);
+            rp->new_funding_hex = strdup(fb.hex);
+            rp->new_funding_vout = UINT32_MAX;
+            rp->new_funding_amount = 0;
+            if (!rp->new_funding_hex ||
+                !rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_FUNDING)) {
+                fprintf(stderr, "LSP rotate: could not record the replacement funding "
+                        "-- NOT broadcasting it (its wallet inputs are released)\n");
+                rp->new_funding_txid[0] = '\0';
+                free(rp->new_funding_hex);
+                rp->new_funding_hex = NULL;
+                rot_funding_abandon(mgr, &fb);
+                return 0;
+            }
+            printf("LSP rotate: replacement funding %s recorded; broadcasting\n",
+                   fund_txid_hex);
+            fflush(stdout);
+        }
+        char f_sent_txid[65] = {0};
+        int f_sent = rot_send_hex(mgr, fb.hex, f_sent_txid);
+        if (mgr->persist)
+            persist_log_broadcast((persist_t *)mgr->persist, fund_txid_hex,
+                                  "rotation_funding", fb.hex, f_sent ? "ok" : "failed");
+        /* Restart drill: the funding is sent (and recorded), not confirmed. */
+        lsp_crash_checkpoint("rotate_funding_sent");
+        if (!f_sent && !rot_tx_in_mempool(mgr, fund_txid_hex) &&
+            rot_tx_confirmations(mgr, fund_txid_hex) < 1) {
+            if (track) {
+                /* Recorded: the resume rebroadcasts this TX, never a different
+                   one, so its inputs stay locked / reserved. */
+                if (fb.light) {
+                    rp->fund_reserved = 1;
+                    memcpy(rp->fund_reserved_txid, fb.res_txid, 65);
+                    rp->fund_reserved_vout = fb.res_vout;
+                }
+                free(fb.hex);
+                fprintf(stderr, "LSP rotate: replacement funding broadcast failed "
+                        "(recorded: the resume rebroadcasts this TX, never a different "
+                        "one)\n");
+            } else {
+                rot_funding_abandon(mgr, &fb);
+                fprintf(stderr, "LSP rotate: replacement funding broadcast failed\n");
+            }
+            return 0;
+        }
+        /* On the network: a light-client reservation has done its job. */
+        if (fb.light) {
+            wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+            if (ws && ws->release_utxo) ws->release_utxo(ws, fb.res_txid, fb.res_vout);
+        }
+        free(fb.hex);
+        if (mgr->rot_is_regtest) {
+            regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+        } else {
+            int rot_timeout = mgr->confirm_timeout_secs > 0 ?
+                              mgr->confirm_timeout_secs : 7200;
+            printf("LSP rotate: waiting for funding confirmation...\n");
+            int confirmed = 0;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                if (chain_be) {
+                    if (lsp_wait_for_confirmation_service(chain_be, fund_txid_hex, rot_timeout,
+                                                           chain_funding_confs(chain_be, chain_be->is_regtest), mgr, lsp)) {
+                        confirmed = 1; break;
+                    }
+                    if (chain_be->is_in_mempool(chain_be, fund_txid_hex)) {
+                        fprintf(stderr, "LSP rotate: funding TX still in mempool, "
+                                "extending wait (attempt %d)\n", attempt + 1);
+                        continue;
+                    }
+                } else {
+                    /* R2 + R3 (mainnet pre-flight): reorg-resilient + network-safe
+                       confirmation depth (regtest=1, signet/testnet4=3, mainnet=6). */
+                    int safe_depth_fund = regtest_network_safe_confirmation_depth(rt);
+                    if (regtest_wait_for_stable_confirmation(rt, fund_txid_hex,
+                                                              safe_depth_fund,
+                                                              /*max_reorg_depth=*/3,
+                                                              rot_timeout) >= 1) {
+                        confirmed = 1; break;
+                    }
+                    if (regtest_is_in_mempool(rt, fund_txid_hex)) {
+                        fprintf(stderr, "LSP rotate: funding TX still in mempool, "
+                                "extending wait (attempt %d)\n", attempt + 1);
+                        continue;
+                    }
+                }
+                fprintf(stderr, "LSP rotate: funding TX dropped from mempool\n");
+                break;
+            }
+            if (!confirmed) {
+                fprintf(stderr, "LSP rotate: funding TX not confirmed after retries%s\n",
+                        track ? " (stays FUNDING: the resume confirms or rebroadcasts it)" : "");
+                return 0;
+            }
+        }
+        if (!rot_find_funding_output(mgr, fund_txid_hex, &fund_vout, &fund_amount)) {
+            fprintf(stderr, "LSP rotate: could not find funding output\n");
+            return 0;
+        }
+        if (track) {
+            rp->new_funding_vout = fund_vout;
+            rp->new_funding_amount = fund_amount;
+            rot_fix_ceremony_params(mgr);
+            if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_FUNDED))
+                return 0;                  /* stays FUNDING on disk: resumable */
         }
     }
 
     unsigned char fund_txid[32];
     hex_decode(fund_txid_hex, fund_txid, 32);
     reverse_bytes(fund_txid, 32);
-
-    uint64_t fund_amount = 0;
-    uint32_t fund_vout = 0;
-    if (rt) {
-        /* Regtest: query bitcoin-cli for the exact output */
-        unsigned char actual_spk[256];
-        size_t actual_spk_len = 0;
-        for (uint32_t v = 0; v < 4; v++) {
-            regtest_get_tx_output(rt, fund_txid_hex, v,
-                                  &fund_amount, actual_spk, &actual_spk_len);
-            if (actual_spk_len == mgr->rot_fund_spk_len &&
-                memcmp(actual_spk, mgr->rot_fund_spk, mgr->rot_fund_spk_len) == 0) {
-                fund_vout = v;
-                break;
-            }
-        }
-    } else {
-        /* Light-client: lsp_fund_spk always puts target at vout=0 */
-        fund_vout = 0;
-        fund_amount = mgr->rot_funding_sats;
-    }
-    if (fund_amount == 0) {
-        fprintf(stderr, "LSP rotate: could not find funding output\n");
-        return 0;
-    }
     printf("LSP rotate: funded %llu sats, txid: %s, vout=%u\n",
            (unsigned long long)fund_amount, fund_txid_hex, fund_vout);
+    if (track) {
+        /* Never create over an outpoint that is already gone. */
+        if (rot_outpoint_unspent(mgr, fund_txid_hex, fund_vout) == 0) {
+            fprintf(stderr, "LSP rotate: replacement funding %s:%u is already SPENT — "
+                    "cannot create the factory over it (operator attention)\n",
+                    fund_txid_hex, fund_vout);
+            return 0;
+        }
+    }
+    /* Restart drill: replacement funded + confirmed, not yet signed -- the
+       exact state the profiles-NULL crash left behind. */
+    lsp_crash_checkpoint("rotate_replacement_funded");
 
     /* For partial rotation: remap client arrays to cooperative subset */
     int saved_client_fds[LSP_MAX_CLIENTS];
@@ -929,10 +1766,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
-    /* Verify ALL participating clients are still connected before committing
-       to new factory.  Factory creation sends FACTORY_PROPOSE to every client;
-       if any is offline the ceremony fails AFTER we've already freed the old
-       factory, leaving the daemon in a broken state. */
+    /* Re-verify ALL participating clients are still connected (checked
+       before funding too, but the confirmation wait can be long).  Factory
+       creation sends FACTORY_PROPOSE to every client; abort before it if any
+       dropped -- a full rotation stays resumable. */
     {
         size_t online = 0;
         for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -976,37 +1813,113 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     }
     lsp->factory.leaf_arity = (factory_arity_t)mgr->rot_leaf_arity;
 
-    /* Compute cltv_timeout for new factory */
+    /* Ceremony parameters.  A tracked rotation fixed them when its funding
+       confirmed (FUNDED), so every ceremony over this funding -- the first run
+       or one after a restart -- builds byte-identical transactions. */
     uint32_t new_cltv = 0;
-    {
-        int cur_h = regtest_get_block_height(rt);
-        if (cur_h > 0) {
-            int offset = mgr->rot_is_regtest ? 35 : 1008;
-            new_cltv = (uint32_t)cur_h + offset;
+    uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
+    size_t n_rot_dist = 0;
+    if (track) {
+        if (rp->n_dist_amounts == 0) {
+            rot_fix_ceremony_params(mgr);
+            if (!rot_progress_persist(mgr)) {
+                if (partial) {
+                    memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+                    memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                    lsp->n_clients = (size_t)mgr->n_channels;
+                }
+                return 0;
+            }
         }
+        new_cltv = rp->new_cltv;
+        n_rot_dist = rp->n_dist_amounts;
+        memcpy(rot_dist_amounts, rp->dist_amounts, n_rot_dist * sizeof(uint64_t));
+    } else {
+        int cur_h = rot_chain_height(mgr);
+        if (cur_h > 0)
+            new_cltv = (uint32_t)cur_h + (mgr->rot_is_regtest ? 35u : 1008u);
+        /* Per-client account_limit (channel capacity) for the new factory's
+           distribution TX: each client's contracted capacity on CLTV expiry,
+           not their current balance (which would let the LSP protect
+           accumulated fees simply by going dark). */
+        for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
+            rot_dist_amounts[n_rot_dist++] = mgr->entries[c].channel.funding_amount;
     }
 
-    /* Per-client account_limit (channel capacity) for the new factory's
-       distribution TX. Inversion-of-timeout-default pays each client their
-       contracted capacity on CLTV expiry — not their current balance, which
-       would let the LSP protect accumulated fees simply by going dark.
-       For the current homogeneous-capacity design, funding_amount is the
-       same across all channels; kept as a per-client array to prepare for
-       heterogeneous-capacity factories. */
-    uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
-    for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
-        rot_dist_amounts[c] = mgr->entries[c].channel.funding_amount;
+    /* The replacement's ladder slot must exist BEFORE its ceremony: once the
+       clients hold its signed tree there is no backing out. */
+    if (lad->n_factories >= LADDER_MAX_FACTORIES)
+        ladder_evict_expired(lad);
+    if (lad->n_factories >= LADDER_MAX_FACTORIES) {
+        fprintf(stderr, "LSP rotate: no ladder slots available — not running the "
+                "creation ceremony\n");
+        if (partial) {
+            memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+            memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+            lsp->n_clients = (size_t)mgr->n_channels;
+        }
+        return 0;
+    }
+
+    /* A ceremony over this funding may already have delivered its signed
+       tree (SIGNING_READY): run one again only if it builds exactly the same
+       transactions, so the clients can never hold two different trees over
+       one output. */
+    int delivered_before = track && rp->phase == LSP_ROT_PROGRESS_SIGNING_READY;
+    if (delivered_before) {
+        int m = lsp_rotation_signed_tree_matches(mgr, lsp);
+        if (m != 1) {
+            rot_report_signing_hold(mgr, m);
+            if (partial) {
+                memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+                memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                lsp->n_clients = (size_t)mgr->n_channels;
+            }
+            return 0;
+        }
+        printf("LSP rotate: the tree rebuilt from the recorded parameters is "
+               "byte-identical to the delivered one (digest %s) — running the "
+               "ceremony again over the same transactions\n", rp->tree_digest);
+        fflush(stdout);
+    }
+
+    /* SIGNING: a ceremony may start; no client holds its tree yet.  The
+       ceremony's before_factory_ready hook records SIGNING_READY right before
+       the first FACTORY_READY.  (A SIGNING_READY marker is never lowered.) */
+    if (track && !delivered_before) {
+        rp->hold_reported = 0;
+        if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_SIGNING)) {
+            if (partial) {
+                memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
+                memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                lsp->n_clients = (size_t)mgr->n_channels;
+            }
+            return 0;
+        }
+    }
+    if (track) {
+        lsp->before_factory_ready = rot_before_factory_ready;
+        lsp->before_factory_ready_ctx = mgr;
+    }
+
     lsp->dist_client_amounts = rot_dist_amounts;
-    lsp->dist_n_client_amounts = mgr->n_channels;
+    lsp->dist_n_client_amounts = n_rot_dist;
 
     /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients) */
-    if (!lsp_run_factory_creation(lsp,
-                                   fund_txid, fund_vout,
-                                   fund_amount,
-                                   mgr->rot_fund_spk, mgr->rot_fund_spk_len,
-                                   mgr->rot_step_blocks,
-                                   mgr->rot_states_per_layer, new_cltv)) {
-        fprintf(stderr, "LSP rotate: new factory creation failed\n");
+    int created = lsp_run_factory_creation(lsp,
+                                           fund_txid, fund_vout,
+                                           fund_amount,
+                                           mgr->rot_fund_spk, mgr->rot_fund_spk_len,
+                                           mgr->rot_step_blocks,
+                                           mgr->rot_states_per_layer, new_cltv);
+    lsp->before_factory_ready = NULL;
+    lsp->before_factory_ready_ctx = NULL;
+    if (!created) {
+        if (!track)
+            fprintf(stderr, "LSP rotate: new factory creation failed\n");
+        else
+            (void)lsp_rotation_ceremony_failed(mgr, lsp->ceremony_ready_sent,
+                                               delivered_before);
         /* lsp->factory holds the caller's template again (arrays allocated;
            see lsp_run_factory_creation's failure path).  Restore the client
            arrays so the daemon can keep servicing connections. */
@@ -1021,22 +1934,58 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     }
     lsp->dist_client_amounts = NULL;
     lsp->dist_n_client_amounts = 0;
+    /* Restart drill: the clients hold the signed tree (SIGNING_READY);
+       nothing persisted yet. */
+    lsp_crash_checkpoint("rotate_ceremony_signed");
 
     /* Set lifecycle for new factory */
     {
-        int cur_h = regtest_get_block_height(rt);
+        int cur_h = rot_chain_height(mgr);
         if (cur_h > 0)
             factory_set_lifecycle(&lsp->factory, (uint32_t)cur_h,
                                   lad->active_blocks, lad->dying_blocks);
     }
     lsp->factory.fee = fe;
 
-    /* Evict expired factories if at max capacity */
-    if (lad->n_factories >= LADDER_MAX_FACTORIES)
-        ladder_evict_expired(lad);
+    /* Persist the new factory and record SIGNED in ONE transaction: the marker
+       says "signed" exactly when the signed replacement is on disk. */
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        if (!persist_begin(db)) {
+            fprintf(stderr, "LSP rotate: CRITICAL: persist_begin failed for the signed "
+                    "replacement%s\n", track ? " (held at SIGNING: operator attention)" : "");
+            return 0;
+        }
+        int pok = persist_save_factory(db, &lsp->factory, mgr->ctx, 0) &&
+                  persist_save_tree_nodes(db, &lsp->factory, 0);
+        if (pok && track) {
+            char dtx[65];
+            rot_txid_display(rp->dying_funding_txid, dtx);
+            persist_rotation_progress_t row;
+            rp->phase = LSP_ROT_PROGRESS_SIGNED;
+            rot_progress_to_row(rp, &row);
+            pok = persist_save_rotation_progress(db, dtx, &row);
+            if (!pok) rp->phase = LSP_ROT_PROGRESS_SIGNING_READY;
+        }
+        if (!pok) {
+            persist_rollback(db);
+            fprintf(stderr, "LSP rotate: CRITICAL: the replacement is signed but could not "
+                    "be persisted -- rolled back%s\n",
+                    track ? "; held at SIGNING_READY" : "");
+            return 0;
+        }
+        if (!persist_commit(db)) {
+            if (track) rp->phase = LSP_ROT_PROGRESS_SIGNING_READY;
+            fprintf(stderr, "LSP rotate: CRITICAL: commit of the signed replacement "
+                    "failed%s\n", track ? "; held at SIGNING_READY" : "");
+            return 0;
+        }
+    } else if (track) {
+        rp->phase = LSP_ROT_PROGRESS_SIGNED;
+    }
 
-    /* Store new factory in next ladder slot */
-    if (lad->n_factories < LADDER_MAX_FACTORIES) {
+    /* Store new factory in its ladder slot (checked free before the ceremony) */
+    {
         ladder_factory_t *lf_new = &lad->factories[lad->n_factories];
         memset(lf_new, 0, sizeof(*lf_new));
         lf_new->factory = lsp->factory;
@@ -1045,36 +1994,18 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         lf_new->is_initialized = 1;
         lf_new->is_funded = 1;
         lf_new->cached_state = FACTORY_ACTIVE;
-        /* #90: copy the SIGNED distribution TX from the ceremony. Previously this
-           copied dist_UNSIGNED_tx, which is unrelayable -> the LSP-side auto-broadcast
-           at EXPIRED (lsp_channels.c) silently failed. Require dist_tx_ready==2
-           (signed); if only the unsigned exists, leave distribution_tx empty (skip
-           auto-broadcast) rather than broadcast an invalid tx. Offline clients still
-           hold their own co-signed copy (wire.c ships dist_signed_tx), so fund safety
-           is unaffected either way. */
+        /* #90: copy the SIGNED distribution TX from the ceremony (only
+           dist_tx_ready == 2); leave the slot empty otherwise rather than
+           broadcast an invalid TX.  Offline clients hold their own co-signed
+           copy (wire.c ships dist_signed_tx), so fund safety is unaffected. */
         (void)ladder_factory_store_distribution_tx(lf_new, &lsp->factory);
         lad->n_factories++;
-    } else {
-        fprintf(stderr, "LSP rotate: no ladder slots available\n");
-        return 0;
     }
 
-    /* Persist new factory (transactional) */
-    if (mgr->persist) {
-        persist_t *db = (persist_t *)mgr->persist;
-        if (!persist_begin(db)) {
-            fprintf(stderr, "LSP rotate: persist_begin failed\n");
-            return 0;
-        }
-        if (!persist_save_factory(db, &lsp->factory, mgr->ctx, 0) ||
-            !persist_save_tree_nodes(db, &lsp->factory, 0)) {
-            fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
-            persist_rollback(db);
-            return 0;
-        } else {
-            persist_commit(db);
-        }
-    }
+    printf("LSP rotate: factory %u created and signed over %s:%u "
+           "(replaces factory %u)\n",
+           lad->factories[lad->n_factories - 1].factory_id,
+           fund_txid_hex, fund_vout, dying_id);
 
     /* Close fds for uncooperative clients (partial rotation only) */
     if (partial) {
@@ -1137,8 +2068,17 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         saved_ch_remote[c] = mgr->entries[c].channel.remote_amount;
     }
 
+    /* lsp_channels_init zeroes mgr: carry the rotation marker across it. */
+    lsp_rotation_progress_t *saved_rp = malloc(sizeof(*saved_rp));
+    if (!saved_rp) {
+        secure_zero(saved_seckey, 32);
+        return 0;
+    }
+    *saved_rp = mgr->rot_progress;
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
+        mgr->rot_progress = *saved_rp;
+        free(saved_rp);
         fprintf(stderr, "LSP rotate: channel reinit failed\n");
         secure_zero(saved_seckey, 32);
         if (rot_cer_persisted) {
@@ -1151,6 +2091,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     }
 
     /* Restore saved state */
+    mgr->rot_progress = *saved_rp;
+    free(saved_rp);
     mgr->bridge_fd = saved_bridge_fd;
     mgr->watchtower = saved_wt;
     mgr->persist = saved_persist;
@@ -1298,9 +2240,253 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
+    if (track) {
+        /* Phase D done: nothing left to resume for this rotation. */
+        (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_DONE);
+        lsp_rotation_progress_clear(mgr);
+    }
+
     printf("LSP rotate: rotation complete — new factory active with %zu channels\n",
            mgr->n_channels);
     return 1;
+}
+
+/* CLOSING: 1 = a recorded close is confirmed (now CLOSED), 0 = wait,
+   -1 = nothing to resume (marker cleared). */
+static int rot_resume_close(lsp_channel_mgr_t *mgr, ladder_factory_t *dying,
+                            uint32_t dying_id) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    regtest_t *rt = rot_rt(mgr);
+    char found[65];
+    int lc;
+    if (mgr->persist) {
+        lc = lsp_rotation_find_logged_close(mgr, rp->dying_funding_txid, found);
+    } else {
+        snprintf(found, sizeof(found), "%s", rp->close_txid);
+        lc = rot_tx_confirmations(mgr, found) >= 1 ? 2 :
+             (rot_tx_in_mempool(mgr, found) ? 1 : 0);
+    }
+    if (lc == 1 && mgr->rot_is_regtest && rt) {
+        regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+        if (rot_tx_confirmations(mgr, found) >= 1) lc = 2;
+    }
+    if (lc == 2) {
+        snprintf(rp->close_txid, sizeof(rp->close_txid), "%s", found);
+        printf("LSP rotate: rotation close %s of factory %u is confirmed\n",
+               rp->close_txid, dying_id);
+        if (dying) tx_buf_free(&dying->distribution_tx);
+        return rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CLOSED) ? 1 : 0;
+    }
+    if (lc == 1) {
+        printf("LSP rotate: rotation close %s still unconfirmed — waiting\n", found);
+        return 0;
+    }
+
+    /* None of the recorded closes is confirmed or in the mempool. */
+    char dtx[65];
+    rot_txid_display(rp->dying_funding_txid, dtx);
+    int un = rot_outpoint_unspent(mgr, dtx, rp->dying_funding_vout);
+    if (un < 0) return 0;                          /* chain state unknown: later */
+    if (un == 1) {
+        char *hex = mgr->persist
+            ? persist_load_rotation_close_hex((persist_t *)mgr->persist, dtx, rp->close_txid)
+            : NULL;
+        if (hex) {
+            char t[65] = {0};
+            int ok = rot_send_hex(mgr, hex, t);
+            free(hex);
+            if (ok) {
+                printf("LSP rotate: rotation close %s of factory %u was not on the "
+                       "network — rebroadcast it\n", rp->close_txid, dying_id);
+                return 0;
+            }
+        }
+        printf("LSP rotate: rotation close %s could not be rebroadcast and factory %u's "
+               "funding is unspent — clearing the progress marker; a new rotation may "
+               "run (every recorded close stays known)\n", rp->close_txid, dying_id);
+        if (dying) dying->partial_rotation_done = 0;
+    } else {
+        fprintf(stderr, "LSP rotate: factory %u's funding was spent by a TX that is none "
+                "of this LSP's recorded rotation closes — nothing to resume\n", dying_id);
+    }
+    (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_NONE);
+    lsp_rotation_progress_clear(mgr);
+    return -1;
+}
+
+/* CLOSED with no funding recorded: a funding this wallet already sent after
+   the close (its record lost) is adopted instead of funding again.
+   1 = adopted (now FUNDING), 0 = none found, -1 = could not record. */
+static int rot_adopt_wallet_funding(lsp_channel_mgr_t *mgr, ladder_t *lad) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    regtest_t *rt = rot_rt(mgr);
+    if (!rt || rp->new_funding_txid[0]) return 0;  /* light client: the FUNDING
+                                                      record is the only source */
+    int cconf = rot_tx_confirmations(mgr, rp->close_txid);
+    int h = rot_chain_height(mgr);
+    int min_h = (cconf >= 1 && h > 0) ? h - cconf + 1 : 0;
+    char (*excl)[65] = calloc(LADDER_MAX_FACTORIES + 1, 65);
+    if (!excl) return 0;
+    size_t ne = 0;
+    for (size_t i = 0; i < lad->n_factories && ne < LADDER_MAX_FACTORIES; i++)
+        rot_txid_display(lad->factories[i].factory.funding_txid, excl[ne++]);
+    char txid[65];
+    int found = regtest_find_wallet_send(rt, mgr->rot_fund_addr, mgr->rot_funding_sats,
+                                         min_h, (const char (*)[65])excl, ne, txid);
+    free(excl);
+    if (!found) return 0;
+    printf("LSP rotate: this wallet already sent a replacement funding %s after the "
+           "close — adopting it, not funding again\n", txid);
+    snprintf(rp->new_funding_txid, sizeof(rp->new_funding_txid), "%s", txid);
+    free(rp->new_funding_hex);
+    rp->new_funding_hex = NULL;
+    rp->new_funding_vout = UINT32_MAX;
+    rp->new_funding_amount = 0;
+    return rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_FUNDING) ? 1 : -1;
+}
+
+/* FUNDING: 1 = confirmed (now FUNDED), 0 = wait, -1 = operator attention. */
+static int rot_resume_funding(lsp_channel_mgr_t *mgr) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    regtest_t *rt = rot_rt(mgr);
+    const char *ft = rp->new_funding_txid;
+    int fconf = rot_tx_confirmations(mgr, ft);
+    if (fconf < 1 && mgr->rot_is_regtest && rt && rot_tx_in_mempool(mgr, ft)) {
+        regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+        fconf = rot_tx_confirmations(mgr, ft);
+    }
+    if (fconf >= 1) {
+        uint32_t v = 0;
+        uint64_t amt = 0;
+        if (!rot_find_funding_output(mgr, ft, &v, &amt)) {
+            fprintf(stderr, "LSP rotate: no replacement funding output in %s "
+                    "(operator attention)\n", ft);
+            return -1;
+        }
+        rp->new_funding_vout = v;
+        rp->new_funding_amount = amt;
+        rot_fix_ceremony_params(mgr);
+        if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_FUNDED)) return 0;
+        printf("LSP rotate: replacement funding %s:%u is confirmed\n", ft, v);
+        return 1;
+    }
+    if (rot_tx_in_mempool(mgr, ft)) {
+        printf("LSP rotate: replacement funding %s still unconfirmed — waiting\n", ft);
+        return 0;
+    }
+    int cdepth = rot_funding_conflict_depth(mgr);
+    if (cdepth > 0) {
+        int need = rot_conflict_safe_depth(mgr);
+        if (cdepth < need) {
+            printf("LSP rotate: an input of the recorded replacement funding %s is "
+                   "spent by another TX only %d block(s) deep (need %d) — waiting "
+                   "before dropping the record\n", ft, cdepth, need);
+            return 0;
+        }
+        /* The conflicting spend is reorg-safe deep: the record can never
+           confirm.  Fund anew -- still exactly one replacement funding can
+           ever confirm.  Its other inputs go back to the wallet and the wallet
+           stops rebroadcasting it. */
+        printf("LSP rotate: recorded replacement funding %s can never confirm (an "
+               "input is spent by another TX %d block(s) deep) — dropping the "
+               "record; a new funding will be built\n", ft, cdepth);
+        regtest_t *drt = rot_rt(mgr);
+        if (drt && rp->new_funding_hex) {
+            (void)regtest_unlock_tx_inputs(drt, rp->new_funding_hex);
+            (void)regtest_abandon_tx(drt, ft);
+        }
+        rp->conflict_seen_height = 0;
+        rot_release_reservation(mgr);
+        rp->new_funding_txid[0] = '\0';
+        free(rp->new_funding_hex);
+        rp->new_funding_hex = NULL;
+        rp->new_funding_vout = UINT32_MAX;
+        rp->new_funding_amount = 0;
+        return rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CLOSED) ? 1 : 0;
+    }
+    if (rp->new_funding_hex) {
+        char t[65] = {0};
+        if (rot_send_hex(mgr, rp->new_funding_hex, t)) {
+            printf("LSP rotate: replacement funding %s was not on the network — "
+                   "rebroadcast the recorded TX\n", ft);
+            rot_release_reservation(mgr);
+            return 0;
+        }
+    }
+    if (!rp->hold_reported) {
+        fprintf(stderr, "LSP rotate: replacement funding %s is neither confirmed nor in "
+                "the mempool and could not be rebroadcast — NOT funding a second "
+                "time (operator attention)\n", ft);
+        rp->hold_reported = 1;
+    }
+    return -1;
+}
+
+int lsp_rotation_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp || !mgr->ladder || !lsp_rotation_progress_pending(mgr))
+        return 0;
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+
+    /* At most one attempt per block: the daemon tick, the retry path and the
+       CLI can all land here. */
+    int h = rot_chain_height(mgr);
+    if (h > 0 && rp->last_attempt_height == (uint32_t)h) return 0;
+    if (h > 0) rp->last_attempt_height = (uint32_t)h;
+
+    /* Factory ids are not stable across a restart (the recovered factory is
+       id 0): find the dying slot by its funding outpoint. */
+    ladder_factory_t *dying = NULL;
+    for (size_t i = 0; i < lad->n_factories; i++) {
+        ladder_factory_t *lf = &lad->factories[i];
+        if (lf->is_initialized &&
+            lf->factory.funding_vout == rp->dying_funding_vout &&
+            memcmp(lf->factory.funding_txid, rp->dying_funding_txid, 32) == 0) {
+            dying = lf;
+            break;
+        }
+    }
+    uint32_t dying_id = dying ? dying->factory_id : rp->dying_factory_id;
+    if (dying) dying->partial_rotation_done = 1;   /* never re-run Phase A/B on it */
+
+    if (rp->phase == LSP_ROT_PROGRESS_SIGNING) {
+        /* SIGNING without SIGNING_READY: the ceremony stopped before its first
+           FACTORY_READY, so no client holds its signed tree -- run it again. */
+        printf("LSP rotate: the creation ceremony over %s:%u stopped before any "
+               "FACTORY_READY (nobody holds its tree) — running it again\n",
+               rp->new_funding_txid, rp->new_funding_vout);
+        if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_FUNDED)) return 0;
+    }
+    if (rp->phase == LSP_ROT_PROGRESS_CLOSING &&
+        rot_resume_close(mgr, dying, dying_id) <= 0)
+        return 0;
+    if (rp->phase == LSP_ROT_PROGRESS_CLOSED &&
+        rot_adopt_wallet_funding(mgr, lad) < 0)
+        return 0;
+    if (rp->phase == LSP_ROT_PROGRESS_FUNDING &&
+        rot_resume_funding(mgr) <= 0)
+        return 0;
+    if (!mgr->rot_fee_est) return 0;
+
+    size_t on = 0;
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        if (lsp->client_fds[i] >= 0) on++;
+    int funded = rp->phase == LSP_ROT_PROGRESS_FUNDED ||
+                 rp->phase == LSP_ROT_PROGRESS_SIGNING_READY;
+    printf("LSP rotate: resuming rotation of factory %u — close %s confirmed, "
+           "replacement %s%s%s; completing Phase C (%zu/%zu clients online)\n",
+           dying_id, rp->close_txid,
+           funded ? "already funded: " : "not yet funded",
+           funded ? rp->new_funding_txid : "",
+           rp->phase == LSP_ROT_PROGRESS_SIGNING_READY ? " (FACTORY_READY delivered before)" : "",
+           on, lsp->n_clients);
+    fflush(stdout);
+    if (on < lsp->n_clients) return 0;
+
+    int ok = rotation_create_replacement(mgr, lsp, lad, dying_id, /*partial*/ 0,
+                                         NULL, NULL, 0);
+    if (ok) lsp_rotation_record_success(mgr, dying_id);
+    return ok;
 }
 
 int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp) {

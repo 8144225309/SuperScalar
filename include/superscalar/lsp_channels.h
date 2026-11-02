@@ -9,6 +9,66 @@
 #include <signal.h>
 #include <time.h>
 
+/* Rotation progress past the irreversible Phase B close (lsp_rotation.c).
+   The rotation close pays every client's channel balance to the LSP wallet;
+   until the replacement factory is created AND signed those funds exist only
+   in the LSP's wallet and books.  This marker (mirrored in the
+   rotation_progress table, every close also in rotation_closes) lets a
+   failure -- or a crash and restart -- anywhere after the close resume
+   instead of re-running Phase A/B or reporting the spent funding as
+   "already rotated".
+
+   Each irreversible step is recorded BEFORE it happens:
+     CLOSING  the signed close TX (txid + hex) is recorded, then broadcast
+     CLOSED   one of the recorded closes confirmed
+     FUNDING  the signed replacement funding TX (txid + hex) is recorded,
+              then broadcast -- a restart never funds a second time
+     FUNDED   the funding confirmed; the ceremony parameters (CLTV, client
+              distribution amounts) are fixed here, once
+     SIGNING  written right before the creation ceremony; no client holds
+              its signed tree yet, so a restart here runs it again
+     SIGNING_READY  written by the ceremony's before_factory_ready hook, right
+              before the first FACTORY_READY, with the tree's digest and its
+              signed distribution TX.  From here clients may hold the signed
+              tree: a ceremony runs again only if the tree rebuilt from the
+              recorded parameters has exactly that digest (the same
+              transactions); otherwise the rotation holds for the operator
+     SIGNED   the replacement is signed; written in the SAME transaction as
+              the factory + tree persist
+     DONE     channels reinitialized over the replacement (Phase D) */
+#define LSP_ROT_PROGRESS_NONE           0
+#define LSP_ROT_PROGRESS_CLOSING        1
+#define LSP_ROT_PROGRESS_CLOSED         2
+#define LSP_ROT_PROGRESS_FUNDING        3
+#define LSP_ROT_PROGRESS_FUNDED         4
+#define LSP_ROT_PROGRESS_SIGNING        5
+#define LSP_ROT_PROGRESS_SIGNING_READY  6
+#define LSP_ROT_PROGRESS_SIGNED         7
+#define LSP_ROT_PROGRESS_DONE           8
+typedef struct {
+    int phase;                              /* LSP_ROT_PROGRESS_* */
+    uint32_t dying_factory_id;
+    unsigned char dying_funding_txid[32];   /* internal byte order */
+    uint32_t dying_funding_vout;
+    char close_txid[65];                    /* display hex: the close being tracked */
+    char new_funding_txid[65];              /* display hex; "" until FUNDING */
+    char *new_funding_hex;                  /* signed funding TX (owned), or NULL */
+    uint32_t new_funding_vout;              /* UINT32_MAX until confirmed + found */
+    uint64_t new_funding_amount;
+    uint32_t new_cltv;                      /* fixed at FUNDED */
+    size_t n_dist_amounts;                  /* fixed at FUNDED */
+    uint64_t dist_amounts[FACTORY_MAX_SIGNERS];
+    char tree_digest[65];                   /* SIGNING_READY: delivered tree (hex) */
+    char *dist_tx_hex;                      /* its signed distribution TX (owned) */
+    uint32_t last_attempt_height;           /* resume: at most one attempt per block */
+    int hold_reported;                      /* operator notice printed */
+    uint32_t conflict_seen_height;          /* first block a funding input was seen
+                                               spent by another TX (memory only) */
+    int fund_reserved;                      /* light client: funding input still */
+    char fund_reserved_txid[65];            /*   reserved in the wallet (memory only) */
+    uint32_t fund_reserved_vout;
+} lsp_rotation_progress_t;
+
 /* Safety margin for HTLC forwarding: outgoing cltv_expiry is reduced by this
    delta so the LSP has time to claim on-chain if the factory needs a unilateral
    close before the upstream HTLC expires.
@@ -120,6 +180,7 @@ typedef struct {
     uint32_t rot_last_attempt_block[8]; /* block height of last failed attempt */
     uint32_t rot_max_retries;           /* 0 = default (3); after N failures, broadcast dist TX */
     uint32_t rot_retry_base_delay;      /* 0 = default (10 blocks); doubles per retry */
+    lsp_rotation_progress_t rot_progress; /* rotation past its close (see above) */
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -423,6 +484,62 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    Resets the readiness tracker regardless of outcome.
    Returns 1 if ceremony was fired, 0 if not all clients ready yet. */
 int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* 1 if mgr->rot_progress records a rotation past its close whose
+   replacement is not yet signed (CLOSING..SIGNING_READY). */
+int lsp_rotation_progress_pending(const lsp_channel_mgr_t *mgr);
+
+/* Load the persisted progress marker for the factory with this funding
+   outpoint into mgr->rot_progress (restart path).  Returns 1 if a rotation of
+   that factory is pending (phase CLOSING..SIGNING_READY). */
+int lsp_rotation_load_progress(lsp_channel_mgr_t *mgr,
+                               const unsigned char *dying_funding_txid32,
+                               uint32_t dying_funding_vout);
+
+/* Free and zero mgr->rot_progress (in memory only). */
+void lsp_rotation_progress_clear(lsp_channel_mgr_t *mgr);
+
+/* Complete a rotation that is past its close, one step per call (at most one
+   attempt per block):
+     CLOSING  any recorded close confirmed -> CLOSED; in the mempool -> wait;
+              dropped -> rebroadcast it while the dying funding is unspent;
+              funding spent by something else -> marker cleared
+     CLOSED   adopt a replacement funding the wallet already sent (lost
+              record), else fund it -- needs every client online
+     FUNDING  confirmed -> FUNDED; in the mempool -> wait; dropped ->
+              rebroadcast the recorded TX; an input spent by another TX that
+              is reorg-safe deep (the record can never confirm) -> CLOSED, the
+              record abandoned, fund anew
+     FUNDED   create + sign the replacement -- needs every client online
+     SIGNING  the ceremony stopped before any FACTORY_READY -> FUNDED
+     SIGNING_READY  run the ceremony again only over a byte-identical tree
+              (lsp_rotation_signed_tree_matches); otherwise hold for the
+              operator
+   Returns 1 when the replacement is active. */
+int lsp_rotation_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* SIGNING_READY: does the tree rebuilt now from the recorded funding, CLTV and
+   distribution amounts (with lsp's current template and client keys) have the
+   recorded digest?  1 = yes (byte-identical transactions), 0 = no, -1 = no
+   digest recorded or it cannot be rebuilt.  Across an LSP restart this needs
+   the factory shape restored from the DB as it was (see the shape-persistence
+   gap for multi-level arity / static-near-root). */
+int lsp_rotation_signed_tree_matches(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* A tracked rotation's creation ceremony failed: DELIVERED clients got
+   FACTORY_READY in this attempt, DELIVERED_BEFORE says an earlier attempt
+   may have delivered one.  Goes back to FUNDED only when no client can hold
+   the signed tree (nothing delivered, and SIGNING_READY never recorded);
+   otherwise stays at SIGNING_READY for the digest gate.  Returns the phase. */
+int lsp_rotation_ceremony_failed(lsp_channel_mgr_t *mgr, size_t delivered,
+                                 int delivered_before);
+
+/* The rotation close (recorded in rotation_closes) that spent the factory
+   funding DYING_FUNDING_TXID32:VOUT, if any: 2 = confirmed, 1 = in the
+   mempool (txid in CLOSE_TXID_OUT65), 0 = none of them. */
+int lsp_rotation_find_logged_close(lsp_channel_mgr_t *mgr,
+                                   const unsigned char *dying_funding_txid32,
+                                   char *close_txid_out65);
 
 /* --- Reconnection (Phase 16) --- */
 

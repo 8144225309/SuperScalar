@@ -1,4 +1,5 @@
 #include "superscalar/lsp_fund.h"
+#include "superscalar/tx_builder.h"
 #include "superscalar/lsp.h"
 #include "superscalar/wire.h"
 #include <string.h>
@@ -59,13 +60,16 @@ static size_t lsp_fund_build_unsigned_tx(unsigned char *out,
     return pos;
 }
 
-int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
-                 const unsigned char *target_spk, size_t target_spk_len,
-                 uint64_t amount_sats, uint64_t fee_rate_kvb,
-                 char *txid_out_65)
+/* Build + sign the funding TX.  On success returns the signed hex (malloc'd)
+   with the selected wallet UTXO still reserved (IN_TXID_HEX65 / IN_VOUT, for
+   release_utxo); on failure releases it and returns NULL. */
+static char *lsp_fund_spk_sign(wallet_source_t *wallet,
+                               const unsigned char *target_spk, size_t target_spk_len,
+                               uint64_t amount_sats, uint64_t fee_rate_kvb,
+                               char *in_txid_hex65, uint32_t *in_vout_out)
 {
-    if (!wallet || !chain || !target_spk || target_spk_len == 0 || amount_sats == 0)
-        return 0;
+    if (!wallet || !target_spk || target_spk_len == 0 || amount_sats == 0)
+        return NULL;
     if (fee_rate_kvb == 0)
         fee_rate_kvb = 110; /* default: 0.11 sat/vB */
 
@@ -75,7 +79,7 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
 
     /* Select UTXO large enough to cover amount + fee */
     char in_txid_hex[65];
-    uint32_t in_vout;
+    uint32_t in_vout = 0;
     uint64_t in_amount;
     unsigned char in_spk[34];
     size_t in_spk_len = 0;
@@ -84,7 +88,7 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
                            in_spk, &in_spk_len)) {
         fprintf(stderr, "lsp_fund_spk: no UTXO >= %llu sats\n",
                 (unsigned long long)(amount_sats + fee_sats));
-        return 0;
+        return NULL;
     }
 
     /* Compute change; absorb dust into fee */
@@ -98,7 +102,7 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
     if (n_outputs == 2) {
         if (!wallet->get_change_spk(wallet, chg_spk, &chg_spk_len)) {
             if (wallet->release_utxo) wallet->release_utxo(wallet, in_txid_hex, in_vout);
-            return 0;
+            return NULL;
         }
     }
 
@@ -125,16 +129,63 @@ int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
                             in_spk, in_spk_len, in_amount)) {
         fprintf(stderr, "lsp_fund_spk: sign_input failed\n");
         if (wallet->release_utxo) wallet->release_utxo(wallet, in_txid_hex, in_vout);
-        return 0;
+        return NULL;
     }
 
     /* Hex-encode signed TX */
     char *hex = malloc(signed_len * 2 + 1);
     if (!hex) {
         if (wallet->release_utxo) wallet->release_utxo(wallet, in_txid_hex, in_vout);
-        return 0;
+        return NULL;
     }
     hex_encode(signed_tx, signed_len, hex);
+    if (in_txid_hex65) memcpy(in_txid_hex65, in_txid_hex, 65);
+    if (in_vout_out) *in_vout_out = in_vout;
+    return hex;
+}
+
+char *lsp_fund_spk_build(wallet_source_t *wallet,
+                         const unsigned char *target_spk, size_t target_spk_len,
+                         uint64_t amount_sats, uint64_t fee_rate_kvb,
+                         char *txid_out_65,
+                         char *reserved_txid_out65, uint32_t *reserved_vout_out)
+{
+    char in_txid[65];
+    uint32_t in_vout = 0;
+    char *hex = lsp_fund_spk_sign(wallet, target_spk, target_spk_len, amount_sats,
+                                  fee_rate_kvb, in_txid, &in_vout);
+    if (!hex) return NULL;
+    size_t n = strlen(hex) / 2;
+    unsigned char *raw = malloc(n ? n : 1);
+    unsigned char txid[32];
+    if (!raw || hex_decode(hex, raw, n) != (int)n || !tx_txid_from_bytes(raw, n, txid)) {
+        if (wallet->release_utxo) wallet->release_utxo(wallet, in_txid, in_vout);
+        free(raw);
+        free(hex);
+        return NULL;
+    }
+    /* The UTXO stays reserved until the caller broadcasts or abandons the TX. */
+    if (reserved_txid_out65) memcpy(reserved_txid_out65, in_txid, 65);
+    if (reserved_vout_out) *reserved_vout_out = in_vout;
+    free(raw);
+    if (txid_out_65) {
+        reverse_bytes(txid, 32);
+        hex_encode(txid, 32, txid_out_65);
+    }
+    return hex;
+}
+
+int lsp_fund_spk(wallet_source_t *wallet, chain_backend_t *chain,
+                 const unsigned char *target_spk, size_t target_spk_len,
+                 uint64_t amount_sats, uint64_t fee_rate_kvb,
+                 char *txid_out_65)
+{
+    if (!chain) return 0;
+    char in_txid_hex[65];
+    uint32_t in_vout = 0;
+    char *hex = lsp_fund_spk_sign(wallet, target_spk, target_spk_len, amount_sats,
+                                  fee_rate_kvb, in_txid_hex, &in_vout);
+    if (!hex) return 0;
 
     /* Broadcast */
     char tmp_txid[65] = {0};

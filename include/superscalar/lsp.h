@@ -106,6 +106,19 @@ typedef struct {
      * follow in Phase 1b.2.  See docs/watchtower-trustless-schema.md
      * for the trust model. */
     persist_wt_t *wt_db;
+
+    /* Number of clients the last creation ceremony sent FACTORY_READY (the
+       signed tree + distribution TX) to.  Reset at the start of every
+       ceremony.  A failed ceremony with a non-zero count may still have left
+       signed trees with clients: rotation never re-runs it automatically. */
+    size_t ceremony_ready_sent;
+
+    /* Optional, called by the creation ceremony with the fully signed factory
+       right BEFORE the first FACTORY_READY is sent (no client holds the
+       signed tree yet).  Returning 0 aborts the ceremony there.  Rotation uses
+       it to record durably that the tree is about to be delivered. */
+    int (*before_factory_ready)(void *lsp, const factory_t *f, void *ctx);
+    void *before_factory_ready_ctx;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */
@@ -136,6 +149,23 @@ int lsp_run_factory_creation(lsp_t *lsp,
    Phase B close so a deterministic setup failure aborts while the old factory
    is still live.  Safe on a factory whose arrays were freed or never
    allocated.  Returns 1 if lsp_run_factory_creation's setup would succeed. */
+/* Digest of a factory's transactions as built (the unsigned tree): sha256
+   over the node count, every node txid (and hashlock-poison txid), and the
+   distribution TX's txid.  Signatures are not part of it.  Two builds with a
+   different digest are different transactions. */
+int lsp_factory_tree_digest(const factory_t *f, unsigned char out32[32]);
+
+/* lsp_factory_creation_preflight over the REAL funding outpoint, returning the
+   digest of the tree the ceremony would build (lsp->dist_client_amounts as for
+   the ceremony).  Returns 1 on success. */
+int lsp_factory_creation_digest(lsp_t *lsp,
+        const secp256k1_pubkey *client_pubkeys, size_t n_clients,
+        const unsigned char *funding_txid, uint32_t funding_vout,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout, unsigned char out32[32]);
+
 int lsp_factory_creation_preflight(lsp_t *lsp,
         const secp256k1_pubkey *client_pubkeys, size_t n_clients,
         uint64_t funding_amount,

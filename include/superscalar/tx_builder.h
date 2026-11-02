@@ -129,4 +129,19 @@ int finalize_signed_tx_multi(
     const unsigned char *sig64s
 );
 
+/* txid (internal byte order) of a serialized transaction, segwit or legacy:
+   sha256d over version || inputs || outputs || locktime (a segwit TX's
+   marker, flag and witness are not part of its txid).  Lets a caller record
+   a signed TX under its txid BEFORE broadcasting it.  Returns 1 on success,
+   0 if TX does not parse as exactly one transaction. */
+int tx_txid_from_bytes(const unsigned char *tx, size_t len,
+                       unsigned char txid_out32[32]);
+
+/* The outpoints a serialized TX spends: up to MAX (prev txid in internal byte
+   order, vout) pairs; *N_OUT is the TX's input count.  Returns 1 if TX
+   parses, 0 otherwise. */
+int tx_parse_inputs(const unsigned char *tx, size_t len,
+                    unsigned char (*prev_txids)[32], uint32_t *prev_vouts,
+                    size_t max, size_t *n_out);
+
 #endif /* SUPERSCALAR_TX_BUILDER_H */

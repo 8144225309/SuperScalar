@@ -1,4 +1,5 @@
 #include "superscalar/lsp.h"
+#include "superscalar/tx_builder.h"
 #include "superscalar/ceremony.h"
 #include "superscalar/lsps.h"
 #include "superscalar/persist.h"
@@ -519,12 +520,15 @@ static int lsp_build_dist_unsigned(lsp_t *lsp, factory_t *f) {
     return 0;
 }
 
-int lsp_factory_creation_preflight(lsp_t *lsp,
+/* Dry run of the creation setup on a scratch factory.  DIGEST_OUT (optional)
+   receives lsp_factory_tree_digest of the scratch build. */
+static int creation_dry_run(lsp_t *lsp,
         const secp256k1_pubkey *client_pubkeys, size_t n_clients,
+        const unsigned char *funding_txid, uint32_t funding_vout,
         uint64_t funding_amount,
         const unsigned char *funding_spk, size_t funding_spk_len,
         uint16_t step_blocks, uint32_t states_per_layer,
-        uint32_t cltv_timeout) {
+        uint32_t cltv_timeout, unsigned char *digest_out) {
     if (!lsp || !client_pubkeys || n_clients == 0 || !funding_spk) return 0;
     size_t n_total = 1 + n_clients;
     secp256k1_pubkey *pks = calloc(n_total, sizeof(*pks));
@@ -539,13 +543,9 @@ int lsp_factory_creation_preflight(lsp_t *lsp,
     pks[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < n_clients; i++)
         pks[i + 1] = client_pubkeys[i];
-    /* Placeholder outpoint: it only changes txids, never whether the build
-       succeeds. */
-    unsigned char placeholder_txid[32];
-    for (int i = 0; i < 32; i++) placeholder_txid[i] = (unsigned char)(0xA5 ^ i);
 
     int ok = factory_setup_for_creation(lsp, scratch, &t, pks, n_total,
-                                        placeholder_txid, 0, funding_amount,
+                                        funding_txid, funding_vout, funding_amount,
                                         funding_spk, funding_spk_len,
                                         step_blocks, states_per_layer,
                                         cltv_timeout, "LSP preflight");
@@ -553,10 +553,13 @@ int lsp_factory_creation_preflight(lsp_t *lsp,
         fprintf(stderr, "LSP preflight: tree has no nodes\n");
         ok = 0;
     }
-    if (ok && cltv_timeout > 0 && !lsp_build_dist_unsigned(lsp, scratch))
+    int dist_ok = ok && cltv_timeout > 0 && lsp_build_dist_unsigned(lsp, scratch);
+    if (ok && cltv_timeout > 0 && !dist_ok && !digest_out)
         fprintf(stderr, "LSP preflight: WARNING: the distribution TX would not "
                 "build (creation still proceeds; offline recovery degraded)\n");
-    if (ok)
+    if (ok && digest_out && !lsp_factory_tree_digest(scratch, digest_out))
+        ok = 0;
+    if (ok && !digest_out)
         printf("LSP preflight: new factory setup OK (%zu participants, "
                "%zu nodes, %d leaves)\n", n_total, scratch->n_nodes,
                scratch->n_leaf_nodes);
@@ -565,6 +568,64 @@ int lsp_factory_creation_preflight(lsp_t *lsp,
     free(pks);
     creation_template_free(&t);
     return ok;
+}
+
+int lsp_factory_creation_preflight(lsp_t *lsp,
+        const secp256k1_pubkey *client_pubkeys, size_t n_clients,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout) {
+    /* Placeholder outpoint: it only changes txids, never whether the build
+       succeeds. */
+    unsigned char placeholder_txid[32];
+    for (int i = 0; i < 32; i++) placeholder_txid[i] = (unsigned char)(0xA5 ^ i);
+    return creation_dry_run(lsp, client_pubkeys, n_clients, placeholder_txid, 0,
+                            funding_amount, funding_spk, funding_spk_len,
+                            step_blocks, states_per_layer, cltv_timeout, NULL);
+}
+
+int lsp_factory_creation_digest(lsp_t *lsp,
+        const secp256k1_pubkey *client_pubkeys, size_t n_clients,
+        const unsigned char *funding_txid, uint32_t funding_vout,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout, unsigned char out32[32]) {
+    if (!funding_txid || !out32) return 0;
+    return creation_dry_run(lsp, client_pubkeys, n_clients, funding_txid, funding_vout,
+                            funding_amount, funding_spk, funding_spk_len,
+                            step_blocks, states_per_layer, cltv_timeout, out32);
+}
+
+int lsp_factory_tree_digest(const factory_t *f, unsigned char out32[32]) {
+    if (!f || !out32 || !f->nodes || f->n_nodes == 0) return 0;
+    size_t cap = 4 + f->n_nodes * 64 + 32;
+    unsigned char *buf = malloc(cap);
+    if (!buf) return 0;
+    size_t off = 0;
+    uint32_t n = (uint32_t)f->n_nodes;
+    for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(n >> (8 * b));
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        memcpy(buf + off, f->nodes[i].txid, 32);
+        off += 32;
+        if (f->nodes[i].poison_unsigned_tx.len > 0) {
+            memcpy(buf + off, f->nodes[i].poison_txid, 32);
+            off += 32;
+        }
+    }
+    unsigned char dist_txid[32];
+    memset(dist_txid, 0, 32);
+    if (f->dist_unsigned_tx.len > 0 &&
+        !tx_txid_from_bytes(f->dist_unsigned_tx.data, f->dist_unsigned_tx.len, dist_txid)) {
+        free(buf);
+        return 0;
+    }
+    memcpy(buf + off, dist_txid, 32);
+    off += 32;
+    sha256(buf, off, out32);
+    free(buf);
+    return 1;
 }
 
 /* Phase 1e.3.b scaffolding: stub for the reversed-flow stateless factory
@@ -647,6 +708,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
 
     /* ---- Setup: rebuild lsp->factory from the caller's template ---- */
     size_t n_total = 1 + lsp->n_clients;
+    lsp->ceremony_ready_sent = 0;
     secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
     all_pubkeys[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < lsp->n_clients; i++)
@@ -1077,6 +1139,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         }
     }
 
+    /* Last point at which no client holds the signed tree: let the caller
+       record that it is about to be delivered.  A refusal aborts here. */
+    if (lsp->before_factory_ready &&
+        !lsp->before_factory_ready(lsp, f, lsp->before_factory_ready_ctx)) {
+        fprintf(stderr, "LSP-stateless: FACTORY_READY not delivered (caller "
+                "refused) -- aborting the ceremony\n");
+        goto fail_pre;
+    }
+
     {
         cJSON *ready = wire_build_factory_ready(f);
         for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -1085,6 +1156,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                 cJSON_Delete(ready);
                 goto fail_pre;
             }
+            lsp->ceremony_ready_sent++;
         }
         cJSON_Delete(ready);
     }

@@ -459,3 +459,92 @@ int finalize_signed_tx_multi(
     tx_buf_write_bytes(out, unsigned_tx + unsigned_tx_len - 4, 4); /* nLockTime */
     return !out->oom;
 }
+
+/* --- txid of a serialized TX ------------------------------------------- */
+
+static int txid_read_varint(const unsigned char *p, size_t len, size_t *off,
+                            uint64_t *v) {
+    if (*off >= len) return 0;
+    unsigned char c = p[(*off)++];
+    if (c < 0xfd) { *v = c; return 1; }
+    size_t n = c == 0xfd ? 2 : (c == 0xfe ? 4 : 8);
+    if (n > len - *off) return 0;
+    uint64_t r = 0;
+    for (size_t i = 0; i < n; i++) r |= (uint64_t)p[*off + i] << (8 * i);
+    *off += n;
+    *v = r;
+    return 1;
+}
+
+static int txid_skip_bytes(const unsigned char *p, size_t len, size_t *off) {
+    uint64_t l;
+    if (!txid_read_varint(p, len, off, &l) || l > len - *off) return 0;
+    *off += (size_t)l;
+    return 1;
+}
+
+int tx_txid_from_bytes(const unsigned char *tx, size_t len,
+                       unsigned char txid_out32[32]) {
+    if (!tx || !txid_out32 || len < 10) return 0;
+    int segwit = (tx[4] == 0x00 && tx[5] == 0x01);
+    size_t off = segwit ? 6 : 4;
+    size_t body_start = off;
+    uint64_t n_in, n_out;
+    if (!txid_read_varint(tx, len, &off, &n_in)) return 0;
+    for (uint64_t i = 0; i < n_in; i++) {
+        if (36 > len - off) return 0;
+        off += 36;                                    /* prevout */
+        if (!txid_skip_bytes(tx, len, &off)) return 0; /* scriptSig */
+        if (4 > len - off) return 0;
+        off += 4;                                     /* nSequence */
+    }
+    if (!txid_read_varint(tx, len, &off, &n_out)) return 0;
+    for (uint64_t i = 0; i < n_out; i++) {
+        if (8 > len - off) return 0;
+        off += 8;                                     /* amount */
+        if (!txid_skip_bytes(tx, len, &off)) return 0; /* scriptPubKey */
+    }
+    size_t body_end = off;
+    if (segwit) {
+        for (uint64_t i = 0; i < n_in; i++) {
+            uint64_t n_items;
+            if (!txid_read_varint(tx, len, &off, &n_items)) return 0;
+            for (uint64_t k = 0; k < n_items; k++)
+                if (!txid_skip_bytes(tx, len, &off)) return 0;
+        }
+    }
+    if (len - off != 4) return 0;                     /* nLockTime, then end */
+    size_t body = body_end - body_start;
+    unsigned char *buf = malloc(8 + body);
+    if (!buf) return 0;
+    memcpy(buf, tx, 4);
+    memcpy(buf + 4, tx + body_start, body);
+    memcpy(buf + 4 + body, tx + off, 4);
+    sha256_double(buf, 8 + body, txid_out32);
+    free(buf);
+    return 1;
+}
+
+int tx_parse_inputs(const unsigned char *tx, size_t len,
+                    unsigned char (*prev_txids)[32], uint32_t *prev_vouts,
+                    size_t max, size_t *n_out) {
+    unsigned char dummy[32];
+    if (!tx || !n_out || !tx_txid_from_bytes(tx, len, dummy)) return 0;
+    int segwit = (tx[4] == 0x00 && tx[5] == 0x01);
+    size_t off = segwit ? 6 : 4;
+    uint64_t n_in;
+    if (!txid_read_varint(tx, len, &off, &n_in)) return 0;
+    for (uint64_t i = 0; i < n_in; i++) {
+        if (i < max) {
+            if (prev_txids) memcpy(prev_txids[i], tx + off, 32);
+            if (prev_vouts)
+                prev_vouts[i] = (uint32_t)tx[off + 32] | ((uint32_t)tx[off + 33] << 8) |
+                                ((uint32_t)tx[off + 34] << 16) | ((uint32_t)tx[off + 35] << 24);
+        }
+        off += 36;
+        if (!txid_skip_bytes(tx, len, &off)) return 0;
+        off += 4;
+    }
+    *n_out = (size_t)n_in;
+    return 1;
+}
