@@ -29,6 +29,16 @@
  *   "ps_record_post_save"  — the INSERT is durable, before FINAL is sent
  *   "ps_record_post_final" — MSG_LEAF_ADVANCE_FINAL has left the process
  *
+ * The same record for PS sub-factory chain advances (src/client.c, the
+ * multi-input ceremony behind client_handle_subfactory_advance; one row per
+ * input this client signs):
+ *   "ps_sub_record_pre_save"   — our per-input partial sigs exist, before the
+ *                                first client_ps_signed_inputs INSERT
+ *   "ps_sub_record_post_save"  — every INSERT is durable, before
+ *                                MSG_SUBFACTORY_CLIENT_FINAL_PSIGS is sent
+ *   "ps_sub_record_post_final" — MSG_SUBFACTORY_CLIENT_FINAL_PSIGS has left
+ *                                the process
+ *
  * The same naming convention extends to ROTATE / FORCE_OUT once those
  * ceremonies wire their own persist transitions (Gaps A + B of #245).  No
  * conditional logic, no flag persistence — pure env check + abort.
