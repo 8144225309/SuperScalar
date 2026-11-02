@@ -25,13 +25,12 @@ All notable changes to SuperScalar are documented here.
 
 ### Tree reload after a restart
 
-- A factory loaded from the DB rebuilds its signed tree from the stored rows and is checked before advances resume (every node signed and spending its stored parent, the DW counter matching every node's nSequence, each PS node's chain of the current epoch), replacing the blanket post-restart refusal. A client DB, which has no `dw_counter_state` row, recovers its epoch from the PS chain rows.
-- **L-stock secret reuse:** the per-node L-stock state counter was not stored and came back as 0, so the next advance committed the LSP's new L-stock to a secret already revealed. It is now stored with each tree row (with the current hash, which a client cannot derive) and restored; a node that advanced without a stored counter keeps the factory refused, and the LSP checks the restored counters against its seed.
-- **PS chains across a rollover:** chain loads take only the rows of the current epoch, contiguous and each spending the previous one, with chain[0] of that epoch. After a root rollover from a longer chain, the old epoch's rows were read as the tip.
-- **Signature before storage:** before the LSP releases its partial signature in an advance (leaf advance, Tier B, both sub-factory paths), and before a client releases its signature (leaf advance, realloc, Tier B), the TX is recorded in the DB. After a restart that reloads the previous state, only that identical TX can be signed in its position (a DW node's nSequence, a PS chain output); a different one is refused.
-- On-request L-stock reveals stop at the stored state after a reload, and after a ceremony that moved the counter but stored nothing.
-- A seedless client now rebuilds a DW leaf's hashlocked L-stock with the hash the LSP sends, so it can follow a hashlock DW leaf advance.
-- **Upgrading:** schema v43 (`tree_node_lstock`, `signed_state_reservations`); older builds refuse the DB. A factory that advanced under a build without these rows reloads with advances refused. Never restore an old DB backup of a live factory (operator guide, Backup & Restore).
+- A factory loaded from the DB rebuilds its signed tree and is checked (parents, DW counter, each PS chain of the current epoch) before advances resume; a failed check keeps them refused.
+- L-stock state counters are stored per node and restored; a restart used to reset them, so the next L-stock could commit to a secret already revealed.
+- PS chains load only the current epoch's linked rows.
+- Before releasing a signature on an advance, the LSP and the client record the TX (the LSP also does so at factory creation); after a restart only the identical TX can be signed in that position. A root advance whose signatures went out but was not stored freezes leaf operations until that same advance completes.
+- On-request L-stock reveals stop at the stored state.
+- **Upgrading:** schema v43; older builds refuse the DB. Factories that advanced under a build without this change (no stored L-stock rows) reload with advances refused. Never restore an old DB backup of a live factory.
 
 ## v0.2.0 — 2026-07-02
 
