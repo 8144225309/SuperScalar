@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+#define PERSIST_SCHEMA_VERSION 41
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -320,6 +320,20 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
                                  uint64_t *local_amount,
                                  uint64_t *remote_amount,
                                  uint64_t *commitment_number);
+
+/* Mark a channel failed (channels.state = 'failed'): its peer did not
+   validly revoke a commitment, or a revoked commitment could not be watched.
+   A restarted LSP keeps refusing updates on it.  persist_save_channel()
+   writes the same state from channel_t.revocation_failed, so re-saving the
+   channel keeps the mark and a new channel saved at that slot starts 'open'.
+   Returns 1 on success. */
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id);
+
+/* Same for a JIT channel (jit_channels.revocation_failed). */
+int persist_mark_jit_failed(persist_t *p, uint32_t jit_channel_id);
+
+/* 1 if the channel's row is marked failed, 0 otherwise (or no row). */
+int persist_channel_is_failed(persist_t *p, uint32_t channel_id);
 
 /* Update channel balances after a payment. */
 int persist_update_channel_balance(persist_t *p, uint32_t channel_id,

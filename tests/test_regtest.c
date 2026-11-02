@@ -796,8 +796,10 @@ int test_regtest_breach_penalty_cpfp(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* --- Client watchtower: register old commitment #0 for monitoring.
        watchtower_set_channel dropped in #208 A3.2 — direct field access
@@ -1030,8 +1032,10 @@ int test_regtest_watchtower_mempool_detection(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* Register commitment #0 with watchtower.
        watchtower_set_channel dropped in #208 A3.2 — direct field access
@@ -1235,8 +1239,10 @@ int test_regtest_watchtower_late_detection(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* Register commitment #0 with watchtower.
        watchtower_set_channel dropped in #208 A3.2 — direct field access

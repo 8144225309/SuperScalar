@@ -204,8 +204,9 @@ static cJSON *method_listchannels(admin_rpc_t *rpc)
         cJSON_AddBoolToObject(ce, "active", e->ready != 0);
         /* state string */
         const char *st = "pending";
-        if (ch->close_state >= 3) st = "closing";
-        else if (e->ready)        st = "active";
+        if (ch->close_state >= 3)      st = "closing";
+        else if (ch->revocation_failed) st = "failed";
+        else if (e->ready)             st = "active";
         cJSON_AddStringToObject(ce, "state", st);
         /* funding txid hex */
         char txid_hex[65];
@@ -1167,7 +1168,8 @@ static cJSON *method_listfunds(admin_rpc_t *rpc)
             cJSON_AddNumberToObject(ce, "channel_id", (double)e->channel_id);
             cJSON_AddNumberToObject(ce, "our_amount_msat", (double)ch->local_amount);
             cJSON_AddNumberToObject(ce, "their_amount_msat", (double)ch->remote_amount);
-            cJSON_AddStringToObject(ce, "state", e->ready ? "active" : "pending");
+            cJSON_AddStringToObject(ce, "state", ch->revocation_failed ? "failed"
+                                    : e->ready ? "active" : "pending");
             cJSON_AddItemToArray(channels, ce);
             total_channel_sats += ch->local_amount / 1000;
         }

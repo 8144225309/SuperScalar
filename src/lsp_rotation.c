@@ -274,6 +274,19 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     size_t turnover_ok = 0, turnover_fail = 0;
     for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+        /* A client with a failed channel (lsp_channels_fail_channel) may hold
+           an unrevoked commitment in the dying factory.  Leave it out of the
+           new factory like an offline client (it normally is offline: it was
+           disconnected and its reconnects are refused).  Without its key
+           turnover the rotation is partial, so the dying factory is not
+           cooperatively closed; its force-close or expiry is the way out for
+           that client's old channel, which the LSP stops tracking here. */
+        if (ci < mgr->n_channels && lsp_channels_client_failed(mgr, ci)) {
+            printf("LSP rotate: client %zu has a failed channel, leaving it "
+                   "out of the new factory\n", ci);
+            turnover_fail++;
+            continue;
+        }
         if (lsp->client_fds[ci] < 0) {
             printf("LSP rotate: client %zu offline, skipping turnover\n", ci);
             turnover_fail++;
@@ -1218,7 +1231,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
        are pre-built at revocation receive time inside
        watchtower_watch_revoked_commitment. */
 
-    /* Persist new channel state (transactional) */
+    /* Persist new channel state (transactional).  These are the new factory's
+       channels, created above by lsp_channels_init: they start unfailed, and a
+       slot reused from the dying factory does not inherit its failed mark
+       (a client with a failed channel was left out in Phase A). */
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
         if (!persist_begin(db)) {

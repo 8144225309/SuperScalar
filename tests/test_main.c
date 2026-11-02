@@ -1464,6 +1464,18 @@ extern int test_factory_and_commitment_entries(void);
 extern int test_htlc_penalty_watch(void);
 extern int test_ptlc_penalty_watch(void);
 
+/* Revocation fail-closed (invalid REVOKE_AND_ACK fails the channel) */
+extern int test_lsp_fulfill_rejects_invalid_revocation(void);
+extern int test_lsp_bridge_add_rejects_invalid_revocation(void);
+extern int test_client_rejects_invalid_lsp_revocation(void);
+extern int test_failed_channel_mark_persists(void);
+extern int test_lsp_add_sender_rejects_invalid_revocation(void);
+extern int test_lsp_fulfill_settles_upstream_after_invalid_revocation(void);
+extern int test_lsp_watch_failure_fails_channel(void);
+extern int test_lsp_reconnect_retransmit_rejects_invalid_revocation(void);
+extern int test_failed_mark_durable_vs_reconnect_session(void);
+extern int test_persist_jit_failed_column_migration(void);
+
 /* Watchtower capacity + registration failure (growable table) */
 extern int test_watchtower_watches_1000_revoked_commitments(void);
 extern int test_watchtower_failed_registration_keeps_last_entry(void);
@@ -3361,6 +3373,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_and_commitment_entries);
     RUN_TEST(test_htlc_penalty_watch);
     RUN_TEST(test_ptlc_penalty_watch);
+
+    printf("\n=== Revocation Fail-Closed ===\n");
+    RUN_TEST(test_lsp_fulfill_rejects_invalid_revocation);
+    RUN_TEST(test_lsp_bridge_add_rejects_invalid_revocation);
+    RUN_TEST(test_client_rejects_invalid_lsp_revocation);
+    RUN_TEST(test_failed_channel_mark_persists);
+    RUN_TEST(test_lsp_add_sender_rejects_invalid_revocation);
+    RUN_TEST(test_lsp_fulfill_settles_upstream_after_invalid_revocation);
+    RUN_TEST(test_lsp_watch_failure_fails_channel);
+    RUN_TEST(test_lsp_reconnect_retransmit_rejects_invalid_revocation);
+    RUN_TEST(test_failed_mark_durable_vs_reconnect_session);
+    RUN_TEST(test_persist_jit_failed_column_migration);
 
     printf("\n=== Watchtower Capacity ===\n");
     RUN_TEST(test_watchtower_watches_1000_revoked_commitments);

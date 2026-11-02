@@ -42,6 +42,9 @@ typedef struct {
     int ready;                  /* 1 after CHANNEL_READY sent */
     time_t last_message_time;   /* epoch timestamp of last wire message */
     int offline_detected;        /* 1 if declared offline */
+    int session_unauthenticated; /* 1 if the current session was opened by
+                                    MSG_RECONNECT, which does not prove the
+                                    client's identity */
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
     size_t close_spk_len;       /* 34 when populated, 0 if unset */
     uint64_t accumulated_fees_sats; /* routing fees earned on THIS channel */

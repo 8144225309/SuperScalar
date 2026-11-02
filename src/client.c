@@ -8,6 +8,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include "superscalar/regtest.h"  /* CL7: regtest_send_raw_tx + regtest_t */
+#include "superscalar/watchtower.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -453,6 +454,17 @@ int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
     }
 
     uint64_t old_cn = ch->commitment_number - 1;
+    /* The next point must be usable before anything is stored: without it the
+       LSP's next revocation could not be verified. */
+    secp256k1_pubkey next_pcp;
+    if (!secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_point, 33)) {
+        fprintf(stderr, "Client: LSP revocation (commitment %llu) carries an "
+                "invalid next per-commitment point — rejecting (fail-closed)\n",
+                (unsigned long long)old_cn);
+        volatile unsigned char *z = (volatile unsigned char *)rev_secret;
+        for (int i = 0; i < 32; i++) z[i] = 0;
+        return 0;
+    }
     /* Verify the LSP's secret against the LSP's committed point (secret*G ==
        committed_PCP). channel_verify_revocation_secret consults the durable
        record, and the choke point re-verifies on store — fail closed. */
@@ -463,17 +475,41 @@ int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
         for (int i = 0; i < 32; i++) z[i] = 0;
         return 0;
     }
-    channel_receive_revocation(ch, old_cn, rev_secret);
+    int stored = channel_receive_revocation(ch, old_cn, rev_secret);
     { volatile unsigned char *z = (volatile unsigned char *)rev_secret;
       for (int i = 0; i < 32; i++) z[i] = 0; }
+    if (!stored) {
+        fprintf(stderr, "Client: LSP revocation (commitment %llu) could not be "
+                "stored — rejecting (fail-closed)\n", (unsigned long long)old_cn);
+        return 0;
+    }
 
     /* Track the LSP's NEXT per-commitment point (carried in this message) so
        subsequent LSP revocations remain verifiable. The client used to discard
        this. */
-    secp256k1_pubkey next_pcp;
-    if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, next_point, 33))
-        channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+    channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
     return 1;
+}
+
+int client_accept_lsp_revocation(channel_t *ch, secp256k1_context *ctx,
+                                 const wire_msg_t *msg,
+                                 struct watchtower_s *wt,
+                                 uint64_t old_local, uint64_t old_remote,
+                                 const htlc_t *old_htlcs, size_t old_n_htlcs) {
+    if (!client_handle_lsp_revoke_and_ack(ch, ctx, msg))
+        return CLIENT_LSP_REV_REJECTED;
+    if (!wt || ch->commitment_number == 0)
+        return CLIENT_LSP_REV_OK;
+    uint64_t old_cn = ch->commitment_number - 1;
+    /* Local channel index 0: the client watchtower has one channel. */
+    if (!watchtower_watch_revoked_commitment(wt, ch, 0, old_cn,
+            old_local, old_remote, old_htlcs, old_n_htlcs, NULL, 0)) {
+        fprintf(stderr, "Client: CRITICAL: revoked LSP commitment %llu could "
+                "not be registered with the watchtower\n",
+                (unsigned long long)old_cn);
+        return CLIENT_LSP_REV_UNWATCHED;
+    }
+    return CLIENT_LSP_REV_OK;
 }
 
 int client_parse_forgery_response(const char *s) {

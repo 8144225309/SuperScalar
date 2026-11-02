@@ -1042,7 +1042,7 @@ done:
     return result;
 }
 
-int watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
+int (watchtower_watch_revoked_commitment)(watchtower_t *wt, channel_t *ch,
                                           uint32_t channel_id,
                                           uint64_t old_commit_num,
                                           uint64_t old_local, uint64_t old_remote,
@@ -1054,7 +1054,7 @@ int watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                  old_ptlcs, old_n_ptlcs, NULL, 0);
 }
 
-int watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
+int (watchtower_watch_revoked_commitment_oracular)(watchtower_t *wt, channel_t *ch,
                                                    uint32_t channel_id,
                                                    uint64_t old_commit_num,
                                                    uint64_t old_local,

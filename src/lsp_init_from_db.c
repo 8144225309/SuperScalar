@@ -225,6 +225,14 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
 
+        /* A channel failed before the restart (invalid revocation, or a
+           revoked commitment that could not be watched) stays failed. */
+        if (persist_channel_is_failed(pdb, (uint32_t)c)) {
+            entry->channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+            fprintf(stderr, "LSP recovery: channel %zu is marked FAILED; it "
+                    "accepts no updates and must be force-closed\n", c);
+        }
+
         /* Load active HTLCs from DB */
         {
             htlc_t *loaded_htlcs = malloc(MAX_HTLCS * sizeof(htlc_t));

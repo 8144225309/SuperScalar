@@ -200,7 +200,29 @@ typedef struct {
        without the LSP's cooperation. */
     unsigned char latest_commitment_sig[64];
     int           has_latest_commitment_sig;
+
+    /* Nonzero when the channel can no longer safely advance: the peer
+       answered a commitment update with a revocation that did not verify (or
+       with none we could parse), or the commitment it revoked could not be
+       registered with the watchtower.  The peer may still hold an unrevoked
+       older commitment, so while this is set channel_add_htlc() and
+       channel_create_commitment_partial_sig() refuse.  CHANNEL_FAILED_DURABLE
+       is persisted (channels.state = 'failed', jit_channels.revocation_failed)
+       and survives a restart; CHANNEL_FAILED_SESSION lives in memory only
+       (see lsp_channels_fail_channel).
+
+       The way out is a force-close.  Factory-level ceremonies are not gated
+       on this flag: a leaf advance or a cooperative factory close needs this
+       client's signature, which the LSP cannot get while the client is
+       disconnected and refused, and a cooperative close the client did sign
+       would retire the unrevoked commitment, which is the safe outcome.
+       Rotation leaves the client out of the new factory (lsp_rotation.c). */
+    int           revocation_failed;
 } channel_t;
+
+/* Values of channel_t.revocation_failed (0 = not failed). */
+#define CHANNEL_FAILED_DURABLE 1  /* persisted; survives an LSP restart */
+#define CHANNEL_FAILED_SESSION 2  /* memory only: failed on an unauthenticated session */
 
 /* --- Key derivation (BOLT #3) --- */
 
@@ -294,9 +316,16 @@ int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
 int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_num,
                                      const unsigned char *secret32);
 
-/* Store a received revocation secret at flat index. */
-int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
-                                      const unsigned char *secret32);
+/* Store a received revocation secret at flat index.  The secret is first
+   verified against the peer's committed point (fail-closed); returns 0 if it
+   does not verify or cannot be stored.  The result must be checked: a caller
+   that carries on after a 0 lets the peer keep an unrevoked older commitment
+   while the channel advances.  See SS_MUST_CHECK for the wrapper macro. */
+SS_MUST_CHECK int (channel_receive_revocation_flat)(channel_t *ch,
+                                                   uint64_t commitment_num,
+                                                   const unsigned char *secret32);
+#define channel_receive_revocation_flat(...) \
+    ((channel_receive_revocation_flat)(__VA_ARGS__) != 0)
 
 /* Retrieve a received revocation secret. Returns 1 if valid. */
 int channel_get_received_revocation(const channel_t *ch, uint64_t commitment_num,
@@ -358,8 +387,15 @@ int channel_verify_and_aggregate_commitment_sig(
 int channel_get_revocation_secret(const channel_t *ch, uint64_t old_commitment_num,
                                     unsigned char *secret_out32);
 
-int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
-                                 const unsigned char *secret32);
+/* Same contract as channel_receive_revocation_flat(): returns 0 when the
+   secret does not verify or cannot be stored, and the result must be
+   checked (a peer that answers with a garbage secret keeps an unrevoked,
+   unpenalisable older commitment otherwise). */
+SS_MUST_CHECK int (channel_receive_revocation)(channel_t *ch,
+                                              uint64_t commitment_num,
+                                              const unsigned char *secret32);
+#define channel_receive_revocation(...) \
+    ((channel_receive_revocation)(__VA_ARGS__) != 0)
 
 int channel_build_penalty_tx(const channel_t *ch,
                                tx_buf_t *penalty_tx_out,

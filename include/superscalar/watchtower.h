@@ -229,12 +229,15 @@ int watchtower_check(watchtower_t *wt);
    commitments that cannot be watched).  A failed registration never modifies
    any other entry.  The DB row is written before the in-memory insert, so if
    only the in-memory insert fails a restart still re-arms the watch. */
-int watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
+SS_MUST_CHECK int (watchtower_watch_revoked_commitment)(watchtower_t *wt,
+                                          channel_t *ch,
                                           uint32_t channel_id,
                                           uint64_t old_commit_num,
                                           uint64_t old_local, uint64_t old_remote,
                                           const htlc_t *old_htlcs, size_t old_n_htlcs,
                                           const ptlc_t *old_ptlcs, size_t old_n_ptlcs);
+#define watchtower_watch_revoked_commitment(...) \
+    ((watchtower_watch_revoked_commitment)(__VA_ARGS__) != 0)
 
 /* === Oracular API (#208 A3.1 — daemon-friendly) ===
 
@@ -270,7 +273,8 @@ int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
    bytes.  Once A3.1b migrates all callers and A3.2 drops the legacy
    path, the `ch` arg can be removed too.  Same return contract as
    watchtower_watch_revoked_commitment. */
-int watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
+SS_MUST_CHECK int (watchtower_watch_revoked_commitment_oracular)(watchtower_t *wt,
+                                                   channel_t *ch,
                                                    uint32_t channel_id,
                                                    uint64_t old_commit_num,
                                                    uint64_t old_local,
@@ -281,6 +285,8 @@ int watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch
                                                    size_t old_n_ptlcs,
                                                    const unsigned char *signed_penalty_tx,
                                                    size_t signed_penalty_tx_len);
+#define watchtower_watch_revoked_commitment_oracular(...) \
+    ((watchtower_watch_revoked_commitment_oracular)(__VA_ARGS__) != 0)
 
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);

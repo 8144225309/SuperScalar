@@ -312,35 +312,20 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 free(old_dest_htlcs);
                 return 1;  /* handled (not a fatal error) */
             }
-            uint32_t ack_chan_id;
-            unsigned char rev_secret[32], next_point[33];
-            if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                            rev_secret, next_point)) {
-                uint64_t old_cn = dest_ch->commitment_number - 1;
-                channel_receive_revocation(dest_ch, old_cn, rev_secret);
-                /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
-                   No-op today (n_ptlcs == 0 at all current callsites); defensive
-                   for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
-                size_t old_dest_n_ptlcs = dest_ch->n_ptlcs;
-                ptlc_t *old_dest_ptlcs = NULL;
-                if (old_dest_n_ptlcs > 0) {
-                    old_dest_ptlcs = malloc(old_dest_n_ptlcs * sizeof(ptlc_t));
-                    if (old_dest_ptlcs)
-                        memcpy(old_dest_ptlcs, dest_ch->ptlcs,
-                               old_dest_n_ptlcs * sizeof(ptlc_t));
-                }
-                watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
-                    (uint32_t)dest_idx, old_cn,
+            /* Fail-closed: if the revocation does not verify, or the commitment
+               it revokes cannot be watched, the channel is failed and this
+               update goes no further (no watch, no LSP revocation). */
+            uint64_t old_cn;
+            if (!lsp_channels_accept_raa(mgr, lsp, dest_idx, dest_ch,
+                    (uint32_t)dest_idx, ack_msg.json,
                     old_dest_local, old_dest_remote,
                     old_dest_htlcs, old_dest_n_htlcs,
-                    /* SF-W-PTLC #171: thread PTLC snapshot */ old_dest_ptlcs, old_dest_n_ptlcs);
-                free(old_dest_ptlcs);
-                secp256k1_pubkey next_pcp;
-                if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
-                    channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
-                /* Bidirectional: send LSP's own revocation to dest */
-                lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
+                    dest_ch->ptlcs, dest_ch->n_ptlcs, &old_cn, NULL)) {
+                cJSON_Delete(ack_msg.json);
+                free(old_dest_htlcs);
+                return 0;
             }
+            lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
             cJSON_Delete(ack_msg.json);
         }
         free(old_dest_htlcs);
@@ -454,36 +439,18 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     wire_msg_t ack_msg;
                     if (wire_recv_timeout(lsp->client_fds[client_idx], &ack_msg, 30) &&
                         ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
-                        uint32_t ack_chan_id;
-                        unsigned char rev_secret[32], next_point[33];
-                        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                                        rev_secret, next_point)) {
-                            uint64_t old_cn = ch->commitment_number - 1;
-                            channel_receive_revocation(ch, old_cn, rev_secret);
-                            /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
-                               No-op today (n_ptlcs == 0 at all current callsites); defensive
-                               for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
-                            size_t old_n_ptlcs = ch->n_ptlcs;
-                            ptlc_t *old_ptlcs = NULL;
-                            if (old_n_ptlcs > 0) {
-                                old_ptlcs = malloc(old_n_ptlcs * sizeof(ptlc_t));
-                                if (old_ptlcs)
-                                    memcpy(old_ptlcs, ch->ptlcs,
-                                           old_n_ptlcs * sizeof(ptlc_t));
-                            }
-                            watchtower_watch_revoked_commitment(mgr->watchtower, ch,
-                                (uint32_t)client_idx, old_cn,
+                        /* Fail-closed: if the revocation does not verify, or the commitment
+                           it revokes cannot be watched, the channel is failed (no watch,
+                           no LSP revocation).  The flow continues: the LSP already holds
+                           the preimage, so recording the fulfil and settling upstream
+                           only collects what it is owed. */
+                        uint64_t old_cn;
+                        if (lsp_channels_accept_raa(mgr, lsp, client_idx, ch,
+                                (uint32_t)client_idx, ack_msg.json,
                                 old_local, old_remote,
                                 old_htlcs, old_n_htlcs,
-                                /* SF-W-PTLC #171: thread PTLC snapshot */ old_ptlcs, old_n_ptlcs);
-                            free(old_ptlcs);
-                            secp256k1_pubkey next_pcp;
-                            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp,
-                                                            next_point, 33))
-                                channel_set_remote_pcp(ch,
-                                    ch->commitment_number + 1, &next_pcp);
+                                ch->ptlcs, ch->n_ptlcs, &old_cn, NULL))
                             lsp_send_revocation(mgr, lsp, client_idx, old_cn);
-                        }
                         cJSON_Delete(ack_msg.json);
                     } else {
                         if (ack_msg.json) cJSON_Delete(ack_msg.json);
