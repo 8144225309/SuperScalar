@@ -1511,15 +1511,35 @@ int persist_begin(persist_t *p) {
 
 int persist_commit(persist_t *p) {
     if (!p || !p->db) return 0;
-    int ok = (sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
-    p->in_transaction = 0;
-    return ok;
+    int rc = sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL);
+    if ((rc & 0xff) == SQLITE_BUSY) {
+        /* A busy COMMIT leaves the transaction open and can be retried;
+           the busy timeout has already waited once. */
+        fprintf(stderr, "persist: COMMIT busy (%s); retrying once\n",
+                sqlite3_errmsg(p->db));
+        rc = sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL);
+    }
+    if (rc == SQLITE_OK) {
+        p->in_transaction = 0;
+        return 1;
+    }
+    /* A failed COMMIT can leave the transaction open (busy database,
+       deferred constraint, full disk).  Clearing the flag anyway made the
+       next BEGIN fail and let later writes join this transaction, to be
+       committed by some unrelated COMMIT.  Roll back so the failure is
+       final and the flag matches the connection. */
+    fprintf(stderr, "persist: CRITICAL: COMMIT failed (%s); rolling back, "
+            "this transaction's writes are lost\n", sqlite3_errmsg(p->db));
+    if (!sqlite3_get_autocommit(p->db))
+        sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL);
+    p->in_transaction = !sqlite3_get_autocommit(p->db);
+    return 0;
 }
 
 int persist_rollback(persist_t *p) {
     if (!p || !p->db) return 0;
     int ok = (sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
-    p->in_transaction = 0;
+    p->in_transaction = !sqlite3_get_autocommit(p->db);
     return ok;
 }
 

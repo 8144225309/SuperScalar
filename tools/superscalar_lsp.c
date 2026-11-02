@@ -4327,10 +4327,13 @@ accept_new_factory:
                     lsp_p->factory.created_block, lsp_p->factory.active_blocks,
                     lsp_p->factory.dying_blocks, 0);
             }
-            if (init_ok)
-                persist_commit(&db);
-            else
+            if (init_ok) {
+                if (!persist_commit(&db))
+                    fprintf(stderr, "LSP: warning: initial factory persist "
+                            "did not commit\n");
+            } else {
                 persist_rollback(&db);
+            }
         }
     }
 

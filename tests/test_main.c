@@ -3379,6 +3379,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_dw_state_save_writes_current_state);
     extern int test_restart_dw_counter_many_leaves_round_trip(void);
     RUN_TEST(test_restart_dw_counter_many_leaves_round_trip);
+    extern int test_restart_commit_busy_retried_once(void);
+    RUN_TEST(test_restart_commit_busy_retried_once);
+    extern int test_restart_commit_failure_rolls_back(void);
+    RUN_TEST(test_restart_commit_failure_rolls_back);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

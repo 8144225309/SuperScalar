@@ -894,3 +894,132 @@ int test_restart_dw_counter_many_leaves_round_trip(void) {
     return 1;
 }
 
+/* ---- A failed COMMIT ---- */
+
+static long rs_count(persist_t *db, const char *sql) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    long n = (sqlite3_step(st) == SQLITE_ROW) ? (long)sqlite3_column_int64(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* A second connection holding a read lock on a rollback-journal file DB
+   makes the writer's COMMIT return SQLITE_BUSY.  (The daemon's DBs use
+   WAL, where a COMMIT is rarely busy; the journal mode is only how the
+   test gets one.)  The handler replaces the 5 s busy timeout and gives up
+   at once. */
+typedef struct {
+    sqlite3 *reader;
+    int calls;
+    int release_on_first;
+} rs_busy_t;
+
+static int rs_busy_handler(void *arg, int n) {
+    (void)n;
+    rs_busy_t *b = arg;
+    b->calls++;
+    if (b->release_on_first && b->calls == 1)
+        sqlite3_exec(b->reader, "COMMIT;", NULL, NULL, NULL);  /* drop the lock */
+    return 0;  /* COMMIT returns SQLITE_BUSY now */
+}
+
+static void rs_unlink_db(const char *path) {
+    char side[600];
+    unlink(path);
+    snprintf(side, sizeof(side), "%s-journal", path);
+    unlink(side);
+    snprintf(side, sizeof(side), "%s-wal", path);
+    unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    unlink(side);
+}
+
+/* A busy COMMIT is retried once: when the reader lets go after the first
+   attempt, the retry commits.  When it stays busy, the transaction is
+   rolled back. */
+int test_restart_commit_busy_retried_once(void) {
+    char path[] = "/tmp/ss_rs_busy_XXXXXX";
+    int tfd = mkstemp(path);  /* an empty file (mode 0600) opens as a new DB */
+    TEST_ASSERT(tfd >= 0, "temp file");
+    close(tfd);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(sqlite3_exec(db.db, "PRAGMA journal_mode=DELETE;"
+                "CREATE TABLE rs_busy (id INTEGER PRIMARY KEY);",
+                NULL, NULL, NULL) == SQLITE_OK, "rollback journal, table");
+    rs_busy_t b = { NULL, 0, 0 };
+    TEST_ASSERT(sqlite3_open_v2(path, &b.reader, SQLITE_OPEN_READONLY, NULL)
+                == SQLITE_OK, "reader");
+    sqlite3_busy_handler(db.db, rs_busy_handler, &b);
+
+    /* Busy once, then free. */
+    TEST_ASSERT(sqlite3_exec(b.reader, "BEGIN; SELECT COUNT(*) FROM rs_busy;",
+                             NULL, NULL, NULL) == SQLITE_OK, "read lock");
+    b.release_on_first = 1;
+    TEST_ASSERT(persist_begin(&db), "begin");
+    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO rs_busy VALUES (1);",
+                             NULL, NULL, NULL) == SQLITE_OK, "insert");
+    TEST_ASSERT(persist_commit(&db), "the retry commits");
+    TEST_ASSERT_EQ(b.calls, 1, "the first COMMIT was busy");
+    TEST_ASSERT(!persist_in_transaction(&db), "transaction closed");
+    TEST_ASSERT_EQ(rs_count(&db, "SELECT COUNT(*) FROM rs_busy;"), 1,
+                   "row committed");
+
+    /* Busy on both attempts. */
+    b.calls = 0;
+    b.release_on_first = 0;
+    TEST_ASSERT(sqlite3_exec(b.reader, "BEGIN; SELECT COUNT(*) FROM rs_busy;",
+                             NULL, NULL, NULL) == SQLITE_OK, "read lock again");
+    TEST_ASSERT(persist_begin(&db), "begin");
+    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO rs_busy VALUES (2);",
+                             NULL, NULL, NULL) == SQLITE_OK, "insert");
+    TEST_ASSERT(!persist_commit(&db), "still busy after the retry: fails");
+    TEST_ASSERT_EQ(b.calls, 2, "COMMIT tried twice");
+    TEST_ASSERT(sqlite3_get_autocommit(db.db), "rolled back");
+    TEST_ASSERT(!persist_in_transaction(&db), "flag cleared");
+    sqlite3_exec(b.reader, "COMMIT;", NULL, NULL, NULL);
+    TEST_ASSERT_EQ(rs_count(&db, "SELECT COUNT(*) FROM rs_busy;"), 1,
+                   "the rolled-back row is not there");
+
+    sqlite3_close(b.reader);
+    persist_close(&db);
+    rs_unlink_db(path);
+    return 1;
+}
+
+/* A deferred foreign-key violation makes COMMIT fail and leaves the
+   SQLite transaction open.  persist_commit used to clear its flag anyway:
+   the next BEGIN then failed and later writes went into the stale
+   transaction.  Now the failed transaction is rolled back, the flag
+   matches the connection, and the next transaction starts clean. */
+int test_restart_commit_failure_rolls_back(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    TEST_ASSERT(sqlite3_exec(db.db,
+        "CREATE TABLE rs_parent (id INTEGER PRIMARY KEY);"
+        "CREATE TABLE rs_child (id INTEGER PRIMARY KEY, parent INTEGER "
+        "  REFERENCES rs_parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        NULL, NULL, NULL) == SQLITE_OK, "create tables");
+
+    TEST_ASSERT(persist_begin(&db), "begin");
+    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO rs_child VALUES (1, 99);",
+                             NULL, NULL, NULL) == SQLITE_OK, "insert orphan row");
+    TEST_ASSERT(!persist_commit(&db), "COMMIT fails on the deferred FK");
+    TEST_ASSERT_EQ(persist_in_transaction(&db), !sqlite3_get_autocommit(db.db),
+                   "in-transaction flag matches the connection");
+    TEST_ASSERT(sqlite3_get_autocommit(db.db), "failed transaction rolled back");
+
+    TEST_ASSERT(persist_begin(&db), "next BEGIN succeeds");
+    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO rs_parent VALUES (7);",
+                             NULL, NULL, NULL) == SQLITE_OK, "insert");
+    TEST_ASSERT(persist_commit(&db), "next COMMIT succeeds");
+    TEST_ASSERT_EQ(rs_count(&db, "SELECT COUNT(*) FROM rs_child;"), 0,
+                   "the failed transaction's row was not committed later");
+    TEST_ASSERT_EQ(rs_count(&db, "SELECT COUNT(*) FROM rs_parent;"), 1,
+                   "the next transaction's row was");
+
+    persist_close(&db);
+    return 1;
+}

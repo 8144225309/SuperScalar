@@ -102,7 +102,9 @@ void persist_close(persist_t *p);
 /* Begin a transaction. Returns 1 on success, 0 on error. */
 int persist_begin(persist_t *p);
 
-/* Commit the current transaction. Returns 1 on success, 0 on error. */
+/* Commit the current transaction.  A busy COMMIT is retried once.  On
+   failure the transaction is rolled back (logged as CRITICAL: its writes
+   are lost) and 0 is returned.  Returns 1 on success. */
 int persist_commit(persist_t *p);
 
 /* Rollback the current transaction. Returns 1 on success, 0 on error. */
