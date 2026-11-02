@@ -350,6 +350,20 @@ int persist_list_subfactory_chain_keys(persist_t *p,
 int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
                                size_t *count_out);
 
+/* A client DB holds one factory channel and keys every per-channel row by
+   this id.  (An LSP DB keys each channel by the client's index.) */
+#define CLIENT_DB_CHANNEL_ID 0
+
+/* Older client builds kept part of the client DB under the client's index
+   (the channel row and balances, the basepoints, and the revocation
+   secrets and remote per-commitment points written through the channel)
+   and the rest under 0.  If the DB's one factory channel is not under
+   CLIENT_DB_CHANNEL_ID, move those rows there, keeping any duplicate
+   already under it.  A DB whose channel is already there, or that has
+   several factory channels (an LSP DB), is left alone.  Returns 1 on
+   success or when there is nothing to move, 0 on error (nothing moved). */
+int persist_client_move_to_channel_0(persist_t *p);
+
 /* Hydrate a channel_t with enough state for channel_build_penalty_tx().
    Zeroes *out_ch, allocates the dynamic arrays channel_init() would, and
    fills in basepoints + revocation secrets + balances from the DB.

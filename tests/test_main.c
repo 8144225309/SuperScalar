@@ -3389,6 +3389,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_advance_refused_after_restore);
     extern int test_restart_client_refuses_tier_b_after_restore(void);
     RUN_TEST(test_restart_client_refuses_tier_b_after_restore);
+    extern int test_restart_client_legacy_db_moves_to_channel_0(void);
+    RUN_TEST(test_restart_client_legacy_db_moves_to_channel_0);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

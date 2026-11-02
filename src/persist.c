@@ -3,6 +3,7 @@
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
+#include "superscalar/jit_channel.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2816,6 +2817,68 @@ int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
     }
     sqlite3_finalize(stmt);
     if (count_out) *count_out = count;
+    return 1;
+}
+
+
+static int exec_with_id(sqlite3 *db, const char *sql, int id) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, id);
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_client_move_to_channel_0(persist_t *p) {
+    if (!p || !p->db) return 0;
+
+    /* JIT channels are at JIT_CHANNEL_ID_BASE and up; the factory channel
+       is the one row below that. */
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT id FROM channels WHERE id < ?;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)JIT_CHANNEL_ID_BASE);
+    int n = 0, old_id = -1, rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        n++;
+        old_id = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return 0;
+    if (n != 1 || old_id == CLIENT_DB_CHANNEL_ID) return 1;
+
+    /* The tables the client wrote under its index. */
+    static const char *const moves[][2] = {
+        { "channels", "id" },
+        { "channel_basepoints", "channel_id" },
+        { "revocation_secrets", "channel_id" },
+        { "remote_pcps", "channel_id" },
+    };
+    int own_txn = !persist_in_transaction(p);
+    if (own_txn && !persist_begin(p)) return 0;
+    int ok = 1;
+    for (size_t i = 0; ok && i < sizeof(moves) / sizeof(moves[0]); i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "UPDATE OR IGNORE %s SET %s = %d WHERE %s = ?;",
+                 moves[i][0], moves[i][1], CLIENT_DB_CHANNEL_ID, moves[i][1]);
+        ok = exec_with_id(p->db, sql, old_id);
+        if (!ok) break;
+        /* Whatever is left duplicated a row already under the new id. */
+        snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s = ?;",
+                 moves[i][0], moves[i][1]);
+        ok = exec_with_id(p->db, sql, old_id);
+    }
+    if (!ok) {
+        fprintf(stderr, "persist: moving the client channel from id %d to %d "
+                "failed: %s\n", old_id, CLIENT_DB_CHANNEL_ID, sqlite3_errmsg(p->db));
+        if (own_txn) persist_rollback(p);
+        return 0;
+    }
+    if (own_txn && !persist_commit(p)) return 0;
+    fprintf(stderr, "persist: moved the client channel's rows from id %d to %d\n",
+            old_id, CLIENT_DB_CHANNEL_ID);
     return 1;
 }
 
