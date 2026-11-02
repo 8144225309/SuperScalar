@@ -20,7 +20,7 @@
 # true payment ceiling (auto-stops on the first conservation violation).
 #
 # Usage: bash test_regtest_pct100_lifecycle.sh [BUILD_DIR]
-# Env: N_CLIENTS(3) MAX_PAYS(6) PAY_MIN(1000) PAY_MAX(6000) PORT(9970)
+# Env: N_CLIENTS(3) MAX_PAYS(6) PAY_MIN(1000) PAY_MAX(6000) PORT(9970) ACTIVE_BLOCKS(500)
 #      PAY_SETTLE_TRIES(40) PAY_RECOVER(1) PAY_GAP(1) CLOSE_WAIT_SEC(900)
 set -uo pipefail
 
@@ -218,7 +218,7 @@ mkfifo "$FIFO"; exec 3<>"$FIFO"; CLI_FD_OPEN=1
 nohup "$LSP_BIN" --network regtest --port "$PORT" \
     --clients "$N_CLIENTS" --arity "$ARITY" --static-near-root "$STATIC_NEAR_ROOT" \
     --amount "$AMOUNT" \
-    --active-blocks 500 --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
+    --active-blocks "${ACTIVE_BLOCKS:-500}" --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
     --fee-rate 1000 --lsp-balance-pct 100 --confirm-timeout 600 \
     --max-conn-rate 100000 --max-handshakes "$(( N_CLIENTS + 16 ))" \
     --seckey "$LSP_SECKEY" \

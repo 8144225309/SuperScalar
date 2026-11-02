@@ -2,7 +2,22 @@
 
 All notable changes to SuperScalar are documented here.
 
-> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. Factory scale limits are documented in `docs/factory-arity.md`. The persisted schema version is **39**.
+
+## Unreleased
+
+### Scale: tested at N=512
+
+**Tested at N=512** (LSP + 512 clients = 513 signers on one factory UTXO): creation, Lightning payments and cooperative close — 512 LN-borne client fundings, client-to-client payments, and a single 513-output cooperative close that conserves to the satoshi. Regtest with 512 independent client daemons (twice), and on public signet via the in-process manager: close `bf8580199b0de7a2d731d21b1d3fc2f4d1e89087575ad02f718dc95c2ef830d0` (22,129 vB, 1 input, 513 outputs, 2,048 real HTLC ceremonies). The practical upper limit is not yet established.
+
+**Known issue above 128 clients:** `FACTORY_MAX_NODES` (512) is still used as a fixed array bound in several paths, and the tree has 4N−2 nodes. Most seriously, the Tier B state advance (the re-sign after a root rollover, which touches every node) writes one entry per affected node into 512-entry stack arrays on both the client and the LSP, so at N≥129 it overflows those stack arrays. This is fixed in the follow-up. Separately, the LSP side of Tier B draws its state nonces from a `musig_nonce_pool`, which holds at most `MUSIG_NONCE_POOL_MAX` (256) nonces, so LSP-side Tier B currently stops at about 64 clients for arity-1/PS trees (4N−2 nodes); that limit is not addressed by the follow-up. The cooperative close uses neither path, so the runs above are unaffected.
+
+- `MUSIG_SESSION_MAX_SIGNERS` 256 → 512, documented as **advisory, not enforced**: nothing reads it at runtime and session buffers are allocated to `n_signers`. `FACTORY_MAX_SIGNERS` stays 256; it is a default for the per-factory signer arrays (which grow to the participant count) and bounds `LADDER_MAX_PARTICIPANTS`, so ladder entries are still refused above 255 clients.
+- `--max-connections` is now bounded by `SS_MAX_PARTICIPANTS`, not `LSP_MAX_CLIENTS`. The latter is a *floor* (`cap = max(LSP_MAX_CLIENTS, expected_clients)`), so validating against it made the flag unusable above 256 while the allocation itself scaled fine.
+- LSP: the CLI profit-share defaults (`--default-profit-bps`, per-participant `contribution_sats`) are written into the factory's profiles before `factory_init`, but those arrays only existed if a shape option had allocated them, and then only for 256 signers. With a plain `--arity 2` the LSP either crashed writing to the unallocated array or, once that write was bounds-checked, silently offered every client 0 bps; above 255 clients, participants 256+ got 0. The arrays are now allocated up front, sized to the participant count.
+- Client: `profit_share_bps` was read from the factory terms only for `my_index < FACTORY_MAX_SIGNERS` (256), so clients 256 and above checked their fee settlement against 0 bps. Now bounded by the profiles allocation (`config.max_signers`), the same fix as the LSP profile loops.
+- `FACTORY_MAX_NODES` deliberately **not** raised: `config.max_nodes` already auto-raises to fit the real tree, so the constant is only a seed value. About 50 stack arrays are sized by it; raising it to cover N=512 (2,046 nodes) would quadruple them and hide the bug rather than fix it. Annotated in place instead.
+- `factory_node_t` 7448 → 6120 bytes (−17.8%) by moving conditionally-used per-node arrays (`ps_prev_*`, `input_merkle_root` family) to the heap, the same treatment `input_signer_indices` already had. At N=512 the 2,046-node tree is 14.53 → 11.94 MiB per process; measured peak RSS for the factory alone (build + sign + cooperative close, no channels or payments: `test_inproc_factory_lifecycle lifecycle 512`, on a 4-core Linux machine) went from 27.0–27.3 MiB to 24.4–24.8 MiB. `factory_detach_txbufs` (ladder entries) now deep-copies the heap `ps_prev_*` arrays and stops sharing the per-input signing arrays with the original.
 
 ## v0.2.0 — 2026-07-02
 

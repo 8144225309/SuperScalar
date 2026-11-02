@@ -12,6 +12,13 @@
 #include <secp256k1_extrakeys.h>
 
 #define FACTORY_MAX_NODES   512
+/* Seed value for cfg->max_nodes only: config.max_nodes auto-raises to fit the
+   real tree (factory_config_fit, factory_build_tree), so the factory is never
+   capped by this.  n_nodes = 4N-2, which exceeds 512 from N=129.
+   Do not use this macro as an array bound or loop limit -- bound by
+   f->n_nodes, f->nodes_cap or f->config.max_nodes instead.  Sites still using
+   it that way truncate or overflow stack arrays above 512 nodes.  Raising it
+   would quadruple the ~50 arrays sized by it and hide those bugs. */
 /* Initial nodes[] capacity; factory_grow_nodes() doubles from here up to
    config.max_nodes.  Small on purpose: the point of growing on demand is that a
    factory costs what its own tree costs, not what the worst-case config would. */
@@ -23,16 +30,12 @@
  * 8 × tx_output_t to 16 × tx_output_t; at 506 nodes (max PS factory at
  * N=128) that's ~50KB extra per factory_t — acceptable. */
 #define FACTORY_MAX_OUTPUTS 16
-/* FACTORY_MAX_SIGNERS = size of the keyagg/pubkey ARRAYS and the upper bound
- * on the MuSig2 signing group (LSP + clients).  The signing limit is
- * MUSIG_SESSION_MAX_SIGNERS, now also 256 (LSP + up to 255 clients).  The old
- * comment here claimed >128 signers was "NOT signable"; that was overly
- * conservative — MuSig2/Schnorr aggregate + sign + verify cleanly to 2048
- * signers, and the distributed session path is valgrind-clean at 256 (see
- * tools/test_musig_scale.c, tools/test_musig_session_scale.c).  NOTE: running
- * 255 client daemons is memory-heavy (~70 MB RSS each); a large-factory
- * deployment is RAM-bound, and shrinking factory_t (dynamic leaf_layers) is a
- * worthwhile follow-up. */
+/* FACTORY_MAX_SIGNERS: DEFAULT size of the per-factory signer arrays
+ * (factory_config_fit grows them to the participant count), and the bound on
+ * LADDER_MAX_PARTICIPANTS, so ladder entries are refused above 255 clients.
+ * It is not a signing limit: MUSIG_SESSION_MAX_SIGNERS is advisory, session
+ * buffers are sized to n_signers, and MuSig2 aggregate + sign + verify is
+ * exercised past 256 signers by tools/test_musig_session_scale.c. */
 #define FACTORY_MAX_SIGNERS 256
 
 /* Absolute ceiling on participants in ONE factory, for validating counts that

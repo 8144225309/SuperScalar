@@ -2071,8 +2071,8 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--max-connections") == 0 && i + 1 < argc) {
             max_connections_arg = atoi(argv[++i]);
-            if (max_connections_arg < 1 || max_connections_arg > LSP_MAX_CLIENTS) {
-                fprintf(stderr, "Error: --max-connections must be 1..%d\n", LSP_MAX_CLIENTS);
+            if (max_connections_arg < 1 || max_connections_arg > SS_MAX_PARTICIPANTS) {
+                fprintf(stderr, "Error: --max-connections must be 1..%d\n", SS_MAX_PARTICIPANTS);
                 return 1;
             }
         }
@@ -4164,6 +4164,21 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
+    /* The shape setters below and the default-profile loop run BEFORE
+       factory_init, on the zeroed lsp_p->factory.  Its participant arrays only
+       existed if a shape setter happened to run (each calls
+       factory_alloc_default_arrays), and were then sized to the default 256
+       signers.  So with a plain "--arity 2" the profile loop saw no profiles
+       and skipped, leaving every client's profit share at 0, and above 255
+       clients it stopped at 256.  Allocate them here, sized to this factory;
+       lsp_run_factory_creation carries them across factory_init. */
+    factory_config_default(&lsp_p->factory.config);
+    if (lsp_p->factory.config.max_signers < (uint32_t)(1 + n_clients))
+        lsp_p->factory.config.max_signers = (uint32_t)(1 + n_clients);
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory participant array allocation failed\n");
+        return 1;
+    }
     if (n_level_arity > 0)
         factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
