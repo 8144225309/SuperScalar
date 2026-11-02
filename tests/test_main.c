@@ -3928,6 +3928,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_tip_race_no_false_forward);
     RUN_TEST(test_reorg_classify_detects_real_reorgs);
     RUN_TEST(test_reorg_classify_unseen_block_reorg);
+
+    /* R5 funding revalidation: re-check decision + restart reload */
+    extern int test_reorg_funding_recheck_due(void);
+    extern int test_reorg_funding_freeze_reloaded_on_restart(void);
+    RUN_TEST(test_reorg_funding_recheck_due);
+    RUN_TEST(test_reorg_funding_freeze_reloaded_on_restart);
 }
 
 extern int regtest_init_faucet(void);
@@ -4072,10 +4078,12 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);
 
-    printf("\n=== Regtest Reorg Detection ===\n");
+    printf("\n=== Regtest Reorg Detection & Funding Revalidation ===\n");
     {
+        extern int test_regtest_reorg_revalidate_factory_funding(void);
         extern int test_regtest_reorg_tip_snapshot_consistent(void);
         extern int test_regtest_reorg_unseen_tip_block_detected(void);
+        RUN_TEST(test_regtest_reorg_revalidate_factory_funding);
         RUN_TEST(test_regtest_reorg_unseen_tip_block_detected);
         /* Mines 300 blocks: keep it last so earlier tests keep subsidy. */
         RUN_TEST(test_regtest_reorg_tip_snapshot_consistent);

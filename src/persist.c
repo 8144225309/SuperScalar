@@ -2742,6 +2742,29 @@ int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
+int persist_load_channel_funding_reorg(persist_t *p, uint32_t channel_id,
+                                       int *funding_pending_reorg) {
+    if (!p || !p->db || !funding_pending_reorg) return 0;
+    *funding_pending_reorg = 0;
+
+    const char *sql =
+        "SELECT funding_pending_reorg FROM channels WHERE id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+
+    int ok = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *funding_pending_reorg = sqlite3_column_int(stmt, 0) ? 1 : 0;
+        ok = 1;
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
                                      uint64_t local_amount,
                                      uint64_t remote_amount,

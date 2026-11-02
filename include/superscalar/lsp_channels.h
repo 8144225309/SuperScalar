@@ -199,6 +199,11 @@ typedef struct {
     /* Reorg detection (R1): the heartbeat's own stored tip. */
     lsp_reorg_state_t hb_reorg;
 
+    /* R5: set by lsp_channels_revalidate_funding() when the funding TX it
+       checked was not confirmed (pending in the mempool, stale, or gone).
+       While set, the daemon loop re-runs revalidation on every new block. */
+    int funding_anchor_unconfirmed;
+
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
     uint64_t locked_in_factories_sats;   /* capital in active factories */
@@ -411,15 +416,27 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    not an error. */
 int lsp_persist_ps_chain0_all(void *persist, factory_t *f);
 
-/* R5 (mainnet pre-flight): revalidate each factory channel's funding UTXO
-   against the active chain.  Sets ch->funding_pending_reorg=1 when the
-   funding TX has been reorged out; clears it back to 0 when re-confirmed.
-   LN-aligned: channel is FROZEN (HTLCs + force-close refused), not
+/* R5 (mainnet pre-flight): revalidate each factory channel's funding
+   against the active chain.  What is checked is the factory's funding TX
+   (lsp->factory.funding_txid), not ch->funding_txid: for a factory channel
+   that is the off-chain leaf state TX, which is normally never broadcast.
+   Sets ch->funding_pending_reorg=1 when the funding TX is neither confirmed
+   nor in the mempool, or has sat in the mempool past the network threshold;
+   clears it back to 0 when it has >= 1 confirmation again.  Sets
+   mgr->funding_anchor_unconfirmed when the funding TX was not confirmed.
+   With lsp == NULL (or no factory funding set) ch->funding_txid itself is
+   checked.
+   LN-aligned: channel is FROZEN (HTLCs + commitment builds refused), not
    abandoned — re-confirmation re-enables it.
    When `lsp` is non-NULL, sends MSG_FUNDING_REORG to lsp->client_fds[slot]
    on every flip so the client mirrors the freeze state.
    Returns the number of channels whose flag state changed. */
 int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* 1 when the daemon loop should call lsp_channels_revalidate_funding() on
+   the next new block: some channel is frozen, or the last revalidation saw
+   the funding TX unconfirmed. */
+int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr);
 
 /* Reorg detection (R1) classification.  Pure: no I/O.
    st is the stored tip (from the previous poll), (cur_height, cur_hash) the

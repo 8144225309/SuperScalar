@@ -3005,58 +3005,129 @@ const char *lsp_reorg_kind_str(lsp_reorg_kind_t kind) {
     }
 }
 
-/* R5 (mainnet pre-flight): revalidate each factory channel's funding UTXO
-   against the active chain.  Sets ch->funding_pending_reorg = 1 when the
-   funding TX is no longer findable (reorged out); clears the flag back to
-   0 when a confirmed observation returns.  Mirrors jit_channels_revalidate
-   _funding() (src/jit_channel.c:752) for the factory-channel case.
-
-   Returns the number of channels whose flag state changed (toggled either
-   direction).  Caller may persist or notify clients on a non-zero return.
-
-   Intended call sites (separate PRs will wire these up):
-     1. Daemon startup recovery (one-shot scan, like jit_channels_*)
-     2. R1's reorg handler in lsp_run_state_advance (defense after watchtower_on_reorg)
-     3. Periodic heartbeat (cheap defense)
-*/
-int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+/* Display-order hex of an internal-order txid. */
+static void reval_txid_hex(const unsigned char txid[32], char out[65]) {
     extern void hex_encode(const unsigned char *, size_t, char *);
     extern void reverse_bytes(unsigned char *, size_t);
+    unsigned char disp[32];
+    memcpy(disp, txid, 32);
+    reverse_bytes(disp, 32);
+    hex_encode(disp, 32, out);
+    out[64] = '\0';
+}
+
+typedef enum {
+    REVAL_CONFIRMED,   /* >= 1 confirmation in the active chain */
+    REVAL_PENDING,     /* in the mempool, younger than the freeze threshold */
+    REVAL_STALE,       /* in the mempool past regtest_network_mempool_freeze_seconds() */
+    REVAL_GONE,        /* neither confirmed nor in the mempool */
+} reval_state_t;
+
+/* State of one funding TX.  conf == 0 alone does not mean "in the mempool":
+   with -txindex, getrawtransaction still returns a TX whose block was
+   disconnected (and a wallet still lists it) with "confirmations": 0, so
+   the mempool is checked as well.  A block connecting between the two RPCs
+   can make a just-confirmed TX look GONE for one call; the next per-block
+   re-check corrects it. */
+static reval_state_t reval_funding_state(regtest_t *rt, const char *txid_hex,
+                                         int *conf_out) {
+    int conf = regtest_get_confirmations(rt, txid_hex);
+    *conf_out = conf;
+    if (conf >= 1) return REVAL_CONFIRMED;
+    if (conf < 0) return REVAL_GONE;
+    int age = regtest_get_mempool_entry_seconds_ago(rt, txid_hex);
+    if (age < 0) return REVAL_GONE;
+    return age >= regtest_network_mempool_freeze_seconds(rt) ? REVAL_STALE
+                                                             : REVAL_PENDING;
+}
+
+static int lsp_channels_any_funding_frozen(const lsp_channel_mgr_t *mgr) {
+    if (!mgr || !mgr->entries) return 0;
+    for (size_t c = 0; c < mgr->n_channels; c++)
+        if (mgr->entries[c].channel.funding_pending_reorg) return 1;
+    return 0;
+}
+
+int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr) {
+    return mgr && (mgr->funding_anchor_unconfirmed ||
+                   lsp_channels_any_funding_frozen(mgr));
+}
+
+/* R5 (mainnet pre-flight): revalidate each factory channel's funding
+   against the active chain, and freeze (funding_pending_reorg = 1)
+   channels whose funding TX is gone; unfreeze them when it confirms again.
+
+   What is checked: a factory channel's ch->funding_txid is its LEAF state
+   transaction (lsp_channels_init: funding_txid = state_node->txid).  That
+   transaction lives in the off-chain factory tree and is normally never
+   broadcast, so it must not be looked up.  What backs every channel of a
+   factory is the factory's funding transaction (lsp->factory.funding_txid).
+   All channels in mgr are built from lsp->factory (lsp_channels_init /
+   lsp_channels_init_from_db are called with &lsp->factory, and again after
+   every rotation, which replaces lsp->factory); ladder factories other than
+   the active one have no entries in mgr.  A leaf TX can only be on chain if
+   the factory funding TX is, so the leaf is never consulted.
+
+   Per call, the factory funding TX is classified once (reval_funding_state):
+     - CONFIRMED: frozen channels are unfrozen.
+     - GONE (not confirmed, not in the mempool) or STALE (in the mempool past
+       the per-network threshold): channels are frozen.
+     - PENDING: no change.
+   mgr->funding_anchor_unconfirmed is set when the result was not CONFIRMED;
+   while it (or any freeze) is set the daemon loop calls this again on every
+   new block (lsp_channels_funding_recheck_due), so PENDING turns into a
+   freeze or an all-clear without waiting for another reorg.
+
+   When lsp is NULL or the factory has no funding txid set, ch->funding_txid
+   itself is checked per channel (the pre-factory behaviour).  JIT channels
+   are handled by jit_channels_revalidate_funding() (src/jit_channel.c).
+
+   Returns the number of channels whose flag changed.  Each change is
+   persisted (v31) and sent to the client as MSG_FUNDING_REORG.
+   Callers: the R1 reorg handlers (daemon loop, heartbeat) and the daemon
+   loop's per-block re-check. */
+int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+    regtest_t *rt = mgr->watchtower->rt;
     int changed = 0;
+    int any_unconfirmed = 0;
+
+    static const unsigned char zero32[32] = {0};
+    const factory_t *f = lsp ? &lsp->factory : NULL;
+    int use_factory = f && memcmp(f->funding_txid, zero32, 32) != 0;
+    char fund_hex[65] = {0};
+    int fund_conf = -1;
+    reval_state_t fund_state = REVAL_GONE;
+    if (use_factory) {
+        reval_txid_hex(f->funding_txid, fund_hex);
+        fund_state = reval_funding_state(rt, fund_hex, &fund_conf);
+    }
+
     for (size_t c = 0; c < mgr->n_channels; c++) {
         channel_t *ch = &mgr->entries[c].channel;
-        /* Compute display-order hex txid for the chain query. */
-        unsigned char disp[32];
-        memcpy(disp, ch->funding_txid, 32);
-        reverse_bytes(disp, 32);
-        char txid_hex[65];
-        hex_encode(disp, 32, txid_hex);
-        txid_hex[64] = '\0';
-        int conf = regtest_get_confirmations(mgr->watchtower->rt, txid_hex);
-        int new_state = -1;
-        /* R5 #128: proactive mempool-expiry freeze.  If the TX is in
-           mempool but unconfirmed (conf == 0) AND it has been there
-           longer than the network-specific threshold, treat it as
-           effectively reorged-out.  Pairs with the reactive `conf < 0`
-           freeze below — together they catch "evicted already" and
-           "about to be evicted". */
-        int mempool_age_freeze = 0;
-        if (conf == 0) {
-            int age = regtest_get_mempool_entry_seconds_ago(
-                mgr->watchtower->rt, txid_hex);
-            int threshold = regtest_network_mempool_freeze_seconds(
-                mgr->watchtower->rt);
-            if (age >= threshold)
-                mempool_age_freeze = 1;
+        char own_hex[65];
+        const char *txid_hex;   /* the TX the decision was based on */
+        int conf;
+        reval_state_t st;
+        if (use_factory) {
+            txid_hex = fund_hex;
+            conf = fund_conf;
+            st = fund_state;
+        } else {
+            reval_txid_hex(ch->funding_txid, own_hex);
+            txid_hex = own_hex;
+            st = reval_funding_state(rt, own_hex, &conf);
         }
-        if ((conf < 0 || mempool_age_freeze) && !ch->funding_pending_reorg) {
+        if (st != REVAL_CONFIRMED) any_unconfirmed = 1;
+
+        int new_state = -1;
+        if ((st == REVAL_GONE || st == REVAL_STALE) && !ch->funding_pending_reorg) {
             fprintf(stderr,
-                "LSP revalidate: channel %zu funding %.16s... %s — "
+                "LSP revalidate: channel %zu %s %.16s... %s — "
                 "FREEZING (funding_pending_reorg=1)\n",
-                c, txid_hex,
-                mempool_age_freeze ? "stale in mempool past timeout"
-                                   : "not on chain");
+                c, use_factory ? "factory funding" : "funding", txid_hex,
+                st == REVAL_STALE ? "stale in mempool past timeout"
+                                  : "not on chain or in mempool");
             ch->funding_pending_reorg = 1;
             changed++;
             new_state = 1;
@@ -3064,11 +3135,11 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             if (mgr->persist)
                 persist_update_channel_funding_reorg(
                     (persist_t *)mgr->persist, (uint32_t)c, 1);
-        } else if (conf >= 1 && ch->funding_pending_reorg) {
+        } else if (st == REVAL_CONFIRMED && ch->funding_pending_reorg) {
             fprintf(stderr,
-                "LSP revalidate: channel %zu funding %.16s... back on chain "
+                "LSP revalidate: channel %zu %s %.16s... back on chain "
                 "(%d confs) — UNFREEZING (funding_pending_reorg=0)\n",
-                c, txid_hex, conf);
+                c, use_factory ? "factory funding" : "funding", txid_hex, conf);
             ch->funding_pending_reorg = 0;
             changed++;
             new_state = 0;
@@ -3091,6 +3162,7 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             }
         }
     }
+    mgr->funding_anchor_unconfirmed = any_unconfirmed;
     return changed;
 }
 
@@ -7278,6 +7350,22 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             factory_recovery_scan((persist_t *)mgr->persist,
                                                   chain_rec);
                         }
+                    }
+                    /* On each new block, re-check the funding anchor while a
+                       channel is frozen or the factory funding has not yet
+                       re-confirmed after a reorg
+                       (lsp_channels_funding_recheck_due).  Unfreezing, and a
+                       later freeze of a funding TX left unconfirmed by a
+                       reorg, otherwise waited for the next detected reorg. */
+                    if (reorg_kind == LSP_REORG_NONE && height > 0 &&
+                        (height != daemon_prev_height ||
+                         strcmp(cur_tip_hash, daemon_prev_hash) != 0) &&
+                        lsp_channels_funding_recheck_due(mgr)) {
+                        int thw = lsp_channels_revalidate_funding(mgr, lsp);
+                        if (thw)
+                            fprintf(stderr, "LSP: new-block revalidate "
+                                    "flipped funding_pending_reorg on %d "
+                                    "channel(s)\n", thw);
                     }
                 }
                 if (height > 0) {

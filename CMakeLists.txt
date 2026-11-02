@@ -372,6 +372,7 @@ add_executable(test_superscalar
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_reorg_tip.c
+    tests/test_regtest_funding_reval.c
     tests/test_cli_arity.c
     tests/test_prometheus.c
 )

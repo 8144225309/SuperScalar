@@ -333,6 +333,11 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
 int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
                                             int funding_pending_reorg);
 
+/* Read it back (lsp_channels_init_from_db).  Returns 1 if the channel row
+   exists, 0 otherwise (*funding_pending_reorg = 0). */
+int persist_load_channel_funding_reorg(persist_t *p, uint32_t channel_id,
+                                       int *funding_pending_reorg);
+
 /* Return all channel ids currently stored, in ascending order. */
 /* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for
    standalone watchtower hydration of PS state entries. */
