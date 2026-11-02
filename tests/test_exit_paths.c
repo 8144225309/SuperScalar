@@ -3163,3 +3163,68 @@ int test_reload_tierb_freeze(void) {
     ex_rig_free(&r);
     return 1;
 }
+
+/* Two DW root rollovers through the real ceremonies, with leaf advances
+   between them and both sides recording every signed state, then a reload
+   and further advances: positions of different epochs never collide. */
+int test_reload_two_rollovers_no_reservation_collision(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_two", 0, 3), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_two2", 3), "second client");
+    alarm(900);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0, rolls = 0, steps = 0;
+    while (rolls < 2 && steps < 12) {
+        uint32_t e = r.lsp->factory.counter.current_epoch;
+        int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+        TEST_ASSERT(rc == 1 && ok1 && ok2, "advance (leaf or root)");
+        if (r.lsp->factory.counter.current_epoch != e) rolls++;
+        steps++;
+    }
+    TEST_ASSERT(rolls == 2 && r.lsp->factory.counter.current_epoch == 2, "two rollovers");
+    int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 2");
+    int nres = ex_sql_int(&r.db, "SELECT COUNT(*) FROM signed_state_reservations");
+    /* the LSP restarts (a DW-only client DB cannot record the epoch, so
+       the clients keep their trees in memory) */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  %d advances, 2 rollovers, %d reservation rows; after reload: "
+           "epoch %u, next advance rc=%d\n", steps + 1, nres,
+           r.lsp->factory.counter.current_epoch, rc);
+    TEST_ASSERT(rc == 1 && ok1, "advance after reload (no reservation conflict)");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A PS factory DB from before ps_initial_signed_states (no chain[0] rows),
+   with advanced chains: the reload cannot tell the chain's epoch or link it,
+   so the factory stays refused rather than loading the rows as stored. */
+int test_reload_ps_without_chain0_refused(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_PS, "rl_noc0", 0), "rig");
+    alarm(300);
+    int ok = 0;
+    for (int a = 0; a < 2; a++)
+        TEST_ASSERT(ex_rig_ps_advance(&r, &ok) == 1 && ok, "chain advance");
+    TEST_ASSERT(sqlite3_exec(r.db.db, "DELETE FROM ps_initial_signed_states",
+                             NULL, NULL, NULL) == SQLITE_OK, "drop chain[0] rows");
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&r.db, 0, g, r.ctx), "reload");
+    printf("  advanced PS chain without a chain[0] row: flag=%d\n",
+           g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "refused");
+    factory_free(g); free(g);
+    alarm(0);
+    ex_rig_free(&r);
+    return 1;
+}

@@ -1203,6 +1203,8 @@ extern int test_reload_client_refuses_conflicting_state(void);
 extern int test_reload_reveal_cap_after_reload(void);
 extern int test_reload_dw_client_epoch_unknown(void);
 extern int test_reload_tierb_freeze(void);
+extern int test_reload_two_rollovers_no_reservation_collision(void);
+extern int test_reload_ps_without_chain0_refused(void);
 extern int test_regtest_exit_client_path_past_128(void);
 extern int test_regtest_exit_after_dw_leaf_advance(void);
 extern int test_regtest_exit_after_ps_leaf_advance(void);
@@ -2499,6 +2501,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reload_reveal_cap_after_reload);
     RUN_TEST(test_reload_dw_client_epoch_unknown);
     RUN_TEST(test_reload_tierb_freeze);
+    RUN_TEST(test_reload_two_rollovers_no_reservation_collision);
+    RUN_TEST(test_reload_ps_without_chain0_refused);
     RUN_TEST(test_admin_rpc_sweepfactory_no_persist);
     RUN_TEST(test_admin_rpc_sweepfactory_missing_dest);
 

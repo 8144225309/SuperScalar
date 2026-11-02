@@ -2486,9 +2486,10 @@ int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
                               const unsigned char *unsigned_tx, size_t tx_len,
                               int any_nsequence) {
     if (!p || !p->db || !unsigned_tx || tx_len == 0) return PERSIST_RESERVE_ERROR;
-    if (p->in_transaction) {
+    if (p->in_transaction || !sqlite3_get_autocommit(p->db)) {
         /* The row must be on disk before the signature leaves; inside an
-           open transaction it would not be until the caller commits. */
+           open transaction (ours, or a raw BEGIN from any other path) it
+           would not be until that transaction commits. */
         fprintf(stderr, "persist_reserve_signed_tx: called inside a "
                 "transaction; refusing\n");
         return PERSIST_RESERVE_ERROR;
@@ -2565,7 +2566,7 @@ int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
 int persist_set_root_advance_pending(persist_t *p, uint32_t factory_id,
                                      uint32_t epoch, int trigger_leaf) {
     if (!p || !p->db || epoch == 0) return 0;
-    if (p->in_transaction) {
+    if (p->in_transaction || !sqlite3_get_autocommit(p->db)) {
         fprintf(stderr, "persist_set_root_advance_pending: called inside a "
                 "transaction; refusing\n");
         return 0;

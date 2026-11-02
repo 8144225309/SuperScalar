@@ -736,6 +736,26 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         }
         memset(lsp_seckey, 0, 32);
 
+        /* Reserve the root node (it spends the funding output) before our
+           partial sigs go out: a creation retried over the same funding,
+           e.g. after a restart, builds a new tree (the CLTV follows the
+           height), while a client may already hold the first one fully
+           signed.  Only the identical tree can then be signed again. */
+        if (lsp->db) {
+            for (size_t ri = 0; ri < f->n_nodes; ri++) {
+                if (f->nodes[ri].parent_index >= 0) continue;
+                if (persist_reserve_signed_tx(lsp->db, 0, (uint32_t)ri,
+                        f->nodes[ri].unsigned_tx.data, f->nodes[ri].unsigned_tx.len,
+                        0) != PERSIST_RESERVE_OK) {
+                    fprintf(stderr, "LSP-stateless: not signing the factory: its "
+                            "root TX conflicts with one already signed over this "
+                            "funding output (or could not be recorded)\n");
+                    free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+                    goto fail_pre;
+                }
+            }
+        }
+
         /* Step D: LSP_RESPONSE -- per-node LSP nonces + psigs + full matrix. */
         cJSON *response = wire_build_factory_lsp_response(
             lsp_pn_per_node, lsp_psig_per_node, (uint32_t)f->n_nodes,
