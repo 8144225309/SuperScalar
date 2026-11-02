@@ -2,8 +2,9 @@
         if (test_dw_advance) {
             printf("\n=== DW ADVANCE TEST ===\n");
 
-            /* Record epoch-0 nSequence values for before/after comparison */
-            uint32_t dwa_initial[FACTORY_MAX_NODES];
+            /* Record epoch-0 nSequence values for before/after comparison.
+               One per tree node (n_nodes can exceed 512 from N=129). */
+            uint32_t dwa_initial[lsp_p->factory.n_nodes ? lsp_p->factory.n_nodes : 1];
             printf("Before advance (epoch %u):\n",
                    dw_counter_epoch(&lsp_p->factory.counter));
             for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
@@ -161,8 +162,8 @@
             memcpy(lsp_p->factory.keypairs, exh_kps,
                    n_total * sizeof(secp256k1_keypair));
 
-            /* Record initial nSequence for all nodes */
-            uint32_t initial_nseq[FACTORY_MAX_NODES];
+            /* Record initial nSequence for all nodes (one per tree node) */
+            uint32_t initial_nseq[lsp_p->factory.n_nodes ? lsp_p->factory.n_nodes : 1];
             for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++)
                 initial_nseq[ni] = lsp_p->factory.nodes[ni].nsequence;
 
@@ -1591,7 +1592,8 @@
                                on-chain (so chain[N-1] can spend it). The helper
                                handles BIP68 + getrawtransaction (fixes the bare-loop
                                bug that affected non-regtest networks). */
-                            int saved_is_signed[FACTORY_MAX_NODES] = {0};
+                            int saved_is_signed[lsp_p->factory.n_nodes ? lsp_p->factory.n_nodes : 1];
+                            memset(saved_is_signed, 0, sizeof(saved_is_signed));
                             for (size_t si = 0; si < lsp_p->factory.n_nodes; si++) {
                                 if (lsp_p->factory.nodes[si].type == NODE_PS_SUBFACTORY) {
                                     saved_is_signed[si] = lsp_p->factory.nodes[si].is_signed;
@@ -1809,8 +1811,12 @@
                    chain[0] — so we must capture pre-rollover bytes here.
                    Mirrored on the CL2 cheat-realloc precedent
                    (tools/superscalar_lsp_post_daemon_tests.inc:1066). */
-                tx_buf_t cl4r_snap[FACTORY_MAX_LEAVES];
-                unsigned char cl4r_snap_txid[FACTORY_MAX_LEAVES][32];
+                /* One per leaf (was [FACTORY_MAX_LEAVES], which the snapshot loop
+                   below overran past 256 leaves). */
+                size_t cl4r_n_snap = lsp_p->factory.n_leaf_nodes > 0
+                                         ? (size_t)lsp_p->factory.n_leaf_nodes : 1;
+                tx_buf_t cl4r_snap[cl4r_n_snap];
+                unsigned char cl4r_snap_txid[cl4r_n_snap][32];
                 int cl4r_cheat_enabled = (getenv("SS_CHEAT_ROLLOVER") != NULL);
                 /* Full pre-rollover tree snapshot (EVERY node, not just leaves) so
                    the mid-window cheat can broadcast the OLD ancestor path with the
@@ -1820,12 +1826,13 @@
                 tx_buf_t *cl4r_node_snap = NULL;
                 unsigned char (*cl4r_node_txid)[32] = NULL;
                 int *cl4r_node_signed = NULL;
-                for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++) {
+                size_t cl4r_node_cap = 0;   /* entries allocated in the three above */
+                for (size_t li = 0; li < cl4r_n_snap; li++) {
                     tx_buf_init(&cl4r_snap[li], 0);
                     memset(cl4r_snap_txid[li], 0, 32);
                 }
                 if (cl4r_cheat_enabled) {
-                    for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes; li++) {
+                    for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes && li < cl4r_n_snap; li++) {
                         size_t ni = lsp_p->factory.leaf_node_indices[li];
                         factory_node_t *ln = &lsp_p->factory.nodes[ni];
                         if (!ln->is_signed || ln->signed_tx.len == 0) continue;
@@ -1852,11 +1859,12 @@
                     /* Snapshot EVERY node's signed bytes + txid (not just leaves):
                        the cheat broadcasts the whole pre-rollover tree so the OLD
                        leaf 0's ancestors land on-chain with matching (old) txids. */
-                    cl4r_node_snap   = calloc(FACTORY_MAX_NODES, sizeof(tx_buf_t));
-                    cl4r_node_txid   = calloc(FACTORY_MAX_NODES, 32);
-                    cl4r_node_signed = calloc(FACTORY_MAX_NODES, sizeof(int));
+                    cl4r_node_cap    = lsp_p->factory.n_nodes ? lsp_p->factory.n_nodes : 1;
+                    cl4r_node_snap   = calloc(cl4r_node_cap, sizeof(tx_buf_t));
+                    cl4r_node_txid   = calloc(cl4r_node_cap, 32);
+                    cl4r_node_signed = calloc(cl4r_node_cap, sizeof(int));
                     if (cl4r_node_snap && cl4r_node_txid && cl4r_node_signed) {
-                        for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                        for (size_t ni = 0; ni < lsp_p->factory.n_nodes && ni < cl4r_node_cap; ni++) {
                             factory_node_t *nd = &lsp_p->factory.nodes[ni];
                             tx_buf_init(&cl4r_node_snap[ni], 0);
                             if (nd->is_signed && nd->signed_tx.len > 0) {
@@ -1928,7 +1936,7 @@
                                inconsistent, unbroadcastable tree (sent=0).  Capturing the
                                whole tree at this instant yields a self-consistent
                                pre-rollover tree whose leaf is exactly T_{n-1}. */
-                            for (size_t ni = 0; ni < lsp_p->factory.n_nodes; ni++) {
+                            for (size_t ni = 0; ni < lsp_p->factory.n_nodes && ni < cl4r_node_cap; ni++) {
                                 factory_node_t *nd = &lsp_p->factory.nodes[ni];
                                 tx_buf_free(&cl4r_node_snap[ni]);
                                 tx_buf_init(&cl4r_node_snap[ni], 0);
@@ -1942,7 +1950,7 @@
                                     memcpy(cl4r_node_txid[ni], nd->txid, 32);
                                 }
                             }
-                            for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes && li < FACTORY_MAX_LEAVES; li++) {
+                            for (size_t li = 0; li < (size_t)lsp_p->factory.n_leaf_nodes && li < cl4r_n_snap; li++) {
                                 size_t lni = lsp_p->factory.leaf_node_indices[li];
                                 factory_node_t *ln = &lsp_p->factory.nodes[lni];
                                 tx_buf_free(&cl4r_snap[li]);
@@ -2010,6 +2018,7 @@
                                    raw OLD leaf 0 whose input never existed -> sent=0. */
                                 unsigned char txid_tmp[32];
                                 size_t nn = lsp_p->factory.n_nodes;
+                                if (nn > cl4r_node_cap) nn = cl4r_node_cap;
                                 int have_snap = (cl4r_node_snap && cl4r_node_txid && cl4r_node_signed);
                                 if (have_snap) {
                                     for (size_t ni = 0; ni < nn; ni++) {
@@ -2070,10 +2079,10 @@
                                             "cannot test stale broadcast\n");
                                 }
                             }
-                            for (size_t li = 0; li < FACTORY_MAX_LEAVES; li++)
+                            for (size_t li = 0; li < cl4r_n_snap; li++)
                                 tx_buf_free(&cl4r_snap[li]);
                             if (cl4r_node_snap) {
-                                for (size_t ni = 0; ni < FACTORY_MAX_NODES; ni++)
+                                for (size_t ni = 0; ni < cl4r_node_cap; ni++)
                                     tx_buf_free(&cl4r_node_snap[ni]);
                                 free(cl4r_node_snap);
                             }
@@ -4466,10 +4475,15 @@ bc_oom:
              * chain[0] is lost after advance. For on-chain force-close, we
              * must broadcast chain[0] before chain[1] (whose input is
              * chain[0]:0), so save a copy of chain[0]'s signed bytes here. */
-            uint64_t pre_amounts[FACTORY_MAX_NODES];
-            int pre_chain_len[FACTORY_MAX_NODES];
-            unsigned char *pre_signed_tx[FACTORY_MAX_NODES] = {0};
-            size_t pre_signed_tx_len[FACTORY_MAX_NODES] = {0};
+            /* Indexed by leaf (li < n_leaf_nodes), one per PS leaf -- which is
+               one per client, so this exceeds 512 from N=513. */
+            size_t psa_n_leaves = psa_f->n_leaf_nodes > 0 ? (size_t)psa_f->n_leaf_nodes : 1;
+            uint64_t pre_amounts[psa_n_leaves];
+            int pre_chain_len[psa_n_leaves];
+            unsigned char *pre_signed_tx[psa_n_leaves];
+            size_t pre_signed_tx_len[psa_n_leaves];
+            memset(pre_signed_tx, 0, sizeof(pre_signed_tx));
+            memset(pre_signed_tx_len, 0, sizeof(pre_signed_tx_len));
             for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
                 size_t nidx = psa_f->leaf_node_indices[li];
                 factory_node_t *n = &psa_f->nodes[nidx];

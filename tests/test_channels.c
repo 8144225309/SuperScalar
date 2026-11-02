@@ -4544,3 +4544,445 @@ int test_client_ps_double_spend_defense_refuses(void) {
     return 1;
 }
 
+
+/* ---- Tier B state advance above 512 tree nodes (client side) ----
+ *
+ * FACTORY_MAX_NODES (512) is only the seed for config.max_nodes; an arity-1
+ * tree has 4N-2 nodes, so from N=129 a root rollover leaves more than 512
+ * nodes awaiting re-sign.  client_handle_state_advance keeps one entry per
+ * affected node (affected[], nonces, slots, psigs), so every one of those
+ * buffers has to hold the real affected count, not 512.
+ *
+ * Harness: one factory built in-process, then fork().  The child is the REAL
+ * client (client_handle_state_advance over a socketpair).  The parent plays
+ * the LSP and every other signer: it mirrors the rollover on its own copy of
+ * the factory and drives the Tier B wire flow (PROPOSE_INTENT ->
+ * CLIENT_PATH_NONCES -> LSP_RESPONSE -> CLIENT_FINAL_PSIGS -> ALL_PSIGS ->
+ * PATH_SIGN_DONE), signing for every participant except the client.  The
+ * client chosen is the one whose leaf sits at the END of nodes[], so its leaf
+ * nodes are affected entries >= 512.  The child reports, via its exit code,
+ * whether every node it signs -- including those leaf nodes -- ends up with a
+ * valid aggregate signature (factory_verify_all).  The parent also completes
+ * those nodes on its own copy with the client's psigs, which only aggregates
+ * to a valid signature if the client signed the right sighash with the right
+ * nonce for every node.
+ *
+ * No daemons, no bitcoind: unit-test cheap even at N=256 (1022 nodes). */
+
+static int tierb_big_build(secp256k1_context *ctx, size_t n_clients,
+                           secp256k1_keypair *kps, factory_t *f) {
+    size_t n_signers = n_clients + 1;
+    secp256k1_pubkey *pks = calloc(n_signers, sizeof(*pks));
+    if (!pks) return 0;
+    for (size_t i = 0; i < n_signers; i++) {
+        unsigned char sk[32];
+        scale_derive_sk(sk, i);
+        if (!secp256k1_keypair_create(ctx, &kps[i], sk) ||
+            !secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) { free(pks); return 0; }
+    }
+    musig_keyagg_t ka;
+    int ok = musig_aggregate_keys(ctx, &ka, pks, n_signers);
+    free(pks);
+    if (!ok) return 0;
+    unsigned char ser[32], tweak[32], fund_spk[34];
+    secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    secp256k1_pubkey tw_pk;
+    secp256k1_xonly_pubkey tw_xo;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka.cache, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xo, NULL, &tw_pk)) return 0;
+    build_p2tr_script_pubkey(fund_spk, &tw_xo);
+
+    unsigned char fund_txid[32];
+    memset(fund_txid, 0x5B, 32);
+    if (!factory_init(f, ctx, kps, n_signers, 2, 2)) return 0;   /* step=2, states=2 */
+    factory_set_arity(f, FACTORY_ARITY_1);
+    factory_set_funding(f, fund_txid, 0, (uint64_t)n_clients * 100000ULL,
+                        fund_spk, 34);
+    return factory_build_tree(f);
+}
+
+/* Child: the real client.  Exit 0 = signed + verified everything it signs. */
+static int tierb_big_client(int fd, secp256k1_context *ctx,
+                            const secp256k1_keypair *kp, factory_t *f,
+                            uint32_t my_index, size_t big_node) {
+    wire_msg_t pm;
+    memset(&pm, 0, sizeof(pm));
+    if (!wire_recv(fd, &pm) || pm.msg_type != MSG_STATE_ADV_PROPOSE_INTENT) {
+        if (pm.json) cJSON_Delete(pm.json);
+        return 10;
+    }
+    int rc = client_handle_state_advance(fd, ctx, kp, f, my_index, &pm);
+    cJSON_Delete(pm.json);
+    if (rc != 1) return 11;
+    if (big_node >= f->n_nodes || !f->nodes[big_node].is_signed ||
+        f->nodes[big_node].signed_tx.len == 0) return 12;
+    size_t n_signed = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (factory_find_signer_slot(f, i, my_index) < 0) continue;
+        if (!f->nodes[i].is_signed) return 13;
+        n_signed++;
+    }
+    if (n_signed == 0) return 14;
+    if (!factory_verify_all(f)) return 15;
+    return 0;
+}
+
+/* Parent: the LSP plus every co-signer except the client. */
+static int tierb_big_lsp(int fd, secp256k1_context *ctx,
+                         const secp256k1_keypair *kps, factory_t *f,
+                         uint32_t my_index, int trigger_leaf,
+                         size_t big_node, size_t *n_affected_out,
+                         size_t *n_completed_out) {
+    int ok = 0;
+    size_t *affected = NULL, *base = NULL;
+    unsigned char *cpn = NULL, *cpn_pz = NULL, *lsp_pn = NULL, *lsp_ps = NULL;
+    unsigned char *all_pn = NULL, *all_ps = NULL, *cps = NULL, *cps_pz = NULL;
+    secp256k1_musig_secnonce *sec = NULL;
+    size_t n_aff = 0, total_slots = 0, max_signers = 0;
+    wire_msg_t m;
+    int sent, prc;
+    *n_affected_out = 0;
+    *n_completed_out = 0;
+
+    /* Mirror the client's Step 2 rollover on our copy. */
+    int adv_rc = 0;
+    for (uint32_t s = 0; s < f->states_per_layer + 2; s++) {
+        adv_rc = factory_advance_leaf_unsigned(f, trigger_leaf);
+        if (adv_rc != 1) break;
+    }
+    if (adv_rc != -1) {
+        fprintf(stderr, "tierb_big: no rollover (%d)\n", adv_rc);
+        return 0;
+    }
+
+    affected = calloc(f->n_nodes, sizeof(size_t));
+    base = calloc(f->n_nodes, sizeof(size_t));
+    if (!affected || !base) goto out;
+    int big_affected = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *n = &f->nodes[i];
+        if (n->is_ps_leaf || !n->is_built || n->is_signed) continue;
+        if (i == big_node) big_affected = 1;
+        base[n_aff] = total_slots;
+        total_slots += n->n_signers;
+        if (n->n_signers > max_signers) max_signers = n->n_signers;
+        affected[n_aff++] = i;
+    }
+    *n_affected_out = n_aff;
+    if (!big_affected) {
+        fprintf(stderr, "tierb_big: node %zu not affected\n", big_node);
+        goto out;
+    }
+
+    cJSON *pi = wire_build_state_adv_propose_intent(
+        (uint32_t)f->counter.current_epoch, (uint32_t)n_aff, trigger_leaf);
+    sent = wire_send(fd, MSG_STATE_ADV_PROPOSE_INTENT, pi);
+    cJSON_Delete(pi);
+    if (!sent) goto out;
+
+    cpn = calloc(n_aff, 66);    cpn_pz = calloc(n_aff, 66);
+    lsp_pn = calloc(n_aff, 66); lsp_ps = calloc(n_aff, 32);
+    cps = calloc(n_aff, 32);    cps_pz = calloc(n_aff, 32);
+    all_pn = calloc(total_slots, 66); all_ps = calloc(total_slots, 32);
+    sec = calloc(max_signers, sizeof(*sec));
+    if (!cpn || !cpn_pz || !lsp_pn || !lsp_ps || !cps || !cps_pz ||
+        !all_pn || !all_ps || !sec) goto out;
+
+    memset(&m, 0, sizeof(m));
+    if (!wire_recv(fd, &m) || m.msg_type != MSG_STATE_ADV_CLIENT_PATH_NONCES) {
+        if (m.json) cJSON_Delete(m.json);
+        fprintf(stderr, "tierb_big: no CLIENT_PATH_NONCES\n");
+        goto out;
+    }
+    prc = wire_parse_state_adv_client_path_nonces(m.json, cpn, (uint32_t)n_aff, cpn_pz);
+    cJSON_Delete(m.json);
+    if (!prc) goto out;
+
+    /* Nonces + psigs for every signer except the client, per node it signs. */
+    for (size_t k = 0; k < n_aff; k++) {
+        size_t ni = affected[k];
+        int cslot = factory_find_signer_slot(f, ni, my_index);
+        if (cslot < 0) continue;
+        if (!factory_session_init_node(f, ni)) goto out;
+        factory_node_t *node = &f->nodes[ni];
+        for (size_t s = 0; s < node->n_signers; s++) {
+            secp256k1_musig_pubnonce pn;
+            if ((int)s == cslot) {
+                if (!musig_pubnonce_parse(ctx, &pn, cpn + k * 66)) goto out;
+            } else {
+                const secp256k1_keypair *kp = &kps[node->signer_indices[s]];
+                unsigned char sk[32];
+                secp256k1_pubkey pk;
+                if (!secp256k1_keypair_sec(ctx, sk, kp) ||
+                    !secp256k1_keypair_pub(ctx, &pk, kp) ||
+                    !musig_generate_nonce(ctx, &sec[s], &pn, sk, &pk,
+                                          &node->keyagg.cache)) {
+                    memset(sk, 0, 32);
+                    goto out;
+                }
+                memset(sk, 0, 32);
+            }
+            musig_pubnonce_serialize(ctx, all_pn + (base[k] + s) * 66, &pn);
+            if (!factory_session_set_nonce(f, ni, s, &pn)) goto out;
+        }
+        if (!factory_session_finalize_node(f, ni)) goto out;
+        int lslot = factory_find_signer_slot(f, ni, 0);
+        if (lslot < 0) goto out;
+        memcpy(lsp_pn + k * 66, all_pn + (base[k] + (size_t)lslot) * 66, 66);
+        for (size_t s = 0; s < node->n_signers; s++) {
+            if ((int)s == cslot) continue;
+            secp256k1_musig_partial_sig ps;
+            if (!musig_create_partial_sig(ctx, &ps, &sec[s],
+                                          &kps[node->signer_indices[s]],
+                                          &node->signing_session) ||
+                !factory_session_set_partial_sig(f, ni, s, &ps)) goto out;
+            musig_partial_sig_serialize(ctx, all_ps + (base[k] + s) * 32, &ps);
+        }
+        memcpy(lsp_ps + k * 32, all_ps + (base[k] + (size_t)lslot) * 32, 32);
+    }
+
+    cJSON *resp = wire_build_state_adv_lsp_response(
+        lsp_pn, lsp_ps, (uint32_t)n_aff, NULL, NULL,
+        all_pn, (uint32_t)(total_slots * 66));
+    sent = resp && wire_send(fd, MSG_STATE_ADV_LSP_RESPONSE, resp);
+    if (resp) cJSON_Delete(resp);
+    if (!sent) goto out;
+
+    memset(&m, 0, sizeof(m));
+    if (!wire_recv(fd, &m) || m.msg_type != MSG_STATE_ADV_CLIENT_FINAL_PSIGS) {
+        if (m.json) cJSON_Delete(m.json);
+        fprintf(stderr, "tierb_big: no CLIENT_FINAL_PSIGS\n");
+        goto out;
+    }
+    prc = wire_parse_state_adv_client_final_psigs(m.json, cps, (uint32_t)n_aff, cps_pz);
+    cJSON_Delete(m.json);
+    if (!prc) goto out;
+
+    /* Fold in the client's psig and complete: a node only aggregates to a
+       valid signature if the client signed it correctly. */
+    for (size_t k = 0; k < n_aff; k++) {
+        size_t ni = affected[k];
+        int cslot = factory_find_signer_slot(f, ni, my_index);
+        if (cslot < 0) continue;
+        secp256k1_musig_partial_sig ps;
+        if (!musig_partial_sig_parse(ctx, &ps, cps + k * 32) ||
+            !factory_session_set_partial_sig(f, ni, (size_t)cslot, &ps) ||
+            !factory_session_complete_node(f, ni)) {
+            fprintf(stderr, "tierb_big: client psig for node %zu (k=%zu) rejected\n",
+                    ni, k);
+            goto out;
+        }
+        memcpy(all_ps + (base[k] + (size_t)cslot) * 32, cps + k * 32, 32);
+        (*n_completed_out)++;
+    }
+    if (!f->nodes[big_node].is_signed) goto out;
+    if (!factory_verify_all(f)) {
+        fprintf(stderr, "tierb_big: LSP-side verify failed\n");
+        goto out;
+    }
+
+    cJSON *apm = wire_build_state_adv_all_psigs(all_ps, (uint32_t)(total_slots * 32));
+    sent = apm && wire_send(fd, MSG_STATE_ADV_ALL_PSIGS, apm);
+    if (apm) cJSON_Delete(apm);
+    if (!sent) goto out;
+    cJSON *done = wire_build_path_sign_done((uint32_t)f->counter.current_epoch);
+    sent = wire_send(fd, MSG_PATH_SIGN_DONE, done);
+    cJSON_Delete(done);
+    ok = sent;
+out:
+    if (sec) { memset(sec, 0, max_signers * sizeof(*sec)); free(sec); }
+    free(affected); free(base); free(cpn); free(cpn_pz); free(lsp_pn);
+    free(lsp_ps); free(all_pn); free(all_ps); free(cps); free(cps_pz);
+    return ok;
+}
+
+static int run_tierb_big(size_t n_clients) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair *kps = calloc(n_clients + 1, sizeof(*kps));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(ctx && kps && f, "alloc");
+    TEST_ASSERT(tierb_big_build(ctx, n_clients, kps, f), "build arity-1 tree");
+    TEST_ASSERT(f->n_nodes > 512, "tree has more than 512 nodes");
+
+    /* The client whose leaf is LAST in nodes[]: its leaf nodes are affected
+       entries >= 512 once the rollover rebuilds the whole tree. */
+    int trigger_leaf = -1;
+    size_t big_node = 0;
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        if (f->leaf_node_indices[li] >= big_node) {
+            big_node = f->leaf_node_indices[li];
+            trigger_leaf = li;
+        }
+    }
+    TEST_ASSERT(trigger_leaf >= 0 && big_node >= 512, "last leaf node index >= 512");
+    uint32_t my_index = 0;
+    for (size_t s = 0; s < f->nodes[big_node].n_signers; s++)
+        if (f->nodes[big_node].signer_indices[s] != 0)
+            my_index = f->nodes[big_node].signer_indices[s];
+    TEST_ASSERT(my_index != 0, "leaf has a client signer");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    /* A peer that dies mid-ceremony must fail this test, not SIGPIPE the
+       whole unit binary. */
+    void (*old_pipe)(int) = signal(SIGPIPE, SIG_IGN);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) signal(SIGPIPE, old_pipe);
+    TEST_ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        alarm(120);   /* a deadlocked ceremony kills the child, not the suite */
+        close(sv[0]);
+        int code = tierb_big_client(sv[1], ctx, &kps[my_index], f, my_index, big_node);
+        if (code) fprintf(stderr, "tierb_big client: exit code %d\n", code);
+        fflush(stderr);
+        _exit(code);
+    }
+    close(sv[1]);
+    size_t n_aff = 0, n_done = 0;
+    int lsp_ok = tierb_big_lsp(sv[0], ctx, kps, f, my_index, trigger_leaf,
+                               big_node, &n_aff, &n_done);
+    close(sv[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    signal(SIGPIPE, old_pipe);
+    size_t n_nodes = f->n_nodes;
+    printf(" [N=%zu nodes=%zu affected=%zu client-signed=%zu last-leaf=%zu]",
+           n_clients, n_nodes, n_aff, n_done, big_node);
+    if (WIFSIGNALED(status))
+        printf(" [client killed by signal %d]", WTERMSIG(status));
+    fflush(stdout);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(n_aff > 512, "rollover affects more than 512 nodes");
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "client signed + verified every node it signs");
+    TEST_ASSERT(lsp_ok, "LSP side completed every client-signed node");
+    return 1;
+}
+
+int test_client_tier_b_state_advance_above_512_nodes(void) {
+    if (!run_tierb_big(129)) return 0;
+    if (!run_tierb_big(256)) return 0;
+    return 1;
+}
+
+/* ---- Tier B state advance: real LSP + real clients, in-process ----
+ *
+ * Companion to the test above: the LSP side (lsp_run_state_advance) is the
+ * real one here, with N forked real clients on socketpairs.  It covers the
+ * LSP's per-affected-node buffers end to end.  N stays at or below 64 because
+ * the LSP draws its state nonces from a musig_nonce_pool, which holds at most
+ * MUSIG_NONCE_POOL_MAX (256) nonces, and an arity-1 rollover affects 4N-2
+ * nodes. */
+static int run_tierb_real(size_t n_clients, int expect_ok) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair *kps = calloc(n_clients + 1, sizeof(*kps));
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    pid_t *pids = calloc(n_clients, sizeof(pid_t));
+    int *fds = calloc(n_clients, sizeof(int));
+    TEST_ASSERT(ctx && kps && lsp && mgr && pids && fds, "alloc");
+    TEST_ASSERT(tierb_big_build(ctx, n_clients, kps, &lsp->factory), "build arity-1 tree");
+    factory_t *f = &lsp->factory;
+
+    lsp->ctx = ctx;
+    lsp->lsp_keypair = kps[0];
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &lsp->lsp_pubkey, &kps[0]), "lsp pubkey");
+    lsp->client_fds = fds;
+    lsp->n_clients = n_clients;
+    lsp->listen_fd = -1;
+    lsp->bridge_fd = -1;
+    mgr->bridge_fd = -1;
+
+    void (*old_pipe)(int) = signal(SIGPIPE, SIG_IGN);   /* see run_tierb_big */
+    fflush(stdout);
+    fflush(stderr);
+    for (size_t c = 0; c < n_clients; c++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        pid_t pid = fork();
+        TEST_ASSERT(pid >= 0, "fork");
+        if (pid == 0) {
+            alarm(120);
+            for (size_t j = 0; j < c; j++) close(fds[j]);
+            close(sv[0]);
+            uint32_t my_index = (uint32_t)(c + 1);
+            /* node 0 (the root kickoff) is signed by every participant */
+            int code = tierb_big_client(sv[1], ctx, &kps[my_index], f, my_index, 0);
+            if (code) fprintf(stderr, "tierb_real client %u: exit code %d\n", my_index, code);
+            fflush(stderr);
+            _exit(code);
+        }
+        close(sv[1]);
+        fds[c] = sv[0];
+        pids[c] = pid;
+    }
+
+    /* Advance leaf 0 to rollover on the LSP, exactly as the clients do in
+       their Step 2, then run the real ceremony. */
+    int adv_rc = 0;
+    for (uint32_t s = 0; s < f->states_per_layer + 2; s++) {
+        adv_rc = factory_advance_leaf_unsigned(f, 0);
+        if (adv_rc != 1) break;
+    }
+    int rc = (adv_rc == -1) ? lsp_run_state_advance(mgr, lsp, 0) : 0;
+
+    for (size_t c = 0; c < n_clients; c++) close(fds[c]);
+    int clients_ok = 1, clients_crashed = 0;
+    for (size_t c = 0; c < n_clients; c++) {
+        int status = 0;
+        waitpid(pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) clients_ok = 0;
+        if (WIFSIGNALED(status)) clients_crashed = 1;
+    }
+    signal(SIGPIPE, old_pipe);
+    size_t n_signed = 0;
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (f->nodes[i].is_signed) n_signed++;
+    int lsp_verify = factory_verify_all(f);
+    size_t n_nodes = f->n_nodes;
+    printf(" [N=%zu nodes=%zu lsp-signed=%zu]", n_clients, n_nodes, n_signed);
+    fflush(stdout);
+
+    factory_free(f);
+    free(lsp);
+    free(mgr);
+    free(pids);
+    free(fds);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(adv_rc == -1, "leaf advance reached rollover");
+    TEST_ASSERT(!clients_crashed, "no client killed by a signal");
+    if (!expect_ok) {
+        TEST_ASSERT(rc == 0, "lsp_run_state_advance fails cleanly");
+        TEST_ASSERT(n_signed == 0, "no node signed by a failed ceremony");
+        return 1;
+    }
+    TEST_ASSERT(rc == 1, "lsp_run_state_advance succeeded");
+    TEST_ASSERT(clients_ok, "every client signed + verified its nodes");
+    TEST_ASSERT(n_signed == n_nodes, "LSP re-signed every node");
+    TEST_ASSERT(lsp_verify, "every LSP node signature verifies");
+    return 1;
+}
+
+int test_tier_b_state_advance_real_lsp_and_clients(void) {
+    if (!run_tierb_real(8, 1)) return 0;
+    if (!run_tierb_real(64, 1)) return 0;
+    return 1;
+}
+
+/* The same real ceremony at N=129 (arity 1, 514 nodes, all affected by the
+   rollover).  The LSP cannot complete it -- its nonce pool holds
+   MUSIG_NONCE_POOL_MAX (256) nonces -- but it must fail by returning 0, with
+   no stack overflow from per-node buffers sized for 512 entries and no client
+   killed by a signal. */
+int test_tier_b_state_advance_lsp_above_512_nodes_fails_cleanly(void) {
+    return run_tierb_real(129, 0);
+}

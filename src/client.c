@@ -17,6 +17,7 @@
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
+extern void secure_zero(void *p, size_t n);
 #include "superscalar/sha256.h"
 
 /* Optional NK server authentication pubkey (set via client_set_lsp_pubkey).
@@ -2250,14 +2251,20 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* #53-B3b: per-NODE L-stock hashes (present when the LSP runs hashlock poison).
        Parsed here into temp arrays (survive cJSON_Delete); applied to the factory
        after factory_init + before build_tree so the client builds the matching
-       2-leaf L-stock SPK without the (LSP-private) seed. */
-    uint32_t *parsed_node_h_idx = (uint32_t *)calloc(FACTORY_MAX_NODES, sizeof(uint32_t));
-    unsigned char (*parsed_node_h)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_NODES, 32);
-    size_t n_node_h = 0;
+       2-leaf L-stock SPK without the (LSP-private) seed.
+       Sized to the array actually received, one entry per hashed node.  Was
+       FACTORY_MAX_NODES (512), which is only the seed for config.max_nodes:
+       entries past the 512th were dropped, so the client built a different L-stock
+       SPK for those nodes than the LSP. */
     cJSON *nlsh_arr = cJSON_GetObjectItem(msg.json, "node_l_stock_hashes");
-    if (parsed_node_h_idx && parsed_node_h && nlsh_arr && cJSON_IsArray(nlsh_arr)) {
-        int nn = cJSON_GetArraySize(nlsh_arr);
-        for (int i = 0; i < nn && n_node_h < FACTORY_MAX_NODES; i++) {
+    int nlsh_n = (nlsh_arr && cJSON_IsArray(nlsh_arr)) ? cJSON_GetArraySize(nlsh_arr) : 0;
+    size_t nlsh_cap = nlsh_n > 0 ? (size_t)nlsh_n : 1;
+    uint32_t *parsed_node_h_idx = (uint32_t *)calloc(nlsh_cap, sizeof(uint32_t));
+    unsigned char (*parsed_node_h)[32] = (unsigned char (*)[32])calloc(nlsh_cap, 32);
+    size_t n_node_h = 0;
+    if (parsed_node_h_idx && parsed_node_h && nlsh_n > 0) {
+        int nn = nlsh_n;
+        for (int i = 0; i < nn && n_node_h < nlsh_cap; i++) {
             cJSON *o = cJSON_GetArrayItem(nlsh_arr, i);
             cJSON *no = o ? cJSON_GetObjectItem(o, "node") : NULL;
             cJSON *hh = o ? cJSON_GetObjectItem(o, "h") : NULL;
@@ -2286,6 +2293,9 @@ int client_run_with_channels(secp256k1_context *ctx,
             client_send_error(fd, "funding_tx_verification_failed");
             wire_close(fd);
             free(all_pubkeys);
+            free(parsed_l_stock_hashes);
+            free(parsed_node_h_idx);
+            free(parsed_node_h);
             return 0;
         }
     } else {
@@ -2307,7 +2317,13 @@ int client_run_with_channels(secp256k1_context *ctx,
        SF-followup #145: factory ptr is registered with g_client_active_factory
        once it's initialized below, so MSG_FUNDING_REORG can find it. */
     factory_t *factory = calloc(1, sizeof(factory_t));
-    if (!factory) return 0;
+    if (!factory) {
+        free(all_pubkeys);
+        free(parsed_l_stock_hashes);
+        free(parsed_node_h_idx);
+        free(parsed_node_h);
+        return 0;
+    }
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     free(all_pubkeys);   /* copied into the factory above */
@@ -2355,6 +2371,9 @@ int client_run_with_channels(secp256k1_context *ctx,
                     my_index, my_bps, g_min_profit_bps);
             factory_free(factory);   /* nine heap arrays; free() alone orphans them */
             free(factory);
+            free(parsed_l_stock_hashes);
+            free(parsed_node_h_idx);
+            free(parsed_node_h);
             client_send_error(fd, "profit_share_too_low");
             wire_close(fd);
             return 0;
@@ -2511,7 +2530,10 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     memset(my_seckey, 0, 32);
 
-    secp256k1_musig_secnonce *my_secnonce_ptrs[FACTORY_MAX_NODES];
+    /* One pointer per pool nonce consumed below; musig_nonce_pool_next fails
+       (-> goto fail) before nonce_count can pass the pool size, which
+       musig_nonce_pool_generate caps at MUSIG_NONCE_POOL_MAX. */
+    secp256k1_musig_secnonce *my_secnonce_ptrs[MUSIG_NONCE_POOL_MAX];
     nonce_entries =
         (wire_bundle_entry_t *)calloc(my_node_count + 1, sizeof(wire_bundle_entry_t));
 
@@ -4665,6 +4687,81 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
+/* Per-affected-node working buffers for the client side of the Tier B
+   ceremony.  A root rollover rebuilds the whole tree, so the affected count can
+   be every node: these hold f->n_nodes entries.  They were fixed
+   [FACTORY_MAX_NODES] (512) stack arrays, which an arity-1 tree (4N-2 nodes)
+   overflows from N=129.  Owned by the wrapper below so every early return of
+   the ceremony body frees them. */
+typedef struct {
+    size_t cap;
+    size_t *affected;
+    int *poison_prepared;
+    secp256k1_musig_secnonce *poison_secnonces;
+    unsigned char (*poison_pubnonces)[66];
+    unsigned char (*poison_psigs)[32];
+    unsigned char (*pubnonces)[66];
+    secp256k1_musig_secnonce *secnonces;
+    int *slot;
+    int *signs;
+    unsigned char (*lsp_pubnonces)[66];
+    unsigned char (*lsp_psigs)[32];
+    unsigned char (*lsp_poison_pubnonces)[66];
+    unsigned char (*lsp_poison_psigs)[32];
+    size_t *nonce_base;
+    unsigned char (*psigs)[32];
+} tierb_client_bufs_t;
+
+static int tierb_client_bufs_alloc(tierb_client_bufs_t *b, size_t n) {
+    if (n == 0) n = 1;
+    b->cap = n;
+    b->affected             = calloc(n, sizeof(*b->affected));
+    b->poison_prepared      = calloc(n, sizeof(*b->poison_prepared));
+    b->poison_secnonces     = calloc(n, sizeof(*b->poison_secnonces));
+    b->poison_pubnonces     = calloc(n, sizeof(*b->poison_pubnonces));
+    b->poison_psigs         = calloc(n, sizeof(*b->poison_psigs));
+    b->pubnonces            = calloc(n, sizeof(*b->pubnonces));
+    b->secnonces            = calloc(n, sizeof(*b->secnonces));
+    b->slot                 = calloc(n, sizeof(*b->slot));
+    b->signs                = calloc(n, sizeof(*b->signs));
+    b->lsp_pubnonces        = calloc(n, sizeof(*b->lsp_pubnonces));
+    b->lsp_psigs            = calloc(n, sizeof(*b->lsp_psigs));
+    b->lsp_poison_pubnonces = calloc(n, sizeof(*b->lsp_poison_pubnonces));
+    b->lsp_poison_psigs     = calloc(n, sizeof(*b->lsp_poison_psigs));
+    b->nonce_base           = calloc(n, sizeof(*b->nonce_base));
+    b->psigs                = calloc(n, sizeof(*b->psigs));
+    return b->affected && b->poison_prepared && b->poison_secnonces &&
+           b->poison_pubnonces && b->poison_psigs && b->pubnonces &&
+           b->secnonces && b->slot && b->signs && b->lsp_pubnonces &&
+           b->lsp_psigs && b->lsp_poison_pubnonces && b->lsp_poison_psigs &&
+           b->nonce_base && b->psigs;
+}
+
+static void tierb_client_bufs_free(tierb_client_bufs_t *b) {
+    /* Secnonces are zeroed by musig_create_partial_sig on the success path;
+       an early return can leave generated-but-unused ones behind. */
+    if (b->secnonces)
+        secure_zero(b->secnonces, b->cap * sizeof(*b->secnonces));
+    if (b->poison_secnonces)
+        secure_zero(b->poison_secnonces, b->cap * sizeof(*b->poison_secnonces));
+    free(b->affected);
+    free(b->poison_prepared);
+    free(b->poison_secnonces);
+    free(b->poison_pubnonces);
+    free(b->poison_psigs);
+    free(b->pubnonces);
+    free(b->secnonces);
+    free(b->slot);
+    free(b->signs);
+    free(b->lsp_pubnonces);
+    free(b->lsp_psigs);
+    free(b->lsp_poison_pubnonces);
+    free(b->lsp_poison_psigs);
+    free(b->nonce_base);
+    free(b->psigs);
+    memset(b, 0, sizeof(*b));
+}
+
 /* Phase 1e.2.d: client-side stateless Tier B handler.  Dispatched from
    client_handle_state_advance when the LSP sends PROPOSE_INTENT (0x81)
    instead of legacy STATE_ADVANCE_PROPOSE.  Mirrors lsp_run_state_advance_stateless
@@ -4672,12 +4769,13 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
      - multi-leaf state TX
      - single-input per leaf
      - no poison TX */
-static int client_handle_state_advance_stateless(int fd,
-                                                   secp256k1_context *ctx,
-                                                   const secp256k1_keypair *keypair,
-                                                   factory_t *factory,
-                                                   uint32_t my_index,
-                                                   const wire_msg_t *propose_msg) {
+static int client_handle_state_advance_stateless_body(int fd,
+                                                      secp256k1_context *ctx,
+                                                      const secp256k1_keypair *keypair,
+                                                      factory_t *factory,
+                                                      uint32_t my_index,
+                                                      const wire_msg_t *propose_msg,
+                                                      tierb_client_bufs_t *bufs) {
     /* Step 1: Parse PROPOSE_INTENT { epoch_after, n_affected_leaves, trigger_leaf_side }. */
     uint32_t epoch_after, n_affected_leaves;
     int trigger_leaf_side;
@@ -4732,8 +4830,15 @@ static int client_handle_state_advance_stateless(int fd,
         }
     }
 
-    /* Step 3: Build affected[] — SAME logic as LSP. */
-    size_t affected[FACTORY_MAX_NODES];
+    /* Step 3: Build affected[] — SAME logic as LSP.  Allocated after the
+       rollover above so the buffers match the tree being re-signed. */
+    if (!tierb_client_bufs_alloc(bufs, factory->n_nodes)) {
+        fprintf(stderr,
+            "Client-stateless Tier B %u: alloc per-node buffers (%zu nodes) failed\n",
+            my_index, factory->n_nodes);
+        return 0;
+    }
+    size_t *affected = bufs->affected;
     size_t n_affected = 0;
     for (size_t i = 0; i < factory->n_nodes; i++) {
         const factory_node_t *n = &factory->nodes[i];
@@ -4765,10 +4870,10 @@ static int client_handle_state_advance_stateless(int fd,
        poison.  poison_prepared[k] is cleared per-leaf if anything degrades or
        if the LSP doesn't reciprocate poison fields. */
     const uint64_t TIERB_POISON_FEE_SATS = 1000;
-    int poison_prepared_c[FACTORY_MAX_NODES];
-    secp256k1_musig_secnonce my_poison_secnonces[FACTORY_MAX_NODES];
-    unsigned char my_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    unsigned char my_poison_psigs_per_node[FACTORY_MAX_NODES][32];
+    int *poison_prepared_c = bufs->poison_prepared;
+    secp256k1_musig_secnonce *my_poison_secnonces = bufs->poison_secnonces;
+    unsigned char (*my_poison_pubnonces_per_node)[66] = bufs->poison_pubnonces;
+    unsigned char (*my_poison_psigs_per_node)[32] = bufs->poison_psigs;
     for (size_t k = 0; k < n_affected; k++) {
         poison_prepared_c[k] = 0;
         memset(my_poison_pubnonces_per_node[k], 0, 66);
@@ -4816,10 +4921,10 @@ static int client_handle_state_advance_stateless(int fd,
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    unsigned char my_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    secp256k1_musig_secnonce my_secnonces[FACTORY_MAX_NODES];
-    int my_slot_per_node[FACTORY_MAX_NODES];
-    int my_signs_per_node[FACTORY_MAX_NODES];
+    unsigned char (*my_pubnonces_per_node)[66] = bufs->pubnonces;
+    secp256k1_musig_secnonce *my_secnonces = bufs->secnonces;
+    int *my_slot_per_node = bufs->slot;
+    int *my_signs_per_node = bufs->signs;
     for (size_t k = 0; k < n_affected; k++) {
         memset(my_pubnonces_per_node[k], 0, 66);
         my_slot_per_node[k] = -1;
@@ -4887,16 +4992,16 @@ static int client_handle_state_advance_stateless(int fd,
         if (lr.json) cJSON_Delete(lr.json);
         return 0;
     }
-    unsigned char lsp_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    unsigned char lsp_psigs_per_node[FACTORY_MAX_NODES][32];
-    unsigned char lsp_poison_pubnonces_per_node[FACTORY_MAX_NODES][66];
-    unsigned char lsp_poison_psigs_per_node[FACTORY_MAX_NODES][32];
-    memset(lsp_poison_pubnonces_per_node, 0, sizeof(lsp_poison_pubnonces_per_node));
-    memset(lsp_poison_psigs_per_node, 0, sizeof(lsp_poison_psigs_per_node));
+    unsigned char (*lsp_pubnonces_per_node)[66] = bufs->lsp_pubnonces;
+    unsigned char (*lsp_psigs_per_node)[32] = bufs->lsp_psigs;
+    unsigned char (*lsp_poison_pubnonces_per_node)[66] = bufs->lsp_poison_pubnonces;
+    unsigned char (*lsp_poison_psigs_per_node)[32] = bufs->lsp_poison_psigs;
+    memset(lsp_poison_pubnonces_per_node, 0, bufs->cap * sizeof(*lsp_poison_pubnonces_per_node));
+    memset(lsp_poison_psigs_per_node, 0, bufs->cap * sizeof(*lsp_poison_psigs_per_node));
     /* Gap A: per-node base offset + total slots for the forwarded all-signer
        nonce matrix (must match the LSP's layout: nodes in affected[] order,
        each occupying n_signers slots of 66 bytes). */
-    size_t node_nonce_base[FACTORY_MAX_NODES];
+    size_t *node_nonce_base = bufs->nonce_base;
     size_t total_nonce_slots = 0;
     for (size_t k = 0; k < n_affected; k++) {
         node_nonce_base[k] = total_nonce_slots;
@@ -4935,7 +5040,7 @@ static int client_handle_state_advance_stateless(int fd,
 
     /* Step 8: for each affected node, set LSP nonce + finalize + set LSP psig +
        create own partial_sig (zeros own secnonce) + set own psig + complete. */
-    unsigned char my_psigs_per_node[FACTORY_MAX_NODES][32];
+    unsigned char (*my_psigs_per_node)[32] = bufs->psigs;
     for (size_t k = 0; k < n_affected; k++) memset(my_psigs_per_node[k], 0, 32);
 
     for (size_t k = 0; k < n_affected; k++) {
@@ -5135,6 +5240,20 @@ static int client_handle_state_advance_stateless(int fd,
     printf("Client-stateless Tier B %u: %zu affected nodes signed\n",
            my_index, n_affected);
     return 1;
+}
+
+static int client_handle_state_advance_stateless(int fd,
+                                                   secp256k1_context *ctx,
+                                                   const secp256k1_keypair *keypair,
+                                                   factory_t *factory,
+                                                   uint32_t my_index,
+                                                   const wire_msg_t *propose_msg) {
+    tierb_client_bufs_t bufs;
+    memset(&bufs, 0, sizeof(bufs));
+    int rc = client_handle_state_advance_stateless_body(fd, ctx, keypair, factory,
+                                                        my_index, propose_msg, &bufs);
+    tierb_client_bufs_free(&bufs);
+    return rc;
 }
 
 int client_handle_state_advance(int fd, secp256k1_context *ctx,

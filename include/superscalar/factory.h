@@ -16,9 +16,9 @@
    real tree (factory_config_fit, factory_build_tree), so the factory is never
    capped by this.  n_nodes = 4N-2, which exceeds 512 from N=129.
    Do not use this macro as an array bound or loop limit -- bound by
-   f->n_nodes, f->nodes_cap or f->config.max_nodes instead.  Sites still using
-   it that way truncate or overflow stack arrays above 512 nodes.  Raising it
-   would quadruple the ~50 arrays sized by it and hide those bugs. */
+   f->n_nodes, f->nodes_cap or f->config.max_nodes instead.  No src/ or tools/
+   code uses it as a bound any more; the remaining test uses are fixed small-N
+   trees.  Raising it would only hide a new site that gets it wrong. */
 /* Initial nodes[] capacity; factory_grow_nodes() doubles from here up to
    config.max_nodes.  Small on purpose: the point of growing on demand is that a
    factory costs what its own tree costs, not what the worst-case config would. */
@@ -950,7 +950,9 @@ uint32_t factory_early_warning_time(const factory_t *f);
    - static_threshold: top N tree depths are kickoff-only (Phase 3)
    - step_blocks / states_per_layer: per-DW-layer config (mainnet 144 / 4)
    Returns ewt in blocks.  Treats PS leaves as 0-cost at the leaf layer
-   when leaf arity == FACTORY_ARITY_PS. */
+   when leaf arity == FACTORY_ARITY_PS.  Returns UINT32_MAX if the shape
+   cannot be evaluated (allocation failure), so callers comparing against a
+   ceiling fail closed. */
 uint32_t factory_compute_ewt_for_shape(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,

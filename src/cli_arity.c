@@ -5,6 +5,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 /* Helper: clear write into err_buf with NUL termination. */
 static void cli_set_err(char *buf, size_t len, const char *fmt, ...) {
@@ -139,6 +140,12 @@ int cli_validate_shape_for_bolt2016(
         n_clients, static_threshold, step_blocks, states_per_layer);
     if (ewt_out) *ewt_out = ewt;
     if (ewt <= CLI_ARITY_BOLT2016_CEILING) return 1;
+    if (ewt == UINT32_MAX) {   /* shape could not be evaluated: fail closed */
+        cli_set_err(err_buf, err_buf_len,
+            "Error: could not evaluate the ewt of --clients %zu (allocation failed)",
+            n_clients);
+        return 0;
+    }
 
     /* Build a printable shape descriptor for the error. */
     char shape[128];
