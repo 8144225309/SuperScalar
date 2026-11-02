@@ -2987,6 +2987,28 @@ int lsp_reorg_rollback_subfactory_chains(factory_t *f, int32_t fork_height) {
         f, fork_height > 0 ? (uint32_t)fork_height : 0);
 }
 
+int lsp_reorg_state_load(void *persist, const char *detector,
+                         lsp_reorg_state_t *st) {
+    if (!persist || !detector || !st) return 0;
+    int32_t h = 0;
+    char hash[65];
+    if (!persist_load_reorg_tip((persist_t *)persist, detector, &h, hash) || h <= 0)
+        return 0;
+    memset(st, 0, sizeof(*st));
+    st->height = h;
+    memcpy(st->hash, hash, 65);
+    st->fork_height = -1;
+    return 1;
+}
+
+int lsp_reorg_state_save(void *persist, const char *detector,
+                         const lsp_reorg_state_t *st) {
+    if (!persist || !detector || !st || st->height <= 0 || !st->hash[0])
+        return 0;
+    return persist_save_reorg_tip((persist_t *)persist, detector,
+                                  st->height, st->hash);
+}
+
 #define LSP_REORG_MAX_TIPS 64
 
 lsp_reorg_kind_t lsp_reorg_poll(regtest_t *rt, lsp_reorg_state_t *st,
@@ -7470,6 +7492,19 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                              block built on it after it was
                                              stored was disconnected */
                     static lsp_reorg_state_t daemon_reorg;
+                    static int daemon_reorg_loaded = 0;
+                    /* Resume from the tip stored before a restart, so a
+                       reorg while the LSP was down is reported (and
+                       handled) on the first poll. */
+                    if (!daemon_reorg_loaded) {
+                        daemon_reorg_loaded = 1;
+                        if (mgr->persist &&
+                            lsp_reorg_state_load(mgr->persist, "daemon",
+                                                 &daemon_reorg))
+                            fprintf(stderr, "LSP: reorg detector resumes from "
+                                    "stored tip %d %.16s\n", daemon_reorg.height,
+                                    daemon_reorg.hash);
+                    }
                     const int32_t daemon_prev_height = daemon_reorg.height;
                     char daemon_prev_hash[65];
                     memcpy(daemon_prev_hash, daemon_reorg.hash, 65);
@@ -7568,6 +7603,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     "flipped funding_pending_reorg on %d "
                                     "channel(s)\n", thw);
                     }
+                    /* Store the new tip only now that the handler above has
+                       run: a restart in the middle of handling a reorg then
+                       compares against the previous tip and reports the
+                       reorg again. */
+                    if (reorg_kind != LSP_REORG_INCONCLUSIVE && mgr->persist &&
+                        (daemon_reorg.height != daemon_prev_height ||
+                         strcmp(daemon_reorg.hash, daemon_prev_hash) != 0))
+                        lsp_reorg_state_save(mgr->persist, "daemon", &daemon_reorg);
                 }
                 if (height > 0) {
                     for (size_t c = 0; c < mgr->n_channels; c++) {

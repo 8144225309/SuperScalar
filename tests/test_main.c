@@ -3950,6 +3950,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_revalidate_rpc_outage_no_change);
     extern int test_persist_funding_anchor_reorg_tip(void);
     RUN_TEST(test_persist_funding_anchor_reorg_tip);
+    extern int test_reorg_tip_persisted_detects_downtime_reorg(void);
+    RUN_TEST(test_reorg_tip_persisted_detects_downtime_reorg);
 }
 
 extern int regtest_init_faucet(void);

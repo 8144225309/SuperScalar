@@ -11,6 +11,10 @@
  *                                           bitcoind unreachable during
  *                                           revalidation: nothing changes
  *   test_persist_funding_anchor_reorg_tip   v40 tables round trip
+ *   test_reorg_tip_persisted_detects_downtime_reorg
+ *                                           the detector's stored tip,
+ *                                           reloaded after a restart,
+ *                                           exposes a reorg during downtime
  * Regtest:
  *   test_regtest_reorg_revalidate_factory_funding
  *     5-party arity-2 factory funded on regtest; lsp_channels_revalidate_
@@ -344,6 +348,58 @@ int test_persist_funding_anchor_reorg_tip(void) {
     if (persist_load_reorg_tip(&db, "heartbeat", &h, hash)) ok = 0;
     persist_close(&db);
     TEST_ASSERT(ok, "funding_anchors / reorg_tips save, replace, load");
+    return 1;
+}
+
+int test_reorg_tip_persisted_detects_downtime_reorg(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open db");
+    char a100[65], b100[65], b101[65];
+    snprintf(a100, sizeof(a100), "a%063x", 100u);
+    snprintf(b100, sizeof(b100), "b%063x", 100u);
+    snprintf(b101, sizeof(b101), "b%063x", 101u);
+
+    /* Before the restart the detector stored (100, a100). */
+    lsp_reorg_state_t st;
+    memset(&st, 0, sizeof(st));
+    lsp_reorg_state_advance(&st, 100, a100, NULL, 0);
+    int ok = lsp_reorg_state_save(&db, "daemon", &st);
+
+    /* While down, a100 was replaced: the chain is now ... a99, b100, b101. */
+    regtest_chain_tip_t tips[2];
+    memset(tips, 0, sizeof(tips));
+    tips[0].height = 101; tips[0].branchlen = 0;
+    snprintf(tips[0].status, sizeof(tips[0].status), "active");
+    memcpy(tips[0].hash, b101, 65);
+    tips[1].height = 100; tips[1].branchlen = 1;
+    snprintf(tips[1].status, sizeof(tips[1].status), "valid-fork");
+    memcpy(tips[1].hash, a100, 65);
+    lsp_reorg_view_t v = {0};
+    v.hash_at_last = b100;
+    v.hash_at_next = b101;
+    v.tips = tips; v.n_tips = 2;
+
+    /* Without the stored tip (previous behaviour): first observation. */
+    lsp_reorg_state_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    lsp_reorg_kind_t k0 = lsp_reorg_classify(&fresh, 101, b101, &v);
+
+    /* With it: the reorg is reported, and its fork height is exact. */
+    lsp_reorg_state_t loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    if (!lsp_reorg_state_load(&db, "daemon", &loaded)) ok = 0;
+    lsp_reorg_kind_t k1 = lsp_reorg_classify(&loaded, 101, b101, &v);
+    int32_t fork = lsp_reorg_fork_height(&loaded, k1, 101, &v);
+    printf("\n    restart after a100 was replaced: fresh state -> %s, "
+           "stored tip -> %s (fork %d)\n   ",
+           k0 == LSP_REORG_NONE ? "NONE (missed)" : lsp_reorg_kind_str(k0),
+           lsp_reorg_kind_str(k1), fork);
+    if (loaded.height != 100 || strcmp(loaded.hash, a100) != 0) ok = 0;
+    persist_close(&db);
+    TEST_ASSERT(ok, "stored tip saved and reloaded");
+    TEST_ASSERT(k0 == LSP_REORG_NONE, "fresh state cannot see it");
+    TEST_ASSERT(k1 == LSP_REORG_FORWARD && fork == 99,
+                "stored tip reports the downtime reorg");
     return 1;
 }
 

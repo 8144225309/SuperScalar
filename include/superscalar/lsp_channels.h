@@ -525,6 +525,16 @@ int32_t lsp_reorg_fork_height(const lsp_reorg_state_t *prev,
    left as they are.  Returns the count. */
 int lsp_reorg_rollback_subfactory_chains(factory_t *f, int32_t fork_height);
 
+/* A detector's stored tip in the DB (v40 reorg_tips), so the first poll
+   after a restart compares against the tip seen before the restart and
+   reports a reorg that happened while the LSP was down.  `persist` is a
+   persist_t*.  Load fills height and hash (seen[] starts empty) and
+   returns 1 when a row exists; save returns 1 on success. */
+int lsp_reorg_state_load(void *persist, const char *detector,
+                         lsp_reorg_state_t *st);
+int lsp_reorg_state_save(void *persist, const char *detector,
+                         const lsp_reorg_state_t *st);
+
 /* One detector poll: tip snapshot, the reads above, classify, and advance
    *st unless the result is INCONCLUSIVE.  Writes the tip read to
    *cur_height / cur_hash (-1 / "" when the tip read failed).  Used by the
