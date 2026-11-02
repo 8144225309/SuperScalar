@@ -3133,6 +3133,9 @@ int main(int argc, char *argv[]) {
                epoch, per-leaf states) from dw_counter_state. */
             printf("LSP recovery: DW counter at epoch %u\n",
                    dw_counter_epoch(&lsp_rp->factory.counter));
+            fprintf(stderr, "LSP recovery: the factory tree is rebuilt at its "
+                    "initial state, not reloaded: leaf advances, reallocs and "
+                    "root advances on it are refused (payments still settle)\n");
 
             /* Set factory lifecycle from current block height */
             {

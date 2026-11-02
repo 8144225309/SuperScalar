@@ -2271,6 +2271,7 @@ int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx) {
 
 int factory_advance_and_rebuild_path(factory_t *f, int leaf_side) {
     int ret = factory_advance_leaf_unsigned(f, leaf_side);
+    if (ret == FACTORY_ADVANCE_REFUSED) return ret;
     if (ret == 0) return -2;  /* fully exhausted */
     if (ret < 0) {
         /* Leaf exhausted, root layer advanced — rebuild path */
@@ -2432,7 +2433,30 @@ int factory_sign_all_with_retry(factory_t *f, int max_attempts) {
     return 0;
 }
 
+/* A factory loaded from the DB has its tree rebuilt at the initial state
+   (persist_load_factory does not reload the signed nodes).  An advance
+   built on it would spend the epoch-0 parents with creation-time amounts:
+   once both sides sign it, the stored valid state is replaced by one whose
+   input never confirms, and a realloc made before the restart is undone.
+   Refuse until the signed tree is reloaded. */
+static int refuse_rebuilt_tree(factory_t *f, const char *what) {
+    if (!f->tree_rebuilt_on_load) return 0;
+    if (!f->tree_refusal_logged) {
+        fprintf(stderr, "factory: CRITICAL: refusing %s: this factory was "
+                "loaded from the DB and its tree is the initial one, not the "
+                "signed tree it had reached; every advance on it is refused "
+                "(logged once)\n", what);
+        f->tree_refusal_logged = 1;
+    }
+    return 1;
+}
+
+int factory_advance_refused(const factory_t *f) {
+    return f && f->tree_rebuilt_on_load;
+}
+
 int factory_advance(factory_t *f) {
+    if (refuse_rebuilt_tree(f, "a root advance")) return 0;
     if (!dw_counter_advance(&f->counter))
         return 0;
 
@@ -2524,6 +2548,7 @@ int factory_rebuild_node_tx(factory_t *f, size_t node_idx) {
 
 int factory_set_leaf_amounts(factory_t *f, int leaf_side,
                               const uint64_t *amounts, size_t n_amounts) {
+    if (refuse_rebuilt_tree(f, "a leaf realloc")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
@@ -2680,6 +2705,7 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
 }
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {
+    if (refuse_rebuilt_tree(f, "a leaf advance")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
@@ -2727,6 +2753,7 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
 }
 
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
+    if (refuse_rebuilt_tree(f, "a leaf advance")) return FACTORY_ADVANCE_REFUSED;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
@@ -2820,6 +2847,7 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
           to distinguish). */
 int factory_tick_root(factory_t *f) {
     if (!f) return 0;
+    if (refuse_rebuilt_tree(f, "a root tick")) return FACTORY_ADVANCE_REFUSED;
     /* F7: invert the trigger semantics.  A "tick" represents one step_blocks
        worth of block-height progression.  Two cases:
 
@@ -2897,6 +2925,7 @@ int factory_subfactory_chain_advance_unsigned(
     int channel_idx_in_sub, uint64_t delta_sats)
 {
     if (!f) return 0;
+    if (refuse_rebuilt_tree(f, "a sub-factory chain advance")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
     if (sub_idx_in_leaf < 0) return 0;
 

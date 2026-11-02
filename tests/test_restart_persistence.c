@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -1188,6 +1189,150 @@ int test_restart_client_reconnect_attaches_db(void) {
                                         pcp_ser), "remote PCP written after the reconnect");
 
     persist_close(&cdb);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* ---- A restored factory refuses to advance ---- */
+
+/* Every dw_counter_state and tree_nodes row, as one string. */
+static char *rs_snapshot(persist_t *db) {
+    const char *sql =
+        "SELECT group_concat(r, '|') FROM ("
+        " SELECT 'dw' || quote(factory_id) || quote(current_epoch) ||"
+        "  quote(n_layers) || quote(layer_states) || quote(per_leaf_enabled) ||"
+        "  quote(n_leaf_nodes) || quote(leaf_states) AS r FROM dw_counter_state"
+        " UNION ALL"
+        " SELECT 'tn' || quote(factory_id) || quote(node_index) ||"
+        "  quote(nsequence) || quote(output_amounts) || quote(txid) ||"
+        "  quote(is_signed) || quote(signed_tx_hex) FROM tree_nodes"
+        " ORDER BY 1);";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &st, NULL) != SQLITE_OK) return NULL;
+    char *out = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        out = strdup(t ? t : "");
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+/* persist_load_factory rebuilds the tree at its initial state, so with the
+   DW counter restored an advance would be built over the epoch-0 parents.
+   Tier B moved the root to state 1 and reset the leaves (the stored state
+   is set up as Tier B leaves it); after a restart the counter comes back
+   there, and every advance entry point, and the LSP's leaf advance, refuse
+   without changing the counter or the stored rows. */
+int test_restart_advance_refused_after_restore(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_dw_factory(&fx), "fixture");
+    factory_t *f = fx.f;
+    TEST_ASSERT(persist_save_tree_nodes(&fx.db, f, 0), "save tree");
+    f->counter.layers[0].current_state = 1;
+    f->counter.current_epoch = 1;
+    f->per_leaf_enabled = 1;
+    TEST_ASSERT(persist_save_factory_dw_state(&fx.db, 0, f), "save DW state");
+    TEST_ASSERT(!f->tree_rebuilt_on_load && !factory_advance_refused(f),
+                "a factory built in memory is not marked");
+    char *before = rs_snapshot(&fx.db);
+    TEST_ASSERT(before && before[0], "snapshot");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load factory");
+    TEST_ASSERT(rec_f->tree_rebuilt_on_load, "loaded factory marked");
+    TEST_ASSERT_EQ(rec_f->counter.layers[0].current_state, 1, "root state restored");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 1, "epoch restored");
+
+    uint64_t amounts[4] = { 0 };
+    size_t n_amounts = rec_f->nodes[rec_f->leaf_node_indices[0]].n_outputs;
+    for (size_t i = 0; i < n_amounts && i < 4; i++)
+        amounts[i] = rec_f->nodes[rec_f->leaf_node_indices[0]].outputs[i].amount_sats;
+    TEST_ASSERT(factory_advance_refused(rec_f), "loaded factory refuses advances");
+    TEST_ASSERT(!rec_f->tree_refusal_logged, "nothing logged yet");
+    TEST_ASSERT_EQ(factory_advance_leaf_unsigned(rec_f, 0), FACTORY_ADVANCE_REFUSED,
+                   "leaf advance refused, not reported as exhausted");
+    TEST_ASSERT(rec_f->tree_refusal_logged, "refusal logged (once per factory)");
+    TEST_ASSERT_EQ(factory_advance_and_rebuild_path(rec_f, 0), FACTORY_ADVANCE_REFUSED,
+                   "advance-and-rebuild refused");
+    TEST_ASSERT_EQ(factory_advance_leaf(rec_f, 0), 0, "signed leaf advance refused");
+    TEST_ASSERT_EQ(factory_set_leaf_amounts(rec_f, 0, amounts,
+                                            n_amounts < 4 ? n_amounts : 4), 0,
+                   "realloc refused");
+    TEST_ASSERT_EQ(factory_advance(rec_f), 0, "root advance refused");
+    TEST_ASSERT_EQ(factory_tick_root(rec_f), FACTORY_ADVANCE_REFUSED,
+                   "root tick refused, not reported as no rollover");
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(rec_f, 0, 0, 0, 1000), 0,
+                   "sub-factory chain advance refused");
+    TEST_ASSERT_EQ(rec_f->counter.layers[0].current_state, 1, "root state unchanged");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 1, "epoch unchanged");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, 0, "leaf states unchanged");
+    factory_free(rec_f);
+    free(rec_f);
+
+    /* The LSP's leaf advance, on a factory restored the way the daemon
+       restores it. */
+    lsp_t *lsp = rs_make_lsp(&fx);
+    TEST_ASSERT(lsp, "lsp");
+    TEST_ASSERT(persist_load_factory(&fx.db, 0, &lsp->factory, fx.ctx), "restore");
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "alloc");
+    mgr->persist = &fx.db;
+    TEST_ASSERT(!lsp_channels_advance_ps_leaf(mgr, lsp, 0), "LSP leaf advance refused");
+    TEST_ASSERT_EQ(lsp->factory.leaf_layers[0].current_state, 0, "leaf state unchanged");
+
+    char *after = rs_snapshot(&fx.db);
+    TEST_ASSERT(after && strcmp(before, after) == 0,
+                "DW and tree rows unchanged");
+
+    free(before);
+    free(after);
+    free(mgr);
+    factory_free(&lsp->factory);
+    rs_free_lsp(lsp);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* A restarted client loads its factory through persist_load_factory too,
+   so it refuses a Tier B proposal, root-driven or leaf-driven, before
+   sending anything back: one restarted client stops root rollovers for
+   the whole factory until the tree reload lands. */
+int test_restart_client_refuses_tier_b_after_restore(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_dw_factory(&fx), "fixture");
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "client restart: load factory");
+    secp256k1_keypair kp;
+    TEST_ASSERT(secp256k1_keypair_create(fx.ctx, &kp, rs_seckeys[1]), "keypair");
+    uint32_t root0 = rec_f->counter.layers[0].current_state;
+    uint32_t epoch0 = rec_f->counter.current_epoch;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    for (int trigger = -1; trigger <= 0; trigger++) {
+        cJSON *j = wire_build_state_adv_propose_intent(epoch0 + 1, 1, trigger);
+        TEST_ASSERT(j, "proposal");
+        wire_msg_t m = { .msg_type = MSG_STATE_ADV_PROPOSE_INTENT, .json = j };
+        int ok = client_handle_state_advance(sv[0], fx.ctx, &kp, rec_f, 1, &m);
+        cJSON_Delete(j);
+        TEST_ASSERT(!ok, trigger < 0 ? "root-driven Tier B refused"
+                                     : "leaf-driven Tier B refused");
+    }
+    TEST_ASSERT_EQ(rec_f->counter.layers[0].current_state, root0, "root state unchanged");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, epoch0, "epoch unchanged");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, 0, "leaf states unchanged");
+    char b;
+    errno = 0;
+    TEST_ASSERT(recv(sv[1], &b, 1, MSG_DONTWAIT) < 0 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK), "nothing sent to the LSP");
+
+    close(sv[0]);
+    close(sv[1]);
+    factory_free(rec_f);
+    free(rec_f);
     rs_teardown(&fx);
     return 1;
 }

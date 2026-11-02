@@ -1439,6 +1439,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 1: advance leaf state to rebuild the unsigned TX. */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
+    if (rc == FACTORY_ADVANCE_REFUSED)
+        return 0;  /* restored from the DB; factory.c logged it */
     if (rc == 0) {
         fprintf(stderr, "LSP-stateless: leaf %d advance exhausted\n", leaf_side);
         return 0;
@@ -3050,6 +3052,8 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 1: Advance DW counter + rebuild unsigned tx */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
+    if (rc == FACTORY_ADVANCE_REFUSED)
+        return 0;  /* restored from the DB; factory.c logged it */
     if (rc == 0) {
         fprintf(stderr, "LSP realloc: leaf %d DW fully exhausted\n", leaf_side);
         return 0;

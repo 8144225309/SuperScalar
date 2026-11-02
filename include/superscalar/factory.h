@@ -407,6 +407,13 @@ typedef struct {
     size_t *leaf_node_indices;
 
     int per_leaf_enabled;          /* activated after first leaf advance */
+    /* Set by persist_load_factory, which rebuilds the tree from the
+       factory parameters at its initial state instead of reloading the
+       signed nodes: the tree in memory does not reflect the advances and
+       reallocs made before the restart, so the advance functions refuse to
+       build on it.  Cleared when the factory is initialised again. */
+    int tree_rebuilt_on_load;
+    int tree_refusal_logged;       /* the CRITICAL refusal line was printed */
     factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
 
     /* Variable arity per tree level (4A): overrides leaf_arity when set.
@@ -748,6 +755,17 @@ int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
                              const unsigned char sighash[32]);
 extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in production */
 
+/* Returned by factory_advance_leaf_unsigned, factory_tick_root and
+   factory_advance_and_rebuild_path when they refuse to build on a factory
+   restored from the DB (tree_rebuilt_on_load), distinct from their 0
+   ("exhausted" / "no rollover").  The boolean advance functions
+   (factory_advance, factory_advance_leaf, factory_set_leaf_amounts,
+   factory_subfactory_chain_advance_unsigned) return 0 for it, as for any
+   failure, because their callers test for zero; factory_advance_refused
+   tells the cases apart.  The refusal is logged once per factory. */
+#define FACTORY_ADVANCE_REFUSED (-3)
+int factory_advance_refused(const factory_t *f);
+
 int factory_advance(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
@@ -759,7 +777,8 @@ int factory_advance_leaf(factory_t *f, int leaf_side);
    Use for split-round signing: call this, then use factory_session_*_node()
    to exchange nonces and partial sigs with the counterparty.
    Returns 0 if fully exhausted (need factory rotation).
-   Returns -1 if leaf exhausted and root advanced (full rebuild needed). */
+   Returns -1 if leaf exhausted and root advanced (full rebuild needed).
+   Returns FACTORY_ADVANCE_REFUSED for a factory restored from the DB. */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
 
 /* Tick the root DW counter forward (PS Tier B trigger).  For PS factories,
@@ -767,7 +786,8 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
    by block-height progression instead.  Caller (LSP) wires this into a
    block-polling loop and runs Tier B on rc=-1.
    Returns -1 on epoch rollover (trees rebuilt; run Tier B);
-   0 otherwise (no rollover or fully exhausted). */
+   0 otherwise (no rollover or fully exhausted);
+   FACTORY_ADVANCE_REFUSED for a factory restored from the DB. */
 int factory_tick_root(factory_t *f);
 
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242 k² PS).
@@ -1128,7 +1148,8 @@ int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx);
 
 /* Advance leaf DW counter. If leaf exhausted, advance root layer and
    rebuild+resign only the affected path. Returns leaf_node_idx on success,
-   -1 on error, -2 if fully exhausted (need factory rotation). */
+   -1 on error, -2 if fully exhausted (need factory rotation),
+   FACTORY_ADVANCE_REFUSED for a factory restored from the DB. */
 int factory_advance_and_rebuild_path(factory_t *f, int leaf_side);
 
 /* --- Tree navigation helpers --- */

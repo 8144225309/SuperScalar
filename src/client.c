@@ -4587,6 +4587,8 @@ static int client_handle_state_advance_stateless(int fd,
         if (trigger_leaf_side < 0) {
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_tick_root(factory);
+                if (adv_rc == FACTORY_ADVANCE_REFUSED)
+                    return 0;  /* restored from the DB; factory.c logged it */
                 if (adv_rc == -1) break;
                 if (adv_rc != 0) {
                     fprintf(stderr, "Client-stateless Tier B %u: root tick step %d "
@@ -4597,6 +4599,8 @@ static int client_handle_state_advance_stateless(int fd,
         } else {
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_advance_leaf_unsigned(factory, trigger_leaf_side);
+                if (adv_rc == FACTORY_ADVANCE_REFUSED)
+                    return 0;  /* restored from the DB; factory.c logged it */
                 if (adv_rc == -1) break;
                 if (adv_rc != 1) {
                     fprintf(stderr, "Client-stateless Tier B %u: advance step %d "

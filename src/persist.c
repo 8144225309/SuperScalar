@@ -2662,6 +2662,9 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         return 0;
     }
 
+    /* The tree built above is the initial one, not the signed tree the
+       factory had reached: no advance may be built on it. */
+    f->tree_rebuilt_on_load = 1;
     return 1;
 }
 
