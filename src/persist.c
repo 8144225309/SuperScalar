@@ -2847,6 +2847,13 @@ int persist_client_move_to_channel_0(persist_t *p) {
     }
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return 0;
+    if (n > 1) {
+        /* Not a single-channel client layout (an LSP DB, or a client DB that
+           an older build's partial rotation left with two rows): leave it. */
+        fprintf(stderr, "persist: %d channel rows below the JIT range; "
+                "not moving any client rows\n", n);
+        return 1;
+    }
     if (n != 1 || old_id == CLIENT_DB_CHANNEL_ID) return 1;
 
     /* The tables the client wrote under its index. */
