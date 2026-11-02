@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+#define PERSIST_SCHEMA_VERSION 40
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -332,6 +332,25 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
    lsp_channels_revalidate_funding when the flag flips. */
 int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
                                             int funding_pending_reorg);
+
+/* Read it back (lsp_channels_init_from_db).  Returns 1 if the channel row
+   exists, 0 otherwise (*funding_pending_reorg = 0). */
+int persist_load_channel_funding_reorg(persist_t *p, uint32_t channel_id,
+                                       int *funding_pending_reorg);
+
+/* v40: the block (height, 64-hex hash) that confirmed a factory funding
+   TX, keyed by its display-order txid.  Save replaces; load returns 1 when
+   a row exists. */
+int persist_save_funding_anchor(persist_t *p, const char *funding_txid_hex,
+                                int32_t height, const char *block_hash);
+int persist_load_funding_anchor(persist_t *p, const char *funding_txid_hex,
+                                int32_t *height, char block_hash[65]);
+
+/* v40: a reorg detector's last stored tip, keyed by detector name. */
+int persist_save_reorg_tip(persist_t *p, const char *detector,
+                           int32_t height, const char *block_hash);
+int persist_load_reorg_tip(persist_t *p, const char *detector,
+                           int32_t *height, char block_hash[65]);
 
 /* Return all channel ids currently stored, in ascending order. */
 /* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for

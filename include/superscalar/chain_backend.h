@@ -87,7 +87,11 @@ struct chain_backend {
     /*
      * Confirmation depth of a transaction (display-order hex txid).
      * Returns confirmation count (>= 1 if confirmed), 0 if unconfirmed
-     * but found in mempool, -1 if not found anywhere.
+     * but found in mempool, -1 if not found anywhere.  The regtest backend
+     * also returns REGTEST_CONF_RPC_ERROR (-2) when bitcoind could not be
+     * reached and REGTEST_CONF_CONFLICTED (-3) for a conflicted wallet TX
+     * (see regtest_get_confirmations); callers that treat any negative
+     * value as "not on chain" must check -2 first.
      */
     int  (*get_confirmations)(chain_backend_t *self, const char *txid_hex);
 
