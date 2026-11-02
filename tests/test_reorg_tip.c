@@ -390,6 +390,84 @@ int test_reorg_classify_unseen_block_reorg(void) {
     return 1;
 }
 
+/* Fork height of reported reorgs (pure). */
+int test_reorg_fork_height(void) {
+    lsp_reorg_state_t prev;
+    regtest_chain_tip_t tips[2];
+    lsp_reorg_view_t v = {0};
+    char ha[65], hb[65], hc[65];
+    snprintf(ha, sizeof(ha), "a%063x", 100u);
+    snprintf(hb, sizeof(hb), "b%063x", 102u);
+    snprintf(hc, sizeof(hc), "c%063x", 101u);
+    st_set(&prev, 100, ha);
+
+    TEST_ASSERT(lsp_reorg_fork_height(&prev, LSP_REORG_NONE, 101, NULL) == -1,
+                "no reorg -> -1");
+    /* Stored tip 100 is now a stale branch of length 2 (99, 100 replaced). */
+    tip_set(&tips[0], 102, 0, "active", hb);
+    tip_set(&tips[1], 100, 2, "valid-fork", prev.hash);
+    v.tips = tips; v.n_tips = 2;
+    TEST_ASSERT(lsp_reorg_fork_height(&prev, LSP_REORG_FORWARD, 102, &v) == 98,
+                "exact fork from the stored tip's stale branch");
+    /* Without that branch: one below the lower tip. */
+    v.n_tips = 1;
+    TEST_ASSERT(lsp_reorg_fork_height(&prev, LSP_REORG_FORWARD, 102, &v) == 99,
+                "fallback: forward");
+    TEST_ASSERT(lsp_reorg_fork_height(&prev, LSP_REORG_HEIGHT_REGRESSION, 97, NULL) == 96,
+                "fallback: regression");
+    /* UNSEEN_BLOCK: the reported branch's fork point. */
+    tip_set(&tips[1], 101, 1, "invalid", hc);
+    v.n_tips = 2;
+    TEST_ASSERT(lsp_reorg_fork_height(&prev, LSP_REORG_UNSEEN_BLOCK, 102, &v) == 100,
+                "unseen block: fork at the stored tip");
+    return 1;
+}
+
+/* The reorg handler's sub-factory step (lsp_reorg_rollback_subfactory_chains,
+   called with the detector's fork height). */
+static int handler_subfactory_step(factory_t *f, int32_t fork_height) {
+    return lsp_reorg_rollback_subfactory_chains(f, fork_height);
+}
+
+/* A shallow reorg must leave an advanced, off-chain sub-factory chain
+   intact; only an entry observed confirmed above the fork is rolled back. */
+int test_reorg_subfactory_chain_kept_on_shallow_reorg(void) {
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_alloc_default_arrays(f);
+    f->n_nodes = 2;
+    factory_node_t *sub = &f->nodes[1];
+    sub->type = NODE_PS_SUBFACTORY;
+    sub->ps_chain_len = 3;
+    sub->ps_n_prev_outputs = 2;
+    memset(sub->ps_prev_txid, 0xAA, 32);
+    unsigned char prev_txid[32];
+    memset(prev_txid, 0xAA, 32);
+    int ok = 1;
+
+    /* Off-chain chain (never observed confirmed), 1-block reorg at 100. */
+    int n = handler_subfactory_step(f, 100);
+    printf("\n    off-chain chain[3], reorg fork 100: rolled back %d, "
+           "chain_len now %d\n   ", n, sub->ps_chain_len);
+    if (n != 0 || sub->ps_chain_len != 3 || sub->ps_n_prev_outputs != 2 ||
+        memcmp(sub->ps_prev_txid, prev_txid, 32) != 0) ok = 0;
+
+    /* Observed confirmed below the fork: still confirmed, kept. */
+    sub->ps_chain_confirmed_height = 95;
+    if (handler_subfactory_step(f, 100) != 0 || sub->ps_chain_len != 3) ok = 0;
+
+    /* Observed confirmed above the fork: its block was disconnected. */
+    sub->ps_chain_confirmed_height = 105;
+    if (handler_subfactory_step(f, 100) != 1 || sub->ps_chain_len != 0 ||
+        sub->ps_chain_confirmed_height != 0) ok = 0;
+
+    f->n_nodes = 0;
+    factory_free(f);
+    free(f);
+    TEST_ASSERT(ok, "only entries confirmed above the fork are rolled back");
+    return 1;
+}
+
 /* ---- regtest: tip snapshot consistency under concurrent mining ---------- */
 
 #define TIP_MINER_BLOCKS 300

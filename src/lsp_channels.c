@@ -2954,6 +2954,39 @@ void lsp_reorg_state_advance(lsp_reorg_state_t *st, int32_t cur_height,
     }
 }
 
+int32_t lsp_reorg_fork_height(const lsp_reorg_state_t *prev,
+                              lsp_reorg_kind_t kind, int32_t cur_height,
+                              const lsp_reorg_view_t *view) {
+    if (kind <= LSP_REORG_NONE || !prev) return -1;
+    if (view && view->tips) {
+        for (size_t i = 0; i < view->n_tips; i++) {
+            const regtest_chain_tip_t *t = &view->tips[i];
+            if (t->branchlen > 0 && strcmp(t->hash, prev->hash) == 0)
+                return t->height - t->branchlen;
+        }
+        if (kind == LSP_REORG_UNSEEN_BLOCK) {
+            int32_t lowest = -1;
+            for (size_t i = 0; i < view->n_tips; i++) {
+                const regtest_chain_tip_t *t = &view->tips[i];
+                if (!reorg_tip_disconnected(t)) continue;
+                int32_t fh = t->height - t->branchlen;
+                if (fh >= prev->height && t->height > prev->height &&
+                    !reorg_tip_seen(prev, t->hash) &&
+                    (lowest < 0 || fh < lowest))
+                    lowest = fh;
+            }
+            if (lowest >= 0) return lowest;
+        }
+    }
+    int32_t low = cur_height < prev->height ? cur_height : prev->height;
+    return low > 0 ? low - 1 : 0;
+}
+
+int lsp_reorg_rollback_subfactory_chains(factory_t *f, int32_t fork_height) {
+    return factory_reset_subfactory_chains_above_height(
+        f, fork_height > 0 ? (uint32_t)fork_height : 0);
+}
+
 #define LSP_REORG_MAX_TIPS 64
 
 lsp_reorg_kind_t lsp_reorg_poll(regtest_t *rt, lsp_reorg_state_t *st,
@@ -2989,8 +3022,10 @@ lsp_reorg_kind_t lsp_reorg_poll(regtest_t *rt, lsp_reorg_state_t *st,
         view.n_tips = n_tips;
     }
     lsp_reorg_kind_t kind = lsp_reorg_classify(st, h, cur_hash, &view);
+    int32_t fork = lsp_reorg_fork_height(st, kind, h, &view);
     if (kind != LSP_REORG_INCONCLUSIVE)
         lsp_reorg_state_advance(st, h, cur_hash, view.tips, view.n_tips);
+    st->fork_height = fork;
     return kind;
 }
 
@@ -7472,20 +7507,23 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         /* Re-validate watchtower entries */
                         watchtower_on_reorg(mgr->watchtower, height,
                                            daemon_prev_height);
-                        /* Drop in-memory sub-factory chain advance state.
-                           A reorg of chain[N-1] would invalidate chain[N]'s
-                           prev-output reference; resetting forces force-close
-                           to fall back to chain[0] (v23/PR #144 path), which
-                           spends the factory leaf output directly. DB rows
-                           in ps_subfactory_chains are preserved for forensics. */
+                        /* Sub-factory chains: roll back only entries that were
+                           observed confirmed above the fork height.  Chains are
+                           off-chain until a force-close, so a reorg leaves them
+                           as they are; nothing records confirmation heights for
+                           them yet, so in practice nothing is rolled back here.
+                           (Wiping every chain on each alarm left
+                           chain[N] signed bytes without the chain state, broke
+                           force-close of advanced sub-factories and let the
+                           next advance overwrite a DB chain row.) */
                         {
-                            int n_sub_reset =
-                                factory_reset_all_subfactory_chains(&lsp->factory);
+                            int n_sub_reset = lsp_reorg_rollback_subfactory_chains(
+                                &lsp->factory, daemon_reorg.fork_height);
                             if (n_sub_reset > 0)
                                 fprintf(stderr,
-                                    "LSP reorg: reset chain advance state for "
-                                    "%d sub-factory(s); force-close falls back "
-                                    "to chain[0]\n", n_sub_reset);
+                                    "LSP reorg: rolled back %d sub-factory "
+                                    "chain(s) confirmed above height %d\n",
+                                    n_sub_reset, daemon_reorg.fork_height);
                         }
                         /* R5 (mainnet pre-flight): revalidate each factory
                            channel's funding UTXO.  Sets funding_pending_reorg

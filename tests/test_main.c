@@ -3936,6 +3936,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_tip_race_no_false_forward);
     RUN_TEST(test_reorg_classify_detects_real_reorgs);
     RUN_TEST(test_reorg_classify_unseen_block_reorg);
+    extern int test_reorg_fork_height(void);
+    extern int test_reorg_subfactory_chain_kept_on_shallow_reorg(void);
+    RUN_TEST(test_reorg_fork_height);
+    RUN_TEST(test_reorg_subfactory_chain_kept_on_shallow_reorg);
 
     /* R5 funding revalidation: re-check decision + restart reload */
     extern int test_reorg_funding_recheck_due(void);

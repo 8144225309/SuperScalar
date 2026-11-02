@@ -98,6 +98,10 @@ typedef struct {
     char    seen[LSP_REORG_SEEN_MAX][65];
     size_t  n_seen;
     size_t  seen_next;
+    /* Set by lsp_reorg_poll(): for a reported reorg, the highest height the
+       old and new chains still share (blocks above it were disconnected);
+       -1 when the poll reported none. */
+    int32_t fork_height;
 } lsp_reorg_state_t;
 
 /* Chain data read after the current tip, for lsp_reorg_classify().
@@ -500,6 +504,26 @@ int lsp_reorg_needs_tips(const lsp_reorg_state_t *st, int32_t cur_height,
 void lsp_reorg_state_advance(lsp_reorg_state_t *st, int32_t cur_height,
                              const char *cur_hash,
                              const regtest_chain_tip_t *tips, size_t n_tips);
+
+/* Fork height of a reorg just classified as `kind` against `prev` (the
+   stored tip before the poll).  Exact when getchaintips lists the branch
+   holding prev->hash (fork = its height - branchlen) or, for UNSEEN_BLOCK,
+   the reported branch; otherwise one below the lower of the two tips.
+   That fallback assumes the reorg went at most one block below the lower
+   tip: for a deeper reorg whose old branch getchaintips no longer lists
+   (e.g. bitcoind restarted since), the result is above the real fork.
+   -1 for NONE / INCONCLUSIVE.  Pure. */
+int32_t lsp_reorg_fork_height(const lsp_reorg_state_t *prev,
+                              lsp_reorg_kind_t kind, int32_t cur_height,
+                              const lsp_reorg_view_t *view);
+
+/* Reorg handler step for PS sub-factory chains: roll back only entries
+   observed confirmed above fork_height.  Nothing records that height
+   (ps_chain_confirmed_height) today, so this resets nothing; it is the hook
+   for when force-close tracking stamps the height at which a chain entry
+   confirmed.  Chains never seen on chain (the normal, off-chain case) are
+   left as they are.  Returns the count. */
+int lsp_reorg_rollback_subfactory_chains(factory_t *f, int32_t fork_height);
 
 /* One detector poll: tip snapshot, the reads above, classify, and advance
    *st unless the result is INCONCLUSIVE.  Writes the tip read to
