@@ -3085,6 +3085,56 @@ size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
     return count;
 }
 
+int persist_load_channel_htlcs(persist_t *p, uint32_t channel_id,
+                               channel_t *ch) {
+    if (!p || !p->db || !ch) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT COUNT(*) FROM htlcs WHERE channel_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int rc = sqlite3_step(stmt);
+    size_t n_rows = (rc == SQLITE_ROW) ? (size_t)sqlite3_column_int64(stmt, 0) : 0;
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW) return -1;
+
+    htlc_t *rows = NULL;
+    size_t n_loaded = 0;
+    if (n_rows > 0) {
+        rows = malloc(n_rows * sizeof(htlc_t));
+        if (!rows) return -1;
+        n_loaded = persist_load_htlcs(p, channel_id, rows, n_rows);
+        if (n_loaded == 0) {
+            free(rows);
+            return -1;
+        }
+    }
+
+    size_t n_keep = 0;
+    for (size_t i = 0; i < n_loaded; i++) {
+        if (rows[i].state != HTLC_STATE_ACTIVE) continue;
+        rows[n_keep++] = rows[i];
+    }
+    if (n_keep > MAX_HTLCS) {
+        fprintf(stderr, "persist: channel %u has %zu active HTLCs stored, more than "
+                "a channel can hold (%d); refusing to load them\n",
+                channel_id, n_keep, MAX_HTLCS);
+        free(rows);
+        return -1;
+    }
+    if (!channel_reserve_htlcs(ch, n_keep)) {
+        free(rows);
+        return -1;
+    }
+    if (n_keep > 0)
+        memcpy(ch->htlcs, rows, n_keep * sizeof(htlc_t));
+    ch->n_htlcs = n_keep;
+    free(rows);
+    return (int)n_keep;
+}
+
 int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id) {
     if (!p || !p->db) return 0;
 

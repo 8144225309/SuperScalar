@@ -406,6 +406,15 @@ int persist_save_htlc(persist_t *p, uint32_t channel_id,
 size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
                             htlc_t *htlcs_out, size_t max_htlcs);
 
+/* Replace ch's HTLCs with the active rows stored for channel_id, growing
+   ch->htlcs to fit.  Fulfilled and failed rows are skipped and do not
+   count.  Fails closed: returns -1 and leaves ch unchanged if there are
+   more active rows than a channel can hold (MAX_HTLCS), or on an
+   allocation or query error.  Otherwise returns the number of HTLCs now
+   in ch. */
+int persist_load_channel_htlcs(persist_t *p, uint32_t channel_id,
+                               channel_t *ch);
+
 /* Delete an HTLC entry (after settle/fail). */
 int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id);
 

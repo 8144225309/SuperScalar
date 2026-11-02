@@ -1768,6 +1768,17 @@ static void channel_compact_htlcs(channel_t *ch) {
     ch->n_htlcs = write;
 }
 
+int channel_reserve_htlcs(channel_t *ch, size_t n) {
+    if (!ch || n > MAX_HTLCS) return 0;
+    if (ch->htlcs && n <= ch->htlcs_cap) return 1;
+    size_t new_cap = n < DEFAULT_HTLCS_CAP ? DEFAULT_HTLCS_CAP : n;
+    htlc_t *tmp = realloc(ch->htlcs, new_cap * sizeof(htlc_t));
+    if (!tmp) return 0;
+    ch->htlcs = tmp;
+    ch->htlcs_cap = new_cap;
+    return 1;
+}
+
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {

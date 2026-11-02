@@ -238,19 +238,19 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
         /* Load active HTLCs from DB */
         {
-            htlc_t *loaded_htlcs = malloc(MAX_HTLCS * sizeof(htlc_t));
-            if (!loaded_htlcs) goto fail;
-            size_t n_loaded = persist_load_htlcs(pdb, (uint32_t)c,
-                                                    loaded_htlcs, MAX_HTLCS);
-            for (size_t h = 0; h < n_loaded; h++) {
-                if (loaded_htlcs[h].state != HTLC_STATE_ACTIVE) continue;
-                if (entry->channel.n_htlcs >= MAX_HTLCS) break;
-                entry->channel.htlcs[entry->channel.n_htlcs++] = loaded_htlcs[h];
+            /* channel_init allocated DEFAULT_HTLCS_CAP entries; the loader
+               grows the array to what the DB holds and refuses more than a
+               channel can hold. */
+            int n_loaded = persist_load_channel_htlcs(pdb, (uint32_t)c,
+                                                      &entry->channel);
+            if (n_loaded < 0) {
+                fprintf(stderr, "LSP recovery: cannot restore HTLCs for "
+                        "channel %zu\n", c);
+                goto fail;
             }
             if (n_loaded > 0)
-                printf("LSP recovery: loaded %zu HTLCs for channel %zu\n",
+                printf("LSP recovery: loaded %d HTLCs for channel %zu\n",
                        n_loaded, c);
-            free(loaded_htlcs);
         }
 
         /* Initialize nonce pool (fresh nonces — reconnect re-exchanges) */

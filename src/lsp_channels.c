@@ -5827,31 +5827,36 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                Roll back to last committed state from persistence. */
             uint64_t db_local, db_remote, db_cn;
             if (persist_load_channel_state((persist_t *)mgr->persist,
-                    (uint32_t)c, &db_local, &db_remote, &db_cn)) {
+                    (uint32_t)c, &db_local, &db_remote, &db_cn) &&
+                persist_load_channel_htlcs((persist_t *)mgr->persist,
+                    (uint32_t)c, ch) >= 0) {
                 ch->local_amount = db_local;
                 ch->remote_amount = db_remote;
                 ch->commitment_number = db_cn;
-                ch->n_htlcs = persist_load_htlcs((persist_t *)mgr->persist,
-                    (uint32_t)c, ch->htlcs, MAX_HTLCS);
                 printf("LSP: rolled back channel %zu to committed state "
                        "(cn=%llu)\n", c, (unsigned long long)db_cn);
             } else {
-                fprintf(stderr, "LSP: rollback failed — no DB state for %zu\n", c);
+                fprintf(stderr, "LSP: rollback failed — no usable DB state for %zu\n", c);
                 wire_close(new_fd);
                 return 0;
             }
         } else if (diff == -1 && mgr->persist) {
             /* Client is 1 ahead: LSP crashed after client committed but
                before LSP persisted. Accept client's commitment_number. */
-            ch->commitment_number = commitment_number;
             uint64_t db_local, db_remote, db_cn;
             if (persist_load_channel_state((persist_t *)mgr->persist,
                     (uint32_t)c, &db_local, &db_remote, &db_cn)) {
+                if (persist_load_channel_htlcs((persist_t *)mgr->persist,
+                        (uint32_t)c, ch) < 0) {
+                    fprintf(stderr, "LSP reconnect: cannot restore HTLCs for "
+                            "slot %zu — closing connection\n", c);
+                    wire_close(new_fd);
+                    return 0;
+                }
                 ch->local_amount = db_local;
                 ch->remote_amount = db_remote;
-                ch->n_htlcs = persist_load_htlcs((persist_t *)mgr->persist,
-                    (uint32_t)c, ch->htlcs, MAX_HTLCS);
             }
+            ch->commitment_number = commitment_number;
             printf("LSP: accepted client %zu commitment_number %llu "
                    "(LSP was behind)\n", c, (unsigned long long)commitment_number);
         } else {
