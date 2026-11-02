@@ -2107,8 +2107,8 @@ int test_exit_client_reload_then_tierb(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Tree reload: the L-stock state counter and PS chains across a root  */
-/* rollover                                                             */
+/* Tree reload: the L-stock state counter, PS chains across a root      */
+/* rollover, and signed-state reservations                              */
 /* ------------------------------------------------------------------ */
 
 static const unsigned char g_rl_seed[32] = {
@@ -2555,6 +2555,40 @@ int test_reload_ps_chain_loaders_filter_epoch(void) {
     return 1;
 }
 
+/* Forwards the wire between the LSP and a client, except one message type
+   from the client, which it swallows before closing both sides. */
+typedef struct {
+    int lsp_fd, cli_fd;
+    uint8_t drop_type;
+    int dropped;
+} rl_proxy_t;
+
+static void *rl_proxy_thread(void *arg) {
+    rl_proxy_t *x = (rl_proxy_t *)arg;
+    for (;;) {
+        struct pollfd pf[2] = { { .fd = x->lsp_fd, .events = POLLIN },
+                                { .fd = x->cli_fd, .events = POLLIN } };
+        if (poll(pf, 2, 130000) <= 0) break;
+        int from_cli = (pf[1].revents & (POLLIN | POLLHUP)) ? 1 : 0;
+        int src = from_cli ? x->cli_fd : x->lsp_fd;
+        int dst = from_cli ? x->lsp_fd : x->cli_fd;
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        if (!wire_recv(src, &m)) break;
+        if (from_cli && m.msg_type == x->drop_type) {
+            x->dropped = 1;
+            if (m.json) cJSON_Delete(m.json);
+            break;
+        }
+        int sent = wire_send(dst, m.msg_type, m.json);
+        if (m.json) cJSON_Delete(m.json);
+        if (!sent) break;
+    }
+    shutdown(x->lsp_fd, SHUT_RDWR);
+    shutdown(x->cli_fd, SHUT_RDWR);
+    return NULL;
+}
+
 /* Fresh LSP <-> client socketpair for the rig (the old one may be shut). */
 static int rl_rig_reconnect(ex_rig_t *r) {
     if (r->sv[0] >= 0) close(r->sv[0]);
@@ -2573,6 +2607,210 @@ static int rl_rig_restart_lsp(ex_rig_t *r) {
     memset(&r->lsp->factory, 0, sizeof(r->lsp->factory));
     return persist_load_factory(&r->db, 0, &r->lsp->factory, r->ctx) &&
            !r->lsp->factory.tree_rebuilt_on_load;
+}
+
+/* Client restart: its factory is reloaded from the client DB. */
+static int rl_rig_restart_client(ex_rig_t *r) {
+    factory_free(r->cf);
+    memset(r->cf, 0, sizeof(*r->cf));
+    return persist_load_factory(&r->cdb, 0, r->cf, r->ctx);
+}
+
+/* One leaf advance in which the client's FINAL never reaches the LSP: the
+   client completes the new state with the LSP's partial sig, then the
+   connection drops.  out_txid gets the state the client holds. */
+static int rl_withheld_final(ex_rig_t *r, unsigned char out_txid[32],
+                             int *lsp_rc) {
+    int q[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, q) != 0) return 0;
+    rl_proxy_t px = { .lsp_fd = r->sv[1], .cli_fd = q[0],
+                      .drop_type = MSG_LEAF_ADVANCE_FINAL, .dropped = 0 };
+    ex_client_t cl = { .fd = q[1], .ctx = r->ctx, .kp = r->kps[1],
+                       .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    pthread_t tp, tc;
+    if (pthread_create(&tp, NULL, rl_proxy_thread, &px) != 0) return 0;
+    if (pthread_create(&tc, NULL, ex_client_thread, &cl) != 0) return 0;
+    *lsp_rc = lsp_channels_advance_ps_leaf(r->mgr, r->lsp, 0);
+    shutdown(r->sv[0], SHUT_RDWR);
+    pthread_join(tp, NULL);
+    pthread_join(tc, NULL);
+    close(q[0]); close(q[1]);
+    size_t leaf = r->cf->leaf_node_indices[0];
+    memcpy(out_txid, r->cf->nodes[leaf].txid, 32);
+    return px.dropped && r->cf->nodes[leaf].is_signed;
+}
+
+/* DW leaf: the LSP releases its partial sig, the client completes state 1
+   and withholds FINAL, the LSP restarts at state 0.  A different state 1 (a
+   realloc at the same nSequence) must be refused; the identical state 1 may
+   be signed again. */
+int test_reload_withheld_final_dw(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "rl_wfdw", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    char stored0[65], sql[200];
+    snprintf(sql, sizeof(sql), "SELECT txid FROM tree_nodes WHERE factory_id=0 "
+             "AND node_index=%zu", leaf);
+    ex_sql_text(&r.db, sql, stored0, sizeof(stored0));
+
+    unsigned char t1[32];
+    int lrc = -1;
+    TEST_ASSERT(rl_withheld_final(&r, t1, &lrc), "client holds state 1, FINAL withheld");
+    char t1hex[65], stored[65];
+    ex_txid_hex(t1, t1hex);
+    ex_sql_text(&r.db, sql, stored, sizeof(stored));
+    printf("  withheld FINAL: LSP rc=%d, client holds state 1 %.16s..., LSP DB "
+           "still at state 0: %s\n", lrc, t1hex,
+           strcmp(stored, stored0) == 0 ? "yes" : "no");
+    TEST_ASSERT(lrc == 0 && strcmp(stored, stored0) == 0, "the LSP stored nothing");
+
+    /* LSP restart; a client at state 0 that signs whatever it is sent */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    TEST_ASSERT(r.lsp->factory.leaf_layers[0].current_state == 0, "LSP back at state 0");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client at state 0");
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    size_t na = ex_realloc_amounts(&r.lsp->factory.nodes[leaf], 1000, amts);
+    int client_ok = 0;
+    int rc = ex_rig_realloc(&r, amts, na, &client_ok);
+    char t1b[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, t1b);
+    printf("  after the restart, a realloc to a different state 1: rc=%d (%s)\n", rc,
+           rc == 1 ? "a SECOND state 1 was signed" : "refused");
+    if (rc == 1)
+        printf("  two signed states with nSequence %u: %.16s... and %.16s...\n",
+               r.lsp->factory.nodes[leaf].nsequence, t1hex, t1b);
+    TEST_ASSERT(rc == 0, "a different state 1 is not signed");
+
+    /* the identical state 1 is signed again */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload 2");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client reload 2");
+    rc = ex_rig_ps_advance(&r, &client_ok);
+    char again[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, again);
+    printf("  plain leaf advance after the restart: rc=%d, state 1 %.16s... (%s)\n",
+           rc, again, strcmp(again, t1hex) == 0 ? "identical" : "DIFFERENT");
+    TEST_ASSERT(rc == 1 && client_ok, "the identical state is re-signed");
+    TEST_ASSERT(strcmp(again, t1hex) == 0, "and it is the state the client held");
+    alarm(0);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* PS leaf: same, for chain[1].  Only the identical chain[1] may be signed
+   for chain[0]'s output; a record of a different chain[1] refuses it. */
+int test_reload_withheld_final_ps(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_PS, "rl_wfps", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    unsigned char t1[32];
+    int lrc = -1;
+    TEST_ASSERT(rl_withheld_final(&r, t1, &lrc), "client holds chain[1], FINAL withheld");
+    char t1hex[65];
+    ex_txid_hex(t1, t1hex);
+    int nres = ex_sql_int(&r.db, "SELECT COUNT(*) FROM signed_state_reservations");
+    printf("  withheld FINAL: LSP rc=%d, client holds chain[1] %.16s..., "
+           "reservations=%d\n", lrc, t1hex, nres);
+    TEST_ASSERT(lrc == 0, "the LSP did not complete");
+    TEST_ASSERT(nres >= 1, "the LSP reserved chain[1] before releasing its partial sig");
+
+    /* a record of a different chain[1] for the same output refuses it */
+    TEST_ASSERT(sqlite3_exec(r.db.db, "UPDATE signed_state_reservations SET txid="
+        "'00000000000000000000000000000000000000000000000000000000000000aa'",
+        NULL, NULL, NULL) == SQLITE_OK, "swap the record");
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client reload");
+    int client_ok = 0;
+    int rc = ex_rig_ps_advance(&r, &client_ok);
+    printf("  chain[1] with another TX recorded for chain[0]'s output: rc=%d\n", rc);
+    TEST_ASSERT(rc == 0, "refused");
+
+    /* with the real record, the identical chain[1] is signed again */
+    char upd[200];
+    snprintf(upd, sizeof(upd), "UPDATE signed_state_reservations SET txid='%s'", t1hex);
+    TEST_ASSERT(sqlite3_exec(r.db.db, upd, NULL, NULL, NULL) == SQLITE_OK, "restore");
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload 2");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client reload 2");
+    rc = ex_rig_ps_advance(&r, &client_ok);
+    char again[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, again);
+    printf("  restart, identical chain[1]: rc=%d %.16s... (%s)\n", rc, again,
+           strcmp(again, t1hex) == 0 ? "identical" : "DIFFERENT");
+    TEST_ASSERT(rc == 1 && client_ok && strcmp(again, t1hex) == 0,
+                "the identical chain[1] is re-signed");
+    alarm(0);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* The client thread, then hang up (a refusing client stops answering; the
+   LSP should not sit out its receive timeout). */
+static void *rl_client_thread_closing(void *arg) {
+    ex_client_thread(arg);
+    shutdown(((ex_client_t *)arg)->fd, SHUT_RDWR);
+    return NULL;
+}
+
+/* Client side: the client completes state 1 with the LSP (it sends FINAL)
+   and crashes before storing it; after its restart (state 0), an LSP that
+   reloaded an old state proposes a different state 1.  The client must
+   refuse to sign it. */
+int test_reload_client_refuses_conflicting_state(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "rl_cli", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    client_set_persist(&r.cdb);
+
+    ex_client_t cl = { .fd = r.sv[1], .ctx = r.ctx, .kp = r.kps[1],
+                       .f = r.cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, ex_client_thread, &cl) == 0, "thread");
+    int rc = lsp_channels_advance_ps_leaf(r.mgr, r.lsp, 0);
+    pthread_join(th, NULL);
+    TEST_ASSERT(rc == 1 && cl.ok, "state 1 signed by both");
+    char t1[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, t1);
+    /* the client crashes before client_persist_exit_state */
+    TEST_ASSERT(rl_rig_restart_client(&r), "client reload (state 0)");
+
+    /* an LSP back at state 0 (an old backup, no reservations) */
+    persist_t *keep = r.mgr->persist;
+    r.mgr->persist = NULL;
+    factory_free(&r.lsp->factory);
+    TEST_ASSERT(ex_build_factory(r.ctx, &r.lsp->factory, r.kps, 3, FACTORY_ARITY_1,
+                                 r.fund_txid, 0, 1000000, r.spk, 2, 4, 1),
+                "LSP at state 0");
+    TEST_ASSERT(rl_rig_reconnect(&r), "reconnect");
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    size_t na = ex_realloc_amounts(&r.lsp->factory.nodes[leaf], 1000, amts);
+    ex_client_t cl2 = { .fd = r.sv[1], .ctx = r.ctx, .kp = r.kps[1],
+                        .f = r.cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    TEST_ASSERT(pthread_create(&th, NULL, rl_client_thread_closing, &cl2) == 0,
+                "thread 2");
+    rc = lsp_realloc_leaf(r.mgr, r.lsp, 0, amts, na);
+    if (rc != 1) shutdown(r.sv[0], SHUT_RDWR);
+    pthread_join(th, NULL);
+    int client_ok = cl2.ok;
+    char t1b[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, t1b);
+    printf("  restarted client asked for a different state 1: rc=%d client_ok=%d (%s)\n",
+           rc, client_ok, rc == 1 ? "the client SIGNED a second state 1" : "refused");
+    if (rc == 1)
+        printf("  the LSP holds two signed states 1: %.16s... and %.16s...\n", t1, t1b);
+    client_set_persist(NULL);
+    r.mgr->persist = keep;
+    alarm(0);
+    TEST_ASSERT(rc == 0 && !client_ok, "the client refuses a different state 1");
+    ex_rig_free(&r);
+    return 1;
 }
 
 /* After a reload the on-request reveal is capped at the stored L-stock state:

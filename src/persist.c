@@ -458,13 +458,15 @@ static const char *SCHEMA_SQL =
     "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
     ");";
 
-/* v43: per-node L-stock state counter.
+/* v43: per-node L-stock state counter, and signed-state reservations.
 
    tree_node_lstock: the L-stock state counter (and the L-stock hash) that
    goes with each node's stored tree_nodes row.  The counter cannot be derived
    from the tree (it counts every rebuild of the L-stock output), and the
    client has no seed to re-derive the hash.  Written in the same statement
    group as the tree row (tree_node_upsert).
+
+   signed_state_reservations: see persist_reserve_signed_tx.
 
    Created whenever missing, independent of the version number, so the step
    works in any merge order with the other schema bumps. */
@@ -475,6 +477,16 @@ static const char *SCHEMA_SQL =
     "  state_counter INTEGER NOT NULL,"                             \
     "  l_stock_hash  TEXT,"                                         \
     "  PRIMARY KEY (factory_id, node_index)"                        \
+    ");"                                                            \
+    "CREATE TABLE IF NOT EXISTS signed_state_reservations ("        \
+    "  factory_id  INTEGER NOT NULL,"                               \
+    "  input_txid  TEXT NOT NULL,"                                  \
+    "  input_vout  INTEGER NOT NULL,"                               \
+    "  nsequence   INTEGER NOT NULL,"                               \
+    "  node_index  INTEGER NOT NULL,"                               \
+    "  txid        TEXT NOT NULL,"                                  \
+    "  created_at  INTEGER DEFAULT (strftime('%s','now')),"         \
+    "  PRIMARY KEY (factory_id, input_txid, input_vout, nsequence)" \
     ");"
 
 int persist_open(persist_t *p, const char *path) {
@@ -1428,8 +1440,8 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
-    /* v43: tree_node_lstock, created whenever missing (see
-       PERSIST_V43_TABLES_SQL). */
+    /* v43: tree_node_lstock + signed_state_reservations, created whenever
+       missing (see PERSIST_V43_TABLES_SQL). */
     {
         char *merr43 = NULL;
         if (sqlite3_exec(p->db, PERSIST_V43_TABLES_SQL, NULL, NULL, &merr43) != SQLITE_OK) {
@@ -2456,6 +2468,89 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return rc == SQLITE_DONE ? 1 : 0;
+}
+
+/* --- Signed-state reservations (v43) --- */
+
+int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
+                              uint32_t node_idx,
+                              const unsigned char *unsigned_tx, size_t tx_len,
+                              int any_nsequence) {
+    if (!p || !p->db || !unsigned_tx || tx_len == 0) return PERSIST_RESERVE_ERROR;
+    if (p->in_transaction) {
+        /* The row must be on disk before the signature leaves; inside an
+           open transaction it would not be until the caller commits. */
+        fprintf(stderr, "persist_reserve_signed_tx: called inside a "
+                "transaction; refusing\n");
+        return PERSIST_RESERVE_ERROR;
+    }
+    pq_tx_info_t *info = malloc(sizeof(*info));
+    if (!info) return PERSIST_RESERVE_ERROR;
+    if (!pq_parse_tx_bytes(unsigned_tx, tx_len, info) || info->n_inputs == 0 ||
+        info->n_inputs >= PQ_MAX_INPUTS) {
+        free(info);
+        return PERSIST_RESERVE_ERROR;
+    }
+    if (sqlite3_exec(p->db, "SAVEPOINT ss_reserve;", NULL, NULL, NULL) != SQLITE_OK) {
+        free(info);
+        return PERSIST_RESERVE_ERROR;
+    }
+    int rc = PERSIST_RESERVE_OK;
+    sqlite3_stmt *sel = NULL, *ins = NULL;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid, node_index FROM signed_state_reservations "
+            "WHERE factory_id=? AND input_txid=? AND input_vout=? AND nsequence=?;",
+            -1, &sel, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(p->db,
+            "INSERT INTO signed_state_reservations "
+            "(factory_id, input_txid, input_vout, nsequence, node_index, txid) "
+            "VALUES (?, ?, ?, ?, ?, ?);", -1, &ins, NULL) != SQLITE_OK)
+        rc = PERSIST_RESERVE_ERROR;
+    for (size_t k = 0; rc == PERSIST_RESERVE_OK && k < info->n_inputs; k++) {
+        sqlite3_int64 nseq_key = any_nsequence ? -1 : (sqlite3_int64)info->prev_nseq[k];
+        sqlite3_reset(sel);
+        sqlite3_bind_int(sel, 1, (int)factory_id);
+        sqlite3_bind_text(sel, 2, info->prev_txid[k], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(sel, 3, (sqlite3_int64)info->prev_vout[k]);
+        sqlite3_bind_int64(sel, 4, nseq_key);
+        int step = sqlite3_step(sel);
+        if (step == SQLITE_ROW) {
+            const char *t = (const char *)sqlite3_column_text(sel, 0);
+            if (!t || strcasecmp(t, info->txid) != 0) {
+                fprintf(stderr, "persist: REFUSING to sign TX %s for node %u: "
+                        "%s:%u (nSequence %lld) is already reserved for TX %s "
+                        "(node %d), which may be fully signed by a peer\n",
+                        info->txid, node_idx, info->prev_txid[k],
+                        info->prev_vout[k], (long long)nseq_key,
+                        t ? t : "?", sqlite3_column_int(sel, 1));
+                rc = PERSIST_RESERVE_CONFLICT;
+            }
+            continue;
+        }
+        if (step != SQLITE_DONE) { rc = PERSIST_RESERVE_ERROR; break; }
+        sqlite3_reset(ins);
+        sqlite3_bind_int(ins, 1, (int)factory_id);
+        sqlite3_bind_text(ins, 2, info->prev_txid[k], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins, 3, (sqlite3_int64)info->prev_vout[k]);
+        sqlite3_bind_int64(ins, 4, nseq_key);
+        sqlite3_bind_int(ins, 5, (int)node_idx);
+        sqlite3_bind_text(ins, 6, info->txid, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(ins) != SQLITE_DONE) rc = PERSIST_RESERVE_ERROR;
+    }
+    if (sel) sqlite3_finalize(sel);
+    if (ins) sqlite3_finalize(ins);
+    if (rc == PERSIST_RESERVE_OK) {
+        if (sqlite3_exec(p->db, "RELEASE ss_reserve;", NULL, NULL, NULL) != SQLITE_OK) {
+            sqlite3_exec(p->db, "ROLLBACK TO ss_reserve; RELEASE ss_reserve;",
+                         NULL, NULL, NULL);
+            rc = PERSIST_RESERVE_ERROR;
+        }
+    } else {
+        sqlite3_exec(p->db, "ROLLBACK TO ss_reserve; RELEASE ss_reserve;",
+                     NULL, NULL, NULL);
+    }
+    free(info);
+    return rc;
 }
 
 int persist_has_factory(persist_t *p, uint32_t factory_id) {

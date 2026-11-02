@@ -44,6 +44,30 @@ void client_set_persist(persist_t *p) {
     g_client_persist = p;
 }
 
+/* Durably reserve node_idx's unsigned TX before this client releases a
+   signature on it (persist_reserve_signed_tx): once it is out, the LSP can
+   hold the fully signed state before the client has stored it, so after a
+   client restart that reloads the previous state the client must not sign a
+   different TX in the same position.  No DB: nothing to reserve.  Returns 1
+   if signing may go ahead. */
+static int client_reserve_node_tx(const factory_t *f, size_t node_idx,
+                                  uint32_t my_index) {
+    if (!g_client_persist) return 1;
+    if (!f || node_idx >= f->n_nodes) return 0;
+    const factory_node_t *node = &f->nodes[node_idx];
+    if (node->unsigned_tx.len == 0) return 0;
+    int any_nseq = node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY;
+    int rc = persist_reserve_signed_tx(g_client_persist, 0, (uint32_t)node_idx,
+                                       node->unsigned_tx.data,
+                                       node->unsigned_tx.len, any_nseq);
+    if (rc != PERSIST_RESERVE_OK)
+        fprintf(stderr, "Client %u: not signing node %zu: %s\n", my_index,
+                node_idx, rc == PERSIST_RESERVE_CONFLICT
+                    ? "a different TX was already signed in its position"
+                    : "could not record the TX before signing");
+    return rc == PERSIST_RESERVE_OK;
+}
+
 /* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
    If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
 static uint16_t g_min_profit_bps = 0;
@@ -3149,6 +3173,12 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
     }
     memset(my_seckey, 0, 32);
 
+    /* The LSP completes the state with this partial sig: reserve it first. */
+    if (!client_reserve_node_tx(factory, node_idx, my_index)) {
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
     /* Send REALLOC_PSIG (state + poison if prepared) */
     unsigned char my_psig_ser[32], my_poison_psig_ser[32];
     musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
@@ -4434,6 +4464,12 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
 
+    /* FINAL hands the LSP the complete new state: reserve it first. */
+    if (!client_reserve_node_tx(factory, node_idx, my_index)) {
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
     /* Step 8: ship FINAL with optional poison sig. */
     cJSON *fin_json = wire_build_leaf_advance_final(
         final_sig,
@@ -4977,6 +5013,17 @@ static int client_handle_state_advance_stateless(int fd,
     }
     /* INVARIANT: own state + poison secnonces zeroed by musig_create_partial_sig. */
     free(all_pn_flat_c);  /* all-signer nonce matrix no longer needed */
+
+    /* Our partial sigs let the LSP complete every node we sign: reserve
+       them first. */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!my_signs_per_node[k]) continue;
+        if (!client_reserve_node_tx(factory, affected[k], my_index)) {
+            for (size_t j = 0; j < n_affected; j++)
+                if (poison_prepared_c[j]) factory_session_reset_poison(factory, affected[j]);
+            return 0;
+        }
+    }
 
     /* Step 9: send CLIENT_FINAL_PSIGS. */
     cJSON *fp = wire_build_state_adv_client_final_psigs(

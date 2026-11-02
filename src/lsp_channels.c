@@ -297,6 +297,33 @@ static int lsp_persist_advanced_subfactory(lsp_channel_mgr_t *mgr, factory_t *f,
     return ok;
 }
 
+/* Durably reserve node_idx's unsigned TX before the LSP releases a signature
+   on it (persist_reserve_signed_tx).  Once the LSP's partial sig is out, the
+   counterparty can hold the fully signed state before the LSP has stored it;
+   after a restart that reloads the previous state, the LSP must not sign a
+   different TX in the same position (the same nSequence of a DW node, or
+   another spend of the same PS chain output), only the identical one.
+   Without a DB nothing survives a restart, so nothing is reserved.  Returns 1
+   if signing may go ahead. */
+static int lsp_reserve_node_tx(lsp_channel_mgr_t *mgr, factory_t *f,
+                               size_t node_idx) {
+    if (!mgr || !mgr->persist) return 1;
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (node->unsigned_tx.len == 0) return 0;
+    int any_nseq = node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY;
+    int rc = persist_reserve_signed_tx((persist_t *)mgr->persist, 0,
+                                       (uint32_t)node_idx,
+                                       node->unsigned_tx.data,
+                                       node->unsigned_tx.len, any_nseq);
+    if (rc != PERSIST_RESERVE_OK)
+        fprintf(stderr, "LSP: not signing node %zu: %s\n", node_idx,
+                rc == PERSIST_RESERVE_CONFLICT
+                    ? "a different TX was already signed in its position"
+                    : "could not record the TX before signing");
+    return rc == PERSIST_RESERVE_OK;
+}
+
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
                        const factory_t *factory,
@@ -1862,6 +1889,13 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         leaf_poison_prepared = 0;
     }
 
+    /* Reserve the new state durably before our partial sig goes out: with
+       it the client can complete the state before we have stored it. */
+    if (!lsp_reserve_node_tx(mgr, f, node_idx)) {
+        factory_session_reset_poison(f, node_idx);
+        return 0;
+    }
+
     /* Step 7: ship LSP_RESPONSE with optional poison fields. */
     unsigned char lsp_poison_pubnonce_ser[66], lsp_poison_psig_ser[32];
     if (leaf_poison_prepared) {
@@ -2703,6 +2737,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
 
+    /* Reserve every re-signed node durably before our partial sigs go out
+       (see lsp_reserve_node_tx). */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!lsp_reserve_node_tx(mgr, f, affected[k])) {
+            for (size_t j = 0; j < n_affected; j++)
+                if (poison_prepared[j]) factory_session_reset_poison(f, affected[j]);
+            return 0;
+        }
+    }
+
     /* Step 7: Send LSP_RESPONSE with per-node pubnonces + psigs to all clients.
        Gap A: also forward EVERY signer's pubnonce per node (from the session,
        which holds all collected nonces) so each client can build the aggnonce
@@ -3465,6 +3509,15 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         realloc_poison_prepared = 0;
     }
 
+    /* The LSP aggregates a realloc itself, but a different TX in a position
+       already reserved (a state the client may hold fully signed) must not
+       be signed either. */
+    if (!lsp_reserve_node_tx(mgr, f, node_idx)) {
+        memset(lsp_seckey, 0, 32);
+        factory_session_reset_poison(f, node_idx);
+        return 0;
+    }
+
     /* Step 9: Create LSP's partial sigs (state + poison if prepared). */
     secp256k1_keypair lsp_kp;
     if (!secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey)) {
@@ -4165,6 +4218,14 @@ static int lsp_subfactory_chain_advance_stateless_multi(
 
     memset(lsp_seckey, 0, 32);
     free(lsp_secnonces);  /* all entries already zeroed by create_partial_sig */
+
+    /* Reserve the new chain TX durably before our partial sigs go out. */
+    if (!lsp_reserve_node_tx(mgr, f, sub_node_i)) {
+        free(lsp_pn_ser); free(lsp_psig_ser);
+        free(all_pn_per_input);
+        factory_session_reset_poison(f, sub_node_i);
+        return 0;
+    }
 
     /* Build flat per-input LSP arrays for the wire response. */
     unsigned char *lsp_pn_flat = calloc(n_inputs, 66);
@@ -4889,6 +4950,12 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         }
     } else {
         memset(&lsp_poison_secnonce, 0, sizeof(lsp_poison_secnonce));
+    }
+
+    /* Reserve the new chain TX durably before our partial sig goes out. */
+    if (!lsp_reserve_node_tx(mgr, f, sub_node_i)) {
+        factory_session_reset_poison(f, sub_node_i);
+        return 0;
     }
 
     /* Step 6: send LSP_RESPONSE to each client (per-client copy so each can

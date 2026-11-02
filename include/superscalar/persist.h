@@ -25,7 +25,8 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations.
-   43 adds tree_node_lstock (persist.c, the v43 step).  Versions 40-42 are taken by changes on other branches; every one of
+   43 adds tree_node_lstock and signed_state_reservations (persist.c, the v43
+   step).  Versions 40-42 are taken by changes on other branches; every one of
    those steps, and this one, creates its tables whenever they are missing, so
    the steps run correctly in any merge order.  When the branches are merged
    the version is the maximum of the bumps (43). */
@@ -309,6 +310,30 @@ int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
                                     const unsigned char parent_txid[32],
                                     uint32_t parent_vout,
                                     unsigned char out_sighash[32]);
+
+/* --- Signed-state reservations (v43) ---
+
+   Before a signer releases a signature on a factory-tree TX (the LSP's
+   partial sig in an advance ceremony, a client's partial or final sig), it
+   records the TX here, durably.  A different TX in the same position is
+   then refused, also after a restart that reloads the previous state.  The
+   position is each input of the TX plus its nSequence for a DW node (states
+   of a DW node spend the same parent and differ by nSequence), or the input
+   alone for a pseudo-Spilman chain TX (any second spend of a chain output is
+   a conflict).  The same TX (same txid) may be signed again.
+
+   Must be called outside a transaction (the row has to be on disk before the
+   signature leaves).  Returns PERSIST_RESERVE_OK when the TX is recorded or
+   was already recorded, PERSIST_RESERVE_CONFLICT when a different TX holds
+   one of its positions (nothing is written), PERSIST_RESERVE_ERROR on any
+   other failure.  Callers must not sign unless the result is OK. */
+#define PERSIST_RESERVE_ERROR    (-1)
+#define PERSIST_RESERVE_CONFLICT   0
+#define PERSIST_RESERVE_OK         1
+int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
+                              uint32_t node_idx,
+                              const unsigned char *unsigned_tx, size_t tx_len,
+                              int any_nsequence);
 
 /* Record a freshly-generated partial signature for a PS advance input.
    Call AFTER signing, BEFORE sending the PSIG to the LSP, so a crash
