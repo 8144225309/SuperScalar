@@ -123,6 +123,22 @@ ladder_factory_t *ladder_get_dying(ladder_t *lad)
     return NULL;
 }
 
+int ladder_factory_store_distribution_tx(ladder_factory_t *lf, const factory_t *f)
+{
+    if (!lf) return 0;
+    tx_buf_free(&lf->distribution_tx);
+    tx_buf_init(&lf->distribution_tx, 256);
+    if (!f || f->dist_tx_ready != 2 || f->dist_signed_tx.len == 0 ||
+        !f->dist_signed_tx.data)
+        return 0;
+    tx_buf_free(&lf->distribution_tx);
+    tx_buf_init(&lf->distribution_tx, f->dist_signed_tx.len);
+    if (!lf->distribution_tx.data) return 0;
+    memcpy(lf->distribution_tx.data, f->dist_signed_tx.data, f->dist_signed_tx.len);
+    lf->distribution_tx.len = f->dist_signed_tx.len;
+    return 1;
+}
+
 ladder_factory_t *ladder_get_by_id(ladder_t *lad, uint32_t factory_id)
 {
     for (size_t i = 0; i < lad->n_factories; i++) {

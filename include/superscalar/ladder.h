@@ -63,6 +63,14 @@ int ladder_advance_block(ladder_t *lad, uint32_t new_block);
 /* Get factory by state. Returns NULL if none found. */
 ladder_factory_t *ladder_get_active(ladder_t *lad);
 ladder_factory_t *ladder_get_dying(ladder_t *lad);
+
+/* Store f's distribution TX in the slot for the LSP's auto-broadcast at
+   EXPIRED -- ONLY the fully co-signed copy (f->dist_tx_ready == 2,
+   f->dist_signed_tx).  On the LSP f->dist_unsigned_tx has an empty witness and
+   every node rejects it, so without a signed copy the slot is left empty
+   (auto-broadcast skipped; clients keep their own signed copy).  Replaces any
+   previous contents.  Returns 1 if a signed TX was stored. */
+int ladder_factory_store_distribution_tx(ladder_factory_t *lf, const factory_t *f);
 ladder_factory_t *ladder_get_by_id(ladder_t *lad, uint32_t factory_id);
 
 /* Record that a client departed via PTLC key turnover. */

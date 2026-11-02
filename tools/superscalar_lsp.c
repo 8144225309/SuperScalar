@@ -4293,18 +4293,18 @@ accept_new_factory:
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
-        /* Copy signed distribution TX from ceremony (if available) */
-        tx_buf_init(&lf->distribution_tx, 256);
-        if (lsp_p->factory.dist_tx_ready && lsp_p->factory.dist_unsigned_tx.len > 0) {
-            /* dist_unsigned_tx holds the signed version after ceremony */
-            tx_buf_free(&lf->distribution_tx);
-            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_unsigned_tx.len);
-            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_unsigned_tx.data,
-                   lsp_p->factory.dist_unsigned_tx.len);
-            lf->distribution_tx.len = lsp_p->factory.dist_unsigned_tx.len;
-            printf("LSP: distribution TX stored (%zu bytes)\n",
+        /* Store the SIGNED distribution TX for the auto-broadcast at EXPIRED.
+           On the LSP the co-signed copy is dist_signed_tx (dist_tx_ready == 2);
+           dist_unsigned_tx has an empty witness and every node rejects it.
+           (Only the CLIENT keeps the signed bytes in dist_unsigned_tx, after
+           parsing FACTORY_READY.)  Same rule as the rotation path. */
+        if (ladder_factory_store_distribution_tx(lf, &lsp_p->factory))
+            printf("LSP: distribution TX stored (signed, %zu bytes)\n",
                    lf->distribution_tx.len);
-        }
+        else
+            printf("LSP: no signed distribution TX (dist_tx_ready=%d) — "
+                   "auto-broadcast at EXPIRED disabled for this factory\n",
+                   lsp_p->factory.dist_tx_ready);
         lad->n_factories = 1;
     }
     printf("LSP: ladder initialized (factory 0 at slot 0, state=%d)\n",

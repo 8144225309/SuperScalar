@@ -307,3 +307,89 @@ int test_rotation_creation_preflight(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* Bug B: the ladder slot's distribution TX (what the LSP auto-broadcasts at
+   EXPIRED) must be the co-signed one.  dist_unsigned_tx carries an empty
+   witness -- bitcoind: "Witness program was passed an empty witness". */
+int test_ladder_distribution_tx_signed_only(void) {
+    secp256k1_context *ctx = rc_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], rc_seckeys[i]), "keypair");
+    unsigned char spk[34];
+    secp256k1_xonly_pubkey fund_key;
+    TEST_ASSERT(rc_funding_spk(ctx, kps, spk, &fund_key), "funding spk");
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0x5E, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    TEST_ASSERT(factory_init(f, ctx, kps, 5, 2, 4), "factory_init");
+    factory_set_funding(f, fake_txid, 0, 200000, spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    tx_output_t outs[6];
+    size_t n_out = factory_compute_distribution_outputs_balanced(f, outs, 6, 500, NULL, 0);
+    TEST_ASSERT(n_out > 0, "dist outputs");
+    TEST_ASSERT(factory_build_distribution_tx_unsigned(f, outs, n_out, 5000), "unsigned dist");
+    TEST_ASSERT(f->dist_tx_ready == 1, "dist_tx_ready == 1 (unsigned only)");
+
+    ladder_factory_t *lf = calloc(1, sizeof(ladder_factory_t));
+    TEST_ASSERT(lf, "alloc slot");
+    /* Unsigned only: nothing is stored (an unrelayable TX must never be). */
+    TEST_ASSERT(ladder_factory_store_distribution_tx(lf, f) == 0, "unsigned not stored");
+    TEST_ASSERT(lf->distribution_tx.len == 0, "slot empty with only an unsigned TX");
+
+    /* Co-sign it the way the stateless ceremony does (each party separately). */
+    TEST_ASSERT(factory_session_init_dist(f), "init dist session");
+    secp256k1_musig_secnonce sn[5];
+    for (size_t j = 0; j < 5; j++) {
+        unsigned char sk[32];
+        secp256k1_pubkey pk;
+        secp256k1_musig_pubnonce pn;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, sk, &kps[j]) &&
+                    secp256k1_keypair_pub(ctx, &pk, &kps[j]), "keys");
+        TEST_ASSERT(musig_generate_nonce(ctx, &sn[j], &pn, sk, &pk,
+                                         &f->nodes[0].keyagg.cache), "nonce");
+        memset(sk, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce_dist(f, j, &pn), "set nonce");
+    }
+    TEST_ASSERT(factory_session_finalize_dist(f), "finalize dist");
+    for (size_t j = 0; j < 5; j++) {
+        secp256k1_musig_partial_sig ps;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &ps, &sn[j], &kps[j],
+                                             &f->dist_signing_session), "psig");
+        TEST_ASSERT(factory_session_set_partial_sig_dist(f, j, &ps), "set psig");
+    }
+    TEST_ASSERT(factory_session_complete_dist(f), "complete dist");
+    TEST_ASSERT(f->dist_tx_ready == 2, "dist_tx_ready == 2 (signed)");
+
+    TEST_ASSERT(ladder_factory_store_distribution_tx(lf, f) == 1, "signed stored");
+    const tx_buf_t *d = &lf->distribution_tx;
+    TEST_ASSERT(d->len == f->dist_signed_tx.len &&
+                memcmp(d->data, f->dist_signed_tx.data, d->len) == 0,
+                "slot holds exactly dist_signed_tx");
+    TEST_ASSERT(d->len != f->dist_unsigned_tx.len ||
+                memcmp(d->data, f->dist_unsigned_tx.data, d->len) != 0,
+                "slot does NOT hold dist_unsigned_tx");
+    /* Segwit serialization with a 1-item, 64-byte key-path witness right
+       before nLockTime, valid against the funding output key. */
+    TEST_ASSERT(d->len >= 80 && d->data[4] == 0x00 && d->data[5] == 0x01,
+                "segwit marker/flag present");
+    TEST_ASSERT(d->data[d->len - 70] == 0x01 && d->data[d->len - 69] == 0x40,
+                "witness present: 1 item of 64 bytes");
+    TEST_ASSERT(secp256k1_schnorrsig_verify(ctx, d->data + d->len - 68,
+                                            f->dist_sighash, 32, &fund_key) == 1,
+                "stored distribution TX signature verifies");
+
+    /* Replacing: a later factory with only an unsigned TX clears the slot. */
+    f->dist_tx_ready = 1;
+    TEST_ASSERT(ladder_factory_store_distribution_tx(lf, f) == 0 &&
+                lf->distribution_tx.len == 0, "slot cleared when no signed TX");
+
+    tx_buf_free(&lf->distribution_tx);
+    free(lf);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

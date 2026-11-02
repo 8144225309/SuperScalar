@@ -1052,14 +1052,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
            auto-broadcast) rather than broadcast an invalid tx. Offline clients still
            hold their own co-signed copy (wire.c ships dist_signed_tx), so fund safety
            is unaffected either way. */
-        tx_buf_init(&lf_new->distribution_tx, 256);
-        if (lsp->factory.dist_tx_ready == 2 && lsp->factory.dist_signed_tx.len > 0) {
-            tx_buf_free(&lf_new->distribution_tx);
-            tx_buf_init(&lf_new->distribution_tx, lsp->factory.dist_signed_tx.len);
-            memcpy(lf_new->distribution_tx.data, lsp->factory.dist_signed_tx.data,
-                   lsp->factory.dist_signed_tx.len);
-            lf_new->distribution_tx.len = lsp->factory.dist_signed_tx.len;
-        }
+        (void)ladder_factory_store_distribution_tx(lf_new, &lsp->factory);
         lad->n_factories++;
     } else {
         fprintf(stderr, "LSP rotate: no ladder slots available\n");
