@@ -283,16 +283,57 @@ Backup format (v2): `[magic][version][salt][iterations][nonce][ciphertext][tag]`
 
 Schedule regular backups in production. Keep backups on a separate machine.
 
+**Never restore an old backup of the DB of a live factory.** A backup holds
+the factory's states as of the moment it was taken. Every advance since then
+superseded one of them and revealed the L-stock secret of the superseded
+state to the clients. A restored DB passes the restart checks (each stored
+node is consistent with the others, just old), so the LSP serves it, and a
+force-close from it publishes states whose secrets the clients hold: they can
+spend the LSP's L-stock outputs and publish the newer states they have. Use a
+backup only for a factory that never advanced after it was taken, or to
+recover keys and settled funds; never to resume a factory's tree state.
+
 ## 7. Crash Recovery
 
 If the LSP process crashes (power failure, OOM, etc.):
 
 1. Restart with the **same `--seckey`** (or `--keyfile`) and **same `--db`** path
-2. The LSP loads factory state, channel balances, and pending HTLCs from the database
+2. The LSP loads factory state, channel balances, and pending HTLCs from the database.
+   It rebuilds the factory's signed tree from the stored rows and checks it
+   (every node signed and spending its stored parent, the DW counter matching
+   every node's nSequence, Pseudo-Spilman chains of the current epoch, the
+   L-stock state counters). If a check fails, the log says so and leaf
+   advances, reallocs and root advances stay refused for that factory;
+   payments still settle and force-close still works from the DB.
 3. Clients detect the disconnect and reconnect automatically (5s retry loop)
 4. After reconnection, pending HTLCs are replayed and normal operation resumes
 
 Without `--db`, crash recovery is not possible — you'll need to wait for CLTV timeout.
+
+### A root advance a client did not complete (frozen factory)
+
+In a root advance (Tier B) the LSP releases its signatures for the new epoch
+before every client has returned its final partial signatures. If a client
+withholds them (or the LSP stops at that point), that client may hold the new
+epoch fully signed, and it would supersede anything signed at the old epoch.
+So until the same root advance completes, the factory refuses leaf advances,
+reallocs and sub-factory advances (it is "frozen"); payments keep settling,
+and the distribution TX still pays everyone at the CLTV.
+
+- The LSP records the clients whose final psigs did not arrive, and re-drives
+  the same root advance on the next leaf-advance request or root tick, at most
+  once per block. A client that crashed after signing catches up on its next
+  reconnect.
+- `--freeze-max-blocks N` (default: half the dying window, or 144 blocks):
+  after N blocks frozen, the LSP logs `CRITICAL` with the withholding clients
+  and the blocks left to expiry, and `listfactories` shows
+  `root_advance_pending` with `"escalated": true`.
+- `--freeze-force-close` (default **off**): also start the factory's
+  force-close at that point. It is off because with it on, any single client
+  could push the whole factory on-chain, at everyone's expense, just by
+  withholding its signatures. Leaving the factory frozen is safe. Decide
+  yourself whether to publish (`recoverfactory`), knowing which clients
+  withheld; they are recorded so a later rotation can leave them out.
 
 ### Publishing a factory tree from the DB (`recoverfactory`)
 

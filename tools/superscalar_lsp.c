@@ -71,6 +71,8 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 #include <pthread.h>
 
 static volatile sig_atomic_t g_shutdown = 0;
+static uint32_t g_freeze_max_blocks = 0;   /* --freeze-max-blocks (0 = default) */
+static int g_freeze_force_close = 0;       /* --freeze-force-close */
 static lsp_t *g_lsp = NULL;  /* for signal handler cleanup */
 static persist_t *g_db = NULL;  /* for broadcast audit logging */
 /* SF-WT-TRUSTLESS Phase 1b (#248): optional watchtower-side DB.
@@ -313,6 +315,11 @@ static void usage(const char *prog) {
         "                       128-client deployment is --arity 2,4,8 --static-near-root 2\n"
         "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
+        "  --freeze-max-blocks N  A root advance a client did not complete freezes leaf\n"
+        "                      operations; after N blocks (default: half the dying window)\n"
+        "                      log CRITICAL with the withholding clients\n"
+        "  --freeze-force-close  Then also start the factory force-close (default off: any\n"
+        "                      one client could otherwise force the factory on-chain)\n"
         "  --force-close-from-db  With --db, for a factory stuck in 'closing' (its signed\n"
         "                      cooperative close does not confirm): publish the signed\n"
         "                      factory tree from the DB (one pass; re-run each block)\n"
@@ -1878,6 +1885,10 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--force-close") == 0)
             force_close = 1;
+        else if (strcmp(argv[i], "--freeze-max-blocks") == 0 && i + 1 < argc)
+            g_freeze_max_blocks = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--freeze-force-close") == 0)
+            g_freeze_force_close = 1;
         else if (strcmp(argv[i], "--force-close-from-db") == 0)
             force_close_from_db = 1;
         else if (strcmp(argv[i], "--test-burn") == 0)
@@ -3163,15 +3174,26 @@ int main(int argc, char *argv[]) {
                 lsp_rp->enable_hashlock_poison = 1;
                 printf("LSP recovery: hashlock L-stock poison RE-ENABLED "
                        "(seed re-derived deterministically from LSP key)\n");
+                /* The reloaded L-stock state counters must agree with the
+                   seed and with the stored L-stock outputs; otherwise the
+                   next advance could commit to a secret already revealed. */
+                if (!lsp_rp->factory.tree_rebuilt_on_load &&
+                    !factory_verify_l_stock_state(&lsp_rp->factory)) {
+                    lsp_rp->factory.tree_rebuilt_on_load = 1;
+                    fprintf(stderr, "LSP recovery: the reloaded L-stock state "
+                            "does not match the seed; advances are refused\n");
+                }
             }
 
-            /* persist_load_factory restored the DW counter (layer states,
-               epoch, per-leaf states) from dw_counter_state. */
             printf("LSP recovery: DW counter at epoch %u\n",
                    dw_counter_epoch(&lsp_rp->factory.counter));
-            fprintf(stderr, "LSP recovery: the factory tree is rebuilt at its "
-                    "initial state, not reloaded: leaf advances, reallocs and "
-                    "root advances on it are refused (payments still settle)\n");
+            if (lsp_rp->factory.tree_rebuilt_on_load)
+                fprintf(stderr, "LSP recovery: the signed tree could not be "
+                        "reloaded and verified: leaf advances, reallocs and "
+                        "root advances are refused (payments still settle)\n");
+            else
+                printf("LSP recovery: signed tree reloaded and verified; "
+                       "advances allowed\n");
 
             /* Set factory lifecycle from current block height */
             {
@@ -3497,6 +3519,8 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            mgr->freeze_max_blocks = g_freeze_max_blocks;
+            mgr->freeze_force_close = g_freeze_force_close;
             lsp_channels_run_daemon_loop(mgr, lsp_rp, &g_shutdown);
 
             /* Persist updated channel balances on shutdown */
@@ -4756,6 +4780,8 @@ accept_new_factory:
             if (g_admin_rpc.listen_fd >= 0)
                 mgr->admin_rpc = &g_admin_rpc;
 
+            mgr->freeze_max_blocks = g_freeze_max_blocks;
+            mgr->freeze_force_close = g_freeze_force_close;
             lsp_channels_run_daemon_loop(mgr, lsp_p, &g_shutdown);
         }
 

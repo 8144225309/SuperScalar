@@ -224,6 +224,20 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    Joins the caller's transaction if one is open.  Returns 1 on success. */
 int client_persist_exit_state(persist_t *db, const factory_t *f);
 
+/* Apply a MSG_TREE_CATCHUP to a factory frozen on a pending root advance:
+   rebuild the pending epoch locally (the one step the freeze allows), then
+   accept the received tree only if it covers every node, each TX is the
+   locally rebuilt unsigned TX with a signature, the TX of every node this
+   client re-signed in that advance is the one it reserved, no TX conflicts
+   with a reservation, and every signature verifies (factory_verify_all).
+   Then the tree is stored (client_persist_exit_state, which clears the
+   mark) and 1 is returned.  Anything else, including a store failure,
+   reloads the factory from db (still frozen) and returns 0: nothing is
+   applied partially.  Returns -1 if that reload fails: f is then empty and
+   the caller must stop using it (the reconnect aborts). */
+int client_apply_tree_catchup(factory_t *f, persist_t *db, const cJSON *json,
+                              uint32_t my_index);
+
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory,

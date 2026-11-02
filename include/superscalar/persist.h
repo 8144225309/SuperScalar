@@ -24,8 +24,13 @@ typedef struct {
     unsigned pq_attempt_n;
 } persist_t;
 
-/* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+/* Current schema version. Bump when adding migrations.
+   43 adds tree_node_lstock, signed_state_reservations, root_advance_pending
+   and root_advance_trees (persist.c, the v43 step).  Versions 40-42 are taken by changes on other branches; every one of
+   those steps, and this one, creates its tables whenever they are missing, so
+   the steps run correctly in any merge order.  When the branches are merged
+   the version is the maximum of the bumps (43). */
+#define PERSIST_SCHEMA_VERSION 43
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -195,7 +200,13 @@ int persist_load_pending_l_stock_poison(persist_t *p, uint32_t factory_id,
                                         uint32_t *node_out, uint32_t *state_out,
                                         size_t max, size_t *n_out);
 
-/* Load all PS chain entries for a leaf in chain_pos order.
+/* Load the PS chain entries of a leaf's CURRENT epoch in chain_pos order.
+   The epoch is that of the leaf's chain[0] row in ps_initial_signed_states
+   Rows of other epochs (left over from before a root rollover) are skipped,
+   and the chain stops at the first row that is not contiguous or does not
+   spend the previous entry (chain[0] for the first), so a stale tail is
+   never taken as the tip.  With no such row (a DB from before that table)
+   the rows are taken as stored, contiguous from position 0.
    chain_txs_out: caller-allocated tx_buf_t[max_chain] (caller must free each on success).
    txids_out: caller-allocated [max_chain][32] internal-order txids.
    amounts_out: caller-allocated uint64_t[max_chain] channel amounts; may be NULL.
@@ -228,7 +239,8 @@ int persist_save_subfactory_chain_entry(persist_t *p, uint32_t factory_id,
                                           const unsigned char *poison_tx,
                                           size_t poison_tx_len);
 
-/* Load all sub-factory chain entries for a sub-factory node in chain_pos order.
+/* Load the sub-factory chain entries of the node's CURRENT epoch in chain_pos
+   order, with the same epoch filter and linkage rule as persist_load_ps_chain.
    chain_txs_out: caller-allocated tx_buf_t[max_chain].
    txids_out: caller-allocated [max_chain][32] internal-order txids.
    sales_stock_out: caller-allocated uint64_t[max_chain] sales-stock amounts.
@@ -298,6 +310,85 @@ int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
                                     const unsigned char parent_txid[32],
                                     uint32_t parent_vout,
                                     unsigned char out_sighash[32]);
+
+/* --- Signed-state reservations (v43) ---
+
+   Before a signer releases a signature on a factory-tree TX (the LSP's
+   partial sig in an advance ceremony, a client's partial or final sig), it
+   records the TX here, durably.  A different TX in the same position is
+   then refused, also after a restart that reloads the previous state.  The
+   position is each input of the TX plus its nSequence for a DW node (states
+   of a DW node spend the same parent and differ by nSequence), or the input
+   alone for a pseudo-Spilman chain TX (any second spend of a chain output is
+   a conflict).  The same TX (same txid) may be signed again.
+
+   Must be called outside a transaction (the row has to be on disk before the
+   signature leaves).  Returns PERSIST_RESERVE_OK when the TX is recorded or
+   was already recorded, PERSIST_RESERVE_CONFLICT when a different TX holds
+   one of its positions (nothing is written), PERSIST_RESERVE_ERROR on any
+   other failure.  Callers must not sign unless the result is OK. */
+/* A root advance (Tier B) to `epoch` whose signatures this side released
+   before storing it (see factory_t.root_advance_pending_epoch).  Set
+   outside a transaction (durable before the signatures leave); cleared, in
+   the transaction that stores the completed epoch, for epochs <= upto.
+   Load: 1 found, 0 none, -1 error. */
+int persist_set_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                     uint32_t epoch, int trigger_leaf);
+int persist_clear_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                       uint32_t upto_epoch);
+int persist_load_root_advance_pending(persist_t *p, uint32_t factory_id,
+                                      uint32_t *epoch_out, int *trigger_out);
+
+/* Bookkeeping of a pending root advance (LSP), kept with its mark (all reset
+   when a new epoch is marked): the clients whose final psigs did not arrive
+   (comma-separated participant indices), the height the freeze was first
+   seen at, the height of the last re-drive, and whether the freeze limit was
+   escalated.  Load returns 1 found, 0 none, -1 error. */
+typedef struct {
+    uint32_t epoch;
+    int trigger_leaf;
+    char withholders[256];
+    uint32_t since_height;
+    uint32_t last_redrive_height;
+    int escalated;
+} persist_root_advance_status_t;
+int persist_load_root_advance_status(persist_t *p, uint32_t factory_id,
+                                     persist_root_advance_status_t *out);
+int persist_set_root_advance_withholders(persist_t *p, uint32_t factory_id,
+                                         const char *csv);
+int persist_set_root_advance_heights(persist_t *p, uint32_t factory_id,
+                                     uint32_t since_height,
+                                     uint32_t last_redrive_height);
+int persist_set_root_advance_escalated(persist_t *p, uint32_t factory_id);
+
+/* The signed tree of the last completed root advance, for a client that
+   signed it but did not store it (MSG_TREE_CATCHUP).  Saved in the
+   transaction that stores the advance; only a tree with every node signed is
+   saved (otherwise nothing, and no catch-up is offered).  Returns 0 only on
+   a DB error. */
+int persist_save_root_advance_tree(persist_t *p, uint32_t factory_id,
+                                   uint32_t epoch, const factory_t *f);
+/* Load it: hex_out[i] (malloc'd, caller frees) for node i < n_nodes.
+   Returns 1 when every node has a row of that epoch, 0 otherwise. */
+int persist_load_root_advance_tree(persist_t *p, uint32_t factory_id,
+                                   uint32_t epoch, size_t n_nodes,
+                                   char **hex_out);
+
+/* Whether a TX is the one reserved for its positions: 1 every input is
+   reserved for this txid, 0 none is reserved, PERSIST_RESERVE_CONFLICT_FOUND
+   one is reserved for another TX, -1 error (or only some inputs). */
+#define PERSIST_RESERVE_CONFLICT_FOUND (-2)
+int persist_lookup_reserved_tx(persist_t *p, uint32_t factory_id,
+                               const unsigned char *unsigned_tx, size_t tx_len,
+                               int any_nsequence);
+
+#define PERSIST_RESERVE_ERROR    (-1)
+#define PERSIST_RESERVE_CONFLICT   0
+#define PERSIST_RESERVE_OK         1
+int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
+                              uint32_t node_idx,
+                              const unsigned char *unsigned_tx, size_t tx_len,
+                              int any_nsequence);
 
 /* Record a freshly-generated partial signature for a PS advance input.
    Call AFTER signing, BEFORE sending the PSIG to the LSP, so a crash

@@ -756,7 +756,7 @@ static void *ex_client_thread(void *arg) {
     ex_client_t *c = (ex_client_t *)arg;
     int done = 0;
     c->ok = 1;
-    while (done < c->n_expected) {
+    while (c->n_expected < 0 || done < c->n_expected) {
         wire_msg_t msg;
         memset(&msg, 0, sizeof(msg));
         if (!wire_recv(c->fd, &msg)) { c->ok = 0; break; }
@@ -775,6 +775,17 @@ static void *ex_client_thread(void *arg) {
                 done++;
             else
                 c->ok = 0;
+        } else if (msg.msg_type == MSG_STATE_ADV_PROPOSE_INTENT ||
+                   msg.msg_type == MSG_STATE_ADVANCE_PROPOSE) {
+            /* Tier B rollover: the stateless handler runs the whole re-sign
+               ceremony; PATH_SIGN_DONE follows as a separate message. */
+            if (client_handle_state_advance(c->fd, c->ctx, &c->kp, c->f,
+                                            c->my_index, &pm))
+                done++;
+            else
+                c->ok = 0;
+        } else if (msg.msg_type == MSG_PATH_SIGN_DONE) {
+            /* end-of-Tier-B notification; nothing to sign */
         }
         if (msg.json) cJSON_Delete(msg.json);
         if (!c->ok) break;
@@ -1421,11 +1432,14 @@ typedef struct {
     persist_t db;
     int db_open;
     char path[256];
+    persist_t cdb;                  /* a client-side DB (no dw_counter_state) */
+    int cdb_open;
+    char cpath[256];
     int sv[2];
 } ex_rig_t;
 
-static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
-                       int hashlocked_l_stock) {
+static int ex_rig_init_ex(ex_rig_t *r, factory_arity_t arity, const char *tag,
+                          int hashlocked_l_stock, uint32_t states) {
     static const unsigned char seed[32] = {
         0x5e, 0xed, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
         0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
@@ -1442,9 +1456,9 @@ static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
     r->cf = calloc(1, sizeof(factory_t));
     int ok = r->lsp && r->cf && lsp_init(r->lsp, r->ctx, &r->kps[0], 0, 2) &&
              ex_build_factory(r->ctx, &r->lsp->factory, r->kps, 3, arity,
-                              r->fund_txid, 0, 1000000, r->spk, 2, 4, 1) &&
+                              r->fund_txid, 0, 1000000, r->spk, 2, states, 1) &&
              ex_build_factory(r->ctx, r->cf, r->kps, 3, arity, r->fund_txid, 0,
-                              1000000, r->spk, 2, 4, 1);
+                              1000000, r->spk, 2, states, 1);
     g_ex_seed = NULL;
     if (!ok) return 0;
     ex_db_path(r->path, sizeof(r->path), tag);
@@ -1452,6 +1466,13 @@ static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
     r->db_open = 1;
     if (arity == FACTORY_ARITY_PS)
         lsp_persist_ps_chain0_all(&r->db, &r->lsp->factory);
+    ex_db_path(r->cpath, sizeof(r->cpath), tag);
+    strncat(r->cpath, "c", sizeof(r->cpath) - strlen(r->cpath) - 1);
+    if (!persist_open(&r->cdb, r->cpath) ||
+        !persist_save_factory(&r->cdb, r->cf, r->ctx, 0) ||
+        !client_persist_exit_state(&r->cdb, r->cf))
+        return 0;
+    r->cdb_open = 1;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, r->sv) != 0) return 0;
     struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
     setsockopt(r->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1473,14 +1494,38 @@ static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
     return 1;
 }
 
+static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
+                       int hashlocked_l_stock) {
+    return ex_rig_init_ex(r, arity, tag, hashlocked_l_stock, 4);
+}
+
 static void ex_rig_free(ex_rig_t *r) {
     if (r->lsp) { lsp_cleanup(r->lsp); free(r->lsp); }
     if (r->sv[1] >= 0) close(r->sv[1]);
     if (r->cf) { factory_free(r->cf); free(r->cf); }
     if (r->mgr) { free(r->mgr->entries); free(r->mgr); }
     if (r->db_open) persist_close(&r->db);
+    if (r->cdb_open) persist_close(&r->cdb);
     if (r->path[0]) unlink(r->path);
+    if (r->cpath[0]) unlink(r->cpath);
     if (r->ctx) secp256k1_context_destroy(r->ctx);
+}
+
+/* Drive one real LSP leaf/PS/Tier-B advance of leaf 0 against a one-shot
+   client thread, then persist the client's resulting view to the client DB.
+   Returns the lsp_channels_advance_ps_leaf rc. */
+static int ex_rig_ps_advance(ex_rig_t *r, int *client_ok) {
+    ex_client_t cl = { .fd = r->sv[1], .ctx = r->ctx, .kp = r->kps[1],
+                       .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    pthread_t th;
+    if (pthread_create(&th, NULL, ex_client_thread, &cl) != 0) return 0;
+    int rc = lsp_channels_advance_ps_leaf(r->mgr, r->lsp, 0);
+    if (rc != 1) shutdown(r->sv[0], SHUT_RDWR);
+    pthread_join(th, NULL);
+    *client_ok = cl.ok;
+    if (rc == 1 && r->cdb_open)
+        client_persist_exit_state(&r->cdb, r->cf);
+    return rc;
 }
 
 /* Run the LSP's real realloc ceremony for leaf 0 against the client thread. */
@@ -1571,9 +1616,8 @@ int test_exit_ps_realloc_refused_leaf_unchanged(void) {
 /* A PS realloc writes its chain entry: a force-close from the DB publishes
    the reallocated state, and persist_load_factory restores the chain at its
    full length with the reallocated tip, so the next chain TX is built on
-   chain[1] rather than being a second, conflicting chain[1].  (A factory
-   restored from the DB refuses advances for now, so only the restored chain
-   is checked here.) */
+   chain[1] rather than being a second, conflicting chain[1].  (Advancing a
+   reloaded factory is covered by the test_reload_* tests.) */
 int test_exit_ps_realloc_persists_chain_entry(void) {
     ex_rig_t r;
     TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_PS, "psrealloc", 0), "rig");
@@ -1836,5 +1880,1821 @@ int test_exit_closing_stops_daemon_loop(void) {
     TEST_ASSERT(rc == 1 && time(NULL) - t0 < 30,
                 "daemon loop returned without a shutdown request");
     ex_rig_free(&r);
+    return 1;
+}
+
+/* A consistent signed tree reloads and clears the advance refusal; a tree
+   whose stored rows contradict the counter (or each other) stays refused. */
+int test_exit_reload_consistent_and_corrupted(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund_txid[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund_txid, 0x51, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_1, fund_txid,
+                                      0, 1000000, spk, 2, 4, 1), "factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "reload_ok");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist tree");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "persist dw state");
+    size_t leaf = f->leaf_node_indices[0];
+
+    /* consistent -> reload clears the flag, advance allowed */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "load");
+    printf("  consistent reload: tree_rebuilt_on_load=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "consistent tree -> refusal cleared");
+    TEST_ASSERT(!factory_advance_refused(g), "refusal cleared");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "advance allowed");
+    factory_free(g); free(g);
+
+    /* corrupt the leaf's stored nSequence -> counter/tree disagree -> refused */
+    char sql[256];
+    snprintf(sql, sizeof(sql), "UPDATE tree_nodes SET nsequence=12345 WHERE "
+             "factory_id=0 AND node_index=%zu", leaf);
+    TEST_ASSERT(sqlite3_exec(db.db, sql, NULL, NULL, NULL) == SQLITE_OK, "tamper nseq");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "load 2");
+    printf("  bad nSequence: tree_rebuilt_on_load=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "mismatched nSequence -> still refused");
+    TEST_ASSERT(factory_advance_refused(g), "advance refused (flag set)");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == FACTORY_ADVANCE_REFUSED,
+                "advance returns FACTORY_ADVANCE_REFUSED");
+    factory_free(g); free(g);
+
+    /* restore nSequence, break the input chain (wrong parent txid) -> refused */
+    snprintf(sql, sizeof(sql), "UPDATE tree_nodes SET nsequence=("
+             "SELECT nsequence FROM tree_nodes WHERE factory_id=0 AND node_index=%zu"
+             ") WHERE 0", leaf);  /* no-op; just re-persist the real tree below */
+    (void)sql;
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save real tree");
+    int parent = f->nodes[leaf].parent_index;
+    snprintf(sql, sizeof(sql), "UPDATE tree_nodes SET txid='%064d' WHERE "
+             "factory_id=0 AND node_index=%d", 9, parent);
+    TEST_ASSERT(sqlite3_exec(db.db, sql, NULL, NULL, NULL) == SQLITE_OK, "tamper parent txid");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "load 3");
+    printf("  broken input chain: tree_rebuilt_on_load=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "broken input chain -> still refused");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* DW leaf advance -> restart -> the reload clears the refusal, restores the
+   advanced leaf state, and the next advance builds on it.  The stored DW
+   counter and the stored tree agree (they are written in one transaction, so
+   a restart never sees state k in the tree with the counter at k-1). */
+int test_exit_dw_advance_reload_then_advance(void) {
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "dwreload", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    int client_ok = 0;
+    TEST_ASSERT(ex_rig_ps_advance(&r, &client_ok) == 1 && client_ok, "DW leaf advance");
+    uint32_t adv_state = r.lsp->factory.leaf_layers[0].current_state;
+    TEST_ASSERT(adv_state == 1, "leaf advanced to state 1");
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&r.db, 0, g, r.ctx), "reload");
+    printf("  reload: flag=%d, leaf0 state=%u (advanced=%u)\n",
+           g->tree_rebuilt_on_load, g->leaf_layers[0].current_state, adv_state);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "refusal cleared");
+    TEST_ASSERT(g->leaf_layers[0].current_state == 1,
+                "reloaded leaf state matches the DB (tree and counter agree)");
+    TEST_ASSERT(factory_node_nsequence(g, leaf) ==
+                dw_current_nsequence(&g->leaf_layers[0]), "node nseq matches counter");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "next advance builds (not refused)");
+    TEST_ASSERT(g->leaf_layers[0].current_state == 2, "next advance moved to state 2");
+    alarm(0);
+    factory_free(g); free(g);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* Advance leaf 0 in memory (the test holds every key, so the signed variant
+   re-signs the whole tree on a rollover, exactly as Tier B does) until the
+   root rolls over to a new epoch.  Returns the new epoch, or 0 on no rollover. */
+static uint32_t ex_local_rollover(factory_t *f, int max_adv) {
+    /* The unsigned variant carries the PS Tier B rollover (returns -1); the
+       signed one does not.  Sign each step here (the test holds every key). */
+    for (int i = 0; i < max_adv; i++) {
+        int rc = factory_advance_leaf_unsigned(f, 0);
+        if (rc == -1) {
+            if (!factory_sign_all(f)) return 0;          /* re-sign the new epoch */
+            return f->counter.current_epoch;
+        }
+        if (rc == 0) return 0;
+        if (!factory_sign_node(f, f->leaf_node_indices[0])) return 0;
+    }
+    return 0;
+}
+
+/* Persist a re-signed tree the way the Tier B save does: the whole signed
+   tree, the DW counter and the new-epoch PS chain[0], in one transaction.
+   With dw_state = 0 (a client DB) the counter row is left out, as a client's
+   DB has none. */
+static int ex_persist_tierb(persist_t *db, factory_t *f, int dw_state) {
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_signed_tree_nodes(db, f, 0) >= 0 &&
+             (!dw_state || persist_save_factory_dw_state(db, 0, f)) &&
+             client_persist_exit_state(db, f);   /* PS chain[0] + chains */
+    if (ok) return persist_commit(db);
+    persist_rollback(db);
+    return 0;
+}
+
+/* PS Tier B rollover -> restart -> the reload clears the refusal, restores the
+   new epoch, and a further advance builds on the reloaded tree. */
+int test_exit_tierb_reload_then_advance(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund_txid[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund_txid, 0x52, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_PS, fund_txid,
+                                      0, 1000000, spk, 2, 2, 1), "factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "tierb");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist");
+    TEST_ASSERT(lsp_persist_ps_chain0_all(&db, f) > 0, "chain0");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw state");
+
+    uint32_t epoch = ex_local_rollover(f, 10);
+    TEST_ASSERT(epoch > 0, "a rollover happened");
+    TEST_ASSERT(ex_persist_tierb(&db, f, 1), "persist the re-signed epoch tree");
+    printf("  rolled to epoch %u and persisted\n", epoch);
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload");
+    printf("  reload: flag=%d, epoch=%u (expected %u)\n",
+           g->tree_rebuilt_on_load, g->counter.current_epoch, epoch);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "refusal cleared after Tier B");
+    TEST_ASSERT(g->counter.current_epoch == epoch, "epoch reloaded from the tree/chains");
+    TEST_ASSERT(!factory_advance_refused(g) &&
+                factory_advance_leaf_unsigned(g, 0) != FACTORY_ADVANCE_REFUSED,
+                "advance not refused after reload");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A restarted CLIENT must not block the factory's next Tier B.  A client DB
+   (no dw_counter_state row) holding a post-rollover tree reloads with the
+   refusal cleared and the epoch recovered from the PS chain rows, so the
+   restarted client can take part in the next ceremony instead of blocking it. */
+int test_exit_client_reload_then_tierb(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund_txid[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund_txid, 0x53, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_PS, fund_txid,
+                                      0, 1000000, spk, 2, 2, 1), "factory");
+    /* a client-side DB: factory params + signed tree + PS chain[0], and NO
+       dw_counter_state row (clients never write one). */
+    char cpath[256];
+    ex_db_path(cpath, sizeof(cpath), "clireload");
+    persist_t cdb;
+    TEST_ASSERT(persist_open(&cdb, cpath), "client db");
+    TEST_ASSERT(persist_save_factory(&cdb, f, ctx, 0), "client factory row");
+    TEST_ASSERT(client_persist_exit_state(&cdb, f), "client creation persist");
+
+    uint32_t epoch = ex_local_rollover(f, 10);
+    TEST_ASSERT(epoch > 0, "a rollover happened");
+    TEST_ASSERT(ex_persist_tierb(&cdb, f, 0), "client persists the post-rollover tree");
+
+    factory_t *cf2 = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(cf2 && persist_load_factory(&cdb, 0, cf2, ctx), "client reload");
+    printf("  client reload: flag=%d, epoch=%u (expected %u), no dw_counter_state row\n",
+           cf2->tree_rebuilt_on_load, cf2->counter.current_epoch, epoch);
+    TEST_ASSERT(!cf2->tree_rebuilt_on_load,
+                "client reload clears the refusal (does not block Tier B)");
+    TEST_ASSERT(cf2->counter.current_epoch == epoch,
+                "epoch recovered from the PS chain rows (no dw_counter_state)");
+    TEST_ASSERT(!factory_advance_refused(cf2) &&
+                factory_advance_leaf_unsigned(cf2, 0) != FACTORY_ADVANCE_REFUSED,
+                "the restarted client can advance (would take part in Tier B)");
+    factory_free(cf2); free(cf2);
+
+    persist_close(&cdb);
+    unlink(cpath);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tree reload: the L-stock state counter, PS chains across a root      */
+/* rollover, and signed-state reservations                              */
+/* ------------------------------------------------------------------ */
+
+static const unsigned char g_rl_seed[32] = {
+    0x7a, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+    0xbb, 0xcc, 0xdd, 0xee, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56,
+    0x67, 0x78, 0x89, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf1 };
+
+/* "Sign" a node for a persistence-only test: the stored bytes are the
+   unsigned TX (same txid), which is all the reload checks look at. */
+static void rl_fake_sign(factory_node_t *n) {
+    tx_buf_free(&n->signed_tx);
+    tx_buf_init(&n->signed_tx, (int)n->unsigned_tx.len);
+    memcpy(n->signed_tx.data, n->unsigned_tx.data, n->unsigned_tx.len);
+    n->signed_tx.len = n->unsigned_tx.len;
+    n->is_signed = 1;
+}
+
+/* A factory with the hashlock L-stock: the seed and the flag are set before
+   the tree is built, so every L-stock commits to H(secret(node, state)). */
+static int rl_build_hashlock(secp256k1_context *ctx, factory_t *f,
+                             const secp256k1_keypair *kps, size_t n,
+                             factory_arity_t arity, uint32_t sub_arity,
+                             const unsigned char fund_txid[32],
+                             const unsigned char spk[34], uint32_t states) {
+    if (!factory_init(f, ctx, kps, n, 2, states)) return 0;
+    factory_set_shachain_seed(f, g_rl_seed);
+    if (!factory_enable_hashlock_poison(f)) return 0;
+    factory_set_arity(f, arity);
+    if (sub_arity > 1) factory_set_ps_subfactory_arity(f, sub_arity);
+    f->fee_per_tx = 1000;
+    factory_set_funding(f, fund_txid, 0, 2000000, spk, 34);
+    if (!factory_build_tree(f)) return 0;
+    if (!factory_sign_all(f)) return 0;
+    /* factory_sign_all leaves the k^2 sub-factory nodes to their own
+       ceremony; for these persistence tests their bytes are enough */
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (f->nodes[i].is_built && !f->nodes[i].is_signed)
+            rl_fake_sign(&f->nodes[i]);
+    return 1;
+}
+
+static int rl_lstock_hash_of(factory_t *f, size_t idx, uint32_t state,
+                             unsigned char out[32]) {
+    unsigned char sec[32];
+    if (!factory_derive_l_stock_secret(f, &f->nodes[idx], state, sec)) return 0;
+    sha256(sec, 32, out);
+    memset(sec, 0, 32);
+    return 1;
+}
+
+/* Persist one advanced node the way the LSP does before DONE: the tree row
+   (which carries the L-stock counter) and the DW counter in one transaction. */
+static int rl_persist_node(persist_t *db, factory_t *f, size_t idx) {
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_tree_node(db, f, 0, idx) &&
+             persist_save_factory_dw_state(db, 0, f);
+    if (ok) return persist_commit(db);
+    persist_rollback(db);
+    return 0;
+}
+
+/* Hashlock DW leaf, three advances, restart: the reloaded L-stock state
+   counter is the stored one, so the next state's L-stock commits to a fresh
+   secret, not to one of the superseded states' secrets the LSP has revealed.
+   A missing counter row fails the reload closed; a tampered one fails the
+   LSP's post-seed check. */
+int test_reload_lstock_counter_dw(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x61, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && rl_build_hashlock(ctx, f, kps, 3, FACTORY_ARITY_1, 0, fund,
+                                       spk, 8), "hashlock factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_lstock");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw state");
+    size_t leaf = f->leaf_node_indices[0];
+    TEST_ASSERT(f->nodes[leaf].has_l_stock_hash, "leaf L-stock is hashlocked");
+
+    for (int a = 0; a < 3; a++) {
+        TEST_ASSERT(factory_advance_leaf(f, 0) == 1, "leaf advance");
+        TEST_ASSERT(rl_persist_node(&db, f, leaf), "persist the advance");
+    }
+    uint32_t c = f->nodes[leaf].l_stock_state_counter;
+    TEST_ASSERT(c == 3, "three L-stock states superseded");
+    /* the LSP reveals the secret of every superseded state 0..c-1 */
+    unsigned char revealed[3][32];
+    for (uint32_t s = 0; s < c; s++)
+        TEST_ASSERT(rl_lstock_hash_of(f, leaf, s, revealed[s]), "revealed hash");
+
+    /* restart */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload");
+    factory_set_shachain_seed(g, g_rl_seed);       /* LSP recovery re-derives it */
+    TEST_ASSERT(factory_enable_hashlock_poison(g), "re-enable hashlock");
+    int verified = factory_verify_l_stock_state(g);
+    factory_node_t *gl = &g->nodes[leaf];
+    printf("  reload: flag=%d, L-stock counter %u (stored %u), verified=%d\n",
+           g->tree_rebuilt_on_load, gl->l_stock_state_counter, c, verified);
+    uint32_t restored = gl->l_stock_state_counter;
+    int adv = factory_advance_leaf_unsigned(g, 0);
+    int reused = -1;
+    for (uint32_t s = 0; s < c; s++)
+        if (memcmp(gl->l_stock_hash, revealed[s], 32) == 0) reused = (int)s;
+    printf("  next state: counter %u, its L-stock hash %s", gl->l_stock_state_counter,
+           reused >= 0 ? "IS the hash of revealed state " : "is fresh\n");
+    if (reused >= 0) printf("%d's secret\n", reused);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "reload verified");
+    TEST_ASSERT(restored == c, "L-stock counter restored");
+    TEST_ASSERT(verified, "restored counter agrees with the seed and the L-stock output");
+    TEST_ASSERT(adv == 1, "next advance");
+    TEST_ASSERT(reused < 0, "the new L-stock is not hashlocked to a revealed secret");
+    unsigned char want[32];
+    TEST_ASSERT(rl_lstock_hash_of(g, leaf, c + 1, want), "hash of the next state");
+    TEST_ASSERT(memcmp(gl->l_stock_hash, want, 32) == 0,
+                "the new L-stock commits to the next state's secret");
+    factory_free(g); free(g);
+
+    /* a DB without the counter rows (written by an older build) */
+    TEST_ASSERT(sqlite3_exec(db.db, "DELETE FROM tree_node_lstock", NULL, NULL,
+                             NULL) == SQLITE_OK, "drop counter rows");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload without counters");
+    printf("  no counter rows: flag=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "advanced node without its counter -> refused");
+    factory_free(g); free(g);
+
+    /* a tampered counter */
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "rewrite the rows");
+    char sql[160];
+    snprintf(sql, sizeof(sql), "UPDATE tree_node_lstock SET state_counter=1 "
+             "WHERE factory_id=0 AND node_index=%zu", leaf);
+    TEST_ASSERT(sqlite3_exec(db.db, sql, NULL, NULL, NULL) == SQLITE_OK, "tamper");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload tampered");
+    factory_set_shachain_seed(g, g_rl_seed);
+    factory_enable_hashlock_poison(g);
+    verified = factory_verify_l_stock_state(g);
+    printf("  tampered counter: verified=%d\n", verified);
+    TEST_ASSERT(!verified, "a counter that does not match the stored hash is caught");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Hashlock DW leaf on the LSP and on a seedless client that mirrors the
+   LSP's per-node hashes (as it is sent them in PROPOSE): two advances, both
+   persisted (the client through client_persist_exit_state), both restarted.
+   Each restores the leaf's L-stock counter and current hash, the LSP's next
+   state commits to a fresh secret, and the restarted client builds the
+   identical TX. */
+int test_reload_lstock_counter_client(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x62, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && rl_build_hashlock(ctx, f, kps, 3, FACTORY_ARITY_1, 0, fund,
+                                       spk, 8), "LSP factory");
+    size_t leaf = f->leaf_node_indices[0];
+
+    /* the client: no seed, mirrors the per-node hashes it was sent */
+    factory_t *c = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(c && factory_init(c, ctx, kps, 3, 2, 8), "client init");
+    factory_set_arity(c, FACTORY_ARITY_1);
+    c->fee_per_tx = 1000;
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (f->nodes[i].has_l_stock_hash)
+            factory_set_node_l_stock_hash(c, i, f->nodes[i].l_stock_hash);
+    factory_set_funding(c, fund, 0, 2000000, spk, 34);
+    TEST_ASSERT(factory_build_tree(c) && factory_sign_all(c), "client tree");
+    TEST_ASSERT(memcmp(c->nodes[leaf].txid, f->nodes[leaf].txid, 32) == 0,
+                "client and LSP agree at creation");
+
+    char path[256], cpath[256];
+    ex_db_path(path, sizeof(path), "rl_lsc");
+    ex_db_path(cpath, sizeof(cpath), "rl_lscc");
+    persist_t db, cdb;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "LSP persist");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw");
+    TEST_ASSERT(persist_open(&cdb, cpath) && persist_save_factory(&cdb, c, ctx, 0) &&
+                client_persist_exit_state(&cdb, c), "client persist");
+
+    for (int a = 0; a < 2; a++) {
+        TEST_ASSERT(factory_advance_leaf_unsigned(f, 0) == 1, "LSP advance");
+        factory_set_node_l_stock_hash(c, leaf, f->nodes[leaf].l_stock_hash);
+        TEST_ASSERT(factory_advance_leaf_unsigned(c, 0) == 1, "client advance");
+        int same = memcmp(c->nodes[leaf].txid, f->nodes[leaf].txid, 32) == 0;
+        printf("  advance %d: client builds the same state as the LSP: %s\n", a + 1,
+               same ? "yes" : "NO");
+        TEST_ASSERT(same, "same leaf state");
+        TEST_ASSERT(factory_sign_node(f, leaf) && factory_sign_node(c, leaf), "sign");
+        TEST_ASSERT(rl_persist_node(&db, f, leaf), "LSP persists the advance");
+        TEST_ASSERT(client_persist_exit_state(&cdb, c), "client persists the advance");
+    }
+    uint32_t cnt = f->nodes[leaf].l_stock_state_counter;
+    TEST_ASSERT(cnt == 2, "two L-stock states superseded");
+    unsigned char revealed[3][32];
+    for (uint32_t s2 = 0; s2 <= cnt; s2++)
+        TEST_ASSERT(rl_lstock_hash_of(f, leaf, s2, revealed[s2]), "hashes");
+
+    /* both restart */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    factory_t *h = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "LSP reload");
+    TEST_ASSERT(h && persist_load_factory(&cdb, 0, h, ctx), "client reload");
+    factory_set_shachain_seed(g, g_rl_seed);
+    TEST_ASSERT(factory_enable_hashlock_poison(g), "LSP re-enables hashlock");
+    int verified = factory_verify_l_stock_state(g);
+    printf("  reload: LSP flag=%d counter=%u verified=%d; client flag=%d counter=%u\n",
+           g->tree_rebuilt_on_load, g->nodes[leaf].l_stock_state_counter, verified,
+           h->tree_rebuilt_on_load, h->nodes[leaf].l_stock_state_counter);
+    TEST_ASSERT(!g->tree_rebuilt_on_load && !h->tree_rebuilt_on_load, "both reloads verified");
+    TEST_ASSERT(verified, "LSP counter agrees with the seed");
+    TEST_ASSERT(g->nodes[leaf].l_stock_state_counter == cnt &&
+                h->nodes[leaf].l_stock_state_counter == cnt, "both counters restored");
+    TEST_ASSERT(h->nodes[leaf].has_l_stock_hash &&
+                memcmp(h->nodes[leaf].l_stock_hash, revealed[cnt], 32) == 0,
+                "client restored the current state's hash (the next poison's target)");
+
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "LSP advance after restart");
+    int reused = -1;
+    for (uint32_t s2 = 0; s2 <= cnt; s2++)
+        if (memcmp(g->nodes[leaf].l_stock_hash, revealed[s2], 32) == 0) reused = (int)s2;
+    printf("  LSP next state: counter %u, hash %s\n", g->nodes[leaf].l_stock_state_counter,
+           reused >= 0 ? "REUSES an earlier state's hash" : "fresh");
+    TEST_ASSERT(reused < 0, "new L-stock hash is not an earlier (revealed) one");
+    factory_set_node_l_stock_hash(h, leaf, g->nodes[leaf].l_stock_hash);
+    TEST_ASSERT(factory_advance_leaf_unsigned(h, 0) == 1, "client advance after restart");
+    int agree = memcmp(h->nodes[leaf].txid, g->nodes[leaf].txid, 32) == 0;
+    printf("  client after restart: counter %u, same TX as the LSP: %s\n",
+           h->nodes[leaf].l_stock_state_counter, agree ? "yes" : "NO");
+    TEST_ASSERT(agree, "the restarted client builds the identical TX");
+    TEST_ASSERT(h->nodes[leaf].l_stock_state_counter == cnt + 1, "client counter agrees");
+
+    factory_free(g); free(g); factory_free(h); free(h);
+    persist_close(&db); persist_close(&cdb);
+    unlink(path); unlink(cpath);
+    factory_free(f); free(f); factory_free(c); free(c);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Persist one PS leaf chain advance the way the LSP does before DONE. */
+static int rl_persist_ps_leaf(persist_t *db, factory_t *f, size_t leaf) {
+    factory_node_t *n = &f->nodes[leaf];
+    unsigned char disp[32];
+    memcpy(disp, n->txid, 32);
+    reverse_bytes(disp, 32);
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_ps_chain_entry(db, 0, (uint32_t)leaf,
+                 n->ps_chain_len - 1, f->counter.current_epoch, disp,
+                 n->signed_tx.data, n->signed_tx.len,
+                 n->outputs[0].amount_sats, NULL, 0) &&
+             persist_save_tree_node(db, f, 0, leaf) &&
+             persist_save_factory_dw_state(db, 0, f);
+    if (ok) return persist_commit(db);
+    persist_rollback(db);
+    return 0;
+}
+
+/* A root rollover after a PS chain longer than the new epoch's: the old
+   epoch's rows at higher positions stay in ps_leaf_chains.  The reload must
+   take the new epoch's tip (and chain[0] of the new epoch), and the next
+   advance must spend it. */
+int test_reload_ps_chain_after_rollover(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x63, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_PS, fund, 0,
+                                      1000000, spk, 2, 3, 1), "PS factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_psroll");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist");
+    TEST_ASSERT(lsp_persist_ps_chain0_all(&db, f) > 0, "chain[0]");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw");
+    size_t leaf = f->leaf_node_indices[0];
+
+    /* epoch 0: chain[1..3], then the rollover */
+    int rolled = 0, n_old = 0;
+    for (int a = 0; a < 10 && !rolled; a++) {
+        int rc = factory_advance_leaf_unsigned(f, 0);
+        if (rc == -1) {
+            TEST_ASSERT(factory_sign_all(f), "re-sign the new epoch");
+            TEST_ASSERT(ex_persist_tierb(&db, f, 1), "persist the Tier B");
+            rolled = 1;
+            break;
+        }
+        TEST_ASSERT(rc == 1 && factory_sign_node(f, leaf), "chain advance");
+        TEST_ASSERT(rl_persist_ps_leaf(&db, f, leaf), "persist chain entry");
+        n_old++;
+    }
+    TEST_ASSERT(rolled && f->counter.current_epoch == 1, "rolled over to epoch 1");
+    /* epoch 1: one advance */
+    TEST_ASSERT(factory_advance_leaf_unsigned(f, 0) == 1 && factory_sign_node(f, leaf),
+                "epoch-1 chain advance");
+    TEST_ASSERT(rl_persist_ps_leaf(&db, f, leaf), "persist epoch-1 entry");
+    char tip[65], prev[65];
+    ex_txid_hex(f->nodes[leaf].txid, tip);
+    ex_txid_hex(f->nodes[leaf].ps_prev_txid, prev);
+    printf("  epoch 0 chain had %d entries; epoch 1 chain has 1 (tip %.16s...); "
+           "ps_leaf_chains rows: %d\n", n_old, tip,
+           ex_sql_int(&db, "SELECT COUNT(*) FROM ps_leaf_chains"));
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload");
+    factory_node_t *gl = &g->nodes[leaf];
+    char gtip[65], gprev[65];
+    ex_txid_hex(gl->txid, gtip);
+    ex_txid_hex(gl->ps_prev_txid, gprev);
+    printf("  reload: flag=%d epoch=%u chain_len=%d tip %.16s... (%s)\n",
+           g->tree_rebuilt_on_load, g->counter.current_epoch, gl->ps_chain_len,
+           gtip, strcmp(gtip, tip) == 0 ? "the epoch-1 tip" : "WRONG");
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "reload verified");
+    TEST_ASSERT(gl->ps_chain_len == 1, "chain length of the current epoch");
+    TEST_ASSERT(strcmp(gtip, tip) == 0, "tip is the epoch-1 entry");
+    TEST_ASSERT(strcmp(gprev, prev) == 0, "it spends the epoch-1 chain[0]");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "next advance");
+    char nprev[65];
+    ex_txid_hex(gl->ps_prev_txid, nprev);
+    TEST_ASSERT(strcmp(nprev, tip) == 0, "the next chain TX spends the epoch-1 tip");
+    factory_free(g); free(g);
+
+    /* chain[0] row of the wrong epoch -> fail closed */
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE ps_initial_signed_states SET epoch=0",
+                             NULL, NULL, NULL) == SQLITE_OK, "tamper epoch");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload tampered");
+    printf("  chain[0] of the old epoch: flag=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "epoch mismatch -> refused");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The chain loaders (leaf and sub-factory) skip other epochs' rows and stop
+   at a row that does not spend the previous entry. */
+int test_reload_ps_chain_loaders_filter_epoch(void) {
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_loaders");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "db");
+    unsigned char p0[32];
+    memset(p0, 0x11, 32);
+    char c0hex[256], c0id[65];
+    ex_dummy_tx(p0, 0, c0hex);
+    TEST_ASSERT(ex_txid_of_hex(c0hex, c0id), "chain[0] txid");
+    unsigned char c0b[128], c0disp[32], c0int[32];
+    size_t c0len = strlen(c0hex) / 2;
+    hex_decode(c0hex, c0b, c0len);
+    hex_decode(c0id, c0disp, 32);
+    memcpy(c0int, c0disp, 32);
+    reverse_bytes(c0int, 32);
+    /* row 0 of epoch 1 spends chain[0]; rows 1-2 are a longer epoch-0 chain */
+    char r0hex[256], r0id[65], s1hex[256], s1id[65], s2hex[256], s2id[65];
+    ex_dummy_tx(c0int, 0, r0hex);
+    ex_txid_of_hex(r0hex, r0id);
+    unsigned char junk[32];
+    memset(junk, 0x22, 32);
+    ex_dummy_tx(junk, 1, s1hex);
+    ex_txid_of_hex(s1hex, s1id);
+    memset(junk, 0x23, 32);
+    ex_dummy_tx(junk, 2, s2hex);
+    ex_txid_of_hex(s2hex, s2id);
+    for (int table = 0; table < 2; table++) {
+        uint32_t node = table ? 9 : 5;
+        TEST_ASSERT(persist_save_ps_initial_signed_state(&db, 0, node, 1, c0disp,
+                                                         c0b, c0len), "chain[0] row");
+        const char *hx[3] = { r0hex, s1hex, s2hex };
+        const char *id[3] = { r0id, s1id, s2id };
+        uint32_t ep[3] = { 1, 0, 0 };
+        for (int k = 0; k < 3; k++) {
+            unsigned char b[128], d[32];
+            size_t bl = strlen(hx[k]) / 2;
+            hex_decode(hx[k], b, bl);
+            hex_decode(id[k], d, 32);
+            uint64_t ch[1] = { 5000 };
+            int ok = table
+                ? persist_save_subfactory_chain_entry(&db, 0, node, k, ep[k], d, b, bl,
+                                                      1000, ch, 1, NULL, 0)
+                : persist_save_ps_chain_entry(&db, 0, node, k, ep[k], d, b, bl,
+                                              5000, NULL, 0);
+            TEST_ASSERT(ok, "chain row");
+        }
+        tx_buf_t txs[8];
+        unsigned char ids[8][32];
+        uint64_t a1[8], a16[8][16];
+        int nch[8];
+        memset(txs, 0, sizeof(txs));
+        int n = table
+            ? persist_load_subfactory_chain(&db, 0, node, txs, ids, a1, a16, nch, NULL, 8)
+            : persist_load_ps_chain(&db, 0, node, txs, ids, a1, NULL, 8);
+        printf("  %s chain: 1 row of the current epoch + 2 older rows -> loaded %d\n",
+               table ? "sub-factory" : "leaf", n);
+        for (int k = 0; k < n; k++) tx_buf_free(&txs[k]);
+        TEST_ASSERT(n == 1, "only the current epoch's linked rows");
+
+        /* a same-epoch row that does not spend the previous entry ends it */
+        unsigned char b1[128], d1[32];
+        size_t bl1 = strlen(s1hex) / 2;
+        hex_decode(s1hex, b1, bl1);
+        hex_decode(s1id, d1, 32);
+        uint64_t ch1[1] = { 5000 };
+        TEST_ASSERT(table
+            ? persist_save_subfactory_chain_entry(&db, 0, node, 1, 1, d1, b1, bl1,
+                                                  1000, ch1, 1, NULL, 0)
+            : persist_save_ps_chain_entry(&db, 0, node, 1, 1, d1, b1, bl1, 5000,
+                                          NULL, 0), "unlinked row");
+        memset(txs, 0, sizeof(txs));
+        n = table
+            ? persist_load_subfactory_chain(&db, 0, node, txs, ids, a1, a16, nch, NULL, 8)
+            : persist_load_ps_chain(&db, 0, node, txs, ids, a1, NULL, 8);
+        for (int k = 0; k < n; k++) tx_buf_free(&txs[k]);
+        TEST_ASSERT(n == 1, "an unlinked row is not part of the chain");
+    }
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* Forwards the wire between the LSP and a client, except one message type
+   from the client, which it swallows before closing both sides. */
+typedef struct {
+    int lsp_fd, cli_fd;
+    uint8_t drop_type;
+    int dropped;
+} rl_proxy_t;
+
+static void *rl_proxy_thread(void *arg) {
+    rl_proxy_t *x = (rl_proxy_t *)arg;
+    for (;;) {
+        struct pollfd pf[2] = { { .fd = x->lsp_fd, .events = POLLIN },
+                                { .fd = x->cli_fd, .events = POLLIN } };
+        if (poll(pf, 2, 130000) <= 0) break;
+        int from_cli = (pf[1].revents & (POLLIN | POLLHUP)) ? 1 : 0;
+        int src = from_cli ? x->cli_fd : x->lsp_fd;
+        int dst = from_cli ? x->lsp_fd : x->cli_fd;
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        if (!wire_recv(src, &m)) break;
+        if (from_cli && m.msg_type == x->drop_type) {
+            x->dropped = 1;
+            if (m.json) cJSON_Delete(m.json);
+            break;
+        }
+        int sent = wire_send(dst, m.msg_type, m.json);
+        if (m.json) cJSON_Delete(m.json);
+        if (!sent) break;
+    }
+    shutdown(x->lsp_fd, SHUT_RDWR);
+    shutdown(x->cli_fd, SHUT_RDWR);
+    return NULL;
+}
+
+/* Fresh LSP <-> client socketpair for the rig (the old one may be shut). */
+static int rl_rig_reconnect(ex_rig_t *r) {
+    if (r->sv[0] >= 0) close(r->sv[0]);
+    if (r->sv[1] >= 0) close(r->sv[1]);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, r->sv) != 0) return 0;
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(r->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(r->sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    r->lsp->client_fds[0] = r->sv[0];
+    return 1;
+}
+
+/* LSP restart: the factory is reloaded from the LSP DB. */
+static int rl_rig_restart_lsp(ex_rig_t *r) {
+    factory_free(&r->lsp->factory);
+    memset(&r->lsp->factory, 0, sizeof(r->lsp->factory));
+    return persist_load_factory(&r->db, 0, &r->lsp->factory, r->ctx) &&
+           !r->lsp->factory.tree_rebuilt_on_load;
+}
+
+/* Client restart: its factory is reloaded from the client DB. */
+static int rl_rig_restart_client(ex_rig_t *r) {
+    factory_free(r->cf);
+    memset(r->cf, 0, sizeof(*r->cf));
+    return persist_load_factory(&r->cdb, 0, r->cf, r->ctx);
+}
+
+/* One leaf advance in which the client's FINAL never reaches the LSP: the
+   client completes the new state with the LSP's partial sig, then the
+   connection drops.  out_txid gets the state the client holds. */
+static int rl_withheld_final(ex_rig_t *r, unsigned char out_txid[32],
+                             int *lsp_rc) {
+    int q[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, q) != 0) return 0;
+    rl_proxy_t px = { .lsp_fd = r->sv[1], .cli_fd = q[0],
+                      .drop_type = MSG_LEAF_ADVANCE_FINAL, .dropped = 0 };
+    ex_client_t cl = { .fd = q[1], .ctx = r->ctx, .kp = r->kps[1],
+                       .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    pthread_t tp, tc;
+    if (pthread_create(&tp, NULL, rl_proxy_thread, &px) != 0) return 0;
+    if (pthread_create(&tc, NULL, ex_client_thread, &cl) != 0) return 0;
+    *lsp_rc = lsp_channels_advance_ps_leaf(r->mgr, r->lsp, 0);
+    shutdown(r->sv[0], SHUT_RDWR);
+    pthread_join(tp, NULL);
+    pthread_join(tc, NULL);
+    close(q[0]); close(q[1]);
+    size_t leaf = r->cf->leaf_node_indices[0];
+    memcpy(out_txid, r->cf->nodes[leaf].txid, 32);
+    return px.dropped && r->cf->nodes[leaf].is_signed;
+}
+
+/* DW leaf: the LSP releases its partial sig, the client completes state 1
+   and withholds FINAL, the LSP restarts at state 0.  A different state 1 (a
+   realloc at the same nSequence) must be refused; the identical state 1 may
+   be signed again. */
+int test_reload_withheld_final_dw(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "rl_wfdw", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    char stored0[65], sql[200];
+    snprintf(sql, sizeof(sql), "SELECT txid FROM tree_nodes WHERE factory_id=0 "
+             "AND node_index=%zu", leaf);
+    ex_sql_text(&r.db, sql, stored0, sizeof(stored0));
+
+    unsigned char t1[32];
+    int lrc = -1;
+    TEST_ASSERT(rl_withheld_final(&r, t1, &lrc), "client holds state 1, FINAL withheld");
+    char t1hex[65], stored[65];
+    ex_txid_hex(t1, t1hex);
+    ex_sql_text(&r.db, sql, stored, sizeof(stored));
+    printf("  withheld FINAL: LSP rc=%d, client holds state 1 %.16s..., LSP DB "
+           "still at state 0: %s\n", lrc, t1hex,
+           strcmp(stored, stored0) == 0 ? "yes" : "no");
+    TEST_ASSERT(lrc == 0 && strcmp(stored, stored0) == 0, "the LSP stored nothing");
+
+    /* LSP restart; a client at state 0 that signs whatever it is sent */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    TEST_ASSERT(r.lsp->factory.leaf_layers[0].current_state == 0, "LSP back at state 0");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client at state 0");
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    size_t na = ex_realloc_amounts(&r.lsp->factory.nodes[leaf], 1000, amts);
+    int client_ok = 0;
+    int rc = ex_rig_realloc(&r, amts, na, &client_ok);
+    char t1b[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, t1b);
+    printf("  after the restart, a realloc to a different state 1: rc=%d (%s)\n", rc,
+           rc == 1 ? "a SECOND state 1 was signed" : "refused");
+    if (rc == 1)
+        printf("  two signed states with nSequence %u: %.16s... and %.16s...\n",
+               r.lsp->factory.nodes[leaf].nsequence, t1hex, t1b);
+    TEST_ASSERT(rc == 0, "a different state 1 is not signed");
+
+    /* the identical state 1 is signed again */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload 2");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client reload 2");
+    rc = ex_rig_ps_advance(&r, &client_ok);
+    char again[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, again);
+    printf("  plain leaf advance after the restart: rc=%d, state 1 %.16s... (%s)\n",
+           rc, again, strcmp(again, t1hex) == 0 ? "identical" : "DIFFERENT");
+    TEST_ASSERT(rc == 1 && client_ok, "the identical state is re-signed");
+    TEST_ASSERT(strcmp(again, t1hex) == 0, "and it is the state the client held");
+    alarm(0);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* PS leaf: same, for chain[1].  Only the identical chain[1] may be signed
+   for chain[0]'s output; a record of a different chain[1] refuses it. */
+int test_reload_withheld_final_ps(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_PS, "rl_wfps", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    unsigned char t1[32];
+    int lrc = -1;
+    TEST_ASSERT(rl_withheld_final(&r, t1, &lrc), "client holds chain[1], FINAL withheld");
+    char t1hex[65];
+    ex_txid_hex(t1, t1hex);
+    int nres = ex_sql_int(&r.db, "SELECT COUNT(*) FROM signed_state_reservations");
+    printf("  withheld FINAL: LSP rc=%d, client holds chain[1] %.16s..., "
+           "reservations=%d\n", lrc, t1hex, nres);
+    TEST_ASSERT(lrc == 0, "the LSP did not complete");
+    TEST_ASSERT(nres >= 1, "the LSP reserved chain[1] before releasing its partial sig");
+
+    /* a record of a different chain[1] for the same output refuses it */
+    TEST_ASSERT(sqlite3_exec(r.db.db, "UPDATE signed_state_reservations SET txid="
+        "'00000000000000000000000000000000000000000000000000000000000000aa'",
+        NULL, NULL, NULL) == SQLITE_OK, "swap the record");
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client reload");
+    int client_ok = 0;
+    int rc = ex_rig_ps_advance(&r, &client_ok);
+    printf("  chain[1] with another TX recorded for chain[0]'s output: rc=%d\n", rc);
+    TEST_ASSERT(rc == 0, "refused");
+
+    /* with the real record, the identical chain[1] is signed again */
+    char upd[200];
+    snprintf(upd, sizeof(upd), "UPDATE signed_state_reservations SET txid='%s'", t1hex);
+    TEST_ASSERT(sqlite3_exec(r.db.db, upd, NULL, NULL, NULL) == SQLITE_OK, "restore");
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload 2");
+    TEST_ASSERT(rl_rig_restart_client(&r) && rl_rig_reconnect(&r), "client reload 2");
+    rc = ex_rig_ps_advance(&r, &client_ok);
+    char again[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, again);
+    printf("  restart, identical chain[1]: rc=%d %.16s... (%s)\n", rc, again,
+           strcmp(again, t1hex) == 0 ? "identical" : "DIFFERENT");
+    TEST_ASSERT(rc == 1 && client_ok && strcmp(again, t1hex) == 0,
+                "the identical chain[1] is re-signed");
+    alarm(0);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* The client thread, then hang up (a refusing client stops answering; the
+   LSP should not sit out its receive timeout). */
+static void *rl_client_thread_closing(void *arg) {
+    ex_client_thread(arg);
+    shutdown(((ex_client_t *)arg)->fd, SHUT_RDWR);
+    return NULL;
+}
+
+/* Client side: the client completes state 1 with the LSP (it sends FINAL)
+   and crashes before storing it; after its restart (state 0), an LSP that
+   reloaded an old state proposes a different state 1.  The client must
+   refuse to sign it. */
+int test_reload_client_refuses_conflicting_state(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "rl_cli", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    client_set_persist(&r.cdb);
+
+    ex_client_t cl = { .fd = r.sv[1], .ctx = r.ctx, .kp = r.kps[1],
+                       .f = r.cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, ex_client_thread, &cl) == 0, "thread");
+    int rc = lsp_channels_advance_ps_leaf(r.mgr, r.lsp, 0);
+    pthread_join(th, NULL);
+    TEST_ASSERT(rc == 1 && cl.ok, "state 1 signed by both");
+    char t1[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, t1);
+    /* the client crashes before client_persist_exit_state */
+    TEST_ASSERT(rl_rig_restart_client(&r), "client reload (state 0)");
+
+    /* an LSP back at state 0 (an old backup, no reservations) */
+    persist_t *keep = r.mgr->persist;
+    r.mgr->persist = NULL;
+    factory_free(&r.lsp->factory);
+    TEST_ASSERT(ex_build_factory(r.ctx, &r.lsp->factory, r.kps, 3, FACTORY_ARITY_1,
+                                 r.fund_txid, 0, 1000000, r.spk, 2, 4, 1),
+                "LSP at state 0");
+    TEST_ASSERT(rl_rig_reconnect(&r), "reconnect");
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    size_t na = ex_realloc_amounts(&r.lsp->factory.nodes[leaf], 1000, amts);
+    ex_client_t cl2 = { .fd = r.sv[1], .ctx = r.ctx, .kp = r.kps[1],
+                        .f = r.cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    TEST_ASSERT(pthread_create(&th, NULL, rl_client_thread_closing, &cl2) == 0,
+                "thread 2");
+    rc = lsp_realloc_leaf(r.mgr, r.lsp, 0, amts, na);
+    if (rc != 1) shutdown(r.sv[0], SHUT_RDWR);
+    pthread_join(th, NULL);
+    int client_ok = cl2.ok;
+    char t1b[65];
+    ex_txid_hex(r.lsp->factory.nodes[leaf].txid, t1b);
+    printf("  restarted client asked for a different state 1: rc=%d client_ok=%d (%s)\n",
+           rc, client_ok, rc == 1 ? "the client SIGNED a second state 1" : "refused");
+    if (rc == 1)
+        printf("  the LSP holds two signed states 1: %.16s... and %.16s...\n", t1, t1b);
+    client_set_persist(NULL);
+    r.mgr->persist = keep;
+    alarm(0);
+    TEST_ASSERT(rc == 0 && !client_ok, "the client refuses a different state 1");
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* After a reload the on-request reveal is capped at the stored L-stock state:
+   superseded states are still handed out, the stored one is not, and a
+   ceremony that moved the in-memory counter but stored nothing (the client
+   stopped answering) does not raise the cap. */
+int test_reload_reveal_cap_after_reload(void) {
+    /* a side that refuses hangs up; a write to it must not kill the run */
+    signal(SIGPIPE, SIG_IGN);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "rl_cap", 1), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    int client_ok = 0;
+    for (int a = 0; a < 2; a++) {
+        size_t na = ex_realloc_amounts(&r.lsp->factory.nodes[leaf], 1000, amts);
+        TEST_ASSERT(ex_rig_realloc(&r, amts, na, &client_ok) == 1 && client_ok,
+                    "durable realloc");
+        TEST_ASSERT(client_persist_exit_state(&r.cdb, r.cf), "client persists");
+    }
+    uint32_t c = r.lsp->factory.nodes[leaf].l_stock_state_counter;
+    TEST_ASSERT(c == 2, "two states superseded");
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    {   /* the rig's L-stock seed, re-set as LSP recovery does */
+        unsigned char seed[32] = { 0x5e, 0xed };
+        for (int i = 2; i < 32; i++) seed[i] = (unsigned char)(i - 1);
+        factory_set_shachain_seed(&r.lsp->factory, seed);
+    }
+    factory_node_t *ln = &r.lsp->factory.nodes[leaf];
+    TEST_ASSERT(ln->l_stock_state_counter == c, "counter restored");
+    r.lsp->factory.use_hashlock_poison = 1;   /* only the reveal handler reads it */
+    int a1 = ex_request_reveal(&r, (uint32_t)leaf, c - 1);
+    int a2 = ex_request_reveal(&r, (uint32_t)leaf, c);
+    r.lsp->factory.use_hashlock_poison = 0;
+    printf("  after reload (stored state %u): state %u revealed %d, state %u revealed %d\n",
+           c, c - 1, a1, c, a2);
+    TEST_ASSERT(a1 == 1, "a superseded state is still revealed");
+    TEST_ASSERT(a2 == 0, "the stored state is not");
+
+    /* a realloc the client never answers: the counter moves, nothing is stored */
+    shutdown(r.sv[1], SHUT_RDWR);
+    size_t na = ex_realloc_amounts(ln, 1000, amts);
+    int rc = lsp_realloc_leaf(r.mgr, r.lsp, 0, amts, na);
+    TEST_ASSERT(rc == 0 && ln->l_stock_state_counter == c + 1,
+                "ceremony stopped after the counter moved");
+    TEST_ASSERT(rl_rig_reconnect(&r), "reconnect");
+    r.lsp->factory.use_hashlock_poison = 1;
+    int a3 = ex_request_reveal(&r, (uint32_t)leaf, c);
+    r.lsp->factory.use_hashlock_poison = 0;
+    printf("  after a ceremony that stored nothing (in memory %u): state %u revealed %d\n",
+           ln->l_stock_state_counter, c, a3);
+    alarm(0);
+    TEST_ASSERT(a3 == 0, "the state still in the DB is not revealed");
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A DW-only (arity-1) client DB records no epoch: no dw_counter_state row and
+   no PS chain rows.  After a root rollover the reload cannot tell the epoch
+   and must stay refused rather than reload it as 0. */
+int test_reload_dw_client_epoch_unknown(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund, 0x64, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_1, fund, 0,
+                                      1000000, spk, 2, 2, 1), "DW factory");
+    char cpath[256];
+    ex_db_path(cpath, sizeof(cpath), "rl_dwcli");
+    persist_t cdb;
+    TEST_ASSERT(persist_open(&cdb, cpath) && persist_save_factory(&cdb, f, ctx, 0) &&
+                client_persist_exit_state(&cdb, f), "client DB");
+
+    /* before any rollover the client reloads normally */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&cdb, 0, g, ctx), "reload");
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "epoch 0: reload verified");
+    factory_free(g); free(g);
+
+    uint32_t epoch = ex_local_rollover(f, 10);
+    TEST_ASSERT(epoch > 0, "rolled over");
+    TEST_ASSERT(ex_persist_tierb(&cdb, f, 0), "client persists the new epoch");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&cdb, 0, g, ctx), "reload after rollover");
+    printf("  DW-only client DB after a rollover to epoch %u: flag=%d (epoch reloaded as %u)\n",
+           epoch, g->tree_rebuilt_on_load, g->counter.current_epoch);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "epoch unknown -> refused, not reloaded as 0");
+    factory_free(g); free(g);
+
+    persist_close(&cdb);
+    unlink(cpath);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Root advance (Tier B) with both clients connected                    */
+/* ------------------------------------------------------------------ */
+
+/* The rig's second client: its own tree copy, DB and connection. */
+typedef struct {
+    factory_t *cf;
+    persist_t cdb;
+    int cdb_open;
+    char cpath[256];
+    int sv[2];
+} rl_cli2_t;
+
+static int rl_cli2_init(ex_rig_t *r, rl_cli2_t *c, const char *tag, uint32_t states) {
+    memset(c, 0, sizeof(*c));
+    c->sv[0] = c->sv[1] = -1;
+    c->cf = calloc(1, sizeof(factory_t));
+    if (!c->cf || !ex_build_factory(r->ctx, c->cf, r->kps, 3, r->lsp->factory.leaf_arity,
+                                    r->fund_txid, 0, 1000000, r->spk, 2, states, 1))
+        return 0;
+    ex_db_path(c->cpath, sizeof(c->cpath), tag);
+    if (!persist_open(&c->cdb, c->cpath) ||
+        !persist_save_factory(&c->cdb, c->cf, r->ctx, 0) ||
+        !client_persist_exit_state(&c->cdb, c->cf))
+        return 0;
+    c->cdb_open = 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, c->sv) != 0) return 0;
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(c->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    r->lsp->client_fds[1] = c->sv[0];
+    return 1;
+}
+
+static int rl_cli2_reconnect(ex_rig_t *r, rl_cli2_t *c) {
+    if (c->sv[0] >= 0) close(c->sv[0]);
+    if (c->sv[1] >= 0) close(c->sv[1]);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, c->sv) != 0) return 0;
+    struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(c->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    r->lsp->client_fds[1] = c->sv[0];
+    return 1;
+}
+
+static void rl_cli2_free(rl_cli2_t *c) {
+    if (c->sv[0] >= 0) close(c->sv[0]);
+    if (c->sv[1] >= 0) close(c->sv[1]);
+    if (c->cf) { factory_free(c->cf); free(c->cf); }
+    if (c->cdb_open) persist_close(&c->cdb);
+    if (c->cpath[0]) unlink(c->cpath);
+}
+
+/* Set: client 1 does not store its view after a completed ceremony (a crash
+   right after PATH_SIGN_DONE, before its exit-state save). */
+static int g_rl_c1_no_save;
+
+/* Like rl_proxy_thread, plus a gate between the two clients: the two
+   in-process clients share one client DB handle (client_set_persist is
+   global), so client 2 is given the LSP's Tier B response only after client
+   1 has sent its final psigs (and so finished writing).  drop_type 0 drops
+   nothing. */
+typedef struct {
+    int lsp_fd, cli_fd;
+    uint8_t drop_type;
+    int dropped;
+    uint8_t signal_type;            /* from the client: set *gate */
+    uint8_t hold_type;              /* from the LSP: wait for *gate */
+    volatile int *gate;
+    int keep_open;                  /* after a drop, stay connected (silent) */
+} rl_gproxy_t;
+
+static void *rl_gproxy_thread(void *arg) {
+    rl_gproxy_t *x = (rl_gproxy_t *)arg;
+    for (;;) {
+        struct pollfd pf[2] = { { .fd = x->lsp_fd, .events = POLLIN },
+                                { .fd = x->cli_fd, .events = POLLIN } };
+        if (poll(pf, 2, 130000) <= 0) break;
+        int from_cli = (pf[1].revents & (POLLIN | POLLHUP)) ? 1 : 0;
+        int src = from_cli ? x->cli_fd : x->lsp_fd;
+        int dst = from_cli ? x->lsp_fd : x->cli_fd;
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        if (!wire_recv(src, &m)) break;
+        if (from_cli && x->signal_type && m.msg_type == x->signal_type && x->gate)
+            *x->gate = 1;
+        if (!from_cli && x->hold_type && m.msg_type == x->hold_type && x->gate)
+            for (int w = 0; w < 12000 && !*x->gate; w++) usleep(10000);
+        if (from_cli && x->drop_type && m.msg_type == x->drop_type) {
+            x->dropped = 1;
+            if (m.json) cJSON_Delete(m.json);
+            if (x->keep_open) continue;
+            break;
+        }
+        int sent = wire_send(dst, m.msg_type, m.json);
+        if (m.json) cJSON_Delete(m.json);
+        if (!sent) break;
+    }
+    shutdown(x->lsp_fd, SHUT_RDWR);
+    shutdown(x->cli_fd, SHUT_RDWR);
+    return NULL;
+}
+
+/* A leaf advance of leaf 0 with both clients listening: client 1 runs the
+   ceremony; client 2 only gets DONE, or, on a rollover, both run Tier B
+   (through gated proxies; drop_c1 swallows a message of client 1's).  Each
+   client stores its view afterwards when it completed.  The connections
+   are replaced afterwards. */
+static int rl_advance2_ex2(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
+                           uint8_t drop_c1, uint8_t drop_c2, int keep_open,
+                           int *dropped);
+static int rl_advance2_ex(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
+                          uint8_t drop_c1, int *dropped) {
+    return rl_advance2_ex2(r, c2, c1_ok, c2_ok, drop_c1, 0, 0, dropped);
+}
+
+static int rl_advance2_ex2(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
+                           uint8_t drop_c1, uint8_t drop_c2, int keep_open,
+                           int *dropped) {
+    int roll = dw_is_exhausted(&r->lsp->factory.leaf_layers[0]) ||
+               factory_root_advance_frozen(&r->lsp->factory);
+    volatile int gate = 0;
+    int q1[2], q2[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, q1) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, q2) != 0) return 0;
+    rl_gproxy_t p1 = { .lsp_fd = r->sv[1], .cli_fd = q1[0], .drop_type = drop_c1,
+                       .signal_type = MSG_STATE_ADV_CLIENT_FINAL_PSIGS, .gate = &gate,
+                       .keep_open = keep_open };
+    rl_gproxy_t p2 = { .lsp_fd = c2->sv[1], .cli_fd = q2[0], .drop_type = drop_c2,
+                       .hold_type = MSG_STATE_ADV_LSP_RESPONSE, .gate = &gate,
+                       .keep_open = keep_open };
+    ex_client_t a = { .fd = q1[1], .ctx = r->ctx, .kp = r->kps[1],
+                      .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    ex_client_t b = { .fd = q2[1], .ctx = r->ctx, .kp = r->kps[2],
+                      .f = c2->cf, .my_index = 2, .n_expected = 1, .ok = 0 };
+    pthread_t t1, t2, ta, tb;
+    if (pthread_create(&t1, NULL, rl_gproxy_thread, &p1) != 0 ||
+        pthread_create(&t2, NULL, rl_gproxy_thread, &p2) != 0 ||
+        pthread_create(&ta, NULL, ex_client_thread, &a) != 0) return 0;
+    if (roll && pthread_create(&tb, NULL, ex_client_thread, &b) != 0) return 0;
+    int rc = lsp_channels_advance_ps_leaf(r->mgr, r->lsp, 0);
+    if (!roll) {
+        /* client 2 only gets DONE; let it arrive, then hang up */
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        struct pollfd pf = { .fd = q2[1], .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 500) > 0 && wire_recv(q2[1], &m) && m.json)
+            cJSON_Delete(m.json);
+    }
+    if (rc != 1 || !roll) shutdown(q2[1], SHUT_RDWR);
+    if (rc != 1) shutdown(q1[1], SHUT_RDWR);
+    pthread_join(ta, NULL);
+    if (roll) pthread_join(tb, NULL);
+    shutdown(r->sv[0], SHUT_RDWR);
+    shutdown(c2->sv[0], SHUT_RDWR);
+    shutdown(q1[1], SHUT_RDWR);
+    shutdown(q2[1], SHUT_RDWR);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    close(q1[0]); close(q1[1]); close(q2[0]); close(q2[1]);
+    *c1_ok = a.ok;
+    *c2_ok = roll ? b.ok : 1;
+    if (dropped) *dropped = p1.dropped;
+    if (rc == 1 && a.ok && !g_rl_c1_no_save) client_persist_exit_state(&r->cdb, r->cf);
+    if (rc == 1 && roll && b.ok) client_persist_exit_state(&c2->cdb, c2->cf);
+    if (!rl_rig_reconnect(r) || !rl_cli2_reconnect(r, c2)) return 0;
+    return rc;
+}
+
+static int rl_advance2(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok) {
+    return rl_advance2_ex(r, c2, c1_ok, c2_ok, 0, NULL);
+}
+
+/* Tier B to epoch 1 in which client 1's final partial sigs never reach the
+   LSP: both sides have released their signatures for epoch 1, nobody stored
+   it.  After restarts the LSP and client 1 are frozen at epoch 0: a leaf
+   advance or realloc is refused on both sides.  A leaf-advance request
+   re-drives the identical Tier B, which completes, and leaf operations
+   resume. */
+int test_reload_tierb_freeze(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_frz", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_frz2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    TEST_ASSERT(dw_is_exhausted(&r.lsp->factory.leaf_layers[0]), "leaf 0 exhausted");
+
+    /* Tier B, client 1's CLIENT_FINAL_PSIGS swallowed */
+    int dropped = 0;
+    int rc = rl_advance2_ex(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    uint32_t pe = 0; int pt = 0;
+    int lsp_mark = persist_load_root_advance_pending(&r.db, 0, &pe, &pt);
+    int cli_mark = persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL);
+    printf("  Tier B with client 1's final psigs withheld: rc=%d dropped=%d; "
+           "pending mark: LSP %d (epoch %u, trigger %d), client 1 %d\n",
+           rc, dropped, lsp_mark, pe, pt, cli_mark);
+    TEST_ASSERT(rc == 0 && dropped, "the root advance did not complete");
+    TEST_ASSERT(lsp_mark == 1 && pe == 1 && pt == 0, "LSP marked epoch 1 pending");
+    TEST_ASSERT(cli_mark == 1, "client 1 marked it pending");
+
+    /* restarts */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    TEST_ASSERT(rl_rig_restart_client(&r), "client 1 reload");
+    factory_free(c2.cf); memset(c2.cf, 0, sizeof(*c2.cf));
+    TEST_ASSERT(persist_load_factory(&c2.cdb, 0, c2.cf, r.ctx), "client 2 reload");
+    factory_t *lf = &r.lsp->factory;
+    printf("  after restarts: LSP epoch %u frozen=%d, client 1 frozen=%d, "
+           "client 2 frozen=%d\n", lf->counter.current_epoch,
+           factory_root_advance_frozen(lf), factory_root_advance_frozen(r.cf),
+           factory_root_advance_frozen(c2.cf));
+    TEST_ASSERT(lf->counter.current_epoch == 0 && factory_root_advance_frozen(lf),
+                "LSP at epoch 0, frozen");
+    TEST_ASSERT(factory_root_advance_frozen(r.cf), "client 1 frozen");
+
+    /* leaf operations at epoch 0 are refused on both sides */
+    int lrc = factory_advance_leaf_unsigned(lf, 1);
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    size_t na = ex_realloc_amounts(&lf->nodes[lf->leaf_node_indices[1]], 1000, amts);
+    int rrc = lsp_realloc_leaf(r.mgr, r.lsp, 1, amts, na);
+    int crc = factory_advance_leaf_unsigned(r.cf, 1);
+    int z[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, z) == 0, "pair");
+    cJSON *prop = wire_build_leaf_advance_propose(1, NULL, NULL);
+    wire_msg_t pm = { .msg_type = MSG_LEAF_ADVANCE_PROPOSE, .json = prop };
+    int hrc = client_handle_leaf_advance(z[0], r.ctx, &r.kps[1], r.cf, 1, &pm);
+    cJSON_Delete(prop);
+    close(z[0]); close(z[1]);
+    printf("  at epoch 0: LSP leaf advance rc=%d, LSP realloc rc=%d; client 1 "
+           "leaf advance rc=%d, PROPOSE handled=%d\n", lrc, rrc, crc, hrc);
+    TEST_ASSERT(lrc == FACTORY_ADVANCE_FROZEN, "LSP leaf advance refused (frozen)");
+    TEST_ASSERT(rrc == 0, "LSP realloc refused");
+    TEST_ASSERT(crc == FACTORY_ADVANCE_FROZEN && hrc == 0, "client refuses a leaf advance");
+
+    /* a leaf-advance request re-drives the identical root advance */
+    char before[65];
+    ex_txid_hex(lf->nodes[0].txid, before);
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    int lsp_mark2 = persist_load_root_advance_pending(&r.db, 0, NULL, NULL);
+    int cli_mark2 = persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL);
+    printf("  re-driven root advance: rc=%d clients %d/%d, epoch %u, frozen LSP %d "
+           "client %d, marks LSP %d client %d\n", rc, ok1, ok2,
+           lf->counter.current_epoch, factory_root_advance_frozen(lf),
+           factory_root_advance_frozen(r.cf), lsp_mark2, cli_mark2);
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "identical Tier B completed");
+    TEST_ASSERT(lf->counter.current_epoch == 1, "epoch 1");
+    TEST_ASSERT(!factory_root_advance_frozen(lf) && !factory_root_advance_frozen(r.cf),
+                "freeze lifted");
+    TEST_ASSERT(lsp_mark2 == 0 && cli_mark2 == 0, "marks cleared with the stored tree");
+
+    /* leaf operations resume */
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  leaf advance at epoch 1: rc=%d\n", rc);
+    TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 1");
+    TEST_ASSERT(rl_rig_restart_lsp(&r) && !factory_root_advance_frozen(&r.lsp->factory) &&
+                r.lsp->factory.counter.current_epoch == 1, "reload: epoch 1, not frozen");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* Two DW root rollovers through the real ceremonies, with leaf advances
+   between them and both sides recording every signed state, then a reload
+   and further advances: positions of different epochs never collide. */
+int test_reload_two_rollovers_no_reservation_collision(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_two", 0, 3), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_two2", 3), "second client");
+    alarm(900);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0, rolls = 0, steps = 0;
+    while (rolls < 2 && steps < 12) {
+        uint32_t e = r.lsp->factory.counter.current_epoch;
+        int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+        TEST_ASSERT(rc == 1 && ok1 && ok2, "advance (leaf or root)");
+        if (r.lsp->factory.counter.current_epoch != e) rolls++;
+        steps++;
+    }
+    TEST_ASSERT(rolls == 2 && r.lsp->factory.counter.current_epoch == 2, "two rollovers");
+    int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 2");
+    int nres = ex_sql_int(&r.db, "SELECT COUNT(*) FROM signed_state_reservations");
+    /* the LSP restarts (a DW-only client DB cannot record the epoch, so
+       the clients keep their trees in memory) */
+    TEST_ASSERT(rl_rig_restart_lsp(&r), "LSP reload");
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  %d advances, 2 rollovers, %d reservation rows; after reload: "
+           "epoch %u, next advance rc=%d\n", steps + 1, nres,
+           r.lsp->factory.counter.current_epoch, rc);
+    TEST_ASSERT(rc == 1 && ok1, "advance after reload (no reservation conflict)");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A PS factory DB from before ps_initial_signed_states (no chain[0] rows),
+   with advanced chains: the reload cannot tell the chain's epoch or link it,
+   so the factory stays refused rather than loading the rows as stored. */
+int test_reload_ps_without_chain0_refused(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_PS, "rl_noc0", 0), "rig");
+    alarm(300);
+    int ok = 0;
+    for (int a = 0; a < 2; a++)
+        TEST_ASSERT(ex_rig_ps_advance(&r, &ok) == 1 && ok, "chain advance");
+    TEST_ASSERT(sqlite3_exec(r.db.db, "DELETE FROM ps_initial_signed_states",
+                             NULL, NULL, NULL) == SQLITE_OK, "drop chain[0] rows");
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&r.db, 0, g, r.ctx), "reload");
+    printf("  advanced PS chain without a chain[0] row: flag=%d\n",
+           g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "refused");
+    factory_free(g); free(g);
+    alarm(0);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* The same Tier B as in test_reload_tierb_freeze, but nobody restarts: the
+   LSP and both clients keep the new epoch in memory, unsigned, with the
+   freeze set.  The re-driven root advance re-signs that same epoch on every
+   side and completes. */
+int test_reload_tierb_redrive_in_memory(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_frzmem", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_frzmem2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    int rc = rl_advance2_ex(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    factory_t *lf = &r.lsp->factory;
+    printf("  withheld final psigs, no restart: rc=%d; in memory: LSP epoch %u "
+           "frozen=%d, client 1 epoch %u frozen=%d, client 2 epoch %u frozen=%d\n",
+           rc, lf->counter.current_epoch, factory_root_advance_frozen(lf),
+           r.cf->counter.current_epoch, factory_root_advance_frozen(r.cf),
+           c2.cf->counter.current_epoch, factory_root_advance_frozen(c2.cf));
+    TEST_ASSERT(rc == 0 && dropped, "root advance interrupted");
+    TEST_ASSERT(factory_root_advance_frozen(lf) && factory_root_advance_frozen(r.cf),
+                "LSP and client 1 frozen in memory");
+    TEST_ASSERT(r.cf->counter.current_epoch == 1, "client 1 still rolled over in memory");
+
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  re-driven without a restart: rc=%d clients %d/%d, epoch %u, "
+           "frozen LSP %d client 1 %d\n", rc, ok1, ok2, lf->counter.current_epoch,
+           factory_root_advance_frozen(lf), factory_root_advance_frozen(r.cf));
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "the same root advance completes");
+    TEST_ASSERT(!factory_root_advance_frozen(lf) && !factory_root_advance_frozen(r.cf),
+                "freeze lifted");
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 1");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* Apply a catch-up (a copy) to client 1; returns the result and checks that
+   a refusal left it frozen at epoch 0. */
+static int rl_try_catchup(ex_rig_t *r, const cJSON *msg, int *still_frozen) {
+    cJSON *cp = cJSON_Duplicate(msg, 1);
+    int rc = client_apply_tree_catchup(r->cf, &r->cdb, cp, 1);
+    cJSON_Delete(cp);
+    *still_frozen = factory_root_advance_frozen(r->cf) &&
+                    r->cf->counter.current_epoch == 0;
+    return rc;
+}
+
+/* Client 1 completes a Tier B with everyone but crashes before storing it:
+   it restarts at epoch 0, frozen, while the LSP stored epoch 1 and will
+   never re-drive it.  On reconnect the LSP sends the stored signed tree
+   (MSG_TREE_CATCHUP); the client checks it against its own rebuild and
+   reservations and stores it.  A tampered, wrong-epoch, partial or oversized
+   catch-up is refused and the client stays frozen. */
+int test_reload_tree_catchup_after_crash(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_catch", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_catch2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    g_rl_c1_no_save = 1;
+    int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    g_rl_c1_no_save = 0;
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "Tier B completed on every side");
+    TEST_ASSERT(r.lsp->factory.counter.current_epoch == 1 &&
+                !factory_root_advance_frozen(&r.lsp->factory), "LSP stored epoch 1");
+
+    /* client 1 crashed before its save: it restarts at epoch 0, frozen */
+    TEST_ASSERT(rl_rig_restart_client(&r), "client 1 reload");
+    printf("  client 1 after the crash: epoch %u, frozen=%d (pending %u)\n",
+           r.cf->counter.current_epoch, factory_root_advance_frozen(r.cf),
+           r.cf->root_advance_pending_epoch);
+    TEST_ASSERT(factory_root_advance_frozen(r.cf) && r.cf->counter.current_epoch == 0,
+                "client 1 frozen at epoch 0");
+
+    /* the reconnect field: an older parser ignores it */
+    cJSON *rq = wire_build_reconnect(r.ctx, &r.pks[1], 0);
+    cJSON_AddNumberToObject(rq, "pending_root_epoch", 1);
+    secp256k1_pubkey pk;
+    uint64_t cn = 1;
+    TEST_ASSERT(wire_parse_reconnect(rq, r.ctx, &pk, &cn) && cn == 0,
+                "MSG_RECONNECT with the optional field still parses");
+    cJSON_Delete(rq);
+
+    /* the LSP offers only a tree it stored as complete */
+    factory_set_root_advance_pending(&r.lsp->factory, 2, 0);
+    cJSON *none = lsp_build_tree_catchup(r.mgr, r.lsp, 1);
+    factory_clear_root_advance_pending(&r.lsp->factory);
+    TEST_ASSERT(!none, "no catch-up while the LSP has a root advance pending");
+    TEST_ASSERT(!lsp_build_tree_catchup(r.mgr, r.lsp, 2), "no catch-up for another epoch");
+    cJSON *cu = lsp_build_tree_catchup(r.mgr, r.lsp, 1);
+    TEST_ASSERT(cu, "catch-up built from the stored tree");
+    cJSON *nodes = cJSON_GetObjectItem(cu, "nodes");
+    int nn = cJSON_GetArraySize(nodes);
+
+    int fr = 0, a = 0;
+    /* one bad signature */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON *o = cJSON_GetArrayItem(cJSON_GetObjectItem(t, "nodes"), nn - 1);
+        char *h = strdup(cJSON_GetObjectItem(o, "tx")->valuestring);
+        size_t hl = strlen(h);
+        h[hl - 8 - 40] = (h[hl - 8 - 40] == '0') ? '1' : '0';
+        cJSON_ReplaceItemInObject(o, "tx", cJSON_CreateString(h));
+        free(h);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  bad signature: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "bad signature refused");
+    }
+    /* two nodes swapped */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON *ar = cJSON_GetObjectItem(t, "nodes");
+        cJSON *o0 = cJSON_GetArrayItem(ar, nn - 1), *o1 = cJSON_GetArrayItem(ar, nn - 2);
+        char *h0 = strdup(cJSON_GetObjectItem(o0, "tx")->valuestring);
+        char *h1 = strdup(cJSON_GetObjectItem(o1, "tx")->valuestring);
+        cJSON_ReplaceItemInObject(o0, "tx", cJSON_CreateString(h1));
+        cJSON_ReplaceItemInObject(o1, "tx", cJSON_CreateString(h0));
+        free(h0); free(h1);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  swapped nodes: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "swapped nodes refused");
+    }
+    /* wrong epoch */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON_ReplaceItemInObject(t, "epoch", cJSON_CreateNumber(2));
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  wrong epoch: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "wrong epoch refused");
+    }
+    /* partial */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON_DeleteItemFromArray(cJSON_GetObjectItem(t, "nodes"), 0);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  partial: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "partial refused");
+    }
+    /* oversized TX */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON *o = cJSON_GetArrayItem(cJSON_GetObjectItem(t, "nodes"), 0);
+        size_t big = WIRE_TREE_CATCHUP_MAX_TX_HEX + 2;
+        char *h = malloc(big + 1);
+        memset(h, 'a', big);
+        h[big] = 0;
+        cJSON_ReplaceItemInObject(o, "tx", cJSON_CreateString(h));
+        free(h);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  oversized: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "oversized refused");
+    }
+    TEST_ASSERT(persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL) == 1,
+                "the mark is still stored after the refusals");
+
+    /* the real catch-up */
+    a = rl_try_catchup(&r, cu, &fr);
+    cJSON_Delete(cu);
+    int mark = persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL);
+    printf("  stored tree: applied=%d, client 1 epoch %u frozen=%d, mark %d\n", a,
+           r.cf->counter.current_epoch, factory_root_advance_frozen(r.cf), mark);
+    TEST_ASSERT(a == 1 && r.cf->counter.current_epoch == 1 &&
+                !factory_root_advance_frozen(r.cf), "caught up to epoch 1");
+    TEST_ASSERT(mark == 0, "mark cleared with the stored tree");
+    TEST_ASSERT(memcmp(r.cf->nodes[r.cf->leaf_node_indices[0]].txid,
+                       r.lsp->factory.nodes[r.lsp->factory.leaf_node_indices[0]].txid,
+                       32) == 0, "client 1 holds the LSP's epoch-1 leaf");
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  leaf advance at epoch 1 after the catch-up: rc=%d\n", rc);
+    TEST_ASSERT(rc == 1 && ok1, "leaf operations resume");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* Shared setup: leaf 0 to its last state, then a Tier B in which client 1's
+   final psigs are swallowed; the LSP is left frozen with client 1 recorded.
+   A mock chain at height 100 is attached. */
+static int rl_frozen_lsp(ex_rig_t *r, rl_cli2_t *c2, chain_backend_t *cb,
+                         const char *tag) {
+    char t2[64];
+    snprintf(t2, sizeof(t2), "%s2", tag);
+    if (!ex_rig_init_ex(r, FACTORY_ARITY_1, tag, 0, 2)) return 0;
+    if (!rl_cli2_init(r, c2, t2, 2)) return 0;
+    mk_init(cb, r->fund_txid);
+    g_mk.height = 100;
+    r->mgr->chain_be = cb;
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    if (rl_advance2(r, c2, &ok1, &ok2) != 1 || !ok1) return 0;
+    int rc = rl_advance2_ex(r, c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    if (rc != 0 || !dropped || !factory_root_advance_frozen(&r->lsp->factory))
+        return 0;
+    /* nobody answers from now on: a re-drive fails at once */
+    shutdown(r->sv[1], SHUT_RDWR);
+    shutdown(c2->sv[1], SHUT_RDWR);
+    return 1;
+}
+
+static void rl_frozen_free(ex_rig_t *r, rl_cli2_t *c2) {
+    r->mgr->chain_be = NULL;
+    rl_cli2_free(c2);
+    r->lsp->client_fds[1] = -1;
+    ex_rig_free(r);
+}
+
+/* A client withholds its final psigs for a root advance: the LSP records the
+   withholder, re-drives at most once per block, escalates only after it has
+   re-driven at least once since it started, then logs CRITICAL and shows
+   the escalation in listfactories.  With --freeze-force-close off nothing is
+   broadcast. */
+int test_reload_freeze_limit_and_escalation(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    rl_cli2_t c2;
+    chain_backend_t cb;
+    alarm(600);
+    TEST_ASSERT(rl_frozen_lsp(&r, &c2, &cb, "rl_flim"), "frozen LSP");
+    persist_root_advance_status_t st;
+    TEST_ASSERT(persist_load_root_advance_status(&r.db, 0, &st) == 1, "status");
+    printf("  withheld: mark epoch %u, withholders \"%s\"\n", st.epoch, st.withholders);
+    TEST_ASSERT(strcmp(st.withholders, "1") == 0, "client 1 recorded as withholding");
+
+    /* the limit is long past, but nothing was re-driven since the start */
+    r.mgr->freeze_max_blocks = 10;
+    int sends0 = g_mk.n_send_calls;
+    int e0 = lsp_check_root_advance_freeze(r.mgr, r.lsp, 100);   /* first sight */
+    int e1 = lsp_check_root_advance_freeze(r.mgr, r.lsp, 150);
+    printf("  frozen since 100, limit 10, no re-drive yet: at 150 -> %d\n", e1);
+    TEST_ASSERT(e0 == 0 && e1 == 0, "no escalation before a re-drive");
+
+    g_mk.height = 150;
+    uint32_t a0 = r.mgr->freeze_redrive_attempts;
+    lsp_redrive_root_advance(r.mgr, r.lsp);
+    uint32_t a1 = r.mgr->freeze_redrive_attempts;
+    lsp_redrive_root_advance(r.mgr, r.lsp);
+    uint32_t a2 = r.mgr->freeze_redrive_attempts;
+    g_mk.height = 151;
+    lsp_redrive_root_advance(r.mgr, r.lsp);
+    uint32_t a3 = r.mgr->freeze_redrive_attempts;
+    printf("  re-drive attempts: height 150: %u, again at 150: %u, at 151: %u\n",
+           a1 - a0, a2 - a1, a3 - a2);
+    TEST_ASSERT(a1 - a0 == 1 && a2 - a1 == 0 && a3 - a2 == 1, "at most one re-drive per block");
+    /* the re-drive itself ran the check: escalated at 150 */
+    int e2 = lsp_check_root_advance_freeze(r.mgr, r.lsp, 152);
+    TEST_ASSERT(persist_load_root_advance_status(&r.db, 0, &st) == 1, "status 2");
+    cJSON *lf = factory_recovery_list(&r.db, &cb);
+    cJSON *ra = NULL;
+    for (int i = 0; lf && i < cJSON_GetArraySize(lf); i++) {
+        cJSON *o = cJSON_GetArrayItem(lf, i);
+        if (cJSON_GetObjectItem(o, "root_advance_pending"))
+            ra = cJSON_GetObjectItem(o, "root_advance_pending");
+    }
+    int esc = ra && cJSON_IsTrue(cJSON_GetObjectItem(ra, "escalated"));
+    const cJSON *wh = ra ? cJSON_GetObjectItem(ra, "withholders") : NULL;
+    printf("  after the re-drive: escalated=%d (again -> %d); listfactories "
+           "escalated=%d withholders=%s; sends %d\n", st.escalated, e2, esc,
+           wh && cJSON_IsString(wh) ? wh->valuestring : "-",
+           g_mk.n_send_calls - sends0);
+    TEST_ASSERT(st.escalated && e2 == 0, "escalated once");
+    TEST_ASSERT(esc && wh && strcmp(wh->valuestring, "1") == 0,
+                "listfactories shows the escalation and the withholder");
+    TEST_ASSERT(g_mk.n_send_calls == sends0, "flag off: nothing broadcast");
+    cJSON_Delete(lf);
+    alarm(0);
+    rl_frozen_free(&r, &c2);
+    return 1;
+}
+
+/* With --freeze-force-close the escalation runs one force-close pass per
+   block, also after a restart, until the whole tree is published and
+   confirmed (a single pass publishes only what its timelocks allow). */
+int test_reload_freeze_force_close_multipass(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    rl_cli2_t c2;
+    chain_backend_t cb;
+    alarm(600);
+    TEST_ASSERT(rl_frozen_lsp(&r, &c2, &cb, "rl_fcmp"), "frozen LSP");
+    r.mgr->freeze_max_blocks = 2;
+    r.mgr->freeze_force_close = 1;
+    lsp_check_root_advance_freeze(r.mgr, r.lsp, 100);
+    g_mk.height = 101;
+    lsp_redrive_root_advance(r.mgr, r.lsp);          /* one re-drive, fails */
+    g_mk.height = 103;
+    int e = lsp_check_root_advance_freeze(r.mgr, r.lsp, 103);
+    TEST_ASSERT(e == 2, "escalated, first force-close pass");
+    int sends1 = g_mk.n_send_calls;
+    int same = lsp_check_root_advance_freeze(r.mgr, r.lsp, 103);
+    TEST_ASSERT(same == 0 && g_mk.n_send_calls == sends1, "one pass per block");
+
+    /* the LSP restarts: the escalation and the passes continue */
+    TEST_ASSERT(rl_rig_restart_lsp(&r) || factory_root_advance_frozen(&r.lsp->factory),
+                "LSP reload");
+    r.mgr->freeze_escalated = 0;
+    r.mgr->freeze_redrive_attempts = 0;
+    r.mgr->freeze_fc_last_height = 0;
+    r.mgr->freeze_fc_settled = 0;
+    int passes = 1;
+    for (int b = 0; b < 80 && !r.mgr->freeze_fc_settled; b++) {
+        mk_mine();
+        if (lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height) == 2)
+            passes++;
+    }
+    char state[16] = {0};
+    persist_get_factory_state(&r.db, 0, state, sizeof(state));
+    printf("  force-close: %d passes, settled=%d, factory state %s, %d TXs sent\n",
+           passes, r.mgr->freeze_fc_settled, state, g_mk.n_send_ok);
+    TEST_ASSERT(passes > 2, "more than one pass was needed");
+    TEST_ASSERT(r.mgr->freeze_fc_settled, "the force-close completed");
+    int more = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height + 1);
+    TEST_ASSERT(more == 0, "no passes after it settled");
+    alarm(0);
+    rl_frozen_free(&r, &c2);
+    return 1;
+}
+
+/* Two clients go silent (connected, no final psigs): Tier B gives up after
+   one overall deadline, not one per client, and records both. */
+int test_reload_tierb_withholders_one_deadline(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_dl", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_dl2", 2), "second client");
+    alarm(600);
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    r.mgr->tierb_psig_deadline_sec = 3;
+    time_t t0 = time(NULL);
+    int rc = rl_advance2_ex2(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                             MSG_STATE_ADV_CLIENT_FINAL_PSIGS, 1, &dropped);
+    long secs = (long)(time(NULL) - t0);
+    persist_root_advance_status_t st;
+    persist_load_root_advance_status(&r.db, 0, &st);
+    printf("  two silent clients, deadline 3 s: rc=%d after %ld s, withholders \"%s\"\n",
+           rc, secs, st.withholders);
+    TEST_ASSERT(rc == 0, "root advance stopped");
+    TEST_ASSERT(secs <= 5, "one deadline in total, not one per client");
+    TEST_ASSERT(strcmp(st.withholders, "1,2") == 0, "both withholders recorded");
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A refused catch-up whose reload from the DB fails reports an error (the
+   factory is then empty) so the reconnect stops using it. */
+int test_reload_catchup_reload_failure(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_crf", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_crf2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    g_rl_c1_no_save = 1;
+    int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    g_rl_c1_no_save = 0;
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "Tier B completed");
+    TEST_ASSERT(rl_rig_restart_client(&r) && factory_root_advance_frozen(r.cf),
+                "client 1 frozen at epoch 0");
+    cJSON *cu = lsp_build_tree_catchup(r.mgr, r.lsp, 1);
+    TEST_ASSERT(cu, "catch-up");
+    /* a bad signature, and the client DB can no longer load the factory */
+    cJSON *o = cJSON_GetArrayItem(cJSON_GetObjectItem(cu, "nodes"),
+                                  cJSON_GetArraySize(cJSON_GetObjectItem(cu, "nodes")) - 1);
+    char *h = strdup(cJSON_GetObjectItem(o, "tx")->valuestring);
+    size_t hl = strlen(h);
+    h[hl - 48] = (h[hl - 48] == '0') ? '1' : '0';
+    cJSON_ReplaceItemInObject(o, "tx", cJSON_CreateString(h));
+    free(h);
+    TEST_ASSERT(sqlite3_exec(r.cdb.db, "DELETE FROM factories", NULL, NULL, NULL) ==
+                SQLITE_OK, "break the client DB");
+    int a = client_apply_tree_catchup(r.cf, &r.cdb, cu, 1);
+    cJSON_Delete(cu);
+    printf("  refused catch-up with a failing reload: rc=%d, n_nodes=%zu\n", a,
+           r.cf->n_nodes);
+    TEST_ASSERT(a == -1, "error reported");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A DB whose v43 tables were created by an earlier build of this change
+   (root_advance_pending without its bookkeeping columns, no
+   root_advance_trees) gets them on open, and the pending-advance writes work. */
+int test_reload_v43_old_table_shape(void) {
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_v43old");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(sqlite3_exec(db.db,
+        "DROP TABLE root_advance_pending; DROP TABLE root_advance_trees; "
+        "CREATE TABLE root_advance_pending (factory_id INTEGER PRIMARY KEY, "
+        "epoch INTEGER NOT NULL, trigger_leaf INTEGER NOT NULL);",
+        NULL, NULL, NULL) == SQLITE_OK, "old table shape");
+    persist_close(&db);
+    TEST_ASSERT(persist_open(&db, path), "reopen");
+    int set = persist_set_root_advance_pending(&db, 0, 3, 1);
+    int wh = persist_set_root_advance_withholders(&db, 0, "2");
+    int hs = persist_set_root_advance_heights(&db, 0, 10, 11);
+    int es = persist_set_root_advance_escalated(&db, 0);
+    persist_root_advance_status_t st;
+    int ld = persist_load_root_advance_status(&db, 0, &st);
+    int trees = ex_sql_int(&db, "SELECT COUNT(*) FROM sqlite_master WHERE "
+                           "name='root_advance_trees'");
+    printf("  old-shape table: set=%d withholders=%d heights=%d escalated=%d "
+           "load=%d (\"%s\", %u, %u, %d); root_advance_trees present=%d\n",
+           set, wh, hs, es, ld, st.withholders, st.since_height,
+           st.last_redrive_height, st.escalated, trees);
+    TEST_ASSERT(set && wh && hs && es && ld == 1, "writes work on the upgraded table");
+    TEST_ASSERT(strcmp(st.withholders, "2") == 0 && st.since_height == 10 &&
+                st.escalated == 1, "values read back");
+    TEST_ASSERT(trees == 1, "root_advance_trees created");
+    persist_close(&db);
+    unlink(path);
     return 1;
 }

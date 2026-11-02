@@ -172,6 +172,11 @@ int client_run_reconnect(secp256k1_context *ctx,
     /* 5. Send MSG_RECONNECT */
     {
         cJSON *reconn = wire_build_reconnect(ctx, &my_pubkey, commitment_number);
+        /* A root advance we signed but did not store: ask for its tree
+           (optional field; an older LSP ignores it). */
+        if (reconn && factory_root_advance_frozen(factory))
+            cJSON_AddNumberToObject(reconn, "pending_root_epoch",
+                                    (double)factory->root_advance_pending_epoch);
         if (!wire_send(fd, MSG_RECONNECT, reconn)) {
             fprintf(stderr, "Client reconnect: send MSG_RECONNECT failed\n");
             cJSON_Delete(reconn);
@@ -407,6 +412,26 @@ int client_run_reconnect(secp256k1_context *ctx,
             /* Now read the actual RECONNECT_ACK */
             if (!wire_recv(fd, &msg)) {
                 fprintf(stderr, "Client reconnect: recv failed after CS retransmit\n");
+                wire_close(fd);
+                factory_free(factory); free(factory);
+                channel_cleanup(&channel);
+                return 0;
+            }
+        }
+        if (msg.msg_type == MSG_TREE_CATCHUP) {
+            /* the signed tree of the root advance we asked for */
+            int cu_rc = client_apply_tree_catchup(factory, db, msg.json, my_index);
+            cJSON_Delete(msg.json);
+            if (cu_rc < 0) {
+                fprintf(stderr, "Client reconnect: factory lost after a refused "
+                        "tree catch-up; aborting the reconnect\n");
+                wire_close(fd);
+                factory_free(factory); free(factory);
+                channel_cleanup(&channel);
+                return 0;
+            }
+            if (!wire_recv(fd, &msg)) {
+                fprintf(stderr, "Client reconnect: recv failed after TREE_CATCHUP\n");
                 wire_close(fd);
                 factory_free(factory); free(factory);
                 channel_cleanup(&channel);

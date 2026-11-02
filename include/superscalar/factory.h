@@ -213,10 +213,11 @@ typedef struct {
     uint32_t l_stock_state_counter;
     /* LSP side: l_stock_state_counter as of the newest state known to be in
        the DB.  An on-request reveal (MSG_LSTOCK_REVEAL_REQUEST) hands out only
-       states below it, so after a failed write the superseded state, which the
-       DB still holds, is never revealed.  Unset (0) means "the in-memory state
-       is the stored one" (creation, load).  Set by the exit-path writes in
-       lsp_channels.c. */
+       states below it, so after a failed write, or a ceremony that stopped
+       after the counter moved, the state the DB still holds is never
+       revealed.  Unset (0) means no advance has been written since creation
+       (the stored state is state 0); a reload from the DB sets it to the
+       stored counter.  Set by the exit-path writes in lsp_channels.c. */
     int l_stock_durable_set;
     uint32_t l_stock_durable_counter;
 
@@ -422,6 +423,18 @@ typedef struct {
        build on it.  Cleared when the factory is initialised again. */
     int tree_rebuilt_on_load;
     int tree_refusal_logged;       /* the CRITICAL refusal line was printed */
+    /* A root advance (Tier B) to this epoch had its signatures released
+       (the LSP's partial sigs, or this client's final psigs) but is not
+       stored as the signed tree yet; 0 = none.  A counterparty may hold that
+       newer epoch fully signed, and it would supersede anything signed at the
+       current epoch, so until the same root advance completes every leaf
+       advance, realloc and sub-factory chain advance is refused
+       (FACTORY_ADVANCE_FROZEN).  The only way forward is the identical root
+       advance (same trigger), which the reservations make the only one
+       signable.  Persisted in root_advance_pending. */
+    uint32_t root_advance_pending_epoch;
+    int root_advance_pending_trigger;  /* trigger_leaf_side of that advance */
+    int root_freeze_logged;
     factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
 
     /* Variable arity per tree level (4A): overrides leaf_arity when set.
@@ -626,6 +639,14 @@ int factory_derive_l_stock_secret(const factory_t *f,
    Call once per leaf node BEFORE factory_build_tree (and update before each advance
    when the new state's H arrives over the wire).  Sets the factory into mirror mode
    (apply_l_stock_hashlock then uses these hashes instead of deriving). */
+/* After a restart, once the hashlock seed is set again (LSP only): check every
+   node's restored L-stock state against the seed.  A stored L-stock hash must
+   be the hash of the secret for the stored state counter, and a DW leaf's
+   stored L-stock output must commit to it; a node without a stored hash gets
+   the one derived from its counter.  Returns 1 if all agree (or the factory
+   has no hashlock), 0 otherwise; the caller then refuses advances. */
+int factory_verify_l_stock_state(factory_t *f);
+
 void factory_set_node_l_stock_hash(factory_t *f, size_t node_idx,
                                    const unsigned char *h32);
 
@@ -774,6 +795,15 @@ extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in pr
 #define FACTORY_ADVANCE_REFUSED (-3)
 int factory_advance_refused(const factory_t *f);
 
+/* Returned by factory_advance_leaf_unsigned and factory_tick_root while a
+   root advance is pending (root_advance_pending_epoch), unless the call is
+   the one that rolls the root over to that epoch.  The boolean advance
+   functions return 0 for it.  Logged once per pending advance. */
+#define FACTORY_ADVANCE_FROZEN (-4)
+int factory_root_advance_frozen(const factory_t *f);
+void factory_set_root_advance_pending(factory_t *f, uint32_t epoch, int trigger);
+void factory_clear_root_advance_pending(factory_t *f);
+
 int factory_advance(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
@@ -788,6 +818,10 @@ int factory_advance_leaf(factory_t *f, int leaf_side);
    Returns -1 if leaf exhausted and root advanced (full rebuild needed).
    Returns FACTORY_ADVANCE_REFUSED for a factory restored from the DB. */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
+
+/* nSequence node idx carries under the factory's current counter (restart
+   reload consistency check). */
+uint32_t factory_node_nsequence(const factory_t *f, size_t idx);
 
 /* Tick the root DW counter forward (PS Tier B trigger).  For PS factories,
    leaf advances are chain extension (no counter) — root rollover is driven

@@ -44,6 +44,30 @@ void client_set_persist(persist_t *p) {
     g_client_persist = p;
 }
 
+/* Durably reserve node_idx's unsigned TX before this client releases a
+   signature on it (persist_reserve_signed_tx): once it is out, the LSP can
+   hold the fully signed state before the client has stored it, so after a
+   client restart that reloads the previous state the client must not sign a
+   different TX in the same position.  No DB: nothing to reserve.  Returns 1
+   if signing may go ahead. */
+static int client_reserve_node_tx(const factory_t *f, size_t node_idx,
+                                  uint32_t my_index) {
+    if (!g_client_persist) return 1;
+    if (!f || node_idx >= f->n_nodes) return 0;
+    const factory_node_t *node = &f->nodes[node_idx];
+    if (node->unsigned_tx.len == 0) return 0;
+    int any_nseq = node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY;
+    int rc = persist_reserve_signed_tx(g_client_persist, 0, (uint32_t)node_idx,
+                                       node->unsigned_tx.data,
+                                       node->unsigned_tx.len, any_nseq);
+    if (rc != PERSIST_RESERVE_OK)
+        fprintf(stderr, "Client %u: not signing node %zu: %s\n", my_index,
+                node_idx, rc == PERSIST_RESERVE_CONFLICT
+                    ? "a different TX was already signed in its position"
+                    : "could not record the TX before signing");
+    return rc == PERSIST_RESERVE_OK;
+}
+
 /* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
    If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
 static uint16_t g_min_profit_bps = 0;
@@ -3149,6 +3173,12 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
     }
     memset(my_seckey, 0, 32);
 
+    /* The LSP completes the state with this partial sig: reserve it first. */
+    if (!client_reserve_node_tx(factory, node_idx, my_index)) {
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
     /* Send REALLOC_PSIG (state + poison if prepared) */
     unsigned char my_psig_ser[32], my_poison_psig_ser[32];
     musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
@@ -4434,6 +4464,12 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
 
+    /* FINAL hands the LSP the complete new state: reserve it first. */
+    if (!client_reserve_node_tx(factory, node_idx, my_index)) {
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
     /* Step 8: ship FINAL with optional poison sig. */
     cJSON *fin_json = wire_build_leaf_advance_final(
         final_sig,
@@ -4546,11 +4582,134 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
+/* Put f back to its stored state after a refused catch-up.  Returns 0 if
+   that fails (f is then empty and must not be used). */
+static int catchup_reload(factory_t *f, persist_t *db) {
+    secp256k1_context *ctx = f->ctx;
+    factory_free(f);
+    memset(f, 0, sizeof(*f));
+    if (!persist_load_factory(db, 0, f, ctx)) {
+        fprintf(stderr, "Client: CRITICAL - could not reload the factory after a "
+                "refused tree catch-up\n");
+        return 0;
+    }
+    return 1;
+}
+
+int client_apply_tree_catchup(factory_t *f, persist_t *db, const cJSON *json,
+                              uint32_t my_index) {
+    if (!f || !db || !json) return 0;
+    if (!factory_root_advance_frozen(f) ||
+        f->counter.current_epoch >= f->root_advance_pending_epoch) {
+        fprintf(stderr, "Client %u: unexpected tree catch-up (no pending root "
+                "advance); ignored\n", my_index);
+        return 0;
+    }
+    uint32_t pending = f->root_advance_pending_epoch;
+    const cJSON *ep = cJSON_GetObjectItem(json, "epoch");
+    const cJSON *arr = cJSON_GetObjectItem(json, "nodes");
+    if (!ep || !cJSON_IsNumber(ep) || ep->valuedouble != (double)pending ||
+        !arr || !cJSON_IsArray(arr) ||
+        cJSON_GetArraySize(arr) != (int)f->n_nodes) {
+        fprintf(stderr, "Client %u: tree catch-up refused: wrong epoch or node "
+                "count (pending epoch %u)\n", my_index, pending);
+        return 0;
+    }
+    /* decode everything before touching the factory */
+    size_t n = f->n_nodes;
+    tx_buf_t *rx = calloc(n, sizeof(tx_buf_t));
+    if (!rx) return 0;
+    int ok = 1;
+    for (int k = 0; ok && k < cJSON_GetArraySize(arr); k++) {
+        const cJSON *o = cJSON_GetArrayItem(arr, k);
+        const cJSON *ni = cJSON_GetObjectItem(o, "node");
+        const cJSON *tx = cJSON_GetObjectItem(o, "tx");
+        if (!ni || !cJSON_IsNumber(ni) || ni->valuedouble < 0 ||
+            ni->valuedouble >= (double)n || !tx || !cJSON_IsString(tx)) { ok = 0; break; }
+        size_t i = (size_t)ni->valuedouble;
+        size_t hl = strlen(tx->valuestring);
+        if (rx[i].data || hl < 140 || (hl & 1) || hl > WIRE_TREE_CATCHUP_MAX_TX_HEX) {
+            ok = 0;
+            break;
+        }
+        tx_buf_init(&rx[i], (int)(hl / 2));
+        if (hex_decode(tx->valuestring, rx[i].data, hl / 2) != (int)(hl / 2)) { ok = 0; break; }
+        rx[i].len = hl / 2;
+    }
+    for (size_t i = 0; ok && i < n; i++) if (!rx[i].data) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "Client %u: tree catch-up refused: malformed\n", my_index);
+        for (size_t i = 0; i < n; i++) tx_buf_free(&rx[i]);
+        free(rx);
+        return 0;
+    }
+
+    /* rebuild the pending epoch locally (allowed while frozen) */
+    int trig = f->root_advance_pending_trigger;
+    int rc = (trig < 0) ? factory_tick_root(f) : factory_advance_leaf_unsigned(f, trig);
+    const char *why = NULL;
+    if (rc != -1 || f->counter.current_epoch != pending)
+        why = "could not rebuild the pending epoch";
+    for (size_t i = 0; !why && i < n; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->unsigned_tx.len == 0) { why = "a node has no rebuilt TX"; break; }
+        /* key-path: the signature sits right before the 4-byte nLockTime */
+        tx_buf_t mine;
+        tx_buf_init(&mine, (int)rx[i].len);
+        unsigned char sig[64];
+        memcpy(sig, rx[i].data + rx[i].len - 68, 64);
+        int same = finalize_signed_tx(&mine, node->unsigned_tx.data,
+                                      node->unsigned_tx.len, sig) &&
+                   mine.len == rx[i].len &&
+                   memcmp(mine.data, rx[i].data, rx[i].len) == 0;
+        tx_buf_free(&mine);
+        if (!same) { why = "a TX is not the locally rebuilt one"; break; }
+        int any_nseq = node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY;
+        int lk = persist_lookup_reserved_tx(db, 0, node->unsigned_tx.data,
+                                            node->unsigned_tx.len, any_nseq);
+        if (lk < 0) { why = "a TX conflicts with a reservation"; break; }
+        /* a node re-signed in this advance that this client signs: it
+           reserved exactly this TX before releasing its psigs */
+        if (!node->is_signed &&
+            factory_find_signer_slot(f, i, my_index) >= 0 && lk != 1) {
+            why = "a node this client signed has no matching reservation";
+            break;
+        }
+    }
+    if (!why) {
+        for (size_t i = 0; i < n; i++) {
+            factory_node_t *node = &f->nodes[i];
+            tx_buf_free(&node->signed_tx);
+            node->signed_tx = rx[i];
+            memset(&rx[i], 0, sizeof(rx[i]));
+            node->is_signed = 1;
+        }
+        if (!factory_verify_all(f)) why = "a signature does not verify";
+    }
+    for (size_t i = 0; i < n; i++) tx_buf_free(&rx[i]);
+    free(rx);
+    if (!why) {
+        factory_clear_root_advance_pending(f);
+        if (!client_persist_exit_state(db, f)) why = "could not store the tree";
+    }
+    if (why) {
+        fprintf(stderr, "Client %u: tree catch-up for epoch %u refused: %s; "
+                "staying frozen\n", my_index, pending, why);
+        return catchup_reload(f, db) ? 0 : -1;
+    }
+    printf("Client %u: caught up with the stored tree of epoch %u\n",
+           my_index, pending);
+    return 1;
+}
+
 int client_persist_exit_state(persist_t *db, const factory_t *f) {
     if (!db || !f) return 0;
     int own_txn = !persist_in_transaction(db);
     if (own_txn && !persist_begin(db)) return 0;
     int ok = persist_save_signed_tree_nodes(db, f, 0) >= 0;
+    /* a root advance completed in memory is stored with this tree */
+    if (ok && !factory_root_advance_frozen(f))
+        ok = persist_clear_root_advance_pending(db, 0, f->counter.current_epoch);
     for (size_t i = 0; ok && i < f->n_nodes; i++) {
         const factory_node_t *n = &f->nodes[i];
         if (!n->is_ps_leaf || !n->is_signed || n->signed_tx.len == 0) continue;
@@ -4630,14 +4789,34 @@ static int client_handle_state_advance_stateless(int fd,
            leaf — DW counter exhaustion.  Per-step rc==1 means advanced (keep
            going). */
     int adv_rc = 0;
-    {
+    if (factory_root_advance_frozen(factory)) {
+        /* We released our final psigs for this root advance but it did not
+           complete.  Only the same advance may follow. */
+        if (epoch_after != factory->root_advance_pending_epoch ||
+            trigger_leaf_side != factory->root_advance_pending_trigger) {
+            fprintf(stderr, "Client-stateless Tier B %u: a root advance to epoch "
+                    "%u (trigger %d) is pending; refusing epoch %u (trigger %d)\n",
+                    my_index, factory->root_advance_pending_epoch,
+                    factory->root_advance_pending_trigger, epoch_after,
+                    trigger_leaf_side);
+            return 0;
+        }
+    }
+    /* Already rolled over to that epoch in memory (an earlier attempt failed
+       without a restart, after or before our final psigs): re-sign the same
+       new epoch, as the LSP does, instead of advancing again.  The
+       reservations keep every TX identical. */
+    if (factory->counter.current_epoch == epoch_after && epoch_after > 0)
+        adv_rc = -1;
+    if (adv_rc != -1) {
         int max_steps = (int)(factory->states_per_layer + 2);
         if (max_steps < 4) max_steps = 4;
         if (trigger_leaf_side < 0) {
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_tick_root(factory);
-                if (adv_rc == FACTORY_ADVANCE_REFUSED)
-                    return 0;  /* restored from the DB; factory.c logged it */
+                if (adv_rc == FACTORY_ADVANCE_REFUSED ||
+                    adv_rc == FACTORY_ADVANCE_FROZEN)
+                    return 0;  /* factory.c logged it */
                 if (adv_rc == -1) break;
                 if (adv_rc != 0) {
                     fprintf(stderr, "Client-stateless Tier B %u: root tick step %d "
@@ -4648,8 +4827,9 @@ static int client_handle_state_advance_stateless(int fd,
         } else {
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_advance_leaf_unsigned(factory, trigger_leaf_side);
-                if (adv_rc == FACTORY_ADVANCE_REFUSED)
-                    return 0;  /* restored from the DB; factory.c logged it */
+                if (adv_rc == FACTORY_ADVANCE_REFUSED ||
+                    adv_rc == FACTORY_ADVANCE_FROZEN)
+                    return 0;  /* factory.c logged it */
                 if (adv_rc == -1) break;
                 if (adv_rc != 1) {
                     fprintf(stderr, "Client-stateless Tier B %u: advance step %d "
@@ -4978,6 +5158,33 @@ static int client_handle_state_advance_stateless(int fd,
     /* INVARIANT: own state + poison secnonces zeroed by musig_create_partial_sig. */
     free(all_pn_flat_c);  /* all-signer nonce matrix no longer needed */
 
+    /* From here the LSP can complete the new epoch: mark it pending,
+       durably, so nothing more is signed at the old epoch until it is stored
+       as complete here (a restarted client reloads the old epoch). */
+    if (g_client_persist &&
+        !persist_set_root_advance_pending(g_client_persist, 0,
+                                          factory->counter.current_epoch,
+                                          trigger_leaf_side)) {
+        fprintf(stderr, "Client-stateless Tier B %u: could not record the pending "
+                "root advance; not signing\n", my_index);
+        for (size_t j = 0; j < n_affected; j++)
+            if (poison_prepared_c[j]) factory_session_reset_poison(factory, affected[j]);
+        return 0;
+    }
+    factory_set_root_advance_pending(factory, factory->counter.current_epoch,
+                                     trigger_leaf_side);
+
+    /* Our partial sigs let the LSP complete every node we sign: reserve
+       them first. */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!my_signs_per_node[k]) continue;
+        if (!client_reserve_node_tx(factory, affected[k], my_index)) {
+            for (size_t j = 0; j < n_affected; j++)
+                if (poison_prepared_c[j]) factory_session_reset_poison(factory, affected[j]);
+            return 0;
+        }
+    }
+
     /* Step 9: send CLIENT_FINAL_PSIGS. */
     cJSON *fp = wire_build_state_adv_client_final_psigs(
         (const unsigned char *)my_psigs_per_node, (uint32_t)n_affected,
@@ -5068,6 +5275,9 @@ static int client_handle_state_advance_stateless(int fd,
 
     printf("Client-stateless Tier B %u: %zu affected nodes signed\n",
            my_index, n_affected);
+    /* complete; client_persist_exit_state clears the stored mark with the
+       new epoch's tree */
+    factory_clear_root_advance_pending(factory);
     return 1;
 }
 

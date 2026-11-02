@@ -148,6 +148,14 @@ static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     return dw_current_nsequence(&f->counter.layers[node->dw_layer_index]);
 }
 
+/* The nSequence node idx would carry under the factory's CURRENT counter.
+   Used by the restart reload (persist.c) to check a stored tree row against
+   the reloaded counter. */
+uint32_t factory_node_nsequence(const factory_t *f, size_t idx) {
+    if (!f || idx >= f->n_nodes) return 0;
+    return node_nsequence(f, &f->nodes[idx]);
+}
+
 /* Add a node to the factory. Returns node index or -1 on error.
    node_cltv: if > 0, build CLTV timeout taptree for this node's spending_spk. */
 static int add_node(
@@ -403,6 +411,52 @@ static int apply_l_stock_hashlock(factory_t *f, factory_node_t *node) {
     sha256(secret, 32, node->l_stock_hash);
     node->has_l_stock_hash = 1;
     memset(secret, 0, sizeof(secret));  /* LSP re-derives on demand; don't retain */
+    return 1;
+}
+
+int factory_verify_l_stock_state(factory_t *f) {
+    if (!f) return 0;
+    if (!f->use_hashlock_poison || !f->has_shachain) return 1;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        int dw_leaf = (node->type == NODE_STATE && node->n_children == 0 &&
+                       !node->is_ps_leaf && node->n_outputs >= 2);
+        if (!node->has_l_stock_hash && !dw_leaf) continue;
+        unsigned char secret[32], h[32];
+        if (!factory_derive_l_stock_secret(f, node, node->l_stock_state_counter,
+                                           secret))
+            return 0;
+        sha256(secret, 32, h);
+        memset(secret, 0, sizeof(secret));
+        if (node->has_l_stock_hash) {
+            if (memcmp(h, node->l_stock_hash, 32) != 0) {
+                fprintf(stderr, "factory: node %zu: the stored L-stock hash is not "
+                        "the hash of state %u's secret\n", i,
+                        node->l_stock_state_counter);
+                return 0;
+            }
+        } else {
+            memcpy(node->l_stock_hash, h, 32);
+            node->has_l_stock_hash = 1;
+        }
+        if (dw_leaf) {
+            /* the stored state's L-stock output must commit to that hash */
+            int anchor = (node->outputs[node->n_outputs - 1].script_pubkey_len ==
+                              P2A_SPK_LEN &&
+                          memcmp(node->outputs[node->n_outputs - 1].script_pubkey,
+                                 P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
+            size_t ls = node->n_outputs - 1 - (size_t)anchor;
+            unsigned char spk[34];
+            if (!build_l_stock_spk(f, node, spk) ||
+                node->outputs[ls].script_pubkey_len != 34 ||
+                memcmp(spk, node->outputs[ls].script_pubkey, 34) != 0) {
+                fprintf(stderr, "factory: node %zu: the stored L-stock output does "
+                        "not commit to state %u's hash\n", i,
+                        node->l_stock_state_counter);
+                return 0;
+            }
+        }
+    }
     return 1;
 }
 
@@ -2271,7 +2325,7 @@ int factory_rebuild_path_unsigned(factory_t *f, int leaf_node_idx) {
 
 int factory_advance_and_rebuild_path(factory_t *f, int leaf_side) {
     int ret = factory_advance_leaf_unsigned(f, leaf_side);
-    if (ret == FACTORY_ADVANCE_REFUSED) return ret;
+    if (ret == FACTORY_ADVANCE_REFUSED || ret == FACTORY_ADVANCE_FROZEN) return ret;
     if (ret == 0) return -2;  /* fully exhausted */
     if (ret < 0) {
         /* Leaf exhausted, root layer advanced — rebuild path */
@@ -2455,6 +2509,44 @@ int factory_advance_refused(const factory_t *f) {
     return f && f->tree_rebuilt_on_load;
 }
 
+int factory_root_advance_frozen(const factory_t *f) {
+    return f && f->root_advance_pending_epoch != 0;
+}
+
+void factory_set_root_advance_pending(factory_t *f, uint32_t epoch, int trigger) {
+    if (!f) return;
+    if (f->root_advance_pending_epoch != epoch) f->root_freeze_logged = 0;
+    f->root_advance_pending_epoch = epoch;
+    f->root_advance_pending_trigger = trigger;
+}
+
+void factory_clear_root_advance_pending(factory_t *f) {
+    if (!f) return;
+    f->root_advance_pending_epoch = 0;
+    f->root_advance_pending_trigger = 0;
+    f->root_freeze_logged = 0;
+}
+
+/* Refuse an operation at the current epoch while a root advance is pending
+   (see root_advance_pending_epoch).  Logged once per pending advance. */
+static int refuse_frozen(factory_t *f, const char *what) {
+    if (!factory_root_advance_frozen(f)) return 0;
+    if (!f->root_freeze_logged) {
+        fprintf(stderr, "factory: refusing %s: a root advance to epoch %u was "
+                "signed by this side but is not stored as complete; a "
+                "counterparty may hold it, so nothing at epoch %u is signed "
+                "until that same root advance completes (logged once)\n", what,
+                f->root_advance_pending_epoch, f->counter.current_epoch);
+        f->root_freeze_logged = 1;
+    }
+    return 1;
+}
+
+/* While frozen, the one allowed step is the rollover to the pending epoch. */
+static int frozen_allows_rollover(const factory_t *f, int rolls_over) {
+    return rolls_over && f->counter.current_epoch < f->root_advance_pending_epoch;
+}
+
 int factory_advance(factory_t *f) {
     if (refuse_rebuilt_tree(f, "a root advance")) return 0;
     if (!dw_counter_advance(&f->counter))
@@ -2549,6 +2641,7 @@ int factory_rebuild_node_tx(factory_t *f, size_t node_idx) {
 int factory_set_leaf_amounts(factory_t *f, int leaf_side,
                               const uint64_t *amounts, size_t n_amounts) {
     if (refuse_rebuilt_tree(f, "a leaf realloc")) return 0;
+    if (refuse_frozen(f, "a leaf realloc")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
@@ -2678,7 +2771,9 @@ fail:
 /* Update L-stock output for a specific leaf node after per-leaf advance.
    L-stock is always the last output. */
 static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
-    if (!f->has_shachain)
+    /* A seedless client mirroring the LSP's hashes has no shachain but must
+       rebuild the L-stock the same way, with the hash it was sent. */
+    if (!f->has_shachain && !f->has_node_l_stock_hashes)
         return 1;  /* nothing to update */
 
     factory_node_t *node = &f->nodes[node_idx];
@@ -2706,6 +2801,7 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {
     if (refuse_rebuilt_tree(f, "a leaf advance")) return 0;
+    if (refuse_frozen(f, "a leaf advance")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
@@ -2755,6 +2851,14 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     if (refuse_rebuilt_tree(f, "a leaf advance")) return FACTORY_ADVANCE_REFUSED;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    if (factory_root_advance_frozen(f)) {
+        const factory_node_t *ln = &f->nodes[f->leaf_node_indices[leaf_side]];
+        int rolls = ln->is_ps_leaf
+            ? ((uint32_t)ln->ps_chain_len + 1 > f->states_per_layer)
+            : dw_is_exhausted(&f->leaf_layers[leaf_side]);
+        if (!frozen_allows_rollover(f, rolls) && refuse_frozen(f, "a leaf advance"))
+            return FACTORY_ADVANCE_FROZEN;
+    }
 
     size_t node_idx = f->leaf_node_indices[leaf_side];
     factory_node_t *node = &f->nodes[node_idx];
@@ -2848,6 +2952,11 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
 int factory_tick_root(factory_t *f) {
     if (!f) return 0;
     if (refuse_rebuilt_tree(f, "a root tick")) return FACTORY_ADVANCE_REFUSED;
+    if (factory_root_advance_frozen(f) &&
+        !frozen_allows_rollover(f, f->counter.n_layers > 0 &&
+                                   dw_is_exhausted(&f->counter.layers[0])) &&
+        refuse_frozen(f, "a root tick"))
+        return FACTORY_ADVANCE_FROZEN;
     /* F7: invert the trigger semantics.  A "tick" represents one step_blocks
        worth of block-height progression.  Two cases:
 
@@ -2926,6 +3035,7 @@ int factory_subfactory_chain_advance_unsigned(
 {
     if (!f) return 0;
     if (refuse_rebuilt_tree(f, "a sub-factory chain advance")) return 0;
+    if (refuse_frozen(f, "a sub-factory chain advance")) return 0;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
     if (sub_idx_in_leaf < 0) return 0;
 

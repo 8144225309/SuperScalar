@@ -297,6 +297,33 @@ static int lsp_persist_advanced_subfactory(lsp_channel_mgr_t *mgr, factory_t *f,
     return ok;
 }
 
+/* Durably reserve node_idx's unsigned TX before the LSP releases a signature
+   on it (persist_reserve_signed_tx).  Once the LSP's partial sig is out, the
+   counterparty can hold the fully signed state before the LSP has stored it;
+   after a restart that reloads the previous state, the LSP must not sign a
+   different TX in the same position (the same nSequence of a DW node, or
+   another spend of the same PS chain output), only the identical one.
+   Without a DB nothing survives a restart, so nothing is reserved.  Returns 1
+   if signing may go ahead. */
+static int lsp_reserve_node_tx(lsp_channel_mgr_t *mgr, factory_t *f,
+                               size_t node_idx) {
+    if (!mgr || !mgr->persist) return 1;
+    if (!f || node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (node->unsigned_tx.len == 0) return 0;
+    int any_nseq = node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY;
+    int rc = persist_reserve_signed_tx((persist_t *)mgr->persist, 0,
+                                       (uint32_t)node_idx,
+                                       node->unsigned_tx.data,
+                                       node->unsigned_tx.len, any_nseq);
+    if (rc != PERSIST_RESERVE_OK)
+        fprintf(stderr, "LSP: not signing node %zu: %s\n", node_idx,
+                rc == PERSIST_RESERVE_CONFLICT
+                    ? "a different TX was already signed in its position"
+                    : "could not record the TX before signing");
+    return rc == PERSIST_RESERVE_OK;
+}
+
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
                        const factory_t *factory,
@@ -1509,12 +1536,175 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
    When SS_MUSIG_STATELESS is unset the caller takes the legacy path
    instead and this function is unreachable. */
+int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                          int trigger_leaf_side);
+
+/* Re-drive a pending root advance (factory_t.root_advance_pending_epoch):
+   the same advance, with the same trigger.  After a restart the factory is
+   still at the previous epoch, so the trigger rolls it over again (the only
+   step the freeze allows); in memory after a failed ceremony it already has.
+   The signed-state reservations make the identical TXs the only ones that
+   can be signed.  Returns 1 when the root advance completed. */
+/* Current height from the chain backend, 0 if unknown. */
+static uint32_t lsp_chain_height(lsp_channel_mgr_t *mgr) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!cb && mgr->watchtower) cb = mgr->watchtower->chain;
+    if (!cb || !cb->get_block_height) return 0;
+    int h = cb->get_block_height(cb);
+    return h > 0 ? (uint32_t)h : 0;
+}
+
+/* One force-close pass per block while escalated with --freeze-force-close,
+   until a pass reports the factory settled: one pass publishes only the
+   levels whose timelocks are met. */
+static int lsp_freeze_force_close_pass(lsp_channel_mgr_t *mgr, uint32_t height) {
+    if (!mgr->freeze_force_close || mgr->freeze_fc_settled) return 0;
+    if (mgr->freeze_fc_last_height == height) return 0;
+    mgr->freeze_fc_last_height = height;
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!cb && mgr->watchtower) cb = mgr->watchtower->chain;
+    factory_recovery_result_t res;
+    memset(&res, 0, sizeof(res));
+    char status[512] = {0};
+    int ok = factory_recovery_run_ex((persist_t *)mgr->persist, cb, 0, 0, &res,
+                                     status, sizeof(status));
+    if (res.settled) mgr->freeze_fc_settled = 1;
+    fprintf(stderr, "LSP: freeze force-close pass at height %u: %s%s\n", height,
+            ok ? "" : "FAILED ", status);
+    return 2;
+}
+
+int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  uint32_t height) {
+    if (!mgr || !lsp || height == 0) return 0;
+    factory_t *f = &lsp->factory;
+    if (!factory_root_advance_frozen(f)) {
+        mgr->freeze_escalated = 0;
+        return 0;
+    }
+    persist_t *db = (persist_t *)mgr->persist;
+    persist_root_advance_status_t st;
+    memset(&st, 0, sizeof(st));
+    if (db) persist_load_root_advance_status(db, 0, &st);
+    if (st.since_height == 0) {
+        /* first sight of this freeze with a known height */
+        if (db) persist_set_root_advance_heights(db, 0, height, st.last_redrive_height);
+        st.since_height = height;
+    }
+    if (st.escalated || mgr->freeze_escalated) {
+        mgr->freeze_escalated = 1;
+        return lsp_freeze_force_close_pass(mgr, height);
+    }
+    uint32_t limit = mgr->freeze_max_blocks;
+    if (limit == 0) limit = f->dying_blocks > 1 ? f->dying_blocks / 2 : 144;
+    if (height < st.since_height || height - st.since_height < limit) return 0;
+    /* an LSP that was down for long escalates only after it has tried the
+       re-drive at least once since it started */
+    if (mgr->freeze_redrive_attempts == 0) return 0;
+
+    uint32_t left = factory_blocks_until_expired(f, height);
+    fprintf(stderr, "LSP: CRITICAL - factory frozen for %u blocks (limit %u) on "
+            "a root advance to epoch %u that client(s) %s did not complete; "
+            "%u blocks to expiry.  Payments still settle and the distribution "
+            "TX pays everyone at the CLTV; %s\n",
+            height - st.since_height, limit, f->root_advance_pending_epoch,
+            st.withholders[0] ? st.withholders : "(unknown)", left,
+            mgr->freeze_force_close ? "starting the force-close (--freeze-force-close)"
+                                    : "force-close is left to the operator "
+                                      "(--freeze-force-close is off)");
+    mgr->freeze_escalated = 1;
+    if (db) persist_set_root_advance_escalated(db, 0);
+    if (!mgr->freeze_force_close) return 1;
+    return lsp_freeze_force_close_pass(mgr, height);
+}
+
+cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch) {
+    if (!mgr || !mgr->persist || !lsp) return NULL;
+    persist_t *db = (persist_t *)mgr->persist;
+    factory_t *f = &lsp->factory;
+    /* only a root advance stored as complete, and only the current epoch */
+    if (factory_root_advance_frozen(f) || f->tree_rebuilt_on_load ||
+        f->counter.current_epoch != epoch)
+        return NULL;
+    if (persist_load_root_advance_pending(db, 0, NULL, NULL) != 0) return NULL;
+    char **hx = calloc(f->n_nodes, sizeof(char *));
+    if (!hx) return NULL;
+    cJSON *j = NULL;
+    if (persist_load_root_advance_tree(db, 0, epoch, f->n_nodes, hx)) {
+        j = cJSON_CreateObject();
+        cJSON_AddNumberToObject(j, "epoch", (double)epoch);
+        cJSON *arr = cJSON_CreateArray();
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "node", (double)i);
+            cJSON_AddStringToObject(o, "tx", hx[i]);
+            cJSON_AddItemToArray(arr, o);
+        }
+        cJSON_AddItemToObject(j, "nodes", arr);
+    } else {
+        fprintf(stderr, "LSP: no stored signed tree of epoch %u to send\n", epoch);
+    }
+    for (size_t i = 0; i < f->n_nodes; i++) free(hx[i]);
+    free(hx);
+    return j;
+}
+
+int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp) return 0;
+    factory_t *f = &lsp->factory;
+    if (!factory_root_advance_frozen(f)) return 0;
+    int trig = f->root_advance_pending_trigger;
+    /* At most one re-drive per block: a client that keeps withholding cannot
+       make the LSP spin. */
+    uint32_t h = lsp_chain_height(mgr);
+    if (h) {
+        lsp_check_root_advance_freeze(mgr, lsp, h);
+        persist_root_advance_status_t st;
+        uint32_t last = mgr->freeze_last_redrive_height;
+        uint32_t since = 0;
+        if (mgr->persist &&
+            persist_load_root_advance_status((persist_t *)mgr->persist, 0, &st) == 1) {
+            if (st.last_redrive_height > last) last = st.last_redrive_height;
+            since = st.since_height;
+        }
+        if (last == h) {
+            fprintf(stderr, "LSP: the pending root advance was already re-driven "
+                    "at height %u; next attempt at the next block\n", h);
+            return 0;
+        }
+        mgr->freeze_last_redrive_height = h;
+        if (mgr->persist)
+            persist_set_root_advance_heights((persist_t *)mgr->persist, 0,
+                                             since ? since : h, h);
+    }
+    mgr->freeze_redrive_attempts++;
+    printf("LSP: re-driving the pending root advance to epoch %u (trigger %d)\n",
+           f->root_advance_pending_epoch, trig);
+    if (f->counter.current_epoch < f->root_advance_pending_epoch) {
+        int rc = (trig < 0) ? factory_tick_root(f)
+                            : factory_advance_leaf_unsigned(f, trig);
+        if (rc != -1 || f->counter.current_epoch != f->root_advance_pending_epoch) {
+            fprintf(stderr, "LSP: cannot roll over to the pending epoch %u "
+                    "(rc=%d, epoch %u); leaf operations stay refused\n",
+                    f->root_advance_pending_epoch, rc, f->counter.current_epoch);
+            return 0;
+        }
+    }
+    return lsp_run_state_advance(mgr, lsp, trig);
+}
+
 static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         int leaf_side) {
     factory_t *f = &lsp->factory;
 
     if (f->leaf_arity != FACTORY_ARITY_1 && f->leaf_arity != FACTORY_ARITY_PS) return 1;
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    /* A root advance we signed but did not store is pending: nothing is
+       signed at the current epoch; a leaf-advance request re-drives that
+       same root advance instead. */
+    if (factory_root_advance_frozen(f))
+        return lsp_redrive_root_advance(mgr, lsp);
 
     /* PS k>=2: same refusal as legacy path (see lsp_advance_leaf header). */
     if (f->leaf_arity == FACTORY_ARITY_PS && f->ps_subfactory_arity >= 2) {
@@ -1596,8 +1786,8 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 1: advance leaf state to rebuild the unsigned TX. */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
-    if (rc == FACTORY_ADVANCE_REFUSED)
-        return 0;  /* restored from the DB; factory.c logged it */
+    if (rc == FACTORY_ADVANCE_REFUSED || rc == FACTORY_ADVANCE_FROZEN)
+        return 0;  /* factory.c logged it */
     if (rc == 0) {
         fprintf(stderr, "LSP-stateless: leaf %d advance exhausted\n", leaf_side);
         return 0;
@@ -1860,6 +2050,13 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fprintf(stderr, "LSP-stateless: set LSP poison partial_sig failed -- degrading\n");
         factory_session_reset_poison(f, node_idx);
         leaf_poison_prepared = 0;
+    }
+
+    /* Reserve the new state durably before our partial sig goes out: with
+       it the client can complete the state before we have stored it. */
+    if (!lsp_reserve_node_tx(mgr, f, node_idx)) {
+        factory_session_reset_poison(f, node_idx);
+        return 0;
     }
 
     /* Step 7: ship LSP_RESPONSE with optional poison fields. */
@@ -2703,6 +2900,31 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        by musig_create_partial_sig.  No LSP secnonce in scope for the recv
        that follows. */
 
+    /* Mark the root advance pending, durably, before our partial sigs go
+       out: from then on a client may hold the new epoch, so nothing more is
+       signed at the old one until this advance is stored as complete. */
+    if (mgr->persist &&
+        !persist_set_root_advance_pending((persist_t *)mgr->persist, 0,
+                                          f->counter.current_epoch,
+                                          trigger_leaf_side)) {
+        fprintf(stderr, "LSP-stateless Tier B: could not record the pending "
+                "root advance; not signing\n");
+        for (size_t j = 0; j < n_affected; j++)
+            if (poison_prepared[j]) factory_session_reset_poison(f, affected[j]);
+        return 0;
+    }
+    factory_set_root_advance_pending(f, f->counter.current_epoch, trigger_leaf_side);
+
+    /* Reserve every re-signed node durably before our partial sigs go out
+       (see lsp_reserve_node_tx). */
+    for (size_t k = 0; k < n_affected; k++) {
+        if (!lsp_reserve_node_tx(mgr, f, affected[k])) {
+            for (size_t j = 0; j < n_affected; j++)
+                if (poison_prepared[j]) factory_session_reset_poison(f, affected[j]);
+            return 0;
+        }
+    }
+
     /* Step 7: Send LSP_RESPONSE with per-node pubnonces + psigs to all clients.
        Gap A: also forward EVERY signer's pubnonce per node (from the session,
        which holds all collected nonces) so each client can build the aggnonce
@@ -2743,17 +2965,44 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     }
     cJSON_Delete(response);
 
-    /* Step 8: Collect CLIENT_FINAL_PSIGS from each client. */
+    /* Step 8: Collect CLIENT_FINAL_PSIGS from each client.  A client that
+       does not deliver is recorded as withholding; the others are still
+       read, so every withholder of this root advance is known. */
+    char withheld_csv[256] = {0};
+    int n_withheld = 0;
+    /* One deadline for all clients: once it has passed, a client whose
+       psigs are not already waiting on its socket counts as withholding. */
+    int psig_deadline = mgr->tierb_psig_deadline_sec > 0
+                        ? mgr->tierb_psig_deadline_sec
+                        : WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC;
+    time_t deadline = time(NULL) + psig_deadline;
     for (size_t c = 0; c < lsp->n_clients; c++) {
         wire_msg_t pmsg;
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg,
-                                          WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC) ||
-            pmsg.msg_type != MSG_STATE_ADV_CLIENT_FINAL_PSIGS) {
+        memset(&pmsg, 0, sizeof(pmsg));
+        long left_sec = (long)(deadline - time(NULL));
+        int got;
+        if (left_sec > 0) {
+            got = recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg,
+                                              (int)left_sec);
+        } else {
+            struct pollfd pf = { .fd = lsp->client_fds[c], .events = POLLIN,
+                                 .revents = 0 };
+            got = (lsp->client_fds[c] >= 0 && poll(&pf, 1, 0) > 0 &&
+                   (pf.revents & POLLIN))
+                  ? recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c],
+                                                &pmsg, 1)
+                  : 0;
+        }
+        if (!got || pmsg.msg_type != MSG_STATE_ADV_CLIENT_FINAL_PSIGS) {
             fprintf(stderr,
                 "LSP-stateless Tier B: expected CLIENT_FINAL_PSIGS from client %zu, "
                 "got 0x%02x\n", c, pmsg.msg_type);
             if (pmsg.json) cJSON_Delete(pmsg.json);
-            return 0;
+            size_t wl = strlen(withheld_csv);
+            snprintf(withheld_csv + wl, sizeof(withheld_csv) - wl, "%s%zu",
+                     n_withheld ? "," : "", c + 1);
+            n_withheld++;
+            continue;
         }
         unsigned char this_client_psigs[FACTORY_MAX_NODES][32];
         unsigned char this_client_poison_psigs[FACTORY_MAX_NODES][32];
@@ -2806,6 +3055,16 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                 }
             }
         }
+    }
+
+    if (n_withheld) {
+        fprintf(stderr, "LSP-stateless Tier B: root advance to epoch %u stopped; "
+                "final psigs withheld by client(s) %s\n",
+                f->counter.current_epoch, withheld_csv);
+        if (mgr->persist)
+            persist_set_root_advance_withholders((persist_t *)mgr->persist, 0,
+                                                 withheld_csv);
+        return 0;
     }
 
     lsp_crash_checkpoint("state_advance_signed");
@@ -2968,6 +3227,14 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                         "the re-signed tree; a force-close from the DB would "
                         "publish the previous epoch\n");
             }
+            /* stored as complete: no longer pending (same transaction), and
+               the tree kept for a client that signed it but missed storing it */
+            if (tierb_durable &&
+                !persist_clear_root_advance_pending(tdb, 0, f->counter.current_epoch))
+                tierb_durable = 0;
+            if (tierb_durable &&
+                !persist_save_root_advance_tree(tdb, 0, f->counter.current_epoch, f))
+                tierb_durable = 0;
             if (towntxn) {
                 if (tierb_durable) tierb_durable = persist_commit(tdb);
                 else               persist_rollback(tdb);
@@ -2976,6 +3243,8 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
     }
     for (size_t ni = 0; ni < f->n_nodes; ni++)
         lsp_note_l_stock_durable(&f->nodes[ni], tierb_durable);
+    if (tierb_durable)
+        factory_clear_root_advance_pending(f);
 
     /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
     if (mgr->persist && c3_round_id > 0) {
@@ -3264,8 +3533,8 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 1: Advance DW counter + rebuild unsigned tx */
     int rc = factory_advance_leaf_unsigned(f, leaf_side);
-    if (rc == FACTORY_ADVANCE_REFUSED)
-        return 0;  /* restored from the DB; factory.c logged it */
+    if (rc == FACTORY_ADVANCE_REFUSED || rc == FACTORY_ADVANCE_FROZEN)
+        return 0;  /* factory.c logged it */
     if (rc == 0) {
         fprintf(stderr, "LSP realloc: leaf %d DW fully exhausted\n", leaf_side);
         return 0;
@@ -3463,6 +3732,15 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fprintf(stderr, "LSP realloc: poison finalize failed — degrading\n");
         factory_session_reset_poison(f, node_idx);
         realloc_poison_prepared = 0;
+    }
+
+    /* The LSP aggregates a realloc itself, but a different TX in a position
+       already reserved (a state the client may hold fully signed) must not
+       be signed either. */
+    if (!lsp_reserve_node_tx(mgr, f, node_idx)) {
+        memset(lsp_seckey, 0, 32);
+        factory_session_reset_poison(f, node_idx);
+        return 0;
     }
 
     /* Step 9: Create LSP's partial sigs (state + poison if prepared). */
@@ -4165,6 +4443,14 @@ static int lsp_subfactory_chain_advance_stateless_multi(
 
     memset(lsp_seckey, 0, 32);
     free(lsp_secnonces);  /* all entries already zeroed by create_partial_sig */
+
+    /* Reserve the new chain TX durably before our partial sigs go out. */
+    if (!lsp_reserve_node_tx(mgr, f, sub_node_i)) {
+        free(lsp_pn_ser); free(lsp_psig_ser);
+        free(all_pn_per_input);
+        factory_session_reset_poison(f, sub_node_i);
+        return 0;
+    }
 
     /* Build flat per-input LSP arrays for the wire response. */
     unsigned char *lsp_pn_flat = calloc(n_inputs, 66);
@@ -4891,6 +5177,12 @@ static int lsp_subfactory_chain_advance_stateless(lsp_channel_mgr_t *mgr,
         memset(&lsp_poison_secnonce, 0, sizeof(lsp_poison_secnonce));
     }
 
+    /* Reserve the new chain TX durably before our partial sig goes out. */
+    if (!lsp_reserve_node_tx(mgr, f, sub_node_i)) {
+        factory_session_reset_poison(f, sub_node_i);
+        return 0;
+    }
+
     /* Step 6: send LSP_RESPONSE to each client (per-client copy so each can
        individually finalize_node + sign).  Single-input -> 1 element each.
        Carries the LSP poison pubnonce + psig when poison is still active. */
@@ -5539,9 +5831,13 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t nidx = req_n[i];
             if (nidx >= lsp->factory.n_nodes) continue;
             factory_node_t *nd = &lsp->factory.nodes[nidx];
-            uint32_t cap = nd->l_stock_state_counter;
-            if (nd->l_stock_durable_set && nd->l_stock_durable_counter < cap)
-                cap = nd->l_stock_durable_counter;
+            /* Only states superseded on disk.  Unset: no advance of this node
+               has been written since the factory was created, so the stored
+               state is still the creation one (state 0) -- even when the
+               in-memory counter moved in a ceremony that did not complete
+               (the client may hold that state, the DB does not). */
+            uint32_t cap = nd->l_stock_durable_set ? nd->l_stock_durable_counter : 0;
+            if (cap > nd->l_stock_state_counter) cap = nd->l_stock_state_counter;
             if (req_s[i] >= cap) {
                 if (req_s[i] < nd->l_stock_state_counter)
                     fprintf(stderr, "LSP: not re-revealing L-stock secret for node "
@@ -6309,6 +6605,23 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 (unsigned long long)ack_cn,
                 (unsigned long long)ch->commitment_number, off,
                 mgr->entries[c].channel_id);
+        }
+        /* A client that signed a root advance but did not store it asks
+           for the tree (optional field; older clients don't send it). */
+        {
+            const cJSON *pre = cJSON_GetObjectItem(msg->json, "pending_root_epoch");
+            if (pre && cJSON_IsNumber(pre) && pre->valuedouble >= 1 &&
+                pre->valuedouble <= 4294967295.0) {
+                cJSON *cu = lsp_build_tree_catchup(mgr, lsp, (uint32_t)pre->valuedouble);
+                if (cu) {
+                    if (!wire_send(new_fd, MSG_TREE_CATCHUP, cu))
+                        fprintf(stderr, "LSP reconnect: send TREE_CATCHUP failed\n");
+                    else
+                        printf("LSP reconnect: sent the signed tree of epoch %u to "
+                               "client %zu\n", (uint32_t)pre->valuedouble, c);
+                    cJSON_Delete(cu);
+                }
+            }
         }
         cJSON *ack = wire_build_reconnect_ack(
             mgr->entries[c].channel_id,
@@ -7910,6 +8223,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
 
+            /* Pending root advance: freeze limit / escalation */
+            if (factory_root_advance_frozen(&lsp->factory)) {
+                uint32_t fh = lsp_chain_height(mgr);
+                if (fh) lsp_check_root_advance_freeze(mgr, lsp, fh);
+            }
+
             /* Check bridge HTLC timeouts */
             if (mgr->bridge_fd >= 0 && mgr->watchtower && mgr->watchtower->rt) {
                 int bh = regtest_get_block_height(mgr->watchtower->rt);
@@ -8376,6 +8695,8 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
 int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
+    if (factory_root_advance_frozen(f))
+        return lsp_redrive_root_advance(mgr, lsp) ? 1 : -1;
     int rc = factory_tick_root(f);
     if (rc != -1) {
         return 0;

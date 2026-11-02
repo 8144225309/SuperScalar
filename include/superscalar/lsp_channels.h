@@ -211,6 +211,25 @@ typedef struct {
        with its own seckey, instead of the N-of-N factory funding SPK. */
     unsigned char lsp_close_spk[34];
     size_t lsp_close_spk_len;       /* 34 when populated, 0 if unset */
+
+    /* Pending root advance (factory_t.root_advance_pending_epoch): the
+       freeze limit.  After freeze_max_blocks (0 = half the dying window, or
+       144 blocks without one) the LSP logs CRITICAL with the clients that
+       withheld their final psigs, and records the escalation (listfactories
+       shows it).  With freeze_force_close it then starts the factory's
+       force-close; off by default, because otherwise any one client could
+       push the whole factory on-chain just by withholding. */
+    uint32_t freeze_max_blocks;
+    int freeze_force_close;
+    int freeze_escalated;              /* escalated (in memory) */
+    uint32_t freeze_redrive_attempts;  /* re-drives started since this process started */
+    uint32_t freeze_last_redrive_height;
+    uint32_t freeze_fc_last_height;    /* last force-close pass (escalated) */
+    int freeze_fc_settled;             /* the force-close reported settled */
+    /* Overall deadline for collecting every client's Tier B final psigs
+       (0 = WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC): k silent clients cost one
+       deadline, not k. */
+    int tierb_psig_deadline_sec;
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -538,6 +557,29 @@ int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Advance one PS leaf via the production wire ceremony (PROPOSE->PSIG->DONE).
    leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
 int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
+
+/* Re-drive a root advance (Tier B) whose signatures were released but that
+   was not stored as complete (factory_t.root_advance_pending_epoch), e.g.
+   after an LSP restart.  While it is pending, every leaf operation is
+   refused; a leaf-advance request or a root tick calls this instead.
+   Returns 1 when the root advance completed. */
+int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* MSG_TREE_CATCHUP payload for a reconnecting client that signed the root
+   advance to `epoch` but did not store it: the stored signed tree of that
+   advance.  NULL unless the LSP has stored that epoch as complete (no
+   pending root advance of its own) and it is the current epoch. */
+cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch);
+
+/* Freeze limit check, called from the daemon loop each pass (and by the
+   re-drive).  It escalates only after at least one re-drive since this
+   process started (an LSP that was down long must give the clients a chance
+   first).  Once escalated with freeze_force_close, it runs one force-close
+   pass per block, also after a restart, until the pass reports the factory
+   settled.  Returns 0 nothing done, 1 escalated now (CRITICAL logged), 2 a
+   force-close pass ran. */
+int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  uint32_t height);
 
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).

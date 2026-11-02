@@ -880,6 +880,19 @@ cJSON *factory_recovery_list(persist_t *p, chain_backend_t *chain)
         cJSON_AddNumberToObject(fobj, "funding_amount_sats", (double)famount);
         cJSON_AddStringToObject(fobj, "state",               state ? state : "unknown");
         cJSON_AddNumberToObject(fobj, "created_at",          (double)created);
+        {   /* a pending root advance freezes leaf operations */
+            persist_root_advance_status_t rs;
+            if (persist_load_root_advance_status(p, fid, &rs) == 1) {
+                cJSON *ra = cJSON_CreateObject();
+                cJSON_AddNumberToObject(ra, "epoch", (double)rs.epoch);
+                cJSON_AddStringToObject(ra, "withholders", rs.withholders);
+                cJSON_AddNumberToObject(ra, "frozen_since_height", (double)rs.since_height);
+                cJSON_AddNumberToObject(ra, "last_redrive_height",
+                                        (double)rs.last_redrive_height);
+                cJSON_AddBoolToObject(ra, "escalated", rs.escalated ? 1 : 0);
+                cJSON_AddItemToObject(fobj, "root_advance_pending", ra);
+            }
+        }
 
         /* Tree node stats (whole tree; PS chains included in n_txs) */
         fr_set_t s;

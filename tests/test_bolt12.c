@@ -261,7 +261,7 @@ int test_persist_schema_v3(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 39, "schema version is 39 (v39 adds factories.use_hashlock_poison for #59 restart-resume; v38 adds #53-B3b l_stock_poison_reveals; v37 adds the #327 at-rest field-encryption marker)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 43, "schema version is 43 (v43 adds tree_node_lstock and signed_state_reservations)");
     persist_close(&p);
     return 1;
 }
