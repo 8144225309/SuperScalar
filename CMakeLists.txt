@@ -291,6 +291,7 @@ add_executable(test_superscalar
     tests/test_channels.c
     tests/spend_helpers.c
     tests/test_close_spendability_full.c
+    tests/test_exit_paths.c
     tests/econ_helpers.c
     tests/test_economic_correctness.c
     tests/test_regtest_hybrid_cln.c
