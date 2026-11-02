@@ -4582,14 +4582,18 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
-/* Put f back to its stored state after a refused catch-up. */
-static void catchup_reload(factory_t *f, persist_t *db) {
+/* Put f back to its stored state after a refused catch-up.  Returns 0 if
+   that fails (f is then empty and must not be used). */
+static int catchup_reload(factory_t *f, persist_t *db) {
     secp256k1_context *ctx = f->ctx;
     factory_free(f);
     memset(f, 0, sizeof(*f));
-    if (!persist_load_factory(db, 0, f, ctx))
+    if (!persist_load_factory(db, 0, f, ctx)) {
         fprintf(stderr, "Client: CRITICAL - could not reload the factory after a "
                 "refused tree catch-up\n");
+        return 0;
+    }
+    return 1;
 }
 
 int client_apply_tree_catchup(factory_t *f, persist_t *db, const cJSON *json,
@@ -4691,8 +4695,7 @@ int client_apply_tree_catchup(factory_t *f, persist_t *db, const cJSON *json,
     if (why) {
         fprintf(stderr, "Client %u: tree catch-up for epoch %u refused: %s; "
                 "staying frozen\n", my_index, pending, why);
-        catchup_reload(f, db);
-        return 0;
+        return catchup_reload(f, db) ? 0 : -1;
     }
     printf("Client %u: caught up with the stored tree of epoch %u\n",
            my_index, pending);

@@ -2982,6 +2982,7 @@ typedef struct {
     uint8_t signal_type;            /* from the client: set *gate */
     uint8_t hold_type;              /* from the LSP: wait for *gate */
     volatile int *gate;
+    int keep_open;                  /* after a drop, stay connected (silent) */
 } rl_gproxy_t;
 
 static void *rl_gproxy_thread(void *arg) {
@@ -3003,6 +3004,7 @@ static void *rl_gproxy_thread(void *arg) {
         if (from_cli && x->drop_type && m.msg_type == x->drop_type) {
             x->dropped = 1;
             if (m.json) cJSON_Delete(m.json);
+            if (x->keep_open) continue;
             break;
         }
         int sent = wire_send(dst, m.msg_type, m.json);
@@ -3019,8 +3021,17 @@ static void *rl_gproxy_thread(void *arg) {
    (through gated proxies; drop_c1 swallows a message of client 1's).  Each
    client stores its view afterwards when it completed.  The connections
    are replaced afterwards. */
+static int rl_advance2_ex2(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
+                           uint8_t drop_c1, uint8_t drop_c2, int keep_open,
+                           int *dropped);
 static int rl_advance2_ex(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
                           uint8_t drop_c1, int *dropped) {
+    return rl_advance2_ex2(r, c2, c1_ok, c2_ok, drop_c1, 0, 0, dropped);
+}
+
+static int rl_advance2_ex2(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
+                           uint8_t drop_c1, uint8_t drop_c2, int keep_open,
+                           int *dropped) {
     int roll = dw_is_exhausted(&r->lsp->factory.leaf_layers[0]) ||
                factory_root_advance_frozen(&r->lsp->factory);
     volatile int gate = 0;
@@ -3028,9 +3039,11 @@ static int rl_advance2_ex(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, q1) != 0 ||
         socketpair(AF_UNIX, SOCK_STREAM, 0, q2) != 0) return 0;
     rl_gproxy_t p1 = { .lsp_fd = r->sv[1], .cli_fd = q1[0], .drop_type = drop_c1,
-                       .signal_type = MSG_STATE_ADV_CLIENT_FINAL_PSIGS, .gate = &gate };
-    rl_gproxy_t p2 = { .lsp_fd = c2->sv[1], .cli_fd = q2[0],
-                       .hold_type = MSG_STATE_ADV_LSP_RESPONSE, .gate = &gate };
+                       .signal_type = MSG_STATE_ADV_CLIENT_FINAL_PSIGS, .gate = &gate,
+                       .keep_open = keep_open };
+    rl_gproxy_t p2 = { .lsp_fd = c2->sv[1], .cli_fd = q2[0], .drop_type = drop_c2,
+                       .hold_type = MSG_STATE_ADV_LSP_RESPONSE, .gate = &gate,
+                       .keep_open = keep_open };
     ex_client_t a = { .fd = q1[1], .ctx = r->ctx, .kp = r->kps[1],
                       .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
     ex_client_t b = { .fd = q2[1], .ctx = r->ctx, .kp = r->kps[2],
@@ -3050,6 +3063,7 @@ static int rl_advance2_ex(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
             cJSON_Delete(m.json);
     }
     if (rc != 1 || !roll) shutdown(q2[1], SHUT_RDWR);
+    if (rc != 1) shutdown(q1[1], SHUT_RDWR);
     pthread_join(ta, NULL);
     if (roll) pthread_join(tb, NULL);
     shutdown(r->sv[0], SHUT_RDWR);
@@ -3430,59 +3444,78 @@ int test_reload_tree_catchup_after_crash(void) {
     return 1;
 }
 
+/* Shared setup: leaf 0 to its last state, then a Tier B in which client 1's
+   final psigs are swallowed; the LSP is left frozen with client 1 recorded.
+   A mock chain at height 100 is attached. */
+static int rl_frozen_lsp(ex_rig_t *r, rl_cli2_t *c2, chain_backend_t *cb,
+                         const char *tag) {
+    char t2[64];
+    snprintf(t2, sizeof(t2), "%s2", tag);
+    if (!ex_rig_init_ex(r, FACTORY_ARITY_1, tag, 0, 2)) return 0;
+    if (!rl_cli2_init(r, c2, t2, 2)) return 0;
+    mk_init(cb, r->fund_txid);
+    g_mk.height = 100;
+    r->mgr->chain_be = cb;
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    if (rl_advance2(r, c2, &ok1, &ok2) != 1 || !ok1) return 0;
+    int rc = rl_advance2_ex(r, c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    if (rc != 0 || !dropped || !factory_root_advance_frozen(&r->lsp->factory))
+        return 0;
+    /* nobody answers from now on: a re-drive fails at once */
+    shutdown(r->sv[1], SHUT_RDWR);
+    shutdown(c2->sv[1], SHUT_RDWR);
+    return 1;
+}
+
+static void rl_frozen_free(ex_rig_t *r, rl_cli2_t *c2) {
+    r->mgr->chain_be = NULL;
+    rl_cli2_free(c2);
+    r->lsp->client_fds[1] = -1;
+    ex_rig_free(r);
+}
+
 /* A client withholds its final psigs for a root advance: the LSP records the
-   withholder, re-drives at most once per block, and after the freeze limit
-   logs CRITICAL and shows the escalation in listfactories.  The force-close
-   starts only with --freeze-force-close; without it nothing is broadcast. */
+   withholder, re-drives at most once per block, escalates only after it has
+   re-driven at least once since it started, then logs CRITICAL and shows
+   the escalation in listfactories.  With --freeze-force-close off nothing is
+   broadcast. */
 int test_reload_freeze_limit_and_escalation(void) {
     signal(SIGPIPE, SIG_IGN);
     client_set_persist(NULL);
     ex_rig_t r;
-    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_flim", 0, 2), "rig");
     rl_cli2_t c2;
-    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_flim2", 2), "second client");
-    alarm(600);
     chain_backend_t cb;
-    mk_init(&cb, r.fund_txid);
-    g_mk.height = 100;
-    r.mgr->chain_be = &cb;
-    int ok1 = 0, ok2 = 0, dropped = 0;
-    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
-    int rc = rl_advance2_ex(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
-                            &dropped);
-    TEST_ASSERT(rc == 0 && dropped && factory_root_advance_frozen(&r.lsp->factory),
-                "root advance withheld; LSP frozen");
+    alarm(600);
+    TEST_ASSERT(rl_frozen_lsp(&r, &c2, &cb, "rl_flim"), "frozen LSP");
     persist_root_advance_status_t st;
     TEST_ASSERT(persist_load_root_advance_status(&r.db, 0, &st) == 1, "status");
     printf("  withheld: mark epoch %u, withholders \"%s\"\n", st.epoch, st.withholders);
     TEST_ASSERT(strcmp(st.withholders, "1") == 0, "client 1 recorded as withholding");
 
-    /* nobody answers now: a re-drive fails at once */
-    shutdown(r.sv[1], SHUT_RDWR);
-    shutdown(c2.sv[1], SHUT_RDWR);
-    g_mk.height = 101;
+    /* the limit is long past, but nothing was re-driven since the start */
+    r.mgr->freeze_max_blocks = 10;
+    int sends0 = g_mk.n_send_calls;
+    int e0 = lsp_check_root_advance_freeze(r.mgr, r.lsp, 100);   /* first sight */
+    int e1 = lsp_check_root_advance_freeze(r.mgr, r.lsp, 150);
+    printf("  frozen since 100, limit 10, no re-drive yet: at 150 -> %d\n", e1);
+    TEST_ASSERT(e0 == 0 && e1 == 0, "no escalation before a re-drive");
+
+    g_mk.height = 150;
     uint32_t a0 = r.mgr->freeze_redrive_attempts;
     lsp_redrive_root_advance(r.mgr, r.lsp);
     uint32_t a1 = r.mgr->freeze_redrive_attempts;
     lsp_redrive_root_advance(r.mgr, r.lsp);
     uint32_t a2 = r.mgr->freeze_redrive_attempts;
-    g_mk.height = 102;
+    g_mk.height = 151;
     lsp_redrive_root_advance(r.mgr, r.lsp);
     uint32_t a3 = r.mgr->freeze_redrive_attempts;
-    printf("  re-drive attempts: height 101: %u, again at 101: %u, at 102: %u\n",
+    printf("  re-drive attempts: height 150: %u, again at 150: %u, at 151: %u\n",
            a1 - a0, a2 - a1, a3 - a2);
     TEST_ASSERT(a1 - a0 == 1 && a2 - a1 == 0 && a3 - a2 == 1, "at most one re-drive per block");
-
-    /* the limit, force-close off */
-    r.mgr->freeze_max_blocks = 10;
+    /* the re-drive itself ran the check: escalated at 150 */
+    int e2 = lsp_check_root_advance_freeze(r.mgr, r.lsp, 152);
     TEST_ASSERT(persist_load_root_advance_status(&r.db, 0, &st) == 1, "status 2");
-    uint32_t since = st.since_height;
-    g_mk.height = (int)since + 5;
-    int sends0 = g_mk.n_send_calls;
-    int e1 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height);
-    g_mk.height = (int)since + 10;
-    int e2 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height);
-    int e3 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height + 1);
     cJSON *lf = factory_recovery_list(&r.db, &cb);
     cJSON *ra = NULL;
     for (int i = 0; lf && i < cJSON_GetArraySize(lf); i++) {
@@ -3492,30 +3525,176 @@ int test_reload_freeze_limit_and_escalation(void) {
     }
     int esc = ra && cJSON_IsTrue(cJSON_GetObjectItem(ra, "escalated"));
     const cJSON *wh = ra ? cJSON_GetObjectItem(ra, "withholders") : NULL;
-    printf("  frozen since %u, limit 10: at +5 -> %d, at +10 -> %d, again -> %d; "
-           "listfactories escalated=%d withholders=%s; sends %d\n", since, e1, e2, e3,
-           esc, wh && cJSON_IsString(wh) ? wh->valuestring : "-",
+    printf("  after the re-drive: escalated=%d (again -> %d); listfactories "
+           "escalated=%d withholders=%s; sends %d\n", st.escalated, e2, esc,
+           wh && cJSON_IsString(wh) ? wh->valuestring : "-",
            g_mk.n_send_calls - sends0);
-    TEST_ASSERT(e1 == 0 && e2 == 1 && e3 == 0, "escalated once, at the limit");
+    TEST_ASSERT(st.escalated && e2 == 0, "escalated once");
     TEST_ASSERT(esc && wh && strcmp(wh->valuestring, "1") == 0,
                 "listfactories shows the escalation and the withholder");
     TEST_ASSERT(g_mk.n_send_calls == sends0, "flag off: nothing broadcast");
     cJSON_Delete(lf);
+    alarm(0);
+    rl_frozen_free(&r, &c2);
+    return 1;
+}
 
-    /* the same with --freeze-force-close */
-    TEST_ASSERT(sqlite3_exec(r.db.db, "UPDATE root_advance_pending SET escalated=0",
-                             NULL, NULL, NULL) == SQLITE_OK, "reset escalation");
-    r.mgr->freeze_escalated = 0;
+/* With --freeze-force-close the escalation runs one force-close pass per
+   block, also after a restart, until the whole tree is published and
+   confirmed (a single pass publishes only what its timelocks allow). */
+int test_reload_freeze_force_close_multipass(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    rl_cli2_t c2;
+    chain_backend_t cb;
+    alarm(600);
+    TEST_ASSERT(rl_frozen_lsp(&r, &c2, &cb, "rl_fcmp"), "frozen LSP");
+    r.mgr->freeze_max_blocks = 2;
     r.mgr->freeze_force_close = 1;
-    int e4 = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height + 2);
-    printf("  with --freeze-force-close: -> %d, sends %d\n", e4,
-           g_mk.n_send_calls - sends0);
-    TEST_ASSERT(e4 == 2 && g_mk.n_send_calls > sends0, "flag on: force-close started");
+    lsp_check_root_advance_freeze(r.mgr, r.lsp, 100);
+    g_mk.height = 101;
+    lsp_redrive_root_advance(r.mgr, r.lsp);          /* one re-drive, fails */
+    g_mk.height = 103;
+    int e = lsp_check_root_advance_freeze(r.mgr, r.lsp, 103);
+    TEST_ASSERT(e == 2, "escalated, first force-close pass");
+    int sends1 = g_mk.n_send_calls;
+    int same = lsp_check_root_advance_freeze(r.mgr, r.lsp, 103);
+    TEST_ASSERT(same == 0 && g_mk.n_send_calls == sends1, "one pass per block");
 
-    r.mgr->chain_be = NULL;
+    /* the LSP restarts: the escalation and the passes continue */
+    TEST_ASSERT(rl_rig_restart_lsp(&r) || factory_root_advance_frozen(&r.lsp->factory),
+                "LSP reload");
+    r.mgr->freeze_escalated = 0;
+    r.mgr->freeze_redrive_attempts = 0;
+    r.mgr->freeze_fc_last_height = 0;
+    r.mgr->freeze_fc_settled = 0;
+    int passes = 1;
+    for (int b = 0; b < 80 && !r.mgr->freeze_fc_settled; b++) {
+        mk_mine();
+        if (lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height) == 2)
+            passes++;
+    }
+    char state[16] = {0};
+    persist_get_factory_state(&r.db, 0, state, sizeof(state));
+    printf("  force-close: %d passes, settled=%d, factory state %s, %d TXs sent\n",
+           passes, r.mgr->freeze_fc_settled, state, g_mk.n_send_ok);
+    TEST_ASSERT(passes > 2, "more than one pass was needed");
+    TEST_ASSERT(r.mgr->freeze_fc_settled, "the force-close completed");
+    int more = lsp_check_root_advance_freeze(r.mgr, r.lsp, (uint32_t)g_mk.height + 1);
+    TEST_ASSERT(more == 0, "no passes after it settled");
+    alarm(0);
+    rl_frozen_free(&r, &c2);
+    return 1;
+}
+
+/* Two clients go silent (connected, no final psigs): Tier B gives up after
+   one overall deadline, not one per client, and records both. */
+int test_reload_tierb_withholders_one_deadline(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_dl", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_dl2", 2), "second client");
+    alarm(600);
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    r.mgr->tierb_psig_deadline_sec = 3;
+    time_t t0 = time(NULL);
+    int rc = rl_advance2_ex2(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                             MSG_STATE_ADV_CLIENT_FINAL_PSIGS, 1, &dropped);
+    long secs = (long)(time(NULL) - t0);
+    persist_root_advance_status_t st;
+    persist_load_root_advance_status(&r.db, 0, &st);
+    printf("  two silent clients, deadline 3 s: rc=%d after %ld s, withholders \"%s\"\n",
+           rc, secs, st.withholders);
+    TEST_ASSERT(rc == 0, "root advance stopped");
+    TEST_ASSERT(secs <= 5, "one deadline in total, not one per client");
+    TEST_ASSERT(strcmp(st.withholders, "1,2") == 0, "both withholders recorded");
     alarm(0);
     rl_cli2_free(&c2);
     r.lsp->client_fds[1] = -1;
     ex_rig_free(&r);
+    return 1;
+}
+
+/* A refused catch-up whose reload from the DB fails reports an error (the
+   factory is then empty) so the reconnect stops using it. */
+int test_reload_catchup_reload_failure(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_crf", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_crf2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    g_rl_c1_no_save = 1;
+    int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    g_rl_c1_no_save = 0;
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "Tier B completed");
+    TEST_ASSERT(rl_rig_restart_client(&r) && factory_root_advance_frozen(r.cf),
+                "client 1 frozen at epoch 0");
+    cJSON *cu = lsp_build_tree_catchup(r.mgr, r.lsp, 1);
+    TEST_ASSERT(cu, "catch-up");
+    /* a bad signature, and the client DB can no longer load the factory */
+    cJSON *o = cJSON_GetArrayItem(cJSON_GetObjectItem(cu, "nodes"),
+                                  cJSON_GetArraySize(cJSON_GetObjectItem(cu, "nodes")) - 1);
+    char *h = strdup(cJSON_GetObjectItem(o, "tx")->valuestring);
+    size_t hl = strlen(h);
+    h[hl - 48] = (h[hl - 48] == '0') ? '1' : '0';
+    cJSON_ReplaceItemInObject(o, "tx", cJSON_CreateString(h));
+    free(h);
+    TEST_ASSERT(sqlite3_exec(r.cdb.db, "DELETE FROM factories", NULL, NULL, NULL) ==
+                SQLITE_OK, "break the client DB");
+    int a = client_apply_tree_catchup(r.cf, &r.cdb, cu, 1);
+    cJSON_Delete(cu);
+    printf("  refused catch-up with a failing reload: rc=%d, n_nodes=%zu\n", a,
+           r.cf->n_nodes);
+    TEST_ASSERT(a == -1, "error reported");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* A DB whose v43 tables were created by an earlier build of this change
+   (root_advance_pending without its bookkeeping columns, no
+   root_advance_trees) gets them on open, and the pending-advance writes work. */
+int test_reload_v43_old_table_shape(void) {
+    char path[256];
+    ex_db_path(path, sizeof(path), "rl_v43old");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    TEST_ASSERT(sqlite3_exec(db.db,
+        "DROP TABLE root_advance_pending; DROP TABLE root_advance_trees; "
+        "CREATE TABLE root_advance_pending (factory_id INTEGER PRIMARY KEY, "
+        "epoch INTEGER NOT NULL, trigger_leaf INTEGER NOT NULL);",
+        NULL, NULL, NULL) == SQLITE_OK, "old table shape");
+    persist_close(&db);
+    TEST_ASSERT(persist_open(&db, path), "reopen");
+    int set = persist_set_root_advance_pending(&db, 0, 3, 1);
+    int wh = persist_set_root_advance_withholders(&db, 0, "2");
+    int hs = persist_set_root_advance_heights(&db, 0, 10, 11);
+    int es = persist_set_root_advance_escalated(&db, 0);
+    persist_root_advance_status_t st;
+    int ld = persist_load_root_advance_status(&db, 0, &st);
+    int trees = ex_sql_int(&db, "SELECT COUNT(*) FROM sqlite_master WHERE "
+                           "name='root_advance_trees'");
+    printf("  old-shape table: set=%d withholders=%d heights=%d escalated=%d "
+           "load=%d (\"%s\", %u, %u, %d); root_advance_trees present=%d\n",
+           set, wh, hs, es, ld, st.withholders, st.since_height,
+           st.last_redrive_height, st.escalated, trees);
+    TEST_ASSERT(set && wh && hs && es && ld == 1, "writes work on the upgraded table");
+    TEST_ASSERT(strcmp(st.withholders, "2") == 0 && st.since_height == 10 &&
+                st.escalated == 1, "values read back");
+    TEST_ASSERT(trees == 1, "root_advance_trees created");
+    persist_close(&db);
+    unlink(path);
     return 1;
 }

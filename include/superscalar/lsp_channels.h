@@ -222,8 +222,14 @@ typedef struct {
     uint32_t freeze_max_blocks;
     int freeze_force_close;
     int freeze_escalated;              /* escalated (in memory) */
-    uint32_t freeze_redrive_attempts;  /* re-drives actually started */
+    uint32_t freeze_redrive_attempts;  /* re-drives started since this process started */
     uint32_t freeze_last_redrive_height;
+    uint32_t freeze_fc_last_height;    /* last force-close pass (escalated) */
+    int freeze_fc_settled;             /* the force-close reported settled */
+    /* Overall deadline for collecting every client's Tier B final psigs
+       (0 = WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC): k silent clients cost one
+       deadline, not k. */
+    int tierb_psig_deadline_sec;
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -566,8 +572,12 @@ int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch);
 
 /* Freeze limit check, called from the daemon loop each pass (and by the
-   re-drive).  Returns 0 nothing to do, 1 escalated now (CRITICAL logged),
-   2 escalated and the force-close was started. */
+   re-drive).  It escalates only after at least one re-drive since this
+   process started (an LSP that was down long must give the clients a chance
+   first).  Once escalated with freeze_force_close, it runs one force-close
+   pass per block, also after a restart, until the pass reports the factory
+   settled.  Returns 0 nothing done, 1 escalated now (CRITICAL logged), 2 a
+   force-close pass ran. */
 int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                   uint32_t height);
 

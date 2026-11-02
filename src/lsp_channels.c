@@ -1554,6 +1554,26 @@ static uint32_t lsp_chain_height(lsp_channel_mgr_t *mgr) {
     return h > 0 ? (uint32_t)h : 0;
 }
 
+/* One force-close pass per block while escalated with --freeze-force-close,
+   until a pass reports the factory settled: one pass publishes only the
+   levels whose timelocks are met. */
+static int lsp_freeze_force_close_pass(lsp_channel_mgr_t *mgr, uint32_t height) {
+    if (!mgr->freeze_force_close || mgr->freeze_fc_settled) return 0;
+    if (mgr->freeze_fc_last_height == height) return 0;
+    mgr->freeze_fc_last_height = height;
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!cb && mgr->watchtower) cb = mgr->watchtower->chain;
+    factory_recovery_result_t res;
+    memset(&res, 0, sizeof(res));
+    char status[512] = {0};
+    int ok = factory_recovery_run_ex((persist_t *)mgr->persist, cb, 0, 0, &res,
+                                     status, sizeof(status));
+    if (res.settled) mgr->freeze_fc_settled = 1;
+    fprintf(stderr, "LSP: freeze force-close pass at height %u: %s%s\n", height,
+            ok ? "" : "FAILED ", status);
+    return 2;
+}
+
 int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                   uint32_t height) {
     if (!mgr || !lsp || height == 0) return 0;
@@ -1573,11 +1593,14 @@ int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     if (st.escalated || mgr->freeze_escalated) {
         mgr->freeze_escalated = 1;
-        return 0;
+        return lsp_freeze_force_close_pass(mgr, height);
     }
     uint32_t limit = mgr->freeze_max_blocks;
     if (limit == 0) limit = f->dying_blocks > 1 ? f->dying_blocks / 2 : 144;
     if (height < st.since_height || height - st.since_height < limit) return 0;
+    /* an LSP that was down for long escalates only after it has tried the
+       re-drive at least once since it started */
+    if (mgr->freeze_redrive_attempts == 0) return 0;
 
     uint32_t left = factory_blocks_until_expired(f, height);
     fprintf(stderr, "LSP: CRITICAL - factory frozen for %u blocks (limit %u) on "
@@ -1592,14 +1615,7 @@ int lsp_check_root_advance_freeze(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     mgr->freeze_escalated = 1;
     if (db) persist_set_root_advance_escalated(db, 0);
     if (!mgr->freeze_force_close) return 1;
-
-    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
-    if (!cb && mgr->watchtower) cb = mgr->watchtower->chain;
-    char status[512] = {0};
-    int ok = factory_recovery_run(db, cb, 0, status, sizeof(status));
-    fprintf(stderr, "LSP: freeze force-close %s: %s\n",
-            ok ? "started" : "pass failed", status);
-    return 2;
+    return lsp_freeze_force_close_pass(mgr, height);
 }
 
 cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch) {
@@ -2954,12 +2970,30 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
        read, so every withholder of this root advance is known. */
     char withheld_csv[256] = {0};
     int n_withheld = 0;
+    /* One deadline for all clients: once it has passed, a client whose
+       psigs are not already waiting on its socket counts as withholding. */
+    int psig_deadline = mgr->tierb_psig_deadline_sec > 0
+                        ? mgr->tierb_psig_deadline_sec
+                        : WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC;
+    time_t deadline = time(NULL) + psig_deadline;
     for (size_t c = 0; c < lsp->n_clients; c++) {
         wire_msg_t pmsg;
         memset(&pmsg, 0, sizeof(pmsg));
-        if (!recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg,
-                                          WIRE_CEREMONY_BUNDLE_TIMEOUT_SEC) ||
-            pmsg.msg_type != MSG_STATE_ADV_CLIENT_FINAL_PSIGS) {
+        long left_sec = (long)(deadline - time(NULL));
+        int got;
+        if (left_sec > 0) {
+            got = recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c], &pmsg,
+                                              (int)left_sec);
+        } else {
+            struct pollfd pf = { .fd = lsp->client_fds[c], .events = POLLIN,
+                                 .revents = 0 };
+            got = (lsp->client_fds[c] >= 0 && poll(&pf, 1, 0) > 0 &&
+                   (pf.revents & POLLIN))
+                  ? recv_timeout_service_bridge(mgr, lsp, lsp->client_fds[c],
+                                                &pmsg, 1)
+                  : 0;
+        }
+        if (!got || pmsg.msg_type != MSG_STATE_ADV_CLIENT_FINAL_PSIGS) {
             fprintf(stderr,
                 "LSP-stateless Tier B: expected CLIENT_FINAL_PSIGS from client %zu, "
                 "got 0x%02x\n", c, pmsg.msg_type);

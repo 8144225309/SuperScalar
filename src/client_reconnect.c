@@ -420,8 +420,16 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
         if (msg.msg_type == MSG_TREE_CATCHUP) {
             /* the signed tree of the root advance we asked for */
-            client_apply_tree_catchup(factory, db, msg.json, my_index);
+            int cu_rc = client_apply_tree_catchup(factory, db, msg.json, my_index);
             cJSON_Delete(msg.json);
+            if (cu_rc < 0) {
+                fprintf(stderr, "Client reconnect: factory lost after a refused "
+                        "tree catch-up; aborting the reconnect\n");
+                wire_close(fd);
+                factory_free(factory); free(factory);
+                channel_cleanup(&channel);
+                return 0;
+            }
             if (!wire_recv(fd, &msg)) {
                 fprintf(stderr, "Client reconnect: recv failed after TREE_CATCHUP\n");
                 wire_close(fd);

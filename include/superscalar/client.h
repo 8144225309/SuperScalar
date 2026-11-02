@@ -233,7 +233,8 @@ int client_persist_exit_state(persist_t *db, const factory_t *f);
    Then the tree is stored (client_persist_exit_state, which clears the
    mark) and 1 is returned.  Anything else, including a store failure,
    reloads the factory from db (still frozen) and returns 0: nothing is
-   applied partially. */
+   applied partially.  Returns -1 if that reload fails: f is then empty and
+   the caller must stop using it (the reconnect aborts). */
 int client_apply_tree_catchup(factory_t *f, persist_t *db, const cJSON *json,
                               uint32_t my_index);
 
