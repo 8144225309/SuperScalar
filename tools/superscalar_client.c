@@ -889,27 +889,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
         if (persist_begin(cbd->db)) {
-            /* Attach persistence so revocation secrets received later land in
-               the revocation_secrets table. */
-            channel_set_persist(ch, cbd->db, CLIENT_DB_CHANNEL_ID);
-            if (persist_save_factory(cbd->db, factory, ctx, 0) &&
-                persist_save_channel(cbd->db, ch, 0, CLIENT_DB_CHANNEL_ID) &&
-                persist_save_basepoints(cbd->db, CLIENT_DB_CHANNEL_ID, ch) &&
-                persist_save_tree_nodes(cbd->db, factory, 0)) {
-                /* Save signed distribution TX if available */
-                if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
-                    persist_save_distribution_tx(cbd->db, 0,
-                        factory->dist_unsigned_tx.data,
-                        factory->dist_unsigned_tx.len);
-                }
-                /* Save initial local PCS so they survive crash before first payment */
-                for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
-                    unsigned char pcs[32];
-                    if (channel_get_local_pcs(ch, cn, pcs)) {
-                        persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, cn, pcs);
-                        memset(pcs, 0, 32);
-                    }
-                }
+            /* Factory, channel, basepoints, tree, local secrets and the
+               LSP's first points; also attaches the DB to the channel. */
+            if (client_persist_initial_state(cbd->db, factory, ch, ctx)) {
                 /* #313 self-custody: persist the INITIAL commitment here too, so a
                    funded-but-never-transacted channel stays force-closeable when the
                    LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written

@@ -5036,3 +5036,46 @@ int client_run_ceremony(secp256k1_context *ctx,
     return client_run_with_channels(ctx, keypair, host, port, NULL, NULL,
                                      NULL, NULL);
 }
+
+int client_persist_initial_state(persist_t *db, factory_t *factory,
+                                 channel_t *ch, secp256k1_context *ctx) {
+    if (!db || !factory || !ch || !ctx) return 0;
+
+    /* Attach first: revocations and points received from here on are
+       written through. */
+    channel_set_persist(ch, db, CLIENT_DB_CHANNEL_ID);
+    if (!persist_save_factory(db, factory, ctx, 0) ||
+        !persist_save_channel(db, ch, 0, CLIENT_DB_CHANNEL_ID) ||
+        !persist_save_basepoints(db, CLIENT_DB_CHANNEL_ID, ch) ||
+        !persist_save_tree_nodes(db, factory, 0))
+        return 0;
+
+    if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0)
+        persist_save_distribution_tx(db, 0, factory->dist_unsigned_tx.data,
+                                     factory->dist_unsigned_tx.len);
+
+    /* Local secrets, so they survive a crash before the first payment. */
+    for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
+        unsigned char pcs[32];
+        if (channel_get_local_pcs(ch, cn, pcs)) {
+            persist_save_local_pcs(db, CLIENT_DB_CHANNEL_ID, cn, pcs);
+            secure_zero(pcs, sizeof(pcs));
+        }
+    }
+
+    /* The LSP's points for commitments 0 and 1 came with its basepoints,
+       before the DB was attached, so nothing wrote them.  Without them a
+       client restarted before its first payment cannot check the LSP's
+       first revocation and refuses it as forged. */
+    for (uint64_t cn = 0; cn <= 1; cn++) {
+        secp256k1_pubkey pcp;
+        unsigned char ser[33];
+        size_t len = sizeof(ser);
+        if (!channel_get_remote_pcp(ch, cn, &pcp)) continue;
+        if (!secp256k1_ec_pubkey_serialize(ctx, ser, &len, &pcp,
+                                           SECP256K1_EC_COMPRESSED) ||
+            !persist_save_remote_pcp(db, CLIENT_DB_CHANNEL_ID, cn, ser))
+            return 0;
+    }
+    return 1;
+}

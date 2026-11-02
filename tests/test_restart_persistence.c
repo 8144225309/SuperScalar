@@ -1447,3 +1447,106 @@ int test_restart_client_legacy_db_moves_to_channel_0(void) {
     rs_teardown(&fx);
     return 1;
 }
+
+/* ---- A client restarted before its first payment ---- */
+
+#define RS_LSP_PCS0 0x41  /* every byte of the LSP's per-commitment secret 0 */
+
+typedef struct {
+    int called;
+    int forged_ok;
+    int valid_ok;
+} rs_first_cb_t;
+
+/* After the restart: the first payment moves the client to commitment 1
+   (as its COMMITMENT_SIGNED handler does), then the LSP revokes commitment
+   0.  A forged REVOKE_AND_ACK, then the real one, go through the client's
+   own handler. */
+static int rs_first_payment_cb(int fd, channel_t *ch, uint32_t my_index,
+                               secp256k1_context *ctx,
+                               const secp256k1_keypair *kp, factory_t *f,
+                               size_t n_participants, void *ud) {
+    (void)fd; (void)my_index; (void)kp; (void)f; (void)n_participants;
+    rs_first_cb_t *c = ud;
+    c->called = 1;
+    ch->commitment_number = 1;
+    unsigned char forged[32], real[32], nxt[32];
+    memset(forged, 0x3c, sizeof(forged));
+    memset(real, RS_LSP_PCS0, sizeof(real));
+    memset(nxt, 0x43, sizeof(nxt));
+    secp256k1_pubkey next_pcp;
+    if (!secp256k1_ec_pubkey_create(ctx, &next_pcp, nxt)) return 2;
+    const unsigned char *secrets[2] = { forged, real };
+    int *results[2] = { &c->forged_ok, &c->valid_ok };
+    for (int i = 0; i < 2; i++) {
+        cJSON *j = wire_build_revoke_and_ack(RS_CLIENT_IDX, secrets[i], ctx,
+                                             &next_pcp);
+        if (!j) return 2;
+        wire_msg_t m = { .msg_type = MSG_LSP_REVOKE_AND_ACK, .json = j };
+        *results[i] = client_handle_lsp_revoke_and_ack(ch, ctx, &m);
+        cJSON_Delete(j);
+    }
+    return 2;
+}
+
+/* The LSP's points for commitments 0 and 1 reach the client before its DB
+   is attached, and the first run saved only the client's own secrets: a
+   client restarted before its first payment had no point to check the
+   LSP's first revocation against, refused it as invalid, and its forgery
+   policy then halted or closed the channel.  Save the first run's state
+   the way the daemon does, restart (reconnect at commitment 0), take the
+   first payment's commitment, and receive the LSP's revocation of
+   commitment 0: a forged secret is refused, the real one is accepted and
+   stored. */
+int test_restart_client_first_points_saved(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 4), "fixture");
+    persist_t cdb;
+    TEST_ASSERT(persist_open(&cdb, NULL), "client db");
+    secp256k1_keypair kp;
+    channel_t cch;
+    TEST_ASSERT(rs_client_channel(&fx, &kp, &cch), "client channel");
+
+    /* The LSP's first two points, as its basepoints message brings them. */
+    unsigned char s[32];
+    secp256k1_pubkey pcp0, pcp1;
+    memset(s, RS_LSP_PCS0, sizeof(s));
+    TEST_ASSERT(secp256k1_ec_pubkey_create(fx.ctx, &pcp0, s), "PCP 0");
+    memset(s, RS_LSP_PCS0 + 1, sizeof(s));
+    TEST_ASSERT(secp256k1_ec_pubkey_create(fx.ctx, &pcp1, s), "PCP 1");
+    channel_set_remote_pcp(&cch, 0, &pcp0);
+    channel_set_remote_pcp(&cch, 1, &pcp1);
+
+    /* The daemon's first-run save. */
+    TEST_ASSERT(persist_begin(&cdb), "begin");
+    TEST_ASSERT(client_persist_initial_state(&cdb, fx.f, &cch, fx.ctx),
+                "first-run save");
+    TEST_ASSERT(persist_commit(&cdb), "commit");
+    channel_cleanup(&cch);
+
+    /* Restart before any payment: reconnect at commitment 0. */
+    rs_first_cb_t cb = { 0, 0, 0 };
+    int lsp_ok = 0;
+    int ok = rs_run_reconnect(&fx, &cdb, &kp, 0, rs_first_payment_cb, &cb, &lsp_ok);
+    TEST_ASSERT(lsp_ok, "fake LSP ran the whole reconnect");
+    TEST_ASSERT(ok && cb.called, "reconnected");
+    TEST_ASSERT(!cb.forged_ok, "forged revocation of commitment 0 refused");
+    TEST_ASSERT(cb.valid_ok, "the LSP's real revocation of commitment 0 accepted");
+
+    unsigned char secrets[4][32], want[32];
+    uint8_t valid[4];
+    size_t n_rev = 0;
+    memset(want, RS_LSP_PCS0, sizeof(want));
+    TEST_ASSERT(persist_load_revocations_flat(&cdb, CLIENT_DB_CHANNEL_ID, secrets,
+                                              valid, 4, &n_rev) &&
+                valid[0] && memcmp(secrets[0], want, 32) == 0,
+                "the real secret is stored");
+    unsigned char ser[33];
+    TEST_ASSERT(persist_load_remote_pcp(&cdb, CLIENT_DB_CHANNEL_ID, 0, ser) &&
+                persist_load_remote_pcp(&cdb, CLIENT_DB_CHANNEL_ID, 1, ser),
+                "the first run saved PCP 0 and 1");
+
+    persist_close(&cdb);
+    rs_teardown(&fx);
+    return 1;
+}

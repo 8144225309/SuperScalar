@@ -52,6 +52,15 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                          const unsigned char *local_htlc_sec32,
                          fee_estimator_t *fee_est);
 
+/* Save what the client's first run must keep to its DB, every
+   per-channel row under CLIENT_DB_CHANNEL_ID: the factory, the channel,
+   its basepoints, the tree, the distribution TX if ready, the local
+   per-commitment secrets so far, and the LSP's points for commitments 0
+   and 1, which arrive before the DB is attached.  Attaches db to ch.
+   Call inside a transaction; returns 1 if every required save succeeded. */
+int client_persist_initial_state(persist_t *db, factory_t *factory,
+                                 channel_t *ch, secp256k1_context *ctx);
+
 /* Set the minimum acceptable profit share in basis points.  If > 0 and
    the LSP's FACTORY_PROPOSE offers less, the client refuses to sign.
    0 = accept any terms (default). */
