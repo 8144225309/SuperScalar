@@ -31,6 +31,32 @@ int   regtest_get_block_height(regtest_t *rt);
    with the current best-block hash hex. Returns 1 on success, 0 on error. */
 int   regtest_get_best_block_hash(regtest_t *rt, char *hash_out_buf);
 
+/* Read the chain tip's height and hash from ONE getblockchaininfo call, so
+   the pair is always consistent.  Calling regtest_get_block_height() and
+   regtest_get_best_block_hash() back to back is racy: a block connected
+   between the two RPCs pairs height H with the hash of block H+1.
+   On success writes *height_out and hash_out (64 hex chars + NUL) and
+   returns 1.  On error sets *height_out = -1, hash_out[0] = 0, returns 0. */
+int   regtest_get_tip(regtest_t *rt, int *height_out, char hash_out[65]);
+
+/* One entry of getchaintips.  status is bitcoind's string: "active",
+   "valid-fork" (fully validated, not in the main chain: typically blocks
+   that were disconnected by a reorg), "invalid", "valid-headers",
+   "headers-only".  The branch forks off the main chain at
+   height - branchlen. */
+typedef struct {
+    int  height;
+    int  branchlen;
+    char status[16];
+    char hash[65];
+} regtest_chain_tip_t;
+
+/* getchaintips.  Writes up to max entries (bitcoind lists them by height,
+   highest first) to out and the number written to *n_out.  Returns 1 on
+   success, 0 on error. */
+int   regtest_get_chain_tips(regtest_t *rt, regtest_chain_tip_t *out,
+                             size_t max, size_t *n_out);
+
 /* Get the block hash at a given height. Writes 64 hex chars + NUL to hash_out.
    Returns 1 on success, 0 on error. */
 int   regtest_get_block_hash(regtest_t *rt, int height,

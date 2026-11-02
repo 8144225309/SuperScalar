@@ -859,6 +859,70 @@ int regtest_get_best_block_hash(regtest_t *rt, char *hash_out_buf) {
     return 1;
 }
 
+/* Chain tip as one consistent (height, hash) pair.  getblockcount and
+   getbestblockhash are separate RPCs: a block connected between them yields
+   height H paired with the hash of H+1, and a reorg detector that stores
+   that pair later sees "the block at H changed" when it did not.
+   getblockchaininfo reads "blocks" and "bestblockhash" from the same tip
+   under cs_main, so the pair it returns always belongs together. */
+int regtest_get_tip(regtest_t *rt, int *height_out, char hash_out[65]) {
+    if (height_out) *height_out = -1;
+    if (hash_out) hash_out[0] = '\0';
+    if (!rt || !height_out || !hash_out) return 0;
+    char *result = regtest_exec(rt, "getblockchaininfo", "");
+    if (!result) return 0;
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json) return 0;
+    int ok = 0;
+    cJSON *blocks = cJSON_GetObjectItem(json, "blocks");
+    cJSON *best = cJSON_GetObjectItem(json, "bestblockhash");
+    if (blocks && cJSON_IsNumber(blocks) && blocks->valueint >= 0 &&
+        best && cJSON_IsString(best) && best->valuestring &&
+        strlen(best->valuestring) == 64) {
+        *height_out = blocks->valueint;
+        memcpy(hash_out, best->valuestring, 64);
+        hash_out[64] = '\0';
+        ok = 1;
+    }
+    cJSON_Delete(json);
+    return ok;
+}
+
+int regtest_get_chain_tips(regtest_t *rt, regtest_chain_tip_t *out,
+                           size_t max, size_t *n_out) {
+    if (n_out) *n_out = 0;
+    if (!rt || !out || !n_out) return 0;
+    char *result = regtest_exec(rt, "getchaintips", "");
+    if (!result) return 0;
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json || !cJSON_IsArray(json)) { cJSON_Delete(json); return 0; }
+    size_t n = 0;
+    cJSON *tip = NULL;
+    cJSON_ArrayForEach(tip, json) {
+        if (n >= max) break;
+        cJSON *h  = cJSON_GetObjectItem(tip, "height");
+        cJSON *bl = cJSON_GetObjectItem(tip, "branchlen");
+        cJSON *st = cJSON_GetObjectItem(tip, "status");
+        cJSON *hs = cJSON_GetObjectItem(tip, "hash");
+        if (!h || !cJSON_IsNumber(h) || !bl || !cJSON_IsNumber(bl) ||
+            !st || !cJSON_IsString(st) || !st->valuestring)
+            continue;
+        regtest_chain_tip_t *t = &out[n++];
+        memset(t, 0, sizeof(*t));
+        t->height = h->valueint;
+        t->branchlen = bl->valueint;
+        strncpy(t->status, st->valuestring, sizeof(t->status) - 1);
+        if (hs && cJSON_IsString(hs) && hs->valuestring &&
+            strlen(hs->valuestring) == 64)
+            memcpy(t->hash, hs->valuestring, 65);
+    }
+    cJSON_Delete(json);
+    *n_out = n;
+    return 1;
+}
+
 int regtest_mine_blocks(regtest_t *rt, int n, const char *address) {
     /* Only allow mining on regtest to prevent accidental mining on other networks */
     if (strcmp(rt->network, "regtest") != 0) return 0;

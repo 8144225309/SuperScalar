@@ -3920,6 +3920,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_bip158_callback_fires);
     RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
     RUN_TEST(test_reorg_bip158_noop);
+
+    /* R1 reorg detector: tip read race + classification */
+    extern int test_reorg_tip_race_no_false_forward(void);
+    extern int test_reorg_classify_detects_real_reorgs(void);
+    extern int test_reorg_classify_unseen_block_reorg(void);
+    RUN_TEST(test_reorg_tip_race_no_false_forward);
+    RUN_TEST(test_reorg_classify_detects_real_reorgs);
+    RUN_TEST(test_reorg_classify_unseen_block_reorg);
 }
 
 extern int regtest_init_faucet(void);
@@ -4063,6 +4071,15 @@ static void run_regtest_tests(void) {
 
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);
+
+    printf("\n=== Regtest Reorg Detection ===\n");
+    {
+        extern int test_regtest_reorg_tip_snapshot_consistent(void);
+        extern int test_regtest_reorg_unseen_tip_block_detected(void);
+        RUN_TEST(test_regtest_reorg_unseen_tip_block_detected);
+        /* Mines 300 blocks: keep it last so earlier tests keep subsidy. */
+        RUN_TEST(test_regtest_reorg_tip_snapshot_consistent);
+    }
 
     regtest_faucet_health_report();
 }
