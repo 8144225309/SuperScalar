@@ -3735,6 +3735,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_reconnect_rollback_more_than_64_htlcs);
     extern int test_restart_reconnect_too_many_htlcs_fails_closed(void);
     RUN_TEST(test_restart_reconnect_too_many_htlcs_fails_closed);
+    extern int test_restart_dw_state_read_error_fails_load(void);
+    RUN_TEST(test_restart_dw_state_read_error_fails_load);
+    extern int test_restart_dw_counter_restored_by_load_factory(void);
+    RUN_TEST(test_restart_dw_counter_restored_by_load_factory);
+    extern int test_restart_dw_counter_out_of_range_loads_exhausted(void);
+    RUN_TEST(test_restart_dw_counter_out_of_range_loads_exhausted);
+    extern int test_restart_dw_state_save_writes_current_state(void);
+    RUN_TEST(test_restart_dw_state_save_writes_current_state);
+    extern int test_restart_dw_counter_many_leaves_round_trip(void);
+    RUN_TEST(test_restart_dw_counter_many_leaves_round_trip);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

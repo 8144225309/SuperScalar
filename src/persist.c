@@ -3544,6 +3544,16 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         #undef PS_RESTORE_MAX
     }
 
+    /* Last: factory_build_tree above re-initialised the DW counter.  If
+       the stored state cannot be read, the counter would stay at the
+       initial state, behind states already signed: fail the load. */
+    if (persist_load_factory_dw_state(p, factory_id, f) < 0) {
+        fprintf(stderr, "persist_load_factory: cannot read the DW counter "
+                "state of factory %u; refusing to load it\n", factory_id);
+        factory_free(f);
+        return 0;
+    }
+
     return 1;
 }
 
@@ -5368,40 +5378,6 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
 
 /* --- DW counter state --- */
 
-int persist_save_dw_counter(persist_t *p, uint32_t factory_id,
-                             uint32_t current_epoch, uint32_t n_layers,
-                             const uint32_t *layer_states) {
-    if (!p || !p->db || !layer_states || n_layers == 0) return 0;
-
-    /* Build comma-separated layer_states string */
-    char buf[256];
-    buf[0] = '\0';
-    for (uint32_t i = 0; i < n_layers; i++) {
-        char tmp[16];
-        snprintf(tmp, sizeof(tmp), "%s%u", i > 0 ? "," : "", layer_states[i]);
-        strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
-    }
-
-    const char *sql =
-        "INSERT OR REPLACE INTO dw_counter_state "
-        "(factory_id, current_epoch, n_layers, layer_states, "
-        " per_leaf_enabled, n_leaf_nodes, leaf_states) "
-        "VALUES (?, ?, ?, ?, 0, 2, '0,0');";
-
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
-
-    sqlite3_bind_int(stmt, 1, (int)factory_id);
-    sqlite3_bind_int(stmt, 2, (int)current_epoch);
-    sqlite3_bind_int(stmt, 3, (int)n_layers);
-    sqlite3_bind_text(stmt, 4, buf, -1, SQLITE_TRANSIENT);
-
-    int ok2 = (sqlite3_step(stmt) == SQLITE_DONE);
-    sqlite3_finalize(stmt);
-    return ok2;
-}
-
 int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
                                          uint32_t current_epoch, uint32_t n_layers,
                                          const uint32_t *layer_states,
@@ -5419,15 +5395,20 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
         strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
     }
 
-    /* Build comma-separated leaf_states string */
-    char leaf_buf[256];
+    /* Build comma-separated leaf_states string, sized for the leaf count
+       (a fixed 256-byte buffer silently dropped every leaf past ~128).
+       The leaf states are recorded whenever they are given, per-leaf mode
+       on or off (all 0 when off), so a row holds every leaf. */
+    int n_leaves = (leaf_states && n_leaf_nodes > 0) ? n_leaf_nodes : 2;
+    size_t leaf_cap = (size_t)n_leaves * 11 + 1;  /* ",4294967295" per leaf */
+    char *leaf_buf = malloc(leaf_cap);
+    if (!leaf_buf) return 0;
+    size_t leaf_len = 0;
     leaf_buf[0] = '\0';
-    int n_leaves = (per_leaf_enabled && leaf_states) ? n_leaf_nodes : 2;
     for (int i = 0; i < n_leaves; i++) {
-        char tmp[16];
-        uint32_t val = (per_leaf_enabled && leaf_states) ? leaf_states[i] : 0;
-        snprintf(tmp, sizeof(tmp), "%s%u", i > 0 ? "," : "", val);
-        strncat(leaf_buf, tmp, sizeof(leaf_buf) - strlen(leaf_buf) - 1);
+        uint32_t val = (leaf_states && n_leaf_nodes > 0) ? leaf_states[i] : 0;
+        leaf_len += (size_t)snprintf(leaf_buf + leaf_len, leaf_cap - leaf_len,
+                                     "%s%u", i > 0 ? "," : "", val);
     }
 
     const char *sql =
@@ -5437,8 +5418,10 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
         "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(leaf_buf);
         return 0;
+    }
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)current_epoch);
@@ -5450,62 +5433,20 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     int ok2 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    free(leaf_buf);
     return ok2;
 }
 
-int persist_load_dw_counter(persist_t *p, uint32_t factory_id,
-                             uint32_t *epoch_out, uint32_t *n_layers_out,
-                             uint32_t *layer_states_out, size_t max_layers) {
-    if (!p || !p->db) return 0;
-
-    const char *sql =
-        "SELECT current_epoch, n_layers, layer_states "
-        "FROM dw_counter_state WHERE factory_id = ?;";
-
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
-
-    sqlite3_bind_int(stmt, 1, (int)factory_id);
-
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return 0;
-    }
-
-    uint32_t epoch = (uint32_t)sqlite3_column_int(stmt, 0);
-    uint32_t n_layers = (uint32_t)sqlite3_column_int(stmt, 1);
-    const char *states_str = (const char *)sqlite3_column_text(stmt, 2);
-
-    if (epoch_out) *epoch_out = epoch;
-    if (n_layers_out) *n_layers_out = n_layers;
-
-    /* Parse comma-separated layer states */
-    if (layer_states_out && states_str) {
-        char tmp[256];
-        strncpy(tmp, states_str, sizeof(tmp) - 1);
-        tmp[sizeof(tmp) - 1] = '\0';
-
-        char *tok = strtok(tmp, ",");
-        size_t idx = 0;
-        while (tok && idx < max_layers && idx < n_layers) {
-            layer_states_out[idx++] = (uint32_t)strtol(tok, NULL, 10);
-            tok = strtok(NULL, ",");
-        }
-    }
-
-    sqlite3_finalize(stmt);
-    return 1;
-}
-
-int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
-                                         uint32_t *epoch_out, uint32_t *n_layers_out,
-                                         uint32_t *layer_states_out, size_t max_layers,
-                                         int *per_leaf_enabled_out,
-                                         uint32_t *leaf_states_out,
-                                         int *n_leaf_nodes_out,
-                                         size_t max_leaf_nodes) {
-    if (!p || !p->db) return 0;
+/* Read the dw_counter_state row for factory_id.  Returns 1 if it was read,
+   0 if there is none, -1 on a query or allocation error. */
+static int dw_counter_row_read(persist_t *p, uint32_t factory_id,
+                               uint32_t *epoch_out, uint32_t *n_layers_out,
+                               uint32_t *layer_states_out, size_t max_layers,
+                               int *per_leaf_enabled_out,
+                               uint32_t *leaf_states_out,
+                               int *n_leaf_nodes_out,
+                               size_t max_leaf_nodes) {
+    if (!p || !p->db) return -1;
 
     const char *sql =
         "SELECT current_epoch, n_layers, layer_states, "
@@ -5514,13 +5455,14 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+        return -1;
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
 
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
         sqlite3_finalize(stmt);
-        return 0;
+        return rc == SQLITE_DONE ? 0 : -1;
     }
 
     uint32_t epoch = (uint32_t)sqlite3_column_int(stmt, 0);
@@ -5552,19 +5494,129 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     const char *leaf_str = (const char *)sqlite3_column_text(stmt, 5);
     if (leaf_states_out && leaf_str) {
-        char tmp[256];
-        strncpy(tmp, leaf_str, sizeof(tmp) - 1);
-        tmp[sizeof(tmp) - 1] = '\0';
-
-        char *tok = strtok(tmp, ",");
+        /* Parse a copy of the whole string (a fixed 256-byte copy dropped
+           every leaf past ~128). */
+        char *tmp = strdup(leaf_str);
+        if (!tmp) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+        char *save = NULL;
+        char *tok = strtok_r(tmp, ",", &save);
         size_t idx = 0;
         while (tok && idx < max_leaf_nodes && idx < (size_t)n_leaf) {
             leaf_states_out[idx++] = (uint32_t)strtol(tok, NULL, 10);
-            tok = strtok(NULL, ",");
+            tok = strtok_r(NULL, ",", &save);
         }
+        free(tmp);
     }
 
     sqlite3_finalize(stmt);
+    return 1;
+}
+
+int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
+                                         uint32_t *epoch_out, uint32_t *n_layers_out,
+                                         uint32_t *layer_states_out, size_t max_layers,
+                                         int *per_leaf_enabled_out,
+                                         uint32_t *leaf_states_out,
+                                         int *n_leaf_nodes_out,
+                                         size_t max_leaf_nodes) {
+    return dw_counter_row_read(p, factory_id, epoch_out, n_layers_out,
+                               layer_states_out, max_layers,
+                               per_leaf_enabled_out, leaf_states_out,
+                               n_leaf_nodes_out, max_leaf_nodes) == 1;
+}
+
+int persist_save_factory_dw_state(persist_t *p, uint32_t factory_id,
+                                  const factory_t *f) {
+    if (!p || !p->db || !f) return 0;
+    if (f->counter.n_layers == 0 || f->counter.n_layers > DW_MAX_LAYERS) return 0;
+
+    uint32_t layer_states[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f->counter.n_layers; i++)
+        layer_states[i] = f->counter.layers[i].current_state;
+
+    int n_leaf = (f->leaf_layers && f->n_leaf_nodes > 0) ? f->n_leaf_nodes : 0;
+    uint32_t *leaf_states = NULL;
+    if (n_leaf > 0) {
+        leaf_states = malloc((size_t)n_leaf * sizeof(uint32_t));
+        if (!leaf_states) return 0;
+        for (int i = 0; i < n_leaf; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
+    }
+
+    int ok = persist_save_dw_counter_with_leaves(p, factory_id,
+                 f->counter.current_epoch, f->counter.n_layers, layer_states,
+                 f->per_leaf_enabled && n_leaf > 0, leaf_states, n_leaf);
+    free(leaf_states);
+    return ok;
+}
+
+/* Restore one DW layer.  An unknown or out-of-range value becomes the
+   layer's last state: wasting the remaining states is safe, signing a
+   state number that was already used is not. */
+static int restore_dw_layer(dw_layer_t *layer, uint32_t stored) {
+    uint32_t last = layer->config.max_states ? layer->config.max_states - 1 : 0;
+    if (stored > last) {
+        layer->current_state = last;
+        return 0;
+    }
+    layer->current_state = stored;
+    return 1;
+}
+
+int persist_load_factory_dw_state(persist_t *p, uint32_t factory_id,
+                                  factory_t *f) {
+    if (!p || !p->db || !f) return -1;
+
+    uint32_t epoch = 0, n_layers = 0;
+    uint32_t layer_states[DW_MAX_LAYERS];
+    for (size_t i = 0; i < DW_MAX_LAYERS; i++) layer_states[i] = UINT32_MAX;
+    int per_leaf = 0, n_leaf = 0;
+    size_t max_leaf = (f->leaf_layers && f->n_leaf_nodes > 0)
+                      ? (size_t)f->n_leaf_nodes : 0;
+    uint32_t *leaf_states = NULL;
+    if (max_leaf > 0) {
+        leaf_states = malloc(max_leaf * sizeof(uint32_t));
+        if (!leaf_states) return -1;
+        for (size_t i = 0; i < max_leaf; i++) leaf_states[i] = UINT32_MAX;
+    }
+
+    int rc = dw_counter_row_read(p, factory_id, &epoch, &n_layers,
+                                 layer_states, DW_MAX_LAYERS, &per_leaf,
+                                 leaf_states, &n_leaf, max_leaf);
+    if (rc <= 0) {
+        free(leaf_states);
+        return rc;  /* 0: no row (a fresh factory); -1: read error */
+    }
+
+    int exact = (n_layers == f->counter.n_layers);
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) {
+        uint32_t v = (n_layers == f->counter.n_layers) ? layer_states[i]
+                                                       : UINT32_MAX;
+        if (!restore_dw_layer(&f->counter.layers[i], v)) exact = 0;
+    }
+    f->counter.current_epoch = epoch;
+
+    if (max_leaf > 0) {
+        /* The save records every leaf, per-leaf mode on or off.  A row
+           that does not hold one state per leaf restores every leaf as
+           exhausted. */
+        int recorded = (n_leaf == f->n_leaf_nodes);
+        if (per_leaf) f->per_leaf_enabled = 1;
+        if (!recorded) exact = 0;
+        for (int i = 0; i < f->n_leaf_nodes; i++) {
+            uint32_t v = recorded ? leaf_states[i] : UINT32_MAX;
+            if (!restore_dw_layer(&f->leaf_layers[i], v)) exact = 0;
+        }
+    }
+    free(leaf_states);
+
+    if (!exact)
+        fprintf(stderr, "persist: DW counter row for factory %u has missing "
+                "or out-of-range states; those layers are restored as "
+                "exhausted\n", factory_id);
     return 1;
 }
 

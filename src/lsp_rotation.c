@@ -1314,7 +1314,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             !persist_save_tree_nodes(db, &lsp->factory, 0) ||
             (has_dist && !persist_save_distribution_tx(db, 0,
                                                        lsp->factory.dist_signed_tx.data,
-                                                       lsp->factory.dist_signed_tx.len))) {
+                                                       lsp->factory.dist_signed_tx.len)) ||
+            !persist_save_factory_dw_state(db, 0, &lsp->factory)) {
             fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
             persist_rollback(db);
             return 0;
