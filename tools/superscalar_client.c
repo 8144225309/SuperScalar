@@ -2355,9 +2355,12 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    char fr_status[256] = {0};
+    char fr_status[512] = {0};
     int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
     fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
+    if (!result)
+        fprintf(stderr, "Client: CLOSE policy force-close FAILED to publish part of "
+                "the exit path; re-run --force-close and check the status above\n");
     /* Broadcast the signed commitment TX (last verified state) if present. */
     unsigned char signed_tx_data[4096];
     size_t signed_tx_len = 0;
@@ -2826,9 +2829,15 @@ int main(int argc, char *argv[]) {
            passive startup/reorg scan that never broadcasts. Call repeatedly (caller
            mines between passes) so each tree level matures its CSV; the root spends
            the funding directly, so no distribution TX is required. */
-        char fr_status[256] = {0};
-        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+        char fr_status[512] = {0};
+        factory_recovery_result_t fr_res;
+        memset(&fr_res, 0, sizeof(fr_res));
+        int result = factory_recovery_run_ex(&db, &chain, 0, 0, &fr_res,
+                                             fr_status, sizeof(fr_status));
         printf("Force-close: %s (run=%d)\n", fr_status, result);
+        if (!result)
+            fprintf(stderr, "Force-close: FAILED to publish part of the factory "
+                    "tree: %s\n", fr_status);
 
         /* Broadcast signed commitment TX if available */
         {
@@ -2885,7 +2894,20 @@ int main(int argc, char *argv[]) {
         }
 
         persist_close(&db);
-        printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
+        if (!result) {
+            printf("=== CLIENT FORCE-CLOSE FAILED (exit path incomplete) ===\n");
+            return 1;
+        }
+        /* One pass: the tree goes out level by level as each relative
+           timelock matures, so the caller re-runs this after each block. */
+        if (fr_res.settled)
+            printf("=== CLIENT FORCE-CLOSE COMPLETE: settled ===\n");
+        else
+            printf("=== CLIENT FORCE-CLOSE IN PROGRESS: %d of %d tree TXs "
+                   "confirmed, %d waiting for a parent or timelock; run "
+                   "--force-close again after the next block(s) until it "
+                   "reports settled ===\n",
+                   fr_res.n_confirmed, fr_res.n_txs, fr_res.n_waiting);
         return 0;
     }
 
