@@ -2191,12 +2191,27 @@ int persist_load_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
 
 /* --- Client-side PS double-spend defense (v20) --- */
 
+/* TEST-ONLY fault-injection hook (persist.h).  NULL outside the unit tests. */
+static persist_test_ps_hook_fn g_ps_test_hook = NULL;
+static void *g_ps_test_hook_user = NULL;
+
+void persist_test_set_ps_hook(persist_test_ps_hook_fn fn, void *user) {
+    g_ps_test_hook = fn;
+    g_ps_test_hook_user = user;
+}
+
+int persist_test_ps_hook_fire(int point) {
+    if (!g_ps_test_hook) return 0;
+    return g_ps_test_hook(point, g_ps_test_hook_user) ? 1 : 0;
+}
+
 int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
                                     const unsigned char parent_txid[32],
                                     uint32_t parent_vout,
                                     unsigned char out_sighash[32])
 {
     if (!p || !p->db || !parent_txid) return 0;
+    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_CHECK)) return 0;  /* injected prepare failure */
     sqlite3_stmt *stmt;
     const char *sql =
         "SELECT sighash FROM client_ps_signed_inputs "
@@ -2232,6 +2247,7 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
                                    const unsigned char partial_sig[36])
 {
     if (!p || !p->db || !parent_txid || !sighash || !partial_sig) return 0;
+    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_SAVE)) return 0;  /* injected step failure */
     sqlite3_stmt *stmt;
     const char *sql =
         "INSERT OR REPLACE INTO client_ps_signed_inputs "

@@ -295,6 +295,23 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
                                    const unsigned char sighash[32],
                                    const unsigned char partial_sig[36]);
 
+/* ---- TEST-ONLY fault injection for the PS record-and-refuse path ----
+   A process-global callback, NULL by default (and in every non-test
+   binary, where each call site below is a single NULL check).  When
+   installed it is invoked with one of the points below right before that
+   step runs; a nonzero return makes the step fail.  The callback may also
+   have side effects, e.g. insert a row through a second connection to
+   simulate a concurrent ceremony winning the race.  Not thread-safe;
+   single-process unit tests only. */
+#define PERSIST_TEST_PS_SIGHASH 1  /* client: before it computes the sighash to record */
+#define PERSIST_TEST_PS_CHECK   2  /* before persist_check_ps_signed_input() queries */
+#define PERSIST_TEST_PS_SAVE    3  /* before persist_save_ps_signed_input() inserts */
+typedef int (*persist_test_ps_hook_fn)(int point, void *user);
+void persist_test_set_ps_hook(persist_test_ps_hook_fn fn, void *user);
+/* Internal to the record-and-refuse path: nonzero = the installed hook asked
+   for this step to fail. */
+int persist_test_ps_hook_fire(int point);
+
 /* List all non-closed factory IDs from the ladder_factories table.
    Returns count written to ids_out (up to max_ids).
    Only returns factories with state != 'closed'. */

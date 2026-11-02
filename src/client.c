@@ -4355,12 +4355,15 @@ static int client_handle_leaf_advance_stateless(int fd,
         }
     }
 
+    lsp_crash_checkpoint("ps_record_pre_save");
+
     /* PS defense: record what we just signed BEFORE shipping FINAL.  A
        crash after record + before send is safe -- a retry sees the row
        and refuses.  Same shape as legacy path. */
     if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
         unsigned char sighash[32];
-        if (compute_taproot_sighash(sighash,
+        if (!persist_test_ps_hook_fire(PERSIST_TEST_PS_SIGHASH) &&
+            compute_taproot_sighash(sighash,
                 ps_node->unsigned_tx.data, ps_node->unsigned_tx.len, 0,
                 ps_node->outputs[0].script_pubkey,
                 ps_node->outputs[0].script_pubkey_len,
@@ -4375,6 +4378,8 @@ static int client_handle_leaf_advance_stateless(int fd,
                 sighash, psig_buf);
         }
     }
+
+    lsp_crash_checkpoint("ps_record_post_save");
 
     /* Step 7: complete_node aggregates both psigs + attaches the signed
        witness, populating node->signed_tx.  Phase 1d.2 also runs the
@@ -4444,6 +4449,7 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
     cJSON_Delete(fin_json);
+    lsp_crash_checkpoint("ps_record_post_final");
 
     /* #59 Phase 1: FINAL is sent — the advance is committed and the old state is
        superseded.  Persist the poison TEMPLATE now (revocation_secret stays NULL),
