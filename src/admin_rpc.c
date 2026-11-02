@@ -819,6 +819,13 @@ static cJSON *method_listfactories(admin_rpc_t *rpc)
 /* ------------------------------------------------------------------ */
 /* Method: recoverfactory                                               */
 /* ------------------------------------------------------------------ */
+/*
+ * Publishes a factory's signed tree (force-close).  Irreversible, so:
+ *   factory_id — uint32, REQUIRED (no default to factory 0)
+ *   dry_run    — bool, default true: report what would be broadcast;
+ *                pass false to actually broadcast.
+ * Positional form: [factory_id, dry_run].
+ */
 static cJSON *method_recoverfactory(admin_rpc_t *rpc, const cJSON *params,
                                     char *errmsg, size_t errcap)
 {
@@ -832,21 +839,48 @@ static cJSON *method_recoverfactory(admin_rpc_t *rpc, const cJSON *params,
     }
 
     uint32_t factory_id = 0;
+    int have_factory_id = 0;
+    int dry_run = 1;
+    const cJSON *fid_item = NULL, *dry_item = NULL;
     if (cJSON_IsObject(params)) {
-        cJSON *f = cJSON_GetObjectItemCaseSensitive(params, "factory_id");
-        if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
+        fid_item = cJSON_GetObjectItemCaseSensitive(params, "factory_id");
+        dry_item = cJSON_GetObjectItemCaseSensitive(params, "dry_run");
     } else if (cJSON_IsArray(params)) {
-        cJSON *f = cJSON_GetArrayItem(params, 0);
-        if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
+        fid_item = cJSON_GetArrayItem(params, 0);
+        dry_item = cJSON_GetArrayItem(params, 1);
     }
+    if (cJSON_IsNumber(fid_item) && fid_item->valuedouble >= 0) {
+        factory_id = (uint32_t)fid_item->valuedouble;
+        have_factory_id = 1;
+    }
+    if (!have_factory_id) {
+        snprintf(errmsg, errcap, "factory_id is required");
+        return NULL;
+    }
+    if (cJSON_IsBool(dry_item))
+        dry_run = cJSON_IsTrue(dry_item) ? 1 : 0;
+    else if (cJSON_IsNumber(dry_item))
+        dry_run = dry_item->valuedouble != 0 ? 1 : 0;
 
-    char status[256] = {0};
-    int ok = factory_recovery_run(p, chain, factory_id, status, sizeof(status));
+    char status[512] = {0};
+    factory_recovery_result_t res;
+    int ok = factory_recovery_run_ex(p, chain, factory_id, dry_run, &res,
+                                     status, sizeof(status));
 
     cJSON *r = cJSON_CreateObject();
     cJSON_AddNumberToObject(r, "factory_id",       (double)factory_id);
+    cJSON_AddBoolToObject  (r, "dry_run",          dry_run);
+    cJSON_AddBoolToObject  (r, "ok",               ok);
     cJSON_AddStringToObject(r, "status",           status[0] ? status : "no action needed");
-    cJSON_AddBoolToObject  (r, "broadcasts_made",  ok);
+    cJSON_AddBoolToObject  (r, "broadcasts_made",  !dry_run && res.n_broadcast > 0);
+    cJSON_AddNumberToObject(r, dry_run ? "would_broadcast" : "n_broadcast",
+                            (double)res.n_broadcast);
+    cJSON_AddNumberToObject(r, "n_txs",            (double)res.n_txs);
+    cJSON_AddNumberToObject(r, "n_confirmed",      (double)res.n_confirmed);
+    cJSON_AddNumberToObject(r, "n_in_mempool",     (double)res.n_in_mempool);
+    cJSON_AddNumberToObject(r, "n_waiting",        (double)res.n_waiting);
+    cJSON_AddNumberToObject(r, "n_failed",         (double)res.n_failed);
+    cJSON_AddBoolToObject  (r, "settled",          res.settled);
     return r;
 }
 
