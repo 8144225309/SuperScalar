@@ -8518,3 +8518,122 @@ int test_factory_client_to_leaf_roundtrip(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* factory_detach_txbufs on a chain-advanced PS sub-factory.
+
+   A ladder entry is a factory_t struct copy of lsp->factory followed by
+   factory_detach_txbufs.  Once a sub-factory chain has advanced, its node
+   carries heap ps_prev_* arrays (and, while signing, the input_* per-input
+   session arrays).  The copy must own its ps_prev_* (structural: the next
+   chain advance builds its sighashes from them) and must not alias the
+   original's per-input session arrays (re-init frees them).  Builds the k=2
+   N=4 PS tree, advances sub-factory 0, opens its per-input sessions, copies
+   via the real path, then mutates each side and frees both. */
+int test_factory_detach_txbufs_ps_chain_advanced(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sk[32] = {0};
+        sk[31] = (unsigned char)(i + 1);
+        sk[0]  = 0xED;
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], sk), "keypair");
+    }
+    unsigned char fund_spk[34];
+    {
+        secp256k1_pubkey pks[5];
+        for (int i = 0; i < 5; i++)
+            secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, 5);
+        unsigned char ser[32], tweak[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey fund_tw;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tw, NULL, &tweaked_pk);
+        build_p2tr_script_pubkey(fund_spk, &fund_tw);
+    }
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xFD, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, 5, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_ps_subfactory_arity(f, 2);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build k2 PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign chain[0]");
+
+    int sub_idx = f->nodes[f->leaf_node_indices[0]].subfactory_node_indices[0];
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 0, 50000), 1,
+                   "chain advance");
+    factory_node_t *sub = &f->nodes[sub_idx];
+    size_t n_in = sub->ps_n_prev_outputs;
+    TEST_ASSERT(n_in == 3 && sub->ps_prev_cap >= n_in && sub->ps_prev_amounts,
+                "ps_prev_* allocated by the chain advance");
+    for (size_t i = 0; i < n_in; i++)
+        TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub_idx, i),
+                    "init per-input session");
+    TEST_ASSERT(sub->input_signing_sessions && sub->input_merkle_root,
+                "per-input session arrays allocated");
+
+    uint64_t snap_amounts[FACTORY_MAX_OUTPUTS];
+    unsigned char snap_spks[FACTORY_MAX_OUTPUTS][34];
+    memcpy(snap_amounts, sub->ps_prev_amounts, n_in * sizeof(uint64_t));
+    memcpy(snap_spks, sub->ps_prev_spks, n_in * 34);
+
+    /* The real copy path (lsp_rotation.c / superscalar_lsp.c ladder entries). */
+    factory_t *copy = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(copy, "alloc copy");
+    *copy = *f;
+    factory_detach_txbufs(copy);
+    factory_node_t *csub = &copy->nodes[sub_idx];
+
+    TEST_ASSERT(csub->ps_prev_amounts != sub->ps_prev_amounts &&
+                csub->ps_prev_spks != sub->ps_prev_spks &&
+                csub->ps_prev_spk_lens != sub->ps_prev_spk_lens,
+                "copy owns its ps_prev_* arrays");
+    TEST_ASSERT_EQ((long)csub->ps_n_prev_outputs, (long)n_in, "copy keeps n_prev_outputs");
+    TEST_ASSERT(memcmp(csub->ps_prev_amounts, snap_amounts, n_in * sizeof(uint64_t)) == 0 &&
+                memcmp(csub->ps_prev_spks, snap_spks, n_in * 34) == 0,
+                "copy ps_prev_* contents match");
+    TEST_ASSERT(csub->input_signing_sessions == NULL && csub->n_input_sessions == 0 &&
+                csub->input_merkle_root == NULL && csub->input_has_merkle_root == NULL &&
+                csub->input_keyaggs == NULL && csub->input_signer_indices == NULL &&
+                csub->input_partial_sigs == NULL,
+                "copy does not alias the original's per-input session arrays");
+
+    /* Mutate the ORIGINAL: a second chain advance rewrites ps_prev_* in place
+       (same capacity, no realloc).  The copy must not see it. */
+    TEST_ASSERT_EQ(factory_subfactory_chain_advance_unsigned(f, 0, 0, 1, 30000), 1,
+                   "second chain advance on original");
+    sub = &f->nodes[sub_idx];
+    TEST_ASSERT(memcmp(sub->ps_prev_amounts, snap_amounts, n_in * sizeof(uint64_t)) != 0,
+                "original ps_prev_amounts changed");
+    TEST_ASSERT(memcmp(csub->ps_prev_amounts, snap_amounts, n_in * sizeof(uint64_t)) == 0,
+                "copy ps_prev_amounts unaffected by the original's advance");
+
+    /* Mutate the COPY: the original must not see it. */
+    uint64_t orig0 = sub->ps_prev_amounts[0];
+    csub->ps_prev_amounts[0] = 0xDEADBEEFULL;
+    TEST_ASSERT(sub->ps_prev_amounts[0] == orig0, "original unaffected by copy write");
+
+    /* Re-opening per-input sessions on the copy allocates its own, and must
+       not free the original's. */
+    TEST_ASSERT(factory_session_init_node_input(f, (size_t)sub_idx, 0),
+                "original re-inits its per-input session");
+    TEST_ASSERT(factory_session_init_node_input(copy, (size_t)sub_idx, 0),
+                "copy opens its own per-input session");
+    TEST_ASSERT(csub->input_signing_sessions != NULL &&
+                csub->input_signing_sessions != sub->input_signing_sessions,
+                "copy's per-input sessions are its own");
+
+    factory_free(copy);
+    free(copy);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

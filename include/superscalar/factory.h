@@ -293,11 +293,21 @@ typedef struct {
        before factory_subfactory_chain_advance_unsigned mutates outputs[].
        Each index i in [0, ps_n_prev_outputs) corresponds to chain[N-1]'s
        output i (vout i becomes input i of chain[N]).
-       Only populated when ps_chain_len > 0 && type == NODE_PS_SUBFACTORY. */
+       Only populated when ps_chain_len > 0 && type == NODE_PS_SUBFACTORY.
+
+       HEAP, not fixed arrays: as [FACTORY_MAX_OUTPUTS] these three cost
+       544 + 128 + 128 = 800 B on EVERY node, while only chain-advanced
+       multi-input PS sub-factory nodes ever populate them.  nodes[] is sized
+       to the participant count, so that was 800 B x (4N-2) per client -- the
+       same O(N^2) shape that input_signer_indices had before it was converted
+       (see below).  Allocated together by ensure_ps_prev_alloc, freed in
+       factory_free.  ps_prev_spks keeps its (*)[34] shape so both
+       ps_prev_spks[i] and sizeof(ps_prev_spks[i]) behave exactly as before. */
     size_t ps_n_prev_outputs;                                     /* 0 = single-input */
-    uint64_t ps_prev_amounts[FACTORY_MAX_OUTPUTS];
-    unsigned char ps_prev_spks[FACTORY_MAX_OUTPUTS][34];
-    size_t ps_prev_spk_lens[FACTORY_MAX_OUTPUTS];
+    uint64_t        *ps_prev_amounts;        /* length ps_prev_cap */
+    unsigned char  (*ps_prev_spks)[34];      /* length ps_prev_cap */
+    size_t          *ps_prev_spk_lens;       /* length ps_prev_cap */
+    size_t           ps_prev_cap;            /* allocated slots; 0 = unallocated */
 
     /* Per-input MuSig sessions for multi-input nodes.  Heap-allocated on
        first factory_session_init_node_input call; freed in factory_free.
@@ -333,8 +343,15 @@ typedef struct {
     uint32_t         *input_signer_indices;   /* n_input_sessions * input_signers_stride */
     size_t            input_signers_stride;   /* = n_signers at alloc time */
     size_t            input_n_signers[FACTORY_MAX_OUTPUTS];
-    unsigned char     input_merkle_root[FACTORY_MAX_OUTPUTS][32];
-    int               input_has_merkle_root[FACTORY_MAX_OUTPUTS];
+    /* HEAP for the same O(N^2) reason as input_signer_indices: as
+       [FACTORY_MAX_OUTPUTS] these cost 512 + 64 = 576 B on every one of the
+       (4N-2) nodes, while only nodes with input sessions ever use them.
+       Allocated/freed alongside the arrays above in ensure_input_sessions_alloc;
+       length is n_input_sessions.  The (*)[32] shape keeps
+       input_merkle_root[i] behaving exactly as before.  Do NOT memset these
+       with sizeof() -- that is sizeof(pointer) now; calloc already zeroes. */
+    unsigned char   (*input_merkle_root)[32];   /* length n_input_sessions */
+    int              *input_has_merkle_root;    /* length n_input_sessions */
 
     /* PS sub-factory wiring (only used when ps_subfactory_arity > 1, the
        canonical k² shape from t/1242).
