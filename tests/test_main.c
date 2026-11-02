@@ -3944,6 +3944,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_funding_freeze_reloaded_on_restart);
     extern int test_reorg_revalidate_rpc_outage_no_change(void);
     RUN_TEST(test_reorg_revalidate_rpc_outage_no_change);
+    extern int test_persist_funding_anchor_reorg_tip(void);
+    RUN_TEST(test_persist_funding_anchor_reorg_tip);
 }
 
 extern int regtest_init_faucet(void);

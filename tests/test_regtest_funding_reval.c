@@ -10,6 +10,7 @@
  *   test_reorg_revalidate_rpc_outage_no_change
  *                                           bitcoind unreachable during
  *                                           revalidation: nothing changes
+ *   test_persist_funding_anchor_reorg_tip   v40 tables round trip
  * Regtest:
  *   test_regtest_reorg_revalidate_factory_funding
  *     5-party arity-2 factory funded on regtest; lsp_channels_revalidate_
@@ -295,6 +296,36 @@ done:
     if (lsp) { factory_free(&lsp->factory); free(lsp); }
     secp256k1_context_destroy(ctx);
     return rc;
+}
+
+int test_persist_funding_anchor_reorg_tip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open db");
+    const char *txid = "11111111111111111111111111111111"
+                       "11111111111111111111111111111111";
+    const char *b1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char *b2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    int32_t h = 0;
+    char hash[65] = {0};
+    int ok = 1;
+    if (persist_load_funding_anchor(&db, txid, &h, hash)) ok = 0;
+    if (!persist_save_funding_anchor(&db, txid, 120, b1)) ok = 0;
+    if (!persist_load_funding_anchor(&db, txid, &h, hash) || h != 120 ||
+        strcmp(hash, b1) != 0) ok = 0;
+    if (!persist_save_funding_anchor(&db, txid, 121, b2)) ok = 0;   /* replace */
+    if (!persist_load_funding_anchor(&db, txid, &h, hash) || h != 121 ||
+        strcmp(hash, b2) != 0) ok = 0;
+    if (persist_save_funding_anchor(&db, txid, 1, "short")) ok = 0;  /* rejected */
+    if (persist_load_reorg_tip(&db, "daemon", &h, hash)) ok = 0;
+    if (!persist_save_reorg_tip(&db, "daemon", 3000, b1)) ok = 0;
+    if (!persist_load_reorg_tip(&db, "daemon", &h, hash) || h != 3000 ||
+        strcmp(hash, b1) != 0) ok = 0;
+    if (persist_load_reorg_tip(&db, "heartbeat", &h, hash)) ok = 0;
+    persist_close(&db);
+    TEST_ASSERT(ok, "funding_anchors / reorg_tips save, replace, load");
+    return 1;
 }
 
 /* ---- regtest ------------------------------------------------------------- */

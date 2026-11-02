@@ -2,7 +2,7 @@
 
 All notable changes to SuperScalar are documented here.
 
-> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **40**.
 
 ## Unreleased
 
