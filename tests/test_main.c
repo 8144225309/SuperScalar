@@ -3363,6 +3363,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_restart_reconnect_rollback_more_than_64_htlcs);
     extern int test_restart_reconnect_too_many_htlcs_fails_closed(void);
     RUN_TEST(test_restart_reconnect_too_many_htlcs_fails_closed);
+    extern int test_restart_dw_counter_two_leaf_old_row(void);
+    RUN_TEST(test_restart_dw_counter_two_leaf_old_row);
+    extern int test_restart_dw_state_read_error_fails_load(void);
+    RUN_TEST(test_restart_dw_state_read_error_fails_load);
+    extern int test_restart_dw_counter_cut_leaf_string(void);
+    RUN_TEST(test_restart_dw_counter_cut_leaf_string);
+    extern int test_restart_dw_counter_per_leaf_off_rows(void);
+    RUN_TEST(test_restart_dw_counter_per_leaf_off_rows);
+    extern int test_restart_dw_counter_restored_by_load_factory(void);
+    RUN_TEST(test_restart_dw_counter_restored_by_load_factory);
+    extern int test_restart_dw_counter_legacy_row_loads_exhausted(void);
+    RUN_TEST(test_restart_dw_counter_legacy_row_loads_exhausted);
+    extern int test_restart_dw_state_save_writes_current_state(void);
+    RUN_TEST(test_restart_dw_state_save_writes_current_state);
+    extern int test_restart_dw_counter_many_leaves_round_trip(void);
+    RUN_TEST(test_restart_dw_counter_many_leaves_round_trip);
     RUN_TEST(test_persist_htlc_bidirectional);
 
     printf("\n=== Client Watchtower ===\n");

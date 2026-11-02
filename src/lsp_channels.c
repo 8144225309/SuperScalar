@@ -2036,17 +2036,10 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 node->signed_tx.data, node->signed_tx.len,
                 node->outputs[0].amount_sats,
                 /* poison_tx */ poison_snapshot, poison_snapshot_len);
-        } else {
-            uint32_t leaf_states[8];
-            for (int i = 0; i < f->n_leaf_nodes; i++)
-                leaf_states[i] = f->leaf_layers[i].current_state;
-            uint32_t layer_states[DW_MAX_LAYERS];
-            for (uint32_t i = 0; i < f->counter.n_layers; i++)
-                layer_states[i] = f->counter.layers[i].config.max_states;
-            persist_save_dw_counter_with_leaves(
-                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-                f->counter.n_layers, layer_states,
-                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        } else if (!persist_save_factory_dw_state((persist_t *)mgr->persist,
+                                                  0, f)) {
+            fprintf(stderr, "LSP-stateless: failed to persist DW state after "
+                    "leaf %d advance\n", leaf_side);
         }
     }
 
@@ -2785,6 +2778,12 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                    saved);
     }
 
+    /* The ceremony moved the root layer and epoch on (and reset the leaf
+       layers); persist that so a restart resumes from this state. */
+    if (mgr->persist &&
+        !persist_save_factory_dw_state((persist_t *)mgr->persist, 0, f))
+        fprintf(stderr, "LSP-stateless Tier B: failed to persist DW state\n");
+
     /* C3 Tier 2 (PR-C-4): mark stateless Tier B ceremony complete. */
     if (mgr->persist && c3_round_id > 0) {
         persist_save_signing_round_done((persist_t *)mgr->persist,
@@ -3486,18 +3485,10 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     cJSON_Delete(done);
 
     /* Step 14: Persist per-leaf DW state */
-    if (mgr->persist) {
-        uint32_t leaf_states[8];
-        for (int i = 0; i < f->n_leaf_nodes; i++)
-            leaf_states[i] = f->leaf_layers[i].current_state;
-        uint32_t layer_states[DW_MAX_LAYERS];
-        for (uint32_t i = 0; i < f->counter.n_layers; i++)
-            layer_states[i] = f->counter.layers[i].config.max_states;
-        persist_save_dw_counter_with_leaves(
-            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-            f->counter.n_layers, layer_states,
-            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
-    }
+    if (mgr->persist &&
+        !persist_save_factory_dw_state((persist_t *)mgr->persist, 0, f))
+        fprintf(stderr, "LSP: failed to persist DW state after leaf %d "
+                "realloc\n", leaf_side);
 
     printf("LSP: leaf %d realloc complete (node %zu), amounts=[", leaf_side, node_idx);
     for (size_t i = 0; i < n_amounts; i++)

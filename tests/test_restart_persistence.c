@@ -541,3 +541,356 @@ int test_restart_reconnect_too_many_htlcs_fails_closed(void) {
     return 1;
 }
 
+/* ---- DW counter ---- */
+
+static int rs_dw_factory(rs_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    if (!persist_open(&fx->db, NULL)) return 0;
+    fx->ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                       SECP256K1_CONTEXT_VERIFY);
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_ec_pubkey_create(fx->ctx, &fx->pks[i], rs_seckeys[i]))
+            return 0;
+    if (!rs_build_factory(fx->ctx, fx->pks, FACTORY_ARITY_1, &fx->f)) return 0;
+    return persist_save_factory(&fx->db, fx->f, fx->ctx, 0);
+}
+
+/* A DW row that cannot be read fails the load.  persist_load_factory
+   ignored the error and kept the counter at the initial state, behind
+   states already signed; an allocation failure took the same path.  Two
+   read errors: a row that fails while being stepped, and no table (the
+   prepare fails).  No row at all is a fresh factory and loads. */
+int test_restart_dw_state_read_error_fails_load(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_dw_factory(&fx), "fixture");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "no row: loads");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 0, "no row: initial state");
+    factory_free(rec_f);
+    free(rec_f);
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g, "alloc");
+    TEST_ASSERT(sqlite3_exec(fx.db.db,
+        "DROP TABLE dw_counter_state;"
+        "CREATE VIEW dw_counter_state AS SELECT 0 AS factory_id, "
+        "  abs(-9223372036854775807 - 1) AS current_epoch, 2 AS n_layers, "
+        "  '0,0' AS layer_states, 0 AS per_leaf_enabled, 2 AS n_leaf_nodes, "
+        "  '0,0' AS leaf_states;",
+        NULL, NULL, NULL) == SQLITE_OK, "a row that fails when stepped");
+    TEST_ASSERT(!persist_load_factory(&fx.db, 0, g, fx.ctx),
+                "step error fails the load");
+    TEST_ASSERT(g->nodes == NULL && g->leaf_layers == NULL,
+                "the failed load freed the factory");
+
+    TEST_ASSERT(sqlite3_exec(fx.db.db, "DROP VIEW dw_counter_state;",
+                             NULL, NULL, NULL) == SQLITE_OK, "no table");
+    TEST_ASSERT(!persist_load_factory(&fx.db, 0, g, fx.ctx),
+                "prepare error fails the load");
+
+    free(g);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* Older builds cut the leaf-state string at 255 characters, possibly in
+   the middle of a number: "...,12" stored as "...,1", which would move
+   that leaf back from state 12 to state 1.  The last value of a
+   255-character string is treated as unknown (the leaf loads as
+   exhausted), as are the leaves the string no longer holds. */
+int test_restart_dw_counter_cut_leaf_string(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_alloc_default_arrays(f);
+    enum { N = 100, MAX = 100 };
+    TEST_ASSERT(f->config.max_leaves >= N, "leaf capacity");
+    dw_counter_init(&f->counter, 2, 10, 4);
+    f->per_leaf_enabled = 1;
+    f->n_leaf_nodes = N;
+    for (int i = 0; i < N; i++) {
+        dw_layer_init(&f->leaf_layers[i], 10, MAX);
+        f->leaf_layers[i].current_state = (i == 0) ? 1 : 12;
+    }
+    /* "1,12,12,...": leaf 85's "12" is characters 254 and 255 (from 0). */
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "save");
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE dw_counter_state SET leaf_states = "
+                "substr(leaf_states, 1, 255);", NULL, NULL, NULL) == SQLITE_OK,
+                "cut the string as older builds did");
+
+    for (int i = 0; i < N; i++) f->leaf_layers[i].current_state = 0;
+    TEST_ASSERT_EQ(persist_load_factory_dw_state(&db, 0, f), 1, "row applied");
+    TEST_ASSERT_EQ(f->leaf_layers[0].current_state, 1, "leaf 0 as stored");
+    for (int i = 1; i < 85; i++)
+        TEST_ASSERT_EQ(f->leaf_layers[i].current_state, 12,
+                       "complete values as stored");
+    for (int i = 85; i < N; i++)
+        TEST_ASSERT_EQ(f->leaf_layers[i].current_state, MAX - 1,
+                       "the cut value and the missing ones load as exhausted");
+
+    factory_free(f);
+    free(f);
+    persist_close(&db);
+    return 1;
+}
+
+/* Rows with per-leaf mode off.  This build writes per_leaf=0 only while no
+   leaf has moved since the leaves were last reset (a leaf advance turns
+   the mode on first and nothing turns it off without resetting every
+   leaf), and records every leaf, so the leaf states load as stored.
+   Older builds stored "0,0" with per-leaf mode off; past epoch 0 their
+   only such writer was the demo-mode epoch advance, run after the demo
+   payments had advanced leaves, so those leaves load as exhausted.  At
+   epoch 0 such a row is the creation one, and the leaves stay at 0. */
+int test_restart_dw_counter_per_leaf_off_rows(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_dw_factory(&fx), "fixture");
+    factory_t *f = fx.f;
+    TEST_ASSERT(f->n_leaf_nodes > 2, "more leaves than an old row's 2");
+    TEST_ASSERT(!f->per_leaf_enabled, "per-leaf mode off");
+
+    /* This build, after a root advance with no leaf advanced. */
+    f->counter.layers[0].current_state = 1;
+    f->counter.current_epoch = 1;
+    TEST_ASSERT(persist_save_factory_dw_state(&fx.db, 0, f), "save");
+    sqlite3_stmt *st;
+    TEST_ASSERT(sqlite3_prepare_v2(fx.db.db, "SELECT n_leaf_nodes FROM "
+                "dw_counter_state WHERE factory_id = 0;", -1, &st, NULL)
+                == SQLITE_OK, "prepare");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "row");
+    int stored_leaves = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    TEST_ASSERT_EQ(stored_leaves, f->n_leaf_nodes, "the row records every leaf");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 1, "epoch restored");
+    TEST_ASSERT_EQ(rec_f->per_leaf_enabled, 0, "per-leaf mode still off");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, 0,
+                       "leaf states as stored");
+    factory_free(rec_f);
+    free(rec_f);
+
+    /* An older build's row past epoch 0 (the demo-mode epoch advance). */
+    uint32_t layers[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f->counter.n_layers; i++)
+        layers[i] = f->counter.layers[i].current_state;
+    TEST_ASSERT(persist_save_dw_counter(&fx.db, 0, 1, f->counter.n_layers,
+                                        layers), "save older row, epoch 1");
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load older row, epoch 1");
+    TEST_ASSERT_EQ(rec_f->counter.layers[0].current_state, 1,
+                   "layer state as stored");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state,
+                       rec_f->leaf_layers[i].config.max_states - 1,
+                       "unknown leaf states load as exhausted");
+    factory_free(rec_f);
+    free(rec_f);
+
+    /* An older build's creation row (epoch 0). */
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) layers[i] = 0;
+    TEST_ASSERT(persist_save_dw_counter(&fx.db, 0, 0, f->counter.n_layers,
+                                        layers), "save older row, epoch 0");
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load older row, epoch 0");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, 0,
+                       "creation row: leaves stay at 0");
+    factory_free(rec_f);
+    free(rec_f);
+
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* The remaining gap, asserted as it stands: on a two-leaf factory an older
+   build's per_leaf=0 "0,0" row (n_leaf_nodes 2) cannot be told from this
+   build's, so past epoch 0 its leaves still load as stored (0), not as
+   exhausted.  Only main's demo-mode epoch save, run after demo payments on
+   a two-leaf factory, wrote such a row with leaves that had moved. */
+int test_restart_dw_counter_two_leaf_old_row(void) {
+    rs_fixture_t fx;
+    memset(&fx, 0, sizeof(fx));
+    TEST_ASSERT(persist_open(&fx.db, NULL), "open");
+    fx.ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                      SECP256K1_CONTEXT_VERIFY);
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_ec_pubkey_create(fx.ctx, &fx.pks[i], rs_seckeys[i]),
+                    "pubkey");
+    TEST_ASSERT(rs_build_factory(fx.ctx, fx.pks, FACTORY_ARITY_2, &fx.f), "factory");
+    TEST_ASSERT_EQ(fx.f->n_leaf_nodes, 2, "two leaves");
+    TEST_ASSERT(persist_save_factory(&fx.db, fx.f, fx.ctx, 0), "save factory");
+
+    uint32_t layers[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < fx.f->counter.n_layers; i++)
+        layers[i] = (i == 0) ? 1 : 0;
+    TEST_ASSERT(persist_save_dw_counter(&fx.db, 0, 1, fx.f->counter.n_layers,
+                                        layers), "older row, epoch 1");
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 1, "epoch restored");
+    TEST_ASSERT_EQ(rec_f->counter.layers[0].current_state, 1, "root state restored");
+    TEST_ASSERT_EQ(rec_f->per_leaf_enabled, 0, "per-leaf mode off");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, 0,
+                       "gap: leaves load as stored, not as exhausted");
+
+    factory_free(rec_f);
+    free(rec_f);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* A restarted LSP must come back at the stored layer states, epoch and
+   per-leaf states.  Stored with persist_save_dw_counter_with_leaves (the
+   row the fixed save sites write), loaded with persist_load_factory (the
+   restart path). */
+int test_restart_dw_counter_restored_by_load_factory(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_dw_factory(&fx), "fixture");
+    factory_t *f = fx.f;
+    TEST_ASSERT(f->counter.n_layers > 0 && f->n_leaf_nodes >= 2, "factory shape");
+
+    uint32_t layers[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f->counter.n_layers; i++)
+        layers[i] = (i + 1) % f->counter.layers[i].config.max_states;
+    uint32_t leaves[64];
+    TEST_ASSERT(f->n_leaf_nodes <= 64, "leaf count");
+    for (int i = 0; i < f->n_leaf_nodes; i++)
+        leaves[i] = (uint32_t)(i * 3 + 1) % f->leaf_layers[i].config.max_states;
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&fx.db, 0, 6,
+                    f->counter.n_layers, layers, 1, leaves, f->n_leaf_nodes),
+                "save counter");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load factory");
+    TEST_ASSERT_EQ(rec_f->counter.n_layers, f->counter.n_layers, "n_layers");
+    for (uint32_t i = 0; i < rec_f->counter.n_layers; i++)
+        TEST_ASSERT_EQ(rec_f->counter.layers[i].current_state, layers[i],
+                       "layer current_state restored");
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 6, "epoch restored");
+    TEST_ASSERT_EQ(rec_f->per_leaf_enabled, 1, "per-leaf mode restored");
+    TEST_ASSERT_EQ(rec_f->n_leaf_nodes, f->n_leaf_nodes, "leaf count");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, leaves[i],
+                       "leaf state restored");
+
+    factory_free(rec_f);
+    free(rec_f);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* Rows written before this fix hold config.max_states as each layer's
+   state, which is out of range (dw_delay_for_state underflows on it).  The
+   real state is unknown, so the layer loads as its last state: the next
+   advance moves to a new root state instead of reusing one. */
+int test_restart_dw_counter_legacy_row_loads_exhausted(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_dw_factory(&fx), "fixture");
+    factory_t *f = fx.f;
+
+    uint32_t layers[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f->counter.n_layers; i++)
+        layers[i] = f->counter.layers[i].config.max_states;
+    uint32_t leaves[64];
+    for (int i = 0; i < f->n_leaf_nodes; i++) leaves[i] = 1;
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&fx.db, 0, 2,
+                    f->counter.n_layers, layers, 1, leaves, f->n_leaf_nodes),
+                "save legacy row");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load factory");
+    for (uint32_t i = 0; i < rec_f->counter.n_layers; i++) {
+        const dw_layer_t *L = &rec_f->counter.layers[i];
+        TEST_ASSERT_EQ(L->current_state, L->config.max_states - 1,
+                       "out-of-range layer state loads as the last state");
+        TEST_ASSERT_EQ(dw_delay_for_state(&L->config, L->current_state), 0,
+                       "no nSequence underflow");
+    }
+    TEST_ASSERT_EQ(rec_f->counter.current_epoch, 2, "epoch restored");
+    for (int i = 0; i < rec_f->n_leaf_nodes; i++)
+        TEST_ASSERT_EQ(rec_f->leaf_layers[i].current_state, 1,
+                       "in-range leaf states restored as stored");
+
+    factory_free(rec_f);
+    free(rec_f);
+    rs_teardown(&fx);
+    return 1;
+}
+
+/* The save used by the leaf-advance, realloc, Tier B, rotation and
+   creation paths writes each layer's current_state (it wrote
+   config.max_states) and every leaf's state.  12 leaves: those paths
+   copied leaf states into a uint32_t[8] on the stack. */
+int test_restart_dw_state_save_writes_current_state(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_alloc_default_arrays(f);
+    dw_counter_init(&f->counter, 3, 10, 4);
+    f->counter.layers[0].current_state = 1;
+    f->counter.layers[1].current_state = 3;
+    f->counter.layers[2].current_state = 2;
+    f->counter.current_epoch = 9;
+    f->per_leaf_enabled = 1;
+    f->n_leaf_nodes = 12;
+    for (int i = 0; i < f->n_leaf_nodes; i++) {
+        dw_layer_init(&f->leaf_layers[i], 10, 4);
+        f->leaf_layers[i].current_state = (uint32_t)(i % 4);
+    }
+
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "save");
+
+    uint32_t epoch = 0, n_layers = 0, layers[DW_MAX_LAYERS];
+    uint32_t leaves[32];
+    int per_leaf = 0, n_leaf = 0;
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 0, &epoch, &n_layers,
+                    layers, DW_MAX_LAYERS, &per_leaf, leaves, &n_leaf, 32),
+                "load");
+    TEST_ASSERT_EQ(n_layers, 3, "n_layers");
+    TEST_ASSERT_EQ(layers[0], 1, "layer 0 current_state");
+    TEST_ASSERT_EQ(layers[1], 3, "layer 1 current_state");
+    TEST_ASSERT_EQ(layers[2], 2, "layer 2 current_state");
+    TEST_ASSERT_EQ(epoch, 9, "epoch");
+    TEST_ASSERT_EQ(per_leaf, 1, "per-leaf flag");
+    TEST_ASSERT_EQ(n_leaf, 12, "leaf count");
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_EQ(leaves[i], (uint32_t)(i % 4), "leaf state");
+
+    factory_free(f);
+    free(f);
+    persist_close(&db);
+    return 1;
+}
+
+/* Up to FACTORY_MAX_LEAVES leaves: the leaf-state string was built in, and
+   parsed from, a 256-byte buffer, so leaves past about the 128th were
+   dropped without an error. */
+int test_restart_dw_counter_many_leaves_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    enum { N = 200 };
+    uint32_t layers[2] = { 1, 2 };
+    uint32_t leaves[N], loaded[N];
+    for (int i = 0; i < N; i++) {
+        leaves[i] = (i % 7 == 0) ? 4000000000u : (uint32_t)(i % 4);
+        loaded[i] = 0xDEADBEEFu;
+    }
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 0, 3, 2, layers,
+                                                    1, leaves, N), "save");
+    uint32_t epoch = 0, n_layers = 0, lay[DW_MAX_LAYERS];
+    int per_leaf = 0, n_leaf = 0;
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 0, &epoch, &n_layers,
+                    lay, DW_MAX_LAYERS, &per_leaf, loaded, &n_leaf, N), "load");
+    TEST_ASSERT_EQ(n_leaf, N, "leaf count");
+    for (int i = 0; i < N; i++)
+        TEST_ASSERT_EQ(loaded[i], leaves[i], "every leaf state round-trips");
+
+    persist_close(&db);
+    return 1;
+}
+
