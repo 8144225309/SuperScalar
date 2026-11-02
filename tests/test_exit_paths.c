@@ -3228,3 +3228,48 @@ int test_reload_ps_without_chain0_refused(void) {
     ex_rig_free(&r);
     return 1;
 }
+
+/* The same Tier B as in test_reload_tierb_freeze, but nobody restarts: the
+   LSP and both clients keep the new epoch in memory, unsigned, with the
+   freeze set.  The re-driven root advance re-signs that same epoch on every
+   side and completes. */
+int test_reload_tierb_redrive_in_memory(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_frzmem", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_frzmem2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0, dropped = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    int rc = rl_advance2_ex(&r, &c2, &ok1, &ok2, MSG_STATE_ADV_CLIENT_FINAL_PSIGS,
+                            &dropped);
+    factory_t *lf = &r.lsp->factory;
+    printf("  withheld final psigs, no restart: rc=%d; in memory: LSP epoch %u "
+           "frozen=%d, client 1 epoch %u frozen=%d, client 2 epoch %u frozen=%d\n",
+           rc, lf->counter.current_epoch, factory_root_advance_frozen(lf),
+           r.cf->counter.current_epoch, factory_root_advance_frozen(r.cf),
+           c2.cf->counter.current_epoch, factory_root_advance_frozen(c2.cf));
+    TEST_ASSERT(rc == 0 && dropped, "root advance interrupted");
+    TEST_ASSERT(factory_root_advance_frozen(lf) && factory_root_advance_frozen(r.cf),
+                "LSP and client 1 frozen in memory");
+    TEST_ASSERT(r.cf->counter.current_epoch == 1, "client 1 still rolled over in memory");
+
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  re-driven without a restart: rc=%d clients %d/%d, epoch %u, "
+           "frozen LSP %d client 1 %d\n", rc, ok1, ok2, lf->counter.current_epoch,
+           factory_root_advance_frozen(lf), factory_root_advance_frozen(r.cf));
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "the same root advance completes");
+    TEST_ASSERT(!factory_root_advance_frozen(lf) && !factory_root_advance_frozen(r.cf),
+                "freeze lifted");
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 1");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}

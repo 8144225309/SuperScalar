@@ -4669,7 +4669,26 @@ static int client_handle_state_advance_stateless(int fd,
            leaf — DW counter exhaustion.  Per-step rc==1 means advanced (keep
            going). */
     int adv_rc = 0;
-    {
+    if (factory_root_advance_frozen(factory)) {
+        /* We released our final psigs for this root advance but it did not
+           complete.  Only the same advance may follow. */
+        if (epoch_after != factory->root_advance_pending_epoch ||
+            trigger_leaf_side != factory->root_advance_pending_trigger) {
+            fprintf(stderr, "Client-stateless Tier B %u: a root advance to epoch "
+                    "%u (trigger %d) is pending; refusing epoch %u (trigger %d)\n",
+                    my_index, factory->root_advance_pending_epoch,
+                    factory->root_advance_pending_trigger, epoch_after,
+                    trigger_leaf_side);
+            return 0;
+        }
+    }
+    /* Already rolled over to that epoch in memory (an earlier attempt failed
+       without a restart, after or before our final psigs): re-sign the same
+       new epoch, as the LSP does, instead of advancing again.  The
+       reservations keep every TX identical. */
+    if (factory->counter.current_epoch == epoch_after && epoch_after > 0)
+        adv_rc = -1;
+    if (adv_rc != -1) {
         int max_steps = (int)(factory->states_per_layer + 2);
         if (max_steps < 4) max_steps = 4;
         if (trigger_leaf_side < 0) {
