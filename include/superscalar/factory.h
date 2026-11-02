@@ -789,6 +789,10 @@ int factory_advance_leaf(factory_t *f, int leaf_side);
    Returns FACTORY_ADVANCE_REFUSED for a factory restored from the DB. */
 int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
 
+/* nSequence node idx carries under the factory's current counter (restart
+   reload consistency check). */
+uint32_t factory_node_nsequence(const factory_t *f, size_t idx);
+
 /* Tick the root DW counter forward (PS Tier B trigger).  For PS factories,
    leaf advances are chain extension (no counter) — root rollover is driven
    by block-height progression instead.  Caller (LSP) wires this into a

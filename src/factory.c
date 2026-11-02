@@ -148,6 +148,14 @@ static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     return dw_current_nsequence(&f->counter.layers[node->dw_layer_index]);
 }
 
+/* The nSequence node idx would carry under the factory's CURRENT counter.
+   Used by the restart reload (persist.c) to check a stored tree row against
+   the reloaded counter. */
+uint32_t factory_node_nsequence(const factory_t *f, size_t idx) {
+    if (!f || idx >= f->n_nodes) return 0;
+    return node_nsequence(f, &f->nodes[idx]);
+}
+
 /* Add a node to the factory. Returns node index or -1 on error.
    node_cltv: if > 0, build CLTV timeout taptree for this node's spending_spk. */
 static int add_node(

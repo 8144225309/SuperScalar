@@ -2351,6 +2351,9 @@ size_t persist_list_active_factory_ids(persist_t *p,
     return count;
 }
 
+static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
+                                      factory_t *f);
+
 int persist_load_factory(persist_t *p, uint32_t factory_id,
                           factory_t *f, secp256k1_context *ctx) {
     if (!p || !p->db || !f || !ctx) return 0;
@@ -2714,9 +2717,20 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         return 0;
     }
 
-    /* The tree built above is the initial one, not the signed tree the
-       factory had reached: no advance may be built on it. */
-    f->tree_rebuilt_on_load = 1;
+    /* Rebuild the signed tree from the stored rows and verify it.  Only if
+       that fails does the factory stay fail-closed (tree_rebuilt_on_load = 1),
+       so advances are refused until it can be reloaded; force-close still reads
+       the DB directly.  The flag is set on f, which the caller copies by value
+       into its ladder slot / lsp->factory, so the factory that advances carries
+       the cleared flag. */
+    if (factory_reload_signed_tree(p, factory_id, f)) {
+        f->tree_rebuilt_on_load = 0;
+    } else {
+        f->tree_rebuilt_on_load = 1;
+        fprintf(stderr, "persist_load_factory: could not reload the signed tree "
+                "of factory %u; advances stay refused until it can be reloaded "
+                "(force-close still reads the DB directly)\n", factory_id);
+    }
     return 1;
 }
 
@@ -4631,6 +4645,207 @@ static void pq_log_attempt(persist_t *p, const char *txid, const char *source,
     sqlite3_finalize(u);
     if (!done)
         persist_log_broadcast(p, txid, source, NULL, result);
+}
+
+/* Invert a block-based BIP68 nSequence to a DW state index.
+   dw_delay_for_state: delay = step * (max_states - 1 - state). */
+static int dw_state_from_nseq(uint16_t step, uint32_t max_states,
+                              uint32_t nseq, uint32_t *state_out) {
+    if (step == 0 || max_states == 0) return 0;
+    if (nseq > 0xFFFFu) return 0;            /* not a plain block delay */
+    if (nseq % step != 0) return 0;
+    uint32_t units = nseq / step;
+    if (units > max_states - 1) return 0;
+    *state_out = (max_states - 1) - units;
+    return 1;
+}
+
+/* Highest epoch recorded in this factory's PS chain rows (0 if none).  A
+   client DB has no dw_counter_state row, so the PS chains are where a PS
+   factory's epoch survives a restart. */
+static uint32_t reload_ps_max_epoch(persist_t *p, uint32_t factory_id) {
+    static const char *qs[] = {
+        "SELECT MAX(epoch) FROM ps_leaf_chains WHERE factory_id=?;",
+        "SELECT MAX(epoch) FROM ps_initial_signed_states WHERE factory_id=?;",
+    };
+    uint32_t e = 0;
+    for (size_t k = 0; k < 2; k++) {
+        sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(p->db, qs[k], -1, &st, NULL) != SQLITE_OK) continue;
+        sqlite3_bind_int(st, 1, (int)factory_id);
+        if (sqlite3_step(st) == SQLITE_ROW &&
+            sqlite3_column_type(st, 0) != SQLITE_NULL) {
+            uint32_t v = (uint32_t)sqlite3_column_int64(st, 0);
+            if (v > e) e = v;
+        }
+        sqlite3_finalize(st);
+    }
+    return e;
+}
+
+/* persist_load_factory rebuilds the tree at its creation state; this reads
+   the stored signed rows that every advance keeps current and rebuilds the
+   in-memory tree to the real state the factory had reached.
+
+   It then verifies, before clearing the refusal:
+     - every node has a signed row (none missing);
+     - the DW counter derived from the stored tree (leaf states from each leaf
+       node's nSequence, root-layer states from the internal nodes, epoch from
+       the PS chain rows or the restored dw_counter_state) matches every
+       stored node's nSequence;
+     - each non-PS node's TX spends its stored parent (the root spends the
+       funding output) -- the funding -> every leaf txid chain.
+   PS chain rows are validated (and the chain tips restored) by the PS restore
+   block above and re-checked by force-close; here they only contribute the
+   epoch and are left as that block restored them.
+
+   Returns 1 only if the whole tree reloaded and every check passed; the
+   caller then allows advances.  On any failure it returns 0 and the caller
+   stays fail-closed.  Leaf/counter states set here are correct regardless, so
+   leaving them on a failed reload is harmless (advances are refused anyway).
+   Never frees f. */
+static int factory_reload_signed_tree(persist_t *p, uint32_t factory_id,
+                                      factory_t *f) {
+    if (!p || !p->db || !f || f->n_nodes == 0) return 0;
+    size_t n = f->n_nodes;
+
+    char     (*txid)[65] = calloc(n, 65);
+    char     **sig       = calloc(n, sizeof(char *));
+    uint32_t *nseq       = calloc(n, sizeof(uint32_t));
+    uint64_t (*amt)[FACTORY_MAX_OUTPUTS] =
+        calloc(n, sizeof(uint64_t[FACTORY_MAX_OUTPUTS]));
+    int      *n_amt      = calloc(n, sizeof(int));
+    int      *seen       = calloc(n, sizeof(int));
+    int ok = txid && sig && nseq && amt && n_amt && seen;
+
+    /* ---- gather every node's stored row ---- */
+    sqlite3_stmt *st = NULL;
+    if (ok && sqlite3_prepare_v2(p->db,
+            "SELECT node_index, is_signed, nsequence, txid, signed_tx_hex, "
+            "output_amounts FROM tree_nodes WHERE factory_id=?;",
+            -1, &st, NULL) != SQLITE_OK)
+        ok = 0;
+    if (ok) {
+        sqlite3_bind_int(st, 1, (int)factory_id);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            int i = sqlite3_column_int(st, 0);
+            if (i < 0 || (size_t)i >= n) continue;
+            const unsigned char *t = sqlite3_column_text(st, 3);
+            const unsigned char *s = sqlite3_column_text(st, 4);
+            if (!sqlite3_column_int(st, 1) || !t ||
+                strlen((const char *)t) != 64 || !s || !s[0]) { ok = 0; break; }
+            memcpy(txid[i], t, 65);
+            nseq[i] = (uint32_t)sqlite3_column_int64(st, 2);
+            sig[i] = strdup((const char *)s);
+            if (!sig[i]) { ok = 0; break; }
+            const unsigned char *oa = sqlite3_column_text(st, 5);
+            int c = 0;
+            if (oa) {
+                const char *q = (const char *)oa;
+                while (*q && c < FACTORY_MAX_OUTPUTS) {
+                    amt[i][c++] = strtoull(q, NULL, 10);
+                    const char *comma = strchr(q, ',');
+                    if (!comma) break;
+                    q = comma + 1;
+                }
+            }
+            n_amt[i] = c;
+            seen[i] = 1;
+        }
+    }
+    if (st) sqlite3_finalize(st);
+    for (size_t i = 0; ok && i < n; i++) if (!seen[i]) ok = 0;
+
+    /* ---- derive the DW counter from the stored tree (leaf states from
+           the signed nodes, not the ambiguous dw_counter_state) ---- */
+    uint32_t epoch = f->counter.current_epoch;
+    uint32_t pse = ok ? reload_ps_max_epoch(p, factory_id) : 0;
+    if (pse > epoch) epoch = pse;
+    int any_leaf_moved = 0;
+    for (size_t i = 0; ok && i < n; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->type == NODE_KICKOFF || node->is_static_only ||
+            node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY ||
+            node->dw_layer_index < 0)
+            continue;
+        int leaf_slot = -1;
+        for (int li = 0; li < f->n_leaf_nodes; li++)
+            if ((int)f->leaf_node_indices[li] == (int)i) { leaf_slot = li; break; }
+        dw_layer_t *layer = (leaf_slot >= 0)
+            ? &f->leaf_layers[leaf_slot]
+            : &f->counter.layers[node->dw_layer_index];
+        uint32_t state;
+        if (!dw_state_from_nseq(layer->config.step_blocks,
+                                layer->config.max_states, nseq[i], &state)) {
+            ok = 0; break;
+        }
+        layer->current_state = state;
+        if (leaf_slot >= 0 && state > 0) any_leaf_moved = 1;
+    }
+    if (ok) {
+        f->counter.current_epoch = epoch;
+        if (any_leaf_moved || (epoch > 0 && f->n_leaf_nodes > 0))
+            f->per_leaf_enabled = 1;
+    }
+
+    /* ---- the derived counter must reproduce every stored nSequence ---- */
+    for (size_t i = 0; ok && i < n; i++)
+        if (factory_node_nsequence(f, i) != nseq[i]) ok = 0;
+
+    /* ---- input chain: each non-PS node spends its stored parent ---- */
+    unsigned char fund_disp[32];
+    memcpy(fund_disp, f->funding_txid, 32);
+    reverse_bytes(fund_disp, 32);
+    char fund_hex[65];
+    hex_encode(fund_disp, 32, fund_hex);
+    for (size_t i = 0; ok && i < n; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY) continue;
+        pq_tx_info_t info;
+        if (!pq_parse_tx(sig[i], &info) ||
+            strcasecmp(info.txid, txid[i]) != 0) { ok = 0; break; }
+        char expect[65];
+        if (node->parent_index >= 0 && (size_t)node->parent_index < n)
+            memcpy(expect, txid[node->parent_index], 65);
+        else
+            memcpy(expect, fund_hex, 65);
+        int spends = 0;
+        for (size_t k = 0; k < info.n_inputs; k++)
+            if (strcasecmp(info.prev_txid[k], expect) == 0) { spends = 1; break; }
+        if (!spends) ok = 0;
+    }
+
+    /* ---- apply the reloaded state to the non-PS in-memory nodes (the PS
+           restore block above already set the PS nodes) ---- */
+    if (ok) {
+        for (size_t i = 0; i < n; i++) {
+            factory_node_t *node = &f->nodes[i];
+            if (node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY) continue;
+            unsigned char internal[32];
+            if (hex_decode(txid[i], internal, 32) == 32) {
+                reverse_bytes(internal, 32);
+                memcpy(node->txid, internal, 32);
+            }
+            size_t blen = strlen(sig[i]) / 2;
+            unsigned char *b = malloc(blen ? blen : 1);
+            if (b && hex_decode(sig[i], b, (int)blen) == (int)blen) {
+                tx_buf_free(&node->signed_tx);
+                tx_buf_init(&node->signed_tx, (int)blen);
+                memcpy(node->signed_tx.data, b, blen);
+                node->signed_tx.len = blen;
+                node->is_signed = 1;
+                node->is_built = 1;
+            }
+            free(b);
+            for (int c = 0; c < n_amt[i] && (size_t)c < node->n_outputs; c++)
+                node->outputs[c].amount_sats = amt[i][c];
+            node->nsequence = nseq[i];
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) free(sig[i]);
+    free(txid); free(sig); free(nseq); free(amt); free(n_amt); free(seen);
+    return ok;
 }
 
 int persist_queue_broadcast(persist_t *p, const char *source, const char *raw_hex,

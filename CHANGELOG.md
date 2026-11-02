@@ -22,6 +22,7 @@ All notable changes to SuperScalar are documented here.
 - `recoverfactory` requires `factory_id` and is a dry run unless `dry_run:false`.
 - **Upgrading operator scripts:** `recoverfactory` now defaults to a dry run and broadcasts nothing; a script that uses it to publish a factory tree must pass `"dry_run": false` (and the now-required `factory_id`).
 - The signed cooperative close is persisted (`closing`) before `CLOSE_DONE`. A `closing` factory is never served again; `--force-close-from-db` publishes its tree if the close does not confirm.
+- Stacked on the restart-persistence branch: every advance now re-saves the signed tree and the DW counter in one transaction before DONE, so a factory loaded from the DB rebuilds its signed tree and is verified (each node spends its stored parent, the counter matches every node's nSequence, PS epochs line up) before advances resume, replacing that branch's blanket post-restart refusal. A client DB, which has no `dw_counter_state` row, recovers its epoch from the PS chain rows, so a restarted client no longer blocks the factory's next Tier B.
 
 ## v0.2.0 — 2026-07-02
 

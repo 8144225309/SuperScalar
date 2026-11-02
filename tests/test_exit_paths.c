@@ -756,7 +756,7 @@ static void *ex_client_thread(void *arg) {
     ex_client_t *c = (ex_client_t *)arg;
     int done = 0;
     c->ok = 1;
-    while (done < c->n_expected) {
+    while (c->n_expected < 0 || done < c->n_expected) {
         wire_msg_t msg;
         memset(&msg, 0, sizeof(msg));
         if (!wire_recv(c->fd, &msg)) { c->ok = 0; break; }
@@ -775,6 +775,17 @@ static void *ex_client_thread(void *arg) {
                 done++;
             else
                 c->ok = 0;
+        } else if (msg.msg_type == MSG_STATE_ADV_PROPOSE_INTENT ||
+                   msg.msg_type == MSG_STATE_ADVANCE_PROPOSE) {
+            /* Tier B rollover: the stateless handler runs the whole re-sign
+               ceremony; PATH_SIGN_DONE follows as a separate message. */
+            if (client_handle_state_advance(c->fd, c->ctx, &c->kp, c->f,
+                                            c->my_index, &pm))
+                done++;
+            else
+                c->ok = 0;
+        } else if (msg.msg_type == MSG_PATH_SIGN_DONE) {
+            /* end-of-Tier-B notification; nothing to sign */
         }
         if (msg.json) cJSON_Delete(msg.json);
         if (!c->ok) break;
@@ -1421,11 +1432,14 @@ typedef struct {
     persist_t db;
     int db_open;
     char path[256];
+    persist_t cdb;                  /* a client-side DB (no dw_counter_state) */
+    int cdb_open;
+    char cpath[256];
     int sv[2];
 } ex_rig_t;
 
-static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
-                       int hashlocked_l_stock) {
+static int ex_rig_init_ex(ex_rig_t *r, factory_arity_t arity, const char *tag,
+                          int hashlocked_l_stock, uint32_t states) {
     static const unsigned char seed[32] = {
         0x5e, 0xed, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
         0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
@@ -1442,9 +1456,9 @@ static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
     r->cf = calloc(1, sizeof(factory_t));
     int ok = r->lsp && r->cf && lsp_init(r->lsp, r->ctx, &r->kps[0], 0, 2) &&
              ex_build_factory(r->ctx, &r->lsp->factory, r->kps, 3, arity,
-                              r->fund_txid, 0, 1000000, r->spk, 2, 4, 1) &&
+                              r->fund_txid, 0, 1000000, r->spk, 2, states, 1) &&
              ex_build_factory(r->ctx, r->cf, r->kps, 3, arity, r->fund_txid, 0,
-                              1000000, r->spk, 2, 4, 1);
+                              1000000, r->spk, 2, states, 1);
     g_ex_seed = NULL;
     if (!ok) return 0;
     ex_db_path(r->path, sizeof(r->path), tag);
@@ -1452,6 +1466,13 @@ static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
     r->db_open = 1;
     if (arity == FACTORY_ARITY_PS)
         lsp_persist_ps_chain0_all(&r->db, &r->lsp->factory);
+    ex_db_path(r->cpath, sizeof(r->cpath), tag);
+    strncat(r->cpath, "c", sizeof(r->cpath) - strlen(r->cpath) - 1);
+    if (!persist_open(&r->cdb, r->cpath) ||
+        !persist_save_factory(&r->cdb, r->cf, r->ctx, 0) ||
+        !client_persist_exit_state(&r->cdb, r->cf))
+        return 0;
+    r->cdb_open = 1;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, r->sv) != 0) return 0;
     struct timeval tv = { .tv_sec = 120, .tv_usec = 0 };
     setsockopt(r->sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1473,14 +1494,38 @@ static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
     return 1;
 }
 
+static int ex_rig_init(ex_rig_t *r, factory_arity_t arity, const char *tag,
+                       int hashlocked_l_stock) {
+    return ex_rig_init_ex(r, arity, tag, hashlocked_l_stock, 4);
+}
+
 static void ex_rig_free(ex_rig_t *r) {
     if (r->lsp) { lsp_cleanup(r->lsp); free(r->lsp); }
     if (r->sv[1] >= 0) close(r->sv[1]);
     if (r->cf) { factory_free(r->cf); free(r->cf); }
     if (r->mgr) { free(r->mgr->entries); free(r->mgr); }
     if (r->db_open) persist_close(&r->db);
+    if (r->cdb_open) persist_close(&r->cdb);
     if (r->path[0]) unlink(r->path);
+    if (r->cpath[0]) unlink(r->cpath);
     if (r->ctx) secp256k1_context_destroy(r->ctx);
+}
+
+/* Drive one real LSP leaf/PS/Tier-B advance of leaf 0 against a one-shot
+   client thread, then persist the client's resulting view to the client DB.
+   Returns the lsp_channels_advance_ps_leaf rc. */
+static int ex_rig_ps_advance(ex_rig_t *r, int *client_ok) {
+    ex_client_t cl = { .fd = r->sv[1], .ctx = r->ctx, .kp = r->kps[1],
+                       .f = r->cf, .my_index = 1, .n_expected = 1, .ok = 0 };
+    pthread_t th;
+    if (pthread_create(&th, NULL, ex_client_thread, &cl) != 0) return 0;
+    int rc = lsp_channels_advance_ps_leaf(r->mgr, r->lsp, 0);
+    if (rc != 1) shutdown(r->sv[0], SHUT_RDWR);
+    pthread_join(th, NULL);
+    *client_ok = cl.ok;
+    if (rc == 1 && r->cdb_open)
+        client_persist_exit_state(&r->cdb, r->cf);
+    return rc;
 }
 
 /* Run the LSP's real realloc ceremony for leaf 0 against the client thread. */
@@ -1836,5 +1881,228 @@ int test_exit_closing_stops_daemon_loop(void) {
     TEST_ASSERT(rc == 1 && time(NULL) - t0 < 30,
                 "daemon loop returned without a shutdown request");
     ex_rig_free(&r);
+    return 1;
+}
+
+/* A consistent signed tree reloads and clears the advance refusal; a tree
+   whose stored rows contradict the counter (or each other) stays refused. */
+int test_exit_reload_consistent_and_corrupted(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund_txid[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund_txid, 0x51, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_1, fund_txid,
+                                      0, 1000000, spk, 2, 4, 1), "factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "reload_ok");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist tree");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "persist dw state");
+    size_t leaf = f->leaf_node_indices[0];
+
+    /* consistent -> reload clears the flag, advance allowed */
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "load");
+    printf("  consistent reload: tree_rebuilt_on_load=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "consistent tree -> refusal cleared");
+    TEST_ASSERT(!factory_advance_refused(g), "refusal cleared");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "advance allowed");
+    factory_free(g); free(g);
+
+    /* corrupt the leaf's stored nSequence -> counter/tree disagree -> refused */
+    char sql[256];
+    snprintf(sql, sizeof(sql), "UPDATE tree_nodes SET nsequence=12345 WHERE "
+             "factory_id=0 AND node_index=%zu", leaf);
+    TEST_ASSERT(sqlite3_exec(db.db, sql, NULL, NULL, NULL) == SQLITE_OK, "tamper nseq");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "load 2");
+    printf("  bad nSequence: tree_rebuilt_on_load=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "mismatched nSequence -> still refused");
+    TEST_ASSERT(factory_advance_refused(g), "advance refused (flag set)");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == FACTORY_ADVANCE_REFUSED,
+                "advance returns FACTORY_ADVANCE_REFUSED");
+    factory_free(g); free(g);
+
+    /* restore nSequence, break the input chain (wrong parent txid) -> refused */
+    snprintf(sql, sizeof(sql), "UPDATE tree_nodes SET nsequence=("
+             "SELECT nsequence FROM tree_nodes WHERE factory_id=0 AND node_index=%zu"
+             ") WHERE 0", leaf);  /* no-op; just re-persist the real tree below */
+    (void)sql;
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save real tree");
+    int parent = f->nodes[leaf].parent_index;
+    snprintf(sql, sizeof(sql), "UPDATE tree_nodes SET txid='%064d' WHERE "
+             "factory_id=0 AND node_index=%d", 9, parent);
+    TEST_ASSERT(sqlite3_exec(db.db, sql, NULL, NULL, NULL) == SQLITE_OK, "tamper parent txid");
+    g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "load 3");
+    printf("  broken input chain: tree_rebuilt_on_load=%d\n", g->tree_rebuilt_on_load);
+    TEST_ASSERT(g->tree_rebuilt_on_load, "broken input chain -> still refused");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* DW leaf advance -> restart -> the reload clears the refusal, restores the
+   advanced leaf state, and the next advance builds on it.  The stored DW
+   counter and the stored tree agree (they are written in one transaction, so
+   a restart never sees state k in the tree with the counter at k-1). */
+int test_exit_dw_advance_reload_then_advance(void) {
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init(&r, FACTORY_ARITY_1, "dwreload", 0), "rig");
+    alarm(300);
+    size_t leaf = r.lsp->factory.leaf_node_indices[0];
+    int client_ok = 0;
+    TEST_ASSERT(ex_rig_ps_advance(&r, &client_ok) == 1 && client_ok, "DW leaf advance");
+    uint32_t adv_state = r.lsp->factory.leaf_layers[0].current_state;
+    TEST_ASSERT(adv_state == 1, "leaf advanced to state 1");
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&r.db, 0, g, r.ctx), "reload");
+    printf("  reload: flag=%d, leaf0 state=%u (advanced=%u)\n",
+           g->tree_rebuilt_on_load, g->leaf_layers[0].current_state, adv_state);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "refusal cleared");
+    TEST_ASSERT(g->leaf_layers[0].current_state == 1,
+                "reloaded leaf state matches the DB (tree and counter agree)");
+    TEST_ASSERT(factory_node_nsequence(g, leaf) ==
+                dw_current_nsequence(&g->leaf_layers[0]), "node nseq matches counter");
+    TEST_ASSERT(factory_advance_leaf_unsigned(g, 0) == 1, "next advance builds (not refused)");
+    TEST_ASSERT(g->leaf_layers[0].current_state == 2, "next advance moved to state 2");
+    alarm(0);
+    factory_free(g); free(g);
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* Advance leaf 0 in memory (the test holds every key, so the signed variant
+   re-signs the whole tree on a rollover, exactly as Tier B does) until the
+   root rolls over to a new epoch.  Returns the new epoch, or 0 on no rollover. */
+static uint32_t ex_local_rollover(factory_t *f, int max_adv) {
+    /* The unsigned variant carries the PS Tier B rollover (returns -1); the
+       signed one does not.  Sign each step here (the test holds every key). */
+    for (int i = 0; i < max_adv; i++) {
+        int rc = factory_advance_leaf_unsigned(f, 0);
+        if (rc == -1) {
+            if (!factory_sign_all(f)) return 0;          /* re-sign the new epoch */
+            return f->counter.current_epoch;
+        }
+        if (rc == 0) return 0;
+        if (!factory_sign_node(f, f->leaf_node_indices[0])) return 0;
+    }
+    return 0;
+}
+
+/* Persist a re-signed tree the way the Tier B save does: the whole signed
+   tree, the DW counter and the new-epoch PS chain[0], in one transaction.
+   With dw_state = 0 (a client DB) the counter row is left out, as a client's
+   DB has none. */
+static int ex_persist_tierb(persist_t *db, factory_t *f, int dw_state) {
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_signed_tree_nodes(db, f, 0) >= 0 &&
+             (!dw_state || persist_save_factory_dw_state(db, 0, f)) &&
+             client_persist_exit_state(db, f);   /* PS chain[0] + chains */
+    if (ok) return persist_commit(db);
+    persist_rollback(db);
+    return 0;
+}
+
+/* PS Tier B rollover -> restart -> the reload clears the refusal, restores the
+   new epoch, and a further advance builds on the reloaded tree. */
+int test_exit_tierb_reload_then_advance(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund_txid[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund_txid, 0x52, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_PS, fund_txid,
+                                      0, 1000000, spk, 2, 2, 1), "factory");
+    char path[256];
+    ex_db_path(path, sizeof(path), "tierb");
+    persist_t db;
+    TEST_ASSERT(ex_persist_factory(&db, path, f, ctx), "persist");
+    TEST_ASSERT(lsp_persist_ps_chain0_all(&db, f) > 0, "chain0");
+    TEST_ASSERT(persist_save_factory_dw_state(&db, 0, f), "dw state");
+
+    uint32_t epoch = ex_local_rollover(f, 10);
+    TEST_ASSERT(epoch > 0, "a rollover happened");
+    TEST_ASSERT(ex_persist_tierb(&db, f, 1), "persist the re-signed epoch tree");
+    printf("  rolled to epoch %u and persisted\n", epoch);
+
+    factory_t *g = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "reload");
+    printf("  reload: flag=%d, epoch=%u (expected %u)\n",
+           g->tree_rebuilt_on_load, g->counter.current_epoch, epoch);
+    TEST_ASSERT(!g->tree_rebuilt_on_load, "refusal cleared after Tier B");
+    TEST_ASSERT(g->counter.current_epoch == epoch, "epoch reloaded from the tree/chains");
+    TEST_ASSERT(!factory_advance_refused(g) &&
+                factory_advance_leaf_unsigned(g, 0) != FACTORY_ADVANCE_REFUSED,
+                "advance not refused after reload");
+    factory_free(g); free(g);
+
+    persist_close(&db);
+    unlink(path);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A restarted CLIENT must not block the factory's next Tier B.  A client DB
+   (no dw_counter_state row) holding a post-rollover tree reloads with the
+   refusal cleared and the epoch recovered from the PS chain rows, so the
+   restarted client can take part in the next ceremony instead of blocking it. */
+int test_exit_client_reload_then_tierb(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    TEST_ASSERT(ex_keys(ctx, 3, kps, pks), "keys");
+    unsigned char spk[34], fund_txid[32];
+    TEST_ASSERT(ex_funding_spk(ctx, pks, 3, spk, NULL), "spk");
+    memset(fund_txid, 0x53, 32);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f && ex_build_factory(ctx, f, kps, 3, FACTORY_ARITY_PS, fund_txid,
+                                      0, 1000000, spk, 2, 2, 1), "factory");
+    /* a client-side DB: factory params + signed tree + PS chain[0], and NO
+       dw_counter_state row (clients never write one). */
+    char cpath[256];
+    ex_db_path(cpath, sizeof(cpath), "clireload");
+    persist_t cdb;
+    TEST_ASSERT(persist_open(&cdb, cpath), "client db");
+    TEST_ASSERT(persist_save_factory(&cdb, f, ctx, 0), "client factory row");
+    TEST_ASSERT(client_persist_exit_state(&cdb, f), "client creation persist");
+
+    uint32_t epoch = ex_local_rollover(f, 10);
+    TEST_ASSERT(epoch > 0, "a rollover happened");
+    TEST_ASSERT(ex_persist_tierb(&cdb, f, 0), "client persists the post-rollover tree");
+
+    factory_t *cf2 = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(cf2 && persist_load_factory(&cdb, 0, cf2, ctx), "client reload");
+    printf("  client reload: flag=%d, epoch=%u (expected %u), no dw_counter_state row\n",
+           cf2->tree_rebuilt_on_load, cf2->counter.current_epoch, epoch);
+    TEST_ASSERT(!cf2->tree_rebuilt_on_load,
+                "client reload clears the refusal (does not block Tier B)");
+    TEST_ASSERT(cf2->counter.current_epoch == epoch,
+                "epoch recovered from the PS chain rows (no dw_counter_state)");
+    TEST_ASSERT(!factory_advance_refused(cf2) &&
+                factory_advance_leaf_unsigned(cf2, 0) != FACTORY_ADVANCE_REFUSED,
+                "the restarted client can advance (would take part in Tier B)");
+    factory_free(cf2); free(cf2);
+
+    persist_close(&cdb);
+    unlink(cpath);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
