@@ -130,6 +130,12 @@ This is a deliberate ZmnSCPxj design choice, not a missing feature.
   if that insert does not succeed.  The full rule, including every
   failure and crash point, is the next section.
 
+- PS sub-factory chain advances (`client_handle_subfactory_advance`) use
+  the same table, one row per input: a sub-factory chain[N+1] spends
+  every output of chain[N], so the client records `(factory_id, chain[N]
+  txid, vout)` for each input it signs.  See "Sub-factory chain advances:
+  per-input record" at the end of the next section.
+
 ### Record-and-refuse: ordering and failure semantics
 
 The record is the whole defense, so the path that writes and reads it
@@ -226,12 +232,95 @@ or `lsp_crash_set_target`:
 | `ps_record_post_save` | INSERT durable, before FINAL | row present, LSP never received FINAL | same sighash → idempotent, succeeds | refused |
 | `ps_record_post_final` | after FINAL left | row present, LSP holds the signature | same sighash → idempotent | refused |
 
+#### Sub-factory chain advances: per-input record
+
+A `NODE_PS_SUBFACTORY` chain[N+1] spends all k+1 outputs of chain[N] (the
+k channel outputs and the sales-stock), nothing revokes it, and the LSP
+chooses `channel_idx` and `delta_sats`.  If the client co-signs
+chain[N] → chain[N+1] and later is back at chain[N] (a restart that
+reloads an older sub-factory state), the LSP can propose a different
+chain[N+1] — another delta, or the same delta into another channel — and,
+without a record, get a second valid spend of the same outputs co-signed.
+The sales-stock poison does not cover this: it punishes broadcasting a
+superseded state, not a sibling of the current one.
+
+The multi-input ceremony behind `client_handle_subfactory_advance`
+(`src/client.c`) applies the rules above per input.  The client signs two
+of the k+1 inputs — its own channel input (2-of-2 with the LSP) and the
+sales-stock input (N-of-N) — and records one row for each, keyed
+`(0, chain[N] txid, vout i)`, with that input's BIP-341 sighash
+(`compute_taproot_sighash_multi`; `SIGHASH_DEFAULT` commits to every input
+and output, so each row names the whole transaction) and the sub-factory's
+node index as `leaf_node_idx`.  Order:
+
+1. **input count and sub-factory** — the `PROPOSE_INTENT`'s `n_inputs`
+   must equal the number of chain[N] outputs, which is what the chain tx
+   spends, and its `subfactory_id` must be the sub-factory that
+   `(leaf_side, sub_idx)` names (the node the local advance mutates);
+   otherwise refuse before any local change.  There is no single-input
+   sub-factory ceremony: no sub-factory chain tx has one input, and the
+   ceremony that `n_inputs == 1` used to select signed the node-level
+   session, whose message (`compute_node_sighash`'s single-prevout
+   preimage) is not the sighash of any input of the tx, and recorded
+   nothing.  It was removed.
+2. **sighash + check, every signed input**, before any nonce.  An error on
+   any input refuses; a row with a different sighash on any input refuses;
+   a row with the same sighash is an idempotent retry.
+3. **nonces** — `CLIENT_PUBNONCES`, then `LSP_RESPONSE`.
+4. **bind, then partial sig, per input** — the input session's `msg32`
+   must equal that input's sighash from step 2.  The partial sigs stay in
+   a secrets struct that a wrapper zeroes on every exit; they do not enter
+   the sessions yet.
+5. **INSERT every signed input**, in ascending order, each a plain
+   `INSERT` (autocommit, fsync'd on return).  Anything but
+   `PS_SAVE_RECORDED` on any input aborts: nothing is sent.
+6. **psigs into the sessions**, then **send** `CLIENT_FINAL_PSIGS` — the
+   first point at which our partial sigs leave the process.
+
+**Multi-input atomicity.** The INSERTs are separate statements, so an
+abort between two of them leaves the earlier rows behind.  That is safe.
+Each row names exactly the transaction that was being signed, so the
+identical retry passes it and records the rest; any different chain[N+1]
+spends that input too (a sub-factory chain tx always spends all of
+chain[N]'s outputs) and is refused at step 2, before any nonce.  Every
+ceremony inserts the same input set in the same order, so one that loses
+an INSERT race to a different spend loses it at its first input and
+records nothing.
+
+The sales-stock poison co-signed in the same ceremony also spends
+chain[N]'s sales-stock, on purpose (it is the penalty for broadcasting the
+superseded chain[N]); it is neither checked nor recorded.
+
+| Checkpoint | Where | Restart, LSP retries the same tx | Restart, LSP proposes a different spend of chain[N] |
+|---|---|---|---|
+| `ps_sub_record_pre_save` | partial sigs exist, before the first INSERT | signs and records | signs and records — nothing was recorded or sent |
+| `ps_sub_record_post_save` | every INSERT durable, before `CLIENT_FINAL_PSIGS` | idempotent, succeeds | refused |
+| `ps_sub_record_post_final` | after `CLIENT_FINAL_PSIGS` left | idempotent | refused |
+
+As for the leaf, every refusal and abort after step 1 returns after the
+local advance (`factory_subfactory_chain_advance_unsigned`), so the client
+has to reload its factory before the LSP's retry lines up.  And as for the
+leaf, the record lives in the client's persist database: restoring that
+database from a backup taken before the record was written loses the
+record with it.
+
 **Tests.** `tests/test_ps_refusal.c` drives the real handler in a forked
 client over a socketpair against an on-disk DB, with the parent playing
 the LSP, and asserts on whether `MSG_LEAF_ADVANCE_FINAL` was sent for: an
 injected check error, an injected insert error, a sighash failure, a
 conflicting record, an identical record, the concurrent-insert race, and
 the three crash checkpoints with restart.
+`tests/test_ps_subfactory_refusal.c` does the same for sub-factory chain
+advances (N=5, k=2; the client signs inputs 0 and 2 of 3), with the parent
+also playing the sub-factory's other client and verifying every input's
+aggregated signature, and asserts on whether `CLIENT_FINAL_PSIGS` was
+sent for: conflicting re-proposals (other delta, other channel), the
+identical retry after a crash, injected check / insert / sighash failures,
+the INSERT race, a failed second-input INSERT, the three crash checkpoints
+with restart, an `n_inputs` or `subfactory_id` that does not match (refused
+before any local change), a second advance (chain[1] → chain[2]), and a
+hashlock sub-factory with the poison active (an honest advance, whose poison
+verifies, and an insert error, which sends no poison partial sig).
 `tests/test_persist.c::test_persist_ps_signed_input_arbiter` covers the
 persist layer.  The fault hook is `persist_test_set_ps_hook`
 (test-only; a NULL check in production).
@@ -279,6 +368,11 @@ Cross-references for the test cases that pin this contract:
 - `tests/test_ps_refusal.c` — failure semantics of the record-and-refuse
   path: check error, insert error, sighash failure, conflicting and
   identical records, the concurrent-insert race, crash + restart.
+- `tests/test_ps_subfactory_refusal.c` — the same for sub-factory chain
+  advances, per input: conflicting re-proposals, the identical retry,
+  injected failures, a partial record, crash + restart, an input count or
+  sub-factory that does not match, a second advance, and a hashlock
+  sub-factory with the poison active.
 - `tests/test_close_spendability_full.c::test_regtest_ps_chain_close_spendability`
   (test_close_spendability_full.c:1197) — final state of a PS chain is
   spendable on regtest, end to end.
