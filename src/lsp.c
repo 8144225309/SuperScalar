@@ -303,6 +303,270 @@ accept_fail:
     return 0;
 }
 
+/* ---- Factory-creation template ---------------------------------------------
+
+   lsp_run_factory_creation(_stateless) rebuilds lsp->factory from scratch:
+   factory_init_from_pubkeys() memsets the struct and allocates fresh arrays.
+   Whatever the caller configured on the factory beforehand -- leaf / level
+   arity, static-near-root depth, PS sub-factory arity, fee, placement and
+   economic mode, participant profiles, revocation-secret mode -- is captured
+   here first and re-applied to the new factory.
+
+   Since #451/#453 the factory's per-participant arrays (profiles, pubkeys,
+   keypairs, nodes, leaf arrays, ...) are heap-allocated, and factory_free()
+   releases them and NULLs the pointers.  The source factory can therefore
+   have NO arrays: it was factory_free'd (an earlier failed attempt, or
+   rotation's teardown of the old factory) or no shape setter ever allocated
+   them.  Capture copies only what exists, sized by the source's own
+   allocation (config.max_signers); apply restores min(saved, new capacity).
+   Nothing in this path may dereference a factory array without a NULL check. */
+typedef struct {
+    factory_arity_t leaf_arity;
+    size_t n_level_arity;
+    uint8_t level_arity[FACTORY_MAX_LEVELS];
+    uint32_t static_threshold;
+    uint32_t ps_subfactory_arity;
+    uint64_t fee_per_tx;
+    placement_mode_t placement;
+    economic_mode_t econ;
+    participant_profile_t *profiles;   /* heap copy; NULL when the source had none */
+    size_t n_profiles;
+    int has_shachain;
+    int use_flat;
+    size_t n_secrets;
+    unsigned char (*secrets)[32];      /* heap copy of the flat secrets (use_flat) */
+    unsigned char shachain_seed[32];
+} lsp_creation_template_t;
+
+static void creation_template_free(lsp_creation_template_t *t) {
+    if (!t) return;
+    free(t->profiles);
+    if (t->secrets) {
+        secure_zero(t->secrets, (t->n_secrets ? t->n_secrets : 1) * 32);
+        free(t->secrets);
+    }
+    secure_zero(t->shachain_seed, sizeof(t->shachain_seed));
+    memset(t, 0, sizeof(*t));
+}
+
+static int creation_template_capture(lsp_creation_template_t *t,
+                                     const factory_t *f) {
+    memset(t, 0, sizeof(*t));
+    t->leaf_arity = f->leaf_arity;
+    t->n_level_arity = f->n_level_arity;
+    if (t->n_level_arity > FACTORY_MAX_LEVELS)
+        t->n_level_arity = FACTORY_MAX_LEVELS;
+    if (t->n_level_arity > 0)
+        memcpy(t->level_arity, f->level_arity, t->n_level_arity * sizeof(uint8_t));
+    t->static_threshold = f->static_threshold_depth;
+    t->ps_subfactory_arity = f->ps_subfactory_arity;
+    t->fee_per_tx = f->fee_per_tx;
+    t->placement = f->placement_mode;
+    t->econ = f->economic_mode;
+    if (f->profiles && f->config.max_signers > 0) {
+        t->n_profiles = f->config.max_signers;
+        t->profiles = malloc(t->n_profiles * sizeof(participant_profile_t));
+        if (!t->profiles) { t->n_profiles = 0; return 0; }
+        memcpy(t->profiles, f->profiles, t->n_profiles * sizeof(participant_profile_t));
+    }
+    t->has_shachain = f->has_shachain;
+    t->use_flat = f->use_flat_secrets;
+    if (t->use_flat) {
+        size_t n = f->n_revocation_secrets;
+        if (n > FACTORY_MAX_EPOCHS) n = FACTORY_MAX_EPOCHS;
+        t->secrets = (unsigned char (*)[32])calloc(n ? n : 1, 32);
+        if (!t->secrets) { creation_template_free(t); return 0; }
+        if (n > 0) memcpy(t->secrets, f->revocation_secrets, n * 32);
+        t->n_secrets = n;
+    } else {
+        memcpy(t->shachain_seed, f->shachain_seed, 32);
+    }
+    return 1;
+}
+
+/* Put a factory back into the caller's pre-creation state after a failed
+   attempt: release the half-built factory, re-allocate the arrays (so the
+   daemon never sees NULL factory arrays -- e.g. the CLI `status` walks
+   leaf_node_indices/nodes) and restore the template fields, so a retry
+   rebuilds the same shape with the same profiles. */
+static void creation_template_restore(factory_t *f,
+                                      const lsp_creation_template_t *t) {
+    factory_free(f);
+    (void)factory_alloc_default_arrays(f);
+    f->leaf_arity = t->leaf_arity;
+    f->n_level_arity = t->n_level_arity;
+    memcpy(f->level_arity, t->level_arity, sizeof(f->level_arity));
+    f->static_threshold_depth = t->static_threshold;
+    f->ps_subfactory_arity = t->ps_subfactory_arity;
+    f->fee_per_tx = t->fee_per_tx;
+    f->placement_mode = t->placement;
+    f->economic_mode = t->econ;
+    if (t->profiles && f->profiles) {
+        size_t n = t->n_profiles < f->config.max_signers ? t->n_profiles
+                                                         : f->config.max_signers;
+        memcpy(f->profiles, t->profiles, n * sizeof(participant_profile_t));
+    }
+    f->has_shachain = t->has_shachain;
+    f->use_flat_secrets = t->use_flat;
+    if (t->use_flat) {
+        f->n_revocation_secrets = t->n_secrets;
+        if (t->secrets && t->n_secrets > 0)
+            memcpy(f->revocation_secrets, t->secrets, t->n_secrets * 32);
+    } else {
+        memcpy(f->shachain_seed, t->shachain_seed, 32);
+    }
+}
+
+/* Build f from scratch for n_total participants (all_pubkeys[0] = LSP) over
+   the given funding outpoint, apply the template, and build the tree.  Shared
+   by the real ceremony and lsp_factory_creation_preflight so the dry run
+   exercises exactly the code the ceremony runs.  Returns 1 on success. */
+static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
+        const lsp_creation_template_t *t,
+        const secp256k1_pubkey *all_pubkeys, size_t n_total,
+        const unsigned char *funding_txid, uint32_t funding_vout,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout, const char *who) {
+    /* Release whatever arrays f still owns (a no-op on a factory_free'd or
+       never-allocated factory): factory_init_from_pubkeys memsets f and
+       would otherwise leak them. */
+    factory_free(f);
+    factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
+                              step_blocks, states_per_layer);
+    if (!f->keypairs || !f->pubkeys || !f->profiles || !f->dist_partial_sigs ||
+        !f->leaf_layers || !f->leaf_node_indices || !f->nodes ||
+        !f->node_l_stock_hashes || !f->node_l_stock_hash_valid) {
+        fprintf(stderr, "%s: factory array allocation failed\n", who);
+        return 0;
+    }
+    if (t->n_level_arity > 0) {
+        factory_set_level_arity(f, t->level_arity, t->n_level_arity);
+    } else if (t->leaf_arity == FACTORY_ARITY_1) {
+        factory_set_arity(f, FACTORY_ARITY_1);
+    } else if (t->leaf_arity == FACTORY_ARITY_PS) {
+        factory_set_arity(f, FACTORY_ARITY_PS);
+    }
+    if (t->static_threshold > 0)
+        factory_set_static_near_root(f, t->static_threshold);
+    if (t->ps_subfactory_arity > 1)
+        factory_set_ps_subfactory_arity(f, t->ps_subfactory_arity);
+    if (t->fee_per_tx > 200)
+        f->fee_per_tx = t->fee_per_tx;
+    f->cltv_timeout = cltv_timeout;
+    f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
+    f->placement_mode = t->placement;
+    f->economic_mode = t->econ;
+    if (t->profiles) {
+        size_t n = t->n_profiles < f->config.max_signers ? t->n_profiles
+                                                         : f->config.max_signers;
+        memcpy(f->profiles, t->profiles, n * sizeof(participant_profile_t));
+    }
+    if (t->has_shachain) {
+        if (t->use_flat && t->secrets)
+            factory_set_flat_secrets(f, (const unsigned char (*)[32])t->secrets,
+                                     t->n_secrets);
+        else if (!t->use_flat)
+            factory_set_shachain_seed(f, t->shachain_seed);
+    }
+
+    /* #53 + restart-resume: (re-)derive + install the hashlock L-stock poison seed
+       AFTER factory_init_from_pubkeys (which wiped use_hashlock_poison).  The seed is
+       DERIVED deterministically from the LSP master key + THIS factory's funding
+       outpoint (factory_derive_lstock_seed) — never randomly minted or persisted as an
+       independent secret — so it is identical on the initial ceremony, on every
+       rotation, and after any LSP restart/backup-restore (the "derive, don't store"
+       rule; both inputs are durable).  Gated on lsp->enable_hashlock_poison; the legacy
+       key-path L-stock remains the default. */
+    if (lsp->enable_hashlock_poison) {
+        unsigned char lsp_sk[32], lstock_seed[32];
+        if (!secp256k1_keypair_sec(lsp->ctx, lsp_sk, &lsp->lsp_keypair)) {
+            fprintf(stderr, "%s: keypair_sec for L-stock seed failed\n", who);
+            return 0;
+        }
+        factory_derive_lstock_seed(lsp_sk, funding_txid, funding_vout, lstock_seed);
+        memset(lsp_sk, 0, sizeof(lsp_sk));
+        factory_set_shachain_seed(f, lstock_seed);
+        memset(lstock_seed, 0, sizeof(lstock_seed));
+        if (f->use_flat_secrets || !factory_enable_hashlock_poison(f)) {
+            fprintf(stderr, "%s: factory_enable_hashlock_poison failed (use_flat=%d)\n",
+                    who, f->use_flat_secrets);
+            return 0;
+        }
+    }
+
+    factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+                        funding_spk, funding_spk_len);
+
+    if (!factory_build_tree(f)) {
+        fprintf(stderr, "%s: factory_build_tree failed\n", who);
+        return 0;
+    }
+    return 1;
+}
+
+/* Build the UNSIGNED distribution TX for f (outputs balanced per the caller's
+   lsp->dist_client_amounts).  Returns 1 if it was built. */
+static int lsp_build_dist_unsigned(lsp_t *lsp, factory_t *f) {
+    tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+    size_t n_dist = factory_compute_distribution_outputs_balanced(f,
+        dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+        lsp->dist_client_amounts, lsp->dist_n_client_amounts);
+    if (n_dist > 0 && f->cltv_timeout > 0)
+        return factory_build_distribution_tx_unsigned(
+            f, dist_outputs, n_dist, f->cltv_timeout);
+    return 0;
+}
+
+int lsp_factory_creation_preflight(lsp_t *lsp,
+        const secp256k1_pubkey *client_pubkeys, size_t n_clients,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout) {
+    if (!lsp || !client_pubkeys || n_clients == 0 || !funding_spk) return 0;
+    size_t n_total = 1 + n_clients;
+    secp256k1_pubkey *pks = calloc(n_total, sizeof(*pks));
+    factory_t *scratch = calloc(1, sizeof(factory_t));
+    lsp_creation_template_t t;
+    if (!pks || !scratch || !creation_template_capture(&t, &lsp->factory)) {
+        fprintf(stderr, "LSP preflight: out of memory\n");
+        free(pks);
+        free(scratch);
+        return 0;
+    }
+    pks[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n_clients; i++)
+        pks[i + 1] = client_pubkeys[i];
+    /* Placeholder outpoint: it only changes txids, never whether the build
+       succeeds. */
+    unsigned char placeholder_txid[32];
+    for (int i = 0; i < 32; i++) placeholder_txid[i] = (unsigned char)(0xA5 ^ i);
+
+    int ok = factory_setup_for_creation(lsp, scratch, &t, pks, n_total,
+                                        placeholder_txid, 0, funding_amount,
+                                        funding_spk, funding_spk_len,
+                                        step_blocks, states_per_layer,
+                                        cltv_timeout, "LSP preflight");
+    if (ok && scratch->n_nodes == 0) {
+        fprintf(stderr, "LSP preflight: tree has no nodes\n");
+        ok = 0;
+    }
+    if (ok && cltv_timeout > 0 && !lsp_build_dist_unsigned(lsp, scratch))
+        fprintf(stderr, "LSP preflight: WARNING: the distribution TX would not "
+                "build (creation still proceeds; offline recovery degraded)\n");
+    if (ok)
+        printf("LSP preflight: new factory setup OK (%zu participants, "
+               "%zu nodes, %d leaves)\n", n_total, scratch->n_nodes,
+               scratch->n_leaf_nodes);
+    factory_free(scratch);
+    free(scratch);
+    free(pks);
+    creation_template_free(&t);
+    return ok;
+}
+
 /* Phase 1e.3.b scaffolding: stub for the reversed-flow stateless factory
    creation ceremony.  Currently returns -1 for all cases (caller falls
    through to legacy lsp_run_factory_creation).  Phase 1e.3.c will fill in
@@ -381,95 +645,27 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         }
     }
 
-    /* ---- Setup: identical to legacy lsp_run_factory_creation ---- */
+    /* ---- Setup: rebuild lsp->factory from the caller's template ---- */
     size_t n_total = 1 + lsp->n_clients;
     secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
     all_pubkeys[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < lsp->n_clients; i++)
         all_pubkeys[i + 1] = lsp->client_pubkeys[i];
 
-    factory_arity_t saved_arity = f->leaf_arity;
-    size_t saved_n_level_arity = f->n_level_arity;
-    uint8_t saved_level_arity[FACTORY_MAX_LEVELS];
-    if (saved_n_level_arity > 0)
-        memcpy(saved_level_arity, f->level_arity,
-               saved_n_level_arity * sizeof(uint8_t));
-    uint32_t saved_static_threshold = f->static_threshold_depth;
-    uint32_t saved_ps_subfactory_arity = f->ps_subfactory_arity;
-    uint64_t saved_fee_per_tx = f->fee_per_tx;
-    placement_mode_t saved_placement = f->placement_mode;
-    economic_mode_t saved_econ = f->economic_mode;
-    participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
-    memcpy(saved_profiles, f->profiles, sizeof(saved_profiles));
-    int saved_has_shachain = f->has_shachain;
-    int saved_use_flat = f->use_flat_secrets;
-    size_t saved_n_secrets = f->n_revocation_secrets;
-    unsigned char (*saved_secrets)[32] = (unsigned char (*)[32])calloc(FACTORY_MAX_EPOCHS, 32);
-    unsigned char saved_shachain_seed[32];
-    if (saved_use_flat && saved_secrets)
-        memcpy(saved_secrets, f->revocation_secrets, saved_n_secrets * 32);
-    else if (!saved_use_flat)
-        memcpy(saved_shachain_seed, f->shachain_seed, 32);
-    factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
-                              step_blocks, states_per_layer);
-    if (saved_n_level_arity > 0) {
-        factory_set_level_arity(f, saved_level_arity, saved_n_level_arity);
-    } else if (saved_arity == FACTORY_ARITY_1) {
-        factory_set_arity(f, FACTORY_ARITY_1);
-    } else if (saved_arity == FACTORY_ARITY_PS) {
-        factory_set_arity(f, FACTORY_ARITY_PS);
+    /* Capture BEFORE the rebuild; NULL-safe for a factory whose arrays were
+       freed or never allocated (see lsp_creation_template_t). */
+    lsp_creation_template_t tmpl;
+    if (!creation_template_capture(&tmpl, f)) {
+        fprintf(stderr, "LSP-stateless factory creation: template capture failed (OOM)\n");
+        return 0;
     }
-    if (saved_static_threshold > 0)
-        factory_set_static_near_root(f, saved_static_threshold);
-    if (saved_ps_subfactory_arity > 1)
-        factory_set_ps_subfactory_arity(f, saved_ps_subfactory_arity);
-    if (saved_fee_per_tx > 200)
-        f->fee_per_tx = saved_fee_per_tx;
-    f->cltv_timeout = cltv_timeout;
-    f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
-    f->placement_mode = saved_placement;
-    f->economic_mode = saved_econ;
-    memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
-    if (saved_has_shachain) {
-        if (saved_use_flat && saved_secrets)
-            factory_set_flat_secrets(f, saved_secrets, saved_n_secrets);
-        else if (!saved_use_flat)
-            factory_set_shachain_seed(f, saved_shachain_seed);
-    }
-    free(saved_secrets);
-
-    /* #53 + restart-resume: (re-)derive + install the hashlock L-stock poison seed
-       AFTER factory_init_from_pubkeys (which wiped use_hashlock_poison).  The seed is
-       DERIVED deterministically from the LSP master key + THIS factory's funding
-       outpoint (factory_derive_lstock_seed) — never randomly minted or persisted as an
-       independent secret — so it is identical on the initial ceremony, on every
-       rotation, and after any LSP restart/backup-restore (the "derive, don't store"
-       rule; both inputs are durable).  Gated on lsp->enable_hashlock_poison; the legacy
-       key-path L-stock remains the default. */
-    if (lsp->enable_hashlock_poison) {
-        unsigned char lsp_sk[32], lstock_seed[32];
-        if (!secp256k1_keypair_sec(lsp->ctx, lsp_sk, &lsp->lsp_keypair)) {
-            fprintf(stderr, "LSP-stateless factory creation: keypair_sec for "
-                            "L-stock seed failed\n");
-            return 0;
-        }
-        factory_derive_lstock_seed(lsp_sk, funding_txid, funding_vout, lstock_seed);
-        memset(lsp_sk, 0, sizeof(lsp_sk));
-        factory_set_shachain_seed(f, lstock_seed);
-        memset(lstock_seed, 0, sizeof(lstock_seed));
-        if (f->use_flat_secrets || !factory_enable_hashlock_poison(f)) {
-            fprintf(stderr, "LSP-stateless factory creation: "
-                            "factory_enable_hashlock_poison failed (use_flat=%d)\n",
-                    f->use_flat_secrets);
-            return 0;
-        }
-    }
-
-    factory_set_funding(f, funding_txid, funding_vout, funding_amount,
-                        funding_spk, funding_spk_len);
-
-    if (!factory_build_tree(f)) {
-        fprintf(stderr, "LSP-stateless factory creation: factory_build_tree failed\n");
+    if (!factory_setup_for_creation(lsp, f, &tmpl, all_pubkeys, n_total,
+                                    funding_txid, funding_vout, funding_amount,
+                                    funding_spk, funding_spk_len,
+                                    step_blocks, states_per_layer, cltv_timeout,
+                                    "LSP-stateless factory creation")) {
+        creation_template_restore(f, &tmpl);
+        creation_template_free(&tmpl);
         return 0;
     }
 
@@ -485,6 +681,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         if (!wire_send(lsp->client_fds[i], MSG_FACTORY_PROPOSE, propose)) {
             fprintf(stderr, "LSP-stateless: send FACTORY_PROPOSE to client %zu failed\n", i);
             cJSON_Delete(propose);
+            creation_template_free(&tmpl);
             return 0;
         }
     }
@@ -509,15 +706,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        net that lets ANYONE broadcast at the factory CLTV to pay every client
        when all parties go offline.  (Legacy rotation also re-signs it later.)
        Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
-    {
-        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
-        size_t n_dist = factory_compute_distribution_outputs_balanced(f,
-            dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
-            lsp->dist_client_amounts, lsp->dist_n_client_amounts);
-        if (n_dist > 0 && f->cltv_timeout > 0)
-            (void)factory_build_distribution_tx_unsigned(
-                f, dist_outputs, n_dist, f->cltv_timeout);
-    }
+    (void)lsp_build_dist_unsigned(lsp, f);
 
     /* ---- Reversed stateless signing exchange ---- */
 
@@ -928,11 +1117,17 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     }
 
     printf("LSP-stateless factory creation: %u nodes signed\n", (unsigned)f->n_nodes);
+    creation_template_free(&tmpl);
     return 1;
 
 fail_pre:
     lsp_abort_ceremony(lsp, "stateless factory creation failed");
-    factory_free(&lsp->factory);
+    /* Release the half-built factory and put the caller's template back with
+       its arrays allocated (never leave lsp->factory with NULL arrays; a
+       retry -- the initial-creation retry loop, a rotation retry -- rebuilds
+       the same shape and profiles). */
+    creation_template_restore(&lsp->factory, &tmpl);
+    creation_template_free(&tmpl);
     return 0;
 }
 

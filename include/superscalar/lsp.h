@@ -127,6 +127,22 @@ int lsp_run_factory_creation(lsp_t *lsp,
                               uint16_t step_blocks, uint32_t states_per_layer,
                               uint32_t cltv_timeout);
 
+/* Dry-run the creation setup for the given participant set (LSP + the
+   n_clients client_pubkeys) WITHOUT touching lsp->factory or the wire:
+   capture lsp->factory's template (shape, profiles, secret mode), build a
+   scratch factory over a placeholder funding outpoint, build its tree and its
+   distribution TX, and free it.  The placeholder only changes txids, never
+   whether the build succeeds.  Rotation runs this BEFORE its irreversible
+   Phase B close so a deterministic setup failure aborts while the old factory
+   is still live.  Safe on a factory whose arrays were freed or never
+   allocated.  Returns 1 if lsp_run_factory_creation's setup would succeed. */
+int lsp_factory_creation_preflight(lsp_t *lsp,
+        const secp256k1_pubkey *client_pubkeys, size_t n_clients,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout);
+
 /* Run cooperative close ceremony over the wire.
    Returns 1 on success, fills close_tx_out with signed tx. */
 int lsp_run_cooperative_close(lsp_t *lsp,

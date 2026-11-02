@@ -1117,6 +1117,12 @@ extern int test_ladder_create_factories(void);
 extern int test_ladder_state_transitions(void);
 extern int test_ladder_key_turnover_close(void);
 extern int test_ladder_overlapping(void);
+extern int test_rotation_creation_after_factory_free(void);
+extern int test_rotation_creation_arrays_never_allocated(void);
+extern int test_rotation_creation_carries_profiles(void);
+extern int test_rotation_creation_failure_keeps_template(void);
+extern int test_rotation_creation_preflight(void);
+extern int test_ladder_distribution_tx_signed_only(void);
 extern int test_regtest_ladder_lifecycle(void);
 extern int test_regtest_ladder_ptlc_migration(void);
 extern int test_regtest_ladder_distribution_fallback(void);
@@ -3088,6 +3094,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ladder_state_transitions);
     RUN_TEST(test_ladder_key_turnover_close);
     RUN_TEST(test_ladder_overlapping);
+    RUN_TEST(test_rotation_creation_after_factory_free);
+    RUN_TEST(test_rotation_creation_arrays_never_allocated);
+    RUN_TEST(test_rotation_creation_carries_profiles);
+    RUN_TEST(test_rotation_creation_failure_keeps_template);
+    RUN_TEST(test_rotation_creation_preflight);
+    RUN_TEST(test_ladder_distribution_tx_signed_only);
 
     printf("\n=== Wire Protocol (Phase 9) ===\n");
     RUN_TEST(test_wire_pubkey_only_factory);

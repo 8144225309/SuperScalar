@@ -4,6 +4,13 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
 
+## Unreleased
+
+### Factory rotation
+
+- **Fixed: rotation crashed the LSP right after closing the old factory.** The crash came in Phase C, after the cooperative close had paid every client's balance to the LSP wallet and the replacement factory had been funded but not yet signed, so the clients' funds had no signed tree and no distribution TX behind them. A retry after a failed initial factory creation crashed the same way. Factory creation now keeps the factory's shape and participant profiles across the ceremony and across a failed attempt, and rotation no longer frees the old factory before creating the new one.
+- **Fixed: the LSP's broadcast of the initial factory's distribution TX at EXPIRED was rejected** ("Witness program was passed an empty witness"): the LSP stored the unsigned TX. It now stores only the co-signed TX. Clients were unaffected; they keep their own signed copy.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
