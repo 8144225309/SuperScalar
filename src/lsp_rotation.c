@@ -952,14 +952,29 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
-    /* Free old factory, preserve arity for new factory.
-       Ladder entries use detached copies (factory_detach_txbufs) so they
-       don't share heap data — no risk of double-free from ladder. */
-    factory_arity_t saved_arity = (factory_arity_t)mgr->rot_leaf_arity;
-    factory_free(&lsp->factory);
-    /* Restore arity on the zeroed struct so lsp_run_factory_creation's
-       saved_arity = f->leaf_arity picks it up correctly. */
-    lsp->factory.leaf_arity = saved_arity;
+    /* Do NOT factory_free the old factory here.  lsp_run_factory_creation
+       captures its template (shape, participant profiles, secret mode) and
+       then releases it itself.  Freeing it first is what crashed rotation once
+       #451/#453 made the factory arrays heap-allocated (f->profiles == NULL at
+       the template capture), and it would drop the profiles even with a
+       NULL-safe creation path.  Ladder entries are detached copies
+       (factory_detach_txbufs), so the live factory owns its arrays.  If an
+       earlier failed attempt left the live factory without arrays,
+       re-establish them and carry the profiles from the dying factory's
+       ladder copy. */
+    {
+        ladder_factory_t *src_lf = ladder_get_by_id(lad, dying_id);
+        if (!lsp->factory.profiles &&
+            factory_alloc_default_arrays(&lsp->factory) &&
+            src_lf && src_lf->factory.profiles) {
+            size_t np = src_lf->factory.config.max_signers;
+            if (np > lsp->factory.config.max_signers)
+                np = lsp->factory.config.max_signers;
+            memcpy(lsp->factory.profiles, src_lf->factory.profiles,
+                   np * sizeof(participant_profile_t));
+        }
+    }
+    lsp->factory.leaf_arity = (factory_arity_t)mgr->rot_leaf_arity;
 
     /* Compute cltv_timeout for new factory */
     uint32_t new_cltv = 0;
@@ -992,8 +1007,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                                    mgr->rot_step_blocks,
                                    mgr->rot_states_per_layer, new_cltv)) {
         fprintf(stderr, "LSP rotate: new factory creation failed\n");
-        /* Factory is already freed — restore client arrays so daemon
-           can still service existing connections without crashing. */
+        /* lsp->factory holds the caller's template again (arrays allocated;
+           see lsp_run_factory_creation's failure path).  Restore the client
+           arrays so the daemon can keep servicing connections. */
         if (partial) {
             memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
