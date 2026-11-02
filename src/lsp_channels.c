@@ -140,6 +140,49 @@ void client_to_leaf(size_t client_idx, const factory_t *factory,
     }
 }
 
+/* The distribution TX carries an nLockTime (the factory CLTV).  Both
+   triggers (EXPIRED, rotation-retry fallback) normally fire before it on
+   non-regtest networks, so a one-shot send is rejected as non-final and was
+   never retried.  Queue it persistently instead: the daemon tick (and a
+   restarted LSP) calls persist_service_queued_broadcasts, which sends it once
+   final and re-sends until it confirms or its input is spent elsewhere. */
+static void lsp_queue_distribution_tx(lsp_channel_mgr_t *mgr,
+                                      const ladder_factory_t *lf,
+                                      const char *why) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!cb || !lf || lf->distribution_tx.len == 0) return;
+    char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
+    if (!dhex) return;
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    hex_encode(lf->distribution_tx.data, lf->distribution_tx.len, dhex);
+    char source[64];
+    snprintf(source, sizeof(source), "distribution_tx_f%u_%s",
+             lf->factory_id, why);
+    if (mgr->persist) {
+        char dtxid[65] = {0};
+        if (persist_queue_broadcast((persist_t *)mgr->persist, source, dhex,
+                                    dtxid)) {
+            printf("LSP: distribution TX %s queued (%s): broadcast once final, "
+                   "retried until confirmed\n", dtxid, why);
+            fflush(stdout);
+            persist_service_queued_broadcasts((persist_t *)mgr->persist, cb);
+            free(dhex);
+            return;
+        }
+        fprintf(stderr, "LSP: could not queue the distribution TX (%s); "
+                "trying a single broadcast\n", why);
+    } else {
+        fprintf(stderr, "LSP: WARNING: no --db, so the distribution TX (%s) "
+                "cannot be retried; trying a single broadcast\n", why);
+    }
+    char dtxid[65];
+    if (cb->send_raw_tx(cb, dhex, dtxid))
+        printf("LSP: distribution TX broadcast: %s\n", dtxid);
+    else
+        fprintf(stderr, "LSP: distribution TX broadcast failed (%s)\n", why);
+    free(dhex);
+}
+
 /* Exit-path persistence shared by the advance ceremonies.  factory_recovery_run
    publishes what is in the DB, so every advance must write its NEW signed
    state before DONE goes out and before the superseded state's L-stock
@@ -7438,6 +7481,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
                         ladder_advance_block(lad, (uint32_t)height);
 
+                        /* Queued distribution TXs (from an earlier tick or
+                           before a restart) are retried every tick until they
+                           confirm. */
+                        if (mgr->persist && mgr->chain_be)
+                            persist_service_queued_broadcasts(
+                                (persist_t *)mgr->persist,
+                                (chain_backend_t *)mgr->chain_be);
+
                         for (size_t fi = 0; fi < lad->n_factories; fi++) {
                             ladder_factory_t *lf = &lad->factories[fi];
                             if (lf->cached_state != old_states[fi]) {
@@ -7464,23 +7515,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         lf->factory.dying_blocks,
                                         lf->partial_rotation_done);
                                 }
-                                /* Auto-broadcast distribution TX on EXPIRED */
+                                /* Auto-broadcast distribution TX on EXPIRED
+                                   (queued: retried until it confirms). */
                                 if (lf->cached_state == FACTORY_EXPIRED &&
                                     lf->distribution_tx.len > 0 &&
                                     mgr->chain_be) {
-                                    chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
-                                    char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
-                                    if (dhex) {
-                                        extern void hex_encode(const unsigned char *,
-                                                               size_t, char *);
-                                        hex_encode(lf->distribution_tx.data,
-                                                   lf->distribution_tx.len, dhex);
-                                        char dtxid[65];
-                                        if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                            printf("LSP: distribution TX broadcast: %s\n",
-                                                   dtxid);
-                                        free(dhex);
-                                    }
+                                    lsp_queue_distribution_tx(mgr, lf, "expired");
                                 }
 
                                 /* Async rotation: handle EXPIRED with partial ready set.
@@ -7701,28 +7741,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             cJSON_Delete(_ab);
                                         }
                                     }
+                                    /* Queued: retried until it confirms, so the
+                                       sentinel below only stops repeating the
+                                       fallback, not the broadcast. */
                                     if (lf->distribution_tx.len > 0 &&
                                         mgr->chain_be) {
-                                        chain_backend_t *_cb =
-                                            (chain_backend_t *)mgr->chain_be;
-                                        char *dhex = malloc(
-                                            lf->distribution_tx.len * 2 + 1);
-                                        if (dhex) {
-                                            extern void hex_encode(
-                                                const unsigned char *, size_t,
-                                                char *);
-                                            hex_encode(lf->distribution_tx.data,
-                                                       lf->distribution_tx.len,
-                                                       dhex);
-                                            char dtxid[65];
-                                            if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                                printf("LSP: fallback distribution "
-                                                       "TX: %s\n", dtxid);
-                                            else
-                                                fprintf(stderr, "LSP: fallback "
-                                                        "dist TX broadcast failed\n");
-                                            free(dhex);
-                                        }
+                                        lsp_queue_distribution_tx(mgr, lf,
+                                                                  "rotation_fallback");
                                     }
                                     /* Sentinel: past max → no further action */
                                     uint32_t ridx = lf->factory_id % 8;
