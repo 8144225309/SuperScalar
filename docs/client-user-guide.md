@@ -148,6 +148,15 @@ If your connection drops:
 
 This happens automatically in `--daemon` mode. With `--db`, your channel state survives client restarts too.
 
+If the client stopped after it signed a factory root advance but before it
+stored the result, it restarts with leaf operations frozen and asks for that
+advance's tree in `MSG_RECONNECT` (optional field `pending_root_epoch`). An
+LSP that has stored the advance answers with `MSG_TREE_CATCHUP` (before
+`MSG_RECONNECT_ACK`): the signed tree of that epoch. The client rebuilds the
+epoch itself and accepts the tree only if every transaction is the one it
+rebuilt, matches what it signed, and carries a valid signature; otherwise it
+stays frozen. Older LSPs and clients ignore the field and the message.
+
 Do not restore an old copy of your client DB while the factory is live. It
 holds older factory states, and your client would reload and use them; a
 force-close from it publishes states the LSP has since superseded.

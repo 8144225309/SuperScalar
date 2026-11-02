@@ -1545,6 +1545,37 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    step the freeze allows); in memory after a failed ceremony it already has.
    The signed-state reservations make the identical TXs the only ones that
    can be signed.  Returns 1 when the root advance completed. */
+cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch) {
+    if (!mgr || !mgr->persist || !lsp) return NULL;
+    persist_t *db = (persist_t *)mgr->persist;
+    factory_t *f = &lsp->factory;
+    /* only a root advance stored as complete, and only the current epoch */
+    if (factory_root_advance_frozen(f) || f->tree_rebuilt_on_load ||
+        f->counter.current_epoch != epoch)
+        return NULL;
+    if (persist_load_root_advance_pending(db, 0, NULL, NULL) != 0) return NULL;
+    char **hx = calloc(f->n_nodes, sizeof(char *));
+    if (!hx) return NULL;
+    cJSON *j = NULL;
+    if (persist_load_root_advance_tree(db, 0, epoch, f->n_nodes, hx)) {
+        j = cJSON_CreateObject();
+        cJSON_AddNumberToObject(j, "epoch", (double)epoch);
+        cJSON *arr = cJSON_CreateArray();
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "node", (double)i);
+            cJSON_AddStringToObject(o, "tx", hx[i]);
+            cJSON_AddItemToArray(arr, o);
+        }
+        cJSON_AddItemToObject(j, "nodes", arr);
+    } else {
+        fprintf(stderr, "LSP: no stored signed tree of epoch %u to send\n", epoch);
+    }
+    for (size_t i = 0; i < f->n_nodes; i++) free(hx[i]);
+    free(hx);
+    return j;
+}
+
 int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
@@ -3062,9 +3093,13 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                         "the re-signed tree; a force-close from the DB would "
                         "publish the previous epoch\n");
             }
-            /* stored as complete: no longer pending (same transaction) */
+            /* stored as complete: no longer pending (same transaction), and
+               the tree kept for a client that signed it but missed storing it */
             if (tierb_durable &&
                 !persist_clear_root_advance_pending(tdb, 0, f->counter.current_epoch))
+                tierb_durable = 0;
+            if (tierb_durable &&
+                !persist_save_root_advance_tree(tdb, 0, f->counter.current_epoch, f))
                 tierb_durable = 0;
             if (towntxn) {
                 if (tierb_durable) tierb_durable = persist_commit(tdb);
@@ -6436,6 +6471,23 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 (unsigned long long)ack_cn,
                 (unsigned long long)ch->commitment_number, off,
                 mgr->entries[c].channel_id);
+        }
+        /* A client that signed a root advance but did not store it asks
+           for the tree (optional field; older clients don't send it). */
+        {
+            const cJSON *pre = cJSON_GetObjectItem(msg->json, "pending_root_epoch");
+            if (pre && cJSON_IsNumber(pre) && pre->valuedouble >= 1 &&
+                pre->valuedouble <= 4294967295.0) {
+                cJSON *cu = lsp_build_tree_catchup(mgr, lsp, (uint32_t)pre->valuedouble);
+                if (cu) {
+                    if (!wire_send(new_fd, MSG_TREE_CATCHUP, cu))
+                        fprintf(stderr, "LSP reconnect: send TREE_CATCHUP failed\n");
+                    else
+                        printf("LSP reconnect: sent the signed tree of epoch %u to "
+                               "client %zu\n", (uint32_t)pre->valuedouble, c);
+                    cJSON_Delete(cu);
+                }
+            }
         }
         cJSON *ack = wire_build_reconnect_ack(
             mgr->entries[c].channel_id,

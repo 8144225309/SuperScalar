@@ -546,6 +546,12 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
    Returns 1 when the root advance completed. */
 int lsp_redrive_root_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
+/* MSG_TREE_CATCHUP payload for a reconnecting client that signed the root
+   advance to `epoch` but did not store it: the stored signed tree of that
+   advance.  NULL unless the LSP has stored that epoch as complete (no
+   pending root advance of its own) and it is the current epoch. */
+cJSON *lsp_build_tree_catchup(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint32_t epoch);
+
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).
    On rollover, drives Tier B ceremony to re-sign every non-PS-leaf node

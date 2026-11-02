@@ -214,6 +214,19 @@
 #define MSG_LSTOCK_REVEAL 0x8C
 #define MSG_LSTOCK_REVEAL_REQUEST 0x8D  /* #59: Client -> LSP, re-request missing reveals */
 
+/* LSP -> Client, during a reconnect, before MSG_RECONNECT_ACK.  A client
+   that released its final psigs for a root advance but did not store it (it
+   crashed between PATH_SIGN_DONE and its save) reconnects frozen and says so
+   in MSG_RECONNECT's optional "pending_root_epoch".  If the LSP has stored
+   that epoch as complete, it sends the signed tree of that root advance:
+     { "epoch": E, "nodes": [ { "node": i, "tx": "<signed TX hex>" }, ... ] }
+   one entry per tree node (a PS node's entry is its chain[0]).  The client
+   rebuilds the epoch itself and accepts the whole tree or nothing
+   (client_apply_tree_catchup).  An LSP that does not know the field sends
+   nothing; a client that does not set it gets nothing. */
+#define MSG_TREE_CATCHUP 0x8E
+#define WIRE_TREE_CATCHUP_MAX_TX_HEX  (400 * 1024)   /* per node */
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01

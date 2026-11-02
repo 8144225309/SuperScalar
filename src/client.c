@@ -4582,6 +4582,123 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
+/* Put f back to its stored state after a refused catch-up. */
+static void catchup_reload(factory_t *f, persist_t *db) {
+    secp256k1_context *ctx = f->ctx;
+    factory_free(f);
+    memset(f, 0, sizeof(*f));
+    if (!persist_load_factory(db, 0, f, ctx))
+        fprintf(stderr, "Client: CRITICAL - could not reload the factory after a "
+                "refused tree catch-up\n");
+}
+
+int client_apply_tree_catchup(factory_t *f, persist_t *db, const cJSON *json,
+                              uint32_t my_index) {
+    if (!f || !db || !json) return 0;
+    if (!factory_root_advance_frozen(f) ||
+        f->counter.current_epoch >= f->root_advance_pending_epoch) {
+        fprintf(stderr, "Client %u: unexpected tree catch-up (no pending root "
+                "advance); ignored\n", my_index);
+        return 0;
+    }
+    uint32_t pending = f->root_advance_pending_epoch;
+    const cJSON *ep = cJSON_GetObjectItem(json, "epoch");
+    const cJSON *arr = cJSON_GetObjectItem(json, "nodes");
+    if (!ep || !cJSON_IsNumber(ep) || ep->valuedouble != (double)pending ||
+        !arr || !cJSON_IsArray(arr) ||
+        cJSON_GetArraySize(arr) != (int)f->n_nodes) {
+        fprintf(stderr, "Client %u: tree catch-up refused: wrong epoch or node "
+                "count (pending epoch %u)\n", my_index, pending);
+        return 0;
+    }
+    /* decode everything before touching the factory */
+    size_t n = f->n_nodes;
+    tx_buf_t *rx = calloc(n, sizeof(tx_buf_t));
+    if (!rx) return 0;
+    int ok = 1;
+    for (int k = 0; ok && k < cJSON_GetArraySize(arr); k++) {
+        const cJSON *o = cJSON_GetArrayItem(arr, k);
+        const cJSON *ni = cJSON_GetObjectItem(o, "node");
+        const cJSON *tx = cJSON_GetObjectItem(o, "tx");
+        if (!ni || !cJSON_IsNumber(ni) || ni->valuedouble < 0 ||
+            ni->valuedouble >= (double)n || !tx || !cJSON_IsString(tx)) { ok = 0; break; }
+        size_t i = (size_t)ni->valuedouble;
+        size_t hl = strlen(tx->valuestring);
+        if (rx[i].data || hl < 140 || (hl & 1) || hl > WIRE_TREE_CATCHUP_MAX_TX_HEX) {
+            ok = 0;
+            break;
+        }
+        tx_buf_init(&rx[i], (int)(hl / 2));
+        if (hex_decode(tx->valuestring, rx[i].data, hl / 2) != (int)(hl / 2)) { ok = 0; break; }
+        rx[i].len = hl / 2;
+    }
+    for (size_t i = 0; ok && i < n; i++) if (!rx[i].data) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "Client %u: tree catch-up refused: malformed\n", my_index);
+        for (size_t i = 0; i < n; i++) tx_buf_free(&rx[i]);
+        free(rx);
+        return 0;
+    }
+
+    /* rebuild the pending epoch locally (allowed while frozen) */
+    int trig = f->root_advance_pending_trigger;
+    int rc = (trig < 0) ? factory_tick_root(f) : factory_advance_leaf_unsigned(f, trig);
+    const char *why = NULL;
+    if (rc != -1 || f->counter.current_epoch != pending)
+        why = "could not rebuild the pending epoch";
+    for (size_t i = 0; !why && i < n; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (node->unsigned_tx.len == 0) { why = "a node has no rebuilt TX"; break; }
+        /* key-path: the signature sits right before the 4-byte nLockTime */
+        tx_buf_t mine;
+        tx_buf_init(&mine, (int)rx[i].len);
+        unsigned char sig[64];
+        memcpy(sig, rx[i].data + rx[i].len - 68, 64);
+        int same = finalize_signed_tx(&mine, node->unsigned_tx.data,
+                                      node->unsigned_tx.len, sig) &&
+                   mine.len == rx[i].len &&
+                   memcmp(mine.data, rx[i].data, rx[i].len) == 0;
+        tx_buf_free(&mine);
+        if (!same) { why = "a TX is not the locally rebuilt one"; break; }
+        int any_nseq = node->is_ps_leaf || node->type == NODE_PS_SUBFACTORY;
+        int lk = persist_lookup_reserved_tx(db, 0, node->unsigned_tx.data,
+                                            node->unsigned_tx.len, any_nseq);
+        if (lk < 0) { why = "a TX conflicts with a reservation"; break; }
+        /* a node re-signed in this advance that this client signs: it
+           reserved exactly this TX before releasing its psigs */
+        if (!node->is_signed &&
+            factory_find_signer_slot(f, i, my_index) >= 0 && lk != 1) {
+            why = "a node this client signed has no matching reservation";
+            break;
+        }
+    }
+    if (!why) {
+        for (size_t i = 0; i < n; i++) {
+            factory_node_t *node = &f->nodes[i];
+            tx_buf_free(&node->signed_tx);
+            node->signed_tx = rx[i];
+            memset(&rx[i], 0, sizeof(rx[i]));
+            node->is_signed = 1;
+        }
+        if (!factory_verify_all(f)) why = "a signature does not verify";
+    }
+    for (size_t i = 0; i < n; i++) tx_buf_free(&rx[i]);
+    free(rx);
+    if (!why) {
+        factory_clear_root_advance_pending(f);
+        if (!client_persist_exit_state(db, f)) why = "could not store the tree";
+    }
+    if (why) {
+        fprintf(stderr, "Client %u: tree catch-up for epoch %u refused: %s; "
+                "staying frozen\n", my_index, pending, why);
+        catchup_reload(f, db);
+        return 0;
+    }
+    printf("Client %u: caught up with the stored tree of epoch %u\n",
+           my_index, pending);
+    return 1;
+}
+
 int client_persist_exit_state(persist_t *db, const factory_t *f) {
     if (!db || !f) return 0;
     int own_txn = !persist_in_transaction(db);

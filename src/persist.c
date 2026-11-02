@@ -471,6 +471,9 @@ static const char *SCHEMA_SQL =
    root_advance_pending: a root advance whose signatures were released but
    that is not stored as complete (persist_set_root_advance_pending).
 
+   root_advance_trees: the signed tree of the last completed root advance
+   (persist_save_root_advance_tree), for MSG_TREE_CATCHUP.
+
    Created whenever missing, independent of the version number, so the step
    works in any merge order with the other schema bumps. */
 #define PERSIST_V43_TABLES_SQL                                       \
@@ -495,6 +498,13 @@ static const char *SCHEMA_SQL =
     "  factory_id   INTEGER PRIMARY KEY,"                           \
     "  epoch        INTEGER NOT NULL,"                              \
     "  trigger_leaf INTEGER NOT NULL"                               \
+    ");"                                                            \
+    "CREATE TABLE IF NOT EXISTS root_advance_trees ("               \
+    "  factory_id    INTEGER NOT NULL,"                             \
+    "  node_index    INTEGER NOT NULL,"                             \
+    "  epoch         INTEGER NOT NULL,"                             \
+    "  signed_tx_hex TEXT NOT NULL,"                                \
+    "  PRIMARY KEY (factory_id, node_index)"                        \
     ");"
 
 int persist_open(persist_t *p, const char *path) {
@@ -2561,6 +2571,118 @@ int persist_reserve_signed_tx(persist_t *p, uint32_t factory_id,
     }
     free(info);
     return rc;
+}
+
+int persist_save_root_advance_tree(persist_t *p, uint32_t factory_id,
+                                   uint32_t epoch, const factory_t *f) {
+    if (!p || !p->db || !f) return 0;
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (!f->nodes[i].is_signed || f->nodes[i].signed_tx.len == 0)
+            return 1;   /* not a whole signed tree: nothing to offer */
+    sqlite3_stmt *del, *ins;
+    if (sqlite3_prepare_v2(p->db, "DELETE FROM root_advance_trees WHERE "
+                           "factory_id=?;", -1, &del, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(del, 1, (int)factory_id);
+    int ok = (sqlite3_step(del) == SQLITE_DONE);
+    sqlite3_finalize(del);
+    if (!ok) return 0;
+    if (sqlite3_prepare_v2(p->db, "INSERT INTO root_advance_trees (factory_id, "
+            "node_index, epoch, signed_tx_hex) VALUES (?, ?, ?, ?);",
+            -1, &ins, NULL) != SQLITE_OK)
+        return 0;
+    for (size_t i = 0; ok && i < f->n_nodes; i++) {
+        const tx_buf_t *t = &f->nodes[i].signed_tx;
+        char *hx = malloc(t->len * 2 + 1);
+        if (!hx) { ok = 0; break; }
+        hex_encode(t->data, t->len, hx);
+        sqlite3_reset(ins);
+        sqlite3_bind_int(ins, 1, (int)factory_id);
+        sqlite3_bind_int(ins, 2, (int)i);
+        sqlite3_bind_int64(ins, 3, (sqlite3_int64)epoch);
+        sqlite3_bind_text(ins, 4, hx, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(ins) != SQLITE_DONE) ok = 0;
+        free(hx);
+    }
+    sqlite3_finalize(ins);
+    return ok;
+}
+
+int persist_load_root_advance_tree(persist_t *p, uint32_t factory_id,
+                                   uint32_t epoch, size_t n_nodes,
+                                   char **hex_out) {
+    if (!p || !p->db || !hex_out || n_nodes == 0) return 0;
+    for (size_t i = 0; i < n_nodes; i++) hex_out[i] = NULL;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT node_index, signed_tx_hex FROM "
+            "root_advance_trees WHERE factory_id=? AND epoch=?;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)epoch);
+    size_t got = 0;
+    int ok = 1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int i = sqlite3_column_int(st, 0);
+        const char *h = (const char *)sqlite3_column_text(st, 1);
+        if (i < 0 || (size_t)i >= n_nodes || !h || hex_out[i]) { ok = 0; break; }
+        hex_out[i] = strdup(h);
+        if (!hex_out[i]) { ok = 0; break; }
+        got++;
+    }
+    sqlite3_finalize(st);
+    if (!ok || got != n_nodes) {
+        for (size_t i = 0; i < n_nodes; i++) { free(hex_out[i]); hex_out[i] = NULL; }
+        return 0;
+    }
+    return 1;
+}
+
+int persist_lookup_reserved_tx(persist_t *p, uint32_t factory_id,
+                               const unsigned char *unsigned_tx, size_t tx_len,
+                               int any_nsequence) {
+    if (!p || !p->db || !unsigned_tx || tx_len == 0) return -1;
+    pq_tx_info_t *info = malloc(sizeof(*info));
+    if (!info) return -1;
+    if (!pq_parse_tx_bytes(unsigned_tx, tx_len, info) || info->n_inputs == 0 ||
+        info->n_inputs >= PQ_MAX_INPUTS) {
+        free(info);
+        return -1;
+    }
+    sqlite3_stmt *sel;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid FROM signed_state_reservations WHERE factory_id=? AND "
+            "input_txid=? AND input_vout=? AND nsequence=?;",
+            -1, &sel, NULL) != SQLITE_OK) {
+        free(info);
+        return -1;
+    }
+    size_t same = 0, none = 0;
+    int rc = 0;
+    for (size_t k = 0; k < info->n_inputs; k++) {
+        sqlite3_reset(sel);
+        sqlite3_bind_int(sel, 1, (int)factory_id);
+        sqlite3_bind_text(sel, 2, info->prev_txid[k], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(sel, 3, (sqlite3_int64)info->prev_vout[k]);
+        sqlite3_bind_int64(sel, 4, any_nsequence ? -1
+                           : (sqlite3_int64)info->prev_nseq[k]);
+        int step = sqlite3_step(sel);
+        if (step == SQLITE_ROW) {
+            const char *t = (const char *)sqlite3_column_text(sel, 0);
+            if (!t || strcasecmp(t, info->txid) != 0) { rc = PERSIST_RESERVE_CONFLICT_FOUND; break; }
+            same++;
+        } else if (step == SQLITE_DONE) {
+            none++;
+        } else {
+            rc = -1;
+            break;
+        }
+    }
+    sqlite3_finalize(sel);
+    free(info);
+    if (rc != 0) return rc;
+    if (same && none) return -1;
+    return same ? 1 : 0;
 }
 
 int persist_set_root_advance_pending(persist_t *p, uint32_t factory_id,

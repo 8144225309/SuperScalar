@@ -25,8 +25,8 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations.
-   43 adds tree_node_lstock, signed_state_reservations and
-   root_advance_pending (persist.c, the v43 step).  Versions 40-42 are taken by changes on other branches; every one of
+   43 adds tree_node_lstock, signed_state_reservations, root_advance_pending
+   and root_advance_trees (persist.c, the v43 step).  Versions 40-42 are taken by changes on other branches; every one of
    those steps, and this one, creates its tables whenever they are missing, so
    the steps run correctly in any merge order.  When the branches are merged
    the version is the maximum of the bumps (43). */
@@ -338,6 +338,27 @@ int persist_clear_root_advance_pending(persist_t *p, uint32_t factory_id,
                                        uint32_t upto_epoch);
 int persist_load_root_advance_pending(persist_t *p, uint32_t factory_id,
                                       uint32_t *epoch_out, int *trigger_out);
+
+/* The signed tree of the last completed root advance, for a client that
+   signed it but did not store it (MSG_TREE_CATCHUP).  Saved in the
+   transaction that stores the advance; only a tree with every node signed is
+   saved (otherwise nothing, and no catch-up is offered).  Returns 0 only on
+   a DB error. */
+int persist_save_root_advance_tree(persist_t *p, uint32_t factory_id,
+                                   uint32_t epoch, const factory_t *f);
+/* Load it: hex_out[i] (malloc'd, caller frees) for node i < n_nodes.
+   Returns 1 when every node has a row of that epoch, 0 otherwise. */
+int persist_load_root_advance_tree(persist_t *p, uint32_t factory_id,
+                                   uint32_t epoch, size_t n_nodes,
+                                   char **hex_out);
+
+/* Whether a TX is the one reserved for its positions: 1 every input is
+   reserved for this txid, 0 none is reserved, PERSIST_RESERVE_CONFLICT_FOUND
+   one is reserved for another TX, -1 error (or only some inputs). */
+#define PERSIST_RESERVE_CONFLICT_FOUND (-2)
+int persist_lookup_reserved_tx(persist_t *p, uint32_t factory_id,
+                               const unsigned char *unsigned_tx, size_t tx_len,
+                               int any_nsequence);
 
 #define PERSIST_RESERVE_ERROR    (-1)
 #define PERSIST_RESERVE_CONFLICT   0

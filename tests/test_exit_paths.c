@@ -2966,6 +2966,10 @@ static void rl_cli2_free(rl_cli2_t *c) {
     if (c->cpath[0]) unlink(c->cpath);
 }
 
+/* Set: client 1 does not store its view after a completed ceremony (a crash
+   right after PATH_SIGN_DONE, before its exit-state save). */
+static int g_rl_c1_no_save;
+
 /* Like rl_proxy_thread, plus a gate between the two clients: the two
    in-process clients share one client DB handle (client_set_persist is
    global), so client 2 is given the LSP's Tier B response only after client
@@ -3058,7 +3062,7 @@ static int rl_advance2_ex(ex_rig_t *r, rl_cli2_t *c2, int *c1_ok, int *c2_ok,
     *c1_ok = a.ok;
     *c2_ok = roll ? b.ok : 1;
     if (dropped) *dropped = p1.dropped;
-    if (rc == 1 && a.ok) client_persist_exit_state(&r->cdb, r->cf);
+    if (rc == 1 && a.ok && !g_rl_c1_no_save) client_persist_exit_state(&r->cdb, r->cf);
     if (rc == 1 && roll && b.ok) client_persist_exit_state(&c2->cdb, c2->cf);
     if (!rl_rig_reconnect(r) || !rl_cli2_reconnect(r, c2)) return 0;
     return rc;
@@ -3266,6 +3270,158 @@ int test_reload_tierb_redrive_in_memory(void) {
                 "freeze lifted");
     rc = rl_advance2(&r, &c2, &ok1, &ok2);
     TEST_ASSERT(rc == 1 && ok1, "leaf advance at epoch 1");
+    client_set_persist(NULL);
+    alarm(0);
+    rl_cli2_free(&c2);
+    r.lsp->client_fds[1] = -1;
+    ex_rig_free(&r);
+    return 1;
+}
+
+/* Apply a catch-up (a copy) to client 1; returns the result and checks that
+   a refusal left it frozen at epoch 0. */
+static int rl_try_catchup(ex_rig_t *r, const cJSON *msg, int *still_frozen) {
+    cJSON *cp = cJSON_Duplicate(msg, 1);
+    int rc = client_apply_tree_catchup(r->cf, &r->cdb, cp, 1);
+    cJSON_Delete(cp);
+    *still_frozen = factory_root_advance_frozen(r->cf) &&
+                    r->cf->counter.current_epoch == 0;
+    return rc;
+}
+
+/* Client 1 completes a Tier B with everyone but crashes before storing it:
+   it restarts at epoch 0, frozen, while the LSP stored epoch 1 and will
+   never re-drive it.  On reconnect the LSP sends the stored signed tree
+   (MSG_TREE_CATCHUP); the client checks it against its own rebuild and
+   reservations and stores it.  A tampered, wrong-epoch, partial or oversized
+   catch-up is refused and the client stays frozen. */
+int test_reload_tree_catchup_after_crash(void) {
+    signal(SIGPIPE, SIG_IGN);
+    client_set_persist(NULL);
+    ex_rig_t r;
+    TEST_ASSERT(ex_rig_init_ex(&r, FACTORY_ARITY_1, "rl_catch", 0, 2), "rig");
+    rl_cli2_t c2;
+    TEST_ASSERT(rl_cli2_init(&r, &c2, "rl_catch2", 2), "second client");
+    alarm(600);
+    client_set_persist(&r.cdb);
+    int ok1 = 0, ok2 = 0;
+    TEST_ASSERT(rl_advance2(&r, &c2, &ok1, &ok2) == 1 && ok1, "leaf 0 to its last state");
+    g_rl_c1_no_save = 1;
+    int rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    g_rl_c1_no_save = 0;
+    TEST_ASSERT(rc == 1 && ok1 && ok2, "Tier B completed on every side");
+    TEST_ASSERT(r.lsp->factory.counter.current_epoch == 1 &&
+                !factory_root_advance_frozen(&r.lsp->factory), "LSP stored epoch 1");
+
+    /* client 1 crashed before its save: it restarts at epoch 0, frozen */
+    TEST_ASSERT(rl_rig_restart_client(&r), "client 1 reload");
+    printf("  client 1 after the crash: epoch %u, frozen=%d (pending %u)\n",
+           r.cf->counter.current_epoch, factory_root_advance_frozen(r.cf),
+           r.cf->root_advance_pending_epoch);
+    TEST_ASSERT(factory_root_advance_frozen(r.cf) && r.cf->counter.current_epoch == 0,
+                "client 1 frozen at epoch 0");
+
+    /* the reconnect field: an older parser ignores it */
+    cJSON *rq = wire_build_reconnect(r.ctx, &r.pks[1], 0);
+    cJSON_AddNumberToObject(rq, "pending_root_epoch", 1);
+    secp256k1_pubkey pk;
+    uint64_t cn = 1;
+    TEST_ASSERT(wire_parse_reconnect(rq, r.ctx, &pk, &cn) && cn == 0,
+                "MSG_RECONNECT with the optional field still parses");
+    cJSON_Delete(rq);
+
+    /* the LSP offers only a tree it stored as complete */
+    factory_set_root_advance_pending(&r.lsp->factory, 2, 0);
+    cJSON *none = lsp_build_tree_catchup(r.mgr, r.lsp, 1);
+    factory_clear_root_advance_pending(&r.lsp->factory);
+    TEST_ASSERT(!none, "no catch-up while the LSP has a root advance pending");
+    TEST_ASSERT(!lsp_build_tree_catchup(r.mgr, r.lsp, 2), "no catch-up for another epoch");
+    cJSON *cu = lsp_build_tree_catchup(r.mgr, r.lsp, 1);
+    TEST_ASSERT(cu, "catch-up built from the stored tree");
+    cJSON *nodes = cJSON_GetObjectItem(cu, "nodes");
+    int nn = cJSON_GetArraySize(nodes);
+
+    int fr = 0, a = 0;
+    /* one bad signature */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON *o = cJSON_GetArrayItem(cJSON_GetObjectItem(t, "nodes"), nn - 1);
+        char *h = strdup(cJSON_GetObjectItem(o, "tx")->valuestring);
+        size_t hl = strlen(h);
+        h[hl - 8 - 40] = (h[hl - 8 - 40] == '0') ? '1' : '0';
+        cJSON_ReplaceItemInObject(o, "tx", cJSON_CreateString(h));
+        free(h);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  bad signature: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "bad signature refused");
+    }
+    /* two nodes swapped */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON *ar = cJSON_GetObjectItem(t, "nodes");
+        cJSON *o0 = cJSON_GetArrayItem(ar, nn - 1), *o1 = cJSON_GetArrayItem(ar, nn - 2);
+        char *h0 = strdup(cJSON_GetObjectItem(o0, "tx")->valuestring);
+        char *h1 = strdup(cJSON_GetObjectItem(o1, "tx")->valuestring);
+        cJSON_ReplaceItemInObject(o0, "tx", cJSON_CreateString(h1));
+        cJSON_ReplaceItemInObject(o1, "tx", cJSON_CreateString(h0));
+        free(h0); free(h1);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  swapped nodes: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "swapped nodes refused");
+    }
+    /* wrong epoch */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON_ReplaceItemInObject(t, "epoch", cJSON_CreateNumber(2));
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  wrong epoch: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "wrong epoch refused");
+    }
+    /* partial */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON_DeleteItemFromArray(cJSON_GetObjectItem(t, "nodes"), 0);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  partial: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "partial refused");
+    }
+    /* oversized TX */
+    {
+        cJSON *t = cJSON_Duplicate(cu, 1);
+        cJSON *o = cJSON_GetArrayItem(cJSON_GetObjectItem(t, "nodes"), 0);
+        size_t big = WIRE_TREE_CATCHUP_MAX_TX_HEX + 2;
+        char *h = malloc(big + 1);
+        memset(h, 'a', big);
+        h[big] = 0;
+        cJSON_ReplaceItemInObject(o, "tx", cJSON_CreateString(h));
+        free(h);
+        a = rl_try_catchup(&r, t, &fr);
+        cJSON_Delete(t);
+        printf("  oversized: applied=%d, still frozen=%d\n", a, fr);
+        TEST_ASSERT(a == 0 && fr, "oversized refused");
+    }
+    TEST_ASSERT(persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL) == 1,
+                "the mark is still stored after the refusals");
+
+    /* the real catch-up */
+    a = rl_try_catchup(&r, cu, &fr);
+    cJSON_Delete(cu);
+    int mark = persist_load_root_advance_pending(&r.cdb, 0, NULL, NULL);
+    printf("  stored tree: applied=%d, client 1 epoch %u frozen=%d, mark %d\n", a,
+           r.cf->counter.current_epoch, factory_root_advance_frozen(r.cf), mark);
+    TEST_ASSERT(a == 1 && r.cf->counter.current_epoch == 1 &&
+                !factory_root_advance_frozen(r.cf), "caught up to epoch 1");
+    TEST_ASSERT(mark == 0, "mark cleared with the stored tree");
+    TEST_ASSERT(memcmp(r.cf->nodes[r.cf->leaf_node_indices[0]].txid,
+                       r.lsp->factory.nodes[r.lsp->factory.leaf_node_indices[0]].txid,
+                       32) == 0, "client 1 holds the LSP's epoch-1 leaf");
+    rc = rl_advance2(&r, &c2, &ok1, &ok2);
+    printf("  leaf advance at epoch 1 after the catch-up: rc=%d\n", rc);
+    TEST_ASSERT(rc == 1 && ok1, "leaf operations resume");
     client_set_persist(NULL);
     alarm(0);
     rl_cli2_free(&c2);
