@@ -1464,6 +1464,11 @@ extern int test_factory_and_commitment_entries(void);
 extern int test_htlc_penalty_watch(void);
 extern int test_ptlc_penalty_watch(void);
 
+/* Watchtower capacity + registration failure (growable table) */
+extern int test_watchtower_watches_1000_revoked_commitments(void);
+extern int test_watchtower_failed_registration_keeps_last_entry(void);
+extern int test_watchtower_rebuild_grows_htlc_array(void);
+
 /* CPFP Anchor System */
 extern int test_penalty_tx_has_anchor(void);
 extern int test_htlc_penalty_tx_has_anchor(void);
@@ -3356,6 +3361,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_and_commitment_entries);
     RUN_TEST(test_htlc_penalty_watch);
     RUN_TEST(test_ptlc_penalty_watch);
+
+    printf("\n=== Watchtower Capacity ===\n");
+    RUN_TEST(test_watchtower_watches_1000_revoked_commitments);
+    RUN_TEST(test_watchtower_failed_registration_keeps_last_entry);
+    RUN_TEST(test_watchtower_rebuild_grows_htlc_array);
 
     printf("\n=== CPFP Anchor System ===\n");
     RUN_TEST(test_penalty_tx_has_anchor);

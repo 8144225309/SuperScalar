@@ -3222,6 +3222,66 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
     return count;
 }
 
+int persist_load_all_old_commitments(persist_t *p,
+                                     persist_old_commitment_row_t **rows_out,
+                                     size_t *n_out) {
+    if (!rows_out || !n_out) return 0;
+    *rows_out = NULL;
+    *n_out = 0;
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT channel_id, commit_num, txid, to_local_vout, to_local_amount, "
+        "       to_local_spk, csv_delay "
+        "FROM old_commitments ORDER BY channel_id ASC, commit_num ASC;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    persist_old_commitment_row_t *rows = NULL;
+    size_t n = 0, cap = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n == cap) {
+            size_t new_cap = cap ? cap * 2 : 64;
+            persist_old_commitment_row_t *tmp =
+                realloc(rows, new_cap * sizeof(*rows));
+            if (!tmp) {
+                sqlite3_finalize(stmt);
+                free(rows);
+                return 0;
+            }
+            rows = tmp;
+            cap = new_cap;
+        }
+        persist_old_commitment_row_t *r = &rows[n];
+        memset(r, 0, sizeof(*r));
+        r->channel_id = (uint32_t)sqlite3_column_int(stmt, 0);
+        r->commit_num = (uint64_t)sqlite3_column_int64(stmt, 1);
+        const char *txid_hex = (const char *)sqlite3_column_text(stmt, 2);
+        if (txid_hex)
+            hex_decode(txid_hex, r->txid, 32);
+        r->to_local_vout = (uint32_t)sqlite3_column_int(stmt, 3);
+        r->to_local_amount = (uint64_t)sqlite3_column_int64(stmt, 4);
+        const char *spk_hex = (const char *)sqlite3_column_text(stmt, 5);
+        if (spk_hex) {
+            int decoded = hex_decode(spk_hex, r->to_local_spk, 34);
+            r->to_local_spk_len = decoded > 0 ? (size_t)decoded : 0;
+        }
+        r->csv_delay = (uint32_t)sqlite3_column_int(stmt, 6);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        free(rows);
+        return 0;
+    }
+    *rows_out = rows;
+    *n_out = n;
+    return 1;
+}
+
 /* --- v25: pre-built penalty TX bytes (closes restart-loses-defense gap) --- */
 
 int persist_save_old_commitment_witness(persist_t *p, uint32_t channel_id,

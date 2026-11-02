@@ -428,6 +428,26 @@ int persist_save_old_commitment_csv_delay(persist_t *p, uint32_t channel_id,
                                             uint64_t commit_num,
                                             uint32_t csv_delay);
 
+/* One old_commitments row (see persist_load_all_old_commitments). */
+typedef struct {
+    uint32_t channel_id;
+    uint64_t commit_num;
+    unsigned char txid[32];
+    uint32_t to_local_vout;
+    uint64_t to_local_amount;
+    unsigned char to_local_spk[34];
+    size_t to_local_spk_len;
+    uint32_t csv_delay;
+} persist_old_commitment_row_t;
+
+/* Load every old_commitments row, for all channels, with no cap, ordered by
+   (channel_id, commit_num).  *rows_out is heap-allocated (caller frees; NULL
+   when there are no rows).  Returns 1 on success (including zero rows), 0 on
+   a DB or allocation error. */
+int persist_load_all_old_commitments(persist_t *p,
+                                     persist_old_commitment_row_t **rows_out,
+                                     size_t *n_out);
+
 /* Load old commitments for a channel. Returns count loaded.
    csv_delays parameter (v32+) may be NULL for legacy callers; 0 = unset. */
 size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,

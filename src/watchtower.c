@@ -62,6 +62,37 @@ static bool penalty_tx_has_p2a_anchor(const unsigned char *tx, size_t len)
     return memcmp(&tx[off], P2A_SPK, P2A_SPK_LEN) == 0;
 }
 
+/* Return a zeroed slot at wt->entries[wt->n_entries], growing the table
+   (doubling) when it is full.  The caller fills the slot and then increments
+   n_entries.  Returns NULL only when the table cannot grow (out of memory);
+   existing entries are untouched in that case.  Every entry type goes through
+   here, so a reused slot never carries pointers left over from an entry that
+   was removed with the swap-with-last pattern. */
+static watchtower_entry_t *wt_reserve_entry(watchtower_t *wt)
+{
+    if (wt->n_entries >= wt->entries_cap) {
+        size_t new_cap = wt->entries_cap ? wt->entries_cap * 2
+                                         : WATCHTOWER_INITIAL_WATCH_CAP;
+        if (new_cap <= wt->entries_cap ||
+            new_cap > SIZE_MAX / sizeof(watchtower_entry_t))
+            return NULL;
+        void *(*grow)(void *, size_t) =
+            wt->entries_realloc ? wt->entries_realloc : realloc;
+        watchtower_entry_t *tmp =
+            grow(wt->entries, new_cap * sizeof(watchtower_entry_t));
+        if (!tmp) {
+            fprintf(stderr, "watchtower: CRITICAL: cannot grow the watch table "
+                    "beyond %zu entries (out of memory)\n", wt->entries_cap);
+            return NULL;
+        }
+        wt->entries = tmp;
+        wt->entries_cap = new_cap;
+    }
+    watchtower_entry_t *e = &wt->entries[wt->n_entries];
+    memset(e, 0, sizeof(*e));
+    return e;
+}
+
 int watchtower_init(watchtower_t *wt, size_t n_channels,
                       regtest_t *rt, fee_estimator_t *fee, persist_t *db) {
     if (!wt) return 0;
@@ -69,7 +100,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
 
     /* Allocate dynamic arrays */
     size_t ch_cap = n_channels < WATCHTOWER_MAX_CHANNELS ? WATCHTOWER_MAX_CHANNELS : n_channels;
-    wt->entries = calloc(WATCHTOWER_MAX_WATCH, sizeof(watchtower_entry_t));
+    wt->entries = calloc(WATCHTOWER_INITIAL_WATCH_CAP, sizeof(watchtower_entry_t));
     wt->channels = calloc(ch_cap, sizeof(channel_t *));
     wt->pending = calloc(WATCHTOWER_MAX_PENDING, sizeof(watchtower_pending_t));
     if (!wt->entries || !wt->channels || !wt->pending) {
@@ -77,7 +108,7 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
         memset(wt, 0, sizeof(*wt));
         return 0;
     }
-    wt->entries_cap = WATCHTOWER_MAX_WATCH;
+    wt->entries_cap = WATCHTOWER_INITIAL_WATCH_CAP;
     wt->channels_cap = ch_cap;
     wt->pending_cap = WATCHTOWER_MAX_PENDING;
     wt->n_channels = n_channels < ch_cap ? n_channels : ch_cap;
@@ -99,91 +130,87 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     memcpy(wt->anchor_spk, P2A_SPK, P2A_SPK_LEN);
     wt->anchor_spk_len = P2A_SPK_LEN;
 
-    /* Load old commitments from DB if available.
-       Loop up to channels_cap (not n_channels) so we also reload entries
-       for JIT channels which are stored at indices >= n_channels. */
+    /* Re-arm every revoked commitment persisted in old_commitments, for every
+       channel id (JIT channels live at ids >= n_channels) and with no cap: the
+       DB is the source of truth for what must be watched.  This used to stop
+       at 128 rows, oldest first, and only looked at ids below channels_cap,
+       so after a restart the newest revoked commitments went unwatched. */
     if (db && db->db) {
-        for (size_t c = 0; c < wt->channels_cap; c++) {
-            uint64_t commit_nums[WATCHTOWER_MAX_WATCH];
-            unsigned char txids[WATCHTOWER_MAX_WATCH][32];
-            uint32_t vouts[WATCHTOWER_MAX_WATCH];
-            uint64_t amounts[WATCHTOWER_MAX_WATCH];
-            unsigned char spks[WATCHTOWER_MAX_WATCH][34];
-            size_t spk_lens[WATCHTOWER_MAX_WATCH];
-            uint32_t csv_delays[WATCHTOWER_MAX_WATCH];
+        persist_old_commitment_row_t *rows = NULL;
+        size_t n_rows = 0;
+        if (!persist_load_all_old_commitments(db, &rows, &n_rows))
+            fprintf(stderr, "watchtower: CRITICAL: could not load revoked "
+                    "commitments from the DB; they are NOT being watched\n");
+        watchtower_htlc_t *tmp_htlcs = n_rows > 0
+            ? malloc(MAX_HTLCS * sizeof(watchtower_htlc_t)) : NULL;
+        if (n_rows > 0 && !tmp_htlcs)
+            fprintf(stderr, "watchtower: CRITICAL: out of memory loading HTLC "
+                    "outputs of revoked commitments; HTLC sweeps disabled\n");
 
-            size_t loaded = persist_load_old_commitments(
-                db, (uint32_t)c, commit_nums, txids, vouts, amounts,
-                spks, spk_lens, csv_delays,
-                wt->entries_cap - wt->n_entries);
+        for (size_t i = 0; i < n_rows; i++) {
+            const persist_old_commitment_row_t *r = &rows[i];
+            watchtower_entry_t *e = wt_reserve_entry(wt);
+            if (!e) {
+                fprintf(stderr, "watchtower: CRITICAL: re-armed only %zu of %zu "
+                        "revoked commitments (out of memory)\n", i, n_rows);
+                break;
+            }
+            wt->n_entries++;
+            e->type = WATCH_COMMITMENT;
+            e->channel_id = r->channel_id;
+            e->commit_num = r->commit_num;
+            memcpy(e->txid, r->txid, 32);
+            /* DB-loaded entries: registered_height = 0 so that late-arrival
+               breach detection works (breach confirmed during downtime).
+               Fresh entries set registered_height in watchtower_watch(). */
+            e->registered_height = 0;
+            e->to_local_vout = r->to_local_vout;
+            e->to_local_amount = r->to_local_amount;
+            memcpy(e->to_local_spk, r->to_local_spk, r->to_local_spk_len);
+            e->to_local_spk_len = r->to_local_spk_len;
+            /* v32 (SF-WTC #149): hydrate csv_delay so oracular CPFP can
+               read it after restart without live channel state. */
+            e->csv_delay = r->csv_delay;
 
-            for (size_t i = 0; i < loaded && wt->n_entries < wt->entries_cap; i++) {
-                watchtower_entry_t *e = &wt->entries[wt->n_entries++];
-                e->type = WATCH_COMMITMENT;
-                e->channel_id = (uint32_t)c;
-                e->commit_num = commit_nums[i];
-                memcpy(e->txid, txids[i], 32);
-                /* DB-loaded entries: registered_height = 0 so that late-arrival
-                   breach detection works (breach confirmed during downtime).
-                   Fresh entries set registered_height in watchtower_watch(). */
-                e->registered_height = 0;
-                e->to_local_vout = vouts[i];
-                e->to_local_amount = amounts[i];
-                memcpy(e->to_local_spk, spks[i], spk_lens[i]);
-                e->to_local_spk_len = spk_lens[i];
-                /* v32 (SF-WTC #149): hydrate csv_delay so oracular CPFP can
-                   read it after restart without live channel state. */
-                e->csv_delay = csv_delays[i];
+            /* Re-register the watched script with the chain backend so
+               BIP 158 scanning resumes correctly after a process restart. */
+            if (wt->chain && wt->chain->register_script && r->to_local_spk_len > 0)
+                wt->chain->register_script(wt->chain,
+                                           e->to_local_spk, e->to_local_spk_len);
 
-                /* Re-register the watched script with the chain backend so
-                   BIP 158 scanning resumes correctly after a process restart. */
-                if (wt->chain && wt->chain->register_script && spk_lens[i] > 0)
-                    wt->chain->register_script(wt->chain,
-                                               e->to_local_spk, e->to_local_spk_len);
-
-                e->n_htlc_outputs = 0;
-                e->response_tx = NULL;
-                e->response_tx_len = 0;
-                e->signed_penalty_tx = NULL;
-                e->signed_penalty_tx_len = 0;
-
-                /* v25 restart-defense load: pull the pre-built penalty TX
-                   bytes if they were persisted.  Without this, the oracular
-                   fast-path skips broadcast post-restart and the channel goes
-                   undefended.  rc=0 (row exists, column empty) is the legacy
-                   fallback path — leaves signed_penalty_tx NULL and channel_t
-                   re-attaches later via watchtower_set_channel. */
-                if (db && db->db) {
-                    unsigned char *bytes = NULL;
-                    size_t blen = 0;
-                    if (persist_load_old_commitment_witness(db, (uint32_t)c,
-                            commit_nums[i], &bytes, &blen) == 1
-                        && bytes && blen > 0) {
-                        e->signed_penalty_tx = bytes;
-                        e->signed_penalty_tx_len = blen;
-                    }
+            /* v25 restart-defense load: pull the pre-built penalty TX
+               bytes if they were persisted.  Without this, the oracular
+               fast-path skips broadcast post-restart and the channel goes
+               undefended.  rc=0 (row exists, column empty) is the legacy
+               fallback path and leaves signed_penalty_tx NULL. */
+            {
+                unsigned char *bytes = NULL;
+                size_t blen = 0;
+                if (persist_load_old_commitment_witness(db, r->channel_id,
+                        r->commit_num, &bytes, &blen) == 1
+                    && bytes && blen > 0) {
+                    e->signed_penalty_tx = bytes;
+                    e->signed_penalty_tx_len = blen;
                 }
+            }
 
-                /* Load persisted HTLC output data for this commitment */
-                if (db && db->db) {
-                    watchtower_htlc_t *tmp_htlcs = malloc(MAX_HTLCS * sizeof(watchtower_htlc_t));
-                    if (!tmp_htlcs) return 0;
-                    size_t n_loaded_htlcs = persist_load_old_commitment_htlcs(
-                        db, (uint32_t)c, commit_nums[i],
-                        tmp_htlcs, MAX_HTLCS);
-                    if (n_loaded_htlcs > 0) {
-                        e->htlc_outputs = calloc(n_loaded_htlcs, sizeof(watchtower_htlc_t));
-                        if (e->htlc_outputs) {
-                            memcpy(e->htlc_outputs, tmp_htlcs,
-                                   n_loaded_htlcs * sizeof(watchtower_htlc_t));
-                            e->n_htlc_outputs = n_loaded_htlcs;
-                            e->htlc_outputs_cap = n_loaded_htlcs;
-                        }
+            /* Load persisted HTLC output data for this commitment */
+            if (tmp_htlcs) {
+                size_t n_loaded_htlcs = persist_load_old_commitment_htlcs(
+                    db, r->channel_id, r->commit_num, tmp_htlcs, MAX_HTLCS);
+                if (n_loaded_htlcs > 0) {
+                    e->htlc_outputs = calloc(n_loaded_htlcs, sizeof(watchtower_htlc_t));
+                    if (e->htlc_outputs) {
+                        memcpy(e->htlc_outputs, tmp_htlcs,
+                               n_loaded_htlcs * sizeof(watchtower_htlc_t));
+                        e->n_htlc_outputs = n_loaded_htlcs;
+                        e->htlc_outputs_cap = n_loaded_htlcs;
                     }
-                    free(tmp_htlcs);
                 }
             }
         }
+        free(tmp_htlcs);
+        free(rows);
 
         /* Load pending penalty entries for CPFP bump tracking */
         char pending_txids[WATCHTOWER_MAX_PENDING][65];
@@ -241,9 +268,14 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
             WT_FC_MAX_WATCHES, WT_FC_MAX_HTLCS_TOTAL);
 
         size_t htlc_cursor = 0;
-        for (size_t w = 0; w < n_fc && wt->n_entries < wt->entries_cap; w++) {
-            watchtower_entry_t *e = &wt->entries[wt->n_entries++];
-            memset(e, 0, sizeof(*e));
+        for (size_t w = 0; w < n_fc; w++) {
+            watchtower_entry_t *e = wt_reserve_entry(wt);
+            if (!e) {
+                fprintf(stderr, "watchtower: CRITICAL: re-armed only %zu of %zu "
+                        "force-close watches (out of memory)\n", w, n_fc);
+                break;
+            }
+            wt->n_entries++;
             e->type = WATCH_FORCE_CLOSE;
             e->channel_id = fc_channels[w];
             memcpy(e->txid, fc_txids[w], 32);
@@ -275,15 +307,42 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
 
 /* watchtower_set_channel removed in #208 A3.2 — see oracular API. */
 
-int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
-                       uint64_t commit_num, const unsigned char *txid32,
-                       uint32_t to_local_vout, uint64_t to_local_amount,
-                       const unsigned char *to_local_spk, size_t spk_len) {
+/* Register a commitment watch.  The old_commitments row is written first and
+   independently of the in-memory table, so a restart re-arms the watch even
+   when the in-memory insert fails.  *entry_out (optional) receives the new
+   in-memory entry, or NULL when none was added.  Returns 1 only when the
+   entry is in memory and, if a DB is attached, its row was written. */
+static int wt_add_commitment_watch(watchtower_t *wt, uint32_t channel_id,
+                                   uint64_t commit_num,
+                                   const unsigned char *txid32,
+                                   uint32_t to_local_vout,
+                                   uint64_t to_local_amount,
+                                   const unsigned char *to_local_spk,
+                                   size_t spk_len,
+                                   watchtower_entry_t **entry_out) {
+    if (entry_out) *entry_out = NULL;
     if (!wt || !txid32 || !to_local_spk) return 0;
-    if (wt->n_entries >= wt->entries_cap) return 0;
     if (spk_len > 34) return 0;
 
-    watchtower_entry_t *e = &wt->entries[wt->n_entries++];
+    int ok = 1;
+    if (wt->db && wt->db->db &&
+        !persist_save_old_commitment(wt->db, channel_id, commit_num,
+                                     txid32, to_local_vout, to_local_amount,
+                                     to_local_spk, spk_len)) {
+        fprintf(stderr, "watchtower: CRITICAL: could not persist the watch for "
+                "commitment %llu (channel %u); it would not survive a restart\n",
+                (unsigned long long)commit_num, channel_id);
+        ok = 0;
+    }
+
+    watchtower_entry_t *e = wt_reserve_entry(wt);
+    if (!e) {
+        fprintf(stderr, "watchtower: CRITICAL: no room to watch commitment %llu "
+                "(channel %u)%s\n", (unsigned long long)commit_num, channel_id,
+                (ok && wt->db && wt->db->db)
+                    ? "; its DB row is written, a restart re-arms it" : "");
+        return 0;
+    }
     e->type = WATCH_COMMITMENT;
     e->channel_id = channel_id;
     e->commit_num = commit_num;
@@ -295,29 +354,26 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     e->to_local_amount = to_local_amount;
     memcpy(e->to_local_spk, to_local_spk, spk_len);
     e->to_local_spk_len = spk_len;
-    /* v32 (SF-WTC): unset by default; populated post-watch by callers that
-       have live channel access (watchtower_watch_revoked_commitment etc.),
-       or hydrated from DB at restart by persist_load_watchtower_entries. */
-    e->csv_delay = 0;
-    e->n_htlc_outputs = 0;
-    e->response_tx = NULL;
-    e->response_tx_len = 0;
-    /* Oracular bytes start NULL — set by watchtower_watch_oracular wrapper. */
-    e->signed_penalty_tx = NULL;
-    e->signed_penalty_tx_len = 0;
-
-    /* Persist if DB available */
-    if (wt->db && wt->db->db) {
-        persist_save_old_commitment(wt->db, channel_id, commit_num,
-                                      txid32, to_local_vout, to_local_amount,
-                                      to_local_spk, spk_len);
-    }
+    /* v32 (SF-WTC): csv_delay stays 0 ("unset") here; callers with live
+       channel access (watchtower_watch_revoked_commitment) stamp it, and the
+       restart loader hydrates it from the DB. */
+    wt->n_entries++;
 
     /* Register script with chain backend (no-op for TXID-polling backend) */
     if (wt->chain && wt->chain->register_script)
         wt->chain->register_script(wt->chain, to_local_spk, spk_len);
 
-    return 1;
+    if (entry_out) *entry_out = e;
+    return ok;
+}
+
+int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
+                       uint64_t commit_num, const unsigned char *txid32,
+                       uint32_t to_local_vout, uint64_t to_local_amount,
+                       const unsigned char *to_local_spk, size_t spk_len) {
+    return wt_add_commitment_watch(wt, channel_id, commit_num, txid32,
+                                   to_local_vout, to_local_amount,
+                                   to_local_spk, spk_len, NULL);
 }
 
 int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
@@ -329,46 +385,103 @@ int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
                                 size_t spk_len,
                                 const unsigned char *signed_penalty_tx,
                                 size_t signed_penalty_tx_len) {
-    /* Register the entry via the legacy path so persist + script
-       registration stay identical, then attach pre-signed bytes onto
-       the just-added entry.  Falls back to legacy lazy-build path
-       transparently when caller passes NULL bytes. */
-    if (!watchtower_watch(wt, channel_id, commit_num, txid32,
-                            to_local_vout, to_local_amount,
-                            to_local_spk, spk_len))
+    /* Register the entry via the common path so persist + script
+       registration stay identical, then attach pre-signed bytes onto the
+       entry that call returned (never onto "the last entry", which belongs
+       to someone else when registration failed).  Falls back to the legacy
+       lazy-build path transparently when the caller passes NULL bytes. */
+    watchtower_entry_t *e = NULL;
+    int ok = wt_add_commitment_watch(wt, channel_id, commit_num, txid32,
+                                     to_local_vout, to_local_amount,
+                                     to_local_spk, spk_len, &e);
+    if (!e)
         return 0;
     if (signed_penalty_tx && signed_penalty_tx_len > 0) {
-        watchtower_entry_t *e = &wt->entries[wt->n_entries - 1];
         unsigned char *copy = malloc(signed_penalty_tx_len);
         if (!copy) return 0;
         memcpy(copy, signed_penalty_tx, signed_penalty_tx_len);
-        /* Defensive: free any stray pointer (shouldn't exist on a fresh
-           entry just allocated by watchtower_watch, but the swap-with-last
-           deletion pattern means we cannot universally trust slot zero-ness
-           without a memset). */
-        free(e->signed_penalty_tx);
         e->signed_penalty_tx = copy;
         e->signed_penalty_tx_len = signed_penalty_tx_len;
         /* v25: persist the pre-built bytes so they survive LSP restart.
            Without this, the restart loader can't reattach the bytes, the
            oracular fast-path skips broadcast, and the channel goes
            undefended. */
-        if (wt->db && wt->db->db)
-            persist_save_old_commitment_witness(wt->db, channel_id, commit_num,
-                                                  signed_penalty_tx,
-                                                  signed_penalty_tx_len);
+        if (wt->db && wt->db->db &&
+            !persist_save_old_commitment_witness(wt->db, channel_id, commit_num,
+                                                 signed_penalty_tx,
+                                                 signed_penalty_tx_len))
+            ok = 0;
     }
-    return 1;
+    return ok;
 }
 
-void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
-                                           uint32_t channel_id,
-                                           uint64_t old_commit_num,
-                                           uint64_t old_local, uint64_t old_remote,
-                                           const htlc_t *old_htlcs, size_t old_n_htlcs,
-                                           const ptlc_t *old_ptlcs, size_t old_n_ptlcs) {
-    if (!wt)
-        return;
+/* Write a commitment's HTLC/PTLC output rows.  Joins the caller's open
+   transaction if there is one (BEGIN would fail inside it and the rows used
+   to be skipped silently), otherwise runs its own.  Returns 1 on success. */
+static int wt_persist_outputs(watchtower_t *wt, uint32_t channel_id,
+                              uint64_t commit_num,
+                              const watchtower_htlc_t *outs, size_t n_outs,
+                              int is_ptlc) {
+    if (!wt->db || !wt->db->db || n_outs == 0) return 1;
+    int own_txn = !persist_in_transaction(wt->db);
+    if (own_txn && !persist_begin(wt->db)) return 0;
+    int ok = 1;
+    for (size_t i = 0; ok && i < n_outs; i++) {
+        ok = is_ptlc
+            ? persist_save_old_commitment_ptlc(wt->db, channel_id, commit_num, &outs[i])
+            : persist_save_old_commitment_htlc(wt->db, channel_id, commit_num, &outs[i]);
+    }
+    if (own_txn) {
+        if (ok)
+            ok = persist_commit(wt->db);
+        else
+            persist_rollback(wt->db);
+    }
+    return ok;
+}
+
+/* Shared body of watchtower_watch_revoked_commitment[_oracular].  When
+   override_penalty is non-NULL it replaces the penalty TX built here. */
+static int wt_watch_revoked_impl(watchtower_t *wt, channel_t *ch,
+                                 uint32_t channel_id,
+                                 uint64_t old_commit_num,
+                                 uint64_t old_local, uint64_t old_remote,
+                                 const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                 const ptlc_t *old_ptlcs, size_t old_n_ptlcs,
+                                 const unsigned char *override_penalty,
+                                 size_t override_penalty_len) {
+    if (!wt || !ch)
+        return 0;
+    if (!old_htlcs) old_n_htlcs = 0;
+    if (!old_ptlcs) old_n_ptlcs = 0;
+
+    /* The snapshot is copied into ch->htlcs / ch->ptlcs below to rebuild
+       the old commitment.  Grow those arrays first.  Copying past their
+       capacity overflowed the heap, and rebuilding without the PTLCs (the old
+       fallback on allocation failure) produced a different txid, so the watch
+       was registered for a transaction that can never appear on chain. */
+    if (old_n_htlcs > ch->htlcs_cap) {
+        htlc_t *grown = realloc(ch->htlcs, old_n_htlcs * sizeof(htlc_t));
+        if (!grown) {
+            fprintf(stderr, "watchtower: CRITICAL: out of memory rebuilding "
+                    "revoked commitment %llu (channel %u, %zu HTLCs); NOT watched\n",
+                    (unsigned long long)old_commit_num, channel_id, old_n_htlcs);
+            return 0;
+        }
+        ch->htlcs = grown;
+        ch->htlcs_cap = old_n_htlcs;
+    }
+    if (old_n_ptlcs > ch->ptlcs_cap) {
+        ptlc_t *grown = realloc(ch->ptlcs, old_n_ptlcs * sizeof(ptlc_t));
+        if (!grown) {
+            fprintf(stderr, "watchtower: CRITICAL: out of memory rebuilding "
+                    "revoked commitment %llu (channel %u, %zu PTLCs); NOT watched\n",
+                    (unsigned long long)old_commit_num, channel_id, old_n_ptlcs);
+            return 0;
+        }
+        ch->ptlcs = grown;
+        ch->ptlcs_cap = old_n_ptlcs;
+    }
 
     /* Save current state (HTLC + PTLC — the old commitment may have had
      * different active HTLCs/PTLCs than the current channel state) */
@@ -378,16 +491,15 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     size_t saved_n_htlcs = ch->n_htlcs;
     htlc_t *saved_htlcs = saved_n_htlcs > 0
         ? malloc(saved_n_htlcs * sizeof(htlc_t)) : NULL;
-    if (saved_n_htlcs > 0 && !saved_htlcs) return;
+    if (saved_n_htlcs > 0 && !saved_htlcs) return 0;
     if (saved_n_htlcs > 0)
         memcpy(saved_htlcs, ch->htlcs, saved_n_htlcs * sizeof(htlc_t));
-    /* SF-W-PTLC: also save PTLC state */
     size_t saved_n_ptlcs = ch->n_ptlcs;
     ptlc_t *saved_ptlcs = saved_n_ptlcs > 0
         ? malloc(saved_n_ptlcs * sizeof(ptlc_t)) : NULL;
     if (saved_n_ptlcs > 0 && !saved_ptlcs) {
         free(saved_htlcs);
-        return;
+        return 0;
     }
     if (saved_n_ptlcs > 0)
         memcpy(saved_ptlcs, ch->ptlcs, saved_n_ptlcs * sizeof(ptlc_t));
@@ -398,30 +510,12 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     ch->commitment_number = old_commit_num;
     ch->local_amount = old_local;
     ch->remote_amount = old_remote;
-    if (old_htlcs && old_n_htlcs > 0) {
-        ch->n_htlcs = old_n_htlcs;
+    ch->n_htlcs = old_n_htlcs;
+    if (old_n_htlcs > 0)
         memcpy(ch->htlcs, old_htlcs, old_n_htlcs * sizeof(htlc_t));
-    } else {
-        ch->n_htlcs = 0;
-    }
-    /* SF-W-PTLC: install old PTLCs so commitment-TX rebuild includes them */
-    if (old_ptlcs && old_n_ptlcs > 0) {
-        if (ch->ptlcs_cap < old_n_ptlcs) {
-            ptlc_t *new_arr = realloc(ch->ptlcs, old_n_ptlcs * sizeof(ptlc_t));
-            if (new_arr) {
-                ch->ptlcs = new_arr;
-                ch->ptlcs_cap = old_n_ptlcs;
-            }
-        }
-        if (ch->ptlcs && ch->ptlcs_cap >= old_n_ptlcs) {
-            ch->n_ptlcs = old_n_ptlcs;
-            memcpy(ch->ptlcs, old_ptlcs, old_n_ptlcs * sizeof(ptlc_t));
-        } else {
-            ch->n_ptlcs = 0;  /* alloc failed — degrade gracefully */
-        }
-    } else {
-        ch->n_ptlcs = 0;
-    }
+    ch->n_ptlcs = old_n_ptlcs;
+    if (old_n_ptlcs > 0)
+        memcpy(ch->ptlcs, old_ptlcs, old_n_ptlcs * sizeof(ptlc_t));
 
     /* Count active HTLCs + PTLCs for output parsing */
     size_t n_active_htlcs = 0;
@@ -451,29 +545,26 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     /* Build the REMOTE's old commitment TX — this is what the remote party
        (the potential cheater) would broadcast.  The watchtower has the
        revocation secrets needed to punish via the penalty TX. */
-    int ok = channel_build_commitment_tx_for_remote(ch, &old_tx, old_txid);
+    int built_old = channel_build_commitment_tx_for_remote(ch, &old_tx, old_txid);
 
-    /* Restore state (HTLCs + PTLCs) */
+    /* Restore state (HTLCs + PTLCs).  The arrays only grew above, so the
+       saved snapshots always fit. */
     ch->commitment_number = saved_num;
     ch->local_amount = saved_local;
     ch->remote_amount = saved_remote;
     ch->n_htlcs = saved_n_htlcs;
     if (saved_n_htlcs > 0)
         memcpy(ch->htlcs, saved_htlcs, saved_n_htlcs * sizeof(htlc_t));
-    /* SF-W-PTLC: restore PTLC state */
-    if (saved_n_ptlcs > 0 && saved_ptlcs && ch->ptlcs && ch->ptlcs_cap >= saved_n_ptlcs) {
-        ch->n_ptlcs = saved_n_ptlcs;
+    ch->n_ptlcs = saved_n_ptlcs;
+    if (saved_n_ptlcs > 0)
         memcpy(ch->ptlcs, saved_ptlcs, saved_n_ptlcs * sizeof(ptlc_t));
-    } else {
-        ch->n_ptlcs = 0;
-    }
 
-    if (!ok) {
-        tx_buf_free(&old_tx);
-        free(saved_htlcs);
-        free(saved_ptlcs);
-        return;
-    }
+    int result = 0;
+    watchtower_entry_t *entry = NULL;
+    watchtower_htlc_t *hout = NULL;   /* HTLC outputs, owned until attached */
+    watchtower_htlc_t *pout = NULL;   /* PTLC outputs, owned until attached */
+    size_t n_hout = 0, n_pout = 0;
+    unsigned char to_local_spk[34];
 
     /* Parse outputs from the unsigned raw tx.
      * Layout (no segwit marker/flag):
@@ -481,494 +572,508 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
      *   (32 prevhash + 4 vout + 1 scriptlen + 0 script + 4 sequence) = 41 vin bytes
      *   + 1 voutcount = 47 bytes offset to first output
      *   Each output: 8 amount (LE) + 1 spk_len + spk_len bytes */
-    if (old_tx.len > 60) {
-        size_t ofs = 4 + 1 + 41 + 1;  /* 47: offset to first output */
+    const size_t ofs = 4 + 1 + 41 + 1;  /* 47: offset to first output */
+    if (!built_old) {
+        fprintf(stderr, "watchtower: CRITICAL: could not rebuild revoked "
+                "commitment %llu (channel %u); NOT watched\n",
+                (unsigned long long)old_commit_num, channel_id);
+        goto done;
+    }
+    if (old_tx.len <= 60 || ofs + 8 + 1 + 34 > old_tx.len ||
+        old_tx.data[ofs + 8] != 34) {
+        fprintf(stderr, "watchtower: CRITICAL: rebuilt revoked commitment %llu "
+                "(channel %u) has no to_local output; NOT watched\n",
+                (unsigned long long)old_commit_num, channel_id);
+        goto done;
+    }
+    memcpy(to_local_spk, &old_tx.data[ofs + 9], 34);
 
-        /* Output 0: to_local */
-        if (ofs + 8 + 1 + 34 <= old_tx.len) {
-            uint8_t spk_len = old_tx.data[ofs + 8];
-            if (spk_len == 34) {
-                unsigned char to_local_spk[34];
-                memcpy(to_local_spk, &old_tx.data[ofs + 9], 34);
-                /* Remote commitment's to_local = peer's balance = old_remote */
-                watchtower_watch(wt, channel_id, old_commit_num,
-                                   old_txid, 0, old_remote,
-                                   to_local_spk, 34);
+    /* Output 0: to_local.  Remote commitment's to_local = peer's balance =
+       old_remote.  Everything below works on the entry this call returns
+       (or on the DB row), never on entries[n_entries - 1], which may be
+       another watch when the insert failed. */
+    result = wt_add_commitment_watch(wt, channel_id, old_commit_num,
+                                     old_txid, 0, old_remote,
+                                     to_local_spk, 34, &entry);
 
-                /* v32 SF-WTC #149: stamp csv_delay on the entry just registered
-                   (in-memory + DB) so the oracular CPFP path can drive escalation
-                   without needing live channel access at bump time. */
-                if (wt->n_entries > 0) {
-                    wt->entries[wt->n_entries - 1].csv_delay = ch->to_self_delay;
-                    if (wt->db && wt->db->db)
-                        persist_save_old_commitment_csv_delay(
-                            wt->db, channel_id, old_commit_num, ch->to_self_delay);
-                }
+    /* v32 SF-WTC #149: stamp csv_delay on the entry (in-memory + DB) so the
+       oracular CPFP path can drive escalation without needing live channel
+       access at bump time.  A missing value falls back to the default. */
+    if (entry)
+        entry->csv_delay = ch->to_self_delay;
+    if (wt->db && wt->db->db)
+        persist_save_old_commitment_csv_delay(wt->db, channel_id,
+                                              old_commit_num, ch->to_self_delay);
 
-                /* #208 A3.1b — pre-build the penalty TX bytes at registration
-                   time and attach to the entry we just created.  After this
-                   land, watchtower_check goes through the oracular fast-path
-                   (no channel_t deref) for every revoked-commitment entry.
-                   channel_build_penalty_tx is commit-state-independent (it
-                   looks up ch->received_revocations[old_commit_num] for the
-                   per-commitment secret), so it's safe to call after the
-                   channel state has been restored. */
-                if (wt->n_entries > 0) {
-                    watchtower_entry_t *just_added =
-                        &wt->entries[wt->n_entries - 1];
-                    int use_anchor = fee_should_use_anchor(wt->fee);
-                    tx_buf_t penalty;
-                    tx_buf_init(&penalty, 512);
-                    if (channel_build_penalty_tx(ch, &penalty,
-                            old_txid, 0, old_remote, to_local_spk, 34,
-                            old_commit_num,
-                            use_anchor ? wt->anchor_spk : NULL,
-                            use_anchor ? wt->anchor_spk_len : 0)) {
-                        unsigned char *copy = malloc(penalty.len);
-                        if (copy) {
-                            memcpy(copy, penalty.data, penalty.len);
-                            free(just_added->signed_penalty_tx);
-                            just_added->signed_penalty_tx = copy;
-                            just_added->signed_penalty_tx_len = penalty.len;
-                            /* v25: persist so LSP restart can reattach.  Without
-                               this, oracular fast-path post-restart sees NULL
-                               and skips broadcast. */
-                            if (wt->db && wt->db->db)
-                                persist_save_old_commitment_witness(
-                                    wt->db, channel_id, old_commit_num,
-                                    penalty.data, penalty.len);
-
-                            /* SF-WT-TRUSTLESS Phase 2c (#248): mirror penalty
-                               into wt_db for trustless WT consumption.  The
-                               penalty was just built using channel secrets;
-                               wt_db never sees the secrets, only the signed
-                               bytes that the WT broadcasts on breach. */
-                            if (wt->wt_db && wt->wt_db->db) {
-                                /* response_txid = wtxid of the signed penalty
-                                   (sha256d of full bytes).  Not the canonical
-                                   non-witness txid; wt_db uses it for
-                                   observability + indexing only, not for
-                                   chain matching (chain matching keys off
-                                   parent_txid). */
-                                unsigned char resp_txid[32];
-                                sha256_double(penalty.data, penalty.len,
-                                              resp_txid);
-                                /* hex-encode the bytes for storage. */
-                                size_t hex_buf_len = penalty.len * 2 + 1;
-                                char *hex = (char *)malloc(hex_buf_len);
-                                if (hex) {
-                                    hex_encode(penalty.data, penalty.len, hex);
-                                    int64_t wid = persist_wt_register_watch(
-                                        wt->wt_db,
-                                        WT_KIND_CHANNEL_COMMITMENT,
-                                        channel_id,
-                                        old_txid,
-                                        /* parent_vout      */ 0,
-                                        /* parent_value_sat */ old_remote,
-                                        to_local_spk,
-                                        /* parent_spk_len   */ 34,
-                                        /* csv_delay        */ ch->to_self_delay,
-                                        hex,
-                                        resp_txid,
-                                        /* fee_bump_budget  */ 0,
-                                        /* fee_bump_dline   */ 0);
-                                    free(hex);
-                                    if (wid > 0) {
-                                        fprintf(stderr,
-                                            "LSP-WT-TRUSTLESS: registered "
-                                            "commitment watch_id=%lld for "
-                                            "channel %u (commit_num=%llu, "
-                                            "to_local=%llu sats)\n",
-                                            (long long)wid, channel_id,
-                                            (unsigned long long)old_commit_num,
-                                            (unsigned long long)old_remote);
-                                    } else {
-                                        fprintf(stderr,
-                                            "LSP-WT-TRUSTLESS: WARN — wt_db "
-                                            "commitment register failed for "
-                                            "channel %u (commit_num=%llu)\n",
-                                            channel_id,
-                                            (unsigned long long)old_commit_num);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    tx_buf_free(&penalty);
+    /* #208 A3.1b — pre-build the penalty TX bytes at registration time so
+       watchtower_check goes through the oracular fast-path (no channel_t
+       deref).  channel_build_penalty_tx is commit-state-independent (it
+       looks up ch->received_revocations[old_commit_num] for the
+       per-commitment secret), so it's safe to call after the channel state
+       has been restored.  A build failure (e.g. a to_local below dust) is not
+       fatal: there is nothing to penalise on that output. */
+    {
+        int use_anchor = fee_should_use_anchor(wt->fee);
+        tx_buf_t penalty;
+        tx_buf_init(&penalty, 512);
+        int built = channel_build_penalty_tx(ch, &penalty,
+                old_txid, 0, old_remote, to_local_spk, 34,
+                old_commit_num,
+                use_anchor ? wt->anchor_spk : NULL,
+                use_anchor ? wt->anchor_spk_len : 0);
+        /* SF-WT-TRUSTLESS Phase 2c (#248): mirror penalty into wt_db for
+           trustless WT consumption.  The penalty was just built using
+           channel secrets; wt_db never sees the secrets, only the signed
+           bytes that the WT broadcasts on breach. */
+        if (built && wt->wt_db && wt->wt_db->db) {
+            /* response_txid = wtxid of the signed penalty (sha256d of full
+               bytes).  Not the canonical non-witness txid; wt_db uses it for
+               observability + indexing only, not for chain matching (chain
+               matching keys off parent_txid). */
+            unsigned char resp_txid[32];
+            sha256_double(penalty.data, penalty.len, resp_txid);
+            /* hex-encode the bytes for storage. */
+            size_t hex_buf_len = penalty.len * 2 + 1;
+            char *hex = (char *)malloc(hex_buf_len);
+            if (hex) {
+                hex_encode(penalty.data, penalty.len, hex);
+                int64_t wid = persist_wt_register_watch(
+                    wt->wt_db,
+                    WT_KIND_CHANNEL_COMMITMENT,
+                    channel_id,
+                    old_txid,
+                    /* parent_vout      */ 0,
+                    /* parent_value_sat */ old_remote,
+                    to_local_spk,
+                    /* parent_spk_len   */ 34,
+                    /* csv_delay        */ ch->to_self_delay,
+                    hex,
+                    resp_txid,
+                    /* fee_bump_budget  */ 0,
+                    /* fee_bump_dline   */ 0);
+                free(hex);
+                if (wid > 0) {
+                    fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: registered "
+                        "commitment watch_id=%lld for "
+                        "channel %u (commit_num=%llu, "
+                        "to_local=%llu sats)\n",
+                        (long long)wid, channel_id,
+                        (unsigned long long)old_commit_num,
+                        (unsigned long long)old_remote);
+                } else {
+                    fprintf(stderr,
+                        "LSP-WT-TRUSTLESS: WARN — wt_db "
+                        "commitment register failed for "
+                        "channel %u (commit_num=%llu)\n",
+                        channel_id,
+                        (unsigned long long)old_commit_num);
                 }
             }
         }
 
-        /* SF-W-PTLC: out_ofs lives at outer scope so the PTLC parsing block
-           below can pick up where HTLC parsing left off (PTLC outputs follow
-           HTLC outputs in the commitment TX layout). */
-        size_t out_ofs = ofs;
+        const unsigned char *pbytes = NULL;
+        size_t plen = 0;
+        if (override_penalty && override_penalty_len > 0) {
+            pbytes = override_penalty;
+            plen = override_penalty_len;
+        } else if (built) {
+            pbytes = penalty.data;
+            plen = penalty.len;
+        }
+        if (pbytes) {
+            /* v25: persist so LSP restart can reattach.  Without this, the
+               oracular fast-path post-restart sees NULL and skips broadcast. */
+            if (wt->db && wt->db->db &&
+                !persist_save_old_commitment_witness(wt->db, channel_id,
+                                                     old_commit_num, pbytes, plen)) {
+                fprintf(stderr, "watchtower: CRITICAL: could not persist the "
+                        "penalty TX for commitment %llu (channel %u)\n",
+                        (unsigned long long)old_commit_num, channel_id);
+                result = 0;
+            }
+            if (entry) {
+                unsigned char *copy = malloc(plen);
+                if (!copy) {
+                    fprintf(stderr, "watchtower: CRITICAL: out of memory "
+                            "attaching the penalty TX for commitment %llu "
+                            "(channel %u)\n",
+                            (unsigned long long)old_commit_num, channel_id);
+                    result = 0;
+                } else {
+                    memcpy(copy, pbytes, plen);
+                    free(entry->signed_penalty_tx);
+                    entry->signed_penalty_tx = copy;
+                    entry->signed_penalty_tx_len = plen;
+                }
+            }
+        }
+        tx_buf_free(&penalty);
+    }
 
-        /* If we have active HTLCs, parse their outputs (vout 2+) and store
-         * in the watchtower entry we just created */
-        if (n_active_htlcs > 0 && wt->n_entries > 0) {
-            watchtower_entry_t *entry = &wt->entries[wt->n_entries - 1];
-            entry->htlc_outputs = calloc(n_active_htlcs, sizeof(watchtower_htlc_t));
-            entry->htlc_outputs_cap = entry->htlc_outputs ? n_active_htlcs : 0;
-            entry->n_htlc_outputs = 0;
+    /* SF-W-PTLC: out_ofs lives at outer scope so the PTLC parsing block
+       below can pick up where HTLC parsing left off (PTLC outputs follow
+       HTLC outputs in the commitment TX layout). */
+    size_t out_ofs = ofs;
 
-            /* Skip output 0 and output 1 to reach HTLC outputs */
+    /* If we have active HTLCs, parse their outputs (vout 2+).  They are
+       collected in hout, persisted, and only then attached to the entry, so
+       the DB rows exist even when the in-memory insert failed. */
+    if (n_active_htlcs > 0) {
+        hout = calloc(n_active_htlcs, sizeof(watchtower_htlc_t));
+        if (!hout) {
+            fprintf(stderr, "watchtower: CRITICAL: out of memory recording the "
+                    "HTLC outputs of commitment %llu (channel %u)\n",
+                    (unsigned long long)old_commit_num, channel_id);
+            result = 0;
+            goto done;
+        }
+
+        /* Skip output 0 and output 1 to reach HTLC outputs */
+        for (uint32_t v = 0; v < 2; v++) {
+            if (out_ofs + 9 > old_tx.len) break;
+            uint8_t slen = old_tx.data[out_ofs + 8];
+            out_ofs += 8 + 1 + slen;
+        }
+
+        /* Parse HTLC outputs (vout 2, 3, ...) */
+        size_t htlc_active_idx = 0;
+        for (size_t i = 0; i < old_n_htlcs && htlc_active_idx < n_active_htlcs; i++) {
+            if (old_htlcs[i].state != HTLC_STATE_ACTIVE)
+                continue;
+
+            if (out_ofs + 8 + 1 > old_tx.len) break;
+            uint64_t amount = 0;
+            for (int b = 0; b < 8; b++)
+                amount |= ((uint64_t)old_tx.data[out_ofs + b]) << (b * 8);
+            uint8_t slen = old_tx.data[out_ofs + 8];
+            if (slen != 34 || out_ofs + 9 + slen > old_tx.len) {
+                out_ofs += 8 + 1 + slen;
+                htlc_active_idx++;
+                continue;
+            }
+
+            watchtower_htlc_t *wh = &hout[n_hout];
+            wh->htlc_vout = (uint32_t)(2 + htlc_active_idx);
+            wh->htlc_amount = amount;
+            memcpy(wh->htlc_spk, &old_tx.data[out_ofs + 9], 34);
+            wh->direction = old_htlcs[i].direction;
+            memcpy(wh->payment_hash, old_htlcs[i].payment_hash, 32);
+            wh->cltv_expiry = old_htlcs[i].cltv_expiry;
+            n_hout++;
+
+            /* Register HTLC script with chain backend */
+            if (wt->chain && wt->chain->register_script)
+                wt->chain->register_script(wt->chain, wh->htlc_spk, 34);
+
+            out_ofs += 8 + 1 + slen;
+            htlc_active_idx++;
+        }
+
+        /* Persist HTLC outputs if DB available (transactional) */
+        if (!wt_persist_outputs(wt, channel_id, old_commit_num, hout, n_hout, 0)) {
+            fprintf(stderr, "watchtower: CRITICAL: could not persist the HTLC "
+                    "outputs of commitment %llu (channel %u)\n",
+                    (unsigned long long)old_commit_num, channel_id);
+            result = 0;
+        }
+
+        /* v35 (#207): pre-build the signed HTLC sweep TX bytes at
+           registration time and persist them, mirroring the v25 pattern
+           for the to_local penalty TX above.  Closes the restart-loses-
+           HTLC-defense gap: after an LSP crash, watchtower_check no
+           longer needs live channel_t state to broadcast HTLC sweeps —
+           the bytes are durably on disk.  Also enables standalone-WT
+           operation (run superscalar_watchtower against the same DB).
+
+           channel_build_htlc_penalty_tx requires ch->htlcs[0] to carry
+           the HTLC metadata (direction, payment_hash, cltv_expiry) —
+           same shim watchtower_check uses on the lazy-build path. */
+        if (wt->db && wt->db->db && n_hout > 0) {
+            int use_anchor_h = fee_should_use_anchor(wt->fee);
+
+            /* Save + restore ch->htlcs[0] across the per-output build loop. */
+            size_t wt_saved_n = ch->n_htlcs;
+            htlc_t wt_saved_h0 = {0};
+            if (wt_saved_n > 0)
+                wt_saved_h0 = ch->htlcs[0];
+
+            for (size_t h = 0; h < n_hout; h++) {
+                watchtower_htlc_t *wh_h = &hout[h];
+
+                /* Shim ch->htlcs[0] like the watchtower_check sweep loop. */
+                ch->n_htlcs = 1;
+                memset(&ch->htlcs[0], 0, sizeof(htlc_t));
+                ch->htlcs[0].direction = wh_h->direction;
+                memcpy(ch->htlcs[0].payment_hash, wh_h->payment_hash, 32);
+                ch->htlcs[0].cltv_expiry = wh_h->cltv_expiry;
+                ch->htlcs[0].state = HTLC_STATE_ACTIVE;
+
+                tx_buf_t sweep;
+                tx_buf_init(&sweep, 512);
+                if (channel_build_htlc_penalty_tx(ch, &sweep,
+                        old_txid, wh_h->htlc_vout, wh_h->htlc_amount,
+                        wh_h->htlc_spk, 34, old_commit_num, 0,
+                        use_anchor_h ? wt->anchor_spk : NULL,
+                        use_anchor_h ? wt->anchor_spk_len : 0)) {
+                    persist_save_old_commitment_htlc_sweep(
+                        wt->db, channel_id, old_commit_num,
+                        wh_h->htlc_vout, sweep.data, sweep.len);
+                    /* G2 #45: mirror the HTLC penalty sweep into wt_db so a
+                       SECRET-LESS standalone WT also sweeps in-flight HTLCs on
+                       a commitment breach (without this it penalizes to_local
+                       but leaks HTLC value).  Keyed on the breach commit txid;
+                       same pattern + sha256_double(resp) txid as the to_local
+                       mirror above. */
+                    if (wt->wt_db && wt->wt_db->db) {
+                        unsigned char h_resp_txid[32];
+                        sha256_double(sweep.data, sweep.len, h_resp_txid);
+                        char *h_hex = (char *)malloc(sweep.len * 2 + 1);
+                        if (h_hex) {
+                            hex_encode(sweep.data, sweep.len, h_hex);
+                            int64_t hwid = persist_wt_register_watch(
+                                wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
+                                channel_id, old_txid,
+                                wh_h->htlc_vout, wh_h->htlc_amount,
+                                wh_h->htlc_spk, 34,
+                                ch->to_self_delay,
+                                h_hex, h_resp_txid, 0, 0);
+                            free(h_hex);
+                            if (hwid <= 0)
+                                fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                    "HTLC-sweep register failed (ch %u vout %u)\n",
+                                    channel_id, wh_h->htlc_vout);
+                        }
+                    }
+                } else {
+                    fprintf(stderr,
+                            "watchtower: failed to build HTLC sweep TX "
+                            "(vout %u) at registration time — restart "
+                            "defense will fall back to lazy build\n",
+                            wh_h->htlc_vout);
+                }
+                tx_buf_free(&sweep);
+            }
+
+            /* Restore ch->htlcs[0] / ch->n_htlcs. */
+            ch->n_htlcs = wt_saved_n;
+            if (wt_saved_n > 0)
+                ch->htlcs[0] = wt_saved_h0;
+        }
+
+        if (entry) {
+            entry->htlc_outputs = hout;
+            entry->n_htlc_outputs = n_hout;
+            entry->htlc_outputs_cap = n_active_htlcs;
+            hout = NULL;
+        }
+    }
+
+    /* SF-W-PTLC: parse PTLC outputs (vouts after HTLC outputs).  Without
+       this feed, watchtower_check's PTLC sweep loop is unreachable and a
+       breach with PTLCs in flight leaks PTLC value.  Mirror of the HTLC
+       block above; uses old_ptlcs (passed in) and walks outputs starting
+       where the HTLC parse left off (out_ofs). */
+    if (n_active_ptlcs > 0) {
+        pout = calloc(n_active_ptlcs, sizeof(watchtower_htlc_t));
+        if (!pout) {
+            fprintf(stderr, "watchtower: CRITICAL: out of memory recording the "
+                    "PTLC outputs of commitment %llu (channel %u)\n",
+                    (unsigned long long)old_commit_num, channel_id);
+            result = 0;
+            goto done;
+        }
+
+        /* If there were no HTLC outputs, out_ofs is still at the first
+           output; advance past to_local + to_remote.  If HTLCs existed,
+           the HTLC parse already advanced out_ofs to the post-HTLC
+           position. */
+        if (n_active_htlcs == 0) {
             for (uint32_t v = 0; v < 2; v++) {
                 if (out_ofs + 9 > old_tx.len) break;
                 uint8_t slen = old_tx.data[out_ofs + 8];
                 out_ofs += 8 + 1 + slen;
             }
-
-            /* Parse HTLC outputs (vout 2, 3, ...) */
-            size_t htlc_active_idx = 0;
-            for (size_t i = 0; i < old_n_htlcs && htlc_active_idx < n_active_htlcs; i++) {
-                if (old_htlcs[i].state != HTLC_STATE_ACTIVE)
-                    continue;
-
-                if (out_ofs + 8 + 1 > old_tx.len) break;
-                uint64_t amount = 0;
-                for (int b = 0; b < 8; b++)
-                    amount |= ((uint64_t)old_tx.data[out_ofs + b]) << (b * 8);
-                uint8_t slen = old_tx.data[out_ofs + 8];
-                if (slen != 34 || out_ofs + 9 + slen > old_tx.len) {
-                    out_ofs += 8 + 1 + slen;
-                    htlc_active_idx++;
-                    continue;
-                }
-
-                watchtower_htlc_t *wh = &entry->htlc_outputs[entry->n_htlc_outputs];
-                wh->htlc_vout = (uint32_t)(2 + htlc_active_idx);
-                wh->htlc_amount = amount;
-                memcpy(wh->htlc_spk, &old_tx.data[out_ofs + 9], 34);
-                wh->direction = old_htlcs[i].direction;
-                memcpy(wh->payment_hash, old_htlcs[i].payment_hash, 32);
-                wh->cltv_expiry = old_htlcs[i].cltv_expiry;
-                entry->n_htlc_outputs++;
-
-                /* Register HTLC script with chain backend */
-                if (wt->chain && wt->chain->register_script)
-                    wt->chain->register_script(wt->chain, wh->htlc_spk, 34);
-
-                out_ofs += 8 + 1 + slen;
-                htlc_active_idx++;
-            }
-
-            /* Persist HTLC outputs if DB available (transactional) */
-            if (wt->db && wt->db->db && entry->n_htlc_outputs > 0) {
-                if (!persist_begin(wt->db)) {
-                    fprintf(stderr, "watchtower: persist_begin failed, skipping HTLC persist\n");
-                } else {
-                    int htlc_ok = 1;
-                    for (size_t h = 0; h < entry->n_htlc_outputs; h++) {
-                        if (!persist_save_old_commitment_htlc(wt->db, channel_id,
-                                old_commit_num, &entry->htlc_outputs[h])) {
-                            htlc_ok = 0;
-                            break;
-                        }
-                    }
-                    if (htlc_ok)
-                        persist_commit(wt->db);
-                    else
-                        persist_rollback(wt->db);
-                }
-            }
-
-            /* v35 (#207): pre-build the signed HTLC sweep TX bytes at
-               registration time and persist them, mirroring the v25 pattern
-               for the to_local penalty TX above.  Closes the restart-loses-
-               HTLC-defense gap: after an LSP crash, watchtower_check no
-               longer needs live channel_t state to broadcast HTLC sweeps —
-               the bytes are durably on disk.  Also enables standalone-WT
-               operation (run superscalar_watchtower against the same DB).
-
-               channel_build_htlc_penalty_tx requires ch->htlcs[0] to carry
-               the HTLC metadata (direction, payment_hash, cltv_expiry) —
-               same shim watchtower_check uses on the lazy-build path. */
-            if (wt->db && wt->db->db && entry->n_htlc_outputs > 0 && ch) {
-                int use_anchor_h = fee_should_use_anchor(wt->fee);
-
-                /* Save + restore ch->htlcs[0] across the per-output build loop. */
-                size_t wt_saved_n = ch->n_htlcs;
-                htlc_t wt_saved_h0 = {0};
-                if (wt_saved_n > 0)
-                    wt_saved_h0 = ch->htlcs[0];
-
-                for (size_t h = 0; h < entry->n_htlc_outputs; h++) {
-                    watchtower_htlc_t *wh_h = &entry->htlc_outputs[h];
-
-                    /* Shim ch->htlcs[0] like the watchtower_check sweep loop. */
-                    ch->n_htlcs = 1;
-                    memset(&ch->htlcs[0], 0, sizeof(htlc_t));
-                    ch->htlcs[0].direction = wh_h->direction;
-                    memcpy(ch->htlcs[0].payment_hash, wh_h->payment_hash, 32);
-                    ch->htlcs[0].cltv_expiry = wh_h->cltv_expiry;
-                    ch->htlcs[0].state = HTLC_STATE_ACTIVE;
-
-                    tx_buf_t sweep;
-                    tx_buf_init(&sweep, 512);
-                    if (channel_build_htlc_penalty_tx(ch, &sweep,
-                            old_txid, wh_h->htlc_vout, wh_h->htlc_amount,
-                            wh_h->htlc_spk, 34, old_commit_num, 0,
-                            use_anchor_h ? wt->anchor_spk : NULL,
-                            use_anchor_h ? wt->anchor_spk_len : 0)) {
-                        persist_save_old_commitment_htlc_sweep(
-                            wt->db, channel_id, old_commit_num,
-                            wh_h->htlc_vout, sweep.data, sweep.len);
-                        /* G2 #45: mirror the HTLC penalty sweep into wt_db so a
-                           SECRET-LESS standalone WT also sweeps in-flight HTLCs on
-                           a commitment breach (without this it penalizes to_local
-                           but leaks HTLC value).  Keyed on the breach commit txid;
-                           same pattern + sha256_double(resp) txid as the to_local
-                           mirror above. */
-                        if (wt->wt_db && wt->wt_db->db) {
-                            unsigned char h_resp_txid[32];
-                            sha256_double(sweep.data, sweep.len, h_resp_txid);
-                            char *h_hex = (char *)malloc(sweep.len * 2 + 1);
-                            if (h_hex) {
-                                hex_encode(sweep.data, sweep.len, h_hex);
-                                int64_t hwid = persist_wt_register_watch(
-                                    wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
-                                    channel_id, old_txid,
-                                    wh_h->htlc_vout, wh_h->htlc_amount,
-                                    wh_h->htlc_spk, 34,
-                                    ch->to_self_delay,
-                                    h_hex, h_resp_txid, 0, 0);
-                                free(h_hex);
-                                if (hwid <= 0)
-                                    fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
-                                        "HTLC-sweep register failed (ch %u vout %u)\n",
-                                        channel_id, wh_h->htlc_vout);
-                            }
-                        }
-                    } else {
-                        fprintf(stderr,
-                                "watchtower: failed to build HTLC sweep TX "
-                                "(vout %u) at registration time — restart "
-                                "defense will fall back to lazy build\n",
-                                wh_h->htlc_vout);
-                    }
-                    tx_buf_free(&sweep);
-                }
-
-                /* Restore ch->htlcs[0] / ch->n_htlcs. */
-                ch->n_htlcs = wt_saved_n;
-                if (wt_saved_n > 0)
-                    ch->htlcs[0] = wt_saved_h0;
-            }
         }
 
-        /* SF-W-PTLC: parse PTLC outputs (vouts after HTLC outputs).  Without
-           this feed, watchtower_check's PTLC sweep loop is unreachable and a
-           breach with PTLCs in flight leaks PTLC value.  Mirror of the HTLC
-           block above; uses old_ptlcs (passed in) and walks outputs starting
-           where the HTLC parse left off (out_ofs). */
-        if (n_active_ptlcs > 0 && wt->n_entries > 0 && old_ptlcs) {
-            watchtower_entry_t *entry = &wt->entries[wt->n_entries - 1];
-            entry->ptlc_outputs = calloc(n_active_ptlcs, sizeof(watchtower_htlc_t));
-            entry->n_ptlc_outputs = 0;
+        size_t ptlc_active_idx = 0;
+        for (size_t i = 0; i < old_n_ptlcs && ptlc_active_idx < n_active_ptlcs; i++) {
+            if (old_ptlcs[i].state != PTLC_STATE_ACTIVE) continue;
+            if (old_ptlcs[i].amount_sats < 546 /* dust */) continue;
 
-            /* If there were no HTLC outputs, out_ofs is still at the first
-               output; advance past to_local + to_remote.  If HTLCs existed,
-               the HTLC parse already advanced out_ofs to the post-HTLC
-               position. */
-            if (n_active_htlcs == 0) {
-                for (uint32_t v = 0; v < 2; v++) {
-                    if (out_ofs + 9 > old_tx.len) break;
-                    uint8_t slen = old_tx.data[out_ofs + 8];
-                    out_ofs += 8 + 1 + slen;
-                }
-            }
-
-            size_t ptlc_active_idx = 0;
-            if (entry->ptlc_outputs)
-            for (size_t i = 0; i < old_n_ptlcs && ptlc_active_idx < n_active_ptlcs; i++) {
-                if (old_ptlcs[i].state != PTLC_STATE_ACTIVE) continue;
-                if (old_ptlcs[i].amount_sats < 546 /* dust */) continue;
-
-                if (out_ofs + 8 + 1 > old_tx.len) break;
-                uint64_t amount = 0;
-                for (int b = 0; b < 8; b++)
-                    amount |= ((uint64_t)old_tx.data[out_ofs + b]) << (b * 8);
-                uint8_t slen = old_tx.data[out_ofs + 8];
-                if (slen != 34 || out_ofs + 9 + slen > old_tx.len) {
-                    out_ofs += 8 + 1 + slen;
-                    ptlc_active_idx++;
-                    continue;
-                }
-
-                watchtower_htlc_t *wp = &entry->ptlc_outputs[entry->n_ptlc_outputs];
-                wp->htlc_vout = (uint32_t)(2 + n_active_htlcs + ptlc_active_idx);
-                wp->htlc_amount = amount;
-                memcpy(wp->htlc_spk, &old_tx.data[out_ofs + 9], 34);
-                wp->direction = (htlc_direction_t)old_ptlcs[i].direction;
-                /* Store xonly form of payment_point in payment_hash[32].
-                   The persist + sweep code already treats this field as
-                   the xonly serialization for PTLC entries. */
-                {
-                    secp256k1_xonly_pubkey pp_xonly;
-                    if (secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly,
-                            NULL, &old_ptlcs[i].payment_point)) {
-                        secp256k1_xonly_pubkey_serialize(ch->ctx,
-                            wp->payment_hash, &pp_xonly);
-                    } else {
-                        memset(wp->payment_hash, 0, 32);
-                    }
-                }
-                wp->cltv_expiry = old_ptlcs[i].cltv_expiry;
-                entry->n_ptlc_outputs++;
-
-                /* Register PTLC script with chain backend */
-                if (wt->chain && wt->chain->register_script)
-                    wt->chain->register_script(wt->chain, wp->htlc_spk, 34);
-
+            if (out_ofs + 8 + 1 > old_tx.len) break;
+            uint64_t amount = 0;
+            for (int b = 0; b < 8; b++)
+                amount |= ((uint64_t)old_tx.data[out_ofs + b]) << (b * 8);
+            uint8_t slen = old_tx.data[out_ofs + 8];
+            if (slen != 34 || out_ofs + 9 + slen > old_tx.len) {
                 out_ofs += 8 + 1 + slen;
                 ptlc_active_idx++;
+                continue;
             }
 
-            /* Persist PTLC outputs (transactional) */
-            if (wt->db && wt->db->db && entry->n_ptlc_outputs > 0) {
-                if (!persist_begin(wt->db)) {
-                    fprintf(stderr, "watchtower: persist_begin failed, skipping PTLC persist\n");
+            watchtower_htlc_t *wp = &pout[n_pout];
+            wp->htlc_vout = (uint32_t)(2 + n_active_htlcs + ptlc_active_idx);
+            wp->htlc_amount = amount;
+            memcpy(wp->htlc_spk, &old_tx.data[out_ofs + 9], 34);
+            wp->direction = (htlc_direction_t)old_ptlcs[i].direction;
+            /* Store xonly form of payment_point in payment_hash[32].
+               The persist + sweep code already treats this field as
+               the xonly serialization for PTLC entries. */
+            {
+                secp256k1_xonly_pubkey pp_xonly;
+                if (secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &pp_xonly,
+                        NULL, &old_ptlcs[i].payment_point)) {
+                    secp256k1_xonly_pubkey_serialize(ch->ctx,
+                        wp->payment_hash, &pp_xonly);
                 } else {
-                    int ptlc_ok = 1;
-                    for (size_t p = 0; p < entry->n_ptlc_outputs; p++) {
-                        if (!persist_save_old_commitment_ptlc(wt->db, channel_id,
-                                old_commit_num, &entry->ptlc_outputs[p])) {
-                            ptlc_ok = 0;
-                            break;
-                        }
-                    }
-                    if (ptlc_ok)
-                        persist_commit(wt->db);
-                    else
-                        persist_rollback(wt->db);
+                    memset(wp->payment_hash, 0, 32);
                 }
             }
+            wp->cltv_expiry = old_ptlcs[i].cltv_expiry;
+            n_pout++;
 
-            /* G2 #45 (PTLC): mirror the PTLC revocation-penalty sweep into
-               wt_db so a SECRET-LESS standalone WT also sweeps in-flight PTLCs
-               on a commitment breach (without this it penalizes to_local + HTLCs
-               but leaks PTLC value).  Mirror of the HTLC wt_db block above: build
-               the sweep now (ch still holds the received revocation secret) and
-               store the signed bytes keyed on the breach txid.  Uses the same
-               ch->ptlcs[0] shim the watchtower_check lazy-build path uses. */
-            if (wt->wt_db && wt->wt_db->db && entry->n_ptlc_outputs > 0 && ch) {
-                int use_anchor_p = fee_should_use_anchor(wt->fee);
-                size_t wt_saved_np = ch->n_ptlcs;
-                ptlc_t wt_saved_p0 = {0};
-                if (wt_saved_np > 0 && ch->ptlcs)
-                    wt_saved_p0 = ch->ptlcs[0];
-                if (!ch->ptlcs) {
-                    ch->ptlcs = (ptlc_t *)calloc(1, sizeof(ptlc_t));
-                    ch->ptlcs_cap = 1;
-                }
-                for (size_t p = 0; ch->ptlcs && p < entry->n_ptlc_outputs; p++) {
-                    watchtower_htlc_t *wp_p = &entry->ptlc_outputs[p];
-                    ch->n_ptlcs = 1;
-                    memset(&ch->ptlcs[0], 0, sizeof(ptlc_t));
-                    ch->ptlcs[0].direction = (ptlc_direction_t)wp_p->direction;
-                    ch->ptlcs[0].cltv_expiry = wp_p->cltv_expiry;
-                    ch->ptlcs[0].state = PTLC_STATE_ACTIVE;
-                    /* payment_hash[32] holds the xonly payment_point; prepend
-                       even-parity to parse a 33-byte pubkey (parity immaterial —
-                       channel_build_ptlc_penalty_tx uses the xonly form). */
-                    {
-                        unsigned char pp33[33];
-                        pp33[0] = 0x02;
-                        memcpy(pp33 + 1, wp_p->payment_hash, 32);
-                        if (!secp256k1_ec_pubkey_parse(ch->ctx,
-                                &ch->ptlcs[0].payment_point, pp33, 33)) {
-                            fprintf(stderr, "watchtower: PTLC mirror skipped -- "
-                                "invalid payment_point for output %zu\n", p);
-                            continue;
-                        }
-                    }
-                    tx_buf_t psweep;
-                    tx_buf_init(&psweep, 512);
-                    if (channel_build_ptlc_penalty_tx(ch, &psweep,
-                            old_txid, wp_p->htlc_vout, wp_p->htlc_amount,
-                            wp_p->htlc_spk, 34, old_commit_num, 0,
-                            use_anchor_p ? wt->anchor_spk : NULL,
-                            use_anchor_p ? wt->anchor_spk_len : 0)) {
-                        unsigned char p_resp_txid[32];
-                        sha256_double(psweep.data, psweep.len, p_resp_txid);
-                        char *p_hex = (char *)malloc(psweep.len * 2 + 1);
-                        if (p_hex) {
-                            hex_encode(psweep.data, psweep.len, p_hex);
-                            int64_t pwid = persist_wt_register_watch(
-                                wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
-                                channel_id, old_txid,
-                                wp_p->htlc_vout, wp_p->htlc_amount,
-                                wp_p->htlc_spk, 34,
-                                ch->to_self_delay,
-                                p_hex, p_resp_txid, 0, 0);
-                            free(p_hex);
-                            if (pwid <= 0)
-                                fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
-                                    "PTLC-sweep register failed (ch %u vout %u)\n",
-                                    channel_id, wp_p->htlc_vout);
-                        }
-                    } else {
-                        fprintf(stderr,
-                                "watchtower: failed to build PTLC sweep TX "
-                                "(vout %u) at registration time — standalone-WT "
-                                "PTLC recourse unavailable for this output\n",
-                                wp_p->htlc_vout);
-                    }
-                    tx_buf_free(&psweep);
-                }
-                ch->n_ptlcs = wt_saved_np;
-                if (wt_saved_np > 0 && ch->ptlcs)
-                    ch->ptlcs[0] = wt_saved_p0;
+            /* Register PTLC script with chain backend */
+            if (wt->chain && wt->chain->register_script)
+                wt->chain->register_script(wt->chain, wp->htlc_spk, 34);
+
+            out_ofs += 8 + 1 + slen;
+            ptlc_active_idx++;
+        }
+
+        /* Persist PTLC outputs (transactional) */
+        if (!wt_persist_outputs(wt, channel_id, old_commit_num, pout, n_pout, 1)) {
+            fprintf(stderr, "watchtower: CRITICAL: could not persist the PTLC "
+                    "outputs of commitment %llu (channel %u)\n",
+                    (unsigned long long)old_commit_num, channel_id);
+            result = 0;
+        }
+
+        /* G2 #45 (PTLC): mirror the PTLC revocation-penalty sweep into
+           wt_db so a SECRET-LESS standalone WT also sweeps in-flight PTLCs
+           on a commitment breach (without this it penalizes to_local + HTLCs
+           but leaks PTLC value).  Mirror of the HTLC wt_db block above: build
+           the sweep now (ch still holds the received revocation secret) and
+           store the signed bytes keyed on the breach txid.  Uses the same
+           ch->ptlcs[0] shim the watchtower_check lazy-build path uses. */
+        if (wt->wt_db && wt->wt_db->db && n_pout > 0) {
+            int use_anchor_p = fee_should_use_anchor(wt->fee);
+            size_t wt_saved_np = ch->n_ptlcs;
+            ptlc_t wt_saved_p0 = {0};
+            if (wt_saved_np > 0 && ch->ptlcs)
+                wt_saved_p0 = ch->ptlcs[0];
+            if (!ch->ptlcs) {
+                ch->ptlcs = (ptlc_t *)calloc(1, sizeof(ptlc_t));
+                ch->ptlcs_cap = ch->ptlcs ? 1 : 0;
             }
+            for (size_t p = 0; ch->ptlcs && p < n_pout; p++) {
+                watchtower_htlc_t *wp_p = &pout[p];
+                ch->n_ptlcs = 1;
+                memset(&ch->ptlcs[0], 0, sizeof(ptlc_t));
+                ch->ptlcs[0].direction = (ptlc_direction_t)wp_p->direction;
+                ch->ptlcs[0].cltv_expiry = wp_p->cltv_expiry;
+                ch->ptlcs[0].state = PTLC_STATE_ACTIVE;
+                /* payment_hash[32] holds the xonly payment_point; prepend
+                   even-parity to parse a 33-byte pubkey (parity immaterial —
+                   channel_build_ptlc_penalty_tx uses the xonly form). */
+                {
+                    unsigned char pp33[33];
+                    pp33[0] = 0x02;
+                    memcpy(pp33 + 1, wp_p->payment_hash, 32);
+                    if (!secp256k1_ec_pubkey_parse(ch->ctx,
+                            &ch->ptlcs[0].payment_point, pp33, 33)) {
+                        fprintf(stderr, "watchtower: PTLC mirror skipped -- "
+                            "invalid payment_point for output %zu\n", p);
+                        continue;
+                    }
+                }
+                tx_buf_t psweep;
+                tx_buf_init(&psweep, 512);
+                if (channel_build_ptlc_penalty_tx(ch, &psweep,
+                        old_txid, wp_p->htlc_vout, wp_p->htlc_amount,
+                        wp_p->htlc_spk, 34, old_commit_num, 0,
+                        use_anchor_p ? wt->anchor_spk : NULL,
+                        use_anchor_p ? wt->anchor_spk_len : 0)) {
+                    unsigned char p_resp_txid[32];
+                    sha256_double(psweep.data, psweep.len, p_resp_txid);
+                    char *p_hex = (char *)malloc(psweep.len * 2 + 1);
+                    if (p_hex) {
+                        hex_encode(psweep.data, psweep.len, p_hex);
+                        int64_t pwid = persist_wt_register_watch(
+                            wt->wt_db, WT_KIND_CHANNEL_COMMITMENT,
+                            channel_id, old_txid,
+                            wp_p->htlc_vout, wp_p->htlc_amount,
+                            wp_p->htlc_spk, 34,
+                            ch->to_self_delay,
+                            p_hex, p_resp_txid, 0, 0);
+                        free(p_hex);
+                        if (pwid <= 0)
+                            fprintf(stderr, "LSP-WT-TRUSTLESS: WARN — wt_db "
+                                "PTLC-sweep register failed (ch %u vout %u)\n",
+                                channel_id, wp_p->htlc_vout);
+                    }
+                } else {
+                    fprintf(stderr,
+                            "watchtower: failed to build PTLC sweep TX "
+                            "(vout %u) at registration time — standalone-WT "
+                            "PTLC recourse unavailable for this output\n",
+                            wp_p->htlc_vout);
+                }
+                tx_buf_free(&psweep);
+            }
+            ch->n_ptlcs = wt_saved_np;
+            if (wt_saved_np > 0 && ch->ptlcs)
+                ch->ptlcs[0] = wt_saved_p0;
+        }
+
+        if (entry) {
+            entry->ptlc_outputs = pout;
+            entry->n_ptlc_outputs = n_pout;
+            pout = NULL;
         }
     }
 
+done:
+    free(hout);
+    free(pout);
     tx_buf_free(&old_tx);
     free(saved_htlcs);
     free(saved_ptlcs);
+    return result;
 }
 
-void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
-                                                    uint32_t channel_id,
-                                                    uint64_t old_commit_num,
-                                                    uint64_t old_local,
-                                                    uint64_t old_remote,
-                                                    const htlc_t *old_htlcs,
-                                                    size_t old_n_htlcs,
-                                                    const ptlc_t *old_ptlcs,
-                                                    size_t old_n_ptlcs,
-                                                    const unsigned char *signed_penalty_tx,
-                                                    size_t signed_penalty_tx_len) {
-    /* Run the existing registration so persist + script registration +
-       HTLC + PTLC parsing all stay identical.  Then attach pre-signed
-       penalty TX bytes to the new entry (the LAST one, since the legacy
-       call always pushes to wt->n_entries - 1 if successful).
+int watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
+                                          uint32_t channel_id,
+                                          uint64_t old_commit_num,
+                                          uint64_t old_local, uint64_t old_remote,
+                                          const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                          const ptlc_t *old_ptlcs, size_t old_n_ptlcs) {
+    return wt_watch_revoked_impl(wt, ch, channel_id, old_commit_num,
+                                 old_local, old_remote,
+                                 old_htlcs, old_n_htlcs,
+                                 old_ptlcs, old_n_ptlcs, NULL, 0);
+}
 
-       If signed_penalty_tx is NULL we degrade to legacy lazy-build
-       behaviour transparently — same call shape as the non-oracular
-       form. */
-    size_t n_before = wt->n_entries;
-    watchtower_watch_revoked_commitment(wt, ch, channel_id, old_commit_num,
-                                          old_local, old_remote,
-                                          old_htlcs, old_n_htlcs,
-                                          old_ptlcs, old_n_ptlcs);
-    if (!signed_penalty_tx || signed_penalty_tx_len == 0) return;
-    if (wt->n_entries == n_before) return;  /* legacy registration failed */
-
-    watchtower_entry_t *e = &wt->entries[wt->n_entries - 1];
-    unsigned char *copy = malloc(signed_penalty_tx_len);
-    if (!copy) return;
-    memcpy(copy, signed_penalty_tx, signed_penalty_tx_len);
-    free(e->signed_penalty_tx);
-    e->signed_penalty_tx = copy;
-    e->signed_penalty_tx_len = signed_penalty_tx_len;
-    /* v25: persist so LSP restart can reattach.  See companion calls in
-       watchtower_watch_oracular and watchtower_watch_revoked_commitment. */
-    if (wt->db && wt->db->db)
-        persist_save_old_commitment_witness(wt->db, channel_id, old_commit_num,
-                                              signed_penalty_tx,
-                                              signed_penalty_tx_len);
+int watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
+                                                   uint32_t channel_id,
+                                                   uint64_t old_commit_num,
+                                                   uint64_t old_local,
+                                                   uint64_t old_remote,
+                                                   const htlc_t *old_htlcs,
+                                                   size_t old_n_htlcs,
+                                                   const ptlc_t *old_ptlcs,
+                                                   size_t old_n_ptlcs,
+                                                   const unsigned char *signed_penalty_tx,
+                                                   size_t signed_penalty_tx_len) {
+    /* Same registration as the legacy form; the caller's pre-signed penalty
+       bytes (when given) replace the ones built here.  NULL bytes degrade to
+       the legacy behaviour transparently. */
+    return wt_watch_revoked_impl(wt, ch, channel_id, old_commit_num,
+                                 old_local, old_remote,
+                                 old_htlcs, old_n_htlcs,
+                                 old_ptlcs, old_n_ptlcs,
+                                 signed_penalty_tx,
+                                 signed_penalty_tx ? signed_penalty_tx_len : 0);
 }
 
 void watchtower_set_chain_backend(watchtower_t *wt, chain_backend_t *backend)
@@ -1895,10 +2000,10 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
                                     const unsigned char *burn_tx,
                                     size_t burn_tx_len) {
     if (!wt || !old_txid32 || !response_tx || response_tx_len == 0) return 0;
-    if (wt->n_entries >= wt->entries_cap) return 0;
 
-    watchtower_entry_t *e = &wt->entries[wt->n_entries++];
-    memset(e, 0, sizeof(*e));
+    watchtower_entry_t *e = wt_reserve_entry(wt);
+    if (!e) return 0;
+    wt->n_entries++;
     e->type = WATCH_FACTORY_NODE;
     e->channel_id = node_idx;
     e->commit_num = 0;
@@ -1956,10 +2061,9 @@ int watchtower_watch_subfactory_node(watchtower_t *wt,
     uint64_t sales_stock_amount)
 {
     if (!wt || !old_chain_txid32 || !response_tx || response_tx_len == 0) return 0;
-    if (wt->n_entries >= wt->entries_cap) return 0;
 
-    watchtower_entry_t *e = &wt->entries[wt->n_entries];
-    memset(e, 0, sizeof(*e));
+    watchtower_entry_t *e = wt_reserve_entry(wt);
+    if (!e) return 0;
     e->type = WATCH_SUBFACTORY_NODE;
     e->channel_id = sub_node_idx;
     e->commit_num = 0;
@@ -2191,18 +2295,8 @@ int watchtower_watch_force_close(watchtower_t *wt, uint32_t channel_id,
     if (!wt || !commitment_txid) return 0;
     if (n_htlcs > 0 && !htlcs) return 0;
 
-    /* Grow entries if needed */
-    if (wt->n_entries >= wt->entries_cap) {
-        size_t new_cap = wt->entries_cap ? wt->entries_cap * 2 : 16;
-        watchtower_entry_t *tmp = realloc(wt->entries,
-                                            new_cap * sizeof(watchtower_entry_t));
-        if (!tmp) return 0;
-        wt->entries = tmp;
-        wt->entries_cap = new_cap;
-    }
-
-    watchtower_entry_t *e = &wt->entries[wt->n_entries];
-    memset(e, 0, sizeof(*e));
+    watchtower_entry_t *e = wt_reserve_entry(wt);
+    if (!e) return 0;
     e->type = WATCH_FORCE_CLOSE;
     e->channel_id = channel_id;
     memcpy(e->txid, commitment_txid, 32);

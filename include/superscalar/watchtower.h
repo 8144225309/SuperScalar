@@ -11,7 +11,11 @@
 #include "htlc_fee_bump.h"
 #include <secp256k1.h>
 
-#define WATCHTOWER_MAX_WATCH 128
+/* Initial capacity of the watch table.  The table grows on demand (doubling)
+   and has no fixed upper bound: every revoked commitment must stay watched.
+   (It used to be a hard 128-entry cap for the whole daemon; once full, new
+   revoked commitments were silently dropped.) */
+#define WATCHTOWER_INITIAL_WATCH_CAP 128
 
 typedef enum {
     WATCH_COMMITMENT,      /* Channel commitment breach — build penalty tx */
@@ -125,6 +129,9 @@ typedef struct watchtower_s {
     watchtower_entry_t *entries;
     size_t n_entries;
     size_t entries_cap;
+    /* Allocator used to grow `entries` (NULL = realloc).  A seam so tests can
+       drive the out-of-memory path, where registration must fail closed. */
+    void *(*entries_realloc)(void *ptr, size_t size);
     /* channels[], n_channels, channels_cap retained in #208 A3.2 only
        to keep the HTLC/PTLC sweep + force-close-timeout-sweep loops
        intact.  After A3.2, no production caller populates channels[],
@@ -192,7 +199,9 @@ void watchtower_set_wallet(watchtower_t *wt, wallet_source_t *wallet);
 
 /* watchtower_set_channel removed in #208 A3.2 — see oracular API below. */
 
-/* Add an old commitment to watch for. */
+/* Add an old commitment to watch for.  The DB row (when a DB is attached) is
+   written before, and independently of, the in-memory insert.  Returns 1 when
+   the entry is in memory and its row was written; 0 otherwise. */
 int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
                        uint64_t commit_num, const unsigned char *txid32,
                        uint32_t to_local_vout, uint64_t to_local_amount,
@@ -211,13 +220,21 @@ int watchtower_check(watchtower_t *wt);
    old_ptlcs/old_n_ptlcs: snapshot of PTLC state at the time of the old commitment.
    Pass NULL/0 if no PTLCs.  When provided, the watchtower will populate
    entry->ptlc_outputs so the sweep loop in watchtower_check can broadcast a
-   PTLC penalty TX on breach. */
-void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
-                                           uint32_t channel_id,
-                                           uint64_t old_commit_num,
-                                           uint64_t old_local, uint64_t old_remote,
-                                           const htlc_t *old_htlcs, size_t old_n_htlcs,
-                                           const ptlc_t *old_ptlcs, size_t old_n_ptlcs);
+   PTLC penalty TX on breach.
+
+   Returns 1 when the revoked commitment is watched: an in-memory entry exists
+   and, when a DB is attached, its old_commitments row, pre-built penalty TX
+   and HTLC/PTLC output rows were written.  Returns 0 otherwise; the caller
+   must treat that as fatal for the channel (do not create further revoked
+   commitments that cannot be watched).  A failed registration never modifies
+   any other entry.  The DB row is written before the in-memory insert, so if
+   only the in-memory insert fails a restart still re-arms the watch. */
+int watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
+                                          uint32_t channel_id,
+                                          uint64_t old_commit_num,
+                                          uint64_t old_local, uint64_t old_remote,
+                                          const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                          const ptlc_t *old_ptlcs, size_t old_n_ptlcs);
 
 /* === Oracular API (#208 A3.1 — daemon-friendly) ===
 
@@ -251,18 +268,19 @@ int watchtower_watch_oracular(watchtower_t *wt, uint32_t channel_id,
    Same arguments as the legacy form (still takes `channel_t *ch` to
    compute txid + to_local_spk derivation), plus pre-signed penalty TX
    bytes.  Once A3.1b migrates all callers and A3.2 drops the legacy
-   path, the `ch` arg can be removed too. */
-void watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
-                                                    uint32_t channel_id,
-                                                    uint64_t old_commit_num,
-                                                    uint64_t old_local,
-                                                    uint64_t old_remote,
-                                                    const htlc_t *old_htlcs,
-                                                    size_t old_n_htlcs,
-                                                    const ptlc_t *old_ptlcs,
-                                                    size_t old_n_ptlcs,
-                                                    const unsigned char *signed_penalty_tx,
-                                                    size_t signed_penalty_tx_len);
+   path, the `ch` arg can be removed too.  Same return contract as
+   watchtower_watch_revoked_commitment. */
+int watchtower_watch_revoked_commitment_oracular(watchtower_t *wt, channel_t *ch,
+                                                   uint32_t channel_id,
+                                                   uint64_t old_commit_num,
+                                                   uint64_t old_local,
+                                                   uint64_t old_remote,
+                                                   const htlc_t *old_htlcs,
+                                                   size_t old_n_htlcs,
+                                                   const ptlc_t *old_ptlcs,
+                                                   size_t old_n_ptlcs,
+                                                   const unsigned char *signed_penalty_tx,
+                                                   size_t signed_penalty_tx_len);
 
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);
