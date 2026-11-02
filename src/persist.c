@@ -922,13 +922,25 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
-    /* v20 migration: client-side PS double-spend defense tracker.
-       Records every (parent_txid, parent_vout) pair a client has already
-       co-signed on a PS leaf, along with the sighash and partial sig.
-       The PROPOSE handler consults this table on every incoming PS advance:
-         - no row → fresh signing, store result
-         - row with matching sighash → idempotent retry, replay stored sig
-         - row with conflicting sighash → refuse (double-spend attempt) */
+    /* v20 migration: client-side PS double-spend defense tracker
+       (record-and-refuse).  Records every (parent_txid, parent_vout) pair a
+       client has co-signed on a PS leaf, with the BIP-341 sighash and the
+       partial sig.  client_handle_leaf_advance_stateless (src/client.c)
+       consults it on every PS advance, BEFORE any nonce exists:
+         - no row                     → sign, then INSERT the record before
+                                        the signature leaves the process
+         - row with matching sighash  → idempotent retry: re-sign the same
+                                        message with a fresh nonce
+         - row with different sighash → refuse (double-spend attempt)
+         - any lookup / insert error  → refuse (fail closed)
+       The PRIMARY KEY is the arbiter between concurrent ceremonies: plain
+       INSERT, never OR REPLACE, so the first record wins and is never
+       overwritten.
+       partial_sig is our partial sig from the FIRST signing of this parent
+       only: a same-sighash retry does not update it.  It cannot be verified
+       on its own (the session's nonces are not stored) and is never
+       replayed -- a retry re-signs under fresh nonces.  It is a record of
+       what was released, nothing more. */
     if (db_version < 20) {
         sqlite3_exec(p->db,
             "CREATE TABLE IF NOT EXISTS client_ps_signed_inputs ("
@@ -937,7 +949,7 @@ int persist_open(persist_t *p, const char *path) {
             "  parent_txid BLOB NOT NULL,"     /* 32 bytes, internal byte order */
             "  parent_vout INTEGER NOT NULL,"
             "  sighash BLOB NOT NULL,"         /* 32 bytes, BIP-341 sighash */
-            "  partial_sig BLOB NOT NULL,"     /* 36 bytes, musig partial sig */
+            "  partial_sig BLOB NOT NULL,"     /* our 32-byte MuSig2 partial sig, zero-padded to 36 bytes */
             "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
             "  PRIMARY KEY (factory_id, parent_txid, parent_vout)"
             ");",
@@ -2205,38 +2217,65 @@ int persist_test_ps_hook_fire(int point) {
     return g_ps_test_hook(point, g_ps_test_hook_user) ? 1 : 0;
 }
 
-int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
-                                    const unsigned char parent_txid[32],
-                                    uint32_t parent_vout,
-                                    unsigned char out_sighash[32])
+/* Shared lookup for the pre-sign check and for the save's conflict
+   re-read.  The test hook is NOT consulted here, so an injected check
+   failure never leaks into the arbiter's re-read. */
+static int ps_signed_input_lookup(persist_t *p, uint32_t factory_id,
+                                  const unsigned char parent_txid[32],
+                                  uint32_t parent_vout,
+                                  unsigned char out_sighash[32])
 {
-    if (!p || !p->db || !parent_txid) return 0;
-    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_CHECK)) return 0;  /* injected prepare failure */
+    if (!p || !p->db || !parent_txid) return PS_SIGNED_INPUT_ERROR;
     sqlite3_stmt *stmt;
     const char *sql =
         "SELECT sighash FROM client_ps_signed_inputs "
         "WHERE factory_id = ? AND parent_txid = ? AND parent_vout = ?;";
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "persist: client_ps_signed_inputs lookup prepare failed: %s\n",
+                sqlite3_errmsg(p->db));
+        return PS_SIGNED_INPUT_ERROR;
+    }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_blob(stmt, 2, parent_txid, 32, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 3, (int)parent_vout);
 
     int rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
+    if (rc == SQLITE_DONE) {
         sqlite3_finalize(stmt);
-        return 0;  /* not found — fresh parent, proceed to sign */
+        return PS_SIGNED_INPUT_NOT_FOUND;  /* no row: fresh parent */
     }
-
-    if (out_sighash) {
-        const void *stored_sighash_blob = sqlite3_column_blob(stmt, 0);
-        int stored_sighash_len = sqlite3_column_bytes(stmt, 0);
-        if (stored_sighash_len == 32)
-            memcpy(out_sighash, stored_sighash_blob, 32);
-        else
-            memset(out_sighash, 0, 32);
+    if (rc != SQLITE_ROW) {
+        /* Busy, I/O, corrupt, ...: we do NOT know whether we signed before,
+           and "unknown" must never be read as "not found". */
+        fprintf(stderr, "persist: client_ps_signed_inputs lookup step failed (rc=%d): %s\n",
+                rc, sqlite3_errmsg(p->db));
+        sqlite3_finalize(stmt);
+        return PS_SIGNED_INPUT_ERROR;
     }
+    const void *blob = sqlite3_column_blob(stmt, 0);
+    int len = sqlite3_column_bytes(stmt, 0);
+    if (!blob || len != 32) {
+        /* A row we cannot compare against is as bad as no answer. */
+        fprintf(stderr, "persist: client_ps_signed_inputs row has a malformed sighash (len=%d)\n",
+                len);
+        sqlite3_finalize(stmt);
+        return PS_SIGNED_INPUT_ERROR;
+    }
+    if (out_sighash)
+        memcpy(out_sighash, blob, 32);
     sqlite3_finalize(stmt);
-    return 1;  /* already signed — refuse */
+    return PS_SIGNED_INPUT_FOUND;
+}
+
+int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
+                                    const unsigned char parent_txid[32],
+                                    uint32_t parent_vout,
+                                    unsigned char out_sighash[32])
+{
+    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_CHECK))
+        return PS_SIGNED_INPUT_ERROR;  /* injected lookup failure */
+    return ps_signed_input_lookup(p, factory_id, parent_txid, parent_vout,
+                                  out_sighash);
 }
 
 int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
@@ -2246,14 +2285,23 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
                                    const unsigned char sighash[32],
                                    const unsigned char partial_sig[36])
 {
-    if (!p || !p->db || !parent_txid || !sighash || !partial_sig) return 0;
-    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_SAVE)) return 0;  /* injected step failure */
+    if (!p || !p->db || !parent_txid || !sighash || !partial_sig)
+        return PS_SAVE_ERROR;
+    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_SAVE))
+        return PS_SAVE_ERROR;  /* injected insert failure */
     sqlite3_stmt *stmt;
+    /* Plain INSERT, never OR REPLACE: the PRIMARY KEY is the arbiter
+       between two ceremonies that both passed the pre-sign check for the
+       same parent.  The first record wins and is never overwritten. */
     const char *sql =
-        "INSERT OR REPLACE INTO client_ps_signed_inputs "
+        "INSERT INTO client_ps_signed_inputs "
         "(factory_id, leaf_node_idx, parent_txid, parent_vout, "
         " sighash, partial_sig) VALUES (?, ?, ?, ?, ?, ?);";
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "persist_save_ps_signed_input: prepare failed: %s\n",
+                sqlite3_errmsg(p->db));
+        return PS_SAVE_ERROR;
+    }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, leaf_node_idx);
     sqlite3_bind_blob(stmt, 3, parent_txid, 32, SQLITE_STATIC);
@@ -2261,8 +2309,26 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
     sqlite3_bind_blob(stmt, 5, sighash, 32, SQLITE_STATIC);
     sqlite3_bind_blob(stmt, 6, partial_sig, 36, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE && (rc & 0xff) != SQLITE_CONSTRAINT)
+        fprintf(stderr, "persist_save_ps_signed_input: insert failed (rc=%d): %s\n",
+                rc, sqlite3_errmsg(p->db));  /* read before finalize resets it */
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? 1 : 0;
+    if (rc == SQLITE_DONE)
+        return PS_SAVE_RECORDED;  /* autocommit on WAL + synchronous=FULL: fsync'd */
+    if ((rc & 0xff) != SQLITE_CONSTRAINT)
+        return PS_SAVE_ERROR;
+    /* Key conflict: a record for this parent already exists -- either a
+       concurrent ceremony won the race, or this is a retry of a ceremony
+       whose record survived a crash.  The row that is there decides. */
+    unsigned char stored[32];
+    int look = ps_signed_input_lookup(p, factory_id, parent_txid, parent_vout,
+                                      stored);
+    if (look != PS_SIGNED_INPUT_FOUND) {
+        fprintf(stderr, "persist_save_ps_signed_input: conflict re-read ambiguous (rc=%d)\n",
+                look);
+        return PS_SAVE_ERROR;
+    }
+    return memcmp(stored, sighash, 32) == 0 ? PS_SAVE_RECORDED : PS_SAVE_CONFLICT;
 }
 
 int persist_has_factory(persist_t *p, uint32_t factory_id) {

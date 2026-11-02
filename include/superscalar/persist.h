@@ -260,34 +260,72 @@ int persist_load_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
                                           tx_buf_t *out_tx,
                                           unsigned char *out_txid_internal_be);
 
-/* --- Client-side PS double-spend defense --- */
+/* --- Client-side PS double-spend defense (record-and-refuse) --- */
 
-/* Check whether this client has already co-signed a PS advance spending
-   (parent_txid, parent_vout). PS has no revocation: once a client signs
-   any TX spending a PS stock UTXO, signing ANOTHER TX spending the same
-   UTXO would enable the LSP to double-spend. So we refuse to sign twice
-   against the same parent input, even if it looks like a legitimate
-   network retry — forcing the LSP to resync state is safer than any
-   replay-based idempotency (which risks subtle nonce-reuse footguns).
+/* Look up whether this client has already co-signed a PS advance spending
+   (parent_txid, parent_vout).  PS has no revocation: once a client signs
+   any TX spending a PS stock UTXO, signing a DIFFERENT TX spending the same
+   UTXO would let the LSP double-spend.  The rule, keyed on the BIP-341
+   sighash the client recorded when it signed:
+     no row                        -> fresh parent: sign, then record
+     row with the SAME sighash     -> idempotent retry of the identical spend
+                                      (re-signing the same message with a
+                                      fresh nonce is safe)
+     row with a DIFFERENT sighash  -> refuse
+     any database error            -> refuse (fail closed: "unknown" is
+                                      not "not found")
+   This function only reports what is stored; the caller compares.
 
    parent_txid: 32 bytes, internal byte order.
-   out_sighash (optional): if non-NULL and a prior row exists, filled with
-     the sighash we previously signed. Lets the caller log match-vs-conflict
-     for observability (match = likely retry, conflict = likely attack).
+   out_sighash (optional): if non-NULL and a row exists, filled with the
+     sighash recorded for that row.
 
    Returns:
-      0 = no prior signing on this parent — proceed to sign.
-      1 = already signed — REFUSE. */
+      PS_SIGNED_INPUT_ERROR     (-1) = could not determine (bad args,
+                                       prepare/step failure, malformed row).
+                                       Callers MUST treat this as "refuse".
+      PS_SIGNED_INPUT_NOT_FOUND  (0) = no prior signing on this parent.
+      PS_SIGNED_INPUT_FOUND      (1) = a row exists; see out_sighash. */
+#define PS_SIGNED_INPUT_ERROR     (-1)
+#define PS_SIGNED_INPUT_NOT_FOUND   0
+#define PS_SIGNED_INPUT_FOUND       1
 int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
                                     const unsigned char parent_txid[32],
                                     uint32_t parent_vout,
                                     unsigned char out_sighash[32]);
 
-/* Record a freshly-generated partial signature for a PS advance input.
-   Call AFTER signing, BEFORE sending the PSIG to the LSP, so a crash
-   between sign and send still locks us in on that parent. Future
-   PROPOSEs against the same parent will be refused.
-   Returns 1 on success. */
+/* Durably record a partial signature for a PS advance input.  Call AFTER
+   signing and BEFORE anything derived from the signature leaves the
+   process (the MSG_LEAF_ADVANCE_FINAL send), so a crash between the two
+   leaves a record a retry is compared against.
+
+   This is the arbiter between two ceremonies that both passed the pre-sign
+   check for the same parent: a plain INSERT under the table's PRIMARY KEY
+   (never OR REPLACE), so the first record wins and is never overwritten.
+   On a key conflict the existing row is re-read: same sighash -> success
+   (identical spend); different sighash -> conflict.
+
+   The client holds no open transaction during the ceremony, so this is an
+   autocommit statement on a journal_mode=WAL + synchronous=FULL
+   connection: PS_SAVE_RECORDED means the row has been fsync'd.
+
+   partial_sig: our 32-byte MuSig2 partial sig, zero-padded to 36 bytes.
+   Only the first signing of a parent is stored -- an identical re-save
+   (same sighash) leaves the existing row, partial_sig included, untouched.
+   It is not verifiable without that session's nonces, which are not
+   stored, and is never replayed.
+
+   Returns:
+      PS_SAVE_RECORDED   (1) = row inserted, or an identical row was already
+                               present.
+      PS_SAVE_CONFLICT   (0) = a row with a DIFFERENT sighash exists for this
+                               parent.  Caller MUST refuse.
+      PS_SAVE_ERROR     (-1) = any other failure (bad args, SQLite error,
+                               ambiguous conflict re-read).  Caller MUST
+                               abort before releasing the signature. */
+#define PS_SAVE_RECORDED   1
+#define PS_SAVE_CONFLICT   0
+#define PS_SAVE_ERROR    (-1)
 int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
                                    int leaf_node_idx,
                                    const unsigned char parent_txid[32],

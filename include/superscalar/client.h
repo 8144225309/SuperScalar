@@ -196,14 +196,21 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    Advances local leaf state, generates partial sig, sends LEAF_ADVANCE_PSIG,
    waits for LEAF_ADVANCE_DONE. Returns 1 on success.
 
-   PS double-spend defense: if client_set_persist() has been called with
-   a non-NULL handle, the PS advance path consults client_ps_signed_inputs
-   before signing and REFUSES if this client has already co-signed a TX
-   spending the same (parent_txid, parent_vout). See ZmnSCPxj §"Pseudo-
-   Spilman wide leaves" — PS has no revocation, so the client's refusal
-   is the only thing preventing an LSP double-spend. When no persist is
-   set, the defense is skipped (tests / in-process usage only — real
-   clients must call client_set_persist at startup). */
+   PS double-spend defense (record-and-refuse): if client_set_persist() has
+   been called with a non-NULL handle, the PS advance path computes the
+   sighash of the proposed spend, consults client_ps_signed_inputs BEFORE
+   any nonce exists, and REFUSES if this client has already co-signed a
+   DIFFERENT TX spending the same (parent_txid, parent_vout) -- or if that
+   lookup fails at all.  A matching sighash is an idempotent retry and is
+   re-signed.  After signing, the record is INSERTed (durable; first record
+   wins) BEFORE MSG_LEAF_ADVANCE_FINAL is sent; if the insert fails, or
+   loses to a conflicting record, the ceremony aborts and nothing is sent.
+   See ZmnSCPxj §"Pseudo-Spilman wide leaves" — PS has no revocation, so
+   the client's refusal is the only thing preventing an LSP double-spend.
+   When no persist is set, the defense is skipped (tests / in-process usage
+   only — real clients must call client_set_persist at startup).  The full
+   rule: docs/pseudo-spilman.md, "Record-and-refuse: ordering and failure
+   semantics". */
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory,
