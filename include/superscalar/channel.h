@@ -244,6 +244,8 @@ int channel_derive_revocation_privkey(const secp256k1_context *ctx,
 
 /* --- Channel lifecycle --- */
 
+/* On failure ch owns nothing (its arrays are freed and NULL): calling
+   channel_cleanup on it is safe and not needed. */
 int channel_init(channel_t *ch, secp256k1_context *ctx,
                   const unsigned char *local_funding_secret32,
                   const secp256k1_pubkey *local_funding_pubkey,

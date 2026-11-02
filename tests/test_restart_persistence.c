@@ -236,3 +236,62 @@ int test_restart_init_from_db_refuses_other_db(void) {
     return 1;
 }
 
+/* ---- A failed restore frees what it allocated ---- */
+
+/* channel_init freed its arrays on an allocation failure without clearing
+   the pointers, so a caller that then ran channel_cleanup (a failed
+   restore does, through lsp_channels_cleanup) freed them twice; its later
+   failures returned with the arrays still allocated.  Every failure now
+   leaves the channel owning nothing.  An all-zero funding secret fails the
+   keypair step, after the arrays are allocated. */
+int test_restart_channel_init_failure_owns_nothing(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx, "ctx");
+    secp256k1_pubkey a, b;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &a, rs_seckeys[0]), "pubkey a");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &b, rs_seckeys[1]), "pubkey b");
+    unsigned char zero_secret[32] = {0}, txid[32], spk[34];
+    memset(txid, 0x11, sizeof(txid));
+    memset(spk, 0x22, sizeof(spk));
+
+    channel_t ch;
+    TEST_ASSERT(!channel_init(&ch, ctx, zero_secret, &a, &b, txid, 0, 100000,
+                              spk, sizeof(spk), 50000, 50000,
+                              CHANNEL_DEFAULT_CSV_DELAY),
+                "channel_init fails on an invalid funding secret");
+    TEST_ASSERT(ch.htlcs == NULL && ch.htlcs_cap == 0, "HTLC array released");
+    TEST_ASSERT(ch.local_pcs == NULL, "local PCS array released");
+    TEST_ASSERT(ch.received_revocations == NULL &&
+                ch.received_revocation_valid == NULL, "revocation arrays released");
+    channel_cleanup(&ch);  /* a caller's cleanup is a no-op */
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A restore that fails part-way (channel 3 has no basepoints) frees the
+   channels it had already set up instead of leaking them. */
+int test_restart_restore_failure_frees_mgr(void) {
+    rs_fixture_t fx;
+    TEST_ASSERT(rs_setup(&fx, 3), "fixture without channel 3 basepoints");
+
+    factory_t *rec_f = NULL;
+    TEST_ASSERT(rs_load_factory(&fx, &rec_f), "load factory");
+    lsp_channel_mgr_t *rec_mgr = calloc(1, sizeof(*rec_mgr));
+    TEST_ASSERT(rec_mgr, "alloc");
+    TEST_ASSERT(!lsp_channels_init_from_db(rec_mgr, fx.ctx, rec_f,
+                                           rs_seckeys[0], 4, &fx.db),
+                "restore fails");
+    TEST_ASSERT(rec_mgr->entries == NULL, "entries freed");
+    TEST_ASSERT(rec_mgr->invoices == NULL, "invoices freed");
+    TEST_ASSERT(rec_mgr->htlc_origins == NULL, "htlc origins freed");
+    TEST_ASSERT_EQ(rec_mgr->n_channels, 0, "no channels left");
+
+    free(rec_mgr);
+    factory_free(rec_f);
+    free(rec_f);
+    rs_teardown(&fx);
+    return 1;
+}
+

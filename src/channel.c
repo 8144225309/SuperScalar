@@ -202,13 +202,8 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->local_pcs = calloc(512, 32);
     ch->received_revocations = calloc(512, 32);
     ch->received_revocation_valid = calloc(512, 1);
-    if (!ch->local_pcs || !ch->received_revocations || !ch->received_revocation_valid) {
-        free(ch->htlcs);
-        free(ch->local_pcs);
-        free(ch->received_revocations);
-        free(ch->received_revocation_valid);
-        return 0;
-    }
+    if (!ch->local_pcs || !ch->received_revocations || !ch->received_revocation_valid)
+        goto fail;
     ch->local_pcs_cap = 512;
     ch->revocations_cap = 512;
 
@@ -220,7 +215,7 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
 
     if (!secp256k1_keypair_create(ctx, &ch->local_funding_keypair,
                                     local_funding_secret32))
-        return 0;
+        goto fail;
 
     /* MuSig key aggregation: try both orderings and pick the one matching
        funding_spk. This ensures the channel's keyagg matches the factory's
@@ -266,7 +261,7 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
             /* Fallback: use [local, remote] (for tests not using factory SPKs) */
             secp256k1_pubkey pks[2] = { *local_funding_pubkey, *remote_funding_pubkey };
             if (!musig_aggregate_keys(ctx, &ch->funding_keyagg, pks, 2))
-                return 0;
+                goto fail;
             ch->local_funding_signer_idx = 0;
         }
     }
@@ -291,6 +286,15 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     channel_generate_local_pcs(ch, 1);
 
     return 1;
+
+fail:
+    /* channel_cleanup frees the arrays and clears the pointers, so a failed
+       init owns nothing and a caller's own channel_cleanup is a no-op.  The
+       allocation-failure path used to free the arrays and leave the
+       pointers set; the later failures returned with them allocated. */
+    channel_cleanup(ch);
+    secure_zero(ch->local_funding_secret, sizeof(ch->local_funding_secret));
+    return 0;
 }
 
 void channel_cleanup(channel_t *ch) {
