@@ -204,6 +204,17 @@ typedef struct {
        While set, the daemon loop re-runs revalidation on every new block. */
     int funding_anchor_unconfirmed;
 
+    /* The block that confirmed the factory funding TX
+       (funding_anchor_txid, display hex).  Recorded from gettxout while the
+       funding output is unspent, persisted in funding_anchors (v40), and
+       used when the output has been spent (factory closed, or its tree on
+       chain): the funding TX is still confirmed as long as this block is in
+       the active chain.  Lets revalidation work without -txindex and at any
+       depth. */
+    char    funding_anchor_txid[65];
+    int32_t funding_anchor_height;
+    char    funding_anchor_block[65];
+
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
     uint64_t locked_in_factories_sats;   /* capital in active factories */
@@ -420,6 +431,8 @@ int lsp_persist_ps_chain0_all(void *persist, factory_t *f);
    against the active chain.  What is checked is the factory's funding TX
    (lsp->factory.funding_txid), not ch->funding_txid: for a factory channel
    that is the off-chain leaf state TX, which is normally never broadcast.
+   The funding is checked through its output (gettxout) and its recorded
+   confirming block, so neither -txindex nor a scan depth limits it.
    Sets ch->funding_pending_reorg=1 when the funding TX is neither confirmed
    nor in the mempool, or has sat in the mempool past the network threshold;
    clears it back to 0 when it has >= 1 confirmation again.  Sets
@@ -437,6 +450,18 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    the next new block: some channel is frozen, or the last revalidation saw
    the funding TX unconfirmed. */
 int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr);
+
+/* Record the factory funding TX's confirming block (see
+   mgr->funding_anchor_*) if not known yet: from memory, then the DB, then
+   gettxout.  The daemon loop calls it on each new block until it is known.
+   Returns 1 when the anchor is known after the call. */
+int lsp_channels_note_funding_anchor(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Test hook: when set, the anchor recording calls it after the gettxout
+   read and before it looks up the block at the computed height, so a test
+   can change the chain inside that window.  NULL outside tests. */
+extern void (*lsp_channels_test_anchor_hook)(void *arg);
+extern void *lsp_channels_test_anchor_hook_arg;
 
 /* Reorg detection (R1) classification.  Pure: no I/O.
    st is the stored tip (from the previous poll), (cur_height, cur_hash) the

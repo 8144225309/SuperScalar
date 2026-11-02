@@ -3044,6 +3044,145 @@ static reval_state_t reval_funding_state(regtest_t *rt, const char *txid_hex,
                                                              : REVAL_PENDING;
 }
 
+/* ---- factory funding anchor (mgr->funding_anchor_*) ---- */
+
+static int reval_anchor_known(const lsp_channel_mgr_t *mgr, const char *fund_hex) {
+    return mgr->funding_anchor_height > 0 && mgr->funding_anchor_block[0] &&
+           strcmp(mgr->funding_anchor_txid, fund_hex) == 0;
+}
+
+static void reval_anchor_set(lsp_channel_mgr_t *mgr, const char *fund_hex,
+                             int32_t height, const char *block_hash, int save) {
+    snprintf(mgr->funding_anchor_txid, sizeof(mgr->funding_anchor_txid), "%s", fund_hex);
+    mgr->funding_anchor_height = height;
+    snprintf(mgr->funding_anchor_block, sizeof(mgr->funding_anchor_block), "%s", block_hash);
+    if (save && mgr->persist)
+        persist_save_funding_anchor((persist_t *)mgr->persist, fund_hex,
+                                    height, block_hash);
+}
+
+static void reval_anchor_load(lsp_channel_mgr_t *mgr, const char *fund_hex) {
+    if (reval_anchor_known(mgr, fund_hex) || !mgr->persist) return;
+    int32_t h = 0;
+    char hash[65];
+    if (persist_load_funding_anchor((persist_t *)mgr->persist, fund_hex, &h, hash) &&
+        h > 0)
+        reval_anchor_set(mgr, fund_hex, h, hash, 0);
+}
+
+void (*lsp_channels_test_anchor_hook)(void *arg) = NULL;
+void *lsp_channels_test_anchor_hook_arg = NULL;
+
+/* From an unspent output with conf >= 1 evaluated at `bestblock`: the
+   confirming block is at height(bestblock) - conf + 1.  The chain can
+   change between the gettxout read and the block-hash lookup (a reorg that
+   also drops the funding TX), so the block now at that height is recorded
+   only if it contains the funding TX. */
+static int reval_anchor_from_txout(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                                   const char *fund_hex, int conf,
+                                   const char *bestblock) {
+    if (conf < 1 || !bestblock[0]) return 0;
+    if (lsp_channels_test_anchor_hook)
+        lsp_channels_test_anchor_hook(lsp_channels_test_anchor_hook_arg);
+    int best_h = regtest_get_block_header_height(rt, bestblock);
+    if (best_h <= 0) return 0;
+    int32_t h = best_h - conf + 1;
+    char hash[65] = {0};
+    if (h <= 0 || !regtest_get_block_hash(rt, h, hash, sizeof(hash)) || !hash[0])
+        return 0;
+    if (reval_anchor_known(mgr, fund_hex) && mgr->funding_anchor_height == h &&
+        strcmp(mgr->funding_anchor_block, hash) == 0)
+        return 1;
+    if (regtest_block_contains_tx(rt, hash, fund_hex) != 1)
+        return 0;                    /* chain moved: record nothing */
+    reval_anchor_set(mgr, fund_hex, h, hash, 1);
+    return 1;
+}
+
+int lsp_channels_note_funding_anchor(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    static const unsigned char zero32[32] = {0};
+    if (!mgr || !lsp || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+    if (memcmp(lsp->factory.funding_txid, zero32, 32) == 0) return 0;
+    char fund_hex[65];
+    reval_txid_hex(lsp->factory.funding_txid, fund_hex);
+    reval_anchor_load(mgr, fund_hex);
+    if (reval_anchor_known(mgr, fund_hex)) return 1;
+    int conf = -1;
+    char best[65];
+    if (regtest_get_txout(mgr->watchtower->rt, fund_hex,
+                          lsp->factory.funding_vout, &conf, best) == 1 && conf >= 1)
+        return reval_anchor_from_txout(mgr, mgr->watchtower->rt, fund_hex,
+                                       conf, best);
+    return 0;
+}
+
+/* State of the factory funding TX, without -txindex or a scan depth:
+     1. gettxout on the funding output (mempool included).  Unspent: its
+        confirmations decide (>= 1 CONFIRMED, and the anchor is recorded;
+        0 in the mempool -> PENDING / STALE by age).
+     2. No unspent output: spent (factory closed, or its tree on chain) or
+        gone.  If the recorded anchor block is still in the active chain,
+        the funding TX is confirmed: CONFIRMED.  If the anchor block left the
+        chain, so did the TX unless it was mined again after the fork, which
+        a normal lookup finds near the tip: reval_funding_state().
+     3. No anchor and no unspent output: a confirmed-and-spent funding TX
+        deeper than this node can see (no -txindex, not a wallet TX) looks
+        the same as a vanished one, so only a definite answer from
+        reval_funding_state() counts; "not found" (-1) is UNKNOWN.  A
+        conflicted wallet TX (REGTEST_CONF_CONFLICTED) is definite: GONE. */
+static reval_state_t reval_factory_funding(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                                           const factory_t *f,
+                                           const char *fund_hex, int *conf_out) {
+    reval_anchor_load(mgr, fund_hex);
+    int conf = -1;
+    char best[65];
+    int r = regtest_get_txout(rt, fund_hex, f->funding_vout, &conf, best);
+    if (r < 0) {
+        *conf_out = REGTEST_CONF_RPC_ERROR;
+        return REVAL_UNKNOWN;
+    }
+    if (r == 1) {
+        *conf_out = conf;
+        if (conf >= 1) {
+            int keep = 0;
+            if (reval_anchor_known(mgr, fund_hex)) {
+                char at[65] = {0};
+                keep = regtest_get_block_hash(rt, mgr->funding_anchor_height,
+                                              at, sizeof(at)) &&
+                       strcmp(at, mgr->funding_anchor_block) == 0;
+            }
+            if (!keep)
+                reval_anchor_from_txout(mgr, rt, fund_hex, conf, best);
+            return REVAL_CONFIRMED;
+        }
+        int age = regtest_get_mempool_entry_seconds_ago(rt, fund_hex);
+        if (age < 0 && regtest_last_rpc_unreachable()) return REVAL_UNKNOWN;
+        if (age < 0) return REVAL_PENDING;   /* mined or dropped since gettxout */
+        return age >= regtest_network_mempool_freeze_seconds(rt) ? REVAL_STALE
+                                                                 : REVAL_PENDING;
+    }
+    if (reval_anchor_known(mgr, fund_hex)) {
+        char at[65] = {0};
+        if (!regtest_get_block_hash(rt, mgr->funding_anchor_height, at, sizeof(at))) {
+            if (regtest_last_rpc_unreachable()) {
+                *conf_out = REGTEST_CONF_RPC_ERROR;
+                return REVAL_UNKNOWN;
+            }
+            at[0] = '\0';                    /* chain now shorter than the anchor */
+        }
+        if (at[0] && strcmp(at, mgr->funding_anchor_block) == 0) {
+            int tip = regtest_get_block_height(rt);
+            *conf_out = tip >= mgr->funding_anchor_height
+                      ? tip - mgr->funding_anchor_height + 1 : 1;
+            return REVAL_CONFIRMED;
+        }
+        return reval_funding_state(rt, fund_hex, conf_out);
+    }
+    reval_state_t st = reval_funding_state(rt, fund_hex, conf_out);
+    if (st == REVAL_GONE && *conf_out == -1) return REVAL_UNKNOWN;
+    return st;
+}
+
 static int lsp_channels_any_funding_frozen(const lsp_channel_mgr_t *mgr) {
     if (!mgr || !mgr->entries) return 0;
     for (size_t c = 0; c < mgr->n_channels; c++)
@@ -3071,7 +3210,9 @@ int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr) {
    the active one have no entries in mgr.  A leaf TX can only be on chain if
    the factory funding TX is, so the leaf is never consulted.
 
-   Per call, the factory funding TX is classified once (reval_funding_state):
+   Per call, the factory funding TX is classified once
+   (reval_factory_funding: its output via gettxout, else its recorded
+   confirming block, see mgr->funding_anchor_*):
      - CONFIRMED: frozen channels are unfrozen.
      - GONE (not confirmed, not in the mempool) or STALE (in the mempool past
        the per-network threshold): channels are frozen.
@@ -3106,7 +3247,7 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     reval_state_t fund_state = REVAL_GONE;
     if (use_factory) {
         reval_txid_hex(f->funding_txid, fund_hex);
-        fund_state = reval_funding_state(rt, fund_hex, &fund_conf);
+        fund_state = reval_factory_funding(mgr, rt, f, fund_hex, &fund_conf);
     }
 
     for (size_t c = 0; c < mgr->n_channels; c++) {
@@ -3173,8 +3314,9 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
     if (any_unknown)
-        fprintf(stderr, "LSP revalidate: bitcoind unreachable, funding state "
-                "unknown — no change\n");
+        fprintf(stderr, "LSP revalidate: funding state unknown (bitcoind "
+                "unreachable, or a spent funding output with no recorded "
+                "block) — no change\n");
     else
         mgr->funding_anchor_unconfirmed = any_unconfirmed;
     return changed;
@@ -7365,6 +7507,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                   chain_rec);
                         }
                     }
+                    /* Record the factory funding's confirming block once
+                       (cheap after that), so revalidation does not need
+                       -txindex. */
+                    if (reorg_kind != LSP_REORG_INCONCLUSIVE && height > 0 &&
+                        (height != daemon_prev_height ||
+                         strcmp(cur_tip_hash, daemon_prev_hash) != 0))
+                        lsp_channels_note_funding_anchor(mgr, lsp);
                     /* On each new block, re-check the funding anchor while a
                        channel is frozen or the factory funding has not yet
                        re-confirmed after a reorg

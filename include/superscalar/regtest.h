@@ -123,6 +123,23 @@ int   regtest_get_confirmations(regtest_t *rt, const char *txid);
    bitcoind (connection failure, timeout, bitcoin-cli unable to connect or
    to run); 0 when bitcoind answered, even with an RPC error. */
 int   regtest_last_rpc_unreachable(void);
+
+/* gettxout txid:vout, mempool included.  Returns 1 when the output is
+   unspent (confirmations: >= 1 in a block, 0 in the mempool; bestblock is
+   the tip it was evaluated at), 0 when there is no unspent output (spent,
+   or the TX is in neither the chain nor the mempool), -1 when bitcoind
+   could not be reached or answered with an error.  Needs no -txindex. */
+int   regtest_get_txout(regtest_t *rt, const char *txid_hex, uint32_t vout,
+                        int *confirmations, char bestblock_out[65]);
+
+/* Height of a block by hash (getblockheader), -1 on error. */
+int   regtest_get_block_header_height(regtest_t *rt, const char *block_hash);
+
+/* 1 when the block block_hash contains txid_hex, 0 when it does not (or
+   bitcoind answered with an error), -1 when bitcoind could not be reached.
+   getrawtransaction with a block hash: needs no -txindex. */
+int   regtest_block_contains_tx(regtest_t *rt, const char *block_hash,
+                                const char *txid_hex);
 /*
  * Batch confirmations for n_txids display-order hex txids.
  * Fetches each block only once (getblock hash 1), O(scan_depth) RPCs total.

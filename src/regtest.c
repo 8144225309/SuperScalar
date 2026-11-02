@@ -929,6 +929,71 @@ int regtest_get_tip(regtest_t *rt, int *height_out, char hash_out[65]) {
     return ok;
 }
 
+int regtest_get_txout(regtest_t *rt, const char *txid_hex, uint32_t vout,
+                      int *confirmations, char bestblock_out[65]) {
+    if (confirmations) *confirmations = -1;
+    if (bestblock_out) bestblock_out[0] = '\0';
+    if (!rt || !txid_hex) return -1;
+    char params[128];
+    snprintf(params, sizeof(params), "\"%s\" %u true", txid_hex, (unsigned)vout);
+    char *r = regtest_exec(rt, "gettxout", params);
+    if (regtest_last_rpc_unreachable() || !r) { free(r); return -1; }
+    const char *p = r;
+    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+    if (*p == '\0' || strncmp(p, "null", 4) == 0) { free(r); return 0; }
+    cJSON *j = cJSON_Parse(p);
+    free(r);
+    if (!j) return -1;               /* e.g. bitcoin-cli "error code: ..." */
+    int ok = -1;
+    cJSON *c = cJSON_GetObjectItem(j, "confirmations");
+    cJSON *b = cJSON_GetObjectItem(j, "bestblock");
+    if (c && cJSON_IsNumber(c)) {
+        if (confirmations) *confirmations = c->valueint;
+        if (bestblock_out && b && cJSON_IsString(b) && b->valuestring &&
+            strlen(b->valuestring) == 64)
+            memcpy(bestblock_out, b->valuestring, 65);
+        ok = 1;
+    }
+    cJSON_Delete(j);
+    return ok;
+}
+
+int regtest_get_block_header_height(regtest_t *rt, const char *block_hash) {
+    if (!rt || !block_hash || strlen(block_hash) != 64) return -1;
+    char params[96];
+    snprintf(params, sizeof(params), "\"%s\"", block_hash);
+    char *r = regtest_exec(rt, "getblockheader", params);
+    if (!r) return -1;
+    cJSON *j = cJSON_Parse(r);
+    free(r);
+    if (!j) return -1;
+    int h = -1;
+    cJSON *hh = cJSON_GetObjectItem(j, "height");
+    if (hh && cJSON_IsNumber(hh)) h = hh->valueint;
+    cJSON_Delete(j);
+    return h;
+}
+
+int regtest_block_contains_tx(regtest_t *rt, const char *block_hash,
+                              const char *txid_hex) {
+    if (!rt || !block_hash || !txid_hex || strlen(block_hash) != 64 ||
+        strlen(txid_hex) != 64)
+        return -1;
+    char params[192];
+    snprintf(params, sizeof(params), "\"%s\" true \"%s\"", txid_hex, block_hash);
+    char *r = regtest_exec(rt, "getrawtransaction", params);
+    if (regtest_last_rpc_unreachable()) { free(r); return -1; }
+    if (!r) return 0;
+    cJSON *j = cJSON_Parse(r);
+    free(r);
+    if (!j) return 0;                /* e.g. -5: not in that block */
+    cJSON *t = cJSON_GetObjectItem(j, "txid");
+    int in = t && cJSON_IsString(t) && t->valuestring &&
+             strcmp(t->valuestring, txid_hex) == 0;
+    cJSON_Delete(j);
+    return in;
+}
+
 int regtest_get_chain_tips(regtest_t *rt, regtest_chain_tip_t *out,
                            size_t max, size_t *n_out) {
     if (n_out) *n_out = 0;

@@ -4096,6 +4096,14 @@ static void run_regtest_tests(void) {
         extern int test_regtest_reorg_tip_snapshot_consistent(void);
         extern int test_regtest_reorg_unseen_tip_block_detected(void);
         RUN_TEST(test_regtest_reorg_revalidate_factory_funding);
+        extern int test_regtest_reorg_revalidate_deep_funding(void);
+        RUN_TEST(test_regtest_reorg_revalidate_deep_funding);
+        extern int test_regtest_reorg_revalidate_anchor_race(void);
+        extern int test_regtest_reorg_revalidate_spent_funding_reorged_out(void);
+        extern int test_regtest_reorg_revalidate_conflicted_funding_no_anchor(void);
+        RUN_TEST(test_regtest_reorg_revalidate_anchor_race);
+        RUN_TEST(test_regtest_reorg_revalidate_spent_funding_reorged_out);
+        RUN_TEST(test_regtest_reorg_revalidate_conflicted_funding_no_anchor);
         RUN_TEST(test_regtest_reorg_unseen_tip_block_detected);
         /* Mines 300 blocks: keep it last so earlier tests keep subsidy. */
         RUN_TEST(test_regtest_reorg_tip_snapshot_consistent);
