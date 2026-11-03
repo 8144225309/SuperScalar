@@ -206,8 +206,6 @@ int test_lsp_channel_init(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -1831,8 +1829,6 @@ int test_fee_policy_balance_split(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -2004,8 +2000,6 @@ int test_fee_estimator_wiring(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
@@ -2074,8 +2068,6 @@ int test_fee_estimator_null_fallback(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
@@ -2762,6 +2754,7 @@ int test_profit_settlement_calculation(void) {
 
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -2803,6 +2796,7 @@ int test_settlement_trigger_at_interval(void) {
     TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -2839,6 +2833,7 @@ int test_on_close_includes_unsettled(void) {
     TEST_ASSERT_EQ(share1, 900, "client 1 unsettled share (per-channel)");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -3831,6 +3826,7 @@ int test_fee_accumulation_and_settlement(void) {
                    "LSP local decreased by per-channel share");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -3942,6 +3938,7 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             free(mgr.entries);
+            factory_free(f);
             free(f);
         }
     }
@@ -4013,8 +4010,6 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Factory with step_blocks=6, states_per_layer=2, 5 participants */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     factory_init(f, ctx, kps, 5, 6, 2);
 
     uint32_t delta = lsp_compute_factory_cltv_delta(f);
@@ -4174,6 +4169,7 @@ int test_close_outputs_wallet_spk(void) {
                 "override beats lsp_close_spk: client 0 uses override");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -4206,8 +4202,6 @@ int test_lsp_close_spk_derived(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -4478,8 +4472,6 @@ int test_client_ps_double_spend_defense_refuses(void) {
     memset(fake_fund_txid, 0x7A, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, N, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
