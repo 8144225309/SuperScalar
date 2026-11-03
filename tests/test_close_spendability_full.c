@@ -746,7 +746,8 @@ static int run_breach_penalty(regtest_t *rt, secp256k1_context *ctx,
     client_ch.commitment_number = 1;
     unsigned char lsp_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* LSP (attacker) broadcasts OLD commitment. */
     char commit_hex[sc.len * 2 + 1];

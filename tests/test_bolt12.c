@@ -261,7 +261,7 @@ int test_persist_schema_v3(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 39, "schema version is 39 (v39 adds factories.use_hashlock_poison for #59 restart-resume; v38 adds #53-B3b l_stock_poison_reveals; v37 adds the #327 at-rest field-encryption marker)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 41, "schema version is 41 (v41 adds jit_channels.revocation_failed; v40 adds funding_anchors + reorg_tips for reorg revalidation / startup reorg check; v39 adds factories.use_hashlock_poison for #59 restart-resume; v38 adds #53-B3b l_stock_poison_reveals; v37 adds the #327 at-rest field-encryption marker)");
     persist_close(&p);
     return 1;
 }

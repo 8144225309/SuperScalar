@@ -796,8 +796,10 @@ int test_regtest_breach_penalty_cpfp(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* --- Client watchtower: register old commitment #0 for monitoring.
        watchtower_set_channel dropped in #208 A3.2 — direct field access
@@ -1030,8 +1032,10 @@ int test_regtest_watchtower_mempool_detection(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* Register commitment #0 with watchtower.
        watchtower_set_channel dropped in #208 A3.2 — direct field access
@@ -1101,6 +1105,169 @@ int test_regtest_watchtower_mempool_detection(void) {
     secp256k1_context_destroy(ctx);
     channel_cleanup(&client_ch);
     channel_cleanup(&lsp_ch);
+    return 1;
+}
+
+/* The watch table used to be a fixed 128 entries for the whole daemon,
+   and registrations past that were dropped silently.  Revoke 200 LSP
+   commitments, register each with the client's watchtower, then broadcast
+   the revoked commitment #150 (registered well after the 128th): the
+   watchtower must detect it and its penalty must confirm. */
+int test_regtest_watchtower_breach_beyond_128(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  FAIL: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    regtest_create_wallet(&rt, "test_wt_beyond_128");
+
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mining address");
+    if (!regtest_fund_from_faucet(&rt, 1.0))
+        regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair kps[2];
+    musig_keyagg_t keyagg;
+    char factory_addr[128];
+    char funding_txid_hex[65];
+    int found_vout = -1;
+    uint64_t fund_amount;
+    unsigned char fund_spk[34];
+    size_t fund_spk_len;
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr,
+                                funding_txid_hex, &found_vout,
+                                &fund_amount, fund_spk, &fund_spk_len),
+                "factory setup");
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    secp256k1_pubkey lsp_pk, client_pk;
+    if (!secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0])) return 0;
+    if (!secp256k1_keypair_pub(ctx, &client_pk, &kps[1])) return 0;
+
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
+    uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : fund_amount;
+    uint64_t local_amt = usable / 2;
+    uint64_t remote_amt = usable - local_amt;
+    uint32_t csv_delay = 6;
+
+    channel_t lsp_ch, client_ch;
+    TEST_ASSERT(channel_init(&lsp_ch, ctx, lsp_seckey, &lsp_pk, &client_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34, local_amt, remote_amt, csv_delay),
+                "init LSP channel");
+    TEST_ASSERT(channel_init(&client_ch, ctx, client_seckey, &client_pk, &lsp_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34, remote_amt, local_amt, csv_delay),
+                "init client channel");
+    channel_generate_random_basepoints(&lsp_ch);
+    channel_generate_random_basepoints(&client_ch);
+    channel_set_remote_basepoints(&lsp_ch,
+        &client_ch.local_payment_basepoint,
+        &client_ch.local_delayed_payment_basepoint,
+        &client_ch.local_revocation_basepoint);
+    channel_set_remote_basepoints(&client_ch,
+        &lsp_ch.local_payment_basepoint,
+        &lsp_ch.local_delayed_payment_basepoint,
+        &lsp_ch.local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    /* Durable committed points, as in production (see the mempool test). */
+    persist_t pcp_db;
+    TEST_ASSERT(persist_open(&pcp_db, NULL), "open in-memory pcp db");
+    channel_set_persist(&lsp_ch, &pcp_db, 1);
+    channel_set_persist(&client_ch, &pcp_db, 2);
+
+    const uint64_t N = 200, TARGET = 150;
+    for (uint64_t k = 2; k <= N + 1; k++)
+        TEST_ASSERT(channel_generate_local_pcs(&lsp_ch, k), "LSP pcs");
+    secp256k1_pubkey pcp;
+    for (uint64_t k = 0; k < 2; k++) {
+        TEST_ASSERT(channel_get_per_commitment_point(&lsp_ch, k, &pcp), "lsp pcp");
+        channel_set_remote_pcp(&client_ch, k, &pcp);
+    }
+
+    watchtower_t wt;
+    TEST_ASSERT(watchtower_init(&wt, 1, &rt, (fee_estimator_t *)&fe, NULL),
+                "watchtower_init");
+
+    tx_buf_t target_signed;
+    tx_buf_init(&target_signed, 1024);
+    unsigned char target_txid[32];
+    int regs_ok = 1;
+    for (uint64_t cn = 0; cn < N; cn++) {
+        if (cn == TARGET) {
+            /* The LSP's fully signed commitment #TARGET: the breach. */
+            tx_buf_t unsigned_tx;
+            tx_buf_init(&unsigned_tx, 512);
+            lsp_ch.commitment_number = cn;
+            TEST_ASSERT(channel_build_commitment_tx(&lsp_ch, &unsigned_tx, target_txid),
+                        "build target commitment");
+            TEST_ASSERT(channel_sign_commitment(&lsp_ch, &target_signed, &unsigned_tx,
+                                                  &kps[1]),
+                        "sign target commitment");
+            tx_buf_free(&unsigned_tx);
+        }
+        /* Advance to cn+1: the client learns the LSP's next point and
+           receives (verified) the LSP's secret for cn. */
+        TEST_ASSERT(channel_get_per_commitment_point(&lsp_ch, cn + 1, &pcp), "next pcp");
+        channel_set_remote_pcp(&client_ch, cn + 1, &pcp);
+        lsp_ch.commitment_number = cn + 1;
+        client_ch.commitment_number = cn + 1;
+        unsigned char secret[32];
+        TEST_ASSERT(channel_get_revocation_secret(&lsp_ch, cn, secret), "LSP secret");
+        TEST_ASSERT(channel_receive_revocation(&client_ch, cn, secret),
+                    "client stores the LSP revocation");
+        int reg = watchtower_watch_revoked_commitment(&wt, &client_ch, 0, cn,
+                      client_ch.local_amount, client_ch.remote_amount,
+                      NULL, 0, NULL, 0);
+        if (!reg) regs_ok = 0;
+    }
+    printf("  %llu revoked commitments registered, %zu watched\n",
+           (unsigned long long)N, wt.n_entries);
+
+    /* BREACH: broadcast the revoked commitment #TARGET. */
+    char *hex = (char *)malloc(target_signed.len * 2 + 1);
+    hex_encode(target_signed.data, target_signed.len, hex);
+    char breach_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, hex, breach_txid_hex);
+    free(hex);
+    TEST_ASSERT(sent, "broadcast revoked commitment #150");
+    printf("  BREACH broadcast (commitment %llu): %s\n",
+           (unsigned long long)TARGET, breach_txid_hex);
+
+    int penalties = watchtower_check(&wt);
+    printf("  watchtower_check: %d penalty tx(s)\n", penalties);
+    TEST_ASSERT(penalties > 0, "breach of commitment #150 detected and penalised");
+
+    /* The broadcast penalty is tracked for confirmation (CPFP table). */
+    char penalty_txid[65] = {0};
+    if (wt.n_pending > 0)
+        memcpy(penalty_txid, wt.pending[0].txid, sizeof penalty_txid);
+    TEST_ASSERT(penalty_txid[0] != '\0', "penalty tracked for confirmation");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int pconf = regtest_get_confirmations(&rt, penalty_txid);
+    printf("  penalty %s confirmations=%d\n", penalty_txid, pconf);
+    TEST_ASSERT(pconf >= 1, "penalty confirmed on chain");
+    watchtower_check(&wt);
+
+    TEST_ASSERT(regs_ok, "every registration reported success");
+    TEST_ASSERT(wt.n_entries >= N - 1, "all revoked commitments stayed watched");
+
+    tx_buf_free(&target_signed);
+    persist_close(&pcp_db);
+    watchtower_cleanup(&wt);
+    channel_cleanup(&client_ch);
+    channel_cleanup(&lsp_ch);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 
@@ -1235,8 +1402,10 @@ int test_regtest_watchtower_late_detection(void) {
     unsigned char lsp_secret0[32], client_secret0[32];
     channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
     channel_get_revocation_secret(&client_ch, 0, client_secret0);
-    channel_receive_revocation(&lsp_ch, 0, client_secret0);
-    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+    TEST_ASSERT(channel_receive_revocation(&lsp_ch, 0, client_secret0),
+                "LSP stores the client revocation");
+    TEST_ASSERT(channel_receive_revocation(&client_ch, 0, lsp_secret0),
+                "client stores the LSP revocation");
 
     /* Register commitment #0 with watchtower.
        watchtower_set_channel dropped in #208 A3.2 — direct field access

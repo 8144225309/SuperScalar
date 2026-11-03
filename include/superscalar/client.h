@@ -147,6 +147,27 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
 int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
                                        const wire_msg_t *msg);
 
+/* Outcome of client_accept_lsp_revocation(). */
+#define CLIENT_LSP_REV_OK          1  /* verified, stored, revoked commitment watched */
+#define CLIENT_LSP_REV_REJECTED    0  /* failed verification: nothing stored or watched */
+#define CLIENT_LSP_REV_UNWATCHED (-1) /* verified and stored, but NOT watched */
+
+struct watchtower_s;
+
+/* Apply the LSP's own revocation (MSG_LSP_REVOKE_AND_ACK) for the LSP
+   commitment the client just replaced, and register that revoked commitment
+   with the client's watchtower (wt may be NULL).  old_local / old_remote /
+   old_htlcs describe the revoked commitment from the client's side.  Every
+   daemon path that receives an LSP revocation goes through here.  The caller
+   must act on anything but CLIENT_LSP_REV_OK: REJECTED is an LSP protocol
+   violation (apply the --on-lsp-forgery policy); UNWATCHED means the client
+   must stop accepting commitments it cannot protect. */
+int client_accept_lsp_revocation(channel_t *ch, secp256k1_context *ctx,
+                                 const wire_msg_t *msg,
+                                 struct watchtower_s *wt,
+                                 uint64_t old_local, uint64_t old_remote,
+                                 const htlc_t *old_htlcs, size_t old_n_htlcs);
+
 /* Item-1 escalation policy: how the client responds once it DETECTS a forged LSP
    revocation (i.e. client_handle_lsp_revoke_and_ack returned 0 — fail-closed). In
    every mode the bad secret is refused and NO watchtower is armed from it; the

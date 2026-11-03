@@ -575,6 +575,7 @@ typedef struct {
     int     lsp_leaf_is_ps;         /* 1 if this factory uses PS (CLTV-gated) leaves (#21) */
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
+    int     wt_register_failed;     /* 1 once a revoked LSP commitment could not be watched */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
 } daemon_cb_data_t;
 
@@ -749,6 +750,118 @@ static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) 
    revoked (before the state-advancing add/fulfill that preceded this). */
 static void client_mark_lsp_poisoned(const char *db_path, const char *reason);  /* #20 fwd-decl */
 
+/* Item-1 escalation: the LSP answered with a revocation that failed
+   verification.  The bad secret was refused and no watchtower was armed from
+   it; apply the configured response so the client does not keep building
+   states it cannot protect against a proven-cheating LSP. */
+static void client_on_lsp_revocation_forgery(daemon_cb_data_t *cbd,
+                                             uint32_t my_index) {
+    if (!cbd) return;
+    cbd->lsp_forgery_detected = 1;
+    /* #21 per-leaf-type: a PS (CLTV-gated) leaf MAY warrant a different
+       response than a revocation-gated leaf. We default to UNIFORM (the PS
+       override is "inherit" unless the operator explicitly set
+       --on-lsp-forgery-ps) and NEVER auto-downgrade: PS leaf *chaining*
+       does not by itself prove the channel-level revocation is non-load-
+       bearing (open security-model question — see revocation doc §9). The
+       leaf type is reported so the operator/auditor sees the severity. */
+    int mode = cbd->lsp_forgery_response;
+    if (cbd->lsp_leaf_is_ps && cbd->lsp_forgery_response_ps >= 0)
+        mode = cbd->lsp_forgery_response_ps;
+    fprintf(stderr, "Client %u: forgery on a %s leaf\n", my_index,
+            cbd->lsp_leaf_is_ps ? "PS/CLTV-gated" : "revocation-gated");
+    switch (mode) {
+    case LSP_FORGERY_HALT:
+        fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — HALT "
+                "policy: refusing all further commitments. Operator should "
+                "force-close (--force-close) on the last verified state.\n",
+                my_index);
+        client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (halt)");
+        break;
+    case LSP_FORGERY_CLOSE:
+        fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — CLOSE "
+                "policy: force-closing on the last verified state.\n", my_index);
+        cbd->force_close_requested = 1;
+        client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (close)");
+        break;
+    case LSP_FORGERY_CONTINUE:
+    default:
+        break;  /* legacy: refuse + no-arm, keep the session */
+    }
+    /* Collapse to the effective decision so the daemon-loop / reconnect
+       break (which reads lsp_forgery_response) honours the PS override. */
+    cbd->lsp_forgery_response = mode;
+}
+
+/* A verified LSP revocation could not be registered with the client
+   watchtower (out of memory, or the DB write failed), so that revoked LSP
+   commitment is not protected by this process.  Stop accepting commitments:
+   each would add another state we cannot protect.  The watch's DB row is
+   written before the in-memory insert, so a restart re-arms it when only the
+   in-memory side failed. */
+static void client_on_unwatched_revocation(daemon_cb_data_t *cbd,
+                                           uint32_t my_index) {
+    fprintf(stderr, "Client %u: CRITICAL: a revoked LSP commitment could not be "
+            "registered with the watchtower; halting (restart to re-arm it "
+            "from the DB)\n", my_index);
+    if (cbd) cbd->wt_register_failed = 1;
+}
+
+/* Persist the LSP's per-commitment points (the handler set the next one in
+   memory) and the client's own PCS, for crash recovery. */
+static void client_persist_lsp_points(daemon_cb_data_t *cbd, channel_t *ch,
+                                      secp256k1_context *ctx) {
+    if (!cbd || !cbd->db || ch->commitment_number == 0) return;
+    unsigned char ser[33];
+    size_t slen;
+    secp256k1_pubkey pcp;
+    if (channel_get_remote_pcp(ch, ch->commitment_number + 1, &pcp)) {
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                       SECP256K1_EC_COMPRESSED);
+        persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
+    }
+    if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
+        slen = 33;
+        secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                       SECP256K1_EC_COMPRESSED);
+        persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
+    }
+    unsigned char pcs[32];
+    if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
+        persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
+    if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
+        persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
+    memset(pcs, 0, 32);
+}
+
+/* Apply an LSP revocation through the shared library helper and act on the
+   outcome.  Used by both daemon paths that receive MSG_LSP_REVOKE_AND_ACK. */
+static void client_apply_lsp_revocation(channel_t *ch, daemon_cb_data_t *cbd,
+                                        secp256k1_context *ctx,
+                                        const wire_msg_t *msg,
+                                        uint64_t old_local, uint64_t old_remote,
+                                        const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                        uint32_t my_index) {
+    /* Revocation-verification standard (client side): verify + retain the
+       LSP's revocation and arm the client watchtower for the LSP commitment
+       it revokes.  Fail-closed: a secret that does not match the LSP's
+       committed point is never stored and never arms the watchtower (it
+       would build a penalty that can't spend). */
+    int rv = client_accept_lsp_revocation(ch, ctx, msg, cbd ? cbd->wt : NULL,
+                                          old_local, old_remote,
+                                          old_htlcs, old_n_htlcs);
+    if (rv == CLIENT_LSP_REV_REJECTED) {
+        fprintf(stderr, "Client %u: LSP revocation FAILED verification "
+                "— refusing (penalty NOT armed)\n", my_index);
+        client_on_lsp_revocation_forgery(cbd, my_index);
+        return;
+    }
+    if (rv == CLIENT_LSP_REV_UNWATCHED)
+        client_on_unwatched_revocation(cbd, my_index);
+    client_persist_lsp_points(cbd, ch, ctx);
+}
+
 static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *cbd,
                                          secp256k1_context *ctx,
                                          uint64_t old_local, uint64_t old_remote,
@@ -764,95 +877,8 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         cJSON_Delete(rev_msg.json);
         return;
     }
-    /* Revocation-verification standard (client side): verify + retain the LSP's
-       revocation via the shared, tested handler (fail-closed). It checks
-       secret*G == the LSP's committed point, stores the secret, and tracks the
-       LSP's next per-commitment point. If verification fails we must NOT arm the
-       watchtower from a bad secret (it would build a penalty that can't spend). */
-    if (!client_handle_lsp_revoke_and_ack(ch, ctx, &rev_msg)) {
-        fprintf(stderr, "Client %u: LSP revocation FAILED verification "
-                "— refusing (penalty NOT armed)\n", my_index);
-        /* Item-1 escalation: the bad secret is already refused and no watchtower
-           is armed from it. Apply the configured response so the client does not
-           keep building states it cannot protect against a proven-cheating LSP. */
-        if (cbd) {
-            cbd->lsp_forgery_detected = 1;
-            /* #21 per-leaf-type: a PS (CLTV-gated) leaf MAY warrant a different
-               response than a revocation-gated leaf. We default to UNIFORM (the PS
-               override is "inherit" unless the operator explicitly set
-               --on-lsp-forgery-ps) and NEVER auto-downgrade: PS leaf *chaining*
-               does not by itself prove the channel-level revocation is non-load-
-               bearing (open security-model question — see revocation doc §9). The
-               leaf type is reported so the operator/auditor sees the severity. */
-            int mode = cbd->lsp_forgery_response;
-            if (cbd->lsp_leaf_is_ps && cbd->lsp_forgery_response_ps >= 0)
-                mode = cbd->lsp_forgery_response_ps;
-            fprintf(stderr, "Client %u: forgery on a %s leaf\n", my_index,
-                    cbd->lsp_leaf_is_ps ? "PS/CLTV-gated" : "revocation-gated");
-            switch (mode) {
-            case LSP_FORGERY_HALT:
-                fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — HALT "
-                        "policy: refusing all further commitments. Operator should "
-                        "force-close (--force-close) on the last verified state.\n",
-                        my_index);
-                client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (halt)");
-                break;
-            case LSP_FORGERY_CLOSE:
-                fprintf(stderr, "Client %u: CRITICAL: LSP revocation forgery — CLOSE "
-                        "policy: force-closing on the last verified state.\n", my_index);
-                cbd->force_close_requested = 1;
-                client_mark_lsp_poisoned(cbd->poison_db_path, "lsp revocation forgery (close)");
-                break;
-            case LSP_FORGERY_CONTINUE:
-            default:
-                break;  /* legacy: refuse + no-arm, keep the session */
-            }
-            /* Collapse to the effective decision so the daemon-loop / reconnect
-               break (which reads lsp_forgery_response) honours the PS override. */
-            cbd->lsp_forgery_response = mode;
-        }
-        cJSON_Delete(rev_msg.json);
-        return;
-    }
-    if (ch->commitment_number > 0) {
-        uint64_t old_cn = ch->commitment_number - 1;
-
-        /* Arm the client watchtower with the now-verified revoked commitment.
-           Local channel index 0 (the client watchtower has one channel). */
-        if (cbd && cbd->wt) {
-            watchtower_watch_revoked_commitment(cbd->wt, ch,
-                0, old_cn,
-                old_local, old_remote,
-                old_htlcs, old_n_htlcs,
-                /* SF-W-PTLC: no PTLC snapshot at this callsite */ NULL, 0);
-        }
-
-        /* Persist remote PCPs (handler set the next one in-memory) + local PCS
-           for crash recovery. */
-        if (cbd && cbd->db) {
-            unsigned char ser[33];
-            size_t slen;
-            secp256k1_pubkey pcp;
-            if (channel_get_remote_pcp(ch, ch->commitment_number + 1, &pcp)) {
-                slen = 33;
-                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
-                                               SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
-            }
-            if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
-                slen = 33;
-                secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
-                                               SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
-            }
-            unsigned char pcs[32];
-            if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
-                persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
-            if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
-                persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
-            memset(pcs, 0, 32);
-        }
-    }
+    client_apply_lsp_revocation(ch, cbd, ctx, &rev_msg, old_local, old_remote,
+                                old_htlcs, old_n_htlcs, my_index);
     cJSON_Delete(rev_msg.json);
 }
 
@@ -1041,6 +1067,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             fprintf(stderr, "Client %u: halting daemon loop (LSP revocation forgery, "
                     "policy=%s)\n", my_index,
                     cbd->lsp_forgery_response == LSP_FORGERY_CLOSE ? "close" : "halt");
+            break;
+        }
+        if (cbd && cbd->wt_register_failed) {
+            fprintf(stderr, "Client %u: halting daemon loop (a revoked LSP "
+                    "commitment could not be watched)\n", my_index);
             break;
         }
 
@@ -1449,44 +1480,18 @@ handle_message:
         case MSG_LSP_REVOKE_AND_ACK: {
             /* LSP's own revocation, arriving naturally in the daemon loop.
                This happens when a queued CS was processed from the inbox:
-               client_handle_commitment_signed sent RAA, LSP responded with this. */
-            uint32_t lra_chan_id;
-            unsigned char lra_rev_secret[32], lra_next_point[33];
-            if (wire_parse_revoke_and_ack(msg.json, &lra_chan_id,
-                                            lra_rev_secret, lra_next_point)) {
-                uint64_t old_cn = ch->commitment_number > 0
-                                  ? ch->commitment_number - 1 : 0;
-                if (ch->commitment_number > 0)
-                    channel_receive_revocation(ch, old_cn, lra_rev_secret);
-                /* Register revoked commitment with client watchtower */
-                if (cbd && cbd->wt && ch->commitment_number > 0) {
-                    uint64_t wt_local = cbd->pending_wt_valid
-                                        ? cbd->pending_wt_local : ch->local_amount;
-                    uint64_t wt_remote = cbd->pending_wt_valid
-                                         ? cbd->pending_wt_remote : ch->remote_amount;
-                    const htlc_t *wt_htlcs = (cbd->pending_wt_valid &&
-                                              cbd->pending_wt_n_htlcs > 0)
-                                             ? cbd->pending_wt_htlcs : NULL;
-                    size_t wt_n_htlcs = cbd->pending_wt_valid
-                                        ? cbd->pending_wt_n_htlcs : 0;
-                    watchtower_watch_revoked_commitment(cbd->wt, ch,
-                        0, old_cn, wt_local, wt_remote, wt_htlcs, wt_n_htlcs,
-                        /* SF-W-PTLC */ NULL, 0);
-                    cbd->pending_wt_valid = 0;
-                }
-                /* Persist new remote PCP */
-                if (cbd && cbd->db) {
-                    secp256k1_pubkey lra_pcp;
-                    if (secp256k1_ec_pubkey_parse(ctx, &lra_pcp, lra_next_point, 33)) {
-                        unsigned char lra_ser[33];
-                        size_t lra_slen = 33;
-                        secp256k1_ec_pubkey_serialize(ctx, lra_ser, &lra_slen,
-                                                       &lra_pcp, SECP256K1_EC_COMPRESSED);
-                        persist_save_remote_pcp(cbd->db, 0,
-                            ch->commitment_number, lra_ser);
-                    }
-                }
-            }
+               client_handle_commitment_signed sent RAA, LSP responded with this.
+               Same fail-closed handling as client_recv_lsp_revocation (this
+               path used to store the secret unchecked and arm the watchtower
+               regardless). */
+            int pend = cbd && cbd->pending_wt_valid;
+            client_apply_lsp_revocation(ch, cbd, ctx, &msg,
+                pend ? cbd->pending_wt_local : ch->local_amount,
+                pend ? cbd->pending_wt_remote : ch->remote_amount,
+                (pend && cbd->pending_wt_n_htlcs > 0) ? cbd->pending_wt_htlcs : NULL,
+                pend ? cbd->pending_wt_n_htlcs : 0,
+                my_index);
+            if (cbd) cbd->pending_wt_valid = 0;
             cJSON_Delete(msg.json);
             break;
         }
@@ -3674,6 +3679,11 @@ int main(int argc, char *argv[]) {
                 cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
                 fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
                         "to a proven-cheating LSP\n");
+                break;
+            }
+            if (cbd.wt_register_failed) {
+                fprintf(stderr, "Client: not reconnecting: a revoked LSP "
+                        "commitment could not be watched (restart to re-arm)\n");
                 break;
             }
             if (!ok) {

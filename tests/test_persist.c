@@ -1589,6 +1589,8 @@ int test_lsp_recovery_round_trip(void) {
         dead_htlc.cltv_expiry = 800;
         TEST_ASSERT(persist_save_htlc(&db, 0, &dead_htlc), "save dead htlc");
     }
+    /* Channel 2 failed before the restart (invalid revocation). */
+    TEST_ASSERT(persist_mark_channel_failed(&db, 2), "mark channel 2 failed");
     TEST_ASSERT(persist_commit(&db), "commit");
 
     /* Now recover: load factory from DB, init channels from DB */
@@ -1605,6 +1607,10 @@ int test_lsp_recovery_round_trip(void) {
                                             seckeys[0], 4, &db),
                 "init from db");
     TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "n_channels");
+    for (size_t c = 0; c < 4; c++)
+        TEST_ASSERT_EQ(rec_mgr.entries[c].channel.revocation_failed,
+                       c == 2 ? CHANNEL_FAILED_DURABLE : 0,
+                       "failed mark reloaded into revocation_failed");
 
     /* Verify ALL 4 channels recovered correctly */
     for (size_t c = 0; c < 4; c++) {
