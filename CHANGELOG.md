@@ -4,6 +4,16 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
 
+## Unreleased
+
+### CI green on `main`
+
+- **Fixed: factory creation crashed when the factory's arrays were freed or never allocated.** `lsp_run_factory_creation` copied the participant profiles out of a NULL pointer (arrays are heap-allocated since PR #451). It crashed the initial ceremony for an LSP set up with `lsp_init()` alone, which is why the Regtest Integration job segfaulted at its 21st test and never ran the rest. It also crashed the creation retry after a failed ceremony, and rotation. Creation now captures and restores the factory's shape, profiles and secret mode NULL-safely, and leaves the factory usable after a failed attempt. This is the creation-side part of PR #463.
+- **Fixed: `superscalar_lsp --arity 2` (without `--static-near-root`) crashed right after funding.** It wrote the default participant profiles into factory arrays that no shape setter had allocated.
+- **Fixed: the sanitizer CI jobs never ran their tests.** `test_inproc_factory_lifecycle` did not link the sanitizer flags, and the LSan suppressions path was relative to the wrong directory. With both fixed, LSan found ~2.6 GB of leaked factory arrays in the unit suite (test code) and two library leaks: `persist_load_factory` with pre-allocated arrays, and the `ladder_create_factory` failure paths.
+- **Fixed: stack overflow persisting per-leaf DW state for factories with more than 8 leaves** (`lsp_channels.c` used a fixed `leaf_states[8]`).
+- **Static analysis:** clean under cppcheck 2.13 (ubuntu-24.04) and 2.19 (ubuntu-26.04): allocation results are checked, arrays filled by possibly-empty loops are zero-initialised, a few library entry points reject NULL, and a duplicate NULL check is gone. The Static Analysis job is pinned to `ubuntu-24.04` so a runner-image change cannot silently change the checker.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
