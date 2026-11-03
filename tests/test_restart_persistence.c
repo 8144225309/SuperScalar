@@ -252,7 +252,8 @@ int test_restart_channel_init_failure_owns_nothing(void) {
     secp256k1_pubkey a, b;
     TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &a, rs_seckeys[0]), "pubkey a");
     TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &b, rs_seckeys[1]), "pubkey b");
-    unsigned char zero_secret[32] = {0}, txid[32], spk[34];
+    const unsigned char zero_secret[32] = {0};
+    unsigned char txid[32], spk[34];
     memset(txid, 0x11, sizeof(txid));
     memset(spk, 0x22, sizeof(spk));
 
@@ -399,7 +400,12 @@ static lsp_t *rs_make_lsp(rs_fixture_t *fx) {
     if (!lsp) return NULL;
     lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
     lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    if (!lsp->client_fds || !lsp->client_pubkeys) return NULL;
+    if (!lsp->client_fds || !lsp->client_pubkeys) {
+        free(lsp->client_fds);
+        free(lsp->client_pubkeys);
+        free(lsp);
+        return NULL;
+    }
     lsp->clients_cap = LSP_MAX_CLIENTS;
     lsp->ctx = fx->ctx;
     lsp->lsp_pubkey = fx->pks[0];
@@ -680,7 +686,7 @@ int test_restart_dw_counter_per_leaf_off_rows(void) {
     free(rec_f);
 
     /* An older build's row past epoch 0 (the demo-mode epoch advance). */
-    uint32_t layers[DW_MAX_LAYERS];
+    uint32_t layers[DW_MAX_LAYERS] = {0};
     for (uint32_t i = 0; i < f->counter.n_layers; i++)
         layers[i] = f->counter.layers[i].current_state;
     TEST_ASSERT(persist_save_dw_counter(&fx.db, 0, 1, f->counter.n_layers,
@@ -728,7 +734,7 @@ int test_restart_dw_counter_two_leaf_old_row(void) {
     TEST_ASSERT_EQ(fx.f->n_leaf_nodes, 2, "two leaves");
     TEST_ASSERT(persist_save_factory(&fx.db, fx.f, fx.ctx, 0), "save factory");
 
-    uint32_t layers[DW_MAX_LAYERS];
+    uint32_t layers[DW_MAX_LAYERS] = {0};
     for (uint32_t i = 0; i < fx.f->counter.n_layers; i++)
         layers[i] = (i == 0) ? 1 : 0;
     TEST_ASSERT(persist_save_dw_counter(&fx.db, 0, 1, fx.f->counter.n_layers,
@@ -758,10 +764,10 @@ int test_restart_dw_counter_restored_by_load_factory(void) {
     factory_t *f = fx.f;
     TEST_ASSERT(f->counter.n_layers > 0 && f->n_leaf_nodes >= 2, "factory shape");
 
-    uint32_t layers[DW_MAX_LAYERS];
+    uint32_t layers[DW_MAX_LAYERS] = {0};
     for (uint32_t i = 0; i < f->counter.n_layers; i++)
         layers[i] = (i + 1) % f->counter.layers[i].config.max_states;
-    uint32_t leaves[64];
+    uint32_t leaves[64] = {0};
     TEST_ASSERT(f->n_leaf_nodes <= 64, "leaf count");
     for (int i = 0; i < f->n_leaf_nodes; i++)
         leaves[i] = (uint32_t)(i * 3 + 1) % f->leaf_layers[i].config.max_states;
@@ -797,10 +803,10 @@ int test_restart_dw_counter_legacy_row_loads_exhausted(void) {
     TEST_ASSERT(rs_dw_factory(&fx), "fixture");
     factory_t *f = fx.f;
 
-    uint32_t layers[DW_MAX_LAYERS];
+    uint32_t layers[DW_MAX_LAYERS] = {0};
     for (uint32_t i = 0; i < f->counter.n_layers; i++)
         layers[i] = f->counter.layers[i].config.max_states;
-    uint32_t leaves[64];
+    uint32_t leaves[64] = {0};
     for (int i = 0; i < f->n_leaf_nodes; i++) leaves[i] = 1;
     TEST_ASSERT(persist_save_dw_counter_with_leaves(&fx.db, 0, 2,
                     f->counter.n_layers, layers, 1, leaves, f->n_leaf_nodes),
@@ -879,7 +885,7 @@ int test_restart_dw_counter_many_leaves_round_trip(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, NULL), "open");
     enum { N = 200 };
-    uint32_t layers[2] = { 1, 2 };
+    const uint32_t layers[2] = { 1, 2 };
     uint32_t leaves[N], loaded[N];
     for (int i = 0; i < N; i++) {
         leaves[i] = (i % 7 == 0) ? 4000000000u : (uint32_t)(i % 4);
@@ -909,24 +915,135 @@ static long rs_count(persist_t *db, const char *sql) {
     return n;
 }
 
-/* A second connection holding a read lock on a rollback-journal file DB
-   makes the writer's COMMIT return SQLITE_BUSY.  (The daemon's DBs use
-   WAL, where a COMMIT is rarely busy; the journal mode is only how the
-   test gets one.)  The handler replaces the 5 s busy timeout and gives up
-   at once. */
+/* A busy COMMIT, made on one connection.  In rollback-journal mode an
+   INSERT takes the SHARED and then the RESERVED lock; only COMMIT asks
+   the VFS for EXCLUSIVE, which it must hold before it writes the database
+   file.  rs_bvfs wraps the platform's default VFS and answers the next n
+   EXCLUSIVE requests with SQLITE_BUSY, which is what the default VFS
+   answers while another connection holds SHARED.  The pager then calls the
+   busy handler (here: give up at once) and COMMIT returns SQLITE_BUSY with
+   the transaction still open.  No second connection is involved, so
+   nothing depends on how a platform's SQLite settles locks between
+   connections.  (The daemon's DBs use WAL, where COMMIT takes no such lock
+   and is rarely busy; the rollback journal is only how the test gets a
+   busy COMMIT.) */
 typedef struct {
-    sqlite3 *reader;
-    int calls;
-    int release_on_first;
-} rs_busy_t;
+    sqlite3_file base;
+    sqlite3_file *real;  /* the wrapped file, stored right after this */
+} rs_bfile_t;
 
-static int rs_busy_handler(void *arg, int n) {
+static sqlite3_vfs rs_bvfs;
+static sqlite3_vfs *rs_bvfs_real;
+static int rs_bvfs_refuse;   /* EXCLUSIVE requests still to refuse */
+static int rs_bvfs_refused;  /* EXCLUSIVE requests refused */
+
+#define RS_REAL(f) (((rs_bfile_t *)(f))->real)
+
+static int rs_bf_close(sqlite3_file *f) {
+    return RS_REAL(f)->pMethods->xClose(RS_REAL(f));
+}
+static int rs_bf_read(sqlite3_file *f, void *buf, int n, sqlite3_int64 off) {
+    return RS_REAL(f)->pMethods->xRead(RS_REAL(f), buf, n, off);
+}
+static int rs_bf_write(sqlite3_file *f, const void *buf, int n, sqlite3_int64 off) {
+    return RS_REAL(f)->pMethods->xWrite(RS_REAL(f), buf, n, off);
+}
+static int rs_bf_truncate(sqlite3_file *f, sqlite3_int64 size) {
+    return RS_REAL(f)->pMethods->xTruncate(RS_REAL(f), size);
+}
+static int rs_bf_sync(sqlite3_file *f, int flags) {
+    return RS_REAL(f)->pMethods->xSync(RS_REAL(f), flags);
+}
+static int rs_bf_size(sqlite3_file *f, sqlite3_int64 *size) {
+    return RS_REAL(f)->pMethods->xFileSize(RS_REAL(f), size);
+}
+static int rs_bf_lock(sqlite3_file *f, int level) {
+    if (level == SQLITE_LOCK_EXCLUSIVE && rs_bvfs_refuse > 0) {
+        rs_bvfs_refuse--;
+        rs_bvfs_refused++;
+        return SQLITE_BUSY;
+    }
+    return RS_REAL(f)->pMethods->xLock(RS_REAL(f), level);
+}
+static int rs_bf_unlock(sqlite3_file *f, int level) {
+    return RS_REAL(f)->pMethods->xUnlock(RS_REAL(f), level);
+}
+static int rs_bf_check_reserved(sqlite3_file *f, int *out) {
+    return RS_REAL(f)->pMethods->xCheckReservedLock(RS_REAL(f), out);
+}
+static int rs_bf_fcntl(sqlite3_file *f, int op, void *arg) {
+    return RS_REAL(f)->pMethods->xFileControl(RS_REAL(f), op, arg);
+}
+static int rs_bf_sector(sqlite3_file *f) {
+    return RS_REAL(f)->pMethods->xSectorSize(RS_REAL(f));
+}
+static int rs_bf_devchar(sqlite3_file *f) {
+    return RS_REAL(f)->pMethods->xDeviceCharacteristics(RS_REAL(f));
+}
+static int rs_bf_shm_map(sqlite3_file *f, int pg, int pgsz, int extend,
+                         void volatile **pp) {
+    return RS_REAL(f)->pMethods->xShmMap(RS_REAL(f), pg, pgsz, extend, pp);
+}
+static int rs_bf_shm_lock(sqlite3_file *f, int off, int n, int flags) {
+    return RS_REAL(f)->pMethods->xShmLock(RS_REAL(f), off, n, flags);
+}
+static void rs_bf_shm_barrier(sqlite3_file *f) {
+    RS_REAL(f)->pMethods->xShmBarrier(RS_REAL(f));
+}
+static int rs_bf_shm_unmap(sqlite3_file *f, int del) {
+    return RS_REAL(f)->pMethods->xShmUnmap(RS_REAL(f), del);
+}
+static int rs_bf_fetch(sqlite3_file *f, sqlite3_int64 off, int n, void **pp) {
+    return RS_REAL(f)->pMethods->xFetch(RS_REAL(f), off, n, pp);
+}
+static int rs_bf_unfetch(sqlite3_file *f, sqlite3_int64 off, void *p) {
+    return RS_REAL(f)->pMethods->xUnfetch(RS_REAL(f), off, p);
+}
+
+/* One table per io-methods version: the wrapper offers the version the
+   wrapped file has (SQLite checks it before using shared memory or mmap). */
+#define RS_BF_METHODS(v) { v, rs_bf_close, rs_bf_read, rs_bf_write, \
+    rs_bf_truncate, rs_bf_sync, rs_bf_size, rs_bf_lock, rs_bf_unlock, \
+    rs_bf_check_reserved, rs_bf_fcntl, rs_bf_sector, rs_bf_devchar, \
+    rs_bf_shm_map, rs_bf_shm_lock, rs_bf_shm_barrier, rs_bf_shm_unmap, \
+    rs_bf_fetch, rs_bf_unfetch }
+static const sqlite3_io_methods rs_bf_methods[3] = {
+    RS_BF_METHODS(1), RS_BF_METHODS(2), RS_BF_METHODS(3)
+};
+
+static int rs_bvfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *f,
+                        int flags, int *out_flags) {
+    (void)vfs;
+    rs_bfile_t *bf = (rs_bfile_t *)f;
+    bf->real = (sqlite3_file *)(bf + 1);
+    memset(bf->real, 0, (size_t)rs_bvfs_real->szOsFile);
+    int rc = rs_bvfs_real->xOpen(rs_bvfs_real, name, bf->real, flags, out_flags);
+    if (!bf->real->pMethods) {
+        bf->base.pMethods = NULL;  /* nothing was opened: nothing to close */
+        return rc;
+    }
+    int v = bf->real->pMethods->iVersion;
+    bf->base.pMethods = &rs_bf_methods[(v < 1 ? 1 : v > 3 ? 3 : v) - 1];
+    return rc;
+}
+
+static int rs_bvfs_install(void) {
+    rs_bvfs_real = sqlite3_vfs_find(NULL);
+    if (!rs_bvfs_real) return 0;
+    rs_bvfs = *rs_bvfs_real;
+    rs_bvfs.pNext = NULL;
+    rs_bvfs.zName = "rs_busy";
+    rs_bvfs.szOsFile = (int)sizeof(rs_bfile_t) + rs_bvfs_real->szOsFile;
+    rs_bvfs.xOpen = rs_bvfs_open;
+    rs_bvfs_refuse = 0;
+    rs_bvfs_refused = 0;
+    return sqlite3_vfs_register(&rs_bvfs, 0) == SQLITE_OK;  /* not the default */
+}
+
+static int rs_give_up(void *arg, int n) {
+    (void)arg;
     (void)n;
-    rs_busy_t *b = arg;
-    b->calls++;
-    if (b->release_on_first && b->calls == 1)
-        sqlite3_exec(b->reader, "COMMIT;", NULL, NULL, NULL);  /* drop the lock */
-    return 0;  /* COMMIT returns SQLITE_BUSY now */
+    return 0;  /* no waiting: COMMIT returns SQLITE_BUSY at once */
 }
 
 static void rs_unlink_db(const char *path) {
@@ -940,58 +1057,71 @@ static void rs_unlink_db(const char *path) {
     unlink(side);
 }
 
-/* A busy COMMIT is retried once: when the reader lets go after the first
-   attempt, the retry commits.  When it stays busy, the transaction is
-   rolled back. */
+static int rs_busy_commit_body(persist_t *db, const char *path) {
+    TEST_ASSERT(sqlite3_open_v2(path, &db->db,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                                "rs_busy") == SQLITE_OK, "open through the test VFS");
+    sqlite3_stmt *st;
+    TEST_ASSERT(sqlite3_prepare_v2(db->db, "PRAGMA journal_mode=DELETE;", -1,
+                                   &st, NULL) == SQLITE_OK, "journal mode");
+    const unsigned char *mode =
+        (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_text(st, 0) : NULL;
+    int rollback = mode && strcmp((const char *)mode, "wal") != 0 &&
+                   strcmp((const char *)mode, "off") != 0;
+    sqlite3_finalize(st);
+    TEST_ASSERT(rollback, "rollback journal (its COMMIT takes the EXCLUSIVE lock)");
+    TEST_ASSERT(sqlite3_exec(db->db, "CREATE TABLE rs_busy (id INTEGER PRIMARY KEY);",
+                             NULL, NULL, NULL) == SQLITE_OK, "table");
+    sqlite3_busy_handler(db->db, rs_give_up, NULL);
+
+    /* Busy once: the retry commits. */
+    TEST_ASSERT(persist_begin(db), "begin");
+    TEST_ASSERT(sqlite3_exec(db->db, "INSERT INTO rs_busy VALUES (1);",
+                             NULL, NULL, NULL) == SQLITE_OK, "insert");
+    rs_bvfs_refused = 0;
+    rs_bvfs_refuse = 1;
+    TEST_ASSERT(persist_commit(db), "the retry commits");
+    TEST_ASSERT_EQ(rs_bvfs_refused, 1, "the first COMMIT was busy");
+    TEST_ASSERT_EQ(rs_bvfs_refuse, 0, "the refusal was used");
+    TEST_ASSERT(!persist_in_transaction(db) && sqlite3_get_autocommit(db->db),
+                "transaction closed");
+    TEST_ASSERT_EQ(rs_count(db, "SELECT COUNT(*) FROM rs_busy;"), 1, "row committed");
+
+    /* Busy on both attempts: rolled back. */
+    TEST_ASSERT(persist_begin(db), "begin");
+    TEST_ASSERT(sqlite3_exec(db->db, "INSERT INTO rs_busy VALUES (2);",
+                             NULL, NULL, NULL) == SQLITE_OK, "insert");
+    rs_bvfs_refused = 0;
+    rs_bvfs_refuse = 2;
+    TEST_ASSERT(!persist_commit(db), "still busy after the retry: fails");
+    TEST_ASSERT_EQ(rs_bvfs_refused, 2, "COMMIT tried twice");
+    rs_bvfs_refuse = 0;
+    TEST_ASSERT(sqlite3_get_autocommit(db->db), "rolled back");
+    TEST_ASSERT(!persist_in_transaction(db), "flag cleared");
+    TEST_ASSERT_EQ(rs_count(db, "SELECT COUNT(*) FROM rs_busy;"), 1,
+                   "the rolled-back row is not there");
+    return 1;
+}
+
+/* A busy COMMIT is retried once: when the retry gets the lock it commits;
+   when the retry is busy too, the transaction is rolled back. */
 int test_restart_commit_busy_retried_once(void) {
     char path[] = "/tmp/ss_rs_busy_XXXXXX";
     int tfd = mkstemp(path);  /* an empty file (mode 0600) opens as a new DB */
     TEST_ASSERT(tfd >= 0, "temp file");
     close(tfd);
-
     persist_t db;
-    TEST_ASSERT(persist_open(&db, path), "open");
-    TEST_ASSERT(sqlite3_exec(db.db, "PRAGMA journal_mode=DELETE;"
-                "CREATE TABLE rs_busy (id INTEGER PRIMARY KEY);",
-                NULL, NULL, NULL) == SQLITE_OK, "rollback journal, table");
-    rs_busy_t b = { NULL, 0, 0 };
-    TEST_ASSERT(sqlite3_open_v2(path, &b.reader, SQLITE_OPEN_READONLY, NULL)
-                == SQLITE_OK, "reader");
-    sqlite3_busy_handler(db.db, rs_busy_handler, &b);
-
-    /* Busy once, then free. */
-    TEST_ASSERT(sqlite3_exec(b.reader, "BEGIN; SELECT COUNT(*) FROM rs_busy;",
-                             NULL, NULL, NULL) == SQLITE_OK, "read lock");
-    b.release_on_first = 1;
-    TEST_ASSERT(persist_begin(&db), "begin");
-    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO rs_busy VALUES (1);",
-                             NULL, NULL, NULL) == SQLITE_OK, "insert");
-    TEST_ASSERT(persist_commit(&db), "the retry commits");
-    TEST_ASSERT_EQ(b.calls, 1, "the first COMMIT was busy");
-    TEST_ASSERT(!persist_in_transaction(&db), "transaction closed");
-    TEST_ASSERT_EQ(rs_count(&db, "SELECT COUNT(*) FROM rs_busy;"), 1,
-                   "row committed");
-
-    /* Busy on both attempts. */
-    b.calls = 0;
-    b.release_on_first = 0;
-    TEST_ASSERT(sqlite3_exec(b.reader, "BEGIN; SELECT COUNT(*) FROM rs_busy;",
-                             NULL, NULL, NULL) == SQLITE_OK, "read lock again");
-    TEST_ASSERT(persist_begin(&db), "begin");
-    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO rs_busy VALUES (2);",
-                             NULL, NULL, NULL) == SQLITE_OK, "insert");
-    TEST_ASSERT(!persist_commit(&db), "still busy after the retry: fails");
-    TEST_ASSERT_EQ(b.calls, 2, "COMMIT tried twice");
-    TEST_ASSERT(sqlite3_get_autocommit(db.db), "rolled back");
-    TEST_ASSERT(!persist_in_transaction(&db), "flag cleared");
-    sqlite3_exec(b.reader, "COMMIT;", NULL, NULL, NULL);
-    TEST_ASSERT_EQ(rs_count(&db, "SELECT COUNT(*) FROM rs_busy;"), 1,
-                   "the rolled-back row is not there");
-
-    sqlite3_close(b.reader);
-    persist_close(&db);
+    memset(&db, 0, sizeof(db));
+    int ok = 0;
+    if (rs_bvfs_install()) {
+        ok = rs_busy_commit_body(&db, path);
+        persist_close(&db);
+        sqlite3_vfs_unregister(&rs_bvfs);
+    } else {
+        printf("  FAIL: %s: cannot register the test VFS\n", __func__);
+    }
     rs_unlink_db(path);
-    return 1;
+    return ok;
 }
 
 /* A deferred foreign-key violation makes COMMIT fail and leaves the
@@ -1053,7 +1183,7 @@ static void rs_fake_lsp(int listen_fd, uint64_t cn) {
     if (!secp256k1_ec_pubkey_create(ctx, &lpk, rs_seckeys[0]) ||
         !secp256k1_ec_pubkey_create(ctx, &cpk, rs_seckeys[RS_CLIENT_IDX + 1]))
         _exit(5);
-    unsigned char txid[32] = {0}, spk[34] = {0};
+    const unsigned char txid[32] = {0}, spk[34] = {0};
     channel_t nch;
     if (!channel_init(&nch, ctx, rs_seckeys[0], &lpk, &cpk, txid, 0, 100000,
                       spk, sizeof(spk), 50000, 50000, CHANNEL_DEFAULT_CSV_DELAY) ||
