@@ -4,6 +4,16 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
 
+## Unreleased
+
+### Restart and reconnect persistence
+
+- **Restored channels lost the peer's secrets:** after an LSP restart, and after any client reconnect or restart, the rebuilt channel had no DB attached, so revocation secrets and per-commitment points received afterwards were not written. Both sides now attach it. The client also saves the LSP's first two points on its first run, so a client restarted before its first payment no longer rejects the LSP's first revocation as forged, and it keeps its whole channel under one id in its DB (older client DBs are moved on open).
+- **HTLC array overflow on restore:** the restart and the reconnect commitment-number rollback copied up to 483 stored HTLCs into the 64 slots `channel_init` allocates. Only active HTLCs are loaded now, the array grows to fit, and more than `MAX_HTLCS` fails the restart or refuses the reconnect.
+- **DW counter and advances after a restart:** saves stored `config.max_states` as each layer's state and the restart ignored the epoch and leaf states; every save site, now including Tier B and rotation, writes the real state and the restart restores it, loading untrustworthy older values as exhausted. The tree itself is still rebuilt at its initial state, so a factory restored from the DB, by the LSP or by any client, refuses leaf advances, reallocs and root advances until the signed tree is reloaded: one restarted client stops root rollovers for the whole factory. Payments still settle.
+- **Upgrading a client:** once this build has opened a client DB, don't go back to an older client build; it looks for the moved rows under the old id and refuses to reconnect. A client DB created by an older build, and restarted before its first payment, still has no stored LSP first points and will still reject the LSP's first revocation; make one payment before restarting such a client.
+- **Failure handling:** a failed restore or `channel_init` frees what it allocated, the client reconnect frees its channel, and `persist_commit` retries a busy COMMIT once, then rolls back with a CRITICAL log instead of leaving the transaction open.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.

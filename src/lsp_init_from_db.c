@@ -35,13 +35,23 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     if (!mgr || !ctx || !factory || !lsp_seckey32 || !pdb) return 0;
     if (n_clients == 0) return 0;
 
+    /* Each restored channel writes received revocations and remote PCPs
+       back to the DB it was restored from (channel_set_persist below), so
+       mgr->persist is set to pdb here rather than trusted from the caller:
+       the LSP restart path used to assign it only after this call, which
+       left every restored channel with no DB.  A different handle is
+       refused. */
+    if (mgr->persist && mgr->persist != pdb) {
+        fprintf(stderr, "LSP recovery: mgr->persist is not the DB being "
+                "restored from; refusing\n");
+        return 0;
+    }
+
     /* Preserve fields set before init (caller may configure these).
-       Mirror of lsp_channels_init — see comment there for why mgr->persist
-       must survive the memset. */
+       Mirror of lsp_channels_init. */
     uint64_t saved_fee_ppm = mgr->routing_fee_ppm;
     uint16_t saved_bal_pct = mgr->lsp_balance_pct;
     void *saved_fee2 = mgr->fee;
-    void *saved_persist = mgr->persist;
     economic_mode_t saved_econ = mgr->economic_mode;
     uint16_t saved_profit_bps = mgr->default_profit_bps;
     uint32_t saved_settle_interval = mgr->settlement_interval_blocks;
@@ -49,7 +59,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
     mgr->routing_fee_ppm = saved_fee_ppm;
     mgr->lsp_balance_pct = saved_bal_pct;
     mgr->fee = saved_fee2;
-    mgr->persist = saved_persist;
+    mgr->persist = pdb;
     mgr->economic_mode = saved_econ;
     mgr->default_profit_bps = saved_profit_bps;
     mgr->settlement_interval_blocks = saved_settle_interval;
@@ -102,7 +112,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         client_to_leaf(c, factory, &node_idx, &vout);
 
         const factory_node_t *state_node = &factory->nodes[node_idx];
-        if (vout >= state_node->n_outputs) return 0;
+        if (vout >= state_node->n_outputs) goto fail;
 
         /* Funding info from the leaf output */
         const unsigned char *funding_txid = state_node->txid;
@@ -113,7 +123,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         /* LSP pubkey (participant 0) */
         secp256k1_pubkey lsp_pubkey;
         if (!secp256k1_ec_pubkey_create(ctx, &lsp_pubkey, lsp_seckey32))
-            return 0;
+            goto fail;
 
         /* Client pubkey (participant c+1) */
         const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
@@ -149,7 +159,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                            funding_spk, funding_spk_len,
                            local_amount, remote_amount,
                            CHANNEL_DEFAULT_CSV_DELAY))
-            return 0;
+            goto fail;
         entry->channel.funder_is_local = 1;
         entry->channel.use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor (matches client; restore parity) */
         /* Attach persistence (see lsp_channels_init for rationale). */
@@ -174,7 +184,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
                         "failed (factory_cltv=%u, node_cltv=%u). Refusing "
                         "to load — on-chain spends would fail Schnorr verify.\n",
                         c, factory->cltv_timeout, state_node->cltv_timeout);
-                return 0;
+                goto fail;
             }
             entry->channel.funding_keyagg = ka;
             entry->channel.local_funding_signer_idx = signer_idx;
@@ -191,7 +201,8 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         unsigned char remote_bps[4][33];
         if (!persist_load_basepoints(pdb, (uint32_t)c, local_secrets, remote_bps)) {
             fprintf(stderr, "LSP recovery: failed to load basepoints for channel %zu\n", c);
-            return 0;
+            memset(local_secrets, 0, sizeof(local_secrets));
+            goto fail;
         }
 
         /* Set local basepoints from loaded secrets */
@@ -209,7 +220,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
             !secp256k1_ec_pubkey_parse(ctx, &rrevoc, remote_bps[2], 33) ||
             !secp256k1_ec_pubkey_parse(ctx, &rhtlc, remote_bps[3], 33)) {
             fprintf(stderr, "LSP recovery: failed to parse remote basepoints for channel %zu\n", c);
-            return 0;
+            goto fail;
         }
         channel_set_remote_basepoints(&entry->channel, &rpay, &rdelay, &rrevoc);
         channel_set_remote_htlc_basepoint(&entry->channel, &rhtlc);
@@ -219,7 +230,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         if (!persist_load_channel_state(pdb, (uint32_t)c,
                                           &loaded_local, &loaded_remote, &loaded_cn)) {
             fprintf(stderr, "LSP recovery: failed to load channel state for channel %zu\n", c);
-            return 0;
+            goto fail;
         }
         entry->channel.local_amount = loaded_local;
         entry->channel.remote_amount = loaded_remote;
@@ -227,27 +238,33 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
         /* Load active HTLCs from DB */
         {
-            htlc_t *loaded_htlcs = malloc(MAX_HTLCS * sizeof(htlc_t));
-            if (!loaded_htlcs) return 0;
-            size_t n_loaded = persist_load_htlcs(pdb, (uint32_t)c,
-                                                    loaded_htlcs, MAX_HTLCS);
-            for (size_t h = 0; h < n_loaded; h++) {
-                if (loaded_htlcs[h].state != HTLC_STATE_ACTIVE) continue;
-                if (entry->channel.n_htlcs >= MAX_HTLCS) break;
-                entry->channel.htlcs[entry->channel.n_htlcs++] = loaded_htlcs[h];
+            /* channel_init allocated DEFAULT_HTLCS_CAP entries; the loader
+               grows the array to what the DB holds and refuses more than a
+               channel can hold. */
+            int n_loaded = persist_load_channel_htlcs(pdb, (uint32_t)c,
+                                                      &entry->channel);
+            if (n_loaded < 0) {
+                fprintf(stderr, "LSP recovery: cannot restore HTLCs for "
+                        "channel %zu\n", c);
+                goto fail;
             }
             if (n_loaded > 0)
-                printf("LSP recovery: loaded %zu HTLCs for channel %zu\n",
+                printf("LSP recovery: loaded %d HTLCs for channel %zu\n",
                        n_loaded, c);
-            free(loaded_htlcs);
         }
 
         /* Initialize nonce pool (fresh nonces — reconnect re-exchanges) */
         if (!channel_init_nonce_pool(&entry->channel, MUSIG_NONCE_POOL_MAX))
-            return 0;
+            goto fail;
 
         entry->ready = 1;  /* channels are already operational */
     }
 
     return 1;
+
+fail:
+    /* Free what was allocated above, so a failed restore leaves mgr empty
+       (entries NULL, n_channels 0) instead of leaking it. */
+    lsp_channels_cleanup(mgr);
+    return 0;
 }

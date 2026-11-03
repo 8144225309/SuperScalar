@@ -3,6 +3,7 @@
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
+#include "superscalar/jit_channel.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1511,15 +1512,35 @@ int persist_begin(persist_t *p) {
 
 int persist_commit(persist_t *p) {
     if (!p || !p->db) return 0;
-    int ok = (sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
-    p->in_transaction = 0;
-    return ok;
+    int rc = sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL);
+    if ((rc & 0xff) == SQLITE_BUSY) {
+        /* A busy COMMIT leaves the transaction open and can be retried;
+           the busy timeout has already waited once. */
+        fprintf(stderr, "persist: COMMIT busy (%s); retrying once\n",
+                sqlite3_errmsg(p->db));
+        rc = sqlite3_exec(p->db, "COMMIT;", NULL, NULL, NULL);
+    }
+    if (rc == SQLITE_OK) {
+        p->in_transaction = 0;
+        return 1;
+    }
+    /* A failed COMMIT can leave the transaction open (busy database,
+       deferred constraint, full disk).  Clearing the flag anyway made the
+       next BEGIN fail and let later writes join this transaction, to be
+       committed by some unrelated COMMIT.  Roll back so the failure is
+       final and the flag matches the connection. */
+    fprintf(stderr, "persist: CRITICAL: COMMIT failed (%s); rolling back, "
+            "this transaction's writes are lost\n", sqlite3_errmsg(p->db));
+    if (!sqlite3_get_autocommit(p->db))
+        sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL);
+    p->in_transaction = !sqlite3_get_autocommit(p->db);
+    return 0;
 }
 
 int persist_rollback(persist_t *p) {
     if (!p || !p->db) return 0;
     int ok = (sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
-    p->in_transaction = 0;
+    p->in_transaction = !sqlite3_get_autocommit(p->db);
     return ok;
 }
 
@@ -2632,6 +2653,19 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         #undef PS_RESTORE_MAX
     }
 
+    /* Last: factory_build_tree above re-initialised the DW counter.  If
+       the stored state cannot be read, the counter would stay at the
+       initial state, behind states already signed: fail the load. */
+    if (persist_load_factory_dw_state(p, factory_id, f) < 0) {
+        fprintf(stderr, "persist_load_factory: cannot read the DW counter "
+                "state of factory %u; refusing to load it\n", factory_id);
+        factory_free(f);
+        return 0;
+    }
+
+    /* The tree built above is the initial one, not the signed tree the
+       factory had reached: no advance may be built on it. */
+    f->tree_rebuilt_on_load = 1;
     return 1;
 }
 
@@ -2783,6 +2817,75 @@ int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
     }
     sqlite3_finalize(stmt);
     if (count_out) *count_out = count;
+    return 1;
+}
+
+
+static int exec_with_id(sqlite3 *db, const char *sql, int id) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, id);
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_client_move_to_channel_0(persist_t *p) {
+    if (!p || !p->db) return 0;
+
+    /* JIT channels are at JIT_CHANNEL_ID_BASE and up; the factory channel
+       is the one row below that. */
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT id FROM channels WHERE id < ?;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)JIT_CHANNEL_ID_BASE);
+    int n = 0, old_id = -1, rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        n++;
+        old_id = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return 0;
+    if (n > 1) {
+        /* Not a single-channel client layout (an LSP DB, or a client DB that
+           an older build's partial rotation left with two rows): leave it. */
+        fprintf(stderr, "persist: %d channel rows below the JIT range; "
+                "not moving any client rows\n", n);
+        return 1;
+    }
+    if (n != 1 || old_id == CLIENT_DB_CHANNEL_ID) return 1;
+
+    /* The tables the client wrote under its index. */
+    static const char *const moves[][2] = {
+        { "channels", "id" },
+        { "channel_basepoints", "channel_id" },
+        { "revocation_secrets", "channel_id" },
+        { "remote_pcps", "channel_id" },
+    };
+    int own_txn = !persist_in_transaction(p);
+    if (own_txn && !persist_begin(p)) return 0;
+    int ok = 1;
+    for (size_t i = 0; ok && i < sizeof(moves) / sizeof(moves[0]); i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "UPDATE OR IGNORE %s SET %s = %d WHERE %s = ?;",
+                 moves[i][0], moves[i][1], CLIENT_DB_CHANNEL_ID, moves[i][1]);
+        ok = exec_with_id(p->db, sql, old_id);
+        if (!ok) break;
+        /* Whatever is left duplicated a row already under the new id. */
+        snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s = ?;",
+                 moves[i][0], moves[i][1]);
+        ok = exec_with_id(p->db, sql, old_id);
+    }
+    if (!ok) {
+        fprintf(stderr, "persist: moving the client channel from id %d to %d "
+                "failed: %s\n", old_id, CLIENT_DB_CHANNEL_ID, sqlite3_errmsg(p->db));
+        if (own_txn) persist_rollback(p);
+        return 0;
+    }
+    if (own_txn && !persist_commit(p)) return 0;
+    fprintf(stderr, "persist: moved the client channel's rows from id %d to %d\n",
+            old_id, CLIENT_DB_CHANNEL_ID);
     return 1;
 }
 
@@ -3083,6 +3186,56 @@ size_t persist_load_htlcs(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+int persist_load_channel_htlcs(persist_t *p, uint32_t channel_id,
+                               channel_t *ch) {
+    if (!p || !p->db || !ch) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT COUNT(*) FROM htlcs WHERE channel_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int rc = sqlite3_step(stmt);
+    size_t n_rows = (rc == SQLITE_ROW) ? (size_t)sqlite3_column_int64(stmt, 0) : 0;
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW) return -1;
+
+    htlc_t *rows = NULL;
+    size_t n_loaded = 0;
+    if (n_rows > 0) {
+        rows = malloc(n_rows * sizeof(htlc_t));
+        if (!rows) return -1;
+        n_loaded = persist_load_htlcs(p, channel_id, rows, n_rows);
+        if (n_loaded == 0) {
+            free(rows);
+            return -1;
+        }
+    }
+
+    size_t n_keep = 0;
+    for (size_t i = 0; i < n_loaded; i++) {
+        if (rows[i].state != HTLC_STATE_ACTIVE) continue;
+        rows[n_keep++] = rows[i];
+    }
+    if (n_keep > MAX_HTLCS) {
+        fprintf(stderr, "persist: channel %u has %zu active HTLCs stored, more than "
+                "a channel can hold (%d); refusing to load them\n",
+                channel_id, n_keep, MAX_HTLCS);
+        free(rows);
+        return -1;
+    }
+    if (!channel_reserve_htlcs(ch, n_keep)) {
+        free(rows);
+        return -1;
+    }
+    if (n_keep > 0)
+        memcpy(ch->htlcs, rows, n_keep * sizeof(htlc_t));
+    ch->n_htlcs = n_keep;
+    free(rows);
+    return (int)n_keep;
 }
 
 int persist_delete_htlc(persist_t *p, uint32_t channel_id, uint64_t htlc_id) {
@@ -4363,15 +4516,21 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
         strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
     }
 
-    /* Build comma-separated leaf_states string */
-    char leaf_buf[256];
+    /* Build comma-separated leaf_states string, sized for the leaf count
+       (a fixed 256-byte buffer silently dropped every leaf past ~128).
+       The leaf states are recorded whenever they are given, per-leaf mode
+       on or off (all 0 when off), so the load can tell this row from an
+       older build's, which stored "0,0" whenever per-leaf mode was off. */
+    int n_leaves = (leaf_states && n_leaf_nodes > 0) ? n_leaf_nodes : 2;
+    size_t leaf_cap = (size_t)n_leaves * 11 + 1;  /* ",4294967295" per leaf */
+    char *leaf_buf = malloc(leaf_cap);
+    if (!leaf_buf) return 0;
+    size_t leaf_len = 0;
     leaf_buf[0] = '\0';
-    int n_leaves = (per_leaf_enabled && leaf_states) ? n_leaf_nodes : 2;
     for (int i = 0; i < n_leaves; i++) {
-        char tmp[16];
-        uint32_t val = (per_leaf_enabled && leaf_states) ? leaf_states[i] : 0;
-        snprintf(tmp, sizeof(tmp), "%s%u", i > 0 ? "," : "", val);
-        strncat(leaf_buf, tmp, sizeof(leaf_buf) - strlen(leaf_buf) - 1);
+        uint32_t val = (leaf_states && n_leaf_nodes > 0) ? leaf_states[i] : 0;
+        leaf_len += (size_t)snprintf(leaf_buf + leaf_len, leaf_cap - leaf_len,
+                                     "%s%u", i > 0 ? "," : "", val);
     }
 
     const char *sql =
@@ -4381,8 +4540,10 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
         "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        free(leaf_buf);
         return 0;
+    }
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, (int)current_epoch);
@@ -4394,6 +4555,7 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     int ok2 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+    free(leaf_buf);
     return ok2;
 }
 
@@ -4442,14 +4604,20 @@ int persist_load_dw_counter(persist_t *p, uint32_t factory_id,
     return 1;
 }
 
-int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
-                                         uint32_t *epoch_out, uint32_t *n_layers_out,
-                                         uint32_t *layer_states_out, size_t max_layers,
-                                         int *per_leaf_enabled_out,
-                                         uint32_t *leaf_states_out,
-                                         int *n_leaf_nodes_out,
-                                         size_t max_leaf_nodes) {
-    if (!p || !p->db) return 0;
+/* Older builds built the leaf-state string in a 256-byte buffer and cut
+   it at this length. */
+#define DW_LEGACY_LEAF_STR_MAX 255
+
+/* Read the dw_counter_state row for factory_id.  Returns 1 if it was read,
+   0 if there is none, -1 on a query or allocation error. */
+static int dw_counter_row_read(persist_t *p, uint32_t factory_id,
+                               uint32_t *epoch_out, uint32_t *n_layers_out,
+                               uint32_t *layer_states_out, size_t max_layers,
+                               int *per_leaf_enabled_out,
+                               uint32_t *leaf_states_out,
+                               int *n_leaf_nodes_out,
+                               size_t max_leaf_nodes) {
+    if (!p || !p->db) return -1;
 
     const char *sql =
         "SELECT current_epoch, n_layers, layer_states, "
@@ -4458,13 +4626,14 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+        return -1;
 
     sqlite3_bind_int(stmt, 1, (int)factory_id);
 
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
         sqlite3_finalize(stmt);
-        return 0;
+        return rc == SQLITE_DONE ? 0 : -1;
     }
 
     uint32_t epoch = (uint32_t)sqlite3_column_int(stmt, 0);
@@ -4496,19 +4665,148 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     const char *leaf_str = (const char *)sqlite3_column_text(stmt, 5);
     if (leaf_states_out && leaf_str) {
-        char tmp[256];
-        strncpy(tmp, leaf_str, sizeof(tmp) - 1);
-        tmp[sizeof(tmp) - 1] = '\0';
-
-        char *tok = strtok(tmp, ",");
+        /* Parse a copy of the whole string (a fixed 256-byte copy dropped
+           every leaf past ~128).  A string of exactly the legacy cut length
+           may end in a number that was cut short ("12" stored as "1"), a
+           lower state than the real one: its last value is not used unless
+           the cut fell just after a comma. */
+        size_t len = strlen(leaf_str);
+        int maybe_cut = (len == DW_LEGACY_LEAF_STR_MAX &&
+                         leaf_str[len - 1] != ',');
+        char *tmp = strdup(leaf_str);
+        if (!tmp) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+        char *save = NULL;
+        char *tok = strtok_r(tmp, ",", &save);
         size_t idx = 0;
         while (tok && idx < max_leaf_nodes && idx < (size_t)n_leaf) {
+            char *next = strtok_r(NULL, ",", &save);
+            if (!next && maybe_cut) break;
             leaf_states_out[idx++] = (uint32_t)strtol(tok, NULL, 10);
-            tok = strtok(NULL, ",");
+            tok = next;
         }
+        free(tmp);
     }
 
     sqlite3_finalize(stmt);
+    return 1;
+}
+
+int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
+                                         uint32_t *epoch_out, uint32_t *n_layers_out,
+                                         uint32_t *layer_states_out, size_t max_layers,
+                                         int *per_leaf_enabled_out,
+                                         uint32_t *leaf_states_out,
+                                         int *n_leaf_nodes_out,
+                                         size_t max_leaf_nodes) {
+    return dw_counter_row_read(p, factory_id, epoch_out, n_layers_out,
+                               layer_states_out, max_layers,
+                               per_leaf_enabled_out, leaf_states_out,
+                               n_leaf_nodes_out, max_leaf_nodes) == 1;
+}
+
+int persist_save_factory_dw_state(persist_t *p, uint32_t factory_id,
+                                  const factory_t *f) {
+    if (!p || !p->db || !f) return 0;
+    if (f->counter.n_layers == 0 || f->counter.n_layers > DW_MAX_LAYERS) return 0;
+
+    uint32_t layer_states[DW_MAX_LAYERS];
+    for (uint32_t i = 0; i < f->counter.n_layers; i++)
+        layer_states[i] = f->counter.layers[i].current_state;
+
+    int n_leaf = (f->leaf_layers && f->n_leaf_nodes > 0) ? f->n_leaf_nodes : 0;
+    uint32_t *leaf_states = NULL;
+    if (n_leaf > 0) {
+        leaf_states = malloc((size_t)n_leaf * sizeof(uint32_t));
+        if (!leaf_states) return 0;
+        for (int i = 0; i < n_leaf; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
+    }
+
+    int ok = persist_save_dw_counter_with_leaves(p, factory_id,
+                 f->counter.current_epoch, f->counter.n_layers, layer_states,
+                 f->per_leaf_enabled && n_leaf > 0, leaf_states, n_leaf);
+    free(leaf_states);
+    return ok;
+}
+
+/* Restore one DW layer.  An unknown or out-of-range value becomes the
+   layer's last state: wasting the remaining states is safe, signing a
+   state number that was already used is not. */
+static int restore_dw_layer(dw_layer_t *layer, uint32_t stored) {
+    uint32_t last = layer->config.max_states ? layer->config.max_states - 1 : 0;
+    if (stored > last) {
+        layer->current_state = last;
+        return 0;
+    }
+    layer->current_state = stored;
+    return 1;
+}
+
+int persist_load_factory_dw_state(persist_t *p, uint32_t factory_id,
+                                  factory_t *f) {
+    if (!p || !p->db || !f) return -1;
+
+    uint32_t epoch = 0, n_layers = 0;
+    uint32_t layer_states[DW_MAX_LAYERS];
+    for (size_t i = 0; i < DW_MAX_LAYERS; i++) layer_states[i] = UINT32_MAX;
+    int per_leaf = 0, n_leaf = 0;
+    size_t max_leaf = (f->leaf_layers && f->n_leaf_nodes > 0)
+                      ? (size_t)f->n_leaf_nodes : 0;
+    uint32_t *leaf_states = NULL;
+    if (max_leaf > 0) {
+        leaf_states = malloc(max_leaf * sizeof(uint32_t));
+        if (!leaf_states) return -1;
+        for (size_t i = 0; i < max_leaf; i++) leaf_states[i] = UINT32_MAX;
+    }
+
+    int rc = dw_counter_row_read(p, factory_id, &epoch, &n_layers,
+                                 layer_states, DW_MAX_LAYERS, &per_leaf,
+                                 leaf_states, &n_leaf, max_leaf);
+    if (rc <= 0) {
+        free(leaf_states);
+        return rc;  /* 0: no row (a fresh factory); -1: read error */
+    }
+
+    int exact = (n_layers == f->counter.n_layers);
+    for (uint32_t i = 0; i < f->counter.n_layers; i++) {
+        uint32_t v = (n_layers == f->counter.n_layers) ? layer_states[i]
+                                                       : UINT32_MAX;
+        if (!restore_dw_layer(&f->counter.layers[i], v)) exact = 0;
+    }
+    f->counter.current_epoch = epoch;
+
+    if (max_leaf > 0) {
+        /* This build records every leaf, per-leaf mode on or off (an older
+           build's "0,0" row looks the same on a two-leaf factory). */
+        int recorded = (n_leaf == f->n_leaf_nodes);
+        if (per_leaf || recorded) {
+            if (per_leaf) f->per_leaf_enabled = 1;
+            if (!recorded) exact = 0;
+            for (int i = 0; i < f->n_leaf_nodes; i++) {
+                uint32_t v = recorded ? leaf_states[i] : UINT32_MAX;
+                if (!restore_dw_layer(&f->leaf_layers[i], v)) exact = 0;
+            }
+        } else if (epoch > 0) {
+            /* An older build's row with per-leaf mode off and no leaf
+               states.  At epoch 0 it is the one written at creation, before
+               any leaf moved, and the leaves stay at 0.  Past epoch 0 its
+               only writer was the demo-mode epoch advance, which ran after
+               the demo payments had advanced leaves: their states are
+               unknown. */
+            for (int i = 0; i < f->n_leaf_nodes; i++)
+                restore_dw_layer(&f->leaf_layers[i], UINT32_MAX);
+            exact = 0;
+        }
+    }
+    free(leaf_states);
+
+    if (!exact)
+        fprintf(stderr, "persist: DW counter row for factory %u has missing, "
+                "cut or out-of-range states (written by an older build); "
+                "those layers are restored as exhausted\n", factory_id);
     return 1;
 }
 

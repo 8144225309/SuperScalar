@@ -1058,12 +1058,14 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             return 0;
         }
         if (!persist_save_factory(db, &lsp->factory, mgr->ctx, 0) ||
-            !persist_save_tree_nodes(db, &lsp->factory, 0)) {
+            !persist_save_tree_nodes(db, &lsp->factory, 0) ||
+            !persist_save_factory_dw_state(db, 0, &lsp->factory)) {
             fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
             persist_rollback(db);
             return 0;
-        } else {
-            persist_commit(db);
+        } else if (!persist_commit(db)) {
+            fprintf(stderr, "LSP rotate: factory persist commit failed\n");
+            return 0;
         }
     }
 

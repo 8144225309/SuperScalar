@@ -737,7 +737,7 @@ static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) 
     }
     tx_buf_free(&unsigned_tx);
 
-    persist_save_commitment_sig(cbd->db, 0, ch->commitment_number,
+    persist_save_commitment_sig(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number,
                                  ch->latest_commitment_sig,
                                  signed_tx.data, signed_tx.len);
     tx_buf_free(&signed_tx);
@@ -837,19 +837,19 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
                 slen = 33;
                 secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
                                                SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number + 1, ser);
+                persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number + 1, ser);
             }
             if (channel_get_remote_pcp(ch, ch->commitment_number, &pcp)) {
                 slen = 33;
                 secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
                                                SECP256K1_EC_COMPRESSED);
-                persist_save_remote_pcp(cbd->db, 0, ch->commitment_number, ser);
+                persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number, ser);
             }
             unsigned char pcs[32];
             if (channel_get_local_pcs(ch, ch->commitment_number, pcs))
-                persist_save_local_pcs(cbd->db, 0, ch->commitment_number, pcs);
+                persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number, pcs);
             if (channel_get_local_pcs(ch, ch->commitment_number + 1, pcs))
-                persist_save_local_pcs(cbd->db, 0, ch->commitment_number + 1, pcs);
+                persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, ch->commitment_number + 1, pcs);
             memset(pcs, 0, 32);
         }
     }
@@ -857,6 +857,19 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
 }
 
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
+/* Open a client DB, moving an older build's channel rows to
+   CLIENT_DB_CHANNEL_ID first (persist_client_move_to_channel_0). */
+static int client_open_db(persist_t *db, const char *path) {
+    if (!persist_open(db, path)) return 0;
+    if (!persist_client_move_to_channel_0(db)) {
+        fprintf(stderr, "Client: cannot move the channel's rows in %s to id %d\n",
+                path, CLIENT_DB_CHANNEL_ID);
+        persist_close(db);
+        return 0;
+    }
+    return 1;
+}
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -876,28 +889,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
         if (persist_begin(cbd->db)) {
-            uint32_t client_idx = my_index - 1;
-            /* Attach persistence so revocation secrets received later land in
-               the revocation_secrets table (needed for standalone watchtower). */
-            channel_set_persist(ch, cbd->db, client_idx);
-            if (persist_save_factory(cbd->db, factory, ctx, 0) &&
-                persist_save_channel(cbd->db, ch, 0, client_idx) &&
-                persist_save_basepoints(cbd->db, client_idx, ch) &&
-                persist_save_tree_nodes(cbd->db, factory, 0)) {
-                /* Save signed distribution TX if available */
-                if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
-                    persist_save_distribution_tx(cbd->db, 0,
-                        factory->dist_unsigned_tx.data,
-                        factory->dist_unsigned_tx.len);
-                }
-                /* Save initial local PCS so they survive crash before first payment */
-                for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
-                    unsigned char pcs[32];
-                    if (channel_get_local_pcs(ch, cn, pcs)) {
-                        persist_save_local_pcs(cbd->db, 0, cn, pcs);
-                        memset(pcs, 0, 32);
-                    }
-                }
+            /* Factory, channel, basepoints, tree, local secrets and the
+               LSP's first points; also attaches the DB to the channel. */
+            if (client_persist_initial_state(cbd->db, factory, ch, ctx)) {
                 /* #313 self-custody: persist the INITIAL commitment here too, so a
                    funded-but-never-transacted channel stays force-closeable when the
                    LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
@@ -1067,7 +1061,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     client_persist_commitment_sig(ch, cbd);
                     cJSON_Delete(imsg.json);
                     if (cbd && cbd->db)
-                        persist_update_channel_balance(cbd->db, my_index - 1,
+                        persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                             ch->local_amount, ch->remote_amount,
                             ch->commitment_number);
                 } else {
@@ -1274,7 +1268,7 @@ handle_message:
 
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
 
@@ -1302,7 +1296,7 @@ handle_message:
                     if (msg.json) cJSON_Delete(msg.json);
                 }
                 if (cbd && cbd->db)
-                    persist_update_channel_balance(cbd->db, my_index - 1,
+                    persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                         ch->local_amount, ch->remote_amount, ch->commitment_number);
                 memset(sett_preimage, 0, 32);
                 break;
@@ -1376,7 +1370,7 @@ handle_message:
 
                     /* Persist balance after fulfill */
                     if (cbd && cbd->db) {
-                        persist_update_channel_balance(cbd->db, my_index - 1,
+                        persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                             ch->local_amount, ch->remote_amount, ch->commitment_number);
                     }
                 }
@@ -1396,7 +1390,7 @@ handle_message:
                 keypair, my_index);
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
             break;
@@ -1440,7 +1434,7 @@ handle_message:
             }
             /* Persist balance after fulfill */
             if (cbd && cbd->db) {
-                persist_update_channel_balance(cbd->db, my_index - 1,
+                persist_update_channel_balance(cbd->db, CLIENT_DB_CHANNEL_ID,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
             break;
@@ -1482,7 +1476,7 @@ handle_message:
                         size_t lra_slen = 33;
                         secp256k1_ec_pubkey_serialize(ctx, lra_ser, &lra_slen,
                                                        &lra_pcp, SECP256K1_EC_COMPRESSED);
-                        persist_save_remote_pcp(cbd->db, 0,
+                        persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID,
                             ch->commitment_number, lra_ser);
                     }
                 }
@@ -1960,10 +1954,9 @@ handle_message:
             /* Persist new factory + channel if DB available */
             if (cbd && cbd->db) {
                 if (persist_begin(cbd->db)) {
-                    uint32_t rot_client_idx = my_index - 1;
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
-                        persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
-                        persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
+                        persist_save_channel(cbd->db, ch, 0, CLIENT_DB_CHANNEL_ID) &&
+                        persist_save_basepoints(cbd->db, CLIENT_DB_CHANNEL_ID, ch) &&
                         persist_save_tree_nodes(cbd->db, factory, 0)) {
                         /* Save signed distribution TX if available */
                         if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
@@ -1976,7 +1969,7 @@ handle_message:
                         for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
                             unsigned char pcs[32];
                             if (channel_get_local_pcs(ch, cn, pcs)) {
-                                persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                                persist_save_local_pcs(cbd->db, CLIENT_DB_CHANNEL_ID, cn, pcs);
                                 memset(pcs, 0, 32);
                             }
                         }
@@ -1988,7 +1981,7 @@ handle_message:
                                 size_t slen = 33;
                                 if (secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
                                         &pcp, SECP256K1_EC_COMPRESSED))
-                                    persist_save_remote_pcp(cbd->db, 0, cn, ser);
+                                    persist_save_remote_pcp(cbd->db, CLIENT_DB_CHANNEL_ID, cn, ser);
                             }
                         }
                         persist_commit(cbd->db);
@@ -2322,7 +2315,7 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         return 0;
     }
     persist_t db;
-    if (!persist_open(&db, db_path)) {
+    if (!client_open_db(&db, db_path)) {
         fprintf(stderr, "Client: CLOSE policy: cannot open DB %s\n", db_path);
         return 0;
     }
@@ -2353,7 +2346,7 @@ static int client_force_close_from_db(const char *db_path, const char *network,
     unsigned char signed_tx_data[4096];
     size_t signed_tx_len = 0;
     uint64_t sig_cn = 0;
-    if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL, signed_tx_data,
+    if (persist_load_commitment_sig(&db, CLIENT_DB_CHANNEL_ID, &sig_cn, NULL, signed_tx_data,
                                     &signed_tx_len, sizeof(signed_tx_data)) &&
         signed_tx_len > 0) {
         char *tx_hex = malloc(signed_tx_len * 2 + 1);
@@ -2768,7 +2761,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         persist_t db;
-        if (!persist_open(&db, db_path)) {
+        if (!client_open_db(&db, db_path)) {
             fprintf(stderr, "ERROR: failed to open database: %s\n", db_path);
             return 1;
         }
@@ -2826,7 +2819,7 @@ int main(int argc, char *argv[]) {
             unsigned char signed_tx_data[4096];
             size_t signed_tx_len = 0;
             uint64_t sig_cn = 0;
-            if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
+            if (persist_load_commitment_sig(&db, CLIENT_DB_CHANNEL_ID, &sig_cn, NULL,
                                              signed_tx_data, &signed_tx_len,
                                              sizeof(signed_tx_data)) &&
                 signed_tx_len > 0) {
@@ -2891,7 +2884,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         persist_t db;
-        if (!persist_open(&db, db_path)) {
+        if (!client_open_db(&db, db_path)) {
             fprintf(stderr, "ERROR: failed to open database: %s\n", db_path);
             return 1;
         }
@@ -2932,7 +2925,7 @@ int main(int argc, char *argv[]) {
         unsigned char commit_tx_data[4096];
         size_t commit_tx_len = 0;
         uint64_t sig_cn = 0;
-        if (!persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
+        if (!persist_load_commitment_sig(&db, CLIENT_DB_CHANNEL_ID, &sig_cn, NULL,
                                           commit_tx_data, &commit_tx_len,
                                           sizeof(commit_tx_data)) ||
             commit_tx_len == 0) {
@@ -2946,12 +2939,12 @@ int main(int argc, char *argv[]) {
         /* Load channel state (balances + commitment number) */
         uint64_t local_amt = 0, remote_amt = 0;
         uint64_t cn = 0;
-        persist_load_channel_state(&db, 0, &local_amt, &remote_amt, &cn);
+        persist_load_channel_state(&db, CLIENT_DB_CHANNEL_ID, &local_amt, &remote_amt, &cn);
 
         /* Load basepoints */
         unsigned char local_secs[4][32];
         unsigned char remote_bps_raw[4][33];
-        if (!persist_load_basepoints(&db, 0, local_secs, remote_bps_raw)) {
+        if (!persist_load_basepoints(&db, CLIENT_DB_CHANNEL_ID, local_secs, remote_bps_raw)) {
             fprintf(stderr, "ERROR: no basepoints in DB\n");
             persist_close(&db);
             return 1;
@@ -3031,7 +3024,7 @@ int main(int argc, char *argv[]) {
             unsigned char (*pcs_arr)[32] = calloc(pcs_max, 32);
             if (pcs_arr) {
                 size_t pcs_loaded = 0;
-                persist_load_local_pcs(&db, 0, pcs_arr, pcs_max, &pcs_loaded);
+                persist_load_local_pcs(&db, CLIENT_DB_CHANNEL_ID, pcs_arr, pcs_max, &pcs_loaded);
                 for (uint64_t c = 0; c < pcs_max; c++) {
                     int nonzero = 0;
                     for (int j = 0; j < 32; j++)
@@ -3441,7 +3434,7 @@ int main(int argc, char *argv[]) {
     persist_t db;
     int use_db = 0;
     if (db_path) {
-        if (!persist_open(&db, db_path)) {
+        if (!client_open_db(&db, db_path)) {
             fprintf(stderr, "Error: cannot open database: %s\n", db_path);
             secp256k1_context_destroy(ctx);
             report_close(&rpt);
