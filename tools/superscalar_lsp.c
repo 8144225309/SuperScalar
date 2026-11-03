@@ -4093,7 +4093,14 @@ accept_new_factory:
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* Populate default profiles from CLI config */
+    /* Populate default profiles from CLI config.  The shape setters above
+       allocate the factory's arrays, but not every shape calls one (a plain
+       --arity 2 without --static-near-root does not), so make sure they exist
+       before writing the profiles. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        return 1;
+    }
     for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
         lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
