@@ -287,6 +287,7 @@ add_executable(test_superscalar
     tests/test_channel.c
     tests/test_adaptor.c
     tests/test_ladder.c
+    tests/test_rotation_creation.c
     tests/test_wire.c
     tests/test_channels.c
     tests/spend_helpers.c
