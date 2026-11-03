@@ -107,7 +107,11 @@ jobs:
             '
 
   static-analysis:
-    runs-on: ubuntu-latest
+    # Pinned: cppcheck comes from the runner image's apt archive, so
+    # ubuntu-latest silently changes the checker (24.04 ships 2.13, 26.04
+    # ships 2.19, which adds checks) and turns the job red without a code
+    # change.  The tree is clean under both; bump the pin deliberately.
+    runs-on: ubuntu-24.04
     name: Static Analysis
     # cppcheck on tools/superscalar_lsp.c can take 12-18 min on the
     # GitHub Actions runner under load; the rest of the corpus finishes
@@ -134,6 +138,7 @@ jobs:
         run: cmake --build build --parallel
       - name: Run cppcheck
         run: |
+          cppcheck --version
           cppcheck --enable=warning,performance,portability \
             --suppress=missingInclude \
             --suppress=unusedFunction \
