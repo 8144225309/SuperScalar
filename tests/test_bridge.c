@@ -2306,10 +2306,12 @@ int test_tor_password_file(void) {
 
     /* Test with password that has no trailing newline */
     f = fopen(tmpfile, "w");
+    TEST_ASSERT(f != NULL, "fopen w failed");
     fprintf(f, "no_newline");
     fclose(f);
 
     f = fopen(tmpfile, "r");
+    TEST_ASSERT(f != NULL, "fopen r failed");
     TEST_ASSERT(fgets(buf, sizeof(buf), f) != NULL, "fgets failed");
     buf[strcspn(buf, "\r\n")] = '\0';
     fclose(f);

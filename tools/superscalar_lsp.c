@@ -3300,7 +3300,7 @@ int main(int argc, char *argv[]) {
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS] = {0};
                 for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
                     all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
@@ -4093,7 +4093,14 @@ accept_new_factory:
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* Populate default profiles from CLI config */
+    /* Populate default profiles from CLI config.  The shape setters above
+       allocate the factory's arrays, but not every shape calls one (a plain
+       --arity 2 without --static-near-root does not), so make sure they exist
+       before writing the profiles. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        return 1;
+    }
     for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
         lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
@@ -4326,7 +4333,7 @@ accept_new_factory:
             }
             if (init_ok) {
                 /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
-                uint32_t init_layers[DW_MAX_LAYERS];
+                uint32_t init_layers[DW_MAX_LAYERS] = {0};
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                     init_layers[li] = lsp_p->factory.counter.layers[li].config.max_states;
                 persist_save_dw_counter(&db, 0, 0, lsp_p->factory.counter.n_layers, init_layers);
@@ -4684,7 +4691,7 @@ accept_new_factory:
                 }
                 printf(" blocks)\n");
                 if (use_db) {
-                    uint32_t layer_states[DW_MAX_LAYERS];
+                    uint32_t layer_states[DW_MAX_LAYERS] = {0};
                     for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                         layer_states[li] = lsp_p->factory.counter.layers[li].current_state;
                     persist_save_dw_counter(&db, 0, epoch,
