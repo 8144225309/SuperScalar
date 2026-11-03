@@ -3865,8 +3865,7 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             factory_t *f = calloc(1, sizeof(factory_t));
-            factory_alloc_default_arrays(f);
-            factory_alloc_default_arrays(f);
+            TEST_ASSERT(f && factory_alloc_default_arrays(f), "alloc factory");
             f->economic_mode = (economic_mode_t)configs[ci].econ;
             f->n_participants = 3;
             f->profiles[0].profit_share_bps = configs[ci].lsp_bps;
@@ -4010,6 +4009,7 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Factory with step_blocks=6, states_per_layer=2, 5 participants */
     factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 2);
 
     uint32_t delta = lsp_compute_factory_cltv_delta(f);

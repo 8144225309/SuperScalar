@@ -74,6 +74,7 @@ static int check_client_error(const wire_msg_t *msg, size_t client_idx) {
 int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
              const secp256k1_keypair *keypair, int port,
              size_t expected_clients) {
+    if (!lsp || !keypair) return 0;
     memset(lsp, 0, sizeof(*lsp));
     lsp->ctx = ctx;
     lsp->lsp_keypair = *keypair;
@@ -1178,7 +1179,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         size_t close_nonces_received = 0;
 
         while (close_nonces_received < lsp->n_clients) {
-            int wait_fds[LSP_MAX_CLIENTS];
+            int wait_fds[LSP_MAX_CLIENTS] = {0};
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_nonce_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;
@@ -1295,7 +1296,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         size_t close_psigs_received = 0;
 
         while (close_psigs_received < lsp->n_clients) {
-            int wait_fds[LSP_MAX_CLIENTS];
+            int wait_fds[LSP_MAX_CLIENTS] = {0};
             for (size_t i = 0; i < lsp->n_clients; i++) {
                 wait_fds[i] = (close_psig_cer.clients[i] == CLIENT_WAITING)
                               ? lsp->client_fds[i] : -1;

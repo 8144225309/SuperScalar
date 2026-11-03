@@ -3782,7 +3782,7 @@ int test_factory_nav_variable_n(void) {
         }
 
         /* Compute funding spk */
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (int i = 0; i < n; i++)
             if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
         musig_keyagg_t ka;
@@ -6451,6 +6451,7 @@ int test_regtest_lstock_hashlock_poison(void) {
     /* POSITIVE consensus: the interpreter accepts it. */
     {
         char *p = (char *)malloc(poison.len * 2 + 16);
+        TEST_ASSERT(p, "alloc");
         snprintf(p, poison.len * 2 + 16, "[\"%s\"]", poison_hex);
         char *tma = regtest_exec(&rt, "testmempoolaccept", p);
         free(p);
@@ -6478,11 +6479,14 @@ int test_regtest_lstock_hashlock_poison(void) {
             if (memcmp(poison.data + i, secret, 32) == 0) { off = (int)i; break; }
         TEST_ASSERT(off >= 0, "preimage present in poison witness");
         unsigned char *mangled = (unsigned char *)malloc(poison.len);
+        TEST_ASSERT(mangled, "alloc");
         memcpy(mangled, poison.data, poison.len);
         mangled[off] ^= 0xFF;  /* break SHA256(preimage)==H_s, keep 32-byte length */
         char *mhex = (char *)malloc(poison.len * 2 + 1);
+        TEST_ASSERT(mhex, "alloc");
         hex_encode(mangled, poison.len, mhex);
         char *p = (char *)malloc(poison.len * 2 + 16);
+        TEST_ASSERT(p, "alloc");
         snprintf(p, poison.len * 2 + 16, "[\"%s\"]", mhex);
         char *tma = regtest_exec(&rt, "testmempoolaccept", p);
         free(p); free(mhex); free(mangled);
@@ -6510,6 +6514,7 @@ int test_regtest_lstock_hashlock_poison(void) {
     /* ECONOMIC OUTCOME: broadcast + confirm + the L-stock is redistributed. */
     {
         char *p = (char *)malloc(poison.len * 2 + 16);
+        TEST_ASSERT(p, "alloc");
         snprintf(p, poison.len * 2 + 16, "\"%s\"", poison_hex);
         char *srt = regtest_exec(&rt, "sendrawtransaction", p);
         free(p);
@@ -6642,8 +6647,10 @@ int test_regtest_lstock_poison_ceremony(void) {
     TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, secret, &poison),
                 "assemble poison with secret");
     char *phex = (char *)malloc(poison.len * 2 + 1);
+    TEST_ASSERT(phex, "alloc");
     hex_encode(poison.data, poison.len, phex);
     char *p = (char *)malloc(poison.len * 2 + 16);
+    TEST_ASSERT(p, "alloc");
     snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
     char *tma = regtest_exec(&rt, "testmempoolaccept", p);
     free(p);
@@ -6679,8 +6686,10 @@ int test_regtest_lstock_poison_ceremony(void) {
                 "from_template byte-identical to with_secret");
     {
         char *thex = (char *)malloc(poison_tmpl.len * 2 + 1);
+        TEST_ASSERT(thex, "alloc");
         hex_encode(poison_tmpl.data, poison_tmpl.len, thex);
         char *tp = (char *)malloc(poison_tmpl.len * 2 + 16);
+        TEST_ASSERT(tp, "alloc");
         snprintf(tp, poison_tmpl.len * 2 + 16, "[\"%s\"]", thex);
         char *tma2 = regtest_exec(&rt, "testmempoolaccept", tp);
         free(tp);
@@ -6902,8 +6911,10 @@ int test_regtest_lstock_poison_old_state(void) {
     tx_buf_free(&bad);
 
     char *phex = (char *)malloc(poison.len * 2 + 1);
+    TEST_ASSERT(phex, "alloc");
     hex_encode(poison.data, poison.len, phex);
     char *p = (char *)malloc(poison.len * 2 + 16);
+    TEST_ASSERT(p, "alloc");
     snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
     char *tma = regtest_exec(&rt, "testmempoolaccept", p);
     free(p);
@@ -7582,7 +7593,7 @@ int test_factory_ps_matrix(void) {
 
         unsigned char fund_spk[34];
         {
-            secp256k1_pubkey pks[64];
+            secp256k1_pubkey pks[64] = {0};
             for (size_t i = 0; i < N; i++)
                 secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
             musig_keyagg_t ka;

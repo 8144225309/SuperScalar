@@ -1888,7 +1888,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Collect channel indices that live on this leaf node. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;
@@ -2729,7 +2729,7 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                        "(%zu bytes, L-stock %llu sats)\n", affected[k], poison_len,
                        (unsigned long long)poison_old_l_amount[k]);
             }
-            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
             size_t n_leaf_ch = 0;
             for (size_t cc = 0; cc < mgr->n_channels; cc++) {
                 size_t c_node; uint32_t c_vout;
@@ -3369,7 +3369,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        (#258), reproduced end-to-end by tools/test_regtest_cheat_realloc.sh. */
     if (mgr->watchtower && realloc_had_signed && node->is_signed &&
         node->signed_tx.len > 0) {
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t cc = 0; cc < mgr->n_channels; cc++) {
             size_t c_node;
@@ -8226,7 +8226,7 @@ int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
            what watchtower wants for old_txid32. */
 
         /* Collect channel ids on this leaf. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;

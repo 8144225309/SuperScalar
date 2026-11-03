@@ -3300,7 +3300,7 @@ int main(int argc, char *argv[]) {
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS] = {0};
                 for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
                     all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
@@ -4333,7 +4333,7 @@ accept_new_factory:
             }
             if (init_ok) {
                 /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
-                uint32_t init_layers[DW_MAX_LAYERS];
+                uint32_t init_layers[DW_MAX_LAYERS] = {0};
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                     init_layers[li] = lsp_p->factory.counter.layers[li].config.max_states;
                 persist_save_dw_counter(&db, 0, 0, lsp_p->factory.counter.n_layers, init_layers);
@@ -4691,7 +4691,7 @@ accept_new_factory:
                 }
                 printf(" blocks)\n");
                 if (use_db) {
-                    uint32_t layer_states[DW_MAX_LAYERS];
+                    uint32_t layer_states[DW_MAX_LAYERS] = {0};
                     for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                         layer_states[li] = lsp_p->factory.counter.layers[li].current_state;
                     persist_save_dw_counter(&db, 0, epoch,

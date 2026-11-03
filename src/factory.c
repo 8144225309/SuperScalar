@@ -779,6 +779,7 @@ int factory_init_with_config(factory_t *f, secp256k1_context *ctx,
                               const secp256k1_keypair *keypairs, size_t n_participants,
                               uint16_t step_blocks, uint32_t states_per_layer,
                               const factory_config_t *cfg) {
+    if (!f) return 0;
     memset(f, 0, sizeof(*f));
     f->ctx = ctx;
     f->n_participants = n_participants;
@@ -1214,6 +1215,7 @@ void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
                          const unsigned char *spk, size_t spk_len) {
+    if (!f) return;
     if (spk_len > sizeof(f->funding_spk)) {
         fprintf(stderr, "factory_set_funding: spk_len %zu exceeds buffer\n", spk_len);
         return;
@@ -1878,6 +1880,7 @@ static int build_subtree(
 }
 
 int factory_build_tree(factory_t *f) {
+    if (!f) return 0;
     size_t n_clients = f->n_participants - 1;
 
     /* Validate participant count */
@@ -3676,6 +3679,7 @@ int factory_assemble_poison_with_secret(factory_t *f, size_t node_idx,
 }
 
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {
+    if (!f || !seed32) return;
     memcpy(f->shachain_seed, seed32, 32);
     f->has_shachain = 1;
 }

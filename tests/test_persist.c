@@ -2514,11 +2514,11 @@ int test_persist_crash_dw_state(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c1 open");
 
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].current_state;
 
-        uint32_t leaf_states[8];
+        uint32_t leaf_states[8] = {0};
         for (int i = 0; i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
 
@@ -2591,11 +2591,11 @@ int test_persist_crash_dw_state(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c2 open");
 
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].current_state;
 
-        uint32_t leaf_states[8];
+        uint32_t leaf_states[8] = {0};
         for (int i = 0; i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
 

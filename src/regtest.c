@@ -973,6 +973,7 @@ int regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *address)
 }
 
 int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
+    if (!rt || !tx_hex) return 0;
     char *params = (char *)malloc(strlen(tx_hex) + 4);
     if (!params) return 0;
     snprintf(params, strlen(tx_hex) + 4, "\"%s\"", tx_hex);

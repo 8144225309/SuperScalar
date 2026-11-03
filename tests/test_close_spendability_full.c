@@ -82,7 +82,7 @@ static int fund_n_party_factory(regtest_t *rt,
                                  uint32_t *out_fund_vout,
                                  uint64_t *out_fund_amount) {
     /* Derive keypairs + pubkeys from deterministic seckeys. */
-    secp256k1_pubkey pks[5];
+    secp256k1_pubkey pks[5] = {0};
     for (size_t i = 0; i < n_participants; i++) {
         if (!secp256k1_keypair_create(ctx, &out_kps[i], N_PARTY_SECKEYS[i])) return 0;
         if (!secp256k1_keypair_pub(ctx, &pks[i], &out_kps[i])) return 0;
@@ -2530,6 +2530,7 @@ int test_regtest_inversion_of_timeout_default(void) {
         regtest_mine_blocks(&rt, 1, mine_addr);
 
     char *dist_hex = malloc(signed_dist.len * 2 + 1);
+    TEST_ASSERT(dist_hex, "alloc dist hex");
     hex_encode(signed_dist.data, signed_dist.len, dist_hex);
     dist_hex[signed_dist.len * 2] = '\0';
     char dist_txid[65];
@@ -3563,7 +3564,7 @@ int test_regtest_full_force_close_and_sweep_arityPS(void) {
 
         /* Build keyagg in signer_indices order: {LSP, client}. */
         secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t s = 0; s < leaf->n_signers; s++) {
             uint32_t sidx = leaf->signer_indices[s];
             signers[s] = kps[sidx];
@@ -3862,7 +3863,7 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
                     "compute channel sighash");
 
         secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t s = 0; s < leaf0->n_signers; s++) {
             uint32_t sidx = leaf0->signer_indices[s];
             signers[s] = kps[sidx];
@@ -3967,7 +3968,7 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
                                               0xFFFFFFFEu),
                     "leaf1 channel sighash");
         secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t s = 0; s < leaf1->n_signers; s++) {
             uint32_t sidx = leaf1->signer_indices[s];
             signers[s] = kps[sidx];
@@ -5941,7 +5942,7 @@ static int sweep_ps_channel_n_party(regtest_t *rt,
         tx_buf_free(&cu); return 0;
     }
     secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-    secp256k1_pubkey  signer_pks[FACTORY_MAX_SIGNERS];
+    secp256k1_pubkey  signer_pks[FACTORY_MAX_SIGNERS] = {0};
     for (size_t s = 0; s < leaf->n_signers; s++) {
         uint32_t sidx = leaf->signer_indices[s];
         signers[s] = kps[sidx];
@@ -6153,7 +6154,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
            (unsigned long long)total_advance_fees,
            (unsigned long long)total_allocated);
 
-    uint64_t expected_deltas[32];
+    uint64_t expected_deltas[32] = {0};
     for (size_t p = 0; p < N; p++) expected_deltas[p] = per_party_recv[p];
     TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
                 "per-party wallet deltas match expected");
