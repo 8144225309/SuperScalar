@@ -12,6 +12,11 @@
 #define MAX_HTLCS 483              /* BOLT #2 maximum */
 #define DEFAULT_HTLCS_CAP 64      /* initial allocation for dynamic htlc arrays */
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
+/* Commitment fee rate bounds (sat/kvB) for a channel whose rate the LSP
+   sets: at least 1000, so the commitment carries its P2A anchor and pays at
+   least 1 sat/vB; at most 100 sat/vB. */
+#define CHANNEL_COMMIT_FEE_RATE_MIN 1000
+#define CHANNEL_COMMIT_FEE_RATE_MAX 100000
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 #define ANCHOR_OUTPUT_AMOUNT     240   /* P2A anchor for CPFP fee bumping (sats) */
 

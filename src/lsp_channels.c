@@ -696,6 +696,11 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             entry->channel_id,
             entry->channel.local_amount * 1000,   /* sats → msat */
             entry->channel.remote_amount * 1000);
+        /* The commitment fee rate, so the client can check that the balances
+           plus the commitment fee are exactly the channel's funding. */
+        if (msg)
+            cJSON_AddNumberToObject(msg, "fee_rate_sat_per_kvb",
+                                    (double)entry->channel.fee_rate_sat_per_kvb);
         if (!wire_send(lsp->client_fds[c], MSG_CHANNEL_READY, msg)) {
             fprintf(stderr, "LSP: failed to send CHANNEL_READY to client %zu\n", c);
             cJSON_Delete(msg);
@@ -5779,6 +5784,42 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     size_t c = (size_t)found;
 
+    if (lsp->client_rotation_v) {
+        uint64_t rv = 0;
+        lsp->client_rotation_v[c] =
+            wire_json_get_uint(msg->json, "rotation_v", 255, &rv) ? (uint8_t)rv : 0;
+    }
+    /* A client that signed a rotation close but missed its end reconnects
+       with its OLD state: tell it about the close instead (it switches to
+       the replacement once the close is confirmed, then reconnects). */
+    {
+        cJSON *rp_j = cJSON_GetObjectItem(msg->json, "rotation_pending");
+        if (rp_j && cJSON_IsString(rp_j) && rp_j->valuestring) {
+            const lsp_rotation_progress_t *rp = &mgr->rot_progress;
+            const char *hex = NULL;
+            int conf = -1;
+            if ((rp->phase == LSP_ROT_PROGRESS_CIN_CLOSING ||
+                 rp->phase == LSP_ROT_PROGRESS_CIN_CLOSED) &&
+                strcmp(rp->close_txid, rp_j->valuestring) == 0) {
+                hex = rp->cin_signed_close_hex;
+                conf = rp->phase == LSP_ROT_PROGRESS_CIN_CLOSED;
+            } else if (mgr->rot_last_cin_close_txid[0] &&
+                       strcmp(mgr->rot_last_cin_close_txid, rp_j->valuestring) == 0) {
+                hex = mgr->rot_last_cin_close_hex;
+                conf = 1;
+            }
+            if (conf >= 0) {
+                cJSON *d = wire_build_rotation_done(rp_j->valuestring, hex, conf);
+                wire_send(new_fd, MSG_ROTATION_DONE, d);
+                cJSON_Delete(d);
+                printf("LSP reconnect: client %zu has rotation close %s pending; told it "
+                       "(%s)\n", c, rp_j->valuestring, conf ? "confirmed" : "not confirmed yet");
+                wire_close(new_fd);
+                return 0;
+            }
+        }
+    }
+
     /* 4. Verify commitment_number matches (Gap 2B: proper reconciliation) */
     channel_t *ch = &mgr->entries[c].channel;
     if (commitment_number != ch->commitment_number) {
@@ -7164,7 +7205,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                        per block. */
                     /* Not gated on rot_auto_rotate: a rotation past its close
                        (started automatically or by hand) must always finish. */
-                    if (lsp_rotation_progress_pending(mgr) &&
+                    if (lsp_rotation_progress_resumable(mgr) &&
                         (uint32_t)height != mgr->rot_progress.last_attempt_height) {
                         /* Steps that need no client (confirming or
                            rebroadcasting the recorded close / funding) run
@@ -7446,6 +7487,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     /* Max retries exhausted — distribution TX fallback */
                                     uint32_t mret = mgr->rot_max_retries > 0
                                                     ? mgr->rot_max_retries : 3;
+                                    (void)lsp_rotation_cin_abandon(mgr,
+                                                                   lf->factory.funding_txid);
                                     printf("LSP: rotation failed %u times for factory %u"
                                            " — broadcasting distribution TX\n",
                                            mret, lf->factory_id);

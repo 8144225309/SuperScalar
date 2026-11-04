@@ -166,9 +166,11 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
     lsp->client_fds = malloc(cap * sizeof(int));
     lsp->client_pubkeys = calloc(cap, sizeof(secp256k1_pubkey));
     lsp->client_identity_pubkeys = calloc(cap, sizeof(secp256k1_pubkey));
-    if (!lsp->client_fds || !lsp->client_pubkeys || !lsp->client_identity_pubkeys) {
+    lsp->client_rotation_v = calloc(cap, sizeof(uint8_t));
+    if (!lsp->client_fds || !lsp->client_pubkeys || !lsp->client_identity_pubkeys ||
+        !lsp->client_rotation_v) {
         free(lsp->client_fds); free(lsp->client_pubkeys);
-        free(lsp->client_identity_pubkeys);
+        free(lsp->client_identity_pubkeys); free(lsp->client_rotation_v);
         memset(lsp, 0, sizeof(*lsp));
         return 0;
     }
@@ -315,6 +317,11 @@ int lsp_accept_clients(lsp_t *lsp) {
         lsp->client_pubkeys[i] = fp_rc == 1 ? fac_pk : id_pk;
         if (lsp->client_identity_pubkeys)
             lsp->client_identity_pubkeys[i] = id_pk;
+        if (lsp->client_rotation_v) {
+            uint64_t rv = 0;
+            lsp->client_rotation_v[i] =
+                wire_json_get_uint(msg.json, "rotation_v", 255, &rv) ? (uint8_t)rv : 0;
+        }
 
         /* Optional slot_hint for deterministic keyagg ordering */
         cJSON *sh_item = cJSON_GetObjectItem(msg.json, "slot_hint");
@@ -362,6 +369,11 @@ int lsp_accept_clients(lsp_t *lsp) {
                         secp256k1_pubkey tpk = lsp->client_pubkeys[target];
                         int tfd = lsp->client_fds[target];
                         int th = hello_slot_hints[target];
+                        if (lsp->client_rotation_v) {
+                            uint8_t trv = lsp->client_rotation_v[target];
+                            lsp->client_rotation_v[target] = lsp->client_rotation_v[j];
+                            lsp->client_rotation_v[j] = trv;
+                        }
                         if (lsp->client_identity_pubkeys) {
                             secp256k1_pubkey tid = lsp->client_identity_pubkeys[target];
                             lsp->client_identity_pubkeys[target] =
@@ -844,6 +856,8 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
 
     /* Send FACTORY_PROPOSE to all clients (tree shape) */
     cJSON *propose = wire_build_factory_propose(f);
+    if (lsp->propose_rotation)
+        cJSON_AddItemReferenceToObject(propose, "rotation", lsp->propose_rotation);
     if (lsp->dist_client_amounts && lsp->dist_n_client_amounts > 0) {
         cJSON *da = cJSON_CreateArray();
         for (size_t i = 0; i < lsp->dist_n_client_amounts; i++)
@@ -1314,6 +1328,35 @@ fail_pre:
     return 0;
 }
 
+/* factory_t holds one signing session inline (the distribution TX's); its
+   small-buffer nonce pointer points into the struct itself, so a struct
+   copy must re-point it (or factory_free would free an interior pointer). */
+static void factory_after_move(factory_t *dst, const factory_t *src_addr) {
+    if (dst->dist_signing_session.pubnonces ==
+        src_addr->dist_signing_session.pubnonces_small)
+        dst->dist_signing_session.pubnonces = dst->dist_signing_session.pubnonces_small;
+}
+
+int lsp_factory_detach(lsp_t *lsp, factory_t *old_out) {
+    if (!lsp || !old_out) return 0;
+    lsp_creation_template_t t;
+    if (!creation_template_capture(&t, &lsp->factory)) return 0;
+    *old_out = lsp->factory;
+    factory_after_move(old_out, &lsp->factory);
+    memset(&lsp->factory, 0, sizeof(lsp->factory));
+    creation_template_restore(&lsp->factory, &t);
+    creation_template_free(&t);
+    return 1;
+}
+
+void lsp_factory_reattach(lsp_t *lsp, factory_t *old) {
+    if (!lsp || !old) return;
+    factory_free(&lsp->factory);
+    lsp->factory = *old;
+    factory_after_move(&lsp->factory, old);
+    memset(old, 0, sizeof(*old));
+}
+
 int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_txid, uint32_t funding_vout,
                               uint64_t funding_amount,
@@ -1327,7 +1370,17 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                                tx_buf_t *close_tx_out,
                                const tx_output_t *outputs, size_t n_outputs,
                                uint32_t current_height) {
-    factory_t *f = &lsp->factory;
+    return lsp_run_cooperative_close_with(lsp, &lsp->factory, close_tx_out, outputs,
+                                          n_outputs, current_height, NULL, NULL);
+}
+
+int lsp_run_cooperative_close_with(lsp_t *lsp, factory_t *f,
+                                   tx_buf_t *close_tx_out,
+                                   const tx_output_t *outputs, size_t n_outputs,
+                                   uint32_t current_height,
+                                   int (*before_done)(void *ctx, const tx_buf_t *signed_tx),
+                                   void *before_done_ctx) {
+    if (!lsp || !f) return 0;
     size_t n_total = 1 + lsp->n_clients;
     int clients_notified = 0;  /* set after CLOSE_PROPOSE sent */
 
@@ -1634,6 +1687,13 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         goto close_fail;
     }
 
+    /* The caller records the signed close before anyone else may hold it. */
+    if (before_done && !before_done(before_done_ctx, close_tx_out)) {
+        fprintf(stderr, "LSP: close signed but not recorded -- not sending CLOSE_DONE\n");
+        tx_buf_free(close_tx_out);
+        goto close_fail;
+    }
+
     /* Send CLOSE_DONE to all clients */
     {
         cJSON *done = wire_build_close_done(close_tx_out->data, close_tx_out->len);
@@ -1735,6 +1795,8 @@ void lsp_cleanup(lsp_t *lsp) {
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
     free(lsp->client_identity_pubkeys);
+    free(lsp->client_rotation_v);
+    lsp->client_rotation_v = NULL;
     lsp->client_fds = NULL;
     lsp->client_pubkeys = NULL;
     lsp->client_identity_pubkeys = NULL;

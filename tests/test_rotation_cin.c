@@ -7,6 +7,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/wire.h"
+#include "superscalar/fee_estimator.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -33,6 +34,181 @@ static int mk_pk(secp256k1_pubkey *pk, unsigned char b) {
     unsigned char s[32];
     memset(s, b, 32);
     return secp256k1_ec_pubkey_create(cin_ctx(), pk, s);
+}
+
+/* Every marker maps to the right next step. */
+int test_cin_resume_action(void) {
+    TEST_ASSERT(lsp_rotation_cin_resume_action(LSP_ROT_PROGRESS_CLOSED, -1, 0, 1) ==
+                LSP_CIN_RESUME_NONE, "old-protocol marker");
+    int pre[] = { LSP_ROT_PROGRESS_CIN_CLOSE_BUILT, LSP_ROT_PROGRESS_CIN_SIGNING,
+                  LSP_ROT_PROGRESS_CIN_SIGNING_READY, LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING };
+    for (size_t i = 0; i < sizeof(pre) / sizeof(pre[0]); i++) {
+        TEST_ASSERT(lsp_rotation_cin_resume_action(pre[i], -1, 0, 1) == LSP_CIN_RESUME_RERUN,
+                    "before the close is signed: rerun over the recorded close");
+        TEST_ASSERT(lsp_rotation_cin_resume_action(pre[i], -1, 0, 0) == LSP_CIN_RESUME_WAIT,
+                    "... but only with every client online");
+    }
+    TEST_ASSERT(lsp_rotation_cin_resume_action(LSP_ROT_PROGRESS_CIN_CLOSING, 0, 0, 0) ==
+                LSP_CIN_RESUME_REBROADCAST, "signed close off the network: rebroadcast");
+    TEST_ASSERT(lsp_rotation_cin_resume_action(LSP_ROT_PROGRESS_CIN_CLOSING, 0, 1, 0) ==
+                LSP_CIN_RESUME_WAIT, "in the mempool: wait");
+    TEST_ASSERT(lsp_rotation_cin_resume_action(LSP_ROT_PROGRESS_CIN_CLOSING, 1, 0, 0) ==
+                LSP_CIN_RESUME_FINISH, "confirmed: finish");
+    TEST_ASSERT(lsp_rotation_cin_resume_action(LSP_ROT_PROGRESS_CIN_CLOSED, -1, 0, 0) ==
+                LSP_CIN_RESUME_FINISH, "closed: finish");
+    return 1;
+}
+
+/* Replacement keys must be fresh. */
+int test_cin_check_keys(void) {
+    secp256k1_context *ctx = cin_ctx();
+    secp256k1_pubkey lsp, old[3], ids[2], fresh[2], bad[2];
+    TEST_ASSERT(mk_pk(&lsp, 0x10) && mk_pk(&old[0], 0x10) && mk_pk(&old[1], 0x11) &&
+                mk_pk(&old[2], 0x12) && mk_pk(&ids[0], 0x21) && mk_pk(&ids[1], 0x22) &&
+                mk_pk(&fresh[0], 0x31) && mk_pk(&fresh[1], 0x32), "keys");
+    const char *why = NULL;
+    TEST_ASSERT(lsp_rotation_cin_check_keys(ctx, &lsp, old, 3, ids, fresh, 2, &why), "fresh ok");
+    bad[0] = fresh[0]; bad[1] = old[2];
+    TEST_ASSERT(!lsp_rotation_cin_check_keys(ctx, &lsp, old, 3, ids, bad, 2, &why) &&
+                strstr(why, "old factory"), "old key refused");
+    bad[1] = ids[0];
+    TEST_ASSERT(!lsp_rotation_cin_check_keys(ctx, &lsp, old, 3, ids, bad, 2, &why) &&
+                strstr(why, "identity"), "identity refused");
+    bad[1] = fresh[0];
+    TEST_ASSERT(!lsp_rotation_cin_check_keys(ctx, &lsp, old, 3, ids, bad, 2, &why) &&
+                strstr(why, "same key"), "duplicate refused");
+    bad[1] = lsp;
+    TEST_ASSERT(!lsp_rotation_cin_check_keys(ctx, &lsp, old, 3, ids, bad, 2, &why) &&
+                strstr(why, "LSP"), "LSP key refused");
+    return 1;
+}
+
+/* The client keeps exactly its balance; a smaller replacement comes out of
+   the LSP side. */
+/* A close into the new factory that is not signed yet never holds back the
+   retry limit or the distribution-TX fallback, and is dropped after it. */
+int test_cin_preclose_fallback(void) {
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    unsigned char d[32], other[32];
+    memset(d, 0x33, 32);
+    memset(other, 0x44, 32);
+    memcpy(mgr->rot_progress.dying_funding_txid, d, 32);
+    int pre[] = { LSP_ROT_PROGRESS_CIN_CLOSE_BUILT, LSP_ROT_PROGRESS_CIN_SIGNING,
+                  LSP_ROT_PROGRESS_CIN_SIGNING_READY, LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING };
+    for (size_t i = 0; i < sizeof(pre) / sizeof(pre[0]); i++) {
+        mgr->rot_progress.phase = pre[i];
+        TEST_ASSERT(!lsp_rotation_progress_pending(mgr), "not past the close");
+        TEST_ASSERT(lsp_rotation_progress_resumable(mgr), "still re-run");
+        TEST_ASSERT(lsp_rotation_cin_preclose(mgr, d), "unsigned close of this factory");
+        TEST_ASSERT(!lsp_rotation_cin_preclose(mgr, other), "not of another factory");
+    }
+    mgr->rot_progress.phase = LSP_ROT_PROGRESS_CIN_CLOSING;
+    TEST_ASSERT(lsp_rotation_progress_pending(mgr) && !lsp_rotation_cin_preclose(mgr, d),
+                "a recorded signed close is past the close");
+    mgr->rot_progress.phase = LSP_ROT_PROGRESS_CIN_CLOSED;
+    TEST_ASSERT(lsp_rotation_progress_pending(mgr), "confirmed close: finish");
+
+    lsp_rotation_progress_t rp;
+    memset(&rp, 0, sizeof(rp));
+    TEST_ASSERT(lsp_rotation_cin_note_failure(&rp, 100, 3, 2) && rp.cin_next_try_height == 104,
+                "first failure: retry after the backoff");
+    TEST_ASSERT(lsp_rotation_cin_note_failure(&rp, 104, 3, 2) && rp.cin_next_try_height == 112,
+                "second failure: longer backoff");
+    TEST_ASSERT(lsp_rotation_cin_note_failure(&rp, 112, 3, 2), "third failure: one more try");
+    TEST_ASSERT(!lsp_rotation_cin_note_failure(&rp, 128, 3, 2), "retry limit reached");
+
+    mgr->rot_progress.phase = LSP_ROT_PROGRESS_CIN_SIGNING;
+    TEST_ASSERT(!lsp_rotation_cin_abandon(mgr, other), "only its own factory's marker");
+    TEST_ASSERT(lsp_rotation_cin_abandon(mgr, d) && mgr->rot_progress.phase == 0,
+                "the unsigned close is dropped");
+    memcpy(mgr->rot_progress.dying_funding_txid, d, 32);
+    mgr->rot_progress.phase = LSP_ROT_PROGRESS_CIN_CLOSING;
+    TEST_ASSERT(!lsp_rotation_cin_abandon(mgr, d), "never once the close is signed");
+    lsp_rotation_progress_clear(mgr);
+    free(mgr);
+    return 1;
+}
+
+/* A dropped (never fully signed) close of a factory is the close a new
+   attempt runs over; new channels never get a commitment fee rate below the
+   anchor minimum. */
+int test_cin_reuse_recorded_close(void) {
+    char path[] = "/tmp/ss_cin_rr_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0, "mkstemp");
+    close(fd);
+    unlink(path);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    mgr->persist = &db;
+    unsigned char d[32];
+    memset(d, 0x55, 32);
+    char dh[65];
+    hex_encode(d, 32, dh);                  /* all 0x55: same in either byte order */
+    secp256k1_pubkey a, b;
+    TEST_ASSERT(mk_pk(&a, 0x21) && mk_pk(&b, 0x22), "pks");
+    unsigned char sa[33], sb[33];
+    size_t la = 33, lb = 33;
+    secp256k1_ec_pubkey_serialize(cin_ctx(), sa, &la, &a, SECP256K1_EC_COMPRESSED);
+    secp256k1_ec_pubkey_serialize(cin_ctx(), sb, &lb, &b, SECP256K1_EC_COMPRESSED);
+    char parts[133];
+    hex_encode(sa, 33, parts);
+    hex_encode(sb, 33, parts + 66);
+    const char *x = "8888888888888888888888888888888888888888888888888888888888888888";
+    persist_rotation_progress_t r;
+    memset(&r, 0, sizeof(r));
+    r.dying_funding_vout = 1;
+    r.phase = LSP_ROT_PROGRESS_DONE;          /* what an abandon leaves */
+    snprintf(r.close_txid, sizeof(r.close_txid), "%s", x);
+    snprintf(r.new_funding_txid, sizeof(r.new_funding_txid), "%s", x);
+    r.new_funding_amount = 99000;
+    TEST_ASSERT(persist_save_rotation_cin(&db, dh, parts, 700, NULL), "record");
+    TEST_ASSERT(persist_save_rotation_progress(&db, dh, &r), "dropped marker");
+    TEST_ASSERT(!lsp_rotation_cin_reload_recorded(mgr, d, 0, 7), "another output: nothing");
+    TEST_ASSERT(lsp_rotation_cin_reload_recorded(mgr, d, 1, 7), "the dropped close is reloaded");
+    TEST_ASSERT(mgr->rot_progress.phase == LSP_ROT_PROGRESS_CIN_CLOSE_BUILT &&
+                strcmp(mgr->rot_progress.close_txid, x) == 0 &&
+                mgr->rot_progress.cin_close_height == 700 &&
+                mgr->rot_progress.new_funding_amount == 99000 &&
+                mgr->rot_progress.n_cin_pubkeys == 2 &&
+                mgr->rot_progress.dying_factory_id == 7,
+                "same close, same height, same participants");
+    TEST_ASSERT(lsp_rotation_cin_preclose(mgr, d), "a marker again: the next attempt re-runs it");
+    lsp_rotation_progress_clear(mgr);
+    TEST_ASSERT(persist_save_rotation_cin(&db, dh, parts, 700, "0200"), "signed record");
+    TEST_ASSERT(persist_save_rotation_progress(&db, dh, &r), "marker");
+    TEST_ASSERT(!lsp_rotation_cin_reload_recorded(mgr, d, 1, 7),
+                "a fully signed close is not a dropped attempt");
+
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 253);
+    TEST_ASSERT(lsp_rotation_commit_fee_rate(&fe.base) == CHANNEL_COMMIT_FEE_RATE_MIN,
+                "a low estimate is raised to the anchor minimum");
+    fee_estimator_static_init(&fe, 5000);
+    TEST_ASSERT(lsp_rotation_commit_fee_rate(&fe.base) == 5000, "a normal estimate");
+    fee_estimator_static_init(&fe, 10000000);
+    TEST_ASSERT(lsp_rotation_commit_fee_rate(&fe.base) == CHANNEL_COMMIT_FEE_RATE_MAX,
+                "capped");
+    TEST_ASSERT(lsp_rotation_commit_fee_rate(NULL) == CHANNEL_COMMIT_FEE_RATE_MIN, "none");
+    lsp_rotation_progress_clear(mgr);
+    free(mgr);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+int test_cin_carry(void) {
+    uint64_t l = 0, c = 0;
+    TEST_ASSERT(lsp_rotation_cin_carry(19038, 5038, 24076, 0, &l, &c) && l == 19038 && c == 5038,
+                "same size: unchanged");
+    TEST_ASSERT(lsp_rotation_cin_carry(19038, 5038, 24000, 0, &l, &c) && l == 18962 && c == 5038,
+                "smaller: LSP pays the difference");
+    TEST_ASSERT(!lsp_rotation_cin_carry(100, 5038, 5000, 0, &l, &c), "client balance must fit");
+    TEST_ASSERT(!lsp_rotation_cin_carry(100, 5000, 5050, 100, &l, &c), "LSP side above reserve");
+    return 1;
 }
 
 /* The LSP and client records, and the DB snapshot. */
@@ -206,5 +382,36 @@ int test_cin_reserve_next_key(void) {
     TEST_ASSERT(factory_key_select(&db, ctx, root, lctx, sk, &idx, &src) && idx == 1,
                 "after the switch the replacement key is current");
     persist_close(&db);
+    return 1;
+}
+
+/* Eligibility: every client connected, announced the protocol, not offline. */
+int test_cin_eligible(void) {
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    int fds[2] = { 5, 6 };
+    uint8_t rv[2] = { 1, 1 };
+    lsp.client_fds = fds;
+    lsp.client_rotation_v = rv;
+    lsp.n_clients = 2;
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    lsp_channel_entry_t entries[2];
+    memset(entries, 0, sizeof(entries));
+    mgr->entries = entries;
+    mgr->n_channels = 2;
+    TEST_ASSERT(lsp_rotation_cin_eligible(mgr, &lsp), "all online and able");
+    rv[1] = 0;
+    TEST_ASSERT(!lsp_rotation_cin_eligible(mgr, &lsp), "an older client");
+    rv[1] = 1;
+    fds[0] = -1;
+    TEST_ASSERT(!lsp_rotation_cin_eligible(mgr, &lsp), "a client offline");
+    fds[0] = 5;
+    entries[1].offline_detected = 1;
+    TEST_ASSERT(!lsp_rotation_cin_eligible(mgr, &lsp), "marked offline");
+    lsp.client_rotation_v = NULL;
+    entries[1].offline_detected = 0;
+    TEST_ASSERT(!lsp_rotation_cin_eligible(mgr, &lsp), "no capability array");
+    free(mgr);
     return 1;
 }

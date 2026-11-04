@@ -3365,6 +3365,10 @@ int main(int argc, char *argv[]) {
                        "its cooperative close (%s, phase %d) — Phase C resumes once "
                        "all %zu clients reconnect\n", mgr->rot_progress.close_txid,
                        mgr->rot_progress.phase, rec_n_clients);
+            else if (lsp_rotation_load_cin_progress(mgr, lsp_rp->factory.funding_txid))
+                printf("LSP recovery: this factory replaced its predecessor by a co-signed "
+                       "close (%s, phase %d) — finishing that rotation\n",
+                       mgr->rot_progress.close_txid, mgr->rot_progress.phase);
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
             mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;

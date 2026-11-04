@@ -123,6 +123,11 @@ typedef struct {
        it to record durably that the tree is about to be delivered. */
     int (*before_factory_ready)(void *lsp, const factory_t *f, void *ctx);
     void *before_factory_ready_ctx;
+    /* Per slot: the rotation protocol version the client announced in HELLO /
+       RECONNECT ("rotation_v"; 0 = none).  NULL in callers that do not fill it. */
+    uint8_t *client_rotation_v;
+    /* When set, attached to FACTORY_PROPOSE as "rotation" (not owned). */
+    struct cJSON *propose_rotation;
 } lsp_t;
 
 /* Initialize LSP state. Returns 1 on success, 0 on failure. */
@@ -244,5 +249,23 @@ int lsp_save_client_identities(const lsp_t *lsp, persist_t *db,
 const char *lsp_hello_keys_conflict(const lsp_t *lsp, const secp256k1_context *ctx,
                                     size_t n_existing, const secp256k1_pubkey *id,
                                     const secp256k1_pubkey *fac);
+
+/* Cooperative close of factory F (not necessarily lsp->factory) with every
+   connected client.  BEFORE_DONE (may be NULL) runs after the signature is
+   aggregated and before any client receives it (CLOSE_DONE); if it returns 0
+   the close is abandoned and nobody gets the signed TX. */
+int lsp_run_cooperative_close_with(lsp_t *lsp, factory_t *f,
+                                   tx_buf_t *close_tx_out,
+                                   const tx_output_t *outputs, size_t n_outputs,
+                                   uint32_t current_height,
+                                   int (*before_done)(void *ctx, const tx_buf_t *signed_tx),
+                                   void *before_done_ctx);
+
+/* Move the live factory to *OLD_OUT and leave lsp->factory as an empty
+   factory with the same shape and profiles (a creation template), so a
+   replacement can be created while the old one is still needed.  Returns 1
+   on success.  lsp_factory_reattach puts *OLD back (freeing lsp->factory). */
+int lsp_factory_detach(lsp_t *lsp, factory_t *old_out);
+void lsp_factory_reattach(lsp_t *lsp, factory_t *old);
 
 #endif /* SUPERSCALAR_LSP_H */

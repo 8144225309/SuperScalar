@@ -121,6 +121,8 @@ static int rot_outpoint_unspent(lsp_channel_mgr_t *mgr, const char *txid_disp,
     return rt ? regtest_outpoint_unspent(rt, txid_disp, vout) : -1;
 }
 
+static int cin_record_load(lsp_channel_mgr_t *mgr);
+
 static void rot_progress_to_row(lsp_rotation_progress_t *rp,
                                 persist_rotation_progress_t *row) {
     memset(row, 0, sizeof(*row));
@@ -193,17 +195,90 @@ void lsp_rotation_progress_clear(lsp_channel_mgr_t *mgr) {
     rot_release_reservation(mgr);
     free(mgr->rot_progress.new_funding_hex);
     free(mgr->rot_progress.dist_tx_hex);
+    free(mgr->rot_progress.cin_signed_close_hex);
     memset(&mgr->rot_progress, 0, sizeof(mgr->rot_progress));
 }
 
 int lsp_rotation_progress_pending(const lsp_channel_mgr_t *mgr) {
-    return mgr && mgr->rot_progress.phase >= LSP_ROT_PROGRESS_CLOSING &&
-           mgr->rot_progress.phase <= LSP_ROT_PROGRESS_SIGNING_READY;
+    /* A close into the new factory is past the close only once it is fully
+       signed and recorded (CIN_CLOSING).  Before that the old factory is the
+       live one, nobody holds a signed close, and the normal retry limit and
+       distribution-TX fallback apply. */
+    return mgr && ((mgr->rot_progress.phase >= LSP_ROT_PROGRESS_CLOSING &&
+                    mgr->rot_progress.phase <= LSP_ROT_PROGRESS_SIGNING_READY) ||
+                   mgr->rot_progress.phase == LSP_ROT_PROGRESS_CIN_CLOSING ||
+                   mgr->rot_progress.phase == LSP_ROT_PROGRESS_CIN_CLOSED);
 }
+
+int lsp_rotation_cin_preclose(const lsp_channel_mgr_t *mgr,
+                              const unsigned char *dying_funding_txid32) {
+    return mgr && dying_funding_txid32 &&
+           LSP_ROT_PROGRESS_IS_CIN(mgr->rot_progress.phase) &&
+           mgr->rot_progress.phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING &&
+           memcmp(mgr->rot_progress.dying_funding_txid, dying_funding_txid32, 32) == 0;
+}
+
+int lsp_rotation_progress_resumable(const lsp_channel_mgr_t *mgr) {
+    return mgr && (lsp_rotation_progress_pending(mgr) ||
+                   (LSP_ROT_PROGRESS_IS_CIN(mgr->rot_progress.phase) &&
+                    mgr->rot_progress.phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING));
+}
+
+int lsp_rotation_cin_note_failure(lsp_rotation_progress_t *rp, uint32_t height,
+                                  uint32_t max_retries, uint32_t base_delay) {
+    if (!rp) return 0;
+    if (max_retries == 0) max_retries = 3;
+    if (base_delay == 0) base_delay = 2;
+    rp->cin_failures++;
+    if (rp->cin_failures > max_retries) return 0;
+    uint32_t shift = rp->cin_failures < 20 ? rp->cin_failures : 20;
+    rp->cin_next_try_height = height + base_delay * (1u << shift);
+    return 1;
+}
+
+int lsp_rotation_cin_abandon(lsp_channel_mgr_t *mgr,
+                             const unsigned char *dying_funding_txid32) {
+    if (!lsp_rotation_cin_preclose(mgr, dying_funding_txid32)) return 0;
+    /* No full signature of the recorded close exists (the LSP records it
+       before anyone can hold it), so the rotation can be dropped. */
+    printf("LSP rotate: abandoning the unsigned close %s into a new factory\n",
+           mgr->rot_progress.close_txid);
+    fflush(stdout);
+    (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_DONE);
+    lsp_rotation_progress_clear(mgr);
+    return 1;
+}
+
+static int rot_load_progress_row(lsp_channel_mgr_t *mgr,
+                                 const unsigned char *dying_funding_txid32,
+                                 uint32_t dying_funding_vout, int dropped_cin);
 
 int lsp_rotation_load_progress(lsp_channel_mgr_t *mgr,
                                const unsigned char *dying_funding_txid32,
                                uint32_t dying_funding_vout) {
+    return rot_load_progress_row(mgr, dying_funding_txid32, dying_funding_vout, 0);
+}
+
+int lsp_rotation_cin_reload_recorded(lsp_channel_mgr_t *mgr,
+                                     const unsigned char *dying_funding_txid32,
+                                     uint32_t dying_funding_vout, uint32_t dying_factory_id) {
+    if (!rot_load_progress_row(mgr, dying_funding_txid32, dying_funding_vout, 1)) return 0;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    rp->dying_factory_id = dying_factory_id;
+    rp->phase = LSP_ROT_PROGRESS_CIN_CLOSE_BUILT;
+    if (!rot_progress_persist(mgr)) {
+        lsp_rotation_progress_clear(mgr);
+        return 0;
+    }
+    printf("LSP rotate: reusing the recorded close %s of this factory (never fully "
+           "signed)\n", rp->close_txid);
+    fflush(stdout);
+    return 1;
+}
+
+static int rot_load_progress_row(lsp_channel_mgr_t *mgr,
+                                 const unsigned char *dying_funding_txid32,
+                                 uint32_t dying_funding_vout, int dropped_cin) {
     if (!mgr || !mgr->persist || !dying_funding_txid32) return 0;
     char dtx[65];
     rot_txid_display(dying_funding_txid32, dtx);
@@ -218,8 +293,14 @@ int lsp_rotation_load_progress(lsp_channel_mgr_t *mgr,
         free(rp);
         return 0;
     }
+    if (dropped_cin && row.phase == LSP_ROT_PROGRESS_DONE && row.close_txid[0] &&
+        row.new_funding_amount > 0)
+        row.phase = LSP_ROT_PROGRESS_CIN_CLOSE_BUILT;   /* checked against its record below */
+    else if (dropped_cin)
+        row.phase = LSP_ROT_PROGRESS_NONE;
     if (row.dying_funding_vout != dying_funding_vout ||
-        row.phase < LSP_ROT_PROGRESS_CLOSING || row.phase > LSP_ROT_PROGRESS_SIGNING_READY) {
+        ((row.phase < LSP_ROT_PROGRESS_CLOSING || row.phase > LSP_ROT_PROGRESS_SIGNING_READY) &&
+         !LSP_ROT_PROGRESS_IS_CIN(row.phase))) {
         free(row.new_funding_hex);
         free(row.dist_tx_hex);
         free(rp);
@@ -241,6 +322,17 @@ int lsp_rotation_load_progress(lsp_channel_mgr_t *mgr,
     lsp_rotation_progress_clear(mgr);
     mgr->rot_progress = *rp;
     free(rp);
+    if (LSP_ROT_PROGRESS_IS_CIN(mgr->rot_progress.phase) && !cin_record_load(mgr)) {
+        fprintf(stderr, "LSP rotate: the close-into-new record of the rotation is missing "
+                "-- ignoring its marker\n");
+        lsp_rotation_progress_clear(mgr);
+        return 0;
+    }
+    if (dropped_cin && (!LSP_ROT_PROGRESS_IS_CIN(mgr->rot_progress.phase) ||
+                        mgr->rot_progress.cin_signed_close_hex)) {
+        lsp_rotation_progress_clear(mgr);   /* not a dropped close into a new factory */
+        return 0;
+    }
     return 1;
 }
 
@@ -426,7 +518,10 @@ static int rot_before_factory_ready(void *lsp_v, const factory_t *f, void *ctx) 
     int saved_phase = rp->phase;
     memcpy(rp->tree_digest, dh, sizeof(rp->tree_digest));
     rp->dist_tx_hex = dist;
-    if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_SIGNING_READY)) {
+    int ready_phase = LSP_ROT_PROGRESS_IS_CIN(saved_phase)
+                          ? LSP_ROT_PROGRESS_CIN_SIGNING_READY
+                          : LSP_ROT_PROGRESS_SIGNING_READY;
+    if (!rot_progress_set_phase(mgr, ready_phase)) {
         memcpy(rp->tree_digest, saved_digest, sizeof(rp->tree_digest));
         rp->dist_tx_hex = saved_dist;
         rp->phase = saved_phase;
@@ -558,6 +653,14 @@ static int rot_find_funding_output(lsp_channel_mgr_t *mgr, const char *txid,
    confirmed: every ceremony over that funding (first run or after a restart)
    then builds byte-identical transactions.  (The hashlock-poison seed is
    derived from the LSP key + the funding outpoint, so it is fixed too.) */
+uint64_t lsp_rotation_commit_fee_rate(void *fee_estimator) {
+    fee_estimator_t *fe = (fee_estimator_t *)fee_estimator;
+    uint64_t r = (fe && fe->get_rate) ? fe->get_rate(fe, FEE_TARGET_NORMAL) : 0;
+    if (r < CHANNEL_COMMIT_FEE_RATE_MIN) r = CHANNEL_COMMIT_FEE_RATE_MIN;
+    if (r > CHANNEL_COMMIT_FEE_RATE_MAX) r = CHANNEL_COMMIT_FEE_RATE_MAX;
+    return r;
+}
+
 static void rot_fix_ceremony_params(lsp_channel_mgr_t *mgr) {
     lsp_rotation_progress_t *rp = &mgr->rot_progress;
     int h = rot_chain_height(mgr);
@@ -572,6 +675,9 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                        int partial, persist_t *rot_db,
                                        const unsigned char *rot_cer_id,
                                        int rot_cer_persisted);
+static int lsp_rotation_close_into_new(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       ladder_factory_t *dying);
+static int lsp_rotation_cin_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* --- Factory rotation --- */
 
@@ -737,6 +843,22 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     printf("LSP rotate: starting rotation for factory %u\n", dying_id);
     fflush(stdout);
+
+    /* Every client online and able to: close the old factory straight into
+       the new one, co-signed, with fresh client keys.  No key leaves anyone. */
+    int cin_ok = lsp_rotation_cin_eligible(mgr, lsp) &&
+                 memcmp(lsp->factory.funding_txid, dying->factory.funding_txid, 32) == 0;
+    if (cin_ok)
+        return lsp_rotation_close_into_new(mgr, lsp, dying);
+    /* A recorded, unsigned close into the new factory: only that ceremony may
+       run for this factory (another close could race it).  Until every client
+       is back this attempt fails, so the retry limit, and then the
+       distribution TX, still apply. */
+    if (lsp_rotation_cin_preclose(mgr, dying->factory.funding_txid)) {
+        fprintf(stderr, "LSP rotate: factory %u has a recorded close into a new factory "
+                "that is not signed yet; it needs every client online\n", dying_id);
+        return 0;
+    }
 
     /* Preflight BEFORE Phase A.  Phase A hands each cooperating client's
        factory key to this LSP, so a deterministic Phase C failure must be
@@ -2157,7 +2279,7 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        the LSP refuses all new HTLCs after a rotation.  Use the same fee rate
        the channels are about to be set to below (and that the checker reads
        from ch->fee_rate_sat_per_kvb). */
-    uint64_t rot_fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
+    uint64_t rot_fee_rate = lsp_rotation_commit_fee_rate(fe);
     uint64_t rot_base_commit_fee = (rot_fee_rate * 154 + 999) / 1000;
     for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
         channel_t *ch = &mgr->entries[c].channel;
@@ -2459,7 +2581,7 @@ static int rot_resume_funding(lsp_channel_mgr_t *mgr) {
 }
 
 int lsp_rotation_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr || !lsp || !mgr->ladder || !lsp_rotation_progress_pending(mgr))
+    if (!mgr || !lsp || !mgr->ladder || !lsp_rotation_progress_resumable(mgr))
         return 0;
     ladder_t *lad = (ladder_t *)mgr->ladder;
     lsp_rotation_progress_t *rp = &mgr->rot_progress;
@@ -2469,6 +2591,9 @@ int lsp_rotation_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     int h = rot_chain_height(mgr);
     if (h > 0 && rp->last_attempt_height == (uint32_t)h) return 0;
     if (h > 0) rp->last_attempt_height = (uint32_t)h;
+
+    if (LSP_ROT_PROGRESS_IS_CIN(rp->phase))
+        return lsp_rotation_cin_resume(mgr, lsp);
 
     /* Factory ids are not stable across a restart (the recovered factory is
        id 0): find the dying slot by its funding outpoint. */
@@ -2539,4 +2664,827 @@ int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     int result = lsp_channels_rotate_factory(mgr, lsp);
     readiness_reset(rt);
     return result ? 1 : 0;
+}
+
+/* ===================================================================
+   Close into the new factory (every old client online).
+
+   No key leaves anyone.  Each client sends a fresh factory key; the LSP
+   builds the UNSIGNED cooperative close of the old factory whose single
+   output is the replacement's funding output (its txid is fixed before any
+   signature); the replacement's creation ceremony runs over that outpoint;
+   the new channels are set up and each client gets an LSP-signed initial
+   commitment; each client checks all of it, stores it, and only then signs
+   the close with its OLD key.  The close is recorded together with the
+   replacement before any client can hold the signed close; then it is
+   broadcast.  Until it confirms the old factory stays valid, after it the
+   replacement is: exactly one of the two worlds happens.
+   =================================================================== */
+
+lsp_cin_resume_action_t lsp_rotation_cin_resume_action(int phase, int close_confs,
+                                                       int in_mempool, int all_online) {
+    if (!LSP_ROT_PROGRESS_IS_CIN(phase)) return LSP_CIN_RESUME_NONE;
+    if (phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING)
+        return all_online ? LSP_CIN_RESUME_RERUN : LSP_CIN_RESUME_WAIT;
+    if (phase == LSP_ROT_PROGRESS_CIN_CLOSED || close_confs >= 1)
+        return LSP_CIN_RESUME_FINISH;
+    return in_mempool ? LSP_CIN_RESUME_WAIT : LSP_CIN_RESUME_REBROADCAST;
+}
+
+static int cin_pk_eq(const secp256k1_context *ctx, const secp256k1_pubkey *a,
+                     const secp256k1_pubkey *b) {
+    unsigned char sa[33], sb[33];
+    size_t la = 33, lb = 33;
+    return secp256k1_ec_pubkey_serialize(ctx, sa, &la, a, SECP256K1_EC_COMPRESSED) &&
+           secp256k1_ec_pubkey_serialize(ctx, sb, &lb, b, SECP256K1_EC_COMPRESSED) &&
+           memcmp(sa, sb, 33) == 0;
+}
+
+int lsp_rotation_cin_check_keys(const secp256k1_context *ctx,
+                                const secp256k1_pubkey *lsp_pk,
+                                const secp256k1_pubkey *old_pks, size_t n_old,
+                                const secp256k1_pubkey *identity_pks,
+                                const secp256k1_pubkey *client_pks, size_t n,
+                                const char **why) {
+    const char *dummy;
+    if (!why) why = &dummy;
+    *why = NULL;
+    if (!ctx || !lsp_pk || !client_pks || n == 0) { *why = "bad arguments"; return 0; }
+    for (size_t i = 0; i < n; i++) {
+        if (cin_pk_eq(ctx, &client_pks[i], lsp_pk)) { *why = "a key equals the LSP key"; return 0; }
+        for (size_t j = 0; old_pks && j < n_old; j++)
+            if (cin_pk_eq(ctx, &client_pks[i], &old_pks[j])) {
+                *why = "a key is reused from the old factory";
+                return 0;
+            }
+        for (size_t j = 0; identity_pks && j < n; j++)
+            if (cin_pk_eq(ctx, &client_pks[i], &identity_pks[j])) {
+                *why = "a key is a client identity key";
+                return 0;
+            }
+        for (size_t j = i + 1; j < n; j++)
+            if (cin_pk_eq(ctx, &client_pks[i], &client_pks[j])) {
+                *why = "two clients sent the same key";
+                return 0;
+            }
+    }
+    return 1;
+}
+
+int lsp_rotation_cin_carry(uint64_t old_lsp, uint64_t old_client, uint64_t new_usable,
+                           uint64_t reserve, uint64_t *new_lsp, uint64_t *new_client) {
+    (void)old_lsp;
+    if (!new_lsp || !new_client || new_usable < old_client) return 0;
+    if (new_usable - old_client < reserve) return 0;
+    *new_client = old_client;
+    *new_lsp = new_usable - old_client;
+    return 1;
+}
+
+int lsp_rotation_cin_eligible(const lsp_channel_mgr_t *mgr, const lsp_t *lsp) {
+    if (!mgr || !lsp || !lsp->client_rotation_v || lsp->n_clients == 0 ||
+        mgr->n_channels != lsp->n_clients)
+        return 0;
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        if (lsp->client_fds[i] < 0 || lsp->client_rotation_v[i] < 1 ||
+            mgr->entries[i].offline_detected)
+            return 0;
+    }
+    return 1;
+}
+
+static void cin_pks_to_hex(const lsp_rotation_progress_t *rp, char *out) {
+    for (size_t i = 0; i < rp->n_cin_pubkeys; i++)
+        hex_encode(rp->cin_pubkeys[i], 33, out + i * 66);
+    out[rp->n_cin_pubkeys * 66] = '\0';
+}
+
+static int cin_pks_from_hex(lsp_rotation_progress_t *rp, const char *hex) {
+    size_t len = hex ? strlen(hex) : 0;
+    if (len == 0 || len % 66 != 0 || len / 66 > FACTORY_MAX_SIGNERS) return 0;
+    rp->n_cin_pubkeys = len / 66;
+    for (size_t i = 0; i < rp->n_cin_pubkeys; i++) {
+        char one[67];
+        memcpy(one, hex + i * 66, 66);
+        one[66] = '\0';
+        if (hex_decode(one, rp->cin_pubkeys[i], 33) != 33) return 0;
+    }
+    return 1;
+}
+
+/* Write the CIN record (participants, height, signed close) next to the
+   progress row.  Standalone statement (or inside the caller's transaction). */
+static int cin_record_save(lsp_channel_mgr_t *mgr) {
+    persist_t *db = (persist_t *)mgr->persist;
+    if (!db) return 1;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    char dtx[65];
+    rot_txid_display(rp->dying_funding_txid, dtx);
+    char *pk_hex = malloc(rp->n_cin_pubkeys * 66 + 1);
+    if (!pk_hex) return 0;
+    cin_pks_to_hex(rp, pk_hex);
+    int ok = persist_save_rotation_cin(db, dtx, pk_hex, rp->cin_close_height,
+                                       rp->cin_signed_close_hex);
+    free(pk_hex);
+    return ok;
+}
+
+static int cin_record_load(lsp_channel_mgr_t *mgr) {
+    persist_t *db = (persist_t *)mgr->persist;
+    if (!db) return 0;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    char dtx[65];
+    rot_txid_display(rp->dying_funding_txid, dtx);
+    char *pk_hex = NULL, *sh = NULL;
+    uint32_t h = 0;
+    if (persist_load_rotation_cin(db, dtx, &pk_hex, &h, &sh) != 1) return 0;
+    int ok = cin_pks_from_hex(rp, pk_hex);
+    free(pk_hex);
+    rp->cin_close_height = h;
+    free(rp->cin_signed_close_hex);
+    rp->cin_signed_close_hex = sh;
+    return ok;
+}
+
+
+/* Build the unsigned close of OLD paying OUTPUT (the replacement funding);
+   TXID32 (internal order) and its hex. */
+static int cin_build_close(const factory_t *old, const tx_output_t *output, uint32_t height,
+                           unsigned char txid32[32], char **hex_out) {
+    tx_buf_t tx;
+    tx_buf_init(&tx, 256);
+    unsigned char sighash[32];
+    int ok = factory_build_cooperative_close_unsigned((factory_t *)old, &tx, sighash,
+                                                      output, 1, height) &&
+             tx_txid_from_bytes(tx.data, tx.len, txid32);
+    if (ok && hex_out) {
+        *hex_out = malloc(tx.len * 2 + 1);
+        if (*hex_out) hex_encode(tx.data, tx.len, *hex_out);
+        else ok = 0;
+    }
+    tx_buf_free(&tx);
+    return ok;
+}
+
+/* ROTATION_BEGIN(v=1, close_into_new) to every client; collect each
+   client's fresh replacement key. */
+static int cin_collect_keys(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                            const unsigned char *dying_txid32, secp256k1_pubkey *out) {
+    unsigned char nonce[32];
+    if (!channel_read_random_bytes(nonce, 32)) return 0;
+    uint64_t epoch = (uint64_t)time(NULL);
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        cJSON *rb = wire_build_rotation_begin(dying_txid32, nonce, epoch);
+        cJSON_AddNumberToObject(rb, "v", 1);
+        cJSON_AddStringToObject(rb, "mode", "close_into_new");
+        int sent = wire_send(lsp->client_fds[i], MSG_ROTATION_BEGIN, rb);
+        cJSON_Delete(rb);
+        if (!sent) {
+            fprintf(stderr, "LSP rotate: send ROTATION_BEGIN to client %zu failed\n", i);
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        int got = 0;
+        for (int tries = 0; tries < 64 && !got; tries++) {
+            wire_msg_t m;
+            memset(&m, 0, sizeof(m));
+            if (!wire_recv_timeout(lsp->client_fds[i], &m, 60)) break;
+            if (m.msg_type == MSG_ROTATION_KEY) {
+                unsigned char d[32];
+                got = wire_parse_rotation_key(m.json, mgr->ctx, &out[i], d) &&
+                      memcmp(d, dying_txid32, 32) == 0;
+                if (!got)
+                    fprintf(stderr, "LSP rotate: bad ROTATION_KEY from client %zu\n", i);
+                cJSON_Delete(m.json);
+                if (!got) return 0;
+            } else if (m.msg_type == MSG_ERROR) {
+                fprintf(stderr, "LSP rotate: client %zu refused the rotation\n", i);
+                cJSON_Delete(m.json);
+                return 0;
+            } else {
+                if (m.json) cJSON_Delete(m.json);      /* stray: keep waiting */
+            }
+        }
+        if (!got) {
+            fprintf(stderr, "LSP rotate: no ROTATION_KEY from client %zu\n", i);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void cin_tell_abort(lsp_t *lsp, const char *why) {
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        if (lsp->client_fds[i] < 0) continue;
+        cJSON *e = wire_build_error(why);
+        wire_send(lsp->client_fds[i], MSG_ERROR, e);
+        cJSON_Delete(e);
+    }
+}
+
+static int cin_wait_confirm(lsp_channel_mgr_t *mgr, lsp_t *lsp, const char *txid) {
+    regtest_t *rt = rot_rt(mgr);
+    chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
+    if (mgr->rot_is_regtest && rt) {
+        regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+        return rot_tx_confirmations(mgr, txid) >= 1;
+    }
+    int timeout = mgr->confirm_timeout_secs > 0 ? mgr->confirm_timeout_secs : 7200;
+    if (chain_be)
+        return lsp_wait_for_confirmation_service(chain_be, txid, timeout,
+                   chain_close_confs(chain_be, chain_be->is_regtest), mgr, lsp) ? 1 : 0;
+    if (rt)
+        return regtest_wait_for_stable_confirmation(rt, txid,
+                   regtest_network_safe_confirmation_depth(rt), 3, timeout) >= 1;
+    return 0;
+}
+
+/* Everything the close's before-CLOSE_DONE hook persists. */
+typedef struct {
+    lsp_channel_mgr_t *mgr;
+    lsp_t *lsp;
+    lsp_channel_mgr_t *tm;          /* the replacement's channels */
+    const char *close_txid;         /* recorded (display) */
+} cin_closing_ctx_t;
+
+/* The close is fully signed and nobody else holds it yet: record it with
+   the replacement factory and channels, in ONE transaction, as CIN_CLOSING. */
+static int cin_record_closing(void *vctx, const tx_buf_t *signed_tx) {
+    cin_closing_ctx_t *c = (cin_closing_ctx_t *)vctx;
+    lsp_channel_mgr_t *mgr = c->mgr;
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    unsigned char t32[32];
+    char t_disp[65];
+    if (!tx_txid_from_bytes(signed_tx->data, signed_tx->len, t32)) return 0;
+    rot_txid_display(t32, t_disp);
+    if (strcmp(t_disp, c->close_txid) != 0) {
+        fprintf(stderr, "LSP rotate: the signed close %s is not the recorded close %s\n",
+                t_disp, c->close_txid);
+        return 0;
+    }
+    char *hex = malloc(signed_tx->len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(signed_tx->data, signed_tx->len, hex);
+    lsp_crash_checkpoint("rotate_close_signed");
+    persist_t *db = (persist_t *)mgr->persist;
+    char *saved_hex = rp->cin_signed_close_hex;
+    rp->cin_signed_close_hex = hex;
+    int saved_phase = rp->phase;
+    rp->phase = LSP_ROT_PROGRESS_CIN_CLOSING;
+    if (db) {
+        char dtx[65];
+        rot_txid_display(rp->dying_funding_txid, dtx);
+        int ok = persist_begin(db);
+        ok = ok && persist_add_rotation_close(db, dtx, c->close_txid, hex);
+        ok = ok && cin_record_save(mgr);
+        ok = ok && persist_save_factory(db, &c->lsp->factory, mgr->ctx, 0) &&
+             persist_save_tree_nodes(db, &c->lsp->factory, 0) &&
+             lsp_save_client_identities(c->lsp, db, mgr->ctx, 0);
+        for (size_t i = 0; ok && i < c->tm->n_channels; i++) {
+            channel_t *ch = &c->tm->entries[i].channel;
+            ok = persist_save_channel(db, ch, 0, (uint32_t)i) &&
+                 persist_save_basepoints(db, (uint32_t)i, ch);
+            for (uint64_t cn = 0; ok && cn <= 1; cn++) {
+                secp256k1_pubkey pcp;
+                unsigned char ser[33], pcs[32];
+                size_t len = 33;
+                if (channel_get_remote_pcp(ch, cn, &pcp) &&
+                    secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &len, &pcp,
+                                                  SECP256K1_EC_COMPRESSED))
+                    ok = persist_save_remote_pcp(db, (uint32_t)i, cn, ser);
+                if (ok && channel_get_local_pcs(ch, cn, pcs))
+                    ok = persist_save_local_pcs(db, (uint32_t)i, cn, pcs);
+                secure_zero(pcs, sizeof(pcs));
+            }
+        }
+        if (ok) {
+            persist_rotation_progress_t row;
+            rot_progress_to_row(rp, &row);
+            ok = persist_save_rotation_progress(db, dtx, &row);
+        }
+        if (!ok || !persist_commit(db)) {
+            if (persist_in_transaction(db)) persist_rollback(db);
+            fprintf(stderr, "LSP rotate: CRITICAL: could not record the signed close "
+                    "with the replacement -- abandoning the close\n");
+            rp->cin_signed_close_hex = saved_hex;
+            rp->phase = saved_phase;
+            secure_zero(hex, strlen(hex));
+            free(hex);
+            return 0;
+        }
+    }
+    free(saved_hex);
+    printf("LSP rotate: close %s fully signed and recorded with the replacement "
+           "(CIN_CLOSING)\n", c->close_txid);
+    fflush(stdout);
+    return 1;
+}
+
+/* Move the replacement's channels from TM into MGR (old channels freed). */
+static void cin_adopt_channels(lsp_channel_mgr_t *mgr, lsp_channel_mgr_t *tm) {
+    for (size_t i = 0; i < mgr->n_channels; i++)
+        channel_cleanup(&mgr->entries[i].channel);
+    free(mgr->entries);
+    mgr->entries = tm->entries;
+    mgr->n_channels = tm->n_channels;
+    mgr->entries_cap = tm->entries_cap;
+    mgr->leaf_arity = tm->leaf_arity;
+    for (size_t i = 0; i < mgr->n_channels; i++)
+        if (mgr->persist)
+            channel_set_persist(&mgr->entries[i].channel, (persist_t *)mgr->persist,
+                                (uint32_t)i);
+    tm->entries = NULL;
+    tm->n_channels = 0;
+    lsp_channels_cleanup(tm);           /* tm's own invoice / origin arrays */
+    free(tm);
+}
+
+static void cin_drop_channels(lsp_channel_mgr_t *tm) {
+    if (!tm) return;
+    lsp_channels_cleanup(tm);
+    free(tm);
+}
+
+/* After CIN_CLOSED: ladder bookkeeping, tell the clients, clear the marker. */
+static int cin_finish(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_factory_t *dying) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    if (rp->phase != LSP_ROT_PROGRESS_CIN_CLOSED &&
+        !rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CIN_CLOSED))
+        return 0;
+    if (dying) {
+        dying->partial_rotation_done = 1;
+        tx_buf_free(&dying->distribution_tx);  /* its funding is spent */
+    }
+    snprintf(mgr->rot_last_cin_close_txid, sizeof(mgr->rot_last_cin_close_txid), "%s",
+             rp->close_txid);
+    free(mgr->rot_last_cin_close_hex);
+    mgr->rot_last_cin_close_hex = rp->cin_signed_close_hex
+                                      ? strdup(rp->cin_signed_close_hex) : NULL;
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        if (lsp->client_fds[i] < 0) continue;
+        cJSON *d = wire_build_rotation_done(rp->close_txid, rp->cin_signed_close_hex, 1);
+        wire_send(lsp->client_fds[i], MSG_ROTATION_DONE, d);
+        cJSON_Delete(d);
+    }
+    (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_DONE);
+    printf("LSP rotate: rotation complete — close %s confirmed; new factory active "
+           "with %zu channels (no key revealed)\n", rp->close_txid, mgr->n_channels);
+    fflush(stdout);
+    lsp_rotation_progress_clear(mgr);
+    return 1;
+}
+
+static int cin_tree_matches(lsp_channel_mgr_t *mgr, lsp_t *lsp, const unsigned char *spk) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    if (strlen(rp->tree_digest) != 64) return -1;
+    unsigned char ftxid[32];
+    if (hex_decode(rp->new_funding_txid, ftxid, 32) != 32) return -1;
+    reverse_bytes(ftxid, 32);
+    const uint64_t *sa = lsp->dist_client_amounts;
+    size_t sn = lsp->dist_n_client_amounts;
+    lsp->dist_client_amounts = rp->dist_amounts;
+    lsp->dist_n_client_amounts = rp->n_dist_amounts;
+    unsigned char d[32];
+    int ok = lsp_factory_creation_digest(lsp, lsp->client_pubkeys, lsp->n_clients,
+                                         ftxid, 0, rp->new_funding_amount, spk, 34,
+                                         mgr->rot_step_blocks, mgr->rot_states_per_layer,
+                                         rp->new_cltv, d);
+    lsp->dist_client_amounts = sa;
+    lsp->dist_n_client_amounts = sn;
+    if (!ok) return -1;
+    char dh[65];
+    hex_encode(d, 32, dh);
+    return strcmp(dh, rp->tree_digest) == 0 ? 1 : 0;
+}
+
+/* Run (or re-run over the recorded close) the close-into-new rotation of the
+   live factory, which is DYING.  Returns 1 when the replacement is active. */
+static int lsp_rotation_close_into_new(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       ladder_factory_t *dying) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    if (!fe || !lad || !dying) return 0;
+    factory_t *old = &lsp->factory;
+    if (memcmp(old->funding_txid, dying->factory.funding_txid, 32) != 0 ||
+        old->funding_vout != dying->factory.funding_vout) {
+        fprintf(stderr, "LSP rotate: the live factory is not the dying one -- not "
+                "rotating by a close into the new factory\n");
+        return 0;
+    }
+    size_t n = lsp->n_clients;
+    /* A close of this factory recorded by an earlier, dropped attempt is used
+       again: a client that signed it signs no other close of its factory. */
+    if (!lsp_rotation_cin_preclose(mgr, old->funding_txid))
+        (void)lsp_rotation_cin_reload_recorded(mgr, old->funding_txid, old->funding_vout,
+                                               dying->factory_id);
+    int resuming = rp->phase >= LSP_ROT_PROGRESS_CIN_CLOSE_BUILT &&
+                   rp->phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING &&
+                   memcmp(rp->dying_funding_txid, old->funding_txid, 32) == 0;
+    printf("LSP rotate: close into the new factory (all %zu clients online%s)\n", n,
+           resuming ? ", over the recorded close" : "");
+    fflush(stdout);
+
+    /* No HTLC may be in flight across the switch: fail them cleanly. */
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        for (size_t h = 0; h < ch->n_htlcs; ) {
+            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
+                channel_fail_htlc(ch, ch->htlcs[h].id);
+            else
+                h++;
+        }
+    }
+
+    /* C0/C1: fresh keys. */
+    secp256k1_pubkey new_pks[FACTORY_MAX_SIGNERS];
+    if (!cin_collect_keys(mgr, lsp, old->funding_txid, new_pks)) {
+        cin_tell_abort(lsp, "rotation aborted: keys");
+        return 0;
+    }
+    {
+        const char *why = NULL;
+        if (!lsp_rotation_cin_check_keys(mgr->ctx, &lsp->lsp_pubkey, old->pubkeys,
+                                         old->n_participants, lsp->client_identity_pubkeys
+                                             ? lsp->client_identity_pubkeys : NULL,
+                                         new_pks, n, &why)) {
+            fprintf(stderr, "LSP rotate: refusing the replacement keys: %s\n", why);
+            cin_tell_abort(lsp, "rotation aborted: keys not fresh");
+            return 0;
+        }
+    }
+    secp256k1_pubkey parts[FACTORY_MAX_SIGNERS];
+    parts[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n; i++) parts[i + 1] = new_pks[i];
+    if (resuming) {
+        int same = rp->n_cin_pubkeys == n + 1;
+        for (size_t i = 0; same && i <= n; i++) {
+            unsigned char ser[33];
+            size_t len = 33;
+            same = secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &len, &parts[i],
+                                                 SECP256K1_EC_COMPRESSED) &&
+                   memcmp(ser, rp->cin_pubkeys[i], 33) == 0;
+        }
+        if (!same) {
+            /* No full signature of the recorded close exists (phase is at most
+               CIN_CLOSE_SIGNING), and a close over other keys has another txid:
+               the recorded one can never be completed.  Start over. */
+            printf("LSP rotate: the clients' replacement keys changed; the recorded close "
+                   "%s was never fully signed and is dropped\n", rp->close_txid);
+            (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_NONE);
+            lsp_rotation_progress_clear(mgr);
+            resuming = 0;
+        }
+    }
+
+    /* C2: the unsigned close paying the replacement funding. */
+    unsigned char spk[34];
+    if (!factory_funding_spk_for(mgr->ctx, parts, n + 1, spk)) return 0;
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    memcpy(out.script_pubkey, spk, 34);
+    out.script_pubkey_len = 34;
+    unsigned char close_txid32[32];
+    char close_disp[65];
+    if (!resuming) {
+        /* One key-path input, one P2TR output: about 111 vB.  The close is
+           signed by everyone and cannot be fee-bumped, so round up. */
+        const size_t close_vsize = 125;
+        uint64_t fee = fee_estimate(fe, close_vsize);
+        if (fee < close_vsize) fee = close_vsize;          /* >= 1 sat/vB */
+        if (fee == 0 || fee >= old->funding_amount_sats / 50) {
+            fprintf(stderr, "LSP rotate: close fee %llu too high for a close into the "
+                    "new factory\n", (unsigned long long)fee);
+            cin_tell_abort(lsp, "rotation aborted: fee");
+            return 0;
+        }
+        int h = rot_chain_height(mgr);
+        if (h <= 0) { cin_tell_abort(lsp, "rotation aborted: no chain"); return 0; }
+        out.amount_sats = old->funding_amount_sats - fee;
+        char *hex = NULL;
+        if (!cin_build_close(old, &out, (uint32_t)h, close_txid32, &hex)) {
+            cin_tell_abort(lsp, "rotation aborted: close");
+            return 0;
+        }
+        rot_txid_display(close_txid32, close_disp);
+        lsp_rotation_progress_clear(mgr);
+        rp->dying_factory_id = dying->factory_id;
+        memcpy(rp->dying_funding_txid, old->funding_txid, 32);
+        rp->dying_funding_vout = old->funding_vout;
+        snprintf(rp->close_txid, sizeof(rp->close_txid), "%s", close_disp);
+        snprintf(rp->new_funding_txid, sizeof(rp->new_funding_txid), "%s", close_disp);
+        rp->new_funding_hex = hex;                       /* the UNSIGNED close */
+        rp->new_funding_vout = 0;
+        rp->new_funding_amount = out.amount_sats;
+        rp->cin_close_height = (uint32_t)h;
+        rp->n_cin_pubkeys = n + 1;
+        for (size_t i = 0; i <= n; i++) {
+            size_t len = 33;
+            secp256k1_ec_pubkey_serialize(mgr->ctx, rp->cin_pubkeys[i], &len, &parts[i],
+                                          SECP256K1_EC_COMPRESSED);
+        }
+        rot_fix_ceremony_params(mgr);
+        rp->phase = LSP_ROT_PROGRESS_CIN_CLOSE_BUILT;
+        if (!cin_record_save(mgr) || !rot_progress_persist(mgr)) {
+            lsp_rotation_progress_clear(mgr);
+            cin_tell_abort(lsp, "rotation aborted: record");
+            return 0;
+        }
+        printf("LSP rotate: close %s of factory %u built (unsigned): pays %llu sats into "
+               "the replacement funding\n", close_disp, dying->factory_id,
+               (unsigned long long)out.amount_sats);
+        fflush(stdout);
+        lsp_crash_checkpoint("rotate_close_built");
+    } else {
+        out.amount_sats = rp->new_funding_amount;
+        if (!cin_build_close(old, &out, rp->cin_close_height, close_txid32, NULL)) return 0;
+        rot_txid_display(close_txid32, close_disp);
+        if (strcmp(close_disp, rp->close_txid) != 0) {
+            fprintf(stderr, "LSP rotate: the close rebuilt from the record (%s) is not the "
+                    "recorded close %s -- holding\n", close_disp, rp->close_txid);
+            cin_tell_abort(lsp, "rotation aborted: record mismatch");
+            return 0;
+        }
+    }
+
+    /* C3: the replacement over close:0, with the fresh keys. */
+    secp256k1_pubkey *saved_pks = malloc(n * sizeof(secp256k1_pubkey));
+    if (!saved_pks) return 0;
+    memcpy(saved_pks, lsp->client_pubkeys, n * sizeof(secp256k1_pubkey));
+    for (size_t i = 0; i < n; i++) lsp->client_pubkeys[i] = new_pks[i];
+    factory_t old_f;
+    if (!lsp_factory_detach(lsp, &old_f)) {
+        memcpy(lsp->client_pubkeys, saved_pks, n * sizeof(secp256k1_pubkey));
+        free(saved_pks);
+        return 0;
+    }
+    lsp->factory.leaf_arity = (factory_arity_t)mgr->rot_leaf_arity;
+    cJSON *rot = cJSON_CreateObject();
+    cJSON_AddStringToObject(rot, "mode", "close_into_new");
+    cJSON *arr = cJSON_CreateArray();
+    for (size_t i = 0; i <= n; i++) {
+        char h66[67];
+        hex_encode(rp->cin_pubkeys[i], 33, h66);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(h66));
+    }
+    cJSON_AddItemToObject(rot, "pubkeys", arr);
+    cJSON_AddNumberToObject(rot, "close_height", (double)rp->cin_close_height);
+    {
+        char od[65];
+        rot_txid_display(old_f.funding_txid, od);
+        cJSON_AddStringToObject(rot, "old_txid", od);
+        cJSON_AddNumberToObject(rot, "old_vout", (double)old_f.funding_vout);
+    }
+    lsp_channel_mgr_t *tm = NULL;
+    int ok = 1;
+    int delivered_before = rp->phase == LSP_ROT_PROGRESS_CIN_SIGNING_READY;
+    if (delivered_before && cin_tree_matches(mgr, lsp, spk) != 1) {
+        fprintf(stderr, "LSP rotate: the replacement tree delivered before cannot be "
+                "rebuilt byte-identically -- holding (no second tree over %s:0)\n",
+                rp->close_txid);
+        ok = 0;
+    }
+    if (ok && !delivered_before && !rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CIN_SIGNING))
+        ok = 0;
+    if (ok) {
+        lsp->propose_rotation = rot;
+        lsp->before_factory_ready = rot_before_factory_ready;
+        lsp->before_factory_ready_ctx = mgr;
+        lsp->dist_client_amounts = rp->dist_amounts;
+        lsp->dist_n_client_amounts = rp->n_dist_amounts;
+        ok = lsp_run_factory_creation(lsp, close_txid32, 0, rp->new_funding_amount, spk, 34,
+                                      mgr->rot_step_blocks, mgr->rot_states_per_layer,
+                                      rp->new_cltv);
+        lsp->propose_rotation = NULL;
+        lsp->before_factory_ready = NULL;
+        lsp->before_factory_ready_ctx = NULL;
+        lsp->dist_client_amounts = NULL;
+        lsp->dist_n_client_amounts = 0;
+        if (!ok) {
+            fprintf(stderr, "LSP rotate: replacement creation ceremony failed\n");
+            if (rp->phase == LSP_ROT_PROGRESS_CIN_SIGNING)
+                (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CIN_CLOSE_BUILT);
+        }
+    }
+    cJSON_Delete(rot);
+    if (ok) {
+        lsp->factory.fee = fe;
+        int ch_h = rot_chain_height(mgr);
+        if (ch_h > 0)
+            factory_set_lifecycle(&lsp->factory, (uint32_t)ch_h, lad->active_blocks,
+                                  lad->dying_blocks);
+        lsp_crash_checkpoint("rotate_ceremony_signed");
+    }
+
+    /* Channels over the replacement, built aside: the old ones stay intact
+       until the close is recorded. */
+    if (ok) {
+        tm = calloc(1, sizeof(*tm));
+        ok = tm != NULL;
+        if (ok) {
+            tm->routing_fee_ppm = mgr->routing_fee_ppm;
+            tm->lsp_balance_pct = mgr->lsp_balance_pct;
+            tm->fee = mgr->fee;
+            tm->persist = NULL;          /* nothing reaches the DB before CIN_CLOSING */
+            ok = lsp_channels_init(tm, mgr->ctx, &lsp->factory, mgr->rot_lsp_seckey, n);
+            if (!ok) { free(tm); tm = NULL; }
+        }
+    }
+    if (ok) {
+        uint64_t rate = lsp_rotation_commit_fee_rate(fe);
+        uint64_t base_fee = (rate * 154 + 999) / 1000;
+        for (size_t c = 0; ok && c < n; c++) {
+            channel_t *nc = &tm->entries[c].channel;
+            const channel_t *oc = &mgr->entries[c].channel;
+            uint64_t usable = nc->funding_amount > base_fee ? nc->funding_amount - base_fee : 0;
+            uint64_t l = 0, r = 0;
+            if (!lsp_rotation_cin_carry(oc->local_amount, oc->remote_amount, usable, 0, &l, &r)) {
+                fprintf(stderr, "LSP rotate: client %zu's balance %llu does not fit the "
+                        "replacement channel (%llu)\n", c,
+                        (unsigned long long)oc->remote_amount, (unsigned long long)usable);
+                ok = 0;
+                break;
+            }
+            nc->local_amount = l;
+            nc->remote_amount = r;
+            nc->fee_rate_sat_per_kvb = rate;
+        }
+    }
+    if (ok) ok = lsp_channels_exchange_basepoints(tm, lsp) && lsp_channels_send_ready(tm, lsp);
+    /* Each client gets an LSP-signed initial commitment (cn 0) with its
+       carried balance, so its exit from the replacement is complete before it
+       signs the close. */
+    for (size_t c = 0; ok && c < n; c++) {
+        unsigned char psig[32];
+        uint32_t nidx = 0;
+        channel_t *nc = &tm->entries[c].channel;
+        if (!channel_create_commitment_partial_sig(nc, psig, &nidx)) { ok = 0; break; }
+        cJSON *cs = wire_build_commitment_signed(tm->entries[c].channel_id, 0, psig, nidx);
+        ok = wire_send(lsp->client_fds[c], MSG_COMMITMENT_SIGNED, cs);
+        cJSON_Delete(cs);
+    }
+    if (ok) lsp_crash_checkpoint("rotate_initial_commitments");
+
+    /* C4: the close, signed by everyone with the OLD keys. */
+    if (ok && !rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING)) ok = 0;
+    tx_buf_t signed_close;
+    tx_buf_init(&signed_close, 256);
+    if (ok) {
+        lsp_crash_checkpoint("rotate_close_signing");
+        cin_closing_ctx_t cc = { mgr, lsp, tm, rp->close_txid };
+        int rc = 0;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            rc = lsp_run_cooperative_close_with(lsp, &old_f, &signed_close, &out, 1,
+                                                rp->cin_close_height,
+                                                cin_record_closing, &cc);
+            if (rc != 2) break;
+        }
+        ok = rc == 1 && rp->phase == LSP_ROT_PROGRESS_CIN_CLOSING;
+        if (!ok) fprintf(stderr, "LSP rotate: the close ceremony did not complete\n");
+    }
+    if (!ok) {
+        /* Nothing irreversible happened: the old factory and channels are the
+           live ones again.  The marker keeps the recorded close for a retry. */
+        cin_drop_channels(tm);
+        lsp_factory_reattach(lsp, &old_f);
+        memcpy(lsp->client_pubkeys, saved_pks, n * sizeof(secp256k1_pubkey));
+        free(saved_pks);
+        tx_buf_free(&signed_close);
+        if (rp->phase != LSP_ROT_PROGRESS_CIN_CLOSING)
+            cin_tell_abort(lsp, "rotation aborted");
+        return 0;
+    }
+
+    /* From here the replacement is the live factory (recorded as such). */
+    free(saved_pks);
+    cin_adopt_channels(mgr, tm);
+    factory_free(&old_f);
+    {
+        char sent[65] = {0};
+        int sent_ok = rot_send_hex(mgr, rp->cin_signed_close_hex, sent);
+        if (mgr->persist)
+            persist_log_broadcast((persist_t *)mgr->persist, rp->close_txid,
+                                  "rotation_close_into_new", rp->cin_signed_close_hex,
+                                  sent_ok ? "ok" : "failed");
+        printf("LSP rotate: close %s broadcast%s\n", rp->close_txid,
+               sent_ok ? "" : " FAILED (the resume rebroadcasts it)");
+        fflush(stdout);
+    }
+    tx_buf_free(&signed_close);
+    lsp_crash_checkpoint("rotate_close_sent");
+
+    /* Ladder slot for the replacement. */
+    if (lad->n_factories >= LADDER_MAX_FACTORIES) ladder_evict_expired(lad);
+    if (lad->n_factories < LADDER_MAX_FACTORIES) {
+        ladder_factory_t *lf_new = &lad->factories[lad->n_factories];
+        memset(lf_new, 0, sizeof(*lf_new));
+        lf_new->factory = lsp->factory;
+        factory_detach_txbufs(&lf_new->factory);
+        lf_new->factory_id = lad->next_factory_id++;
+        lf_new->is_initialized = 1;
+        lf_new->is_funded = 1;
+        lf_new->cached_state = FACTORY_ACTIVE;
+        (void)ladder_factory_store_distribution_tx(lf_new, &lsp->factory);
+        lad->n_factories++;
+    }
+    dying = ladder_get_by_id(lad, rp->dying_factory_id);
+    if (!cin_wait_confirm(mgr, lsp, rp->close_txid)) {
+        fprintf(stderr, "LSP rotate: close %s not confirmed yet (the resume waits)\n",
+                rp->close_txid);
+        return 0;
+    }
+    return cin_finish(mgr, lsp, dying);
+}
+
+/* Resume a CIN marker (lsp_rotation_resume). */
+static int lsp_rotation_cin_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    ladder_factory_t *dying = NULL;
+    for (size_t i = 0; lad && i < lad->n_factories; i++) {
+        ladder_factory_t *lf = &lad->factories[i];
+        if (lf->is_initialized && lf->factory.funding_vout == rp->dying_funding_vout &&
+            memcmp(lf->factory.funding_txid, rp->dying_funding_txid, 32) == 0) {
+            dying = lf;
+            break;
+        }
+    }
+    int confs = rp->close_txid[0] ? rot_tx_confirmations(mgr, rp->close_txid) : -1;
+    int mem = rp->close_txid[0] ? rot_tx_in_mempool(mgr, rp->close_txid) : 0;
+    lsp_cin_resume_action_t a = lsp_rotation_cin_resume_action(
+        rp->phase, confs, mem, lsp_rotation_cin_eligible(mgr, lsp));
+    if (rp->phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING) {
+        /* Not signed yet: re-run with backoff; give up after the retry limit
+           (nobody holds the signed close, the old factory and its
+           distribution TX stay as they are). */
+        int h = rot_chain_height(mgr);
+        if (h > 0 && rp->cin_next_try_height && (uint32_t)h < rp->cin_next_try_height)
+            return 0;
+        if (a == LSP_CIN_RESUME_RERUN && dying && lsp_rotation_close_into_new(mgr, lsp, dying))
+            return 1;
+        if (!lsp_rotation_cin_preclose(mgr, rp->dying_funding_txid))
+            return 0;                       /* moved on (or was replaced) */
+        if (!lsp_rotation_cin_note_failure(rp, h > 0 ? (uint32_t)h : 0,
+                                           mgr->rot_max_retries, mgr->rot_retry_base_delay)) {
+            fprintf(stderr, "LSP rotate: the close into the new factory failed %u times\n",
+                    rp->cin_failures);
+            (void)lsp_rotation_cin_abandon(mgr, rp->dying_funding_txid);
+        }
+        return 0;
+    }
+    switch (a) {
+    case LSP_CIN_RESUME_RERUN:
+        if (!dying) {
+            fprintf(stderr, "LSP rotate: the dying factory of the recorded close is not in "
+                    "the ladder -- holding\n");
+            return 0;
+        }
+        return lsp_rotation_close_into_new(mgr, lsp, dying);
+    case LSP_CIN_RESUME_REBROADCAST:
+        if (rp->cin_signed_close_hex) {
+            char t[65] = {0};
+            if (rot_send_hex(mgr, rp->cin_signed_close_hex, t))
+                printf("LSP rotate: rebroadcast the recorded close %s\n", rp->close_txid);
+        }
+        if (mgr->rot_is_regtest && rot_rt(mgr))
+            regtest_mine_blocks(rot_rt(mgr), 1, mgr->rot_mine_addr);
+        return 0;
+    case LSP_CIN_RESUME_FINISH:
+        return cin_finish(mgr, lsp, dying);
+    case LSP_CIN_RESUME_WAIT:
+    case LSP_CIN_RESUME_NONE:
+    default:
+        if (rp->phase == LSP_ROT_PROGRESS_CIN_CLOSING && mgr->rot_is_regtest && rot_rt(mgr))
+            regtest_mine_blocks(rot_rt(mgr), 1, mgr->rot_mine_addr);
+        return 0;
+    }
+}
+
+int lsp_rotation_load_cin_progress(lsp_channel_mgr_t *mgr,
+                                   const unsigned char *live_funding_txid32) {
+    if (!mgr || !mgr->persist || !live_funding_txid32) return 0;
+    char ft[65], dtx[65];
+    rot_txid_display(live_funding_txid32, ft);
+    if (persist_find_rotation_by_new_funding((persist_t *)mgr->persist, ft, dtx) != 1)
+        return 0;
+    unsigned char d32[32];
+    if (hex_decode(dtx, d32, 32) != 32) return 0;
+    reverse_bytes(d32, 32);
+    persist_rotation_progress_t row;
+    memset(&row, 0, sizeof(row));
+    uint64_t amounts[FACTORY_MAX_SIGNERS];
+    row.dist_amounts = amounts;
+    if (!persist_load_rotation_progress((persist_t *)mgr->persist, dtx, &row,
+                                        FACTORY_MAX_SIGNERS) ||
+        (row.phase != LSP_ROT_PROGRESS_CIN_CLOSING &&
+         row.phase != LSP_ROT_PROGRESS_CIN_CLOSED)) {
+        free(row.new_funding_hex);
+        free(row.dist_tx_hex);
+        return 0;
+    }
+    free(row.new_funding_hex);
+    free(row.dist_tx_hex);
+    return lsp_rotation_load_progress(mgr, d32, row.dying_funding_vout) &&
+           LSP_ROT_PROGRESS_IS_CIN(mgr->rot_progress.phase);
 }
