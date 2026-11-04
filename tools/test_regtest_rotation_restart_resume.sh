@@ -21,6 +21,27 @@
 #   CKPT=rotate_ceremony_signed       the ceremony delivered the signed tree to
 #                                     the clients; nothing persisted yet
 #
+# With every client online and able to, a rotation closes the old factory
+# straight into the new one (co-signed, fresh client keys, nothing revealed),
+# so those checkpoints are:
+#
+#   CKPT=rotate_close_built          the unsigned close is recorded
+#   CKPT=rotate_ceremony_before_ready the replacement's signatures are
+#                                     aggregated; no client has FACTORY_READY
+#   CKPT=rotate_ceremony_signed      clients hold the signed replacement tree
+#   CKPT=rotate_initial_commitments  clients hold their initial commitments
+#   CKPT=rotate_close_signing        the close ceremony is about to start
+#   CKPT=rotate_close_signed         the close is aggregated, not yet recorded
+#                                     (no client got CLOSE_DONE)
+#   CKPT=rotate_close_sent           the close is recorded with the
+#                                     replacement and broadcast
+#
+# PASS for these: exactly ONE close is ever built for the old factory, the
+# restart completes the rotation over it ("rotation complete"), the close
+# confirms, no client key is revealed (no Phase A), and every client switches
+# to the replacement.  Before rotate_close_sent the restart runs the ceremony
+# again over the recorded close; after it the restart only finishes.
+#
 # then restart it (recovery mode, same DB).  The persisted rotation-progress
 # marker must make the restarted LSP resume once the clients reconnect:
 #
@@ -110,7 +131,9 @@ echo "=== Phase 1: crashed at $CKPT ==="
 grep -aE "LSP rotate:|closed:|funded .*sats|HIT" "$TMP/lsp1.log" | tail -8
 
 # The close and the funding are recorded (and logged) BEFORE their broadcast.
-CLOSE1=$(grep -aoE "rotation close [0-9a-f]{64} recorded|factory [0-9]+ closed: [0-9a-f]{64}" "$TMP/lsp1.log" | grep -oE "[0-9a-f]{64}" | tail -1)
+CLOSE1=$(grep -aoE "rotation close [0-9a-f]{64} recorded|factory [0-9]+ closed: [0-9a-f]{64}|LSP rotate: close [0-9a-f]{64} of factory [0-9]+ built" "$TMP/lsp1.log" | grep -oE "[0-9a-f]{64}" | tail -1)
+CIN=0
+grep -qa "LSP rotate: close into the new factory" "$TMP/lsp1.log" && CIN=1
 FUND1=$(grep -aoE "replacement funding [0-9a-f]{64} recorded|LSP rotate: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$TMP/lsp1.log" | grep -oE "[0-9a-f]{64}" | tail -1)
 echo "Phase-1 close txid: ${CLOSE1:-<none>}   Phase-1 replacement funding: ${FUND1:-<none>}"
 [ -n "$CLOSE1" ] || { echo "RESUME-FAIL: no Phase-1 close txid (crash landed before close?)"; exit 1; }
@@ -150,6 +173,36 @@ echo "=== Phase 2 after the resume (later rotations of replacement factories) ==
 tail -n +"$(( ${END2:-0} + 1 ))" "$L2" | grep -aE "ladder factory|starting rotation|closed:|created and signed|rotation complete|no DYING|rotation failed" | cut -c1-160 | tail -12
 
 cnt() { local n; n=$(grep -acE "$1" "$2" 2>/dev/null) || n=0; echo "$n"; }
+
+if [ "$CIN" = 1 ]; then
+  CLOSES=$(grep -ahoE "LSP rotate: close [0-9a-f]{64} of factory [0-9]+ built" "$TMP/lsp1.log" "$R2" | grep -oE "[0-9a-f]{64}" | sort -u)
+  N_CLOSES=$(printf "%s\n" "$CLOSES" | grep -c . || true)
+  COMPLETE=$(cnt "LSP rotate: rotation complete" "$R2")
+  REVEALED=$(( $(cnt "key extracted via wire PTLC|Phase A — PTLC key turnover" "$TMP/lsp1.log") + $(cnt "key extracted via wire PTLC|Phase A — PTLC key turnover" "$R2") ))
+  RERAN=$(cnt "close into the new factory \(all [0-9]+ clients online, over the recorded close\)" "$R2")
+  FINISHED=$(cnt "replaced its predecessor by a co-signed close" "$R2")
+  CONF1=$($BCLI getrawtransaction "$CLOSE1" true 2>/dev/null | grep -c '"confirmations"' || true)
+  SWITCHED=0
+  for N in 1 2 3 4; do grep -qa "switched to the replacement factory" "$TMP/c$N.log" && SWITCHED=$((SWITCHED + 1)); done
+  echo "=== Phase 2 (close into the new factory) ==="
+  grep -aE "LSP recovery: this factory replaced|close into the new factory|close [0-9a-f]{64}|rotation complete" "$R2" | cut -c1-170 | tail -8
+  echo
+  echo "=== fund-safety: ckpt=$CKPT closes_built=$N_CLOSES reran_over_recorded=$RERAN finished_after_restart=$FINISHED complete=$COMPLETE close_confirmed=$CONF1 keys_revealed=$REVEALED clients_switched=$SWITCHED/4 ==="
+  OK=0
+  if [ "$N_CLOSES" -eq 1 ] && [ "$COMPLETE" -ge 1 ] && [ "${CONF1:-0}" -ge 1 ] &&
+     [ "$REVEALED" -eq 0 ] && [ "$SWITCHED" -eq 4 ]; then
+    case "$CKPT" in
+      rotate_close_sent) [ "$FINISHED" -ge 1 ] && OK=1 ;;
+      *) [ "$RERAN" -ge 1 ] && OK=1 ;;
+    esac
+  fi
+  if [ "$OK" = 1 ]; then
+    echo "RESUME-PASS: crash at $CKPT: the restart completed the close into the new factory over the one recorded close ($CLOSE1), confirmed; no key revealed; all clients switched."
+    exit 0
+  fi
+  echo "RESUME-FAIL: want closes_built=1 complete>=1 close_confirmed>=1 keys_revealed=0 clients_switched=4/4 and (rotate_close_sent: finished_after_restart>=1; else reran_over_recorded>=1)"
+  exit 1
+fi
 RESUMED=$(cnt "resuming rotation of factory|resuming Phase C" "$R2")
 HOLD=$(cnt "HOLD:" "$L2")
 IDENT=$(cnt "byte-identical to the delivered one" "$L2")
