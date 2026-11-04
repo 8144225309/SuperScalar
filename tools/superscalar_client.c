@@ -270,6 +270,7 @@ static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 #include "superscalar/sha256.h"
+#include "superscalar/factory_keys.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
 
@@ -598,6 +599,10 @@ typedef struct {
 
 static client_rotation_ctx_t g_rotation_ctx;
 
+/* The per-factory key chosen at startup (factory_keys.h). */
+static uint32_t g_factory_key_index = 0;
+static int      g_factory_key_index_set = 0;
+
 static void rotation_ctx_set(const unsigned char *dying_txid,
                               const unsigned char *new_nonce,
                               uint64_t epoch) {
@@ -904,6 +909,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                    to signed_commitments on the first payment, leaving a never-used
                    channel unrecoverable in a cold mass-exit (Frontier B). */
                 client_persist_commitment_sig(ch, cbd);
+                /* The reserved factory key is now used by a persisted factory. */
+                if (g_factory_key_index_set &&
+                    !persist_factory_key_set_state(cbd->db, g_factory_key_index,
+                                                   FACTORY_KEY_STATE_ACTIVE, 0))
+                    fprintf(stderr, "Client %u: could not mark factory key %u active\n",
+                            my_index, g_factory_key_index);
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
@@ -3000,8 +3011,31 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         secp256k1_keypair sweep_kp;
-        secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
-        memset(sweep_seckey, 0, 32);
+        {
+            /* The channel is keyed with the stored factory's key: re-derive
+               it from the root key (identity key for a legacy factory). */
+            /* Read-only: this emergency path never writes a key row or the
+               counter, and never reserves an index. */
+            unsigned char pin_ctx[33], sweep_fsk[32];
+            const unsigned char *pin = NULL;
+            if (lsp_pubkey_hex && hex_decode(lsp_pubkey_hex, pin_ctx, 33) == 33)
+                pin = pin_ctx;
+            uint32_t sweep_fidx = 0;
+            factory_key_source_t sweep_fsrc = FACTORY_KEY_LEGACY;
+            if (factory_key_lookup(&db, sweep_ctx, sweep_seckey, pin, sweep_fsk,
+                                   &sweep_fidx, &sweep_fsrc, NULL) != 1 ||
+                !secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_fsk)) {
+                fprintf(stderr, "ERROR: could not re-derive the factory key\n");
+                secure_zero(sweep_seckey, 32);
+                secure_zero(sweep_fsk, 32);
+                factory_free(sweep_factory); free(sweep_factory);
+                secp256k1_context_destroy(sweep_ctx);
+                persist_close(&db);
+                return 1;
+            }
+            secure_zero(sweep_fsk, 32);
+        }
+        secure_zero(sweep_seckey, 32);
 
         /* Initialize channel using the same path as reconnect */
         channel_t sweep_ch;
@@ -3457,6 +3491,46 @@ int main(int argc, char *argv[]) {
            consult client_ps_signed_inputs and refuse to sign a second
            TX spending the same parent UTXO. ZmnSCPxj §PS wide leaves. */
         client_set_persist(&db);
+    }
+
+    /* Per-factory signing key: a fresh hardened key per factory, never the
+       identity key (factory_keys.h).  A factory created before per-factory
+       keys keeps signing with the identity key (legacy). */
+    {
+        /* The key is bound to the pinned LSP key: a new key with a DB
+           needs --lsp-pubkey (factory_key_select refuses otherwise). */
+        unsigned char lsp_ctx33[33], root_sk[32], fac_sk[32];
+        const unsigned char *pin = NULL;
+        if (lsp_pubkey_hex && hex_decode(lsp_pubkey_hex, lsp_ctx33, 33) == 33)
+            pin = lsp_ctx33;
+        uint32_t fidx = 0;
+        factory_key_source_t fsrc = FACTORY_KEY_FRESH;
+        secp256k1_keypair fac_kp;
+        int fk_ok = secp256k1_keypair_sec(ctx, root_sk, &kp) &&
+                    factory_key_select(use_db ? &db : NULL, ctx, root_sk, pin,
+                                       fac_sk, &fidx, &fsrc) &&
+                    secp256k1_keypair_create(ctx, &fac_kp, fac_sk);
+        secure_zero(root_sk, sizeof(root_sk));
+        secure_zero(fac_sk, sizeof(fac_sk));
+        if (!fk_ok) {
+            fprintf(stderr, "Error: could not choose a factory key (see above)%s\n",
+                    (use_db && !pin) ? "; pass the LSP's key with --lsp-pubkey" : "");
+            secure_zero(&fac_kp, sizeof(fac_kp));
+            if (use_db) persist_close(&db);
+            secp256k1_context_destroy(ctx);
+            report_close(&rpt);
+            return 1;
+        }
+        static const char *fk_src_names[] = { "fresh", "reloaded", "recovered", "legacy" };
+        if (fsrc == FACTORY_KEY_LEGACY) {
+            printf("Client: factory key: legacy factory, signing with the identity key\n");
+        } else {
+            client_set_factory_keypair(&fac_kp);
+            g_factory_key_index = fidx;
+            g_factory_key_index_set = use_db;
+            printf("Client: factory key index %u (%s)\n", fidx, fk_src_names[fsrc]);
+        }
+        secure_zero(&fac_kp, sizeof(fac_kp));
     }
 
     signal(SIGINT, sigint_handler);
