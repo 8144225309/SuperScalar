@@ -2221,6 +2221,19 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
                     &pcp, SECP256K1_EC_COMPRESSED))
                 persist_save_remote_pcp(db, (uint32_t)c, 1, pcp_ser);
+            /* And the LSP's own per-commitment secrets for cn=0,1.  A client
+               reconnect restores them from the DB; without this it restored
+               the OLD channel's secrets at the same slot, so the LSP's first
+               revocation on the new channel did not match the point it had
+               sent, and the client refused it as forged. */
+            for (uint64_t cn = 0; cn <= 1 && ch_ok; cn++) {
+                unsigned char pcs[32];
+                if (!channel_get_local_pcs(ch, cn, pcs) ||
+                    !persist_save_local_pcs(db, (uint32_t)c, cn, pcs))
+                    ch_ok = 0;
+                secure_zero(pcs, sizeof(pcs));
+            }
+            if (!ch_ok) break;
         }
         if (ch_ok) {
             persist_commit(db);
