@@ -14,9 +14,16 @@
 #                to an LSP-controlled address.
 #   BALANCES     every client's channel balance is the same after the rotation
 #                (LSP view and client view), and the new tree carries it.
-#   PAY_AFTER    a payment over the replacement factory succeeds.
+#   PAY_AFTER    a payment over the replacement factory succeeds, and no client
+#                rejects the LSP's revocation for it.
 #   KEYS_AT_REST once the old factory is closed on chain, the LSP's database
 #                holds no client secret key for it.
+#   IDENTITY     no client key the LSP holds is a client's identity (--seckey)
+#                key: a client signs each factory with its own derived key.
+#   PAYOUT_KEYS  --export-factory-keys gives descriptors Bitcoin Core accepts,
+#                and the tr() one pays the client's distribution-TX output.
+#   RESTART      a client restarted from its DB after the rotation reloads its
+#                factory key and reconnects by its identity key.
 #   LSP_ALONE    the LSP cannot spend the replacement factory's funding output
 #                by itself.  The drill builds that spend from key material the
 #                LSP holds (its own --seckey plus the keys in its database),
@@ -94,13 +101,17 @@ stdbuf -oL "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" < "$TMP/cli" > "$L" 2>&1 &
 LSP=$!
 wait_log "$L" "listening" 20 || { echo "KEYS-SETUP-FAIL: LSP never listened"; tail -8 "$L"; exit 2; }
 
-for N in 1 2 3 4; do
+start_client() { # start_client <N>: client N (seckey N+1), log appended
+  local N=$1 SK
   SK=$(printf "%064x" $((N + 1)))
   stdbuf -oL "$BUILD/superscalar_client" --network regtest --host 127.0.0.1 --port $PORT --daemon \
     --seckey "$SK" --fee-rate 1100 --lsp-balance-pct 50 --lsp-pubkey $LSP_PUB \
     --participant-id $N --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" \
-    --wallet "$WALLET" --db "$TMP/c${N}.db" > "$TMP/c${N}.log" 2>&1 &
+    --wallet "$WALLET" --db "$TMP/c${N}.db" >> "$TMP/c${N}.log" 2>&1 &
   CPID[$N]=$!
+}
+for N in 1 2 3 4; do
+  start_client $N
   sleep 0.3
 done
 
@@ -163,6 +174,17 @@ if [ "$COMPLETE" -ge 1 ]; then
   for i in $(seq 1 30); do sleep 1; [ "$(cnt "CLI: pay (succeeded|FAILED)" "$L")" -gt "$before" ] && break; done
   POST_OK=$(( $(cnt "CLI: pay succeeded" "$L") - PRE_OK ))
   POST_DONE=$(( $(cnt "CLI: pay (succeeded|FAILED)" "$L") - before ))
+
+  # Restart client 4 from its DB (it takes no part in the payment above): it
+  # must reload the same factory key and reconnect by its identity key.
+  kill -9 "${CPID[4]}" 2>/dev/null; sleep 2
+  echo "--- client 4 restarted ---" >> "$TMP/c4.log"
+  start_client 4
+  for i in $(seq 1 60); do
+    sleep 1
+    sed -n '/client 4 restarted/,$p' "$TMP/c4.log" | grep -qa "reconnected (channel=" && break
+  done
+  RESTART_LOG=$(sed -n '/client 4 restarted/,$p' "$TMP/c4.log" | grep -aE "factory key|reconnected \(channel|REFUSING" | tr '\n' ' ' | cut -c1-200)
 fi
 
 UNSAFE=0
@@ -249,8 +271,24 @@ done
 if [ "$COMPLETE" -ge 1 ]; then
   verdict BALANCES $BAL_BAD "$BAL_DETAIL"
   # --- PAY_AFTER ---
-  if [ "$POST_OK" -ge 1 ]; then verdict PAY_AFTER 0 "pay 1->0 after rotation succeeded"
+  REJ=""
+  for N in 1 2 3 4; do
+    sed -n '/rotation complete, reconnecting/,$p' "$TMP/c$N.log" 2>/dev/null |
+      grep -qa "LSP revocation FAILED verification" && REJ="$REJ c$N"
+  done
+  if [ "$POST_OK" -ge 1 ] && [ -n "$REJ" ]; then
+    verdict PAY_AFTER 1 "the LSP reports pay 1->0 succeeded, but client(s) $REJ rejected the LSP's revocation as forged and halted"
+  elif [ "$POST_OK" -ge 1 ]; then verdict PAY_AFTER 0 "pay 1->0 after rotation succeeded"
   else verdict PAY_AFTER 1 "pay 1->0 after rotation: ${POST_DONE} result line(s), 0 succeeded ($(grep -aE "CLI: pay|LSP: .*(fail|FAIL|reject)" "$L" | tail -2 | tr '\n' ' ' | cut -c1-200))"; fi
+fi
+
+# --- RESTART: a client restart reloads its factory key ---
+if [ "$COMPLETE" -ge 1 ]; then
+  if echo "$RESTART_LOG" | grep -q "reloaded" && echo "$RESTART_LOG" | grep -q "reconnected"; then
+    verdict RESTART 0 "client 4 restarted: $RESTART_LOG"
+  else
+    verdict RESTART 1 "client 4 restarted: ${RESTART_LOG:-no reconnect}"
+  fi
 fi
 
 # --- KEYS_AT_REST ---
@@ -263,11 +301,36 @@ IDENT=0
 while IFS='|' read -r fid cidx key; do
   [ "$key" = "$(printf "%064x" $((cidx + 1)))" ] && IDENT=$((IDENT + 1))
 done < "$TMP/departed.txt"
+if [ "$IDENT" -gt 0 ]; then
+  verdict IDENTITY 1 "$IDENT of the $N_DEP client key(s) the LSP holds equal the client's own --seckey (its identity key)"
+else
+  verdict IDENTITY 0 "none of the $N_DEP client key(s) the LSP holds is a client's identity key"
+fi
 if [ "$N_DEP" -gt 0 ]; then
   verdict KEYS_AT_REST 1 "old factory close confirmations: $CLOSE_CONF; departed_clients holds $N_DEP client secret key(s) ($N_PLAIN as plaintext hex); $IDENT of them equal the client's own --seckey (its identity and channel key)"
 else
   verdict KEYS_AT_REST 0 "no client secret key left in the LSP database"
 fi
+
+# --- PAYOUT_KEYS: the exported descriptors pay this client's outputs ---
+EXP=$("$BUILD/superscalar_client" --network regtest --seckey "$(printf "%064x" 2)" \
+        --db "$TMP/c1.db" --export-factory-keys 2>/dev/null)
+TRD=$(echo "$EXP" | awk '/distribution TX/{print $3; exit}')
+RAWD=$(echo "$EXP" | awk '/cooperative close/{print $3; exit}')
+DIST_HEX=$(sqlite3 "$TMP/c1.db" "SELECT signed_tx_hex FROM distribution_txs ORDER BY factory_id DESC LIMIT 1;" 2>/dev/null)
+PAY_DETAIL="no exported descriptor"
+PAY_BAD=1
+if [ -n "$TRD" ] && [ -n "$RAWD" ] && [ -n "$DIST_HEX" ]; then
+  # The checksums are the ones Bitcoin Core computes, and the tr() key is the
+  # output key of client 1's output in its stored distribution TX.
+  CK_RAW=$($BCLI getdescriptorinfo "${RAWD%#*}" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["checksum"])' 2>/dev/null)
+  TR_PUB=$($BCLI getdescriptorinfo "${TRD%#*}" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["descriptor"])' 2>/dev/null)
+  TR_ADDR=$($BCLI deriveaddresses "$TR_PUB" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])' 2>/dev/null)
+  IN_DIST=$($BCLI decoderawtransaction "$DIST_HEX" 2>/dev/null | python3 -c 'import json,sys; a=sys.argv[1]; t=json.load(sys.stdin); print(sum(1 for o in t["vout"] if o["scriptPubKey"].get("address")==a))' "$TR_ADDR" 2>/dev/null)
+  PAY_DETAIL="rawtr checksum ours=${RAWD#*#} core=${CK_RAW:-?}; tr() address ${TR_ADDR:-?} is ${IN_DIST:-0} output(s) of client 1's distribution TX"
+  [ "${RAWD#*#}" = "$CK_RAW" ] && [ "${IN_DIST:-0}" -ge 1 ] && PAY_BAD=0
+fi
+verdict PAYOUT_KEYS $PAY_BAD "$PAY_DETAIL"
 
 # --- LSP_ALONE: key-path spend of the replacement funding, LSP-held keys only ---
 NEW_FUND=$(grep -aoE "LSP rotate: funded [0-9]+ sats, txid: [0-9a-f]{64}, vout=[0-9]+" "$L" | tail -1)
