@@ -582,6 +582,27 @@ void wire_hello_set_slot_hint(cJSON *hello, int slot_hint) {
     cJSON_AddNumberToObject(hello, "slot_hint", slot_hint);
 }
 
+void wire_hello_set_factory_pubkey(cJSON *hello, const secp256k1_context *ctx,
+                                   const secp256k1_pubkey *factory_pk) {
+    if (!hello || !ctx || !factory_pk) return;
+    char hex[67];
+    pubkey_to_hex(ctx, factory_pk, hex);
+    cJSON_AddStringToObject(hello, "factory_pubkey", hex);
+}
+
+int wire_parse_hello_factory_pubkey(const cJSON *hello, const secp256k1_context *ctx,
+                                    secp256k1_pubkey *out) {
+    if (!hello || !ctx || !out) return -1;
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(hello, "factory_pubkey");
+    if (!it) return 0;
+    unsigned char buf[33];
+    if (!cJSON_IsString(it) || !it->valuestring ||
+        hex_decode(it->valuestring, buf, 33) != 33 ||
+        !secp256k1_ec_pubkey_parse(ctx, out, buf, 33))
+        return -1;
+    return 1;
+}
+
 cJSON *wire_build_hello_ack(const secp256k1_context *ctx,
                             const secp256k1_pubkey *lsp_pubkey,
                             uint32_t participant_index,

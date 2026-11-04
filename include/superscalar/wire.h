@@ -318,6 +318,15 @@ cJSON *wire_build_hello(const secp256k1_context *ctx, const secp256k1_pubkey *pu
    a deterministic keyagg order across restarts. */
 void wire_hello_set_slot_hint(cJSON *hello, int slot_hint);
 
+/* HELLO "factory_pubkey": the key the client signs this factory with, when it
+   is not its identity key ("pubkey").  Parse returns 1 if present and valid,
+   0 if absent (the factory key is the identity key: an older client), -1 if
+   malformed. */
+void wire_hello_set_factory_pubkey(cJSON *hello, const secp256k1_context *ctx,
+                                   const secp256k1_pubkey *factory_pk);
+int wire_parse_hello_factory_pubkey(const cJSON *hello, const secp256k1_context *ctx,
+                                    secp256k1_pubkey *out);
+
 /* LSP → Client: HELLO_ACK {lsp_pubkey, participant_index, all_pubkeys[]} */
 cJSON *wire_build_hello_ack(const secp256k1_context *ctx,
                             const secp256k1_pubkey *lsp_pubkey,

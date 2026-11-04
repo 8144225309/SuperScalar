@@ -1715,14 +1715,19 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* For partial rotation: remap client arrays to cooperative subset */
     int saved_client_fds[LSP_MAX_CLIENTS];
     secp256k1_pubkey saved_client_pks[LSP_MAX_CLIENTS];
+    secp256k1_pubkey saved_client_ids[LSP_MAX_CLIENTS];
     size_t n_coop = 0;
 
     memset(saved_client_fds, -1, sizeof(saved_client_fds));
     memset(saved_client_pks, 0, sizeof(saved_client_pks));
+    memset(saved_client_ids, 0, sizeof(saved_client_ids));
 
     if (partial) {
         memcpy(saved_client_fds, lsp->client_fds, sizeof(saved_client_fds));
         memcpy(saved_client_pks, lsp->client_pubkeys, sizeof(saved_client_pks));
+        if (lsp->client_identity_pubkeys)
+            memcpy(saved_client_ids, lsp->client_identity_pubkeys,
+                   sizeof(saved_client_ids));
 
         uint32_t coop[FACTORY_MAX_SIGNERS];
         n_coop = ladder_get_cooperative_clients(lad, dying_id,
@@ -1735,6 +1740,9 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (fd >= 0) {
                 lsp->client_fds[n_online] = fd;
                 lsp->client_pubkeys[n_online] = saved_client_pks[coop[i] - 1];
+                if (lsp->client_identity_pubkeys)
+                    lsp->client_identity_pubkeys[n_online] =
+                        saved_client_ids[coop[i] - 1];
                 n_online++;
             } else {
                 printf("LSP rotate: cooperative client %u went offline, skipping\n",
@@ -1747,6 +1755,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             /* Restore original client arrays */
             memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+            if (lsp->client_identity_pubkeys)
+                memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
             lsp->n_clients = (size_t)mgr->n_channels;
             return 0;
         }
@@ -1783,6 +1793,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (partial) {
                 memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
                 memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                if (lsp->client_identity_pubkeys)
+                    memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
                 lsp->n_clients = (size_t)mgr->n_channels;
             }
             return 0;
@@ -1826,6 +1838,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (partial) {
                     memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
                     memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                    if (lsp->client_identity_pubkeys)
+                        memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
                     lsp->n_clients = (size_t)mgr->n_channels;
                 }
                 return 0;
@@ -1856,6 +1870,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (partial) {
             memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+            if (lsp->client_identity_pubkeys)
+                memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
             lsp->n_clients = (size_t)mgr->n_channels;
         }
         return 0;
@@ -1873,6 +1889,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (partial) {
                 memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
                 memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                if (lsp->client_identity_pubkeys)
+                    memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
                 lsp->n_clients = (size_t)mgr->n_channels;
             }
             return 0;
@@ -1892,6 +1910,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (partial) {
                 memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
                 memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+                if (lsp->client_identity_pubkeys)
+                    memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
                 lsp->n_clients = (size_t)mgr->n_channels;
             }
             return 0;
@@ -1926,6 +1946,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (partial) {
             memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
+            if (lsp->client_identity_pubkeys)
+                memcpy(lsp->client_identity_pubkeys, saved_client_ids, sizeof(saved_client_ids));
             lsp->n_clients = (size_t)mgr->n_channels;
         }
         lsp->dist_client_amounts = NULL;
@@ -1957,7 +1979,8 @@ static int rotation_create_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         int pok = persist_save_factory(db, &lsp->factory, mgr->ctx, 0) &&
-                  persist_save_tree_nodes(db, &lsp->factory, 0);
+                  persist_save_tree_nodes(db, &lsp->factory, 0) &&
+                  lsp_save_client_identities(lsp, db, mgr->ctx, 0);
         if (pok && track) {
             char dtx[65];
             rot_txid_display(rp->dying_funding_txid, dtx);

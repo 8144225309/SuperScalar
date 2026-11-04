@@ -133,6 +133,7 @@ add_library(superscalar
     src/shachain.c
     src/channel.c
     src/adaptor.c
+    src/factory_keys.c
     src/ladder.c
     src/wire.c
     src/lsp.c
@@ -289,6 +290,7 @@ add_executable(test_superscalar
     tests/test_ladder.c
     tests/test_rotation_creation.c
     tests/test_rotation_resume.c
+    tests/test_factory_keys.c
     tests/test_wire.c
     tests/test_channels.c
     tests/spend_helpers.c

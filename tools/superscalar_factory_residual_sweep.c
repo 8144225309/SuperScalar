@@ -13,6 +13,11 @@
  * The reconstructed SPK is ASSERTED == the on-chain SPK BEFORE signing, so a
  * wrong key/merkle/funding-order fails safe (no wasted fee), never a bad sig.
  *
+ * --client-seckeys are each client's key IN THAT FACTORY: for a factory
+ * created with per-factory keys, the "seckey" printed by
+ * `superscalar_client --export-factory-keys`; for an older (legacy)
+ * factory, the client's --seckey.
+ *
  * Usage:
  *   superscalar_factory_residual_sweep \
  *     --lsp-seckey HEX64 --client-seckeys HEX64,HEX64,... \

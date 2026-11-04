@@ -52,6 +52,85 @@ void lsp_ceremony_derive_id(const unsigned char *fid32,
     memcpy(out_cid8, digest, 8);
 }
 
+const secp256k1_pubkey *lsp_client_identity(const lsp_t *lsp, size_t i) {
+    static const secp256k1_pubkey zero;
+    if (!lsp || !lsp->client_pubkeys) return NULL;
+    if (lsp->client_identity_pubkeys &&
+        memcmp(&lsp->client_identity_pubkeys[i], &zero, sizeof(zero)) != 0)
+        return &lsp->client_identity_pubkeys[i];
+    return &lsp->client_pubkeys[i];
+}
+
+int lsp_find_client_slot_by_identity(const lsp_t *lsp, const secp256k1_context *ctx,
+                                     const secp256k1_pubkey *pk) {
+    if (!lsp || !ctx || !pk || !lsp->client_pubkeys) return -1;
+    unsigned char want[33], cur[33];
+    size_t len = 33;
+    if (!secp256k1_ec_pubkey_serialize(ctx, want, &len, pk, SECP256K1_EC_COMPRESSED))
+        return -1;
+    for (size_t c = 0; c < lsp->n_clients; c++) {
+        const secp256k1_pubkey *id = lsp_client_identity(lsp, c);
+        len = 33;
+        if (id && secp256k1_ec_pubkey_serialize(ctx, cur, &len, id,
+                                                SECP256K1_EC_COMPRESSED) &&
+            memcmp(want, cur, 33) == 0)
+            return (int)c;
+    }
+    return -1;
+}
+
+size_t lsp_load_client_identities(lsp_t *lsp, persist_t *db,
+                                  const secp256k1_context *ctx, uint32_t factory_id) {
+    static const secp256k1_pubkey zero;
+    if (!lsp || !lsp->client_pubkeys || !lsp->client_identity_pubkeys) return 0;
+    memset(lsp->client_identity_pubkeys, 0, lsp->n_clients * sizeof(secp256k1_pubkey));
+    size_t n = (db && ctx) ? persist_load_participant_identities(db, factory_id, ctx,
+                                 lsp->client_identity_pubkeys, lsp->n_clients) : 0;
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        if (memcmp(&lsp->client_identity_pubkeys[i], &zero, sizeof(zero)) == 0)
+            lsp->client_identity_pubkeys[i] = lsp->client_pubkeys[i];
+    return n;
+}
+
+int lsp_save_client_identities(const lsp_t *lsp, persist_t *db,
+                               const secp256k1_context *ctx, uint32_t factory_id) {
+    if (!lsp || !db || !ctx) return 0;
+    if (!lsp->client_pubkeys || lsp->n_clients == 0) return 1;   /* nothing to record */
+    secp256k1_pubkey *ids = calloc(lsp->n_clients, sizeof(secp256k1_pubkey));
+    if (!ids) return 0;
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        ids[i] = *lsp_client_identity(lsp, i);
+    int ok = persist_save_participant_identities(db, factory_id, ctx, ids, lsp->n_clients);
+    free(ids);
+    return ok;
+}
+
+static int lsp_pk_eq(const secp256k1_context *ctx, const secp256k1_pubkey *a,
+                     const secp256k1_pubkey *b) {
+    unsigned char sa[33], sb[33];
+    size_t la = 33, lb = 33;
+    return secp256k1_ec_pubkey_serialize(ctx, sa, &la, a, SECP256K1_EC_COMPRESSED) &&
+           secp256k1_ec_pubkey_serialize(ctx, sb, &lb, b, SECP256K1_EC_COMPRESSED) &&
+           memcmp(sa, sb, 33) == 0;
+}
+
+const char *lsp_hello_keys_conflict(const lsp_t *lsp, const secp256k1_context *ctx,
+                                    size_t n_existing, const secp256k1_pubkey *id,
+                                    const secp256k1_pubkey *fac) {
+    if (!lsp || !ctx || !id || !fac) return "bad arguments";
+    if (lsp_pk_eq(ctx, id, &lsp->lsp_pubkey) || lsp_pk_eq(ctx, fac, &lsp->lsp_pubkey))
+        return "a key equals the LSP key";
+    for (size_t c = 0; c < n_existing && lsp->client_pubkeys; c++) {
+        const secp256k1_pubkey *cid = lsp_client_identity(lsp, c);
+        const secp256k1_pubkey *cfac = &lsp->client_pubkeys[c];
+        if (lsp_pk_eq(ctx, id, cid) || lsp_pk_eq(ctx, id, cfac))
+            return "identity key already used by a connected client";
+        if (lsp_pk_eq(ctx, fac, cid) || lsp_pk_eq(ctx, fac, cfac))
+            return "factory key already used by a connected client";
+    }
+    return NULL;
+}
+
 void lsp_ceremony_get_client_pubkey33(const lsp_t *lsp, size_t client_idx,
                                        unsigned char out33[33]) {
     size_t len = 33;
@@ -86,8 +165,10 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
     size_t cap = expected_clients < LSP_MAX_CLIENTS ? LSP_MAX_CLIENTS : expected_clients;
     lsp->client_fds = malloc(cap * sizeof(int));
     lsp->client_pubkeys = calloc(cap, sizeof(secp256k1_pubkey));
-    if (!lsp->client_fds || !lsp->client_pubkeys) {
+    lsp->client_identity_pubkeys = calloc(cap, sizeof(secp256k1_pubkey));
+    if (!lsp->client_fds || !lsp->client_pubkeys || !lsp->client_identity_pubkeys) {
         free(lsp->client_fds); free(lsp->client_pubkeys);
+        free(lsp->client_identity_pubkeys);
         memset(lsp, 0, sizeof(*lsp));
         return 0;
     }
@@ -203,13 +284,37 @@ int lsp_accept_clients(lsp_t *lsp) {
         }
 
         unsigned char pk_buf[33];
+        secp256k1_pubkey id_pk, fac_pk;
         if (hex_decode(pk_item->valuestring, pk_buf, 33) != 33 ||
-            !secp256k1_ec_pubkey_parse(lsp->ctx, &lsp->client_pubkeys[i], pk_buf, 33)) {
+            !secp256k1_ec_pubkey_parse(lsp->ctx, &id_pk, pk_buf, 33)) {
             fprintf(stderr, "LSP: invalid pubkey from client %zu -- dropping, retrying slot\n", i);
             cJSON_Delete(msg.json);
             wire_close(fd);
             i--; continue;
         }
+        /* The key the client signs this factory with.  An older client has
+           no "factory_pubkey": its identity key is its factory key. */
+        int fp_rc = wire_parse_hello_factory_pubkey(msg.json, lsp->ctx, &fac_pk);
+        if (fp_rc < 0) {
+            fprintf(stderr, "LSP: invalid factory_pubkey from client %zu -- dropping, retrying slot\n", i);
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            i--; continue;
+        }
+        {
+            const char *dup = lsp_hello_keys_conflict(lsp, lsp->ctx, i, &id_pk,
+                                                      fp_rc == 1 ? &fac_pk : &id_pk);
+            if (dup) {
+                fprintf(stderr, "LSP: HELLO from client %zu refused (%s) -- dropping, "
+                        "retrying slot\n", i, dup);
+                cJSON_Delete(msg.json);
+                wire_close(fd);
+                i--; continue;
+            }
+        }
+        lsp->client_pubkeys[i] = fp_rc == 1 ? fac_pk : id_pk;
+        if (lsp->client_identity_pubkeys)
+            lsp->client_identity_pubkeys[i] = id_pk;
 
         /* Optional slot_hint for deterministic keyagg ordering */
         cJSON *sh_item = cJSON_GetObjectItem(msg.json, "slot_hint");
@@ -257,6 +362,12 @@ int lsp_accept_clients(lsp_t *lsp) {
                         secp256k1_pubkey tpk = lsp->client_pubkeys[target];
                         int tfd = lsp->client_fds[target];
                         int th = hello_slot_hints[target];
+                        if (lsp->client_identity_pubkeys) {
+                            secp256k1_pubkey tid = lsp->client_identity_pubkeys[target];
+                            lsp->client_identity_pubkeys[target] =
+                                lsp->client_identity_pubkeys[j];
+                            lsp->client_identity_pubkeys[j] = tid;
+                        }
                         lsp->client_pubkeys[target] = lsp->client_pubkeys[j];
                         lsp->client_fds[target] = lsp->client_fds[j];
                         hello_slot_hints[target] = hello_slot_hints[j];
@@ -1623,8 +1734,10 @@ void lsp_cleanup(lsp_t *lsp) {
     }
     free(lsp->client_fds);
     free(lsp->client_pubkeys);
+    free(lsp->client_identity_pubkeys);
     lsp->client_fds = NULL;
     lsp->client_pubkeys = NULL;
+    lsp->client_identity_pubkeys = NULL;
     if (lsp->bridge_fd >= 0) {
         wire_close(lsp->bridge_fd);
         lsp->bridge_fd = -1;

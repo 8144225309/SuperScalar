@@ -270,6 +270,7 @@ static int attach_light_client_client(watchtower_t *wt, persist_t *db_ptr,
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 #include "superscalar/sha256.h"
+#include "superscalar/factory_keys.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
 
@@ -598,6 +599,10 @@ typedef struct {
 
 static client_rotation_ctx_t g_rotation_ctx;
 
+/* The per-factory key chosen at startup (factory_keys.h). */
+static uint32_t g_factory_key_index = 0;
+static int      g_factory_key_index_set = 0;
+
 static void rotation_ctx_set(const unsigned char *dying_txid,
                               const unsigned char *new_nonce,
                               uint64_t epoch) {
@@ -904,6 +909,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                    to signed_commitments on the first payment, leaving a never-used
                    channel unrecoverable in a cold mass-exit (Frontier B). */
                 client_persist_commitment_sig(ch, cbd);
+                /* The reserved factory key is now used by a persisted factory. */
+                if (g_factory_key_index_set &&
+                    !persist_factory_key_set_state(cbd->db, g_factory_key_index,
+                                                   FACTORY_KEY_STATE_ACTIVE, 0))
+                    fprintf(stderr, "Client %u: could not mark factory key %u active\n",
+                            my_index, g_factory_key_index);
                 persist_commit(cbd->db);
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
@@ -2259,6 +2270,110 @@ static void client_wire_log_cb(int dir, uint8_t type, const cJSON *json,
     persist_log_wire_message((persist_t *)ud, dir, type, peer_label, json);
 }
 
+/* --export-factory-keys: print the secret of every factory key in the DB,
+   with descriptors a wallet can import to spend this client's payouts:
+   rawtr() for a cooperative-close output, tr() for a distribution-TX output.
+   Writes no key row and never reserves an index (opening an older DB may
+   still run the schema migration and tighten its permissions).  Prints
+   private keys; for a legacy factory, the client's master (identity) key. */
+static int client_export_factory_keys(secp256k1_context *ctx, const secp256k1_keypair *kp,
+                                      const char *db_path, const char *network) {
+    if (!db_path) {
+        fprintf(stderr, "ERROR: --export-factory-keys requires --db PATH\n");
+        return 0;
+    }
+    persist_t db;
+    if (!persist_open(&db, db_path)) {
+        fprintf(stderr, "ERROR: failed to open database: %s\n", db_path);
+        return 0;
+    }
+    int mainnet = network && (strcmp(network, "mainnet") == 0 ||
+                              strcmp(network, "bitcoin") == 0);
+    fprintf(stderr,
+        "WARNING: the output below contains PRIVATE KEYS for this client's factory\n"
+        "payouts. Anyone who sees them can spend those funds. Do not paste them into\n"
+        "anything you do not fully trust, and clear your terminal afterwards.\n");
+    unsigned char root[32];
+    if (!secp256k1_keypair_sec(ctx, root, kp)) { persist_close(&db); return 0; }
+
+    enum { MAXROWS = 4096 };
+    uint32_t *idx = calloc(MAXROWS, sizeof(uint32_t));
+    unsigned char (*rctx)[33] = calloc(MAXROWS, 33);
+    unsigned char (*rpk)[33] = calloc(MAXROWS, 33);
+    char (*rstate)[16] = calloc(MAXROWS, 16);
+    int ok = idx && rctx && rpk && rstate;
+    int n = ok ? persist_factory_key_list(&db, idx, rctx, rpk, rstate, MAXROWS) : -1;
+    if (n < 0) {
+        fprintf(stderr, "ERROR: cannot read the factory key table\n");
+        ok = 0;
+    }
+    if (n == MAXROWS)
+        fprintf(stderr, "WARNING: the DB holds at least %d factory keys; only the "
+                "first %d are printed\n", MAXROWS, MAXROWS);
+    for (int i = 0; ok && i < n; i++) {
+        unsigned char sk[32], pk[33];
+        char pkhex[67], skhex[65], d_raw[160], d_tr[160];
+        if (!factory_key_derive_pubkey(ctx, pk, root, rctx[i], idx[i]) ||
+            memcmp(pk, rpk[i], 33) != 0 ||
+            !factory_key_derive(ctx, sk, root, rctx[i], idx[i])) {
+            fprintf(stderr, "ERROR: factory key %u does not derive from this key "
+                    "(wrong --seckey/keyfile for this DB?)\n", idx[i]);
+            ok = 0;
+            break;
+        }
+        hex_encode(rpk[i], 33, pkhex);
+        hex_encode(sk, 32, skhex);
+        int dok = factory_key_descriptor(sk, mainnet, 1, d_raw, sizeof(d_raw)) &&
+                  factory_key_descriptor(sk, mainnet, 0, d_tr, sizeof(d_tr));
+        secure_zero(sk, sizeof(sk));
+        if (!dok) { secure_zero(skhex, sizeof(skhex)); ok = 0; break; }
+        printf("factory key %u (%s%s)\n", idx[i], rstate[i],
+               factory_key_ctx_is_zero(rctx[i]) ? ", not bound to an LSP key" : "");
+        printf("  pubkey             %s\n", pkhex);
+        printf("  seckey             %s\n", skhex);
+        printf("  cooperative close  %s\n", d_raw);
+        printf("  distribution TX    %s\n", d_tr);
+        secure_zero(skhex, sizeof(skhex));
+        secure_zero(d_raw, sizeof(d_raw));
+        secure_zero(d_tr, sizeof(d_tr));
+    }
+    /* A factory from before per-factory keys signs and pays with the
+       identity key itself. */
+    if (ok) {
+        unsigned char parts[FACTORY_MAX_SIGNERS][33], id33[33];
+        secp256k1_pubkey id_pk;
+        size_t len = 33;
+        int np = persist_load_participant_pubkeys33(&db, 0, parts, FACTORY_MAX_SIGNERS);
+        if (secp256k1_keypair_pub(ctx, &id_pk, kp) &&
+            secp256k1_ec_pubkey_serialize(ctx, id33, &len, &id_pk, SECP256K1_EC_COMPRESSED)) {
+            for (int i = 0; i < np; i++) {
+                if (memcmp(parts[i], id33, 33) != 0) continue;
+                char d_raw[160], d_tr[160];
+                if (factory_key_descriptor(root, mainnet, 1, d_raw, sizeof(d_raw)) &&
+                    factory_key_descriptor(root, mainnet, 0, d_tr, sizeof(d_tr))) {
+                    fprintf(stderr, "WARNING: the legacy factory line below is your "
+                            "MASTER (identity) key, the same as --seckey / your 24 words: "
+                            "it controls this client's identity and every key derived "
+                            "from it, not only this payout.\n");
+                    printf("legacy factory (signs and pays with the identity key; "
+                           "THIS IS YOUR MASTER KEY)\n");
+                    printf("  cooperative close  %s\n", d_raw);
+                    printf("  distribution TX    %s\n", d_tr);
+                }
+                secure_zero(d_raw, sizeof(d_raw));
+                secure_zero(d_tr, sizeof(d_tr));
+                break;
+            }
+        }
+        if (n == 0 && np <= 0)
+            printf("no factory keys in %s\n", db_path);
+    }
+    secure_zero(root, sizeof(root));
+    free(idx); free(rctx); free(rpk); free(rstate);
+    persist_close(&db);
+    return ok;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s --seckey HEX --port PORT [--host HOST] [OPTIONS]\n"
@@ -2300,6 +2415,8 @@ static void usage(const char *prog) {
         "                                      close    = refuse + force-close on last verified state\n"
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
+        "  --export-factory-keys             Print the private key and wallet descriptors of\n"
+        "                                    every factory key in --db (PRINTS SECRETS)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
@@ -2441,6 +2558,7 @@ int main(int argc, char *argv[]) {
     const char *log_file_path = NULL; /* --log-file PATH */
     int use_syslog = 0;               /* --syslog */
     int use_json_log = 0;              /* --json-log */
+    int export_factory_keys = 0;      /* --export-factory-keys: print payout keys */
     int sweep_to_local = 0;           /* --sweep-to-local: sweep to_local after CSV */
     const char *sweep_dest_addr = NULL; /* --sweep-dest: destination address for sweep */
 
@@ -2670,6 +2788,8 @@ int main(int argc, char *argv[]) {
             force_close = 1;
         } else if (strcmp(argv[i], "--sweep-to-local") == 0) {
             sweep_to_local = 1;
+        } else if (strcmp(argv[i], "--export-factory-keys") == 0) {
+            export_factory_keys = 1;
         } else if (strcmp(argv[i], "--sweep-dest") == 0 && i + 1 < argc) {
             sweep_dest_addr = argv[++i];
         } else if (strcmp(argv[i], "--i-accept-the-risk") == 0) {
@@ -3000,8 +3120,31 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         secp256k1_keypair sweep_kp;
-        secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
-        memset(sweep_seckey, 0, 32);
+        {
+            /* The channel is keyed with the stored factory's key: re-derive
+               it from the root key (identity key for a legacy factory). */
+            /* Read-only: this emergency path never writes a key row or the
+               counter, and never reserves an index. */
+            unsigned char pin_ctx[33], sweep_fsk[32];
+            const unsigned char *pin = NULL;
+            if (lsp_pubkey_hex && hex_decode(lsp_pubkey_hex, pin_ctx, 33) == 33)
+                pin = pin_ctx;
+            uint32_t sweep_fidx = 0;
+            factory_key_source_t sweep_fsrc = FACTORY_KEY_LEGACY;
+            if (factory_key_lookup(&db, sweep_ctx, sweep_seckey, pin, sweep_fsk,
+                                   &sweep_fidx, &sweep_fsrc, NULL) != 1 ||
+                !secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_fsk)) {
+                fprintf(stderr, "ERROR: could not re-derive the factory key\n");
+                secure_zero(sweep_seckey, 32);
+                secure_zero(sweep_fsk, 32);
+                factory_free(sweep_factory); free(sweep_factory);
+                secp256k1_context_destroy(sweep_ctx);
+                persist_close(&db);
+                return 1;
+            }
+            secure_zero(sweep_fsk, 32);
+        }
+        secure_zero(sweep_seckey, 32);
 
         /* Initialize channel using the same path as reconnect */
         channel_t sweep_ch;
@@ -3352,6 +3495,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* --export-factory-keys: print payout keys and exit (no LSP needed). */
+    if (export_factory_keys) {
+        secure_zero(seckey, 32);
+        int eok = client_export_factory_keys(ctx, &kp, db_path, network);
+        secure_zero(&kp, sizeof(kp));
+        report_close(&rpt);
+        secp256k1_context_destroy(ctx);
+        return eok ? 0 : 1;
+    }
+
     /* Bootstrap from well-known endpoint: overrides --host, --port, --lsp-pubkey */
     static char wk_host_buf[256];
     static char wk_pubkey_buf[128];
@@ -3457,6 +3610,46 @@ int main(int argc, char *argv[]) {
            consult client_ps_signed_inputs and refuse to sign a second
            TX spending the same parent UTXO. ZmnSCPxj §PS wide leaves. */
         client_set_persist(&db);
+    }
+
+    /* Per-factory signing key: a fresh hardened key per factory, never the
+       identity key (factory_keys.h).  A factory created before per-factory
+       keys keeps signing with the identity key (legacy). */
+    {
+        /* The key is bound to the pinned LSP key: a new key with a DB
+           needs --lsp-pubkey (factory_key_select refuses otherwise). */
+        unsigned char lsp_ctx33[33], root_sk[32], fac_sk[32];
+        const unsigned char *pin = NULL;
+        if (lsp_pubkey_hex && hex_decode(lsp_pubkey_hex, lsp_ctx33, 33) == 33)
+            pin = lsp_ctx33;
+        uint32_t fidx = 0;
+        factory_key_source_t fsrc = FACTORY_KEY_FRESH;
+        secp256k1_keypair fac_kp;
+        int fk_ok = secp256k1_keypair_sec(ctx, root_sk, &kp) &&
+                    factory_key_select(use_db ? &db : NULL, ctx, root_sk, pin,
+                                       fac_sk, &fidx, &fsrc) &&
+                    secp256k1_keypair_create(ctx, &fac_kp, fac_sk);
+        secure_zero(root_sk, sizeof(root_sk));
+        secure_zero(fac_sk, sizeof(fac_sk));
+        if (!fk_ok) {
+            fprintf(stderr, "Error: could not choose a factory key (see above)%s\n",
+                    (use_db && !pin) ? "; pass the LSP's key with --lsp-pubkey" : "");
+            secure_zero(&fac_kp, sizeof(fac_kp));
+            if (use_db) persist_close(&db);
+            secp256k1_context_destroy(ctx);
+            report_close(&rpt);
+            return 1;
+        }
+        static const char *fk_src_names[] = { "fresh", "reloaded", "recovered", "legacy" };
+        if (fsrc == FACTORY_KEY_LEGACY) {
+            printf("Client: factory key: legacy factory, signing with the identity key\n");
+        } else {
+            client_set_factory_keypair(&fac_kp);
+            g_factory_key_index = fidx;
+            g_factory_key_index_set = use_db;
+            printf("Client: factory key index %u (%s)\n", fidx, fk_src_names[fsrc]);
+        }
+        secure_zero(&fac_kp, sizeof(fac_kp));
     }
 
     signal(SIGINT, sigint_handler);

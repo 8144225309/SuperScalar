@@ -90,6 +90,11 @@ int client_run_reconnect(secp256k1_context *ctx,
                            void *user_data) {
     if (!ctx || !keypair || !db) return 0;
 
+    /* KEYPAIR is the identity key (sent in RECONNECT); the factory and its
+       channel are signed with the per-factory key when one is set. */
+    secp256k1_pubkey id_pubkey;
+    secp256k1_keypair_pub(ctx, &id_pubkey, keypair);
+    keypair = client_factory_keypair(keypair);
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
@@ -164,7 +169,7 @@ int client_run_reconnect(secp256k1_context *ctx,
 
     /* 5. Send MSG_RECONNECT */
     {
-        cJSON *reconn = wire_build_reconnect(ctx, &my_pubkey, commitment_number);
+        cJSON *reconn = wire_build_reconnect(ctx, &id_pubkey, commitment_number);
         if (!wire_send(fd, MSG_RECONNECT, reconn)) {
             fprintf(stderr, "Client reconnect: send MSG_RECONNECT failed\n");
             cJSON_Delete(reconn);

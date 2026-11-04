@@ -258,4 +258,14 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey);
    array, making the funding address deterministic across restarts. */
 void client_set_slot_hint(int slot_hint);
 
+/* Per-factory signing key (factory_keys.h).  When set, the client announces
+   it as HELLO "factory_pubkey" and signs the factory, its channel and any
+   key turnover with it; the keypair passed to client_run_with_channels /
+   client_run_reconnect stays the identity key (HELLO / RECONNECT "pubkey").
+   NULL clears it (the identity key is then also the factory key, as before). */
+void client_set_factory_keypair(const secp256k1_keypair *factory_kp);
+
+/* The factory keypair if one is set, else IDENTITY. */
+const secp256k1_keypair *client_factory_keypair(const secp256k1_keypair *identity);
+
 #endif /* SUPERSCALAR_CLIENT_H */

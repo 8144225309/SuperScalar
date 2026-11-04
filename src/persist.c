@@ -53,6 +53,38 @@ static const char *SCHEMA_VERSION_SQL =
     "  PRIMARY KEY (dying_funding_txid, close_txid)"         \
     ");"
 
+
+/* v44: per-factory client keys.  factory_keys (client): one row per derived
+   factory key index, never reused (factory_keys.h).  factory_participants
+   gains identity_pubkey: the client's identity (HELLO / RECONNECT) key when it
+   differs from its factory key.  Created / added whenever missing, so the step
+   does not depend on the order in which schema bumps are merged. */
+#define PERSIST_V44_TABLES_SQL                                \
+    "CREATE TABLE IF NOT EXISTS factory_keys ("              \
+    "  key_index INTEGER PRIMARY KEY,"                       \
+    "  lsp_ctx TEXT NOT NULL,"                               \
+    "  pubkey TEXT NOT NULL,"                                \
+    "  factory_id INTEGER,"                                  \
+    "  state TEXT NOT NULL,"                                 \
+    "  created_at INTEGER,"                                  \
+    "  released_at INTEGER"                                  \
+    ");"
+
+static int persist_v44_column_exists(sqlite3 *db, const char *table,
+                                    const char *column) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int found = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 1);
+        if (name && strcmp(name, column) == 0) { found = 1; break; }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS factories ("
     "  id INTEGER PRIMARY KEY,"
@@ -1430,6 +1462,26 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v44: per-factory client keys (see PERSIST_V44_TABLES_SQL). */
+    {
+        char *merr44 = NULL;
+        int ok44 = sqlite3_exec(p->db, PERSIST_V44_TABLES_SQL, NULL, NULL,
+                                &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "factory_participants",
+                                              "identity_pubkey"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE factory_participants ADD COLUMN identity_pubkey TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (!ok44) {
+            fprintf(stderr, "persist_open: migration v44 failed: %s\n",
+                    merr44 ? merr44 : "unknown");
+            sqlite3_free(merr44);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1630,8 +1682,11 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
     /* Save participants */
     const char *pk_sql =
-        "INSERT OR REPLACE INTO factory_participants (factory_id, slot, pubkey) "
-        "VALUES (?, ?, ?);";
+        "INSERT INTO factory_participants (factory_id, slot, pubkey) "
+        "VALUES (?, ?, ?) ON CONFLICT(factory_id, slot) DO UPDATE SET "
+        "pubkey = excluded.pubkey, identity_pubkey = CASE WHEN "
+        "factory_participants.pubkey = excluded.pubkey THEN "
+        "factory_participants.identity_pubkey ELSE NULL END;";
 
     for (size_t i = 0; i < f->n_participants; i++) {
         sqlite3_stmt *pk_stmt;
@@ -7428,4 +7483,265 @@ char *persist_load_rotation_close_hex(persist_t *p, const char *dying_funding_tx
     }
     sqlite3_finalize(stmt);
     return out;
+}
+
+/* --- Per-factory client keys (v44) --- */
+
+static void fk_hex33(const unsigned char *in33, char out[67]) {
+    hex_encode(in33, 33, out);
+}
+
+int persist_factory_key_save(persist_t *p, uint32_t key_index,
+                             const unsigned char lsp_ctx33[33],
+                             const unsigned char pubkey33[33],
+                             int factory_id, const char *state) {
+    if (!p || !p->db || !lsp_ctx33 || !pubkey33 || !state) return 0;
+    /* A plain INSERT: an index is never overwritten. */
+    const char *sql =
+        "INSERT INTO factory_keys "
+        "(key_index, lsp_ctx, pubkey, factory_id, state, created_at) "
+        "VALUES (?, ?, ?, ?, ?, strftime('%s','now'));";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    char ctx_hex[67], pk_hex[67];
+    fk_hex33(lsp_ctx33, ctx_hex);
+    fk_hex33(pubkey33, pk_hex);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)key_index);
+    sqlite3_bind_text(st, 2, ctx_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, pk_hex, -1, SQLITE_TRANSIENT);
+    if (factory_id >= 0) sqlite3_bind_int(st, 4, factory_id);
+    else sqlite3_bind_null(st, 4);
+    sqlite3_bind_text(st, 5, state, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_factory_key_load_current(persist_t *p, uint32_t *key_index,
+                                     unsigned char lsp_ctx33[33],
+                                     unsigned char pubkey33[33]) {
+    if (!p || !p->db) return -1;
+    const char *sql =
+        "SELECT key_index, lsp_ctx, pubkey FROM factory_keys "
+        "WHERE state IN ('reserved', 'active') "
+        "ORDER BY key_index DESC LIMIT 1;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    int rc = sqlite3_step(st);
+    int ret;
+    if (rc == SQLITE_DONE) {
+        ret = 0;
+    } else if (rc == SQLITE_ROW) {
+        const char *c = (const char *)sqlite3_column_text(st, 1);
+        const char *k = (const char *)sqlite3_column_text(st, 2);
+        unsigned char cb[33], kb[33];
+        if (c && k && hex_decode(c, cb, 33) == 33 && hex_decode(k, kb, 33) == 33) {
+            if (key_index) *key_index = (uint32_t)sqlite3_column_int64(st, 0);
+            if (lsp_ctx33) memcpy(lsp_ctx33, cb, 33);
+            if (pubkey33) memcpy(pubkey33, kb, 33);
+            ret = 1;
+        } else {
+            ret = -1;                    /* a corrupt row is an error, not "none" */
+        }
+    } else {
+        ret = -1;
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
+int persist_factory_key_get_state(persist_t *p, uint32_t key_index, char state[16]) {
+    if (!p || !p->db) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT state FROM factory_keys WHERE key_index = ?;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)key_index);
+    int rc = sqlite3_step(st);
+    int ret = rc == SQLITE_DONE ? 0 : (rc == SQLITE_ROW ? 1 : -1);
+    if (ret == 1 && state) {
+        const char *s = (const char *)sqlite3_column_text(st, 0);
+        snprintf(state, 16, "%s", s ? s : "");
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
+int persist_factory_key_set_state(persist_t *p, uint32_t key_index,
+                                  const char *state, int factory_id) {
+    if (!p || !p->db || !state) return 0;
+    const char *sql = factory_id >= 0
+        ? "UPDATE factory_keys SET state = ?, factory_id = ?, "
+          "released_at = CASE WHEN ? = 'released' THEN strftime('%s','now') "
+          "ELSE released_at END WHERE key_index = ?;"
+        : "UPDATE factory_keys SET state = ?, "
+          "released_at = CASE WHEN ? = 'released' THEN strftime('%s','now') "
+          "ELSE released_at END WHERE key_index = ?;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int b = 1;
+    sqlite3_bind_text(st, b++, state, -1, SQLITE_TRANSIENT);
+    if (factory_id >= 0) sqlite3_bind_int(st, b++, factory_id);
+    sqlite3_bind_text(st, b++, state, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, b, (sqlite3_int64)key_index);
+    int ok = (sqlite3_step(st) == SQLITE_DONE) && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_factory_key_is_released(persist_t *p, const unsigned char pubkey33[33]) {
+    if (!p || !p->db || !pubkey33) return -1;
+    const char *sql =
+        "SELECT 1 FROM factory_keys WHERE pubkey = ? AND state = 'released' LIMIT 1;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    char pk_hex[67];
+    fk_hex33(pubkey33, pk_hex);
+    sqlite3_bind_text(st, 1, pk_hex, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? 1 : (rc == SQLITE_DONE ? 0 : -1);
+}
+
+int persist_factory_key_max_index(persist_t *p, int64_t *out) {
+    if (!p || !p->db || !out) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT MAX(key_index) FROM factory_keys;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *out = sqlite3_column_type(st, 0) == SQLITE_NULL
+                   ? -1 : (int64_t)sqlite3_column_int64(st, 0);
+        ok = 1;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_factory_key_list(persist_t *p, uint32_t *idx_out,
+                             unsigned char (*ctx_out)[33], unsigned char (*pk_out)[33],
+                             char (*state_out)[16], size_t max) {
+    if (!p || !p->db || !idx_out || !ctx_out || !pk_out || !state_out) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT key_index, lsp_ctx, pubkey, state FROM factory_keys "
+            "ORDER BY key_index;", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    int n = 0, rc;
+    while ((size_t)n < max && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *c = (const char *)sqlite3_column_text(st, 1);
+        const char *k = (const char *)sqlite3_column_text(st, 2);
+        const char *s = (const char *)sqlite3_column_text(st, 3);
+        if (!c || !k || hex_decode(c, ctx_out[n], 33) != 33 ||
+            hex_decode(k, pk_out[n], 33) != 33) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        idx_out[n] = (uint32_t)sqlite3_column_int64(st, 0);
+        snprintf(state_out[n], 16, "%s", s ? s : "");
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int persist_load_counter_checked(persist_t *p, const char *name, uint64_t *out) {
+    if (!p || !p->db || !name || !out) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT value FROM id_counters WHERE name = ?;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    int ret = rc == SQLITE_ROW ? 1 : (rc == SQLITE_DONE ? 0 : -1);
+    if (ret == 1) *out = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return ret;
+}
+
+int persist_factory_exists_checked(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT 1 FROM factories WHERE id = ?;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? 1 : (rc == SQLITE_DONE ? 0 : -1);
+}
+
+int persist_load_participant_pubkeys33(persist_t *p, uint32_t factory_id,
+                                       unsigned char (*out33)[33], size_t max) {
+    if (!p || !p->db || !out33) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT pubkey FROM factory_participants WHERE factory_id = ? ORDER BY slot;",
+            -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    int n = 0, rc = SQLITE_DONE;
+    while ((size_t)n < max && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *h = (const char *)sqlite3_column_text(st, 0);
+        if (h && hex_decode(h, out33[n], 33) == 33) n++;
+    }
+    sqlite3_finalize(st);
+    return (rc == SQLITE_ROW || rc == SQLITE_DONE) ? n : -1;
+}
+
+int persist_save_participant_identities(persist_t *p, uint32_t factory_id,
+                                        const secp256k1_context *ctx,
+                                        const secp256k1_pubkey *ids, size_t n_clients) {
+    if (!p || !p->db || !ctx || (!ids && n_clients)) return 0;
+    static const secp256k1_pubkey zero_pk;
+    const char *sql =
+        "UPDATE factory_participants SET identity_pubkey = ? "
+        "WHERE factory_id = ? AND slot = ?;";
+    for (size_t i = 0; i < n_clients; i++) {
+        /* An unset (all-zero) entry is not a key: never hand it to
+           secp256k1 (its illegal-argument callback aborts). */
+        if (memcmp(&ids[i], &zero_pk, sizeof(zero_pk)) == 0) continue;
+        unsigned char ser[33];
+        size_t len = 33;
+        if (!secp256k1_ec_pubkey_serialize(ctx, ser, &len, &ids[i],
+                                           SECP256K1_EC_COMPRESSED))
+            return 0;
+        char hex[67];
+        hex_encode(ser, 33, hex);
+        sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_text(st, 1, hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, (int)factory_id);
+        sqlite3_bind_int(st, 3, (int)(i + 1));          /* slot 0 = LSP */
+        int ok = (sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+size_t persist_load_participant_identities(persist_t *p, uint32_t factory_id,
+                                           const secp256k1_context *ctx,
+                                           secp256k1_pubkey *out, size_t n_clients) {
+    if (!p || !p->db || !ctx || !out) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT slot, identity_pubkey FROM factory_participants "
+            "WHERE factory_id = ? AND slot >= 1 AND identity_pubkey IS NOT NULL;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    size_t n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int slot = sqlite3_column_int(st, 0);
+        const char *h = (const char *)sqlite3_column_text(st, 1);
+        unsigned char ser[33];
+        if (slot < 1 || (size_t)slot > n_clients || !h ||
+            hex_decode(h, ser, 33) != 33)
+            continue;
+        if (secp256k1_ec_pubkey_parse(ctx, &out[slot - 1], ser, 33)) n++;
+    }
+    sqlite3_finalize(st);
+    return n;
 }

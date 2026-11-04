@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 42
+#define PERSIST_SCHEMA_VERSION 44
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -1494,5 +1494,55 @@ int persist_scan_ceremonies_by_factory(persist_t *p,
                                          void *user_data);
 
 /* === End SF-CEREMONY-HELPERS ============================================== */
+
+
+/* --- Per-factory client keys (v44, factory_keys.h) ---
+   Reads return 1 found, 0 none, -1 on a DB error (callers must not treat an
+   error as "none").
+   factory_key_save: plain INSERT (fails if the index exists; factory_id < 0
+   stores NULL).  load_current: the highest-index row in state reserved or
+   active.  get_state: STATE gets the row's state.  set_state: one row
+   (factory_id < 0 leaves it unchanged); returns 1 on success.  is_released:
+   1 if PUBKEY33 is a key this client handed over.  max_index: returns 1 on
+   success with *OUT = -1 if there is no row, 0 on error.  list: every row,
+   index order; returns the count or -1. */
+int persist_factory_key_save(persist_t *p, uint32_t key_index,
+                             const unsigned char lsp_ctx33[33],
+                             const unsigned char pubkey33[33],
+                             int factory_id, const char *state);
+int persist_factory_key_load_current(persist_t *p, uint32_t *key_index,
+                                     unsigned char lsp_ctx33[33],
+                                     unsigned char pubkey33[33]);
+int persist_factory_key_get_state(persist_t *p, uint32_t key_index, char state[16]);
+int persist_factory_key_set_state(persist_t *p, uint32_t key_index,
+                                  const char *state, int factory_id);
+int persist_factory_key_is_released(persist_t *p, const unsigned char pubkey33[33]);
+int persist_factory_key_max_index(persist_t *p, int64_t *out);
+int persist_factory_key_list(persist_t *p, uint32_t *idx_out,
+                             unsigned char (*ctx_out)[33], unsigned char (*pk_out)[33],
+                             char (*state_out)[16], size_t max);
+
+/* id_counters row NAME: 1 found (*OUT set), 0 absent, -1 DB error. */
+int persist_load_counter_checked(persist_t *p, const char *name, uint64_t *out);
+
+/* 1 if factory FACTORY_ID is stored, 0 if not, -1 on a DB error. */
+int persist_factory_exists_checked(persist_t *p, uint32_t factory_id);
+
+/* Participant pubkeys of FACTORY_ID in slot order (slot 0 = LSP); the count,
+   or -1 on a DB error. */
+int persist_load_participant_pubkeys33(persist_t *p, uint32_t factory_id,
+                                       unsigned char (*out33)[33], size_t max);
+
+/* Client identity pubkeys (LSP side): ids[i] is the identity of the client in
+   slot i + 1; all-zero entries are skipped.  Save after persist_save_factory
+   (it keeps an identity only while the slot's factory key is unchanged).
+   Load fills out[slot - 1] for every slot that has one and returns how many
+   it filled. */
+int persist_save_participant_identities(persist_t *p, uint32_t factory_id,
+                                        const secp256k1_context *ctx,
+                                        const secp256k1_pubkey *ids, size_t n_clients);
+size_t persist_load_participant_identities(persist_t *p, uint32_t factory_id,
+                                           const secp256k1_context *ctx,
+                                           secp256k1_pubkey *out, size_t n_clients);
 
 #endif /* SUPERSCALAR_PERSIST_H */

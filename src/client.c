@@ -1,4 +1,6 @@
 #include "superscalar/client.h"
+#include "superscalar/factory_keys.h"
+#include "superscalar/types.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
@@ -54,6 +56,23 @@ void client_set_min_profit_bps(uint16_t bps) {
 
 /* Optional slot hint sent in HELLO (1..n_clients). 0 = no hint. */
 static int g_slot_hint = 0;
+
+static secp256k1_keypair g_factory_kp;
+static int g_factory_kp_set = 0;
+
+void client_set_factory_keypair(const secp256k1_keypair *factory_kp) {
+    if (factory_kp) {
+        g_factory_kp = *factory_kp;
+        g_factory_kp_set = 1;
+    } else {
+        secure_zero(&g_factory_kp, sizeof(g_factory_kp));
+        g_factory_kp_set = 0;
+    }
+}
+
+const secp256k1_keypair *client_factory_keypair(const secp256k1_keypair *identity) {
+    return g_factory_kp_set ? &g_factory_kp : identity;
+}
 
 void client_set_slot_hint(int slot_hint) {
     g_slot_hint = slot_hint;
@@ -1910,6 +1929,12 @@ int client_run_with_channels(secp256k1_context *ctx,
                               void *user_data,
                               client_verify_funding_fn verify_funding,
                               void *verify_ctx) {
+    /* KEYPAIR is the identity key; the factory is signed with the
+       per-factory key when one is set. */
+    const secp256k1_keypair *identity_kp = keypair;
+    keypair = client_factory_keypair(identity_kp);
+    secp256k1_pubkey id_pubkey;
+    secp256k1_keypair_pub(ctx, &id_pubkey, identity_kp);
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
@@ -1936,8 +1961,10 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
 
     /* Send HELLO */
-    cJSON *hello = wire_build_hello(ctx, &my_pubkey);
+    cJSON *hello = wire_build_hello(ctx, &id_pubkey);
     wire_hello_set_slot_hint(hello, g_slot_hint);
+    if (keypair != identity_kp)
+        wire_hello_set_factory_pubkey(hello, ctx, &my_pubkey);
     if (!wire_send(fd, MSG_HELLO, hello)) {
         fprintf(stderr, "Client: send HELLO failed\n");
         cJSON_Delete(hello);
@@ -2014,8 +2041,31 @@ int client_run_with_channels(secp256k1_context *ctx,
                                        &all_pubkeys[my_index],
                                        SECP256K1_EC_COMPRESSED);
         if (memcmp(my_ser, their_ser, 33) != 0) {
-            fprintf(stderr, "Client: REFUSING — pubkey at index %u does not "
-                    "match our key (identity mismatch)\n", my_index);
+            unsigned char id_ser[33];
+            size_t id_len = 33;
+            secp256k1_ec_pubkey_serialize(ctx, id_ser, &id_len, &id_pubkey,
+                                           SECP256K1_EC_COMPRESSED);
+            if (keypair != identity_kp && memcmp(their_ser, id_ser, 33) == 0)
+                fprintf(stderr, "Client: REFUSING — the LSP put our identity key in "
+                        "our slot: it does not support per-factory keys (it ignored "
+                        "HELLO factory_pubkey). Upgrade the LSP. Signing a factory "
+                        "with the identity key would hand that key to the LSP at "
+                        "rotation.\n");
+            else
+                fprintf(stderr, "Client: REFUSING — the key at participant index %u "
+                        "is not our factory key\n", my_index);
+            wire_close(fd);
+            return 0;
+        }
+    }
+    /* Never sign a factory that holds our identity key, our factory key in a
+       second slot, or a key we have handed over before. */
+    {
+        const char *why = NULL;
+        if (!factory_key_check_participants(ctx, g_client_persist, &id_pubkey,
+                                            &my_pubkey, my_index, all_pubkeys,
+                                            n_participants, &why)) {
+            fprintf(stderr, "Client: REFUSING factory — %s\n", why ? why : "bad key set");
             wire_close(fd);
             return 0;
         }
