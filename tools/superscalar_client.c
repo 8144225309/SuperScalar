@@ -3876,6 +3876,12 @@ int main(int argc, char *argv[]) {
            skip the fresh HELLO handshake and go straight to reconnect. */
         /* A rotation by a co-signed close whose close is confirmed: switch to
            the replacement's DB first. */
+        /* With a signed rotation close pending, check the old factory for
+           breaches first (the rotation's chain lookups below can be slow). */
+        if (use_db && cbd.wt) {
+            client_cin_refresh_frozen(&db);
+            if (client_cin_frozen()) watchtower_check(cbd.wt);
+        }
         if (use_db && client_cin_resolve(&db, db_path, rt_ok ? &rt : NULL)) {
             if (cbd.wt) watchtower_clear_entries(cbd.wt);   /* old factory resolved */
             if (!choose_factory_key(ctx, &kp, &db, lsp_pubkey_hex))

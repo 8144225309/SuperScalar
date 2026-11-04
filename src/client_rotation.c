@@ -579,6 +579,11 @@ int client_cin_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db
                 "(%d)\n", close_height, tip);
         return 0;
     }
+    if (!client_cin_old_funding_unspent(g_cin_rt, old_f)) {
+        fprintf(stderr, "Client: REFUSING the rotation: our factory's funding is already "
+                "spent (or cannot be checked)\n");
+        return 0;
+    }
     size_t n = (size_t)cJSON_GetArraySize(pka);
     if (n < 2 || n > FACTORY_MAX_SIGNERS || n != old_f->n_participants || my_index >= n) {
         fprintf(stderr, "Client: bad participant list in the rotation proposal\n");
@@ -834,7 +839,7 @@ int client_cin_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db
         }
         free(hex);
         int confs = -1, other = -1;
-        if (dok) client_cin_chain_view(g_cin_rt, &row, &confs, &other);
+        if (dok) client_cin_chain_view(g_cin_rt, db, &row, &confs, &other);
         (void)other;
         result = dok && confs >= g_cin_depth;
         if (result)
@@ -887,6 +892,21 @@ static void cin_scan_blocks(regtest_t *rt, const persist_client_rotation_t *row,
     if (from < row->close_height) from = row->close_height;
     uint32_t to = (uint32_t)tip;
     if (to >= from + CIN_SCAN_MAX_BLOCKS) to = from + CIN_SCAN_MAX_BLOCKS - 1;
+    /* Blocks below the prune height are gone: skip them (the known
+       transactions were looked up before this scan) instead of stopping. */
+    uint32_t prune_below = 0;
+    {
+        char *ci = regtest_exec(rt, "getblockchaininfo", "");
+        cJSON *cj = ci ? cJSON_Parse(ci) : NULL;
+        free(ci);
+        const cJSON *pr = cj ? cJSON_GetObjectItemCaseSensitive(cj, "pruned") : NULL;
+        const cJSON *ph = cj ? cJSON_GetObjectItemCaseSensitive(cj, "pruneheight") : NULL;
+        if (cJSON_IsTrue(pr) && cJSON_IsNumber(ph) && ph->valuedouble > 0)
+            prune_below = (uint32_t)ph->valuedouble;
+        cJSON_Delete(cj);
+    }
+    uint32_t skipped_from = 0, n_skipped = 0;
+    int hit = 0;
     for (uint32_t h = from; h <= to; h++) {
         char params[96];
         snprintf(params, sizeof(params), "%u", h);
@@ -897,10 +917,14 @@ static void cin_scan_blocks(regtest_t *rt, const persist_client_rotation_t *row,
         free(hr);
         snprintf(params, sizeof(params), "\"%s\" 2", hash);
         char *br = regtest_exec(rt, "getblock", params);
-        if (!br) return;
-        cJSON *b = cJSON_Parse(br);
+        cJSON *b = br ? cJSON_Parse(br) : NULL;
         free(br);
-        if (!b) return;
+        if (!b) {
+            if (h >= prune_below) return;          /* not pruned: try again later */
+            if (n_skipped++ == 0) skipped_from = h;
+            g_scan_next = h + 1;
+            continue;
+        }
         const cJSON *txs = cJSON_GetObjectItemCaseSensitive(b, "tx");
         int found = 0;
         const cJSON *tx;
@@ -927,12 +951,103 @@ static void cin_scan_blocks(regtest_t *rt, const persist_client_rotation_t *row,
             if (found) break;
         }
         cJSON_Delete(b);
-        if (found) { g_scan_next = h; return; }
+        if (found) { g_scan_next = h; hit = 1; break; }
     }
-    g_scan_next = to + 1;
+    if (n_skipped)
+        fprintf(stderr, "Client: WARNING: blocks %u..%u are pruned on this node; the "
+                "rotation close %s could not be looked for there (only its known "
+                "transactions were checked)\n", skipped_from, skipped_from + n_skipped - 1,
+                row->close_txid);
+    if (!hit) g_scan_next = to + 1;
 }
 
-void client_cin_chain_view(regtest_t *rt, const persist_client_rotation_t *row,
+/* The depth of a transaction the client knows by txid, without txindex: the
+   node's own lookup (mempool or txindex), then any of its outputs still in
+   the UTXO set.  -1 if not seen. */
+static int known_tx_confs(regtest_t *rt, const char *txid, uint32_t n_out) {
+    int best = -1;
+    char params[128];
+    snprintf(params, sizeof(params), "\"%s\" true", txid);
+    char *r = regtest_exec(rt, "getrawtransaction", params);
+    cJSON *j = r ? cJSON_Parse(r) : NULL;
+    free(r);
+    const cJSON *c = j ? cJSON_GetObjectItemCaseSensitive(j, "confirmations") : NULL;
+    if (cJSON_IsNumber(c)) best = (int)c->valuedouble;
+    cJSON_Delete(j);
+    if (n_out > 16) n_out = 16;
+    for (uint32_t v = 0; v < n_out; v++) {
+        snprintf(params, sizeof(params), "\"%s\" %u false", txid, v);
+        r = regtest_exec(rt, "gettxout", params);
+        j = r ? cJSON_Parse(r) : NULL;
+        free(r);
+        c = j ? cJSON_GetObjectItemCaseSensitive(j, "confirmations") : NULL;
+        if (cJSON_IsNumber(c) && (int)c->valuedouble > best) best = (int)c->valuedouble;
+        cJSON_Delete(j);
+    }
+    return best;
+}
+
+/* The deepest of the factory-0 tree transactions in DB (ROOTS_ONLY: the
+   ones spending the funding output).  -1 if none is seen. */
+static int tree_txs_confs(regtest_t *rt, persist_t *db, int roots_only) {
+    if (!db || !db->db) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db,
+            "SELECT txid, n_outputs, parent_index FROM tree_nodes WHERE factory_id = 0 "
+            "LIMIT 256;", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    int best = -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        int parent = sqlite3_column_type(st, 2) == SQLITE_NULL ? -1 : sqlite3_column_int(st, 2);
+        if (!t || strlen(t) != 64 || (roots_only && parent >= 0)) continue;
+        int c = known_tx_confs(rt, t, (uint32_t)sqlite3_column_int(st, 1));
+        if (c > best) best = c;
+    }
+    sqlite3_finalize(st);
+    return best;
+}
+
+/* The old factory's own spenders the client knows: its tree root and its
+   distribution TX (main DB). */
+static int old_spenders_confs(regtest_t *rt, persist_t *db) {
+    int best = tree_txs_confs(rt, db, 1);
+    unsigned char *buf = malloc(100000);
+    size_t len = 0;
+    if (buf && persist_load_distribution_tx(db, 0, buf, &len, 100000) && len > 0) {
+        unsigned char t[32];
+        char disp[65];
+        if (tx_txid_from_bytes(buf, len, t)) {
+            txid_display(t, disp);
+            int c = known_tx_confs(rt, disp, 4);
+            if (c > best) best = c;
+        }
+    }
+    free(buf);
+    return best;
+}
+
+/* The replacement's tree transactions (side DB): each spends the close or
+   one of its descendants, so its depth bounds the close's. */
+static int replacement_txs_confs(regtest_t *rt, const char *side) {
+    if (!side || !side[0] || access(side, F_OK) != 0) return -1;
+    persist_t s;
+    memset(&s, 0, sizeof(s));
+    if (!persist_open_readonly(&s, side)) return -1;
+    int c = tree_txs_confs(rt, &s, 0);
+    persist_close(&s);
+    return c;
+}
+
+int client_cin_old_funding_unspent(regtest_t *rt, const factory_t *old_f) {
+    if (!rt || !old_f) return 0;
+    char d[65];
+    txid_display(old_f->funding_txid, d);
+    return regtest_outpoint_unspent(rt, d, old_f->funding_vout) == 1;
+}
+
+void client_cin_chain_view(regtest_t *rt, persist_t *db,
+                           const persist_client_rotation_t *row,
                            int *close_confs, int *other_confs) {
     *close_confs = -1;
     *other_confs = -1;
@@ -955,6 +1070,17 @@ void client_cin_chain_view(regtest_t *rt, const persist_client_rotation_t *row,
         cJSON_Delete(j);
     }
     if (*close_confs >= g_cin_depth) return;
+    /* Transactions known by txid: the replacement's tree (descendants of the
+       close) and the old factory's root and distribution TX (other spends of
+       its funding). */
+    int rc = replacement_txs_confs(rt, row->side_db);
+    if (rc > *close_confs) *close_confs = rc;
+    if (*close_confs >= g_cin_depth) return;
+    if (db) {
+        int oc = old_spenders_confs(rt, db);
+        if (oc > *other_confs) *other_confs = oc;
+        if (*other_confs >= g_cin_depth) return;
+    }
     /* Otherwise the blocks since the close's height: the close (its output
        already spent) or another spend of the old funding. */
     int tip = regtest_get_block_height(rt);
@@ -997,7 +1123,7 @@ int client_cin_resolve(persist_t *db, const char *db_path, regtest_t *rt) {
     memset(&row, 0, sizeof(row));
     if (persist_client_rotation_load_open(db, &row) != 1) return 0;
     int confs = -1, other = -1;
-    if (state_is_signed(row.state)) client_cin_chain_view(rt, &row, &confs, &other);
+    if (state_is_signed(row.state)) client_cin_chain_view(rt, db, &row, &confs, &other);
     if (confs < g_cin_depth && other >= g_cin_depth) {
         /* The old factory was resolved without the close (which can now
            never confirm): the rotation is over and the freeze lifted. */

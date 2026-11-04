@@ -48,9 +48,17 @@ int client_cin_refuse_while_frozen(const wire_msg_t *m, const unsigned char *fun
    (CLOSE_CONFS) and of another transaction spending the old funding
    (OTHER_CONFS), each -1 if not seen.  Works without txindex and after any
    absence: the wallet / txindex / recent blocks first, then the close's
-   output in the UTXO set, then the blocks from the close's height. */
-void client_cin_chain_view(regtest_t *rt, const persist_client_rotation_t *row,
+   output in the UTXO set, then the transactions it knows by txid (the
+   replacement's tree in the side DB; the old tree's root and distribution
+   TX in DB), then the blocks from the close's height (pruned blocks are
+   skipped with a warning). */
+void client_cin_chain_view(regtest_t *rt, persist_t *db,
+                           const persist_client_rotation_t *row,
                            int *close_confs, int *other_confs);
+
+/* 1 if OLD_F's funding output is unspent on RT (a rotation is refused
+   otherwise). */
+int client_cin_old_funding_unspent(regtest_t *rt, const factory_t *old_f);
 
 /* The close's nLockTime height is not in the future: at most TIP + 1. */
 int client_cin_check_close_height(uint32_t close_height, int tip);

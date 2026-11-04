@@ -583,8 +583,10 @@ static int fake_cli(char *path) {
         "m=$1; shift\n"
         "case \"$m\" in\n"
         "getblockcount) echo \"$SS_FAKE_TIP\";;\n"
+        "getblockchaininfo) echo \"${SS_FAKE_CHAININFO:-{}}\";;\n"
         "getblockhash) printf '%064x\\n' \"$1\";;\n"
         "getblock) h=$(echo \"$1\" | tr -d '\"'); n=$((0x$(echo \"$h\" | cut -c57-64)));\n"
+        "  if [ -n \"$SS_FAKE_PRUNED_BELOW\" ] && [ \"$n\" -lt \"$SS_FAKE_PRUNED_BELOW\" ]; then exit 1; fi;\n"
         "  if [ \"$n\" = \"$SS_FAKE_HEIGHT\" ]; then echo \"$SS_FAKE_BLOCK\"; else echo '{\"tx\":[]}'; fi;;\n"
         "gettxout) if [ -n \"$SS_FAKE_TXOUT_FOR\" ] && echo \"$1\" | grep -q \"$SS_FAKE_TXOUT_FOR\"; then echo \"$SS_FAKE_TXOUT\"; else echo null; fi;;\n"
         "*) exit 1;;\n"
@@ -622,13 +624,13 @@ int test_cin_client_chain_view(void) {
     setenv("SS_FAKE_BLOCK", blk, 1);
     unsetenv("SS_FAKE_TXOUT_FOR");
     int cc = -1, oc = -1;
-    client_cin_chain_view(&rt, &r, &cc, &oc);
+    client_cin_chain_view(&rt, NULL, &r, &cc, &oc);
     TEST_ASSERT(cc == 111 && oc == -1, "a close 110 blocks deep (its output spent) is found");
 
     setenv("SS_FAKE_TXOUT_FOR", x, 1);
     setenv("SS_FAKE_TXOUT", "{\"confirmations\": 50}", 1);
     setenv("SS_FAKE_HEIGHT", "0", 1);
-    client_cin_chain_view(&rt, &r, &cc, &oc);
+    client_cin_chain_view(&rt, NULL, &r, &cc, &oc);
     TEST_ASSERT(cc == 50, "the close's output in the UTXO set gives its depth");
     unsetenv("SS_FAKE_TXOUT_FOR");
 
@@ -662,6 +664,114 @@ int test_cin_client_chain_view(void) {
     persist_close(&db);
     unlink(side);
     unlink(path);
+    unlink(cli);
+    return 1;
+}
+
+/* On a pruned node, after a long absence, with the close's output already
+   spent by the replacement's kickoff: the pruned blocks are skipped, the
+   close is still found in a later block, and the transactions the client
+   knows by txid (the replacement's tree, the old tree's root) are looked up
+   directly.  A proposal whose old funding is already spent is refused. */
+int test_cin_client_chain_view_pruned(void) {
+    char cli[] = "/tmp/ss_cin_cli_XXXXXX";
+    TEST_ASSERT(fake_cli(cli), "fake cli");
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    snprintf(rt.cli_path, sizeof(rt.cli_path), "%s", cli);
+    snprintf(rt.network, sizeof(rt.network), "regtest");
+    const char *old = "9898989898989898989898989898989898989898989898989898989898989898";
+    const char *x = "cccc989898989898989898989898989898989898989898989898989898989898";
+    persist_client_rotation_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.old_txid, sizeof(r.old_txid), "%s", old);
+    r.old_vout = 1;
+    snprintf(r.close_txid, sizeof(r.close_txid), "%s", x);
+    snprintf(r.state, sizeof(r.state), "close_signed");
+    r.close_height = 5;
+    char blk[512];
+    snprintf(blk, sizeof(blk), "{\"tx\":[{\"txid\":\"%s\",\"vin\":[{\"txid\":\"%s\",\"vout\":1}]}]}",
+             x, old);
+    setenv("SS_FAKE_TIP", "120", 1);
+    setenv("SS_FAKE_HEIGHT", "60", 1);
+    setenv("SS_FAKE_BLOCK", blk, 1);
+    setenv("SS_FAKE_PRUNED_BELOW", "50", 1);
+    setenv("SS_FAKE_CHAININFO", "{\"pruned\":true,\"pruneheight\":50}", 1);
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    int cc = -1, oc = -1;
+    client_cin_chain_view(&rt, NULL, &r, &cc, &oc);
+    TEST_ASSERT(cc == 61, "pruned blocks are skipped and the close is found after them");
+
+    /* The close's block is pruned too, but the replacement's root (side DB)
+       has an unspent output. */
+    setenv("SS_FAKE_PRUNED_BELOW", "100", 1);
+    setenv("SS_FAKE_CHAININFO", "{\"pruned\":true,\"pruneheight\":100}", 1);
+    char side[] = "/tmp/ss_cin_sd_XXXXXX";
+    persist_t s;
+    TEST_ASSERT(tmp_db(side, &s), "side db");
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++) TEST_ASSERT(mk_pk(&pks[i], (unsigned char)(0x30 + i)), "pk");
+    factory_t *f = repl_factory(pks, 200);
+    TEST_ASSERT(f && persist_save_tree_nodes(&s, f, 0), "the replacement's tree");
+    unsigned char t[32], rv[32];
+    char root[65];
+    TEST_ASSERT(tx_txid_from_bytes(f->nodes[0].unsigned_tx.data, f->nodes[0].unsigned_tx.len, t),
+                "root txid");
+    memcpy(rv, t, 32);
+    reverse_bytes(rv, 32);
+    hex_encode(rv, 32, root);
+    persist_close(&s);
+    factory_free(f);
+    free(f);
+    snprintf(r.side_db, sizeof(r.side_db), "%s", side);
+    setenv("SS_FAKE_TXOUT_FOR", root, 1);
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 40}", 1);
+    cc = oc = -1;
+    client_cin_chain_view(&rt, NULL, &r, &cc, &oc);
+    TEST_ASSERT(cc == 40, "the replacement's root gives the close's depth");
+
+    /* The old tree's root (main DB) spent the old funding instead. */
+    char mainp[] = "/tmp/ss_cin_md_XXXXXX";
+    persist_t m;
+    TEST_ASSERT(tmp_db(mainp, &m), "main db");
+    for (int i = 0; i < 3; i++) TEST_ASSERT(mk_pk(&pks[i], (unsigned char)(0x38 + i)), "pk");
+    f = repl_factory(pks, 300);
+    TEST_ASSERT(f && persist_save_tree_nodes(&m, f, 0), "the old tree");
+    TEST_ASSERT(tx_txid_from_bytes(f->nodes[0].unsigned_tx.data, f->nodes[0].unsigned_tx.len, t),
+                "old root txid");
+    memcpy(rv, t, 32);
+    reverse_bytes(rv, 32);
+    char oroot[65];
+    hex_encode(rv, 32, oroot);
+    factory_free(f);
+    free(f);
+    r.side_db[0] = '\0';
+    setenv("SS_FAKE_TXOUT_FOR", oroot, 1);
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 30}", 1);
+    cc = oc = -1;
+    client_cin_chain_view(&rt, &m, &r, &cc, &oc);
+    TEST_ASSERT(cc < 1 && oc == 30, "the old tree's root is another spend of the old funding");
+    persist_close(&m);
+
+    /* A proposal over an already spent old funding is refused. */
+    factory_t of;
+    memset(&of, 0, sizeof(of));
+    memset(of.funding_txid, 0x98, 32);
+    of.funding_vout = 1;
+    setenv("SS_FAKE_TXOUT_FOR", old, 1);
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 9, \"value\": 0.001}", 1);
+    TEST_ASSERT(client_cin_old_funding_unspent(&rt, &of), "unspent: the rotation may run");
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    TEST_ASSERT(!client_cin_old_funding_unspent(&rt, &of), "spent: refused");
+
+    unsetenv("SS_FAKE_TIP");
+    unsetenv("SS_FAKE_HEIGHT");
+    unsetenv("SS_FAKE_BLOCK");
+    unsetenv("SS_FAKE_TXOUT");
+    unsetenv("SS_FAKE_PRUNED_BELOW");
+    unsetenv("SS_FAKE_CHAININFO");
+    unlink(side);
+    unlink(mainp);
     unlink(cli);
     return 1;
 }
