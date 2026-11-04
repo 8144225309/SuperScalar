@@ -1204,10 +1204,14 @@ int test_persist_departed_clients_round_trip(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, NULL), "open");
 
-    unsigned char key0[32], key1[32], key2[32];
+    unsigned char key0[32], key1[32], key2[32], seal[32];
     memset(key0, 0xAA, 32);
     memset(key1, 0xBB, 32);
     memset(key2, 0xCC, 32);
+    memset(seal, 0x5E, 32);
+    /* Released keys are never stored in the clear: a seal is required. */
+    TEST_ASSERT(!persist_save_departed_client(&db, 0, 1, key0), "no seal: refused");
+    persist_set_departed_seal_key(&db, seal);
 
     TEST_ASSERT(persist_save_departed_client(&db, 0, 1, key0), "save departed 0");
     TEST_ASSERT(persist_save_departed_client(&db, 0, 2, key1), "save departed 1");

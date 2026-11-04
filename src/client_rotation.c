@@ -284,26 +284,8 @@ static int nodes_match_local(const secp256k1_context *ctx, const factory_t *nf) 
 }
 
 int client_cin_tree_digest(const factory_t *f, char out_hex[65]) {
-    if (!f || !out_hex || f->n_nodes == 0) return 0;
-    size_t total = 4;
-    for (size_t i = 0; i < f->n_nodes; i++) {
-        if (!f->nodes[i].unsigned_tx.data || f->nodes[i].unsigned_tx.len == 0) return 0;
-        total += 4 + f->nodes[i].unsigned_tx.len;
-    }
-    unsigned char *buf = malloc(total);
-    if (!buf) return 0;
-    size_t off = 0;
-    uint32_t n = (uint32_t)f->n_nodes;
-    for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(n >> (8 * b));
-    for (size_t i = 0; i < f->n_nodes; i++) {
-        uint32_t l = (uint32_t)f->nodes[i].unsigned_tx.len;
-        for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(l >> (8 * b));
-        memcpy(buf + off, f->nodes[i].unsigned_tx.data, l);
-        off += l;
-    }
     unsigned char d[32];
-    sha256(buf, total, d);
-    free(buf);
+    if (!out_hex || !factory_tree_digest(f, d)) return 0;
     hex_encode(d, 32, out_hex);
     return 1;
 }

@@ -1243,6 +1243,21 @@ size_t factory_compute_distribution_outputs_balanced(
 
 /* The key-path-only P2TR funding SPK of a factory over PUBKEYS (slot order,
    LSP first): MuSig2 key aggregation, then the BIP-86 tweak. */
+/* SHA256 over every node's unsigned transaction (count, then length-prefixed
+   bytes, little endian): the identity of a signed tree. */
+int factory_tree_digest(const factory_t *f, unsigned char out32[32]);
+
+/* What a client sells in a partial rotation: its old position (OLD outpoint)
+   for exactly this position in the replacement (NEW outpoint, its tree
+   digest, the client's new key, its carried balance and slot).
+   tagged_hash("SuperScalar/turnover/v2", ...); txids in internal order. */
+void factory_release_binding(const unsigned char old_txid32[32], uint32_t old_vout,
+                             const unsigned char new_txid32[32], uint32_t new_vout,
+                             const unsigned char tree_digest32[32],
+                             const unsigned char pubkey_new33[33],
+                             uint64_t carried_sats, uint32_t slot,
+                             unsigned char out32[32]);
+
 int factory_funding_spk_for(const secp256k1_context *ctx, const secp256k1_pubkey *pubkeys,
                             size_t n, unsigned char spk_out34[34]);
 

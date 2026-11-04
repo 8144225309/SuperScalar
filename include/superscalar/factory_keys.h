@@ -43,6 +43,7 @@
 #define FACTORY_KEY_STATE_RESERVED  "reserved"   /* sent to the LSP, no factory yet */
 #define FACTORY_KEY_STATE_ACTIVE    "active"     /* used by a persisted factory */
 #define FACTORY_KEY_STATE_RELEASED  "released"   /* handed over to the LSP: never reuse */
+#define FACTORY_KEY_STATE_RETIRED   "retired"    /* a factory we moved out of, not released */
 
 typedef enum {
     FACTORY_KEY_FRESH = 0,      /* new index reserved */

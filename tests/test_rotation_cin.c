@@ -11,6 +11,7 @@
 #include "superscalar/fee_estimator.h"
 #include "cJSON.h"
 #include <stdio.h>
+#include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -799,6 +800,62 @@ int test_cin_htlc_quiescence(void) {
     TEST_ASSERT(lsp_rotation_channels_quiet(mgr, NULL) &&
                 client_cin_channel_quiet(&entries[1].channel), "settled: go");
     free(mgr);
+    return 1;
+}
+
+/* The partial rotation's messages, its release binding, and released keys
+   sealed at rest. */
+int test_part_records(void) {
+    unsigned char t[32], b[32], sig[64], t2[32], b2[32], sig2[64], sk[32], sk2[32];
+    memset(t, 0x11, 32); memset(b, 0x22, 32); memset(sig, 0x33, 64); memset(sk, 0x44, 32);
+    cJSON *j = wire_build_rotation_release_req(t, b, sig);
+    TEST_ASSERT(j && wire_parse_rotation_release_req(j, t2, b2, sig2) &&
+                memcmp(t, t2, 32) == 0 && memcmp(b, b2, 32) == 0 && memcmp(sig, sig2, 64) == 0,
+                "release request round trip");
+    cJSON_Delete(j);
+    j = wire_build_rotation_release(b, sk);
+    TEST_ASSERT(j && wire_parse_rotation_release(j, b2, sk2) && memcmp(sk, sk2, 32) == 0,
+                "release round trip");
+    cJSON_Delete(j);
+
+    unsigned char pk[33], d[32], r1[32], r2[32];
+    memset(pk, 0x02, 33); memset(d, 0x55, 32);
+    factory_release_binding(t, 1, b, 0, d, pk, 5000, 2, r1);
+    factory_release_binding(t, 1, b, 0, d, pk, 5000, 2, r2);
+    TEST_ASSERT(memcmp(r1, r2, 32) == 0, "deterministic");
+    factory_release_binding(t, 1, b, 0, d, pk, 4999, 2, r2);
+    TEST_ASSERT(memcmp(r1, r2, 32) != 0, "bound to the carried balance");
+    factory_release_binding(t, 1, b, 0, d, pk, 5000, 3, r2);
+    TEST_ASSERT(memcmp(r1, r2, 32) != 0, "bound to the slot");
+
+    char path[] = "/tmp/ss_part_rec_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0, "mkstemp");
+    close(fd);
+    unlink(path);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    unsigned char seal[32];
+    memset(seal, 0x66, 32);
+    persist_set_departed_seal_key(&db, seal);
+    TEST_ASSERT(persist_save_departed_client(&db, 3, 1, sk), "save a released key");
+    sqlite3_stmt *st;
+    TEST_ASSERT(sqlite3_prepare_v2(db.db, "SELECT extracted_key FROM departed_clients;", -1,
+                                   &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW,
+                "row");
+    char stored[256];
+    snprintf(stored, sizeof(stored), "%s", (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    char plain[65];
+    hex_encode(sk, 32, plain);
+    TEST_ASSERT(strncmp(stored, "dk1:", 4) == 0 && !strstr(stored, plain), "sealed, not plaintext");
+    int dep[4] = {0};
+    unsigned char keys[4][32];
+    memset(keys, 0, sizeof(keys));
+    TEST_ASSERT(persist_load_departed_clients(&db, 3, dep, keys, 4) == 1 && dep[1] &&
+                memcmp(keys[1], sk, 32) == 0, "unsealed on load");
+    persist_close(&db);
+    unlink(path);
     return 1;
 }
 
