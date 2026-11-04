@@ -776,6 +776,32 @@ int test_cin_client_chain_view_pruned(void) {
     return 1;
 }
 
+/* No rotation while an HTLC is in flight, on either side. */
+int test_cin_htlc_quiescence(void) {
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    lsp_channel_entry_t entries[2];
+    memset(entries, 0, sizeof(entries));
+    htlc_t h[1];
+    memset(h, 0, sizeof(h));
+    h[0].state = HTLC_STATE_ACTIVE;
+    entries[1].channel.htlcs = h;
+    entries[1].channel.n_htlcs = 1;
+    mgr->entries = entries;
+    mgr->n_channels = 2;
+    TEST_ASSERT(!lsp_rotation_channels_quiet(mgr, NULL), "an HTLC in flight: wait");
+    unsigned char set[2] = { 1, 0 };
+    TEST_ASSERT(lsp_rotation_channels_quiet(mgr, set), "not a channel of the rotation");
+    TEST_ASSERT(!client_cin_channel_quiet(&entries[1].channel), "client: refused");
+    TEST_ASSERT(client_cin_channel_quiet(&entries[0].channel), "client: no HTLC");
+    TEST_ASSERT(!client_cin_channel_quiet(NULL), "client: no channel");
+    h[0].state = HTLC_STATE_FULFILLED;
+    TEST_ASSERT(lsp_rotation_channels_quiet(mgr, NULL) &&
+                client_cin_channel_quiet(&entries[1].channel), "settled: go");
+    free(mgr);
+    return 1;
+}
+
 /* The LSP and client records, and the DB snapshot. */
 int test_cin_records(void) {
     char path[] = "/tmp/ss_cin_rec_XXXXXX";

@@ -2828,6 +2828,24 @@ static int cin_build_close(const factory_t *old, const tx_output_t *output, uint
 
 /* ROTATION_BEGIN(v=1, close_into_new) to every client; collect each
    client's fresh replacement key. */
+int lsp_rotation_channels_quiet(const lsp_channel_mgr_t *mgr, const unsigned char *in_set) {
+    if (!mgr) return 0;
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (in_set && !in_set[c]) continue;
+        const channel_t *ch = &mgr->entries[c].channel;
+        for (size_t h = 0; h < ch->n_htlcs; h++)
+            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) return 0;
+    }
+    return 1;
+}
+
+/* A message a client sends while the LSP waits for its rotation key. */
+static int rot_is_channel_msg(uint8_t t) {
+    return t == MSG_UPDATE_ADD_HTLC || t == MSG_UPDATE_FULFILL_HTLC ||
+           t == MSG_UPDATE_FAIL_HTLC || t == MSG_COMMITMENT_SIGNED ||
+           t == MSG_REVOKE_AND_ACK;
+}
+
 static int cin_collect_keys(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             const unsigned char *dying_txid32, secp256k1_pubkey *out) {
     unsigned char nonce[32];
@@ -2862,8 +2880,17 @@ static int cin_collect_keys(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 fprintf(stderr, "LSP rotate: client %zu refused the rotation\n", i);
                 cJSON_Delete(m.json);
                 return 0;
+            } else if (rot_is_channel_msg(m.msg_type) && i < mgr->n_channels) {
+                /* Channel traffic (a payment, a preimage): handle it as usual,
+                   never drop it, and try the rotation again later. */
+                fprintf(stderr, "LSP rotate: client %zu sent channel traffic (0x%02x) during "
+                        "the rotation -- handling it; rotation retried later\n", i,
+                        m.msg_type);
+                (void)lsp_channels_handle_msg(mgr, lsp, i, &m);
+                cJSON_Delete(m.json);
+                return 0;
             } else {
-                if (m.json) cJSON_Delete(m.json);      /* stray: keep waiting */
+                if (m.json) cJSON_Delete(m.json);      /* ping and such: keep waiting */
             }
         }
         if (!got) {
@@ -3086,15 +3113,13 @@ static int lsp_rotation_close_into_new(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            resuming ? ", over the recorded close" : "");
     fflush(stdout);
 
-    /* No HTLC may be in flight across the switch: fail them cleanly. */
-    for (size_t c = 0; c < mgr->n_channels; c++) {
-        channel_t *ch = &mgr->entries[c].channel;
-        for (size_t h = 0; h < ch->n_htlcs; ) {
-            if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
-                channel_fail_htlc(ch, ch->htlcs[h].id);
-            else
-                h++;
-        }
+    /* No HTLC may be in flight across the switch: the old channels' balances
+       are what the replacement carries.  Wait for them to settle (the
+       rotation is retried) instead of failing them on this side only. */
+    if (!lsp_rotation_channels_quiet(mgr, NULL)) {
+        fprintf(stderr, "LSP rotate: an HTLC is in flight on a channel of factory %u -- "
+                "not rotating yet\n", dying->factory_id);
+        return 0;
     }
 
     /* C0/C1: fresh keys. */

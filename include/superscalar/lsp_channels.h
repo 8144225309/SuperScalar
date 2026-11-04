@@ -720,6 +720,11 @@ int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    announced that it can rotate by a co-signed close. */
 int lsp_rotation_cin_eligible(const lsp_channel_mgr_t *mgr, const lsp_t *lsp);
 
+/* 1 if no channel (IN_SET[c] nonzero, or every channel if IN_SET is NULL) has
+   an HTLC in flight.  A rotation waits for this: the replacement carries the
+   old balances, so nothing may be pending on either side. */
+int lsp_rotation_channels_quiet(const lsp_channel_mgr_t *mgr, const unsigned char *in_set);
+
 /* 1 if the marker is a close into a new factory of DYING_FUNDING_TXID32
    (internal order) that is not yet fully signed (phases up to
    CIN_CLOSE_SIGNING). */

@@ -1175,6 +1175,7 @@ extern int test_cin_channel_amounts_exact(void);
 extern int test_cin_client_ambiguous_proposal(void);
 extern int test_cin_client_chain_view(void);
 extern int test_cin_client_chain_view_pruned(void);
+extern int test_cin_htlc_quiescence(void);
 extern int test_cin_records(void);
 extern int test_cin_tree_bind_record(void);
 extern int test_cin_json_strict(void);
@@ -3211,6 +3212,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cin_client_ambiguous_proposal);
     RUN_TEST(test_cin_client_chain_view);
     RUN_TEST(test_cin_client_chain_view_pruned);
+    RUN_TEST(test_cin_htlc_quiescence);
     RUN_TEST(test_cin_records);
     RUN_TEST(test_cin_tree_bind_record);
     RUN_TEST(test_cin_json_strict);

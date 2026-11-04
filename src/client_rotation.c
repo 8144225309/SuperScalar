@@ -319,8 +319,21 @@ static int root_secret(secp256k1_context *ctx, unsigned char out[32]) {
     return id && secp256k1_keypair_sec(ctx, out, id);
 }
 
+int client_cin_channel_quiet(const channel_t *ch) {
+    if (!ch) return 0;
+    for (size_t h = 0; h < ch->n_htlcs; h++)
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) return 0;
+    return 1;
+}
+
 int client_cin_on_begin(int fd, secp256k1_context *ctx, persist_t *db,
-                        const factory_t *old_f, const cJSON *begin) {
+                        const factory_t *old_f, const channel_t *old_ch,
+                        const cJSON *begin) {
+    if (!client_cin_channel_quiet(old_ch)) {
+        fprintf(stderr, "Client: refusing the rotation: an HTLC is in flight on our "
+                "channel\n");
+        return 0;
+    }
     if (!db || !old_f || !begin || !client_cin_capable()) {
         fprintf(stderr, "Client: close-into-new rotation needs --db, a pinned --lsp-pubkey "
                 "and a chain source; refusing\n");
@@ -554,6 +567,11 @@ static int cin_sign_guard(void *arg, factory_t *f, int phase) {
 int client_cin_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db_path,
                    const secp256k1_keypair *old_kp, factory_t *old_f, channel_t *old_ch,
                    uint32_t my_index, const wire_msg_t *propose) {
+    if (old_ch && !client_cin_channel_quiet(old_ch)) {
+        fprintf(stderr, "Client: REFUSING the rotation: an HTLC is in flight on our "
+                "channel\n");
+        return 0;
+    }
     if (!db || !db_path || !old_kp || !old_f || !old_ch || !propose || my_index < 1 ||
         !client_cin_capable() || !g_cin_rt) {
         fprintf(stderr, "Client: close-into-new rotation needs --db, a pinned --lsp-pubkey "

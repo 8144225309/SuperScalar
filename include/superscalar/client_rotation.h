@@ -75,8 +75,13 @@ int client_cin_bind_tree(persist_t *db, const char *close_txid, const factory_t 
    retry of the same old factory, reuse) the replacement's factory key and
    answer MSG_ROTATION_KEY.  Needs DB and the identity keypair / LSP context
    set in client.h.  Returns 1 if the key was sent. */
+/* 1 if the old channel has no HTLC in flight (a rotation is refused
+   otherwise: the replacement carries the old balances). */
+int client_cin_channel_quiet(const channel_t *ch);
+
 int client_cin_on_begin(int fd, secp256k1_context *ctx, persist_t *db,
-                        const factory_t *old_f, const cJSON *begin);
+                        const factory_t *old_f, const channel_t *old_ch,
+                        const cJSON *begin);
 
 /* MSG_FACTORY_PROPOSE carrying "rotation": {"mode":"close_into_new"}.  Runs
    the whole client side up to MSG_ROTATION_DONE.  OLD_KP is the old

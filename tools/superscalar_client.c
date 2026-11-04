@@ -1603,7 +1603,7 @@ handle_message:
                 cJSON *mj = cJSON_GetObjectItem(msg.json, "mode");
                 if (vj && cJSON_IsNumber(vj) && vj->valuedouble >= 1 && mj &&
                     cJSON_IsString(mj) && strcmp(mj->valuestring, "close_into_new") == 0) {
-                    if (!client_cin_on_begin(fd, ctx, cbd ? cbd->db : NULL, factory,
+                    if (!client_cin_on_begin(fd, ctx, cbd ? cbd->db : NULL, factory, ch,
                                              msg.json)) {
                         cJSON *e = wire_build_error("rotation refused");
                         wire_send(fd, MSG_ERROR, e);
