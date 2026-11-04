@@ -5120,3 +5120,11 @@ void factory_detach_txbufs(factory_t *f) {
         f->leaf_node_indices = li;
     }
 }
+
+int factory_funding_spk_for(const secp256k1_context *ctx, const secp256k1_pubkey *pubkeys,
+                            size_t n, unsigned char spk_out34[34]) {
+    if (!ctx || !pubkeys || n == 0 || !spk_out34) return 0;
+    musig_keyagg_t ka;
+    secp256k1_xonly_pubkey tw;
+    return build_musig_p2tr_spk(ctx, spk_out34, &tw, NULL, &ka, pubkeys, n, NULL);
+}

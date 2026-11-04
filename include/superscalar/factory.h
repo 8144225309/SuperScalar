@@ -1241,4 +1241,9 @@ size_t factory_compute_distribution_outputs_balanced(
     const uint64_t *client_amounts,
     size_t n_client_amounts);
 
+/* The key-path-only P2TR funding SPK of a factory over PUBKEYS (slot order,
+   LSP first): MuSig2 key aggregation, then the BIP-86 tweak. */
+int factory_funding_spk_for(const secp256k1_context *ctx, const secp256k1_pubkey *pubkeys,
+                            size_t n, unsigned char spk_out34[34]);
+
 #endif /* SUPERSCALAR_FACTORY_H */

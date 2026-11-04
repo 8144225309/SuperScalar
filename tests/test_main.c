@@ -1160,6 +1160,12 @@ extern int test_lsp_identity_slot_match(void);
 extern int test_lsp_reconnect_matches_identity(void);
 extern int test_lsp_identity_recovery_fill_and_save(void);
 extern int test_lsp_hello_duplicate_keys(void);
+/* Rotation by a co-signed close into the new factory */
+extern int test_cin_records(void);
+extern int test_cin_tree_bind_record(void);
+extern int test_cin_json_strict(void);
+extern int test_cin_wire_roundtrip(void);
+extern int test_cin_reserve_next_key(void);
 extern int test_tx_txid_from_bytes(void);
 extern int test_ladder_distribution_tx_signed_only(void);
 extern int test_regtest_ladder_lifecycle(void);
@@ -3176,6 +3182,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_reconnect_matches_identity);
     RUN_TEST(test_lsp_identity_recovery_fill_and_save);
     RUN_TEST(test_lsp_hello_duplicate_keys);
+    RUN_TEST(test_cin_records);
+    RUN_TEST(test_cin_tree_bind_record);
+    RUN_TEST(test_cin_json_strict);
+    RUN_TEST(test_cin_wire_roundtrip);
+    RUN_TEST(test_cin_reserve_next_key);
     RUN_TEST(test_tx_txid_from_bytes);
     RUN_TEST(test_ladder_distribution_tx_signed_only);
 

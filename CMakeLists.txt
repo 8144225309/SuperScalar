@@ -291,6 +291,7 @@ add_executable(test_superscalar
     tests/test_rotation_creation.c
     tests/test_rotation_resume.c
     tests/test_factory_keys.c
+    tests/test_rotation_cin.c
     tests/test_wire.c
     tests/test_channels.c
     tests/spend_helpers.c

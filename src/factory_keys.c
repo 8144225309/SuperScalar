@@ -439,3 +439,52 @@ int factory_key_descriptor(const unsigned char seckey32[32], int mainnet, int ra
     secure_zero(body, sizeof(body));
     return ok;
 }
+
+int factory_key_reserve_next(persist_t *db, const secp256k1_context *ctx,
+                             const unsigned char root_seckey32[32],
+                             const unsigned char *pinned_ctx33,
+                             unsigned char out_seckey32[32], uint32_t *out_index) {
+    if (!db || !ctx || !root_seckey32 || !out_seckey32) return 0;
+    if (!pinned_ctx33 || factory_key_ctx_is_zero(pinned_ctx33)) {
+        fprintf(stderr, "factory key: a new factory key needs the LSP's key pinned "
+                "(--lsp-pubkey)\n");
+        return 0;
+    }
+    int own = !persist_in_transaction(db);
+    if (own && !persist_begin(db)) return 0;
+    uint64_t next = 0;
+    unsigned char pk[33];
+    if (!fk_next_index(db, &next) || next > UINT32_MAX) goto fail;
+    uint32_t idx = (uint32_t)next;
+    while (!factory_key_derive_pubkey(ctx, pk, root_seckey32, pinned_ctx33, idx)) {
+        if (idx == UINT32_MAX) goto fail;
+        idx++;
+    }
+    if (!persist_factory_key_save(db, idx, pinned_ctx33, pk, -1, FACTORY_KEY_STATE_RESERVED) ||
+        !persist_save_counter(db, FACTORY_KEY_COUNTER, (uint64_t)idx + 1) ||
+        !factory_key_derive(ctx, out_seckey32, root_seckey32, pinned_ctx33, idx))
+        goto fail;
+    if (own && !persist_commit(db)) {
+        secure_zero(out_seckey32, 32);
+        return 0;
+    }
+    if (out_index) *out_index = idx;
+    return 1;
+fail:
+    if (own) persist_rollback(db);
+    secure_zero(out_seckey32, 32);
+    return 0;
+}
+
+int factory_key_derive_stored(persist_t *db, const secp256k1_context *ctx,
+                              const unsigned char root_seckey32[32], uint32_t index,
+                              unsigned char out_seckey32[32]) {
+    if (!db || !ctx || !root_seckey32 || !out_seckey32) return 0;
+    unsigned char rctx[33], rpk[33], pk[33];
+    char state[16];
+    if (persist_factory_key_get_row(db, index, rctx, rpk, state) != 1) return 0;
+    if (!factory_key_derive_pubkey(ctx, pk, root_seckey32, rctx, index) ||
+        memcmp(pk, rpk, 33) != 0)
+        return 0;
+    return factory_key_derive(ctx, out_seckey32, root_seckey32, rctx, index);
+}

@@ -3405,3 +3405,95 @@ int wire_parse_rotate(const cJSON *json, uint8_t *out_mode) {
     if (m && cJSON_IsNumber(m)) *out_mode = (uint8_t)m->valueint;
     return 1;
 }
+
+/* --- Close-into-new rotation (MSG_ROTATION_KEY / MSG_ROTATION_DONE) --- */
+
+cJSON *wire_build_rotation_key(const secp256k1_context *ctx, const secp256k1_pubkey *pk,
+                               const unsigned char dying_txid32[32]) {
+    if (!ctx || !pk || !dying_txid32) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    char hex[67];
+    pubkey_to_hex(ctx, pk, hex);
+    cJSON_AddStringToObject(j, "pubkey", hex);
+    wire_json_add_hex(j, "dying_txid", dying_txid32, 32);
+    return j;
+}
+
+int wire_parse_rotation_key(const cJSON *j, const secp256k1_context *ctx,
+                            secp256k1_pubkey *pk_out, unsigned char dying_txid32[32]) {
+    if (!j || !ctx || !pk_out || !dying_txid32) return 0;
+    unsigned char buf[33];
+    if (wire_json_get_hex(j, "pubkey", buf, 33) != 33 ||
+        !secp256k1_ec_pubkey_parse(ctx, pk_out, buf, 33))
+        return 0;
+    return wire_json_get_hex(j, "dying_txid", dying_txid32, 32) == 32;
+}
+
+cJSON *wire_build_rotation_done(const char *close_txid_hex, const char *close_hex,
+                                int confirmed) {
+    if (!close_txid_hex) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "close_txid", close_txid_hex);
+    if (close_hex && close_hex[0]) cJSON_AddStringToObject(j, "close_hex", close_hex);
+    cJSON_AddBoolToObject(j, "confirmed", confirmed ? 1 : 0);
+    return j;
+}
+
+int wire_parse_rotation_done(const cJSON *j, char close_txid_out[65], char **close_hex_out,
+                             int *confirmed_out) {
+    if (!j || !close_txid_out) return 0;
+    const cJSON *t = cJSON_GetObjectItemCaseSensitive(j, "close_txid");
+    if (!cJSON_IsString(t) || !t->valuestring || strlen(t->valuestring) != 64) return 0;
+    snprintf(close_txid_out, 65, "%s", t->valuestring);
+    if (close_hex_out) {
+        *close_hex_out = NULL;
+        const cJSON *h = cJSON_GetObjectItemCaseSensitive(j, "close_hex");
+        if (cJSON_IsString(h) && h->valuestring) {
+            *close_hex_out = strdup(h->valuestring);
+            if (!*close_hex_out) return 0;
+        }
+    }
+    if (confirmed_out) {
+        const cJSON *c = cJSON_GetObjectItemCaseSensitive(j, "confirmed");
+        *confirmed_out = cJSON_IsTrue(c) ? 1 : 0;
+    }
+    return 1;
+}
+
+static int wire_key_eq_nocase(const char *a, const char *b) {
+    for (;; a++, b++) {
+        unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+        if (ca == 0) return 1;
+    }
+}
+
+int wire_json_unambiguous(const cJSON *j) {
+    if (!j) return 1;
+    for (const cJSON *c = j->child; c; c = c->next) {
+        if (cJSON_IsObject(j) && c->string) {
+            for (const cJSON *d = c->next; d; d = d->next)
+                if (d->string && wire_key_eq_nocase(c->string, d->string))
+                    return 0;
+        }
+        if ((cJSON_IsObject(c) || cJSON_IsArray(c)) && !wire_json_unambiguous(c))
+            return 0;
+    }
+    return 1;
+}
+
+int wire_json_get_uint(const cJSON *obj, const char *key, uint64_t max, uint64_t *out) {
+    if (!obj || !key || !out) return 0;
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsNumber(v)) return 0;
+    double d = v->valuedouble;
+    const double lim = 9007199254740992.0;   /* 2^53 */
+    if (max > (uint64_t)lim) max = (uint64_t)lim;
+    if (!(d >= 0.0) || d > (double)max) return 0;
+    uint64_t u = (uint64_t)d;
+    if ((double)u != d) return 0;
+    *out = u;
+    return 1;
+}
