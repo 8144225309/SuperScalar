@@ -2,6 +2,7 @@
    balance carry, the close check a client runs before signing, the resume
    and resolve decisions, the records, and the wire messages. */
 #include "superscalar/lsp_channels.h"
+#include "superscalar/client_rotation.h"
 #include "superscalar/factory_keys.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
@@ -13,6 +14,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include "superscalar/client.h"
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern void reverse_bytes(unsigned char *data, size_t len);
@@ -208,6 +212,457 @@ int test_cin_carry(void) {
                 "smaller: LSP pays the difference");
     TEST_ASSERT(!lsp_rotation_cin_carry(100, 5038, 5000, 0, &l, &c), "client balance must fit");
     TEST_ASSERT(!lsp_rotation_cin_carry(100, 5000, 5050, 100, &l, &c), "LSP side above reserve");
+    return 1;
+}
+
+int test_cin_client_resolve_action(void) {
+    TEST_ASSERT(client_cin_resolve_action("key_sent", -1, 0) == CLIENT_CIN_NONE, "key_sent");
+    TEST_ASSERT(client_cin_resolve_action("verified", 5, 1) == CLIENT_CIN_NONE,
+                "a stored replacement is kept");
+    TEST_ASSERT(client_cin_resolve_action("close_signed", 0, 0) == CLIENT_CIN_WAIT, "wait");
+    TEST_ASSERT(client_cin_resolve_action("close_signed", -1, 1) == CLIENT_CIN_BROADCAST,
+                "broadcast the held close");
+    TEST_ASSERT(client_cin_resolve_action("close_signed", 1, 0) == CLIENT_CIN_PROMOTE,
+                "confirmed on chain: promote");
+    TEST_ASSERT(client_cin_resolve_action("closed", -1, 0) == CLIENT_CIN_WAIT,
+                "the LSP's word alone does not switch");
+    TEST_ASSERT(client_cin_resolve_action("closed", 1, 0) == CLIENT_CIN_PROMOTE,
+                "confirmed on our chain source: promote");
+    TEST_ASSERT(client_cin_resolve_action("done", 9, 1) == CLIENT_CIN_NONE, "done");
+    return 1;
+}
+
+static factory_t *old_factory(secp256k1_pubkey *pks) {
+    for (int i = 0; i < 3; i++) if (!mk_pk(&pks[i], (unsigned char)(0x40 + i))) return NULL;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return NULL;
+    factory_init_from_pubkeys(f, cin_ctx(), pks, 3, 10, 4);
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x07, 32);
+    if (!factory_funding_spk_for(cin_ctx(), pks, 3, spk)) return NULL;
+    factory_set_funding(f, txid, 1, 100000, spk, 34);
+    return f;
+}
+
+/* What a client checks before signing anything in a close into the new
+   factory. */
+int test_cin_client_check_close(void) {
+    secp256k1_context *ctx = cin_ctx();
+    secp256k1_pubkey opk[3], npk[3];
+    factory_t *f = old_factory(opk);
+    TEST_ASSERT(f, "old factory");
+    npk[0] = opk[0];                                  /* same LSP */
+    TEST_ASSERT(mk_pk(&npk[1], 0x51) && mk_pk(&npk[2], 0x52), "fresh keys");
+    unsigned char spk[34];
+    TEST_ASSERT(factory_funding_spk_for(ctx, npk, 3, spk), "new spk");
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.amount_sats = 99800;
+    memcpy(out.script_pubkey, spk, 34);
+    out.script_pubkey_len = 34;
+    tx_buf_t tx;
+    tx_buf_init(&tx, 256);
+    unsigned char sighash[32], txid[32];
+    TEST_ASSERT(factory_build_cooperative_close_unsigned(f, &tx, sighash, &out, 1, 500) &&
+                tx_txid_from_bytes(tx.data, tx.len, txid), "close");
+    tx_buf_free(&tx);
+    const char *why = NULL;
+    TEST_ASSERT(client_cin_check_close(ctx, f, npk, 3, spk, 34, 99800, 0, txid, 500, &why),
+                "the real close passes");
+    TEST_ASSERT(!client_cin_check_close(ctx, f, npk, 3, spk, 34, 99800, 0, txid, 501, &why),
+                "another height: another txid");
+    TEST_ASSERT(!client_cin_check_close(ctx, f, npk, 3, spk, 34, 99800, 1, txid, 500, &why),
+                "funding must be output 0");
+    TEST_ASSERT(!client_cin_check_close(ctx, f, npk, 3, spk, 34, 90000, 0, txid, 500, &why) &&
+                strstr(why, "fee"), "fee above 2 percent refused");
+    unsigned char wrong[34];
+    memcpy(wrong, spk, 34);
+    wrong[10] ^= 1;
+    TEST_ASSERT(!client_cin_check_close(ctx, f, npk, 3, wrong, 34, 99800, 0, txid, 500, &why),
+                "funding must be the participants' key");
+    secp256k1_pubkey reuse[3] = { opk[0], npk[1], opk[2] };
+    TEST_ASSERT(!client_cin_check_close(ctx, f, reuse, 3, spk, 34, 99800, 0, txid, 500, &why) &&
+                strstr(why, "reused"), "old key reuse refused");
+    secp256k1_pubkey nolsp[3] = { npk[1], npk[2], npk[1] };
+    TEST_ASSERT(!client_cin_check_close(ctx, f, nolsp, 3, spk, 34, 99800, 0, txid, 500, &why),
+                "slot 0 must be the LSP");
+    factory_free(f);
+    free(f);
+    return 1;
+}
+
+static int tmp_db(char *path, persist_t *db) {
+    int fd = mkstemp(path);
+    if (fd < 0) return 0;
+    close(fd);
+    unlink(path);
+    return persist_open(db, path);
+}
+
+static void touch(const char *p) {
+    FILE *f = fopen(p, "w");
+    if (f) { fputs("x", f); fclose(f); }
+}
+
+/* A malicious LSP reports the close confirmed (and sends a bogus close):
+   without its own confirmation the client neither switches nor stops
+   guarding the old factory, and keeps it frozen. */
+int test_cin_client_no_switch_on_lsp_word(void) {
+    char path[] = "/tmp/ss_cin_lw_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    char side[64], pre[64];
+    snprintf(side, sizeof(side), "%s.rotation", path);
+    snprintf(pre, sizeof(pre), "%s.pre-rotation", path);
+    touch(side);
+    const char *x = "3333333333333333333333333333333333333333333333333333333333333333";
+    persist_client_rotation_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.old_txid, sizeof(r.old_txid), "%s", "4444444444444444444444444444444444444444444444444444444444444444");
+    snprintf(r.close_txid, sizeof(r.close_txid), "%s", x);
+    snprintf(r.state, sizeof(r.state), "close_signed");
+    snprintf(r.side_db, sizeof(r.side_db), "%s", side);
+    TEST_ASSERT(persist_client_rotation_save(&db, &r), "row");
+    cJSON *done = cJSON_CreateObject();
+    cJSON_AddStringToObject(done, "close_txid", x);
+    cJSON_AddStringToObject(done, "close_hex", "0200000000010000000000");
+    cJSON_AddBoolToObject(done, "confirmed", 1);
+    TEST_ASSERT(client_cin_on_rotation_done(&db, done) == 1, "matches the pending close");
+    cJSON_Delete(done);
+    persist_client_rotation_t b;
+    memset(&b, 0, sizeof(b));
+    TEST_ASSERT(persist_client_rotation_load_open(&db, &b) == 1 && b.close_hex == NULL &&
+                strcmp(b.state, "close_signed") == 0,
+                "a close whose txid is not the close is not kept; the state stays");
+    free(b.close_hex);
+    TEST_ASSERT(client_cin_resolve(&db, path, NULL) == 0, "no switch on the LSP's word");
+    TEST_ASSERT(access(pre, F_OK) != 0 && access(side, F_OK) == 0, "both DBs untouched");
+    TEST_ASSERT(client_cin_frozen(), "the old channel is frozen");
+
+    client_cin_set_capable(0);
+    cJSON *rc = cJSON_CreateObject();
+    client_cin_reconnect_fields(&db, rc);
+    TEST_ASSERT(!cJSON_GetObjectItemCaseSensitive(rc, "rotation_v") &&
+                cJSON_GetObjectItemCaseSensitive(rc, "rotation_pending"),
+                "no rotation_v without a chain source; the pending close is reported");
+    cJSON_Delete(rc);
+    client_cin_set_capable(1);
+    rc = cJSON_CreateObject();
+    client_cin_reconnect_fields(&db, rc);
+    TEST_ASSERT(cJSON_GetObjectItemCaseSensitive(rc, "rotation_v"), "able: rotation_v");
+    cJSON_Delete(rc);
+    client_cin_set_capable(0);
+    client_cin_refresh_frozen(NULL);
+    persist_close(&db);
+    unlink(side);
+    unlink(path);
+    return 1;
+}
+
+static factory_t *repl_factory(const secp256k1_pubkey *pks, uint64_t fee_per_tx) {
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return NULL;
+    factory_init_from_pubkeys(f, cin_ctx(), pks, 3, 10, 4);
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x09, 32);
+    if (!factory_funding_spk_for(cin_ctx(), pks, 3, spk)) return NULL;
+    factory_set_funding(f, txid, 0, 100000, spk, 34);
+    f->cltv_timeout = 2000;
+    f->fee_per_tx = fee_per_tx;
+    if (!factory_build_tree(f)) { factory_free(f); free(f); return NULL; }
+    return f;
+}
+
+/* A malicious LSP gets a second, different tree signed over the same close:
+   the client signs only the first tree over each close, and a stored
+   replacement is never dropped while the old factory is unresolved. */
+int test_cin_client_one_tree_per_close(void) {
+    char path[] = "/tmp/ss_cin_ot_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    char side[64];
+    snprintf(side, sizeof(side), "%s.rotation", path);
+    touch(side);
+    persist_client_rotation_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.old_txid, sizeof(r.old_txid), "%s", "5555555555555555555555555555555555555555555555555555555555555555");
+    snprintf(r.close_txid, sizeof(r.close_txid), "%s", "6666666666666666666666666666666666666666666666666666666666666666");
+    snprintf(r.state, sizeof(r.state), "verified");
+    snprintf(r.side_db, sizeof(r.side_db), "%s", side);
+    TEST_ASSERT(persist_client_rotation_save(&db, &r), "row");
+    (void)client_cin_resolve(&db, path, NULL);
+    persist_client_rotation_t b;
+    memset(&b, 0, sizeof(b));
+    TEST_ASSERT(access(side, F_OK) == 0, "the replacement of a signed tree is kept");
+    TEST_ASSERT(persist_client_rotation_load_open(&db, &b) == 1 &&
+                strcmp(b.state, "verified") == 0 && strcmp(b.side_db, side) == 0,
+                "the row still points at it");
+    free(b.close_hex);
+
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++) TEST_ASSERT(mk_pk(&pks[i], (unsigned char)(0x70 + i)), "pk");
+    factory_t *t1 = repl_factory(pks, 200), *t2 = repl_factory(pks, 300);
+    TEST_ASSERT(t1 && t2, "two trees over the same funding");
+    char d1[65], d2[65];
+    TEST_ASSERT(client_cin_tree_digest(t1, d1) && client_cin_tree_digest(t2, d2) &&
+                strcmp(d1, d2) != 0, "the trees differ");
+    const char *x = r.close_txid;
+    TEST_ASSERT(client_cin_bind_tree(&db, x, t1), "the first tree over the close");
+    TEST_ASSERT(client_cin_bind_tree(&db, x, t1), "the same tree again (a re-run)");
+    TEST_ASSERT(!client_cin_bind_tree(&db, x, t2), "a different tree over the same close");
+    factory_free(t1); free(t1);
+    factory_free(t2); free(t2);
+    persist_close(&db);
+    unlink(side);
+    unlink(path);
+    return 1;
+}
+
+/* After its close signature is out the client's old channel takes no
+   payment and no other rotation; the close may not be dated in the future. */
+int test_cin_client_freeze(void) {
+    TEST_ASSERT(client_cin_check_close_height(100, 99), "at the tip + 1");
+    TEST_ASSERT(!client_cin_check_close_height(101, 99), "a future locktime is refused");
+    TEST_ASSERT(!client_cin_check_close_height(5, -1), "no tip: refused");
+    char path[] = "/tmp/ss_cin_fz_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    persist_client_rotation_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.old_txid, sizeof(r.old_txid), "%s", "7777777777777777777777777777777777777777777777777777777777777777");
+    snprintf(r.state, sizeof(r.state), "verified");
+    TEST_ASSERT(persist_client_rotation_save(&db, &r), "row");
+    client_cin_refresh_frozen(&db);
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = MSG_UPDATE_ADD_HTLC;
+    m.json = cJSON_CreateObject();
+    unsigned char oldf[32], otherf[32];
+    memset(oldf, 0x77, 32);
+    memset(otherf, 0x78, 32);
+    TEST_ASSERT(!client_cin_frozen() && !client_cin_refuse_while_frozen(&m, oldf),
+                "nothing signed: the channel is live");
+    snprintf(r.state, sizeof(r.state), "close_signed");
+    TEST_ASSERT(persist_client_rotation_save(&db, &r), "row");
+    client_cin_refresh_frozen(&db);
+    TEST_ASSERT(client_cin_frozen() && client_cin_refuse_while_frozen(&m, oldf),
+                "signed: an incoming payment is refused");
+    TEST_ASSERT(!client_cin_frozen_for(otherf) && !client_cin_refuse_while_frozen(&m, otherf),
+                "another factory is not frozen");
+    m.msg_type = MSG_PTLC_PRESIG;
+    TEST_ASSERT(client_cin_refuse_while_frozen(&m, oldf), "and a key turnover");
+    m.msg_type = MSG_FACTORY_PROPOSE;
+    TEST_ASSERT(client_cin_refuse_while_frozen(&m, oldf), "and another rotation");
+    cJSON *rot = cJSON_AddObjectToObject(m.json, "rotation");
+    cJSON_AddStringToObject(rot, "mode", "close_into_new");
+    TEST_ASSERT(!client_cin_refuse_while_frozen(&m, oldf), "the same close may be re-run");
+    m.msg_type = MSG_ROTATION_BEGIN;
+    TEST_ASSERT(client_cin_refuse_while_frozen(&m, oldf), "a legacy rotation begin");
+    cJSON_AddStringToObject(m.json, "mode", "close_into_new");
+    TEST_ASSERT(!client_cin_refuse_while_frozen(&m, oldf), "the close-into-new begin");
+    cJSON_Delete(m.json);
+    client_cin_refresh_frozen(NULL);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* A malicious LSP's CHANNEL_READY balances that overrun the leaf output (or
+   leave out the commitment fee) give a commitment that cannot be mined. */
+int test_cin_channel_amounts_exact(void) {
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.funding_amount = 24214;
+    ch.fee_rate_sat_per_kvb = 1000;
+    ch.local_amount = 19022;
+    ch.remote_amount = 5038;
+    TEST_ASSERT(client_channel_amounts_exact(&ch), "balances + 154 sat fee = funding");
+    ch.local_amount = 19023;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch), "outputs above the leaf");
+    ch.local_amount = 19021;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch), "not exact");
+    ch.fee_rate_sat_per_kvb = 2000;
+    ch.local_amount = 19022 - 154;
+    TEST_ASSERT(client_channel_amounts_exact(&ch), "the fee follows the rate");
+    ch.n_htlcs = 1;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch), "no HTLC on a new channel");
+    ch.n_htlcs = 0;
+    ch.local_amount = UINT64_MAX - 3;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch), "no overflow");
+    ch.fee_rate_sat_per_kvb = 0;
+    ch.local_amount = 24214 - 5038;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch),
+                "rate 0: a commitment with no fee and no anchor is refused");
+    ch.fee_rate_sat_per_kvb = 999;
+    ch.local_amount = 19022;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch), "rate 999: no anchor, refused");
+    ch.fee_rate_sat_per_kvb = CHANNEL_COMMIT_FEE_RATE_MAX + 1;
+    ch.local_amount = 24214 - 5038 - (((uint64_t)CHANNEL_COMMIT_FEE_RATE_MAX + 1) * 154 + 999) / 1000;
+    TEST_ASSERT(!client_channel_amounts_exact(&ch), "above the cap, refused");
+    return 1;
+}
+
+/* A malicious LSP's proposal with case-variant funding keys: the client
+   never builds (or signs) a tree over a funding other than the checked one. */
+int test_cin_client_ambiguous_proposal(void) {
+    secp256k1_context *ctx = cin_ctx();
+    secp256k1_pubkey pks[3];
+    unsigned char sec[32];
+    memset(sec, 0x71, 32);
+    secp256k1_keypair kp;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &kp, sec), "kp");
+    TEST_ASSERT(mk_pk(&pks[0], 0x70) && mk_pk(&pks[1], 0x71) && mk_pk(&pks[2], 0x72), "pks");
+    unsigned char spk[34], txid[32];
+    TEST_ASSERT(factory_funding_spk_for(ctx, pks, 3, spk), "spk");
+    memset(txid, 0x09, 32);
+    char spk_hex[69], txid_hex[65];
+    hex_encode(spk, 34, spk_hex);
+    unsigned char rev[32];
+    memcpy(rev, txid, 32);
+    reverse_bytes(rev, 32);
+    hex_encode(rev, 32, txid_hex);
+    char js[1024];
+    snprintf(js, sizeof(js),
+             "{\"FUNDING_AMOUNT\":150000,\"Funding_Vout\":1,\"funding_amount\":200000,"
+             "\"funding_vout\":0,\"funding_txid\":\"%s\",\"funding_spk\":\"%s\","
+             "\"step_blocks\":10,\"states_per_layer\":4,\"cltv_timeout\":2000,"
+             "\"fee_per_tx\":200}", txid_hex, spk_hex);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    shutdown(sv[1], SHUT_WR);
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = MSG_FACTORY_PROPOSE;
+    m.json = cJSON_Parse(js);
+    factory_t *nf = calloc(1, sizeof(factory_t));
+    channel_t *nc = calloc(1, sizeof(channel_t));
+    TEST_ASSERT(m.json && nf && nc, "setup");
+    int r = client_do_factory_rotation(sv[0], ctx, &kp, 1, 3, pks, nf, nc, &m);
+    TEST_ASSERT(r == 0, "refused");
+    TEST_ASSERT(nf->funding_vout != 1 && nf->funding_amount_sats != 150000,
+                "no tree over the case-variant funding");
+    factory_free(nf);
+    cJSON_Delete(m.json);
+
+    /* A lying proposal with a bound funding: the tree is built over the
+       checked funding, whatever the proposal says. */
+    snprintf(js, sizeof(js),
+             "{\"funding_amount\":150000,\"funding_vout\":1,\"funding_txid\":\"%s\","
+             "\"funding_spk\":\"%s\",\"step_blocks\":10,\"states_per_layer\":4,"
+             "\"cltv_timeout\":2000,\"fee_per_tx\":200}", txid_hex, spk_hex);
+    m.json = cJSON_Parse(js);
+    client_funding_bind_t bind;
+    memset(&bind, 0, sizeof(bind));
+    memcpy(bind.txid, txid, 32);
+    bind.vout = 0;
+    bind.amount = 200000;
+    memcpy(bind.spk, spk, 34);
+    memset(nf, 0, sizeof(*nf));
+    r = client_do_factory_rotation_bound(sv[0], ctx, &kp, 1, 3, pks, nf, nc, &m, &bind);
+    TEST_ASSERT(r == 0, "no LSP on the other end");
+    TEST_ASSERT(nf->funding_vout == 0 && nf->funding_amount_sats == 200000 &&
+                memcmp(nf->funding_txid, txid, 32) == 0, "built over the checked funding");
+    factory_free(nf);
+    free(nf);
+    free(nc);
+    cJSON_Delete(m.json);
+    close(sv[0]);
+    close(sv[1]);
+    return 1;
+}
+
+/* A stand-in bitcoin-cli: block hashes are the height in hex, one block
+   (SS_FAKE_HEIGHT) holds SS_FAKE_BLOCK, gettxout answers SS_FAKE_TXOUT for
+   SS_FAKE_TXOUT_FOR and "spent" otherwise; no wallet, no txindex. */
+static int fake_cli(char *path) {
+    int fd = mkstemp(path);
+    if (fd < 0) return 0;
+    const char *sh =
+        "#!/bin/sh\n"
+        "set -- $(for a in \"$@\"; do case \"$a\" in -*) ;; *) printf '%s\\n' \"$a\";; esac; done)\n"
+        "m=$1; shift\n"
+        "case \"$m\" in\n"
+        "getblockcount) echo \"$SS_FAKE_TIP\";;\n"
+        "getblockhash) printf '%064x\\n' \"$1\";;\n"
+        "getblock) h=$(echo \"$1\" | tr -d '\"'); n=$((0x$(echo \"$h\" | cut -c57-64)));\n"
+        "  if [ \"$n\" = \"$SS_FAKE_HEIGHT\" ]; then echo \"$SS_FAKE_BLOCK\"; else echo '{\"tx\":[]}'; fi;;\n"
+        "gettxout) if [ -n \"$SS_FAKE_TXOUT_FOR\" ] && echo \"$1\" | grep -q \"$SS_FAKE_TXOUT_FOR\"; then echo \"$SS_FAKE_TXOUT\"; else echo null; fi;;\n"
+        "*) exit 1;;\n"
+        "esac\n";
+    int ok = write(fd, sh, strlen(sh)) == (ssize_t)strlen(sh);
+    close(fd);
+    return ok && chmod(path, 0700) == 0;
+}
+
+/* The client finds its close (or another spend of the old funding) however
+   long it was away, without txindex: a close mined 110 blocks ago whose
+   output is spent too, the close's output still unspent, and the old funding
+   taken by another transaction (the rotation ends and the freeze lifts). */
+int test_cin_client_chain_view(void) {
+    char cli[] = "/tmp/ss_cin_cli_XXXXXX";
+    TEST_ASSERT(fake_cli(cli), "fake cli");
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    snprintf(rt.cli_path, sizeof(rt.cli_path), "%s", cli);
+    snprintf(rt.network, sizeof(rt.network), "regtest");
+    const char *old = "9999999999999999999999999999999999999999999999999999999999999999";
+    const char *x = "aaaa999999999999999999999999999999999999999999999999999999999999";
+    persist_client_rotation_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.old_txid, sizeof(r.old_txid), "%s", old);
+    r.old_vout = 1;
+    snprintf(r.close_txid, sizeof(r.close_txid), "%s", x);
+    snprintf(r.state, sizeof(r.state), "close_signed");
+    r.close_height = 5;
+    char blk[512];
+    snprintf(blk, sizeof(blk), "{\"tx\":[{\"txid\":\"%s\",\"vin\":[{\"txid\":\"%s\",\"vout\":1}]}]}",
+             x, old);
+    setenv("SS_FAKE_TIP", "120", 1);
+    setenv("SS_FAKE_HEIGHT", "10", 1);
+    setenv("SS_FAKE_BLOCK", blk, 1);
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    int cc = -1, oc = -1;
+    client_cin_chain_view(&rt, &r, &cc, &oc);
+    TEST_ASSERT(cc == 111 && oc == -1, "a close 110 blocks deep (its output spent) is found");
+
+    setenv("SS_FAKE_TXOUT_FOR", x, 1);
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 50}", 1);
+    setenv("SS_FAKE_HEIGHT", "0", 1);
+    client_cin_chain_view(&rt, &r, &cc, &oc);
+    TEST_ASSERT(cc == 50, "the close's output in the UTXO set gives its depth");
+    unsetenv("SS_FAKE_TXOUT_FOR");
+
+    char path[] = "/tmp/ss_cin_cv_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    char side[64];
+    snprintf(side, sizeof(side), "%s.rotation", path);
+    touch(side);
+    snprintf(r.side_db, sizeof(r.side_db), "%s", side);
+    TEST_ASSERT(persist_client_rotation_save(&db, &r), "row");
+    snprintf(blk, sizeof(blk), "{\"tx\":[{\"txid\":\"%s\",\"vin\":[{\"txid\":\"%s\",\"vout\":1}]}]}",
+             "bbbb999999999999999999999999999999999999999999999999999999999999", old);
+    setenv("SS_FAKE_BLOCK", blk, 1);
+    setenv("SS_FAKE_HEIGHT", "100", 1);
+    client_cin_refresh_frozen(&db);
+    TEST_ASSERT(client_cin_frozen(), "frozen while the close may confirm");
+    TEST_ASSERT(client_cin_resolve(&db, path, &rt) == 0, "no switch");
+    persist_client_rotation_t b;
+    memset(&b, 0, sizeof(b));
+    TEST_ASSERT(persist_client_rotation_load(&db, old, &b) == 1 &&
+                strcmp(b.state, "abandoned") == 0 && b.close_height == 5,
+                "the old funding spent by another transaction: rotation abandoned");
+    free(b.close_hex);
+    TEST_ASSERT(!client_cin_frozen(), "and the old channel unfrozen");
+    TEST_ASSERT(access(side, F_OK) == 0, "the stored replacement stays on disk");
+    unsetenv("SS_FAKE_TIP");
+    unsetenv("SS_FAKE_HEIGHT");
+    unsetenv("SS_FAKE_BLOCK");
+    unsetenv("SS_FAKE_TXOUT");
+    persist_close(&db);
+    unlink(side);
+    unlink(path);
+    unlink(cli);
     return 1;
 }
 

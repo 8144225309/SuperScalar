@@ -11,6 +11,7 @@
  */
 
 #include "superscalar/client.h"
+#include "superscalar/client_rotation.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/channel.h"
@@ -170,6 +171,7 @@ int client_run_reconnect(secp256k1_context *ctx,
     /* 5. Send MSG_RECONNECT */
     {
         cJSON *reconn = wire_build_reconnect(ctx, &id_pubkey, commitment_number);
+        client_cin_reconnect_fields(db, reconn);
         if (!wire_send(fd, MSG_RECONNECT, reconn)) {
             fprintf(stderr, "Client reconnect: send MSG_RECONNECT failed\n");
             cJSON_Delete(reconn);
@@ -302,7 +304,18 @@ int client_run_reconnect(secp256k1_context *ctx,
     /* Receive LSP's pubnonces */
     {
         wire_msg_t msg;
-        if (!wire_recv(fd, &msg) || msg.msg_type != MSG_CHANNEL_NONCES) {
+        memset(&msg, 0, sizeof(msg));
+        int got_msg = wire_recv(fd, &msg);
+        if (got_msg && msg.msg_type == MSG_ROTATION_DONE) {
+            /* Our signed rotation close is known to the LSP: record it; the
+               caller switches DBs once it is confirmed and reconnects. */
+            (void)client_cin_on_rotation_done(db, msg.json);
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            factory_free(factory); free(factory);
+            return 0;
+        }
+        if (!got_msg || msg.msg_type != MSG_CHANNEL_NONCES) {
             fprintf(stderr, "Client reconnect: expected CHANNEL_NONCES from LSP\n");
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);

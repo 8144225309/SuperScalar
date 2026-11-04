@@ -1,4 +1,5 @@
 #include "superscalar/client.h"
+#include "superscalar/client_rotation.h"
 #include "superscalar/factory_keys.h"
 #include "superscalar/types.h"
 #include "superscalar/wire.h"
@@ -72,6 +73,72 @@ void client_set_factory_keypair(const secp256k1_keypair *factory_kp) {
 
 const secp256k1_keypair *client_factory_keypair(const secp256k1_keypair *identity) {
     return g_factory_kp_set ? &g_factory_kp : identity;
+}
+
+static secp256k1_keypair g_identity_kp;
+static int g_identity_kp_set = 0;
+static unsigned char g_factory_key_ctx[33];
+static int g_factory_key_ctx_set = 0;
+static char *g_last_close_hex = NULL;
+
+void client_set_identity_keypair(const secp256k1_keypair *identity_kp) {
+    if (identity_kp) { g_identity_kp = *identity_kp; g_identity_kp_set = 1; }
+    else { secure_zero(&g_identity_kp, sizeof(g_identity_kp)); g_identity_kp_set = 0; }
+}
+
+const secp256k1_keypair *client_identity_keypair(void) {
+    return g_identity_kp_set ? &g_identity_kp : NULL;
+}
+
+void client_set_factory_key_ctx(const unsigned char *lsp_ctx33) {
+    if (lsp_ctx33) { memcpy(g_factory_key_ctx, lsp_ctx33, 33); g_factory_key_ctx_set = 1; }
+    else { memset(g_factory_key_ctx, 0, 33); g_factory_key_ctx_set = 0; }
+}
+
+const unsigned char *client_factory_key_ctx(void) {
+    return g_factory_key_ctx_set ? g_factory_key_ctx : NULL;
+}
+
+static tx_output_t g_expected_close_out;
+static uint32_t g_expected_close_height = 0;
+static int g_expected_close_set = 0;
+
+void client_set_expected_close(const tx_output_t *output, uint32_t height) {
+    if (output) {
+        g_expected_close_out = *output;
+        g_expected_close_height = height;
+        g_expected_close_set = 1;
+    } else {
+        memset(&g_expected_close_out, 0, sizeof(g_expected_close_out));
+        g_expected_close_set = 0;
+    }
+}
+
+static client_sign_guard_fn g_sign_guard = NULL;
+static void *g_sign_guard_arg = NULL;
+
+void client_set_sign_guard(client_sign_guard_fn fn, void *arg) {
+    g_sign_guard = fn;
+    g_sign_guard_arg = fn ? arg : NULL;
+}
+
+int client_channel_amounts_exact(const channel_t *ch) {
+    if (!ch || ch->n_htlcs != 0) return 0;
+    /* Below the minimum the commitment has no anchor and pays less than
+       1 sat/vB: an exit nobody can get mined. */
+    if (ch->fee_rate_sat_per_kvb < CHANNEL_COMMIT_FEE_RATE_MIN ||
+        ch->fee_rate_sat_per_kvb > CHANNEL_COMMIT_FEE_RATE_MAX)
+        return 0;
+    uint64_t fee = (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+    uint64_t l = ch->local_amount, r = ch->remote_amount;
+    if (l > ch->funding_amount || r > ch->funding_amount - l) return 0;
+    return l + r + fee == ch->funding_amount;
+}
+
+char *client_take_last_close_hex(void) {
+    char *h = g_last_close_hex;
+    g_last_close_hex = NULL;
+    return h;
 }
 
 void client_set_slot_hint(int slot_hint) {
@@ -679,6 +746,18 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     }
     if (!initial_msg) cJSON_Delete(msg.json);
 
+    /* A rotation close: exactly the verified close, or nothing. */
+    if (g_expected_close_set &&
+        (n_outputs != 1 || close_height != g_expected_close_height ||
+         close_outputs[0].amount_sats != g_expected_close_out.amount_sats ||
+         close_outputs[0].script_pubkey_len != g_expected_close_out.script_pubkey_len ||
+         memcmp(close_outputs[0].script_pubkey, g_expected_close_out.script_pubkey,
+                g_expected_close_out.script_pubkey_len) != 0)) {
+        fprintf(stderr, "Client: REFUSING close: it is not the verified rotation close\n");
+        free(close_outputs);
+        return 0;
+    }
+
     /* Verify cooperative close outputs before signing.
        The client must receive at least its channel balance.  If the LSP
        short-changes the close outputs, the client refuses to sign and
@@ -903,6 +982,12 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         tx_buf_free(&close_unsigned);
         return 0;
     }
+    {
+        cJSON *th = done_msg.json ? cJSON_GetObjectItem(done_msg.json, "tx_hex") : NULL;
+        free(g_last_close_hex);
+        g_last_close_hex = (th && cJSON_IsString(th) && th->valuestring)
+                               ? strdup(th->valuestring) : NULL;
+    }
     cJSON_Delete(done_msg.json);
 
     tx_buf_free(&close_unsigned);
@@ -1004,12 +1089,29 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                 factory_t *factory_out,
                                 channel_t *channel_out,
                                 const wire_msg_t *initial_propose) {
+    return client_do_factory_rotation_bound(fd, ctx, keypair, my_index, n_participants,
+                                            all_pubkeys, factory_out, channel_out,
+                                            initial_propose, NULL);
+}
+
+int client_do_factory_rotation_bound(int fd, secp256k1_context *ctx,
+                                     const secp256k1_keypair *keypair,
+                                     uint32_t my_index, size_t n_participants,
+                                     const secp256k1_pubkey *all_pubkeys,
+                                     factory_t *factory_out, channel_t *channel_out,
+                                     const wire_msg_t *initial_propose,
+                                     const client_funding_bind_t *bind) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
     wire_msg_t msg;
 
     /* Parse FACTORY_PROPOSE from initial_propose */
-    const cJSON *pj = initial_propose->json;
+    const cJSON *pj = initial_propose ? initial_propose->json : NULL;
+    if (!pj || !wire_json_unambiguous(pj)) {
+        fprintf(stderr, "Client %u: REFUSING rotation: the proposal has keys that differ "
+                "only in case\n", my_index);
+        return 0;
+    }
     cJSON *fv = cJSON_GetObjectItem(pj, "funding_vout");
     cJSON *fa = cJSON_GetObjectItem(pj, "funding_amount");
     cJSON *sb = cJSON_GetObjectItem(pj, "step_blocks");
@@ -1028,6 +1130,14 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     uint64_t funding_amount = (uint64_t)fa->valuedouble;
     unsigned char funding_spk[34];
     size_t spk_len = (size_t)wire_json_get_hex(pj, "funding_spk", funding_spk, 34);
+    if (bind) {
+        /* The funding the caller checked, not the proposal's (again). */
+        memcpy(funding_txid, bind->txid, 32);
+        funding_vout = bind->vout;
+        funding_amount = bind->amount;
+        memcpy(funding_spk, bind->spk, 34);
+        spk_len = 34;
+    }
     uint16_t step_blocks = (uint16_t)sb->valuedouble;
     uint32_t states_per_layer = (uint32_t)sp->valuedouble;
     uint32_t cltv_timeout = (uint32_t)ct->valuedouble;
@@ -1127,6 +1237,14 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     free(rot_hashes);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
+    if (bind && (memcmp(factory_out->funding_txid, bind->txid, 32) != 0 ||
+                 factory_out->funding_vout != bind->vout ||
+                 factory_out->funding_amount_sats != bind->amount ||
+                 factory_out->funding_spk_len != 34 ||
+                 memcmp(factory_out->funding_spk, bind->spk, 34) != 0)) {
+        fprintf(stderr, "Client %u: REFUSING rotation: funding mismatch\n", my_index);
+        return 0;
+    }
 
     if (!factory_build_tree(factory_out)) {
         printf("Client %u: ROTATION BUILD_TREE FAILED spk=%zu amt=%llu\n", my_index, spk_len, (unsigned long long)funding_amount);
@@ -1177,6 +1295,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     secp256k1_musig_secnonce *secnonces = NULL;
     wire_bundle_entry_t *nonce_entries = NULL;
 
+    if (bind && !rot_stateless) {
+        fprintf(stderr, "Client %u: a bound rotation needs the stateless signing engine\n",
+                my_index);
+        return 0;
+    }
     if (rot_stateless) {
         if (!client_factory_creation_stateless_signing(fd, ctx, keypair,
                                                         factory_out, my_index, 0))
@@ -1443,9 +1566,17 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         free(secnonces); free(nonce_entries); return 0;
     }
     uint64_t rot_bal_local = 0, rot_bal_remote = 0;
+    uint64_t rot_fee_rate = 0;
+    int rot_has_fee_rate = 0;
     {
         uint32_t channel_id;
         wire_parse_channel_ready(msg.json, &channel_id, &rot_bal_local, &rot_bal_remote);
+        rot_has_fee_rate = cJSON_GetObjectItemCaseSensitive(msg.json,
+                                                            "fee_rate_sat_per_kvb") != NULL;
+        if (rot_has_fee_rate &&
+            !wire_json_get_uint(msg.json, "fee_rate_sat_per_kvb",
+                                CHANNEL_COMMIT_FEE_RATE_MAX, &rot_fee_rate))
+            rot_fee_rate = 0;               /* refused below */
         cJSON_Delete(msg.json);
         printf("Client %u: rotation channel %u ready (local=%llu, remote=%llu)\n",
                my_index, channel_id, (unsigned long long)rot_bal_local, (unsigned long long)rot_bal_remote);
@@ -1485,6 +1616,20 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (rot_bal_local > 0 || rot_bal_remote > 0) {
         channel_out->local_amount  = rot_bal_remote / 1000;
         channel_out->remote_amount = rot_bal_local  / 1000;
+    }
+    if (rot_has_fee_rate)
+        channel_out->fee_rate_sat_per_kvb = rot_fee_rate;
+    /* The commitment can only be mined if its outputs fit the leaf: the
+       balances plus the commitment fee must be exactly the channel funding. */
+    if (rot_bal_local % 1000 != 0 || rot_bal_remote % 1000 != 0 ||
+        !client_channel_amounts_exact(channel_out)) {
+        fprintf(stderr, "Client %u: REFUSING rotation — channel balances %llu + %llu do "
+                "not match the channel funding %llu at fee rate %llu\n", my_index,
+                (unsigned long long)channel_out->local_amount,
+                (unsigned long long)channel_out->remote_amount,
+                (unsigned long long)channel_out->funding_amount,
+                (unsigned long long)channel_out->fee_rate_sat_per_kvb);
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     /* Verify the LSP carried the client's balance into the new factory.
@@ -1710,6 +1855,15 @@ static int client_factory_creation_stateless_signing(
         free(my_secnonces); free(my_slot);
         return 0;
     }
+    if (g_sign_guard && !g_sign_guard(g_sign_guard_arg, factory, 0)) {
+        fprintf(stderr, "Client-stateless %u: refusing to sign this tree\n", my_index);
+        cJSON_Delete(lr.json);
+        free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+        free(my_secnonces); free(my_slot);
+        return 0;
+    }
+    int dist_guard_refused = 0;
+
     /* #54 G1b: distribution-TX dist co-signing (self-contained; runs only if the
        LSP offered it via lsp_dist_pubnonce).  The client REBUILDS the dist TX from
        the LSP-sent per-client amounts, VERIFIES its own output is not shorted vs
@@ -1787,6 +1941,11 @@ static int client_factory_creation_stateless_signing(
                         if (!musig_pubnonce_parse(ctx, &pns, all_dist_pn + s * 66) ||
                             !factory_session_set_nonce_dist(factory, s, &pns)) set_ok = 0;
                     }
+                    if (set_ok && g_sign_guard &&
+                        !g_sign_guard(g_sign_guard_arg, factory, 1)) {
+                        dist_guard_refused = 1;
+                        set_ok = 0;
+                    }
                     if (set_ok && factory_session_finalize_dist(factory)) {
                         secp256k1_musig_partial_sig dps;
                         if (musig_create_partial_sig(ctx, &dps, &my_dist_secnonce,
@@ -1802,6 +1961,14 @@ static int client_factory_creation_stateless_signing(
         }
     }
 
+    if (dist_guard_refused) {
+        fprintf(stderr, "Client-stateless %u: refusing to sign this distribution TX\n",
+                my_index);
+        cJSON_Delete(lr.json);
+        free(lsp_pn_per_node); free(lsp_psig_per_node); free(all_pn);
+        free(my_secnonces); free(my_slot);
+        return 0;
+    }
     cJSON_Delete(lr.json);
     (void)lsp_psig_per_node;  /* LSP psigs are aggregated LSP-side, not by client. */
 
@@ -1965,6 +2132,10 @@ int client_run_with_channels(secp256k1_context *ctx,
     wire_hello_set_slot_hint(hello, g_slot_hint);
     if (keypair != identity_kp)
         wire_hello_set_factory_pubkey(hello, ctx, &my_pubkey);
+    /* This client can rotate by a co-signed close into the new factory (it
+       has a DB, a pinned LSP and its own chain source). */
+    if (client_cin_capable())
+        cJSON_AddNumberToObject(hello, "rotation_v", 1);
     if (!wire_send(fd, MSG_HELLO, hello)) {
         fprintf(stderr, "Client: send HELLO failed\n");
         cJSON_Delete(hello);
