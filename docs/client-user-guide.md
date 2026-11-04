@@ -32,6 +32,44 @@ echo "Save this: $MY_KEY"
 
 With BIP39, you can recover your key from the 24 words at any time. Without it, if you lose your key, you lose access to your channel balance. The LSP cannot recover it for you — though your funds will eventually be recoverable via the CLTV timeout path.
 
+### Your factory keys
+
+The key above is your **identity** key: it identifies you to the LSP and is never used
+to sign a factory. For every factory you join, the client derives a separate **factory
+key** from it (and from the LSP's pinned key), records which one in `--db`, and signs
+that factory, its channel and its payouts with it. Handing one factory key to the LSP
+(as a rotation does) reveals neither your identity key nor any other factory key.
+
+- With `--db`, pin the LSP's key with `--lsp-pubkey` (required on signet, testnet and
+  mainnet anyway). Without it the client refuses to create a new factory key.
+- Keep `--db` backed up. If it is lost but you still have your key or 24 words, the
+  client finds the key of a stored factory by trying the first 1000 key indexes.
+  Finding your factories from the chain alone is not supported yet.
+- A factory created by an older client signs with the identity key itself ("legacy
+  factory"); it keeps doing so until it is rotated.
+
+#### Spending your payouts
+
+Your cooperative-close output pays your factory key directly (descriptor
+`rawtr(KEY)`), and your distribution-TX output pays the BIP-86 tweaked key (descriptor
+`tr(KEY)`). To spend them from a wallet, print the keys:
+
+```bash
+./superscalar_client --seckey $MY_KEY --db client.db --network signet --export-factory-keys
+```
+
+**This prints private keys.** Anyone who sees the output can spend those payouts. For
+each factory key it prints the pubkey, the secret (hex), and both descriptors with
+their checksums; import the one you need into Bitcoin Core, for example
+`bitcoin-cli importdescriptors '[{"desc":"rawtr(...)#...","timestamp":0}]'` into a
+descriptor wallet. A legacy factory is listed with your identity key's descriptors:
+**that line is your master key** (the same secret as `--seckey` or your 24 words), so
+treat it accordingly. The command writes no key row and never reserves a key index;
+opening an older DB may still run the schema migration and tighten the file's
+permissions. It prints at most 4096 keys and warns if there are more. The recovery tools `recover_stranded_coop_output` and
+`superscalar_factory_residual_sweep` take client secrets: pass the "seckey" printed
+here (for a legacy factory, your `--seckey`).
+
 ## 2. Connect to the LSP
 
 ### Basic Connection (Regtest)
@@ -241,6 +279,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--force-close` | off | Broadcast your factory tree on-chain from the local DB (unilateral exit) |
 | `--sweep-to-local` | off | After force-close, sweep your `to_local` outputs once CSV maturity hits |
 | `--sweep-dest ADDR` | (wallet) | Destination address for swept funds (defaults to your bitcoind wallet) |
+| `--export-factory-keys` | off | Print the secret and wallet descriptors of every factory key in `--db`, then exit (**prints private keys**; see "Spending your payouts") |
 
 ### Misc / Diagnostic
 
@@ -256,6 +295,9 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 |---------|-----|
 | "expected FACTORY_PROPOSE" | LSP isn't running or wrong `--host`/`--port` |
 | Can't reconnect after restart | Use same `--seckey` and `--db` as original connection |
+| "a new factory key needs the LSP's key pinned" | Pass the LSP's key with `--lsp-pubkey` (needed with `--db`) |
+| "the LSP put our identity key in our slot: it does not support per-factory keys" | The LSP runs an older version that ignores per-factory keys. Ask the operator to upgrade; the client refuses to sign a factory with its identity key |
+| "stored key N does not match this root key" | The `--seckey` / keyfile is not the one this `--db` was created with |
 | Balance shows 0 | Channel not yet open (factory ceremony incomplete) or wrong `--db` |
 | "connection refused" | LSP not running, wrong port, or firewall blocking |
 | ".onion address requires --tor-proxy" | Add `--tor-proxy 127.0.0.1:9050` |

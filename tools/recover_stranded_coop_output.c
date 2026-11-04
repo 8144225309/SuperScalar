@@ -21,6 +21,11 @@
  *     --fee          <sats> \
  *     [--broadcast]          (if omitted, just print tx hex)
  *
+ * --client-seckeys are each client's key IN THAT FACTORY: for a factory
+ * created with per-factory keys, the "seckey" printed by
+ * `superscalar_client --export-factory-keys`; for an older (legacy)
+ * factory, the client's --seckey.
+ *
  * The funding_spk is reconstructed internally as:
  *     MuSig-KeyAgg(pubkeys...)  then BIP-341 taptweak with empty merkle.
  */
