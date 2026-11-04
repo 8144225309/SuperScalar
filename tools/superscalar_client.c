@@ -271,6 +271,7 @@ extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 #include "superscalar/sha256.h"
 #include "superscalar/factory_keys.h"
+#include "superscalar/client_rotation.h"
 #include "superscalar/bolt12.h"
 #include "superscalar/bech32m.h"
 
@@ -1138,6 +1139,17 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
 handle_message:
+        if (client_cin_refuse_while_frozen(&msg, factory ? factory->funding_txid : NULL)) {
+            /* A signed close of the old factory may exist: its balances are
+               the ones carried into the replacement.  Nothing on the old
+               channel may change until that close resolves. */
+            fprintf(stderr, "Client %u: refusing message 0x%02x: the old channel is frozen "
+                    "while our signed rotation close is pending\n", my_index, msg.msg_type);
+            cJSON *e = wire_build_error("channel frozen: rotation close pending");
+            if (e) { wire_send(fd, MSG_ERROR, e); cJSON_Delete(e); }
+            cJSON_Delete(msg.json);
+            return 0;
+        }
         switch (msg.msg_type) {
         case MSG_UPDATE_ADD_HTLC: {
             /* Save pre-add state (this is the OLD commitment being revoked) */
@@ -1585,6 +1597,22 @@ handle_message:
         }
 
         case MSG_ROTATION_BEGIN: {
+            /* Close into the new factory: answer with a fresh factory key. */
+            {
+                cJSON *vj = cJSON_GetObjectItem(msg.json, "v");
+                cJSON *mj = cJSON_GetObjectItem(msg.json, "mode");
+                if (vj && cJSON_IsNumber(vj) && vj->valuedouble >= 1 && mj &&
+                    cJSON_IsString(mj) && strcmp(mj->valuestring, "close_into_new") == 0) {
+                    if (!client_cin_on_begin(fd, ctx, cbd ? cbd->db : NULL, factory,
+                                             msg.json)) {
+                        cJSON *e = wire_build_error("rotation refused");
+                        wire_send(fd, MSG_ERROR, e);
+                        cJSON_Delete(e);
+                    }
+                    cJSON_Delete(msg.json);
+                    break;
+                }
+            }
             /* SF-PTLC-TURNOVER-AUTH #196: rotation context precursor.
                Records (dying_factory_txid, new_factory_nonce, rotation_epoch)
                so the next MSG_PTLC_PRESIG can be validated against it. */
@@ -1941,6 +1969,24 @@ handle_message:
         case MSG_FACTORY_PROPOSE: {
             /* LSP initiates factory rotation — create new factory */
             printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
+            {
+                cJSON *rj = cJSON_GetObjectItem(msg.json, "rotation");
+                cJSON *mj = rj ? cJSON_GetObjectItem(rj, "mode") : NULL;
+                if (mj && cJSON_IsString(mj) &&
+                    strcmp(mj->valuestring, "close_into_new") == 0) {
+                    int cin_ok = client_cin_run(fd, ctx, cbd ? cbd->db : NULL,
+                                                cbd ? cbd->poison_db_path : NULL,
+                                                keypair, factory, ch, my_index, &msg);
+                    cJSON_Delete(msg.json);
+                    /* The old factory stays watched until the switch, which
+                       happens (before the reconnect) only once our own chain
+                       source shows the close at the safe depth. */
+                    if (cin_ok)
+                        printf("Client %u: rotation complete, reconnecting with new "
+                               "factory\n", my_index);
+                    return 0;
+                }
+            }
 
             /* Save pubkeys from current factory */
             secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS];
@@ -2372,6 +2418,49 @@ static int client_export_factory_keys(secp256k1_context *ctx, const secp256k1_ke
     free(idx); free(rctx); free(rpk); free(rstate);
     persist_close(&db);
     return ok;
+}
+
+/* The per-factory signing key (factory_keys.h), chosen at startup and again
+   after a rotation switches the DB.  Also records the identity keypair and
+   the pinned LSP context a rotation reserves its replacement key from. */
+static int choose_factory_key(secp256k1_context *ctx, const secp256k1_keypair *kp,
+                              persist_t *db, const char *lsp_pubkey_hex) {
+    /* The key is bound to the pinned LSP key: a new key with a DB needs
+       --lsp-pubkey (factory_key_select refuses otherwise). */
+    unsigned char lsp_ctx33[33], root_sk[32], fac_sk[32];
+    const unsigned char *pin = NULL;
+    if (lsp_pubkey_hex && hex_decode(lsp_pubkey_hex, lsp_ctx33, 33) == 33)
+        pin = lsp_ctx33;
+    client_set_identity_keypair(kp);
+    client_set_factory_key_ctx(pin);
+    uint32_t fidx = 0;
+    factory_key_source_t fsrc = FACTORY_KEY_FRESH;
+    secp256k1_keypair fac_kp;
+    memset(&fac_kp, 0, sizeof(fac_kp));
+    int fk_ok = secp256k1_keypair_sec(ctx, root_sk, kp) &&
+                factory_key_select(db, ctx, root_sk, pin, fac_sk, &fidx, &fsrc) &&
+                secp256k1_keypair_create(ctx, &fac_kp, fac_sk);
+    secure_zero(root_sk, sizeof(root_sk));
+    secure_zero(fac_sk, sizeof(fac_sk));
+    if (!fk_ok) {
+        fprintf(stderr, "Error: could not choose a factory key (see above)%s\n",
+                (db && !pin) ? "; pass the LSP's key with --lsp-pubkey" : "");
+        secure_zero(&fac_kp, sizeof(fac_kp));
+        return 0;
+    }
+    static const char *fk_src_names[] = { "fresh", "reloaded", "recovered", "legacy" };
+    if (fsrc == FACTORY_KEY_LEGACY) {
+        client_set_factory_keypair(NULL);
+        g_factory_key_index_set = 0;
+        printf("Client: factory key: legacy factory, signing with the identity key\n");
+    } else {
+        client_set_factory_keypair(&fac_kp);
+        g_factory_key_index = fidx;
+        g_factory_key_index_set = db != NULL;
+        printf("Client: factory key index %u (%s)\n", fidx, fk_src_names[fsrc]);
+    }
+    secure_zero(&fac_kp, sizeof(fac_kp));
+    return 1;
 }
 
 static void usage(const char *prog) {
@@ -3615,41 +3704,11 @@ int main(int argc, char *argv[]) {
     /* Per-factory signing key: a fresh hardened key per factory, never the
        identity key (factory_keys.h).  A factory created before per-factory
        keys keeps signing with the identity key (legacy). */
-    {
-        /* The key is bound to the pinned LSP key: a new key with a DB
-           needs --lsp-pubkey (factory_key_select refuses otherwise). */
-        unsigned char lsp_ctx33[33], root_sk[32], fac_sk[32];
-        const unsigned char *pin = NULL;
-        if (lsp_pubkey_hex && hex_decode(lsp_pubkey_hex, lsp_ctx33, 33) == 33)
-            pin = lsp_ctx33;
-        uint32_t fidx = 0;
-        factory_key_source_t fsrc = FACTORY_KEY_FRESH;
-        secp256k1_keypair fac_kp;
-        int fk_ok = secp256k1_keypair_sec(ctx, root_sk, &kp) &&
-                    factory_key_select(use_db ? &db : NULL, ctx, root_sk, pin,
-                                       fac_sk, &fidx, &fsrc) &&
-                    secp256k1_keypair_create(ctx, &fac_kp, fac_sk);
-        secure_zero(root_sk, sizeof(root_sk));
-        secure_zero(fac_sk, sizeof(fac_sk));
-        if (!fk_ok) {
-            fprintf(stderr, "Error: could not choose a factory key (see above)%s\n",
-                    (use_db && !pin) ? "; pass the LSP's key with --lsp-pubkey" : "");
-            secure_zero(&fac_kp, sizeof(fac_kp));
-            if (use_db) persist_close(&db);
-            secp256k1_context_destroy(ctx);
-            report_close(&rpt);
-            return 1;
-        }
-        static const char *fk_src_names[] = { "fresh", "reloaded", "recovered", "legacy" };
-        if (fsrc == FACTORY_KEY_LEGACY) {
-            printf("Client: factory key: legacy factory, signing with the identity key\n");
-        } else {
-            client_set_factory_keypair(&fac_kp);
-            g_factory_key_index = fidx;
-            g_factory_key_index_set = use_db;
-            printf("Client: factory key index %u (%s)\n", fidx, fk_src_names[fsrc]);
-        }
-        secure_zero(&fac_kp, sizeof(fac_kp));
+    if (!choose_factory_key(ctx, &kp, use_db ? &db : NULL, lsp_pubkey_hex)) {
+        if (use_db) persist_close(&db);
+        secp256k1_context_destroy(ctx);
+        report_close(&rpt);
+        return 1;
     }
 
     signal(SIGINT, sigint_handler);
@@ -3669,6 +3728,11 @@ int main(int argc, char *argv[]) {
         extern void client_set_chain_rt(regtest_t *);
         client_set_chain_rt(&rt);
     }
+    /* A close into a new factory is only taken part in with a DB, a pinned
+       LSP and our own chain source (the switch waits for it). */
+    client_cin_set_chain(rt_ok ? &rt : NULL,
+                         rt_ok ? regtest_network_safe_confirmation_depth(&rt) : 6);
+    client_cin_set_capable(use_db && rt_ok && client_factory_key_ctx() != NULL);
 
     /* Fee estimator — honour --fee-estimator if provided */
     static watchtower_t client_wt;
@@ -3810,6 +3874,19 @@ int main(int argc, char *argv[]) {
 
         /* If the DB already has a persisted factory from a previous run,
            skip the fresh HELLO handshake and go straight to reconnect. */
+        /* A rotation by a co-signed close whose close is confirmed: switch to
+           the replacement's DB first. */
+        /* With a signed rotation close pending, check the old factory for
+           breaches first (the rotation's chain lookups below can be slow). */
+        if (use_db && cbd.wt) {
+            client_cin_refresh_frozen(&db);
+            if (client_cin_frozen()) watchtower_check(cbd.wt);
+        }
+        if (use_db && client_cin_resolve(&db, db_path, rt_ok ? &rt : NULL)) {
+            if (cbd.wt) watchtower_clear_entries(cbd.wt);   /* old factory resolved */
+            if (!choose_factory_key(ctx, &kp, &db, lsp_pubkey_hex))
+                return 1;
+        }
         int first_run = (use_db && persist_has_factory(&db, 0)) ? 0 : 1;
 
         /* Scan for breaches that may have occurred while we were offline.
@@ -3859,6 +3936,11 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("Client: reconnecting from persisted state...\n");
                 cbd.saved_initial = 1;  /* already saved on first run */
+                if (client_cin_resolve(&db, db_path, rt_ok ? &rt : NULL)) {
+                    if (cbd.wt) watchtower_clear_entries(cbd.wt);   /* old factory resolved */
+                    if (!choose_factory_key(ctx, &kp, &db, lsp_pubkey_hex))
+                        break;
+                }
                 ok = client_run_reconnect(ctx, &kp, host, port, &db,
                                             daemon_channel_cb, &cbd);
             }

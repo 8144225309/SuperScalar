@@ -214,6 +214,17 @@
 #define MSG_LSTOCK_REVEAL 0x8C
 #define MSG_LSTOCK_REVEAL_REQUEST 0x8D  /* #59: Client -> LSP, re-request missing reveals */
 
+/* Close-into-new rotation (all old clients online).
+   MSG_ROTATION_KEY  client -> LSP after MSG_ROTATION_BEGIN {"v":1,
+                     "mode":"close_into_new"}: {"pubkey": the client's fresh
+                     factory key for the replacement, "dying_txid"}.
+   MSG_ROTATION_DONE LSP -> client once the co-signed close of the old factory
+                     (it funds the replacement) is confirmed, or on reconnect
+                     while it is pending: {"close_txid", "close_hex"?,
+                     "confirmed"}. */
+#define MSG_ROTATION_KEY  0x8F
+#define MSG_ROTATION_DONE 0x90
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -299,6 +310,15 @@ void wire_json_add_hex(cJSON *obj, const char *key, const unsigned char *data, s
 
 /* Decode hex string from JSON object into binary. Returns decoded length or 0 on error. */
 int wire_json_get_hex(const cJSON *obj, const char *key, unsigned char *out, size_t max_len);
+
+/* 1 if no object anywhere in J has two keys that are equal ignoring case
+   (cJSON lookups differ in case handling and pick the first match, so such a
+   message can mean different things to different readers). */
+int wire_json_unambiguous(const cJSON *j);
+
+/* OBJ[KEY] (exact case) as an unsigned integer: a number with no fraction,
+   0 <= value <= MAX (MAX at most 2^53).  Returns 1 and sets *OUT, else 0. */
+int wire_json_get_uint(const cJSON *obj, const char *key, uint64_t max, uint64_t *out);
 
 /* --- Nonce/Psig bundle entry --- */
 typedef struct {
@@ -1308,5 +1328,16 @@ cJSON *wire_build_force_out(const char *checkpoint_name);
 int    wire_parse_force_out(const cJSON *json, char out_name[64]);
 cJSON *wire_build_rotate(uint8_t mode);
 int    wire_parse_rotate(const cJSON *json, uint8_t *out_mode);
+
+
+cJSON *wire_build_rotation_key(const secp256k1_context *ctx, const secp256k1_pubkey *pk,
+                               const unsigned char dying_txid32[32]);
+int wire_parse_rotation_key(const cJSON *j, const secp256k1_context *ctx,
+                            secp256k1_pubkey *pk_out, unsigned char dying_txid32[32]);
+cJSON *wire_build_rotation_done(const char *close_txid_hex, const char *close_hex,
+                                int confirmed);
+/* close_hex_out (may be NULL) gets a malloc'd copy or NULL. */
+int wire_parse_rotation_done(const cJSON *j, char close_txid_out[65], char **close_hex_out,
+                             int *confirmed_out);
 
 #endif /* SUPERSCALAR_WIRE_H */

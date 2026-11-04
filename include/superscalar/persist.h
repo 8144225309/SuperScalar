@@ -1500,8 +1500,9 @@ int persist_scan_ceremonies_by_factory(persist_t *p,
    Reads return 1 found, 0 none, -1 on a DB error (callers must not treat an
    error as "none").
    factory_key_save: plain INSERT (fails if the index exists; factory_id < 0
-   stores NULL).  load_current: the highest-index row in state reserved or
-   active.  get_state: STATE gets the row's state.  set_state: one row
+   stores NULL).  load_current: the highest-index active row, else the
+   highest-index reserved row (a replacement key reserved by a rotation
+   never displaces the active key).  get_state: STATE gets the row's state.  set_state: one row
    (factory_id < 0 leaves it unchanged); returns 1 on success.  is_released:
    1 if PUBKEY33 is a key this client handed over.  max_index: returns 1 on
    success with *OUT = -1 if there is no row, 0 on error.  list: every row,
@@ -1544,5 +1545,58 @@ int persist_save_participant_identities(persist_t *p, uint32_t factory_id,
 size_t persist_load_participant_identities(persist_t *p, uint32_t factory_id,
                                            const secp256k1_context *ctx,
                                            secp256k1_pubkey *out, size_t n_clients);
+
+
+/* --- Close-into-new rotation records (v44) ---
+   rotation_cin (LSP): per dying funding, the replacement's participant
+   pubkeys (hex, 33 bytes each, LSP first), the close's nLockTime height and,
+   once fully signed, the signed close.  load / find return 1 found, 0 none,
+   -1 on a DB error; load's strings are malloc'd (caller frees). */
+int persist_save_rotation_cin(persist_t *p, const char *dying_hex,
+                              const char *participants_hex, uint32_t close_height,
+                              const char *signed_close_hex);
+int persist_load_rotation_cin(persist_t *p, const char *dying_hex,
+                              char **participants_hex, uint32_t *close_height,
+                              char **signed_close_hex);
+/* The dying funding (display hex) of the rotation whose replacement funding
+   is NEW_TXID_HEX. */
+int persist_find_rotation_by_new_funding(persist_t *p, const char *new_txid_hex,
+                                         char dying_hex_out[65]);
+
+/* client_rotations (client): one row per old factory funding the client is
+   rotating out of.  state: key_sent, verified, close_signed, closed, done,
+   abandoned.  side_db: the file holding the verified replacement until it
+   becomes the main DB.  close_hex: the signed close, once known. */
+typedef struct {
+    char old_txid[65];
+    uint32_t old_vout;
+    uint32_t key_index;
+    char close_txid[65];
+    char state[16];
+    char side_db[256];
+    char *close_hex;            /* load: malloc'd or NULL (caller frees) */
+    uint32_t close_height;      /* the close's nLockTime: it confirms at or after it */
+} persist_client_rotation_t;
+int persist_client_rotation_save(persist_t *p, const persist_client_rotation_t *r);
+int persist_client_rotation_load(persist_t *p, const char *old_txid_hex,
+                                 persist_client_rotation_t *r);
+/* The most recent row not yet done or abandoned. */
+int persist_client_rotation_load_open(persist_t *p, persist_client_rotation_t *r);
+
+/* client_rotation_trees (client): the first replacement tree the client
+   signed over each replacement funding (the close's txid, display hex).  Binds
+   DIGEST_HEX to CLOSE_TXID_HEX if nothing is bound yet.  Returns 1 if
+   DIGEST_HEX is the bound tree, 0 if a different tree is bound, -1 on a DB
+   error. */
+int persist_client_rotation_bind_tree(persist_t *p, const char *close_txid_hex,
+                                      const char *digest_hex);
+
+/* Write a consistent copy of the whole DB to PATH (VACUUM INTO).  Refused
+   inside a transaction. */
+int persist_snapshot_to(persist_t *p, const char *path);
+
+/* Key row INDEX: 1 found (ctx, pubkey, state set), 0 none, -1 DB error. */
+int persist_factory_key_get_row(persist_t *p, uint32_t key_index, unsigned char ctx33[33],
+                                unsigned char pk33[33], char state[16]);
 
 #endif /* SUPERSCALAR_PERSIST_H */

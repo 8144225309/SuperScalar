@@ -11,7 +11,9 @@
 #                replacement factory is funded and signed (the client must
 #                already hold its own signed exit path there).
 #   CLOSE_PAYEE  the old factory's close does not pay the clients' balances
-#                to an LSP-controlled address.
+#                to an LSP-controlled address; a co-signed close into the new
+#                factory must have exactly one output, the replacement's
+#                funding, under keys other than the old factory's.
 #   BALANCES     every client's channel balance is the same after the rotation
 #                (LSP view and client view), and the new tree carries it.
 #   PAY_AFTER    a payment over the replacement factory succeeds, and no client
@@ -224,7 +226,25 @@ PY
     verdict CLOSE_PAYEE 0 "client outputs of the close do not pay the LSP wallet"
   fi
 else
-  verdict CLOSE_PAYEE 0 "no cooperative close of the old factory"
+  CIN_CLOSE=$(grep -aoE "LSP rotate: close [0-9a-f]{64} of factory [0-9]+ built" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+  if [ -n "$CIN_CLOSE" ] && [ "$COMPLETE" -ge 1 ]; then
+    # Co-signed close into the new factory: one output, the replacement's
+    # funding, under keys that are not the old factory's.
+    read -r C_NOUT C_SPK C_AMT < <($BCLI getrawtransaction "$CIN_CLOSE" 1 2>/dev/null | python3 -c '
+import json,sys; t=json.load(sys.stdin); o=t["vout"]
+print(len(o), o[0]["scriptPubKey"]["hex"], round(o[0]["value"]*1e8))' 2>/dev/null)
+    O_TXID=$(grep -aoE "^LSP: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+    O_VOUT=$(grep -aoE "^LSP: funding vout=[0-9]+" "$L" | grep -oE "[0-9]+$" | head -1)
+    O_SPK=$($BCLI getrawtransaction "$O_TXID" 1 2>/dev/null | python3 -c '
+import json,sys; t=json.load(sys.stdin); print(t["vout"][int(sys.argv[1])]["scriptPubKey"]["hex"])' "${O_VOUT:-0}" 2>/dev/null)
+    if [ "${C_NOUT:-0}" = 1 ] && [ -n "$C_SPK" ] && [ "$C_SPK" != "$O_SPK" ]; then
+      verdict CLOSE_PAYEE 0 "co-signed close $CIN_CLOSE has one output ($C_AMT sats) and it is the replacement's funding, under fresh keys (old SPK ${O_SPK:0:16}.., new ${C_SPK:0:16}..)"
+    else
+      verdict CLOSE_PAYEE 1 "close $CIN_CLOSE: outputs=${C_NOUT:-?} spk=${C_SPK:-?} old_spk=${O_SPK:-?}"
+    fi
+  else
+    verdict CLOSE_PAYEE 0 "no cooperative close of the old factory"
+  fi
 fi
 
 if [ "$COMPLETE" -lt 1 ]; then
@@ -315,8 +335,8 @@ fi
 # --- PAYOUT_KEYS: the exported descriptors pay this client's outputs ---
 EXP=$("$BUILD/superscalar_client" --network regtest --seckey "$(printf "%064x" 2)" \
         --db "$TMP/c1.db" --export-factory-keys 2>/dev/null)
-TRD=$(echo "$EXP" | awk '/distribution TX/{print $3; exit}')
-RAWD=$(echo "$EXP" | awk '/cooperative close/{print $3; exit}')
+TRD=$(echo "$EXP" | awk '/distribution TX/{d=$3} END{print d}')
+RAWD=$(echo "$EXP" | awk '/cooperative close/{d=$3} END{print d}')
 DIST_HEX=$(sqlite3 "$TMP/c1.db" "SELECT signed_tx_hex FROM distribution_txs ORDER BY factory_id DESC LIMIT 1;" 2>/dev/null)
 PAY_DETAIL="no exported descriptor"
 PAY_BAD=1
@@ -336,6 +356,9 @@ verdict PAYOUT_KEYS $PAY_BAD "$PAY_DETAIL"
 NEW_FUND=$(grep -aoE "LSP rotate: funded [0-9]+ sats, txid: [0-9a-f]{64}, vout=[0-9]+" "$L" | tail -1)
 NEW_TXID=$(echo "$NEW_FUND" | grep -oE "[0-9a-f]{64}")
 NEW_VOUT=$(echo "$NEW_FUND" | grep -oE "vout=[0-9]+" | cut -d= -f2)
+if [ -z "$NEW_TXID" ] && [ -n "${CIN_CLOSE:-}" ] && [ "$COMPLETE" -ge 1 ]; then
+  NEW_TXID=$CIN_CLOSE; NEW_VOUT=0
+fi
 SPENT_BY=""
 # Client 1's own signed root kickoff of the replacement: its first exit step.
 kickoff_accept() {
@@ -374,6 +397,9 @@ def th(tag, m):
     t = hashlib.sha256(tag.encode()).digest(); return hashlib.sha256(t + t + m).digest()
 secs = [int(sys.argv[1], 16)]
 rows = [l.strip().split("|") for l in open(sys.argv[2]) if l.strip()]
+if not rows:
+    sys.stderr.write("lsp-held keys: the LSP holds no client key at all\n")
+    sys.exit(1)
 fid0 = min(int(r[0]) for r in rows)                  # the rotated (dying) factory
 rows = sorted((int(r[1]), r[2]) for r in rows if int(r[0]) == fid0)
 secs += [int(k, 16) for _, k in rows]

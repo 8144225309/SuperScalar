@@ -136,4 +136,18 @@ int descriptor_checksum(const char *desc, char out9[9]);
 int factory_key_descriptor(const unsigned char seckey32[32], int mainnet, int raw,
                            char *out, size_t outlen);
 
+/* Reserve a NEW index (never the current one) for a replacement factory,
+   bound to the pinned LSP context; committed before returning.  Returns 1
+   with the secret and index. */
+int factory_key_reserve_next(persist_t *db, const secp256k1_context *ctx,
+                             const unsigned char root_seckey32[32],
+                             const unsigned char *pinned_ctx33,
+                             unsigned char out_seckey32[32], uint32_t *out_index);
+
+/* The secret of the stored key row INDEX (re-derived with the row's context
+   and checked against its pubkey).  Read-only. */
+int factory_key_derive_stored(persist_t *db, const secp256k1_context *ctx,
+                              const unsigned char root_seckey32[32], uint32_t index,
+                              unsigned char out_seckey32[32]);
+
 #endif /* SUPERSCALAR_FACTORY_KEYS_H */

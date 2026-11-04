@@ -112,6 +112,39 @@ int client_run_reconnect(secp256k1_context *ctx,
    FACTORY_PROPOSE message (no HELLO handshake).
    Overwrites factory_out and channel_out with the new factory/channel.
    Returns 1 on success. */
+/* The replacement funding a rotation must use, checked by the caller before
+   the ceremony: the tree is built over exactly this outpoint, amount and
+   script (never re-read from the proposal). */
+typedef struct {
+    unsigned char txid[32];      /* internal order */
+    uint32_t vout;
+    uint64_t amount;
+    unsigned char spk[34];
+} client_funding_bind_t;
+
+/* As client_do_factory_rotation, with the funding taken from BIND (NULL: from
+   the proposal).  With BIND the stateless signing engine is required. */
+int client_do_factory_rotation_bound(int fd, secp256k1_context *ctx,
+                                     const secp256k1_keypair *keypair,
+                                     uint32_t my_index, size_t n_participants,
+                                     const secp256k1_pubkey *all_pubkeys,
+                                     factory_t *factory_out, channel_t *channel_out,
+                                     const wire_msg_t *initial_propose,
+                                     const client_funding_bind_t *bind);
+
+/* Called by the creation signing engine right before this client's first
+   partial signature: PHASE 0 for the tree (all nodes built), PHASE 1 for the
+   distribution TX (built, about to be signed).  Returning 0 aborts the
+   ceremony before anything is signed.  NULL clears it. */
+typedef int (*client_sign_guard_fn)(void *arg, factory_t *f, int phase);
+void client_set_sign_guard(client_sign_guard_fn fn, void *arg);
+
+/* A new channel's balances, as the LSP reported them, are exactly its funding
+   (the leaf output) less the commitment fee at its fee rate, with no HTLC, and
+   the fee rate is within CHANNEL_COMMIT_FEE_RATE_MIN..MAX (so the commitment
+   has its anchor): anything else gives a commitment that cannot be mined. */
+int client_channel_amounts_exact(const channel_t *ch);
+
 int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 uint32_t my_index,
@@ -267,5 +300,22 @@ void client_set_factory_keypair(const secp256k1_keypair *factory_kp);
 
 /* The factory keypair if one is set, else IDENTITY. */
 const secp256k1_keypair *client_factory_keypair(const secp256k1_keypair *identity);
+
+/* The identity (root) keypair and the pinned LSP context the factory keys are
+   derived with; a rotation reserves its replacement key from them.  NULL
+   clears. */
+void client_set_identity_keypair(const secp256k1_keypair *identity_kp);
+const secp256k1_keypair *client_identity_keypair(void);
+void client_set_factory_key_ctx(const unsigned char *lsp_ctx33);
+const unsigned char *client_factory_key_ctx(void);
+
+/* The signed close of the last cooperative close this process took part in
+   (from CLOSE_DONE), handed over to the caller (malloc'd hex) or NULL. */
+char *client_take_last_close_hex(void);
+
+/* While set, client_do_close_ceremony signs only a close with exactly this
+   one output at exactly this height (every PROPOSE, re-proposals included).
+   NULL clears. */
+void client_set_expected_close(const tx_output_t *output, uint32_t height);
 
 #endif /* SUPERSCALAR_CLIENT_H */

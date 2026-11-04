@@ -45,6 +45,32 @@
 #define LSP_ROT_PROGRESS_SIGNING_READY  6
 #define LSP_ROT_PROGRESS_SIGNED         7
 #define LSP_ROT_PROGRESS_DONE           8
+/* Close into the new factory (every old client online; nothing revealed):
+     CIN_CLOSE_BUILT    the unsigned close of the old factory, paying the
+                        replacement's funding output, is recorded with the
+                        replacement's participants (fresh client keys) and
+                        the close height
+     CIN_SIGNING        the replacement's creation ceremony over the close's
+                        output may start
+     CIN_SIGNING_READY  FACTORY_READY may have reached a client: a ceremony
+                        runs again only over a byte-identical tree
+     CIN_CLOSE_SIGNING  the close ceremony (old keys) may have started; no
+                        full signature exists anywhere yet
+     CIN_CLOSING        the close is fully signed and recorded, in the SAME
+                        transaction as the replacement factory and channels;
+                        it may be on the network
+     CIN_CLOSED         the close is confirmed: the old factory is resolved
+   Until CIN_CLOSING the old factory stays the live one and a retry reuses the
+   recorded close (same keys, same height); a different close is built only
+   when the recorded one can never be signed. */
+#define LSP_ROT_PROGRESS_CIN_CLOSE_BUILT    10
+#define LSP_ROT_PROGRESS_CIN_SIGNING        11
+#define LSP_ROT_PROGRESS_CIN_SIGNING_READY  12
+#define LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING  13
+#define LSP_ROT_PROGRESS_CIN_CLOSING        14
+#define LSP_ROT_PROGRESS_CIN_CLOSED         15
+#define LSP_ROT_PROGRESS_IS_CIN(ph) ((ph) >= LSP_ROT_PROGRESS_CIN_CLOSE_BUILT && \
+                                     (ph) <= LSP_ROT_PROGRESS_CIN_CLOSED)
 typedef struct {
     int phase;                              /* LSP_ROT_PROGRESS_* */
     uint32_t dying_factory_id;
@@ -67,7 +93,29 @@ typedef struct {
     int fund_reserved;                      /* light client: funding input still */
     char fund_reserved_txid[65];            /*   reserved in the wallet (memory only) */
     uint32_t fund_reserved_vout;
+    /* Close into the new factory (CIN phases). */
+    unsigned char cin_pubkeys[FACTORY_MAX_SIGNERS][33]; /* replacement, LSP first */
+    size_t n_cin_pubkeys;
+    uint32_t cin_close_height;              /* the close's nLockTime */
+    char *cin_signed_close_hex;             /* CIN_CLOSING: the signed close (owned) */
+    uint32_t cin_failures;                  /* failed re-runs before the close is signed */
+    uint32_t cin_next_try_height;           /* backoff for the next re-run */
 } lsp_rotation_progress_t;
+
+/* What a CIN resume does next (lsp_rotation_cin_resume_action). */
+typedef enum {
+    LSP_CIN_RESUME_NONE = 0,     /* not a CIN marker */
+    LSP_CIN_RESUME_WAIT,         /* needs every client online / a block */
+    LSP_CIN_RESUME_RERUN,        /* run the ceremony again over the recorded close */
+    LSP_CIN_RESUME_REBROADCAST,  /* the signed close is off the network: send it */
+    LSP_CIN_RESUME_FINISH,       /* the close is confirmed: finish the rotation */
+} lsp_cin_resume_action_t;
+
+/* PHASE: the marker; CLOSE_CONFS: confirmations of the recorded close (-1
+   unknown); IN_MEMPOOL; ALL_ONLINE: every client connected and able to
+   rotate this way. */
+lsp_cin_resume_action_t lsp_rotation_cin_resume_action(int phase, int close_confs,
+                                                       int in_mempool, int all_online);
 
 /* Safety margin for HTLC forwarding: outgoing cltv_expiry is reduced by this
    delta so the LSP has time to claim on-chain if the factory needs a unilateral
@@ -181,6 +229,10 @@ typedef struct {
     uint32_t rot_max_retries;           /* 0 = default (3); after N failures, broadcast dist TX */
     uint32_t rot_retry_base_delay;      /* 0 = default (10 blocks); doubles per retry */
     lsp_rotation_progress_t rot_progress; /* rotation past its close (see above) */
+    /* The last completed close-into-new rotation: a client that signed its
+       close but missed the end is told about it on reconnect. */
+    char rot_last_cin_close_txid[65];
+    char *rot_last_cin_close_hex;
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -662,4 +714,66 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
    for the new epoch.  Returns 1 = ceremony complete, 0 = no rollover,
    -1 = ceremony failed.  See src/lsp_channels.c for caller wiring. */
 int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+/* --- Close into the new factory (lsp_rotation.c) --- */
+
+/* 1 if every client of the live factory is connected, not marked offline and
+   announced that it can rotate by a co-signed close. */
+int lsp_rotation_cin_eligible(const lsp_channel_mgr_t *mgr, const lsp_t *lsp);
+
+/* 1 if the marker is a close into a new factory of DYING_FUNDING_TXID32
+   (internal order) that is not yet fully signed (phases up to
+   CIN_CLOSE_SIGNING). */
+int lsp_rotation_cin_preclose(const lsp_channel_mgr_t *mgr,
+                              const unsigned char *dying_funding_txid32);
+
+/* A marker the daemon steps each block: past the close, or a close into a
+   new factory not yet signed (re-run with backoff; dropped after the retry
+   limit, leaving the distribution TX as the fallback). */
+int lsp_rotation_progress_resumable(const lsp_channel_mgr_t *mgr);
+
+/* After a failed re-run of an unsigned close into a new factory at HEIGHT:
+   1 to keep retrying (next try set), 0 when the retry limit is reached. */
+int lsp_rotation_cin_note_failure(lsp_rotation_progress_t *rp, uint32_t height,
+                                  uint32_t max_retries, uint32_t base_delay);
+
+/* Drop such a marker (the factory falls back to the distribution TX). Returns
+   1 if one was dropped. */
+int lsp_rotation_cin_abandon(lsp_channel_mgr_t *mgr,
+                             const unsigned char *dying_funding_txid32);
+
+/* A dropped (never fully signed) close into a new factory recorded for this
+   funding: make it the marker again (CIN_CLOSE_BUILT), so a new attempt runs
+   over the same close.  Returns 1 if one was reloaded. */
+int lsp_rotation_cin_reload_recorded(lsp_channel_mgr_t *mgr,
+                                     const unsigned char *dying_funding_txid32,
+                                     uint32_t dying_funding_vout, uint32_t dying_factory_id);
+
+/* The commitment fee rate for new channels: the estimator's, at least
+   CHANNEL_COMMIT_FEE_RATE_MIN and at most CHANNEL_COMMIT_FEE_RATE_MAX. */
+uint64_t lsp_rotation_commit_fee_rate(void *fee_estimator);
+
+/* Refuse replacement keys that are not fresh: a key equal to the LSP's, to
+   any participant key of the OLD factory, to any client's identity key, or
+   to another replacement key.  CLIENT_PKS has N entries (slot order).
+   Returns 1 if acceptable; otherwise 0 with a reason in WHY (may be NULL). */
+int lsp_rotation_cin_check_keys(const secp256k1_context *ctx,
+                                const secp256k1_pubkey *lsp_pk,
+                                const secp256k1_pubkey *old_pks, size_t n_old,
+                                const secp256k1_pubkey *identity_pks,
+                                const secp256k1_pubkey *client_pks, size_t n,
+                                const char **why);
+
+/* Carry a channel's balances into a replacement channel whose usable amount
+   is NEW_USABLE: the client keeps exactly OLD_CLIENT; the LSP gets the rest,
+   so a smaller replacement (the close fee) comes out of the LSP side.
+   Refuses (0) when the LSP side would fall below RESERVE. */
+int lsp_rotation_cin_carry(uint64_t old_lsp, uint64_t old_client, uint64_t new_usable,
+                           uint64_t reserve, uint64_t *new_lsp, uint64_t *new_client);
+
+/* LSP restart: the live factory is the replacement of a close-into-new
+   rotation whose close is recorded (CIN_CLOSING / CIN_CLOSED): load that
+   marker so the daemon finishes it.  Returns 1 if loaded. */
+int lsp_rotation_load_cin_progress(lsp_channel_mgr_t *mgr,
+                                   const unsigned char *live_funding_txid32);
+
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */
