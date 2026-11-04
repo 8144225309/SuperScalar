@@ -3093,6 +3093,14 @@ int main(int argc, char *argv[]) {
             lsp_rp->n_clients = rec_n_clients;
             for (size_t i = 0; i < rec_n_clients; i++)
                 lsp_rp->client_pubkeys[i] = rec_f->pubkeys[i + 1];
+            /* Identity keys for reconnect matching.  A slot without a stored
+               identity (a factory from before per-factory keys) keeps an empty
+               entry: its identity is its factory key. */
+            if (lsp_rp->client_identity_pubkeys) {
+                size_t n_id = lsp_load_client_identities(lsp_rp, &db, ctx, 0);
+                printf("LSP recovery: %zu/%zu client identity keys loaded "
+                       "(the rest are their factory keys)\n", n_id, rec_n_clients);
+            }
 
             /* Copy factory and set fee estimator */
             lsp_rp->factory = *rec_f;
@@ -4332,6 +4340,10 @@ accept_new_factory:
             }
             if (init_ok && !persist_save_tree_nodes(&db, &lsp_p->factory, 0)) {
                 fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
+                init_ok = 0;
+            }
+            if (init_ok && !lsp_save_client_identities(lsp_p, &db, ctx, 0)) {
+                fprintf(stderr, "LSP: warning: failed to persist client identities\n");
                 init_ok = 0;
             }
             if (init_ok) {

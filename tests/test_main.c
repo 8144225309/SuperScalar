@@ -1142,7 +1142,7 @@ extern int test_rotation_marker_refused_in_open_txn(void);
 extern int test_rotation_spent_guard_resumes_logged_close(void);
 extern int test_rotation_find_logged_close(void);
 extern int test_rotation_progress_persist_roundtrip(void);
-/* Per-factory client keys */
+/* Per-factory client keys + identity/factory key split */
 extern int test_factory_key_derive_deterministic(void);
 extern int test_factory_key_hardened(void);
 extern int test_factory_key_select_reserve_and_reload(void);
@@ -1156,6 +1156,10 @@ extern int test_factory_key_no_overwrite_and_read_only_lookup(void);
 extern int test_factory_key_db_errors_refuse(void);
 extern int test_factory_key_payout_descriptors(void);
 extern int test_factory_key_hello_and_identity_rows(void);
+extern int test_lsp_identity_slot_match(void);
+extern int test_lsp_reconnect_matches_identity(void);
+extern int test_lsp_identity_recovery_fill_and_save(void);
+extern int test_lsp_hello_duplicate_keys(void);
 extern int test_tx_txid_from_bytes(void);
 extern int test_ladder_distribution_tx_signed_only(void);
 extern int test_regtest_ladder_lifecycle(void);
@@ -3168,6 +3172,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_key_db_errors_refuse);
     RUN_TEST(test_factory_key_payout_descriptors);
     RUN_TEST(test_factory_key_hello_and_identity_rows);
+    RUN_TEST(test_lsp_identity_slot_match);
+    RUN_TEST(test_lsp_reconnect_matches_identity);
+    RUN_TEST(test_lsp_identity_recovery_fill_and_save);
+    RUN_TEST(test_lsp_hello_duplicate_keys);
     RUN_TEST(test_tx_txid_from_bytes);
     RUN_TEST(test_ladder_distribution_tx_signed_only);
 

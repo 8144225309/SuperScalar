@@ -1,15 +1,20 @@
-/* Per-factory client keys (factory_keys.h): derivation, hardening,
-   refusal of reused or identity keys, the seed scan and reload after a
-   restart. */
+/* Per-factory client keys (factory_keys.h) and the LSP's identity/factory
+   key split: derivation, hardening, refusal of reused or identity keys, the
+   seed scan, reload after a restart, and reconnect matching by identity. */
 #include "superscalar/factory_keys.h"
 #include "superscalar/persist.h"
+#include "superscalar/lsp.h"
+#include "superscalar/lsp_channels.h"
 #include "superscalar/wire.h"
+#include "superscalar/musig.h"
 #include "superscalar/factory.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -558,5 +563,262 @@ int test_factory_key_hello_and_identity_rows(void) {
     TEST_ASSERT(persist_load_participant_identities(&db, 0, ctx, back, 2) == 1,
                 "stale identity dropped");
     persist_close(&db);
+    return 1;
+}
+
+/* lsp_find_client_slot_by_identity: matches identity keys, never a factory
+   key alone; an empty identity entry falls back to the factory key. */
+int test_lsp_identity_slot_match(void) {
+    secp256k1_context *ctx = fk_ctx();
+    unsigned char s[32];
+    secp256k1_pubkey fac[3], ids[3];
+    for (int i = 0; i < 3; i++) {
+        memset(s, 0x70 + i, 32);
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &fac[i], s), "fac");
+        memset(s, 0x80 + i, 32);
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &ids[i], s), "id");
+    }
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    lsp.client_pubkeys = fac;
+    lsp.n_clients = 3;
+    /* No identity array (older callers): factory keys are the identities. */
+    TEST_ASSERT(lsp_find_client_slot_by_identity(&lsp, ctx, &fac[2]) == 2, "fallback");
+    secp256k1_pubkey idarr[3];
+    memcpy(idarr, ids, sizeof(idarr));
+    memset(&idarr[1], 0, sizeof(idarr[1]));      /* slot 1: legacy client */
+    lsp.client_identity_pubkeys = idarr;
+    TEST_ASSERT(lsp_find_client_slot_by_identity(&lsp, ctx, &ids[0]) == 0, "identity 0");
+    TEST_ASSERT(lsp_find_client_slot_by_identity(&lsp, ctx, &ids[2]) == 2, "identity 2");
+    TEST_ASSERT(lsp_find_client_slot_by_identity(&lsp, ctx, &fac[0]) == -1,
+                "factory key alone does not match");
+    TEST_ASSERT(lsp_find_client_slot_by_identity(&lsp, ctx, &fac[1]) == 1,
+                "legacy slot matches by its factory key");
+    return 1;
+}
+
+/* The LSP reconnect handler finds a client by its identity key when the
+   client signs with a different factory key, and rejects the factory key. */
+int test_lsp_reconnect_matches_identity(void) {
+    secp256k1_context *ctx = fk_ctx();
+    unsigned char lsp_sec[32];
+    memset(lsp_sec, 0x10, 32);
+    secp256k1_pubkey lsp_pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec), "lsp");
+
+    secp256k1_pubkey fac[4], ids[4];
+    for (int i = 0; i < 4; i++) {
+        unsigned char s[32];
+        memset(s, 0x21 + i, 32);
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &fac[i], s), "fac");
+        memset(s, 0x91 + i, 32);
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &ids[i], s), "id");
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "alloc");
+    lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->client_identity_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
+    lsp->clients_cap = LSP_MAX_CLIENTS;
+    lsp->ctx = ctx;
+    lsp->lsp_pubkey = lsp_pk;
+    lsp->n_clients = 4;
+    lsp->listen_fd = -1;
+    lsp->bridge_fd = -1;
+    for (int i = 0; i < 4; i++) {
+        lsp->client_pubkeys[i] = fac[i];
+        lsp->client_identity_pubkeys[i] = ids[i];
+        lsp->client_fds[i] = -1;
+    }
+    secp256k1_pubkey all_pks[5];
+    all_pks[0] = lsp_pk;
+    for (int i = 0; i < 4; i++) all_pks[i + 1] = fac[i];
+    factory_t *factory = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(factory, "factory");
+    factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x01, 32);
+    spk[0] = 0x51; spk[1] = 0x20;
+    memset(spk + 2, 0xAA, 32);
+    factory_set_funding(factory, txid, 0, 100000, spk, 34);
+    factory_build_tree(factory);
+    lsp->factory = *factory;
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, factory, lsp_sec, 4), "channels init");
+
+    /* 1. RECONNECT with client 2's factory key: unknown. */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        cJSON *rc = wire_build_reconnect(ctx, &fac[2], 0);
+        TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, rc), "send");
+        cJSON_Delete(rc);
+        TEST_ASSERT(!lsp_channels_handle_reconnect(&mgr, lsp, sv[0]),
+                    "factory key alone is not a known client");
+        TEST_ASSERT(lsp->client_fds[2] < 0, "slot 2 still offline");
+        close(sv[1]);
+    }
+
+    /* 2. RECONNECT with client 2's identity key: accepted into slot 2. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    {
+        cJSON *rc = wire_build_reconnect(ctx, &ids[2], 0);
+        TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, rc), "send identity");
+        cJSON_Delete(rc);
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        wire_msg_t nm;
+        if (!wire_recv(sv[1], &nm) || nm.msg_type != MSG_CHANNEL_NONCES) _exit(2);
+        cJSON_Delete(nm.json);
+        unsigned char csec[32];
+        memset(csec, 0x23, 32);                  /* client 2's factory key */
+        secp256k1_context *cctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        secp256k1_pubkey cpk;
+        if (!secp256k1_ec_pubkey_create(cctx, &cpk, csec)) _exit(7);
+        unsigned char (*nonces)[66] = calloc(MUSIG_NONCE_POOL_MAX, 66);
+        if (!nonces) _exit(8);
+        for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+            secp256k1_musig_secnonce sn;
+            secp256k1_musig_pubnonce pn;
+            musig_keyagg_t ka;
+            secp256k1_pubkey pks[2] = { lsp_pk, cpk };
+            musig_aggregate_keys(cctx, &ka, pks, 2);
+            musig_generate_nonce(cctx, &sn, &pn, csec, &cpk, &ka.cache);
+            musig_pubnonce_serialize(cctx, nonces[i], &pn);
+        }
+        cJSON *reply = wire_build_channel_nonces(2, (const unsigned char (*)[66])nonces,
+                                                 MUSIG_NONCE_POOL_MAX);
+        wire_send(sv[1], MSG_CHANNEL_NONCES, reply);
+        cJSON_Delete(reply);
+        free(nonces);
+        wire_msg_t ack;
+        if (!wire_recv(sv[1], &ack) || ack.msg_type != MSG_RECONNECT_ACK) _exit(4);
+        uint32_t ch_id;
+        uint64_t la, ra, cn;
+        if (!wire_parse_reconnect_ack(ack.json, &ch_id, &la, &ra, &cn) || ch_id != 2)
+            _exit(5);
+        cJSON_Delete(ack.json);
+        close(sv[1]);
+        secp256k1_context_destroy(cctx);
+        _exit(0);
+    }
+    close(sv[1]);
+    int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    TEST_ASSERT(ok, "identity reconnect handled");
+    TEST_ASSERT(lsp->client_fds[2] >= 0, "slot 2 online");
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "client side ok");
+
+    lsp_channels_cleanup(&mgr);
+    if (lsp->client_fds[2] >= 0) close(lsp->client_fds[2]);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp->client_identity_pubkeys);
+    free(lsp);
+    factory_free(factory);
+    free(factory);
+    return 1;
+}
+
+/* LSP recovery of a factory stored before identity keys were recorded (no
+   identity rows), or with only some rows: every slot gets an identity (its
+   factory key when none is stored), and persisting the factory again (as a
+   rotation does) works.  A zero entry used to reach secp256k1 and abort. */
+int test_lsp_identity_recovery_fill_and_save(void) {
+    secp256k1_context *ctx = fk_ctx();
+    unsigned char s[32];
+    secp256k1_pubkey client_fac;
+    memset(s, 0x41, 32);
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &client_fac, s), "client key");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    TEST_ASSERT(save_factory_with_client_key(&db, ctx, &client_fac), "factory, no identities");
+
+    /* Factory keys of slots 1 and 2 as stored. */
+    unsigned char parts[3][33];
+    TEST_ASSERT(persist_load_participant_pubkeys33(&db, 0, parts, 3) == 3, "participants");
+    secp256k1_pubkey fac[2], ids[2];
+    TEST_ASSERT(secp256k1_ec_pubkey_parse(ctx, &fac[0], parts[1], 33) &&
+                secp256k1_ec_pubkey_parse(ctx, &fac[1], parts[2], 33), "parse");
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    lsp.client_pubkeys = fac;
+    lsp.client_identity_pubkeys = ids;
+    lsp.n_clients = 2;
+
+    /* No identity rows: 0 loaded, both filled from the factory keys. */
+    TEST_ASSERT(lsp_load_client_identities(&lsp, &db, ctx, 0) == 0, "0/2 loaded");
+    unsigned char a[33], b[33];
+    for (int i = 0; i < 2; i++) {
+        ser33(ctx, &ids[i], a);
+        TEST_ASSERT(memcmp(a, parts[i + 1], 33) == 0, "filled from factory key");
+    }
+    TEST_ASSERT(save_factory_with_client_key(&db, ctx, &client_fac), "rotation re-persist");
+    TEST_ASSERT(lsp_save_client_identities(&lsp, &db, ctx, 0), "save identities");
+
+    /* Partly loaded: slot 1 has a real identity row, slot 2 none. */
+    TEST_ASSERT(sqlite3_exec(db.db,
+        "UPDATE factory_participants SET identity_pubkey = NULL WHERE slot = 2;",
+        NULL, NULL, NULL) == SQLITE_OK, "drop slot 2 identity");
+    secp256k1_pubkey real_id;
+    memset(s, 0x42, 32);
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &real_id, s), "real id");
+    secp256k1_pubkey one[1] = { real_id };
+    TEST_ASSERT(persist_save_participant_identities(&db, 0, ctx, one, 1), "slot 1 identity");
+    memset(ids, 0, sizeof(ids));
+    TEST_ASSERT(lsp_load_client_identities(&lsp, &db, ctx, 0) == 1, "1/2 loaded");
+    ser33(ctx, &ids[0], a);
+    ser33(ctx, &real_id, b);
+    TEST_ASSERT(memcmp(a, b, 33) == 0, "slot 1 = stored identity");
+    ser33(ctx, &ids[1], a);
+    TEST_ASSERT(memcmp(a, parts[2], 33) == 0, "slot 2 = factory key");
+    TEST_ASSERT(lsp_save_client_identities(&lsp, &db, ctx, 0), "save again");
+
+    /* An all-zero entry (never filled) is skipped, not serialized. */
+    memset(&ids[1], 0, sizeof(ids[1]));
+    TEST_ASSERT(persist_save_participant_identities(&db, 0, ctx, ids, 2), "zero entry skipped");
+    TEST_ASSERT(lsp_save_client_identities(&lsp, &db, ctx, 0), "save via fallback");
+    persist_close(&db);
+    return 1;
+}
+
+/* HELLO keys that collide with a connected client (identity or factory key,
+   either way round) or with the LSP's key are refused. */
+int test_lsp_hello_duplicate_keys(void) {
+    secp256k1_context *ctx = fk_ctx();
+    unsigned char s[32];
+    secp256k1_pubkey lsp_pk, fac[2], ids[2], new_id, new_fac;
+    memset(s, 0x51, 32); TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &lsp_pk, s), "lsp");
+    for (int i = 0; i < 2; i++) {
+        memset(s, 0x52 + i, 32); TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &fac[i], s), "fac");
+        memset(s, 0x62 + i, 32); TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &ids[i], s), "id");
+    }
+    memset(s, 0x71, 32); TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &new_id, s), "new id");
+    memset(s, 0x72, 32); TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &new_fac, s), "new fac");
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    lsp.lsp_pubkey = lsp_pk;
+    lsp.client_pubkeys = fac;
+    lsp.client_identity_pubkeys = ids;
+    lsp.n_clients = 2;
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &new_id, &new_fac) == NULL, "fresh keys ok");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &ids[1], &new_fac) != NULL, "dup identity");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &new_id, &fac[0]) != NULL, "dup factory key");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &new_id, &ids[0]) != NULL,
+                "factory key = another client's identity");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &fac[1], &new_fac) != NULL,
+                "identity = another client's factory key");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &new_id, &lsp_pk) != NULL, "LSP key");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 2, &new_id, &new_id) == NULL,
+                "identity = own factory key (older client) ok");
+    TEST_ASSERT(lsp_hello_keys_conflict(&lsp, ctx, 1, &ids[1], &fac[1]) == NULL,
+                "only connected slots count");
     return 1;
 }

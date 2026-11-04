@@ -376,16 +376,7 @@ int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             secp256k1_pubkey pk;
             if (qjson && wire_json_get_hex(qjson, "pubkey", pk_buf, 33) == 33 &&
                 secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
-                int slot = -1;
-                for (size_t s = 0; s < lsp->n_clients; s++) {
-                    unsigned char s1[33], s2[33];
-                    size_t l1 = 33, l2 = 33;
-                    if (secp256k1_ec_pubkey_serialize(mgr->ctx, s1, &l1,
-                            &lsp->client_pubkeys[s], SECP256K1_EC_COMPRESSED) &&
-                        secp256k1_ec_pubkey_serialize(mgr->ctx, s2, &l2,
-                            &pk, SECP256K1_EC_COMPRESSED) &&
-                        memcmp(s1, s2, 33) == 0) { slot = (int)s; break; }
-                }
+                int slot = lsp_find_client_slot_by_identity(lsp, mgr->ctx, &pk);
                 if (slot >= 0) {
                     cJSON_Delete(qjson);
                     uint64_t cn = mgr->entries[slot].channel.commitment_number;
@@ -5760,21 +5751,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
 static int find_client_slot_by_pubkey(const lsp_t *lsp,
                                        const secp256k1_context *ctx,
                                        const secp256k1_pubkey *pk) {
-    unsigned char pk_ser[33], cmp_ser[33];
-    size_t len1 = 33, len2 = 33;
-    if (!secp256k1_ec_pubkey_serialize(ctx, pk_ser, &len1, pk,
-                                        SECP256K1_EC_COMPRESSED))
-        return -1;
-    for (size_t c = 0; c < lsp->n_clients; c++) {
-        len2 = 33;
-        if (!secp256k1_ec_pubkey_serialize(ctx, cmp_ser, &len2,
-                                            &lsp->client_pubkeys[c],
-                                            SECP256K1_EC_COMPRESSED))
-            continue;
-        if (memcmp(pk_ser, cmp_ser, 33) == 0)
-            return (int)c;
-    }
-    return -1;
+    return lsp_find_client_slot_by_identity(lsp, ctx, pk);
 }
 
 /* Core reconnect handler that takes an already-read MSG_RECONNECT message. */
@@ -5791,24 +5768,9 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* 3. Match pubkey against lsp->client_pubkeys[] to find client index */
-    int found = -1;
-    unsigned char client_ser[33], cmp_ser[33];
-    size_t len1 = 33, len2 = 33;
-    if (!secp256k1_ec_pubkey_serialize(mgr->ctx, client_ser, &len1, &client_pk,
-                                        SECP256K1_EC_COMPRESSED))
-        return 0;
-    for (size_t c = 0; c < lsp->n_clients; c++) {
-        len2 = 33;
-        if (!secp256k1_ec_pubkey_serialize(mgr->ctx, cmp_ser, &len2,
-                                            &lsp->client_pubkeys[c],
-                                            SECP256K1_EC_COMPRESSED))
-            return 0;
-        if (memcmp(client_ser, cmp_ser, 33) == 0) {
-            found = (int)c;
-            break;
-        }
-    }
+    /* 3. Match the client's identity key to find its slot (its factory key
+          may differ: per-factory keys). */
+    int found = lsp_find_client_slot_by_identity(lsp, mgr->ctx, &client_pk);
 
     if (found < 0) {
         fprintf(stderr, "LSP reconnect: unknown pubkey\n");
@@ -6871,19 +6833,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (qjson &&
                     wire_json_get_hex(qjson, "pubkey", pk_buf, 33) == 33 &&
                     secp256k1_ec_pubkey_parse(mgr->ctx, &pk, pk_buf, 33)) {
-                    int slot = -1;
-                    for (size_t s = 0; s < lsp->n_clients; s++) {
-                        unsigned char s1[33], s2[33];
-                        size_t l1 = 33, l2 = 33;
-                        if (secp256k1_ec_pubkey_serialize(mgr->ctx, s1, &l1,
-                                &lsp->client_pubkeys[s], SECP256K1_EC_COMPRESSED) &&
-                            secp256k1_ec_pubkey_serialize(mgr->ctx, s2, &l2,
-                                &pk, SECP256K1_EC_COMPRESSED) &&
-                            memcmp(s1, s2, 33) == 0) {
-                            slot = (int)s;
-                            break;
-                        }
-                    }
+                    int slot = lsp_find_client_slot_by_identity(lsp, mgr->ctx, &pk);
                     if (slot >= 0) {
                         cJSON_Delete(qjson);
                         uint64_t cn = mgr->entries[slot].channel.commitment_number;

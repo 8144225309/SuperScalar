@@ -20,7 +20,11 @@ typedef struct {
 
     /* Connected clients (dynamically allocated, capacity clients_cap) */
     int *client_fds;
-    secp256k1_pubkey *client_pubkeys;
+    secp256k1_pubkey *client_pubkeys;   /* factory (signing) keys, slot order */
+    /* Identity keys (HELLO / RECONNECT), slot order.  Differs from
+       client_pubkeys[i] when the client signs with a per-factory key.
+       NULL, or an all-zero entry, means "same as client_pubkeys[i]". */
+    secp256k1_pubkey *client_identity_pubkeys;
     size_t n_clients;
     size_t clients_cap;
     size_t expected_clients;
@@ -213,5 +217,32 @@ void lsp_ceremony_get_client_pubkey33(const lsp_t *lsp, size_t client_idx,
 
 /* Cleanup */
 void lsp_cleanup(lsp_t *lsp);
+
+/* Slot of the connected client whose identity key is PK (see
+   client_identity_pubkeys), or -1.  Never matches by factory key alone. */
+int lsp_find_client_slot_by_identity(const lsp_t *lsp, const secp256k1_context *ctx,
+                                     const secp256k1_pubkey *pk);
+
+/* Identity key of slot I (falls back to the factory key). */
+const secp256k1_pubkey *lsp_client_identity(const lsp_t *lsp, size_t i);
+
+/* Recovery: load the stored identity keys of FACTORY_ID into
+   lsp->client_identity_pubkeys (lsp->n_clients slots) and fill every slot
+   without one with its factory key (a factory stored before identities were
+   recorded).  Returns how many were loaded from DB. */
+size_t lsp_load_client_identities(lsp_t *lsp, persist_t *db,
+                                  const secp256k1_context *ctx, uint32_t factory_id);
+
+/* Persist the identity of every slot (lsp_client_identity) with FACTORY_ID.
+   Call after persist_save_factory.  Returns 1 on success. */
+int lsp_save_client_identities(const lsp_t *lsp, persist_t *db,
+                               const secp256k1_context *ctx, uint32_t factory_id);
+
+/* NULL if a HELLO with identity ID and factory key FAC may take the next
+   slot; otherwise why not: one of the keys is already used by one of the
+   first N_EXISTING clients (as identity or factory key) or is the LSP key. */
+const char *lsp_hello_keys_conflict(const lsp_t *lsp, const secp256k1_context *ctx,
+                                    size_t n_existing, const secp256k1_pubkey *id,
+                                    const secp256k1_pubkey *fac);
 
 #endif /* SUPERSCALAR_LSP_H */
