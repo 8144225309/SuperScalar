@@ -2135,7 +2135,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* This client can rotate by a co-signed close into the new factory (it
        has a DB, a pinned LSP and its own chain source). */
     if (client_cin_capable())
-        cJSON_AddNumberToObject(hello, "rotation_v", 1);
+        cJSON_AddNumberToObject(hello, "rotation_v", 2);
     if (!wire_send(fd, MSG_HELLO, hello)) {
         fprintf(stderr, "Client: send HELLO failed\n");
         cJSON_Delete(hello);

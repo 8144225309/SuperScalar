@@ -8,9 +8,11 @@
 #include "superscalar/factory.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/wire.h"
+#include "superscalar/watchtower.h"
 #include "superscalar/fee_estimator.h"
 #include "cJSON.h"
 #include <stdio.h>
+#include <secp256k1_schnorrsig.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
@@ -20,6 +22,7 @@
 #include "superscalar/client.h"
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
 #define TEST_ASSERT(cond, msg) do { \
@@ -896,6 +899,590 @@ int test_part_records(void) {
                 memcmp(keys[1], sk, 32) == 0, "unsealed on load");
     persist_close(&db);
     unlink(path);
+    return 1;
+}
+
+/* A malicious LSP asks for the old key in a partial rotation: each release
+   condition the client checks refuses on its own. */
+int test_part_release_check(void) {
+    secp256k1_context *ctx = cin_ctx();
+    char cli[] = "/tmp/ss_cin_cli_XXXXXX";
+    TEST_ASSERT(fake_cli(cli), "fake cli");
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    snprintf(rt.cli_path, sizeof(rt.cli_path), "%s", cli);
+    snprintf(rt.network, sizeof(rt.network), "regtest");
+    char path[] = "/tmp/ss_part_rc_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+
+    /* Identity, LSP, the old per-factory key (a row with a pinned context). */
+    unsigned char isk[32], lsk[32], root[32], osk[32], c33[33];
+    memset(isk, 0x61, 32); memset(lsk, 0x62, 32); memset(root, 0x61, 32);
+    secp256k1_keypair ikp, lkp, okp;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &ikp, isk) &&
+                secp256k1_keypair_create(ctx, &lkp, lsk), "keys");
+    client_set_identity_keypair(&ikp);
+    secp256k1_pubkey lpk;
+    secp256k1_keypair_pub(ctx, &lpk, &lkp);
+    size_t l33 = 33;
+    secp256k1_ec_pubkey_serialize(ctx, c33, &l33, &lpk, SECP256K1_EC_COMPRESSED);
+    uint32_t oidx = 99;
+    TEST_ASSERT(factory_key_reserve_next(&db, ctx, root, c33, osk, &oidx) &&
+                secp256k1_keypair_create(ctx, &okp, osk), "old per-factory key");
+
+    /* The replacement we signed and its funding. */
+    secp256k1_pubkey pks[3];
+    pks[0] = lpk;
+    TEST_ASSERT(mk_pk(&pks[1], 0x73) && mk_pk(&pks[2], 0x74), "pks");
+    factory_t *nf = repl_factory(pks, 200);
+    TEST_ASSERT(nf, "replacement");
+    client_funding_bind_t bind;
+    memset(&bind, 0, sizeof(bind));
+    memcpy(bind.txid, nf->funding_txid, 32);
+    bind.vout = nf->funding_vout;
+    bind.amount = nf->funding_amount_sats;
+    memcpy(bind.spk, nf->funding_spk, 34);
+    factory_t old_f;
+    memset(&old_f, 0, sizeof(old_f));
+    memset(old_f.funding_txid, 0x5a, 32);
+    old_f.funding_vout = 1;
+    channel_t och;
+    memset(&och, 0, sizeof(och));
+    och.local_amount = 5000;
+    uint64_t carried = 5000;
+    uint32_t slot = 1;
+
+    /* What an honest LSP sends. */
+    unsigned char digest[32], npk33[33], bind_ok[32], receipt[64], aux[32], out[32];
+    l33 = 33;
+    secp256k1_ec_pubkey_serialize(ctx, npk33, &l33, &pks[1], SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(factory_tree_digest(nf, digest), "digest");
+    factory_release_binding(old_f.funding_txid, 1, bind.txid, bind.vout, digest, npk33, carried,
+                            slot, bind_ok);
+    memset(aux, 0x01, 32);
+    TEST_ASSERT(secp256k1_schnorrsig_sign32(ctx, receipt, bind_ok, &lkp, aux), "receipt");
+    char ftx[65], spkh[69], txo[512];
+    unsigned char rv[32];
+    memcpy(rv, bind.txid, 32);
+    reverse_bytes(rv, 32);
+    hex_encode(rv, 32, ftx);
+    hex_encode(bind.spk, 34, spkh);
+    snprintf(txo, sizeof(txo), "{\"confirmations\":2,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"%s\"}}",
+             (double)bind.amount / 1e8, spkh);
+    setenv("SS_FAKE_TXOUT_FOR", ftx, 1);
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    client_part_set_jit_active(0);
+#define RC(kp, ch, b, rcpt, c) client_part_release_check(&rt, &db, ctx, &old_f, &lpk, kp, ch, nf, \
+        &bind, &pks[1], slot, c, bind.txid, b, rcpt, out, &oidx)
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) == NULL, "an honest request: release");
+
+    unsigned char bad[64];
+    memcpy(bad, receipt, 64);
+    bad[5] ^= 1;
+    TEST_ASSERT(RC(&okp, &och, bind_ok, bad, carried) != NULL, "a forged receipt");
+    unsigned char other[32];
+    factory_release_binding(old_f.funding_txid, 1, bind.txid, bind.vout, digest, npk33,
+                            carried - 1, slot, other);
+    unsigned char r2[64];
+    TEST_ASSERT(secp256k1_schnorrsig_sign32(ctx, r2, other, &lkp, aux), "receipt 2");
+    TEST_ASSERT(RC(&okp, &och, other, r2, carried) != NULL,
+                "a binding (and receipt) for less than our balance");
+    TEST_ASSERT(RC(&okp, &och, other, receipt, carried) != NULL,
+                "a binding that is not our position, with a receipt over ours");
+    TEST_ASSERT(RC(&ikp, &och, bind_ok, receipt, carried) != NULL,
+                "the identity key (a legacy factory) is never released");
+    client_part_set_jit_active(1);
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) != NULL, "a JIT channel is open");
+    client_part_set_jit_active(0);
+    och.local_amount = 5001;
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) != NULL,
+                "our old balance rose after the check");
+    och.local_amount = 5000;
+    snprintf(txo, sizeof(txo), "{\"confirmations\":0,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"%s\"}}",
+             (double)bind.amount / 1e8, spkh);
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) != NULL, "funding not confirmed");
+    snprintf(txo, sizeof(txo), "{\"confirmations\":2,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"%s\"}}",
+             (double)(bind.amount - 1) / 1e8, spkh);
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) != NULL, "funding amount differs");
+    snprintf(txo, sizeof(txo), "{\"confirmations\":2,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"5120%s\"}}",
+             (double)bind.amount / 1e8, "1111111111111111111111111111111111111111111111111111111111111111");
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) != NULL,
+                "the funding output pays another script");
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    TEST_ASSERT(RC(&okp, &och, bind_ok, receipt, carried) != NULL, "funding not on our chain");
+#undef RC
+
+    /* A key row with the zero context (not bound to this LSP) is never released. */
+    sqlite3_exec(db.db, "UPDATE factory_keys SET lsp_ctx = "
+                 "'000000000000000000000000000000000000000000000000000000000000000000';",
+                 NULL, NULL, NULL);
+    TEST_ASSERT(!client_part_key_releasable(&db, ctx, &okp, &oidx), "a zero-context key");
+    unsetenv("SS_FAKE_TXOUT");
+    client_set_identity_keypair(NULL);
+    factory_free(nf);
+    free(nf);
+    persist_close(&db);
+    unlink(path);
+    unlink(cli);
+    return 1;
+}
+
+/* After a partial rotation the old factory's channel rows move under the
+   retired factory's own ids (so the LSP can still defend it), and a client
+   that stayed is recognised.  A partial rotation waits for every channel of
+   the old factory, the stayers' included. */
+int test_part_retired_rows(void) {
+    char path[] = "/tmp/ss_part_rr_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    unsigned char pcs[32], got[32];
+    memset(pcs, 0x31, 32);
+    TEST_ASSERT(persist_save_local_pcs(&db, 1, 0, pcs) && persist_save_local_pcs(&db, 2, 0, pcs),
+                "per-channel rows for slots 1 and 2");
+    TEST_ASSERT(sqlite3_exec(db.db, "INSERT INTO channels (id, factory_id, slot, local_amount, "
+                             "remote_amount, funding_amount, commitment_number) VALUES "
+                             "(1, 0, 1, 10, 20, 31, 0);", NULL, NULL, NULL) == SQLITE_OK,
+                "a channel row (its id is its slot)");
+    uint32_t rf = LSP_RETIRED_FACTORY_ID(7), cid = LSP_RETIRED_CHANNEL_ID(7, 1);
+    TEST_ASSERT(persist_retire_channel_rows(&db, 0, rf, 1, cid), "retire slot 1");
+    sqlite3_stmt *st;
+    int n_slot1 = -1, n_cid = -1, n_slot2 = -1;
+    if (sqlite3_prepare_v2(db.db, "SELECT (SELECT COUNT(*) FROM local_pcs WHERE channel_id = 1),"
+                           "(SELECT COUNT(*) FROM local_pcs WHERE channel_id = ?),"
+                           "(SELECT COUNT(*) FROM local_pcs WHERE channel_id = 2);",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, cid);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n_slot1 = sqlite3_column_int(st, 0);
+            n_cid = sqlite3_column_int(st, 1);
+            n_slot2 = sqlite3_column_int(st, 2);
+        }
+        sqlite3_finalize(st);
+    }
+    TEST_ASSERT(n_slot1 == 0 && n_cid == 1 && n_slot2 == 1,
+                "slot 1's rows moved to the retired id, slot 2 untouched");
+    TEST_ASSERT(sqlite3_exec(db.db, "INSERT OR REPLACE INTO channels (id, factory_id, slot, "
+                             "local_amount, remote_amount, funding_amount, commitment_number) "
+                             "VALUES (1, 0, 1, 1, 2, 3, 0);", NULL, NULL, NULL) == SQLITE_OK,
+                "the replacement's channel at the same slot");
+    int n_kept = -1;
+    if (sqlite3_prepare_v2(db.db, "SELECT COUNT(*) FROM channels WHERE factory_id = ? AND "
+                           "slot = 1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, rf);
+        if (sqlite3_step(st) == SQLITE_ROW) n_kept = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    TEST_ASSERT(n_kept == 1, "the old channel row survives the new one at its slot");
+    memset(got, 0, 32);
+    (void)got;
+    persist_close(&db);
+    unlink(path);
+
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    mgr->ctx = cin_ctx();
+    secp256k1_pubkey a, b;
+    TEST_ASSERT(mk_pk(&a, 0x41) && mk_pk(&b, 0x42), "pks");
+    mgr->part_retired_ids[0] = a;
+    mgr->n_part_retired = 1;
+    TEST_ASSERT(lsp_rotation_part_is_retired(mgr, &a) && !lsp_rotation_part_is_retired(mgr, &b),
+                "a client that stayed is recognised");
+
+    lsp_channel_entry_t entries[2];
+    memset(entries, 0, sizeof(entries));
+    htlc_t h[1];
+    memset(h, 0, sizeof(h));
+    h[0].state = HTLC_STATE_ACTIVE;
+    entries[1].channel.htlcs = h;       /* the stayer's channel */
+    entries[1].channel.n_htlcs = 1;
+    mgr->entries = entries;
+    mgr->n_channels = 2;
+    TEST_ASSERT(!lsp_rotation_partial_may_start(mgr), "a stayer's HTLC in flight: wait");
+    h[0].state = HTLC_STATE_FULFILLED;
+    TEST_ASSERT(lsp_rotation_partial_may_start(mgr), "settled: go");
+    free(mgr);
+    return 1;
+}
+
+/* A release still owed is asked for again when the client reconnects, and
+   taken only for its old factory key. */
+int test_part_release_again(void) {
+    secp256k1_context *ctx = cin_ctx();
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    mgr->ctx = ctx;
+    memset(mgr->rot_lsp_seckey, 0x62, 32);
+    unsigned char osk[32];
+    memset(osk, 0x63, 32);
+    secp256k1_pubkey opk, npk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &opk, osk) && mk_pk(&npk, 0x64), "keys");
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, mgr->part_rel.old_pk[0], &l, &opk, SECP256K1_EC_COMPRESSED);
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, mgr->part_rel.new_pk[0], &l, &npk, SECP256K1_EC_COMPRESSED);
+    memset(mgr->part_rel.old_txid, 0x01, 32);
+    memset(mgr->part_rel.new_txid, 0x02, 32);
+    memset(mgr->part_rel.digest, 0x03, 32);
+    mgr->part_rel.carried[0] = 5000;
+    mgr->part_rel.m = 1;
+    mgr->part_rel.valid = 1;
+    mgr->part_rel.funded = 1;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    int fds[1] = { sv[0] };
+    lsp.client_fds = fds;
+    lsp.n_clients = 1;
+    TEST_ASSERT(lsp_rotation_part_on_reconnect(mgr, &lsp, 0), "asked again on reconnect");
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    TEST_ASSERT(wire_recv_timeout(sv[1], &m, 5) && m.msg_type == MSG_ROTATION_RELEASE_REQ,
+                "the client gets the request");
+    unsigned char ft[32], bind[32], rc[64];
+    TEST_ASSERT(wire_parse_rotation_release_req(m.json, ft, bind, rc), "request parses");
+    cJSON_Delete(m.json);
+    unsigned char wrong[32];
+    memset(wrong, 0x65, 32);
+    cJSON *r = wire_build_rotation_release(bind, wrong);
+    TEST_ASSERT(!lsp_rotation_part_on_release(mgr, &lsp, 0, r), "another key is not taken");
+    cJSON_Delete(r);
+    r = wire_build_rotation_release(bind, osk);
+    TEST_ASSERT(lsp_rotation_part_on_release(mgr, &lsp, 0, r) && mgr->part_rel.released[0],
+                "its old factory key is taken");
+    cJSON_Delete(r);
+    TEST_ASSERT(!lsp_rotation_part_on_reconnect(mgr, &lsp, 0), "not asked once released");
+    close(sv[0]);
+    close(sv[1]);
+    free(mgr);
+
+    /* A client that signed but was never asked switches once the funding is
+       at the safe depth, keeping its old key. */
+    TEST_ASSERT(client_cin_resolve_action("part_signed", 1, 0) == CLIENT_CIN_PROMOTE,
+                "funded at the safe depth: switch");
+    TEST_ASSERT(client_cin_resolve_action("part_signed", 0, 0) == CLIENT_CIN_NONE,
+                "not yet: stay");
+    char cli[] = "/tmp/ss_cin_cli_XXXXXX";
+    TEST_ASSERT(fake_cli(cli), "fake cli");
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    snprintf(rt.cli_path, sizeof(rt.cli_path), "%s", cli);
+    snprintf(rt.network, sizeof(rt.network), "regtest");
+    char path[] = "/tmp/ss_part_ps_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    char side[64];
+    snprintf(side, sizeof(side), "%s.rotation", path);
+    persist_t sd;
+    TEST_ASSERT(persist_open(&sd, side), "side db");
+    persist_close(&sd);
+    const char *ftx = "5656565656565656565656565656565656565656565656565656565656565656";
+    persist_client_rotation_t row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.old_txid, sizeof(row.old_txid), "%s", "5757575757575757575757575757575757575757575757575757575757575757");
+    snprintf(row.close_txid, sizeof(row.close_txid), "%s", ftx);
+    snprintf(row.state, sizeof(row.state), "part_signed");
+    snprintf(row.side_db, sizeof(row.side_db), "%s", side);
+    row.close_height = 0;
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row");
+    setenv("SS_FAKE_TXOUT_FOR", ftx, 1);
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 0}", 1);
+    TEST_ASSERT(client_cin_resolve(&db, path, &rt) == 0, "funding unconfirmed: no switch");
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 3}", 1);
+    TEST_ASSERT(client_cin_resolve(&db, path, &rt) == 1, "funded: switched without a release");
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    unsetenv("SS_FAKE_TXOUT");
+    persist_close(&db);
+    char pre[64];
+    snprintf(pre, sizeof(pre), "%s.pre-rotation", path);
+    unlink(pre);
+    unlink(path);
+    unlink(cli);
+    return 1;
+}
+
+/* Released keys: a sealed blob cannot be moved to another row, and nothing
+   is stored in the clear without a seal. */
+int test_part_seal_rows(void) {
+    char path[] = "/tmp/ss_part_sr_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    unsigned char sk[32];
+    memset(sk, 0x44, 32);
+    TEST_ASSERT(!persist_save_departed_client(&db, 3, 1, sk), "no seal: refused");
+    unsigned char seal[32];
+    memset(seal, 0x66, 32);
+    persist_set_departed_seal_key(&db, seal);
+    TEST_ASSERT(persist_save_departed_client(&db, 3, 1, sk), "sealed");
+    sqlite3_exec(db.db, "INSERT INTO departed_clients (factory_id, client_idx, extracted_key) "
+                 "SELECT factory_id, 2, extracted_key FROM departed_clients WHERE client_idx = 1;",
+                 NULL, NULL, NULL);
+    int dep[4] = {0};
+    unsigned char keys[4][32];
+    memset(keys, 0, sizeof(keys));
+    size_t nd = persist_load_departed_clients(&db, 3, dep, keys, 4);
+    TEST_ASSERT(memcmp(keys[1], sk, 32) == 0, "its own row unseals");
+    TEST_ASSERT(memcmp(keys[2], sk, 32) != 0, "a copied blob does not unseal in another row");
+    TEST_ASSERT(nd == 1 && dep[1] && !dep[2], "a key that does not unseal is no departure");
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* A release asked for later must never hand over the key the client signs
+   its current factory with: the probe a legacy client (old key = identity
+   key) whose replacement key is index 0 and whose row records index 0. */
+int test_part_release_leak(void) {
+    secp256k1_context *ctx = cin_ctx();
+    char cli[] = "/tmp/ss_cin_cli_XXXXXX";
+    TEST_ASSERT(fake_cli(cli), "fake cli");
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    snprintf(rt.cli_path, sizeof(rt.cli_path), "%s", cli);
+    snprintf(rt.network, sizeof(rt.network), "regtest");
+    char path[] = "/tmp/ss_part_lk_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    unsigned char isk[32], lsk[32], c33[33], k0[32], k1[32];
+    memset(isk, 0x71, 32); memset(lsk, 0x72, 32);
+    secp256k1_keypair ikp, lkp, kp0, kp1;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &ikp, isk) &&
+                secp256k1_keypair_create(ctx, &lkp, lsk), "keys");
+    client_set_identity_keypair(&ikp);
+    secp256k1_pubkey lpk, pk0, pk1, other;
+    secp256k1_keypair_pub(ctx, &lpk, &lkp);
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, c33, &l, &lpk, SECP256K1_EC_COMPRESSED);
+    uint32_t i0 = 99, i1 = 99;
+    TEST_ASSERT(factory_key_reserve_next(&db, ctx, isk, c33, k0, &i0) &&
+                secp256k1_keypair_create(ctx, &kp0, k0), "index 0: the replacement key");
+    secp256k1_keypair_pub(ctx, &pk0, &kp0);
+    client_set_factory_keypair(&kp0);           /* switched: our current key */
+    TEST_ASSERT(persist_factory_key_set_state(&db, i0, FACTORY_KEY_STATE_ACTIVE, 0), "active");
+    TEST_ASSERT(mk_pk(&other, 0x75), "other");
+    secp256k1_pubkey pks[3] = { lpk, pk0, other };
+    factory_t *f = repl_factory(pks, 200);
+    TEST_ASSERT(f, "the replacement (our factory now)");
+    char ftx[65], spkh[69], txo[512];
+    unsigned char rv[32];
+    memcpy(rv, f->funding_txid, 32);
+    reverse_bytes(rv, 32);
+    hex_encode(rv, 32, ftx);
+    hex_encode(f->funding_spk, 34, spkh);
+    snprintf(txo, sizeof(txo), "{\"confirmations\":2,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"%s\"}}",
+             (double)f->funding_amount_sats / 1e8, spkh);
+    setenv("SS_FAKE_TXOUT_FOR", ftx, 1);
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    client_part_set_jit_active(0);
+    client_cin_set_chain(&rt, 1);
+
+    /* An honest-format request for our position. */
+    const char *oldtx = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    unsigned char old32[32], digest[32], npk33[33], bind[32], rc[64], aux[32];
+    TEST_ASSERT(hex_decode(oldtx, old32, 32) == 32, "old txid");
+    reverse_bytes(old32, 32);
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, npk33, &l, &pk0, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(factory_tree_digest(f, digest), "digest");
+    factory_release_binding(old32, 1, f->funding_txid, f->funding_vout, digest, npk33, 5000, 1, bind);
+    memset(aux, 0x02, 32);
+    TEST_ASSERT(secp256k1_schnorrsig_sign32(ctx, rc, bind, &lkp, aux), "receipt");
+    cJSON *req = wire_build_rotation_release_req(f->funding_txid, bind, rc);
+
+    persist_client_rotation_t row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.old_txid, sizeof(row.old_txid), "%s", oldtx);
+    row.old_vout = 1;
+    snprintf(row.close_txid, sizeof(row.close_txid), "%s", ftx);
+    snprintf(row.state, sizeof(row.state), "part_switched");
+    row.close_height = f->funding_vout;
+    row.old_key_index = 0;
+    row.carried = 5000;
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row (no old key recorded)");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+#define SENT_RELEASE() ({ wire_msg_t m_; memset(&m_, 0, sizeof(m_)); int r_ = 0; \
+        if (wire_recv_timeout(sv[1], &m_, 1)) { r_ = m_.msg_type == MSG_ROTATION_RELEASE; \
+        cJSON_Delete(m_.json); } r_; })
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+                "no recorded old key: nothing released");
+
+    char h0[67];
+    unsigned char s0[33];
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, s0, &l, &pk0, SECP256K1_EC_COMPRESSED);
+    hex_encode(s0, 33, h0);
+    snprintf(row.old_pubkey, sizeof(row.old_pubkey), "%s", h0);
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row (the current key recorded)");
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+                "never the current factory key");
+    /* Even if its key row were not active any more. */
+    TEST_ASSERT(persist_factory_key_set_state(&db, i0, FACTORY_KEY_STATE_RETIRED, 0), "retired");
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+                "never the current factory key, whatever its key row says");
+    TEST_ASSERT(persist_factory_key_set_state(&db, i0, FACTORY_KEY_STATE_ACTIVE, 0), "active");
+    char st[16];
+    unsigned char kc[33], kpk[33];
+    TEST_ASSERT(persist_factory_key_get_row(&db, i0, kc, kpk, st) == 1 &&
+                strcmp(st, FACTORY_KEY_STATE_ACTIVE) == 0, "the current key is not marked released");
+
+    /* The real old key: index 1, recorded, retired: released. */
+    TEST_ASSERT(factory_key_reserve_next(&db, ctx, isk, c33, k1, &i1) &&
+                secp256k1_keypair_create(ctx, &kp1, k1), "index 1: the old key");
+    secp256k1_keypair_pub(ctx, &pk1, &kp1);
+    unsigned char s1[33];
+    char h1[67];
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, s1, &l, &pk1, SECP256K1_EC_COMPRESSED);
+    hex_encode(s1, 33, h1);
+    row.old_key_index = i1;
+    snprintf(row.old_pubkey, sizeof(row.old_pubkey), "%s", h1);
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row (the old key)");
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+                "the old key still active: refused");
+    TEST_ASSERT(persist_factory_key_set_state(&db, i1, FACTORY_KEY_STATE_RETIRED, 0), "retired");
+    snprintf(row.state, sizeof(row.state), "done");
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row done");
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+                "not a signed, unreleased partial rotation: refused");
+    snprintf(row.state, sizeof(row.state), "part_switched");
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row again");
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 1 && SENT_RELEASE(),
+                "the recorded old key is released");
+#undef SENT_RELEASE
+    persist_client_rotation_t chk;
+    memset(&chk, 0, sizeof(chk));
+    TEST_ASSERT(persist_client_rotation_load(&db, oldtx, &chk) == 1 &&
+                strcmp(chk.state, "done") == 0, "released after the switch: the row is closed");
+    free(chk.close_hex);
+    snprintf(row.state, sizeof(row.state), "part_switched");
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "an unreleased switched row");
+    (void)client_cin_resolve(&db, path, &rt);       /* the old funding is spent (not in the UTXO set) */
+    memset(&chk, 0, sizeof(chk));
+    TEST_ASSERT(persist_client_rotation_load(&db, oldtx, &chk) == 1 &&
+                strcmp(chk.state, "done") == 0, "closed once the old funding is spent");
+    free(chk.close_hex);
+    cJSON_Delete(req);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Who may take part at all. */
+    factory_t of;
+    memset(&of, 0, sizeof(of));
+    secp256k1_pubkey opks[3] = { lpk, pk1, other };
+    of.pubkeys = opks;
+    of.n_participants = 3;
+    uint32_t oi = 0;
+    char oh[67];
+    TEST_ASSERT(client_part_old_key_ok(&db, ctx, &kp1, &of, &oi, oh) && oi == i1 &&
+                strcmp(oh, h1) == 0, "a per-factory key of the old factory");
+    TEST_ASSERT(!client_part_old_key_ok(&db, ctx, &ikp, &of, &oi, oh),
+                "the identity key (a legacy factory): refused before signing");
+    opks[1] = other;
+    TEST_ASSERT(!client_part_old_key_ok(&db, ctx, &kp1, &of, &oi, oh),
+                "a key that is not ours in the old factory");
+    of.pubkeys = NULL;
+
+    client_set_factory_keypair(NULL);
+    client_set_identity_keypair(NULL);
+    client_cin_set_chain(NULL, 1);
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    unsetenv("SS_FAKE_TXOUT");
+    factory_free(f);
+    free(f);
+    persist_close(&db);
+    unlink(path);
+    unlink(cli);
+    return 1;
+}
+
+/* After an LSP restart the watch entries of a retired channel are loaded
+   again, and a client that stayed is still recognised. */
+int test_part_retired_restart(void) {
+    char path[] = "/tmp/ss_part_rs_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    uint32_t rcid = LSP_RETIRED_CHANNEL_ID(3, 2), rf = LSP_RETIRED_FACTORY_ID(3);
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x7a, 32);
+    memset(spk, 0x51, 34);
+    TEST_ASSERT(persist_save_old_commitment(&db, rcid, 4, txid, 0, 1000, spk, 34),
+                "a revoked commitment of the retired channel");
+    secp256k1_pubkey id;
+    TEST_ASSERT(mk_pk(&id, 0x7b), "identity");
+    unsigned char id33[33];
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(cin_ctx(), id33, &l, &id, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(persist_save_retired_channel(&db, rcid, rf, 2, id33), "retired channel");
+    watchtower_t *wt = calloc(1, sizeof(*wt));
+    TEST_ASSERT(wt && watchtower_init(wt, 2, NULL, NULL, &db), "watchtower");
+    int found = 0;
+    for (size_t i = 0; i < wt->n_entries; i++)
+        if (wt->entries[i].channel_id == rcid && wt->entries[i].commit_num == 4) found = 1;
+    TEST_ASSERT(found, "the retired channel's entry is watched again");
+    watchtower_cleanup(wt);
+    free(wt);
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    mgr->ctx = cin_ctx();
+    mgr->persist = &db;
+    TEST_ASSERT(lsp_rotation_part_is_retired(mgr, &id), "the stayer is recognised from the DB");
+    free(mgr);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+static int g_queued[8];
+static size_t g_n_queued;
+static void capture_queue(void *arg, const wire_msg_t *m) {
+    (void)arg;
+    if (g_n_queued < 8) g_queued[g_n_queued++] = m->msg_type;
+    cJSON_Delete(m->json);
+}
+
+/* A malicious LSP slips the old key turnover into a payment: while the
+   client waits for COMMITMENT_SIGNED it sends a ROTATION_BEGIN of its own and
+   a PTLC_PRESIG.  Nothing is adapted or sent but a refusal; the begin goes to
+   the daemon loop, which checks it. */
+int test_inline_turnover_refused(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    unsigned char d[32], nn[32], presig[64], tm[32];
+    memset(d, 0x11, 32); memset(nn, 0x12, 32); memset(presig, 0x13, 64); memset(tm, 0x14, 32);
+    cJSON *rb = wire_build_rotation_begin(d, nn, 7);
+    cJSON *ps = wire_build_ptlc_presig(presig, 0, tm);
+    cJSON *cs = cJSON_CreateObject();
+    TEST_ASSERT(rb && ps && cs && wire_send(sv[1], MSG_ROTATION_BEGIN, rb) &&
+                wire_send(sv[1], MSG_PTLC_PRESIG, ps) && wire_send(sv[1], MSG_COMMITMENT_SIGNED, cs),
+                "the LSP's messages");
+    cJSON_Delete(rb); cJSON_Delete(ps); cJSON_Delete(cs);
+    g_n_queued = 0;
+    wire_msg_t m;
+    TEST_ASSERT(client_recv_expected(sv[0], &m, 5, MSG_COMMITMENT_SIGNED, capture_queue, NULL),
+                "the payment flow gets its COMMITMENT_SIGNED");
+    cJSON_Delete(m.json);
+    TEST_ASSERT(g_n_queued == 1 && g_queued[0] == MSG_ROTATION_BEGIN,
+                "the begin is left for the daemon loop; the pre-signature is not passed on");
+    wire_msg_t r;
+    memset(&r, 0, sizeof(r));
+    TEST_ASSERT(wire_recv_timeout(sv[1], &r, 2) && r.msg_type == MSG_ERROR,
+                "the pre-signature is refused");
+    cJSON_Delete(r.json);
+    memset(&r, 0, sizeof(r));
+    TEST_ASSERT(!wire_recv_timeout(sv[1], &r, 1) || r.msg_type != MSG_PTLC_ADAPTED_SIG,
+                "no adapted signature (no key) ever goes back");
+    if (r.json) cJSON_Delete(r.json);
+    wire_msg_t pm;
+    memset(&pm, 0, sizeof(pm));
+    pm.msg_type = MSG_PTLC_PRESIG;
+    TEST_ASSERT(client_refuse_key_turnover(-1, &pm), "the daemon loop uses the same gate");
+    close(sv[0]);
+    close(sv[1]);
     return 1;
 }
 

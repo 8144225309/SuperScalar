@@ -615,108 +615,28 @@ static void rotation_ctx_set(const unsigned char *dying_txid,
     g_rotation_ctx.expecting = 1;
 }
 
-static void rotation_ctx_clear(void) {
-    memset(&g_rotation_ctx, 0, sizeof(g_rotation_ctx));
-}
 
 /* Returns 1 iff presig turnover_msg matches expected; 0 otherwise. */
-static int rotation_ctx_check_presig(const unsigned char *received_turnover_msg) {
-    if (!g_rotation_ctx.expecting) return 0;
-    if (memcmp(received_turnover_msg,
-               g_rotation_ctx.expected_turnover_msg, 32) != 0) return 0;
-    return 1;
+
+static void inbox_queue(void *arg, const wire_msg_t *m) {
+    client_inbox_push((client_inbox_t *)arg, m);
 }
 
-/* Handle a PTLC_PRESIG message inline (when received during a blocking wait
-   for another message type like COMMITMENT_SIGNED).  This prevents the rotation
-   PTLC from being silently discarded when it arrives mid-HTLC-flow. */
-static void handle_ptlc_presig_inline(int fd, wire_msg_t *msg,
-                                       secp256k1_context *ctx,
-                                       const secp256k1_keypair *keypair,
-                                       uint32_t my_index) {
-    unsigned char presig[64], turnover_msg[32];
-    int nonce_parity;
-    if (!wire_parse_ptlc_presig(msg->json, presig, &nonce_parity, turnover_msg)) {
-        fprintf(stderr, "Client %u: bad inline PTLC_PRESIG\n", my_index);
-        return;
-    }
-    /* SF-PTLC-TURNOVER-AUTH #196: refuse if no matching ROTATION_BEGIN. */
-    if (!rotation_ctx_check_presig(turnover_msg)) {
-        fprintf(stderr, "Client %u: REJECTED inline PTLC_PRESIG (no matching ROTATION_BEGIN; adversarial LSP suspected, #196)\n", my_index);
-        rotation_ctx_clear();
-        return;
-    }
-    rotation_ctx_clear();
-    unsigned char my_seckey[32];
-    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair))
-        return;
-    unsigned char adapted_sig[64];
-    if (!adaptor_adapt(ctx, adapted_sig, presig, my_seckey, nonce_parity)) {
-        memset(my_seckey, 0, 32);
-        return;
-    }
-    memset(my_seckey, 0, 32);
-    cJSON *reply = wire_build_ptlc_adapted_sig(adapted_sig);
-    wire_send(fd, MSG_PTLC_ADAPTED_SIG, reply);
-    cJSON_Delete(reply);
-    printf("Client %u: handled PTLC_PRESIG inline (mid-HTLC flow)\n", my_index);
-}
-
-/* Receive a specific message type, handling PTLC_PRESIG inline if it arrives
-   instead.  Returns 1 if expected message received, 0 on timeout/error. */
+/* Receive a specific message type inside a payment flow (see
+   client_recv_expected: the old key turnover is refused there too, and any
+   other message goes to the inbox for the daemon loop).  Returns 1 if the
+   expected message was received, 0 on timeout/error. */
 static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
                                 uint8_t expected_type,
                                 secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 uint32_t my_index,
                                 client_inbox_t *inbox) {
-    struct timeval start, now;
-    gettimeofday(&start, NULL);
-    while (1) {
-        gettimeofday(&now, NULL);
-        int elapsed = (int)(now.tv_sec - start.tv_sec);
-        int remaining = timeout_sec - elapsed;
-        if (remaining <= 0)
-            return 0;
-        if (!wire_recv_timeout(fd, msg, remaining))
-            return 0;
-        if (msg->msg_type == expected_type)
-            return 1;
-        if (msg->msg_type == MSG_ROTATION_BEGIN) {
-            /* SF-PTLC-TURNOVER-AUTH #196: record rotation context inline
-               so an inline PTLC_PRESIG (mid-HTLC-flow) can validate. */
-            unsigned char dt[32], nn[32];
-            uint64_t ep = 0;
-            if (wire_parse_rotation_begin(msg->json, dt, nn, &ep)) {
-                rotation_ctx_set(dt, nn, ep);
-                printf("Client %u: ROTATION_BEGIN accepted inline (epoch=%llu)\n",
-                       my_index, (unsigned long long)ep);
-            } else {
-                fprintf(stderr, "Client %u: bad inline ROTATION_BEGIN\n", my_index);
-            }
-            cJSON_Delete(msg->json);
-            msg->json = NULL;
-            continue;
-        }
-        if (msg->msg_type == MSG_PTLC_PRESIG) {
-            handle_ptlc_presig_inline(fd, msg, ctx, keypair, my_index);
-            cJSON_Delete(msg->json);
-            msg->json = NULL;
-            continue;  /* Retry for the expected message */
-        }
-        /* Unexpected non-PTLC message: queue to inbox so the daemon loop
-           can process it, rather than silently discarding it. */
-        if (msg->msg_type == MSG_ERROR)
-            return 0;  /* propagate abort */
-        if (inbox) {
-            client_inbox_push(inbox, msg);
-            msg->json = NULL;  /* inbox owns the json now */
-        } else {
-            cJSON_Delete(msg->json);
-            msg->json = NULL;
-        }
-        continue;  /* keep waiting for expected_type */
-    }
+    (void)ctx;
+    (void)keypair;
+    (void)my_index;
+    return client_recv_expected(fd, msg, timeout_sec, expected_type,
+                                inbox ? inbox_queue : NULL, inbox);
 }
 
 /* Persist the latest commitment TX signature to DB.
@@ -1596,13 +1516,28 @@ handle_message:
             break;
         }
 
+        case MSG_ROTATION_RELEASE_REQ: {
+            /* A release still owed for a partial rotation we switched out of. */
+            client_part_set_jit_active(cbd && cbd->jit_ch &&
+                                       cbd->jit_ch->state != JIT_STATE_NONE &&
+                                       cbd->jit_ch->state != JIT_STATE_CLOSED);
+            (void)client_part_on_release_req(fd, ctx, cbd ? cbd->db : NULL, factory, msg.json);
+            cJSON_Delete(msg.json);
+            break;
+        }
+
         case MSG_ROTATION_BEGIN: {
             /* Close into the new factory: answer with a fresh factory key. */
             {
                 cJSON *vj = cJSON_GetObjectItem(msg.json, "v");
                 cJSON *mj = cJSON_GetObjectItem(msg.json, "mode");
                 if (vj && cJSON_IsNumber(vj) && vj->valuedouble >= 1 && mj &&
-                    cJSON_IsString(mj) && strcmp(mj->valuestring, "close_into_new") == 0) {
+                    cJSON_IsString(mj) &&
+                    (strcmp(mj->valuestring, "close_into_new") == 0 ||
+                     (strcmp(mj->valuestring, "partial") == 0 && vj->valuedouble >= 2))) {
+                    client_part_set_jit_active(cbd && cbd->jit_ch &&
+                                               cbd->jit_ch->state != JIT_STATE_NONE &&
+                                               cbd->jit_ch->state != JIT_STATE_CLOSED);
                     if (!client_cin_on_begin(fd, ctx, cbd ? cbd->db : NULL, factory, ch,
                                              msg.json)) {
                         cJSON *e = wire_build_error("rotation refused");
@@ -1631,53 +1566,14 @@ handle_message:
             break;
         }
 
-        case MSG_PTLC_PRESIG: {
-            /* LSP sends adaptor pre-signature for PTLC key turnover */
-            unsigned char presig[64], turnover_msg[32];
-            int nonce_parity;
-            if (!wire_parse_ptlc_presig(msg.json, presig, &nonce_parity, turnover_msg)) {
-                fprintf(stderr, "Client %u: bad PTLC_PRESIG\n", my_index);
-                cJSON_Delete(msg.json);
-                break;
-            }
+        case MSG_PTLC_PRESIG:
+        case MSG_PTLC_COMPLETE:
+            /* The old key turnover: refused (the same gate as inside payment
+               flows; a partial rotation releases a key only after the
+               client's own checks). */
+            (void)client_refuse_key_turnover(fd, &msg);
             cJSON_Delete(msg.json);
-
-            /* SF-PTLC-TURNOVER-AUTH #196: refuse if no matching ROTATION_BEGIN. */
-            if (!rotation_ctx_check_presig(turnover_msg)) {
-                fprintf(stderr, "Client %u: REJECTED PTLC_PRESIG (no matching ROTATION_BEGIN; adversarial LSP suspected, #196)\n", my_index);
-                rotation_ctx_clear();
-                break;
-            }
-            rotation_ctx_clear();
-
-            /* Adapt with our secret key */
-            unsigned char my_seckey[32];
-            if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
-                fprintf(stderr, "Client %u: keypair_sec failed\n", my_index);
-                break;
-            }
-            unsigned char adapted_sig[64];
-            if (!adaptor_adapt(ctx, adapted_sig, presig, my_seckey, nonce_parity)) {
-                fprintf(stderr, "Client %u: adaptor_adapt failed\n", my_index);
-                memset(my_seckey, 0, 32);
-                break;
-            }
-            memset(my_seckey, 0, 32);
-
-            /* Send adapted signature back */
-            cJSON *reply = wire_build_ptlc_adapted_sig(adapted_sig);
-            wire_send(fd, MSG_PTLC_ADAPTED_SIG, reply);
-            cJSON_Delete(reply);
-
-            /* Receive PTLC_COMPLETE acknowledgement (5s timeout) */
-            wire_msg_t complete_msg;
-            if (wire_recv_timeout(fd, &complete_msg, 5)) {
-                if (complete_msg.msg_type == MSG_PTLC_COMPLETE)
-                    printf("Client %u: PTLC departure complete\n", my_index);
-                cJSON_Delete(complete_msg.json);
-            }
             break;
-        }
 
         case MSG_PING: {
             /* Keepalive ping from LSP: respond with pong */
@@ -1972,6 +1868,19 @@ handle_message:
             {
                 cJSON *rj = cJSON_GetObjectItem(msg.json, "rotation");
                 cJSON *mj = rj ? cJSON_GetObjectItem(rj, "mode") : NULL;
+                if (mj && cJSON_IsString(mj) && strcmp(mj->valuestring, "partial") == 0) {
+                    client_part_set_jit_active(cbd && cbd->jit_ch &&
+                                               cbd->jit_ch->state != JIT_STATE_NONE &&
+                                               cbd->jit_ch->state != JIT_STATE_CLOSED);
+                    int part_ok = client_part_run(fd, ctx, cbd ? cbd->db : NULL,
+                                                  cbd ? cbd->poison_db_path : NULL,
+                                                  keypair, factory, ch, &msg);
+                    cJSON_Delete(msg.json);
+                    if (part_ok)
+                        printf("Client %u: rotation complete, reconnecting with new "
+                               "factory\n", my_index);
+                    return 0;
+                }
                 if (mj && cJSON_IsString(mj) &&
                     strcmp(mj->valuestring, "close_into_new") == 0) {
                     int cin_ok = client_cin_run(fd, ctx, cbd ? cbd->db : NULL,

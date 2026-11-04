@@ -19,6 +19,7 @@
 #include "superscalar/channel.h"
 #include "superscalar/wire.h"
 #include "superscalar/regtest.h"
+#include "superscalar/client.h"
 
 /* Whether this client announces "rotation_v": it needs a DB, a pinned LSP
    context and its own chain source (set once at startup). */
@@ -59,6 +60,21 @@ void client_cin_chain_view(regtest_t *rt, persist_t *db,
 /* 1 if OLD_F's funding output is unspent on RT (a rotation is refused
    otherwise). */
 int client_cin_old_funding_unspent(regtest_t *rt, const factory_t *old_f);
+
+/* The one gate for the old PTLC key turnover, wherever a message is
+   received: a new client never completes it (it would reveal the key it
+   signs its factory with).  A PTLC_PRESIG is answered with MSG_ERROR.
+   Returns 1 if M is a turnover message (the caller drops it). */
+int client_refuse_key_turnover(int fd, const wire_msg_t *m);
+
+/* Receive until a message of type EXPECTED arrives (1) or TIMEOUT_SEC pass /
+   the connection fails / MSG_ERROR arrives (0), inside a payment flow.
+   Turnover messages are refused (client_refuse_key_turnover); every other
+   message, a rotation begin included, is handed to QUEUE (which takes its
+   JSON) for the daemon loop, or dropped if QUEUE is NULL. */
+typedef void (*client_queue_fn)(void *arg, const wire_msg_t *m);
+int client_recv_expected(int fd, wire_msg_t *msg, int timeout_sec, uint8_t expected,
+                         client_queue_fn queue, void *queue_arg);
 
 /* The close's nLockTime height is not in the future: at most TIP + 1. */
 int client_cin_check_close_height(uint32_t close_height, int tip);
@@ -135,5 +151,66 @@ int client_cin_check_close(const secp256k1_context *ctx, const factory_t *old_f,
                            uint64_t funding_amount, uint32_t funding_vout,
                            const unsigned char funding_txid32[32], uint32_t close_height,
                            const char **why);
+
+/* --- Partial rotation with verified release ("rotation_v" 2) ---
+   MSG_FACTORY_PROPOSE carrying "rotation": {"mode":"partial", "pubkeys": the
+   LSP and the fresh keys of the clients moving}.  Signs the replacement over
+   the LSP's (unbroadcast) funding with the same checks as a close into the
+   new factory, stores it, and on MSG_ROTATION_RELEASE_REQ releases the old
+   factory key only if: the funding is confirmed at the safe depth on our
+   chain with the proposed amount and script, the binding is exactly our
+   position and the LSP's receipt over it verifies, the old key is a
+   per-factory key bound to this LSP (never the identity key), no JIT
+   channel is open, and the old channel is unchanged.  "released" is written
+   before the key is sent.  Returns 1 once released (client_cin_resolve then
+   makes the side DB the main DB before the reconnect). */
+int client_part_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db_path,
+                    const secp256k1_keypair *old_kp, factory_t *old_f, channel_t *old_ch,
+                    const wire_msg_t *propose);
+
+/* The release decision for a MSG_ROTATION_RELEASE_REQ (REQ_TXID32,
+   REQ_BINDING32, RECEIPT64): NULL if the old key may be released (then
+   BINDING_OUT32 is our own binding and *OLD_IDX_OUT the old key's index),
+   else the reason.  NF is the replacement we signed, BIND its funding, NPK
+   and SLOT our key and slot there, CARRIED our verified balance in it,
+   LSP_PK the LSP's key. */
+const char *client_part_release_check(regtest_t *rt, persist_t *db, secp256k1_context *ctx,
+                                      const factory_t *old_f, const secp256k1_pubkey *lsp_pk,
+                                      const secp256k1_keypair *old_kp, const channel_t *old_ch,
+                                      const factory_t *nf, const client_funding_bind_t *bind,
+                                      const secp256k1_pubkey *npk, uint32_t slot,
+                                      uint64_t carried, const unsigned char req_txid32[32],
+                                      const unsigned char req_binding32[32],
+                                      const unsigned char receipt64[64],
+                                      unsigned char binding_out32[32], uint32_t *old_idx_out);
+
+/* MSG_ROTATION_RELEASE_REQ received later (after the switch to the funded
+   replacement F, which is our factory now): the same release checks, with
+   the old key and carried balance from the rotation row.  Returns 1 if the
+   key was released. */
+int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
+                               const factory_t *f, const cJSON *req);
+
+/* Whether a JIT channel is open (its key must not be released with the
+   factory key). */
+void client_part_set_jit_active(int active);
+
+/* 1 if OLD_KP may be released: not the identity key, and a factory-key row
+   with a non-zero (pinned) LSP context; *IDX_OUT gets its index. */
+int client_part_key_releasable(persist_t *db, secp256k1_context *ctx,
+                               const secp256k1_keypair *old_kp, uint32_t *idx_out);
+
+/* 1 if OLD_KP is this client's key in OLD_F (a participant other than the
+   LSP) and may be released (client_part_key_releasable); *IDX_OUT gets its
+   index and PUB_HEX_OUT its compressed pubkey (hex).  A partial rotation is
+   refused before anything is signed otherwise. */
+int client_part_old_key_ok(persist_t *db, secp256k1_context *ctx,
+                           const secp256k1_keypair *old_kp, const factory_t *old_f,
+                           uint32_t *idx_out, char pub_hex_out[67]);
+
+/* 1 if TXID32:VOUT (internal order) is in RT's UTXO set at the safe depth,
+   paying AMOUNT to SPK34. */
+int client_part_funding_confirmed(regtest_t *rt, const unsigned char txid32[32], uint32_t vout,
+                                  uint64_t amount, const unsigned char spk34[34]);
 
 #endif /* SUPERSCALAR_CLIENT_ROTATION_H */
