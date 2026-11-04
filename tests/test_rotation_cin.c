@@ -41,6 +41,46 @@ static int mk_pk(secp256k1_pubkey *pk, unsigned char b) {
     return secp256k1_ec_pubkey_create(cin_ctx(), pk, s);
 }
 
+/* Who moves in a partial rotation: connected, able ("rotation_v" >= 2),
+   not marked offline. */
+int test_part_lsp_set(void) {
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    int fds[3] = { 5, 6, -1 };
+    uint8_t rv[3] = { 2, 1, 2 };
+    secp256k1_pubkey fpk[3], ipk[3];
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(mk_pk(&fpk[i], (unsigned char)(0x21 + i)) &&
+                    mk_pk(&ipk[i], (unsigned char)(0x31 + i)), "keys");
+    lsp.ctx = cin_ctx();
+    lsp.client_fds = fds;
+    lsp.client_rotation_v = rv;
+    lsp.client_pubkeys = fpk;
+    lsp.client_identity_pubkeys = ipk;
+    lsp.n_clients = 3;
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    lsp_channel_entry_t entries[3];
+    memset(entries, 0, sizeof(entries));
+    mgr->entries = entries;
+    mgr->n_channels = 3;
+    unsigned char set[3];
+    TEST_ASSERT(lsp_rotation_partial_set(mgr, &lsp, set) == 1 && set[0] && !set[1] && !set[2],
+                "only the connected client that can release safely");
+    ipk[0] = fpk[0];
+    TEST_ASSERT(lsp_rotation_partial_set(mgr, &lsp, set) == 0 && !set[0],
+                "a legacy client (factory key = identity key) never moves");
+    ipk[0] = fpk[1];
+    TEST_ASSERT(lsp_rotation_partial_set(mgr, &lsp, set) == 1, "a per-factory key moves");
+    TEST_ASSERT(lsp_rotation_any_upgraded(&lsp), "upgraded clients: never the old turnover");
+    entries[0].offline_detected = 1;
+    TEST_ASSERT(lsp_rotation_partial_set(mgr, &lsp, set) == 0, "marked offline");
+    rv[0] = rv[1] = rv[2] = 0;
+    TEST_ASSERT(!lsp_rotation_any_upgraded(&lsp), "no upgraded client");
+    free(mgr);
+    return 1;
+}
+
 /* Every marker maps to the right next step. */
 int test_cin_resume_action(void) {
     TEST_ASSERT(lsp_rotation_cin_resume_action(LSP_ROT_PROGRESS_CLOSED, -1, 0, 1) ==

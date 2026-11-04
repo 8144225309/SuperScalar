@@ -69,6 +69,17 @@
 #define LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING  13
 #define LSP_ROT_PROGRESS_CIN_CLOSING        14
 #define LSP_ROT_PROGRESS_CIN_CLOSED         15
+/* Partial rotation with verified release (some old clients offline):
+     PART_BUILT    the replacement's funding (to the fresh keys of the clients
+                   moving) is built and signed, NOT broadcast
+     PART_SIGNING  its creation ceremony runs (sign before fund)
+     PART_FUNDING  the replacement, its channels and identities are recorded;
+                   the funding may be on the network
+     PART_FUNDED   the funding is confirmed: clients release their old keys */
+#define LSP_ROT_PROGRESS_PART_BUILT    20
+#define LSP_ROT_PROGRESS_PART_SIGNING  21
+#define LSP_ROT_PROGRESS_PART_FUNDING  22
+#define LSP_ROT_PROGRESS_PART_FUNDED   23
 #define LSP_ROT_PROGRESS_IS_CIN(ph) ((ph) >= LSP_ROT_PROGRESS_CIN_CLOSE_BUILT && \
                                      (ph) <= LSP_ROT_PROGRESS_CIN_CLOSED)
 typedef struct {
@@ -233,6 +244,25 @@ typedef struct {
        close but missed the end is told about it on reconnect. */
     char rot_last_cin_close_txid[65];
     char *rot_last_cin_close_hex;
+    /* Partial rotation: the releases still owed (asked again on reconnect)
+       and the identities of the clients that stayed in the old factory. */
+    struct {
+        int valid, funded;
+        uint32_t dying_id;
+        unsigned char old_txid[32];
+        uint32_t old_vout;
+        unsigned char new_txid[32];
+        uint32_t new_vout;
+        unsigned char digest[32];
+        size_t m;
+        unsigned char old_pk[FACTORY_MAX_SIGNERS][33];   /* old factory key, by new slot */
+        unsigned char new_pk[FACTORY_MAX_SIGNERS][33];
+        uint32_t old_slot[FACTORY_MAX_SIGNERS];
+        uint64_t carried[FACTORY_MAX_SIGNERS];
+        unsigned char released[FACTORY_MAX_SIGNERS];
+    } part_rel;
+    secp256k1_pubkey part_retired_ids[FACTORY_MAX_SIGNERS];
+    size_t n_part_retired;
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -724,6 +754,41 @@ int lsp_rotation_cin_eligible(const lsp_channel_mgr_t *mgr, const lsp_t *lsp);
    an HTLC in flight.  A rotation waits for this: the replacement carries the
    old balances, so nothing may be pending on either side. */
 int lsp_rotation_channels_quiet(const lsp_channel_mgr_t *mgr, const unsigned char *in_set);
+
+/* The clients that can move in a partial rotation now (IN_SET[c] = 1):
+   connected, not marked offline, announced "rotation_v" >= 2, and no open
+   JIT channel.  Returns how many. */
+size_t lsp_rotation_partial_set(const lsp_channel_mgr_t *mgr, const lsp_t *lsp,
+                                unsigned char *in_set);
+
+/* 1 if client C signs the live factory with its identity key (a legacy
+   factory): it never takes part in a partial rotation. */
+int lsp_rotation_client_is_legacy(const lsp_t *lsp, size_t c);
+
+/* 1 if any client of the factory announced "rotation_v". */
+int lsp_rotation_any_upgraded(const lsp_t *lsp);
+
+/* A partial rotation may start: no HTLC in flight on ANY channel of the old
+   factory (the clients that stay are not served by the replacement). */
+int lsp_rotation_partial_may_start(const lsp_channel_mgr_t *mgr);
+
+/* After client C (new slot) reconnects: ask again for its release if it is
+   still owed and the replacement is funded.  Returns 1 if a request was sent. */
+int lsp_rotation_part_on_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c);
+
+/* MSG_ROTATION_RELEASE from client C: check the key against the old factory
+   and store it sealed.  Returns 1 if it was taken. */
+int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                 const cJSON *json);
+
+/* 1 if PK is the identity of a client that stayed in a factory retired by a
+   partial rotation. */
+int lsp_rotation_part_is_retired(const lsp_channel_mgr_t *mgr, const secp256k1_pubkey *pk);
+
+/* Where a retired factory's rows are kept (see persist_retire_channel_rows). */
+#define LSP_RETIRED_FACTORY_ID(dying_id) (0x10000u + ((dying_id) & 0xffffu))
+#define LSP_RETIRED_CHANNEL_ID(dying_id, slot) \
+    (0x40000000u + (((dying_id) & 0xffffu) << 8) + ((slot) & 0xffu))
 
 /* 1 if the marker is a close into a new factory of DYING_FUNDING_TXID32
    (internal order) that is not yet fully signed (phases up to

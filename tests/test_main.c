@@ -1162,6 +1162,7 @@ extern int test_lsp_identity_recovery_fill_and_save(void);
 extern int test_lsp_hello_duplicate_keys(void);
 /* Rotation by a co-signed close into the new factory */
 extern int test_cin_resume_action(void);
+extern int test_part_lsp_set(void);
 extern int test_cin_check_keys(void);
 extern int test_cin_preclose_fallback(void);
 extern int test_cin_reuse_recorded_close(void);
@@ -3200,6 +3201,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_identity_recovery_fill_and_save);
     RUN_TEST(test_lsp_hello_duplicate_keys);
     RUN_TEST(test_cin_resume_action);
+    RUN_TEST(test_part_lsp_set);
     RUN_TEST(test_cin_check_keys);
     RUN_TEST(test_cin_preclose_fallback);
     RUN_TEST(test_cin_reuse_recorded_close);
