@@ -1155,6 +1155,9 @@ extern int test_regtest_force_close_to_local(void);
 extern int test_regtest_breach_penalty_spendability(void);
 extern int test_regtest_ps_chain_close_spendability(void);
 extern int test_regtest_htlc_in_flight_spendability(void);
+extern int test_htlc_claim_local_commit(void);
+extern int test_htlc_claim_remote_commit(void);
+extern int test_htlc_claim_preimage_script(void);
 extern int test_regtest_rotation_all_arities(void);
 extern int test_regtest_full_tree_force_close_all_arities(void);
 extern int test_regtest_k2_ps_subfactory_force_close(void);
@@ -3790,6 +3793,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_with_real_htlc);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
+    RUN_TEST(test_htlc_claim_local_commit);
+    RUN_TEST(test_htlc_claim_remote_commit);
+    RUN_TEST(test_htlc_claim_preimage_script);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
     RUN_TEST(test_regtest_param_sanitization);
