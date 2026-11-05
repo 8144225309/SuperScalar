@@ -13,8 +13,13 @@
  *   test_htlc_claim_schema_upgrade        v39 -> v40 pending_sweeps migration
  *   test_htlc_claim_priority_timing       claim timing vs the CLTV / timeout path
  *   test_htlc_claim_lsp_sender_selection  LSP arms claims on sender channels
+ * Regtest drills (bitcoind):
+ *   test_regtest_htlc_claim_lsp_payee          sender = client
+ *   test_regtest_htlc_claim_lsp_payee_restart  same, payee restarts
+ *   test_regtest_htlc_claim_client_payee       sender = LSP
  */
 
+#include "superscalar/regtest.h"   /* before chain_backend.h: regtest init */
 #include "superscalar/channel.h"
 #include "superscalar/sweeper.h"
 #include "superscalar/persist.h"
@@ -2359,6 +2364,385 @@ int test_htlc_claim_lsp_sender_selection(void)
     free(mgr);
     pair_cleanup(&a);
     pair_cleanup(&b);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Regtest drills                                                       */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    regtest_t rt;
+    chain_backend_t chain;
+    char mine_addr[128];
+    unsigned char fund_txid[32];
+    uint32_t fund_vout;
+    uint64_t fund_amount;
+} drill_t;
+
+static int drill_setup(drill_t *d, secp256k1_context *ctx, const char *wallet)
+{
+    memset(d, 0, sizeof(*d));
+    if (!regtest_init(&d->rt)) return -1;
+    regtest_create_wallet(&d->rt, wallet);
+    if (!regtest_get_new_address(&d->rt, d->mine_addr, sizeof(d->mine_addr)))
+        return 0;
+    if (!regtest_fund_from_faucet(&d->rt, 1.0))
+        regtest_mine_blocks(&d->rt, 101, d->mine_addr);
+    chain_backend_regtest_init(&d->chain, &d->rt);
+
+    secp256k1_keypair a, b;
+    secp256k1_keypair_create(ctx, &a, LSP_SECKEY);
+    secp256k1_keypair_create(ctx, &b, CLI_SECKEY);
+    secp256k1_pubkey pa, pb;
+    secp256k1_keypair_pub(ctx, &pa, &a);
+    secp256k1_keypair_pub(ctx, &pb, &b);
+    unsigned char spk[34], xonly[32];
+    if (!pair_fund_spk(ctx, &pa, &pb, spk, xonly)) return 0;
+    char addr[128], txid_hex[65];
+    if (!regtest_derive_p2tr_address(&d->rt, xonly, addr, sizeof(addr)))
+        return 0;
+    if (!regtest_fund_address(&d->rt, addr, 0.001, txid_hex)) return 0;
+    regtest_mine_blocks(&d->rt, 1, d->mine_addr);
+    d->fund_vout = UINT32_MAX;
+    for (uint32_t v = 0; v < 4; v++) {
+        uint64_t amt = 0; unsigned char s[64]; size_t sl = 0;
+        if (regtest_get_tx_output(&d->rt, txid_hex, v, &amt, s, &sl) &&
+            sl == 34 && memcmp(s, spk, 34) == 0) {
+            d->fund_vout = v; d->fund_amount = amt; break;
+        }
+    }
+    if (d->fund_vout == UINT32_MAX) return 0;
+    hex_decode(txid_hex, d->fund_txid, 32);
+    reverse_bytes(d->fund_txid, 32);
+    return 1;
+}
+
+/* Sign (both keys, in-process) and broadcast holder's own commitment. */
+static int broadcast_commitment(drill_t *d, channel_t *holder,
+                                const secp256k1_keypair *other_kp,
+                                unsigned char *txid32, char *txid_hex)
+{
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 1024); tx_buf_init(&sc, 2048);
+    int ok = channel_build_commitment_tx(holder, &uc, txid32) &&
+             channel_sign_commitment(holder, &sc, &uc, other_kp);
+    if (ok) {
+        char *hex = malloc(sc.len * 2 + 1);
+        ok = hex != NULL;
+        if (ok) {
+            hex_encode(sc.data, sc.len, hex);
+            ok = regtest_send_raw_tx(&d->rt, hex, txid_hex);
+            free(hex);
+        }
+    }
+    tx_buf_free(&uc); tx_buf_free(&sc);
+    return ok;
+}
+
+static int send_tx(drill_t *d, const tx_buf_t *tx, char *txid_out)
+{
+    char *hex = malloc(tx->len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(tx->data, tx->len, hex);
+    int ok = regtest_send_raw_tx(&d->rt, hex, txid_out);
+    free(hex);
+    return ok;
+}
+
+/* Attack: client pays the LSP; LSP reveals the preimage; the client keeps
+   its revoke_and_ack and broadcasts the commitment still holding the HTLC,
+   intending to take it back after the CLTV.  The LSP must claim first.
+   restart: the LSP restarts (sweeper reloaded from its DB) between the
+   commitment confirming and the claim. */
+static int run_lsp_payee(int restart)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    drill_t d;
+    int s = drill_setup(&d, ctx, restart ? "htlc_claim_lsp_rs" : "htlc_claim_lsp");
+    if (s < 0) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    TEST_ASSERT(s == 1, "drill setup");
+
+    pair_t p;
+    TEST_ASSERT(pair_init(&p, ctx, d.fund_txid, d.fund_vout, d.fund_amount, 10),
+                "pair");
+    int h0 = regtest_get_block_height(&d.rt);
+    uint32_t cltv = (uint32_t)h0 + 25;
+    TEST_ASSERT(pair_add_htlc(&p, 1, 20000, cltv), "client adds HTLC");
+
+    /* LSP side: manager with one channel and a persistent sweeper. */
+    char path[] = "/tmp/ss_htlc_drill_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0, "temp db");
+    close(fd);              /* empty 0600 file: opened as a new DB */
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "lsp db");
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr != NULL, "mgr");
+    mgr->entries = calloc(1, sizeof(lsp_channel_entry_t));
+    TEST_ASSERT(mgr->entries != NULL, "entries");
+    mgr->n_channels = 1;
+    memcpy(&mgr->entries[0].channel, &p.lsp, sizeof(channel_t));
+    channel_t *lch = &mgr->entries[0].channel;
+    sweeper_t sw;
+    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, &db, NULL),
+                "sweeper");
+    lsp_channels_attach_sweeper(mgr, &sw);
+    char dest_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&d.rt, dest_addr, sizeof(dest_addr)),
+                "dest addr");
+    size_t dl = 0;
+    TEST_ASSERT(regtest_get_address_scriptpubkey(&d.rt, dest_addr, sw.dest_spk,
+                                                 &dl) && dl == 34, "dest spk");
+    sw.dest_spk_len = 34;
+
+    /* LSP reveals the preimage: production hook, then the fulfil. */
+    int reg = lsp_channels_register_htlc_claim(mgr, 0, p.lsp_htlc_id,
+                                               p.preimage);
+    TEST_ASSERT(channel_fulfill_htlc(lch, p.lsp_htlc_id, p.preimage),
+                "LSP fulfils");
+    /* The client never sends its revoke_and_ack: nothing cancels the claim. */
+
+    /* Attacker broadcasts the commitment it holds and pre-builds its
+       HTLC-timeout from it. */
+    unsigned char ct[32];
+    char ct_hex[65];
+    TEST_ASSERT(broadcast_commitment(&d, &p.cli, &p.lsp_kp, ct, ct_hex),
+                "client broadcasts commitment holding the HTLC");
+    regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&d.rt, ct_hex) >= 1,
+                "commitment confirmed");
+    uint32_t vout = 2;
+    uint64_t amt = 0; unsigned char spk[64]; size_t sl = 0;
+    TEST_ASSERT(regtest_get_tx_output(&d.rt, ct_hex, vout, &amt, spk, &sl) &&
+                sl == 34 && amt == 20000, "HTLC output on chain");
+    tx_buf_t tmo;
+    tx_buf_init(&tmo, 512);
+    TEST_ASSERT(channel_build_htlc_timeout_tx(&p.cli, &tmo, ct, vout, amt,
+                                              spk, 34, 0),
+                "attacker timeout built");
+
+    int reloaded = 1;
+    if (restart) {
+        sweeper_cleanup(&sw);
+        persist_close(&db);
+        TEST_ASSERT(persist_open(&db, path), "lsp db reopen");
+        TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, &db, NULL),
+                    "sweeper reload");
+        lsp_channels_attach_sweeper(mgr, &sw);
+        size_t dl2 = 0;
+        regtest_get_address_scriptpubkey(&d.rt, dest_addr, sw.dest_spk, &dl2);
+        sw.dest_spk_len = 34;
+        reloaded = (sw.n_entries == 1 &&
+                    sw.entries[0].type == SWEEP_HTLC_SUCCESS);
+        printf("  payee restarted; claim %sreloaded from DB\n",
+               reloaded ? "" : "NOT ");
+    }
+
+    /* Payee's cycle: claim. */
+    int claimed = 0;
+    if (sweeper_check(&sw) == 1 && sw.n_entries == 1 &&
+        sw.entries[0].state == SWEEP_BROADCAST) {
+        char claim_txid[65];
+        memcpy(claim_txid, sw.entries[0].sweep_txid, 65);
+        int hb = regtest_get_block_height(&d.rt);
+        TEST_ASSERT((uint32_t)hb < cltv, "claim broadcast before the CLTV");
+        regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+        TEST_ASSERT(regtest_get_confirmations(&d.rt, claim_txid) >= 1,
+                    "claim confirmed");
+        printf("  claim %s confirmed at height %d (cltv %u)\n", claim_txid,
+               hb + 1, cltv);
+        TEST_ASSERT(regtest_outpoint_unspent(&d.rt, ct_hex, vout) == 0,
+                    "HTLC output spent by the claim");
+
+        /* Buried -> claim output swept to the destination. */
+        sweeper_check(&sw);
+        TEST_ASSERT(sw.n_entries == 1 &&
+                    sw.entries[0].type == SWEEP_HTLC_SUCCESS_OUTPUT &&
+                    sw.entries[0].state == SWEEP_BROADCAST,
+                    "claim output sweep broadcast");
+        char sweep_txid[65];
+        memcpy(sweep_txid, sw.entries[0].sweep_txid, 65);
+        regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+        TEST_ASSERT(regtest_get_confirmations(&d.rt, sweep_txid) >= 1,
+                    "sweep confirmed");
+        sweeper_check(&sw);
+        TEST_ASSERT(sw.n_entries == 0, "all entries done");
+        claimed = 1;
+    }
+
+    /* Attacker: CLTV and CSV reached, the timeout must fail. */
+    int h = regtest_get_block_height(&d.rt);
+    if ((uint32_t)h < cltv + 10)
+        regtest_mine_blocks(&d.rt, (int)(cltv + 10 - (uint32_t)h), d.mine_addr);
+    char tmo_txid[65];
+    int tmo_ok = send_tx(&d, &tmo, tmo_txid);
+    if (tmo_ok) {
+        regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+        printf("  ATTACK SUCCEEDED: sender's timeout %s confirmed=%d — the "
+               "payee lost the HTLC\n", tmo_txid,
+               regtest_get_confirmations(&d.rt, tmo_txid) >= 1);
+    } else {
+        printf("  sender's timeout claim rejected after CLTV\n");
+    }
+    TEST_ASSERT(reg == 1, "claim registered before reveal");
+    TEST_ASSERT(reloaded, "claim reloaded after restart");
+    TEST_ASSERT(claimed, "payee claimed the HTLC on chain");
+    TEST_ASSERT(!tmo_ok, "sender's timeout rejected (HTLC already claimed)");
+
+    tx_buf_free(&tmo);
+    sweeper_cleanup(&sw);
+    persist_close(&db);
+    unlink(path);
+    channel_cleanup(lch);
+    free(mgr->entries);
+    free(mgr);
+    channel_cleanup(&p.cli);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_regtest_htlc_claim_lsp_payee(void) { return run_lsp_payee(0); }
+int test_regtest_htlc_claim_lsp_payee_restart(void) { return run_lsp_payee(1); }
+
+/* Client as payee: the LSP offered the HTLC, the client revealed the
+   preimage (production client_fulfill_payment) and the LSP never signed
+   the next commitment.  The client's latest signed commitment still holds
+   the HTLC; it broadcasts it and claims via its CSV-delayed success leaf
+   before the LSP's timeout (CLTV, no CSV) becomes valid. */
+int test_regtest_htlc_claim_client_payee(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    drill_t d;
+    int s = drill_setup(&d, ctx, "htlc_claim_cli");
+    if (s < 0) {
+        printf("  SKIP: bitcoind not available\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    TEST_ASSERT(s == 1, "drill setup");
+
+    pair_t p;
+    TEST_ASSERT(pair_init(&p, ctx, d.fund_txid, d.fund_vout, d.fund_amount, 10),
+                "pair");
+    int h0 = regtest_get_block_height(&d.rt);
+    uint32_t cltv = (uint32_t)h0 + 25;
+    TEST_ASSERT(pair_add_htlc(&p, 0, 20000, cltv), "LSP adds HTLC");
+
+    /* Client signs + holds commitment (built now; broadcast below). */
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 1024); tx_buf_init(&sc, 2048);
+    unsigned char ct[32];
+    TEST_ASSERT(channel_build_commitment_tx(&p.cli, &uc, ct) &&
+                channel_sign_commitment(&p.cli, &sc, &uc, &p.lsp_kp),
+                "client commitment signed");
+
+    /* Attacker (LSP) timeout on the client's commitment: CLTV, no CSV,
+       LSP key.  Built from a copy of the client's view with the LSP's HTLC
+       secret, which yields exactly the received-HTLC timeout leaf. */
+    char ct_hex[65];
+    txid_internal_to_hex(ct, ct_hex);
+    channel_t atk = p.cli;
+    memcpy(atk.local_htlc_basepoint_secret, p.lsp.local_htlc_basepoint_secret, 32);
+
+    sweeper_t sw;
+    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &d.chain, NULL, NULL),
+                "client sweeper");
+    g_lookup_ch = &p.cli;
+    sweeper_set_channel_lookup(&sw, lookup_one, NULL);
+    client_set_htlc_sweeper(&sw, 0);
+    TEST_ASSERT(pair_client_signed(&p), "client holds its commitment signed");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    /* Attacker's timeout tx needs the HTLC still present in the copy. */
+    uint32_t vout = 2;
+    uint64_t amt = 20000;
+    unsigned char spk[34];
+    {
+        ptx_t ut;
+        TEST_ASSERT(ptx_parse(uc.data, uc.len, &ut) && ut.n_out >= 3,
+                    "parse commitment");
+        memcpy(spk, ut.out_spk[2], 34);
+        TEST_ASSERT(ut.out_amount[2] == amt, "HTLC at vout 2");
+    }
+    tx_buf_t tmo;
+    tx_buf_init(&tmo, 512);
+    TEST_ASSERT(channel_build_htlc_timeout_tx(&atk, &tmo, ct, vout, amt, spk,
+                                              34, 0), "attacker timeout built");
+
+    TEST_ASSERT(client_fulfill_payment(sv[0], &p.cli, p.cli_htlc_id,
+                                       p.preimage), "client fulfils");
+    int reg = (sw.n_entries == 1 &&
+               sw.entries[0].claim_side == HTLC_CLAIM_LOCAL_COMMIT &&
+               memcmp(sw.entries[0].source_txid, ct, 32) == 0);
+    close(sv[0]); close(sv[1]);
+    /* No COMMITMENT_SIGNED from the LSP: nothing cancels the claim. */
+
+    char bt[65];
+    {
+        char *hex = malloc(sc.len * 2 + 1);
+        TEST_ASSERT(hex != NULL, "alloc");
+        hex_encode(sc.data, sc.len, hex);
+        int ok = regtest_send_raw_tx(&d.rt, hex, bt);
+        free(hex);
+        TEST_ASSERT(ok, "client broadcasts its commitment");
+    }
+    regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+    TEST_ASSERT(regtest_get_confirmations(&d.rt, ct_hex) >= 1,
+                "commitment confirmed");
+
+    int claimed = 0;
+    for (int i = 0; i < 12 && !claimed; i++) {
+        sweeper_check(&sw);
+        if (sw.n_entries == 1 && sw.entries[0].state == SWEEP_BROADCAST) {
+            claimed = 1;
+            break;
+        }
+        regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+    }
+    if (claimed) {
+        char claim_txid[65];
+        memcpy(claim_txid, sw.entries[0].sweep_txid, 65);
+        int hb = regtest_get_block_height(&d.rt);
+        TEST_ASSERT((uint32_t)hb < cltv, "claim before the CLTV");
+        regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+        TEST_ASSERT(regtest_get_confirmations(&d.rt, claim_txid) >= 1,
+                    "claim confirmed");
+        printf("  client claim %s confirmed at height %d (cltv %u)\n",
+               claim_txid, hb + 1, cltv);
+        sweeper_check(&sw);
+        TEST_ASSERT(sw.n_entries == 0, "claim buried, entry done");
+    }
+
+    int h = regtest_get_block_height(&d.rt);
+    if ((uint32_t)h < cltv + 1)
+        regtest_mine_blocks(&d.rt, (int)(cltv + 1 - (uint32_t)h), d.mine_addr);
+    char tmo_txid[65];
+    int tmo_ok = send_tx(&d, &tmo, tmo_txid);
+    if (tmo_ok) {
+        regtest_mine_blocks(&d.rt, 1, d.mine_addr);
+        printf("  ATTACK SUCCEEDED: LSP's timeout %s confirmed=%d — the "
+               "client lost the HTLC\n", tmo_txid,
+               regtest_get_confirmations(&d.rt, tmo_txid) >= 1);
+    } else {
+        printf("  LSP's timeout claim rejected after CLTV\n");
+    }
+    TEST_ASSERT(reg, "claim registered on the client's own commitment");
+    TEST_ASSERT(claimed, "claim broadcast once the CSV allows");
+    TEST_ASSERT(!tmo_ok, "LSP's timeout rejected (HTLC already claimed)");
+
+    client_set_htlc_sweeper(NULL, 0);
+    tx_buf_free(&tmo); tx_buf_free(&uc); tx_buf_free(&sc);
+    sweeper_cleanup(&sw);
+    pair_cleanup(&p);
     secp256k1_context_destroy(ctx);
     return 1;
 }
