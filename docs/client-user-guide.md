@@ -164,8 +164,12 @@ learn your factory key before anything is verified.
   client holds its signed replacement tree before the LSP funds it. After the funding
   confirms, it checks its own exit path and balance in the replacement, switches, and
   only then releases its old factory key, against an LSP receipt signed over exactly that
-  position. Clients that do not move keep their full exit in the old factory; one that
-  reconnects later is told by the LSP to exit through that factory.
+  position. Right before the key it settles its old channel: it accepts one final update
+  that moves exactly the balance carried into the replacement to the LSP (same channel,
+  next commitment, same fee rate, nothing in flight), signs it and revokes its own latest
+  old commitment. It never does this before those checks pass. Clients that do not move
+  keep their full exit in the old factory; one that reconnects later is told by the LSP
+  to exit through that factory.
 
 The client switches only when the close (or the replacement's funding) is at the safe
 depth on its own chain view, not on the LSP's word: 1 confirmation on regtest, 3 on
@@ -181,7 +185,14 @@ it keeps the current DB under a second name, `<db>.pre-rotation` (`<db>.pre-rota
 The `.pre-rotation` file holds the old factory's state and its **secret keys**. Keep it,
 backed up like `--db`, until the old factory is resolved (its funding output is spent and
 that spend is buried, or your exit from it has confirmed). Then archive it or delete it
-securely.
+securely. A client that switched before it released settles its old channel from this
+file when the LSP asks for the release again, so do not remove it while a release is
+still owed.
+
+After a partial rotation the last commitment in that file is **revoked** (the settlement
+revoked it). Never broadcast it, and never force-close from that file: the LSP holds the
+revocation and would take that balance as a penalty. That balance was paid to you in the
+replacement.
 
 ## 3. Receiving Payments
 

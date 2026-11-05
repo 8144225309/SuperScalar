@@ -381,12 +381,16 @@ Each check prints SAFE or UNSAFE:
 | `STRANDED` | partial, winddown | No replacement funding is left unspent without a signed factory over it |
 | `STAYER` | partial | The client that stayed reconnects, is told its factory is retired, and exits it: its old tree's root, broadcast from its own DB, confirms; the LSP's DB still holds that factory's tree and channels |
 | `WIND_DOWN` | winddown | Once every client released, and only after the last release, the LSP closes the old factory alone to its own wallet, recorded before broadcast; the close confirms, and the released keys are then deleted (`KEYS_AT_REST`) |
+| `SETTLE` | partial, winddown | Every client that released its key first settled its old channel: its carried balance moved to the LSP and its latest old commitment revoked (the LSP's and the clients' logs and the LSP's DB agree) |
+| `DOUBLE_CLAIM` | partial | After the stayer pushed the old tree, moved clients act maliciously from their old DB (`.pre-rotation`): client 1 pushes its old tree path and its revoked last old commitment in one block, client 2 pushes its old leaf only. The LSP's penalty takes client 1's `to_local`, and the LSP sweeps client 2's old channel output to its wallet |
+| `SWEEP` | partial | The released-key outputs are the LSP's before the keys go: with `DIST_SWEEP=1` (the stayer does not force-close) the LSP publishes the old distribution TX at its CLTV and sweeps every released-key output in it; otherwise the moved clients' old-tree outputs that reached the chain are swept or spent and buried |
 
 Exit 0 only if every check is SAFE; exit 1 if any check is UNSAFE or (`MODE=full`) the rotation did not complete; exit 2 on a setup failure.
 
 ```bash
 MODE=full     bash tools/test_regtest_rotation_key_custody.sh
 MODE=partial  bash tools/test_regtest_rotation_key_custody.sh
+MODE=partial DIST_SWEEP=1 bash tools/test_regtest_rotation_key_custody.sh
 MODE=winddown bash tools/test_regtest_rotation_key_custody.sh
 ```
 
