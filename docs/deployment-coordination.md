@@ -121,6 +121,8 @@ For watchtower protection, the client also needs bitcoin-cli access:
   --rpcpassword YOUR_PASS
 ```
 
+To take part in factory rotation, a client needs this RPC access, `--db`, and the LSP's key pinned with `--lsp-pubkey`. Without them it stays in the old factory when the factory is rotated and exits through it.
+
 ### What Clients Need to Know
 
 Share this with your clients:
@@ -129,6 +131,7 @@ Share this with your clients:
 2. **Network**: signet (must match LSP)
 3. **Number of clients**: how many need to connect before the factory starts
 4. **Funding amount**: what the factory will hold (informational)
+5. **LSP pubkey**: for `--lsp-pubkey` (printed by the LSP at startup; needed for rotation)
 
 Clients do NOT need:
 - Access to the LSP's wallet
@@ -274,11 +277,13 @@ bash tools/exhibition_testnet4.sh --structure 4
 
 ### Rotation (Zero Downtime)
 
-When `--active-blocks` is reached, the LSP automatically:
-1. Initiates PTLC key turnover (extracts client keys via adaptor sigs)
-2. Closes old factory (LSP can sign alone with extracted keys)
-3. Creates new factory with same clients
-4. Channels resume in new factory
+When a factory reaches DYING, the LSP rotates it into a replacement:
+
+1. **Every client online and upgraded:** the old factory is closed straight into the new one. Clients send fresh factory keys, check the close and their replacement tree, and only then sign the close. No key is revealed, and the LSP needs no extra liquidity.
+2. **Some clients offline or not upgraded:** a partial rotation with verified release. The LSP builds a replacement over the upgraded clients online, has it signed, then funds it from its wallet. Each moving client checks its own position in the replacement and only then releases its old factory key. The other clients stay in the old factory and exit through it (its signed tree, their commitments, or the distribution TX after the CLTV).
+3. Each client switches to the replacement once the close (or the replacement's funding) is at the safe depth on its own chain view.
+
+Upgrade requirements: a client takes part only with rotation support, `--db`, `--lsp-pubkey` and its own Bitcoin Core RPC connection. Upgraded clients refuse the older key turnover. With a mix of upgraded and older clients, the upgraded ones move by verified release and the older ones stay and exit. For a partial rotation the LSP wallet must hold the replacement's funding on top of the old factory, which stays locked until it is resolved. See [LSP Operator Guide §12](lsp-operator-guide.md#12-factory-rotation) for what is recorded, restarts, key deletion and backups.
 
 ### Manual Close
 
@@ -346,7 +351,7 @@ sqlite3 -header -column lsp.db \
 ### Before Launch
 
 - [ ] bitcoind synced and running on target network
-- [ ] Wallet funded (factory amount + ~5,000 sats for fees)
+- [ ] Wallet funded (factory amount + ~5,000 sats for fees; a partial rotation needs a replacement's funding on top)
 - [ ] LSP key generated and backed up
 - [ ] `--db` flag set for crash recovery
 - [ ] Firewall allows inbound on LSP port

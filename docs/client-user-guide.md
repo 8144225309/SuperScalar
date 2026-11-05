@@ -38,7 +38,8 @@ The key above is your **identity** key: it identifies you to the LSP and is neve
 to sign a factory. For every factory you join, the client derives a separate **factory
 key** from it (and from the LSP's pinned key), records which one in `--db`, and signs
 that factory, its channel and its payouts with it. Handing one factory key to the LSP
-(as a rotation does) reveals neither your identity key nor any other factory key.
+(as a partial rotation does, after the client's own checks) reveals neither your
+identity key nor any other factory key.
 
 - With `--db`, pin the LSP's key with `--lsp-pubkey` (required on signet, testnet and
   mainnet anyway). Without it the client refuses to create a new factory key.
@@ -46,7 +47,19 @@ that factory, its channel and its payouts with it. Handing one factory key to th
   client finds the key of a stored factory by trying the first 1000 key indexes.
   Finding your factories from the chain alone is not supported yet.
 - A factory created by an older client signs with the identity key itself ("legacy
-  factory"); it keeps doing so until it is rotated.
+  factory"); it keeps doing so until it is rotated. Its key is never released to the
+  LSP: it moves only in a rotation with every client online.
+
+Each factory key has a state, shown by `--export-factory-keys`:
+
+| State | Meaning |
+|-------|---------|
+| `reserved` | Sent to the LSP for a factory that is not signed yet |
+| `active` | The key of the factory you are in |
+| `retired` | A factory you moved out of; the key was not released |
+| `released` | Handed to the LSP in a partial rotation; never used again |
+
+After a rotation switch exactly one key is active.
 
 #### Spending your payouts
 
@@ -69,6 +82,12 @@ opening an older DB may still run the schema migration and tighten the file's
 permissions. It prints at most 4096 keys and warns if there are more. The recovery tools `recover_stranded_coop_output` and
 `superscalar_factory_residual_sweep` take client secrets: pass the "seckey" printed
 here (for a legacy factory, your `--seckey`).
+
+Retired and released keys are listed too. A retired key belongs to a factory you moved
+out of; keep it until that factory is resolved. A **released** key was handed to the LSP
+in a partial rotation: its value was already paid to you in the replacement factory, so
+any old-factory output that still pays this key belongs to the LSP. Do not spend such
+outputs — the LSP sweeps them. The key is listed only so you can recognise it.
 
 ## 2. Connect to the LSP
 
@@ -120,6 +139,49 @@ With `--daemon`, the client stays running and:
 - Handles JIT channel offers (with `--auto-accept-jit`)
 
 Without `--daemon`, the client joins the factory ceremony and exits after channel setup.
+
+### Factory Rotation
+
+Before a factory expires the LSP rotates it into a replacement. The client takes part
+only when it runs with:
+
+- `--db`,
+- the LSP's key pinned with `--lsp-pubkey`, and
+- its own Bitcoin Core RPC connection (`--cli-path`, `--rpcuser`, `--rpcpassword`, ...):
+  the client checks the rotation on its own chain view and waits on it to switch.
+
+Without all three it takes no part: it stays in the old factory and leaves through that
+factory's exits (its signed tree, your channel commitment, or the distribution TX after
+the CLTV). The client always refuses the older key turnover, in which the LSP would
+learn your factory key before anything is verified.
+
+- **Every client online and able: close into the new factory.** The client sends a fresh
+  factory key, checks the close of the old factory (one output, paying the replacement
+  under the fresh keys, your balance carried exactly) and its replacement tree, stores
+  them, and only then signs the close with its old key. No key is handed over. Once it
+  has signed, it refuses further state changes on the old factory.
+- **Some clients offline or not upgraded: partial rotation with verified release.** The
+  client holds its signed replacement tree before the LSP funds it. After the funding
+  confirms, it checks its own exit path and balance in the replacement, switches, and
+  only then releases its old factory key, against an LSP receipt signed over exactly that
+  position. Clients that do not move keep their full exit in the old factory; one that
+  reconnects later is told by the LSP to exit through that factory.
+
+The client switches only when the close (or the replacement's funding) is at the safe
+depth on its own chain view, not on the LSP's word: 1 confirmation on regtest, 3 on
+signet and testnet, 6 on mainnet.
+
+#### The switch and the `.pre-rotation` file
+
+The client builds the replacement's state in a side DB, `<db>.rotation`. At the switch
+it keeps the current DB under a second name, `<db>.pre-rotation` (`<db>.pre-rotation.1`,
+`.2`, ... on later rotations), and then renames the side DB to `<db>` in one rename, so
+`<db>` always holds a complete DB.
+
+The `.pre-rotation` file holds the old factory's state and its **secret keys**. Keep it,
+backed up like `--db`, until the old factory is resolved (its funding output is spent and
+that spend is buried, or your exit from it has confirmed). Then archive it or delete it
+securely.
 
 ## 3. Receiving Payments
 
@@ -279,7 +341,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--force-close` | off | Broadcast your factory tree on-chain from the local DB (unilateral exit) |
 | `--sweep-to-local` | off | After force-close, sweep your `to_local` outputs once CSV maturity hits |
 | `--sweep-dest ADDR` | (wallet) | Destination address for swept funds (defaults to your bitcoind wallet) |
-| `--export-factory-keys` | off | Print the secret and wallet descriptors of every factory key in `--db`, then exit (**prints private keys**; see "Spending your payouts") |
+| `--export-factory-keys` | off | Print the state, secret and wallet descriptors of every factory key in `--db` (reserved, active, retired, released), then exit (**prints private keys**; see "Spending your payouts") |
 
 ### Misc / Diagnostic
 

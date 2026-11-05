@@ -311,9 +311,11 @@ Broadcasts revoked commitment, mines 3 blocks, THEN runs the watchtower check. W
 
 ### 6. `test_regtest_ptlc_no_coop_close`
 
-**Question:** What if the LSP extracts all keys and then disappears?
+**Question:** If the factory is never closed cooperatively, does the distribution TX pay everyone after the CLTV?
 
-Performs PTLC key turnover, LSP refuses to close cooperatively. After CLTV timeout, the distribution TX confirms. Proves clients get funds back even when the LSP has all keys.
+Builds and signs a factory in one process (which holds every participant's key, the state a PTLC key turnover leaves), never closes it cooperatively, mines past the distribution TX's nLockTime and broadcasts it. The distribution TX confirms and pays every participant its expected amount.
+
+This shows the timeout fallback works when the LSP does not close the factory. It does not protect a client whose factory key the LSP holds: with every client's key the LSP can sign the factory's key path alone and spend the funding output before the CLTV, and the distribution TX is then never valid. The distribution TX only protects against an LSP that does not do that.
 
 ### 7. `test_regtest_all_offline_recovery`
 
@@ -344,6 +346,86 @@ Attempts to spend an HTLC with an incorrect preimage. Bitcoin consensus (`OP_SHA
 **Question:** Can old factory tree txs be replayed after cooperative close?
 
 Closes factory cooperatively (spending the funding UTXO), then broadcasts old kickoff tx. Bitcoin consensus rejects the double-spend.
+
+---
+
+## Rotation Drills
+
+Two shell drills run a real factory rotation with one LSP and four client daemons on a private regtest node. Node, wallet and build are overridable from the environment: `REPO`, `CONF`, `RPCPORT`, `RPCUSER`, `RPCPASS`, `WALLET`, `PORT`, `BUILD`.
+
+### `tools/test_regtest_rotation_key_custody.sh`
+
+What a completed rotation leaves the LSP able to do on its own, and what it does to the clients' balances. The clients make payments so the balances differ from the default split, the factory reaches DYING and the LSP rotates it. `MODE` picks the path; `ARITY` sets the factory shape (`--arity`, default 1).
+
+| `MODE` | Path |
+|--------|------|
+| `full` (default) | Every client online: the old factory closes into the new one |
+| `partial` | Client 4 goes offline before DYING: a partial rotation with verified release over clients 1-3 |
+| `winddown` | The partial path with every client online (`SS_TEST_ROTATE_PARTIAL`, regtest only): every client moves and releases |
+
+Each check prints SAFE or UNSAFE:
+
+| Check | Modes | SAFE when |
+|-------|-------|-----------|
+| `ORDER` | all | No client factory secret reaches the LSP before the replacement is funded and signed; the client already holds its own signed exit path there |
+| `CLOSE_PAYEE` | all | The old factory's close does not pay the clients' balances to an LSP-controlled address; a co-signed close into the new factory has exactly one output, the replacement's funding, under keys other than the old factory's |
+| `BALANCES` | all | Every client's channel balance is the same after the rotation (LSP view and client view), and the new tree carries it |
+| `PAY_AFTER` | all | A payment over the replacement succeeds, and no client rejects the LSP's revocation for it |
+| `KEYS_AT_REST` | all | The LSP's DB holds no client secret key in the clear, and none at all once the old factory is resolved: a partial rotation keeps the released keys, sealed, until then; the drill mines until the LSP must have deleted them and checks that it did. The seal key is derived from the LSP's own secret on the same host, so it protects a leaked DB or backup, not a compromised host |
+| `KEY_ROWS` | all | Every client that moved has exactly one active factory key row, the replacement's; its old factory key row is retired (or released) |
+| `IDENTITY` | all | No client key the LSP holds is a client's identity (`--seckey`) key |
+| `PAYOUT_KEYS` | all | `--export-factory-keys` gives descriptors Bitcoin Core accepts, and the `tr()` one pays the client's distribution-TX output |
+| `RESTART` | all | A client restarted from its DB after the rotation reloads its factory key and reconnects by its identity key (`partial` restarts client 3, which moved) |
+| `LSP_ALONE` | all | The LSP cannot spend the replacement's funding output by itself: the drill builds that spend from every key the LSP holds (its `--seckey` plus the keys in its DB), signs it on the key path and broadcasts it, and it must not confirm. Runs last, since a confirmed spend destroys the replacement |
+| `REPLACEMENT` | partial, winddown | Every client that handed over its key holds a signed replacement factory |
+| `STRANDED` | partial, winddown | No replacement funding is left unspent without a signed factory over it |
+| `STAYER` | partial | The client that stayed reconnects, is told its factory is retired, and exits it: its old tree's root, broadcast from its own DB, confirms; the LSP's DB still holds that factory's tree and channels |
+| `WIND_DOWN` | winddown | Once every client released, and only after the last release, the LSP closes the old factory alone to its own wallet, recorded before broadcast; the close confirms, and the released keys are then deleted (`KEYS_AT_REST`) |
+
+Exit 0 only if every check is SAFE; exit 1 if any check is UNSAFE or (`MODE=full`) the rotation did not complete; exit 2 on a setup failure.
+
+```bash
+MODE=full     bash tools/test_regtest_rotation_key_custody.sh
+MODE=partial  bash tools/test_regtest_rotation_key_custody.sh
+MODE=winddown bash tools/test_regtest_rotation_key_custody.sh
+```
+
+### `tools/test_regtest_rotation_restart_resume.sh`
+
+Crashes the LSP at a checkpoint of a rotation (`CKPT`, via `SUPERSCALAR_CRASH_AT`), restarts it on the same DB and checks that the restarted LSP completes that rotation once the clients reconnect, never abandoning or repeating an irreversible step. Every step is recorded before it happens, so a crash right after it is resumable.
+
+Close into the new factory (every client online):
+
+| `CKPT` | Crash point |
+|--------|-------------|
+| `rotate_close_built` | The unsigned close is recorded |
+| `rotate_ceremony_before_ready` | The replacement's signatures are aggregated; no client has FACTORY_READY |
+| `rotate_ceremony_signed` | The clients hold the signed replacement tree |
+| `rotate_initial_commitments` | The clients hold their initial commitments |
+| `rotate_close_signing` | The close ceremony is about to start |
+| `rotate_close_signed` | The close is aggregated, not yet recorded (no client got CLOSE_DONE) |
+| `rotate_close_sent` | The close is recorded with the replacement and broadcast |
+
+PASS: exactly one close is ever built for the old factory, the restart completes the rotation over it, the close confirms, no client key is revealed, and every client switches to the replacement. Before `rotate_close_sent` the restart runs the ceremony again over the recorded close (for `rotate_ceremony_signed`, only over a byte-identical tree, so the clients never hold two different trees over one output); after it the restart only finishes.
+
+Partial rotation (the LSP takes the partial path with every client online, `SS_TEST_ROTATE_PARTIAL`, regtest only):
+
+| `CKPT` | Crash point |
+|--------|-------------|
+| `rotate_part_built` | The replacement funding is built and recorded in the progress marker; nothing signed |
+| `rotate_part_signed` | The clients hold the signed replacement tree; the replacement is not recorded, not funded |
+| `rotate_part_recorded` | The replacement and the owed releases are recorded; the funding is not broadcast |
+| `rotate_part_funded` | The funding is confirmed; no release asked for yet |
+| `rotate_part_released` | One client released; the others are owed |
+
+PASS: for `built` and `signed` the first funding never confirms (it was never broadcast) and the restart drops that rotation, then rotates again with one new funding; for `recorded` the restart rebroadcasts the recorded funding and no other; for `funded` and `released` there is no new funding at all. In every case exactly one replacement funding confirms, every client switches and releases once (owed releases are asked for again after the restart), the LSP then closes the old factory alone, and the released keys are deleted once that close is buried.
+
+The remaining checkpoints (`rotate_close_broadcast`, the default, `rotate_replacement_funded` and `rotate_funding_sent`) belong to the older rotation path, which is not used once any client of the factory is upgraded.
+
+```bash
+CKPT=rotate_close_signed   bash tools/test_regtest_rotation_restart_resume.sh
+CKPT=rotate_part_recorded  bash tools/test_regtest_rotation_restart_resume.sh
+```
 
 ---
 
@@ -441,11 +523,11 @@ python3 tools/manual_tests.py help
 | Test | What it covers |
 |------|---------------|
 | `demo` | Basic --demo: factory + 4 payments + cooperative close |
-| `rotation` | --test-rotation: full PTLC turnover + factory rotation |
+| `rotation` | --test-rotation: scripted rotation by the older PTLC key turnover (not the daemon's rotation; clients of this release refuse the turnover) |
 | `force_close` | --force-close: broadcast full DW tree on-chain |
 | `expiry` | --test-expiry: mine past CLTV, recover via timeout |
 | `distrib` | --test-distrib: broadcast pre-signed distribution TX |
-| `turnover` | --test-turnover: PTLC key turnover for all clients |
+| `turnover` | --test-turnover: scripted PTLC key turnover for all clients (clients of this release refuse it) |
 | `breach` | --breach-test: broadcast revoked commitment + watchtower |
 | `arity1` | --arity 1: per-client leaves, legacy DW (200k funding) |
 | `arity3` | --arity 3: Pseudo-Spilman canonical (chained TXs, default; design at [superscalar.win](https://superscalar.win)) |
@@ -609,7 +691,7 @@ Quick version:
 ```bash
 bash tools/run_demo.sh --basic       # Factory + payments + close (~30s)
 bash tools/run_demo.sh --breach      # + watchtower penalty (~60s)
-bash tools/run_demo.sh --rotation    # + factory rotation (~2min)
+bash tools/run_demo.sh --rotation    # + scripted PTLC-turnover rotation (~2min)
 bash tools/run_demo.sh --all         # All scenarios
 ```
 
