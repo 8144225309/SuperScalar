@@ -6814,6 +6814,13 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     return 1;
 }
 
+/* 1 if FD has data (or EOF) to read right now. */
+static int fd_readable_now(int fd) {
+    if (fd < 0) return 0;
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    return poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR));
+}
+
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag) {
     if (!mgr || !lsp || !shutdown_flag) return 0;
@@ -7966,12 +7973,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 mgr->cli_enabled = 0;
             } else {
                 line[nr] = '\0';
-                /* Strip trailing newline */
-                size_t len = strlen(line);
-                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
-                    line[--len] = '\0';
-
-                lsp_channels_handle_cli_line(mgr, lsp, line, shutdown_flag);
+                /* One command per line: commands written while the loop was
+                   busy arrive in one read. */
+                char *save = NULL;
+                for (char *cmd = strtok_r(line, "\r\n", &save); cmd;
+                     cmd = strtok_r(NULL, "\r\n", &save))
+                    if (cmd[0]) lsp_channels_handle_cli_line(mgr, lsp, cmd, shutdown_flag);
             }
         }
 
@@ -7980,7 +7987,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             admin_rpc_service((admin_rpc_t *)mgr->admin_rpc);
 
         /* Handle bridge messages */
-        if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
+        if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN) &&
+            mgr->bridge_fd >= 0 &&
+            (pfds[bridge_slot].fd == mgr->bridge_fd || fd_readable_now(mgr->bridge_fd))) {
             wire_msg_t msg;
             if (!wire_recv(mgr->bridge_fd, &msg)) {
                 fprintf(stderr, "LSP daemon: bridge disconnected\n");
@@ -7997,6 +8006,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         for (size_t c = 0; c < mgr->n_channels; c++) {
             if (client_slots[c] < 0) continue;
             if (!(pfds[client_slots[c]].revents & POLLIN)) continue;
+            /* The poll result is for the socket polled.  A reconnect handled
+               above (or any step since the poll) may have replaced this
+               client's socket, and the new one may have nothing to read: a
+               blocking read there stalls the whole loop until that client
+               sends something. */
+            if (lsp->client_fds[c] < 0 ||
+                (pfds[client_slots[c]].fd != lsp->client_fds[c] &&
+                 !fd_readable_now(lsp->client_fds[c])))
+                continue;
 
             wire_msg_t msg;
             if (!wire_recv(lsp->client_fds[c], &msg)) {
