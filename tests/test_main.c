@@ -1178,6 +1178,9 @@ extern int test_htlc_claim_lsp_sender_selection(void);
 extern int test_htlc_claim_lsp_fulfil_handler(void);
 extern int test_htlc_claim_lsp_bridge_handler(void);
 extern int test_htlc_claim_client_without_lsp(void);
+extern int test_htlc_claim_withheld_raa_second_htlc(void);
+extern int test_htlc_claim_garbled_raa_fails_channel(void);
+extern int test_htlc_claim_unrevoked_after_add(void);
 extern int test_htlc_claim_schema_upgrade(void);
 extern int test_regtest_htlc_claim_lsp_payee(void);
 extern int test_regtest_htlc_claim_lsp_payee_restart(void);
@@ -3840,6 +3843,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_claim_lsp_fulfil_handler);
     RUN_TEST(test_htlc_claim_lsp_bridge_handler);
     RUN_TEST(test_htlc_claim_client_without_lsp);
+    RUN_TEST(test_htlc_claim_withheld_raa_second_htlc);
+    RUN_TEST(test_htlc_claim_garbled_raa_fails_channel);
+    RUN_TEST(test_htlc_claim_unrevoked_after_add);
     RUN_TEST(test_htlc_claim_schema_upgrade);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");

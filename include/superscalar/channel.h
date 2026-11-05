@@ -200,7 +200,18 @@ typedef struct {
        without the LSP's cooperation. */
     unsigned char latest_commitment_sig[64];
     int           has_latest_commitment_sig;
+
+    /* Nonzero once the channel can no longer safely advance: the peer
+       answered a commitment update with no revocation, or one that does not
+       verify, so it may still broadcast an older commitment we cannot
+       penalise.  While set, channel_add_htlc() and
+       channel_create_commitment_partial_sig() refuse.  Persisted
+       (channels.state = 'failed').  The way out is on chain. */
+    int           revocation_failed;
 } channel_t;
+
+/* Value of channel_t.revocation_failed once set (0 = not failed). */
+#define CHANNEL_FAILED_DURABLE 1
 
 /* --- Key derivation (BOLT #3) --- */
 

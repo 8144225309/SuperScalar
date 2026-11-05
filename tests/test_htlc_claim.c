@@ -9,10 +9,30 @@
  *   test_htlc_claim_local_commit          claim from our own commitment
  *   test_htlc_claim_remote_commit         claim from the counterparty's
  *   test_htlc_claim_preimage_script       success-leaf script + fail-closed checks
+ *   test_htlc_claim_schema_columns_any_version  claim columns at any version
+ *   test_htlc_claim_newer_revocation_keeps_claim  revoking N+1 keeps N's claim
+ *   test_htlc_claim_same_hash_two_outputs one claim per HTLC output
+ *   test_htlc_claim_dust_not_armed        no claim that would leave dust; fee
+ *   test_htlc_claim_pending_lookup_and_prune  no search; superseded dropped
+ *   test_htlc_claim_superseded_reorg      superseded only once buried final
+ *   test_htlc_claim_spent_output_seen     a spent HTLC output is not "absent"
+ *   test_htlc_claim_armed_expiry          armed claims never broadcast expire
+ *   test_htlc_claim_watch_armed_from_known  watch armed from a known preimage
+ *   test_htlc_claim_watch_then_arm        watch, then arm with the preimage
+ *   test_htlc_claim_registration_fails_closed  no claim that is not on disk
+ *   test_htlc_claim_filter_backend        BIP 158-style backend
+ *   test_htlc_claim_preimage_sealed       preimage sealed at rest
+ *   test_htlc_claim_penalty_spent         our penalty spent it: not lost
  *   test_htlc_claim_persist_reload        sweeper persistence across a reload
- *   test_htlc_claim_schema_upgrade        v39 -> v40 pending_sweeps migration
+ *   test_htlc_claim_schema_upgrade        pending_sweeps claim-column migration
  *   test_htlc_claim_priority_timing       claim timing vs the CLTV / timeout path
  *   test_htlc_claim_lsp_sender_selection  LSP arms claims on sender channels
+ *   test_htlc_claim_lsp_fulfil_handler    the LSP fulfil handler arms the claim
+ *   test_htlc_claim_lsp_bridge_handler    the bridge pay-result handler too
+ *   test_htlc_claim_client_without_lsp    client claims from its DB alone
+ *   test_htlc_claim_withheld_raa_second_htlc  sender keeps N: A and B claimed
+ *   test_htlc_claim_garbled_raa_fails_channel  invalid revocation fails it
+ *   test_htlc_claim_unrevoked_after_add   add without an answer: N watched
  * Regtest drills (bitcoind):
  *   test_regtest_htlc_claim_lsp_payee          sender = client
  *   test_regtest_htlc_claim_lsp_payee_restart  same, payee restarts
@@ -24,6 +44,7 @@
 #include "superscalar/sweeper.h"
 #include "superscalar/persist.h"
 #include "superscalar/lsp_channels.h"
+#include "superscalar/lsp_channels_internal.h"
 #include "superscalar/client.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/musig.h"
@@ -2310,6 +2331,214 @@ int test_htlc_claim_client_without_lsp(void)
     persist_close(&db);
     unlink(path);
     pair_cleanup(&p);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Second HTLC on both legs, with its own preimage, after lspnet_init. */
+static int lspnet_add_second(lspnet_t *n, unsigned char *pre_b)
+{
+    unsigned char hb[32];
+    memset(pre_b, 0x3C, 32);
+    sha256(pre_b, 32, hb);
+    uint64_t i1, i2;
+    if (!channel_add_htlc(&n->mgr->entries[0].channel, HTLC_RECEIVED, 9000,
+                          hb, 600, &i1) ||
+        !channel_add_htlc(&n->s.cli, HTLC_OFFERED, 9000, hb, 600, &i2) ||
+        !channel_add_htlc(&n->mgr->entries[1].channel, HTLC_OFFERED, 9000,
+                          hb, 560, &i1) ||
+        !channel_add_htlc(&n->p.cli, HTLC_RECEIVED, 9000, hb, 560, &i2))
+        return 0;
+    for (int k = 0; k < 2; k++) {
+        pair_t *x = k ? &n->p : &n->s;
+        secp256k1_pubkey pt;
+        if (!channel_get_per_commitment_point(&x->cli, 3, &pt)) return 0;
+        channel_set_remote_pcp(&n->mgr->entries[k].channel, 3, &pt);
+    }
+    return pair_cli_commit(&n->s, n->s_commit, n->s_commit_hex);
+}
+
+/* The payee reveals preimage pre for its HTLC htlc_id. */
+static int payee_fulfils_htlc(lspnet_t *n, uint64_t htlc_id,
+                              const unsigned char *pre, wire_msg_t *msg)
+{
+    if (!channel_fulfill_htlc(&n->p.cli, htlc_id, pre) ||
+        !client_send_raa(&n->p, n->cli_fd[1], 1, 0))
+        return 0;
+    msg->msg_type = MSG_UPDATE_FULFILL_HTLC;
+    msg->json = wire_build_update_fulfill_htlc(htlc_id, pre);
+    return msg->json != NULL;
+}
+
+/* Withholding alone: the sender has HTLCs A and B on commitment N.  The
+   payee fulfils A; the sender takes the preimage and never revokes N.
+   The payee then fulfils B: the LSP has paid it, so B must be claimable
+   on N too, and the sender must not get B's preimage. */
+int test_htlc_claim_withheld_raa_second_htlc(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    unsigned char pre_b[32];
+    TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_add_second(&n, pre_b),
+                "sender has A and B on N, payee has both");
+    uint64_t a_id = n.p.cli_htlc_id, b_id = a_id + 1;
+    shutdown(n.cli_fd[0], SHUT_WR);          /* sender never answers */
+
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils_htlc(&n, a_id, n.p.preimage, &msg), "fulfil A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(n.mgr->entries[0].channel.revocation_failed,
+                "sender channel failed: N not revoked");
+    TEST_ASSERT(n.lsp->client_fds[0] < 0, "sender disconnected");
+
+    TEST_ASSERT(payee_fulfils_htlc(&n, b_id, pre_b, &msg), "fulfil B");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "only A was revealed to the sender");
+
+    mk_put(&n.m, n.s_commit_hex, 100);       /* sender broadcasts N */
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 2, "both HTLC outputs on N claimed");
+    lspnet_free(&n);
+
+    /* Same, but the sender broadcasts N+1 (B only). */
+    TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_add_second(&n, pre_b),
+                "setup 2");
+    shutdown(n.cli_fd[0], SHUT_WR);
+    TEST_ASSERT(payee_fulfils_htlc(&n, a_id, n.p.preimage, &msg), "fulfil A 2");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage),
+                "sender applies A");
+    unsigned char t1[32];
+    char t1_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.s, t1, t1_hex), "sender commitment N+1");
+    TEST_ASSERT(payee_fulfils_htlc(&n, b_id, pre_b, &msg), "fulfil B 2");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    mk_put(&n.m, t1_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "B claimed on N+1");
+    n.m.height += sweeper_final_depth(&n.sw) - 1;
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.sw.n_entries == 1 && n.sw.entries[0].state == SWEEP_BROADCAST,
+                "claims on N dropped once N+1 is buried final");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A revoke_and_ack that does not verify (with a well-formed next point)
+   fails the channel: the next point is not stored, the LSP revocation is
+   not sent, the claim on the unrevoked commitment stays, the mark is
+   persisted, and the client is not heard from again. */
+int test_htlc_claim_garbled_raa_fails_channel(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "sender channel row");
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils");
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage) &&
+                client_send_raa(&n.s, n.cli_fd[0], 0, 1),
+                "sender answers with a garbled revocation");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+
+    channel_t *sc = &n.mgr->entries[0].channel;
+    unsigned char secret[32];
+    secp256k1_pubkey pt;
+    TEST_ASSERT(sc->revocation_failed, "sender channel failed");
+    TEST_ASSERT(!channel_get_received_revocation(sc, 1, secret),
+                "no revocation stored");
+    TEST_ASSERT(!channel_get_remote_pcp(sc, 3, &pt), "next point not stored");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_LSP_REVOKE_AND_ACK) == 0,
+                "no LSP revocation sent");
+    TEST_ASSERT(n.sw.n_entries == 1 && n.sw.entries[0].channel_id == 0 &&
+                memcmp(n.sw.entries[0].preimage, n.s.preimage, 32) == 0,
+                "claim on the unrevoked commitment kept");
+    TEST_ASSERT(persist_channel_is_failed(&n.db, 0), "failure persisted");
+    TEST_ASSERT(persist_save_channel(&n.db, sc, 0, 0) &&
+                persist_channel_is_failed(&n.db, 0), "kept when re-saved");
+
+    /* Nothing more is signed for the channel or taken from its client. */
+    unsigned char psig[32];
+    uint32_t nidx;
+    uint64_t id;
+    TEST_ASSERT(!channel_create_commitment_partial_sig(sc, psig, &nidx) &&
+                !channel_add_htlc(sc, HTLC_RECEIVED, 1000, n.s.hash, 600, &id),
+                "no new commitment, no new HTLC");
+    wire_msg_t late;
+    late.msg_type = MSG_UPDATE_FAIL_HTLC;
+    late.json = wire_build_update_fail_htlc(0, "late");
+    TEST_ASSERT(!lsp_channels_handle_msg(n.mgr, n.lsp, 0, &late),
+                "message from the failed channel dropped");
+    cJSON_Delete(late.json);
+
+    mk_put(&n.m, n.s_commit_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "claimed when the sender broadcasts");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A client that does not answer an add keeps the commitment the add
+   replaced.  The channel goes on, but the HTLCs on that commitment were
+   watched, so a preimage revealed later is claimable there too. */
+int test_htlc_claim_unrevoked_after_add(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: A on N");
+    channel_t *sc = &n.mgr->entries[0].channel;
+    TEST_ASSERT(lsp_channels_watch_commitment(n.mgr, 0) && n.sw.n_entries == 1,
+                "add path: A watched on N");
+    unsigned char h2[32];
+    memset(h2, 0x66, 32);
+    uint64_t i1, i2;
+    TEST_ASSERT(channel_add_htlc(sc, HTLC_RECEIVED, 5000, h2, 600, &i1) &&
+                channel_add_htlc(&n.s.cli, HTLC_OFFERED, 5000, h2, 600, &i2),
+                "sender adds B: N+1");
+    secp256k1_pubkey next;
+    TEST_ASSERT(!lsp_channels_take_revocation(n.mgr, n.lsp, 0, NULL, 0, &next),
+                "no revoke_and_ack");
+    TEST_ASSERT(!sc->revocation_failed, "an add without an answer does not fail");
+
+    /* A preimage of A arrives later (payee fulfils). */
+    TEST_ASSERT(lsp_channels_register_htlc_claim(n.mgr, 0, n.s.lsp_htlc_id,
+                                                 n.s.preimage) == 1,
+                "armed on N+1");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 2,
+                "and on N, where the watch was");
+    mk_put(&n.m, n.s_commit_hex, 100);       /* the sender broadcasts N */
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "A claimed on N");
+
+    /* With a valid revocation the watch goes. */
+    lspnet_free(&n);
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup 2");
+    sc = &n.mgr->entries[0].channel;
+    TEST_ASSERT(lsp_channels_watch_commitment(n.mgr, 0) && n.sw.n_entries == 1,
+                "watched");
+    TEST_ASSERT(channel_add_htlc(sc, HTLC_RECEIVED, 5000, h2, 600, &i1) &&
+                channel_add_htlc(&n.s.cli, HTLC_OFFERED, 5000, h2, 600, &i2),
+                "N+1 again");
+    TEST_ASSERT(client_send_raa(&n.s, n.cli_fd[0], 0, 0), "sender revokes N");
+    wire_msg_t ack;
+    TEST_ASSERT(wire_recv(n.lsp->client_fds[0], &ack), "LSP reads it");
+    TEST_ASSERT(lsp_channels_take_revocation(n.mgr, n.lsp, 0, &ack, 0, &next),
+                "valid revocation");
+    cJSON_Delete(ack.json);
+    TEST_ASSERT(n.sw.n_entries == 0, "watch dropped");
+    lspnet_free(&n);
     secp256k1_context_destroy(ctx);
     return 1;
 }

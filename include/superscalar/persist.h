@@ -337,6 +337,14 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
 int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
                                             int funding_pending_reorg);
 
+/* Mark a channel failed (channels.state = 'failed', see
+   channel_t.revocation_failed), so a restart reloads it failed.  Returns 1
+   if the row was updated. */
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id);
+
+/* 1 if the channel row is marked failed. */
+int persist_channel_is_failed(persist_t *p, uint32_t channel_id);
+
 /* Return all channel ids currently stored, in ascending order. */
 /* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for
    standalone watchtower hydration of PS state entries. */

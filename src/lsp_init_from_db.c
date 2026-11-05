@@ -224,6 +224,13 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.local_amount = loaded_local;
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
+        /* A channel failed before the restart stays failed. */
+        if (persist_channel_is_failed(pdb, (uint32_t)c)) {
+            entry->channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+            fprintf(stderr, "LSP recovery: channel %zu is failed (no valid "
+                    "revocation from its client); it must be closed on chain\n",
+                    c);
+        }
 
         /* Load active HTLCs from DB */
         {

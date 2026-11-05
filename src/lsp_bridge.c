@@ -211,7 +211,10 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            same cltv (delta-subtracting LSP-side only would diverge sighashes
            and break partial_sig_verify — caught by #310 CI regtest_bridge tests). */
         uint64_t dest_htlc_id;
-        if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
+        /* The client may never revoke the commitment this add replaces:
+           watch the HTLCs it offered us there first. */
+        if (!lsp_channels_watch_commitment(mgr, dest_idx) ||
+            !channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
                                payment_hash, cltv_expiry, &dest_htlc_id)) {
             cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
                 "insufficient_funds", htlc_id);
@@ -317,7 +320,15 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                             rev_secret, next_point)) {
                 uint64_t old_cn = dest_ch->commitment_number - 1;
-                channel_receive_revocation(dest_ch, old_cn, rev_secret);
+                if (!channel_receive_revocation(dest_ch, old_cn, rev_secret)) {
+                    /* Does not verify: the client keeps commitment old_cn. */
+                    lsp_channels_fail_channel(mgr, lsp, dest_idx,
+                        "revocation secret does not verify");
+                    cJSON_Delete(ack_msg.json);
+                    free(old_dest_htlcs);
+                    return 1;
+                }
+                lsp_channels_cancel_htlc_claims(mgr, dest_idx, old_cn);
                 /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                    No-op today (n_ptlcs == 0 at all current callsites); defensive
                    for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -421,6 +432,18 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (client_idx >= mgr->n_channels) break;
             channel_t *ch = &mgr->entries[client_idx].channel;
 
+            /* A failed channel gets no preimage: arm the claims, and the
+               HTLC is claimed on chain if the client broadcasts. */
+            if (success && ch->revocation_failed) {
+                lsp_channels_register_htlc_claim(mgr, client_idx, htlc_id_val,
+                                                 preimage);
+                fprintf(stderr, "LSP: client %zu channel failed: preimage of "
+                        "HTLC %llu not revealed to it, claimed on chain if it "
+                        "broadcasts\n", client_idx,
+                        (unsigned long long)htlc_id_val);
+                break;
+            }
+
             if (success) {
                 /* Capture pre-fulfill state for watchtower */
                 uint64_t old_local = ch->local_amount;
@@ -435,7 +458,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    the commitment still holding this HTLC once it sees the
                    preimage: be ready to claim it on chain first, and do not
                    reveal the preimage if the claim cannot be armed. */
-                if (lsp_channels_register_htlc_claim(mgr, client_idx,
+                if (!lsp_channels_watch_commitment(mgr, client_idx) ||
+                    lsp_channels_register_htlc_claim(mgr, client_idx,
                                                      htlc_id_val,
                                                      preimage) < 0) {
                     fprintf(stderr, "LSP: CRITICAL: no on-chain claim for "
@@ -464,19 +488,23 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     cJSON_Delete(cs);
                 }
 
-                /* Wait for REVOKE_AND_ACK from client */
+                /* Wait for REVOKE_AND_ACK from client.  It has the
+                   preimage now: a missing or invalid revocation fails the
+                   channel, and the commitment it kept, still holding the
+                   HTLC, is claimed on chain if broadcast. */
                 {
                     wire_msg_t ack_msg;
-                    if (wire_recv_timeout(lsp->client_fds[client_idx], &ack_msg, 30) &&
-                        ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
-                        uint32_t ack_chan_id;
-                        unsigned char rev_secret[32], next_point[33];
-                        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                                        rev_secret, next_point)) {
-                            uint64_t old_cn = ch->commitment_number - 1;
-                            if (channel_receive_revocation(ch, old_cn, rev_secret))
-                                lsp_channels_cancel_htlc_claims(mgr, client_idx,
-                                                                old_cn);
+                    int got = wire_recv_timeout(lsp->client_fds[client_idx],
+                                                &ack_msg, 30);
+                    uint64_t old_cn = ch->commitment_number - 1;
+                    secp256k1_pubkey next_pcp;
+                    if (!got) memset(&ack_msg, 0, sizeof(ack_msg));
+                    if (lsp_channels_take_revocation(mgr, lsp, client_idx,
+                                                     got ? &ack_msg : NULL, 1,
+                                                     &next_pcp)) {
+                        /* Verified: watch the revoked commitment and record
+                           the next point. */
+                        {
                             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                                No-op today (n_ptlcs == 0 at all current callsites); defensive
                                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -494,19 +522,12 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 old_htlcs, old_n_htlcs,
                                 /* SF-W-PTLC #171: thread PTLC snapshot */ old_ptlcs, old_n_ptlcs);
                             free(old_ptlcs);
-                            secp256k1_pubkey next_pcp;
-                            if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp,
-                                                            next_point, 33))
-                                channel_set_remote_pcp(ch,
-                                    ch->commitment_number + 1, &next_pcp);
+                            channel_set_remote_pcp(ch,
+                                ch->commitment_number + 1, &next_pcp);
                             lsp_send_revocation(mgr, lsp, client_idx, old_cn);
                         }
-                        cJSON_Delete(ack_msg.json);
-                    } else {
-                        if (ack_msg.json) cJSON_Delete(ack_msg.json);
-                        fprintf(stderr, "LSP: bridge pay fulfill — "
-                                "no REVOKE_AND_ACK from client %zu\n", client_idx);
                     }
+                    if (ack_msg.json) cJSON_Delete(ack_msg.json);
                 }
                 free(old_htlcs);
 

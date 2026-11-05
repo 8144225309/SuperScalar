@@ -2708,7 +2708,7 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
         " commitment_number, funding_txid, funding_vout, state, "
         " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
         " funding_pending_reorg) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?);";
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -2723,10 +2723,13 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     sqlite3_bind_int64(stmt, 7, (sqlite3_int64)ch->commitment_number);
     sqlite3_bind_text(stmt, 8, txid_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 9, (int)ch->funding_vout);
-    sqlite3_bind_int(stmt, 10, (int)ch->to_self_delay);
-    sqlite3_bind_int64(stmt, 11, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
-    sqlite3_bind_int(stmt, 12, ch->use_revocation_leaf);
-    sqlite3_bind_int(stmt, 13, ch->funding_pending_reorg);
+    /* A failed channel stays failed when re-saved. */
+    sqlite3_bind_text(stmt, 10, ch->revocation_failed ? "failed" : "open", -1,
+                      SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 11, (int)ch->to_self_delay);
+    sqlite3_bind_int64(stmt, 12, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
+    sqlite3_bind_int(stmt, 13, ch->use_revocation_leaf);
+    sqlite3_bind_int(stmt, 14, ch->funding_pending_reorg);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2771,6 +2774,35 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return 1;
+}
+
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "UPDATE channels SET state = 'failed' WHERE id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE) && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_channel_is_failed(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, "SELECT state FROM channels WHERE id = ?;",
+                           -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int failed = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *st = (const char *)sqlite3_column_text(stmt, 0);
+        failed = st && strcmp(st, "failed") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return failed;
 }
 
 int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,

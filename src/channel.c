@@ -1513,6 +1513,13 @@ int channel_create_commitment_partial_sig(
     unsigned char *partial_sig32_out,
     uint32_t *nonce_index_out)
 {
+    /* A failed channel signs nothing more (see channel_t.revocation_failed). */
+    if (ch->revocation_failed) {
+        fprintf(stderr, "channel_create_commitment_partial_sig: refused, "
+                "channel failed\n");
+        return 0;
+    }
+
     /* 1. Determine nonce index = remote_nonce_next (consumed in order) */
     uint32_t nidx = (uint32_t)ch->remote_nonce_next;
     if (nidx >= ch->remote_nonce_count) return 0;
@@ -1775,6 +1782,10 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     if (ch->funding_pending_reorg) {
         fprintf(stderr, "channel_add_htlc: refused — funding UTXO pending "
                 "reorg (waiting for re-confirmation)\n");
+        return 0;
+    }
+    if (ch->revocation_failed) {
+        fprintf(stderr, "channel_add_htlc: refused, channel failed\n");
         return 0;
     }
     if (ch->n_htlcs >= MAX_HTLCS) {
