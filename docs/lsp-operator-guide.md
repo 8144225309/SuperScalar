@@ -562,14 +562,19 @@ Only if *every* client of the old factory has since moved and released — no st
 
 ### Released keys and backups
 
-Released client keys are stored only sealed in the LSP DB: under the field encryption with `--encrypt-db`, otherwise under a seal key derived from the LSP's own secret. This protects a leaked DB or backup, not a compromised host. A released key still guards the moved client's old-factory outputs: its channel output in the factory tree (a 2-of-2 of the released key and the LSP) and its output in the distribution TX (which pays that key). The LSP holds the released key, so it sweeps these to its own wallet automatically as they appear on chain (from the chain tick; a BIP 158 light-client LSP does not run this and must sweep by hand). The keys are loaded again on restart and deleted only once the old factory is resolved and nothing a released key guards is left unspent:
+Released client keys are stored only sealed in the LSP DB: under the field encryption with `--encrypt-db`, otherwise under a seal key derived from the LSP's own secret. This protects a leaked DB or backup, not a compromised host. A released key still guards two of the moved client's old-factory outputs: its payout in the distribution TX (which pays that key) and its channel output in the factory tree (a 2-of-2 of the released key and the LSP). The keys are loaded again on restart.
 
-- the LSP's own close is buried, or
-- the old funding is otherwise spent and buried, and every on-chain output a released key can spend — its distribution-TX output and its tree channel output — has been swept and buried, or can no longer appear.
+If the old factory is still unresolved at its CLTV, the LSP publishes its recorded distribution TX, and from the chain tick it sweeps every distribution-TX output that pays a released key to its own wallet (a BIP 158 light-client LSP does not run this tick and must do this by hand). The keys are then deleted:
 
-The keys are never deleted while such an output is still unspent, and never held past the point where none can appear. Backups taken in between contain the sealed keys; rotate backups so old copies do not outlive the deletion.
+- when the LSP's own close is buried (every client moved), or
+- when the distribution TX is buried and every output in it that pays a released key is spent; the keys are not deleted while such an output is unspent, or
+- when the old funding was spent some other way (a client pushed the tree on chain, so the distribution TX can no longer confirm), once the old CLTV plus the margin (6 blocks on regtest, 100 elsewhere) has passed.
 
-Remaining race: when a client has stayed, re-signing the distribution TX needs that stayer's key, so the LSP cannot move the moved clients' distribution-TX value before the CLTV. After the CLTV, the LSP's sweep of a released key's distribution-TX output competes on fee with anyone else who knows that key. A separate settlement step at release time (the moved client signs its old-factory balance over to the LSP and revokes its last old commitment, so a later broadcast of it is penalised) removes the older-commitment claim; this fee race on the distribution-TX output is inherent to the stayer case.
+Backups taken in between contain the sealed keys; rotate backups so old copies do not outlive the deletion.
+
+Remaining race: when a client has stayed, re-signing the distribution TX needs that stayer's key, so the LSP cannot move the moved clients' distribution-TX value before the CLTV. After the CLTV, the LSP's sweep of a released key's distribution-TX output competes on fee with anyone else who knows that key. This fee race on the distribution-TX output is inherent to the stayer case.
+
+Open exposure: a moved client still holds its last old-factory channel commitment, which releasing its key does not revoke. If a stayer pushes the old tree on chain, that client can claim its old channel balance again through that commitment, racing the LSP. The release does not yet settle the old channel to the LSP, and the LSP does not yet sweep a moved client's channel output in the old tree. Until it does, the partial path carries this LSP-side risk from a malicious moved client.
 
 ### What is recorded, and restarts
 

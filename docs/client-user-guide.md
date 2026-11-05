@@ -87,7 +87,7 @@ Retired and released keys are listed too. A retired key belongs to a factory you
 out of; keep it until that factory is resolved. A **released** key was handed to the LSP
 in a partial rotation: its value was already paid to you in the replacement factory, so
 any old-factory output that still pays this key belongs to the LSP. Do not spend such
-outputs — the LSP sweeps them. The key is listed only so you can recognise it.
+outputs — the LSP sweeps its distribution-TX payout. The key is listed only so you can recognise it.
 
 ## 2. Connect to the LSP
 

@@ -815,6 +815,7 @@ typedef enum {
     LSP_WD_NONE = 0,
     LSP_WD_CLOSE,           /* build, record and broadcast the close */
     LSP_WD_WAIT,            /* the recorded close: rebroadcast or wait */
+    LSP_WD_SWEEP,           /* the dist TX is on chain: sweep released-key outputs */
     LSP_WD_DELETE           /* resolved: delete the released keys */
 } lsp_wd_action_t;
 
@@ -823,9 +824,34 @@ typedef enum {
 #define LSP_WD_CLOSE_DEPTH(regtest) ((regtest) ? 6 : 106)
 #define LSP_WD_CLTV_MARGIN(regtest) ((regtest) ? 6 : 100)
 
+/* The next wind-down step for an old factory, from what the chain shows.
+   close_confs: the LSP's own close confirmations (-1 none).  funding_spent: the
+   old funding is spent.  dist_present / dist_buried: its distribution TX is in
+   the mempool-or-chain / buried.  n_released_unresolved: released-key outputs
+   (dist payouts) still unspent.  past_cltv_margin: height is past the old CLTV
+   plus the margin.  Keys are deleted only when nothing a released key guards is
+   unspent: the LSP's own close is buried, OR the dist TX is buried and every
+   released-key output is spent, OR (a non-dist on-chain spend bypassed the dist
+   TX, so no dist output can appear) past the CLTV plus the margin.  Known gap:
+   a moved client's channel output in the old tree (2-of-2 of its released key
+   and the LSP) is not swept or tracked, and its old commitment is not revoked
+   at release; that exposure remains until the release settles the old
+   channel. */
 lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
                                              uint32_t n_released, int close_confs,
-                                             int height, uint32_t old_cltv, int regtest);
+                                             int funding_spent, int dist_present,
+                                             int dist_buried, uint32_t n_released_unresolved,
+                                             int past_cltv_margin, int regtest);
+
+/* A key-path P2TR sweep of SRC (a distribution-TX output paying P2TR of the
+   taproot-tweaked released key KEY32) to OUT_SPK.  Signs with the tweaked
+   key.  Returns 1 with the signed TX and its display txid; refuses if KEY32
+   does not control SRC_SPK. */
+int lsp_rotation_sweep_build(const secp256k1_context *ctx, const unsigned char *key32,
+                             const unsigned char *src_txid32, uint32_t src_vout,
+                             uint64_t src_amount, const unsigned char *src_spk34,
+                             const unsigned char *out_spk, size_t out_spk_len,
+                             uint64_t fee, tx_buf_t *signed_out, char txid_out[65]);
 
 /* The LSP's key-path close of the retired factory R, signed with its own
    key and every client's released key (KEYS, by participant index from 1;

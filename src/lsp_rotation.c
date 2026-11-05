@@ -3831,6 +3831,18 @@ static int part_save_record(lsp_channel_mgr_t *mgr, persist_t *db, const factory
                                            SECP256K1_EC_COMPRESSED);
     }
     snprintf(r->state, sizeof(r->state), "releasing");
+    /* Keep the old factory's signed distribution TX: the sweep of the
+       released-key payout outputs needs it (txid is witness-independent, so
+       the unsigned copy would do, but the signed one is what confirms). */
+    if (old_f->dist_tx_ready == 2 && old_f->dist_signed_tx.len > 0) {
+        r->dist_hex = malloc(old_f->dist_signed_tx.len * 2 + 1);
+        if (r->dist_hex) hex_encode(old_f->dist_signed_tx.data, old_f->dist_signed_tx.len,
+                                    r->dist_hex);
+    } else if (old_f->dist_unsigned_tx.len > 0) {
+        r->dist_hex = malloc(old_f->dist_unsigned_tx.len * 2 + 1);
+        if (r->dist_hex) hex_encode(old_f->dist_unsigned_tx.data, old_f->dist_unsigned_tx.len,
+                                    r->dist_hex);
+    }
     ok = ok && persist_save_part_rotation(db, r);
     for (size_t j = 0; ok && j < mgr->part_rel.m; j++) {
         persist_part_release_t rel;
@@ -3842,6 +3854,7 @@ static int part_save_record(lsp_channel_mgr_t *mgr, persist_t *db, const factory
         rel.carried = mgr->part_rel.carried[j];
         ok = persist_save_part_release(db, r->old_txid, &rel);
     }
+    free(r->dist_hex);
     free(r);
     return ok;
 }
@@ -4450,6 +4463,7 @@ int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
             any = 1;
         }
         free(rows[i].close_hex);
+        free(rows[i].dist_hex);
     }
     free(rows);
     fflush(stdout);
@@ -4462,16 +4476,99 @@ int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
 
 lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
                                              uint32_t n_released, int close_confs,
-                                             int height, uint32_t old_cltv, int regtest) {
+                                             int funding_spent, int dist_present,
+                                             int dist_buried, uint32_t n_released_unresolved,
+                                             int past_cltv_margin, int regtest) {
     if (!state || strcmp(state, "done") == 0) return LSP_WD_NONE;
-    if (height > 0 && old_cltv > 0 &&
-        (uint64_t)height >= (uint64_t)old_cltv + LSP_WD_CLTV_MARGIN(regtest))
-        return LSP_WD_DELETE;
+    /* The LSP's own close (no stayer): keys go once it is buried. */
     if (strcmp(state, "closing") == 0)
         return close_confs >= LSP_WD_CLOSE_DEPTH(regtest) ? LSP_WD_DELETE : LSP_WD_WAIT;
-    if (strcmp(state, "releasing") == 0 && m > 0 && m == n_old && n_released == m)
+    if (strcmp(state, "releasing") != 0) return LSP_WD_NONE;
+    /* Every client moved and released and the old funding is still there: the
+       LSP can close it alone. */
+    if (m > 0 && m == n_old && n_released == m && !funding_spent)
         return LSP_WD_CLOSE;
+    /* Otherwise the old factory resolves on its own (stayers, or the dist TX
+       at the CLTV).  Keys are deleted only when nothing a released key guards
+       is unspent. */
+    if (funding_spent && dist_present) {
+        if (n_released_unresolved > 0) return LSP_WD_SWEEP;
+        if (dist_buried) return LSP_WD_DELETE;          /* swept and buried */
+        return LSP_WD_WAIT;
+    }
+    if (funding_spent && !dist_present && past_cltv_margin)
+        return LSP_WD_DELETE;    /* a non-dist spend bypassed the dist TX; no dist
+                                    output can appear.  Known gap: a moved client's
+                                    tree channel output (2-of-2 of its released key
+                                    and the LSP) is neither swept nor tracked here. */
     return LSP_WD_NONE;
+}
+
+/* P2TR of the taproot-tweaked released key (its distribution-TX payout). */
+static int wd_payout_spk(const secp256k1_context *ctx, const unsigned char *key_pub33,
+                         unsigned char spk_out34[34]) {
+    secp256k1_pubkey pk;
+    secp256k1_xonly_pubkey xo, outx;
+    secp256k1_pubkey outp;
+    unsigned char ser[32], tweak[32];
+    if (!secp256k1_ec_pubkey_parse(ctx, &pk, key_pub33, 33) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk) ||
+        !secp256k1_xonly_pubkey_serialize(ctx, ser, &xo))
+        return 0;
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &outp, &xo, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &outx, NULL, &outp))
+        return 0;
+    build_p2tr_script_pubkey(spk_out34, &outx);
+    return 1;
+}
+
+int lsp_rotation_sweep_build(const secp256k1_context *ctx, const unsigned char *key32,
+                             const unsigned char *src_txid32, uint32_t src_vout,
+                             uint64_t src_amount, const unsigned char *src_spk34,
+                             const unsigned char *out_spk, size_t out_spk_len,
+                             uint64_t fee, tx_buf_t *signed_out, char txid_out[65]) {
+    if (!ctx || !key32 || !src_txid32 || !src_spk34 || !out_spk || !signed_out || !txid_out)
+        return 0;
+    if (out_spk_len == 0 || out_spk_len > 34 || src_amount <= fee + 330) return 0;
+    secp256k1_keypair kp;
+    secp256k1_pubkey pub;
+    unsigned char want[34];
+    if (!secp256k1_keypair_create(ctx, &kp, key32) ||
+        !secp256k1_keypair_pub(ctx, &pub, &kp)) {
+        secure_zero(&kp, sizeof(kp));
+        return 0;
+    }
+    unsigned char pub33[33];
+    size_t l = 33;
+    int ok = secp256k1_ec_pubkey_serialize(ctx, pub33, &l, &pub, SECP256K1_EC_COMPRESSED) &&
+             wd_payout_spk(ctx, pub33, want) && memcmp(want, src_spk34, 34) == 0;
+    /* Tweak the signing key to the output key. */
+    secp256k1_xonly_pubkey xo;
+    unsigned char ser[32], tweak[32];
+    if (ok) ok = secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pub) &&
+                 secp256k1_xonly_pubkey_serialize(ctx, ser, &xo);
+    if (ok) { sha256_tagged("TapTweak", ser, 32, tweak);
+              ok = secp256k1_keypair_xonly_tweak_add(ctx, &kp, tweak); }
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.amount_sats = src_amount - fee;
+    memcpy(out.script_pubkey, out_spk, out_spk_len);
+    out.script_pubkey_len = out_spk_len;
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    unsigned char dtxid[32], sh[32], sig[64], aux[32];
+    memset(aux, 0, 32);
+    ok = ok && build_unsigned_tx_with_locktime(&utx, dtxid, src_txid32, src_vout,
+                                               0xFFFFFFFDu, 0, &out, 1) &&
+         compute_taproot_sighash(sh, utx.data, utx.len, 0, src_spk34, 34, src_amount,
+                                 0xFFFFFFFDu) &&
+         secp256k1_schnorrsig_sign32(ctx, sig, sh, &kp, aux) &&
+         finalize_signed_tx(signed_out, utx.data, utx.len, sig);
+    if (ok) hex_encode(dtxid, 32, txid_out);
+    tx_buf_free(&utx);
+    secure_zero(&kp, sizeof(kp));
+    return ok;
 }
 
 int lsp_rotation_winddown_build(const secp256k1_context *ctx,
@@ -4537,14 +4634,91 @@ static ladder_factory_t *wd_ladder_slot(lsp_channel_mgr_t *mgr, const char *old_
 
 /* Build, record, then broadcast the close (never a second one: the record
    is checked first by the caller's state). */
+/* An LSP-controlled P2TR (or wallet) output script for close/sweep outputs. */
+static int wd_wallet_spk(lsp_channel_mgr_t *mgr, char addr_out[128],
+                         unsigned char *spk, size_t *spk_len) {
+    regtest_t *rt = rot_rt(mgr);
+    wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+    if (addr_out) addr_out[0] = '\0';
+    if (rt && regtest_get_new_address(rt, addr_out, 128) &&
+        regtest_get_address_scriptpubkey(rt, addr_out, spk, spk_len))
+        return 1;
+    if (!rt && ws && ws->get_change_spk && ws->get_change_spk(ws, spk, spk_len))
+        return 1;
+    return 0;
+}
+
+/* Sweep every unspent distribution-TX output that pays a released key of R
+   to the LSP wallet.  Returns the number still unresolved (unspent) after. */
+static uint32_t wd_sweep(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r,
+                         const persist_part_release_t *rel, size_t nr,
+                         const char *dist_disp) {
+    persist_t *db = (persist_t *)mgr->persist;
+    size_t np = (size_t)r->n_old + 1;
+    int *dep = calloc(np, sizeof(int));
+    unsigned char (*keys)[32] = calloc(np, 32);
+    char addr[128];
+    unsigned char wspk[64];
+    size_t wl = 0;
+    int have_wallet = dep && keys && wd_wallet_spk(mgr, addr, wspk, &wl) && wl && wl <= 34;
+    size_t have_keys = (dep && keys)
+        ? persist_load_departed_clients(db, r->retired_id, dep, keys, np) : 0;
+    (void)have_keys;
+    fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
+    uint64_t fee = fe ? fee_estimate(fe, 112) : 0;
+    if (fee == 0) fee = (112 * FEE_FLOOR_SAT_PER_KVB + 999) / 1000;
+    uint32_t unresolved = 0;
+    for (size_t k = 0; k < nr; k++) {
+        if (!rel[k].released) continue;
+        unsigned char spk[34];
+        uint32_t vout = 0;
+        uint64_t amt = 0;
+        if (!r->dist_hex || !wd_payout_spk(mgr->ctx, rel[k].old_pk, spk) ||
+            !rot_hex_find_output(r->dist_hex, spk, &vout, &amt))
+            continue;                       /* no such payout output */
+        if (rot_outpoint_unspent(mgr, dist_disp, vout) != 1)
+            continue;                       /* already spent (by us or anyone): resolved */
+        unresolved++;
+        uint32_t pidx = rel[k].old_slot + 1;
+        if (!have_wallet || pidx >= np || !dep[pidx]) continue;
+        unsigned char dtxid[32];
+        if (hex_decode(dist_disp, dtxid, 32) != 32) continue;
+        reverse_bytes(dtxid, 32);
+        tx_buf_t stx;
+        tx_buf_init(&stx, 256);
+        char t[65] = {0};
+        if (lsp_rotation_sweep_build(mgr->ctx, keys[pidx], dtxid, vout, amt, spk, wspk, wl,
+                                     fee, &stx, t)) {
+            char *hx = malloc(stx.len * 2 + 1);
+            if (hx) {
+                hex_encode(stx.data, stx.len, hx);
+                char sent[65] = {0};
+                int sok = rot_send_hex(mgr, hx, sent);
+                persist_log_broadcast(db, t, "rotation_release_sweep", hx,
+                                      sok ? "ok" : "failed");
+                printf("LSP rotate: sweeping released-key distribution output %s:%u "
+                       "(%llu sats) to the LSP wallet%s — %s\n", dist_disp, vout,
+                       (unsigned long long)amt, addr[0] ? addr : "",
+                       sok ? "broadcast" : "not yet (retried next block)");
+                free(hx);
+            }
+        }
+        tx_buf_free(&stx);
+    }
+    if (keys) secure_zero(keys, np * 32);
+    free(keys);
+    free(dep);
+    fflush(stdout);
+    return unresolved;
+}
+
 static int wd_close(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int height) {
     persist_t *db = (persist_t *)mgr->persist;
-    regtest_t *rt = rot_rt(mgr);
     int un = rot_outpoint_unspent(mgr, r->old_txid, r->old_vout);
     if (un != 1) {
         if (un == 0)
             printf("LSP rotate: the old factory %s is already spent -- no close of its "
-                   "own; the released keys go at its CLTV + margin\n", r->old_txid);
+                   "own; the released keys go once it is resolved on chain\n", r->old_txid);
         return 0;
     }
     tx_output_t out;
@@ -4552,10 +4726,7 @@ static int wd_close(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int heig
     char addr[128] = {0};
     unsigned char wspk[64];
     size_t wl = 0;
-    wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
-    if (!(rt && regtest_get_new_address(rt, addr, sizeof(addr)) &&
-          regtest_get_address_scriptpubkey(rt, addr, wspk, &wl)) &&
-        !(!rt && ws && ws->get_change_spk && ws->get_change_spk(ws, wspk, &wl))) {
+    if (!wd_wallet_spk(mgr, addr, wspk, &wl)) {
         fprintf(stderr, "LSP rotate: no wallet address for the old factory's close\n");
         return 0;
     }
@@ -4643,7 +4814,8 @@ static int wd_delete(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int con
         printf("LSP rotate: the old factory %s is closed (%s, %d confirmations); the "
                "released keys kept for it are deleted\n", r->old_txid, r->close_txid, confs);
     else
-        printf("LSP rotate: the old factory %s is past its CLTV + margin; the released "
+        printf("LSP rotate: the old factory %s is resolved on chain and every released-key "
+               "output has been swept and buried (or can no longer appear); the released "
                "keys kept for it are deleted\n", r->old_txid);
     fflush(stdout);
     return 1;
@@ -4660,7 +4832,6 @@ int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force) {
     persist_part_release_t *rel = calloc(FACTORY_MAX_SIGNERS, sizeof(*rel));
     if (!rows || !rel) { free(rows); free(rel); return 0; }
     size_t n = persist_load_part_rotations(db, rows, LADDER_MAX_FACTORIES, 1);
-    regtest_t *rt = rot_rt(mgr);
     int did = 0;
     for (size_t i = 0; i < n; i++) {
         persist_part_rotation_t *r = &rows[i];
@@ -4668,31 +4839,85 @@ int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force) {
         uint32_t released = 0;
         for (size_t k = 0; k < nr; k++) released += rel[k].released ? 1 : 0;
         int confs = r->close_txid[0] ? rot_tx_confirmations(mgr, r->close_txid) : -1;
+        int funding_spent = rot_outpoint_unspent(mgr, r->old_txid, r->old_vout) == 0;
+        /* The old factory's distribution TX and its released-key payout outputs. */
+        char dist_disp[65] = {0};
+        int dist_present = 0, dist_buried = 0;
+        uint32_t n_unresolved = 0;
+        if (r->dist_hex) {
+            size_t dn = strlen(r->dist_hex) / 2;
+            unsigned char *db2 = malloc(dn ? dn : 1);
+            unsigned char dt[32];
+            if (db2 && hex_decode(r->dist_hex, db2, dn) == (int)dn &&
+                tx_txid_from_bytes(db2, dn, dt))
+                rot_txid_display(dt, dist_disp);
+            free(db2);
+        }
+        if (dist_disp[0]) {
+            int dc = rot_tx_confirmations(mgr, dist_disp);
+            dist_present = dc >= 1 || rot_tx_in_mempool(mgr, dist_disp);
+            dist_buried = dc >= LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest);
+            for (size_t k = 0; k < nr; k++) {
+                unsigned char spk[34];
+                uint32_t vout = 0;
+                uint64_t amt = 0;
+                if (rel[k].released && wd_payout_spk(mgr->ctx, rel[k].old_pk, spk) &&
+                    rot_hex_find_output(r->dist_hex, spk, &vout, &amt) &&
+                    rot_outpoint_unspent(mgr, dist_disp, vout) == 1)
+                    n_unresolved++;
+            }
+        }
+        int past_cltv = h > 0 && r->old_cltv > 0 &&
+                        (uint64_t)h >= (uint64_t)r->old_cltv + LSP_WD_CLTV_MARGIN(mgr->rot_is_regtest);
         lsp_wd_action_t a = lsp_rotation_winddown_action(r->state, r->n_old, r->m, released,
-                                                         confs, h, r->old_cltv,
+                                                         confs, funding_spent, dist_present,
+                                                         dist_buried, n_unresolved, past_cltv,
                                                          mgr->rot_is_regtest);
         switch (a) {
         case LSP_WD_CLOSE:
             did |= wd_close(mgr, r, h);
             break;
-        case LSP_WD_WAIT:
-            if (confs < 1 && r->close_hex && !rot_tx_in_mempool(mgr, r->close_txid)) {
-                char t[65] = {0};
-                if (rot_send_hex(mgr, r->close_hex, t))
-                    printf("LSP rotate: the old factory's close %s was not on the network "
-                           "— rebroadcast it\n", r->close_txid);
-            } else if (confs < 1 && mgr->rot_is_regtest && rt) {
-                regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
-            }
+        case LSP_WD_SWEEP:
+            (void)wd_sweep(mgr, r, rel, nr, dist_disp);
+            did = 1;
             break;
         case LSP_WD_DELETE:
             did |= wd_delete(mgr, r, confs, strcmp(r->state, "closing") == 0 &&
                                             confs >= LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest));
             break;
+        case LSP_WD_WAIT:
+            if (strcmp(r->state, "releasing") == 0 && n_unresolved > 0)
+                (void)wd_sweep(mgr, r, rel, nr, dist_disp);
+            /* a "closing" wait falls through to the close rebroadcast below */
+            if (strcmp(r->state, "closing") == 0 && confs < 1 && r->close_hex &&
+                !rot_tx_in_mempool(mgr, r->close_txid)) {
+                char t[65] = {0};
+                if (rot_send_hex(mgr, r->close_hex, t))
+                    printf("LSP rotate: the old factory's close %s was not on the "
+                           "network — rebroadcast it\n", r->close_txid);
+            }
+            break;
         default:
+            /* Clients stayed and the old factory is still unresolved at its
+               CLTV: publish its recorded distribution TX (as the design's
+               EXPIRED handling does), so it resolves and the released-key
+               payout outputs can be swept.  Rebroadcast each block until it
+               is on the network; a stayer may publish it first. */
+            if (strcmp(r->state, "releasing") == 0 && !funding_spent && !dist_present &&
+                r->dist_hex && r->old_cltv > 0 && h > 0 && (uint32_t)h >= r->old_cltv) {
+                char t[65] = {0};
+                if (rot_send_hex(mgr, r->dist_hex, t)) {
+                    persist_log_broadcast(db, dist_disp, "rotation_old_distribution",
+                                          r->dist_hex, "ok");
+                    printf("LSP rotate: the old factory %s is unresolved at its CLTV — "
+                           "published its distribution TX %s\n", r->old_txid, dist_disp);
+                    did = 1;
+                }
+            }
             break;
         }
         free(r->close_hex);
+        free(r->dist_hex);
     }
     free(rows);
     free(rel);

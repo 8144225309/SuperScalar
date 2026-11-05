@@ -760,6 +760,8 @@ typedef struct {
     char state[16];             /* releasing | closing | done */
     char close_txid[65];        /* the LSP's own close (wind-down), recorded first */
     char *close_hex;            /* malloc'd by load; caller frees */
+    char *dist_hex;             /* the old factory's signed distribution TX (for the
+                                   sweep of released-key outputs); malloc'd by load */
 } persist_part_rotation_t;
 
 typedef struct {

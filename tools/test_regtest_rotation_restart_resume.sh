@@ -210,7 +210,10 @@ if [ "$PART" = 1 ]; then
   F1_CONF=0; [ "$CONF_F" = "$F1" ] && F1_CONF=1
   N_FUNDS=$(printf "%s\n" $FUNDS | grep -c . || true)
   DROPPED=$(cnt "LSP recovery: a partial rotation of this factory stopped before its replacement was recorded" "$L2")
-  REBC=$(cnt "replacement funding $F1 was not on the network" "$L2")
+  # The recorded funding is rebroadcast first thing at startup, before the
+  # daemon can spend from the wallet (or, failing that, by the resume step).
+  REBC_START=$(cnt "LSP recovery: rebroadcast the recorded replacement funding $F1 before any wallet use" "$L2")
+  REBC=$(( REBC_START + $(cnt "replacement funding $F1 was not on the network" "$L2") ))
   OWED=$(cnt "LSP recovery: [0-9]+ of [0-9]+ release\(s\) still owed" "$L2")
   REL=$(grep -ahoE "client [0-9]+ released its old factory key \(verified release\)" "$TMP/lsp1.log" "$L2" | sort -u | wc -l)
   REL_LINES=$(grep -ahE "client [0-9]+ released its old factory key \(verified release\)" "$TMP/lsp1.log" "$L2" | wc -l)
@@ -223,7 +226,7 @@ if [ "$PART" = 1 ]; then
   SWITCHED=0
   for N in 1 2 3 4; do grep -qa "switched to the replacement factory" "$TMP/c$N.log" && SWITCHED=$((SWITCHED + 1)); done
   echo
-  echo "=== fund-safety: ckpt=$CKPT fundings_built=$N_FUNDS confirmed=$N_CONF first_confirmed=$F1_CONF dropped=$DROPPED rebroadcast=$REBC owed_loaded=$OWED released=$REL/4 (lines $REL_LINES) clients_switched=$SWITCHED/4 winddown_closes=$N_WD close_conf=${WD_CONF:-0} keys_deleted=$DELETED keys_left=${LEFT:-?} ==="
+  echo "=== fund-safety: ckpt=$CKPT fundings_built=$N_FUNDS confirmed=$N_CONF first_confirmed=$F1_CONF dropped=$DROPPED rebroadcast=$REBC (at startup $REBC_START) owed_loaded=$OWED released=$REL/4 (lines $REL_LINES) clients_switched=$SWITCHED/4 winddown_closes=$N_WD close_conf=${WD_CONF:-0} keys_deleted=$DELETED keys_left=${LEFT:-?} ==="
   OK=0
   if [ "$N_CONF" -eq 1 ] && [ "$REL" -eq 4 ] && [ "$REL_LINES" -eq 4 ] && [ "$SWITCHED" -eq 4 ] &&
      [ "$N_WD" -eq 1 ] && [ "${WD_CONF:-0}" -ge 6 ] && [ "$DELETED" -ge 1 ] && [ "${LEFT:-1}" -eq 0 ]; then
@@ -231,7 +234,7 @@ if [ "$PART" = 1 ]; then
       rotate_part_built|rotate_part_signed)
         [ "$DROPPED" -ge 1 ] && [ "$F1_CONF" -eq 0 ] && [ "$N_FUNDS" -eq 2 ] && OK=1 ;;
       rotate_part_recorded)
-        [ "$F1_CONF" -eq 1 ] && [ "$N_FUNDS" -eq 1 ] && [ "$REBC" -ge 1 ] && OK=1 ;;
+        [ "$F1_CONF" -eq 1 ] && [ "$N_FUNDS" -eq 1 ] && [ "$REBC_START" -ge 1 ] && OK=1 ;;
       *)
         [ "$F1_CONF" -eq 1 ] && [ "$N_FUNDS" -eq 1 ] && [ "$OWED" -ge 1 ] && OK=1 ;;
     esac
@@ -245,7 +248,7 @@ if [ "$PART" = 1 ]; then
     grep -aiE "rotation|release|switched|refus|reconnect" "$TMP/c$N.log" | tail -10 | sed "s/^/  c$N: /" | cut -c1-200
   done
   grep -aE "reconnect|release|asked" "$TMP/lsp2.log" | head -20 | sed "s/^/  lsp2: /" | cut -c1-200
-  echo "RESUME-FAIL: want confirmed=1 released=4/4 (4 lines) clients_switched=4/4 winddown_closes=1 close_conf>=6 keys_deleted>=1 keys_left=0 and (built/signed: dropped>=1 first_confirmed=0 fundings_built=2; recorded: first_confirmed=1 fundings_built=1 rebroadcast>=1; funded/released: first_confirmed=1 fundings_built=1 owed_loaded>=1)"
+  echo "RESUME-FAIL: want confirmed=1 released=4/4 (4 lines) clients_switched=4/4 winddown_closes=1 close_conf>=6 keys_deleted>=1 keys_left=0 and (built/signed: dropped>=1 first_confirmed=0 fundings_built=2; recorded: first_confirmed=1 fundings_built=1 rebroadcast_at_startup>=1; funded/released: first_confirmed=1 fundings_built=1 owed_loaded>=1)"
   exit 1
 fi
 [ -n "$CLOSE1" ] || { echo "RESUME-FAIL: no Phase-1 close txid (crash landed before close?)"; exit 1; }

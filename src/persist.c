@@ -118,6 +118,7 @@ static const char *SCHEMA_VERSION_SQL =
     "  state TEXT NOT NULL,"                                 \
     "  close_txid TEXT,"                                     \
     "  close_hex TEXT,"                                      \
+    "  dist_hex TEXT,"                                       \
     "  updated_at INTEGER"                                   \
     ");"                                                     \
     "CREATE TABLE IF NOT EXISTS part_releases ("             \
@@ -1545,6 +1546,10 @@ int persist_open(persist_t *p, const char *path) {
         if (ok44 && !persist_v44_column_exists(p->db, "client_rotations", "old_pubkey"))
             ok44 = sqlite3_exec(p->db,
                 "ALTER TABLE client_rotations ADD COLUMN old_pubkey TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "part_rotations", "dist_hex"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE part_rotations ADD COLUMN dist_hex TEXT;",
                 NULL, NULL, &merr44) == SQLITE_OK;
         if (!ok44) {
             fprintf(stderr, "persist_open: migration v44 failed: %s\n",
@@ -8239,7 +8244,8 @@ int persist_save_part_rotation(persist_t *p, const persist_part_rotation_t *r) {
     int ok = sqlite3_prepare_v2(p->db,
         "INSERT OR REPLACE INTO part_rotations (old_txid, old_vout, retired_id, new_txid, "
         "new_vout, digest, n_old, m, old_amount, old_cltv, old_pubkeys, state, close_txid, "
-        "close_hex, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'));",
+        "close_hex, dist_hex, updated_at) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'));",
         -1, &st, NULL) == SQLITE_OK;
     if (ok) {
         sqlite3_bind_text(st, 1, r->old_txid, -1, SQLITE_TRANSIENT);
@@ -8258,6 +8264,8 @@ int persist_save_part_rotation(persist_t *p, const persist_part_rotation_t *r) {
         else sqlite3_bind_null(st, 13);
         if (r->close_hex) sqlite3_bind_text(st, 14, r->close_hex, -1, SQLITE_TRANSIENT);
         else sqlite3_bind_null(st, 14);
+        if (r->dist_hex) sqlite3_bind_text(st, 15, r->dist_hex, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(st, 15);
         ok = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
@@ -8271,10 +8279,10 @@ size_t persist_load_part_rotations(persist_t *p, persist_part_rotation_t *rows, 
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(p->db, open_only
             ? "SELECT old_txid, old_vout, retired_id, new_txid, new_vout, digest, n_old, m, "
-              "old_amount, old_cltv, old_pubkeys, state, close_txid, close_hex FROM "
+              "old_amount, old_cltv, old_pubkeys, state, close_txid, close_hex, dist_hex FROM "
               "part_rotations WHERE state != 'done' ORDER BY retired_id;"
             : "SELECT old_txid, old_vout, retired_id, new_txid, new_vout, digest, n_old, m, "
-              "old_amount, old_cltv, old_pubkeys, state, close_txid, close_hex FROM "
+              "old_amount, old_cltv, old_pubkeys, state, close_txid, close_hex, dist_hex FROM "
               "part_rotations ORDER BY retired_id;", -1, &st, NULL) != SQLITE_OK)
         return 0;
     size_t n = 0;
@@ -8288,6 +8296,7 @@ size_t persist_load_part_rotations(persist_t *p, persist_part_rotation_t *rows, 
         const char *s = (const char *)sqlite3_column_text(st, 11);
         const char *ct = (const char *)sqlite3_column_text(st, 12);
         const char *ch = (const char *)sqlite3_column_text(st, 13);
+        const char *dh = (const char *)sqlite3_column_text(st, 14);
         r->n_old = (uint32_t)sqlite3_column_int64(st, 6);
         size_t npk = (size_t)r->n_old + 1;
         if (!o || !nt || !dg || !pk || !s || npk > FACTORY_MAX_SIGNERS ||
@@ -8320,6 +8329,7 @@ size_t persist_load_part_rotations(persist_t *p, persist_part_rotation_t *rows, 
         snprintf(r->state, sizeof(r->state), "%s", s);
         if (ct) snprintf(r->close_txid, sizeof(r->close_txid), "%s", ct);
         if (ch) r->close_hex = strdup(ch);
+        if (dh) r->dist_hex = strdup(dh);
         n++;
     }
     sqlite3_finalize(st);

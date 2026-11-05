@@ -1194,6 +1194,7 @@ extern int test_part_winddown_close(void);
 extern int test_part_winddown_tick(void);
 extern int test_part_reask(void);
 extern int test_part_switch_due(void);
+extern int test_part_sweep_build(void);
 extern int test_cin_records(void);
 extern int test_cin_tree_bind_record(void);
 extern int test_cin_json_strict(void);
@@ -3249,6 +3250,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_part_winddown_tick);
     RUN_TEST(test_part_reask);
     RUN_TEST(test_part_switch_due);
+    RUN_TEST(test_part_sweep_build);
     RUN_TEST(test_cin_records);
     RUN_TEST(test_cin_tree_bind_record);
     RUN_TEST(test_cin_json_strict);

@@ -71,6 +71,10 @@ REPO="${REPO:-/root/SuperScalar}"
 cd "$REPO" || exit 2
 
 MODE="${MODE:-full}"               # full | partial (client 4 offline at DYING) | winddown
+# DIST_SWEEP=1 (with MODE=partial): the stayer does NOT force-close, so the old
+# factory is still unresolved at its CLTV; the LSP then publishes its recorded
+# distribution TX and sweeps every moved client's released-key output, and the
+# on-chain sweep is exercised end to end.
 ARITY="${ARITY:-1}"                # factory shape passed to --arity
 PORT="${PORT:-9975}"
 TMP="/tmp/rot_keys_${MODE}_$PORT"
@@ -352,6 +356,12 @@ if [ "$COMPLETE" -ge 1 ]; then
   else verdict PAY_AFTER 1 "pay 1->0 after rotation: ${POST_DONE} result line(s), 0 succeeded ($(grep -aE "CLI: pay|LSP: .*(fail|FAIL|reject)" "$L" | tail -2 | tr '\n' ' ' | cut -c1-200))"; fi
 fi
 
+if [ "$COMPLETE" -ge 1 ] && { [ "${POST_OK:-0}" -lt 1 ] || ! echo "${RESTART_LOG:-}" | grep -q reconnected; }; then
+  echo "=== context: LSP after the rotation, and client 4 ==="
+  sed -n '/LSP rotate: rotation complete/,$p' "$L" | grep -avE "Channel [0-9]+: local=|Leaf [0-9]+:" | head -150 | cut -c1-170
+  tail -15 "$TMP/c4.log" | cut -c1-170 | sed 's/^/  c4: /'
+fi
+
 # --- RESTART: a client restart reloads its factory key ---
 if [ "$COMPLETE" -ge 1 ]; then
   if echo "$RESTART_LOG" | grep -q "reloaded" && echo "$RESTART_LOG" | grep -q "reconnected"; then
@@ -446,7 +456,7 @@ print("%s:%d" % (i["txid"], i["vout"]), len(o), o[0]["scriptPubKey"].get("addres
 fi
 
 # --- STAYER: the client that stayed is told to exit, and can ---
-if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ]; then
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ]; then
   echo "--- client 4 back after the rotation ---" >> "$TMP/c4.log"
   start_client 4
   for i in $(seq 1 40); do
@@ -597,18 +607,24 @@ if [ "$MODE" != full ] && [ "$COMPLETE" -ge 1 ] && [ "$N_DEP" -gt 0 ]; then
   # the replacement is not rotated meanwhile.
   for N in 1 2 3 4; do kill -9 "${CPID[$N]}" 2>/dev/null; done
   OLD_CLTV=$(sqlite3 "$DB" "SELECT old_cltv FROM part_rotations ORDER BY retired_id LIMIT 1;" 2>/dev/null)
-  H0=$($BCLI getblockcount)
-  NEED=8; [ "$MODE" = partial ] && NEED=$(( ${OLD_CLTV:-0} + 7 - H0 ))
-  [ "$NEED" -lt 1 ] && NEED=1
-  echo "mining $NEED block(s) (height $H0, old factory CLTV ${OLD_CLTV:-?})"
-  while [ "$NEED" -gt 0 ]; do
-    STEP=$(( NEED < 10 ? NEED : 10 ))
-    $BCLI -rpcwallet="$WALLET" generatetoaddress "$STEP" "$MADDR" >/dev/null 2>&1
-    NEED=$(( NEED - STEP )); sleep 2
+
+  # The old factory must first resolve: winddown closes it alone once every
+  # client released; partial (stayer) resolves at its CLTV, when the LSP
+  # auto-broadcasts its distribution TX, and the LSP then sweeps every
+  # released-key output before the keys can go.  Mine in a loop (the daemon
+  # steps the wind-down once per block) until the deletion log, or a cap.
+  CAP=$(( ${OLD_CLTV:-0} + 60 )); H=$($BCLI getblockcount)
+  [ "$CAP" -lt "$(( H + 30 ))" ] && CAP=$(( H + 30 ))
+  echo "mining toward the deletion (height $H, old factory CLTV ${OLD_CLTV:-?}, cap $CAP)"
+  for _ in $(seq 1 "$CAP"); do
+    grep -qa "the released keys kept for it are deleted" "$L" && break
+    [ "$($BCLI getblockcount)" -ge "$CAP" ] && { sleep 2; grep -qa "the released keys kept for it are deleted" "$L" && break; break; }
+    $BCLI -rpcwallet="$WALLET" generatetoaddress 2 "$MADDR" >/dev/null 2>&1
+    sleep 2
   done
-  wait_log "$L" "the released keys kept for it are deleted" 60
   N_DEP_END=$(sqlite3 "$DB" "SELECT COUNT(*) FROM departed_clients;" 2>/dev/null)
-  DEL_DETAIL="; at height $($BCLI getblockcount): $(grep -aoE "the old factory [0-9a-f]{64} is (closed|past its CLTV)[^;]*; the released keys kept for it are deleted" "$L" | head -1 | cut -c1-140), $N_DEP_END left"
+  SWEPT=$(cnt "sweeping released-key distribution output" "$L")
+  DEL_DETAIL="; at height $($BCLI getblockcount): $(grep -aoE "the old factory [0-9a-f]{64} is (closed|resolved on chain)[^;]*; the released keys kept for it are deleted" "$L" | head -1 | cut -c1-150); released-key dist outputs swept=$SWEPT; $N_DEP_END left"
 fi
 if [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "${N_DEP_END:-1}" -eq 0 ]; then
   if [ "$N_DEP" -gt 0 ]; then
@@ -618,6 +634,45 @@ if [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "${N_DEP_END:-1}" -
   fi
 else
   verdict KEYS_AT_REST 1 "$REST_EARLY$DEL_DETAIL"
+fi
+
+# --- SWEEP: with a stayer, the old factory resolves via its distribution TX;
+#     the LSP sweeps every moved client's distribution-TX output (which pays a
+#     released key) to its own wallet, and only then are the keys deleted. ---
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${N_DEP:-0}" -gt 0 ]; then
+  N_MOVED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE released = 1;" 2>/dev/null)
+  SWEPT=$(cnt "sweeping released-key distribution output" "$L")
+  SWEEP_WON=0
+  # The sweeps pay the LSP's wallet, so the wallet knows them.
+  for tx in $(sqlite3 "$DB" "SELECT DISTINCT txid FROM broadcast_log WHERE source='rotation_release_sweep';" 2>/dev/null); do
+    c=$($BCLI -rpcwallet="$WALLET" gettransaction "$tx" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get(\"confirmations\",0))" 2>/dev/null)
+    [ "${c:-0}" -ge 1 ] && SWEEP_WON=$((SWEEP_WON + 1))
+  done
+  # The old factory resolved through its distribution TX if the LSP published
+  # it, or saw it and swept its released-key outputs.
+  N_PUB=$(sqlite3 "$DB" "SELECT COUNT(*) FROM broadcast_log WHERE source='rotation_old_distribution';" 2>/dev/null)
+  ODT=$(grep -aoE "published its distribution TX [0-9a-f]{64}|sweeping released-key distribution output [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+  DIST_CONF=0
+  if [ "${N_PUB:-0}" -ge 1 ] || [ "${SWEPT:-0}" -ge 1 ]; then DIST_CONF=1; fi
+  echo "sweep context: old dist txid=${ODT:-none} via_dist=$DIST_CONF published_by_lsp=${N_PUB:-0} sweeps_broadcast=${SWEPT:-0} sweeps_confirmed_in_lsp_wallet=${SWEEP_WON:-0}"
+  grep -aE "published its distribution|sweeping released-key|is resolved on chain" "$L" | head -8 | cut -c1-170 | sed 's/^/  lsp: /'
+  if [ "${DIST_CONF:-0}" -ge 1 ]; then
+    if [ "${SWEEP_WON:-0}" -ge 1 ] && [ "${N_DEP_END:-1}" -eq 0 ]; then
+      verdict SWEEP 0 "the old factory resolved via its distribution TX; the LSP swept $SWEEP_WON of ${N_MOVED:-?} released-key output(s) to its own wallet (confirmed), then deleted the keys"
+    else
+      verdict SWEEP 1 "dist TX confirmed but swept=$SWEPT won=$SWEEP_WON keys_left=${N_DEP_END:-?}"
+    fi
+  else
+    # Resolved via the tree (a stayer forced its exit): no distribution TX, so
+    # no released-key payout output to sweep.  The moved clients' channel
+    # outputs in the old tree are not swept by this (a known open item); the
+    # keys must still go.
+    if [ "${N_DEP_END:-1}" -eq 0 ]; then
+      verdict SWEEP 0 "the old factory resolved via the tree (no distribution TX); no released-key payout output to sweep; the released keys were deleted (the moved clients' old-tree channel outputs are not covered by this sweep)"
+    else
+      verdict SWEEP 1 "resolved via the tree but ${N_DEP_END} released key(s) still in the DB"
+    fi
+  fi
 fi
 
 echo

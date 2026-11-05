@@ -9,6 +9,7 @@
 #include "superscalar/factory_keys.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
+#include "superscalar/sha256.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/wire.h"
 #include "superscalar/watchtower.h"
@@ -1761,27 +1762,37 @@ int test_part_load_restart(void) {
 /* When the LSP may close the old factory alone, and when the released keys
    go. */
 int test_part_winddown_action(void) {
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 100, 500, 1) == LSP_WD_CLOSE,
+    /* Every client moved and released and the funding is still there: close. */
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 0, 0, 0, 0, 0, 1) == LSP_WD_CLOSE,
                 "every client moved and released: close");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 100, 500, 1) == LSP_WD_NONE,
-                "a client stayed: never an LSP-alone close");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 3, -1, 100, 500, 1) == LSP_WD_NONE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 1, 0, 0, 0, 0, 1) == LSP_WD_NONE,
+                "but not once the funding is already spent");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 3, -1, 0, 0, 0, 0, 0, 1) == LSP_WD_NONE,
                 "a release still owed: wait");
-    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 0, 100, 500, 1) == LSP_WD_WAIT &&
-                lsp_rotation_winddown_action("closing", 4, 4, 4, 5, 100, 500, 1) == LSP_WD_WAIT,
-                "the close not buried yet: keep the keys");
-    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 100, 500, 1) == LSP_WD_DELETE,
-                "buried on regtest: delete");
-    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 100, 500, 0) == LSP_WD_WAIT &&
-                lsp_rotation_winddown_action("closing", 4, 4, 4, 106, 100, 5000, 0) == LSP_WD_DELETE,
-                "elsewhere: 6 plus a margin of 100");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 505, 500, 1) == LSP_WD_NONE &&
-                lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 506, 500, 1) == LSP_WD_DELETE,
-                "with clients that stayed: at the old CLTV plus the margin");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 599, 500, 0) == LSP_WD_NONE &&
-                lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 600, 500, 0) == LSP_WD_DELETE,
-                "and off regtest after 100 blocks");
-    TEST_ASSERT(lsp_rotation_winddown_action("done", 4, 4, 4, 9, 900, 500, 1) == LSP_WD_NONE,
+    /* The LSP's own close: keys only once it is buried. */
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 5, 1, 0, 0, 0, 0, 1) == LSP_WD_WAIT &&
+                lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 1, 0, 0, 0, 0, 1) == LSP_WD_DELETE,
+                "close buried on regtest (6): delete");
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 105, 1, 0, 0, 0, 1, 0) == LSP_WD_WAIT &&
+                lsp_rotation_winddown_action("closing", 4, 4, 4, 106, 1, 0, 0, 0, 1, 0) == LSP_WD_DELETE,
+                "elsewhere: 106");
+    /* Stayers: the dist TX on chain and its released-key outputs. */
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 0, 2, 0, 1) == LSP_WD_SWEEP,
+                "dist TX present with unspent released-key outputs: sweep");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 0, 0, 0, 1) == LSP_WD_WAIT,
+                "swept but not buried yet: wait, do not delete");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 1, 0, 1) == LSP_WD_SWEEP,
+                "still an unspent output though buried: sweep, never delete while guarded");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 0, 0, 1) == LSP_WD_DELETE,
+                "dist buried and every released-key output spent: delete");
+    /* A non-dist spend bypassed the dist TX: no dist output can appear. */
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 0, 1) == LSP_WD_NONE,
+                "funding spent by a non-dist TX, not yet past CLTV+margin: wait");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 1, 1) == LSP_WD_DELETE,
+                "funding spent by a non-dist TX and past CLTV+margin: delete");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 0, 0, 0, 0, 1, 1) == LSP_WD_NONE,
+                "funding still unspent: never delete, whatever the height");
+    TEST_ASSERT(lsp_rotation_winddown_action("done", 4, 4, 4, 9, 1, 1, 1, 0, 1, 1) == LSP_WD_NONE,
                 "done: nothing");
     return 1;
 }
@@ -2070,6 +2081,65 @@ int test_part_switch_due(void) {
     persist_close(&db);
     unlink(path);
     unlink(cli);
+    return 1;
+}
+
+/* The sweep of a released key's distribution-TX output: a valid key-path
+   spend of P2TR(tweak(k)) signed with k, to the LSP wallet; a wrong key is
+   refused (it does not control that output). */
+int test_part_sweep_build(void) {
+    secp256k1_context *ctx = cin_ctx();
+    unsigned char k[32], wrong[32];
+    memset(k, 0x5a, 32);
+    memset(wrong, 0x5b, 32);
+    /* The output script: P2TR of the taproot-tweaked xonly(k). */
+    secp256k1_pubkey pk, outp;
+    secp256k1_xonly_pubkey xo, outx;
+    unsigned char ser[32], tweak[32], spk[34];
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pk, k) &&
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &xo, NULL, &pk) &&
+                secp256k1_xonly_pubkey_serialize(ctx, ser, &xo), "key");
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    TEST_ASSERT(secp256k1_xonly_pubkey_tweak_add(ctx, &outp, &xo, tweak) &&
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &outx, NULL, &outp), "tweak");
+    build_p2tr_script_pubkey(spk, &outx);
+    unsigned char src_txid[32];
+    memset(src_txid, 0x7e, 32);
+    unsigned char out_spk[34];
+    out_spk[0] = 0x51; out_spk[1] = 0x20;
+    memset(out_spk + 2, 0x22, 32);
+    tx_buf_t stx;
+    tx_buf_init(&stx, 256);
+    char txid[65];
+    TEST_ASSERT(!lsp_rotation_sweep_build(ctx, wrong, src_txid, 1, 100000, spk, out_spk, 34,
+                                          500, &stx, txid),
+                "a key that does not control the output is refused");
+    TEST_ASSERT(lsp_rotation_sweep_build(ctx, k, src_txid, 1, 100000, spk, out_spk, 34,
+                                         500, &stx, txid), "built with the right key");
+    /* Verify the key-path signature against the output key. */
+    unsigned char sh[32];
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    tx_output_t o;
+    memset(&o, 0, sizeof(o));
+    o.amount_sats = 100000 - 500;
+    memcpy(o.script_pubkey, out_spk, 34);
+    o.script_pubkey_len = 34;
+    TEST_ASSERT(build_unsigned_tx_with_locktime(&utx, NULL, src_txid, 1, 0xFFFFFFFDu, 0, &o, 1) &&
+                compute_taproot_sighash(sh, utx.data, utx.len, 0, spk, 34, 100000, 0xFFFFFFFDu),
+                "sighash");
+    TEST_ASSERT(stx.len > 68, "has a witness");
+    const unsigned char *sig = stx.data + stx.len - 4 - 64;
+    TEST_ASSERT(secp256k1_schnorrsig_verify(ctx, sig, sh, 32, &outx),
+                "a valid key-path signature of the released-key output");
+    /* No fee room: refused. */
+    tx_buf_t s2;
+    tx_buf_init(&s2, 64);
+    TEST_ASSERT(!lsp_rotation_sweep_build(ctx, k, src_txid, 1, 400, spk, out_spk, 34,
+                                          500, &s2, txid), "uneconomical: refused");
+    tx_buf_free(&utx);
+    tx_buf_free(&stx);
+    tx_buf_free(&s2);
     return 1;
 }
 
