@@ -677,6 +677,136 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
     return 1;
 }
 
+/* ---- A payment through the LSP's handlers leaves no commitment signature
+   pending: both clients can still take part in a partial rotation ---- */
+
+int test_part_pending_cs_cleared(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i]) ||
+            !secp256k1_keypair_pub(ctx, &pks[i], &kps[i]))
+            return 0;
+    /* A funding output of the five keys (not on any chain: the handlers
+       never look it up). */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32], tweak_val[32], fund_spk[34];
+    TEST_ASSERT(secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey), "agg");
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    TEST_ASSERT(secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache,
+                                                       tweak_val) &&
+                secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk),
+                "tweak");
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0x6d, 32);
+    uint64_t funding_amount = 1000000;
+
+    unsigned char preimage[32] = { [0 ... 31] = 0x78 };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+    int port = 21900 + (getpid() % 1000);
+    payment_test_data_t sender_data, payee_data, idle_data;
+    memset(&sender_data, 0, sizeof(sender_data));
+    memset(&payee_data, 0, sizeof(payee_data));
+    memset(&idle_data, 0, sizeof(idle_data));
+    memcpy(sender_data.payment_hash, payment_hash, 32);
+    sender_data.is_sender = 1;
+    memcpy(payee_data.payment_hash, payment_hash, 32);
+    memcpy(payee_data.preimage, preimage, 32);
+
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
+            /* Its own key only (no factory or identity key another test set). */
+            client_set_factory_keypair(NULL);
+            client_set_identity_keypair(NULL);
+            void *cb_data = c == 0 ? (void *)&sender_data
+                          : c == 1 ? (void *)&payee_data : (void *)&idle_data;
+            int ok = client_run_with_channels(child_ctx, &child_kp, "127.0.0.1", port,
+                                              payment_client_cb, cb_data, NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "lsp");
+    lsp_init(lsp, ctx, &kps[0], port, 4);
+    char path[] = "/tmp/ss_pcs_XXXXXX";
+    int tfd = mkstemp(path);
+    persist_t db;
+    memset(&db, 0, sizeof(db));
+    int ok = lsp_accept_clients(lsp) &&
+             lsp_run_factory_creation(lsp, funding_txid, 0, funding_amount, fund_spk, 34, 10,
+                                      4, 0);
+    ok = ok && tfd >= 0 && (close(tfd), 1) && persist_open(&db, path);
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    ok = ok && lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 4) &&
+         lsp_channels_exchange_basepoints(&ch_mgr, lsp) && lsp_channels_send_ready(&ch_mgr, lsp);
+    for (size_t c = 0; ok && c < ch_mgr.n_channels; c++)
+        ok = persist_save_channel(&db, &ch_mgr.entries[c].channel, 0, (uint32_t)c);
+    if (ok) ch_mgr.persist = &db;
+    /* The payment: ADD from client 0, then FULFILL from client 1, each
+       through the LSP's handlers (commitment signatures and revocations on
+       both channels). */
+    int steps[2][2] = { { 0, MSG_UPDATE_ADD_HTLC }, { 1, MSG_UPDATE_FULFILL_HTLC } };
+    for (int s = 0; ok && s < 2; s++) {
+        wire_msg_t msg;
+        memset(&msg, 0, sizeof(msg));
+        ok = wire_recv(lsp->client_fds[steps[s][0]], &msg) && msg.msg_type == steps[s][1] &&
+             lsp_channels_handle_msg(&ch_mgr, lsp, (size_t)steps[s][0], &msg);
+        if (msg.json) cJSON_Delete(msg.json);
+    }
+    int paid = ok &&
+               ch_mgr.entries[1].channel.commitment_number > 0;
+    uint64_t pc = 0;
+    int pending0 = ok && persist_load_pending_cs(&db, ch_mgr.entries[0].channel_id, &pc);
+    int pending1 = ok && persist_load_pending_cs(&db, ch_mgr.entries[1].channel_id, &pc);
+    /* Admission: upgraded clients with their own identity keys. */
+    size_t admitted = 0;
+    unsigned char set[4] = {0};
+    if (ok) {
+        for (size_t c = 0; c < 4; c++) {
+            unsigned char ik[32];
+            memset(ik, (int)(0x61 + c), 32);
+            (void)secp256k1_ec_pubkey_create(ctx, &lsp->client_identity_pubkeys[c], ik);
+            lsp->client_rotation_v[c] = 2;
+        }
+        admitted = lsp_rotation_partial_set(&ch_mgr, lsp, set);
+    }
+    printf("    paid=%d pending: ch0=%d ch1=%d; admitted %zu (ch0=%d ch1=%d)\n", paid, pending0,
+           pending1, admitted, set[0], set[1]);
+    ch_mgr.persist = NULL;
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    for (int c = 0; c < 4; c++) {
+        int status;
+        kill(child_pids[c], SIGKILL);
+        waitpid(child_pids[c], &status, 0);
+    }
+    if (db.db) persist_close(&db);
+    unlink(path);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(ok && paid, "the payment went through the LSP's handlers");
+    TEST_ASSERT(!pending0 && !pending1, "nothing pending once every signature was answered");
+    TEST_ASSERT(set[0] && set[1], "both clients of the payment can still take part in a rotation");
+    return 1;
+}
+
 int test_regtest_intra_factory_payment(void) {
     /* Initialize regtest */
     regtest_t rt;

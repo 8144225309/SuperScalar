@@ -566,6 +566,8 @@ static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             msg->msg_type == MSG_LSPS_REQUEST ||
             msg->msg_type == MSG_QUEUE_POLL ||
             msg->msg_type == MSG_QUEUE_DONE ||
+            msg->msg_type == MSG_ROTATION_SETTLE_REQ ||
+            msg->msg_type == MSG_ROTATION_SETTLE_ACK ||
             msg->msg_type == MSG_PONG) {
             lsp_channels_handle_msg(mgr, lsp, client_idx, msg);
             if (msg->json) { cJSON_Delete(msg->json); msg->json = NULL; }
@@ -866,6 +868,18 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t amount_sats = amount_msat / 1000;
     if (amount_sats == 0) return 0;
 
+    /* A mover that has not released its old factory key still holds an
+       unrevoked old commitment: nothing leaves through its replacement
+       channel until it has settled and released. */
+    if (lsp_rotation_part_holds_outbound(mgr, lsp, sender_idx)) {
+        fprintf(stderr, "LSP: client %zu has not released its old factory key -- its HTLC "
+                "is refused until it does\n", sender_idx);
+        cJSON *fail = wire_build_update_fail_htlc(htlc_id, "old factory key not released");
+        wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
+        cJSON_Delete(fail);
+        return 1;   /* a payment failure, not a protocol error */
+    }
+
     channel_t *sender_ch = &mgr->entries[sender_idx].channel;
 
     /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
@@ -963,6 +977,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 return 0;
             }
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
+            /* The signature is answered: nothing is pending on this channel. */
+            if (mgr->persist)
+                persist_save_pending_cs((persist_t *)mgr->persist,
+                                        mgr->entries[sender_idx].channel_id, 0);
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
                 old_sender_local, old_sender_remote,
@@ -1241,6 +1259,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 return 0;
             }
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
+            /* The signature is answered: nothing is pending on this channel. */
+            if (mgr->persist)
+                persist_save_pending_cs((persist_t *)mgr->persist, dest_chan_id, 0);
             uint32_t wt_chan_id = dest_is_jit ?
                 (uint32_t)(mgr->n_channels + dest_idx) : (uint32_t)dest_idx;
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
@@ -5036,7 +5057,10 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = ch->commitment_number - 1;
-            channel_receive_revocation(ch, old_cn, rev_secret);
+            /* Answered with a valid revocation: nothing is pending any more. */
+            if (channel_receive_revocation(ch, old_cn, rev_secret) && mgr->persist)
+                persist_save_pending_cs((persist_t *)mgr->persist,
+                                        mgr->entries[client_idx].channel_id, 0);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -6036,23 +6060,30 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         pcs_raa.msg_type == MSG_REVOKE_AND_ACK) {
                         uint32_t pcs_ack_id;
                         unsigned char pcs_rev[32], pcs_np[33];
+                        int revoked = 0;
                         if (wire_parse_revoke_and_ack(pcs_raa.json, &pcs_ack_id,
                                                         pcs_rev, pcs_np)) {
                             uint64_t old_pcn = ch->commitment_number - 1;
-                            channel_receive_revocation(ch, old_pcn, pcs_rev);
+                            revoked = channel_receive_revocation(ch, old_pcn, pcs_rev);
                         }
+                        secure_zero(pcs_rev, sizeof(pcs_rev));
                         cJSON_Delete(pcs_raa.json);
-                        persist_save_pending_cs(pcs_db,
-                            mgr->entries[c].channel_id, 0); /* clear */
+                        /* Cleared only with the revocation of the commitment
+                           before it; otherwise it stays pending (sent again at
+                           the next reconnect). */
+                        if (revoked)
+                            persist_save_pending_cs(pcs_db, mgr->entries[c].channel_id, 0);
+                        else
+                            fprintf(stderr, "LSP reconnect: no valid revocation after the CS "
+                                    "retransmit (client %zu) -- still pending\n", c);
                     } else {
                         if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
+                        /* No revocation of the commitment before it: the
+                           signature stays pending (sent again at the next
+                           reconnect), and the channel is left out of a
+                           rotation until it is answered. */
                         fprintf(stderr, "LSP reconnect: RAA timeout after CS retransmit "
-                                "(client %zu) — clearing stale pending_cs\n", c);
-                        /* Clear pending_cs to prevent infinite retransmit on
-                           every future reconnect.  The client already processed
-                           the CS on the first attempt. */
-                        persist_save_pending_cs(pcs_db,
-                            mgr->entries[c].channel_id, 0);
+                                "(client %zu) -- still pending\n", c);
                     }
                 }
                 cJSON_Delete(pcs_cs);
@@ -6572,6 +6603,39 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 /* Factory rotation moved to lsp_rotation.c */
+
+size_t lsp_cli_feed(lsp_cli_buf_t *b, const char *buf, size_t n, char **lines_out) {
+    *lines_out = NULL;
+    if (!b || !buf || n == 0) return 0;
+    char *out = malloc(n + sizeof(b->line) + 1);
+    if (!out) return 0;
+    size_t used = 0, nl = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\n' || c == '\r') {
+            if (b->len > 0 && !b->discard) {
+                memcpy(out + used, b->line, b->len);
+                used += b->len;
+                out[used++] = '\0';
+                nl++;
+            }
+            b->len = 0;
+            b->discard = 0;
+        } else if (b->discard) {
+            continue;                 /* the rest of an over-long line */
+        } else if (b->len < sizeof(b->line) - 1) {
+            b->line[b->len++] = c;
+        } else {
+            /* Over-long: dropped up to its newline, even one in a later
+               read, rather than run a truncated command or its tail. */
+            b->len = 0;
+            b->discard = 1;
+        }
+    }
+    if (nl == 0) { free(out); return 0; }
+    *lines_out = out;
+    return nl;
+}
 
 int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
                                   const char *line,
@@ -7972,21 +8036,25 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                Was 256, which silently truncated long invoices and caused
                the tail of the BOLT11 to be re-read as a bogus next
                command ('CLI: unknown command'). */
-            char line[2048];
+            char buf[2048];
             /* Use read() instead of fgets() — fgets permanently marks
                stdio EOF on FIFOs even when new writers connect later. */
-            ssize_t nr = read(STDIN_FILENO, line, sizeof(line) - 1);
+            ssize_t nr = read(STDIN_FILENO, buf, sizeof(buf) - 1);
             if (nr <= 0) {
                 /* EOF or error — disable CLI to prevent spin loop */
                 mgr->cli_enabled = 0;
             } else {
-                line[nr] = '\0';
-                /* One command per line: commands written while the loop was
-                   busy arrive in one read. */
-                char *save = NULL;
-                for (char *cmd = strtok_r(line, "\r\n", &save); cmd;
-                     cmd = strtok_r(NULL, "\r\n", &save))
-                    if (cmd[0]) lsp_channels_handle_cli_line(mgr, lsp, cmd, shutdown_flag);
+                /* A persistent line buffer: run only complete lines and carry
+                   the remainder (a command split over two reads, or a backlog
+                   longer than one read) to the next read. */
+                static lsp_cli_buf_t cli_buf;
+                char *lines = NULL;
+                size_t nl = lsp_cli_feed(&cli_buf, buf, (size_t)nr, &lines);
+                for (size_t k = 0, off = 0; k < nl && lines; k++) {
+                    lsp_channels_handle_cli_line(mgr, lsp, lines + off, shutdown_flag);
+                    off += strlen(lines + off) + 1;
+                }
+                free(lines);
             }
         }
 
@@ -7996,8 +8064,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN) &&
-            mgr->bridge_fd >= 0 &&
-            (pfds[bridge_slot].fd == mgr->bridge_fd || fd_readable_now(mgr->bridge_fd))) {
+            mgr->bridge_fd >= 0 && fd_readable_now(mgr->bridge_fd)) {
             wire_msg_t msg;
             if (!wire_recv(mgr->bridge_fd, &msg)) {
                 fprintf(stderr, "LSP daemon: bridge disconnected\n");
@@ -8014,14 +8081,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         for (size_t c = 0; c < mgr->n_channels; c++) {
             if (client_slots[c] < 0) continue;
             if (!(pfds[client_slots[c]].revents & POLLIN)) continue;
-            /* The poll result is for the socket polled.  A reconnect handled
-               above (or any step since the poll) may have replaced this
-               client's socket, and the new one may have nothing to read: a
-               blocking read there stalls the whole loop until that client
-               sends something. */
-            if (lsp->client_fds[c] < 0 ||
-                (pfds[client_slots[c]].fd != lsp->client_fds[c] &&
-                 !fd_readable_now(lsp->client_fds[c])))
+            /* The poll result is for the socket polled, but a reconnect
+               handled above (or any step since the poll) may have closed this
+               slot's socket and a new connection may have taken the same fd
+               number back.  So read only the current socket, and only when it
+               has data right now: this never blocks the loop on an idle
+               socket. */
+            if (lsp->client_fds[c] < 0 || !fd_readable_now(lsp->client_fds[c]))
                 continue;
 
             wire_msg_t msg;

@@ -782,6 +782,8 @@ typedef struct {
     uint32_t leaf_cltv;         /* the leaf node's CLTV */
     char sweep_txid[65];        /* the LSP's sweep of that output, once sent */
     uint32_t spent_height;      /* first height that output was seen spent (0: not) */
+    unsigned char identity[33]; /* the mover's identity key (HELLO / RECONNECT) */
+    int has_identity;
 } persist_part_release_t;
 
 int persist_save_part_rotation(persist_t *p, const persist_part_rotation_t *r);
@@ -795,6 +797,26 @@ size_t persist_load_part_releases(persist_t *p, const char *old_txid,
 int persist_set_part_released(persist_t *p, const char *old_txid, uint32_t j);
 /* The settlement of mover J's old channel is done (its revocation held). */
 int persist_set_part_settled(persist_t *p, const char *old_txid, uint32_t j);
+/* The height the replacement of OLD_TXID reached the safe depth: the release
+   deadline counts from it, across restarts (the first one recorded stays).
+   load: 0 if none. */
+int persist_save_part_funded_height(persist_t *p, const char *old_txid, uint32_t height);
+uint32_t persist_load_part_funded_height(persist_t *p, const char *old_txid);
+/* A client (by identity) that missed a release deadline: left out of every
+   later partial rotation, across restarts. */
+int persist_save_part_excluded(persist_t *p, const unsigned char identity33[33],
+                               const char *old_txid);
+int persist_part_is_excluded(persist_t *p, const unsigned char identity33[33]);
+/* 1 if IDENTITY33 is a mover that has not released its old factory key in a
+   partial rotation whose old factory is not resolved yet. */
+int persist_part_unreleased_identity(persist_t *p, const unsigned char identity33[33]);
+/* Client: the height it signed the replacement of OLD_TXID at, and the first
+   height it saw that replacement's funding confirmed (0: never).  save keeps
+   the first signed height and the first confirmation. */
+int persist_client_part_watch_load(persist_t *p, const char *old_txid,
+                                   uint32_t *signed_height, uint32_t *confirmed_height);
+int persist_client_part_watch_save(persist_t *p, const char *old_txid,
+                                   uint32_t signed_height, uint32_t confirmed_height);
 /* Mover J's old-tree channel output: the sweep sent and the first height it
    was seen spent. */
 int persist_set_part_leaf_state(persist_t *p, const char *old_txid, uint32_t j,

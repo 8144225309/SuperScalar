@@ -1387,6 +1387,19 @@ int regtest_outpoint_unspent(regtest_t *rt, const char *txid_hex_display,
     return spent ? 0 : 1;
 }
 
+int regtest_outpoint_unspent_confirmed(regtest_t *rt, const char *txid_hex_display,
+                              uint32_t vout) {
+    if (!rt || !txid_hex_display) return -1;
+    char params[128];
+    snprintf(params, sizeof(params), "%s %u false",
+             txid_hex_display, (unsigned)vout);
+    char *result = regtest_exec(rt, "gettxout", params);
+    if (!result) return -1;
+    int spent = (result[0] == '\0' || strncmp(result, "null", 4) == 0);
+    free(result);
+    return spent ? 0 : 1;
+}
+
 int regtest_get_raw_tx(regtest_t *rt, const char *txid,
                          char *tx_hex_out, size_t max_len) {
     if (!rt || !txid || !tx_hex_out || max_len == 0) return 0;

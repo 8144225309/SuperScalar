@@ -55,12 +55,21 @@
 #                channel: its carried balance moved to the LSP and its latest
 #                old commitment revoked (LSP and client logs agree).
 #   DOUBLE_CLAIM after the stayer pushed the old tree, a moved client acts
-#                maliciously from its old DB (kept as .pre-rotation): client 1
-#                pushes its old tree path and its last old commitment (revoked
-#                by the settlement) in one block, client 2 pushes its old leaf
-#                only.  The LSP must win both: its penalty takes client 1's
-#                to_local, and it sweeps client 2's old channel output with
-#                the released key.
+#                maliciously: client 1 pushes its old tree path (from its old
+#                DB, kept as .pre-rotation) and, in one block, its latest
+#                commitment before the settlement, from a copy of its DB taken
+#                before the rotation (its old DB itself now holds the settled
+#                state); client 2 pushes its old leaf only.  That commitment
+#                must be the one the LSP watched (same number and txid), and
+#                the LSP must win both: its penalty takes client 1's to_local,
+#                and it sweeps client 2's old channel output with the released
+#                key.
+#   SETTLED_STATE client 3 (channel index 2) force-closes its old channel from
+#                its old DB, with the commitment the client's force-close reads
+#                (channel 0 of that DB): it is the settled one (the LSP's
+#                record has the same commitment number); it confirms, pays the
+#                client nothing and the whole channel balance to the LSP's
+#                side, and is not a breach.
 #
 # MODE=winddown takes the partial path with every client online
 # (SS_TEST_ROTATE_PARTIAL, regtest only): every client moves and releases,
@@ -173,6 +182,9 @@ sleep 2
 cli "status"; sleep 2
 grep -aE "^  Channel [0-9]+: local=" "$L" | tail -4 > "$TMP/pre_status"
 echo "=== pre-rotation balances (LSP view; remote = client) ==="; cat "$TMP/pre_status"
+# A copy of client 1's DB as it is before the rotation: what a client that
+# kept a backup holds (DOUBLE_CLAIM broadcasts its latest commitment from it).
+sqlite3 "$TMP/c1.db" ".backup '$TMP/c1.db.backup'" 2>/dev/null
 
 if [ "$MODE" = partial ]; then
   # Client 4 goes offline before DYING: the rotation can only be partial.
@@ -508,14 +520,18 @@ if [ "$MODE" != full ] && [ "$COMPLETE" -ge 1 ]; then
 fi
 
 # --- DOUBLE_CLAIM: a moved client claims its old position again ---
-# push_path <old db> <cidx> <with_commitment 0|1> <tag>: from the client's old
-# DB, broadcast its old tree path down to its channel output (mining for the
-# relative timelocks); the leaf goes in one block together with the client's
-# last old commitment when asked.  Prints "leaf_txid:vout commitment_txid".
+# push_path <old db> <cidx> <with_commitment 0|1> <tag> [<commitment db>
+# [<commitment channel>]]: from the client's old DB, broadcast its old tree path
+# down to its channel output (mining for the relative timelocks); the leaf goes
+# in one block together with the client's latest commitment in <commitment db>
+# (default: the old DB; from <commitment channel> if given, else channel 0 or
+# <cidx>) when asked.  Prints "leaf_txid:vout commitment_txid".
 push_path() {
-  python3 - "$1" "$2" > "$TMP/path_$4.txt" <<'PY'
+  python3 - "$1" "$2" "${5:-$1}" "${6:-}" > "$TMP/path_$4.txt" <<'PY'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1]); cidx = int(sys.argv[2])
+cdb = sqlite3.connect(sys.argv[3])
+only = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] != "" else None
 ch = db.execute("SELECT funding_txid, funding_vout FROM channels WHERE factory_id = 0 AND slot = ? ORDER BY id LIMIT 1", (cidx,)).fetchone()
 nodes = {r[0]: r for r in db.execute("SELECT node_index, parent_index, txid, signed_tx_hex FROM tree_nodes WHERE factory_id = 0")}
 leaf = [r for r in nodes.values() if r[2] == ch[0]][0]
@@ -523,7 +539,10 @@ path = []; n = leaf
 while n is not None:
     path.append(n); p = n[1]
     n = nodes.get(p) if p is not None and p >= 0 else None
-cm = db.execute("SELECT signed_tx_hex FROM signed_commitments WHERE channel_id IN (0, ?) ORDER BY commitment_number DESC LIMIT 1", (cidx,)).fetchone()
+if only is None:
+    cm = cdb.execute("SELECT signed_tx_hex FROM signed_commitments WHERE channel_id IN (0, ?) ORDER BY commitment_number DESC LIMIT 1", (cidx,)).fetchone()
+else:
+    cm = cdb.execute("SELECT signed_tx_hex FROM signed_commitments WHERE channel_id = ?", (only,)).fetchone()
 print("%s %d %s" % (ch[0], ch[1], cm[0] if cm else ""))
 for r in reversed(path): print(r[2], r[3])
 PY
@@ -555,11 +574,20 @@ PY
   fi
   echo "$leaf_txid:$leaf_vout ${ctxid:-none}"
 }
+# cn_of <db> <cidx>: the number of the latest signed commitment in a client DB.
+cn_of() { sqlite3 "$1" "SELECT commitment_number FROM signed_commitments WHERE channel_id IN (0, $2) ORDER BY commitment_number DESC LIMIT 1;" 2>/dev/null; }
 if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ] && \
-   [ -f "$TMP/c1.db.pre-rotation" ] && [ -f "$TMP/c2.db.pre-rotation" ]; then
-  read -r C1_LEAF C1_COMMIT < <(push_path "$TMP/c1.db.pre-rotation" 0 1 c1)
+   [ -f "$TMP/c1.db.pre-rotation" ] && [ -f "$TMP/c2.db.pre-rotation" ] && \
+   [ -f "$TMP/c1.db.backup" ]; then
+  C1_BK_CN=$(cn_of "$TMP/c1.db.backup" 0)
+  C1_OLD_CN=$(cn_of "$TMP/c1.db.pre-rotation" 0)
+  # What the LSP revoked and watched for client 1 (slot 0) at the settlement.
+  W_LINE=$(grep -aoE "client 0 settled its old channel: .* its old commitment [0-9]+ revoked and watched \([0-9a-f]{64}\)" "$L" | head -1)
+  W_CN=$(echo "$W_LINE" | grep -oE "old commitment [0-9]+" | grep -oE "[0-9]+$")
+  W_TX=$(echo "$W_LINE" | grep -oE "[0-9a-f]{64}")
+  read -r C1_LEAF C1_COMMIT < <(push_path "$TMP/c1.db.pre-rotation" 0 1 c1 "$TMP/c1.db.backup")
   read -r C2_LEAF _ < <(push_path "$TMP/c2.db.pre-rotation" 1 0 c2)
-  echo "double claim: client 1 leaf ${C1_LEAF:-?} with its revoked commitment ${C1_COMMIT:-?}; client 2 leaf ${C2_LEAF:-?}"
+  echo "double claim: client 1 leaf ${C1_LEAF:-?} with its pre-settlement commitment ${C1_BK_CN:-?} ${C1_COMMIT:-?} (its old DB holds the settled commitment ${C1_OLD_CN:-?}); the LSP watched commitment ${W_CN:-?} ${W_TX:-?}; client 2 leaf ${C2_LEAF:-?}"
   # Let the LSP answer: the wind-down steps once per block, the watchtower
   # checks once a minute.
   dc_eval() {
@@ -573,10 +601,15 @@ if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ]
     C2_SWEEP_CONF=$($BCLI -rpcwallet="$WALLET" gettransaction "${C2_SWEEP:-x}" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
     C2_OUT=$($BCLI gettxout "${C2_LEAF%:*}" "${C2_LEAF#*:}" 2>/dev/null)
     C1_OK=0
-    # Client 1's revoked commitment confirmed: the LSP's penalty took its to_local.
-    [ "${C1_CONF:-0}" -ge 1 ] && [ -n "$PEN" ] && [ "${PEN_CONF:-0}" -ge 1 ] && [ -z "$C1_TOLOCAL" ] && C1_OK=1
+    # The commitment broadcast is the one the LSP watched (the settlement's
+    # revocation is of exactly that commitment) ...
+    C1_MATCH=0
+    [ -n "$W_TX" ] && [ "$W_TX" = "${C1_COMMIT:-x}" ] && [ "${W_CN:-x}" = "${C1_BK_CN:-y}" ] && \
+      [ "${C1_OLD_CN:-0}" = "$(( ${C1_BK_CN:-0} + 1 ))" ] && C1_MATCH=1
+    # ... and confirmed: the LSP's penalty took its to_local.
+    [ "$C1_MATCH" = 1 ] && [ "${C1_CONF:-0}" -ge 1 ] && [ -n "$PEN" ] && [ "${PEN_CONF:-0}" -ge 1 ] && [ -z "$C1_TOLOCAL" ] && C1_OK=1
     # Or it never confirmed because the LSP swept that output first.
-    [ "${C1_CONF:-0}" -lt 1 ] && [ "${C1_LEAF_SWEPT:-0}" -ge 1 ] && [ -z "$($BCLI gettxout "${C1_LEAF%:*}" "${C1_LEAF#*:}" 2>/dev/null)" ] && C1_OK=1
+    [ "$C1_MATCH" = 1 ] && [ "${C1_CONF:-0}" -lt 1 ] && [ "${C1_LEAF_SWEPT:-0}" -ge 1 ] && [ -z "$($BCLI gettxout "${C1_LEAF%:*}" "${C1_LEAF#*:}" 2>/dev/null)" ] && C1_OK=1
     C2_OK=0
     [ -n "$C2_SWEEP" ] && [ "${C2_SWEEP_CONF:-0}" -ge 1 ] && [ -z "$C2_OUT" ] && C2_OK=1
   }
@@ -585,12 +618,38 @@ if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ]
     dc_eval
     [ "$C1_OK" = 1 ] && [ "$C2_OK" = 1 ] && break
   done
-  DC_DETAIL="client 1: revoked commitment ${C1_COMMIT:0:16}.. conf=${C1_CONF:-0}, penalty ${PEN_TX:0:16}.. conf=${PEN_CONF:-0}, its to_local unspent: ${C1_TOLOCAL:+yes}${C1_TOLOCAL:-no}; client 2: old leaf ${C2_LEAF:0:16}.. swept by ${C2_SWEEP:0:16}.. conf=${C2_SWEEP_CONF:-0}, unspent: ${C2_OUT:+yes}${C2_OUT:-no}"
+  DC_DETAIL="client 1: pre-settlement commitment ${C1_BK_CN:-?} ${C1_COMMIT:0:16}.. (= LSP-watched ${W_CN:-?} ${W_TX:0:16}..: $([ "$C1_MATCH" = 1 ] && echo yes || echo no); old DB at ${C1_OLD_CN:-?}) conf=${C1_CONF:-0}, penalty ${PEN_TX:0:16}.. conf=${PEN_CONF:-0}, its to_local unspent: ${C1_TOLOCAL:+yes}${C1_TOLOCAL:-no}; client 2: old leaf ${C2_LEAF:0:16}.. swept by ${C2_SWEEP:0:16}.. conf=${C2_SWEEP_CONF:-0}, unspent: ${C2_OUT:+yes}${C2_OUT:-no}"
   if [ "$C1_OK" = 1 ] && [ "$C2_OK" = 1 ]; then
     verdict DOUBLE_CLAIM 0 "the LSP won both: $DC_DETAIL"
   else
     verdict DOUBLE_CLAIM 1 "$DC_DETAIL"
     grep -aE "BREACH|Penalty|old-tree channel output|settled its old" "$L" | tail -8 | cut -c1-170 | sed 's/^/  lsp: /'
+  fi
+fi
+
+# --- SETTLED_STATE: a moved client force-closes from its old DB: the settled
+#     state, which pays it nothing ---
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ] && \
+   [ -f "$TMP/c3.db.pre-rotation" ]; then
+  # What the client's force-close reads: channel 0 of its old DB.
+  C3_CN=$(sqlite3 "$TMP/c3.db.pre-rotation" "SELECT commitment_number FROM signed_commitments WHERE channel_id = 0;" 2>/dev/null)
+  RF=$(sqlite3 "$DB" "SELECT retired_id FROM part_rotations ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
+  read -r S_LA S_RA S_CN < <(sqlite3 -separator ' ' "$DB" "SELECT local_amount, remote_amount, commitment_number FROM channels WHERE factory_id = ${RF:-0} AND slot = 2;" 2>/dev/null)
+  read -r C3_LEAF C3_COMMIT < <(push_path "$TMP/c3.db.pre-rotation" 2 1 c3 "$TMP/c3.db.pre-rotation" 0)
+  for _ in $(seq 1 6); do $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1; sleep 2; done
+  read -r C3_CONF C3_V0 C3_REST < <($BCLI getrawtransaction "${C3_COMMIT:-x}" 1 2>/dev/null | python3 -c '
+import json, sys
+t = json.load(sys.stdin)
+v = [round(o["value"] * 1e8) for o in t["vout"]]
+print(t.get("confirmations", 0), v[0] if v else -1, sum(v[1:]))' 2>/dev/null)
+  C3_BREACH=$(cnt "BREACH DETECTED on channel [0-9]+, commitment [0-9]+ \(txid: ${C3_COMMIT:-x}\)" "$L")
+  SS_DETAIL="client 3: its old DB's commitment ${C3_CN:-?} ${C3_COMMIT:0:16}.. conf=${C3_CONF:-0}, its side ${C3_V0:-?} sats, the rest ${C3_REST:-?} sats; the LSP's record: commitment ${S_CN:-?}, LSP ${S_LA:-?} / client ${S_RA:-?}; breach alarms on it: $C3_BREACH"
+  if [ "${C3_CONF:-0}" -ge 1 ] && [ "${C3_V0:-1}" = 0 ] && [ "${S_RA:-1}" = 0 ] && \
+     [ -n "${S_LA:-}" ] && [ "${C3_REST:-x}" = "$S_LA" ] && [ "${C3_CN:-x}" = "${S_CN:-y}" ] && \
+     [ "$C3_BREACH" = 0 ]; then
+    verdict SETTLED_STATE 0 "the settled commitment pays the client nothing and the whole balance to the LSP's side: $SS_DETAIL"
+  else
+    verdict SETTLED_STATE 1 "$SS_DETAIL"
   fi
 fi
 

@@ -266,6 +266,8 @@ typedef struct {
         unsigned char released[FACTORY_MAX_SIGNERS];
         unsigned char settled[FACTORY_MAX_SIGNERS];      /* old commitment revoked */
         uint32_t old_cltv;             /* the old factory's CLTV */
+        uint32_t funded_height;        /* height the replacement reached safe depth */
+        secp256k1_pubkey ids[FACTORY_MAX_SIGNERS];       /* mover identities (deadline) */
     } part_rel;
     secp256k1_pubkey part_retired_ids[FACTORY_MAX_SIGNERS];
     size_t n_part_retired;
@@ -458,6 +460,16 @@ int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
+
+/* The CLI's line splitter: complete lines from BUF go out (in *LINES_OUT, each
+   NUL-terminated, malloc'd; returns how many), a partial line is kept for the
+   next read, and an over-long line is dropped up to its newline. */
+typedef struct {
+    char line[4096];
+    size_t len;
+    int discard;
+} lsp_cli_buf_t;
+size_t lsp_cli_feed(lsp_cli_buf_t *b, const char *buf, size_t n, char **lines_out);
 
 /* Handle a single CLI command line (extracted for testability).
    Returns 1 if command was recognized, 0 otherwise. */
@@ -875,6 +887,7 @@ typedef enum {
    reached the chain swept or spent and buried. */
 lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
                                              uint32_t n_released, int close_confs,
+                                             int close_in_mempool,
                                              int funding_spent, int dist_present,
                                              int dist_buried, uint32_t n_released_unresolved,
                                              uint32_t n_leaf_unspent, uint32_t n_leaf_pending,
@@ -933,9 +946,36 @@ int lsp_rotation_winddown_build(const secp256k1_context *ctx,
    FORCE).  Returns 1 if anything was done. */
 int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force);
 
+/* 1 while client C of the live factory is a mover of a partial rotation that
+   has not released its old factory key (it still holds an unrevoked old
+   commitment): an HTLC it offers is refused until it settles and releases;
+   HTLCs to it are not affected. */
+int lsp_rotation_part_holds_outbound(const lsp_channel_mgr_t *mgr, const lsp_t *lsp, size_t c);
+
+/* 1 if ID is a mover that has not released its old factory key in a partial
+   rotation still open (in memory or in the DB): it is held, and it does not
+   move on in a later rotation. */
+int lsp_rotation_part_unreleased_mover(const lsp_channel_mgr_t *mgr,
+                                       const secp256k1_pubkey *id);
+
+/* The exposure to mover C of the live factory if it never releases: the
+   larger of its old channel's value and its output in the factory's
+   distribution TX (its amount plus its share of the surplus). */
+uint64_t lsp_rotation_part_exposure(const lsp_channel_mgr_t *mgr, const lsp_t *lsp, size_t c);
+/* The exposure already open: every unreleased mover of every partial
+   rotation not yet resolved (carried amount or distribution-TX output,
+   whichever is larger). */
+uint64_t lsp_rotation_part_open_exposure(const lsp_channel_mgr_t *mgr);
+
 /* 1 if PK is the identity of a client that stayed in a factory retired by a
    partial rotation. */
 int lsp_rotation_part_is_retired(const lsp_channel_mgr_t *mgr, const secp256k1_pubkey *pk);
+
+/* The bound on exposure from movers that sign but never release (operator
+   guide): a per-mover cap, a total cap over unreleased movers, and a release
+   deadline in blocks after safe depth (0 disables a cap). */
+void lsp_rotation_set_exposure_caps(uint64_t client_cap, uint64_t total_cap,
+                                    uint32_t deadline_blocks);
 
 /* Where a retired factory's rows are kept (see persist_retire_channel_rows). */
 #define LSP_RETIRED_FACTORY_ID(dying_id) (0x10000u + ((dying_id) & 0xffffu))
