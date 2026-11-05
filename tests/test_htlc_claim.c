@@ -33,6 +33,32 @@
  *   test_htlc_claim_withheld_raa_second_htlc  sender keeps N: A and B claimed
  *   test_htlc_claim_garbled_raa_fails_channel  invalid revocation fails it
  *   test_htlc_claim_unrevoked_after_add   add without an answer: N watched
+ *   test_htlc_claim_add_sender_watched    handle_add_htlc, sender leg
+ *   test_htlc_claim_add_dest_watched      handle_add_htlc, destination leg
+ *   test_htlc_claim_bridge_add_watched    bridge add, no rollback over a CS
+ *   test_htlc_claim_payee_fulfil_watched  payee leg: watched, not fatal
+ *   test_htlc_claim_settlement_garbled_raa  profit settlement update
+ *   test_htlc_claim_rollback_behind_signed  no second commitment at a number
+ *   test_htlc_claim_no_second_commitment  sign / resend rules, on disk
+ *   test_htlc_claim_failed_reconnect_told failed channel: client told
+ *   test_htlc_claim_slow_sender_recovers  late revocation restores it
+ *   test_htlc_claim_reconnect_behind_rolled_back  back to the unrevoked one
+ *   test_htlc_claim_replay_watched        HTLC replay on reconnect
+ *   test_htlc_claim_behind_sender_recovers  one behind: rolled back, recovers
+ *   test_htlc_claim_spoofed_reconnect_restored  impostor one behind: undone
+ *   test_htlc_claim_spoofed_reconnect_keeps_channel  impostor: nothing failed
+ *   test_htlc_claim_failed_reconnect_other_cn_told  failed: only its cn resumes
+ *   test_htlc_claim_late_revocation_keeps_claims  no snapshot: claims kept
+ *   test_htlc_claim_secure_watches_commitment  securing watches the rest
+ *   test_htlc_claim_pong_before_raa_keeps_sender  PONG before the revocation
+ *   test_htlc_claim_strays_before_raa  strays in every revocation wait
+ *   test_htlc_claim_failed_no_lsp_revocation  none on a failed channel
+ *   test_htlc_claim_failed_mark_without_row  failed mark without a row
+ *   test_htlc_claim_unarmed_preimage_kept preimage kept when no claim arms
+ *   test_htlc_claim_failed_rotation_ready failed channel, rotation goes on
+ *   test_htlc_claim_bridge_result_during_payee_wait   pay result queued
+ *   test_htlc_claim_bridge_result_during_sender_wait  same, sender wait
+ *   test_htlc_claim_lsp_sibling_reorg     LSP claim survives a reorg
  * Regtest drills (bitcoind):
  *   test_regtest_htlc_claim_lsp_payee          sender = client
  *   test_regtest_htlc_claim_lsp_payee_restart  same, payee restarts
@@ -51,6 +77,7 @@
 #include "superscalar/tapscript.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
+#include "superscalar/readiness.h"
 #include <secp256k1_schnorrsig.h>
 #include <sqlite3.h>
 #include <stdio.h>
@@ -2072,6 +2099,8 @@ static int lspnet_init(lspnet_t *n, secp256k1_context *ctx)
 
 static void lspnet_free(lspnet_t *n)
 {
+    lsp_channels_free_deferred_bridge(n->mgr);
+    lsp_channels_drop_pending_updates(n->mgr);
     sweeper_cleanup(&n->sw);
     for (int i = 0; i < 2; i++) {
         if (n->lsp && n->lsp->client_fds && n->lsp->client_fds[i] >= 0)
@@ -2539,6 +2568,1464 @@ int test_htlc_claim_unrevoked_after_add(void)
     cJSON_Delete(ack.json);
     TEST_ASSERT(n.sw.n_entries == 0, "watch dropped");
     lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Every LSP path that replaces a client commitment                     */
+/* ------------------------------------------------------------------ */
+
+static void lsp_dump_claims(const sweeper_t *sw)
+{
+    for (size_t i = 0; i < sw->n_entries; i++)
+        printf("  entry %zu type %d channel %u cn %llu vout %u armed %d\n", i,
+               (int)sw->entries[i].type, sw->entries[i].channel_id,
+               (unsigned long long)sw->entries[i].commitment_number,
+               sw->entries[i].source_vout,
+               sw->entries[i].preimage[0] || sw->entries[i].preimage[1]);
+}
+
+/* Client 1 (the payee) offers HTLC Y (preimage pre_y) on its commitment,
+   which then becomes the one at n->pn (number 2).  The LSP has the
+   client's point for 3. */
+static int lspnet_payee_offers(lspnet_t *n, unsigned char *pre_y,
+                               uint64_t *y_id)
+{
+    unsigned char hy[32];
+    memset(pre_y, 0x71, 32);
+    sha256(pre_y, 32, hy);
+    uint64_t yc;
+    if (!channel_add_htlc(&n->mgr->entries[1].channel, HTLC_RECEIVED, 4000,
+                          hy, 1500, y_id) ||
+        !channel_add_htlc(&n->p.cli, HTLC_OFFERED, 4000, hy, 1500, &yc))
+        return 0;
+    secp256k1_pubkey pt;
+    if (!channel_get_per_commitment_point(&n->p.cli, 3, &pt)) return 0;
+    channel_set_remote_pcp(&n->mgr->entries[1].channel, 3, &pt);
+    return 1;
+}
+
+/* An add whose sender never revokes the commitment it replaces: that
+   commitment (handle_add_htlc, sender leg) is watched, so the preimage
+   of an HTLC on it, learned later, is claimed there. */
+int test_htlc_claim_add_sender_watched(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: A on sender commitment 1");
+    n.mgr->entries[1].ready = 1;
+    channel_t *sc = &n.mgr->entries[0].channel;
+    unsigned char hx[32];
+    memset(hx, 0x5D, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_OFFERED, 3000, hx, 1500, &cid),
+                "sender adds X");
+    shutdown(n.cli_fd[0], SHUT_WR);          /* and never revokes 1 */
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 1500);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 0, &add);
+    cJSON_Delete(add.json);
+    TEST_ASSERT(sc->commitment_number == 2 && !sc->revocation_failed,
+                "commitment 2 signed, unanswered, channel open");
+
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 0,
+                "no preimage to a sender with a revocation outstanding");
+    lsp_dump_claims(&n.sw);
+    mk_put(&n.m, n.s_commit_hex, 100);       /* the sender broadcasts 1 */
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "A claimed on commitment 1");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Same for the destination of a forward (handle_add_htlc, dest leg): the
+   commitment the add replaces holds an HTLC the destination offered. */
+int test_htlc_claim_add_dest_watched(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    n.mgr->entries[1].ready = 1;
+    unsigned char pre_y[32];
+    uint64_t y_id;
+    TEST_ASSERT(lspnet_payee_offers(&n, pre_y, &y_id), "client 1 offers Y");
+    unsigned char pn[32];
+    char pn_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.p, pn, pn_hex), "its commitment 2");
+
+    unsigned char hx[32];
+    memset(hx, 0x5D, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_OFFERED, 3000, hx, 1500, &cid) &&
+                client_send_raa(&n.s, n.cli_fd[0], 0, 0),
+                "client 0 adds X for client 1 and revokes");
+    shutdown(n.cli_fd[1], SHUT_WR);          /* client 1 never revokes 2 */
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 1500);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 0, &add);
+    cJSON_Delete(add.json);
+    TEST_ASSERT(n.mgr->entries[1].channel.commitment_number == 3 &&
+                !n.mgr->entries[1].channel.revocation_failed,
+                "X forwarded on commitment 3, unanswered");
+
+    TEST_ASSERT(lsp_channels_secure_preimage(n.mgr, n.lsp, 1, y_id, pre_y),
+                "Y's preimage learned");
+    mk_put(&n.m, pn_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "Y claimed on commitment 2");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Same for an inbound bridge payment (lsp_channels_handle_bridge_msg). */
+int test_htlc_claim_bridge_add_watched(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    unsigned char pre_y[32];
+    uint64_t y_id;
+    TEST_ASSERT(lspnet_payee_offers(&n, pre_y, &y_id), "client 1 offers Y");
+    unsigned char pn[32];
+    char pn_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.p, pn, pn_hex), "its commitment 2");
+    unsigned char pre_z[32], hz[32];
+    memset(pre_z, 0x72, 32);
+    sha256(pre_z, 32, hz);
+    n.mgr->invoices = calloc(4, sizeof(invoice_entry_t));
+    n.mgr->invoices_cap = 4;
+    TEST_ASSERT(lsp_channels_register_invoice(n.mgr, hz, pre_z, 1, 5000 * 1000),
+                "invoice of client 1");
+    shutdown(n.cli_fd[1], SHUT_WR);          /* client 1 never revokes 2 */
+    wire_msg_t m;
+    m.msg_type = MSG_BRIDGE_ADD_HTLC;
+    m.json = wire_build_bridge_add_htlc(hz, 5000 * 1000, 1500, 77);
+    lsp_channels_handle_bridge_msg(n.mgr, n.lsp, &m);
+    cJSON_Delete(m.json);
+    TEST_ASSERT(n.mgr->entries[1].channel.commitment_number == 3,
+                "bridge HTLC on commitment 3, unanswered");
+    int kept = 0;
+    for (size_t h = 0; h < n.mgr->entries[1].channel.n_htlcs; h++)
+        if (memcmp(n.mgr->entries[1].channel.htlcs[h].payment_hash, hz, 32) == 0)
+            kept = 1;
+    TEST_ASSERT(kept, "not rolled back over the commitment signed with it");
+
+    TEST_ASSERT(lsp_channels_secure_preimage(n.mgr, n.lsp, 1, y_id, pre_y),
+                "Y's preimage learned");
+    mk_put(&n.m, pn_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "Y claimed on commitment 2");
+    free(n.mgr->invoices);
+    free(n.mgr->htlc_origins);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A payee that fulfils and does not revoke: its channel is not failed for
+   that (the commitment it keeps pays it no more, and nothing more can be
+   signed for it), and the commitment the fulfil replaced, holding an HTLC
+   the payee offered, is watched. */
+int test_htlc_claim_payee_fulfil_watched(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    unsigned char pre_y[32];
+    uint64_t y_id;
+    TEST_ASSERT(lspnet_payee_offers(&n, pre_y, &y_id), "payee offers Y");
+    unsigned char pn[32];
+    char pn_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.p, pn, pn_hex), "payee commitment 2");
+    TEST_ASSERT(channel_fulfill_htlc(&n.p.cli, n.p.cli_htlc_id, n.p.preimage),
+                "payee fulfils A");
+    shutdown(n.cli_fd[1], SHUT_WR);          /* and never revokes 2 */
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage) &&
+                client_send_raa(&n.s, n.cli_fd[0], 0, 0), "sender revokes");
+    wire_msg_t msg;
+    msg.msg_type = MSG_UPDATE_FULFILL_HTLC;
+    msg.json = wire_build_update_fulfill_htlc(n.p.lsp_htlc_id, n.p.preimage);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    channel_t *pc = &n.mgr->entries[1].channel;
+    secp256k1_pubkey pt;
+    TEST_ASSERT(pc->commitment_number == 3 && !pc->revocation_failed,
+                "payee not failed for a missing revocation");
+    TEST_ASSERT(!channel_get_remote_pcp(pc, 4, &pt), "but no next point");
+    TEST_ASSERT(drain_count(n.cli_fd[1], MSG_LSP_REVOKE_AND_ACK) == 0,
+                "and no LSP revocation");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "the payment settled upstream");
+
+    TEST_ASSERT(lsp_channels_secure_preimage(n.mgr, n.lsp, 1, y_id, pre_y),
+                "Y's preimage learned");
+    mk_put(&n.m, pn_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "Y claimed on payee commitment 2");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Profit settlement adds an HTLC to a client's channel: like any update,
+   it watches the commitment it replaces, and a revocation that does not
+   verify fails the channel (no next point, no LSP revocation). */
+int test_htlc_claim_settlement_garbled_raa(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: A on sender commitment 1");
+    static factory_t f;
+    static participant_profile_t prof[3];
+    memset(&f, 0, sizeof(f));
+    memset(prof, 0, sizeof(prof));
+    prof[1].profit_share_bps = 5000;
+    f.n_participants = 3;
+    f.profiles = prof;
+    f.cltv_timeout = 1000;
+    n.mgr->economic_mode = ECON_PROFIT_SHARED;
+    n.mgr->accumulated_fees_sats = 2000;
+    n.mgr->entries[0].accumulated_fees_sats = 2000;
+    unsigned char dh[32];
+    memset(dh, 0x11, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_RECEIVED, 1000, dh, 500, &cid),
+                "client applies the settlement add (commitment 2)");
+    TEST_ASSERT(client_send_raa(&n.s, n.cli_fd[0], 0, 1),
+                "client answers with a revocation that does not verify");
+    shutdown(n.cli_fd[0], SHUT_WR);
+    lsp_channels_settle_via_payment(n.mgr, n.lsp, &f);
+    channel_t *sc = &n.mgr->entries[0].channel;
+    secp256k1_pubkey pt;
+    TEST_ASSERT(sc->revocation_failed, "channel failed");
+    TEST_ASSERT(!channel_get_remote_pcp(sc, 3, &pt), "no next point stored");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_LSP_REVOKE_AND_ACK) == 0 &&
+                drain_count(n.cli_fd[0], MSG_REVOKE_AND_ACK) == 0,
+                "no LSP revocation");
+
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    lsp_dump_claims(&n.sw);
+    mk_put(&n.m, n.s_commit_hex, 100);       /* sender broadcasts 1 */
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "A claimed on unrevoked commitment 1");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A state behind a commitment the LSP signed (here: rolled back after an
+   unanswered add) is never signed again at that number: an update that
+   would is refused and undone, before the preimage goes out.  The
+   commitment the client may hold there was watched when it was signed. */
+int test_htlc_claim_rollback_behind_signed(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: A on sender commitment 1");
+    n.mgr->entries[1].ready = 1;
+    channel_t *sc = &n.mgr->entries[0].channel;
+    uint64_t sv_local = sc->local_amount, sv_remote = sc->remote_amount;
+    size_t sv_n = sc->n_htlcs;
+    unsigned char hx[32];
+    memset(hx, 0x5D, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_OFFERED, 3000, hx, 600, &cid),
+                "client adds X (its commitment 2: A and X)");
+    unsigned char old2[32];
+    char old2_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.s, old2, old2_hex), "client commitment 2");
+    shutdown(n.cli_fd[0], SHUT_WR);          /* never revokes 1 */
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 600);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 0, &add);
+    cJSON_Delete(add.json);
+    TEST_ASSERT(sc->commitment_number == 2 && !sc->revocation_failed,
+                "add signed commitment 2, channel open");
+    /* Roll the channel back to commitment 1, as a rollback would. */
+    sc->local_amount = sv_local;
+    sc->remote_amount = sv_remote;
+    sc->commitment_number = 1;
+    sc->n_htlcs = sv_n;
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(!sc->revocation_failed && sc->commitment_number == 1 &&
+                sc->n_htlcs == sv_n,
+                "no second commitment 2: A's settle refused and undone, "
+                "the channel kept");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 0,
+                "preimage not revealed");
+    lsp_dump_claims(&n.sw);
+    mk_put(&n.m, old2_hex, 100);             /* client broadcasts its 2 */
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "A claimed on the commitment 2 it holds");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* lsp_channels_update_sign never signs a different commitment at a number
+   already signed (the update is undone instead, the channel kept); the
+   reconnect resend only resends the identical one. */
+int test_htlc_claim_no_second_commitment(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    en->has_signed = 1;
+    en->signed_cn = en->channel.commitment_number;
+    memset(en->signed_txid, 0xAB, 32);       /* another commitment there */
+    TEST_ASSERT(!lsp_channels_resend_commitment_signed(n.mgr, n.lsp, 0) &&
+                !en->channel.revocation_failed &&
+                drain_count(n.cli_fd[0], MSG_COMMITMENT_SIGNED) == 0,
+                "resend: nothing sent, channel kept");
+    channel_t *ec = &en->channel;
+    uint64_t cn0 = ec->commitment_number, l0 = ec->local_amount;
+    size_t nh0 = ec->n_htlcs;
+    lsp_update_t u;
+    TEST_ASSERT(lsp_channels_update_begin(n.mgr, 0, &u), "an update begins");
+    unsigned char hy[32];
+    memset(hy, 0x3C, 32);
+    uint64_t yid;
+    TEST_ASSERT(channel_add_htlc(ec, HTLC_OFFERED, 2000, hy, 500, &yid),
+                "the LSP adds Y");
+    en->signed_cn = cn0 + 1;                 /* another commitment there */
+    TEST_ASSERT(!lsp_channels_update_sign(n.mgr, n.lsp, &u) && u.undone &&
+                !ec->revocation_failed &&
+                drain_count(n.cli_fd[0], MSG_COMMITMENT_SIGNED) == 0,
+                "update: refused, the channel kept");
+    TEST_ASSERT(ec->commitment_number == cn0 && ec->n_htlcs == nh0 &&
+                ec->local_amount == l0, "and the add undone");
+    lsp_channels_update_end(&u);
+    uint64_t scn = 0;
+    unsigned char stx[32];
+    TEST_ASSERT(!persist_channel_is_failed(&n.db, 0), "nothing failed on disk");
+
+    /* The identical commitment is resent, and its record is on disk. */
+    lspnet_free(&n);
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup 2");
+    en = &n.mgr->entries[0];
+    lsp_update_t v;
+    memset(&v, 0, sizeof(v));
+    v.idx = 0;
+    v.ch = &en->channel;
+    v.chan_id = en->channel_id;
+    TEST_ASSERT(lsp_channels_update_sign(n.mgr, n.lsp, &v) &&
+                drain_count(n.cli_fd[0], MSG_COMMITMENT_SIGNED) == 1,
+                "signed once");
+    TEST_ASSERT(persist_load_remote_signed(&n.db, 0, &scn, stx) &&
+                scn == en->channel.commitment_number &&
+                memcmp(stx, en->signed_txid, 32) == 0, "recorded on disk");
+    TEST_ASSERT(lsp_channels_resend_commitment_signed(n.mgr, n.lsp, 0) &&
+                drain_count(n.cli_fd[0], MSG_COMMITMENT_SIGNED) == 1,
+                "the same commitment resent");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The client end of a reconnect: MSG_RECONNECT at cn, then (optionally)
+   the client's nonces. */
+static int lspnet_reconnect_msgs(pair_t *x, int fd, uint64_t cn, int nonces)
+{
+    secp256k1_pubkey pk;
+    secp256k1_keypair_pub(x->ctx, &pk, &x->cli_kp);
+    cJSON *r = wire_build_reconnect(x->ctx, &pk, cn);
+    int ok = wire_send(fd, MSG_RECONNECT, r);
+    cJSON_Delete(r);
+    if (!ok || !nonces) return ok;
+    static unsigned char ser[MUSIG_NONCE_POOL_MAX][66];
+    if (!channel_init_nonce_pool(&x->cli, MUSIG_NONCE_POOL_MAX)) return 0;
+    for (size_t i = 0; i < x->cli.local_nonce_pool.count; i++)
+        if (!musig_pubnonce_serialize(x->ctx, ser[i],
+                &x->cli.local_nonce_pool.nonces[i].pubnonce))
+            return 0;
+    cJSON *nm = wire_build_channel_nonces(0, ser, x->cli.local_nonce_pool.count);
+    ok = wire_send(fd, MSG_CHANNEL_NONCES, nm);
+    cJSON_Delete(nm);
+    return ok;
+}
+
+static void lspnet_client_pubkeys(lspnet_t *n)
+{
+    n->lsp->client_pubkeys = calloc(2, sizeof(secp256k1_pubkey));
+    secp256k1_keypair_pub(n->s.ctx, &n->lsp->client_pubkeys[0], &n->s.cli_kp);
+    /* the payee's client key: any other key */
+    unsigned char k[32];
+    memset(k, 0x07, 32);
+    secp256k1_ec_pubkey_create(n->s.ctx, &n->lsp->client_pubkeys[1], k);
+}
+
+/* An MSG_ERROR saying the channel failed (WIRE_ERROR_CHANNEL_FAILED). */
+static int is_channel_failed(const wire_msg_t *m)
+{
+    if (m->msg_type != MSG_ERROR || !m->json) return 0;
+    cJSON *s = cJSON_GetObjectItem(m->json, "message");
+    return s && cJSON_IsString(s) &&
+           strncmp(s->valuestring, WIRE_ERROR_CHANNEL_FAILED,
+                   strlen(WIRE_ERROR_CHANNEL_FAILED)) == 0;
+}
+
+/* The first message waiting on fd: 1 if it says the channel failed. */
+static int got_channel_failed(int fd)
+{
+    struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&pf, 1, 2000) <= 0) return 0;
+    wire_msg_t m;
+    if (!wire_recv(fd, &m)) return 0;
+    int r = is_channel_failed(&m);
+    if (m.json) cJSON_Delete(m.json);
+    return r;
+}
+
+/* A failed channel that cannot be restored: its client is told so when
+   the channel fails and on every reconnect, then disconnected. */
+int test_htlc_claim_failed_reconnect_told(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    lsp_channels_fail_channel(n.mgr, n.lsp, 0, "a test failure", 0);
+    TEST_ASSERT(got_channel_failed(n.cli_fd[0]), "told when it failed");
+    TEST_ASSERT(n.lsp->client_fds[0] < 0, "and disconnected");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 1, 1), "client reconnects");
+    TEST_ASSERT(!lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "reconnect not resumed");
+    TEST_ASSERT(got_channel_failed(sv[1]), "told again, before any nonces");
+    TEST_ASSERT(n.lsp->client_fds[0] < 0, "not reattached");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* An honest sender too slow to revoke after a fulfil: its channel fails
+   and it is told.  It reconnects with the revocation: the very commitment
+   it was waiting on is resent, the valid answer restores the channel, and
+   the LSP's own revocation follows. */
+int test_htlc_claim_slow_sender_recovers(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "sender channel row");
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    shutdown(n.cli_fd[0], SHUT_WR);          /* the sender is too slow */
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    channel_t *sc = &n.mgr->entries[0].channel;
+    TEST_ASSERT(sc->revocation_failed && n.mgr->entries[0].fail_recoverable,
+                "failed, recoverably");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "it had the preimage");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 1, "A claimable on 1");
+
+    /* It applied the fulfil (commitment 2) and reconnects with it. */
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage),
+                "sender applies A");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 2, 1) &&
+                client_send_raa(&n.s, sv[1], 0, 0),
+                "reconnect at 2, nonces, revocation of 1");
+    TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "reconnect resumed");
+    TEST_ASSERT(!sc->revocation_failed && !persist_channel_is_failed(&n.db, 0),
+                "channel restored, also on disk");
+    unsigned char secret[32];
+    TEST_ASSERT(channel_get_received_revocation(sc, 1, secret), "1 revoked");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 0,
+                "claim on 1 retired by the revocation");
+    int n_cs = 0, n_rev = 0, n_ack = 0;
+    for (;;) {
+        struct pollfd pf = { .fd = sv[1], .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 0) <= 0) break;
+        wire_msg_t m;
+        if (!wire_recv(sv[1], &m)) break;
+        n_cs += m.msg_type == MSG_COMMITMENT_SIGNED;
+        n_rev += m.msg_type == MSG_LSP_REVOKE_AND_ACK;
+        n_ack += m.msg_type == MSG_RECONNECT_ACK;
+        if (m.json) cJSON_Delete(m.json);
+    }
+    TEST_ASSERT(n_cs == 1 && n_rev == 1 && n_ack == 1,
+                "commitment resent, LSP revocation, reconnect ack");
+
+    /* Without the revocation it stays failed, and says why. */
+    lsp_channels_fail_channel(n.mgr, n.lsp, 0, "again", 1);
+    TEST_ASSERT(got_channel_failed(sv[1]), "told when it failed again");
+    close(sv[1]);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 2, 1), "reconnect, mute");
+    shutdown(sv[1], SHUT_WR);
+    TEST_ASSERT(!lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]) &&
+                sc->revocation_failed, "stays failed");
+    int told = 0;
+    for (;;) {
+        struct pollfd pf = { .fd = sv[1], .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 0) <= 0) break;
+        wire_msg_t m;
+        if (!wire_recv(sv[1], &m)) break;
+        if (is_channel_failed(&m)) told = 1;
+        if (m.json) cJSON_Delete(m.json);
+    }
+    TEST_ASSERT(told, "told why");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A client reconnecting one behind a commitment the LSP signed, whose
+   previous commitment it never revoked: the channel goes back to the
+   commitment the client holds, nothing is failed, and the signed one stays
+   the only one that can be signed next.  A fulfil that would sign a
+   different commitment 2 is refused before the preimage goes out, and the
+   commitment 2 the client may hold is claimed against. */
+int test_htlc_claim_reconnect_behind_rolled_back(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: A on sender commitment 1");
+    lspnet_client_pubkeys(&n);
+    n.mgr->entries[1].ready = 1;
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "sender channel row (commitment 1)");
+    channel_t *sc = &n.mgr->entries[0].channel;
+    unsigned char hx[32];
+    memset(hx, 0x5D, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_OFFERED, 3000, hx, 600, &cid),
+                "client adds X (its commitment 2)");
+    unsigned char old2[32];
+    char old2_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.s, old2, old2_hex), "client commitment 2");
+    shutdown(n.cli_fd[0], SHUT_WR);
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 600);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 0, &add);
+    cJSON_Delete(add.json);
+    TEST_ASSERT(sc->commitment_number == 2, "LSP signed commitment 2");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 1, 1), "reconnect at 1");
+    shutdown(sv[1], SHUT_WR);
+    TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "resumed at 1");
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    TEST_ASSERT(!sc->revocation_failed && sc->commitment_number == 1 &&
+                en->signed_cn == 2 && en->rolled_back != NULL,
+                "rolled back to 1, commitment 2 kept aside, channel open");
+    TEST_ASSERT(!persist_channel_is_failed(&n.db, 0), "nothing on disk");
+
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(sc->commitment_number == 1 && !sc->revocation_failed,
+                "no other commitment 2 signed");
+    TEST_ASSERT(drain_count(sv[1], MSG_UPDATE_FULFILL_HTLC) == 0,
+                "preimage not revealed");
+    close(sv[1]);
+    mk_put(&n.m, old2_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "A claimed on the commitment 2 it holds");
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The HTLC replay on reconnect is an update like any other: the sender's
+   commitment it replaces is watched, and a missing revocation stops the
+   replay (no next point). */
+int test_htlc_claim_replay_watched(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: A on client 0's commitment 1");
+    lspnet_client_pubkeys(&n);
+    /* Z, from client 1 to client 0, waits for client 0. */
+    unsigned char pre_z[32], hz[32];
+    memset(pre_z, 0x73, 32);
+    sha256(pre_z, 32, hz);
+    uint64_t zid;
+    n.mgr->invoices = calloc(4, sizeof(invoice_entry_t));
+    n.mgr->invoices_cap = 4;
+    TEST_ASSERT(lsp_channels_register_invoice(n.mgr, hz, pre_z, 0, 2000 * 1000) &&
+                channel_add_htlc(&n.mgr->entries[1].channel, HTLC_RECEIVED,
+                                 2000, hz, 1500, &zid), "Z queued for client 0");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 1, 1), "client 0 reconnects");
+    shutdown(sv[1], SHUT_WR);                /* and never revokes 1 */
+    n.lsp->factory.n_nodes = 1;              /* a live factory: replay */
+    TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "reconnected");
+    n.lsp->factory.n_nodes = 0;
+    channel_t *sc = &n.mgr->entries[0].channel;
+    TEST_ASSERT(sc->commitment_number == 2 && !sc->revocation_failed,
+                "Z replayed on commitment 2, unanswered");
+
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    lsp_dump_claims(&n.sw);
+    mk_put(&n.m, n.s_commit_hex, 100);       /* client 0 broadcasts 1 */
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "A claimed on commitment 1");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    free(n.mgr->invoices);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Messages waiting on fd, by type (all are read). */
+typedef struct { int cs, ful, ack, lsp_rev, failed; } lspnet_seen_t;
+
+static lspnet_seen_t lspnet_seen(int fd)
+{
+    lspnet_seen_t s = { 0, 0, 0, 0, 0 };
+    for (;;) {
+        struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        wire_msg_t m;
+        if (!wire_recv(fd, &m)) break;
+        s.cs += m.msg_type == MSG_COMMITMENT_SIGNED;
+        s.ful += m.msg_type == MSG_UPDATE_FULFILL_HTLC;
+        s.ack += m.msg_type == MSG_RECONNECT_ACK;
+        s.lsp_rev += m.msg_type == MSG_LSP_REVOKE_AND_ACK;
+        s.failed += is_channel_failed(&m);
+        if (m.json) cJSON_Delete(m.json);
+    }
+    return s;
+}
+
+/* The sender of lspnet_init is too slow to revoke after the back-fulfil
+   of A: its channel fails, recoverably, at a signed commitment 2. */
+static int lspnet_sender_fails_slow(lspnet_t *n)
+{
+    wire_msg_t msg;
+    if (!persist_save_channel(&n->db, &n->mgr->entries[0].channel, 0, 0) ||
+        !payee_fulfils(n, &msg))
+        return 0;
+    shutdown(n->cli_fd[0], SHUT_WR);
+    lsp_channels_handle_msg(n->mgr, n->lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    const lsp_channel_entry_t *en = &n->mgr->entries[0];
+    return en->channel.revocation_failed && en->fail_recoverable &&
+           en->channel.commitment_number == 2 && en->signed_cn == 2;
+}
+
+/* An honest sender crashed after the LSP's back-fulfil of A, before it
+   stored or revoked anything: its channel failed for want of the
+   revocation.  It comes back one behind, at commitment 1, which it never
+   revoked.  The LSP rolls back to 1 and settles A again: the very
+   commitment 2 it signed is signed again, the sender revokes 1, and the
+   channel is restored, also on disk. */
+int test_htlc_claim_behind_sender_recovers(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    TEST_ASSERT(lspnet_sender_fails_slow(&n),
+                "sender failed recoverably at signed commitment 2");
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    channel_t *sc = &en->channel;
+    unsigned char signed2[32];
+    memcpy(signed2, en->signed_txid, 32);
+    TEST_ASSERT(persist_channel_is_failed(&n.db, 0), "failure on disk");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 1, 1),
+                "it reconnects at 1, with nonces");
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage) &&
+                client_send_raa(&n.s, sv[1], 0, 0),
+                "and revokes 1 once A is settled again");
+    TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "reconnect resumed");
+    TEST_ASSERT(!sc->revocation_failed && !persist_channel_is_failed(&n.db, 0),
+                "channel restored, also on disk");
+    TEST_ASSERT(sc->commitment_number == 2 && en->signed_cn == 2 &&
+                memcmp(en->signed_txid, signed2, 32) == 0 && !en->rolled_back,
+                "the same commitment 2 signed again");
+    unsigned char secret[32];
+    TEST_ASSERT(channel_get_received_revocation(sc, 1, secret), "1 revoked");
+    lspnet_seen_t s = lspnet_seen(sv[1]);
+    TEST_ASSERT(s.ack == 1 && s.ful == 1 && s.cs == 1 && s.lsp_rev == 1 &&
+                s.failed == 0,
+                "ack, A's fulfil, commitment 2, LSP revocation; no close");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* While an honest sender's revocation is outstanding (it holds commitment
+   2, not yet revoked 1), someone who knows only its public key reconnects
+   "one behind" and goes silent.  The LSP rolls back to 1 in memory, but
+   fails nothing and writes nothing; when the sender reconnects with
+   commitment 2, that commitment is restored and resent, and the sender's
+   revocation of 1 is taken as usual. */
+int test_htlc_claim_spoofed_reconnect_restored(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    n.mgr->entries[1].ready = 1;
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "sender channel row");
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    channel_t *sc = &en->channel;
+    unsigned char hx[32];
+    memset(hx, 0x5E, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_OFFERED, 3000, hx, 600, &cid),
+                "sender adds X (its commitment 2)");
+    shutdown(n.cli_fd[0], SHUT_WR);          /* its answer is late */
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 600);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 0, &add);
+    cJSON_Delete(add.json);
+    TEST_ASSERT(sc->commitment_number == 2 && !sc->revocation_failed &&
+                en->pending_revoke, "commitment 2 signed, revocation of 1 due");
+    unsigned char signed2[32];
+    memcpy(signed2, en->signed_txid, 32);
+
+    int a[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, a[1], 1, 0),
+                "an impostor reconnects at 1");
+    shutdown(a[1], SHUT_WR);
+    lsp_channels_handle_reconnect(n.mgr, n.lsp, a[0]);
+    close(a[1]);
+    uint64_t scn = 0;
+    unsigned char stx[32];
+    TEST_ASSERT(!sc->revocation_failed && !persist_channel_is_failed(&n.db, 0),
+                "nothing failed, in memory or on disk");
+    TEST_ASSERT(persist_load_remote_signed(&n.db, 0, &scn, stx) && scn == 2 &&
+                memcmp(stx, signed2, 32) == 0, "signed record unchanged");
+    TEST_ASSERT(lspnet_seen(n.cli_fd[0]).failed == 0,
+                "the sender is not told to close");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 2, 1) &&
+                client_send_raa(&n.s, sv[1], 0, 0),
+                "the sender reconnects at 2 and revokes 1");
+    TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "reconnect resumed");
+    TEST_ASSERT(sc->commitment_number == 2 && !sc->revocation_failed &&
+                !en->rolled_back && memcmp(en->signed_txid, signed2, 32) == 0,
+                "commitment 2 restored");
+    unsigned char secret[32];
+    TEST_ASSERT(channel_get_received_revocation(sc, 1, secret), "1 revoked");
+    lspnet_seen_t s = lspnet_seen(sv[1]);
+    TEST_ASSERT(s.cs == 1 && s.ack == 1 && s.failed == 0,
+                "commitment 2 resent, reconnect ack, no close");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* One honest update on the sender channel: the payee fulfils, the sender
+   revokes.  Afterwards the LSP has signed sender commitment 2. */
+static int lspnet_honest_round(lspnet_t *n)
+{
+    wire_msg_t msg;
+    if (!payee_fulfils(n, &msg)) return 0;
+    if (!channel_fulfill_htlc(&n->s.cli, n->s.cli_htlc_id, n->s.preimage) ||
+        !client_send_raa(&n->s, n->cli_fd[0], 0, 0))
+        return 0;
+    lsp_channels_handle_msg(n->mgr, n->lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    drain_count(n->cli_fd[0], MSG_UPDATE_FULFILL_HTLC);
+    return 1;
+}
+
+/* MSG_RECONNECT carries only a public key and a commitment number.  A
+   third party that knows an honest, connected client's public key cannot
+   get that client's channel failed (or the client told to close it) by
+   reconnecting behind it. */
+int test_htlc_claim_spoofed_reconnect_keeps_channel(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "sender channel row");
+    TEST_ASSERT(lspnet_honest_round(&n), "honest update");
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    TEST_ASSERT(en->channel.commitment_number == 2 && en->has_signed &&
+                en->signed_cn == 2 && !en->channel.revocation_failed,
+                "sender at signed commitment 2, open");
+    int fd0 = n.lsp->client_fds[0];
+
+    for (uint64_t cn = 0; cn < 2; cn++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], cn, 0), "reconnect msg");
+        TEST_ASSERT(!lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                    "refused");
+        close(sv[1]);
+    }
+    TEST_ASSERT(!en->channel.revocation_failed &&
+                !persist_channel_is_failed(&n.db, 0) &&
+                en->channel.commitment_number == 2,
+                "honest channel not failed, not rolled back");
+    TEST_ASSERT(n.lsp->client_fds[0] == fd0, "its connection kept");
+    TEST_ASSERT(!got_channel_failed(n.cli_fd[0]),
+                "honest client not told to close its channel");
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A recoverably failed channel resumes only at the commitment it failed
+   at (or one behind it, rolled back): a reconnect at any other number is
+   told the channel failed and changes nothing. */
+int test_htlc_claim_failed_reconnect_other_cn_told(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    TEST_ASSERT(lspnet_sender_fails_slow(&n), "sender failed at 2");
+    channel_t *sc = &n.mgr->entries[0].channel;
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage),
+                "sender applies A");
+    const uint64_t other[2] = { 3, 0 };
+    for (int k = 0; k < 2; k++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], other[k], 1) &&
+                    client_send_raa(&n.s, sv[1], 0, 0), "reconnect elsewhere");
+        TEST_ASSERT(!lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                    "not resumed");
+        TEST_ASSERT(got_channel_failed(sv[1]), "told the channel failed");
+        TEST_ASSERT(sc->revocation_failed && sc->commitment_number == 2 &&
+                    n.lsp->client_fds[0] < 0, "still failed, at 2, detached");
+        close(sv[1]);
+    }
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A late revocation after a restart, when what the revoked commitment held
+   is no longer known: the channel is restored, but the commitment cannot
+   go to the watchtower, so its HTLC claims stay. */
+int test_htlc_claim_late_revocation_keeps_claims(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lspnet_client_pubkeys(&n);
+    TEST_ASSERT(lspnet_sender_fails_slow(&n), "sender failed at 2");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 1, "A claimable on 1");
+    lsp_channels_drop_pending_updates(n.mgr);    /* as a restart does */
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage),
+                "sender applies A");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 2, 1) &&
+                client_send_raa(&n.s, sv[1], 0, 0),
+                "reconnect at 2, nonces, revocation of 1");
+    TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]),
+                "reconnect resumed");
+    channel_t *sc = &n.mgr->entries[0].channel;
+    unsigned char secret[32];
+    TEST_ASSERT(!sc->revocation_failed &&
+                channel_get_received_revocation(sc, 1, secret),
+                "restored, 1 revoked");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 1,
+                "the claim on 1 kept: 1 is not with the watchtower");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Securing a preimage on a channel that cannot be updated watches its
+   current commitment too: every HTLC the client offered there (B as well
+   as A) is then claimed once its preimage is learned. */
+int test_htlc_claim_secure_watches_commitment(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    unsigned char pre_b[32], hb[32];
+    TEST_ASSERT(lspnet_add_second(&n, pre_b), "A and B on sender commitment 2");
+    sha256(pre_b, 32, hb);
+    lsp_channels_fail_channel(n.mgr, n.lsp, 0, "a test failure", 0);
+    TEST_ASSERT(lsp_channels_settle_received(n.mgr, n.lsp, 0, n.s.lsp_htlc_id,
+                                             n.s.preimage), "A secured");
+    int watch_b = 0;
+    for (size_t i = 0; i < n.sw.n_entries; i++) {
+        const sweep_entry_t *e = &n.sw.entries[i];
+        int armed = 0;
+        for (size_t k = 0; k < 32; k++) armed |= e->preimage[k];
+        if (e->type == SWEEP_HTLC_SUCCESS && e->channel_id == 0 &&
+            e->commitment_number == 2 && !armed &&
+            memcmp(e->payment_hash, hb, 32) == 0)
+            watch_b = 1;
+    }
+    TEST_ASSERT(watch_b, "B watched on commitment 2");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The daemon pings every client every 30 s and clients answer PONG.  A
+   PONG that reaches the LSP just before the sender's valid revoke_and_ack
+   (sender leg of a fulfil) does not fail the channel. */
+int test_htlc_claim_pong_before_raa_keeps_sender(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    cJSON *pong = cJSON_CreateObject();
+    TEST_ASSERT(wire_send(n.cli_fd[0], MSG_PONG, pong), "sender PONG queued");
+    cJSON_Delete(pong);
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage) &&
+                client_send_raa(&n.s, n.cli_fd[0], 0, 0),
+                "then its valid revocation");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    channel_t *sc = &n.mgr->entries[0].channel;
+    unsigned char secret[32];
+    TEST_ASSERT(!sc->revocation_failed, "honest sender not failed");
+    TEST_ASSERT(channel_get_received_revocation(sc, 1, secret),
+                "its revocation taken");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A benign message a client may send at any time (kind 0 PONG, 1
+   QUEUE_POLL, 2 REGISTER_INVOICE). */
+static int send_stray(lspnet_t *n, int fd, int kind)
+{
+    static const uint8_t type[3] = { MSG_PONG, MSG_QUEUE_POLL,
+                                     MSG_REGISTER_INVOICE };
+    cJSON *j;
+    if (kind == 2) {
+        unsigned char pre[32], h[32];
+        memset(pre, 0x61 + kind, 32);
+        sha256(pre, 32, h);
+        j = wire_build_register_invoice(h, pre, 1000 * 1000, 0);
+    } else {
+        j = cJSON_CreateObject();
+    }
+    (void)n;
+    int ok = j && wire_send(fd, type[kind], j);
+    if (j) cJSON_Delete(j);
+    return ok;
+}
+
+static int lspnet_invoices(lspnet_t *n)
+{
+    n->mgr->invoices = calloc(8, sizeof(invoice_entry_t));
+    n->mgr->invoices_cap = 8;
+    return n->mgr->invoices != NULL;
+}
+
+/* Every wait for a client's revoke_and_ack drains the benign messages the
+   client may send meanwhile, so an honest client is never failed (or its
+   revocation lost) for a PONG, QUEUE_POLL or REGISTER_INVOICE sent just
+   before it: the sender leg of a fulfil, the commitment resent on
+   reconnect, a bridge HTLC's destination and a profit settlement. */
+int test_htlc_claim_strays_before_raa(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    unsigned char secret[32];
+    for (int kind = 0; kind < 3; kind++) {
+        lspnet_t n;
+        wire_msg_t msg;
+
+        /* Sender leg of a fulfil. */
+        TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_invoices(&n), "setup");
+        TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+        TEST_ASSERT(send_stray(&n, n.cli_fd[0], kind) &&
+                    channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id,
+                                         n.s.preimage) &&
+                    client_send_raa(&n.s, n.cli_fd[0], 0, 0),
+                    "sender: a stray, then its revocation");
+        lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+        cJSON_Delete(msg.json);
+        TEST_ASSERT(!n.mgr->entries[0].channel.revocation_failed &&
+                    channel_get_received_revocation(&n.mgr->entries[0].channel,
+                                                    1, secret),
+                    "fulfil: sender revoked 1, not failed");
+        free(n.mgr->invoices);
+        lspnet_free(&n);
+
+        /* The commitment resent on reconnect. */
+        TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_invoices(&n), "setup 2");
+        lspnet_client_pubkeys(&n);
+        TEST_ASSERT(lspnet_sender_fails_slow(&n), "sender failed at 2");
+        TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id,
+                                         n.s.preimage), "sender applies A");
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 2, 1) &&
+                    send_stray(&n, sv[1], kind) &&
+                    client_send_raa(&n.s, sv[1], 0, 0),
+                    "reconnect at 2, a stray, then the revocation");
+        TEST_ASSERT(lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]) &&
+                    !n.mgr->entries[0].channel.revocation_failed,
+                    "reconnect: channel restored");
+        close(sv[1]);
+        free(n.lsp->client_pubkeys);
+        free(n.mgr->invoices);
+        lspnet_free(&n);
+
+        /* A bridge HTLC's destination. */
+        TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_invoices(&n), "setup 3");
+        unsigned char pre_z[32], hz[32];
+        memset(pre_z, 0x72, 32);
+        sha256(pre_z, 32, hz);
+        uint64_t zid;
+        TEST_ASSERT(lsp_channels_register_invoice(n.mgr, hz, pre_z, 1,
+                                                  5000 * 1000) &&
+                    channel_add_htlc(&n.p.cli, HTLC_RECEIVED, 5000, hz, 1500,
+                                     &zid),
+                    "invoice of client 1, which applies the add");
+        TEST_ASSERT(send_stray(&n, n.cli_fd[1], kind) &&
+                    client_send_raa(&n.p, n.cli_fd[1], 1, 0),
+                    "client 1: a stray, then its revocation");
+        msg.msg_type = MSG_BRIDGE_ADD_HTLC;
+        msg.json = wire_build_bridge_add_htlc(hz, 5000 * 1000, 1500, 77);
+        lsp_channels_handle_bridge_msg(n.mgr, n.lsp, &msg);
+        cJSON_Delete(msg.json);
+        TEST_ASSERT(!n.mgr->entries[1].channel.revocation_failed &&
+                    channel_get_received_revocation(&n.mgr->entries[1].channel,
+                                                    1, secret),
+                    "bridge: client 1 revoked 1");
+        free(n.mgr->invoices);
+        free(n.mgr->htlc_origins);
+        lspnet_free(&n);
+
+        /* A profit settlement. */
+        TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_invoices(&n), "setup 4");
+        static factory_t f;
+        static participant_profile_t prof[3];
+        memset(&f, 0, sizeof(f));
+        memset(prof, 0, sizeof(prof));
+        prof[1].profit_share_bps = 5000;
+        f.n_participants = 3;
+        f.profiles = prof;
+        f.cltv_timeout = 1000;
+        n.mgr->economic_mode = ECON_PROFIT_SHARED;
+        n.mgr->accumulated_fees_sats = 2000;
+        n.mgr->entries[0].accumulated_fees_sats = 2000;
+        unsigned char dh[32];
+        memset(dh, 0x11, 32);
+        uint64_t cid;
+        TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_RECEIVED, 1000, dh, 500,
+                                     &cid) &&
+                    send_stray(&n, n.cli_fd[0], kind) &&
+                    client_send_raa(&n.s, n.cli_fd[0], 0, 0),
+                    "client: the settlement add, a stray, its revocation");
+        shutdown(n.cli_fd[0], SHUT_WR);
+        lsp_channels_settle_via_payment(n.mgr, n.lsp, &f);
+        TEST_ASSERT(!n.mgr->entries[0].channel.revocation_failed &&
+                    channel_get_received_revocation(&n.mgr->entries[0].channel,
+                                                    1, secret),
+                    "settlement: client revoked 1");
+        free(n.mgr->invoices);
+        lspnet_free(&n);
+    }
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* No LSP revocation is ever sent on a failed channel. */
+int test_htlc_claim_failed_no_lsp_revocation(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    lsp_send_revocation(n.mgr, n.lsp, 0, 0);
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_LSP_REVOKE_AND_ACK) == 1,
+                "sent on an open channel");
+    lsp_channels_fail_channel(n.mgr, NULL, 0, "a test failure", 0);
+    lsp_send_revocation(n.mgr, n.lsp, 0, 0);
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_LSP_REVOKE_AND_ACK) == 0,
+                "not on a failed one");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The failed mark needs no channels row, keeps whether it can be cleared,
+   and survives reopening the database. */
+int test_htlc_claim_failed_mark_without_row(void)
+{
+    char path[] = "/tmp/ss_htlc_failmark_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0, "temp db");
+    close(fd);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+    int rec = -1;
+    TEST_ASSERT(!persist_channel_failure(&db, 7, &rec) && rec == 0, "not failed");
+    TEST_ASSERT(persist_mark_channel_failed(&db, 7, "no revocation", 1) &&
+                persist_mark_channel_failed(&db, 8, "conflict", 0),
+                "marked, no channels rows");
+    persist_close(&db);
+    TEST_ASSERT(persist_open(&db, path), "reopen");
+    TEST_ASSERT(persist_channel_failure(&db, 7, &rec) && rec == 1,
+                "7 failed, recoverable");
+    TEST_ASSERT(persist_channel_failure(&db, 8, &rec) && rec == 0,
+                "8 failed, not recoverable");
+    TEST_ASSERT(persist_clear_channel_failed(&db, 7) &&
+                !persist_channel_is_failed(&db, 7) &&
+                persist_channel_is_failed(&db, 8), "7 cleared");
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* When no claim can be armed (here: inside a transaction), the preimage
+   is kept on disk, the channel fails, and the retry arms the claim. */
+int test_htlc_claim_unarmed_preimage_kept(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    TEST_ASSERT(persist_begin(&n.db), "open a transaction");
+    TEST_ASSERT(!lsp_channels_settle_received(n.mgr, n.lsp, 0, n.s.lsp_htlc_id,
+                                              n.s.preimage),
+                "not settled: no claim could be armed");
+    TEST_ASSERT(persist_commit(&n.db), "commit");
+    TEST_ASSERT(n.mgr->entries[0].channel.revocation_failed &&
+                !n.mgr->entries[0].fail_recoverable, "channel failed");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 0,
+                "preimage not revealed");
+    uint32_t ch[4];
+    uint64_t id[4];
+    unsigned char pre[4][32];
+    TEST_ASSERT(persist_load_pending_preimages(&n.db, ch, id, pre, 4) == 1 &&
+                ch[0] == 0 && id[0] == n.s.lsp_htlc_id &&
+                memcmp(pre[0], n.s.preimage, 32) == 0, "preimage on disk");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 0, "no claim yet");
+    lsp_channels_retry_pending_preimages(n.mgr);
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) == 1, "claim armed on retry");
+    TEST_ASSERT(persist_load_pending_preimages(&n.db, ch, id, pre, 4) == 0,
+                "and the stored preimage dropped");
+    mk_put(&n.m, n.s_commit_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "claimed");
+    lspnet_free(&n);
+
+    /* A bridge pay result whose claim cannot be armed keeps its origin. */
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup 2");
+    htlc_origin_t origin;
+    memset(&origin, 0, sizeof(origin));
+    memcpy(origin.payment_hash, n.s.hash, 32);
+    origin.request_id = 5;
+    origin.sender_idx = 0;
+    origin.sender_htlc_id = n.s.lsp_htlc_id;
+    origin.active = 1;
+    n.mgr->htlc_origins = &origin;
+    n.mgr->n_htlc_origins = 1;
+    wire_msg_t pr;
+    pr.msg_type = MSG_BRIDGE_PAY_RESULT;
+    pr.json = wire_build_bridge_pay_result(5, 1, n.s.preimage);
+    TEST_ASSERT(persist_begin(&n.db), "open a transaction 2");
+    lsp_channels_handle_bridge_msg(n.mgr, n.lsp, &pr);
+    TEST_ASSERT(persist_commit(&n.db), "commit 2");
+    cJSON_Delete(pr.json);
+    TEST_ASSERT(origin.active, "origin kept: the HTLC is not claimable yet");
+    lsp_channels_retry_pending_preimages(n.mgr);
+    TEST_ASSERT(!origin.active && sweeper_pending_claims(&n.sw) == 1,
+                "retired once the retry armed the claim");
+    n.mgr->htlc_origins = NULL;
+    n.mgr->n_htlc_origins = 0;
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A failed channel does not hold back rotation of the others. */
+int test_htlc_claim_failed_rotation_ready(void)
+{
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    lsp_channel_entry_t en[3];
+    memset(en, 0, sizeof(en));
+    mgr.entries = en;
+    mgr.n_channels = 3;
+    readiness_tracker_t rt;
+    readiness_init(&rt, 0, 3, NULL);
+    mgr.readiness = &rt;
+    readiness_set_connected(&rt, 0, 1);
+    readiness_set_ready(&rt, 0, 1);
+    readiness_set_connected(&rt, 1, 1);
+    readiness_set_ready(&rt, 1, 1);
+    TEST_ASSERT(!lsp_rotation_clients_ready(&mgr), "client 2 not ready");
+    en[2].channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+    TEST_ASSERT(lsp_rotation_clients_ready(&mgr),
+                "client 2's channel failed: it stays, the others rotate");
+    en[0].channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+    en[1].channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+    TEST_ASSERT(!lsp_rotation_clients_ready(&mgr), "nobody left to rotate");
+    return 1;
+}
+
+/* ---- The bridge during a client update ---- */
+
+/* A bridge pay result read while the payee leg of a fulfil waits for its
+   revocation is not handled inside that update: its claim is armed at
+   once, and the result is handled afterwards.  The sender never revokes:
+   B, paid out through the bridge, must be claimable on whichever of its
+   commitments the sender broadcasts. */
+int test_htlc_claim_bridge_result_during_payee_wait(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    unsigned char pre_b[32];
+    TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_add_second(&n, pre_b),
+                "sender: A (intra-factory) and B (paid out via bridge)");
+    htlc_origin_t *origin = calloc(1, sizeof(*origin));
+    TEST_ASSERT(origin != NULL, "origin");
+    sha256(pre_b, 32, origin->payment_hash);
+    origin->request_id = 9;
+    origin->sender_idx = 0;
+    origin->sender_htlc_id = n.s.lsp_htlc_id + 1;
+    origin->active = 1;
+    n.mgr->htlc_origins = origin;
+    n.mgr->n_htlc_origins = 1;
+    int bsv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, bsv) == 0, "bridge pair");
+    n.mgr->bridge_fd = bsv[0];
+    cJSON *pr = wire_build_bridge_pay_result(9, 1, pre_b);
+    TEST_ASSERT(wire_send(bsv[1], MSG_BRIDGE_PAY_RESULT, pr), "pay result queued");
+    cJSON_Delete(pr);
+    shutdown(n.cli_fd[0], SHUT_WR);          /* sender never revokes */
+
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(origin->active && n.mgr->n_deferred_bridge == 1,
+                "pay result queued, origin kept");
+    lsp_dump_claims(&n.sw);
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage),
+                "sender applies A");
+    unsigned char c3[32];
+    char c3_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.s, c3, c3_hex), "commitment 3 (B only)");
+    mk_put(&n.m, c3_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "B claimed on commitment 3");
+
+    lsp_channels_drain_deferred_bridge(n.mgr, n.lsp);
+    TEST_ASSERT(!origin->active && n.mgr->n_deferred_bridge == 0,
+                "handled afterwards: origin retired once B is claimable");
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "only A's preimage went to the failed sender");
+    n.mgr->bridge_fd = -1;
+    close(bsv[0]);
+    close(bsv[1]);
+    lspnet_free(&n);
+    free(origin);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+#include <pthread.h>
+static int g_bridge_wfd;
+static unsigned char g_bridge_pre[32];
+static void *late_pay_result(void *arg)
+{
+    (void)arg;
+    sleep(2);       /* after the payee leg: inside the sender's wait */
+    cJSON *pr = wire_build_bridge_pay_result(9, 1, g_bridge_pre);
+    wire_send(g_bridge_wfd, MSG_BRIDGE_PAY_RESULT, pr);
+    cJSON_Delete(pr);
+    return NULL;
+}
+
+/* Same, but the pay result arrives while the fulfil waits for the
+   sender's own revocation (which never comes). */
+int test_htlc_claim_bridge_result_during_sender_wait(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    unsigned char pre_b[32];
+    TEST_ASSERT(lspnet_init(&n, ctx) && lspnet_add_second(&n, pre_b),
+                "sender: A (intra-factory) and B (paid out via bridge)");
+    htlc_origin_t *origin = calloc(1, sizeof(*origin));
+    TEST_ASSERT(origin != NULL, "origin");
+    sha256(pre_b, 32, origin->payment_hash);
+    origin->request_id = 9;
+    origin->sender_idx = 0;
+    origin->sender_htlc_id = n.s.lsp_htlc_id + 1;
+    origin->active = 1;
+    n.mgr->htlc_origins = origin;
+    n.mgr->n_htlc_origins = 1;
+    int bsv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, bsv) == 0, "bridge pair");
+    n.mgr->bridge_fd = bsv[0];
+    g_bridge_wfd = bsv[1];
+    memcpy(g_bridge_pre, pre_b, 32);
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, late_pay_result, NULL) == 0, "thread");
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils A");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);   /* ~30 s: sender mute */
+    cJSON_Delete(msg.json);
+    pthread_join(th, NULL);
+    TEST_ASSERT(origin->active && n.mgr->n_deferred_bridge == 1,
+                "pay result queued, origin kept");
+    lsp_dump_claims(&n.sw);
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage),
+                "sender applies A");
+    unsigned char c3[32];
+    char c3_hex[65];
+    TEST_ASSERT(pair_cli_commit(&n.s, c3, c3_hex), "commitment 3 (B only)");
+    mk_put(&n.m, c3_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "B claimed on commitment 3");
+    lsp_channels_drain_deferred_bridge(n.mgr, n.lsp);
+    TEST_ASSERT(!origin->active, "origin retired once B is claimable");
+    n.mgr->bridge_fd = -1;
+    close(bsv[0]);
+    close(bsv[1]);
+    lspnet_free(&n);
+    free(origin);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* An LSP claim on commitment 1, superseded by commitment 2 confirming,
+   survives a one-block reorg that mines 1 instead. */
+int test_htlc_claim_lsp_sibling_reorg(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    pair_t p;
+    TEST_ASSERT(pair_init(&p, ctx, UNIT_FUND_TXID, 0, 100000, 10), "init");
+    TEST_ASSERT(pair_add_htlc(&p, 1, 7000, 600), "A on 1");
+    unsigned char c1[32];
+    char c1_hex[65];
+    TEST_ASSERT(pair_cli_commit(&p, c1, c1_hex), "commitment 1");
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr != NULL, "mgr");
+    mgr->entries = calloc(1, sizeof(lsp_channel_entry_t));
+    TEST_ASSERT(mgr->entries != NULL, "entries");
+    mgr->n_channels = 1;
+    mgr->entries[0].channel = p.lsp;
+    channel_t *lch = &mgr->entries[0].channel;
+    mock_chain_t m;
+    mock_init(&m, 100);
+    sweeper_t sw;
+    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &m.base, NULL, NULL), "sw");
+    lsp_channels_attach_sweeper(mgr, &sw);
+    TEST_ASSERT(lsp_channels_watch_commitment(mgr, 0), "watch 1");
+    unsigned char hb[32];
+    memset(hb, 0x4B, 32);
+    uint64_t i1, i2;
+    TEST_ASSERT(channel_add_htlc(lch, HTLC_RECEIVED, 5000, hb, 600, &i1) &&
+                channel_add_htlc(&p.cli, HTLC_OFFERED, 5000, hb, 600, &i2),
+                "B: 2");
+    TEST_ASSERT(pair_send_pcp(&p, 2), "pcp 2");
+    {
+        secp256k1_pubkey pt;
+        channel_get_per_commitment_point(&p.cli, 2, &pt);
+        channel_set_remote_pcp(lch, 2, &pt);
+    }
+    unsigned char c2[32];
+    char c2_hex[65];
+    TEST_ASSERT(pair_cli_commit(&p, c2, c2_hex), "commitment 2");
+    TEST_ASSERT(lsp_channels_register_htlc_claim(mgr, 0, p.lsp_htlc_id,
+                p.preimage) == 1, "A armed on 2 and on 1");
+    mk_put(&m, c2_hex, 100);                 /* 2 mined (1 conf) */
+    sweeper_check(&sw);
+    sweeper_check(&sw);
+    mk_forget(&m, c2_hex);                   /* one-block reorg: 1 instead */
+    m.n_spent = 0;
+    mk_put(&m, c1_hex, 100);
+    sweeper_check(&sw);
+    sweeper_check(&sw);
+    int covers1 = 0;
+    for (size_t i = 0; i < sw.n_entries; i++)
+        if (memcmp(sw.entries[i].source_txid, c1, 32) == 0) covers1 = 1;
+    TEST_ASSERT(covers1, "claim on 1 still there after the reorg");
+    sweeper_cleanup(&sw);
+    free(mgr->entries);
+    free(mgr);
+    pair_cleanup(&p);
     secp256k1_context_destroy(ctx);
     return 1;
 }

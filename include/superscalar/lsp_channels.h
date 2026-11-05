@@ -45,6 +45,24 @@ typedef struct {
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
     size_t close_spk_len;       /* 34 when populated, 0 if unset */
     uint64_t accumulated_fees_sats; /* routing fees earned on THIS channel */
+    /* The highest commitment of the client's channel the LSP has signed
+       (lsp_channels_update_sign): never another one at that number. */
+    int has_signed;
+    uint64_t signed_cn;
+    unsigned char signed_txid[32];
+    /* The channel failed only for want of a valid revocation of the
+       commitment before the current one: a valid one restores it. */
+    int fail_recoverable;
+    /* What the commitment an update replaced held, while its revocation is
+       outstanding (lsp_update_t*, owned). */
+    void *pending_revoke;
+    /* The commitment signed at signed_cn, while a reconnect has rolled the
+       channel back to the one before it (lsp_update_t*, owned): restored
+       if the client comes back holding it. */
+    void *rolled_back;
+    /* A recoverable failure resumed in memory on reconnect: the disk still
+       records it until the client's next valid revocation. */
+    int fail_on_disk;
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
@@ -203,6 +221,12 @@ typedef struct {
         int valid;
     } pending_reconnects[8];
     size_t n_pending_reconnects;
+
+    /* Bridge messages read while a client update was waiting, handled by
+       the daemon loop afterwards (wire_msg_t*, owned). */
+    void *deferred_bridge;
+    size_t n_deferred_bridge;
+    size_t deferred_bridge_cap;
 
     /* P2TR scriptPubKey for the LSP's cooperative-close output.
        Symmetric with per-entry close_spk (each client's own P2TR). Derived

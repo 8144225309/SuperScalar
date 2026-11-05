@@ -1589,6 +1589,14 @@ int test_lsp_recovery_round_trip(void) {
         dead_htlc.cltv_expiry = 800;
         TEST_ASSERT(persist_save_htlc(&db, 0, &dead_htlc), "save dead htlc");
     }
+    /* Channel 2 failed (restorable by a late revocation); the last
+       commitment signed for channel 1's client. */
+    unsigned char signed_txid[32];
+    memset(signed_txid, 0x5C, 32);
+    TEST_ASSERT(persist_mark_channel_failed(&db, 2, "no revocation", 1),
+                "mark channel 2 failed");
+    TEST_ASSERT(persist_save_remote_signed(&db, 1, 3, signed_txid),
+                "record channel 1's signed commitment");
     TEST_ASSERT(persist_commit(&db), "commit");
 
     /* Now recover: load factory from DB, init channels from DB */
@@ -1605,6 +1613,17 @@ int test_lsp_recovery_round_trip(void) {
                                             seckeys[0], 4, &db),
                 "init from db");
     TEST_ASSERT_EQ(rec_mgr.n_channels, 4, "n_channels");
+    TEST_ASSERT(rec_mgr.entries[2].channel.revocation_failed &&
+                rec_mgr.entries[2].fail_recoverable,
+                "channel 2 reloaded failed, restorable");
+    TEST_ASSERT(!rec_mgr.entries[0].channel.revocation_failed &&
+                !rec_mgr.entries[1].channel.revocation_failed,
+                "the others reloaded open");
+    TEST_ASSERT(rec_mgr.entries[1].has_signed &&
+                rec_mgr.entries[1].signed_cn == 3 &&
+                memcmp(rec_mgr.entries[1].signed_txid, signed_txid, 32) == 0 &&
+                !rec_mgr.entries[0].has_signed,
+                "signed commitment record reloaded");
 
     /* Verify ALL 4 channels recovered correctly */
     for (size_t c = 0; c < 4; c++) {

@@ -225,11 +225,27 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
         /* A channel failed before the restart stays failed. */
-        if (persist_channel_is_failed(pdb, (uint32_t)c)) {
-            entry->channel.revocation_failed = CHANNEL_FAILED_DURABLE;
-            fprintf(stderr, "LSP recovery: channel %zu is failed (no valid "
-                    "revocation from its client); it must be closed on chain\n",
-                    c);
+        {
+            int recoverable = 0;
+            if (persist_channel_failure(pdb, (uint32_t)c, &recoverable)) {
+                entry->channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+                entry->fail_recoverable = recoverable;
+                fprintf(stderr, "LSP recovery: channel %zu is failed (no "
+                        "valid revocation from its client); it must be "
+                        "closed on chain%s\n", c, recoverable
+                        ? " unless the client revokes on reconnect" : "");
+            }
+        }
+        /* The commitment last signed for the client: never another one at
+           that number. */
+        {
+            uint64_t scn;
+            unsigned char stxid[32];
+            if (persist_load_remote_signed(pdb, (uint32_t)c, &scn, stxid)) {
+                entry->has_signed = 1;
+                entry->signed_cn = scn;
+                memcpy(entry->signed_txid, stxid, 32);
+            }
         }
 
         /* Load active HTLCs from DB */

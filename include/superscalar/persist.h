@@ -19,7 +19,9 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations.
-   45 adds the pending_sweeps columns of on-chain HTLC-success claims.
+   45 adds the pending_sweeps columns of on-chain HTLC-success claims, and
+   the tables failed_channels, remote_commitment_signed and
+   htlc_preimages_pending (created with the schema, at any version).
    Versions 40-44 are used by changes on other branches; the v45 step adds
    each column whenever it is missing, so it runs correctly in any merge
    order, and the merged version is the highest bump. */
@@ -337,13 +339,45 @@ int persist_update_channel_balance(persist_t *p, uint32_t channel_id,
 int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
                                             int funding_pending_reorg);
 
-/* Mark a channel failed (channels.state = 'failed', see
-   channel_t.revocation_failed), so a restart reloads it failed.  Returns 1
-   if the row was updated. */
-int persist_mark_channel_failed(persist_t *p, uint32_t channel_id);
+/* Mark a channel failed (see channel_t.revocation_failed), so a restart
+   reloads it failed: a failed_channels row, which needs no channels row,
+   and channels.state = 'failed' where that row exists.  recoverable: the
+   failure is only a missing or invalid revocation, which a later valid one
+   clears.  Returns 1 if the mark is stored. */
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id,
+                                const char *reason, int recoverable);
 
-/* 1 if the channel row is marked failed. */
+/* Remove the failed mark (a valid revocation arrived after all). */
+int persist_clear_channel_failed(persist_t *p, uint32_t channel_id);
+
+/* 1 if the channel is marked failed; *recoverable_out (may be NULL) is
+   set from the mark (0 for a bare channels.state = 'failed'). */
 int persist_channel_is_failed(persist_t *p, uint32_t channel_id);
+int persist_channel_failure(persist_t *p, uint32_t channel_id,
+                            int *recoverable_out);
+
+/* The highest commitment of the client's channel the LSP has signed
+   (number and txid, internal byte order), so that it never signs a
+   different commitment at that number, also after a restart. */
+int persist_save_remote_signed(persist_t *p, uint32_t channel_id,
+                               uint64_t commitment_number,
+                               const unsigned char *txid32);
+int persist_load_remote_signed(persist_t *p, uint32_t channel_id,
+                               uint64_t *commitment_number,
+                               unsigned char *txid32);
+
+/* Preimages of HTLCs a client offered us that we could not yet arm an
+   on-chain claim for (sealed at rest): kept until a claim is armed or the
+   HTLC is settled.  Load returns the number of rows (at most max). */
+int persist_save_pending_preimage(persist_t *p, uint32_t channel_id,
+                                  uint64_t htlc_id,
+                                  const unsigned char *preimage32);
+int persist_delete_pending_preimage(persist_t *p, uint32_t channel_id,
+                                    uint64_t htlc_id);
+size_t persist_load_pending_preimages(persist_t *p, uint32_t *channel_ids,
+                                      uint64_t *htlc_ids,
+                                      unsigned char (*preimages)[32],
+                                      size_t max);
 
 /* Return all channel ids currently stored, in ascending order. */
 /* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for

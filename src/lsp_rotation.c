@@ -274,6 +274,14 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     size_t turnover_ok = 0, turnover_fail = 0;
     for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+        /* A failed channel is closed on chain: its client does not move to
+           the new factory, it stays like a client that is offline. */
+        if (ci < mgr->n_channels && mgr->entries[ci].channel.revocation_failed) {
+            printf("LSP rotate: client %zu channel failed, it stays in the "
+                   "old factory\n", ci);
+            turnover_fail++;
+            continue;
+        }
         if (lsp->client_fds[ci] < 0) {
             printf("LSP rotate: client %zu offline, skipping turnover\n", ci);
             turnover_fail++;
@@ -1128,6 +1136,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         saved_ch_remote[c] = mgr->entries[c].channel.remote_amount;
     }
 
+    /* The old channels' outstanding updates go with them. */
+    lsp_channels_drop_pending_updates(mgr);
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: channel reinit failed\n");
@@ -1294,13 +1304,24 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return 1;
 }
 
+int lsp_rotation_clients_ready(const lsp_channel_mgr_t *mgr) {
+    if (!mgr || !mgr->readiness) return 0;
+    const readiness_tracker_t *rt = (const readiness_tracker_t *)mgr->readiness;
+    size_t n_live = 0, n_ready = 0;
+    for (size_t i = 0; i < rt->n_clients; i++) {
+        if (i < mgr->n_channels && mgr->entries[i].channel.revocation_failed)
+            continue;
+        n_live++;
+        if (rt->clients[i].is_ready) n_ready++;
+    }
+    return n_live > 0 && n_ready == n_live;
+}
+
 int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr->readiness)
+    if (!lsp_rotation_clients_ready(mgr))
         return 0;
 
     readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
-    if (!readiness_all_ready(rt))
-        return 0;
 
     printf("LSP rotate: all %zu clients ready — firing async rotation ceremony\n",
            rt->n_clients);
