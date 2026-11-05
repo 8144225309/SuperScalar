@@ -808,8 +808,13 @@ int persist_save_part_excluded(persist_t *p, const unsigned char identity33[33],
                                const char *old_txid);
 int persist_part_is_excluded(persist_t *p, const unsigned char identity33[33]);
 /* 1 if IDENTITY33 is a mover that has not released its old factory key in a
-   partial rotation whose old factory is not resolved yet. */
-int persist_part_unreleased_identity(persist_t *p, const unsigned char identity33[33]);
+   partial rotation whose old factory is not resolved yet: not done, and its
+   old funding not seen spent at least DEPTH blocks before TIP. */
+int persist_part_unreleased_identity(persist_t *p, const unsigned char identity33[33],
+                                     uint32_t tip, uint32_t depth);
+/* The first height the old funding of OLD_TXID was seen spent (confirmed);
+   0 forgets it (the spend was reorged out). */
+int persist_set_part_resolved(persist_t *p, const char *old_txid, uint32_t spent_height);
 /* Client: the height it signed the replacement of OLD_TXID at, and the first
    height it saw that replacement's funding confirmed (0: never).  save keeps
    the first signed height and the first confirmation. */

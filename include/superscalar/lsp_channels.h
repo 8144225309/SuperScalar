@@ -461,6 +461,14 @@ int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
 
+/* After a revocation answered a commitment signature (ANSWERED) or not:
+   the channel's new balance and commitment number, and the pending mark of
+   that signature cleared, in one transaction, so the mark is never gone
+   while the recorded number is the old one.  Joins an open transaction.
+   Returns 1 if all of it was written. */
+int lsp_channels_persist_answered(persist_t *db, uint32_t channel_id, uint32_t slot,
+                                  const channel_t *ch, int answered);
+
 /* The CLI's line splitter: complete lines from BUF go out (in *LINES_OUT, each
    NUL-terminated, malloc'd; returns how many), a partial line is kept for the
    next read, and an over-long line is dropped up to its newline. */

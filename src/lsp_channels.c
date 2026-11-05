@@ -855,6 +855,22 @@ int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
 /* --- HTLC handling --- */
 
 /* Handle ADD_HTLC from a client: add to sender's channel, forward to recipient. */
+int lsp_channels_persist_answered(persist_t *db, uint32_t channel_id, uint32_t slot,
+                                  const channel_t *ch, int answered) {
+    if (!db || !ch) return 0;
+    int own = !persist_in_transaction(db);
+    if (own && !persist_begin(db)) return 0;
+    int ok = persist_update_channel_balance(db, slot, ch->local_amount, ch->remote_amount,
+                                            ch->commitment_number);
+    /* Only with that number recorded: never cleared while the record is old. */
+    if (ok && answered) ok = persist_save_pending_cs(db, channel_id, 0);
+    if (own) {
+        if (ok) ok = persist_commit(db);
+        else persist_rollback(db);
+    }
+    return ok;
+}
+
 static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                              size_t sender_idx, const cJSON *json) {
     uint64_t htlc_id, amount_msat;
@@ -948,6 +964,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     int sender_batch = 0;
+    int sender_answered = 0;
 
     /* Wait for REVOKE_AND_ACK from sender */
     {
@@ -977,10 +994,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 return 0;
             }
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
-            /* The signature is answered: nothing is pending on this channel. */
-            if (mgr->persist)
-                persist_save_pending_cs((persist_t *)mgr->persist,
-                                        mgr->entries[sender_idx].channel_id, 0);
+            /* The signature is answered: its pending mark goes with the new
+               balance and number (below). */
+            sender_answered = 1;
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
                 old_sender_local, old_sender_remote,
@@ -1029,10 +1045,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         int own_txn = !persist_in_transaction(db);
         if (own_txn) persist_begin(db);
 
-        persist_update_channel_balance(db,
-            (uint32_t)sender_idx,
-            sender_ch->local_amount, sender_ch->remote_amount,
-            sender_ch->commitment_number);
+        (void)lsp_channels_persist_answered(db, mgr->entries[sender_idx].channel_id,
+                                            (uint32_t)sender_idx, sender_ch, sender_answered);
 
         htlc_t sender_persist;
         memset(&sender_persist, 0, sizeof(sender_persist));
@@ -1233,6 +1247,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     int dest_batch = 0;
+    int dest_answered = 0;
 
     /* Wait for REVOKE_AND_ACK from dest */
     {
@@ -1259,9 +1274,9 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 return 0;
             }
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
-            /* The signature is answered: nothing is pending on this channel. */
-            if (mgr->persist)
-                persist_save_pending_cs((persist_t *)mgr->persist, dest_chan_id, 0);
+            /* The signature is answered: its pending mark goes with the new
+               balance and number (below). */
+            dest_answered = 1;
             uint32_t wt_chan_id = dest_is_jit ?
                 (uint32_t)(mgr->n_channels + dest_idx) : (uint32_t)dest_idx;
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
@@ -1320,10 +1335,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         persist_t *db = (persist_t *)mgr->persist;
         int own_txn = !persist_in_transaction(db);
         if (own_txn) persist_begin(db);
-        persist_update_channel_balance(db,
-            (uint32_t)dest_idx,
-            dest_ch->local_amount, dest_ch->remote_amount,
-            dest_ch->commitment_number);
+        (void)lsp_channels_persist_answered(db, dest_chan_id, (uint32_t)dest_idx, dest_ch,
+                                            dest_answered);
         if (own_txn) persist_commit(db);
     }
     /* Commit dest batch (PCS/PCP + balance in one fsync) */
@@ -4992,6 +5005,7 @@ int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Handle FULFILL_HTLC from a client (the payee reveals the preimage). */
 static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                  size_t client_idx, const cJSON *json) {
+    int fulfill_answered = 0;
     uint64_t htlc_id;
     unsigned char preimage[32];
 
@@ -5057,10 +5071,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = ch->commitment_number - 1;
-            /* Answered with a valid revocation: nothing is pending any more. */
-            if (channel_receive_revocation(ch, old_cn, rev_secret) && mgr->persist)
-                persist_save_pending_cs((persist_t *)mgr->persist,
-                                        mgr->entries[client_idx].channel_id, 0);
+            /* Answered with a valid revocation: its pending mark goes with
+               the new balance and number (below). */
+            fulfill_answered = channel_receive_revocation(ch, old_cn, rev_secret);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -5116,10 +5129,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             fulfill_txn_started = 1;
         }
 
-        persist_update_channel_balance(db,
-            (uint32_t)client_idx,
-            ch->local_amount, ch->remote_amount,
-            ch->commitment_number);
+        (void)lsp_channels_persist_answered(db, mgr->entries[client_idx].channel_id,
+                                            (uint32_t)client_idx, ch, fulfill_answered);
         persist_deactivate_invoice(db, payment_hash);
         persist_delete_htlc(db, (uint32_t)client_idx, htlc_id);
         /* Transaction stays open — committed after sender persist below */

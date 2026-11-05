@@ -2754,16 +2754,22 @@ static int pk_set(const secp256k1_pubkey *p) {
 int lsp_rotation_part_unreleased_mover(const lsp_channel_mgr_t *mgr,
                                        const secp256k1_pubkey *id) {
     if (!mgr || !id || !pk_set(id)) return 0;
-    if (mgr->part_rel.valid)
-        for (size_t j = 0; j < mgr->part_rel.m; j++)
-            if (!mgr->part_rel.released[j] && pk_set(&mgr->part_rel.ids[j]) &&
-                cin_pk_eq(mgr->ctx, &mgr->part_rel.ids[j], id))
-                return 1;
+    if (!mgr->persist) {
+        if (mgr->part_rel.valid)
+            for (size_t j = 0; j < mgr->part_rel.m; j++)
+                if (!mgr->part_rel.released[j] && pk_set(&mgr->part_rel.ids[j]) &&
+                    cin_pk_eq(mgr->ctx, &mgr->part_rel.ids[j], id))
+                    return 1;
+        return 0;
+    }
+    /* From the DB: until it releases, or its old factory is resolved (the
+       old funding spent and buried, as of the last wind-down step). */
     unsigned char id33[33];
     size_t l = 33;
-    return mgr->persist &&
-           secp256k1_ec_pubkey_serialize(mgr->ctx, id33, &l, id, SECP256K1_EC_COMPRESSED) &&
-           persist_part_unreleased_identity((persist_t *)mgr->persist, id33);
+    return secp256k1_ec_pubkey_serialize(mgr->ctx, id33, &l, id, SECP256K1_EC_COMPRESSED) &&
+           persist_part_unreleased_identity((persist_t *)mgr->persist, id33,
+                                            mgr->part_wd_height,
+                                            LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest));
 }
 
 int lsp_rotation_cin_check_keys(const secp256k1_context *ctx,
@@ -3640,10 +3646,13 @@ uint64_t lsp_rotation_part_open_exposure(const lsp_channel_mgr_t *mgr) {
     persist_t *db = mgr ? (persist_t *)mgr->persist : NULL;
     if (!db) return 0;
     uint64_t total = 0;
-    enum { MAXR = 16 };
+    enum { MAXR = LADDER_MAX_FACTORIES };
     persist_part_rotation_t *rows = calloc(MAXR, sizeof(*rows));
     persist_part_release_t *rel = calloc(FACTORY_MAX_SIGNERS, sizeof(*rel));
     size_t n = rows && rel ? persist_load_part_rotations(db, rows, MAXR, 1) : 0;
+    if (n == MAXR)
+        fprintf(stderr, "LSP rotate: %d open partial rotations counted for the exposure "
+                "total; more may be open\n", (int)MAXR);
     for (size_t i = 0; i < n; i++) {
         unsigned char *dist = NULL;
         size_t dl = 0;
@@ -4059,7 +4068,8 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
 int lsp_rotation_part_holds_outbound(const lsp_channel_mgr_t *mgr, const lsp_t *lsp,
                                      size_t c) {
     if (!mgr || !lsp) return 0;
-    if (mgr->part_rel.valid && c < mgr->part_rel.m && !mgr->part_rel.released[c] &&
+    if (!mgr->persist && mgr->part_rel.valid && c < mgr->part_rel.m &&
+        !mgr->part_rel.released[c] &&
         memcmp(lsp->factory.funding_txid, mgr->part_rel.new_txid, 32) == 0)
         return 1;
     /* By identity: an unreleased mover stays held after a later rotation and
@@ -5564,6 +5574,13 @@ int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force) {
         for (size_t k = 0; k < nr; k++) released += rel[k].released ? 1 : 0;
         int confs = r->close_txid[0] ? rot_tx_confirmations(mgr, r->close_txid) : -1;
         int funding_spent = rot_outpoint_unspent(mgr, r->old_txid, r->old_vout) == 0;
+        {
+            /* When the old factory resolves: the first height its funding is
+               seen spent by a confirmed transaction (forgotten on a reorg). */
+            int cu = rot_outpoint_unspent_confirmed(mgr, r->old_txid, r->old_vout);
+            if (cu == 0 && h > 0) (void)persist_set_part_resolved(db, r->old_txid, (uint32_t)h);
+            else if (cu == 1) (void)persist_set_part_resolved(db, r->old_txid, 0);
+        }
         /* The old factory's distribution TX and its released-key payout outputs. */
         char dist_disp[65] = {0};
         int dist_present = 0, dist_buried = 0;

@@ -2002,6 +2002,20 @@ int test_part_hold_outbound(void) {
         lsp->client_fds[0] = sa[0];
         TEST_ASSERT(!(lsp_rotation_partial_set(mgr, lsp, set) && set[0]),
                     "a partial rotation leaves it in place");
+        /* Its old factory resolved (the old funding spent, the spend buried):
+           nothing more can be had from it, so it is free, whatever the
+           row's state. */
+        TEST_ASSERT(persist_set_part_resolved(&db, otx, 100), "the old funding spent at 100");
+        mgr->part_wd_height = 100 + LSP_WD_CLOSE_DEPTH(0) - 1;
+        TEST_ASSERT(lsp_rotation_part_holds_outbound(mgr, lsp, 0), "not buried yet: still held");
+        mgr->part_wd_height = 100 + LSP_WD_CLOSE_DEPTH(0);
+        TEST_ASSERT(!lsp_rotation_part_holds_outbound(mgr, lsp, 0) &&
+                    lsp_rotation_cin_eligible(mgr, lsp),
+                    "its old factory resolved: not held, and it can move on");
+        TEST_ASSERT(persist_set_part_resolved(&db, otx, 0) &&
+                    lsp_rotation_part_holds_outbound(mgr, lsp, 0),
+                    "the spend reorged out: held again");
+        mgr->part_wd_height = 0;
         TEST_ASSERT(persist_set_part_released(&db, otx, 0), "released");
         TEST_ASSERT(!lsp_rotation_part_holds_outbound(mgr, lsp, 0), "released: not held");
         mgr->persist = NULL;
@@ -3462,6 +3476,45 @@ int test_part_signed_abandon(void) {
     persist_close(&db);
     unlink(path);
     unlink(cli);
+    return 1;
+}
+
+/* The pending mark of an answered commitment signature goes in the same
+   transaction as the new balance and number: if the number cannot be
+   recorded, the mark stays (never cleared while the record is old). */
+int test_part_pending_with_balance(void) {
+    char path[] = "/tmp/ss_part_pb_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.local_amount = 7000;
+    ch.remote_amount = 3000;
+    ch.funding_amount = 11000;
+    ch.commitment_number = 4;
+    TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "the channel at commitment 4");
+    ch.commitment_number = 5;
+    TEST_ASSERT(persist_save_pending_cs(&db, 0, 5), "a signature for commitment 5 pending");
+    TEST_ASSERT(sqlite3_exec(db.db, "CREATE TRIGGER no_bal BEFORE UPDATE ON channels BEGIN "
+                             "SELECT RAISE(ABORT, 'no'); END;", NULL, NULL, NULL) == SQLITE_OK,
+                "the number cannot be written");
+    uint64_t pc = 0, la = 0, ra = 0, cn = 0;
+    TEST_ASSERT(!lsp_channels_persist_answered(&db, 0, 0, &ch, 1), "nothing written");
+    TEST_ASSERT(persist_load_pending_cs(&db, 0, &pc) && pc == 5 &&
+                persist_load_channel_state(&db, 0, &la, &ra, &cn) && cn == 4,
+                "the record is still at 4, and the signature still pending");
+    TEST_ASSERT(sqlite3_exec(db.db, "DROP TRIGGER no_bal;", NULL, NULL, NULL) == SQLITE_OK, "drop");
+    TEST_ASSERT(lsp_channels_persist_answered(&db, 0, 0, &ch, 1), "written");
+    TEST_ASSERT(!persist_load_pending_cs(&db, 0, &pc) &&
+                persist_load_channel_state(&db, 0, &la, &ra, &cn) && cn == 5,
+                "the record at 5 and nothing pending, together");
+    ch.commitment_number = 6;
+    TEST_ASSERT(persist_save_pending_cs(&db, 0, 6) &&
+                lsp_channels_persist_answered(&db, 0, 0, &ch, 0) &&
+                persist_load_pending_cs(&db, 0, &pc) && pc == 6,
+                "not answered: the number recorded, the mark kept");
+    persist_close(&db);
+    unlink(path);
     return 1;
 }
 

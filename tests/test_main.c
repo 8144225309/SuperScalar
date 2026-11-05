@@ -1197,6 +1197,7 @@ extern int test_part_deadline_persist(void);
 extern int test_part_exposure_bound(void);
 extern int test_cli_feed_overlong(void);
 extern int test_part_signed_abandon(void);
+extern int test_part_pending_with_balance(void);
 extern int test_part_switch_due(void);
 extern int test_part_sweep_build(void);
 extern int test_part_settle_client(void);
@@ -3264,6 +3265,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_part_exposure_bound);
     RUN_TEST(test_cli_feed_overlong);
     RUN_TEST(test_part_signed_abandon);
+    RUN_TEST(test_part_pending_with_balance);
     RUN_TEST(test_part_switch_due);
     RUN_TEST(test_part_sweep_build);
     RUN_TEST(test_part_settle_client);

@@ -633,7 +633,10 @@ if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ]
    [ -f "$TMP/c3.db.pre-rotation" ]; then
   # What the client's force-close reads: channel 0 of its old DB.
   C3_CN=$(sqlite3 "$TMP/c3.db.pre-rotation" "SELECT commitment_number FROM signed_commitments WHERE channel_id = 0;" 2>/dev/null)
-  RF=$(sqlite3 "$DB" "SELECT retired_id FROM part_rotations ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
+  # The LSP's record of exactly that old factory (the replacement may itself
+  # have been rotated since, with a record of its own).
+  C3_OLD=$(sqlite3 "$TMP/c3.db.pre-rotation" "SELECT funding_txid FROM factories WHERE id = 0;" 2>/dev/null)
+  RF=$(sqlite3 "$DB" "SELECT retired_id FROM part_rotations WHERE old_txid = '${C3_OLD:-x}';" 2>/dev/null)
   read -r S_LA S_RA S_CN < <(sqlite3 -separator ' ' "$DB" "SELECT local_amount, remote_amount, commitment_number FROM channels WHERE factory_id = ${RF:-0} AND slot = 2;" 2>/dev/null)
   read -r C3_LEAF C3_COMMIT < <(push_path "$TMP/c3.db.pre-rotation" 2 1 c3 "$TMP/c3.db.pre-rotation" 0)
   for _ in $(seq 1 6); do $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1; sleep 2; done

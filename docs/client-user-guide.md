@@ -172,7 +172,8 @@ learn your factory key before anything is verified.
   the remainder), and it checks that against the real old channel, not an assumed value.
   The settled commitment is stored in the old database as its latest state, under the
   channel a force-close from that file reads, before anything is revoked (it pays the
-  client nothing; a force-close from that file only costs the fee). If the settlement is
+  client nothing; it has a 0-sat output, so it is non-standard and a force-close from that
+  file will not relay). If the settlement is
   interrupted after the client accepted it, the next release request is answered with
   the same settled state; nothing more is given. It never does this before those checks pass. Clients that do not move
   keep their full exit in the old factory; one that reconnects later is told by the LSP

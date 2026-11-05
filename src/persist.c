@@ -108,6 +108,10 @@ static const char *SCHEMA_VERSION_SQL =
     "  signed_height INTEGER NOT NULL,"                      \
     "  confirmed_height INTEGER NOT NULL DEFAULT 0"          \
     ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS part_resolved ("             \
+    "  old_txid TEXT PRIMARY KEY,"                           \
+    "  spent_height INTEGER NOT NULL"                        \
+    ");"                                                     \
     "CREATE TABLE IF NOT EXISTS part_deadlines ("            \
     "  old_txid TEXT PRIMARY KEY,"                           \
     "  funded_height INTEGER NOT NULL"                       \
@@ -8556,16 +8560,37 @@ int persist_save_part_excluded(persist_t *p, const unsigned char identity33[33],
     return ok;
 }
 
-int persist_part_unreleased_identity(persist_t *p, const unsigned char identity33[33]) {
+int persist_set_part_resolved(persist_t *p, const char *old_txid, uint32_t spent_height) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    const char *sql = spent_height
+        ? "INSERT OR IGNORE INTO part_resolved (old_txid, spent_height) VALUES (?, ?);"
+        : "DELETE FROM part_resolved WHERE old_txid = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    if (spent_height) sqlite3_bind_int64(st, 2, spent_height);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_part_unreleased_identity(persist_t *p, const unsigned char identity33[33],
+                                     uint32_t tip, uint32_t depth) {
     if (!p || !p->db || !identity33) return 0;
     char id[67];
     hex_encode(identity33, 33, id);
     sqlite3_stmt *st;
+    /* Not once its old factory is resolved: the old funding spent and that
+       spend buried (whatever the row's state). */
     if (sqlite3_prepare_v2(p->db, "SELECT 1 FROM part_releases r JOIN part_rotations o ON "
-                           "o.old_txid = r.old_txid WHERE o.state != 'done' AND "
-                           "r.released = 0 AND r.identity = ?;", -1, &st, NULL) != SQLITE_OK)
+                           "o.old_txid = r.old_txid LEFT JOIN part_resolved s ON "
+                           "s.old_txid = r.old_txid WHERE o.state != 'done' AND "
+                           "r.released = 0 AND r.identity = ? AND (s.spent_height IS NULL "
+                           "OR ? < s.spent_height + ?);", -1, &st, NULL) != SQLITE_OK)
         return 0;
     sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, tip);
+    sqlite3_bind_int64(st, 3, depth);
     int found = sqlite3_step(st) == SQLITE_ROW;
     sqlite3_finalize(st);
     return found;
