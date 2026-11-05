@@ -509,6 +509,12 @@ int channel_htlc_claim_spk(const channel_t *ch, int side,
     const secp256k1_pubkey *pcp, const unsigned char *payment_hash32,
     uint32_t cltv_expiry, unsigned char *spk_out34);
 
+/* 1 if latest_commitment_sig is a valid signature of the commitment ch
+   describes now, i.e. we hold that commitment signed and can broadcast
+   it.  After a local update the counterparty has not signed yet, the
+   current state is not that commitment. */
+int channel_holds_signed_commitment(const channel_t *ch);
+
 /* Virtual size of a claim, for its fee. */
 #define HTLC_CLAIM_VSIZE 180
 

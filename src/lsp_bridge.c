@@ -431,6 +431,21 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (old_n_htlcs > 0 && old_htlcs)
                     memcpy(old_htlcs, ch->htlcs, old_n_htlcs * sizeof(htlc_t));
 
+                /* The client may withhold its revoke_and_ack and broadcast
+                   the commitment still holding this HTLC once it sees the
+                   preimage: be ready to claim it on chain first, and do not
+                   reveal the preimage if the claim cannot be armed. */
+                if (lsp_channels_register_htlc_claim(mgr, client_idx,
+                                                     htlc_id_val,
+                                                     preimage) < 0) {
+                    fprintf(stderr, "LSP: CRITICAL: no on-chain claim for "
+                            "HTLC %llu of client %zu: its preimage is not "
+                            "revealed, the channel must be closed on chain\n",
+                            (unsigned long long)htlc_id_val, client_idx);
+                    free(old_htlcs);
+                    break;
+                }
+
                 /* Fulfill the HTLC on the client's channel */
                 channel_fulfill_htlc(ch, htlc_id_val, preimage);
 
@@ -459,7 +474,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                                         rev_secret, next_point)) {
                             uint64_t old_cn = ch->commitment_number - 1;
-                            channel_receive_revocation(ch, old_cn, rev_secret);
+                            if (channel_receive_revocation(ch, old_cn, rev_secret))
+                                lsp_channels_cancel_htlc_claims(mgr, client_idx,
+                                                                old_cn);
                             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                                No-op today (n_ptlcs == 0 at all current callsites); defensive
                                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */

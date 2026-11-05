@@ -2599,6 +2599,25 @@ int channel_htlc_claim_spk(const channel_t *ch, int side,
                                     &s, &t, &internal, &parity, spk_out34);
 }
 
+int channel_holds_signed_commitment(const channel_t *ch)
+{
+    if (!ch || !ch->has_latest_commitment_sig || ch->funding_spk_len != 34)
+        return 0;
+    tx_buf_t utx;
+    tx_buf_init(&utx, 512);
+    unsigned char txid[32], sighash[32];
+    int ok = channel_build_commitment_tx(ch, &utx, txid) &&
+             compute_taproot_sighash(sighash, utx.data, utx.len, 0,
+                                     ch->funding_spk, ch->funding_spk_len,
+                                     ch->funding_amount, 0xFFFFFFFE);
+    tx_buf_free(&utx);
+    secp256k1_xonly_pubkey key;
+    return ok &&
+           secp256k1_xonly_pubkey_parse(ch->ctx, &key, ch->funding_spk + 2) &&
+           secp256k1_schnorrsig_verify(ch->ctx, ch->latest_commitment_sig,
+                                       sighash, 32, &key);
+}
+
 uint64_t channel_htlc_claim_fee(const channel_t *ch)
 {
     /* Same fee rule as channel_build_htlc_timeout_tx. */
