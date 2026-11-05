@@ -2,6 +2,8 @@
    balance carry, the close check a client runs before signing, the resume
    and resolve decisions, the records, and the wire messages. */
 #include "superscalar/lsp_channels.h"
+#include "superscalar/wallet_source.h"
+#include "superscalar/chain_backend.h"
 #include "superscalar/ladder.h"
 #include "superscalar/client_rotation.h"
 #include "superscalar/factory_keys.h"
@@ -13,6 +15,7 @@
 #include "superscalar/fee_estimator.h"
 #include "cJSON.h"
 #include <stdio.h>
+#include <stdbool.h>
 #include <secp256k1_schnorrsig.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -1750,6 +1753,229 @@ int test_part_load_restart(void) {
     lsp_rotation_progress_clear(mgr);
     free(mgr);
     free(r);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* When the LSP may close the old factory alone, and when the released keys
+   go. */
+int test_part_winddown_action(void) {
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 100, 500, 1) == LSP_WD_CLOSE,
+                "every client moved and released: close");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 100, 500, 1) == LSP_WD_NONE,
+                "a client stayed: never an LSP-alone close");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 3, -1, 100, 500, 1) == LSP_WD_NONE,
+                "a release still owed: wait");
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 0, 100, 500, 1) == LSP_WD_WAIT &&
+                lsp_rotation_winddown_action("closing", 4, 4, 4, 5, 100, 500, 1) == LSP_WD_WAIT,
+                "the close not buried yet: keep the keys");
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 100, 500, 1) == LSP_WD_DELETE,
+                "buried on regtest: delete");
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 100, 500, 0) == LSP_WD_WAIT &&
+                lsp_rotation_winddown_action("closing", 4, 4, 4, 106, 100, 5000, 0) == LSP_WD_DELETE,
+                "elsewhere: 6 plus a margin of 100");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 505, 500, 1) == LSP_WD_NONE &&
+                lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 506, 500, 1) == LSP_WD_DELETE,
+                "with clients that stayed: at the old CLTV plus the margin");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 599, 500, 0) == LSP_WD_NONE &&
+                lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 600, 500, 0) == LSP_WD_DELETE,
+                "and off regtest after 100 blocks");
+    TEST_ASSERT(lsp_rotation_winddown_action("done", 4, 4, 4, 9, 900, 500, 1) == LSP_WD_NONE,
+                "done: nothing");
+    return 1;
+}
+
+/* The LSP's own close of the old factory: a valid key-path signature for
+   the old funding output from its key and the released keys, and nothing
+   with a key that is not that participant's. */
+int test_part_winddown_close(void) {
+    secp256k1_context *ctx = cin_ctx();
+    unsigned char sk[3][32];
+    secp256k1_pubkey pk[3];
+    persist_part_rotation_t *r = calloc(1, sizeof(*r));
+    TEST_ASSERT(r, "alloc");
+    for (int i = 0; i < 3; i++) {
+        memset(sk[i], 0x31 + i, 32);
+        size_t l = 33;
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pk[i], sk[i]) &&
+                    secp256k1_ec_pubkey_serialize(ctx, r->old_pks[i], &l, &pk[i],
+                                                  SECP256K1_EC_COMPRESSED), "key");
+    }
+    snprintf(r->old_txid, sizeof(r->old_txid), "%s", "9191919191919191919191919191919191919191919191919191919191919191");
+    r->old_vout = 3;
+    r->n_old = 2;
+    r->old_amount = 100000;
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.amount_sats = 99000;
+    out.script_pubkey[0] = 0x51;
+    out.script_pubkey[1] = 0x20;
+    memset(out.script_pubkey + 2, 0x77, 32);
+    out.script_pubkey_len = 34;
+    tx_buf_t stx;
+    tx_buf_init(&stx, 256);
+    char txid[65];
+    TEST_ASSERT(lsp_rotation_winddown_build(ctx, sk[0], r, (const unsigned char (*)[32])sk,
+                                            &out, 777, &stx, txid), "built");
+    /* Verify the signature against the old funding output's key. */
+    unsigned char spk[34], ot[32], sh[32];
+    TEST_ASSERT(factory_funding_spk_for(ctx, pk, 3, spk), "spk");
+    hex_decode(r->old_txid, ot, 32);
+    reverse_bytes(ot, 32);
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    TEST_ASSERT(build_unsigned_tx_with_locktime(&utx, NULL, ot, 3, 0xFFFFFFFEu, 777, &out, 1) &&
+                compute_taproot_sighash(sh, utx.data, utx.len, 0, spk, 34, 100000, 0xFFFFFFFEu),
+                "sighash");
+    secp256k1_xonly_pubkey xo;
+    TEST_ASSERT(stx.len > 68 && secp256k1_xonly_pubkey_parse(ctx, &xo, spk + 2), "xonly");
+    const unsigned char *sig = stx.data + stx.len - 4 - 64;
+    TEST_ASSERT(secp256k1_schnorrsig_verify(ctx, sig, sh, 32, &xo),
+                "a valid key-path signature of the old funding output");
+    tx_buf_free(&utx);
+    tx_buf_free(&stx);
+    /* Another participant's key in a slot: refused, not a bad signature. */
+    unsigned char swapped[3][32];
+    memcpy(swapped[0], sk[0], 32);
+    memcpy(swapped[1], sk[2], 32);
+    memcpy(swapped[2], sk[1], 32);
+    tx_buf_init(&stx, 256);
+    TEST_ASSERT(!lsp_rotation_winddown_build(ctx, sk[0], r, (const unsigned char (*)[32])swapped,
+                                             &out, 777, &stx, txid), "keys out of place: refused");
+    unsigned char missing[3][32];
+    memcpy(missing, sk, sizeof(missing));
+    memset(missing[2], 0, 32);
+    TEST_ASSERT(!lsp_rotation_winddown_build(ctx, sk[0], r, (const unsigned char (*)[32])missing,
+                                             &out, 777, &stx, txid), "a key missing: refused");
+    out.amount_sats = 100000;
+    TEST_ASSERT(!lsp_rotation_winddown_build(ctx, sk[0], r, (const unsigned char (*)[32])sk,
+                                             &out, 777, &stx, txid), "no fee: refused");
+    tx_buf_free(&stx);
+    free(r);
+    return 1;
+}
+
+static int wd_height = 100, wd_confs = -1, wd_unspent = 1, wd_sent = 0, wd_recorded_first = 0;
+static persist_t *wd_db = NULL;
+static int wd_get_height(chain_backend_t *s) { (void)s; return wd_height; }
+static int wd_get_confs(chain_backend_t *s, const char *t) { (void)s; (void)t; return wd_confs; }
+static bool wd_in_mempool(chain_backend_t *s, const char *t) { (void)s; (void)t; return wd_confs == 0; }
+static int wd_outpoint(chain_backend_t *s, const char *t, uint32_t v) {
+    (void)s; (void)t; (void)v; return wd_unspent;
+}
+static int wd_send(chain_backend_t *s, const char *hex, char *txid_out) {
+    (void)s; (void)hex;
+    persist_part_rotation_t *rows = calloc(1, sizeof(*rows));
+    if (rows && wd_sent == 0 && persist_load_part_rotations(wd_db, rows, 1, 1) == 1 &&
+        strcmp(rows[0].state, "closing") == 0 && rows[0].close_hex &&
+        strcmp(rows[0].close_hex, hex) == 0)
+        wd_recorded_first = 1;              /* on disk before it first went out */
+    if (rows) free(rows[0].close_hex);
+    free(rows);
+    wd_sent++;
+    if (txid_out) txid_out[0] = '\0';
+    return 1;
+}
+static int wd_change_spk(wallet_source_t *w, unsigned char *spk, size_t *len) {
+    (void)w;
+    spk[0] = 0x51; spk[1] = 0x20;
+    memset(spk + 2, 0x55, 32);
+    *len = 34;
+    return 1;
+}
+
+/* The wind-down end to end: every client released, so the LSP records its
+   close of the old factory, broadcasts it, and deletes the released keys
+   only once the close is buried. */
+int test_part_winddown_tick(void) {
+    secp256k1_context *ctx = cin_ctx();
+    char path[] = "/tmp/ss_part_wt_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    unsigned char seal[32];
+    memset(seal, 0x66, 32);
+    persist_set_departed_seal_key(&db, seal);
+    persist_part_rotation_t *r = calloc(1, sizeof(*r));
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(r && mgr, "alloc");
+    unsigned char sk[3][32];
+    for (int i = 0; i < 3; i++) {
+        secp256k1_pubkey pk;
+        size_t l = 33;
+        memset(sk[i], 0x41 + i, 32);
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pk, sk[i]) &&
+                    secp256k1_ec_pubkey_serialize(ctx, r->old_pks[i], &l, &pk,
+                                                  SECP256K1_EC_COMPRESSED), "key");
+    }
+    snprintf(r->old_txid, sizeof(r->old_txid), "%s", "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1");
+    snprintf(r->new_txid, sizeof(r->new_txid), "%s", "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2");
+    r->retired_id = LSP_RETIRED_FACTORY_ID(1);
+    r->n_old = 2;
+    r->m = 2;
+    r->old_amount = 100000;
+    r->old_cltv = 5000;
+    snprintf(r->state, sizeof(r->state), "releasing");
+    TEST_ASSERT(persist_save_part_rotation(&db, r), "record");
+    for (uint32_t j = 0; j < 2; j++) {
+        persist_part_release_t rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.j = j;
+        rel.old_slot = j;
+        rel.released = 1;
+        TEST_ASSERT(persist_save_part_release(&db, r->old_txid, &rel) &&
+                    persist_save_departed_client(&db, r->retired_id, j + 1, sk[j + 1]),
+                    "released");
+    }
+    chain_backend_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.get_block_height = wd_get_height;
+    cb.get_confirmations = wd_get_confs;
+    cb.is_in_mempool = wd_in_mempool;
+    cb.is_outpoint_unspent = wd_outpoint;
+    cb.send_raw_tx = wd_send;
+    wallet_source_t ws;
+    memset(&ws, 0, sizeof(ws));
+    ws.get_change_spk = wd_change_spk;
+    mgr->ctx = ctx;
+    mgr->persist = &db;
+    mgr->chain_be = &cb;
+    mgr->wallet_src = &ws;
+    mgr->rot_is_regtest = 1;
+    memcpy(mgr->rot_lsp_seckey, sk[0], 32);
+    wd_db = &db;
+    wd_height = 100; wd_confs = -1; wd_unspent = 1; wd_sent = 0; wd_recorded_first = 0;
+    TEST_ASSERT(lsp_rotation_winddown_tick(mgr, 1) == 1 && wd_sent == 1, "closed alone");
+    TEST_ASSERT(wd_recorded_first, "the close was recorded before it was broadcast");
+    persist_part_rotation_t *back = calloc(1, sizeof(*back));
+    TEST_ASSERT(back && persist_load_part_rotations(&db, back, 1, 1) == 1 &&
+                strcmp(back->state, "closing") == 0 && back->close_txid[0], "closing");
+    char ct[65];
+    snprintf(ct, sizeof(ct), "%s", back->close_txid);
+    free(back->close_hex);
+    wd_confs = 0;
+    TEST_ASSERT(lsp_rotation_winddown_tick(mgr, 1) == 0 && wd_sent == 1,
+                "in the mempool: no second broadcast, no second close");
+    wd_confs = 5;
+    (void)lsp_rotation_winddown_tick(mgr, 1);
+    int dep[4] = {0};
+    TEST_ASSERT(persist_load_departed_clients(&db, r->retired_id, dep, NULL, 4) == 2,
+                "not buried yet: the keys stay");
+    TEST_ASSERT(persist_load_part_rotations(&db, back, 1, 1) == 1 &&
+                strcmp(back->close_txid, ct) == 0, "still the one recorded close");
+    free(back->close_hex);
+    wd_confs = 6;
+    TEST_ASSERT(lsp_rotation_winddown_tick(mgr, 1) == 1, "resolved");
+    TEST_ASSERT(persist_load_departed_clients(&db, r->retired_id, dep, NULL, 4) == 0,
+                "the released keys are deleted");
+    TEST_ASSERT(persist_load_part_rotations(&db, back, 1, 1) == 0 &&
+                persist_load_part_rotations(&db, back, 1, 0) == 1 &&
+                strcmp(back->state, "done") == 0, "done");
+    free(back->close_hex);
+    free(back);
+    free(r);
+    free(mgr);
+    wd_db = NULL;
     persist_close(&db);
     unlink(path);
     return 1;

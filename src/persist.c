@@ -8291,8 +8291,12 @@ size_t persist_load_part_rotations(persist_t *p, persist_part_rotation_t *rows, 
         r->n_old = (uint32_t)sqlite3_column_int64(st, 6);
         size_t npk = (size_t)r->n_old + 1;
         if (!o || !nt || !dg || !pk || !s || npk > FACTORY_MAX_SIGNERS ||
-            strlen(pk) != npk * 66 || hex_decode(dg, r->digest, 32) != 32)
+            strlen(pk) != npk * 66 || hex_decode(dg, r->digest, 32) != 32) {
+            fprintf(stderr, "persist: skipping a malformed part_rotations row (old_txid %s) "
+                    "-- its released keys will not be deleted automatically\n",
+                    o ? o : "?");
             continue;
+        }
         int bad = 0;
         for (size_t i = 0; i < npk && !bad; i++) {
             char h[67];
@@ -8300,7 +8304,11 @@ size_t persist_load_part_rotations(persist_t *p, persist_part_rotation_t *rows, 
             h[66] = '\0';
             bad = hex_decode(h, r->old_pks[i], 33) != 33;
         }
-        if (bad) continue;
+        if (bad) {
+            fprintf(stderr, "persist: skipping a part_rotations row with a bad pubkey "
+                    "(old_txid %s)\n", o);
+            continue;
+        }
         snprintf(r->old_txid, sizeof(r->old_txid), "%s", o);
         r->old_vout = (uint32_t)sqlite3_column_int64(st, 1);
         r->retired_id = (uint32_t)sqlite3_column_int64(st, 2);
@@ -8384,13 +8392,21 @@ int persist_set_part_released(persist_t *p, const char *old_txid, uint32_t j) {
 
 int persist_delete_departed_clients(persist_t *p, uint32_t factory_id) {
     if (!p || !p->db) return 0;
+    /* Overwrite the freed pages too (the rows are sealed; this keeps the
+       blobs out of the file once deleted). */
+    sqlite3_exec(p->db, "PRAGMA secure_delete = ON;", NULL, NULL, NULL);
     sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(p->db, "DELETE FROM departed_clients WHERE factory_id = ?;", -1,
-                           &st, NULL) != SQLITE_OK)
-        return 0;
-    sqlite3_bind_int64(st, 1, factory_id);
-    int ok = sqlite3_step(st) == SQLITE_DONE;
-    sqlite3_finalize(st);
+    int ok = sqlite3_prepare_v2(p->db, "DELETE FROM departed_clients WHERE factory_id = ?;",
+                                -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_int64(st, 1, factory_id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(p->db, "PRAGMA secure_delete = OFF;", NULL, NULL, NULL);
+    /* Flush the deleted (sealed) pages out of the WAL too, so a copy of the
+       file taken after this does not still carry them. */
+    if (ok) sqlite3_exec(p->db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
     return ok;
 }
 

@@ -7241,6 +7241,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         }
                     }
 
+                    /* The old factories of partial rotations: closed by
+                       this LSP once every client released, keys deleted once
+                       resolved (one step per block). */
+                    (void)lsp_rotation_winddown_tick(mgr, 0);
+
                     /* Profit settlement: handled above via chain_be (works
                        without watchtower). Removed from watchtower block. */
                     /* Factory lifecycle monitoring */

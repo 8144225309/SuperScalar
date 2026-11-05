@@ -3787,6 +3787,8 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
     printf("LSP rotate: client %zu released its old factory key (verified release)\n",
            (size_t)old_slot);
     fflush(stdout);
+    if (mgr->rot_progress.phase == LSP_ROT_PROGRESS_NONE)
+        (void)lsp_rotation_winddown_tick(mgr, 1);      /* the last one: close now */
     return 1;
 }
 
@@ -4235,6 +4237,7 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
            "factory, %zu released their old factory key; the old factory stays for the "
            "others\n", m, n_old, released);
     fflush(stdout);
+    (void)lsp_rotation_winddown_tick(mgr, 1);
     return 1;
 }
 
@@ -4434,6 +4437,250 @@ int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
     free(rows);
     fflush(stdout);
     return any;
+}
+
+/* ===================================================================
+   Winding down the old factory of a partial rotation (see lsp_channels.h).
+   =================================================================== */
+
+lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
+                                             uint32_t n_released, int close_confs,
+                                             int height, uint32_t old_cltv, int regtest) {
+    if (!state || strcmp(state, "done") == 0) return LSP_WD_NONE;
+    if (height > 0 && old_cltv > 0 &&
+        (uint64_t)height >= (uint64_t)old_cltv + LSP_WD_CLTV_MARGIN(regtest))
+        return LSP_WD_DELETE;
+    if (strcmp(state, "closing") == 0)
+        return close_confs >= LSP_WD_CLOSE_DEPTH(regtest) ? LSP_WD_DELETE : LSP_WD_WAIT;
+    if (strcmp(state, "releasing") == 0 && m > 0 && m == n_old && n_released == m)
+        return LSP_WD_CLOSE;
+    return LSP_WD_NONE;
+}
+
+int lsp_rotation_winddown_build(const secp256k1_context *ctx,
+                                const unsigned char *lsp_seckey32,
+                                const persist_part_rotation_t *r,
+                                const unsigned char (*keys)[32], const tx_output_t *out,
+                                uint32_t locktime, tx_buf_t *signed_out, char txid_out[65]) {
+    if (!ctx || !lsp_seckey32 || !r || !keys || !out || !signed_out || !txid_out) return 0;
+    size_t n = (size_t)r->n_old + 1;
+    if (n < 2 || n > FACTORY_MAX_SIGNERS || out->amount_sats == 0 ||
+        out->amount_sats >= r->old_amount)
+        return 0;
+    secp256k1_pubkey *pks = calloc(n, sizeof(*pks));
+    secp256k1_keypair *kps = calloc(n, sizeof(*kps));
+    int ok = pks && kps;
+    for (size_t i = 0; ok && i < n; i++) {
+        secp256k1_pubkey kp;
+        unsigned char ser[33];
+        size_t l = 33;
+        /* Each key must be that participant's: a wrong one signs nothing. */
+        ok = secp256k1_ec_pubkey_parse(ctx, &pks[i], r->old_pks[i], 33) &&
+             secp256k1_keypair_create(ctx, &kps[i], i == 0 ? lsp_seckey32 : keys[i]) &&
+             secp256k1_keypair_pub(ctx, &kp, &kps[i]) &&
+             secp256k1_ec_pubkey_serialize(ctx, ser, &l, &kp, SECP256K1_EC_COMPRESSED) &&
+             memcmp(ser, r->old_pks[i], 33) == 0;
+    }
+    unsigned char spk[34], ot[32], dtxid[32], sh[32], sig[64];
+    musig_keyagg_t ka;
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    ok = ok && factory_funding_spk_for(ctx, pks, n, spk) &&
+         musig_aggregate_keys(ctx, &ka, pks, n) &&
+         hex_decode(r->old_txid, ot, 32) == 32;
+    if (ok) reverse_bytes(ot, 32);
+    ok = ok && build_unsigned_tx_with_locktime(&utx, dtxid, ot, r->old_vout, 0xFFFFFFFEu,
+                                               locktime, out, 1) &&
+         compute_taproot_sighash(sh, utx.data, utx.len, 0, spk, 34, r->old_amount,
+                                 0xFFFFFFFEu) &&
+         musig_sign_taproot(ctx, sig, sh, kps, n, &ka, NULL) &&
+         finalize_signed_tx(signed_out, utx.data, utx.len, sig);
+    if (ok) hex_encode(dtxid, 32, txid_out);
+    tx_buf_free(&utx);
+    if (kps) secure_zero(kps, n * sizeof(*kps));
+    free(kps);
+    free(pks);
+    return ok;
+}
+
+static ladder_factory_t *wd_ladder_slot(lsp_channel_mgr_t *mgr, const char *old_txid,
+                                        uint32_t old_vout) {
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    unsigned char t[32];
+    if (!lad || hex_decode(old_txid, t, 32) != 32) return NULL;
+    reverse_bytes(t, 32);
+    for (size_t i = 0; i < lad->n_factories; i++) {
+        ladder_factory_t *lf = &lad->factories[i];
+        if (lf->is_initialized && lf->factory.funding_vout == old_vout &&
+            memcmp(lf->factory.funding_txid, t, 32) == 0)
+            return lf;
+    }
+    return NULL;
+}
+
+/* Build, record, then broadcast the close (never a second one: the record
+   is checked first by the caller's state). */
+static int wd_close(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int height) {
+    persist_t *db = (persist_t *)mgr->persist;
+    regtest_t *rt = rot_rt(mgr);
+    int un = rot_outpoint_unspent(mgr, r->old_txid, r->old_vout);
+    if (un != 1) {
+        if (un == 0)
+            printf("LSP rotate: the old factory %s is already spent -- no close of its "
+                   "own; the released keys go at its CLTV + margin\n", r->old_txid);
+        return 0;
+    }
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    char addr[128] = {0};
+    unsigned char wspk[64];
+    size_t wl = 0;
+    wallet_source_t *ws = (wallet_source_t *)mgr->wallet_src;
+    if (!(rt && regtest_get_new_address(rt, addr, sizeof(addr)) &&
+          regtest_get_address_scriptpubkey(rt, addr, wspk, &wl)) &&
+        !(!rt && ws && ws->get_change_spk && ws->get_change_spk(ws, wspk, &wl))) {
+        fprintf(stderr, "LSP rotate: no wallet address for the old factory's close\n");
+        return 0;
+    }
+    if (wl == 0 || wl > sizeof(out.script_pubkey)) return 0;
+    memcpy(out.script_pubkey, wspk, wl);
+    out.script_pubkey_len = wl;
+    size_t vsize = 68 + 43;
+    uint64_t fee = mgr->rot_fee_est ? fee_estimate((fee_estimator_t *)mgr->rot_fee_est, vsize) : 0;
+    if (fee == 0) fee = (vsize * FEE_FLOOR_SAT_PER_KVB + 999) / 1000;
+    if (r->old_amount <= fee + 330) return 0;
+    out.amount_sats = r->old_amount - fee;
+
+    size_t n = (size_t)r->n_old + 1;
+    int *dep = calloc(n, sizeof(int));
+    unsigned char (*keys)[32] = calloc(n, 32);
+    tx_buf_t stx;
+    tx_buf_init(&stx, 256);
+    char txid[65] = {0};
+    int ok = dep && keys &&
+             persist_load_departed_clients(db, r->retired_id, dep, keys, n) == n - 1 &&
+             lsp_rotation_winddown_build(mgr->ctx, mgr->rot_lsp_seckey, r,
+                                         (const unsigned char (*)[32])keys, &out,
+                                         height > 0 ? (uint32_t)height : 0, &stx, txid);
+    if (keys) secure_zero(keys, n * 32);
+    free(keys);
+    free(dep);
+    char *hex = ok ? malloc(stx.len * 2 + 1) : NULL;
+    if (hex) hex_encode(stx.data, stx.len, hex);
+    tx_buf_free(&stx);
+    if (!hex) {
+        fprintf(stderr, "LSP rotate: could not build the old factory %s's close from the "
+                "released keys\n", r->old_txid);
+        return 0;
+    }
+    /* Recorded before it can be broadcast. */
+    snprintf(r->state, sizeof(r->state), "closing");
+    snprintf(r->close_txid, sizeof(r->close_txid), "%s", txid);
+    free(r->close_hex);
+    r->close_hex = hex;
+    if (!persist_save_part_rotation(db, r)) {
+        fprintf(stderr, "LSP rotate: could not record the old factory's close -- not "
+                "broadcasting it\n");
+        return 0;
+    }
+    printf("LSP rotate: every client of the old factory %s released its key — closing it "
+           "alone: close %s recorded (%llu sats to %s)\n", r->old_txid, txid,
+           (unsigned long long)out.amount_sats, addr[0] ? addr : "this wallet");
+    char sent[65] = {0};
+    int sok = rot_send_hex(mgr, hex, sent);
+    persist_log_broadcast(db, txid, "rotation_winddown_close", hex, sok ? "ok" : "failed");
+    printf("LSP rotate: old factory close %s %s\n", txid,
+           sok ? "broadcast" : "not broadcast yet (rebroadcast from the record)");
+    fflush(stdout);
+    return 1;
+}
+
+static int wd_delete(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int confs,
+                     int closed_by_us) {
+    persist_t *db = (persist_t *)mgr->persist;
+    char prev[16];
+    snprintf(prev, sizeof(prev), "%s", r->state);
+    snprintf(r->state, sizeof(r->state), "done");
+    int ok = persist_begin(db) && persist_delete_departed_clients(db, r->retired_id) &&
+             persist_save_part_rotation(db, r);
+    if (ok) ok = persist_commit(db);
+    else if (persist_in_transaction(db)) persist_rollback(db);
+    if (!ok) {
+        snprintf(r->state, sizeof(r->state), "%s", prev);
+        return 0;
+    }
+    ladder_factory_t *lf = wd_ladder_slot(mgr, r->old_txid, r->old_vout);
+    if (lf) {
+        secure_zero(lf->extracted_keys, sizeof(lf->extracted_keys));
+        memset(lf->client_departed, 0, sizeof(lf->client_departed));
+        lf->n_departed = 0;
+        if (closed_by_us) tx_buf_free(&lf->distribution_tx);   /* nothing left to broadcast */
+    }
+    if (mgr->part_rel.valid) {
+        char o[65];
+        rot_txid_display(mgr->part_rel.old_txid, o);
+        if (strcmp(o, r->old_txid) == 0)
+            memset(&mgr->part_rel, 0, sizeof(mgr->part_rel));   /* nothing owed any more */
+    }
+    if (closed_by_us)
+        printf("LSP rotate: the old factory %s is closed (%s, %d confirmations); the "
+               "released keys kept for it are deleted\n", r->old_txid, r->close_txid, confs);
+    else
+        printf("LSP rotate: the old factory %s is past its CLTV + margin; the released "
+               "keys kept for it are deleted\n", r->old_txid);
+    fflush(stdout);
+    return 1;
+}
+
+int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force) {
+    if (!mgr || !mgr->persist) return 0;
+    persist_t *db = (persist_t *)mgr->persist;
+    if (persist_in_transaction(db)) return 0;
+    int h = rot_chain_height(mgr);
+    if (!force && h > 0 && mgr->part_wd_height == (uint32_t)h) return 0;
+    if (h > 0) mgr->part_wd_height = (uint32_t)h;
+    persist_part_rotation_t *rows = calloc(LADDER_MAX_FACTORIES, sizeof(*rows));
+    persist_part_release_t *rel = calloc(FACTORY_MAX_SIGNERS, sizeof(*rel));
+    if (!rows || !rel) { free(rows); free(rel); return 0; }
+    size_t n = persist_load_part_rotations(db, rows, LADDER_MAX_FACTORIES, 1);
+    regtest_t *rt = rot_rt(mgr);
+    int did = 0;
+    for (size_t i = 0; i < n; i++) {
+        persist_part_rotation_t *r = &rows[i];
+        size_t nr = persist_load_part_releases(db, r->old_txid, rel, FACTORY_MAX_SIGNERS);
+        uint32_t released = 0;
+        for (size_t k = 0; k < nr; k++) released += rel[k].released ? 1 : 0;
+        int confs = r->close_txid[0] ? rot_tx_confirmations(mgr, r->close_txid) : -1;
+        lsp_wd_action_t a = lsp_rotation_winddown_action(r->state, r->n_old, r->m, released,
+                                                         confs, h, r->old_cltv,
+                                                         mgr->rot_is_regtest);
+        switch (a) {
+        case LSP_WD_CLOSE:
+            did |= wd_close(mgr, r, h);
+            break;
+        case LSP_WD_WAIT:
+            if (confs < 1 && r->close_hex && !rot_tx_in_mempool(mgr, r->close_txid)) {
+                char t[65] = {0};
+                if (rot_send_hex(mgr, r->close_hex, t))
+                    printf("LSP rotate: the old factory's close %s was not on the network "
+                           "— rebroadcast it\n", r->close_txid);
+            } else if (confs < 1 && mgr->rot_is_regtest && rt) {
+                regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+            }
+            break;
+        case LSP_WD_DELETE:
+            did |= wd_delete(mgr, r, confs, strcmp(r->state, "closing") == 0 &&
+                                            confs >= LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest));
+            break;
+        default:
+            break;
+        }
+        free(r->close_hex);
+    }
+    free(rows);
+    free(rel);
+    fflush(stdout);
+    return did;
 }
 
 /* Resume a CIN marker (lsp_rotation_resume). */

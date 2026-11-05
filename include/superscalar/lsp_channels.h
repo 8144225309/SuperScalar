@@ -267,6 +267,7 @@ typedef struct {
     } part_rel;
     secp256k1_pubkey part_retired_ids[FACTORY_MAX_SIGNERS];
     size_t n_part_retired;
+    uint32_t part_wd_height;       /* last height the wind-down was stepped */
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -794,6 +795,45 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
    clients reconnect.  Returns 1 if anything was loaded or dropped. */
 int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
                            const unsigned char *live_txid32, uint32_t live_vout);
+
+/* Winding down the old factory of a partial rotation.
+
+   Every client of it released (no client stayed): the LSP closes it alone,
+   to its own wallet, with its key and the released keys (those balances
+   are paid in the replacement).  The close is recorded before it is
+   broadcast and rebroadcast until it confirms; once it is buried the
+   released keys are deleted.  Some clients stayed: no such close exists; the
+   old factory ends through their exits or its distribution TX, and the
+   released keys are deleted at its CLTV plus a margin. */
+typedef enum {
+    LSP_WD_NONE = 0,
+    LSP_WD_CLOSE,           /* build, record and broadcast the close */
+    LSP_WD_WAIT,            /* the recorded close: rebroadcast or wait */
+    LSP_WD_DELETE           /* resolved: delete the released keys */
+} lsp_wd_action_t;
+
+/* Depth of the LSP's own close before the keys go (6 plus a margin of 100
+   off regtest), and the margin after the old CLTV. */
+#define LSP_WD_CLOSE_DEPTH(regtest) ((regtest) ? 6 : 106)
+#define LSP_WD_CLTV_MARGIN(regtest) ((regtest) ? 6 : 100)
+
+lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
+                                             uint32_t n_released, int close_confs,
+                                             int height, uint32_t old_cltv, int regtest);
+
+/* The LSP's key-path close of the retired factory R, signed with its own
+   key and every client's released key (KEYS, by participant index from 1;
+   each must be that participant's).  One output, OUT.  Returns 1 with the
+   signed TX and its txid (display hex). */
+int lsp_rotation_winddown_build(const secp256k1_context *ctx,
+                                const unsigned char *lsp_seckey32,
+                                const persist_part_rotation_t *r,
+                                const unsigned char (*keys)[32], const tx_output_t *out,
+                                uint32_t locktime, tx_buf_t *signed_out, char txid_out[65]);
+
+/* One step for every open partial rotation (at most once per block unless
+   FORCE).  Returns 1 if anything was done. */
+int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force);
 
 /* 1 if PK is the identity of a client that stayed in a factory retired by a
    partial rotation. */
