@@ -1,6 +1,11 @@
 #ifndef SUPERSCALAR_CLIENT_ROTATION_H
 #define SUPERSCALAR_CLIENT_ROTATION_H
 
+/* A partial rotation's replacement that is not confirmed this many blocks
+   after the client signed it (and never was) is abandoned: the old channel
+   is unfrozen. */
+#define CLIENT_PART_ABANDON_BLOCKS 1008
+
 /* Client side of a rotation by a co-signed close into the new factory
    (every old client online).  Nothing is revealed: the client sends a fresh
    factory key, checks the replacement (its funding is the old factory's
@@ -44,6 +49,10 @@ int client_cin_frozen_for(const unsigned char *funding_txid32);
    must be refused (an incoming HTLC, a PTLC key turnover, or any rotation
    that is not the close into the new factory already in progress). */
 int client_cin_refuse_while_frozen(const wire_msg_t *m, const unsigned char *funding_txid32);
+
+/* The index of the factory key KP in DB's key rows (1 found). */
+int client_key_index_of(persist_t *db, secp256k1_context *ctx, const secp256k1_keypair *kp,
+                        uint32_t *idx_out);
 
 /* The client's own view of a signed rotation ROW: confirmations of the close
    (CLOSE_CONFS) and of another transaction spending the old funding
@@ -166,7 +175,7 @@ int client_cin_check_close(const secp256k1_context *ctx, const factory_t *old_f,
    makes the side DB the main DB before the reconnect). */
 int client_part_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db_path,
                     const secp256k1_keypair *old_kp, factory_t *old_f, channel_t *old_ch,
-                    const wire_msg_t *propose);
+                    const wire_msg_t *propose, client_queue_fn queue, void *qarg);
 
 /* The release decision for a MSG_ROTATION_RELEASE_REQ (REQ_TXID32,
    REQ_BINDING32, RECEIPT64): NULL if the old key may be released (then
@@ -189,7 +198,46 @@ const char *client_part_release_check(regtest_t *rt, persist_t *db, secp256k1_co
    the old key and carried balance from the rotation row.  Returns 1 if the
    key was released. */
 int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
-                               const factory_t *f, const cJSON *req);
+                               const char *db_path, const factory_t *f, const cJSON *req,
+                               client_queue_fn queue, void *qarg);
+
+/* The settlement of our old channel, part of a release (run only after the
+   release checks pass, before the key goes).  The client asks for it, and
+   accepts only one final update of the recorded old channel: the next
+   commitment, the fee rate unchanged, no HTLC or PTLC in flight, our side
+   left with exactly our old balance minus what was carried into the
+   replacement (normally 0), the rest to the LSP, and the LSP's side at most
+   the capacity minus the commitment fee.  Returns NULL if the offer S is
+   acceptable for CH, else why not. */
+const char *client_part_settle_check(const channel_t *ch, uint64_t carried,
+                                     const unsigned char old_txid32[32],
+                                     const wire_rotation_settle_t *s);
+
+/* Our old channel at its latest persisted state from ODB (a DB whose
+   factory 0 is the old factory, ours under OLD_KP).  The caller runs
+   channel_cleanup.  OLD_TXID_OUT32 (optional): that factory's funding. */
+int client_part_load_old_channel(persist_t *odb, secp256k1_context *ctx,
+                                 const secp256k1_keypair *old_kp, channel_t *ch,
+                                 unsigned char old_txid_out32[32], uint32_t *cidx_out);
+
+/* Run the settlement over FD on CH (loaded): send MSG_ROTATION_SETTLE_REQ,
+   check the LSP's MSG_ROTATION_SETTLE (client_part_settle_check and its
+   signature), then send MSG_ROTATION_SETTLE_ACK revoking our latest old
+   commitment.  Returns NULL once that revocation is sent, else why not
+   (nothing revoked). */
+/* How long a release waits for the LSP's settlement (seconds; default 120). */
+void client_part_set_settle_timeout(int sec);
+const char *client_part_settle(int fd, secp256k1_context *ctx, channel_t *ch,
+                               const unsigned char old_txid32[32], uint64_t carried,
+                               int timeout_sec, client_queue_fn queue, void *qarg,
+                               persist_t *odb, uint32_t cidx, regtest_t *rt,
+                               const client_funding_bind_t *bind);
+
+/* 1 if REQ (a release request) is for a partial rotation we signed whose
+   funding is now at the safe depth on our own chain, but we still run the
+   old factory: the client ends the session, switches (client_cin_resolve)
+   and is asked again after it reconnects. */
+int client_part_switch_due(persist_t *db, const cJSON *req);
 
 /* Whether a JIT channel is open (its key must not be released with the
    factory key). */

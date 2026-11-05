@@ -82,6 +82,8 @@
 #define LSP_ROT_PROGRESS_PART_FUNDED   23
 #define LSP_ROT_PROGRESS_IS_CIN(ph) ((ph) >= LSP_ROT_PROGRESS_CIN_CLOSE_BUILT && \
                                      (ph) <= LSP_ROT_PROGRESS_CIN_CLOSED)
+#define LSP_ROT_PROGRESS_IS_PART(ph) ((ph) >= LSP_ROT_PROGRESS_PART_BUILT && \
+                                      (ph) <= LSP_ROT_PROGRESS_PART_FUNDED)
 typedef struct {
     int phase;                              /* LSP_ROT_PROGRESS_* */
     uint32_t dying_factory_id;
@@ -248,7 +250,9 @@ typedef struct {
        and the identities of the clients that stayed in the old factory. */
     struct {
         int valid, funded;
-        uint32_t dying_id;
+        uint32_t dying_id;             /* ladder id, this process only */
+        uint32_t retired_id;           /* the old factory's rows and released keys */
+        uint32_t n_old;                /* clients of the old factory */
         unsigned char old_txid[32];
         uint32_t old_vout;
         unsigned char new_txid[32];
@@ -260,9 +264,15 @@ typedef struct {
         uint32_t old_slot[FACTORY_MAX_SIGNERS];
         uint64_t carried[FACTORY_MAX_SIGNERS];
         unsigned char released[FACTORY_MAX_SIGNERS];
+        unsigned char settled[FACTORY_MAX_SIGNERS];      /* old commitment revoked */
+        uint32_t old_cltv;             /* the old factory's CLTV */
+        uint32_t funded_height;        /* height the replacement reached safe depth */
+        secp256k1_pubkey ids[FACTORY_MAX_SIGNERS];       /* mover identities (deadline) */
     } part_rel;
     secp256k1_pubkey part_retired_ids[FACTORY_MAX_SIGNERS];
     size_t n_part_retired;
+    uint32_t part_wd_height;       /* last height the wind-down was stepped */
+    uint32_t part_reask_height;    /* last height owed releases were asked again */
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -450,6 +460,24 @@ int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
+
+/* After a revocation answered a commitment signature (ANSWERED) or not:
+   the channel's new balance and commitment number, and the pending mark of
+   that signature cleared, in one transaction, so the mark is never gone
+   while the recorded number is the old one.  Joins an open transaction.
+   Returns 1 if all of it was written. */
+int lsp_channels_persist_answered(persist_t *db, uint32_t channel_id, uint32_t slot,
+                                  const channel_t *ch, int answered);
+
+/* The CLI's line splitter: complete lines from BUF go out (in *LINES_OUT, each
+   NUL-terminated, malloc'd; returns how many), a partial line is kept for the
+   next read, and an over-long line is dropped up to its newline. */
+typedef struct {
+    char line[4096];
+    size_t len;
+    int discard;
+} lsp_cli_buf_t;
+size_t lsp_cli_feed(lsp_cli_buf_t *b, const char *buf, size_t n, char **lines_out);
 
 /* Handle a single CLI command line (extracted for testability).
    Returns 1 if command was recognized, 0 otherwise. */
@@ -776,14 +804,186 @@ int lsp_rotation_partial_may_start(const lsp_channel_mgr_t *mgr);
    still owed and the replacement is funded.  Returns 1 if a request was sent. */
 int lsp_rotation_part_on_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c);
 
+/* Every few blocks: ask the connected clients that still owe a release
+   again (a client asked before it could release, e.g. before it switched,
+   refuses; it is asked again later).  Returns how many were asked. */
+size_t lsp_rotation_part_reask(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
 /* MSG_ROTATION_RELEASE from client C: check the key against the old factory
    and store it sealed.  Returns 1 if it was taken. */
+/* The settlement of mover C's old channel, part of its release: on its
+   MSG_ROTATION_SETTLE_REQ the LSP loads that channel (kept under its retired
+   id) and answers MSG_ROTATION_SETTLE, one final update moving the balance
+   the client carried into the replacement to the LSP; on its
+   MSG_ROTATION_SETTLE_ACK it checks the revocation of the client's latest old
+   commitment, keeps it, watches that commitment (a later broadcast is
+   penalised, after a restart too) and records the settled state.  A release
+   counts only once settled.  Return 1 on success. */
+int lsp_rotation_part_on_settle_req(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                    const cJSON *json);
+int lsp_rotation_part_on_settle_ack(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                    const cJSON *json);
+
+/* Mover C's old channel (LSP side) from its retired rows, at its latest
+   state; the caller runs channel_cleanup.  It loads channel secrets, so it
+   is in the secrets library; the daemon registers it with
+   lsp_rotation_set_old_channel_loader (without it no settlement is made). */
+int lsp_rotation_part_load_old_channel(lsp_channel_mgr_t *mgr, size_t c, channel_t *ch);
+void lsp_rotation_set_old_channel_loader(int (*fn)(lsp_channel_mgr_t *, size_t, channel_t *));
+/* Mover C's old channel id (its retired rows) and its part_releases row. */
+uint32_t lsp_rotation_part_old_channel_id(const lsp_channel_mgr_t *mgr, size_t c);
+int lsp_rotation_part_release_row(lsp_channel_mgr_t *mgr, size_t c,
+                                  persist_part_release_t *out);
+
+/* The settlement offer over CH (LSP view, at the client's latest
+   commitment): moves min(client balance, CARRIED) to the LSP, advances the
+   commitment number, and signs the client's new commitment with a fresh
+   nonce against CLIENT_NONCE66.  With ALREADY the state is the settled one
+   and is signed again as it is.  Returns 1 with OUT filled (old_txid left to
+   the caller). */
+int lsp_rotation_settle_offer(channel_t *ch, uint64_t carried, int already,
+                              const unsigned char client_nonce66[66],
+                              wire_rotation_settle_t *out);
+
 int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
                                  const cJSON *json);
+
+/* After a restart, the partial rotation of the live factory (LIVE_TXID32,
+   internal order).  One that stopped before its replacement was recorded is
+   dropped: that funding was never broadcast, and its wallet inputs are
+   unlocked (RT).  One whose replacement is the live factory resumes from its
+   marker (the daemon rebroadcasts a recorded funding that is not on the
+   network), and the releases still owed are asked for again when those
+   clients reconnect.  Returns 1 if anything was loaded or dropped. */
+int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                           const unsigned char *live_txid32, uint32_t live_vout);
+
+/* Winding down the old factory of a partial rotation.
+
+   Every client of it released (no client stayed): the LSP closes it alone,
+   to its own wallet, with its key and the released keys (those balances
+   are paid in the replacement).  The close is recorded before it is
+   broadcast and rebroadcast until it confirms; once it is buried the
+   released keys are deleted.  Some clients stayed: no such close exists; the
+   old factory ends through their exits or its distribution TX, and the
+   released keys are deleted at its CLTV plus a margin. */
+typedef enum {
+    LSP_WD_NONE = 0,
+    LSP_WD_CLOSE,           /* build, record and broadcast the close */
+    LSP_WD_WAIT,            /* the recorded close: rebroadcast or wait */
+    LSP_WD_SWEEP,           /* the dist TX is on chain: sweep released-key outputs */
+    LSP_WD_DELETE           /* resolved: delete the released keys */
+} lsp_wd_action_t;
+
+/* Depth of the LSP's own close before the keys go (6 plus a margin of 100
+   off regtest), and the margin after the old CLTV. */
+#define LSP_WD_CLOSE_DEPTH(regtest) ((regtest) ? 6 : 106)
+#define LSP_WD_CLTV_MARGIN(regtest) ((regtest) ? 6 : 100)
+
+/* The next wind-down step for an old factory, from what the chain shows.
+   close_confs: the LSP's own close confirmations (-1 none).  funding_spent: the
+   old funding is spent.  dist_present / dist_buried: its distribution TX is in
+   the mempool-or-chain / buried.  n_released_unresolved: released-key outputs
+   (dist payouts) still unspent.  n_leaf_unspent: moved clients' channel
+   outputs in the old tree (MuSig of a released key and the LSP) on chain and
+   unspent; n_leaf_pending: such outputs spent (or in the mempool) but not yet
+   buried.  past_cltv_margin: height is past the old CLTV plus the margin.
+   Keys are deleted only when nothing a released key guards is unspent: the
+   LSP's own close is buried, OR the dist TX is buried and every released-key
+   output is spent, OR (the funding spent by the tree, so no dist output can
+   appear) past the CLTV plus the margin with every such tree output that
+   reached the chain swept or spent and buried. */
+lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
+                                             uint32_t n_released, int close_confs,
+                                             int close_in_mempool,
+                                             int funding_spent, int dist_present,
+                                             int dist_buried, uint32_t n_released_unresolved,
+                                             uint32_t n_leaf_unspent, uint32_t n_leaf_pending,
+                                             int past_cltv_margin, int regtest);
+
+/* A key-path sweep of a moved client's channel output in the old tree (REL's
+   leaf: MuSig of its released key KEY32 and the LSP's key, tweaked with the
+   leaf's merkle root) to OUT_SPK.  Refuses unless the two keys control that
+   output.  Returns 1 with the signed TX and its display txid. */
+int lsp_rotation_leaf_sweep_build(const secp256k1_context *ctx,
+                                  const unsigned char *lsp_seckey32,
+                                  const unsigned char *key32,
+                                  const persist_part_release_t *rel,
+                                  const unsigned char *out_spk, size_t out_spk_len,
+                                  uint64_t fee, tx_buf_t *signed_out, char txid_out[65]);
+
+/* The virtual size the fee of a sweep of a moved client's old-tree channel
+   output is paid for: by the key path, or (CLTV_PATH) through the leaf's
+   CLTV script leaf.  At least the real size of either sweep. */
+size_t lsp_rotation_leaf_sweep_vsize(int cltv_path);
+
+/* The same output, once the released keys are gone: the LSP alone through
+   the leaf's CLTV script leaf (<cltv> OP_CLTV OP_DROP <LSP> OP_CHECKSIG; the
+   CLTV is the leaf's or the factory's, FACTORY_CLTV), nLockTime at that
+   CLTV.  REL->old_pk is the client's (released) key, for the internal key.
+   Refuses unless that script leaf and internal key give the output key. */
+int lsp_rotation_leaf_timeout_sweep_build(const secp256k1_context *ctx,
+                                          const unsigned char *lsp_seckey32,
+                                          const persist_part_release_t *rel,
+                                          uint32_t factory_cltv,
+                                          const unsigned char *out_spk, size_t out_spk_len,
+                                          uint64_t fee, tx_buf_t *signed_out,
+                                          char txid_out[65]);
+
+/* A key-path P2TR sweep of SRC (a distribution-TX output paying P2TR of the
+   taproot-tweaked released key KEY32) to OUT_SPK.  Signs with the tweaked
+   key.  Returns 1 with the signed TX and its display txid; refuses if KEY32
+   does not control SRC_SPK. */
+int lsp_rotation_sweep_build(const secp256k1_context *ctx, const unsigned char *key32,
+                             const unsigned char *src_txid32, uint32_t src_vout,
+                             uint64_t src_amount, const unsigned char *src_spk34,
+                             const unsigned char *out_spk, size_t out_spk_len,
+                             uint64_t fee, tx_buf_t *signed_out, char txid_out[65]);
+
+/* The LSP's key-path close of the retired factory R, signed with its own
+   key and every client's released key (KEYS, by participant index from 1;
+   each must be that participant's).  One output, OUT.  Returns 1 with the
+   signed TX and its txid (display hex). */
+int lsp_rotation_winddown_build(const secp256k1_context *ctx,
+                                const unsigned char *lsp_seckey32,
+                                const persist_part_rotation_t *r,
+                                const unsigned char (*keys)[32], const tx_output_t *out,
+                                uint32_t locktime, tx_buf_t *signed_out, char txid_out[65]);
+
+/* One step for every open partial rotation (at most once per block unless
+   FORCE).  Returns 1 if anything was done. */
+int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force);
+
+/* 1 while client C of the live factory is a mover of a partial rotation that
+   has not released its old factory key (it still holds an unrevoked old
+   commitment): an HTLC it offers is refused until it settles and releases;
+   HTLCs to it are not affected. */
+int lsp_rotation_part_holds_outbound(const lsp_channel_mgr_t *mgr, const lsp_t *lsp, size_t c);
+
+/* 1 if ID is a mover that has not released its old factory key in a partial
+   rotation still open (in memory or in the DB): it is held, and it does not
+   move on in a later rotation. */
+int lsp_rotation_part_unreleased_mover(const lsp_channel_mgr_t *mgr,
+                                       const secp256k1_pubkey *id);
+
+/* The exposure to mover C of the live factory if it never releases: the
+   larger of its old channel's value and its output in the factory's
+   distribution TX (its amount plus its share of the surplus). */
+uint64_t lsp_rotation_part_exposure(const lsp_channel_mgr_t *mgr, const lsp_t *lsp, size_t c);
+/* The exposure already open: every unreleased mover of every partial
+   rotation not yet resolved (carried amount or distribution-TX output,
+   whichever is larger). */
+uint64_t lsp_rotation_part_open_exposure(const lsp_channel_mgr_t *mgr);
 
 /* 1 if PK is the identity of a client that stayed in a factory retired by a
    partial rotation. */
 int lsp_rotation_part_is_retired(const lsp_channel_mgr_t *mgr, const secp256k1_pubkey *pk);
+
+/* The bound on exposure from movers that sign but never release (operator
+   guide): a per-mover cap, a total cap over unreleased movers, and a release
+   deadline in blocks after safe depth (0 disables a cap). */
+void lsp_rotation_set_exposure_caps(uint64_t client_cap, uint64_t total_cap,
+                                    uint32_t deadline_blocks);
 
 /* Where a retired factory's rows are kept (see persist_retire_channel_rows). */
 #define LSP_RETIRED_FACTORY_ID(dying_id) (0x10000u + ((dying_id) & 0xffffu))

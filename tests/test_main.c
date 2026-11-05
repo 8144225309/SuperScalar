@@ -1185,6 +1185,28 @@ extern int test_part_seal_rows(void);
 extern int test_part_release_leak(void);
 extern int test_part_retired_restart(void);
 extern int test_inline_turnover_refused(void);
+extern int test_cin_all_open_rows(void);
+extern int test_part_record_rows(void);
+extern int test_part_release_slot(void);
+extern int test_part_load_restart(void);
+extern int test_part_winddown_action(void);
+extern int test_part_winddown_close(void);
+extern int test_part_winddown_tick(void);
+extern int test_part_reask(void);
+extern int test_part_deadline_persist(void);
+extern int test_part_exposure_bound(void);
+extern int test_cli_feed_overlong(void);
+extern int test_part_signed_abandon(void);
+extern int test_part_pending_with_balance(void);
+extern int test_part_switch_due(void);
+extern int test_part_sweep_build(void);
+extern int test_part_settle_client(void);
+extern int test_part_settle_watch(void);
+extern int test_part_hold_outbound(void);
+extern int test_part_pending_cs_cleared(void);
+extern int test_part_leaf_sweep_build(void);
+extern int test_part_freeze(void);
+extern int test_part_settle_queues(void);
 extern int test_cin_records(void);
 extern int test_cin_tree_bind_record(void);
 extern int test_cin_json_strict(void);
@@ -3231,6 +3253,28 @@ static void run_unit_tests(void) {
     RUN_TEST(test_part_release_leak);
     RUN_TEST(test_part_retired_restart);
     RUN_TEST(test_inline_turnover_refused);
+    RUN_TEST(test_cin_all_open_rows);
+    RUN_TEST(test_part_record_rows);
+    RUN_TEST(test_part_release_slot);
+    RUN_TEST(test_part_load_restart);
+    RUN_TEST(test_part_winddown_action);
+    RUN_TEST(test_part_winddown_close);
+    RUN_TEST(test_part_winddown_tick);
+    RUN_TEST(test_part_reask);
+    RUN_TEST(test_part_deadline_persist);
+    RUN_TEST(test_part_exposure_bound);
+    RUN_TEST(test_cli_feed_overlong);
+    RUN_TEST(test_part_signed_abandon);
+    RUN_TEST(test_part_pending_with_balance);
+    RUN_TEST(test_part_switch_due);
+    RUN_TEST(test_part_sweep_build);
+    RUN_TEST(test_part_settle_client);
+    RUN_TEST(test_part_settle_watch);
+    RUN_TEST(test_part_hold_outbound);
+    RUN_TEST(test_part_pending_cs_cleared);
+    RUN_TEST(test_part_leaf_sweep_build);
+    RUN_TEST(test_part_freeze);
+    RUN_TEST(test_part_settle_queues);
     RUN_TEST(test_cin_records);
     RUN_TEST(test_cin_tree_bind_record);
     RUN_TEST(test_cin_json_strict);
@@ -4219,8 +4263,11 @@ static void run_regtest_tests(void) {
     regtest_faucet_health_report();
 }
 
+extern void test_rotation_register_loaders(void);
+
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
+    test_rotation_register_loaders();
 
     if (argc < 2)
         run_unit = 1;

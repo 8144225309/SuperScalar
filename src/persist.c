@@ -102,6 +102,62 @@ static const char *SCHEMA_VERSION_SQL =
     "  close_txid TEXT PRIMARY KEY,"                         \
     "  tree_digest TEXT NOT NULL,"                           \
     "  created_at INTEGER"                                   \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS client_part_watch ("         \
+    "  old_txid TEXT PRIMARY KEY,"                           \
+    "  signed_height INTEGER NOT NULL,"                      \
+    "  confirmed_height INTEGER NOT NULL DEFAULT 0"          \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS part_resolved ("             \
+    "  old_txid TEXT PRIMARY KEY,"                           \
+    "  spent_height INTEGER NOT NULL"                        \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS part_deadlines ("            \
+    "  old_txid TEXT PRIMARY KEY,"                           \
+    "  funded_height INTEGER NOT NULL"                       \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS part_excluded ("             \
+    "  identity TEXT PRIMARY KEY,"                           \
+    "  old_txid TEXT,"                                       \
+    "  excluded_at INTEGER"                                  \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS part_rotations ("            \
+    "  old_txid TEXT PRIMARY KEY,"                           \
+    "  old_vout INTEGER NOT NULL,"                           \
+    "  retired_id INTEGER NOT NULL,"                         \
+    "  new_txid TEXT NOT NULL,"                              \
+    "  new_vout INTEGER NOT NULL,"                           \
+    "  digest TEXT NOT NULL,"                                \
+    "  n_old INTEGER NOT NULL,"                              \
+    "  m INTEGER NOT NULL,"                                  \
+    "  old_amount INTEGER NOT NULL,"                         \
+    "  old_cltv INTEGER NOT NULL,"                           \
+    "  old_pubkeys TEXT NOT NULL,"                           \
+    "  state TEXT NOT NULL,"                                 \
+    "  close_txid TEXT,"                                     \
+    "  close_hex TEXT,"                                      \
+    "  dist_hex TEXT,"                                       \
+    "  updated_at INTEGER"                                   \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS part_releases ("             \
+    "  old_txid TEXT NOT NULL,"                              \
+    "  j INTEGER NOT NULL,"                                  \
+    "  old_slot INTEGER NOT NULL,"                           \
+    "  old_pk TEXT NOT NULL,"                                \
+    "  new_pk TEXT NOT NULL,"                                \
+    "  carried INTEGER NOT NULL,"                            \
+    "  released INTEGER NOT NULL DEFAULT 0,"                 \
+    "  settled INTEGER NOT NULL DEFAULT 0,"                  \
+    "  leaf_txid TEXT,"                                      \
+    "  leaf_vout INTEGER,"                                   \
+    "  leaf_amount INTEGER,"                                 \
+    "  leaf_spk TEXT,"                                       \
+    "  leaf_merkle TEXT,"                                    \
+    "  leaf_cltv INTEGER,"                                   \
+    "  identity TEXT,"                                       \
+    "  sweep_txid TEXT,"                                     \
+    "  spent_height INTEGER,"                                \
+    "  PRIMARY KEY (old_txid, j)"                            \
     ");"
 
 static int persist_v44_column_exists(sqlite3 *db, const char *table,
@@ -1518,6 +1574,26 @@ int persist_open(persist_t *p, const char *path) {
         if (ok44 && !persist_v44_column_exists(p->db, "client_rotations", "old_pubkey"))
             ok44 = sqlite3_exec(p->db,
                 "ALTER TABLE client_rotations ADD COLUMN old_pubkey TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "part_rotations", "dist_hex"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE part_rotations ADD COLUMN dist_hex TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "part_releases", "identity"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE part_releases ADD COLUMN identity TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "part_releases", "settled"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE part_releases ADD COLUMN settled INTEGER NOT NULL DEFAULT 0;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_txid TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_vout INTEGER;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_amount INTEGER;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_spk TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_merkle TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_cltv INTEGER;"
+                "ALTER TABLE part_releases ADD COLUMN sweep_txid TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN spent_height INTEGER;",
                 NULL, NULL, &merr44) == SQLITE_OK;
         if (!ok44) {
             fprintf(stderr, "persist_open: migration v44 failed: %s\n",
@@ -8029,6 +8105,23 @@ int persist_client_rotation_load(persist_t *p, const char *old_txid_hex,
     return ret;
 }
 
+size_t persist_client_rotation_load_all_open(persist_t *p, persist_client_rotation_t *rows,
+                                             size_t max) {
+    if (!p || !p->db || !rows || max == 0) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT old_funding_txid, old_vout, key_index, close_txid, state, side_db, "
+            "close_hex, close_height, old_key_index, carried, old_pubkey FROM client_rotations "
+            "WHERE state NOT IN ('done', 'abandoned') ORDER BY updated_at DESC;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    size_t n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW)
+        if (client_rotation_row(st, &rows[n]) == 1) n++;
+    sqlite3_finalize(st);
+    return n;
+}
+
 int persist_client_rotation_load_open(persist_t *p, persist_client_rotation_t *r) {
     if (!p || !p->db || !r) return -1;
     sqlite3_stmt *st;
@@ -8176,6 +8269,425 @@ int persist_save_retired_channel(persist_t *p, uint32_t channel_id, uint32_t fac
     int ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     return ok;
+}
+
+/* ---- part_rotations / part_releases (LSP) ---- */
+
+int persist_save_part_rotation(persist_t *p, const persist_part_rotation_t *r) {
+    if (!p || !p->db || !r || !r->old_txid[0] || !r->state[0] ||
+        (size_t)r->n_old + 1 > FACTORY_MAX_SIGNERS)
+        return 0;
+    size_t npk = (size_t)r->n_old + 1;
+    char *pks = malloc(npk * 66 + 1);
+    if (!pks) return 0;
+    for (size_t i = 0; i < npk; i++) hex_encode(r->old_pks[i], 33, pks + i * 66);
+    pks[npk * 66] = '\0';
+    char dg[65];
+    hex_encode(r->digest, 32, dg);
+    sqlite3_stmt *st;
+    int ok = sqlite3_prepare_v2(p->db,
+        "INSERT OR REPLACE INTO part_rotations (old_txid, old_vout, retired_id, new_txid, "
+        "new_vout, digest, n_old, m, old_amount, old_cltv, old_pubkeys, state, close_txid, "
+        "close_hex, dist_hex, updated_at) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'));",
+        -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(st, 1, r->old_txid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, r->old_vout);
+        sqlite3_bind_int64(st, 3, r->retired_id);
+        sqlite3_bind_text(st, 4, r->new_txid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, r->new_vout);
+        sqlite3_bind_text(st, 6, dg, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 7, r->n_old);
+        sqlite3_bind_int64(st, 8, r->m);
+        sqlite3_bind_int64(st, 9, (sqlite3_int64)r->old_amount);
+        sqlite3_bind_int64(st, 10, r->old_cltv);
+        sqlite3_bind_text(st, 11, pks, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 12, r->state, -1, SQLITE_TRANSIENT);
+        if (r->close_txid[0]) sqlite3_bind_text(st, 13, r->close_txid, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(st, 13);
+        if (r->close_hex) sqlite3_bind_text(st, 14, r->close_hex, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(st, 14);
+        if (r->dist_hex) sqlite3_bind_text(st, 15, r->dist_hex, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(st, 15);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    free(pks);
+    return ok;
+}
+
+size_t persist_load_part_rotations(persist_t *p, persist_part_rotation_t *rows, size_t max,
+                                   int open_only) {
+    if (!p || !p->db || !rows || max == 0) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, open_only
+            ? "SELECT old_txid, old_vout, retired_id, new_txid, new_vout, digest, n_old, m, "
+              "old_amount, old_cltv, old_pubkeys, state, close_txid, close_hex, dist_hex FROM "
+              "part_rotations WHERE state != 'done' ORDER BY retired_id;"
+            : "SELECT old_txid, old_vout, retired_id, new_txid, new_vout, digest, n_old, m, "
+              "old_amount, old_cltv, old_pubkeys, state, close_txid, close_hex, dist_hex FROM "
+              "part_rotations ORDER BY retired_id;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    size_t n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        persist_part_rotation_t *r = &rows[n];
+        memset(r, 0, sizeof(*r));
+        const char *o = (const char *)sqlite3_column_text(st, 0);
+        const char *nt = (const char *)sqlite3_column_text(st, 3);
+        const char *dg = (const char *)sqlite3_column_text(st, 5);
+        const char *pk = (const char *)sqlite3_column_text(st, 10);
+        const char *s = (const char *)sqlite3_column_text(st, 11);
+        const char *ct = (const char *)sqlite3_column_text(st, 12);
+        const char *ch = (const char *)sqlite3_column_text(st, 13);
+        const char *dh = (const char *)sqlite3_column_text(st, 14);
+        r->n_old = (uint32_t)sqlite3_column_int64(st, 6);
+        size_t npk = (size_t)r->n_old + 1;
+        if (!o || !nt || !dg || !pk || !s || npk > FACTORY_MAX_SIGNERS ||
+            strlen(pk) != npk * 66 || hex_decode(dg, r->digest, 32) != 32) {
+            fprintf(stderr, "persist: skipping a malformed part_rotations row (old_txid %s) "
+                    "-- its released keys will not be deleted automatically\n",
+                    o ? o : "?");
+            continue;
+        }
+        int bad = 0;
+        for (size_t i = 0; i < npk && !bad; i++) {
+            char h[67];
+            memcpy(h, pk + i * 66, 66);
+            h[66] = '\0';
+            bad = hex_decode(h, r->old_pks[i], 33) != 33;
+        }
+        if (bad) {
+            fprintf(stderr, "persist: skipping a part_rotations row with a bad pubkey "
+                    "(old_txid %s)\n", o);
+            continue;
+        }
+        snprintf(r->old_txid, sizeof(r->old_txid), "%s", o);
+        r->old_vout = (uint32_t)sqlite3_column_int64(st, 1);
+        r->retired_id = (uint32_t)sqlite3_column_int64(st, 2);
+        snprintf(r->new_txid, sizeof(r->new_txid), "%s", nt);
+        r->new_vout = (uint32_t)sqlite3_column_int64(st, 4);
+        r->m = (uint32_t)sqlite3_column_int64(st, 7);
+        r->old_amount = (uint64_t)sqlite3_column_int64(st, 8);
+        r->old_cltv = (uint32_t)sqlite3_column_int64(st, 9);
+        snprintf(r->state, sizeof(r->state), "%s", s);
+        if (ct) snprintf(r->close_txid, sizeof(r->close_txid), "%s", ct);
+        if (ch) r->close_hex = strdup(ch);
+        if (dh) r->dist_hex = strdup(dh);
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int persist_save_part_release(persist_t *p, const char *old_txid,
+                              const persist_part_release_t *r) {
+    if (!p || !p->db || !old_txid || !r) return 0;
+    char op[67], np[67];
+    hex_encode(r->old_pk, 33, op);
+    hex_encode(r->new_pk, 33, np);
+    char spk[69], mr[65];
+    hex_encode(r->leaf_spk, 34, spk);
+    hex_encode(r->leaf_merkle, 32, mr);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "INSERT OR REPLACE INTO part_releases (old_txid, j, "
+                           "old_slot, old_pk, new_pk, carried, released, settled, leaf_txid, "
+                           "leaf_vout, leaf_amount, leaf_spk, leaf_merkle, leaf_cltv, "
+                           "sweep_txid, spent_height, identity) VALUES "
+                           "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    char idh[67];
+    if (r->has_identity) hex_encode(r->identity, 33, idh);
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, r->j);
+    sqlite3_bind_int64(st, 3, r->old_slot);
+    sqlite3_bind_text(st, 4, op, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, np, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)r->carried);
+    sqlite3_bind_int(st, 7, r->released ? 1 : 0);
+    sqlite3_bind_int(st, 8, r->settled ? 1 : 0);
+    if (r->leaf_txid[0]) {
+        sqlite3_bind_text(st, 9, r->leaf_txid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 10, r->leaf_vout);
+        sqlite3_bind_int64(st, 11, (sqlite3_int64)r->leaf_amount);
+        sqlite3_bind_text(st, 12, spk, -1, SQLITE_TRANSIENT);
+        if (r->has_leaf_merkle) sqlite3_bind_text(st, 13, mr, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(st, 13);
+        sqlite3_bind_int64(st, 14, r->leaf_cltv);
+    } else {
+        for (int k = 9; k <= 14; k++) sqlite3_bind_null(st, k);
+    }
+    if (r->sweep_txid[0]) sqlite3_bind_text(st, 15, r->sweep_txid, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 15);
+    sqlite3_bind_int64(st, 16, r->spent_height);
+    if (r->has_identity) sqlite3_bind_text(st, 17, idh, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 17);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+size_t persist_load_part_releases(persist_t *p, const char *old_txid,
+                                  persist_part_release_t *rows, size_t max) {
+    if (!p || !p->db || !old_txid || !rows || max == 0) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT j, old_slot, old_pk, new_pk, carried, released, "
+                           "settled, leaf_txid, leaf_vout, leaf_amount, leaf_spk, leaf_merkle, "
+                           "leaf_cltv, sweep_txid, spent_height, identity "
+                           "FROM part_releases WHERE old_txid = ? ORDER BY j;", -1, &st,
+                           NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    size_t n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        persist_part_release_t *r = &rows[n];
+        memset(r, 0, sizeof(*r));
+        const char *op = (const char *)sqlite3_column_text(st, 2);
+        const char *np = (const char *)sqlite3_column_text(st, 3);
+        if (!op || !np || hex_decode(op, r->old_pk, 33) != 33 ||
+            hex_decode(np, r->new_pk, 33) != 33)
+            continue;
+        r->j = (uint32_t)sqlite3_column_int64(st, 0);
+        r->old_slot = (uint32_t)sqlite3_column_int64(st, 1);
+        r->carried = (uint64_t)sqlite3_column_int64(st, 4);
+        r->released = sqlite3_column_int(st, 5) ? 1 : 0;
+        r->settled = sqlite3_column_int(st, 6) ? 1 : 0;
+        const char *lt = (const char *)sqlite3_column_text(st, 7);
+        const char *ls = (const char *)sqlite3_column_text(st, 10);
+        const char *lm = (const char *)sqlite3_column_text(st, 11);
+        const char *sw = (const char *)sqlite3_column_text(st, 13);
+        if (lt && strlen(lt) == 64 && ls && hex_decode(ls, r->leaf_spk, 34) == 34) {
+            snprintf(r->leaf_txid, sizeof(r->leaf_txid), "%s", lt);
+            r->leaf_vout = (uint32_t)sqlite3_column_int64(st, 8);
+            r->leaf_amount = (uint64_t)sqlite3_column_int64(st, 9);
+            r->has_leaf_merkle = lm && hex_decode(lm, r->leaf_merkle, 32) == 32;
+            r->leaf_cltv = (uint32_t)sqlite3_column_int64(st, 12);
+        }
+        if (sw && strlen(sw) == 64) snprintf(r->sweep_txid, sizeof(r->sweep_txid), "%s", sw);
+        r->spent_height = (uint32_t)sqlite3_column_int64(st, 14);
+        const char *idh = (const char *)sqlite3_column_text(st, 15);
+        r->has_identity = idh && hex_decode(idh, r->identity, 33) == 33;
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int persist_set_part_released(persist_t *p, const char *old_txid, uint32_t j) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "UPDATE part_releases SET released = 1 WHERE "
+                           "old_txid = ? AND j = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, j);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_set_part_settled(persist_t *p, const char *old_txid, uint32_t j) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "UPDATE part_releases SET settled = 1 WHERE "
+                           "old_txid = ? AND j = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, j);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_set_part_leaf_state(persist_t *p, const char *old_txid, uint32_t j,
+                                const char *sweep_txid, uint32_t spent_height) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "UPDATE part_releases SET sweep_txid = ?, spent_height = ? "
+                           "WHERE old_txid = ? AND j = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    if (sweep_txid && sweep_txid[0]) sqlite3_bind_text(st, 1, sweep_txid, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 1);
+    sqlite3_bind_int64(st, 2, spent_height);
+    sqlite3_bind_text(st, 3, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, j);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_save_part_funded_height(persist_t *p, const char *old_txid, uint32_t height) {
+    if (!p || !p->db || !old_txid || !height) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "INSERT OR IGNORE INTO part_deadlines (old_txid, "
+                           "funded_height) VALUES (?, ?);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, height);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+uint32_t persist_load_part_funded_height(persist_t *p, const char *old_txid) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT funded_height FROM part_deadlines WHERE old_txid = ?;",
+                           -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    uint32_t h = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) h = (uint32_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return h;
+}
+
+int persist_save_part_excluded(persist_t *p, const unsigned char identity33[33],
+                               const char *old_txid) {
+    if (!p || !p->db || !identity33) return 0;
+    char id[67];
+    hex_encode(identity33, 33, id);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "INSERT OR IGNORE INTO part_excluded (identity, old_txid, "
+                           "excluded_at) VALUES (?, ?, strftime('%s','now'));", -1, &st,
+                           NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    if (old_txid) sqlite3_bind_text(st, 2, old_txid, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 2);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_set_part_resolved(persist_t *p, const char *old_txid, uint32_t spent_height) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    const char *sql = spent_height
+        ? "INSERT OR IGNORE INTO part_resolved (old_txid, spent_height) VALUES (?, ?);"
+        : "DELETE FROM part_resolved WHERE old_txid = ?;";
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    if (spent_height) sqlite3_bind_int64(st, 2, spent_height);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_part_unreleased_identity(persist_t *p, const unsigned char identity33[33],
+                                     uint32_t tip, uint32_t depth) {
+    if (!p || !p->db || !identity33) return 0;
+    char id[67];
+    hex_encode(identity33, 33, id);
+    sqlite3_stmt *st;
+    /* Not once its old factory is resolved: the old funding spent and that
+       spend buried (whatever the row's state). */
+    if (sqlite3_prepare_v2(p->db, "SELECT 1 FROM part_releases r JOIN part_rotations o ON "
+                           "o.old_txid = r.old_txid LEFT JOIN part_resolved s ON "
+                           "s.old_txid = r.old_txid WHERE o.state != 'done' AND "
+                           "r.released = 0 AND r.identity = ? AND (s.spent_height IS NULL "
+                           "OR ? < s.spent_height + ?);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, tip);
+    sqlite3_bind_int64(st, 3, depth);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
+int persist_client_part_watch_load(persist_t *p, const char *old_txid,
+                                   uint32_t *signed_height, uint32_t *confirmed_height) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT signed_height, confirmed_height FROM "
+                           "client_part_watch WHERE old_txid = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    if (found) {
+        if (signed_height) *signed_height = (uint32_t)sqlite3_column_int64(st, 0);
+        if (confirmed_height) *confirmed_height = (uint32_t)sqlite3_column_int64(st, 1);
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+int persist_client_part_watch_save(persist_t *p, const char *old_txid,
+                                   uint32_t signed_height, uint32_t confirmed_height) {
+    if (!p || !p->db || !old_txid || !signed_height) return 0;
+    sqlite3_stmt *st;
+    /* The first signed height stays; a confirmation, once seen, stays. */
+    if (sqlite3_prepare_v2(p->db, "INSERT OR IGNORE INTO client_part_watch (old_txid, "
+                           "signed_height, confirmed_height) VALUES (?, ?, 0);", -1, &st,
+                           NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, signed_height);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    if (ok && confirmed_height) {
+        if (sqlite3_prepare_v2(p->db, "UPDATE client_part_watch SET confirmed_height = ? "
+                               "WHERE old_txid = ? AND confirmed_height = 0;", -1, &st,
+                               NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_int64(st, 1, confirmed_height);
+        sqlite3_bind_text(st, 2, old_txid, -1, SQLITE_TRANSIENT);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    return ok;
+}
+
+int persist_part_is_excluded(persist_t *p, const unsigned char identity33[33]) {
+    if (!p || !p->db || !identity33) return 0;
+    char id[67];
+    hex_encode(identity33, 33, id);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT 1 FROM part_excluded WHERE identity = ?;", -1, &st,
+                           NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
+int persist_delete_departed_clients(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return 0;
+    /* Overwrite the freed pages too (the rows are sealed; this keeps the
+       blobs out of the file once deleted). */
+    sqlite3_exec(p->db, "PRAGMA secure_delete = ON;", NULL, NULL, NULL);
+    sqlite3_stmt *st;
+    int ok = sqlite3_prepare_v2(p->db, "DELETE FROM departed_clients WHERE factory_id = ?;",
+                                -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_int64(st, 1, factory_id);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(p->db, "PRAGMA secure_delete = OFF;", NULL, NULL, NULL);
+    /* Flush the deleted (sealed) pages out of the WAL too, so a copy of the
+       file taken after this does not still carry them. */
+    if (ok) sqlite3_exec(p->db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
+    return ok;
+}
+
+uint32_t persist_next_retired_index(persist_t *p) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT MAX(m) FROM (SELECT MAX(id) AS m FROM factories WHERE id >= 65536 AND "
+            "id < 131072 UNION ALL SELECT MAX(retired_id) FROM part_rotations UNION ALL "
+            "SELECT MAX(factory_id) FROM retired_channels);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    uint32_t next = 0;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) {
+        sqlite3_int64 m = sqlite3_column_int64(st, 0);
+        if (m >= 65536 && m < 131071) next = (uint32_t)(m - 65536 + 1);
+    }
+    sqlite3_finalize(st);
+    return next;
 }
 
 size_t persist_load_retired_channels(persist_t *p, uint32_t *channel_ids,

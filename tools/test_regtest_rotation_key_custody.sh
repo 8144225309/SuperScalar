@@ -19,12 +19,15 @@
 #   PAY_AFTER    a payment over the replacement factory succeeds, and no client
 #                rejects the LSP's revocation for it.
 #   KEYS_AT_REST the LSP's database holds no client secret key in the clear,
-#                and none at all once the old factory is closed on chain (a
-#                partial rotation keeps the released keys, sealed, while the
-#                old factory still holds the clients that did not move).  The
-#                seal key is derived from the LSP's own secret on the same
-#                host: it protects against leaks of the database alone (a
-#                backup), not of the host.
+#                and none at all once the old factory is resolved (a partial
+#                rotation keeps the released keys, sealed, until then; the
+#                drill mines until the LSP must have deleted them and checks
+#                that it did).  The seal key is derived from the LSP's own
+#                secret on the same host: it protects against leaks of the
+#                database alone (a backup), not of the host.
+#   KEY_ROWS     every client that moved has exactly one active factory key
+#                row, the replacement's; its old factory key row is retired
+#                (or released).
 #   IDENTITY     no client key the LSP holds is a client's identity (--seckey)
 #                key: a client signs each factory with its own derived key.
 #   PAYOUT_KEYS  --export-factory-keys gives descriptors Bitcoin Core accepts,
@@ -48,6 +51,33 @@
 #                rotation, is told that factory is retired, and exits it: its
 #                old tree's root, broadcast from its own DB, confirms; the
 #                LSP's database still holds that factory's tree and channels.
+#   SETTLE       every client that released its key first settled its old
+#                channel: its carried balance moved to the LSP and its latest
+#                old commitment revoked (LSP and client logs agree).
+#   DOUBLE_CLAIM after the stayer pushed the old tree, a moved client acts
+#                maliciously: client 1 pushes its old tree path (from its old
+#                DB, kept as .pre-rotation) and, in one block, its latest
+#                commitment before the settlement, from a copy of its DB taken
+#                before the rotation (its old DB itself now holds the settled
+#                state); client 2 pushes its old leaf only.  That commitment
+#                must be the one the LSP watched (same number and txid), and
+#                the LSP must win both: its penalty takes client 1's to_local,
+#                and it sweeps client 2's old channel output with the released
+#                key.
+#   SETTLED_STATE client 3 (channel index 2) force-closes its old channel from
+#                its old DB, with the commitment the client's force-close reads
+#                (channel 0 of that DB): it is the settled one (the LSP's
+#                record has the same commitment number); it confirms, pays the
+#                client nothing and the whole channel balance to the LSP's
+#                side, and is not a breach.
+#
+# MODE=winddown takes the partial path with every client online
+# (SS_TEST_ROTATE_PARTIAL, regtest only): every client moves and releases,
+# and adds REPLACEMENT, STRANDED and:
+#   WIND_DOWN    once every client released, the LSP closes the old factory
+#                alone, to its own wallet, recorded before broadcast, and only
+#                after the last release; the close confirms; the released
+#                keys are then deleted (KEYS_AT_REST).
 #
 # PASS (exit 0) only if every check is SAFE.  Exit 1 if any check is UNSAFE
 # or (MODE=full) the rotation did not complete; exit 2 = setup failure.
@@ -59,7 +89,11 @@ set -uo pipefail
 REPO="${REPO:-/root/SuperScalar}"
 cd "$REPO" || exit 2
 
-MODE="${MODE:-full}"               # full | partial (client 4 offline at DYING)
+MODE="${MODE:-full}"               # full | partial (client 4 offline at DYING) | winddown
+# DIST_SWEEP=1 (with MODE=partial): the stayer does NOT force-close, so the old
+# factory is still unresolved at its CLTV; the LSP then publishes its recorded
+# distribution TX and sweeps every moved client's released-key output, and the
+# on-chain sweep is exercised end to end.
 ARITY="${ARITY:-1}"                # factory shape passed to --arity
 PORT="${PORT:-9975}"
 TMP="/tmp/rot_keys_${MODE}_$PORT"
@@ -108,7 +142,9 @@ LSP_ARGS=(--network regtest --port $PORT --daemon --cli --active-blocks 12 --dyi
   --lsp-balance-pct 50 --clients 4 --arity "$ARITY" --amount $AMOUNT --fee-rate 1100
   --confirm-timeout 86400 --seckey $LSP_SECKEY
   --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" --wallet "$WALLET" --db "$DB")
-stdbuf -oL "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" < "$TMP/cli" > "$L" 2>&1 &
+LSP_ENV=()
+[ "$MODE" = winddown ] && LSP_ENV=(SS_TEST_ROTATE_PARTIAL=1)
+env "${LSP_ENV[@]}" stdbuf -oL "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" < "$TMP/cli" > "$L" 2>&1 &
 LSP=$!
 wait_log "$L" "listening" 20 || { echo "KEYS-SETUP-FAIL: LSP never listened"; tail -8 "$L"; exit 2; }
 
@@ -146,6 +182,9 @@ sleep 2
 cli "status"; sleep 2
 grep -aE "^  Channel [0-9]+: local=" "$L" | tail -4 > "$TMP/pre_status"
 echo "=== pre-rotation balances (LSP view; remote = client) ==="; cat "$TMP/pre_status"
+# A copy of client 1's DB as it is before the rotation: what a client that
+# kept a backup holds (DOUBLE_CLAIM broadcasts its latest commitment from it).
+sqlite3 "$TMP/c1.db" ".backup '$TMP/c1.db.backup'" 2>/dev/null
 
 if [ "$MODE" = partial ]; then
   # Client 4 goes offline before DYING: the rotation can only be partial.
@@ -253,7 +292,11 @@ import json,sys; t=json.load(sys.stdin); print(t["vout"][int(sys.argv[1])]["scri
       verdict CLOSE_PAYEE 1 "close $CIN_CLOSE: outputs=${C_NOUT:-?} spk=${C_SPK:-?} old_spk=${O_SPK:-?}"
     fi
   else
-    verdict CLOSE_PAYEE 0 "no cooperative close of the old factory"
+    if [ "$MODE" = winddown ]; then
+      verdict CLOSE_PAYEE 0 "no co-signed close of the old factory (the LSP's own close of it is WIND_DOWN)"
+    else
+      verdict CLOSE_PAYEE 0 "no cooperative close of the old factory"
+    fi
   fi
 fi
 
@@ -278,7 +321,7 @@ if [ "$COMPLETE" -lt 1 ]; then
   echo "old factory funding $OLD_TXID:${OLD_VOUT:-0} unspent: $([ -n "$OLD_SPK" ] && echo "yes (${OLD_SPK#* } sats)" || echo no)"
 fi
 
-if [ "$COMPLETE" -ge 1 ] && [ "$MODE" = partial ]; then
+if [ "$COMPLETE" -ge 1 ] && [ "$MODE" != full ]; then
   # --- REPLACEMENT: every client that released its key holds the replacement ---
   REL=$(cnt "released its old factory key" "$L"); MISS=""
   for N in $(seq 1 "$N_ROT"); do
@@ -335,6 +378,12 @@ if [ "$COMPLETE" -ge 1 ]; then
   else verdict PAY_AFTER 1 "pay 1->0 after rotation: ${POST_DONE} result line(s), 0 succeeded ($(grep -aE "CLI: pay|LSP: .*(fail|FAIL|reject)" "$L" | tail -2 | tr '\n' ' ' | cut -c1-200))"; fi
 fi
 
+if [ "$COMPLETE" -ge 1 ] && { [ "${POST_OK:-0}" -lt 1 ] || ! echo "${RESTART_LOG:-}" | grep -q reconnected; }; then
+  echo "=== context: LSP after the rotation, and client 4 ==="
+  sed -n '/LSP rotate: rotation complete/,$p' "$L" | grep -avE "Channel [0-9]+: local=|Leaf [0-9]+:" | head -150 | cut -c1-170
+  tail -15 "$TMP/c4.log" | cut -c1-170 | sed 's/^/  c4: /'
+fi
+
 # --- RESTART: a client restart reloads its factory key ---
 if [ "$COMPLETE" -ge 1 ]; then
   if echo "$RESTART_LOG" | grep -q "reloaded" && echo "$RESTART_LOG" | grep -q "reconnected"; then
@@ -354,26 +403,82 @@ IDENT=0
 while IFS='|' read -r fid cidx key; do
   [ "$key" = "$(printf "%064x" $((cidx + 1)))" ] && IDENT=$((IDENT + 1))
 done < "$TMP/departed.txt"
-if [ "$IDENT" -gt 0 ]; then
-  verdict IDENTITY 1 "$IDENT of the $N_DEP client key(s) the LSP holds equal the client's own --seckey (its identity key)"
-else
-  verdict IDENTITY 0 "none of the $N_DEP client key(s) the LSP holds is a client's identity key"
-fi
 N_SEALED=$(awk -F'|' 'index($3,"dk1:")==1' "$TMP/departed.txt" | grep -c .)
 OLD_OPEN=0
 O_TXID=$(grep -aoE "^LSP: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
 O_VOUT=$(grep -aoE "^LSP: funding vout=[0-9]+" "$L" | grep -oE "[0-9]+$" | head -1)
 [ -n "$O_TXID" ] && [ -n "$($BCLI gettxout "$O_TXID" "${O_VOUT:-0}" 2>/dev/null)" ] && OLD_OPEN=1
-if [ "$N_DEP" -gt 0 ] && [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "$OLD_OPEN" -eq 1 ] && [ "$IDENT" -eq 0 ]; then
-  verdict KEYS_AT_REST 0 "the $N_DEP released key(s) are sealed (none in the clear) while the old factory is still open for the clients that did not move"
-elif [ "$N_DEP" -gt 0 ]; then
-  verdict KEYS_AT_REST 1 "old factory close confirmations: $CLOSE_CONF (old funding unspent: $OLD_OPEN); departed_clients holds $N_DEP client secret key(s) ($N_PLAIN as plaintext hex, $N_SEALED sealed); $IDENT of them equal the client's own --seckey (its identity and channel key)"
+# (verdict at the end, after the old factory must have been resolved)
+REST_EARLY="departed_clients held $N_DEP key(s) after the rotation ($N_PLAIN as plaintext hex, $N_SEALED sealed; old funding unspent: $OLD_OPEN)"
+
+# --- IDENTITY (by public key): no released old key is a client's identity key ---
+REL_PKS=$(sqlite3 "$DB" "SELECT old_pk FROM part_releases;" 2>/dev/null | tr '\n' ' ')
+ID_HIT=$(python3 - $REL_PKS <<'PY'
+import sys
+P = 2**256 - 2**32 - 977
+G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+     0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+def add(a, b):
+    if a is None: return b
+    if b is None: return a
+    if a[0] == b[0] and (a[1] + b[1]) % P == 0: return None
+    if a == b: l = 3 * a[0] * a[0] * pow(2 * a[1], P - 2, P) % P
+    else: l = (b[1] - a[1]) * pow(b[0] - a[0], P - 2, P) % P
+    x = (l * l - a[0] - b[0]) % P
+    return (x, (l * (a[0] - x) - a[1]) % P)
+def mul(k, pt=G):
+    r = None
+    while k:
+        if k & 1: r = add(r, pt)
+        pt = add(pt, pt); k >>= 1
+    return r
+def ser(pt): return (bytes([2 + (pt[1] & 1)]) + pt[0].to_bytes(32, "big")).hex()
+ids = {ser(mul(n + 1)) for n in range(1, 5)}      # client N signs in with seckey N+1
+print(sum(1 for pk in sys.argv[1:] if pk in ids))
+PY
+)
+N_REL_PK=$(echo $REL_PKS | wc -w)
+if [ "$IDENT" -gt 0 ] || [ "${ID_HIT:-1}" -gt 0 ]; then
+  verdict IDENTITY 1 "of the $N_DEP client key(s) the LSP holds, $IDENT equal a client's own --seckey (plaintext rows); of the $N_REL_PK released old key(s), ${ID_HIT:-?} are a client's identity key (by public key)"
 else
-  verdict KEYS_AT_REST 0 "no client secret key left in the LSP database"
+  verdict IDENTITY 0 "none of the $N_DEP client key(s) the LSP holds is a client's identity key ($N_REL_PK released old key(s) checked by public key)"
+fi
+
+# --- KEY_ROWS: a moved client has one active factory key, the replacement's ---
+KR_BAD=0; KR_DETAIL=""
+if [ "$COMPLETE" -ge 1 ]; then
+  for N in $(seq 1 "$N_ROT"); do
+    act=$(sqlite3 "$TMP/c$N.db" "SELECT COUNT(*) FROM factory_keys WHERE state = 'active';" 2>/dev/null)
+    old=$(sqlite3 "$TMP/c$N.db" "SELECT COUNT(*) FROM factory_keys WHERE state IN ('retired', 'released');" 2>/dev/null)
+    KR_DETAIL="$KR_DETAIL c$N[active=${act:-?} retired/released=${old:-?}]"
+    { [ "${act:-0}" = 1 ] && [ "${old:-0}" -ge 1 ]; } || KR_BAD=1
+  done
+  verdict KEY_ROWS $KR_BAD "$KR_DETAIL"
+fi
+
+# --- WIND_DOWN: every client released; the LSP closes the old factory alone ---
+if [ "$MODE" = winddown ] && [ "$COMPLETE" -ge 1 ]; then
+  wait_log "$L" "closing it alone: close [0-9a-f]{64} recorded" 60
+  WD_LN=$(grep -naE "closing it alone: close [0-9a-f]{64} recorded" "$L" | head -1 | cut -d: -f1)
+  WD_TXID=$(grep -aoE "closing it alone: close [0-9a-f]{64} recorded" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+  N_WD=$(cnt "closing it alone: close [0-9a-f]{64} recorded" "$L")
+  LAST_REL=$(grep -naE "released its old factory key \(verified release\)" "$L" | tail -1 | cut -d: -f1)
+  N_RELEASED=$(grep -aoE "client [0-9]+ released its old factory key \(verified release\)" "$L" | sort -u | wc -l)
+  $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+  read -r WD_IN WD_NOUT WD_ADDR WD_CONF < <($BCLI getrawtransaction "${WD_TXID:-x}" 1 2>/dev/null | python3 -c '
+import json,sys; t=json.load(sys.stdin); i=t["vin"][0]; o=t["vout"]
+print("%s:%d" % (i["txid"], i["vout"]), len(o), o[0]["scriptPubKey"].get("address","?"), t.get("confirmations",0))' 2>/dev/null)
+  WD_MINE=$($BCLI -rpcwallet="$WALLET" getaddressinfo "${WD_ADDR:-x}" 2>/dev/null | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("ismine") else 0)' 2>/dev/null)
+  if [ -n "$WD_TXID" ] && [ "$N_WD" = 1 ] && [ "$N_RELEASED" = 4 ] && [ -n "$LAST_REL" ] && [ "$WD_LN" -gt "$LAST_REL" ] &&
+     [ "$WD_IN" = "$O_TXID:${O_VOUT:-0}" ] && [ "$WD_NOUT" = 1 ] && [ "${WD_MINE:-0}" = 1 ] && [ "${WD_CONF:-0}" -ge 1 ]; then
+    verdict WIND_DOWN 0 "all $N_RELEASED clients released, then the LSP closed the old factory alone: $WD_TXID spends $WD_IN, one output to its own wallet ($WD_ADDR), $WD_CONF conf"
+  else
+    verdict WIND_DOWN 1 "closes=$N_WD released=$N_RELEASED close_line=${WD_LN:-none} last_release_line=${LAST_REL:-none} close=${WD_TXID:-none} spends=${WD_IN:-?} (old $O_TXID:${O_VOUT:-0}) outputs=${WD_NOUT:-?} to_lsp_wallet=${WD_MINE:-?} conf=${WD_CONF:-0}"
+  fi
 fi
 
 # --- STAYER: the client that stayed is told to exit, and can ---
-if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ]; then
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ]; then
   echo "--- client 4 back after the rotation ---" >> "$TMP/c4.log"
   start_client 4
   for i in $(seq 1 40); do
@@ -395,6 +500,159 @@ if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ]; then
     verdict STAYER 0 "client 4 reconnected, was told its factory is retired, and its exit confirmed (old root ${ROOT:0:16}.. $ROOT_CONF conf); the LSP kept the old factory ($RET_TREE tree rows, $RET_CH channels)"
   else
     verdict STAYER 1 "told=$TOLD old root ${ROOT:-none} confirmations=${ROOT_CONF:-0} kept tree=${RET_TREE:-0} channels=${RET_CH:-0} ($(tail -2 "$TMP/c4-exit.log" | tr '\n' ' ' | cut -c1-160))"
+  fi
+fi
+
+# --- SETTLE: every release came with the settlement of the old channel ---
+if [ "$MODE" != full ] && [ "$COMPLETE" -ge 1 ]; then
+  N_REL=$(cnt "released its old factory key \(verified release\)" "$L")
+  N_SET=$(cnt "settled its old channel: [0-9]+ sats back to the LSP" "$L")
+  N_CSET=0
+  for N in 1 2 3 4; do grep -qa "Client: old channel settled:" "$TMP/c$N.log" 2>/dev/null && N_CSET=$((N_CSET + 1)); done
+  N_SETDB=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE released = 1 AND settled = 1;" 2>/dev/null)
+  N_RELDB=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE released = 1;" 2>/dev/null)
+  if [ "${N_REL:-0}" -ge 1 ] && [ "$N_SET" -ge "$N_REL" ] && [ "$N_CSET" -ge "$N_REL" ] && \
+     [ "${N_SETDB:-0}" = "${N_RELDB:-x}" ]; then
+    verdict SETTLE 0 "$N_REL release(s), each after the settlement of its old channel (LSP: $N_SET settled, clients: $N_CSET; DB: $N_SETDB of $N_RELDB released rows settled)"
+  else
+    verdict SETTLE 1 "releases=$N_REL settled(lsp)=$N_SET settled(clients)=$N_CSET db settled/released=${N_SETDB:-?}/${N_RELDB:-?}"
+  fi
+fi
+
+# --- DOUBLE_CLAIM: a moved client claims its old position again ---
+# push_path <old db> <cidx> <with_commitment 0|1> <tag> [<commitment db>
+# [<commitment channel>]]: from the client's old DB, broadcast its old tree path
+# down to its channel output (mining for the relative timelocks); the leaf goes
+# in one block together with the client's latest commitment in <commitment db>
+# (default: the old DB; from <commitment channel> if given, else channel 0 or
+# <cidx>) when asked.  Prints "leaf_txid:vout commitment_txid".
+push_path() {
+  python3 - "$1" "$2" "${5:-$1}" "${6:-}" > "$TMP/path_$4.txt" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1]); cidx = int(sys.argv[2])
+cdb = sqlite3.connect(sys.argv[3])
+only = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] != "" else None
+ch = db.execute("SELECT funding_txid, funding_vout FROM channels WHERE factory_id = 0 AND slot = ? ORDER BY id LIMIT 1", (cidx,)).fetchone()
+nodes = {r[0]: r for r in db.execute("SELECT node_index, parent_index, txid, signed_tx_hex FROM tree_nodes WHERE factory_id = 0")}
+leaf = [r for r in nodes.values() if r[2] == ch[0]][0]
+path = []; n = leaf
+while n is not None:
+    path.append(n); p = n[1]
+    n = nodes.get(p) if p is not None and p >= 0 else None
+if only is None:
+    cm = cdb.execute("SELECT signed_tx_hex FROM signed_commitments WHERE channel_id IN (0, ?) ORDER BY commitment_number DESC LIMIT 1", (cidx,)).fetchone()
+else:
+    cm = cdb.execute("SELECT signed_tx_hex FROM signed_commitments WHERE channel_id = ?", (only,)).fetchone()
+print("%s %d %s" % (ch[0], ch[1], cm[0] if cm else ""))
+for r in reversed(path): print(r[2], r[3])
+PY
+  local leaf_txid leaf_vout chex txid hex last="" lasthex=""
+  read -r leaf_txid leaf_vout chex < "$TMP/path_$4.txt"
+  while read -r txid hex; do
+    [ -n "$last" ] || true
+    last=$txid; lasthex=$hex
+    [ "$txid" = "$leaf_txid" ] && break
+    for _ in $(seq 1 160); do
+      [ -n "$($BCLI getrawtransaction "$txid" 1 2>/dev/null | grep -o '"confirmations"')" ] && break
+      $BCLI sendrawtransaction "$hex" >/dev/null 2>&1
+      $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+    done
+  done < <(tail -n +2 "$TMP/path_$4.txt")
+  local ctxid=""
+  if [ "$3" = 1 ] && [ -n "$chex" ]; then
+    ctxid=$($BCLI decoderawtransaction "$chex" | python3 -c 'import json,sys; print(json.load(sys.stdin)["txid"])')
+    for _ in $(seq 1 160); do
+      $BCLI generateblock "$MADDR" "[\"$lasthex\",\"$chex\"]" >/dev/null 2>&1 && break
+      $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+    done
+  else
+    for _ in $(seq 1 160); do
+      [ -n "$($BCLI getrawtransaction "$leaf_txid" 1 2>/dev/null | grep -o '"confirmations"')" ] && break
+      $BCLI sendrawtransaction "$lasthex" >/dev/null 2>&1
+      $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+    done
+  fi
+  echo "$leaf_txid:$leaf_vout ${ctxid:-none}"
+}
+# cn_of <db> <cidx>: the number of the latest signed commitment in a client DB.
+cn_of() { sqlite3 "$1" "SELECT commitment_number FROM signed_commitments WHERE channel_id IN (0, $2) ORDER BY commitment_number DESC LIMIT 1;" 2>/dev/null; }
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ] && \
+   [ -f "$TMP/c1.db.pre-rotation" ] && [ -f "$TMP/c2.db.pre-rotation" ] && \
+   [ -f "$TMP/c1.db.backup" ]; then
+  C1_BK_CN=$(cn_of "$TMP/c1.db.backup" 0)
+  C1_OLD_CN=$(cn_of "$TMP/c1.db.pre-rotation" 0)
+  # What the LSP revoked and watched for client 1 (slot 0) at the settlement.
+  W_LINE=$(grep -aoE "client 0 settled its old channel: .* its old commitment [0-9]+ revoked and watched \([0-9a-f]{64}\)" "$L" | head -1)
+  W_CN=$(echo "$W_LINE" | grep -oE "old commitment [0-9]+" | grep -oE "[0-9]+$")
+  W_TX=$(echo "$W_LINE" | grep -oE "[0-9a-f]{64}")
+  read -r C1_LEAF C1_COMMIT < <(push_path "$TMP/c1.db.pre-rotation" 0 1 c1 "$TMP/c1.db.backup")
+  read -r C2_LEAF _ < <(push_path "$TMP/c2.db.pre-rotation" 1 0 c2)
+  echo "double claim: client 1 leaf ${C1_LEAF:-?} with its pre-settlement commitment ${C1_BK_CN:-?} ${C1_COMMIT:-?} (its old DB holds the settled commitment ${C1_OLD_CN:-?}); the LSP watched commitment ${W_CN:-?} ${W_TX:-?}; client 2 leaf ${C2_LEAF:-?}"
+  # Let the LSP answer: the wind-down steps once per block, the watchtower
+  # checks once a minute.
+  dc_eval() {
+    C1_CONF=$($BCLI getrawtransaction "${C1_COMMIT:-x}" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    C1_TOLOCAL=$($BCLI gettxout "${C1_COMMIT:-x}" 0 2>/dev/null)
+    PEN=$(grep -aE "BREACH DETECTED on channel [0-9]+, commitment [0-9]+ \(txid: ${C1_COMMIT:-x}\)" "$L" | head -1)
+    PEN_TX=$(sed -n "/BREACH DETECTED on channel [0-9]*, commitment [0-9]* (txid: ${C1_COMMIT:-x})/,\$p" "$L" | grep -aoE "Penalty tx broadcast: [0-9a-f]{64}" | head -1 | awk '{print $NF}')
+    PEN_CONF=$($BCLI getrawtransaction "${PEN_TX:-x}" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    C1_LEAF_SWEPT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE leaf_txid = '${C1_LEAF%:*}' AND sweep_txid IS NOT NULL;" 2>/dev/null)
+    C2_SWEEP=$(sqlite3 "$DB" "SELECT sweep_txid FROM part_releases WHERE leaf_txid = '${C2_LEAF%:*}';" 2>/dev/null)
+    C2_SWEEP_CONF=$($BCLI -rpcwallet="$WALLET" gettransaction "${C2_SWEEP:-x}" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    C2_OUT=$($BCLI gettxout "${C2_LEAF%:*}" "${C2_LEAF#*:}" 2>/dev/null)
+    C1_OK=0
+    # The commitment broadcast is the one the LSP watched (the settlement's
+    # revocation is of exactly that commitment) ...
+    C1_MATCH=0
+    [ -n "$W_TX" ] && [ "$W_TX" = "${C1_COMMIT:-x}" ] && [ "${W_CN:-x}" = "${C1_BK_CN:-y}" ] && \
+      [ "${C1_OLD_CN:-0}" = "$(( ${C1_BK_CN:-0} + 1 ))" ] && C1_MATCH=1
+    # ... and confirmed: the LSP's penalty took its to_local.
+    [ "$C1_MATCH" = 1 ] && [ "${C1_CONF:-0}" -ge 1 ] && [ -n "$PEN" ] && [ "${PEN_CONF:-0}" -ge 1 ] && [ -z "$C1_TOLOCAL" ] && C1_OK=1
+    # Or it never confirmed because the LSP swept that output first.
+    [ "$C1_MATCH" = 1 ] && [ "${C1_CONF:-0}" -lt 1 ] && [ "${C1_LEAF_SWEPT:-0}" -ge 1 ] && [ -z "$($BCLI gettxout "${C1_LEAF%:*}" "${C1_LEAF#*:}" 2>/dev/null)" ] && C1_OK=1
+    C2_OK=0
+    [ -n "$C2_SWEEP" ] && [ "${C2_SWEEP_CONF:-0}" -ge 1 ] && [ -z "$C2_OUT" ] && C2_OK=1
+  }
+  for _ in $(seq 1 50); do
+    $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1; sleep 3
+    dc_eval
+    [ "$C1_OK" = 1 ] && [ "$C2_OK" = 1 ] && break
+  done
+  DC_DETAIL="client 1: pre-settlement commitment ${C1_BK_CN:-?} ${C1_COMMIT:0:16}.. (= LSP-watched ${W_CN:-?} ${W_TX:0:16}..: $([ "$C1_MATCH" = 1 ] && echo yes || echo no); old DB at ${C1_OLD_CN:-?}) conf=${C1_CONF:-0}, penalty ${PEN_TX:0:16}.. conf=${PEN_CONF:-0}, its to_local unspent: ${C1_TOLOCAL:+yes}${C1_TOLOCAL:-no}; client 2: old leaf ${C2_LEAF:0:16}.. swept by ${C2_SWEEP:0:16}.. conf=${C2_SWEEP_CONF:-0}, unspent: ${C2_OUT:+yes}${C2_OUT:-no}"
+  if [ "$C1_OK" = 1 ] && [ "$C2_OK" = 1 ]; then
+    verdict DOUBLE_CLAIM 0 "the LSP won both: $DC_DETAIL"
+  else
+    verdict DOUBLE_CLAIM 1 "$DC_DETAIL"
+    grep -aE "BREACH|Penalty|old-tree channel output|settled its old" "$L" | tail -8 | cut -c1-170 | sed 's/^/  lsp: /'
+  fi
+fi
+
+# --- SETTLED_STATE: a moved client force-closes from its old DB: the settled
+#     state, which pays it nothing ---
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ] && \
+   [ -f "$TMP/c3.db.pre-rotation" ]; then
+  # What the client's force-close reads: channel 0 of its old DB.
+  C3_CN=$(sqlite3 "$TMP/c3.db.pre-rotation" "SELECT commitment_number FROM signed_commitments WHERE channel_id = 0;" 2>/dev/null)
+  # The LSP's record of exactly that old factory (the replacement may itself
+  # have been rotated since, with a record of its own).
+  C3_OLD=$(sqlite3 "$TMP/c3.db.pre-rotation" "SELECT funding_txid FROM factories WHERE id = 0;" 2>/dev/null)
+  RF=$(sqlite3 "$DB" "SELECT retired_id FROM part_rotations WHERE old_txid = '${C3_OLD:-x}';" 2>/dev/null)
+  read -r S_LA S_RA S_CN < <(sqlite3 -separator ' ' "$DB" "SELECT local_amount, remote_amount, commitment_number FROM channels WHERE factory_id = ${RF:-0} AND slot = 2;" 2>/dev/null)
+  read -r C3_LEAF C3_COMMIT < <(push_path "$TMP/c3.db.pre-rotation" 2 1 c3 "$TMP/c3.db.pre-rotation" 0)
+  for _ in $(seq 1 6); do $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1; sleep 2; done
+  read -r C3_CONF C3_V0 C3_REST < <($BCLI getrawtransaction "${C3_COMMIT:-x}" 1 2>/dev/null | python3 -c '
+import json, sys
+t = json.load(sys.stdin)
+v = [round(o["value"] * 1e8) for o in t["vout"]]
+print(t.get("confirmations", 0), v[0] if v else -1, sum(v[1:]))' 2>/dev/null)
+  C3_BREACH=$(cnt "BREACH DETECTED on channel [0-9]+, commitment [0-9]+ \(txid: ${C3_COMMIT:-x}\)" "$L")
+  SS_DETAIL="client 3: its old DB's commitment ${C3_CN:-?} ${C3_COMMIT:0:16}.. conf=${C3_CONF:-0}, its side ${C3_V0:-?} sats, the rest ${C3_REST:-?} sats; the LSP's record: commitment ${S_CN:-?}, LSP ${S_LA:-?} / client ${S_RA:-?}; breach alarms on it: $C3_BREACH"
+  if [ "${C3_CONF:-0}" -ge 1 ] && [ "${C3_V0:-1}" = 0 ] && [ "${S_RA:-1}" = 0 ] && \
+     [ -n "${S_LA:-}" ] && [ "${C3_REST:-x}" = "$S_LA" ] && [ "${C3_CN:-x}" = "${S_CN:-y}" ] && \
+     [ "$C3_BREACH" = 0 ]; then
+    verdict SETTLED_STATE 0 "the settled commitment pays the client nothing and the whole balance to the LSP's side: $SS_DETAIL"
+  else
+    verdict SETTLED_STATE 1 "$SS_DETAIL"
   fi
 fi
 
@@ -513,6 +771,84 @@ print("confirmations=%s inputs=%d witness_items=%d sig_bytes=%d" % (j.get("confi
   verdict LSP_ALONE 1 "replacement funding $NEW_TXID:$NEW_VOUT spent by $SPENT_BY, signed only with LSP-held keys ($INFO; outpoint unspent now: ${STILL:+yes}${STILL:-no}; client 1's signed kickoff: before=$KICK_BEFORE after=$KICK_AFTER)"
 else
   verdict LSP_ALONE 0 "the LSP's key material does not sign for the replacement funding ${NEW_TXID:-?}:${NEW_VOUT:-?}"
+fi
+
+# --- KEYS_AT_REST: the released keys are gone once the old factory is resolved ---
+DEL_DETAIL=""
+N_DEP_END=$N_DEP
+if [ "$MODE" != full ] && [ "$COMPLETE" -ge 1 ] && [ "$N_DEP" -gt 0 ]; then
+  # Resolved: the LSP's own close buried (winddown), or the old CLTV plus the
+  # margin passed (clients stayed).  The clients are stopped first so that
+  # the replacement is not rotated meanwhile.
+  for N in 1 2 3 4; do kill -9 "${CPID[$N]}" 2>/dev/null; done
+  OLD_CLTV=$(sqlite3 "$DB" "SELECT old_cltv FROM part_rotations ORDER BY retired_id LIMIT 1;" 2>/dev/null)
+
+  # The old factory must first resolve: winddown closes it alone once every
+  # client released; partial (stayer) resolves at its CLTV, when the LSP
+  # auto-broadcasts its distribution TX, and the LSP then sweeps every
+  # released-key output before the keys can go.  Mine in a loop (the daemon
+  # steps the wind-down once per block) until the deletion log, or a cap.
+  CAP=$(( ${OLD_CLTV:-0} + 60 )); H=$($BCLI getblockcount)
+  [ "$CAP" -lt "$(( H + 30 ))" ] && CAP=$(( H + 30 ))
+  echo "mining toward the deletion (height $H, old factory CLTV ${OLD_CLTV:-?}, cap $CAP)"
+  for _ in $(seq 1 "$CAP"); do
+    grep -qa "the released keys kept for it are deleted" "$L" && break
+    [ "$($BCLI getblockcount)" -ge "$CAP" ] && { sleep 2; grep -qa "the released keys kept for it are deleted" "$L" && break; break; }
+    $BCLI -rpcwallet="$WALLET" generatetoaddress 2 "$MADDR" >/dev/null 2>&1
+    sleep 2
+  done
+  N_DEP_END=$(sqlite3 "$DB" "SELECT COUNT(*) FROM departed_clients;" 2>/dev/null)
+  SWEPT=$(cnt "sweeping released-key distribution output" "$L")
+  DEL_DETAIL="; at height $($BCLI getblockcount): $(grep -aoE "the old factory [0-9a-f]{64} is (closed|resolved on chain)[^;]*; the released keys kept for it are deleted" "$L" | head -1 | cut -c1-150); released-key dist outputs swept=$SWEPT; $N_DEP_END left"
+fi
+if [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "${N_DEP_END:-1}" -eq 0 ]; then
+  if [ "$N_DEP" -gt 0 ]; then
+    verdict KEYS_AT_REST 0 "$REST_EARLY, all sealed$DEL_DETAIL"
+  else
+    verdict KEYS_AT_REST 0 "no client secret key in the LSP database"
+  fi
+else
+  verdict KEYS_AT_REST 1 "$REST_EARLY$DEL_DETAIL"
+fi
+
+# --- SWEEP: with a stayer, the old factory resolves via its distribution TX;
+#     the LSP sweeps every moved client's distribution-TX output (which pays a
+#     released key) to its own wallet, and only then are the keys deleted. ---
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${N_DEP:-0}" -gt 0 ]; then
+  N_MOVED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE released = 1;" 2>/dev/null)
+  SWEPT=$(cnt "sweeping released-key distribution output" "$L")
+  SWEEP_WON=0
+  # The sweeps pay the LSP's wallet, so the wallet knows them.
+  for tx in $(sqlite3 "$DB" "SELECT DISTINCT txid FROM broadcast_log WHERE source='rotation_release_sweep';" 2>/dev/null); do
+    c=$($BCLI -rpcwallet="$WALLET" gettransaction "$tx" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get(\"confirmations\",0))" 2>/dev/null)
+    [ "${c:-0}" -ge 1 ] && SWEEP_WON=$((SWEEP_WON + 1))
+  done
+  # The old factory resolved through its distribution TX if the LSP published
+  # it, or saw it and swept its released-key outputs.
+  N_PUB=$(sqlite3 "$DB" "SELECT COUNT(*) FROM broadcast_log WHERE source='rotation_old_distribution';" 2>/dev/null)
+  ODT=$(grep -aoE "published its distribution TX [0-9a-f]{64}|sweeping released-key distribution output [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+  DIST_CONF=0
+  if [ "${N_PUB:-0}" -ge 1 ] || [ "${SWEPT:-0}" -ge 1 ]; then DIST_CONF=1; fi
+  echo "sweep context: old dist txid=${ODT:-none} via_dist=$DIST_CONF published_by_lsp=${N_PUB:-0} sweeps_broadcast=${SWEPT:-0} sweeps_confirmed_in_lsp_wallet=${SWEEP_WON:-0}"
+  grep -aE "published its distribution|sweeping released-key|is resolved on chain" "$L" | head -8 | cut -c1-170 | sed 's/^/  lsp: /'
+  if [ "${DIST_CONF:-0}" -ge 1 ]; then
+    if [ "${SWEEP_WON:-0}" -ge 1 ] && [ "${N_DEP_END:-1}" -eq 0 ]; then
+      verdict SWEEP 0 "the old factory resolved via its distribution TX; the LSP swept $SWEEP_WON of ${N_MOVED:-?} released-key output(s) to its own wallet (confirmed), then deleted the keys"
+    else
+      verdict SWEEP 1 "dist TX confirmed but swept=$SWEPT won=$SWEEP_WON keys_left=${N_DEP_END:-?}"
+    fi
+  else
+    # Resolved via the tree (a stayer forced its exit): no distribution TX.
+    # Every moved client's old-tree channel output that reached the chain was
+    # swept by the LSP or spent (the penalised commitment), and buried, before
+    # the keys went.
+    N_LEAF_SWEPT=$(cnt "old-tree channel output .* is on chain -- sweeping it" "$L")
+    if [ "${N_DEP_END:-1}" -eq 0 ]; then
+      verdict SWEEP 0 "the old factory resolved via the tree (no distribution TX); old-tree channel outputs swept by the LSP: $N_LEAF_SWEPT; the released keys were deleted after those outputs were spent and buried"
+    else
+      verdict SWEEP 1 "resolved via the tree but ${N_DEP_END} released key(s) still in the DB"
+    fi
+  fi
 fi
 
 echo

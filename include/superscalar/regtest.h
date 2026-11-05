@@ -80,6 +80,12 @@ int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 int   regtest_outpoint_unspent(regtest_t *rt,
                                  const char *txid_hex_display,
                                  uint32_t vout);
+/* As regtest_outpoint_unspent, but from the confirmed chain only (gettxout
+   with include_mempool=false): a spend sitting only in the mempool does not
+   count as spent. */
+int   regtest_outpoint_unspent_confirmed(regtest_t *rt,
+                                 const char *txid_hex_display,
+                                 uint32_t vout);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
 /*
  * Batch confirmations for n_txids display-order hex txids.
@@ -241,6 +247,7 @@ char *regtest_build_signed_payment(regtest_t *rt, const char *address,
    NOT be broadcast, or whose record was dropped.  Inputs already spent or not
    locked are skipped.  Returns how many were unlocked, -1 if TX_HEX does not
    parse. */
+int regtest_lock_tx_inputs(regtest_t *rt, const char *tx_hex);
 int regtest_unlock_tx_inputs(regtest_t *rt, const char *tx_hex);
 
 /* abandontransaction: the wallet stops rebroadcasting TXID (only possible

@@ -74,6 +74,8 @@ bash tools/run_demo.sh --client-breach
 bash tools/run_demo.sh --rotation
 ```
 
+This demo runs the LSP's `--test-rotation` mode, a scripted rotation by the older PTLC key turnover.
+
 **What you'll see:**
 1. Factory 0 created, payments flow
 2. PTLC key turnover: adaptor signatures extract client keys
@@ -83,6 +85,8 @@ bash tools/run_demo.sh --rotation
 6. Factory 1 cooperatively closed
 
 **Duration:** ~2 minutes.
+
+Clients of this release refuse the key turnover, so with them the demo stops at step 2. It is not the rotation the LSP daemon performs: a DYING factory is closed straight into the new factory when every client is online and upgraded (fresh client keys, no key revealed), or rotated by a partial rotation with verified release otherwise. See [LSP Operator Guide §12](lsp-operator-guide.md#12-factory-rotation); the rotation drills in the [Testing Guide](testing-guide.md#rotation-drills) run both paths.
 
 ### All Demos Sequentially
 
@@ -258,7 +262,7 @@ python3 tools/test_orchestrator.py --scenario cooperative_close    # Clean SIGTE
 python3 tools/test_orchestrator.py --scenario timeout_expiry       # All vanish; LSP reclaims via CLTV
 python3 tools/test_orchestrator.py --scenario timeout_recovery     # Clients vanish → LSP timeout reclaim
 python3 tools/test_orchestrator.py --scenario jit_lifecycle        # Late client triggers JIT channel create + fund + route
-python3 tools/test_orchestrator.py --scenario factory_rotation     # DYING trigger → PTLC turnover → new factory
+python3 tools/test_orchestrator.py --scenario factory_rotation     # DYING trigger → automatic rotation → new factory
 python3 tools/test_orchestrator.py --scenario full_lifecycle       # Factory → payments → watchtower → cooperative close
 ```
 
@@ -300,8 +304,8 @@ These flags run after the `--demo` payment sequence to demonstrate specific prot
 | `--cheat-daemon` | LSP broadcasts a revoked commitment and sleeps — clients must detect it |
 | `--test-expiry` | Mines past CLTV timeout, LSP recovers funds via timeout script path |
 | `--test-distrib` | Broadcasts the pre-signed distribution TX (nLockTime fallback for clients) |
-| `--test-turnover` | PTLC key turnover via adaptor signatures, LSP closes alone afterward |
-| `--test-rotation` | Full factory rotation: PTLC turnover + close + new factory + payments |
+| `--test-turnover` | Scripted PTLC key turnover via adaptor signatures, LSP closes alone afterward (clients of this release refuse the turnover) |
+| `--test-rotation` | Scripted rotation by the older PTLC key turnover + close + new factory + payments; not the daemon's rotation (see the Rotation demo above) |
 | `--force-close` | Broadcasts entire factory tree on-chain, waits for all confirmations |
 
 Example:

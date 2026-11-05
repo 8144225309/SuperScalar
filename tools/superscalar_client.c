@@ -1487,8 +1487,20 @@ handle_message:
             client_part_set_jit_active(cbd && cbd->jit_ch &&
                                        cbd->jit_ch->state != JIT_STATE_NONE &&
                                        cbd->jit_ch->state != JIT_STATE_CLOSED);
-            (void)client_part_on_release_req(fd, ctx, cbd ? cbd->db : NULL, factory, msg.json);
+            int rel = client_part_on_release_req(fd, ctx, cbd ? cbd->db : NULL,
+                                                 cbd ? cbd->poison_db_path : NULL, factory,
+                                                 msg.json, cbd ? inbox_queue : NULL,
+                                                 cbd ? &cbd->inbox : NULL);
+            /* Asked while we still run the old factory: once the replacement
+               is at the safe depth, switch first (the request comes again). */
+            int due = !rel && client_part_switch_due(cbd ? cbd->db : NULL, msg.json);
             cJSON_Delete(msg.json);
+            if (due) {
+                printf("Client %u: the replacement is funded at the safe depth — switching "
+                       "to it before releasing\n", my_index);
+                fflush(stdout);
+                return 0;
+            }
             break;
         }
 
@@ -1830,7 +1842,9 @@ handle_message:
                                                cbd->jit_ch->state != JIT_STATE_CLOSED);
                     int part_ok = client_part_run(fd, ctx, cbd ? cbd->db : NULL,
                                                   cbd ? cbd->poison_db_path : NULL,
-                                                  keypair, factory, ch, &msg);
+                                                  keypair, factory, ch, &msg,
+                                                  cbd ? inbox_queue : NULL,
+                                                  cbd ? &cbd->inbox : NULL);
                     cJSON_Delete(msg.json);
                     if (part_ok)
                         printf("Client %u: rotation complete, reconnecting with new "

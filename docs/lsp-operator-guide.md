@@ -245,8 +245,8 @@ These flags run after the `--demo` payment sequence to test specific protocol fe
 | `--cheat-daemon` | off | Broadcast revoked commitment and sleep (clients detect) |
 | `--test-expiry` | off | Mine past CLTV, recover via timeout script path |
 | `--test-distrib` | off | Broadcast pre-signed distribution TX (nLockTime fallback) |
-| `--test-turnover` | off | PTLC key turnover, close with extracted keys |
-| `--test-rotation` | off | Full factory rotation lifecycle |
+| `--test-turnover` | off | Scripted PTLC key turnover, close with extracted keys (clients of this release refuse the turnover) |
+| `--test-rotation` | off | Scripted rotation by the older PTLC key turnover; not the rotation the daemon performs (see §12) |
 | `--force-close` | off | Broadcast factory tree on-chain, wait for confirmations |
 
 ### Interactive CLI
@@ -522,14 +522,78 @@ The full rollback contract per primitive (realloc, buy-liquidity, bridge HTLC, c
 
 ## 12. Factory Rotation
 
-Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). Before expiry, the LSP rotates to a new factory:
+Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). When a factory reaches DYING, the daemon rotates it into a replacement factory; the `rotate` CLI command triggers a rotation by hand. Which path it takes depends on the clients:
 
-1. PTLC key turnover extracts client keys via adaptor signatures
-2. Old factory is cooperatively closed (LSP can sign alone with extracted keys)
-3. New factory is created with the same clients
-4. Channels resume in the new factory
+| Clients | Path |
+|---------|------|
+| Every client online and announcing rotation support | Close into the new factory |
+| Some offline or not upgraded | Partial rotation with verified release, over the clients that can take part |
 
-This happens automatically in daemon mode when `--active-blocks` is reached. You can also trigger it manually with `--test-rotation` for testing.
+A client announces rotation support only when it runs with `--db`, the LSP's key pinned with `--lsp-pubkey`, and its own Bitcoin Core RPC connection (see the [Client User Guide](client-user-guide.md#factory-rotation)). A client without them stays in the old factory and exits through it. Upgraded clients refuse the older key turnover (an adaptor signature that reveals the client's factory key before anything else), and it is not used once any client of the factory is upgraded.
+
+### Close into the new factory
+
+1. Each client sends a fresh per-factory key.
+2. The LSP builds the unsigned cooperative close of the old factory. Its single output is the replacement factory's funding output.
+3. The replacement's creation ceremony runs over that outpoint, and the new channels and their initial commitments are set up.
+4. Each client checks the close (one output, paying the replacement under the fresh keys, its balance carried exactly) and its replacement tree, stores them, and only then signs the close with its old factory key.
+5. The LSP records the signed close with the replacement, then broadcasts it.
+
+No key is revealed, and the rotation needs no LSP liquidity beyond the old factory. Until the close confirms the old factory stays valid; a client that has signed the close refuses further state changes on it. After the close confirms the replacement is live. Each client switches when the close is at its network's safe depth on its own chain view (1 block on regtest, 3 on signet and testnet, 6 on mainnet), not on the LSP's word.
+
+### Partial rotation with verified release
+
+1. The replacement is built over the clients that can take part, under their fresh keys.
+2. It is signed before it is funded: every moving client holds its signed replacement tree first.
+3. The LSP records the replacement and the releases it is owed, then funds it from its wallet.
+4. After the funding confirms, each moving client checks its own exit path and balance in the replacement, switches at safe depth, and only then releases its old factory key, against an LSP Schnorr receipt bound to exactly that position.
+5. Before the key, the client settles its old channel: one final update of that channel moves the balance it carried into the replacement to the LSP, the client signs it and revokes its own latest old commitment, then sends the key. The LSP counts a release only with both the revocation and the key; the revoked commitment goes into its watch entries for the retired channel (kept across restarts), so a later broadcast of it is penalised.
+
+**Liquidity.** The old factory stays locked until it is resolved, so a partial rotation needs free wallet funds for the replacement's funding on top of it.
+
+**Who moves.** A client with an open JIT channel, or one whose factory signs with its identity key (a legacy factory), is left out of a partial rotation: a legacy factory key is never released.
+
+**The exposure bound (a mover that never releases).** The replacement is funded before the releases, so until a moving client has settled and released it holds both its funded replacement position and its old position. Any modified client can refuse to release and keep both, at the cost of on-chain fees only; the LSP's loss is then at most the larger of that client's old-channel value and its output in the old factory's distribution TX (its amount plus its equal share of the surplus, which absorbs the L-stock; it takes one or the other, not both). The LSP bounds that loss rather than removing it:
+
+- A client is admitted to a partial rotation only if that larger amount is within a **per-mover cap**, and the total over every unreleased mover of every partial rotation not yet resolved (this one included) is within a **per-LSP total cap** (`--rotation-exposure-cap`, `--rotation-exposure-total`, in sats; conservative defaults). A client over a cap stays in the old factory as a stayer.
+- A mover that has not settled and released within `--rotation-release-deadline` blocks of the replacement reaching the safe depth is logged for the operator and excluded from later partial rotations, so its exposure cannot recur. The exclusion and the height the deadline counts from are kept in the LSP's database (tables `part_excluded` and `part_deadlines`, the deadline's start recorded on every path where the replacement is first seen at the safe depth, a resume included) and hold across an LSP restart; the excluded client is the one recorded with the rotation (by identity).
+- Until a mover has settled and released, the LSP forwards no HTLC it offers: the HTLC is failed back (`old factory key not released`). The hold is by the client's identity, recorded with the rotation, so it stays after a later rotation of the replacement and across an LSP restart, until the client releases or its old factory is resolved (its funding spent by a confirmed transaction, buried for the close depth, as seen by the wind-down step). HTLCs to that client are not affected, and once it has released, its payments go through as before. Clients with nothing owed are never held. Such a mover also does not move on: a later close into a new factory is not used while it is in the factory, and a later partial rotation leaves it in place, so its balance is not carried on before it releases. Other ways value leaves a channel: a client's close request is only logged (the LSP closes a factory only on the operator's command, and a cooperative close of the factory pays every client its balance, an unreleased mover included); the LSP never signs a splice. A mover whose settlement was interrupted finishes it when it is asked again (it answers the settlement again before it sends its key again), so an honest mover is not held for good by a lost message.
+- A client with a commitment signature still pending on its channel (one the LSP sent and that is not answered with a revocation yet) is left out of the rotation. The pending mark is cleared by the revocation; a retransmit after a reconnect that is not answered keeps it.
+
+So the LSP's loss is at most the total cap over all unreleased movers, and any modified client can take up to its own cap. The atomic carry that would remove this (a PTLC in the replacement) is a documented follow-up.
+
+**Clients that stay.** They keep their full exit in the old factory: its signed tree, their channel commitments, and its distribution TX at the old CLTV. The LSP keeps the old factory's tree and channels (under retired ids) and tells a stayer that reconnects to exit through the old factory. An absent client's live balance is only safe through its own exit before that CLTV.
+
+### Wind-down of the old factory
+
+Normally a partial rotation leaves at least one client in the old factory (that is why it is partial), so the old factory ends the usual way: the stayers exit it, or its distribution TX confirms at the old CLTV. The moved clients were already paid in the replacement; the LSP recovers their old-factory value automatically (see "Released keys" below).
+
+Only if *every* client of the old factory has since moved and released — no stayer left — does the LSP close it alone (key path: its own key plus the released keys) to its own wallet. That close is recorded before broadcast and rebroadcast until it confirms.
+
+### Released keys and backups
+
+Released client keys are stored only sealed in the LSP DB: under the field encryption with `--encrypt-db`, otherwise under a seal key derived from the LSP's own secret. This protects a leaked DB or backup, not a compromised host. A released key still guards two of the moved client's old-factory outputs: its payout in the distribution TX (which pays that key) and its channel output in the factory tree (MuSig of the released key and the LSP, plus the LSP's CLTV script leaf). The keys are loaded again on restart.
+
+If the old factory is still unresolved at its CLTV, the LSP publishes its recorded distribution TX, and from the chain tick it sweeps every distribution-TX output that pays a released key to its own wallet. If instead a client pushes the old tree on chain, the LSP sweeps every moved client's channel output in the tree as soon as it appears, on the key path with the released key and its own key (each output is recorded with the part record: outpoint, amount, script, merkle root). A BIP 158 light-client LSP does not run this tick and must do this by hand. The keys are then deleted:
+
+- when the LSP's own close is buried (every client moved), or
+- when the distribution TX is buried and every output in it that pays a released key is spent; the keys are not deleted while such an output is unspent, or
+- when a client pushed the tree (the distribution TX can no longer confirm), once the old CLTV plus the margin (6 blocks on regtest, 100 elsewhere) has passed and every moved client's tree output that reached the chain is spent and buried. A tree output that appears only later is still the LSP's: the LSP keeps watching for it and takes it through its CLTV script leaf with its own key.
+
+Backups taken in between contain the sealed keys; rotate backups so old copies do not outlive the deletion.
+
+Remaining race: when a client has stayed, re-signing the distribution TX needs that stayer's key, so the LSP cannot move the moved clients' distribution-TX value before the CLTV. After the CLTV, the LSP's sweep of a released key's distribution-TX output competes on fee with anyone else who knows that key. This fee race on the distribution-TX output is inherent to the stayer case.
+
+A moved client cannot claim its old channel balance a second time. The settlement revoked its latest old commitment, and the LSP holds that revocation and watches exactly that commitment (its number and txid), as it watches every earlier one: broadcasting any of them, from a copy of the client's database taken at any time before the settlement, is penalised. The client's old database itself now holds the settled commitment, stored under channel 0 (what a force-close from that file reads) and under the channel's own index before the revocation is sent (one signed commitment per channel, so it replaces the revoked one; nothing is revoked if it cannot be stored): it pays the client nothing and the whole channel balance to the LSP's side, and it has a 0-sat output for the client, so it is non-standard and a force-close from it will not relay. The LSP sweeps the client's old-tree output when it appears. A settlement that was interrupted after the client accepted it (the revocation did not reach the LSP, or the client stopped before its key went) is answered again on the next request with the same settled state and the same revocation. The LSP settles and revokes against the commitment number in its database, and refuses to settle while a commitment signature it recorded as sent is still unanswered on that channel. The pending mark is cleared in the same transaction that records the new number, so the record is never behind an answered signature; a signature sent in the instant before a crash, before its pending mark was written, is not covered (the reconnect then adopts the client's number, as it always has). The LSP's own `to_remote` output in a mover's settled or revoked commitment, once that commitment is on chain, is recovered by hand from the retired channel's basepoint secret; it is not swept automatically. The settled commitment keeps a 0-sat output for the client, so it is non-standard and reaches the chain only if a miner includes it directly.
+
+### What is recorded, and restarts
+
+Every step is recorded in the DB before it happens. A restarted LSP (same `--seckey` and `--db`) resumes the rotation once the clients reconnect:
+
+- **Close into the new factory:** a recorded close is rebroadcast; a second close is never built. A close that was recorded but not yet signed is signed by running the ceremony again over it.
+- **Partial rotation:** a rotation that stopped before its replacement was recorded is dropped, and the wallet inputs of its unbroadcast funding are unlocked; the next attempt starts over. A recorded funding is rebroadcast, never replaced by another one. Releases still owed are asked for again when those clients reconnect.
+
+`--test-rotation` runs a scripted rotation by the older key turnover after `--demo`; it is a test mode, not the rotation the daemon performs. The rotation drills in the [Testing Guide](testing-guide.md#rotation-drills) exercise the daemon's paths.
 
 ## 13. Troubleshooting
 

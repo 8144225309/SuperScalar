@@ -3535,3 +3535,56 @@ int wire_parse_rotation_release(const cJSON *j, unsigned char binding32[32],
     return wire_json_get_hex(j, "binding", binding32, 32) == 32 &&
            wire_json_get_hex(j, "old_seckey", old_seckey32, 32) == 32;
 }
+
+cJSON *wire_build_rotation_settle_req(const unsigned char old_txid32[32],
+                                      uint64_t commitment_number,
+                                      const unsigned char pubnonce66[66]) {
+    if (!old_txid32 || !pubnonce66) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "funding_txid", old_txid32, 32);
+    cJSON_AddNumberToObject(j, "commitment_number", (double)commitment_number);
+    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    return j;
+}
+
+int wire_parse_rotation_settle_req(const cJSON *j, unsigned char old_txid32[32],
+                                   uint64_t *commitment_number,
+                                   unsigned char pubnonce66[66]) {
+    if (!j || !old_txid32 || !commitment_number || !pubnonce66 || !wire_json_unambiguous(j))
+        return 0;
+    return wire_json_get_hex(j, "funding_txid", old_txid32, 32) == 32 &&
+           wire_json_get_uint(j, "commitment_number", UINT32_MAX, commitment_number) &&
+           wire_json_get_hex(j, "pubnonce", pubnonce66, 66) == 66;
+}
+
+cJSON *wire_build_rotation_settle(const wire_rotation_settle_t *s) {
+    if (!s) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "funding_txid", s->old_txid, 32);
+    cJSON_AddNumberToObject(j, "commitment_number", (double)s->commitment_number);
+    cJSON_AddNumberToObject(j, "client_amount", (double)s->client_amount);
+    cJSON_AddNumberToObject(j, "lsp_amount", (double)s->lsp_amount);
+    cJSON_AddNumberToObject(j, "fee_rate", (double)s->fee_rate);
+    wire_json_add_hex(j, "pubnonce", s->pubnonce, 66);
+    wire_json_add_hex(j, "partial_sig", s->partial_sig, 32);
+    cJSON_AddNumberToObject(j, "nonce_index", (double)s->nonce_index);
+    return j;
+}
+
+int wire_parse_rotation_settle(const cJSON *j, wire_rotation_settle_t *s) {
+    if (!j || !s || !wire_json_unambiguous(j)) return 0;
+    memset(s, 0, sizeof(*s));
+    uint64_t ni = 0;
+    int ok = wire_json_get_hex(j, "funding_txid", s->old_txid, 32) == 32 &&
+             wire_json_get_uint(j, "commitment_number", UINT32_MAX, &s->commitment_number) &&
+             wire_json_get_uint(j, "client_amount", 2100000000000000ULL, &s->client_amount) &&
+             wire_json_get_uint(j, "lsp_amount", 2100000000000000ULL, &s->lsp_amount) &&
+             wire_json_get_uint(j, "fee_rate", 100000000ULL, &s->fee_rate) &&
+             wire_json_get_hex(j, "pubnonce", s->pubnonce, 66) == 66 &&
+             wire_json_get_hex(j, "partial_sig", s->partial_sig, 32) == 32 &&
+             wire_json_get_uint(j, "nonce_index", UINT32_MAX, &ni);
+    s->nonce_index = (uint32_t)ni;
+    return ok;
+}

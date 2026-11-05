@@ -1,5 +1,10 @@
 # Tier B: Multi-party state-advance ceremony
 
+> This document covers the state-advance ceremony inside one factory. Rotating a
+> factory into a replacement (a close into the new factory, or a partial rotation with
+> verified release) is described in
+> [LSP Operator Guide §12](lsp-operator-guide.md#12-factory-rotation).
+
 ## Background
 
 A SuperScalar factory's tree of unsigned transactions includes nSequence

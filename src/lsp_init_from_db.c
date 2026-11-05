@@ -251,3 +251,96 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
     return 1;
 }
+
+/* A mover's old channel of a partial rotation (see lsp_channels.h), from
+   its retired rows. */
+extern int hex_decode(const char *, unsigned char *, size_t);
+extern void reverse_bytes(unsigned char *, size_t);
+
+int lsp_rotation_part_load_old_channel(lsp_channel_mgr_t *mgr, size_t c, channel_t *ch) {
+    if (!mgr || !ch || !mgr->persist || !mgr->part_rel.valid || c >= mgr->part_rel.m)
+        return 0;
+    persist_t *db = (persist_t *)mgr->persist;
+    persist_part_release_t rel;
+    if (!lsp_rotation_part_release_row(mgr, c, &rel) || !rel.leaf_txid[0]) return 0;
+    uint32_t cid = lsp_rotation_part_old_channel_id(mgr, c);
+    secp256k1_pubkey lpk, cpk;
+    unsigned char ltx[32];
+    uint64_t la = 0, ra = 0, cn = 0;
+    if (!secp256k1_ec_pubkey_create(mgr->ctx, &lpk, mgr->rot_lsp_seckey) ||
+        !secp256k1_ec_pubkey_parse(mgr->ctx, &cpk, mgr->part_rel.old_pk[c], 33) ||
+        hex_decode(rel.leaf_txid, ltx, 32) != 32 ||
+        !persist_load_channel_state(db, cid, &la, &ra, &cn))
+        return 0;
+    reverse_bytes(ltx, 32);
+    memset(ch, 0, sizeof(*ch));
+    if (!channel_init(ch, mgr->ctx, mgr->rot_lsp_seckey, &lpk, &cpk, ltx, rel.leaf_vout,
+                      rel.leaf_amount, rel.leaf_spk, 34, la, ra, CHANNEL_DEFAULT_CSV_DELAY))
+        return 0;
+    ch->funder_is_local = 1;
+    ch->use_cpfp_anchor = 1;
+    ch->commitment_number = cn;
+    int ok = 1;
+    {
+        musig_keyagg_t ka;
+        uint32_t si = 0;
+        unsigned char mr[32];
+        int hm = 0;
+        ok = channel_discover_funding_keyagg(mgr->ctx, &lpk, &cpk, &lpk, mgr->part_rel.old_cltv,
+                                             rel.leaf_cltv, rel.leaf_spk, 34, &ka, &si, mr, &hm);
+        if (ok) {
+            ch->funding_keyagg = ka;
+            ch->local_funding_signer_idx = si;
+            ch->has_chan_merkle_root = hm;
+            if (hm) memcpy(ch->chan_merkle_root, mr, 32);
+        }
+    }
+    unsigned char ls[4][32], rb[4][33];
+    ok = ok && persist_load_basepoints(db, cid, ls, rb);
+    if (ok) {
+        secp256k1_pubkey p0, p1, p2, p3;
+        channel_set_local_basepoints(ch, ls[0], ls[1], ls[2]);
+        channel_set_local_htlc_basepoint(ch, ls[3]);
+        ok = secp256k1_ec_pubkey_parse(mgr->ctx, &p0, rb[0], 33) &&
+             secp256k1_ec_pubkey_parse(mgr->ctx, &p1, rb[1], 33) &&
+             secp256k1_ec_pubkey_parse(mgr->ctx, &p2, rb[2], 33) &&
+             secp256k1_ec_pubkey_parse(mgr->ctx, &p3, rb[3], 33);
+        if (ok) {
+            channel_set_remote_basepoints(ch, &p0, &p1, &p2);
+            channel_set_remote_htlc_basepoint(ch, &p3);
+        }
+    }
+    secure_zero(ls, sizeof(ls));
+    if (ok) {
+        htlc_t *hs = calloc(MAX_HTLCS, sizeof(htlc_t));
+        size_t nh = hs ? persist_load_htlcs(db, cid, hs, MAX_HTLCS) : 0;
+        for (size_t h = 0; h < nh && ch->n_htlcs < MAX_HTLCS; h++)
+            if (hs[h].state == HTLC_STATE_ACTIVE) ch->htlcs[ch->n_htlcs++] = hs[h];
+        free(hs);
+        ok = hs != NULL;
+    }
+    /* The client's points around its latest commitment (the settlement signs
+       the next one; its revocation is of the latest, or of the one before
+       when the settled state is answered again). */
+    for (uint64_t k = cn ? cn - 1 : 0; ok && k <= cn + 1; k++) {
+        unsigned char ser[33];
+        secp256k1_pubkey pcp;
+        if (persist_load_remote_pcp(db, cid, k, ser) &&
+            secp256k1_ec_pubkey_parse(mgr->ctx, &pcp, ser, 33))
+            channel_set_remote_pcp(ch, k, &pcp);
+    }
+    if (ok) {
+        size_t pmax = (size_t)cn + 2, got = 0;
+        unsigned char (*pcs)[32] = calloc(pmax, 32);
+        if (pcs && persist_load_local_pcs(db, cid, pcs, pmax, &got))
+            for (uint64_t k = 0; k < pmax; k++) {
+                int nz = 0;
+                for (int b = 0; b < 32 && !nz; b++) nz = pcs[k][b] != 0;
+                if (nz) channel_set_local_pcs(ch, k, pcs[k]);
+            }
+        if (pcs) { secure_zero(pcs, pmax * 32); free(pcs); }
+        channel_set_persist(ch, db, cid);
+    }
+    if (!ok) channel_cleanup(ch);
+    return ok;
+}
