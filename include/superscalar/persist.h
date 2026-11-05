@@ -18,8 +18,12 @@ typedef struct {
     int enc_enabled;
 } persist_t;
 
-/* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+/* Current schema version. Bump when adding migrations.
+   45 adds the pending_sweeps columns of on-chain HTLC-success claims.
+   Versions 40-44 are used by changes on other branches; the v45 step adds
+   each column whenever it is missing, so it runs correctly in any merge
+   order, and the merged version is the highest bump. */
+#define PERSIST_SCHEMA_VERSION 45
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
