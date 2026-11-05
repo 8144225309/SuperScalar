@@ -3743,6 +3743,23 @@ int lsp_rotation_part_on_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c)
     return ok;
 }
 
+#define LSP_PART_REASK_BLOCKS 3
+
+size_t lsp_rotation_part_reask(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp || !mgr->part_rel.valid || mgr->rot_progress.phase != LSP_ROT_PROGRESS_NONE)
+        return 0;
+    int h = rot_chain_height(mgr);
+    if (h <= 0 || (mgr->part_reask_height &&
+                   (uint32_t)h < mgr->part_reask_height + LSP_PART_REASK_BLOCKS))
+        return 0;
+    mgr->part_reask_height = (uint32_t)h;
+    size_t asked = 0;
+    for (size_t j = 0; j < mgr->part_rel.m; j++)
+        if (!mgr->part_rel.released[j] && lsp_rotation_part_on_reconnect(mgr, lsp, j))
+            asked++;
+    return asked;
+}
+
 int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
                                  const cJSON *json) {
     (void)lsp;

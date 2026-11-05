@@ -195,6 +195,12 @@ const char *client_part_release_check(regtest_t *rt, persist_t *db, secp256k1_co
 int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
                                const factory_t *f, const cJSON *req);
 
+/* 1 if REQ (a release request) is for a partial rotation we signed whose
+   funding is now at the safe depth on our own chain, but we still run the
+   old factory: the client ends the session, switches (client_cin_resolve)
+   and is asked again after it reconnects. */
+int client_part_switch_due(persist_t *db, const cJSON *req);
+
 /* Whether a JIT channel is open (its key must not be released with the
    factory key). */
 void client_part_set_jit_active(int active);

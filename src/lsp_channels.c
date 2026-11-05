@@ -7245,6 +7245,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                        this LSP once every client released, keys deleted once
                        resolved (one step per block). */
                     (void)lsp_rotation_winddown_tick(mgr, 0);
+                    (void)lsp_rotation_part_reask(mgr, lsp);
 
                     /* Profit settlement: handled above via chain_be (works
                        without watchtower). Removed from watchtower block. */

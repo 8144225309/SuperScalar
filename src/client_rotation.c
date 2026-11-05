@@ -1613,6 +1613,39 @@ out:
     return result;
 }
 
+int client_part_switch_due(persist_t *db, const cJSON *req) {
+    if (!db || !req || !g_cin_rt) return 0;
+    unsigned char ft[32], b[32], rc[64];
+    if (!wire_parse_rotation_release_req(req, ft, b, rc)) return 0;
+    char fdisp[65];
+    txid_display(ft, fdisp);
+    persist_client_rotation_t rows[CIN_MAX_OPEN];
+    memset(rows, 0, sizeof(rows));
+    size_t n = persist_client_rotation_load_all_open(db, rows, CIN_MAX_OPEN);
+    int due = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!due && strcmp(rows[i].state, "part_signed") == 0 &&
+            strcmp(rows[i].close_txid, fdisp) == 0) {
+            /* Our own chain view, as in client_cin_resolve (close_height holds
+               the funding's vout on this path). */
+            char params[128];
+            snprintf(params, sizeof(params), "\"%s\" %u false", rows[i].close_txid,
+                     rows[i].close_height);
+            char *r = regtest_exec(g_cin_rt, "gettxout", params);
+            cJSON *j = r ? cJSON_Parse(r) : NULL;
+            free(r);
+            const cJSON *c = j ? cJSON_GetObjectItemCaseSensitive(j, "confirmations") : NULL;
+            if (cJSON_IsNumber(c) &&
+                client_cin_resolve_action("part_signed", (int)c->valuedouble, 0) ==
+                    CLIENT_CIN_PROMOTE)
+                due = 1;
+            cJSON_Delete(j);
+        }
+        free(rows[i].close_hex);
+    }
+    return due;
+}
+
 int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
                                const factory_t *f, const cJSON *req) {
     if (!db || !f || !req || !g_cin_rt) return 0;

@@ -268,6 +268,7 @@ typedef struct {
     secp256k1_pubkey part_retired_ids[FACTORY_MAX_SIGNERS];
     size_t n_part_retired;
     uint32_t part_wd_height;       /* last height the wind-down was stepped */
+    uint32_t part_reask_height;    /* last height owed releases were asked again */
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -780,6 +781,11 @@ int lsp_rotation_partial_may_start(const lsp_channel_mgr_t *mgr);
 /* After client C (new slot) reconnects: ask again for its release if it is
    still owed and the replacement is funded.  Returns 1 if a request was sent. */
 int lsp_rotation_part_on_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c);
+
+/* Every few blocks: ask the connected clients that still owe a release
+   again (a client asked before it could release, e.g. before it switched,
+   refuses; it is asked again later).  Returns how many were asked. */
+size_t lsp_rotation_part_reask(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* MSG_ROTATION_RELEASE from client C: check the key against the old factory
    and store it sealed.  Returns 1 if it was taken. */

@@ -1981,6 +1981,98 @@ int test_part_winddown_tick(void) {
     return 1;
 }
 
+/* A release still owed is asked for again every few blocks while the
+   client is connected (one asked too early refuses and is asked later). */
+int test_part_reask(void) {
+    secp256k1_context *ctx = cin_ctx();
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    mgr->ctx = ctx;
+    memset(mgr->rot_lsp_seckey, 0x62, 32);
+    secp256k1_pubkey npk;
+    TEST_ASSERT(mk_pk(&npk, 0x64), "key");
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, mgr->part_rel.new_pk[0], &l, &npk, SECP256K1_EC_COMPRESSED);
+    mgr->part_rel.m = 1;
+    mgr->part_rel.valid = 1;
+    mgr->part_rel.funded = 1;
+    chain_backend_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.get_block_height = wd_get_height;
+    mgr->chain_be = &cb;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    int fds[1] = { sv[0] };
+    lsp.client_fds = fds;
+    lsp.n_clients = 1;
+    wd_height = 200;
+    TEST_ASSERT(lsp_rotation_part_reask(mgr, &lsp) == 1, "asked");
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    TEST_ASSERT(wire_recv_timeout(sv[1], &m, 5) && m.msg_type == MSG_ROTATION_RELEASE_REQ, "request");
+    cJSON_Delete(m.json);
+    TEST_ASSERT(lsp_rotation_part_reask(mgr, &lsp) == 0, "not again in the same block");
+    wd_height = 203;
+    TEST_ASSERT(lsp_rotation_part_reask(mgr, &lsp) == 1, "again a few blocks later");
+    memset(&m, 0, sizeof(m));
+    TEST_ASSERT(wire_recv_timeout(sv[1], &m, 5) && m.msg_type == MSG_ROTATION_RELEASE_REQ, "request");
+    cJSON_Delete(m.json);
+    mgr->part_rel.released[0] = 1;
+    wd_height = 210;
+    TEST_ASSERT(lsp_rotation_part_reask(mgr, &lsp) == 0, "not once released");
+    close(sv[0]);
+    close(sv[1]);
+    free(mgr);
+    return 1;
+}
+
+/* A release request while we still run the old factory: switch first once
+   the replacement's funding is at the safe depth on our own chain. */
+int test_part_switch_due(void) {
+    char cli[] = "/tmp/ss_cin_sd_XXXXXX";
+    TEST_ASSERT(fake_cli(cli), "fake cli");
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    snprintf(rt.cli_path, sizeof(rt.cli_path), "%s", cli);
+    snprintf(rt.network, sizeof(rt.network), "regtest");
+    client_cin_set_chain(&rt, 1);
+    char path[] = "/tmp/ss_part_sd_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    const char *ftx = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+    persist_client_rotation_t row;
+    memset(&row, 0, sizeof(row));
+    snprintf(row.old_txid, sizeof(row.old_txid), "%s", "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2");
+    snprintf(row.close_txid, sizeof(row.close_txid), "%s", ftx);
+    snprintf(row.state, sizeof(row.state), "part_signed");
+    TEST_ASSERT(persist_client_rotation_save(&db, &row), "row");
+    unsigned char f32[32], bind[32], rc[64];
+    hex_decode(ftx, f32, 32);
+    reverse_bytes(f32, 32);
+    memset(bind, 1, 32);
+    memset(rc, 2, 64);
+    cJSON *req = wire_build_rotation_release_req(f32, bind, rc);
+    TEST_ASSERT(req, "req");
+    setenv("SS_FAKE_TXOUT_FOR", ftx, 1);
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 0}", 1);
+    TEST_ASSERT(!client_part_switch_due(&db, req), "not funded yet: stay");
+    setenv("SS_FAKE_TXOUT", "{\"confirmations\": 2}", 1);
+    TEST_ASSERT(client_part_switch_due(&db, req), "funded at the safe depth: switch first");
+    snprintf(row.state, sizeof(row.state), "part_switched");
+    TEST_ASSERT(persist_client_rotation_save(&db, &row) && !client_part_switch_due(&db, req),
+                "already switched: nothing to do");
+    unsetenv("SS_FAKE_TXOUT_FOR");
+    unsetenv("SS_FAKE_TXOUT");
+    cJSON_Delete(req);
+    client_cin_set_chain(NULL, 1);
+    persist_close(&db);
+    unlink(path);
+    unlink(cli);
+    return 1;
+}
+
 /* The LSP and client records, and the DB snapshot. */
 int test_cin_records(void) {
     char path[] = "/tmp/ss_cin_rec_XXXXXX";
