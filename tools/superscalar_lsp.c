@@ -10,6 +10,7 @@
 #include "superscalar/fee.h"
 #include "superscalar/cpfp.h"
 #include "superscalar/watchtower.h"
+#include "superscalar/sweeper.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/network.h"
 #include "superscalar/dw_state.h"
@@ -3338,6 +3339,17 @@ int main(int argc, char *argv[]) {
                     attach_hd_wallet(&rec_wt, use_db ? &db : NULL, ctx, network,
                                      hd_mnemonic, hd_passphrase, hd_lookahead);
             }
+            /* On-chain HTLC-success claims; pending ones reload from the DB.
+               After attach_light_client, which replaces the backend (and
+               drops what was registered with it): the sweeper uses the
+               watchtower's backend and registers its scripts there. */
+            {
+                static sweeper_t rec_sweeper;
+                chain_backend_t *sw_chain = rec_wt.chain ? rec_wt.chain : chain_be;
+                if (sweeper_init(&rec_sweeper, ctx, NULL, NULL, 0, sw_chain,
+                                 &db, fee_est))
+                    lsp_channels_attach_sweeper(mgr, &rec_sweeper);
+            }
 
             /* Initialize ladder (heap — ladder_t is ~26MB with 8 factories) */
             ladder_t *rec_lad_p = calloc(1, sizeof(ladder_t));
@@ -4728,6 +4740,15 @@ accept_new_factory:
             if (!rt_ok)
                 attach_hd_wallet(&wt, use_db ? &db : NULL, ctx, network,
                                  hd_mnemonic, hd_passphrase, hd_lookahead);
+        }
+        /* On-chain HTLC-success claims; pending ones reload from the DB.
+           After attach_light_client (see the recovery path above). */
+        {
+            static sweeper_t htlc_sweeper;
+            chain_backend_t *sw_chain = wt.chain ? wt.chain : chain_be;
+            if (sweeper_init(&htlc_sweeper, ctx, NULL, NULL, 0, sw_chain,
+                             use_db ? &db : NULL, fee_est))
+                lsp_channels_attach_sweeper(mgr, &htlc_sweeper);
         }
 
         /* Wire ladder into channel manager (Tier 2) */

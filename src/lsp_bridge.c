@@ -1334,6 +1334,23 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (old_n_htlcs > 0 && old_htlcs)
                     memcpy(old_htlcs, ch->htlcs, old_n_htlcs * sizeof(htlc_t));
 
+                /* The client may withhold its revoke_and_ack and broadcast
+                   the commitment still holding this HTLC once it sees the
+                   preimage: be ready to claim it on chain first.  If the
+                   claim cannot be armed, the preimage is not revealed and
+                   the result is left unacknowledged, so the plugin repeats
+                   it and arming is tried again. */
+                if (lsp_channels_register_htlc_claim(mgr, client_idx,
+                                                     htlc_id_val,
+                                                     preimage) < 0) {
+                    fprintf(stderr, "LSP: CRITICAL: no on-chain claim for "
+                            "HTLC %llu of client %zu: its preimage is not "
+                            "revealed yet\n",
+                            (unsigned long long)htlc_id_val, client_idx);
+                    free(old_htlcs);
+                    return 0;
+                }
+
                 /* Fulfill the HTLC on the client's channel; the client is
                    told nothing unless that worked */
                 if (!channel_fulfill_htlc(ch, htlc_id_val, preimage)) {

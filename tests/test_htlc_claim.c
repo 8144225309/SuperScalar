@@ -6,17 +6,20 @@
  * withholds its revoke_and_ack), before the sender can time it out.
  *
  * Unit tests (mock chain):
- *   test_htlc_claim_local_commit     claim from our own commitment
- *   test_htlc_claim_remote_commit    claim from the counterparty's
- *   test_htlc_claim_preimage_script  success-leaf script + fail-closed checks
- *   test_htlc_claim_persist_reload   sweeper persistence across a reload
- *   test_htlc_claim_schema_upgrade   v39 -> v40 pending_sweeps migration
- *   test_htlc_claim_priority_timing  claim timing vs the CLTV / timeout path
+ *   test_htlc_claim_local_commit          claim from our own commitment
+ *   test_htlc_claim_remote_commit         claim from the counterparty's
+ *   test_htlc_claim_preimage_script       success-leaf script + fail-closed checks
+ *   test_htlc_claim_persist_reload        sweeper persistence across a reload
+ *   test_htlc_claim_schema_upgrade        v39 -> v40 pending_sweeps migration
+ *   test_htlc_claim_priority_timing       claim timing vs the CLTV / timeout path
+ *   test_htlc_claim_lsp_sender_selection  LSP arms claims on sender channels
  */
 
 #include "superscalar/channel.h"
 #include "superscalar/sweeper.h"
 #include "superscalar/persist.h"
+#include "superscalar/lsp_channels.h"
+#include "superscalar/client.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/musig.h"
 #include "superscalar/tapscript.h"
@@ -28,6 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/socket.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int  hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -1944,6 +1949,416 @@ int test_htlc_claim_priority_timing(void)
 
     sweeper_cleanup(&sw);
     pair_cleanup(&p);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* LSP message handlers, in process                                     */
+/* ------------------------------------------------------------------ */
+
+/* Exchange nonce pools both ways, as MSG_CHANNEL_NONCES does. */
+static int pair_nonces(pair_t *p)
+{
+    static unsigned char ser[MUSIG_NONCE_POOL_MAX][66];
+    if (!channel_init_nonce_pool(&p->lsp, MUSIG_NONCE_POOL_MAX) ||
+        !channel_init_nonce_pool(&p->cli, MUSIG_NONCE_POOL_MAX))
+        return 0;
+    for (size_t i = 0; i < p->lsp.local_nonce_pool.count; i++)
+        if (!musig_pubnonce_serialize(p->ctx, ser[i],
+                &p->lsp.local_nonce_pool.nonces[i].pubnonce))
+            return 0;
+    if (!channel_set_remote_pubnonces(&p->cli, ser,
+                                      p->lsp.local_nonce_pool.count))
+        return 0;
+    for (size_t i = 0; i < p->cli.local_nonce_pool.count; i++)
+        if (!musig_pubnonce_serialize(p->ctx, ser[i],
+                &p->cli.local_nonce_pool.nonces[i].pubnonce))
+            return 0;
+    return channel_set_remote_pubnonces(&p->lsp, ser,
+                                        p->cli.local_nonce_pool.count);
+}
+
+/* An LSP with a sender channel (index 0) and a payee channel (index 1),
+   each wired to a socketpair whose far end plays the client.  The sender
+   paid the payee 7000 sats through the LSP; both HTLCs are on commitment
+   1.  The LSP manager owns copies of the LSP-side channels. */
+typedef struct {
+    pair_t s, p;
+    lsp_channel_mgr_t *mgr;
+    lsp_t *lsp;
+    int cli_fd[2];
+    unsigned char s_commit[32];    /* sender commitment 1 (holds the HTLC) */
+    char s_commit_hex[65];
+    mock_chain_t m;
+    sweeper_t sw;
+    persist_t db;
+    char path[64];
+} lspnet_t;
+
+static int lspnet_init(lspnet_t *n, secp256k1_context *ctx)
+{
+    static const unsigned char FUND_P[32] = { [0 ... 31] = 0x33 };
+    memset(n, 0, sizeof(*n));
+    if (!pair_init(&n->s, ctx, UNIT_FUND_TXID, 0, 100000, 10) ||
+        !pair_init(&n->p, ctx, FUND_P, 0, 100000, 10) ||
+        !pair_nonces(&n->s) || !pair_nonces(&n->p))
+        return 0;
+    if (!pair_add_htlc(&n->s, 1, 7000, 600) ||     /* sender offers */
+        !pair_add_htlc(&n->p, 0, 7000, 560))       /* LSP offers payee */
+        return 0;
+    if (!pair_send_pcp(&n->s, 2) || !pair_send_pcp(&n->p, 2)) return 0;
+    if (!pair_cli_commit(&n->s, n->s_commit, n->s_commit_hex)) return 0;
+
+    snprintf(n->path, sizeof(n->path), "/tmp/ss_htlc_lspnet_XXXXXX");
+    int fd = mkstemp(n->path);
+    if (fd < 0) return 0;
+    close(fd);
+    if (!persist_open(&n->db, n->path)) return 0;
+
+    n->mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    n->lsp = calloc(1, sizeof(lsp_t));
+    if (!n->mgr || !n->lsp) return 0;
+    n->mgr->entries = calloc(2, sizeof(lsp_channel_entry_t));
+    n->lsp->client_fds = calloc(2, sizeof(int));
+    if (!n->mgr->entries || !n->lsp->client_fds) return 0;
+    n->mgr->n_channels = 2;
+    n->mgr->ctx = ctx;
+    n->mgr->bridge_fd = -1;
+    n->mgr->persist = &n->db;
+    n->mgr->entries[0].channel = n->s.lsp;
+    n->mgr->entries[0].channel_id = 0;
+    n->mgr->entries[1].channel = n->p.lsp;
+    n->mgr->entries[1].channel_id = 1;
+    n->lsp->n_clients = 2;
+    n->lsp->listen_fd = -1;
+    for (int i = 0; i < 2; i++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        n->lsp->client_fds[i] = sv[0];
+        n->cli_fd[i] = sv[1];
+    }
+    mock_init(&n->m, 100);
+    if (!sweeper_init(&n->sw, ctx, NULL, NULL, 0, &n->m.base, &n->db, NULL))
+        return 0;
+    return lsp_channels_attach_sweeper(n->mgr, &n->sw);
+}
+
+static void lspnet_free(lspnet_t *n)
+{
+    sweeper_cleanup(&n->sw);
+    for (int i = 0; i < 2; i++) {
+        if (n->lsp && n->lsp->client_fds && n->lsp->client_fds[i] >= 0)
+            close(n->lsp->client_fds[i]);
+        if (n->cli_fd[i] > 0) close(n->cli_fd[i]);
+    }
+    if (n->mgr && n->mgr->entries) {
+        channel_cleanup(&n->mgr->entries[0].channel);
+        channel_cleanup(&n->mgr->entries[1].channel);
+        free(n->mgr->entries);
+    }
+    free(n->mgr);
+    if (n->lsp) free(n->lsp->client_fds);
+    free(n->lsp);
+    channel_cleanup(&n->s.cli);
+    channel_cleanup(&n->p.cli);
+    persist_close(&n->db);
+    unlink(n->path);
+}
+
+/* The client of pair x answers the LSP commitment_signed: revoke its
+   previous commitment (garbled on request) and give its next point. */
+static int client_send_raa(pair_t *x, int fd, uint32_t chan_id, int garble)
+{
+    uint64_t cn = x->cli.commitment_number;
+    unsigned char sec[32];
+    secp256k1_pubkey next;
+    if (!channel_get_per_commitment_secret(&x->cli, cn - 1, sec) ||
+        !channel_get_per_commitment_point(&x->cli, cn + 1, &next))
+        return 0;
+    if (garble) sec[0] ^= 1;
+    cJSON *j = wire_build_revoke_and_ack(chan_id, sec, x->ctx, &next);
+    int ok = wire_send(fd, MSG_REVOKE_AND_ACK, j);
+    cJSON_Delete(j);
+    memset(sec, 0, 32);
+    return ok;
+}
+
+/* Messages of type t waiting on a client end (all are read). */
+static int drain_count(int fd, uint8_t t)
+{
+    int n = 0;
+    for (;;) {
+        struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        wire_msg_t m;
+        if (!wire_recv(fd, &m)) break;
+        if (m.msg_type == t) n++;
+        if (m.json) cJSON_Delete(m.json);
+    }
+    return n;
+}
+
+/* The payee reveals the preimage to the LSP: it fulfils on its side and
+   queues its revoke_and_ack for the commitment_signed that follows. */
+static int payee_fulfils(lspnet_t *n, wire_msg_t *msg)
+{
+    if (!channel_fulfill_htlc(&n->p.cli, n->p.cli_htlc_id, n->p.preimage) ||
+        !client_send_raa(&n->p, n->cli_fd[1], 1, 0))
+        return 0;
+    msg->msg_type = MSG_UPDATE_FULFILL_HTLC;
+    msg->json = wire_build_update_fulfill_htlc(n->p.lsp_htlc_id, n->p.preimage);
+    return msg->json != NULL;
+}
+
+/* The production fulfil handler arms the claim on the sender channel
+   before the preimage goes back to the sender; a sender that then
+   withholds its revoke_and_ack and broadcasts the commitment holding the
+   HTLC is claimed against. */
+int test_htlc_claim_lsp_fulfil_handler(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils");
+    shutdown(n.cli_fd[0], SHUT_WR);          /* sender: no revoke_and_ack */
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "preimage went back to the sender");
+    TEST_ASSERT(n.sw.n_entries == 1 && n.sw.entries[0].channel_id == 0 &&
+                n.sw.entries[0].claim_side == HTLC_CLAIM_REMOTE_COMMIT &&
+                memcmp(n.sw.entries[0].source_txid, n.s_commit, 32) == 0 &&
+                memcmp(n.sw.entries[0].preimage, n.s.preimage, 32) == 0,
+                "claim armed on the sender commitment that holds the HTLC");
+    TEST_ASSERT(count_rows(&n.db, "htlc_success") == 1, "and on disk");
+
+    mk_put(&n.m, n.s_commit_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "claimed when the sender broadcasts it");
+    lspnet_free(&n);
+
+    /* A valid revoke_and_ack retires the claim. */
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup 2");
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils 2");
+    TEST_ASSERT(channel_fulfill_htlc(&n.s.cli, n.s.cli_htlc_id, n.s.preimage) &&
+                client_send_raa(&n.s, n.cli_fd[0], 0, 0), "sender revokes");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "sender fulfilled");
+    TEST_ASSERT(n.sw.n_entries == 0 && count_rows(&n.db, "htlc_success") == 0,
+                "claim cancelled by the verified revocation");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The bridge pay-result handler does the same for an outbound payment. */
+int test_htlc_claim_lsp_bridge_handler(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    htlc_origin_t origin;
+    memset(&origin, 0, sizeof(origin));
+    memcpy(origin.payment_hash, n.s.hash, 32);
+    origin.request_id = 7;
+    origin.sender_idx = 0;
+    origin.sender_htlc_id = n.s.lsp_htlc_id;
+    origin.active = 1;
+    n.mgr->htlc_origins = &origin;
+    n.mgr->n_htlc_origins = 1;
+    shutdown(n.cli_fd[0], SHUT_WR);          /* sender: no revoke_and_ack */
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_PAY_RESULT;
+    msg.json = wire_build_bridge_pay_result(7, 1, n.s.preimage);
+    lsp_channels_handle_bridge_msg(n.mgr, n.lsp, &msg);
+    cJSON_Delete(msg.json);
+    n.mgr->htlc_origins = NULL;
+    n.mgr->n_htlc_origins = 0;
+
+    TEST_ASSERT(drain_count(n.cli_fd[0], MSG_UPDATE_FULFILL_HTLC) == 1,
+                "preimage went to the sender");
+    TEST_ASSERT(n.sw.n_entries == 1 && n.sw.entries[0].channel_id == 0 &&
+                memcmp(n.sw.entries[0].source_txid, n.s_commit, 32) == 0,
+                "claim armed on the sender commitment");
+    mk_put(&n.m, n.s_commit_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 1, "claimed");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Store the client signature of its current commitment, as
+   client_handle_commitment_signed does after verifying the LSP's. */
+static int pair_client_signed(pair_t *p)
+{
+    tx_buf_t uc, sc;
+    tx_buf_init(&uc, 1024);
+    tx_buf_init(&sc, 2048);
+    unsigned char txid[32];
+    ptx_t t;
+    int ok = channel_build_commitment_tx(&p->cli, &uc, txid) &&
+             channel_sign_commitment(&p->cli, &sc, &uc, &p->lsp_kp) &&
+             ptx_parse(sc.data, sc.len, &t) && t.n_wit == 1 &&
+             t.wit_len[0] == 64;
+    if (ok) {
+        memcpy(p->cli.latest_commitment_sig, t.wit[0], 64);
+        p->cli.has_latest_commitment_sig = 1;
+    }
+    tx_buf_free(&uc);
+    tx_buf_free(&sc);
+    return ok;
+}
+
+/* A client claims from its persisted state alone: the LSP gone, the
+   client restarted, no live channel.  A client also never arms a claim on
+   (or reveals a preimage against) a commitment it does not hold signed. */
+int test_htlc_claim_client_without_lsp(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    char path[] = "/tmp/ss_htlc_cli_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0, "temp db");
+    close(fd);
+    const uint32_t idx = 3;                /* the client row in its DB */
+    pair_t p;
+    TEST_ASSERT(pair_init(&p, ctx, UNIT_FUND_TXID, 0, 100000, 10), "init");
+    TEST_ASSERT(pair_add_htlc(&p, 0, 20000, 600), "LSP pays the client");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path) &&
+                persist_save_channel(&db, &p.cli, 0, idx) &&
+                persist_save_basepoints(&db, idx, &p.cli), "client db");
+    mock_chain_t m;
+    mock_init(&m, 100);
+    sweeper_t sw;
+    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &m.base, &db, NULL),
+                "sweeper");
+    client_htlc_claims_attach(&sw, &db, ctx);
+    client_set_htlc_live_channel(&p.cli);
+    client_set_htlc_sweeper(&sw, idx);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    /* Not holding the current commitment signed: preimage kept. */
+    TEST_ASSERT(!client_fulfill_payment(sv[0], &p.cli, p.cli_htlc_id,
+                                        p.preimage), "fulfil refused");
+    TEST_ASSERT(sw.n_entries == 0 && drain_count(sv[1],
+                MSG_UPDATE_FULFILL_HTLC) == 0, "no claim, nothing sent");
+
+    TEST_ASSERT(pair_client_signed(&p), "client holds it signed");
+    unsigned char ct[32];
+    char ct_hex[65];
+    TEST_ASSERT(pair_cli_commit(&p, ct, ct_hex), "commitment");
+
+    TEST_ASSERT(client_fulfill_payment(sv[0], &p.cli, p.cli_htlc_id,
+                                       p.preimage), "client fulfils");
+    TEST_ASSERT(drain_count(sv[1], MSG_UPDATE_FULFILL_HTLC) == 1, "revealed");
+    TEST_ASSERT(sw.n_entries == 1 && sw.entries[0].channel_id == idx &&
+                sw.entries[0].claim_side == HTLC_CLAIM_LOCAL_COMMIT &&
+                memcmp(sw.entries[0].source_txid, ct, 32) == 0,
+                "claim armed on the signed commitment");
+    sweep_entry_t armed = sw.entries[0];
+    close(sv[0]); close(sv[1]);
+
+    /* The LSP never signs again and goes away; the client restarts. */
+    client_set_htlc_live_channel(NULL);
+    client_set_htlc_sweeper(NULL, 0);
+    sweeper_cleanup(&sw);
+    persist_close(&db);
+    TEST_ASSERT(persist_open(&db, path), "reopen");
+    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &m.base, &db, NULL) &&
+                sw.n_entries == 1, "claim reloaded");
+    client_htlc_claims_attach(&sw, &db, ctx);
+
+    mk_put(&m, ct_hex, 100);
+    TEST_ASSERT(client_run_htlc_claims(&sw) == 1 && m.n_sent == 0,
+                "pending through the CSV");
+    m.height = 109;
+    TEST_ASSERT(client_run_htlc_claims(&sw) == 1 && m.n_sent == 1,
+                "claimed from the DB state, no session");
+    tx_buf_t ref;
+    tx_buf_init(&ref, 512);
+    secp256k1_pubkey pcp;
+    TEST_ASSERT(secp256k1_ec_pubkey_parse(ctx, &pcp, armed.commit_point, 33) &&
+                channel_build_htlc_claim_tx(&p.cli, &ref, HTLC_CLAIM_LOCAL_COMMIT,
+                    &pcp, ct, armed.source_vout, armed.amount_sats,
+                    armed.htlc_spk, p.hash, p.preimage, armed.cltv_expiry,
+                    armed.amount_sats - armed.claim_amount, NULL, NULL),
+                "reference claim from the live channel");
+    TEST_ASSERT(ref.len == m.last_sent_len &&
+                memcmp(ref.data, m.last_sent, ref.len) == 0,
+                "same claim as from the live channel");
+    tx_buf_free(&ref);
+    mk_put(&m, sw.entries[0].sweep_txid, 109);
+    TEST_ASSERT(client_run_htlc_claims(&sw) == 0, "settled");
+
+    client_htlc_claims_attach(NULL, NULL, NULL);
+    sweeper_cleanup(&sw);
+    persist_close(&db);
+    unlink(path);
+    pair_cleanup(&p);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* LSP forwarding A -> B: when B's preimage arrives, the claim is armed on
+   the sender A's channel (against A's commitment) and not on B's. */
+int test_htlc_claim_lsp_sender_selection(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    static const unsigned char FUND_B[32] = { [0 ... 31] = 0x22 };
+    pair_t a, b;
+    TEST_ASSERT(pair_init(&a, ctx, UNIT_FUND_TXID, 0, 100000, 10), "init A");
+    TEST_ASSERT(pair_init(&b, ctx, FUND_B, 0, 100000, 10), "init B");
+    TEST_ASSERT(pair_add_htlc(&a, 1, 7000, 600), "A pays LSP");
+    TEST_ASSERT(pair_add_htlc(&b, 0, 7000, 560), "LSP pays B");
+
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr != NULL, "mgr");
+    mgr->entries = calloc(2, sizeof(lsp_channel_entry_t));
+    TEST_ASSERT(mgr->entries != NULL, "entries");
+    mgr->n_channels = 2;
+    mgr->entries[0].channel = a.lsp;
+    mgr->entries[1].channel = b.lsp;
+
+    TEST_ASSERT(lsp_channels_register_sender_claims(mgr, 1, a.preimage) == 0,
+                "no sweeper attached: nothing registered");
+
+    mock_chain_t m;
+    mock_init(&m, 100);
+    sweeper_t sw;
+    TEST_ASSERT(sweeper_init(&sw, ctx, NULL, NULL, 0, &m.base, NULL, NULL),
+                "sweeper");
+    TEST_ASSERT(lsp_channels_attach_sweeper(mgr, &sw), "attach");
+    TEST_ASSERT(lsp_channels_register_sender_claims(mgr, 1, a.preimage) == 1,
+                "one sender claim");
+    TEST_ASSERT(sw.n_entries == 1 && sw.entries[0].channel_id == 0 &&
+                sw.entries[0].claim_side == HTLC_CLAIM_REMOTE_COMMIT,
+                "armed on the sender's channel, against its commitment");
+    unsigned char a_txid[32];
+    tx_buf_t ac;
+    tx_buf_init(&ac, 1024);
+    TEST_ASSERT(channel_build_commitment_tx(&a.cli, &ac, a_txid), "A commit");
+    tx_buf_free(&ac);
+    TEST_ASSERT(memcmp(sw.entries[0].source_txid, a_txid, 32) == 0,
+                "source = the commitment the sender holds signed");
+    TEST_ASSERT(sw.get_channel(sw.get_channel_arg, 0) ==
+                &mgr->entries[0].channel, "lookup resolves the LSP channel");
+
+    sweeper_cleanup(&sw);
+    free(mgr->entries);
+    free(mgr);
+    pair_cleanup(&a);
+    pair_cleanup(&b);
     secp256k1_context_destroy(ctx);
     return 1;
 }

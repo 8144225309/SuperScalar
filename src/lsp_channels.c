@@ -225,6 +225,13 @@ int (lsp_channels_accept_revocation)(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         lsp_channels_fail_channel(mgr, lsp, client_idx, ch, 1, why);
         return 0;
     }
+    /* Commitment old_cn is now validly revoked: broadcasting it is a
+       breach, which the penalty path covers, so the HTLC-success claims
+       armed on it are no longer needed.  Only a revocation that verified
+       gets here; a garbled one leaves them armed. */
+    if (mgr->entries && client_idx < mgr->n_channels &&
+        ch == &mgr->entries[client_idx].channel)
+        lsp_channels_cancel_htlc_claims(mgr, client_idx, old_cn);
     if (old_cn_out) *old_cn_out = old_cn;
     if (next_pcp_out) *next_pcp_out = next_pcp;
     return 1;
@@ -5581,6 +5588,14 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        persisted (or bridge propagation completes), so the two balance
        updates are atomic.  If the LSP crashes between payee credit and
        sender debit, the DB rolls back both. */
+    /* Once a sender sees the preimage it may withhold its revoke_and_ack and
+       broadcast the commitment that still holds its HTLC.  Arm the on-chain
+       claim for every such HTLC before the preimage goes out, and before the
+       transaction below opens: a claim is only registered once its row is
+       on disk.  A sender whose claim could not be armed is not sent the
+       preimage (see the loop below). */
+    lsp_channels_register_sender_claims(mgr, client_idx, preimage);
+
     int fulfill_txn_started = 0;
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
@@ -5634,7 +5649,20 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (htlc->direction != HTLC_RECEIVED) continue;
             if (memcmp(htlc->payment_hash, payment_hash, 32) != 0) continue;
 
-            /* Found it — fulfill on sender's channel */
+            /* Found it — fulfill on sender's channel, but only once the
+               on-chain claim of this HTLC is on disk.  It was registered
+               before the transaction above opened; this call finds it and
+               writes nothing.  Without it the sender could take the
+               preimage, withhold its revoke_and_ack and time the HTLC out
+               on chain. */
+            if (lsp_channels_register_htlc_claim(mgr, s, htlc->id,
+                                                 preimage) < 0) {
+                fprintf(stderr, "LSP: CRITICAL: no on-chain claim for HTLC "
+                        "%llu of client %zu: its preimage is not revealed, "
+                        "the channel must be closed on chain\n",
+                        (unsigned long long)htlc->id, s);
+                continue;
+            }
             uint64_t old_sender_local = sender_ch->local_amount;
             uint64_t old_sender_remote = sender_ch->remote_amount;
             size_t old_sender_n_htlcs = sender_ch->n_htlcs;
@@ -8134,9 +8162,6 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     if (!lsp_channels_check_conservation(mgr))
                         fprintf(stderr, "LSP: ALERT — balance conservation "
                                 "violated, refusing new HTLCs\n");
-                    /* Detect commitment TXs on-chain and register sweeps */
-                    if (mgr->sweeper)
-                        lsp_channels_detect_commitment_sweeps(mgr);
                     /* Run sweeper on same cycle */
                     if (mgr->sweeper)
                         sweeper_check((sweeper_t *)mgr->sweeper);
@@ -8535,84 +8560,73 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Demo mode + payment initiation moved to lsp_demo.c */
 
 /* ------------------------------------------------------------------ */
-/* Auto-sweep outputs after force-close                                 */
+/* On-chain HTLC-success claims                                         */
 /* ------------------------------------------------------------------ */
 
-/*
- * Detect commitment TXs on-chain and register to_local outputs with the
- * sweeper for CSV-delayed sweep.
- *
- * After a force-close, the client broadcasts their commitment TX (they hold
- * the fully-signed MuSig2 version). The LSP detects the commitment TX on
- * chain and sweeps the to_local output after the CSV delay.
- *
- * Called from the daemon loop alongside watchtower_check().
- */
-int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr)
+static channel_t *lsp_sweeper_get_channel(void *arg, uint32_t channel_id)
 {
-    extern void hex_encode(const unsigned char *, size_t, char *);
-    extern void reverse_bytes(unsigned char *, size_t);
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)arg;
+    if (!mgr || channel_id >= mgr->n_channels) return NULL;
+    return &mgr->entries[channel_id].channel;
+}
 
-    if (!mgr || !mgr->watchtower || !mgr->sweeper) return 0;
+int lsp_channels_attach_sweeper(lsp_channel_mgr_t *mgr, void *sweeper)
+{
+    if (!mgr || !sweeper) return 0;
+    sweeper_set_channel_lookup((sweeper_t *)sweeper, lsp_sweeper_get_channel,
+                               mgr);
+    mgr->sweeper = sweeper;
+    return 1;
+}
 
-    chain_backend_t *chain = mgr->watchtower->chain;
-    sweeper_t *sw = (sweeper_t *)mgr->sweeper;
-    if (!chain) return 0;
+int lsp_channels_register_htlc_claim(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t htlc_id,
+                                     const unsigned char *preimage32)
+{
+    if (!mgr || !mgr->sweeper || idx >= mgr->n_channels) return 0;
+    /* The client holds its own commitment signed, so that is the one it can
+       broadcast with this HTLC still in it. */
+    int r = sweeper_add_htlc_success((sweeper_t *)mgr->sweeper,
+                                     &mgr->entries[idx].channel,
+                                     (uint32_t)idx, 0,
+                                     HTLC_CLAIM_REMOTE_COMMIT, htlc_id,
+                                     preimage32);
+    if (r < 0)
+        fprintf(stderr, "LSP: ALERT — could not register on-chain claim for "
+                "HTLC %llu on channel %zu before revealing its preimage\n",
+                (unsigned long long)htlc_id, idx);
+    return r;
+}
 
-    int n_registered = 0;
-
-    for (size_t c = 0; c < mgr->n_channels; c++) {
-        channel_t *ch = &mgr->entries[c].channel;
-        if (ch->funding_amount == 0) continue;
-
-        /* Build the expected commitment TX to get its txid */
-        tx_buf_t unsigned_tx;
-        tx_buf_init(&unsigned_tx, 512);
-        unsigned char commit_txid[32];
-        if (!channel_build_commitment_tx(ch, &unsigned_tx, commit_txid)) {
-            tx_buf_free(&unsigned_tx);
-            continue;
-        }
-        tx_buf_free(&unsigned_tx);
-
-        /* Check if this commitment TX is on-chain */
-        unsigned char display_txid[32];
-        memcpy(display_txid, commit_txid, 32);
-        reverse_bytes(display_txid, 32);
-        char txid_hex[65];
-        hex_encode(display_txid, 32, txid_hex);
-
-        int confs = chain->get_confirmations(chain, txid_hex);
-        if (confs < 1) continue;  /* Not confirmed yet */
-
-        /* Check if we already registered a sweep for this output */
-        int already = 0;
-        for (size_t s = 0; s < sw->n_entries; s++) {
-            if (memcmp(sw->entries[s].source_txid, commit_txid, 32) == 0 &&
-                sw->entries[s].type == SWEEP_TO_LOCAL) {
-                already = 1;
-                break;
-            }
-        }
-        if (already) continue;
-
-        /* Register to_local output (vout 0) for CSV-delayed sweep.
-           The to_local output has a CSV delay of to_self_delay blocks. */
-        if (ch->local_amount >= CHANNEL_DUST_LIMIT_SATS) {
-            sweeper_add(sw, SWEEP_TO_LOCAL,
-                        commit_txid, 0, ch->local_amount,
-                        ch->to_self_delay,
-                        (uint32_t)c, 0, ch->commitment_number);
-            printf("LSP sweeper: channel %zu — commitment confirmed, "
-                   "registered to_local sweep (%llu sats, CSV %u)\n",
-                   c, (unsigned long long)ch->local_amount,
-                   ch->to_self_delay);
-            fflush(stdout);
-            n_registered++;
+int lsp_channels_register_sender_claims(lsp_channel_mgr_t *mgr,
+                                        size_t payee_idx,
+                                        const unsigned char *preimage32)
+{
+    if (!mgr || !mgr->sweeper || !preimage32) return 0;
+    unsigned char hash[32];
+    sha256(preimage32, 32, hash);
+    int n = 0;
+    for (size_t s = 0; s < mgr->n_channels; s++) {
+        if (s == payee_idx) continue;
+        const channel_t *sc = &mgr->entries[s].channel;
+        for (size_t h = 0; h < sc->n_htlcs; h++) {
+            if (sc->htlcs[h].state == HTLC_STATE_ACTIVE &&
+                sc->htlcs[h].direction == HTLC_RECEIVED &&
+                memcmp(sc->htlcs[h].payment_hash, hash, 32) == 0 &&
+                lsp_channels_register_htlc_claim(mgr, s, sc->htlcs[h].id,
+                                                 preimage32) == 1)
+                n++;
         }
     }
+    return n;
+}
 
-    return n_registered;
+void lsp_channels_cancel_htlc_claims(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t old_cn)
+{
+    if (!mgr || !mgr->sweeper) return;
+    sweeper_cancel_htlc_success((sweeper_t *)mgr->sweeper, (uint32_t)idx,
+                                old_cn);
 }
 
 /* ------------------------------------------------------------------ */

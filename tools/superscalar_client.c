@@ -645,7 +645,22 @@ typedef struct {
        no longer matches a usable channel, so the client must not reconnect
        from it or report success. */
     int     rotation_not_completed;
+    /* On-chain HTLC-success claims (we are payee). */
+    sweeper_t *htlc_sweeper;
 } daemon_cb_data_t;
+
+/* Keep running the HTLC claims while any is pending: once the preimage is
+   out, the HTLC is ours only if the claim confirms. */
+static void client_wait_htlc_claims(sweeper_t *sw) {
+    size_t n = client_run_htlc_claims(sw);
+    if (n > 0)
+        printf("Client: %zu HTLC claim(s) pending on chain; staying up until "
+               "they settle\n", n);
+    while (n > 0 && !g_shutdown) {
+        sleep(10);
+        n = client_run_htlc_claims(sw);
+    }
+}
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
    handler. The MSG_PTLC_PRESIG handler used to adapt the client identity
@@ -1044,6 +1059,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                void *user_data) {
     daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
 
+    if (cbd && cbd->htlc_sweeper) {
+        /* Claims are keyed by the channel row (client index) so they can be
+           rebuilt from the DB without this session. */
+        client_set_htlc_live_channel(ch);
+        client_set_htlc_sweeper(cbd->htlc_sweeper,
+                                my_index > 0 ? my_index - 1 : 0);
+    }
+
     /* #21: record whether this factory uses PS (CLTV-gated) leaves, for the
        per-leaf-type forgery response. Factory-level signal (any PS leaf present);
        cheap + idempotent. */
@@ -1321,6 +1344,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (cbd && cbd->wt && (tnow - last_wt) >= 10) {
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
+                if (cbd->htlc_sweeper)
+                    client_run_htlc_claims(cbd->htlc_sweeper);
             }
             if (cbd && cbd->db)
                 client_dist_tick(cbd->db, cbd->wt, ctx);
@@ -3481,6 +3506,33 @@ int main(int argc, char *argv[]) {
            the root spends the funding directly, so no distribution TX is
            required. */
         int exit_state = client_exit_pass(&db, &chain);
+
+        /* HTLC claims armed before their preimages went out, run from the
+           DB alone: one cycle per run, as the tree and the commitment
+           confirm between runs. */
+        {
+            secp256k1_context *cl_ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+            sweeper_t cl_sw;
+            if (cl_ctx && sweeper_init(&cl_sw, cl_ctx, NULL, NULL, 0, &chain,
+                                       &db, NULL)) {
+                /* Claims on our other commitments stay until the one just
+                   broadcast is buried final (a reorg can still swap it). */
+                client_htlc_claims_attach(&cl_sw, &db, cl_ctx);
+                size_t n_claims = client_run_htlc_claims(&cl_sw);
+                if (n_claims > 0) {
+                    printf("Force-close: %zu HTLC claim(s) pending: run "
+                           "--force-close again, or keep the client running, "
+                           "until they settle\n", n_claims);
+                    if (exit_state == CLIENT_EXIT_PUBLISHED)
+                        exit_state = CLIENT_EXIT_IN_PROGRESS;
+                }
+                client_htlc_claims_attach(NULL, NULL, NULL);
+                sweeper_cleanup(&cl_sw);
+            }
+            if (cl_ctx) secp256k1_context_destroy(cl_ctx);
+        }
+
         persist_close(&db);
         if (exit_state == CLIENT_EXIT_FAILED) {
             printf("=== CLIENT FORCE-CLOSE FAILED ===\n");
@@ -4208,6 +4260,7 @@ int main(int argc, char *argv[]) {
 
     /* Fee estimator — honour --fee-estimator if provided */
     static watchtower_t client_wt;
+    static sweeper_t client_sweeper;
     static fee_estimator_static_t  client_fee_static;
     static fee_estimator_blocks_t  client_fee_blocks;
     static fee_estimator_api_t     client_fee_api;
@@ -4271,6 +4324,13 @@ int main(int argc, char *argv[]) {
         memset(&cbd, 0, sizeof(cbd));
         cbd.db = use_db ? &db : NULL;
         cbd.wt = &client_wt;
+        if (client_wt.chain &&
+            sweeper_init(&client_sweeper, ctx, NULL, NULL, 0, client_wt.chain,
+                         use_db ? &db : NULL, client_fee_ptr)) {
+            client_htlc_claims_attach(&client_sweeper, use_db ? &db : NULL,
+                                      ctx);
+            cbd.htlc_sweeper = &client_sweeper;
+        }
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
         cbd.lsp_forgery_response = lsp_forgery_mode;
@@ -4405,6 +4465,10 @@ int main(int argc, char *argv[]) {
                 ok = client_run_reconnect(ctx, &kp, host, port, &db,
                                             daemon_channel_cb, &cbd);
             }
+            /* The session's channel is gone: claims are built from the DB
+               until the next session. */
+            client_set_htlc_live_channel(NULL);
+            client_set_htlc_sweeper(NULL, 0);
             if (g_shutdown) break;
             if (ok == CLIENT_RECONNECT_REFUSED) {
                 /* The stored factory is not the signed tree.  Waiting and
@@ -4463,6 +4527,15 @@ int main(int argc, char *argv[]) {
                                cbd.jit_ch ? "open" : "none");
                     }
                 }
+                /* Same for HTLC claims, which must not wait for the LSP. */
+                if (cbd.htlc_sweeper) {
+                    static time_t last_claims = 0;
+                    time_t tn = time(NULL);
+                    if (tn - last_claims >= 10) {
+                        last_claims = tn;
+                        client_run_htlc_claims(cbd.htlc_sweeper);
+                    }
+                }
                 sleep(1);
             } else {
                 break;  /* clean exit */
@@ -4472,6 +4545,7 @@ int main(int argc, char *argv[]) {
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
+        client_wait_htlc_claims(cbd.htlc_sweeper);
         /* A close that did not complete is not a clean exit. */
         if (cbd.close_not_completed || cbd.rotation_not_completed)
             ok = 0;
@@ -4509,6 +4583,14 @@ int main(int argc, char *argv[]) {
             memset(&cbd, 0, sizeof(cbd));
             cbd.db  = use_db ? &db : NULL;
             cbd.wt  = &client_wt;
+            if (client_wt.chain &&
+                sweeper_init(&client_sweeper, ctx, NULL, NULL, 0,
+                             client_wt.chain, use_db ? &db : NULL,
+                             client_fee_ptr)) {
+                client_htlc_claims_attach(&client_sweeper,
+                                          use_db ? &db : NULL, ctx);
+                cbd.htlc_sweeper = &client_sweeper;
+            }
             cbd.fee = client_fee_ptr;
             cbd.rt  = rt_ok ? &rt : NULL;
             cbd.lsp_forgery_response = lsp_forgery_mode;
@@ -4519,9 +4601,12 @@ int main(int argc, char *argv[]) {
             ok = client_run_with_channels(ctx, &kp, host, port,
                                           daemon_channel_cb, &cbd,
                                           sa_vfn, sa_vctx);
+            client_set_htlc_live_channel(NULL);
+            client_set_htlc_sweeper(NULL, 0);
             if (cbd.force_close_requested)
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
+            client_wait_htlc_claims(cbd.htlc_sweeper);
             if (cbd.close_not_completed)
                 ok = 0;
         } else {

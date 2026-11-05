@@ -1206,6 +1206,10 @@ extern int test_htlc_claim_preimage_sealed(void);
 extern int test_htlc_claim_penalty_spent(void);
 extern int test_htlc_claim_persist_reload(void);
 extern int test_htlc_claim_priority_timing(void);
+extern int test_htlc_claim_lsp_sender_selection(void);
+extern int test_htlc_claim_lsp_fulfil_handler(void);
+extern int test_htlc_claim_lsp_bridge_handler(void);
+extern int test_htlc_claim_client_without_lsp(void);
 extern int test_htlc_claim_schema_upgrade(void);
 extern int test_regtest_rotation_all_arities(void);
 extern int test_regtest_full_tree_force_close_all_arities(void);
@@ -4285,6 +4289,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_claim_penalty_spent);
     RUN_TEST(test_htlc_claim_persist_reload);
     RUN_TEST(test_htlc_claim_priority_timing);
+    RUN_TEST(test_htlc_claim_lsp_sender_selection);
+    RUN_TEST(test_htlc_claim_lsp_fulfil_handler);
+    RUN_TEST(test_htlc_claim_lsp_bridge_handler);
+    RUN_TEST(test_htlc_claim_client_without_lsp);
     RUN_TEST(test_htlc_claim_schema_upgrade);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
