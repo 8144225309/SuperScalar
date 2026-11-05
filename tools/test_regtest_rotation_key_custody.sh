@@ -51,6 +51,16 @@
 #                rotation, is told that factory is retired, and exits it: its
 #                old tree's root, broadcast from its own DB, confirms; the
 #                LSP's database still holds that factory's tree and channels.
+#   SETTLE       every client that released its key first settled its old
+#                channel: its carried balance moved to the LSP and its latest
+#                old commitment revoked (LSP and client logs agree).
+#   DOUBLE_CLAIM after the stayer pushed the old tree, a moved client acts
+#                maliciously from its old DB (kept as .pre-rotation): client 1
+#                pushes its old tree path and its last old commitment (revoked
+#                by the settlement) in one block, client 2 pushes its old leaf
+#                only.  The LSP must win both: its penalty takes client 1's
+#                to_local, and it sweeps client 2's old channel output with
+#                the released key.
 #
 # MODE=winddown takes the partial path with every client online
 # (SS_TEST_ROTATE_PARTIAL, regtest only): every client moves and releases,
@@ -481,6 +491,109 @@ if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ]
   fi
 fi
 
+# --- SETTLE: every release came with the settlement of the old channel ---
+if [ "$MODE" != full ] && [ "$COMPLETE" -ge 1 ]; then
+  N_REL=$(cnt "released its old factory key \(verified release\)" "$L")
+  N_SET=$(cnt "settled its old channel: [0-9]+ sats back to the LSP" "$L")
+  N_CSET=0
+  for N in 1 2 3 4; do grep -qa "Client: old channel settled:" "$TMP/c$N.log" 2>/dev/null && N_CSET=$((N_CSET + 1)); done
+  N_SETDB=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE released = 1 AND settled = 1;" 2>/dev/null)
+  N_RELDB=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE released = 1;" 2>/dev/null)
+  if [ "${N_REL:-0}" -ge 1 ] && [ "$N_SET" -ge "$N_REL" ] && [ "$N_CSET" -ge "$N_REL" ] && \
+     [ "${N_SETDB:-0}" = "${N_RELDB:-x}" ]; then
+    verdict SETTLE 0 "$N_REL release(s), each after the settlement of its old channel (LSP: $N_SET settled, clients: $N_CSET; DB: $N_SETDB of $N_RELDB released rows settled)"
+  else
+    verdict SETTLE 1 "releases=$N_REL settled(lsp)=$N_SET settled(clients)=$N_CSET db settled/released=${N_SETDB:-?}/${N_RELDB:-?}"
+  fi
+fi
+
+# --- DOUBLE_CLAIM: a moved client claims its old position again ---
+# push_path <old db> <cidx> <with_commitment 0|1> <tag>: from the client's old
+# DB, broadcast its old tree path down to its channel output (mining for the
+# relative timelocks); the leaf goes in one block together with the client's
+# last old commitment when asked.  Prints "leaf_txid:vout commitment_txid".
+push_path() {
+  python3 - "$1" "$2" > "$TMP/path_$4.txt" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1]); cidx = int(sys.argv[2])
+ch = db.execute("SELECT funding_txid, funding_vout FROM channels WHERE factory_id = 0 AND slot = ? ORDER BY id LIMIT 1", (cidx,)).fetchone()
+nodes = {r[0]: r for r in db.execute("SELECT node_index, parent_index, txid, signed_tx_hex FROM tree_nodes WHERE factory_id = 0")}
+leaf = [r for r in nodes.values() if r[2] == ch[0]][0]
+path = []; n = leaf
+while n is not None:
+    path.append(n); p = n[1]
+    n = nodes.get(p) if p is not None and p >= 0 else None
+cm = db.execute("SELECT signed_tx_hex FROM signed_commitments WHERE channel_id IN (0, ?) ORDER BY commitment_number DESC LIMIT 1", (cidx,)).fetchone()
+print("%s %d %s" % (ch[0], ch[1], cm[0] if cm else ""))
+for r in reversed(path): print(r[2], r[3])
+PY
+  local leaf_txid leaf_vout chex txid hex last="" lasthex=""
+  read -r leaf_txid leaf_vout chex < "$TMP/path_$4.txt"
+  while read -r txid hex; do
+    [ -n "$last" ] || true
+    last=$txid; lasthex=$hex
+    [ "$txid" = "$leaf_txid" ] && break
+    for _ in $(seq 1 160); do
+      [ -n "$($BCLI getrawtransaction "$txid" 1 2>/dev/null | grep -o '"confirmations"')" ] && break
+      $BCLI sendrawtransaction "$hex" >/dev/null 2>&1
+      $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+    done
+  done < <(tail -n +2 "$TMP/path_$4.txt")
+  local ctxid=""
+  if [ "$3" = 1 ] && [ -n "$chex" ]; then
+    ctxid=$($BCLI decoderawtransaction "$chex" | python3 -c 'import json,sys; print(json.load(sys.stdin)["txid"])')
+    for _ in $(seq 1 160); do
+      $BCLI generateblock "$MADDR" "[\"$lasthex\",\"$chex\"]" >/dev/null 2>&1 && break
+      $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+    done
+  else
+    for _ in $(seq 1 160); do
+      [ -n "$($BCLI getrawtransaction "$leaf_txid" 1 2>/dev/null | grep -o '"confirmations"')" ] && break
+      $BCLI sendrawtransaction "$lasthex" >/dev/null 2>&1
+      $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+    done
+  fi
+  echo "$leaf_txid:$leaf_vout ${ctxid:-none}"
+}
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${DIST_SWEEP:-0}" != 1 ] && \
+   [ -f "$TMP/c1.db.pre-rotation" ] && [ -f "$TMP/c2.db.pre-rotation" ]; then
+  read -r C1_LEAF C1_COMMIT < <(push_path "$TMP/c1.db.pre-rotation" 0 1 c1)
+  read -r C2_LEAF _ < <(push_path "$TMP/c2.db.pre-rotation" 1 0 c2)
+  echo "double claim: client 1 leaf ${C1_LEAF:-?} with its revoked commitment ${C1_COMMIT:-?}; client 2 leaf ${C2_LEAF:-?}"
+  # Let the LSP answer: the wind-down steps once per block, the watchtower
+  # checks once a minute.
+  dc_eval() {
+    C1_CONF=$($BCLI getrawtransaction "${C1_COMMIT:-x}" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    C1_TOLOCAL=$($BCLI gettxout "${C1_COMMIT:-x}" 0 2>/dev/null)
+    PEN=$(grep -aE "BREACH DETECTED on channel [0-9]+, commitment [0-9]+ \(txid: ${C1_COMMIT:-x}\)" "$L" | head -1)
+    PEN_TX=$(sed -n "/BREACH DETECTED on channel [0-9]*, commitment [0-9]* (txid: ${C1_COMMIT:-x})/,\$p" "$L" | grep -aoE "Penalty tx broadcast: [0-9a-f]{64}" | head -1 | awk '{print $NF}')
+    PEN_CONF=$($BCLI getrawtransaction "${PEN_TX:-x}" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    C1_LEAF_SWEPT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM part_releases WHERE leaf_txid = '${C1_LEAF%:*}' AND sweep_txid IS NOT NULL;" 2>/dev/null)
+    C2_SWEEP=$(sqlite3 "$DB" "SELECT sweep_txid FROM part_releases WHERE leaf_txid = '${C2_LEAF%:*}';" 2>/dev/null)
+    C2_SWEEP_CONF=$($BCLI -rpcwallet="$WALLET" gettransaction "${C2_SWEEP:-x}" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    C2_OUT=$($BCLI gettxout "${C2_LEAF%:*}" "${C2_LEAF#*:}" 2>/dev/null)
+    C1_OK=0
+    # Client 1's revoked commitment confirmed: the LSP's penalty took its to_local.
+    [ "${C1_CONF:-0}" -ge 1 ] && [ -n "$PEN" ] && [ "${PEN_CONF:-0}" -ge 1 ] && [ -z "$C1_TOLOCAL" ] && C1_OK=1
+    # Or it never confirmed because the LSP swept that output first.
+    [ "${C1_CONF:-0}" -lt 1 ] && [ "${C1_LEAF_SWEPT:-0}" -ge 1 ] && [ -z "$($BCLI gettxout "${C1_LEAF%:*}" "${C1_LEAF#*:}" 2>/dev/null)" ] && C1_OK=1
+    C2_OK=0
+    [ -n "$C2_SWEEP" ] && [ "${C2_SWEEP_CONF:-0}" -ge 1 ] && [ -z "$C2_OUT" ] && C2_OK=1
+  }
+  for _ in $(seq 1 50); do
+    $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1; sleep 3
+    dc_eval
+    [ "$C1_OK" = 1 ] && [ "$C2_OK" = 1 ] && break
+  done
+  DC_DETAIL="client 1: revoked commitment ${C1_COMMIT:0:16}.. conf=${C1_CONF:-0}, penalty ${PEN_TX:0:16}.. conf=${PEN_CONF:-0}, its to_local unspent: ${C1_TOLOCAL:+yes}${C1_TOLOCAL:-no}; client 2: old leaf ${C2_LEAF:0:16}.. swept by ${C2_SWEEP:0:16}.. conf=${C2_SWEEP_CONF:-0}, unspent: ${C2_OUT:+yes}${C2_OUT:-no}"
+  if [ "$C1_OK" = 1 ] && [ "$C2_OK" = 1 ]; then
+    verdict DOUBLE_CLAIM 0 "the LSP won both: $DC_DETAIL"
+  else
+    verdict DOUBLE_CLAIM 1 "$DC_DETAIL"
+    grep -aE "BREACH|Penalty|old-tree channel output|settled its old" "$L" | tail -8 | cut -c1-170 | sed 's/^/  lsp: /'
+  fi
+fi
+
 # --- PAYOUT_KEYS: the exported descriptors pay this client's outputs ---
 EXP=$("$BUILD/superscalar_client" --network regtest --seckey "$(printf "%064x" 2)" \
         --db "$TMP/c1.db" --export-factory-keys 2>/dev/null)
@@ -663,12 +776,13 @@ if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ] && [ "${N_DEP:-0}" -gt 0 ]; th
       verdict SWEEP 1 "dist TX confirmed but swept=$SWEPT won=$SWEEP_WON keys_left=${N_DEP_END:-?}"
     fi
   else
-    # Resolved via the tree (a stayer forced its exit): no distribution TX, so
-    # no released-key payout output to sweep.  The moved clients' channel
-    # outputs in the old tree are not swept by this (a known open item); the
-    # keys must still go.
+    # Resolved via the tree (a stayer forced its exit): no distribution TX.
+    # Every moved client's old-tree channel output that reached the chain was
+    # swept by the LSP or spent (the penalised commitment), and buried, before
+    # the keys went.
+    N_LEAF_SWEPT=$(cnt "old-tree channel output .* is on chain -- sweeping it" "$L")
     if [ "${N_DEP_END:-1}" -eq 0 ]; then
-      verdict SWEEP 0 "the old factory resolved via the tree (no distribution TX); no released-key payout output to sweep; the released keys were deleted (the moved clients' old-tree channel outputs are not covered by this sweep)"
+      verdict SWEEP 0 "the old factory resolved via the tree (no distribution TX); old-tree channel outputs swept by the LSP: $N_LEAF_SWEPT; the released keys were deleted after those outputs were spent and buried"
     else
       verdict SWEEP 1 "resolved via the tree but ${N_DEP_END} released key(s) still in the DB"
     fi
