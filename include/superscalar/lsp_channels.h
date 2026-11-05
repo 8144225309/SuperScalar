@@ -264,6 +264,8 @@ typedef struct {
         uint32_t old_slot[FACTORY_MAX_SIGNERS];
         uint64_t carried[FACTORY_MAX_SIGNERS];
         unsigned char released[FACTORY_MAX_SIGNERS];
+        unsigned char settled[FACTORY_MAX_SIGNERS];      /* old commitment revoked */
+        uint32_t old_cltv;             /* the old factory's CLTV */
     } part_rel;
     secp256k1_pubkey part_retired_ids[FACTORY_MAX_SIGNERS];
     size_t n_part_retired;
@@ -789,6 +791,40 @@ size_t lsp_rotation_part_reask(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* MSG_ROTATION_RELEASE from client C: check the key against the old factory
    and store it sealed.  Returns 1 if it was taken. */
+/* The settlement of mover C's old channel, part of its release: on its
+   MSG_ROTATION_SETTLE_REQ the LSP loads that channel (kept under its retired
+   id) and answers MSG_ROTATION_SETTLE, one final update moving the balance
+   the client carried into the replacement to the LSP; on its
+   MSG_ROTATION_SETTLE_ACK it checks the revocation of the client's latest old
+   commitment, keeps it, watches that commitment (a later broadcast is
+   penalised, after a restart too) and records the settled state.  A release
+   counts only once settled.  Return 1 on success. */
+int lsp_rotation_part_on_settle_req(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                    const cJSON *json);
+int lsp_rotation_part_on_settle_ack(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                    const cJSON *json);
+
+/* Mover C's old channel (LSP side) from its retired rows, at its latest
+   state; the caller runs channel_cleanup.  It loads channel secrets, so it
+   is in the secrets library; the daemon registers it with
+   lsp_rotation_set_old_channel_loader (without it no settlement is made). */
+int lsp_rotation_part_load_old_channel(lsp_channel_mgr_t *mgr, size_t c, channel_t *ch);
+void lsp_rotation_set_old_channel_loader(int (*fn)(lsp_channel_mgr_t *, size_t, channel_t *));
+/* Mover C's old channel id (its retired rows) and its part_releases row. */
+uint32_t lsp_rotation_part_old_channel_id(const lsp_channel_mgr_t *mgr, size_t c);
+int lsp_rotation_part_release_row(lsp_channel_mgr_t *mgr, size_t c,
+                                  persist_part_release_t *out);
+
+/* The settlement offer over CH (LSP view, at the client's latest
+   commitment): moves min(client balance, CARRIED) to the LSP, advances the
+   commitment number, and signs the client's new commitment with a fresh
+   nonce against CLIENT_NONCE66.  With ALREADY the state is the settled one
+   and is signed again as it is.  Returns 1 with OUT filled (old_txid left to
+   the caller). */
+int lsp_rotation_settle_offer(channel_t *ch, uint64_t carried, int already,
+                              const unsigned char client_nonce66[66],
+                              wire_rotation_settle_t *out);
+
 int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
                                  const cJSON *json);
 

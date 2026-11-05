@@ -3687,6 +3687,7 @@ static void part_rel_fill(lsp_channel_mgr_t *mgr, lsp_t *lsp, const factory_t *o
         mgr->part_rel.old_slot[j] = (uint32_t)idx[j];
         mgr->part_rel.carried[j] = carried[j];
     }
+    mgr->part_rel.old_cltv = old_f->cltv_timeout;
     mgr->part_rel.valid = 1;
 }
 
@@ -3765,6 +3766,13 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
     (void)lsp;
     if (!mgr || !json || !mgr->part_rel.valid || c >= mgr->part_rel.m) return 0;
     if (mgr->part_rel.released[c]) return 1;
+    if (!mgr->part_rel.settled[c]) {
+        /* Only with the revocation of its latest old commitment: otherwise
+           that commitment still pays the client the balance it carried. */
+        fprintf(stderr, "LSP rotate: client %zu sent its key before settling its old "
+                "channel -- not counted\n", (size_t)mgr->part_rel.old_slot[c]);
+        return 0;
+    }
     unsigned char bind[32], b2[32], sk[32], ser[33];
     secp256k1_pubkey pub;
     size_t l = 33;
@@ -3806,6 +3814,179 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
     fflush(stdout);
     if (mgr->rot_progress.phase == LSP_ROT_PROGRESS_NONE)
         (void)lsp_rotation_winddown_tick(mgr, 1);      /* the last one: close now */
+    return 1;
+}
+
+/* ---- The settlement of a mover's old channel (part of its release) ---- */
+
+uint32_t lsp_rotation_part_old_channel_id(const lsp_channel_mgr_t *mgr, size_t c) {
+    return LSP_RETIRED_CHANNEL_ID(mgr->part_rel.retired_id - LSP_RETIRED_FACTORY_ID(0),
+                                  mgr->part_rel.old_slot[c]);
+}
+
+int lsp_rotation_part_release_row(lsp_channel_mgr_t *mgr, size_t c,
+                                  persist_part_release_t *out) {
+    persist_t *db = (persist_t *)mgr->persist;
+    if (!db) return 0;
+    persist_part_release_t *rel = calloc(FACTORY_MAX_SIGNERS, sizeof(*rel));
+    if (!rel) return 0;
+    char otx[65];
+    rot_txid_display(mgr->part_rel.old_txid, otx);
+    size_t n = persist_load_part_releases(db, otx, rel, FACTORY_MAX_SIGNERS);
+    int found = 0;
+    for (size_t k = 0; k < n && !found; k++)
+        if (rel[k].j == c) { *out = rel[k]; found = 1; }
+    free(rel);
+    return found;
+}
+
+/* The loader of a mover's old channel lives with the other secret loaders
+   (lsp_init_from_db.c); the LSP daemon registers it. */
+static int (*g_part_old_loader)(lsp_channel_mgr_t *, size_t, channel_t *) = NULL;
+
+void lsp_rotation_set_old_channel_loader(int (*fn)(lsp_channel_mgr_t *, size_t, channel_t *)) {
+    g_part_old_loader = fn;
+}
+
+static int part_load_old(lsp_channel_mgr_t *mgr, size_t c, channel_t *ch) {
+    return g_part_old_loader && g_part_old_loader(mgr, c, ch);
+}
+
+int lsp_rotation_settle_offer(channel_t *ch, uint64_t carried, int already,
+                              const unsigned char client_nonce66[66],
+                              wire_rotation_settle_t *out) {
+    if (!ch || !client_nonce66 || !out) return 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) return 0;
+    for (size_t i = 0; i < ch->n_ptlcs; i++)
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE) return 0;
+    if (!already) {
+        uint64_t mv = ch->remote_amount < carried ? ch->remote_amount : carried;
+        ch->remote_amount -= mv;
+        ch->local_amount += mv;
+        ch->commitment_number++;
+    }
+    if (!channel_init_nonce_pool(ch, 1) ||
+        !channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])client_nonce66, 1) ||
+        !musig_pubnonce_serialize(ch->ctx, out->pubnonce, &ch->local_nonce_pool.nonces[0].pubnonce) ||
+        !channel_create_commitment_partial_sig(ch, out->partial_sig, &out->nonce_index))
+        return 0;
+    out->commitment_number = ch->commitment_number;
+    out->client_amount = ch->remote_amount;
+    out->lsp_amount = ch->local_amount;
+    out->fee_rate = ch->fee_rate_sat_per_kvb;
+    return 1;
+}
+
+int lsp_rotation_part_on_settle_req(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                    const cJSON *json) {
+    if (!mgr || !lsp || !json || !mgr->part_rel.valid || c >= mgr->part_rel.m ||
+        c >= lsp->n_clients || lsp->client_fds[c] < 0 || mgr->part_rel.released[c])
+        return 0;
+    unsigned char ot[32], nonce[66];
+    uint64_t cn = 0;
+    if (!wire_parse_rotation_settle_req(json, ot, &cn, nonce) ||
+        memcmp(ot, mgr->part_rel.old_txid, 32) != 0)
+        return 0;
+    channel_t ch;
+    if (!part_load_old(mgr, c, &ch)) {
+        fprintf(stderr, "LSP rotate: the old channel of client %zu could not be loaded -- no "
+                "settlement\n", (size_t)mgr->part_rel.old_slot[c]);
+        return 0;
+    }
+    int already = mgr->part_rel.settled[c];
+    wire_rotation_settle_t s;
+    memset(&s, 0, sizeof(s));
+    int ok = (already ? cn + 1 == ch.commitment_number : cn == ch.commitment_number) &&
+             lsp_rotation_settle_offer(&ch, mgr->part_rel.carried[c], already, nonce, &s);
+    if (ok) {
+        memcpy(s.old_txid, mgr->part_rel.old_txid, 32);
+        cJSON *m = wire_build_rotation_settle(&s);
+        ok = m && wire_send(lsp->client_fds[c], MSG_ROTATION_SETTLE, m);
+        cJSON_Delete(m);
+    } else {
+        fprintf(stderr, "LSP rotate: client %zu asked to settle its old channel at commitment "
+                "%llu (ours: %llu) -- refused\n", (size_t)mgr->part_rel.old_slot[c],
+                (unsigned long long)cn, (unsigned long long)ch.commitment_number);
+        cJSON *e = wire_build_error("settlement refused");
+        if (e) { wire_send(lsp->client_fds[c], MSG_ERROR, e); cJSON_Delete(e); }
+    }
+    channel_cleanup(&ch);
+    return ok;
+}
+
+int lsp_rotation_part_on_settle_ack(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                                    const cJSON *json) {
+    (void)lsp;
+    if (!mgr || !json || !mgr->part_rel.valid || c >= mgr->part_rel.m) return 0;
+    uint32_t cid_w = 0;
+    unsigned char sec[32], np[33];
+    if (!wire_parse_revoke_and_ack(json, &cid_w, sec, np)) return 0;
+    channel_t ch;
+    if (!part_load_old(mgr, c, &ch)) {
+        secure_zero(sec, sizeof(sec));
+        return 0;
+    }
+    size_t slot = (size_t)mgr->part_rel.old_slot[c];
+    int ok;
+    if (mgr->part_rel.settled[c]) {
+        /* Answered again: the revocation is already held. */
+        ok = ch.commitment_number > 0 &&
+             channel_verify_revocation_secret(&ch, ch.commitment_number - 1, sec);
+        secure_zero(sec, sizeof(sec));
+        channel_cleanup(&ch);
+        return ok;
+    }
+    uint64_t old_cn = ch.commitment_number;
+    uint64_t old_local = ch.local_amount, old_remote = ch.remote_amount;
+    if (!channel_verify_revocation_secret(&ch, old_cn, sec)) {
+        fprintf(stderr, "LSP rotate: client %zu sent an INVALID revocation of its old "
+                "commitment %llu -- not settled\n", slot, (unsigned long long)old_cn);
+        secure_zero(sec, sizeof(sec));
+        channel_cleanup(&ch);
+        return 0;
+    }
+    persist_t *db = (persist_t *)mgr->persist;
+    uint32_t cid = lsp_rotation_part_old_channel_id(mgr, c);
+    char otx[65];
+    rot_txid_display(mgr->part_rel.old_txid, otx);
+    uint64_t mv = old_remote < mgr->part_rel.carried[c] ? old_remote : mgr->part_rel.carried[c];
+    int own = !persist_in_transaction(db);
+    ok = !own || persist_begin(db);
+    /* The revocation, the watch on the revoked commitment (its penalty built
+       now and kept), and the settled state, together. */
+    ok = ok && channel_receive_revocation(&ch, old_cn, sec);
+    char wtx[65] = "none";
+    if (ok && mgr->watchtower) {
+        watchtower_t *wt = mgr->watchtower;
+        size_t before = wt->n_entries;
+        watchtower_watch_revoked_commitment(wt, &ch, cid, old_cn, old_local, old_remote,
+                                            NULL, 0, NULL, 0);
+        if (wt->n_entries > before) {
+            unsigned char d[32];
+            memcpy(d, wt->entries[before].txid, 32);
+            reverse_bytes(d, 32);
+            hex_encode(d, 32, wtx);
+        }
+    }
+    ok = ok && persist_update_channel_balance(db, cid, old_local + mv, old_remote - mv,
+                                              old_cn + 1) &&
+         persist_set_part_settled(db, otx, (uint32_t)c);
+    if (own) {
+        if (ok) ok = persist_commit(db);
+        else persist_rollback(db);
+    }
+    secure_zero(sec, sizeof(sec));
+    channel_cleanup(&ch);
+    if (!ok) {
+        fprintf(stderr, "LSP rotate: could not record the settlement of client %zu\n", slot);
+        return 0;
+    }
+    mgr->part_rel.settled[c] = 1;
+    printf("LSP rotate: client %zu settled its old channel: %llu sats back to the LSP, its "
+           "old commitment %llu revoked and watched (%s)\n", slot, (unsigned long long)mv,
+           (unsigned long long)old_cn, wtx);
+    fflush(stdout);
     return 1;
 }
 
@@ -3852,7 +4033,30 @@ static int part_save_record(lsp_channel_mgr_t *mgr, persist_t *db, const factory
         memcpy(rel.old_pk, mgr->part_rel.old_pk[j], 33);
         memcpy(rel.new_pk, mgr->part_rel.new_pk[j], 33);
         rel.carried = mgr->part_rel.carried[j];
-        ok = persist_save_part_release(db, r->old_txid, &rel);
+        /* Its channel output in the old tree: the old channel's funding,
+           which a released key and the LSP's key spend together. */
+        size_t ni = 0;
+        uint32_t lv = 0;
+        ok = factory_client_to_leaf(old_f, rel.old_slot, &ni, &lv) && ni < old_f->n_nodes &&
+             lv < old_f->nodes[ni].n_outputs &&
+             old_f->nodes[ni].outputs[lv].script_pubkey_len == 34 &&
+             rel.old_slot + 1 < old_f->n_participants;
+        if (ok) {
+            const factory_node_t *nd = &old_f->nodes[ni];
+            musig_keyagg_t ka;
+            uint32_t si = 0;
+            rot_txid_display(nd->txid, rel.leaf_txid);
+            rel.leaf_vout = lv;
+            rel.leaf_amount = nd->outputs[lv].amount_sats;
+            memcpy(rel.leaf_spk, nd->outputs[lv].script_pubkey, 34);
+            rel.leaf_cltv = nd->cltv_timeout;
+            ok = channel_discover_funding_keyagg(mgr->ctx, &old_f->pubkeys[0],
+                                                 &old_f->pubkeys[rel.old_slot + 1],
+                                                 &old_f->pubkeys[0], old_f->cltv_timeout,
+                                                 nd->cltv_timeout, rel.leaf_spk, 34, &ka, &si,
+                                                 rel.leaf_merkle, &rel.has_leaf_merkle);
+        }
+        ok = ok && persist_save_part_release(db, r->old_txid, &rel);
     }
     free(r->dist_hex);
     free(r);
@@ -4238,6 +4442,11 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
         for (int tries = 0; tries < 16 && !got; tries++) {
             if (!wire_recv_timeout(lsp->client_fds[j], &rm, 600)) break;
             if (rm.msg_type == MSG_ROTATION_RELEASE) { got = 1; break; }
+            /* The settlement of its old channel comes first. */
+            if (rm.msg_type == MSG_ROTATION_SETTLE_REQ)
+                (void)lsp_rotation_part_on_settle_req(mgr, lsp, j, rm.json);
+            else if (rm.msg_type == MSG_ROTATION_SETTLE_ACK)
+                (void)lsp_rotation_part_on_settle_ack(mgr, lsp, j, rm.json);
             if (rm.json) cJSON_Delete(rm.json);
             rm.json = NULL;
             if (rm.msg_type == MSG_ERROR) break;
@@ -4347,6 +4556,7 @@ static int part_rel_restore(lsp_channel_mgr_t *mgr, const persist_part_rotation_
         mgr->part_rel.old_slot[j] = rel[k].old_slot;
         mgr->part_rel.carried[j] = rel[k].carried;
         mgr->part_rel.released[j] = rel[k].released ? 1 : 0;
+        mgr->part_rel.settled[j] = rel[k].settled ? 1 : 0;
         if (!rel[k].released) owed++;
     }
     free(rel);
@@ -4362,6 +4572,7 @@ static int part_rel_restore(lsp_channel_mgr_t *mgr, const persist_part_rotation_
     mgr->part_rel.m = r->m;
     mgr->part_rel.n_old = r->n_old;
     mgr->part_rel.retired_id = r->retired_id;
+    mgr->part_rel.old_cltv = r->old_cltv;
     mgr->part_rel.dying_id = UINT32_MAX;          /* not in this process's ladder */
     mgr->part_rel.valid = 1;
     if (owed_out) *owed_out = owed;

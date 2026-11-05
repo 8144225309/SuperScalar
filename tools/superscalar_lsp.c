@@ -1375,6 +1375,8 @@ int main(int argc, char *argv[]) {
     /* Line-buffered stdout/stderr so logs are visible in real time */
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    /* A partial rotation settles each mover's old channel from its retired rows. */
+    lsp_rotation_set_old_channel_loader(lsp_rotation_part_load_old_channel);
     /* Process start time, captured before any other work — used for the
        Prometheus uptime metric so it reflects true LSP-process lifetime
        rather than the (later) time when --prometheus-port forks the

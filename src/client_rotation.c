@@ -1289,6 +1289,201 @@ int client_part_funding_confirmed(regtest_t *rt, const unsigned char txid32[32],
     return ok;
 }
 
+/* ---- The settlement of our old channel (part of a release) ---- */
+
+static int g_part_settle_timeout = 120;
+void client_part_set_settle_timeout(int sec) { g_part_settle_timeout = sec > 0 ? sec : 120; }
+
+const char *client_part_settle_check(const channel_t *ch, uint64_t carried,
+                                     const unsigned char old_txid32[32],
+                                     const wire_rotation_settle_t *s) {
+    if (!ch || !old_txid32 || !s) return "bad arguments";
+    if (memcmp(s->old_txid, old_txid32, 32) != 0)
+        return "the settlement is not for our old factory";
+    if (!client_cin_channel_quiet(ch)) return "an HTLC is in flight on our old channel";
+    for (size_t i = 0; i < ch->n_ptlcs; i++)
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE)
+            return "a PTLC is in flight on our old channel";
+    if (s->commitment_number != ch->commitment_number + 1)
+        return "the settlement is not the next state of our old channel";
+    if (s->fee_rate != ch->fee_rate_sat_per_kvb)
+        return "the settlement changes the fee rate";
+    uint64_t keep = ch->local_amount > carried ? ch->local_amount - carried : 0;
+    uint64_t mv = ch->local_amount - keep;
+    if (s->client_amount != keep || s->lsp_amount != ch->remote_amount + mv)
+        return "the settlement does not move exactly the carried balance to the LSP";
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, ch->fee_rate_sat_per_kvb);
+    uint64_t cf = fee_for_commitment_tx(&fe.base, 0);
+    if (ch->funding_amount < cf || s->lsp_amount > ch->funding_amount - cf ||
+        s->client_amount > ch->funding_amount - cf - s->lsp_amount)
+        return "the settlement pays out more than the channel holds";
+    return NULL;
+}
+
+int client_part_load_old_channel(persist_t *odb, secp256k1_context *ctx,
+                                 const secp256k1_keypair *old_kp, channel_t *ch,
+                                 unsigned char old_txid_out32[32]) {
+    if (!odb || !ctx || !old_kp || !ch) return 0;
+    memset(ch, 0, sizeof(*ch));
+    factory_t *f = calloc(1, sizeof(*f));
+    if (!f) return 0;
+    int ok = persist_load_factory(odb, 0, f, ctx);
+    secp256k1_pubkey opk;
+    uint32_t mi = 0;
+    if (ok && secp256k1_keypair_pub(ctx, &opk, old_kp))
+        for (size_t i = 1; i < f->n_participants && !mi; i++)
+            if (pk_eq(ctx, &f->pubkeys[i], &opk)) mi = (uint32_t)i;
+    ok = ok && mi > 0;
+    uint32_t cidx = mi ? mi - 1 : 0;
+    unsigned char ls[4][32], rb[4][33];
+    secp256k1_pubkey p0, p1, p2, p3;
+    ok = ok && persist_load_basepoints(odb, cidx, ls, rb) &&
+         secp256k1_ec_pubkey_parse(ctx, &p0, rb[0], 33) &&
+         secp256k1_ec_pubkey_parse(ctx, &p1, rb[1], 33) &&
+         secp256k1_ec_pubkey_parse(ctx, &p2, rb[2], 33) &&
+         secp256k1_ec_pubkey_parse(ctx, &p3, rb[3], 33);
+    int inited = ok && client_init_channel(ch, ctx, f, old_kp, mi, &p0, &p1, &p2, &p3,
+                                           ls[0], ls[1], ls[2], ls[3], NULL);
+    secure_zero(ls, sizeof(ls));
+    ok = inited;
+    uint64_t la = 0, ra = 0, cn = 0;
+    ok = ok && persist_load_channel_state(odb, cidx, &la, &ra, &cn);
+    if (ok) {
+        ch->local_amount = la;
+        ch->remote_amount = ra;
+        ch->commitment_number = cn;
+        /* Our per-commitment secrets as persisted (the LSP holds the points
+           of these; a fresh one would not match). */
+        size_t pmax = (size_t)cn + 2, got = 0;
+        unsigned char (*pcs)[32] = calloc(pmax, 32);
+        if (pcs && persist_load_local_pcs(odb, 0, pcs, pmax, &got))
+            for (uint64_t k = 0; k < pmax; k++) {
+                int nz = 0;
+                for (int b = 0; b < 32 && !nz; b++) nz = pcs[k][b] != 0;
+                if (nz) channel_set_local_pcs(ch, k, pcs[k]);
+            }
+        if (pcs) { secure_zero(pcs, pmax * 32); free(pcs); }
+        ok = pcs != NULL;
+        for (uint64_t k = cn ? cn - 1 : 0; ok && k <= cn + 1; k++) {
+            unsigned char ser[33];
+            secp256k1_pubkey pcp;
+            if (persist_load_remote_pcp(odb, 0, k, ser) &&
+                secp256k1_ec_pubkey_parse(ctx, &pcp, ser, 33))
+                channel_set_remote_pcp(ch, k, &pcp);
+        }
+        htlc_t *hs = calloc(MAX_HTLCS, sizeof(htlc_t));
+        size_t nh = hs ? persist_load_htlcs(odb, cidx, hs, MAX_HTLCS) : 0;
+        for (size_t h = 0; h < nh && ch->n_htlcs < MAX_HTLCS; h++)
+            if (hs[h].state == HTLC_STATE_ACTIVE) ch->htlcs[ch->n_htlcs++] = hs[h];
+        free(hs);
+        ok = ok && hs != NULL;
+    }
+    if (ok && old_txid_out32) memcpy(old_txid_out32, f->funding_txid, 32);
+    if (!ok && inited) channel_cleanup(ch);
+    factory_free(f);
+    free(f);
+    return ok;
+}
+
+const char *client_part_settle(int fd, secp256k1_context *ctx, channel_t *ch,
+                               const unsigned char old_txid32[32], uint64_t carried,
+                               int timeout_sec) {
+    if (!ctx || !ch || !old_txid32) return "bad arguments";
+    if (!client_cin_channel_quiet(ch)) return "an HTLC is in flight on our old channel";
+    unsigned char pn[66];
+    if (!channel_init_nonce_pool(ch, 1) ||
+        !musig_pubnonce_serialize(ctx, pn, &ch->local_nonce_pool.nonces[0].pubnonce))
+        return "internal";
+    cJSON *rq = wire_build_rotation_settle_req(old_txid32, ch->commitment_number, pn);
+    int ok = rq && wire_send(fd, MSG_ROTATION_SETTLE_REQ, rq);
+    cJSON_Delete(rq);
+    if (!ok) return "could not ask for the settlement";
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    if (!recv_skip(fd, &m, timeout_sec) || m.msg_type != MSG_ROTATION_SETTLE) {
+        if (m.json) cJSON_Delete(m.json);
+        return "no settlement of our old channel was offered";
+    }
+    wire_rotation_settle_t s;
+    ok = wire_parse_rotation_settle(m.json, &s);
+    cJSON_Delete(m.json);
+    if (!ok) return "malformed settlement";
+    const char *why = client_part_settle_check(ch, carried, old_txid32, &s);
+    if (why) return why;
+    uint64_t old_cn = ch->commitment_number;
+    uint64_t moved = ch->local_amount - s.client_amount;
+    char rtx[65] = "?";
+    {
+        tx_buf_t ut;
+        unsigned char t32[32];
+        tx_buf_init(&ut, 512);
+        if (channel_build_commitment_tx(ch, &ut, t32)) {
+            reverse_bytes(t32, 32);
+            hex_encode(t32, 32, rtx);
+        }
+        tx_buf_free(&ut);
+    }
+    ch->local_amount = s.client_amount;
+    ch->remote_amount = s.lsp_amount;
+    ch->commitment_number = s.commitment_number;
+    unsigned char full[64], sec[32];
+    if (!channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])s.pubnonce, 1) ||
+        !channel_verify_and_aggregate_commitment_sig(ch, s.partial_sig, s.nonce_index, full))
+        return "the LSP's settlement signature does not verify for our old channel";
+    memcpy(ch->latest_commitment_sig, full, 64);
+    ch->has_latest_commitment_sig = 1;
+    secp256k1_pubkey np;
+    if (ch->n_local_pcs <= s.commitment_number + 1 &&
+        !channel_generate_local_pcs(ch, s.commitment_number + 1))
+        return "internal";
+    if (!channel_get_revocation_secret(ch, old_cn, sec) ||
+        !channel_get_per_commitment_point(ch, s.commitment_number + 1, &np))
+        return "internal";
+    cJSON *ack = wire_build_revoke_and_ack(0, sec, ctx, &np);
+    secure_zero(sec, sizeof(sec));
+    ok = ack && wire_send(fd, MSG_ROTATION_SETTLE_ACK, ack);
+    if (ack) {
+        cJSON *k = cJSON_GetObjectItemCaseSensitive(ack, "revocation_secret");
+        if (cJSON_IsString(k)) secure_zero(k->valuestring, strlen(k->valuestring));
+        cJSON_Delete(ack);
+    }
+    if (!ok) return "could not send the revocation";
+    printf("Client: old channel settled: %llu sats to the LSP (carried into the "
+           "replacement), our old commitment %llu revoked (%s)\n", (unsigned long long)moved,
+           (unsigned long long)old_cn, rtx);
+    fflush(stdout);
+    return NULL;
+}
+
+/* After the switch our old channel lives in the old DB, kept beside the main
+   one as DB_PATH.pre-rotation[.N]: the one whose factory 0 is OLD_TXID32. */
+static int open_old_db(const char *db_path, const unsigned char old_txid32[32],
+                       persist_t *out) {
+    if (!db_path || strlen(db_path) > 600) return 0;
+    char want[65];
+    txid_display(old_txid32, want);
+    for (int i = 0; i < 1000; i++) {
+        char p[700];
+        if (i == 0) snprintf(p, sizeof(p), "%s.pre-rotation", db_path);
+        else snprintf(p, sizeof(p), "%s.pre-rotation.%d", db_path, i);
+        if (access(p, F_OK) != 0) break;
+        memset(out, 0, sizeof(*out));
+        if (!persist_open(out, p)) continue;
+        sqlite3_stmt *st;
+        int match = 0;
+        if (sqlite3_prepare_v2(out->db, "SELECT funding_txid FROM factories WHERE id = 0;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                match = strcmp((const char *)sqlite3_column_text(st, 0), want) == 0;
+            sqlite3_finalize(st);
+        }
+        if (match) return 1;
+        persist_close(out);
+    }
+    return 0;
+}
+
 /* Mark key IDX released in the DB at PATH (the side DB that becomes ours). */
 static int mark_released_in(const char *path, uint32_t idx, const char *old_txid) {
     persist_t s;
@@ -1570,6 +1765,20 @@ int client_part_run(int fd, secp256k1_context *ctx, persist_t *db, const char *d
                                               nf, &bind, &npk, slot, nc->local_amount, ft,
                                               b_lsp, receipt, b_own, &oidx)
                   : "malformed release request";
+        if (!why) {
+            /* Only now: the settlement of the old channel, then the key. */
+            channel_t och;
+            unsigned char ot[32];
+            if (!client_part_load_old_channel(db, ctx, old_kp, &och, ot)) {
+                why = "our old channel cannot be loaded";
+            } else {
+                why = memcmp(ot, old_f->funding_txid, 32) != 0
+                          ? "our DB's factory is not the old factory"
+                          : client_part_settle(fd, ctx, &och, old_f->funding_txid,
+                                               nc->local_amount, g_part_settle_timeout);
+                channel_cleanup(&och);
+            }
+        }
         if (why) {
             fprintf(stderr, "Client: NOT releasing our old factory key: %s\n", why);
             cJSON *e = wire_build_error("release refused");
@@ -1647,7 +1856,7 @@ int client_part_switch_due(persist_t *db, const cJSON *req) {
 }
 
 int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
-                               const factory_t *f, const cJSON *req) {
+                               const char *db_path, const factory_t *f, const cJSON *req) {
     if (!db || !f || !req || !g_cin_rt) return 0;
     unsigned char ft[32], b_lsp[32], receipt[64], b_own[32];
     if (!wire_parse_rotation_release_req(req, ft, b_lsp, receipt)) return 0;
@@ -1734,6 +1943,29 @@ int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
                                         &old_stub_ch, f, &bind, &npk, slot, row.carried, ft,
                                         b_lsp, receipt, b_own, &oidx);
         if (!why && oidx != row.old_key_index) why = "our old factory key is not the recorded one";
+    }
+    if (!why) {
+        /* Only now: the settlement of the old channel, from the old DB (the
+           main one until the switch, its kept copy after), then the key. */
+        persist_t odb;
+        memset(&odb, 0, sizeof(odb));
+        int own = strcmp(row.state, "part_switched") == 0;
+        persist_t *op = own ? (open_old_db(db_path, old_stub.funding_txid, &odb) ? &odb : NULL)
+                            : db;
+        channel_t och;
+        unsigned char ot[32];
+        if (!op) {
+            why = "the DB of our old factory (its .pre-rotation copy) is not there";
+        } else if (!client_part_load_old_channel(op, ctx, &okp, &och, ot)) {
+            why = "our old channel cannot be loaded";
+        } else {
+            why = memcmp(ot, old_stub.funding_txid, 32) != 0
+                      ? "the old DB's factory is not the old factory"
+                      : client_part_settle(fd, ctx, &och, old_stub.funding_txid, row.carried,
+                                           g_part_settle_timeout);
+            channel_cleanup(&och);
+        }
+        if (own && op) persist_close(&odb);
     }
     if (why) {
         fprintf(stderr, "Client: NOT releasing our old factory key: %s\n", why);

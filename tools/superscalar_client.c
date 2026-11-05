@@ -1487,7 +1487,8 @@ handle_message:
             client_part_set_jit_active(cbd && cbd->jit_ch &&
                                        cbd->jit_ch->state != JIT_STATE_NONE &&
                                        cbd->jit_ch->state != JIT_STATE_CLOSED);
-            int rel = client_part_on_release_req(fd, ctx, cbd ? cbd->db : NULL, factory,
+            int rel = client_part_on_release_req(fd, ctx, cbd ? cbd->db : NULL,
+                                                 cbd ? cbd->poison_db_path : NULL, factory,
                                                  msg.json);
             /* Asked while we still run the old factory: once the replacement
                is at the safe depth, switch first (the request comes again). */

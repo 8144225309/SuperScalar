@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "superscalar/client.h"
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
@@ -1157,6 +1158,9 @@ int test_part_release_again(void) {
     TEST_ASSERT(!lsp_rotation_part_on_release(mgr, &lsp, 0, r), "another key is not taken");
     cJSON_Delete(r);
     r = wire_build_rotation_release(bind, osk);
+    TEST_ASSERT(!lsp_rotation_part_on_release(mgr, &lsp, 0, r) && !mgr->part_rel.released[0],
+                "the right key, but its old commitment not revoked: the release does not count");
+    mgr->part_rel.settled[0] = 1;                   /* the settlement's revocation held */
     TEST_ASSERT(lsp_rotation_part_on_release(mgr, &lsp, 0, r) && mgr->part_rel.released[0],
                 "its old factory key is taken");
     cJSON_Delete(r);
@@ -1238,6 +1242,314 @@ int test_part_seal_rows(void) {
     return 1;
 }
 
+/* As the LSP daemon does: a partial rotation settles each mover's old
+   channel from its retired rows. */
+void test_rotation_register_loaders(void) {
+    lsp_rotation_set_old_channel_loader(lsp_rotation_part_load_old_channel);
+}
+
+/* ---- The settlement of a mover's old channel: the client against a
+   dishonest LSP ---- */
+
+typedef struct {
+    factory_t *f;            /* the old factory: the LSP, the client's old key, another */
+    channel_t lch;           /* the LSP's view of the client's old channel */
+} settle_pair_t;
+
+static void settle_pair_free(settle_pair_t *sp) {
+    channel_cleanup(&sp->lch);
+    if (sp->f) { factory_free(sp->f); free(sp->f); }
+    memset(sp, 0, sizeof(*sp));
+}
+
+/* The old factory (funding OLD32) with the client's old key OKP at slot 1;
+   the client's old channel at commitment 3 stored in a DB at PATH, and the
+   LSP's view of that channel in SP. */
+static int settle_pair_build(settle_pair_t *sp, const char *path, const secp256k1_keypair *okp,
+                             const unsigned char old32[32], const unsigned char lsk[32],
+                             const secp256k1_pubkey *other) {
+    secp256k1_context *ctx = cin_ctx();
+    memset(sp, 0, sizeof(*sp));
+    secp256k1_pubkey lpk, opk;
+    if (!secp256k1_ec_pubkey_create(ctx, &lpk, lsk) || !secp256k1_keypair_pub(ctx, &opk, okp))
+        return 0;
+    secp256k1_pubkey pks[3] = { lpk, opk, *other };
+    sp->f = calloc(1, sizeof(factory_t));
+    unsigned char spk[34];
+    if (!sp->f) return 0;
+    factory_init_from_pubkeys(sp->f, ctx, pks, 3, 10, 4);
+    if (!factory_funding_spk_for(ctx, pks, 3, spk)) return 0;
+    factory_set_funding(sp->f, old32, 1, 100000, spk, 34);
+    sp->f->cltv_timeout = 2000;
+    if (!factory_build_tree(sp->f)) return 0;
+    /* Both sides work from the factory as the client's DB gives it back. */
+    {
+        persist_t fdb;
+        unlink(path);
+        factory_t *f2 = calloc(1, sizeof(factory_t));
+        int fok = f2 && persist_open(&fdb, path);
+        fok = fok && persist_save_factory(&fdb, sp->f, ctx, 0) &&
+              persist_save_tree_nodes(&fdb, sp->f, 0) && persist_load_factory(&fdb, 0, f2, ctx);
+        if (fdb.db) persist_close(&fdb);
+        factory_free(sp->f);
+        free(sp->f);
+        sp->f = f2;
+        if (!fok) return 0;
+    }
+    unsigned char ls[4][32], cs[4][32];
+    secp256k1_pubkey lbp[4];
+    for (int i = 0; i < 4; i++) {
+        memset(ls[i], 0x31 + i, 32);
+        memset(cs[i], 0x41 + i, 32);
+        if (!secp256k1_ec_pubkey_create(ctx, &lbp[i], ls[i])) return 0;
+    }
+    channel_t cch;
+    memset(&cch, 0, sizeof(cch));
+    if (!client_init_channel(&cch, ctx, sp->f, okp, 1, &lbp[0], &lbp[1], &lbp[2], &lbp[3],
+                             cs[0], cs[1], cs[2], cs[3], NULL))
+        return 0;
+    cch.commitment_number = 3;
+    for (uint64_t k = 0; k <= 4; k++) channel_generate_local_pcs(&cch, k);
+    persist_t odb;
+    int ok = persist_open(&odb, path);
+    ok = ok && persist_save_channel(&odb, &cch, 0, 0) && persist_save_basepoints(&odb, 0, &cch) &&
+         persist_update_channel_balance(&odb, 0, cch.local_amount, cch.remote_amount, 3);
+    for (uint64_t k = 0; ok && k <= 4; k++) {
+        unsigned char pcs[32];
+        ok = channel_get_local_pcs(&cch, k, pcs) && persist_save_local_pcs(&odb, 0, k, pcs);
+    }
+    if (odb.db) persist_close(&odb);
+    /* The LSP's view: the same leaf output. */
+    size_t ni = 0;
+    uint32_t v = 0;
+    ok = ok && factory_client_to_leaf(sp->f, 0, &ni, &v);
+    if (!ok) { channel_cleanup(&cch); return 0; }
+    const factory_node_t *nd = &sp->f->nodes[ni];
+    ok = channel_init(&sp->lch, ctx, lsk, &lpk, &opk, nd->txid, v, nd->outputs[v].amount_sats,
+                      nd->outputs[v].script_pubkey, 34, cch.remote_amount, cch.local_amount,
+                      cch.to_self_delay);
+    if (ok) {
+        musig_keyagg_t ka;
+        uint32_t si = 0;
+        unsigned char mr[32];
+        int hm = 0;
+        sp->lch.funder_is_local = 1;
+        sp->lch.use_cpfp_anchor = cch.use_cpfp_anchor;
+        sp->lch.use_revocation_leaf = cch.use_revocation_leaf;
+        ok = channel_discover_funding_keyagg(ctx, &lpk, &opk, &lpk, sp->f->cltv_timeout,
+                                             nd->cltv_timeout, nd->outputs[v].script_pubkey, 34,
+                                             &ka, &si, mr, &hm);
+        sp->lch.funding_keyagg = ka;
+        sp->lch.local_funding_signer_idx = si;
+        sp->lch.has_chan_merkle_root = hm;
+        if (hm) memcpy(sp->lch.chan_merkle_root, mr, 32);
+        channel_set_local_basepoints(&sp->lch, ls[0], ls[1], ls[2]);
+        channel_set_local_htlc_basepoint(&sp->lch, ls[3]);
+        channel_set_remote_basepoints(&sp->lch, &cch.local_payment_basepoint,
+                                      &cch.local_delayed_payment_basepoint,
+                                      &cch.local_revocation_basepoint);
+        channel_set_remote_htlc_basepoint(&sp->lch, &cch.local_htlc_basepoint);
+        sp->lch.commitment_number = 3;
+        for (uint64_t k = 0; k <= 4; k++) {
+            secp256k1_pubkey pcp;
+            channel_generate_local_pcs(&sp->lch, k);
+            if (k >= 2 && channel_get_per_commitment_point(&cch, k, &pcp))
+                channel_set_remote_pcp(&sp->lch, k, &pcp);
+        }
+    }
+    channel_cleanup(&cch);
+    return ok;
+}
+
+enum { FAKE_HONEST, FAKE_SPLIT, FAKE_OTHER_FACTORY, FAKE_OTHER_CHANNEL, FAKE_FEE,
+       FAKE_NO_SETTLE };
+
+typedef struct {
+    int fd;
+    settle_pair_t *sp;
+    uint64_t carried;
+    int mode;
+    int got_req, got_ack, ack_ok, got_release, got_error, ack_before_release;
+} fake_lsp_t;
+
+/* A scripted LSP on the other end: answers the settlement request as MODE
+   says, and reports what the client sent. */
+static void *fake_lsp_run(void *arg) {
+    fake_lsp_t *x = (fake_lsp_t *)arg;
+    for (int i = 0; i < 8 && !x->got_release; i++) {
+        wire_msg_t m;
+        memset(&m, 0, sizeof(m));
+        if (!wire_recv_timeout(x->fd, &m, 2)) break;
+        if (m.msg_type == MSG_ROTATION_SETTLE_REQ) {
+            unsigned char ot[32], nonce[66];
+            uint64_t cn = 0;
+            x->got_req = wire_parse_rotation_settle_req(m.json, ot, &cn, nonce);
+            channel_t *ch = &x->sp->lch;
+            if (x->mode == FAKE_NO_SETTLE) {
+                /* No settlement: a plain commitment signature, as if a
+                   revocation were owed anyway. */
+                unsigned char z[32];
+                memset(z, 0, 32);
+                cJSON *cs = wire_build_commitment_signed(0, cn + 1, z, 0);
+                wire_send(x->fd, MSG_COMMITMENT_SIGNED, cs);
+                cJSON_Delete(cs);
+            } else {
+                uint64_t carried = x->carried;
+                uint32_t saved_vout = ch->funding_vout;
+                if (x->mode == FAKE_SPLIT) carried /= 2;
+                if (x->mode == FAKE_OTHER_CHANNEL) ch->funding_vout ^= 1;
+                if (x->mode == FAKE_FEE) ch->fee_rate_sat_per_kvb = 2000;
+                wire_rotation_settle_t s;
+                memset(&s, 0, sizeof(s));
+                if (lsp_rotation_settle_offer(ch, carried, 0, nonce, &s)) {
+                    memcpy(s.old_txid, ot, 32);
+                    if (x->mode == FAKE_OTHER_FACTORY) s.old_txid[0] ^= 1;
+                    cJSON *sm = wire_build_rotation_settle(&s);
+                    wire_send(x->fd, MSG_ROTATION_SETTLE, sm);
+                    cJSON_Delete(sm);
+                }
+                ch->funding_vout = saved_vout;
+            }
+        } else if (m.msg_type == MSG_ROTATION_SETTLE_ACK) {
+            uint32_t cid = 0;
+            unsigned char sec[32], np[33];
+            x->got_ack = 1;
+            x->ack_ok = wire_parse_revoke_and_ack(m.json, &cid, sec, np) &&
+                        channel_verify_revocation_secret(&x->sp->lch, 3, sec);
+        } else if (m.msg_type == MSG_ROTATION_RELEASE) {
+            x->got_release = 1;
+            x->ack_before_release = x->got_ack;
+        } else if (m.msg_type == MSG_ERROR) {
+            x->got_error = 1;
+        }
+        cJSON_Delete(m.json);
+    }
+    return NULL;
+}
+
+/* The client settles its old channel only as recorded: exactly the carried
+   balance to the LSP, the next commitment of that very channel, the fee rate
+   unchanged, nothing in flight; otherwise it revokes nothing. */
+int test_part_settle_client(void) {
+    secp256k1_context *ctx = cin_ctx();
+    unsigned char lsk[32], osk[32], old32[32];
+    memset(lsk, 0x72, 32);
+    memset(osk, 0x73, 32);
+    memset(old32, 0x5a, 32);
+    secp256k1_keypair okp;
+    secp256k1_pubkey oth;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &okp, osk) && mk_pk(&oth, 0x75), "keys");
+    const struct { int mode; const char *what; } cases[] = {
+        { FAKE_HONEST, "the honest settlement: revoked" },
+        { FAKE_SPLIT, "a split that leaves us part of the carried balance: refused" },
+        { FAKE_OTHER_FACTORY, "a settlement for another factory: refused" },
+        { FAKE_OTHER_CHANNEL, "a settlement signed for another channel: refused" },
+        { FAKE_FEE, "a settlement at another fee rate: refused" },
+        { FAKE_NO_SETTLE, "a revocation asked for without a settlement: refused" },
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        char path[] = "/tmp/ss_part_st_XXXXXX";
+        int tfd = mkstemp(path);
+        TEST_ASSERT(tfd >= 0, "tmp");
+        close(tfd);
+        settle_pair_t sp;
+        TEST_ASSERT(settle_pair_build(&sp, path, &okp, old32, lsk, &oth), "old channel pair");
+        persist_t odb;
+        TEST_ASSERT(persist_open(&odb, path), "old db");
+        channel_t och;
+        unsigned char ot[32];
+        TEST_ASSERT(client_part_load_old_channel(&odb, ctx, &okp, &och, ot) &&
+                    memcmp(ot, old32, 32) == 0 && och.commitment_number == 3,
+                    "our old channel loads from the old DB");
+        uint64_t carried = och.local_amount, lsp_before = och.remote_amount;
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        fake_lsp_t x;
+        memset(&x, 0, sizeof(x));
+        x.fd = sv[1]; x.sp = &sp; x.carried = carried; x.mode = cases[k].mode;
+        pthread_t th;
+        TEST_ASSERT(pthread_create(&th, NULL, fake_lsp_run, &x) == 0, "fake LSP");
+        const char *why = client_part_settle(sv[0], ctx, &och, old32, carried, 3);
+        close(sv[0]);
+        pthread_join(th, NULL);
+        close(sv[1]);
+        printf("    %s: %s\n", cases[k].what, why ? why : "settled");
+        if (cases[k].mode == FAKE_HONEST)
+            TEST_ASSERT(!why && x.got_ack && x.ack_ok && och.local_amount == 0 &&
+                        och.remote_amount == lsp_before + carried && och.commitment_number == 4,
+                        cases[k].what);
+        else
+            TEST_ASSERT(why && x.got_req && !x.got_ack, cases[k].what);
+        channel_cleanup(&och);
+        persist_close(&odb);
+        settle_pair_free(&sp);
+        unlink(path);
+    }
+    /* An HTLC in flight on the old channel: not even asked for. */
+    {
+        char path[] = "/tmp/ss_part_sh_XXXXXX";
+        int tfd = mkstemp(path);
+        TEST_ASSERT(tfd >= 0, "tmp");
+        close(tfd);
+        settle_pair_t sp;
+        TEST_ASSERT(settle_pair_build(&sp, path, &okp, old32, lsk, &oth), "old channel pair");
+        persist_t odb;
+        channel_t och;
+        TEST_ASSERT(persist_open(&odb, path) &&
+                    client_part_load_old_channel(&odb, ctx, &okp, &och, NULL), "loads");
+        uint64_t hid = 0;
+        unsigned char ph[32];
+        memset(ph, 0x44, 32);
+        TEST_ASSERT(channel_add_htlc(&och, HTLC_OFFERED, 1000, ph, 500, &hid), "an HTLC");
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        fake_lsp_t x;
+        memset(&x, 0, sizeof(x));
+        x.fd = sv[1]; x.sp = &sp; x.carried = 1; x.mode = FAKE_HONEST;
+        pthread_t th;
+        TEST_ASSERT(pthread_create(&th, NULL, fake_lsp_run, &x) == 0, "fake LSP");
+        const char *why = client_part_settle(sv[0], ctx, &och, old32, 1, 3);
+        close(sv[0]);
+        pthread_join(th, NULL);
+        close(sv[1]);
+        TEST_ASSERT(why && !x.got_req && !x.got_ack, "an HTLC in flight: nothing asked, nothing revoked");
+        channel_cleanup(&och);
+        persist_close(&odb);
+        settle_pair_free(&sp);
+        unlink(path);
+    }
+    /* The checks themselves, against the recorded channel. */
+    {
+        channel_t ch;
+        memset(&ch, 0, sizeof(ch));
+        ch.local_amount = 7000;
+        ch.remote_amount = 40000;
+        ch.funding_amount = 50000;
+        ch.commitment_number = 9;
+        ch.fee_rate_sat_per_kvb = 1000;
+        wire_rotation_settle_t s;
+        memset(&s, 0, sizeof(s));
+        memcpy(s.old_txid, old32, 32);
+        s.commitment_number = 10;
+        s.client_amount = 0;
+        s.lsp_amount = 47000;
+        s.fee_rate = 1000;
+        TEST_ASSERT(!client_part_settle_check(&ch, 7000, old32, &s), "exact: accepted");
+        s.client_amount = 1000; s.lsp_amount = 46000;
+        TEST_ASSERT(client_part_settle_check(&ch, 7000, old32, &s), "part kept: refused");
+        TEST_ASSERT(!client_part_settle_check(&ch, 6000, old32, &s),
+                    "old balance minus carried kept: accepted");
+        s.client_amount = 0; s.lsp_amount = 47000;
+        s.commitment_number = 11;
+        TEST_ASSERT(client_part_settle_check(&ch, 7000, old32, &s), "not the next commitment");
+        s.commitment_number = 10;
+        ch.funding_amount = 47000;
+        TEST_ASSERT(client_part_settle_check(&ch, 7000, old32, &s),
+                    "the LSP's side above the capacity minus the commitment fee: refused");
+    }
+    return 1;
+}
+
 /* A release asked for later must never hand over the key the client signs
    its current factory with: the probe a legacy client (old key = identity
    key) whose replacement key is index 0 and whose row records index 0. */
@@ -1313,7 +1625,7 @@ int test_part_release_leak(void) {
 #define SENT_RELEASE() ({ wire_msg_t m_; memset(&m_, 0, sizeof(m_)); int r_ = 0; \
         if (wire_recv_timeout(sv[1], &m_, 1)) { r_ = m_.msg_type == MSG_ROTATION_RELEASE; \
         cJSON_Delete(m_.json); } r_; })
-    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, path, f, req) == 0 && !SENT_RELEASE(),
                 "no recorded old key: nothing released");
 
     char h0[67];
@@ -1323,11 +1635,11 @@ int test_part_release_leak(void) {
     hex_encode(s0, 33, h0);
     snprintf(row.old_pubkey, sizeof(row.old_pubkey), "%s", h0);
     TEST_ASSERT(persist_client_rotation_save(&db, &row), "row (the current key recorded)");
-    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, path, f, req) == 0 && !SENT_RELEASE(),
                 "never the current factory key");
     /* Even if its key row were not active any more. */
     TEST_ASSERT(persist_factory_key_set_state(&db, i0, FACTORY_KEY_STATE_RETIRED, 0), "retired");
-    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, path, f, req) == 0 && !SENT_RELEASE(),
                 "never the current factory key, whatever its key row says");
     TEST_ASSERT(persist_factory_key_set_state(&db, i0, FACTORY_KEY_STATE_ACTIVE, 0), "active");
     char st[16];
@@ -1347,18 +1659,71 @@ int test_part_release_leak(void) {
     row.old_key_index = i1;
     snprintf(row.old_pubkey, sizeof(row.old_pubkey), "%s", h1);
     TEST_ASSERT(persist_client_rotation_save(&db, &row), "row (the old key)");
-    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, path, f, req) == 0 && !SENT_RELEASE(),
                 "the old key still active: refused");
     TEST_ASSERT(persist_factory_key_set_state(&db, i1, FACTORY_KEY_STATE_RETIRED, 0), "retired");
     snprintf(row.state, sizeof(row.state), "done");
     TEST_ASSERT(persist_client_rotation_save(&db, &row), "row done");
-    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 0 && !SENT_RELEASE(),
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, path, f, req) == 0 && !SENT_RELEASE(),
                 "not a signed, unreleased partial rotation: refused");
     snprintf(row.state, sizeof(row.state), "part_switched");
     TEST_ASSERT(persist_client_rotation_save(&db, &row), "row again");
-    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, f, req) == 1 && SENT_RELEASE(),
-                "the recorded old key is released");
+    TEST_ASSERT(client_part_on_release_req(sv[0], ctx, &db, path, f, req) == 0 && !SENT_RELEASE(),
+                "its old channel cannot be settled (no copy of the old DB): nothing released");
 #undef SENT_RELEASE
+    /* The old DB, kept as the .pre-rotation copy at the switch: the old
+       channel is settled from it, then the key goes. */
+    char pre[96];
+    snprintf(pre, sizeof(pre), "%s.pre-rotation", path);
+    secp256k1_pubkey oth;
+    TEST_ASSERT(mk_pk(&oth, 0x76), "other");
+    settle_pair_t sp;
+    TEST_ASSERT(settle_pair_build(&sp, pre, &kp1, old32, lsk, &oth), "the old DB");
+    client_part_set_settle_timeout(3);
+    /* A settlement offered before the release checks pass is not taken, and
+       nothing is revoked: the replacement is not at the safe depth yet. */
+    snprintf(txo, sizeof(txo), "{\"confirmations\":0,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"%s\"}}",
+             (double)f->funding_amount_sats / 1e8, spkh);
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    {
+        wire_rotation_settle_t early;
+        memset(&early, 0, sizeof(early));
+        memcpy(early.old_txid, old32, 32);
+        early.commitment_number = 4;
+        early.lsp_amount = 1;
+        cJSON *em = wire_build_rotation_settle(&early);
+        TEST_ASSERT(em && wire_send(sv[1], MSG_ROTATION_SETTLE, em), "an early settlement offer");
+        cJSON_Delete(em);
+    }
+    fake_lsp_t x;
+    memset(&x, 0, sizeof(x));
+    x.fd = sv[1]; x.sp = &sp; x.carried = 5000; x.mode = FAKE_HONEST;
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, fake_lsp_run, &x) == 0, "fake LSP");
+    int rr = client_part_on_release_req(sv[0], ctx, &db, path, f, req);
+    pthread_join(th, NULL);
+    TEST_ASSERT(rr == 0 && !x.got_req && !x.got_ack && !x.got_release,
+                "release checks fail: no settlement asked, nothing revoked, no key");
+    {
+        wire_msg_t dm;
+        memset(&dm, 0, sizeof(dm));
+        TEST_ASSERT(wire_recv_timeout(sv[0], &dm, 1) && dm.msg_type == MSG_ROTATION_SETTLE,
+                    "the early offer was never read");
+        cJSON_Delete(dm.json);
+    }
+    snprintf(txo, sizeof(txo), "{\"confirmations\":2,\"value\":%.8f,\"scriptPubKey\":{\"hex\":\"%s\"}}",
+             (double)f->funding_amount_sats / 1e8, spkh);
+    setenv("SS_FAKE_TXOUT", txo, 1);
+    memset(&x, 0, sizeof(x));
+    x.fd = sv[1]; x.sp = &sp; x.carried = 5000; x.mode = FAKE_HONEST;
+    TEST_ASSERT(pthread_create(&th, NULL, fake_lsp_run, &x) == 0, "fake LSP");
+    rr = client_part_on_release_req(sv[0], ctx, &db, path, f, req);
+    pthread_join(th, NULL);
+    TEST_ASSERT(rr == 1 && x.got_req && x.got_ack && x.ack_ok && x.got_release &&
+                x.ack_before_release, "settled from the old DB, its old commitment revoked, then released");
+    settle_pair_free(&sp);
+    unlink(pre);
+    client_part_set_settle_timeout(120);
     persist_client_rotation_t chk;
     memset(&chk, 0, sizeof(chk));
     TEST_ASSERT(persist_client_rotation_load(&db, oldtx, &chk) == 1 &&
@@ -1652,6 +2017,7 @@ int test_part_release_slot(void) {
     cJSON *r = wire_build_rotation_release(bind, osk);
     lsp_t lsp;
     memset(&lsp, 0, sizeof(lsp));
+    mgr->part_rel.settled[0] = 1;
     TEST_ASSERT(lsp_rotation_part_on_release(mgr, &lsp, 0, r), "taken");
     cJSON_Delete(r);
     int dep[4] = {0};

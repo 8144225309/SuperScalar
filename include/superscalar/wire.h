@@ -235,6 +235,25 @@
 #define MSG_ROTATION_RELEASE_REQ 0x91
 #define MSG_ROTATION_RELEASE     0x92
 
+/* The settlement of the client's old channel, part of its release: after its
+   release checks pass and before it sends its key, the client asks for one
+   final update of its old channel that moves the balance it carried into the
+   replacement to the LSP, signs it, and revokes its own latest old
+   commitment.
+   MSG_ROTATION_SETTLE_REQ client -> LSP: {"funding_txid": the old factory's
+                     funding, "commitment_number": the client's latest old
+                     commitment, "pubnonce": a fresh nonce for that channel}.
+   MSG_ROTATION_SETTLE LSP -> client: {"funding_txid", "commitment_number":
+                     the next one, "client_amount", "lsp_amount", "fee_rate",
+                     "pubnonce", "partial_sig", "nonce_index"}: the LSP's
+                     partial signature over the client's new commitment.
+   MSG_ROTATION_SETTLE_ACK client -> LSP: the REVOKE_AND_ACK of the old channel
+                     ({"channel_id", "revocation_secret",
+                     "next_per_commitment_point"}); then MSG_ROTATION_RELEASE. */
+#define MSG_ROTATION_SETTLE_REQ  0x93
+#define MSG_ROTATION_SETTLE      0x94
+#define MSG_ROTATION_SETTLE_ACK  0x95
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -1360,5 +1379,24 @@ cJSON *wire_build_rotation_release(const unsigned char binding32[32],
                                    const unsigned char old_seckey32[32]);
 int wire_parse_rotation_release(const cJSON *j, unsigned char binding32[32],
                                 unsigned char old_seckey32[32]);
+
+/* MSG_ROTATION_SETTLE_REQ / MSG_ROTATION_SETTLE (txids in internal order). */
+cJSON *wire_build_rotation_settle_req(const unsigned char old_txid32[32],
+                                      uint64_t commitment_number,
+                                      const unsigned char pubnonce66[66]);
+int wire_parse_rotation_settle_req(const cJSON *j, unsigned char old_txid32[32],
+                                   uint64_t *commitment_number,
+                                   unsigned char pubnonce66[66]);
+typedef struct {
+    unsigned char old_txid[32];
+    uint64_t commitment_number;     /* the client's new old-channel commitment */
+    uint64_t client_amount, lsp_amount;
+    uint64_t fee_rate;              /* sat/kvB of that commitment */
+    unsigned char pubnonce[66];
+    unsigned char partial_sig[32];
+    uint32_t nonce_index;
+} wire_rotation_settle_t;
+cJSON *wire_build_rotation_settle(const wire_rotation_settle_t *s);
+int wire_parse_rotation_settle(const cJSON *j, wire_rotation_settle_t *s);
 
 #endif /* SUPERSCALAR_WIRE_H */

@@ -129,6 +129,15 @@ static const char *SCHEMA_VERSION_SQL =
     "  new_pk TEXT NOT NULL,"                                \
     "  carried INTEGER NOT NULL,"                            \
     "  released INTEGER NOT NULL DEFAULT 0,"                 \
+    "  settled INTEGER NOT NULL DEFAULT 0,"                  \
+    "  leaf_txid TEXT,"                                      \
+    "  leaf_vout INTEGER,"                                   \
+    "  leaf_amount INTEGER,"                                 \
+    "  leaf_spk TEXT,"                                       \
+    "  leaf_merkle TEXT,"                                    \
+    "  leaf_cltv INTEGER,"                                   \
+    "  sweep_txid TEXT,"                                     \
+    "  spent_height INTEGER,"                                \
     "  PRIMARY KEY (old_txid, j)"                            \
     ");"
 
@@ -1550,6 +1559,18 @@ int persist_open(persist_t *p, const char *path) {
         if (ok44 && !persist_v44_column_exists(p->db, "part_rotations", "dist_hex"))
             ok44 = sqlite3_exec(p->db,
                 "ALTER TABLE part_rotations ADD COLUMN dist_hex TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "part_releases", "settled"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE part_releases ADD COLUMN settled INTEGER NOT NULL DEFAULT 0;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_txid TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_vout INTEGER;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_amount INTEGER;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_spk TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_merkle TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN leaf_cltv INTEGER;"
+                "ALTER TABLE part_releases ADD COLUMN sweep_txid TEXT;"
+                "ALTER TABLE part_releases ADD COLUMN spent_height INTEGER;",
                 NULL, NULL, &merr44) == SQLITE_OK;
         if (!ok44) {
             fprintf(stderr, "persist_open: migration v44 failed: %s\n",
@@ -8342,10 +8363,15 @@ int persist_save_part_release(persist_t *p, const char *old_txid,
     char op[67], np[67];
     hex_encode(r->old_pk, 33, op);
     hex_encode(r->new_pk, 33, np);
+    char spk[69], mr[65];
+    hex_encode(r->leaf_spk, 34, spk);
+    hex_encode(r->leaf_merkle, 32, mr);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(p->db, "INSERT OR REPLACE INTO part_releases (old_txid, j, "
-                           "old_slot, old_pk, new_pk, carried, released) VALUES "
-                           "(?,?,?,?,?,?,?);", -1, &st, NULL) != SQLITE_OK)
+                           "old_slot, old_pk, new_pk, carried, released, settled, leaf_txid, "
+                           "leaf_vout, leaf_amount, leaf_spk, leaf_merkle, leaf_cltv, "
+                           "sweep_txid, spent_height) VALUES "
+                           "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);", -1, &st, NULL) != SQLITE_OK)
         return 0;
     sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, r->j);
@@ -8354,6 +8380,21 @@ int persist_save_part_release(persist_t *p, const char *old_txid,
     sqlite3_bind_text(st, 5, np, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)r->carried);
     sqlite3_bind_int(st, 7, r->released ? 1 : 0);
+    sqlite3_bind_int(st, 8, r->settled ? 1 : 0);
+    if (r->leaf_txid[0]) {
+        sqlite3_bind_text(st, 9, r->leaf_txid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 10, r->leaf_vout);
+        sqlite3_bind_int64(st, 11, (sqlite3_int64)r->leaf_amount);
+        sqlite3_bind_text(st, 12, spk, -1, SQLITE_TRANSIENT);
+        if (r->has_leaf_merkle) sqlite3_bind_text(st, 13, mr, -1, SQLITE_TRANSIENT);
+        else sqlite3_bind_null(st, 13);
+        sqlite3_bind_int64(st, 14, r->leaf_cltv);
+    } else {
+        for (int k = 9; k <= 14; k++) sqlite3_bind_null(st, k);
+    }
+    if (r->sweep_txid[0]) sqlite3_bind_text(st, 15, r->sweep_txid, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 15);
+    sqlite3_bind_int64(st, 16, r->spent_height);
     int ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     return ok;
@@ -8363,7 +8404,9 @@ size_t persist_load_part_releases(persist_t *p, const char *old_txid,
                                   persist_part_release_t *rows, size_t max) {
     if (!p || !p->db || !old_txid || !rows || max == 0) return 0;
     sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(p->db, "SELECT j, old_slot, old_pk, new_pk, carried, released "
+    if (sqlite3_prepare_v2(p->db, "SELECT j, old_slot, old_pk, new_pk, carried, released, "
+                           "settled, leaf_txid, leaf_vout, leaf_amount, leaf_spk, leaf_merkle, "
+                           "leaf_cltv, sweep_txid, spent_height "
                            "FROM part_releases WHERE old_txid = ? ORDER BY j;", -1, &st,
                            NULL) != SQLITE_OK)
         return 0;
@@ -8381,6 +8424,20 @@ size_t persist_load_part_releases(persist_t *p, const char *old_txid,
         r->old_slot = (uint32_t)sqlite3_column_int64(st, 1);
         r->carried = (uint64_t)sqlite3_column_int64(st, 4);
         r->released = sqlite3_column_int(st, 5) ? 1 : 0;
+        r->settled = sqlite3_column_int(st, 6) ? 1 : 0;
+        const char *lt = (const char *)sqlite3_column_text(st, 7);
+        const char *ls = (const char *)sqlite3_column_text(st, 10);
+        const char *lm = (const char *)sqlite3_column_text(st, 11);
+        const char *sw = (const char *)sqlite3_column_text(st, 13);
+        if (lt && strlen(lt) == 64 && ls && hex_decode(ls, r->leaf_spk, 34) == 34) {
+            snprintf(r->leaf_txid, sizeof(r->leaf_txid), "%s", lt);
+            r->leaf_vout = (uint32_t)sqlite3_column_int64(st, 8);
+            r->leaf_amount = (uint64_t)sqlite3_column_int64(st, 9);
+            r->has_leaf_merkle = lm && hex_decode(lm, r->leaf_merkle, 32) == 32;
+            r->leaf_cltv = (uint32_t)sqlite3_column_int64(st, 12);
+        }
+        if (sw && strlen(sw) == 64) snprintf(r->sweep_txid, sizeof(r->sweep_txid), "%s", sw);
+        r->spent_height = (uint32_t)sqlite3_column_int64(st, 14);
         n++;
     }
     sqlite3_finalize(st);
@@ -8395,6 +8452,36 @@ int persist_set_part_released(persist_t *p, const char *old_txid, uint32_t j) {
         return 0;
     sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, j);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_set_part_settled(persist_t *p, const char *old_txid, uint32_t j) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "UPDATE part_releases SET settled = 1 WHERE "
+                           "old_txid = ? AND j = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, j);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int persist_set_part_leaf_state(persist_t *p, const char *old_txid, uint32_t j,
+                                const char *sweep_txid, uint32_t spent_height) {
+    if (!p || !p->db || !old_txid) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "UPDATE part_releases SET sweep_txid = ?, spent_height = ? "
+                           "WHERE old_txid = ? AND j = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    if (sweep_txid && sweep_txid[0]) sqlite3_bind_text(st, 1, sweep_txid, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 1);
+    sqlite3_bind_int64(st, 2, spent_height);
+    sqlite3_bind_text(st, 3, old_txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, j);
     int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(p->db) == 1;
     sqlite3_finalize(st);
     return ok;

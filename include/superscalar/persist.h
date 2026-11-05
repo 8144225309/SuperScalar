@@ -769,7 +769,19 @@ typedef struct {
     uint32_t old_slot;          /* slot in the old factory */
     unsigned char old_pk[33], new_pk[33];
     uint64_t carried;
-    int released;
+    int released;               /* its old key is held (only after the settlement) */
+    int settled;                /* its latest old commitment is revoked */
+    /* Its channel output in the old tree: MuSig(old key, LSP) on the key
+       path, plus the leaf's CLTV script leaf when it has one. */
+    char leaf_txid[65];         /* display hex; empty if not recorded */
+    uint32_t leaf_vout;
+    uint64_t leaf_amount;
+    unsigned char leaf_spk[34];
+    unsigned char leaf_merkle[32];
+    int has_leaf_merkle;
+    uint32_t leaf_cltv;         /* the leaf node's CLTV */
+    char sweep_txid[65];        /* the LSP's sweep of that output, once sent */
+    uint32_t spent_height;      /* first height that output was seen spent (0: not) */
 } persist_part_release_t;
 
 int persist_save_part_rotation(persist_t *p, const persist_part_rotation_t *r);
@@ -781,6 +793,12 @@ int persist_save_part_release(persist_t *p, const char *old_txid,
 size_t persist_load_part_releases(persist_t *p, const char *old_txid,
                                   persist_part_release_t *rows, size_t max);
 int persist_set_part_released(persist_t *p, const char *old_txid, uint32_t j);
+/* The settlement of mover J's old channel is done (its revocation held). */
+int persist_set_part_settled(persist_t *p, const char *old_txid, uint32_t j);
+/* Mover J's old-tree channel output: the sweep sent and the first height it
+   was seen spent. */
+int persist_set_part_leaf_state(persist_t *p, const char *old_txid, uint32_t j,
+                                const char *sweep_txid, uint32_t spent_height);
 /* Every released key stored for FACTORY_ID. */
 int persist_delete_departed_clients(persist_t *p, uint32_t factory_id);
 /* The next unused retired-factory index (see LSP_RETIRED_FACTORY_ID): unique

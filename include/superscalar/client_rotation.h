@@ -193,7 +193,37 @@ const char *client_part_release_check(regtest_t *rt, persist_t *db, secp256k1_co
    the old key and carried balance from the rotation row.  Returns 1 if the
    key was released. */
 int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
-                               const factory_t *f, const cJSON *req);
+                               const char *db_path, const factory_t *f, const cJSON *req);
+
+/* The settlement of our old channel, part of a release (run only after the
+   release checks pass, before the key goes).  The client asks for it, and
+   accepts only one final update of the recorded old channel: the next
+   commitment, the fee rate unchanged, no HTLC or PTLC in flight, our side
+   left with exactly our old balance minus what was carried into the
+   replacement (normally 0), the rest to the LSP, and the LSP's side at most
+   the capacity minus the commitment fee.  Returns NULL if the offer S is
+   acceptable for CH, else why not. */
+const char *client_part_settle_check(const channel_t *ch, uint64_t carried,
+                                     const unsigned char old_txid32[32],
+                                     const wire_rotation_settle_t *s);
+
+/* Our old channel at its latest persisted state from ODB (a DB whose
+   factory 0 is the old factory, ours under OLD_KP).  The caller runs
+   channel_cleanup.  OLD_TXID_OUT32 (optional): that factory's funding. */
+int client_part_load_old_channel(persist_t *odb, secp256k1_context *ctx,
+                                 const secp256k1_keypair *old_kp, channel_t *ch,
+                                 unsigned char old_txid_out32[32]);
+
+/* Run the settlement over FD on CH (loaded): send MSG_ROTATION_SETTLE_REQ,
+   check the LSP's MSG_ROTATION_SETTLE (client_part_settle_check and its
+   signature), then send MSG_ROTATION_SETTLE_ACK revoking our latest old
+   commitment.  Returns NULL once that revocation is sent, else why not
+   (nothing revoked). */
+/* How long a release waits for the LSP's settlement (seconds; default 120). */
+void client_part_set_settle_timeout(int sec);
+const char *client_part_settle(int fd, secp256k1_context *ctx, channel_t *ch,
+                               const unsigned char old_txid32[32], uint64_t carried,
+                               int timeout_sec);
 
 /* 1 if REQ (a release request) is for a partial rotation we signed whose
    funding is now at the safe depth on our own chain, but we still run the

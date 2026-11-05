@@ -1195,6 +1195,7 @@ extern int test_part_winddown_tick(void);
 extern int test_part_reask(void);
 extern int test_part_switch_due(void);
 extern int test_part_sweep_build(void);
+extern int test_part_settle_client(void);
 extern int test_cin_records(void);
 extern int test_cin_tree_bind_record(void);
 extern int test_cin_json_strict(void);
@@ -3251,6 +3252,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_part_reask);
     RUN_TEST(test_part_switch_due);
     RUN_TEST(test_part_sweep_build);
+    RUN_TEST(test_part_settle_client);
     RUN_TEST(test_cin_records);
     RUN_TEST(test_cin_tree_bind_record);
     RUN_TEST(test_cin_json_strict);
@@ -4239,8 +4241,11 @@ static void run_regtest_tests(void) {
     regtest_faucet_health_report();
 }
 
+extern void test_rotation_register_loaders(void);
+
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
+    test_rotation_register_loaders();
 
     if (argc < 2)
         run_unit = 1;

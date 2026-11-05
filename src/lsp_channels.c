@@ -5263,6 +5263,14 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         (void)lsp_rotation_part_on_release(mgr, lsp, client_idx, msg->json);
         return 1;
 
+    case MSG_ROTATION_SETTLE_REQ:
+        (void)lsp_rotation_part_on_settle_req(mgr, lsp, client_idx, msg->json);
+        return 1;
+
+    case MSG_ROTATION_SETTLE_ACK:
+        (void)lsp_rotation_part_on_settle_ack(mgr, lsp, client_idx, msg->json);
+        return 1;
+
     case MSG_UPDATE_FAIL_HTLC: {
         uint64_t htlc_id;
         char reason[256];
