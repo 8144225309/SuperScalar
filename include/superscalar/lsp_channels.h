@@ -864,20 +864,50 @@ typedef enum {
    close_confs: the LSP's own close confirmations (-1 none).  funding_spent: the
    old funding is spent.  dist_present / dist_buried: its distribution TX is in
    the mempool-or-chain / buried.  n_released_unresolved: released-key outputs
-   (dist payouts) still unspent.  past_cltv_margin: height is past the old CLTV
-   plus the margin.  Keys are deleted only when nothing a released key guards is
-   unspent: the LSP's own close is buried, OR the dist TX is buried and every
-   released-key output is spent, OR (a non-dist on-chain spend bypassed the dist
-   TX, so no dist output can appear) past the CLTV plus the margin.  Known gap:
-   a moved client's channel output in the old tree (2-of-2 of its released key
-   and the LSP) is not swept or tracked, and its old commitment is not revoked
-   at release; that exposure remains until the release settles the old
-   channel. */
+   (dist payouts) still unspent.  n_leaf_unspent: moved clients' channel
+   outputs in the old tree (MuSig of a released key and the LSP) on chain and
+   unspent; n_leaf_pending: such outputs spent (or in the mempool) but not yet
+   buried.  past_cltv_margin: height is past the old CLTV plus the margin.
+   Keys are deleted only when nothing a released key guards is unspent: the
+   LSP's own close is buried, OR the dist TX is buried and every released-key
+   output is spent, OR (the funding spent by the tree, so no dist output can
+   appear) past the CLTV plus the margin with every such tree output that
+   reached the chain swept or spent and buried. */
 lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, uint32_t m,
                                              uint32_t n_released, int close_confs,
                                              int funding_spent, int dist_present,
                                              int dist_buried, uint32_t n_released_unresolved,
+                                             uint32_t n_leaf_unspent, uint32_t n_leaf_pending,
                                              int past_cltv_margin, int regtest);
+
+/* A key-path sweep of a moved client's channel output in the old tree (REL's
+   leaf: MuSig of its released key KEY32 and the LSP's key, tweaked with the
+   leaf's merkle root) to OUT_SPK.  Refuses unless the two keys control that
+   output.  Returns 1 with the signed TX and its display txid. */
+int lsp_rotation_leaf_sweep_build(const secp256k1_context *ctx,
+                                  const unsigned char *lsp_seckey32,
+                                  const unsigned char *key32,
+                                  const persist_part_release_t *rel,
+                                  const unsigned char *out_spk, size_t out_spk_len,
+                                  uint64_t fee, tx_buf_t *signed_out, char txid_out[65]);
+
+/* The virtual size the fee of a sweep of a moved client's old-tree channel
+   output is paid for: by the key path, or (CLTV_PATH) through the leaf's
+   CLTV script leaf.  At least the real size of either sweep. */
+size_t lsp_rotation_leaf_sweep_vsize(int cltv_path);
+
+/* The same output, once the released keys are gone: the LSP alone through
+   the leaf's CLTV script leaf (<cltv> OP_CLTV OP_DROP <LSP> OP_CHECKSIG; the
+   CLTV is the leaf's or the factory's, FACTORY_CLTV), nLockTime at that
+   CLTV.  REL->old_pk is the client's (released) key, for the internal key.
+   Refuses unless that script leaf and internal key give the output key. */
+int lsp_rotation_leaf_timeout_sweep_build(const secp256k1_context *ctx,
+                                          const unsigned char *lsp_seckey32,
+                                          const persist_part_release_t *rel,
+                                          uint32_t factory_cltv,
+                                          const unsigned char *out_spk, size_t out_spk_len,
+                                          uint64_t fee, tx_buf_t *signed_out,
+                                          char txid_out[65]);
 
 /* A key-path P2TR sweep of SRC (a distribution-TX output paying P2TR of the
    taproot-tweaked released key KEY32) to OUT_SPK.  Signs with the tweaked

@@ -1550,6 +1550,105 @@ int test_part_settle_client(void) {
     return 1;
 }
 
+/* The LSP sweeps a moved client's old-tree channel output with the released
+   key and its own, only if those two keys control it. */
+/* The virtual size of a one-input segwit transaction with an empty
+   scriptSig (0 if it cannot be read). */
+static size_t sweep_vsize(const unsigned char *tx, size_t len) {
+    if (len < 10 || tx[4] != 0 || tx[5] != 1 || tx[6] != 1) return 0;
+    size_t off = 7 + 32 + 4 + 1 + 4;            /* the input, empty scriptSig */
+    if (off >= len) return 0;
+    size_t nout = tx[off++];
+    for (size_t i = 0; i < nout; i++) {
+        if (off + 9 > len) return 0;
+        off += 8;
+        off += 1 + tx[off];
+    }
+    if (off + 4 > len) return 0;
+    size_t wit = len - 4 - off, base = len - 2 - wit;
+    return (base * 3 + len + 3) / 4;
+}
+
+int test_part_leaf_sweep_build(void) {
+    secp256k1_context *ctx = cin_ctx();
+    unsigned char lsk[32], osk[32], wrong[32], old32[32];
+    memset(lsk, 0x72, 32);
+    memset(osk, 0x73, 32);
+    memset(wrong, 0x74, 32);
+    memset(old32, 0x5b, 32);
+    secp256k1_keypair okp;
+    secp256k1_pubkey oth;
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &okp, osk) && mk_pk(&oth, 0x75), "keys");
+    char path[] = "/tmp/ss_part_lf_XXXXXX";
+    int tfd = mkstemp(path);
+    TEST_ASSERT(tfd >= 0, "tmp");
+    close(tfd);
+    settle_pair_t sp;
+    TEST_ASSERT(settle_pair_build(&sp, path, &okp, old32, lsk, &oth), "old factory");
+    persist_part_release_t rel;
+    memset(&rel, 0, sizeof(rel));
+    unsigned char rv[32];
+    memcpy(rv, sp.lch.funding_txid, 32);
+    reverse_bytes(rv, 32);
+    hex_encode(rv, 32, rel.leaf_txid);
+    rel.leaf_vout = sp.lch.funding_vout;
+    rel.leaf_amount = sp.lch.funding_amount;
+    memcpy(rel.leaf_spk, sp.lch.funding_spk, 34);
+    rel.has_leaf_merkle = sp.lch.has_chan_merkle_root;
+    memcpy(rel.leaf_merkle, sp.lch.chan_merkle_root, 32);
+    TEST_ASSERT(rel.has_leaf_merkle, "the leaf output has its CLTV script leaf");
+    unsigned char out[34] = { 0x51, 0x20 };
+    memset(out + 2, 0x66, 32);
+    tx_buf_t stx;
+    tx_buf_init(&stx, 256);
+    char t[65];
+    TEST_ASSERT(lsp_rotation_leaf_sweep_build(ctx, lsk, osk, &rel, out, 34, 300, &stx, t) &&
+                stx.len > 0, "the released key and the LSP key sweep it");
+    TEST_ASSERT(sweep_vsize(stx.data, stx.len) <= lsp_rotation_leaf_sweep_vsize(0),
+                "its fee is paid for at least its real size");
+    tx_buf_free(&stx);
+    tx_buf_init(&stx, 256);
+    TEST_ASSERT(!lsp_rotation_leaf_sweep_build(ctx, lsk, wrong, &rel, out, 34, 300, &stx, t),
+                "another key does not control it: refused");
+    tx_buf_free(&stx);
+    /* Once the keys are gone: the LSP alone, through the leaf's CLTV path. */
+    secp256k1_pubkey opk;
+    size_t l33 = 33;
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &opk, &okp) &&
+                secp256k1_ec_pubkey_serialize(ctx, rel.old_pk, &l33, &opk, SECP256K1_EC_COMPRESSED),
+                "the client's key");
+    rel.leaf_cltv = sp.f->cltv_timeout;
+    tx_buf_init(&stx, 256);
+    TEST_ASSERT(lsp_rotation_leaf_timeout_sweep_build(ctx, lsk, &rel, sp.f->cltv_timeout, out, 34,
+                                                      300, &stx, t) && stx.len > 0,
+                "the LSP alone through the CLTV path");
+    printf("    sweep vsize: CLTV path %zu (paid for %zu)\n", sweep_vsize(stx.data, stx.len),
+           lsp_rotation_leaf_sweep_vsize(1));
+    TEST_ASSERT(sweep_vsize(stx.data, stx.len) <= lsp_rotation_leaf_sweep_vsize(1),
+                "its fee is paid for at least its real size (script and control block)");
+    tx_buf_free(&stx);
+    unsigned char wrong_pk[33];
+    memcpy(wrong_pk, rel.old_pk, 33);
+    secp256k1_pubkey wpk;
+    TEST_ASSERT(mk_pk(&wpk, 0x77), "wrong");
+    l33 = 33;
+    secp256k1_ec_pubkey_serialize(ctx, rel.old_pk, &l33, &wpk, SECP256K1_EC_COMPRESSED);
+    tx_buf_init(&stx, 256);
+    TEST_ASSERT(!lsp_rotation_leaf_timeout_sweep_build(ctx, lsk, &rel, sp.f->cltv_timeout, out, 34,
+                                                       300, &stx, t),
+                "an internal key that is not the output's: refused");
+    tx_buf_free(&stx);
+    memcpy(rel.old_pk, wrong_pk, 33);
+    tx_buf_init(&stx, 256);
+    rel.has_leaf_merkle = 0;
+    TEST_ASSERT(!lsp_rotation_leaf_sweep_build(ctx, lsk, osk, &rel, out, 34, 300, &stx, t),
+                "without the leaf's merkle root the key is not the output's: refused");
+    tx_buf_free(&stx);
+    settle_pair_free(&sp);
+    unlink(path);
+    return 1;
+}
+
 /* A release asked for later must never hand over the key the client signs
    its current factory with: the probe a legacy client (old key = identity
    key) whose replacement key is index 0 and whose row records index 0. */
@@ -2129,37 +2228,46 @@ int test_part_load_restart(void) {
    go. */
 int test_part_winddown_action(void) {
     /* Every client moved and released and the funding is still there: close. */
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 0, 0, 0, 0, 0, 1) == LSP_WD_CLOSE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 0, 0, 0, 0, 0, 0, 0, 1) == LSP_WD_CLOSE,
                 "every client moved and released: close");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 1, 0, 0, 0, 0, 1) == LSP_WD_NONE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 4, -1, 1, 0, 0, 0, 0, 0, 0, 1) == LSP_WD_NONE,
                 "but not once the funding is already spent");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 3, -1, 0, 0, 0, 0, 0, 1) == LSP_WD_NONE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 4, 3, -1, 0, 0, 0, 0, 0, 0, 0, 1) == LSP_WD_NONE,
                 "a release still owed: wait");
     /* The LSP's own close: keys only once it is buried. */
-    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 5, 1, 0, 0, 0, 0, 1) == LSP_WD_WAIT &&
-                lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 1, 0, 0, 0, 0, 1) == LSP_WD_DELETE,
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 5, 1, 0, 0, 0, 0, 0, 0, 1) == LSP_WD_WAIT &&
+                lsp_rotation_winddown_action("closing", 4, 4, 4, 6, 1, 0, 0, 0, 0, 0, 0, 1) == LSP_WD_DELETE,
                 "close buried on regtest (6): delete");
-    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 105, 1, 0, 0, 0, 1, 0) == LSP_WD_WAIT &&
-                lsp_rotation_winddown_action("closing", 4, 4, 4, 106, 1, 0, 0, 0, 1, 0) == LSP_WD_DELETE,
+    TEST_ASSERT(lsp_rotation_winddown_action("closing", 4, 4, 4, 105, 1, 0, 0, 0, 0, 0, 1, 0) == LSP_WD_WAIT &&
+                lsp_rotation_winddown_action("closing", 4, 4, 4, 106, 1, 0, 0, 0, 0, 0, 1, 0) == LSP_WD_DELETE,
                 "elsewhere: 106");
     /* Stayers: the dist TX on chain and its released-key outputs. */
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 0, 2, 0, 1) == LSP_WD_SWEEP,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 0, 2, 0, 0, 0, 1) == LSP_WD_SWEEP,
                 "dist TX present with unspent released-key outputs: sweep");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 0, 0, 0, 1) == LSP_WD_WAIT,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 0, 0, 0, 0, 0, 1) == LSP_WD_WAIT,
                 "swept but not buried yet: wait, do not delete");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 1, 0, 1) == LSP_WD_SWEEP,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 1, 0, 0, 0, 1) == LSP_WD_SWEEP,
                 "still an unspent output though buried: sweep, never delete while guarded");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 0, 0, 1) == LSP_WD_DELETE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 0, 0, 0, 0, 1) == LSP_WD_DELETE,
                 "dist buried and every released-key output spent: delete");
     /* A non-dist spend bypassed the dist TX: no dist output can appear. */
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 0, 1) == LSP_WD_NONE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 0, 0, 0, 1) == LSP_WD_NONE,
                 "funding spent by a non-dist TX, not yet past CLTV+margin: wait");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 1, 1) == LSP_WD_DELETE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 0, 0, 1, 1) == LSP_WD_DELETE,
                 "funding spent by a non-dist TX and past CLTV+margin: delete");
-    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 0, 0, 0, 0, 1, 1) == LSP_WD_NONE,
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 0, 0, 0, 0, 0, 0, 1, 1) == LSP_WD_NONE,
                 "funding still unspent: never delete, whatever the height");
-    TEST_ASSERT(lsp_rotation_winddown_action("done", 4, 4, 4, 9, 1, 1, 1, 0, 1, 1) == LSP_WD_NONE,
+    TEST_ASSERT(lsp_rotation_winddown_action("done", 4, 4, 4, 9, 1, 1, 1, 0, 0, 0, 1, 1) == LSP_WD_NONE,
                 "done: nothing");
+    /* The tree spent the funding: the moved clients' old-tree channel outputs. */
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 1, 0, 0, 1) == LSP_WD_SWEEP,
+                "a moved client's old-tree output on chain: swept at once, before the CLTV");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 1, 0, 1, 1) == LSP_WD_SWEEP,
+                "past the CLTV with such an output unspent: sweep, never delete");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 0, 0, 0, 0, 1, 1, 1) == LSP_WD_WAIT,
+                "spent but not buried yet: wait, keys kept");
+    TEST_ASSERT(lsp_rotation_winddown_action("releasing", 4, 3, 3, -1, 1, 1, 1, 0, 0, 1, 1, 1) == LSP_WD_WAIT,
+                "dist buried but a tree output pending: wait");
     return 1;
 }
 

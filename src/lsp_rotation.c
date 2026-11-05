@@ -4689,6 +4689,7 @@ lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, 
                                              uint32_t n_released, int close_confs,
                                              int funding_spent, int dist_present,
                                              int dist_buried, uint32_t n_released_unresolved,
+                                             uint32_t n_leaf_unspent, uint32_t n_leaf_pending,
                                              int past_cltv_margin, int regtest) {
     if (!state || strcmp(state, "done") == 0) return LSP_WD_NONE;
     /* The LSP's own close (no stayer): keys go once it is buried. */
@@ -4702,16 +4703,17 @@ lsp_wd_action_t lsp_rotation_winddown_action(const char *state, uint32_t n_old, 
     /* Otherwise the old factory resolves on its own (stayers, or the dist TX
        at the CLTV).  Keys are deleted only when nothing a released key guards
        is unspent. */
-    if (funding_spent && dist_present) {
-        if (n_released_unresolved > 0) return LSP_WD_SWEEP;
-        if (dist_buried) return LSP_WD_DELETE;          /* swept and buried */
-        return LSP_WD_WAIT;
-    }
-    if (funding_spent && !dist_present && past_cltv_margin)
-        return LSP_WD_DELETE;    /* a non-dist spend bypassed the dist TX; no dist
-                                    output can appear.  Known gap: a moved client's
-                                    tree channel output (2-of-2 of its released key
-                                    and the LSP) is neither swept nor tracked here. */
+    if (!funding_spent) return LSP_WD_NONE;
+    if (n_released_unresolved > 0 || n_leaf_unspent > 0) return LSP_WD_SWEEP;
+    if (n_leaf_pending > 0) return LSP_WD_WAIT;         /* spent, not buried yet */
+    if (dist_present)
+        return dist_buried ? LSP_WD_DELETE : LSP_WD_WAIT;   /* swept and buried */
+    /* The tree spent the funding (no dist output can appear), and every
+       moved client's channel output that reached the chain is swept or spent
+       and buried.  One that appears later is still the LSP's: the client's
+       latest old commitment pays it to the LSP, an earlier one is revoked
+       (the watch entries use the revocations, not the keys). */
+    if (past_cltv_margin) return LSP_WD_DELETE;
     return LSP_WD_NONE;
 }
 
@@ -4923,6 +4925,227 @@ static uint32_t wd_sweep(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r,
     return unresolved;
 }
 
+int lsp_rotation_leaf_sweep_build(const secp256k1_context *ctx,
+                                  const unsigned char *lsp_seckey32,
+                                  const unsigned char *key32,
+                                  const persist_part_release_t *rel,
+                                  const unsigned char *out_spk, size_t out_spk_len,
+                                  uint64_t fee, tx_buf_t *signed_out, char txid_out[65]) {
+    if (!ctx || !lsp_seckey32 || !key32 || !rel || !rel->leaf_txid[0] || !out_spk ||
+        !signed_out || !txid_out || out_spk_len == 0 || out_spk_len > 34 ||
+        rel->leaf_amount <= fee + 330)
+        return 0;
+    secp256k1_keypair kp[2];
+    secp256k1_pubkey pk[2];
+    secp256k1_xonly_pubkey target;
+    int ok = secp256k1_keypair_create(ctx, &kp[0], lsp_seckey32) &&
+             secp256k1_keypair_create(ctx, &kp[1], key32) &&
+             secp256k1_keypair_pub(ctx, &pk[0], &kp[0]) &&
+             secp256k1_keypair_pub(ctx, &pk[1], &kp[1]) &&
+             rel->leaf_spk[0] == 0x51 && rel->leaf_spk[1] == 0x20 &&
+             secp256k1_xonly_pubkey_parse(ctx, &target, rel->leaf_spk + 2);
+    unsigned char lt[32], dtxid[32], sh[32], sig[64];
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.amount_sats = rel->leaf_amount - fee;
+    memcpy(out.script_pubkey, out_spk, out_spk_len);
+    out.script_pubkey_len = out_spk_len;
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    ok = ok && hex_decode(rel->leaf_txid, lt, 32) == 32;
+    if (ok) reverse_bytes(lt, 32);
+    ok = ok && build_unsigned_tx_with_locktime(&utx, dtxid, lt, rel->leaf_vout, 0xFFFFFFFDu,
+                                               0, &out, 1) &&
+         compute_taproot_sighash(sh, utx.data, utx.len, 0, rel->leaf_spk, 34,
+                                 rel->leaf_amount, 0xFFFFFFFDu);
+    /* Both signer orders (the channel's key order is not recorded); only a
+       signature valid for the output key is used. */
+    int signed_ok = 0;
+    for (int order = 0; ok && order < 2 && !signed_ok; order++) {
+        secp256k1_pubkey pks[2] = { pk[order], pk[1 - order] };
+        secp256k1_keypair kps[2] = { kp[order], kp[1 - order] };
+        musig_keyagg_t ka;
+        signed_ok = musig_aggregate_keys(ctx, &ka, pks, 2) &&
+                    musig_sign_taproot(ctx, sig, sh, kps, 2, &ka,
+                                       rel->has_leaf_merkle ? rel->leaf_merkle : NULL) &&
+                    secp256k1_schnorrsig_verify(ctx, sig, sh, 32, &target);
+        secure_zero(kps, sizeof(kps));
+    }
+    ok = ok && signed_ok && finalize_signed_tx(signed_out, utx.data, utx.len, sig);
+    if (ok) hex_encode(dtxid, 32, txid_out);
+    tx_buf_free(&utx);
+    secure_zero(kp, sizeof(kp));
+    return ok;
+}
+
+size_t lsp_rotation_leaf_sweep_vsize(int cltv_path) {
+    /* One input, one output: the key path's witness is one signature; the
+       CLTV path's also carries the script and the control block. */
+    return cltv_path ? 140 : 112;
+}
+
+int lsp_rotation_leaf_timeout_sweep_build(const secp256k1_context *ctx,
+                                          const unsigned char *lsp_seckey32,
+                                          const persist_part_release_t *rel,
+                                          uint32_t factory_cltv,
+                                          const unsigned char *out_spk, size_t out_spk_len,
+                                          uint64_t fee, tx_buf_t *signed_out,
+                                          char txid_out[65]) {
+    if (!ctx || !lsp_seckey32 || !rel || !rel->leaf_txid[0] || !rel->has_leaf_merkle ||
+        !out_spk || !signed_out || !txid_out || out_spk_len == 0 || out_spk_len > 34 ||
+        rel->leaf_amount <= fee + 330)
+        return 0;
+    secp256k1_keypair lkp;
+    secp256k1_pubkey lpk, cpk;
+    secp256k1_xonly_pubkey lx;
+    int ok = secp256k1_keypair_create(ctx, &lkp, lsp_seckey32) &&
+             secp256k1_keypair_pub(ctx, &lpk, &lkp) &&
+             secp256k1_xonly_pubkey_from_pubkey(ctx, &lx, NULL, &lpk) &&
+             secp256k1_ec_pubkey_parse(ctx, &cpk, rel->old_pk, 33);
+    /* The script leaf whose root is the recorded one. */
+    tapscript_leaf_t leaf;
+    uint32_t cltv = 0;
+    uint32_t cands[2] = { rel->leaf_cltv, factory_cltv };
+    for (int i = 0; ok && i < 2 && !cltv; i++) {
+        unsigned char mr[32];
+        if (cands[i] > 0 && tapscript_build_cltv_timeout(&leaf, cands[i], &lx, ctx) &&
+            tapscript_merkle_root(mr, &leaf, 1) && memcmp(mr, rel->leaf_merkle, 32) == 0)
+            cltv = cands[i];
+    }
+    ok = ok && cltv > 0;
+    /* The internal key (either signer order) whose tweak is the output key. */
+    musig_keyagg_t ka;
+    int parity = 0, found = 0;
+    for (int order = 0; ok && order < 2 && !found; order++) {
+        secp256k1_pubkey pks[2] = { order ? cpk : lpk, order ? lpk : cpk };
+        secp256k1_xonly_pubkey tw;
+        unsigned char ser[32];
+        found = musig_aggregate_keys(ctx, &ka, pks, 2) &&
+                tapscript_tweak_pubkey(ctx, &tw, &parity, &ka.agg_pubkey, rel->leaf_merkle) &&
+                secp256k1_xonly_pubkey_serialize(ctx, ser, &tw) &&
+                memcmp(ser, rel->leaf_spk + 2, 32) == 0;
+    }
+    ok = ok && found && rel->leaf_spk[0] == 0x51 && rel->leaf_spk[1] == 0x20;
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.amount_sats = rel->leaf_amount - fee;
+    memcpy(out.script_pubkey, out_spk, out_spk_len);
+    out.script_pubkey_len = out_spk_len;
+    tx_buf_t utx;
+    tx_buf_init(&utx, 256);
+    unsigned char lt[32], dtxid[32], sh[32], sig[64], aux[32], cb[65];
+    size_t cbl = 0;
+    memset(aux, 0, 32);
+    ok = ok && hex_decode(rel->leaf_txid, lt, 32) == 32;
+    if (ok) reverse_bytes(lt, 32);
+    ok = ok && build_unsigned_tx_with_locktime(&utx, dtxid, lt, rel->leaf_vout, 0xFFFFFFFEu,
+                                               cltv, &out, 1) &&
+         compute_tapscript_sighash(sh, utx.data, utx.len, 0, rel->leaf_spk, 34,
+                                   rel->leaf_amount, 0xFFFFFFFEu, &leaf) &&
+         secp256k1_schnorrsig_sign32(ctx, sig, sh, &lkp, aux) &&
+         tapscript_build_control_block(cb, &cbl, parity, &ka.agg_pubkey, ctx) &&
+         finalize_script_path_tx(signed_out, utx.data, utx.len, sig, leaf.script,
+                                 leaf.script_len, cb, cbl);
+    if (ok) hex_encode(dtxid, 32, txid_out);
+    tx_buf_free(&utx);
+    secure_zero(&lkp, sizeof(lkp));
+    return ok;
+}
+
+/* Every moved client's channel output in the old tree that is on chain:
+   sweep the unspent ones (released key + the LSP's key) to the LSP wallet;
+   track the spent ones until buried.  Counts into *UNSPENT, *PENDING and
+   *MISSING (not on chain).  SWEEP: 0 none, 1 with the released keys, 2 by the
+   LSP alone (its CLTV script leaf; the keys are gone). */
+static void wd_leaf_scan(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r,
+                         persist_part_release_t *rel, size_t nr, int h, int do_sweep,
+                         uint32_t *unspent, uint32_t *pending, uint32_t *missing) {
+    persist_t *db = (persist_t *)mgr->persist;
+    size_t np = (size_t)r->n_old + 1;
+    int *dep = NULL;
+    unsigned char (*keys)[32] = NULL;
+    int depth = LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest);
+    for (size_t k = 0; k < nr; k++) {
+        persist_part_release_t *x = &rel[k];
+        if (!x->released || !x->leaf_txid[0]) continue;
+        if (rot_tx_confirmations(mgr, x->leaf_txid) < 1) {
+            if (rot_tx_in_mempool(mgr, x->leaf_txid)) (*pending)++;
+            else (*missing)++;
+            continue;                       /* not on chain (yet) */
+        }
+        int un = rot_outpoint_unspent(mgr, x->leaf_txid, x->leaf_vout);
+        if (un == 0) {
+            int sc = x->sweep_txid[0] ? rot_tx_confirmations(mgr, x->sweep_txid) : -1;
+            if (!x->spent_height && h > 0) {
+                x->spent_height = (uint32_t)h;
+                (void)persist_set_part_leaf_state(db, r->old_txid, x->j, x->sweep_txid,
+                                                  x->spent_height);
+            }
+            if (sc >= depth || (x->spent_height && h > 0 &&
+                                (uint64_t)h >= (uint64_t)x->spent_height + (uint64_t)depth))
+                continue;                   /* spent and buried */
+            (*pending)++;
+            continue;
+        }
+        if (un != 1) { (*pending)++; continue; }
+        (*unspent)++;
+        if (x->spent_height)                /* a spend that was reorged out */
+            (void)persist_set_part_leaf_state(db, r->old_txid, x->j, x->sweep_txid,
+                                              x->spent_height = 0);
+        if (!do_sweep) continue;
+        if (do_sweep == 2) {
+            if (h <= 0 || (uint32_t)h < r->old_cltv) continue;
+        } else if (!dep) {
+            dep = calloc(np, sizeof(int));
+            keys = calloc(np, 32);
+            if (!dep || !keys) break;
+            (void)persist_load_departed_clients(db, r->retired_id, dep, keys, np);
+        }
+        uint32_t pidx = x->old_slot + 1;
+        char addr[128];
+        unsigned char wspk[64];
+        size_t wl = 0;
+        if ((do_sweep == 1 && (pidx >= np || !dep[pidx])) ||
+            !wd_wallet_spk(mgr, addr, wspk, &wl) || !wl || wl > 34)
+            continue;
+        fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
+        size_t vb = lsp_rotation_leaf_sweep_vsize(do_sweep == 2);
+        uint64_t fee = fe ? fee_estimate(fe, vb) : 0;
+        if (fee == 0) fee = (vb * FEE_FLOOR_SAT_PER_KVB + 999) / 1000;
+        tx_buf_t stx;
+        tx_buf_init(&stx, 256);
+        char t[65] = {0};
+        int built = do_sweep == 1
+            ? lsp_rotation_leaf_sweep_build(mgr->ctx, mgr->rot_lsp_seckey, keys[pidx], x, wspk,
+                                            wl, fee, &stx, t)
+            : lsp_rotation_leaf_timeout_sweep_build(mgr->ctx, mgr->rot_lsp_seckey, x,
+                                                    r->old_cltv, wspk, wl, fee, &stx, t);
+        if (built) {
+            char *hx = malloc(stx.len * 2 + 1);
+            if (hx) {
+                hex_encode(stx.data, stx.len, hx);
+                /* Recorded before it is sent. */
+                snprintf(x->sweep_txid, sizeof(x->sweep_txid), "%s", t);
+                (void)persist_set_part_leaf_state(db, r->old_txid, x->j, x->sweep_txid, 0);
+                char sent[65] = {0};
+                int sok = rot_send_hex(mgr, hx, sent);
+                persist_log_broadcast(db, t, "rotation_leaf_sweep", hx, sok ? "ok" : "failed");
+                printf("LSP rotate: a moved client's old-tree channel output %s:%u (%llu sats) "
+                       "is on chain -- sweeping it to the LSP wallet %s: %s %s\n",
+                       x->leaf_txid, x->leaf_vout, (unsigned long long)x->leaf_amount,
+                       do_sweep == 1 ? "with its released key" : "through its CLTV path", t,
+                       sok ? "broadcast" : "not accepted now (retried next block)");
+                free(hx);
+            }
+        }
+        tx_buf_free(&stx);
+    }
+    if (keys) secure_zero(keys, np * 32);
+    free(keys);
+    free(dep);
+    fflush(stdout);
+}
+
 static int wd_close(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int height) {
     persist_t *db = (persist_t *)mgr->persist;
     int un = rot_outpoint_unspent(mgr, r->old_txid, r->old_vout);
@@ -4995,11 +5218,11 @@ static int wd_close(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int heig
 }
 
 static int wd_delete(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int confs,
-                     int closed_by_us) {
+                     int closed_by_us, int keep_watching) {
     persist_t *db = (persist_t *)mgr->persist;
     char prev[16];
     snprintf(prev, sizeof(prev), "%s", r->state);
-    snprintf(r->state, sizeof(r->state), "done");
+    snprintf(r->state, sizeof(r->state), "%s", keep_watching ? "watching" : "done");
     int ok = persist_begin(db) && persist_delete_departed_clients(db, r->retired_id) &&
              persist_save_part_rotation(db, r);
     if (ok) ok = persist_commit(db);
@@ -5027,7 +5250,9 @@ static int wd_delete(lsp_channel_mgr_t *mgr, persist_part_rotation_t *r, int con
     else
         printf("LSP rotate: the old factory %s is resolved on chain and every released-key "
                "output has been swept and buried (or can no longer appear); the released "
-               "keys kept for it are deleted\n", r->old_txid);
+               "keys kept for it are deleted%s\n", r->old_txid,
+               keep_watching ? " (a moved client's old-tree output not on chain yet stays "
+                               "watched: the LSP takes it through its CLTV path)" : "");
     fflush(stdout);
     return 1;
 }
@@ -5080,21 +5305,45 @@ int lsp_rotation_winddown_tick(lsp_channel_mgr_t *mgr, int force) {
         }
         int past_cltv = h > 0 && r->old_cltv > 0 &&
                         (uint64_t)h >= (uint64_t)r->old_cltv + LSP_WD_CLTV_MARGIN(mgr->rot_is_regtest);
+        /* The moved clients' channel outputs in the old tree (only once the
+           funding is spent can any tree transaction be on chain). */
+        uint32_t n_leaf_unspent = 0, n_leaf_pending = 0, n_leaf_missing = 0;
+        if (funding_spent && strcmp(r->state, "releasing") == 0)
+            wd_leaf_scan(mgr, r, rel, nr, h, 1, &n_leaf_unspent, &n_leaf_pending,
+                         &n_leaf_missing);
+        if (strcmp(r->state, "watching") == 0) {
+            /* The keys are gone; a moved client's old-tree output that shows
+               up now is the LSP's through its CLTV path.  Done once every
+               one of them reached the chain and is spent and buried. */
+            wd_leaf_scan(mgr, r, rel, nr, h, 2, &n_leaf_unspent, &n_leaf_pending,
+                         &n_leaf_missing);
+            if (n_leaf_unspent == 0 && n_leaf_pending == 0 && n_leaf_missing == 0) {
+                snprintf(r->state, sizeof(r->state), "done");
+                if (persist_save_part_rotation(db, r))
+                    printf("LSP rotate: every moved client's old-tree output of %s is spent "
+                           "and buried\n", r->old_txid);
+            }
+            free(r->close_hex);
+            free(r->dist_hex);
+            continue;
+        }
         lsp_wd_action_t a = lsp_rotation_winddown_action(r->state, r->n_old, r->m, released,
                                                          confs, funding_spent, dist_present,
-                                                         dist_buried, n_unresolved, past_cltv,
-                                                         mgr->rot_is_regtest);
+                                                         dist_buried, n_unresolved,
+                                                         n_leaf_unspent, n_leaf_pending,
+                                                         past_cltv, mgr->rot_is_regtest);
         switch (a) {
         case LSP_WD_CLOSE:
             did |= wd_close(mgr, r, h);
             break;
         case LSP_WD_SWEEP:
-            (void)wd_sweep(mgr, r, rel, nr, dist_disp);
-            did = 1;
+            if (n_unresolved > 0) (void)wd_sweep(mgr, r, rel, nr, dist_disp);
+            did = 1;                        /* the tree outputs were swept by the scan */
             break;
         case LSP_WD_DELETE:
             did |= wd_delete(mgr, r, confs, strcmp(r->state, "closing") == 0 &&
-                                            confs >= LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest));
+                                            confs >= LSP_WD_CLOSE_DEPTH(mgr->rot_is_regtest),
+                             strcmp(r->state, "releasing") == 0 && n_leaf_missing > 0);
             break;
         case LSP_WD_WAIT:
             if (strcmp(r->state, "releasing") == 0 && n_unresolved > 0)
