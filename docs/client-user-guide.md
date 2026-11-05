@@ -167,7 +167,14 @@ learn your factory key before anything is verified.
   position. Right before the key it settles its old channel: it accepts one final update
   that moves exactly the balance carried into the replacement to the LSP (same channel,
   next commitment, same fee rate, nothing in flight), signs it and revokes its own latest
-  old commitment. It never does this before those checks pass. Clients that do not move
+  old commitment. It accepts the settlement only if its old channel holds no more than
+  the balance carried into the replacement (otherwise releasing the key would forfeit
+  the remainder), and it checks that against the real old channel, not an assumed value.
+  The settled commitment is stored in the old database as its latest state, under the
+  channel a force-close from that file reads, before anything is revoked (it pays the
+  client nothing; a force-close from that file only costs the fee). If the settlement is
+  interrupted after the client accepted it, the next release request is answered with
+  the same settled state; nothing more is given. It never does this before those checks pass. Clients that do not move
   keep their full exit in the old factory; one that reconnects later is told by the LSP
   to exit through that factory.
 
@@ -189,10 +196,13 @@ securely. A client that switched before it released settles its old channel from
 file when the LSP asks for the release again, so do not remove it while a release is
 still owed.
 
-After a partial rotation the last commitment in that file is **revoked** (the settlement
-revoked it). Never broadcast it, and never force-close from that file: the LSP holds the
-revocation and would take that balance as a penalty. That balance was paid to you in the
-replacement.
+After a partial rotation the latest commitment in that file is the settled one, which pays
+you nothing (that balance was paid to you in the replacement); the commitments before it
+are **revoked**. A copy of that file from before the settlement holds a revoked commitment:
+never broadcast it, the LSP holds the revocation and would take that balance as a penalty.
+A replacement that never confirms is given up after 1008 blocks (it never confirmed and
+is not in the mempool or in any block since you signed): the old channel then accepts
+payments again.
 
 ## 3. Receiving Payments
 
