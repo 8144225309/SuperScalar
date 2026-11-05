@@ -1613,6 +1613,10 @@ int persist_client_rotation_load(persist_t *p, const char *old_txid_hex,
                                  persist_client_rotation_t *r);
 /* The most recent row not yet done or abandoned. */
 int persist_client_rotation_load_open(persist_t *p, persist_client_rotation_t *r);
+/* Every such row, most recent first (up to MAX; close_hex malloc'd per row,
+   caller frees).  Returns how many. */
+size_t persist_client_rotation_load_all_open(persist_t *p, persist_client_rotation_t *rows,
+                                             size_t max);
 
 /* client_rotation_trees (client): the first replacement tree the client
    signed over each replacement funding (the close's txid, display hex).  Binds

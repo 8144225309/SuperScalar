@@ -45,6 +45,10 @@ int client_cin_frozen_for(const unsigned char *funding_txid32);
    that is not the close into the new factory already in progress). */
 int client_cin_refuse_while_frozen(const wire_msg_t *m, const unsigned char *funding_txid32);
 
+/* The index of the factory key KP in DB's key rows (1 found). */
+int client_key_index_of(persist_t *db, secp256k1_context *ctx, const secp256k1_keypair *kp,
+                        uint32_t *idx_out);
+
 /* The client's own view of a signed rotation ROW: confirmations of the close
    (CLOSE_CONFS) and of another transaction spending the old funding
    (OTHER_CONFS), each -1 if not seen.  Works without txindex and after any

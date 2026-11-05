@@ -8029,6 +8029,23 @@ int persist_client_rotation_load(persist_t *p, const char *old_txid_hex,
     return ret;
 }
 
+size_t persist_client_rotation_load_all_open(persist_t *p, persist_client_rotation_t *rows,
+                                             size_t max) {
+    if (!p || !p->db || !rows || max == 0) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT old_funding_txid, old_vout, key_index, close_txid, state, side_db, "
+            "close_hex, close_height, old_key_index, carried, old_pubkey FROM client_rotations "
+            "WHERE state NOT IN ('done', 'abandoned') ORDER BY updated_at DESC;",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    size_t n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW)
+        if (client_rotation_row(st, &rows[n]) == 1) n++;
+    sqlite3_finalize(st);
+    return n;
+}
+
 int persist_client_rotation_load_open(persist_t *p, persist_client_rotation_t *r) {
     if (!p || !p->db || !r) return -1;
     sqlite3_stmt *st;

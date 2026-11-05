@@ -1486,6 +1486,40 @@ int test_inline_turnover_refused(void) {
     return 1;
 }
 
+/* Every open rotation row counts: an older signed close freezes its factory
+   and still switches, whatever row is newer. */
+int test_cin_all_open_rows(void) {
+    char path[] = "/tmp/ss_cin_ao_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    persist_client_rotation_t a, b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    snprintf(a.old_txid, sizeof(a.old_txid), "%s", "6161616161616161616161616161616161616161616161616161616161616161");
+    snprintf(a.close_txid, sizeof(a.close_txid), "%s", "6262626262626262626262626262626262626262626262626262626262626262");
+    snprintf(a.state, sizeof(a.state), "close_signed");
+    TEST_ASSERT(persist_client_rotation_save(&db, &a), "older: a signed close");
+    sqlite3_exec(db.db, "UPDATE client_rotations SET updated_at = 1;", NULL, NULL, NULL);
+    snprintf(b.old_txid, sizeof(b.old_txid), "%s", "6363636363636363636363636363636363636363636363636363636363636363");
+    snprintf(b.state, sizeof(b.state), "key_sent");
+    TEST_ASSERT(persist_client_rotation_save(&db, &b), "newer: only a key sent");
+    client_cin_refresh_frozen(&db);
+    unsigned char fa[32];
+    memset(fa, 0x61, 32);
+    TEST_ASSERT(client_cin_frozen() && client_cin_frozen_for(fa),
+                "the older signed close still freezes its factory");
+    cJSON *rc = cJSON_CreateObject();
+    client_cin_reconnect_fields(&db, rc);
+    const cJSON *pend = cJSON_GetObjectItemCaseSensitive(rc, "rotation_pending");
+    TEST_ASSERT(cJSON_IsString(pend) && strcmp(pend->valuestring, a.close_txid) == 0,
+                "and is reported as pending");
+    cJSON_Delete(rc);
+    client_cin_refresh_frozen(NULL);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
 /* The LSP and client records, and the DB snapshot. */
 int test_cin_records(void) {
     char path[] = "/tmp/ss_cin_rec_XXXXXX";

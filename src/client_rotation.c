@@ -27,7 +27,9 @@ static int g_cin_capable = 0;
 static regtest_t *g_cin_rt = NULL;
 static int g_cin_depth = 1;
 static int g_cin_frozen = 0;
-static char g_cin_frozen_old[65];      /* the old funding (display hex) it is for */
+#define CIN_MAX_OPEN 16
+static char g_cin_frozen_old[CIN_MAX_OPEN][65];   /* the old fundings it is for */
+static size_t g_cin_n_frozen = 0;
 
 void client_cin_set_capable(int capable) { g_cin_capable = capable ? 1 : 0; }
 int client_cin_capable(void) { return g_cin_capable; }
@@ -47,7 +49,9 @@ int client_cin_frozen_for(const unsigned char *funding_txid32) {
     if (!funding_txid32) return 1;
     char d[65];
     txid_display(funding_txid32, d);
-    return strcmp(d, g_cin_frozen_old) == 0;
+    for (size_t i = 0; i < g_cin_n_frozen; i++)
+        if (strcmp(d, g_cin_frozen_old[i]) == 0) return 1;
+    return 0;
 }
 
 static int state_is_signed(const char *state) {
@@ -56,15 +60,19 @@ static int state_is_signed(const char *state) {
 
 void client_cin_refresh_frozen(persist_t *db) {
     g_cin_frozen = 0;
-    g_cin_frozen_old[0] = '\0';
+    g_cin_n_frozen = 0;
     if (!db) return;
-    persist_client_rotation_t row;
-    memset(&row, 0, sizeof(row));
-    if (persist_client_rotation_load_open(db, &row) == 1 && state_is_signed(row.state)) {
-        g_cin_frozen = 1;
-        snprintf(g_cin_frozen_old, sizeof(g_cin_frozen_old), "%s", row.old_txid);
+    /* Every open rotation, not only the most recent one. */
+    persist_client_rotation_t rows[CIN_MAX_OPEN];
+    memset(rows, 0, sizeof(rows));
+    size_t n = persist_client_rotation_load_all_open(db, rows, CIN_MAX_OPEN);
+    for (size_t i = 0; i < n; i++) {
+        if (state_is_signed(rows[i].state) && g_cin_n_frozen < CIN_MAX_OPEN) {
+            g_cin_frozen = 1;
+            snprintf(g_cin_frozen_old[g_cin_n_frozen++], 65, "%s", rows[i].old_txid);
+        }
+        free(rows[i].close_hex);
     }
-    free(row.close_hex);
 }
 
 static int msg_is_cin_rotation(const wire_msg_t *m, const char *outer) {
@@ -343,6 +351,28 @@ int client_cin_bind_tree(persist_t *db, const char *close_txid, const factory_t 
     return persist_client_rotation_bind_tree(db, close_txid, dg) == 1;
 }
 
+int client_key_index_of(persist_t *db, secp256k1_context *ctx, const secp256k1_keypair *kp,
+                        uint32_t *idx_out) {
+    if (!db || !db->db || !kp) return 0;
+    secp256k1_pubkey pk;
+    unsigned char ser[33];
+    size_t l = 33;
+    char hex[67];
+    if (!secp256k1_keypair_pub(ctx, &pk, kp) ||
+        !secp256k1_ec_pubkey_serialize(ctx, ser, &l, &pk, SECP256K1_EC_COMPRESSED))
+        return 0;
+    hex_encode(ser, 33, hex);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db, "SELECT key_index FROM factory_keys WHERE pubkey = ? "
+                           "LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, hex, -1, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(st) == SQLITE_ROW;
+    if (ok && idx_out) *idx_out = (uint32_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return ok;
+}
+
 static int root_secret(secp256k1_context *ctx, unsigned char out[32]) {
     const secp256k1_keypair *id = client_identity_keypair();
     return id && secp256k1_keypair_sec(ctx, out, id);
@@ -469,7 +499,8 @@ static int db_flush_close(persist_t *s, const char *path) {
    and moved into place in one rename (an earlier copy stays until then). */
 static int write_side_db(persist_t *db, const char *side, secp256k1_context *ctx,
                          factory_t *nf, channel_t *nc, uint32_t my_index,
-                         const persist_client_rotation_t *row, uint32_t key_idx) {
+                         const persist_client_rotation_t *row, uint32_t key_idx,
+                         long retire_old_idx) {
     char tmp[720];
     if (strlen(side) > 600) return 0;
     snprintf(tmp, sizeof(tmp), "%s.tmp", side);
@@ -521,8 +552,9 @@ static int write_side_db(persist_t *db, const char *side, secp256k1_context *ctx
         tx_buf_free(&st);
     }
     ok = ok && persist_factory_key_set_state(&s, key_idx, FACTORY_KEY_STATE_ACTIVE, 0);
-    if (ok && row->old_pubkey[0])
-        ok = persist_factory_key_set_state(&s, row->old_key_index, FACTORY_KEY_STATE_RETIRED, 0);
+    if (ok && retire_old_idx >= 0 && (uint32_t)retire_old_idx != key_idx)
+        ok = persist_factory_key_set_state(&s, (uint32_t)retire_old_idx,
+                                           FACTORY_KEY_STATE_RETIRED, 0);
     if (ok) {
         persist_client_rotation_t done = *row;
         done.close_hex = NULL;
@@ -798,7 +830,12 @@ int client_cin_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db
         goto out;
     }
     snprintf(side, sizeof(side), "%s.rotation", db_path);
-    if (!write_side_db(db, side, ctx, nf, nc, my_index, &row, row.key_index)) {
+    long cin_old_idx = -1;
+    {
+        uint32_t oi = 0;
+        if (client_key_index_of(db, ctx, old_kp, &oi)) cin_old_idx = (long)oi;
+    }
+    if (!write_side_db(db, side, ctx, nf, nc, my_index, &row, row.key_index, cin_old_idx)) {
         fprintf(stderr, "Client: could not store the replacement -- not signing the close\n");
         goto out;
     }
@@ -839,7 +876,8 @@ int client_cin_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db
         snprintf(row.state, sizeof(row.state), "close_signed");
         if (!persist_client_rotation_save(db, &row)) { cJSON_Delete(m.json); goto out; }
         g_cin_frozen = 1;
-        snprintf(g_cin_frozen_old, sizeof(g_cin_frozen_old), "%s", old_hex);
+        if (g_cin_n_frozen < CIN_MAX_OPEN)
+            snprintf(g_cin_frozen_old[g_cin_n_frozen++], 65, "%s", old_hex);
         secp256k1_pubkey opk;
         secp256k1_keypair_pub(ctx, &opk, old_kp);
         tx_output_t eo;
@@ -1503,7 +1541,8 @@ int client_part_run(int fd, secp256k1_context *ctx, persist_t *db, const char *d
     snprintf(side, sizeof(side), "%s.rotation", db_path);
     row.close_height = bind.vout;            /* partial: where the funding pays */
     row.carried = nc->local_amount;
-    if (!write_side_db(db, side, ctx, nf, nc, slot, &row, row.key_index)) {
+    if (!write_side_db(db, side, ctx, nf, nc, slot, &row, row.key_index,
+                       (long)row.old_key_index)) {
         fprintf(stderr, "Client: could not store the replacement\n");
         goto out;
     }
@@ -1695,12 +1734,8 @@ out:
     return ok;
 }
 
-int client_cin_resolve(persist_t *db, const char *db_path, regtest_t *rt) {
-    if (!db || !db_path) return 0;
-    client_cin_refresh_frozen(db);
-    persist_client_rotation_t row;
-    memset(&row, 0, sizeof(row));
-    if (persist_client_rotation_load_open(db, &row) != 1) return 0;
+static int resolve_row(persist_t *db, const char *db_path, regtest_t *rt,
+                       persist_client_rotation_t row) {
     /* Switched, not released: closed once the old funding is spent on chain
        (nothing can be asked for it any more). */
     if (strcmp(row.state, "part_switched") == 0) {
@@ -1768,29 +1803,63 @@ int client_cin_resolve(persist_t *db, const char *db_path, regtest_t *rt) {
     return promoted;
 }
 
+int client_cin_resolve(persist_t *db, const char *db_path, regtest_t *rt) {
+    if (!db || !db_path) return 0;
+    client_cin_refresh_frozen(db);
+    /* Every open rotation row, most recent first; the DB is switched at
+       most once per call (the caller then starts again from the new DB). */
+    persist_client_rotation_t rows[CIN_MAX_OPEN];
+    memset(rows, 0, sizeof(rows));
+    size_t n = persist_client_rotation_load_all_open(db, rows, CIN_MAX_OPEN);
+    int promoted = 0;
+    size_t i = 0;
+    for (; i < n && !promoted; i++)
+        promoted = resolve_row(db, db_path, rt, rows[i]);   /* takes rows[i].close_hex */
+    for (; i < n; i++) free(rows[i].close_hex);
+    return promoted;
+}
+
 void client_cin_reconnect_fields(persist_t *db, cJSON *reconnect) {
     if (!reconnect) return;
     if (client_cin_capable() && db)
         cJSON_AddNumberToObject(reconnect, "rotation_v", 2);
     if (!db) return;
-    persist_client_rotation_t row;
-    memset(&row, 0, sizeof(row));
-    if (persist_client_rotation_load_open(db, &row) != 1) return;
-    if (state_is_signed(row.state) && row.close_txid[0])
-        cJSON_AddStringToObject(reconnect, "rotation_pending", row.close_txid);
-    free(row.close_hex);
+    persist_client_rotation_t rows[CIN_MAX_OPEN];
+    memset(rows, 0, sizeof(rows));
+    size_t n = persist_client_rotation_load_all_open(db, rows, CIN_MAX_OPEN);
+    int added = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!added && state_is_signed(rows[i].state) && rows[i].close_txid[0]) {
+            cJSON_AddStringToObject(reconnect, "rotation_pending", rows[i].close_txid);
+            added = 1;
+        }
+        free(rows[i].close_hex);
+    }
 }
 
 int client_cin_on_rotation_done(persist_t *db, const cJSON *done) {
     if (!db || !done) return 0;
-    persist_client_rotation_t row;
-    memset(&row, 0, sizeof(row));
-    if (persist_client_rotation_load_open(db, &row) != 1) return 0;
     char ct[65];
     char *hex = NULL;
     int conf = 0;
-    int ok = wire_parse_rotation_done(done, ct, &hex, &conf) &&
-             strcmp(ct, row.close_txid) == 0 && state_is_signed(row.state);
+    if (!wire_parse_rotation_done(done, ct, &hex, &conf)) {
+        free(hex);
+        return 0;
+    }
+    persist_client_rotation_t rows[CIN_MAX_OPEN], row;
+    memset(rows, 0, sizeof(rows));
+    memset(&row, 0, sizeof(row));
+    size_t n = persist_client_rotation_load_all_open(db, rows, CIN_MAX_OPEN);
+    int found = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!found && strcmp(ct, rows[i].close_txid) == 0 && state_is_signed(rows[i].state)) {
+            row = rows[i];
+            found = 1;
+        } else {
+            free(rows[i].close_hex);
+        }
+    }
+    int ok = found;
     if (ok) {
         /* Only the signed close itself is taken (it lets us broadcast); the
            confirmation is ours to see. */
