@@ -2356,6 +2356,36 @@ int regtest_scan_block_txs(regtest_t *rt, const char *block_hash,
 
 /* --- Build a wallet payment without broadcasting it; find a wallet send --- */
 
+/* Lock every input of TX_HEX in the wallet (so a later wallet spend does not
+   pick them), one call per input.  Returns how many were locked, or -1. */
+int regtest_lock_tx_inputs(regtest_t *rt, const char *tx_hex) {
+    if (!rt || !tx_hex) return -1;
+    size_t n = strlen(tx_hex) / 2;
+    unsigned char *bytes = malloc(n ? n : 1);
+    if (!bytes || hex_decode(tx_hex, bytes, n) != (int)n) { free(bytes); return -1; }
+    size_t n_in = 0;
+    unsigned char (*prev)[32] = calloc(256, 32);
+    uint32_t *vouts = calloc(256, sizeof(uint32_t));
+    int ok = prev && vouts && tx_parse_inputs(bytes, n, prev, vouts, 256, &n_in);
+    free(bytes);
+    if (!ok) { free(prev); free(vouts); return -1; }
+    int locked = 0;
+    for (size_t i = 0; i < n_in && i < 256; i++) {
+        unsigned char rb[32];
+        char disp[65], params[192];
+        for (int k = 0; k < 32; k++) rb[k] = prev[i][31 - k];
+        hex_encode(rb, 32, disp);
+        snprintf(params, sizeof(params), "false '[{\"txid\":\"%s\",\"vout\":%u}]'",
+                 disp, (unsigned)vouts[i]);
+        char *res = regtest_exec(rt, "lockunspent", params);
+        if (res && strstr(res, "true") && !strstr(res, "error")) locked++;
+        free(res);
+    }
+    free(prev);
+    free(vouts);
+    return locked;
+}
+
 int regtest_unlock_tx_inputs(regtest_t *rt, const char *tx_hex) {
     if (!rt || !tx_hex) return -1;
     size_t n = strlen(tx_hex) / 2;

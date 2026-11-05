@@ -6095,6 +6095,9 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     printf("LSP: client %zu reconnected (commitment=%llu)\n",
            c, (unsigned long long)ch->commitment_number);
+    /* A release still owed is asked for again, whichever path accepted the
+       reconnect. */
+    (void)lsp_rotation_part_on_reconnect(mgr, lsp, c);
     return 1;
 }
 
@@ -6113,10 +6116,6 @@ int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd
 
     int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &msg);
     cJSON_Delete(msg.json);
-    if (ret)
-        for (size_t c = 0; c < lsp->n_clients; c++)
-            if (lsp->client_fds[c] == new_fd)
-                (void)lsp_rotation_part_on_reconnect(mgr, lsp, c);
     return ret;
 }
 

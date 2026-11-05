@@ -222,7 +222,9 @@ int lsp_rotation_cin_preclose(const lsp_channel_mgr_t *mgr,
 int lsp_rotation_progress_resumable(const lsp_channel_mgr_t *mgr) {
     return mgr && (lsp_rotation_progress_pending(mgr) ||
                    (LSP_ROT_PROGRESS_IS_CIN(mgr->rot_progress.phase) &&
-                    mgr->rot_progress.phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING));
+                    mgr->rot_progress.phase <= LSP_ROT_PROGRESS_CIN_CLOSE_SIGNING) ||
+                   mgr->rot_progress.phase == LSP_ROT_PROGRESS_PART_FUNDING ||
+                   mgr->rot_progress.phase == LSP_ROT_PROGRESS_PART_FUNDED);
 }
 
 int lsp_rotation_cin_note_failure(lsp_rotation_progress_t *rp, uint32_t height,
@@ -854,6 +856,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
        the new one, co-signed, with fresh client keys.  No key leaves anyone. */
     int cin_ok = lsp_rotation_cin_eligible(mgr, lsp) &&
                  memcmp(lsp->factory.funding_txid, dying->factory.funding_txid, 32) == 0;
+    if (cin_ok && superscalar_cheat_allowed() && getenv("SS_TEST_ROTATE_PARTIAL")) {
+        /* Regtest only: the partial path with every client (wind-down tests). */
+        printf("LSP rotate: SS_TEST_ROTATE_PARTIAL: partial rotation although every "
+               "client is online\n");
+        cin_ok = 0;
+    }
     if (cin_ok)
         return lsp_rotation_close_into_new(mgr, lsp, dying);
     /* A recorded, unsigned close into the new factory: only that ceremony may
@@ -2600,6 +2608,8 @@ static int rot_resume_funding(lsp_channel_mgr_t *mgr) {
     return -1;
 }
 
+static int lsp_rotation_part_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
 int lsp_rotation_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp || !mgr->ladder || !lsp_rotation_progress_resumable(mgr))
         return 0;
@@ -2614,6 +2624,8 @@ int lsp_rotation_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     if (LSP_ROT_PROGRESS_IS_CIN(rp->phase))
         return lsp_rotation_cin_resume(mgr, lsp);
+    if (LSP_ROT_PROGRESS_IS_PART(rp->phase))
+        return lsp_rotation_part_resume(mgr, lsp);
 
     /* Factory ids are not stable across a restart (the recovered factory is
        id 0): find the dying slot by its funding outpoint. */
@@ -3655,10 +3667,11 @@ int lsp_rotation_part_is_retired(const lsp_channel_mgr_t *mgr, const secp256k1_p
 static void part_rel_fill(lsp_channel_mgr_t *mgr, lsp_t *lsp, const factory_t *old_f,
                           const size_t *idx, size_t m, const secp256k1_pubkey *new_pks,
                           const uint64_t *carried, const unsigned char ftxid32[32],
-                          uint32_t fvout) {
+                          uint32_t fvout, size_t n_old) {
     memset(&mgr->part_rel, 0, sizeof(mgr->part_rel));
     if (!factory_tree_digest(&lsp->factory, mgr->part_rel.digest)) return;
     mgr->part_rel.dying_id = mgr->rot_progress.dying_factory_id;
+    mgr->part_rel.n_old = (uint32_t)n_old;
     memcpy(mgr->part_rel.old_txid, old_f->funding_txid, 32);
     mgr->part_rel.old_vout = old_f->funding_vout;
     memcpy(mgr->part_rel.new_txid, ftxid32, 32);
@@ -3675,6 +3688,18 @@ static void part_rel_fill(lsp_channel_mgr_t *mgr, lsp_t *lsp, const factory_t *o
         mgr->part_rel.carried[j] = carried[j];
     }
     mgr->part_rel.valid = 1;
+}
+
+/* The old factory's ladder slot (this process), found by its funding. */
+static ladder_factory_t *part_ladder_slot(lsp_channel_mgr_t *mgr) {
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    for (size_t i = 0; lad && i < lad->n_factories; i++) {
+        ladder_factory_t *lf = &lad->factories[i];
+        if (lf->is_initialized && lf->factory.funding_vout == mgr->part_rel.old_vout &&
+            memcmp(lf->factory.funding_txid, mgr->part_rel.old_txid, 32) == 0)
+            return lf;
+    }
+    return NULL;
 }
 
 static void part_binding(const lsp_channel_mgr_t *mgr, size_t j, unsigned char out[32]) {
@@ -3732,12 +3757,26 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
              secp256k1_ec_pubkey_serialize(mgr->ctx, ser, &l, &pub, SECP256K1_EC_COMPRESSED) &&
              memcmp(ser, mgr->part_rel.old_pk[c], 33) == 0;
     uint32_t old_slot = mgr->part_rel.old_slot[c];
-    if (ok && mgr->persist)
-        ok = persist_save_departed_client((persist_t *)mgr->persist, mgr->part_rel.dying_id,
-                                          old_slot, sk);
-    if (ok && mgr->ladder)
-        (void)ladder_record_key_turnover((ladder_t *)mgr->ladder, mgr->part_rel.dying_id,
-                                         old_slot, sk);
+    uint32_t pidx = old_slot + 1;           /* its participant index in the old factory */
+    persist_t *db = (persist_t *)mgr->persist;
+    if (ok && db) {
+        /* The key and the end of what is owed, together. */
+        char otx[65];
+        rot_txid_display(mgr->part_rel.old_txid, otx);
+        int own = !persist_in_transaction(db);
+        ok = (!own || persist_begin(db)) &&
+             persist_save_departed_client(db, mgr->part_rel.retired_id, pidx, sk) &&
+             persist_set_part_released(db, otx, (uint32_t)c);
+        if (own) {
+            if (ok) ok = persist_commit(db);
+            else persist_rollback(db);
+        }
+    }
+    if (ok) {
+        ladder_factory_t *lf = part_ladder_slot(mgr);
+        if (lf) (void)ladder_record_key_turnover((ladder_t *)mgr->ladder, lf->factory_id,
+                                                 pidx, sk);
+    }
     secure_zero(sk, sizeof(sk));
     if (!ok) {
         fprintf(stderr, "LSP rotate: client %zu sent a release that does not match its old "
@@ -3751,14 +3790,56 @@ int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
     return 1;
 }
 
+static int part_save_record(lsp_channel_mgr_t *mgr, persist_t *db, const factory_t *old_f) {
+    if (!mgr->part_rel.valid || old_f->n_participants != (size_t)mgr->part_rel.n_old + 1)
+        return 0;
+    persist_part_rotation_t *r = calloc(1, sizeof(*r));
+    if (!r) return 0;
+    rot_txid_display(mgr->part_rel.old_txid, r->old_txid);
+    r->old_vout = mgr->part_rel.old_vout;
+    r->retired_id = mgr->part_rel.retired_id;
+    rot_txid_display(mgr->part_rel.new_txid, r->new_txid);
+    r->new_vout = mgr->part_rel.new_vout;
+    memcpy(r->digest, mgr->part_rel.digest, 32);
+    r->n_old = mgr->part_rel.n_old;
+    r->m = (uint32_t)mgr->part_rel.m;
+    r->old_amount = old_f->funding_amount_sats;
+    r->old_cltv = old_f->cltv_timeout;
+    int ok = 1;
+    for (size_t i = 0; ok && i < old_f->n_participants; i++) {
+        size_t l = 33;
+        ok = secp256k1_ec_pubkey_serialize(mgr->ctx, r->old_pks[i], &l, &old_f->pubkeys[i],
+                                           SECP256K1_EC_COMPRESSED);
+    }
+    snprintf(r->state, sizeof(r->state), "releasing");
+    ok = ok && persist_save_part_rotation(db, r);
+    for (size_t j = 0; ok && j < mgr->part_rel.m; j++) {
+        persist_part_release_t rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.j = (uint32_t)j;
+        rel.old_slot = mgr->part_rel.old_slot[j];
+        memcpy(rel.old_pk, mgr->part_rel.old_pk[j], 33);
+        memcpy(rel.new_pk, mgr->part_rel.new_pk[j], 33);
+        rel.carried = mgr->part_rel.carried[j];
+        ok = persist_save_part_release(db, r->old_txid, &rel);
+    }
+    free(r);
+    return ok;
+}
+
 static int part_record_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    lsp_channel_mgr_t *tm, const factory_t *old_f,
                                    const rot_client_save_t *sv) {
     persist_t *db = (persist_t *)mgr->persist;
-    if (!db) return 1;
+    if (!db) {
+        mgr->part_rel.retired_id = LSP_RETIRED_FACTORY_ID(0);
+        return 1;
+    }
     lsp_rotation_progress_t *rp = &mgr->rot_progress;
     char dtx[65];
     rot_txid_display(rp->dying_funding_txid, dtx);
+    /* Not the ladder id: those restart at 0 with every restart. */
+    uint32_t ri = persist_next_retired_index(db);
     int ok = persist_begin(db);
     /* The old factory stays: its signed tree, its participants and
        identities, every old channel and all their per-channel rows (secrets,
@@ -3766,7 +3847,8 @@ static int part_record_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        retired factory's own ids before factory 0 and the slot ids are reused,
        so the LSP can still answer its states and punish revoked commitments,
        and the clients that stayed can exit it. */
-    uint32_t rf = LSP_RETIRED_FACTORY_ID(rp->dying_factory_id);
+    uint32_t rf = LSP_RETIRED_FACTORY_ID(ri);
+    mgr->part_rel.retired_id = rf;
     if (ok) {
         lsp_t old_view = *lsp;
         old_view.client_pubkeys = sv->pks;
@@ -3777,7 +3859,7 @@ static int part_record_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
              lsp_save_client_identities(&old_view, db, mgr->ctx, rf);
     }
     for (size_t c = 0; ok && c < sv->n; c++) {
-        uint32_t rcid = LSP_RETIRED_CHANNEL_ID(rp->dying_factory_id, c);
+        uint32_t rcid = LSP_RETIRED_CHANNEL_ID(ri, c);
         unsigned char id33[33];
         size_t l33 = 33;
         ok = persist_retire_channel_rows(db, 0, rf, (uint32_t)c, rcid) &&
@@ -3809,6 +3891,8 @@ static int part_record_replacement(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             secure_zero(pcs, sizeof(pcs));
         }
     }
+    /* What is owed for the old factory, kept until it is resolved. */
+    ok = ok && part_save_record(mgr, db, old_f);
     if (ok) {
         rp->phase = LSP_ROT_PROGRESS_PART_FUNDING;
         persist_rotation_progress_t row;
@@ -3937,6 +4021,7 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
         rot_tell_abort_set(lsp, idx, m, "rotation aborted: record");
         return 0;
     }
+    lsp_crash_checkpoint("rotate_part_built");
 
     /* The replacement over that outpoint, with M only. */
     rot_client_save_t sv;
@@ -3991,6 +4076,7 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
         printf("LSP rotate: factory %u created and signed over %s:%u (replaces factory %u)\n",
                lad->next_factory_id, fb.txid, fvout, dying->factory_id);
         fflush(stdout);
+        lsp_crash_checkpoint("rotate_part_signed");
     }
 
     /* Channels for M, each carrying that client's balance (by identity, not
@@ -4039,12 +4125,21 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
         ok = wire_send(lsp->client_fds[j], MSG_COMMITMENT_SIGNED, cs);
         cJSON_Delete(cs);
     }
-    /* I4: recorded on this side before the funding goes out. */
+    /* Recorded on this side before the funding goes out, with the
+       releases it makes owed. */
+    if (ok) part_rel_fill(mgr, lsp, &old_f, idx, m, new_pks, carried, ftxid32, fvout, sv.n);
     if (ok && !part_record_replacement(mgr, lsp, tm, &old_f, &sv)) {
         fprintf(stderr, "LSP rotate: could not record the replacement -- not funding it\n");
         ok = 0;
     }
+    if (ok) {
+        printf("LSP rotate: replacement funding %s recorded with the replacement factory\n",
+               fb.txid);
+        fflush(stdout);
+        lsp_crash_checkpoint("rotate_part_recorded");
+    }
     if (!ok) {
+        memset(&mgr->part_rel, 0, sizeof(mgr->part_rel));
         cin_drop_channels(tm);
         lsp_factory_reattach(lsp, &old_f);
         rot_clients_restore(lsp, &sv);
@@ -4068,7 +4163,6 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
                sent_ok ? "" : " (broadcast FAILED; the record keeps it)");
         fflush(stdout);
     }
-    part_rel_fill(mgr, lsp, &old_f, idx, m, new_pks, carried, ftxid32, fvout);
     mgr->n_part_retired = 0;
     for (size_t c = 0; c < n_old; c++)
         if (!in_set[c] && mgr->n_part_retired < FACTORY_MAX_SIGNERS)
@@ -4098,6 +4192,7 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
         return 0;
     }
     (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_PART_FUNDED);
+    lsp_crash_checkpoint("rotate_part_funded");
 
     /* Verified release: a receipt over exactly this position, then the key.
        A release still owed is asked for again when that client reconnects. */
@@ -4120,7 +4215,8 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
                     "(asked again when it reconnects)\n", idx[j]);
             continue;
         }
-        if (lsp_rotation_part_on_release(mgr, lsp, j, rm.json)) released++;
+        if (lsp_rotation_part_on_release(mgr, lsp, j, rm.json) && ++released == 1)
+            lsp_crash_checkpoint("rotate_part_released");
         cJSON_Delete(rm.json);
     }
     fflush(stdout);
@@ -4140,6 +4236,204 @@ static int lsp_rotation_partial(lsp_channel_mgr_t *mgr, lsp_t *lsp, ladder_facto
            "others\n", m, n_old, released);
     fflush(stdout);
     return 1;
+}
+
+/* Resume a partial rotation's marker (lsp_rotation_resume).  FUNDING: the
+   recorded funding, rebroadcast if it is not on the network (never another
+   one); FUNDED: the releases still owed are asked for. */
+static int lsp_rotation_part_resume(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    lsp_rotation_progress_t *rp = &mgr->rot_progress;
+    regtest_t *rt = rot_rt(mgr);
+    char ft[65];
+    snprintf(ft, sizeof(ft), "%s", rp->new_funding_txid);
+    if (rp->phase != LSP_ROT_PROGRESS_PART_FUNDING && rp->phase != LSP_ROT_PROGRESS_PART_FUNDED)
+        return 0;
+    if (rp->phase == LSP_ROT_PROGRESS_PART_FUNDING) {
+        if (rot_tx_confirmations(mgr, ft) < 1 && !rot_tx_in_mempool(mgr, ft)) {
+            char t[65] = {0};
+            if (!rp->new_funding_hex || !rot_send_hex(mgr, rp->new_funding_hex, t)) {
+                if (!rp->hold_reported) {
+                    fprintf(stderr, "LSP rotate: the recorded replacement funding %s is "
+                            "neither confirmed nor in the mempool and could not be "
+                            "rebroadcast -- NOT funding another (operator attention)\n", ft);
+                    rp->hold_reported = 1;
+                }
+                return 0;
+            }
+            if (mgr->persist)
+                persist_log_broadcast((persist_t *)mgr->persist, ft,
+                                      "rotation_partial_funding", rp->new_funding_hex, "ok");
+            printf("LSP rotate: replacement funding %s was not on the network — "
+                   "rebroadcast the recorded TX\n", ft);
+        }
+        if (rot_tx_confirmations(mgr, ft) < 1 && mgr->rot_is_regtest && rt &&
+            rot_tx_in_mempool(mgr, ft))
+            regtest_mine_blocks(rt, 1, mgr->rot_mine_addr);
+        if (rot_tx_confirmations(mgr, ft) < 1) {
+            printf("LSP rotate: replacement funding %s still unconfirmed — waiting\n", ft);
+            fflush(stdout);
+            return 0;
+        }
+        if (!rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_PART_FUNDED)) return 0;
+        printf("LSP rotate: replacement funding %s is confirmed\n", ft);
+    }
+    size_t owed = 0, asked = 0;
+    if (mgr->part_rel.valid) {
+        mgr->part_rel.funded = 1;
+        for (size_t j = 0; j < mgr->part_rel.m; j++) {
+            if (mgr->part_rel.released[j]) continue;
+            owed++;
+            if (part_send_release_req(mgr, lsp, j)) asked++;
+        }
+    }
+    (void)rot_progress_set_phase(mgr, LSP_ROT_PROGRESS_DONE);
+    lsp_rotation_progress_clear(mgr);
+    printf("LSP rotate: rotation complete — partial rotation resumed, replacement "
+           "funding %s confirmed; %zu release(s) still owed (%zu asked now, the others "
+           "when those clients reconnect)\n", ft, owed, asked);
+    fflush(stdout);
+    return 1;
+}
+
+static int part_rel_restore(lsp_channel_mgr_t *mgr, const persist_part_rotation_t *r,
+                            size_t *owed_out) {
+    persist_part_release_t *rel = calloc(FACTORY_MAX_SIGNERS, sizeof(*rel));
+    if (!rel) return 0;
+    size_t n = persist_load_part_releases((persist_t *)mgr->persist, r->old_txid, rel,
+                                          FACTORY_MAX_SIGNERS);
+    memset(&mgr->part_rel, 0, sizeof(mgr->part_rel));
+    int ok = n == r->m && r->m > 0 && r->m < FACTORY_MAX_SIGNERS &&
+             hex_decode(r->old_txid, mgr->part_rel.old_txid, 32) == 32 &&
+             hex_decode(r->new_txid, mgr->part_rel.new_txid, 32) == 32;
+    size_t owed = 0;
+    for (size_t k = 0; ok && k < n; k++) {
+        uint32_t j = rel[k].j;
+        if (j >= r->m) { ok = 0; break; }
+        memcpy(mgr->part_rel.old_pk[j], rel[k].old_pk, 33);
+        memcpy(mgr->part_rel.new_pk[j], rel[k].new_pk, 33);
+        mgr->part_rel.old_slot[j] = rel[k].old_slot;
+        mgr->part_rel.carried[j] = rel[k].carried;
+        mgr->part_rel.released[j] = rel[k].released ? 1 : 0;
+        if (!rel[k].released) owed++;
+    }
+    free(rel);
+    if (!ok) {
+        memset(&mgr->part_rel, 0, sizeof(mgr->part_rel));
+        return 0;
+    }
+    reverse_bytes(mgr->part_rel.old_txid, 32);
+    reverse_bytes(mgr->part_rel.new_txid, 32);
+    mgr->part_rel.old_vout = r->old_vout;
+    mgr->part_rel.new_vout = r->new_vout;
+    memcpy(mgr->part_rel.digest, r->digest, 32);
+    mgr->part_rel.m = r->m;
+    mgr->part_rel.n_old = r->n_old;
+    mgr->part_rel.retired_id = r->retired_id;
+    mgr->part_rel.dying_id = UINT32_MAX;          /* not in this process's ladder */
+    mgr->part_rel.valid = 1;
+    if (owed_out) *owed_out = owed;
+    return 1;
+}
+
+int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                           const unsigned char *live_txid32, uint32_t live_vout) {
+    if (!mgr || !mgr->persist || !live_txid32) return 0;
+    persist_t *db = (persist_t *)mgr->persist;
+    char live[65];
+    rot_txid_display(live_txid32, live);
+    int any = 0;
+    persist_rotation_progress_t row;
+    uint64_t amounts[FACTORY_MAX_SIGNERS];
+
+    /* Stopped before the replacement was recorded: the live factory is still
+       the old one, and the funding was never broadcast. */
+    memset(&row, 0, sizeof(row));
+    row.dist_amounts = amounts;
+    if (persist_load_rotation_progress(db, live, &row, FACTORY_MAX_SIGNERS) &&
+        row.dying_funding_vout == live_vout &&
+        (row.phase == LSP_ROT_PROGRESS_PART_BUILT || row.phase == LSP_ROT_PROGRESS_PART_SIGNING)) {
+        int ph = row.phase;
+        if (rt && row.new_funding_hex && regtest_unlock_tx_inputs(rt, row.new_funding_hex) < 0)
+            fprintf(stderr, "LSP recovery: could not unlock the wallet inputs of the "
+                    "dropped replacement funding %s\n", row.new_funding_txid);
+        row.phase = LSP_ROT_PROGRESS_DONE;
+        if (persist_save_rotation_progress(db, live, &row)) {
+            printf("LSP recovery: a partial rotation of this factory stopped before its "
+                   "replacement was recorded (phase %d) — dropped; its funding %s was "
+                   "never broadcast\n", ph, row.new_funding_txid);
+            any = 1;
+        }
+    }
+    free(row.new_funding_hex);
+    free(row.dist_tx_hex);
+
+    /* The live factory is a partial rotation's replacement. */
+    char dtx[65];
+    memset(&row, 0, sizeof(row));
+    row.dist_amounts = amounts;
+    if (mgr->rot_progress.phase == LSP_ROT_PROGRESS_NONE &&
+        persist_find_rotation_by_new_funding(db, live, dtx) == 1 &&
+        persist_load_rotation_progress(db, dtx, &row, FACTORY_MAX_SIGNERS) &&
+        (row.phase == LSP_ROT_PROGRESS_PART_FUNDING || row.phase == LSP_ROT_PROGRESS_PART_FUNDED)) {
+        lsp_rotation_progress_t *rp = &mgr->rot_progress;
+        lsp_rotation_progress_clear(mgr);
+        if (hex_decode(dtx, rp->dying_funding_txid, 32) == 32) {
+            reverse_bytes(rp->dying_funding_txid, 32);
+            rp->phase = row.phase;
+            rp->dying_factory_id = row.dying_factory_id;
+            rp->dying_funding_vout = row.dying_funding_vout;
+            snprintf(rp->new_funding_txid, sizeof(rp->new_funding_txid), "%s", live);
+            rp->new_funding_hex = row.new_funding_hex;       /* ownership moves */
+            row.new_funding_hex = NULL;
+            rp->new_funding_vout = row.new_funding_vout;
+            rp->new_funding_amount = row.new_funding_amount;
+            rp->new_cltv = row.new_cltv;
+            /* A PART_FUNDING funding was recorded but its wallet-input
+               locks are in-memory and gone after the restart.  Rebroadcast it
+               (and re-lock its inputs) FIRST THING, before the daemon does
+               anything that could spend from the wallet and invalidate it. */
+            if (rp->phase == LSP_ROT_PROGRESS_PART_FUNDING && rp->new_funding_hex &&
+                rot_tx_confirmations(mgr, live) < 1 && !rot_tx_in_mempool(mgr, live)) {
+                char t[65] = {0};
+                if (rt) (void)regtest_lock_tx_inputs(rt, rp->new_funding_hex);
+                if (rot_send_hex(mgr, rp->new_funding_hex, t)) {
+                    persist_log_broadcast(db, live, "rotation_partial_funding",
+                                          rp->new_funding_hex, "ok");
+                    printf("LSP recovery: rebroadcast the recorded replacement funding %s "
+                           "before any wallet use\n", live);
+                } else if (rt) {
+                    (void)regtest_lock_tx_inputs(rt, rp->new_funding_hex);
+                }
+            }
+            printf("LSP recovery: this factory replaces %s in a partial rotation (phase %d) "
+                   "— %s\n", dtx, row.phase,
+                   row.phase == LSP_ROT_PROGRESS_PART_FUNDING
+                       ? "its recorded funding is confirmed or rebroadcast"
+                       : "the releases still owed are asked for again");
+            any = 1;
+        }
+    }
+    free(row.new_funding_hex);
+    free(row.dist_tx_hex);
+
+    /* The releases still owed for the old factory. */
+    persist_part_rotation_t *rows = calloc(LADDER_MAX_FACTORIES, sizeof(*rows));
+    if (!rows) return any;
+    size_t n = persist_load_part_rotations(db, rows, LADDER_MAX_FACTORIES, 1);
+    for (size_t i = 0; i < n; i++) {
+        size_t owed = 0;
+        if (strcmp(rows[i].new_txid, live) == 0 && rows[i].new_vout == live_vout &&
+            strcmp(rows[i].state, "releasing") == 0 && part_rel_restore(mgr, &rows[i], &owed)) {
+            printf("LSP recovery: %zu of %u release(s) still owed for the old factory %s — "
+                   "asked again when those clients reconnect\n", owed, rows[i].m,
+                   rows[i].old_txid);
+            any = 1;
+        }
+        free(rows[i].close_hex);
+    }
+    free(rows);
+    fflush(stdout);
+    return any;
 }
 
 /* Resume a CIN marker (lsp_rotation_resume). */

@@ -241,6 +241,7 @@ char *regtest_build_signed_payment(regtest_t *rt, const char *address,
    NOT be broadcast, or whose record was dropped.  Inputs already spent or not
    locked are skipped.  Returns how many were unlocked, -1 if TX_HEX does not
    parse. */
+int regtest_lock_tx_inputs(regtest_t *rt, const char *tx_hex);
 int regtest_unlock_tx_inputs(regtest_t *rt, const char *tx_hex);
 
 /* abandontransaction: the wallet stops rebroadcasting TXID (only possible

@@ -3377,6 +3377,8 @@ int main(int argc, char *argv[]) {
                 printf("LSP recovery: this factory replaced its predecessor by a co-signed "
                        "close (%s, phase %d) — finishing that rotation\n",
                        mgr->rot_progress.close_txid, mgr->rot_progress.phase);
+            (void)lsp_rotation_part_load(mgr, &rt, lsp_rp->factory.funding_txid,
+                                         lsp_rp->factory.funding_vout);
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
             mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;

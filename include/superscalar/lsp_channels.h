@@ -82,6 +82,8 @@
 #define LSP_ROT_PROGRESS_PART_FUNDED   23
 #define LSP_ROT_PROGRESS_IS_CIN(ph) ((ph) >= LSP_ROT_PROGRESS_CIN_CLOSE_BUILT && \
                                      (ph) <= LSP_ROT_PROGRESS_CIN_CLOSED)
+#define LSP_ROT_PROGRESS_IS_PART(ph) ((ph) >= LSP_ROT_PROGRESS_PART_BUILT && \
+                                      (ph) <= LSP_ROT_PROGRESS_PART_FUNDED)
 typedef struct {
     int phase;                              /* LSP_ROT_PROGRESS_* */
     uint32_t dying_factory_id;
@@ -248,7 +250,9 @@ typedef struct {
        and the identities of the clients that stayed in the old factory. */
     struct {
         int valid, funded;
-        uint32_t dying_id;
+        uint32_t dying_id;             /* ladder id, this process only */
+        uint32_t retired_id;           /* the old factory's rows and released keys */
+        uint32_t n_old;                /* clients of the old factory */
         unsigned char old_txid[32];
         uint32_t old_vout;
         unsigned char new_txid[32];
@@ -780,6 +784,16 @@ int lsp_rotation_part_on_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c)
    and store it sealed.  Returns 1 if it was taken. */
 int lsp_rotation_part_on_release(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
                                  const cJSON *json);
+
+/* After a restart, the partial rotation of the live factory (LIVE_TXID32,
+   internal order).  One that stopped before its replacement was recorded is
+   dropped: that funding was never broadcast, and its wallet inputs are
+   unlocked (RT).  One whose replacement is the live factory resumes from its
+   marker (the daemon rebroadcasts a recorded funding that is not on the
+   network), and the releases still owed are asked for again when those
+   clients reconnect.  Returns 1 if anything was loaded or dropped. */
+int lsp_rotation_part_load(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                           const unsigned char *live_txid32, uint32_t live_vout);
 
 /* 1 if PK is the identity of a client that stayed in a factory retired by a
    partial rotation. */

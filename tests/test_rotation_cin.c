@@ -2,6 +2,7 @@
    balance carry, the close check a client runs before signing, the resume
    and resolve decisions, the records, and the wire messages. */
 #include "superscalar/lsp_channels.h"
+#include "superscalar/ladder.h"
 #include "superscalar/client_rotation.h"
 #include "superscalar/factory_keys.h"
 #include "superscalar/persist.h"
@@ -1515,6 +1516,240 @@ int test_cin_all_open_rows(void) {
                 "and is reported as pending");
     cJSON_Delete(rc);
     client_cin_refresh_frozen(NULL);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* The partial rotation's record: what is owed for the old factory survives
+   a restart, and retired ids never repeat. */
+int test_part_record_rows(void) {
+    char path[] = "/tmp/ss_part_rr_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    TEST_ASSERT(persist_next_retired_index(&db) == 0, "first retired index");
+    persist_part_rotation_t *r = calloc(1, sizeof(*r));
+    persist_part_rotation_t *back = calloc(2, sizeof(*back));
+    TEST_ASSERT(r && back, "alloc");
+    snprintf(r->old_txid, sizeof(r->old_txid), "%s", "7171717171717171717171717171717171717171717171717171717171717171");
+    snprintf(r->new_txid, sizeof(r->new_txid), "%s", "7272727272727272727272727272727272727272727272727272727272727272");
+    r->old_vout = 1;
+    r->new_vout = 2;
+    r->retired_id = LSP_RETIRED_FACTORY_ID(0);
+    r->n_old = 2;
+    r->m = 2;
+    r->old_amount = 200000;
+    r->old_cltv = 900;
+    memset(r->digest, 0x73, 32);
+    for (int i = 0; i < 3; i++) { r->old_pks[i][0] = 0x02; memset(r->old_pks[i] + 1, 0x10 + i, 32); }
+    snprintf(r->state, sizeof(r->state), "releasing");
+    TEST_ASSERT(persist_save_part_rotation(&db, r), "saved");
+    for (uint32_t j = 0; j < 2; j++) {
+        persist_part_release_t rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.j = j;
+        rel.old_slot = j + 1;
+        rel.old_pk[0] = rel.new_pk[0] = 0x03;
+        rel.carried = 1000 + j;
+        TEST_ASSERT(persist_save_part_release(&db, r->old_txid, &rel), "release row");
+    }
+    TEST_ASSERT(persist_next_retired_index(&db) == 1, "the next retired index moves on");
+    TEST_ASSERT(persist_set_part_released(&db, r->old_txid, 1), "released");
+    TEST_ASSERT(!persist_set_part_released(&db, r->old_txid, 5), "no such row");
+    TEST_ASSERT(persist_load_part_rotations(&db, back, 2, 1) == 1, "one open row");
+    TEST_ASSERT(strcmp(back[0].old_txid, r->old_txid) == 0 && back[0].n_old == 2 &&
+                back[0].m == 2 && back[0].old_amount == 200000 && back[0].old_cltv == 900 &&
+                memcmp(back[0].old_pks, r->old_pks, 3 * 33) == 0 &&
+                memcmp(back[0].digest, r->digest, 32) == 0 && !back[0].close_hex,
+                "the row comes back");
+    persist_part_release_t rels[4];
+    TEST_ASSERT(persist_load_part_releases(&db, r->old_txid, rels, 4) == 2 &&
+                !rels[0].released && rels[1].released && rels[1].old_slot == 2 &&
+                rels[1].carried == 1001, "and what is owed");
+    snprintf(r->state, sizeof(r->state), "done");
+    TEST_ASSERT(persist_save_part_rotation(&db, r) &&
+                persist_load_part_rotations(&db, back, 2, 1) == 0 &&
+                persist_load_part_rotations(&db, back, 2, 0) == 1, "done: no longer open");
+    /* Deleting the released keys of one retired factory only. */
+    unsigned char seal[32], sk[32];
+    memset(seal, 0x66, 32);
+    memset(sk, 0x44, 32);
+    persist_set_departed_seal_key(&db, seal);
+    TEST_ASSERT(persist_save_departed_client(&db, r->retired_id, 1, sk) &&
+                persist_save_departed_client(&db, r->retired_id + 1, 1, sk), "keys");
+    TEST_ASSERT(persist_delete_departed_clients(&db, r->retired_id), "deleted");
+    int dep[4] = {0};
+    TEST_ASSERT(persist_load_departed_clients(&db, r->retired_id, dep, NULL, 4) == 0 &&
+                persist_load_departed_clients(&db, r->retired_id + 1, dep, NULL, 4) == 1,
+                "only that factory's");
+    free(r);
+    free(back);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* A release is stored under the old factory's retired id at the client's
+   PARTICIPANT index (slot + 1), marks the owed row, and reaches the ladder
+   at that index: the LSP alone can then close the old factory. */
+int test_part_release_slot(void) {
+    secp256k1_context *ctx = cin_ctx();
+    char path[] = "/tmp/ss_part_rs_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    unsigned char seal[32];
+    memset(seal, 0x66, 32);
+    persist_set_departed_seal_key(&db, seal);
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    ladder_t *lad = calloc(1, sizeof(*lad));
+    TEST_ASSERT(mgr && lad, "alloc");
+    mgr->ctx = ctx;
+    mgr->persist = &db;
+    mgr->ladder = lad;
+    memset(mgr->rot_lsp_seckey, 0x62, 32);
+    unsigned char osk[32];
+    memset(osk, 0x63, 32);
+    secp256k1_pubkey opk, npk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &opk, osk) && mk_pk(&npk, 0x64), "keys");
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, mgr->part_rel.old_pk[0], &l, &opk, SECP256K1_EC_COMPRESSED);
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, mgr->part_rel.new_pk[0], &l, &npk, SECP256K1_EC_COMPRESSED);
+    memset(mgr->part_rel.old_txid, 0x01, 32);
+    mgr->part_rel.old_vout = 0;
+    memset(mgr->part_rel.new_txid, 0x02, 32);
+    memset(mgr->part_rel.digest, 0x03, 32);
+    mgr->part_rel.old_slot[0] = 1;          /* the old factory's second client */
+    mgr->part_rel.carried[0] = 5000;
+    mgr->part_rel.m = 1;
+    mgr->part_rel.n_old = 2;
+    mgr->part_rel.retired_id = LSP_RETIRED_FACTORY_ID(4);
+    mgr->part_rel.valid = 1;
+    mgr->part_rel.funded = 1;
+    char otx[65];
+    {
+        unsigned char rb[32];
+        for (int i = 0; i < 32; i++) rb[i] = mgr->part_rel.old_txid[31 - i];
+        hex_encode(rb, 32, otx);
+    }
+    persist_part_release_t rel;
+    memset(&rel, 0, sizeof(rel));
+    rel.old_slot = 1;
+    TEST_ASSERT(persist_save_part_release(&db, otx, &rel), "owed row");
+    ladder_factory_t *lf = &lad->factories[0];
+    lf->is_initialized = 1;
+    lf->factory_id = 9;
+    lf->factory.n_participants = 3;
+    memcpy(lf->factory.funding_txid, mgr->part_rel.old_txid, 32);
+    lad->n_factories = 1;
+    unsigned char bind[32];
+    factory_release_binding(mgr->part_rel.old_txid, 0, mgr->part_rel.new_txid, 0,
+                            mgr->part_rel.digest, mgr->part_rel.new_pk[0], 5000, 1, bind);
+    cJSON *r = wire_build_rotation_release(bind, osk);
+    lsp_t lsp;
+    memset(&lsp, 0, sizeof(lsp));
+    TEST_ASSERT(lsp_rotation_part_on_release(mgr, &lsp, 0, r), "taken");
+    cJSON_Delete(r);
+    int dep[4] = {0};
+    unsigned char keys[4][32];
+    memset(keys, 0, sizeof(keys));
+    TEST_ASSERT(persist_load_departed_clients(&db, LSP_RETIRED_FACTORY_ID(4), dep, keys, 4) == 1 &&
+                dep[2] && !dep[1] && memcmp(keys[2], osk, 32) == 0,
+                "stored at participant index 2 under the retired id");
+    persist_part_release_t back[2];
+    TEST_ASSERT(persist_load_part_releases(&db, otx, back, 2) == 1 && back[0].released,
+                "no longer owed");
+    TEST_ASSERT(lf->client_departed[2] && !lf->client_departed[1] &&
+                memcmp(lf->extracted_keys[2], osk, 32) == 0 && lf->n_departed == 1,
+                "the ladder has it at the participant index");
+    free(lad);
+    free(mgr);
+    persist_close(&db);
+    unlink(path);
+    return 1;
+}
+
+/* After a restart: the replacement's marker resumes, what is owed comes
+   back, and a rotation that stopped before its record is dropped. */
+int test_part_load_restart(void) {
+    char path[] = "/tmp/ss_part_lr_XXXXXX";
+    persist_t db;
+    TEST_ASSERT(tmp_db(path, &db), "db");
+    const char *old_hex = "8181818181818181818181818181818181818181818181818181818181818181";
+    const char *new_hex = "8282828282828282828282828282828282828282828282828282828282828282";
+    const char *other_hex = "8383838383838383838383838383838383838383838383838383838383838383";
+    persist_rotation_progress_t row;
+    memset(&row, 0, sizeof(row));
+    row.phase = LSP_ROT_PROGRESS_PART_FUNDING;
+    row.dying_funding_vout = 0;
+    snprintf(row.new_funding_txid, sizeof(row.new_funding_txid), "%s", new_hex);
+    row.new_funding_hex = (char *)"0200";
+    row.new_funding_vout = 1;
+    row.new_funding_amount = 150000;
+    TEST_ASSERT(persist_save_rotation_progress(&db, old_hex, &row), "marker");
+    persist_part_rotation_t *r = calloc(1, sizeof(*r));
+    TEST_ASSERT(r, "alloc");
+    snprintf(r->old_txid, sizeof(r->old_txid), "%s", old_hex);
+    snprintf(r->new_txid, sizeof(r->new_txid), "%s", new_hex);
+    r->new_vout = 1;
+    r->retired_id = LSP_RETIRED_FACTORY_ID(2);
+    r->n_old = 3;
+    r->m = 2;
+    for (int i = 0; i < 4; i++) r->old_pks[i][0] = 0x02;
+    snprintf(r->state, sizeof(r->state), "releasing");
+    TEST_ASSERT(persist_save_part_rotation(&db, r), "record");
+    for (uint32_t j = 0; j < 2; j++) {
+        persist_part_release_t rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.j = j;
+        rel.old_slot = 2 - j;
+        rel.old_pk[0] = 0x02;
+        rel.old_pk[1] = (unsigned char)j;
+        rel.carried = 700 + j;
+        rel.released = j == 0;
+        TEST_ASSERT(persist_save_part_release(&db, old_hex, &rel), "owed");
+    }
+    /* A second factory whose rotation stopped at PART_SIGNING. */
+    memset(&row, 0, sizeof(row));
+    row.phase = LSP_ROT_PROGRESS_PART_SIGNING;
+    row.dying_funding_vout = 1;
+    snprintf(row.new_funding_txid, sizeof(row.new_funding_txid), "%s", other_hex);
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(*mgr));
+    TEST_ASSERT(mgr, "mgr");
+    mgr->ctx = cin_ctx();
+    mgr->persist = &db;
+    unsigned char live[32];
+    TEST_ASSERT(hex_decode(new_hex, live, 32) == 32, "hex");
+    reverse_bytes(live, 32);
+    /* The live factory is the replacement (and, for the second marker, the
+       old factory of a rotation that never got recorded). */
+    TEST_ASSERT(persist_save_rotation_progress(&db, new_hex, &row), "stopped marker");
+    TEST_ASSERT(lsp_rotation_part_load(mgr, NULL, live, 1), "loaded");
+    persist_rotation_progress_t chk;
+    memset(&chk, 0, sizeof(chk));
+    TEST_ASSERT(persist_load_rotation_progress(&db, new_hex, &chk, 0) &&
+                chk.phase == LSP_ROT_PROGRESS_DONE, "the unrecorded rotation is dropped");
+    free(chk.new_funding_hex);
+    free(chk.dist_tx_hex);
+    TEST_ASSERT(mgr->rot_progress.phase == LSP_ROT_PROGRESS_PART_FUNDING &&
+                strcmp(mgr->rot_progress.new_funding_txid, new_hex) == 0 &&
+                mgr->rot_progress.new_funding_hex &&
+                strcmp(mgr->rot_progress.new_funding_hex, "0200") == 0 &&
+                lsp_rotation_progress_resumable(mgr),
+                "the replacement's marker resumes with its recorded funding");
+    unsigned char o32[32];
+    hex_decode(old_hex, o32, 32);
+    reverse_bytes(o32, 32);
+    TEST_ASSERT(mgr->part_rel.valid && mgr->part_rel.m == 2 && mgr->part_rel.n_old == 3 &&
+                mgr->part_rel.retired_id == LSP_RETIRED_FACTORY_ID(2) &&
+                memcmp(mgr->part_rel.old_txid, o32, 32) == 0 &&
+                mgr->part_rel.released[0] && !mgr->part_rel.released[1] &&
+                mgr->part_rel.old_slot[1] == 1 && mgr->part_rel.carried[1] == 701 &&
+                mgr->part_rel.old_pk[1][1] == 1,
+                "what is owed comes back");
+    lsp_rotation_progress_clear(mgr);
+    free(mgr);
+    free(r);
     persist_close(&db);
     unlink(path);
     return 1;
