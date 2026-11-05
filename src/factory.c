@@ -5128,3 +5128,45 @@ int factory_funding_spk_for(const secp256k1_context *ctx, const secp256k1_pubkey
     secp256k1_xonly_pubkey tw;
     return build_musig_p2tr_spk(ctx, spk_out34, &tw, NULL, &ka, pubkeys, n, NULL);
 }
+
+int factory_tree_digest(const factory_t *f, unsigned char out32[32]) {
+    if (!f || !out32 || f->n_nodes == 0) return 0;
+    size_t total = 4;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        if (!f->nodes[i].unsigned_tx.data || f->nodes[i].unsigned_tx.len == 0) return 0;
+        total += 4 + f->nodes[i].unsigned_tx.len;
+    }
+    unsigned char *buf = malloc(total);
+    if (!buf) return 0;
+    size_t off = 0;
+    uint32_t n = (uint32_t)f->n_nodes;
+    for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(n >> (8 * b));
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        uint32_t l = (uint32_t)f->nodes[i].unsigned_tx.len;
+        for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(l >> (8 * b));
+        memcpy(buf + off, f->nodes[i].unsigned_tx.data, l);
+        off += l;
+    }
+    sha256(buf, total, out32);
+    free(buf);
+    return 1;
+}
+
+void factory_release_binding(const unsigned char old_txid32[32], uint32_t old_vout,
+                             const unsigned char new_txid32[32], uint32_t new_vout,
+                             const unsigned char tree_digest32[32],
+                             const unsigned char pubkey_new33[33],
+                             uint64_t carried_sats, uint32_t slot,
+                             unsigned char out32[32]) {
+    unsigned char m[32 + 4 + 32 + 4 + 32 + 33 + 8 + 4];
+    size_t o = 0;
+    memcpy(m + o, old_txid32, 32); o += 32;
+    for (int b = 0; b < 4; b++) m[o++] = (unsigned char)(old_vout >> (8 * b));
+    memcpy(m + o, new_txid32, 32); o += 32;
+    for (int b = 0; b < 4; b++) m[o++] = (unsigned char)(new_vout >> (8 * b));
+    memcpy(m + o, tree_digest32, 32); o += 32;
+    memcpy(m + o, pubkey_new33, 33); o += 33;
+    for (int b = 0; b < 8; b++) m[o++] = (unsigned char)(carried_sats >> (8 * b));
+    for (int b = 0; b < 4; b++) m[o++] = (unsigned char)(slot >> (8 * b));
+    sha256_tagged("SuperScalar/turnover/v2", m, o, out32);
+}

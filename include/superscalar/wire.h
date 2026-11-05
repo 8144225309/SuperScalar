@@ -225,6 +225,16 @@
 #define MSG_ROTATION_KEY  0x8F
 #define MSG_ROTATION_DONE 0x90
 
+/* Partial rotation with verified release (some old clients offline).
+   MSG_ROTATION_RELEASE_REQ LSP -> client once the replacement's funding is
+                     confirmed: {"funding_txid", "binding": the release
+                     binding (factory_release_binding), "receipt": the LSP's
+                     Schnorr signature over it with its factory key}.
+   MSG_ROTATION_RELEASE client -> LSP after its own checks: {"binding",
+                     "old_seckey": the client's key of the old factory}. */
+#define MSG_ROTATION_RELEASE_REQ 0x91
+#define MSG_ROTATION_RELEASE     0x92
+
 /* Ceremony abort reason codes (single byte). Unknown values: treat as
    OTHER and surface reason_text for diagnostics. */
 #define CEREMONY_ABORT_LSP_RESTART          0x01
@@ -1339,5 +1349,16 @@ cJSON *wire_build_rotation_done(const char *close_txid_hex, const char *close_he
 /* close_hex_out (may be NULL) gets a malloc'd copy or NULL. */
 int wire_parse_rotation_done(const cJSON *j, char close_txid_out[65], char **close_hex_out,
                              int *confirmed_out);
+
+/* MSG_ROTATION_RELEASE_REQ / MSG_ROTATION_RELEASE (txids in internal order). */
+cJSON *wire_build_rotation_release_req(const unsigned char funding_txid32[32],
+                                       const unsigned char binding32[32],
+                                       const unsigned char receipt64[64]);
+int wire_parse_rotation_release_req(const cJSON *j, unsigned char funding_txid32[32],
+                                    unsigned char binding32[32], unsigned char receipt64[64]);
+cJSON *wire_build_rotation_release(const unsigned char binding32[32],
+                                   const unsigned char old_seckey32[32]);
+int wire_parse_rotation_release(const cJSON *j, unsigned char binding32[32],
+                                unsigned char old_seckey32[32]);
 
 #endif /* SUPERSCALAR_WIRE_H */

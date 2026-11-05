@@ -5259,6 +5259,10 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     case MSG_UPDATE_FULFILL_HTLC:
         return handle_fulfill_htlc(mgr, lsp, client_idx, msg->json);
 
+    case MSG_ROTATION_RELEASE:
+        (void)lsp_rotation_part_on_release(mgr, lsp, client_idx, msg->json);
+        return 1;
+
     case MSG_UPDATE_FAIL_HTLC: {
         uint64_t htlc_id;
         char reason[256];
@@ -5778,6 +5782,18 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     int found = lsp_find_client_slot_by_identity(lsp, mgr->ctx, &client_pk);
 
     if (found < 0) {
+        if (lsp_rotation_part_is_retired(mgr, &client_pk)) {
+            /* It stayed in the old factory, which the replacement does not
+               serve: its exit is that factory's signed tree, its channel and
+               the distribution TX, all kept on both sides. */
+            fprintf(stderr, "LSP reconnect: a client of a factory retired by a partial "
+                    "rotation -- told to exit through that factory\n");
+            cJSON *e = wire_build_error("factory retired by a partial rotation: exit "
+                                        "through its signed transactions");
+            if (e) { wire_send(new_fd, MSG_ERROR, e); cJSON_Delete(e); }
+            wire_close(new_fd);
+            return 0;
+        }
         fprintf(stderr, "LSP reconnect: unknown pubkey\n");
         wire_close(new_fd);
         return 0;
@@ -6097,6 +6113,10 @@ int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd
 
     int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &msg);
     cJSON_Delete(msg.json);
+    if (ret)
+        for (size_t c = 0; c < lsp->n_clients; c++)
+            if (lsp->client_fds[c] == new_fd)
+                (void)lsp_rotation_part_on_reconnect(mgr, lsp, c);
     return ret;
 }
 

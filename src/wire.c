@@ -3497,3 +3497,41 @@ int wire_json_get_uint(const cJSON *obj, const char *key, uint64_t max, uint64_t
     *out = u;
     return 1;
 }
+
+cJSON *wire_build_rotation_release_req(const unsigned char funding_txid32[32],
+                                       const unsigned char binding32[32],
+                                       const unsigned char receipt64[64]) {
+    if (!funding_txid32 || !binding32 || !receipt64) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "funding_txid", funding_txid32, 32);
+    wire_json_add_hex(j, "binding", binding32, 32);
+    wire_json_add_hex(j, "receipt", receipt64, 64);
+    return j;
+}
+
+int wire_parse_rotation_release_req(const cJSON *j, unsigned char funding_txid32[32],
+                                    unsigned char binding32[32], unsigned char receipt64[64]) {
+    if (!j || !funding_txid32 || !binding32 || !receipt64 || !wire_json_unambiguous(j))
+        return 0;
+    return wire_json_get_hex(j, "funding_txid", funding_txid32, 32) == 32 &&
+           wire_json_get_hex(j, "binding", binding32, 32) == 32 &&
+           wire_json_get_hex(j, "receipt", receipt64, 64) == 64;
+}
+
+cJSON *wire_build_rotation_release(const unsigned char binding32[32],
+                                   const unsigned char old_seckey32[32]) {
+    if (!binding32 || !old_seckey32) return NULL;
+    cJSON *j = cJSON_CreateObject();
+    if (!j) return NULL;
+    wire_json_add_hex(j, "binding", binding32, 32);
+    wire_json_add_hex(j, "old_seckey", old_seckey32, 32);
+    return j;
+}
+
+int wire_parse_rotation_release(const cJSON *j, unsigned char binding32[32],
+                                unsigned char old_seckey32[32]) {
+    if (!j || !binding32 || !old_seckey32 || !wire_json_unambiguous(j)) return 0;
+    return wire_json_get_hex(j, "binding", binding32, 32) == 32 &&
+           wire_json_get_hex(j, "old_seckey", old_seckey32, 32) == 32;
+}

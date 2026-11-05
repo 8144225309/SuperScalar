@@ -16,6 +16,10 @@ typedef struct {
        in memory only — never persisted. Zeroed at persist_close. */
     unsigned char dek[32];
     int enc_enabled;
+    /* Seal for the client keys released to the LSP (departed_clients) when
+       field encryption is off: never stored, zeroed at persist_close. */
+    unsigned char seal_key[32];
+    int seal_key_set;
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
@@ -712,6 +716,30 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
                                          size_t max_leaf_nodes);
 
 /* --- Departed clients (Phase 23) --- */
+
+/* Released client keys are stored sealed even without --encrypt-db: under
+   this key (the LSP derives it from its own secret) as "dk1:" + hex(nonce,
+   ciphertext, tag).  With field encryption on, that is used instead. */
+void persist_set_departed_seal_key(persist_t *p, const unsigned char key32[32]);
+
+/* A factory that stays after a partial rotation keeps its channel rows: the
+   channel saved as (FROM_FACTORY, SLOT) moves to (TO_FACTORY, SLOT), and
+   every per-channel row (any table with a channel_id column: secrets,
+   points, commitment signatures, HTLCs, watch entries) of channel id SLOT
+   moves to TO_CHANNEL_ID.  One statement per table; joins the caller's
+   transaction.  Returns 1 on success. */
+int persist_retire_channel_rows(persist_t *p, uint32_t from_factory, uint32_t to_factory,
+                                uint32_t slot, uint32_t to_channel_id);
+
+/* The retired channels (LSP): channel id, its factory and slot, and the
+   identity of the client that held it (IDENTITY33 may be NULL).  The
+   watchtower reloads their watch entries after a restart; a client that
+   stayed is recognised by its identity.  load: up to MAX rows, returns how
+   many (IDENTITIES33 may be NULL; an unknown identity comes back zeroed). */
+int persist_save_retired_channel(persist_t *p, uint32_t channel_id, uint32_t factory_id,
+                                 uint32_t slot, const unsigned char *identity33);
+size_t persist_load_retired_channels(persist_t *p, uint32_t *channel_ids,
+                                     unsigned char (*identities33)[33], size_t max);
 
 int persist_save_departed_client(persist_t *p, uint32_t factory_id,
                                   uint32_t client_idx,
@@ -1575,7 +1603,10 @@ typedef struct {
     char state[16];
     char side_db[256];
     char *close_hex;            /* load: malloc'd or NULL (caller frees) */
-    uint32_t close_height;      /* the close's nLockTime: it confirms at or after it */
+    uint32_t close_height;      /* the close's nLockTime (partial: the funding's vout) */
+    uint32_t old_key_index;     /* partial: the old factory key's index */
+    uint64_t carried;           /* partial: the balance carried into the replacement */
+    char old_pubkey[67];        /* partial: the old factory key (hex), checked on a release */
 } persist_client_rotation_t;
 int persist_client_rotation_save(persist_t *p, const persist_client_rotation_t *r);
 int persist_client_rotation_load(persist_t *p, const char *old_txid_hex,

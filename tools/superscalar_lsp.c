@@ -2889,6 +2889,14 @@ int main(int argc, char *argv[]) {
        --encrypt-db. This must run after the key is final and before any secret
        column is read or written (recovery's channel init is later). */
     if (use_db) {
+        /* Client keys released in a partial rotation are never stored in
+           the clear, with or without --encrypt-db. */
+        {
+            unsigned char seal[32];
+            sha256_tagged("SuperScalar/departed-seal/v1", lsp_seckey, 32, seal);
+            persist_set_departed_seal_key(&db, seal);
+            secure_zero(seal, sizeof(seal));
+        }
         int mainnet_db = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
         if (mainnet_db) encrypt_db = 1;
         if (encrypt_db) {

@@ -18,8 +18,13 @@
 #                (LSP view and client view), and the new tree carries it.
 #   PAY_AFTER    a payment over the replacement factory succeeds, and no client
 #                rejects the LSP's revocation for it.
-#   KEYS_AT_REST once the old factory is closed on chain, the LSP's database
-#                holds no client secret key for it.
+#   KEYS_AT_REST the LSP's database holds no client secret key in the clear,
+#                and none at all once the old factory is closed on chain (a
+#                partial rotation keeps the released keys, sealed, while the
+#                old factory still holds the clients that did not move).  The
+#                seal key is derived from the LSP's own secret on the same
+#                host: it protects against leaks of the database alone (a
+#                backup), not of the host.
 #   IDENTITY     no client key the LSP holds is a client's identity (--seckey)
 #                key: a client signs each factory with its own derived key.
 #   PAYOUT_KEYS  --export-factory-keys gives descriptors Bitcoin Core accepts,
@@ -34,11 +39,15 @@
 #                is gone.  This runs last: it destroys the replacement.
 #
 # MODE=partial takes client 4 offline before DYING, so only a partial rotation
-# is possible, and adds:
+# is possible (the RESTART check then restarts client 3, which moved), and adds:
 #   REPLACEMENT  every client that handed over its key holds a signed
 #                replacement factory.
 #   STRANDED     no replacement funding is left unspent without a signed
 #                factory over it.
+#   STAYER       the client that stayed in the old factory reconnects after the
+#                rotation, is told that factory is retired, and exits it: its
+#                old tree's root, broadcast from its own DB, confirms; the
+#                LSP's database still holds that factory's tree and channels.
 #
 # PASS (exit 0) only if every check is SAFE.  Exit 1 if any check is UNSAFE
 # or (MODE=full) the rotation did not complete; exit 2 = setup failure.
@@ -177,16 +186,17 @@ if [ "$COMPLETE" -ge 1 ]; then
   POST_OK=$(( $(cnt "CLI: pay succeeded" "$L") - PRE_OK ))
   POST_DONE=$(( $(cnt "CLI: pay (succeeded|FAILED)" "$L") - before ))
 
-  # Restart client 4 from its DB (it takes no part in the payment above): it
-  # must reload the same factory key and reconnect by its identity key.
-  kill -9 "${CPID[4]}" 2>/dev/null; sleep 2
-  echo "--- client 4 restarted ---" >> "$TMP/c4.log"
-  start_client 4
+  # Restart a client that moved from its DB (it takes no part in the payment
+  # above): it must reload its factory key and reconnect by its identity key.
+  RC=4; [ "$MODE" = partial ] && RC=3
+  kill -9 "${CPID[$RC]}" 2>/dev/null; sleep 2
+  echo "--- client $RC restarted ---" >> "$TMP/c$RC.log"
+  start_client $RC
   for i in $(seq 1 60); do
     sleep 1
-    sed -n '/client 4 restarted/,$p' "$TMP/c4.log" | grep -qa "reconnected (channel=" && break
+    sed -n "/client $RC restarted/,\$p" "$TMP/c$RC.log" | grep -qa "reconnected (channel=" && break
   done
-  RESTART_LOG=$(sed -n '/client 4 restarted/,$p' "$TMP/c4.log" | grep -aE "factory key|reconnected \(channel|REFUSING" | tr '\n' ' ' | cut -c1-200)
+  RESTART_LOG=$(sed -n "/client $RC restarted/,\$p" "$TMP/c$RC.log" | grep -aE "factory key|reconnected \(channel|REFUSING" | tr '\n' ' ' | cut -c1-200)
 fi
 
 UNSAFE=0
@@ -196,14 +206,14 @@ echo
 echo "=================== checks ($MODE) ==================="
 
 # --- ORDER: key reveal vs replacement funded + signed ---
-LN_X=$(grep -naE "key extracted via wire PTLC" "$L" | head -1 | cut -d: -f1)
+LN_X=$(grep -naE "key extracted via wire PTLC|released its old factory key" "$L" | head -1 | cut -d: -f1)
 LN_F=$(grep -naE "LSP rotate: funded [0-9]+ sats" "$L" | head -1 | cut -d: -f1)
 LN_S=$(grep -naE "LSP rotate: factory [0-9]+ created and signed over" "$L" | head -1 | cut -d: -f1)
-N_X=$(cnt "key extracted via wire PTLC" "$L")
-if [ -n "$LN_X" ] && { [ -z "$LN_S" ] || [ "$LN_X" -lt "$LN_S" ]; }; then
+N_X=$(cnt "key extracted via wire PTLC|released its old factory key" "$L")
+if [ -n "$LN_X" ] && { [ -z "$LN_S" ] || [ "$LN_X" -lt "$LN_S" ] || [ -z "$LN_F" ] || [ "$LN_X" -lt "$LN_F" ]; }; then
   verdict ORDER 1 "$N_X client keys extracted at log line $LN_X; replacement funded at line ${LN_F:-never}, signed at line ${LN_S:-never}"
 else
-  verdict ORDER 0 "no key left a client before the replacement was signed (extract=${LN_X:-none} signed=${LN_S:-none})"
+  verdict ORDER 0 "no key left a client before the replacement was funded and signed (release=${LN_X:-none} signed=${LN_S:-none} funded=${LN_F:-none})"
 fi
 
 # --- CLOSE_PAYEE: where the old factory's close sends the client balances ---
@@ -268,6 +278,29 @@ if [ "$COMPLETE" -lt 1 ]; then
   echo "old factory funding $OLD_TXID:${OLD_VOUT:-0} unspent: $([ -n "$OLD_SPK" ] && echo "yes (${OLD_SPK#* } sats)" || echo no)"
 fi
 
+if [ "$COMPLETE" -ge 1 ] && [ "$MODE" = partial ]; then
+  # --- REPLACEMENT: every client that released its key holds the replacement ---
+  REL=$(cnt "released its old factory key" "$L"); MISS=""
+  for N in $(seq 1 "$N_ROT"); do
+    grep -qa "old factory key released" "$TMP/c$N.log" || continue
+    grep -qa "switched to the replacement factory" "$TMP/c$N.log" || MISS="$MISS c$N"
+  done
+  if [ -z "$MISS" ] && [ "$REL" -ge 1 ]; then
+    verdict REPLACEMENT 0 "$REL client(s) released their key, each after switching to the signed, funded replacement"
+  else
+    verdict REPLACEMENT 1 "released=$REL; without the replacement:${MISS:- none}"
+  fi
+  # --- STRANDED: the replacement funding is the signed factory's ---
+  RF=$(grep -aoE "LSP rotate: funded [0-9]+ sats, txid: [0-9a-f]{64}, vout=[0-9]+" "$L" | tail -1)
+  RF_TXID=$(echo "$RF" | grep -oE "[0-9a-f]{64}")
+  SG=$(grep -aoE "LSP rotate: factory [0-9]+ created and signed over [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | tail -1)
+  if [ -n "$RF_TXID" ] && [ "$RF_TXID" = "$SG" ]; then
+    verdict STRANDED 0 "the one replacement funding $RF_TXID was signed over before it was broadcast"
+  else
+    verdict STRANDED 1 "replacement funding ${RF_TXID:-none}, signed over ${SG:-none}"
+  fi
+fi
+
 # --- BALANCES: per-client balance before vs after ---
 BAL_BAD=0; BAL_DETAIL=""
 [ "$COMPLETE" -ge 1 ] && for c in $(seq 0 $((N_ROT - 1))); do
@@ -283,7 +316,7 @@ done
   grep -qa "REFUSING rotation" "$TMP/c$N.log" && { BAL_BAD=1; BAL_DETAIL="$BAL_DETAIL c$N:REFUSED"; }
   # Both sides must sign commitments over the same channel funding amount
   # (a taproot sighash commits to it).
-  lf=$(sqlite3 "$DB" "SELECT funding_amount FROM channels WHERE slot=$((N - 1)) ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+  lf=$(sqlite3 "$DB" "SELECT funding_amount FROM channels WHERE factory_id=0 AND slot=$((N - 1)) ORDER BY id DESC LIMIT 1;" 2>/dev/null)
   cf=$(sqlite3 "$TMP/c$N.db" "SELECT local_amount||'/'||funding_amount FROM channels ORDER BY id DESC LIMIT 1;" 2>/dev/null)
   BAL_DETAIL="$BAL_DETAIL c$N-db[client/funding=$cf lsp-funding=$lf]"
   [ "${cf#*/}" = "$lf" ] || BAL_BAD=1
@@ -305,9 +338,9 @@ fi
 # --- RESTART: a client restart reloads its factory key ---
 if [ "$COMPLETE" -ge 1 ]; then
   if echo "$RESTART_LOG" | grep -q "reloaded" && echo "$RESTART_LOG" | grep -q "reconnected"; then
-    verdict RESTART 0 "client 4 restarted: $RESTART_LOG"
+    verdict RESTART 0 "client $RC restarted: $RESTART_LOG"
   else
-    verdict RESTART 1 "client 4 restarted: ${RESTART_LOG:-no reconnect}"
+    verdict RESTART 1 "client $RC restarted: ${RESTART_LOG:-no reconnect}"
   fi
 fi
 
@@ -326,10 +359,43 @@ if [ "$IDENT" -gt 0 ]; then
 else
   verdict IDENTITY 0 "none of the $N_DEP client key(s) the LSP holds is a client's identity key"
 fi
-if [ "$N_DEP" -gt 0 ]; then
-  verdict KEYS_AT_REST 1 "old factory close confirmations: $CLOSE_CONF; departed_clients holds $N_DEP client secret key(s) ($N_PLAIN as plaintext hex); $IDENT of them equal the client's own --seckey (its identity and channel key)"
+N_SEALED=$(awk -F'|' 'index($3,"dk1:")==1' "$TMP/departed.txt" | grep -c .)
+OLD_OPEN=0
+O_TXID=$(grep -aoE "^LSP: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+O_VOUT=$(grep -aoE "^LSP: funding vout=[0-9]+" "$L" | grep -oE "[0-9]+$" | head -1)
+[ -n "$O_TXID" ] && [ -n "$($BCLI gettxout "$O_TXID" "${O_VOUT:-0}" 2>/dev/null)" ] && OLD_OPEN=1
+if [ "$N_DEP" -gt 0 ] && [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "$OLD_OPEN" -eq 1 ] && [ "$IDENT" -eq 0 ]; then
+  verdict KEYS_AT_REST 0 "the $N_DEP released key(s) are sealed (none in the clear) while the old factory is still open for the clients that did not move"
+elif [ "$N_DEP" -gt 0 ]; then
+  verdict KEYS_AT_REST 1 "old factory close confirmations: $CLOSE_CONF (old funding unspent: $OLD_OPEN); departed_clients holds $N_DEP client secret key(s) ($N_PLAIN as plaintext hex, $N_SEALED sealed); $IDENT of them equal the client's own --seckey (its identity and channel key)"
 else
   verdict KEYS_AT_REST 0 "no client secret key left in the LSP database"
+fi
+
+# --- STAYER: the client that stayed is told to exit, and can ---
+if [ "$MODE" = partial ] && [ "$COMPLETE" -ge 1 ]; then
+  echo "--- client 4 back after the rotation ---" >> "$TMP/c4.log"
+  start_client 4
+  for i in $(seq 1 40); do
+    sleep 1
+    grep -qa "a client of a factory retired by a partial rotation" "$L" && break
+  done
+  TOLD=$(cnt "a client of a factory retired by a partial rotation" "$L")
+  kill -9 "${CPID[4]}" 2>/dev/null; sleep 1
+  ROOT=$(sqlite3 "$TMP/c4.db" "SELECT txid FROM tree_nodes WHERE factory_id = 0 AND (parent_index IS NULL OR parent_index < 0) LIMIT 1;" 2>/dev/null)
+  timeout 180 "$BUILD/superscalar_client" --network regtest --seckey "$(printf "%064x" 5)" \
+    --db "$TMP/c4.db" --force-close --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" \
+    --rpcport "$RPCPORT" --wallet "$WALLET" > "$TMP/c4-exit.log" 2>&1
+  $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+  ROOT_CONF=$($BCLI getrawtransaction "$ROOT" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+  # The LSP kept the old factory (tree, channels) under its retired ids.
+  RET_TREE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM tree_nodes WHERE factory_id >= 65536 AND factory_id < 131072;" 2>/dev/null)
+  RET_CH=$(sqlite3 "$DB" "SELECT COUNT(*) FROM channels WHERE factory_id >= 65536 AND factory_id < 131072;" 2>/dev/null)
+  if [ "${TOLD:-0}" -ge 1 ] && [ "${ROOT_CONF:-0}" -ge 1 ] && [ "${RET_TREE:-0}" -ge 1 ] && [ "${RET_CH:-0}" -ge 4 ]; then
+    verdict STAYER 0 "client 4 reconnected, was told its factory is retired, and its exit confirmed (old root ${ROOT:0:16}.. $ROOT_CONF conf); the LSP kept the old factory ($RET_TREE tree rows, $RET_CH channels)"
+  else
+    verdict STAYER 1 "told=$TOLD old root ${ROOT:-none} confirmations=${ROOT_CONF:-0} kept tree=${RET_TREE:-0} channels=${RET_CH:-0} ($(tail -2 "$TMP/c4-exit.log" | tr '\n' ' ' | cut -c1-160))"
+  fi
 fi
 
 # --- PAYOUT_KEYS: the exported descriptors pay this client's outputs ---

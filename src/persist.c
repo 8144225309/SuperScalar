@@ -1,4 +1,7 @@
 #include "superscalar/persist.h"
+#include "superscalar/types.h"
+#include <secp256k1.h>
+#include "superscalar/crypto_aead.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
@@ -84,7 +87,16 @@ static const char *SCHEMA_VERSION_SQL =
     "  side_db TEXT,"                                        \
     "  close_hex TEXT,"                                      \
     "  close_height INTEGER,"                                \
+    "  old_key_index INTEGER,"                               \
+    "  carried INTEGER,"                                     \
+    "  old_pubkey TEXT,"                                     \
     "  updated_at INTEGER"                                   \
+    ");"                                                     \
+    "CREATE TABLE IF NOT EXISTS retired_channels ("          \
+    "  channel_id INTEGER PRIMARY KEY,"                      \
+    "  factory_id INTEGER NOT NULL,"                         \
+    "  slot INTEGER NOT NULL,"                               \
+    "  identity TEXT"                                        \
     ");"                                                     \
     "CREATE TABLE IF NOT EXISTS client_rotation_trees ("     \
     "  close_txid TEXT PRIMARY KEY,"                         \
@@ -1498,6 +1510,15 @@ int persist_open(persist_t *p, const char *path) {
             ok44 = sqlite3_exec(p->db,
                 "ALTER TABLE client_rotations ADD COLUMN close_height INTEGER;",
                 NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "client_rotations", "old_key_index"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE client_rotations ADD COLUMN old_key_index INTEGER;"
+                "ALTER TABLE client_rotations ADD COLUMN carried INTEGER;",
+                NULL, NULL, &merr44) == SQLITE_OK;
+        if (ok44 && !persist_v44_column_exists(p->db, "client_rotations", "old_pubkey"))
+            ok44 = sqlite3_exec(p->db,
+                "ALTER TABLE client_rotations ADD COLUMN old_pubkey TEXT;",
+                NULL, NULL, &merr44) == SQLITE_OK;
         if (!ok44) {
             fprintf(stderr, "persist_open: migration v44 failed: %s\n",
                     merr44 ? merr44 : "unknown");
@@ -1542,6 +1563,9 @@ void persist_close(persist_t *p) {
         volatile unsigned char *z = (volatile unsigned char *)p->dek;
         for (size_t i = 0; i < sizeof p->dek; i++) z[i] = 0;
         p->enc_enabled = 0;
+        z = (volatile unsigned char *)p->seal_key;
+        for (size_t i = 0; i < sizeof p->seal_key; i++) z[i] = 0;
+        p->seal_key_set = 0;
     }
     if (p && p->db) {
         sqlite3_close(p->db);
@@ -4642,6 +4666,75 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
 /* --- Departed clients --- */
 
+void persist_set_departed_seal_key(persist_t *p, const unsigned char key32[32]) {
+    if (!p) return;
+    if (!key32) { memset(p->seal_key, 0, 32); p->seal_key_set = 0; return; }
+    memcpy(p->seal_key, key32, 32);
+    p->seal_key_set = 1;
+}
+
+/* The sealed row: AAD = "departed" || factory_id || client_idx (a blob
+   cannot be moved to another row); plaintext = the key and its pubkey,
+   checked on load. */
+static void departed_aad(uint32_t factory_id, uint32_t client_idx, unsigned char aad[16]) {
+    memcpy(aad, "departed", 8);
+    for (int b = 0; b < 4; b++) aad[8 + b] = (unsigned char)(factory_id >> (8 * b));
+    for (int b = 0; b < 4; b++) aad[12 + b] = (unsigned char)(client_idx >> (8 * b));
+}
+
+#define DEPARTED_PT_LEN (32 + 33)
+#define DEPARTED_HEX_LEN (4 + 2 * (12 + DEPARTED_PT_LEN + 16))
+
+static char *departed_seal(persist_t *p, uint32_t factory_id, uint32_t client_idx,
+                           const unsigned char key32[32]) {
+    unsigned char nonce[12], pt[DEPARTED_PT_LEN], ct[DEPARTED_PT_LEN], tag[16], aad[16];
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    secp256k1_pubkey pk;
+    size_t l = 33;
+    int ok = ctx && secp256k1_ec_pubkey_create(ctx, &pk, key32) &&
+             secp256k1_ec_pubkey_serialize(ctx, pt + 32, &l, &pk, SECP256K1_EC_COMPRESSED);
+    if (ctx) secp256k1_context_destroy(ctx);
+    memcpy(pt, key32, 32);
+    departed_aad(factory_id, client_idx, aad);
+    ok = ok && channel_read_random_bytes(nonce, 12) &&
+         aead_encrypt(ct, tag, pt, DEPARTED_PT_LEN, aad, 16, p->seal_key, nonce);
+    secure_zero(pt, sizeof(pt));
+    if (!ok) return NULL;
+    char *out = malloc(DEPARTED_HEX_LEN + 1);
+    if (!out) return NULL;
+    memcpy(out, "dk1:", 4);
+    hex_encode(nonce, 12, out + 4);
+    hex_encode(ct, DEPARTED_PT_LEN, out + 4 + 24);
+    hex_encode(tag, 16, out + 4 + 24 + 2 * DEPARTED_PT_LEN);
+    return out;
+}
+
+static int departed_unseal(persist_t *p, uint32_t factory_id, uint32_t client_idx,
+                           const char *stored, unsigned char out32[32]) {
+    if (!p->seal_key_set || strlen(stored) != DEPARTED_HEX_LEN) return 0;
+    unsigned char nonce[12], ct[DEPARTED_PT_LEN], pt[DEPARTED_PT_LEN], tag[16], aad[16];
+    char hn[25], hc[2 * DEPARTED_PT_LEN + 1], ht[33];
+    memcpy(hn, stored + 4, 24); hn[24] = 0;
+    memcpy(hc, stored + 4 + 24, 2 * DEPARTED_PT_LEN); hc[2 * DEPARTED_PT_LEN] = 0;
+    memcpy(ht, stored + 4 + 24 + 2 * DEPARTED_PT_LEN, 32); ht[32] = 0;
+    if (hex_decode(hn, nonce, 12) != 12 || hex_decode(hc, ct, DEPARTED_PT_LEN) != DEPARTED_PT_LEN ||
+        hex_decode(ht, tag, 16) != 16)
+        return 0;
+    departed_aad(factory_id, client_idx, aad);
+    if (!aead_decrypt(pt, ct, DEPARTED_PT_LEN, tag, aad, 16, p->seal_key, nonce)) return 0;
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    secp256k1_pubkey pk;
+    unsigned char ser[33];
+    size_t l = 33;
+    int ok = ctx && secp256k1_ec_pubkey_create(ctx, &pk, pt) &&
+             secp256k1_ec_pubkey_serialize(ctx, ser, &l, &pk, SECP256K1_EC_COMPRESSED) &&
+             memcmp(ser, pt + 32, 33) == 0;
+    if (ctx) secp256k1_context_destroy(ctx);
+    if (ok) memcpy(out32, pt, 32);
+    secure_zero(pt, sizeof(pt));
+    return ok;
+}
+
 int persist_save_departed_client(persist_t *p, uint32_t factory_id,
                                   uint32_t client_idx,
                                   const unsigned char *extracted_key32) {
@@ -4649,9 +4742,16 @@ int persist_save_departed_client(persist_t *p, uint32_t factory_id,
 
     char key_hex[65];
     hex_encode(extracted_key32, 32, key_hex);
-    char *dc_sealed = persist_seal_text(p, key_hex);   /* #327b: seal at rest (client privkey) */
+    /* Never in the clear: field encryption, or the departed seal. */
+    char *dc_sealed = p->enc_enabled ? persist_seal_text(p, key_hex)
+                    : p->seal_key_set ? departed_seal(p, factory_id, client_idx, extracted_key32)
+                    : NULL;
     memset(key_hex, 0, sizeof key_hex);
-    if (!dc_sealed) return 0;
+    if (!dc_sealed) {
+        fprintf(stderr, "persist: refusing to store a released client key without a seal "
+                "(no field encryption and no departed seal key)\n");
+        return 0;
+    }
 
     const char *sql =
         "INSERT OR REPLACE INTO departed_clients "
@@ -4694,6 +4794,19 @@ size_t persist_load_departed_clients(persist_t *p, uint32_t factory_id,
         const char *stored = (const char *)sqlite3_column_text(stmt, 1);
 
         if (cidx < max_clients) {
+            if (stored && strncmp(stored, "dk1:", 4) == 0) {
+                unsigned char k[32];
+                if (!departed_unseal(p, factory_id, cidx, stored, k)) {
+                    fprintf(stderr, "persist: a released client key could not be "
+                            "unsealed (wrong LSP key?) -- not loaded\n");
+                    continue;           /* no key: not departed either */
+                }
+                if (keys_out) memcpy(keys_out[cidx], k, 32);
+                secure_zero(k, sizeof(k));
+                if (departed_out) departed_out[cidx] = 1;
+                count++;
+                continue;
+            }
             if (departed_out) departed_out[cidx] = 1;
             if (keys_out && stored) {
                 char *key_pt = NULL;                       /* #327b: open at rest */
@@ -7849,8 +7962,8 @@ int persist_client_rotation_save(persist_t *p, const persist_client_rotation_t *
     const char *sql =
         "INSERT OR REPLACE INTO client_rotations "
         "(old_funding_txid, old_vout, key_index, close_txid, state, side_db, "
-        " close_hex, close_height, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'));";
+        " close_hex, close_height, old_key_index, carried, old_pubkey, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'));";
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_text(st, 1, r->old_txid, -1, SQLITE_TRANSIENT);
@@ -7865,6 +7978,10 @@ int persist_client_rotation_save(persist_t *p, const persist_client_rotation_t *
         sqlite3_bind_text(st, 7, r->close_hex, -1, SQLITE_TRANSIENT);
     else sqlite3_bind_null(st, 7);
     sqlite3_bind_int64(st, 8, (sqlite3_int64)r->close_height);
+    sqlite3_bind_int64(st, 9, (sqlite3_int64)r->old_key_index);
+    sqlite3_bind_int64(st, 10, (sqlite3_int64)r->carried);
+    if (r->old_pubkey[0]) sqlite3_bind_text(st, 11, r->old_pubkey, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 11);
     int ok = (sqlite3_step(st) == SQLITE_DONE);
     sqlite3_finalize(st);
     return ok;
@@ -7885,6 +8002,10 @@ static int client_rotation_row(sqlite3_stmt *st, persist_client_rotation_t *r) {
     snprintf(r->state, sizeof(r->state), "%s", s);
     if (d) snprintf(r->side_db, sizeof(r->side_db), "%s", d);
     r->close_height = (uint32_t)sqlite3_column_int64(st, 7);
+    r->old_key_index = (uint32_t)sqlite3_column_int64(st, 8);
+    r->carried = (uint64_t)sqlite3_column_int64(st, 9);
+    const char *opk = (const char *)sqlite3_column_text(st, 10);
+    if (opk) snprintf(r->old_pubkey, sizeof(r->old_pubkey), "%s", opk);
     if (h) {
         r->close_hex = strdup(h);
         if (!r->close_hex) return -1;
@@ -7898,7 +8019,7 @@ int persist_client_rotation_load(persist_t *p, const char *old_txid_hex,
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(p->db,
             "SELECT old_funding_txid, old_vout, key_index, close_txid, state, side_db, "
-            "close_hex, close_height FROM client_rotations WHERE old_funding_txid = ?;",
+            "close_hex, close_height, old_key_index, carried, old_pubkey FROM client_rotations WHERE old_funding_txid = ?;",
             -1, &st, NULL) != SQLITE_OK)
         return -1;
     sqlite3_bind_text(st, 1, old_txid_hex, -1, SQLITE_TRANSIENT);
@@ -7913,7 +8034,7 @@ int persist_client_rotation_load_open(persist_t *p, persist_client_rotation_t *r
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(p->db,
             "SELECT old_funding_txid, old_vout, key_index, close_txid, state, side_db, "
-            "close_hex, close_height FROM client_rotations WHERE state NOT IN ('done', 'abandoned') "
+            "close_hex, close_height, old_key_index, carried, old_pubkey FROM client_rotations WHERE state NOT IN ('done', 'abandoned') "
             "ORDER BY updated_at DESC LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
         return -1;
     int rc = sqlite3_step(st);
@@ -7989,4 +8110,90 @@ int persist_factory_key_get_row(persist_t *p, uint32_t key_index, unsigned char 
     }
     sqlite3_finalize(st);
     return ret;
+}
+
+int persist_retire_channel_rows(persist_t *p, uint32_t from_factory, uint32_t to_factory,
+                                uint32_t slot, uint32_t to_channel_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *st;
+    /* The row id too: a channel row's id is its slot, and the replacement's
+       channels are saved under the same ids. */
+    if (sqlite3_prepare_v2(p->db, "UPDATE channels SET factory_id = ?, id = ? WHERE "
+                           "factory_id = ? AND slot = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(st, 1, to_factory);
+    sqlite3_bind_int64(st, 2, to_channel_id);
+    sqlite3_bind_int64(st, 3, from_factory);
+    sqlite3_bind_int64(st, 4, slot);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    if (!ok) return 0;
+    char **names = NULL;
+    size_t n = 0;
+    if (sqlite3_prepare_v2(p->db, "SELECT DISTINCT m.name FROM sqlite_master m, "
+                           "pragma_table_info(m.name) c WHERE m.type = 'table' AND "
+                           "c.name = 'channel_id' AND m.name != 'channels';",
+                           -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        char **nn = t ? realloc(names, (n + 1) * sizeof(char *)) : NULL;
+        if (!nn || !(nn[n] = strdup(t))) { ok = 0; if (nn) names = nn; break; }
+        names = nn;
+        n++;
+    }
+    sqlite3_finalize(st);
+    for (size_t i = 0; ok && i < n; i++) {
+        char sql[400];
+        if (strlen(names[i]) > 300) { ok = 0; break; }
+        snprintf(sql, sizeof(sql), "UPDATE \"%s\" SET channel_id = ? WHERE channel_id = ?;",
+                 names[i]);
+        if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_int64(st, 1, to_channel_id);
+        sqlite3_bind_int64(st, 2, slot);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    for (size_t i = 0; i < n; i++) free(names[i]);
+    free(names);
+    return ok;
+}
+
+int persist_save_retired_channel(persist_t *p, uint32_t channel_id, uint32_t factory_id,
+                                 uint32_t slot, const unsigned char *identity33) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "INSERT OR REPLACE INTO retired_channels (channel_id, "
+                           "factory_id, slot, identity) VALUES (?, ?, ?, ?);", -1, &st,
+                           NULL) != SQLITE_OK)
+        return 0;
+    char h[67];
+    sqlite3_bind_int64(st, 1, channel_id);
+    sqlite3_bind_int64(st, 2, factory_id);
+    sqlite3_bind_int64(st, 3, slot);
+    if (identity33) { hex_encode(identity33, 33, h); sqlite3_bind_text(st, 4, h, -1, SQLITE_TRANSIENT); }
+    else sqlite3_bind_null(st, 4);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+size_t persist_load_retired_channels(persist_t *p, uint32_t *channel_ids,
+                                     unsigned char (*identities33)[33], size_t max) {
+    if (!p || !p->db || max == 0) return 0;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, "SELECT channel_id, identity FROM retired_channels "
+                           "ORDER BY channel_id;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    size_t n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        if (channel_ids) channel_ids[n] = (uint32_t)sqlite3_column_int64(st, 0);
+        if (identities33) {
+            const char *h = (const char *)sqlite3_column_text(st, 1);
+            if (!h || hex_decode(h, identities33[n], 33) != 33) memset(identities33[n], 0, 33);
+        }
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
 }

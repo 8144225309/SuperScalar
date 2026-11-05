@@ -10,10 +10,12 @@
 #include <secp256k1_schnorrsig.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -86,6 +88,43 @@ int client_cin_refuse_while_frozen(const wire_msg_t *m, const unsigned char *fun
     }
 }
 
+int client_refuse_key_turnover(int fd, const wire_msg_t *m) {
+    if (!m || (m->msg_type != MSG_PTLC_PRESIG && m->msg_type != MSG_PTLC_COMPLETE))
+        return 0;
+    if (m->msg_type == MSG_PTLC_PRESIG) {
+        /* Completing it hands the LSP the key this client signs its factory
+           with, before anything is verified. */
+        fprintf(stderr, "Client: refusing the old key turnover (PTLC_PRESIG)\n");
+        cJSON *e = wire_build_error("key turnover refused");
+        if (e) { wire_send(fd, MSG_ERROR, e); cJSON_Delete(e); }
+    }
+    return 1;
+}
+
+int client_recv_expected(int fd, wire_msg_t *msg, int timeout_sec, uint8_t expected,
+                         client_queue_fn queue, void *queue_arg) {
+    if (!msg) return 0;
+    time_t start = time(NULL);
+    for (;;) {
+        int remaining = timeout_sec - (int)(time(NULL) - start);
+        if (remaining <= 0) return 0;
+        memset(msg, 0, sizeof(*msg));
+        if (!wire_recv_timeout(fd, msg, remaining)) return 0;
+        if (msg->msg_type == expected) return 1;
+        if (client_refuse_key_turnover(fd, msg)) {
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;
+        }
+        if (msg->msg_type == MSG_ERROR) return 0;      /* propagate an abort */
+        /* Anything else (a rotation begin included) is for the daemon loop,
+           which applies all of its checks to it. */
+        if (queue) queue(queue_arg, msg);
+        else cJSON_Delete(msg->json);
+        msg->json = NULL;
+    }
+}
+
 int client_cin_check_close_height(uint32_t close_height, int tip) {
     return tip > 0 && (uint64_t)close_height <= (uint64_t)tip + 1;
 }
@@ -126,6 +165,14 @@ static int pk_eq(const secp256k1_context *ctx, const secp256k1_pubkey *a,
 client_cin_action_t client_cin_resolve_action(const char *state, int close_confs,
                                               int has_close_hex) {
     if (!state) return CLIENT_CIN_NONE;
+    /* Released in a partial rotation: the funding was confirmed at the safe
+       depth before the key left, so the replacement is ours. */
+    if (strcmp(state, "released") == 0) return CLIENT_CIN_PROMOTE;
+    /* Signed into a partial rotation, not released: once the replacement's
+       funding is at the safe depth it is ours too, so switch to it (the old
+       key stays ours; the old DB is kept as the pre-rotation file). */
+    if (strcmp(state, "part_signed") == 0)
+        return close_confs >= g_cin_depth ? CLIENT_CIN_PROMOTE : CLIENT_CIN_NONE;
     /* A signed close (or one the LSP called confirmed) switches only once the
        client's own chain source shows it at the safe depth.  The replacement
        of a tree we signed is kept until then, whatever the state. */
@@ -284,26 +331,8 @@ static int nodes_match_local(const secp256k1_context *ctx, const factory_t *nf) 
 }
 
 int client_cin_tree_digest(const factory_t *f, char out_hex[65]) {
-    if (!f || !out_hex || f->n_nodes == 0) return 0;
-    size_t total = 4;
-    for (size_t i = 0; i < f->n_nodes; i++) {
-        if (!f->nodes[i].unsigned_tx.data || f->nodes[i].unsigned_tx.len == 0) return 0;
-        total += 4 + f->nodes[i].unsigned_tx.len;
-    }
-    unsigned char *buf = malloc(total);
-    if (!buf) return 0;
-    size_t off = 0;
-    uint32_t n = (uint32_t)f->n_nodes;
-    for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(n >> (8 * b));
-    for (size_t i = 0; i < f->n_nodes; i++) {
-        uint32_t l = (uint32_t)f->nodes[i].unsigned_tx.len;
-        for (int b = 0; b < 4; b++) buf[off++] = (unsigned char)(l >> (8 * b));
-        memcpy(buf + off, f->nodes[i].unsigned_tx.data, l);
-        off += l;
-    }
     unsigned char d[32];
-    sha256(buf, total, d);
-    free(buf);
+    if (!out_hex || !factory_tree_digest(f, d)) return 0;
     hex_encode(d, 32, out_hex);
     return 1;
 }
@@ -319,8 +348,21 @@ static int root_secret(secp256k1_context *ctx, unsigned char out[32]) {
     return id && secp256k1_keypair_sec(ctx, out, id);
 }
 
+int client_cin_channel_quiet(const channel_t *ch) {
+    if (!ch) return 0;
+    for (size_t h = 0; h < ch->n_htlcs; h++)
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) return 0;
+    return 1;
+}
+
 int client_cin_on_begin(int fd, secp256k1_context *ctx, persist_t *db,
-                        const factory_t *old_f, const cJSON *begin) {
+                        const factory_t *old_f, const channel_t *old_ch,
+                        const cJSON *begin) {
+    if (!client_cin_channel_quiet(old_ch)) {
+        fprintf(stderr, "Client: refusing the rotation: an HTLC is in flight on our "
+                "channel\n");
+        return 0;
+    }
     if (!db || !old_f || !begin || !client_cin_capable()) {
         fprintf(stderr, "Client: close-into-new rotation needs --db, a pinned --lsp-pubkey "
                 "and a chain source; refusing\n");
@@ -439,7 +481,9 @@ static int write_side_db(persist_t *db, const char *side, secp256k1_context *ctx
     char sql[256];
     snprintf(sql, sizeof(sql),
              "DELETE FROM local_pcs WHERE channel_id IN (0, %u);"
-             "DELETE FROM remote_pcps WHERE channel_id IN (0, %u);", cidx, cidx);
+             "DELETE FROM remote_pcps WHERE channel_id IN (0, %u);"
+             "DELETE FROM factory_participants WHERE factory_id = 0;"
+             "DELETE FROM tree_nodes WHERE factory_id = 0;", cidx, cidx);
     sqlite3_exec(s.db, sql, NULL, NULL, NULL);
     int ok = persist_begin(&s);
     ok = ok && persist_save_factory(&s, nf, ctx, 0) && persist_save_tree_nodes(&s, nf, 0) &&
@@ -477,10 +521,13 @@ static int write_side_db(persist_t *db, const char *side, secp256k1_context *ctx
         tx_buf_free(&st);
     }
     ok = ok && persist_factory_key_set_state(&s, key_idx, FACTORY_KEY_STATE_ACTIVE, 0);
+    if (ok && row->old_pubkey[0])
+        ok = persist_factory_key_set_state(&s, row->old_key_index, FACTORY_KEY_STATE_RETIRED, 0);
     if (ok) {
         persist_client_rotation_t done = *row;
         done.close_hex = NULL;
-        snprintf(done.state, sizeof(done.state), "done");
+        snprintf(done.state, sizeof(done.state), "%s",
+                 row->old_pubkey[0] ? "part_switched" : "done");
         done.side_db[0] = '\0';
         ok = persist_client_rotation_save(&s, &done);
     }
@@ -554,6 +601,11 @@ static int cin_sign_guard(void *arg, factory_t *f, int phase) {
 int client_cin_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db_path,
                    const secp256k1_keypair *old_kp, factory_t *old_f, channel_t *old_ch,
                    uint32_t my_index, const wire_msg_t *propose) {
+    if (old_ch && !client_cin_channel_quiet(old_ch)) {
+        fprintf(stderr, "Client: REFUSING the rotation: an HTLC is in flight on our "
+                "channel\n");
+        return 0;
+    }
     if (!db || !db_path || !old_kp || !old_f || !old_ch || !propose || my_index < 1 ||
         !client_cin_capable() || !g_cin_rt) {
         fprintf(stderr, "Client: close-into-new rotation needs --db, a pinned --lsp-pubkey "
@@ -1116,14 +1168,568 @@ static int promote(persist_t *db, const char *db_path, const char *side) {
     return ok;
 }
 
+/* ===================================================================
+   Partial rotation with verified release: the client moves into a
+   replacement funded by the LSP to the fresh keys of the clients online now,
+   and sells its old position (releases its old factory key) only after it
+   has checked, from its own data and chain source, that it holds a funded,
+   signed position there worth its balance.
+   =================================================================== */
+
+static int g_part_jit_active = 0;
+void client_part_set_jit_active(int active) { g_part_jit_active = active ? 1 : 0; }
+
+int client_part_key_releasable(persist_t *db, secp256k1_context *ctx,
+                               const secp256k1_keypair *old_kp, uint32_t *idx_out) {
+    if (!db || !db->db || !ctx || !old_kp) return 0;
+    secp256k1_pubkey opk, ipk;
+    const secp256k1_keypair *id = client_identity_keypair();
+    if (!secp256k1_keypair_pub(ctx, &opk, old_kp)) return 0;
+    if (!id || !secp256k1_keypair_pub(ctx, &ipk, id) || pk_eq(ctx, &opk, &ipk))
+        return 0;                       /* a legacy factory: the identity key, never */
+    unsigned char ser[33];
+    size_t len = 33;
+    char hex[67];
+    if (!secp256k1_ec_pubkey_serialize(ctx, ser, &len, &opk, SECP256K1_EC_COMPRESSED))
+        return 0;
+    hex_encode(ser, 33, hex);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db, "SELECT key_index, lsp_ctx FROM factory_keys WHERE "
+                           "pubkey = ? LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, hex, -1, SQLITE_TRANSIENT);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *c = (const char *)sqlite3_column_text(st, 1);
+        unsigned char c33[33];
+        if (c && hex_decode(c, c33, 33) == 33 && !factory_key_ctx_is_zero(c33)) {
+            ok = 1;                     /* a per-factory key bound to this LSP */
+            if (idx_out) *idx_out = (uint32_t)sqlite3_column_int64(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+int client_part_old_key_ok(persist_t *db, secp256k1_context *ctx,
+                           const secp256k1_keypair *old_kp, const factory_t *old_f,
+                           uint32_t *idx_out, char pub_hex_out[67]) {
+    secp256k1_pubkey opk;
+    if (!old_f || !old_kp || !secp256k1_keypair_pub(ctx, &opk, old_kp)) return 0;
+    int in_factory = 0;
+    for (size_t j = 1; j < old_f->n_participants && !in_factory; j++)
+        in_factory = pk_eq(ctx, &old_f->pubkeys[j], &opk);
+    if (!in_factory || !client_part_key_releasable(db, ctx, old_kp, idx_out)) return 0;
+    if (pub_hex_out) {
+        unsigned char ser[33];
+        size_t l = 33;
+        if (!secp256k1_ec_pubkey_serialize(ctx, ser, &l, &opk, SECP256K1_EC_COMPRESSED))
+            return 0;
+        hex_encode(ser, 33, pub_hex_out);
+    }
+    return 1;
+}
+
+int client_part_funding_confirmed(regtest_t *rt, const unsigned char txid32[32], uint32_t vout,
+                                  uint64_t amount, const unsigned char spk34[34]) {
+    if (!rt || !txid32 || !spk34) return 0;
+    char disp[65], params[128], want[69];
+    txid_display(txid32, disp);
+    hex_encode(spk34, 34, want);
+    snprintf(params, sizeof(params), "\"%s\" %u false", disp, vout);
+    char *r = regtest_exec(rt, "gettxout", params);
+    cJSON *j = r ? cJSON_Parse(r) : NULL;
+    free(r);
+    const cJSON *c = j ? cJSON_GetObjectItemCaseSensitive(j, "confirmations") : NULL;
+    const cJSON *v = j ? cJSON_GetObjectItemCaseSensitive(j, "value") : NULL;
+    const cJSON *s = j ? cJSON_GetObjectItemCaseSensitive(j, "scriptPubKey") : NULL;
+    const cJSON *h = s ? cJSON_GetObjectItemCaseSensitive(s, "hex") : NULL;
+    int ok = cJSON_IsNumber(c) && (int)c->valuedouble >= g_cin_depth && cJSON_IsNumber(v) &&
+             (uint64_t)(v->valuedouble * 100000000.0 + 0.5) == amount && cJSON_IsString(h) &&
+             strcmp(h->valuestring, want) == 0;
+    cJSON_Delete(j);
+    return ok;
+}
+
+/* Mark key IDX released in the DB at PATH (the side DB that becomes ours). */
+static int mark_released_in(const char *path, uint32_t idx, const char *old_txid) {
+    persist_t s;
+    memset(&s, 0, sizeof(s));
+    if (!persist_open(&s, path)) return 0;
+    int ok = persist_factory_key_set_state(&s, idx, FACTORY_KEY_STATE_RELEASED, 0);
+    /* The side DB's row is closed: nothing is owed any more. */
+    persist_client_rotation_t r;
+    memset(&r, 0, sizeof(r));
+    if (ok && old_txid && persist_client_rotation_load(&s, old_txid, &r) == 1) {
+        snprintf(r.state, sizeof(r.state), "done");
+        ok = persist_client_rotation_save(&s, &r);
+    }
+    free(r.close_hex);
+    ok = db_flush_close(&s, path) && ok;
+    return ok;
+}
+
+const char *client_part_release_check(regtest_t *rt, persist_t *db, secp256k1_context *ctx,
+                                      const factory_t *old_f, const secp256k1_pubkey *lsp_pk,
+                                      const secp256k1_keypair *old_kp, const channel_t *old_ch,
+                                      const factory_t *nf, const client_funding_bind_t *bind,
+                                      const secp256k1_pubkey *npk, uint32_t slot,
+                                      uint64_t carried, const unsigned char req_txid32[32],
+                                      const unsigned char req_binding32[32],
+                                      const unsigned char receipt64[64],
+                                      unsigned char binding_out32[32], uint32_t *old_idx_out) {
+    unsigned char digest[32], npk33[33];
+    size_t len = 33;
+    secp256k1_xonly_pubkey lx;
+    if (!bind || !nf || !old_f || !npk || !lsp_pk || !req_txid32 || !req_binding32 ||
+        !receipt64 || !binding_out32)
+        return "bad arguments";
+    if (memcmp(req_txid32, bind->txid, 32) != 0)
+        return "the release request is not for our funding";
+    if (!client_part_funding_confirmed(rt, bind->txid, bind->vout, bind->amount, bind->spk))
+        return "the replacement's funding is not confirmed at the safe depth on our chain";
+    if (!factory_tree_digest(nf, digest) ||
+        !secp256k1_ec_pubkey_serialize(ctx, npk33, &len, npk, SECP256K1_EC_COMPRESSED))
+        return "internal";
+    factory_release_binding(old_f->funding_txid, old_f->funding_vout, bind->txid, bind->vout,
+                            digest, npk33, carried, slot, binding_out32);
+    if (memcmp(binding_out32, req_binding32, 32) != 0)
+        return "the release binding is not our position";
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lx, NULL, lsp_pk) ||
+        !secp256k1_schnorrsig_verify(ctx, receipt64, binding_out32, 32, &lx))
+        return "the LSP's receipt does not verify";
+    if (!client_part_key_releasable(db, ctx, old_kp, old_idx_out))
+        return "our old factory key must never be released (identity or unbound key)";
+    if (g_part_jit_active)
+        return "a JIT channel is open with our key";
+    if (!client_cin_channel_quiet(old_ch) || old_ch->local_amount > carried)
+        return "our old channel changed since the replacement was checked";
+    return NULL;
+}
+
+int client_part_run(int fd, secp256k1_context *ctx, persist_t *db, const char *db_path,
+                    const secp256k1_keypair *old_kp, factory_t *old_f, channel_t *old_ch,
+                    const wire_msg_t *propose) {
+    if (old_ch && !client_cin_channel_quiet(old_ch)) {
+        fprintf(stderr, "Client: REFUSING the rotation: an HTLC is in flight on our "
+                "channel\n");
+        return 0;
+    }
+    if (!db || !db_path || !old_kp || !old_f || !old_ch || !propose ||
+        !client_cin_capable() || !g_cin_rt) {
+        fprintf(stderr, "Client: a partial rotation needs --db, a pinned --lsp-pubkey and a "
+                "chain source; refusing\n");
+        return 0;
+    }
+    const cJSON *pj = propose->json;
+    if (!wire_json_unambiguous(pj)) {
+        fprintf(stderr, "Client: REFUSING the rotation: keys that differ only in case\n");
+        return 0;
+    }
+    const cJSON *rot = cJSON_GetObjectItemCaseSensitive(pj, "rotation");
+    const cJSON *pka = rot ? cJSON_GetObjectItemCaseSensitive(rot, "pubkeys") : NULL;
+    if (!cJSON_IsArray(pka)) {
+        fprintf(stderr, "Client: malformed partial rotation proposal\n");
+        return 0;
+    }
+    if (!client_cin_old_funding_unspent(g_cin_rt, old_f)) {
+        fprintf(stderr, "Client: REFUSING the rotation: our factory's funding is already "
+                "spent (or cannot be checked)\n");
+        return 0;
+    }
+    size_t n = (size_t)cJSON_GetArraySize(pka);
+    if (n < 2 || n > FACTORY_MAX_SIGNERS) {
+        fprintf(stderr, "Client: bad participant list in the rotation proposal\n");
+        return 0;
+    }
+    secp256k1_pubkey *pks = calloc(n, sizeof(secp256k1_pubkey));
+    if (!pks) return 0;
+    for (size_t i = 0; i < n; i++) {
+        const cJSON *e = cJSON_GetArrayItem(pka, (int)i);
+        unsigned char b[33];
+        if (!cJSON_IsString(e) || hex_decode(e->valuestring, b, 33) != 33 ||
+            !secp256k1_ec_pubkey_parse(ctx, &pks[i], b, 33)) {
+            free(pks);
+            return 0;
+        }
+    }
+
+    char old_hex[65];
+    txid_display(old_f->funding_txid, old_hex);
+    persist_client_rotation_t row;
+    memset(&row, 0, sizeof(row));
+    int result = 0;
+    factory_t *nf = NULL;
+    channel_t *nc = NULL;
+    unsigned char root[32], nsk[32], osk[32];
+    secp256k1_keypair nkp;
+    memset(&nkp, 0, sizeof(nkp));
+    memset(osk, 0, sizeof(osk));
+    cin_guard_t guard;
+    memset(&guard, 0, sizeof(guard));
+    tx_buf_init(&guard.dist_unsigned, 16);
+    client_funding_bind_t bind;
+    memset(&bind, 0, sizeof(bind));
+    const char *why = NULL;
+    uint32_t slot = 0;
+    if (persist_client_rotation_load(db, old_hex, &row) != 1) {
+        fprintf(stderr, "Client: no replacement key was reserved for this rotation\n");
+        goto out;
+    }
+    if (state_is_signed(row.state)) {
+        fprintf(stderr, "Client: REFUSING a partial rotation: a close of our factory may be "
+                "signed\n");
+        goto out;
+    }
+    if (!root_secret(ctx, root) || !factory_key_derive_stored(db, ctx, root, row.key_index, nsk) ||
+        !secp256k1_keypair_create(ctx, &nkp, nsk))
+        goto out;
+    secp256k1_pubkey npk, id_pk;
+    if (!secp256k1_keypair_pub(ctx, &npk, &nkp) ||
+        !secp256k1_keypair_pub(ctx, &id_pk, client_identity_keypair()))
+        goto out;
+
+    /* Our fresh key in exactly one slot, the LSP in slot 0, no key of the old
+       factory, and the funding to the participants' aggregate key. */
+    for (size_t i = 1; i < n; i++)
+        if (pk_eq(ctx, &pks[i], &npk)) { if (slot) { slot = 0; break; } slot = (uint32_t)i; }
+    uint64_t fv64 = 0, fa64 = 0;
+    unsigned char want_spk[34];
+    if (!slot) why = "our fresh key is not in exactly one slot";
+    else if (!pk_eq(ctx, &pks[0], &old_f->pubkeys[0])) why = "slot 0 is not the LSP key";
+    else if (!factory_key_check_participants(ctx, db, &id_pk, &npk, slot, pks, n, &why)) {
+        /* why set */
+    } else if (!wire_json_get_uint(pj, "funding_vout", UINT32_MAX, &fv64) ||
+               !wire_json_get_uint(pj, "funding_amount", 2100000000000000ULL, &fa64) ||
+               fa64 == 0 ||
+               wire_json_get_hex(pj, "funding_txid", bind.txid, 32) != 32 ||
+               wire_json_get_hex(pj, "funding_spk", bind.spk, 34) != 34) {
+        why = "malformed funding";
+    } else if (!factory_funding_spk_for(ctx, pks, n, want_spk) ||
+               memcmp(want_spk, bind.spk, 34) != 0) {
+        why = "the funding output is not the participants' aggregate key";
+    } else {
+        for (size_t i = 1; i < n && !why; i++)
+            for (size_t j = 0; j < old_f->n_participants && !why; j++)
+                if (pk_eq(ctx, &pks[i], &old_f->pubkeys[j]))
+                    why = "a replacement key is reused from the old factory";
+    }
+    /* Only a client that may later release its old key takes part: a
+       per-factory key bound to this LSP and in the old factory. */
+    if (!why && !client_part_old_key_ok(db, ctx, old_kp, old_f, &row.old_key_index,
+                                        row.old_pubkey))
+        why = "our old factory key can never be released (identity or unbound key)";
+    if (why) {
+        fprintf(stderr, "Client: REFUSING the rotation: %s\n", why);
+        goto out;
+    }
+    reverse_bytes(bind.txid, 32);
+    bind.vout = (uint32_t)fv64;
+    bind.amount = fa64;
+    char fund_disp[65];
+    txid_display(bind.txid, fund_disp);
+    snprintf(row.close_txid, sizeof(row.close_txid), "%s", fund_disp);
+    row.close_height = 0;
+    if (strcmp(row.state, "part_signed") != 0) snprintf(row.state, sizeof(row.state), "key_sent");
+    if (!persist_client_rotation_save(db, &row)) goto out;
+    printf("Client: partial rotation proposal checked: slot %u of %zu, funding %s:%u; "
+           "signing the replacement tree\n", slot, n - 1, fund_disp, bind.vout);
+    fflush(stdout);
+
+    /* The tree over exactly that funding, bound to it before we sign. */
+    nf = calloc(1, sizeof(*nf));
+    nc = calloc(1, sizeof(*nc));
+    if (!nf || !nc) goto out;
+    nc->local_amount = old_ch->local_amount;
+    guard.db = db;
+    guard.ctx = ctx;
+    guard.old_f = old_f;
+    guard.bind = &bind;
+    guard.close_disp = fund_disp;
+    guard.npk = &npk;
+    guard.min_amount = old_ch->local_amount;
+    client_set_sign_guard(cin_sign_guard, &guard);
+    int rok = client_do_factory_rotation_bound(fd, ctx, &nkp, slot, n, pks, nf, nc, propose,
+                                               &bind);
+    client_set_sign_guard(NULL, NULL);
+    if (!rok) {
+        fprintf(stderr, "Client: replacement ceremony failed\n");
+        goto out;
+    }
+    int all_signed = nf->n_nodes > 0;
+    for (size_t i = 0; i < nf->n_nodes; i++)
+        if (!nf->nodes[i].is_signed) all_signed = 0;
+    if (!all_signed || !guard.tree_bound || !cin_funding_is_bound(nf, &bind) ||
+        !factory_verify_all(nf) || !nodes_match_local(ctx, nf) ||
+        nf->cltv_timeout <= old_f->cltv_timeout || nc->local_amount < old_ch->local_amount ||
+        !client_channel_amounts_exact(nc)) {
+        fprintf(stderr, "Client: REFUSING the rotation: the replacement is not the tree we "
+                "signed, not fully signed, or does not carry our balance\n");
+        goto out;
+    }
+    if (nf->dist_tx_ready != 2 || !guard.dist_captured ||
+        !signed_is_keypath_of(ctx, &nf->dist_unsigned_tx, guard.dist_unsigned.data,
+                              guard.dist_unsigned.len, guard.dist_sighash,
+                              &nf->nodes[0].tweaked_pubkey) ||
+        !check_distribution_tx(ctx, nf, nf->dist_unsigned_tx.data, nf->dist_unsigned_tx.len,
+                               &npk, old_ch->local_amount)) {
+        fprintf(stderr, "Client: REFUSING the rotation: the replacement's distribution TX "
+                "is not the one we signed, or its signature is invalid\n");
+        goto out;
+    }
+    {
+        wire_msg_t m;
+        if (!recv_skip(fd, &m, 120) || m.msg_type != MSG_COMMITMENT_SIGNED) {
+            fprintf(stderr, "Client: expected the initial commitment signature\n");
+            if (m.json) cJSON_Delete(m.json);
+            goto out;
+        }
+        uint32_t cid, nidx;
+        uint64_t cn;
+        unsigned char psig[32], full[64];
+        int cok = wire_parse_commitment_signed(m.json, &cid, &cn, psig, &nidx) && cn == 0 &&
+                  nc->commitment_number == 0 &&
+                  channel_verify_and_aggregate_commitment_sig(nc, psig, nidx, full);
+        cJSON_Delete(m.json);
+        if (!cok) {
+            fprintf(stderr, "Client: REFUSING the rotation: bad initial commitment signature\n");
+            goto out;
+        }
+        memcpy(nc->latest_commitment_sig, full, 64);
+        nc->has_latest_commitment_sig = 1;
+    }
+    char side[200];
+    if (strlen(db_path) > sizeof(side) - 16) goto out;
+    snprintf(side, sizeof(side), "%s.rotation", db_path);
+    row.close_height = bind.vout;            /* partial: where the funding pays */
+    row.carried = nc->local_amount;
+    if (!write_side_db(db, side, ctx, nf, nc, slot, &row, row.key_index)) {
+        fprintf(stderr, "Client: could not store the replacement\n");
+        goto out;
+    }
+    snprintf(row.side_db, sizeof(row.side_db), "%s", side);
+    snprintf(row.state, sizeof(row.state), "part_signed");
+    if (!persist_client_rotation_save(db, &row)) goto out;
+    printf("Client: replacement signed and stored (slot %u, balance %llu); waiting for its "
+           "funding\n", slot, (unsigned long long)nc->local_amount);
+    fflush(stdout);
+
+    /* The release request: only once the funding is ours to see at the safe
+       depth, against a receipt over exactly our position. */
+    {
+        wire_msg_t m;
+        if (!recv_skip(fd, &m, 7200) || m.msg_type != MSG_ROTATION_RELEASE_REQ) {
+            fprintf(stderr, "Client: no release request (we keep our old factory)\n");
+            if (m.json) cJSON_Delete(m.json);
+            goto out;
+        }
+        unsigned char ft[32], b_lsp[32], receipt[64], b_own[32];
+        int pok = wire_parse_rotation_release_req(m.json, ft, b_lsp, receipt);
+        cJSON_Delete(m.json);
+        uint32_t oidx = 0;
+        why = pok ? client_part_release_check(g_cin_rt, db, ctx, old_f, &pks[0], old_kp, old_ch,
+                                              nf, &bind, &npk, slot, nc->local_amount, ft,
+                                              b_lsp, receipt, b_own, &oidx)
+                  : "malformed release request";
+        if (why) {
+            fprintf(stderr, "Client: NOT releasing our old factory key: %s\n", why);
+            cJSON *e = wire_build_error("release refused");
+            if (e) { wire_send(fd, MSG_ERROR, e); cJSON_Delete(e); }
+            goto out;
+        }
+        /* Write-ahead: released (and the key never reused), then send. */
+        snprintf(row.state, sizeof(row.state), "released");
+        if (!persist_client_rotation_save(db, &row) ||
+            !persist_factory_key_set_state(db, oidx, FACTORY_KEY_STATE_RELEASED, 0) ||
+            !mark_released_in(side, oidx, row.old_txid) ||
+            !secp256k1_keypair_sec(ctx, osk, old_kp))
+            goto out;
+        cJSON *rl = wire_build_rotation_release(b_own, osk);
+        int sent = rl && wire_send(fd, MSG_ROTATION_RELEASE, rl);
+        if (rl) {
+            cJSON *k = cJSON_GetObjectItemCaseSensitive(rl, "old_seckey");
+            if (cJSON_IsString(k)) secure_zero(k->valuestring, strlen(k->valuestring));
+            cJSON_Delete(rl);
+        }
+        printf("Client: old factory key released%s (verified: funded replacement at the "
+               "safe depth, our slot %u, balance %llu)\n", sent ? "" : " (send failed)",
+               slot, (unsigned long long)nc->local_amount);
+        fflush(stdout);
+    }
+    /* The old position is sold.  The side DB becomes the main DB right
+       before the reconnect (client_cin_resolve: state "released"), where the
+       caller also picks the replacement's factory key. */
+    result = 1;
+out:
+    client_set_sign_guard(NULL, NULL);
+    tx_buf_free(&guard.dist_unsigned);
+    secure_zero(root, sizeof(root));
+    secure_zero(nsk, sizeof(nsk));
+    secure_zero(osk, sizeof(osk));
+    secure_zero(&nkp, sizeof(nkp));
+    free(row.close_hex);
+    free(pks);
+    if (nf) { factory_free(nf); free(nf); }
+    if (nc) { channel_cleanup(nc); free(nc); }
+    return result;
+}
+
+int client_part_on_release_req(int fd, secp256k1_context *ctx, persist_t *db,
+                               const factory_t *f, const cJSON *req) {
+    if (!db || !f || !req || !g_cin_rt) return 0;
+    unsigned char ft[32], b_lsp[32], receipt[64], b_own[32];
+    if (!wire_parse_rotation_release_req(req, ft, b_lsp, receipt)) return 0;
+    char fdisp[65], oldhex[65];
+    txid_display(ft, fdisp);
+    sqlite3_stmt *st;
+    oldhex[0] = '\0';
+    if (sqlite3_prepare_v2(db->db, "SELECT old_funding_txid FROM client_rotations WHERE "
+                           "close_txid = ? LIMIT 1;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(st, 1, fdisp, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+        snprintf(oldhex, sizeof(oldhex), "%s", (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    persist_client_rotation_t row;
+    memset(&row, 0, sizeof(row));
+    if (!oldhex[0] || persist_client_rotation_load(db, oldhex, &row) != 1) return 0;
+    const char *why = NULL;
+    unsigned char root[32], osk[32];
+    secp256k1_keypair okp;
+    memset(&okp, 0, sizeof(okp));
+    memset(osk, 0, sizeof(osk));
+    int ok = 0;
+    /* Our slot and key in the replacement, which is our factory now. */
+    const secp256k1_keypair *fkp = client_factory_keypair(client_identity_keypair());
+    secp256k1_pubkey npk;
+    uint32_t slot = 0;
+    if (fkp && secp256k1_keypair_pub(ctx, &npk, fkp))
+        for (size_t i = 1; i < f->n_participants; i++)
+            if (pk_eq(ctx, &f->pubkeys[i], &npk)) { slot = (uint32_t)i; break; }
+    client_funding_bind_t bind;
+    memset(&bind, 0, sizeof(bind));
+    memcpy(bind.txid, f->funding_txid, 32);
+    bind.vout = f->funding_vout;
+    bind.amount = f->funding_amount_sats;
+    if (f->funding_spk_len == 34) memcpy(bind.spk, f->funding_spk, 34);
+    factory_t old_stub;
+    memset(&old_stub, 0, sizeof(old_stub));
+    if (hex_decode(row.old_txid, old_stub.funding_txid, 32) != 32) goto out;
+    reverse_bytes(old_stub.funding_txid, 32);
+    old_stub.funding_vout = row.old_vout;
+    /* The old channel is not served after the switch (the LSP retired that
+       factory), so its balance is the one carried. */
+    channel_t old_stub_ch;
+    memset(&old_stub_ch, 0, sizeof(old_stub_ch));
+    old_stub_ch.local_amount = row.carried;
+    if (strcmp(row.state, "part_signed") != 0 && strcmp(row.state, "part_switched") != 0) {
+        why = "no unreleased partial rotation for this funding";
+    } else if (!row.old_pubkey[0]) {
+        why = "the rotation recorded no old factory key";
+    } else if (!slot || !root_secret(ctx, root) ||
+               !factory_key_derive_stored(db, ctx, root, row.old_key_index, osk) ||
+               !secp256k1_keypair_create(ctx, &okp, osk)) {
+        why = "our old factory key is not known";
+    } else {
+        /* The key derived from the recorded index must be exactly the
+           recorded old key (checked to be in the old factory when the
+           rotation was signed), not the key we sign the current factory
+           with, and no longer an active key. */
+        secp256k1_pubkey dpk;
+        unsigned char dser[33], kc[33], kpk[33];
+        char dhex[67], kstate[16];
+        size_t l = 33;
+        int st_ok = persist_factory_key_get_row(db, row.old_key_index, kc, kpk, kstate) == 1;
+        if (!secp256k1_keypair_pub(ctx, &dpk, &okp) ||
+            !secp256k1_ec_pubkey_serialize(ctx, dser, &l, &dpk, SECP256K1_EC_COMPRESSED))
+            why = "internal";
+        else {
+            hex_encode(dser, 33, dhex);
+            if (strcmp(dhex, row.old_pubkey) != 0)
+                why = "the derived key is not our recorded old factory key";
+            else if (pk_eq(ctx, &dpk, &npk))
+                why = "the derived key is our current factory key";
+            else if (!st_ok || strcmp(kstate, FACTORY_KEY_STATE_ACTIVE) == 0 ||
+                     strcmp(kstate, FACTORY_KEY_STATE_RESERVED) == 0)
+                why = "the old key is still an active key";
+        }
+    }
+    if (why) {
+        /* refused below */
+    } else {
+        uint32_t oidx = 0;
+        why = client_part_release_check(g_cin_rt, db, ctx, &old_stub, &f->pubkeys[0], &okp,
+                                        &old_stub_ch, f, &bind, &npk, slot, row.carried, ft,
+                                        b_lsp, receipt, b_own, &oidx);
+        if (!why && oidx != row.old_key_index) why = "our old factory key is not the recorded one";
+    }
+    if (why) {
+        fprintf(stderr, "Client: NOT releasing our old factory key: %s\n", why);
+        cJSON *e = wire_build_error("release refused");
+        if (e) { wire_send(fd, MSG_ERROR, e); cJSON_Delete(e); }
+        goto out;
+    }
+    /* Already switched: released means done. */
+    snprintf(row.state, sizeof(row.state), "done");
+    if (!persist_client_rotation_save(db, &row) ||
+        !persist_factory_key_set_state(db, row.old_key_index, FACTORY_KEY_STATE_RELEASED, 0))
+        goto out;
+    {
+        cJSON *rl = wire_build_rotation_release(b_own, osk);
+        ok = rl && wire_send(fd, MSG_ROTATION_RELEASE, rl);
+        if (rl) {
+            cJSON *k = cJSON_GetObjectItemCaseSensitive(rl, "old_seckey");
+            if (cJSON_IsString(k)) secure_zero(k->valuestring, strlen(k->valuestring));
+            cJSON_Delete(rl);
+        }
+    }
+    printf("Client: old factory key released on request (verified: funded replacement at "
+           "the safe depth, our slot %u, balance %llu)\n", slot,
+           (unsigned long long)row.carried);
+    fflush(stdout);
+out:
+    secure_zero(root, sizeof(root));
+    secure_zero(osk, sizeof(osk));
+    secure_zero(&okp, sizeof(okp));
+    free(row.close_hex);
+    return ok;
+}
+
 int client_cin_resolve(persist_t *db, const char *db_path, regtest_t *rt) {
     if (!db || !db_path) return 0;
     client_cin_refresh_frozen(db);
     persist_client_rotation_t row;
     memset(&row, 0, sizeof(row));
     if (persist_client_rotation_load_open(db, &row) != 1) return 0;
+    /* Switched, not released: closed once the old funding is spent on chain
+       (nothing can be asked for it any more). */
+    if (strcmp(row.state, "part_switched") == 0) {
+        if (rt && row.old_txid[0]) {
+            char params[128];
+            snprintf(params, sizeof(params), "\"%s\" %u false", row.old_txid, row.old_vout);
+            char *r = regtest_exec(rt, "gettxout", params);
+            int spent = r && (r[0] == '\0' || strncmp(r, "null", 4) == 0);
+            free(r);
+            if (spent) {
+                snprintf(row.state, sizeof(row.state), "done");
+                (void)persist_client_rotation_save(db, &row);
+            }
+        }
+        free(row.close_hex);
+        return 0;
+    }
     int confs = -1, other = -1;
     if (state_is_signed(row.state)) client_cin_chain_view(rt, db, &row, &confs, &other);
+    if (rt && strcmp(row.state, "part_signed") == 0 && row.close_txid[0]) {
+        char params[128];
+        snprintf(params, sizeof(params), "\"%s\" %u false", row.close_txid, row.close_height);
+        char *r = regtest_exec(rt, "gettxout", params);
+        cJSON *j = r ? cJSON_Parse(r) : NULL;
+        free(r);
+        const cJSON *c = j ? cJSON_GetObjectItemCaseSensitive(j, "confirmations") : NULL;
+        if (cJSON_IsNumber(c)) confs = (int)c->valuedouble;
+        cJSON_Delete(j);
+    }
     if (confs < g_cin_depth && other >= g_cin_depth) {
         /* The old factory was resolved without the close (which can now
            never confirm): the rotation is over and the freeze lifted. */
@@ -1165,7 +1771,7 @@ int client_cin_resolve(persist_t *db, const char *db_path, regtest_t *rt) {
 void client_cin_reconnect_fields(persist_t *db, cJSON *reconnect) {
     if (!reconnect) return;
     if (client_cin_capable() && db)
-        cJSON_AddNumberToObject(reconnect, "rotation_v", 1);
+        cJSON_AddNumberToObject(reconnect, "rotation_v", 2);
     if (!db) return;
     persist_client_rotation_t row;
     memset(&row, 0, sizeof(row));

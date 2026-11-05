@@ -62,6 +62,91 @@ static bool penalty_tx_has_p2a_anchor(const unsigned char *tx, size_t len)
     return memcmp(&tx[off], P2A_SPK, P2A_SPK_LEN) == 0;
 }
 
+/* The watch entries of channel C saved in DB (old commitments, their
+   penalty bytes and HTLC outputs).  0 on an allocation failure. */
+static int wt_load_channel_entries(watchtower_t *wt, persist_t *db, size_t c) {
+        uint64_t commit_nums[WATCHTOWER_MAX_WATCH];
+        unsigned char txids[WATCHTOWER_MAX_WATCH][32];
+        uint32_t vouts[WATCHTOWER_MAX_WATCH];
+        uint64_t amounts[WATCHTOWER_MAX_WATCH];
+        unsigned char spks[WATCHTOWER_MAX_WATCH][34];
+        size_t spk_lens[WATCHTOWER_MAX_WATCH];
+        uint32_t csv_delays[WATCHTOWER_MAX_WATCH];
+
+        size_t loaded = persist_load_old_commitments(
+            db, (uint32_t)c, commit_nums, txids, vouts, amounts,
+            spks, spk_lens, csv_delays,
+            wt->entries_cap - wt->n_entries);
+
+        for (size_t i = 0; i < loaded && wt->n_entries < wt->entries_cap; i++) {
+            watchtower_entry_t *e = &wt->entries[wt->n_entries++];
+            e->type = WATCH_COMMITMENT;
+            e->channel_id = (uint32_t)c;
+            e->commit_num = commit_nums[i];
+            memcpy(e->txid, txids[i], 32);
+            /* DB-loaded entries: registered_height = 0 so that late-arrival
+               breach detection works (breach confirmed during downtime).
+               Fresh entries set registered_height in watchtower_watch(). */
+            e->registered_height = 0;
+            e->to_local_vout = vouts[i];
+            e->to_local_amount = amounts[i];
+            memcpy(e->to_local_spk, spks[i], spk_lens[i]);
+            e->to_local_spk_len = spk_lens[i];
+            /* Hydrate csv_delay so oracular CPFP can
+               read it after restart without live channel state. */
+            e->csv_delay = csv_delays[i];
+
+            /* Re-register the watched script with the chain backend so
+               BIP 158 scanning resumes correctly after a process restart. */
+            if (wt->chain && wt->chain->register_script && spk_lens[i] > 0)
+                wt->chain->register_script(wt->chain,
+                                           e->to_local_spk, e->to_local_spk_len);
+
+            e->n_htlc_outputs = 0;
+            e->response_tx = NULL;
+            e->response_tx_len = 0;
+            e->signed_penalty_tx = NULL;
+            e->signed_penalty_tx_len = 0;
+
+            /* v25 restart-defense load: pull the pre-built penalty TX
+               bytes if they were persisted.  Without this, the oracular
+               fast-path skips broadcast post-restart and the channel goes
+               undefended.  rc=0 (row exists, column empty) is the legacy
+               fallback path — leaves signed_penalty_tx NULL and channel_t
+               re-attaches later via watchtower_set_channel. */
+            if (db && db->db) {
+                unsigned char *bytes = NULL;
+                size_t blen = 0;
+                if (persist_load_old_commitment_witness(db, (uint32_t)c,
+                        commit_nums[i], &bytes, &blen) == 1
+                    && bytes && blen > 0) {
+                    e->signed_penalty_tx = bytes;
+                    e->signed_penalty_tx_len = blen;
+                }
+            }
+
+            /* Load persisted HTLC output data for this commitment */
+            if (db && db->db) {
+                watchtower_htlc_t *tmp_htlcs = malloc(MAX_HTLCS * sizeof(watchtower_htlc_t));
+                if (!tmp_htlcs) return 0;
+                size_t n_loaded_htlcs = persist_load_old_commitment_htlcs(
+                    db, (uint32_t)c, commit_nums[i],
+                    tmp_htlcs, MAX_HTLCS);
+                if (n_loaded_htlcs > 0) {
+                    e->htlc_outputs = calloc(n_loaded_htlcs, sizeof(watchtower_htlc_t));
+                    if (e->htlc_outputs) {
+                        memcpy(e->htlc_outputs, tmp_htlcs,
+                               n_loaded_htlcs * sizeof(watchtower_htlc_t));
+                        e->n_htlc_outputs = n_loaded_htlcs;
+                        e->htlc_outputs_cap = n_loaded_htlcs;
+                    }
+                }
+                free(tmp_htlcs);
+            }
+        }
+    return 1;
+}
+
 int watchtower_init(watchtower_t *wt, size_t n_channels,
                       regtest_t *rt, fee_estimator_t *fee, persist_t *db) {
     if (!wt) return 0;
@@ -103,86 +188,20 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
        Loop up to channels_cap (not n_channels) so we also reload entries
        for JIT channels which are stored at indices >= n_channels. */
     if (db && db->db) {
-        for (size_t c = 0; c < wt->channels_cap; c++) {
-            uint64_t commit_nums[WATCHTOWER_MAX_WATCH];
-            unsigned char txids[WATCHTOWER_MAX_WATCH][32];
-            uint32_t vouts[WATCHTOWER_MAX_WATCH];
-            uint64_t amounts[WATCHTOWER_MAX_WATCH];
-            unsigned char spks[WATCHTOWER_MAX_WATCH][34];
-            size_t spk_lens[WATCHTOWER_MAX_WATCH];
-            uint32_t csv_delays[WATCHTOWER_MAX_WATCH];
-
-            size_t loaded = persist_load_old_commitments(
-                db, (uint32_t)c, commit_nums, txids, vouts, amounts,
-                spks, spk_lens, csv_delays,
-                wt->entries_cap - wt->n_entries);
-
-            for (size_t i = 0; i < loaded && wt->n_entries < wt->entries_cap; i++) {
-                watchtower_entry_t *e = &wt->entries[wt->n_entries++];
-                e->type = WATCH_COMMITMENT;
-                e->channel_id = (uint32_t)c;
-                e->commit_num = commit_nums[i];
-                memcpy(e->txid, txids[i], 32);
-                /* DB-loaded entries: registered_height = 0 so that late-arrival
-                   breach detection works (breach confirmed during downtime).
-                   Fresh entries set registered_height in watchtower_watch(). */
-                e->registered_height = 0;
-                e->to_local_vout = vouts[i];
-                e->to_local_amount = amounts[i];
-                memcpy(e->to_local_spk, spks[i], spk_lens[i]);
-                e->to_local_spk_len = spk_lens[i];
-                /* v32 (SF-WTC #149): hydrate csv_delay so oracular CPFP can
-                   read it after restart without live channel state. */
-                e->csv_delay = csv_delays[i];
-
-                /* Re-register the watched script with the chain backend so
-                   BIP 158 scanning resumes correctly after a process restart. */
-                if (wt->chain && wt->chain->register_script && spk_lens[i] > 0)
-                    wt->chain->register_script(wt->chain,
-                                               e->to_local_spk, e->to_local_spk_len);
-
-                e->n_htlc_outputs = 0;
-                e->response_tx = NULL;
-                e->response_tx_len = 0;
-                e->signed_penalty_tx = NULL;
-                e->signed_penalty_tx_len = 0;
-
-                /* v25 restart-defense load: pull the pre-built penalty TX
-                   bytes if they were persisted.  Without this, the oracular
-                   fast-path skips broadcast post-restart and the channel goes
-                   undefended.  rc=0 (row exists, column empty) is the legacy
-                   fallback path — leaves signed_penalty_tx NULL and channel_t
-                   re-attaches later via watchtower_set_channel. */
-                if (db && db->db) {
-                    unsigned char *bytes = NULL;
-                    size_t blen = 0;
-                    if (persist_load_old_commitment_witness(db, (uint32_t)c,
-                            commit_nums[i], &bytes, &blen) == 1
-                        && bytes && blen > 0) {
-                        e->signed_penalty_tx = bytes;
-                        e->signed_penalty_tx_len = blen;
-                    }
-                }
-
-                /* Load persisted HTLC output data for this commitment */
-                if (db && db->db) {
-                    watchtower_htlc_t *tmp_htlcs = malloc(MAX_HTLCS * sizeof(watchtower_htlc_t));
-                    if (!tmp_htlcs) return 0;
-                    size_t n_loaded_htlcs = persist_load_old_commitment_htlcs(
-                        db, (uint32_t)c, commit_nums[i],
-                        tmp_htlcs, MAX_HTLCS);
-                    if (n_loaded_htlcs > 0) {
-                        e->htlc_outputs = calloc(n_loaded_htlcs, sizeof(watchtower_htlc_t));
-                        if (e->htlc_outputs) {
-                            memcpy(e->htlc_outputs, tmp_htlcs,
-                                   n_loaded_htlcs * sizeof(watchtower_htlc_t));
-                            e->n_htlc_outputs = n_loaded_htlcs;
-                            e->htlc_outputs_cap = n_loaded_htlcs;
-                        }
-                    }
-                    free(tmp_htlcs);
-                }
-            }
+        for (size_t c = 0; c < wt->channels_cap; c++)
+            if (!wt_load_channel_entries(wt, db, c)) return 0;
+        /* Channels of a factory retired by a partial rotation keep their
+           entries under retired ids: a revoked commitment there is still
+           answered after a restart. */
+        {
+            size_t nr = persist_load_retired_channels(db, NULL, NULL, (size_t)-1);
+            uint32_t *rids = nr ? calloc(nr, sizeof(uint32_t)) : NULL;
+            if (nr && !rids) return 0;
+            nr = rids ? persist_load_retired_channels(db, rids, NULL, nr) : 0;
+            for (size_t k = 0; k < nr; k++)
+                if (rids[k] >= wt->channels_cap &&
+                    !wt_load_channel_entries(wt, db, rids[k])) { free(rids); return 0; }
+            free(rids);
         }
 
         /* Load pending penalty entries for CPFP bump tracking */
