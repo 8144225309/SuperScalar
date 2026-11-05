@@ -36,6 +36,27 @@
 #   CKPT=rotate_close_sent           the close is recorded with the
 #                                     replacement and broadcast
 #
+# A partial rotation (CKPT=rotate_part_*; the LSP takes the partial path with
+# every client online, SS_TEST_ROTATE_PARTIAL, regtest only):
+#
+#   CKPT=rotate_part_built     the replacement funding is built and recorded
+#                              in the marker, nothing signed
+#   CKPT=rotate_part_signed    the clients hold the signed replacement tree;
+#                              the replacement is not recorded, not funded
+#   CKPT=rotate_part_recorded  the replacement and the owed releases are
+#                              recorded; the funding is NOT broadcast
+#   CKPT=rotate_part_funded    the funding is confirmed; no release asked yet
+#   CKPT=rotate_part_released  one client released; the others are owed
+#
+# PASS for these: built/signed: the first funding never confirms (it was
+# never broadcast) and the restart drops that rotation, then rotates again
+# with one new funding; recorded: the restart rebroadcasts the recorded
+# funding, no other; funded/released: no new funding at all.  In every case
+# exactly one replacement funding confirms, every client switches and
+# releases once (the owed releases are asked for again after the restart),
+# the LSP then closes the old factory alone, and the released keys are
+# deleted once that close is buried.
+#
 # PASS for these: exactly ONE close is ever built for the old factory, the
 # restart completes the rotation over it ("rotation complete"), the close
 # confirms, no client key is revealed (no Phase A), and every client switches
@@ -99,8 +120,13 @@ LSP_ARGS=(--network regtest --port $PORT --daemon --active-blocks 6 --dying-bloc
   --confirm-timeout 86400 --seckey $LSP_SECKEY
   --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" --wallet "$WALLET" --db "$DB")
 
+PART=0
+case "$CKPT" in rotate_part_*) PART=1 ;; esac
+LSP_ENV=()
+[ "$PART" = 1 ] && LSP_ENV=(SS_TEST_ROTATE_PARTIAL=1)
+
 # --- Phase 1: LSP with crash-at + 4 clients (1-based participant-id, matrix scheme) ---
-SUPERSCALAR_CRASH_AT="$CKPT" "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" > "$TMP/lsp1.log" 2>&1 &
+env "${LSP_ENV[@]}" SUPERSCALAR_CRASH_AT="$CKPT" "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" > "$TMP/lsp1.log" 2>&1 &
 LSP1=$!
 for i in $(seq 1 20); do sleep 1; grep -q listening "$TMP/lsp1.log" 2>/dev/null && break; kill -0 $LSP1 2>/dev/null || break; done
 grep -q listening "$TMP/lsp1.log" || { echo "RESUME-FAIL: LSP1 never listened"; tail -8 "$TMP/lsp1.log"; exit 1; }
@@ -136,6 +162,92 @@ CIN=0
 grep -qa "LSP rotate: close into the new factory" "$TMP/lsp1.log" && CIN=1
 FUND1=$(grep -aoE "replacement funding [0-9a-f]{64} recorded|LSP rotate: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$TMP/lsp1.log" | grep -oE "[0-9a-f]{64}" | tail -1)
 echo "Phase-1 close txid: ${CLOSE1:-<none>}   Phase-1 replacement funding: ${FUND1:-<none>}"
+cnt() { local n; n=$(grep -acE "$1" "$2" 2>/dev/null) || n=0; echo "$n"; }
+
+if [ "$PART" = 1 ]; then
+  F1=$(grep -aoE "replacement funding [0-9a-f]{64}:[0-9]+ built" "$TMP/lsp1.log" | grep -oE "[0-9a-f]{64}" | head -1)
+  [ -n "$F1" ] || { echo "RESUME-FAIL: no partial replacement funding built in phase 1"; exit 1; }
+  # The factory the interrupted rotation replaces (the first one).
+  O1=$(grep -aoE "^LSP: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$TMP/lsp1.log" | grep -oE "[0-9a-f]{64}" | head -1)
+  echo "=== Phase 2: restart (partial rotation) ==="
+  # Past the record the restarted LSP's live factory is the replacement: give
+  # it a longer life than 6 blocks, so it is not itself rotated before the
+  # releases it is owed come in.
+  LSP_ARGS2=("${LSP_ARGS[@]}")
+  case "$CKPT" in
+    rotate_part_built|rotate_part_signed) ;;
+    *) for i in "${!LSP_ARGS2[@]}"; do
+         [ "${LSP_ARGS2[$i]}" = "--active-blocks" ] && LSP_ARGS2[$((i + 1))]=60
+       done ;;
+  esac
+  env "${LSP_ENV[@]}" "$BUILD/superscalar_lsp" "${LSP_ARGS2[@]}" > "$TMP/lsp2.log" 2>&1 &
+  LSP2=$!
+  ( while kill -0 $LSP2 2>/dev/null; do $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1; sleep 2; done ) &
+  MINER=$!
+  for i in $(seq 1 400); do
+    sleep 1
+    kill -0 $LSP2 2>/dev/null || break
+    grep -qa "the old factory $O1 is closed" "$TMP/lsp2.log" && { echo "keys deleted at ~${i}s"; break; }
+  done
+  sleep 3
+  kill -9 $LSP2 $MINER 2>/dev/null
+  sleep 1
+  # Verdicts are scoped to the interrupted rotation: lsp2.log up to the
+  # LSP's own close of that old factory (with --active-blocks 6 the
+  # replacement later reaches DYING and is rotated in turn).
+  L2="$TMP/lsp2.resume.log"
+  END2=$(grep -anm1 "every client of the old factory $O1 released its key" "$TMP/lsp2.log" | cut -d: -f1)
+  if [ -n "$END2" ]; then head -n "$END2" "$TMP/lsp2.log" > "$L2"; else cp "$TMP/lsp2.log" "$L2"; fi
+  echo "=== Phase 2 (partial) ==="
+  grep -aE "LSP recovery: (a partial|this factory replaces|[0-9]+ of [0-9]+ release)|replacement funding|released its old factory key|closing it alone|old factory close|is closed|deleted|rotation complete|asked client" "$L2" | cut -c1-170 | head -30
+  # Every replacement funding ever built, and which confirmed.
+  FUNDS=$(grep -ahoE "replacement funding [0-9a-f]{64}:[0-9]+ built" "$TMP/lsp1.log" "$L2" | grep -oE "[0-9a-f]{64}" | sort -u)
+  N_CONF=0; CONF_F=""
+  for f in $FUNDS; do
+    c=$($BCLI getrawtransaction "$f" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+    [ "${c:-0}" -ge 1 ] && { N_CONF=$((N_CONF + 1)); CONF_F=$f; }
+  done
+  F1_CONF=0; [ "$CONF_F" = "$F1" ] && F1_CONF=1
+  N_FUNDS=$(printf "%s\n" $FUNDS | grep -c . || true)
+  DROPPED=$(cnt "LSP recovery: a partial rotation of this factory stopped before its replacement was recorded" "$L2")
+  REBC=$(cnt "replacement funding $F1 was not on the network" "$L2")
+  OWED=$(cnt "LSP recovery: [0-9]+ of [0-9]+ release\(s\) still owed" "$L2")
+  REL=$(grep -ahoE "client [0-9]+ released its old factory key \(verified release\)" "$TMP/lsp1.log" "$L2" | sort -u | wc -l)
+  REL_LINES=$(grep -ahE "client [0-9]+ released its old factory key \(verified release\)" "$TMP/lsp1.log" "$L2" | wc -l)
+  WD=$(grep -aoE "the old factory $O1 released its key — closing it alone: close [0-9a-f]{64} recorded" "$TMP/lsp2.log" | grep -oE "close [0-9a-f]{64}" | grep -oE "[0-9a-f]{64}" | sort -u)
+  N_WD=$(printf "%s\n" $WD | grep -c . || true)
+  WD_CONF=0
+  [ -n "$WD" ] && WD_CONF=$($BCLI getrawtransaction "$WD" 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirmations",0))' 2>/dev/null)
+  DELETED=$(cnt "the old factory $O1 is closed .*the released keys kept for it are deleted" "$TMP/lsp2.log")
+  LEFT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM departed_clients WHERE factory_id = (SELECT retired_id FROM part_rotations WHERE old_txid = '$O1');" 2>/dev/null)
+  SWITCHED=0
+  for N in 1 2 3 4; do grep -qa "switched to the replacement factory" "$TMP/c$N.log" && SWITCHED=$((SWITCHED + 1)); done
+  echo
+  echo "=== fund-safety: ckpt=$CKPT fundings_built=$N_FUNDS confirmed=$N_CONF first_confirmed=$F1_CONF dropped=$DROPPED rebroadcast=$REBC owed_loaded=$OWED released=$REL/4 (lines $REL_LINES) clients_switched=$SWITCHED/4 winddown_closes=$N_WD close_conf=${WD_CONF:-0} keys_deleted=$DELETED keys_left=${LEFT:-?} ==="
+  OK=0
+  if [ "$N_CONF" -eq 1 ] && [ "$REL" -eq 4 ] && [ "$REL_LINES" -eq 4 ] && [ "$SWITCHED" -eq 4 ] &&
+     [ "$N_WD" -eq 1 ] && [ "${WD_CONF:-0}" -ge 6 ] && [ "$DELETED" -ge 1 ] && [ "${LEFT:-1}" -eq 0 ]; then
+    case "$CKPT" in
+      rotate_part_built|rotate_part_signed)
+        [ "$DROPPED" -ge 1 ] && [ "$F1_CONF" -eq 0 ] && [ "$N_FUNDS" -eq 2 ] && OK=1 ;;
+      rotate_part_recorded)
+        [ "$F1_CONF" -eq 1 ] && [ "$N_FUNDS" -eq 1 ] && [ "$REBC" -ge 1 ] && OK=1 ;;
+      *)
+        [ "$F1_CONF" -eq 1 ] && [ "$N_FUNDS" -eq 1 ] && [ "$OWED" -ge 1 ] && OK=1 ;;
+    esac
+  fi
+  if [ "$OK" = 1 ]; then
+    echo "RESUME-PASS: crash at $CKPT: one replacement funding confirmed ($CONF_F), every client switched and released once, the LSP closed the old factory alone ($WD) and deleted the released keys."
+    exit 0
+  fi
+  echo "=== on failure: the clients' rotation lines, and the LSP's reconnects ==="
+  for N in 1 2 3 4; do
+    grep -aiE "rotation|release|switched|refus|reconnect" "$TMP/c$N.log" | tail -10 | sed "s/^/  c$N: /" | cut -c1-200
+  done
+  grep -aE "reconnect|release|asked" "$TMP/lsp2.log" | head -20 | sed "s/^/  lsp2: /" | cut -c1-200
+  echo "RESUME-FAIL: want confirmed=1 released=4/4 (4 lines) clients_switched=4/4 winddown_closes=1 close_conf>=6 keys_deleted>=1 keys_left=0 and (built/signed: dropped>=1 first_confirmed=0 fundings_built=2; recorded: first_confirmed=1 fundings_built=1 rebroadcast>=1; funded/released: first_confirmed=1 fundings_built=1 owed_loaded>=1)"
+  exit 1
+fi
 [ -n "$CLOSE1" ] || { echo "RESUME-FAIL: no Phase-1 close txid (crash landed before close?)"; exit 1; }
 
 # --- Phase 2: RESTART (no crash-at).  Recovery loads the progress marker and

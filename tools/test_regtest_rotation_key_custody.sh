@@ -19,12 +19,15 @@
 #   PAY_AFTER    a payment over the replacement factory succeeds, and no client
 #                rejects the LSP's revocation for it.
 #   KEYS_AT_REST the LSP's database holds no client secret key in the clear,
-#                and none at all once the old factory is closed on chain (a
-#                partial rotation keeps the released keys, sealed, while the
-#                old factory still holds the clients that did not move).  The
-#                seal key is derived from the LSP's own secret on the same
-#                host: it protects against leaks of the database alone (a
-#                backup), not of the host.
+#                and none at all once the old factory is resolved (a partial
+#                rotation keeps the released keys, sealed, until then; the
+#                drill mines until the LSP must have deleted them and checks
+#                that it did).  The seal key is derived from the LSP's own
+#                secret on the same host: it protects against leaks of the
+#                database alone (a backup), not of the host.
+#   KEY_ROWS     every client that moved has exactly one active factory key
+#                row, the replacement's; its old factory key row is retired
+#                (or released).
 #   IDENTITY     no client key the LSP holds is a client's identity (--seckey)
 #                key: a client signs each factory with its own derived key.
 #   PAYOUT_KEYS  --export-factory-keys gives descriptors Bitcoin Core accepts,
@@ -49,6 +52,14 @@
 #                old tree's root, broadcast from its own DB, confirms; the
 #                LSP's database still holds that factory's tree and channels.
 #
+# MODE=winddown takes the partial path with every client online
+# (SS_TEST_ROTATE_PARTIAL, regtest only): every client moves and releases,
+# and adds REPLACEMENT, STRANDED and:
+#   WIND_DOWN    once every client released, the LSP closes the old factory
+#                alone, to its own wallet, recorded before broadcast, and only
+#                after the last release; the close confirms; the released
+#                keys are then deleted (KEYS_AT_REST).
+#
 # PASS (exit 0) only if every check is SAFE.  Exit 1 if any check is UNSAFE
 # or (MODE=full) the rotation did not complete; exit 2 = setup failure.
 #
@@ -59,7 +70,7 @@ set -uo pipefail
 REPO="${REPO:-/root/SuperScalar}"
 cd "$REPO" || exit 2
 
-MODE="${MODE:-full}"               # full | partial (client 4 offline at DYING)
+MODE="${MODE:-full}"               # full | partial (client 4 offline at DYING) | winddown
 ARITY="${ARITY:-1}"                # factory shape passed to --arity
 PORT="${PORT:-9975}"
 TMP="/tmp/rot_keys_${MODE}_$PORT"
@@ -108,7 +119,9 @@ LSP_ARGS=(--network regtest --port $PORT --daemon --cli --active-blocks 12 --dyi
   --lsp-balance-pct 50 --clients 4 --arity "$ARITY" --amount $AMOUNT --fee-rate 1100
   --confirm-timeout 86400 --seckey $LSP_SECKEY
   --rpcuser "$RPCUSER" --rpcpassword "$RPCPASS" --rpcport "$RPCPORT" --wallet "$WALLET" --db "$DB")
-stdbuf -oL "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" < "$TMP/cli" > "$L" 2>&1 &
+LSP_ENV=()
+[ "$MODE" = winddown ] && LSP_ENV=(SS_TEST_ROTATE_PARTIAL=1)
+env "${LSP_ENV[@]}" stdbuf -oL "$BUILD/superscalar_lsp" "${LSP_ARGS[@]}" < "$TMP/cli" > "$L" 2>&1 &
 LSP=$!
 wait_log "$L" "listening" 20 || { echo "KEYS-SETUP-FAIL: LSP never listened"; tail -8 "$L"; exit 2; }
 
@@ -253,7 +266,11 @@ import json,sys; t=json.load(sys.stdin); print(t["vout"][int(sys.argv[1])]["scri
       verdict CLOSE_PAYEE 1 "close $CIN_CLOSE: outputs=${C_NOUT:-?} spk=${C_SPK:-?} old_spk=${O_SPK:-?}"
     fi
   else
-    verdict CLOSE_PAYEE 0 "no cooperative close of the old factory"
+    if [ "$MODE" = winddown ]; then
+      verdict CLOSE_PAYEE 0 "no co-signed close of the old factory (the LSP's own close of it is WIND_DOWN)"
+    else
+      verdict CLOSE_PAYEE 0 "no cooperative close of the old factory"
+    fi
   fi
 fi
 
@@ -278,7 +295,7 @@ if [ "$COMPLETE" -lt 1 ]; then
   echo "old factory funding $OLD_TXID:${OLD_VOUT:-0} unspent: $([ -n "$OLD_SPK" ] && echo "yes (${OLD_SPK#* } sats)" || echo no)"
 fi
 
-if [ "$COMPLETE" -ge 1 ] && [ "$MODE" = partial ]; then
+if [ "$COMPLETE" -ge 1 ] && [ "$MODE" != full ]; then
   # --- REPLACEMENT: every client that released its key holds the replacement ---
   REL=$(cnt "released its old factory key" "$L"); MISS=""
   for N in $(seq 1 "$N_ROT"); do
@@ -354,22 +371,78 @@ IDENT=0
 while IFS='|' read -r fid cidx key; do
   [ "$key" = "$(printf "%064x" $((cidx + 1)))" ] && IDENT=$((IDENT + 1))
 done < "$TMP/departed.txt"
-if [ "$IDENT" -gt 0 ]; then
-  verdict IDENTITY 1 "$IDENT of the $N_DEP client key(s) the LSP holds equal the client's own --seckey (its identity key)"
-else
-  verdict IDENTITY 0 "none of the $N_DEP client key(s) the LSP holds is a client's identity key"
-fi
 N_SEALED=$(awk -F'|' 'index($3,"dk1:")==1' "$TMP/departed.txt" | grep -c .)
 OLD_OPEN=0
 O_TXID=$(grep -aoE "^LSP: funded [0-9]+ sats, txid: [0-9a-f]{64}" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
 O_VOUT=$(grep -aoE "^LSP: funding vout=[0-9]+" "$L" | grep -oE "[0-9]+$" | head -1)
 [ -n "$O_TXID" ] && [ -n "$($BCLI gettxout "$O_TXID" "${O_VOUT:-0}" 2>/dev/null)" ] && OLD_OPEN=1
-if [ "$N_DEP" -gt 0 ] && [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "$OLD_OPEN" -eq 1 ] && [ "$IDENT" -eq 0 ]; then
-  verdict KEYS_AT_REST 0 "the $N_DEP released key(s) are sealed (none in the clear) while the old factory is still open for the clients that did not move"
-elif [ "$N_DEP" -gt 0 ]; then
-  verdict KEYS_AT_REST 1 "old factory close confirmations: $CLOSE_CONF (old funding unspent: $OLD_OPEN); departed_clients holds $N_DEP client secret key(s) ($N_PLAIN as plaintext hex, $N_SEALED sealed); $IDENT of them equal the client's own --seckey (its identity and channel key)"
+# (verdict at the end, after the old factory must have been resolved)
+REST_EARLY="departed_clients held $N_DEP key(s) after the rotation ($N_PLAIN as plaintext hex, $N_SEALED sealed; old funding unspent: $OLD_OPEN)"
+
+# --- IDENTITY (by public key): no released old key is a client's identity key ---
+REL_PKS=$(sqlite3 "$DB" "SELECT old_pk FROM part_releases;" 2>/dev/null | tr '\n' ' ')
+ID_HIT=$(python3 - $REL_PKS <<'PY'
+import sys
+P = 2**256 - 2**32 - 977
+G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+     0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+def add(a, b):
+    if a is None: return b
+    if b is None: return a
+    if a[0] == b[0] and (a[1] + b[1]) % P == 0: return None
+    if a == b: l = 3 * a[0] * a[0] * pow(2 * a[1], P - 2, P) % P
+    else: l = (b[1] - a[1]) * pow(b[0] - a[0], P - 2, P) % P
+    x = (l * l - a[0] - b[0]) % P
+    return (x, (l * (a[0] - x) - a[1]) % P)
+def mul(k, pt=G):
+    r = None
+    while k:
+        if k & 1: r = add(r, pt)
+        pt = add(pt, pt); k >>= 1
+    return r
+def ser(pt): return (bytes([2 + (pt[1] & 1)]) + pt[0].to_bytes(32, "big")).hex()
+ids = {ser(mul(n + 1)) for n in range(1, 5)}      # client N signs in with seckey N+1
+print(sum(1 for pk in sys.argv[1:] if pk in ids))
+PY
+)
+N_REL_PK=$(echo $REL_PKS | wc -w)
+if [ "$IDENT" -gt 0 ] || [ "${ID_HIT:-1}" -gt 0 ]; then
+  verdict IDENTITY 1 "of the $N_DEP client key(s) the LSP holds, $IDENT equal a client's own --seckey (plaintext rows); of the $N_REL_PK released old key(s), ${ID_HIT:-?} are a client's identity key (by public key)"
 else
-  verdict KEYS_AT_REST 0 "no client secret key left in the LSP database"
+  verdict IDENTITY 0 "none of the $N_DEP client key(s) the LSP holds is a client's identity key ($N_REL_PK released old key(s) checked by public key)"
+fi
+
+# --- KEY_ROWS: a moved client has one active factory key, the replacement's ---
+KR_BAD=0; KR_DETAIL=""
+if [ "$COMPLETE" -ge 1 ]; then
+  for N in $(seq 1 "$N_ROT"); do
+    act=$(sqlite3 "$TMP/c$N.db" "SELECT COUNT(*) FROM factory_keys WHERE state = 'active';" 2>/dev/null)
+    old=$(sqlite3 "$TMP/c$N.db" "SELECT COUNT(*) FROM factory_keys WHERE state IN ('retired', 'released');" 2>/dev/null)
+    KR_DETAIL="$KR_DETAIL c$N[active=${act:-?} retired/released=${old:-?}]"
+    { [ "${act:-0}" = 1 ] && [ "${old:-0}" -ge 1 ]; } || KR_BAD=1
+  done
+  verdict KEY_ROWS $KR_BAD "$KR_DETAIL"
+fi
+
+# --- WIND_DOWN: every client released; the LSP closes the old factory alone ---
+if [ "$MODE" = winddown ] && [ "$COMPLETE" -ge 1 ]; then
+  wait_log "$L" "closing it alone: close [0-9a-f]{64} recorded" 60
+  WD_LN=$(grep -naE "closing it alone: close [0-9a-f]{64} recorded" "$L" | head -1 | cut -d: -f1)
+  WD_TXID=$(grep -aoE "closing it alone: close [0-9a-f]{64} recorded" "$L" | grep -oE "[0-9a-f]{64}" | head -1)
+  N_WD=$(cnt "closing it alone: close [0-9a-f]{64} recorded" "$L")
+  LAST_REL=$(grep -naE "released its old factory key \(verified release\)" "$L" | tail -1 | cut -d: -f1)
+  N_RELEASED=$(grep -aoE "client [0-9]+ released its old factory key \(verified release\)" "$L" | sort -u | wc -l)
+  $BCLI -rpcwallet="$WALLET" generatetoaddress 1 "$MADDR" >/dev/null 2>&1
+  read -r WD_IN WD_NOUT WD_ADDR WD_CONF < <($BCLI getrawtransaction "${WD_TXID:-x}" 1 2>/dev/null | python3 -c '
+import json,sys; t=json.load(sys.stdin); i=t["vin"][0]; o=t["vout"]
+print("%s:%d" % (i["txid"], i["vout"]), len(o), o[0]["scriptPubKey"].get("address","?"), t.get("confirmations",0))' 2>/dev/null)
+  WD_MINE=$($BCLI -rpcwallet="$WALLET" getaddressinfo "${WD_ADDR:-x}" 2>/dev/null | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("ismine") else 0)' 2>/dev/null)
+  if [ -n "$WD_TXID" ] && [ "$N_WD" = 1 ] && [ "$N_RELEASED" = 4 ] && [ -n "$LAST_REL" ] && [ "$WD_LN" -gt "$LAST_REL" ] &&
+     [ "$WD_IN" = "$O_TXID:${O_VOUT:-0}" ] && [ "$WD_NOUT" = 1 ] && [ "${WD_MINE:-0}" = 1 ] && [ "${WD_CONF:-0}" -ge 1 ]; then
+    verdict WIND_DOWN 0 "all $N_RELEASED clients released, then the LSP closed the old factory alone: $WD_TXID spends $WD_IN, one output to its own wallet ($WD_ADDR), $WD_CONF conf"
+  else
+    verdict WIND_DOWN 1 "closes=$N_WD released=$N_RELEASED close_line=${WD_LN:-none} last_release_line=${LAST_REL:-none} close=${WD_TXID:-none} spends=${WD_IN:-?} (old $O_TXID:${O_VOUT:-0}) outputs=${WD_NOUT:-?} to_lsp_wallet=${WD_MINE:-?} conf=${WD_CONF:-0}"
+  fi
 fi
 
 # --- STAYER: the client that stayed is told to exit, and can ---
@@ -513,6 +586,38 @@ print("confirmations=%s inputs=%d witness_items=%d sig_bytes=%d" % (j.get("confi
   verdict LSP_ALONE 1 "replacement funding $NEW_TXID:$NEW_VOUT spent by $SPENT_BY, signed only with LSP-held keys ($INFO; outpoint unspent now: ${STILL:+yes}${STILL:-no}; client 1's signed kickoff: before=$KICK_BEFORE after=$KICK_AFTER)"
 else
   verdict LSP_ALONE 0 "the LSP's key material does not sign for the replacement funding ${NEW_TXID:-?}:${NEW_VOUT:-?}"
+fi
+
+# --- KEYS_AT_REST: the released keys are gone once the old factory is resolved ---
+DEL_DETAIL=""
+N_DEP_END=$N_DEP
+if [ "$MODE" != full ] && [ "$COMPLETE" -ge 1 ] && [ "$N_DEP" -gt 0 ]; then
+  # Resolved: the LSP's own close buried (winddown), or the old CLTV plus the
+  # margin passed (clients stayed).  The clients are stopped first so that
+  # the replacement is not rotated meanwhile.
+  for N in 1 2 3 4; do kill -9 "${CPID[$N]}" 2>/dev/null; done
+  OLD_CLTV=$(sqlite3 "$DB" "SELECT old_cltv FROM part_rotations ORDER BY retired_id LIMIT 1;" 2>/dev/null)
+  H0=$($BCLI getblockcount)
+  NEED=8; [ "$MODE" = partial ] && NEED=$(( ${OLD_CLTV:-0} + 7 - H0 ))
+  [ "$NEED" -lt 1 ] && NEED=1
+  echo "mining $NEED block(s) (height $H0, old factory CLTV ${OLD_CLTV:-?})"
+  while [ "$NEED" -gt 0 ]; do
+    STEP=$(( NEED < 10 ? NEED : 10 ))
+    $BCLI -rpcwallet="$WALLET" generatetoaddress "$STEP" "$MADDR" >/dev/null 2>&1
+    NEED=$(( NEED - STEP )); sleep 2
+  done
+  wait_log "$L" "the released keys kept for it are deleted" 60
+  N_DEP_END=$(sqlite3 "$DB" "SELECT COUNT(*) FROM departed_clients;" 2>/dev/null)
+  DEL_DETAIL="; at height $($BCLI getblockcount): $(grep -aoE "the old factory [0-9a-f]{64} is (closed|past its CLTV)[^;]*; the released keys kept for it are deleted" "$L" | head -1 | cut -c1-140), $N_DEP_END left"
+fi
+if [ "$N_PLAIN" -eq 0 ] && [ "$N_SEALED" -eq "$N_DEP" ] && [ "${N_DEP_END:-1}" -eq 0 ]; then
+  if [ "$N_DEP" -gt 0 ]; then
+    verdict KEYS_AT_REST 0 "$REST_EARLY, all sealed$DEL_DETAIL"
+  else
+    verdict KEYS_AT_REST 0 "no client secret key in the LSP database"
+  fi
+else
+  verdict KEYS_AT_REST 1 "$REST_EARLY$DEL_DETAIL"
 fi
 
 echo
