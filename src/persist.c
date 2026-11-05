@@ -444,29 +444,39 @@ static const char *SCHEMA_SQL =
     "  commitment_number INTEGER NOT NULL,"
     "  txid TEXT NOT NULL"
     ");"
-    /* v45: preimages awaiting an on-chain claim (sealed). */
+    /* v45: preimages awaiting an on-chain claim (sealed), per factory
+       generation (a rotation reuses the channel ids). */
     "CREATE TABLE IF NOT EXISTS htlc_preimages_pending ("
+    "  factory_id INTEGER NOT NULL DEFAULT 0,"
     "  channel_id INTEGER NOT NULL,"
     "  htlc_id INTEGER NOT NULL,"
     "  preimage TEXT NOT NULL,"
-    "  PRIMARY KEY (channel_id, htlc_id)"
+    "  PRIMARY KEY (factory_id, channel_id, htlc_id)"
     ");";
 
-/* Add a column to a table if it does not have it yet.  Returns 1 if the
-   column is there afterwards. */
-static int persist_ensure_column(sqlite3 *db, const char *table,
-                                 const char *col, const char *decl) {
+/* 1 if the table has the column, 0 if not, -1 on error. */
+static int persist_has_column(sqlite3 *db, const char *table, const char *col) {
     char sql[256];
     snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
     sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
     int have = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *n = (const char *)sqlite3_column_text(st, 1);
         if (n && strcmp(n, col) == 0) { have = 1; break; }
     }
     sqlite3_finalize(st);
+    return have;
+}
+
+/* Add a column to a table if it does not have it yet.  Returns 1 if the
+   column is there afterwards. */
+static int persist_ensure_column(sqlite3 *db, const char *table,
+                                 const char *col, const char *decl) {
+    int have = persist_has_column(db, table, col);
+    if (have < 0) return 0;
     if (have) return 1;
+    char sql[256];
     snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;", table, col, decl);
     return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
 }
@@ -1450,6 +1460,44 @@ int persist_open(persist_t *p, const char *path) {
                 p->db = NULL;
                 return 0;
             }
+        }
+    }
+
+    /* An htlc_preimages_pending table keyed by channel and HTLC only gets
+       the factory generation added to its key.  Its rows belong to the
+       first generation.  The key changes, so the table is rebuilt rather
+       than altered. */
+    {
+        int have = persist_has_column(p->db, "htlc_preimages_pending",
+                                      "factory_id");
+        if (have == 0) {
+            const char *rebuild =
+                "BEGIN;"
+                "CREATE TABLE htlc_preimages_pending_new ("
+                "  factory_id INTEGER NOT NULL DEFAULT 0,"
+                "  channel_id INTEGER NOT NULL,"
+                "  htlc_id INTEGER NOT NULL,"
+                "  preimage TEXT NOT NULL,"
+                "  PRIMARY KEY (factory_id, channel_id, htlc_id));"
+                "INSERT INTO htlc_preimages_pending_new "
+                "  (factory_id, channel_id, htlc_id, preimage) "
+                "  SELECT 0, channel_id, htlc_id, preimage "
+                "  FROM htlc_preimages_pending;"
+                "DROP TABLE htlc_preimages_pending;"
+                "ALTER TABLE htlc_preimages_pending_new "
+                "  RENAME TO htlc_preimages_pending;"
+                "COMMIT;";
+            if (sqlite3_exec(p->db, rebuild, NULL, NULL, NULL) != SQLITE_OK)
+                have = -1;
+        }
+        if (have < 0) {
+            fprintf(stderr, "persist_open: migration v45 "
+                    "(htlc_preimages_pending) failed: %s\n",
+                    sqlite3_errmsg(p->db));
+            sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
         }
     }
 
@@ -2912,8 +2960,17 @@ int persist_load_remote_signed(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
-int persist_save_pending_preimage(persist_t *p, uint32_t channel_id,
-                                  uint64_t htlc_id,
+int persist_clear_channel_update_state(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    return persist_exec_channel(p,
+               "DELETE FROM remote_commitment_signed WHERE channel_id = ?;",
+               channel_id) &&
+           persist_exec_channel(p,
+               "DELETE FROM failed_channels WHERE channel_id = ?;", channel_id);
+}
+
+int persist_save_pending_preimage(persist_t *p, uint32_t factory_id,
+                                  uint32_t channel_id, uint64_t htlc_id,
                                   const unsigned char *preimage32) {
     if (!p || !p->db || !preimage32) return 0;
     char hex[65];
@@ -2924,12 +2981,13 @@ int persist_save_pending_preimage(persist_t *p, uint32_t channel_id,
     sqlite3_stmt *stmt;
     int ok = 0;
     if (sqlite3_prepare_v2(p->db,
-            "INSERT OR REPLACE INTO htlc_preimages_pending (channel_id, "
-            "htlc_id, preimage) VALUES (?, ?, ?);",
+            "INSERT OR REPLACE INTO htlc_preimages_pending (factory_id, "
+            "channel_id, htlc_id, preimage) VALUES (?, ?, ?, ?);",
             -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int(stmt, 1, (int)channel_id);
-        sqlite3_bind_int64(stmt, 2, (sqlite3_int64)htlc_id);
-        sqlite3_bind_text(stmt, 3, sealed, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)factory_id);
+        sqlite3_bind_int(stmt, 2, (int)channel_id);
+        sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
+        sqlite3_bind_text(stmt, 4, sealed, -1, SQLITE_TRANSIENT);
         ok = (sqlite3_step(stmt) == SQLITE_DONE);
         sqlite3_finalize(stmt);
     }
@@ -2937,22 +2995,24 @@ int persist_save_pending_preimage(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
-int persist_delete_pending_preimage(persist_t *p, uint32_t channel_id,
-                                    uint64_t htlc_id) {
+int persist_delete_pending_preimage(persist_t *p, uint32_t factory_id,
+                                    uint32_t channel_id, uint64_t htlc_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db,
-            "DELETE FROM htlc_preimages_pending WHERE channel_id = ? AND "
-            "htlc_id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+            "DELETE FROM htlc_preimages_pending WHERE factory_id = ? AND "
+            "channel_id = ? AND htlc_id = ?;", -1, &stmt, NULL) != SQLITE_OK)
         return 0;
-    sqlite3_bind_int(stmt, 1, (int)channel_id);
-    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)htlc_id);
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
 }
 
-size_t persist_load_pending_preimages(persist_t *p, uint32_t *channel_ids,
+size_t persist_load_pending_preimages(persist_t *p, uint32_t factory_id,
+                                      uint32_t *channel_ids,
                                       uint64_t *htlc_ids,
                                       unsigned char (*preimages)[32],
                                       size_t max) {
@@ -2960,8 +3020,10 @@ size_t persist_load_pending_preimages(persist_t *p, uint32_t *channel_ids,
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db,
             "SELECT channel_id, htlc_id, preimage FROM htlc_preimages_pending "
-            "ORDER BY channel_id, htlc_id;", -1, &stmt, NULL) != SQLITE_OK)
+            "WHERE factory_id = ? ORDER BY channel_id, htlc_id;", -1, &stmt,
+            NULL) != SQLITE_OK)
         return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)factory_id);
     size_t n = 0;
     while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
         const char *stored = (const char *)sqlite3_column_text(stmt, 2);

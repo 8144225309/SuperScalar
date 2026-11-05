@@ -468,6 +468,11 @@ int sweeper_add(sweeper_t *sw, sweep_type_t type,
     return sweeper_append(sw, &e);
 }
 
+void sweeper_set_factory(sweeper_t *sw, uint32_t factory_id)
+{
+    if (sw) sw->factory_id = factory_id;
+}
+
 void sweeper_set_channel_lookup(sweeper_t *sw,
     channel_t *(*get_channel)(void *arg, uint32_t channel_id), void *arg)
 {
@@ -543,12 +548,27 @@ static int claim_find_htlc(const channel_t *ch, uint64_t htlc_id,
     return 0;
 }
 
+/* An HTLC entry of channel channel_id of the current factory. */
+static int htlc_entry_of(const sweeper_t *sw, const sweep_entry_t *e,
+                         uint32_t channel_id)
+{
+    return e->type == SWEEP_HTLC_SUCCESS && e->channel_id == channel_id &&
+           e->factory_id == sw->factory_id;
+}
+
+/* An HTLC entry of a factory rotated away from: kept, not acted on. */
+static int htlc_entry_dormant(const sweeper_t *sw, const sweep_entry_t *e)
+{
+    return (e->type == SWEEP_HTLC_SUCCESS ||
+            e->type == SWEEP_HTLC_SUCCESS_OUTPUT) &&
+           e->factory_id != sw->factory_id;
+}
+
 static size_t sweeper_count_claims(const sweeper_t *sw, uint32_t channel_id)
 {
     size_t n = 0;
     for (size_t i = 0; i < sw->n_entries; i++)
-        if (sw->entries[i].type == SWEEP_HTLC_SUCCESS &&
-            sw->entries[i].channel_id == channel_id)
+        if (htlc_entry_of(sw, &sw->entries[i], channel_id))
             n++;
     return n;
 }
@@ -574,7 +594,7 @@ static int sweeper_known_preimage(const sweeper_t *sw, uint32_t channel_id,
 {
     for (size_t i = 0; i < sw->n_entries; i++) {
         const sweep_entry_t *x = &sw->entries[i];
-        if (x->type == SWEEP_HTLC_SUCCESS && x->channel_id == channel_id &&
+        if (htlc_entry_of(sw, x, channel_id) &&
             claim_has_preimage(x) && memcmp(x->payment_hash, hash32, 32) == 0) {
             memcpy(preimage_out, x->preimage, 32);
             return 1;
@@ -786,7 +806,7 @@ int sweeper_supply_preimage(sweeper_t *sw, uint32_t channel_id,
     int n = 0;
     for (size_t i = 0; i < sw->n_entries; i++) {
         sweep_entry_t *e = &sw->entries[i];
-        if (e->type != SWEEP_HTLC_SUCCESS || e->channel_id != channel_id ||
+        if (!htlc_entry_of(sw, e, channel_id) ||
             claim_has_preimage(e) || memcmp(e->payment_hash, hash, 32) != 0)
             continue;
         if (!sweeper_can_persist_now(sw)) return -1;
@@ -808,7 +828,7 @@ int sweeper_cancel_htlc_success(sweeper_t *sw, uint32_t channel_id,
     int removed = 0;
     for (size_t i = 0; i < sw->n_entries; ) {
         sweep_entry_t *e = &sw->entries[i];
-        if (e->type == SWEEP_HTLC_SUCCESS && e->channel_id == channel_id &&
+        if (htlc_entry_of(sw, e, channel_id) &&
             e->commitment_number == commitment_number &&
             e->state == SWEEP_PENDING && e->confirmed_height == 0) {
             sweeper_drop(sw, i);
@@ -967,7 +987,8 @@ static claim_seen_t *claim_seen_build(const sweeper_t *sw, size_t *n_out)
     size_t n = 0;
     for (size_t i = 0; i < sw->n_entries; i++)
         if (sw->entries[i].type == SWEEP_HTLC_SUCCESS &&
-            sw->entries[i].confirmed_height > 0)
+            sw->entries[i].confirmed_height > 0 &&
+            !htlc_entry_dormant(sw, &sw->entries[i]))
             n++;
     if (n == 0) return NULL;
     claim_seen_t *s = calloc(n, sizeof(*s));
@@ -975,7 +996,8 @@ static claim_seen_t *claim_seen_build(const sweeper_t *sw, size_t *n_out)
     size_t k = 0;
     for (size_t i = 0; i < sw->n_entries; i++) {
         const sweep_entry_t *e = &sw->entries[i];
-        if (e->type != SWEEP_HTLC_SUCCESS || e->confirmed_height == 0)
+        if (e->type != SWEEP_HTLC_SUCCESS || e->confirmed_height == 0 ||
+            htlc_entry_dormant(sw, e))
             continue;
         s[k].channel_id = e->channel_id;
         s[k].side = e->claim_side;
@@ -1214,6 +1236,11 @@ int sweeper_check(sweeper_t *sw)
 
     for (size_t i = 0; i < sw->n_entries; ) {
         sweep_entry_t *e = &sw->entries[i];
+
+        if (htlc_entry_dormant(sw, e)) {
+            i++;
+            continue;
+        }
 
         /* A watched claim (no preimage yet) costs no chain lookup.  It goes
            once its commitment is revoked or superseded, or its HTLC has

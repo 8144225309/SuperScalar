@@ -369,15 +369,21 @@ int persist_load_remote_signed(persist_t *p, uint32_t channel_id,
 /* Preimages of HTLCs a client offered us that we could not yet arm an
    on-chain claim for (sealed at rest): kept until a claim is armed or the
    HTLC is settled.  Load returns the number of rows (at most max). */
-int persist_save_pending_preimage(persist_t *p, uint32_t channel_id,
-                                  uint64_t htlc_id,
+int persist_save_pending_preimage(persist_t *p, uint32_t factory_id,
+                                  uint32_t channel_id, uint64_t htlc_id,
                                   const unsigned char *preimage32);
-int persist_delete_pending_preimage(persist_t *p, uint32_t channel_id,
-                                    uint64_t htlc_id);
-size_t persist_load_pending_preimages(persist_t *p, uint32_t *channel_ids,
+int persist_delete_pending_preimage(persist_t *p, uint32_t factory_id,
+                                    uint32_t channel_id, uint64_t htlc_id);
+size_t persist_load_pending_preimages(persist_t *p, uint32_t factory_id,
+                                      uint32_t *channel_ids,
                                       uint64_t *htlc_ids,
                                       unsigned char (*preimages)[32],
                                       size_t max);
+
+/* Forget the update state a channel id carried in the factory before a
+   rotation: the commitment last signed for it (remote_commitment_signed)
+   and its failed mark (failed_channels).  Returns 1 on success. */
+int persist_clear_channel_update_state(persist_t *p, uint32_t channel_id);
 
 /* Return all channel ids currently stored, in ascending order. */
 /* CL4: enumerate ps_leaf_chains and ps_subfactory_chains keys for

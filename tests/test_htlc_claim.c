@@ -57,6 +57,8 @@
  *   test_htlc_claim_failed_mark_without_row  failed mark without a row
  *   test_htlc_claim_unarmed_preimage_kept preimage kept when no claim arms
  *   test_htlc_claim_failed_rotation_ready failed channel, rotation goes on
+ *   test_htlc_claim_stale_signed_record_keeps_channel  far-ahead record: refused, kept
+ *   test_htlc_claim_rotation_restart_no_stale  rotation + restart: nothing stale
  *   test_htlc_claim_bridge_result_during_payee_wait   pay result queued
  *   test_htlc_claim_bridge_result_during_sender_wait  same, sender wait
  *   test_htlc_claim_lsp_sibling_reorg     LSP claim survives a reorg
@@ -3795,13 +3797,13 @@ int test_htlc_claim_unarmed_preimage_kept(void)
     uint32_t ch[4];
     uint64_t id[4];
     unsigned char pre[4][32];
-    TEST_ASSERT(persist_load_pending_preimages(&n.db, ch, id, pre, 4) == 1 &&
+    TEST_ASSERT(persist_load_pending_preimages(&n.db, 0, ch, id, pre, 4) == 1 &&
                 ch[0] == 0 && id[0] == n.s.lsp_htlc_id &&
                 memcmp(pre[0], n.s.preimage, 32) == 0, "preimage on disk");
     TEST_ASSERT(sweeper_pending_claims(&n.sw) == 0, "no claim yet");
     lsp_channels_retry_pending_preimages(n.mgr);
     TEST_ASSERT(sweeper_pending_claims(&n.sw) == 1, "claim armed on retry");
-    TEST_ASSERT(persist_load_pending_preimages(&n.db, ch, id, pre, 4) == 0,
+    TEST_ASSERT(persist_load_pending_preimages(&n.db, 0, ch, id, pre, 4) == 0,
                 "and the stored preimage dropped");
     mk_put(&n.m, n.s_commit_hex, 100);
     sweeper_check(&n.sw);
@@ -3860,6 +3862,136 @@ int test_htlc_claim_failed_rotation_ready(void)
     en[0].channel.revocation_failed = CHANNEL_FAILED_DURABLE;
     en[1].channel.revocation_failed = CHANNEL_FAILED_DURABLE;
     TEST_ASSERT(!lsp_rotation_clients_ready(&mgr), "nobody left to rotate");
+    return 1;
+}
+
+/* Client 0 adds X to its channel and revokes the commitment before; the
+   LSP handles the add (forwarding it to client 1). */
+static void lspnet_sender_adds(lspnet_t *n, unsigned char fill)
+{
+    unsigned char hx[32];
+    memset(hx, fill, 32);
+    uint64_t cid;
+    channel_add_htlc(&n->s.cli, HTLC_OFFERED, 3000, hx, 600, &cid);
+    shutdown(n->cli_fd[1], SHUT_WR);
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 600);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    client_send_raa(&n->s, n->cli_fd[0], 0, 0);
+    lsp_channels_handle_msg(n->mgr, n->lsp, 0, &add);
+    cJSON_Delete(add.json);
+}
+
+/* A commitment record the LSP reloads that is far ahead of the channel
+   (here left by an older channel at the same index) never fails the
+   channel: an update that would sign at that number is refused instead. */
+int test_htlc_claim_stale_signed_record_keeps_channel(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: channel at commitment 1");
+    n.mgr->entries[1].ready = 1;
+    unsigned char old_txid[32];
+    memset(old_txid, 0x6E, 32);
+    TEST_ASSERT(persist_save_remote_signed(&n.db, 0, 57, old_txid),
+                "a record of commitment 57");
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "channels row at commitment 1");
+    lsp_channels_load_update_state(n.mgr, &n.db); /* as after a restart */
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    TEST_ASSERT(en->has_signed && en->signed_cn == 57, "record reloaded");
+    lspnet_sender_adds(&n, 0x4C);
+    TEST_ASSERT(!en->channel.revocation_failed &&
+                !persist_channel_is_failed(&n.db, 0),
+                "the channel is not failed by the record");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A rotation re-creates the channels under the same ids.  What the old
+   factory's channels left on disk under those ids (the commitment last
+   signed, a failed mark) is cleared in the transaction that persists the
+   new channels; its HTLC claims and stored preimages are kept, scoped to
+   its factory generation, and not acted on for the new channels.  After a
+   restart the new channels work: an honest update is signed, nothing is
+   failed, and nothing of the old factory is cancelled or consumed. */
+int test_htlc_claim_rotation_restart_no_stale(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    n.mgr->entries[1].ready = 1;
+
+    /* The old factory: channel 0 signed up to 57, channel 1 failed, a
+       claim of A armed on channel 0, a preimage stored for channel 0. */
+    unsigned char old_txid[32], old_pre[32];
+    memset(old_txid, 0x6E, 32);
+    memset(old_pre, 0x2A, 32);
+    TEST_ASSERT(persist_save_remote_signed(&n.db, 0, 57, old_txid) &&
+                persist_mark_channel_failed(&n.db, 1, "old factory", 0),
+                "old records");
+    TEST_ASSERT(lsp_channels_secure_preimage(n.mgr, n.lsp, 0, n.s.lsp_htlc_id,
+                                             n.s.preimage) &&
+                sweeper_pending_claims(&n.sw) == 1, "old claim armed");
+    TEST_ASSERT(persist_save_pending_preimage(&n.db, 0, 0, 99, old_pre),
+                "old stored preimage");
+    size_t old_entries = n.sw.n_entries;
+
+    /* The rotation persists the new channels (here the same objects stand
+       for them), then the LSP restarts. */
+    TEST_ASSERT(lsp_rotation_persist_channels(n.mgr) &&
+                n.mgr->factory_gen == 1 && n.sw.factory_id == 1,
+                "new channels persisted, generation 1");
+    for (int c = 0; c < 2; c++) {
+        lsp_channel_entry_t *e = &n.mgr->entries[c];
+        e->has_signed = 0;
+        e->signed_cn = 0;
+        e->channel.revocation_failed = 0;
+        e->fail_recoverable = 0;
+    }
+    n.mgr->factory_gen = 0;
+    sweeper_cleanup(&n.sw);
+    TEST_ASSERT(sweeper_init(&n.sw, ctx, NULL, NULL, 0, &n.m.base, &n.db,
+                             NULL), "sweeper reloaded");
+    lsp_channels_load_update_state(n.mgr, &n.db);
+    TEST_ASSERT(lsp_channels_attach_sweeper(n.mgr, &n.sw), "attached");
+    TEST_ASSERT(n.mgr->factory_gen == 1 && n.sw.factory_id == 1,
+                "generation reloaded");
+    TEST_ASSERT(!n.mgr->entries[0].has_signed &&
+                !n.mgr->entries[1].channel.revocation_failed,
+                "no stale record or failure reloaded");
+    TEST_ASSERT(n.sw.n_entries == old_entries,
+                "the old factory's claim entries kept");
+    mk_put(&n.m, n.s_commit_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == 0,
+                "an old factory's claim is not built from the new channel");
+
+    lspnet_sender_adds(&n, 0x4D);
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    unsigned char secret[32];
+    TEST_ASSERT(en->channel.commitment_number == 2 && en->has_signed &&
+                en->signed_cn == 2 && !en->channel.revocation_failed &&
+                channel_get_received_revocation(&en->channel, 1, secret),
+                "an honest add signed and revoked on the new channel");
+    size_t old_left = 0;
+    for (size_t i = 0; i < n.sw.n_entries; i++)
+        old_left += n.sw.entries[i].factory_id == 0;
+    TEST_ASSERT(old_left == old_entries,
+                "the old claims not cancelled by the new revocation");
+    lsp_channels_retry_pending_preimages(n.mgr);
+    uint32_t ch[4];
+    uint64_t id[4];
+    unsigned char pre[4][32];
+    TEST_ASSERT(persist_load_pending_preimages(&n.db, 0, ch, id, pre, 4) == 1 &&
+                persist_load_pending_preimages(&n.db, 1, ch, id, pre, 4) == 0,
+                "the old stored preimage kept, not taken for the new channel");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 
@@ -4483,5 +4615,153 @@ int test_regtest_htlc_claim_client_payee(void)
     sweeper_cleanup(&sw);
     pair_cleanup(&p);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A reconnect one behind a signed commitment rolls the channel back in
+   memory.  On the rolled-back channel only the set-aside commitment may
+   be signed, so settling an HTLC back to the sender is refused: no
+   preimage goes out on that connection, nothing is marked failed, and
+   the claim on the sender's commitment stays armed. */
+int test_htlc_claim_rollback_reveals_nothing(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup: sender on commitment 1");
+    lspnet_client_pubkeys(&n);
+    TEST_ASSERT(persist_save_channel(&n.db, &n.mgr->entries[0].channel, 0, 0),
+                "sender channel row");
+    lsp_channel_entry_t *en = &n.mgr->entries[0];
+    channel_t *sc = &en->channel;
+
+    /* The LSP signs commitment 2 for an add; the sender does not revoke 1. */
+    n.mgr->entries[1].ready = 1;
+    unsigned char hx[32];
+    memset(hx, 0x5D, 32);
+    uint64_t cid;
+    TEST_ASSERT(channel_add_htlc(&n.s.cli, HTLC_OFFERED, 3000, hx, 600, &cid),
+                "client adds an HTLC");
+    shutdown(n.cli_fd[0], SHUT_WR);
+    wire_msg_t add;
+    add.msg_type = MSG_UPDATE_ADD_HTLC;
+    add.json = wire_build_update_add_htlc(cid, 3000 * 1000, hx, 600);
+    cJSON_AddNumberToObject(add.json, "dest_client", 1);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 0, &add);
+    cJSON_Delete(add.json);
+    TEST_ASSERT(sc->commitment_number == 2 && en->has_signed &&
+                en->signed_cn == 2 && !sc->revocation_failed &&
+                en->pending_revoke, "signed 2, 1 unrevoked, channel open");
+
+    /* A reconnect reporting commitment 1. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(lspnet_reconnect_msgs(&n.s, sv[1], 1, 1), "reconnect at 1");
+    lsp_channels_handle_reconnect(n.mgr, n.lsp, sv[0]);
+    TEST_ASSERT(!sc->revocation_failed && !persist_channel_is_failed(&n.db, 0),
+                "not failed, nothing persisted");
+    TEST_ASSERT(sc->commitment_number == 1 && en->rolled_back,
+                "rolled back in memory, commitment 2 set aside");
+
+    /* The payee fulfils: settling back to the sender is refused. */
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils");
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(drain_count(sv[1], MSG_UPDATE_FULFILL_HTLC) == 0,
+                "no preimage on the rolled-back channel");
+    TEST_ASSERT(!persist_channel_is_failed(&n.db, 0),
+                "still not marked failed");
+    TEST_ASSERT(sweeper_pending_claims(&n.sw) >= 1,
+                "the HTLC is still claimable on chain");
+    close(sv[1]);
+    free(n.lsp->client_pubkeys);
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* After a rotation, a claim armed in the previous factory generation is
+   kept but never built against the new factory's channel, whose keys are
+   different. */
+int test_htlc_claim_rotation_claim_dormant(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    lspnet_t n;
+    TEST_ASSERT(lspnet_init(&n, ctx), "setup");
+    wire_msg_t msg;
+    TEST_ASSERT(payee_fulfils(&n, &msg), "payee fulfils");
+    shutdown(n.cli_fd[0], SHUT_WR);
+    lsp_channels_handle_msg(n.mgr, n.lsp, 1, &msg);
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(n.sw.n_entries == 1 && n.sw.entries[0].factory_id == 0,
+                "claim armed in generation 0");
+    size_t sent_before = n.m.n_sent;
+
+    sweeper_set_factory(&n.sw, 1);
+    n.mgr->factory_gen = 1;
+
+    mk_put(&n.m, n.s_commit_hex, 100);
+    sweeper_check(&n.sw);
+    TEST_ASSERT(n.m.n_sent == sent_before,
+                "no claim built against the new factory");
+    TEST_ASSERT(n.sw.n_entries == 1, "the entry is kept");
+    lspnet_free(&n);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A database whose htlc_preimages_pending table is keyed by channel and
+   HTLC only is upgraded on open: its rows move to generation 0 and the
+   same channel and HTLC can then be stored for another generation. */
+int test_htlc_claim_preimage_table_upgraded(void)
+{
+    char path[] = "/tmp/ss_htlc_pre_mig_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0, "tmp");
+    close(fd);
+    {
+        sqlite3 *db;
+        TEST_ASSERT(sqlite3_open(path, &db) == SQLITE_OK, "open raw");
+        TEST_ASSERT(sqlite3_exec(db,
+            "CREATE TABLE htlc_preimages_pending ("
+            "  channel_id INTEGER NOT NULL,"
+            "  htlc_id INTEGER NOT NULL,"
+            "  preimage TEXT NOT NULL,"
+            "  PRIMARY KEY (channel_id, htlc_id));"
+            "INSERT INTO htlc_preimages_pending VALUES (3, 7, 'old');",
+            NULL, NULL, NULL) == SQLITE_OK, "old table with a row");
+        sqlite3_close(db);
+    }
+
+    persist_t p;
+    TEST_ASSERT(persist_open(&p, path), "open upgrades the table");
+    sqlite3_stmt *st;
+    TEST_ASSERT(sqlite3_prepare_v2(p.db,
+        "SELECT factory_id, preimage FROM htlc_preimages_pending "
+        "WHERE channel_id = 3 AND htlc_id = 7;", -1, &st, NULL) == SQLITE_OK,
+        "query");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "old row kept");
+    TEST_ASSERT(sqlite3_column_int(st, 0) == 0, "old row in generation 0");
+    sqlite3_finalize(st);
+
+    unsigned char pre[32];
+    memset(pre, 0xA7, 32);
+    TEST_ASSERT(persist_save_pending_preimage(&p, 1, 3, 7, pre),
+                "store the same HTLC for generation 1");
+    TEST_ASSERT(sqlite3_prepare_v2(p.db,
+        "SELECT COUNT(*) FROM htlc_preimages_pending "
+        "WHERE channel_id = 3 AND htlc_id = 7;", -1, &st, NULL) == SQLITE_OK,
+        "count");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW &&
+                sqlite3_column_int(st, 0) == 2,
+                "both generations kept");
+    sqlite3_finalize(st);
+    persist_close(&p);
+
+    TEST_ASSERT(persist_open(&p, path), "reopen leaves the table as is");
+    persist_close(&p);
+    unlink(path);
     return 1;
 }

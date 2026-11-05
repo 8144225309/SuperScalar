@@ -179,7 +179,8 @@ int lsp_channels_watch_commitment(lsp_channel_mgr_t *mgr, size_t client_idx) {
             ch->htlcs[h].direction != HTLC_RECEIVED)
             continue;
         if (sweeper_watch_htlc((sweeper_t *)mgr->sweeper, ch,
-                               (uint32_t)client_idx, 0, ch->htlcs[h].id) < 0)
+                               (uint32_t)client_idx, mgr->factory_gen,
+                               ch->htlcs[h].id) < 0)
             ok = 0;
     }
     if (!ok)
@@ -685,6 +686,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
        re-init (rotation): without the sweeper no claim would be armed
        before a preimage goes out. */
     void *saved_sweeper = mgr->sweeper;
+    uint32_t saved_gen = mgr->factory_gen;
     void *saved_deferred = mgr->deferred_bridge;
     size_t saved_n_deferred = mgr->n_deferred_bridge;
     size_t saved_deferred_cap = mgr->deferred_bridge_cap;
@@ -694,6 +696,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     mgr->fee = saved_fee;
     mgr->persist = saved_persist;
     mgr->sweeper = saved_sweeper;
+    mgr->factory_gen = saved_gen;
     mgr->deferred_bridge = saved_deferred;
     mgr->n_deferred_bridge = saved_n_deferred;
     mgr->deferred_bridge_cap = saved_deferred_cap;
@@ -5986,7 +5989,8 @@ static void settle_known_preimages(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 int armed = 0;
                 for (size_t k = 0; k < 32; k++) armed |= e->preimage[k];
                 if (e->type == SWEEP_HTLC_SUCCESS && e->channel_id == idx &&
-                    armed && memcmp(e->payment_hash, x->payment_hash, 32) == 0) {
+                    e->factory_id == mgr->factory_gen && armed &&
+                    memcmp(e->payment_hash, x->payment_hash, 32) == 0) {
                     memcpy(pre, e->preimage, 32);
                     id = x->id;
                     found = 1;
@@ -8355,6 +8359,7 @@ int lsp_channels_attach_sweeper(lsp_channel_mgr_t *mgr, void *sweeper)
     if (!mgr || !sweeper) return 0;
     sweeper_set_channel_lookup((sweeper_t *)sweeper, lsp_sweeper_get_channel,
                                mgr);
+    sweeper_set_factory((sweeper_t *)sweeper, mgr->factory_gen);
     mgr->sweeper = sweeper;
     return 1;
 }
@@ -8373,7 +8378,7 @@ int lsp_channels_register_htlc_claim(lsp_channel_mgr_t *mgr, size_t idx,
     if (r == 0)
         r = sweeper_add_htlc_success((sweeper_t *)mgr->sweeper,
                                      &mgr->entries[idx].channel,
-                                     (uint32_t)idx, 0,
+                                     (uint32_t)idx, mgr->factory_gen,
                                      HTLC_CLAIM_REMOTE_COMMIT, htlc_id,
                                      preimage32);
     if (r < 0)
@@ -8438,7 +8443,8 @@ int lsp_channels_secure_preimage(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         lsp_channels_register_htlc_claim(mgr, idx, htlc_id, preimage32) >= 0) {
         if (mgr->persist)
             persist_delete_pending_preimage((persist_t *)mgr->persist,
-                                            (uint32_t)idx, htlc_id);
+                                            mgr->factory_gen, (uint32_t)idx,
+                                            htlc_id);
         return 1;
     }
     /* Keep the preimage on disk until a claim is armed (retried by
@@ -8446,7 +8452,8 @@ int lsp_channels_secure_preimage(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        client: its channel must close on chain. */
     if (!mgr->persist ||
         !persist_save_pending_preimage((persist_t *)mgr->persist,
-                                       (uint32_t)idx, htlc_id, preimage32))
+                                       mgr->factory_gen, (uint32_t)idx,
+                                       htlc_id, preimage32))
         fprintf(stderr, "LSP: CRITICAL: could not store the preimage of HTLC "
                 "%llu of client %zu either\n", (unsigned long long)htlc_id,
                 idx);
@@ -8563,7 +8570,8 @@ void lsp_channels_retry_pending_preimages(lsp_channel_mgr_t *mgr)
     uint64_t ids[MAXP];
     unsigned char (*pres)[32] = calloc(MAXP, 32);
     if (!pres) return;
-    size_t n = persist_load_pending_preimages(db, chans, ids, pres, MAXP);
+    size_t n = persist_load_pending_preimages(db, mgr->factory_gen, chans,
+                                              ids, pres, MAXP);
     for (size_t k = 0; k < n; k++) {
         size_t idx = chans[k];
         unsigned char hash[32];
@@ -8586,7 +8594,8 @@ void lsp_channels_retry_pending_preimages(lsp_channel_mgr_t *mgr)
                     "armed\n", (unsigned long long)ids[k], idx);
         }
         if (done) {
-            persist_delete_pending_preimage(db, chans[k], ids[k]);
+            persist_delete_pending_preimage(db, mgr->factory_gen, chans[k],
+                                            ids[k]);
             for (size_t o = 0; o < mgr->n_htlc_origins; o++) {
                 htlc_origin_t *org = &mgr->htlc_origins[o];
                 if (org->active && org->sender_idx == idx &&

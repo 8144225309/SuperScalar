@@ -121,6 +121,19 @@ void lsp_channels_update_end(lsp_update_t *u);
 int lsp_channels_take_late_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                       size_t client_idx, const wire_msg_t *ack);
 
+/* Load what lsp_channels_init_from_db restores of mgr's update state from
+   db (persist_t *): the factory generation, and each channel's failed mark
+   and the commitment last signed for it. */
+void lsp_channels_load_update_state(lsp_channel_mgr_t *mgr, void *db);
+
+/* Persist the channels a rotation has just set up, in one transaction:
+   their rows and basepoints, the update state the old factory's channels
+   left under the same ids cleared (persist_clear_channel_update_state),
+   and the next factory generation, which then scopes the sweeper's HTLC
+   entries and the stored preimages (the old factory's are kept, not
+   acted on).  Returns 1 on success; on failure nothing is written. */
+int lsp_rotation_persist_channels(lsp_channel_mgr_t *mgr);
+
 /* Free what updates still waiting for a revocation keep (cleanup and
    rotation). */
 void lsp_channels_drop_pending_updates(lsp_channel_mgr_t *mgr);

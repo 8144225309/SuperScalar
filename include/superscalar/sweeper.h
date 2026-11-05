@@ -122,6 +122,11 @@ typedef struct {
        claims and their output sweeps).  NULL = tracking only. */
     channel_t       *(*get_channel)(void *arg, uint32_t channel_id);
     void             *get_channel_arg;
+    /* The factory (generation) whose channels get_channel and the channel
+       ids of the per-channel calls below refer to.  HTLC entries of another
+       factory (one rotated away from) are kept but not acted on: its
+       channels, and their keys, are no longer there. */
+    uint32_t          factory_id;
 } sweeper_t;
 
 /* Initialize the sweeper. Loads pending sweeps from DB.
@@ -165,6 +170,10 @@ int sweeper_add(sweeper_t *sw, sweep_type_t type,
                 uint32_t csv_delay,
                 uint32_t channel_id, uint32_t factory_id,
                 uint64_t commitment_number);
+
+/* Set the factory whose channels the channel ids refer to (see
+   sweeper_t.factory_id). */
+void sweeper_set_factory(sweeper_t *sw, uint32_t factory_id);
 
 /* Set the channel lookup used to build HTLC-success claims. */
 void sweeper_set_channel_lookup(sweeper_t *sw,

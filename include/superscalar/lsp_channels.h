@@ -206,6 +206,10 @@ typedef struct {
 
     /* Sweeper: auto-sweep timelocked outputs after force-close */
     void *sweeper;    /* sweeper_t* or NULL — avoids header dependency */
+    /* Rotations so far (persisted counter "factory_generation"): the
+       sweeper's HTLC entries and the stored preimages of a channel id are
+       those of the current factory's channel. */
+    uint32_t factory_gen;
 
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;

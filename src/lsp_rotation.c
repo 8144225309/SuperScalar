@@ -13,6 +13,7 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
 #include "superscalar/readiness.h"
+#include "superscalar/sweeper.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1229,40 +1230,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
        watchtower_watch_revoked_commitment. */
 
     /* Persist new channel state (transactional) */
-    if (mgr->persist) {
-        persist_t *db = (persist_t *)mgr->persist;
-        if (!persist_begin(db)) {
-            fprintf(stderr, "LSP rotate: persist_begin failed for channels\n");
-            return 0;
-        }
-        int ch_ok = 1;
-        for (size_t c = 0; c < mgr->n_channels; c++) {
-            channel_t *ch = &mgr->entries[c].channel;
-            if (!persist_save_channel(db, ch, 0, (uint32_t)c) ||
-                !persist_save_basepoints(db, (uint32_t)c, ch)) {
-                ch_ok = 0;
-                break;
-            }
-            /* Persist remote PCPs (cn=0,1) so reconnect doesn't load
-               stale values from the old channel at the same slot. */
-            unsigned char pcp_ser[33];
-            size_t pcp_len = 33;
-            secp256k1_pubkey pcp;
-            if (channel_get_remote_pcp(ch, 0, &pcp) &&
-                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
-                    &pcp, SECP256K1_EC_COMPRESSED))
-                persist_save_remote_pcp(db, (uint32_t)c, 0, pcp_ser);
-            pcp_len = 33;
-            if (channel_get_remote_pcp(ch, 1, &pcp) &&
-                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
-                    &pcp, SECP256K1_EC_COMPRESSED))
-                persist_save_remote_pcp(db, (uint32_t)c, 1, pcp_ser);
-        }
-        if (ch_ok) {
-            persist_commit(db);
-        } else {
-            fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
-            persist_rollback(db);
+    if (!lsp_rotation_persist_channels(mgr)) {
+        if (mgr->persist) {
             if (rot_cer_persisted) {
                 persist_update_ceremony_state(rot_db, rot_cer_id,
                                                PERSIST_CEREMONY_STATE_ABORTED);
@@ -1301,6 +1270,55 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     printf("LSP rotate: rotation complete — new factory active with %zu channels\n",
            mgr->n_channels);
+    return 1;
+}
+
+int lsp_rotation_persist_channels(lsp_channel_mgr_t *mgr) {
+    uint32_t gen = mgr->factory_gen + 1;
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        if (!persist_begin(db)) {
+            fprintf(stderr, "LSP rotate: persist_begin failed for channels\n");
+            return 0;
+        }
+        int ch_ok = 1;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            channel_t *ch = &mgr->entries[c].channel;
+            /* The old factory's channel at this id: what it signed, and
+               whether it failed, does not carry over to the new one. */
+            if (!persist_save_channel(db, ch, 0, (uint32_t)c) ||
+                !persist_save_basepoints(db, (uint32_t)c, ch) ||
+                !persist_clear_channel_update_state(db, (uint32_t)c)) {
+                ch_ok = 0;
+                break;
+            }
+            /* Persist remote PCPs (cn=0,1) so reconnect doesn't load
+               stale values from the old channel at the same slot. */
+            unsigned char pcp_ser[33];
+            size_t pcp_len = 33;
+            secp256k1_pubkey pcp;
+            if (channel_get_remote_pcp(ch, 0, &pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
+                    &pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)c, 0, pcp_ser);
+            pcp_len = 33;
+            if (channel_get_remote_pcp(ch, 1, &pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
+                    &pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)c, 1, pcp_ser);
+        }
+        if (ch_ok && !persist_save_counter(db, "factory_generation", gen))
+            ch_ok = 0;
+        if (!ch_ok) {
+            fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
+            persist_rollback(db);
+            return 0;
+        }
+        persist_commit(db);
+    }
+    mgr->factory_gen = gen;
+    if (mgr->sweeper)
+        sweeper_set_factory((sweeper_t *)mgr->sweeper, gen);
     return 1;
 }
 
