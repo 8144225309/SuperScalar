@@ -715,8 +715,10 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
         }
         /* Unexpected non-PTLC message: queue to inbox so the daemon loop
            can process it, rather than silently discarding it. */
-        if (msg->msg_type == MSG_ERROR)
+        if (msg->msg_type == MSG_ERROR) {
+            client_note_lsp_error(msg);
             return 0;  /* propagate abort */
+        }
         if (inbox) {
             client_inbox_push(inbox, msg);
             msg->json = NULL;  /* inbox owns the json now */
@@ -3717,6 +3719,7 @@ int main(int argc, char *argv[]) {
         }
 
         while (!g_shutdown) {
+            client_reset_lsp_failed_channel();      /* per session */
             if (first_run || !use_db) {
                 ok = client_run_with_channels(ctx, &kp, host, port,
                                                 daemon_channel_cb, &cbd,
@@ -3739,6 +3742,12 @@ int main(int argc, char *argv[]) {
                 cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
                 fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
                         "to a proven-cheating LSP\n");
+                break;
+            }
+            /* The LSP failed our channel (it told us, at the time or on a
+               reconnect): close it on chain, which runs our HTLC claims. */
+            if (client_lsp_failed_channel()) {
+                cbd.force_close_requested = 1;
                 break;
             }
             if (!ok) {
@@ -3816,11 +3825,14 @@ int main(int argc, char *argv[]) {
             cbd.poison_db_path = db_path;
             cbd.scripted_actions   = actions;
             cbd.n_scripted_actions = n_actions;
+            client_reset_lsp_failed_channel();      /* per session */
             ok = client_run_with_channels(ctx, &kp, host, port,
                                           daemon_channel_cb, &cbd,
                                           sa_vfn, sa_vctx);
             client_set_htlc_live_channel(NULL);
             client_set_htlc_sweeper(NULL, 0);
+            if (client_lsp_failed_channel())
+                cbd.force_close_requested = 1;
             if (cbd.force_close_requested) {
                 char fc_txid[65] = "";
                 client_force_close_from_db(db_path, network, cli_path,

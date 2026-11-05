@@ -1200,6 +1200,7 @@ extern int test_htlc_claim_late_revocation_keeps_claims(void);
 extern int test_htlc_claim_secure_watches_commitment(void);
 extern int test_htlc_claim_pong_before_raa_keeps_sender(void);
 extern int test_htlc_claim_strays_before_raa(void);
+extern int test_htlc_claim_client_told_failed(void);
 extern int test_htlc_claim_failed_no_lsp_revocation(void);
 extern int test_htlc_claim_failed_mark_without_row(void);
 extern int test_htlc_claim_unarmed_preimage_kept(void);
@@ -3891,6 +3892,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_claim_secure_watches_commitment);
     RUN_TEST(test_htlc_claim_pong_before_raa_keeps_sender);
     RUN_TEST(test_htlc_claim_strays_before_raa);
+    RUN_TEST(test_htlc_claim_client_told_failed);
     RUN_TEST(test_htlc_claim_failed_no_lsp_revocation);
     RUN_TEST(test_htlc_claim_failed_mark_without_row);
     RUN_TEST(test_htlc_claim_unarmed_preimage_kept);

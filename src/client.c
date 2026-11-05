@@ -180,12 +180,33 @@ static void client_check_conservation(const channel_t *ch, const char *context) 
     }
 }
 
+static int g_lsp_failed_channel = 0;
+
+int client_note_lsp_error(const wire_msg_t *msg) {
+    if (!msg || msg->msg_type != MSG_ERROR || !msg->json) return 0;
+    cJSON *m = cJSON_GetObjectItem(msg->json, "message");
+    if (!m || !cJSON_IsString(m) ||
+        strncmp(m->valuestring, WIRE_ERROR_CHANNEL_FAILED,
+                strlen(WIRE_ERROR_CHANNEL_FAILED)) != 0)
+        return 0;
+    if (!g_lsp_failed_channel)
+        fprintf(stderr, "Client: CRITICAL: the LSP failed our channel (%s): "
+                "closing it on chain\n", m->valuestring);
+    g_lsp_failed_channel = 1;
+    return 1;
+}
+
+int client_lsp_failed_channel(void) { return g_lsp_failed_channel; }
+
+void client_reset_lsp_failed_channel(void) { g_lsp_failed_channel = 0; }
+
 /* Returns 1 if message is MSG_ERROR (and prints it), 0 otherwise */
 static int check_msg_error(const wire_msg_t *msg) {
     if (msg->msg_type == MSG_ERROR) {
         cJSON *m = cJSON_GetObjectItem(msg->json, "message");
         fprintf(stderr, "Client: LSP error: %s\n",
                 (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
+        client_note_lsp_error(msg);
         return 1;
     }
     return 0;
@@ -274,6 +295,9 @@ int client_handle_async_msg(const wire_msg_t *msg) {
         }
         return 1;
     }
+    /* The LSP failed our channel: noted, the session ends when it hangs up. */
+    if (client_note_lsp_error(msg))
+        return 1;
     return 0;
 }
 

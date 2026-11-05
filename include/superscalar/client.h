@@ -176,6 +176,17 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
    client daemon dispatch so both handle them identically. */
 int client_handle_async_msg(const wire_msg_t *msg);
 
+/* An MSG_ERROR from the LSP saying it failed our channel
+   (WIRE_ERROR_CHANNEL_FAILED): the channel is to be closed on chain.
+   client_note_lsp_error records it (returns 1 if msg is one);
+   client_lsp_failed_channel reports whether one was seen;
+   client_reset_lsp_failed_channel forgets it.  It holds for one session
+   with the LSP: the daemon resets it before each connection (the LSP
+   says it again on every reconnect to a failed channel). */
+int client_note_lsp_error(const wire_msg_t *msg);
+int client_lsp_failed_channel(void);
+void client_reset_lsp_failed_channel(void);
+
 /* Send FULFILL_HTLC to LSP (reveal preimage for received HTLC).
    If an HTLC sweeper is set, first registers an on-chain claim of the HTLC
    from our own commitment, which still holds it until the LSP signs the

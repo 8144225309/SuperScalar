@@ -52,6 +52,7 @@
  *   test_htlc_claim_secure_watches_commitment  securing watches the rest
  *   test_htlc_claim_pong_before_raa_keeps_sender  PONG before the revocation
  *   test_htlc_claim_strays_before_raa  strays in every revocation wait
+ *   test_htlc_claim_client_told_failed    the client takes the LSP's error
  *   test_htlc_claim_failed_no_lsp_revocation  none on a failed channel
  *   test_htlc_claim_failed_mark_without_row  failed mark without a row
  *   test_htlc_claim_unarmed_preimage_kept preimage kept when no claim arms
@@ -3701,6 +3702,28 @@ int test_htlc_claim_strays_before_raa(void)
         lspnet_free(&n);
     }
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The client takes the LSP's word that it failed the channel: the error
+   is recognised wherever it arrives (here: the async notification path the
+   daemon loop uses), and the daemon then force-closes. */
+int test_htlc_claim_client_told_failed(void)
+{
+    client_reset_lsp_failed_channel();
+    wire_msg_t m;
+    m.msg_type = MSG_ERROR;
+    m.json = wire_build_error("some other error");
+    TEST_ASSERT(!client_handle_async_msg(&m) && !client_lsp_failed_channel(),
+                "another error is not taken for it");
+    cJSON_Delete(m.json);
+    m.json = wire_build_error(WIRE_ERROR_CHANNEL_FAILED ": no revocation; "
+                              "close the channel on chain");
+    TEST_ASSERT(client_handle_async_msg(&m) && client_lsp_failed_channel(),
+                "the channel-failed error is noted");
+    cJSON_Delete(m.json);
+    client_reset_lsp_failed_channel();
+    TEST_ASSERT(!client_lsp_failed_channel(), "reset");
     return 1;
 }
 
