@@ -103,6 +103,7 @@ typedef struct {
     /* Continuous ladder rotation (set once at daemon startup) */
     unsigned char rot_lsp_seckey[32];
     void *rot_fee_est;              /* fee_estimator_t* — avoids header dependency */
+    uint64_t rot_tree_fee_rate;     /* --tree-fee-rate for rotated factories (0 = estimator) */
     unsigned char rot_fund_spk[34];
     size_t rot_fund_spk_len;
     char rot_fund_addr[128];

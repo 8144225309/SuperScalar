@@ -396,7 +396,8 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                saved_n_level_arity * sizeof(uint8_t));
     uint32_t saved_static_threshold = f->static_threshold_depth;
     uint32_t saved_ps_subfactory_arity = f->ps_subfactory_arity;
-    uint64_t saved_fee_per_tx = f->fee_per_tx;
+    uint64_t saved_tree_fee_rate = f->tree_fee_rate;
+    fee_estimator_t *saved_fee_est = f->fee;
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
     /* f has not been through factory_init yet: it is either zeroed (lsp_init),
@@ -437,8 +438,11 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         factory_set_static_near_root(f, saved_static_threshold);
     if (saved_ps_subfactory_arity > 1)
         factory_set_ps_subfactory_arity(f, saved_ps_subfactory_arity);
-    if (saved_fee_per_tx > 200)
-        f->fee_per_tx = saved_fee_per_tx;
+    /* The tree fee rate must be known before the tree is built and signed:
+       factory_init_from_pubkeys cleared both the configured rate and the
+       estimator it falls back to. */
+    f->tree_fee_rate = saved_tree_fee_rate;
+    f->fee = saved_fee_est;
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
@@ -488,6 +492,20 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         fprintf(stderr, "LSP-stateless factory creation: factory_build_tree failed\n");
         return 0;
     }
+    if (!factory_check_tree_fees(f, FEE_PRESIGNED_FLOOR_SAT_PER_KVB, NULL)) {
+        fprintf(stderr, "LSP-stateless factory creation: tree pays below the "
+                "pre-signed fee floor\n");
+        return 0;
+    }
+    {
+        char why[200];
+        if (!factory_check_presigned_fee_bounds(f, why, sizeof(why))) {
+            fprintf(stderr, "LSP-stateless factory creation: refusing to sign: %s\n",
+                    why);
+            return 0;
+        }
+    }
+    printf("LSP: tree fee rate %llu sat/kvB\n", (unsigned long long)f->tree_fee_rate);
 
     /* Send FACTORY_PROPOSE to all clients (tree shape) */
     cJSON *propose = wire_build_factory_propose(f);
@@ -525,14 +543,21 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        net that lets ANYONE broadcast at the factory CLTV to pay every client
        when all parties go offline.  (Legacy rotation also re-signs it later.)
        Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
-    {
+    if (f->cltv_timeout > 0) {
         tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+        uint64_t dist_fee = factory_distribution_fee(f, f->n_participants - 1);
         size_t n_dist = factory_compute_distribution_outputs_balanced(f,
-            dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+            dist_outputs, FACTORY_MAX_SIGNERS + 1, dist_fee,
             lsp->dist_client_amounts, lsp->dist_n_client_amounts);
-        if (n_dist > 0 && f->cltv_timeout > 0)
-            (void)factory_build_distribution_tx_unsigned(
-                f, dist_outputs, n_dist, f->cltv_timeout);
+        if (n_dist == 0 ||
+            !factory_build_distribution_tx_unsigned(f, dist_outputs, n_dist,
+                                                    f->cltv_timeout)) {
+            fprintf(stderr, "LSP-stateless factory creation: cannot build the "
+                    "distribution TX (fee %llu sat, funding %llu sat); aborting\n",
+                    (unsigned long long)dist_fee,
+                    (unsigned long long)f->funding_amount_sats);
+            return 0;
+        }
     }
 
     /* ---- Reversed stateless signing exchange ---- */

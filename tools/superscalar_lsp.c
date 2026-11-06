@@ -274,6 +274,11 @@ static void usage(const char *prog) {
         "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
         "  --demo              Run demo payment sequence after channels ready\n"
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
+        "  --tree-fee-rate N   Fee rate in sat/kvB the factory tree's pre-signed txs are sized at\n"
+        "                      (default: the fee estimator's 6-block rate, at most\n"
+        "                      --max-tree-fee-rate; never below 1250)\n"
+        "  --max-tree-fee-rate N  Highest tree fee rate in sat/kvB; must match the clients'\n"
+        "                      --max-tree-fee-rate (default 100000; 0 = none)\n"
         "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
@@ -1397,6 +1402,7 @@ int main(int argc, char *argv[]) {
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
     uint64_t fee_rate = 1000;  /* sat/kvB, default 1 sat/vB */
+    uint64_t tree_fee_rate_arg = 0;  /* --tree-fee-rate; 0 = estimator */
     int bump_budget_pct = 0;       /* --bump-budget-pct (0 = default 50%) */
     uint64_t max_bump_fee = 0;     /* --max-bump-fee (0 = default 50000 sats) */
     const char *seckey_hex = NULL;
@@ -1640,6 +1646,10 @@ int main(int argc, char *argv[]) {
             demo_mode = 1;
         else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
             fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--tree-fee-rate") == 0 && i + 1 < argc)
+            tree_fee_rate_arg = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--max-tree-fee-rate") == 0 && i + 1 < argc)
+            factory_set_max_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc)
             backup_dir = argv[++i];
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
@@ -2266,6 +2276,16 @@ int main(int argc, char *argv[]) {
     }
     if (use_json_log)
         ss_log_set_json(1);
+
+    /* --- Tree fee rate: an explicit rate must be one the clients sign --- */
+    if (tree_fee_rate_arg > 0 && factory_max_tree_fee_rate() > 0 &&
+        tree_fee_rate_arg > factory_max_tree_fee_rate()) {
+        fprintf(stderr, "ERROR: --tree-fee-rate %llu is above the maximum tree fee "
+                "rate %llu sat/kvB that clients sign (--max-tree-fee-rate)\n",
+                (unsigned long long)tree_fee_rate_arg,
+                (unsigned long long)factory_max_tree_fee_rate());
+        return 1;
+    }
 
     /* --- Validate fee rate floor --- */
     if (fee_rate < FEE_FLOOR_SAT_PER_KVB) {
@@ -3293,6 +3313,7 @@ int main(int argc, char *argv[]) {
             /* Wire rotation parameters */
             memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
             mgr->rot_fee_est = fee_est;
+            mgr->rot_tree_fee_rate = tree_fee_rate_arg;
             memcpy(mgr->rot_fund_spk, lsp_rp->factory.funding_spk,
                    lsp_rp->factory.funding_spk_len);
             mgr->rot_fund_spk_len = lsp_rp->factory.funding_spk_len;
@@ -4083,6 +4104,10 @@ accept_new_factory:
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    /* The tree's pre-signed fees are fixed when the ceremony signs it, so the
+       rate (explicit, else the estimator) must be in place before it runs. */
+    lsp_p->factory.fee = fee_est;
+    lsp_p->factory.tree_fee_rate = tree_fee_rate_arg;
     if (n_level_arity > 0)
         factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)
@@ -4358,7 +4383,7 @@ accept_new_factory:
     report_add_uint(&rpt, "n_nodes", lsp_p->factory.n_nodes);
     report_add_uint(&rpt, "n_participants", lsp_p->factory.n_participants);
     report_add_uint(&rpt, "step_blocks", lsp_p->factory.step_blocks);
-    report_add_uint(&rpt, "fee_per_tx", lsp_p->factory.fee_per_tx);
+    report_add_uint(&rpt, "tree_fee_rate", lsp_p->factory.tree_fee_rate);
     report_factory_tree(&rpt, ctx, &lsp_p->factory);
     report_end_section(&rpt);
     report_flush(&rpt);
@@ -4572,6 +4597,7 @@ accept_new_factory:
         /* Wire rotation parameters for continuous ladder (Gap #3) */
         memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
         mgr->rot_fee_est = fee_est;
+        mgr->rot_tree_fee_rate = tree_fee_rate_arg;
         memcpy(mgr->rot_fund_spk, fund_spk, 34);
         mgr->rot_fund_spk_len = 34;
         snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr), "%s", fund_addr);

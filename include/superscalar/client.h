@@ -57,6 +57,19 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
+/* Highest tree fee rate (sat/kvB) the client agrees to sign.  The tree's
+   pre-signed fees come out of the factory funding, so an LSP proposing an
+   extreme rate shrinks every channel.  This is the protocol maximum the LSP
+   clamps its estimate to (factory_set_max_tree_fee_rate; default
+   FACTORY_MAX_TREE_FEE_RATE); 0 = no ceiling.  Whatever the ceiling, the
+   client refuses a rate below FEE_PRESIGNED_FLOOR_SAT_PER_KVB: a tree that
+   cannot relay cannot be exited. */
+#define CLIENT_DEFAULT_MAX_TREE_FEE_RATE FACTORY_MAX_TREE_FEE_RATE
+void client_set_max_tree_fee_rate(uint64_t sat_per_kvb);
+
+/* 1 if the client would sign a tree at sat_per_kvb (see above). */
+int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb);
+
 /* Optional callback to verify the funding TX on-chain before signing the
    factory tree.  If provided to client_run_with_channels, called after
    FACTORY_PROPOSE is parsed and before any tree signing.  Return 1 if the

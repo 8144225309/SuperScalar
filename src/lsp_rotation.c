@@ -960,6 +960,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     /* Restore arity on the zeroed struct so lsp_run_factory_creation's
        saved_arity = f->leaf_arity picks it up correctly. */
     lsp->factory.leaf_arity = saved_arity;
+    /* The new tree is sized at the configured rate, else the estimator's
+       current rate: both must be in place before the ceremony signs it. */
+    lsp->factory.tree_fee_rate = mgr->rot_tree_fee_rate;
+    lsp->factory.fee = (fee_estimator_t *)mgr->rot_fee_est;
 
     /* Compute cltv_timeout for new factory */
     uint32_t new_cltv = 0;
@@ -1095,6 +1099,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     unsigned char saved_seckey[32];
     memcpy(saved_seckey, mgr->rot_lsp_seckey, 32);
     void *saved_fee_est = mgr->rot_fee_est;
+    uint64_t saved_tree_fee_rate = mgr->rot_tree_fee_rate;
     unsigned char saved_fund_spk[34];
     memcpy(saved_fund_spk, mgr->rot_fund_spk, 34);
     size_t saved_fund_spk_len = mgr->rot_fund_spk_len;
@@ -1149,6 +1154,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     memcpy(mgr->rot_lsp_seckey, saved_seckey, 32);
     secure_zero(saved_seckey, 32);
     mgr->rot_fee_est = saved_fee_est;
+    mgr->rot_tree_fee_rate = saved_tree_fee_rate;
     memcpy(mgr->rot_fund_spk, saved_fund_spk, 34);
     mgr->rot_fund_spk_len = saved_fund_spk_len;
     memcpy(mgr->rot_fund_addr, saved_fund_addr, 128);

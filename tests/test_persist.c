@@ -1496,7 +1496,7 @@ int test_lsp_recovery_round_trip(void) {
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
 
     /* Set funding (need valid funding for channel init) */
     musig_keyagg_t ka;
@@ -2013,7 +2013,7 @@ int test_persist_crash_stress(void) {
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
 
     /* Compute funding SPK */
     musig_keyagg_t ka;
@@ -2366,7 +2366,7 @@ int test_persist_crash_stress(void) {
     }
 
     /* ===== Cycle 4: Extreme values ===== */
-    uint64_t commit_fee = f->fee_per_tx;
+    uint64_t commit_fee = 500;
     mgr.entries[0].channel.local_amount = 0;
     mgr.entries[0].channel.remote_amount = f->funding_amount_sats / 4 - commit_fee;
     mgr.entries[0].channel.commitment_number = 200;

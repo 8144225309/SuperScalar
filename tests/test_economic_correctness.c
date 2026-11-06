@@ -782,7 +782,7 @@ int test_regtest_econ_ps_advance(void) {
     size_t leaf0_idx = f->leaf_node_indices[0];
     factory_node_t *leaf0 = &f->nodes[leaf0_idx];
     uint64_t pre_channel_amt = leaf0->outputs[0].amount_sats;
-    uint64_t fee_per_tx = f->fee_per_tx;
+    uint64_t fee_per_tx = factory_ps_chain_reserve(f);
     printf("  [PS advance] pre-advance: leaf[0] channel_out=%llu sats, fee_per_tx=%llu\n",
            (unsigned long long)pre_channel_amt, (unsigned long long)fee_per_tx);
 

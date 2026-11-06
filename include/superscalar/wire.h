@@ -325,7 +325,9 @@ cJSON *wire_build_hello_ack(const secp256k1_context *ctx,
                             const secp256k1_pubkey *all_pubkeys, size_t n);
 
 /* LSP → Client: FACTORY_PROPOSE {funding_txid, funding_vout, funding_amount,
-                                   step_blocks, states_per_layer, cltv_timeout, fee_per_tx} */
+                                   step_blocks, states_per_layer, cltv_timeout,
+                                   tree_fee_rate, leaf_arity, ...}
+   tree_fee_rate: the sat/kvB rate every pre-signed tree tx is sized at. */
 cJSON *wire_build_factory_propose(const factory_t *f);
 
 /* Client → LSP: NONCE_BUNDLE {entries: [{node_idx, slot, pubnonce_hex}...]} */

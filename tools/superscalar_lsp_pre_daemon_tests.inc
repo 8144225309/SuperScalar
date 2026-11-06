@@ -4503,7 +4503,7 @@ bc_oom:
                 for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
                     size_t nidx = psa_f->leaf_node_indices[li];
                     factory_node_t *node = &psa_f->nodes[nidx];
-                    uint64_t expected_amt = pre_amounts[li] - psa_f->fee_per_tx;
+                    uint64_t expected_amt = pre_amounts[li] - factory_ps_chain_reserve(psa_f);
                     printf("  Leaf %d post-advance: chain_len=%d, n_outputs=%zu, chan_amount=%llu (expected %llu)\n",
                            li, node->ps_chain_len, node->n_outputs,
                            (unsigned long long)node->outputs[0].amount_sats,

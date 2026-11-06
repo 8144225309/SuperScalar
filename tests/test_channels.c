@@ -1299,18 +1299,24 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
         uint64_t d_orig = (ch_d->funding_amount > cfe ?
                            ch_d->funding_amount - cfe : 0) / 2;
 
+        /* The remote side gets the rest of the usable amount (an odd usable
+           amount leaves it one sat more than local). */
+        uint64_t a_rem = ch_a->funding_amount - cfe - a_orig;
+        uint64_t b_rem = ch_b->funding_amount - cfe - b_orig;
+        uint64_t c_rem = ch_c->funding_amount - cfe - c_orig;
+        uint64_t d_rem = ch_d->funding_amount - cfe - d_orig;
         /* A: +2000 local (received from A), -600 local (sent to A) = net +1400 */
         uint64_t exp_a_local = a_orig + 2000 - 600;
-        uint64_t exp_a_remote = a_orig - 2000 + 600;
+        uint64_t exp_a_remote = a_rem - 2000 + 600;
         /* B: -2000 local (sent to B), +1500 local (received from B) = net -500 */
         uint64_t exp_b_local = b_orig - 2000 + 1500;
-        uint64_t exp_b_remote = b_orig + 2000 - 1500;
+        uint64_t exp_b_remote = b_rem + 2000 - 1500;
         /* C: -1500 local (sent to C), +1000 local (received from C) = net -500 */
         uint64_t exp_c_local = c_orig - 1500 + 1000;
-        uint64_t exp_c_remote = c_orig + 1500 - 1000;
+        uint64_t exp_c_remote = c_rem + 1500 - 1000;
         /* D: -1000 local (sent to D), +600 local (received from D) = net -400 */
         uint64_t exp_d_local = d_orig - 1000 + 600;
-        uint64_t exp_d_remote = d_orig + 1000 - 600;
+        uint64_t exp_d_remote = d_rem + 1000 - 600;
 
         printf("LSP: Channel A: local=%llu remote=%llu (exp %llu/%llu)\n",
                (unsigned long long)ch_a->local_amount,

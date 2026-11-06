@@ -2294,6 +2294,8 @@ static void usage(const char *prog) {
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --max-tree-fee-rate N             Refuse a factory whose tree fee rate exceeds N sat/kvB\n"
+        "                                      (default 100000, the LSP default; 0 = no ceiling)\n"
         "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
@@ -2554,6 +2556,8 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-tree-fee-rate") == 0 && i + 1 < argc)
+            client_set_max_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--cheat-client") == 0 && i + 1 < argc) {
             /* CL7: adversarial client cheat. SIDE = 0 (left) or 1 (right).
                Sets env var read by client_handle_leaf_advance. */

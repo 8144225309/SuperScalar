@@ -2673,8 +2673,9 @@ int test_factory_arity1_min_funding_reject(void) {
     f->funding_amount_sats = 1000;  /* Way below minimum for 14-node tree */
     TEST_ASSERT(!factory_build_tree(f), "tiny funding rejected");
 
-    /* Set minimum valid amount: 14*fee_per_tx + 8*1092 */
-    uint64_t min = 14 * f->fee_per_tx + 8 * 1092;
+    /* Set minimum valid amount: 14 per-node reserves + 8*1092 */
+    uint64_t min = 14 * (factory_tree_tx_fee(f, 1, 1, f->use_tree_anchor) +
+                         (f->use_tree_anchor ? ANCHOR_OUTPUT_AMOUNT : 0)) + 8 * 1092;
     f->funding_amount_sats = min;
     /* Reset node count for fresh build */
     f->n_nodes = 0;
@@ -3036,7 +3037,7 @@ static int validate_tree_invariants(const factory_t *f) {
         uint64_t out_total = 0;
         for (size_t j = 0; j < node->n_outputs; j++)
             out_total += node->outputs[j].amount_sats;
-        if (out_total + f->fee_per_tx != node->input_amount) return 0;
+        if (out_total + node->fee_sats != node->input_amount) return 0;
     }
 
     /* 5. CLTV monotonicity: child cltv < parent cltv (when both have taptree) */
@@ -4692,7 +4693,7 @@ int test_arity2_leaf_advance(void) {
     factory_set_arity(f, FACTORY_ARITY_2);
     factory_set_funding(f, fake_txid, 0, 500000, fund_spk, 34);
 
-    f->fee_per_tx = 330;
+    f->tree_fee_rate = 3000;
     f->cltv_timeout = 1000;
     TEST_ASSERT(factory_build_tree(f), "build arity-2 tree");
     TEST_ASSERT(factory_sign_all(f), "sign all");
@@ -5696,13 +5697,13 @@ int test_factory_ps_subfactory_chain_extension(void) {
     TEST_ASSERT_EQ((long)sub->outputs[1].amount_sats, (long)b_chan_before,
                     "B's channel unchanged");
     TEST_ASSERT_EQ((long)sub->outputs[2].amount_sats,
-                    (long)(sstock_before - delta - f->fee_per_tx),
+                    (long)(sstock_before - delta - sub->fee_sats),
                     "sales-stock = prior - delta - fee");
-    /* Conservation: total decreased by exactly fee_per_tx. */
+    /* Conservation: total decreased by exactly the advance's fee. */
     uint64_t total_after = sub->outputs[0].amount_sats +
                            sub->outputs[1].amount_sats +
                            sub->outputs[2].amount_sats;
-    TEST_ASSERT_EQ((long)total_after, (long)(total_before - f->fee_per_tx),
+    TEST_ASSERT_EQ((long)total_after, (long)(total_before - sub->fee_sats),
                     "conservation: total - fee");
 
     /* Re-sign sub-factory 0 via the new multi-input per-node MuSig.
@@ -5784,7 +5785,7 @@ int test_factory_ps_subfactory_chain_extension(void) {
                     (long)(b_chan_before + delta2),
                     "B's channel grew by delta2");
     TEST_ASSERT_EQ((long)sub->outputs[2].amount_sats,
-                    (long)(sstock_chain1 - delta2 - f->fee_per_tx),
+                    (long)(sstock_chain1 - delta2 - sub->fee_sats),
                     "sales-stock = chain[1] - delta2 - fee");
 
     /* Sign chain[2] via the per-input flow.  SF-MULTI-KEYAGG (#283):
@@ -5982,8 +5983,8 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
     size_t tx_len = sub->signed_tx.len;
     TEST_ASSERT(tx_len > 100, "signed_tx is non-trivial");
 
-    /* offset 0..3: nVersion = 2 */
-    TEST_ASSERT_EQ(tx[0], 0x02, "nVersion byte 0");
+    /* offset 0..3: nVersion = 3 (TRUC tree tx) */
+    TEST_ASSERT_EQ(tx[0], FACTORY_TREE_TX_VERSION, "nVersion byte 0");
     /* offset 4: segwit marker = 0x00 */
     TEST_ASSERT_EQ(tx[4], 0x00, "segwit marker");
     /* offset 5: segwit flag = 0x01 */
@@ -6019,10 +6020,10 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
         pos += 9 + spk_len;
     }
 
-    /* Conservation: sum(in_amounts) == sum(out_amounts) + fee_per_tx.
+    /* Conservation: sum(in_amounts) == sum(out_amounts) + fee.
        The advance moves `delta` from sales-stock to channel A — total
        just decreases by fee. */
-    TEST_ASSERT_EQ((long)out_total, (long)(in_total - f->fee_per_tx),
+    TEST_ASSERT_EQ((long)out_total, (long)(in_total - sub->fee_sats),
                     "input total - fee = output total (conservation)");
 
     /* 3 witnesses follow, each = 1 + 1 + 64 = 66 bytes (stack_count=1, sig_len=64, sig). */
@@ -7357,7 +7358,7 @@ int test_factory_ps_amount_invariant(void) {
     TEST_ASSERT(factory_sign_all(f), "sign");
 
     size_t leaf0 = f->leaf_node_indices[0];
-    uint64_t fee = f->fee_per_tx;
+    uint64_t fee = factory_ps_chain_reserve(f);
 
     /* chain[0]: must have 2 outputs (channel + L-stock) */
     TEST_ASSERT_EQ((int)f->nodes[leaf0].n_outputs, 2, "chain[0] has 2 outputs");
@@ -7432,7 +7433,8 @@ int test_factory_ps_dust_limit(void) {
 
     /* Set fee so that next advance output = chan_after_1 - fee < dust limit.
        fee = chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1 guarantees out < 546. */
-    f->fee_per_tx = chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1;
+    f->tree_fee_rate = (chan_after_1 - CHANNEL_DUST_LIMIT_SATS + 1) * 1000 /
+                       fee_keypath_tx_vsize(1, 1, f->use_tree_anchor ? 1 : 0) + 1000;
 
     /* This advance must fail: output would be below dust. */
     TEST_ASSERT(!factory_advance_leaf(f, 0), "advance returns 0 at dust limit");
@@ -7547,7 +7549,7 @@ int test_factory_ps_split_round_leaf_advance(void) {
     factory_node_t *node = &f->nodes[node_idx];
 
     uint64_t initial_chan = node->outputs[0].amount_sats;
-    uint64_t fee = f->fee_per_tx;
+    uint64_t fee = factory_ps_chain_reserve(f);
 
     /* Step 1: LSP side — advance unsigned (PS branch) */
     int rc = factory_advance_leaf_unsigned(f, 0);
@@ -8279,7 +8281,8 @@ int test_factory_static_near_root_n128_arity_2_4_8_static_2(void) {
     for (int li = 0; li < f->n_leaf_nodes; li++) {
         leaf_in_total += f->nodes[f->leaf_node_indices[li]].input_amount;
     }
-    uint64_t fees_total = (uint64_t)f->n_nodes * f->fee_per_tx;
+    uint64_t fees_total = 0;
+    for (size_t ni = 0; ni < f->n_nodes; ni++) fees_total += f->nodes[ni].fee_sats;
     /* leaf_in already accounts for the tree TX fees above each leaf;
        the remaining check is that the funding was fully apportioned. */
     printf("  [n128 {2,4,8} thr=2] leaf_in_total=%llu, n_nodes=%zu, "

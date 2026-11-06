@@ -49,12 +49,6 @@ uint64_t fee_for_cpfp_child(fee_estimator_t *fe);
 /* Commitment tx is 154 vB base + 43 vB per active HTLC — uses NORMAL rate. */
 uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs);
 
-/* Factory tree tx: 1 key-path input, n_p2tr_outputs P2TR outputs, plus the
-   P2A anchor when with_anchor is set.  Sized with fee_keypath_tx_vsize at the
-   NORMAL rate, floored at FEE_PRESIGNED_FLOOR_SAT_PER_KVB. */
-uint64_t fee_for_factory_tx(fee_estimator_t *fe, size_t n_p2tr_outputs,
-                            int with_anchor);
-
 /* -----------------------------------------------------------------------
  * Exact sizing for pre-signed transactions
  *

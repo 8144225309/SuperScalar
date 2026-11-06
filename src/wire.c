@@ -617,7 +617,7 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
     cJSON_AddNumberToObject(j, "step_blocks", f->step_blocks);
     cJSON_AddNumberToObject(j, "states_per_layer", f->states_per_layer);
     cJSON_AddNumberToObject(j, "cltv_timeout", f->cltv_timeout);
-    cJSON_AddNumberToObject(j, "fee_per_tx", (double)f->fee_per_tx);
+    cJSON_AddNumberToObject(j, "tree_fee_rate", (double)f->tree_fee_rate);
     cJSON_AddNumberToObject(j, "leaf_arity", (double)f->leaf_arity);
     if (f->n_level_arity > 0) {
         cJSON *la = cJSON_CreateArray();

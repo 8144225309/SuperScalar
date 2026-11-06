@@ -81,14 +81,6 @@ uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs)
     return compute_fee(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
 }
 
-uint64_t fee_for_factory_tx(fee_estimator_t *fe, size_t n_p2tr_outputs,
-                            int with_anchor)
-{
-    if (!fe || !fe->get_rate) return 0;
-    size_t vsize = fee_keypath_tx_vsize(1, n_p2tr_outputs, with_anchor ? 1 : 0);
-    return fee_presigned(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
-}
-
 static size_t varint_len(size_t n)
 {
     return n < 0xfd ? 1 : n <= 0xffff ? 3 : 5;
