@@ -295,6 +295,10 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     fee_estimator_t *_fe = fee_est;
     if (!_fe) { fee_estimator_static_init(&_fe_default, 1000); _fe = &_fe_default.base; }
     uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
+    if (commit_fee == FEE_INVALID) {
+        fprintf(stderr, "client: commitment fee not computable at the current estimate\n");
+        return 0;
+    }
     uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;
     uint64_t remote_amount = usable - local_amount;

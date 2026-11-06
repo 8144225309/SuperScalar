@@ -26,6 +26,10 @@ typedef enum {
    Bitcoin Core won't relay below this with lowered -minrelaytxfee. */
 #define FEE_FLOOR_SAT_PER_KVB  100
 
+/* Highest rate taken from an external fee API: 10000 sat/vB.  A higher (or
+   absurd) value from the API is clamped to it. */
+#define FEE_API_MAX_SAT_PER_KVB  10000000ULL
+
 typedef struct fee_estimator fee_estimator_t;
 struct fee_estimator {
     /* Required.  Returns sat/kvB; 0 = unavailable / estimator not ready. */

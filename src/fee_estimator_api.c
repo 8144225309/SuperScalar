@@ -158,6 +158,17 @@ char *ss_http_get_simple(const char *url, void *ctx)
  * {"fastestFee":N,"halfHourFee":N,"hourFee":N,"economyFee":N,"minimumFee":N}
  * All values in sat/vByte; multiply by 1000 to get sat/kvB.
  * --------------------------------------------------------------------- */
+/* A sat/vB rate from the API as sat/kvB, within [the relay floor,
+   FEE_API_MAX_SAT_PER_KVB]; 0 for a value that is not a positive number. */
+static uint64_t api_rate(const cJSON *v)
+{
+    if (!v || !cJSON_IsNumber(v) || !(v->valuedouble > 0)) return 0;
+    if (v->valuedouble >= (double)FEE_API_MAX_SAT_PER_KVB / 1000.0)
+        return FEE_API_MAX_SAT_PER_KVB;
+    uint64_t r = (uint64_t)(v->valuedouble * 1000.0 + 0.5);
+    return r < FEE_FLOOR_SAT_PER_KVB ? FEE_FLOOR_SAT_PER_KVB : r;
+}
+
 static int parse_mempool_json(const char *body, uint64_t cached[4])
 {
     cJSON *json = cJSON_Parse(body);
@@ -169,16 +180,11 @@ static int parse_mempool_json(const char *body, uint64_t cached[4])
     cJSON *minimum = cJSON_GetObjectItem(json, "minimumFee");
 
     int ok = 0;
-    if (fastest && cJSON_IsNumber(fastest) && fastest->valuedouble > 0) {
-        cached[FEE_RPC_IDX_URGENT] = (uint64_t)(fastest->valuedouble * 1000.0 + 0.5);
-        ok = 1;
-    }
-    if (half && cJSON_IsNumber(half) && half->valuedouble > 0)
-        cached[FEE_RPC_IDX_NORMAL] = (uint64_t)(half->valuedouble * 1000.0 + 0.5);
-    if (economy && cJSON_IsNumber(economy) && economy->valuedouble > 0)
-        cached[FEE_RPC_IDX_ECONOMY] = (uint64_t)(economy->valuedouble * 1000.0 + 0.5);
-    if (minimum && cJSON_IsNumber(minimum) && minimum->valuedouble > 0)
-        cached[FEE_RPC_IDX_MINIMUM] = (uint64_t)(minimum->valuedouble * 1000.0 + 0.5);
+    uint64_t r;
+    if ((r = api_rate(fastest)) > 0) { cached[FEE_RPC_IDX_URGENT] = r; ok = 1; }
+    if ((r = api_rate(half)) > 0)    cached[FEE_RPC_IDX_NORMAL] = r;
+    if ((r = api_rate(economy)) > 0) cached[FEE_RPC_IDX_ECONOMY] = r;
+    if ((r = api_rate(minimum)) > 0) cached[FEE_RPC_IDX_MINIMUM] = r;
 
     /* Clamp all to minimum relay fee */
     for (int i = 0; i < 4; i++)

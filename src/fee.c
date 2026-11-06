@@ -33,15 +33,17 @@ int fee_update_from_node(fee_estimator_t *fe, void *rt, int target_blocks)
  * Fee helpers — route through the vtable
  * --------------------------------------------------------------------- */
 
-/* Overflow-safe fee computation: rate * vsize / 1000, rounded up.
-   Returns 0 if rate is 0 (estimator unavailable). */
+/* ceil(rate * vsize / 1000).  Returns 0 if rate is 0 (estimator unavailable)
+   and FEE_INVALID when the fee would exceed FEE_MAX_SATS: the product is
+   bounded before it is formed, so it never overflows. */
 static uint64_t compute_fee(uint64_t sat_per_kvb, size_t vsize_bytes)
 {
     if (sat_per_kvb == 0) return 0;
-    /* Cap at 1 BTC to prevent overflow at extreme fee rates */
-    if (sat_per_kvb > (uint64_t)100000000 / (vsize_bytes + 1))
-        return 100000000ULL;
-    return (sat_per_kvb * vsize_bytes + 999) / 1000;
+    if (vsize_bytes > 0 &&
+        sat_per_kvb > (FEE_MAX_SATS * 1000) / (uint64_t)vsize_bytes)
+        return FEE_INVALID;
+    uint64_t fee = (sat_per_kvb * (uint64_t)vsize_bytes + 999) / 1000;
+    return fee > FEE_MAX_SATS ? FEE_INVALID : fee;
 }
 
 uint64_t fee_estimate(fee_estimator_t *fe, size_t vsize_bytes)
@@ -79,12 +81,49 @@ uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs)
     return compute_fee(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
 }
 
-uint64_t fee_for_factory_tx(fee_estimator_t *fe, size_t n_outputs)
+uint64_t fee_for_factory_tx(fee_estimator_t *fe, size_t n_p2tr_outputs,
+                            int with_anchor)
 {
-    /* Factory tree tx: 68 vB overhead + 43 vB per P2TR output — NORMAL */
     if (!fe || !fe->get_rate) return 0;
-    size_t vsize = 68 + 43 * n_outputs;
-    return compute_fee(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
+    size_t vsize = fee_keypath_tx_vsize(1, n_p2tr_outputs, with_anchor ? 1 : 0);
+    return fee_presigned(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
+}
+
+static size_t varint_len(size_t n)
+{
+    return n < 0xfd ? 1 : n <= 0xffff ? 3 : 5;
+}
+
+size_t fee_tx_vsize(size_t n_inputs, size_t n_outputs, size_t outputs_bytes,
+                    size_t witness_bytes)
+{
+    /* version + vin count + inputs (outpoint, empty scriptSig, sequence)
+       + vout count + outputs + locktime */
+    size_t base = 4 + varint_len(n_inputs) + 41 * n_inputs +
+                  varint_len(n_outputs) + outputs_bytes + 4;
+    size_t weight = 4 * base;
+    if (witness_bytes > 0)
+        weight += 2 + witness_bytes;   /* marker + flag */
+    return (weight + 3) / 4;
+}
+
+size_t fee_keypath_tx_vsize(size_t n_inputs, size_t n_p2tr, size_t n_p2a)
+{
+    return fee_tx_vsize(n_inputs, n_p2tr + n_p2a,
+                        FEE_P2TR_OUTPUT_BYTES * n_p2tr + FEE_P2A_OUTPUT_BYTES * n_p2a,
+                        FEE_KEYPATH_WITNESS_BYTES * n_inputs);
+}
+
+uint64_t fee_at_rate(uint64_t sat_per_kvb, size_t vsize)
+{
+    return compute_fee(sat_per_kvb, vsize);
+}
+
+uint64_t fee_presigned(uint64_t sat_per_kvb, size_t vsize)
+{
+    if (sat_per_kvb < FEE_PRESIGNED_FLOOR_SAT_PER_KVB)
+        sat_per_kvb = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
+    return compute_fee(sat_per_kvb, vsize);
 }
 
 int fee_should_use_anchor(fee_estimator_t *fe)

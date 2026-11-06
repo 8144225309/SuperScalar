@@ -665,24 +665,31 @@ int test_fee_penalty_tx(void) {
     return 1;
 }
 
-/* Test 10: factory tx fee scales with n_outputs */
+/* Test 10: factory tx fee follows the exact vsize, anchor included, and never
+   drops below the pre-signed floor. */
 int test_fee_factory_tx(void) {
     fee_estimator_static_t fe;
-    fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
+    fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB: below the floor */
 
-    uint64_t fee1 = fee_for_factory_tx((fee_estimator_t *)&fe, 1);
-    uint64_t fee3 = fee_for_factory_tx((fee_estimator_t *)&fe, 3);
-    uint64_t fee5 = fee_for_factory_tx((fee_estimator_t *)&fe, 5);
+    /* 1-in key-path: 10.5 overhead + 57.5 input = 68; + 43 per P2TR, + 13 P2A */
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 1, 0), 111, "1 P2TR: 111 vB");
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 3, 0), 197, "3 P2TR: 197 vB");
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 3, 1), 210, "3 P2TR + P2A: 210 vB");
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(3, 3, 0), 312, "3-in 3-out: 312 vB");
 
-    /* fee = (68 + 43*n) at 1 sat/vB: 68 = 10 tx overhead + 58 P2TR keypath input */
-    TEST_ASSERT_EQ(fee1, 111, "1 output: 68+43=111");
-    TEST_ASSERT_EQ(fee3, 197, "3 outputs: 68+129=197");
-    TEST_ASSERT_EQ(fee5, 283, "5 outputs: 68+215=283");
+    /* At 1 sat/vB the 1250 sat/kvB floor applies: ceil(1.25 * vsize) */
+    uint64_t fee1 = fee_for_factory_tx((fee_estimator_t *)&fe, 1, 0);
+    uint64_t fee3a = fee_for_factory_tx((fee_estimator_t *)&fe, 3, 1);
+    TEST_ASSERT_EQ(fee1, 139, "1 output at floor");
+    TEST_ASSERT_EQ(fee3a, 263, "3 outputs + anchor at floor");
+    TEST_ASSERT(fee3a >= 210, "pays min relay for 210 vB");
 
-    /* Must scale: more outputs = higher fee */
-    TEST_ASSERT(fee3 > fee1, "fee scales up with outputs");
-    TEST_ASSERT(fee5 > fee3, "fee scales up more");
-
+    fee_estimator_static_t fe5;
+    fee_estimator_static_init(&fe5, 5000);  /* 5 sat/vB: above the floor */
+    TEST_ASSERT_EQ(fee_for_factory_tx((fee_estimator_t *)&fe5, 3, 1), 1050,
+                   "5 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_presigned(0, 210), 263, "rate 0 still pays the floor");
+    TEST_ASSERT_EQ(fee_at_rate(1000, 210), 210, "fee_at_rate is plain ceil");
     return 1;
 }
 

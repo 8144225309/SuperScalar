@@ -251,6 +251,10 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         fee_estimator_static_init(&_fe_default, 1000);
         fee_estimator_t *_fe = &_fe_default.base;
         uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
+        if (commit_fee == FEE_INVALID) {
+            fprintf(stderr, "lsp_channels_init: commitment fee not computable\n");
+            return 0;
+        }
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         /* Balance split: lsp_balance_pct controls LSP share (default 50 = fair) */
         uint16_t pct = mgr->lsp_balance_pct;
@@ -3474,6 +3478,10 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
         if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
         uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
+        if (commit_fee_ra == FEE_INVALID) {
+            fprintf(stderr, "LSP realloc: commitment fee not computable\n");
+            return 0;
+        }
         uint64_t usable_ra = client_amt > commit_fee_ra ? client_amt - commit_fee_ra : 0;
         entry->channel.local_amount = (usable_ra * pct) / 100;
         entry->channel.remote_amount = usable_ra - entry->channel.local_amount;

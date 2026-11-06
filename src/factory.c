@@ -1897,7 +1897,7 @@ int factory_build_tree(factory_t *f) {
 
     /* Override fee_per_tx from fee estimator if available */
     if (f->fee) {
-        f->fee_per_tx = fee_for_factory_tx(f->fee, 3);
+        f->fee_per_tx = fee_for_factory_tx(f->fee, 3, f->use_tree_anchor);
     }
 
     /* Compute tree metrics (variable arity uses simulation) */
