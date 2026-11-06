@@ -2571,3 +2571,375 @@ int test_rotation_retry_factory_id_collision(void) {
 
     return 1;
 }
+
+/* ---- rotation postponed on fees -------------------------------------- */
+
+#include "superscalar/wire.h"
+#include "superscalar/persist.h"
+#include "superscalar/jit_channel.h"
+#include "superscalar/chain_backend.h"
+#include "superscalar/wallet_source.h"
+#include "superscalar/fee_estimator.h"
+#include "superscalar/lsp.h"
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+/* A client that answers a PTLC key turnover the way superscalar_client
+   does; counts every message the LSP sends it. */
+typedef struct {
+    secp256k1_context *ctx;
+    int fd;
+    unsigned char sec[32];
+    int n_msgs;
+} turnover_client_t;
+
+static void *turnover_client(void *arg) {
+    turnover_client_t *c = (turnover_client_t *)arg;
+    wire_msg_t m;
+    while (wire_recv_timeout(c->fd, &m, 60)) {
+        c->n_msgs++;
+        if (m.msg_type == MSG_PTLC_PRESIG) {
+            unsigned char presig[64], tmsg[32], sig[64];
+            int parity;
+            if (wire_parse_ptlc_presig(m.json, presig, &parity, tmsg) &&
+                adaptor_adapt(c->ctx, sig, presig, c->sec, parity)) {
+                cJSON *r = wire_build_ptlc_adapted_sig(sig);
+                wire_send(c->fd, MSG_PTLC_ADAPTED_SIG, r);
+                cJSON_Delete(r);
+            }
+        }
+        if (m.json) cJSON_Delete(m.json);
+    }
+    return NULL;
+}
+
+/* Chain and wallet that only count what is asked of them. */
+static int g_pp_sends, g_pp_wallet;
+static uint32_t g_pp_height;
+static int pp_height(chain_backend_t *s) { (void)s; return (int)g_pp_height; }
+static int pp_send(chain_backend_t *s, const char *hex, char *txid) {
+    (void)s; (void)hex; (void)txid; g_pp_sends++; return 0;
+}
+static int pp_change_spk(wallet_source_t *s, unsigned char *spk, size_t *len) {
+    (void)s; (void)spk; (void)len; g_pp_wallet++; return 0;
+}
+
+static int pp_count_rotate(const persist_ceremony_t *c, void *ud) {
+    int *n = (int *)ud;
+    if (c->ceremony_type == PERSIST_CEREMONY_TYPE_ROTATE) {
+        n[0]++;
+        if (c->state == PERSIST_CEREMONY_STATE_ABORTED) n[1]++;
+    }
+    return 1;
+}
+
+static void pp_advance(ladder_t *lad, uint32_t h) {
+    g_pp_height = h;
+    ladder_advance_block(lad, h);
+}
+
+/* A rotation whose fees do not fit stops before anything irreversible: no
+   message to any client (no key handed over), no HTLC failed, no JIT
+   channel closed, nothing broadcast, the old factory untouched, the ROTATE
+   ceremony ABORTED.  A cooperative close above half the funding at the
+   current estimate postpones it: not a failed attempt, retried on every
+   block while the factory is DYING with the retry budget intact; only once
+   the factory has expired does the next retry tick fall back to the
+   distribution TX.  A replacement tree whose pre-signed fees exceed the
+   bound even at the floor rate does not depend on the fee market: that
+   attempt fails and uses a retry. */
+int test_rotation_postponed_on_fees_changes_nothing(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair lsp_kp, client_kps[4];
+    TEST_ASSERT(secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec), "lsp kp");
+    TEST_ASSERT(make_client_keypairs(ctx, client_kps), "client kps");
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked),
+                "funding spk");
+
+    /* the old factory: created at 100, DYING from 110, EXPIRED at 120 */
+    ladder_t *lad = calloc(1, sizeof(ladder_t));
+    TEST_ASSERT(lad, "ladder alloc");
+    ladder_init(lad, ctx, &lsp_kp, 10, 10);
+    pp_advance(lad, 100);
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0x5A, 32);
+    TEST_ASSERT(ladder_create_factory(lad, client_kps, 4, 100000, fake_txid, 0,
+                                      fund_spk, 34), "create factory");
+    pp_advance(lad, 110);
+    ladder_factory_t *old = &lad->factories[0];
+    TEST_ASSERT_EQ(old->cached_state, FACTORY_DYING, "old factory DYING");
+
+    /* four online clients that would hand over their keys if asked */
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "lsp alloc");
+    lsp->ctx = ctx;
+    lsp->n_clients = 4;
+    lsp->client_fds = calloc(4, sizeof(int));
+    lsp->client_pubkeys = calloc(4, sizeof(secp256k1_pubkey));
+    TEST_ASSERT(lsp->client_fds && lsp->client_pubkeys, "lsp arrays");
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &lsp->lsp_pubkey, &lsp_kp), "lsp pk");
+    turnover_client_t cl[4];
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        lsp->client_fds[i] = sv[0];
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &lsp->client_pubkeys[i], &client_kps[i]),
+                    "client pk");
+        cl[i].ctx = ctx;
+        cl[i].fd = sv[1];
+        memcpy(cl[i].sec, client_secs[i], 32);
+        cl[i].n_msgs = 0;
+        TEST_ASSERT(pthread_create(&th[i], NULL, turnover_client, &cl[i]) == 0, "thread");
+    }
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "persist");
+    chain_backend_t chain;
+    memset(&chain, 0, sizeof(chain));
+    chain.get_block_height = pp_height;
+    chain.send_raw_tx = pp_send;
+    wallet_source_t wallet;
+    memset(&wallet, 0, sizeof(wallet));
+    wallet.get_change_spk = pp_change_spk;
+    g_pp_sends = g_pp_wallet = 0;
+
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 300000);   /* 300 sat/vB spike */
+
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    TEST_ASSERT(mgr, "mgr alloc");
+    mgr->ctx = ctx;
+    mgr->ladder = lad;
+    mgr->persist = &db;
+    mgr->chain_be = &chain;
+    mgr->wallet_src = &wallet;
+    mgr->rot_fee_est = &fe.base;
+    memcpy(mgr->rot_lsp_seckey, lsp_sec, 32);
+    mgr->rot_leaf_arity = FACTORY_ARITY_2;
+    mgr->rot_step_blocks = 4;
+    mgr->rot_states_per_layer = 4;
+    mgr->rot_max_retries = 3;
+    mgr->rot_attempted_mask = 1u;       /* the daemon's first attempt */
+    mgr->n_channels = 4;
+    mgr->entries = calloc(4, sizeof(lsp_channel_entry_t));
+    TEST_ASSERT(mgr->entries, "entries");
+    /* an HTLC in flight on client 0's channel */
+    mgr->entries[0].channel.htlcs = calloc(1, sizeof(htlc_t));
+    TEST_ASSERT(mgr->entries[0].channel.htlcs, "htlcs");
+    mgr->entries[0].channel.htlcs_cap = 1;
+    mgr->entries[0].channel.n_htlcs = 1;
+    mgr->entries[0].channel.htlcs[0].state = HTLC_STATE_ACTIVE;
+    mgr->entries[0].channel.htlcs[0].id = 7;
+    /* an open JIT channel with client 0, closable with its turned-over key */
+    jit_channel_t *jit = calloc(1, sizeof(jit_channel_t));
+    TEST_ASSERT(jit, "jit");
+    jit->state = JIT_STATE_OPEN;
+    jit->client_idx = 0;
+    jit->channel.remote_funding_pubkey = lsp->client_pubkeys[0];
+    mgr->jit_channels = jit;
+    mgr->n_jit_channels = 1;
+    mgr->jit_channels_cap = 1;
+
+    /* 1. the new factory's tree fits (enough funding), but the full close of
+          the old one would cost more than half its 50000 sat funding at the
+          clamped spike rate (283 vB x 100 sat/vB): postponed */
+    mgr->rot_funding_sats = 1000000;
+    lsp->factory.funding_amount_sats = 50000;
+    int rc1 = lsp_channels_rotate_factory(mgr, lsp);
+    int retry_same = lsp_rotation_should_retry(mgr, 0, 110);
+    int retry_next = lsp_rotation_should_retry(mgr, 0, 111);
+    /* 2. the new factory's pre-signed fees exceed the bound even at the
+          floor rate: the attempt fails, and the daemon records the failure */
+    mgr->rot_funding_sats = 5000;
+    pp_advance(lad, 111);
+    int rc2 = lsp_channels_rotate_factory(mgr, lsp);
+    lsp_rotation_record_failure(mgr, 0, 111);
+    int retry_after_fail = lsp_rotation_should_retry(mgr, 0, 112);
+    mgr->rot_funding_sats = 1000000;
+    /* 3. the spike lasts: postponed on every block of the DYING window, no
+          further retry used */
+    int all_postponed = 1, all_retried = 1;
+    for (uint32_t h = 112; h < 120; h++) {
+        pp_advance(lad, h);
+        if (lsp_channels_rotate_factory(mgr, lsp) != LSP_ROTATE_POSTPONED) all_postponed = 0;
+        if (lsp_rotation_should_retry(mgr, 0, h + 1) != 1) all_retried = 0;
+    }
+    uint8_t count_dying = mgr->rot_retry_count[0];
+    /* 4. still postponed once the factory has expired: the budget is spent and
+          the next retry tick takes the distribution-TX fallback */
+    pp_advance(lad, 120);
+    int expired = old->cached_state == FACTORY_EXPIRED;
+    int rc4 = lsp_channels_rotate_factory(mgr, lsp);
+    int retry_expired = lsp_rotation_should_retry(mgr, 0, 121);
+
+    /* hang up and collect what each client received */
+    for (int i = 0; i < 4; i++) shutdown(lsp->client_fds[i], SHUT_RDWR);
+    int msgs = 0;
+    for (int i = 0; i < 4; i++) {
+        pthread_join(th[i], NULL);
+        msgs += cl[i].n_msgs;
+        close(cl[i].fd);
+        close(lsp->client_fds[i]);
+    }
+    int departed_db[5] = {0};
+    unsigned char keys_db[5][32];
+    size_t n_departed_db = persist_load_departed_clients(&db, 0, departed_db, keys_db, 5);
+    int cer[2] = {0, 0};
+    persist_scan_ceremonies_by_factory(&db, old->factory.funding_txid, -1,
+                                       pp_count_rotate, cer);
+
+    printf("  rc %d %d .. %d; msgs to clients %d; departed %zu (db %zu); htlcs %zu; "
+           "jit state %d; wallet calls %d; sends %d; ROTATE ceremonies %d (%d aborted); "
+           "retries used %u then %u\n", rc1, rc2, rc4, msgs, old->n_departed,
+           n_departed_db, mgr->entries[0].channel.n_htlcs, (int)jit->state,
+           g_pp_wallet, g_pp_sends, cer[0], cer[1], (unsigned)count_dying,
+           (unsigned)mgr->rot_retry_count[0]);
+    TEST_ASSERT_EQ(rc1, LSP_ROTATE_POSTPONED, "close fee: postponed");
+    TEST_ASSERT_EQ(rc2, LSP_ROTATE_FAILED, "tree fees above the bound at the floor: failed");
+    TEST_ASSERT(all_postponed, "postponed on every block of the spike");
+    TEST_ASSERT(expired, "factory expired at 120");
+    TEST_ASSERT_EQ(rc4, LSP_ROTATE_POSTPONED, "postponed after expiry");
+    /* nothing changed */
+    TEST_ASSERT_EQ(msgs, 0, "no message to any client");
+    TEST_ASSERT_EQ(old->n_departed, 0, "no key handed over");
+    for (int p = 0; p <= 4; p++)
+        TEST_ASSERT_EQ(old->client_departed[p], 0, "no client departed");
+    TEST_ASSERT_EQ(n_departed_db, 0, "no departed client persisted");
+    TEST_ASSERT_EQ(old->partial_rotation_done, 0, "old factory not retired");
+    TEST_ASSERT_EQ(mgr->entries[0].channel.n_htlcs, 1, "HTLC not failed");
+    TEST_ASSERT_EQ(mgr->entries[0].channel.htlcs[0].state, HTLC_STATE_ACTIVE, "HTLC active");
+    TEST_ASSERT_EQ(jit->state, JIT_STATE_OPEN, "JIT channel open");
+    TEST_ASSERT_EQ(g_pp_wallet, 0, "no wallet address taken (no JIT close)");
+    TEST_ASSERT_EQ(g_pp_sends, 0, "nothing broadcast");
+    TEST_ASSERT_EQ(lsp->n_clients, 4, "client set unchanged");
+    TEST_ASSERT(cer[0] >= 1 && cer[1] == cer[0], "every ROTATE ceremony ABORTED");
+    /* not a failure */
+    TEST_ASSERT_EQ(retry_same, 0, "not again in the same block");
+    TEST_ASSERT_EQ(retry_next, 1, "again on the next block");
+    TEST_ASSERT_EQ(retry_after_fail, 0, "a failure waits for its backoff");
+    TEST_ASSERT(all_retried, "retried on every block while DYING");
+    TEST_ASSERT_EQ(count_dying, 1, "only the failed attempt used a retry while DYING");
+    TEST_ASSERT_EQ(retry_expired, -1, "after expiry: distribution-TX fallback");
+    TEST_ASSERT_EQ(mgr->rot_postponed[0], 2, "postponed until expiry");
+
+    /* a real failure still counts, and a success clears the postponement */
+    lsp_channel_mgr_t m2;
+    memset(&m2, 0, sizeof(m2));
+    m2.rot_attempted_mask = 1u;
+    lsp_rotation_record_postponed(&m2, 0, 50, 0);
+    lsp_rotation_record_failure(&m2, 0, 51);
+    TEST_ASSERT_EQ(m2.rot_retry_count[0], 1, "failure counted");
+    TEST_ASSERT_EQ(m2.rot_postponed[0], 0, "failure ends the postponement");
+    TEST_ASSERT_EQ(lsp_rotation_should_retry(&m2, 0, 52), 0, "backoff again");
+    lsp_rotation_record_postponed(&m2, 0, 60, 0);
+    lsp_rotation_record_success(&m2, 0);
+    TEST_ASSERT_EQ(m2.rot_postponed[0], 0, "success clears it");
+
+    free(mgr->entries[0].channel.htlcs);
+    free(mgr->entries);
+    free(jit);
+    free(mgr);
+    persist_close(&db);
+    free(lsp->client_fds);
+    free(lsp->client_pubkeys);
+    free(lsp);
+    ladder_free(lad);
+    free(lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- distribution TX state on chain ------------------------------------ */
+
+/* A node answering from a fixed picture of the chain. */
+static struct {
+    int confs;              /* get_confirmations(dist txid) */
+    int in_mempool;
+    int funding_unspent;    /* is_outpoint_unspent(funding): 1, 0, -1 */
+    int out_unspent[2];     /* is_outpoint_unspent(dist txid, v) */
+} g_ds;
+static char g_ds_fund_hex[65];
+
+static int ds_confs(chain_backend_t *s, const char *t) { (void)s; (void)t; return g_ds.confs; }
+static bool ds_mempool(chain_backend_t *s, const char *t) { (void)s; (void)t; return g_ds.in_mempool != 0; }
+static int ds_unspent(chain_backend_t *s, const char *txid, uint32_t vout) {
+    (void)s;
+    if (strcmp(txid, g_ds_fund_hex) == 0) return g_ds.funding_unspent;
+    return vout < 2 ? g_ds.out_unspent[vout] : 0;
+}
+
+/* Distribution TX recognised whatever the node indexes: on a node without
+   txindex a confirmed distribution TX paying only clients is not found by
+   txid; its outputs in the UTXO set show it confirmed, not "spent by
+   another transaction". */
+int test_distribution_tx_state_without_txindex(void) {
+    ladder_factory_t *lf = calloc(1, sizeof(ladder_factory_t));
+    TEST_ASSERT(lf, "alloc");
+    for (int i = 0; i < 32; i++) lf->factory.funding_txid[i] = (unsigned char)(0x40 + i);
+    lf->factory.funding_vout = 1;
+    {
+        unsigned char d[32];
+        memcpy(d, lf->factory.funding_txid, 32);
+        reverse_bytes(d, 32);
+        hex_encode(d, 32, g_ds_fund_hex);
+    }
+    /* v3, spends the funding, one P2TR client output and a P2A anchor */
+    unsigned char tx[4 + 1 + 41 + 1 + 43 + 13 + 4];
+    size_t n = 0;
+    tx[n++] = 3; tx[n++] = 0; tx[n++] = 0; tx[n++] = 0;
+    tx[n++] = 1;
+    memcpy(tx + n, lf->factory.funding_txid, 32); n += 32;
+    tx[n++] = 1; tx[n++] = 0; tx[n++] = 0; tx[n++] = 0;
+    tx[n++] = 0;
+    tx[n++] = 0xff; tx[n++] = 0xff; tx[n++] = 0xff; tx[n++] = 0xff;
+    tx[n++] = 2;
+    uint64_t amt = 99000;
+    for (int i = 0; i < 8; i++) tx[n++] = (unsigned char)(amt >> (8 * i));
+    tx[n++] = 34; tx[n++] = 0x51; tx[n++] = 0x20;
+    memset(tx + n, 0x77, 32); n += 32;
+    amt = 240;
+    for (int i = 0; i < 8; i++) tx[n++] = (unsigned char)(amt >> (8 * i));
+    tx[n++] = 4; tx[n++] = 0x51; tx[n++] = 0x02; tx[n++] = 0x4e; tx[n++] = 0x73;
+    tx[n++] = 0x10; tx[n++] = 0x27; tx[n++] = 0; tx[n++] = 0;
+    cpfp_tx_info_t ti;
+    TEST_ASSERT(cpfp_parse_tx(tx, n, &ti), "parse");
+    TEST_ASSERT_EQ(ti.n_outputs, 2, "two outputs");
+
+    chain_backend_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.get_confirmations = ds_confs;
+    cb.is_in_mempool = ds_mempool;
+    cb.is_outpoint_unspent = ds_unspent;
+
+    /* found by txid (txindex, or it pays the wallet) */
+    g_ds.confs = 3; g_ds.in_mempool = 0; g_ds.funding_unspent = 0;
+    g_ds.out_unspent[0] = 0; g_ds.out_unspent[1] = 0;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_CONFIRMED, "by txid");
+    /* in the mempool: keep sending (re-bump) */
+    g_ds.confs = 0; g_ds.in_mempool = 1;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_TO_SEND, "mempool");
+    /* nowhere yet, funding unspent or not known: send */
+    g_ds.confs = -1; g_ds.in_mempool = 0; g_ds.funding_unspent = 1;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_TO_SEND, "unspent");
+    g_ds.funding_unspent = -1;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_TO_SEND, "unknown");
+    /* no txindex: not found by txid, funding spent, its client output in the
+       UTXO set (anchor spent by the CPFP child): confirmed */
+    g_ds.funding_unspent = 0;
+    g_ds.out_unspent[0] = 1;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_CONFIRMED,
+                   "confirmed, found by its outputs");
+    /* funding spent and none of its outputs exist: spent by another tx */
+    g_ds.out_unspent[0] = 0;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_SPENT_ELSEWHERE,
+                   "spent elsewhere");
+    /* a node that cannot answer for outpoints: keep sending */
+    cb.is_outpoint_unspent = NULL;
+    TEST_ASSERT_EQ(lsp_distribution_tx_state(&cb, lf, &ti), LSP_DIST_TO_SEND, "no outpoint query");
+    free(lf);
+    return 1;
+}

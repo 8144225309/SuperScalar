@@ -303,6 +303,8 @@ add_executable(test_superscalar
     tests/test_reconnect.c
     tests/test_client_watchtower.c
     tests/test_cpfp.c
+    tests/test_tree_fees.c
+    tests/test_regtest_cpfp.c
     tests/test_jit.c
     tests/test_ceremony.c
     tests/test_crash_checkpoint.c
