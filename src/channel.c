@@ -1513,6 +1513,13 @@ int channel_create_commitment_partial_sig(
     unsigned char *partial_sig32_out,
     uint32_t *nonce_index_out)
 {
+    /* A failed channel signs nothing more (see channel_t.revocation_failed). */
+    if (ch->revocation_failed) {
+        fprintf(stderr, "channel_create_commitment_partial_sig: refused, "
+                "channel failed\n");
+        return 0;
+    }
+
     /* 1. Determine nonce index = remote_nonce_next (consumed in order) */
     uint32_t nidx = (uint32_t)ch->remote_nonce_next;
     if (nidx >= ch->remote_nonce_count) return 0;
@@ -1775,6 +1782,10 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     if (ch->funding_pending_reorg) {
         fprintf(stderr, "channel_add_htlc: refused — funding UTXO pending "
                 "reorg (waiting for re-confirmation)\n");
+        return 0;
+    }
+    if (ch->revocation_failed) {
+        fprintf(stderr, "channel_add_htlc: refused, channel failed\n");
         return 0;
     }
     if (ch->n_htlcs >= MAX_HTLCS) {
@@ -2520,6 +2531,234 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 
     secure_zero(signing_key, 32);
     tx_buf_free(&unsigned_tx);
+    return 1;
+}
+
+/* ---- On-chain HTLC-success claim (BOLT #5) ---- */
+
+/* Rebuild the taptree of an HTLC output that pays us on preimage.
+   Mirrors channel_build_commitment_tx_impl: on our commitment the HTLC is
+   RECEIVED; on the counterparty's (built with swapped basepoints, see
+   channel_build_commitment_tx_for_remote) the same HTLC is OFFERED, and
+   the internal key is the revocation key we would hold against them. */
+static int channel_htlc_claim_tree(const channel_t *ch, int side,
+    const secp256k1_pubkey *pcp, const unsigned char *payment_hash32,
+    uint32_t cltv_expiry,
+    tapscript_leaf_t *success_leaf, tapscript_leaf_t *timeout_leaf,
+    secp256k1_xonly_pubkey *internal_out, int *parity_out,
+    unsigned char *spk_out34)
+{
+    if (side != HTLC_CLAIM_LOCAL_COMMIT && side != HTLC_CLAIM_REMOTE_COMMIT)
+        return 0;
+
+    secp256k1_pubkey our_htlc, their_htlc, revocation;
+    if (!channel_derive_pubkey(ch->ctx, &our_htlc,
+                                &ch->local_htlc_basepoint, pcp))
+        return 0;
+    if (!channel_derive_pubkey(ch->ctx, &their_htlc,
+                                &ch->remote_htlc_basepoint, pcp))
+        return 0;
+    const secp256k1_pubkey *rev_base = (side == HTLC_CLAIM_REMOTE_COMMIT)
+        ? &ch->local_revocation_basepoint : &ch->remote_revocation_basepoint;
+    if (!channel_derive_revocation_pubkey(ch->ctx, &revocation, rev_base, pcp))
+        return 0;
+
+    secp256k1_xonly_pubkey our_x, their_x;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &our_x, NULL, &our_htlc) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &their_x, NULL, &their_htlc) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ch->ctx, internal_out, NULL,
+                                             &revocation))
+        return 0;
+
+    if (side == HTLC_CLAIM_REMOTE_COMMIT) {
+        if (!tapscript_build_htlc_offered_success(success_leaf,
+                payment_hash32, &our_x, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_offered_timeout(timeout_leaf,
+                cltv_expiry, ch->to_self_delay, &their_x, ch->ctx))
+            return 0;
+    } else {
+        if (!tapscript_build_htlc_received_success(success_leaf,
+                payment_hash32, ch->to_self_delay, &our_x, ch->ctx))
+            return 0;
+        if (!tapscript_build_htlc_received_timeout(timeout_leaf,
+                cltv_expiry, &their_x, ch->ctx))
+            return 0;
+    }
+
+    tapscript_leaf_t leaves[2] = { *success_leaf, *timeout_leaf };
+    unsigned char merkle[32];
+    tapscript_merkle_root(merkle, leaves, 2);
+
+    secp256k1_xonly_pubkey tweaked;
+    if (!tapscript_tweak_pubkey(ch->ctx, &tweaked, parity_out,
+                                 internal_out, merkle))
+        return 0;
+    build_p2tr_script_pubkey(spk_out34, &tweaked);
+    return 1;
+}
+
+int channel_htlc_claim_spk(const channel_t *ch, int side,
+    const secp256k1_pubkey *pcp, const unsigned char *payment_hash32,
+    uint32_t cltv_expiry, unsigned char *spk_out34)
+{
+    if (!ch || !pcp || !payment_hash32 || !spk_out34) return 0;
+    tapscript_leaf_t s, t;
+    secp256k1_xonly_pubkey internal;
+    int parity = 0;
+    return channel_htlc_claim_tree(ch, side, pcp, payment_hash32, cltv_expiry,
+                                    &s, &t, &internal, &parity, spk_out34);
+}
+
+int channel_holds_signed_commitment(const channel_t *ch)
+{
+    if (!ch || !ch->has_latest_commitment_sig || ch->funding_spk_len != 34)
+        return 0;
+    tx_buf_t utx;
+    tx_buf_init(&utx, 512);
+    unsigned char txid[32], sighash[32];
+    int ok = channel_build_commitment_tx(ch, &utx, txid) &&
+             compute_taproot_sighash(sighash, utx.data, utx.len, 0,
+                                     ch->funding_spk, ch->funding_spk_len,
+                                     ch->funding_amount, 0xFFFFFFFE);
+    tx_buf_free(&utx);
+    secp256k1_xonly_pubkey key;
+    return ok &&
+           secp256k1_xonly_pubkey_parse(ch->ctx, &key, ch->funding_spk + 2) &&
+           secp256k1_schnorrsig_verify(ch->ctx, ch->latest_commitment_sig,
+                                       sighash, 32, &key);
+}
+
+uint64_t channel_htlc_claim_fee(const channel_t *ch)
+{
+    /* Same fee rule as channel_build_htlc_timeout_tx. */
+    return ch ? (ch->fee_rate_sat_per_kvb * HTLC_CLAIM_VSIZE + 999) / 1000 : 0;
+}
+
+int channel_build_htlc_claim_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    int side, const secp256k1_pubkey *pcp,
+    const unsigned char *commitment_txid, uint32_t htlc_vout,
+    uint64_t htlc_amount, const unsigned char *htlc_spk34,
+    const unsigned char *payment_hash32, const unsigned char *preimage32,
+    uint32_t cltv_expiry, uint64_t fee_sats, uint64_t *out_amount,
+    unsigned char *txid_out32)
+{
+    if (!ch || !signed_tx_out || !pcp || !commitment_txid || !htlc_spk34 ||
+        !payment_hash32 || !preimage32)
+        return 0;
+
+    /* Never put a wrong preimage on chain. */
+    unsigned char h[32];
+    sha256(preimage32, 32, h);
+    if (memcmp(h, payment_hash32, 32) != 0) {
+        fprintf(stderr, "HTLC claim: preimage does not match payment hash\n");
+        return 0;
+    }
+
+    tapscript_leaf_t success_leaf, timeout_leaf;
+    secp256k1_xonly_pubkey internal;
+    int parity = 0;
+    unsigned char spk[34];
+    if (!channel_htlc_claim_tree(ch, side, pcp, payment_hash32, cltv_expiry,
+                                  &success_leaf, &timeout_leaf, &internal,
+                                  &parity, spk))
+        return 0;
+    if (memcmp(spk, htlc_spk34, 34) != 0) {
+        fprintf(stderr, "HTLC claim: rebuilt script does not match output "
+                "(vout %u)\n", htlc_vout);
+        return 0;
+    }
+
+    /* The success leaf on our own commitment carries the broadcaster CSV;
+       on theirs it has none. */
+    uint32_t nsequence = (side == HTLC_CLAIM_LOCAL_COMMIT)
+                         ? ch->to_self_delay : 0xFFFFFFFD;
+
+    /* Destination: key-path P2TR(local_payment_basepoint), as the
+       HTLC-timeout path, so channel_build_htlc_output_sweep applies. */
+    secp256k1_xonly_pubkey dest_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_xonly, NULL,
+                                             &ch->local_payment_basepoint))
+        return 0;
+    unsigned char dest_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ch->ctx, dest_ser, &dest_xonly))
+        return 0;
+    unsigned char dest_tweak[32];
+    sha256_tagged("TapTweak", dest_ser, 32, dest_tweak);
+    secp256k1_pubkey dest_full;
+    if (!secp256k1_xonly_pubkey_tweak_add(ch->ctx, &dest_full, &dest_xonly,
+                                            dest_tweak))
+        return 0;
+    secp256k1_xonly_pubkey dest_tweaked;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
+                                             &dest_full))
+        return 0;
+
+    uint64_t fee = fee_sats ? fee_sats : channel_htlc_claim_fee(ch);
+    uint64_t amt = htlc_amount > fee ? htlc_amount - fee : 0;
+    if (amt < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "HTLC claim: output %llu sats below dust limit\n",
+                (unsigned long long)amt);
+        return 0;
+    }
+
+    tx_output_t output;
+    build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
+    output.script_pubkey_len = 34;
+    output.amount_sats = amt;
+
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char txid[32];
+    if (!build_unsigned_tx(&unsigned_tx, txid, commitment_txid, htlc_vout,
+                            nsequence, &output, 1)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    unsigned char sighash[32];
+    if (!compute_tapscript_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                    0, htlc_spk34, 34, htlc_amount, nsequence,
+                                    &success_leaf)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    unsigned char key[32];
+    if (!channel_derive_privkey(ch->ctx, key, ch->local_htlc_basepoint_secret,
+                                 pcp)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+    secp256k1_keypair kp;
+    int ok = secp256k1_keypair_create(ch->ctx, &kp, key);
+    secure_zero(key, 32);
+    unsigned char sig64[64];
+    if (ok)
+        ok = secp256k1_schnorrsig_sign32(ch->ctx, sig64, sighash, &kp, NULL);
+    secure_zero(&kp, sizeof(kp));
+    if (!ok) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    unsigned char control_block[65];
+    size_t cb_len = 0;
+    if (!tapscript_build_control_block_2leaf(control_block, &cb_len, parity,
+                                              &internal, &timeout_leaf,
+                                              ch->ctx)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    ok = finalize_script_path_tx_preimage(signed_tx_out,
+            unsigned_tx.data, unsigned_tx.len, sig64, preimage32, 32,
+            success_leaf.script, success_leaf.script_len,
+            control_block, cb_len);
+    tx_buf_free(&unsigned_tx);
+    if (!ok) return 0;
+    if (out_amount) *out_amount = amt;
+    if (txid_out32) memcpy(txid_out32, txid, 32);
     return 1;
 }
 

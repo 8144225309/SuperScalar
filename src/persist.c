@@ -430,7 +430,56 @@ static const char *SCHEMA_SQL =
     "  chan_amount_sats INTEGER NOT NULL,"
     "  epoch INTEGER NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
+    ");"
+    /* v45: channels the LSP failed (no valid revocation from the client),
+       independent of the channels row. */
+    "CREATE TABLE IF NOT EXISTS failed_channels ("
+    "  channel_id INTEGER PRIMARY KEY,"
+    "  recoverable INTEGER NOT NULL DEFAULT 0,"
+    "  reason TEXT NOT NULL DEFAULT ''"
+    ");"
+    /* v45: highest client commitment the LSP signed, per channel. */
+    "CREATE TABLE IF NOT EXISTS remote_commitment_signed ("
+    "  channel_id INTEGER PRIMARY KEY,"
+    "  commitment_number INTEGER NOT NULL,"
+    "  txid TEXT NOT NULL"
+    ");"
+    /* v45: preimages awaiting an on-chain claim (sealed), per factory
+       generation (a rotation reuses the channel ids). */
+    "CREATE TABLE IF NOT EXISTS htlc_preimages_pending ("
+    "  factory_id INTEGER NOT NULL DEFAULT 0,"
+    "  channel_id INTEGER NOT NULL,"
+    "  htlc_id INTEGER NOT NULL,"
+    "  preimage TEXT NOT NULL,"
+    "  PRIMARY KEY (factory_id, channel_id, htlc_id)"
     ");";
+
+/* 1 if the table has the column, 0 if not, -1 on error. */
+static int persist_has_column(sqlite3 *db, const char *table, const char *col) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    int have = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, col) == 0) { have = 1; break; }
+    }
+    sqlite3_finalize(st);
+    return have;
+}
+
+/* Add a column to a table if it does not have it yet.  Returns 1 if the
+   column is there afterwards. */
+static int persist_ensure_column(sqlite3 *db, const char *table,
+                                 const char *col, const char *decl) {
+    int have = persist_has_column(db, table, col);
+    if (have < 0) return 0;
+    if (have) return 1;
+    char sql[256];
+    snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;", table, col, decl);
+    return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+}
 
 int persist_open(persist_t *p, const char *path) {
     if (!p) return 0;
@@ -1381,6 +1430,75 @@ int persist_open(persist_t *p, const char *path) {
         sqlite3_exec(p->db,
             "ALTER TABLE factories ADD COLUMN use_hashlock_poison INTEGER NOT NULL DEFAULT 0;",
             NULL, NULL, NULL);
+    }
+
+    /* v45: on-chain HTLC-success claims ride in pending_sweeps.  They carry
+       what is needed to rebuild the claim after a restart, once the HTLC
+       itself is gone from channel state: the preimage, the HTLC script and
+       the per-commitment point of the commitment holding it.  Each column
+       is added whenever it is missing, whatever version the database is
+       stamped with, so the step is correct in any order relative to other
+       schema changes; if one cannot be added the open fails and the
+       version is not recorded. */
+    {
+        static const char *const claim_cols[][2] = {
+            { "claim_side",   "INTEGER NOT NULL DEFAULT 0" },
+            { "payment_hash", "TEXT NOT NULL DEFAULT ''" },
+            { "preimage",     "TEXT NOT NULL DEFAULT ''" },
+            { "cltv_expiry",  "INTEGER NOT NULL DEFAULT 0" },
+            { "htlc_spk",     "TEXT NOT NULL DEFAULT ''" },
+            { "commit_point", "TEXT NOT NULL DEFAULT ''" },
+            { "claim_amount", "INTEGER NOT NULL DEFAULT 0" },
+        };
+        for (size_t k = 0; k < sizeof(claim_cols) / sizeof(claim_cols[0]); k++) {
+            if (!persist_ensure_column(p->db, "pending_sweeps",
+                                       claim_cols[k][0], claim_cols[k][1])) {
+                fprintf(stderr, "persist_open: migration v45 (pending_sweeps "
+                        "column %s) failed: %s\n", claim_cols[k][0],
+                        sqlite3_errmsg(p->db));
+                sqlite3_close(p->db);
+                p->db = NULL;
+                return 0;
+            }
+        }
+    }
+
+    /* An htlc_preimages_pending table keyed by channel and HTLC only gets
+       the factory generation added to its key.  Its rows belong to the
+       first generation.  The key changes, so the table is rebuilt rather
+       than altered. */
+    {
+        int have = persist_has_column(p->db, "htlc_preimages_pending",
+                                      "factory_id");
+        if (have == 0) {
+            const char *rebuild =
+                "BEGIN;"
+                "CREATE TABLE htlc_preimages_pending_new ("
+                "  factory_id INTEGER NOT NULL DEFAULT 0,"
+                "  channel_id INTEGER NOT NULL,"
+                "  htlc_id INTEGER NOT NULL,"
+                "  preimage TEXT NOT NULL,"
+                "  PRIMARY KEY (factory_id, channel_id, htlc_id));"
+                "INSERT INTO htlc_preimages_pending_new "
+                "  (factory_id, channel_id, htlc_id, preimage) "
+                "  SELECT 0, channel_id, htlc_id, preimage "
+                "  FROM htlc_preimages_pending;"
+                "DROP TABLE htlc_preimages_pending;"
+                "ALTER TABLE htlc_preimages_pending_new "
+                "  RENAME TO htlc_preimages_pending;"
+                "COMMIT;";
+            if (sqlite3_exec(p->db, rebuild, NULL, NULL, NULL) != SQLITE_OK)
+                have = -1;
+        }
+        if (have < 0) {
+            fprintf(stderr, "persist_open: migration v45 "
+                    "(htlc_preimages_pending) failed: %s\n",
+                    sqlite3_errmsg(p->db));
+            sqlite3_exec(p->db, "ROLLBACK;", NULL, NULL, NULL);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
     }
 
     /* Record the current version if not already present */
@@ -2658,7 +2776,7 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
         " commitment_number, funding_txid, funding_vout, state, "
         " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
         " funding_pending_reorg) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?);";
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -2673,10 +2791,13 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     sqlite3_bind_int64(stmt, 7, (sqlite3_int64)ch->commitment_number);
     sqlite3_bind_text(stmt, 8, txid_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 9, (int)ch->funding_vout);
-    sqlite3_bind_int(stmt, 10, (int)ch->to_self_delay);
-    sqlite3_bind_int64(stmt, 11, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
-    sqlite3_bind_int(stmt, 12, ch->use_revocation_leaf);
-    sqlite3_bind_int(stmt, 13, ch->funding_pending_reorg);
+    /* A failed channel stays failed when re-saved. */
+    sqlite3_bind_text(stmt, 10, ch->revocation_failed ? "failed" : "open", -1,
+                      SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 11, (int)ch->to_self_delay);
+    sqlite3_bind_int64(stmt, 12, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
+    sqlite3_bind_int(stmt, 13, ch->use_revocation_leaf);
+    sqlite3_bind_int(stmt, 14, ch->funding_pending_reorg);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2721,6 +2842,207 @@ int persist_load_channel_state(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return 1;
+}
+
+/* Run sql with one integer channel id bound.  Returns 1 if it completed. */
+static int persist_exec_channel(persist_t *p, const char *sql,
+                                uint32_t channel_id) {
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_mark_channel_failed(persist_t *p, uint32_t channel_id,
+                                const char *reason, int recoverable) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO failed_channels (channel_id, recoverable, "
+            "reason) VALUES (?, ?, ?);", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int(stmt, 2, recoverable ? 1 : 0);
+    sqlite3_bind_text(stmt, 3, reason ? reason : "", -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    /* The channels row, where there is one, says so too. */
+    persist_exec_channel(p, "UPDATE channels SET state = 'failed' WHERE id = ?;",
+                         channel_id);
+    return ok;
+}
+
+int persist_clear_channel_failed(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    return persist_exec_channel(p,
+               "DELETE FROM failed_channels WHERE channel_id = ?;", channel_id) &&
+           persist_exec_channel(p,
+               "UPDATE channels SET state = 'open' WHERE id = ? AND "
+               "state = 'failed';", channel_id);
+}
+
+int persist_channel_failure(persist_t *p, uint32_t channel_id,
+                            int *recoverable_out) {
+    if (recoverable_out) *recoverable_out = 0;
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    int failed = 0;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT recoverable FROM failed_channels WHERE channel_id = ?;",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, (int)channel_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            failed = 1;
+            if (recoverable_out)
+                *recoverable_out = sqlite3_column_int(stmt, 0) != 0;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (failed) return 1;
+    if (sqlite3_prepare_v2(p->db, "SELECT state FROM channels WHERE id = ?;",
+                           -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *st = (const char *)sqlite3_column_text(stmt, 0);
+        failed = st && strcmp(st, "failed") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return failed;
+}
+
+int persist_channel_is_failed(persist_t *p, uint32_t channel_id) {
+    return persist_channel_failure(p, channel_id, NULL);
+}
+
+int persist_save_remote_signed(persist_t *p, uint32_t channel_id,
+                               uint64_t commitment_number,
+                               const unsigned char *txid32) {
+    if (!p || !p->db || !txid32) return 0;
+    char hex[65];
+    hex_encode(txid32, 32, hex);
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO remote_commitment_signed (channel_id, "
+            "commitment_number, txid) VALUES (?, ?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commitment_number);
+    sqlite3_bind_text(stmt, 3, hex, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_remote_signed(persist_t *p, uint32_t channel_id,
+                               uint64_t *commitment_number,
+                               unsigned char *txid32) {
+    if (!p || !p->db || !commitment_number || !txid32) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT commitment_number, txid FROM remote_commitment_signed "
+            "WHERE channel_id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int ok = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (hex && strlen(hex) == 64 && hex_decode(hex, txid32, 32) == 32) {
+            *commitment_number = (uint64_t)sqlite3_column_int64(stmt, 0);
+            ok = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_clear_channel_update_state(persist_t *p, uint32_t channel_id) {
+    if (!p || !p->db) return 0;
+    return persist_exec_channel(p,
+               "DELETE FROM remote_commitment_signed WHERE channel_id = ?;",
+               channel_id) &&
+           persist_exec_channel(p,
+               "DELETE FROM failed_channels WHERE channel_id = ?;", channel_id);
+}
+
+int persist_save_pending_preimage(persist_t *p, uint32_t factory_id,
+                                  uint32_t channel_id, uint64_t htlc_id,
+                                  const unsigned char *preimage32) {
+    if (!p || !p->db || !preimage32) return 0;
+    char hex[65];
+    hex_encode(preimage32, 32, hex);
+    char *sealed = persist_seal_text(p, hex);
+    memset(hex, 0, sizeof(hex));
+    if (!sealed) return 0;
+    sqlite3_stmt *stmt;
+    int ok = 0;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR REPLACE INTO htlc_preimages_pending (factory_id, "
+            "channel_id, htlc_id, preimage) VALUES (?, ?, ?, ?);",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)factory_id);
+        sqlite3_bind_int(stmt, 2, (int)channel_id);
+        sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
+        sqlite3_bind_text(stmt, 4, sealed, -1, SQLITE_TRANSIENT);
+        ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+    }
+    free(sealed);
+    return ok;
+}
+
+int persist_delete_pending_preimage(persist_t *p, uint32_t factory_id,
+                                    uint32_t channel_id, uint64_t htlc_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM htlc_preimages_pending WHERE factory_id = ? AND "
+            "channel_id = ? AND htlc_id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)channel_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)htlc_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_pending_preimages(persist_t *p, uint32_t factory_id,
+                                      uint32_t *channel_ids,
+                                      uint64_t *htlc_ids,
+                                      unsigned char (*preimages)[32],
+                                      size_t max) {
+    if (!p || !p->db || !channel_ids || !htlc_ids || !preimages) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT channel_id, htlc_id, preimage FROM htlc_preimages_pending "
+            "WHERE factory_id = ? ORDER BY channel_id, htlc_id;", -1, &stmt,
+            NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)factory_id);
+    size_t n = 0;
+    while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *stored = (const char *)sqlite3_column_text(stmt, 2);
+        char *hex = NULL;
+        if (!stored || !persist_open_text(p, stored, &hex) || !hex ||
+            strlen(hex) != 64 || hex_decode(hex, preimages[n], 32) != 32) {
+            fprintf(stderr, "persist_load_pending_preimages: a row cannot be "
+                    "opened, skipped\n");
+            if (hex) { memset(hex, 0, strlen(hex)); free(hex); }
+            continue;
+        }
+        memset(hex, 0, 64);
+        free(hex);
+        channel_ids[n] = (uint32_t)sqlite3_column_int(stmt, 0);
+        htlc_ids[n] = (uint64_t)sqlite3_column_int64(stmt, 1);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    return n;
 }
 
 int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,

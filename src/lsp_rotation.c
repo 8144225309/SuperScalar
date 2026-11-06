@@ -13,6 +13,7 @@
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
 #include "superscalar/readiness.h"
+#include "superscalar/sweeper.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -274,6 +275,14 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     size_t turnover_ok = 0, turnover_fail = 0;
     for (size_t ci = 0; ci < lsp->n_clients; ci++) {
+        /* A failed channel is closed on chain: its client does not move to
+           the new factory, it stays like a client that is offline. */
+        if (ci < mgr->n_channels && mgr->entries[ci].channel.revocation_failed) {
+            printf("LSP rotate: client %zu channel failed, it stays in the "
+                   "old factory\n", ci);
+            turnover_fail++;
+            continue;
+        }
         if (lsp->client_fds[ci] < 0) {
             printf("LSP rotate: client %zu offline, skipping turnover\n", ci);
             turnover_fail++;
@@ -1128,6 +1137,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         saved_ch_remote[c] = mgr->entries[c].channel.remote_amount;
     }
 
+    /* The old channels' outstanding updates go with them. */
+    lsp_channels_drop_pending_updates(mgr);
     if (!lsp_channels_init(mgr, mgr->ctx, &lsp->factory,
                             saved_seckey, lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: channel reinit failed\n");
@@ -1219,40 +1230,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
        watchtower_watch_revoked_commitment. */
 
     /* Persist new channel state (transactional) */
-    if (mgr->persist) {
-        persist_t *db = (persist_t *)mgr->persist;
-        if (!persist_begin(db)) {
-            fprintf(stderr, "LSP rotate: persist_begin failed for channels\n");
-            return 0;
-        }
-        int ch_ok = 1;
-        for (size_t c = 0; c < mgr->n_channels; c++) {
-            channel_t *ch = &mgr->entries[c].channel;
-            if (!persist_save_channel(db, ch, 0, (uint32_t)c) ||
-                !persist_save_basepoints(db, (uint32_t)c, ch)) {
-                ch_ok = 0;
-                break;
-            }
-            /* Persist remote PCPs (cn=0,1) so reconnect doesn't load
-               stale values from the old channel at the same slot. */
-            unsigned char pcp_ser[33];
-            size_t pcp_len = 33;
-            secp256k1_pubkey pcp;
-            if (channel_get_remote_pcp(ch, 0, &pcp) &&
-                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
-                    &pcp, SECP256K1_EC_COMPRESSED))
-                persist_save_remote_pcp(db, (uint32_t)c, 0, pcp_ser);
-            pcp_len = 33;
-            if (channel_get_remote_pcp(ch, 1, &pcp) &&
-                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
-                    &pcp, SECP256K1_EC_COMPRESSED))
-                persist_save_remote_pcp(db, (uint32_t)c, 1, pcp_ser);
-        }
-        if (ch_ok) {
-            persist_commit(db);
-        } else {
-            fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
-            persist_rollback(db);
+    if (!lsp_rotation_persist_channels(mgr)) {
+        if (mgr->persist) {
             if (rot_cer_persisted) {
                 persist_update_ceremony_state(rot_db, rot_cer_id,
                                                PERSIST_CEREMONY_STATE_ABORTED);
@@ -1294,13 +1273,73 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return 1;
 }
 
+int lsp_rotation_persist_channels(lsp_channel_mgr_t *mgr) {
+    uint32_t gen = mgr->factory_gen + 1;
+    if (mgr->persist) {
+        persist_t *db = (persist_t *)mgr->persist;
+        if (!persist_begin(db)) {
+            fprintf(stderr, "LSP rotate: persist_begin failed for channels\n");
+            return 0;
+        }
+        int ch_ok = 1;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            channel_t *ch = &mgr->entries[c].channel;
+            /* The old factory's channel at this id: what it signed, and
+               whether it failed, does not carry over to the new one. */
+            if (!persist_save_channel(db, ch, 0, (uint32_t)c) ||
+                !persist_save_basepoints(db, (uint32_t)c, ch) ||
+                !persist_clear_channel_update_state(db, (uint32_t)c)) {
+                ch_ok = 0;
+                break;
+            }
+            /* Persist remote PCPs (cn=0,1) so reconnect doesn't load
+               stale values from the old channel at the same slot. */
+            unsigned char pcp_ser[33];
+            size_t pcp_len = 33;
+            secp256k1_pubkey pcp;
+            if (channel_get_remote_pcp(ch, 0, &pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
+                    &pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)c, 0, pcp_ser);
+            pcp_len = 33;
+            if (channel_get_remote_pcp(ch, 1, &pcp) &&
+                secp256k1_ec_pubkey_serialize(mgr->ctx, pcp_ser, &pcp_len,
+                    &pcp, SECP256K1_EC_COMPRESSED))
+                persist_save_remote_pcp(db, (uint32_t)c, 1, pcp_ser);
+        }
+        if (ch_ok && !persist_save_counter(db, "factory_generation", gen))
+            ch_ok = 0;
+        if (!ch_ok) {
+            fprintf(stderr, "LSP rotate: channel persist failed, rolling back\n");
+            persist_rollback(db);
+            return 0;
+        }
+        persist_commit(db);
+    }
+    mgr->factory_gen = gen;
+    if (mgr->sweeper)
+        sweeper_set_factory((sweeper_t *)mgr->sweeper, gen);
+    return 1;
+}
+
+int lsp_rotation_clients_ready(const lsp_channel_mgr_t *mgr) {
+    if (!mgr || !mgr->readiness) return 0;
+    const readiness_tracker_t *rt = (const readiness_tracker_t *)mgr->readiness;
+    size_t n_live = 0, n_ready = 0;
+    for (size_t i = 0; i < rt->n_clients; i++) {
+        if (i < mgr->n_channels && mgr->entries[i].channel.revocation_failed)
+            continue;
+        n_live++;
+        if (rt->clients[i].is_ready) n_ready++;
+    }
+    return n_live > 0 && n_ready == n_live;
+}
+
 int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr->readiness)
+    if (!lsp_rotation_clients_ready(mgr))
         return 0;
 
     readiness_tracker_t *rt = (readiness_tracker_t *)mgr->readiness;
-    if (!readiness_all_ready(rt))
-        return 0;
 
     printf("LSP rotate: all %zu clients ready — firing async rotation ceremony\n",
            rt->n_clients);

@@ -28,7 +28,7 @@ pre-mainnet ops checklist drafted under task #151.
 
 ### Code / audit prerequisites
 
-- [ ] Schema migrations through v39 (at-rest secret encryption) applied
+- [ ] Schema migrations through v45 (v37: at-rest secret encryption; v45: HTLC-success claims) applied
       and tested on a populated DB (per #185)
 - [ ] Factory funding canonical-chain guard active (#125-#129); no
       open issues against `lsp_channels_revalidate_funding`
@@ -539,7 +539,7 @@ gate for flipping the kill switch from `mainnet refused` to
 
 ### Audit prereqs (#152 SF-AUDIT)
 
-- [ ] All schema migrations v1..v39 covered by upgrade tests on a
+- [ ] All schema migrations v1..v45 covered by upgrade tests on a
       populated DB
 - [x] Watchtower restart audit (#135, #161) signed off (per PR #287 commit body)
 - [ ] Reorg correctness audit (#125-#129) signed off

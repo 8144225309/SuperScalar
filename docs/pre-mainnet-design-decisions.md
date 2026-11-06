@@ -176,8 +176,9 @@ BIP-431 TRUC + package relay (1p1c).
 construction/protocol change, and does backup-restore cover the *new* secrets
 (hashlock poison intents, revocation, distribution TX)?
 
-**Current state.** SQLite schema migration is at v39 with a tested ladder
-(v1→v39, data-preserving, idempotent — `tests/test_persist.c`). Encrypted backup
+**Current state.** SQLite schema migration is at v45 with a tested ladder
+(v1→v45, data-preserving, idempotent — `tests/test_persist.c`; the v45
+`pending_sweeps` step also in `tests/test_htlc_claim.c`). Encrypted backup
 (`src/backup.c`: ChaCha20-Poly1305, PBKDF2 600k) covers DB + keyfile; a
 `--backup-dir` pre-rotation snapshot exists. The **new secrets are persisted**
 (`l_stock_poison_reveals`, `revocation_secrets`, `distribution_tx`) and thus

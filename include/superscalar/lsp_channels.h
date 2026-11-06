@@ -45,6 +45,24 @@ typedef struct {
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
     size_t close_spk_len;       /* 34 when populated, 0 if unset */
     uint64_t accumulated_fees_sats; /* routing fees earned on THIS channel */
+    /* The highest commitment of the client's channel the LSP has signed
+       (lsp_channels_update_sign): never another one at that number. */
+    int has_signed;
+    uint64_t signed_cn;
+    unsigned char signed_txid[32];
+    /* The channel failed only for want of a valid revocation of the
+       commitment before the current one: a valid one restores it. */
+    int fail_recoverable;
+    /* What the commitment an update replaced held, while its revocation is
+       outstanding (lsp_update_t*, owned). */
+    void *pending_revoke;
+    /* The commitment signed at signed_cn, while a reconnect has rolled the
+       channel back to the one before it (lsp_update_t*, owned): restored
+       if the client comes back holding it. */
+    void *rolled_back;
+    /* A recoverable failure resumed in memory on reconnect: the disk still
+       records it until the client's next valid revocation. */
+    int fail_on_disk;
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
@@ -188,6 +206,10 @@ typedef struct {
 
     /* Sweeper: auto-sweep timelocked outputs after force-close */
     void *sweeper;    /* sweeper_t* or NULL — avoids header dependency */
+    /* Rotations so far (persisted counter "factory_generation"): the
+       sweeper's HTLC entries and the stored preimages of a channel id are
+       those of the current factory's channel. */
+    uint32_t factory_gen;
 
     /* Native inbound HTLC tracking (fake-SCID / BOLT #4 path) */
     htlc_inbound_table_t htlc_inbound;
@@ -203,6 +225,12 @@ typedef struct {
         int valid;
     } pending_reconnects[8];
     size_t n_pending_reconnects;
+
+    /* Bridge messages read while a client update was waiting, handled by
+       the daemon loop afterwards (wire_msg_t*, owned). */
+    void *deferred_bridge;
+    size_t n_deferred_bridge;
+    size_t deferred_bridge_cap;
 
     /* P2TR scriptPubKey for the LSP's cooperative-close output.
        Symmetric with per-entry close_spk (each client's own P2TR). Derived
@@ -431,9 +459,31 @@ int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
    sends MSG_RECONNECT_ACK. Returns 1 on success. */
 int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd);
 
-/* Detect commitment TXs on-chain and register to_local outputs with the
-   sweeper for CSV-delayed sweep. Called from daemon loop. */
-int lsp_channels_detect_commitment_sweeps(lsp_channel_mgr_t *mgr);
+/* On-chain HTLC-success claims (BOLT #5).  mgr->sweeper, when set, claims
+   HTLCs a client offered us whose preimage we revealed, if the client puts
+   a commitment still holding them on chain.
+   lsp_channels_attach_sweeper: point the sweeper's channel lookup at mgr
+   and install it as mgr->sweeper.
+   lsp_channels_register_htlc_claim: call before revealing the preimage of
+   HTLC htlc_id (still ACTIVE) on channel idx.  Returns 1 if registered
+   (the claim is on disk), 0 if there is nothing to claim on chain, -1 on
+   error (also logged): the preimage must then not be revealed to idx.
+   lsp_channels_register_sender_claims: the same for every HTLC with this
+   preimage's hash that a client other than payee_idx offered us (the
+   senders a fulfil is about to be propagated back to).  Returns the
+   number registered.
+   lsp_channels_cancel_htlc_claims: call once the client's commitment
+   old_cn is validly revoked; only claims on that commitment are dropped.
+   sweeper is a sweeper_t* (void* as mgr->sweeper). */
+int lsp_channels_attach_sweeper(lsp_channel_mgr_t *mgr, void *sweeper);
+int lsp_channels_register_htlc_claim(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t htlc_id,
+                                     const unsigned char *preimage32);
+int lsp_channels_register_sender_claims(lsp_channel_mgr_t *mgr,
+                                        size_t payee_idx,
+                                        const unsigned char *preimage32);
+void lsp_channels_cancel_htlc_claims(lsp_channel_mgr_t *mgr, size_t idx,
+                                     uint64_t old_cn);
 
 /* Balance conservation invariant check.
    Verifies sum(local + remote + active_htlcs + active_ptlcs) == funding_amount

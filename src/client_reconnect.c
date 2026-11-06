@@ -298,6 +298,7 @@ int client_run_reconnect(secp256k1_context *ctx,
     {
         wire_msg_t msg;
         if (!wire_recv(fd, &msg) || msg.msg_type != MSG_CHANNEL_NONCES) {
+            client_note_lsp_error(&msg);
             fprintf(stderr, "Client reconnect: expected CHANNEL_NONCES from LSP\n");
             if (msg.json) cJSON_Delete(msg.json);
             wire_close(fd);

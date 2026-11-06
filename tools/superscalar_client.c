@@ -576,7 +576,22 @@ typedef struct {
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
+    /* On-chain HTLC-success claims (we are payee). */
+    sweeper_t *htlc_sweeper;
 } daemon_cb_data_t;
+
+/* Keep running the HTLC claims while any is pending: once the preimage is
+   out, the HTLC is ours only if the claim confirms. */
+static void client_wait_htlc_claims(sweeper_t *sw) {
+    size_t n = client_run_htlc_claims(sw);
+    if (n > 0)
+        printf("Client: %zu HTLC claim(s) pending on chain; staying up until "
+               "they settle\n", n);
+    while (n > 0 && !g_shutdown) {
+        sleep(10);
+        n = client_run_htlc_claims(sw);
+    }
+}
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
    handler. The MSG_PTLC_PRESIG handler used to adapt the client identity
@@ -700,8 +715,10 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
         }
         /* Unexpected non-PTLC message: queue to inbox so the daemon loop
            can process it, rather than silently discarding it. */
-        if (msg->msg_type == MSG_ERROR)
+        if (msg->msg_type == MSG_ERROR) {
+            client_note_lsp_error(msg);
             return 0;  /* propagate abort */
+        }
         if (inbox) {
             client_inbox_push(inbox, msg);
             msg->json = NULL;  /* inbox owns the json now */
@@ -864,6 +881,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                size_t n_participants,
                                void *user_data) {
     daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
+
+    if (cbd && cbd->htlc_sweeper) {
+        /* Claims are keyed by the channel row (client index) so they can be
+           rebuilt from the DB without this session. */
+        client_set_htlc_live_channel(ch);
+        client_set_htlc_sweeper(cbd->htlc_sweeper,
+                                my_index > 0 ? my_index - 1 : 0);
+    }
 
     /* #21: record whether this factory uses PS (CLTV-gated) leaves, for the
        per-leaf-type forgery response. Factory-level signal (any PS leaf present);
@@ -1096,6 +1121,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (cbd && cbd->wt && (tnow - last_wt) >= 10) {
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
+                if (cbd->htlc_sweeper)
+                    client_run_htlc_claims(cbd->htlc_sweeper);
             }
             /* Periodic fee settlement verification: compare expected share
                (from tracked routing volume) to actual balance increase. */
@@ -2316,7 +2343,7 @@ static void usage(const char *prog) {
 static int client_force_close_from_db(const char *db_path, const char *network,
                                       const char *cli_path, const char *rpcuser,
                                       const char *rpcpassword, const char *datadir,
-                                      int rpcport) {
+                                      int rpcport, char *commit_txid_out) {
     if (!db_path) {
         fprintf(stderr, "Client: CLOSE policy needs --db to force-close; cannot proceed\n");
         return 0;
@@ -2361,9 +2388,11 @@ static int client_force_close_from_db(const char *db_path, const char *network,
             extern void hex_encode(const unsigned char *, size_t, char *);
             hex_encode(signed_tx_data, signed_tx_len, tx_hex);
             char commit_txid[65];
-            if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
+            if (chain.send_raw_tx(&chain, tx_hex, commit_txid)) {
                 fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
                         "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
+                if (commit_txid_out) memcpy(commit_txid_out, commit_txid, 65);
+            }
             free(tx_hex);
         }
     }
@@ -2822,6 +2851,7 @@ int main(int argc, char *argv[]) {
         printf("Force-close: %s (run=%d)\n", fr_status, result);
 
         /* Broadcast signed commitment TX if available */
+        char fc_commit_txid[65] = "";
         {
             unsigned char signed_tx_data[4096];
             size_t signed_tx_len = 0;
@@ -2835,10 +2865,12 @@ int main(int argc, char *argv[]) {
                     extern void hex_encode(const unsigned char *, size_t, char *);
                     hex_encode(signed_tx_data, signed_tx_len, tx_hex);
                     char commit_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
+                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid)) {
                         printf("Force-close: commitment TX broadcast: %s "
                                "(cn=%llu)\n", commit_txid,
                                (unsigned long long)sig_cn);
+                        memcpy(fc_commit_txid, commit_txid, 65);
+                    }
                     else
                         printf("Force-close: commitment TX broadcast failed "
                                "(may need tree to confirm first)\n");
@@ -2873,6 +2905,29 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("Force-close: no distribution TX in DB\n");
             }
+        }
+
+        /* HTLC claims armed before their preimages went out, run from the
+           DB alone: one cycle per run, as the tree and the commitment
+           confirm between runs. */
+        {
+            secp256k1_context *cl_ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+            sweeper_t cl_sw;
+            if (cl_ctx && sweeper_init(&cl_sw, cl_ctx, NULL, NULL, 0, &chain,
+                                       &db, NULL)) {
+                /* Claims on our other commitments stay until the one just
+                   broadcast is buried final (a reorg can still swap it). */
+                client_htlc_claims_attach(&cl_sw, &db, cl_ctx);
+                size_t n_claims = client_run_htlc_claims(&cl_sw);
+                if (n_claims > 0)
+                    printf("Force-close: %zu HTLC claim(s) pending: run "
+                           "--force-close again, or keep the client running, "
+                           "until they settle\n", n_claims);
+                client_htlc_claims_attach(NULL, NULL, NULL);
+                sweeper_cleanup(&cl_sw);
+            }
+            if (cl_ctx) secp256k1_context_destroy(cl_ctx);
         }
 
         persist_close(&db);
@@ -3479,6 +3534,7 @@ int main(int argc, char *argv[]) {
 
     /* Fee estimator — honour --fee-estimator if provided */
     static watchtower_t client_wt;
+    static sweeper_t client_sweeper;
     static fee_estimator_static_t  client_fee_static;
     static fee_estimator_blocks_t  client_fee_blocks;
     static fee_estimator_api_t     client_fee_api;
@@ -3538,6 +3594,13 @@ int main(int argc, char *argv[]) {
         memset(&cbd, 0, sizeof(cbd));
         cbd.db = use_db ? &db : NULL;
         cbd.wt = &client_wt;
+        if (client_wt.chain &&
+            sweeper_init(&client_sweeper, ctx, NULL, NULL, 0, client_wt.chain,
+                         use_db ? &db : NULL, client_fee_ptr)) {
+            client_htlc_claims_attach(&client_sweeper, use_db ? &db : NULL,
+                                      ctx);
+            cbd.htlc_sweeper = &client_sweeper;
+        }
         cbd.fee = client_fee_ptr;
         cbd.rt = rt_ok ? &rt : NULL;
         cbd.lsp_forgery_response = lsp_forgery_mode;
@@ -3656,6 +3719,7 @@ int main(int argc, char *argv[]) {
         }
 
         while (!g_shutdown) {
+            client_reset_lsp_failed_channel();      /* per session */
             if (first_run || !use_db) {
                 ok = client_run_with_channels(ctx, &kp, host, port,
                                                 daemon_channel_cb, &cbd,
@@ -3669,11 +3733,21 @@ int main(int argc, char *argv[]) {
                 ok = client_run_reconnect(ctx, &kp, host, port, &db,
                                             daemon_channel_cb, &cbd);
             }
+            /* The session's channel is gone: claims are built from the DB
+               until the next session. */
+            client_set_htlc_live_channel(NULL);
+            client_set_htlc_sweeper(NULL, 0);
             if (g_shutdown) break;
             if (cbd.lsp_forgery_detected &&
                 cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
                 fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
                         "to a proven-cheating LSP\n");
+                break;
+            }
+            /* The LSP failed our channel (it told us, at the time or on a
+               reconnect): close it on chain, which runs our HTLC claims. */
+            if (client_lsp_failed_channel()) {
+                cbd.force_close_requested = 1;
                 break;
             }
             if (!ok) {
@@ -3682,14 +3756,27 @@ int main(int argc, char *argv[]) {
                    detect on-chain breaches even when the LSP is unreachable. */
                 if (cbd.wt)
                     watchtower_check(cbd.wt);
+                /* Same for HTLC claims, which must not wait for the LSP. */
+                if (cbd.htlc_sweeper) {
+                    static time_t last_claims = 0;
+                    time_t tn = time(NULL);
+                    if (tn - last_claims >= 10) {
+                        last_claims = tn;
+                        client_run_htlc_claims(cbd.htlc_sweeper);
+                    }
+                }
                 sleep(1);
             } else {
                 break;  /* clean exit */
             }
         }
-        if (cbd.force_close_requested)
+        if (cbd.force_close_requested) {
+            char fc_txid[65] = "";
             client_force_close_from_db(db_path, network, cli_path,
-                                       rpcuser, rpcpassword, datadir, rpcport);
+                                       rpcuser, rpcpassword, datadir, rpcport,
+                                       fc_txid);
+        }
+        client_wait_htlc_claims(cbd.htlc_sweeper);
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
@@ -3723,6 +3810,14 @@ int main(int argc, char *argv[]) {
             memset(&cbd, 0, sizeof(cbd));
             cbd.db  = use_db ? &db : NULL;
             cbd.wt  = &client_wt;
+            if (client_wt.chain &&
+                sweeper_init(&client_sweeper, ctx, NULL, NULL, 0,
+                             client_wt.chain, use_db ? &db : NULL,
+                             client_fee_ptr)) {
+                client_htlc_claims_attach(&client_sweeper,
+                                          use_db ? &db : NULL, ctx);
+                cbd.htlc_sweeper = &client_sweeper;
+            }
             cbd.fee = client_fee_ptr;
             cbd.rt  = rt_ok ? &rt : NULL;
             cbd.lsp_forgery_response = lsp_forgery_mode;
@@ -3730,12 +3825,21 @@ int main(int argc, char *argv[]) {
             cbd.poison_db_path = db_path;
             cbd.scripted_actions   = actions;
             cbd.n_scripted_actions = n_actions;
+            client_reset_lsp_failed_channel();      /* per session */
             ok = client_run_with_channels(ctx, &kp, host, port,
                                           daemon_channel_cb, &cbd,
                                           sa_vfn, sa_vctx);
-            if (cbd.force_close_requested)
+            client_set_htlc_live_channel(NULL);
+            client_set_htlc_sweeper(NULL, 0);
+            if (client_lsp_failed_channel())
+                cbd.force_close_requested = 1;
+            if (cbd.force_close_requested) {
+                char fc_txid[65] = "";
                 client_force_close_from_db(db_path, network, cli_path,
-                                           rpcuser, rpcpassword, datadir, rpcport);
+                                           rpcuser, rpcpassword, datadir,
+                                           rpcport, fc_txid);
+            }
+            client_wait_htlc_claims(cbd.htlc_sweeper);
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */
             multi_payment_data_t data = { actions, n_actions, 0 };

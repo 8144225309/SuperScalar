@@ -176,11 +176,46 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
    client daemon dispatch so both handle them identically. */
 int client_handle_async_msg(const wire_msg_t *msg);
 
+/* An MSG_ERROR from the LSP saying it failed our channel
+   (WIRE_ERROR_CHANNEL_FAILED): the channel is to be closed on chain.
+   client_note_lsp_error records it (returns 1 if msg is one);
+   client_lsp_failed_channel reports whether one was seen;
+   client_reset_lsp_failed_channel forgets it.  It holds for one session
+   with the LSP: the daemon resets it before each connection (the LSP
+   says it again on every reconnect to a failed channel). */
+int client_note_lsp_error(const wire_msg_t *msg);
+int client_lsp_failed_channel(void);
+void client_reset_lsp_failed_channel(void);
+
 /* Send FULFILL_HTLC to LSP (reveal preimage for received HTLC).
+   If an HTLC sweeper is set, first registers an on-chain claim of the HTLC
+   from our own commitment, which still holds it until the LSP signs the
+   next one.  The preimage is not revealed (returns 0) if we do not hold
+   our current commitment signed or the claim cannot be registered.
    Returns 1 on success. */
 int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
+
+/* Sweeper (sweeper_t*) used for on-chain HTLC-success claims of the channel
+   identified as channel_id in it.  NULL disables registration.  Claims are
+   dropped again once client_handle_commitment_signed revokes the
+   commitment that held the HTLC. */
+void client_set_htlc_sweeper(void *sweeper, uint32_t channel_id);
+
+/* The channel of the live session (NULL once it ends).  Claims of that
+   channel are built from it while it is set. */
+void client_set_htlc_live_channel(channel_t *ch);
+
+/* Point the sweeper (sweeper_t*) at the claim channel lookup: the live
+   channel, else the channel loaded from db (persist_t*), so claims work
+   with the LSP unreachable, after a restart and after a force-close. */
+void client_htlc_claims_attach(void *sweeper, persist_t *db,
+                               secp256k1_context *ctx);
+
+/* One claim cycle (sweeper_check).  Returns the number of claims still
+   pending (armed claims and claim-output sweeps). */
+size_t client_run_htlc_claims(void *sweeper);
 
 /* Handle a LEAF_REALLOC_PROPOSE from the LSP.
    Reads PROPOSE, sends NONCE, reads ALL_NONCES, sends PSIG, reads DONE.

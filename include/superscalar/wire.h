@@ -393,6 +393,10 @@ cJSON *wire_build_close_done(const unsigned char *tx_data, size_t tx_len);
 /* MSG_ERROR {message} */
 cJSON *wire_build_error(const char *message);
 
+/* Start of the MSG_ERROR message an LSP sends a client whose channel it
+   failed: the client is to close that channel on chain. */
+#define WIRE_ERROR_CHANNEL_FAILED "channel_failed"
+
 /* --- Channel operation message builders (Phase 10) --- */
 
 /* LSP → Client: CHANNEL_READY {channel_id, balance_local_msat, balance_remote_msat} */

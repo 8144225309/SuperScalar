@@ -18,6 +18,72 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
+#include "superscalar/sweeper.h"
+
+static sweeper_t *g_htlc_sweeper;
+static uint32_t   g_htlc_sweeper_channel;
+
+void client_set_htlc_sweeper(void *sweeper, uint32_t channel_id) {
+    g_htlc_sweeper = (sweeper_t *)sweeper;
+    g_htlc_sweeper_channel = channel_id;
+}
+
+/* Channel the claims are built from: the live session's, or, with no
+   session, the channel's keys and basepoints loaded from the DB, which is
+   all a claim needs.  The claims thus keep working while the LSP is
+   unreachable, after a restart, and after a force-close. */
+static channel_t         *g_htlc_live_ch;
+static persist_t         *g_htlc_db;
+static secp256k1_context *g_htlc_ctx;
+static channel_t          g_htlc_db_ch;
+static int                g_htlc_db_ch_loaded;
+static uint32_t           g_htlc_db_ch_id;
+
+void client_set_htlc_live_channel(channel_t *ch) {
+    g_htlc_live_ch = ch;
+}
+
+static channel_t *client_htlc_claim_channel(void *arg, uint32_t channel_id) {
+    (void)arg;
+    if (g_htlc_live_ch && channel_id == g_htlc_sweeper_channel)
+        return g_htlc_live_ch;
+    if (!g_htlc_db || !g_htlc_ctx) return NULL;
+    if (g_htlc_db_ch_loaded && g_htlc_db_ch_id == channel_id)
+        return &g_htlc_db_ch;
+    if (g_htlc_db_ch_loaded) {
+        channel_cleanup(&g_htlc_db_ch);
+        g_htlc_db_ch_loaded = 0;
+    }
+    if (!persist_load_channel_for_watchtower(g_htlc_db, channel_id, g_htlc_ctx,
+                                             &g_htlc_db_ch)) {
+        fprintf(stderr, "Client: no channel %u in the DB to build an HTLC "
+                "claim from\n", channel_id);
+        return NULL;
+    }
+    g_htlc_db_ch_loaded = 1;
+    g_htlc_db_ch_id = channel_id;
+    return &g_htlc_db_ch;
+}
+
+void client_htlc_claims_attach(void *sweeper, persist_t *db,
+                               secp256k1_context *ctx) {
+    g_htlc_db = db;
+    g_htlc_ctx = ctx;
+    if (g_htlc_db_ch_loaded) {
+        channel_cleanup(&g_htlc_db_ch);
+        g_htlc_db_ch_loaded = 0;
+    }
+    if (sweeper)
+        sweeper_set_channel_lookup((sweeper_t *)sweeper,
+                                   client_htlc_claim_channel, NULL);
+}
+
+size_t client_run_htlc_claims(void *sweeper) {
+    sweeper_t *sw = (sweeper_t *)sweeper;
+    if (!sw) return 0;
+    sweeper_check(sw);
+    return sweeper_pending_claims(sw);
+}
 
 /* Optional NK server authentication pubkey (set via client_set_lsp_pubkey).
  * SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): de-static'd as
@@ -114,12 +180,33 @@ static void client_check_conservation(const channel_t *ch, const char *context) 
     }
 }
 
+static int g_lsp_failed_channel = 0;
+
+int client_note_lsp_error(const wire_msg_t *msg) {
+    if (!msg || msg->msg_type != MSG_ERROR || !msg->json) return 0;
+    cJSON *m = cJSON_GetObjectItem(msg->json, "message");
+    if (!m || !cJSON_IsString(m) ||
+        strncmp(m->valuestring, WIRE_ERROR_CHANNEL_FAILED,
+                strlen(WIRE_ERROR_CHANNEL_FAILED)) != 0)
+        return 0;
+    if (!g_lsp_failed_channel)
+        fprintf(stderr, "Client: CRITICAL: the LSP failed our channel (%s): "
+                "closing it on chain\n", m->valuestring);
+    g_lsp_failed_channel = 1;
+    return 1;
+}
+
+int client_lsp_failed_channel(void) { return g_lsp_failed_channel; }
+
+void client_reset_lsp_failed_channel(void) { g_lsp_failed_channel = 0; }
+
 /* Returns 1 if message is MSG_ERROR (and prints it), 0 otherwise */
 static int check_msg_error(const wire_msg_t *msg) {
     if (msg->msg_type == MSG_ERROR) {
         cJSON *m = cJSON_GetObjectItem(msg->json, "message");
         fprintf(stderr, "Client: LSP error: %s\n",
                 (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
+        client_note_lsp_error(msg);
         return 1;
     }
     return 0;
@@ -208,6 +295,9 @@ int client_handle_async_msg(const wire_msg_t *msg) {
         }
         return 1;
     }
+    /* The LSP failed our channel: noted, the session ends when it hangs up. */
+    if (client_note_lsp_error(msg))
+        return 1;
     return 0;
 }
 
@@ -434,6 +524,11 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     if (!ok)
         fprintf(stderr, "Client: wire_send REVOKE_AND_ACK failed (cn=%llu)\n",
                 (unsigned long long)ch->commitment_number);
+    /* We hold the new commitment signed and have revoked the previous one:
+       a claim registered against it is no longer needed. */
+    if (ok && g_htlc_sweeper && ch->commitment_number > 0)
+        sweeper_cancel_htlc_success(g_htlc_sweeper, g_htlc_sweeper_channel,
+                                    ch->commitment_number - 1);
     return ok;
 }
 
@@ -516,6 +611,28 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
 int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32) {
+    /* Once the LSP has the preimage it may never sign the commitment that
+       settles the HTLC; ours still holds it.  Arm the on-chain claim first,
+       against the commitment we hold signed, and keep the preimage if the
+       claim cannot be armed. */
+    if (g_htlc_sweeper) {
+        if (!channel_holds_signed_commitment(ch)) {
+            fprintf(stderr, "Client: not revealing the preimage of HTLC %llu: "
+                    "our current commitment is not signed by the LSP, so no "
+                    "claim could be armed on it\n",
+                    (unsigned long long)htlc_id);
+            return 0;
+        }
+        if (sweeper_add_htlc_success(g_htlc_sweeper, ch, g_htlc_sweeper_channel,
+                                     0, HTLC_CLAIM_LOCAL_COMMIT, htlc_id,
+                                     preimage32) < 0) {
+            fprintf(stderr, "Client: ALERT: could not register an on-chain "
+                    "claim for HTLC %llu: its preimage is not revealed\n",
+                    (unsigned long long)htlc_id);
+            return 0;
+        }
+    }
+
     /* Fulfill locally */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage32))
         return 0;

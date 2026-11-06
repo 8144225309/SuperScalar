@@ -10,6 +10,7 @@
  */
 
 #include "superscalar/lsp_channels.h"
+#include "superscalar/lsp_channels_internal.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/channel.h"
@@ -248,6 +249,37 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
 
         entry->ready = 1;  /* channels are already operational */
     }
+    lsp_channels_load_update_state(mgr, pdb);
 
     return 1;
+}
+
+void lsp_channels_load_update_state(lsp_channel_mgr_t *mgr, void *db)
+{
+    persist_t *pdb = (persist_t *)db;
+    if (!mgr || !pdb) return;
+    mgr->factory_gen = (uint32_t)persist_load_counter(pdb,
+                                                      "factory_generation", 0);
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        lsp_channel_entry_t *entry = &mgr->entries[c];
+        /* A channel failed before the restart stays failed. */
+        int recoverable = 0;
+        if (persist_channel_failure(pdb, (uint32_t)c, &recoverable)) {
+            entry->channel.revocation_failed = CHANNEL_FAILED_DURABLE;
+            entry->fail_recoverable = recoverable;
+            fprintf(stderr, "LSP recovery: channel %zu is failed (no "
+                    "valid revocation from its client); it must be "
+                    "closed on chain%s\n", c, recoverable
+                    ? " unless the client revokes on reconnect" : "");
+        }
+        /* The commitment last signed for the client: never another one at
+           that number. */
+        uint64_t scn;
+        unsigned char stxid[32];
+        if (persist_load_remote_signed(pdb, (uint32_t)c, &scn, stxid)) {
+            entry->has_signed = 1;
+            entry->signed_cn = scn;
+            memcpy(entry->signed_txid, stxid, 32);
+        }
+    }
 }
