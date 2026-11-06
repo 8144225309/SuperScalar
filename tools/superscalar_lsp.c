@@ -4074,6 +4074,15 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
+    /* lsp_p->factory is configured below, before the creation ceremony runs
+       factory_init on it, so its dynamic arrays (profiles included) must be
+       allocated first: lsp_init leaves them NULL. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        lsp_cleanup(lsp_p);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     if (n_level_arity > 0)
         factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
     else if (leaf_arity == 1)

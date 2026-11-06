@@ -4,6 +4,13 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
 
+## v0.2.1 — Unreleased
+
+### Fixes
+
+- **LSP crash on a fresh start:** the LSP daemon segfaulted after funding at the default arity, and `lsp_run_factory_creation` crashed on any LSP whose factory had not been through `factory_init` (a fresh `lsp_init`, or the factory released before a rotation). Both read or wrote the factory's dynamic arrays before they were allocated. The ceremony no longer leaks the arrays allocated by pre-init configuration either.
+- **Build:** `test_inproc_factory_lifecycle` links with `-DENABLE_SANITIZERS=ON`.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.

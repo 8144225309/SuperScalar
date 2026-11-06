@@ -529,3 +529,6 @@ add_executable(test_inproc_factory_lifecycle tools/test_inproc_factory_lifecycle
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(test_inproc_factory_lifecycle PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_inproc_factory_lifecycle PRIVATE project_sanitizers)
+endif()

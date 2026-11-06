@@ -399,8 +399,19 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     uint64_t saved_fee_per_tx = f->fee_per_tx;
     placement_mode_t saved_placement = f->placement_mode;
     economic_mode_t saved_econ = f->economic_mode;
+    /* f has not been through factory_init yet: it is either zeroed (lsp_init),
+       released (factory_free on rotation), or only partly allocated by the
+       pre-init setters (factory_set_arity, factory_alloc_default_arrays).  Its
+       dynamic arrays, profiles included, may therefore be NULL. */
     participant_profile_t saved_profiles[FACTORY_MAX_SIGNERS];
-    memcpy(saved_profiles, f->profiles, sizeof(saved_profiles));
+    size_t n_saved_profiles = 0;
+    if (f->profiles) {
+        n_saved_profiles = n_total < FACTORY_MAX_SIGNERS ? n_total : FACTORY_MAX_SIGNERS;
+        if (n_saved_profiles > f->config.max_signers)
+            n_saved_profiles = f->config.max_signers;
+        memcpy(saved_profiles, f->profiles,
+               n_saved_profiles * sizeof(saved_profiles[0]));
+    }
     int saved_has_shachain = f->has_shachain;
     int saved_use_flat = f->use_flat_secrets;
     size_t saved_n_secrets = f->n_revocation_secrets;
@@ -410,6 +421,9 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         memcpy(saved_secrets, f->revocation_secrets, saved_n_secrets * 32);
     else if (!saved_use_flat)
         memcpy(saved_shachain_seed, f->shachain_seed, 32);
+    /* factory_init_from_pubkeys memsets f: release whatever the setters above
+       allocated first, or it leaks. */
+    factory_free(f);
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
     if (saved_n_level_arity > 0) {
@@ -429,7 +443,9 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     f->placement_mode = saved_placement;
     f->economic_mode = saved_econ;
-    memcpy(f->profiles, saved_profiles, sizeof(saved_profiles));
+    if (n_saved_profiles > 0)
+        memcpy(f->profiles, saved_profiles,
+               n_saved_profiles * sizeof(saved_profiles[0]));
     if (saved_has_shachain) {
         if (saved_use_flat && saved_secrets)
             factory_set_flat_secrets(f, saved_secrets, saved_n_secrets);
