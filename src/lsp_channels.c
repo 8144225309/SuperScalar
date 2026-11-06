@@ -1,4 +1,5 @@
 #include "superscalar/lsp_channels.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/ceremony.h"
 #include "superscalar/chain_backend.h"
@@ -7279,7 +7280,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         hex_encode(lf->distribution_tx.data,
                                                    lf->distribution_tx.len, dhex);
                                         char dtxid[65];
-                                        if (_cb->send_raw_tx(_cb, dhex, dtxid))
+                                        if (cpfp_send_default(_cb, dhex, dtxid))
                                             printf("LSP: distribution TX broadcast: %s\n",
                                                    dtxid);
                                         free(dhex);
@@ -7518,7 +7519,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                        lf->distribution_tx.len,
                                                        dhex);
                                             char dtxid[65];
-                                            if (_cb->send_raw_tx(_cb, dhex, dtxid))
+                                            if (cpfp_send_default(_cb, dhex, dtxid))
                                                 printf("LSP: fallback distribution "
                                                        "TX: %s\n", dtxid);
                                             else

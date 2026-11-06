@@ -8,6 +8,7 @@
 #include "superscalar/report.h"
 #include "superscalar/persist.h"
 #include "superscalar/fee.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/dw_state.h"
@@ -813,7 +814,11 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
         hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
 
         char txid_out[65];
-        int ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+        (void)rt;  /* broadcasts go through the CPFP default set up in main */
+        cpfp_result_t res = cpfp_send_default(NULL, tx_hex, txid_out);
+        int ok = res != CPFP_FAILED;
+        if (res == CPFP_PARENT_ONLY)
+            printf("  node[%zu] is in the mempool without its CPFP child\n", i);
 
         /* Audit log */
         if (g_db) {
@@ -980,7 +985,10 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
     int bcast_limit = is_regtest ? 60 : confirm_timeout;
     const int CSV_RETRY_INTERVAL_SECS = 60;
     for (int attempt = 0; bcast_waited < bcast_limit; attempt++) {
-        ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+        cpfp_result_t res = cpfp_send_default(NULL, tx_hex, txid_out);
+        ok = res != CPFP_FAILED;
+        if (res == CPFP_PARENT_ONLY)
+            printf("  %s is in the mempool without its CPFP child\n", log_source);
         if (ok) break;
         if (attempt == 0) {
             printf("  %s broadcast pending (waiting for BIP68)...\n", log_source);
@@ -1003,9 +1011,9 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         persist_log_broadcast(g_db, ok ? txid_out : "?", log_source, tx_hex,
                               ok ? "ok" : "failed");
     }
-    free(tx_hex);
 
     if (!ok) {
+        free(tx_hex);
         fprintf(stderr, "force-close: %s broadcast failed after retries\n", log_source);
         return 0;
     }
@@ -1022,15 +1030,31 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         printf("  %s broadcast OK (txid=%.16s...), waiting for stable confirmation...\n",
                log_source, txid_out);
         fflush(stdout);
-        if (!regtest_wait_for_stable_confirmation(rt, txid_out,
-                                                    /*target_depth=*/1,
-                                                    /*max_reorg_depth=*/3,
-                                                    confirm_timeout)) {
+        /* Wait in slices and send the tx again between them: the CPFP path
+           raises its package (a new or replacing anchor child) when it pays
+           less than the urgent estimate or the mempool minimum has risen. */
+        const int REBUMP_INTERVAL_SECS = 600;
+        int waited = 0, confirmed = 0;
+        while (!confirmed && waited < confirm_timeout) {
+            int slice = confirm_timeout - waited;
+            if (slice > REBUMP_INTERVAL_SECS) slice = REBUMP_INTERVAL_SECS;
+            confirmed = regtest_wait_for_stable_confirmation(rt, txid_out,
+                                                             /*target_depth=*/1,
+                                                             /*max_reorg_depth=*/3,
+                                                             slice);
+            waited += slice;
+            if (!confirmed && waited < confirm_timeout) {
+                char again[65];
+                cpfp_send_default(NULL, tx_hex, again);
+            }
+        }
+        if (!confirmed) {
             fprintf(stderr,
                     "  %s confirmation wait timed out or stuck on reorg — "
                     "downstream may need to re-broadcast\n", log_source);
         }
     }
+    free(tx_hex);
 
     if (display_txid_internal_be) {
         unsigned char disp[32];
@@ -3031,6 +3055,10 @@ int main(int argc, char *argv[]) {
         chain_be = (chain_backend_t *)&g_bip158;
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
     }
+    /* Pre-signed txs (tree, distribution TX, commitments) go out through the
+       CPFP path: alone when they pay enough, else as a package with a child
+       spending their P2A anchor, funded from this wallet. */
+    cpfp_set_default(rt_ok ? &rt : NULL, wallet_src, fee_est, max_bump_fee);
 
     /* Apply confirmation depth overrides.
        --safe-confs sets all four; per-operation flags override individually. */
@@ -4327,15 +4355,15 @@ accept_new_factory:
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
-        /* Copy signed distribution TX from ceremony (if available) */
+        /* Copy the co-signed distribution TX from the ceremony, as rotation
+           does: the unsigned one cannot be broadcast at expiry. */
         tx_buf_init(&lf->distribution_tx, 256);
-        if (lsp_p->factory.dist_tx_ready && lsp_p->factory.dist_unsigned_tx.len > 0) {
-            /* dist_unsigned_tx holds the signed version after ceremony */
+        if (lsp_p->factory.dist_tx_ready == 2 && lsp_p->factory.dist_signed_tx.len > 0) {
             tx_buf_free(&lf->distribution_tx);
-            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_unsigned_tx.len);
-            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_unsigned_tx.data,
-                   lsp_p->factory.dist_unsigned_tx.len);
-            lf->distribution_tx.len = lsp_p->factory.dist_unsigned_tx.len;
+            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_signed_tx.len);
+            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_signed_tx.data,
+                   lsp_p->factory.dist_signed_tx.len);
+            lf->distribution_tx.len = lsp_p->factory.dist_signed_tx.len;
             printf("LSP: distribution TX stored (%zu bytes)\n",
                    lf->distribution_tx.len);
         }

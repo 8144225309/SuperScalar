@@ -2581,7 +2581,7 @@
                 fflush(stderr);
             }
 
-            int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_str);
+            int sent = cpfp_send_default(NULL, commit_hex, commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, sent ? commit_txid_str : "?",
                     "htlc_commitment", commit_hex, sent ? "ok" : "failed");
@@ -3639,7 +3639,7 @@
             }
             hex_encode(pc_commit_signed.data, pc_commit_signed.len, pc_commit_hex);
             char pc_commit_txid_str[65];
-            int pc_sent = regtest_send_raw_tx(&rt, pc_commit_hex,
+            int pc_sent = cpfp_send_default(NULL, pc_commit_hex,
                                                 pc_commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, pc_sent ? pc_commit_txid_str : "?",
@@ -4194,7 +4194,7 @@ bc_oom:
 
                 char *chex = malloc(cs.len * 2 + 1);
                 hex_encode(cs.data, cs.len, chex);
-                int csent = regtest_send_raw_tx(&rt, chex, commit_txids[ci]);
+                int csent = cpfp_send_default(NULL, chex, commit_txids[ci]);
                 if (g_db) {
                     char label[64];
                     snprintf(label, sizeof(label), "multi_htlc_commit_%zu", ci);
@@ -4402,7 +4402,7 @@ bc_oom:
                 char *chex = malloc(cs.len * 2 + 1);
                 hex_encode(cs.data, cs.len, chex);
                 char ctxid_str[65];
-                int csent = regtest_send_raw_tx(&rt, chex, ctxid_str);
+                int csent = cpfp_send_default(NULL, chex, ctxid_str);
                 if (g_db) {
                     char label[64];
                     snprintf(label, sizeof(label), "settlement_commit_%zu", ci);

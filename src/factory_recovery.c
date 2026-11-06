@@ -10,6 +10,7 @@
  */
 
 #include "superscalar/factory_recovery.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/tx_builder.h"
@@ -158,7 +159,7 @@ static int broadcast_node(chain_backend_t *chain, persist_t *p,
     char source[40];
     snprintf(source, sizeof(source), "recovery_node_%d", node->node_index);
 
-    int ok = chain->send_raw_tx(chain, node->signed_tx_hex, result_txid);
+    int ok = cpfp_send_default(chain, node->signed_tx_hex, result_txid);
 
     /* Log every attempt (success or failure) to the broadcast audit table */
     const char *log_txid = result_txid[0] ? result_txid : node->txid;
@@ -223,7 +224,8 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
     /* Track which nodes were broadcast this call to avoid re-sending the
      * same TX repeatedly when it is already in the mempool (send_raw_tx
      * can succeed multiple times for a mempool TX, which would spin the
-     * progress loop forever). */
+     * progress loop forever).  A node still in the mempool from an earlier
+     * call is sent again: the CPFP path re-bumps it if it pays too little. */
     int broadcast_done[FR_MAX_NODES];
     memset(broadcast_done, 0, sizeof(broadcast_done));
 
@@ -237,29 +239,30 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
             if (nd->confs >= 1 || broadcast_done[i]) continue;
             if (!nd->signed_tx_hex) continue; /* not yet signed — skip */
 
-            /* Determine whether parent is confirmed (or just broadcast
-             * this call — in-mempool parent is sufficient for child). */
             /* Gate on explicit force-close request. Scan mode (startup /
                reorg) just refreshes confs and never broadcasts — otherwise
                a fresh, healthy factory gets its tree force-published the
                moment the funding TX confirms. */
             if (!allow_root_broadcast) continue;
 
+            /* A child goes out only once its parent is CONFIRMED.  Tree txs
+               are TRUC: an unconfirmed TRUC tx may have one unconfirmed
+               ancestor and one descendant, so a child sent while the parent
+               is in the mempool is either rejected or takes the parent's only
+               descendant slot, which the CPFP child on the parent's anchor
+               needs. */
             int parent_ok = 0;
             if (nd->parent_index < 0) {
                 /* Root node (kickoff): depends on the factory funding TX. */
                 parent_ok = (funding_confs >= chain_funding_confs(chain, chain->is_regtest));
             } else {
                 fr_node_t *par = find_node(nodes, n, nd->parent_index);
-                int par_i = par ? (int)(par - nodes) : -1;
-                parent_ok = par && ((par->confs >= 1) ||
-                                    (par_i >= 0 && broadcast_done[par_i]));
+                parent_ok = par && par->confs >= 1;
             }
             if (!parent_ok) continue;
 
             int ok = broadcast_node(chain, p, nd, factory_id);
             if (ok) {
-                /* Treat as in-mempool so children can be queued in same pass */
                 nd->confs = 0;
                 broadcast_done[i] = 1;
                 total_broadcast++;
