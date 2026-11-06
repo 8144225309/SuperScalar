@@ -111,6 +111,16 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
                                   uint64_t target_rate, uint64_t max_child_fee,
                                   const char *tx_hex, char *txid_out);
 
+/* Oldest Bitcoin Core (getnetworkinfo "version") that relays the exit:
+   TRUC transactions, P2A anchors and 1-parent-1-child package relay
+   through submitpackage all need 28.0. */
+#define CPFP_MIN_NODE_VERSION 280000
+
+/* 0, after an error naming the version, when the node behind rt is older
+   than CPFP_MIN_NODE_VERSION; 1 otherwise (also when rt is NULL or the
+   version cannot be read, with a warning). */
+int cpfp_check_node_version(regtest_t *rt);
+
 /* Process-wide defaults for broadcast paths that only hold a chain backend
    (factory recovery, client force-close).  rt NULL disables packaging.
    urgent (optional): its FEE_TARGET_URGENT rate is the target_rate, so a

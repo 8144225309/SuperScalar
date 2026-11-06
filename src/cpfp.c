@@ -778,6 +778,30 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
     return res;
 }
 
+/* ---- node requirements ------------------------------------------------ */
+
+int cpfp_check_node_version(regtest_t *rt) {
+    if (!rt) return 1;
+    cJSON *j = rpc_json(rt, "getnetworkinfo", "", 0);
+    cJSON *v = j ? cJSON_GetObjectItem(j, "version") : NULL;
+    if (!v || !cJSON_IsNumber(v)) {
+        cJSON_Delete(j);
+        fprintf(stderr, "WARNING: cannot read the Bitcoin Core version "
+                "(getnetworkinfo); Bitcoin Core %d.%d or later is required\n",
+                CPFP_MIN_NODE_VERSION / 10000, (CPFP_MIN_NODE_VERSION / 100) % 100);
+        return 1;
+    }
+    long ver = (long)v->valuedouble;
+    cJSON_Delete(j);
+    if (ver >= CPFP_MIN_NODE_VERSION) return 1;
+    fprintf(stderr, "ERROR: Bitcoin Core %ld.%ld.%ld is too old: factory exits use "
+            "TRUC (nVersion 3) transactions, P2A anchors and package relay "
+            "(submitpackage), which need Bitcoin Core %d.%d or later\n",
+            ver / 10000, (ver / 100) % 100, ver % 100,
+            CPFP_MIN_NODE_VERSION / 10000, (CPFP_MIN_NODE_VERSION / 100) % 100);
+    return 0;
+}
+
 /* ---- process defaults ------------------------------------------------- */
 
 static regtest_t *g_cpfp_rt;

@@ -95,10 +95,11 @@ static fee_estimator_t *client_exit_fee_estimator(regtest_t *rt, const char **mo
    of rt bound to --wallet (the caller's rt keeps its own wallet setting).  A
    pre-signed tx goes alone only when it pays the mempool minimum and the
    urgent fee estimate; otherwise it is packaged (or re-bumped) with a child. */
-static void client_setup_cpfp(const regtest_t *rt) {
+static int client_setup_cpfp(const regtest_t *rt) {
     wallet_source_t *w = NULL;
     fee_estimator_t *urgent = NULL;
     const char *mode = "none";
+    if (rt && !cpfp_check_node_version((regtest_t *)rt)) return 0;
     if (rt) {
         g_client_cpfp_rt = *rt;
         if (g_client_wallet_name) {
@@ -115,6 +116,7 @@ static void client_setup_cpfp(const regtest_t *rt) {
            "target: urgent estimate from %s)\n",
            rt ? "bitcoind RPC, package relay" : "chain backend",
            w ? g_client_wallet_name : "anchor only", mode);
+    return 1;
 }
 
 static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
@@ -2417,7 +2419,10 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         have_rt = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
                                     datadir, rpcport);
     }
-    client_setup_cpfp(have_rt ? &rt : NULL);
+    if (!client_setup_cpfp(have_rt ? &rt : NULL)) {
+        persist_close(&db);
+        return 0;
+    }
     if (!have_chain) {
         fprintf(stderr, "Client: CLOSE policy: no chain backend (need regtest or "
                 "--rpcuser/--rpcpassword) — cannot force-close\n");
@@ -2900,7 +2905,10 @@ int main(int argc, char *argv[]) {
             persist_close(&db);
             return 1;
         }
-        client_setup_cpfp(have_rt ? &rt : NULL);
+        if (!client_setup_cpfp(have_rt ? &rt : NULL)) {
+            persist_close(&db);
+            return 1;
+        }
 
         /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
            signed factory tree is published root-down. factory_recovery_scan() is the
@@ -3556,7 +3564,7 @@ int main(int argc, char *argv[]) {
     regtest_t rt;
     int rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
                                   datadir, rpcport);
-    if (rt_ok) client_setup_cpfp(&rt);
+    if (rt_ok && !client_setup_cpfp(&rt)) return 1;
     if (!rt_ok)
         fprintf(stderr, "Client: regtest init failed (watchtower/RPC disabled)\n");
     /* CL7.B: expose rt to client_handle_leaf_advance so --cheat-client can

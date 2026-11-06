@@ -2972,6 +2972,10 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    if (rt_ok && !cpfp_check_node_version(&rt)) {
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     /* Auto-create/load wallet (handles "already exists" gracefully) */
     if (rt_ok)
         regtest_create_wallet(&rt, wallet_name ? wallet_name : "superscalar_lsp");

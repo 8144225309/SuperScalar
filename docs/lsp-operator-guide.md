@@ -7,7 +7,10 @@ How to deploy and run a SuperScalar LSP node. Covers regtest, signet, and testne
 ## Prerequisites
 
 - Built `superscalar_lsp` binary (see main [README](../README.md#build))
-- Bitcoin Core 28.1+ (`bitcoind` and `bitcoin-cli`)
+- Bitcoin Core 28.1+ (`bitcoind` and `bitcoin-cli`).  28.0 is the minimum, and
+  the LSP refuses to start on an older node: factory exits are TRUC (nVersion 3)
+  transactions with P2A anchors, relayed through package relay (`submitpackage`)
+  when their pre-signed fee is below what the mempool needs.
 - SQLite3 (system package, used for persistence)
 - A funded wallet on your target network
 
@@ -177,6 +180,8 @@ Press **Ctrl+C**. The LSP will:
 | `--active-blocks` | 20 (regtest) / 4320 (other) | Factory active period in blocks |
 | `--dying-blocks` | 10 (regtest) / 432 (other) | Factory dying period (rotation window) |
 | `--fee-rate` | 1000 | Fee rate in sat/kvB |
+| `--tree-fee-rate N` | estimator | Rate (sat/kvB) the factory tree's pre-signed txs are sized at; default the estimator's 6-block rate, never below 1250 |
+| `--max-tree-fee-rate N` | 100000 | Highest tree fee rate; an estimate above it is clamped (the exit then relies on CPFP). Must match the clients' value |
 
 **Ceremony timeouts on signet/testnet4**: MuSig2 signing ceremonies (factory creation, cooperative close, rotation) use longer message timeouts on non-regtest networks — 120s per message vs 30s on regtest. The cooperative close nonce/psig collection uses 300s per client on signet/testnet4. These are automatic based on `--network`; no flags needed.
 
@@ -323,7 +328,7 @@ The watchtower prints heartbeat messages and broadcasts the relevant pre-signed 
 | `--datadir PATH` | (default) | Bitcoin datadir |
 | `--rpcport PORT` | (auto) | Bitcoin RPC port override |
 | `--bump-wallet NAME` | — | Funded wallet the CPFP fee-bumper draws UTXOs from (to CPFP the P2A anchor; the WT holds no protocol keys) |
-| `--max-bump-fee SATS` | — | Cap on cumulative RBF fee bumps for the penalty broadcast |
+| `--max-bump-fee SATS` | 50000 | Cap on the fee of one CPFP child (penalty bumps and every pre-signed exit tx) |
 | `--bump-budget-pct N` | — | Percentage of channel value to budget for fee bumps |
 | `--inspect-db` | off | Diagnostic: dump factory state, breach detections, and chain-state assertions; exits without polling. Useful for forensics on a captured DB. |
 | `--version` | — | Show version and exit |
