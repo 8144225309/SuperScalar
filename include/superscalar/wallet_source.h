@@ -53,7 +53,9 @@ struct wallet_source {
      *            for the signed result — typically tx_len + 200 bytes).
      * spk/spk_len: scriptPubKey of the UTXO being signed.
      * amount_sats: value of the UTXO being signed.
-     * Returns 1 on success (tx updated), 0 on failure.
+     * Returns 1 when input input_idx now carries the wallet's signature (tx
+     * updated), 0 when the wallet could not sign it (e.g. not its coin).
+     * Other inputs (a keyless P2A anchor) may stay unsigned.
      */
     int (*sign_input)(wallet_source_t *self,
                       unsigned char *tx, size_t *tx_len,
@@ -70,6 +72,14 @@ struct wallet_source {
     void (*release_utxo)(wallet_source_t *self,
                          const char *txid_hex, uint32_t vout);
 
+    /*
+     * 1 if the coin txid_hex:vout with scriptPubKey spk is the wallet's own
+     * (it holds the key that spends it), 0 if not or unknown.  May be NULL:
+     * no coin is then taken as the wallet's.
+     */
+    int (*owns_coin)(wallet_source_t *self, const char *txid_hex, uint32_t vout,
+                     const unsigned char *spk, size_t spk_len);
+
     /* Optional cleanup.  NULL if no heap allocs. */
     void (*free)(wallet_source_t *self);
 };
@@ -84,9 +94,22 @@ struct wallet_source {
 typedef struct {
     wallet_source_t base; /* must be first */
     void           *rt;  /* regtest_t *; void* to avoid pulling regtest.h here */
+    /* One prevout the node cannot look up (an output of a tx that is not in
+       the mempool yet, e.g. the P2A anchor of a package parent).  sign_input
+       passes it to the signer when gettxout misses that outpoint. */
+    int             has_hint;
+    char            hint_txid[65];
+    uint32_t        hint_vout;
+    char            hint_spk_hex[69];
+    uint64_t        hint_amount;
 } wallet_source_rpc_t;
 
 /* rt: regtest_t * (cast to void* to match the field type above) */
 void wallet_source_rpc_init(wallet_source_rpc_t *ws, void *rt);
+
+/* Set (txid_hex non-NULL) or clear the prevout hint above. */
+void wallet_source_rpc_set_prevout_hint(wallet_source_rpc_t *ws,
+                                        const char *txid_hex, uint32_t vout,
+                                        const char *spk_hex, uint64_t amount_sats);
 
 #endif /* SUPERSCALAR_WALLET_SOURCE_H */

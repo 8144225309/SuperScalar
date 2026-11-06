@@ -72,7 +72,7 @@ static int rpc_get_change_spk(wallet_source_t *self,
  *   [{"txid":"...","vout":N,"scriptPubKey":"...","amount":X.XXXXXXXX}, ...]
  * or NULL if nothing useful was found.
  * --------------------------------------------------------------------- */
-static char *build_prevtxs_json(regtest_t *rt,
+static char *build_prevtxs_json(regtest_t *rt, const wallet_source_rpc_t *ws,
                                  const unsigned char *tx, size_t tx_len)
 {
     if (!rt || !tx || tx_len < 6) return NULL;
@@ -127,10 +127,42 @@ static char *build_prevtxs_json(regtest_t *rt,
         char params[140];
         snprintf(params, sizeof(params), "\"%s\" %u true", txid_disp, vout);
         char *result = regtest_exec(rt, "gettxout", params);
-        if (!result) continue;
-
-        cJSON *gto = cJSON_Parse(result);
-        free(result);
+        cJSON *gto = NULL;
+        if (result) {
+            gto = cJSON_Parse(result);
+            free(result);
+        }
+        if (!gto || !cJSON_GetObjectItem(gto, "value")) {
+            /* Spent in the mempool (the coin of a child being replaced): the
+               chain state still has it. */
+            snprintf(params, sizeof(params), "\"%s\" %u false", txid_disp, vout);
+            char *r2 = regtest_exec(rt, "gettxout", params);
+            cJSON *g2 = r2 ? cJSON_Parse(r2) : NULL;
+            free(r2);
+            if (g2 && cJSON_GetObjectItem(g2, "value")) {
+                cJSON_Delete(gto);
+                gto = g2;
+            } else {
+                cJSON_Delete(g2);
+            }
+        }
+        if ((!gto || !cJSON_GetObjectItem(gto, "value")) && ws && ws->has_hint &&
+            vout == ws->hint_vout && strcmp(txid_disp, ws->hint_txid) == 0) {
+            if (added) {
+                if (jlen + 1 < json_cap) json[jlen++] = ',';
+            }
+            int n = snprintf(json + jlen, json_cap - jlen,
+                "{\"txid\":\"%s\",\"vout\":%u,"
+                "\"scriptPubKey\":\"%s\",\"amount\":%.8f}",
+                txid_disp, vout, ws->hint_spk_hex,
+                (double)ws->hint_amount / 100000000.0);
+            if (n > 0 && (size_t)n < json_cap - jlen) {
+                jlen += (size_t)n;
+                added++;
+            }
+            cJSON_Delete(gto);
+            continue;
+        }
         if (!gto) continue;
 
         cJSON *val  = cJSON_GetObjectItem(gto, "value");
@@ -160,18 +192,47 @@ static char *build_prevtxs_json(regtest_t *rt,
     return json;
 }
 
+/* Outpoint (display-order txid) spent by input idx of a serialized tx
+   (legacy or segwit encoding).  Returns 1 if found. */
+static int tx_input_outpoint(const unsigned char *tx, size_t len, size_t idx,
+                             char txid_out[65], uint32_t *vout_out)
+{
+    static const char hexchars[] = "0123456789abcdef";
+    if (!tx || len < 10) return 0;
+    size_t pos = (tx[4] == 0x00 && tx[5] == 0x01) ? 6 : 4;
+    size_t n_in = tx[pos++];
+    if (n_in >= 0xfd || idx >= n_in) return 0;
+    for (size_t i = 0; i < n_in; i++) {
+        if (pos + 37 > len) return 0;
+        if (i == idx) {
+            for (int j = 31; j >= 0; j--) {
+                txid_out[(31 - j) * 2]     = hexchars[(tx[pos + j] >> 4) & 0xF];
+                txid_out[(31 - j) * 2 + 1] = hexchars[ tx[pos + j]       & 0xF];
+            }
+            txid_out[64] = '\0';
+            *vout_out = (uint32_t)tx[pos + 32] | ((uint32_t)tx[pos + 33] << 8) |
+                        ((uint32_t)tx[pos + 34] << 16) | ((uint32_t)tx[pos + 35] << 24);
+            return 1;
+        }
+        pos += 36;
+        size_t ss = tx[pos++];
+        if (ss >= 0xfd || pos + ss + 4 > len) return 0;
+        pos += ss + 4;
+    }
+    return 0;
+}
+
 /* -----------------------------------------------------------------------
- * sign_input: wraps regtest_sign_raw_tx_with_wallet.
+ * sign_input: signrawtransactionwithwallet on input input_idx.
  *
- * The watchtower CPFP tx has two inputs:
+ * A CPFP child has two inputs:
  *   input 0 — P2A anchor (anyone-can-spend, no signing needed)
  *   input 1 — wallet UTXO (this is what we sign)
  *
- * We hex-encode the unsigned tx, call signrawtransactionwithwallet with
- * prevtxs built from gettxout for each input (so that Taproot sighash
+ * prevtxs is built from gettxout for each input (so that Taproot sighash
  * sha_amounts covers all input amounts, including the unconfirmed P2A
- * anchor from the penalty tx that is in the mempool).
- * require_complete=0 because the P2A input will never have a signature.
+ * anchor).  Succeeds only when the wallet signed input_idx: a coin that is
+ * not the wallet's comes back unsigned and is a failure.
  * --------------------------------------------------------------------- */
 static int rpc_sign_input(wallet_source_t *self,
                            unsigned char *tx, size_t *tx_len,
@@ -179,9 +240,13 @@ static int rpc_sign_input(wallet_source_t *self,
                            const unsigned char *spk, size_t spk_len,
                            uint64_t amount_sats)
 {
-    (void)input_idx; (void)spk; (void)spk_len; (void)amount_sats;
+    (void)spk; (void)spk_len; (void)amount_sats;
     wallet_source_rpc_t *ws = (wallet_source_rpc_t *)self;
     regtest_t *rt = (regtest_t *)ws->rt;
+
+    char in_txid[65];
+    uint32_t in_vout = 0;
+    if (!tx_input_outpoint(tx, *tx_len, input_idx, in_txid, &in_vout)) return 0;
 
     /* Hex-encode the unsigned tx */
     size_t hex_len = (*tx_len) * 2 + 1;
@@ -200,23 +265,89 @@ static int rpc_sign_input(wallet_source_t *self,
      * This is critical for Taproot signing (BIP 341 sha_amounts covers ALL
      * inputs).  The P2A anchor (input 0) is from the unconfirmed penalty tx
      * in the mempool; gettxout with include_mempool=true finds it. */
-    char *prevtxs = build_prevtxs_json(rt, tx, *tx_len);
-
-    char *signed_hex = regtest_sign_raw_tx_with_wallet(rt, unsigned_hex, prevtxs, 0);
+    char *prevtxs = build_prevtxs_json(rt, ws, tx, *tx_len);
+    size_t plen = strlen(unsigned_hex) + (prevtxs ? strlen(prevtxs) : 0) + 16;
+    char *params = malloc(plen);
+    if (!params) { free(unsigned_hex); free(prevtxs); return 0; }
+    /* single quotes: the RPC call goes through /bin/sh */
+    if (prevtxs) snprintf(params, plen, "\"%s\" '%s'", unsigned_hex, prevtxs);
+    else         snprintf(params, plen, "\"%s\"", unsigned_hex);
     free(unsigned_hex);
     free(prevtxs);
-    if (!signed_hex) return 0;
+    char *result = regtest_exec(rt, "signrawtransactionwithwallet", params);
+    free(params);
+    cJSON *json = result ? cJSON_Parse(result) : NULL;
+    free(result);
+    if (!json) return 0;
 
-    size_t signed_len = strlen(signed_hex) / 2;
-    if (signed_len > *tx_len + 512) {
-        /* Buffer probably too small — shouldn't happen for a 2-input tx */
-        free(signed_hex);
-        return 0;
+    /* "complete" is false whenever any input lacks a signature, the keyless
+       anchor included; what matters is that input_idx has none of the
+       errors signrawtransactionwithwallet lists per unsigned input. */
+    cJSON *hex = cJSON_GetObjectItem(json, "hex");
+    int ok = hex && cJSON_IsString(hex);
+    if (ok && !cJSON_IsTrue(cJSON_GetObjectItem(json, "complete"))) {
+        cJSON *errors = cJSON_GetObjectItem(json, "errors");
+        if (!errors || !cJSON_IsArray(errors)) ok = 0;
+        for (int i = 0; ok && i < cJSON_GetArraySize(errors); i++) {
+            cJSON *e = cJSON_GetArrayItem(errors, i);
+            cJSON *et = cJSON_GetObjectItem(e, "txid");
+            cJSON *ev = cJSON_GetObjectItem(e, "vout");
+            if (!et || !cJSON_IsString(et) || !ev || !cJSON_IsNumber(ev)) continue;
+            if (strcmp(et->valuestring, in_txid) != 0 ||
+                (uint32_t)ev->valuedouble != in_vout) continue;
+            cJSON *msg = cJSON_GetObjectItem(e, "error");
+            fprintf(stderr, "wallet: cannot sign input %zu (%s:%u): %s\n",
+                    input_idx, in_txid, in_vout,
+                    (msg && cJSON_IsString(msg)) ? msg->valuestring : "?");
+            ok = 0;
+        }
     }
-    hex_decode(signed_hex, tx, signed_len);
-    free(signed_hex);
-    *tx_len = signed_len;
-    return 1;
+    size_t signed_len = ok ? strlen(hex->valuestring) / 2 : 0;
+    /* the caller's buffer holds the unsigned tx plus 512 bytes */
+    if (ok && signed_len > *tx_len + 512) ok = 0;
+    if (ok && hex_decode(hex->valuestring, tx, signed_len) != (int)signed_len) ok = 0;
+    if (ok) *tx_len = signed_len;
+    cJSON_Delete(json);
+    return ok;
+}
+
+/* -----------------------------------------------------------------------
+ * owns_coin: the coin's scriptPubKey belongs to the wallet (ismine).
+ * --------------------------------------------------------------------- */
+static int rpc_owns_coin(wallet_source_t *self, const char *txid_hex,
+                          uint32_t vout, const unsigned char *spk,
+                          size_t spk_len)
+{
+    (void)txid_hex; (void)vout;
+    wallet_source_rpc_t *ws = (wallet_source_rpc_t *)self;
+    regtest_t *rt = (regtest_t *)ws->rt;
+    static const char hexchars[] = "0123456789abcdef";
+    if (!spk || spk_len == 0 || spk_len > 64) return 0;
+    char params[160];
+    size_t n = 0;
+    params[n++] = '"';
+    for (size_t i = 0; i < spk_len; i++) {
+        params[n++] = hexchars[(spk[i] >> 4) & 0xF];
+        params[n++] = hexchars[ spk[i]       & 0xF];
+    }
+    params[n++] = '"';
+    params[n] = '\0';
+    char *r = regtest_exec(rt, "decodescript", params);
+    cJSON *d = r ? cJSON_Parse(r) : NULL;
+    free(r);
+    cJSON *addr = d ? cJSON_GetObjectItem(d, "address") : NULL;
+    int mine = 0;
+    if (addr && cJSON_IsString(addr) && strlen(addr->valuestring) < 120) {
+        snprintf(params, sizeof(params), "\"%s\"", addr->valuestring);
+        char *ri = regtest_exec(rt, "getaddressinfo", params);
+        cJSON *info = ri ? cJSON_Parse(ri) : NULL;
+        free(ri);
+        cJSON *im = info ? cJSON_GetObjectItem(info, "ismine") : NULL;
+        mine = im && cJSON_IsTrue(im);
+        cJSON_Delete(info);
+    }
+    cJSON_Delete(d);
+    return mine;
 }
 
 /* -----------------------------------------------------------------------
@@ -232,6 +363,23 @@ static void rpc_release_utxo(wallet_source_t *self,
 /* -----------------------------------------------------------------------
  * Public init
  * --------------------------------------------------------------------- */
+void wallet_source_rpc_set_prevout_hint(wallet_source_rpc_t *ws,
+                                        const char *txid_hex, uint32_t vout,
+                                        const char *spk_hex, uint64_t amount_sats)
+{
+    if (!ws) return;
+    if (!txid_hex || !spk_hex || strlen(txid_hex) != 64 ||
+        strlen(spk_hex) >= sizeof(ws->hint_spk_hex)) {
+        ws->has_hint = 0;
+        return;
+    }
+    memcpy(ws->hint_txid, txid_hex, 65);
+    ws->hint_vout = vout;
+    strcpy(ws->hint_spk_hex, spk_hex);
+    ws->hint_amount = amount_sats;
+    ws->has_hint = 1;
+}
+
 void wallet_source_rpc_init(wallet_source_rpc_t *ws, void *rt)
 {
     if (!ws) return;
@@ -240,6 +388,7 @@ void wallet_source_rpc_init(wallet_source_rpc_t *ws, void *rt)
     ws->base.get_change_spk = rpc_get_change_spk;
     ws->base.sign_input     = rpc_sign_input;
     ws->base.release_utxo   = rpc_release_utxo;
+    ws->base.owns_coin      = rpc_owns_coin;
     ws->base.free           = NULL;
     ws->base.type           = WALLET_SOURCE_RPC;
     ws->rt = rt;

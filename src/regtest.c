@@ -1098,6 +1098,14 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
     return -1;
 }
 
+char *regtest_exec_quiet(const regtest_t *rt, const char *method, const char *params) {
+    int prev = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
+    char *r = regtest_exec(rt, method, params);
+    g_regtest_poll_quiet = prev;
+    return r;
+}
+
 int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     /* Poll-loop quiet scope: suppress -5/-19 noise. Task #200. */
     int prev = g_regtest_poll_quiet;
@@ -1800,7 +1808,9 @@ void regtest_release_utxo(regtest_t *rt, const char *txid_hex, uint32_t vout) {
     char params[160];
     snprintf(params, sizeof(params),
              "true [{\"txid\":\"%s\",\"vout\":%u}]", txid_hex, vout);
-    char *r = regtest_exec(rt, "lockunspent", params);
+    /* After a successful broadcast the wallet has already dropped the lock
+       of the now-spent coin and refuses this ("expected unspent output"). */
+    char *r = regtest_exec_quiet(rt, "lockunspent", params);
     if (r) free(r);
 }
 
