@@ -2229,7 +2229,8 @@
                 reverse_bytes(root_txid_rev, 32);
                 hex_encode(root_txid_rev, 32, root_txid_hex);
                 watchtower_add_pending_tx(&g_watchtower, root_txid_hex,
-                                           1, WATCHTOWER_ANCHOR_AMOUNT);
+                                           1, WATCHTOWER_ANCHOR_AMOUNT,
+                                           lsp_p->factory.funding_amount_sats);
             }
 
             /* Skip cooperative close — factory already spent */

@@ -398,12 +398,15 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                uint64_t anchor_amount,
                                uint64_t target_feerate_kvb);
 
-/* Phase L: register any broadcast tx for CPFP monitoring.
-   Mirrors what penalty-tx broadcast does internally. Returns 1 on success.
-   Returns 0 if table full or wt/txid_hex is NULL. */
+/* Register a broadcast tx for CPFP monitoring: the escalator raises its
+   package through the anchor until it confirms.  value_sats: what the tx
+   moves (its fee budget is bump_budget_pct of it, at most max_bump_fee_sat);
+   0 = not known, the budget is then max_bump_fee_sat.  Returns 1 on success,
+   0 if the table is full or wt/txid_hex is NULL. */
 int watchtower_add_pending_tx(watchtower_t *wt,
                                const char *txid_hex,
                                uint32_t anchor_vout,
-                               uint64_t anchor_amount);
+                               uint64_t anchor_amount,
+                               uint64_t value_sats);
 
 #endif /* SUPERSCALAR_WATCHTOWER_H */
