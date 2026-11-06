@@ -373,6 +373,13 @@ typedef struct {
        it used back here. */
     uint64_t tree_fee_rate;
     fee_estimator_t *fee;  /* LSP side: source of tree_fee_rate when it is 0 */
+    /* LSP side: highest tree fee rate that keeps this factory's pre-signed
+       fees within factory_check_presigned_fee_bounds for its funding (set
+       before funding, see lsp_plan_tree_fee_rate); factory_build_tree lowers
+       a higher rate to it.  0 = no such limit. */
+    uint64_t tree_fee_rate_max;
+    /* 1: factory_build_tree logs nothing (trial builds while planning). */
+    int build_quiet;
 
     /* CLTV timeout (absolute block height) */
     uint32_t cltv_timeout;
@@ -766,6 +773,12 @@ int factory_build_tree(factory_t *f);
    from --max-tree-fee-rate on both daemons; LSP and clients must agree. */
 void factory_set_max_tree_fee_rate(uint64_t sat_per_kvb);
 uint64_t factory_max_tree_fee_rate(void);
+
+/* Rate (sat/kvB) for the transactions the LSP sizes and pays for itself
+   from an estimate: the rotation's cooperative close, JIT and reallocated
+   channel commitments, the JIT close.  fe's NORMAL rate, clamped to
+   factory_max_tree_fee_rate() as the tree is; 0 when fe gives no rate. */
+uint64_t factory_lsp_fee_rate(fee_estimator_t *fe);
 
 /* Effective tree fee rate (sat/kvB): tree_fee_rate, floored at
    FEE_PRESIGNED_FLOOR_SAT_PER_KVB. */

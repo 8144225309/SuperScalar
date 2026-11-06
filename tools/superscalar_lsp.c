@@ -3922,6 +3922,69 @@ accept_new_factory:
     }
     printf("LSP: funding address: %s\n", fund_addr);
 
+    /* lsp_p->factory is configured here, before the creation ceremony runs
+       factory_init on it, so its dynamic arrays (profiles included) must be
+       allocated first: lsp_init leaves them NULL. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        lsp_cleanup(lsp_p);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    /* The tree's pre-signed fees are fixed when the ceremony signs it, so the
+       rate (explicit, else the estimator) must be in place before it runs. */
+    lsp_p->factory.fee = fee_est;
+    lsp_p->factory.tree_fee_rate = tree_fee_rate_arg;
+    if (n_level_arity > 0)
+        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
+    else if (leaf_arity == 1)
+        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
+    else if (leaf_arity == 3)
+        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
+    /* Phase 3: optionally turn the top N depths into kickoff-only static
+       layers (CLTV-timeout-only, no DW state machine).  Must be applied
+       AFTER arity configuration so the DW counter is correctly resized. */
+    if (static_near_root > 0)
+        factory_set_static_near_root(&lsp_p->factory, static_near_root);
+    /* PS k² sub-factory arity: applied AFTER arity configuration so the
+       leaf-count + DW counter recompute correctly for k>1. */
+    if (ps_subfactory_arity_arg > 0)
+        factory_set_ps_subfactory_arity(&lsp_p->factory,
+                                          (uint32_t)ps_subfactory_arity_arg);
+    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
+
+    /* Every signer refuses a tree whose pre-signed exit fees exceed
+       FACTORY_MAX_EXIT_FEE_PCT of the funding (factory_check_presigned_fee_bounds).
+       That bound depends only on the tree shape, the client count, the rate
+       and the funding, so it is settled here, before any funding is
+       broadcast: a factory that fails it even at the floor rate is never
+       funded, and a rate above what it allows is lowered to the highest rate
+       that passes (the clients accept it: it passes their check). */
+    {
+        uint64_t max_rate = 0, asked_rate = 0;
+        char why[256];
+        if (!lsp_plan_tree_fee_rate(lsp_p, &lsp_p->factory, lsp_p->n_clients,
+                                    funding_sats, step_blocks, states_per_layer,
+                                    /* any CLTV: a distribution TX exists */ 1,
+                                    &max_rate, &asked_rate, why, sizeof(why))) {
+            fprintf(stderr, "LSP: refusing to fund the factory: its pre-signed exit "
+                    "fees would exceed %d%% of the %llu sat funding (%s); nothing "
+                    "was funded.  Fund more per client or wait for lower fees.\n",
+                    FACTORY_MAX_EXIT_FEE_PCT, (unsigned long long)funding_sats, why);
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        lsp_p->factory.tree_fee_rate_max = max_rate;
+        if (asked_rate > max_rate)
+            printf("LSP: a tree fee rate of %llu sat/kvB would put more than %d%% of the "
+                   "%llu sat funding into pre-signed exit fees; the tree is sized at "
+                   "%llu sat/kvB at most\n", (unsigned long long)asked_rate,
+                   FACTORY_MAX_EXIT_FEE_PCT, (unsigned long long)funding_sats,
+                   (unsigned long long)max_rate);
+    }
+
     /* === Phase 3: Fund the factory === */
     char mine_addr[128] = {0};
     if (rt_ok) {
@@ -4123,37 +4186,6 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    /* lsp_p->factory is configured below, before the creation ceremony runs
-       factory_init on it, so its dynamic arrays (profiles included) must be
-       allocated first: lsp_init leaves them NULL. */
-    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
-        fprintf(stderr, "LSP: factory array allocation failed\n");
-        lsp_cleanup(lsp_p);
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
-    /* The tree's pre-signed fees are fixed when the ceremony signs it, so the
-       rate (explicit, else the estimator) must be in place before it runs. */
-    lsp_p->factory.fee = fee_est;
-    lsp_p->factory.tree_fee_rate = tree_fee_rate_arg;
-    if (n_level_arity > 0)
-        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
-        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
-    else if (leaf_arity == 3)
-        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
-    /* Phase 3: optionally turn the top N depths into kickoff-only static
-       layers (CLTV-timeout-only, no DW state machine).  Must be applied
-       AFTER arity configuration so the DW counter is correctly resized. */
-    if (static_near_root > 0)
-        factory_set_static_near_root(&lsp_p->factory, static_near_root);
-    /* PS k² sub-factory arity: applied AFTER arity configuration so the
-       leaf-count + DW counter recompute correctly for k>1. */
-    if (ps_subfactory_arity_arg > 0)
-        factory_set_ps_subfactory_arity(&lsp_p->factory,
-                                          (uint32_t)ps_subfactory_arity_arg);
-    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
-    lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
     /* Populate default profiles from CLI config */
     for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {

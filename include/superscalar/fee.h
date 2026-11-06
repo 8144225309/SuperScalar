@@ -49,6 +49,9 @@ uint64_t fee_for_cpfp_child(fee_estimator_t *fe);
 /* Commitment tx is 154 vB base + 43 vB per active HTLC — uses NORMAL rate. */
 uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs);
 
+/* The same commitment fee at a given rate (sat/kvB). */
+uint64_t fee_commitment_tx_at(uint64_t sat_per_kvb, size_t n_htlcs);
+
 /* -----------------------------------------------------------------------
  * Exact sizing for pre-signed transactions
  *

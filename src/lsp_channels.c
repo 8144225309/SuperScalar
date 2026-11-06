@@ -3478,7 +3478,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fee_estimator_static_t _fe_realloc;
         fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
         if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
-        uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
+        uint64_t commit_fee_ra = fee_commitment_tx_at(factory_lsp_fee_rate(_fe_ra), 0);
         if (commit_fee_ra == FEE_INVALID) {
             fprintf(stderr, "LSP realloc: commitment fee not computable\n");
             return 0;
@@ -6692,8 +6692,11 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     } else if (strcmp(line, "rotate") == 0) {
         printf("CLI: forcing rotation\n");
         fflush(stdout);
-        if (lsp_channels_rotate_factory(mgr, lsp))
+        int rot_rc = lsp_channels_rotate_factory(mgr, lsp);
+        if (rot_rc == LSP_ROTATE_OK)
             printf("CLI: rotation succeeded\n");
+        else if (rot_rc == LSP_ROTATE_POSTPONED)
+            printf("CLI: rotation postponed (fees), nothing changed\n");
         else {
             printf("CLI: rotation FAILED\n");
             fflush(stdout);
@@ -7327,6 +7330,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         uint32_t ridx = lf->factory_id % 8;
                                         mgr->rot_retry_count[ridx] = 0;
                                         mgr->rot_last_attempt_block[ridx] = 0;
+                                        mgr->rot_postponed[ridx] = 0;
 
                                         if (mgr->readiness) {
                                             /* Async path: queue rotation request for all clients,
@@ -7387,11 +7391,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                     mgr->entries[rc].offline_detected = 0;
                                                 }
                                             }
-                                            if (ok) {
+                                            if (ok == LSP_ROTATE_OK) {
                                                 printf("LSP: auto-rotation complete — new factory active\n");
                                                 fflush(stdout);
                                                 lsp_rotation_record_success(mgr, lf->factory_id);
-                                            } else {
+                                            } else if (ok == LSP_ROTATE_FAILED) {
                                                 fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
                                                         lf->factory_id);
                                                 lsp_rotation_record_failure(mgr, lf->factory_id,
@@ -7446,9 +7450,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     uint32_t attempt = mgr->rot_retry_count[ridx] + 1;
                                     uint32_t mret = mgr->rot_max_retries > 0
                                                     ? mgr->rot_max_retries : 3;
-                                    printf("LSP: retrying rotation for factory %u "
-                                           "(attempt %u/%u)\n",
-                                           lf->factory_id, attempt, mret);
+                                    if (mgr->rot_postponed[ridx] == 1)
+                                        printf("LSP: retrying postponed rotation for factory "
+                                               "%u (%u/%u retries used)\n",
+                                               lf->factory_id, attempt - 1, mret);
+                                    else
+                                        printf("LSP: retrying rotation for factory %u "
+                                               "(attempt %u/%u)\n",
+                                               lf->factory_id, attempt, mret);
                                     fflush(stdout);
                                     int ok = lsp_channels_rotate_factory(mgr, lsp);
                                     {
@@ -7458,11 +7467,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             mgr->entries[rc].offline_detected = 0;
                                         }
                                     }
-                                    if (ok) {
+                                    if (ok == LSP_ROTATE_OK) {
                                         printf("LSP: retry rotation complete\n");
                                         fflush(stdout);
                                         lsp_rotation_record_success(mgr, lf->factory_id);
-                                    } else {
+                                    } else if (ok == LSP_ROTATE_FAILED) {
                                         lsp_rotation_record_failure(mgr, lf->factory_id,
                                                                     (uint32_t)height);
                                         fprintf(stderr, "LSP: retry rotation FAILED "
@@ -7472,9 +7481,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     /* Max retries exhausted — distribution TX fallback */
                                     uint32_t mret = mgr->rot_max_retries > 0
                                                     ? mgr->rot_max_retries : 3;
-                                    printf("LSP: rotation failed %u times for factory %u"
-                                           " — broadcasting distribution TX\n",
-                                           mret, lf->factory_id);
+                                    if (mgr->rot_postponed[lf->factory_id % 8] == 2)
+                                        printf("LSP: rotation of factory %u postponed on fees"
+                                               " until it expired — broadcasting distribution TX\n",
+                                               lf->factory_id);
+                                    else
+                                        printf("LSP: rotation failed %u times for factory %u"
+                                               " — broadcasting distribution TX\n",
+                                               mret, lf->factory_id);
                                     fflush(stdout);
                                     /* #49/#51: notify all clients (best-effort) that
                                        the rotation ceremony is aborted (retry limit)

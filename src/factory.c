@@ -512,6 +512,10 @@ static uint64_t node_reserve(const factory_t *f, factory_node_t *node,
     return fee + (with_anchor ? (uint64_t)ANCHOR_OUTPUT_AMOUNT : 0);
 }
 
+/* factory_build_tree messages, silenced for trial builds (build_quiet) */
+#define BUILD_LOG(f, ...) do { if (!(f)->build_quiet) printf(__VA_ARGS__); } while (0)
+#define BUILD_ERR(f, ...) do { if (!(f)->build_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
+
 static uint64_t g_max_tree_fee_rate = FACTORY_MAX_TREE_FEE_RATE;
 
 void factory_set_max_tree_fee_rate(uint64_t sat_per_kvb) {
@@ -520,6 +524,13 @@ void factory_set_max_tree_fee_rate(uint64_t sat_per_kvb) {
 
 uint64_t factory_max_tree_fee_rate(void) {
     return g_max_tree_fee_rate;
+}
+
+uint64_t factory_lsp_fee_rate(fee_estimator_t *fe) {
+    if (!fe || !fe->get_rate) return 0;
+    uint64_t r = fe->get_rate(fe, FEE_TARGET_NORMAL);
+    uint64_t max = factory_max_tree_fee_rate();
+    return (max > 0 && r > max) ? max : r;
 }
 
 uint64_t factory_tree_fee_rate(const factory_t *f) {
@@ -576,7 +587,7 @@ static int setup_leaf_outputs(
     uint64_t remainder = output_total - per_output * 3;
 
     if (per_output < CHANNEL_DUST_LIMIT_SATS) {
-        fprintf(stderr, "Factory: output %llu below dust limit\n",
+        BUILD_ERR(f, "Factory: output %llu below dust limit\n",
                 (unsigned long long)per_output);
         return 0;
     }
@@ -1298,7 +1309,7 @@ static int setup_single_leaf_outputs(
     uint64_t remainder = output_total - per_output * 2;
 
     if (per_output < CHANNEL_DUST_LIMIT_SATS) {
-        fprintf(stderr, "Factory: single leaf output %llu below dust limit\n",
+        BUILD_ERR(f, "Factory: single leaf output %llu below dust limit\n",
                 (unsigned long long)per_output);
         return 0;
     }
@@ -1361,7 +1372,7 @@ static int setup_ps_leaf_outputs(
     uint64_t remainder   = output_total - per_output * 2;
 
     if (per_output < CHANNEL_DUST_LIMIT_SATS) {
-        fprintf(stderr, "Factory: PS leaf output %llu below dust limit\n",
+        BUILD_ERR(f, "Factory: PS leaf output %llu below dust limit\n",
                 (unsigned long long)per_output);
         return 0;
     }
@@ -1452,7 +1463,7 @@ static int setup_ps_leaf_with_subfactories(
     uint64_t per_output = output_total / n_outputs;
     uint64_t remainder = output_total - per_output * n_outputs;
     if (per_output < CHANNEL_DUST_LIMIT_SATS) {
-        fprintf(stderr, "Factory: PS k=%u leaf per-output %llu below dust\n",
+        BUILD_ERR(f, "Factory: PS k=%u leaf per-output %llu below dust\n",
                 k, (unsigned long long)per_output);
         return 0;
     }
@@ -1610,7 +1621,7 @@ static int setup_nway_leaf_outputs(
     uint64_t remainder = output_total - per_output * n_outputs;
 
     if (per_output < CHANNEL_DUST_LIMIT_SATS) {
-        fprintf(stderr, "Factory: n-way leaf output %llu below dust limit\n",
+        BUILD_ERR(f, "Factory: n-way leaf output %llu below dust limit\n",
                 (unsigned long long)per_output);
         return 0;
     }
@@ -1970,7 +1981,7 @@ int factory_build_tree(factory_t *f) {
         if (max > 0 && est > max) {
             /* Every client refuses a tree above the agreed maximum: size it
                at the maximum and let CPFP on the anchors cover the rest. */
-            printf("factory: fee estimate %llu sat/kvB above the agreed maximum "
+            BUILD_LOG(f, "factory: fee estimate %llu sat/kvB above the agreed maximum "
                    "tree fee rate; tree sized at %llu sat/kvB (exit relies on "
                    "CPFP)\n", (unsigned long long)est, (unsigned long long)max);
             est = max;
@@ -1978,6 +1989,18 @@ int factory_build_tree(factory_t *f) {
         f->tree_fee_rate = est;
     }
     f->tree_fee_rate = factory_tree_fee_rate(f);
+    if (f->tree_fee_rate_max >= FEE_PRESIGNED_FLOOR_SAT_PER_KVB &&
+        f->tree_fee_rate > f->tree_fee_rate_max) {
+        /* Above it, more than FACTORY_MAX_EXIT_FEE_PCT of the funding would
+           go to pre-signed fees and every signer would refuse the tree. */
+        BUILD_LOG(f, "factory: tree fee rate %llu sat/kvB lowered to %llu sat/kvB, the "
+                  "highest that keeps the pre-signed exit fees within %d%% of the "
+                  "%llu sat funding (exit relies on CPFP for the rest)\n",
+                  (unsigned long long)f->tree_fee_rate,
+                  (unsigned long long)f->tree_fee_rate_max, FACTORY_MAX_EXIT_FEE_PCT,
+                  (unsigned long long)f->funding_amount_sats);
+        f->tree_fee_rate = f->tree_fee_rate_max;
+    }
 
     /* Compute tree metrics (variable arity uses simulation) */
     int tree_depth, n_leaves;
@@ -2024,7 +2047,7 @@ int factory_build_tree(factory_t *f) {
     uint64_t node_min = factory_tree_tx_fee(f, 1, 1, f->use_tree_anchor);
     if (node_min == FEE_INVALID ||
         node_min > (FEE_MAX_SATS / (uint64_t)(total_nodes_ub + 1))) {
-        fprintf(stderr, "factory_build_tree: tree fee rate %llu sat/kvB gives "
+        BUILD_ERR(f, "factory_build_tree: tree fee rate %llu sat/kvB gives "
                 "no payable fee\n", (unsigned long long)f->tree_fee_rate);
         return 0;
     }
@@ -2033,7 +2056,7 @@ int factory_build_tree(factory_t *f) {
                                 (f->use_tree_anchor ? ANCHOR_OUTPUT_AMOUNT : 0)) +
                            (uint64_t)n_leaves * 1092;
     if (f->funding_amount_sats < min_funding) {
-        fprintf(stderr, "factory_build_tree: funding %lu sats below minimum %lu\n",
+        BUILD_ERR(f, "factory_build_tree: funding %lu sats below minimum %lu\n",
                 (unsigned long)f->funding_amount_sats, (unsigned long)min_funding);
         return 0;
     }

@@ -77,8 +77,12 @@ uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs)
 {
     /* Commitment tx: 154 vB base + 43 vB per active HTLC — NORMAL */
     if (!fe || !fe->get_rate) return 0;
-    size_t vsize = 154 + 43 * n_htlcs;
-    return compute_fee(fe->get_rate(fe, FEE_TARGET_NORMAL), vsize);
+    return fee_commitment_tx_at(fe->get_rate(fe, FEE_TARGET_NORMAL), n_htlcs);
+}
+
+uint64_t fee_commitment_tx_at(uint64_t sat_per_kvb, size_t n_htlcs)
+{
+    return compute_fee(sat_per_kvb, 154 + 43 * n_htlcs);
 }
 
 static size_t varint_len(size_t n)

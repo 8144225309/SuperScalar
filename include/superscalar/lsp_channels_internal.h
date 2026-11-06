@@ -22,6 +22,15 @@ int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
 void lsp_rotation_record_failure(lsp_channel_mgr_t *mgr,
                                  uint32_t factory_id, uint32_t cur_height);
 
+/* Record a rotation postponed because the old factory's cooperative close
+   does not fit at the current fee estimate.  Not a failure: the retry count
+   is untouched and should_retry fires again on the next block.  expired:
+   the factory is past its expiry, the last point a rotation can replace it;
+   the retry budget is then spent so the next retry tick takes the
+   distribution-TX fallback. */
+void lsp_rotation_record_postponed(lsp_channel_mgr_t *mgr, uint32_t factory_id,
+                                   uint32_t cur_height, int expired);
+
 /* Record a successful rotation (resets retry state). */
 void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id);
 
