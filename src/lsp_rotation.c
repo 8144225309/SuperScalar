@@ -1201,8 +1201,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             fprintf(stderr, "LSP rotate: persist_begin failed\n");
             return 0;
         }
+        /* with its co-signed distribution TX, broadcast at expiry even
+           after a restart */
+        int has_dist = lsp->factory.dist_tx_ready == 2 &&
+                       lsp->factory.dist_signed_tx.len > 0;
         if (!persist_save_factory(db, &lsp->factory, mgr->ctx, 0) ||
-            !persist_save_tree_nodes(db, &lsp->factory, 0)) {
+            !persist_save_tree_nodes(db, &lsp->factory, 0) ||
+            (has_dist && !persist_save_distribution_tx(db, 0,
+                                                       lsp->factory.dist_signed_tx.data,
+                                                       lsp->factory.dist_signed_tx.len))) {
             fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
             persist_rollback(db);
             return 0;

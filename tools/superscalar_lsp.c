@@ -3192,8 +3192,14 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Set factory lifecycle from current block height */
-            {
+            /* The factory keeps the lifecycle it was created with (its expiry
+               does not move on a restart); one with none recorded starts
+               from the current block height. */
+            if (lsp_rp->factory.active_blocks > 0) {
+                printf("LSP recovery: factory created at block %u (active %u, dying %u "
+                       "blocks)\n", lsp_rp->factory.created_block,
+                       lsp_rp->factory.active_blocks, lsp_rp->factory.dying_blocks);
+            } else {
                 int cur_height = regtest_get_block_height(&rt);
                 if (cur_height > 0)
                     factory_set_lifecycle(&lsp_rp->factory, (uint32_t)cur_height,
@@ -3320,9 +3326,30 @@ int main(int argc, char *argv[]) {
                 lf->factory_id = rec_lad.next_factory_id++;
                 lf->is_initialized = 1;
                 lf->is_funded = 1;
-                lf->cached_state = factory_get_state(&lsp_rp->factory,
-                                                       rec_lad.current_block);
+                /* Starts as ACTIVE: the daemon's first block sees the real
+                   state as a transition, so a factory found DYING starts its
+                   rotation and one found EXPIRED gets its distribution TX
+                   sent, as without the restart. */
+                lf->cached_state = FACTORY_ACTIVE;
                 tx_buf_init(&lf->distribution_tx, 256);
+                size_t dlen = 0;
+                if (persist_load_distribution_tx(&db, 0, NULL, &dlen, 0) && dlen > 0) {
+                    tx_buf_free(&lf->distribution_tx);
+                    tx_buf_init(&lf->distribution_tx, dlen);
+                    cpfp_tx_info_t dti;
+                    if (persist_load_distribution_tx(&db, 0, lf->distribution_tx.data,
+                                                     &dlen, dlen) &&
+                        cpfp_parse_tx(lf->distribution_tx.data, dlen, &dti) &&
+                        dti.n_inputs == 1 &&
+                        memcmp(dti.in_txid[0], lf->factory.funding_txid, 32) == 0 &&
+                        dti.in_vout[0] == lf->factory.funding_vout) {
+                        lf->distribution_tx.len = dlen;
+                        printf("LSP recovery: distribution TX %s loaded\n", dti.txid_hex);
+                    } else {
+                        fprintf(stderr, "LSP recovery: the stored distribution TX does not "
+                                "spend this factory's funding; not used\n");
+                    }
+                }
                 rec_lad.n_factories = 1;
             }
             mgr->ladder = &rec_lad;
@@ -4430,6 +4457,14 @@ accept_new_factory:
                 persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
                     lsp_p->factory.created_block, lsp_p->factory.active_blocks,
                     lsp_p->factory.dying_blocks, 0);
+            }
+            /* The co-signed distribution TX: after a restart the LSP still
+               broadcasts it at expiry. */
+            if (init_ok && lad->factories[0].distribution_tx.len > 0 &&
+                !persist_save_distribution_tx(&db, 0, lad->factories[0].distribution_tx.data,
+                                              lad->factories[0].distribution_tx.len)) {
+                fprintf(stderr, "LSP: warning: failed to persist the distribution TX\n");
+                init_ok = 0;
             }
             if (init_ok)
                 persist_commit(&db);

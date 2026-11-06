@@ -3,6 +3,9 @@
 
 #include "lsp_channels.h"
 #include "lsp.h"
+#include "chain_backend.h"
+#include "cpfp.h"
+#include "ladder.h"
 
 /* Shared helpers used across lsp_channels split modules.
    These are internal to the LSP channel subsystem — not public API. */
@@ -33,5 +36,14 @@ void lsp_rotation_record_postponed(lsp_channel_mgr_t *mgr, uint32_t factory_id,
 
 /* Record a successful rotation (resets retry state). */
 void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id);
+
+/* Where a factory's distribution TX (parsed as ti) stands on chain. */
+typedef enum {
+    LSP_DIST_TO_SEND,          /* funding unspent, the TX in the mempool, or not known */
+    LSP_DIST_CONFIRMED,        /* found by txid, or (no txindex) its outputs exist */
+    LSP_DIST_SPENT_ELSEWHERE   /* funding spent, the TX neither in the mempool nor found */
+} lsp_dist_state_t;
+lsp_dist_state_t lsp_distribution_tx_state(chain_backend_t *cb, const ladder_factory_t *lf,
+                                           const cpfp_tx_info_t *ti);
 
 #endif /* SUPERSCALAR_LSP_CHANNELS_INTERNAL_H */
