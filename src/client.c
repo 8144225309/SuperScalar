@@ -52,6 +52,44 @@ void client_set_min_profit_bps(uint16_t bps) {
     g_min_profit_bps = bps;
 }
 
+void client_set_max_tree_fee_rate(uint64_t sat_per_kvb) {
+    factory_set_max_tree_fee_rate(sat_per_kvb);
+}
+
+int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb) {
+    uint64_t max = factory_max_tree_fee_rate();
+    if (sat_per_kvb < FEE_PRESIGNED_FLOOR_SAT_PER_KVB) return 0;
+    if (max > 0 && sat_per_kvb > max) return 0;
+    return 1;
+}
+
+/* Fee check on a tree the client built from FACTORY_PROPOSE, before it signs
+   anything: the agreed rate must be within the client's bounds, every node
+   must pay at least the pre-signed floor for its real size, and no exit path
+   may pay more than the sanity bounds of factory_check_presigned_fee_bounds. */
+static int client_check_tree_fees(const factory_t *f, uint64_t proposed_rate,
+                                  uint32_t my_index) {
+    if (!client_tree_fee_rate_acceptable(proposed_rate)) {
+        fprintf(stderr, "Client %u: REFUSING — tree fee rate %llu sat/kvB outside "
+                "[%d, %llu]\n", my_index, (unsigned long long)proposed_rate,
+                FEE_PRESIGNED_FLOOR_SAT_PER_KVB,
+                (unsigned long long)factory_max_tree_fee_rate());
+        return 0;
+    }
+    size_t bad = 0;
+    if (!factory_check_tree_fees(f, FEE_PRESIGNED_FLOOR_SAT_PER_KVB, &bad)) {
+        fprintf(stderr, "Client %u: REFUSING — tree node %zu pays below the "
+                "relay floor\n", my_index, bad);
+        return 0;
+    }
+    char why[200];
+    if (!factory_check_presigned_fee_bounds(f, why, sizeof(why))) {
+        fprintf(stderr, "Client %u: REFUSING — %s\n", my_index, why);
+        return 0;
+    }
+    return 1;
+}
+
 /* Optional slot hint sent in HELLO (1..n_clients). 0 = no hint. */
 static int g_slot_hint = 0;
 
@@ -295,6 +333,10 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     fee_estimator_t *_fe = fee_est;
     if (!_fe) { fee_estimator_static_init(&_fe_default, 1000); _fe = &_fe_default.base; }
     uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
+    if (commit_fee == FEE_INVALID) {
+        fprintf(stderr, "client: commitment fee not computable at the current estimate\n");
+        return 0;
+    }
     uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;
     uint64_t remote_amount = usable - local_amount;
@@ -996,7 +1038,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     cJSON *sb = cJSON_GetObjectItem(pj, "step_blocks");
     cJSON *sp = cJSON_GetObjectItem(pj, "states_per_layer");
     cJSON *ct = cJSON_GetObjectItem(pj, "cltv_timeout");
-    cJSON *fp = cJSON_GetObjectItem(pj, "fee_per_tx");
+    cJSON *fp = cJSON_GetObjectItem(pj, "tree_fee_rate");
     if (!fv || !fa || !sb || !sp || !ct || !fp) {
         fprintf(stderr, "Client %u: malformed FACTORY_PROPOSE in rotation\n", my_index);
         return 0;
@@ -1012,7 +1054,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     uint16_t step_blocks = (uint16_t)sb->valuedouble;
     uint32_t states_per_layer = (uint32_t)sp->valuedouble;
     uint32_t cltv_timeout = (uint32_t)ct->valuedouble;
-    uint64_t fee_per_tx = (uint64_t)fp->valuedouble;
+    uint64_t tree_fee_rate = (uint64_t)fp->valuedouble;
     cJSON *arity_item = cJSON_GetObjectItem(pj, "leaf_arity");
     int rot_leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
     uint8_t rot_level_arities[FACTORY_MAX_LEVELS];
@@ -1091,7 +1133,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                               step_blocks, states_per_layer);
     factory_out->cltv_timeout = cltv_timeout;
     factory_out->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
-    factory_out->fee_per_tx = fee_per_tx;
+    factory_out->tree_fee_rate = tree_fee_rate;
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
     memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
@@ -1112,6 +1154,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (!factory_build_tree(factory_out)) {
         printf("Client %u: ROTATION BUILD_TREE FAILED spk=%zu amt=%llu\n", my_index, spk_len, (unsigned long long)funding_amount);
         fflush(stdout);
+        return 0;
+    }
+    if (!client_check_tree_fees(factory_out, tree_fee_rate, my_index)) {
+        client_send_error(fd, "tree_fee_rejected");
         return 0;
     }
     printf("Client %u: rotation tree OK (%zu nodes)\n", my_index, factory_out->n_nodes);
@@ -1217,7 +1263,8 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (dist_slot >= 0 && factory_out->cltv_timeout > 0) {
             tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
             size_t n_dist = factory_compute_distribution_outputs_balanced(
-                factory_out, dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+                factory_out, dist_outputs, FACTORY_MAX_SIGNERS + 1,
+                factory_distribution_fee(factory_out, factory_out->n_participants - 1),
                 rot_n_dist_amounts > 0 ? rot_dist_amounts : NULL,
                 rot_n_dist_amounts);
             if (n_dist > 0 &&
@@ -1753,7 +1800,8 @@ static int client_factory_creation_stateless_signing(
             if (ok) {
                 tx_output_t douts[FACTORY_MAX_SIGNERS + 1];
                 size_t nd = factory_compute_distribution_outputs_balanced(
-                    factory, douts, FACTORY_MAX_SIGNERS + 1, 500,
+                    factory, douts, FACTORY_MAX_SIGNERS + 1,
+                factory_distribution_fee(factory, factory->n_participants - 1),
                     (n_amt > 0) ? dist_amounts : NULL, n_amt);
                 if (nd > 0 && dist_nlock > 0 &&
                     factory_build_distribution_tx_unsigned(factory, douts, nd,
@@ -2037,7 +2085,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         cJSON *sb = cJSON_GetObjectItem(msg.json, "step_blocks");
         cJSON *sp = cJSON_GetObjectItem(msg.json, "states_per_layer");
         cJSON *ct = cJSON_GetObjectItem(msg.json, "cltv_timeout");
-        cJSON *fp = cJSON_GetObjectItem(msg.json, "fee_per_tx");
+        cJSON *fp = cJSON_GetObjectItem(msg.json, "tree_fee_rate");
         if (!fv || !cJSON_IsNumber(fv) || !fa || !cJSON_IsNumber(fa) ||
             !sb || !cJSON_IsNumber(sb) || !sp || !cJSON_IsNumber(sp) ||
             !ct || !cJSON_IsNumber(ct) || !fp || !cJSON_IsNumber(fp)) {
@@ -2056,7 +2104,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     cJSON *sb_item = cJSON_GetObjectItem(msg.json, "step_blocks");
     cJSON *spl_item = cJSON_GetObjectItem(msg.json, "states_per_layer");
     cJSON *ct_item = cJSON_GetObjectItem(msg.json, "cltv_timeout");
-    cJSON *fpt_item = cJSON_GetObjectItem(msg.json, "fee_per_tx");
+    cJSON *fpt_item = cJSON_GetObjectItem(msg.json, "tree_fee_rate");
     if (!fv_item || !fa_item || !sb_item || !spl_item || !ct_item || !fpt_item) {
         fprintf(stderr, "Client: FACTORY_PROPOSE missing required fields\n");
         cJSON_Delete(msg.json);
@@ -2069,7 +2117,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     uint16_t step_blocks = (uint16_t)sb_item->valuedouble;
     uint32_t states_per_layer = (uint32_t)spl_item->valuedouble;
     uint32_t cltv_timeout = (uint32_t)ct_item->valuedouble;
-    uint64_t fee_per_tx = (uint64_t)fpt_item->valuedouble;
+    uint64_t tree_fee_rate = (uint64_t)fpt_item->valuedouble;
     cJSON *arity_item = cJSON_GetObjectItem(msg.json, "leaf_arity");
     int leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
 
@@ -2225,7 +2273,7 @@ int client_run_with_channels(secp256k1_context *ctx,
                               step_blocks, states_per_layer);
     factory->cltv_timeout = cltv_timeout;
     factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
-    factory->fee_per_tx = fee_per_tx;
+    factory->tree_fee_rate = tree_fee_rate;
     factory->placement_mode = (placement_mode_t)placement_mode;
     factory->economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory->profiles, profiles, sizeof(profiles));
@@ -2295,6 +2343,13 @@ int client_run_with_channels(secp256k1_context *ctx,
     if (!factory_build_tree(factory)) {
         fprintf(stderr, "Client: factory_build_tree failed\n");
         client_send_error(fd, "factory_build_tree failed");
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
+    if (!client_check_tree_fees(factory, tree_fee_rate, my_index)) {
+        client_send_error(fd, "tree_fee_rejected");
         factory_free(factory);
         free(factory);
         wire_close(fd);
@@ -2462,7 +2517,8 @@ int client_run_with_channels(secp256k1_context *ctx,
         if (dist_slot >= 0 && factory->cltv_timeout > 0) {
             tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
             size_t n_dist = factory_compute_distribution_outputs_balanced(
-                factory, dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+                factory, dist_outputs, FACTORY_MAX_SIGNERS + 1,
+                factory_distribution_fee(factory, factory->n_participants - 1),
                 init_n_dist_amounts > 0 ? init_dist_amounts : NULL,
                 init_n_dist_amounts);
             if (n_dist > 0 &&

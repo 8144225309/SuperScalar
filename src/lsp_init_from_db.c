@@ -132,6 +132,10 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         fee_estimator_static_init(&_fe_default2, 1000);
         fee_estimator_t *_fe2 = &_fe_default2.base;
         uint64_t commit_fee = fee_for_commitment_tx(_fe2, 0);
+        if (commit_fee == FEE_INVALID) {
+            fprintf(stderr, "lsp_channels_init_from_db: commitment fee not computable\n");
+            return 0;
+        }
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         uint16_t pct2 = mgr->lsp_balance_pct;
         if (pct2 == 0) pct2 = 50;

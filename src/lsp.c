@@ -303,6 +303,147 @@ accept_fail:
     return 0;
 }
 
+/* Tree shape settings that factory_init_from_pubkeys resets. */
+typedef struct {
+    factory_arity_t leaf_arity;
+    size_t n_level_arity;
+    uint8_t level_arity[FACTORY_MAX_LEVELS];
+    uint32_t static_threshold;
+    uint32_t ps_subfactory_arity;
+    placement_mode_t placement;
+    economic_mode_t econ;
+} tree_shape_t;
+
+static void tree_shape_of(const factory_t *f, tree_shape_t *s) {
+    memset(s, 0, sizeof(*s));
+    s->leaf_arity = f->leaf_arity;
+    s->n_level_arity = f->n_level_arity <= FACTORY_MAX_LEVELS ? f->n_level_arity : 0;
+    if (s->n_level_arity > 0)
+        memcpy(s->level_arity, f->level_arity, s->n_level_arity * sizeof(uint8_t));
+    s->static_threshold = f->static_threshold_depth;
+    s->ps_subfactory_arity = f->ps_subfactory_arity;
+    s->placement = f->placement_mode;
+    s->econ = f->economic_mode;
+}
+
+static void tree_shape_apply(factory_t *f, const tree_shape_t *s) {
+    if (s->n_level_arity > 0) {
+        factory_set_level_arity(f, s->level_arity, s->n_level_arity);
+    } else if (s->leaf_arity == FACTORY_ARITY_1) {
+        factory_set_arity(f, FACTORY_ARITY_1);
+    } else if (s->leaf_arity == FACTORY_ARITY_PS) {
+        factory_set_arity(f, FACTORY_ARITY_PS);
+    }
+    if (s->static_threshold > 0)
+        factory_set_static_near_root(f, s->static_threshold);
+    if (s->ps_subfactory_arity > 1)
+        factory_set_ps_subfactory_arity(f, s->ps_subfactory_arity);
+    f->placement_mode = s->placement;
+    f->economic_mode = s->econ;
+}
+
+/* Build, without signing, the tree the creation ceremony would build: cfg's
+   shape, the LSP and the first n_clients clients, funding_amount on a
+   placeholder outpoint, at rate (0: cfg's estimator).  1 if every node pays
+   the floor and the pre-signed fee bounds hold.  *rate_used: the rate the
+   tree was sized at. */
+static int trial_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                      uint64_t funding_amount, uint16_t step_blocks,
+                      uint32_t states_per_layer, uint32_t cltv_timeout,
+                      uint64_t rate, uint64_t *rate_used, char *why, size_t why_len) {
+    if (rate_used) *rate_used = 0;
+    size_t n_total = n_clients + 1;
+    if (n_clients == 0 || n_clients > lsp->n_clients || n_total > FACTORY_MAX_SIGNERS) {
+        snprintf(why, why_len, "%zu clients", n_clients);
+        return 0;
+    }
+    secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+    pks[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n_clients; i++)
+        pks[i + 1] = lsp->client_pubkeys[i];
+    factory_t *t = calloc(1, sizeof(factory_t));
+    if (!t) { snprintf(why, why_len, "out of memory"); return 0; }
+    int ok = 0;
+    tree_shape_t shape;
+    tree_shape_of(cfg, &shape);
+    factory_init_from_pubkeys(t, lsp->ctx, pks, n_total, step_blocks, states_per_layer);
+    tree_shape_apply(t, &shape);
+    t->tree_fee_rate = rate;
+    t->fee = rate ? NULL : cfg->fee;
+    t->cltv_timeout = cltv_timeout;
+    t->use_tree_anchor = 1;
+    t->build_quiet = 1;
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x5a, sizeof(txid));
+    spk[0] = 0x51;
+    spk[1] = 0x20;
+    memset(spk + 2, 0x5a, 32);
+    factory_set_funding(t, txid, 0, funding_amount, spk, sizeof(spk));
+    if (!factory_build_tree(t)) {
+        snprintf(why, why_len, "a %zu-client tree cannot be built from %llu sat at "
+                 "%llu sat/kvB", n_clients, (unsigned long long)funding_amount,
+                 (unsigned long long)t->tree_fee_rate);
+    } else if (!factory_check_tree_fees(t, FEE_PRESIGNED_FLOOR_SAT_PER_KVB, NULL)) {
+        snprintf(why, why_len, "a tree node pays below the pre-signed floor");
+    } else {
+        ok = factory_check_presigned_fee_bounds(t, why, why_len);
+    }
+    if (rate_used) *rate_used = t->tree_fee_rate;
+    factory_free(t);
+    free(t);
+    return ok;
+}
+
+int lsp_plan_tree_fee_rate(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                           uint64_t funding_amount, uint16_t step_blocks,
+                           uint32_t states_per_layer, uint32_t cltv_timeout,
+                           uint64_t *max_rate_out, uint64_t *asked_rate_out,
+                           char *why, size_t why_len) {
+    char dummy[8];
+    if (!why || why_len == 0) { why = dummy; why_len = sizeof(dummy); }
+    why[0] = '\0';
+    if (max_rate_out) *max_rate_out = 0;
+    if (asked_rate_out) *asked_rate_out = 0;
+    if (!lsp || !cfg) return 0;
+    /* the rate asked for: explicit, else the estimate (clamped) */
+    uint64_t asked = 0;
+    char w[200];
+    int asked_ok = trial_tree(lsp, cfg, n_clients, funding_amount, step_blocks,
+                              states_per_layer, cltv_timeout, cfg->tree_fee_rate,
+                              &asked, w, sizeof(w));
+    if (asked < FEE_PRESIGNED_FLOOR_SAT_PER_KVB) asked = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
+    if (asked_rate_out) *asked_rate_out = asked;
+    /* Search up to the explicit rate, or for the estimator up to the
+       maximum clients sign (a later estimate is then bounded too). */
+    uint64_t hi = asked;
+    uint64_t gmax = factory_max_tree_fee_rate();
+    if (cfg->tree_fee_rate == 0 && gmax > hi) hi = gmax;
+    uint64_t lo = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
+    if (!(asked_ok && hi == asked) &&
+        !trial_tree(lsp, cfg, n_clients, funding_amount, step_blocks,
+                    states_per_layer, cltv_timeout, hi, NULL, w, sizeof(w))) {
+        /* the bound fails at hi: find the highest passing rate below it */
+        if (!trial_tree(lsp, cfg, n_clients, funding_amount, step_blocks,
+                        states_per_layer, cltv_timeout, lo, NULL, w, sizeof(w))) {
+            snprintf(why, why_len, "even at the %d sat/kvB floor rate: %s",
+                     FEE_PRESIGNED_FLOOR_SAT_PER_KVB, w);
+            return 0;
+        }
+        /* passes at lo, fails at hi (pre-signed fees grow with the rate) */
+        while (hi - lo > 1) {
+            uint64_t mid = lo + (hi - lo) / 2;
+            if (trial_tree(lsp, cfg, n_clients, funding_amount, step_blocks,
+                           states_per_layer, cltv_timeout, mid, NULL, w, sizeof(w)))
+                lo = mid;
+            else
+                hi = mid;
+        }
+        hi = lo;
+    }
+    if (max_rate_out) *max_rate_out = hi;
+    return 1;
+}
+
 /* Phase 1e.3.b scaffolding: stub for the reversed-flow stateless factory
    creation ceremony.  Currently returns -1 for all cases (caller falls
    through to legacy lsp_run_factory_creation).  Phase 1e.3.c will fill in
@@ -388,17 +529,11 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     for (size_t i = 0; i < lsp->n_clients; i++)
         all_pubkeys[i + 1] = lsp->client_pubkeys[i];
 
-    factory_arity_t saved_arity = f->leaf_arity;
-    size_t saved_n_level_arity = f->n_level_arity;
-    uint8_t saved_level_arity[FACTORY_MAX_LEVELS];
-    if (saved_n_level_arity > 0)
-        memcpy(saved_level_arity, f->level_arity,
-               saved_n_level_arity * sizeof(uint8_t));
-    uint32_t saved_static_threshold = f->static_threshold_depth;
-    uint32_t saved_ps_subfactory_arity = f->ps_subfactory_arity;
-    uint64_t saved_fee_per_tx = f->fee_per_tx;
-    placement_mode_t saved_placement = f->placement_mode;
-    economic_mode_t saved_econ = f->economic_mode;
+    tree_shape_t saved_shape;
+    tree_shape_of(f, &saved_shape);
+    uint64_t saved_tree_fee_rate = f->tree_fee_rate;
+    uint64_t saved_tree_fee_rate_max = f->tree_fee_rate_max;
+    fee_estimator_t *saved_fee_est = f->fee;
     /* f has not been through factory_init yet: it is either zeroed (lsp_init),
        released (factory_free on rotation), or only partly allocated by the
        pre-init setters (factory_set_arity, factory_alloc_default_arrays).  Its
@@ -426,23 +561,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     factory_free(f);
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
-    if (saved_n_level_arity > 0) {
-        factory_set_level_arity(f, saved_level_arity, saved_n_level_arity);
-    } else if (saved_arity == FACTORY_ARITY_1) {
-        factory_set_arity(f, FACTORY_ARITY_1);
-    } else if (saved_arity == FACTORY_ARITY_PS) {
-        factory_set_arity(f, FACTORY_ARITY_PS);
-    }
-    if (saved_static_threshold > 0)
-        factory_set_static_near_root(f, saved_static_threshold);
-    if (saved_ps_subfactory_arity > 1)
-        factory_set_ps_subfactory_arity(f, saved_ps_subfactory_arity);
-    if (saved_fee_per_tx > 200)
-        f->fee_per_tx = saved_fee_per_tx;
+    tree_shape_apply(f, &saved_shape);
+    /* The tree fee rate must be known before the tree is built and signed:
+       factory_init_from_pubkeys cleared both the configured rate and the
+       estimator it falls back to. */
+    f->tree_fee_rate = saved_tree_fee_rate;
+    f->tree_fee_rate_max = saved_tree_fee_rate_max;
+    f->fee = saved_fee_est;
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
-    f->placement_mode = saved_placement;
-    f->economic_mode = saved_econ;
     if (n_saved_profiles > 0)
         memcpy(f->profiles, saved_profiles,
                n_saved_profiles * sizeof(saved_profiles[0]));
@@ -488,6 +615,20 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         fprintf(stderr, "LSP-stateless factory creation: factory_build_tree failed\n");
         return 0;
     }
+    if (!factory_check_tree_fees(f, FEE_PRESIGNED_FLOOR_SAT_PER_KVB, NULL)) {
+        fprintf(stderr, "LSP-stateless factory creation: tree pays below the "
+                "pre-signed fee floor\n");
+        return 0;
+    }
+    {
+        char why[200];
+        if (!factory_check_presigned_fee_bounds(f, why, sizeof(why))) {
+            fprintf(stderr, "LSP-stateless factory creation: refusing to sign: %s\n",
+                    why);
+            return 0;
+        }
+    }
+    printf("LSP: tree fee rate %llu sat/kvB\n", (unsigned long long)f->tree_fee_rate);
 
     /* Send FACTORY_PROPOSE to all clients (tree shape) */
     cJSON *propose = wire_build_factory_propose(f);
@@ -525,14 +666,21 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        net that lets ANYONE broadcast at the factory CLTV to pay every client
        when all parties go offline.  (Legacy rotation also re-signs it later.)
        Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
-    {
+    if (f->cltv_timeout > 0) {
         tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+        uint64_t dist_fee = factory_distribution_fee(f, f->n_participants - 1);
         size_t n_dist = factory_compute_distribution_outputs_balanced(f,
-            dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
+            dist_outputs, FACTORY_MAX_SIGNERS + 1, dist_fee,
             lsp->dist_client_amounts, lsp->dist_n_client_amounts);
-        if (n_dist > 0 && f->cltv_timeout > 0)
-            (void)factory_build_distribution_tx_unsigned(
-                f, dist_outputs, n_dist, f->cltv_timeout);
+        if (n_dist == 0 ||
+            !factory_build_distribution_tx_unsigned(f, dist_outputs, n_dist,
+                                                    f->cltv_timeout)) {
+            fprintf(stderr, "LSP-stateless factory creation: cannot build the "
+                    "distribution TX (fee %llu sat, funding %llu sat); aborting\n",
+                    (unsigned long long)dist_fee,
+                    (unsigned long long)f->funding_amount_sats);
+            return 0;
+        }
     }
 
     /* ---- Reversed stateless signing exchange ---- */

@@ -21,6 +21,11 @@ typedef struct {
     size_t n_departed;
 
     int partial_rotation_done;   /* 1 = old factory retired via partial rotation */
+
+    /* distribution TX broadcast (at expiry or as the rotation fallback) and
+       not yet confirmed: sent again / re-bumped on every block */
+    int dist_pending;
+    char dist_txid[65];
 } ladder_factory_t;
 
 typedef struct {

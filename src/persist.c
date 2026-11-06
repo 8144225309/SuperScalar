@@ -1383,6 +1383,28 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v40: the rate (sat/kvB) the tree's pre-signed txs were sized at.  The
+       tree is rebuilt from it on load, so it must match what was signed.
+       fee_per_tx keeps the mean per-node fee, for reporting. */
+    if (db_version < 40) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN tree_fee_rate INTEGER NOT NULL DEFAULT 0;",
+            NULL, NULL, NULL);
+    }
+    /* v40 (cont.): the factory's lifecycle (block it was created at, ACTIVE
+       and DYING lengths), so a restart keeps its expiry instead of starting
+       a new lifetime; 0 = not recorded.  Added whenever missing (an ALTER of
+       a column that exists fails harmlessly). */
+    {
+        static const char *lifecycle_cols[] = {
+            "ALTER TABLE factories ADD COLUMN created_block INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE factories ADD COLUMN active_blocks INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE factories ADD COLUMN dying_blocks INTEGER NOT NULL DEFAULT 0;",
+        };
+        for (size_t ci = 0; ci < 3; ci++)
+            sqlite3_exec(p->db, lifecycle_cols[ci], NULL, NULL, NULL);
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1553,8 +1575,8 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         "INSERT OR REPLACE INTO factories "
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
         " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
-        " use_hashlock_poison) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " use_hashlock_poison, tree_fee_rate, created_block, active_blocks, dying_blocks) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1570,9 +1592,19 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 6, (int)f->step_blocks);
     sqlite3_bind_int(stmt, 7, (int)f->states_per_layer);
     sqlite3_bind_int(stmt, 8, (int)f->cltv_timeout);
-    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
+    /* fee_per_tx: mean per-node fee, rounded up, so tree tx count x fee_per_tx
+       is the tree's broadcast cost (the dashboard's projection). */
+    uint64_t tree_fees = 0;
+    for (size_t ni = 0; ni < f->n_nodes; ni++)
+        tree_fees += f->nodes[ni].fee_sats;
+    uint64_t mean_node_fee = f->n_nodes ? (tree_fees + f->n_nodes - 1) / f->n_nodes : 0;
+    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)mean_node_fee);
     sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
     sqlite3_bind_int(stmt, 11, f->use_hashlock_poison ? 1 : 0);  /* #59 restart-resume */
+    sqlite3_bind_int64(stmt, 12, (sqlite3_int64)f->tree_fee_rate);
+    sqlite3_bind_int(stmt, 13, (int)f->created_block);
+    sqlite3_bind_int(stmt, 14, (int)f->active_blocks);
+    sqlite3_bind_int(stmt, 15, (int)f->dying_blocks);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2285,8 +2317,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
-        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
-        "use_hashlock_poison "
+        "step_blocks, states_per_layer, cltv_timeout, tree_fee_rate, leaf_arity, "
+        "use_hashlock_poison, created_block, active_blocks, dying_blocks "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2307,13 +2339,16 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint16_t step_blocks = (uint16_t)sqlite3_column_int(stmt, 4);
     uint32_t states_per_layer = (uint32_t)sqlite3_column_int(stmt, 5);
     uint32_t cltv_timeout = (uint32_t)sqlite3_column_int(stmt, 6);
-    uint64_t fee_per_tx = (uint64_t)sqlite3_column_int64(stmt, 7);
+    uint64_t tree_fee_rate = (uint64_t)sqlite3_column_int64(stmt, 7);
     int leaf_arity_raw = sqlite3_column_int(stmt, 8);
     factory_arity_t leaf_arity =
         (leaf_arity_raw == (int)FACTORY_ARITY_1)  ? FACTORY_ARITY_1  :
         (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
                                                      FACTORY_ARITY_2;
     int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
+    uint32_t created_block = (uint32_t)sqlite3_column_int(stmt, 10);
+    uint32_t active_blocks = (uint32_t)sqlite3_column_int(stmt, 11);
+    uint32_t dying_blocks = (uint32_t)sqlite3_column_int(stmt, 12);
 
     /* Data validation (Phase 2: item 2.6) */
     if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
@@ -2339,7 +2374,6 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     }
 
     (void)cltv_timeout;
-    (void)fee_per_tx;
 
     unsigned char funding_txid[32];
     if (txid_hex)
@@ -2415,7 +2449,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                                step_blocks, states_per_layer);
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (restore parity) */
-    f->fee_per_tx = fee_per_tx;
+    factory_set_lifecycle(f, created_block, active_blocks, dying_blocks);
+    f->tree_fee_rate = tree_fee_rate;
     if (leaf_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);
     else if (leaf_arity == FACTORY_ARITY_PS)

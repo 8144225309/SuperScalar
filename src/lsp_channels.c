@@ -1,4 +1,5 @@
 #include "superscalar/lsp_channels.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/ceremony.h"
 #include "superscalar/chain_backend.h"
@@ -251,6 +252,10 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         fee_estimator_static_init(&_fe_default, 1000);
         fee_estimator_t *_fe = &_fe_default.base;
         uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
+        if (commit_fee == FEE_INVALID) {
+            fprintf(stderr, "lsp_channels_init: commitment fee not computable\n");
+            return 0;
+        }
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         /* Balance split: lsp_balance_pct controls LSP share (default 50 = fair) */
         uint16_t pct = mgr->lsp_balance_pct;
@@ -340,6 +345,148 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
 /* Accept a connection on the listen socket and queue it for deferred processing.
    Callable from any wait loop (confirmation waits, ceremony waits, etc.).
    Returns 1 if a connection was queued, 0 otherwise. */
+
+/* ---- distribution TX at expiry ------------------------------------------ */
+
+extern void hex_encode(const unsigned char *, size_t, char *);
+extern void reverse_bytes(unsigned char *, size_t);
+
+/* Broadcast lf's distribution TX through the CPFP path (alone when it pays
+   enough, else as a package with a child on its anchor; re-bumped when it is
+   in the mempool below the urgent rate) and keep it on the retry list:
+   retry_distribution_txs sends it again on every new block until it
+   confirms.  why: log prefix.  Returns 1 if it is in the mempool or a block. */
+static int send_distribution_tx(lsp_channel_mgr_t *mgr, ladder_factory_t *lf,
+                                const char *why) {
+    if (!mgr || !lf || lf->distribution_tx.len == 0 || !mgr->chain_be) return 0;
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    cpfp_tx_info_t ti;
+    if (!cpfp_parse_tx(lf->distribution_tx.data, lf->distribution_tx.len, &ti)) {
+        fprintf(stderr, "LSP: %s distribution TX of factory %u does not parse\n",
+                why, lf->factory_id);
+        return 0;
+    }
+    char *hex = malloc(lf->distribution_tx.len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(lf->distribution_tx.data, lf->distribution_tx.len, hex);
+    char txid[65] = "";
+    cpfp_result_t r = cpfp_send_default(cb, hex, txid);
+    free(hex);
+    if (!lf->dist_pending) {
+        lf->dist_pending = 1;
+        memcpy(lf->dist_txid, ti.txid_hex, 65);
+    }
+    switch (r) {
+    case CPFP_FAILED:
+        fprintf(stderr, "LSP: %s distribution TX %s of factory %u not accepted; "
+                "sending it again every block until it confirms\n", why,
+                ti.txid_hex, lf->factory_id);
+        return 0;
+    case CPFP_BUMP_FAILED:
+        fprintf(stderr, "LSP: %s distribution TX %s of factory %u is in the "
+                "mempool below the target rate and could not be raised; "
+                "retrying every block\n", why, ti.txid_hex, lf->factory_id);
+        return 1;
+    case CPFP_KNOWN:
+        return 1;
+    default:
+        printf("LSP: %s distribution TX %s of factory %u %s\n", why, ti.txid_hex,
+               lf->factory_id, r == CPFP_BUMPED ? "re-bumped in the mempool"
+                                                : "broadcast");
+        fflush(stdout);
+        return 1;
+    }
+}
+
+/* A node without txindex finds a confirmed transaction by txid only when it
+   pays the wallet; a distribution TX paying only clients is recognised by
+   its outputs in the UTXO set instead. */
+lsp_dist_state_t lsp_distribution_tx_state(chain_backend_t *cb, const ladder_factory_t *lf,
+                                           const cpfp_tx_info_t *ti) {
+    if (cb->get_confirmations && cb->get_confirmations(cb, ti->txid_hex) >= 1)
+        return LSP_DIST_CONFIRMED;
+    if (cb->is_in_mempool && cb->is_in_mempool(cb, ti->txid_hex))
+        return LSP_DIST_TO_SEND;
+    if (!cb->is_outpoint_unspent)
+        return LSP_DIST_TO_SEND;
+    unsigned char d[32];
+    char fund_hex[65];
+    memcpy(d, lf->factory.funding_txid, 32);
+    reverse_bytes(d, 32);
+    hex_encode(d, 32, fund_hex);
+    if (cb->is_outpoint_unspent(cb, fund_hex, lf->factory.funding_vout) != 0)
+        return LSP_DIST_TO_SEND;            /* unspent, or not known */
+    /* funding spent, not by a TX in the mempool: by ours if one of its
+       outputs is in the UTXO set */
+    for (size_t v = 0; v < ti->n_outputs; v++)
+        if (cb->is_outpoint_unspent(cb, ti->txid_hex, (uint32_t)v) == 1)
+            return LSP_DIST_CONFIRMED;
+    return LSP_DIST_SPENT_ELSEWHERE;
+}
+
+/* Send lf's distribution TX unless it is already confirmed or its funding
+   is spent by another transaction (a restart can find either). */
+static void send_distribution_tx_if_due(lsp_channel_mgr_t *mgr, ladder_factory_t *lf,
+                                        const char *why) {
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    cpfp_tx_info_t ti;
+    if (!cb || lf->distribution_tx.len == 0 ||
+        !cpfp_parse_tx(lf->distribution_tx.data, lf->distribution_tx.len, &ti)) {
+        send_distribution_tx(mgr, lf, why);   /* logs why it cannot */
+        return;
+    }
+    switch (lsp_distribution_tx_state(cb, lf, &ti)) {
+    case LSP_DIST_CONFIRMED:
+        printf("LSP: %s distribution TX %s of factory %u already confirmed\n", why,
+               ti.txid_hex, lf->factory_id);
+        fflush(stdout);
+        return;
+    case LSP_DIST_SPENT_ELSEWHERE:
+        printf("LSP: %s factory %u funding is spent and its distribution TX %s is "
+               "neither in the mempool nor on chain with an unspent output: not sent\n",
+               why, lf->factory_id, ti.txid_hex);
+        fflush(stdout);
+        return;
+    default:
+        send_distribution_tx(mgr, lf, why);
+    }
+}
+
+/* Once per block: every distribution TX sent and not yet confirmed is sent
+   again (re-broadcast if it left the mempool, re-bumped if its package fell
+   below the urgent rate).  It leaves the list once confirmed, or once the
+   factory funding is spent by something else. */
+static void retry_distribution_txs(lsp_channel_mgr_t *mgr) {
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    chain_backend_t *cb = (chain_backend_t *)mgr->chain_be;
+    if (!lad || !cb) return;
+    for (size_t fi = 0; fi < lad->n_factories; fi++) {
+        ladder_factory_t *lf = &lad->factories[fi];
+        if (!lf->dist_pending) continue;
+        cpfp_tx_info_t ti;
+        if (!cpfp_parse_tx(lf->distribution_tx.data, lf->distribution_tx.len, &ti)) {
+            lf->dist_pending = 0;
+            continue;
+        }
+        lsp_dist_state_t st = lsp_distribution_tx_state(cb, lf, &ti);
+        if (st == LSP_DIST_CONFIRMED) {
+            printf("LSP: distribution TX %s of factory %u confirmed\n",
+                   lf->dist_txid, lf->factory_id);
+            fflush(stdout);
+            lf->dist_pending = 0;
+            continue;
+        }
+        if (st == LSP_DIST_SPENT_ELSEWHERE) {
+            printf("LSP: factory %u funding is spent and its distribution TX %s is "
+                   "neither in the mempool nor on chain with an unspent output: no "
+                   "longer retried\n", lf->factory_id, lf->dist_txid);
+            fflush(stdout);
+            lf->dist_pending = 0;
+            continue;
+        }
+        send_distribution_tx(mgr, lf, "retry:");
+    }
+}
 
 /* Forward declarations for daemon_loop_once */
 static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp, int fd, const wire_msg_t *msg);
@@ -3473,7 +3620,11 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         fee_estimator_static_t _fe_realloc;
         fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
         if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
-        uint64_t commit_fee_ra = fee_for_commitment_tx(_fe_ra, 0);
+        uint64_t commit_fee_ra = fee_commitment_tx_at(factory_lsp_fee_rate(_fe_ra), 0);
+        if (commit_fee_ra == FEE_INVALID) {
+            fprintf(stderr, "LSP realloc: commitment fee not computable\n");
+            return 0;
+        }
         uint64_t usable_ra = client_amt > commit_fee_ra ? client_amt - commit_fee_ra : 0;
         entry->channel.local_amount = (usable_ra * pct) / 100;
         entry->channel.remote_amount = usable_ra - entry->channel.local_amount;
@@ -6683,8 +6834,11 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     } else if (strcmp(line, "rotate") == 0) {
         printf("CLI: forcing rotation\n");
         fflush(stdout);
-        if (lsp_channels_rotate_factory(mgr, lsp))
+        int rot_rc = lsp_channels_rotate_factory(mgr, lsp);
+        if (rot_rc == LSP_ROTATE_OK)
             printf("CLI: rotation succeeded\n");
+        else if (rot_rc == LSP_ROTATE_POSTPONED)
+            printf("CLI: rotation postponed (fees), nothing changed\n");
         else {
             printf("CLI: rotation FAILED\n");
             fflush(stdout);
@@ -7259,24 +7413,13 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         lf->factory.dying_blocks,
                                         lf->partial_rotation_done);
                                 }
-                                /* Auto-broadcast distribution TX on EXPIRED */
+                                /* Auto-broadcast distribution TX on EXPIRED;
+                                   retried and re-bumped every block until it
+                                   confirms (retry_distribution_txs). */
                                 if (lf->cached_state == FACTORY_EXPIRED &&
                                     lf->distribution_tx.len > 0 &&
-                                    mgr->chain_be) {
-                                    chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
-                                    char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
-                                    if (dhex) {
-                                        extern void hex_encode(const unsigned char *,
-                                                               size_t, char *);
-                                        hex_encode(lf->distribution_tx.data,
-                                                   lf->distribution_tx.len, dhex);
-                                        char dtxid[65];
-                                        if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                            printf("LSP: distribution TX broadcast: %s\n",
-                                                   dtxid);
-                                        free(dhex);
-                                    }
-                                }
+                                    mgr->chain_be && !lf->dist_pending)
+                                    send_distribution_tx_if_due(mgr, lf, "expiry:");
 
                                 /* Async rotation: handle EXPIRED with partial ready set.
                                    DYING → EXPIRED means the window closed; rotate
@@ -7318,6 +7461,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         uint32_t ridx = lf->factory_id % 8;
                                         mgr->rot_retry_count[ridx] = 0;
                                         mgr->rot_last_attempt_block[ridx] = 0;
+                                        mgr->rot_postponed[ridx] = 0;
 
                                         if (mgr->readiness) {
                                             /* Async path: queue rotation request for all clients,
@@ -7378,11 +7522,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                     mgr->entries[rc].offline_detected = 0;
                                                 }
                                             }
-                                            if (ok) {
+                                            if (ok == LSP_ROTATE_OK) {
                                                 printf("LSP: auto-rotation complete — new factory active\n");
                                                 fflush(stdout);
                                                 lsp_rotation_record_success(mgr, lf->factory_id);
-                                            } else {
+                                            } else if (ok == LSP_ROTATE_FAILED) {
                                                 fprintf(stderr, "LSP: auto-rotation FAILED for factory %u\n",
                                                         lf->factory_id);
                                                 lsp_rotation_record_failure(mgr, lf->factory_id,
@@ -7437,9 +7581,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     uint32_t attempt = mgr->rot_retry_count[ridx] + 1;
                                     uint32_t mret = mgr->rot_max_retries > 0
                                                     ? mgr->rot_max_retries : 3;
-                                    printf("LSP: retrying rotation for factory %u "
-                                           "(attempt %u/%u)\n",
-                                           lf->factory_id, attempt, mret);
+                                    if (mgr->rot_postponed[ridx] == 1)
+                                        printf("LSP: retrying postponed rotation for factory "
+                                               "%u (%u/%u retries used)\n",
+                                               lf->factory_id, attempt - 1, mret);
+                                    else
+                                        printf("LSP: retrying rotation for factory %u "
+                                               "(attempt %u/%u)\n",
+                                               lf->factory_id, attempt, mret);
                                     fflush(stdout);
                                     int ok = lsp_channels_rotate_factory(mgr, lsp);
                                     {
@@ -7449,11 +7598,11 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             mgr->entries[rc].offline_detected = 0;
                                         }
                                     }
-                                    if (ok) {
+                                    if (ok == LSP_ROTATE_OK) {
                                         printf("LSP: retry rotation complete\n");
                                         fflush(stdout);
                                         lsp_rotation_record_success(mgr, lf->factory_id);
-                                    } else {
+                                    } else if (ok == LSP_ROTATE_FAILED) {
                                         lsp_rotation_record_failure(mgr, lf->factory_id,
                                                                     (uint32_t)height);
                                         fprintf(stderr, "LSP: retry rotation FAILED "
@@ -7463,9 +7612,14 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     /* Max retries exhausted — distribution TX fallback */
                                     uint32_t mret = mgr->rot_max_retries > 0
                                                     ? mgr->rot_max_retries : 3;
-                                    printf("LSP: rotation failed %u times for factory %u"
-                                           " — broadcasting distribution TX\n",
-                                           mret, lf->factory_id);
+                                    if (mgr->rot_postponed[lf->factory_id % 8] == 2)
+                                        printf("LSP: rotation of factory %u postponed on fees"
+                                               " until it expired — broadcasting distribution TX\n",
+                                               lf->factory_id);
+                                    else
+                                        printf("LSP: rotation failed %u times for factory %u"
+                                               " — broadcasting distribution TX\n",
+                                               mret, lf->factory_id);
                                     fflush(stdout);
                                     /* #49/#51: notify all clients (best-effort) that
                                        the rotation ceremony is aborted (retry limit)
@@ -7497,32 +7651,21 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         }
                                     }
                                     if (lf->distribution_tx.len > 0 &&
-                                        mgr->chain_be) {
-                                        chain_backend_t *_cb =
-                                            (chain_backend_t *)mgr->chain_be;
-                                        char *dhex = malloc(
-                                            lf->distribution_tx.len * 2 + 1);
-                                        if (dhex) {
-                                            extern void hex_encode(
-                                                const unsigned char *, size_t,
-                                                char *);
-                                            hex_encode(lf->distribution_tx.data,
-                                                       lf->distribution_tx.len,
-                                                       dhex);
-                                            char dtxid[65];
-                                            if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                                printf("LSP: fallback distribution "
-                                                       "TX: %s\n", dtxid);
-                                            else
-                                                fprintf(stderr, "LSP: fallback "
-                                                        "dist TX broadcast failed\n");
-                                            free(dhex);
-                                        }
-                                    }
+                                        mgr->chain_be && !lf->dist_pending)
+                                        send_distribution_tx_if_due(mgr, lf, "fallback:");
                                     /* Sentinel: past max → no further action */
                                     uint32_t ridx = lf->factory_id % 8;
                                     mgr->rot_retry_count[ridx] = (uint8_t)(mret + 1);
                                 }
+                            }
+                        }
+                        /* distribution TXs sent earlier: once per block,
+                           re-sent / re-bumped until they confirm */
+                        {
+                            static int last_dist_retry_height = 0;
+                            if (height > 0 && height != last_dist_retry_height) {
+                                last_dist_retry_height = height;
+                                retry_distribution_txs(mgr);
                             }
                         }
                     }

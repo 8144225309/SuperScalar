@@ -1,4 +1,5 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/ptlc_commit.h"
 #include "superscalar/htlc_fee_bump.h"
 #include "superscalar/wallet_source.h"
@@ -16,6 +17,45 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 extern void sha256_double(const unsigned char *data, size_t len, unsigned char *out32);
+
+/* Broadcast a pre-signed response: through bitcoind RPC it goes alone when it
+   pays enough, else as a package with a CPFP child on its P2A anchor (funded
+   from wt->wallet); without RPC, a plain send through the chain backend. */
+static int wt_send_presigned(watchtower_t *wt, const char *hex, char *txid_out) {
+    if (wt->rt) {
+        uint64_t target = (wt->fee && wt->fee->get_rate)
+            ? wt->fee->get_rate(wt->fee, FEE_TARGET_URGENT) : 0;
+        return cpfp_send_presigned(wt->rt, wt->wallet, target, wt->max_bump_fee_sat,
+                                   hex, txid_out) != CPFP_FAILED;
+    }
+    return wt->chain->send_raw_tx(wt->chain, hex, txid_out);
+}
+
+/* Raise the package of a pending tx (in the mempool) to feerate through its
+   anchor, spending at most budget on the child.  The CPFP path replaces the
+   anchor's current spender, our own earlier child included, rather than
+   adding a second child next to it. */
+static cpfp_result_t wt_rebump(watchtower_t *wt, const char *txid,
+                               uint64_t feerate, uint64_t budget) {
+    const size_t cap = 220000;
+    char *hex = malloc(cap);
+    if (!hex) return CPFP_FAILED;
+    cpfp_result_t r = CPFP_FAILED;
+    if (regtest_get_raw_tx(wt->rt, txid, hex, cap))
+        r = cpfp_send_presigned(wt->rt, wt->wallet, feerate, budget, hex, NULL);
+    free(hex);
+    return r;
+}
+
+/* Persist a pending entry's escalation schedule, so a restart resumes it. */
+static void wt_save_pending(watchtower_t *wt, const watchtower_pending_t *p) {
+    if (!wt->db || !wt->db->db) return;
+    persist_save_pending(wt->db, p->txid, p->anchor_vout, p->anchor_amount,
+                         p->cycles_in_mempool, (int)p->fee_bump.last_bump_block,
+                         p->penalty_value, p->csv_delay, p->start_height,
+                         p->fee_bump.start_block, p->fee_bump.deadline_block,
+                         p->fee_bump.budget_sat, p->fee_bump.start_feerate);
+}
 
 /* Authoritative check: does this serialised penalty TX contain a P2A anchor
  * at vout 1?  The build-time `use_anchor` decision (fee_should_use_anchor at
@@ -1106,7 +1146,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (resp_hex) {
                     hex_encode(e->response_tx, e->response_tx_len, resp_hex);
                     char resp_txid[65];
-                    if (wt->chain->send_raw_tx(wt->chain, resp_hex, resp_txid)) {
+                    if (wt_send_presigned(wt, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
                         memcpy(factory_resp_txid, resp_txid, 64);
                         factory_resp_txid[64] = '\0';
@@ -1132,15 +1172,17 @@ int watchtower_check(watchtower_t *wt) {
                default RPC wallet (watchtower.c:95) + the existing deadline-aware
                escalator (watchtower_build_cpfp_tx) do the rest. Mirrors the
                WATCH_COMMITMENT enqueue; only when the response carries a P2A anchor. */
-            if (factory_resp_txid[0] &&
-                penalty_tx_has_p2a_anchor(e->response_tx, e->response_tx_len) &&
+            cpfp_tx_info_t resp_info;
+            int resp_parsed = e->response_tx && e->response_tx_len > 0 &&
+                cpfp_parse_tx(e->response_tx, e->response_tx_len, &resp_info);
+            if (factory_resp_txid[0] && resp_parsed && resp_info.anchor_vout >= 0 &&
                 wt->anchor_spk_len == P2A_SPK_LEN &&
                 wt->n_pending < wt->pending_cap) {
                 uint32_t fn_cur_h = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
                 watchtower_pending_t *fp = &wt->pending[wt->n_pending++];
                 memcpy(fp->txid, factory_resp_txid, 64); fp->txid[64] = '\0';
-                fp->anchor_vout = 1;
-                fp->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
+                fp->anchor_vout = (uint32_t)resp_info.anchor_vout;
+                fp->anchor_amount = resp_info.anchor_amount;
                 fp->penalty_value = (e->sub_sales_stock_amount > 0)
                                     ? e->sub_sales_stock_amount
                                     : e->to_local_amount;
@@ -1162,7 +1204,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (burn_hex) {
                     hex_encode(e->burn_tx, e->burn_tx_len, burn_hex);
                     char burn_txid[65];
-                    if (wt->chain->send_raw_tx(wt->chain, burn_hex, burn_txid)) {
+                    if (wt_send_presigned(wt, burn_hex, burn_txid)) {
                         printf("  L-stock burn tx broadcast: %s\n", burn_txid);
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, burn_txid,
@@ -1242,7 +1284,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (poison_hex) {
                     hex_encode(e->burn_tx, e->burn_tx_len, poison_hex);
                     char poison_txid[65];
-                    if (wt->chain->send_raw_tx(wt->chain, poison_hex, poison_txid)) {
+                    if (wt_send_presigned(wt, poison_hex, poison_txid)) {
                         printf("  Sub-factory poison tx broadcast: %s\n", poison_txid);
                         memcpy(sub_resp_txid, poison_txid, 64);
                         sub_resp_txid[64] = '\0';
@@ -1325,7 +1367,7 @@ int watchtower_check(watchtower_t *wt) {
         int penalty_sent = 0;
         if (penalty_hex) {
             hex_encode(penalty_tx.data, penalty_tx.len, penalty_hex);
-            if (wt->chain->send_raw_tx(wt->chain, penalty_hex, penalty_txid)) {
+            if (wt_send_presigned(wt, penalty_hex, penalty_txid)) {
                 printf("  Penalty tx broadcast: %s\n", penalty_txid);
                 fflush(stdout);
                 penalties_broadcast++;
@@ -1610,7 +1652,8 @@ int watchtower_check(watchtower_t *wt) {
                             memcpy(htlc->sweep_txid, txid, 65);
                             /* Register for CPFP monitoring */
                             watchtower_add_pending_tx(wt, txid, 1,
-                                                      WATCHTOWER_ANCHOR_AMOUNT);
+                                                      WATCHTOWER_ANCHOR_AMOUNT,
+                                                      htlc->htlc_amount);
                             if (wt->db && wt->db->db)
                                 persist_log_broadcast(wt->db, txid,
                                                       "htlc_timeout", tx_hex, "ok");
@@ -1682,8 +1725,12 @@ int watchtower_check(watchtower_t *wt) {
                                budget_basis, budget_pct,
                                WATCHTOWER_CPFP_CHILD_VSIZE, start_fr);
 
-            if (wt->max_bump_fee_sat > 0 && p->fee_bump.budget_sat > wt->max_bump_fee_sat)
-                p->fee_bump.budget_sat = wt->max_bump_fee_sat;
+            /* No value at stake recorded (0): the budget is the configured
+               ceiling per bump, not a share of the 240-sat anchor. */
+            uint64_t ceiling = wt->max_bump_fee_sat > 0 ? wt->max_bump_fee_sat
+                                                        : CPFP_DEFAULT_MAX_CHILD_FEE;
+            if (p->penalty_value == 0 || p->fee_bump.budget_sat > ceiling)
+                p->fee_bump.budget_sat = ceiling;
         }
         uint32_t cur_block = wt->chain ? wt->chain->get_block_height(wt->chain) : 0;
         if (htlc_fee_bump_should_bump(&p->fee_bump, cur_block)) {
@@ -1700,6 +1747,19 @@ int watchtower_check(watchtower_t *wt) {
                 fprintf(stderr,
                     "  CPFP skipped: parent %s not in mempool (cycles=%d)\n",
                     p->txid, p->cycles_in_mempool);
+            } else if (wt->rt) {
+                uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
+                cpfp_result_t br = wt_rebump(wt, p->txid, fr, p->fee_bump.budget_sat);
+                if (br == CPFP_BUMPED || br == CPFP_KNOWN) {
+                    /* bumped, or the package already pays fr */
+                    htlc_fee_bump_record_broadcast(&p->fee_bump, cur_block, fr);
+                    wt_save_pending(wt, p);
+                    if (br == CPFP_BUMPED)
+                        printf("  CPFP package of %s raised to %llu sat/kvB\n",
+                               p->txid, (unsigned long long)fr);
+                } else {
+                    fprintf(stderr, "  CPFP bump of %s failed\n", p->txid);
+                }
             } else {
                 uint64_t fr = htlc_fee_bump_calc_feerate(&p->fee_bump, cur_block);
                 tx_buf_t cpfp;
@@ -1717,15 +1777,7 @@ int watchtower_check(watchtower_t *wt) {
                             if (wt->db && wt->db->db) {
                                 /* v27: persist the escalation schedule so a
                                    mid-bump restart resumes instead of rebasing. */
-                                persist_save_pending(wt->db, p->txid,
-                                    p->anchor_vout, p->anchor_amount,
-                                    p->cycles_in_mempool,
-                                    (int)p->fee_bump.last_bump_block,
-                                    p->penalty_value, p->csv_delay, p->start_height,
-                                    p->fee_bump.start_block,
-                                    p->fee_bump.deadline_block,
-                                    p->fee_bump.budget_sat,
-                                    p->fee_bump.start_feerate);
+                                wt_save_pending(wt, p);
                                 persist_log_broadcast(wt->db, cpfp_txid,
                                                       "cpfp", cpfp_hex, "ok");
                             }
@@ -1780,8 +1832,13 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     int result = 0;
 
     uint64_t cpfp_fee = target_feerate_kvb > 0
-        ? (target_feerate_kvb * WATCHTOWER_CPFP_CHILD_VSIZE + 999) / 1000
+        ? fee_at_rate(target_feerate_kvb, WATCHTOWER_CPFP_CHILD_VSIZE)
         : (wt->fee ? fee_for_cpfp_child(wt->fee) : 200);
+    if (cpfp_fee == FEE_INVALID) {
+        fprintf(stderr, "CPFP: no payable child fee at %llu sat/kvB\n",
+                (unsigned long long)target_feerate_kvb);
+        return 0;
+    }
     uint64_t min_amount = cpfp_fee + 1000;  /* fee + dust margin */
 
     if (!wt->wallet->get_utxo(wt->wallet, min_amount,
@@ -1863,7 +1920,8 @@ done:
 int watchtower_add_pending_tx(watchtower_t *wt,
                                const char *txid_hex,
                                uint32_t anchor_vout,
-                               uint64_t anchor_amount)
+                               uint64_t anchor_amount,
+                               uint64_t value_sats)
 {
     if (!wt || !txid_hex) return 0;
     if (wt->n_pending >= wt->pending_cap) return 0;
@@ -1874,7 +1932,7 @@ int watchtower_add_pending_tx(watchtower_t *wt,
     p->txid[64] = '\0';
     p->anchor_vout       = anchor_vout;
     p->anchor_amount     = anchor_amount;
-    p->penalty_value     = 0;
+    p->penalty_value     = value_sats;    /* budget basis; 0 = not known */
     p->csv_delay         = CHANNEL_DEFAULT_CSV_DELAY;
     p->start_height      = cur_height;
     p->cycles_in_mempool = 0;

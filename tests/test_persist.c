@@ -1086,6 +1086,7 @@ int test_persist_factory_round_trip(void) {
     fake_txid[0] = 0xDD;
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
+    factory_set_lifecycle(f, 1234, 4320, 432);
 
     /* Save factory */
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
@@ -1101,6 +1102,23 @@ int test_persist_factory_round_trip(void) {
     TEST_ASSERT_EQ(f2->step_blocks, 10, "step_blocks");
     TEST_ASSERT_EQ(f2->funding_amount_sats, 1000000, "funding_amount");
     TEST_ASSERT_EQ(f2->n_nodes, f->n_nodes, "n_nodes");
+    /* the lifecycle survives a restart: the expiry does not move */
+    TEST_ASSERT_EQ(f2->created_block, 1234, "created_block");
+    TEST_ASSERT_EQ(f2->active_blocks, 4320, "active_blocks");
+    TEST_ASSERT_EQ(f2->dying_blocks, 432, "dying_blocks");
+
+    /* the co-signed distribution TX is kept for the same factory id */
+    {
+        unsigned char dtx[120], back[120];
+        for (size_t i = 0; i < sizeof(dtx); i++) dtx[i] = (unsigned char)(i * 7 + 1);
+        size_t blen = 0;
+        TEST_ASSERT(!persist_load_distribution_tx(&db, 0, NULL, &blen, 0), "none yet");
+        TEST_ASSERT(persist_save_distribution_tx(&db, 0, dtx, sizeof(dtx)), "save dist");
+        TEST_ASSERT(persist_load_distribution_tx(&db, 0, NULL, &blen, 0), "dist length");
+        TEST_ASSERT_EQ(blen, sizeof(dtx), "dist length matches");
+        TEST_ASSERT(persist_load_distribution_tx(&db, 0, back, &blen, sizeof(back)), "load dist");
+        TEST_ASSERT(memcmp(back, dtx, sizeof(dtx)) == 0, "dist bytes match");
+    }
 
     /* Verify txids match (the tree was rebuilt, so all node txids should match) */
     for (size_t i = 0; i < f->n_nodes; i++) {
@@ -1496,7 +1514,7 @@ int test_lsp_recovery_round_trip(void) {
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
 
     /* Set funding (need valid funding for channel init) */
     musig_keyagg_t ka;
@@ -2013,7 +2031,7 @@ int test_persist_crash_stress(void) {
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
 
     /* Compute funding SPK */
     musig_keyagg_t ka;
@@ -2366,7 +2384,7 @@ int test_persist_crash_stress(void) {
     }
 
     /* ===== Cycle 4: Extreme values ===== */
-    uint64_t commit_fee = f->fee_per_tx;
+    uint64_t commit_fee = 500;
     mgr.entries[0].channel.local_amount = 0;
     mgr.entries[0].channel.remote_amount = f->funding_amount_sats / 4 - commit_fee;
     mgr.entries[0].channel.commitment_number = 200;

@@ -117,6 +117,24 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
    Returns 1 when all clients connected. */
 int lsp_accept_clients(lsp_t *lsp);
 
+/* Before any funding is broadcast: the highest tree fee rate, at least the
+   pre-signed floor, at which a factory of cfg's shape (its arity settings,
+   the LSP and n_clients of its clients, funding_amount, cltv_timeout for the
+   distribution TX) passes factory_check_presigned_fee_bounds, the check
+   every signer applies before signing.  The bound depends only on that
+   shape, the client count, the rate and the funding.  The rate asked for is
+   cfg->tree_fee_rate, else cfg->fee's NORMAL estimate clamped to
+   factory_max_tree_fee_rate (*asked_rate_out); for an estimate the search
+   goes up to that maximum, so a later estimate is bounded too.  Returns 1
+   with *max_rate_out, to be set as the factory's tree_fee_rate_max (a
+   higher rate is then lowered to it); 0, with why, when even the floor rate
+   fails: such a factory must not be funded. */
+int lsp_plan_tree_fee_rate(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                           uint64_t funding_amount, uint16_t step_blocks,
+                           uint32_t states_per_layer, uint32_t cltv_timeout,
+                           uint64_t *max_rate_out, uint64_t *asked_rate_out,
+                           char *why, size_t why_len);
+
 /* Run full factory creation ceremony over the wire.
    funding_txid: internal byte order, already funded.
    Returns 1 on success (factory fully signed). */

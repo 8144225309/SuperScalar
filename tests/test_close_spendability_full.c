@@ -3745,7 +3745,7 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
     /* Advance leaf 0 n_advances times. After each advance, the leaf node's
        signed_tx contains chain[i] -- we broadcast it immediately, mine 1
        block, then advance again. */
-    uint64_t fee_per_tx = f->fee_per_tx;
+    uint64_t fee_per_tx = factory_ps_chain_reserve(f);
     char leaf0_chainN_txid[65];
     memcpy(leaf0_chainN_txid, leaf0_chain0_txid, 65);  /* if N=0 fallback */
     for (int adv = 1; adv <= n_advances; adv++) {
@@ -5362,7 +5362,7 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
     /* Wider N-way state nodes are larger TXs than the binary builder's;
        bump fee_per_tx above CI regtest mempool min relay (~240 sats for
        these vBytes). 1000 sats clears all currently-known regtest floors. */
-    f->fee_per_tx = 1000;
+    f->tree_fee_rate = 2000;
 
     uint8_t arities[3] = { 2, 4, 8 };
     factory_set_level_arity(f, arities, 3);
@@ -6032,7 +6032,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
        Sized for N=32 (31 leaves max). */
     ps_leaf_chain_t leaf_chains[32] = {0};
     uint64_t total_advance_fees = 0;
-    uint64_t fee_per_tx = f->fee_per_tx;
+    uint64_t fee_per_tx = factory_ps_chain_reserve(f);
     for (int li = 0; li < n_leaves; li++) {
         int n_adv = (chain_lens != NULL) ? chain_lens[li] : 0;
         TEST_ASSERT(advance_and_broadcast_leaf_chain(rt, f, li,
@@ -6677,7 +6677,7 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
        clear CI regtest mempool min-relay (~240 sats). 1000 sats safe. */
-    f->fee_per_tx = 1000;
+    f->tree_fee_rate = 2000;
     uint8_t arities[3] = { 2, 4, 8 };
     factory_set_level_arity(f, arities, 3);
 
@@ -6984,7 +6984,7 @@ int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void) {
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
        clear CI regtest mempool min-relay (~240 sats). 1000 sats safe. */
-    f->fee_per_tx = 1000;
+    f->tree_fee_rate = 2000;
     uint8_t arities[3] = { 2, 4, 8 };
     factory_set_level_arity(f, arities, 3);
     factory_set_static_near_root(f, 1);
@@ -7299,7 +7299,7 @@ int test_regtest_nway_n64_dw_advance_resign_lifecycle(void) {
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
        clear CI regtest mempool min-relay (~240 sats). 1000 sats safe. */
-    f->fee_per_tx = 1000;
+    f->tree_fee_rate = 2000;
     uint8_t arities[3] = { 2, 4, 8 };
     factory_set_level_arity(f, arities, 3);
     factory_set_static_near_root(f, 1);
@@ -7627,7 +7627,7 @@ int test_regtest_static_near_root_lifecycle(void) {
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* PR #104 bumped fee_per_tx to 1000 sats for N-way regtest mempool floor. */
-    f->fee_per_tx = 1000;
+    f->tree_fee_rate = 2000;
     uint8_t arities[2] = {2, 4};
     factory_set_level_arity(f, arities, 2);
     factory_set_static_near_root(f, 1);
@@ -7926,7 +7926,7 @@ int test_regtest_static_near_root_unilateral_exit(void) {
     factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
-    f->fee_per_tx = 1000;
+    f->tree_fee_rate = 2000;
     uint8_t arities[2] = {2, 4};
     factory_set_level_arity(f, arities, 2);
     factory_set_static_near_root(f, 1);

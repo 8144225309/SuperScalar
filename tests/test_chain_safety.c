@@ -335,7 +335,7 @@ int test_watchtower_add_pending(void)
 
     const char *fake_txid =
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    int r = watchtower_add_pending_tx(&wt, fake_txid, 1, 240);
+    int r = watchtower_add_pending_tx(&wt, fake_txid, 1, 240, 0);
     size_t n = wt.n_pending;
 
     watchtower_cleanup(&wt);
@@ -355,13 +355,13 @@ int test_watchtower_add_pending_full(void)
     for (int i = 0; i < WATCHTOWER_MAX_PENDING; i++) {
         snprintf(txid, sizeof(txid),
                  "%064x", i + 1);
-        watchtower_add_pending_tx(&wt, txid, 1, 240);
+        watchtower_add_pending_tx(&wt, txid, 1, 240, 0);
     }
     ASSERT(wt.n_pending == WATCHTOWER_MAX_PENDING, "CS4: filled to max");
 
     /* One more should fail */
     int r = watchtower_add_pending_tx(&wt, "cc00000000000000000000000000000000000000000000000000000000000000",
-                                      1, 240);
+                                      1, 240, 0);
 
     watchtower_cleanup(&wt);
 

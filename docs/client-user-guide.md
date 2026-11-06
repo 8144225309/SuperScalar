@@ -7,7 +7,9 @@ How to connect to a SuperScalar LSP and use your payment channel.
 - The `superscalar_client` binary (see main [README](../README.md#build) for build instructions)
 - The LSP's IP address (or hostname / .onion) and port
 - A 32-byte secret key for your identity
-- (Optional) `bitcoin-cli` access for watchtower functionality
+- (Optional) `bitcoin-cli` access for watchtower functionality.  The node must
+  be Bitcoin Core 28.0 or later (the client refuses an older one): factory
+  exits are TRUC transactions with P2A anchors that need package relay.
 
 ## 1. Generate Your Key
 
@@ -222,6 +224,9 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--datadir PATH` | (default) | Bitcoin datadir |
 | `--rpcport PORT` | (auto) | Bitcoin RPC port override |
 | `--fee-rate N` | 1000 | Fee rate for penalty / sweep transactions (sat/kvB) |
+| `--fee-estimator MODE` | static | `static[:N]`, `api[:URL]` or `blocks`. Its urgent rate is also the CPFP target of exit broadcasts (default there: `estimatesmartfee`) |
+| `--wallet NAME` | none | bitcoind wallet that funds CPFP children on exit; without it a bump spends the P2A anchor alone |
+| `--max-tree-fee-rate N` | 100000 | Refuse a factory whose tree fee rate (sat/kvB) is above N; must match the LSP's value |
 | `--light-client HOST:PORT` | — | Use a BIP-158 P2P compact-block-filter peer instead of a local bitcoind |
 | `--light-client-fallback HOST:PORT` | — | Add a fallback BIP-158 peer (can repeat, up to 7 peers total) |
 
