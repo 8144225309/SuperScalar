@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
@@ -977,6 +978,128 @@ int test_basepoint_independence(void) {
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- LSP creation ceremony on a factory that was never initialized ---- */
+
+/* Runs lsp_run_factory_creation against two clients on socketpairs.  The
+   first client's end has already queued an MSG_ERROR, so the ceremony sends
+   FACTORY_PROPOSE and then aborts on its first read.  Returns 1 and the
+   PROPOSE the first client received in *propose_out (caller frees) on that
+   expected path, 0 otherwise. */
+#define CREATION_TEST_CLIENTS 2
+static int run_creation_until_client_error(secp256k1_context *ctx, lsp_t *lsp,
+                                           const secp256k1_keypair *client_kps,
+                                           cJSON **propose_out) {
+    *propose_out = NULL;
+    int peer[CREATION_TEST_CLIENTS];
+    for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        /* A failed ceremony must not leave the test blocked in wire_recv. */
+        struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        lsp->client_fds[c] = sv[0];   /* closed by lsp_cleanup */
+        peer[c] = sv[1];
+        if (!secp256k1_keypair_pub(ctx, &lsp->client_pubkeys[c], &client_kps[c]))
+            return 0;
+    }
+    lsp->n_clients = CREATION_TEST_CLIENTS;
+
+    cJSON *err = wire_build_error("test: abort after propose");
+    int sent = wire_send(peer[0], MSG_ERROR, err);
+    cJSON_Delete(err);
+
+    int rc = -1;
+    if (sent) {
+        unsigned char txid[32], spk[34];
+        memset(txid, 0xAB, sizeof(txid));
+        spk[0] = 0x51; spk[1] = 0x20;
+        memset(spk + 2, 0xCD, 32);
+        rc = lsp_run_factory_creation(lsp, txid, 0, 100000, spk, sizeof(spk),
+                                      10, 4, 0);
+    }
+
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    int got = (rc == 0) && wire_recv(peer[0], &m);
+    for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++)
+        close(peer[c]);
+    if (!got || m.msg_type != MSG_FACTORY_PROPOSE || !m.json) {
+        if (m.json) cJSON_Delete(m.json);
+        return 0;
+    }
+    *propose_out = m.json;
+    return 1;
+}
+
+/* lsp_init leaves lsp->factory zeroed (no dynamic arrays).  The creation
+   ceremony must accept that and build the factory itself. */
+int test_lsp_factory_creation_from_fresh_lsp(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    TEST_ASSERT(make_keypairs(ctx, kps), "keypairs");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "alloc lsp");
+    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CREATION_TEST_CLIENTS), "lsp_init");
+    TEST_ASSERT(lsp->factory.profiles == NULL, "lsp_init leaves arrays unallocated");
+
+    cJSON *propose = NULL;
+    int ok = run_creation_until_client_error(ctx, lsp, &kps[1], &propose);
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(ok, "ceremony sends FACTORY_PROPOSE, then aborts on the client error");
+    cJSON *profiles = cJSON_GetObjectItem(propose, "profiles");
+    int n = cJSON_IsArray(profiles) ? cJSON_GetArraySize(profiles) : -1;
+    cJSON_Delete(propose);
+    TEST_ASSERT_EQ(n, 1 + CREATION_TEST_CLIENTS, "one profile per participant");
+    return 1;
+}
+
+/* Profiles configured on lsp->factory before the ceremony (as the LSP daemon
+   does from its CLI flags) must reach the clients, and the arrays the
+   configuration allocated must be released when the ceremony re-initializes
+   the factory (LeakSanitizer catches that under ENABLE_SANITIZERS). */
+int test_lsp_factory_creation_keeps_preset_profiles(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    TEST_ASSERT(make_keypairs(ctx, kps), "keypairs");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "alloc lsp");
+    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CREATION_TEST_CLIENTS), "lsp_init");
+    TEST_ASSERT(factory_alloc_default_arrays(&lsp->factory), "alloc arrays");
+    lsp->factory.economic_mode = ECON_PROFIT_SHARED;
+    lsp->factory.profiles[0].participant_idx = 0;
+    lsp->factory.profiles[0].profit_share_bps = 8766;
+    lsp->factory.profiles[1].participant_idx = 1;
+    lsp->factory.profiles[1].profit_share_bps = 1234;
+    lsp->factory.profiles[1].contribution_sats = 50000;
+
+    cJSON *propose = NULL;
+    int ok = run_creation_until_client_error(ctx, lsp, &kps[1], &propose);
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(ok, "ceremony sends FACTORY_PROPOSE, then aborts on the client error");
+
+    cJSON *econ = cJSON_GetObjectItem(propose, "economic_mode");
+    cJSON *profiles = cJSON_GetObjectItem(propose, "profiles");
+    cJSON *p0 = cJSON_IsArray(profiles) ? cJSON_GetArrayItem(profiles, 0) : NULL;
+    cJSON *p1 = cJSON_IsArray(profiles) ? cJSON_GetArrayItem(profiles, 1) : NULL;
+    cJSON *bps0 = p0 ? cJSON_GetObjectItem(p0, "profit_bps") : NULL;
+    cJSON *bps1 = p1 ? cJSON_GetObjectItem(p1, "profit_bps") : NULL;
+    cJSON *contrib1 = p1 ? cJSON_GetObjectItem(p1, "contribution") : NULL;
+    long v_econ = cJSON_IsNumber(econ) ? (long)econ->valuedouble : -1;
+    long v_bps0 = cJSON_IsNumber(bps0) ? (long)bps0->valuedouble : -1;
+    long v_bps1 = cJSON_IsNumber(bps1) ? (long)bps1->valuedouble : -1;
+    long v_contrib1 = cJSON_IsNumber(contrib1) ? (long)contrib1->valuedouble : -1;
+    cJSON_Delete(propose);
+    TEST_ASSERT_EQ(v_econ, ECON_PROFIT_SHARED, "economic mode proposed");
+    TEST_ASSERT_EQ(v_bps0, 8766, "LSP profit share proposed");
+    TEST_ASSERT_EQ(v_bps1, 1234, "client profit share proposed");
+    TEST_ASSERT_EQ(v_contrib1, 50000, "client contribution proposed");
     return 1;
 }
 
