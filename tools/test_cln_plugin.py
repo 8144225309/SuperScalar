@@ -8,8 +8,10 @@ Run:  python3 -m unittest tools/test_cln_plugin.py
 
 import hashlib
 import os
+import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -410,6 +412,81 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assertEqual(self.pay_results(), [{
             "method": "pay_result", "request_id": 29, "success": True,
             "preimage": PREIMAGE}])
+
+
+class BridgeAuthTest(PluginTestCase):
+    """The plugin presents the bridge's shared secret before anything else."""
+
+    SECRET = "5c" * 32
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = b""
+
+        def sendall(self, data):
+            self.sent += data
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.secret_path = os.path.join(self.dir.name, "bridge-plugin.secret")
+        for name, value in (("BRIDGE_SECRET_FILE", self.secret_path),
+                            ("bridge_sock", None)):
+            p = mock.patch.object(cln_plugin, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def write_secret(self, text):
+        with open(self.secret_path, "w") as f:
+            f.write(text)
+
+    def connect(self):
+        sock = self.FakeSocket()
+        with mock.patch.object(cln_plugin.socket, "create_connection",
+                               return_value=sock) as create:
+            ok = cln_plugin.connect_bridge()
+        return ok, sock, create
+
+    def test_secret_is_the_first_message(self):
+        self.write_secret(self.SECRET + "\n")
+        ok, sock, create = self.connect()
+        self.assertTrue(ok)
+        create.assert_called_once()
+        first_line, rest = sock.sent.split(b"\n", 1)
+        self.assertEqual(json.loads(first_line),
+                         {"method": "auth", "token": self.SECRET})
+        self.assertEqual(rest, b"")
+        self.assertIs(cln_plugin.bridge_sock, sock)
+
+    def test_secret_is_read_again_on_every_connect(self):
+        self.write_secret("aa" * 32)
+        _, first, _ = self.connect()
+        self.write_secret("bb" * 32)
+        _, second, _ = self.connect()
+        self.assertEqual(json.loads(first.sent)["token"], "aa" * 32)
+        self.assertEqual(json.loads(second.sent)["token"], "bb" * 32)
+
+    def test_no_connection_without_a_secret(self):
+        ok, sock, create = self.connect()   # file does not exist
+        self.assertFalse(ok)
+        create.assert_not_called()
+        self.assertIsNone(cln_plugin.bridge_sock)
+
+    def test_no_connection_with_a_malformed_secret(self):
+        for text in ("", "short", "zz" * 32, "5c" * 33):
+            self.write_secret(text)
+            ok, sock, create = self.connect()
+            self.assertFalse(ok, text)
+            create.assert_not_called()
+            self.assertEqual(sock.sent, b"")
+
+    def test_home_directory_is_expanded(self):
+        with mock.patch.object(cln_plugin, "BRIDGE_SECRET_FILE",
+                               "~/bridge-plugin.secret"), \
+                mock.patch.dict(os.environ, {"HOME": self.dir.name}):
+            self.write_secret(self.SECRET)
+            self.assertEqual(cln_plugin.read_bridge_secret(), self.SECRET)
 
 
 class ClnRpcTest(unittest.TestCase):

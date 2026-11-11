@@ -18,8 +18,12 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <errno.h>
 #include <secp256k1.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
@@ -3634,5 +3638,317 @@ int test_bridge_outbound_max_delay(void) {
                        "cltv_expiry_out_of_bounds") == 0, "reason string");
     TEST_ASSERT(strcmp(lsp_bridge_pay_check_str(BRIDGE_PAY_NO_CHAIN_HEIGHT),
                        "chain_height_unavailable") == 0, "reason string");
+    return 1;
+}
+
+/* ---- Plugin port: shared secret file ---- */
+
+static const char TEST_PLUGIN_SECRET[] =
+    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+int test_bridge_plugin_secret_file(void) {
+    char dir[] = "/tmp/ss_bridge_secret_XXXXXX";
+    TEST_ASSERT(mkdtemp(dir) != NULL, "mkdtemp");
+    char path[256], path2[256], link_path[256];
+    snprintf(path, sizeof(path), "%s/plugin.secret", dir);
+    snprintf(path2, sizeof(path2), "%s/other.secret", dir);
+    snprintf(link_path, sizeof(link_path), "%s/link.secret", dir);
+
+    /* First use creates the file: 64 hex characters, owner-only. */
+    char s1[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1], s2[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
+    TEST_ASSERT(bridge_plugin_secret_load(path, s1), "secret created");
+    TEST_ASSERT_EQ(strlen(s1), BRIDGE_PLUGIN_SECRET_HEX_LEN, "secret length");
+    TEST_ASSERT(strspn(s1, "0123456789abcdef") == BRIDGE_PLUGIN_SECRET_HEX_LEN,
+                "secret is hex");
+    struct stat st;
+    TEST_ASSERT(stat(path, &st) == 0, "secret file exists");
+    TEST_ASSERT_EQ(st.st_mode & 0777, 0600, "secret file mode 0600");
+
+    /* Loading again returns the same secret; a new file gets a new one. */
+    TEST_ASSERT(bridge_plugin_secret_load(path, s2), "secret reloaded");
+    TEST_ASSERT(strcmp(s1, s2) == 0, "same secret on reload");
+    TEST_ASSERT(bridge_plugin_secret_load(path2, s2), "second secret created");
+    TEST_ASSERT(strcmp(s1, s2) != 0, "secrets are random");
+
+    /* A file others can read is refused. */
+    TEST_ASSERT(chmod(path, 0644) == 0, "chmod 0644");
+    TEST_ASSERT(!bridge_plugin_secret_load(path, s2), "world-readable secret refused");
+    TEST_ASSERT(chmod(path, 0640) == 0, "chmod 0640");
+    TEST_ASSERT(!bridge_plugin_secret_load(path, s2), "group-readable secret refused");
+    TEST_ASSERT(chmod(path, 0600) == 0, "chmod 0600");
+    TEST_ASSERT(bridge_plugin_secret_load(path, s2), "0600 accepted again");
+
+    /* A symlink is not followed. */
+    TEST_ASSERT(symlink(path, link_path) == 0, "symlink");
+    TEST_ASSERT(!bridge_plugin_secret_load(link_path, s2), "symlink refused");
+
+    /* Content that is not a 64-hex secret is refused. */
+    FILE *f = fopen(path2, "w");
+    TEST_ASSERT(f != NULL, "open for rewrite");
+    fputs("not-a-secret\n", f);
+    fclose(f);
+    TEST_ASSERT(!bridge_plugin_secret_load(path2, s2), "malformed secret refused");
+
+    /* A missing directory cannot be created into. */
+    char nodir[300];
+    snprintf(nodir, sizeof(nodir), "%s/missing/plugin.secret", dir);
+    TEST_ASSERT(!bridge_plugin_secret_load(nodir, s2), "missing directory");
+
+    bridge_t br;
+    bridge_init(&br);
+    TEST_ASSERT(!bridge_set_plugin_secret(&br, "abc"), "short secret rejected");
+    TEST_ASSERT(!br.has_plugin_secret, "no secret set");
+    TEST_ASSERT(bridge_set_plugin_secret(&br, s1), "secret set");
+    TEST_ASSERT(br.has_plugin_secret, "secret recorded");
+
+    unlink(link_path); unlink(path); unlink(path2); rmdir(dir);
+    return 1;
+}
+
+/* ---- Plugin port: binds to loopback unless told otherwise ---- */
+
+static int bound_addr(int fd, struct sockaddr_in *out) {
+    socklen_t len = sizeof(*out);
+    memset(out, 0, sizeof(*out));
+    return getsockname(fd, (struct sockaddr *)out, &len) == 0;
+}
+
+int test_bridge_plugin_port_loopback(void) {
+    bridge_t br;
+    bridge_init(&br);
+    struct sockaddr_in sa;
+
+    /* No secret, no listener. */
+    TEST_ASSERT(!bridge_listen_plugin(&br, NULL, 0), "no secret: refuses to listen");
+    TEST_ASSERT_EQ(br.plugin_listen_fd, -1, "nothing bound");
+
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+
+    /* Default: loopback only. */
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen (default address)");
+    TEST_ASSERT(bound_addr(br.plugin_listen_fd, &sa), "getsockname");
+    TEST_ASSERT_EQ(ntohl(sa.sin_addr.s_addr), INADDR_LOOPBACK, "bound to 127.0.0.1");
+    wire_close(br.plugin_listen_fd);
+    br.plugin_listen_fd = -1;
+
+    TEST_ASSERT(bridge_listen_plugin(&br, "", 0), "listen (empty address)");
+    TEST_ASSERT(bound_addr(br.plugin_listen_fd, &sa), "getsockname");
+    TEST_ASSERT_EQ(ntohl(sa.sin_addr.s_addr), INADDR_LOOPBACK, "empty = 127.0.0.1");
+    wire_close(br.plugin_listen_fd);
+    br.plugin_listen_fd = -1;
+
+    /* Another address only when asked for explicitly. */
+    TEST_ASSERT(bridge_listen_plugin(&br, "0.0.0.0", 0), "listen (explicit address)");
+    TEST_ASSERT(bound_addr(br.plugin_listen_fd, &sa), "getsockname");
+    TEST_ASSERT_EQ(ntohl(sa.sin_addr.s_addr), INADDR_ANY, "bound as requested");
+    wire_close(br.plugin_listen_fd);
+    br.plugin_listen_fd = -1;
+
+    /* An address that does not parse is an error, not "all interfaces". */
+    TEST_ASSERT(!bridge_listen_plugin(&br, "localhost", 0), "hostname rejected");
+    TEST_ASSERT(!bridge_listen_plugin(&br, "not-an-address", 0), "garbage rejected");
+    TEST_ASSERT_EQ(br.plugin_listen_fd, -1, "nothing bound");
+    TEST_ASSERT_EQ(wire_listen("not-an-address", 0), -1,
+                   "wire_listen rejects an unparseable address");
+
+    bridge_cleanup(&br);
+    return 1;
+}
+
+/* ---- Plugin port: only an authenticated connection becomes the plugin ---- */
+
+static int connect_plugin_port(const bridge_t *br) {
+    struct sockaddr_in sa;
+    if (!bound_addr(br->plugin_listen_fd, &sa)) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+static int wait_readable(int fd) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    return poll(&p, 1, 5000) == 1;
+}
+
+static int send_str(int fd, const char *s) {
+    return write(fd, s, strlen(s)) == (ssize_t)strlen(s);
+}
+
+/* 1 if the peer closed the connection without sending anything (a reset
+   counts: that is what closing with unread input produces). */
+static int peer_closed(int fd) {
+    char c;
+    ssize_t n = read(fd, &c, 1);
+    return n == 0 || (n < 0 && errno == ECONNRESET);
+}
+
+/* Accept `fd`'s connection, feed it `first_line` and service it. */
+static int offer_first_line(bridge_t *br, int fd, const char *first_line) {
+    if (!wait_readable(br->plugin_listen_fd)) return -2;
+    if (!bridge_accept_plugin(br)) return -3;
+    if (!send_str(fd, first_line)) return -4;
+    if (!wait_readable(br->plugin_pending_fd)) return -5;
+    return bridge_service_pending_plugin(br);
+}
+
+int test_bridge_plugin_auth(void) {
+    bridge_t br;
+    bridge_init(&br);
+    int lsp_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+    br.lsp_fd = lsp_sv[1];
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
+
+    char good[256], line[512];
+    snprintf(good, sizeof(good), "{\"method\":\"auth\",\"token\":\"%s\"}\n",
+             TEST_PLUGIN_SECRET);
+
+    /* Wrong secrets: a different one, one differing only in its last
+       character, a truncated one, an empty one. */
+    static const char *bad_tokens[] = {
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeef0",
+        "00112233445566778899aabbccddeeff",
+        "",
+    };
+    for (size_t i = 0; i < sizeof(bad_tokens) / sizeof(bad_tokens[0]); i++) {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        snprintf(line, sizeof(line), "{\"method\":\"auth\",\"token\":\"%s\"}\n",
+                 bad_tokens[i]);
+        TEST_ASSERT_EQ(offer_first_line(&br, c, line), -1, "wrong secret dropped");
+        TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
+        TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
+        TEST_ASSERT(peer_closed(c), "connection closed, nothing sent to it");
+        close(c);
+    }
+
+    /* A connection that starts talking without authenticating is dropped
+       and its message goes nowhere. */
+    static const char *unauthenticated[] = {
+        "{\"method\":\"htlc_accepted\",\"payment_hash\":"
+        "\"abababababababababababababababababababababababababababababababab\","
+        "\"amount_msat\":5000000,\"cltv_expiry\":500}\n",
+        "{\"method\":\"pay_result\",\"request_id\":1,\"success\":true,\"preimage\":"
+        "\"abababababababababababababababababababababababababababababababab\"}\n",
+        "{\"token\":\"00112233445566778899aabbccddeeff"
+        "00112233445566778899aabbccddeeff\"}\n",
+        "not json\n",
+    };
+    for (size_t i = 0; i < sizeof(unauthenticated) / sizeof(unauthenticated[0]); i++) {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        TEST_ASSERT_EQ(offer_first_line(&br, c, unauthenticated[i]), -1,
+                       "unauthenticated message dropped");
+        TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
+        TEST_ASSERT(peer_closed(c), "connection closed");
+        close(c);
+    }
+    wire_msg_t stray;
+    TEST_ASSERT(!wire_recv_timeout(lsp_sv[0], &stray, 1),
+                "nothing from unauthenticated peers reached the LSP");
+
+    /* A first line too long to be an auth message is dropped. */
+    {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        char big[600];
+        memset(big, 'a', sizeof(big) - 1);
+        big[sizeof(big) - 1] = '\0';
+        TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
+        TEST_ASSERT(bridge_accept_plugin(&br), "accept");
+        TEST_ASSERT(send_str(c, big), "send oversized line");
+        int r = 0;
+        for (int tries = 0; tries < 10 && r == 0; tries++) {
+            TEST_ASSERT(wait_readable(br.plugin_pending_fd), "data pending");
+            r = bridge_service_pending_plugin(&br);
+        }
+        TEST_ASSERT_EQ(r, -1, "oversized first line dropped");
+        TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
+        close(c);
+    }
+
+    /* A connection that never authenticates is dropped after the timeout. */
+    {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
+        TEST_ASSERT(bridge_accept_plugin(&br), "accept");
+        time_t t0 = br.plugin_pending_since;
+        TEST_ASSERT(!bridge_expire_pending_plugin(&br, t0 + BRIDGE_PLUGIN_AUTH_TIMEOUT - 1),
+                    "still within the timeout");
+        TEST_ASSERT(br.plugin_pending_fd >= 0, "still pending");
+        TEST_ASSERT(bridge_expire_pending_plugin(&br, t0 + BRIDGE_PLUGIN_AUTH_TIMEOUT),
+                    "expired");
+        TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "dropped");
+        TEST_ASSERT(peer_closed(c), "connection closed");
+        close(c);
+    }
+
+    /* The right secret, arriving in two pieces and followed at once by a
+       plugin message. */
+    int plugin = connect_plugin_port(&br);
+    TEST_ASSERT(plugin >= 0, "connect");
+    TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
+    TEST_ASSERT(bridge_accept_plugin(&br), "accept");
+    TEST_ASSERT_EQ(br.plugin_fd, -1, "not the plugin before authenticating");
+    TEST_ASSERT(write(plugin, good, 20) == 20, "send first part");
+    TEST_ASSERT(wait_readable(br.plugin_pending_fd), "data pending");
+    TEST_ASSERT_EQ(bridge_service_pending_plugin(&br), 0, "auth line incomplete");
+    TEST_ASSERT_EQ(br.plugin_fd, -1, "still not the plugin");
+    snprintf(line, sizeof(line), "%s{\"method\":\"invoice_bolt11\",\"payment_hash\":"
+             "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
+             "\"bolt11\":\"lnbcrt1ptest\"}\n", good + 20);
+    TEST_ASSERT(send_str(plugin, line), "send rest + next message");
+    int r = 0;
+    for (int tries = 0; tries < 10 && r == 0; tries++) {
+        TEST_ASSERT(wait_readable(br.plugin_pending_fd), "data pending");
+        r = bridge_service_pending_plugin(&br);
+    }
+    TEST_ASSERT_EQ(r, 1, "right secret accepted");
+    TEST_ASSERT(br.plugin_fd >= 0, "now the plugin");
+    TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
+
+    /* It is told so... */
+    char buf[256];
+    ssize_t n = read(plugin, buf, sizeof(buf) - 1);
+    TEST_ASSERT(n > 0, "auth reply");
+    buf[n] = '\0';
+    TEST_ASSERT(strstr(buf, "\"auth_ok\"") != NULL, "auth_ok sent");
+
+    /* ...and the message behind the auth line is ordinary plugin traffic.
+       (If more than the auth line has arrived it is already buffered.) */
+    char *next = bridge_read_plugin_line(&br);
+    TEST_ASSERT(next != NULL, "message after auth available");
+    TEST_ASSERT(strstr(next, "\"invoice_bolt11\"") != NULL, "message intact");
+    TEST_ASSERT(bridge_handle_plugin_msg(&br, next), "message handled");
+    free(next);
+    wire_msg_t fwd;
+    TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &fwd, 5), "forwarded to LSP");
+    TEST_ASSERT_EQ(fwd.msg_type, MSG_INVOICE_BOLT11, "INVOICE_BOLT11");
+    cJSON_Delete(fwd.json);
+
+    /* While it is connected nobody else gets in, right secret or not, and
+       the plugin keeps its connection. */
+    int live_fd = br.plugin_fd;
+    for (int i = 0; i < 2; i++) {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        TEST_ASSERT(send_str(c, good), "second connection sends the secret");
+        TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
+        TEST_ASSERT(!bridge_accept_plugin(&br), "second connection refused");
+        TEST_ASSERT_EQ(br.plugin_fd, live_fd, "plugin connection unchanged");
+        TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "nothing pending");
+        TEST_ASSERT(peer_closed(c), "second connection closed");
+        close(c);
+    }
+
+    close(plugin);
+    close(lsp_sv[0]);
+    bridge_cleanup(&br);
     return 1;
 }

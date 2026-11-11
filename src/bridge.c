@@ -4,7 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 
 void bridge_init(bridge_t *br) {
@@ -12,6 +17,7 @@ void bridge_init(bridge_t *br) {
     br->lsp_fd = -1;
     br->plugin_listen_fd = -1;
     br->plugin_fd = -1;
+    br->plugin_pending_fd = -1;
     br->next_htlc_id = 1;
     br->next_request_id = 1;
     br->use_nk = 0;
@@ -101,23 +107,265 @@ int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
     return 1;
 }
 
-int bridge_listen_plugin(bridge_t *br, int plugin_port) {
-    br->plugin_listen_fd = wire_listen(NULL, plugin_port);
-    if (br->plugin_listen_fd < 0) {
-        fprintf(stderr, "Bridge: failed to listen on port %d\n", plugin_port);
-        return 0;
+/* --- Plugin shared secret --- */
+
+static int is_secret_hex(const char *s) {
+    if (!s || strlen(s) != BRIDGE_PLUGIN_SECRET_HEX_LEN) return 0;
+    for (size_t i = 0; i < BRIDGE_PLUGIN_SECRET_HEX_LEN; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return 0;
     }
-    printf("Bridge: listening for plugin on port %d\n", plugin_port);
     return 1;
 }
 
+/* Compare two n-byte buffers without an early exit, so the time taken does
+   not reveal how many leading bytes matched. */
+static int ct_equal(const char *a, const char *b, size_t n) {
+    unsigned char diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    return diff == 0;
+}
+
+static int write_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t w = write(fd, buf, len);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return 0;
+        buf += w;
+        len -= (size_t)w;
+    }
+    return 1;
+}
+
+static int secret_create(const char *path, char *out_hex) {
+    unsigned char raw[BRIDGE_PLUGIN_SECRET_HEX_LEN / 2];
+    int rfd = open("/dev/urandom", O_RDONLY);
+    if (rfd < 0) return 0;
+    size_t got = 0;
+    while (got < sizeof(raw)) {
+        ssize_t r = read(rfd, raw + got, sizeof(raw) - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(rfd);
+    if (got != sizeof(raw)) return 0;
+
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        out_hex[2 * i]     = digits[raw[i] >> 4];
+        out_hex[2 * i + 1] = digits[raw[i] & 0x0f];
+    }
+    out_hex[BRIDGE_PLUGIN_SECRET_HEX_LEN] = '\0';
+    memset(raw, 0, sizeof(raw));
+
+    /* O_EXCL: never write into a file somebody else put there. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return 0;
+    int ok = fchmod(fd, 0600) == 0 &&
+             write_all(fd, out_hex, BRIDGE_PLUGIN_SECRET_HEX_LEN) &&
+             write_all(fd, "\n", 1) && fsync(fd) == 0;
+    if (close(fd) != 0) ok = 0;
+    if (!ok) unlink(path);
+    return ok;
+}
+
+int bridge_plugin_secret_load(const char *path, char *out_hex) {
+    if (!path || !path[0] || !out_hex) return 0;
+    out_hex[0] = '\0';
+
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "Bridge: cannot open plugin secret %s: %s\n",
+                    path, strerror(errno));
+            return 0;
+        }
+        if (!secret_create(path, out_hex)) {
+            fprintf(stderr, "Bridge: cannot create plugin secret %s: %s\n",
+                    path, strerror(errno));
+            out_hex[0] = '\0';
+            return 0;
+        }
+        printf("Bridge: wrote new plugin secret to %s\n", path);
+        return 1;
+    }
+
+    struct stat st;
+    char buf[BRIDGE_PLUGIN_SECRET_HEX_LEN + 16];
+    ssize_t n = -1;
+    int ok = fstat(fd, &st) == 0;
+    if (ok && (!S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+               (st.st_mode & 077) != 0)) {
+        fprintf(stderr, "Bridge: plugin secret %s must be a regular file "
+                "owned by this user with mode 0600\n", path);
+        ok = 0;
+    }
+    if (ok) {
+        n = read(fd, buf, sizeof(buf) - 1);
+        if (n < 0) ok = 0;
+    }
+    close(fd);
+    if (!ok) return 0;
+
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
+                     buf[n - 1] == ' ' || buf[n - 1] == '\t'))
+        buf[--n] = '\0';
+    if (!is_secret_hex(buf)) {
+        fprintf(stderr, "Bridge: plugin secret %s is not %d hex characters\n",
+                path, BRIDGE_PLUGIN_SECRET_HEX_LEN);
+        memset(buf, 0, sizeof(buf));
+        return 0;
+    }
+    memcpy(out_hex, buf, BRIDGE_PLUGIN_SECRET_HEX_LEN + 1);
+    memset(buf, 0, sizeof(buf));
+    return 1;
+}
+
+int bridge_set_plugin_secret(bridge_t *br, const char *secret_hex) {
+    if (!br || !is_secret_hex(secret_hex)) return 0;
+    memcpy(br->plugin_secret, secret_hex, BRIDGE_PLUGIN_SECRET_HEX_LEN + 1);
+    br->has_plugin_secret = 1;
+    return 1;
+}
+
+/* --- Plugin port --- */
+
+int bridge_listen_plugin(bridge_t *br, const char *bind_addr, int plugin_port) {
+    if (!br->has_plugin_secret) {
+        fprintf(stderr, "Bridge: no plugin secret set, not listening\n");
+        return 0;
+    }
+    if (!bind_addr || !bind_addr[0])
+        bind_addr = BRIDGE_PLUGIN_BIND_DEFAULT;
+    struct in_addr parsed;
+    if (inet_pton(AF_INET, bind_addr, &parsed) != 1) {
+        fprintf(stderr, "Bridge: plugin bind address '%s' is not an IPv4 "
+                "address\n", bind_addr);
+        return 0;
+    }
+    if ((ntohl(parsed.s_addr) >> 24) != 127)
+        fprintf(stderr, "Bridge: WARNING — plugin port bound to %s; the "
+                "plugin link is not encrypted, keep it on a trusted network\n",
+                bind_addr);
+
+    br->plugin_listen_fd = wire_listen(bind_addr, plugin_port);
+    if (br->plugin_listen_fd < 0) {
+        fprintf(stderr, "Bridge: failed to listen on %s:%d\n",
+                bind_addr, plugin_port);
+        return 0;
+    }
+    printf("Bridge: listening for plugin on %s:%d\n", bind_addr, plugin_port);
+    return 1;
+}
+
+static void drop_pending_plugin(bridge_t *br) {
+    if (br->plugin_pending_fd >= 0)
+        wire_close(br->plugin_pending_fd);
+    br->plugin_pending_fd = -1;
+    br->plugin_pending_len = 0;
+    memset(br->plugin_pending_buf, 0, sizeof(br->plugin_pending_buf));
+}
+
 int bridge_accept_plugin(bridge_t *br) {
-    br->plugin_fd = wire_accept(br->plugin_listen_fd);
-    if (br->plugin_fd < 0) {
+    int fd = wire_accept(br->plugin_listen_fd);
+    if (fd < 0) {
         fprintf(stderr, "Bridge: failed to accept plugin\n");
         return 0;
     }
-    printf("Bridge: plugin connected\n");
+    /* One plugin at a time: a newcomer never displaces or joins it. */
+    if (br->plugin_fd >= 0 || br->plugin_pending_fd >= 0) {
+        fprintf(stderr, "Bridge: rejected extra connection on plugin port\n");
+        wire_close(fd);
+        return 0;
+    }
+    br->plugin_pending_fd = fd;
+    br->plugin_pending_since = time(NULL);
+    br->plugin_pending_len = 0;
+    return 1;
+}
+
+int bridge_expire_pending_plugin(bridge_t *br, time_t now) {
+    if (br->plugin_pending_fd < 0) return 0;
+    if (now - br->plugin_pending_since < BRIDGE_PLUGIN_AUTH_TIMEOUT) return 0;
+    fprintf(stderr, "Bridge: plugin connection did not authenticate in time\n");
+    drop_pending_plugin(br);
+    return 1;
+}
+
+/* 1 if `line` is the auth message carrying this bridge's secret. */
+static int plugin_auth_line_ok(const bridge_t *br, const char *line) {
+    if (!br->has_plugin_secret) return 0;
+    cJSON *json = cJSON_Parse(line);
+    if (!json) return 0;
+    int ok = 0;
+    cJSON *method = cJSON_GetObjectItem(json, "method");
+    cJSON *token = cJSON_GetObjectItem(json, "token");
+    if (method && cJSON_IsString(method) &&
+        strcmp(method->valuestring, "auth") == 0 &&
+        token && cJSON_IsString(token) &&
+        strlen(token->valuestring) == BRIDGE_PLUGIN_SECRET_HEX_LEN)
+        ok = ct_equal(token->valuestring, br->plugin_secret,
+                      BRIDGE_PLUGIN_SECRET_HEX_LEN);
+    cJSON_Delete(json);
+    return ok;
+}
+
+int bridge_service_pending_plugin(bridge_t *br) {
+    if (br->plugin_pending_fd < 0) return -1;
+
+    size_t room = sizeof(br->plugin_pending_buf) - br->plugin_pending_len;
+    ssize_t n = room > 0
+        ? recv(br->plugin_pending_fd,
+               br->plugin_pending_buf + br->plugin_pending_len, room,
+               MSG_DONTWAIT)
+        : 0;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return 0;
+    if (n <= 0) {
+        /* Closed, failed, or a first line too long to be an auth message. */
+        drop_pending_plugin(br);
+        return -1;
+    }
+    br->plugin_pending_len += (size_t)n;
+
+    char *nl = memchr(br->plugin_pending_buf, '\n', br->plugin_pending_len);
+    if (!nl) {
+        if (br->plugin_pending_len == sizeof(br->plugin_pending_buf)) {
+            drop_pending_plugin(br);
+            return -1;
+        }
+        return 0;
+    }
+
+    *nl = '\0';
+    if (!plugin_auth_line_ok(br, br->plugin_pending_buf)) {
+        fprintf(stderr, "Bridge: plugin connection failed authentication\n");
+        drop_pending_plugin(br);
+        return -1;
+    }
+
+    /* Authenticated: this is the plugin.  Anything it sent after the auth
+       line is ordinary plugin traffic. */
+    size_t used = (size_t)(nl - br->plugin_pending_buf) + 1;
+    size_t rest = br->plugin_pending_len - used;
+    memcpy(br->plugin_read_buf, br->plugin_pending_buf + used, rest);
+    br->plugin_read_len = rest;
+    br->plugin_read_pos = 0;
+    br->plugin_fd = br->plugin_pending_fd;
+    br->plugin_pending_fd = -1;
+    br->plugin_pending_len = 0;
+    memset(br->plugin_pending_buf, 0, sizeof(br->plugin_pending_buf));
+    printf("Bridge: plugin connected and authenticated\n");
+
+    cJSON *ack = cJSON_CreateObject();
+    cJSON_AddStringToObject(ack, "method", "auth_ok");
+    bridge_send_plugin_json(br, ack);
+    cJSON_Delete(ack);
     return 1;
 }
 
@@ -400,19 +648,30 @@ int bridge_run(bridge_t *br) {
         if (br->plugin_fd >= 0) {
             FD_SET(br->plugin_fd, &rfds);
             if (br->plugin_fd > max_fd) max_fd = br->plugin_fd;
-        } else if (br->plugin_listen_fd >= 0) {
+        }
+        if (br->plugin_pending_fd >= 0) {
+            FD_SET(br->plugin_pending_fd, &rfds);
+            if (br->plugin_pending_fd > max_fd) max_fd = br->plugin_pending_fd;
+        }
+        /* Keep watching the listen socket while a plugin is connected, so
+           further connections are turned away instead of queueing up. */
+        if (br->plugin_listen_fd >= 0) {
             FD_SET(br->plugin_listen_fd, &rfds);
             if (br->plugin_listen_fd > max_fd) max_fd = br->plugin_listen_fd;
         }
 
-        /* Use heartbeat interval as select timeout (or 60s if no heartbeat) */
+        /* Use heartbeat interval as select timeout (or 60s if no heartbeat);
+           wake sooner while a connection still has to authenticate. */
         int timeout_sec = (br->heartbeat_interval > 0) ? br->heartbeat_interval : 60;
+        if (br->plugin_pending_fd >= 0 && timeout_sec > BRIDGE_PLUGIN_AUTH_TIMEOUT)
+            timeout_sec = BRIDGE_PLUGIN_AUTH_TIMEOUT;
         struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
         int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) {
             perror("Bridge: select");
             return 0;
         }
+        bridge_expire_pending_plugin(br, time(NULL));
 
         /* Heartbeat: check for stale LSP connection on timeout */
         if (ret == 0) {
@@ -442,8 +701,16 @@ int bridge_run(bridge_t *br) {
             continue;
         }
 
-        /* Accept pending plugin connection */
-        if (br->plugin_listen_fd >= 0 && br->plugin_fd < 0 &&
+        /* A connection waiting to authenticate has sent something */
+        int plugin_just_authenticated = 0;
+        if (br->plugin_pending_fd >= 0 &&
+            FD_ISSET(br->plugin_pending_fd, &rfds)) {
+            plugin_just_authenticated = bridge_service_pending_plugin(br) == 1;
+        }
+
+        /* New connection on the plugin port (held until it authenticates,
+           or closed at once if a plugin is already there) */
+        if (br->plugin_listen_fd >= 0 &&
             FD_ISSET(br->plugin_listen_fd, &rfds)) {
             bridge_accept_plugin(br);
         }
@@ -475,8 +742,16 @@ int bridge_run(bridge_t *br) {
             cJSON_Delete(msg.json);
         }
 
-        /* Handle plugin messages */
-        if (br->plugin_fd >= 0 && FD_ISSET(br->plugin_fd, &rfds)) {
+        /* Handle plugin messages: when the socket is readable, and for as
+           long as complete lines are already buffered (several messages can
+           arrive in one read, or right behind the auth line). */
+        int plugin_readable = br->plugin_fd >= 0 && !plugin_just_authenticated &&
+                              FD_ISSET(br->plugin_fd, &rfds);
+        while (br->plugin_fd >= 0 &&
+               (plugin_readable ||
+                memchr(br->plugin_read_buf + br->plugin_read_pos, '\n',
+                       br->plugin_read_len - br->plugin_read_pos))) {
+            plugin_readable = 0;
             char *line = bridge_read_plugin_line(br);
             if (!line) {
                 fprintf(stderr, "Bridge: plugin connection lost\n");
@@ -484,7 +759,7 @@ int bridge_run(bridge_t *br) {
                 br->plugin_fd = -1;
                 br->plugin_read_len = 0;
                 br->plugin_read_pos = 0;
-                continue;
+                break;
             }
             if (!bridge_handle_plugin_msg(br, line)) {
                 free(line);
@@ -522,8 +797,10 @@ int bridge_reconnect_lsp(bridge_t *br) {
 void bridge_cleanup(bridge_t *br) {
     if (br->lsp_fd >= 0) wire_close(br->lsp_fd);
     if (br->plugin_fd >= 0) wire_close(br->plugin_fd);
+    if (br->plugin_pending_fd >= 0) wire_close(br->plugin_pending_fd);
     if (br->plugin_listen_fd >= 0) wire_close(br->plugin_listen_fd);
     br->lsp_fd = -1;
     br->plugin_fd = -1;
+    br->plugin_pending_fd = -1;
     br->plugin_listen_fd = -1;
 }

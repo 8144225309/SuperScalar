@@ -13,15 +13,21 @@ Handles:
 Non-factory HTLCs pass through to CLN's normal handling, so traditional
 Lightning channels continue to work unaffected.
 
+The bridge only talks to a plugin that presents its shared secret.  The
+bridge writes the secret to a file (mode 0600) when it first starts; this
+plugin reads the same file and sends the secret as its first message.
+
 Usage:
   lightningd --plugin=/path/to/cln_plugin.py \
              --superscalar-bridge-host=127.0.0.1 \
              --superscalar-bridge-port=9736 \
+             --superscalar-bridge-secret-file=~/.superscalar/bridge-plugin.secret \
              --superscalar-lightning-cli=lightning-cli
 """
 
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -30,6 +36,8 @@ import time
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
+# File holding the secret the bridge expects (written by superscalar_bridge)
+BRIDGE_SECRET_FILE = "~/.superscalar/bridge-plugin.secret"
 LIGHTNING_CLI = "lightning-cli"
 LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
 KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend (overridable via plugin option)
@@ -68,7 +76,6 @@ def cli_cmd(*args):
     network subdir.  Split the path so both sides agree."""
     cmd = LIGHTNING_CLI.split()
     if LIGHTNING_DIR:
-        import os
         tail = os.path.basename(LIGHTNING_DIR)
         if tail in _KNOWN_NETWORKS:
             # CLN v25+: lightning-dir includes network subdir — split it
@@ -176,11 +183,36 @@ def send_to_bridge(msg):
         return False
 
 
+def read_bridge_secret():
+    """Read the bridge's shared secret (64 hex characters) from
+    BRIDGE_SECRET_FILE.  Returns None if it is missing or malformed."""
+    path = os.path.expanduser(BRIDGE_SECRET_FILE)
+    try:
+        with open(path, "r") as f:
+            secret = f.read(256).strip()
+    except OSError as e:
+        log(f"Cannot read bridge secret {path}: {e}")
+        return None
+    if not _is_hash(secret):
+        log(f"Bridge secret {path} is not 64 hex characters")
+        return None
+    return secret
+
+
 def connect_bridge():
-    """Connect to the SuperScalar bridge daemon."""
+    """Connect to the SuperScalar bridge daemon and authenticate.
+
+    The secret is read afresh on every attempt (the bridge may have been
+    started, and the file created, after this plugin) and sent as the first
+    message; the bridge drops the connection if it is wrong."""
     global bridge_sock
+    secret = read_bridge_secret()
+    if secret is None:
+        return False
     try:
         sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT))
+        auth = json.dumps({"method": "auth", "token": secret}) + "\n"
+        sock.sendall(auth.encode())
         with lock:
             bridge_sock = sock
         log(f"Connected to bridge at {BRIDGE_HOST}:{BRIDGE_PORT}")
@@ -242,7 +274,10 @@ def handle_bridge_msg(msg):
     """Handle a message from the bridge."""
     method = msg.get("method", "")
 
-    if method == "htlc_resolve":
+    if method == "auth_ok":
+        log("Bridge accepted our secret")
+
+    elif method == "htlc_resolve":
         payment_hash = msg.get("payment_hash", "")
         result = msg.get("result")
         log(f"htlc_resolve: hash={payment_hash[:16]}... result={result}")
@@ -725,7 +760,7 @@ def read_requests():
 
 
 def main():
-    global BRIDGE_HOST, BRIDGE_PORT, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT, ROUTE_HINT
+    global BRIDGE_HOST, BRIDGE_PORT, BRIDGE_SECRET_FILE, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT, ROUTE_HINT
 
     # CLN plugin main loop: read JSON-RPC requests
     for request in read_requests():
@@ -749,6 +784,12 @@ def main():
                             "type": "int",
                             "default": 9736,
                             "description": "SuperScalar bridge port"
+                        },
+                        {
+                            "name": "superscalar-bridge-secret-file",
+                            "type": "string",
+                            "default": "~/.superscalar/bridge-plugin.secret",
+                            "description": "File with the secret the SuperScalar bridge expects"
                         },
                         {
                             "name": "superscalar-lightning-cli",
@@ -787,6 +828,8 @@ def main():
             config = request.get("params", {}).get("options", {})
             BRIDGE_HOST = config.get("superscalar-bridge-host", BRIDGE_HOST)
             BRIDGE_PORT = int(config.get("superscalar-bridge-port", BRIDGE_PORT))
+            BRIDGE_SECRET_FILE = config.get("superscalar-bridge-secret-file",
+                                            BRIDGE_SECRET_FILE)
             LIGHTNING_CLI = config.get("superscalar-lightning-cli", LIGHTNING_CLI)
             KEYSEND_DEFAULT_CLIENT = int(config.get("superscalar-keysend-client",
                                                       KEYSEND_DEFAULT_CLIENT))

@@ -9,6 +9,13 @@
 
 #define BRIDGE_MAX_PENDING 256
 
+/* The CLN plugin proves itself with a shared secret: 32 random bytes, kept
+   as 64 hex characters in a file only its owner can read. */
+#define BRIDGE_PLUGIN_SECRET_HEX_LEN 64
+#define BRIDGE_PLUGIN_BIND_DEFAULT   "127.0.0.1"
+/* Seconds a new connection has to present the secret. */
+#define BRIDGE_PLUGIN_AUTH_TIMEOUT   10
+
 /* Pending inbound HTLC (from CLN plugin, waiting for LSP resolution) */
 typedef struct {
     unsigned char payment_hash[32];
@@ -19,7 +26,17 @@ typedef struct {
 typedef struct {
     int lsp_fd;                          /* TCP connection to LSP */
     int plugin_listen_fd;                /* TCP listen socket for CLN plugin */
-    int plugin_fd;                       /* Connected CLN plugin socket */
+    int plugin_fd;                       /* Connected, authenticated CLN plugin */
+
+    /* A connection is not the plugin until it has presented the shared
+       secret.  Until then it waits here and nothing is read from or sent
+       to it as plugin traffic. */
+    int plugin_pending_fd;               /* accepted, not yet authenticated */
+    time_t plugin_pending_since;
+    char plugin_pending_buf[512];        /* its first line, as it arrives */
+    size_t plugin_pending_len;
+    char plugin_secret[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
+    int has_plugin_secret;
 
     bridge_pending_htlc_t pending_inbound[BRIDGE_MAX_PENDING];
     size_t n_pending;
@@ -68,12 +85,38 @@ void bridge_set_pubkey(bridge_t *br, const secp256k1_pubkey *pk);
    Returns 1 on success. */
 int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port);
 
-/* Start listening for CLN plugin connections on plugin_port.
-   Returns 1 on success. */
-int bridge_listen_plugin(bridge_t *br, int plugin_port);
+/* Read the plugin shared secret from `path`, creating the file with a fresh
+   random secret (mode 0600) if it does not exist.  An existing file must be
+   a regular file owned by this user, not accessible by group or others, and
+   hold exactly 64 hex characters.  out_hex receives the secret
+   (BRIDGE_PLUGIN_SECRET_HEX_LEN + 1 bytes).  Returns 1 on success. */
+int bridge_plugin_secret_load(const char *path, char *out_hex);
 
-/* Accept a plugin connection (blocking). Returns 1 on success. */
+/* Set the secret the plugin must present (64 hex characters).
+   Returns 1 on success, 0 if the value is malformed. */
+int bridge_set_plugin_secret(bridge_t *br, const char *secret_hex);
+
+/* Start listening for the CLN plugin on bind_addr:plugin_port.
+   bind_addr NULL or "" means loopback (BRIDGE_PLUGIN_BIND_DEFAULT); it must
+   be a literal IPv4 address.  Refuses to listen before a secret is set.
+   Returns 1 on success. */
+int bridge_listen_plugin(bridge_t *br, const char *bind_addr, int plugin_port);
+
+/* Accept a connection on the plugin port (blocking).  The connection is
+   held as pending until it authenticates; it is closed immediately if a
+   plugin is already connected or another connection is pending.
+   Returns 1 if a connection is now pending, 0 otherwise. */
 int bridge_accept_plugin(bridge_t *br);
+
+/* Read what the pending connection has sent.  Its first line must be
+   {"method":"auth","token":"<secret>"}; the token is compared in constant
+   time.  Returns 1 once it is authenticated (it is then plugin_fd), 0 if
+   the line is not complete yet, -1 if the connection was dropped. */
+int bridge_service_pending_plugin(bridge_t *br);
+
+/* Drop a pending connection that has not authenticated within
+   BRIDGE_PLUGIN_AUTH_TIMEOUT seconds of `now`.  Returns 1 if dropped. */
+int bridge_expire_pending_plugin(bridge_t *br, time_t now);
 
 /* Handle a wire message from the LSP (MSG_BRIDGE_*).
    Forwards to plugin as newline-delimited JSON. Returns 1 on success. */
