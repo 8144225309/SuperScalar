@@ -1891,7 +1891,8 @@
                         printf("  tick %d/%d: lsp_factory_tick_root...\n",
                                it + 1, n_iters);
                         fflush(stdout);
-                        int rc = lsp_factory_tick_root(mgr, lsp_p);
+                        int rc = lsp_factory_tick_root(mgr, lsp_p,
+                                /* allow_live_channel */ 1);
                         if (rc < 0) {
                             printf("  FAIL: lsp_factory_tick_root returned %d on tick %d\n",
                                    rc, it + 1);
