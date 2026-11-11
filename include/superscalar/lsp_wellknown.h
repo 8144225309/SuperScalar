@@ -63,6 +63,10 @@ void lsp_wellknown_handle_connection(int fd,
  * Fetch .well-known/lsps.json over plain HTTP from host:80.
  * On success fills host_out, port_out, pubkey_hex_out and returns 1.
  * On error returns 0.
+ *
+ * The response is not authenticated: anyone on the network path can replace
+ * it.  The host and port are only a place to connect to, but the public key
+ * must not be used to authenticate the LSP -- see lsp_wellknown_select_pin().
  */
 int lsp_wellknown_fetch_http(const char *domain,
                               char *host_out,       size_t host_cap,
@@ -77,6 +81,30 @@ int lsp_wellknown_fetch_http_port(const char *domain, uint16_t tcp_port,
                                    char *host_out,       size_t host_cap,
                                    uint16_t *port_out,
                                    char *pubkey_hex_out, size_t pubkey_cap);
+
+/* Outcome of lsp_wellknown_select_pin(). */
+typedef enum {
+    LSP_PIN_NONE = 0,   /* the operator configured no key: nothing is pinned */
+    LSP_PIN_CONFIGURED, /* the operator's key is pinned; the advertised key,
+                           if there is one, is the same key */
+    LSP_PIN_MISMATCH    /* the advertised key differs from the operator's key */
+} lsp_pin_result_t;
+
+/*
+ * Choose the LSP public key to pin for the Noise handshake.
+ *
+ * configured_pubkey_hex is the key the operator supplied out of band
+ * (--lsp-pubkey), or NULL.  advertised_pubkey_hex is the key from an
+ * unauthenticated well-known response, or NULL.
+ *
+ * Only the operator's key can be pinned.  The advertised key is never
+ * returned: it is compared with the operator's key (hex case is ignored) and
+ * a difference is reported as LSP_PIN_MISMATCH.  *pin_out is set to
+ * configured_pubkey_hex for LSP_PIN_CONFIGURED and to NULL otherwise.
+ */
+lsp_pin_result_t lsp_wellknown_select_pin(const char *configured_pubkey_hex,
+                                           const char *advertised_pubkey_hex,
+                                           const char **pin_out);
 
 /*
  * Fork a background process that accepts HTTP connections on tcp_port and

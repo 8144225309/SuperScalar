@@ -199,7 +199,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 |------|---------|-------------|
 | `--host HOST` | 127.0.0.1 | LSP hostname or IP (supports `.onion`) |
 | `--port PORT` | 9735 | LSP port |
-| `--lsp HOST:PORT` | — | Shorthand: sets both `--host` and `--port` from a single string |
+| `--lsp DOMAIN` | — | Look up `--host` and `--port` at `http://DOMAIN/.well-known/lsps.json`. The public key served there is fetched over unauthenticated HTTP and is never trusted: `--lsp-pubkey` is still required outside regtest, and the client refuses to connect if the two differ |
 | `--lsp-pubkey HEX` | none | LSP static pubkey for NK authentication (33-byte compressed hex) |
 | `--participant-id N` | auto | Explicit client slot ID in the factory (auto-assigned by LSP if omitted) |
 | `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / testnet4 / mainnet |

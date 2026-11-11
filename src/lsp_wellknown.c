@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
@@ -263,6 +264,23 @@ int lsp_wellknown_fetch_http(const char *domain,
                                          host_out, host_cap,
                                          port_out,
                                          pubkey_hex_out, pubkey_cap);
+}
+
+/* --- Client: which key may authenticate the LSP --- */
+
+lsp_pin_result_t lsp_wellknown_select_pin(const char *configured_pubkey_hex,
+                                           const char *advertised_pubkey_hex,
+                                           const char **pin_out) {
+    if (pin_out) *pin_out = NULL;
+
+    if (!configured_pubkey_hex) return LSP_PIN_NONE;
+
+    if (advertised_pubkey_hex &&
+        strcasecmp(configured_pubkey_hex, advertised_pubkey_hex) != 0)
+        return LSP_PIN_MISMATCH;
+
+    if (pin_out) *pin_out = configured_pubkey_hex;
+    return LSP_PIN_CONFIGURED;
 }
 
 /* --- Background server (fork-based) --- */

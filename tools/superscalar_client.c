@@ -2291,6 +2291,9 @@ static void usage(const char *prog) {
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
+        "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
+        "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
+        "                                    (outside regtest) and must match it.\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
@@ -3365,7 +3368,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Bootstrap from well-known endpoint: overrides --host, --port, --lsp-pubkey */
+    /* Bootstrap from the well-known endpoint: it supplies --host and --port.
+       The response travels over plain HTTP, so the public key in it is not
+       proof of anything and never becomes the pinned key: only --lsp-pubkey
+       does.  With that key pinned, a forged response can at worst point the
+       client at a host that then fails the handshake. */
     static char wk_host_buf[256];
     static char wk_pubkey_buf[128];
     if (lsp_domain) {
@@ -3385,10 +3392,35 @@ int main(int argc, char *argv[]) {
         }
         host = wk_host_buf;
         port = (int)wk_port;
-        if (!lsp_pubkey_hex)
-            lsp_pubkey_hex = wk_pubkey_buf;
-        printf("Client: bootstrapped from %s -> %s:%d pubkey %s\n",
-               lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
+        printf("Client: bootstrapped from %s -> %s:%d\n",
+               lsp_domain, wk_host_buf, wk_port);
+
+        const char *pin = NULL;
+        switch (lsp_wellknown_select_pin(lsp_pubkey_hex, wk_pubkey_buf, &pin)) {
+        case LSP_PIN_MISMATCH:
+            fprintf(stderr,
+                "Error: --lsp-pubkey does not match the key advertised by %s.\n"
+                "  --lsp-pubkey: %s\n"
+                "  advertised:   %s\n"
+                "  Either the LSP has changed its key (confirm the new key with the\n"
+                "  operator out of band) or the response did not come from your LSP.\n",
+                lsp_domain, lsp_pubkey_hex, wk_pubkey_buf);
+            memset(seckey, 0, 32);
+            report_close(&rpt);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        case LSP_PIN_CONFIGURED:
+            printf("Client: advertised LSP pubkey matches --lsp-pubkey\n");
+            break;
+        case LSP_PIN_NONE:
+            printf("Client: %s advertises LSP pubkey %s\n"
+                   "Client: that key was fetched over unauthenticated HTTP and is NOT trusted.\n"
+                   "Client: confirm it with the LSP operator out of band, then pass it\n"
+                   "Client: with --lsp-pubkey.\n",
+                   lsp_domain, wk_pubkey_buf);
+            break;
+        }
+        lsp_pubkey_hex = pin;
     }
 
     /* Require --lsp-pubkey on non-regtest to prevent MITM */

@@ -248,3 +248,56 @@ int test_client_bootstrap_from_domain(void) {
 
     return 1;
 }
+
+/* -----------------------------------------------------------------------
+ * Test 5: a key from the well-known response never becomes the pinned key
+ *
+ * The response is fetched over plain HTTP, so whoever controls the network
+ * path chooses the key in it.  Only the key the operator configured can pin
+ * the LSP; the advertised key can agree with it or contradict it.
+ * ----------------------------------------------------------------------- */
+int test_wellknown_pubkey_never_pins(void) {
+    const char *operator_key =
+        "02abc123def456abc123def456abc123def456abc123def456abc123def456ab0102";
+    const char *operator_key_upper =
+        "02ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456AB0102";
+    const char *other_key =
+        "03ffc123def456abc123def456abc123def456abc123def456abc123def456ab0102";
+    const char *pin;
+
+    /* No configured key: the advertised key must not be adopted. */
+    pin = other_key;
+    ASSERT(lsp_wellknown_select_pin(NULL, other_key, &pin) == LSP_PIN_NONE,
+           "advertised key alone pins nothing");
+    ASSERT(pin == NULL, "no pin without a configured key");
+
+    pin = other_key;
+    ASSERT(lsp_wellknown_select_pin(NULL, NULL, &pin) == LSP_PIN_NONE,
+           "no keys at all pins nothing");
+    ASSERT(pin == NULL, "no pin without any key");
+
+    /* Configured key, matching advertisement: the configured key is pinned. */
+    pin = NULL;
+    ASSERT(lsp_wellknown_select_pin(operator_key, operator_key_upper, &pin)
+               == LSP_PIN_CONFIGURED,
+           "matching advertisement (any hex case) is accepted");
+    ASSERT(pin == operator_key, "the configured key is the pin");
+
+    /* Configured key, nothing advertised (no --lsp lookup). */
+    pin = NULL;
+    ASSERT(lsp_wellknown_select_pin(operator_key, NULL, &pin) == LSP_PIN_CONFIGURED,
+           "configured key pins without a lookup");
+    ASSERT(pin == operator_key, "the configured key is the pin");
+
+    /* Configured key, different advertisement: reported, and the advertised
+       key is still not handed out. */
+    pin = other_key;
+    ASSERT(lsp_wellknown_select_pin(operator_key, other_key, &pin) == LSP_PIN_MISMATCH,
+           "differing advertisement is a mismatch");
+    ASSERT(pin == NULL, "no pin on mismatch");
+
+    /* pin_out is optional. */
+    ASSERT(lsp_wellknown_select_pin(NULL, other_key, NULL) == LSP_PIN_NONE,
+           "NULL pin_out is accepted");
+    return 1;
+}
