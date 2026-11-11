@@ -2350,8 +2350,8 @@ int main(int argc, char *argv[]) {
                                           blocker, sizeof(blocker))) {
                 fprintf(stderr,
                     "Error: %s already exists; --restore never overwrites.\n"
-                    "  Move the existing database (with its -wal and -shm files) and\n"
-                    "  keyfile away first, then run --restore again.\n", blocker);
+                    "  Move the existing database (with its -wal, -shm and -journal\n"
+                    "  files) and keyfile away first, then run --restore again.\n", blocker);
                 return 1;
             }
             int ok = backup_restore(restore_path_arg, db_path, keyfile_path,

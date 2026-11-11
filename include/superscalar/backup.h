@@ -53,17 +53,26 @@ int backup_verify(const char *backup_path, const unsigned char *passphrase,
 
 /* Restore DB + keyfile from encrypted backup.
    A restore never replaces anything: it fails without writing if anything
-   exists at dest_db_path, at its SQLite sidecars (dest_db_path + "-wal" and
-   "-shm") or at dest_keyfile_path.  Both files are written with mode 0600 and
-   appear only once both are complete on disk; on error neither is left
-   behind.
+   exists at dest_db_path, at its SQLite sidecars (dest_db_path + "-wal",
+   "-shm" and "-journal") or at dest_keyfile_path.
+
+   Both files are written with mode 0600 and are complete on disk before
+   either appears at its destination; the keyfile is put in place first, then
+   the database.  A failure normally leaves neither behind.  It is not a
+   single atomic step, though:
+     - if the database cannot be put in place and the keyfile then cannot be
+       removed again, the keyfile stays and an error naming it is printed;
+     - if the process is killed between the two steps, the keyfile is there
+       without the database.
+   In both cases the next restore is refused until the keyfile is removed.
    Returns 1 on success, 0 on error. */
 int backup_restore(const char *backup_path, const char *dest_db_path,
                    const char *dest_keyfile_path, const unsigned char *passphrase,
                    size_t passphrase_len);
 
 /* The first path that stops a restore to these destinations because
-   something already exists there, written to buf; NULL if nothing does. */
+   something already exists there (the database, its "-wal", "-shm" or
+   "-journal" sidecar, or the keyfile), written to buf; NULL if nothing does. */
 const char *backup_restore_blocked_by(const char *dest_db_path,
                                      const char *dest_keyfile_path,
                                      char *buf, size_t buf_len);

@@ -390,8 +390,8 @@ static void disk_writes_work(void) {
 }
 
 /* A restore never replaces anything.  If the database, one of its SQLite
-   sidecars or the keyfile is already there, it fails and every existing file
-   is left exactly as it was. */
+   sidecars (-wal, -shm, -journal) or the keyfile is already there, it fails
+   and every existing file is left exactly as it was. */
 int test_backup_restore_refuses_existing(void) {
     const char *db_path = "/tmp/test_bak_noclobber_src_db.sqlite";
     const char *kf_path = "/tmp/test_bak_noclobber_src_kf.key";
@@ -399,8 +399,10 @@ int test_backup_restore_refuses_existing(void) {
     const char *rest_db = "/tmp/test_bak_noclobber_db.sqlite";
     const char *rest_wal = "/tmp/test_bak_noclobber_db.sqlite-wal";
     const char *rest_shm = "/tmp/test_bak_noclobber_db.sqlite-shm";
+    const char *rest_journal = "/tmp/test_bak_noclobber_db.sqlite-journal";
     const char *rest_kf = "/tmp/test_bak_noclobber_kf.key";
-    const char *const dests[] = { rest_db, rest_wal, rest_shm, rest_kf };
+    const char *const dests[] = { rest_db, rest_wal, rest_shm, rest_journal, rest_kf };
+    const size_t n_dests = sizeof(dests) / sizeof(dests[0]);
 
     static const unsigned char backed_up_db[] = "database inside the backup";
     static const unsigned char backed_up_kf[] = "keyfile inside the backup";
@@ -413,8 +415,8 @@ int test_backup_restore_refuses_existing(void) {
     TEST_ASSERT(backup_create(db_path, kf_path, bak_path, pass, pass_len), "backup_create");
 
     /* One existing destination at a time is enough to stop the restore. */
-    for (size_t blocker = 0; blocker < 4; blocker++) {
-        for (size_t i = 0; i < 4; i++) remove(dests[i]);
+    for (size_t blocker = 0; blocker < n_dests; blocker++) {
+        for (size_t i = 0; i < n_dests; i++) remove(dests[i]);
         TEST_ASSERT(write_test_file(dests[blocker], live, sizeof(live) - 1), "live file");
 
         char blocked_by[256];
@@ -427,14 +429,14 @@ int test_backup_restore_refuses_existing(void) {
                     "restore over an existing file is refused");
         TEST_ASSERT(file_holds(dests[blocker], live, sizeof(live) - 1),
                     "existing file is untouched");
-        for (size_t i = 0; i < 4; i++) {
+        for (size_t i = 0; i < n_dests; i++) {
             if (i != blocker)
                 TEST_ASSERT(!path_exists(dests[i]), "no other destination was created");
         }
     }
 
     /* Nothing in the way: the restore goes through. */
-    for (size_t i = 0; i < 4; i++) remove(dests[i]);
+    for (size_t i = 0; i < n_dests; i++) remove(dests[i]);
     char blocked_by[256];
     TEST_ASSERT(backup_restore_blocked_by(rest_db, rest_kf, blocked_by,
                                           sizeof(blocked_by)) == NULL,
@@ -446,7 +448,7 @@ int test_backup_restore_refuses_existing(void) {
     remove(db_path);
     remove(kf_path);
     remove(bak_path);
-    for (size_t i = 0; i < 4; i++) remove(dests[i]);
+    for (size_t i = 0; i < n_dests; i++) remove(dests[i]);
     return 1;
 }
 

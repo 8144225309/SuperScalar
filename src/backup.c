@@ -352,9 +352,10 @@ const char *backup_restore_blocked_by(const char *dest_db_path,
                                      char *buf, size_t buf_len) {
     if (!dest_db_path || !dest_keyfile_path || !buf || buf_len == 0) return NULL;
 
-    /* The SQLite sidecars count too: a write-ahead log left over from another
-       database would be replayed into the restored one. */
-    static const char *const db_suffixes[] = { "", "-wal", "-shm" };
+    /* The SQLite sidecars count too: a write-ahead log or rollback journal
+       left over from another database would be replayed into the restored
+       one. */
+    static const char *const db_suffixes[] = { "", "-wal", "-shm", "-journal" };
     for (size_t i = 0; i < sizeof(db_suffixes) / sizeof(db_suffixes[0]); i++) {
         int n = snprintf(buf, buf_len, "%s%s", dest_db_path, db_suffixes[i]);
         if (n < 0 || (size_t)n >= buf_len || secure_file_exists(buf)) return buf;
@@ -401,15 +402,27 @@ int backup_restore(const char *backup_path, const char *dest_db_path,
     staged_kf = secure_file_stage(dest_keyfile_path, kf_data, kf_len);
     if (!staged_kf) goto done;
 
-    int db_placed = secure_file_commit(staged_db, dest_db_path, 0);
-    staged_db = NULL;
-    if (!db_placed) goto done;
-
+    /* The keyfile goes into place first.  If the process dies between the two
+       steps, what is left is the key without a database: a later start loads
+       that key and begins with empty state.  The other order would leave a
+       database with no key, and a later start would create a new, unrelated
+       key beside it. */
     int kf_placed = secure_file_commit(staged_kf, dest_keyfile_path, 0);
     staged_kf = NULL;
-    if (!kf_placed) {
-        /* Nothing was at dest_db_path before this call: take it back out. */
-        remove(dest_db_path);
+    if (!kf_placed) goto done;
+
+    int db_placed = secure_file_commit(staged_db, dest_db_path, 0);
+    staged_db = NULL;
+    if (!db_placed) {
+        /* Nothing was at dest_keyfile_path before this call: take it back
+           out, and say so if that fails, because the restore is then
+           incomplete rather than undone. */
+        if (remove(dest_keyfile_path) != 0)
+            fprintf(stderr,
+                "Error: the restore failed after the keyfile had been written, and\n"
+                "  %s could not be removed (%s).\n"
+                "  Remove it by hand before running --restore again.\n",
+                dest_keyfile_path, strerror(errno));
         goto done;
     }
     ok = 1;
