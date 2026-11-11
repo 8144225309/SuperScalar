@@ -25,6 +25,9 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <time.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -36,6 +39,114 @@ extern void reverse_bytes(unsigned char *data, size_t len);
         return 0; \
     } \
 } while(0)
+
+/* ---- Hard deadlines ----
+
+   The ceremony tests talk over sockets to forked clients or to an LSP.  If a
+   message that one side waits for never comes, a test would sit in recv() or
+   accept() and the whole suite with it.  Each such test therefore runs in a
+   process of its own, in its own process group, under a deadline: when the
+   deadline passes the group is killed and the test FAILS.  The group is also
+   killed after a normal finish, so nothing a test started outlives it.
+
+   SS_TEST_NO_DEADLINE=1 runs the bodies in the calling process instead, for
+   a debugger or a leak checker. */
+
+static double cs_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static int cs_run_with_deadline(int (*body)(void), int seconds,
+                                const char *name) {
+    const char *inproc = getenv("SS_TEST_NO_DEADLINE");
+    if (inproc && inproc[0] == '1') return body();
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        printf("  FAIL: %s: fork failed\n", name);
+        return 0;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        int ok = body();
+        fflush(stdout);
+        fflush(stderr);
+        _exit(ok ? 0 : 1);
+    }
+    setpgid(pid, pid);   /* from this side too: no window before the kill */
+
+    int status = 0, finished = 0;
+    double deadline = cs_now() + (double)seconds;
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) { finished = 1; break; }
+        if (r < 0 && errno != EINTR) break;
+        if (cs_now() >= deadline) break;
+        usleep(20000);
+    }
+    /* The body, and every process it started that is still around. */
+    kill(-pid, SIGKILL);
+    if (!finished) {
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        printf("  FAIL: %s: no result within %d s; test processes killed\n",
+               name, seconds);
+        return 0;
+    }
+    if (!WIFEXITED(status)) {
+        printf("  FAIL: %s: test process ended abnormally (signal %d)\n",
+               name, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        return 0;
+    }
+    return WEXITSTATUS(status) == 0;
+}
+
+/* Define test `name` as a body run under a deadline of `seconds`. */
+#define CS_DEADLINE_TEST(name, seconds) \
+    static int name##_body(void); \
+    int name(void) { return cs_run_with_deadline(name##_body, seconds, #name); } \
+    static int name##_body(void)
+
+#define CS_UNIT_DEADLINE_SEC 120
+#define CS_REGTEST_DEADLINE_SEC 600
+
+/* How long forked clients get to finish once the LSP side is done. */
+#define CS_REAP_GRACE_SEC 20
+
+/* Reap n children.  A child still running when the grace period ends is
+   killed and counts as failed.  exit_codes_out (may be NULL) receives each
+   exit status, or -1 for a child that was killed or died of a signal.
+   Returns how many exited 0. */
+static int cs_reap(const pid_t *pids, int n, int grace_sec,
+                   int *exit_codes_out) {
+    int done[16] = {0}, n_ok = 0, n_left = n;
+    double deadline = cs_now() + (double)grace_sec;
+    if (n > 16) n = n_left = 16;
+    for (int c = 0; c < n; c++)
+        if (exit_codes_out) exit_codes_out[c] = -1;
+    while (n_left > 0) {
+        int expired = cs_now() >= deadline;
+        for (int c = 0; c < n; c++) {
+            if (done[c]) continue;
+            int status = 0;
+            if (expired) kill(pids[c], SIGKILL);
+            pid_t r = waitpid(pids[c], &status, expired ? 0 : WNOHANG);
+            if (r == 0) continue;
+            if (r < 0 && errno == EINTR) continue;
+            done[c] = 1;
+            n_left--;
+            if (r == pids[c] && WIFEXITED(status)) {
+                if (exit_codes_out) exit_codes_out[c] = WEXITSTATUS(status);
+                if (WEXITSTATUS(status) == 0) n_ok++;
+            }
+        }
+        if (n_left > 0 && !expired) usleep(20000);
+    }
+    return n_ok;
+}
 
 #define CS_N 5              /* LSP + 4 clients */
 #define CS_FUNDING 1000000  /* sats */
@@ -475,7 +586,7 @@ static int cs_run_client_close(secp256k1_context *ctx,
 
 /* A proposal that does not pay the client is refused before the client
    reveals a nonce; one that does pay it gets a nonce. */
-int test_client_close_refuses_unpaid_proposal(void) {
+CS_DEADLINE_TEST(test_client_close_refuses_unpaid_proposal, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -546,7 +657,7 @@ int test_client_close_refuses_unpaid_proposal(void) {
 /* A client with no channel signs any close: it is owed nothing.  But if its
    own database holds a channel for this factory, it was started without its
    state and must refuse rather than sign its balance away. */
-int test_client_close_without_channel(void) {
+CS_DEADLINE_TEST(test_client_close_without_channel, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -655,7 +766,7 @@ static int cs_client_channel_reload(channel_t *ch, secp256k1_context *ctx,
    its balances and reconnected: the reloaded channel has the reduced balance
    and an empty HTLC list.  A proposal that pays that balance exactly must be
    refused, or the HTLC amount would go to the LSP. */
-int test_client_close_after_reconnect_with_htlc_in_flight(void) {
+CS_DEADLINE_TEST(test_client_close_after_reconnect_with_htlc_in_flight, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -762,7 +873,7 @@ int test_client_close_after_reconnect_with_htlc_in_flight(void) {
 
 /* The nLockTime of a proposed close must be near the client's own chain tip,
    and cannot be judged at all without one. */
-int test_client_close_locktime_bound(void) {
+CS_DEADLINE_TEST(test_client_close_locktime_bound, CS_UNIT_DEADLINE_SEC) {
     const uint32_t tip = 800000;
     const uint32_t margin = CLIENT_CLOSE_LOCKTIME_MARGIN;
 
@@ -845,7 +956,7 @@ int test_client_close_locktime_bound(void) {
    complete that close whenever it likes.  The client remembers it: it signs
    a later proposal only if that pays at least as much, and takes part in no
    leaf or state advance of the factory. */
-int test_client_close_records_signed_close(void) {
+CS_DEADLINE_TEST(test_client_close_records_signed_close, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -977,7 +1088,7 @@ int test_client_close_records_signed_close(void) {
 
 /* The record of a signed close is written to the client's database before
    the signature is sent, and a restarted client finds it there. */
-int test_client_close_record_survives_restart(void) {
+CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1116,7 +1227,7 @@ int test_client_close_record_survives_restart(void) {
 
 /* Full ceremony: the LSP proposes each party's balance at its own script and
    every client co-signs. */
-int test_client_close_honest_ceremony(void) {
+CS_DEADLINE_TEST(test_client_close_honest_ceremony, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1179,12 +1290,8 @@ int test_client_close_honest_ceremony(void) {
     free(lsp);
     signal(SIGPIPE, old_sigpipe);
 
-    int clients_ok = 1;
-    for (int c = 0; c < CS_N - 1; c++) {
-        int status = 0;
-        waitpid(pids[c], &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) clients_ok = 0;
-    }
+    int clients_ok =
+        cs_reap(pids, CS_N - 1, CS_REAP_GRACE_SEC, NULL) == CS_N - 1;
     secp256k1_context_destroy(ctx);
 
     TEST_ASSERT(close_rc == 1, "honest cooperative close completes");
@@ -1203,34 +1310,45 @@ static int cs_idle_cb(int fd, channel_t *ch, uint32_t my_index,
     return 1;
 }
 
-/* Run an LSP and four clients in one process group over loopback TCP, on a
-   made-up funding outpoint: factory creation, channel open, then one close
-   proposal.  The clients run client_run_with_channels, so the channel each
-   of them opened is what its close check sees.  With honest != 0 the LSP
-   proposes every party's balance at its own script, otherwise one output
-   paying everything to the LSP.  Reports the LSP's close result and how many
-   clients finished the ceremony. */
-static int cs_run_inprocess_close(int honest, int port, int *close_rc_out,
-                                  int *n_clients_done_out,
-                                  int *balances_ok_out) {
-    secp256k1_context *ctx = cs_ctx();
-    secp256k1_keypair kps[CS_N];
-    secp256k1_pubkey pks[CS_N];
-    if (!cs_keys(ctx, kps, pks)) return 0;
+/* Open the LSP's listening socket on a port the kernel picks and report the
+   port.  Done before any client is forked: a client that connects before the
+   LSP reaches accept() then simply waits in the backlog, instead of being
+   refused because nobody listens yet.  accept() gets a timeout so a client
+   that never arrives is an error, not a wait without end. */
+static int cs_lsp_listen(lsp_t *lsp, int *port_out) {
+    int fd = wire_listen("127.0.0.1", 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0 ||
+        ntohs(addr.sin_port) == 0) {
+        close(fd);
+        return 0;
+    }
+    lsp->listen_fd = fd;
+    lsp->port = (int)ntohs(addr.sin_port);
+    lsp->accept_timeout_sec = 30;
+    *port_out = lsp->port;
+    return 1;
+}
 
-    unsigned char fund_spk[34], fund_txid[32];
-    if (!cs_funding_spk(ctx, pks, fund_spk, NULL)) return 0;
-    memset(fund_txid, 0xAA, 32);
-
-    /* A client that refuses hangs up; nobody may die of SIGPIPE. */
-    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
-
-    pid_t child[CS_N - 1];
+/* Fork the four clients; each runs client_run_with_channels against the
+   LSP's port and exits 0 if it finished the close.  The LSP must already be
+   listening.  Returns 0 if a fork fails; clients started before that are
+   killed and reaped. */
+static int cs_fork_channel_clients(const lsp_t *lsp, int port,
+                                   pid_t child[CS_N - 1]) {
     fflush(stdout);
+    fflush(stderr);
     for (int c = 0; c < CS_N - 1; c++) {
         pid_t pid = fork();
+        if (pid < 0) {
+            cs_reap(child, c, 0, NULL);
+            return 0;
+        }
         if (pid == 0) {
-            usleep(100000 * (c + 1));
+            close(lsp->listen_fd);
             secp256k1_context *cc = cs_ctx();
             secp256k1_keypair ck;
             if (!secp256k1_keypair_create(cc, &ck, cs_seckeys[c + 1])) _exit(2);
@@ -1241,13 +1359,49 @@ static int cs_run_inprocess_close(int honest, int port, int *close_rc_out,
         }
         child[c] = pid;
     }
+    return 1;
+}
 
+/* Run an LSP and four clients over loopback TCP, on a made-up funding
+   outpoint: factory creation, channel open, then one close proposal.  The
+   clients run client_run_with_channels, so the channel each of them opened
+   is what its close check sees.  With honest != 0 the LSP proposes every
+   party's balance at its own script, otherwise one output paying everything
+   to the LSP.  Reports the LSP's close result and how many clients finished
+   the ceremony.  Returns 1 if factory and channels were set up. */
+static int cs_run_inprocess_close(int honest, int *close_rc_out,
+                                  int *n_clients_done_out,
+                                  int *balances_ok_out) {
+    *close_rc_out = -1;
+    *n_clients_done_out = 0;
+    *balances_ok_out = 0;
+
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    unsigned char fund_spk[34], fund_txid[32];
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    if (!lsp) return 0;
-    lsp_init(lsp, ctx, &kps[0], port, CS_N - 1);
+    int port = 0;
+    if (!lsp || !cs_keys(ctx, kps, pks) ||
+        !cs_funding_spk(ctx, pks, fund_spk, NULL) ||
+        !lsp_init(lsp, ctx, &kps[0], 0, CS_N - 1)) {
+        free(lsp);
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    memset(fund_txid, 0xAA, 32);
     factory_alloc_default_arrays(&lsp->factory);
-    int setup_ok = 1;
-    if (!lsp_accept_clients(lsp)) setup_ok = 0;
+
+    /* A client that refuses hangs up; nobody may die of SIGPIPE.  Set
+       before forking so the clients inherit it. */
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    pid_t child[CS_N - 1];
+    int setup_ok = cs_lsp_listen(lsp, &port);
+    int forked = setup_ok && cs_fork_channel_clients(lsp, port, child);
+    if (!forked) setup_ok = 0;
+
+    if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
                                                fund_spk, 34, 10, 4, 0))
         setup_ok = 0;
@@ -1265,7 +1419,6 @@ static int cs_run_inprocess_close(int honest, int port, int *close_rc_out,
         if (ch_mgr.entries[c].channel.remote_amount < CHANNEL_DUST_LIMIT_SATS)
             *balances_ok_out = 0;
 
-    *close_rc_out = -1;
     if (setup_ok) {
         tx_output_t outs[CS_N];
         size_t n_outs;
@@ -1286,18 +1439,16 @@ static int cs_run_inprocess_close(int honest, int port, int *close_rc_out,
         tx_buf_free(&close_tx);
     }
 
+    /* Hanging up ends whatever a client is still waiting for; one that does
+       not leave within the grace period is killed.  Every path that forked
+       comes through here. */
     lsp_channels_cleanup(&ch_mgr);
     lsp_cleanup(lsp);
     free(lsp);
+    if (forked)
+        *n_clients_done_out = cs_reap(child, CS_N - 1,
+                                       setup_ok ? CS_REAP_GRACE_SEC : 0, NULL);
     signal(SIGPIPE, old_sigpipe);
-
-    *n_clients_done_out = 0;
-    for (int c = 0; c < CS_N - 1; c++) {
-        int status = 0;
-        waitpid(child[c], &status, 0);
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-            (*n_clients_done_out)++;
-    }
     secp256k1_context_destroy(ctx);
     return setup_ok;
 }
@@ -1306,19 +1457,17 @@ static int cs_run_inprocess_close(int honest, int port, int *close_rc_out,
    ceremony.  Clients that went through the real factory creation and channel
    open complete a close that pays them, and all refuse one whose single
    output pays the LSP; without the channel they would sign either. */
-int test_client_run_with_channels_checks_close(void) {
-    int port = 21900 + (getpid() % 1000);
+CS_DEADLINE_TEST(test_client_run_with_channels_checks_close,
+                 CS_UNIT_DEADLINE_SEC) {
     int close_rc = -1, n_done = -1, balances_ok = 0;
 
-    TEST_ASSERT(cs_run_inprocess_close(1, port, &close_rc, &n_done,
-                                        &balances_ok),
+    TEST_ASSERT(cs_run_inprocess_close(1, &close_rc, &n_done, &balances_ok),
                 "factory and channels set up (honest close)");
     TEST_ASSERT(balances_ok, "every client holds a non-dust balance");
     TEST_ASSERT(close_rc == 1, "close paying every client completes");
     TEST_ASSERT(n_done == CS_N - 1, "every client completed the honest close");
 
-    TEST_ASSERT(cs_run_inprocess_close(0, port + 1, &close_rc, &n_done,
-                                        &balances_ok),
+    TEST_ASSERT(cs_run_inprocess_close(0, &close_rc, &n_done, &balances_ok),
                 "factory and channels set up (close paying only the LSP)");
     TEST_ASSERT(balances_ok, "every client holds a non-dust balance");
     TEST_ASSERT(close_rc == 0, "close paying only the LSP does not complete");
@@ -1329,7 +1478,8 @@ int test_client_run_with_channels_checks_close(void) {
 /* End to end on regtest: real clients with open channels are offered a close
    whose single output pays the LSP.  No client signs, the ceremony fails, and
    the factory funding output stays unspent. */
-int test_regtest_coop_close_refuses_lsp_payee(void) {
+CS_DEADLINE_TEST(test_regtest_coop_close_refuses_lsp_payee,
+                 CS_REGTEST_DEADLINE_SEC) {
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  FAIL: regtest not available\n");
@@ -1382,30 +1532,21 @@ int test_regtest_coop_close_refuses_lsp_payee(void) {
     }
     TEST_ASSERT(found_vout && fund_amount > 0, "funding output located");
 
-    int port = 19900 + (getpid() % 1000);
-    pid_t child[CS_N - 1];
-    fflush(stdout);
-    for (int c = 0; c < CS_N - 1; c++) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            usleep(100000 * (c + 1));
-            secp256k1_context *cc = cs_ctx();
-            secp256k1_keypair ck;
-            if (!secp256k1_keypair_create(cc, &ck, cs_seckeys[c + 1])) _exit(2);
-            int ok = client_run_with_channels(cc, &ck, "127.0.0.1", port,
-                                               cs_idle_cb, NULL, NULL, NULL);
-            secp256k1_context_destroy(cc);
-            _exit(ok ? 0 : 1);
-        }
-        child[c] = pid;
-    }
-
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    if (!lsp) return 0;
-    lsp_init(lsp, ctx, &kps[0], port, CS_N - 1);
+    TEST_ASSERT(lsp != NULL, "alloc");
+    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CS_N - 1), "lsp init");
     factory_alloc_default_arrays(&lsp->factory);
-    int setup_ok = 1;
-    if (!lsp_accept_clients(lsp)) setup_ok = 0;
+
+    /* The clients hang up as soon as they refuse; the LSP's abort notice to
+       them must not take anyone down with SIGPIPE. */
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    int port = 0;
+    pid_t child[CS_N - 1];
+    int setup_ok = cs_lsp_listen(lsp, &port);
+    int forked = setup_ok && cs_fork_channel_clients(lsp, port, child);
+    if (!forked) setup_ok = 0;
+    if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, fund_vout,
                                                fund_amount, fund_spk, 34,
                                                10, 4, 0))
@@ -1425,10 +1566,6 @@ int test_regtest_coop_close_refuses_lsp_payee(void) {
         if (ch_mgr.entries[c].channel.remote_amount < CHANNEL_DUST_LIMIT_SATS)
             balances_ok = 0;
 
-    /* The clients hang up as soon as they refuse; the LSP's abort notice to
-       them must not take the test process down with SIGPIPE. */
-    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
-
     int close_rc = -1;
     if (setup_ok) {
         unsigned char lsp_spk[34];
@@ -1447,12 +1584,9 @@ int test_regtest_coop_close_refuses_lsp_payee(void) {
     free(lsp);
     signal(SIGPIPE, old_sigpipe);
 
-    int n_signed = 0;
-    for (int c = 0; c < CS_N - 1; c++) {
-        int status = 0;
-        waitpid(child[c], &status, 0);
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) n_signed++;
-    }
+    int n_signed = forked
+        ? cs_reap(child, CS_N - 1, setup_ok ? CS_REAP_GRACE_SEC : 0, NULL)
+        : 0;
 
     regtest_mine_blocks(&rt, 1, mine_addr);
     int unspent = regtest_outpoint_unspent(&rt, fund_txid_hex, fund_vout);
@@ -1625,7 +1759,7 @@ static int cs_leaf_intact(const factory_t *f, int leaf_side,
 
 /* The handler refuses every proposal, whatever the amounts: it reveals no
    nonce and its signed leaf is left exactly as it was. */
-int test_client_leaf_realloc_handler_refuses_all(void) {
+CS_DEADLINE_TEST(test_client_leaf_realloc_handler_refuses_all, CS_UNIT_DEADLINE_SEC) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1705,11 +1839,11 @@ int test_client_leaf_realloc_handler_refuses_all(void) {
 
 /* Drive lsp_realloc_leaf on leaf 0 against the real client handler in both
    clients of that leaf.  Reports the LSP's return value, each client's exit
-   code and whether the LSP came out holding a signed leaf that differs from
-   the one the clients hold. */
+   code and whether the LSP came out on the same signed leaf it went in
+   with, which is the leaf the clients still hold. */
 static int cs_run_realloc_ceremony(const int64_t *deltas, int *lsp_rc_out,
                                    int client_code_out[2],
-                                   int *lsp_has_new_signed_leaf_out) {
+                                   int *lsp_leaf_intact_out) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1780,32 +1914,26 @@ static int cs_run_realloc_ceremony(const int64_t *deltas, int *lsp_rc_out,
     mgr.bridge_fd = -1;
     *lsp_rc_out = lsp_realloc_leaf(&mgr, lsp, 0, amts, n);
 
-    const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[0]];
-    *lsp_has_new_signed_leaf_out =
-        leaf->is_signed && leaf->signed_tx.len > 0 &&
-        memcmp(leaf->txid, snap.txid, 32) != 0;
+    *lsp_leaf_intact_out = cs_leaf_intact(f, 0, &snap);
 
     for (int c = 2; c < CS_N - 1; c++) close(peer_fd[c]);
     lsp_cleanup(lsp);
     free(lsp);
     signal(SIGPIPE, old_sigpipe);
 
-    for (int c = 0; c < 2; c++) {
-        int status = 0;
-        waitpid(pids[c], &status, 0);
-        client_code_out[c] = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    }
+    cs_reap(pids, 2, CS_REAP_GRACE_SEC, client_code_out);
     secp256k1_context_destroy(ctx);
     return 1;
 }
 
 /* Full ceremony, L-stock moved into a client's channel output: the amounts
    satisfy the amount rule, and the clients still refuse.  The LSP's ceremony
-   fails and it gets no signed replacement leaf. */
-int test_client_leaf_realloc_ceremony_refused(void) {
+   fails and puts its own leaf back as it was. */
+CS_DEADLINE_TEST(test_client_leaf_realloc_ceremony_refused, CS_UNIT_DEADLINE_SEC) {
     const int64_t deltas[3] = { 5000, 0, -5000 };
-    int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_new_leaf = -1;
-    TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes, &lsp_new_leaf),
+    int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_leaf_intact = -1;
+    TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes,
+                                         &lsp_leaf_intact),
                 "run ceremony");
     if (codes[0] != CS_REALLOC_REFUSED_INTACT ||
         codes[1] != CS_REALLOC_REFUSED_INTACT)
@@ -1814,7 +1942,8 @@ int test_client_leaf_realloc_ceremony_refused(void) {
                 codes[1] == CS_REALLOC_REFUSED_INTACT,
                 "both clients refuse and keep their signed leaf");
     TEST_ASSERT(lsp_rc == 0, "the LSP's reallocation does not complete");
-    TEST_ASSERT(lsp_new_leaf == 0, "the LSP holds no signed replacement leaf");
+    TEST_ASSERT(lsp_leaf_intact == 1,
+                "the LSP is back on the signed leaf its clients hold");
     return 1;
 }
 
@@ -1822,19 +1951,76 @@ int test_client_leaf_realloc_ceremony_refused(void) {
    A client that co-signed it would be left without a signed leaf while the
    LSP held one that supersedes the client's commitments, so it is refused
    like any other. */
-int test_client_leaf_realloc_identity_refused(void) {
+CS_DEADLINE_TEST(test_client_leaf_realloc_identity_refused, CS_UNIT_DEADLINE_SEC) {
     const int64_t deltas[3] = { 0, 0, 0 };
-    int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_new_leaf = -1;
-    TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes, &lsp_new_leaf),
+    int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_leaf_intact = -1;
+    TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes,
+                                         &lsp_leaf_intact),
                 "run ceremony");
     if (codes[0] != CS_REALLOC_REFUSED_INTACT ||
         codes[1] != CS_REALLOC_REFUSED_INTACT)
-        printf("  client exit codes: %d %d, LSP rc %d, LSP holds new signed "
-               "leaf: %d\n", codes[0], codes[1], lsp_rc, lsp_new_leaf);
+        printf("  client exit codes: %d %d, LSP rc %d, LSP leaf intact: %d\n",
+               codes[0], codes[1], lsp_rc, lsp_leaf_intact);
     TEST_ASSERT(codes[0] == CS_REALLOC_REFUSED_INTACT &&
                 codes[1] == CS_REALLOC_REFUSED_INTACT,
                 "both clients refuse and keep their signed leaf");
     TEST_ASSERT(lsp_rc == 0, "the LSP's reallocation does not complete");
-    TEST_ASSERT(lsp_new_leaf == 0, "the LSP holds no signed replacement leaf");
+    TEST_ASSERT(lsp_leaf_intact == 1,
+                "the LSP is back on the signed leaf its clients hold");
+    return 1;
+}
+
+/* Selling L-stock to a client needs a leaf reallocation, so the LSP refuses
+   the request before anything happens: no message to any client, and its
+   leaf exactly as it was. */
+CS_DEADLINE_TEST(test_lsp_buy_liquidity_refused, CS_UNIT_DEADLINE_SEC) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp != NULL, "alloc");
+    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CS_N - 1), "lsp init");
+    factory_t *f = &lsp->factory;
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+    TEST_ASSERT(factory_sign_all(f), "sign tree");
+
+    int peer_fd[CS_N - 1];
+    for (int c = 0; c < CS_N - 1; c++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        lsp->client_fds[c] = sv[0];
+        peer_fd[c] = sv[1];
+    }
+    lsp->n_clients = CS_N - 1;
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.bridge_fd = -1;
+    mgr.n_channels = CS_N - 1;
+
+    cs_leaf_snapshot_t snap;
+    cs_leaf_snapshot(f, 0, &snap);
+    TEST_ASSERT(cs_leaf_intact(f, 0, &snap), "leaf signed before the request");
+
+    int rc = lsp_channels_buy_liquidity(&mgr, lsp, 0, 1000);
+    int intact = cs_leaf_intact(f, 0, &snap);
+
+    /* Nothing may have been written to any client. */
+    int silent = 1;
+    for (int c = 0; c < CS_N - 1; c++) {
+        unsigned char byte;
+        ssize_t got = recv(peer_fd[c], &byte, 1, MSG_DONTWAIT);
+        if (got > 0) silent = 0;
+        close(peer_fd[c]);
+    }
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+
+    TEST_ASSERT(rc == 0, "buy_liquidity is refused");
+    TEST_ASSERT(intact, "the LSP's leaf is untouched");
+    TEST_ASSERT(silent, "no client was contacted");
     return 1;
 }

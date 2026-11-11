@@ -3952,6 +3952,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_leaf_realloc_handler_refuses_all);
     RUN_TEST(test_client_leaf_realloc_ceremony_refused);
     RUN_TEST(test_client_leaf_realloc_identity_refused);
+    extern int test_lsp_buy_liquidity_refused(void);
+    RUN_TEST(test_lsp_buy_liquidity_refused);
 }
 
 extern int regtest_init_faucet(void);
