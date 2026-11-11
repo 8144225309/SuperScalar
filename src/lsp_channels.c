@@ -7211,61 +7211,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     if (cur_tip_hash[0]) memcpy(daemon_last_tip_hash, cur_tip_hash, 65);
                 }
                 if (height > 0) {
-                    for (size_t c = 0; c < mgr->n_channels; c++) {
-                        channel_t *ch = &mgr->entries[c].channel;
-                        int n_failed = channel_check_htlc_timeouts(ch, (uint32_t)height);
-                        if (n_failed > 0) {
-                            printf("LSP: auto-failed %d expired HTLCs on channel %zu "
-                                   "(height=%d)\n", n_failed, c, height);
-                            /* Delete failed HTLCs from persistence (atomic batch) */
-                            if (mgr->persist) {
-                                persist_t *db = (persist_t *)mgr->persist;
-                                int own_txn = !persist_in_transaction(db);
-                                if (own_txn) persist_begin(db);
-                                for (size_t h = 0; h < ch->n_htlcs; h++) {
-                                    if (ch->htlcs[h].state == HTLC_STATE_FAILED)
-                                        persist_delete_htlc(db,
-                                                            (uint32_t)c, ch->htlcs[h].id);
-                                }
-                                if (own_txn) persist_commit(db);
-                            }
-                        }
-                    }
-
-                    /* Bridge HTLC timeout check: fail back bridge HTLCs approaching
-                       their CLTV deadline to avoid on-chain resolution.
-                       Safety margin: fail 10 blocks before expiry. */
-                    if (mgr->htlc_origins && mgr->bridge_fd >= 0) {
-                        for (size_t oi = 0; oi < mgr->n_htlc_origins; oi++) {
-                            htlc_origin_t *orig = &mgr->htlc_origins[oi];
-                            if (!orig->active || orig->cltv_expiry == 0) continue;
-                            if ((uint32_t)height + 10 >= orig->cltv_expiry) {
-                                fprintf(stderr, "LSP: bridge HTLC timeout — failing back "
-                                        "htlc_id=%llu (height=%d, cltv=%u)\n",
-                                        (unsigned long long)orig->bridge_htlc_id,
-                                        height, orig->cltv_expiry);
-                                unsigned char zero_hash[32] = {0};
-                                cJSON *fail = wire_build_bridge_fail_htlc(
-                                    zero_hash, "cltv_expiry_too_soon",
-                                    orig->bridge_htlc_id);
-                                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
-                                cJSON_Delete(fail);
-                                /* Also fail the channel-side HTLC if still active */
-                                for (size_t c = 0; c < mgr->n_channels; c++) {
-                                    channel_t *ch = &mgr->entries[c].channel;
-                                    for (size_t h = 0; h < ch->n_htlcs; h++) {
-                                        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE &&
-                                            memcmp(ch->htlcs[h].payment_hash,
-                                                   orig->payment_hash, 32) == 0) {
-                                            channel_fail_htlc(ch, ch->htlcs[h].id);
-                                            break;
-                                        }
-                                    }
-                                }
-                                orig->active = 0;
-                            }
-                        }
-                    }
+                    /* Expired HTLCs and inbound bridge HTLCs near their
+                       deadline; never an HTLC whose outside payment is
+                       still in flight. */
+                    lsp_channels_expire_htlcs(mgr, lsp, (uint32_t)height);
 
                     /* Profit settlement: handled above via chain_be (works
                        without watchtower). Removed from watchtower block. */

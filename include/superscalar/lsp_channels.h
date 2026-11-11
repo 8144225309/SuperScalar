@@ -624,6 +624,21 @@ void lsp_channels_note_outbound_paid(lsp_channel_mgr_t *mgr,
 int lsp_channels_outbound_was_paid(const lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32);
 
+/* 1 if HTLC htlc_id on client client_idx's channel pays for an outside
+   payment whose result has not arrived yet. */
+int lsp_channels_htlc_awaits_outside_pay(const lsp_channel_mgr_t *mgr,
+                                          size_t client_idx, uint64_t htlc_id);
+
+/* The per-block expiry pass of the daemon loop.
+   - Channel HTLCs that have reached their expiry are failed, except those
+     that pay for an outside payment still in flight: only the Lightning
+     node's result may settle those (a timer could refund a payment that
+     went through).
+   - Inbound bridge HTLCs within 10 blocks of their expiry are failed back
+     to the bridge.  Outbound origins are left alone. */
+void lsp_channels_expire_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                uint32_t height);
+
 /* 1 if another origin can be recorded. */
 int lsp_channels_origin_slot_free(const lsp_channel_mgr_t *mgr);
 

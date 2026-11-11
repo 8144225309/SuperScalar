@@ -1100,3 +1100,82 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
         }
     }
 }
+
+int lsp_channels_htlc_awaits_outside_pay(const lsp_channel_mgr_t *mgr,
+                                          size_t client_idx, uint64_t htlc_id) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        const htlc_origin_t *o = &mgr->htlc_origins[i];
+        if (o->active && o->bridge_htlc_id == 0 && o->request_id != 0 &&
+            o->sender_idx == client_idx && o->sender_htlc_id == htlc_id)
+            return 1;
+    }
+    return 0;
+}
+
+void lsp_channels_expire_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                uint32_t height) {
+    (void)lsp;
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        channel_t *ch = &mgr->entries[c].channel;
+        /* Monotonicity guard: a height that went backward (reorg) must not
+           fail anything early. */
+        if (height < ch->last_htlc_check_height) continue;
+        ch->last_htlc_check_height = height;
+
+        /* Collect first: failing an HTLC rearranges the array. */
+        uint64_t expired[MAX_HTLCS];
+        size_t n_expired = 0;
+        for (size_t h = 0; h < ch->n_htlcs && n_expired < MAX_HTLCS; h++) {
+            const htlc_t *htlc = &ch->htlcs[h];
+            if (htlc->state != HTLC_STATE_ACTIVE || htlc->cltv_expiry == 0 ||
+                height < htlc->cltv_expiry)
+                continue;
+            if (htlc->direction == HTLC_RECEIVED &&
+                lsp_channels_htlc_awaits_outside_pay(mgr, c, htlc->id))
+                continue;
+            expired[n_expired++] = htlc->id;
+        }
+        if (n_expired == 0) continue;
+
+        persist_t *db = (persist_t *)mgr->persist;
+        int own_txn = db && !persist_in_transaction(db);
+        if (own_txn) persist_begin(db);
+        int n_failed = 0;
+        for (size_t k = 0; k < n_expired; k++) {
+            if (!channel_fail_htlc(ch, expired[k])) continue;
+            n_failed++;
+            if (db) persist_delete_htlc(db, (uint32_t)c, expired[k]);
+        }
+        if (own_txn) persist_commit(db);
+        if (n_failed > 0)
+            printf("LSP: auto-failed %d expired HTLCs on channel %zu "
+                   "(height=%u)\n", n_failed, c, height);
+    }
+
+    /* Inbound bridge HTLCs approaching their deadline are failed back to
+       avoid on-chain resolution (10 blocks before expiry). */
+    if (!mgr->htlc_origins || mgr->bridge_fd < 0) return;
+    for (size_t oi = 0; oi < mgr->n_htlc_origins; oi++) {
+        htlc_origin_t *orig = &mgr->htlc_origins[oi];
+        if (!orig->active || orig->cltv_expiry == 0) continue;
+        if (orig->bridge_htlc_id == 0) continue;   /* outbound: never by timer */
+        if (height + 10 < orig->cltv_expiry) continue;
+
+        fprintf(stderr, "LSP: bridge HTLC timeout — failing back "
+                "htlc_id=%llu (height=%u, cltv=%u)\n",
+                (unsigned long long)orig->bridge_htlc_id, height,
+                orig->cltv_expiry);
+        cJSON *fail = wire_build_bridge_fail_htlc(orig->payment_hash,
+            "cltv_expiry_too_soon", orig->bridge_htlc_id);
+        wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+        cJSON_Delete(fail);
+        /* Also fail the HTLC offered to the client for it, if still active */
+        if (orig->sender_idx < mgr->n_channels)
+            channel_fail_htlc(&mgr->entries[orig->sender_idx].channel,
+                              orig->sender_htlc_id);
+        orig->active = 0;
+        if (mgr->persist)
+            persist_deactivate_htlc_origin((persist_t *)mgr->persist,
+                                            orig->payment_hash);
+    }
+}

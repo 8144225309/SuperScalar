@@ -4833,15 +4833,35 @@ int test_lsp_outbound_pay_held_past_expiry(void) {
     htlc_origin_t *o = &f.mgr.htlc_origins[0];
     wire_msg_t stray;
 
-    /* The client's HTLC expires at 500.  Well before, near, at and past
-       that height, with no result from the Lightning node, nothing is
-       failed and nobody is told anything. */
-    static const uint32_t heights[] = { 100, 459, 460, 499, 500, 501, 100000 };
+    /* A second HTLC from the same client, with no outside payment behind
+       it, expiring at 300: the expiry pass does fail that one. */
+    unsigned char other_hash[32];
+    memset(other_hash, 0x73, 32);
+    uint64_t plain_htlc;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_RECEIVED, 2000, other_hash, 300, &plain_htlc),
+                "plain HTLC");
+    TEST_ASSERT_EQ(ch->remote_amount, 94000, "both HTLCs out of the client's balance");
+
+    /* The outside-payment HTLC expires at 500.  Both timer paths the daemon
+       loop runs each block (the per-block expiry pass and the bridge
+       timeout check) are driven well before, near, at and past that
+       height, with no result from the Lightning node: it is never failed
+       and nobody is told anything about it. */
+    static const uint32_t heights[] = { 100, 299, 300, 459, 460, 489, 490,
+                                        499, 500, 501, 100000 };
     for (size_t i = 0; i < sizeof(heights) / sizeof(heights[0]); i++) {
+        lsp_channels_expire_htlcs(&f.mgr, f.lsp, heights[i]);
         lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, heights[i]);
         TEST_ASSERT(o->active, "origin stays open");
-        TEST_ASSERT_EQ(ch->n_htlcs, 1, "client HTLC still held");
-        TEST_ASSERT_EQ(ch->remote_amount, 96000, "client not refunded");
+        TEST_ASSERT(lsp_channels_htlc_awaits_outside_pay(&f.mgr, 0, f.htlc_id),
+                    "HTLC still waits for its outside payment");
+        TEST_ASSERT_EQ(ch->n_htlcs, heights[i] >= 300 ? 1 : 2,
+                       "only the plain HTLC is failed, at its expiry");
+        TEST_ASSERT_EQ(ch->remote_amount, heights[i] >= 300 ? 96000 : 94000,
+                       "client refunded the plain HTLC only");
+        TEST_ASSERT(ch->htlcs[0].id == f.htlc_id &&
+                    ch->htlcs[0].state == HTLC_STATE_ACTIVE,
+                    "outside-payment HTLC still held");
         TEST_ASSERT_EQ(o->expiry_warned, heights[i] >= 460,
                        "warned once the expiry is near");
     }
