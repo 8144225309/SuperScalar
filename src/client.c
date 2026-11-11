@@ -85,16 +85,6 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
     }
 }
 
-/* Client-side conservation invariant check (defense-in-depth).
-   The commitment signature already prevents exploitation, but this catches
-   bugs in the balance arithmetic itself.
-
-   Conservation: local + remote + Σ(htlc.amount + htlc.fee_at_add)
-                 == funding − base_commit_fee
-   The base commit-tx fee (154 vB × fee_rate) is deducted from the channel's
-   usable balance at init time (lsp_channels_init, src/lsp_channels.c:203-204),
-   so the invariant must account for it — otherwise the check trips by
-   exactly base_commit_fee on every balanced channel. */
 /* Both sides of the conservation invariant for ch: what the channel state
    accounts for (balances plus every active HTLC) and what the funding output
    holds once the base commitment fee is taken off.  Returns 1 if they agree. */
@@ -120,6 +110,16 @@ static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
     return sum == expected;
 }
 
+/* Client-side conservation invariant check (defense-in-depth).
+   The commitment signature already prevents exploitation, but this catches
+   bugs in the balance arithmetic itself.
+
+   Conservation: local + remote + Σ(htlc.amount + htlc.fee_at_add)
+                 == funding − base_commit_fee
+   The base commit-tx fee (154 vB × fee_rate) is deducted from the channel's
+   usable balance at init time (lsp_channels_init, src/lsp_channels.c:203-204),
+   so the invariant must account for it — otherwise the check trips by
+   exactly base_commit_fee on every balanced channel. */
 static void client_check_conservation(const channel_t *ch, const char *context) {
     if (!ch || ch->funding_amount == 0) return;
     uint64_t sum, expected, base_commit_fee;
