@@ -14,13 +14,17 @@
 # at port 1, where nothing listens, and has a time limit.
 set -u
 
-B=${1:-build}
+B=$(cd "${1:-build}" 2>/dev/null && pwd) || { echo "FAIL: build directory not found"; exit 1; }
 LSP=$B/superscalar_lsp
 CLIENT=$B/superscalar_client
 WT=$B/superscalar_watchtower
 KEY=1111111111111111111111111111111111111111111111111111111111111111
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+# Every command runs with an empty HOME and an empty working directory, so a
+# file created in a default location is seen as well as one at a given path.
+mkdir "$TMP/home" "$TMP/cwd" "$TMP/files"
+F=$TMP/files
 
 fail=0
 n=0
@@ -30,7 +34,8 @@ expect_refusal() {
     local want=$1; shift
     n=$((n + 1))
     local out rc
-    out=$(timeout -s KILL 30 "$@" --rpcport 1 2>&1)
+    out=$(cd "$TMP/cwd" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/home/.config" \
+          XDG_DATA_HOME="$TMP/home/.local/share" timeout -s KILL 30 "$@" --rpcport 1 2>&1)
     rc=$?
     if [ "$rc" -ne 1 ] || ! printf '%s' "$out" | grep -qF -- "$want"; then
         echo "FAIL: expected exit 1 with \"$want\" from: $*"
@@ -47,47 +52,49 @@ done
 for NET in mainnet bitcoin; do
     # Risk acknowledgement: all three daemons.
     expect_refusal "mainnet operation refused" "$LSP" --network "$NET"
-    expect_refusal "mainnet operation refused" "$CLIENT" --network "$NET" --keyfile "$TMP/none.key"
-    expect_refusal "mainnet operation refused" "$WT" --network "$NET" --wt-db "$TMP/wt.db"
+    expect_refusal "mainnet operation refused" "$CLIENT" --network "$NET" --keyfile "$F/none.key"
+    expect_refusal "mainnet operation refused" "$WT" --network "$NET" --wt-db "$F/wt.db"
 
     # Secret key on the command line: LSP and client.
     expect_refusal "--seckey is refused on mainnet" \
         "$LSP" --network "$NET" --i-accept-the-risk --seckey "$KEY"
     expect_refusal "--seckey is refused on mainnet" \
-        "$CLIENT" --network "$NET" --i-accept-the-risk --seckey "$KEY" --db "$TMP/c.db"
+        "$CLIENT" --network "$NET" --i-accept-the-risk --seckey "$KEY" --db "$F/c.db"
 
     # Test scaffolding in the arguments and in the environment: all three.
     expect_refusal "refused on mainnet" "$LSP" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" \
-        "$WT" --network "$NET" --i-accept-the-risk --wt-db "$TMP/wt.db" --test-flag
+        "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db" --test-flag
     expect_refusal "refused on mainnet" \
         env SS_CHEAT_DUST_RACE=1 "$LSP" --network "$NET" --i-accept-the-risk
     expect_refusal "refused on mainnet" \
         env SUPERSCALAR_CRASH_ALLOW=1 "$CLIENT" --network "$NET" --i-accept-the-risk
     expect_refusal "refused on mainnet" \
-        env SS_KILL_AT=1 "$WT" --network "$NET" --i-accept-the-risk --wt-db "$TMP/wt.db"
+        env SS_KILL_AT=1 "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db"
 
     # Persistent state: --db for LSP and client, --wt-db for the LSP.
     expect_refusal "mainnet requires --db" "$LSP" --network "$NET" --i-accept-the-risk
     expect_refusal "mainnet requires --db" \
-        "$CLIENT" --network "$NET" --i-accept-the-risk --keyfile "$TMP/none.key"
+        "$CLIENT" --network "$NET" --i-accept-the-risk --keyfile "$F/none.key"
     expect_refusal "mainnet requires --wt-db" \
-        "$LSP" --network "$NET" --i-accept-the-risk --db "$TMP/l.db"
+        "$LSP" --network "$NET" --i-accept-the-risk --db "$F/l.db"
 done
 
 # Chain names that are not supported.
 expect_refusal "unknown --network" "$LSP" --network livenet
 expect_refusal "unknown --network" "$CLIENT" --network livenet --seckey "$KEY"
-expect_refusal "unknown --network" "$WT" --network livenet --wt-db "$TMP/wt.db"
+expect_refusal "unknown --network" "$WT" --network livenet --wt-db "$F/wt.db"
 
 # The client on a non-regtest chain needs a pinned LSP key.
 expect_refusal "--lsp-pubkey required" \
     "$CLIENT" --network signet --seckey "$KEY" --rpcuser u --rpcpassword p
 
-# No case may have created a key or a database.
-if [ -n "$(ls -A "$TMP")" ]; then
-    echo "FAIL: a refused start-up created files: $(ls -A "$TMP" | tr '\n' ' ')"
+# No case may have created anything: not at a path it was given, not in its
+# working directory, not under HOME.
+created=$(find "$TMP" -mindepth 2 | sed "s|^$TMP/||")
+if [ -n "$created" ]; then
+    echo "FAIL: a refused start-up created files: $(printf '%s' "$created" | tr '\n' ' ')"
     fail=1
 fi
 

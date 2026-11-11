@@ -269,6 +269,7 @@ extern int test_wellknown_json_format(void);
 extern int test_client_bootstrap_from_domain(void);
 extern int test_wellknown_pubkey_never_pins(void);
 extern int test_client_endpoint_resolution(void);
+extern int test_wellknown_serve_fork_ports(void);
 /* PR #17 Phase 3: BOLT #7 gossip */
 extern int test_gossip_node_announcement_sign_verify(void);
 extern int test_gossip_channel_announcement_fields(void);
@@ -2261,6 +2262,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_bootstrap_from_domain);
     RUN_TEST(test_wellknown_pubkey_never_pins);
     RUN_TEST(test_client_endpoint_resolution);
+    RUN_TEST(test_wellknown_serve_fork_ports);
 
     printf("\n=== PR #17 Phase 3: BOLT #7 Gossip ===\n");
     RUN_TEST(test_gossip_node_announcement_sign_verify);

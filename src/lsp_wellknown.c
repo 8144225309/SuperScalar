@@ -322,9 +322,11 @@ lsp_endpoint_status_t lsp_wellknown_resolve_endpoint(
 
 /* --- Background server (fork-based) --- */
 
-int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
-                              uint16_t tcp_port) {
-    if (!cfg || tcp_port == 0) return 0;
+/* tcp_port 0 lets the operating system choose; the port actually bound is
+   written to *bound_port_out when that is not NULL. */
+static int serve_fork(const lsp_wellknown_cfg_t *cfg, uint16_t tcp_port,
+                      uint16_t *bound_port_out) {
+    if (!cfg) return 0;
 
     /* Create TCP server socket before forking */
     int srv = socket(AF_INET6, SOCK_STREAM, 0);
@@ -365,6 +367,18 @@ int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
         return 0;
     }
 
+    if (bound_port_out) {
+        struct sockaddr_storage bound;
+        socklen_t bound_len = sizeof(bound);
+        if (getsockname(srv, (struct sockaddr *)&bound, &bound_len) != 0) {
+            close(srv);
+            return 0;
+        }
+        *bound_port_out = ntohs(bound.ss_family == AF_INET6
+            ? ((struct sockaddr_in6 *)&bound)->sin6_port
+            : ((struct sockaddr_in *)&bound)->sin_port);
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         close(srv);
@@ -397,4 +411,16 @@ int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
     }
     close(srv);
     _exit(0);
+}
+
+int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
+                              uint16_t tcp_port) {
+    if (tcp_port == 0) return 0;
+    return serve_fork(cfg, tcp_port, NULL);
+}
+
+int lsp_wellknown_serve_fork_any_port(const lsp_wellknown_cfg_t *cfg,
+                                       uint16_t *tcp_port_out) {
+    if (!tcp_port_out) return 0;
+    return serve_fork(cfg, 0, tcp_port_out);
 }

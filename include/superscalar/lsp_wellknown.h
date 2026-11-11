@@ -151,4 +151,11 @@ lsp_endpoint_status_t lsp_wellknown_resolve_endpoint(
 int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
                               uint16_t tcp_port);
 
+/*
+ * Same, on a free port chosen by the operating system, which is written to
+ * *tcp_port_out.  For tests: no fixed port that something else may hold.
+ */
+int lsp_wellknown_serve_fork_any_port(const lsp_wellknown_cfg_t *cfg,
+                                       uint16_t *tcp_port_out);
+
 #endif /* SUPERSCALAR_LSP_WELLKNOWN_H */

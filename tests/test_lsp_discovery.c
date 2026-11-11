@@ -217,7 +217,7 @@ int test_wellknown_http_serve(void) {
 /* -----------------------------------------------------------------------
  * Test 4: end-to-end fetch from a local well-known HTTP server
  *
- * Forks a background server via lsp_wellknown_serve_fork(), then uses
+ * Forks a background server on a free port, then uses
  * lsp_wellknown_fetch_http_port() to retrieve and parse the response.
  * ----------------------------------------------------------------------- */
 /* Stop a server started with lsp_wellknown_serve_fork() and reap it, so the
@@ -229,16 +229,11 @@ static void stop_server(int server_pid) {
 }
 
 int test_client_bootstrap_from_domain(void) {
-    /* Use a high port unlikely to collide with anything */
-    uint16_t test_port = 18765;
-
-    /* Fork a background server serving TEST_CFG */
-    int server = lsp_wellknown_serve_fork(&TEST_CFG, test_port);
-    if (!server) {
-        /* If fork is unavailable (e.g. some sandboxes), skip gracefully */
-        printf("  SKIP: lsp_wellknown_serve_fork unavailable\n");
-        return 1;
-    }
+    /* Fork a background server serving TEST_CFG on a free port.  Not being
+       able to start it is a failure: the test must not pass without running. */
+    uint16_t test_port = 0;
+    int server = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &test_port);
+    ASSERT(server > 0 && test_port != 0, "well-known test server starts");
 
     /* Give the child process time to bind and listen */
     usleep(150000);  /* 150 ms */
@@ -321,15 +316,12 @@ int test_wellknown_pubkey_never_pins(void) {
  * must never end up pinned and must never satisfy the pin requirement.
  * ----------------------------------------------------------------------- */
 int test_client_endpoint_resolution(void) {
-    uint16_t test_port = 18766;
     const char *other_key =
         "03ffc123def456abc123def456abc123def456abc123def456abc123def456ab0102";
 
-    int server = lsp_wellknown_serve_fork(&TEST_CFG, test_port);
-    if (!server) {
-        printf("  SKIP: lsp_wellknown_serve_fork unavailable\n");
-        return 1;
-    }
+    uint16_t test_port = 0;
+    int server = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &test_port);
+    ASSERT(server > 0 && test_port != 0, "well-known test server starts");
     usleep(150000);
 
     lsp_endpoint_t no_key_required, no_key_optional, mismatch, match;
@@ -392,5 +384,24 @@ int test_client_endpoint_resolution(void) {
                                           NULL, 0, &direct) == LSP_ENDPOINT_OK,
            "direct endpoint without a key where none is required");
     ASSERT(direct.pinned_pubkey_hex == NULL, "nothing pinned");
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 7: server start-up on a fixed port and on a free port
+ * ----------------------------------------------------------------------- */
+int test_wellknown_serve_fork_ports(void) {
+    ASSERT(lsp_wellknown_serve_fork(&TEST_CFG, 0) == 0, "port 0 is not a fixed port");
+    ASSERT(lsp_wellknown_serve_fork_any_port(&TEST_CFG, NULL) == 0, "port out is required");
+    ASSERT(lsp_wellknown_serve_fork_any_port(NULL, &(uint16_t){0}) == 0, "cfg is required");
+
+    uint16_t port_a = 0, port_b = 0;
+    int server_a = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &port_a);
+    int server_b = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &port_b);
+    stop_server(server_a);
+    stop_server(server_b);
+
+    ASSERT(server_a > 0 && server_b > 0, "two servers start");
+    ASSERT(port_a != 0 && port_b != 0 && port_a != port_b, "each on its own port");
     return 1;
 }
