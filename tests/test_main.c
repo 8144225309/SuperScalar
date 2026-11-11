@@ -4020,6 +4020,48 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_bip158_callback_fires);
     RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
     RUN_TEST(test_reorg_bip158_noop);
+
+    printf("\n=== Client Signing Checks ===\n");
+    extern int test_client_close_outputs_acceptable(void);
+    extern int test_client_close_single_payout_output(void);
+    extern int test_client_close_tip_retry(void);
+    extern int test_client_close_repropose_changed_outputs(void);
+    extern int test_client_close_record_unreadable(void);
+    extern int test_client_close_refuses_unbalanced_channel(void);
+    extern int test_client_close_after_reconnect_with_htlc_in_flight(void);
+    extern int test_client_run_with_channels_checks_close(void);
+    extern int test_client_close_refuses_unpaid_proposal(void);
+    extern int test_client_close_without_channel(void);
+    extern int test_client_close_locktime_bound(void);
+    extern int test_client_close_records_signed_close(void);
+    extern int test_client_close_record_survives_restart(void);
+    extern int test_client_close_honest_ceremony(void);
+    RUN_TEST(test_client_close_outputs_acceptable);
+    RUN_TEST(test_client_close_single_payout_output);
+    RUN_TEST(test_client_close_refuses_unbalanced_channel);
+    RUN_TEST(test_client_close_after_reconnect_with_htlc_in_flight);
+    RUN_TEST(test_client_close_refuses_unpaid_proposal);
+    RUN_TEST(test_client_close_without_channel);
+    RUN_TEST(test_client_close_locktime_bound);
+    RUN_TEST(test_client_close_tip_retry);
+    RUN_TEST(test_client_close_records_signed_close);
+    RUN_TEST(test_client_close_repropose_changed_outputs);
+    RUN_TEST(test_client_close_record_survives_restart);
+    RUN_TEST(test_client_close_record_unreadable);
+    extern int test_conservation_counts_ptlc_fee(void);
+    RUN_TEST(test_conservation_counts_ptlc_fee);
+    RUN_TEST(test_client_close_honest_ceremony);
+    RUN_TEST(test_client_run_with_channels_checks_close);
+    extern int test_client_leaf_realloc_acceptable(void);
+    extern int test_client_leaf_realloc_handler_refuses_all(void);
+    extern int test_client_leaf_realloc_ceremony_refused(void);
+    extern int test_client_leaf_realloc_identity_refused(void);
+    RUN_TEST(test_client_leaf_realloc_acceptable);
+    RUN_TEST(test_client_leaf_realloc_handler_refuses_all);
+    RUN_TEST(test_client_leaf_realloc_ceremony_refused);
+    RUN_TEST(test_client_leaf_realloc_identity_refused);
+    extern int test_lsp_buy_liquidity_refused(void);
+    RUN_TEST(test_lsp_buy_liquidity_refused);
 }
 
 extern int regtest_init_faucet(void);
@@ -4149,6 +4191,8 @@ static void run_regtest_tests(void) {
     printf("\n=== Security Model Gap Tests (Regtest) ===\n");
     RUN_TEST(test_regtest_htlc_wrong_preimage_rejected);
     RUN_TEST(test_regtest_funding_double_spend_rejected);
+    extern int test_regtest_coop_close_refuses_lsp_payee(void);
+    RUN_TEST(test_regtest_coop_close_refuses_lsp_payee);
 
     printf("\n=== Regtest Fee Estimation ===\n");
     RUN_TEST(test_regtest_fee_estimation_parsing);

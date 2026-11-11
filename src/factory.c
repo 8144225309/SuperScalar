@@ -2563,6 +2563,80 @@ int factory_set_leaf_amounts(factory_t *f, int leaf_side,
     return rebuild_node_tx(f, node_idx);
 }
 
+static int leaf_snapshot_copy_buf(tx_buf_t *dst, const tx_buf_t *src) {
+    tx_buf_free(dst);
+    tx_buf_init(dst, src->len);
+    if (src->len > 0) {
+        if (!dst->data) return 0;
+        memcpy(dst->data, src->data, src->len);
+    }
+    dst->len = src->len;
+    return 1;
+}
+
+int factory_leaf_snapshot(const factory_t *f, int leaf_side,
+                           factory_leaf_snapshot_t *snap) {
+    if (!f || !snap) return 0;
+    memset(snap, 0, sizeof(*snap));
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    const factory_node_t *node = &f->nodes[f->leaf_node_indices[leaf_side]];
+
+    snap->per_leaf_enabled = f->per_leaf_enabled;
+    snap->leaf_layer = f->leaf_layers[leaf_side];
+    memcpy(snap->outputs, node->outputs, sizeof(snap->outputs));
+    snap->n_outputs = node->n_outputs;
+    memcpy(snap->txid, node->txid, 32);
+    snap->nsequence = node->nsequence;
+    snap->is_built = node->is_built;
+    snap->is_signed = node->is_signed;
+    memcpy(snap->l_stock_hash, node->l_stock_hash, 32);
+    snap->has_l_stock_hash = node->has_l_stock_hash;
+    snap->l_stock_state_counter = node->l_stock_state_counter;
+    snap->ps_chain_len = node->ps_chain_len;
+    memcpy(snap->ps_prev_txid, node->ps_prev_txid, 32);
+    snap->ps_prev_chan_amount = node->ps_prev_chan_amount;
+    if (!leaf_snapshot_copy_buf(&snap->unsigned_tx, &node->unsigned_tx) ||
+        !leaf_snapshot_copy_buf(&snap->signed_tx, &node->signed_tx)) {
+        factory_leaf_snapshot_free(snap);
+        return 0;
+    }
+    snap->valid = 1;
+    return 1;
+}
+
+int factory_leaf_restore(factory_t *f, int leaf_side,
+                          const factory_leaf_snapshot_t *snap) {
+    if (!f || !snap || !snap->valid) return 0;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+    factory_node_t *node = &f->nodes[f->leaf_node_indices[leaf_side]];
+
+    if (!leaf_snapshot_copy_buf(&node->unsigned_tx, &snap->unsigned_tx) ||
+        !leaf_snapshot_copy_buf(&node->signed_tx, &snap->signed_tx))
+        return 0;
+    f->per_leaf_enabled = snap->per_leaf_enabled;
+    f->leaf_layers[leaf_side] = snap->leaf_layer;
+    memcpy(node->outputs, snap->outputs, sizeof(node->outputs));
+    node->n_outputs = snap->n_outputs;
+    memcpy(node->txid, snap->txid, 32);
+    node->nsequence = snap->nsequence;
+    node->is_built = snap->is_built;
+    node->is_signed = snap->is_signed;
+    memcpy(node->l_stock_hash, snap->l_stock_hash, 32);
+    node->has_l_stock_hash = snap->has_l_stock_hash;
+    node->l_stock_state_counter = snap->l_stock_state_counter;
+    node->ps_chain_len = snap->ps_chain_len;
+    memcpy(node->ps_prev_txid, snap->ps_prev_txid, 32);
+    node->ps_prev_chan_amount = snap->ps_prev_chan_amount;
+    return 1;
+}
+
+void factory_leaf_snapshot_free(factory_leaf_snapshot_t *snap) {
+    if (!snap) return;
+    tx_buf_free(&snap->unsigned_tx);
+    tx_buf_free(&snap->signed_tx);
+    memset(snap, 0, sizeof(*snap));
+}
+
 /* Sign a single node (local-only, all keypairs available). */
 int factory_sign_node(factory_t *f, size_t node_idx) {
     if (node_idx >= f->n_nodes) return 0;
