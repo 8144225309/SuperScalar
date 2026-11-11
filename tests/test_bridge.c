@@ -11,6 +11,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/chain_backend.h"
+#include "superscalar/persist.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -4987,5 +4988,135 @@ int test_lsp_outbound_internal_invoice_refused(void) {
     close(cl[0]); close(cl[1]); close(br[0]); close(br[1]);
     free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- One payment hash, both directions: origins are not interchangeable ---- */
+
+/* Active origin rows in the database: total, and how many are outbound */
+static size_t db_origins(persist_t *db, size_t *n_outbound) {
+    unsigned char hashes[8][32];
+    uint64_t bridge_ids[8], req_ids[8], htlc_ids[8];
+    size_t senders[8];
+    size_t n = persist_load_htlc_origins(db, hashes, bridge_ids, req_ids,
+                                          senders, htlc_ids, 8);
+    *n_outbound = 0;
+    for (size_t i = 0; i < n; i++)
+        if (bridge_ids[i] == 0) (*n_outbound)++;
+    return n;
+}
+
+int test_lsp_same_hash_inbound_and_outbound(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    f.mgr.persist = &db;
+    f.mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    f.mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    TEST_ASSERT(f.mgr.invoices != NULL, "alloc");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    htlc_origin_t *out = &f.mgr.htlc_origins[0];
+    lsp_channels_origin_save(&f.mgr, out);      /* request 7 for hash H, in flight */
+    size_t n_out = 0;
+    TEST_ASSERT_EQ(db_origins(&db, &n_out), 1, "one origin stored");
+    char reason[128];
+    size_t dest;
+
+    /* The client that is paying H on the outside now registers H as an
+       invoice: refused, and it is told there will be no invoice. */
+    int cl[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    close(f.client_fd); close(f.client_peer);
+    f.client_fd = cl[0]; f.client_peer = cl[1];
+    shutdown(f.client_peer, SHUT_WR);   /* the client never answers */
+    {
+        cJSON *reg = wire_build_register_invoice(f.hash, f.preimage, 4000000, 0);
+        wire_msg_t m; m.msg_type = MSG_REGISTER_INVOICE; m.json = reg;
+        TEST_ASSERT(lsp_channels_handle_msg(&f.mgr, f.lsp, 0, &m), "handled");
+        cJSON_Delete(reg);
+        TEST_ASSERT(!lsp_channels_lookup_invoice(&f.mgr, f.hash, &dest),
+                    "hash in flight is not registered as an invoice");
+        wire_msg_t r;
+        TEST_ASSERT(wire_recv_timeout(f.client_peer, &r, 5), "client answered");
+        unsigned char rh[32]; char rb[64];
+        TEST_ASSERT(r.msg_type == MSG_INVOICE_BOLT11 &&
+                    wire_parse_invoice_bolt11(r.json, rh, rb, sizeof(rb)) &&
+                    rb[0] == '\0', "with an empty invoice");
+        cJSON_Delete(r.json);
+        TEST_ASSERT(!lsp_channels_register_invoice(&f.mgr, f.hash, f.preimage, 0, 4000000),
+                    "direct registration refused too");
+    }
+
+    /* An inbound HTLC for H, with or without a keysend preimage, is refused */
+    TEST_ASSERT(offer_bridge_htlc(&f.mgr, f.lsp, f.bridge_peer, f.hash, 4000000,
+                                   500, 70, reason, sizeof(reason)), "failed back");
+    TEST_ASSERT(strcmp(reason, "payment_hash_in_use") == 0, "inbound HTLC refused");
+    {
+        cJSON *ks = wire_build_bridge_add_htlc_keysend(f.hash, 4000000, 500, 71,
+                                                         f.preimage, 0);
+        wire_msg_t m; m.msg_type = MSG_BRIDGE_ADD_HTLC; m.json = ks;
+        TEST_ASSERT(lsp_channels_handle_bridge_msg(&f.mgr, f.lsp, &m), "handled");
+        cJSON_Delete(ks);
+        wire_msg_t r; unsigned char rh[32]; uint64_t rid = 0;
+        TEST_ASSERT(wire_recv_timeout(f.bridge_peer, &r, 5), "bridge answered");
+        TEST_ASSERT(r.msg_type == MSG_BRIDGE_FAIL_HTLC &&
+                    wire_parse_bridge_fail_htlc(r.json, rh, reason, sizeof(reason), &rid) &&
+                    rid == 71 && strcmp(reason, "payment_hash_in_use") == 0,
+                    "keysend for the hash refused");
+        cJSON_Delete(r.json);
+        TEST_ASSERT(!lsp_channels_lookup_invoice(&f.mgr, f.hash, &dest),
+                    "keysend did not register the hash");
+    }
+    TEST_ASSERT_EQ(ch->n_htlcs, 1, "nothing offered to the client");
+
+    /* Even with an inbound origin for H standing next to the outbound one,
+       each is found, settled and stored on its own. */
+    TEST_ASSERT(lsp_channels_get_bridge_origin(&f.mgr, f.hash) == 0 && out->active,
+                "an outbound origin is not an inbound one");
+    htlc_origin_t *in = lsp_channels_track_bridge_origin(&f.mgr, f.hash, 90);
+    TEST_ASSERT(in != NULL && in != out, "inbound origin in its own entry");
+    in->sender_idx = 0; in->sender_htlc_id = 555;
+    lsp_channels_origin_save(&f.mgr, in);
+    TEST_ASSERT(in->db_id != 0 && in->db_id != out->db_id, "its own row");
+    TEST_ASSERT(lsp_channels_find_origin(&f.mgr, f.hash, 0) == in, "found as inbound");
+    TEST_ASSERT(lsp_channels_find_origin(&f.mgr, f.hash, 1) == out, "found as outbound");
+    TEST_ASSERT_EQ(db_origins(&db, &n_out), 2, "two origins stored");
+
+    /* The client settles the inbound HTLC */
+    TEST_ASSERT_EQ(lsp_channels_settle_bridge_origin(&f.mgr, f.hash, f.preimage), 90,
+                   "the inbound origin is the one settled");
+    TEST_ASSERT(!in->active, "inbound origin closed");
+    TEST_ASSERT(out->active && out->request_id == 7, "outbound origin untouched");
+    TEST_ASSERT_EQ(db_origins(&db, &n_out), 1, "one origin left in the database");
+    TEST_ASSERT_EQ(n_out, 1, "and it is the outbound one");
+
+    /* The outside payment's result still finds its HTLC */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "client's HTLC claimed");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "LSP credited");
+    TEST_ASSERT(!out->active, "outbound origin closed");
+    TEST_ASSERT_EQ(db_origins(&db, &n_out), 0, "no origin left in the database");
+
+    /* Paid: the hash can still not become an invoice or an inbound payment */
+    TEST_ASSERT(lsp_channels_hash_spent_or_busy(&f.mgr, f.hash), "hash is spent");
+    TEST_ASSERT(!lsp_channels_register_invoice(&f.mgr, f.hash, f.preimage, 0, 4000000),
+                "paid hash not registered");
+    wire_msg_t drain;
+    while (wire_recv_timeout(f.bridge_peer, &drain, 1)) cJSON_Delete(drain.json);
+    TEST_ASSERT(offer_bridge_htlc(&f.mgr, f.lsp, f.bridge_peer, f.hash, 4000000,
+                                   500, 72, reason, sizeof(reason)), "failed back");
+    TEST_ASSERT(strcmp(reason, "payment_hash_in_use") == 0, "paid hash refused inbound");
+
+    /* An unrelated hash registers as before */
+    unsigned char p2[32], h2[32];
+    memset(p2, 0x74, 32);
+    sha256(p2, 32, h2);
+    TEST_ASSERT(lsp_channels_register_invoice(&f.mgr, h2, p2, 0, 1000), "fresh hash ok");
+
+    free(f.mgr.invoices);
+    f.mgr.persist = NULL;
+    persist_close(&db);
+    pay_fixture_free(&f);
     return 1;
 }

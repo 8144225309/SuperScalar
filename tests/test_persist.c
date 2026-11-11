@@ -5709,3 +5709,40 @@ int test_lsp_forgery_response_parse(void) {
 }
 
 /* === End revocation verification standard tests =========================== */
+
+/* ---- HTLC origins sharing a payment hash are separate rows ---- */
+
+int test_persist_htlc_origin_rows(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+    unsigned char hash[32];
+    memset(hash, 0x5e, 32);
+
+    /* One inbound and one outbound origin for the same hash */
+    int64_t in_id = persist_insert_htlc_origin(&db, hash, 90, 0, 1, 11);
+    int64_t out_id = persist_insert_htlc_origin(&db, hash, 0, 7, 2, 22);
+    TEST_ASSERT(in_id > 0 && out_id > 0 && in_id != out_id, "two rows");
+
+    TEST_ASSERT(persist_update_htlc_origin(&db, in_id, 91, 0, 1, 12), "update one row");
+
+    unsigned char hashes[4][32];
+    uint64_t bridge[4], req[4], htlc[4];
+    size_t sender[4];
+    int64_t ids[4];
+    TEST_ASSERT_EQ(persist_load_htlc_origins_ids(&db, hashes, bridge, req, sender,
+                                                  htlc, ids, 4), 2, "both active");
+    TEST_ASSERT(ids[0] == in_id && bridge[0] == 91 && htlc[0] == 12,
+                "updated row carries the new values");
+    TEST_ASSERT(ids[1] == out_id && bridge[1] == 0 && req[1] == 7 && htlc[1] == 22,
+                "the other row is unchanged");
+
+    /* Closing the inbound row leaves the outbound one */
+    TEST_ASSERT(persist_deactivate_htlc_origin_id(&db, in_id), "close inbound row");
+    TEST_ASSERT_EQ(persist_load_htlc_origins_ids(&db, hashes, bridge, req, sender,
+                                                  htlc, ids, 4), 1, "one active");
+    TEST_ASSERT(ids[0] == out_id && req[0] == 7, "the outbound row");
+    TEST_ASSERT(!persist_deactivate_htlc_origin_id(&db, 0), "row id 0 is nobody");
+
+    persist_close(&db);
+    return 1;
+}

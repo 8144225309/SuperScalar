@@ -740,6 +740,27 @@ int persist_save_htlc_origin(persist_t *p,
                               const unsigned char *payment_hash32,
                               uint64_t bridge_htlc_id, uint64_t request_id,
                               size_t sender_idx, uint64_t sender_htlc_id);
+/* Origins by row: two origins can share a payment hash (one in each
+   direction), so a row is updated and closed by its id, never by hash.
+   persist_insert_htlc_origin returns the new row id (0 on failure). */
+int64_t persist_insert_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t bridge_htlc_id, uint64_t request_id,
+                                    size_t sender_idx, uint64_t sender_htlc_id);
+int persist_update_htlc_origin(persist_t *p, int64_t row_id,
+                                uint64_t bridge_htlc_id, uint64_t request_id,
+                                size_t sender_idx, uint64_t sender_htlc_id);
+int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id);
+/* As persist_load_htlc_origins, also returning each row's id. */
+size_t persist_load_htlc_origins_ids(persist_t *p,
+                                      unsigned char (*hashes_out)[32],
+                                      uint64_t *bridge_ids_out,
+                                      uint64_t *request_ids_out,
+                                      size_t *sender_idxs_out,
+                                      uint64_t *sender_htlc_ids_out,
+                                      int64_t *row_ids_out,
+                                      size_t max_origins);
+
 int persist_deactivate_htlc_origin(persist_t *p,
                                     const unsigned char *payment_hash32);
 size_t persist_load_htlc_origins(persist_t *p,

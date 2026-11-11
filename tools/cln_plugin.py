@@ -554,6 +554,19 @@ def handle_bridge_msg(msg):
         payment_hash = msg.get("payment_hash", "")
         preimage_hex = msg.get("preimage", "")
         amount_msat = int(msg.get("amount_msat", 0))
+        # No invoice for a hash this node is paying, or has paid, on the
+        # outside: CLN would hold the preimage of its own outgoing payment.
+        with pays_lock:
+            paying = any(
+                rec.get("payment_hash") == payment_hash and
+                not (rec.get("result") and not rec["result"].get("success"))
+                for rec in open_pays.values())
+        if paying:
+            log(f"No invoice for {payment_hash[:16]}...: an outside payment "
+                f"for this hash is open")
+            send_to_bridge({"method": "invoice_bolt11",
+                            "payment_hash": payment_hash, "bolt11": ""})
+            return
         t = threading.Thread(
             target=_create_cln_invoice,
             args=(payment_hash, preimage_hex, amount_msat),

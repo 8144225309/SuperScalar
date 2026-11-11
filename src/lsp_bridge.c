@@ -207,6 +207,9 @@ int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *preimage32,
                                     size_t dest_client, uint64_t amount_msat) {
     if (dest_client >= mgr->n_channels) return 0;
+    /* One use per payment hash: not while an HTLC for it is in flight, and
+       not after a payment for it went through in either direction. */
+    if (lsp_channels_hash_spent_or_busy(mgr, payment_hash32)) return 0;
 
     /* Reuse an inactive slot first */
     invoice_entry_t *inv = NULL;
@@ -394,26 +397,63 @@ htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
     memcpy(origin->payment_hash, payment_hash32, 32);
     origin->bridge_htlc_id = bridge_htlc_id;
     origin->active = 1;
-
-    if (mgr->persist)
-        persist_save_htlc_origin((persist_t *)mgr->persist, payment_hash32,
-                                  bridge_htlc_id, 0, 0, 0);
     return origin;
 }
 
+htlc_origin_t *lsp_channels_find_origin(lsp_channel_mgr_t *mgr,
+                                         const unsigned char *payment_hash32,
+                                         int outbound) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        htlc_origin_t *o = &mgr->htlc_origins[i];
+        if (!o->active) continue;
+        if ((o->bridge_htlc_id == 0) != (outbound != 0)) continue;
+        if (memcmp(o->payment_hash, payment_hash32, 32) == 0)
+            return o;
+    }
+    return NULL;
+}
+
+void lsp_channels_origin_save(lsp_channel_mgr_t *mgr, htlc_origin_t *origin) {
+    if (!mgr->persist || !origin) return;
+    persist_t *db = (persist_t *)mgr->persist;
+    if (origin->db_id == 0)
+        origin->db_id = persist_insert_htlc_origin(db, origin->payment_hash,
+            origin->bridge_htlc_id, origin->request_id,
+            origin->sender_idx, origin->sender_htlc_id);
+    else
+        persist_update_htlc_origin(db, origin->db_id,
+            origin->bridge_htlc_id, origin->request_id,
+            origin->sender_idx, origin->sender_htlc_id);
+}
+
+void lsp_channels_origin_close(lsp_channel_mgr_t *mgr, htlc_origin_t *origin) {
+    if (!origin) return;
+    origin->active = 0;
+    if (mgr->persist && origin->db_id != 0)
+        persist_deactivate_htlc_origin_id((persist_t *)mgr->persist,
+                                           origin->db_id);
+}
+
+int lsp_channels_hash_spent_or_busy(const lsp_channel_mgr_t *mgr,
+                                     const unsigned char *payment_hash32) {
+    if (lsp_channels_hash_in_flight(mgr, payment_hash32) ||
+        lsp_channels_outbound_was_paid(mgr, payment_hash32))
+        return 1;
+    for (size_t i = 0; i < mgr->n_bridge_fulfilled; i++)
+        if (memcmp(mgr->bridge_fulfilled[i].payment_hash, payment_hash32, 32) == 0)
+            return 1;
+    return 0;
+}
+
+/* Inbound only: an outside payment a client requested for the same hash is
+   a different origin and is not touched. */
 uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
                                           const unsigned char *payment_hash32) {
-    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
-        if (!mgr->htlc_origins[i].active) continue;
-        if (memcmp(mgr->htlc_origins[i].payment_hash, payment_hash32, 32) == 0) {
-            mgr->htlc_origins[i].active = 0;
-            if (mgr->persist)
-                persist_deactivate_htlc_origin((persist_t *)mgr->persist,
-                                                payment_hash32);
-            return mgr->htlc_origins[i].bridge_htlc_id;
-        }
-    }
-    return 0;
+    htlc_origin_t *o = lsp_channels_find_origin(mgr, payment_hash32, 0);
+    if (!o) return 0;
+    uint64_t id = o->bridge_htlc_id;
+    lsp_channels_origin_close(mgr, o);
+    return id;
 }
 
 int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
@@ -458,10 +498,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                            cltv_expiry)) {
                 prev->bridge_htlc_id = htlc_id;
                 memcpy(prev->upstream_id, upstream_id, sizeof(prev->upstream_id));
-                if (mgr->persist)
-                    persist_save_htlc_origin((persist_t *)mgr->persist,
-                        payment_hash, htlc_id, 0,
-                        prev->sender_idx, prev->sender_htlc_id);
+                lsp_channels_origin_save(mgr, prev);
                 printf("LSP: bridge HTLC offered again, still in flight "
                        "(htlc_id now %llu)\n", (unsigned long long)htlc_id);
                 return 1;
@@ -480,6 +517,20 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                        "fulfilled, fulfil repeated\n");
                 return 1;
             }
+        }
+
+        /* A hash a client is paying, or has paid, on the outside is not
+           also accepted as an inbound payment (invoice or keysend): the two
+           would be settled by the same preimage. */
+        if (lsp_channels_find_origin(mgr, payment_hash, 1) ||
+            lsp_channels_outbound_was_paid(mgr, payment_hash)) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "payment_hash_in_use", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC rejected — hash is in use by an "
+                   "outside payment\n");
+            return 1;
         }
 
         /* Look up invoice to find dest_client */
@@ -637,26 +688,16 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
         }
 
-        /* Track bridge origin for back-propagation (with cltv for timeout) */
-        lsp_channels_track_bridge_origin(mgr, payment_hash, htlc_id);
-        /* Store cltv_expiry and dest info for timeout cleanup.
-           Look up by payment_hash since slot reuse may place it anywhere. */
-        for (size_t oi = 0; oi < mgr->n_htlc_origins; oi++) {
-            htlc_origin_t *org = &mgr->htlc_origins[oi];
-            if (org->active && memcmp(org->payment_hash, payment_hash, 32) == 0) {
-                org->cltv_expiry = cltv_expiry;
-                org->sender_idx = dest_idx;
-                org->sender_htlc_id = dest_htlc_id;
-                memcpy(org->upstream_id, upstream_id, sizeof(org->upstream_id));
-                /* Re-persist with updated sender/cltv fields so timeout
-                   routing works after crash (the initial persist only
-                   stored bridge_htlc_id with zeroed sender fields) */
-                if (mgr->persist)
-                    persist_save_htlc_origin((persist_t *)mgr->persist,
-                        payment_hash, htlc_id, 0,
-                        dest_idx, dest_htlc_id);
-                break;
-            }
+        /* Track bridge origin for back-propagation (with cltv for timeout),
+           in the entry the tracker filled. */
+        htlc_origin_t *org = lsp_channels_track_bridge_origin(mgr, payment_hash,
+                                                               htlc_id);
+        if (org) {
+            org->cltv_expiry = cltv_expiry;
+            org->sender_idx = dest_idx;
+            org->sender_htlc_id = dest_htlc_id;
+            memcpy(org->upstream_id, upstream_id, sizeof(org->upstream_id));
+            lsp_channels_origin_save(mgr, org);
         }
 
         /* Forward ADD_HTLC to destination client */
@@ -939,8 +980,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             ch->commitment_number + 1, pcs);
                     memset(pcs, 0, 32);
 
-                    persist_deactivate_htlc_origin(db,
-                        mgr->htlc_origins[i].payment_hash);
+                    persist_deactivate_htlc_origin_id(db,
+                        mgr->htlc_origins[i].db_id);
 
                     if (own_txn) persist_commit(db);
                 }
@@ -972,8 +1013,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         ch->local_amount, ch->remote_amount,
                         ch->commitment_number);
                     persist_delete_htlc(db, (uint32_t)client_idx, htlc_id_val);
-                    persist_deactivate_htlc_origin(db,
-                        mgr->htlc_origins[i].payment_hash);
+                    persist_deactivate_htlc_origin_id(db,
+                        mgr->htlc_origins[i].db_id);
 
                     if (own_txn) persist_commit(db);
                 }
@@ -1093,10 +1134,7 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
                 cJSON_Delete(fail);
             }
 
-            origin->active = 0;
-            if (mgr->persist)
-                persist_deactivate_htlc_origin((persist_t *)mgr->persist,
-                                                origin->payment_hash);
+            lsp_channels_origin_close(mgr, origin);
         }
     }
 }
@@ -1173,9 +1211,6 @@ void lsp_channels_expire_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (orig->sender_idx < mgr->n_channels)
             channel_fail_htlc(&mgr->entries[orig->sender_idx].channel,
                               orig->sender_htlc_id);
-        orig->active = 0;
-        if (mgr->persist)
-            persist_deactivate_htlc_origin((persist_t *)mgr->persist,
-                                            orig->payment_hash);
+        lsp_channels_origin_close(mgr, orig);
     }
 }

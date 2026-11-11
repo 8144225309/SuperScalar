@@ -144,6 +144,7 @@ typedef struct {
     #define BRIDGE_UPSTREAM_ID_MAX 64
     char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
     int expiry_warned;          /* outbound: unresolved-near-expiry logged */
+    int64_t db_id;              /* its row in the database, 0 if not saved */
     int active;
 } htlc_origin_t;
 
@@ -601,7 +602,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* Record that an HTLC for payment_hash32 came in through the bridge
    (bridge_htlc_id > 0) or went out through it (bridge_htlc_id == 0).
    Returns the origin entry that was filled (an earlier free slot is reused
-   before the table grows), or NULL if the table is full. */
+   before the table grows), or NULL if the table is full.  The caller
+   completes the entry and writes it with lsp_channels_origin_save. */
 htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id);
@@ -638,6 +640,27 @@ int lsp_channels_htlc_awaits_outside_pay(const lsp_channel_mgr_t *mgr,
      to the bridge.  Outbound origins are left alone. */
 void lsp_channels_expire_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 uint32_t height);
+
+/* The open origin for payment_hash32 in one direction: outbound != 0 for
+   an outside payment requested by a client, 0 for an HTLC that came in
+   through the bridge.  One hash can have one of each; they are never
+   interchangeable.  NULL if there is none. */
+htlc_origin_t *lsp_channels_find_origin(lsp_channel_mgr_t *mgr,
+                                         const unsigned char *payment_hash32,
+                                         int outbound);
+
+/* Write an origin to the database (insert the first time, update after). */
+void lsp_channels_origin_save(lsp_channel_mgr_t *mgr, htlc_origin_t *origin);
+
+/* Close an origin, in memory and its own row in the database. */
+void lsp_channels_origin_close(lsp_channel_mgr_t *mgr, htlc_origin_t *origin);
+
+/* 1 if payment_hash32 must not be used for a new invoice or a new inbound
+   payment: an HTLC for it is in flight in either direction, an outside
+   payment for it completed, or an inbound one was fulfilled (its preimage
+   is known outside). */
+int lsp_channels_hash_spent_or_busy(const lsp_channel_mgr_t *mgr,
+                                     const unsigned char *payment_hash32);
 
 /* 1 if another origin can be recorded. */
 int lsp_channels_origin_slot_free(const lsp_channel_mgr_t *mgr);

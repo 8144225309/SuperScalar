@@ -1108,16 +1108,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         /* Track origin for when PAY_RESULT comes back: request_id and the
            sender's HTLC go into the entry the tracker filled. */
-        if (lsp_channels_track_outbound_pay(mgr, payment_hash, request_id,
-                                             sender_idx, new_htlc_id,
-                                             cltv_expiry)) {
+        htlc_origin_t *out_origin = lsp_channels_track_outbound_pay(
+            mgr, payment_hash, request_id, sender_idx, new_htlc_id, cltv_expiry);
+        if (out_origin) {
             /* Persist origin + counter atomically */
             if (mgr->persist) {
                 persist_t *db = (persist_t *)mgr->persist;
                 int own_txn = !persist_in_transaction(db);
                 if (own_txn) persist_begin(db);
-                persist_save_htlc_origin(db,
-                    payment_hash, 0, request_id, sender_idx, new_htlc_id);
+                lsp_channels_origin_save(mgr, out_origin);
                 persist_save_counter(db,
                                       "next_request_id", mgr->next_request_id);
                 if (own_txn) persist_commit(db);
@@ -5388,6 +5387,17 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wire_parse_register_invoice(msg->json, payment_hash, preimage,
                                            &amount_msat, &dest_client))
             return 0;
+        /* A hash with an HTLC in flight, or one already paid in either
+           direction, cannot become an invoice: tell the client there will
+           be none (an empty BOLT11 string). */
+        if (lsp_channels_hash_spent_or_busy(mgr, payment_hash)) {
+            fprintf(stderr, "LSP: register_invoice from client %zu refused — "
+                    "payment hash is in use or already paid\n", client_idx);
+            cJSON *none = wire_build_invoice_bolt11(payment_hash, "");
+            wire_send(lsp->client_fds[client_idx], MSG_INVOICE_BOLT11, none);
+            cJSON_Delete(none);
+            return 1;
+        }
         if (!lsp_channels_register_invoice(mgr, payment_hash, preimage,
                                              dest_client, amount_msat)) {
             fprintf(stderr, "LSP: register_invoice failed\n");

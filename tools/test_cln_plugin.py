@@ -638,6 +638,33 @@ class PayResultDeliveryTest(PluginTestCase):
         self.assertEqual(cln.calls_to("pay"), [])
         self.assert_pay_failed(9)
 
+    def test_no_invoice_is_created_for_a_hash_being_paid(self):
+        started = []
+
+        class RecordingThread:
+            def __init__(self, target, args=(), daemon=None):
+                started.append(args)
+
+            def start(self):
+                pass
+
+        self.use_cln(decode=decoded_invoice(4_000_000), pay=PAY_TIMEOUT,
+                     listpays=listed("complete"))
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.to_bridge.clear()
+        register = {"method": "invoice_registered", "payment_hash": PAYMENT_HASH,
+                    "preimage": PREIMAGE, "amount_msat": 4_000_000,
+                    "dest_client": 0}
+        with mock.patch.object(cln_plugin.threading, "Thread", RecordingThread):
+            cln_plugin.handle_bridge_msg(register)
+            self.assertEqual(started, [])
+            self.assertEqual(self.to_bridge, [{
+                "method": "invoice_bolt11", "payment_hash": PAYMENT_HASH,
+                "bolt11": ""}])
+            # Another hash gets its invoice as before.
+            cln_plugin.handle_bridge_msg(dict(register, payment_hash=OTHER_HASH))
+            self.assertEqual(len(started), 1)
+
     def test_state_file_is_private_and_tolerates_damage(self):
         self.use_cln(decode=decoded_invoice(4_000_000),
                      pay={"status": "complete", "payment_preimage": PREIMAGE})

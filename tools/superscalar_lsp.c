@@ -3198,9 +3198,10 @@ int main(int argc, char *argv[]) {
                 uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
                 size_t orig_sender[MAX_HTLC_ORIGINS];
                 uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-                size_t n_orig = persist_load_htlc_origins(&db,
+                int64_t orig_ids[MAX_HTLC_ORIGINS];
+                size_t n_orig = persist_load_htlc_origins_ids(&db,
                     orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                    MAX_HTLC_ORIGINS);
+                    orig_ids, MAX_HTLC_ORIGINS);
                 for (size_t i = 0; i < n_orig; i++) {
                     if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
                     htlc_origin_t *o = &mgr->htlc_origins[mgr->n_htlc_origins++];
@@ -3209,6 +3210,7 @@ int main(int argc, char *argv[]) {
                     o->request_id = orig_req[i];
                     o->sender_idx = orig_sender[i];
                     o->sender_htlc_id = orig_htlc[i];
+                    o->db_id = orig_ids[i];
                     o->active = 1;
                 }
                 if (n_orig > 0)
@@ -4464,9 +4466,10 @@ accept_new_factory:
             uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
             size_t orig_sender[MAX_HTLC_ORIGINS];
             uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-            size_t n_orig = persist_load_htlc_origins(&db,
+            int64_t orig_ids[MAX_HTLC_ORIGINS];
+            size_t n_orig = persist_load_htlc_origins_ids(&db,
                 orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                MAX_HTLC_ORIGINS);
+                orig_ids, MAX_HTLC_ORIGINS);
             for (size_t i = 0; i < n_orig; i++) {
                 if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
                 htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
@@ -4475,6 +4478,7 @@ accept_new_factory:
                 origin->request_id = orig_req[i];
                 origin->sender_idx = orig_sender[i];
                 origin->sender_htlc_id = orig_htlc[i];
+                origin->db_id = orig_ids[i];
                 origin->active = 1;
             }
             if (n_orig > 0)

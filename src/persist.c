@@ -4715,6 +4715,48 @@ int persist_deactivate_htlc_origin(persist_t *p,
     return ok7;
 }
 
+int64_t persist_insert_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t bridge_htlc_id, uint64_t request_id,
+                                    size_t sender_idx, uint64_t sender_htlc_id) {
+    if (!persist_save_htlc_origin(p, payment_hash32, bridge_htlc_id, request_id,
+                                   sender_idx, sender_htlc_id))
+        return 0;
+    return (int64_t)sqlite3_last_insert_rowid(p->db);
+}
+
+int persist_update_htlc_origin(persist_t *p, int64_t row_id,
+                                uint64_t bridge_htlc_id, uint64_t request_id,
+                                size_t sender_idx, uint64_t sender_htlc_id) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "UPDATE htlc_origins SET bridge_htlc_id = ?, request_id = ?, "
+        "sender_idx = ?, sender_htlc_id = ? WHERE id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)bridge_htlc_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)request_id);
+    sqlite3_bind_int(stmt, 3, (int)sender_idx);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)sender_htlc_id);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)row_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql = "UPDATE htlc_origins SET active = 0 WHERE id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 size_t persist_load_htlc_origins(persist_t *p,
                                   unsigned char (*hashes_out)[32],
                                   uint64_t *bridge_ids_out,
@@ -4722,10 +4764,24 @@ size_t persist_load_htlc_origins(persist_t *p,
                                   size_t *sender_idxs_out,
                                   uint64_t *sender_htlc_ids_out,
                                   size_t max_origins) {
+    return persist_load_htlc_origins_ids(p, hashes_out, bridge_ids_out,
+                                          request_ids_out, sender_idxs_out,
+                                          sender_htlc_ids_out, NULL, max_origins);
+}
+
+size_t persist_load_htlc_origins_ids(persist_t *p,
+                                      unsigned char (*hashes_out)[32],
+                                      uint64_t *bridge_ids_out,
+                                      uint64_t *request_ids_out,
+                                      size_t *sender_idxs_out,
+                                      uint64_t *sender_htlc_ids_out,
+                                      int64_t *row_ids_out,
+                                      size_t max_origins) {
     if (!p || !p->db) return 0;
 
     const char *sql =
-        "SELECT payment_hash, bridge_htlc_id, request_id, sender_idx, sender_htlc_id "
+        "SELECT payment_hash, bridge_htlc_id, request_id, sender_idx, "
+        "sender_htlc_id, id "
         "FROM htlc_origins WHERE active = 1 ORDER BY id;";
 
     sqlite3_stmt *stmt;
@@ -4745,6 +4801,8 @@ size_t persist_load_htlc_origins(persist_t *p,
             sender_idxs_out[count] = (size_t)sqlite3_column_int(stmt, 3);
         if (sender_htlc_ids_out)
             sender_htlc_ids_out[count] = (uint64_t)sqlite3_column_int64(stmt, 4);
+        if (row_ids_out)
+            row_ids_out[count] = (int64_t)sqlite3_column_int64(stmt, 5);
         count++;
     }
 
