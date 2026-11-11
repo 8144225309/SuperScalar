@@ -305,52 +305,20 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
-/* Helper: receive next non-bookkeeping message.
-   Transparently consumes:
-     - MSG_LSP_REVOKE_AND_ACK (0x50): bidirectional revocations, 9 sites per payment.
-     - MSG_LEAF_ADVANCE_PROPOSE (0x58) + MSG_LEAF_ADVANCE_DONE (0x5A): the
-       post-HTLC-fulfill per-leaf advance ceremony that FACTORY_ARITY_1 and
-       FACTORY_ARITY_PS trigger in lsp_channels.c:2259. The client must
-       participate (send LEAF_ADVANCE_PSIG) or the LSP hangs waiting.
-       We delegate to client_handle_leaf_advance which handles the full
-       PROPOSE → PSIG → DONE sub-ceremony.
-   Returns 1 on success with out populated with the next payment-flow msg. */
-static int recv_skip_revocations_ex(int fd, wire_msg_t *out,
-                                      secp256k1_context *ctx,
-                                      const secp256k1_keypair *keypair,
-                                      factory_t *factory,
-                                      uint32_t my_index) {
+/* Helper: receive the next payment-flow message, transparently consuming
+   MSG_LSP_REVOKE_AND_ACK (0x50), the LSP's half of the bidirectional
+   revocation exchange.  Nothing else is skipped: a payment triggers no
+   factory-tree ceremony, so any other message is handed to the caller.
+   Returns 1 on success with out populated. */
+static int recv_skip_revocations(int fd, wire_msg_t *out) {
     for (;;) {
         if (!wire_recv(fd, out)) return 0;
         if (out->msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
             cJSON_Delete(out->json);
             continue;
         }
-        if (out->msg_type == 0x58) {  /* MSG_LEAF_ADVANCE_PROPOSE */
-            /* Handle the leaf advance in-line. client_handle_leaf_advance
-               consumes PROPOSE, sends PSIG, waits for DONE. */
-            if (ctx && keypair && factory) {
-                if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
-                                                  my_index, out)) {
-                    cJSON_Delete(out->json);
-                    return 0;
-                }
-            }
-            cJSON_Delete(out->json);
-            continue;
-        }
-        if (out->msg_type == 0x5A) {  /* MSG_LEAF_ADVANCE_DONE — stray */
-            cJSON_Delete(out->json);
-            continue;
-        }
         return 1;
     }
-}
-/* Back-compat wrapper: callers without ctx/keypair/factory fall through
-   to the old revocation-only behavior. Leaf-advance will then be
-   unhandled (original pre-fix behavior). */
-static int recv_skip_revocations(int fd, wire_msg_t *out) {
-    return recv_skip_revocations_ex(fd, out, NULL, NULL, NULL, 0);
 }
 
 static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -377,7 +345,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for COMMITMENT_SIGNED (acknowledging HTLC) */
             wire_msg_t msg;
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv failed after send\n", my_index);
                 return 0;
             }
@@ -392,7 +360,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Wait for FULFILL_HTLC */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
             }
@@ -414,7 +382,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -430,7 +398,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for ADD_HTLC from LSP */
             wire_msg_t msg;
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv ADD_HTLC failed\n", my_index);
                 return 0;
             }
@@ -445,7 +413,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit failed\n", my_index);
                 return 0;
             }
@@ -477,7 +445,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             client_fulfill_payment(fd, ch, htlc_id, act->preimage);
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -486,50 +454,6 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
-            }
-        }
-
-        /* Drain any pending LEAF_ADVANCE_PROPOSE that the LSP sent for this
-           client after the HTLC fulfill committed (src/lsp_channels.c:2259 —
-           FACTORY_ARITY_1 and FACTORY_ARITY_PS trigger a per-leaf MuSig
-           advance after every fulfill). Without this, the next action's
-           ADD_HTLC races the LSP's advance ceremony and the LSP drops our
-           ADD_HTLC with 'expected LEAF_ADVANCE_PSIG from client N, got 0x31'.
-
-           Only drain BETWEEN actions, not after the last action — otherwise
-           we'd consume MSG_CLOSE_PROPOSE or similar post-payment traffic the
-           caller expects. */
-        if (i + 1 < data->n_actions) {
-            wire_msg_t drain_msg;
-            while (1) {
-                wire_set_timeout(fd, 2);
-                int got = wire_recv(fd, &drain_msg);
-                wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
-                if (!got) break;  /* timeout / no more drainable messages */
-                if (drain_msg.msg_type == 0x58) {  /* LEAF_ADVANCE_PROPOSE */
-                    if (ctx && keypair && factory &&
-                        !client_handle_leaf_advance(fd, ctx, keypair, factory,
-                                                       my_index, &drain_msg)) {
-                        cJSON_Delete(drain_msg.json);
-                        fprintf(stderr, "Client %u: leaf_advance drain failed\n",
-                                my_index);
-                        return 0;
-                    }
-                    cJSON_Delete(drain_msg.json);
-                    continue;
-                }
-                cJSON_Delete(drain_msg.json);
-                if (drain_msg.msg_type == 0x50 ||       /* REVOKE_AND_ACK */
-                    drain_msg.msg_type == 0x5A)          /* LEAF_ADVANCE_DONE */
-                    continue;
-                /* Not a drainable noise message — stop draining. This
-                   message is now consumed; the next action will expect to
-                   see it and may stall. That's a test-ordering issue, not a
-                   drain bug. Do not drain anything the next action expects. */
-                fprintf(stderr,
-                    "Client %u: drain consumed unexpected msg 0x%02x — "
-                    "test may stall\n", my_index, drain_msg.msg_type);
-                break;
             }
         }
     }
@@ -4555,3 +4479,267 @@ int test_client_ps_double_spend_defense_refuses(void) {
     return 1;
 }
 
+/* ---- A settled payment leaves the factory leaf untouched ----
+
+   In-process: LSP + 2 clients over TCP on a per-client-leaf factory, no chain
+   backend (the funding outpoint is synthetic; nothing is broadcast).  Client A
+   pays client B through the LSP's normal message handler, then:
+
+     1. both leaf nodes must be exactly what they were before the payment
+        (txid, signed bytes, PS chain length, DW leaf state);
+     2. the leaf-advance entry point must refuse a leaf whose channel holds
+        client funds, without changing anything;
+     3. with the explicit override the same entry point must run the ceremony
+        and replace the leaf transaction, while the channel keeps its funding
+        outpoint -- the reason for the refusal in (2). */
+
+typedef struct {
+    unsigned char txid[32];
+    unsigned char *signed_tx;
+    size_t signed_tx_len;
+    int ps_chain_len;
+    uint32_t dw_state;
+    uint32_t epoch;
+} leaf_snapshot_t;
+
+static void leaf_snapshot_take(const factory_t *f, int leaf_side, leaf_snapshot_t *out) {
+    const factory_node_t *n = &f->nodes[f->leaf_node_indices[leaf_side]];
+    memset(out, 0, sizeof(*out));
+    memcpy(out->txid, n->txid, 32);
+    if (n->is_signed && n->signed_tx.len > 0) {
+        out->signed_tx = malloc(n->signed_tx.len);
+        if (out->signed_tx) {
+            memcpy(out->signed_tx, n->signed_tx.data, n->signed_tx.len);
+            out->signed_tx_len = n->signed_tx.len;
+        }
+    }
+    out->ps_chain_len = n->ps_chain_len;
+    out->dw_state = f->leaf_layers[leaf_side].current_state;
+    out->epoch = f->counter.current_epoch;
+}
+
+static int leaf_snapshot_matches(const factory_t *f, int leaf_side, const leaf_snapshot_t *snap) {
+    const factory_node_t *n = &f->nodes[f->leaf_node_indices[leaf_side]];
+    if (memcmp(snap->txid, n->txid, 32) != 0) return 0;
+    if (snap->ps_chain_len != n->ps_chain_len) return 0;
+    if (snap->dw_state != f->leaf_layers[leaf_side].current_state) return 0;
+    if (snap->epoch != f->counter.current_epoch) return 0;
+    if (snap->signed_tx_len != (n->is_signed ? n->signed_tx.len : 0)) return 0;
+    if (snap->signed_tx_len > 0 &&
+        memcmp(snap->signed_tx, n->signed_tx.data, snap->signed_tx_len) != 0) return 0;
+    return 1;
+}
+
+static int run_payment_leaf_untouched(int arity_code, int port_bias) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* Funding SPK: key-path P2TR over the 3-of-3 aggregate. */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 3);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0xC7, 32);
+    const uint32_t funding_vout = 0;
+    const uint64_t funding_amount = 1000000;
+
+    unsigned char preimage[32] = { [0 ... 31] = 0x5D };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    payment_test_data_t sender_data, payee_data;
+    memset(&sender_data, 0, sizeof(sender_data));
+    memset(&payee_data, 0, sizeof(payee_data));
+    memcpy(sender_data.payment_hash, payment_hash, 32);
+    sender_data.is_sender = 1;
+    memcpy(payee_data.payment_hash, payment_hash, 32);
+    memcpy(payee_data.preimage, preimage, 32);
+
+    int port = 21300 + (getpid() % 1000) + port_bias;
+
+    pid_t child_pids[2];
+    for (int c = 0; c < 2; c++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
+            int ok = client_run_with_channels(child_ctx, &child_kp,
+                                               "127.0.0.1", port,
+                                               payment_client_cb,
+                                               c == 0 ? &sender_data : &payee_data,
+                                               NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 2);
+    int lsp_ok = 1;
+    const char *why = "";
+#define LEAF_STEP(cond, msg) do { \
+        if (lsp_ok && !(cond)) { lsp_ok = 0; why = (msg); } \
+    } while (0)
+
+    LEAF_STEP(lsp_accept_clients(lsp), "accept clients");
+    lsp->factory.leaf_arity = (factory_arity_t)arity_code;
+    LEAF_STEP(lsp_run_factory_creation(lsp, funding_txid, funding_vout,
+                                        funding_amount, fund_spk, 34, 10, 4, 0),
+              "factory creation");
+    LEAF_STEP((int)lsp->factory.leaf_arity == arity_code, "requested leaf arity kept");
+    LEAF_STEP(lsp->factory.n_leaf_nodes == 2, "one leaf per client");
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    LEAF_STEP(lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 2), "channel init");
+    LEAF_STEP(lsp_channels_exchange_basepoints(&ch_mgr, lsp), "basepoint exchange");
+    LEAF_STEP(lsp_channels_send_ready(&ch_mgr, lsp), "channel_ready");
+
+    leaf_snapshot_t before[2];
+    memset(before, 0, sizeof(before));
+    unsigned char chan_funding_txid[2][32];
+    uint64_t remote_before[2] = {0, 0};
+    if (lsp_ok) {
+        for (int l = 0; l < 2; l++) {
+            leaf_snapshot_take(&lsp->factory, l, &before[l]);
+            memcpy(chan_funding_txid[l], ch_mgr.entries[l].channel.funding_txid, 32);
+            remote_before[l] = ch_mgr.entries[l].channel.remote_amount;
+            /* The channel is funded by output 0 of its leaf transaction. */
+            LEAF_STEP(memcmp(chan_funding_txid[l], before[l].txid, 32) == 0,
+                      "channel funded by its leaf");
+        }
+    }
+
+    /* The payment: ADD_HTLC from client A, FULFILL_HTLC from client B, both
+       through the LSP's message handler (the settlement path). */
+    for (int step = 0; step < 2 && lsp_ok; step++) {
+        wire_msg_t msg;
+        uint8_t want = step == 0 ? MSG_UPDATE_ADD_HTLC : MSG_UPDATE_FULFILL_HTLC;
+        if (!wire_recv(lsp->client_fds[step], &msg)) {
+            lsp_ok = 0; why = "recv payment message";
+            break;
+        }
+        LEAF_STEP(msg.msg_type == want, "payment message type");
+        LEAF_STEP(lsp_channels_handle_msg(&ch_mgr, lsp, (size_t)step, &msg),
+                  "handle payment message");
+        cJSON_Delete(msg.json);
+    }
+
+    /* (1) payment settled, leaves untouched. */
+    if (lsp_ok) {
+        LEAF_STEP(ch_mgr.entries[0].channel.remote_amount == remote_before[0] - 5000,
+                  "sender debited");
+        LEAF_STEP(ch_mgr.entries[1].channel.remote_amount == remote_before[1] + 5000,
+                  "payee credited");
+        for (int l = 0; l < 2; l++) {
+            LEAF_STEP(leaf_snapshot_matches(&lsp->factory, l, &before[l]),
+                      "leaf unchanged by the payment");
+            LEAF_STEP(memcmp(ch_mgr.entries[l].channel.funding_txid,
+                             lsp->factory.nodes[lsp->factory.leaf_node_indices[l]].txid,
+                             32) == 0,
+                      "channel still funded by the current leaf transaction");
+        }
+    }
+
+    /* (2) the entry point refuses a leaf with client funds on it. */
+    if (lsp_ok) {
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
+                  "advance refused while the channel holds client funds");
+        for (int l = 0; l < 2; l++)
+            LEAF_STEP(leaf_snapshot_matches(&lsp->factory, l, &before[l]),
+                      "refused advance changed nothing");
+    }
+
+    /* (3) the ceremony itself still works through the entry point when the
+       override is given: leaf 1 is replaced, leaf 0 is not, and the channel
+       on leaf 1 is left pointing at the replaced transaction. */
+    if (lsp_ok) {
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 1) == 1,
+                  "advance ceremony with override");
+        const factory_node_t *n1 =
+            &lsp->factory.nodes[lsp->factory.leaf_node_indices[1]];
+        LEAF_STEP(memcmp(n1->txid, before[1].txid, 32) != 0,
+                  "advanced leaf has a new txid");
+        LEAF_STEP(n1->is_signed && n1->signed_tx.len > 0, "advanced leaf is signed");
+        if (arity_code == FACTORY_ARITY_PS)
+            LEAF_STEP(n1->ps_chain_len == before[1].ps_chain_len + 1,
+                      "PS chain extended by one");
+        else
+            LEAF_STEP(lsp->factory.leaf_layers[1].current_state == before[1].dw_state + 1,
+                      "DW leaf state advanced by one");
+        LEAF_STEP(leaf_snapshot_matches(&lsp->factory, 0, &before[0]),
+                  "other leaf untouched by the advance");
+        LEAF_STEP(memcmp(ch_mgr.entries[1].channel.funding_txid,
+                         chan_funding_txid[1], 32) == 0,
+                  "advance does not re-anchor the channel");
+    }
+
+    /* Cooperative close so the clients exit cleanly (never broadcast). */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 500;
+        tx_output_t close_outputs[3];
+        for (size_t i = 0; i < 3; i++) {
+            close_outputs[i].amount_sats = close_total / 3;
+            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+            close_outputs[i].script_pubkey_len = 34;
+        }
+        close_outputs[2].amount_sats = close_total - 2 * (close_total / 3);
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+        LEAF_STEP(lsp_run_cooperative_close(lsp, &close_tx, close_outputs, 3, 0),
+                  "cooperative close");
+        tx_buf_free(&close_tx);
+    }
+#undef LEAF_STEP
+
+    for (int l = 0; l < 2; l++) free(before[l].signed_tx);
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+
+    int all_children_ok = 1;
+    for (int c = 0; c < 2; c++) {
+        int status;
+        if (!lsp_ok) kill(child_pids[c], SIGKILL);
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            all_children_ok = 0;
+    }
+    secp256k1_context_destroy(ctx);
+
+    if (!lsp_ok) {
+        printf("  FAIL: %s (arity code %d): %s\n", __func__, arity_code, why);
+        return 0;
+    }
+    TEST_ASSERT(all_children_ok, "both clients completed");
+    return 1;
+}
+
+int test_payment_leaves_leaf_untouched_arity_ps(void) {
+    return run_payment_leaf_untouched(FACTORY_ARITY_PS, 0);
+}
+
+int test_payment_leaves_leaf_untouched_arity1(void) {
+    return run_payment_leaf_untouched(FACTORY_ARITY_1, 50);
+}
