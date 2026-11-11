@@ -842,9 +842,12 @@ uint32_t lsp_compute_factory_cltv_delta(const void *factory_ptr) {
 
 int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
                                    uint32_t factory_cltv_timeout,
-                                   uint32_t cltv_delta) {
+                                   uint32_t cltv_delta,
+                                   uint32_t current_height) {
     if (cltv_delta == 0) cltv_delta = FACTORY_CLTV_DELTA_DEFAULT;
-    if (cltv_expiry <= cltv_delta)
+    /* cltv_expiry is an absolute height: the delta has to fit between the
+       chain tip and the expiry, not between zero and the expiry. */
+    if ((uint64_t)cltv_expiry <= (uint64_t)current_height + cltv_delta)
         return 0;
     /* Reject HTLCs that expire at or past factory timeout — funds would be trapped */
     if (factory_cltv_timeout > 0 && cltv_expiry >= factory_cltv_timeout)
@@ -877,6 +880,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     int pay_outside = (!dest_item || !cJSON_IsNumber(dest_item)) &&
                       bolt11_item && cJSON_IsString(bolt11_item);
     uint64_t outside_budget_msat = 0;
+    uint32_t outside_max_delay = 0;
 
     /* An outside payment is only attempted for an invoice that this HTLC
        actually funds.  Anything else is refused before the HTLC is taken. */
@@ -885,10 +889,19 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (mgr->bridge_fd < 0) {
             why = "bridge_unavailable";
         } else {
+            uint32_t min_final_cltv = 0;
             bridge_pay_check_t chk = lsp_bridge_check_outbound_invoice(
                 mgr->ctx, bolt11_item->valuestring, payment_hash, amount_sats,
                 mgr->routing_fee_ppm, lsp_channels_network(mgr),
-                (uint64_t)time(NULL), NULL, &outside_budget_msat, NULL);
+                (uint64_t)time(NULL), NULL, &outside_budget_msat,
+                &min_final_cltv);
+            /* The HTLC must outlive the outside route by the blocks the LSP
+               needs to claim it in the factory once the preimage is known. */
+            if (chk == BRIDGE_PAY_OK)
+                chk = lsp_bridge_outbound_max_delay(
+                    cltv_expiry, lsp_channels_chain_height(mgr), min_final_cltv,
+                    lsp_compute_factory_cltv_delta(&lsp->factory),
+                    lsp->factory.cltv_timeout, &outside_max_delay);
             if (chk != BRIDGE_PAY_OK)
                 why = lsp_bridge_pay_check_str(chk);
         }
@@ -1074,7 +1087,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t request_id = mgr->next_request_id++;
         cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
                                                   payment_hash, request_id,
-                                                  outside_budget_msat);
+                                                  outside_budget_msat,
+                                                  outside_max_delay);
         int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
         cJSON_Delete(pay);
         if (!ok) return 0;
@@ -1179,7 +1193,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint32_t fwd_cltv_expiry;
     if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry,
                                         lsp->factory.cltv_timeout,
-                                        factory_delta)) {
+                                        factory_delta, 0)) {
         fprintf(stderr, "LSP: cltv_expiry %u rejected (delta %u, factory timeout %u)\n",
                 cltv_expiry, factory_delta, lsp->factory.cltv_timeout);
         free(old_dest_htlcs);

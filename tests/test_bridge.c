@@ -10,6 +10,7 @@
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
 #include "superscalar/bolt11.h"
+#include "superscalar/chain_backend.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -119,24 +120,31 @@ int test_bridge_msg_round_trip(void) {
 
     /* BRIDGE_SEND_PAY */
     {
-        cJSON *j = wire_build_bridge_send_pay("lnbc10n1p0...", hash, 7, 123456);
+        cJSON *j = wire_build_bridge_send_pay("lnbc10n1p0...", hash, 7, 123456, 144);
         TEST_ASSERT(j != NULL, "build bridge_send_pay");
 
         char bolt11[256];
         unsigned char ph[32];
         uint64_t rid, max_total;
+        uint32_t max_delay;
         TEST_ASSERT(wire_parse_bridge_send_pay(j, bolt11, sizeof(bolt11), ph, &rid,
-                                                 &max_total),
+                                                 &max_total, &max_delay),
                      "parse bridge_send_pay");
+        TEST_ASSERT_EQ(max_delay, 144, "send_pay max_delay");
         TEST_ASSERT(strcmp(bolt11, "lnbc10n1p0...") == 0, "send_pay bolt11");
         TEST_ASSERT_MEM_EQ(ph, hash, 32, "send_pay payment_hash");
         TEST_ASSERT_EQ(rid, 7, "send_pay request_id");
         TEST_ASSERT_EQ(max_total, 123456, "send_pay max_total_msat");
 
-        /* A request without a spend cap is malformed. */
+        /* A request without a delay bound or a spend cap is malformed. */
+        cJSON_DeleteItemFromObject(j, "max_delay");
+        TEST_ASSERT(!wire_parse_bridge_send_pay(j, bolt11, sizeof(bolt11), ph,
+                                                  &rid, &max_total, &max_delay),
+                     "send_pay without max_delay rejected");
+        cJSON_AddNumberToObject(j, "max_delay", 144);
         cJSON_DeleteItemFromObject(j, "max_total_msat");
         TEST_ASSERT(!wire_parse_bridge_send_pay(j, bolt11, sizeof(bolt11), ph,
-                                                  &rid, &max_total),
+                                                  &rid, &max_total, &max_delay),
                      "send_pay without max_total_msat rejected");
         cJSON_Delete(j);
     }
@@ -312,7 +320,7 @@ int test_bridge_outbound_flow(void) {
     /* LSP sends SEND_PAY to bridge */
     unsigned char hash[32];
     memset(hash, 0xEE, 32);
-    cJSON *pay = wire_build_bridge_send_pay("lnbc1pvjluezpp5...", hash, 99, 5000);
+    cJSON *pay = wire_build_bridge_send_pay("lnbc1pvjluezpp5...", hash, 99, 5000, 144);
     TEST_ASSERT(wire_send(sv[1], MSG_BRIDGE_SEND_PAY, pay), "send pay");
     cJSON_Delete(pay);
 
@@ -324,8 +332,10 @@ int test_bridge_outbound_flow(void) {
     char bolt11[256];
     unsigned char ph[32];
     uint64_t rid, max_total;
+    uint32_t max_delay;
     TEST_ASSERT(wire_parse_bridge_send_pay(msg.json, bolt11, sizeof(bolt11),
-                                             ph, &rid, &max_total), "parse send_pay");
+                                             ph, &rid, &max_total, &max_delay),
+                "parse send_pay");
     TEST_ASSERT_EQ(rid, 99, "request_id");
     cJSON_Delete(msg.json);
 
@@ -1556,6 +1566,7 @@ typedef struct {
     uint32_t sender_my_index;    /* 1-based slot of the OUT sender */
     uint64_t amount_sats;
     unsigned char payment_hash[32];
+    uint32_t cltv_expiry;
     char bolt11[1024];
 } bridge_out_data_t;
 
@@ -1574,12 +1585,12 @@ static int bridge_out_sender_cb(int fd, channel_t *ch, uint32_t my_index,
        client_send_payment but swaps dest_client -> bolt11. */
     uint64_t htlc_id;
     if (!channel_add_htlc(ch, HTLC_OFFERED, d->amount_sats, d->payment_hash,
-                           500, &htlc_id)) {
+                           d->cltv_expiry, &htlc_id)) {
         fprintf(stderr, "OUT sender %u: channel_add_htlc failed\n", my_index);
         return 0;
     }
     cJSON *msg = wire_build_update_add_htlc(htlc_id, d->amount_sats * 1000,
-                                             d->payment_hash, 500);
+                                             d->payment_hash, d->cltv_expiry);
     cJSON_AddStringToObject(msg, "bolt11", d->bolt11);  /* the outbound marker */
     int ok = wire_send(fd, MSG_UPDATE_ADD_HTLC, msg);
     cJSON_Delete(msg);
@@ -1718,6 +1729,12 @@ int test_regtest_bridge_out(void) {
     out_data.sender_my_index = 1;       /* client 0 */
     out_data.amount_sats = OUT_AMT;
     memcpy(out_data.payment_hash, out_hash, 32);
+    /* Expiry well past the tip: room for the invoice's final hop and the
+       LSP's forwarding margin. */
+    const uint32_t OUT_CLTV_BLOCKS = 600;
+    int out_tip = regtest_get_block_height(&rt);
+    TEST_ASSERT(out_tip > 0, "chain tip");
+    out_data.cltv_expiry = (uint32_t)out_tip + OUT_CLTV_BLOCKS;
     {
         /* The outside invoice: same hash and amount as the HTLC offered. */
         unsigned char payee_key[32] = { [0 ... 31] = 0x65 };
@@ -1774,7 +1791,12 @@ int test_regtest_bridge_out(void) {
     }
     if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) { fprintf(stderr, "LSP: basepoints failed\n"); lsp_ok = 0; }
     if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) { fprintf(stderr, "LSP: send_ready failed\n"); lsp_ok = 0; }
-    if (lsp_ok) snprintf(ch_mgr.network, sizeof(ch_mgr.network), "regtest");
+    chain_backend_t out_chain;
+    chain_backend_regtest_init(&out_chain, &rt);
+    if (lsp_ok) {
+        snprintf(ch_mgr.network, sizeof(ch_mgr.network), "regtest");
+        ch_mgr.chain_be = &out_chain;
+    }
 
     if (lsp_ok) {
         /* Socketpair = the bridge link. sv[1] is the EXTERNAL world (the 65th node). */
@@ -1802,9 +1824,12 @@ int test_regtest_bridge_out(void) {
             else if (lsp_ok) {
                 TEST_ASSERT_EQ(sp.msg_type, MSG_BRIDGE_SEND_PAY, "external got SEND_PAY (pay-out)");
                 char rb[1024]; unsigned char rph[32]; uint64_t rid = 0, rmax = 0;
+                uint32_t rdelay = 0;
                 TEST_ASSERT(wire_parse_bridge_send_pay(sp.json, rb, sizeof(rb), rph,
-                                                         &rid, &rmax),
+                                                         &rid, &rmax, &rdelay),
                             "external: parse SEND_PAY");
+                TEST_ASSERT(rdelay >= 18 && rdelay < OUT_CLTV_BLOCKS,
+                            "SEND_PAY route delay fits inside the HTLC's lifetime");
                 TEST_ASSERT_MEM_EQ(rph, out_hash, 32, "SEND_PAY names the HTLC's hash");
                 TEST_ASSERT_EQ(rmax, OUT_AMT * 1000, "SEND_PAY caps spend at the HTLC amount");
                 printf("external (65th node): received pay-out request %llu for bolt11=%s\n",
@@ -3290,7 +3315,7 @@ int test_bridge_pay_request_carries_limits(void) {
     unsigned char hash[32];
     memset(hash, 0xC3, 32);
     cJSON *pay = wire_build_bridge_send_pay("lnbcrt40u1pinvoice", hash, 11,
-                                              3996000);
+                                              3996000, 432);
     wire_msg_t msg;
     msg.msg_type = MSG_BRIDGE_SEND_PAY;
     msg.json = pay;
@@ -3321,6 +3346,9 @@ int test_bridge_pay_request_carries_limits(void) {
     cJSON *mt = cJSON_GetObjectItem(fwd, "max_total_msat");
     TEST_ASSERT(mt && cJSON_IsNumber(mt), "max_total_msat forwarded");
     TEST_ASSERT_EQ((uint64_t)mt->valuedouble, 3996000, "max_total_msat value");
+    cJSON *md = cJSON_GetObjectItem(fwd, "max_delay");
+    TEST_ASSERT(md && cJSON_IsNumber(md), "max_delay forwarded");
+    TEST_ASSERT_EQ((uint32_t)md->valuedouble, 432, "max_delay value");
 
     cJSON_Delete(fwd);
     close(sv[0]);
@@ -3383,8 +3411,10 @@ int test_bridge_operator_pay(void) {
     char rb[2048];
     unsigned char rph[32];
     uint64_t rrid = 0, rmax = 0;
+    uint32_t rdelay = 0;
     TEST_ASSERT(wire_parse_bridge_send_pay(msg.json, rb, sizeof(rb), rph, &rrid,
-                                             &rmax), "parse SEND_PAY");
+                                             &rmax, &rdelay), "parse SEND_PAY");
+    TEST_ASSERT_EQ(rdelay, LSP_BRIDGE_OPERATOR_MAX_DELAY, "default route delay");
     TEST_ASSERT(strcmp(rb, inv) == 0, "invoice forwarded unchanged");
     TEST_ASSERT_MEM_EQ(rph, hash, 32, "hash taken from the invoice");
     TEST_ASSERT_EQ(rmax, 2010000, "spend capped at amount + allowance");
@@ -3396,7 +3426,7 @@ int test_bridge_operator_pay(void) {
     TEST_ASSERT(lsp_channels_operator_pay(&mgr, inv, &rid, &err), "small invoice sent");
     TEST_ASSERT(wire_recv(sv[1], &msg), "bridge receives SEND_PAY");
     TEST_ASSERT(wire_parse_bridge_send_pay(msg.json, rb, sizeof(rb), rph, &rrid,
-                                             &rmax), "parse SEND_PAY");
+                                             &rmax, &rdelay), "parse SEND_PAY");
     TEST_ASSERT_EQ(rmax, 15000, "flat allowance for a small invoice");
     cJSON_Delete(msg.json);
 
@@ -3412,8 +3442,15 @@ int test_bridge_operator_pay(void) {
 
 /* ---- A client HTLC for an invoice it does not fund is failed, not paid ---- */
 
-/* Offer an HTLC with a bolt11 from client 0 and return the reason the LSP
-   failed it with ("" if it was not failed). */
+/* Chain backend stub reporting a fixed tip. */
+static int fixed_tip_height;
+static int fixed_tip_get_block_height(chain_backend_t *self) {
+    (void)self;
+    return fixed_tip_height;
+}
+
+/* Offer an HTLC (expiring at height 500) with a bolt11 from client 0 and
+   return the reason the LSP failed it with ("" if it was not failed). */
 static int offer_outside_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp, int client_peer_fd,
                               const unsigned char *hash, uint64_t amount_msat,
                               const char *bolt11, char *reason, size_t reason_cap) {
@@ -3502,9 +3539,36 @@ int test_lsp_outbound_htlc_refused(void) {
     TEST_ASSERT_EQ(mgr.next_request_id, 1, "no request id consumed");
     TEST_ASSERT_EQ(mgr.entries[0].channel.n_htlcs, 0, "no HTLC added");
 
-    /* A valid invoice with no bridge connected is failed too. */
+    /* A valid invoice, but the LSP cannot tell how far away the HTLC's
+       expiry is. */
     TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, now, 3600, 18,
                                   inv, sizeof(inv)), "encode");
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "chain_height_unavailable") == 0,
+                "refused: chain tip unknown");
+
+    /* The HTLC expires at 500.  The route needs the invoice's 18 final-hop
+       blocks and the LSP its 40-block margin, so a tip of 442 leaves no
+       room, and a tip past the expiry certainly does not. */
+    chain_backend_t tip;
+    memset(&tip, 0, sizeof(tip));
+    tip.get_block_height = fixed_tip_get_block_height;
+    mgr.chain_be = &tip;
+    fixed_tip_height = 442;
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "cltv_expiry_out_of_bounds") == 0,
+                "refused: expiry too close to the tip");
+    fixed_tip_height = 800000;
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "cltv_expiry_out_of_bounds") == 0,
+                "refused: expiry below the tip");
+    TEST_ASSERT(!wire_recv_timeout(br[1], &stray, 1), "nothing sent to bridge");
+    TEST_ASSERT_EQ(mgr.entries[0].channel.n_htlcs, 0, "no HTLC added");
+
+    /* A valid invoice with no bridge connected is failed too. */
     mgr.bridge_fd = -1;
     TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
                                     reason, sizeof(reason)), "HTLC failed back");
@@ -3514,5 +3578,61 @@ int test_lsp_outbound_htlc_refused(void) {
     free(mgr.entries);
     free(lsp);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Outbound HTLC deadline vs. the outside route ---- */
+
+int test_bridge_outbound_max_delay(void) {
+    uint32_t delay = 0;
+
+    /* Tip 1000, invoice needs 18 final-hop blocks, LSP keeps 40: the HTLC
+       must expire after 1058. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1058, 1000, 18, 40, 0, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "expiry == tip+final+margin refused");
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1059, 1000, 18, 40, 0, &delay),
+                   BRIDGE_PAY_OK, "one block more accepted");
+    /* The route may use what is left after the margin: 1059 - 40 - 1000. */
+    TEST_ASSERT_EQ(delay, 19, "max delay leaves the margin");
+
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1500, 1000, 18, 40, 0, &delay),
+                   BRIDGE_PAY_OK, "roomy expiry accepted");
+    TEST_ASSERT_EQ(delay, 460, "max delay = expiry - margin - tip");
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1500, 1000, 18, 40, 0, NULL),
+                   BRIDGE_PAY_OK, "output is optional");
+
+    /* A larger final-hop requirement or margin needs a later expiry. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1500, 1000, 461, 40, 0, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "final hop does not fit");
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1500, 1000, 18, 482, 0, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "margin does not fit");
+
+    /* An expiry that is only large as a bare number is still in the past. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(500, 800000, 18, 40, 0, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "expiry below the tip refused");
+
+    /* Tip unknown: refuse rather than guess. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1500, 0, 18, 40, 0, &delay),
+                   BRIDGE_PAY_NO_CHAIN_HEIGHT, "unknown tip refused");
+
+    /* The HTLC must also expire before the factory does. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1400, 1000, 18, 40, 1400, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "expiry at factory timeout refused");
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(1399, 1000, 18, 40, 1400, &delay),
+                   BRIDGE_PAY_OK, "expiry before factory timeout accepted");
+
+    /* A zero margin falls back to the default. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(
+                       1000 + 18 + FACTORY_CLTV_DELTA_DEFAULT, 1000, 18, 0, 0, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "default margin applied");
+
+    /* No wrap-around near the top of the height range. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_max_delay(100, UINT32_MAX - 5, 18, 40, 0, &delay),
+                   BRIDGE_PAY_CLTV_OUT_OF_BOUNDS, "no wrap-around");
+
+    TEST_ASSERT(strcmp(lsp_bridge_pay_check_str(BRIDGE_PAY_CLTV_OUT_OF_BOUNDS),
+                       "cltv_expiry_out_of_bounds") == 0, "reason string");
+    TEST_ASSERT(strcmp(lsp_bridge_pay_check_str(BRIDGE_PAY_NO_CHAIN_HEIGHT),
+                       "chain_height_unavailable") == 0, "reason string");
     return 1;
 }

@@ -5,6 +5,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/regtest.h"
+#include "superscalar/chain_backend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,20 @@ const char *lsp_channels_network(const lsp_channel_mgr_t *mgr) {
     return NULL;
 }
 
+uint32_t lsp_channels_chain_height(const lsp_channel_mgr_t *mgr) {
+    if (!mgr) return 0;
+    if (mgr->chain_be) {
+        chain_backend_t *be = (chain_backend_t *)mgr->chain_be;
+        int h = be->get_block_height ? be->get_block_height(be) : -1;
+        if (h > 0) return (uint32_t)h;
+    }
+    if (mgr->watchtower && mgr->watchtower->rt) {
+        int h = regtest_get_block_height(mgr->watchtower->rt);
+        if (h > 0) return (uint32_t)h;
+    }
+    return 0;
+}
+
 /* --- Outbound invoice checks --- */
 
 const char *lsp_bridge_pay_check_str(bridge_pay_check_t r) {
@@ -34,6 +49,8 @@ const char *lsp_bridge_pay_check_str(bridge_pay_check_t r) {
     case BRIDGE_PAY_NO_AMOUNT:          return "invoice_without_amount";
     case BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC: return "invoice_amount_exceeds_htlc";
     case BRIDGE_PAY_EXPIRED:            return "invoice_expired";
+    case BRIDGE_PAY_NO_CHAIN_HEIGHT:    return "chain_height_unavailable";
+    case BRIDGE_PAY_CLTV_OUT_OF_BOUNDS: return "cltv_expiry_out_of_bounds";
     }
     return "invalid_invoice";
 }
@@ -106,6 +123,32 @@ bridge_pay_check_t lsp_bridge_check_outbound_invoice(
     return BRIDGE_PAY_OK;
 }
 
+bridge_pay_check_t lsp_bridge_outbound_max_delay(uint32_t htlc_cltv_expiry,
+                                                  uint32_t current_height,
+                                                  uint32_t min_final_cltv,
+                                                  uint32_t forward_margin,
+                                                  uint32_t factory_cltv_timeout,
+                                                  uint32_t *max_delay_out) {
+    /* Without the tip there is nothing to measure the expiry against. */
+    if (current_height == 0)
+        return BRIDGE_PAY_NO_CHAIN_HEIGHT;
+    if (forward_margin == 0) forward_margin = FACTORY_CLTV_DELTA_DEFAULT;
+
+    /* Earliest height the final hop may demand; it must still leave the
+       forwarding margin before the client's HTLC expires. */
+    uint64_t final_hop = (uint64_t)current_height + min_final_cltv;
+    if (final_hop > UINT32_MAX)
+        return BRIDGE_PAY_CLTV_OUT_OF_BOUNDS;
+    uint32_t settle_by;   /* htlc_cltv_expiry - forward_margin */
+    if (!lsp_validate_cltv_for_forward(htlc_cltv_expiry, &settle_by,
+                                        factory_cltv_timeout, forward_margin,
+                                        (uint32_t)final_hop))
+        return BRIDGE_PAY_CLTV_OUT_OF_BOUNDS;
+
+    if (max_delay_out) *max_delay_out = settle_by - current_height;
+    return BRIDGE_PAY_OK;
+}
+
 /* Routing-fee allowance for operator-initiated pays: 0.5% of the invoice,
    at least 5 sat (Core Lightning's own `pay` defaults). */
 #define OPERATOR_PAY_FEE_PPM        5000
@@ -143,7 +186,8 @@ int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
     uint64_t request_id = mgr->next_request_id++;
     cJSON *pay = wire_build_bridge_send_pay(bolt11, inv.payment_hash,
                                               request_id,
-                                              inv.amount_msat + fee_allow);
+                                              inv.amount_msat + fee_allow,
+                                              LSP_BRIDGE_OPERATOR_MAX_DELAY);
     int ok = pay && wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
     if (pay) cJSON_Delete(pay);
     if (mgr->persist)
@@ -328,7 +372,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t fwd_cltv_expiry;
         if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry,
                                             lsp->factory.cltv_timeout,
-                                            factory_delta)) {
+                                            factory_delta, 0)) {
             cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
                 "cltv_expiry_out_of_bounds", htlc_id);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);

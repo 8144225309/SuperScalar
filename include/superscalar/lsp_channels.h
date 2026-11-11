@@ -26,14 +26,18 @@
 uint32_t lsp_compute_factory_cltv_delta(const void *factory_ptr);
 
 /* Validate and adjust cltv_expiry for HTLC forwarding through a factory channel.
-   Returns 1 if cltv_expiry has enough room for the delta, 0 if too low.
+   cltv_expiry is an absolute block height, so it is measured against the
+   chain tip: returns 1 only if cltv_expiry > current_height + cltv_delta.
+   Pass current_height = 0 when the tip is not known; the HTLC must then at
+   least exceed cltv_delta itself.
    Rejects HTLCs whose cltv_expiry >= factory_cltv_timeout (funds would be
    trapped past factory expiry). Pass 0 for factory_cltv_timeout to skip check.
    cltv_delta is the minimum safety margin computed by lsp_compute_factory_cltv_delta.
    On success, *fwd_cltv_out = cltv_expiry - cltv_delta. */
 int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
                                    uint32_t factory_cltv_timeout,
-                                   uint32_t cltv_delta);
+                                   uint32_t cltv_delta,
+                                   uint32_t current_height);
 
 /* --- Outbound payments through the bridge --- */
 
@@ -45,7 +49,9 @@ typedef enum {
     BRIDGE_PAY_HASH_MISMATCH,        /* invoice hash != HTLC hash */
     BRIDGE_PAY_NO_AMOUNT,            /* amountless invoices are refused */
     BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC,  /* invoice asks for more than the HTLC funds */
-    BRIDGE_PAY_EXPIRED
+    BRIDGE_PAY_EXPIRED,
+    BRIDGE_PAY_NO_CHAIN_HEIGHT,      /* tip unknown: deadline cannot be judged */
+    BRIDGE_PAY_CLTV_OUT_OF_BOUNDS     /* HTLC expires too soon for the route, or past the factory */
 } bridge_pay_check_t;
 
 /* Short reason string for a check result (used as the HTLC failure reason). */
@@ -76,6 +82,26 @@ bridge_pay_check_t lsp_bridge_check_outbound_invoice(
     uint64_t routing_fee_ppm, const char *network, uint64_t now,
     uint64_t *invoice_msat_out, uint64_t *budget_msat_out,
     uint32_t *min_final_cltv_out);
+
+/* How long the outside payment may stay locked up, given the HTLC the client
+   offered for it.  The HTLC must expire later than
+       current_height + min_final_cltv + forward_margin
+   (the invoice's final-hop requirement plus the blocks the LSP keeps for
+   itself to claim the client's HTLC after the outside payment settles) and
+   before factory_cltv_timeout (0 = no limit).
+   On success returns BRIDGE_PAY_OK and sets *max_delay_out to the largest
+   total route delay, in blocks from the current tip, that still leaves
+   forward_margin before the client's HTLC expires. */
+bridge_pay_check_t lsp_bridge_outbound_max_delay(uint32_t htlc_cltv_expiry,
+                                                  uint32_t current_height,
+                                                  uint32_t min_final_cltv,
+                                                  uint32_t forward_margin,
+                                                  uint32_t factory_cltv_timeout,
+                                                  uint32_t *max_delay_out);
+
+/* Route delay allowed for operator-initiated pays, which have no client
+   HTLC to bound them (Core Lightning's own default). */
+#define LSP_BRIDGE_OPERATOR_MAX_DELAY 2016
 
 /* Per-client channel entry managed by the LSP */
 typedef struct {
@@ -493,6 +519,10 @@ void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
 /* Chain the LSP runs on, for invoice checks: mgr->network if set, else the
    watchtower's chain connection, else NULL. */
 const char *lsp_channels_network(const lsp_channel_mgr_t *mgr);
+
+/* Current chain tip height from the chain backend (or the watchtower's chain
+   connection); 0 if neither is available. */
+uint32_t lsp_channels_chain_height(const lsp_channel_mgr_t *mgr);
 
 /* Ask the bridge to pay an invoice out of the LSP's own Lightning node on the
    operator's instruction (no client HTLC backs it).  The invoice must decode,

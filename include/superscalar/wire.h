@@ -692,13 +692,15 @@ cJSON *wire_build_bridge_fail_htlc(const unsigned char *payment_hash32,
                                      const char *reason, uint64_t htlc_id);
 
 /* LSP → Bridge: BRIDGE_SEND_PAY {bolt11, payment_hash, request_id,
-   max_total_msat}.  payment_hash is the hash the invoice must carry and
-   max_total_msat is the most the paying node may spend on it, routing fees
-   included; the plugin enforces both. */
+   max_total_msat, max_delay}.  payment_hash is the hash the invoice must
+   carry, max_total_msat is the most the paying node may spend on it, routing
+   fees included, and max_delay is the longest the payment may be locked up,
+   in blocks; the plugin enforces all three. */
 cJSON *wire_build_bridge_send_pay(const char *bolt11,
                                     const unsigned char *payment_hash32,
                                     uint64_t request_id,
-                                    uint64_t max_total_msat);
+                                    uint64_t max_total_msat,
+                                    uint32_t max_delay);
 
 /* Bridge → LSP: BRIDGE_PAY_RESULT {request_id, success, preimage} */
 cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
@@ -741,7 +743,8 @@ int wire_parse_bridge_send_pay(const cJSON *json,
                                  char *bolt11, size_t bolt11_len,
                                  unsigned char *payment_hash32,
                                  uint64_t *request_id,
-                                 uint64_t *max_total_msat);
+                                 uint64_t *max_total_msat,
+                                 uint32_t *max_delay);
 
 int wire_parse_bridge_pay_result(const cJSON *json,
                                    uint64_t *request_id, int *success,

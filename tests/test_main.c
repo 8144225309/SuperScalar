@@ -1281,6 +1281,7 @@ extern int test_bridge_outbound_invoice_check(void);
 extern int test_bridge_pay_request_carries_limits(void);
 extern int test_bridge_operator_pay(void);
 extern int test_lsp_outbound_htlc_refused(void);
+extern int test_bridge_outbound_max_delay(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -3199,6 +3200,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_pay_request_carries_limits);
     RUN_TEST(test_bridge_operator_pay);
     RUN_TEST(test_lsp_outbound_htlc_refused);
+    RUN_TEST(test_bridge_outbound_max_delay);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

@@ -51,6 +51,13 @@ KEYSEND_TLV_TYPE = "5482373484"
 # enough blocks of margin before the timeout check fires.
 FACTORY_INVOICE_CLTV = 80
 
+# Outbound pays.  CLN's `pay` stops starting new attempts after
+# PAY_RETRY_FOR seconds; parts already in flight can still settle later.
+PAY_RETRY_FOR = 60
+PAY_CLI_TIMEOUT = 600      # how long to wait for `pay` itself to return
+PAY_POLL_INTERVAL = 10     # seconds between listpays polls while unresolved
+PAY_SETTLE_GRACE = 30      # slack added to PAY_RETRY_FOR before trusting "failed"
+
 
 _KNOWN_NETWORKS = {"bitcoin", "testnet", "signet", "regtest", "testnet4", "liquidv1"}
 
@@ -297,11 +304,12 @@ def handle_bridge_msg(msg):
         request_id = msg.get("request_id", 0)
         payment_hash = msg.get("payment_hash")
         max_total_msat = msg.get("max_total_msat")
+        max_delay = msg.get("max_delay")
         log(f"Pay request: {bolt11[:30]}... (id={request_id})")
         # Run lightning-cli pay in a background thread to avoid blocking
         t = threading.Thread(
             target=_do_pay,
-            args=(bolt11, request_id, payment_hash, max_total_msat),
+            args=(bolt11, request_id, payment_hash, max_total_msat, max_delay),
             daemon=True
         )
         t.start()
@@ -378,13 +386,14 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
         })
 
 
-def check_pay_request(decoded, payment_hash, max_total_msat):
+def check_pay_request(decoded, payment_hash, max_total_msat, max_delay):
     """Check a decoded invoice against what the bridge authorised.
 
-    The bridge names the payment hash the invoice must carry and the most
-    this node may spend on it, routing fees included.  Both are checked here
-    against CLN's own decoding of the invoice, so a request that does not
-    match its invoice is never paid.
+    The bridge names the payment hash the invoice must carry, the most this
+    node may spend on it (routing fees included) and the longest the payment
+    may stay locked up, in blocks.  All are checked here against CLN's own
+    decoding of the invoice, so a request that does not match its invoice is
+    never paid.
 
     Returns (invoice_amount_msat, None) if the invoice may be paid, or
     (None, reason) if it must be refused."""
@@ -393,6 +402,9 @@ def check_pay_request(decoded, payment_hash, max_total_msat):
     if (isinstance(max_total_msat, bool) or not isinstance(max_total_msat, int)
             or max_total_msat <= 0):
         return None, "request carries no spend cap"
+    if (isinstance(max_delay, bool) or not isinstance(max_delay, int)
+            or max_delay <= 0):
+        return None, "request carries no delay bound"
     if not isinstance(decoded, dict) or decoded.get("valid") is not True \
             or decoded.get("type") != "bolt11 invoice":
         return None, "not a valid bolt11 invoice"
@@ -404,6 +416,11 @@ def check_pay_request(decoded, payment_hash, max_total_msat):
     if amount_msat > max_total_msat:
         return None, (f"invoice amount {amount_msat} msat exceeds the cap of "
                       f"{max_total_msat} msat")
+    final_cltv = decoded.get("min_final_cltv_expiry")
+    if isinstance(final_cltv, int) and not isinstance(final_cltv, bool) \
+            and final_cltv > max_delay:
+        return None, (f"invoice needs {final_cltv} final-hop blocks, more than "
+                      f"the {max_delay} allowed")
     return amount_msat, None
 
 
@@ -423,12 +440,53 @@ def _send_pay_result(request_id, success, preimage=None):
     })
 
 
-def _do_pay(bolt11, request_id, payment_hash, max_total_msat):
+def _pay_state(payment_hash):
+    """Ask CLN what has become of the payment for payment_hash.
+
+    Returns (state, preimage):
+      "complete"  it was paid; preimage is the proof
+      "pending"   at least one attempt is still in flight
+      "failed"    attempts were made and every one of them has failed
+      "none"      CLN knows of no attempt for this hash
+      "unknown"   CLN could not be asked, or gave an answer we cannot read"""
+    try:
+        pays = cln_rpc("listpays", {"payment_hash": payment_hash},
+                       timeout=30).get("pays", [])
+    except Exception as e:
+        log(f"listpays failed: {type(e).__name__}: {e}")
+        return "unknown", None
+    if not isinstance(pays, list):
+        return "unknown", None
+    statuses = set()
+    for p in pays:
+        status = p.get("status") if isinstance(p, dict) else None
+        if status == "complete":
+            preimage = p.get("preimage", p.get("payment_preimage", ""))
+            if _preimage_matches(preimage, payment_hash):
+                return "complete", preimage
+        statuses.add(status)
+    if not statuses:
+        return "none", None
+    if statuses == {"failed"}:
+        return "failed", None
+    if "pending" in statuses:
+        return "pending", None
+    return "unknown", None
+
+
+def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
     """Pay an outside invoice on the bridge's request and report the result.
 
     The invoice is paid only if CLN decodes it to the requested payment hash
     and to an amount within max_total_msat; the rest of the cap is the most
-    CLN may add in routing fees (pay's maxfee)."""
+    CLN may add in routing fees (pay's maxfee), and max_delay bounds how long
+    the route may lock the payment up (pay's maxdelay).
+
+    The LSP refunds its client when told the payment failed, so failure is
+    reported only once CLN can no longer complete it.  A `pay` that times
+    out, errors or returns "pending" may leave attempts in flight; the
+    payment is then followed with listpays until it has completed or every
+    attempt has failed, and the bridge hears nothing in the meantime."""
     log(f"Pay start: request_id={request_id}, bolt11_len={len(bolt11)}, "
         f"bolt11_prefix={bolt11[:20]}...")
     try:
@@ -437,40 +495,67 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat):
         log(f"Pay refused: cannot decode invoice: {type(e).__name__}: {e}")
         _send_pay_result(request_id, False)
         return
-    amount_msat, why = check_pay_request(decoded, payment_hash, max_total_msat)
+    amount_msat, why = check_pay_request(decoded, payment_hash, max_total_msat,
+                                         max_delay)
     if why:
         log(f"Pay refused for request_id={request_id}: {why}")
         _send_pay_result(request_id, False)
         return
 
+    # From here on CLN may have HTLCs out for this hash.
+    started = time.monotonic()
+    pay_ended = False   # True once CLN itself said the pay command is over
     try:
         pay_result = cln_rpc(
             "pay",
-            {"bolt11": bolt11, "maxfee": max_total_msat - amount_msat},
-            timeout=600
+            {"bolt11": bolt11,
+             "maxfee": max_total_msat - amount_msat,
+             "maxdelay": max_delay,
+             "retry_for": PAY_RETRY_FOR},
+            timeout=PAY_CLI_TIMEOUT
         )
+        status = pay_result.get("status", "?")
+        preimage = pay_result.get("payment_preimage", "")
+        log(f"Pay returned: status={status}, preimage_prefix={preimage[:16]}")
+        if status == "complete" and _preimage_matches(preimage, payment_hash):
+            _send_pay_result(request_id, True, preimage)
+            log(f"Pay succeeded: {preimage[:16]}...")
+            return
+        pay_ended = status == "failed"
+    except ClnRpcError as e:
+        # A JSON-RPC error is CLN's own verdict that the command is over
+        # (it will start no further attempts).  Anything else, such as
+        # lightning-cli losing its connection, says nothing about the pay.
+        pay_ended = e.code is not None
+        log(f"Pay error for request_id={request_id}: code={e.code} {e}")
     except subprocess.TimeoutExpired:
-        log(f"Pay timeout (>600s) for request_id={request_id} — "
-            f"CLN still processing; result uncertain")
-        _send_pay_result(request_id, False)
-        return
+        log(f"Pay still running after {PAY_CLI_TIMEOUT}s for "
+            f"request_id={request_id}")
     except Exception as e:
-        log(f"Pay failed: {type(e).__name__}: {e}")
-        _send_pay_result(request_id, False)
-        return
+        log(f"Pay exception for request_id={request_id}: "
+            f"{type(e).__name__}: {e}")
 
-    status = pay_result.get("status", "?")
-    preimage = pay_result.get("payment_preimage", "")
-    log(f"Pay JSON parsed: status={status}, preimage_prefix={preimage[:16]}")
-    # Only report success when CLN explicitly reports status='complete'
-    # AND hands back the preimage of the requested hash.
-    if status == "complete" and _preimage_matches(preimage, payment_hash):
-        _send_pay_result(request_id, True, preimage)
-        log(f"Pay succeeded: {preimage[:16]}...")
-    else:
-        log(f"Pay returned status={status} without a matching preimage "
-            f"— reporting failure to bridge")
-        _send_pay_result(request_id, False)
+    # Not complete.  Follow the payment until CLN has settled it either way.
+    polls = 0
+    while True:
+        state, preimage = _pay_state(payment_hash)
+        if state == "complete":
+            _send_pay_result(request_id, True, preimage)
+            log(f"Pay succeeded after follow-up: {preimage[:16]}...")
+            return
+        # "failed"/"none" only count once no new attempt can start: either
+        # CLN ended the command, or its retry window is long past.
+        no_new_attempts = pay_ended or \
+            time.monotonic() - started >= PAY_RETRY_FOR + PAY_SETTLE_GRACE
+        if state in ("failed", "none") and no_new_attempts:
+            log(f"Pay failed for request_id={request_id} (listpays: {state})")
+            _send_pay_result(request_id, False)
+            return
+        if polls % 30 == 0:
+            log(f"Pay unresolved for request_id={request_id} "
+                f"(listpays: {state}); holding")
+        polls += 1
+        time.sleep(PAY_POLL_INTERVAL)
 
 
 def _extract_keysend_preimage(params):
