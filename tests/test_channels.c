@@ -4687,19 +4687,17 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
                   "advance does not re-anchor the channel");
     }
 
-    /* Cooperative close so the clients exit cleanly (never broadcast). */
+    /* Cooperative close so the clients exit cleanly (never broadcast).  Every
+       party is paid its channel balance at its own close script. */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
         tx_output_t close_outputs[3];
-        for (size_t i = 0; i < 3; i++) {
-            close_outputs[i].amount_sats = close_total / 3;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[2].amount_sats = close_total - 2 * (close_total / 3);
+        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        LEAF_STEP(n_close == 3, "build close outputs");
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
-        LEAF_STEP(lsp_run_cooperative_close(lsp, &close_tx, close_outputs, 3, 0),
+        LEAF_STEP(lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_close, 0),
                   "cooperative close");
         tx_buf_free(&close_tx);
     }
