@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# test_regtest_idle_client_exit.sh — a client that has never sent or received a
+# payment can still leave its channel alone.
+#
+# One LSP daemon and four client daemons build a factory on the default leaf
+# type and open their channels.  Then every SuperScalar process is killed and
+# each client runs --force-close from nothing but its own database: it
+# publishes the factory tree down to its leaf and then its own commitment.
+#
+#   scenario "idle"  : no payment is ever made.  Every client must already hold
+#                      a signed commitment 0 when its channel becomes usable.
+#                      Client 4 is also killed and restarted before the LSP
+#                      disappears: it must reconnect from its database with
+#                      that commitment unchanged.
+#   scenario "mixed" : client 1 pays client 2 once; clients 3 and 4 stay idle.
+#                      The two that transacted exit with their latest
+#                      commitment, which requires that the settled payment
+#                      left the leaf transaction funding their channels
+#                      unchanged.
+#
+# Checked in both scenarios, for all four clients:
+#   - a signed commitment is in the client database before the kill, and for a
+#     client that never transacted it is commitment number 0;
+#   - the commitment confirms and spends the client's channel funding output;
+#   - output 0 (to_local) equals the client's balance in its own database and
+#     the balance the LSP recorded for that channel;
+#   - every transaction that spends a factory output is a signed tree node or
+#     one of the four commitments, and the factory funding amount equals the
+#     unspent outputs plus the fees paid plus anchors consumed by fee bumps.
+#
+# The test starts its own bitcoind (regtest, private datadir, own RPC port)
+# with minrelaytxfee and blockmintxfee lowered to 0.5 sat/vB: a commitment
+# transaction's fee is sized from an estimated weight and can come out just
+# under 1 sat/vB at the 1000 sat/kvB rate used here, which a node with the
+# default relay floor would refuse.
+#
+# Usage: bash tools/test_regtest_idle_client_exit.sh [BUILD_DIR]
+# Env:   SCENARIOS ("idle mixed")  RPCPORT (18543)  PORT (29961)  KEEP (0)
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="${1:-$(dirname "$SCRIPT_DIR")/build}"
+LSP_BIN="$BUILD_DIR/superscalar_lsp"
+CLIENT_BIN="$BUILD_DIR/superscalar_client"
+SCENARIOS="${SCENARIOS:-idle mixed}"
+RPCPORT="${RPCPORT:-18543}"
+PORT="${PORT:-29961}"
+KEEP="${KEEP:-0}"
+
+N=4
+AMOUNT=400000
+FEE=1000
+PAY_AMT=10000
+PREIMAGE=$(printf '%02x%062x' 0x70 0)
+LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
+LSP_PUB="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+WALLET="idle_exit"
+
+for b in "$LSP_BIN" "$CLIENT_BIN"; do [ -x "$b" ] || { echo "FAIL: $b not found"; exit 1; }; done
+for t in bitcoind bitcoin-cli sqlite3 python3; do command -v $t >/dev/null || { echo "FAIL: $t not on PATH"; exit 1; }; done
+
+TMP=$(mktemp -d /tmp/ss-idle-exit.XXXXXX)
+BTC="$TMP/btc"; mkdir -p "$BTC"
+RPC=(--rpcuser rpcuser --rpcpassword rpcpass --rpcport "$RPCPORT")
+BCLI=(bitcoin-cli -regtest -datadir="$BTC" -rpcport="$RPCPORT" -rpcuser=rpcuser -rpcpassword=rpcpass)
+MINER_PID=""; PIDS=()
+
+green(){ printf '\033[32m%s\033[0m\n' "$*"; }
+red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+stop_miner(){ [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null; MINER_PID=""; }
+kill_ss(){ stop_miner; for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; PIDS=(); sleep 2; }
+cleanup(){
+    kill_ss
+    "${BCLI[@]}" stop >/dev/null 2>&1
+    for _ in $(seq 1 20); do [ -f "$BTC/regtest/bitcoind.pid" ] || break; sleep 1; done
+    if [ "$KEEP" = 1 ]; then echo "logs and databases kept in $TMP"; else rm -rf "$TMP"; fi
+}
+trap cleanup EXIT
+mine(){ "${BCLI[@]}" -rpcwallet=$WALLET generatetoaddress "${1:-1}" "$MINE_ADDR" >/dev/null 2>&1 || true; }
+
+# ---- private regtest node ----
+{ echo regtest=1; echo server=1; echo txindex=1; echo listen=0
+  echo rpcuser=rpcuser; echo rpcpassword=rpcpass; echo fallbackfee=0.00001
+  echo minrelaytxfee=0.000005; echo blockmintxfee=0.000005
+  echo "[regtest]"; echo "rpcport=$RPCPORT"; } > "$BTC/bitcoin.conf"
+bitcoind -regtest -datadir="$BTC" -daemon >/dev/null || { echo "FAIL: bitcoind did not start"; exit 1; }
+for _ in $(seq 1 60); do "${BCLI[@]}" getblockcount >/dev/null 2>&1 && break; sleep 1; done
+"${BCLI[@]}" getblockcount >/dev/null 2>&1 || { echo "FAIL: bitcoind RPC not reachable on port $RPCPORT"; exit 1; }
+"${BCLI[@]}" -named createwallet wallet_name=$WALLET >/dev/null
+MINE_ADDR=$("${BCLI[@]}" -rpcwallet=$WALLET -named getnewaddress address_type=bech32m)
+mine 110
+
+wait_log(){ # pattern file seconds what
+    for _ in $(seq 1 "$3"); do
+        grep -qE "$1" "$2" 2>/dev/null && return 0
+        kill -0 "$LSP_PID" 2>/dev/null || { grep -qE "$1" "$2" 2>/dev/null && return 0; echo "  LSP exited while waiting for $4"; return 1; }
+        sleep 1
+    done
+    echo "  timeout waiting for $4"; return 1
+}
+
+run_scenario(){
+    local SC=$1 P=$2 D="$TMP/$1"
+    mkdir -p "$D"
+    echo
+    echo "=== scenario '$SC': LSP + $N clients, $([ "$SC" = idle ] && echo "no payments" || echo "client 1 pays client 2, clients 3 and 4 idle") ==="
+    local H0; H0=$("${BCLI[@]}" getblockcount)
+    local LSPARGS=(--network regtest --port "$P" --clients $N --amount $AMOUNT
+        --active-blocks 3000 --dying-blocks 300 --cltv-timeout $((H0 + 3500))
+        --step-blocks 5 --states-per-layer 2 --fee-rate $FEE --lsp-balance-pct 50
+        --confirm-timeout 600 --seckey "$LSP_SECKEY" "${RPC[@]}" --wallet $WALLET
+        --db "$D/lsp.db" --daemon)
+    [ "$SC" = mixed ] && LSPARGS+=(--payments 1)
+    "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
+    LSP_PID=$!; PIDS+=($LSP_PID)
+    wait_log "listening" "$D/lsp.log" 60 "LSP to listen" || { tail -20 "$D/lsp.log"; return 1; }
+
+    local i
+    declare -a CPID
+    start_client(){ # participant id; uses SC, P, D of the running scenario
+        local id=$1 SK EXTRA=(--daemon)
+        SK=$(printf '%064x' $((id + 1)))
+        if [ "$SC" = mixed ]; then
+            [ "$id" = 1 ] && EXTRA=(--channels --send "1:$PAY_AMT:$PREIMAGE")
+            [ "$id" = 2 ] && EXTRA=(--channels --recv "$PREIMAGE")
+        fi
+        "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port "$P" --seckey "$SK" \
+            --fee-rate $FEE --lsp-balance-pct 50 --lsp-pubkey "$LSP_PUB" --participant-id "$id" \
+            "${RPC[@]}" --wallet $WALLET --db "$D/c$id.db" "${EXTRA[@]}" >> "$D/c$id.log" 2>&1 </dev/null &
+        CPID[$id]=$!; PIDS+=($!)
+    }
+    for i in $(seq 1 $N); do start_client "$i"; sleep 0.3; done
+    ( while true; do mine 1; sleep 3; done ) & MINER_PID=$!
+
+    wait_log "channels ready" "$D/lsp.log" 400 "channels ready" || { tail -30 "$D/lsp.log"; return 1; }
+    if [ "$SC" = mixed ]; then
+        wait_log "all 1 payments processed" "$D/lsp.log" 180 "the payment" || { tail -30 "$D/lsp.log"; return 1; }
+    fi
+    wait_log "entering daemon mode" "$D/lsp.log" 120 "LSP daemon mode" || { tail -30 "$D/lsp.log"; return 1; }
+    echo "  channels ready, LSP in daemon mode (height $("${BCLI[@]}" getblockcount))"
+
+    # Every client must hold a signed commitment now, payment or not.
+    local have=0 n
+    for _ in $(seq 1 20); do
+        have=0
+        for i in $(seq 1 $N); do
+            n=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT count(*) FROM signed_commitments;" 2>/dev/null || echo 0)
+            [ "${n:-0}" -ge 1 ] && have=$((have + 1))
+        done
+        [ "$have" -eq $N ] && break
+        sleep 1
+    done
+    for i in $(seq 1 $N); do
+        echo "  client $i: $(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT 'commitment_number=' || commitment_number FROM signed_commitments;" 2>/dev/null | head -1 | grep . || echo "NO signed commitment") balance=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT local_amount FROM channels LIMIT 1;" 2>/dev/null)"
+    done
+    [ "$have" -eq $N ] || red "  only $have of $N clients hold a signed commitment before the LSP disappears"
+
+    # A client restarted before its first payment keeps its commitment 0.
+    local restart_ok=1 before after
+    if [ "$SC" = idle ] && [ "$have" -eq $N ]; then
+        before=$(sqlite3 "file:$D/c4.db?mode=ro" "SELECT commitment_number || ':' || signed_tx_hex FROM signed_commitments;" 2>/dev/null)
+        kill -9 "${CPID[4]}" 2>/dev/null; sleep 1
+        start_client 4
+        for _ in $(seq 1 60); do grep -q "reconnected (channel" "$D/c4.log" 2>/dev/null && break; sleep 1; done
+        after=$(sqlite3 "file:$D/c4.db?mode=ro" "SELECT commitment_number || ':' || signed_tx_hex FROM signed_commitments;" 2>/dev/null)
+        if ! grep -q "reconnected (channel" "$D/c4.log" 2>/dev/null; then
+            red "  CHECK FAIL client 4 did not reconnect after its restart"; tail -5 "$D/c4.log" | sed 's/^/    /'; restart_ok=0
+        elif [ -z "$after" ] || [ "$before" != "$after" ]; then
+            red "  CHECK FAIL client 4's stored commitment changed or disappeared across its restart"; restart_ok=0
+        else
+            echo "  ok   client 4 restarted and reconnected from its database; its commitment 0 is unchanged"
+        fi
+    fi
+    sleep 5
+
+    echo "  killing the LSP and all clients"
+    kill_ss
+
+    # Each client exits alone from its database; mine between passes so each
+    # tree level matures.
+    local pass conf c h
+    declare -a CTX
+    for i in $(seq 1 $N); do
+        h=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT signed_tx_hex FROM signed_commitments ORDER BY commitment_number DESC LIMIT 1;" 2>/dev/null)
+        CTX[$i]=""
+        [ -n "$h" ] && CTX[$i]=$("${BCLI[@]}" decoderawtransaction "$h" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["txid"])' 2>/dev/null)
+    done
+    for pass in $(seq 1 40); do
+        local FC=()
+        for i in $(seq 1 $N); do
+            timeout 180 "$CLIENT_BIN" --network regtest --cli-path bitcoin-cli "${RPC[@]}" \
+                --force-close --db "$D/c$i.db" >> "$D/fc_c$i.log" 2>&1 </dev/null &
+            FC+=($!)
+        done
+        for c in "${FC[@]}"; do wait "$c" 2>/dev/null || true; done
+        mine 6
+        conf=0
+        for i in $(seq 1 $N); do
+            [ -n "${CTX[$i]}" ] || continue
+            c=$("${BCLI[@]}" getrawtransaction "${CTX[$i]}" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+            [ "${c:-0}" -ge 1 ] && conf=$((conf + 1))
+        done
+        [ "$conf" -eq $N ] && break
+        # nothing more can happen for a client without a commitment once the tree is out
+        [ "$have" -lt $N ] && [ "$pass" -ge 15 ] && [ "$conf" -eq "$have" ] && break
+    done
+    echo "  $conf of $N commitments confirmed after $pass force-close pass(es) (height $("${BCLI[@]}" getblockcount))"
+    mine 2
+
+    BCLI_STR="${BCLI[*]}" python3 - "$D" "$N" "$SC" "$PAY_AMT" <<'PYEOF'
+import sys, os, json, sqlite3, subprocess
+D, N, SC, PAY = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+BCLI = os.environ["BCLI_STR"].split()
+P2A = "51024e73"
+fails = 0
+def ok(m): print("  ok   " + m)
+def fail(m):
+    global fails
+    fails += 1
+    print("  CHECK FAIL " + m)
+def cli(*a, stdin=None):
+    r = subprocess.run(BCLI + list(a), input=stdin, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+def decode(h):
+    r = cli("-stdin", "decoderawtransaction", stdin=h)
+    return json.loads(r) if r else None
+def q(db, sql):
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=30)
+        rows = c.execute(sql).fetchall(); c.close(); return rows
+    except Exception:
+        return []
+def sats(v): return int(round(v * 1e8))
+
+lsp_db = os.path.join(D, "lsp.db")
+fac = q(lsp_db, "SELECT funding_txid, funding_vout, funding_amount FROM factories ORDER BY id DESC LIMIT 1")
+if not fac:
+    print("  CHECK FAIL no factory row in the LSP database"); sys.exit(1)
+fund_op, F = (fac[0][0], fac[0][1]), fac[0][2]
+lsp_ch = {r[0]: r[1:] for r in q(lsp_db, "SELECT slot, local_amount, remote_amount, funding_txid, funding_vout, commitment_number FROM channels")}
+movers = {1: -PAY, 2: PAY} if SC == "mixed" else {}
+
+# signed tree, as every client holds it
+known = {}
+for i in range(1, N + 1):
+    for (hx,) in q(os.path.join(D, "c%d.db" % i), "SELECT signed_tx_hex FROM tree_nodes WHERE signed_tx_hex IS NOT NULL AND signed_tx_hex != ''"):
+        d = decode(hx)
+        if d: known[d["txid"]] = "tree"
+
+commits = {}; total_bal = 0; total_tolocal = 0; idle_bal = set()
+for i in range(1, N + 1):
+    db = os.path.join(D, "c%d.db" % i)
+    role = "idle" if i not in movers else ("sender" if movers[i] < 0 else "receiver")
+    ch = q(db, "SELECT local_amount, remote_amount, funding_txid, funding_vout FROM channels LIMIT 1")
+    sc = q(db, "SELECT commitment_number, signed_tx_hex FROM signed_commitments ORDER BY commitment_number DESC LIMIT 1")
+    if not ch:
+        fail("client %d (%s): no channel row" % (i, role)); continue
+    bal = ch[0][0]; total_bal += bal
+    if role == "idle": idle_bal.add(bal)
+    if not sc:
+        fail("client %d (%s): no signed commitment in its database, balance %d sat cannot be claimed" % (i, role, bal)); continue
+    cn, d = sc[0][0], decode(sc[0][1])
+    if d is None:
+        fail("client %d (%s): stored commitment does not decode" % (i, role)); continue
+    known[d["txid"]] = "commitment"; commits[i] = d
+    if role == "idle" and cn != 0:
+        fail("client %d (idle): commitment number %d, expected 0" % (i, cn))
+    if role != "idle" and cn == 0:
+        fail("client %d (%s): still at commitment 0 after the payment" % (i, role))
+    if (d["vin"][0]["txid"], d["vin"][0]["vout"]) != (ch[0][2], ch[0][3]):
+        fail("client %d (%s): commitment does not spend its channel funding output" % (i, role))
+    raw = cli("getrawtransaction", d["txid"], "1")
+    conf = json.loads(raw).get("confirmations", 0) if raw else 0
+    if conf < 1:
+        fail("client %d (%s): commitment %s not confirmed" % (i, role, d["txid"])); continue
+    tl = sats(d["vout"][0]["value"]); total_tolocal += tl
+    l = lsp_ch.get(i - 1)
+    if tl != bal:
+        fail("client %d (%s): to_local %d sat != balance in its database %d sat" % (i, role, tl, bal))
+    elif l is None or l[1] != bal:
+        fail("client %d (%s): balance %d sat != the LSP's record %s" % (i, role, bal, l[1] if l else None))
+    else:
+        ok("client %d (%s): commitment %d confirmed (%d conf), to_local %d sat = its balance (client and LSP databases agree)" % (i, role, cn, conf, tl))
+if SC == "mixed" and len(idle_bal) == 1:
+    base = next(iter(idle_bal))
+    for i, delta in movers.items():
+        b = q(os.path.join(D, "c%d.db" % i), "SELECT local_amount FROM channels LIMIT 1")
+        if b and b[0][0] != base + delta:
+            fail("client %d: balance %d sat, expected idle balance %d %+d" % (i, b[0][0], base, delta))
+    if not fails: ok("sender is down %d sat and receiver up %d sat against the idle balance %d sat" % (PAY, PAY, base))
+if len(commits) == N and total_tolocal == total_bal:
+    ok("sum of the %d to_local outputs = sum of client balances = %d sat" % (N, total_bal))
+elif len(commits) == N:
+    fail("sum of to_local %d sat != sum of client balances %d sat" % (total_tolocal, total_bal))
+
+# walk the chain from the factory funding output
+fraw = cli("getrawtransaction", fund_op[0], "1")
+if not fraw:
+    fail("factory funding transaction not found on chain"); sys.exit(1)
+ftx = json.loads(fraw)
+if sats(ftx["vout"][fund_op[1]]["value"]) != F:
+    fail("funding output on chain %d sat != factory funding_amount %d sat" % (sats(ftx["vout"][fund_op[1]]["value"]), F))
+start = json.loads(cli("getblockheader", ftx["blockhash"]))["height"]
+tip = int(cli("getblockcount")); chain = {}
+for h in range(start, tip + 1):
+    for tx in json.loads(cli("getblock", cli("getblockhash", str(h)), "2"))["tx"]:
+        if "coinbase" not in tx["vin"][0]: chain[tx["txid"]] = tx
+spender = {}
+for t, tx in chain.items():
+    for vin in tx["vin"]: spender[(vin["txid"], vin["vout"])] = t
+desc = set(); ops = {fund_op}; changed = True
+while changed:
+    changed = False
+    for t, tx in chain.items():
+        if t in desc: continue
+        if any((v["txid"], v["vout"]) in ops for v in tx["vin"]):
+            desc.add(t); changed = True
+            for o in tx["vout"]: ops.add((t, o["n"]))
+def spk(op): return chain[op[0]]["vout"][op[1]]["scriptPubKey"]["hex"] if op[0] in chain else None
+foreign = [t for t in desc if t not in known and any(
+    (v["txid"], v["vout"]) in ops and v["txid"] in known and spk((v["txid"], v["vout"])) != P2A for v in chain[t]["vin"])]
+if foreign: fail("%d on-chain transaction(s) spend a factory output but are neither a signed tree node nor a client commitment: %s" % (len(foreign), foreign[:3]))
+else: ok("every transaction spending a factory output is a signed tree node or a client commitment (%d tree, %d commitments on chain)" % (
+    sum(1 for t in desc if known.get(t) == "tree"), sum(1 for t in desc if known.get(t) == "commitment")))
+fees = unspent = bumped = 0
+for t in desc:
+    if t not in known: continue
+    tx = chain[t]
+    inv = sum(F if (v["txid"], v["vout"]) == fund_op else sats(chain[v["txid"]]["vout"][v["vout"]]["value"]) for v in tx["vin"])
+    fees += inv - sum(sats(o["value"]) for o in tx["vout"])
+    for o in tx["vout"]:
+        s = spender.get((t, o["n"]))
+        if s is None: unspent += sats(o["value"])
+        elif s not in known: bumped += sats(o["value"])
+if not desc: fail("the factory funding output was never spent")
+elif unspent + fees + bumped == F:
+    ok("conservation: funding %d sat = %d unspent + %d fees + %d anchors spent by fee bumps" % (F, unspent, fees, bumped))
+else: fail("conservation: funding %d sat != %d unspent + %d fees + %d anchors spent by fee bumps" % (F, unspent, fees, bumped))
+sys.exit(1 if fails else 0)
+PYEOF
+    local rc=$?
+    [ "$restart_ok" = 1 ] || rc=1
+    if [ $rc -ne 0 ]; then
+        for i in $(seq 1 $N); do echo "  --- client $i force-close log (tail) ---"; tail -4 "$D/fc_c$i.log" 2>/dev/null | sed 's/^/  /'; done
+    fi
+    return $rc
+}
+
+RESULT=0; n=0
+for SC in $SCENARIOS; do
+    if run_scenario "$SC" $((PORT + n)); then green "scenario '$SC': PASS"; else red "scenario '$SC': FAIL"; RESULT=1; fi
+    kill_ss
+    n=$((n + 1))
+done
+echo
+if [ $RESULT -eq 0 ]; then green "PASS: every client left its channel alone with its full balance ($SCENARIOS)"; else red "FAIL: see CHECK FAIL lines above"; fi
+exit $RESULT
