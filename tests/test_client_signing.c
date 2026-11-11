@@ -106,11 +106,13 @@ static int cs_run_with_deadline(int (*body)(void), int seconds,
     return WEXITSTATUS(status) == 0;
 }
 
-/* Define test `name` as a body run under a deadline of `seconds`. */
-#define CS_DEADLINE_TEST(name, seconds) \
-    static int name##_body(void); \
-    int name(void) { return cs_run_with_deadline(name##_body, seconds, #name); } \
-    static int name##_body(void)
+/* A test with a deadline is written as a body, `static int NAME_body(void)`,
+   and gets its public entry point from CS_DEADLINE_ENTRY(NAME, seconds) in
+   the list at the end of this file.  The entry points are kept apart from
+   the bodies, one to a line, so that no two functions start on the same
+   source line: coverage tools identify a function by the line it starts on. */
+#define CS_DEADLINE_ENTRY(name, seconds) \
+    int name(void) { return cs_run_with_deadline(name##_body, seconds, #name); }
 
 #define CS_UNIT_DEADLINE_SEC 120
 #define CS_REGTEST_DEADLINE_SEC 600
@@ -662,7 +664,7 @@ static int cs_run_client_close(secp256k1_context *ctx,
 
 /* A proposal that does not pay the client is refused before the client
    reveals a nonce; one that does pay it gets a nonce. */
-CS_DEADLINE_TEST(test_client_close_refuses_unpaid_proposal, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_refuses_unpaid_proposal_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -733,7 +735,7 @@ CS_DEADLINE_TEST(test_client_close_refuses_unpaid_proposal, CS_UNIT_DEADLINE_SEC
 /* A client with no channel signs any close: it is owed nothing.  But if its
    own database holds a channel for this factory, it was started without its
    state and must refuse rather than sign its balance away. */
-CS_DEADLINE_TEST(test_client_close_without_channel, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_without_channel_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -842,7 +844,7 @@ static int cs_client_channel_reload(channel_t *ch, secp256k1_context *ctx,
    its balances and reconnected: the reloaded channel has the reduced balance
    and an empty HTLC list.  A proposal that pays that balance exactly must be
    refused, or the HTLC amount would go to the LSP. */
-CS_DEADLINE_TEST(test_client_close_after_reconnect_with_htlc_in_flight, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_after_reconnect_with_htlc_in_flight_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -949,7 +951,7 @@ CS_DEADLINE_TEST(test_client_close_after_reconnect_with_htlc_in_flight, CS_UNIT_
 
 /* The nLockTime of a proposed close must be near the client's own chain tip,
    and cannot be judged at all without one. */
-CS_DEADLINE_TEST(test_client_close_locktime_bound, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_locktime_bound_body(void) {
     const uint32_t tip = 800000;
     const uint32_t margin = CLIENT_CLOSE_LOCKTIME_MARGIN;
 
@@ -1050,7 +1052,7 @@ static uint32_t cs_tip_source(void *ctx) {
    The client asks again for a bounded time.  If it still has no tip it says
    "cannot verify, try again" and neither signs nor records anything; that is
    not a refusal.  A tip that is known and stays too low is a refusal. */
-CS_DEADLINE_TEST(test_client_close_tip_retry, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_tip_retry_body(void) {
     const uint32_t tip = 800000;
     const int attempts = 4;
     secp256k1_context *ctx = cs_ctx();
@@ -1146,7 +1148,7 @@ CS_DEADLINE_TEST(test_client_close_tip_retry, CS_UNIT_DEADLINE_SEC) {
    complete that close whenever it likes.  The client remembers it: it signs
    a later proposal only if that pays at least as much, and takes part in no
    leaf or state advance of the factory. */
-CS_DEADLINE_TEST(test_client_close_records_signed_close, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_records_signed_close_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1279,8 +1281,7 @@ CS_DEADLINE_TEST(test_client_close_records_signed_close, CS_UNIT_DEADLINE_SEC) {
 /* After the client signed, the LSP may propose different outputs.  What
    matters to the client stays the same: its one output must pay at least
    what the signed close pays. */
-CS_DEADLINE_TEST(test_client_close_repropose_changed_outputs,
-                 CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_repropose_changed_outputs_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1379,7 +1380,7 @@ CS_DEADLINE_TEST(test_client_close_repropose_changed_outputs,
 
 /* When the client's own records cannot be read it must not act as if they
    were empty: it signs no close and takes part in no advance. */
-CS_DEADLINE_TEST(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_record_unreadable_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1545,7 +1546,7 @@ CS_DEADLINE_TEST(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC) {
 
 /* The record of a signed close is written to the client's database before
    the signature is sent, and a restarted client finds it there. */
-CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_record_survives_restart_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1702,7 +1703,7 @@ CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC
 
 /* Full ceremony: the LSP proposes each party's balance at its own script and
    every client co-signs. */
-CS_DEADLINE_TEST(test_client_close_honest_ceremony, CS_UNIT_DEADLINE_SEC) {
+static int test_client_close_honest_ceremony_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -1932,8 +1933,7 @@ static int cs_run_inprocess_close(int honest, int *close_rc_out,
    ceremony.  Clients that went through the real factory creation and channel
    open complete a close that pays them, and all refuse one whose single
    output pays the LSP; without the channel they would sign either. */
-CS_DEADLINE_TEST(test_client_run_with_channels_checks_close,
-                 CS_UNIT_DEADLINE_SEC) {
+static int test_client_run_with_channels_checks_close_body(void) {
     int close_rc = -1, n_done = -1, balances_ok = 0;
 
     TEST_ASSERT(cs_run_inprocess_close(1, &close_rc, &n_done, &balances_ok),
@@ -1953,8 +1953,7 @@ CS_DEADLINE_TEST(test_client_run_with_channels_checks_close,
 /* End to end on regtest: real clients with open channels are offered a close
    whose single output pays the LSP.  No client signs, the ceremony fails, and
    the factory funding output stays unspent. */
-CS_DEADLINE_TEST(test_regtest_coop_close_refuses_lsp_payee,
-                 CS_REGTEST_DEADLINE_SEC) {
+static int test_regtest_coop_close_refuses_lsp_payee_body(void) {
     regtest_t rt;
     if (!regtest_init(&rt)) {
         printf("  FAIL: regtest not available\n");
@@ -2303,7 +2302,7 @@ static int cs_leaf_intact(const factory_t *f, int leaf_side,
 
 /* The handler refuses every proposal, whatever the amounts: it reveals no
    nonce and its signed leaf is left exactly as it was. */
-CS_DEADLINE_TEST(test_client_leaf_realloc_handler_refuses_all, CS_UNIT_DEADLINE_SEC) {
+static int test_client_leaf_realloc_handler_refuses_all_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -2473,7 +2472,7 @@ static int cs_run_realloc_ceremony(const int64_t *deltas, int *lsp_rc_out,
 /* Full ceremony, L-stock moved into a client's channel output: the amounts
    satisfy the amount rule, and the clients still refuse.  The LSP's ceremony
    fails and puts its own leaf back as it was. */
-CS_DEADLINE_TEST(test_client_leaf_realloc_ceremony_refused, CS_UNIT_DEADLINE_SEC) {
+static int test_client_leaf_realloc_ceremony_refused_body(void) {
     const int64_t deltas[3] = { 5000, 0, -5000 };
     int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_leaf_intact = -1;
     TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes,
@@ -2495,7 +2494,7 @@ CS_DEADLINE_TEST(test_client_leaf_realloc_ceremony_refused, CS_UNIT_DEADLINE_SEC
    A client that co-signed it would be left without a signed leaf while the
    LSP held one that supersedes the client's commitments, so it is refused
    like any other. */
-CS_DEADLINE_TEST(test_client_leaf_realloc_identity_refused, CS_UNIT_DEADLINE_SEC) {
+static int test_client_leaf_realloc_identity_refused_body(void) {
     const int64_t deltas[3] = { 0, 0, 0 };
     int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_leaf_intact = -1;
     TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes,
@@ -2517,7 +2516,7 @@ CS_DEADLINE_TEST(test_client_leaf_realloc_identity_refused, CS_UNIT_DEADLINE_SEC
 /* Selling L-stock to a client needs a leaf reallocation, so the LSP refuses
    the request before anything happens: no message to any client, and its
    leaf exactly as it was. */
-CS_DEADLINE_TEST(test_lsp_buy_liquidity_refused, CS_UNIT_DEADLINE_SEC) {
+static int test_lsp_buy_liquidity_refused_body(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -2568,3 +2567,22 @@ CS_DEADLINE_TEST(test_lsp_buy_liquidity_refused, CS_UNIT_DEADLINE_SEC) {
     TEST_ASSERT(silent, "no client was contacted");
     return 1;
 }
+
+/* ---- Entry points of the tests that run under a deadline ---- */
+
+CS_DEADLINE_ENTRY(test_client_close_refuses_unpaid_proposal, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_without_channel, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_after_reconnect_with_htlc_in_flight, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_locktime_bound, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_tip_retry, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_records_signed_close, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_repropose_changed_outputs, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_close_honest_ceremony, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_run_with_channels_checks_close, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_regtest_coop_close_refuses_lsp_payee, CS_REGTEST_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_leaf_realloc_handler_refuses_all, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_leaf_realloc_ceremony_refused, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_client_leaf_realloc_identity_refused, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_lsp_buy_liquidity_refused, CS_UNIT_DEADLINE_SEC)
