@@ -535,9 +535,16 @@ typedef struct {
 int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    const rebalance_entry_t *entries, size_t n_entries);
 
-/* Advance one PS leaf via the production wire ceremony (PROPOSE->PSIG->DONE).
-   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
-int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
+/* Advance one leaf (arity-1 DW or PS) via the wire ceremony.
+   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip/refusal.
+
+   The advance replaces the transaction that funds the leaf's channel and does
+   not re-anchor the channel, so it is refused (no state change, nothing sent)
+   while a channel on the leaf holds client funds.  allow_live_channel != 0
+   skips that check; it is for harnesses that exercise the ceremony itself.
+   Payments never advance a leaf. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side,
+                                  int allow_live_channel);
 
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).

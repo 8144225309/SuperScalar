@@ -663,7 +663,8 @@
             int tier_b_fired_in_loop = 0;
             uint32_t epoch_at_loop_start = lsp_p->factory.counter.current_epoch;
             for (int ac = 0; ac < advance_count_arg; ac++) {
-                int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, cl1_cheat_side);
+                int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, cl1_cheat_side,
+                                /* allow_live_channel */ 1);
                 if (adv_rc != 1) {
                     fprintf(stderr, "LEAF ADVANCE TEST: lsp_channels_advance_ps_leaf(%d) returned %d at iter %d\n",
                             cl1_cheat_side, adv_rc, ac);
@@ -1734,9 +1735,9 @@
             int rollover_pass = 1;
 
             /* CL2-TB: enable on FACTORY_ARITY_PS (arity 3) too.
-               lsp_channels_advance_ps_leaf is a 1-line wrapper around
-               lsp_advance_leaf which works for any arity. The gate was
-               stale (predated PS arity introduction). */
+               lsp_channels_advance_ps_leaf drives lsp_advance_leaf, which
+               works for any per-client leaf arity. The gate was stale
+               (predated PS arity introduction). */
             if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
                 lsp_p->factory.leaf_arity != FACTORY_ARITY_PS) {
                 printf("  SKIP: --test-tier-b-rollover requires --arity 1 (DW) or --arity 3 (PS)\n");
@@ -1958,7 +1959,8 @@
                                     "(the WT-armed immediately-superseded state) before final rollover\n",
                                     lsp_p->factory.n_nodes);
                         }
-                        int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                        int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0,
+                                /* allow_live_channel */ 1);
                         if (rc != 1) {
                             printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
                             rollover_pass = 0;
@@ -2166,7 +2168,8 @@
                             printf("  F1: driving 1 PS leaf advance on leaf 0 to "
                                    "verify new chain[0] is spendable...\n");
                             fflush(stdout);
-                            int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                            int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0,
+                                /* allow_live_channel */ 1);
                             if (adv_rc != 1) {
                                 printf("  FAIL (F1): post-rollover leaf advance "
                                        "returned %d (expected 1) — new chain[0] "
@@ -4491,7 +4494,8 @@ bc_oom:
             int psa_pass = 1;
             for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
                 printf("PS advance: leaf %d...\n", li);
-                int arc = lsp_channels_advance_ps_leaf(mgr, lsp_p, li);
+                int arc = lsp_channels_advance_ps_leaf(mgr, lsp_p, li,
+                                /* allow_live_channel */ 1);
                 if (!arc) {
                     fprintf(stderr, "PS ADVANCE TEST: lsp_advance_leaf failed for leaf %d\n", li);
                     psa_pass = 0;

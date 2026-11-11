@@ -5121,7 +5121,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
-    int sender_found = -1;
     for (size_t s = 0; s < mgr->n_channels; s++) {
         if (s == client_idx) continue;
         channel_t *sender_ch = &mgr->entries[s].channel;
@@ -5223,7 +5222,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
-            sender_found = (int)s;
             break;
         }
     }
@@ -5233,18 +5231,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (fulfill_txn_started && mgr->persist)
         persist_commit((persist_t *)mgr->persist);
 
-    /* Per-leaf advance: after payment settles, advance both affected leaves.
-       Arity-1 (DW) and Arity-PS both use per-leaf 2-of-2 signing, so only
-       the involved clients' leaves need to be re-signed, not the entire tree. */
-    if (lsp->factory.leaf_arity == FACTORY_ARITY_1 ||
-        lsp->factory.leaf_arity == FACTORY_ARITY_PS) {
-        /* Advance payee's leaf */
-        lsp_advance_leaf(mgr, lsp, (int)client_idx);
-        /* Advance sender's leaf (if found via intra-factory routing) */
-        if (sender_found >= 0 && sender_found != (int)client_idx)
-            lsp_advance_leaf(mgr, lsp, sender_found);
-    }
-
+    /* A settled payment moves balances inside the channels only; nothing the
+       leaf transaction commits to has changed, so the factory tree is left
+       untouched.  Advancing the leaf here would replace the transaction whose
+       output funds the channel while both sides' commitments keep spending
+       the old outpoint. */
     return 1;
 }
 
@@ -8112,8 +8103,45 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
 }
 
 
-/* Public wrapper: advance one PS leaf via the production wire ceremony. */
-int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
+/* Public entry point: advance one leaf (arity-1 DW or PS) via the wire
+   ceremony.
+
+   The advanced leaf transaction replaces the one whose output funds the
+   leaf's channel: a PS advance appends a chain transaction that spends the
+   previous channel output, and a DW advance produces a new leaf txid with a
+   lower nSequence.  The ceremony does not move the channel onto the new
+   outpoint and no commitment is re-signed, so once the advanced leaf is on
+   chain the commitments held by both sides spend an output that no longer
+   exists.  The advance is therefore refused, before any state is touched or
+   any message is sent, while a channel funded by this leaf still carries
+   client funds (a client balance or an in-flight HTLC).
+
+   allow_live_channel != 0 skips that check.  It exists for harnesses that
+   exercise the ceremony itself; nothing that serves real client funds may
+   pass it. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side,
+                                  int allow_live_channel) {
+    if (!mgr || !lsp) return 0;
+    const factory_t *f = &lsp->factory;
+    if (!allow_live_channel && leaf_side >= 0 && leaf_side < f->n_leaf_nodes) {
+        size_t leaf_node = f->leaf_node_indices[leaf_side];
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            size_t c_node;
+            uint32_t c_vout;
+            if (!factory_client_to_leaf(f, c, &c_node, &c_vout)) continue;
+            if (c_node != leaf_node) continue;
+            const channel_t *ch = &mgr->entries[c].channel;
+            if (ch->funding_amount == 0) continue;
+            if (ch->remote_amount == 0 && ch->n_htlcs == 0) continue;
+            fprintf(stderr,
+                    "LSP: leaf %d advance refused -- channel %zu is funded by "
+                    "this leaf and holds client funds (client balance %llu "
+                    "sats, %zu HTLC(s)); the advance would not re-anchor it\n",
+                    leaf_side, c,
+                    (unsigned long long)ch->remote_amount, ch->n_htlcs);
+            return 0;
+        }
+    }
     return lsp_advance_leaf(mgr, lsp, leaf_side);
 }
 

@@ -554,10 +554,10 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         msg = *initial_msg;
         got_propose = 1;
     } else {
-        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages
-           and trailing leaf-advance traffic (per-leaf advance ceremonies
-           trigger after HTLC fulfill in lsp_channels.c:2259; their
-           PROPOSE/DONE messages may arrive just before CLOSE_PROPOSE). */
+        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages and
+           taking part in a leaf-advance or state-advance ceremony the LSP
+           starts before the close.  Payments never start one; none has to
+           arrive for the close to proceed. */
         for (;;) {
             if (!wire_recv(fd, &msg) || check_msg_error(&msg)) {
                 fprintf(stderr, "Client: expected CLOSE_PROPOSE\n");
