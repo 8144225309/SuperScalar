@@ -47,9 +47,24 @@ PIDS=()
 
 cleanup() {
     echo "=== Cleaning up ==="
-    kill "${FIFO_HOLDER_PID:-}" 2>/dev/null || true
+    kill -KILL "${FIFO_HOLDER_PID:-}" 2>/dev/null || true
+    # Ask every process to stop, but never block on it: allow 10 s in total,
+    # then SIGKILL. A bare `wait` hung the harness, and the test binary reading
+    # it through popen(), whenever the LSP did not exit on SIGTERM.
     for pid in "${PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
+    for _ in $(seq 1 20); do
+        alive=0
+        for pid in "${PIDS[@]:-}"; do
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" = 0 ] && break
+        sleep 0.5
+    done
+    for pid in "${PIDS[@]:-}"; do
+        [ -n "$pid" ] || continue
+        kill -KILL "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
     # Preserve key logs at /tmp before rm -rf nukes TMPDIR.
@@ -62,9 +77,9 @@ cleanup() {
     if [ -f "$TMPDIR/bridge.log" ]; then
         cp "$TMPDIR/bridge.log" /tmp/bridge_last_bridge.log 2>/dev/null || true
     fi
-    lightning-cli --network=regtest --lightning-dir="$CLN_DIR" stop 2>/dev/null || true
-    [ -d "$CLN2_DIR" ] && lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" stop 2>/dev/null || true
-    $BCLI stop 2>/dev/null || true
+    timeout 30 lightning-cli --network=regtest --lightning-dir="$CLN_DIR" stop 2>/dev/null || true
+    [ -d "$CLN2_DIR" ] && timeout 30 lightning-cli --network=regtest --lightning-dir="$CLN2_DIR" stop 2>/dev/null || true
+    timeout 30 $BCLI stop 2>/dev/null || true
     sleep 2
     rm -rf "$TMPDIR"
     echo "  Preserved logs: /tmp/bridge_last_{cln,lsp,bridge}.log"
@@ -109,10 +124,19 @@ FIFO_HOLDER_PID=$!
 
 SS_ARITY="${SS_ARITY:-2}"  # 1=FACTORY_ARITY_1, 2=FACTORY_ARITY_2, 3=FACTORY_ARITY_PS
 echo "  (using factory arity: $SS_ARITY)"
+# lsp_validate_cltv_for_forward() rejects an inbound HTLC whose expiry is not
+# before the factory CLTV. The regtest auto-CLTV is only current+35, shorter
+# than CLN's final CLTV delta, so without a pin every bridged HTLC is rejected.
+# Pin the factory to a production-like lifetime (matching --active-blocks 500),
+# as test_bridge_regtest.sh does. The check itself is unchanged.
+CUR_HEIGHT=$($BCLI getblockcount)
+[ -n "$CUR_HEIGHT" ] || { echo "FAIL: getblockcount returned nothing"; exit 1; }
+FACTORY_CLTV=$(( CUR_HEIGHT + 500 ))
 stdbuf -oL $LSP_BIN --daemon --cli --network regtest --port "$LSP_PORT" \
     --seckey "$LSP_SECKEY" --clients 4 --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" --rpcuser rpcuser --rpcpassword rpcpass \
     --amount 100000 --active-blocks 500 --arity "$SS_ARITY" \
+    --cltv-timeout "$FACTORY_CLTV" \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")

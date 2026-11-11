@@ -923,7 +923,8 @@
         printf("\n=== POST-DAEMON WIRE LEAF ADVANCE TEST (stateless=%s) ===\n",
                (legacy && legacy[0] == '1') ? "0" : "1");
         fflush(stdout);
-        int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+        int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0,
+                                /* allow_live_channel */ 1);
         if (adv_rc == 1) {
             printf("=== POST-DAEMON WIRE LEAF ADVANCE: PASS ===\n");
         } else {

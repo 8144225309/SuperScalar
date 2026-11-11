@@ -166,7 +166,7 @@ echo
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
-    "$CLIENT_BIN" \
+    "$CLIENT_BIN" --test-allow-tree-advance \
         --network regtest \
         --host 127.0.0.1 --port $LSP_PORT \
         --seckey "${CLIENT_SECKEYS[$i]}" \
