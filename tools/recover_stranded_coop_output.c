@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 
     /* Derive keypairs + pubkeys. */
     secp256k1_keypair kps[128];
-    secp256k1_pubkey  pks[128];
+    secp256k1_pubkey  pks[128] = {0};
     for (size_t i = 0; i < n_signers; i++) {
         if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) {
             fprintf(stderr, "keypair_create failed (signer %zu)\n", i); return 1;

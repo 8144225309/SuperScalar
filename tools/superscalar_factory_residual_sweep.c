@@ -146,6 +146,7 @@ int main(int argc, char **argv) {
     /* Rebuild the factory deterministically (same keys/arity/cltv/funding/hashlock
        -> identical keyaggs/merkles/SPKs as on-chain). */
     factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) { fprintf(stderr, "out of memory\n"); return 1; }
     factory_init(f, ctx, kps, n_part, 64, 16);
     factory_set_arity(f, FACTORY_ARITY_PS);
     factory_set_ps_subfactory_arity(f, ps_sub_arity);
@@ -186,7 +187,7 @@ int main(int argc, char **argv) {
            output); the MuSig self-verify below confirms our (participants,merkle)
            reproduce a VALID key-path sig for it -> a wrong derivation fails the verify
            and is NEVER broadcast (no wasted fee). */
-        secp256k1_pubkey pks[64]; secp256k1_keypair sgn_kps[64];
+        secp256k1_pubkey pks[64] = {0}; secp256k1_keypair sgn_kps[64];
         for (size_t k=0;k<n_sig;k++){ pks[k]=f->pubkeys[signers[k]]; sgn_kps[k]=kps[signers[k]]; }
         musig_keyagg_t ka; if (!musig_aggregate_keys(ctx,&ka,pks,n_sig)){fprintf(stderr,"keyagg fail\n");free(d);continue;}
         secp256k1_xonly_pubkey tw;
@@ -211,7 +212,9 @@ int main(int argc, char **argv) {
         n_ok++;
         tx_buf_t stx; tx_buf_init(&stx,256);
         if (!finalize_signed_tx(&stx,utx.data,utx.len,sig)){fprintf(stderr,"  finalize fail\n");free(d);continue;}
-        char *txh = malloc(stx.len*2+1); hex_encode(stx.data,stx.len,txh); txh[stx.len*2]=0;
+        char *txh = malloc(stx.len*2+1);
+        if (!txh) { fprintf(stderr, "  out of memory\n"); tx_buf_free(&stx); free(d); continue; }
+        hex_encode(stx.data,stx.len,txh); txh[stx.len*2]=0;
         printf("  signed (%zu B)\n  hex: %s\n", stx.len, txh);
         if (!do_broadcast) { free(txh); free(d); continue; }
         char cmd[200000];

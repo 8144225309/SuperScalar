@@ -180,7 +180,6 @@ int test_reconnect_pubkey_match(void) {
         all_pks[i + 1] = client_pks[i];
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) { free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp); return 0; }
     factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
 
@@ -397,7 +396,6 @@ int test_client_persist_reload(void) {
 
     /* Build factory */
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -567,7 +565,6 @@ int test_balance_reporting(void) {
     }
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -1793,6 +1790,7 @@ int test_factory_lifecycle_daemon_check(void) {
     s = factory_get_state(f, 200);
     TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 200 = EXPIRED");
 
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -1969,7 +1967,8 @@ int test_ladder_daemon_integration(void) {
     ladder_advance_block(lad, 130);
     TEST_ASSERT_EQ(lf->cached_state, FACTORY_EXPIRED, "EXPIRED at 130");
 
-    tx_buf_free(&lf->distribution_tx);
+    ladder_free(lad);   /* the slot's detached factory copy + distribution_tx */
+    factory_free(f);
     free(f);
     free(lad);
     secp256k1_context_destroy(ctx);
@@ -1993,7 +1992,6 @@ int test_distribution_tx_amounts(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -2587,7 +2585,6 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2657,7 +2654,6 @@ int test_reconnect_commitment_mismatch_reject(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2915,7 +2911,6 @@ int test_reconnect_htlc_replay(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
