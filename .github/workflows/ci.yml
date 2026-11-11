@@ -68,14 +68,21 @@ jobs:
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           ./build/test_inproc_scale 4
+      - name: CLN plugin unit tests
+        # Plugin logic with the CLN RPC and bridge socket mocked; no node needed.
+        if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
+        run: python3 -m unittest -v tools/test_cln_plugin.py
       - name: CLN-bridge secure-by-default (#5 finding 1)
         # The bridge must REFUSE to start without --lsp-pubkey (unauthenticated NN
         # is MITM-exposed) unless --insecure-no-auth is explicitly passed.
         if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
         run: |
-          if ./build/superscalar_bridge >/tmp/br.out 2>&1; then
+          rc=0; ./build/superscalar_bridge >/tmp/br.out 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "FAIL: bridge started WITHOUT --lsp-pubkey"; cat /tmp/br.out; exit 1
           fi
+          # A configuration error is reported as 78 so supervisors do not loop
+          [ "$rc" -eq 78 ] || { echo "FAIL: exit status $rc, expected 78"; exit 1; }
           grep -q "refusing to start without --lsp-pubkey" /tmp/br.out || {
             echo "FAIL: missing secure-by-default refusal"; cat /tmp/br.out; exit 1; }
           echo "OK: bridge refuses unauthenticated NN startup by default"

@@ -476,18 +476,11 @@ static cJSON *method_pay_bridge(admin_rpc_t *rpc, const cJSON *params,
         return NULL;
     }
 
-    /* Send bolt11 directly to bridge — bridge handles routing via CLN */
-    uint64_t request_id = mgr->next_request_id++;
-    unsigned char dummy_hash[32] = {0};
-    cJSON *pay_msg = wire_build_bridge_send_pay(bolt11_str, dummy_hash, request_id);
-    if (!pay_msg) {
-        snprintf(errmsg, errcap, "failed to build bridge pay message");
-        return NULL;
-    }
-    int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay_msg);
-    cJSON_Delete(pay_msg);
-    if (!ok) {
-        snprintf(errmsg, errcap, "bridge send failed");
+    /* Hand the invoice to the bridge — CLN does the routing */
+    uint64_t request_id = 0;
+    const char *err = NULL;
+    if (!lsp_channels_operator_pay(mgr, bolt11_str, &request_id, &err)) {
+        snprintf(errmsg, errcap, "%s", err ? err : "bridge pay failed");
         return NULL;
     }
 

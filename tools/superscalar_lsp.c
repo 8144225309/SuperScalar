@@ -3186,25 +3186,10 @@ int main(int argc, char *argv[]) {
             }
 
             {
-                unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
-                uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
-                size_t orig_sender[MAX_HTLC_ORIGINS];
-                uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-                size_t n_orig = persist_load_htlc_origins(&db,
-                    orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                    MAX_HTLC_ORIGINS);
-                for (size_t i = 0; i < n_orig; i++) {
-                    if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                    htlc_origin_t *o = &mgr->htlc_origins[mgr->n_htlc_origins++];
-                    memcpy(o->payment_hash, orig_hashes[i], 32);
-                    o->bridge_htlc_id = orig_bridge[i];
-                    o->request_id = orig_req[i];
-                    o->sender_idx = orig_sender[i];
-                    o->sender_htlc_id = orig_htlc[i];
-                    o->active = 1;
-                }
+                size_t n_orig = lsp_channels_restore_origins(mgr);
                 if (n_orig > 0)
-                    printf("LSP recovery: loaded %zu HTLC origins from DB\n", n_orig);
+                    printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+                lsp_channels_load_bridge_fulfils(mgr);
             }
 
             /* Initialize watchtower */
@@ -3222,6 +3207,8 @@ int main(int argc, char *argv[]) {
             watchtower_register_autosettle(&rec_wt,
                                             watchtower_autosettle_leaf_channels);
             mgr->watchtower = &rec_wt;
+            snprintf(mgr->network, sizeof(mgr->network), "%s",
+                     network ? network : "");
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) rec_wt.max_bump_fee_sat = max_bump_fee;
@@ -4459,25 +4446,10 @@ accept_new_factory:
                 printf("LSP: loaded %zu invoices from DB\n", n_inv);
 
             /* Load HTLC origins */
-            unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
-            uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
-            size_t orig_sender[MAX_HTLC_ORIGINS];
-            uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-            size_t n_orig = persist_load_htlc_origins(&db,
-                orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                MAX_HTLC_ORIGINS);
-            for (size_t i = 0; i < n_orig; i++) {
-                if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
-                memcpy(origin->payment_hash, orig_hashes[i], 32);
-                origin->bridge_htlc_id = orig_bridge[i];
-                origin->request_id = orig_req[i];
-                origin->sender_idx = orig_sender[i];
-                origin->sender_htlc_id = orig_htlc[i];
-                origin->active = 1;
-            }
+            size_t n_orig = lsp_channels_restore_origins(mgr);
             if (n_orig > 0)
                 printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+            lsp_channels_load_bridge_fulfils(mgr);
         }
 
         /* Do NOT override channel.fee_rate_sat_per_kvb with --fee-rate:
@@ -4544,6 +4516,8 @@ accept_new_factory:
            TU so it doesn't appear in the trustless WT binary). */
         watchtower_register_autosettle(&wt, watchtower_autosettle_leaf_channels);
         mgr->watchtower = &wt;
+        snprintf(mgr->network, sizeof(mgr->network), "%s",
+                 network ? network : "");
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;

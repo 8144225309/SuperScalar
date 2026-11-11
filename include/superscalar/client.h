@@ -326,6 +326,14 @@ int client_parse_forgery_response(const char *s);
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
 
+/* Apply an UPDATE_FAIL_HTLC from the LSP to the channel.
+   An HTLC the LSP never took (uncommitted) is rolled back and nothing
+   follows.  A committed one is failed, the amount returns to whoever
+   offered it, and the LSP's COMMITMENT_SIGNED follows as after a fulfil.
+   Returns 1 if the HTLC was removed; *committed_out says which case. */
+int client_handle_fail_htlc(channel_t *ch, const wire_msg_t *msg,
+                             int *committed_out, uint64_t *htlc_id_out);
+
 /* Handle async / unsolicited LSP->client notifications (MSG_FUNDING_REORG,
    MSG_CEREMONY_ABORT).  Returns 1 if handled (caller still frees msg->json), 0
    otherwise.  Shared by the ceremony recv path (wire_recv_handle_ping) and the
