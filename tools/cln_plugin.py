@@ -62,11 +62,20 @@ bridge_sock = None
 pending_htlcs = {}
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
-# Factory invoices the LSP has fulfilled through this plugin (payment_hash,
-# oldest first).  CLN still holds such an invoice as unpaid, with its
-# preimage: a later HTLC for the hash must never be left to CLN.  Kept in
-# BRIDGE_STATE_FILE; the CLN invoice itself is deleted as well when possible.
+# Factory invoices the LSP has fulfilled through this plugin, oldest first:
+# payment_hash -> {"preimage": hex, "upstream": CLN's name of the HTLC that
+# paid it}.  CLN still holds such an invoice as unpaid, with its preimage: a
+# later HTLC for the hash must never be left to CLN.  If CLN offers the very
+# HTLC that paid it again (it lost our answer in a restart), it gets the
+# same answer.  Kept in BRIDGE_STATE_FILE; the CLN invoice itself is deleted
+# as well when possible.
 settled_invoices = {}
+# HTLCs handed to the LSP and not yet resolved, by CLN's name for them:
+# upstream -> {"payment_hash": hex, "factory_invoice": bool}.  Kept in
+# BRIDGE_STATE_FILE.  When CLN restarts it offers each of them again; the
+# client may hold it by then, so it is held here until the LSP says how it
+# ended, whatever the state of the bridge link or of the invoice.
+forwarded_htlcs = {}
 SETTLED_MAX = 20000
 invoice_labels = {}  # payment_hash -> CLN label of the factory invoice
 NODE_ID = None       # this CLN node's id (from getinfo), once known
@@ -84,6 +93,13 @@ KEYSEND_TLV_TYPE = "5482373484"
 # FACTORY_CLTV_DELTA (40) so the HTLC arriving at the LSP still has
 # enough blocks of margin before the timeout check fires.
 FACTORY_INVOICE_CLTV = 80
+
+# How long CLN keeps a factory invoice payable.  An HTLC that pays it can be
+# held for as long as its timelock allows, so the invoice has to outlive
+# the hour a payer gets to start paying by that hold time (taken as twice
+# the final CLTV delta at ten minutes a block).
+FACTORY_INVOICE_PAY_WINDOW = 3600
+FACTORY_INVOICE_EXPIRY = FACTORY_INVOICE_PAY_WINDOW + 2 * FACTORY_INVOICE_CLTV * 600
 
 # Outbound pays.  CLN's `pay` stops starting new attempts after
 # PAY_RETRY_FOR seconds; parts already in flight can still settle later.
@@ -332,13 +348,36 @@ def hook_fail(rpc_id, failure_message=FAIL_TEMPORARY_NODE):
                             "failure_message": failure_message}})
 
 
-def _mark_settled(payment_hash):
-    """The LSP fulfilled this factory invoice: remember it for good."""
+def _mark_settled(payment_hash, preimage, upstream):
+    """The LSP fulfilled this factory invoice: remember it for good, with
+    the answer given and which HTLC it was given for."""
     with lock:
-        settled_invoices[payment_hash] = True
+        settled_invoices[payment_hash] = {"preimage": preimage,
+                                          "upstream": upstream}
         while len(settled_invoices) > SETTLED_MAX:
             del settled_invoices[next(iter(settled_invoices))]
     save_state()
+
+
+def _note_forwarded(upstream, payment_hash, factory_invoice):
+    """An HTLC CLN names is about to go to the LSP: remember that across a
+    restart."""
+    if not upstream:
+        return
+    with lock:
+        forwarded_htlcs[upstream] = {"payment_hash": payment_hash,
+                                     "factory_invoice": bool(factory_invoice)}
+    save_state()
+
+
+def _forget_forwarded(upstream):
+    """The HTLC was answered: nothing to hold for any more."""
+    if not upstream:
+        return
+    with lock:
+        known = forwarded_htlcs.pop(upstream, None) is not None
+    if known:
+        save_state()
 
 
 def _drop_cln_invoice(payment_hash):
@@ -508,6 +547,14 @@ def handle_bridge_msg(msg):
         payment_hash = msg.get("payment_hash", "")
         result = msg.get("result")
         log(f"htlc_resolve: hash={payment_hash[:16]}... result={result}")
+        # A fulfil is only a fulfil with the preimage of this hash.  CLN
+        # would reject anything else and fail the HTLC, which the client
+        # may already have been paid for: keep holding instead.
+        if result == "fulfill" and \
+                not _preimage_matches(msg.get("preimage", ""), payment_hash):
+            log(f"ERROR: fulfil for {payment_hash[:16]}... carries a preimage "
+                f"that does not hash to it; HTLC stays held")
+            return
         with lock:
             held = pending_htlcs.pop(payment_hash, None)
             # The invoice stays registered until it is paid: after a failed
@@ -536,7 +583,7 @@ def handle_bridge_msg(msg):
             # Closed for good before CLN is answered: no later HTLC for this
             # hash is ever passed on to CLN, which still has the invoice.
             if settle:
-                _mark_settled(payment_hash)
+                _mark_settled(payment_hash, preimage, held.get("upstream", ""))
             send_to_cln({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
@@ -549,9 +596,11 @@ def handle_bridge_msg(msg):
             # the fulfil and repeats it.
             send_to_bridge({"method": "htlc_resolved",
                             "payment_hash": payment_hash})
+            _forget_forwarded(held.get("upstream", ""))
             if settle:
                 _spawn(_drop_cln_invoice, payment_hash)
         else:
+            _forget_forwarded(held.get("upstream", ""))
             reason = msg.get("reason", "unknown")
             # The LSP does not know this hash.  If it is not one of our
             # invoices either (a forward, or keysend) the HTLC is CLN's
@@ -641,7 +690,7 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
             f"amount_msat={amount_msat}",
             f"label={label}",
             "description=SuperScalar factory payment",
-            "expiry=3600",
+            f"expiry={FACTORY_INVOICE_EXPIRY}",
             f"preimage={preimage_hex}",
             f"cltv={FACTORY_INVOICE_CLTV}"
         )
@@ -732,8 +781,10 @@ def save_state():
     with pays_lock:
         pays = {str(k): v for k, v in open_pays.items()}
     with lock:
-        settled = list(settled_invoices)
-    data = json.dumps({"pays": pays, "settled": settled})
+        settled = dict(settled_invoices)
+        forwarded = dict(forwarded_htlcs)
+    data = json.dumps({"pays": pays, "settled": settled,
+                       "forwarded": forwarded})
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -755,16 +806,23 @@ def load_state():
         with open(path, "r") as f:
             state = json.load(f)
         pays = state.get("pays", {})
-        settled = state.get("settled", [])
+        settled = state.get("settled", {})
+        forwarded = state.get("forwarded", {})
     except FileNotFoundError:
         return 0
     except (OSError, ValueError, AttributeError) as e:
         log(f"Cannot read plugin state {path}: {e}")
         return 0
     with lock:
-        for ph in settled if isinstance(settled, list) else []:
-            if _is_hash(ph):
-                settled_invoices[ph] = True
+        for ph, rec in settled.items():
+            if _is_hash(ph) and isinstance(rec, dict):
+                settled_invoices[ph] = {"preimage": rec.get("preimage", ""),
+                                        "upstream": rec.get("upstream", "")}
+        for up, rec in forwarded.items():
+            if up and isinstance(rec, dict) and _is_hash(rec.get("payment_hash")):
+                forwarded_htlcs[up] = {
+                    "payment_hash": rec["payment_hash"],
+                    "factory_invoice": bool(rec.get("factory_invoice"))}
     restored = 0
     with pays_lock:
         for key, rec in pays.items():
@@ -1147,6 +1205,43 @@ def handle_htlc_accepted(rpc_id, params):
     cltv_expiry = htlc.get("cltv_expiry", 0)
     upstream = upstream_id(htlc)
 
+    with lock:
+        stored = settled_invoices.get(payment_hash)
+        replayed = forwarded_htlcs.get(upstream) if upstream else None
+
+    # The HTLC that paid a fulfilled invoice, offered again: CLN lost our
+    # answer in a restart.  The client has been paid; give the same answer.
+    if upstream and isinstance(stored, dict) and \
+            stored.get("upstream") == upstream and \
+            _preimage_matches(stored.get("preimage", ""), payment_hash):
+        log(f"HTLC {upstream} for fulfilled invoice {payment_hash[:16]}... "
+            f"offered again — resolving as before")
+        send_to_cln({"jsonrpc": "2.0", "id": rpc_id,
+                     "result": {"result": "resolve",
+                                "payment_key": stored["preimage"]}})
+        send_to_bridge({"method": "htlc_resolved",
+                        "payment_hash": payment_hash})
+        return
+
+    # An HTLC we handed to the LSP before a restart, offered again.  The
+    # client may hold it, so only the LSP can say how it ends: hold it and
+    # offer it to the LSP again (now, or once the bridge is back).  Whether
+    # the invoice is still listed, still unpaid or even readable does not
+    # matter here, and neither "fail" nor "continue" is safe.
+    if replayed and replayed.get("payment_hash") == payment_hash:
+        bridge_msg = {"method": "htlc_accepted", "payment_hash": payment_hash,
+                      "amount_msat": amount_msat, "cltv_expiry": cltv_expiry,
+                      "upstream_id": upstream}
+        with lock:
+            pending_htlcs[payment_hash] = {
+                "rpc_id": rpc_id,
+                "factory_invoice": replayed.get("factory_invoice", False),
+                "upstream": upstream, "msg": dict(bridge_msg)}
+        log(f"HTLC {upstream} for {payment_hash[:16]}... offered again after "
+            f"a restart — held for the LSP")
+        send_to_bridge(bridge_msg)
+        return
+
     # The invoice list could not be read yet, so the registry below may be
     # missing factory invoices.  Try again now.
     if not registry_recovered:
@@ -1250,6 +1345,7 @@ def handle_htlc_accepted(rpc_id, params):
     with lock:
         if payment_hash in pending_htlcs:
             pending_htlcs[payment_hash]["msg"] = dict(bridge_msg)
+    _note_forwarded(upstream, payment_hash, is_ours)
 
     log(f"Forwarding HTLC {payment_hash[:16]}... to bridge"
         f"{' (keysend)' if keysend_preimage else ''}")
@@ -1259,6 +1355,7 @@ def handle_htlc_accepted(rpc_id, params):
         log(f"Bridge send failed for HTLC {payment_hash[:16]}...")
         with lock:
             pending_htlcs.pop(payment_hash, None)
+        _forget_forwarded(upstream)
         if is_ours:
             # The LSP cannot be reached, so the factory client cannot be
             # paid; CLN must not settle the invoice in its place.  A

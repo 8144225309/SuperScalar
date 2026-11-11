@@ -1,6 +1,9 @@
 [Unit]
 Description=SuperScalar Bridge Daemon
-After=superscalar-lsp.service lightningd.service
+# Start order: bitcoind -> superscalar-lsp -> superscalar-bridge -> lightningd.
+# The CLN plugin connects to the bridge, so the bridge comes first.
+After=superscalar-lsp.service
+Before=lightningd.service
 Requires=superscalar-lsp.service
 
 [Service]
