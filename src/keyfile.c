@@ -184,6 +184,10 @@ static load_result_t keyfile_decrypt(const unsigned char *buf, size_t n,
         const unsigned char *ciphertext = buf + 36;
         const unsigned char *tag = buf + 68;
 
+        if (iters < KEYFILE_PBKDF2_MIN_ITERATIONS ||
+            iters > KEYFILE_PBKDF2_MAX_ITERATIONS)
+            return LOAD_FAILED;
+
         unsigned char enc_key[32];
         if (!derive_key_v2(enc_key, passphrase, salt, 16, (int)iters)) {
             return LOAD_FAILED;

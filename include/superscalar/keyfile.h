@@ -11,6 +11,10 @@
 /* v2 format: [magic "SK02":4][iters BE:4][salt:16][nonce:12][ct:32][tag:16] = 84 bytes */
 #define KEYFILE_SIZE_V2 84
 #define KEYFILE_PBKDF2_ITERATIONS 600000
+/* Iteration counts accepted when loading a keyfile.  The count comes from the
+   file, so it is bounded: a huge value would stall the loader. */
+#define KEYFILE_PBKDF2_MIN_ITERATIONS 100000
+#define KEYFILE_PBKDF2_MAX_ITERATIONS 10000000
 #define KEYFILE_MAGIC "SK02"
 
 /* Save secret key to encrypted file (always writes v2 format).

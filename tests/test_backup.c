@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "superscalar/backup.h"
+#include "superscalar/crypto_aead.h"
+#include <openssl/evp.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -615,5 +617,104 @@ int test_backup_read_leaves_other_files_alone(void) {
     remove(bak_path);
     remove(victim);
     remove(link_path);
+    return 1;
+}
+
+/* Build a v2 backup file by hand with the given iteration count, correctly
+   encrypted under pass, holding a one-byte database and a one-byte keyfile. */
+static size_t craft_backup(unsigned char *out, uint32_t iters, const char *pass) {
+    static const unsigned char plaintext[10] = { 1, 0, 0, 0, 'D', 1, 0, 0, 0, 'K' };
+    unsigned char *o = out;
+    memcpy(o, BACKUP_MAGIC, BACKUP_MAGIC_LEN);
+    o += BACKUP_MAGIC_LEN;
+    *o++ = BACKUP_VERSION;
+    *o++ = (unsigned char)(iters >> 24);
+    *o++ = (unsigned char)(iters >> 16);
+    *o++ = (unsigned char)(iters >> 8);
+    *o++ = (unsigned char)iters;
+    unsigned char *salt = o;
+    memset(salt, 0x33, BACKUP_SALT_LEN);
+    o += BACKUP_SALT_LEN;
+    unsigned char *nonce = o;
+    memset(nonce, 0x44, BACKUP_NONCE_LEN);
+    o += BACKUP_NONCE_LEN;
+
+    unsigned char key[32];
+    unsigned char aad[BACKUP_MAGIC_LEN + 1];
+    memcpy(aad, BACKUP_MAGIC, BACKUP_MAGIC_LEN);
+    aad[BACKUP_MAGIC_LEN] = BACKUP_VERSION;
+    if (PKCS5_PBKDF2_HMAC(pass, (int)strlen(pass), salt, BACKUP_SALT_LEN,
+                          (int)iters, EVP_sha256(), 32, key) != 1)
+        return 0;
+    if (!aead_encrypt(o, o + sizeof(plaintext), plaintext, sizeof(plaintext),
+                      aad, sizeof(aad), key, nonce))
+        return 0;
+    return (size_t)(o - out) + sizeof(plaintext) + BACKUP_TAG_LEN;
+}
+
+/* Hand-made backup files: truncated headers, and iteration counts outside
+   the accepted range, are rejected (and rejected quickly). */
+int test_backup_crafted_files_rejected(void) {
+    const char *bak_path = "/tmp/test_bak_crafted.bak";
+    const char *pass = "crafted-pass";
+    const unsigned char *upass = (const unsigned char *)pass;
+    size_t pass_len = strlen(pass);
+    unsigned char file[256];
+
+    /* The crafting helper itself produces a backup the reader accepts. */
+    size_t len = craft_backup(file, BACKUP_PBKDF2_MIN_ITERATIONS, pass);
+    TEST_ASSERT(len > 0, "craft a backup");
+    TEST_ASSERT(write_test_file(bak_path, file, len), "write");
+    TEST_ASSERT(backup_verify(bak_path, upass, pass_len),
+                "a hand-made backup at the minimum iteration count verifies");
+
+    /* The same file with fewer iterations than the minimum: refused although
+       the passphrase is right and the encryption is valid. */
+    len = craft_backup(file, 1000, pass);
+    TEST_ASSERT(len > 0, "craft a weak backup");
+    TEST_ASSERT(write_test_file(bak_path, file, len), "write");
+    TEST_ASSERT(!backup_verify(bak_path, upass, pass_len),
+                "iteration count below the minimum is refused");
+
+    /* Counts that are zero, above the maximum, or negative as a signed int. */
+    static const uint32_t bad_iters[] = {
+        0, 1, BACKUP_PBKDF2_MIN_ITERATIONS - 1, BACKUP_PBKDF2_MAX_ITERATIONS + 1,
+        0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu
+    };
+    len = craft_backup(file, BACKUP_PBKDF2_MIN_ITERATIONS, pass);
+    for (size_t i = 0; i < sizeof(bad_iters) / sizeof(bad_iters[0]); i++) {
+        file[9]  = (unsigned char)(bad_iters[i] >> 24);
+        file[10] = (unsigned char)(bad_iters[i] >> 16);
+        file[11] = (unsigned char)(bad_iters[i] >> 8);
+        file[12] = (unsigned char)bad_iters[i];
+        TEST_ASSERT(write_test_file(bak_path, file, len), "write");
+        TEST_ASSERT(!backup_verify(bak_path, upass, pass_len),
+                    "out-of-range iteration count is refused");
+    }
+
+    /* Files that end inside the header, including one that is exactly the
+       magic with no version byte after it. */
+    len = craft_backup(file, BACKUP_PBKDF2_MIN_ITERATIONS, pass);
+    for (size_t cut = 0; cut <= BACKUP_HEADER_LEN + BACKUP_TAG_LEN; cut++) {
+        /* An exact-size buffer, so reading past the end is caught by the
+           memory checker. */
+        unsigned char *exact = malloc(cut ? cut : 1);
+        TEST_ASSERT(exact != NULL, "malloc");
+        memcpy(exact, file, cut);
+        int wrote = write_test_file(bak_path, exact, cut);
+        free(exact);
+        TEST_ASSERT(wrote, "write truncated file");
+        TEST_ASSERT(!backup_verify(bak_path, upass, pass_len),
+                    "truncated backup is refused");
+    }
+    for (int v1 = 0; v1 <= 1; v1++) {
+        TEST_ASSERT(write_test_file(bak_path,
+                        (const unsigned char *)(v1 ? BACKUP_MAGIC_V1 : BACKUP_MAGIC),
+                        BACKUP_MAGIC_LEN), "write bare magic");
+        TEST_ASSERT(!backup_verify(bak_path, upass, pass_len),
+                    "a file that is only the magic is refused");
+    }
+
+    remove(bak_path);
     return 1;
 }

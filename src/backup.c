@@ -237,7 +237,7 @@ static unsigned char *backup_decrypt(const char *backup_path,
 
     /* Determine format by magic bytes */
     int is_v2 = 0;
-    if (file_len >= BACKUP_MAGIC_LEN &&
+    if (file_len > BACKUP_MAGIC_LEN &&
         memcmp(file_data, BACKUP_MAGIC, BACKUP_MAGIC_LEN) == 0 &&
         file_data[BACKUP_MAGIC_LEN] == BACKUP_VERSION) {
         is_v2 = 1;
@@ -282,6 +282,11 @@ static unsigned char *backup_decrypt(const char *backup_path,
         salt = file_data + 13;
         nonce_ptr = salt + BACKUP_SALT_LEN;
 
+        if (iters < BACKUP_PBKDF2_MIN_ITERATIONS ||
+            iters > BACKUP_PBKDF2_MAX_ITERATIONS) {
+            free(file_data);
+            return NULL;
+        }
         if (!derive_backup_key_v2(key, passphrase, passphrase_len,
                                    salt, BACKUP_SALT_LEN, (int)iters)) {
             free(file_data);

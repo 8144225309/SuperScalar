@@ -1,5 +1,6 @@
 #include "superscalar/keyfile.h"
 #include <secp256k1.h>
+#include <openssl/evp.h>
 #include <secp256k1_extrakeys.h>
 #include <stdio.h>
 #include <string.h>
@@ -670,5 +671,72 @@ int test_keyfile_mode_not_ours_to_change(void) {
     unlink(target);
     unlink(link_path);
     unlink(not_a_key);
+    return 1;
+}
+
+/* Build a v2 keyfile by hand with the given iteration count, correctly
+   encrypted under pass. */
+static int craft_keyfile(unsigned char out[KEYFILE_SIZE_V2], uint32_t iters,
+                         const unsigned char seckey[32], const char *pass) {
+    memcpy(out, KEYFILE_MAGIC, 4);
+    out[4] = (unsigned char)(iters >> 24);
+    out[5] = (unsigned char)(iters >> 16);
+    out[6] = (unsigned char)(iters >> 8);
+    out[7] = (unsigned char)iters;
+    memset(out + 8, 0x35, 16);   /* salt */
+    memset(out + 24, 0x46, 12);  /* nonce */
+
+    unsigned char enc_key[32];
+    if (PKCS5_PBKDF2_HMAC(pass, (int)strlen(pass), out + 8, 16, (int)iters,
+                          EVP_sha256(), 32, enc_key) != 1)
+        return 0;
+    return aead_encrypt(out + 36, out + 68, seckey, 32, NULL, 0, enc_key, out + 24);
+}
+
+/* Hand-made keyfiles with an iteration count outside the accepted range are
+   rejected, also when the passphrase is right; so are files with bytes
+   missing or added. */
+int test_keyfile_crafted_files_rejected(void) {
+    const char *path = "/tmp/test_keyfile_crafted.key";
+    unsigned char key[32], out[32], file[KEYFILE_SIZE_V2 + 1];
+    memset(key, 0x77, 32);
+    unlink(path);
+
+    TEST_ASSERT(craft_keyfile(file, KEYFILE_PBKDF2_MIN_ITERATIONS, key, "pw"), "craft");
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2), "write");
+    TEST_ASSERT(chmod(path, 0600) == 0, "mode");
+    TEST_ASSERT(keyfile_load(path, out, "pw"),
+                "a hand-made keyfile at the minimum iteration count loads");
+    TEST_ASSERT(memcmp(out, key, 32) == 0, "key recovered");
+
+    TEST_ASSERT(craft_keyfile(file, 1000, key, "pw"), "craft a weak keyfile");
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2), "write");
+    TEST_ASSERT(!keyfile_load(path, out, "pw"),
+                "iteration count below the minimum is refused");
+
+    static const uint32_t bad_iters[] = {
+        0, 1, KEYFILE_PBKDF2_MIN_ITERATIONS - 1, KEYFILE_PBKDF2_MAX_ITERATIONS + 1,
+        0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu
+    };
+    TEST_ASSERT(craft_keyfile(file, KEYFILE_PBKDF2_MIN_ITERATIONS, key, "pw"), "craft");
+    for (size_t i = 0; i < sizeof(bad_iters) / sizeof(bad_iters[0]); i++) {
+        file[4] = (unsigned char)(bad_iters[i] >> 24);
+        file[5] = (unsigned char)(bad_iters[i] >> 16);
+        file[6] = (unsigned char)(bad_iters[i] >> 8);
+        file[7] = (unsigned char)bad_iters[i];
+        TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2), "write");
+        TEST_ASSERT(!keyfile_load(path, out, "pw"),
+                    "out-of-range iteration count is refused");
+    }
+
+    /* One byte short, and one byte long. */
+    TEST_ASSERT(craft_keyfile(file, KEYFILE_PBKDF2_MIN_ITERATIONS, key, "pw"), "craft");
+    file[KEYFILE_SIZE_V2] = 0;
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2 - 1), "write short");
+    TEST_ASSERT(!keyfile_load(path, out, "pw"), "short keyfile is refused");
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2 + 1), "write long");
+    TEST_ASSERT(!keyfile_load(path, out, "pw"), "keyfile with trailing data is refused");
+
+    unlink(path);
     return 1;
 }

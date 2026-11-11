@@ -1761,6 +1761,7 @@ extern int test_backup_restore_refuses_existing(void);
 extern int test_backup_failed_write_reported(void);
 extern int test_backup_read_tightens_mode(void);
 extern int test_backup_read_leaves_other_files_alone(void);
+extern int test_backup_crafted_files_rejected(void);
 
 /* UTXO Coin Selection (Mainnet Gap #1) */
 extern int test_coin_select_basic(void);
@@ -1936,6 +1937,7 @@ extern int test_keyfile_save_replaces_atomically(void);
 extern int test_keyfile_symlink_path(void);
 extern int test_keyfile_load_tightens_mode(void);
 extern int test_keyfile_mode_not_ours_to_change(void);
+extern int test_keyfile_crafted_files_rejected(void);
 extern int test_secure_file_mode_owner_only(void);
 extern int test_secure_file_create_only(void);
 extern int test_secure_file_failed_write_keeps_old(void);
@@ -3694,6 +3696,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_backup_failed_write_reported);
     RUN_TEST(test_backup_read_tightens_mode);
     RUN_TEST(test_backup_read_leaves_other_files_alone);
+    RUN_TEST(test_backup_crafted_files_rejected);
 
     printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
     RUN_TEST(test_coin_select_basic);
@@ -3873,6 +3876,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_keyfile_symlink_path);
     RUN_TEST(test_keyfile_load_tightens_mode);
     RUN_TEST(test_keyfile_mode_not_ours_to_change);
+    RUN_TEST(test_keyfile_crafted_files_rejected);
     RUN_TEST(test_secure_file_mode_owner_only);
     RUN_TEST(test_secure_file_create_only);
     RUN_TEST(test_secure_file_failed_write_keeps_old);

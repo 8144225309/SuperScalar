@@ -27,6 +27,10 @@
 #define BACKUP_NONCE_LEN 12
 #define BACKUP_TAG_LEN 16
 #define BACKUP_PBKDF2_ITERATIONS 600000
+/* Iteration counts accepted when reading a backup.  The count comes from the
+   file, so it is bounded: a huge value would stall the reader. */
+#define BACKUP_PBKDF2_MIN_ITERATIONS 100000
+#define BACKUP_PBKDF2_MAX_ITERATIONS 10000000
 #define BACKUP_HEADER_LEN_V1 (BACKUP_MAGIC_LEN + 1 + BACKUP_SALT_LEN + BACKUP_NONCE_LEN)
 #define BACKUP_HEADER_LEN (BACKUP_MAGIC_LEN + 1 + 4 + BACKUP_SALT_LEN + BACKUP_NONCE_LEN)
 
