@@ -7,7 +7,7 @@
 #   --lsp-host HOST            LSP_HOST            default 127.0.0.1
 #   --lsp-port PORT            LSP_PORT            default 9735
 #   --lsp-pubkey HEX           LSP_PUBKEY          required: the LSP prints it at startup
-#   --plugin-port PORT         PLUGIN_PORT         default 19736
+#   --plugin-port PORT         PLUGIN_PORT         default 9736
 #   --plugin-bind ADDR         PLUGIN_BIND         default 127.0.0.1 (bridge default)
 #   --plugin-secret-file PATH  PLUGIN_SECRET_FILE  default ~/.superscalar/bridge-plugin.secret
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 
 LSP_HOST="${LSP_HOST:-127.0.0.1}"
 LSP_PORT="${LSP_PORT:-9735}"
-PLUGIN_PORT="${PLUGIN_PORT:-19736}"
+PLUGIN_PORT="${PLUGIN_PORT:-9736}"
 LSP_PUBKEY="${LSP_PUBKEY:-}"
 PLUGIN_BIND="${PLUGIN_BIND:-}"
 PLUGIN_SECRET_FILE="${PLUGIN_SECRET_FILE:-}"

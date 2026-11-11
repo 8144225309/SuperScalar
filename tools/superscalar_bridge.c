@@ -34,8 +34,9 @@ static void usage(const char *prog) {
             "                        testing only -- production MUST use --lsp-pubkey)\n"
             "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
             "  --version             Show version and exit\n"
-            "Exits with status 78 when it cannot run as configured (no LSP key,\n"
-            "unusable secret file or bind address); do not restart it on that.\n"
+            "Exits with status 78 when it cannot run as configured (unknown option,\n"
+            "missing or invalid LSP key, invalid Tor proxy, unusable secret file or\n"
+            "bind address); do not restart it on that.\n"
             "  --help                Show this help\n", prog);
 }
 
@@ -59,7 +60,7 @@ int main(int argc, char *argv[]) {
         {"tor-proxy",   required_argument, 0, 't'},
         {"insecure-no-auth", no_argument,  0, 'I'},
         {"version",     no_argument,       0, 'v'},
-        {"help",        no_argument,       0, '?'},
+        {"help",        no_argument,       0, 'H'},
         {0, 0, 0, 0}
     };
 
@@ -77,7 +78,11 @@ int main(int argc, char *argv[]) {
         case 'v':
             printf("superscalar_bridge %s\n", SUPERSCALAR_VERSION);
             return 0;
-        default: usage(argv[0]); return 1;
+        case 'H': usage(argv[0]); return 0;
+        default:
+            /* an option the bridge does not know: a configuration error */
+            usage(argv[0]);
+            return EXIT_BAD_CONFIG;
         }
     }
 
@@ -88,7 +93,7 @@ int main(int argc, char *argv[]) {
         if (!tor_parse_proxy_arg(tor_proxy_arg, proxy_host, sizeof(proxy_host),
                                   &proxy_port)) {
             fprintf(stderr, "Error: invalid --tor-proxy format (use HOST:PORT)\n");
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         wire_set_proxy(proxy_host, proxy_port);
         printf("Bridge: Tor SOCKS5 proxy set to %s:%d\n", proxy_host, proxy_port);
@@ -111,13 +116,13 @@ int main(int argc, char *argv[]) {
         if (hex_decode(lsp_pubkey_hex, pk_buf, 33) != 33) {
             fprintf(stderr, "Error: --lsp-pubkey must be 33-byte compressed pubkey hex\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         secp256k1_pubkey lsp_pk;
         if (!secp256k1_ec_pubkey_parse(ctx, &lsp_pk, pk_buf, 33)) {
             fprintf(stderr, "Error: invalid --lsp-pubkey\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         bridge_set_lsp_pubkey(&br, &lsp_pk);
         printf("Bridge: NK authentication enabled (pinned LSP pubkey)\n");

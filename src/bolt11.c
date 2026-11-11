@@ -40,31 +40,32 @@ static void init_rev(void) {
 }
 
 /* ---- polymod (BIP 173) ---- */
-static uint32_t bech32_polymod(const uint8_t *v, size_t n) {
-    uint32_t c = 1;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t c0 = (uint8_t)(c >> 25);
-        c = ((c & 0x1ffffffUL) << 5) ^ v[i];
-        if (c0 & 1)  c ^= 0x3b6a57b2UL;
-        if (c0 & 2)  c ^= 0x26508e6dUL;
-        if (c0 & 4)  c ^= 0x1ea119faUL;
-        if (c0 & 8)  c ^= 0x3d4233ddUL;
-        if (c0 & 16) c ^= 0x2a1462b3UL;
-    }
+static uint32_t polymod_step(uint32_t c, uint8_t v) {
+    uint8_t c0 = (uint8_t)(c >> 25);
+    c = ((c & 0x1ffffffUL) << 5) ^ v;
+    if (c0 & 1)  c ^= 0x3b6a57b2UL;
+    if (c0 & 2)  c ^= 0x26508e6dUL;
+    if (c0 & 4)  c ^= 0x1ea119faUL;
+    if (c0 & 8)  c ^= 0x3d4233ddUL;
+    if (c0 & 16) c ^= 0x2a1462b3UL;
     return c;
 }
 
+/* The bech32 checksum of hrp + data, whatever their length: the values are
+   fed to the polymod one at a time, with no intermediate buffer to outgrow. */
 static uint32_t bech32_checksum_val(const char *hrp, size_t hrp_len,
                                      const uint8_t *data5, size_t d5_len) {
-    uint8_t buf[1024];
-    size_t pos = 0;
-    if (hrp_len * 2 + 1 + d5_len + 6 > sizeof(buf)) return 0;
-    for (size_t i = 0; i < hrp_len; i++) buf[pos++] = (uint8_t)((unsigned char)hrp[i] >> 5);
-    buf[pos++] = 0;
-    for (size_t i = 0; i < hrp_len; i++) buf[pos++] = (uint8_t)((unsigned char)hrp[i] & 0x1f);
-    for (size_t i = 0; i < d5_len;  i++) buf[pos++] = data5[i];
-    for (int i = 0; i < 6; i++) buf[pos++] = 0;
-    return bech32_polymod(buf, pos) ^ BECH32_CONST;
+    uint32_t c = 1;
+    for (size_t i = 0; i < hrp_len; i++)
+        c = polymod_step(c, (uint8_t)((unsigned char)hrp[i] >> 5));
+    c = polymod_step(c, 0);
+    for (size_t i = 0; i < hrp_len; i++)
+        c = polymod_step(c, (uint8_t)((unsigned char)hrp[i] & 0x1f));
+    for (size_t i = 0; i < d5_len; i++)
+        c = polymod_step(c, data5[i]);
+    for (int i = 0; i < 6; i++)
+        c = polymod_step(c, 0);
+    return c ^ BECH32_CONST;
 }
 
 /* ---- 5-bit ↔ 8-bit conversion ---- */

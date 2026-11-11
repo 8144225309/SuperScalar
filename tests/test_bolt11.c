@@ -974,3 +974,44 @@ int test_bolt11_encode_signature_and_payee(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- The checksum of a long invoice is verified like any other ---- */
+int test_bolt11_long_invoice_checksum(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char key[32]; memset(key, 0x42, 32);
+    bolt11_invoice_t dec;
+
+    /* Well over a thousand data characters: two unknown fields of 900
+       groups each on top of the required ones */
+    groups_t g; g.n = 0;
+    g_put(&g, 1700000000, 7);
+    g_hash_and_secret(&g);
+    g_field(&g, 2, 900, 7, 7);
+    g_field(&g, 2, 900, 9, 9);
+    static char inv[4096];
+    ASSERT(g_finish(ctx, "lnbc15u", &g, key, inv, sizeof(inv)), "build");
+    size_t len = strlen(inv);
+    ASSERT(len > 2000, "invoice is long");
+    ASSERT(bolt11_decode(ctx, inv, &dec), "long invoice decodes");
+    ASSERT(dec.amount_msat == 1500000, "amount");
+
+    /* Any change to it is caught by the checksum */
+    static char bad[4096];
+    strcpy(bad, inv);
+    bad[len / 2] = bad[len / 2] == 'q' ? 'p' : 'q';
+    ASSERT(!bolt11_decode(ctx, bad, &dec), "altered long invoice rejected");
+
+    /* Including a checksum of all zeros */
+    strcpy(bad, inv);
+    memset(bad + len - 6, 'q', 6);
+    ASSERT(!bolt11_decode(ctx, bad, &dec), "zero checksum on a long invoice rejected");
+    strcpy(bad, inv);
+    bad[len - 1] = bad[len - 1] == 'q' ? 'p' : 'q';
+    ASSERT(!bolt11_decode(ctx, bad, &dec), "wrong last checksum character rejected");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -308,6 +308,7 @@ extern int test_bolt11_spec_valid_examples(void);
 extern int test_bolt11_spec_invalid_examples(void);
 extern int test_bolt11_reader_strictness(void);
 extern int test_bolt11_encode_signature_and_payee(void);
+extern int test_bolt11_long_invoice_checksum(void);
 extern int test_bolt11_amount_units_and_fields(void);
 extern int test_pathfind_two_hops(void);
 extern int test_pathfind_one_hop(void);
@@ -895,6 +896,7 @@ extern int test_peer_mgr_channel_scid_field(void);
 extern int test_tor_parse_proxy_arg_basic(void);
 /* PR #22 Phase 2: Invoice receivability */
 extern int test_invoice_create_decode(void);
+extern int test_invoice_feature_bits(void);
 
 /* PR #53 Phase C: stateless invoice wiring */
 extern int test_stateless_invoice_secret_derived(void);
@@ -2301,6 +2303,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt11_spec_invalid_examples);
     RUN_TEST(test_bolt11_reader_strictness);
     RUN_TEST(test_bolt11_encode_signature_and_payee);
+    RUN_TEST(test_bolt11_long_invoice_checksum);
     RUN_TEST(test_bolt11_amount_units_and_fields);
 
     printf("\n=== Pathfinding (Dijkstra) ===\n");
@@ -2982,6 +2985,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tor_parse_proxy_arg_basic);
     printf("\n=== PR #22 Phase 2: Invoice Receivability ===\n");
     RUN_TEST(test_invoice_create_decode);
+    RUN_TEST(test_invoice_feature_bits);
     /* PR #53 Phase C: stateless invoice wiring */
     RUN_TEST(test_stateless_invoice_secret_derived);
     RUN_TEST(test_stateless_invoice_secrets_differ);

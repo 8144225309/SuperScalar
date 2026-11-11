@@ -431,15 +431,18 @@ sends a random nonce and proves it holds the secret with an HMAC over both
 nonces, the plugin checks the bridge first, and neither side acts on a message
 from a peer that has not passed. Both sides refuse a secret file that is not a
 regular file owned by their own user with no group or other permissions. The
-link itself is not encrypted and messages after the handshake are not
-individually authenticated, so keep it on loopback or a trusted network. Only
+handshake also yields a session key, and every later line in either direction
+carries a MAC under it with a running counter, so a process between the two
+cannot add, alter, replay or drop a message without ending the connection. The
+link is not encrypted (payment hashes, amounts and preimages are readable to
+whoever can see the traffic), so keep it on loopback or a trusted network. Only
 one plugin connection is served at a time; further connections are closed.
 
 ### Step 3: Start CLN with the Plugin
 
 ```bash
 lightningd --network=regtest \
-  --plugin=/path/to/tools/cln_plugin.py \
+  --important-plugin=/path/to/tools/cln_plugin.py \
   --superscalar-bridge-host=127.0.0.1 \
   --superscalar-bridge-port=9736 \
   --superscalar-bridge-secret-file=~/.superscalar/bridge-plugin.secret \
@@ -475,6 +478,23 @@ directory it cannot create, or a secret file it cannot create or will not
 accept. The message says which. `start_bridge.sh` and the systemd unit do not
 restart it on that status.
 
+### What the plugin keeps on disk
+
+The plugin's state file (`superscalar-bridge-state-file`) holds what must
+survive a restart of `lightningd`: outside payments that were requested and
+whose result the LSP has not acknowledged, the HTLCs handed to the LSP and not
+yet resolved, and the factory invoices already fulfilled (with the preimage
+given). It is written atomically, mode `0600`, and records the CLN node id and
+the LSP key it belongs to.
+
+The plugin loads it before it does anything else and **stops** if the file
+cannot be read or parsed, belongs to another node, or cannot be written. With
+`important-plugin=` that stops `lightningd`. Do not delete the file to get
+going again without checking it: an open payment in it may still complete on
+the node (and would then never be reported to the LSP), and a held HTLC would
+be treated as new. A bridge that serves a different LSP than the one recorded
+is refused the link.
+
 ### What the bridge checks do not cover
 
 Core Lightning holds every factory invoice together with its preimage (that
@@ -483,38 +503,104 @@ handle an HTLC for a factory invoice, deletes CLN's copy once the LSP has
 fulfilled it, and keeps fulfilled hashes closed across restarts. That
 protection is the plugin's, so it has limits:
 
-- **Plugin not loaded.** If `lightningd` runs without the plugin (disabled,
-  crashed with CLN configured to carry on, or started before it was
-  installed), CLN settles any HTLC for an unpaid factory invoice by itself:
-  the payer is charged and the node keeps the money, while the factory client
-  is not paid. Run the plugin as `important-plugin=` so that CLN stops when
-  it does, and do not start `lightningd` without it while factory invoices
-  are outstanding.
+- **Plugin not loaded.** If `lightningd` runs without the plugin, CLN settles
+  any HTLC for an unpaid factory invoice by itself: the payer is charged and
+  the node keeps the money, while the factory client is not paid. Load the
+  plugin as `important-plugin=` so that CLN stops when it does, and do not
+  start `lightningd` without it while factory invoices are outstanding.
 - **Self-payment.** A factory client paying another factory client's invoice
   as an outside payment is refused by the LSP (`invoice_is_internal`) and by
   the plugin (invoice issued by, or payable to, this node). Both checks rely
-  on the registries of the running LSP and plugin; an invoice neither still
-  knows is not recognised.
+  on the registries of the running LSP and plugin.
+- **One use per payment hash.** A hash with an HTLC in flight, or one that was
+  paid in either direction, is not accepted for a new invoice or a new inbound
+  payment. The LSP's memory of completed hashes is bounded (the last 64
+  outside payments, the last 32 inbound fulfils) and is not restored after an
+  LSP restart, except for inbound fulfils the bridge has not yet confirmed.
 - **Multi-part payments** to a factory invoice are refused part by part; the
   payer has to send the full amount in one HTLC.
 - **HTLC replay** after a `lightningd` restart is matched by CLN's own HTLC
-  name (`short_channel_id` and `id` in the `htlc_accepted` hook). A CLN that
-  does not report both cannot be matched, and the repeat is refused.
+  name (`short_channel_id` and `id` in the `htlc_accepted` hook). An HTLC CLN
+  does not name cannot be matched: the repeat is refused, and it is not
+  offered to the LSP again after a bridge reconnect.
+- **A pay result the LSP rejects** (for instance a success whose preimage
+  does not match) leaves the client's HTLC held and is logged as an error by
+  the LSP and the plugin. Nothing resolves it automatically.
+- **An outside payment whose result never arrives** (node or bridge down for
+  good) leaves the client's HTLC held; the LSP warns near its expiry and does
+  not fail it on a timer.
 - **Deadlines.** The check that an HTLC's expiry is far enough past the
   current block height is applied to outside payments only, not yet to
   inbound and factory-internal HTLCs.
-- **The plugin link** is authenticated at connection time; it is not
-  encrypted and later messages are not individually authenticated.
+- **The plugin link** is authenticated line by line but not encrypted.
+- **A bridge restart** loses its table of pending inbound HTLCs and its queue
+  for the plugin. The plugin offers its held HTLCs again when it reconnects
+  and the LSP repeats unconfirmed fulfils, which covers both; a pay request
+  that was only in the bridge's queue is lost, and its client HTLC stays held.
 
-The following are covered by unit tests with CLN's RPC mocked and have not
-been exercised against a running Core Lightning node: `pay` with `maxfee`,
-`maxdelay` and `retry_for`; the shape of `decode`, `listpays`, `listsendpays`,
-`listinvoices`, `delinvoice` and `getinfo` replies; `htlc_accepted` being
-called again for unresolved HTLCs after a restart, with the same
-`short_channel_id` and `id`; HTLCs staying held across a bridge reconnect;
-the failure codes returned from the hook; and the plugin's state file across
-a real `lightningd` restart. Test these on regtest or signet before relying
-on the bridge.
+### Live-node checklist
+
+Everything above is covered by unit tests with CLN's RPC and hook mocked.
+None of it has been exercised against a running Core Lightning node. The code
+relies on the following behaviour of CLN; check each on regtest or signet
+before relying on the bridge.
+
+`htlc_accepted` hook
+- [ ] `htlc.short_channel_id` and `htlc.id` are present and identify the
+      incoming HTLC; `htlc.amount_msat` is the amount received and
+      `htlc.cltv_expiry` its absolute expiry.
+- [ ] After a restart, `lightningd` calls the hook again for every HTLC that
+      was unresolved, with the same `short_channel_id` and `id`.
+- [ ] An HTLC stays held for as long as the plugin does not answer, including
+      across a bridge reconnect, and the answer may come from another thread.
+- [ ] `{"result": "resolve", "payment_key": ...}` settles the HTLC without the
+      invoice being marked paid; `{"result": "fail", "failure_message":
+      "2002"}` and `"0017"` are accepted as failure messages.
+- [ ] `{"result": "continue"}` for a hash with no invoice forwards or fails
+      the HTLC as CLN would without the plugin.
+- [ ] The hook registration `"before": ["keysend"]` is honoured.
+
+Invoices
+- [ ] `invoice` accepts `preimage`, `cltv`, `expiry` and
+      `exposeprivatechannels` together, and returns `bolt11`.
+- [ ] `listinvoices` returns `label`, `payment_hash` and `status` (`unpaid`
+      until paid or expired).
+- [ ] `delinvoice label=... status=unpaid` removes an invoice whose HTLC was
+      resolved through the hook.
+
+Outside payments
+- [ ] `decode` returns `type: "bolt11 invoice"`, `valid`, `payment_hash`,
+      `amount_msat`, `payee` and `min_final_cltv_expiry`.
+- [ ] `pay` accepts `maxfee`, `maxdelay` and `retry_for` together; `maxfee`
+      is an absolute amount in millisatoshi and bounds the total fee.
+- [ ] `pay` starts no new attempt after `retry_for` seconds, and none after
+      it has returned an error; a JSON-RPC error from `pay` means the command
+      is over.
+- [ ] `pay` for an invoice the node already paid returns the old preimage
+      without paying again (the reason the plugin checks `listsendpays`
+      first).
+- [ ] `listpays payment_hash=...` reports `pending` while any part is in
+      flight, `failed` only when all parts failed, and `complete` with
+      `preimage`.
+- [ ] `listsendpays payment_hash=...` returns `payments` with `status`.
+- [ ] `getinfo` returns `id`, and RPC calls work from inside the plugin's
+      `init` handling.
+
+Plugin life cycle
+- [ ] With `important-plugin=`, `lightningd` stops when the plugin exits
+      (the plugin exits on an unusable state file).
+- [ ] The plugin's options are delivered in `init` as declared, and
+      `lightning-dir` is in `configuration`.
+- [ ] `lightning-cli -k` with `--lightning-dir`/`--network` as the plugin
+      builds them reaches the node the plugin runs in.
+
+Deployment
+- [ ] `tools/deploy/superscalar-bridge.service` starts the bridge before
+      `lightningd`, and the copy of the secret file for the `lightningd` user
+      is accepted by the plugin.
+- [ ] End to end: an inbound payment to a factory invoice, an outside payment
+      from a factory client, each across a restart of `lightningd`, of the
+      bridge and of the LSP while the HTLC is in flight.
 
 ### Bridge Daemon Flags
 

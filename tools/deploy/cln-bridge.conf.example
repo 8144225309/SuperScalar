@@ -9,6 +9,7 @@
 #      will retry every 5 seconds until it connects)
 #   2. cln_plugin.py requires Python 3
 #   3. The bridge port here must match --plugin-port on superscalar_bridge
+#      (9736 is the default of both and what superscalar-bridge.service uses)
 #
 # Start order: bitcoind -> superscalar_lsp -> superscalar_bridge -> lightningd
 
@@ -38,12 +39,16 @@ alias=my-superscalar-bridge
 
 # --- SuperScalar bridge plugin ---
 # Path to the plugin script (shipped in tools/cln_plugin.py)
-plugin=/path/to/SuperScalar/tools/cln_plugin.py
+# important-plugin, not plugin: lightningd then refuses to run without it.
+# CLN holds the factory invoices with their preimages, and without the
+# plugin it would settle payments to them by itself, with no factory client
+# being paid.
+important-plugin=/path/to/SuperScalar/tools/cln_plugin.py
 
 # Host and port where superscalar_bridge listens for the plugin.
 # Must match --plugin-port passed to superscalar_bridge.
 superscalar-bridge-host=127.0.0.1
-superscalar-bridge-port=9737
+superscalar-bridge-port=9736
 
 # The secret shared with superscalar_bridge.  The plugin and the bridge
 # prove to each other that they hold it; it is never sent.  The file must be
