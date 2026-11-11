@@ -7700,8 +7700,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
 
-            /* Check bridge HTLC timeouts */
-            if (mgr->bridge_fd >= 0 && mgr->watchtower && mgr->watchtower->rt) {
+            /* Check bridge HTLC timeouts.  Also with the bridge away: an
+               outside payment that is still unresolved near its expiry is
+               reported exactly then. */
+            if (mgr->watchtower && mgr->watchtower->rt) {
                 int bh = regtest_get_block_height(mgr->watchtower->rt);
                 if (bh > 0)
                     lsp_channels_check_bridge_htlc_timeouts(mgr, lsp, (uint32_t)bh);
