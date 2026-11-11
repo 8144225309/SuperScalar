@@ -1383,6 +1383,29 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* Client record of a cooperative close it has co-signed: one row per
+       factory, keyed by the factory's funding outpoint.  Written before the
+       client releases its partial signature, so a client that restarts
+       still knows the LSP may hold a signed close of that factory.
+       CREATE TABLE IF NOT EXISTS is idempotent, so no version gate. */
+    {
+        char *cs_err = NULL;
+        if (sqlite3_exec(p->db,
+                "CREATE TABLE IF NOT EXISTS client_close_signed ("
+                "  funding_txid BLOB NOT NULL,"    /* 32 bytes, internal order */
+                "  funding_vout INTEGER NOT NULL,"
+                "  paid_sats INTEGER NOT NULL,"    /* to the client's script */
+                "  sighash BLOB NOT NULL,"         /* 32 bytes, close sighash */
+                "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+                "  PRIMARY KEY (funding_txid, funding_vout)"
+                ");",
+                NULL, NULL, &cs_err) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: client_close_signed table error: %s\n",
+                    cs_err ? cs_err : "unknown");
+            sqlite3_free(cs_err);
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -2681,6 +2704,56 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+int persist_save_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t paid_sats,
+                               const unsigned char sighash[32]) {
+    if (!p || !p->db || !funding_txid || !sighash) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO client_close_signed "
+        "(funding_txid, funding_vout, paid_sats, sighash) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(stmt, 1, funding_txid, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)funding_vout);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)paid_sats);
+    sqlite3_bind_blob(stmt, 4, sighash, 32, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_load_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t *paid_sats_out,
+                               unsigned char sighash_out[32]) {
+    if (!p || !p->db || !funding_txid) return 0;
+    const char *sql =
+        "SELECT paid_sats, sighash FROM client_close_signed "
+        "WHERE funding_txid = ? AND funding_vout = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(stmt, 1, funding_txid, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)funding_vout);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    if (paid_sats_out)
+        *paid_sats_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+    if (sighash_out) {
+        const void *blob = sqlite3_column_blob(stmt, 1);
+        if (blob && sqlite3_column_bytes(stmt, 1) == 32)
+            memcpy(sighash_out, blob, 32);
+        else
+            memset(sighash_out, 0, 32);
+    }
+    sqlite3_finalize(stmt);
+    return 1;
 }
 
 int persist_factory_has_channel(persist_t *p,

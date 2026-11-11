@@ -576,6 +576,10 @@ typedef struct {
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
+    /* Cooperative closes this client has signed for the current factory.
+       Once close_state.signed_close is set the factory is frozen: the loop
+       acts on nothing but a close proposal. */
+    client_close_state_t close_state;
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -857,6 +861,14 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
 }
 
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
+/* This client's own chain tip height, 0 if no chain backend can tell. */
+static uint32_t client_tool_chain_tip(void *ctx) {
+    watchtower_t *wt = (watchtower_t *)ctx;
+    if (!wt || !wt->chain || !wt->chain->get_block_height) return 0;
+    int h = wt->chain->get_block_height(wt->chain);
+    return h > 0 ? (uint32_t)h : 0;
+}
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -963,6 +975,18 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             cJSON_Delete(stale_imsg.json);
     }
 
+    /* Load what this client has already signed for this factory.  The same
+       cbd is reused across reconnects and rotations, so this runs on every
+       entry, against the factory now in use. */
+    client_close_state_init(&cbd->close_state, cbd->db, factory);
+    if (cbd->close_state.signed_close)
+        fprintf(stderr, "Client %u: a cooperative close of this factory was "
+                "signed earlier (paying this client %llu sats) and may still "
+                "be completed by the LSP. The channel is frozen: only a close "
+                "paying at least that much will be signed. Use --force-close "
+                "to exit unilaterally.\n", my_index,
+                (unsigned long long)cbd->close_state.paid_sats);
+
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
     /* Log factory lifecycle once (Tier 2) */
@@ -996,7 +1020,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
        revocation + FULFILL.  Fired once, here, immediately after CHANNEL_READY
        (the LSP --demo loop is already "waiting for payments" by this point —
        same timing the old standalone_channel_cb used successfully). */
-    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated) {
+    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated &&
+        !cbd->close_state.signed_close) {
         uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
                                 ? factory->cltv_timeout - 40 : 500;
         for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
@@ -1051,7 +1076,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         {
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
-                if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
+                if (imsg.msg_type == MSG_COMMITMENT_SIGNED &&
+                    !cbd->close_state.signed_close) {
                     /* Save old state for deferred watchtower registration.
                        LSP revocation arrives later as MSG_LSP_REVOKE_AND_ACK. */
                     if (cbd->wt) {
@@ -1127,6 +1153,24 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
 handle_message:
+        /* A cooperative close of this factory was signed and may still be
+           completed by the LSP.  Nothing that changes the channel or the
+           factory tree is acted on any more: only a close proposal (which
+           the ceremony accepts if it pays at least as much), keepalives and
+           the LSP's own revocations, which only add to what this client can
+           prove.  Everything else is dropped unanswered. */
+        if (cbd->close_state.signed_close &&
+            msg.msg_type != MSG_CLOSE_PROPOSE &&
+            msg.msg_type != MSG_PING && msg.msg_type != MSG_PONG &&
+            msg.msg_type != MSG_LSP_REVOKE_AND_ACK) {
+            fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
+                    "cooperative close of this factory was already signed; "
+                    "only a close or a unilateral exit (--force-close) can "
+                    "follow\n", my_index, msg.msg_type);
+            if (msg.json) cJSON_Delete(msg.json);
+            continue;
+        }
+
         switch (msg.msg_type) {
         case MSG_UPDATE_ADD_HTLC: {
             /* Save pre-add state (this is the OLD commitment being revoked) */
@@ -1494,7 +1538,9 @@ handle_message:
         case MSG_CLOSE_PROPOSE:
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
             client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                      factory, n_participants, &msg, 0, ch, 0);
+                                      factory, n_participants, &msg,
+                                      client_chain_tip(), ch,
+                                      &cbd->close_state, 0);
             cJSON_Delete(msg.json);
             return 2;  /* close already handled */
 
@@ -3506,6 +3552,10 @@ int main(int argc, char *argv[]) {
 
     watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, client_fee_ptr,
                       use_db ? &db : NULL);
+    /* The close ceremony bounds a proposal's nLockTime by this client's own
+       chain tip, read from whatever chain backend the watchtower ends up
+       with (bitcoind RPC, or the light client attached below). */
+    client_set_chain_tip_source(client_tool_chain_tip, &client_wt);
 
     /* Attach BIP 158 light client as chain backend (overrides regtest backend) */
     if (light_client_arg) {

@@ -305,38 +305,106 @@ int test_client_close_refuses_unbalanced_channel(void) {
     return 1;
 }
 
-/* Run the client side of the close ceremony against one proposal and report
-   what the client did.  *sent_type_out is the type of the first message the
-   client wrote back (0 if none). */
+/* One message of a scripted LSP. */
+typedef struct {
+    uint8_t type;
+    cJSON *json;
+} cs_lsp_msg_t;
+
+static cs_lsp_msg_t cs_msg_propose(const tx_output_t *outs, size_t n_outs,
+                                   uint32_t locktime) {
+    cs_lsp_msg_t m = { MSG_CLOSE_PROPOSE,
+                       wire_build_close_propose(outs, n_outs, locktime) };
+    return m;
+}
+
+/* CLOSE_ALL_NONCES with a well-formed public nonce in every signer slot. */
+static cs_lsp_msg_t cs_msg_all_nonces(secp256k1_context *ctx,
+                                      const secp256k1_pubkey *pks) {
+    unsigned char ser[CS_N][66];
+    for (int i = 0; i < CS_N; i++) {
+        secp256k1_musig_secnonce sec;
+        secp256k1_musig_pubnonce pub;
+        musig_generate_nonce(ctx, &sec, &pub, cs_seckeys[i], &pks[i], NULL);
+        musig_pubnonce_serialize(ctx, ser[i], &pub);
+    }
+    cs_lsp_msg_t m = { MSG_CLOSE_ALL_NONCES,
+                       wire_build_close_all_nonces(
+                           (const unsigned char (*)[66])ser, CS_N) };
+    return m;
+}
+
+static cs_lsp_msg_t cs_msg_done(void) {
+    static const unsigned char tx[4] = { 0x02, 0x00, 0x00, 0x00 };
+    cs_lsp_msg_t m = { MSG_CLOSE_DONE, wire_build_close_done(tx, sizeof(tx)) };
+    return m;
+}
+
+static cs_lsp_msg_t cs_msg_error(void) {
+    cs_lsp_msg_t m = { MSG_ERROR, wire_build_error("close failed") };
+    return m;
+}
+
+#define CS_MAX_SENT 8
+
+/* Run the client side of the close ceremony against a scripted LSP.  All
+   LSP messages are queued and the stream is ended before the client starts,
+   so a client that waits for more than the script holds sees end of stream
+   and the test stays finite.  Records the type of every message the client
+   wrote back.  Takes ownership of the messages. */
+static int cs_run_client_close_script(secp256k1_context *ctx,
+                                      const secp256k1_keypair *kp,
+                                      const secp256k1_pubkey *pk, factory_t *f,
+                                      const channel_t *ch,
+                                      client_close_state_t *cs, uint32_t tip,
+                                      cs_lsp_msg_t *msgs, size_t n_msgs,
+                                      int *client_rc_out,
+                                      uint8_t sent_out[CS_MAX_SENT],
+                                      size_t *n_sent_out) {
+    int sv[2];
+    int ok = (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    for (size_t i = 0; i < n_msgs; i++) {
+        if (ok && (!msgs[i].json ||
+                   !wire_send(sv[0], msgs[i].type, msgs[i].json)))
+            ok = 0;
+        if (msgs[i].json) cJSON_Delete(msgs[i].json);
+    }
+    if (!ok) return 0;
+    shutdown(sv[0], SHUT_WR);
+
+    *client_rc_out = client_do_close_ceremony(sv[1], ctx, kp, pk, f, CS_N,
+                                               NULL, tip, ch, cs, 0);
+    close(sv[1]);
+
+    *n_sent_out = 0;
+    memset(sent_out, 0, CS_MAX_SENT);
+    wire_msg_t reply;
+    memset(&reply, 0, sizeof(reply));
+    while (*n_sent_out < CS_MAX_SENT && wire_recv(sv[0], &reply)) {
+        sent_out[(*n_sent_out)++] = reply.msg_type;
+        if (reply.json) cJSON_Delete(reply.json);
+        memset(&reply, 0, sizeof(reply));
+    }
+    close(sv[0]);
+    return 1;
+}
+
+/* Run the client side of the close ceremony against one proposal (nLockTime
+   0) and report what the client did.  *sent_type_out is the type of the
+   first message the client wrote back (0 if none). */
 static int cs_run_client_close(secp256k1_context *ctx,
                                const secp256k1_keypair *kp,
                                const secp256k1_pubkey *pk, factory_t *f,
                                const channel_t *ch,
                                const tx_output_t *outs, size_t n_outs,
                                int *client_rc_out, uint8_t *sent_type_out) {
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
-
-    cJSON *propose = wire_build_close_propose(outs, n_outs, 0);
-    int sent = wire_send(sv[0], MSG_CLOSE_PROPOSE, propose);
-    cJSON_Delete(propose);
-    if (!sent) { close(sv[0]); close(sv[1]); return 0; }
-    /* Nothing follows the proposal: a client that goes on to sign blocks on
-       the next ceremony message, so end the stream to keep the test finite. */
-    shutdown(sv[0], SHUT_WR);
-
-    *client_rc_out = client_do_close_ceremony(sv[1], ctx, kp, pk, f, CS_N,
-                                               NULL, 0, ch, 0);
-    close(sv[1]);
-
-    wire_msg_t reply;
-    memset(&reply, 0, sizeof(reply));
-    *sent_type_out = 0;
-    if (wire_recv(sv[0], &reply)) {
-        *sent_type_out = reply.msg_type;
-        if (reply.json) cJSON_Delete(reply.json);
-    }
-    close(sv[0]);
+    cs_lsp_msg_t msgs[1] = { cs_msg_propose(outs, n_outs, 0) };
+    uint8_t sent[CS_MAX_SENT];
+    size_t n_sent = 0;
+    if (!cs_run_client_close_script(ctx, kp, pk, f, ch, NULL, 0, msgs, 1,
+                                     client_rc_out, sent, &n_sent))
+        return 0;
+    *sent_type_out = n_sent > 0 ? sent[0] : 0;
     return 1;
 }
 
@@ -487,6 +555,360 @@ int test_client_close_without_channel(void) {
     return 1;
 }
 
+/* The nLockTime of a proposed close must be near the client's own chain tip,
+   and cannot be judged at all without one. */
+int test_client_close_locktime_bound(void) {
+    const uint32_t tip = 800000;
+    const uint32_t margin = CLIENT_CLOSE_LOCKTIME_MARGIN;
+
+    TEST_ASSERT(client_close_locktime_acceptable(0, 0), "no lock, no tip");
+    TEST_ASSERT(client_close_locktime_acceptable(0, tip), "no lock");
+    TEST_ASSERT(client_close_locktime_acceptable(tip, tip), "lock at the tip");
+    TEST_ASSERT(client_close_locktime_acceptable(tip - 1000, tip),
+                "lock below the tip");
+    TEST_ASSERT(client_close_locktime_acceptable(tip + margin, tip),
+                "lock at the margin");
+    TEST_ASSERT(!client_close_locktime_acceptable(tip + margin + 1, tip),
+                "lock one block past the margin");
+    TEST_ASSERT(!client_close_locktime_acceptable(tip + 100000, tip),
+                "lock far in the future");
+    TEST_ASSERT(!client_close_locktime_acceptable(tip, 0),
+                "a height cannot be judged without a tip");
+    TEST_ASSERT(!client_close_locktime_acceptable(1, 0),
+                "any height needs a tip");
+    TEST_ASSERT(!client_close_locktime_acceptable(500000000u, 499999999u),
+                "time-based lock");
+    TEST_ASSERT(!client_close_locktime_acceptable(0xFFFFFFFFu, 0xFFFFFFFFu),
+                "time-based lock, maximum value");
+
+    /* The ceremony applies the rule before revealing a nonce. */
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+    const uint64_t balance = 120000;
+    channel_t ch;
+    cs_channel(&ch, balance);
+    tx_output_t outs[2];
+    cs_output(&outs[0], CS_FUNDING - 1000 - balance, lsp_spk);
+    cs_output(&outs[1], balance, my_spk);
+
+    struct { uint32_t locktime, tip; int signs; } cases[] = {
+        { tip + margin + 1, tip, 0 },   /* too far ahead */
+        { tip,              0,   0 },   /* client has no tip */
+        { 500000000u,       tip, 0 },   /* time-based */
+        { tip + margin,     tip, 1 },
+        { tip,              tip, 1 },
+        { 0,                0,   1 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        client_close_state_t cs;
+        client_close_state_init(&cs, NULL, f);
+        cs_lsp_msg_t msgs[1] = { cs_msg_propose(outs, 2, cases[i].locktime) };
+        int rc = -1;
+        uint8_t sent[CS_MAX_SENT];
+        size_t n_sent = 0;
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                                                &cs, cases[i].tip, msgs, 1,
+                                                &rc, sent, &n_sent), "run");
+        if (cases[i].signs) {
+            TEST_ASSERT(n_sent >= 1 && sent[0] == MSG_CLOSE_NONCE,
+                        "acceptable nLockTime: client takes part");
+            TEST_ASSERT(!cs.refused, "no refusal recorded");
+        } else {
+            TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                        "unacceptable nLockTime: refused, no nonce");
+            TEST_ASSERT(cs.refused, "refusal recorded");
+            TEST_ASSERT(!cs.signed_close, "nothing was signed");
+        }
+    }
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Once the client has released a partial signature for a close, the LSP may
+   complete that close whenever it likes.  The client remembers it: it signs
+   a later proposal only if that pays at least as much, and takes part in no
+   leaf or state advance of the factory. */
+int test_client_close_records_signed_close(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+
+    const uint64_t balance = 120000, generous = balance + 500;
+    channel_t ch;
+    cs_channel(&ch, balance);
+    tx_output_t pay_generous[2], pay_exact[2];
+    cs_output(&pay_generous[0], CS_FUNDING - 1000 - generous, lsp_spk);
+    cs_output(&pay_generous[1], generous, my_spk);
+    cs_output(&pay_exact[0], CS_FUNDING - 1000 - balance, lsp_spk);
+    cs_output(&pay_exact[1], balance, my_spk);
+
+    client_close_state_t cs;
+    client_close_state_init(&cs, NULL, f);
+    TEST_ASSERT(!cs.signed_close, "nothing signed yet");
+    int rc = -1;
+    uint8_t sent[CS_MAX_SENT];
+    size_t n_sent = 0;
+
+    /* A refused proposal leaves no record. */
+    {
+        tx_output_t all_to_lsp;
+        cs_output(&all_to_lsp, CS_FUNDING - 1000, lsp_spk);
+        cs_lsp_msg_t msgs[1] = { cs_msg_propose(&all_to_lsp, 1, 0) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 1, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && cs.refused && !cs.signed_close,
+                    "refusal records no signed close");
+    }
+
+    /* The client signs, then the LSP reports that the close failed. */
+    {
+        cs_lsp_msg_t msgs[3] = { cs_msg_propose(pay_generous, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_error() };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 3, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(n_sent == 2 && sent[0] == MSG_CLOSE_NONCE &&
+                    sent[1] == MSG_CLOSE_PSIG, "client signed the close");
+        TEST_ASSERT(rc == 0 && !cs.refused, "ceremony failed, not refused");
+        TEST_ASSERT(cs.signed_close && cs.paid_sats == generous,
+                    "the signed close is on record with what it pays");
+        unsigned char zero[32] = {0};
+        TEST_ASSERT(memcmp(cs.sighash, zero, 32) != 0, "sighash on record");
+    }
+
+    /* A new proposal that covers the balance but pays less than the close
+       already signed is refused. */
+    {
+        cs_lsp_msg_t msgs[2] = { cs_msg_propose(pay_exact, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 2, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                    "lower-paying replacement refused, no nonce");
+        TEST_ASSERT(cs.refused && cs.paid_sats == generous,
+                    "record unchanged by the refusal");
+    }
+
+    /* A leaf or state advance arriving in the ceremony is refused. */
+    {
+        const uint8_t advance_types[3] = { MSG_LEAF_ADVANCE_PROPOSE,
+                                           MSG_STATE_ADVANCE_PROPOSE,
+                                           MSG_STATE_ADV_PROPOSE_INTENT };
+        for (int t = 0; t < 3; t++) {
+            cs_lsp_msg_t msgs[1] = { { advance_types[t], cJSON_CreateObject() } };
+            TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f,
+                            &ch, &cs, 0, msgs, 1, &rc, sent, &n_sent), "run");
+            TEST_ASSERT(rc == 0 && cs.refused && n_sent == 1 &&
+                        sent[0] == MSG_ERROR,
+                        "advance after a signed close is refused");
+        }
+        /* The same advance arriving between the nonce and the signature of a
+           re-proposed close. */
+        cs_lsp_msg_t msgs[2] = { cs_msg_propose(pay_generous, 2, 0),
+                                 { MSG_LEAF_ADVANCE_PROPOSE,
+                                   cJSON_CreateObject() } };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 2, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && cs.refused && n_sent == 2 &&
+                    sent[0] == MSG_CLOSE_NONCE && sent[1] == MSG_ERROR,
+                    "advance during a re-proposed close is refused");
+    }
+
+    /* A proposal paying at least as much is signed, and can complete. */
+    {
+        cs_lsp_msg_t msgs[3] = { cs_msg_propose(pay_generous, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_done() };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 3, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 1 && n_sent == 2 && sent[1] == MSG_CLOSE_PSIG,
+                    "equal-paying replacement signed and completed");
+        TEST_ASSERT(!cs.refused && cs.signed_close, "still on record");
+    }
+
+    /* Within one ceremony: the LSP re-proposes after the client signed, with
+       a lower payout.  The first round is signed, the second refused. */
+    {
+        client_close_state_t fresh;
+        client_close_state_init(&fresh, NULL, f);
+        cs_lsp_msg_t msgs[4] = { cs_msg_propose(pay_generous, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_propose(pay_exact, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &fresh, 0, msgs, 4, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 3 && sent[0] == MSG_CLOSE_NONCE &&
+                    sent[1] == MSG_CLOSE_PSIG && sent[2] == MSG_ERROR,
+                    "lower-paying re-proposal refused after signing");
+        TEST_ASSERT(fresh.refused && fresh.paid_sats == generous,
+                    "record keeps the close that was signed");
+    }
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The record of a signed close is written to the client's database before
+   the signature is sent, and a restarted client finds it there. */
+int test_client_close_record_survives_restart(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+    const uint64_t balance = 120000, generous = balance + 500;
+    channel_t ch;
+    cs_channel(&ch, balance);
+    tx_output_t pay_generous[2], pay_exact[2];
+    cs_output(&pay_generous[0], CS_FUNDING - 1000 - generous, lsp_spk);
+    cs_output(&pay_generous[1], generous, my_spk);
+    cs_output(&pay_exact[0], CS_FUNDING - 1000 - balance, lsp_spk);
+    cs_output(&pay_exact[1], balance, my_spk);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    int rc = -1;
+    uint8_t sent[CS_MAX_SENT];
+    size_t n_sent = 0;
+    int pass = 1;
+#define CS_CHECK(cond, msg) do { \
+        if (pass && !(cond)) { \
+            printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+            pass = 0; \
+        } \
+    } while (0)
+
+    /* First run: the client signs, the LSP reports failure. */
+    client_close_state_t cs;
+    client_close_state_init(&cs, &db, f);
+    CS_CHECK(!cs.signed_close, "no record before signing");
+    {
+        cs_lsp_msg_t msgs[3] = { cs_msg_propose(pay_generous, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_error() };
+        CS_CHECK(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                     &cs, 0, msgs, 3, &rc, sent, &n_sent), "run");
+        CS_CHECK(n_sent == 2 && sent[1] == MSG_CLOSE_PSIG, "client signed");
+    }
+
+    /* "Restart": a fresh state loaded from the same database. */
+    client_close_state_t reloaded;
+    client_close_state_init(&reloaded, &db, f);
+    CS_CHECK(reloaded.signed_close, "record found after restart");
+    CS_CHECK(reloaded.paid_sats == generous, "payout on record");
+    CS_CHECK(memcmp(reloaded.sighash, cs.sighash, 32) == 0, "sighash on record");
+
+    /* It is the record of this factory only. */
+    {
+        unsigned char saved_txid[32];
+        memcpy(saved_txid, f->funding_txid, 32);
+        memset(f->funding_txid, 0xBB, 32);
+        client_close_state_t other;
+        client_close_state_init(&other, &db, f);
+        CS_CHECK(!other.signed_close, "another factory has no record");
+        memcpy(f->funding_txid, saved_txid, 32);
+    }
+
+    /* A caller that passes no state gets the record through the database
+       set with client_set_persist: the lower-paying proposal is refused. */
+    client_set_persist(&db);
+    {
+        cs_lsp_msg_t msgs[2] = { cs_msg_propose(pay_exact, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        CS_CHECK(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                     NULL, 0, msgs, 2, &rc, sent, &n_sent), "run");
+        CS_CHECK(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                 "restarted client refuses a lower-paying close");
+    }
+
+    /* The advance handlers refuse on the strength of the record alone. */
+    for (int which = 0; which < 3; which++) {
+        int sv[2];
+        CS_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        wire_msg_t propose;
+        memset(&propose, 0, sizeof(propose));
+        propose.json = cJSON_CreateObject();
+        shutdown(sv[0], SHUT_WR);
+        int hrc;
+        if (which == 0) {
+            propose.msg_type = MSG_LEAF_ADVANCE_PROPOSE;
+            hrc = client_handle_leaf_advance(sv[1], ctx, &kps[1], f, 1, &propose);
+        } else if (which == 1) {
+            propose.msg_type = MSG_STATE_ADV_PROPOSE_INTENT;
+            hrc = client_handle_state_advance(sv[1], ctx, &kps[1], f, 1, &propose);
+        } else {
+            propose.msg_type = MSG_SUBFACTORY_PROPOSE_INTENT;
+            hrc = client_handle_subfactory_advance(sv[1], ctx, &kps[1], f, 1,
+                                                    &propose);
+        }
+        cJSON_Delete(propose.json);
+        close(sv[1]);
+        wire_msg_t reply;
+        memset(&reply, 0, sizeof(reply));
+        uint8_t got = 0;
+        if (wire_recv(sv[0], &reply)) {
+            got = reply.msg_type;
+            if (reply.json) cJSON_Delete(reply.json);
+        }
+        close(sv[0]);
+        CS_CHECK(hrc == 0 && got == MSG_ERROR,
+                 "advance of a factory with a signed close is refused");
+    }
+    client_set_persist(NULL);
+
+    /* A higher-paying close replaces the record. */
+    {
+        tx_output_t pay_more[2];
+        cs_output(&pay_more[0], CS_FUNDING - 1000 - generous - 100, lsp_spk);
+        cs_output(&pay_more[1], generous + 100, my_spk);
+        cs_lsp_msg_t msgs[3] = { cs_msg_propose(pay_more, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_done() };
+        CS_CHECK(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                     &reloaded, 0, msgs, 3, &rc, sent, &n_sent), "run");
+        CS_CHECK(rc == 1, "higher-paying close signed and completed");
+        client_close_state_t again;
+        client_close_state_init(&again, &db, f);
+        CS_CHECK(again.signed_close && again.paid_sats == generous + 100,
+                 "record updated to the close signed last");
+    }
+#undef CS_CHECK
+
+    persist_close(&db);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return pass;
+}
+
 /* Full ceremony: the LSP proposes each party's balance at its own script and
    every client co-signs. */
 int test_client_close_honest_ceremony(void) {
@@ -531,7 +953,7 @@ int test_client_close_honest_ceremony(void) {
             cs_channel(&ch, balances[c]);
             int ok = client_do_close_ceremony(sv[1], ctx, &kps[c + 1],
                                                &pks[c + 1], &lsp->factory,
-                                               CS_N, NULL, 0, &ch, 0);
+                                               CS_N, NULL, 0, &ch, NULL, 0);
             _exit(ok ? 0 : 1);
         }
         close(sv[1]);
@@ -990,6 +1412,12 @@ static int cs_run_realloc_ceremony(const int64_t *deltas, int *lsp_rc_out,
     }
     lsp->n_clients = CS_N - 1;
 
+    /* The LSP gives up at the first refusal and hangs up while the other
+       client may still be writing its own; neither side may die of SIGPIPE
+       (the client tool ignores it too).  Set before forking so the clients
+       inherit it. */
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
     pid_t pids[2];
     fflush(stdout);
     for (int c = 0; c < 2; c++) {
@@ -1022,7 +1450,6 @@ static int cs_run_realloc_ceremony(const int64_t *deltas, int *lsp_rc_out,
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
     mgr.bridge_fd = -1;
-    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
     *lsp_rc_out = lsp_realloc_leaf(&mgr, lsp, 0, amts, n);
 
     const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[0]];

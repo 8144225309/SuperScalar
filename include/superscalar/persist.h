@@ -316,6 +316,25 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
 /* Load channel core state (balances, commitment_number).
    Channel must already be initialized via channel_init() with the correct
    keys. This overwrites balances and commitment_number. */
+/* Client record of a cooperative close it has co-signed, keyed by the
+   factory's funding outpoint (funding_txid in internal byte order).
+   paid_sats is what the close pays to the client's own script; sighash is
+   the sighash of the close transaction.  One row per factory: saving again
+   replaces it.  Save returns 1 once the row is written. */
+int persist_save_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t paid_sats,
+                               const unsigned char sighash[32]);
+
+/* Load the record for a factory.  Returns 1 if one exists (outputs may be
+   NULL), 0 if the client has not signed a close of that factory. */
+int persist_load_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t *paid_sats_out,
+                               unsigned char sighash_out[32]);
+
 /* 1 if a channel is stored for the factory funded by this outpoint
    (funding_txid in internal byte order), 0 otherwise. */
 int persist_factory_has_channel(persist_t *p,

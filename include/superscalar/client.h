@@ -89,6 +89,64 @@ int client_close_script(const secp256k1_context *ctx,
                          const secp256k1_pubkey *my_pubkey,
                          unsigned char *spk_out34);
 
+/* Total of the outputs carrying this client's own close script.  Returns 1
+   and writes the sum, 0 if the script cannot be derived or the sum
+   overflows. */
+int client_close_amount_to_client(const secp256k1_context *ctx,
+                                   const secp256k1_pubkey *my_pubkey,
+                                   const tx_output_t *outputs,
+                                   size_t n_outputs,
+                                   uint64_t *paid_sats_out);
+
+/* How many blocks the nLockTime of a proposed close may lie above the
+   client's own chain tip.  The LSP sets nLockTime to its current height; the
+   margin only has to absorb the client's view of the chain lagging by a few
+   blocks.  Six blocks is about an hour. */
+#define CLIENT_CLOSE_LOCKTIME_MARGIN 6
+
+/* Decide whether the nLockTime of a proposed close is acceptable.  A signed
+   close that cannot confirm yet is a transaction the LSP can hold back and
+   use later, so the lock must be near the present:
+     - 0 imposes no lock and is always acceptable;
+     - a height is acceptable only if the client knows its chain tip
+       (tip_height != 0) and the height is at most
+       tip_height + CLIENT_CLOSE_LOCKTIME_MARGIN;
+     - a time-based lock (>= 500000000) is never acceptable.
+   Returns 1 if acceptable. */
+int client_close_locktime_acceptable(uint32_t locktime, uint32_t tip_height);
+
+/* Source of the client's own chain tip height, used to bound the nLockTime
+   of close proposals.  fn returns the height, or 0 if it is not known.
+   With no source set the tip is unknown. */
+typedef uint32_t (*client_chain_tip_fn)(void *ctx);
+void client_set_chain_tip_source(client_chain_tip_fn fn, void *ctx);
+uint32_t client_chain_tip(void);
+
+/* What the client knows about cooperative closes it has signed for one
+   factory.
+
+   Once the client has released a partial signature for a close, the LSP may
+   be able to complete and broadcast that close at any later time, whatever
+   it reports back.  From that moment the factory is frozen for this client:
+   it takes part in no further channel update and no leaf or state advance of
+   that factory, and signs only another close that pays it at least
+   paid_sats.  A unilateral exit stays possible.
+
+   With db set the record is written before the partial signature is sent
+   and client_close_state_init reads it back, so it survives a restart. */
+typedef struct {
+    int signed_close;           /* 1 once a partial signature was released */
+    uint64_t paid_sats;         /* what that close pays this client's script */
+    unsigned char sighash[32];  /* sighash of that close transaction */
+    int refused;                /* set by client_do_close_ceremony: 1 if it
+                                   ended by refusing what the LSP proposed */
+    persist_t *db;              /* where the record is kept, or NULL */
+} client_close_state_t;
+
+/* Reset cs and load the record for factory from db (db may be NULL). */
+void client_close_state_init(client_close_state_t *cs, persist_t *db,
+                              const factory_t *factory);
+
 /* Decide whether a cooperative-close proposal is safe for this client to sign.
    Returns 1 only if
      - no HTLC is pending on ch,
@@ -115,9 +173,17 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
    script (client_close_script) and refuses while any HTLC is pending; see
    client_close_outputs_acceptable.  Pass NULL only when the client never
    opened a channel in this factory and so holds no balance; with NULL the
-   client still refuses if the database set with client_set_persist holds a
-   channel for this factory.
-   Returns 1 on success, 0 on refusal or failure. */
+   client still refuses if its database holds a channel for this factory.
+   current_height is the client's own chain tip (0 if unknown); the proposal's
+   nLockTime must satisfy client_close_locktime_acceptable against it.
+   cs is the client's close state for this factory.  The ceremony records
+   the close in it (and in cs->db) before sending the partial signature;
+   once cs->signed_close is set it refuses leaf and state advances that
+   arrive during the ceremony and any proposal paying the client less than
+   cs->paid_sats.  Pass NULL to use a state private to this call, loaded
+   from and saved to the database set with client_set_persist.
+   Returns 1 on success, 0 on refusal or failure; cs->refused tells the two
+   apart. */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
                                const secp256k1_pubkey *my_pubkey,
@@ -126,6 +192,7 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const wire_msg_t *initial_msg,
                                uint32_t current_height,
                                const channel_t *ch,
+                               client_close_state_t *cs,
                                int repropose_depth);
 
 /* Reconnect to LSP using persisted state from SQLite.
@@ -291,9 +358,11 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const wire_msg_t *propose_msg);
 
 /* Set (or clear) the persistence handle used for the PS double-spend
-   defense and for the checks the close ceremony makes against the client's
-   own records. Pass NULL to disable. Must be called before any PS advance
-   or close happens; safe to call once at startup. */
+   defense, for the checks the close ceremony makes against the client's
+   own records, and for refusing leaf and state advances of a factory whose
+   close this client has already signed. Pass NULL to disable. Must be
+   called before any PS advance or close happens; safe to call once at
+   startup. */
 void client_set_persist(persist_t *persist);
 
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
