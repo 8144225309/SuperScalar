@@ -58,7 +58,7 @@ int test_prop_hex_roundtrip(void) {
     unsigned int seed = 42;
     for (int trial = 0; trial < 1000; trial++) {
         size_t len = 1 + (rand_r(&seed) % 256);
-        unsigned char data[256], decoded[256];
+        unsigned char data[256] = {0}, decoded[256];
         char hex[513];
         for (size_t i = 0; i < len; i++)
             data[i] = (unsigned char)(rand_r(&seed) & 0xff);
@@ -692,6 +692,7 @@ int test_prop_rebalance_conservation(void) {
        but we CAN verify the threshold detection and balance math. */
     unsigned int seed = 77;
     lsp_channel_entry_t *entries_buf = calloc(4, sizeof(lsp_channel_entry_t));
+    if (!entries_buf) return 0;
 
     for (int trial = 0; trial < 100; trial++) {
         lsp_channel_mgr_t mgr;
@@ -826,6 +827,7 @@ int test_prop_keysend_bridge_e2e(void) {
 
     unsigned int seed = 33;
     invoice_entry_t *invoices_buf = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    if (!invoices_buf) return 0;
     for (int trial = 0; trial < 50; trial++) {
         unsigned char preimage[32], hash[32];
         for (int i = 0; i < 32; i++)
@@ -1072,6 +1074,7 @@ int test_prop_keysend_invoice_collision(void) {
 
     unsigned int seed = 66;
     invoice_entry_t *invoices_buf = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    if (!invoices_buf) return 0;
 
     for (int trial = 0; trial < 100; trial++) {
         lsp_channel_mgr_t mgr;

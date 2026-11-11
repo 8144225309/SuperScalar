@@ -1498,6 +1498,7 @@ int test_ln_dispatch_forward_fail_sends_malformed(void)
     d.ctx = ctx; d.pmgr = &pmgr;
     size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
     unsigned char *msg = calloc(1, msg_len);
+    ASSERT(msg, "alloc msg");
     msg[0] = 0x00; msg[1] = 0x80;
     msg[2+32+8+6] = 0x27; msg[2+32+8+7] = 0x10;
     int r = ln_dispatch_process_msg(&d, 0, msg, msg_len);
@@ -1525,6 +1526,7 @@ int test_ln_dispatch_forward_fail_null_pmgr(void)
     d.ctx = ctx; d.pmgr = NULL;
     size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
     unsigned char *msg = calloc(1, msg_len);
+    ASSERT(msg, "alloc msg");
     msg[0] = 0x00; msg[1] = 0x80;
     msg[2+32+8+7] = 0x01;
     int r = ln_dispatch_process_msg(&d, 0, msg, msg_len);

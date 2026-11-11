@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
@@ -265,11 +266,67 @@ int lsp_wellknown_fetch_http(const char *domain,
                                          pubkey_hex_out, pubkey_cap);
 }
 
+/* --- Client: which key may authenticate the LSP --- */
+
+lsp_pin_result_t lsp_wellknown_select_pin(const char *configured_pubkey_hex,
+                                           const char *advertised_pubkey_hex,
+                                           const char **pin_out) {
+    if (pin_out) *pin_out = NULL;
+
+    if (!configured_pubkey_hex) return LSP_PIN_NONE;
+
+    if (advertised_pubkey_hex &&
+        strcasecmp(configured_pubkey_hex, advertised_pubkey_hex) != 0)
+        return LSP_PIN_MISMATCH;
+
+    if (pin_out) *pin_out = configured_pubkey_hex;
+    return LSP_PIN_CONFIGURED;
+}
+
+lsp_endpoint_status_t lsp_wellknown_resolve_endpoint(
+    const char *domain, uint16_t http_port,
+    const char *host, int port,
+    const char *configured_pubkey_hex, int pin_required,
+    lsp_endpoint_t *out) {
+    if (!out) return LSP_ENDPOINT_FETCH_FAILED;
+    memset(out, 0, sizeof(*out));
+
+    const char *advertised = NULL;
+    if (domain) {
+        uint16_t wk_port = 0;
+        if (!lsp_wellknown_fetch_http_port(domain, http_port,
+                                           out->host, sizeof(out->host),
+                                           &wk_port,
+                                           out->advertised_pubkey_hex,
+                                           sizeof(out->advertised_pubkey_hex))) {
+            out->host[0] = '\0';
+            out->advertised_pubkey_hex[0] = '\0';
+            return LSP_ENDPOINT_FETCH_FAILED;
+        }
+        out->port = (int)wk_port;
+        advertised = out->advertised_pubkey_hex;
+    } else {
+        snprintf(out->host, sizeof(out->host), "%s", host ? host : "");
+        out->port = port;
+    }
+
+    if (lsp_wellknown_select_pin(configured_pubkey_hex, advertised,
+                                 &out->pinned_pubkey_hex) == LSP_PIN_MISMATCH)
+        return LSP_ENDPOINT_PIN_MISMATCH;
+
+    if (pin_required && !out->pinned_pubkey_hex)
+        return LSP_ENDPOINT_PIN_REQUIRED;
+
+    return LSP_ENDPOINT_OK;
+}
+
 /* --- Background server (fork-based) --- */
 
-int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
-                              uint16_t tcp_port) {
-    if (!cfg || tcp_port == 0) return 0;
+/* tcp_port 0 lets the operating system choose; the port actually bound is
+   written to *bound_port_out when that is not NULL. */
+static int serve_fork(const lsp_wellknown_cfg_t *cfg, uint16_t tcp_port,
+                      uint16_t *bound_port_out) {
+    if (!cfg) return 0;
 
     /* Create TCP server socket before forking */
     int srv = socket(AF_INET6, SOCK_STREAM, 0);
@@ -310,6 +367,18 @@ int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
         return 0;
     }
 
+    if (bound_port_out) {
+        struct sockaddr_storage bound;
+        socklen_t bound_len = sizeof(bound);
+        if (getsockname(srv, (struct sockaddr *)&bound, &bound_len) != 0) {
+            close(srv);
+            return 0;
+        }
+        *bound_port_out = ntohs(bound.ss_family == AF_INET6
+            ? ((struct sockaddr_in6 *)&bound)->sin6_port
+            : ((struct sockaddr_in *)&bound)->sin_port);
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         close(srv);
@@ -319,7 +388,7 @@ int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
     if (pid > 0) {
         /* Parent: close server fd, continue */
         close(srv);
-        return 1;
+        return (int)pid;
     }
 
     /* Child: accept connections and serve .well-known/lsps.json */
@@ -342,4 +411,16 @@ int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
     }
     close(srv);
     _exit(0);
+}
+
+int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
+                              uint16_t tcp_port) {
+    if (tcp_port == 0) return 0;
+    return serve_fork(cfg, tcp_port, NULL);
+}
+
+int lsp_wellknown_serve_fork_any_port(const lsp_wellknown_cfg_t *cfg,
+                                       uint16_t *tcp_port_out) {
+    if (!tcp_port_out) return 0;
+    return serve_fork(cfg, 0, tcp_port_out);
 }
