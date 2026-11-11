@@ -2494,16 +2494,18 @@ int main(int argc, char *argv[]) {
     {
         extern char **environ;
         char gate_err[512];
-        if (!network_gate_risk_accepted(network, accept_risk,
-                                        gate_err, sizeof(gate_err)) ||
-            !network_gate_cmdline_seckey(network, seckey_hex != NULL,
-                                         gate_err, sizeof(gate_err)) ||
-            !network_gate_no_test_scaffolding(network, argc, argv, environ,
-                                              gate_err, sizeof(gate_err)) ||
-            !network_gate_db(network, db_path != NULL,
-                             gate_err, sizeof(gate_err)) ||
-            !network_gate_watchtower_db(network, wt_db_path != NULL,
-                                        gate_err, sizeof(gate_err))) {
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_LSP,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .have_wt_db = wt_db_path != NULL,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
             fputs(gate_err, stderr);
             return 1;
         }

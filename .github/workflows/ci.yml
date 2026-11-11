@@ -76,6 +76,12 @@ jobs:
           grep -q "refusing to start without --lsp-pubkey" /tmp/br.out || {
             echo "FAIL: missing secure-by-default refusal"; cat /tmp/br.out; exit 1; }
           echo "OK: bridge refuses unauthenticated NN startup by default"
+      - name: Daemon start-up gates
+        # Each daemon must refuse an unsafe mainnet start (either spelling of
+        # the chain name), an unknown chain and an unpinned LSP before it does
+        # anything.  No node is needed: every case exits at the start-up check.
+        if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
+        run: tools/test_startup_gates.sh build
 
   arm64-build-test:
     runs-on: ubuntu-latest

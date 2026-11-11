@@ -170,3 +170,96 @@ int test_network_mainnet_step_floor_alias(void) {
                     "no step floor on test chains");
     return 1;
 }
+
+/* The start-up check each daemon runs, with the gates that belong to its
+   role.  A start that satisfies every gate passes; taking any one thing away
+   is refused, under either spelling of mainnet. */
+int test_network_startup_gates_per_role(void) {
+    char err[512];
+    char *const clean_argv[] = { "daemon", "--db", "x.db", NULL };
+    char *const cheat_argv[] = { "daemon", "--cheat-daemon", NULL };
+    char *const clean_env[]  = { "PATH=/usr/bin", NULL };
+    char *const cheat_env[]  = { "SS_CHEAT_DUST_RACE=1", NULL };
+
+    static const network_role_t roles[] = {
+        NETWORK_ROLE_LSP, NETWORK_ROLE_CLIENT, NETWORK_ROLE_WATCHTOWER
+    };
+
+    for (size_t r = 0; r < sizeof(roles) / sizeof(roles[0]); r++) {
+        network_role_t role = roles[r];
+        int holds_key = role != NETWORK_ROLE_WATCHTOWER;
+
+        for (size_t i = 0; i < N_MAINNET; i++) {
+            const network_startup_t good = {
+                .role = role, .network = MAINNET_NAMES[i], .accept_risk = 1,
+                .seckey_on_cmdline = 0, .have_db = 1, .have_wt_db = 1,
+                .argc = 3, .argv = clean_argv, .envp = clean_env,
+            };
+            TEST_ASSERT(network_startup_gates(&good, err, sizeof(err)),
+                        "a complete mainnet start passes");
+
+            network_startup_t s = good;
+            s.accept_risk = 0;
+            err[0] = '\0';
+            TEST_ASSERT(!network_startup_gates(&s, err, sizeof(err)),
+                        "every role needs the risk acknowledgement");
+            TEST_ASSERT(strstr(err, "--i-accept-the-risk") != NULL, "risk message");
+
+            s = good;
+            s.argc = 2;
+            s.argv = cheat_argv;
+            TEST_ASSERT(!network_startup_gates(&s, err, sizeof(err)),
+                        "every role refuses cheat flags");
+            s = good;
+            s.envp = cheat_env;
+            TEST_ASSERT(!network_startup_gates(&s, err, sizeof(err)),
+                        "every role refuses cheat environment variables");
+
+            s = good;
+            s.seckey_on_cmdline = 1;
+            err[0] = '\0';
+            TEST_ASSERT(network_startup_gates(&s, err, sizeof(err)) == !holds_key,
+                        "LSP and client refuse --seckey on mainnet");
+            if (holds_key)
+                TEST_ASSERT(strstr(err, "--seckey") != NULL, "seckey message");
+
+            s = good;
+            s.have_db = 0;
+            TEST_ASSERT(network_startup_gates(&s, err, sizeof(err)) == !holds_key,
+                        "LSP and client need --db on mainnet");
+
+            s = good;
+            s.have_wt_db = 0;
+            TEST_ASSERT(network_startup_gates(&s, err, sizeof(err)) ==
+                            (role != NETWORK_ROLE_LSP),
+                        "the LSP needs --wt-db on mainnet");
+        }
+
+        /* Other chains: none of the gates apply. */
+        for (size_t i = 0; i < N_OTHER; i++) {
+            const network_startup_t bare = {
+                .role = role, .network = OTHER_NAMES[i], .seckey_on_cmdline = 1,
+                .argc = 2, .argv = cheat_argv, .envp = cheat_env,
+            };
+            TEST_ASSERT(network_startup_gates(&bare, err, sizeof(err)),
+                        "test chains pass without any of it");
+        }
+
+        /* A chain name that is not supported is refused for every role. */
+        static const char *const unknown[] = { "livenet", "Mainnet", "", NULL };
+        for (size_t i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+            const network_startup_t bad = {
+                .role = role, .network = unknown[i], .accept_risk = 1,
+                .have_db = 1, .have_wt_db = 1,
+                .argc = 3, .argv = clean_argv, .envp = clean_env,
+            };
+            err[0] = '\0';
+            TEST_ASSERT(!network_startup_gates(&bad, err, sizeof(err)),
+                        "unknown chain name is refused");
+            TEST_ASSERT(strstr(err, "unknown --network") != NULL, "unknown-network message");
+        }
+    }
+
+    TEST_ASSERT(!network_startup_gates(NULL, err, sizeof(err)), "NULL is refused");
+    return 1;
+}

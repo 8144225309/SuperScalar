@@ -106,10 +106,46 @@ lsp_pin_result_t lsp_wellknown_select_pin(const char *configured_pubkey_hex,
                                            const char *advertised_pubkey_hex,
                                            const char **pin_out);
 
+/* Outcome of lsp_wellknown_resolve_endpoint(). */
+typedef enum {
+    LSP_ENDPOINT_OK = 0,
+    LSP_ENDPOINT_FETCH_FAILED,   /* the well-known lookup failed */
+    LSP_ENDPOINT_PIN_MISMATCH,   /* advertised key differs from the operator's */
+    LSP_ENDPOINT_PIN_REQUIRED    /* a pinned key is required and none was configured */
+} lsp_endpoint_status_t;
+
+typedef struct {
+    char        host[256];
+    int         port;
+    const char *pinned_pubkey_hex;          /* the operator's key, or NULL */
+    char        advertised_pubkey_hex[128]; /* from the lookup; "" if none.
+                                               For display only. */
+} lsp_endpoint_t;
+
+/*
+ * Work out where the client connects and which key authenticates the LSP.
+ *
+ * domain (--lsp) may be NULL: then host and port are used as given.
+ * Otherwise the host and port come from the well-known endpoint served at
+ * domain:http_port.  configured_pubkey_hex (--lsp-pubkey) may be NULL.
+ * pin_required says whether connecting without a pinned key is refused.
+ *
+ * out->pinned_pubkey_hex is configured_pubkey_hex or NULL and nothing else:
+ * the advertised key is reported in out->advertised_pubkey_hex but never
+ * pinned, and it does not satisfy pin_required.  out is filled as far as the
+ * resolution got, also when the result is not LSP_ENDPOINT_OK.
+ */
+lsp_endpoint_status_t lsp_wellknown_resolve_endpoint(
+    const char *domain, uint16_t http_port,
+    const char *host, int port,
+    const char *configured_pubkey_hex, int pin_required,
+    lsp_endpoint_t *out);
+
 /*
  * Fork a background process that accepts HTTP connections on tcp_port and
- * serves the .well-known/lsps.json endpoint.  Returns 1 in the parent on
- * success, 0 on error.  The child runs indefinitely; the parent continues.
+ * serves the .well-known/lsps.json endpoint.  Returns the process id of the
+ * server (> 0) in the parent on success, 0 on error.  The child runs until it
+ * is killed; the parent continues.
  * Requires fork() (Linux/macOS).
  */
 int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,

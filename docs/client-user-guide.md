@@ -186,7 +186,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--seckey HEX` | **required** | Your 32-byte secret key (hex) |
+| `--seckey HEX` | **required** unless `--keyfile` | Your 32-byte secret key (hex). Refused on mainnet (visible in `ps` and shell history): use `--keyfile` there |
 | `--keyfile PATH` | none | Encrypted keyfile path (alternative to `--seckey`) |
 | `--passphrase PASS` | none | Keyfile passphrase |
 | `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |

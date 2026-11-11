@@ -98,3 +98,38 @@ int network_gate_watchtower_db(const char *network, int have_wt_db,
             "See docs/watchtower-trustless-schema.md for the model.\n");
     return 0;
 }
+
+int network_startup_gates(const network_startup_t *startup,
+                          char *err_buf, size_t err_buf_len) {
+    if (!startup) return 0;
+    const char *network = startup->network;
+
+    if (!network_canonical(network)) {
+        if (err_buf && err_buf_len)
+            snprintf(err_buf, err_buf_len,
+                "Error: unknown --network '%s' (expected regtest|testnet|"
+                "testnet4|signet|mainnet).\n", network ? network : "");
+        return 0;
+    }
+
+    int holds_key = startup->role != NETWORK_ROLE_WATCHTOWER;
+
+    if (!network_gate_risk_accepted(network, startup->accept_risk,
+                                    err_buf, err_buf_len))
+        return 0;
+    if (holds_key &&
+        !network_gate_cmdline_seckey(network, startup->seckey_on_cmdline,
+                                     err_buf, err_buf_len))
+        return 0;
+    if (!network_gate_no_test_scaffolding(network, startup->argc, startup->argv,
+                                          startup->envp, err_buf, err_buf_len))
+        return 0;
+    if (holds_key &&
+        !network_gate_db(network, startup->have_db, err_buf, err_buf_len))
+        return 0;
+    if (startup->role == NETWORK_ROLE_LSP &&
+        !network_gate_watchtower_db(network, startup->have_wt_db,
+                                    err_buf, err_buf_len))
+        return 0;
+    return 1;
+}

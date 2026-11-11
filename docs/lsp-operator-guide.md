@@ -308,6 +308,8 @@ For defense-in-depth, run `superscalar_watchtower` on a separate machine. It ope
   --rpcpassword YOUR_PASS
 ```
 
+On mainnet the watchtower, like the LSP and the client, starts only with `--i-accept-the-risk` and refuses `--cheat-*` / `--test-*` flags and `SS_CHEAT*`, `SS_KILL*` and `SUPERSCALAR_CRASH*` environment variables.
+
 The watchtower prints heartbeat messages and broadcasts the relevant pre-signed response automatically if a breach is detected. Because it holds no secrets and no keys, a compromised watchtower cannot construct any new transaction — verifiable with `nm` (see [`watchtower-trustless-schema.md`](watchtower-trustless-schema.md)). To fund CPFP fee-bumping of the anyone-can-spend P2A anchors under fee pressure, pass `--bump-wallet` (a wallet the bumper spends its own UTXOs from; the watchtower still signs nothing of the protocol).
 
 ### Watchtower flags

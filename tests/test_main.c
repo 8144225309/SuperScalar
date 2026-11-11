@@ -268,6 +268,7 @@ extern int test_lsps2_two_independent_entries(void);
 extern int test_wellknown_json_format(void);
 extern int test_client_bootstrap_from_domain(void);
 extern int test_wellknown_pubkey_never_pins(void);
+extern int test_client_endpoint_resolution(void);
 /* PR #17 Phase 3: BOLT #7 gossip */
 extern int test_gossip_node_announcement_sign_verify(void);
 extern int test_gossip_channel_announcement_fields(void);
@@ -1920,6 +1921,7 @@ extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
 extern int test_network_gate_db(void);
 extern int test_network_mainnet_step_floor_alias(void);
+extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
 extern int test_keyfile_wrong_passphrase_v2(void);
@@ -2252,6 +2254,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wellknown_http_serve);
     RUN_TEST(test_client_bootstrap_from_domain);
     RUN_TEST(test_wellknown_pubkey_never_pins);
+    RUN_TEST(test_client_endpoint_resolution);
 
     printf("\n=== PR #17 Phase 3: BOLT #7 Gossip ===\n");
     RUN_TEST(test_gossip_node_announcement_sign_verify);
@@ -3849,6 +3852,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_network_gate_no_test_scaffolding);
     RUN_TEST(test_network_gate_db);
     RUN_TEST(test_network_mainnet_step_floor_alias);
+    RUN_TEST(test_network_startup_gates_per_role);
 
     printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
     RUN_TEST(test_keyfile_v2_roundtrip);

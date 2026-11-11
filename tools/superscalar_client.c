@@ -3252,14 +3252,23 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
-    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement
-       and a database for persistent state. */
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding, and a
+       database for persistent state. */
     {
+        extern char **environ;
         char gate_err[512];
-        if (!network_gate_risk_accepted(network, accept_risk,
-                                        gate_err, sizeof(gate_err)) ||
-            !network_gate_db(network, db_path != NULL,
-                             gate_err, sizeof(gate_err))) {
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_CLIENT,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
             fputs(gate_err, stderr);
             return 1;
         }
@@ -3368,69 +3377,63 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Bootstrap from the well-known endpoint: it supplies --host and --port.
-       The response travels over plain HTTP, so the public key in it is not
-       proof of anything and never becomes the pinned key: only --lsp-pubkey
-       does.  With that key pinned, a forged response can at worst point the
-       client at a host that then fails the handshake. */
-    static char wk_host_buf[256];
-    static char wk_pubkey_buf[128];
-    if (lsp_domain) {
-        uint16_t wk_port = 0;
-        printf("Client: fetching /.well-known/lsps.json from %s ...\n",
-               lsp_domain);
-        if (!lsp_wellknown_fetch_http(lsp_domain,
-                                      wk_host_buf, sizeof(wk_host_buf),
-                                      &wk_port, wk_pubkey_buf,
-                                      sizeof(wk_pubkey_buf))) {
+    /* Where to connect, and which key authenticates the LSP.  With --lsp the
+       well-known endpoint supplies the host and port.  Its response travels
+       over plain HTTP, so the public key in it is not proof of anything and
+       never becomes the pinned key: only --lsp-pubkey does, and every network
+       except regtest requires it. */
+    static lsp_endpoint_t lsp_endpoint;
+    {
+        if (lsp_domain)
+            printf("Client: fetching /.well-known/lsps.json from %s ...\n",
+                   lsp_domain);
+        lsp_endpoint_status_t ep_status = lsp_wellknown_resolve_endpoint(
+            lsp_domain, 80, host, port, lsp_pubkey_hex,
+            strcmp(network, "regtest") != 0, &lsp_endpoint);
+
+        if (lsp_domain && ep_status != LSP_ENDPOINT_FETCH_FAILED) {
+            printf("Client: bootstrapped from %s -> %s:%d\n",
+                   lsp_domain, lsp_endpoint.host, lsp_endpoint.port);
+            if (lsp_endpoint.pinned_pubkey_hex)
+                printf("Client: advertised LSP pubkey matches --lsp-pubkey\n");
+            else if (ep_status != LSP_ENDPOINT_PIN_MISMATCH)
+                printf("Client: %s advertises LSP pubkey %s\n"
+                       "Client: that key was fetched over unauthenticated HTTP and is NOT trusted.\n"
+                       "Client: confirm it with the LSP operator out of band, then pass it\n"
+                       "Client: with --lsp-pubkey.\n",
+                       lsp_domain, lsp_endpoint.advertised_pubkey_hex);
+        }
+
+        switch (ep_status) {
+        case LSP_ENDPOINT_OK:
+            break;
+        case LSP_ENDPOINT_FETCH_FAILED:
             fprintf(stderr, "Client: failed to fetch well-known from %s\n",
                     lsp_domain);
-            memset(seckey, 0, 32);
-            report_close(&rpt);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        host = wk_host_buf;
-        port = (int)wk_port;
-        printf("Client: bootstrapped from %s -> %s:%d\n",
-               lsp_domain, wk_host_buf, wk_port);
-
-        const char *pin = NULL;
-        switch (lsp_wellknown_select_pin(lsp_pubkey_hex, wk_pubkey_buf, &pin)) {
-        case LSP_PIN_MISMATCH:
+            break;
+        case LSP_ENDPOINT_PIN_MISMATCH:
             fprintf(stderr,
                 "Error: --lsp-pubkey does not match the key advertised by %s.\n"
                 "  --lsp-pubkey: %s\n"
                 "  advertised:   %s\n"
                 "  Either the LSP has changed its key (confirm the new key with the\n"
                 "  operator out of band) or the response did not come from your LSP.\n",
-                lsp_domain, lsp_pubkey_hex, wk_pubkey_buf);
+                lsp_domain, lsp_pubkey_hex, lsp_endpoint.advertised_pubkey_hex);
+            break;
+        case LSP_ENDPOINT_PIN_REQUIRED:
+            fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                    "(prevents MITM attacks)\n");
+            break;
+        }
+        if (ep_status != LSP_ENDPOINT_OK) {
             memset(seckey, 0, 32);
             report_close(&rpt);
             secp256k1_context_destroy(ctx);
             return 1;
-        case LSP_PIN_CONFIGURED:
-            printf("Client: advertised LSP pubkey matches --lsp-pubkey\n");
-            break;
-        case LSP_PIN_NONE:
-            printf("Client: %s advertises LSP pubkey %s\n"
-                   "Client: that key was fetched over unauthenticated HTTP and is NOT trusted.\n"
-                   "Client: confirm it with the LSP operator out of band, then pass it\n"
-                   "Client: with --lsp-pubkey.\n",
-                   lsp_domain, wk_pubkey_buf);
-            break;
         }
-        lsp_pubkey_hex = pin;
-    }
-
-    /* Require --lsp-pubkey on non-regtest to prevent MITM */
-    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
-        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
-                "(prevents MITM attacks)\n");
-        memset(seckey, 0, 32);
-        report_close(&rpt);
-        secp256k1_context_destroy(ctx);
-        return 1;
+        host = lsp_endpoint.host;
+        port = lsp_endpoint.port;
+        lsp_pubkey_hex = lsp_endpoint.pinned_pubkey_hex;
     }
 
     /* NK authentication: pin LSP static pubkey if provided */

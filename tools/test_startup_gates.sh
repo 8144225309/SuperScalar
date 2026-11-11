@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Start-up refusals of the daemon binaries.
+#
+# Usage: tools/test_startup_gates.sh [BUILD_DIR]     (default: build)
+#
+# Runs superscalar_lsp, superscalar_client and superscalar_watchtower with
+# command lines that must be refused before the daemon does anything, and
+# checks the exit status and the message.  It covers what the unit tests of
+# network_startup_gates() cannot: that each binary passes its own flags to the
+# check and exits when it fails, for both spellings of mainnet.
+#
+# No bitcoind is needed and none is contacted: every case must exit at the
+# start-up check.  As a second line of defence every command points the RPC
+# at port 1, where nothing listens, and has a time limit.
+set -u
+
+B=${1:-build}
+LSP=$B/superscalar_lsp
+CLIENT=$B/superscalar_client
+WT=$B/superscalar_watchtower
+KEY=1111111111111111111111111111111111111111111111111111111111111111
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+fail=0
+n=0
+
+# expect_refusal "<text expected in the output>" command...
+expect_refusal() {
+    local want=$1; shift
+    n=$((n + 1))
+    local out rc
+    out=$(timeout -s KILL 30 "$@" --rpcport 1 2>&1)
+    rc=$?
+    if [ "$rc" -ne 1 ] || ! printf '%s' "$out" | grep -qF -- "$want"; then
+        echo "FAIL: expected exit 1 with \"$want\" from: $*"
+        echo "      exit status $rc; output:"
+        printf '%s\n' "$out" | head -5 | sed 's/^/      | /'
+        fail=1
+    fi
+}
+
+for bin in "$LSP" "$CLIENT" "$WT"; do
+    [ -x "$bin" ] || { echo "FAIL: $bin not found (build first)"; exit 1; }
+done
+
+for NET in mainnet bitcoin; do
+    # Risk acknowledgement: all three daemons.
+    expect_refusal "mainnet operation refused" "$LSP" --network "$NET"
+    expect_refusal "mainnet operation refused" "$CLIENT" --network "$NET" --keyfile "$TMP/none.key"
+    expect_refusal "mainnet operation refused" "$WT" --network "$NET" --wt-db "$TMP/wt.db"
+
+    # Secret key on the command line: LSP and client.
+    expect_refusal "--seckey is refused on mainnet" \
+        "$LSP" --network "$NET" --i-accept-the-risk --seckey "$KEY"
+    expect_refusal "--seckey is refused on mainnet" \
+        "$CLIENT" --network "$NET" --i-accept-the-risk --seckey "$KEY" --db "$TMP/c.db"
+
+    # Test scaffolding in the arguments and in the environment: all three.
+    expect_refusal "refused on mainnet" "$LSP" --network "$NET" --i-accept-the-risk --cheat-daemon
+    expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --cheat-daemon
+    expect_refusal "refused on mainnet" \
+        "$WT" --network "$NET" --i-accept-the-risk --wt-db "$TMP/wt.db" --test-flag
+    expect_refusal "refused on mainnet" \
+        env SS_CHEAT_DUST_RACE=1 "$LSP" --network "$NET" --i-accept-the-risk
+    expect_refusal "refused on mainnet" \
+        env SUPERSCALAR_CRASH_ALLOW=1 "$CLIENT" --network "$NET" --i-accept-the-risk
+    expect_refusal "refused on mainnet" \
+        env SS_KILL_AT=1 "$WT" --network "$NET" --i-accept-the-risk --wt-db "$TMP/wt.db"
+
+    # Persistent state: --db for LSP and client, --wt-db for the LSP.
+    expect_refusal "mainnet requires --db" "$LSP" --network "$NET" --i-accept-the-risk
+    expect_refusal "mainnet requires --db" \
+        "$CLIENT" --network "$NET" --i-accept-the-risk --keyfile "$TMP/none.key"
+    expect_refusal "mainnet requires --wt-db" \
+        "$LSP" --network "$NET" --i-accept-the-risk --db "$TMP/l.db"
+done
+
+# Chain names that are not supported.
+expect_refusal "unknown --network" "$LSP" --network livenet
+expect_refusal "unknown --network" "$CLIENT" --network livenet --seckey "$KEY"
+expect_refusal "unknown --network" "$WT" --network livenet --wt-db "$TMP/wt.db"
+
+# The client on a non-regtest chain needs a pinned LSP key.
+expect_refusal "--lsp-pubkey required" \
+    "$CLIENT" --network signet --seckey "$KEY" --rpcuser u --rpcpassword p
+
+# No case may have created a key or a database.
+if [ -n "$(ls -A "$TMP")" ]; then
+    echo "FAIL: a refused start-up created files: $(ls -A "$TMP" | tr '\n' ' ')"
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "start-up gates: FAILED"
+    exit 1
+fi
+echo "start-up gates: all $n refusals OK"

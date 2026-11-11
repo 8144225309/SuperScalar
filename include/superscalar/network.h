@@ -22,7 +22,41 @@ int network_is_mainnet(const char *network);
 const char *network_canonical(const char *network);
 
 /*
- * Mainnet start-up gates.  Each returns 1 if start-up may continue and 0 if
+ * Start-up check for a daemon: the one call each daemon makes with what it
+ * parsed from its command line.  It refuses a chain name that is not
+ * supported and applies every mainnet gate that belongs to the daemon's role:
+ *
+ *   LSP         risk acknowledgement, no --seckey, no test scaffolding,
+ *               --db, --wt-db
+ *   client      risk acknowledgement, no --seckey, no test scaffolding, --db
+ *   watchtower  risk acknowledgement, no test scaffolding
+ *
+ * Returns 1 if start-up may continue.  Returns 0 if it must be refused, with
+ * a message for the operator in err_buf.
+ */
+typedef enum {
+    NETWORK_ROLE_LSP = 0,
+    NETWORK_ROLE_CLIENT,
+    NETWORK_ROLE_WATCHTOWER
+} network_role_t;
+
+typedef struct {
+    network_role_t role;
+    const char *network;      /* --network, canonical or not */
+    int accept_risk;          /* --i-accept-the-risk given */
+    int seckey_on_cmdline;    /* --seckey given */
+    int have_db;              /* --db given */
+    int have_wt_db;           /* --wt-db given */
+    int argc;                 /* the daemon's own argc/argv */
+    char *const *argv;
+    char *const *envp;        /* its environment (NULL-terminated), or NULL */
+} network_startup_t;
+
+int network_startup_gates(const network_startup_t *startup,
+                          char *err_buf, size_t err_buf_len);
+
+/*
+ * The individual mainnet gates.  Each returns 1 if start-up may continue and 0 if
  * it must be refused, in which case a message for the operator is written to
  * err_buf.  All of them pass on every chain other than mainnet.
  */
