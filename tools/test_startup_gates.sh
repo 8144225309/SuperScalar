@@ -64,6 +64,7 @@ for NET in mainnet bitcoin; do
     # Test scaffolding in the arguments and in the environment: all three.
     expect_refusal "refused on mainnet" "$LSP" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --cheat-daemon
+    expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --test-allow-tree-advance
     expect_refusal "refused on mainnet" \
         "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db" --test-flag
     expect_refusal "refused on mainnet" \

@@ -151,7 +151,7 @@ done
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     CLIENT_SECKEY=$(printf "%064x" $((0x02 + i)))
-    "$CLIENT_BIN" \
+    "$CLIENT_BIN" --test-allow-tree-advance \
         --network regtest \
         --host 127.0.0.1 --port $LSP_PORT \
         --daemon \

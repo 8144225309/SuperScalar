@@ -1149,6 +1149,8 @@ extern int test_wire_path_bundle_no_poison_back_compat(void);
 extern int test_wire_subfactory_multi_input_helpers_round_trip(void);
 extern int test_wire_close_unsigned(void);
 extern int test_wire_distributed_signing(void);
+extern int test_lsp_factory_creation_from_fresh_lsp(void);
+extern int test_lsp_factory_creation_keeps_preset_profiles(void);
 extern int test_regtest_wire_factory(void);
 extern int test_regtest_wire_factory_arity1(void);
 extern int test_regtest_wire_factory_mixed_arity(void);
@@ -1962,6 +1964,9 @@ extern int test_conservation_balanced(void);
 extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
+extern int test_payment_leaves_leaf_untouched_arity_ps(void);
+extern int test_payment_leaves_leaf_untouched_arity1(void);
+extern int test_client_refuses_tree_advances(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
 
@@ -3215,6 +3220,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_subfactory_multi_input_helpers_round_trip);
     RUN_TEST(test_wire_close_unsigned);
     RUN_TEST(test_wire_distributed_signing);
+    RUN_TEST(test_lsp_factory_creation_from_fresh_lsp);
+    RUN_TEST(test_lsp_factory_creation_keeps_preset_profiles);
 
     printf("\n=== Channel Operations (Phase 10) ===\n");
     RUN_TEST(test_channel_msg_round_trip);
@@ -3957,6 +3964,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_violated);
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
+    RUN_TEST(test_payment_leaves_leaf_untouched_arity_ps);
+    RUN_TEST(test_payment_leaves_leaf_untouched_arity1);
+    RUN_TEST(test_client_refuses_tree_advances);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
 

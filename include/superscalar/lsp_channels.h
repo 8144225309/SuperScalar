@@ -854,14 +854,27 @@ typedef struct {
 int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    const rebalance_entry_t *entries, size_t n_entries);
 
-/* Advance one PS leaf via the production wire ceremony (PROPOSE->PSIG->DONE).
-   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
-int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
+/* Advance one leaf (arity-1 DW or PS) via the wire ceremony.
+   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip/refusal.
+
+   The advance replaces the transaction that funds the leaf's channel and does
+   not re-anchor the channel, so it is refused (no state change, nothing sent)
+   while an open channel is funded by the leaf, whatever its balances -- or by
+   any leaf of the factory when the advance would exhaust this leaf and roll
+   over into a whole-tree state advance.  allow_live_channel != 0 skips that
+   check; it is for harnesses that exercise the ceremony itself.
+   Payments never advance a leaf. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side,
+                                  int allow_live_channel);
 
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).
    On rollover, drives Tier B ceremony to re-sign every non-PS-leaf node
-   for the new epoch.  Returns 1 = ceremony complete, 0 = no rollover,
-   -1 = ceremony failed.  See src/lsp_channels.c for caller wiring. */
-int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+   for the new epoch.  A rollover replaces every leaf without re-anchoring
+   any channel, so the tick is refused (counter untouched) while any channel
+   of the factory is open, unless allow_live_channel != 0 (harnesses only).
+   Returns 1 = ceremony complete, 0 = no rollover,
+   -1 = refused or ceremony failed. */
+int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                           int allow_live_channel);
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */

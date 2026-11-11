@@ -193,7 +193,7 @@ echo "--- $N_CLIENTS client daemons ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     CLIENT_LOG="$TMPDIR/client_${i}.log"
     CLIENT_DB="$TMPDIR/client_${i}.db"
-    env $SS_ASAN_ENV "$CLIENT_BIN" \
+    env $SS_ASAN_ENV "$CLIENT_BIN" --test-allow-tree-advance \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --host 127.0.0.1 --port "$LSP_PORT" \
         --network regtest \
