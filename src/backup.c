@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -12,6 +15,18 @@ extern void hkdf_extract(unsigned char prk[32], const unsigned char *salt, size_
                           const unsigned char *ikm, size_t ikm_len);
 extern void hkdf_expand(unsigned char *okm, size_t okm_len, const unsigned char prk[32],
                          const unsigned char *info, size_t info_len);
+
+/* Tighten a keyfile or backup that is accessible to group or others to mode
+   0600, with a warning.  Best effort: a backup may sit on read-only media, and
+   being unable to change its mode must not stop a restore. */
+static void tighten_secret_file(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+        (void)secure_file_make_private(fd, path);
+    close(fd);
+}
 
 /* Read entire file into malloc'd buffer. Caller frees. Returns NULL on error. */
 static unsigned char *read_file(const char *path, size_t *len_out) {
@@ -87,6 +102,7 @@ int backup_create(const char *db_path, const char *keyfile_path,
     unsigned char *db_data = read_file(db_path, &db_len);
     if (!db_data) return 0;
 
+    tighten_secret_file(keyfile_path);
     unsigned char *kf_data = read_file(keyfile_path, &kf_len);
     if (!kf_data) { free(db_data); return 0; }
 
@@ -181,6 +197,7 @@ static unsigned char *backup_decrypt(const char *backup_path,
     if (!backup_path || !passphrase || !passphrase_len)
         return NULL;
 
+    tighten_secret_file(backup_path);
     size_t file_len = 0;
     unsigned char *file_data = read_file(backup_path, &file_len);
     if (!file_data) return NULL;

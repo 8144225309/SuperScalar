@@ -20,7 +20,9 @@
 int keyfile_save(const char *path, const unsigned char *seckey32,
                  const char *passphrase);
 
-/* Load secret key from encrypted file (auto-detects v1 or v2). */
+/* Load secret key from encrypted file (auto-detects v1 or v2).
+   A keyfile that is accessible to group or others is tightened to mode 0600
+   first, with a warning on stderr; if it cannot be tightened the load fails. */
 int keyfile_load(const char *path, unsigned char *seckey32_out,
                  const char *passphrase);
 

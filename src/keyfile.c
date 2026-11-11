@@ -7,6 +7,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -101,8 +104,24 @@ int keyfile_load(const char *path, unsigned char *seckey32_out,
                  const char *passphrase) {
     if (!path || !seckey32_out || !passphrase) return 0;
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+
+    /* The key must not be readable by anyone else.  A keyfile found with
+       group or world access is tightened to 0600 (with a warning); if that is
+       not possible the key is not used. */
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        !secure_file_make_private(fd, path)) {
+        close(fd);
+        return 0;
+    }
+
+    FILE *fp = fdopen(fd, "rb");
+    if (!fp) {
+        close(fd);
+        return 0;
+    }
 
     /* Read up to v2 size to detect format */
     unsigned char buf[KEYFILE_SIZE_V2];

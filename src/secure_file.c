@@ -165,3 +165,21 @@ int secure_file_write_atomic(const char *path, const unsigned char *data,
     if (!staged) return 0;
     return secure_file_commit(staged, path, replace);
 }
+
+int secure_file_make_private(int fd, const char *path) {
+    const char *name = path ? path : "(file)";
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    if ((st.st_mode & (S_IRWXG | S_IRWXO)) == 0) return 1;
+
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        fprintf(stderr, "WARNING - %s is group/world-accessible (mode 0%o) and "
+                "could not be changed to 0600.\n",
+                name, (unsigned)(st.st_mode & 0777));
+        return 0;
+    }
+    fprintf(stderr, "WARNING - %s was group/world-accessible (mode 0%o); "
+            "tightened to 0600. If this host is shared, treat its content as "
+            "exposed.\n", name, (unsigned)(st.st_mode & 0777));
+    return 1;
+}

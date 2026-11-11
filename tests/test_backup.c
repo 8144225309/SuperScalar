@@ -509,3 +509,43 @@ int test_backup_failed_write_reported(void) {
     remove(rest_kf);
     return 1;
 }
+
+/* A backup, and the keyfile a backup is made from, are tightened to 0600
+   when they are read. */
+int test_backup_read_tightens_mode(void) {
+    const char *db_path = "/tmp/test_bak_loose_db.sqlite";
+    const char *kf_path = "/tmp/test_bak_loose_kf.key";
+    const char *bak_path = "/tmp/test_bak_loose.bak";
+    const char *rest_db = "/tmp/test_bak_loose_rest_db.sqlite";
+    const char *rest_kf = "/tmp/test_bak_loose_rest_kf.key";
+
+    static const unsigned char db_data[] = "loose mode test database";
+    static const unsigned char kf_data[] = "loose mode test keyfile";
+    const unsigned char *pass = (const unsigned char *)"loose-pass";
+    size_t pass_len = strlen((const char *)pass);
+
+    remove(bak_path);
+    remove(rest_db);
+    remove(rest_kf);
+    TEST_ASSERT(write_test_file(db_path, db_data, sizeof(db_data) - 1), "write db");
+    TEST_ASSERT(write_test_file(kf_path, kf_data, sizeof(kf_data) - 1), "write kf");
+
+    TEST_ASSERT(chmod(kf_path, 0644) == 0, "loosen keyfile");
+    TEST_ASSERT(backup_create(db_path, kf_path, bak_path, pass, pass_len), "backup_create");
+    TEST_ASSERT(file_mode(kf_path) == 0600, "source keyfile tightened by backup_create");
+
+    TEST_ASSERT(chmod(bak_path, 0644) == 0, "loosen backup");
+    TEST_ASSERT(backup_verify(bak_path, pass, pass_len), "backup_verify");
+    TEST_ASSERT(file_mode(bak_path) == 0600, "backup tightened by backup_verify");
+
+    TEST_ASSERT(chmod(bak_path, 0666) == 0, "loosen backup");
+    TEST_ASSERT(backup_restore(bak_path, rest_db, rest_kf, pass, pass_len), "backup_restore");
+    TEST_ASSERT(file_mode(bak_path) == 0600, "backup tightened by backup_restore");
+
+    remove(db_path);
+    remove(kf_path);
+    remove(bak_path);
+    remove(rest_db);
+    remove(rest_kf);
+    return 1;
+}

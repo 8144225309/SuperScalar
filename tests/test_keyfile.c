@@ -563,3 +563,33 @@ int test_keyfile_symlink_path(void) {
     unlink(dangling);
     return 1;
 }
+
+/* A keyfile left group- or world-readable (written by an older build, or
+   copied carelessly) is tightened to 0600 when it is loaded. */
+int test_keyfile_load_tightens_mode(void) {
+    const char *path = "/tmp/test_keyfile_loose.key";
+    unlink(path);
+
+    unsigned char key[32], out[32];
+    memset(key, 0x51, 32);
+    TEST_ASSERT(keyfile_save(path, key, "pw"), "save");
+
+    static const int loose_modes[] = { 0644, 0640, 0666 };
+    for (size_t i = 0; i < sizeof(loose_modes) / sizeof(loose_modes[0]); i++) {
+        TEST_ASSERT(chmod(path, (mode_t)loose_modes[i]) == 0, "loosen");
+        TEST_ASSERT(keyfile_load(path, out, "pw"), "load");
+        TEST_ASSERT(memcmp(out, key, 32) == 0, "key loaded");
+        TEST_ASSERT_EQ(file_mode(path), 0600, "keyfile tightened on load");
+    }
+
+    /* Also when the passphrase is wrong: the file is exposed either way. */
+    TEST_ASSERT(chmod(path, 0644) == 0, "loosen");
+    TEST_ASSERT(!keyfile_load(path, out, "wrong"), "wrong passphrase");
+    TEST_ASSERT_EQ(file_mode(path), 0600, "keyfile tightened on a failed load");
+
+    /* Only a regular file is a keyfile. */
+    TEST_ASSERT(!keyfile_load("/tmp", out, "pw"), "a directory is not loaded");
+
+    unlink(path);
+    return 1;
+}

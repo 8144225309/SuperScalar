@@ -1,5 +1,6 @@
 #include "superscalar/secure_file.h"
 #include <dirent.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -234,5 +235,35 @@ int test_secure_file_removes_stale_temporaries(void) {
     TEST_ASSERT(holds(lookalike, OLD_DATA, OLD_LEN), "differently named file kept");
     TEST_ASSERT(holds(unrelated, OLD_DATA, OLD_LEN), "unrelated file kept");
     TEST_ASSERT(dir_entries() == 4, "destination plus the three kept files");
+    return fresh_dir() && rmdir(SF_DIR) == 0;
+}
+
+/* An open file that others can access is tightened to 0600; one that is
+   already owner-only is left alone. */
+int test_secure_file_make_private(void) {
+    const char *path = SF_DIR "/file";
+    TEST_ASSERT(fresh_dir(), "scratch dir");
+    TEST_ASSERT(put(path, OLD_DATA, OLD_LEN), "file");
+
+    static const int loose_modes[] = { 0644, 0640, 0604, 0660, 0666, 0755 };
+    for (size_t i = 0; i < sizeof(loose_modes) / sizeof(loose_modes[0]); i++) {
+        TEST_ASSERT(chmod(path, (mode_t)loose_modes[i]) == 0, "loosen");
+        int fd = open(path, O_RDONLY);
+        TEST_ASSERT(fd >= 0, "open");
+        int result = secure_file_make_private(fd, path);
+        close(fd);
+        TEST_ASSERT(result == 1, "tightening succeeds");
+        TEST_ASSERT(file_mode(path) == 0600, "mode is 0600 afterwards");
+    }
+
+    TEST_ASSERT(chmod(path, 0400) == 0, "owner read-only");
+    int fd = open(path, O_RDONLY);
+    TEST_ASSERT(fd >= 0, "open");
+    TEST_ASSERT(secure_file_make_private(fd, path) == 1, "already private");
+    close(fd);
+    TEST_ASSERT(file_mode(path) == 0400, "an owner-only mode is not changed");
+
+    TEST_ASSERT(secure_file_make_private(-1, path) == 0, "bad descriptor is an error");
+    TEST_ASSERT(holds(path, OLD_DATA, OLD_LEN), "content untouched");
     return fresh_dir() && rmdir(SF_DIR) == 0;
 }

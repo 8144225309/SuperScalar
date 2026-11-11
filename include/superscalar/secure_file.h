@@ -47,4 +47,11 @@ char *secure_file_stage(const char *path, const unsigned char *data, size_t len)
 int secure_file_commit(char *staged, const char *path, int replace);
 void secure_file_discard(char *staged);
 
+/* Make an open file owner-only.  If the file is accessible to group or others
+   it is changed to mode 0600 and a warning naming path is printed, since its
+   content may already have been read by others.
+   Returns 1 if the file is owner-only on return, 0 if it is not (the mode
+   could not be read or changed). */
+int secure_file_make_private(int fd, const char *path);
+
 #endif /* SUPERSCALAR_SECURE_FILE_H */
