@@ -17,8 +17,19 @@
 #                      commitment, which requires that the settled payment
 #                      left the leaf transaction funding their channels
 #                      unchanged.
+#   scenario "rotate": client 1 pays client 2, then the factory reaches the
+#                      end of its (short) active period and the LSP rotates
+#                      it.  Nobody transacts in the new factory.  Every
+#                      client must hold a signed commitment 0 for its channel
+#                      in the NEW factory, carrying its balance, and exit
+#                      with it.
+#   scenario "reconnect": client 4 is restarted right after channel open,
+#                      then pays and is paid.  Both payments must succeed and
+#                      the client must stay up (commitment 0 took nonce index
+#                      0 on both sides; the pools are exchanged afresh on
+#                      reconnect).  No exit is attempted in this scenario.
 #
-# Checked in both scenarios, for all four clients:
+# Checked in the exit scenarios, for all four clients:
 #   - a signed commitment is in the client database before the kill, and for a
 #     client that never transacted it is commitment number 0;
 #   - the commitment confirms and spends the client's channel funding output;
@@ -28,21 +39,26 @@
 #     one of the four commitments, and the factory funding amount equals the
 #     unspent outputs plus the fees paid plus anchors consumed by fee bumps.
 #
-# The test starts its own bitcoind (regtest, private datadir, own RPC port)
-# with minrelaytxfee and blockmintxfee lowered to 0.5 sat/vB: a commitment
-# transaction's fee is sized from an estimated weight and can come out just
-# under 1 sat/vB at the 1000 sat/kvB rate used here, which a node with the
-# default relay floor would refuse.
+# RELAY FEE.  The test starts its own bitcoind (regtest, private datadir, own
+# RPC port) with minrelaytxfee and blockmintxfee lowered to 0.5 sat/vB.  This
+# matters: a commitment transaction pays a fixed 154 sat and is about 167 vB,
+# which is BELOW the default 1 sat/vB minimum relay fee.  Under default relay
+# policy an idle client's commitment is therefore not relayed on its own; it
+# can only confirm together with a fee-paying child that spends its anchor.
+# Giving the exit path that child (and sizing the tree's fees) is a separate
+# change to the tree and commitment fees; it is not part of what this test
+# covers, and this test would fail on a node with the default relay floor.
 #
 # Usage: bash tools/test_regtest_idle_client_exit.sh [BUILD_DIR]
-# Env:   SCENARIOS ("idle mixed")  RPCPORT (18543)  PORT (29961)  KEEP (0)
+# Env:   SCENARIOS ("idle mixed rotate reconnect")  RPCPORT (18543)
+#        PORT (29961)  KEEP (0)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${1:-$(dirname "$SCRIPT_DIR")/build}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
-SCENARIOS="${SCENARIOS:-idle mixed}"
+SCENARIOS="${SCENARIOS:-idle mixed rotate reconnect}"
 RPCPORT="${RPCPORT:-18543}"
 PORT="${PORT:-29961}"
 KEEP="${KEEP:-0}"
@@ -68,7 +84,18 @@ MINER_PID=""; PIDS=()
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 stop_miner(){ [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null; MINER_PID=""; }
-kill_ss(){ stop_miner; for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; PIDS=(); sleep 2; }
+kill_ss(){ stop_miner; for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; PIDS=(); { exec 9>&-; } 2>/dev/null; sleep 2; }
+# cli_pay <lsp log> <from> <to> <sats>: payment through the LSP's --cli (0-based client indexes)
+cli_pay(){
+    local before; before=$(grep -c "CLI: pay succeeded" "$1")
+    echo "pay $2 $3 $4" >&9
+    for _ in $(seq 1 60); do
+        sleep 1
+        [ "$(grep -c "CLI: pay succeeded" "$1")" -gt "$before" ] && return 0
+    done
+    return 1
+}
+bal_of(){ sqlite3 "file:$1?mode=ro" "SELECT local_amount FROM channels LIMIT 1;" 2>/dev/null; }
 cleanup(){
     kill_ss
     "${BCLI[@]}" stop >/dev/null 2>&1
@@ -103,15 +130,29 @@ run_scenario(){
     local SC=$1 P=$2 D="$TMP/$1"
     mkdir -p "$D"
     echo
-    echo "=== scenario '$SC': LSP + $N clients, $([ "$SC" = idle ] && echo "no payments" || echo "client 1 pays client 2, clients 3 and 4 idle") ==="
+    case "$SC" in
+        idle)      echo "=== scenario 'idle': LSP + $N clients, no payments ===" ;;
+        mixed)     echo "=== scenario 'mixed': LSP + $N clients, client 1 pays client 2, clients 3 and 4 idle ===" ;;
+        rotate)    echo "=== scenario 'rotate': LSP + $N clients, one payment, factory rotation, then exit from the new factory ===" ;;
+        reconnect) echo "=== scenario 'reconnect': LSP + $N clients, client 4 restarted after open, then payments ===" ;;
+        *)         echo "unknown scenario '$SC'"; return 1 ;;
+    esac
     local H0; H0=$("${BCLI[@]}" getblockcount)
+    local ACTIVE=3000
+    [ "$SC" = rotate ] && ACTIVE=45
     local LSPARGS=(--network regtest --port "$P" --clients $N --amount $AMOUNT
-        --active-blocks 3000 --dying-blocks 300 --cltv-timeout $((H0 + 3500))
+        --active-blocks $ACTIVE --dying-blocks 300 --cltv-timeout $((H0 + 3500))
         --step-blocks 5 --states-per-layer 2 --fee-rate $FEE --lsp-balance-pct 50
         --confirm-timeout 600 --seckey "$LSP_SECKEY" "${RPC[@]}" --wallet $WALLET
         --db "$D/lsp.db" --daemon)
     [ "$SC" = mixed ] && LSPARGS+=(--payments 1)
-    "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
+    if [ "$SC" = rotate ] || [ "$SC" = reconnect ]; then
+        LSPARGS+=(--cli)
+        mkfifo "$D/cli.fifo"; exec 9<>"$D/cli.fifo"
+        "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 <&9 &
+    else
+        "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
+    fi
     LSP_PID=$!; PIDS+=($LSP_PID)
     wait_log "listening" "$D/lsp.log" 60 "LSP to listen" || { tail -20 "$D/lsp.log"; return 1; }
 
@@ -157,7 +198,7 @@ run_scenario(){
 
     # A client restarted before its first payment keeps its commitment 0.
     local restart_ok=1 before after
-    if [ "$SC" = idle ] && [ "$have" -eq $N ]; then
+    if { [ "$SC" = idle ] || [ "$SC" = reconnect ]; } && [ "$have" -eq $N ]; then
         before=$(sqlite3 "file:$D/c4.db?mode=ro" "SELECT commitment_number || ':' || signed_tx_hex FROM signed_commitments;" 2>/dev/null)
         kill -9 "${CPID[4]}" 2>/dev/null; sleep 1
         start_client 4
@@ -170,6 +211,63 @@ run_scenario(){
         else
             echo "  ok   client 4 restarted and reconnected from its database; its commitment 0 is unchanged"
         fi
+    fi
+
+    if [ "$SC" = reconnect ]; then
+        local ok=$restart_ok base b4
+        [ "$have" -eq $N ] || ok=0
+        base=$(bal_of "$D/c3.db")
+        sleep 3
+        if cli_pay "$D/lsp.log" 3 0 5000; then echo "  ok   payment of 5000 sat from the restarted client 4 to client 1 succeeded"
+        else red "  CHECK FAIL payment from the restarted client 4 did not succeed"; ok=0; fi
+        if cli_pay "$D/lsp.log" 0 3 2000; then echo "  ok   payment of 2000 sat from client 1 to the restarted client 4 succeeded"
+        else red "  CHECK FAIL payment to the restarted client 4 did not succeed"; ok=0; fi
+        sleep 4
+        if ! kill -0 "${CPID[4]}" 2>/dev/null; then red "  CHECK FAIL client 4 is no longer running"; ok=0; fi
+        if grep -qE "no retrievable committed point|INVALID LSP revocation|verification/aggregation failed|halting daemon loop" "$D/c4.log"; then
+            red "  CHECK FAIL client 4 rejected a signature or revocation after its restart:"
+            grep -E "no retrievable committed point|INVALID LSP revocation|verification/aggregation failed|halting daemon loop" "$D/c4.log" | head -3 | sed 's/^/    /'
+            ok=0
+        fi
+        b4=$(bal_of "$D/c4.db")
+        if [ -n "$base" ] && [ "${b4:-0}" -eq $((base - 3000)) ]; then echo "  ok   client 4 balance $b4 sat = $base - 5000 + 2000"
+        else red "  CHECK FAIL client 4 balance ${b4:-none} sat, expected $((base - 3000))"; ok=0; fi
+        kill_ss
+        [ "$ok" = 1 ]; return $?
+    fi
+
+    local PRE_BAL=""
+    if [ "$SC" = rotate ]; then
+        sleep 3
+        if cli_pay "$D/lsp.log" 0 1 5000; then echo "  payment of 5000 sat from client 1 to client 2 settled in the first factory"
+        else red "  CHECK FAIL payment before the rotation did not succeed"; return 1; fi
+        sleep 3
+        for i in $(seq 1 $N); do PRE_BAL="$PRE_BAL $(bal_of "$D/c$i.db")"; done
+        echo "  balances before the rotation:$PRE_BAL"
+        # run the factory out of its active period; the LSP rotates on its own
+        mine 45
+        if ! wait_log "LSP rotate: rotation complete" "$D/lsp.log" 600 "the rotation"; then
+            red "  CHECK FAIL the rotation did not complete"
+            grep -aE "LSP rotate:|rotation" "$D/lsp.log" | tail -8 | sed 's/^/    /'
+            for i in $(seq 1 $N); do grep -aE "rotation|ROTATION|REFUSING|initial commitment|opening balances" "$D/c$i.log" | tail -3 | sed "s/^/    c$i: /"; done
+            return 1
+        fi
+        echo "  rotation succeeded (height $("${BCLI[@]}" getblockcount))"
+        for _ in $(seq 1 60); do
+            have=0
+            for i in $(seq 1 $N); do
+                grep -q "persisted rotated factory" "$D/c$i.log" 2>/dev/null || continue
+                n=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT count(*) FROM signed_commitments WHERE commitment_number = 0;" 2>/dev/null || echo 0)
+                [ "${n:-0}" -ge 1 ] && have=$((have + 1))
+            done
+            [ "$have" -eq $N ] && break
+            sleep 1
+        done
+        for i in $(seq 1 $N); do
+            echo "  client $i after rotation: $(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT 'commitment_number=' || commitment_number FROM signed_commitments;" 2>/dev/null | head -1 | grep . || echo "NO signed commitment") balance=$(bal_of "$D/c$i.db")"
+        done
+        [ "$have" -eq $N ] || red "  only $have of $N clients hold a signed commitment 0 for the new factory"
+        sleep 5
     fi
     sleep 5
 
@@ -207,7 +305,7 @@ run_scenario(){
     echo "  $conf of $N commitments confirmed after $pass force-close pass(es) (height $("${BCLI[@]}" getblockcount))"
     mine 2
 
-    BCLI_STR="${BCLI[*]}" python3 - "$D" "$N" "$SC" "$PAY_AMT" <<'PYEOF'
+    BCLI_STR="${BCLI[*]}" PRE_BAL="$PRE_BAL" python3 - "$D" "$N" "$SC" "$PAY_AMT" <<'PYEOF'
 import sys, os, json, sqlite3, subprocess
 D, N, SC, PAY = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 BCLI = os.environ["BCLI_STR"].split()
@@ -233,11 +331,13 @@ def q(db, sql):
 def sats(v): return int(round(v * 1e8))
 
 lsp_db = os.path.join(D, "lsp.db")
-fac = q(lsp_db, "SELECT funding_txid, funding_vout, funding_amount FROM factories ORDER BY id DESC LIMIT 1")
+# the factory the clients are in now, as client 1 recorded it
+fac = q(os.path.join(D, "c1.db"), "SELECT funding_txid, funding_vout, funding_amount FROM factories ORDER BY id DESC LIMIT 1")
 if not fac:
-    print("  CHECK FAIL no factory row in the LSP database"); sys.exit(1)
+    print("  CHECK FAIL no factory row in client 1's database"); sys.exit(1)
 fund_op, F = (fac[0][0], fac[0][1]), fac[0][2]
-lsp_ch = {r[0]: r[1:] for r in q(lsp_db, "SELECT slot, local_amount, remote_amount, funding_txid, funding_vout, commitment_number FROM channels")}
+lsp_rows = q(lsp_db, "SELECT slot, local_amount, remote_amount, funding_txid, funding_vout, commitment_number FROM channels")
+pre_bal = [int(x) for x in os.environ.get("PRE_BAL", "").split()]
 movers = {1: -PAY, 2: PAY} if SC == "mixed" else {}
 
 # signed tree, as every client holds it
@@ -274,7 +374,9 @@ for i in range(1, N + 1):
     if conf < 1:
         fail("client %d (%s): commitment %s not confirmed" % (i, role, d["txid"])); continue
     tl = sats(d["vout"][0]["value"]); total_tolocal += tl
-    l = lsp_ch.get(i - 1)
+    l = next((r[1:] for r in lsp_rows if r[0] == i - 1 and (r[3], r[4]) == (ch[0][2], ch[0][3])), None)
+    if pre_bal and bal != pre_bal[i - 1]:
+        fail("client %d: balance %d sat in the new factory, %d sat before the rotation" % (i, bal, pre_bal[i - 1]))
     if tl != bal:
         fail("client %d (%s): to_local %d sat != balance in its database %d sat" % (i, role, tl, bal))
     elif l is None or l[1] != bal:
