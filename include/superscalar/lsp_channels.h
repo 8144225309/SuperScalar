@@ -561,9 +561,26 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      const wire_msg_t *msg);
 
 /* Track that an HTLC came from the bridge (for back-propagation). */
-void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
+/* Record that an HTLC for payment_hash32 came in through the bridge
+   (bridge_htlc_id > 0) or went out through it (bridge_htlc_id == 0).
+   Returns the origin entry that was filled (an earlier free slot is reused
+   before the table grows), or NULL if the table is full. */
+htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id);
+
+/* 1 if another origin can be recorded. */
+int lsp_channels_origin_slot_free(const lsp_channel_mgr_t *mgr);
+
+/* Record an outside payment requested for a client's HTLC, so that the
+   bridge's result for request_id finds its way back to that HTLC.
+   Returns the origin entry, or NULL if the table is full. */
+htlc_origin_t *lsp_channels_track_outbound_pay(lsp_channel_mgr_t *mgr,
+                                        const unsigned char *payment_hash32,
+                                        uint64_t request_id,
+                                        size_t sender_idx,
+                                        uint64_t sender_htlc_id,
+                                        uint32_t cltv_expiry);
 
 /* Check bridge HTLC timeouts: fail back any HTLC whose cltv_expiry is
    approaching (within FACTORY_CLTV_DELTA blocks of current height).

@@ -1289,6 +1289,7 @@ extern int test_bridge_plugin_secret_file(void);
 extern int test_bridge_plugin_port_loopback(void);
 extern int test_bridge_plugin_auth(void);
 extern int test_lsp_inbound_amount_below_invoice(void);
+extern int test_lsp_outbound_origin_slot_reuse(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -3215,6 +3216,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_plugin_port_loopback);
     RUN_TEST(test_bridge_plugin_auth);
     RUN_TEST(test_lsp_inbound_amount_below_invoice);
+    RUN_TEST(test_lsp_outbound_origin_slot_reuse);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

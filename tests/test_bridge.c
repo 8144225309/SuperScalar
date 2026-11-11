@@ -4079,3 +4079,60 @@ int test_lsp_inbound_amount_below_invoice(void) {
     free(lsp);
     return 1;
 }
+
+/* ---- Outbound pays are tracked in the slot the tracker filled ---- */
+
+int test_lsp_outbound_origin_slot_reuse(void) {
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.htlc_origins = calloc(4, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = 4;
+    TEST_ASSERT(mgr.htlc_origins != NULL, "alloc");
+
+    unsigned char h[6][32];
+    for (int i = 0; i < 6; i++) memset(h[i], 0x60 + i, 32);
+
+    /* Three pays in flight fill slots 0..2 */
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(lsp_channels_track_outbound_pay(&mgr, h[i], 100 + i, i, 10 + i, 500)
+                    == &mgr.htlc_origins[i], "pay tracked in next slot");
+    TEST_ASSERT_EQ(mgr.n_htlc_origins, 3, "three origins");
+
+    /* The first one resolves, leaving slot 0 free below the others */
+    mgr.htlc_origins[0].active = 0;
+    TEST_ASSERT(lsp_channels_origin_slot_free(&mgr), "a slot is free");
+
+    /* Two more pays start while pays 101 and 102 are still in flight */
+    htlc_origin_t *d = lsp_channels_track_outbound_pay(&mgr, h[3], 103, 1, 21, 600);
+    htlc_origin_t *e = lsp_channels_track_outbound_pay(&mgr, h[4], 104, 0, 22, 700);
+    TEST_ASSERT(d == &mgr.htlc_origins[0], "freed slot reused");
+    TEST_ASSERT(e == &mgr.htlc_origins[3], "then the table grows");
+
+    /* Every pay in flight is still found by its own request id, with its
+       own hash and sender */
+    static const struct { uint64_t rid; int hash; size_t sender; uint64_t htlc; }
+        want[] = { {101, 1, 1, 11}, {102, 2, 2, 12}, {103, 3, 1, 21}, {104, 4, 0, 22} };
+    for (size_t w = 0; w < 4; w++) {
+        int found = 0;
+        for (size_t i = 0; i < mgr.n_htlc_origins; i++) {
+            htlc_origin_t *o = &mgr.htlc_origins[i];
+            if (!o->active || o->request_id != want[w].rid) continue;
+            found++;
+            TEST_ASSERT_MEM_EQ(o->payment_hash, h[want[w].hash], 32, "hash of this pay");
+            TEST_ASSERT_EQ(o->sender_idx, want[w].sender, "sender of this pay");
+            TEST_ASSERT_EQ(o->sender_htlc_id, want[w].htlc, "sender HTLC of this pay");
+            TEST_ASSERT_EQ(o->bridge_htlc_id, 0, "outbound origin");
+        }
+        TEST_ASSERT_EQ(found, 1, "exactly one origin per request id");
+    }
+    TEST_ASSERT_EQ(d->cltv_expiry, 600, "expiry recorded");
+
+    /* Full table: refused, nothing overwritten */
+    TEST_ASSERT(!lsp_channels_origin_slot_free(&mgr), "table full");
+    TEST_ASSERT(lsp_channels_track_outbound_pay(&mgr, h[5], 105, 3, 23, 800) == NULL,
+                "no slot: not tracked");
+    TEST_ASSERT_EQ(mgr.htlc_origins[3].request_id, 104, "last entry untouched");
+
+    free(mgr.htlc_origins);
+    return 1;
+}

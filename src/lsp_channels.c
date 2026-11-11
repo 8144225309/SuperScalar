@@ -904,6 +904,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     lsp->factory.cltv_timeout, &outside_max_delay);
             if (chk != BRIDGE_PAY_OK)
                 why = lsp_bridge_pay_check_str(chk);
+            else if (!lsp_channels_origin_slot_free(mgr))
+                why = "too_many_pending_payments";
         }
         if (why) {
             fprintf(stderr, "LSP: outside payment from client %zu refused: %s\n",
@@ -1093,14 +1095,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(pay);
         if (!ok) return 0;
 
-        /* Track origin for when PAY_RESULT comes back */
-        lsp_channels_track_bridge_origin(mgr, payment_hash, 0);
-        /* Store request_id + sender info for back-propagation */
-        if (mgr->n_htlc_origins > 0) {
-            htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins - 1];
-            origin->request_id = request_id;
-            origin->sender_idx = sender_idx;
-            origin->sender_htlc_id = new_htlc_id;
+        /* Track origin for when PAY_RESULT comes back: request_id and the
+           sender's HTLC go into the entry the tracker filled. */
+        if (lsp_channels_track_outbound_pay(mgr, payment_hash, request_id,
+                                             sender_idx, new_htlc_id,
+                                             cltv_expiry)) {
             /* Persist origin + counter atomically */
             if (mgr->persist) {
                 persist_t *db = (persist_t *)mgr->persist;

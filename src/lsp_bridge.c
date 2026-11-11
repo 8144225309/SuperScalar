@@ -270,7 +270,29 @@ int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
     return 0;
 }
 
-void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
+int lsp_channels_origin_slot_free(const lsp_channel_mgr_t *mgr) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++)
+        if (!mgr->htlc_origins[i].active) return 1;
+    return mgr->n_htlc_origins < mgr->htlc_origins_cap;
+}
+
+htlc_origin_t *lsp_channels_track_outbound_pay(lsp_channel_mgr_t *mgr,
+                                        const unsigned char *payment_hash32,
+                                        uint64_t request_id,
+                                        size_t sender_idx,
+                                        uint64_t sender_htlc_id,
+                                        uint32_t cltv_expiry) {
+    htlc_origin_t *origin =
+        lsp_channels_track_bridge_origin(mgr, payment_hash32, 0);
+    if (!origin) return NULL;
+    origin->request_id = request_id;
+    origin->sender_idx = sender_idx;
+    origin->sender_htlc_id = sender_htlc_id;
+    origin->cltv_expiry = cltv_expiry;
+    return origin;
+}
+
+htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id) {
     /* Reuse an inactive slot first */
@@ -282,17 +304,18 @@ void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
         }
     }
     if (!origin) {
-        if (mgr->n_htlc_origins >= mgr->htlc_origins_cap) return;
+        if (mgr->n_htlc_origins >= mgr->htlc_origins_cap) return NULL;
         origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
     }
+    memset(origin, 0, sizeof(*origin));
     memcpy(origin->payment_hash, payment_hash32, 32);
     origin->bridge_htlc_id = bridge_htlc_id;
-    origin->cltv_expiry = 0;
     origin->active = 1;
 
     if (mgr->persist)
         persist_save_htlc_origin((persist_t *)mgr->persist, payment_hash32,
                                   bridge_htlc_id, 0, 0, 0);
+    return origin;
 }
 
 uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
