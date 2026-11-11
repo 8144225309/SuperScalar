@@ -819,7 +819,7 @@ def collect_factory_config(cfg):
                 "daemon": flag_present("--daemon"),
                 "demo": flag_present("--demo"),
                 "cli": flag_present("--cli"),
-                "no_jit": flag_present("--no-jit"),
+                "jit_experimental": flag_present("--enable-jit-experimental"),
                 "onion": flag_present("--onion"),
                 "tor_only": flag_present("--tor-only"),
                 "i_accept_risk": flag_present("--i-accept-the-risk"),
@@ -1276,7 +1276,7 @@ def collect_demo():
             "fee_bump_after": "6", "fee_bump_max": "3",
             "settlement_interval": "144",
             "daemon": True, "demo": True, "cli": False,
-            "no_jit": False, "onion": False, "tor_only": False,
+            "jit_experimental": False, "onion": False, "tor_only": False,
             "i_accept_risk": False,
         },
         "tx_enrichment": {
@@ -1744,7 +1744,7 @@ function rConfig(D){
  if(c.daemon)flags.push(['daemon','b i']);
  if(c.demo)flags.push(['demo','b i']);
  if(c.cli)flags.push(['cli','b i']);
- if(c.no_jit)flags.push(['no-jit','b w']);
+ if(c.jit_experimental)flags.push(['jit-experimental','b dn']);
  if(c.onion)flags.push(['tor onion','b i']);
  if(c.tor_only)flags.push(['tor-only','b i']);
  if(c.i_accept_risk)flags.push(['mainnet-risk','b dn']);

@@ -6655,8 +6655,8 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             ladder_t *lad = (ladder_t *)mgr->ladder;
             printf("  Ladder factories: %zu\n", lad->n_factories);
         }
-        /* JIT channels */
-        if (mgr->jit_enabled && mgr->n_jit_channels > 0)
+        /* JIT channels: listed whether or not new opens are enabled */
+        if (mgr->n_jit_channels > 0)
             printf("  JIT channels: %zu\n", mgr->n_jit_channels);
         printf("---\n");
         fflush(stdout);
@@ -6771,6 +6771,52 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     }
     fflush(stdout);
     return 1;
+}
+
+/* Once every factory has expired, offer a JIT channel to each connected
+   client that has none.  Does nothing, and sends nothing, unless opening JIT
+   channels is enabled on this manager.  Returns the number of opens
+   attempted. */
+int lsp_channels_jit_expiry_trigger(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp || !jit_channels_enabled(mgr)) return 0;
+
+    int all_expired = 1;
+    if (mgr->ladder) {
+        ladder_t *lad = (ladder_t *)mgr->ladder;
+        for (size_t fi = 0; fi < lad->n_factories; fi++) {
+            if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
+                all_expired = 0;
+                break;
+            }
+        }
+        if (lad->n_factories == 0)
+            all_expired = 0; /* no factories at all != expired */
+    } else {
+        /* Single-factory mode: check main factory */
+        if (mgr->watchtower && mgr->watchtower->rt) {
+            int h = regtest_get_block_height(mgr->watchtower->rt);
+            factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
+            all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
+        } else {
+            all_expired = 0;
+        }
+    }
+    if (!all_expired) return 0;
+
+    int attempted = 0;
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (lsp->client_fds[c] < 0 || jit_channel_is_active(mgr, c))
+            continue;
+        uint64_t jit_amt = mgr->jit_funding_sats;
+        if (jit_amt == 0)
+            jit_amt = mgr->rot_funding_sats / mgr->n_channels;
+        if (jit_amt == 0) continue;
+        printf("LSP: opening JIT channel for client %zu (factory expired)\n", c);
+        fflush(stdout);
+        jit_channel_create(mgr, lsp, c, jit_amt, "factory_expired");
+        attempted++;
+    }
+    return attempted;
 }
 
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
@@ -7589,47 +7635,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
 
             /* JIT channel trigger: factory expired + client online + no JIT */
-            if (mgr->jit_enabled) {
-                int all_expired = 1;
-                if (mgr->ladder) {
-                    ladder_t *lad = (ladder_t *)mgr->ladder;
-                    for (size_t fi = 0; fi < lad->n_factories; fi++) {
-                        if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
-                            all_expired = 0;
-                            break;
-                        }
-                    }
-                    if (lad->n_factories == 0)
-                        all_expired = 0; /* no factories at all != expired */
-                } else {
-                    /* Single-factory mode: check main factory */
-                    if (mgr->watchtower && mgr->watchtower->rt) {
-                        int h = regtest_get_block_height(mgr->watchtower->rt);
-                        factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
-                        all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
-                    } else {
-                        all_expired = 0;
-                    }
-                }
-
-                if (all_expired) {
-                    for (size_t c = 0; c < mgr->n_channels; c++) {
-                        if (lsp->client_fds[c] >= 0 &&
-                            !jit_channel_is_active(mgr, c)) {
-                            uint64_t jit_amt = mgr->jit_funding_sats;
-                            if (jit_amt == 0)
-                                jit_amt = mgr->rot_funding_sats / mgr->n_channels;
-                            if (jit_amt > 0) {
-                                printf("LSP: opening JIT channel for client %zu "
-                                       "(factory expired)\n", c);
-                                fflush(stdout);
-                                jit_channel_create(mgr, lsp, c, jit_amt,
-                                                    "factory_expired");
-                            }
-                        }
-                    }
-                }
-            }
+            lsp_channels_jit_expiry_trigger(mgr, lsp);
 
             /* Check JIT funding confirmation (FUNDING → OPEN) */
             jit_channels_check_funding(mgr);

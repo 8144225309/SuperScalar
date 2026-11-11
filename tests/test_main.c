@@ -1572,6 +1572,9 @@ extern int test_jit_persist_skip_closed(void);
 extern int test_jit_multiple_channels(void);
 extern int test_jit_multiple_watchtower_indices(void);
 extern int test_jit_funding_confirmation_transition(void);
+extern int test_jit_create_refused_when_disabled(void);
+extern int test_jit_expiry_trigger_refused_when_disabled(void);
+extern int test_lsps2_buy_refused_when_jit_disabled(void);
 
 /* Per-Leaf Advance */
 extern int test_factory_advance_leaf_left(void);
@@ -1928,6 +1931,7 @@ extern int test_network_gate_risk_accepted(void);
 extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
 extern int test_network_gate_db(void);
+extern int test_network_gate_no_experimental_jit(void);
 extern int test_network_mainnet_step_floor_alias(void);
 extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
@@ -3506,6 +3510,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_multiple_channels);
     RUN_TEST(test_jit_multiple_watchtower_indices);
     RUN_TEST(test_jit_funding_confirmation_transition);
+    RUN_TEST(test_jit_create_refused_when_disabled);
+    RUN_TEST(test_jit_expiry_trigger_refused_when_disabled);
+    RUN_TEST(test_lsps2_buy_refused_when_jit_disabled);
 
     printf("\n=== Per-Leaf Advance ===\n");
     RUN_TEST(test_factory_advance_leaf_left);
@@ -3870,6 +3877,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_network_gate_cmdline_seckey);
     RUN_TEST(test_network_gate_no_test_scaffolding);
     RUN_TEST(test_network_gate_db);
+    RUN_TEST(test_network_gate_no_experimental_jit);
     RUN_TEST(test_network_mainnet_step_floor_alias);
     RUN_TEST(test_network_startup_gates_per_role);
 

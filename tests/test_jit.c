@@ -203,7 +203,7 @@ int test_jit_channel_init_and_find(void) {
     TEST_ASSERT(jit_channels_init(&mgr), "jit_channels_init");
     TEST_ASSERT(mgr.jit_channels != NULL, "jit_channels allocated");
     TEST_ASSERT_EQ((long)mgr.n_jit_channels, 0, "n_jit should be 0");
-    TEST_ASSERT_EQ(mgr.jit_enabled, 1, "jit should be enabled");
+    TEST_ASSERT_EQ(mgr.jit_enabled, 0, "opening JIT channels is off after init");
 
     /* No channels yet */
     TEST_ASSERT(jit_channel_find(&mgr, 0) == NULL, "should find nothing");
@@ -1150,7 +1150,7 @@ int test_regtest_jit_daemon_trigger(void) {
     int h = regtest_get_block_height(mgr.watchtower->rt);
     factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
     TEST_ASSERT(fs == FACTORY_EXPIRED, "daemon should detect factory EXPIRED");
-    TEST_ASSERT(mgr.jit_enabled, "JIT should be enabled");
+    TEST_ASSERT(!mgr.jit_enabled, "JIT opens are off after init");
     TEST_ASSERT(!jit_channel_is_active(&mgr, 0), "no active JIT for client 0");
 
     /* Create socketpair for client wire protocol */
@@ -1168,9 +1168,21 @@ int test_regtest_jit_daemon_trigger(void) {
     pthread_t tid;
     pthread_create(&tid, NULL, jit_client_handler, &client_args);
 
-    /* Call jit_channel_create — same as daemon loop would at line 1891 */
-    int ok = jit_channel_create(&mgr, lsp, 0, 50000, "factory_expired");
-    TEST_ASSERT(ok, "jit_channel_create should succeed");
+    /* Without the opt-in nothing is opened and the wallet is not used. */
+    double bal_before = regtest_get_balance(&rt);
+    TEST_ASSERT(!jit_channel_create(&mgr, lsp, 0, 50000, "factory_expired"),
+                "jit_channel_create refuses while JIT opens are disabled");
+    TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&mgr, lsp), 0,
+                   "expiry trigger does nothing while JIT opens are disabled");
+    TEST_ASSERT_EQ((long)mgr.n_jit_channels, 0, "no JIT channel recorded");
+    TEST_ASSERT(regtest_get_balance(&rt) == bal_before, "wallet balance unchanged");
+
+    /* Opt in, as the experimental flag does, and open through the same
+       factory-expired trigger the daemon loop runs. */
+    mgr.jit_enabled = 1;
+    int ok = lsp_channels_jit_expiry_trigger(&mgr, lsp) == 1 &&
+             jit_channel_is_active(&mgr, 0);
+    TEST_ASSERT(ok, "expiry trigger should open the JIT channel");
 
     /* Verify JIT channel is active */
     TEST_ASSERT(jit_channel_is_active(&mgr, 0), "JIT should be active after create");
@@ -1196,5 +1208,240 @@ int test_regtest_jit_daemon_trigger(void) {
     close(sv[0]);
     close(sv[1]);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- JIT opens are off unless explicitly enabled --- */
+
+#include "superscalar/ladder.h"
+#include "superscalar/lsps.h"
+#include "superscalar/wallet_source.h"
+#include <poll.h>
+
+static int g_gate_wallet_calls;
+static int g_gate_broadcast_calls;
+
+static int gate_wallet_get_utxo(wallet_source_t *self, uint64_t min_sats,
+                                char txid_hex[65], uint32_t *vout,
+                                uint64_t *amount, unsigned char *spk,
+                                size_t *spk_len) {
+    (void)self; (void)min_sats; (void)txid_hex; (void)vout; (void)amount;
+    (void)spk; (void)spk_len;
+    g_gate_wallet_calls++;
+    return 0;
+}
+
+static int gate_chain_send_raw_tx(chain_backend_t *self, const char *tx_hex,
+                                  char *txid_out) {
+    (void)self; (void)tx_hex; (void)txid_out;
+    g_gate_broadcast_calls++;
+    return 0;
+}
+
+/* 1 if a wire frame is waiting on fd within timeout_ms. */
+static int gate_fd_readable(int fd, int timeout_ms) {
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    return poll(&p, 1, timeout_ms) > 0 && (p.revents & POLLIN);
+}
+
+typedef struct {
+    lsp_channel_mgr_t mgr;
+    lsp_t *lsp;
+    secp256k1_context *ctx;
+    wallet_source_t wallet;
+    chain_backend_t chain;
+    int peer_fd[2];             /* the client ends of the connections */
+    ladder_t *ladder;
+} jit_gate_fixture_t;
+
+static int jit_gate_fixture_init(jit_gate_fixture_t *fx, size_t n_clients) {
+    memset(fx, 0, sizeof(*fx));
+    fx->peer_fd[0] = fx->peer_fd[1] = -1;
+    if (n_clients < 1 || n_clients > 2) return 0;
+    fx->ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    fx->mgr.ctx = fx->ctx;
+    fx->mgr.entries = calloc(n_clients, sizeof(lsp_channel_entry_t));
+    fx->mgr.entries_cap = n_clients;
+    fx->mgr.n_channels = n_clients;
+    memset(fx->mgr.rot_lsp_seckey, 0x01, 32);
+    fx->mgr.jit_funding_sats = 50000;
+    fx->wallet.get_utxo = gate_wallet_get_utxo;
+    fx->chain.send_raw_tx = gate_chain_send_raw_tx;
+    fx->mgr.wallet_src = &fx->wallet;
+    fx->mgr.chain_be = &fx->chain;
+    if (!jit_channels_init(&fx->mgr)) return 0;
+
+    fx->lsp = calloc(1, sizeof(lsp_t));
+    if (!fx->mgr.entries || !fx->lsp) return 0;
+    fx->lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    if (!fx->lsp->client_fds) return 0;
+    fx->lsp->clients_cap = LSP_MAX_CLIENTS;
+    fx->lsp->n_clients = n_clients;
+    for (size_t i = 0; i < LSP_MAX_CLIENTS; i++) fx->lsp->client_fds[i] = -1;
+    for (size_t i = 0; i < n_clients; i++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        fx->lsp->client_fds[i] = sv[0];
+        fx->peer_fd[i] = sv[1];
+    }
+
+    /* One factory, expired. */
+    fx->ladder = calloc(1, sizeof(ladder_t));
+    if (!fx->ladder) return 0;
+    fx->ladder->n_factories = 1;
+    fx->ladder->factories[0].cached_state = FACTORY_EXPIRED;
+    fx->mgr.ladder = fx->ladder;
+
+    g_gate_wallet_calls = 0;
+    g_gate_broadcast_calls = 0;
+    return 1;
+}
+
+static void jit_gate_fixture_free(jit_gate_fixture_t *fx) {
+    for (size_t i = 0; i < 2; i++) {
+        if (fx->peer_fd[i] >= 0) close(fx->peer_fd[i]);
+        if (fx->lsp && fx->lsp->client_fds[i] >= 0) close(fx->lsp->client_fds[i]);
+    }
+    jit_channels_cleanup(&fx->mgr);
+    free(fx->mgr.entries);
+    if (fx->lsp) free(fx->lsp->client_fds);
+    free(fx->lsp);
+    free(fx->ladder);
+    if (fx->ctx) secp256k1_context_destroy(fx->ctx);
+}
+
+/* Reads one JIT_OFFER and hangs up, so an enabled open fails fast. */
+static void *gate_peer_take_offer_and_hang_up(void *arg) {
+    int *fd = (int *)arg;
+    static int got_offer = 1;
+    wire_msg_t msg;
+    void *ret = NULL;
+    if (wire_recv(*fd, &msg)) {
+        if (msg.msg_type == MSG_JIT_OFFER) ret = &got_offer;
+        cJSON_Delete(msg.json);
+    }
+    /* Half-close: the LSP sees end-of-stream, and may still write a reply. */
+    shutdown(*fd, SHUT_WR);
+    return ret;
+}
+
+int test_jit_create_refused_when_disabled(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    TEST_ASSERT_EQ(jit_channels_enabled(&fx.mgr), 0, "JIT opens are off by default");
+
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "create refuses when JIT opens are disabled");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200), "nothing was sent to the client");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Enabled: the same call does reach the client. */
+    fx.mgr.jit_enabled = 1;
+    pthread_t tid;
+    pthread_create(&tid, NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[0]);
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "open fails when the client hangs up");
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "with JIT enabled the client receives JIT_OFFER");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+int test_jit_expiry_trigger_refused_when_disabled(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 2), "fixture");
+
+    /* Every factory expired and both clients connected: nothing happens. */
+    for (int pass = 0; pass < 3; pass++)
+        TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&fx.mgr, fx.lsp), 0,
+                       "trigger does nothing when JIT opens are disabled");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200), "client 0 got nothing");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 50), "client 1 got nothing");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Enabled: each connected client is offered a channel. */
+    fx.mgr.jit_enabled = 1;
+    pthread_t tid[2];
+    for (int i = 0; i < 2; i++)
+        pthread_create(&tid[i], NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[i]);
+    TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&fx.mgr, fx.lsp), 2,
+                   "with JIT enabled the trigger attempts an open per client");
+    for (int i = 0; i < 2; i++) {
+        void *peer_ret = NULL;
+        pthread_join(tid[i], &peer_ret);
+        TEST_ASSERT(peer_ret != NULL, "with JIT enabled the client receives JIT_OFFER");
+    }
+
+    /* A factory that has not expired never triggers, enabled or not. */
+    fx.ladder->factories[0].cached_state = FACTORY_ACTIVE;
+    TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&fx.mgr, fx.lsp), 0,
+                   "no trigger while a factory is active");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+static cJSON *gate_build_lsps2_buy(int id) {
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps2.buy");
+    cJSON_AddNumberToObject(req, "id", id);
+    cJSON *params = cJSON_CreateObject();
+    cJSON *ofp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(ofp, "min_fee_msat", 1000);
+    cJSON_AddItemToObject(params, "opening_fee_params", ofp);
+    cJSON_AddNumberToObject(params, "payment_size_msat", 5000000000.0);
+    cJSON_AddItemToObject(req, "params", params);
+    return req;
+}
+
+int test_lsps2_buy_refused_when_jit_disabled(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+
+    lsps_ctx_t lctx = { .mgr = &fx.mgr, .lsp = fx.lsp, .client_idx = 0 };
+    cJSON *req = gate_build_lsps2_buy(41);
+    TEST_ASSERT_EQ(lsps_handle_request(&lctx, fx.lsp->client_fds[0], req), 1,
+                   "request is handled");
+    cJSON_Delete(req);
+
+    /* The client gets exactly one frame: a JSON-RPC error for its request. */
+    TEST_ASSERT(gate_fd_readable(fx.peer_fd[0], 1000), "client gets a reply");
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(fx.peer_fd[0], &msg), "recv reply");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_LSPS_RESPONSE, "reply is an LSPS response, not JIT_OFFER");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(msg.json, "id");
+    const cJSON *err = cJSON_GetObjectItemCaseSensitive(msg.json, "error");
+    const cJSON *code = err ? cJSON_GetObjectItemCaseSensitive(err, "code") : NULL;
+    TEST_ASSERT(id && (int)id->valuedouble == 41, "reply carries the request id");
+    TEST_ASSERT(err && code && (int)code->valuedouble == LSPS_ERR_METHOD_NOT_FOUND,
+                "reply is an error");
+    TEST_ASSERT(cJSON_GetObjectItemCaseSensitive(msg.json, "result") == NULL,
+                "no result, no channel id");
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200), "no further frame (no JIT_OFFER)");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Enabled: the same request does start an open. */
+    fx.mgr.jit_enabled = 1;
+    pthread_t tid;
+    pthread_create(&tid, NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[0]);
+    req = gate_build_lsps2_buy(42);
+    lsps_handle_request(&lctx, fx.lsp->client_fds[0], req);
+    cJSON_Delete(req);
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "with JIT enabled the client receives JIT_OFFER");
+
+    jit_gate_fixture_free(&fx);
     return 1;
 }

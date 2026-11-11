@@ -299,7 +299,9 @@ static void usage(const char *prog) {
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
-        "  --no-jit            Disable JIT channel fallback\n"
+        "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
+        "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
+        "                      an open can strand the LSP's funds. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
         "                       Comma-separated activates TRUE N-way mixed arity per level\n"
@@ -355,6 +357,7 @@ static void usage(const char *prog) {
         "  --test-splice-client-seckey HEX  Client[0] secret key for test-only MuSig2 signing\n"
         "  --test-lightclient  Run in BIP 157/158 light-client mode and verify filter sync\n"
         "  --test-jit          After demo: create JIT channels for all clients\n"
+        "                      (implies --enable-jit-experimental)\n"
         "  --test-lsps2        After demo: wait for client LSPS2 buy flow\n"
         "  --test-bolt12       After demo: BOLT12 offer codec + signature test\n"
         "  --test-buy-liquidity After demo: buy inbound liquidity from L-stock\n"
@@ -1434,7 +1437,7 @@ int main(int argc, char *argv[]) {
     int32_t active_blocks_arg = -1;  /* -1 = auto */
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
-    int no_jit = 0;
+    int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
                                         (1, 2 = legacy DW; 3 = PS canonical) */
@@ -1814,8 +1817,8 @@ int main(int argc, char *argv[]) {
             dying_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--jit-amount") == 0 && i + 1 < argc)
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--no-jit") == 0)
-            no_jit = 1;
+        else if (strcmp(argv[i], "--enable-jit-experimental") == 0)
+            enable_jit_experimental = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -2501,6 +2504,7 @@ int main(int argc, char *argv[]) {
             .seckey_on_cmdline = seckey_hex != NULL,
             .have_db = db_path != NULL,
             .have_wt_db = wt_db_path != NULL,
+            .enable_jit_experimental = enable_jit_experimental,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -2510,6 +2514,14 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+    /* The JIT test mode opens a JIT channel itself, so it carries the opt-in
+       (--test-* is refused on mainnet by the gates above). */
+    if (test_jit)
+        enable_jit_experimental = 1;
+    if (enable_jit_experimental)
+        fprintf(stderr, "WARNING: --enable-jit-experimental: JIT channel opens are "
+                "enabled. This is unsafe and for testing only.\n");
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
@@ -3345,7 +3357,7 @@ int main(int argc, char *argv[]) {
 
             /* JIT Channel Fallback */
             jit_channels_init(mgr);
-            if (no_jit) mgr->jit_enabled = 0;
+            mgr->jit_enabled = enable_jit_experimental;
             mgr->jit_funding_sats = (jit_amount_arg > 0) ?
                 (uint64_t)jit_amount_arg :
                 (funding_sats / (uint64_t)rec_n_clients);
@@ -4582,7 +4594,7 @@ accept_new_factory:
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(mgr);
-        if (no_jit) mgr->jit_enabled = 0;
+        mgr->jit_enabled = enable_jit_experimental;
         mgr->jit_funding_sats = (jit_amount_arg > 0) ?
             (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
 

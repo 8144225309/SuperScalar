@@ -965,7 +965,8 @@ def scenario_jit_lifecycle(orch):
     orch._log("All 4 clients connect; factory expires → JIT channels triggered.")
 
     # Start LSP with JIT enabled and short lifecycle for quick expiry
-    orch.start_lsp(["--demo", "--daemon", "--jit-amount", "50000",
+    orch.start_lsp(["--demo", "--daemon", "--enable-jit-experimental",
+                     "--jit-amount", "50000",
                      "--active-blocks", "5", "--dying-blocks", "3"])
     time.sleep(orch.timing["lsp_bind"])
 
@@ -2200,7 +2201,7 @@ def scenario_lsps2_buy(orch):
     orch.n_clients = 1
 
     # --daemon keeps the LSP alive after the demo so jit_channel_create has mgr context
-    orch.start_lsp(["--demo", "--daemon", "--arity", "1"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-jit-experimental", "--arity", "1"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_client(0, ["--test-lsps2-buy"])
 

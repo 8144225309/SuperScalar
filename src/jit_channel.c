@@ -54,8 +54,13 @@ int jit_channels_init(void *mgr_ptr) {
         memset(mgr->jit_channels, 0, mgr->jit_channels_cap * sizeof(jit_channel_t));
     }
     mgr->n_jit_channels = 0;
-    mgr->jit_enabled = 1;
+    mgr->jit_enabled = 0;
     return 1;
+}
+
+int jit_channels_enabled(void *mgr_ptr) {
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    return (mgr && mgr->jit_enabled) ? 1 : 0;
 }
 
 jit_channel_t *jit_channel_find(void *mgr_ptr, size_t client_idx) {
@@ -104,7 +109,13 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
                         const char *reason) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
     lsp_t *lsp = (lsp_t *)lsp_ptr;
-    if (!mgr || !lsp || !mgr->jit_channels) return 0;
+    if (!mgr || !lsp) return 0;
+    if (!jit_channels_enabled(mgr)) {
+        fprintf(stderr, "LSP JIT: not opening a JIT channel for client %zu (%s): "
+                "JIT opens are disabled\n", client_idx, reason ? reason : "");
+        return 0;
+    }
+    if (!mgr->jit_channels) return 0;
     if (client_idx >= mgr->n_channels) return 0;
     if (lsp->client_fds[client_idx] < 0) return 0;
     if (mgr->n_jit_channels >= mgr->jit_channels_cap) return 0;

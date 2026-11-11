@@ -169,7 +169,12 @@ int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
     } else if (strcmp(method, "lsps2.buy") == 0) {
         const cJSON *params = cJSON_GetObjectItemCaseSensitive(json, "params");
         uint64_t amount_msat = 0, fee_msat = 0;
-        if (!params || !lsps2_parse_buy(params, &amount_msat, &fee_msat)) {
+        if (ctx && ctx->mgr && !jit_channels_enabled(ctx->mgr)) {
+            /* Refused before anything is sent to the client's channel
+               connection and before any wallet action. */
+            response = lsps_build_error(req_id, LSPS_ERR_METHOD_NOT_FOUND,
+                                         "lsps2.buy is not enabled on this LSP");
+        } else if (!params || !lsps2_parse_buy(params, &amount_msat, &fee_msat)) {
             response = lsps_build_error(req_id, LSPS_ERR_INVALID_PARAMS, "invalid params");
         } else {
             cJSON *result = cJSON_CreateObject();

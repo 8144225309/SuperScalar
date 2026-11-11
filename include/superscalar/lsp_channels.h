@@ -125,7 +125,7 @@ typedef struct {
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
     size_t n_jit_channels;
     size_t jit_channels_cap;
-    int jit_enabled;               /* 1 = JIT enabled (default), 0 = --no-jit */
+    int jit_enabled;               /* 1 = JIT opens allowed (experimental opt-in); default 0 */
     uint64_t jit_funding_sats;     /* per-client JIT funding amount */
 
     /* Factory arity (Upgrade 2) */
@@ -296,6 +296,11 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
    Returns 1 on success, 0 on error. */
 int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                   size_t expected_msgs);
+
+/* Once every factory has expired, offer a JIT channel to each connected
+   client that has none.  Does nothing unless opening JIT channels is enabled
+   (mgr->jit_enabled).  Returns the number of opens attempted. */
+int lsp_channels_jit_expiry_trigger(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* Run a daemon event loop handling channel messages until shutdown.
    Loops on select() with 5-second timeout checking *shutdown_flag.

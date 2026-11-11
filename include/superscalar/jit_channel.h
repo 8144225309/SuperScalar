@@ -44,11 +44,20 @@ struct lsp;
 /* --- JIT channel lifecycle --- */
 
 /* Initialize JIT channel subsystem.  Zeros out jit_channels array.
-   Must be called before any other jit_channel_* function. */
+   Must be called before any other jit_channel_* function.
+   Opening new JIT channels is left disabled: the caller turns it on by
+   setting jit_enabled on the manager. */
 int jit_channels_init(void *mgr_ptr);
+
+/* 1 if this manager may open new JIT channels, 0 otherwise.  Opening is
+   experimental and off unless the operator opted in.  Channels that already
+   exist are tracked and closed regardless of this setting. */
+int jit_channels_enabled(void *mgr_ptr);
 
 /* Create a JIT channel for a specific online client.
    Funds on-chain, initializes channel_t, exchanges basepoints/nonces.
+   Refuses (returns 0) before sending anything to the client or touching the
+   wallet when jit_channels_enabled() is 0.
    Returns 1 on success. */
 int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
                         size_t client_idx, uint64_t funding_amount,

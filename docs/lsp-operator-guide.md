@@ -208,8 +208,18 @@ Press **Ctrl+C**. The LSP will:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--no-jit` | off | Disable JIT channel fallback |
-| `--jit-amount` | auto | Per-client JIT channel funding amount |
+| `--enable-jit-experimental` | off | **Unsafe, testing only.** Allow the LSP to open JIT channels: for every connected client once all factories have expired, and when a factory client sends `lsps2.buy`. Refused on mainnet. |
+| `--jit-amount` | auto | Per-client JIT channel funding amount (only used with `--enable-jit-experimental`) |
+
+JIT channels are **disabled by default**. Without `--enable-jit-experimental`
+the LSP never offers a JIT channel, never funds one, and answers `lsps2.buy`
+with a JSON-RPC error. The current JIT channel is an experiment: the LSP
+broadcasts the funding transaction before the client has signed anything, so
+a client that stops responding leaves the LSP's coins in a 2-of-2 output, and
+the channel cannot yet carry payments. Do not enable it with funds you are
+not prepared to lose. `--test-jit` implies the flag. JIT channels that were
+opened earlier are still loaded, watched and closed whether or not the flag
+is given.
 
 ### Placement Modes Explained
 
