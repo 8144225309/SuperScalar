@@ -1,12 +1,10 @@
 #include "superscalar/backup.h"
 #include "superscalar/crypto_aead.h"
+#include "superscalar/secure_file.h"
 #include "superscalar/types.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _POSIX_VERSION
-#include <fcntl.h>
-#endif
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -146,12 +144,7 @@ int backup_create(const char *db_path, const char *keyfile_path,
     if (!enc_ok) { free(ciphertext); return 0; }
 
     /* Write backup file (v2: magic + version + iters_BE + salt + nonce + ct + tag) */
-#ifdef _POSIX_VERSION
-    int fd = open(backup_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    FILE *fp = fd >= 0 ? fdopen(fd, "wb") : NULL;
-#else
-    FILE *fp = fopen(backup_path, "wb");
-#endif
+    FILE *fp = secure_file_open_private(backup_path);
     if (!fp) { free(ciphertext); return 0; }
 
     size_t written = 0;
@@ -313,14 +306,14 @@ int backup_restore(const char *backup_path, const char *dest_db_path,
     const unsigned char *kf_data = pt + 4 + db_len + 4;
 
     /* Write DB */
-    FILE *fp = fopen(dest_db_path, "wb");
+    FILE *fp = secure_file_open_private(dest_db_path);
     if (!fp) { secure_zero(pt, pt_len); free(pt); return 0; }
     size_t w = fwrite(db_data, 1, db_len, fp);
     fclose(fp);
     if (w != db_len) { secure_zero(pt, pt_len); free(pt); return 0; }
 
     /* Write keyfile */
-    fp = fopen(dest_keyfile_path, "wb");
+    fp = secure_file_open_private(dest_keyfile_path);
     if (!fp) { secure_zero(pt, pt_len); free(pt); return 0; }
     w = fwrite(kf_data, 1, kf_len, fp);
     fclose(fp);

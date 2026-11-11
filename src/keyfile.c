@@ -1,13 +1,11 @@
 #include "superscalar/keyfile.h"
 #include "superscalar/hd_key.h"
+#include "superscalar/secure_file.h"
 #include "superscalar/types.h"
 #include <secp256k1_extrakeys.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#ifdef _POSIX_VERSION
-#include <fcntl.h>
-#endif
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -78,12 +76,7 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
     aead_encrypt(ciphertext, tag, seckey32, 32, NULL, 0, enc_key, nonce);
 
     /* Write v2 format: [magic:4][iters_BE:4][salt:16][nonce:12][ct:32][tag:16] = 84 bytes */
-#ifdef _POSIX_VERSION
-    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    FILE *fp = fd >= 0 ? fdopen(fd, "wb") : NULL;
-#else
-    FILE *fp = fopen(path, "wb");
-#endif
+    FILE *fp = secure_file_open_private(path);
     if (!fp) {
         secure_zero(enc_key, 32);
         return 0;

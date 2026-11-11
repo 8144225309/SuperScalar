@@ -161,6 +161,7 @@ add_library(superscalar
     src/crypto_aead.c
     src/noise.c
     src/keyfile.c
+    src/secure_file.c
     src/hd_key.c
     src/jit_channel.c
     src/tor.c

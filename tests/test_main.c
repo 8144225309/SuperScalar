@@ -1754,6 +1754,7 @@ extern int test_backup_corrupt_file(void);
 extern int test_backup_v2_roundtrip(void);
 extern int test_backup_v1_compat(void);
 extern int test_backup_v2_wrong_passphrase(void);
+extern int test_backup_files_owner_only(void);
 
 /* UTXO Coin Selection (Mainnet Gap #1) */
 extern int test_coin_select_basic(void);
@@ -1907,6 +1908,7 @@ extern int test_regtest_ps_old_state_response(void);
 extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
 extern int test_keyfile_wrong_passphrase_v2(void);
+extern int test_keyfile_created_owner_only(void);
 
 /* Mainnet Audit: HD Key Derivation */
 extern int test_hd_master_from_seed(void);
@@ -3649,6 +3651,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_backup_v2_roundtrip);
     RUN_TEST(test_backup_v1_compat);
     RUN_TEST(test_backup_v2_wrong_passphrase);
+    RUN_TEST(test_backup_files_owner_only);
 
     printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
     RUN_TEST(test_coin_select_basic);
@@ -3804,6 +3807,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_keyfile_v2_roundtrip);
     RUN_TEST(test_keyfile_v1_compat);
     RUN_TEST(test_keyfile_wrong_passphrase_v2);
+    RUN_TEST(test_keyfile_created_owner_only);
 
     printf("\n=== Mainnet Audit: HD Key Derivation ===\n");
     RUN_TEST(test_hd_master_from_seed);

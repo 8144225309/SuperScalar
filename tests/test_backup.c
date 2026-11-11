@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include "superscalar/backup.h"
 
 #define TEST_ASSERT(cond, msg) do { \
@@ -276,5 +277,72 @@ int test_backup_v2_wrong_passphrase(void) {
                 "restore should fail with wrong passphrase");
 
     remove(db_path); remove(kf_path); remove(bak_path);
+    return 1;
+}
+
+/* Mode bits of a file, or -1 if it cannot be stat'ed. */
+static int file_mode(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int)(st.st_mode & 07777);
+}
+
+/* A backup contains the keyfile and the database, and a restore writes both
+   back out: all three files must be owner-only whatever the umask is, and
+   whatever mode a file already at the destination had. */
+int test_backup_files_owner_only(void) {
+    const char *db_path = "/tmp/test_bak_mode_db.sqlite";
+    const char *kf_path = "/tmp/test_bak_mode_kf.key";
+    const char *bak_path = "/tmp/test_bak_mode.bak";
+    const char *rest_db = "/tmp/test_bak_mode_restored_db.sqlite";
+    const char *rest_kf = "/tmp/test_bak_mode_restored_kf.key";
+
+    unsigned char db_data[] = "mode test db data";
+    unsigned char kf_data[] = "mode test kf data";
+    const unsigned char *pass = (const unsigned char *)"mode-pass";
+    size_t pass_len = strlen((const char *)pass);
+
+    remove(bak_path);
+    remove(rest_db);
+    remove(rest_kf);
+    TEST_ASSERT(write_test_file(db_path, db_data, sizeof(db_data) - 1), "write db");
+    TEST_ASSERT(write_test_file(kf_path, kf_data, sizeof(kf_data) - 1), "write kf");
+
+    mode_t old_umask = umask(0);
+
+    int created = backup_create(db_path, kf_path, bak_path, pass, pass_len);
+    int mode_bak = file_mode(bak_path);
+    int restored = backup_restore(bak_path, rest_db, rest_kf, pass, pass_len);
+    int mode_db = file_mode(rest_db);
+    int mode_kf = file_mode(rest_kf);
+
+    /* Permissive files already at the destinations must not keep their mode. */
+    int chmod_ok = chmod(bak_path, 0644) == 0 && chmod(rest_db, 0644) == 0 &&
+                   chmod(rest_kf, 0644) == 0;
+    int recreated = backup_create(db_path, kf_path, bak_path, pass, pass_len);
+    int mode_bak2 = file_mode(bak_path);
+    int restored2 = backup_restore(bak_path, rest_db, rest_kf, pass, pass_len);
+    int mode_db2 = file_mode(rest_db);
+    int mode_kf2 = file_mode(rest_kf);
+
+    umask(old_umask);
+
+    TEST_ASSERT(created, "backup_create");
+    TEST_ASSERT(mode_bak == 0600, "new backup file must be mode 0600");
+    TEST_ASSERT(restored, "backup_restore");
+    TEST_ASSERT(mode_db == 0600, "restored database must be mode 0600");
+    TEST_ASSERT(mode_kf == 0600, "restored keyfile must be mode 0600");
+    TEST_ASSERT(chmod_ok, "chmod 0644");
+    TEST_ASSERT(recreated, "backup_create over existing file");
+    TEST_ASSERT(mode_bak2 == 0600, "rewritten backup file must be mode 0600");
+    TEST_ASSERT(restored2, "backup_restore over existing files");
+    TEST_ASSERT(mode_db2 == 0600, "rewritten database must be mode 0600");
+    TEST_ASSERT(mode_kf2 == 0600, "rewritten keyfile must be mode 0600");
+
+    remove(db_path);
+    remove(kf_path);
+    remove(bak_path);
+    remove(rest_db);
+    remove(rest_kf);
     return 1;
 }

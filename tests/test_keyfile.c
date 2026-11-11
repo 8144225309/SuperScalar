@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -279,5 +280,41 @@ int test_keyfile_from_seed(void) {
     unlink(path1);
     unlink(path2);
     unlink(path3);
+    return 1;
+}
+
+/* Mode bits of a file, or -1 if it cannot be stat'ed. */
+static int file_mode(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int)(st.st_mode & 07777);
+}
+
+/* The keyfile holds the node's secret key: it must be owner-only whatever the
+   umask is, and whatever mode a file already at that path had. */
+int test_keyfile_created_owner_only(void) {
+    const char *path = "/tmp/test_keyfile_mode.key";
+    unlink(path);
+
+    unsigned char seckey[32];
+    memset(seckey, 0x42, 32);
+
+    mode_t old_umask = umask(0);
+    int saved = keyfile_save(path, seckey, "pass");
+    int mode_fresh = file_mode(path);
+
+    /* A permissive file already at the path must not keep its mode. */
+    int chmod_ok = (chmod(path, 0644) == 0);
+    int resaved = keyfile_save(path, seckey, "pass");
+    int mode_resaved = file_mode(path);
+    umask(old_umask);
+
+    TEST_ASSERT(saved, "keyfile_save");
+    TEST_ASSERT_EQ(mode_fresh, 0600, "new keyfile mode");
+    TEST_ASSERT(chmod_ok, "chmod 0644");
+    TEST_ASSERT(resaved, "keyfile_save over existing file");
+    TEST_ASSERT_EQ(mode_resaved, 0600, "rewritten keyfile mode");
+
+    unlink(path);
     return 1;
 }
