@@ -431,6 +431,13 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
    startup. */
 void client_set_persist(persist_t *persist);
 
+/* The client refuses every leaf, state and sub-factory advance: none of
+   them moves its channel onto the tree they produce, so co-signing one
+   would leave the channel without a unilateral exit.  allow != 0 lifts the
+   refusal for harnesses that exercise those ceremonies with real clients;
+   it must never be set for a client holding real funds.  Off by default. */
+void client_set_allow_tree_advance(int allow);
+
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
    If set (non-NULL), all future connections use Noise NK instead of NN.
    If NULL (default), falls back to NN with no server authentication. */
