@@ -47,6 +47,7 @@
 #define MSG_BRIDGE_REGISTER     0x47  /* LSP → Bridge: register invoice */
 #define MSG_BRIDGE_PAY_RESULT_ACK 0x57 /* LSP → Bridge: pay result recorded */
 #define MSG_BRIDGE_FULFILL_ACK  0x8E  /* Bridge → LSP: fulfil reached the node */
+#define MSG_BRIDGE_FULFILL_UNRESOLVED 0x8F /* Bridge → LSP: node could not take the fulfil */
 
 /* Reconnection messages (Phase 16) */
 #define MSG_RECONNECT           0x48  /* Client → LSP: reconnect with pubkey */
@@ -717,6 +718,15 @@ cJSON *wire_build_bridge_send_pay(const char *bolt11,
    resolved the HTLC with the preimage; the fulfil need not be sent again. */
 cJSON *wire_build_bridge_fulfill_ack(const unsigned char *payment_hash32);
 int wire_parse_bridge_fulfill_ack(const cJSON *json, unsigned char *payment_hash32);
+
+/* Bridge → LSP: BRIDGE_FULFILL_UNRESOLVED {payment_hash, reason}.  The
+   Lightning node could not be given the preimage for its HTLC; the fulfil
+   has not settled anything upstream. */
+cJSON *wire_build_bridge_fulfill_unresolved(const unsigned char *payment_hash32,
+                                             const char *reason);
+int wire_parse_bridge_fulfill_unresolved(const cJSON *json,
+                                          unsigned char *payment_hash32,
+                                          char *reason, size_t reason_len);
 
 /* LSP → Bridge: BRIDGE_PAY_RESULT_ACK {request_id, status, reason}.  The
    result for this request has been dealt with and need not be sent again.

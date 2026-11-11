@@ -264,9 +264,9 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
-            channel_receive_revocation(dest_ch, old_cn, rev_secret);
             /* PTLC snapshot for revocation registration (mirrors c2c path). */
             size_t old_dest_n_ptlcs = dest_ch->n_ptlcs;
             ptlc_t *old_dest_ptlcs = NULL;
@@ -408,9 +408,9 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
-                                                rev_secret, next_point)) {
+                                                rev_secret, next_point) &&
+                    lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
-                    channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     /* PTLC snapshot for revocation registration (mirrors c2c path). */
                     size_t old_dest_ful_n_ptlcs = dest_ch->n_ptlcs;
                     ptlc_t *old_dest_ful_ptlcs = NULL;
@@ -615,9 +615,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
-            channel_receive_revocation(sender_ch, old_cn, rev_secret);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -751,9 +751,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
-            channel_receive_revocation(dest_ch, old_cn, rev_secret);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -882,9 +882,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
-                                                rev_secret, next_point)) {
+                                                rev_secret, next_point) &&
+                    lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
-                    channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                        No-op today (n_ptlcs == 0 at all current callsites); defensive
                        for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -990,9 +990,9 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
-                                                rev_secret, next_point)) {
+                                                rev_secret, next_point) &&
+                    lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
-                    channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                        No-op today (n_ptlcs == 0 at all current callsites); defensive
                        for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -1351,9 +1351,9 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
-            channel_receive_revocation(sender_ch, old_cn, rev_secret);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */

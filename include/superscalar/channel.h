@@ -200,6 +200,12 @@ typedef struct {
        without the LSP's cooperation. */
     unsigned char latest_commitment_sig[64];
     int           has_latest_commitment_sig;
+
+    /* The HTLC this side offered last, for as long as no commitment that
+       contains it has been accepted from the peer.  Only such an HTLC can be
+       taken back by channel_rollback_htlc. */
+    int           has_unsigned_offer;
+    uint64_t      unsigned_offer_id;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */

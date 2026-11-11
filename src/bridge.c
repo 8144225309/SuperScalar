@@ -967,6 +967,23 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         return ok;
     }
 
+    if (strcmp(method->valuestring, "htlc_unresolved") == 0) {
+        /* The node could not be given the preimage: the fulfil settled
+           nothing upstream, and the LSP must know that */
+        unsigned char payment_hash[32];
+        if (wire_json_get_hex(json, "payment_hash", payment_hash, 32) != 32) {
+            cJSON_Delete(json);
+            return 0;
+        }
+        cJSON *why = cJSON_GetObjectItem(json, "reason");
+        cJSON *msg = wire_build_bridge_fulfill_unresolved(payment_hash,
+            (why && cJSON_IsString(why)) ? why->valuestring : "");
+        int ok = wire_send(br->lsp_fd, MSG_BRIDGE_FULFILL_UNRESOLVED, msg);
+        cJSON_Delete(msg);
+        cJSON_Delete(json);
+        return ok;
+    }
+
     if (strcmp(method->valuestring, "pay_result") == 0) {
         cJSON *ri = cJSON_GetObjectItem(json, "request_id");
         cJSON *su = cJSON_GetObjectItem(json, "success");

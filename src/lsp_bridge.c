@@ -14,6 +14,8 @@
 #include <string.h>
 #include <time.h>
 
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd) {
     mgr->bridge_fd = bridge_fd;
 }
@@ -329,7 +331,7 @@ size_t lsp_channels_flush_bridge_fulfils(lsp_channel_mgr_t *mgr) {
     size_t sent = 0;
     for (size_t i = 0; i < mgr->n_bridge_fulfilled; i++) {
         const bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
-        if (!f->undelivered) continue;
+        if (!f->undelivered || f->unresolved) continue;
         cJSON *again = wire_build_bridge_fulfill_htlc(f->payment_hash, f->preimage,
                                                        f->bridge_htlc_id);
         wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, again);
@@ -370,6 +372,56 @@ static void bridge_fulfil_confirmed(lsp_channel_mgr_t *mgr,
     }
     if (mgr->persist)
         persist_delete_bridge_fulfil((persist_t *)mgr->persist, payment_hash32);
+}
+
+/* The Lightning node could not take the preimage for its HTLC (it no longer
+   has the HTLC to resolve).  The client was paid inside the factory, the
+   node was not paid upstream.  The fulfil stays recorded, in the database
+   too, for the operator; it is not repeated again until the next start. */
+static void bridge_fulfil_unresolved(lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32,
+                                      const char *reason) {
+    char hash_hex[65], pre_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+    for (size_t i = 0; i < mgr->n_bridge_fulfilled; i++) {
+        bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
+        if (memcmp(f->payment_hash, payment_hash32, 32) != 0) continue;
+        hex_encode(f->preimage, 32, pre_hex);
+        if (!f->unresolved)
+            fprintf(stderr, "LSP: ERROR — the Lightning node could not take "
+                    "the fulfil of %s (upstream HTLC %s, reason: %s).  The "
+                    "client has been paid; the incoming payment is NOT "
+                    "settled.  Operator action needed: preimage %s\n",
+                    hash_hex, f->upstream_id[0] ? f->upstream_id : "unknown",
+                    reason, pre_hex);
+        f->unresolved = 1;
+        memset(pre_hex, 0, sizeof(pre_hex));
+        return;
+    }
+    fprintf(stderr, "LSP: ERROR — the Lightning node reports an unresolved "
+            "fulfil for %s (reason: %s), which is not on record here\n",
+            hash_hex, reason);
+}
+
+size_t lsp_channels_flush_bridge_fails(lsp_channel_mgr_t *mgr) {
+    if (mgr->bridge_fd < 0) return 0;
+    size_t sent = 0;
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        htlc_origin_t *o = &mgr->htlc_origins[i];
+        if (!o->active || !o->fail_pending || o->bridge_htlc_id == 0) continue;
+        cJSON *fail = wire_build_bridge_fail_htlc(o->payment_hash,
+            "htlc_timeout", o->bridge_htlc_id);
+        int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+        cJSON_Delete(fail);
+        if (!ok) break;
+        lsp_channels_origin_close(mgr, o);
+        o->fail_pending = 0;
+        sent++;
+    }
+    if (sent)
+        printf("LSP: told the bridge of %zu inbound HTLC(s) failed while it "
+               "was away\n", sent);
+    return sent;
 }
 
 /* The inbound origin in flight for this hash, or NULL. */
@@ -559,6 +611,71 @@ int lsp_channels_recv_client_reply(int fd, wire_msg_t *msg, uint8_t expected,
     }
 }
 
+int lsp_channels_accept_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                    channel_t *ch,
+                                    const unsigned char *secret32) {
+    if (ch->commitment_number > 0 &&
+        channel_receive_revocation(ch, ch->commitment_number - 1, secret32))
+        return 1;
+
+    /* Without the secret the commitment it should revoke stays usable by
+       the client and cannot be penalised: the exchange has not happened. */
+    size_t idx = mgr->n_channels;
+    for (size_t i = 0; i < mgr->n_channels; i++)
+        if (&mgr->entries[i].channel == ch) { idx = i; break; }
+    fprintf(stderr, "LSP: ERROR — invalid revocation secret for commitment "
+            "%llu from client %zu; the exchange is not complete and the "
+            "connection is dropped\n",
+            (unsigned long long)(ch->commitment_number ? ch->commitment_number - 1 : 0),
+            idx);
+    if (idx < mgr->n_channels && lsp && lsp->client_fds &&
+        lsp->client_fds[idx] >= 0) {
+        wire_close(lsp->client_fds[idx]);
+        lsp->client_fds[idx] = -1;
+        if (mgr->readiness)
+            readiness_clear((readiness_tracker_t *)mgr->readiness, (uint32_t)idx);
+    }
+    return 0;
+}
+
+/* Put a bridge message aside until its channel is free again. */
+static int defer_bridge_msg(lsp_channel_mgr_t *mgr, const wire_msg_t *msg,
+                             size_t client_idx) {
+    if (mgr->n_bridge_deferred >= LSP_BRIDGE_DEFERRED_MAX) {
+        fprintf(stderr, "LSP: ERROR — bridge message 0x%02x for busy client "
+                "%zu dropped: too many waiting\n", msg->msg_type, client_idx);
+        return 0;
+    }
+    cJSON *copy = cJSON_Duplicate(msg->json, 1);
+    if (!copy) return 0;
+    mgr->bridge_deferred[mgr->n_bridge_deferred].msg_type = msg->msg_type;
+    mgr->bridge_deferred[mgr->n_bridge_deferred].json = copy;
+    mgr->n_bridge_deferred++;
+    printf("LSP: bridge message 0x%02x waits for the exchange in progress "
+           "with client %zu\n", msg->msg_type, client_idx);
+    return 1;
+}
+
+size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (mgr->n_bridge_deferred == 0) return 0;
+    for (size_t i = 0; i < mgr->n_channels; i++)
+        if (mgr->entries[i].exchange_in_progress) return 0;
+
+    wire_msg_t waiting[LSP_BRIDGE_DEFERRED_MAX];
+    size_t n = mgr->n_bridge_deferred;
+    for (size_t i = 0; i < n; i++) {
+        waiting[i].msg_type = mgr->bridge_deferred[i].msg_type;
+        waiting[i].json = (cJSON *)mgr->bridge_deferred[i].json;
+        mgr->bridge_deferred[i].json = NULL;
+    }
+    mgr->n_bridge_deferred = 0;
+    for (size_t i = 0; i < n; i++) {
+        lsp_channels_handle_bridge_msg(mgr, lsp, &waiting[i]);
+        cJSON_Delete(waiting[i].json);
+    }
+    return n;
+}
+
 int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      size_t client_idx,
                                      uint64_t old_local, uint64_t old_remote,
@@ -589,9 +706,9 @@ int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (sent &&
             lsp_channels_recv_client_reply(fd, &ack_msg, MSG_REVOKE_AND_ACK, 30) &&
             wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
             uint64_t old_cn = ch->commitment_number - 1;
-            channel_receive_revocation(ch, old_cn, rev_secret);
             size_t old_n_ptlcs = ch->n_ptlcs;
             ptlc_t *old_ptlcs = NULL;
             if (old_n_ptlcs > 0) {
@@ -620,7 +737,7 @@ int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 "not complete (commitment %llu); dropping its connection until "
                 "it reconnects\n", client_idx,
                 (unsigned long long)ch->commitment_number);
-        if (fd >= 0) {
+        if (fd >= 0 && lsp->client_fds[client_idx] == fd) {
             wire_close(fd);
             lsp->client_fds[client_idx] = -1;
         }
@@ -738,6 +855,20 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
            it), so attach the new offer to what is there. */
         {
             htlc_origin_t *prev = inbound_origin(mgr, payment_hash);
+            if (prev && prev->fail_pending &&
+                same_upstream_htlc(mgr, prev, upstream_id, amount_msat,
+                                   cltv_expiry)) {
+                /* Already failed towards the client while the bridge was
+                   away: this is where the node gets the verdict */
+                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                    "htlc_timeout", htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
+                lsp_channels_origin_close(mgr, prev);
+                printf("LSP: bridge HTLC offered again after it timed out, "
+                       "failed back\n");
+                return 1;
+            }
             if (prev && same_upstream_htlc(mgr, prev, upstream_id, amount_msat,
                                            cltv_expiry)) {
                 prev->bridge_htlc_id = htlc_id;
@@ -897,6 +1028,17 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
+        /* Not while another exchange with this client is in progress */
+        if (mgr->entries[dest_idx].exchange_in_progress) {
+            if (!defer_bridge_msg(mgr, msg, dest_idx)) {
+                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                    "client_busy", htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
+            }
+            return 1;
+        }
+
         /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
         uint64_t old_dest_local = dest_ch->local_amount;
         uint64_t old_dest_remote = dest_ch->remote_amount;
@@ -1010,9 +1152,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t ack_chan_id;
             unsigned char rev_secret[32], next_point[33];
             if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                            rev_secret, next_point)) {
+                                            rev_secret, next_point) &&
+                lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
                 uint64_t old_cn = dest_ch->commitment_number - 1;
-                channel_receive_revocation(dest_ch, old_cn, rev_secret);
                 /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                    No-op today (n_ptlcs == 0 at all current callsites); defensive
                    for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -1125,6 +1267,18 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 break;
             }
             channel_t *ch = &mgr->entries[client_idx].channel;
+
+            /* The LSP is in the middle of another exchange with this client
+               (this message was read while waiting for its reply).  Applying
+               the result now would start a second exchange on the channel
+               and take the reply meant for the first.  It is applied, and
+               acknowledged, once the channel is free. */
+            if (mgr->entries[client_idx].exchange_in_progress) {
+                if (defer_bridge_msg(mgr, msg, client_idx))
+                    return 1;
+                /* could not be kept: unacknowledged, the plugin repeats it */
+                return 0;
+            }
 
             /* A success is only a success with the preimage of the hash the
                client's HTLC is locked to.  Anything else settles nothing:
@@ -1279,7 +1433,19 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             cJSON_Delete(ack);
         }
         lsp_channels_flush_bridge_fulfils(mgr);
+        lsp_channels_flush_bridge_fails(mgr);
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
         return 1;
+
+    case MSG_BRIDGE_FULFILL_UNRESOLVED: {
+        unsigned char payment_hash[32];
+        char why[96];
+        if (!wire_parse_bridge_fulfill_unresolved(msg->json, payment_hash,
+                                                    why, sizeof(why)))
+            return 0;
+        bridge_fulfil_unresolved(mgr, payment_hash, why);
+        return 1;
+    }
 
     case MSG_BRIDGE_FULFILL_ACK: {
         unsigned char payment_hash[32];
@@ -1327,26 +1493,32 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
 
         /* Fail back if current height is within FACTORY_CLTV_DELTA_DEFAULT of expiry */
         if (current_height + FACTORY_CLTV_DELTA_DEFAULT >= origin->cltv_expiry) {
-            printf("LSP: bridge HTLC timeout — height %u approaching expiry %u\n",
-                   current_height, origin->cltv_expiry);
+            if (!origin->fail_pending) {
+                printf("LSP: bridge HTLC timeout — height %u approaching expiry %u\n",
+                       current_height, origin->cltv_expiry);
 
-            /* Fail HTLC on destination channel to free balance */
-            size_t dest_idx = origin->sender_idx;
-            uint64_t dest_htlc_id = origin->sender_htlc_id;
-            if (dest_idx < mgr->n_channels) {
-                fail_committed_htlc(mgr, lsp, dest_idx, dest_htlc_id,
-                                    "htlc_timeout");
+                /* Fail HTLC on destination channel to free balance */
+                size_t dest_idx = origin->sender_idx;
+                uint64_t dest_htlc_id = origin->sender_htlc_id;
+                if (dest_idx < mgr->n_channels) {
+                    fail_committed_htlc(mgr, lsp, dest_idx, dest_htlc_id,
+                                        "htlc_timeout");
+                }
+                /* The Lightning node holds its HTLC until it hears the
+                   verdict.  The origin stays open (and in the database)
+                   until the bridge has been told: now, or when it is back. */
+                origin->fail_pending = 1;
             }
-
-            /* Send BRIDGE_FAIL_HTLC to bridge if connected */
             if (mgr->bridge_fd >= 0) {
                 cJSON *fail = wire_build_bridge_fail_htlc(origin->payment_hash,
                     "htlc_timeout", origin->bridge_htlc_id);
-                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
                 cJSON_Delete(fail);
+                if (ok) {
+                    origin->fail_pending = 0;
+                    lsp_channels_origin_close(mgr, origin);
+                }
             }
-
-            lsp_channels_origin_close(mgr, origin);
         }
     }
 }

@@ -5569,6 +5569,21 @@ int test_bridge_queues_for_absent_plugin(void) {
                 memcmp(ah, h1, 32) == 0, "BRIDGE_FULFILL_ACK for the hash");
     cJSON_Delete(ack.json);
 
+    /* The plugin could not hand the preimage to the node: the LSP is told
+       that, not that the fulfil was taken */
+    TEST_ASSERT(bridge_handle_plugin_msg(&br,
+        "{\"method\":\"htlc_unresolved\",\"payment_hash\":"
+        "\"5151515151515151515151515151515151515151515151515151515151515151\","
+        "\"reason\":\"channel_gone\"}"),
+        "htlc_unresolved handled");
+    TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &ack, 5), "LSP told");
+    char why[32];
+    TEST_ASSERT(ack.msg_type == MSG_BRIDGE_FULFILL_UNRESOLVED &&
+                wire_parse_bridge_fulfill_unresolved(ack.json, ah, why, sizeof(why)) &&
+                memcmp(ah, h1, 32) == 0 && strcmp(why, "channel_gone") == 0,
+                "BRIDGE_FULFILL_UNRESOLVED for the hash, with the reason");
+    cJSON_Delete(ack.json);
+
     close(plugin);
     close(lsp_sv[0]);
     bridge_cleanup(&br);
@@ -5947,7 +5962,382 @@ int test_channel_rollback_htlc(void) {
     TEST_ASSERT(channel_fail_htlc(&ch, b), "fail the first");
     TEST_ASSERT(!channel_rollback_htlc(&ch, b), "a failed HTLC is not rolled back");
     TEST_ASSERT_EQ(ch.local_amount, 100000, "all amounts back");
+
+    /* An HTLC the peer offered is never rolled back */
+    uint64_t r = 99;
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_RECEIVED, 2000, h1, 500, &r), "received HTLC");
+    uint64_t cn = ch.commitment_number;
+    uint64_t loc = ch.local_amount, rem = ch.remote_amount;
+    TEST_ASSERT(!channel_rollback_htlc(&ch, r), "a received HTLC cannot be rolled back");
+    TEST_ASSERT_EQ(ch.n_htlcs, 1, "it stays");
+    TEST_ASSERT(ch.local_amount == loc && ch.remote_amount == rem, "amounts untouched");
+    TEST_ASSERT_EQ(ch.commitment_number, cn, "commitment number untouched");
+    TEST_ASSERT(channel_fail_htlc(&ch, r), "fail it");
+
+    /* Nor an own offer once a commitment containing it has been accepted */
+    uint64_t d = 99;
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 2000, h2, 500, &d), "offer");
+    TEST_ASSERT(ch.has_unsigned_offer && ch.unsigned_offer_id == d, "offer is unsigned");
+    ch.has_unsigned_offer = 0;      /* what accepting COMMITMENT_SIGNED does */
+    cn = ch.commitment_number;
+    loc = ch.local_amount; rem = ch.remote_amount;
+    TEST_ASSERT(!channel_rollback_htlc(&ch, d), "a committed offer cannot be rolled back");
+    TEST_ASSERT_EQ(ch.n_htlcs, 1, "it stays");
+    TEST_ASSERT(ch.local_amount == loc && ch.remote_amount == rem, "amounts untouched");
+    TEST_ASSERT_EQ(ch.commitment_number, cn, "commitment number untouched");
+
+    /* The client refuses the LSP's claim that such an HTLC was never taken,
+       and changes nothing */
+    {
+        wire_msg_t fm;
+        int committed = -1;
+        uint64_t fid = 0;
+        fm.msg_type = MSG_UPDATE_FAIL_HTLC;
+        fm.json = wire_build_update_fail_htlc_uncommitted(d, "x");
+        TEST_ASSERT(!client_handle_fail_htlc(&ch, &fm, &committed, &fid),
+                    "refusal of a committed HTLC is a protocol error");
+        cJSON_Delete(fm.json);
+        TEST_ASSERT_EQ(ch.n_htlcs, 1, "HTLC kept");
+        TEST_ASSERT(ch.local_amount == loc && ch.remote_amount == rem, "amounts kept");
+        TEST_ASSERT_EQ(ch.commitment_number, cn, "commitment number kept");
+    }
     channel_cleanup(&ch);
+    return 1;
+}
+
+/* ---- A revocation secret that does not match is not a revocation ---- */
+
+int test_lsp_refuses_bad_revocation_secret(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    unsigned char good[32], bad[32];
+    memset(good, 0x33, 32);
+    memset(bad, 0x34, 32);
+    secp256k1_pubkey committed;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &committed, good), "point");
+
+    /* The client committed to a point for commitment 0 and now answers the
+       next commitment with a secret that is not the one behind it */
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    ch->ctx = ctx;
+    TEST_ASSERT_EQ(ch->commitment_number, 1, "one commitment to revoke");
+    channel_set_remote_pcp(ch, 0, &committed);
+    int ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, bad);
+    TEST_ASSERT_EQ(ok, 0, "wrong secret refused");
+    TEST_ASSERT(!ch->received_revocation_valid || !ch->received_revocation_valid[0],
+                "nothing stored for the commitment");
+    TEST_ASSERT_EQ(f.client_fd, -1, "client connection dropped");
+    wire_msg_t m;
+    TEST_ASSERT(!wire_recv_timeout(f.client_peer, &m, 1),
+                "the LSP released nothing: no revocation of its own was sent");
+    ch->ctx = NULL;
+    pay_fixture_free(&f);
+
+    /* The right secret is taken, and the connection kept */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    ch = &f.mgr.entries[0].channel;
+    ch->ctx = ctx;
+    channel_set_remote_pcp(ch, 0, &committed);
+    ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, good);
+    TEST_ASSERT_EQ(ok, 1, "matching secret accepted");
+    TEST_ASSERT(ch->received_revocation_valid && ch->received_revocation_valid[0],
+                "stored");
+    TEST_ASSERT(f.client_fd >= 0, "connection kept");
+
+    /* A secret for a commitment whose point is not known is refused too */
+    uint64_t extra;
+    unsigned char h[32];
+    memset(h, 0x35, 32);
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 1000, h, 500, &extra), "next commitment");
+    ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, good);
+    TEST_ASSERT_EQ(ok, 0, "no committed point: refused");
+    TEST_ASSERT_EQ(f.client_fd, -1, "client connection dropped");
+    ch->ctx = NULL;
+    pay_fixture_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- A pay result for a channel with an exchange in progress waits ---- */
+
+int test_lsp_pay_result_waits_for_busy_channel(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+
+    /* The LSP is waiting for this client's reply in another exchange */
+    f.mgr.entries[0].exchange_in_progress = 1;
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "taken");
+    TEST_ASSERT(pay_untouched(&f), "nothing applied, client sent nothing");
+    uint64_t rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 0, "not acknowledged yet");
+    TEST_ASSERT_EQ(f.mgr.n_bridge_deferred, 1, "kept for later");
+    size_t ran = lsp_channels_run_deferred_bridge_msgs(&f.mgr, f.lsp);
+    TEST_ASSERT_EQ(ran, 0, "not while the channel is busy");
+    TEST_ASSERT(pay_untouched(&f), "still nothing applied");
+
+    /* The outer exchange is over: the result is applied and acknowledged */
+    f.mgr.entries[0].exchange_in_progress = 0;
+    ran = lsp_channels_run_deferred_bridge_msgs(&f.mgr, f.lsp);
+    TEST_ASSERT_EQ(ran, 1, "applied once the channel is free");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC fulfilled");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "LSP credited");
+    TEST_ASSERT(lsp_channels_outbound_was_paid(&f.mgr, f.hash), "payment recorded");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "acknowledged now");
+    TEST_ASSERT_EQ(f.mgr.n_bridge_deferred, 0, "nothing left waiting");
+    ran = lsp_channels_run_deferred_bridge_msgs(&f.mgr, f.lsp);
+    TEST_ASSERT_EQ(ran, 0, "and not applied twice");
+    pay_fixture_free(&f);
+
+    /* A failure waits the same way */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    f.mgr.entries[0].exchange_in_progress = 1;
+    TEST_ASSERT(deliver_pay_result(&f, 7, 0, NULL), "taken");
+    TEST_ASSERT(pay_untouched(&f), "nothing applied");
+    f.mgr.entries[0].exchange_in_progress = 0;
+    ran = lsp_channels_run_deferred_bridge_msgs(&f.mgr, f.lsp);
+    TEST_ASSERT_EQ(ran, 1, "applied");
+    TEST_ASSERT_EQ(f.mgr.entries[0].channel.n_htlcs, 0, "HTLC failed back");
+    pay_fixture_free(&f);
+    return 1;
+}
+
+/* ---- A client fails only an HTLC it was offered ---- */
+
+int test_lsp_client_cannot_fail_its_own_htlc(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    wire_msg_t m;
+    m.msg_type = MSG_UPDATE_FAIL_HTLC;
+
+    /* The HTLC the client offered for an outside payment in flight */
+    m.json = wire_build_update_fail_htlc(f.htlc_id, "changed my mind");
+    int r = lsp_channels_handle_msg(&f.mgr, f.lsp, 0, &m);
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(r, 0, "refused");
+    TEST_ASSERT(pay_untouched(&f), "HTLC, balance and origin untouched");
+
+    /* The same once the outside payment is no longer tracked: still an HTLC
+       the client offered, never one it may fail */
+    f.mgr.htlc_origins[0].active = 0;
+    uint64_t rem = ch->remote_amount;
+    m.json = wire_build_update_fail_htlc(f.htlc_id, "again");
+    r = lsp_channels_handle_msg(&f.mgr, f.lsp, 0, &m);
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(r, 0, "refused");
+    TEST_ASSERT_EQ(ch->n_htlcs, 1, "HTLC kept");
+    TEST_ASSERT_EQ(ch->remote_amount, rem, "client not refunded");
+
+    /* An HTLC that does not exist */
+    m.json = wire_build_update_fail_htlc(4242, "none");
+    r = lsp_channels_handle_msg(&f.mgr, f.lsp, 0, &m);
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(r, 0, "refused");
+
+    /* One the LSP offered to the client can be failed by it */
+    unsigned char h[32];
+    memset(h, 0x44, 32);
+    uint64_t offered;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 3000, h, 500, &offered), "LSP offers");
+    TEST_ASSERT_EQ(ch->local_amount, 97000, "LSP's amount locked");
+    m.json = wire_build_update_fail_htlc(offered, "no thanks");
+    r = lsp_channels_handle_msg(&f.mgr, f.lsp, 0, &m);
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(r, 1, "accepted");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "LSP's amount back");
+    TEST_ASSERT_EQ(ch->n_htlcs, 1, "only the client's own HTLC is left");
+    pay_fixture_free(&f);
+    return 1;
+}
+
+/* ---- An inbound HTLC failed while the bridge is away: the bridge hears ---- */
+
+/* The fixture's channel with one more HTLC, offered by the LSP for an inbound
+   payment known to the node as upstream 1x1x1:0 (bridge id 31, expiry 500) */
+static htlc_origin_t *add_inbound_origin(pay_fixture_t *f, const unsigned char *hash) {
+    channel_t *ch = &f->mgr.entries[0].channel;
+    uint64_t id;
+    if (!channel_add_htlc(ch, HTLC_OFFERED, 3000, hash, 500, &id)) return NULL;
+    htlc_origin_t *o = lsp_channels_track_bridge_origin(&f->mgr, hash, 31);
+    if (!o) return NULL;
+    o->sender_idx = 0;
+    o->sender_htlc_id = id;
+    o->cltv_expiry = 500;
+    strcpy(o->upstream_id, "1x1x1:0");
+    return o;
+}
+
+static int next_bridge_fail(pay_fixture_t *f, const unsigned char *hash, uint64_t *id) {
+    wire_msg_t m;
+    unsigned char got[32];
+    char why[64];
+    if (!wire_recv_timeout(f->bridge_peer, &m, 1)) return 0;
+    int ok = m.msg_type == MSG_BRIDGE_FAIL_HTLC &&
+             wire_parse_bridge_fail_htlc(m.json, got, why, sizeof(why), id) &&
+             memcmp(got, hash, 32) == 0;
+    cJSON_Delete(m.json);
+    return ok;
+}
+
+int test_lsp_inbound_timeout_reaches_bridge_later(void) {
+    unsigned char h[32];
+    memset(h, 0x61, 32);
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    htlc_origin_t *o = add_inbound_origin(&f, h);
+    TEST_ASSERT(o != NULL, "inbound HTLC in flight");
+    int bridge_fd = f.mgr.bridge_fd;
+
+    /* Near expiry with the bridge away: the client's HTLC is failed, the
+       origin stays until the bridge can be told */
+    f.mgr.bridge_fd = -1;
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, 495);
+    TEST_ASSERT_EQ(ch->n_htlcs, 1, "the inbound HTLC is failed on the channel");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "LSP's amount back");
+    TEST_ASSERT(o->active && o->fail_pending, "origin kept: fail still to deliver");
+    TEST_ASSERT(lsp_channels_bridge_htlc_pending(&f.mgr, h), "hash still in use");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(f.client_peer, &m, 1) &&
+                m.msg_type == MSG_UPDATE_FAIL_HTLC, "client told once");
+    cJSON_Delete(m.json);
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, 496);
+    TEST_ASSERT(o->active && o->fail_pending, "still waiting for the bridge");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "nothing failed twice");
+
+    /* The bridge is back: its first heartbeat brings the verdict */
+    f.mgr.bridge_fd = bridge_fd;
+    deliver_bridge_msg(&f.mgr, f.lsp, MSG_BRIDGE_HELLO, wire_build_bridge_hello(NULL));
+    TEST_ASSERT(wire_recv_timeout(f.bridge_peer, &m, 1) &&
+                m.msg_type == MSG_BRIDGE_HELLO_ACK, "heartbeat answered");
+    cJSON_Delete(m.json);
+    uint64_t id = 0;
+    TEST_ASSERT(next_bridge_fail(&f, h, &id), "BRIDGE_FAIL_HTLC for the HTLC");
+    TEST_ASSERT_EQ(id, 31, "under the bridge's id");
+    TEST_ASSERT(!o->active, "origin closed");
+    size_t again = lsp_channels_flush_bridge_fails(&f.mgr);
+    TEST_ASSERT_EQ(again, 0, "told once");
+    pay_fixture_free(&f);
+
+    /* The node offers the held HTLC again after the reconnect, before any
+       heartbeat: it gets the fail verdict under the new id */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    o = add_inbound_origin(&f, h);
+    TEST_ASSERT(o != NULL, "inbound HTLC in flight");
+    bridge_fd = f.mgr.bridge_fd;
+    f.mgr.bridge_fd = -1;
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, 495);
+    TEST_ASSERT(o->active && o->fail_pending, "fail waits for the bridge");
+    f.mgr.bridge_fd = bridge_fd;
+    cJSON *add = wire_build_bridge_add_htlc(h, 3000000, 500, 77);
+    cJSON_AddStringToObject(add, "upstream_id", "1x1x1:0");
+    deliver_bridge_msg(&f.mgr, f.lsp, MSG_BRIDGE_ADD_HTLC, add);
+    id = 0;
+    TEST_ASSERT(next_bridge_fail(&f, h, &id), "fail verdict for the re-offered HTLC");
+    TEST_ASSERT_EQ(id, 77, "under its new id");
+    TEST_ASSERT(!o->active, "origin closed");
+    TEST_ASSERT_EQ(f.mgr.entries[0].channel.n_htlcs, 1, "nothing offered to the client again");
+    pay_fixture_free(&f);
+
+    /* With the bridge connected the verdict goes out at once, as before */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    o = add_inbound_origin(&f, h);
+    TEST_ASSERT(o != NULL, "inbound HTLC in flight");
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, 495);
+    id = 0;
+    TEST_ASSERT(next_bridge_fail(&f, h, &id) && id == 31, "failed back at once");
+    TEST_ASSERT(!o->active, "origin closed");
+    pay_fixture_free(&f);
+    return 1;
+}
+
+/* ---- A fulfil the node could not take stays on record ---- */
+
+int test_lsp_unresolved_fulfil_is_kept(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.persist = &db;
+    mgr.bridge_fd = sv[0];
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.htlc_origins && lsp, "alloc");
+
+    unsigned char preimage[32], hash[32];
+    memset(preimage, 0x52, 32);
+    sha256(preimage, 32, hash);
+    htlc_origin_t *o = lsp_channels_track_bridge_origin(&mgr, hash, 90);
+    TEST_ASSERT(o != NULL, "origin");
+    strcpy(o->upstream_id, "5x5x5:3");
+    uint64_t bid = lsp_channels_settle_bridge_origin(&mgr, hash, preimage);
+    TEST_ASSERT_EQ(bid, 90, "client fulfilled");
+    size_t sent = lsp_channels_flush_bridge_fulfils(&mgr);
+    TEST_ASSERT_EQ(sent, 1, "fulfil sent to the bridge");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(sv[1], &m, 1) &&
+                m.msg_type == MSG_BRIDGE_FULFILL_HTLC, "the fulfil");
+    cJSON_Delete(m.json);
+
+    /* The node could not take it: not confirmed, not forgotten */
+    deliver_bridge_msg(&mgr, lsp, MSG_BRIDGE_FULFILL_UNRESOLVED,
+                       wire_build_bridge_fulfill_unresolved(hash, "channel_gone"));
+    TEST_ASSERT(mgr.bridge_fulfilled[0].undelivered, "still not confirmed");
+    TEST_ASSERT(mgr.bridge_fulfilled[0].unresolved, "marked for the operator");
+    TEST_ASSERT(memcmp(mgr.bridge_fulfilled[0].preimage, preimage, 32) == 0 &&
+                strcmp(mgr.bridge_fulfilled[0].upstream_id, "5x5x5:3") == 0,
+                "preimage and upstream HTLC kept");
+    persist_bridge_fulfil_t rows[4];
+    size_t n = persist_load_bridge_fulfils(&db, rows, 4, 0);
+    TEST_ASSERT_EQ(n, 1, "still in the database");
+    TEST_ASSERT(memcmp(rows[0].preimage, preimage, 32) == 0 &&
+                memcmp(rows[0].payment_hash, hash, 32) == 0 &&
+                strcmp(rows[0].upstream_id, "5x5x5:3") == 0, "with preimage, hash and upstream");
+    TEST_ASSERT(lsp_channels_hash_spent_or_busy(&mgr, hash), "hash stays spent");
+    sent = lsp_channels_flush_bridge_fulfils(&mgr);
+    TEST_ASSERT_EQ(sent, 0, "not repeated at every heartbeat");
+    TEST_ASSERT(!wire_recv_timeout(sv[1], &m, 1), "bridge sent nothing more");
+
+    /* After a restart it is offered to the node once more */
+    {
+        lsp_channel_mgr_t again;
+        memset(&again, 0, sizeof(again));
+        again.persist = &db;
+        again.bridge_fd = sv[0];
+        n = lsp_channels_load_bridge_fulfils(&again);
+        TEST_ASSERT_EQ(n, 1, "restored from disk");
+        sent = lsp_channels_flush_bridge_fulfils(&again);
+        TEST_ASSERT_EQ(sent, 1, "and sent");
+        TEST_ASSERT(wire_recv_timeout(sv[1], &m, 1) &&
+                    m.msg_type == MSG_BRIDGE_FULFILL_HTLC, "the fulfil");
+        cJSON_Delete(m.json);
+    }
+
+    /* The wire message */
+    {
+        unsigned char got[32];
+        char why[32];
+        cJSON *j = wire_build_bridge_fulfill_unresolved(hash, "channel_gone");
+        TEST_ASSERT(wire_parse_bridge_fulfill_unresolved(j, got, why, sizeof(why)) &&
+                    memcmp(got, hash, 32) == 0 && strcmp(why, "channel_gone") == 0,
+                    "round trip");
+        cJSON_DeleteItemFromObject(j, "payment_hash");
+        TEST_ASSERT(!wire_parse_bridge_fulfill_unresolved(j, got, why, sizeof(why)),
+                    "hash required");
+        cJSON_Delete(j);
+    }
+
+    close(sv[0]); close(sv[1]);
+    free(mgr.htlc_origins); free(lsp);
+    persist_close(&db);
     return 1;
 }
 

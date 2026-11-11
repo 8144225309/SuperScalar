@@ -1318,6 +1318,11 @@ extern int test_lsp_recv_client_reply_skips_keepalives(void);
 extern int test_lsp_incomplete_commitment_drops_client(void);
 extern int test_channel_rollback_htlc(void);
 extern int test_client_handles_update_fail_htlc(void);
+extern int test_lsp_refuses_bad_revocation_secret(void);
+extern int test_lsp_pay_result_waits_for_busy_channel(void);
+extern int test_lsp_client_cannot_fail_its_own_htlc(void);
+extern int test_lsp_inbound_timeout_reaches_bridge_later(void);
+extern int test_lsp_unresolved_fulfil_is_kept(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -3273,6 +3278,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_incomplete_commitment_drops_client);
     RUN_TEST(test_channel_rollback_htlc);
     RUN_TEST(test_client_handles_update_fail_htlc);
+    RUN_TEST(test_lsp_refuses_bad_revocation_secret);
+    RUN_TEST(test_lsp_pay_result_waits_for_busy_channel);
+    RUN_TEST(test_lsp_client_cannot_fail_its_own_htlc);
+    RUN_TEST(test_lsp_inbound_timeout_reaches_bridge_later);
+    RUN_TEST(test_lsp_unresolved_fulfil_is_kept);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

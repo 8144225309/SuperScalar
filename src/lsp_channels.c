@@ -499,9 +499,21 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 fprintf(stderr, "LSP: bridge disconnected during ceremony\n");
                 mgr->bridge_fd = -1;
             } else {
+                /* The channel of the client whose reply is awaited here is
+                   in the middle of an exchange: bridge messages that would
+                   start another one on it are put aside. */
+                size_t busy = mgr->n_channels;
+                for (size_t bi = 0; lsp && lsp->client_fds && bi < mgr->n_channels; bi++)
+                    if (lsp->client_fds[bi] == client_fd) { busy = bi; break; }
+                int was_busy = busy < mgr->n_channels
+                    ? mgr->entries[busy].exchange_in_progress : 0;
+                if (busy < mgr->n_channels)
+                    mgr->entries[busy].exchange_in_progress = 1;
                 servicing = 1;
                 lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
                 servicing = 0;
+                if (busy < mgr->n_channels)
+                    mgr->entries[busy].exchange_in_progress = was_busy;
                 cJSON_Delete(bmsg.json);
             }
         }
@@ -5103,9 +5115,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
             uint64_t old_cn = ch->commitment_number - 1;
-            channel_receive_revocation(ch, old_cn, rev_secret);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -5250,9 +5262,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                                rev_secret, next_point)) {
+                                                rev_secret, next_point) &&
+                    lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
-                    channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                        No-op today (n_ptlcs == 0 at all current callsites); defensive
                        for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -5343,6 +5355,23 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wire_parse_update_fail_htlc(msg->json, &htlc_id, reason, sizeof(reason)))
             return 0;
         channel_t *ch = &mgr->entries[client_idx].channel;
+        /* A client can only give back an HTLC the LSP offered to it.  One
+           the client offered itself is the LSP's to resolve: failing it here
+           would refund the client for a payment that may still go through
+           (an outside payment in flight above all). */
+        const htlc_t *target = NULL;
+        for (size_t hi = 0; hi < ch->n_htlcs; hi++)
+            if (ch->htlcs[hi].id == htlc_id &&
+                ch->htlcs[hi].state == HTLC_STATE_ACTIVE)
+                target = &ch->htlcs[hi];
+        if (!target || target->direction != HTLC_OFFERED ||
+            lsp_channels_htlc_awaits_outside_pay(mgr, client_idx, htlc_id)) {
+            fprintf(stderr, "LSP: PROTOCOL ERROR — client %zu sent "
+                    "UPDATE_FAIL_HTLC for HTLC %llu, which is %s; ignored\n",
+                    client_idx, (unsigned long long)htlc_id,
+                    target ? "not one it received" : "not active");
+            return 0;
+        }
         channel_fail_htlc(ch, htlc_id);
         /* Delete failed HTLC from persistence */
         if (mgr->persist)
@@ -6097,7 +6126,16 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         if (wire_parse_revoke_and_ack(pcs_raa.json, &pcs_ack_id,
                                                         pcs_rev, pcs_np)) {
                             uint64_t old_pcn = ch->commitment_number - 1;
-                            channel_receive_revocation(ch, old_pcn, pcs_rev);
+                            if (!channel_receive_revocation(ch, old_pcn, pcs_rev)) {
+                                fprintf(stderr, "LSP reconnect: ERROR — invalid "
+                                        "revocation secret for commitment %llu "
+                                        "from client %zu; commitment stays "
+                                        "pending, reconnect refused\n",
+                                        (unsigned long long)old_pcn, c);
+                                cJSON_Delete(pcs_raa.json);
+                                cJSON_Delete(pcs_cs);
+                                return 0;
+                            }
                         }
                         cJSON_Delete(pcs_raa.json);
                         persist_save_pending_cs(pcs_db,
@@ -6408,14 +6446,15 @@ int lsp_channels_settle_via_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t ack_ch_id;
             unsigned char rev_secret[32], next_point[33];
             if (wire_parse_revoke_and_ack(ack.json, &ack_ch_id,
-                                            rev_secret, next_point)) {
-                uint64_t old_cn = ch->commitment_number - 1;
-                channel_receive_revocation(ch, old_cn, rev_secret);
+                                            rev_secret, next_point) &&
+                lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
                 secp256k1_pubkey next_pcp;
                 if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                     channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
             }
             cJSON_Delete(ack.json);
+            /* a refused revocation secret ends the exchange here */
+            if (lsp->client_fds[i] < 0) continue;
         }
 
         /* Send LSP's own revocation */
@@ -6575,6 +6614,9 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         if (ret == 0)
             continue;  /* idle tick -- stay patient; loop_deadline bounds the wait */
+
+        /* Bridge messages put aside during an exchange */
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
@@ -7964,6 +8006,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Handle admin RPC request */
         if (admin_rpc_slot >= 0 && (pfds[admin_rpc_slot].revents & POLLIN))
             admin_rpc_service((admin_rpc_t *)mgr->admin_rpc);
+
+        /* Bridge messages put aside during an exchange */
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {

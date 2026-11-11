@@ -1845,6 +1845,27 @@ int wire_parse_bridge_fulfill_ack(const cJSON *json, unsigned char *payment_hash
     return wire_json_get_hex(json, "payment_hash", payment_hash32, 32) == 32;
 }
 
+cJSON *wire_build_bridge_fulfill_unresolved(const unsigned char *payment_hash32,
+                                             const char *reason) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddStringToObject(j, "reason", reason ? reason : "");
+    return j;
+}
+
+int wire_parse_bridge_fulfill_unresolved(const cJSON *json,
+                                          unsigned char *payment_hash32,
+                                          char *reason, size_t reason_len) {
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    if (reason && reason_len > 0) {
+        cJSON *r = cJSON_GetObjectItem(json, "reason");
+        snprintf(reason, reason_len, "%s",
+                 (r && cJSON_IsString(r)) ? r->valuestring : "");
+    }
+    return 1;
+}
+
 cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id,
                                           const char *rejected_reason) {
     cJSON *j = cJSON_CreateObject();

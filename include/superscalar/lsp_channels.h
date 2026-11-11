@@ -113,6 +113,8 @@ typedef struct {
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
     size_t close_spk_len;       /* 34 when populated, 0 if unset */
     uint64_t accumulated_fees_sats; /* routing fees earned on THIS channel */
+    int exchange_in_progress;   /* the LSP is waiting for this client's reply:
+                                   no other exchange may start on the channel */
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
@@ -144,6 +146,8 @@ typedef struct {
     #define BRIDGE_UPSTREAM_ID_MAX 64
     char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
     int expiry_warned;          /* outbound: unresolved-near-expiry logged */
+    int fail_pending;           /* inbound: failed towards the client, the
+                                   bridge has still to be told */
     int64_t db_id;              /* its row in the database, 0 if not saved */
     int active;
 } htlc_origin_t;
@@ -157,6 +161,8 @@ typedef struct {
     char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
     uint64_t bridge_htlc_id;
     int undelivered;    /* the bridge has not confirmed this fulfil yet */
+    int unresolved;     /* the Lightning node could not take it: kept, not
+                           repeated until the next start */
 } bridge_fulfilled_t;
 
 typedef struct {
@@ -182,6 +188,11 @@ typedef struct {
     bridge_fulfilled_t bridge_fulfilled[LSP_BRIDGE_FULFILLED_MAX];
     size_t n_bridge_fulfilled;
     size_t bridge_fulfilled_next;
+    /* Bridge messages that arrived for a channel with an exchange in
+       progress; handled once the channel is free. */
+    #define LSP_BRIDGE_DEFERRED_MAX 16
+    struct { uint8_t msg_type; void *json; } bridge_deferred[LSP_BRIDGE_DEFERRED_MAX];
+    size_t n_bridge_deferred;
     #define LSP_OUTBOUND_PAID_MAX 64
     unsigned char outbound_paid[LSP_OUTBOUND_PAID_MAX][32];
     size_t n_outbound_paid;
@@ -659,6 +670,24 @@ uint64_t lsp_channels_settle_bridge_origin(lsp_channel_mgr_t *mgr,
    lsp_channels_flush_bridge_fulfils sends them; it returns how many.
    lsp_channels_load_bridge_fulfils restores them after a restart. */
 size_t lsp_channels_flush_bridge_fulfils(lsp_channel_mgr_t *mgr);
+
+/* Tell the bridge about inbound HTLCs that were failed while it was away.
+   Returns how many. */
+size_t lsp_channels_flush_bridge_fails(lsp_channel_mgr_t *mgr);
+
+/* Handle the bridge messages that were put aside because their channel had
+   an exchange in progress.  Does nothing while any channel still has one.
+   Returns how many were handled. */
+size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Take the revocation secret a client sent for the commitment before the
+   channel's current one.  Returns 1 if it matches the point the client
+   committed to and was stored.  Otherwise nothing is stored, the error is
+   logged and the client's connection is dropped: the caller must not go on
+   with the exchange (no watchtower entry, no revocation of its own). */
+int lsp_channels_accept_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                    channel_t *ch,
+                                    const unsigned char *secret32);
 size_t lsp_channels_load_bridge_fulfils(lsp_channel_mgr_t *mgr);
 
 /* 1 if an HTLC for payment_hash32 is in flight through the bridge in either
