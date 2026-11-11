@@ -2956,10 +2956,49 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return changed;
 }
 
-/* Cooperatively redistribute output amounts on an arity-2 leaf (3-of-3).
-   LSP proposes new amounts; both clients agree via 2-round MuSig2 ceremony. */
+static int lsp_realloc_leaf_ceremony(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int leaf_side, const uint64_t *amounts,
+                                      size_t n_amounts);
+
+/* Cooperatively redistribute output amounts on a leaf.  The ceremony
+   advances the LSP's own copy of the leaf before it asks the clients, so a
+   ceremony that fails (a client refuses, times out or sends a bad
+   signature) would leave the LSP on a leaf state nobody else holds and with
+   no signature for it.  The leaf is captured first and put back on failure. */
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts) {
+    if (!mgr || !lsp || !amounts) return 0;
+    factory_t *f = &lsp->factory;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    factory_leaf_snapshot_t before;
+    if (!factory_leaf_snapshot(f, leaf_side, &before)) {
+        fprintf(stderr, "LSP realloc: cannot capture leaf %d before the "
+                "ceremony\n", leaf_side);
+        return 0;
+    }
+    uint32_t root_epoch_before = f->counter.current_epoch;
+
+    int ok = lsp_realloc_leaf_ceremony(mgr, lsp, leaf_side, amounts, n_amounts);
+
+    /* If the leaf counter was exhausted the root advanced and the whole tree
+       was rebuilt for a new epoch; that is not undone leaf by leaf. */
+    if (!ok && f->counter.current_epoch == root_epoch_before) {
+        factory_session_reset_poison(f, f->leaf_node_indices[leaf_side]);
+        if (factory_leaf_restore(f, leaf_side, &before))
+            fprintf(stderr, "LSP realloc: ceremony failed — leaf %d restored "
+                    "to its state before the proposal\n", leaf_side);
+        else
+            fprintf(stderr, "LSP realloc: ceremony failed and leaf %d could "
+                    "NOT be restored\n", leaf_side);
+    }
+    factory_leaf_snapshot_free(&before);
+    return ok;
+}
+
+static int lsp_realloc_leaf_ceremony(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int leaf_side, const uint64_t *amounts,
+                                      size_t n_amounts) {
     factory_t *f = &lsp->factory;
 
     /* Generalized to N-of-N MuSig.  Works for any leaf arity where the
@@ -4898,91 +4937,19 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 /* Buy inbound liquidity from L-stock for a client.
-   Moves amount_sats from the L-stock output (last vout on the leaf) to
-   the client's channel output, then adjusts channel balance so purchased
-   sats become LSP local_amount (= client's inbound capacity).
 
-   Generalized in PR #123 (Gap C-followup) to work for any leaf arity
-   that has an L-stock output (i.e., n_outputs >= 2 — at least 1 channel
-   + L-stock).  PS leaves post-advance (n_outputs == 1, no L-stock) are
-   correctly rejected. */
+   Selling L-stock moves sats from the leaf's L-stock output to the client's
+   channel output, which is a leaf reallocation.  Clients refuse to co-sign
+   one, because their channel cannot yet be moved to the new leaf output, so
+   the request is refused here, before anything is proposed to a client or
+   changed on the leaf. */
 int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 size_t client_idx, uint64_t amount_sats) {
-    if (!mgr || !lsp) return 0;
-    factory_t *f = &lsp->factory;
-    if (client_idx >= mgr->n_channels || amount_sats == 0) {
-        fprintf(stderr, "buy_liquidity: invalid client %zu or amount 0\n", client_idx);
-        return 0;
-    }
-
-    /* Map client to leaf */
-    size_t node_idx;
-    uint32_t vout;
-    client_to_leaf(client_idx, f, &node_idx, &vout);
-    factory_node_t *ln = &f->nodes[node_idx];
-    if (ln->n_outputs < 2) {
-        fprintf(stderr, "buy_liquidity: leaf %zu has %zu outputs, need >= 2 (channels + L-stock)\n",
-                node_idx, ln->n_outputs);
-        return 0;
-    }
-
-    /* L-stock is the LAST output on the leaf (canonical layout for both
-       uniform-arity and mixed-arity factories). */
-    size_t lstock_vout = ln->n_outputs - 1;
-    if (vout == lstock_vout) {
-        fprintf(stderr, "buy_liquidity: client %zu maps to L-stock vout, not a channel\n", client_idx);
-        return 0;
-    }
-
-    /* Validate L-stock has enough (keep >= 546 dust) */
-    uint64_t lstock = ln->outputs[lstock_vout].amount_sats;
-    if (lstock < 546 + amount_sats) {
-        fprintf(stderr, "buy_liquidity: amount %llu exceeds L-stock %llu (dust limit)\n",
-                (unsigned long long)amount_sats, (unsigned long long)lstock);
-        return 0;
-    }
-
-    /* Find which leaf_side this client's leaf is at.  We need this for
-       lsp_realloc_leaf which takes leaf_side (index into
-       f->leaf_node_indices[]), not raw node_idx. */
-    int leaf_side = -1;
-    for (int i = 0; i < f->n_leaf_nodes; i++) {
-        if (f->leaf_node_indices[i] == node_idx) { leaf_side = i; break; }
-    }
-    if (leaf_side < 0) {
-        fprintf(stderr, "buy_liquidity: node %zu not found in leaf_node_indices\n", node_idx);
-        return 0;
-    }
-
-    /* Build new amounts: add to client's output, subtract from L-stock */
-    uint64_t new_amounts[FACTORY_MAX_OUTPUTS];
-    for (size_t k = 0; k < ln->n_outputs; k++)
-        new_amounts[k] = ln->outputs[k].amount_sats;
-    new_amounts[vout] += amount_sats;
-    new_amounts[lstock_vout] -= amount_sats;
-
-    /* Perform the reallocation (DW advance + MuSig2 re-sign) */
-    if (!lsp_realloc_leaf(mgr, lsp, leaf_side, new_amounts, ln->n_outputs)) {
-        fprintf(stderr, "buy_liquidity: realloc failed\n");
-        return 0;
-    }
-
-    /* Override balance split: purchased sats go to LSP local_amount
-       (= client's inbound capacity) */
-    size_t fd_idx = client_idx;
-    if (fd_idx < mgr->n_channels) {
-        lsp_channel_entry_t *entry = &mgr->entries[fd_idx];
-        uint64_t add_msat = amount_sats * 1000;
-        entry->channel.local_amount += add_msat;
-        if (entry->channel.remote_amount >= add_msat)
-            entry->channel.remote_amount -= add_msat;
-        else
-            entry->channel.remote_amount = 0;
-    }
-
-    printf("LSP: buy_liquidity client %zu: +%llu sats inbound from L-stock\n",
-           client_idx, (unsigned long long)amount_sats);
-    return 1;
+    (void)mgr; (void)lsp;
+    fprintf(stderr, "buy_liquidity: refused for client %zu (%llu sats): "
+            LSP_LEAF_REALLOC_UNAVAILABLE "\n",
+            client_idx, (unsigned long long)amount_sats);
+    return 0;
 }
 
 /* Handle FULFILL_HTLC from a client (the payee reveals the preimage). */
@@ -6745,7 +6712,8 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("  status                       Show factory/channel/bridge state\n");
         printf("  rotate                       Force factory rotation\n");
         printf("  close                        Cooperative close and shutdown\n");
-        printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n");
+        printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n"
+               "                               (" LSP_LEAF_REALLOC_UNAVAILABLE ")\n");
         printf("  pay_external <client> <bolt11> Pay external LN invoice via bridge\n");
         printf("  help                         Show this help\n");
     } else if (strncmp(line, "buy_liquidity ", 14) == 0) {
@@ -6758,12 +6726,12 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             } else if (amt == 0) {
                 printf("CLI: amount must be > 0\n");
             } else {
-                printf("CLI: buying %llu sats inbound for client %u\n", amt, client);
-                fflush(stdout);
+                /* Refused up front; see lsp_channels_buy_liquidity. */
                 if (lsp_channels_buy_liquidity(mgr, lsp, (size_t)client, (uint64_t)amt))
                     printf("CLI: buy_liquidity succeeded\n");
                 else
-                    printf("CLI: buy_liquidity FAILED\n");
+                    printf("CLI: buy_liquidity refused: "
+                           LSP_LEAF_REALLOC_UNAVAILABLE "\n");
             }
         } else {
             printf("CLI: usage: buy_liquidity <client> <amount_sats>\n");
@@ -8089,8 +8057,10 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
             }
         }
         for (size_t p = 0; p < ch->n_ptlcs; p++) {
-            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE)
+            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE) {
                 sum += ch->ptlcs[p].amount_sats;
+                sum += ch->ptlcs[p].fee_at_add;
+            }
         }
 
         /* Match lsp_channels_init: base commit_fee (154 vB × fee_rate)
