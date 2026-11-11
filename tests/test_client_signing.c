@@ -305,6 +305,71 @@ int test_client_close_refuses_unbalanced_channel(void) {
     return 1;
 }
 
+/* The balance may be paid in several outputs; what counts is their sum, and
+   only outputs carrying the client's own script are part of it. */
+int test_client_close_sums_outputs_to_own_script(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+
+    unsigned char spk[CS_N][34];
+    for (int i = 0; i < CS_N; i++)
+        TEST_ASSERT(client_close_script(ctx, &pks[i], spk[i]), "close script");
+
+    const uint64_t balance = 100000;
+    channel_t ch;
+    cs_channel(&ch, balance);
+    tx_output_t outs[5];
+    uint64_t paid = 0;
+
+    /* 60000 + 30000 + 10000 to the client, interleaved with others. */
+    cs_output(&outs[0], 60000, spk[1]);
+    cs_output(&outs[1], 500000, spk[0]);
+    cs_output(&outs[2], 30000, spk[1]);
+    cs_output(&outs[3], 250000, spk[2]);
+    cs_output(&outs[4], 10000, spk[1]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
+                paid == 100000, "three own outputs are summed");
+    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
+                "balance split over three outputs is accepted");
+
+    /* One sat short in total. */
+    cs_output(&outs[4], 9999, spk[1]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
+                paid == 99999, "sum is one sat short");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
+                "a sum one sat short is refused");
+
+    /* The missing part paid to another client's script does not count. */
+    cs_output(&outs[4], 10000, spk[2]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
+                paid == 90000, "another client's output is not summed");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
+                "sum completed by another script is refused");
+
+    /* Nor does an own-script output with a truncated script. */
+    cs_output(&outs[4], 10000, spk[1]);
+    outs[4].script_pubkey_len = 33;
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
+                paid == 90000, "truncated script is not summed");
+
+    /* No output of its own at all. */
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[3], outs, 5, &paid) &&
+                paid == 0, "a client with no output is paid nothing");
+
+    /* A sum that overflows cannot be trusted. */
+    cs_output(&outs[0], UINT64_MAX, spk[1]);
+    cs_output(&outs[2], 1, spk[1]);
+    TEST_ASSERT(!client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid),
+                "overflowing sum is an error");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
+                "overflowing sum is refused");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* One message of a scripted LSP. */
 typedef struct {
     uint8_t type;
@@ -553,6 +618,146 @@ int test_client_close_without_channel(void) {
     TEST_ASSERT(!has_other && !has_other_vout,
                 "a channel of another factory does not count");
     return 1;
+}
+
+/* Build client 1's channel on its leaf output the way the client does. */
+static int cs_client_channel(channel_t *ch, secp256k1_context *ctx,
+                             const factory_t *f, const secp256k1_keypair *kps,
+                             const secp256k1_pubkey *pks) {
+    static const unsigned char sec[4][32] = {
+        { [0 ... 31] = 0x61 }, { [0 ... 31] = 0x62 },
+        { [0 ... 31] = 0x63 }, { [0 ... 31] = 0x64 },
+    };
+    /* Any valid points serve as the LSP's basepoints here. */
+    return client_init_channel(ch, ctx, f, &kps[1], 1,
+                                &pks[0], &pks[2], &pks[3], &pks[4],
+                                sec[0], sec[1], sec[2], sec[3], NULL);
+}
+
+/* Reload the channel as a reconnecting client does: rebuild it from the
+   factory, then overwrite balances and commitment number with the stored
+   ones.  HTLCs are not part of what is stored or restored. */
+static int cs_client_channel_reload(channel_t *ch, secp256k1_context *ctx,
+                                    const factory_t *f,
+                                    const secp256k1_keypair *kps,
+                                    const secp256k1_pubkey *pks,
+                                    persist_t *db) {
+    uint64_t local = 0, remote = 0, cn = 0;
+    if (!cs_client_channel(ch, ctx, f, kps, pks)) return 0;
+    if (!persist_load_channel_state(db, 0, &local, &remote, &cn)) return 0;
+    ch->local_amount = local;
+    ch->remote_amount = remote;
+    ch->commitment_number = cn;
+    return 1;
+}
+
+/* A close attempted after a reconnect.  The client offered an HTLC, saved
+   its balances and reconnected: the reloaded channel has the reduced balance
+   and an empty HTLC list.  A proposal that pays that balance exactly must be
+   refused, or the HTLC amount would go to the LSP. */
+int test_client_close_after_reconnect_with_htlc_in_flight(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+
+    int pass = 1;
+#define CS_CHECK(cond, msg) do { \
+        if (pass && !(cond)) { \
+            printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+            pass = 0; \
+        } \
+    } while (0)
+
+    channel_t live;
+    CS_CHECK(cs_client_channel(&live, ctx, f, kps, pks), "open channel");
+    const uint64_t balance_before = live.local_amount;
+    CS_CHECK(balance_before > 50000, "client holds a balance");
+    CS_CHECK(persist_save_channel(&db, &live, 0, 0), "save channel");
+
+    tx_output_t outs[2];
+    int rc = -1;
+    uint8_t sent = 0;
+
+    /* Control: reconnect with nothing in flight, close paying the balance. */
+    {
+        channel_t reloaded;
+        CS_CHECK(cs_client_channel_reload(&reloaded, ctx, f, kps, pks, &db),
+                 "reload channel");
+        CS_CHECK(reloaded.local_amount == balance_before, "balance restored");
+        cs_output(&outs[0], CS_FUNDING - 1000 - reloaded.local_amount, lsp_spk);
+        cs_output(&outs[1], reloaded.local_amount, my_spk);
+        CS_CHECK(cs_run_client_close(ctx, &kps[1], &pks[1], f, &reloaded,
+                                      outs, 2, &rc, &sent), "run");
+        CS_CHECK(sent == MSG_CLOSE_NONCE,
+                 "reconnected client with nothing in flight signs");
+        channel_cleanup(&reloaded);
+    }
+
+    /* The client offers an HTLC and stores its new balances. */
+    const uint64_t htlc_amount = 20000;
+    unsigned char payment_hash[32];
+    memset(payment_hash, 0x5A, 32);
+    uint64_t htlc_id = 0;
+    CS_CHECK(channel_add_htlc(&live, HTLC_OFFERED, htlc_amount, payment_hash,
+                               500, &htlc_id), "offer HTLC");
+    CS_CHECK(live.local_amount < balance_before, "HTLC left the balance");
+    CS_CHECK(persist_update_channel_balance(&db, 0, live.local_amount,
+                                             live.remote_amount,
+                                             live.commitment_number),
+             "store balances");
+
+    /* While still connected, the pending-HTLC rule refuses. */
+    cs_output(&outs[0], CS_FUNDING - 1000 - live.local_amount, lsp_spk);
+    cs_output(&outs[1], live.local_amount, my_spk);
+    CS_CHECK(cs_run_client_close(ctx, &kps[1], &pks[1], f, &live, outs, 2,
+                                  &rc, &sent), "run");
+    CS_CHECK(rc == 0 && sent == MSG_ERROR,
+             "connected client refuses over the pending HTLC");
+
+    /* Reconnect: the HTLC is gone from the channel, its amount from the
+       balance. */
+    {
+        channel_t reloaded;
+        CS_CHECK(cs_client_channel_reload(&reloaded, ctx, f, kps, pks, &db),
+                 "reload channel");
+        size_t n_active = 0;
+        for (size_t i = 0; i < reloaded.n_htlcs; i++)
+            if (reloaded.htlcs[i].state == HTLC_STATE_ACTIVE) n_active++;
+        CS_CHECK(n_active == 0, "no HTLC restored on reconnect");
+        CS_CHECK(reloaded.local_amount == live.local_amount &&
+                 reloaded.local_amount < balance_before,
+                 "reloaded balance excludes the HTLC amount");
+
+        /* The LSP offers exactly that reduced balance. */
+        cs_output(&outs[0], CS_FUNDING - 1000 - reloaded.local_amount, lsp_spk);
+        cs_output(&outs[1], reloaded.local_amount, my_spk);
+        CS_CHECK(cs_run_client_close(ctx, &kps[1], &pks[1], f, &reloaded,
+                                      outs, 2, &rc, &sent), "run");
+        CS_CHECK(sent != MSG_CLOSE_NONCE, "client reveals no nonce");
+        CS_CHECK(rc == 0 && sent == MSG_ERROR,
+                 "reconnected client refuses a close that drops its HTLC");
+        channel_cleanup(&reloaded);
+    }
+#undef CS_CHECK
+
+    channel_cleanup(&live);
+    persist_close(&db);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return pass;
 }
 
 /* The nLockTime of a proposed close must be near the client's own chain tip,
@@ -995,6 +1200,129 @@ static int cs_idle_cb(int fd, channel_t *ch, uint32_t my_index,
                       factory_t *f, size_t n, void *ud) {
     (void)fd; (void)ch; (void)my_index; (void)ctx; (void)kp; (void)f; (void)n;
     (void)ud;
+    return 1;
+}
+
+/* Run an LSP and four clients in one process group over loopback TCP, on a
+   made-up funding outpoint: factory creation, channel open, then one close
+   proposal.  The clients run client_run_with_channels, so the channel each
+   of them opened is what its close check sees.  With honest != 0 the LSP
+   proposes every party's balance at its own script, otherwise one output
+   paying everything to the LSP.  Reports the LSP's close result and how many
+   clients finished the ceremony. */
+static int cs_run_inprocess_close(int honest, int port, int *close_rc_out,
+                                  int *n_clients_done_out,
+                                  int *balances_ok_out) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    if (!cs_keys(ctx, kps, pks)) return 0;
+
+    unsigned char fund_spk[34], fund_txid[32];
+    if (!cs_funding_spk(ctx, pks, fund_spk, NULL)) return 0;
+    memset(fund_txid, 0xAA, 32);
+
+    /* A client that refuses hangs up; nobody may die of SIGPIPE. */
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    pid_t child[CS_N - 1];
+    fflush(stdout);
+    for (int c = 0; c < CS_N - 1; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            secp256k1_context *cc = cs_ctx();
+            secp256k1_keypair ck;
+            if (!secp256k1_keypair_create(cc, &ck, cs_seckeys[c + 1])) _exit(2);
+            int ok = client_run_with_channels(cc, &ck, "127.0.0.1", port,
+                                               cs_idle_cb, NULL, NULL, NULL);
+            secp256k1_context_destroy(cc);
+            _exit(ok ? 0 : 1);
+        }
+        child[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, CS_N - 1);
+    factory_alloc_default_arrays(&lsp->factory);
+    int setup_ok = 1;
+    if (!lsp_accept_clients(lsp)) setup_ok = 0;
+    if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
+                                               fund_spk, 34, 10, 4, 0))
+        setup_ok = 0;
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    if (setup_ok && !lsp_channels_init(&ch_mgr, ctx, &lsp->factory,
+                                        cs_seckeys[0], CS_N - 1))
+        setup_ok = 0;
+    if (setup_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) setup_ok = 0;
+    if (setup_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) setup_ok = 0;
+
+    *balances_ok_out = setup_ok;
+    for (size_t c = 0; setup_ok && c < ch_mgr.n_channels; c++)
+        if (ch_mgr.entries[c].channel.remote_amount < CHANNEL_DUST_LIMIT_SATS)
+            *balances_ok_out = 0;
+
+    *close_rc_out = -1;
+    if (setup_ok) {
+        tx_output_t outs[CS_N];
+        size_t n_outs;
+        if (honest) {
+            n_outs = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                       outs, 500, NULL, 0);
+        } else {
+            unsigned char lsp_spk[34];
+            client_close_script(ctx, &pks[0], lsp_spk);
+            cs_output(&outs[0], CS_FUNDING - 1000, lsp_spk);
+            n_outs = 1;
+        }
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+        if (n_outs > 0)
+            *close_rc_out = lsp_run_cooperative_close(lsp, &close_tx, outs,
+                                                       n_outs, 0);
+        tx_buf_free(&close_tx);
+    }
+
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    signal(SIGPIPE, old_sigpipe);
+
+    *n_clients_done_out = 0;
+    for (int c = 0; c < CS_N - 1; c++) {
+        int status = 0;
+        waitpid(child[c], &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+            (*n_clients_done_out)++;
+    }
+    secp256k1_context_destroy(ctx);
+    return setup_ok;
+}
+
+/* client_run_with_channels hands the channel it opened to the close
+   ceremony.  Clients that went through the real factory creation and channel
+   open complete a close that pays them, and all refuse one whose single
+   output pays the LSP; without the channel they would sign either. */
+int test_client_run_with_channels_checks_close(void) {
+    int port = 21900 + (getpid() % 1000);
+    int close_rc = -1, n_done = -1, balances_ok = 0;
+
+    TEST_ASSERT(cs_run_inprocess_close(1, port, &close_rc, &n_done,
+                                        &balances_ok),
+                "factory and channels set up (honest close)");
+    TEST_ASSERT(balances_ok, "every client holds a non-dust balance");
+    TEST_ASSERT(close_rc == 1, "close paying every client completes");
+    TEST_ASSERT(n_done == CS_N - 1, "every client completed the honest close");
+
+    TEST_ASSERT(cs_run_inprocess_close(0, port + 1, &close_rc, &n_done,
+                                        &balances_ok),
+                "factory and channels set up (close paying only the LSP)");
+    TEST_ASSERT(balances_ok, "every client holds a non-dust balance");
+    TEST_ASSERT(close_rc == 0, "close paying only the LSP does not complete");
+    TEST_ASSERT(n_done == 0, "no client completed the dishonest close");
     return 1;
 }
 
