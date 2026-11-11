@@ -1905,6 +1905,13 @@ extern int test_regtest_ps_chain_close(void);
 extern int test_regtest_ps_old_state_response(void);
 
 /* Mainnet Audit: Password-Hardened KDF */
+extern int test_network_is_mainnet(void);
+extern int test_network_canonical(void);
+extern int test_network_gate_risk_accepted(void);
+extern int test_network_gate_cmdline_seckey(void);
+extern int test_network_gate_no_test_scaffolding(void);
+extern int test_network_gate_db(void);
+extern int test_network_mainnet_step_floor_alias(void);
 extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
 extern int test_keyfile_wrong_passphrase_v2(void);
@@ -3807,6 +3814,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_regtest_ps_basic_close);
     RUN_TEST(test_regtest_ps_chain_close);
     RUN_TEST(test_regtest_ps_old_state_response);
+
+    printf("\n=== Network Names & Mainnet Start-up Gates ===\n");
+    RUN_TEST(test_network_is_mainnet);
+    RUN_TEST(test_network_canonical);
+    RUN_TEST(test_network_gate_risk_accepted);
+    RUN_TEST(test_network_gate_cmdline_seckey);
+    RUN_TEST(test_network_gate_no_test_scaffolding);
+    RUN_TEST(test_network_gate_db);
+    RUN_TEST(test_network_mainnet_step_floor_alias);
 
     printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
     RUN_TEST(test_keyfile_v2_roundtrip);

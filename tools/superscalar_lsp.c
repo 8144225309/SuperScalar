@@ -10,6 +10,7 @@
 #include "superscalar/fee.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/dw_state.h"
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
@@ -2246,6 +2247,19 @@ int main(int argc, char *argv[]) {
 
     if (!network)
         network = "regtest";  /* default to regtest */
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
+        }
+        network = canonical;
+    }
     int is_regtest = (strcmp(network, "regtest") == 0);
     /* #9 cheat-gate: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are inert
        unless this is regtest, even if the env var is set directly. */
@@ -2274,8 +2288,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (fee_rate < 1000) {
-        int is_mainnet = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-        if (is_mainnet) {
+        if (network_is_mainnet(network)) {
             fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
                     "default minrelaytxfee (1 sat/vB).\n"
                     "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or use package relay "
@@ -2452,92 +2465,26 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
-    }
-
-    /* #327a: refuse cmdline --seckey on mainnet. Process args are visible to
-       any local user via `ps` / /proc/<pid>/cmdline and persist in shell
-       history — an unacceptable key-exposure vector for a node holding real
-       funds. Mainnet operators must use the encrypted --keyfile (PBKDF2-600K
-       + AEAD at rest). Regtest/signet/testnet keep --seckey for convenience. */
-    if ((strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0) && seckey_hex) {
-        fprintf(stderr,
-            "Error: --seckey is refused on mainnet (visible via ps / shell history).\n"
-            "Use --keyfile PATH (encrypted at rest); create one with --generate-mnemonic\n"
-            "or --from-mnemonic, optionally protected by --passphrase.\n");
-        return 1;
-    }
-
-    /* #9: refuse ALL test/cheat scaffolding flags on mainnet (footgun guard on
-       top of --i-accept-the-risk). Detection cheats are self-harming and
-       defense-bypass cheats are theft; neither belongs on a mainnet node. */
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port (chain_backend_rpc.c) while the
-       exact-"mainnet" guards would NOT fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding in the
+       arguments or the environment, and persistent state for both the node
+       (--db) and the trustless watchtower (--wt-db). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        if (!network_gate_risk_accepted(network, accept_risk,
+                                        gate_err, sizeof(gate_err)) ||
+            !network_gate_cmdline_seckey(network, seckey_hex != NULL,
+                                         gate_err, sizeof(gate_err)) ||
+            !network_gate_no_test_scaffolding(network, argc, argv, environ,
+                                              gate_err, sizeof(gate_err)) ||
+            !network_gate_db(network, db_path != NULL,
+                             gate_err, sizeof(gate_err)) ||
+            !network_gate_watchtower_db(network, wt_db_path != NULL,
+                                        gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
-        /* #9: also refuse cheat/kill/crash ENV vars on mainnet (not just args).
-           The library gate (superscalar_cheat_allowed) already makes them inert,
-           but fail LOUD so a misconfigured mainnet node never starts with a
-           defense-bypass or crash-injection knob lurking in its environment. */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    /* G1 (gap-scan): prefix, not exact, so SUPERSCALAR_CRASH_ALLOW
-                       (gates peer-sent MSG_FORCE_OUT/MSG_ROTATE) is caught too. */
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
-        }
-    }
-
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
-        return 1;
-    }
-    /* SF-WT-TRUSTLESS Phase 2c PR-E (#248): mainnet also requires --wt-db
-       so the operator runs a trustless watchtower binary (the only WT
-       mode in v0.2.0) against this LSP's pre-signed response TXs.
-       Without --wt-db the LSP can still run on mainnet but loses
-       trustless WT support — flag this as an error so operators can't
-       accidentally deploy mainnet without it. */
-    if (strcmp(network, "mainnet") == 0 && !wt_db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --wt-db for the trustless watchtower.\n"
-            "v0.2.0 removed the legacy --db-only watchtower mode; the LSP\n"
-            "must populate wt.db so a standalone trustless WT can broadcast\n"
-            "penalty TXs on breach without ever opening lsp.db.\n"
-            "See docs/watchtower-trustless-schema.md for the model.\n");
-        return 1;
     }
 
     /* Resolve confirmation timeout */
@@ -2906,8 +2853,7 @@ int main(int argc, char *argv[]) {
        --encrypt-db. This must run after the key is final and before any secret
        column is read or written (recovery's channel init is later). */
     if (use_db) {
-        int mainnet_db = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-        if (mainnet_db) encrypt_db = 1;
+        if (network_is_mainnet(network)) encrypt_db = 1;
         if (encrypt_db) {
             persist_set_encryption_key(&db, lsp_seckey);
             if (!persist_apply_encryption(&db)) {

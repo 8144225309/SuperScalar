@@ -2,6 +2,7 @@
 #include "superscalar/watchtower.h"
 #include "superscalar/persist_wt.h"
 #include "superscalar/regtest.h"
+#include "superscalar/network.h"
 #include "superscalar/fee.h"
 #include "superscalar/channel.h"
 #include <secp256k1.h>
@@ -129,6 +130,18 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: --wt-db PATH is required.\n");
         usage(argv[0]);
         return 1;
+    }
+
+    /* Canonicalise the chain name once ("bitcoin" is mainnet) and refuse
+       names that are not a supported chain. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
+        }
+        network = canonical;
     }
 
     /* Initialize bitcoin RPC connection */

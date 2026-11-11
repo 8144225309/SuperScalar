@@ -231,6 +231,7 @@ add_library(superscalar
     src/scb.c
     src/onion_message.c
     src/cli_arity.c
+    src/network.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -373,6 +374,7 @@ add_executable(test_superscalar
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_cli_arity.c
+    tests/test_network.c
     tests/test_prometheus.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)

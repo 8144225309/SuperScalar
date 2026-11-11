@@ -7,6 +7,7 @@
 #include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
@@ -2709,42 +2710,30 @@ int main(int argc, char *argv[]) {
     if (use_json_log)
         ss_log_set_json(1);
 
-    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
-       test/cheat scaffolding flags on mainnet (footgun guard). */
-    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port while the exact-"mainnet" guards
-       would not fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
         }
-        /* G2 (gap-scan): mirror the LSP -- also refuse cheat/kill/crash ENV vars on
-           mainnet (SS_CHEAT_* are gate-inert, but SUPERSCALAR_CRASH* -> abort() is
-           env-driven; fail LOUD rather than silently accept a crash knob). */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
+        network = canonical;
+    }
+    /* Defense-bypass cheats are inert unless this is regtest. */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    /* Mainnet refuses test/cheat scaffolding in the arguments and in the
+       environment (see network.h). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        if (!network_gate_no_test_scaffolding(network, argc, argv, environ,
+                                              gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
     }
 
@@ -3247,22 +3236,17 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
-    }
-
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
-        return 1;
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement
+       and a database for persistent state. */
+    {
+        char gate_err[512];
+        if (!network_gate_risk_accepted(network, accept_risk,
+                                        gate_err, sizeof(gate_err)) ||
+            !network_gate_db(network, db_path != NULL,
+                             gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
+        }
     }
 
     /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
