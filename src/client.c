@@ -460,6 +460,9 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
        commitment TX independently (trustless force-close). */
     memcpy(ch->latest_commitment_sig, full_sig64, 64);
     ch->has_latest_commitment_sig = 1;
+    /* Whatever this side offered is in a commitment the LSP has signed now:
+       it can no longer be taken back as never committed. */
+    ch->has_unsigned_offer = 0;
 
     /* Get revocation secret for the old commitment */
     unsigned char rev_secret[32];
@@ -557,6 +560,28 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
 
     client_check_conservation(ch, "after add_htlc");
     return 1;
+}
+
+int client_handle_fail_htlc(channel_t *ch, const wire_msg_t *msg,
+                             int *committed_out, uint64_t *htlc_id_out) {
+    uint64_t htlc_id;
+    char reason[128];
+    if (!wire_parse_update_fail_htlc(msg->json, &htlc_id, reason, sizeof(reason)))
+        return 0;
+    int uncommitted = wire_update_fail_htlc_is_uncommitted(msg->json);
+    if (committed_out) *committed_out = !uncommitted;
+    if (htlc_id_out) *htlc_id_out = htlc_id;
+    int ok = uncommitted ? channel_rollback_htlc(ch, htlc_id)
+                         : channel_fail_htlc(ch, htlc_id);
+    if (!ok)
+        fprintf(stderr, "Client: PROTOCOL ERROR — UPDATE_FAIL_HTLC%s for HTLC "
+                "%llu (%s) does not match the channel; nothing changed\n",
+                uncommitted ? " (never committed)" : "",
+                (unsigned long long)htlc_id, reason);
+    else
+        printf("Client: HTLC %llu %s: %s\n", (unsigned long long)htlc_id,
+               uncommitted ? "refused" : "failed", reason);
+    return ok;
 }
 
 int client_fulfill_payment(int fd, channel_t *ch,

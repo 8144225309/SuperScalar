@@ -1563,6 +1563,44 @@ handle_message:
             break;
         }
 
+        case MSG_UPDATE_FAIL_HTLC: {
+            /* The LSP gives an HTLC back.  One it never took is simply
+               dropped.  One that was committed is failed and the commitment
+               exchange follows, exactly as after a fulfil. */
+            uint64_t pre_fail_local = ch->local_amount;
+            uint64_t pre_fail_remote = ch->remote_amount;
+            htlc_t pre_fail_htlcs[MAX_HTLCS];
+            size_t pre_fail_n_htlcs = ch->n_htlcs;
+            if (pre_fail_n_htlcs > 0)
+                memcpy(pre_fail_htlcs, ch->htlcs, pre_fail_n_htlcs * sizeof(htlc_t));
+
+            int fail_committed = 0;
+            uint64_t fail_htlc_id = 0;
+            int fail_ok = client_handle_fail_htlc(ch, &msg, &fail_committed,
+                                                   &fail_htlc_id);
+            cJSON_Delete(msg.json);
+            if (fail_ok && fail_committed) {
+                if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                         ctx, keypair, my_index, &cbd->inbox) &&
+                    msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    client_handle_commitment_signed(fd, ch, ctx, &msg);
+                    client_persist_commitment_sig(ch, cbd);
+                    if (msg.json) cJSON_Delete(msg.json);
+                    client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                        pre_fail_local, pre_fail_remote,
+                        pre_fail_n_htlcs > 0 ? pre_fail_htlcs : NULL, pre_fail_n_htlcs,
+                        keypair, my_index);
+                } else {
+                    if (msg.json) cJSON_Delete(msg.json);
+                }
+            }
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+            break;
+        }
+
         case MSG_LSP_REVOKE_AND_ACK: {
             /* LSP's own revocation, arriving naturally in the daemon loop.
                This happens when a queued CS was processed from the inbox:
