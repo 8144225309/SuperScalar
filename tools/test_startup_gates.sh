@@ -86,9 +86,19 @@ expect_refusal "unknown --network" "$LSP" --network livenet
 expect_refusal "unknown --network" "$CLIENT" --network livenet --seckey "$KEY"
 expect_refusal "unknown --network" "$WT" --network livenet --wt-db "$F/wt.db"
 
-# The client on a non-regtest chain needs a pinned LSP key.
+# The client on a non-regtest chain needs a pinned LSP key, and says so before
+# it creates the keyfile it was pointed at.
 expect_refusal "--lsp-pubkey required" \
     "$CLIENT" --network signet --seckey "$KEY" --rpcuser u --rpcpassword p
+expect_refusal "--lsp-pubkey required" \
+    "$CLIENT" --network signet --keyfile "$F/new.key" --rpcuser u --rpcpassword p
+
+# The well-known lookup is a direct connection: refused when Tor is in use.
+expect_refusal "cannot be used with --tor-proxy" \
+    "$CLIENT" --network regtest --seckey "$KEY" --lsp 127.0.0.1 \
+    --tor-proxy 127.0.0.1:1 --tor-only
+expect_refusal "cannot be used with --tor-proxy" \
+    "$CLIENT" --network regtest --seckey "$KEY" --lsp 127.0.0.1 --tor-proxy 127.0.0.1:1
 
 # No case may have created anything: not at a path it was given, not in its
 # working directory, not under HOME.

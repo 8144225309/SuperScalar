@@ -2293,7 +2293,8 @@ static void usage(const char *prog) {
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
         "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
-        "                                    (outside regtest) and must match it.\n"
+        "                                    (outside regtest) and must match it.  The lookup is a direct HTTP\n"
+        "                                    connection: refused together with --tor-proxy / --tor-only.\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
@@ -3286,6 +3287,26 @@ int main(int argc, char *argv[]) {
             "       Without it, an adversarial LSP could claim a larger\n"
             "       funding_amount than actually exists; see audit 2026-05-17.\n",
             network);
+        return 1;
+    }
+
+    /* Every network except regtest needs the LSP's key pinned with
+       --lsp-pubkey.  Checked here, before a keyfile or anything else is
+       created; the endpoint resolution below enforces the same rule. */
+    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
+        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                "(prevents MITM attacks)\n");
+        return 1;
+    }
+
+    /* The well-known lookup is a direct HTTP connection.  With Tor in use it
+       would reveal this host to the LSP's domain, so the two are not combined. */
+    if (lsp_domain && (tor_proxy_arg || tor_only)) {
+        fprintf(stderr,
+            "Error: --lsp DOMAIN cannot be used with --tor-proxy / --tor-only.\n"
+            "  The lookup of /.well-known/lsps.json is a direct clearnet HTTP\n"
+            "  connection and would bypass Tor. Give the LSP's address with\n"
+            "  --host and --port (and its key with --lsp-pubkey) instead.\n");
         return 1;
     }
 
