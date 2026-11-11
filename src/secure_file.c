@@ -141,13 +141,15 @@ int secure_file_commit(char *staged, const char *path, int replace) {
            an existing file could be replaced. */
         unlink(staged);
         ok = 1;
-    } else if (errno == EEXIST) {
-        ok = 0;
-    } else {
-        /* Filesystem without hard links: check, then rename. */
+    } else if (errno == EPERM || errno == EOPNOTSUPP || errno == ENOSYS) {
+        /* The filesystem has no hard links: check, then rename.  Only these
+           errors mean that; any other failure (the path exists, no access,
+           an I/O error, ...) fails the write. */
         struct stat st;
         ok = lstat(path, &st) != 0 && errno == ENOENT &&
              rename(staged, path) == 0;
+    } else {
+        ok = 0;
     }
 
     if (ok)
