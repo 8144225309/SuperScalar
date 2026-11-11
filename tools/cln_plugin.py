@@ -84,6 +84,12 @@ settled_invoices = {}
 # client may hold it by then, so it is held here until the LSP says how it
 # ended, whatever the state of the bridge link or of the invoice.
 forwarded_htlcs = {}
+# Fulfils from the LSP that could not be handed to CLN because CLN no longer
+# has the HTLC: payment_hash -> {"preimage": hex, "upstream": CLN's name of
+# the HTLC, "reason": why}.  The factory client was paid and the incoming
+# payment was not settled, so the preimage is kept for the operator.  Kept
+# in BRIDGE_STATE_FILE and never dropped by the plugin.
+unresolved_fulfils = {}
 SETTLED_MAX = 20000
 invoice_labels = {}  # payment_hash -> CLN label of the factory invoice
 NODE_ID = None       # this CLN node's id (from getinfo), once known
@@ -454,6 +460,15 @@ def _mark_settled(payment_hash, preimage, upstream):
     save_state()
 
 
+def _mark_unresolved(payment_hash, preimage, upstream, reason):
+    """The LSP's fulfil could not be handed to CLN: keep the preimage."""
+    with lock:
+        unresolved_fulfils[payment_hash] = {"preimage": preimage,
+                                            "upstream": upstream,
+                                            "reason": reason}
+    save_state()
+
+
 def _note_forwarded(upstream, payment_hash, factory_invoice):
     """An HTLC CLN names is about to go to the LSP: remember that across a
     restart."""
@@ -519,25 +534,22 @@ def own_invoice_reason(decoded, payment_hash):
     return None
 
 
-# Channel states in which CLN no longer has the channel's HTLCs in hand
-CHANNEL_GONE_STATES = ("AWAITING_UNILATERAL", "FUNDING_SPEND_SEEN", "ONCHAIN",
-                       "CLOSINGD_COMPLETE")
-
-
 def htlc_still_held(upstream):
-    """False only if CLN demonstrably no longer holds the incoming HTLC
-    named `upstream`: its channel has been closed unilaterally or is
-    on-chain.
+    """False only if CLN has forgotten the channel the incoming HTLC named
+    `upstream` arrived on: listpeerchannels answers and lists no channel
+    under that short channel id.
 
-    Answering a held htlc_accepted hook for such an HTLC makes CLN v26.06.9
-    abort, so the answer is withheld then.  If CLN does not name the HTLC,
-    cannot be asked, or does not list the channel, the answer goes ahead as
-    before."""
+    lightningd v26.06.9 aborted when a held htlc_accepted hook was answered
+    after the HTLC's channel had been closed on-chain and forgotten, so the
+    answer is withheld then.  A channel that is still listed, in whatever
+    state, gets its answer: while a channel is being closed, the answer is
+    how CLN learns the preimage it needs to claim the HTLC.  The answer
+    also goes ahead if CLN did not name the HTLC or cannot be asked."""
     scid = (upstream or "").rpartition(":")[0]
     if not scid:
         return True
     try:
-        channels = cln_rpc("listpeerchannels", timeout=15).get("channels", [])
+        channels = cln_rpc("listpeerchannels", timeout=15).get("channels")
     except Exception:
         return True
     if not isinstance(channels, list):
@@ -548,8 +560,8 @@ def htlc_still_held(upstream):
         alias = ch.get("alias") if isinstance(ch.get("alias"), dict) else {}
         if scid in (ch.get("short_channel_id"), alias.get("local"),
                     alias.get("remote")):
-            return ch.get("state") not in CHANNEL_GONE_STATES
-    return True
+            return True
+    return False
 
 
 def recover_registered_invoices():
@@ -705,28 +717,43 @@ def handle_bridge_msg(msg):
                 settle = False
 
         if held is not None and not htlc_still_held(held.get("upstream", "")):
-            # The channel this HTLC came in on is no longer live.  CLN can
-            # not take an answer for it any more.
-            log(f"ERROR: HTLC {held.get('upstream')} for {payment_hash[:16]}... "
-                f"is no longer held by CLN (channel closed or on-chain); the "
-                f"LSP's {result} cannot be applied"
-                + (" and the incoming payment may be lost" if result == "fulfill" else ""))
-            if settle:
-                _mark_settled(payment_hash, msg.get("preimage", ""),
-                              held.get("upstream", ""))
+            # CLN has forgotten the channel this HTLC came in on and cannot
+            # take an answer for it any more.
+            upstream = held.get("upstream", "")
             if result == "fulfill":
-                send_to_bridge({"method": "htlc_resolved",
-                                "payment_hash": payment_hash})
-            _forget_forwarded(held.get("upstream", ""))
+                # The client was paid; the incoming payment was not settled.
+                # Keep the preimage and tell the LSP exactly that: it must
+                # not take the fulfil for delivered.
+                log(f"ERROR: fulfil for {payment_hash[:16]}... cannot be given "
+                    f"to CLN: the channel of HTLC {upstream} is gone.  The "
+                    f"incoming payment is NOT settled; the preimage is kept "
+                    f"in the state file under 'unresolved'")
+                _mark_unresolved(payment_hash, msg.get("preimage", ""),
+                                 upstream, "channel_gone")
+                if settle:
+                    _mark_settled(payment_hash, msg.get("preimage", ""), upstream)
+                send_to_bridge({"method": "htlc_unresolved",
+                                "payment_hash": payment_hash,
+                                "reason": "channel_gone"})
+            else:
+                log(f"HTLC {upstream} for {payment_hash[:16]}... is no longer "
+                    f"held by CLN (channel gone); the LSP's {result} is dropped")
+            _forget_forwarded(upstream)
             return
 
         if held is None:
             log(f"No pending HTLC for hash {payment_hash[:16]}...")
-            # A fulfil repeated for an HTLC we already resolved: say so, or
-            # the LSP keeps repeating it.
+            # A fulfil repeated for an HTLC we already answered: say how it
+            # ended, or the LSP keeps repeating it.
             with lock:
                 done = payment_hash in settled_invoices
-            if result == "fulfill" and done:
+                lost = payment_hash in unresolved_fulfils
+            if result == "fulfill" and lost:
+                send_to_bridge({"method": "htlc_unresolved",
+                                "payment_hash": payment_hash,
+                                "reason": unresolved_fulfils[payment_hash]
+                                .get("reason", "")})
+            elif result == "fulfill" and done:
                 send_to_bridge({"method": "htlc_resolved",
                                 "payment_hash": payment_hash})
             return
@@ -942,9 +969,11 @@ def save_state():
         with lock:
             settled = dict(settled_invoices)
             forwarded = dict(forwarded_htlcs)
+            unresolved = dict(unresolved_fulfils)
         data = json.dumps({"version": 1, "node_id": STATE_NODE_ID,
                            "lsp_key": STATE_LSP_KEY, "pays": pays,
-                           "settled": settled, "forwarded": forwarded})
+                           "settled": settled, "forwarded": forwarded,
+                           "unresolved": unresolved})
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(prefix=".bridge-plugin.state.",
@@ -998,7 +1027,9 @@ def load_state(node_id=None):
     pays = state.get("pays", {})
     settled = state.get("settled", {})
     forwarded = state.get("forwarded", {})
-    if not all(isinstance(part, dict) for part in (pays, settled, forwarded)):
+    unresolved = state.get("unresolved", {})
+    if not all(isinstance(part, dict)
+               for part in (pays, settled, forwarded, unresolved)):
         raise StateFileError(f"{path} has a malformed section")
     file_node = state.get("node_id")
     if node_id and file_node and file_node != node_id:
@@ -1034,6 +1065,12 @@ def load_state(node_id=None):
                 forwarded_htlcs[up] = {
                     "payment_hash": rec["payment_hash"],
                     "factory_invoice": bool(rec.get("factory_invoice"))}
+        for ph, rec in unresolved.items():
+            if _is_hash(ph) and isinstance(rec, dict):
+                unresolved_fulfils[ph] = {
+                    "preimage": rec.get("preimage", ""),
+                    "upstream": rec.get("upstream", ""),
+                    "reason": rec.get("reason", "")}
     with pays_lock:
         open_pays.update(parsed)
     return len(parsed)

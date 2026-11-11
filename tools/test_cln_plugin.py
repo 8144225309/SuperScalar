@@ -44,7 +44,9 @@ class FakeCln:
         # No earlier payment for the hash unless a test says otherwise.
         replies.setdefault("listsendpays", {"payments": []})
         replies.setdefault("getinfo", {"id": OWN_NODE})
-        replies.setdefault("listpeerchannels", {"channels": []})
+        # CLN cannot say which channels it has unless a test scripts it
+        replies.setdefault("listpeerchannels",
+                           cln_plugin.ClnRpcError("not scripted", -1))
         self.replies = {m: list(r) if isinstance(r, list) else [r]
                         for m, r in replies.items()}
         self.calls = []
@@ -89,6 +91,7 @@ class PluginTestCase(unittest.TestCase):
         self.state_dir = tempfile.TemporaryDirectory()
         cln_plugin.settled_invoices.clear()
         cln_plugin.forwarded_htlcs.clear()
+        cln_plugin.unresolved_fulfils.clear()
         cln_plugin.invoice_labels.clear()
         for name, value in (("NODE_ID", None), ("STATE_NODE_ID", None),
                             ("STATE_LSP_KEY", None),
@@ -1501,17 +1504,26 @@ def peer_channel(state, scid="100x1x0", **extra):
     return dict({"short_channel_id": scid, "state": state}, **extra)
 
 
-class HtlcOnClosedChannelTest(PluginTestCase):
-    """A held hook is not answered once the HTLC's channel is closed
-    unilaterally or on-chain."""
+class HtlcOnForgottenChannelTest(PluginTestCase):
+    """A held hook is not answered once CLN has forgotten the HTLC's channel,
+    and the LSP is told that its fulfil settled nothing."""
 
     def hook_answers(self):
         return [(m["id"], m["result"]) for m in self.to_cln if "id" in m]
 
-    def hold(self, rpc_id=4):
-        cln_plugin.registered_invoices.add(PAYMENT_HASH)
-        cln_plugin.handle_htlc_accepted(rpc_id, htlc(channel="100x1x0",
-                                                     htlc_id=5))
+    def from_plugin(self, method):
+        return [m for m in self.to_bridge if m.get("method") == method]
+
+    def hold(self, rpc_id=4, factory_invoice=True):
+        if factory_invoice:
+            cln_plugin.registered_invoices.add(PAYMENT_HASH)
+            cln_plugin.handle_htlc_accepted(rpc_id, htlc(channel="100x1x0",
+                                                         htlc_id=5))
+        else:
+            # a forward the LSP takes: CLN holds no invoice for it
+            cln_plugin.handle_htlc_accepted(rpc_id, htlc(
+                channel="100x1x0", htlc_id=5, short_channel_id="1x1x1"))
+        self.assertIn(PAYMENT_HASH, cln_plugin.pending_htlcs)
 
     def lsp_says(self, result):
         msg = {"method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
@@ -1522,60 +1534,101 @@ class HtlcOnClosedChannelTest(PluginTestCase):
             msg["reason"] = "timeout"
         cln_plugin.handle_bridge_msg(msg)
 
-    def test_gone_states(self):
-        for state in ("AWAITING_UNILATERAL", "FUNDING_SPEND_SEEN", "ONCHAIN",
+    def test_listed_channel_is_answered_in_any_state(self):
+        for state in ("CHANNELD_NORMAL", "CHANNELD_SHUTTING_DOWN",
+                      "AWAITING_UNILATERAL", "FUNDING_SPEND_SEEN", "ONCHAIN",
                       "CLOSINGD_COMPLETE"):
             self.use_cln(listpeerchannels={"channels": [
                 peer_channel("CHANNELD_NORMAL", "7x7x7"),
                 peer_channel(state)]})
-            self.assertFalse(cln_plugin.htlc_still_held("100x1x0:5"), state)
+            self.assertTrue(cln_plugin.htlc_still_held("100x1x0:5"), state)
 
     def test_channel_known_by_its_alias(self):
-        self.use_cln(listpeerchannels={"channels": [
-            {"state": "ONCHAIN", "alias": {"local": "100x1x0",
-                                           "remote": "9x9x9"}}]})
-        self.assertFalse(cln_plugin.htlc_still_held("100x1x0:5"))
+        for side in ("local", "remote"):
+            self.use_cln(listpeerchannels={"channels": [
+                {"state": "CHANNELD_NORMAL", "alias": {side: "100x1x0"}}]})
+            self.assertTrue(cln_plugin.htlc_still_held("100x1x0:5"), side)
 
-    def test_answer_goes_ahead_unless_the_channel_is_known_gone(self):
-        for reply in ({"channels": [peer_channel("CHANNELD_NORMAL")]},
-                      {"channels": [peer_channel("CHANNELD_SHUTTING_DOWN")]},
-                      {"channels": [peer_channel("ONCHAIN", "7x7x7")]},
-                      {"channels": []}, {}, {"channels": "?"},
+    def test_forgotten_channel(self):
+        for reply in ({"channels": []},
+                      {"channels": [peer_channel("CHANNELD_NORMAL", "7x7x7")]}):
+            self.use_cln(listpeerchannels=reply)
+            self.assertFalse(cln_plugin.htlc_still_held("100x1x0:5"), reply)
+
+    def test_answer_goes_ahead_if_cln_cannot_say(self):
+        for reply in ({}, {"channels": "?"},
                       cln_plugin.ClnRpcError("down", -1),
                       subprocess.TimeoutExpired(cmd="lightning-cli", timeout=15)):
             self.use_cln(listpeerchannels=reply)
             self.assertTrue(cln_plugin.htlc_still_held("100x1x0:5"), reply)
-        self.assertTrue(cln_plugin.htlc_still_held(""))
+        self.use_cln(listpeerchannels={"channels": []})
+        self.assertTrue(cln_plugin.htlc_still_held(""))   # HTLC not named
 
-    def test_fulfil_is_not_passed_to_cln_for_a_channel_gone_on_chain(self):
-        self.hold()
-        self.use_cln(listpeerchannels={"channels": [peer_channel("ONCHAIN")]})
+    def check_fulfil_reported_unresolved(self, factory_invoice):
+        self.hold(factory_invoice=factory_invoice)
+        self.use_cln(listpeerchannels={"channels": []})
         self.lsp_says("fulfill")
         self.assertEqual(self.hook_answers(), [])
-        # the LSP is told, so that it stops repeating the fulfil, and the
-        # invoice is closed
-        self.assertEqual(
-            [m for m in self.to_bridge if m.get("method") == "htlc_resolved"],
-            [{"method": "htlc_resolved", "payment_hash": PAYMENT_HASH}])
-        self.assertIn(PAYMENT_HASH, cln_plugin.settled_invoices)
+        # the LSP is not told the node took the preimage
+        self.assertEqual(self.from_plugin("htlc_resolved"), [])
+        self.assertEqual(self.from_plugin("htlc_unresolved"), [
+            {"method": "htlc_unresolved", "payment_hash": PAYMENT_HASH,
+             "reason": "channel_gone"}])
+        # the preimage is on disk whether or not CLN held an invoice
+        self.assertEqual(cln_plugin.unresolved_fulfils[PAYMENT_HASH], {
+            "preimage": PREIMAGE, "upstream": "100x1x0:5",
+            "reason": "channel_gone"})
+        with open(cln_plugin.BRIDGE_STATE_FILE) as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["unresolved"][PAYMENT_HASH]["preimage"],
+                         PREIMAGE)
+        self.assertEqual(PAYMENT_HASH in cln_plugin.settled_invoices,
+                         factory_invoice)
         self.assertEqual(cln_plugin.pending_htlcs, {})
         self.assertEqual(cln_plugin.forwarded_htlcs, {})
 
-    def test_fail_is_not_passed_to_cln_for_a_channel_gone_on_chain(self):
+    def test_fulfil_of_a_factory_invoice_for_a_forgotten_channel(self):
+        self.check_fulfil_reported_unresolved(factory_invoice=True)
+
+    def test_fulfil_of_a_forward_for_a_forgotten_channel(self):
+        self.check_fulfil_reported_unresolved(factory_invoice=False)
+
+    def test_repeated_fulfil_gets_the_same_report(self):
         self.hold()
-        self.use_cln(listpeerchannels={"channels": [
-            peer_channel("AWAITING_UNILATERAL")]})
+        self.use_cln(listpeerchannels={"channels": []})
+        self.lsp_says("fulfill")
+        self.to_bridge.clear()
+        self.lsp_says("fulfill")
+        self.assertEqual(self.from_plugin("htlc_resolved"), [])
+        self.assertEqual(self.from_plugin("htlc_unresolved"), [
+            {"method": "htlc_unresolved", "payment_hash": PAYMENT_HASH,
+             "reason": "channel_gone"}])
+
+    def test_unresolved_fulfils_survive_a_restart(self):
+        self.hold()
+        self.use_cln(listpeerchannels={"channels": []})
+        self.lsp_says("fulfill")
+        cln_plugin.unresolved_fulfils.clear()
+        cln_plugin.load_state()
+        self.assertEqual(cln_plugin.unresolved_fulfils[PAYMENT_HASH]["preimage"],
+                         PREIMAGE)
+
+    def test_fail_for_a_forgotten_channel_is_dropped(self):
+        self.hold()
+        self.use_cln(listpeerchannels={"channels": []})
         self.lsp_says("fail")
         self.assertEqual(self.hook_answers(), [])
+        self.assertEqual(self.from_plugin("htlc_unresolved"), [])
         self.assertNotIn(PAYMENT_HASH, cln_plugin.settled_invoices)
+        self.assertEqual(cln_plugin.unresolved_fulfils, {})
 
-    def test_live_channel_is_answered(self):
+    def test_channel_on_chain_but_listed_gets_the_preimage(self):
         self.hold()
-        self.use_cln(listpeerchannels={"channels": [
-            peer_channel("CHANNELD_NORMAL")]})
+        self.use_cln(listpeerchannels={"channels": [peer_channel("ONCHAIN")]})
         self.lsp_says("fulfill")
         self.assertEqual(self.hook_answers(), [
             (4, {"result": "resolve", "payment_key": PREIMAGE})])
+        self.assertEqual(self.from_plugin("htlc_unresolved"), [])
         self.assertEqual(self.cln.calls_to("listpeerchannels"), [{}])
 
 
