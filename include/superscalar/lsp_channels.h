@@ -565,8 +565,29 @@ void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
    "rejected" with the reason; the plugin repeats a result until it is
    answered and never after. */
 
+/* Wait up to timeout_sec for a message of type `expected` from a client.
+   Keepalives that arrive first are dealt with (a ping is answered, a pong
+   dropped); any other message that is not the expected one is logged and
+   dropped.  Returns 1 with the message, 0 on timeout or a lost connection. */
+int lsp_channels_recv_client_reply(int fd, wire_msg_t *msg, uint8_t expected,
+                                    int timeout_sec);
+
+/* After an HTLC on a client's channel was fulfilled or failed (and the
+   client told): sign the new commitment, send COMMITMENT_SIGNED, take the
+   client's REVOKE_AND_ACK and send the LSP's own revocation.  old_* is the
+   channel as it was before the change, for the watchtower.
+   Returns 1 when the exchange completed.  If it did not, the client's
+   connection is dropped, so nothing further happens on a channel whose
+   commitment is in doubt until the client reconnects and the pending
+   commitment is sent again. */
+int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                     size_t client_idx,
+                                     uint64_t old_local, uint64_t old_remote,
+                                     const htlc_t *old_htlcs, size_t old_n_htlcs);
+
 /* Give a client back the HTLC it offered for an outside payment that was
-   never requested from the Lightning node, and close its origin. */
+   never requested from the Lightning node, and close its origin.  The HTLC
+   is in the commitment, so the commitment exchange follows. */
 void lsp_channels_fail_outbound_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                       htlc_origin_t *origin, size_t client_idx,
                                       uint64_t htlc_id, const char *reason);

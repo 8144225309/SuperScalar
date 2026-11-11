@@ -1314,6 +1314,10 @@ extern int test_bridge_queues_for_absent_plugin(void);
 extern int test_bridge_reports_lsp_key(void);
 extern int test_bridge_plugin_line_auth(void);
 extern int test_bridge_plugin_silent_connection_replaced(void);
+extern int test_lsp_recv_client_reply_skips_keepalives(void);
+extern int test_lsp_incomplete_commitment_drops_client(void);
+extern int test_channel_rollback_htlc(void);
+extern int test_client_handles_update_fail_htlc(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -3265,6 +3269,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_reports_lsp_key);
     RUN_TEST(test_bridge_plugin_line_auth);
     RUN_TEST(test_bridge_plugin_silent_connection_replaced);
+    RUN_TEST(test_lsp_recv_client_reply_skips_keepalives);
+    RUN_TEST(test_lsp_incomplete_commitment_drops_client);
+    RUN_TEST(test_channel_rollback_htlc);
+    RUN_TEST(test_client_handles_update_fail_htlc);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

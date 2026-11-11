@@ -3447,6 +3447,10 @@ int test_bridge_operator_pay(void) {
 
 /* ---- A client HTLC for an invoice it does not fund is failed, not paid ---- */
 
+/* Whether the last refusal read by offer_outside_htlc said the HTLC was
+   never taken */
+static int last_refusal_uncommitted;
+
 /* Chain backend stub reporting a fixed tip. */
 static int fixed_tip_height;
 static int fixed_tip_get_block_height(chain_backend_t *self) {
@@ -3475,6 +3479,7 @@ static int offer_outside_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp, int client_pee
     int ok = reply.msg_type == MSG_UPDATE_FAIL_HTLC &&
              wire_parse_update_fail_htlc(reply.json, &failed_id, reason, reason_cap) &&
              failed_id == 9;
+    last_refusal_uncommitted = ok && wire_update_fail_htlc_is_uncommitted(reply.json);
     cJSON_Delete(reply.json);
     return ok;
 }
@@ -3513,6 +3518,8 @@ int test_lsp_outbound_htlc_refused(void) {
                                     reason, sizeof(reason)), "HTLC failed back");
     TEST_ASSERT(strcmp(reason, "invoice_payment_hash_mismatch") == 0,
                 "refused: hash mismatch");
+    TEST_ASSERT(last_refusal_uncommitted,
+                "refusal says the HTLC was never taken (no commitment follows)");
 
     /* Invoice for more than the HTLC carries. */
     TEST_ASSERT(make_out_invoice(ctx, "bcrt", 400000000, hash, now, 3600, 18,
@@ -4310,7 +4317,8 @@ static int pay_fixture_init(pay_fixture_t *f) {
 }
 
 static void pay_fixture_free(pay_fixture_t *f) {
-    close(f->client_fd); close(f->client_peer);
+    if (f->client_fd >= 0) close(f->client_fd);
+    close(f->client_peer);
     close(f->mgr.bridge_fd); close(f->bridge_peer);
     free(f->mgr.entries[0].channel.htlcs);
     free(f->mgr.entries);
@@ -5803,5 +5811,248 @@ int test_bridge_plugin_silent_connection_replaced(void) {
     TEST_ASSERT(peer_closed(second), "newcomer closed");
     close(first); close(second);
     bridge_cleanup(&br);
+    return 1;
+}
+
+/* ---- Waiting for a client's reply: keepalives do not count ---- */
+
+int test_lsp_recv_client_reply_skips_keepalives(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    wire_msg_t m;
+    cJSON *empty = cJSON_CreateObject();
+
+    /* The LSP pings its clients every 30 s, so a pong can be on the wire
+       ahead of the REVOKE_AND_ACK it is waiting for; so can a ping. */
+    TEST_ASSERT(wire_send(sv[1], MSG_PONG, empty), "pong");
+    TEST_ASSERT(wire_send(sv[1], MSG_PING, empty), "ping");
+    TEST_ASSERT(wire_send(sv[1], MSG_PONG, empty), "pong");
+    TEST_ASSERT(wire_send(sv[1], MSG_REVOKE_AND_ACK, empty), "the reply");
+    TEST_ASSERT(lsp_channels_recv_client_reply(sv[0], &m, MSG_REVOKE_AND_ACK, 5),
+                "reply found behind the keepalives");
+    TEST_ASSERT_EQ(m.msg_type, MSG_REVOKE_AND_ACK, "it is the reply");
+    cJSON_Delete(m.json);
+    /* ...and the ping was answered */
+    TEST_ASSERT(wire_recv_timeout(sv[1], &m, 5) && m.msg_type == MSG_PONG,
+                "ping answered with a pong");
+    cJSON_Delete(m.json);
+
+    /* Another message in between is dropped, the reply still found */
+    TEST_ASSERT(wire_send(sv[1], MSG_QUEUE_POLL, empty), "stray");
+    TEST_ASSERT(wire_send(sv[1], MSG_REVOKE_AND_ACK, empty), "the reply");
+    TEST_ASSERT(lsp_channels_recv_client_reply(sv[0], &m, MSG_REVOKE_AND_ACK, 5),
+                "reply found behind a stray message");
+    cJSON_Delete(m.json);
+
+    /* Keepalives alone are not a reply: the wait ends at its deadline */
+    TEST_ASSERT(wire_send(sv[1], MSG_PONG, empty), "pong");
+    time_t t0 = time(NULL);
+    TEST_ASSERT(!lsp_channels_recv_client_reply(sv[0], &m, MSG_REVOKE_AND_ACK, 2),
+                "no reply: gives up");
+    TEST_ASSERT(time(NULL) - t0 <= 4, "at the deadline");
+
+    /* A closed connection ends it at once */
+    close(sv[1]);
+    TEST_ASSERT(!lsp_channels_recv_client_reply(sv[0], &m, MSG_REVOKE_AND_ACK, 30),
+                "connection gone");
+    TEST_ASSERT(!lsp_channels_recv_client_reply(-1, &m, MSG_REVOKE_AND_ACK, 30),
+                "no connection");
+    cJSON_Delete(empty);
+    close(sv[0]);
+    return 1;
+}
+
+/* ---- An incomplete commitment exchange drops the client's connection ---- */
+
+int test_lsp_incomplete_commitment_drops_client(void) {
+    pay_fixture_t f;
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+
+    /* Fulfil: the client (which never answers here) is told, the fulfil
+       stands, and the connection is given up rather than used further */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    f.mgr.persist = &db;
+    channel_t *ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC fulfilled");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "LSP credited");
+    TEST_ASSERT_EQ(f.client_fd, -1, "client connection dropped");
+    uint64_t pending = 0;
+    TEST_ASSERT(persist_load_pending_cs(&db, f.mgr.entries[0].channel_id, &pending) &&
+                pending == ch->commitment_number,
+                "commitment remembered for the client's reconnect");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(f.client_peer, &m, 5) &&
+                m.msg_type == MSG_UPDATE_FULFILL_HTLC, "client had been told");
+    cJSON_Delete(m.json);
+    uint64_t rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "result acknowledged all the same");
+    f.mgr.persist = NULL;
+    pay_fixture_free(&f);
+
+    /* Failure: the same, with a plain UPDATE_FAIL_HTLC (the HTLC was in the
+       commitment, so it is not flagged as never taken) */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    f.mgr.persist = &db;
+    ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT(deliver_pay_result(&f, 7, 0, NULL), "handled");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC failed");
+    TEST_ASSERT_EQ(ch->remote_amount, 100000, "client refunded");
+    TEST_ASSERT_EQ(f.client_fd, -1, "client connection dropped");
+    TEST_ASSERT(wire_recv_timeout(f.client_peer, &m, 5), "client had been told");
+    TEST_ASSERT_EQ(m.msg_type, MSG_UPDATE_FAIL_HTLC, "UPDATE_FAIL_HTLC");
+    TEST_ASSERT(!wire_update_fail_htlc_is_uncommitted(m.json),
+                "a committed HTLC: a commitment exchange belongs to it");
+    cJSON_Delete(m.json);
+    f.mgr.persist = NULL;
+    pay_fixture_free(&f);
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- A refused HTLC is undone on the client; a failed one is failed ---- */
+
+int test_channel_rollback_htlc(void) {
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.local_amount = 100000;
+    ch.remote_amount = 100000;
+    unsigned char h1[32], h2[32];
+    memset(h1, 0x81, 32); memset(h2, 0x82, 32);
+    uint64_t a = 99, b = 99, c = 99;
+
+    /* Added, then refused: as if it had never been added */
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 4000, h1, 500, &a), "add");
+    TEST_ASSERT_EQ(ch.commitment_number, 1, "commitment advanced by the add");
+    TEST_ASSERT(channel_rollback_htlc(&ch, a), "rollback");
+    TEST_ASSERT_EQ(ch.local_amount, 100000, "amount back");
+    TEST_ASSERT_EQ(ch.remote_amount, 100000, "fee back");
+    TEST_ASSERT_EQ(ch.n_htlcs, 0, "HTLC gone");
+    TEST_ASSERT_EQ(ch.commitment_number, 0, "commitment number back");
+    TEST_ASSERT(!channel_rollback_htlc(&ch, a), "only once");
+
+    /* The next HTLC takes the same id, as it does on the side that never
+       saw the first one */
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 3000, h2, 500, &b), "add again");
+    TEST_ASSERT_EQ(b, a, "same HTLC id");
+    TEST_ASSERT_EQ(ch.commitment_number, 1, "same commitment number");
+
+    /* Only the latest HTLC, and only while it is the latest change */
+    TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 2000, h1, 500, &c), "second HTLC");
+    TEST_ASSERT(!channel_rollback_htlc(&ch, b), "an earlier HTLC cannot be rolled back");
+    TEST_ASSERT(!channel_rollback_htlc(&ch, 12345), "nor one that does not exist");
+    TEST_ASSERT(channel_rollback_htlc(&ch, c), "the latest can");
+    TEST_ASSERT(channel_fail_htlc(&ch, b), "fail the first");
+    TEST_ASSERT(!channel_rollback_htlc(&ch, b), "a failed HTLC is not rolled back");
+    TEST_ASSERT_EQ(ch.local_amount, 100000, "all amounts back");
+    free(ch.htlcs);
+    return 1;
+}
+
+int test_client_handles_update_fail_htlc(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    int cl[2], br[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, br) == 0, "socketpair");
+
+    /* The LSP's view of client 0, and the client's own view of its channel */
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 1;
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    mgr.bridge_fd = br[0];
+    mgr.next_request_id = 1;
+    snprintf(mgr.network, sizeof(mgr.network), "regtest");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.htlc_origins && lsp, "alloc");
+    int client_fd = cl[0];
+    lsp->client_fds = &client_fd;
+    channel_t *lsp_ch = &mgr.entries[0].channel;
+    lsp_ch->local_amount = 100000; lsp_ch->remote_amount = 100000;
+    channel_t client_ch;
+    memset(&client_ch, 0, sizeof(client_ch));
+    client_ch.local_amount = 100000; client_ch.remote_amount = 100000;
+
+    unsigned char hash[32];
+    memset(hash, 0x83, 32);
+    wire_msg_t m;
+    int committed = -1;
+    uint64_t failed_id = 99;
+
+    /* Twice over: the client offers an HTLC for an invoice the LSP will not
+       pay, the LSP refuses it, the client undoes it.  After each round both
+       sides hold the same state, so the next payment starts clean. */
+    for (int round = 0; round < 2; round++) {
+        uint64_t id;
+        TEST_ASSERT(channel_add_htlc(&client_ch, HTLC_OFFERED, 4000, hash, 500, &id),
+                    "client adds the HTLC");
+        cJSON *add = wire_build_update_add_htlc(id, 4000000, hash, 500);
+        cJSON_AddStringToObject(add, "bolt11", "lnbcrt40u1pnotaninvoice");
+        m.msg_type = MSG_UPDATE_ADD_HTLC; m.json = add;
+        TEST_ASSERT(lsp_channels_handle_msg(&mgr, lsp, 0, &m), "LSP handles the ADD");
+        cJSON_Delete(add);
+
+        TEST_ASSERT(wire_recv_timeout(cl[1], &m, 5), "client gets the answer");
+        TEST_ASSERT_EQ(m.msg_type, MSG_UPDATE_FAIL_HTLC, "UPDATE_FAIL_HTLC");
+        TEST_ASSERT(client_handle_fail_htlc(&client_ch, &m, &committed, &failed_id),
+                    "client applies it");
+        cJSON_Delete(m.json);
+        TEST_ASSERT_EQ(committed, 0, "refusal: no commitment exchange follows");
+        TEST_ASSERT_EQ(failed_id, id, "for its HTLC");
+
+        TEST_ASSERT_EQ(client_ch.n_htlcs, lsp_ch->n_htlcs, "same HTLCs (none)");
+        TEST_ASSERT_EQ(client_ch.commitment_number, lsp_ch->commitment_number,
+                       "same commitment number");
+        TEST_ASSERT_EQ(client_ch.local_amount, 100000, "client balance restored");
+        TEST_ASSERT_EQ(client_ch.next_htlc_id, lsp_ch->next_htlc_id, "same next HTLC id");
+        TEST_ASSERT(!wire_recv_timeout(cl[1], &m, 1), "nothing follows the refusal");
+    }
+
+    /* A committed HTLC that the LSP fails: the client fails it too and
+       expects the commitment exchange (its commitment number moves on, as
+       the LSP's does) */
+    uint64_t lsp_id, client_id;
+    TEST_ASSERT(channel_add_htlc(&client_ch, HTLC_OFFERED, 4000, hash, 500, &client_id),
+                "client side of a committed HTLC");
+    TEST_ASSERT(channel_add_htlc(lsp_ch, HTLC_RECEIVED, 4000, hash, 500, &lsp_id),
+                "LSP side of it");
+    TEST_ASSERT_EQ(client_id, lsp_id, "same id on both sides");
+    lsp_channels_fail_outbound_htlc(&mgr, lsp, NULL, 0, lsp_id, "bridge_unavailable");
+    TEST_ASSERT(wire_recv_timeout(cl[1], &m, 5), "client gets the failure");
+    TEST_ASSERT(client_handle_fail_htlc(&client_ch, &m, &committed, &failed_id),
+                "client applies it");
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(committed, 1, "failure of a committed HTLC");
+    TEST_ASSERT_EQ(client_ch.n_htlcs, 0, "HTLC gone on the client");
+    TEST_ASSERT_EQ(client_ch.local_amount, 100000, "client refunded");
+    TEST_ASSERT_EQ(client_ch.commitment_number, lsp_ch->commitment_number,
+                   "both sides moved to the same commitment");
+    TEST_ASSERT_EQ(lsp_ch->remote_amount, 100000, "LSP's view of the client restored");
+
+    /* A fail for an HTLC the client does not have changes nothing */
+    cJSON *bogus = wire_build_update_fail_htlc(777, "x");
+    m.msg_type = MSG_UPDATE_FAIL_HTLC; m.json = bogus;
+    TEST_ASSERT(!client_handle_fail_htlc(&client_ch, &m, &committed, &failed_id),
+                "unknown HTLC");
+    cJSON_Delete(bogus);
+    bogus = wire_build_update_fail_htlc_uncommitted(777, "x");
+    m.json = bogus;
+    TEST_ASSERT(!client_handle_fail_htlc(&client_ch, &m, &committed, &failed_id),
+                "unknown refused HTLC");
+    cJSON_Delete(bogus);
+    TEST_ASSERT_EQ(client_ch.local_amount, 100000, "balance untouched");
+
+    free(client_ch.htlcs); free(lsp_ch->htlcs);
+    if (client_fd >= 0) close(client_fd);
+    close(cl[1]); close(br[0]); close(br[1]);
+    free(mgr.entries); free(mgr.htlc_origins); free(lsp);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

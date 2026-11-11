@@ -921,7 +921,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (why) {
             fprintf(stderr, "LSP: outside payment from client %zu refused: %s\n",
                     sender_idx, why);
-            cJSON *fail = wire_build_update_fail_htlc(htlc_id, why);
+            /* Refused before the HTLC was taken into the channel: the
+               client drops it from its own state and no commitment
+               exchange follows. */
+            cJSON *fail = wire_build_update_fail_htlc_uncommitted(htlc_id, why);
             wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
             cJSON_Delete(fail);
             return 1;  /* a payment failure, not a protocol error */
@@ -959,8 +962,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                            payment_hash, cltv_expiry, &new_htlc_id)) {
         fprintf(stderr, "LSP: add_htlc failed for client %zu (insufficient funds?)\n",
                 sender_idx);
-        /* Send fail back */
-        cJSON *fail = wire_build_update_fail_htlc(htlc_id, "insufficient funds");
+        /* Send fail back: the HTLC was not taken, so the client drops it
+           and no commitment follows */
+        cJSON *fail = wire_build_update_fail_htlc_uncommitted(htlc_id,
+                                                               "insufficient funds");
         wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
         cJSON_Delete(fail);
         free(old_sender_htlcs);

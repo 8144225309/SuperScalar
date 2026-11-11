@@ -899,6 +899,17 @@ cJSON *wire_build_update_fail_htlc(uint64_t htlc_id, const char *reason) {
     return j;
 }
 
+cJSON *wire_build_update_fail_htlc_uncommitted(uint64_t htlc_id, const char *reason) {
+    cJSON *j = wire_build_update_fail_htlc(htlc_id, reason);
+    cJSON_AddBoolToObject(j, "uncommitted", 1);
+    return j;
+}
+
+int wire_update_fail_htlc_is_uncommitted(const cJSON *json) {
+    cJSON *u = cJSON_GetObjectItem(json, "uncommitted");
+    return u && cJSON_IsBool(u) && cJSON_IsTrue(u);
+}
+
 cJSON *wire_build_close_request(void) {
     return cJSON_CreateObject();
 }

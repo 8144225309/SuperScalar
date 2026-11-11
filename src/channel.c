@@ -1939,6 +1939,27 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
     return 1;
 }
 
+int channel_rollback_htlc(channel_t *ch, uint64_t htlc_id) {
+    if (ch->n_htlcs == 0 || ch->commitment_number == 0) return 0;
+    htlc_t *h = &ch->htlcs[ch->n_htlcs - 1];
+    if (h->id != htlc_id || h->state != HTLC_STATE_ACTIVE ||
+        htlc_id + 1 != ch->next_htlc_id)
+        return 0;
+
+    if (h->direction == HTLC_OFFERED)
+        ch->local_amount += h->amount_sats;
+    else
+        ch->remote_amount += h->amount_sats;
+    uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
+    *funder_bal += h->fee_at_add;
+
+    memset(h, 0, sizeof(*h));
+    ch->n_htlcs--;
+    ch->next_htlc_id--;
+    ch->commitment_number--;
+    return 1;
+}
+
 /* ---- HTLC timeout enforcement ---- */
 
 int channel_check_htlc_timeouts(channel_t *ch, uint32_t current_height) {

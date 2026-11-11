@@ -513,6 +513,26 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
     return 1;
 }
 
+int client_handle_fail_htlc(channel_t *ch, const wire_msg_t *msg,
+                             int *committed_out, uint64_t *htlc_id_out) {
+    uint64_t htlc_id;
+    char reason[128];
+    if (!wire_parse_update_fail_htlc(msg->json, &htlc_id, reason, sizeof(reason)))
+        return 0;
+    int uncommitted = wire_update_fail_htlc_is_uncommitted(msg->json);
+    if (committed_out) *committed_out = !uncommitted;
+    if (htlc_id_out) *htlc_id_out = htlc_id;
+    int ok = uncommitted ? channel_rollback_htlc(ch, htlc_id)
+                         : channel_fail_htlc(ch, htlc_id);
+    if (!ok)
+        fprintf(stderr, "Client: UPDATE_FAIL_HTLC for HTLC %llu (%s) does not "
+                "match the channel\n", (unsigned long long)htlc_id, reason);
+    else
+        printf("Client: HTLC %llu %s: %s\n", (unsigned long long)htlc_id,
+               uncommitted ? "refused" : "failed", reason);
+    return ok;
+}
+
 int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32) {

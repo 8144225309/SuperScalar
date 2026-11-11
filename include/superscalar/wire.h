@@ -460,6 +460,15 @@ int wire_parse_update_fulfill_htlc(const cJSON *json, uint64_t *htlc_id,
 int wire_parse_update_fail_htlc(const cJSON *json, uint64_t *htlc_id,
                                   char *reason, size_t reason_len);
 
+/* UPDATE_FAIL_HTLC for an HTLC the receiver of the ADD never took into its
+   channel state ({..., "uncommitted": true}).  The sender of the ADD drops
+   the HTLC from its own state; no commitment exchange follows.  Without the
+   flag the HTLC was committed on both sides and a COMMITMENT_SIGNED follows,
+   as after a fulfil. */
+cJSON *wire_build_update_fail_htlc_uncommitted(uint64_t htlc_id, const char *reason);
+/* 1 if a parsed UPDATE_FAIL_HTLC carries the uncommitted flag. */
+int wire_update_fail_htlc_is_uncommitted(const cJSON *json);
+
 int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
                                 unsigned char pubnonces_out[][66],
                                 size_t max_nonces, size_t *count_out);
