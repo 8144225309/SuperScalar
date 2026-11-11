@@ -2046,13 +2046,12 @@ handle_message:
         }
 
         case MSG_LEAF_REALLOC_PROPOSE: {
-            /* LSP proposes leaf reallocation — run the full ceremony
-               (nonce exchange + partial sig exchange + done confirmation). */
+            /* LSP proposes a leaf reallocation.  The client refuses every
+               one (see client_handle_leaf_realloc): it answers with an error
+               and its leaf and channel are unchanged, so the loop goes on. */
             wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
-            if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
-                                              my_index, &propose_msg)) {
-                fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
-            }
+            client_handle_leaf_realloc(fd, ctx, keypair, factory,
+                                        my_index, &propose_msg);
             cJSON_Delete(msg.json);
             break;
         }

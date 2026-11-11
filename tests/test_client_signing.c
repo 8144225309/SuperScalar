@@ -556,8 +556,9 @@ static size_t cs_leaf_amounts(const factory_node_t *leaf, uint64_t *amounts) {
     return n;
 }
 
-/* The acceptance rule: a client's own channel output, found from its own
-   tree, may grow but never shrink, and the leaf total is conserved. */
+/* The amount rule: a client's own channel output, found from its own tree,
+   may grow but never shrink, and the leaf total is conserved.  Passing it is
+   not enough to sign; see the handler tests below. */
 int test_client_leaf_realloc_acceptable(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
@@ -608,11 +609,11 @@ int test_client_leaf_realloc_acceptable(void) {
     memcpy(amts, cur, sizeof(cur));
     amts[2] -= 1000; amts[0] += 1000;
     TEST_ASSERT(client_leaf_realloc_acceptable(f, 1, 0, amts, n),
-                "stock moving to own channel is accepted");
+                "stock moving to own channel passes the rule");
     TEST_ASSERT(client_leaf_realloc_acceptable(f, 2, 0, amts, n),
-                "stock moving to the neighbour's channel is accepted");
+                "stock moving to the neighbour's channel passes the rule");
     TEST_ASSERT(client_leaf_realloc_acceptable(f, 1, 0, cur, n),
-                "unchanged amounts are accepted");
+                "unchanged amounts pass the rule");
 
     /* Amounts must conserve the leaf total and stay above dust. */
     memcpy(amts, cur, sizeof(cur));
@@ -662,9 +663,42 @@ static cJSON *cs_realloc_propose(secp256k1_context *ctx,
     return wire_build_leaf_realloc_propose(leaf_side, amounts, n, ser, NULL);
 }
 
-/* The handler refuses a reallocation that shrinks the client's output: it
-   reveals no nonce and its signed leaf is left exactly as it was. */
-int test_client_leaf_realloc_refuses_shrunk_output(void) {
+/* What a client must still hold after a reallocation proposal: the same
+   signed leaf at the same state. */
+typedef struct {
+    unsigned char txid[32];
+    uint32_t state;
+    uint32_t nsequence;
+    uint64_t amounts[FACTORY_MAX_OUTPUTS];
+    size_t n_amounts;
+} cs_leaf_snapshot_t;
+
+static void cs_leaf_snapshot(const factory_t *f, int leaf_side,
+                             cs_leaf_snapshot_t *snap) {
+    const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[leaf_side]];
+    memcpy(snap->txid, leaf->txid, 32);
+    snap->state = f->leaf_layers[leaf_side].current_state;
+    snap->nsequence = leaf->nsequence;
+    snap->n_amounts = cs_leaf_amounts(leaf, snap->amounts);
+}
+
+/* 1 if the leaf is still signed and identical to the snapshot. */
+static int cs_leaf_intact(const factory_t *f, int leaf_side,
+                          const cs_leaf_snapshot_t *snap) {
+    const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[leaf_side]];
+    uint64_t now[FACTORY_MAX_OUTPUTS];
+    if (cs_leaf_amounts(leaf, now) != snap->n_amounts) return 0;
+    if (memcmp(now, snap->amounts, snap->n_amounts * sizeof(uint64_t)) != 0)
+        return 0;
+    if (memcmp(leaf->txid, snap->txid, 32) != 0) return 0;
+    if (f->leaf_layers[leaf_side].current_state != snap->state) return 0;
+    if (leaf->nsequence != snap->nsequence) return 0;
+    return leaf->is_signed && leaf->signed_tx.len > 0;
+}
+
+/* The handler refuses every proposal, whatever the amounts: it reveals no
+   nonce and its signed leaf is left exactly as it was. */
+int test_client_leaf_realloc_handler_refuses_all(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -675,57 +709,59 @@ int test_client_leaf_realloc_refuses_shrunk_output(void) {
     TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
     TEST_ASSERT(factory_sign_all(f), "sign tree");
 
-    size_t leaf_idx = f->leaf_node_indices[0];
-    factory_node_t *leaf = &f->nodes[leaf_idx];
-    uint64_t before[FACTORY_MAX_OUTPUTS], amts[FACTORY_MAX_OUTPUTS];
-    size_t n = cs_leaf_amounts(leaf, before);
-    unsigned char txid_before[32];
-    memcpy(txid_before, leaf->txid, 32);
-    uint32_t state_before = f->leaf_layers[0].current_state;
-    uint32_t nseq_before = leaf->nsequence;
-    TEST_ASSERT(leaf->is_signed, "leaf signed before the proposal");
+    cs_leaf_snapshot_t snap;
+    cs_leaf_snapshot(f, 0, &snap);
+    size_t n = snap.n_amounts;
+    TEST_ASSERT(n == 3, "two channel outputs and the L-stock");
+    TEST_ASSERT(cs_leaf_intact(f, 0, &snap), "leaf signed before the proposal");
 
-    /* Client 1's channel output reduced to dust in favour of the L-stock. */
-    memcpy(amts, before, sizeof(before));
-    amts[n - 1] += amts[0] - CHANNEL_DUST_LIMIT_SATS;
-    amts[0] = CHANNEL_DUST_LIMIT_SATS;
+    /* 0: client 1's output cut to dust in favour of the L-stock.
+       1: L-stock moved into client 1's output.
+       2: amounts unchanged. */
+    for (int variant = 0; variant < 3; variant++) {
+        uint64_t amts[FACTORY_MAX_OUTPUTS];
+        memcpy(amts, snap.amounts, sizeof(amts));
+        if (variant == 0) {
+            amts[2] += amts[0] - CHANNEL_DUST_LIMIT_SATS;
+            amts[0] = CHANNEL_DUST_LIMIT_SATS;
+        } else if (variant == 1) {
+            amts[0] += 5000;
+            amts[2] -= 5000;
+        }
+        if (variant != 0)
+            TEST_ASSERT(client_leaf_realloc_acceptable(f, 1, 0, amts, n),
+                        "amounts pass the amount rule");
 
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
-    wire_msg_t propose;
-    memset(&propose, 0, sizeof(propose));
-    propose.msg_type = MSG_LEAF_REALLOC_PROPOSE;
-    propose.json = cs_realloc_propose(ctx, &kps[0], &pks[0], f, 0, amts, n);
-    TEST_ASSERT(propose.json != NULL, "build proposal");
-    /* Nothing follows the proposal: a client that goes on to sign blocks on
-       the next ceremony message, so end the stream to keep the test finite. */
-    shutdown(sv[0], SHUT_WR);
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        wire_msg_t propose;
+        memset(&propose, 0, sizeof(propose));
+        propose.msg_type = MSG_LEAF_REALLOC_PROPOSE;
+        propose.json = cs_realloc_propose(ctx, &kps[0], &pks[0], f, 0, amts, n);
+        TEST_ASSERT(propose.json != NULL, "build proposal");
+        /* Nothing follows the proposal: a client that went on to sign would
+           block on the next ceremony message, so end the stream. */
+        shutdown(sv[0], SHUT_WR);
 
-    int rc = client_handle_leaf_realloc(sv[1], ctx, &kps[1], f, 1, &propose);
-    cJSON_Delete(propose.json);
-    close(sv[1]);
+        int rc = client_handle_leaf_realloc(sv[1], ctx, &kps[1], f, 1, &propose);
+        cJSON_Delete(propose.json);
+        close(sv[1]);
 
-    wire_msg_t reply;
-    memset(&reply, 0, sizeof(reply));
-    uint8_t sent = 0;
-    if (wire_recv(sv[0], &reply)) {
-        sent = reply.msg_type;
-        if (reply.json) cJSON_Delete(reply.json);
+        wire_msg_t reply;
+        memset(&reply, 0, sizeof(reply));
+        uint8_t sent = 0;
+        if (wire_recv(sv[0], &reply)) {
+            sent = reply.msg_type;
+            if (reply.json) cJSON_Delete(reply.json);
+        }
+        close(sv[0]);
+
+        TEST_ASSERT(sent != MSG_LEAF_REALLOC_NONCE, "client reveals no nonce");
+        TEST_ASSERT(rc == 0, "client refuses the reallocation");
+        TEST_ASSERT(sent == MSG_ERROR, "client reports the refusal");
+        TEST_ASSERT(cs_leaf_intact(f, 0, &snap),
+                    "client still holds its signed leaf, unchanged");
     }
-    close(sv[0]);
-
-    TEST_ASSERT(sent != MSG_LEAF_REALLOC_NONCE, "client reveals no nonce");
-    TEST_ASSERT(rc == 0, "client refuses the reallocation");
-    TEST_ASSERT(sent == MSG_ERROR, "client reports the refusal");
-
-    uint64_t after[FACTORY_MAX_OUTPUTS];
-    TEST_ASSERT(cs_leaf_amounts(leaf, after) == n, "output count unchanged");
-    TEST_ASSERT(memcmp(before, after, n * sizeof(uint64_t)) == 0,
-                "leaf amounts unchanged");
-    TEST_ASSERT(memcmp(txid_before, leaf->txid, 32) == 0, "leaf txid unchanged");
-    TEST_ASSERT(f->leaf_layers[0].current_state == state_before &&
-                leaf->nsequence == nseq_before, "leaf state not advanced");
-    TEST_ASSERT(leaf->is_signed, "client still holds its signed leaf");
 
     factory_free(f);
     free(f);
@@ -733,41 +769,45 @@ int test_client_leaf_realloc_refuses_shrunk_output(void) {
     return 1;
 }
 
-/* Full ceremony: the LSP moves L-stock into a client's channel output and
-   both clients of the leaf co-sign the new leaf state. */
-int test_client_leaf_realloc_honest_ceremony(void) {
+/* Exit codes of a client child in cs_run_realloc_ceremony. */
+#define CS_REALLOC_REFUSED_INTACT   0  /* refused, signed leaf unchanged */
+#define CS_REALLOC_SETUP_FAILED     2
+#define CS_REALLOC_ACCEPTED_SIGNED  3  /* took part, holds a signed leaf */
+#define CS_REALLOC_ACCEPTED_NO_SIG  4  /* took part, left with no signed leaf */
+#define CS_REALLOC_REFUSED_CHANGED  5  /* refused, but its leaf was modified */
+
+/* Drive lsp_realloc_leaf on leaf 0 against the real client handler in both
+   clients of that leaf.  Reports the LSP's return value, each client's exit
+   code and whether the LSP came out holding a signed leaf that differs from
+   the one the clients hold. */
+static int cs_run_realloc_ceremony(const int64_t *deltas, int *lsp_rc_out,
+                                   int client_code_out[2],
+                                   int *lsp_has_new_signed_leaf_out) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
-    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    if (!cs_keys(ctx, kps, pks)) return 0;
 
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    TEST_ASSERT(lsp != NULL, "alloc");
-    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CS_N - 1), "lsp init");
+    if (!lsp) return 0;
+    if (!lsp_init(lsp, ctx, &kps[0], 0, CS_N - 1)) return 0;
     factory_t *f = &lsp->factory;
-    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
-    TEST_ASSERT(factory_sign_all(f), "sign tree");
+    if (!cs_build_factory(f, ctx, kps, pks)) return 0;
+    if (!factory_sign_all(f)) return 0;
 
-    size_t leaf_idx = f->leaf_node_indices[0];
-    factory_node_t *leaf = &f->nodes[leaf_idx];
-    uint64_t before[FACTORY_MAX_OUTPUTS], amts[FACTORY_MAX_OUTPUTS];
-    size_t n = cs_leaf_amounts(leaf, before);
-    TEST_ASSERT(n == 3, "two channel outputs and the L-stock");
-    unsigned char txid_before[32];
-    memcpy(txid_before, leaf->txid, 32);
+    cs_leaf_snapshot_t snap;
+    cs_leaf_snapshot(f, 0, &snap);
+    size_t n = snap.n_amounts;
+    if (n != 3) return 0;
+    uint64_t amts[FACTORY_MAX_OUTPUTS];
+    for (size_t i = 0; i < n; i++)
+        amts[i] = (uint64_t)((int64_t)snap.amounts[i] + deltas[i]);
 
-    const uint64_t moved = 5000;
-    TEST_ASSERT(before[2] > moved + CHANNEL_DUST_LIMIT_SATS, "enough L-stock");
-    memcpy(amts, before, sizeof(before));
-    amts[0] += moved;
-    amts[2] -= moved;
-
-    /* One connection per client; only the two clients of leaf 0 take part,
-       the other two just receive the final notification. */
+    /* One connection per client; only the two clients of leaf 0 are asked. */
     int peer_fd[CS_N - 1];
     for (int c = 0; c < CS_N - 1; c++) {
         int sv[2];
-        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
         lsp->client_fds[c] = sv[0];
         peer_fd[c] = sv[1];
     }
@@ -777,7 +817,7 @@ int test_client_leaf_realloc_honest_ceremony(void) {
     fflush(stdout);
     for (int c = 0; c < 2; c++) {
         pid_t pid = fork();
-        TEST_ASSERT(pid >= 0, "fork");
+        if (pid < 0) return 0;
         if (pid == 0) {
             for (int p = 0; p < CS_N - 1; p++) {
                 close(lsp->client_fds[p]);
@@ -787,15 +827,16 @@ int test_client_leaf_realloc_honest_ceremony(void) {
             wire_msg_t msg;
             if (!wire_recv(peer_fd[c], &msg) ||
                 msg.msg_type != MSG_LEAF_REALLOC_PROPOSE)
-                _exit(2);
+                _exit(CS_REALLOC_SETUP_FAILED);
+            /* The child works on its own copy of the tree. */
             int ok = client_handle_leaf_realloc(peer_fd[c], ctx, &kps[my_index],
                                                  f, my_index, &msg);
-            /* The child works on its own copy of the tree. */
             const factory_node_t *my_leaf = &f->nodes[f->leaf_node_indices[0]];
-            if (ok && (my_leaf->outputs[0].amount_sats != amts[0] ||
-                       my_leaf->outputs[2].amount_sats != amts[2]))
-                ok = 0;
-            _exit(ok ? 0 : 1);
+            if (ok)
+                _exit(my_leaf->is_signed ? CS_REALLOC_ACCEPTED_SIGNED
+                                         : CS_REALLOC_ACCEPTED_NO_SIG);
+            _exit(cs_leaf_intact(f, 0, &snap) ? CS_REALLOC_REFUSED_INTACT
+                                              : CS_REALLOC_REFUSED_CHANGED);
         }
         pids[c] = pid;
     }
@@ -805,31 +846,63 @@ int test_client_leaf_realloc_honest_ceremony(void) {
     memset(&mgr, 0, sizeof(mgr));
     mgr.bridge_fd = -1;
     void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
-    int realloc_rc = lsp_realloc_leaf(&mgr, lsp, 0, amts, n);
+    *lsp_rc_out = lsp_realloc_leaf(&mgr, lsp, 0, amts, n);
 
-    uint64_t after[FACTORY_MAX_OUTPUTS];
-    size_t n_after = cs_leaf_amounts(leaf, after);
-    int amounts_ok = (n_after == n &&
-                      memcmp(after, amts, n * sizeof(uint64_t)) == 0);
-    int signed_ok = leaf->is_signed && leaf->signed_tx.len > 0;
-    int txid_changed = memcmp(txid_before, leaf->txid, 32) != 0;
+    const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[0]];
+    *lsp_has_new_signed_leaf_out =
+        leaf->is_signed && leaf->signed_tx.len > 0 &&
+        memcmp(leaf->txid, snap.txid, 32) != 0;
 
     for (int c = 2; c < CS_N - 1; c++) close(peer_fd[c]);
     lsp_cleanup(lsp);
     free(lsp);
     signal(SIGPIPE, old_sigpipe);
 
-    int clients_ok = 1;
     for (int c = 0; c < 2; c++) {
         int status = 0;
         waitpid(pids[c], &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) clients_ok = 0;
+        client_code_out[c] = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
     secp256k1_context_destroy(ctx);
+    return 1;
+}
 
-    TEST_ASSERT(realloc_rc == 1, "honest reallocation completes");
-    TEST_ASSERT(amounts_ok, "leaf carries the new amounts");
-    TEST_ASSERT(signed_ok && txid_changed, "new leaf state is signed");
-    TEST_ASSERT(clients_ok, "both clients co-signed and applied the amounts");
+/* Full ceremony, L-stock moved into a client's channel output: the amounts
+   satisfy the amount rule, and the clients still refuse.  The LSP's ceremony
+   fails and it gets no signed replacement leaf. */
+int test_client_leaf_realloc_ceremony_refused(void) {
+    const int64_t deltas[3] = { 5000, 0, -5000 };
+    int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_new_leaf = -1;
+    TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes, &lsp_new_leaf),
+                "run ceremony");
+    if (codes[0] != CS_REALLOC_REFUSED_INTACT ||
+        codes[1] != CS_REALLOC_REFUSED_INTACT)
+        printf("  client exit codes: %d %d\n", codes[0], codes[1]);
+    TEST_ASSERT(codes[0] == CS_REALLOC_REFUSED_INTACT &&
+                codes[1] == CS_REALLOC_REFUSED_INTACT,
+                "both clients refuse and keep their signed leaf");
+    TEST_ASSERT(lsp_rc == 0, "the LSP's reallocation does not complete");
+    TEST_ASSERT(lsp_new_leaf == 0, "the LSP holds no signed replacement leaf");
+    return 1;
+}
+
+/* A reallocation that changes no amount still replaces the leaf transaction.
+   A client that co-signed it would be left without a signed leaf while the
+   LSP held one that supersedes the client's commitments, so it is refused
+   like any other. */
+int test_client_leaf_realloc_identity_refused(void) {
+    const int64_t deltas[3] = { 0, 0, 0 };
+    int lsp_rc = -1, codes[2] = { -1, -1 }, lsp_new_leaf = -1;
+    TEST_ASSERT(cs_run_realloc_ceremony(deltas, &lsp_rc, codes, &lsp_new_leaf),
+                "run ceremony");
+    if (codes[0] != CS_REALLOC_REFUSED_INTACT ||
+        codes[1] != CS_REALLOC_REFUSED_INTACT)
+        printf("  client exit codes: %d %d, LSP rc %d, LSP holds new signed "
+               "leaf: %d\n", codes[0], codes[1], lsp_rc, lsp_new_leaf);
+    TEST_ASSERT(codes[0] == CS_REALLOC_REFUSED_INTACT &&
+                codes[1] == CS_REALLOC_REFUSED_INTACT,
+                "both clients refuse and keep their signed leaf");
+    TEST_ASSERT(lsp_rc == 0, "the LSP's reallocation does not complete");
+    TEST_ASSERT(lsp_new_leaf == 0, "the LSP holds no signed replacement leaf");
     return 1;
 }

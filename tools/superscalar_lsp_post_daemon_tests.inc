@@ -1109,20 +1109,22 @@
             printf("  SKIP: --test-realloc requires --clients >= 2\n");
             printf("LEAF REALLOC TEST: SKIP (gate=clients)\n");
         } else {
-            /* Record current leaf node output amounts (authoritative source) */
+            /* Clients refuse every leaf reallocation: a reallocation replaces
+               the leaf transaction and nothing moves their channel to the new
+               leaf output.  The test proposes one whose amounts are otherwise
+               unobjectionable (L-stock moved toward a channel, total
+               conserved) and passes when the clients refuse it and the LSP is
+               left without a signed replacement leaf. */
             size_t leaf_node_idx = lsp_p->factory.leaf_node_indices[0];
             factory_node_t *leaf_node = &lsp_p->factory.nodes[leaf_node_idx];
-            uint64_t orig_amounts[3];
-            uint64_t orig_total = 0;
-            for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++) {
+            uint64_t orig_amounts[3] = {0, 0, 0};
+            for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++)
                 orig_amounts[k] = leaf_node->outputs[k].amount_sats;
-                orig_total += orig_amounts[k];
-            }
+            unsigned char orig_leaf_txid[32];
+            memcpy(orig_leaf_txid, leaf_node->txid, 32);
 
-            /* Build redistributed amounts: move 20% of the L-stock (slot 2)
-               into the second client's channel output (slot 1).  Stock may
-               only flow toward channels; clients refuse to sign a realloc
-               that shrinks their own output. */
+            /* Move 20% of the L-stock (slot 2) into the second client's
+               channel output (slot 1). */
             uint64_t shift = orig_amounts[2] / 5;
             if (orig_amounts[2] - shift < 546)
                 shift = orig_amounts[2] > 546 ? orig_amounts[2] - 546 : 0;
@@ -1131,7 +1133,7 @@
             new_amounts[1] = orig_amounts[1] + shift;
             new_amounts[2] = orig_amounts[2] - shift;
 
-            printf("Reallocating leaf 0: [%llu, %llu, %llu] → [%llu, %llu, %llu]\n",
+            printf("Proposing leaf 0 realloc: [%llu, %llu, %llu] → [%llu, %llu, %llu]\n",
                    (unsigned long long)orig_amounts[0],
                    (unsigned long long)orig_amounts[1],
                    (unsigned long long)orig_amounts[2],
@@ -1139,113 +1141,27 @@
                    (unsigned long long)new_amounts[1],
                    (unsigned long long)new_amounts[2]);
 
-            /* CL2 --cheat-realloc: snapshot the pre-realloc leaf signed_tx BEFORE
-               lsp_realloc_leaf mutates the node. After realloc completes, this
-               snapshotted tx is the revoked state we'll attempt to broadcast. */
-            tx_buf_t cl2_pre_realloc_tx;
-            tx_buf_init(&cl2_pre_realloc_tx, 0);
-            if (cheat_realloc &&
-                leaf_node->is_signed && leaf_node->signed_tx.len > 0) {
-                tx_buf_init(&cl2_pre_realloc_tx, (int)leaf_node->signed_tx.len);
-                memcpy(cl2_pre_realloc_tx.data, leaf_node->signed_tx.data,
-                       leaf_node->signed_tx.len);
-                cl2_pre_realloc_tx.len = leaf_node->signed_tx.len;
-                printf("CL2 cheat-realloc: snapshotted pre-realloc leaf tx (%zu bytes)\n",
-                       (size_t)cl2_pre_realloc_tx.len);
-            }
-
             int rc = lsp_realloc_leaf(mgr, lsp_p, 0, new_amounts, 3);
-            if (rc != 1) {
-                printf("  FAIL: lsp_realloc_leaf returned %d (expected 1)\n", rc);
+            if (rc != 0) {
+                printf("  FAIL: lsp_realloc_leaf returned %d — clients co-signed "
+                       "a leaf reallocation (expected a refusal)\n", rc);
+                realloc_pass = 0;
+            } else {
+                printf("  clients refused the reallocation (expected)\n");
+            }
+            if (leaf_node->is_signed && leaf_node->signed_tx.len > 0 &&
+                memcmp(leaf_node->txid, orig_leaf_txid, 32) != 0) {
+                printf("  FAIL: LSP holds a signed replacement leaf after the "
+                       "refusal\n");
                 realloc_pass = 0;
             }
-
-            /* Verify amounts updated (read from leaf node outputs) */
-            if (realloc_pass) {
-                uint64_t post_total = 0;
-                /* #98: match orig_total's k<3 (the reallocatable channel+L-stock
-                   outputs) -- exclude the trailing P2A tree anchor (fixed 240 sats,
-                   present before + after the realloc, not part of the redistribution). */
-                for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++)
-                    post_total += leaf_node->outputs[k].amount_sats;
-                if (post_total != orig_total) {
-                    printf("  FAIL: total funding changed "
-                           "(%llu → %llu)\n",
-                           (unsigned long long)orig_total,
-                           (unsigned long long)post_total);
-                    realloc_pass = 0;
-                }
+            if (cheat_realloc) {
+                /* The stale-leaf broadcast needs a completed reallocation to
+                   make the old leaf stale; there is none to cheat against. */
+                printf("  FAIL: --cheat-realloc requires a completed leaf "
+                       "reallocation, which clients refuse\n");
+                realloc_pass = 0;
             }
-
-            /* CL2 cheat-realloc broadcast + watchtower assertion. */
-            if (realloc_pass && cheat_realloc && cl2_pre_realloc_tx.len > 0) {
-                /* The realloc cheat is only meaningful if the parent factory
-                   tree is on-chain (else the stale leaf has no parent UTXO to
-                   spend, sendrawtransaction returns -25 missingorspent).
-                   Mirror the --cheat-leaf trick: temporarily set is_signed=0
-                   on the realloc'd leaf so broadcast_factory_tree_any_network
-                   skips it, broadcast the parent path, then restore and broadcast
-                   the snapshotted pre-realloc leaf. WT now sees the stale on
-                   chain alongside the registered post-realloc state. */
-                printf("\n--- CL2 cheat-realloc: broadcasting parent factory tree (skipping realloc'd leaf) ---\n");
-                fflush(stdout);
-                int saved_leaf_is_signed = leaf_node->is_signed;
-                leaf_node->is_signed = 0;
-                int parent_tree_ok = broadcast_factory_tree_any_network(
-                    &lsp_p->factory, &rt, mine_addr, is_regtest,
-                    confirm_timeout_secs);
-                leaf_node->is_signed = saved_leaf_is_signed;
-                if (!parent_tree_ok) {
-                    fprintf(stderr,
-                            "CL2 CHEAT-REALLOC: parent tree broadcast failed — cannot test stale broadcast\n");
-                    realloc_pass = 0;
-                    goto cl2_cleanup;
-                }
-                printf("CL2 CHEAT-REALLOC: parent tree on-chain; broadcasting revoked pre-realloc leaf\n");
-
-                char *cheat_hex = malloc((size_t)cl2_pre_realloc_tx.len * 2 + 1);
-                char cheat_txid_str[65] = {0};
-                int sent = 0;
-                if (cheat_hex) {
-                    hex_encode(cl2_pre_realloc_tx.data,
-                               (size_t)cl2_pre_realloc_tx.len, cheat_hex);
-                    sent = regtest_send_raw_tx(&rt, cheat_hex, cheat_txid_str);
-                    if (g_db)
-                        persist_log_broadcast(g_db,
-                            sent ? cheat_txid_str : "?",
-                            "cheat_realloc_stale",
-                            cheat_hex,
-                            sent ? "ok" : "failed");
-                    free(cheat_hex);
-                }
-                if (!sent) {
-                    fprintf(stderr, "CL2 CHEAT-REALLOC: stale broadcast failed\n");
-                    realloc_pass = 0;
-                } else {
-                    printf("CL2 CHEAT-REALLOC: revoked tx broadcast txid=%s\n",
-                           cheat_txid_str);
-                    if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
-                    watchtower_t *wt_cl2 = mgr->watchtower;
-                    if (!wt_cl2) {
-                        fprintf(stderr,
-                                "CL2 CHEAT-REALLOC: no watchtower configured — cannot assert defense\n");
-                        realloc_pass = 0;
-                    } else {
-                        int detected = watchtower_check(wt_cl2);
-                        if (detected > 0) {
-                            printf("CL2 CHEAT-REALLOC: BREACH DETECTED! Watchtower broadcast %d penalty tx(s)\n",
-                                   detected);
-                            if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
-                        } else {
-                            fprintf(stderr,
-                                    "CL2 CHEAT-REALLOC: watchtower did NOT detect revoked broadcast (defense MISS)\n");
-                            realloc_pass = 0;
-                        }
-                    }
-                }
-            }
-        cl2_cleanup:
-            tx_buf_free(&cl2_pre_realloc_tx);
 
             printf("LEAF REALLOC TEST: %s\n", realloc_pass ? "PASS" : "FAIL");
         }

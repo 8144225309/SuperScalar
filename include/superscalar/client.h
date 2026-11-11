@@ -204,20 +204,26 @@ int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
 
-/* Decide whether an LSP-proposed leaf reallocation is safe for this client
-   to sign.  Evaluated entirely against the client's own tree: the client
-   must be a signer of the leaf, the amounts must cover exactly the leaf's
-   reallocatable outputs and conserve their total, and the output funding
-   this client's channel (located with factory_client_to_leaf, never from the
-   message) must not be smaller than it is now.  Returns 1 if acceptable. */
+/* Amount rule for an LSP-proposed leaf reallocation.  Evaluated entirely
+   against the client's own tree: the client must be a signer of the leaf,
+   the amounts must cover exactly the leaf's reallocatable outputs and
+   conserve their total, and the output funding this client's channel
+   (located with factory_client_to_leaf, never from the message) must not be
+   smaller than it is now.  Returns 1 if the amounts satisfy the rule.
+
+   Passing this rule does NOT make a reallocation signable.  A reallocation
+   replaces the leaf transaction, and the client's channel and commitments
+   are not moved to the new leaf output, so a client that co-signs one loses
+   its unilateral exit even when its amount is unchanged.  The rule is only
+   one precondition for a future ceremony that also re-anchors the channel;
+   client_handle_leaf_realloc does not consult it and refuses everything. */
 int client_leaf_realloc_acceptable(const factory_t *factory,
                                     uint32_t my_index, int leaf_side,
                                     const uint64_t *amounts, size_t n_amounts);
 
-/* Handle a LEAF_REALLOC_PROPOSE from the LSP.
-   Reads PROPOSE, sends NONCE, reads ALL_NONCES, sends PSIG, reads DONE.
-   Updates local factory amounts.
-   Returns 1 on success. */
+/* Handle a LEAF_REALLOC_PROPOSE from the LSP: always refuse.
+   Sends an error to the LSP, reveals no nonce, produces no signature and
+   leaves the factory untouched.  Always returns 0. */
 int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 factory_t *factory,

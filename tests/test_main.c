@@ -3929,11 +3929,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_close_refuses_unpaid_proposal);
     RUN_TEST(test_client_close_honest_ceremony);
     extern int test_client_leaf_realloc_acceptable(void);
-    extern int test_client_leaf_realloc_refuses_shrunk_output(void);
-    extern int test_client_leaf_realloc_honest_ceremony(void);
+    extern int test_client_leaf_realloc_handler_refuses_all(void);
+    extern int test_client_leaf_realloc_ceremony_refused(void);
+    extern int test_client_leaf_realloc_identity_refused(void);
     RUN_TEST(test_client_leaf_realloc_acceptable);
-    RUN_TEST(test_client_leaf_realloc_refuses_shrunk_output);
-    RUN_TEST(test_client_leaf_realloc_honest_ceremony);
+    RUN_TEST(test_client_leaf_realloc_handler_refuses_all);
+    RUN_TEST(test_client_leaf_realloc_ceremony_refused);
+    RUN_TEST(test_client_leaf_realloc_identity_refused);
 }
 
 extern int regtest_init_faucet(void);
