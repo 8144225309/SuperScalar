@@ -3952,3 +3952,130 @@ int test_bridge_plugin_auth(void) {
     bridge_cleanup(&br);
     return 1;
 }
+
+/* ---- Inbound bridge HTLC must carry the invoice amount ---- */
+
+/* Hand the LSP an inbound bridge HTLC and return the reason it was failed
+   with ("" if no failure came back). */
+static int offer_bridge_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp, int bridge_peer_fd,
+                             const unsigned char *hash, uint64_t amount_msat,
+                             uint32_t cltv_expiry, uint64_t htlc_id,
+                             char *reason, size_t reason_cap) {
+    cJSON *add = wire_build_bridge_add_htlc(hash, amount_msat, cltv_expiry, htlc_id);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_ADD_HTLC;
+    msg.json = add;
+    int handled = lsp_channels_handle_bridge_msg(mgr, lsp, &msg);
+    cJSON_Delete(add);
+    reason[0] = '\0';
+    if (!handled) return 0;
+
+    wire_msg_t reply;
+    if (!wire_recv_timeout(bridge_peer_fd, &reply, 5)) return 0;
+    unsigned char failed_hash[32];
+    uint64_t failed_id = 0;
+    int ok = reply.msg_type == MSG_BRIDGE_FAIL_HTLC &&
+             wire_parse_bridge_fail_htlc(reply.json, failed_hash, reason,
+                                          reason_cap, &failed_id) &&
+             failed_id == htlc_id && memcmp(failed_hash, hash, 32) == 0;
+    cJSON_Delete(reply.json);
+    return ok;
+}
+
+int test_lsp_inbound_amount_below_invoice(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 2;
+    mgr.bridge_fd = sv[0];
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.entries_cap = 2;
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.invoices && mgr.htlc_origins && lsp, "alloc");
+
+    unsigned char preimage[32], hash[32];
+    memset(preimage, 0x39, 32);
+    sha256(preimage, 32, hash);
+    const uint64_t INVOICE_MSAT = 5000000;
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, INVOICE_MSAT),
+                "register invoice");
+    uint64_t registered = 0;
+    TEST_ASSERT(lsp_channels_invoice_amount(&mgr, hash, &registered), "invoice found");
+    TEST_ASSERT_EQ(registered, INVOICE_MSAT, "invoice amount");
+
+    char reason[128];
+
+    /* Less than the invoice asks for: refused, whether by a lot (a part of
+       a split payment), by one satoshi, or by one millisatoshi. */
+    static const uint64_t short_amounts[] = { 1000, 2500000, 4999000, 4999999 };
+    for (size_t i = 0; i < sizeof(short_amounts) / sizeof(short_amounts[0]); i++) {
+        TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash, short_amounts[i],
+                                       500, 70 + i, reason, sizeof(reason)),
+                    "short HTLC failed back");
+        TEST_ASSERT(strcmp(reason, "amount_below_invoice") == 0,
+                    "refused: below invoice amount");
+    }
+    /* Nothing was offered to the client and nothing is tracked. */
+    TEST_ASSERT_EQ(mgr.entries[1].channel.n_htlcs, 0, "no HTLC offered to client");
+    TEST_ASSERT(!lsp_channels_bridge_htlc_pending(&mgr, hash), "no HTLC tracked");
+    size_t dest = 99;
+    TEST_ASSERT(lsp_channels_lookup_invoice(&mgr, hash, &dest) && dest == 1,
+                "invoice still payable");
+
+    /* The full amount gets past the amount check (and is stopped only by
+       the next one: this HTLC's expiry is too low to forward). */
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash, INVOICE_MSAT,
+                                   10, 80, reason, sizeof(reason)),
+                "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "cltv_expiry_out_of_bounds") == 0,
+                "full amount is not refused for its amount");
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash, INVOICE_MSAT + 1000,
+                                   10, 81, reason, sizeof(reason)),
+                "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "cltv_expiry_out_of_bounds") == 0,
+                "overpayment is not refused for its amount");
+
+    /* While one HTLC for the invoice is in flight, another is refused even
+       at the full amount. */
+    lsp_channels_track_bridge_origin(&mgr, hash, 90);
+    TEST_ASSERT(lsp_channels_bridge_htlc_pending(&mgr, hash), "HTLC in flight");
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash, INVOICE_MSAT,
+                                   500, 91, reason, sizeof(reason)),
+                "second HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "duplicate_payment_hash") == 0,
+                "refused: payment already in flight");
+    TEST_ASSERT_EQ(lsp_channels_get_bridge_origin(&mgr, hash), 90,
+                   "first HTLC still the tracked one");
+
+    /* An invoice registered without an amount accepts any amount. */
+    unsigned char preimage2[32], hash2[32];
+    memset(preimage2, 0x3a, 32);
+    sha256(preimage2, 32, hash2);
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash2, preimage2, 0, 0),
+                "register amountless invoice");
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash2, 1000, 10, 95,
+                                   reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "cltv_expiry_out_of_bounds") == 0,
+                "amountless invoice: not refused for its amount");
+
+    /* Unknown hash: unchanged. */
+    unsigned char unknown[32];
+    memset(unknown, 0x3b, 32);
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], unknown, INVOICE_MSAT, 500, 96,
+                                   reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "unknown_payment_hash") == 0, "unknown hash");
+
+    close(sv[0]);
+    close(sv[1]);
+    free(mgr.entries);
+    free(mgr.invoices);
+    free(mgr.htlc_origins);
+    free(lsp);
+    return 1;
+}

@@ -246,6 +246,30 @@ int lsp_channels_lookup_invoice(lsp_channel_mgr_t *mgr,
     return 0;
 }
 
+int lsp_channels_invoice_amount(lsp_channel_mgr_t *mgr,
+                                 const unsigned char *payment_hash32,
+                                 uint64_t *amount_msat_out) {
+    for (size_t i = 0; i < mgr->n_invoices; i++) {
+        if (!mgr->invoices[i].active) continue;
+        if (memcmp(mgr->invoices[i].payment_hash, payment_hash32, 32) == 0) {
+            if (amount_msat_out) *amount_msat_out = mgr->invoices[i].amount_msat;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        const htlc_origin_t *o = &mgr->htlc_origins[i];
+        if (o->active && o->bridge_htlc_id > 0 &&
+            memcmp(o->payment_hash, payment_hash32, 32) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id) {
@@ -340,6 +364,39 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 printf("LSP: bridge HTLC unknown hash, failing back\n");
                 return 1;
             }
+        }
+
+        /* The invoice amount must arrive in this one HTLC.  The client is
+           offered exactly what came in and releases the preimage for it, so
+           an HTLC below the invoice amount would settle the invoice for
+           less than it asks.  Parts of a multi-part payment are not
+           collected: each is below the invoice amount and is refused here,
+           before anything is offered to the client. */
+        uint64_t invoice_msat = 0;
+        if (lsp_channels_invoice_amount(mgr, payment_hash, &invoice_msat) &&
+            amount_msat < invoice_msat) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "amount_below_invoice", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC rejected — %llu msat is below the "
+                   "invoice amount of %llu msat\n",
+                   (unsigned long long)amount_msat,
+                   (unsigned long long)invoice_msat);
+            return 1;
+        }
+
+        /* One HTLC per invoice at a time: a second one for the same hash
+           would be a further part or a repeat of a payment still in
+           flight. */
+        if (lsp_channels_bridge_htlc_pending(mgr, payment_hash)) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "duplicate_payment_hash", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC rejected — payment already in flight "
+                   "for this hash\n");
+            return 1;
         }
 
         /* Reject sub-satoshi fractions: on-chain amounts are whole sats */

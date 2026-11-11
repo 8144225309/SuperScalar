@@ -13,6 +13,11 @@ Handles:
 Non-factory HTLCs pass through to CLN's normal handling, so traditional
 Lightning channels continue to work unaffected.
 
+CLN holds every factory invoice together with its preimage, so if the hook
+answered "continue" for an HTLC paying one, CLN would settle the invoice
+itself and the factory client would never be paid.  HTLCs for factory
+invoices are therefore only ever resolved (on the LSP's word) or failed.
+
 The bridge only talks to a plugin that presents its shared secret.  The
 bridge writes the secret to a file (mode 0600) when it first starts; this
 plugin reads the same file and sends the secret as its first message.
@@ -44,9 +49,14 @@ KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend (overridable via p
 ROUTE_HINT = None  # "node_id/scid/fee_base/fee_ppm/cltv_delta" for factory channels
 bridge_sock = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
-pending_htlcs = {}   # payment_hash -> rpc_id for resolving
+# payment_hash -> {"rpc_id": hook request to answer,
+#                  "factory_invoice": True if CLN holds this hash's invoice}
+pending_htlcs = {}
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
+# True once registered_invoices has been rebuilt from CLN's invoice list.
+# Until then an unlisted hash may still be a factory invoice.
+registry_recovered = False
 lock = threading.Lock()
 send_lock = threading.Lock()  # serializes sendall to bridge socket
 cln_lock = threading.Lock()  # serializes writes to CLN stdout
@@ -199,6 +209,51 @@ def read_bridge_secret():
     return secret
 
 
+# BOLT #4 failure codes for the htlc_accepted hook (hex, no data)
+FAIL_TEMPORARY_NODE = "2002"   # temporary_node_failure
+FAIL_MPP_TIMEOUT = "0017"      # mpp_timeout: give up on this payment set
+
+
+def hook_continue(rpc_id):
+    """Let CLN handle the HTLC itself.  Never for a factory invoice: CLN has
+    its preimage and would settle it without the factory client being paid."""
+    send_to_cln({"jsonrpc": "2.0", "id": rpc_id,
+                 "result": {"result": "continue"}})
+
+
+def hook_fail(rpc_id, failure_message=FAIL_TEMPORARY_NODE):
+    """Fail the HTLC back to its sender.
+    CLN v25+ requires failure_message for hook fail."""
+    send_to_cln({"jsonrpc": "2.0", "id": rpc_id,
+                 "result": {"result": "fail",
+                            "failure_message": failure_message}})
+
+
+def recover_registered_invoices():
+    """Rebuild registered_invoices from CLN's invoice list (the set is lost
+    when the plugin restarts; the invoices are not).  Returns True once the
+    list has been read."""
+    global registry_recovered
+    try:
+        invs = cln_rpc("listinvoices", timeout=10).get("invoices", [])
+    except Exception as e:
+        log(f"Invoice recovery failed: {type(e).__name__}: {e}")
+        return False
+    recovered = 0
+    with lock:
+        for inv in invs:
+            if inv.get("status") == "unpaid" and \
+               inv.get("label", "").startswith("superscalar-"):
+                ph = inv.get("payment_hash", "")
+                if ph and ph not in registered_invoices:
+                    registered_invoices.add(ph)
+                    recovered += 1
+        registry_recovered = True
+    if recovered:
+        log(f"Recovered {recovered} unpaid factory invoices from CLN DB")
+    return True
+
+
 def connect_bridge():
     """Connect to the SuperScalar bridge daemon and authenticate.
 
@@ -255,19 +310,19 @@ def bridge_reader():
         while not connect_bridge():
             log("Bridge reconnect failed, retrying in 5s...")
             time.sleep(5)
-        # Clean up orphaned HTLCs from the old connection — send "continue"
-        # so CLN retries or resolves them via its own invoice DB
+        # HTLCs handed to the bridge over the old connection stay held.  The
+        # LSP may already have offered them to its client, so neither
+        # answer is safe from here: "continue" would let CLN settle the
+        # invoice whether or not the client is paid, and "fail" would refund
+        # the sender of an HTLC the client may still claim.  The LSP's
+        # verdict arrives as htlc_resolve, keyed by payment hash, over
+        # whichever connection is up.
         with lock:
-            orphans = dict(pending_htlcs)
-            pending_htlcs.clear()
-        for ph, rid in orphans.items():
-            log(f"Orphaned HTLC {ph[:16]}... — returning continue")
-            send_to_cln({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {"result": "continue"}
-            })
-        log("Bridge reconnected")
+            held = len(pending_htlcs)
+        if held:
+            log(f"Bridge reconnected; {held} HTLC(s) still awaiting the LSP")
+        else:
+            log("Bridge reconnected")
 
 
 def handle_bridge_msg(msg):
@@ -282,13 +337,17 @@ def handle_bridge_msg(msg):
         result = msg.get("result")
         log(f"htlc_resolve: hash={payment_hash[:16]}... result={result}")
         with lock:
-            rpc_id = pending_htlcs.pop(payment_hash, None)
-            # Clean up resolved invoice from registry
-            registered_invoices.discard(payment_hash)
+            held = pending_htlcs.pop(payment_hash, None)
+            # The invoice stays registered until it is paid: after a failed
+            # attempt the next HTLC for it must come back here, not fall
+            # through to CLN.
+            if held is not None and result == "fulfill":
+                registered_invoices.discard(payment_hash)
 
-        if rpc_id is None:
+        if held is None:
             log(f"No pending HTLC for hash {payment_hash[:16]}...")
             return
+        rpc_id = held["rpc_id"]
 
         if result == "fulfill":
             preimage = msg.get("preimage", "")
@@ -302,24 +361,14 @@ def handle_bridge_msg(msg):
             })
         else:
             reason = msg.get("reason", "unknown")
-            # If bridge rejects with unknown_payment_hash, let CLN handle it
-            if reason == "unknown_payment_hash":
-                send_to_cln({
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "result": {"result": "continue"}
-                })
+            # The LSP does not know this hash.  If it is not one of our
+            # invoices either (a forward, or keysend) the HTLC is CLN's
+            # business.  If CLN holds the invoice, "continue" would have CLN
+            # settle it with nobody paying the factory client: fail it.
+            if reason == "unknown_payment_hash" and not held["factory_invoice"]:
+                hook_continue(rpc_id)
             else:
-                # CLN v25+ requires failure_message for hook fail.
-                # 2002 = TEMPORARY_NODE_FAILURE (BOLT #4 wire format).
-                send_to_cln({
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "result": {
-                        "result": "fail",
-                        "failure_message": "2002"
-                    }
-                })
+                hook_fail(rpc_id)
 
     elif method == "invoice_registered":
         # Bridge forwarded a registered invoice — create CLN invoice with
@@ -657,10 +706,16 @@ def handle_htlc_accepted(rpc_id, params):
     amount_msat = int(str(raw_amt).replace("msat", ""))
     cltv_expiry = htlc.get("cltv_expiry", 0)
 
+    # The invoice list could not be read yet, so the registry below may be
+    # missing factory invoices.  Try again now.
+    if not registry_recovered:
+        recover_registered_invoices()
+
     # Check if this HTLC is for a registered factory invoice
     with lock:
         is_ours = payment_hash in registered_invoices
         n_registered = len(registered_invoices)
+        registry_known = registry_recovered
 
     # Check for keysend TLV if not a registered invoice
     keysend_preimage = None
@@ -686,33 +741,42 @@ def handle_htlc_accepted(rpc_id, params):
         f"forward={is_forward} (registry={n_registered})")
 
     if not is_ours and not keysend_preimage and not is_forward:
-        # Not a factory payment, not keysend, not a forward — let CLN handle
-        send_to_cln({
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "result": {"result": "continue"}
-        })
+        if not registry_known:
+            # A payment to this node for a hash we cannot classify: CLN's
+            # invoice list is unreadable, so this may be a factory invoice
+            # that CLN would settle itself.  Fail it; the sender can retry.
+            log(f"Cannot tell whether {payment_hash[:16]}... is a factory "
+                f"invoice — failing")
+            hook_fail(rpc_id)
+            return
+        # Not a factory payment, not keysend, not a forward — an invoice of
+        # this node's own.  Let CLN handle it; no factory client is involved.
+        hook_continue(rpc_id)
         return
 
-    # For forwarding HTLCs, use the forward_msat and outgoing_cltv from onion
-    if is_forward and not is_ours and not keysend_preimage:
-        fwd_msat = onion.get("forward_msat", onion.get("forward_amount", amount_msat))
-        if isinstance(fwd_msat, str):
-            fwd_msat = int(fwd_msat.replace("msat", ""))
-        amount_msat = int(fwd_msat)
+    # amount_msat is what this HTLC actually delivers to the node.  That is
+    # the amount the LSP is told, also for a forward: the onion's forward
+    # amount is whatever the sender wrote and was never received.
 
     # Register pending HTLC keyed by payment_hash (no counter desync risk)
     with lock:
-        if payment_hash in pending_htlcs:
-            # Duplicate HTLC for same hash (MPP or retry) — let CLN handle
+        duplicate = payment_hash in pending_htlcs
+        if not duplicate:
+            pending_htlcs[payment_hash] = {"rpc_id": rpc_id,
+                                           "factory_invoice": is_ours}
+    if duplicate:
+        # A second HTLC for a hash that is already with the LSP: a further
+        # part of a split payment, or a repeat.  The LSP takes an invoice
+        # in one HTLC.  For a factory invoice CLN must not get to settle
+        # this one from its own copy of the preimage, so fail it; anything
+        # else is CLN's to handle.
+        if is_ours:
+            log(f"Duplicate HTLC for factory invoice {payment_hash[:16]}..., failing")
+            hook_fail(rpc_id, FAIL_MPP_TIMEOUT)
+        else:
             log(f"Duplicate HTLC for {payment_hash[:16]}..., passing to CLN")
-            send_to_cln({
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {"result": "continue"}
-            })
-            return
-        pending_htlcs[payment_hash] = rpc_id
+            hook_continue(rpc_id)
+        return
 
     # Build bridge message
     bridge_msg = {
@@ -732,14 +796,16 @@ def handle_htlc_accepted(rpc_id, params):
 
     if not ok:
         log(f"Bridge send failed for HTLC {payment_hash[:16]}...")
-        # Bridge not connected — let CLN handle it (maybe CLN has the invoice)
         with lock:
             pending_htlcs.pop(payment_hash, None)
-        send_to_cln({
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "result": {"result": "continue"}
-        })
+        if is_ours:
+            # The LSP cannot be reached, so the factory client cannot be
+            # paid; CLN must not settle the invoice in its place.  A
+            # temporary failure lets the sender retry later.
+            hook_fail(rpc_id)
+        else:
+            # Not an invoice of ours — let CLN handle it
+            hook_continue(rpc_id)
 
 
 def read_requests():
@@ -858,24 +924,8 @@ def main():
             # Re-populate registered_invoices from CLN's invoice DB.
             # On plugin restart (CLN restart), the in-memory set is empty
             # but CLN still has the invoices with "superscalar-" labels.
-            try:
-                cmd = cli_cmd("listinvoices")
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                if result.returncode == 0:
-                    invs = json.loads(result.stdout).get("invoices", [])
-                    recovered = 0
-                    for inv in invs:
-                        if inv.get("status") == "unpaid" and \
-                           inv.get("label", "").startswith("superscalar-"):
-                            ph = inv.get("payment_hash", "")
-                            if ph:
-                                with lock:
-                                    registered_invoices.add(ph)
-                                recovered += 1
-                    if recovered:
-                        log(f"Recovered {recovered} unpaid factory invoices from CLN DB")
-            except Exception as e:
-                log(f"Invoice recovery failed: {e}")
+            # If this fails it is retried when the next HTLC arrives.
+            recover_registered_invoices()
 
             log(f"Plugin initialized (bridge={'connected' if connected else 'disconnected'}, "
                 f"cli={LIGHTNING_CLI}, dir={LIGHTNING_DIR})")

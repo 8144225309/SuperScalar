@@ -70,9 +70,15 @@ class PluginTestCase(unittest.TestCase):
             p = mock.patch.object(cln_plugin, target, repl)
             p.start()
             self.addCleanup(p.stop)
+        # The clock is always faked, so a pay that keeps polling fails the
+        # test instead of sleeping.
+        self.sleeps = self.install_clock()
         cln_plugin.pending_htlcs.clear()
         cln_plugin.pending_pays.clear()
         cln_plugin.registered_invoices.clear()
+        p = mock.patch.object(cln_plugin, "registry_recovered", True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def use_cln(self, **replies):
         fake = FakeCln(**replies)
@@ -81,7 +87,7 @@ class PluginTestCase(unittest.TestCase):
         self.addCleanup(p.stop)
         return fake
 
-    def use_clock(self):
+    def install_clock(self):
         """Replace the plugin's clock: sleeping advances it instantly.
         Returns the list of sleeps taken."""
         clock = {"now": 1000.0}
@@ -289,7 +295,7 @@ class OutboundPayResolutionTest(PluginTestCase):
         cln_plugin._do_pay(BOLT11, request_id, PAYMENT_HASH, 4_000_000, 144)
 
     def test_timeout_then_late_success_is_reported_as_success(self):
-        sleeps = self.use_clock()
+        sleeps = self.sleeps
         cln = self.use_cln(
             decode=decoded_invoice(4_000_000), pay=PAY_TIMEOUT,
             listpays=[listed("pending"), listed("pending"), listed("complete")])
@@ -303,7 +309,6 @@ class OutboundPayResolutionTest(PluginTestCase):
             "preimage": PREIMAGE}])
 
     def test_nothing_is_reported_while_the_payment_is_pending(self):
-        self.use_clock()
         reported_during_poll = []
 
         def scripted(method, params=None, timeout=60):
@@ -323,7 +328,6 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assert_pay_failed(21)
 
     def test_pending_status_from_pay_is_followed_not_failed(self):
-        self.use_clock()
         self.use_cln(
             decode=decoded_invoice(4_000_000), pay={"status": "pending"},
             listpays=[listed("pending"), listed("complete")])
@@ -333,7 +337,6 @@ class OutboundPayResolutionTest(PluginTestCase):
             "preimage": PREIMAGE}])
 
     def test_pay_error_with_parts_in_flight_is_followed(self):
-        self.use_clock()
         # 210: pay gave up retrying while an earlier attempt is still out.
         cln = self.use_cln(
             decode=decoded_invoice(4_000_000),
@@ -346,7 +349,7 @@ class OutboundPayResolutionTest(PluginTestCase):
             "preimage": PREIMAGE}])
 
     def test_pay_error_with_every_attempt_failed_is_a_failure(self):
-        sleeps = self.use_clock()
+        sleeps = self.sleeps
         self.use_cln(
             decode=decoded_invoice(4_000_000),
             pay=cln_plugin.ClnRpcError("Ran out of routes", code=205),
@@ -356,7 +359,7 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assert_pay_failed(24)
 
     def test_pay_error_before_any_attempt_is_a_failure(self):
-        sleeps = self.use_clock()
+        sleeps = self.sleeps
         self.use_cln(
             decode=decoded_invoice(4_000_000),
             pay=cln_plugin.ClnRpcError("Could not find a route", code=205),
@@ -366,7 +369,7 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assert_pay_failed(25)
 
     def test_timeout_does_not_trust_failed_while_pay_may_still_retry(self):
-        sleeps = self.use_clock()
+        sleeps = self.sleeps
         # `pay` did not return, so it may be between two attempts: "failed"
         # is only final once its retry window has passed.
         self.use_cln(decode=decoded_invoice(4_000_000), pay=PAY_TIMEOUT,
@@ -378,7 +381,6 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assert_pay_failed(26)
 
     def test_lost_cli_connection_is_not_a_failure(self):
-        self.use_clock()
         # lightning-cli died without a JSON-RPC error: no verdict on the pay.
         self.use_cln(
             decode=decoded_invoice(4_000_000),
@@ -388,7 +390,7 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assertEqual(self.pay_results()[0]["success"], True)
 
     def test_unreachable_cln_keeps_the_payment_held(self):
-        sleeps = self.use_clock()
+        sleeps = self.sleeps
         self.use_cln(
             decode=decoded_invoice(4_000_000), pay=PAY_TIMEOUT,
             listpays=[cln_plugin.ClnRpcError("Connection refused")] * 30
@@ -400,7 +402,7 @@ class OutboundPayResolutionTest(PluginTestCase):
             "preimage": PREIMAGE}])
 
     def test_complete_without_the_right_preimage_is_never_a_success(self):
-        sleeps = self.use_clock()
+        sleeps = self.sleeps
         self.use_cln(
             decode=decoded_invoice(4_000_000),
             pay={"status": "complete", "payment_preimage": "22" * 32},
@@ -412,6 +414,218 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assertEqual(self.pay_results(), [{
             "method": "pay_result", "request_id": 29, "success": True,
             "preimage": PREIMAGE}])
+
+
+def htlc(payment_hash=PAYMENT_HASH, amount_msat=5_000_000, cltv_expiry=500,
+         **onion):
+    """htlc_accepted hook parameters.  Extra keywords go into the onion; a
+    short_channel_id there makes it a forward."""
+    return {"htlc": {"payment_hash": payment_hash, "amount_msat": amount_msat,
+                     "cltv_expiry": cltv_expiry},
+            "onion": dict(onion)}
+
+
+CONTINUE = {"result": "continue"}
+
+
+def fail(code="2002"):
+    return {"result": "fail", "failure_message": code}
+
+
+class InboundHtlcTest(PluginTestCase):
+    """HTLCs for factory invoices are resolved on the LSP's word or failed;
+    they are never left for CLN to settle from its own copy of the invoice."""
+
+    def hook_answers(self):
+        """(rpc_id, result) for every hook answer sent to CLN."""
+        return [(m["id"], m["result"]) for m in self.to_cln if "id" in m]
+
+    def to_lsp(self):
+        return [m for m in self.to_bridge if m.get("method") == "htlc_accepted"]
+
+    def register(self, payment_hash=PAYMENT_HASH):
+        cln_plugin.registered_invoices.add(payment_hash)
+
+    def lsp_fails(self, reason, payment_hash=PAYMENT_HASH):
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": payment_hash,
+            "htlc_id": 1, "result": "fail", "reason": reason})
+
+    # --- amount ---
+
+    def test_factory_invoice_htlc_goes_to_the_lsp_with_its_amount(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(1, htlc(amount_msat=5_000_000))
+        self.assertEqual(self.to_lsp(), [{
+            "method": "htlc_accepted", "payment_hash": PAYMENT_HASH,
+            "amount_msat": 5_000_000, "cltv_expiry": 500}])
+        self.assertEqual(self.hook_answers(), [])   # held until the LSP answers
+
+    def test_amount_is_what_the_htlc_delivers_not_the_onion_forward_amount(self):
+        # A sender routes 1 sat through this node while its onion claims a
+        # 5,000 sat forward.  Only the 1 sat arrived.
+        for claimed in (5_000_000, "5000000msat"):
+            self.to_bridge.clear()
+            cln_plugin.pending_htlcs.clear()
+            cln_plugin.handle_htlc_accepted(2, htlc(
+                amount_msat=1000, short_channel_id="1x1x1",
+                forward_msat=claimed, outgoing_cltv_value=400))
+            self.assertEqual([m["amount_msat"] for m in self.to_lsp()], [1000])
+
+    def test_forward_of_a_registered_hash_reports_the_received_amount(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(3, htlc(
+            amount_msat="1000msat", short_channel_id="1x1x1",
+            forward_msat=5_000_000))
+        self.assertEqual([m["amount_msat"] for m in self.to_lsp()], [1000])
+
+    # --- the LSP's answer ---
+
+    def test_fulfil_resolves_the_htlc_and_retires_the_invoice(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(4, htlc())
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertEqual(self.hook_answers(), [
+            (4, {"result": "resolve", "payment_key": PREIMAGE})])
+        self.assertNotIn(PAYMENT_HASH, cln_plugin.registered_invoices)
+        self.assertEqual(cln_plugin.pending_htlcs, {})
+
+    def test_lsp_refusal_fails_the_htlc(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(5, htlc(amount_msat=1000))
+        self.lsp_fails("amount_below_invoice")
+        self.assertEqual(self.hook_answers(), [(5, fail())])
+
+    def test_refused_invoice_stays_registered_for_the_next_attempt(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(6, htlc(amount_msat=1000))
+        self.lsp_fails("amount_below_invoice")
+        self.assertIn(PAYMENT_HASH, cln_plugin.registered_invoices)
+        # The retry is offered to the LSP again rather than left to CLN.
+        cln_plugin.handle_htlc_accepted(7, htlc(amount_msat=5_000_000))
+        self.assertEqual([m["amount_msat"] for m in self.to_lsp()],
+                         [1000, 5_000_000])
+        self.assertEqual(self.hook_answers(), [(6, fail())])
+
+    def test_factory_invoice_unknown_to_the_lsp_is_failed_not_continued(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(8, htlc())
+        self.lsp_fails("unknown_payment_hash")
+        self.assertEqual(self.hook_answers(), [(8, fail())])
+        self.assertIn(PAYMENT_HASH, cln_plugin.registered_invoices)
+
+    def test_forward_unknown_to_the_lsp_is_left_to_cln(self):
+        cln_plugin.handle_htlc_accepted(9, htlc(short_channel_id="1x1x1"))
+        self.lsp_fails("unknown_payment_hash")
+        self.assertEqual(self.hook_answers(), [(9, CONTINUE)])
+
+    def test_forward_refused_by_the_lsp_for_another_reason_is_failed(self):
+        cln_plugin.handle_htlc_accepted(10, htlc(short_channel_id="1x1x1"))
+        self.lsp_fails("insufficient_funds")
+        self.assertEqual(self.hook_answers(), [(10, fail())])
+
+    # --- HTLCs that never reach the LSP ---
+
+    def test_own_invoice_of_the_node_is_left_to_cln(self):
+        cln_plugin.handle_htlc_accepted(11, htlc(payment_hash=OTHER_HASH))
+        self.assertEqual(self.hook_answers(), [(11, CONTINUE)])
+        self.assertEqual(self.to_lsp(), [])
+
+    def test_second_htlc_for_a_factory_invoice_in_flight_is_failed(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(12, htlc(amount_msat=2_500_000))
+        cln_plugin.handle_htlc_accepted(13, htlc(amount_msat=2_500_000))
+        self.assertEqual(self.hook_answers(), [(13, fail("0017"))])
+        self.assertEqual(len(self.to_lsp()), 1)
+        # The first one is still the LSP's to resolve.
+        self.assertEqual(cln_plugin.pending_htlcs[PAYMENT_HASH]["rpc_id"], 12)
+
+    def test_second_htlc_for_a_forward_in_flight_is_left_to_cln(self):
+        cln_plugin.handle_htlc_accepted(14, htlc(short_channel_id="1x1x1"))
+        cln_plugin.handle_htlc_accepted(15, htlc(short_channel_id="1x1x1"))
+        self.assertEqual(self.hook_answers(), [(15, CONTINUE)])
+
+    def test_factory_invoice_is_failed_when_the_bridge_is_down(self):
+        self.register()
+        with mock.patch.object(cln_plugin, "send_to_bridge", lambda m: False):
+            cln_plugin.handle_htlc_accepted(16, htlc())
+        self.assertEqual(self.hook_answers(), [(16, fail())])
+        self.assertEqual(cln_plugin.pending_htlcs, {})
+        self.assertIn(PAYMENT_HASH, cln_plugin.registered_invoices)
+
+    def test_forward_is_left_to_cln_when_the_bridge_is_down(self):
+        with mock.patch.object(cln_plugin, "send_to_bridge", lambda m: False):
+            cln_plugin.handle_htlc_accepted(17, htlc(short_channel_id="1x1x1"))
+        self.assertEqual(self.hook_answers(), [(17, CONTINUE)])
+
+    # --- the registry after a restart ---
+
+    def test_registry_is_rebuilt_from_unpaid_factory_invoices(self):
+        cln_plugin.registry_recovered = False
+        self.use_cln(listinvoices={"invoices": [
+            {"label": "superscalar-aa-1", "status": "unpaid",
+             "payment_hash": PAYMENT_HASH},
+            {"label": "superscalar-bb-2", "status": "paid",
+             "payment_hash": "bb" * 32},
+            {"label": "coffee", "status": "unpaid",
+             "payment_hash": OTHER_HASH}]})
+        self.assertTrue(cln_plugin.recover_registered_invoices())
+        self.assertEqual(cln_plugin.registered_invoices, {PAYMENT_HASH})
+        self.assertTrue(cln_plugin.registry_recovered)
+
+    def test_unclassifiable_htlc_is_failed_while_the_registry_is_unknown(self):
+        cln_plugin.registry_recovered = False
+        cln = self.use_cln(listinvoices=[
+            cln_plugin.ClnRpcError("Connection refused"),
+            {"invoices": [{"label": "superscalar-aa-1", "status": "unpaid",
+                           "payment_hash": PAYMENT_HASH}]}])
+        # CLN's invoice list cannot be read: this may be a factory invoice.
+        cln_plugin.handle_htlc_accepted(18, htlc())
+        self.assertEqual(self.hook_answers(), [(18, fail())])
+        self.assertEqual(self.to_lsp(), [])
+        # Once it can be read, the retry is recognised and sent to the LSP.
+        cln_plugin.handle_htlc_accepted(19, htlc())
+        self.assertEqual(len(self.to_lsp()), 1)
+        self.assertEqual(len(cln.calls_to("listinvoices")), 2)
+        # ...and the list is not fetched again after that.
+        cln_plugin.handle_htlc_accepted(20, htlc(payment_hash=OTHER_HASH))
+        self.assertEqual(len(cln.calls_to("listinvoices")), 2)
+        self.assertEqual(self.hook_answers()[-1], (20, CONTINUE))
+
+    # --- bridge reconnect ---
+
+    def test_held_htlcs_stay_held_across_a_bridge_reconnect(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(21, htlc())
+
+        class Stop(Exception):
+            pass
+
+        connects = []
+
+        def fake_connect():
+            connects.append(1)
+            if len(connects) > 1:
+                raise Stop()
+            return True
+
+        with mock.patch.object(cln_plugin, "bridge_sock", None), \
+                mock.patch.object(cln_plugin, "connect_bridge", fake_connect), \
+                mock.patch.object(cln_plugin.time, "sleep", lambda s: None):
+            with self.assertRaises(Stop):
+                cln_plugin.bridge_reader()   # disconnect, reconnect, disconnect
+
+        # Nothing was answered to CLN and the HTLC is still the LSP's.
+        self.assertEqual(self.hook_answers(), [])
+        self.assertEqual(cln_plugin.pending_htlcs[PAYMENT_HASH]["rpc_id"], 21)
+        # Its verdict still resolves the HTLC afterwards.
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertEqual(self.hook_answers(), [
+            (21, {"result": "resolve", "payment_key": PREIMAGE})])
 
 
 class BridgeAuthTest(PluginTestCase):

@@ -516,6 +516,17 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr);
 /* Set bridge fd in channel manager. */
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
 
+/* Amount of the registered invoice for payment_hash32, in msat (0 = the
+   invoice names no amount).  Returns 1 if the invoice is registered. */
+int lsp_channels_invoice_amount(lsp_channel_mgr_t *mgr,
+                                 const unsigned char *payment_hash32,
+                                 uint64_t *amount_msat_out);
+
+/* 1 if an HTLC that came in through the bridge for payment_hash32 is still
+   unresolved. */
+int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32);
+
 /* Chain the LSP runs on, for invoice checks: mgr->network if set, else the
    watchtower's chain connection, else NULL. */
 const char *lsp_channels_network(const lsp_channel_mgr_t *mgr);
