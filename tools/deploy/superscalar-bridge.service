@@ -7,10 +7,28 @@ Requires=superscalar-lsp.service
 Type=simple
 User=superscalar
 Group=superscalar
+# The LSP's static public key (it prints it at startup).  Required.
+Environment=LSP_PUBKEY=
+# Where the bridge keeps the secret it shares with the CLN plugin.  The
+# bridge creates the file (mode 0600, owned by User= above) on first start.
+# lightningd usually runs as another user: give that user its own copy, e.g.
+#   install -o cln -g cln -m 0600 /var/lib/superscalar/bridge-plugin.secret \
+#       /var/lib/cln/bridge-plugin.secret
+# and set superscalar-bridge-secret-file=/var/lib/cln/bridge-plugin.secret in
+# the CLN config.  Repeat the copy if the secret file is ever recreated.
+Environment=PLUGIN_SECRET_FILE=/var/lib/superscalar/bridge-plugin.secret
+# Address the plugin port binds to.  Leave on loopback unless lightningd
+# runs on another host; the link is authenticated but not encrypted.
+Environment=PLUGIN_BIND=127.0.0.1
+StateDirectory=superscalar
+StateDirectoryMode=0750
 ExecStart=/usr/local/share/superscalar/tools/deploy/start_bridge.sh \
     --lsp-host 127.0.0.1 --lsp-port 9735 --plugin-port 19736
 Restart=on-failure
 RestartSec=5
+# 78 = the bridge cannot run as configured (missing LSP key, unusable secret
+# file or bind address): restarting would only loop.
+RestartPreventExitStatus=78
 StandardOutput=append:/var/log/superscalar/bridge.log
 StandardError=append:/var/log/superscalar/bridge.log
 

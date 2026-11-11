@@ -7,7 +7,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <errno.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
+
+/* Exit status for a configuration the bridge cannot run with.  Restarting
+   does not help, so supervisors stop on it (sysexits.h EX_CONFIG). */
+#define EXIT_BAD_CONFIG 78
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
@@ -28,6 +34,8 @@ static void usage(const char *prog) {
             "                        testing only -- production MUST use --lsp-pubkey)\n"
             "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
             "  --version             Show version and exit\n"
+            "Exits with status 78 when it cannot run as configured (no LSP key,\n"
+            "unusable secret file or bind address); do not restart it on that.\n"
             "  --help                Show this help\n", prog);
 }
 
@@ -128,7 +136,16 @@ int main(int argc, char *argv[]) {
             "transport is MITM-exposed.  Pass --lsp-pubkey HEX (the LSP prints it at\n"
             "startup) for authenticated NK transport, or --insecure-no-auth to override\n"
             "for testing only.\n");
-        return 1;
+        return EXIT_BAD_CONFIG;
+    }
+
+    if (plugin_bind && plugin_bind[0]) {
+        struct in_addr parsed;
+        if (inet_pton(AF_INET, plugin_bind, &parsed) != 1) {
+            fprintf(stderr, "Error: --plugin-bind '%s' is not an IPv4 address\n",
+                    plugin_bind);
+            return EXIT_BAD_CONFIG;
+        }
     }
 
     /* Shared secret the CLN plugin must present on the plugin port. */
@@ -137,19 +154,27 @@ int main(int argc, char *argv[]) {
         const char *home = getenv("HOME");
         if (!home || !home[0]) {
             fprintf(stderr, "Error: HOME is not set; pass --plugin-secret-file\n");
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         snprintf(secret_path_buf, sizeof(secret_path_buf), "%s/.superscalar", home);
-        mkdir(secret_path_buf, 0700);   /* fine if it already exists */
+        if (mkdir(secret_path_buf, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "Error: cannot create %s for the plugin secret: %s\n"
+                    "Create the directory, or name a writable file with "
+                    "--plugin-secret-file.\n",
+                    secret_path_buf, strerror(errno));
+            return EXIT_BAD_CONFIG;
+        }
         snprintf(secret_path_buf, sizeof(secret_path_buf),
                  "%s/.superscalar/bridge-plugin.secret", home);
         plugin_secret_file = secret_path_buf;
     }
     char plugin_secret[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
     if (!bridge_plugin_secret_load(plugin_secret_file, plugin_secret)) {
-        fprintf(stderr, "Error: no usable plugin secret at %s\n",
+        fprintf(stderr, "Error: no usable plugin secret at %s\n"
+                "The file must be creatable there, or already exist as a regular "
+                "file owned by this user with mode 0600.\n",
                 plugin_secret_file);
-        return 1;
+        return EXIT_BAD_CONFIG;
     }
     printf("Bridge: plugin secret file: %s\n", plugin_secret_file);
     bridge_set_plugin_secret(&br, plugin_secret);

@@ -45,6 +45,18 @@ plugin=/path/to/SuperScalar/tools/cln_plugin.py
 superscalar-bridge-host=127.0.0.1
 superscalar-bridge-port=9737
 
+# The secret shared with superscalar_bridge.  The plugin and the bridge
+# prove to each other that they hold it; it is never sent.  The file must be
+# a regular file owned by the user lightningd runs as, mode 0600.  If the
+# bridge runs as another user, copy its file (--plugin-secret-file) here:
+#   install -o cln -g cln -m 0600 /var/lib/superscalar/bridge-plugin.secret \
+#       /var/lib/cln/bridge-plugin.secret
+superscalar-bridge-secret-file=/var/lib/cln/bridge-plugin.secret
+
+# Where the plugin records outside payments until the LSP has acknowledged
+# their result (so a restart loses none).  Must be writable by lightningd.
+superscalar-bridge-state-file=/var/lib/cln/bridge-plugin.state.json
+
 # Path to lightning-cli for the plugin to call back into CLN.
 # Include --lightning-dir if your CLN data isn't in the default location.
 superscalar-lightning-cli=lightning-cli --lightning-dir=/var/lib/cln

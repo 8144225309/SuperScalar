@@ -446,6 +446,35 @@ lightningd --network=regtest \
   --superscalar-lightning-cli=lightning-cli
 ```
 
+### Running the plugin as a different user
+
+`lightningd` normally runs under its own account, and both sides insist that
+the secret file belongs to the user reading it. Give each side its own copy:
+
+```bash
+# The bridge (user superscalar) creates its file on first start:
+#   --plugin-secret-file /var/lib/superscalar/bridge-plugin.secret
+# Copy it for lightningd (user cln), owner-only:
+sudo install -o cln -g cln -m 0600 \
+    /var/lib/superscalar/bridge-plugin.secret /var/lib/cln/bridge-plugin.secret
+```
+
+and point the plugin at its copy with
+`superscalar-bridge-secret-file=/var/lib/cln/bridge-plugin.secret`. Repeat the
+copy whenever the bridge's file is recreated. The plugin also needs a writable
+`superscalar-bridge-state-file` (default
+`~/.superscalar/bridge-plugin.state.json`), where it records outside payments
+until the LSP has acknowledged their result. `tools/deploy/start_bridge.sh`
+accepts `--plugin-bind` and `--plugin-secret-file` (or `PLUGIN_BIND` and
+`PLUGIN_SECRET_FILE`), `tools/deploy/superscalar-bridge.service` sets them, and
+`tools/deploy/cln-bridge.conf.example` shows the plugin side.
+
+The bridge exits with status 78 when it cannot run as configured: no
+`--lsp-pubkey`, a `--plugin-bind` that is not an IPv4 address, a secret
+directory it cannot create, or a secret file it cannot create or will not
+accept. The message says which. `start_bridge.sh` and the systemd unit do not
+restart it on that status.
+
 ### Bridge Daemon Flags
 
 | Flag | Default | Description |
@@ -464,7 +493,8 @@ lightningd --network=regtest \
 |--------|---------|-------------|
 | `--superscalar-bridge-host` | `127.0.0.1` | Bridge daemon hostname |
 | `--superscalar-bridge-port` | `9736` | Bridge daemon port |
-| `--superscalar-bridge-secret-file` | `~/.superscalar/bridge-plugin.secret` | File with the bridge's shared secret (written by the bridge) |
+| `--superscalar-bridge-secret-file` | `~/.superscalar/bridge-plugin.secret` | File with the bridge's shared secret (written by the bridge); regular file, owned by the plugin's user, mode `0600` |
+| `--superscalar-bridge-state-file` | `~/.superscalar/bridge-plugin.state.json` | Where the plugin records outside payments until their result is acknowledged |
 | `--superscalar-lightning-cli` | `lightning-cli` | Path to `lightning-cli` binary (used for invoice creation) |
 
 ### Invoice Flow
