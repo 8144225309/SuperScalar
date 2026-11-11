@@ -1398,6 +1398,105 @@ class InboundHtlcTest(PluginTestCase):
             (21, {"result": "resolve", "payment_key": PREIMAGE})])
 
 
+def bigsize(n):
+    if n < 0xfd:
+        return bytes([n])
+    if n <= 0xffff:
+        return b"\xfd" + n.to_bytes(2, "big")
+    if n <= 0xffffffff:
+        return b"\xfe" + n.to_bytes(4, "big")
+    return b"\xff" + n.to_bytes(8, "big")
+
+
+def tlv(tlv_type, value):
+    return bigsize(tlv_type) + bigsize(len(value)) + value
+
+
+def keysend_stream(preimage_hex=PREIMAGE, amount_msat=1_000_000, cltv=130):
+    """TLV stream of a final-hop keysend onion: amt_to_forward,
+    outgoing_cltv_value and the preimage record."""
+    tu = lambda n: n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return (tlv(2, tu(amount_msat)) + tlv(4, tu(cltv))
+            + tlv(5482373484, bytes.fromhex(preimage_hex)))
+
+
+def with_length(stream):
+    return bigsize(len(stream)) + stream
+
+
+# The onion payload CLN v26.06.9 passed to the hook for an ordinary invoice
+# payment: length, amt_to_forward, outgoing_cltv_value, payment_data.
+INVOICE_PAYLOAD = ("2d02031e84800401e30823bfc578695d20ec6588d316937fd7d932f02c"
+                   "3d3e797f3c4dea80b77d14ead56c1e8480")
+
+
+class KeysendTest(PluginTestCase):
+    """A keysend is recognised whichever way the onion payload is framed,
+    and is refused: it is never left for CLN to settle."""
+
+    def hook_answers(self):
+        return [(m["id"], m["result"]) for m in self.to_cln if "id" in m]
+
+    def to_lsp(self):
+        return [m for m in self.to_bridge if m.get("method") == "htlc_accepted"]
+
+    def preimage_in(self, payload):
+        return cln_plugin._extract_keysend_preimage(
+            {"onion": {"payload": payload}})
+
+    def test_payload_with_length_prefix(self):
+        self.assertEqual(
+            self.preimage_in(with_length(keysend_stream()).hex()), PREIMAGE)
+
+    def test_bare_tlv_stream(self):
+        self.assertEqual(self.preimage_in(keysend_stream().hex()), PREIMAGE)
+
+    def test_long_payload_with_three_byte_length(self):
+        stream = keysend_stream() + tlv(65537, b"\x00" * 300)
+        self.assertEqual(with_length(stream)[0], 0xfd)
+        self.assertEqual(self.preimage_in(with_length(stream).hex()), PREIMAGE)
+
+    def test_invoice_payment_payload_is_not_a_keysend(self):
+        self.assertIsNone(self.preimage_in(INVOICE_PAYLOAD))
+        readings = cln_plugin._onion_payload_readings(INVOICE_PAYLOAD)
+        self.assertEqual([[t for t, _ in r] for r in readings], [[2, 4, 8]])
+
+    def test_malformed_payloads(self):
+        whole = with_length(keysend_stream()).hex()
+        for payload in ("", "zz", whole[:-2], "ff", "0502",
+                        with_length(tlv(5482373484, b"\x11" * 31)).hex()):
+            self.assertIsNone(self.preimage_in(payload), payload)
+
+    def test_parsed_tlvs_are_still_read(self):
+        self.assertEqual(cln_plugin._extract_keysend_preimage(
+            {"onion": {"tlvs": {"5482373484": PREIMAGE}}}), PREIMAGE)
+
+    def test_keysend_is_refused_for_good(self):
+        for n, stream in enumerate((with_length(keysend_stream()),
+                                    keysend_stream())):
+            self.to_cln.clear()
+            cln_plugin.handle_htlc_accepted(40 + n, htlc(
+                amount_msat=1_000_000, payload=stream.hex()))
+            self.assertEqual(self.hook_answers(), [(40 + n, {
+                "result": "fail",
+                "failure_message": "400f" + "00000000000f4240" + "00000000"})])
+            self.assertEqual(self.to_lsp(), [])
+            self.assertEqual(cln_plugin.pending_htlcs, {})
+
+    def test_keysend_for_the_hash_of_an_open_outside_payment_is_refused(self):
+        cln_plugin.open_pays[7] = {"payment_hash": PAYMENT_HASH}
+        cln_plugin.handle_htlc_accepted(42, htlc(
+            payload=with_length(keysend_stream()).hex()))
+        (rpc_id, answer), = self.hook_answers()
+        self.assertEqual(answer["result"], "fail")
+        self.assertTrue(answer["failure_message"].startswith("400f"))
+
+    def test_invoice_payment_to_the_node_is_left_to_cln(self):
+        cln_plugin.handle_htlc_accepted(43, htlc(
+            payment_hash=OTHER_HASH, payload=INVOICE_PAYLOAD))
+        self.assertEqual(self.hook_answers(), [(43, {"result": "continue"})])
+
+
 class FakeBridge:
     """The bridge's end of a new connection, as a socket for the plugin.
     `secret` is what this peer holds (None: it holds none and bluffs)."""

@@ -422,6 +422,12 @@ FAIL_TEMPORARY_NODE = "2002"   # temporary_node_failure
 FAIL_MPP_TIMEOUT = "0017"      # mpp_timeout: give up on this payment set
 
 
+def fail_unknown_details(amount_msat):
+    """incorrect_or_unknown_payment_details (PERM|15) with the amount: the
+    sender should not try this payment again."""
+    return "400f" + int(amount_msat).to_bytes(8, "big").hex() + "00000000"
+
+
 def hook_continue(rpc_id):
     """Let CLN handle the HTLC itself.  Never for a factory invoice: CLN has
     its preimage and would settle it without the factory client being paid."""
@@ -1326,40 +1332,57 @@ def _follow_pay(request_id, payment_hash, started, pay_ended):
         time.sleep(PAY_POLL_INTERVAL)
 
 
-def _extract_keysend_preimage(params):
-    """Check if the HTLC contains a keysend TLV (type 5482373484).
-    Returns the preimage hex string if found and valid, None otherwise."""
-    onion = params.get("onion", {})
-    payload = onion.get("payload", "")
-    # CLN provides the payload as a hex-encoded TLV stream; but the
-    # individual TLVs are typically pre-parsed in onion.type and
-    # onion.short_channel_id etc.  The keysend preimage is in the
-    # per-hop payload's TLV.  CLN exposes it in onion.payload as raw
-    # hex, or sometimes in a "tlvs" field depending on version.
+def _tlv_records(stream):
+    """The records of a TLV stream as (type, value) pairs, or None if the
+    bytes are not one well-formed stream."""
+    records = []
+    offset = 0
+    try:
+        while offset < len(stream):
+            tlv_type, offset = _read_varint(stream, offset)
+            tlv_len, offset = _read_varint(stream, offset)
+            if offset + tlv_len > len(stream):
+                return None
+            records.append((tlv_type, stream[offset:offset + tlv_len]))
+            offset += tlv_len
+    except (ValueError, IndexError):
+        return None
+    return records
 
-    # Method 1: CLN v24+ may include parsed TLVs
+
+def _onion_payload_readings(payload_hex):
+    """The TLV records of the hook's onion payload, under each way the bytes
+    can be read: CLN hands over the payload as it is in the onion, a BigSize
+    length followed by the TLV stream; a bare TLV stream is accepted too."""
+    try:
+        raw = bytes.fromhex(payload_hex)
+    except (ValueError, TypeError):
+        return []
+    readings = []
+    try:
+        length, start = _read_varint(raw, 0)
+        if start + length == len(raw):
+            readings.append(_tlv_records(raw[start:]))
+    except ValueError:
+        pass
+    readings.append(_tlv_records(raw))
+    return [r for r in readings if r is not None]
+
+
+def _extract_keysend_preimage(params):
+    """The keysend preimage carried in the HTLC's onion (TLV type
+    5482373484, 32 bytes), as hex, or None if there is none."""
+    onion = params.get("onion", {})
+
+    # Some CLN versions hand over parsed TLVs
     tlvs = onion.get("tlvs", {})
-    if KEYSEND_TLV_TYPE in tlvs:
+    if isinstance(tlvs, dict) and KEYSEND_TLV_TYPE in tlvs:
         return tlvs[KEYSEND_TLV_TYPE]
 
-    # Method 2: Some CLN versions put keysend preimage in onion payload
-    # as raw hex TLV stream — parse manually
-    if payload and len(payload) > 64:
-        try:
-            raw = bytes.fromhex(payload)
-            offset = 0
-            while offset < len(raw):
-                # TLV: varint type, varint length, value
-                tlv_type, offset = _read_varint(raw, offset)
-                tlv_len, offset = _read_varint(raw, offset)
-                if offset + tlv_len > len(raw):
-                    break
-                if str(tlv_type) == KEYSEND_TLV_TYPE and tlv_len == 32:
-                    return raw[offset:offset + tlv_len].hex()
-                offset += tlv_len
-        except Exception:
-            pass
-
+    for records in _onion_payload_readings(onion.get("payload", "")):
+        for tlv_type, value in records:
+            if str(tlv_type) == KEYSEND_TLV_TYPE and len(value) == 32:
+                return value.hex()
     return None
 
 
@@ -1500,6 +1523,18 @@ def handle_htlc_accepted(rpc_id, params):
         f"cltv={cltv_expiry} ours={is_ours} keysend={keysend_preimage is not None} "
         f"forward={is_forward} (registry={n_registered})")
 
+    if keysend_preimage:
+        # A spontaneous payment carrying its own preimage.  There is no way
+        # yet to credit one to a factory client (the client would have to be
+        # given the preimage), and left alone CLN's keysend plugin would
+        # settle it for the node, with no factory client being paid and
+        # without the LSP's check that the hash is not in use by an outside
+        # payment.  So it is refused, for good.
+        log(f"Keysend {payment_hash[:16]}... refused: keysend to factory "
+            f"clients is not supported")
+        hook_fail(rpc_id, fail_unknown_details(amount_msat))
+        return
+
     if not is_ours and not keysend_preimage and not is_forward:
         if not registry_known:
             # A payment to this node for a hash we cannot classify: CLN's
@@ -1553,10 +1588,6 @@ def handle_htlc_accepted(rpc_id, params):
         "cltv_expiry": cltv_expiry,
         "upstream_id": upstream
     }
-    if keysend_preimage:
-        bridge_msg["keysend"] = True
-        bridge_msg["preimage"] = keysend_preimage
-        bridge_msg["dest_client"] = KEYSEND_DEFAULT_CLIENT
     with lock:
         if payment_hash in pending_htlcs:
             pending_htlcs[payment_hash]["msg"] = dict(bridge_msg)
@@ -1646,7 +1677,7 @@ def main():
                             "name": "superscalar-keysend-client",
                             "type": "int",
                             "default": 0,
-                            "description": "Default factory client index for keysend payments"
+                            "description": "Reserved: keysend to factory clients is not supported yet, keysends are refused"
                         },
                         {
                             "name": "superscalar-route-hint",
