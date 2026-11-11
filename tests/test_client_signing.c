@@ -109,6 +109,19 @@ static void cs_output(tx_output_t *o, uint64_t amount, const unsigned char *spk3
 
 /* ---- Cooperative close ---- */
 
+#define CS_CHAN_FUNDING 400000  /* sats in the leaf output funding a channel */
+#define CS_COMMIT_FEE 154       /* base commitment fee at 1000 sat/kvB */
+
+/* A channel whose state adds up: the client holds `local`, the LSP the rest
+   of the funding output. */
+static void cs_channel(channel_t *ch, uint64_t local) {
+    memset(ch, 0, sizeof(*ch));
+    ch->funding_amount = CS_CHAN_FUNDING;
+    ch->fee_rate_sat_per_kvb = 1000;
+    ch->local_amount = local;
+    ch->remote_amount = CS_CHAN_FUNDING - CS_COMMIT_FEE - local;
+}
+
 /* The acceptance rule itself: only outputs to the client's own script count
    toward its balance, and nothing is signed while an HTLC is in flight. */
 int test_client_close_outputs_acceptable(void) {
@@ -133,8 +146,7 @@ int test_client_close_outputs_acceptable(void) {
 
     const uint64_t balance = 100000;
     channel_t ch;
-    memset(&ch, 0, sizeof(ch));
-    ch.local_amount = balance;
+    cs_channel(&ch, balance);
 
     tx_output_t outs[3];
 
@@ -177,29 +189,116 @@ int test_client_close_outputs_acceptable(void) {
     TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[2], &ch, outs, 2),
                 "the same proposal does not satisfy a different client");
 
-    /* An HTLC in flight is not covered by any output. */
+    /* An HTLC in flight is not covered by any output.  The client offered
+       1000 sats: they left its balance and sit in the HTLC, so the state
+       still adds up and only the pending-HTLC rule can refuse. */
     htlc_t pending;
     memset(&pending, 0, sizeof(pending));
     pending.state = HTLC_STATE_ACTIVE;
     pending.amount_sats = 1000;
+    ch.local_amount -= pending.amount_sats;
     ch.htlcs = &pending;
     ch.n_htlcs = 1;
     TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
                 "close with a pending HTLC must be refused");
+    /* Once it has failed back, the balance is whole again. */
+    pending.state = HTLC_STATE_FAILED;
+    ch.local_amount += pending.amount_sats;
+    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "a resolved HTLC does not block the close");
     ch.htlcs = NULL;
     ch.n_htlcs = 0;
 
     /* A balance below the dust limit cannot have an output. */
-    ch.local_amount = CHANNEL_DUST_LIMIT_SATS - 1;
+    cs_channel(&ch, CHANNEL_DUST_LIMIT_SATS - 1);
     TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 1),
                 "sub-dust balance needs no output");
-    ch.local_amount = CHANNEL_DUST_LIMIT_SATS;
+    cs_channel(&ch, CHANNEL_DUST_LIMIT_SATS);
     TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 1),
                 "a balance at the dust limit needs its output");
 
     /* No channel, no balance. */
     TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], NULL, outs, 1),
                 "client without a channel has nothing to verify");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A close is only signed for a channel whose state accounts for the whole
+   funding output.  An HTLC that is missing from the HTLC list (the list is
+   not restored when a channel is reloaded) shows up as an amount that is in
+   neither balance; a close paying local_amount in full would give that
+   amount to the LSP. */
+int test_client_close_refuses_unbalanced_channel(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+
+    const uint64_t balance = 100000, htlc_amount = 30000;
+    channel_t ch;
+    tx_output_t outs[2];
+
+    /* Baseline: state adds up, proposal pays the balance. */
+    cs_channel(&ch, balance);
+    cs_output(&outs[0], CS_FUNDING - 1000 - balance, lsp_spk);
+    cs_output(&outs[1], balance, my_spk);
+    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "balanced channel paid in full is accepted");
+
+    /* An outgoing HTLC left the client's balance and is not in the list.
+       The proposal pays the remaining local_amount exactly. */
+    cs_channel(&ch, balance);
+    ch.local_amount -= htlc_amount;
+    cs_output(&outs[0], CS_FUNDING - 1000 - ch.local_amount, lsp_spk);
+    cs_output(&outs[1], ch.local_amount, my_spk);
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "missing outgoing HTLC amount must be refused");
+
+    /* The same HTLC, listed and active: the state adds up again and the
+       pending-HTLC rule refuses instead. */
+    htlc_t h;
+    memset(&h, 0, sizeof(h));
+    h.state = HTLC_STATE_ACTIVE;
+    h.amount_sats = htlc_amount;
+    ch.htlcs = &h;
+    ch.n_htlcs = 1;
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "listed pending HTLC is refused");
+    ch.htlcs = NULL;
+    ch.n_htlcs = 0;
+
+    /* An incoming HTLC left the LSP's balance and is not in the list. */
+    cs_channel(&ch, balance);
+    ch.remote_amount -= htlc_amount;
+    cs_output(&outs[1], balance, my_spk);
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "missing incoming HTLC amount must be refused");
+
+    /* The missing amount took the balance below dust: no output would be
+       required, and the close must still be refused. */
+    cs_channel(&ch, htlc_amount + 100);
+    ch.local_amount -= htlc_amount;
+    TEST_ASSERT(ch.local_amount < CHANNEL_DUST_LIMIT_SATS, "sub-dust remainder");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 1),
+                "sub-dust balance does not excuse a missing amount");
+
+    /* Balances that claim more than the funding output holds. */
+    cs_channel(&ch, balance);
+    ch.remote_amount += 1;
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "state exceeding the funding output must be refused");
+
+    /* No funding amount to check against. */
+    cs_channel(&ch, balance);
+    ch.funding_amount = 0;
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "channel without a funding amount must be refused");
 
     secp256k1_context_destroy(ctx);
     return 1;
@@ -258,8 +357,7 @@ int test_client_close_refuses_unpaid_proposal(void) {
 
     const uint64_t balance = 120000;
     channel_t ch;
-    memset(&ch, 0, sizeof(ch));
-    ch.local_amount = balance;
+    cs_channel(&ch, balance);
 
     tx_output_t outs[2];
     int rc = -1;
@@ -288,12 +386,14 @@ int test_client_close_refuses_unpaid_proposal(void) {
     memset(&pending, 0, sizeof(pending));
     pending.state = HTLC_STATE_ACTIVE;
     pending.amount_sats = 5000;
+    ch.remote_amount -= pending.amount_sats;   /* offered by the LSP */
     ch.htlcs = &pending;
     ch.n_htlcs = 1;
     TEST_ASSERT(cs_run_client_close(ctx, &kps[1], &pks[1], f, &ch, outs, 2,
                                      &rc, &sent), "run");
     TEST_ASSERT(rc == 0, "client refuses to close over a pending HTLC");
     TEST_ASSERT(sent == MSG_ERROR, "client reports the refusal");
+    ch.remote_amount += pending.amount_sats;
     ch.htlcs = NULL;
     ch.n_htlcs = 0;
 
@@ -350,8 +450,7 @@ int test_client_close_honest_ceremony(void) {
             close(sv[0]);
             for (int p = 0; p < c; p++) close(lsp->client_fds[p]);
             channel_t ch;
-            memset(&ch, 0, sizeof(ch));
-            ch.local_amount = balances[c];
+            cs_channel(&ch, balances[c]);
             int ok = client_do_close_ceremony(sv[1], ctx, &kps[c + 1],
                                                &pks[c + 1], &lsp->factory,
                                                CS_N, NULL, 0, &ch, 0);

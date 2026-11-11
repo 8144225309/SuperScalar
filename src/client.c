@@ -82,8 +82,12 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
    usable balance at init time (lsp_channels_init, src/lsp_channels.c:203-204),
    so the invariant must account for it — otherwise the check trips by
    exactly base_commit_fee on every balanced channel. */
-static void client_check_conservation(const channel_t *ch, const char *context) {
-    if (!ch || ch->funding_amount == 0) return;
+/* Both sides of the conservation invariant for ch: what the channel state
+   accounts for (balances plus every active HTLC) and what the funding output
+   holds once the base commitment fee is taken off.  Returns 1 if they agree. */
+static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
+                                     uint64_t *expected_out,
+                                     uint64_t *base_commit_fee_out) {
     uint64_t sum = ch->local_amount + ch->remote_amount;
     for (size_t h = 0; h < ch->n_htlcs; h++) {
         if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
@@ -97,7 +101,16 @@ static void client_check_conservation(const channel_t *ch, const char *context) 
         (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
     uint64_t expected = ch->funding_amount > base_commit_fee
                         ? ch->funding_amount - base_commit_fee : 0;
-    if (sum != expected) {
+    if (sum_out) *sum_out = sum;
+    if (expected_out) *expected_out = expected;
+    if (base_commit_fee_out) *base_commit_fee_out = base_commit_fee;
+    return sum == expected;
+}
+
+static void client_check_conservation(const channel_t *ch, const char *context) {
+    if (!ch || ch->funding_amount == 0) return;
+    uint64_t sum, expected, base_commit_fee;
+    if (!client_channel_conserved(ch, &sum, &expected, &base_commit_fee)) {
         fprintf(stderr, "CLIENT CONSERVATION VIOLATION (%s): "
                 "local=%llu remote=%llu htlc_sum=%llu total=%llu "
                 "expected=%llu funding=%llu base_commit_fee=%llu "
@@ -555,12 +568,33 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
        not represented by any output, so signing now would forfeit it (an
        incoming one the client can claim, or an outgoing one that may yet be
        refunded).  Wait for it to resolve, or exit with the commitment. */
-    for (size_t i = 0; i < ch->n_htlcs; i++) {
-        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) {
-            fprintf(stderr, "Client: REFUSING cooperative close — %zu HTLC(s) "
-                    "still pending on the channel\n", ch->n_htlcs);
-            return 0;
-        }
+    size_t n_active = 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) n_active++;
+    if (n_active > 0) {
+        fprintf(stderr, "Client: REFUSING cooperative close — %zu HTLC(s) "
+                "still pending on the channel\n", n_active);
+        return 0;
+    }
+
+    /* The balances must account for the whole funding output.  The HTLC list
+       is not restored when a channel is reloaded, so an HTLC that was in
+       flight then is invisible to the check above; what gives it away is
+       that its amount is in neither balance.  A close paying local_amount
+       would hand that amount to the LSP, so a channel whose state does not
+       add up is never closed cooperatively. */
+    uint64_t accounted = 0, expected = 0;
+    if (ch->funding_amount == 0 ||
+        !client_channel_conserved(ch, &accounted, &expected, NULL)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — channel state "
+                "accounts for %llu sats (local %llu, remote %llu) but the "
+                "funding output holds %llu after the commitment fee; an HTLC "
+                "may be unresolved\n",
+                (unsigned long long)accounted,
+                (unsigned long long)ch->local_amount,
+                (unsigned long long)ch->remote_amount,
+                (unsigned long long)expected);
+        return 0;
     }
 
     /* A balance below the dust limit cannot be paid by a standard output. */

@@ -90,10 +90,16 @@ int client_close_script(const secp256k1_context *ctx,
                          unsigned char *spk_out34);
 
 /* Decide whether a cooperative-close proposal is safe for this client to sign.
-   Returns 1 only if no HTLC is pending on ch and the outputs carrying the
-   client's own close script sum to at least ch->local_amount (no output is
-   required for a balance below the dust limit).  Outputs to any other script
-   are ignored regardless of amount.  ch == NULL (no channel) returns 1. */
+   Returns 1 only if
+     - no HTLC is pending on ch,
+     - the channel state accounts for the whole funding output: local +
+       remote + active HTLCs == funding_amount - base commitment fee (an HTLC
+       missing from the list makes this fail), and
+     - the outputs carrying the client's own close script sum to at least
+       ch->local_amount (no output is required for a balance below the dust
+       limit).
+   Outputs to any other script are ignored regardless of amount.
+   ch == NULL (no channel) returns 1. */
 int client_close_outputs_acceptable(const secp256k1_context *ctx,
                                      const secp256k1_pubkey *my_pubkey,
                                      const channel_t *ch,
