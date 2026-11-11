@@ -370,22 +370,45 @@ int bridge_service_pending_plugin(bridge_t *br) {
 }
 
 uint64_t bridge_add_pending(bridge_t *br, const unsigned char *payment_hash32) {
-    if (br->n_pending >= BRIDGE_MAX_PENDING) return 0;
+    for (size_t i = 0; i < BRIDGE_MAX_PENDING; i++) {
+        bridge_pending_htlc_t *e = &br->pending_inbound[i];
+        if (e->pending) continue;
+        /* 0 means "no HTLC" to the LSP, so it is never handed out */
+        if (br->next_htlc_id == 0) br->next_htlc_id = 1;
+        memcpy(e->payment_hash, payment_hash32, 32);
+        e->htlc_id = br->next_htlc_id++;
+        e->pending = 1;
+        br->n_pending++;
+        return e->htlc_id;
+    }
+    return 0;
+}
 
-    size_t idx = br->n_pending++;
-    memcpy(br->pending_inbound[idx].payment_hash, payment_hash32, 32);
-    br->pending_inbound[idx].htlc_id = br->next_htlc_id++;
-    br->pending_inbound[idx].pending = 1;
-    return br->pending_inbound[idx].htlc_id;
+static void free_pending(bridge_t *br, bridge_pending_htlc_t *e) {
+    memset(e, 0, sizeof(*e));
+    if (br->n_pending > 0) br->n_pending--;
 }
 
 int bridge_resolve_pending(bridge_t *br, const unsigned char *payment_hash32,
                              uint64_t *htlc_id_out) {
-    for (size_t i = 0; i < br->n_pending; i++) {
-        if (!br->pending_inbound[i].pending) continue;
-        if (memcmp(br->pending_inbound[i].payment_hash, payment_hash32, 32) == 0) {
-            *htlc_id_out = br->pending_inbound[i].htlc_id;
-            br->pending_inbound[i].pending = 0;
+    for (size_t i = 0; i < BRIDGE_MAX_PENDING; i++) {
+        bridge_pending_htlc_t *e = &br->pending_inbound[i];
+        if (!e->pending) continue;
+        if (memcmp(e->payment_hash, payment_hash32, 32) == 0) {
+            *htlc_id_out = e->htlc_id;
+            free_pending(br, e);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int bridge_release_pending(bridge_t *br, uint64_t htlc_id) {
+    if (htlc_id == 0) return 0;
+    for (size_t i = 0; i < BRIDGE_MAX_PENDING; i++) {
+        bridge_pending_htlc_t *e = &br->pending_inbound[i];
+        if (e->pending && e->htlc_id == htlc_id) {
+            free_pending(br, e);
             return 1;
         }
     }
@@ -457,6 +480,7 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         if (!wire_parse_bridge_fulfill_htlc(msg->json, payment_hash, preimage,
                                               &htlc_id))
             return 0;
+        bridge_release_pending(br, htlc_id);
 
         /* Forward to plugin (include payment_hash for correlation) */
         cJSON *j = cJSON_CreateObject();
@@ -477,6 +501,7 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         if (!wire_parse_bridge_fail_htlc(msg->json, payment_hash, reason,
                                            sizeof(reason), &htlc_id))
             return 0;
+        bridge_release_pending(br, htlc_id);
 
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "method", "htlc_resolve");
@@ -577,6 +602,22 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
 
         /* Assign htlc_id and track */
         uint64_t htlc_id = bridge_add_pending(br, payment_hash);
+        if (htlc_id == 0) {
+            /* Table full: the LSP cannot be asked, so tell the plugin to
+               fail this HTLC rather than leave it held with no id. */
+            fprintf(stderr, "Bridge: %d inbound HTLCs pending, refusing another\n",
+                    BRIDGE_MAX_PENDING);
+            cJSON *j = cJSON_CreateObject();
+            cJSON_AddStringToObject(j, "method", "htlc_resolve");
+            wire_json_add_hex(j, "payment_hash", payment_hash, 32);
+            cJSON_AddNumberToObject(j, "htlc_id", 0);
+            cJSON_AddStringToObject(j, "result", "fail");
+            cJSON_AddStringToObject(j, "reason", "bridge_busy");
+            bridge_send_plugin_json(br, j);
+            cJSON_Delete(j);
+            cJSON_Delete(json);
+            return 1;
+        }
 
         /* Forward to LSP */
         cJSON *msg = wire_build_bridge_add_htlc(payment_hash, amount_msat,

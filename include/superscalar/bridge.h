@@ -39,7 +39,7 @@ typedef struct {
     int has_plugin_secret;
 
     bridge_pending_htlc_t pending_inbound[BRIDGE_MAX_PENDING];
-    size_t n_pending;
+    size_t n_pending;                    /* entries currently in use */
 
     uint64_t next_htlc_id;              /* correlation ID for inbound HTLCs */
     uint64_t next_request_id;           /* correlation ID for outbound pays */
@@ -138,12 +138,18 @@ int bridge_send_plugin_json(bridge_t *br, cJSON *json);
    Runs until error or shutdown. Returns 0 on error. */
 int bridge_run(bridge_t *br);
 
-/* Add a pending inbound HTLC. Returns assigned htlc_id. */
+/* Add a pending inbound HTLC.  Returns the htlc_id assigned to it (never
+   0), or 0 if BRIDGE_MAX_PENDING HTLCs are already pending. */
 uint64_t bridge_add_pending(bridge_t *br, const unsigned char *payment_hash32);
 
-/* Find and remove a pending HTLC by payment_hash. Returns htlc_id, or -1. */
+/* Find and free a pending HTLC by payment_hash.  Returns 1 and sets
+   *htlc_id_out if one was pending, 0 otherwise. */
 int bridge_resolve_pending(bridge_t *br, const unsigned char *payment_hash32,
                              uint64_t *htlc_id_out);
+
+/* Free the pending HTLC with this htlc_id (the LSP resolved it).
+   Returns 1 if it was pending. */
+int bridge_release_pending(bridge_t *br, uint64_t htlc_id);
 
 /* Set heartbeat interval in seconds (default 30). */
 void bridge_set_heartbeat(bridge_t *br, int interval_sec);

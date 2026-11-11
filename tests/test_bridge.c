@@ -4346,3 +4346,125 @@ int test_lsp_outbound_one_pay_per_hash(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Bridge pending table: freed on resolve, bounded, ids never 0 ---- */
+
+int test_bridge_pending_table(void) {
+    bridge_t br;
+    bridge_init(&br);
+    unsigned char h[32];
+
+    /* Fill the table: every id is distinct and non-zero */
+    uint64_t ids[BRIDGE_MAX_PENDING];
+    for (int i = 0; i < BRIDGE_MAX_PENDING; i++) {
+        memset(h, 0, 32); h[0] = (unsigned char)i; h[1] = (unsigned char)(i >> 8);
+        ids[i] = bridge_add_pending(&br, h);
+        TEST_ASSERT(ids[i] != 0, "id is never 0");
+        TEST_ASSERT(i == 0 || ids[i] != ids[i - 1], "ids are distinct");
+    }
+    TEST_ASSERT_EQ(br.n_pending, BRIDGE_MAX_PENDING, "table full");
+    memset(h, 0xFE, 32);
+    TEST_ASSERT_EQ(bridge_add_pending(&br, h), 0, "full table refuses");
+    TEST_ASSERT_EQ(br.n_pending, BRIDGE_MAX_PENDING, "nothing added");
+
+    /* Resolving one frees its slot for the next HTLC */
+    TEST_ASSERT(bridge_release_pending(&br, ids[100]), "release by id");
+    TEST_ASSERT(!bridge_release_pending(&br, ids[100]), "only once");
+    TEST_ASSERT(!bridge_release_pending(&br, 0), "id 0 is nobody");
+    TEST_ASSERT_EQ(br.n_pending, BRIDGE_MAX_PENDING - 1, "one slot free");
+    uint64_t fresh = bridge_add_pending(&br, h);
+    TEST_ASSERT(fresh != 0 && fresh != ids[100], "freed slot reused with a new id");
+    uint64_t by_hash = 0;
+    TEST_ASSERT(bridge_resolve_pending(&br, h, &by_hash), "resolve by hash");
+    TEST_ASSERT_EQ(by_hash, fresh, "the id it was given");
+    TEST_ASSERT(!bridge_resolve_pending(&br, h, &by_hash), "gone after resolve");
+
+    /* The id counter wrapping around does not produce 0 */
+    br.next_htlc_id = UINT64_MAX;
+    TEST_ASSERT_EQ(bridge_add_pending(&br, h), UINT64_MAX, "last id before wrap");
+    TEST_ASSERT(bridge_release_pending(&br, UINT64_MAX), "release");
+    TEST_ASSERT_EQ(bridge_add_pending(&br, h), 1, "wraps to 1, not 0");
+    return 1;
+}
+
+/* Send the bridge an htlc_accepted from the plugin; returns what it did:
+   the htlc_id it forwarded to the LSP, or 0 if it refused to the plugin. */
+static int bridge_inbound_once(bridge_t *br, int lsp_peer, int plugin_peer,
+                               int n, uint64_t *htlc_id_out) {
+    char line[256];
+    snprintf(line, sizeof(line),
+             "{\"method\":\"htlc_accepted\",\"payment_hash\":\"%064x\","
+             "\"amount_msat\":5000000,\"cltv_expiry\":500}", n);
+    if (!bridge_handle_plugin_msg(br, line)) return 0;
+    *htlc_id_out = 0;
+    struct pollfd p[2] = { { .fd = lsp_peer, .events = POLLIN },
+                           { .fd = plugin_peer, .events = POLLIN } };
+    if (poll(p, 2, 5000) < 1) return 0;
+    if (p[0].revents & POLLIN) {
+        wire_msg_t m;
+        unsigned char ph[32]; uint64_t amt; uint32_t cltv;
+        if (!wire_recv(lsp_peer, &m)) return 0;
+        int ok = m.msg_type == MSG_BRIDGE_ADD_HTLC &&
+                 wire_parse_bridge_add_htlc(m.json, ph, &amt, &cltv, htlc_id_out);
+        cJSON_Delete(m.json);
+        return ok;
+    }
+    char buf[512];
+    ssize_t r = read(plugin_peer, buf, sizeof(buf) - 1);
+    if (r <= 0) return 0;
+    buf[r] = '\0';
+    return strstr(buf, "\"htlc_resolve\"") && strstr(buf, "\"fail\"") &&
+           strstr(buf, "bridge_busy");
+}
+
+int test_bridge_inbound_beyond_pending_limit(void) {
+    int lsp_sv[2], plugin_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, plugin_sv) == 0, "socketpair");
+    bridge_t br;
+    bridge_init(&br);
+    br.lsp_fd = lsp_sv[1];
+    br.plugin_fd = plugin_sv[1];
+
+    /* Far more HTLCs than the table holds pass through, each resolved by
+       the LSP before the next: every one gets a usable id. */
+    for (int n = 1; n <= 3 * BRIDGE_MAX_PENDING; n++) {
+        uint64_t id = 0;
+        TEST_ASSERT(bridge_inbound_once(&br, lsp_sv[0], plugin_sv[0], n, &id),
+                    "htlc_accepted handled");
+        TEST_ASSERT(id != 0, "forwarded to the LSP with a non-zero id");
+
+        unsigned char ph[32];
+        memset(ph, 0, 32);
+        cJSON *res = (n % 2) ? wire_build_bridge_fail_htlc(ph, "no", id)
+                             : wire_build_bridge_fulfill_htlc(ph, ph, id);
+        wire_msg_t m;
+        m.msg_type = (n % 2) ? MSG_BRIDGE_FAIL_HTLC : MSG_BRIDGE_FULFILL_HTLC;
+        m.json = res;
+        TEST_ASSERT(bridge_handle_lsp_msg(&br, &m), "LSP resolution handled");
+        cJSON_Delete(res);
+        char buf[512];
+        TEST_ASSERT(read(plugin_sv[0], buf, sizeof(buf)) > 0, "resolution reaches plugin");
+        TEST_ASSERT_EQ(br.n_pending, 0, "entry freed");
+    }
+
+    /* With nothing resolved, the table fills; the next HTLC is refused to
+       the plugin and nothing with id 0 goes to the LSP. */
+    for (int n = 1; n <= BRIDGE_MAX_PENDING; n++) {
+        uint64_t id = 0;
+        TEST_ASSERT(bridge_inbound_once(&br, lsp_sv[0], plugin_sv[0], 5000 + n, &id),
+                    "htlc_accepted handled");
+        TEST_ASSERT(id != 0, "forwarded with a non-zero id");
+    }
+    for (int n = 1; n <= 3; n++) {
+        uint64_t id = 99;
+        TEST_ASSERT(bridge_inbound_once(&br, lsp_sv[0], plugin_sv[0], 9000 + n, &id),
+                    "over-limit htlc_accepted answered");
+        TEST_ASSERT_EQ(id, 0, "refused to the plugin, not forwarded");
+    }
+    TEST_ASSERT_EQ(br.n_pending, BRIDGE_MAX_PENDING, "table still full");
+
+    close(lsp_sv[0]); close(lsp_sv[1]);
+    close(plugin_sv[0]); close(plugin_sv[1]);
+    return 1;
+}
