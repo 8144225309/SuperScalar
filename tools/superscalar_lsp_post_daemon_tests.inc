@@ -1149,10 +1149,17 @@
             } else {
                 printf("  clients refused the reallocation (expected)\n");
             }
-            if (leaf_node->is_signed && leaf_node->signed_tx.len > 0 &&
-                memcmp(leaf_node->txid, orig_leaf_txid, 32) != 0) {
-                printf("  FAIL: LSP holds a signed replacement leaf after the "
-                       "refusal\n");
+            /* The failed ceremony must leave the LSP on the leaf it shares
+               with its clients: same transaction, same amounts, signed. */
+            int leaf_restored =
+                leaf_node->is_signed && leaf_node->signed_tx.len > 0 &&
+                memcmp(leaf_node->txid, orig_leaf_txid, 32) == 0;
+            for (size_t k = 0; k < 3 && k < leaf_node->n_outputs; k++)
+                if (leaf_node->outputs[k].amount_sats != orig_amounts[k])
+                    leaf_restored = 0;
+            if (!leaf_restored) {
+                printf("  FAIL: LSP leaf is not back in its signed state "
+                       "from before the proposal\n");
                 realloc_pass = 0;
             }
             if (cheat_realloc) {
@@ -1502,125 +1509,50 @@
             printf("  SKIP: --test-buy-liquidity requires --leaf-arity 2\n");
             printf("BUY LIQUIDITY TEST: SKIP (gate=arity)\n");
         } else {
-            /* Buy 1000 sats of inbound liquidity for client 0 from L-stock */
+            /* Buying liquidity needs a leaf reallocation, which clients do
+               not co-sign.  The LSP must refuse the request up front: no
+               proposal to any client, leaf and channel exactly as before. */
             uint64_t buy_amount = 1000;
-            printf("  Buying %llu sats inbound for client 0 from L-stock...\n",
+            printf("  Requesting %llu sats inbound for client 0 from L-stock...\n",
                    (unsigned long long)buy_amount);
             fflush(stdout);
 
-            /* Record pre-buy state */
             size_t leaf_node_idx = lsp_p->factory.leaf_node_indices[0];
             factory_node_t *buy_leaf_node = &lsp_p->factory.nodes[leaf_node_idx];
             uint64_t pre_lstock = buy_leaf_node->outputs[2].amount_sats;
             uint64_t pre_client = buy_leaf_node->outputs[0].amount_sats;
+            uint64_t pre_local = mgr->entries[0].channel.local_amount;
+            uint64_t pre_remote = mgr->entries[0].channel.remote_amount;
+            int pre_signed = buy_leaf_node->is_signed;
+            unsigned char pre_txid[32];
+            memcpy(pre_txid, buy_leaf_node->txid, 32);
 
-            /* SF-CHEAT-LSTOCK-BUY (#255): snapshot the pre-buy leaf signed_tx
-               BEFORE lsp_channels_buy_liquidity mutates the node (via internal
-               lsp_realloc_leaf).  After the honest ceremony completes, this
-               snapshotted tx is the revoked pre-buy state we will broadcast.
-               Mirrors the CL2 cheat-realloc pattern (see line 1066 above). */
-            tx_buf_t cl_lsb_pre_buy_tx;
-            tx_buf_init(&cl_lsb_pre_buy_tx, 0);
-            if (cheat_lstock_buy &&
-                buy_leaf_node->is_signed && buy_leaf_node->signed_tx.len > 0) {
-                tx_buf_init(&cl_lsb_pre_buy_tx, (int)buy_leaf_node->signed_tx.len);
-                memcpy(cl_lsb_pre_buy_tx.data, buy_leaf_node->signed_tx.data,
-                       buy_leaf_node->signed_tx.len);
-                cl_lsb_pre_buy_tx.len = buy_leaf_node->signed_tx.len;
-                printf("CL?-CHEAT-LSTOCK-BUY: snapshotted pre-buy leaf tx (%zu bytes)\n",
-                       (size_t)cl_lsb_pre_buy_tx.len);
-            }
-
-            if (!lsp_channels_buy_liquidity(mgr, lsp_p, 0, buy_amount)) {
-                printf("  buy_liquidity FAILED\n");
+            if (lsp_channels_buy_liquidity(mgr, lsp_p, 0, buy_amount)) {
+                printf("  FAIL: buy_liquidity succeeded (expected a refusal)\n");
                 buy_pass = 0;
             } else {
-                /* Verify L-stock decreased and client output increased */
-                uint64_t post_lstock = buy_leaf_node->outputs[2].amount_sats;
-                uint64_t post_client = buy_leaf_node->outputs[0].amount_sats;
-
-                printf("  L-stock: %llu → %llu (-%llu)\n",
-                       (unsigned long long)pre_lstock, (unsigned long long)post_lstock,
-                       (unsigned long long)(pre_lstock - post_lstock));
-                printf("  Client 0 output: %llu → %llu (+%llu)\n",
-                       (unsigned long long)pre_client, (unsigned long long)post_client,
-                       (unsigned long long)(post_client - pre_client));
-
-                if (post_lstock >= pre_lstock || post_client <= pre_client) {
-                    printf("  Balance check FAILED\n");
-                    buy_pass = 0;
-                }
+                printf("  buy_liquidity refused (expected)\n");
             }
-
-            /* SF-CHEAT-LSTOCK-BUY (#255): adversarial broadcast + WT assertion.
-               At this point the honest L-stock buy ceremony has completed and
-               buy_leaf_node->signed_tx now contains the POST-BUY state.  The
-               watchtower has registered the new state via lsp_realloc_leaf's
-               revocation path.  Now broadcast the snapshotted PRE-BUY tx (the
-               revoked state) and assert WT detects + responds.  Same trick as
-               CL2 cheat-realloc: temporarily set is_signed=0 on the buy leaf
-               so broadcast_factory_tree_any_network lands the parent without
-               the post-buy leaf, then broadcast the pre-buy snapshot. */
-            if (buy_pass && cheat_lstock_buy && cl_lsb_pre_buy_tx.len > 0) {
-                printf("\n--- CL?-CHEAT-LSTOCK-BUY: broadcasting parent factory tree (skipping post-buy leaf) ---\n");
-                fflush(stdout);
-                int saved_leaf_is_signed = buy_leaf_node->is_signed;
-                buy_leaf_node->is_signed = 0;
-                int parent_tree_ok = broadcast_factory_tree_any_network(
-                    &lsp_p->factory, &rt, mine_addr, is_regtest,
-                    confirm_timeout_secs);
-                buy_leaf_node->is_signed = saved_leaf_is_signed;
-                if (!parent_tree_ok) {
-                    fprintf(stderr,
-                            "CL?-CHEAT-LSTOCK-BUY: parent tree broadcast failed — cannot test stale broadcast\n");
-                    buy_pass = 0;
-                    goto cl_lstock_buy_cleanup;
-                }
-                printf("CL?-CHEAT-LSTOCK-BUY: parent tree on-chain; broadcasting revoked pre-buy leaf\n");
-
-                char *cheat_hex = malloc((size_t)cl_lsb_pre_buy_tx.len * 2 + 1);
-                char cheat_txid_str[65] = {0};
-                int sent = 0;
-                if (cheat_hex) {
-                    hex_encode(cl_lsb_pre_buy_tx.data,
-                               (size_t)cl_lsb_pre_buy_tx.len, cheat_hex);
-                    sent = regtest_send_raw_tx(&rt, cheat_hex, cheat_txid_str);
-                    if (g_db)
-                        persist_log_broadcast(g_db,
-                            sent ? cheat_txid_str : "?",
-                            "cheat_lstock_buy_stale",
-                            cheat_hex,
-                            sent ? "ok" : "failed");
-                    free(cheat_hex);
-                }
-                if (!sent) {
-                    fprintf(stderr, "CL?-CHEAT-LSTOCK-BUY: stale broadcast failed\n");
-                    buy_pass = 0;
-                } else {
-                    printf("CL?-CHEAT-LSTOCK-BUY: revoked tx broadcast txid=%s\n",
-                           cheat_txid_str);
-                    if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
-                    watchtower_t *wt_lsb = mgr->watchtower;
-                    if (!wt_lsb) {
-                        fprintf(stderr,
-                                "CL?-CHEAT-LSTOCK-BUY: no watchtower configured — cannot assert defense\n");
-                        buy_pass = 0;
-                    } else {
-                        int detected = watchtower_check(wt_lsb);
-                        if (detected > 0) {
-                            printf("CL?-CHEAT-LSTOCK-BUY: BREACH DETECTED! Watchtower broadcast %d penalty tx(s)\n",
-                                   detected);
-                            if (is_regtest) regtest_mine_blocks(&rt, 1, mine_addr);
-                        } else {
-                            fprintf(stderr,
-                                    "CL?-CHEAT-LSTOCK-BUY: watchtower did NOT detect revoked broadcast (defense MISS)\n");
-                            buy_pass = 0;
-                        }
-                    }
-                }
+            if (buy_leaf_node->outputs[2].amount_sats != pre_lstock ||
+                buy_leaf_node->outputs[0].amount_sats != pre_client ||
+                buy_leaf_node->is_signed != pre_signed ||
+                memcmp(buy_leaf_node->txid, pre_txid, 32) != 0) {
+                printf("  FAIL: the leaf changed although the request was refused\n");
+                buy_pass = 0;
             }
-        cl_lstock_buy_cleanup:
-            tx_buf_free(&cl_lsb_pre_buy_tx);
+            if (mgr->entries[0].channel.local_amount != pre_local ||
+                mgr->entries[0].channel.remote_amount != pre_remote) {
+                printf("  FAIL: channel balances changed although the request "
+                       "was refused\n");
+                buy_pass = 0;
+            }
+            if (cheat_lstock_buy) {
+                /* The stale-leaf broadcast needs a completed purchase to make
+                   the old leaf stale; there is none to cheat against. */
+                printf("  FAIL: --cheat-lstock-buy requires a completed "
+                       "liquidity purchase, which is refused\n");
+                buy_pass = 0;
+            }
 
             printf("BUY LIQUIDITY TEST: %s\n", buy_pass ? "PASS" : "FAIL");
         }
