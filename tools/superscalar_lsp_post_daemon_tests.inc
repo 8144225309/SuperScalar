@@ -759,7 +759,7 @@
         }
 
         /* Build keyagg for the funding key (used as message) */
-        secp256k1_pubkey turnover_pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey turnover_pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t ti = 0; ti < n_total; ti++) {
             if (!secp256k1_keypair_pub(ctx, &turnover_pks[ti], &all_kps[ti])) {
                 fprintf(stderr, "TURNOVER TEST: keypair pub failed\n");
@@ -1332,7 +1332,7 @@
                against.  Same registration shape as the realloc / rollover
                precedents (watchtower_watch_factory_node_with_channels). */
             size_t jit_leaf_idx_reg = lsp_p->factory.leaf_node_indices[0];
-            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
             size_t n_leaf_ch = 0;
             for (size_t cc = 0; cc < mgr->n_channels; cc++) {
                 size_t c_node;

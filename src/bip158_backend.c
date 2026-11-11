@@ -1,4 +1,5 @@
 #include "superscalar/bip158_backend.h"
+#include "superscalar/network.h"
 #include "superscalar/p2p_bitcoin.h"
 #include "superscalar/persist.h"
 #include "superscalar/regtest.h"
@@ -739,7 +740,7 @@ static const bip158_cp_t testnet3_checkpoints[] = {
 
 static const bip158_cp_t *get_checkpoints(const char *network, size_t *count)
 {
-    if (strcmp(network, "mainnet") == 0) {
+    if (network_is_mainnet(network)) {
         *count = sizeof(mainnet_checkpoints) / sizeof(mainnet_checkpoints[0]);
         return mainnet_checkpoints;
     }
@@ -1022,6 +1023,7 @@ static int bip158_genesis_hash(const char *network, uint8_t out32[32])
             0xc7,0xb2,0xb7,0x3c,0xf1,0x88,0x91,0x0f } },
     };
     if (!network || !out32) return 0;
+    if (network_is_mainnet(network)) network = "mainnet";
     for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
         if (strcmp(table[i].name, network) == 0) {
             memcpy(out32, table[i].h, 32);

@@ -65,6 +65,7 @@ int ladder_create_factory(ladder_t *lad,
 
     /* Build tree and sign */
     if (!factory_build_tree(&lf->factory)) {
+        factory_free(&lf->factory);
         tx_buf_free(&lf->distribution_tx);
         return 0;
     }
@@ -74,6 +75,7 @@ int ladder_create_factory(ladder_t *lad,
         dw_counter_advance(&lf->factory.counter);
 
     if (!factory_sign_all_with_retry(&lf->factory, SS_NONCE_RETRY_MAX)) {
+        factory_free(&lf->factory);
         tx_buf_free(&lf->distribution_tx);
         return 0;
     }

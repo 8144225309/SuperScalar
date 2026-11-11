@@ -273,6 +273,7 @@ int compute_tapscript_sighash(
     /* scriptpubkeys hash */
     size_t spk_ser_len = 1 + prev_spk_len;
     unsigned char *spk_ser = (unsigned char *)malloc(spk_ser_len);
+    if (!spk_ser) return 0;
     spk_ser[0] = (unsigned char)prev_spk_len;
     memcpy(spk_ser + 1, prev_spk, prev_spk_len);
     unsigned char sha_scriptpubkeys[32];

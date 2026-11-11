@@ -8,10 +8,17 @@ Type=simple
 User=superscalar
 Group=superscalar
 EnvironmentFile=-/etc/superscalar/env
+# --wt-db is the watchtower database the LSP writes with its own --wt-db
+# option; point both at the same file.
+# SS_WATCHTOWER_ARGS holds extra options and is empty unless set in
+# /etc/superscalar/env.  A mainnet watchtower does not start without the
+# operator's acknowledgement: set SS_WATCHTOWER_ARGS=--i-accept-the-risk
+# there.  It is deliberately not written into this unit.
 ExecStart=/usr/local/bin/superscalar_watchtower \
     --network ${SS_NETWORK:-signet} \
-    --db /var/lib/superscalar/watchtower.db \
-    --rpcuser ${SS_RPCUSER:-rpcuser} --rpcpassword ${SS_RPCPASSWORD:-rpcpass}
+    --wt-db /var/lib/superscalar/wt.db \
+    --rpcuser ${SS_RPCUSER:-rpcuser} --rpcpassword ${SS_RPCPASSWORD:-rpcpass} \
+    $SS_WATCHTOWER_ARGS
 Restart=on-failure
 RestartSec=30
 LimitNOFILE=65536

@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -216,19 +217,23 @@ int test_wellknown_http_serve(void) {
 /* -----------------------------------------------------------------------
  * Test 4: end-to-end fetch from a local well-known HTTP server
  *
- * Forks a background server via lsp_wellknown_serve_fork(), then uses
+ * Forks a background server on a free port, then uses
  * lsp_wellknown_fetch_http_port() to retrieve and parse the response.
  * ----------------------------------------------------------------------- */
-int test_client_bootstrap_from_domain(void) {
-    /* Use a high port unlikely to collide with anything */
-    uint16_t test_port = 18765;
+/* Stop a server started with lsp_wellknown_serve_fork() and reap it, so the
+   test leaves no process behind. */
+static void stop_server(int server_pid) {
+    if (server_pid <= 0) return;
+    kill((pid_t)server_pid, SIGTERM);
+    waitpid((pid_t)server_pid, NULL, 0);
+}
 
-    /* Fork a background server serving TEST_CFG */
-    if (!lsp_wellknown_serve_fork(&TEST_CFG, test_port)) {
-        /* If fork is unavailable (e.g. some sandboxes), skip gracefully */
-        printf("  SKIP: lsp_wellknown_serve_fork unavailable\n");
-        return 1;
-    }
+int test_client_bootstrap_from_domain(void) {
+    /* Fork a background server serving TEST_CFG on a free port.  Not being
+       able to start it is a failure: the test must not pass without running. */
+    uint16_t test_port = 0;
+    int server = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &test_port);
+    ASSERT(server > 0 && test_port != 0, "well-known test server starts");
 
     /* Give the child process time to bind and listen */
     usleep(150000);  /* 150 ms */
@@ -237,14 +242,166 @@ int test_client_bootstrap_from_domain(void) {
     uint16_t port    = 0;
     char pubkey[128] = {0};
 
-    ASSERT(lsp_wellknown_fetch_http_port("127.0.0.1", test_port,
-                                         host, sizeof(host),
-                                         &port, pubkey, sizeof(pubkey)),
-           "fetch_http_port from local server succeeds");
+    int fetched = lsp_wellknown_fetch_http_port("127.0.0.1", test_port,
+                                                host, sizeof(host),
+                                                &port, pubkey, sizeof(pubkey));
+    stop_server(server);
 
+    ASSERT(fetched, "fetch_http_port from local server succeeds");
     ASSERT(strcmp(host, TEST_CFG.host) == 0, "fetched host matches cfg");
     ASSERT(port == TEST_CFG.bolt8_port,       "fetched port matches cfg");
     ASSERT(strcmp(pubkey, TEST_CFG.pubkey_hex) == 0, "fetched pubkey matches cfg");
 
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 5: a key from the well-known response never becomes the pinned key
+ *
+ * The response is fetched over plain HTTP, so whoever controls the network
+ * path chooses the key in it.  Only the key the operator configured can pin
+ * the LSP; the advertised key can agree with it or contradict it.
+ * ----------------------------------------------------------------------- */
+int test_wellknown_pubkey_never_pins(void) {
+    const char *operator_key =
+        "02abc123def456abc123def456abc123def456abc123def456abc123def456ab0102";
+    const char *operator_key_upper =
+        "02ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456AB0102";
+    const char *other_key =
+        "03ffc123def456abc123def456abc123def456abc123def456abc123def456ab0102";
+    const char *pin;
+
+    /* No configured key: the advertised key must not be adopted. */
+    pin = other_key;
+    ASSERT(lsp_wellknown_select_pin(NULL, other_key, &pin) == LSP_PIN_NONE,
+           "advertised key alone pins nothing");
+    ASSERT(pin == NULL, "no pin without a configured key");
+
+    pin = other_key;
+    ASSERT(lsp_wellknown_select_pin(NULL, NULL, &pin) == LSP_PIN_NONE,
+           "no keys at all pins nothing");
+    ASSERT(pin == NULL, "no pin without any key");
+
+    /* Configured key, matching advertisement: the configured key is pinned. */
+    pin = NULL;
+    ASSERT(lsp_wellknown_select_pin(operator_key, operator_key_upper, &pin)
+               == LSP_PIN_CONFIGURED,
+           "matching advertisement (any hex case) is accepted");
+    ASSERT(pin == operator_key, "the configured key is the pin");
+
+    /* Configured key, nothing advertised (no --lsp lookup). */
+    pin = NULL;
+    ASSERT(lsp_wellknown_select_pin(operator_key, NULL, &pin) == LSP_PIN_CONFIGURED,
+           "configured key pins without a lookup");
+    ASSERT(pin == operator_key, "the configured key is the pin");
+
+    /* Configured key, different advertisement: reported, and the advertised
+       key is still not handed out. */
+    pin = other_key;
+    ASSERT(lsp_wellknown_select_pin(operator_key, other_key, &pin) == LSP_PIN_MISMATCH,
+           "differing advertisement is a mismatch");
+    ASSERT(pin == NULL, "no pin on mismatch");
+
+    /* pin_out is optional. */
+    ASSERT(lsp_wellknown_select_pin(NULL, other_key, NULL) == LSP_PIN_NONE,
+           "NULL pin_out is accepted");
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 6: the client's start-up resolution of the LSP endpoint and pin
+ *
+ * Runs the function the client calls at start-up against a local well-known
+ * server whose response advertises TEST_CFG.pubkey_hex.  The advertised key
+ * must never end up pinned and must never satisfy the pin requirement.
+ * ----------------------------------------------------------------------- */
+int test_client_endpoint_resolution(void) {
+    const char *other_key =
+        "03ffc123def456abc123def456abc123def456abc123def456abc123def456ab0102";
+
+    uint16_t test_port = 0;
+    int server = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &test_port);
+    ASSERT(server > 0 && test_port != 0, "well-known test server starts");
+    usleep(150000);
+
+    lsp_endpoint_t no_key_required, no_key_optional, mismatch, match;
+    lsp_endpoint_status_t st_required = lsp_wellknown_resolve_endpoint(
+        "127.0.0.1", test_port, "ignored.example", 1, NULL, 1, &no_key_required);
+    lsp_endpoint_status_t st_optional = lsp_wellknown_resolve_endpoint(
+        "127.0.0.1", test_port, "ignored.example", 1, NULL, 0, &no_key_optional);
+    lsp_endpoint_status_t st_mismatch = lsp_wellknown_resolve_endpoint(
+        "127.0.0.1", test_port, "ignored.example", 1, other_key, 1, &mismatch);
+    lsp_endpoint_status_t st_match = lsp_wellknown_resolve_endpoint(
+        "127.0.0.1", test_port, "ignored.example", 1, TEST_CFG.pubkey_hex, 1, &match);
+    stop_server(server);
+
+    /* Lookup without --lsp-pubkey where a pin is required: refused, although
+       the response carries a key. */
+    ASSERT(st_required == LSP_ENDPOINT_PIN_REQUIRED,
+           "advertised key does not satisfy the pin requirement");
+    ASSERT(no_key_required.pinned_pubkey_hex == NULL, "nothing pinned");
+    ASSERT(strcmp(no_key_required.advertised_pubkey_hex, TEST_CFG.pubkey_hex) == 0,
+           "advertised key is reported for display");
+
+    /* Same lookup where no pin is required (regtest): allowed, still unpinned. */
+    ASSERT(st_optional == LSP_ENDPOINT_OK, "no pin required: lookup alone is enough");
+    ASSERT(no_key_optional.pinned_pubkey_hex == NULL, "advertised key is not pinned");
+    ASSERT(strcmp(no_key_optional.host, TEST_CFG.host) == 0, "host from the lookup");
+    ASSERT(no_key_optional.port == TEST_CFG.bolt8_port, "port from the lookup");
+
+    /* --lsp-pubkey differs from the advertised key. */
+    ASSERT(st_mismatch == LSP_ENDPOINT_PIN_MISMATCH, "mismatch is refused");
+    ASSERT(mismatch.pinned_pubkey_hex == NULL, "nothing pinned on mismatch");
+
+    /* --lsp-pubkey equals the advertised key: the operator's key is pinned. */
+    ASSERT(st_match == LSP_ENDPOINT_OK, "matching key is accepted");
+    ASSERT(match.pinned_pubkey_hex == TEST_CFG.pubkey_hex, "the configured key is pinned");
+    ASSERT(strcmp(match.host, TEST_CFG.host) == 0, "host from the lookup");
+
+    /* The server is gone now: the lookup fails and yields nothing. */
+    lsp_endpoint_t failed;
+    ASSERT(lsp_wellknown_resolve_endpoint("127.0.0.1", test_port, "h", 1,
+                                          TEST_CFG.pubkey_hex, 1, &failed)
+               == LSP_ENDPOINT_FETCH_FAILED,
+           "failed lookup is reported");
+    ASSERT(failed.pinned_pubkey_hex == NULL && failed.host[0] == '\0',
+           "no endpoint from a failed lookup");
+
+    /* No lookup (--host/--port): the endpoint is passed through. */
+    lsp_endpoint_t direct;
+    ASSERT(lsp_wellknown_resolve_endpoint(NULL, 80, "lsp.example.org", 9735,
+                                          other_key, 1, &direct) == LSP_ENDPOINT_OK,
+           "direct endpoint with a configured key");
+    ASSERT(strcmp(direct.host, "lsp.example.org") == 0 && direct.port == 9735,
+           "host and port passed through");
+    ASSERT(direct.pinned_pubkey_hex == other_key, "configured key pinned");
+    ASSERT(direct.advertised_pubkey_hex[0] == '\0', "nothing advertised");
+
+    ASSERT(lsp_wellknown_resolve_endpoint(NULL, 80, "lsp.example.org", 9735,
+                                          NULL, 1, &direct) == LSP_ENDPOINT_PIN_REQUIRED,
+           "direct endpoint without a key where one is required");
+    ASSERT(lsp_wellknown_resolve_endpoint(NULL, 80, "127.0.0.1", 9735,
+                                          NULL, 0, &direct) == LSP_ENDPOINT_OK,
+           "direct endpoint without a key where none is required");
+    ASSERT(direct.pinned_pubkey_hex == NULL, "nothing pinned");
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * Test 7: server start-up on a fixed port and on a free port
+ * ----------------------------------------------------------------------- */
+int test_wellknown_serve_fork_ports(void) {
+    ASSERT(lsp_wellknown_serve_fork(&TEST_CFG, 0) == 0, "port 0 is not a fixed port");
+    ASSERT(lsp_wellknown_serve_fork_any_port(&TEST_CFG, NULL) == 0, "port out is required");
+    ASSERT(lsp_wellknown_serve_fork_any_port(NULL, &(uint16_t){0}) == 0, "cfg is required");
+
+    uint16_t port_a = 0, port_b = 0;
+    int server_a = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &port_a);
+    int server_b = lsp_wellknown_serve_fork_any_port(&TEST_CFG, &port_b);
+    stop_server(server_a);
+    stop_server(server_b);
+
+    ASSERT(server_a > 0 && server_b > 0, "two servers start");
+    ASSERT(port_a != 0 && port_b != 0 && port_a != port_b, "each on its own port");
     return 1;
 }

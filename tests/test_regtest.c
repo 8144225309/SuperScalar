@@ -221,6 +221,11 @@ static int build_and_broadcast_state_tx(
     }
 
     char *tx_hex = (char *)malloc(signed_buf.len * 2 + 1);
+    if (!tx_hex) {
+        tx_buf_free(&unsigned_buf);
+        tx_buf_free(&signed_buf);
+        return 0;
+    }
     hex_encode(signed_buf.data, signed_buf.len, tx_hex);
 
     int ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
@@ -502,6 +507,7 @@ int test_regtest_musig_onchain(void) {
                 "finalize signed tx");
 
     char *tx_hex = (char *)malloc(signed_buf.len * 2 + 1);
+    TEST_ASSERT(tx_hex, "alloc tx hex");
     hex_encode(signed_buf.data, signed_buf.len, tx_hex);
 
     char txid_out[65];
