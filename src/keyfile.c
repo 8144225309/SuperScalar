@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -100,34 +101,80 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
     return keyfile_write(path, seckey32, passphrase, 1);
 }
 
+typedef enum {
+    LOAD_OK = 0,
+    LOAD_FAILED,        /* missing, unreadable, not a keyfile, wrong passphrase */
+    LOAD_INSECURE_MODE  /* a keyfile, but readable by every user: not used */
+} load_result_t;
+
+static load_result_t keyfile_decrypt(const unsigned char *buf, size_t n,
+                                     unsigned char *seckey32_out,
+                                     const char *passphrase);
+
+static load_result_t keyfile_load_checked(const char *path,
+                                          unsigned char *seckey32_out,
+                                          const char *passphrase) {
+    if (!path || !seckey32_out || !passphrase) return LOAD_FAILED;
+
+    int via_symlink = 0;
+    int fd = secure_file_open_read(path, &via_symlink);
+    if (fd < 0) return LOAD_FAILED;
+
+    /* Read one byte more than a keyfile holds, to see where the file ends. */
+    unsigned char buf[KEYFILE_SIZE_V2 + 1];
+    size_t n = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf + n, sizeof(buf) - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (n == sizeof(buf)) break;
+    }
+
+    int is_keyfile = (n == KEYFILE_SIZE_V2 && memcmp(buf, KEYFILE_MAGIC, 4) == 0) ||
+                     n == KEYFILE_SIZE_V1;
+    if (!is_keyfile) {
+        /* Not a keyfile: its permissions are none of our business. */
+        close(fd);
+        secure_zero(buf, sizeof(buf));
+        return LOAD_FAILED;
+    }
+
+    /* The key must not be readable by other users.  Where the file is ours
+       to change it is tightened to 0600.  Where it is not (another owner, a
+       read-only mount, a link):
+         - group access is accepted with a warning: that is how a key is
+           shared with a service account;
+         - world access is refused: the key is not used. */
+    struct stat st;
+    unsigned mode = fstat(fd, &st) == 0 ? (unsigned)(st.st_mode & 0777) : 0;
+    secure_file_access_t access = secure_file_restrict(fd, path, via_symlink);
+    close(fd);
+    if (access == SECURE_FILE_WORLD_ACCESSIBLE) {
+        fprintf(stderr,
+            "Error: keyfile %s is readable by every user on this host (mode 0%o)\n"
+            "  and its mode could not be changed, so it is not used.\n"
+            "  As the file's owner run: chmod 600 %s\n"
+            "  (for a mounted secret, set the mount's file mode to 0400 or 0440).\n",
+            path, mode, path);
+        secure_zero(buf, sizeof(buf));
+        return LOAD_INSECURE_MODE;
+    }
+
+    load_result_t result = keyfile_decrypt(buf, n, seckey32_out, passphrase);
+    secure_zero(buf, sizeof(buf));
+    return result;
+}
+
 int keyfile_load(const char *path, unsigned char *seckey32_out,
                  const char *passphrase) {
-    if (!path || !seckey32_out || !passphrase) return 0;
+    return keyfile_load_checked(path, seckey32_out, passphrase) == LOAD_OK;
+}
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
-
-    /* The key must not be readable by anyone else.  A keyfile found with
-       group or world access is tightened to 0600 (with a warning); if that is
-       not possible the key is not used. */
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-        !secure_file_make_private(fd, path)) {
-        close(fd);
-        return 0;
-    }
-
-    FILE *fp = fdopen(fd, "rb");
-    if (!fp) {
-        close(fd);
-        return 0;
-    }
-
-    /* Read up to v2 size to detect format */
-    unsigned char buf[KEYFILE_SIZE_V2];
-    size_t n = fread(buf, 1, KEYFILE_SIZE_V2, fp);
-    fclose(fp);
-
+/* Decrypt the content of a recognised keyfile (v1 or v2). */
+static load_result_t keyfile_decrypt(const unsigned char *buf, size_t n,
+                                     unsigned char *seckey32_out,
+                                     const char *passphrase) {
     if (n == KEYFILE_SIZE_V2 && memcmp(buf, KEYFILE_MAGIC, 4) == 0) {
         /* v2 format */
         uint32_t iters = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
@@ -139,13 +186,13 @@ int keyfile_load(const char *path, unsigned char *seckey32_out,
 
         unsigned char enc_key[32];
         if (!derive_key_v2(enc_key, passphrase, salt, 16, (int)iters)) {
-            return 0;
+            return LOAD_FAILED;
         }
 
         int ok = aead_decrypt(seckey32_out, ciphertext, 32, tag,
                                NULL, 0, enc_key, nonce);
         secure_zero(enc_key, 32);
-        return ok ? 1 : 0;
+        return ok ? LOAD_OK : LOAD_FAILED;
     }
 
     if (n == KEYFILE_SIZE_V1) {
@@ -160,10 +207,10 @@ int keyfile_load(const char *path, unsigned char *seckey32_out,
         int ok = aead_decrypt(seckey32_out, ciphertext, 32, tag,
                                NULL, 0, enc_key, nonce);
         secure_zero(enc_key, 32);
-        return ok ? 1 : 0;
+        return ok ? LOAD_OK : LOAD_FAILED;
     }
 
-    return 0; /* unknown format */
+    return LOAD_FAILED; /* unknown format */
 }
 
 int keyfile_generate(const char *path, unsigned char *seckey32_out,
@@ -214,8 +261,11 @@ keyfile_open_result_t keyfile_load_or_generate(const char *path,
         return KEYFILE_OPEN_GENERATE_FAILED;
 
     if (keyfile_exists(path)) {
-        return keyfile_load(path, seckey32_out, passphrase)
-                   ? KEYFILE_OPEN_LOADED : KEYFILE_OPEN_LOAD_FAILED;
+        switch (keyfile_load_checked(path, seckey32_out, passphrase)) {
+        case LOAD_OK:            return KEYFILE_OPEN_LOADED;
+        case LOAD_INSECURE_MODE: return KEYFILE_OPEN_INSECURE_MODE;
+        default:                 return KEYFILE_OPEN_LOAD_FAILED;
+        }
     }
 
     return keyfile_generate(path, seckey32_out, passphrase, ctx)

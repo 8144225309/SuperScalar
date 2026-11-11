@@ -166,20 +166,57 @@ int secure_file_write_atomic(const char *path, const unsigned char *data,
     return secure_file_commit(staged, path, replace);
 }
 
-int secure_file_make_private(int fd, const char *path) {
+int secure_file_open_read(const char *path, int *via_symlink_out) {
+    if (via_symlink_out) *via_symlink_out = 0;
+    if (!path) return -1;
+
+    /* O_NONBLOCK: opening a FIFO must not wait for a writer. */
+    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+    int fd = open(path, flags | O_NOFOLLOW);
+    if (fd < 0) {
+        struct stat lst;
+        if (lstat(path, &lst) != 0 || !S_ISLNK(lst.st_mode)) return -1;
+        fd = open(path, flags);
+        if (fd < 0) return -1;
+        if (via_symlink_out) *via_symlink_out = 1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+secure_file_access_t secure_file_restrict(int fd, const char *path, int via_symlink) {
     const char *name = path ? path : "(file)";
     struct stat st;
-    if (fstat(fd, &st) != 0) return 0;
-    if ((st.st_mode & (S_IRWXG | S_IRWXO)) == 0) return 1;
-
-    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
-        fprintf(stderr, "WARNING - %s is group/world-accessible (mode 0%o) and "
-                "could not be changed to 0600.\n",
-                name, (unsigned)(st.st_mode & 0777));
-        return 0;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "WARNING - cannot check the permissions of %s.\n", name);
+        return SECURE_FILE_WORLD_ACCESSIBLE;
     }
-    fprintf(stderr, "WARNING - %s was group/world-accessible (mode 0%o); "
-            "tightened to 0600. If this host is shared, treat its content as "
-            "exposed.\n", name, (unsigned)(st.st_mode & 0777));
-    return 1;
+
+    unsigned mode = (unsigned)(st.st_mode & 0777);
+    if ((mode & (S_IRWXG | S_IRWXO)) == 0) return SECURE_FILE_PRIVATE;
+
+    const char *why_not = NULL;
+    if (!S_ISREG(st.st_mode))          why_not = "it is not a regular file";
+    else if (via_symlink)              why_not = "it is reached through a symbolic link";
+    else if (st.st_uid != geteuid())   why_not = "it is owned by another user";
+    else if (st.st_nlink != 1)         why_not = "it has more than one hard link";
+    else if (fchmod(fd, S_IRUSR | S_IWUSR) != 0)
+                                       why_not = "its mode could not be changed";
+
+    if (!why_not) {
+        fprintf(stderr, "WARNING - %s was group/world-accessible (mode 0%o); "
+                "tightened to 0600. If this host is shared, treat its content as "
+                "exposed.\n", name, mode);
+        return SECURE_FILE_PRIVATE;
+    }
+
+    int world = (mode & S_IRWXO) != 0;
+    fprintf(stderr, "WARNING - %s is %s-accessible (mode 0%o) and was left "
+            "unchanged: %s.\n", name, world ? "world" : "group", mode, why_not);
+    return world ? SECURE_FILE_WORLD_ACCESSIBLE : SECURE_FILE_GROUP_ACCESSIBLE;
 }

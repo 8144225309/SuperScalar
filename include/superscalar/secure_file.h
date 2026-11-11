@@ -47,11 +47,36 @@ char *secure_file_stage(const char *path, const unsigned char *data, size_t len)
 int secure_file_commit(char *staged, const char *path, int replace);
 void secure_file_discard(char *staged);
 
-/* Make an open file owner-only.  If the file is accessible to group or others
-   it is changed to mode 0600 and a warning naming path is printed, since its
-   content may already have been read by others.
-   Returns 1 if the file is owner-only on return, 0 if it is not (the mode
-   could not be read or changed). */
-int secure_file_make_private(int fd, const char *path);
+/*
+ * Reading files that hold secrets.
+ */
+
+/* Open a secret file for reading.  Only a regular file is opened; a FIFO or
+   device at the path is refused without blocking.  A symbolic link is
+   followed (a key or backup may legitimately be reached through one) and
+   *via_symlink_out is set to 1 in that case, 0 otherwise.
+   Returns a close-on-exec descriptor, or -1. */
+int secure_file_open_read(const char *path, int *via_symlink_out);
+
+/* Who, besides the owner, can still access a file after secure_file_restrict(). */
+typedef enum {
+    SECURE_FILE_PRIVATE = 0,       /* nobody (already, or tightened just now) */
+    SECURE_FILE_GROUP_ACCESSIBLE,  /* its group; left as it was */
+    SECURE_FILE_WORLD_ACCESSIBLE   /* everyone; left as it was */
+} secure_file_access_t;
+
+/* Make an open secret file owner-only where that is ours to do.
+
+   A file that group or others can access is changed to mode 0600 only if it
+   is a regular file, owned by the calling user, with a single hard link, and
+   was not reached through a symbolic link (pass the via_symlink value from
+   secure_file_open_read).  Anything else is left exactly as it is: it may be
+   another user's file, a file deliberately shared with a group, or a
+   different file that a link points at.
+
+   A warning naming path is printed whenever the file was tightened or was
+   left accessible to others.  The return value says what access remains; the
+   caller decides whether that is acceptable. */
+secure_file_access_t secure_file_restrict(int fd, const char *path, int via_symlink);
 
 #endif /* SUPERSCALAR_SECURE_FILE_H */

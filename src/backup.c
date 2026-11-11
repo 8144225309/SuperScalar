@@ -1,10 +1,12 @@
 #include "superscalar/backup.h"
 #include "superscalar/crypto_aead.h"
+#include "superscalar/keyfile.h"
 #include "superscalar/secure_file.h"
 #include "superscalar/types.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,16 +18,35 @@ extern void hkdf_extract(unsigned char prk[32], const unsigned char *salt, size_
 extern void hkdf_expand(unsigned char *okm, size_t okm_len, const unsigned char prk[32],
                          const unsigned char *info, size_t info_len);
 
-/* Tighten a keyfile or backup that is accessible to group or others to mode
-   0600, with a warning.  Best effort: a backup may sit on read-only media, and
-   being unable to change its mode must not stop a restore. */
-static void tighten_secret_file(const char *path) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
+/* Read a whole regular file from an open descriptor into a malloc'd buffer.
+   Caller frees.  Returns NULL on error. */
+static unsigned char *read_fd(int fd, size_t *len_out) {
     struct stat st;
-    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
-        (void)secure_file_make_private(fd, path);
-    close(fd);
+    if (fstat(fd, &st) != 0 || st.st_size < 0 ||
+        st.st_size > 100 * 1024 * 1024)  /* 100MB sanity limit */
+        return NULL;
+
+    size_t size = (size_t)st.st_size;
+    unsigned char *buf = malloc(size ? size : 1);
+    if (!buf) return NULL;
+
+    size_t n = 0;
+    while (n < size) {
+        ssize_t r = read(fd, buf + n, size - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    if (n != size) { free(buf); return NULL; }
+
+    *len_out = size;
+    return buf;
+}
+
+/* Does this look like a keyfile (v1 or v2)? */
+static int is_keyfile_content(const unsigned char *data, size_t len) {
+    return len == KEYFILE_SIZE_V1 ||
+           (len == KEYFILE_SIZE_V2 && memcmp(data, KEYFILE_MAGIC, 4) == 0);
 }
 
 /* Read entire file into malloc'd buffer. Caller frees. Returns NULL on error. */
@@ -102,8 +123,16 @@ int backup_create(const char *db_path, const char *keyfile_path,
     unsigned char *db_data = read_file(db_path, &db_len);
     if (!db_data) return 0;
 
-    tighten_secret_file(keyfile_path);
-    unsigned char *kf_data = read_file(keyfile_path, &kf_len);
+    /* The keyfile is read from the descriptor whose permissions are checked.
+       A keyfile left group/world-accessible is tightened where that is ours
+       to do (see secure_file_restrict); either way the backup goes ahead. */
+    int kf_via_symlink = 0;
+    int kf_fd = secure_file_open_read(keyfile_path, &kf_via_symlink);
+    if (kf_fd < 0) { free(db_data); return 0; }
+    unsigned char *kf_data = read_fd(kf_fd, &kf_len);
+    if (kf_data && is_keyfile_content(kf_data, kf_len))
+        (void)secure_file_restrict(kf_fd, keyfile_path, kf_via_symlink);
+    close(kf_fd);
     if (!kf_data) { free(db_data); return 0; }
 
     /* Build plaintext: [db_len:4][db_data][kf_len:4][kf_data] */
@@ -197,10 +226,14 @@ static unsigned char *backup_decrypt(const char *backup_path,
     if (!backup_path || !passphrase || !passphrase_len)
         return NULL;
 
-    tighten_secret_file(backup_path);
+    /* One descriptor is opened, read, and (once the content is known to be a
+       backup) has its permissions checked. */
+    int via_symlink = 0;
+    int fd = secure_file_open_read(backup_path, &via_symlink);
+    if (fd < 0) return NULL;
     size_t file_len = 0;
-    unsigned char *file_data = read_file(backup_path, &file_len);
-    if (!file_data) return NULL;
+    unsigned char *file_data = read_fd(fd, &file_len);
+    if (!file_data) { close(fd); return NULL; }
 
     /* Determine format by magic bytes */
     int is_v2 = 0;
@@ -214,6 +247,7 @@ static unsigned char *backup_decrypt(const char *backup_path,
 
     /* Validate minimum size */
     if (file_len < hdr_len + BACKUP_TAG_LEN) {
+        close(fd);
         free(file_data);
         return NULL;
     }
@@ -222,10 +256,17 @@ static unsigned char *backup_decrypt(const char *backup_path,
     if (!is_v2) {
         if (memcmp(file_data, BACKUP_MAGIC_V1, BACKUP_MAGIC_LEN) != 0 ||
             file_data[BACKUP_MAGIC_LEN] != BACKUP_VERSION_V1) {
+            close(fd);
             free(file_data);
             return NULL;
         }
     }
+
+    /* It is a backup.  One left group/world-accessible is tightened where
+       that is ours to do; where it is not (read-only media, another owner, a
+       link) it is still read. */
+    (void)secure_file_restrict(fd, backup_path, via_symlink);
+    close(fd);
 
     const unsigned char *salt;
     const unsigned char *nonce_ptr;

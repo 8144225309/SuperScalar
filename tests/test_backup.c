@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "superscalar/backup.h"
 
 #define TEST_ASSERT(cond, msg) do { \
@@ -520,7 +521,8 @@ int test_backup_read_tightens_mode(void) {
     const char *rest_kf = "/tmp/test_bak_loose_rest_kf.key";
 
     static const unsigned char db_data[] = "loose mode test database";
-    static const unsigned char kf_data[] = "loose mode test keyfile";
+    /* Sized like a keyfile: only a file that looks like one is tightened. */
+    static const unsigned char kf_data[61] = "loose mode test keyfile";
     const unsigned char *pass = (const unsigned char *)"loose-pass";
     size_t pass_len = strlen((const char *)pass);
 
@@ -547,5 +549,69 @@ int test_backup_read_tightens_mode(void) {
     remove(bak_path);
     remove(rest_db);
     remove(rest_kf);
+    return 1;
+}
+
+/* Reading a "backup" must never change the mode of some other file: not the
+   file a link at the backup path points to, not a hard-linked file, and not a
+   file that is not a backup at all. */
+int test_backup_read_leaves_other_files_alone(void) {
+    const char *db_path = "/tmp/test_bak_other_db.sqlite";
+    const char *kf_path = "/tmp/test_bak_other_kf.key";
+    const char *bak_path = "/tmp/test_bak_other.bak";
+    const char *victim = "/tmp/test_bak_other_victim.bin";
+    const char *link_path = "/tmp/test_bak_other_link.bak";
+    const char *hard = "/tmp/test_bak_other_hard.bak";
+
+    static const unsigned char db_data[] = "other files test database";
+    static const unsigned char kf_data[] = "other files test keyfile";
+    static const unsigned char victim_data[200] = "not a backup";
+    const unsigned char *pass = (const unsigned char *)"other-pass";
+    size_t pass_len = strlen((const char *)pass);
+
+    remove(bak_path);
+    remove(victim);
+    remove(link_path);
+    remove(hard);
+    TEST_ASSERT(write_test_file(db_path, db_data, sizeof(db_data) - 1), "write db");
+    TEST_ASSERT(write_test_file(kf_path, kf_data, sizeof(kf_data) - 1), "write kf");
+    TEST_ASSERT(chmod(kf_path, 0644) == 0, "source mode");
+    TEST_ASSERT(backup_create(db_path, kf_path, bak_path, pass, pass_len), "backup_create");
+    TEST_ASSERT(file_mode(kf_path) == 0644,
+                "a source file that is not a keyfile keeps its mode");
+    TEST_ASSERT(write_test_file(victim, victim_data, sizeof(victim_data)), "write victim");
+
+    /* The backup path is a link to an unrelated setuid file. */
+    TEST_ASSERT(chmod(victim, 04755) == 0, "setuid mode");
+    TEST_ASSERT(symlink(victim, link_path) == 0, "symlink to victim");
+    TEST_ASSERT(!backup_verify(link_path, pass, pass_len), "not a backup");
+    TEST_ASSERT(file_mode(victim) == 04755, "link target's mode untouched");
+    remove(link_path);
+
+    /* The same file named directly: still not a backup, still untouched. */
+    TEST_ASSERT(!backup_verify(victim, pass, pass_len), "not a backup");
+    TEST_ASSERT(file_mode(victim) == 04755, "non-backup file's mode untouched");
+
+    /* A real backup behind a link is read, and its mode is left alone. */
+    TEST_ASSERT(chmod(bak_path, 0644) == 0, "loosen backup");
+    TEST_ASSERT(symlink(bak_path, link_path) == 0, "symlink to backup");
+    TEST_ASSERT(backup_verify(link_path, pass, pass_len), "backup behind a link verifies");
+    TEST_ASSERT(file_mode(bak_path) == 0644, "backup behind a link keeps its mode");
+
+    /* A real backup with a second hard link: read, mode left alone. */
+    TEST_ASSERT(link(bak_path, hard) == 0, "hard link");
+    TEST_ASSERT(backup_verify(bak_path, pass, pass_len), "hard-linked backup verifies");
+    TEST_ASSERT(file_mode(bak_path) == 0644, "hard-linked backup keeps its mode");
+    remove(hard);
+
+    /* Named directly with one link, it is ours to tighten. */
+    TEST_ASSERT(backup_verify(bak_path, pass, pass_len), "backup verifies");
+    TEST_ASSERT(file_mode(bak_path) == 0600, "plain backup is tightened");
+
+    remove(db_path);
+    remove(kf_path);
+    remove(bak_path);
+    remove(victim);
+    remove(link_path);
     return 1;
 }

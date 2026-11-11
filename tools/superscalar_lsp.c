@@ -2797,6 +2797,11 @@ int main(int argc, char *argv[]) {
                 "  move the file away first.\n", keyfile_path);
             secp256k1_context_destroy(ctx);
             return 1;
+        case KEYFILE_OPEN_INSECURE_MODE:
+            fprintf(stderr, "Error: refusing to start with keyfile %s: its permissions\n"
+                "  let every user read it (details above).\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
         default:
             fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
             secp256k1_context_destroy(ctx);

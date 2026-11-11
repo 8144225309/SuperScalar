@@ -41,10 +41,13 @@ int backup_create(const char *db_path, const char *keyfile_path,
 /* Verify backup integrity without extracting.
    Returns 1 if valid, 0 on error or corrupt.
 
-   Reading a backup (verify or restore) and reading the keyfile for a new
-   backup tighten a file that is accessible to group or others to mode 0600,
-   with a warning on stderr.  This is best effort: a backup that cannot be
-   changed (read-only media) is still read. */
+   Permissions: when a backup is read (verify or restore), and when the
+   keyfile is read for a new backup, a file that group or others can access
+   is tightened to mode 0600, with a warning on stderr.  That happens only
+   once the content is recognised as a backup (or keyfile), and only if it is
+   a regular file owned by the caller with one hard link that is not reached
+   through a symbolic link.  Anything else is left as it is, with a warning,
+   and is still read: a backup on read-only media can be restored. */
 int backup_verify(const char *backup_path, const unsigned char *passphrase,
                   size_t passphrase_len);
 

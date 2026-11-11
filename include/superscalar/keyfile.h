@@ -21,8 +21,15 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
                  const char *passphrase);
 
 /* Load secret key from encrypted file (auto-detects v1 or v2).
-   A keyfile that is accessible to group or others is tightened to mode 0600
-   first, with a warning on stderr; if it cannot be tightened the load fails. */
+
+   Permissions: a keyfile that group or others can access is tightened to mode
+   0600, with a warning on stderr, if it is a regular file owned by the caller
+   with one hard link and is not reached through a symbolic link.  Otherwise
+   its mode is left alone, and then
+     - a keyfile that only its group can access is used, with a warning;
+     - a keyfile that every user can access is not used: the load fails and
+       an error naming the mode and the fix is printed.
+   A file that is not a keyfile is never touched. */
 int keyfile_load(const char *path, unsigned char *seckey32_out,
                  const char *passphrase);
 
@@ -40,6 +47,9 @@ typedef enum {
     KEYFILE_OPEN_LOAD_FAILED,      /* a file is there but could not be loaded
                                       (wrong passphrase, corrupt, unreadable);
                                       it is left untouched */
+    KEYFILE_OPEN_INSECURE_MODE,    /* the keyfile is readable by every user and
+                                      its mode could not be changed; it was not
+                                      used (keyfile_load printed the details) */
     KEYFILE_OPEN_GENERATE_FAILED   /* no file at path and creating one failed */
 } keyfile_open_result_t;
 

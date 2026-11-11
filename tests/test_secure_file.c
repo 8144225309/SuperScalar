@@ -238,32 +238,114 @@ int test_secure_file_removes_stale_temporaries(void) {
     return fresh_dir() && rmdir(SF_DIR) == 0;
 }
 
-/* An open file that others can access is tightened to 0600; one that is
-   already owner-only is left alone. */
-int test_secure_file_make_private(void) {
-    const char *path = SF_DIR "/file";
+/* Only a regular file is opened for reading; a link is followed and
+   reported. */
+int test_secure_file_open_read(void) {
+    const char *file = SF_DIR "/file", *link_path = SF_DIR "/link";
+    const char *dangling = SF_DIR "/dangling", *fifo = SF_DIR "/fifo";
+    TEST_ASSERT(fresh_dir(), "scratch dir");
+    TEST_ASSERT(put(file, OLD_DATA, OLD_LEN), "file");
+    TEST_ASSERT(symlink(file, link_path) == 0, "symlink");
+    TEST_ASSERT(symlink(SF_DIR "/missing", dangling) == 0, "dangling symlink");
+    TEST_ASSERT(mkfifo(fifo, 0644) == 0, "fifo");
+
+    int via = -1;
+    int fd = secure_file_open_read(file, &via);
+    TEST_ASSERT(fd >= 0 && via == 0, "regular file opens, not through a link");
+    close(fd);
+
+    via = -1;
+    fd = secure_file_open_read(link_path, &via);
+    TEST_ASSERT(fd >= 0 && via == 1, "a link to a file opens and is reported");
+    close(fd);
+
+    TEST_ASSERT(secure_file_open_read(dangling, &via) < 0, "dangling link");
+    TEST_ASSERT(secure_file_open_read(SF_DIR "/missing", &via) < 0, "missing file");
+    TEST_ASSERT(secure_file_open_read(SF_DIR, &via) < 0, "a directory is not opened");
+    /* Must return at once: a FIFO without a writer would block a plain open. */
+    TEST_ASSERT(secure_file_open_read(fifo, &via) < 0, "a FIFO is not opened");
+    TEST_ASSERT(secure_file_open_read(NULL, &via) < 0, "NULL path");
+    fd = secure_file_open_read(file, NULL);
+    TEST_ASSERT(fd >= 0, "via_symlink_out is optional");
+    close(fd);
+    return fresh_dir() && rmdir(SF_DIR) == 0;
+}
+
+/* A file that others can access is tightened to 0600 when it is ours to
+   change, and is otherwise left exactly as it is. */
+int test_secure_file_restrict(void) {
+    const char *path = SF_DIR "/file", *hard = SF_DIR "/hardlink";
+    const char *fifo = SF_DIR "/fifo";
     TEST_ASSERT(fresh_dir(), "scratch dir");
     TEST_ASSERT(put(path, OLD_DATA, OLD_LEN), "file");
 
+    /* Ours, regular, one link, opened directly: tightened. */
     static const int loose_modes[] = { 0644, 0640, 0604, 0660, 0666, 0755 };
     for (size_t i = 0; i < sizeof(loose_modes) / sizeof(loose_modes[0]); i++) {
         TEST_ASSERT(chmod(path, (mode_t)loose_modes[i]) == 0, "loosen");
         int fd = open(path, O_RDONLY);
         TEST_ASSERT(fd >= 0, "open");
-        int result = secure_file_make_private(fd, path);
+        secure_file_access_t access = secure_file_restrict(fd, path, 0);
         close(fd);
-        TEST_ASSERT(result == 1, "tightening succeeds");
+        TEST_ASSERT(access == SECURE_FILE_PRIVATE, "tightened");
         TEST_ASSERT(file_mode(path) == 0600, "mode is 0600 afterwards");
     }
 
+    /* Already owner-only: nothing changes. */
     TEST_ASSERT(chmod(path, 0400) == 0, "owner read-only");
     int fd = open(path, O_RDONLY);
     TEST_ASSERT(fd >= 0, "open");
-    TEST_ASSERT(secure_file_make_private(fd, path) == 1, "already private");
+    TEST_ASSERT(secure_file_restrict(fd, path, 0) == SECURE_FILE_PRIVATE, "already private");
     close(fd);
     TEST_ASSERT(file_mode(path) == 0400, "an owner-only mode is not changed");
 
-    TEST_ASSERT(secure_file_make_private(-1, path) == 0, "bad descriptor is an error");
+    /* Reached through a symbolic link: left alone, whatever its mode. */
+    TEST_ASSERT(chmod(path, 04755) == 0, "setuid mode");
+    fd = open(path, O_RDONLY);
+    TEST_ASSERT(fd >= 0, "open");
+    TEST_ASSERT(secure_file_restrict(fd, path, 1) == SECURE_FILE_WORLD_ACCESSIBLE,
+                "world access reported for a file behind a link");
+    TEST_ASSERT(file_mode(path) == 04755, "mode behind a link untouched");
+    TEST_ASSERT(chmod(path, 0640) == 0, "group mode");
+    TEST_ASSERT(secure_file_restrict(fd, path, 1) == SECURE_FILE_GROUP_ACCESSIBLE,
+                "group access reported for a file behind a link");
+    TEST_ASSERT(file_mode(path) == 0640, "mode behind a link untouched");
+    close(fd);
+
+    /* A second hard link: the file may also be something else. */
+    TEST_ASSERT(link(path, hard) == 0, "hard link");
+    TEST_ASSERT(chmod(path, 0644) == 0, "loosen");
+    fd = open(path, O_RDONLY);
+    TEST_ASSERT(fd >= 0, "open");
+    TEST_ASSERT(secure_file_restrict(fd, path, 0) == SECURE_FILE_WORLD_ACCESSIBLE,
+                "world access reported for a hard-linked file");
+    close(fd);
+    TEST_ASSERT(file_mode(path) == 0644, "hard-linked file untouched");
+    TEST_ASSERT(unlink(hard) == 0, "remove hard link");
+
+    /* Not a regular file. */
+    TEST_ASSERT(mkfifo(fifo, 0644) == 0, "fifo");
+    fd = open(fifo, O_RDONLY | O_NONBLOCK);
+    TEST_ASSERT(fd >= 0, "open fifo");
+    TEST_ASSERT(secure_file_restrict(fd, fifo, 0) == SECURE_FILE_WORLD_ACCESSIBLE,
+                "world access reported for a FIFO");
+    close(fd);
+    TEST_ASSERT(file_mode(fifo) == 0644, "FIFO untouched");
+
+    /* Owned by another user.  Only root can set that up. */
+    if (geteuid() == 0) {
+        TEST_ASSERT(chmod(path, 0640) == 0 && chown(path, 65534, 65534) == 0,
+                    "give the file away");
+        fd = open(path, O_RDONLY);
+        TEST_ASSERT(fd >= 0, "open");
+        TEST_ASSERT(secure_file_restrict(fd, path, 0) == SECURE_FILE_GROUP_ACCESSIBLE,
+                    "another user's group-shared file is reported");
+        close(fd);
+        TEST_ASSERT(file_mode(path) == 0640, "another user's file untouched");
+    }
+
+    TEST_ASSERT(secure_file_restrict(-1, path, 0) == SECURE_FILE_WORLD_ACCESSIBLE,
+                "a file that cannot be examined is not called private");
     TEST_ASSERT(holds(path, OLD_DATA, OLD_LEN), "content untouched");
     return fresh_dir() && rmdir(SF_DIR) == 0;
 }

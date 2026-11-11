@@ -593,3 +593,82 @@ int test_keyfile_load_tightens_mode(void) {
     unlink(path);
     return 1;
 }
+
+/* A keyfile whose mode is not ours to change keeps its mode.  If only its
+   group can read it, it is used; if every user can read it, it is refused
+   with its own result, not reported as a wrong passphrase. */
+int test_keyfile_mode_not_ours_to_change(void) {
+    const char *target = "/tmp/test_keyfile_shared_target.key";
+    const char *link_path = "/tmp/test_keyfile_shared_link.key";
+    const char *hard = "/tmp/test_keyfile_shared_hard.key";
+    const char *not_a_key = "/tmp/test_keyfile_shared_other.bin";
+    unlink(target);
+    unlink(link_path);
+    unlink(hard);
+    unlink(not_a_key);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char key[32], out[32];
+    memset(key, 0x61, 32);
+    TEST_ASSERT(keyfile_save(target, key, "pw"), "save");
+    TEST_ASSERT(symlink(target, link_path) == 0, "symlink");
+
+    /* Through a link, group-readable: used, mode kept. */
+    TEST_ASSERT(chmod(target, 0640) == 0, "group-readable");
+    memset(out, 0, 32);
+    TEST_ASSERT_EQ(keyfile_load_or_generate(link_path, out, "pw", ctx),
+                   KEYFILE_OPEN_LOADED, "group-readable key behind a link is used");
+    TEST_ASSERT(memcmp(out, key, 32) == 0, "key loaded");
+    TEST_ASSERT_EQ(file_mode(target), 0640, "mode behind a link kept");
+
+    /* Through a link, world-readable: refused as such, mode kept. */
+    TEST_ASSERT(chmod(target, 0644) == 0, "world-readable");
+    memset(out, 0, 32);
+    TEST_ASSERT_EQ(keyfile_load_or_generate(link_path, out, "pw", ctx),
+                   KEYFILE_OPEN_INSECURE_MODE, "world-readable key behind a link is refused");
+    TEST_ASSERT(!keyfile_load(link_path, out, "pw"), "keyfile_load refuses it too");
+    static const unsigned char zero[32] = { 0 };
+    TEST_ASSERT(memcmp(out, zero, 32) == 0, "no key material returned");
+    TEST_ASSERT_EQ(file_mode(target), 0644, "mode behind a link kept");
+
+    /* A second hard link: same rules. */
+    TEST_ASSERT(link(target, hard) == 0, "hard link");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                   KEYFILE_OPEN_INSECURE_MODE, "world-readable hard-linked key is refused");
+    TEST_ASSERT_EQ(file_mode(target), 0644, "hard-linked file kept");
+    TEST_ASSERT(chmod(target, 0640) == 0, "group-readable");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                   KEYFILE_OPEN_LOADED, "group-readable hard-linked key is used");
+    TEST_ASSERT_EQ(file_mode(target), 0640, "hard-linked file kept");
+    TEST_ASSERT(unlink(hard) == 0, "remove hard link");
+
+    /* Owned by another user (the service-account case).  Only root can set
+       that up. */
+    if (geteuid() == 0) {
+        TEST_ASSERT(chown(target, 65534, 65534) == 0, "give the keyfile away");
+        TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                       KEYFILE_OPEN_LOADED, "another user's group-readable key is used");
+        TEST_ASSERT_EQ(file_mode(target), 0640, "another user's file kept");
+        TEST_ASSERT(chmod(target, 0644) == 0, "world-readable");
+        TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                       KEYFILE_OPEN_INSECURE_MODE, "another user's world-readable key is refused");
+        TEST_ASSERT_EQ(file_mode(target), 0644, "another user's file kept");
+    }
+
+    /* A file that is not a keyfile is not touched at all. */
+    unsigned char junk[200];
+    memset(junk, 0x5A, sizeof(junk));
+    TEST_ASSERT(spit(not_a_key, junk, sizeof(junk)), "unrelated file");
+    TEST_ASSERT(chmod(not_a_key, 04755) == 0, "setuid mode");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(not_a_key, out, "pw", ctx),
+                   KEYFILE_OPEN_LOAD_FAILED, "an unrelated file is just not a keyfile");
+    TEST_ASSERT_EQ(file_mode(not_a_key), 04755, "unrelated file's mode kept");
+
+    secp256k1_context_destroy(ctx);
+    unlink(target);
+    unlink(link_path);
+    unlink(not_a_key);
+    return 1;
+}
