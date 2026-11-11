@@ -1578,6 +1578,7 @@ int test_keyfile_wrong_passphrase(void) {
 
 int test_keyfile_generate(void) {
     const char *path = "/tmp/test_superscalar_keyfile3.dat";
+    unlink(path);
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 

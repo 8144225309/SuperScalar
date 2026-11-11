@@ -8,6 +8,7 @@
  */
 
 #include "superscalar/invoice.h"
+#include "superscalar/network.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/sha256.h"
 #include "superscalar/stateless_invoice.h"
@@ -94,7 +95,7 @@ int invoice_create(bolt11_invoice_table_t *tbl,
 
     /* Network prefix */
     const char *pfx = "bcrt";  /* default regtest */
-    if (strcmp(network, "mainnet") == 0) pfx = "bc";
+    if (network_is_mainnet(network)) pfx = "bc";
     else if (strcmp(network, "testnet") == 0) pfx = "tb";
     else if (strcmp(network, "signet") == 0)  pfx = "tbs";
     else if (strcmp(network, "testnet4") == 0) pfx = "tb";
@@ -173,7 +174,7 @@ int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
     bolt11_invoice_t inv;
     memset(&inv, 0, sizeof(inv));
     const char *pfx2 = "bcrt";
-    if (strcmp(network, "mainnet") == 0) pfx2 = "bc";
+    if (network_is_mainnet(network)) pfx2 = "bc";
     else if (strcmp(network, "testnet") == 0) pfx2 = "tb";
     else if (strcmp(network, "signet") == 0) pfx2 = "tbs";
     else if (strcmp(network, "testnet4") == 0) pfx2 = "tb";

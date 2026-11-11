@@ -1,4 +1,5 @@
 #include "superscalar/cli_arity.h"
+#include "superscalar/network.h"
 #include "superscalar/factory.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,9 +175,7 @@ int cli_validate_shape_for_bolt2016(
 int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
                                     char *err_buf, size_t err_buf_len)
 {
-    int is_mainnet = network &&
-        (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-    if (!is_mainnet) return 1;                     /* non-mainnet: always OK */
+    if (!network_is_mainnet(network)) return 1;                     /* non-mainnet: always OK */
     if (step_blocks >= CLI_ARITY_MAINNET_MIN_STEP_BLOCKS) return 1;
     cli_set_err(err_buf, err_buf_len,
         "Error: --step-blocks %u is below the mainnet safety floor of %u "

@@ -11,25 +11,64 @@
 /* v2 format: [magic "SK02":4][iters BE:4][salt:16][nonce:12][ct:32][tag:16] = 84 bytes */
 #define KEYFILE_SIZE_V2 84
 #define KEYFILE_PBKDF2_ITERATIONS 600000
+/* Iteration counts accepted when loading a keyfile.  The count comes from the
+   file, so it is bounded: a huge value would stall the loader. */
+#define KEYFILE_PBKDF2_MIN_ITERATIONS 100000
+#define KEYFILE_PBKDF2_MAX_ITERATIONS 10000000
 #define KEYFILE_MAGIC "SK02"
 
 /* Save secret key to encrypted file (always writes v2 format).
-   Derives encryption key from passphrase via PBKDF2-HMAC-SHA256 (600K iterations). */
+   Derives encryption key from passphrase via PBKDF2-HMAC-SHA256 (600K iterations).
+   The write is atomic: a file already at path is replaced only once the new
+   one is complete on disk. */
 int keyfile_save(const char *path, const unsigned char *seckey32,
                  const char *passphrase);
 
-/* Load secret key from encrypted file (auto-detects v1 or v2). */
+/* Load secret key from encrypted file (auto-detects v1 or v2).
+
+   Permissions: a keyfile that group or others can access is tightened to mode
+   0600, with a warning on stderr, if it is a regular file owned by the caller
+   with one hard link and is not reached through a symbolic link.  Otherwise
+   its mode is left alone, and then
+     - a keyfile that only its group can access is used, with a warning;
+     - a keyfile that every user can access is not used: the load fails and
+       an error naming the mode and the fix is printed.
+   A file that is not a keyfile is never touched. */
 int keyfile_load(const char *path, unsigned char *seckey32_out,
                  const char *passphrase);
 
-/* Generate random keypair and save to file (v2 format). */
+/* Generate random keypair and save to file (v2 format).
+   Fails, leaving the file untouched, if anything already exists at path. */
 int keyfile_generate(const char *path, unsigned char *seckey32_out,
                      const char *passphrase, secp256k1_context *ctx);
+
+/* Returns 0 only if there is definitely nothing at path. */
+int keyfile_exists(const char *path);
+
+typedef enum {
+    KEYFILE_OPEN_LOADED = 0,       /* existing keyfile decrypted */
+    KEYFILE_OPEN_GENERATED,        /* no file at path: new key created and saved */
+    KEYFILE_OPEN_LOAD_FAILED,      /* a file is there but could not be loaded
+                                      (wrong passphrase, corrupt, unreadable);
+                                      it is left untouched */
+    KEYFILE_OPEN_INSECURE_MODE,    /* the keyfile is readable by every user and
+                                      its mode could not be changed; it was not
+                                      used (keyfile_load printed the details) */
+    KEYFILE_OPEN_GENERATE_FAILED   /* no file at path and creating one failed */
+} keyfile_open_result_t;
+
+/* Load the key at path, or create one if nothing is there yet.  A file that
+   exists is never replaced, whether or not it can be loaded. */
+keyfile_open_result_t keyfile_load_or_generate(const char *path,
+                                               unsigned char *seckey32_out,
+                                               const char *passphrase,
+                                               secp256k1_context *ctx);
 
 /* Check if keyfile needs upgrade (returns 1 if v1 format). */
 int keyfile_needs_upgrade(const char *path);
 
-/* Generate key from HD seed and save to file (v2 format). */
+/* Generate key from HD seed and save to file (v2 format).
+   Fails, leaving the file untouched, if anything already exists at path. */
 int keyfile_generate_from_seed(const char *path, unsigned char *seckey32_out,
                                 const char *passphrase,
                                 const unsigned char *seed, size_t seed_len,
