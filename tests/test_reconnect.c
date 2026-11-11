@@ -2810,7 +2810,6 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
         secp256k1_pubkey client_pks[4];
         factory_t *factory = calloc(1, sizeof(factory_t));
         if (!factory) return 0;
-        factory_alloc_default_arrays(factory);
         lsp_t *lsp = calloc(1, sizeof(lsp_t));
         if (!lsp) { free(factory); return 0; }
         lsp_channel_mgr_t mgr;

@@ -4715,7 +4715,7 @@ int test_lsp_inbound_replay_reattaches(void) {
     TEST_ASSERT_EQ(lsp_channels_settle_bridge_origin(&mgr, hash, preimage), 0,
                    "no origin was opened for the repeat");
 
-    free(ch->htlcs);
+    channel_cleanup(ch);
     close(sv[0]); close(sv[1]);
     free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
     return 1;
@@ -4776,7 +4776,7 @@ int test_lsp_inbound_replay_restored_origin(void) {
                    MSG_BRIDGE_FAIL_HTLC, "another HTLC refused");
     TEST_ASSERT(strcmp(reason, "duplicate_payment_hash") == 0, "as a duplicate");
 
-    free(ch->htlcs);
+    channel_cleanup(ch);
     close(sv[0]); close(sv[1]);
     free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
     return 1;
@@ -5258,7 +5258,7 @@ int test_lsp_inbound_origin_table_and_rollback(void) {
     size_t dest;
     TEST_ASSERT(lsp_channels_lookup_invoice(&mgr, hash, &dest), "invoice still open");
 
-    free(ch->htlcs);
+    channel_cleanup(ch);
     close(sv[0]); close(sv[1]); close(cl[0]); close(cl[1]);
     free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
     return 1;
