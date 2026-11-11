@@ -63,6 +63,25 @@ cJSON *lsps_build_error(int id, int code, const char *message);
  */
 int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json);
 
+/*
+ * Compute the response to an LSPS request without sending it.
+ * Returns a new cJSON response object (caller must cJSON_Delete), or NULL if
+ * json is not a request.  ctx may be NULL: methods that need the channel
+ * manager then answer with an error.
+ */
+cJSON *lsps_dispatch_request(const lsps_ctx_t *ctx, const cJSON *json);
+
+/*
+ * Answer an LSPS request that arrived from an outside peer (the BOLT #8
+ * listener), on that listener's thread.  Writes the JSON-RPC response into
+ * resp_buf and returns its length (0 if nothing fits); the caller sends it
+ * back over the peer's encrypted transport.
+ * This entry point has no channel context by construction: it never touches
+ * the channel manager or a factory client's connection, and it refuses
+ * lsps2.buy with a JSON-RPC error.
+ */
+int lsps_peer_request(const char *json_req, char *resp_buf, size_t resp_cap);
+
 /* -----------------------------------------------------------------------
  * LSPS1 — Channel purchase API
  * --------------------------------------------------------------------- */

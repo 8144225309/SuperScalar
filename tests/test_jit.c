@@ -1445,3 +1445,77 @@ int test_lsps2_buy_refused_when_jit_disabled(void) {
     jit_gate_fixture_free(&fx);
     return 1;
 }
+
+/* --- LSPS requests from outside peers --- */
+
+/* Parses a JSON-RPC reply: returns the error code (0 if it is a result) and
+   the id; -1 if the reply does not parse. */
+static int peer_reply_error_code(const char *reply, int *id_out, int *has_result) {
+    cJSON *j = cJSON_Parse(reply);
+    if (!j) return -1;
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(j, "id");
+    const cJSON *err = cJSON_GetObjectItemCaseSensitive(j, "error");
+    const cJSON *code = err ? cJSON_GetObjectItemCaseSensitive(err, "code") : NULL;
+    if (id_out) *id_out = id ? (int)id->valuedouble : -1;
+    if (has_result)
+        *has_result = cJSON_GetObjectItemCaseSensitive(j, "result") != NULL;
+    int rc = code ? (int)code->valuedouble : 0;
+    cJSON_Delete(j);
+    return rc;
+}
+
+int test_lsps_peer_request_refuses_buy(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    /* Even an LSP that has opted in to JIT opens, with client 0 connected. */
+    fx.mgr.jit_enabled = 1;
+
+    char reply[2048];
+    int id = 0, has_result = 0;
+
+    cJSON *req = gate_build_lsps2_buy(77);
+    char *req_s = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    int n = lsps_peer_request(req_s, reply, sizeof(reply));
+    free(req_s);
+    TEST_ASSERT(n > 0 && (size_t)n == strlen(reply), "a reply is returned to the peer");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result),
+                   LSPS_ERR_METHOD_NOT_FOUND, "lsps2.buy from a peer is an error");
+    TEST_ASSERT_EQ(id, 77, "reply carries the request id");
+    TEST_ASSERT(!has_result, "no result, no channel id");
+    TEST_ASSERT(strstr(reply, "lsps2.buy is not available") != NULL,
+                "the refusal names the method");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200),
+                "nothing was written to factory client 0");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Read-only methods are still answered, through the reply buffer. */
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"lsps2.get_info\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "get_info is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result), 0, "get_info is not an error");
+    TEST_ASSERT(id == 5 && has_result, "get_info reply has a result");
+
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"lsps9.nope\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "unknown method is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, NULL), LSPS_ERR_METHOD_NOT_FOUND,
+                   "unknown method is method-not-found");
+
+    n = lsps_peer_request("{not json", reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "malformed JSON is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, NULL, NULL), LSPS_ERR_PARSE_ERROR,
+                   "malformed JSON is a parse error");
+
+    char tiny[8];
+    TEST_ASSERT_EQ(lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"lsps2.buy\"}",
+                                     tiny, sizeof(tiny)), 0,
+                   "a reply that does not fit is not truncated into the buffer");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50),
+                "still nothing written to factory client 0");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}

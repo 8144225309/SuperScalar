@@ -73,11 +73,11 @@ cJSON *lsps_build_error(int id, int code, const char *message)
     return resp;
 }
 
-int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
+cJSON *lsps_dispatch_request(const lsps_ctx_t *ctx, const cJSON *json)
 {
     int req_id = 0;
     const char *method = lsps_parse_request(json, &req_id);
-    if (!method) return 0;
+    if (!method) return NULL;
 
     cJSON *response = NULL;
 
@@ -204,11 +204,76 @@ int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
         response = lsps_build_error(req_id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
     }
 
+    return response;
+}
+
+int lsps_handle_request(const lsps_ctx_t *ctx, int fd, const cJSON *json)
+{
+    if (!lsps_parse_request(json, NULL)) return 0;
+
+    cJSON *response = lsps_dispatch_request(ctx, json);
     if (response) {
         wire_send(fd, MSG_LSPS_RESPONSE, response);
         cJSON_Delete(response);
     }
     return 1;
+}
+
+int lsps_peer_request(const char *json_req, char *resp_buf, size_t resp_cap)
+{
+    if (!json_req || !resp_buf || resp_cap == 0) return 0;
+
+    cJSON *resp = NULL;
+    cJSON *json = cJSON_Parse(json_req);
+    if (!json) {
+        resp = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
+    } else {
+        int id = 0;
+        const char *method = lsps_parse_request(json, &id);
+        if (!method) {
+            resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
+        } else if (strcmp(method, "lsps1_get_info") == 0) {
+            lsps1_info_t info;
+            memset(&info, 0, sizeof(info));
+            info.min_channel_balance_msat = 100000000ULL;
+            info.max_channel_balance_msat = 10000000000ULL;
+            info.min_confirmations        = 1;
+            info.base_fee_msat            = 1000;
+            info.fee_ppm                  = 500;
+            resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
+        } else if (strcmp(method, "lsps2_get_info") == 0) {
+            lsps2_fee_params_t params;
+            memset(&params, 0, sizeof(params));
+            params.min_fee_msat             = 1000;
+            params.fee_ppm                  = 500;
+            params.min_channel_balance_msat = 100000000ULL;
+            params.max_channel_balance_msat = 10000000000ULL;
+            resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
+        } else if (strcmp(method, "lsps2.buy") == 0) {
+            /* A JIT channel is opened with a factory client over that
+               client's own connection, by the channel manager's thread.  An
+               outside peer is neither, so the purchase is refused here. */
+            resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND,
+                                     "lsps2.buy is not available on this connection");
+        } else {
+            /* No channel context: nothing below can reach the channel
+               manager or a factory client's connection. */
+            resp = lsps_dispatch_request(NULL, json);
+        }
+        cJSON_Delete(json);
+    }
+
+    int written = 0;
+    if (resp) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) {
+            size_t n = strlen(s);
+            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
+            free(s);
+        }
+        cJSON_Delete(resp);
+    }
+    return written;
 }
 
 /* -----------------------------------------------------------------------

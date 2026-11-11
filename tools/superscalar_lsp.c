@@ -104,9 +104,6 @@ static bolt11_invoice_table_t g_invoice_tbl;
 /* CLTV watchdog: pointer to the active channel manager, set after each alloc */
 static lsp_channel_mgr_t *g_channel_mgr = NULL;
 
-/* LSPS0 context for bolt8_server callback */
-static lsps_ctx_t  g_lsps_ctx;
-
 /* LSPS2 JIT pending channel intercept table */
 static lsps2_pending_table_t g_lsps2_pending;
 
@@ -125,90 +122,13 @@ static void *ln_dispatch_thread(void *arg) {
     return NULL;
 }
 
-/* Gap 3: callback from ln_dispatch when JIT cost is covered.
- * Opens a JIT channel for the client then relays the pending HTLC. */
-static void on_jit_open(void *cb_ctx, uint64_t scid,
-                         uint64_t out_amount_msat,
-                         size_t in_peer_idx, uint64_t in_htlc_id)
-{
-    (void)cb_ctx; (void)in_peer_idx; (void)in_htlc_id;
-    /* SCID encodes client_idx: (0x800000 << 40) | ((client_idx+1) << 16) | block */
-    size_t client_idx = (size_t)(((scid >> 16) & 0xFFFFFF) - 1);
-
-    /* Open the JIT channel (no-op if already open) */
-    if (!jit_channel_is_active(g_channel_mgr, client_idx))
-        jit_channel_create(g_channel_mgr, g_lsp, client_idx,
-                            out_amount_msat * 2, "lsps2-jit");
-
-    fprintf(stderr, "LSP: JIT channel opened for client %zu (scid=0x%llx)\n",
-            client_idx, (unsigned long long)scid);
-}
-
-/* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
+/* LSPS0 adapter for the BOLT #8 listener.  Requests from outside peers are
+   answered without any channel context (see lsps_peer_request). */
 static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
                            const char *json_req, char *resp_buf, size_t resp_cap)
 {
-    (void)state;
-    if (!json_req || !resp_buf || resp_cap == 0) return 0;
-    lsps_ctx_t *ctx = (lsps_ctx_t *)userdata;
-
-    cJSON *json = cJSON_Parse(json_req);
-    if (!json) {
-        cJSON *err = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
-        if (err) {
-            char *s = cJSON_PrintUnformatted(err);
-            if (s) {
-                size_t n = strlen(s);
-                if (n < resp_cap) { memcpy(resp_buf, s, n + 1); free(s); cJSON_Delete(err); return (int)n; }
-                free(s);
-            }
-            cJSON_Delete(err);
-        }
-        return 0;
-    }
-
-    int id = 0;
-    const char *method = lsps_parse_request(json, &id);
-    cJSON *resp = NULL;
-
-    if (!method) {
-        resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
-    } else if (strcmp(method, "lsps1_get_info") == 0) {
-        lsps1_info_t info;
-        memset(&info, 0, sizeof(info));
-        info.min_channel_balance_msat = 100000000ULL;
-        info.max_channel_balance_msat = 10000000000ULL;
-        info.min_confirmations        = 1;
-        info.base_fee_msat            = 1000;
-        info.fee_ppm                  = 500;
-        resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
-    } else if (strcmp(method, "lsps2_get_info") == 0) {
-        lsps2_fee_params_t params;
-        memset(&params, 0, sizeof(params));
-        params.min_fee_msat             = 1000;
-        params.fee_ppm                  = 500;
-        params.min_channel_balance_msat = 100000000ULL;
-        params.max_channel_balance_msat = 10000000000ULL;
-        resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
-    } else if (lsps_handle_request(ctx, fd, json)) {
-        cJSON_Delete(json);
-        return 0;
-    } else {
-        resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
-    }
-
-    cJSON_Delete(json);
-    int written = 0;
-    if (resp) {
-        char *s = cJSON_PrintUnformatted(resp);
-        if (s) {
-            size_t n = strlen(s);
-            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
-            free(s);
-        }
-        cJSON_Delete(resp);
-    }
-    return written;
+    (void)userdata; (void)fd; (void)state;
+    return lsps_peer_request(json_req, resp_buf, resp_cap);
 }
 
 /* Chain monitoring: called by bip158_backend after each new block is processed */
@@ -3650,11 +3570,8 @@ accept_new_factory:
             g_ln_dispatch.invoices = &g_invoice_tbl;
 
             /* Wire LSPS0 callback */
-            memset(&g_lsps_ctx, 0, sizeof(g_lsps_ctx));
-            g_lsps_ctx.mgr = g_channel_mgr;
-            g_lsps_ctx.lsp = g_lsp;
             g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
-            g_bolt8_cfg.cb_userdata      = &g_lsps_ctx;
+            g_bolt8_cfg.cb_userdata      = NULL;
 
             /* Wire Tor proxy for .onion outbound peers */
             if (tor_proxy_arg) {
@@ -3686,7 +3603,7 @@ accept_new_factory:
             g_ln_dispatch.watchtower  = &g_watchtower;
             g_ln_dispatch.scb_path    = scb_path_arg; /* NULL = disabled */
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
-    g_ln_dispatch.jit_open_cb = on_jit_open;
+    g_ln_dispatch.jit_open_cb = NULL;
     g_ln_dispatch.jit_cb_ctx  = NULL;
     g_ln_dispatch.network     = network;
 
