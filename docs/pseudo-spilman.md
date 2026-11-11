@@ -52,13 +52,25 @@ channel opened; a leaf advance (PS: a new chain transaction spending that
 output; DW: a new leaf txid with a lower nSequence) replaces that
 transaction and does **not** move the channel onto the new outpoint, so
 commitments signed before the advance cannot be broadcast after the
-advanced leaf confirms. `lsp_channels_advance_ps_leaf` therefore refuses
-to advance a leaf while a channel on it holds client funds (a client
-balance or an in-flight HTLC); the override argument exists only for the
-harness flags that exercise the ceremony (`--test-leaf-advance`,
-`--test-wire-leaf-advance`, `--test-ps-advance`, `--test-tier-b-rollover`).
+advanced leaf confirms. The same holds for a whole-tree state advance and
+for a sub-factory advance. Until advances re-anchor channels, both sides
+refuse them:
+
+- The LSP entry points `lsp_channels_advance_ps_leaf` and
+  `lsp_factory_tick_root` refuse while an open channel is funded by the
+  leaf — whatever its balances — or by any leaf of the factory when the
+  advance would roll over into a whole-tree state advance. Their
+  `allow_live_channel` argument exists only for the harness flags that
+  exercise the ceremonies (`--test-leaf-advance`, `--test-wire-leaf-advance`,
+  `--test-ps-advance`, `--test-tier-b-rollover`).
+- The client refuses every leaf, state and sub-factory advance proposal
+  with an error, before changing its tree or producing a nonce. The
+  harness-only client flag `--test-allow-tree-advance` (refused on mainnet)
+  lifts this for the ceremony tests.
+
 Verified by `tools/test_regtest_payment_no_leaf_advance.sh` and the unit
-tests `test_payment_leaves_leaf_untouched_arity_ps` / `_arity1`.
+tests `test_payment_leaves_leaf_untouched_arity_ps` / `_arity1` and
+`test_client_refuses_tree_advances`.
 
 ## Why PS is non-revocable
 

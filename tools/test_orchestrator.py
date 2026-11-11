@@ -1821,7 +1821,8 @@ def scenario_ps_advance(orch):
 
     orch.start_lsp(["--arity", "3", "--clients", "1", "--demo", "--test-ps-advance"])
     time.sleep(orch.timing["lsp_bind"])
-    orch.start_client(0)
+    # Clients refuse leaf advances unless this harness-only flag is given.
+    orch.start_client(0, ["--test-allow-tree-advance"])
 
     rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
     orch._log(f"LSP exited with code {rc}")
