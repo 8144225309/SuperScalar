@@ -267,6 +267,9 @@ extern int test_lsps2_two_independent_entries(void);
 /* PR #17 Phase 2: LSP discovery */
 extern int test_wellknown_json_format(void);
 extern int test_client_bootstrap_from_domain(void);
+extern int test_wellknown_pubkey_never_pins(void);
+extern int test_client_endpoint_resolution(void);
+extern int test_wellknown_serve_fork_ports(void);
 /* PR #17 Phase 3: BOLT #7 gossip */
 extern int test_gossip_node_announcement_sign_verify(void);
 extern int test_gossip_channel_announcement_fields(void);
@@ -1754,6 +1757,12 @@ extern int test_backup_corrupt_file(void);
 extern int test_backup_v2_roundtrip(void);
 extern int test_backup_v1_compat(void);
 extern int test_backup_v2_wrong_passphrase(void);
+extern int test_backup_files_owner_only(void);
+extern int test_backup_restore_refuses_existing(void);
+extern int test_backup_failed_write_reported(void);
+extern int test_backup_read_tightens_mode(void);
+extern int test_backup_read_leaves_other_files_alone(void);
+extern int test_backup_crafted_files_rejected(void);
 
 /* UTXO Coin Selection (Mainnet Gap #1) */
 extern int test_coin_select_basic(void);
@@ -1832,6 +1841,11 @@ extern int test_bip39_seed_no_passphrase(void);
 extern int test_bip39_vector_7f(void);
 extern int test_bip39_generate(void);
 extern int test_bip39_keyfile_integration(void);
+extern int test_bip39_official_vectors(void);
+extern int test_bip39_15_and_21_words(void);
+extern int test_bip39_check_reports_reason(void);
+extern int test_bip39_seed_refuses_invalid_mnemonic(void);
+extern int test_bip39_whitespace_normalized(void);
 
 /* Mainnet Audit: Atomic DB Transactions */
 extern int test_persist_transaction_commit(void);
@@ -1904,9 +1918,36 @@ extern int test_regtest_ps_chain_close(void);
 extern int test_regtest_ps_old_state_response(void);
 
 /* Mainnet Audit: Password-Hardened KDF */
+extern int test_network_is_mainnet(void);
+extern int test_network_canonical(void);
+extern int test_network_gate_risk_accepted(void);
+extern int test_network_gate_cmdline_seckey(void);
+extern int test_network_gate_no_test_scaffolding(void);
+extern int test_network_gate_db(void);
+extern int test_network_mainnet_step_floor_alias(void);
+extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
 extern int test_keyfile_wrong_passphrase_v2(void);
+extern int test_keyfile_created_owner_only(void);
+extern int test_keyfile_load_or_generate_new_path(void);
+extern int test_keyfile_wrong_passphrase_keeps_file(void);
+extern int test_keyfile_corrupt_file_kept(void);
+extern int test_keyfile_generate_refuses_existing(void);
+extern int test_keyfile_save_replaces_atomically(void);
+extern int test_keyfile_symlink_path(void);
+extern int test_keyfile_load_tightens_mode(void);
+extern int test_keyfile_mode_not_ours_to_change(void);
+extern int test_keyfile_crafted_files_rejected(void);
+extern int test_secure_file_mode_owner_only(void);
+extern int test_secure_file_create_only(void);
+extern int test_secure_file_failed_write_keeps_old(void);
+extern int test_secure_file_refuses_symlink(void);
+extern int test_secure_file_refuses_dangling_symlink(void);
+extern int test_secure_file_stage_commit_discard(void);
+extern int test_secure_file_removes_stale_temporaries(void);
+extern int test_secure_file_open_read(void);
+extern int test_secure_file_restrict(void);
 
 /* Mainnet Audit: HD Key Derivation */
 extern int test_hd_master_from_seed(void);
@@ -2219,6 +2260,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wellknown_json_parse);
     RUN_TEST(test_wellknown_http_serve);
     RUN_TEST(test_client_bootstrap_from_domain);
+    RUN_TEST(test_wellknown_pubkey_never_pins);
+    RUN_TEST(test_client_endpoint_resolution);
+    RUN_TEST(test_wellknown_serve_fork_ports);
 
     printf("\n=== PR #17 Phase 3: BOLT #7 Gossip ===\n");
     RUN_TEST(test_gossip_node_announcement_sign_verify);
@@ -3649,6 +3693,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_backup_v2_roundtrip);
     RUN_TEST(test_backup_v1_compat);
     RUN_TEST(test_backup_v2_wrong_passphrase);
+    RUN_TEST(test_backup_files_owner_only);
+    RUN_TEST(test_backup_restore_refuses_existing);
+    RUN_TEST(test_backup_failed_write_reported);
+    RUN_TEST(test_backup_read_tightens_mode);
+    RUN_TEST(test_backup_read_leaves_other_files_alone);
+    RUN_TEST(test_backup_crafted_files_rejected);
 
     printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
     RUN_TEST(test_coin_select_basic);
@@ -3729,6 +3779,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bip39_vector_7f);
     RUN_TEST(test_bip39_generate);
     RUN_TEST(test_bip39_keyfile_integration);
+    RUN_TEST(test_bip39_official_vectors);
+    RUN_TEST(test_bip39_15_and_21_words);
+    RUN_TEST(test_bip39_check_reports_reason);
+    RUN_TEST(test_bip39_seed_refuses_invalid_mnemonic);
+    RUN_TEST(test_bip39_whitespace_normalized);
 
     printf("\n=== Mainnet Audit: Atomic DB Transactions ===\n");
     RUN_TEST(test_persist_transaction_commit);
@@ -3800,10 +3855,39 @@ static void run_unit_tests(void) {
     RUN_TEST(test_regtest_ps_chain_close);
     RUN_TEST(test_regtest_ps_old_state_response);
 
+    printf("\n=== Network Names & Mainnet Start-up Gates ===\n");
+    RUN_TEST(test_network_is_mainnet);
+    RUN_TEST(test_network_canonical);
+    RUN_TEST(test_network_gate_risk_accepted);
+    RUN_TEST(test_network_gate_cmdline_seckey);
+    RUN_TEST(test_network_gate_no_test_scaffolding);
+    RUN_TEST(test_network_gate_db);
+    RUN_TEST(test_network_mainnet_step_floor_alias);
+    RUN_TEST(test_network_startup_gates_per_role);
+
     printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
     RUN_TEST(test_keyfile_v2_roundtrip);
     RUN_TEST(test_keyfile_v1_compat);
     RUN_TEST(test_keyfile_wrong_passphrase_v2);
+    RUN_TEST(test_keyfile_created_owner_only);
+    RUN_TEST(test_keyfile_load_or_generate_new_path);
+    RUN_TEST(test_keyfile_wrong_passphrase_keeps_file);
+    RUN_TEST(test_keyfile_corrupt_file_kept);
+    RUN_TEST(test_keyfile_generate_refuses_existing);
+    RUN_TEST(test_keyfile_save_replaces_atomically);
+    RUN_TEST(test_keyfile_symlink_path);
+    RUN_TEST(test_keyfile_load_tightens_mode);
+    RUN_TEST(test_keyfile_mode_not_ours_to_change);
+    RUN_TEST(test_keyfile_crafted_files_rejected);
+    RUN_TEST(test_secure_file_mode_owner_only);
+    RUN_TEST(test_secure_file_create_only);
+    RUN_TEST(test_secure_file_failed_write_keeps_old);
+    RUN_TEST(test_secure_file_refuses_symlink);
+    RUN_TEST(test_secure_file_refuses_dangling_symlink);
+    RUN_TEST(test_secure_file_stage_commit_discard);
+    RUN_TEST(test_secure_file_removes_stale_temporaries);
+    RUN_TEST(test_secure_file_open_read);
+    RUN_TEST(test_secure_file_restrict);
 
     printf("\n=== Mainnet Audit: HD Key Derivation ===\n");
     RUN_TEST(test_hd_master_from_seed);

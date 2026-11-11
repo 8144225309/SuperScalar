@@ -4,6 +4,46 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
 
+## Unreleased
+
+### Key handling and start-up safety
+
+Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a refusal, so existing start-up scripts may need adjusting.
+
+**Keyfiles**
+
+- **An existing keyfile that cannot be loaded is now an error.** With a wrong or missing `--passphrase`, or a damaged file, `superscalar_lsp` and `superscalar_client` exit and leave the file untouched. Before, they generated a new key over it, destroying the old one. A key is created only when nothing exists at `--keyfile`.
+- **`--generate-mnemonic` and `--from-mnemonic` refuse an existing keyfile** instead of replacing it.
+- **Keyfiles are written atomically** (temporary file `<keyfile>.ss-partial.XXXXXX`, fsync, rename). The keyfile's directory must be writable; a `--keyfile` path that is a symbolic link can be read but is not written to.
+- **Keyfiles, backups, restored databases and restored keyfiles are created with mode `0600`.** Before, they were created with the umask default (usually world-readable).
+- **Existing keyfiles and backups with loose permissions are tightened to `0600` when read**, with a warning, if they are regular files owned by the current user with one hard link and not reached through a symbolic link. Otherwise the mode is left alone. A keyfile readable only by its group is then used with a warning; **a keyfile readable by every user is refused** with an error naming the mode. Backups are read in either case.
+- A v2 keyfile must be exactly 84 bytes, and the PBKDF2 iteration count stored in a keyfile or backup must be between 100,000 and 10,000,000.
+
+**Recovery phrases**
+
+- **`--hd-mnemonic` and `--from-mnemonic` are validated** (12/15/18/21/24 words, BIP39 English wordlist, checksum; extra whitespace ignored). An invalid phrase stops start-up with the reason. Before, a typo in `--hd-mnemonic` silently opened a different, empty wallet.
+
+**Backup and restore**
+
+- **`--restore` never overwrites.** It refuses if the database, its `-wal`, `-shm` or `-journal` file, or the keyfile already exists. Before, it truncated the live files first. It needs `--db` and `--keyfile` as destinations.
+- **`--backup` and `--restore` report failed writes** (full disk, quota) and no longer leave empty files or print `OK`. An existing backup is replaced only once the new one is complete.
+
+**Mainnet start-up gates**
+
+- **`--network bitcoin` is treated exactly as `--network mainnet`** by every gate and by the library (invoice prefix, P2P magic, `bitcoin-cli` chain flag, checkpoints). Before, it skipped most mainnet gates.
+- **`superscalar_client` refuses `--seckey` on mainnet**, as the LSP already did; use `--keyfile`.
+- **`superscalar_watchtower` requires `--i-accept-the-risk` on mainnet** (new flag), refuses test/cheat flags and environment variables there, and refuses unknown `--network` names. `tools/deploy/superscalar-watchtower.service` now passes `--wt-db` (it still passed the removed `--db`) and takes extra options from `SS_WATCHTOWER_ARGS`.
+
+**Client connection**
+
+- **`--lsp DOMAIN` no longer supplies the LSP's key.** The key in `/.well-known/lsps.json` is fetched over plain HTTP; it is shown as a hint and never pinned. `--lsp-pubkey` is required on every network except regtest, and the client exits if it differs from the advertised key.
+- The `--lsp-pubkey` requirement is checked before a keyfile is created.
+- **`--lsp DOMAIN` is refused together with `--tor-proxy` / `--tor-only`**: the lookup is a direct clearnet connection.
+
+**Tests**
+
+- `tools/test_startup_gates.sh` (run in CI) checks the start-up refusals of the three daemon binaries.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
