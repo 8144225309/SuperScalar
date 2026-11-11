@@ -8,6 +8,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/readiness.h"
+#include "superscalar/network.h"
 #include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,8 +62,10 @@ const char *lsp_bridge_pay_check_str(bridge_pay_check_t r) {
 }
 
 int lsp_bridge_invoice_network_ok(const char *network, const char *invoice_hrp) {
+    /* "bitcoin" and "mainnet" name the same chain */
+    network = network_canonical(network);
     if (!network || !invoice_hrp) return 0;
-    if (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0)
+    if (network_is_mainnet(network))
         return strcmp(invoice_hrp, "bc") == 0;
     if (strcmp(network, "testnet") == 0 || strcmp(network, "testnet4") == 0)
         return strcmp(invoice_hrp, "tb") == 0;

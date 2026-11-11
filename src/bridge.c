@@ -1,5 +1,6 @@
 #include "superscalar/bridge.h"
 #include "superscalar/noise.h"
+#include "superscalar/secure_file.h"
 #include <secp256k1.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -251,14 +252,13 @@ static int secret_create(const char *path, char *out_hex) {
     out_hex[BRIDGE_PLUGIN_SECRET_HEX_LEN] = '\0';
     memset(raw, 0, sizeof(raw));
 
-    /* O_EXCL: never write into a file somebody else put there. */
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-    if (fd < 0) return 0;
-    int ok = fchmod(fd, 0600) == 0 &&
-             write_all(fd, out_hex, BRIDGE_PLUGIN_SECRET_HEX_LEN) &&
-             write_all(fd, "\n", 1) && fsync(fd) == 0;
-    if (close(fd) != 0) ok = 0;
-    if (!ok) unlink(path);
+    /* Mode 0600, complete or not there at all, and never into or over
+       anything somebody else put at the path (a symbolic link included). */
+    unsigned char line[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
+    memcpy(line, out_hex, BRIDGE_PLUGIN_SECRET_HEX_LEN);
+    line[BRIDGE_PLUGIN_SECRET_HEX_LEN] = '\n';
+    int ok = secure_file_write_atomic(path, line, sizeof(line), 0);
+    memset(line, 0, sizeof(line));
     return ok;
 }
 
