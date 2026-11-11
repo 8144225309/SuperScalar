@@ -34,9 +34,24 @@ void bridge_init(bridge_t *br) {
 }
 
 void bridge_set_lsp_pubkey(bridge_t *br, const secp256k1_pubkey *pk) {
+    br->lsp_pubkey_hex[0] = '\0';
     if (pk) {
         br->lsp_pubkey = *pk;
         br->use_nk = 1;
+        /* The plugin ties its state to the LSP it works for */
+        secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        unsigned char ser[33];
+        size_t len = sizeof(ser);
+        if (ctx && secp256k1_ec_pubkey_serialize(ctx, ser, &len, pk,
+                                                  SECP256K1_EC_COMPRESSED)) {
+            static const char digits[] = "0123456789abcdef";
+            for (size_t i = 0; i < 33; i++) {
+                br->lsp_pubkey_hex[2 * i]     = digits[ser[i] >> 4];
+                br->lsp_pubkey_hex[2 * i + 1] = digits[ser[i] & 0x0f];
+            }
+            br->lsp_pubkey_hex[66] = '\0';
+        }
+        if (ctx) secp256k1_context_destroy(ctx);
     } else {
         br->use_nk = 0;
     }
@@ -456,6 +471,7 @@ int bridge_service_pending_plugin(bridge_t *br) {
 
         cJSON *ack = cJSON_CreateObject();
         cJSON_AddStringToObject(ack, "method", "auth_ok");
+        cJSON_AddStringToObject(ack, "lsp_pubkey", br->lsp_pubkey_hex);
         plugin_send_if_connected(br, ack);
         cJSON_Delete(ack);
         /* What arrived for the plugin while it was away */

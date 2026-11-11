@@ -54,6 +54,8 @@ class FakeCln:
             raise AssertionError(f"unexpected CLN call: {method}")
         queue = self.replies[method]
         reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        if callable(reply):
+            reply = reply()
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -86,7 +88,8 @@ class PluginTestCase(unittest.TestCase):
         cln_plugin.settled_invoices.clear()
         cln_plugin.forwarded_htlcs.clear()
         cln_plugin.invoice_labels.clear()
-        for name, value in (("NODE_ID", None),
+        for name, value in (("NODE_ID", None), ("STATE_NODE_ID", None),
+                            ("STATE_LSP_KEY", None),
                             ("_spawn", lambda target, *args: target(*args))):
             p = mock.patch.object(cln_plugin, name, value)
             p.start()
@@ -449,9 +452,11 @@ class PayResultDeliveryTest(PluginTestCase):
                                       "request_id": request_id})
 
     def restart_plugin(self):
-        """Forget everything in memory, as a new process would."""
+        """Forget everything in memory and read the state file, as a new
+        process does before anything else."""
         cln_plugin.open_pays.clear()
         self.to_bridge.clear()
+        cln_plugin.load_state()
 
     def run_inline(self):
         p = mock.patch.object(cln_plugin, "_spawn",
@@ -647,7 +652,6 @@ class PayResultDeliveryTest(PluginTestCase):
         self.assertIn(7, cln_plugin.open_pays)
         # Its record is still on disk for a restart to pick up.
         self.restart_plugin()
-        cln_plugin.load_state()
         self.assertIn(7, cln_plugin.open_pays)
 
     def test_rejected_result_is_kept_but_not_repeated(self):
@@ -668,7 +672,6 @@ class PayResultDeliveryTest(PluginTestCase):
         self.assertEqual(cln_plugin.resend_pay_results(), 0)
         self.assertEqual(len(self.pay_results()), 1)
         self.restart_plugin()
-        cln_plugin.load_state()
         self.assertEqual(cln_plugin.open_pays[7]["rejected"], "preimage_mismatch")
         self.assertEqual(cln_plugin.resend_pay_results(), 0)
 
@@ -699,16 +702,174 @@ class PayResultDeliveryTest(PluginTestCase):
             cln_plugin.handle_bridge_msg(dict(register, payment_hash=OTHER_HASH))
             self.assertEqual(len(started), 1)
 
-    def test_state_file_is_private_and_tolerates_damage(self):
-        self.use_cln(decode=decoded_invoice(4_000_000),
-                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+    def test_failure_is_not_reported_before_the_retry_window_from_launch(self):
+        # The request sat for a long time before `pay` was launched (slow
+        # decode).  `pay` then hangs and its attempt shows as failed: CLN
+        # may still retry until its window, counted from the launch, is over.
+        def slow_decode():
+            self.clock["now"] += 500
+            return decoded_invoice(4_000_000)
+
+        self.use_cln(decode=slow_decode, pay=PAY_TIMEOUT, listpays=listed("failed"))
         cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
-        path = cln_plugin.BRIDGE_STATE_FILE
-        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-        with open(path, "w") as f:
-            f.write("{ not json")
+        window = cln_plugin.PAY_RETRY_FOR + cln_plugin.PAY_SETTLE_GRACE
+        self.assertGreaterEqual(sum(self.sleeps), window)
+        self.assert_pay_failed(7)
+
+    def test_launch_time_is_what_a_restart_counts_from(self):
+        self.run_inline()
+        self.use_cln(decode=decoded_invoice(4_000_000), pay=KeyboardInterrupt())
+        requested = self.clock["now"]
+        with self.assertRaises(KeyboardInterrupt):
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        rec = cln_plugin.open_pays[7]
+        self.assertTrue(rec["launched"])
+        self.assertEqual(rec["started"], requested)
+        # A request that never got as far as `pay` has no launch time: after
+        # a restart its window is counted from then, not from zero.
+        cln_plugin._open_pay(8, OTHER_HASH)
+        self.assertFalse(cln_plugin.open_pays[8]["launched"])
+        self.assertIsNone(cln_plugin.open_pays[8]["started"])
         self.restart_plugin()
-        self.assertEqual(cln_plugin.recover_open_pays(), 0)
+        self.use_cln(listpays=listed())
+        cln_plugin.recover_open_pays()
+        window = cln_plugin.PAY_RETRY_FOR + cln_plugin.PAY_SETTLE_GRACE
+        self.assertGreaterEqual(sum(self.sleeps), window)
+        self.assertEqual(sorted(m["request_id"] for m in self.pay_results()), [7, 8])
+
+
+class StateFileTest(PluginTestCase):
+    """The state file is written whole, belongs to one node and one LSP, and
+    is never silently ignored."""
+
+    NODE = OWN_NODE
+
+    def path(self):
+        return cln_plugin.BRIDGE_STATE_FILE
+
+    def some_state(self):
+        cln_plugin._open_pay(7, PAYMENT_HASH)
+        cln_plugin._mark_settled(PAYMENT_HASH2, PREIMAGE2, "100x1x0:5")
+        cln_plugin._note_forwarded("100x1x0:6", OTHER_HASH, True)
+
+    def forget(self):
+        cln_plugin.open_pays.clear()
+        cln_plugin.settled_invoices.clear()
+        cln_plugin.forwarded_htlcs.clear()
+
+    def test_everything_survives_a_reload(self):
+        self.some_state()
+        self.forget()
+        self.assertEqual(cln_plugin.load_state(), 1)
+        self.assertEqual(cln_plugin.open_pays[7]["payment_hash"], PAYMENT_HASH)
+        self.assertEqual(cln_plugin.settled_invoices[PAYMENT_HASH2],
+                         {"preimage": PREIMAGE2, "upstream": "100x1x0:5"})
+        self.assertEqual(cln_plugin.forwarded_htlcs["100x1x0:6"],
+                         {"payment_hash": OTHER_HASH, "factory_invoice": True})
+
+    def test_file_is_private_and_no_temporary_files_are_left(self):
+        self.some_state()
+        self.assertEqual(os.stat(self.path()).st_mode & 0o777, 0o600)
+        self.assertEqual(os.listdir(os.path.dirname(self.path())),
+                         [os.path.basename(self.path())])
+
+    def test_concurrent_saves_leave_one_complete_state(self):
+        import threading as real_threading
+        self.some_state()
+        errors = []
+
+        def hammer(n):
+            try:
+                for i in range(5):
+                    cln_plugin._note_forwarded(f"{n}x{i}x0:1", OTHER_HASH, False)
+            except Exception as e:      # pragma: no cover
+                errors.append(e)
+
+        threads = [real_threading.Thread(target=hammer, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        with open(self.path()) as f:
+            state = json.load(f)
+        self.assertEqual(len(state["forwarded"]), 6 * 5 + 1)
+        self.assertEqual(os.listdir(os.path.dirname(self.path())),
+                         [os.path.basename(self.path())])
+
+    def test_a_missing_file_is_a_fresh_start(self):
+        self.assertEqual(cln_plugin.load_state(self.NODE), 0)
+        self.assertEqual(cln_plugin.STATE_NODE_ID, self.NODE)
+
+    def test_a_damaged_file_is_an_error_not_an_empty_state(self):
+        for text in ("{ not json", "", "[1, 2]", '{"pays": []}',
+                     '{"pays": {"x": {}}}', '{"pays": {"7": 5}}',
+                     '{"settled": "no"}'):
+            with open(self.path(), "w") as f:
+                f.write(text)
+            self.forget()
+            with self.assertRaises(cln_plugin.StateFileError, msg=text):
+                cln_plugin.load_state(self.NODE)
+            self.assertEqual(cln_plugin.open_pays, {})
+
+    def test_an_unreadable_file_is_an_error(self):
+        os.mkdir(self.path())       # a directory where the file should be
+        with self.assertRaises(cln_plugin.StateFileError):
+            cln_plugin.load_state(self.NODE)
+
+    def test_a_file_from_another_node_is_refused(self):
+        cln_plugin.STATE_NODE_ID = "03" + "aa" * 32
+        self.some_state()
+        self.forget()
+        with self.assertRaises(cln_plugin.StateFileError) as caught:
+            cln_plugin.load_state(self.NODE)
+        self.assertIn("belongs to node", str(caught.exception))
+        self.assertEqual(cln_plugin.open_pays, {})
+        # The node it was written for reads it.
+        self.assertEqual(cln_plugin.load_state("03" + "aa" * 32), 1)
+
+    def test_the_node_id_is_recorded_with_the_state(self):
+        self.use_cln()
+        cln_plugin.init_state()
+        self.some_state()
+        with open(self.path()) as f:
+            self.assertEqual(json.load(f)["node_id"], OWN_NODE)
+
+    def test_plugin_stops_on_a_damaged_file(self):
+        logged = []
+        with open(self.path(), "w") as f:
+            f.write("{ not json")
+        self.use_cln()
+        with mock.patch.object(cln_plugin, "log", logged.append), \
+                mock.patch.object(cln_plugin.sys, "stderr"), \
+                self.assertRaises(SystemExit) as stopped:
+            cln_plugin.init_state()
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("FATAL", logged[0])
+        self.assertIn("not valid JSON", logged[0])
+        # The damaged file is left as it was, for the operator.
+        with open(self.path()) as f:
+            self.assertEqual(f.read(), "{ not json")
+
+    def test_plugin_stops_when_the_node_cannot_be_identified(self):
+        self.use_cln(getinfo=cln_plugin.ClnRpcError("Connection refused"))
+        with mock.patch.object(cln_plugin.sys, "stderr"), \
+                self.assertRaises(SystemExit):
+            cln_plugin.init_state(attempts=3)
+        self.assertEqual(self.sleeps, [1, 1, 1])
+
+    def test_state_is_tied_to_the_lsp_the_bridge_serves(self):
+        lsp_a, lsp_b = "02" + "a1" * 32, "02" + "b2" * 32
+        self.assertTrue(cln_plugin.check_lsp_identity(lsp_a))
+        self.assertTrue(cln_plugin.check_lsp_identity(lsp_a))
+        self.assertFalse(cln_plugin.check_lsp_identity(lsp_b))
+        self.assertFalse(cln_plugin.check_lsp_identity(""))
+        # It is part of the state on disk.
+        cln_plugin.STATE_LSP_KEY = None
+        cln_plugin.load_state()
+        self.assertEqual(cln_plugin.STATE_LSP_KEY, lsp_a)
+        self.assertFalse(cln_plugin.check_lsp_identity(lsp_b))
 
 
 def htlc(payment_hash=PAYMENT_HASH, amount_msat=5_000_000, cltv_expiry=500,
@@ -1214,7 +1375,9 @@ class FakeBridge:
     """The bridge's end of a new connection, as a socket for the plugin.
     `secret` is what this peer holds (None: it holds none and bluffs)."""
 
-    def __init__(self, secret, instead_of_challenge=None, accept=True):
+    def __init__(self, secret, instead_of_challenge=None, accept=True,
+                 lsp_pubkey=""):
+        self.lsp_pubkey = lsp_pubkey
         self.secret = secret
         self.instead_of_challenge = instead_of_challenge
         self.accept = accept
@@ -1256,7 +1419,7 @@ class FakeBridge:
                     "proof": cln_plugin.auth_proof(
                         key, b"bridge", self.plugin_nonce, self.nonce)})
             elif msg["method"] == "auth_response" and self.accept:
-                self._reply({"method": "auth_ok"})
+                self._reply({"method": "auth_ok", "lsp_pubkey": self.lsp_pubkey})
 
 
 class BridgeAuthTest(PluginTestCase):
@@ -1383,6 +1546,18 @@ class BridgeAuthTest(PluginTestCase):
         ok, _ = self.connect(bridge)
         self.assertFalse(ok)
         self.assertIsNone(cln_plugin.bridge_sock)
+
+    def test_bridge_of_another_lsp_is_refused(self):
+        self.write_secret(self.SECRET)
+        lsp_a, lsp_b = "02" + "a1" * 32, "02" + "b2" * 32
+        self.assertTrue(self.connect(FakeBridge(self.SECRET, lsp_pubkey=lsp_a))[0])
+        cln_plugin.bridge_sock = None
+        other = FakeBridge(self.SECRET, lsp_pubkey=lsp_b)
+        ok, _ = self.connect(other)
+        self.assertFalse(ok)
+        self.assertIsNone(cln_plugin.bridge_sock)
+        self.assertTrue(other.closed)
+        self.assertTrue(self.connect(FakeBridge(self.SECRET, lsp_pubkey=lsp_a))[0])
 
     def test_secret_is_read_again_on_every_connect(self):
         self.write_secret("aa" * 32)

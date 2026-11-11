@@ -5545,3 +5545,44 @@ int test_bridge_queues_for_absent_plugin(void) {
     bridge_cleanup(&br);
     return 1;
 }
+
+/* ---- The bridge tells the plugin which LSP it serves ---- */
+
+int test_bridge_reports_lsp_key(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    unsigned char sk[32]; memset(sk, 0x31, 32);
+    secp256k1_pubkey pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pk, sk), "key");
+    unsigned char ser[33]; size_t len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, ser, &len, &pk, SECP256K1_EC_COMPRESSED);
+    char want[67];
+    hex_encode(ser, 33, want);
+
+    bridge_t br;
+    bridge_init(&br);
+    TEST_ASSERT(br.lsp_pubkey_hex[0] == '\0', "no key, nothing to report");
+    bridge_set_lsp_pubkey(&br, &pk);
+    TEST_ASSERT(strcmp(br.lsp_pubkey_hex, want) == 0, "pinned key reported as hex");
+    bridge_set_lsp_pubkey(&br, NULL);
+    TEST_ASSERT(br.lsp_pubkey_hex[0] == '\0', "cleared with the pin");
+    bridge_set_lsp_pubkey(&br, &pk);
+
+    /* It reaches the plugin with auth_ok */
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
+    int plugin = connect_plugin_port(&br);
+    TEST_ASSERT(plugin >= 0, "connect");
+    unsigned char nb[32];
+    TEST_ASSERT_EQ(plugin_handshake(&br, plugin, TEST_PLUGIN_SECRET,
+                                     BRIDGE_AUTH_ROLE_PLUGIN, nb, NULL), 1, "authenticated");
+    char line[512];
+    TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)), "auth_ok");
+    TEST_ASSERT(strstr(line, "\"auth_ok\"") && strstr(line, "\"lsp_pubkey\"") &&
+                strstr(line, want), "auth_ok names the LSP");
+
+    close(plugin);
+    bridge_cleanup(&br);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

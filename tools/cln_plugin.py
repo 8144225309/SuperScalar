@@ -40,6 +40,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -116,6 +117,18 @@ RESULT_RETRY_INTERVAL = 15 # seconds between repeats of an unacknowledged result
 # is still in flight nor loses a result that was not delivered.
 open_pays = {}
 pays_lock = threading.RLock()
+
+# The state file belongs to one CLN node working for one LSP.  Request ids,
+# HTLC names and payment hashes mean nothing to another pair, so a file
+# from elsewhere is refused rather than acted on.
+state_lock = threading.RLock()   # one save at a time
+STATE_NODE_ID = None    # the CLN node the state belongs to
+STATE_LSP_KEY = None    # the LSP's key as the bridge reports it ("" if the
+                        # bridge runs without one); None until first seen
+
+
+class StateFileError(Exception):
+    """The state file exists but cannot be used."""
 
 
 _KNOWN_NETWORKS = {"bitcoin", "testnet", "signet", "regtest", "testnet4", "liquidv1"}
@@ -325,7 +338,7 @@ def authenticate_bridge(sock, secret):
     if not isinstance(accepted, dict) or accepted.get("method") != "auth_ok":
         log("Bridge did not accept our proof")
         return False
-    return True
+    return check_lsp_identity(accepted.get("lsp_pubkey", ""))
 
 
 # BOLT #4 failure codes for the htlc_accepted hook (hex, no data)
@@ -775,44 +788,101 @@ def _preimage_matches(preimage, payment_hash):
 
 
 def save_state():
-    """Write open_pays to BRIDGE_STATE_FILE (atomically, mode 0600)."""
+    """Write the plugin's state to BRIDGE_STATE_FILE.
+
+    One save at a time; each writes a temporary file of its own (mode
+    0600), syncs it, renames it over the state file and syncs the
+    directory, so that the file on disk is always one complete state."""
     path = os.path.expanduser(BRIDGE_STATE_FILE)
-    tmp = path + ".tmp"
-    with pays_lock:
-        pays = {str(k): v for k, v in open_pays.items()}
-    with lock:
-        settled = dict(settled_invoices)
-        forwarded = dict(forwarded_htlcs)
-    data = json.dumps({"pays": pays, "settled": settled,
-                       "forwarded": forwarded})
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        return True
-    except OSError as e:
-        log(f"Cannot save plugin state to {path}: {e}")
-        return False
+    directory = os.path.dirname(path) or "."
+    with state_lock:
+        with pays_lock:
+            pays = {str(k): dict(v) for k, v in open_pays.items()}
+        with lock:
+            settled = dict(settled_invoices)
+            forwarded = dict(forwarded_htlcs)
+        data = json.dumps({"version": 1, "node_id": STATE_NODE_ID,
+                           "lsp_key": STATE_LSP_KEY, "pays": pays,
+                           "settled": settled, "forwarded": forwarded})
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".bridge-plugin.state.",
+                                       dir=directory)
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = None
+            dfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return True
+        except OSError as e:
+            log(f"ERROR: cannot save plugin state to {path}: {e}")
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            return False
 
 
-def load_state():
-    """Read open_pays back from BRIDGE_STATE_FILE.  Returns how many
-    payments were restored."""
+def load_state(node_id=None):
+    """Read the plugin's state back from BRIDGE_STATE_FILE.
+
+    A missing file is a fresh start.  A file that cannot be read, is not
+    what save_state writes, or was written for another CLN node raises
+    StateFileError: it may describe payments in flight and held HTLCs, and
+    carrying on as if there were none could pay twice or drop an HTLC.
+    Returns how many outside payments were restored."""
+    global STATE_NODE_ID, STATE_LSP_KEY
     path = os.path.expanduser(BRIDGE_STATE_FILE)
     try:
         with open(path, "r") as f:
-            state = json.load(f)
-        pays = state.get("pays", {})
-        settled = state.get("settled", {})
-        forwarded = state.get("forwarded", {})
+            text = f.read()
     except FileNotFoundError:
+        STATE_NODE_ID = node_id
         return 0
-    except (OSError, ValueError, AttributeError) as e:
-        log(f"Cannot read plugin state {path}: {e}")
-        return 0
+    except OSError as e:
+        raise StateFileError(f"cannot read {path}: {e}")
+    try:
+        state = json.loads(text)
+    except ValueError as e:
+        raise StateFileError(f"{path} is not valid JSON ({e})")
+    if not isinstance(state, dict):
+        raise StateFileError(f"{path} does not hold a state object")
+    pays = state.get("pays", {})
+    settled = state.get("settled", {})
+    forwarded = state.get("forwarded", {})
+    if not all(isinstance(part, dict) for part in (pays, settled, forwarded)):
+        raise StateFileError(f"{path} has a malformed section")
+    file_node = state.get("node_id")
+    if node_id and file_node and file_node != node_id:
+        raise StateFileError(
+            f"{path} belongs to node {file_node}, this node is {node_id}")
+    parsed = {}
+    for key, rec in pays.items():
+        try:
+            request_id = int(key)
+        except ValueError:
+            raise StateFileError(f"{path} has a malformed payment id {key!r}")
+        if not isinstance(rec, dict):
+            raise StateFileError(f"{path} has a malformed payment {key}")
+        parsed[request_id] = {
+            "payment_hash": rec.get("payment_hash", ""),
+            "started": rec.get("started"),
+            "launched": bool(rec.get("launched")),
+            "result": rec.get("result"),
+        }
+        if rec.get("rejected"):
+            parsed[request_id]["rejected"] = rec["rejected"]
+
+    with state_lock:
+        STATE_NODE_ID = node_id or file_node
+        STATE_LSP_KEY = state.get("lsp_key")
     with lock:
         for ph, rec in settled.items():
             if _is_hash(ph) and isinstance(rec, dict):
@@ -823,24 +893,57 @@ def load_state():
                 forwarded_htlcs[up] = {
                     "payment_hash": rec["payment_hash"],
                     "factory_invoice": bool(rec.get("factory_invoice"))}
-    restored = 0
     with pays_lock:
-        for key, rec in pays.items():
-            try:
-                request_id = int(key)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            open_pays[request_id] = {
-                "payment_hash": rec.get("payment_hash", ""),
-                "started": rec.get("started", 0),
-                "result": rec.get("result"),
-            }
-            if rec.get("rejected"):
-                open_pays[request_id]["rejected"] = rec["rejected"]
-            restored += 1
-    return restored
+        open_pays.update(parsed)
+    return len(parsed)
+
+
+def init_state(attempts=10):
+    """Find out which node this is and load its state, before anything else
+    runs.  Stops the plugin if either cannot be done: without its state it
+    could pay an invoice twice or mishandle an HTLC it was holding."""
+    node_id = None
+    for attempt in range(attempts):
+        node_id = own_node_id()
+        if node_id:
+            break
+        time.sleep(1)
+    try:
+        if not node_id:
+            raise StateFileError("cannot ask CLN for this node's id (getinfo)")
+        return load_state(node_id)
+    except StateFileError as e:
+        message = (f"FATAL: {e}. The SuperScalar plugin is not starting. Its "
+                   f"state file records outside payments in flight and HTLCs "
+                   f"held for the LSP; move it away only after checking that "
+                   f"none are open.")
+        log(message)
+        sys.stderr.write(f"superscalar: {message}\n")
+        sys.stderr.flush()
+        sys.exit(1)
+
+
+def check_lsp_identity(lsp_key):
+    """The bridge says which LSP it serves.  The first answer is recorded
+    with the state; a different one later means the state belongs to
+    another LSP, and the link is refused."""
+    global STATE_LSP_KEY
+    if not isinstance(lsp_key, str):
+        lsp_key = ""
+    with state_lock:
+        if STATE_LSP_KEY is None:
+            STATE_LSP_KEY = lsp_key
+            first = True
+        elif STATE_LSP_KEY == lsp_key:
+            return True
+        else:
+            log(f"ERROR: the bridge serves LSP {lsp_key or '(no key)'} but "
+                f"this plugin's state belongs to LSP "
+                f"{STATE_LSP_KEY or '(no key)'}; refusing the link")
+            return False
+    if first:
+        save_state()
+    return True
 
 
 def _open_pay(request_id, payment_hash):
@@ -850,9 +953,23 @@ def _open_pay(request_id, payment_hash):
         if request_id in open_pays:
             return False
         open_pays[request_id] = {"payment_hash": payment_hash,
-                                 "started": time.time(), "result": None}
+                                 "started": None, "launched": False,
+                                 "result": None}
     save_state()
     return True
+
+
+def _mark_pay_launched(request_id):
+    """`pay` is about to be called: from this moment CLN may make attempts,
+    and its retry window is counted from here.  Returns the time recorded."""
+    now = time.time()
+    with pays_lock:
+        rec = open_pays.get(request_id)
+        if rec is not None:
+            rec["started"] = now
+            rec["launched"] = True
+    save_state()
+    return now
 
 
 def _send_pay_result(request_id, success, preimage=None):
@@ -935,9 +1052,11 @@ def recover_open_pays():
     One that already has its result only needs delivering.  One without
     was in flight (or about to start) when the plugin stopped; CLN is asked
     what became of it, and it is followed until CLN has settled it."""
-    restored = load_state()
+    # No start time means `pay` was not known to have been launched; the
+    # window is then counted from now, which can only be later.
     with pays_lock:
-        unresolved = [(rid, rec["payment_hash"], rec.get("started", 0))
+        restored = len(open_pays)
+        unresolved = [(rid, rec["payment_hash"], rec.get("started") or time.time())
                       for rid, rec in open_pays.items() if not rec.get("result")]
     for request_id, payment_hash, started in unresolved:
         if not _is_hash(payment_hash):
@@ -1050,7 +1169,7 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
         return
 
     # From here on CLN may have HTLCs out for this hash.
-    started = time.time()
+    started = _mark_pay_launched(request_id)
     pay_ended = False   # True once CLN itself said the pay command is over
     try:
         pay_result = cln_rpc(
@@ -1473,6 +1592,11 @@ def main():
             cln_config = request.get("params", {}).get("configuration", {})
             LIGHTNING_DIR = cln_config.get("lightning-dir")
 
+            # State first: which node this is, the outside payments that
+            # were open and the HTLCs that were held.  Nothing talks to the
+            # bridge and no thread runs before it is loaded.
+            init_state()
+
             connected = connect_bridge()
             # Always start bridge_reader — it reconnects on disconnect
             t = threading.Thread(target=bridge_reader, daemon=True)
@@ -1486,9 +1610,6 @@ def main():
 
             global _can_log_to_cln
             _can_log_to_cln = True
-
-            # What must survive a restart: fulfilled invoices, open payments.
-            load_state()
 
             # Re-populate registered_invoices from CLN's invoice DB.
             # On plugin restart (CLN restart), the in-memory set is empty

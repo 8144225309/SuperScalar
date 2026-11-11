@@ -67,6 +67,8 @@ typedef struct {
 
     /* NK (server-authenticated) handshake support */
     secp256k1_pubkey lsp_pubkey;        /* pinned LSP static pubkey */
+    char lsp_pubkey_hex[67];            /* the same, as told to the plugin;
+                                           "" when no key is pinned */
     int use_nk;                         /* 1 = use NK handshake, 0 = NN fallback */
 
     /* Finding A defense-in-depth: optional bridge static pubkey advertised
