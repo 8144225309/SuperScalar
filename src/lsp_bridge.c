@@ -4,6 +4,7 @@
 #include "superscalar/htlc_inbound.h"
 #include "superscalar/persist.h"
 #include "superscalar/bolt11.h"
+#include "superscalar/sha256.h"
 #include "superscalar/regtest.h"
 #include "superscalar/chain_backend.h"
 #include <stdio.h>
@@ -267,6 +268,32 @@ int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
             memcmp(o->payment_hash, payment_hash32, 32) == 0)
             return 1;
     }
+    return 0;
+}
+
+int lsp_channels_hash_in_flight(const lsp_channel_mgr_t *mgr,
+                                 const unsigned char *payment_hash32) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++)
+        if (mgr->htlc_origins[i].active &&
+            memcmp(mgr->htlc_origins[i].payment_hash, payment_hash32, 32) == 0)
+            return 1;
+    return 0;
+}
+
+void lsp_channels_note_outbound_paid(lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32) {
+    memcpy(mgr->outbound_paid[mgr->outbound_paid_next], payment_hash32, 32);
+    mgr->outbound_paid_next =
+        (mgr->outbound_paid_next + 1) % LSP_OUTBOUND_PAID_MAX;
+    if (mgr->n_outbound_paid < LSP_OUTBOUND_PAID_MAX)
+        mgr->n_outbound_paid++;
+}
+
+int lsp_channels_outbound_was_paid(const lsp_channel_mgr_t *mgr,
+                                    const unsigned char *payment_hash32) {
+    for (size_t i = 0; i < mgr->n_outbound_paid; i++)
+        if (memcmp(mgr->outbound_paid[i], payment_hash32, 32) == 0)
+            return 1;
     return 0;
 }
 
@@ -672,6 +699,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t request_id;
         int success;
         unsigned char preimage[32];
+        memset(preimage, 0, sizeof(preimage));
         if (!wire_parse_bridge_pay_result(msg->json, &request_id, &success,
                                             preimage))
             return 0;
@@ -679,17 +707,33 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("LSP: bridge pay result: request_id=%llu success=%d\n",
                (unsigned long long)request_id, success);
 
-        /* Find the originating HTLC by request_id */
-        for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        /* Find the originating HTLC by request_id (outbound origins only:
+           request ids start at 1 and inbound origins carry none) */
+        for (size_t i = 0; request_id != 0 && i < mgr->n_htlc_origins; i++) {
             if (!mgr->htlc_origins[i].active) continue;
+            if (mgr->htlc_origins[i].bridge_htlc_id != 0) continue;
             if (mgr->htlc_origins[i].request_id != request_id) continue;
 
             size_t client_idx = mgr->htlc_origins[i].sender_idx;
             uint64_t htlc_id_val = mgr->htlc_origins[i].sender_htlc_id;
-            mgr->htlc_origins[i].active = 0;
 
             if (client_idx >= mgr->n_channels) break;
             channel_t *ch = &mgr->entries[client_idx].channel;
+
+            /* A success is only a success with the preimage of the hash the
+               client's HTLC is locked to.  Anything else settles nothing:
+               the HTLC stays as it is and the origin stays open for the
+               real result. */
+            if (success) {
+                unsigned char check[32];
+                sha256(preimage, 32, check);
+                if (memcmp(check, mgr->htlc_origins[i].payment_hash, 32) != 0) {
+                    fprintf(stderr, "LSP: bridge pay result %llu ignored — "
+                            "preimage does not match the payment hash\n",
+                            (unsigned long long)request_id);
+                    return 1;
+                }
+            }
 
             if (success) {
                 /* Capture pre-fulfill state for watchtower */
@@ -701,8 +745,19 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (old_n_htlcs > 0 && old_htlcs)
                     memcpy(old_htlcs, ch->htlcs, old_n_htlcs * sizeof(htlc_t));
 
-                /* Fulfill the HTLC on the client's channel */
-                channel_fulfill_htlc(ch, htlc_id_val, preimage);
+                /* Fulfill the HTLC on the client's channel; the client is
+                   told nothing unless that worked */
+                if (!channel_fulfill_htlc(ch, htlc_id_val, preimage)) {
+                    fprintf(stderr, "LSP: bridge pay result %llu ignored — "
+                            "no HTLC %llu to fulfil on client %zu\n",
+                            (unsigned long long)request_id,
+                            (unsigned long long)htlc_id_val, client_idx);
+                    free(old_htlcs);
+                    return 1;
+                }
+                mgr->htlc_origins[i].active = 0;
+                lsp_channels_note_outbound_paid(mgr,
+                    mgr->htlc_origins[i].payment_hash);
 
                 cJSON *ful = wire_build_update_fulfill_htlc(htlc_id_val, preimage);
                 wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FULFILL_HTLC, ful);
@@ -795,7 +850,14 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                        client_idx, (unsigned long long)htlc_id_val);
             } else {
                 /* Fail the HTLC */
-                channel_fail_htlc(ch, htlc_id_val);
+                if (!channel_fail_htlc(ch, htlc_id_val)) {
+                    fprintf(stderr, "LSP: bridge pay result %llu ignored — "
+                            "no HTLC %llu to fail on client %zu\n",
+                            (unsigned long long)request_id,
+                            (unsigned long long)htlc_id_val, client_idx);
+                    return 1;
+                }
+                mgr->htlc_origins[i].active = 0;
                 cJSON *fail = wire_build_update_fail_htlc(htlc_id_val, "bridge_pay_failed");
                 wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FAIL_HTLC, fail);
                 cJSON_Delete(fail);

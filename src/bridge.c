@@ -601,8 +601,14 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         int success = cJSON_IsTrue(su);
         unsigned char preimage[32];
         memset(preimage, 0, 32);
-        if (success)
-            wire_json_get_hex(json, "preimage", preimage, 32);
+        if (success &&
+            wire_json_get_hex(json, "preimage", preimage, 32) != 32) {
+            /* Not a usable result: never pass on a success without proof */
+            fprintf(stderr, "Bridge: pay_result %llu claims success without "
+                    "a preimage, dropped\n", (unsigned long long)request_id);
+            cJSON_Delete(json);
+            return 1;
+        }
 
         cJSON *msg = wire_build_bridge_pay_result(request_id, success,
                                                     success ? preimage : NULL);

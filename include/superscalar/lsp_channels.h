@@ -157,6 +157,12 @@ typedef struct {
     uint64_t next_request_id;    /* for outbound pay correlation */
     char network[16];            /* chain name; invoices for any other chain
                                     are refused.  Set after init. */
+    /* Payment hashes of the most recent outside payments that completed
+       (ring buffer): a client is not charged a second time for one. */
+    #define LSP_OUTBOUND_PAID_MAX 64
+    unsigned char outbound_paid[LSP_OUTBOUND_PAID_MAX][32];
+    size_t n_outbound_paid;
+    size_t outbound_paid_next;
 
     /* Watchtower (Phase 18) */
     watchtower_t *watchtower;
@@ -568,6 +574,17 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id);
+
+/* 1 if an HTLC for payment_hash32 is in flight through the bridge in either
+   direction. */
+int lsp_channels_hash_in_flight(const lsp_channel_mgr_t *mgr,
+                                 const unsigned char *payment_hash32);
+
+/* Remember / look up an outside payment that completed. */
+void lsp_channels_note_outbound_paid(lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32);
+int lsp_channels_outbound_was_paid(const lsp_channel_mgr_t *mgr,
+                                    const unsigned char *payment_hash32);
 
 /* 1 if another origin can be recorded. */
 int lsp_channels_origin_slot_free(const lsp_channel_mgr_t *mgr);

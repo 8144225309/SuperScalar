@@ -1978,8 +1978,10 @@ int wire_parse_bridge_pay_result(const cJSON *json,
         return 0;
     *request_id = (uint64_t)ri->valuedouble;
     *success = cJSON_IsTrue(su) ? 1 : 0;
-    if (*success && preimage32)
-        wire_json_get_hex(json, "preimage", preimage32, 32);
+    /* A success without its 32-byte preimage is not a result */
+    if (*success && preimage32 &&
+        wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+        return 0;
     return 1;
 }
 

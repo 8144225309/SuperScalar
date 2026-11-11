@@ -4136,3 +4136,213 @@ int test_lsp_outbound_origin_slot_reuse(void) {
     free(mgr.htlc_origins);
     return 1;
 }
+
+/* ---- Outbound pay results: only the right preimage settles the HTLC ---- */
+
+typedef struct {
+    lsp_channel_mgr_t mgr;
+    lsp_t *lsp;
+    int client_fd;      /* LSP's end of the client connection */
+    int client_peer;    /* the client's end */
+    int bridge_peer;    /* the bridge's end of the bridge connection */
+    unsigned char preimage[32], hash[32];
+    uint64_t htlc_id;
+} pay_fixture_t;
+
+/* One client with one 4,000 sat HTLC offered for an outside payment that
+   is in flight as request 7. */
+static int pay_fixture_init(pay_fixture_t *f) {
+    memset(f, 0, sizeof(*f));
+    int cl[2], br[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, cl) != 0) return 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, br) != 0) return 0;
+    f->client_fd = cl[0]; f->client_peer = cl[1];
+    f->bridge_peer = br[1];
+    f->mgr.n_channels = 1;
+    f->mgr.bridge_fd = br[0];
+    f->mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    f->mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    f->mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    f->mgr.next_request_id = 8;
+    f->lsp = calloc(1, sizeof(lsp_t));
+    if (!f->mgr.entries || !f->mgr.htlc_origins || !f->lsp) return 0;
+    f->lsp->client_fds = &f->client_fd;
+    /* The client never answers: reads on its connection end at once */
+    shutdown(f->client_peer, SHUT_WR);
+
+    memset(f->preimage, 0x71, 32);
+    sha256(f->preimage, 32, f->hash);
+    channel_t *ch = &f->mgr.entries[0].channel;
+    ch->local_amount = 100000;
+    ch->remote_amount = 100000;
+    if (!channel_add_htlc(ch, HTLC_RECEIVED, 4000, f->hash, 500, &f->htlc_id))
+        return 0;
+    return lsp_channels_track_outbound_pay(&f->mgr, f->hash, 7, 0, f->htlc_id,
+                                            500) != NULL;
+}
+
+static void pay_fixture_free(pay_fixture_t *f) {
+    close(f->client_fd); close(f->client_peer);
+    close(f->mgr.bridge_fd); close(f->bridge_peer);
+    free(f->mgr.entries[0].channel.htlcs);
+    free(f->mgr.entries);
+    free(f->mgr.htlc_origins);
+    free(f->lsp);
+}
+
+static int deliver_pay_result(pay_fixture_t *f, uint64_t request_id, int success,
+                              const unsigned char *preimage) {
+    cJSON *res = wire_build_bridge_pay_result(request_id, success, preimage);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_PAY_RESULT;
+    msg.json = res;
+    int r = lsp_channels_handle_bridge_msg(&f->mgr, f->lsp, &msg);
+    cJSON_Delete(res);
+    return r;
+}
+
+/* 1 if the HTLC is still pending, the origin still open and the client has
+   been sent nothing. */
+static int pay_untouched(pay_fixture_t *f) {
+    channel_t *ch = &f->mgr.entries[0].channel;
+    wire_msg_t stray;
+    if (wire_recv_timeout(f->client_peer, &stray, 1)) {
+        cJSON_Delete(stray.json);
+        return 0;
+    }
+    return ch->n_htlcs == 1 && ch->htlcs[0].state == HTLC_STATE_ACTIVE &&
+           ch->local_amount == 100000 &&
+           f->mgr.htlc_origins[0].active &&
+           !lsp_channels_outbound_was_paid(&f->mgr, f->hash);
+}
+
+int test_lsp_pay_result_requires_preimage(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    unsigned char wrong[32], zero[32];
+    memset(wrong, 0x72, 32);
+    memset(zero, 0, 32);
+
+    /* "Success" with a preimage of something else, or of nothing */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, wrong), "handled");
+    TEST_ASSERT(pay_untouched(&f), "wrong preimage changes nothing");
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, zero), "handled");
+    TEST_ASSERT(pay_untouched(&f), "zero preimage changes nothing");
+
+    /* "Success" with no preimage at all does not even parse */
+    TEST_ASSERT(!deliver_pay_result(&f, 7, 1, NULL), "success without preimage rejected");
+    TEST_ASSERT(pay_untouched(&f), "missing preimage changes nothing");
+
+    /* A result for another request, or for no request, touches nothing */
+    TEST_ASSERT(deliver_pay_result(&f, 99, 1, f.preimage), "handled");
+    TEST_ASSERT(pay_untouched(&f), "unknown request id changes nothing");
+    TEST_ASSERT(deliver_pay_result(&f, 0, 0, NULL), "handled");
+    TEST_ASSERT(pay_untouched(&f), "request id 0 changes nothing");
+
+    /* The real preimage settles it: the LSP is credited, the client told */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC fulfilled");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "LSP credited the HTLC amount");
+    TEST_ASSERT(!f.mgr.htlc_origins[0].active, "origin closed");
+    TEST_ASSERT(lsp_channels_outbound_was_paid(&f.mgr, f.hash), "remembered as paid");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(f.client_peer, &m, 5), "client notified");
+    TEST_ASSERT_EQ(m.msg_type, MSG_UPDATE_FULFILL_HTLC, "FULFILL to client");
+    uint64_t fid; unsigned char fpre[32];
+    TEST_ASSERT(wire_parse_update_fulfill_htlc(m.json, &fid, fpre), "parse FULFILL");
+    TEST_ASSERT_EQ(fid, f.htlc_id, "the client's HTLC");
+    TEST_ASSERT_MEM_EQ(fpre, f.preimage, 32, "with the preimage");
+    cJSON_Delete(m.json);
+
+    /* A repeat of the result changes nothing further */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "not credited twice");
+
+    pay_fixture_free(&f);
+    return 1;
+}
+
+int test_lsp_pay_result_failure(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+
+    /* A definitive failure refunds the client and closes the origin */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 0, NULL), "handled");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC failed");
+    TEST_ASSERT_EQ(ch->remote_amount, 100000, "client refunded");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "LSP not credited");
+    TEST_ASSERT(!f.mgr.htlc_origins[0].active, "origin closed");
+    TEST_ASSERT(!lsp_channels_outbound_was_paid(&f.mgr, f.hash), "not marked paid");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(f.client_peer, &m, 5), "client notified");
+    TEST_ASSERT_EQ(m.msg_type, MSG_UPDATE_FAIL_HTLC, "FAIL to client");
+    cJSON_Delete(m.json);
+
+    /* A late "success" for the same request finds nothing to settle */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "nothing credited afterwards");
+    TEST_ASSERT(!wire_recv_timeout(f.client_peer, &m, 1), "client told nothing more");
+
+    pay_fixture_free(&f);
+    return 1;
+}
+
+/* ---- One outside payment per hash ---- */
+
+int test_lsp_outbound_one_pay_per_hash(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    f.mgr.ctx = ctx;
+    snprintf(f.mgr.network, sizeof(f.mgr.network), "regtest");
+    chain_backend_t tip;
+    memset(&tip, 0, sizeof(tip));
+    tip.get_block_height = fixed_tip_get_block_height;
+    fixed_tip_height = 100;
+    f.mgr.chain_be = &tip;
+    /* this test reads the LSP's replies on the client connection */
+    int cl[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    close(f.client_fd); close(f.client_peer);
+    f.client_fd = cl[0]; f.client_peer = cl[1];
+
+    char inv[2048], reason[128];
+    uint32_t now = (uint32_t)time(NULL);
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, f.hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+
+    /* Request 7 is paying this hash: a second HTLC for it is refused */
+    TEST_ASSERT(offer_outside_htlc(&f.mgr, f.lsp, f.client_peer, f.hash, 4000000,
+                                    inv, reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "payment_hash_in_flight") == 0,
+                "refused while the first pay is in flight");
+    TEST_ASSERT_EQ(f.mgr.entries[0].channel.n_htlcs, 1, "no second HTLC taken");
+    TEST_ASSERT_EQ(f.mgr.next_request_id, 8, "no second pay requested");
+
+    /* After the first pay completed, the invoice is paid: refused again */
+    f.mgr.htlc_origins[0].active = 0;
+    lsp_channels_note_outbound_paid(&f.mgr, f.hash);
+    TEST_ASSERT(offer_outside_htlc(&f.mgr, f.lsp, f.client_peer, f.hash, 4000000,
+                                    inv, reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "invoice_already_paid") == 0,
+                "refused once the invoice was paid");
+    wire_msg_t stray;
+    TEST_ASSERT(!wire_recv_timeout(f.bridge_peer, &stray, 1), "nothing sent to bridge");
+
+    /* The memory of paid hashes is bounded and keeps the newest */
+    unsigned char h[32];
+    for (int i = 0; i < LSP_OUTBOUND_PAID_MAX; i++) {
+        memset(h, 0, 32); h[0] = (unsigned char)i; h[1] = 0xEE;
+        lsp_channels_note_outbound_paid(&f.mgr, h);
+    }
+    TEST_ASSERT(lsp_channels_outbound_was_paid(&f.mgr, h), "newest remembered");
+    TEST_ASSERT(!lsp_channels_outbound_was_paid(&f.mgr, f.hash), "oldest forgotten");
+
+    pay_fixture_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

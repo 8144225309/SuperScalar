@@ -904,6 +904,12 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     lsp->factory.cltv_timeout, &outside_max_delay);
             if (chk != BRIDGE_PAY_OK)
                 why = lsp_bridge_pay_check_str(chk);
+            /* One outside payment per hash: a second HTLC for a hash that
+               is being paid, or was paid, would be charged for nothing. */
+            else if (lsp_channels_hash_in_flight(mgr, payment_hash))
+                why = "payment_hash_in_flight";
+            else if (lsp_channels_outbound_was_paid(mgr, payment_hash))
+                why = "invoice_already_paid";
             else if (!lsp_channels_origin_slot_free(mgr))
                 why = "too_many_pending_payments";
         }
