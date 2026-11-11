@@ -611,12 +611,12 @@ deploy.
 - [x] `{"result": "resolve", "payment_key": ...}` settles the HTLC without the
       invoice being marked paid; `{"result": "fail", "failure_message":
       "2002"}` and `"0017"` are accepted as failure messages.
-- [ ] `{"result": "fail", "failure_message": "400f" + amount + height}`
+- [x] `{"result": "fail", "failure_message": "400f" + amount + height}`
       (the answer to a keysend) reaches the sender as
       `incorrect_or_unknown_payment_details`.
 - [x] `{"result": "continue"}` for a hash with no invoice forwards or fails
       the HTLC as CLN would without the plugin.
-- [ ] The hook registration `"before": ["keysend"]` is honoured: the plugin
+- [x] The hook registration `"before": ["keysend"]` is honoured: the plugin
       sees a keysend before CLN's keysend plugin does.
 - [ ] The hook must not be answered once the HTLC's channel has gone
       on-chain (CLN aborts); `listpeerchannels` returns `short_channel_id`,
