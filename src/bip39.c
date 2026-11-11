@@ -90,17 +90,24 @@ static int is_separator(char c) {
 }
 
 /* Split a phrase into wordlist indices.  Words may be separated, preceded and
-   followed by any amount of ASCII whitespace.  Rejects words that are not in
-   the wordlist and phrases whose length is not 12, 15, 18, 21 or 24 words. */
+   followed by any amount of ASCII whitespace.  The number of words is checked
+   first (12, 15, 18, 21 or 24), so a phrase of the wrong length is reported
+   as that whatever its words are; then every word must be in the wordlist. */
 static bip39_status_t parse_words(const char *mnemonic,
                                   int indices[BIP39_MAX_WORDS], size_t *n_words_out) {
     size_t n_words = 0;
-    const char *p = mnemonic;
-
-    for (;;) {
+    for (const char *p = mnemonic; *p != '\0';) {
         while (is_separator(*p)) p++;
         if (*p == '\0') break;
+        while (*p != '\0' && !is_separator(*p)) p++;
+        n_words++;
+    }
+    if (n_words < 12 || n_words > BIP39_MAX_WORDS || n_words % 3 != 0)
+        return BIP39_ERR_WORD_COUNT;
 
+    const char *p = mnemonic;
+    for (size_t w = 0; w < n_words; w++) {
+        while (is_separator(*p)) p++;
         const char *start = p;
         while (*p != '\0' && !is_separator(*p)) p++;
         size_t len = (size_t)(p - start);
@@ -112,12 +119,8 @@ static bip39_status_t parse_words(const char *mnemonic,
         int idx = word_index(word);
         secure_zero(word, sizeof(word));
         if (idx < 0) return BIP39_ERR_UNKNOWN_WORD;
-
-        if (n_words == BIP39_MAX_WORDS) return BIP39_ERR_WORD_COUNT;
-        indices[n_words++] = idx;
+        indices[w] = idx;
     }
-
-    if (n_words < 12 || n_words % 3 != 0) return BIP39_ERR_WORD_COUNT;
 
     *n_words_out = n_words;
     return BIP39_OK;

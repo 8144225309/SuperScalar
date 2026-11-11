@@ -109,8 +109,8 @@ int test_bip39_validate_bad_word(void) {
    Mnemonic: "abandon abandon abandon abandon abandon abandon
               abandon abandon abandon abandon abandon about"
    Passphrase: "TREZOR"
-   Expected seed (hex): c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e7e24990e04ee4c7c
-                         9eb5fcda4341fa8e421ef1672ced6ee1fea7138cfa58f5ec01e2c1d7bff00aa8 */
+   Expected seed (hex): c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553
+                         1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04 */
 int test_bip39_seed_derivation(void) {
     const char *mnemonic = "abandon abandon abandon abandon abandon abandon "
                            "abandon abandon abandon abandon abandon about";
@@ -251,24 +251,29 @@ int test_bip39_keyfile_integration(void) {
     return 1;
 }
 
-/* Official BIP39 English test vectors (trezor/python-mnemonic vectors.json,
-   passphrase "TREZOR"): entropy, mnemonic, seed. */
-static const struct {
+/* The official BIP39 English test vectors: all 24 entries of vectors.json in
+   trezor/python-mnemonic (entropy, mnemonic, seed with passphrase "TREZOR").
+   They cover 12-, 18- and 24-word phrases. */
+typedef struct {
     const char *entropy_hex;
     const char *mnemonic;
     const char *seed_hex;
-} BIP39_VECTORS[] = {
+} bip39_vector_t;
+
+static const bip39_vector_t BIP39_VECTORS[] = {
     { "00000000000000000000000000000000",
       "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
       "abandon abandon about",
       "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553"
       "1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04" },
     { "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
-      "legal winner thank year wave sausage worth useful legal winner thank yellow",
+      "legal winner thank year wave sausage worth useful legal winner thank "
+      "yellow",
       "2e8905819b8723fe2c1d161860e5ee1830318dbf49a83bd451cfb8440c28bd6f"
       "a457fe1296106559a3c80937a1c1069be3a3a5bd381ee6260e8d9739fce1f607" },
     { "80808080808080808080808080808080",
-      "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+      "letter advice cage absurd amount doctor acoustic avoid letter advice cage "
+      "above",
       "d71de856f81a8acc65e6fc851a38d4d7ec216fd0796d0a6827a3ad6ed5511a30"
       "fa280f12eb2e47ed2ac03b5c462a0358d18d69fe4f985ec81778c1b370b652a8" },
     { "ffffffffffffffffffffffffffffffff",
@@ -280,61 +285,261 @@ static const struct {
       "abandon abandon abandon abandon abandon abandon abandon abandon agent",
       "035895f2f481b1b0f01fcf8c289c794660b289981a78f8106447707fdd9666ca"
       "06da5a9a565181599b79f53b844d8a71dd9f439c52a3d7b3e8a79c906ac845fa" },
+    { "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+      "legal winner thank year wave sausage worth useful legal winner thank year "
+      "wave sausage worth useful legal will",
+      "f2b94508732bcbacbcc020faefecfc89feafa6649a5491b8c952cede496c214a"
+      "0c7b3c392d168748f2d4a612bada0753b52a1c7ac53c1e93abd5c6320b9e95dd" },
+    { "808080808080808080808080808080808080808080808080",
+      "letter advice cage absurd amount doctor acoustic avoid letter advice cage "
+      "absurd amount doctor acoustic avoid letter always",
+      "107d7c02a5aa6f38c58083ff74f04c607c2d2c0ecc55501dadd72d025b751bc2"
+      "7fe913ffb796f841c49b1d33b610cf0e91d3aa239027f5e99fe4ce9e5088cd65" },
+    { "ffffffffffffffffffffffffffffffffffffffffffffffff",
+      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo when",
+      "0cd6e5d827bb62eb8fc1e262254223817fd068a74b5b449cc2f667c3f1f985a7"
+      "6379b43348d952e2265b4cd129090758b3e3c2c49103b5051aac2eaeb890a528" },
     { "0000000000000000000000000000000000000000000000000000000000000000",
       "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
       "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
       "abandon abandon abandon abandon abandon art",
       "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd30971"
       "70af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8" },
+    { "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+      "legal winner thank year wave sausage worth useful legal winner thank year "
+      "wave sausage worth useful legal winner thank year wave sausage worth title",
+      "bc09fca1804f7e69da93c2f2028eb238c227f2e9dda30cd63699232578480a40"
+      "21b146ad717fbb7e451ce9eb835f43620bf5c514db0f8add49f5d121449d3e87" },
     { "8080808080808080808080808080808080808080808080808080808080808080",
       "letter advice cage absurd amount doctor acoustic avoid letter advice cage "
-      "absurd amount doctor acoustic avoid letter advice cage absurd amount doctor "
-      "acoustic bless",
+      "absurd amount doctor acoustic avoid letter advice cage absurd amount "
+      "doctor acoustic bless",
       "c0c519bd0e91a2ed54357d9d1ebef6f5af218a153624cf4f2da911a0ed8f7a09"
       "e2ef61af0aca007096df430022f7a2b6fb91661a9589097069720d015e4e982f" },
     { "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo "
-      "zoo zoo zoo zoo vote",
+      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo "
+      "zoo zoo zoo zoo zoo vote",
       "dd48c104698c30cfe2b6142103248622fb7bb0ff692eebb00089b32d22484e16"
       "13912f0a5b694407be899ffd31ed3992c456cdf60f5d4564b8ba3f05a69890ad" },
     { "9e885d952ad362caeb4efe34a8e91bd2",
-      "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic",
+      "ozone drill grab fiber curtain grace pudding thank cruise elder eight "
+      "picnic",
       "274ddc525802f7c828d8ef7ddbcdc5304e87ac3535913611fbbfa986d0c9e547"
       "6c91689f9c8a54fd55bd38606aa6a8595ad213d4c9c9f9aca3fb217069a41028" },
+    { "6610b25967cdcca9d59875f5cb50b0ea75433311869e930b",
+      "gravity machine north sort system female filter attitude volume fold club "
+      "stay feature office ecology stable narrow fog",
+      "628c3827a8823298ee685db84f55caa34b5cc195a778e52d45f59bcf75aba68e"
+      "4d7590e101dc414bc1bbd5737666fbbef35d1f1903953b66624f910feef245ac" },
+    { "68a79eaca2324873eacc50cb9c6eca8cc68ea5d936f98787c60c7ebc74e6ce7c",
+      "hamster diagram private dutch cause delay private meat slide toddler razor "
+      "book happy fancy gospel tennis maple dilemma loan word shrug inflict delay "
+      "length",
+      "64c87cde7e12ecf6704ab95bb1408bef047c22db4cc7491c4271d170a1b213d2"
+      "0b385bc1588d9c7b38f1b39d415665b8a9030c9ec653d75e65f847d8fc1fc440" },
+    { "c0ba5a8e914111210f2bd131f3d5e08d",
+      "scheme spot photo card baby mountain device kick cradle pact join borrow",
+      "ea725895aaae8d4c1cf682c1bfd2d358d52ed9f0f0591131b559e2724bb234fc"
+      "a05aa9c02c57407e04ee9dc3b454aa63fbff483a8b11de949624b9f1831a9612" },
+    { "6d9be1ee6ebd27a258115aad99b7317b9c8d28b6d76431c3",
+      "horn tenant knee talent sponsor spell gate clip pulse soap slush warm "
+      "silver nephew swap uncle crack brave",
+      "fd579828af3da1d32544ce4db5c73d53fc8acc4ddb1e3b251a31179cdb71e853"
+      "c56d2fcb11aed39898ce6c34b10b5382772db8796e52837b54468aeb312cfc3d" },
+    { "9f6a2878b2520799a44ef18bc7df394e7061a224d2c33cd015b157d746869863",
+      "panda eyebrow bullet gorilla call smoke muffin taste mesh discover soft "
+      "ostrich alcohol speed nation flash devote level hobby quick inner drive "
+      "ghost inside",
+      "72be8e052fc4919d2adf28d5306b5474b0069df35b02303de8c1729c9538dbb6"
+      "fc2d731d5f832193cd9fb6aeecbc469594a70e3dd50811b5067f3b88b28c3e8d" },
+    { "23db8160a31d3e0dca3688ed941adbf3",
+      "cat swing flag economy stadium alone churn speed unique patch report train",
+      "deb5f45449e615feff5640f2e49f933ff51895de3b4381832b3139941c57b592"
+      "05a42480c52175b6efcffaa58a2503887c1e8b363a707256bdd2b587b46541f5" },
+    { "8197a4a47f0425faeaa69deebc05ca29c0a5b5cc76ceacc0",
+      "light rule cinnamon wrap drastic word pride squirrel upgrade then income "
+      "fatal apart sustain crack supply proud access",
+      "4cbdff1ca2db800fd61cae72a57475fdc6bab03e441fd63f96dabd1f183ef5b7"
+      "82925f00105f318309a7e9c3ea6967c7801e46c8a58082674c860a37b93eda02" },
+    { "066dca1a2bb7e8a1db2832148ce9933eea0f3ac9548d793112d9a95c9407efad",
+      "all hour make first leader extend hole alien behind guard gospel lava path "
+      "output census museum junior mass reopen famous sing advance salt reform",
+      "26e975ec644423f4a4c4f4215ef09b4bd7ef924e85d1d17c4cf3f136c2863cf6"
+      "df0a475045652c57eb5fb41513ca2a2d67722b77e954b4b3fc11f7590449191d" },
+    { "f30f8c1da665478f49b001d94c5fc452",
+      "vessel ladder alter error federal sibling chat ability sun glass valve "
+      "picture",
+      "2aaa9242daafcee6aa9d7269f17d4efe271e1b9a529178d7dc139cd18747090b"
+      "f9d60295d0ce74309a78852a9caadf0af48aae1c6253839624076224374bc63f" },
+    { "c10ec20dc3cd9f652c7fac2f1230f7a3c828389a14392f05",
+      "scissors invite lock maple supreme raw rapid void congress muscle digital "
+      "elegant little brisk hair mango congress clump",
+      "7b4a10be9d98e6cba265566db7f136718e1398c71cb581e1b2f464cac1ceedf4"
+      "f3e274dc270003c670ad8d02c4558b2f8e39edea2775c9e232c7cb798b069e88" },
     { "f585c11aec520db57dd353c69554b21a89b20fb0650966fa0a9d6f74fd989d8f",
-      "void come effort suffer camp survey warrior heavy shoot primary clutch crush "
-      "open amazing screen patrol group space point ten exist slush involve unfold",
+      "void come effort suffer camp survey warrior heavy shoot primary clutch "
+      "crush open amazing screen patrol group space point ten exist slush involve "
+      "unfold",
       "01f5bced59dec48e362f2c45b5de68b9fd6c92c6634f44d6d40aab69056506f0"
       "e35524a518034ddc1192e1dacd32c1ed3eaa3c3b131c88ed8e7e54c49a5d0998" },
 };
 #define N_BIP39_VECTORS (sizeof(BIP39_VECTORS) / sizeof(BIP39_VECTORS[0]))
 
-/* Every official vector: entropy -> mnemonic, mnemonic -> entropy, validity
-   and seed. */
+/* The official set has no 15- or 21-word phrase.  These fill the gap: 160-
+   and 224-bit entropy, with mnemonic and seed (passphrase "TREZOR") computed
+   by a separate reference implementation of the BIP39 algorithm that
+   reproduces all 24 official vectors. */
+static const bip39_vector_t BIP39_VECTORS_15_21[] = {
+    { "0000000000000000000000000000000000000000",
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon abandon abandon abandon address",
+      "fa08713f46bf5cb48728ceb70e3aae1bc53c5cb7b4e29c5610261d1cbb7be3be"
+      "d4d805256fec515754d2be35974fc5da678168e9d9bb0cb70948026923b0def3" },
+    { "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+      "legal winner thank year wave sausage worth useful legal winner thank year "
+      "wave sausage wise",
+      "f938c2f3ebd11f1c9057b713d977b5260e4282a57811ab163a9708c4ce153079"
+      "83ac24c4451c7cb353b2002d0a1ee8a404fa59f0f6aa8323fa9bb61248cf4808" },
+    { "8080808080808080808080808080808080808080",
+      "letter advice cage absurd amount doctor acoustic avoid letter advice cage "
+      "absurd amount doctor accident",
+      "bc40a19ec918698b32e3e13ed906006d9e3b9987ba7dee6fc53a824774cc5be6"
+      "8f89b865bbfbac21b2fb99c016e214f54f239f77dd99881c1b81de275c60be3d" },
+    { "ffffffffffffffffffffffffffffffffffffffff",
+      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrist",
+      "bfee6f9d2bcfa1331bd6482a24abca521e5f7e769498b9a0146672194c7356e4"
+      "e409be22bc379c8b64fee2aa24b54d3ec20d10a083eaa5d1d6b4b365941ad37c" },
+    { "69ed8e78cd245e17a46202dc897c10fb78aa7fd4",
+      "hazard hockey owner olympic echo armed muscle doctor symptom episode "
+      "aerobic want melt divide fashion",
+      "2d4b7283f4ba4b4e8f090cdffe4dd0f8774f554e75b64b7ad96c4185bec75eaf"
+      "aaa6ad70408ccef1d8ecf5ff3bd5806b1265c9f15d0a2dafa54e1ca10320267e" },
+    { "00000000000000000000000000000000000000000000000000000000",
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon admit",
+      "e7dadc189d2e8d07ac278d9ec98a1d2d327e4a6b7df494c00cbf2cbf2d3543da"
+      "c7000fc72d4ada8d9997dc8db388ff22c6d79f604a7455f2df5534a28eee04c6" },
+    { "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+      "legal winner thank year wave sausage worth useful legal winner thank year "
+      "wave sausage worth useful legal winner thank year viable",
+      "99c0597b2bef5ca4859e21075fee0fc931747a30469b6f564d95f74913c357ac"
+      "eb55221b4f4fe6965e871340b45754b1ae59e53da1797b69b30c5fa40ec105b8" },
+    { "80808080808080808080808080808080808080808080808080808080",
+      "letter advice cage absurd amount doctor acoustic avoid letter advice cage "
+      "absurd amount doctor acoustic avoid letter advice cage absurd apart",
+      "708f0487a927474944ed882e5f05954656bd82bebcf4119b1233e90ee8b27b16"
+      "d48a77be2c2aceecc32b07a94a5e9a04d94856a2b9fd7c2362ac4153420ef2e6" },
+    { "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo "
+      "zoo zoo veteran",
+      "4aa0af4ca02ef1d9fa675cd02aa06d318425564e7fadd3d51b6165cc56d77398"
+      "f28d8522073cd036c2a4a24a83e919211c84500d96cb120084e613ff5fcd96c1" },
+    { "3ea4cc13a3edc47bd067eb1c1b5754385dc0983edca4a2ae33cbd03b",
+      "dirt chapter agent elephant sword digital dose word bright survey steak "
+      "idle swing equal window nest pencil immense very parrot reveal",
+      "3b3de79d6227d15c80af907e6e95b3d8b3a21a3bc8cb537466d6f583fbe0d0b5"
+      "07f820805b4100434a704120b79d01cd76672f5753dce32ee5f00819f7707f5d" },
+};
+#define N_BIP39_VECTORS_15_21 \
+    (sizeof(BIP39_VECTORS_15_21) / sizeof(BIP39_VECTORS_15_21[0]))
+
+/* Check one vector in every direction: entropy -> mnemonic, mnemonic ->
+   entropy, validity and seed.  Returns the phrase length in words, 0 on a
+   mismatch. */
+static size_t check_vector(const bip39_vector_t *v) {
+    size_t ent_len = strlen(v->entropy_hex) / 2;
+    unsigned char entropy[32], recovered[32], expected_seed[64], seed[64];
+    if (!hex_to_bytes(v->entropy_hex, entropy, ent_len)) return 0;
+    if (!hex_to_bytes(v->seed_hex, expected_seed, 64)) return 0;
+
+    char mnemonic[512];
+    if (!bip39_entropy_to_mnemonic(entropy, ent_len, mnemonic, sizeof(mnemonic))) return 0;
+    if (strcmp(mnemonic, v->mnemonic) != 0) return 0;
+
+    if (bip39_check(v->mnemonic) != BIP39_OK) return 0;
+    if (bip39_mnemonic_to_entropy(v->mnemonic, recovered, sizeof(recovered)) != ent_len)
+        return 0;
+    if (memcmp(recovered, entropy, ent_len) != 0) return 0;
+
+    if (!bip39_mnemonic_to_seed(v->mnemonic, "TREZOR", seed)) return 0;
+    if (memcmp(seed, expected_seed, 64) != 0) return 0;
+
+    size_t n_words = 1;
+    for (const char *c = v->mnemonic; *c; c++) {
+        if (*c == ' ') n_words++;
+    }
+    return n_words;
+}
+
+/* Every official vector, in every direction. */
 int test_bip39_official_vectors(void) {
+    size_t by_length[25] = { 0 };
+    TEST_ASSERT(N_BIP39_VECTORS == 24, "the official set has 24 vectors");
     for (size_t i = 0; i < N_BIP39_VECTORS; i++) {
-        size_t ent_len = strlen(BIP39_VECTORS[i].entropy_hex) / 2;
-        unsigned char entropy[32], recovered[32], expected_seed[64], seed[64];
-        TEST_ASSERT(hex_to_bytes(BIP39_VECTORS[i].entropy_hex, entropy, ent_len),
-                    "entropy hex");
-        TEST_ASSERT(hex_to_bytes(BIP39_VECTORS[i].seed_hex, expected_seed, 64),
-                    "seed hex");
+        size_t n_words = check_vector(&BIP39_VECTORS[i]);
+        if (n_words == 0)
+            printf("  official vector %zu does not match\n", i);
+        TEST_ASSERT(n_words == 12 || n_words == 18 || n_words == 24,
+                    "official vector matches");
+        by_length[n_words]++;
+    }
+    TEST_ASSERT(by_length[12] == 8 && by_length[18] == 8 && by_length[24] == 8,
+                "eight vectors each of 12, 18 and 24 words");
+    return 1;
+}
 
-        char mnemonic[512];
-        TEST_ASSERT(bip39_entropy_to_mnemonic(entropy, ent_len, mnemonic, sizeof(mnemonic)),
-                    "entropy_to_mnemonic");
-        TEST_ASSERT(strcmp(mnemonic, BIP39_VECTORS[i].mnemonic) == 0,
-                    "mnemonic matches vector");
+/* 15- and 21-word phrases (160- and 224-bit entropy), and the phrase lengths
+   around them that are not valid. */
+int test_bip39_15_and_21_words(void) {
+    size_t by_length[25] = { 0 };
+    for (size_t i = 0; i < N_BIP39_VECTORS_15_21; i++) {
+        size_t n_words = check_vector(&BIP39_VECTORS_15_21[i]);
+        if (n_words == 0)
+            printf("  15/21-word vector %zu does not match\n", i);
+        TEST_ASSERT(n_words == 15 || n_words == 21, "vector matches");
+        by_length[n_words]++;
+    }
+    TEST_ASSERT(by_length[15] == 5 && by_length[21] == 5,
+                "five vectors each of 15 and 21 words");
 
-        TEST_ASSERT(bip39_check(BIP39_VECTORS[i].mnemonic) == BIP39_OK, "vector is valid");
-        TEST_ASSERT(bip39_mnemonic_to_entropy(BIP39_VECTORS[i].mnemonic, recovered,
-                                              sizeof(recovered)) == ent_len,
-                    "entropy length");
-        TEST_ASSERT(memcmp(recovered, entropy, ent_len) == 0, "entropy matches vector");
+    /* Generated phrases of these lengths validate and round-trip. */
+    static const int counts[] = { 15, 21 };
+    for (size_t i = 0; i < 2; i++) {
+        char generated[512], normalized[256];
+        unsigned char entropy[32], seed[64];
+        TEST_ASSERT(bip39_generate(counts[i], generated, sizeof(generated)), "generate");
+        TEST_ASSERT(bip39_check(generated) == BIP39_OK, "generated phrase is valid");
+        TEST_ASSERT(bip39_mnemonic_to_entropy(generated, entropy, sizeof(entropy)) ==
+                        (size_t)counts[i] * 4 / 3,
+                    "entropy length for the phrase length");
+        TEST_ASSERT(bip39_normalize(generated, normalized, sizeof(normalized)) &&
+                    strcmp(generated, normalized) == 0, "generated phrase is canonical");
+        TEST_ASSERT(bip39_mnemonic_to_seed(generated, "", seed), "seed");
+    }
 
-        TEST_ASSERT(bip39_mnemonic_to_seed(BIP39_VECTORS[i].mnemonic, "TREZOR", seed),
-                    "mnemonic_to_seed");
-        TEST_ASSERT(memcmp(seed, expected_seed, 64) == 0, "seed matches vector");
+    /* One word short or long of 15 and of 21 is a word-count error; a
+       phrase of the right length with one word changed fails the checksum. */
+    for (size_t v = 0; v < N_BIP39_VECTORS_15_21; v++) {
+        const char *phrase = BIP39_VECTORS_15_21[v].mnemonic;
+        char longer[512], shorter[512], altered[512];
+
+        snprintf(longer, sizeof(longer), "%s abandon", phrase);
+        TEST_ASSERT(bip39_check(longer) == BIP39_ERR_WORD_COUNT, "16 or 22 words");
+
+        snprintf(shorter, sizeof(shorter), "%s", phrase);
+        *strrchr(shorter, ' ') = '\0';
+        TEST_ASSERT(bip39_check(shorter) == BIP39_ERR_WORD_COUNT, "14 or 20 words");
+
+        /* Same length, first word replaced by a different wordlist word. */
+        const char *rest = strchr(phrase, ' ');
+        snprintf(altered, sizeof(altered), "%s%s",
+                 strncmp(phrase, "zoo ", 4) == 0 ? "abandon" : "zoo", rest);
+        TEST_ASSERT(bip39_check(altered) == BIP39_ERR_CHECKSUM,
+                    "a changed word breaks the checksum");
+        unsigned char seed[64];
+        TEST_ASSERT(!bip39_mnemonic_to_seed(altered, "TREZOR", seed),
+                    "no seed from the altered phrase");
     }
     return 1;
 }
@@ -372,12 +577,22 @@ int test_bip39_check_reports_reason(void) {
 
     /* A valid 24-word phrase followed by more words is not a valid phrase. */
     char long_phrase[512];
-    snprintf(long_phrase, sizeof(long_phrase), "%s abandon", BIP39_VECTORS[5].mnemonic);
+    snprintf(long_phrase, sizeof(long_phrase), "%s abandon", BIP39_VECTORS[8].mnemonic);
     TEST_ASSERT(bip39_check(long_phrase) == BIP39_ERR_WORD_COUNT, "25 words");
     TEST_ASSERT(!bip39_validate(long_phrase), "25 words do not validate");
     unsigned char entropy[32];
     TEST_ASSERT(bip39_mnemonic_to_entropy(long_phrase, entropy, sizeof(entropy)) == 0,
                 "25 words give no entropy");
+
+    /* A phrase of the wrong length is a word-count error whatever its words
+       are: the count is what the user has to fix first. */
+    snprintf(long_phrase, sizeof(long_phrase), "%s notaword", BIP39_VECTORS[8].mnemonic);
+    TEST_ASSERT(bip39_check(long_phrase) == BIP39_ERR_WORD_COUNT,
+                "25 words, the last one unknown");
+    TEST_ASSERT(bip39_check("legal winner thank year wave sausage worth usefull "
+                            "legal winner thank") == BIP39_ERR_WORD_COUNT,
+                "11 words, one misspelt");
+    TEST_ASSERT(bip39_check("one two three") == BIP39_ERR_WORD_COUNT, "3 words");
 
     for (int st = BIP39_OK; st <= BIP39_ERR_CHECKSUM; st++) {
         const char *msg = bip39_status_str((bip39_status_t)st);

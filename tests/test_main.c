@@ -1839,6 +1839,7 @@ extern int test_bip39_vector_7f(void);
 extern int test_bip39_generate(void);
 extern int test_bip39_keyfile_integration(void);
 extern int test_bip39_official_vectors(void);
+extern int test_bip39_15_and_21_words(void);
 extern int test_bip39_check_reports_reason(void);
 extern int test_bip39_seed_refuses_invalid_mnemonic(void);
 extern int test_bip39_whitespace_normalized(void);
@@ -3770,6 +3771,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bip39_generate);
     RUN_TEST(test_bip39_keyfile_integration);
     RUN_TEST(test_bip39_official_vectors);
+    RUN_TEST(test_bip39_15_and_21_words);
     RUN_TEST(test_bip39_check_reports_reason);
     RUN_TEST(test_bip39_seed_refuses_invalid_mnemonic);
     RUN_TEST(test_bip39_whitespace_normalized);
