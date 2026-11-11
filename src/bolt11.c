@@ -174,10 +174,14 @@ static int parse_network(const char *hrp, size_t hrp_len,
         msat = n * 100000000ULL * 1000ULL;
     } else if (i == hrp_len - 1) {
         switch (hrp[i]) {
-        case 'm': msat = n * 100000ULL;      break; /* milli-BTC */
-        case 'u': msat = n * 100ULL;         break; /* micro-BTC */
-        case 'n': msat = n / 10;             break; /* nano-BTC */
-        case 'p': msat = n / 10000;          break; /* pico-BTC */
+        /* 1 BTC = 10^11 msat */
+        case 'm': msat = n * 100000000ULL;   break; /* milli-BTC */
+        case 'u': msat = n * 100000ULL;      break; /* micro-BTC */
+        case 'n': msat = n * 100ULL;         break; /* nano-BTC */
+        case 'p':                                   /* pico-BTC = 0.1 msat */
+            if (n % 10 != 0) return 0;
+            msat = n / 10;
+            break;
         default: return 0;
         }
     } else return 0;
@@ -200,9 +204,9 @@ static int build_hrp(const bolt11_invoice_t *inv, char *hrp, size_t hrp_cap) {
         uint64_t m = inv->amount_msat;
         const char *sfx = "";
         uint64_t val = 0;
-        if (m % 100000 == 0) {        val = m / 100000; sfx = "m"; }
-        else if (m % 100 == 0) {      val = m / 100;    sfx = "u"; }
-        else if (m % 10 == 0 && m >= 10) { val = m / 10; sfx = "n"; }
+        if (m % 100000000ULL == 0) {  val = m / 100000000ULL; sfx = "m"; }
+        else if (m % 100000 == 0) {   val = m / 100000; sfx = "u"; }
+        else if (m % 100 == 0) {      val = m / 100;    sfx = "n"; }
         else {                         val = m * 10;     sfx = "p"; }
         n = snprintf(hrp + pos, hrp_cap - pos, "%llu%s",
                      (unsigned long long)val, sfx);
@@ -297,14 +301,14 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
-        case 4: { /* x: expiry */
+        case 6: { /* x: expiry */
             uint64_t exp = 0;
             for (size_t k = 0; k < fdata5_len; k++)
                 exp = (exp << 5) | fdata5[k];
             out->expiry = (uint32_t)exp;
             break;
         }
-        case 5: { /* h: description_hash (52 groups = 32 bytes) */
+        case 23: { /* h: description_hash (52 groups = 32 bytes) */
             if (fdata5_len == 52) {
                 unsigned char tmp[32];
                 if (fivebit_to_bytes(fdata5, 52, tmp, 32) == 32) {
@@ -314,7 +318,7 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
-        case 6: { /* c: min_final_cltv_expiry */
+        case 24: { /* c: min_final_cltv_expiry */
             uint64_t clv = 0;
             for (size_t k = 0; k < fdata5_len; k++)
                 clv = (clv << 5) | fdata5[k];
@@ -369,7 +373,7 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
-        case 20: { /* f (features) */
+        case 5: { /* 9: feature bits */
             if (fdata5_len <= 4) {
                 uint16_t feat = 0;
                 for (size_t k = 0; k < fdata5_len; k++)
@@ -529,7 +533,7 @@ int bolt11_encode(const bolt11_invoice_t *inv,
     if (inv->has_description_hash) {
         uint8_t f[52];
         bytes_to_5bit(inv->description_hash, 32, f, 52);
-        WRITE_FIELD(5, f, 52);
+        WRITE_FIELD(23, f, 52);
     }
 
     /* x: expiry (if non-default) */
@@ -542,7 +546,7 @@ int bolt11_encode(const bolt11_invoice_t *inv,
         else if (exp < (1u << 10)) { f_len = 2; f[0] = (uint8_t)(exp >> 5); f[1] = (uint8_t)(exp & 0x1f); }
         else if (exp < (1u << 15)) { f_len = 3; f[0] = (uint8_t)(exp >> 10); f[1] = (uint8_t)((exp >> 5) & 0x1f); f[2] = (uint8_t)(exp & 0x1f); }
         else                       { f_len = 4; f[0] = (uint8_t)(exp >> 15); f[1] = (uint8_t)((exp >> 10) & 0x1f); f[2] = (uint8_t)((exp >> 5) & 0x1f); f[3] = (uint8_t)(exp & 0x1f); }
-        WRITE_FIELD(4, f, f_len);
+        WRITE_FIELD(6, f, f_len);
     }
 
     /* c: min_final_cltv_expiry */
@@ -553,7 +557,7 @@ int bolt11_encode(const bolt11_invoice_t *inv,
         if (clv < 32)      { f_len = 1; f[0] = (uint8_t)clv; }
         else if (clv < 1024){ f_len = 2; f[0] = (uint8_t)(clv >> 5); f[1] = (uint8_t)(clv & 0x1f); }
         else               { f_len = 3; f[0] = (uint8_t)(clv >> 10); f[1] = (uint8_t)((clv >> 5) & 0x1f); f[2] = (uint8_t)(clv & 0x1f); }
-        WRITE_FIELD(6, f, f_len);
+        WRITE_FIELD(24, f, f_len);
     }
 
     /* n: payee pubkey (tag 19 = bech32 'n') */

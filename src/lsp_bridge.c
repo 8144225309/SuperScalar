@@ -3,12 +3,158 @@
 #include "superscalar/lsp_channels_internal.h"
 #include "superscalar/htlc_inbound.h"
 #include "superscalar/persist.h"
+#include "superscalar/bolt11.h"
+#include "superscalar/regtest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd) {
     mgr->bridge_fd = bridge_fd;
+}
+
+const char *lsp_channels_network(const lsp_channel_mgr_t *mgr) {
+    if (!mgr) return NULL;
+    if (mgr->network[0]) return mgr->network;
+    if (mgr->watchtower && mgr->watchtower->rt &&
+        mgr->watchtower->rt->network[0])
+        return mgr->watchtower->rt->network;
+    return NULL;
+}
+
+/* --- Outbound invoice checks --- */
+
+const char *lsp_bridge_pay_check_str(bridge_pay_check_t r) {
+    switch (r) {
+    case BRIDGE_PAY_OK:                 return "ok";
+    case BRIDGE_PAY_BAD_INVOICE:        return "invalid_invoice";
+    case BRIDGE_PAY_WRONG_NETWORK:      return "invoice_wrong_network";
+    case BRIDGE_PAY_HASH_MISMATCH:      return "invoice_payment_hash_mismatch";
+    case BRIDGE_PAY_NO_AMOUNT:          return "invoice_without_amount";
+    case BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC: return "invoice_amount_exceeds_htlc";
+    case BRIDGE_PAY_EXPIRED:            return "invoice_expired";
+    }
+    return "invalid_invoice";
+}
+
+int lsp_bridge_invoice_network_ok(const char *network, const char *invoice_hrp) {
+    if (!network || !invoice_hrp) return 0;
+    if (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0)
+        return strcmp(invoice_hrp, "bc") == 0;
+    if (strcmp(network, "testnet") == 0 || strcmp(network, "testnet4") == 0)
+        return strcmp(invoice_hrp, "tb") == 0;
+    if (strcmp(network, "signet") == 0)
+        return strcmp(invoice_hrp, "tbs") == 0;
+    if (strcmp(network, "regtest") == 0)
+        return strcmp(invoice_hrp, "bcrt") == 0;
+    return 0;
+}
+
+uint64_t lsp_bridge_outbound_budget_msat(uint64_t htlc_amount_sats,
+                                           uint64_t routing_fee_ppm) {
+    if (htlc_amount_sats > UINT64_MAX / 1000) return 0;
+    if (routing_fee_ppm >= 1000000) return 0;
+    uint64_t amount_msat = htlc_amount_sats * 1000;
+    /* ceil(amount_msat * ppm / 10^6) without overflowing 64 bits */
+    uint64_t fee_msat = (amount_msat / 1000000) * routing_fee_ppm +
+        ((amount_msat % 1000000) * routing_fee_ppm + 999999) / 1000000;
+    if (fee_msat >= amount_msat) return 0;
+    return amount_msat - fee_msat;
+}
+
+bridge_pay_check_t lsp_bridge_check_outbound_invoice(
+    secp256k1_context *ctx, const char *bolt11,
+    const unsigned char *htlc_payment_hash32, uint64_t htlc_amount_sats,
+    uint64_t routing_fee_ppm, const char *network, uint64_t now,
+    uint64_t *invoice_msat_out, uint64_t *budget_msat_out,
+    uint32_t *min_final_cltv_out) {
+    if (!ctx || !bolt11 || !htlc_payment_hash32)
+        return BRIDGE_PAY_BAD_INVOICE;
+
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    if (!bolt11_decode(ctx, bolt11, &inv))
+        return BRIDGE_PAY_BAD_INVOICE;
+
+    if (!lsp_bridge_invoice_network_ok(network, inv.network))
+        return BRIDGE_PAY_WRONG_NETWORK;
+
+    /* The client's HTLC only pays the LSP back if the outside payment
+       releases the preimage of this exact hash. */
+    if (memcmp(inv.payment_hash, htlc_payment_hash32, 32) != 0)
+        return BRIDGE_PAY_HASH_MISMATCH;
+
+    /* An amountless invoice lets the payer choose the amount, so there is
+       nothing to bound the spend with. */
+    if (!inv.has_amount || inv.amount_msat == 0)
+        return BRIDGE_PAY_NO_AMOUNT;
+
+    uint64_t budget = lsp_bridge_outbound_budget_msat(htlc_amount_sats,
+                                                        routing_fee_ppm);
+    if (inv.amount_msat > budget)
+        return BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC;
+
+    if (now >= (uint64_t)inv.timestamp + (uint64_t)inv.expiry)
+        return BRIDGE_PAY_EXPIRED;
+
+    if (invoice_msat_out) *invoice_msat_out = inv.amount_msat;
+    if (budget_msat_out) *budget_msat_out = budget;
+    if (min_final_cltv_out)
+        *min_final_cltv_out = inv.min_final_cltv_expiry > 0
+            ? (uint32_t)inv.min_final_cltv_expiry : 0;
+    return BRIDGE_PAY_OK;
+}
+
+/* Routing-fee allowance for operator-initiated pays: 0.5% of the invoice,
+   at least 5 sat (Core Lightning's own `pay` defaults). */
+#define OPERATOR_PAY_FEE_PPM        5000
+#define OPERATOR_PAY_FEE_FLOOR_MSAT 5000
+
+int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
+                               uint64_t *request_id_out, const char **err_out) {
+    const char *err = NULL;
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    if (!mgr || !bolt11)
+        err = "missing invoice";
+    else if (mgr->bridge_fd < 0)
+        err = "bridge not connected";
+    else if (!bolt11_decode(mgr->ctx, bolt11, &inv))
+        err = "invalid_invoice";
+    else if (!lsp_bridge_invoice_network_ok(lsp_channels_network(mgr),
+                                             inv.network))
+        err = "invoice_wrong_network";
+    else if (!inv.has_amount || inv.amount_msat == 0)
+        err = "invoice_without_amount";
+    else if ((uint64_t)time(NULL) >=
+             (uint64_t)inv.timestamp + (uint64_t)inv.expiry)
+        err = "invoice_expired";
+    if (err) {
+        if (err_out) *err_out = err;
+        return 0;
+    }
+
+    uint64_t fee_allow = inv.amount_msat / 1000000 * OPERATOR_PAY_FEE_PPM +
+        (inv.amount_msat % 1000000) * OPERATOR_PAY_FEE_PPM / 1000000;
+    if (fee_allow < OPERATOR_PAY_FEE_FLOOR_MSAT)
+        fee_allow = OPERATOR_PAY_FEE_FLOOR_MSAT;
+
+    uint64_t request_id = mgr->next_request_id++;
+    cJSON *pay = wire_build_bridge_send_pay(bolt11, inv.payment_hash,
+                                              request_id,
+                                              inv.amount_msat + fee_allow);
+    int ok = pay && wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
+    if (pay) cJSON_Delete(pay);
+    if (mgr->persist)
+        persist_save_counter((persist_t *)mgr->persist,
+                              "next_request_id", mgr->next_request_id);
+    if (!ok) {
+        if (err_out) *err_out = "bridge send failed";
+        return 0;
+    }
+    if (request_id_out) *request_id_out = request_id;
+    return 1;
 }
 
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,

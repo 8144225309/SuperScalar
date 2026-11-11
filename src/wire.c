@@ -1797,11 +1797,13 @@ cJSON *wire_build_bridge_fail_htlc(const unsigned char *payment_hash32,
 
 cJSON *wire_build_bridge_send_pay(const char *bolt11,
                                     const unsigned char *payment_hash32,
-                                    uint64_t request_id) {
+                                    uint64_t request_id,
+                                    uint64_t max_total_msat) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "bolt11", bolt11);
     wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
     cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    cJSON_AddNumberToObject(j, "max_total_msat", (double)max_total_msat);
     return j;
 }
 
@@ -1937,14 +1939,18 @@ int wire_parse_bridge_fail_htlc(const cJSON *json,
 int wire_parse_bridge_send_pay(const cJSON *json,
                                  char *bolt11, size_t bolt11_len,
                                  unsigned char *payment_hash32,
-                                 uint64_t *request_id) {
+                                 uint64_t *request_id,
+                                 uint64_t *max_total_msat) {
     cJSON *b = cJSON_GetObjectItem(json, "bolt11");
     cJSON *ri = cJSON_GetObjectItem(json, "request_id");
-    if (!b || !cJSON_IsString(b) || !wire_check_nonneg(ri))
+    cJSON *mt = cJSON_GetObjectItem(json, "max_total_msat");
+    if (!b || !cJSON_IsString(b) || !wire_check_nonneg(ri) ||
+        !wire_check_nonneg(mt))
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
     *request_id = (uint64_t)ri->valuedouble;
+    *max_total_msat = (uint64_t)mt->valuedouble;
     if (bolt11 && bolt11_len > 0) {
         strncpy(bolt11, b->valuestring, bolt11_len - 1);
         bolt11[bolt11_len - 1] = '\0';

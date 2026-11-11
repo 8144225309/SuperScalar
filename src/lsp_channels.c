@@ -870,6 +870,38 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t amount_sats = amount_msat / 1000;
     if (amount_sats == 0) return 0;
 
+    /* Destination: dest_client for a factory-internal payment, or a bolt11
+       invoice to be paid on the outside through the bridge. */
+    cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
+    cJSON *bolt11_item = cJSON_GetObjectItem(json, "bolt11");
+    int pay_outside = (!dest_item || !cJSON_IsNumber(dest_item)) &&
+                      bolt11_item && cJSON_IsString(bolt11_item);
+    uint64_t outside_budget_msat = 0;
+
+    /* An outside payment is only attempted for an invoice that this HTLC
+       actually funds.  Anything else is refused before the HTLC is taken. */
+    if (pay_outside) {
+        const char *why = NULL;
+        if (mgr->bridge_fd < 0) {
+            why = "bridge_unavailable";
+        } else {
+            bridge_pay_check_t chk = lsp_bridge_check_outbound_invoice(
+                mgr->ctx, bolt11_item->valuestring, payment_hash, amount_sats,
+                mgr->routing_fee_ppm, lsp_channels_network(mgr),
+                (uint64_t)time(NULL), NULL, &outside_budget_msat, NULL);
+            if (chk != BRIDGE_PAY_OK)
+                why = lsp_bridge_pay_check_str(chk);
+        }
+        if (why) {
+            fprintf(stderr, "LSP: outside payment from client %zu refused: %s\n",
+                    sender_idx, why);
+            cJSON *fail = wire_build_update_fail_htlc(htlc_id, why);
+            wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            return 1;  /* a payment failure, not a protocol error */
+        }
+    }
+
     channel_t *sender_ch = &mgr->entries[sender_idx].channel;
 
     /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
@@ -1036,16 +1068,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (sender_batch)
         persist_commit((persist_t *)mgr->persist);
 
-    /* Find destination: check dest_client field, then bolt11 for bridge routing */
-    cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
-    cJSON *bolt11_item = cJSON_GetObjectItem(json, "bolt11");
-
-    /* If bolt11 present and bridge connected, route outbound via bridge */
-    if ((!dest_item || !cJSON_IsNumber(dest_item)) &&
-        bolt11_item && cJSON_IsString(bolt11_item) && mgr->bridge_fd >= 0) {
+    /* Invoice checked above: route outbound via the bridge, telling it the
+       hash the invoice must carry and the most it may spend. */
+    if (pay_outside && mgr->bridge_fd >= 0) {
         uint64_t request_id = mgr->next_request_id++;
         cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
-                                                  payment_hash, request_id);
+                                                  payment_hash, request_id,
+                                                  outside_budget_msat);
         int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
         cJSON_Delete(pay);
         if (!ok) return 0;
@@ -6768,17 +6797,14 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             } else {
                 printf("CLI: paying external invoice from client %u...\n", from);
                 fflush(stdout);
-                /* Send bolt11 to bridge for outbound payment */
-                uint64_t request_id = mgr->next_request_id++;
-                unsigned char dummy_hash[32] = {0};
-                cJSON *pay_msg = wire_build_bridge_send_pay(bolt11,
-                                                             dummy_hash, request_id);
-                if (wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay_msg))
+                uint64_t request_id = 0;
+                const char *err = NULL;
+                if (lsp_channels_operator_pay(mgr, bolt11, &request_id, &err))
                     printf("CLI: pay_external sent to bridge (request %llu)\n",
                            (unsigned long long)request_id);
                 else
-                    printf("CLI: pay_external bridge send FAILED\n");
-                cJSON_Delete(pay_msg);
+                    printf("CLI: pay_external FAILED: %s\n",
+                           err ? err : "unknown");
             }
         } else {
             printf("CLI: usage: pay_external <from_client> <bolt11_invoice>\n");

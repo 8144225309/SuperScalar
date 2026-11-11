@@ -3230,6 +3230,8 @@ int main(int argc, char *argv[]) {
             watchtower_register_autosettle(&rec_wt,
                                             watchtower_autosettle_leaf_channels);
             mgr->watchtower = &rec_wt;
+            snprintf(mgr->network, sizeof(mgr->network), "%s",
+                     network ? network : "");
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) rec_wt.max_bump_fee_sat = max_bump_fee;
@@ -4543,6 +4545,8 @@ accept_new_factory:
            TU so it doesn't appear in the trustless WT binary). */
         watchtower_register_autosettle(&wt, watchtower_autosettle_leaf_channels);
         mgr->watchtower = &wt;
+        snprintf(mgr->network, sizeof(mgr->network), "%s",
+                 network ? network : "");
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;

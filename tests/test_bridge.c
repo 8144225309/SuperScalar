@@ -9,10 +9,12 @@
 #include "superscalar/client.h"
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
+#include "superscalar/bolt11.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -117,17 +119,25 @@ int test_bridge_msg_round_trip(void) {
 
     /* BRIDGE_SEND_PAY */
     {
-        cJSON *j = wire_build_bridge_send_pay("lnbc10n1p0...", hash, 7);
+        cJSON *j = wire_build_bridge_send_pay("lnbc10n1p0...", hash, 7, 123456);
         TEST_ASSERT(j != NULL, "build bridge_send_pay");
 
         char bolt11[256];
         unsigned char ph[32];
-        uint64_t rid;
-        TEST_ASSERT(wire_parse_bridge_send_pay(j, bolt11, sizeof(bolt11), ph, &rid),
+        uint64_t rid, max_total;
+        TEST_ASSERT(wire_parse_bridge_send_pay(j, bolt11, sizeof(bolt11), ph, &rid,
+                                                 &max_total),
                      "parse bridge_send_pay");
         TEST_ASSERT(strcmp(bolt11, "lnbc10n1p0...") == 0, "send_pay bolt11");
         TEST_ASSERT_MEM_EQ(ph, hash, 32, "send_pay payment_hash");
         TEST_ASSERT_EQ(rid, 7, "send_pay request_id");
+        TEST_ASSERT_EQ(max_total, 123456, "send_pay max_total_msat");
+
+        /* A request without a spend cap is malformed. */
+        cJSON_DeleteItemFromObject(j, "max_total_msat");
+        TEST_ASSERT(!wire_parse_bridge_send_pay(j, bolt11, sizeof(bolt11), ph,
+                                                  &rid, &max_total),
+                     "send_pay without max_total_msat rejected");
         cJSON_Delete(j);
     }
 
@@ -302,7 +312,7 @@ int test_bridge_outbound_flow(void) {
     /* LSP sends SEND_PAY to bridge */
     unsigned char hash[32];
     memset(hash, 0xEE, 32);
-    cJSON *pay = wire_build_bridge_send_pay("lnbc1pvjluezpp5...", hash, 99);
+    cJSON *pay = wire_build_bridge_send_pay("lnbc1pvjluezpp5...", hash, 99, 5000);
     TEST_ASSERT(wire_send(sv[1], MSG_BRIDGE_SEND_PAY, pay), "send pay");
     cJSON_Delete(pay);
 
@@ -313,9 +323,9 @@ int test_bridge_outbound_flow(void) {
 
     char bolt11[256];
     unsigned char ph[32];
-    uint64_t rid;
+    uint64_t rid, max_total;
     TEST_ASSERT(wire_parse_bridge_send_pay(msg.json, bolt11, sizeof(bolt11),
-                                             ph, &rid), "parse send_pay");
+                                             ph, &rid, &max_total), "parse send_pay");
     TEST_ASSERT_EQ(rid, 99, "request_id");
     cJSON_Delete(msg.json);
 
@@ -1546,7 +1556,7 @@ typedef struct {
     uint32_t sender_my_index;    /* 1-based slot of the OUT sender */
     uint64_t amount_sats;
     unsigned char payment_hash[32];
-    char bolt11[128];
+    char bolt11[1024];
 } bridge_out_data_t;
 
 static int bridge_out_sender_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -1708,7 +1718,24 @@ int test_regtest_bridge_out(void) {
     out_data.sender_my_index = 1;       /* client 0 */
     out_data.amount_sats = OUT_AMT;
     memcpy(out_data.payment_hash, out_hash, 32);
-    strncpy(out_data.bolt11, "lnbcrt40u1pexternaldest0", sizeof(out_data.bolt11) - 1);
+    {
+        /* The outside invoice: same hash and amount as the HTLC offered. */
+        unsigned char payee_key[32] = { [0 ... 31] = 0x65 };
+        bolt11_invoice_t ext;
+        memset(&ext, 0, sizeof(ext));
+        strcpy(ext.network, "bcrt");
+        ext.amount_msat = OUT_AMT * 1000; ext.has_amount = 1;
+        ext.timestamp = (uint32_t)time(NULL);
+        ext.expiry = 3600;
+        ext.min_final_cltv_expiry = 18;
+        memcpy(ext.payment_hash, out_hash, 32);
+        memset(ext.payment_secret, 0x66, 32);
+        ext.has_payment_secret = 1;
+        strcpy(ext.description, "outside payee");
+        TEST_ASSERT(bolt11_encode(&ext, payee_key, ctx, out_data.bolt11,
+                                   sizeof(out_data.bolt11)),
+                    "encode outside invoice");
+    }
     bridge_out_data_t idle_data;
     memset(&idle_data, 0, sizeof(idle_data));
 
@@ -1747,6 +1774,7 @@ int test_regtest_bridge_out(void) {
     }
     if (lsp_ok && !lsp_channels_exchange_basepoints(&ch_mgr, lsp)) { fprintf(stderr, "LSP: basepoints failed\n"); lsp_ok = 0; }
     if (lsp_ok && !lsp_channels_send_ready(&ch_mgr, lsp)) { fprintf(stderr, "LSP: send_ready failed\n"); lsp_ok = 0; }
+    if (lsp_ok) snprintf(ch_mgr.network, sizeof(ch_mgr.network), "regtest");
 
     if (lsp_ok) {
         /* Socketpair = the bridge link. sv[1] is the EXTERNAL world (the 65th node). */
@@ -1773,8 +1801,12 @@ int test_regtest_bridge_out(void) {
             if (lsp_ok && !wire_recv(sv[1], &sp)) { fprintf(stderr, "external: recv SEND_PAY failed\n"); lsp_ok = 0; }
             else if (lsp_ok) {
                 TEST_ASSERT_EQ(sp.msg_type, MSG_BRIDGE_SEND_PAY, "external got SEND_PAY (pay-out)");
-                char rb[256]; unsigned char rph[32]; uint64_t rid = 0;
-                wire_parse_bridge_send_pay(sp.json, rb, sizeof(rb), rph, &rid);
+                char rb[1024]; unsigned char rph[32]; uint64_t rid = 0, rmax = 0;
+                TEST_ASSERT(wire_parse_bridge_send_pay(sp.json, rb, sizeof(rb), rph,
+                                                         &rid, &rmax),
+                            "external: parse SEND_PAY");
+                TEST_ASSERT_MEM_EQ(rph, out_hash, 32, "SEND_PAY names the HTLC's hash");
+                TEST_ASSERT_EQ(rmax, OUT_AMT * 1000, "SEND_PAY caps spend at the HTLC amount");
                 printf("external (65th node): received pay-out request %llu for bolt11=%s\n",
                        (unsigned long long)rid, rb);
                 cJSON_Delete(sp.json);
@@ -3079,4 +3111,408 @@ int test_regtest_bridge_payment_n64_mixed_arity(void) {
    bridge HTLC never fulfills. */
 int test_regtest_bridge_payment_n64_mixed_arity_client8(void) {
     return run_bridge_payment_n64_mixed_arity(8, "test_bridge_n64_c8", 200);
+}
+
+/* ---- Outbound invoice validation ---- */
+
+static const unsigned char out_payee_key[32] = { [0 ... 31] = 0x5a };
+
+/* Encode an invoice for the outbound-check tests. */
+static int make_out_invoice(secp256k1_context *ctx, const char *hrp,
+                            uint64_t amount_msat, const unsigned char *hash32,
+                            uint32_t timestamp, uint32_t expiry,
+                            int min_final_cltv, char *out, size_t out_cap) {
+    bolt11_invoice_t inv;
+    memset(&inv, 0, sizeof(inv));
+    strncpy(inv.network, hrp, sizeof(inv.network) - 1);
+    inv.amount_msat = amount_msat;
+    inv.has_amount = amount_msat > 0;
+    inv.timestamp = timestamp;
+    inv.expiry = expiry;
+    inv.min_final_cltv_expiry = min_final_cltv;
+    memcpy(inv.payment_hash, hash32, 32);
+    memset(inv.payment_secret, 0x33, 32);
+    inv.has_payment_secret = 1;
+    strcpy(inv.description, "outbound");
+    return bolt11_encode(&inv, out_payee_key, ctx, out, out_cap);
+}
+
+int test_bridge_outbound_budget(void) {
+    /* No fee: the whole HTLC is available. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(4000, 0), 4000000, "no fee");
+    /* 1000 ppm of 4,000,000 msat = 4,000 msat. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(4000, 1000), 3996000, "0.1% fee");
+    /* The fee rounds up: 1 ppm of 1,000 msat still costs 1 msat. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(1, 1), 999, "fee rounds up");
+    /* A fee of 100% or more leaves nothing. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(4000, 1000000), 0, "100% fee");
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(4000, 5000000), 0, ">100% fee");
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(0, 0), 0, "empty HTLC");
+    /* Large amounts do not overflow: 21M BTC in sats at 2500 ppm. */
+    TEST_ASSERT_EQ(lsp_bridge_outbound_budget_msat(2100000000000000ULL, 2500),
+                   2100000000000000000ULL - 5250000000000000ULL, "21M BTC");
+
+    TEST_ASSERT(lsp_bridge_invoice_network_ok("mainnet", "bc"), "mainnet/bc");
+    TEST_ASSERT(lsp_bridge_invoice_network_ok("regtest", "bcrt"), "regtest/bcrt");
+    TEST_ASSERT(lsp_bridge_invoice_network_ok("signet", "tbs"), "signet/tbs");
+    TEST_ASSERT(lsp_bridge_invoice_network_ok("testnet4", "tb"), "testnet4/tb");
+    TEST_ASSERT(!lsp_bridge_invoice_network_ok("mainnet", "bcrt"), "mainnet/bcrt");
+    TEST_ASSERT(!lsp_bridge_invoice_network_ok("regtest", "bc"), "regtest/bc");
+    TEST_ASSERT(!lsp_bridge_invoice_network_ok("signet", "tb"), "signet/tb");
+    TEST_ASSERT(!lsp_bridge_invoice_network_ok(NULL, "bc"), "unknown chain");
+    TEST_ASSERT(!lsp_bridge_invoice_network_ok("", "bc"), "empty chain");
+    return 1;
+}
+
+int test_bridge_outbound_invoice_check(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+
+    unsigned char hash[32], other_hash[32];
+    memset(hash, 0xA1, 32);
+    memset(other_hash, 0xA2, 32);
+    const uint32_t T = 1700000000;   /* invoice creation time */
+    const uint64_t NOW = T + 100;
+    char inv[2048];
+    uint64_t inv_msat = 0, budget = 0;
+    uint32_t min_cltv = 0;
+
+    /* An invoice for exactly what the HTLC carries is accepted. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", NOW, &inv_msat, &budget, &min_cltv),
+                   BRIDGE_PAY_OK, "matching invoice accepted");
+    TEST_ASSERT_EQ(inv_msat, 4000000, "invoice amount reported");
+    TEST_ASSERT_EQ(budget, 4000000, "budget reported");
+    TEST_ASSERT_EQ(min_cltv, 40, "min_final_cltv reported");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_OK, "outputs are optional");
+
+    /* The invoice must be for the hash the HTLC is locked to. */
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, other_hash, 4000,
+                       0, "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_HASH_MISMATCH, "foreign payment hash refused");
+
+    /* The invoice must not ask for more than the HTLC carries... */
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 3999, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC, "invoice above HTLC refused");
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000001, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC, "1 msat above HTLC refused");
+    /* ...where a much larger invoice in a bigger unit is no exception. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000000ULL, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC, "1000x invoice refused");
+
+    /* ...nor for more than is left after the LSP's fee. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 1000,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC, "fee not covered: refused");
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 3996000, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    budget = 0;
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 1000,
+                       "regtest", NOW, NULL, &budget, NULL),
+                   BRIDGE_PAY_OK, "HTLC minus fee covers invoice");
+    TEST_ASSERT_EQ(budget, 3996000, "budget is HTLC minus fee");
+
+    /* Amountless invoices are refused. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 0, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_NO_AMOUNT, "amountless invoice refused");
+
+    /* Wrong chain, or a chain the LSP cannot name. */
+    TEST_ASSERT(make_out_invoice(ctx, "bc", 4000000, hash, T, 3600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_WRONG_NETWORK, "mainnet invoice on regtest refused");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       NULL, NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_WRONG_NETWORK, "unknown chain refused");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "mainnet", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_OK, "mainnet invoice on mainnet accepted");
+
+    /* Expiry: valid until timestamp + expiry, exclusive. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, T, 600, 40,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", (uint64_t)T + 599, NULL, NULL, NULL),
+                   BRIDGE_PAY_OK, "last valid second accepted");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, inv, hash, 4000, 0,
+                       "regtest", (uint64_t)T + 600, NULL, NULL, NULL),
+                   BRIDGE_PAY_EXPIRED, "expired invoice refused");
+
+    /* Not an invoice at all. */
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, "lnbcrt40u1pexternal",
+                       hash, 4000, 0, "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_BAD_INVOICE, "garbage refused");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, "", hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_BAD_INVOICE, "empty string refused");
+    TEST_ASSERT_EQ(lsp_bridge_check_outbound_invoice(ctx, NULL, hash, 4000, 0,
+                       "regtest", NOW, NULL, NULL, NULL),
+                   BRIDGE_PAY_BAD_INVOICE, "NULL refused");
+
+    /* Every refusal has its own reason string. */
+    TEST_ASSERT(strcmp(lsp_bridge_pay_check_str(BRIDGE_PAY_HASH_MISMATCH),
+                       "invoice_payment_hash_mismatch") == 0, "reason string");
+    TEST_ASSERT(strcmp(lsp_bridge_pay_check_str(BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC),
+                       "invoice_amount_exceeds_htlc") == 0, "reason string");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- The bridge hands the plugin the hash and spend cap with each pay ---- */
+
+int test_bridge_pay_request_carries_limits(void) {
+    int sv[2];  /* sv[0]=plugin side, sv[1]=bridge plugin_fd */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    bridge_t br;
+    bridge_init(&br);
+    br.plugin_fd = sv[1];
+
+    unsigned char hash[32];
+    memset(hash, 0xC3, 32);
+    cJSON *pay = wire_build_bridge_send_pay("lnbcrt40u1pinvoice", hash, 11,
+                                              3996000);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_SEND_PAY;
+    msg.json = pay;
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &msg), "handle send_pay");
+    cJSON_Delete(pay);
+
+    char buf[4096];
+    ssize_t n = read(sv[0], buf, sizeof(buf) - 1);
+    TEST_ASSERT(n > 0, "read plugin output");
+    buf[n] = '\0';
+    cJSON *fwd = cJSON_Parse(buf);
+    TEST_ASSERT(fwd != NULL, "parse forwarded JSON");
+
+    cJSON *method = cJSON_GetObjectItem(fwd, "method");
+    TEST_ASSERT(method && cJSON_IsString(method) &&
+                strcmp(method->valuestring, "pay_request") == 0,
+                "method is pay_request");
+    cJSON *b11 = cJSON_GetObjectItem(fwd, "bolt11");
+    TEST_ASSERT(b11 && cJSON_IsString(b11) &&
+                strcmp(b11->valuestring, "lnbcrt40u1pinvoice") == 0, "bolt11");
+    cJSON *rid = cJSON_GetObjectItem(fwd, "request_id");
+    TEST_ASSERT(rid && cJSON_IsNumber(rid), "request_id exists");
+    TEST_ASSERT_EQ((uint64_t)rid->valuedouble, 11, "request_id");
+    unsigned char fwd_hash[32];
+    TEST_ASSERT(wire_json_get_hex(fwd, "payment_hash", fwd_hash, 32) == 32,
+                "payment_hash forwarded");
+    TEST_ASSERT_MEM_EQ(fwd_hash, hash, 32, "payment_hash matches");
+    cJSON *mt = cJSON_GetObjectItem(fwd, "max_total_msat");
+    TEST_ASSERT(mt && cJSON_IsNumber(mt), "max_total_msat forwarded");
+    TEST_ASSERT_EQ((uint64_t)mt->valuedouble, 3996000, "max_total_msat value");
+
+    cJSON_Delete(fwd);
+    close(sv[0]);
+    close(sv[1]);
+    return 1;
+}
+
+/* ---- Operator-initiated pay: invoice is checked, spend is capped ---- */
+
+int test_bridge_operator_pay(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.bridge_fd = sv[0];
+    mgr.next_request_id = 5;
+    snprintf(mgr.network, sizeof(mgr.network), "regtest");
+
+    unsigned char hash[32];
+    memset(hash, 0xD4, 32);
+    uint32_t now = (uint32_t)time(NULL);
+    char inv[2048];
+    uint64_t rid = 0;
+    const char *err = NULL;
+
+    /* Refusals send nothing to the bridge. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 0, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(!lsp_channels_operator_pay(&mgr, inv, &rid, &err),
+                "amountless invoice refused");
+    TEST_ASSERT(err && strcmp(err, "invoice_without_amount") == 0, "reason");
+    TEST_ASSERT(make_out_invoice(ctx, "bc", 2000000, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(!lsp_channels_operator_pay(&mgr, inv, &rid, &err),
+                "wrong-chain invoice refused");
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 2000000, hash, now - 7200, 3600,
+                                  18, inv, sizeof(inv)), "encode");
+    TEST_ASSERT(!lsp_channels_operator_pay(&mgr, inv, &rid, &err),
+                "expired invoice refused");
+    TEST_ASSERT(!lsp_channels_operator_pay(&mgr, "not-an-invoice", &rid, &err),
+                "garbage refused");
+    TEST_ASSERT_EQ(mgr.next_request_id, 5, "no request id consumed by refusals");
+
+    /* A good invoice goes out with its own hash and a bounded spend:
+       2,000,000 msat + 0.5% = 2,010,000 msat. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 2000000, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(lsp_channels_operator_pay(&mgr, inv, &rid, &err),
+                "valid invoice sent");
+    TEST_ASSERT_EQ(rid, 5, "request id returned");
+
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(sv[1], &msg), "bridge receives SEND_PAY");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_BRIDGE_SEND_PAY, "SEND_PAY type");
+    char rb[2048];
+    unsigned char rph[32];
+    uint64_t rrid = 0, rmax = 0;
+    TEST_ASSERT(wire_parse_bridge_send_pay(msg.json, rb, sizeof(rb), rph, &rrid,
+                                             &rmax), "parse SEND_PAY");
+    TEST_ASSERT(strcmp(rb, inv) == 0, "invoice forwarded unchanged");
+    TEST_ASSERT_MEM_EQ(rph, hash, 32, "hash taken from the invoice");
+    TEST_ASSERT_EQ(rmax, 2010000, "spend capped at amount + allowance");
+    cJSON_Delete(msg.json);
+
+    /* Small invoices get the flat 5 sat allowance. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 10000, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(lsp_channels_operator_pay(&mgr, inv, &rid, &err), "small invoice sent");
+    TEST_ASSERT(wire_recv(sv[1], &msg), "bridge receives SEND_PAY");
+    TEST_ASSERT(wire_parse_bridge_send_pay(msg.json, rb, sizeof(rb), rph, &rrid,
+                                             &rmax), "parse SEND_PAY");
+    TEST_ASSERT_EQ(rmax, 15000, "flat allowance for a small invoice");
+    cJSON_Delete(msg.json);
+
+    /* No bridge: refused. */
+    mgr.bridge_fd = -1;
+    TEST_ASSERT(!lsp_channels_operator_pay(&mgr, inv, &rid, &err), "no bridge");
+
+    close(sv[0]);
+    close(sv[1]);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- A client HTLC for an invoice it does not fund is failed, not paid ---- */
+
+/* Offer an HTLC with a bolt11 from client 0 and return the reason the LSP
+   failed it with ("" if it was not failed). */
+static int offer_outside_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp, int client_peer_fd,
+                              const unsigned char *hash, uint64_t amount_msat,
+                              const char *bolt11, char *reason, size_t reason_cap) {
+    cJSON *add = wire_build_update_add_htlc(9, amount_msat, hash, 500);
+    cJSON_AddStringToObject(add, "bolt11", bolt11);
+    wire_msg_t msg;
+    msg.msg_type = MSG_UPDATE_ADD_HTLC;
+    msg.json = add;
+    int handled = lsp_channels_handle_msg(mgr, lsp, 0, &msg);
+    cJSON_Delete(add);
+    reason[0] = 0;
+    if (!handled) return 0;
+
+    wire_msg_t reply;
+    if (!wire_recv_timeout(client_peer_fd, &reply, 5)) return 0;
+    uint64_t failed_id = 0;
+    int ok = reply.msg_type == MSG_UPDATE_FAIL_HTLC &&
+             wire_parse_update_fail_htlc(reply.json, &failed_id, reason, reason_cap) &&
+             failed_id == 9;
+    cJSON_Delete(reply.json);
+    return ok;
+}
+
+int test_lsp_outbound_htlc_refused(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    int cl[2], br[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "client socketpair");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, br) == 0, "bridge socketpair");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 1;
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.bridge_fd = br[0];
+    mgr.next_request_id = 1;
+    snprintf(mgr.network, sizeof(mgr.network), "regtest");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && lsp, "alloc");
+    int client_fd = cl[0];
+    lsp->client_fds = &client_fd;
+
+    unsigned char hash[32], other_hash[32];
+    memset(hash, 0xE5, 32);
+    memset(other_hash, 0xE6, 32);
+    uint32_t now = (uint32_t)time(NULL);
+    char inv[2048], reason[128];
+
+    /* Invoice for a different payment hash than the HTLC. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, other_hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "invoice_payment_hash_mismatch") == 0,
+                "refused: hash mismatch");
+
+    /* Invoice for more than the HTLC carries. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 400000000, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "invoice_amount_exceeds_htlc") == 0,
+                "refused: amount above HTLC");
+
+    /* Sub-satoshi remainder of the HTLC does not count: 4,000,999 msat is
+       a 4,000 sat HTLC and cannot fund a 4,000,999 msat invoice. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000999, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000999, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "invoice_amount_exceeds_htlc") == 0,
+                "refused: msat remainder not counted");
+
+    /* Not an invoice. */
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000,
+                                    "lnbcrt40u1pexternaldest0",
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "invalid_invoice") == 0, "refused: undecodable");
+
+    /* None of the refusals reached the bridge, took a request id, or
+       touched the channel. */
+    wire_msg_t stray;
+    TEST_ASSERT(!wire_recv_timeout(br[1], &stray, 1), "nothing sent to bridge");
+    TEST_ASSERT_EQ(mgr.next_request_id, 1, "no request id consumed");
+    TEST_ASSERT_EQ(mgr.entries[0].channel.n_htlcs, 0, "no HTLC added");
+
+    /* A valid invoice with no bridge connected is failed too. */
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, now, 3600, 18,
+                                  inv, sizeof(inv)), "encode");
+    mgr.bridge_fd = -1;
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "bridge_unavailable") == 0, "refused: no bridge");
+
+    close(cl[0]); close(cl[1]); close(br[0]); close(br[1]);
+    free(mgr.entries);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    return 1;
 }

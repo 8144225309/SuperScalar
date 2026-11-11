@@ -324,3 +324,96 @@ int test_bolt11_full_roundtrip_with_metadata(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Published BOLT #11 example invoices decode to their stated values ---- */
+int test_bolt11_spec_vectors(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+
+    static const unsigned char spec_hash[32] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x00,0x01,0x02,0x03,
+        0x04,0x05,0x06,0x07,0x08,0x09,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+        0x08,0x09,0x01,0x02 };
+
+    /* "Please send $3 for a cup of coffee to the same peer, within one
+       minute": 2500 micro-BTC, expiry 60 seconds. */
+    bolt11_invoice_t dec;
+    memset(&dec, 0, sizeof(dec));
+    ASSERT(bolt11_decode(ctx,
+        "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3"
+        "zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxat"
+        "syp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh"
+        "8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh",
+        &dec), "coffee invoice decodes");
+    ASSERT(strcmp(dec.network, "bc") == 0, "coffee: mainnet");
+    ASSERT(dec.has_amount, "coffee: has amount");
+    ASSERT(dec.amount_msat == 250000000ULL, "coffee: 2500u = 250,000,000 msat");
+    ASSERT(dec.timestamp == 1496314658, "coffee: timestamp");
+    ASSERT(dec.expiry == 60, "coffee: x field is the expiry");
+    ASSERT(dec.min_final_cltv_expiry == 18, "coffee: default min_final_cltv");
+    ASSERT(memcmp(dec.payment_hash, spec_hash, 32) == 0, "coffee: payment hash");
+
+    /* "Please make a donation of any amount": no amount, default expiry. */
+    memset(&dec, 0, sizeof(dec));
+    ASSERT(bolt11_decode(ctx,
+        "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs"
+        "pp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5s"
+        "xxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ue"
+        "h7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt"
+        "8r2t7mlcwspyetp5h2tztugp9lfyql",
+        &dec), "donation invoice decodes");
+    ASSERT(!dec.has_amount && dec.amount_msat == 0, "donation: no amount");
+    ASSERT(dec.expiry == 3600, "donation: default expiry");
+    ASSERT(memcmp(dec.payment_hash, spec_hash, 32) == 0, "donation: payment hash");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Amount units, expiry and min_final_cltv survive encode/decode ---- */
+int test_bolt11_amount_units_and_fields(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char node_priv[32]; memset(node_priv, 0x51, 32);
+
+    static const struct { uint64_t msat; const char *prefix; } cases[] = {
+        { 250000000ULL, "lnbc2500u1" },   /* 250,000 sat */
+        { 100000000ULL, "lnbc1m1"    },   /* 0.001 BTC   */
+        { 4000000ULL,   "lnbc40u1"   },   /* 4,000 sat   */
+        { 1000ULL,      "lnbc10n1"   },   /* 1 sat       */
+        { 1ULL,         "lnbc10p1"   },   /* 1 msat      */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bolt11_invoice_t inv;
+        memset(&inv, 0, sizeof(inv));
+        strcpy(inv.network, "bc");
+        inv.amount_msat = cases[i].msat; inv.has_amount = 1;
+        inv.timestamp = 1700000100;
+        memset(inv.payment_hash, 0x21, 32);
+        memset(inv.payment_secret, 0x22, 32);
+        inv.has_payment_secret = 1;
+        strcpy(inv.description, "units");
+        inv.expiry = 900;
+        inv.min_final_cltv_expiry = 144;
+
+        char enc[2048];
+        ASSERT(bolt11_encode(&inv, node_priv, ctx, enc, sizeof(enc)), "encode");
+        ASSERT(strncmp(enc, cases[i].prefix, strlen(cases[i].prefix)) == 0,
+               "amount written in BOLT #11 units");
+
+        bolt11_invoice_t dec;
+        memset(&dec, 0, sizeof(dec));
+        ASSERT(bolt11_decode(ctx, enc, &dec), "decode");
+        ASSERT(dec.has_amount && dec.amount_msat == cases[i].msat,
+               "amount round-trips");
+        ASSERT(dec.expiry == 900, "expiry round-trips");
+        ASSERT(dec.min_final_cltv_expiry == 144, "min_final_cltv round-trips");
+    }
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

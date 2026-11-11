@@ -244,15 +244,20 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
     case MSG_BRIDGE_SEND_PAY: {
         char bolt11[2048];
         unsigned char payment_hash[32];
-        uint64_t request_id;
+        uint64_t request_id, max_total_msat;
         if (!wire_parse_bridge_send_pay(msg->json, bolt11, sizeof(bolt11),
-                                          payment_hash, &request_id))
+                                          payment_hash, &request_id,
+                                          &max_total_msat))
             return 0;
 
+        /* The plugin checks the invoice against payment_hash and refuses to
+           spend more than max_total_msat, so both must reach it. */
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "method", "pay_request");
         cJSON_AddStringToObject(j, "bolt11", bolt11);
         cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+        wire_json_add_hex(j, "payment_hash", payment_hash, 32);
+        cJSON_AddNumberToObject(j, "max_total_msat", (double)max_total_msat);
         int ok = bridge_send_plugin_json(br, j);
         cJSON_Delete(j);
         return ok;

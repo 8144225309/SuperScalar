@@ -7,7 +7,8 @@ Handles:
   - htlc_accepted hook: selectively forwards factory HTLCs to bridge
   - invoice_registered from bridge: creates CLN invoice with known preimage
   - superscalar-pay RPC: convenience wrapper for lightning-cli pay
-  - pay_request from bridge: calls lightning-cli pay for outbound LN payments
+  - pay_request from bridge: pays an outside invoice with lightning-cli pay,
+    after checking it against the payment hash and spend cap the bridge sent
 
 Non-factory HTLCs pass through to CLN's normal handling, so traditional
 Lightning channels continue to work unaffected.
@@ -71,6 +72,57 @@ def cli_cmd(*args):
             cmd.extend(["--lightning-dir", LIGHTNING_DIR])
     cmd.extend(args)
     return cmd
+
+
+class ClnRpcError(Exception):
+    """CLN answered an RPC call with an error."""
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def cln_rpc(method, params=None, timeout=60):
+    """Call a CLN RPC method through lightning-cli with keyword parameters.
+    Returns the decoded result.  Raises ClnRpcError if CLN reports an error
+    and subprocess.TimeoutExpired if lightning-cli does not return in time."""
+    args = ["-k", method]
+    for key, value in (params or {}).items():
+        args.append(f"{key}={value}")
+    result = subprocess.run(cli_cmd(*args), capture_output=True, text=True,
+                            timeout=timeout)
+    if result.returncode != 0:
+        code = None
+        message = (result.stdout or result.stderr or "").strip()[:300]
+        try:
+            err = json.loads(result.stdout)
+            code = err.get("code")
+            message = err.get("message", message)
+        except (ValueError, AttributeError):
+            pass
+        raise ClnRpcError(message, code)
+    return json.loads(result.stdout)
+
+
+def _msat(value):
+    """Parse a CLN millisatoshi amount (int, or "123msat" in older releases).
+    Returns None if there is no usable amount."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).replace("msat", ""))
+    except ValueError:
+        return None
+
+
+def _is_hash(value):
+    """True for a 32-byte value in hex."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
 
 
 _can_log_to_cln = False
@@ -243,9 +295,15 @@ def handle_bridge_msg(msg):
     elif method == "pay_request":
         bolt11 = msg.get("bolt11", "")
         request_id = msg.get("request_id", 0)
+        payment_hash = msg.get("payment_hash")
+        max_total_msat = msg.get("max_total_msat")
         log(f"Pay request: {bolt11[:30]}... (id={request_id})")
         # Run lightning-cli pay in a background thread to avoid blocking
-        t = threading.Thread(target=_do_pay, args=(bolt11, request_id), daemon=True)
+        t = threading.Thread(
+            target=_do_pay,
+            args=(bolt11, request_id, payment_hash, max_total_msat),
+            daemon=True
+        )
         t.start()
 
     elif method == "pay_result":
@@ -320,84 +378,99 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
         })
 
 
-def _do_pay(bolt11, request_id):
-    """Execute lightning-cli pay in a subprocess and report result to bridge.
+def check_pay_request(decoded, payment_hash, max_total_msat):
+    """Check a decoded invoice against what the bridge authorised.
 
-    Logs verbose details so bridge-accounting races can be diagnosed.
-    See commit history for the root-cause of the 'pay succeeded on LN but
-    LSP reports success=0' class of bug. """
+    The bridge names the payment hash the invoice must carry and the most
+    this node may spend on it, routing fees included.  Both are checked here
+    against CLN's own decoding of the invoice, so a request that does not
+    match its invoice is never paid.
+
+    Returns (invoice_amount_msat, None) if the invoice may be paid, or
+    (None, reason) if it must be refused."""
+    if not _is_hash(payment_hash):
+        return None, "request carries no payment hash"
+    if (isinstance(max_total_msat, bool) or not isinstance(max_total_msat, int)
+            or max_total_msat <= 0):
+        return None, "request carries no spend cap"
+    if not isinstance(decoded, dict) or decoded.get("valid") is not True \
+            or decoded.get("type") != "bolt11 invoice":
+        return None, "not a valid bolt11 invoice"
+    if str(decoded.get("payment_hash", "")).lower() != payment_hash.lower():
+        return None, "invoice payment hash differs from the requested one"
+    amount_msat = _msat(decoded.get("amount_msat"))
+    if amount_msat is None or amount_msat <= 0:
+        return None, "invoice states no amount"
+    if amount_msat > max_total_msat:
+        return None, (f"invoice amount {amount_msat} msat exceeds the cap of "
+                      f"{max_total_msat} msat")
+    return amount_msat, None
+
+
+def _preimage_matches(preimage, payment_hash):
+    """True if preimage (hex) hashes to payment_hash (hex)."""
+    if not _is_hash(preimage) or not _is_hash(payment_hash):
+        return False
+    return hashlib.sha256(bytes.fromhex(preimage)).hexdigest() == payment_hash.lower()
+
+
+def _send_pay_result(request_id, success, preimage=None):
+    send_to_bridge({
+        "method": "pay_result",
+        "request_id": request_id,
+        "success": bool(success),
+        "preimage": preimage if success else "00" * 32
+    })
+
+
+def _do_pay(bolt11, request_id, payment_hash, max_total_msat):
+    """Pay an outside invoice on the bridge's request and report the result.
+
+    The invoice is paid only if CLN decodes it to the requested payment hash
+    and to an amount within max_total_msat; the rest of the cap is the most
+    CLN may add in routing fees (pay's maxfee)."""
     log(f"Pay start: request_id={request_id}, bolt11_len={len(bolt11)}, "
         f"bolt11_prefix={bolt11[:20]}...")
     try:
-        result = subprocess.run(
-            cli_cmd("pay", bolt11),
-            capture_output=True, text=True, timeout=600
+        decoded = cln_rpc("decode", {"string": bolt11}, timeout=30)
+    except Exception as e:
+        log(f"Pay refused: cannot decode invoice: {type(e).__name__}: {e}")
+        _send_pay_result(request_id, False)
+        return
+    amount_msat, why = check_pay_request(decoded, payment_hash, max_total_msat)
+    if why:
+        log(f"Pay refused for request_id={request_id}: {why}")
+        _send_pay_result(request_id, False)
+        return
+
+    try:
+        pay_result = cln_rpc(
+            "pay",
+            {"bolt11": bolt11, "maxfee": max_total_msat - amount_msat},
+            timeout=600
         )
-        log(f"Pay lightning-cli returncode={result.returncode}, "
-            f"stdout_len={len(result.stdout)}, stderr_len={len(result.stderr)}")
-        if result.returncode == 0:
-            try:
-                pay_result = json.loads(result.stdout)
-            except json.JSONDecodeError as je:
-                log(f"Pay stdout NOT JSON (parse error: {je}); "
-                    f"stdout_head={result.stdout[:200]!r}")
-                send_to_bridge({
-                    "method": "pay_result",
-                    "request_id": request_id,
-                    "success": False,
-                    "preimage": "00" * 32
-                })
-                return
-            status = pay_result.get("status", "?")
-            preimage = pay_result.get("payment_preimage", "00" * 32)
-            log(f"Pay JSON parsed: status={status}, preimage_prefix={preimage[:16]}")
-            # CLN 'pay' returncode=0 can include status='pending' (not complete).
-            # Only report success when CLN explicitly reports status='complete'
-            # AND a real preimage (not all-zero placeholder).
-            if status == "complete" and preimage != "00" * 32:
-                send_to_bridge({
-                    "method": "pay_result",
-                    "request_id": request_id,
-                    "success": True,
-                    "preimage": preimage
-                })
-                log(f"Pay succeeded: {preimage[:16]}...")
-            else:
-                log(f"Pay returncode=0 but status!={status} or preimage empty "
-                    f"— reporting failure to bridge")
-                send_to_bridge({
-                    "method": "pay_result",
-                    "request_id": request_id,
-                    "success": False,
-                    "preimage": "00" * 32
-                })
-        else:
-            log(f"Pay failed rc={result.returncode}: "
-                f"stderr={result.stderr[:300]!r} "
-                f"stdout={result.stdout[:300]!r}")
-            send_to_bridge({
-                "method": "pay_result",
-                "request_id": request_id,
-                "success": False,
-                "preimage": "00" * 32
-            })
     except subprocess.TimeoutExpired:
         log(f"Pay timeout (>600s) for request_id={request_id} — "
             f"CLN still processing; result uncertain")
-        send_to_bridge({
-            "method": "pay_result",
-            "request_id": request_id,
-            "success": False,
-            "preimage": "00" * 32
-        })
+        _send_pay_result(request_id, False)
+        return
     except Exception as e:
-        log(f"Pay exception: {type(e).__name__}: {e}")
-        send_to_bridge({
-            "method": "pay_result",
-            "request_id": request_id,
-            "success": False,
-            "preimage": "00" * 32
-        })
+        log(f"Pay failed: {type(e).__name__}: {e}")
+        _send_pay_result(request_id, False)
+        return
+
+    status = pay_result.get("status", "?")
+    preimage = pay_result.get("payment_preimage", "")
+    log(f"Pay JSON parsed: status={status}, preimage_prefix={preimage[:16]}")
+    # Only report success when CLN explicitly reports status='complete'
+    # AND hands back the preimage of the requested hash.
+    if status == "complete" and _preimage_matches(preimage, payment_hash):
+        _send_pay_result(request_id, True, preimage)
+        log(f"Pay succeeded: {preimage[:16]}...")
+    else:
+        log(f"Pay returned status={status} without a matching preimage "
+            f"— reporting failure to bridge")
+        _send_pay_result(request_id, False)
 
 
 def _extract_keysend_preimage(params):

@@ -304,6 +304,8 @@ extern int test_bolt11_metadata_roundtrip(void);
 extern int test_bolt11_no_metadata(void);
 extern int test_bolt11_metadata_truncated(void);
 extern int test_bolt11_full_roundtrip_with_metadata(void);
+extern int test_bolt11_spec_vectors(void);
+extern int test_bolt11_amount_units_and_fields(void);
 extern int test_pathfind_two_hops(void);
 extern int test_pathfind_one_hop(void);
 extern int test_pathfind_no_route(void);
@@ -1274,6 +1276,11 @@ extern int test_bridge_htlc_timeout(void);
 extern int test_bridge_invoice_bolt11_round_trip(void);
 extern int test_bridge_bolt11_plugin_to_lsp(void);
 extern int test_bridge_preimage_passthrough(void);
+extern int test_bridge_outbound_budget(void);
+extern int test_bridge_outbound_invoice_check(void);
+extern int test_bridge_pay_request_carries_limits(void);
+extern int test_bridge_operator_pay(void);
+extern int test_lsp_outbound_htlc_refused(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -2259,6 +2266,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt11_no_metadata);
     RUN_TEST(test_bolt11_metadata_truncated);
     RUN_TEST(test_bolt11_full_roundtrip_with_metadata);
+    RUN_TEST(test_bolt11_spec_vectors);
+    RUN_TEST(test_bolt11_amount_units_and_fields);
 
     printf("\n=== Pathfinding (Dijkstra) ===\n");
     RUN_TEST(test_pathfind_two_hops);
@@ -3185,6 +3194,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
     RUN_TEST(test_bridge_preimage_passthrough);
     RUN_TEST(test_bridge_keysend_inbound);
+    RUN_TEST(test_bridge_outbound_budget);
+    RUN_TEST(test_bridge_outbound_invoice_check);
+    RUN_TEST(test_bridge_pay_request_carries_limits);
+    RUN_TEST(test_bridge_operator_pay);
+    RUN_TEST(test_lsp_outbound_htlc_refused);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

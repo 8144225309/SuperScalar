@@ -35,6 +35,48 @@ int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
                                    uint32_t factory_cltv_timeout,
                                    uint32_t cltv_delta);
 
+/* --- Outbound payments through the bridge --- */
+
+/* Outcome of checking an invoice against the HTLC a client offered for it. */
+typedef enum {
+    BRIDGE_PAY_OK = 0,
+    BRIDGE_PAY_BAD_INVOICE,          /* does not decode */
+    BRIDGE_PAY_WRONG_NETWORK,        /* invoice is for another chain */
+    BRIDGE_PAY_HASH_MISMATCH,        /* invoice hash != HTLC hash */
+    BRIDGE_PAY_NO_AMOUNT,            /* amountless invoices are refused */
+    BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC,  /* invoice asks for more than the HTLC funds */
+    BRIDGE_PAY_EXPIRED
+} bridge_pay_check_t;
+
+/* Short reason string for a check result (used as the HTLC failure reason). */
+const char *lsp_bridge_pay_check_str(bridge_pay_check_t r);
+
+/* 1 if a BOLT #11 network prefix ("bc", "tb", "tbs", "bcrt") belongs to the
+   named chain ("mainnet", "testnet", "testnet4", "signet", "regtest"). */
+int lsp_bridge_invoice_network_ok(const char *network, const char *invoice_hrp);
+
+/* What is left of an offered HTLC for the outside payment once the LSP's
+   routing fee (routing_fee_ppm, rounded up) is taken: the most that may be
+   spent on the invoice and its routing fees together.  Returns 0 when the
+   fee consumes the whole HTLC. */
+uint64_t lsp_bridge_outbound_budget_msat(uint64_t htlc_amount_sats,
+                                           uint64_t routing_fee_ppm);
+
+/* Check an invoice a client asked the LSP to pay against the HTLC it offered.
+   The invoice must decode, be for `network`, carry exactly the HTLC's payment
+   hash, state an amount no greater than the HTLC amount minus the LSP's fee,
+   and not be expired at `now` (unix seconds).
+   On BRIDGE_PAY_OK the outputs (each optional) are filled:
+     invoice_msat_out    the invoice amount
+     budget_msat_out     lsp_bridge_outbound_budget_msat() for this HTLC
+     min_final_cltv_out  the invoice's min_final_cltv_expiry */
+bridge_pay_check_t lsp_bridge_check_outbound_invoice(
+    secp256k1_context *ctx, const char *bolt11,
+    const unsigned char *htlc_payment_hash32, uint64_t htlc_amount_sats,
+    uint64_t routing_fee_ppm, const char *network, uint64_t now,
+    uint64_t *invoice_msat_out, uint64_t *budget_msat_out,
+    uint32_t *min_final_cltv_out);
+
 /* Per-client channel entry managed by the LSP */
 typedef struct {
     channel_t channel;          /* Poon-Dryja channel (LSP=local, client=remote) */
@@ -87,6 +129,8 @@ typedef struct {
     size_t n_htlc_origins;
     size_t htlc_origins_cap;
     uint64_t next_request_id;    /* for outbound pay correlation */
+    char network[16];            /* chain name; invoices for any other chain
+                                    are refused.  Set after init. */
 
     /* Watchtower (Phase 18) */
     watchtower_t *watchtower;
@@ -445,6 +489,19 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr);
 
 /* Set bridge fd in channel manager. */
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
+
+/* Chain the LSP runs on, for invoice checks: mgr->network if set, else the
+   watchtower's chain connection, else NULL. */
+const char *lsp_channels_network(const lsp_channel_mgr_t *mgr);
+
+/* Ask the bridge to pay an invoice out of the LSP's own Lightning node on the
+   operator's instruction (no client HTLC backs it).  The invoice must decode,
+   be for this chain, state an amount and be unexpired; the node is allowed
+   the invoice amount plus a small routing-fee allowance.  Returns 1 and sets
+   *request_id_out on success; on failure returns 0 and points *err_out at a
+   static reason string. */
+int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
+                               uint64_t *request_id_out, const char **err_out);
 
 /* Register an invoice (payment_hash → dest_client) for bridge inbound routing. */
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
