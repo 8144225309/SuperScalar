@@ -437,6 +437,84 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     return ok;
 }
 
+int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg) {
+    if (!ch || !msg || msg->msg_type != MSG_COMMITMENT_SIGNED) return 0;
+
+    uint32_t channel_id;
+    uint64_t commitment_number;
+    unsigned char partial_sig32[32];
+    uint32_t nonce_index;
+    if (!wire_parse_commitment_signed(msg->json, &channel_id,
+                                        &commitment_number, partial_sig32,
+                                        &nonce_index)) {
+        fprintf(stderr, "Client: malformed initial COMMITMENT_SIGNED\n");
+        return 0;
+    }
+    if (commitment_number != 0 || ch->commitment_number != 0) {
+        fprintf(stderr, "Client: initial COMMITMENT_SIGNED is for commitment %llu "
+                "(channel at %llu), expected 0\n",
+                (unsigned long long)commitment_number,
+                (unsigned long long)ch->commitment_number);
+        return 0;
+    }
+
+    unsigned char full_sig64[64];
+    if (!channel_verify_and_aggregate_commitment_sig(ch, partial_sig32,
+                                                       nonce_index, full_sig64)) {
+        fprintf(stderr, "Client: initial commitment sig verification/aggregation failed\n");
+        return 0;
+    }
+    memcpy(ch->latest_commitment_sig, full_sig64, 64);
+    ch->has_latest_commitment_sig = 1;
+    return 1;
+}
+
+/* Channel open: receive the LSP's COMMITMENT_SIGNED for commitment 0, which
+   the LSP sends right after the nonce exchange. */
+static int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index) {
+    wire_msg_t msg;
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
+        msg.msg_type != MSG_COMMITMENT_SIGNED) {
+        fprintf(stderr, "Client %u: expected initial COMMITMENT_SIGNED\n", my_index);
+        if (msg.json) cJSON_Delete(msg.json);
+        return 0;
+    }
+    int ok = client_handle_initial_commitment_signed(ch, &msg);
+    cJSON_Delete(msg.json);
+    if (!ok)
+        fprintf(stderr, "Client %u: initial commitment rejected, channel not usable\n",
+                my_index);
+    return ok;
+}
+
+int client_persist_latest_commitment(persist_t *db, uint32_t channel_id,
+                                       const channel_t *ch) {
+    if (!db || !ch || !ch->has_latest_commitment_sig) return 0;
+
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+    tx_buf_t signed_tx;
+    tx_buf_init(&signed_tx, 512);
+    if (!finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len,
+                             ch->latest_commitment_sig)) {
+        tx_buf_free(&unsigned_tx);
+        tx_buf_free(&signed_tx);
+        return 0;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    int ok = persist_save_commitment_sig(db, channel_id, ch->commitment_number,
+                                          ch->latest_commitment_sig,
+                                          signed_tx.data, signed_tx.len);
+    tx_buf_free(&signed_tx);
+    return ok;
+}
+
 int client_handle_lsp_revoke_and_ack(channel_t *ch, secp256k1_context *ctx,
                                        const wire_msg_t *msg) {
     if (!ch || !msg) return 0;
@@ -1525,6 +1603,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 
         channel_set_remote_pubnonces(channel_out,
             (const unsigned char (*)[66])lsp_nonces, lsp_nonce_count);
+    }
+
+    /* Signed commitment 0 for the new channel, before it is used. */
+    if (!client_recv_initial_commitment(fd, channel_out, my_index)) {
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     free(secnonces);
@@ -2868,6 +2951,14 @@ int client_run_with_channels(secp256k1_context *ctx,
 
         printf("Client %u: nonce exchange complete (%zu nonces)\n",
                my_index, channel.remote_nonce_count);
+
+        /* The LSP now signs the client's commitment 0.  The channel is not
+           handed to the callback (and so cannot send or receive) until the
+           client holds a fully signed commitment paying its opening balance. */
+        if (!client_recv_initial_commitment(fd, &channel, my_index))
+            goto fail;
+        printf("Client %u: initial commitment signed (local=%llu sats)\n",
+               my_index, (unsigned long long)channel.local_amount);
 
         /* Call the channel callback */
         int cb_ret = channel_cb(fd, &channel, my_index, ctx, keypair,

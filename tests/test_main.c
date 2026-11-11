@@ -1336,6 +1336,9 @@ extern int test_prometheus_client_counter(void);
 extern int test_reconnect_wire(void);
 extern int test_reconnect_pubkey_match(void);
 extern int test_reconnect_nonce_reexchange(void);
+extern int test_initial_commitment_signed_at_open(void);
+extern int test_initial_commitment_rejects_invalid(void);
+extern int test_initial_commitment_persist_reload(void);
 extern int test_client_persist_reload(void);
 
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
@@ -3288,6 +3291,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_wire);
     RUN_TEST(test_reconnect_pubkey_match);
     RUN_TEST(test_reconnect_nonce_reexchange);
+    RUN_TEST(test_initial_commitment_signed_at_open);
+    RUN_TEST(test_initial_commitment_rejects_invalid);
+    RUN_TEST(test_initial_commitment_persist_reload);
     RUN_TEST(test_client_persist_reload);
 
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");

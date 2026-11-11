@@ -360,6 +360,12 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
     (void)ctx; (void)keypair; (void)factory; (void)n_participants;
 
+    if (!ch->has_latest_commitment_sig || ch->commitment_number != 0) {
+        fprintf(stderr, "Client %u: channel handed over without a signed "
+                "commitment 0\n", my_index);
+        return 0;
+    }
+
     for (size_t i = 0; i < data->n_actions; i++) {
         scripted_action_t *act = &data->actions[i];
 
@@ -553,6 +559,12 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                                void *user_data) {
     payment_test_data_t *data = (payment_test_data_t *)user_data;
     (void)ctx; (void)keypair; (void)factory; (void)n_participants;
+
+    if (!ch->has_latest_commitment_sig || ch->commitment_number != 0) {
+        fprintf(stderr, "Client %u: channel handed over without a signed "
+                "commitment 0\n", my_index);
+        return 0;
+    }
 
     if (data->is_sender) {
         /* Client A (index 1): send payment to Client B (index 2, = client_idx 1) */

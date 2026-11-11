@@ -137,6 +137,23 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
                                       secp256k1_context *ctx,
                                       const wire_msg_t *msg);
 
+/* Channel open: handle the LSP's COMMITMENT_SIGNED for commitment 0.
+   Verifies the LSP's partial signature over the client's initial commitment
+   transaction, aggregates it with the client's own and stores the result in
+   ch->latest_commitment_sig.  Nothing is revoked and no REVOKE_AND_ACK is
+   sent: there is no earlier commitment.  Returns 1 on success; 0 if the
+   message is malformed, is not for commitment 0, or the signature does not
+   verify (the channel must not be used). */
+int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg);
+
+/* Write the channel's latest fully signed commitment transaction
+   (ch->latest_commitment_sig over the commitment at ch->commitment_number)
+   to the signed_commitments table, so it can be broadcast from the database
+   alone.  Returns 1 if the row was written, 0 otherwise (including when the
+   channel holds no commitment signature). */
+int client_persist_latest_commitment(persist_t *db, uint32_t channel_id,
+                                       const channel_t *ch);
+
 /* Revocation-verification standard (client side): verify the LSP's revealed
    per-commitment secret against the LSP's committed per-commitment point, then
    retain it (so the user can detect an LSP breach) and track the LSP's next

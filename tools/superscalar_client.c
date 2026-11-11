@@ -718,31 +718,9 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
 /* Persist the latest commitment TX signature to DB.
    Call after each client_handle_commitment_signed so the client can
    broadcast the commitment TX independently for trustless force-close. */
-static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
-    if (!cbd || !cbd->db || !ch->has_latest_commitment_sig) return;
-
-    /* Build signed commitment TX from stored sig */
-    tx_buf_t unsigned_tx;
-    tx_buf_init(&unsigned_tx, 512);
-    unsigned char txid[32];
-    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
-        tx_buf_free(&unsigned_tx);
-        return;
-    }
-    tx_buf_t signed_tx;
-    tx_buf_init(&signed_tx, 512);
-    if (!finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len,
-                             ch->latest_commitment_sig)) {
-        tx_buf_free(&unsigned_tx);
-        tx_buf_free(&signed_tx);
-        return;
-    }
-    tx_buf_free(&unsigned_tx);
-
-    persist_save_commitment_sig(cbd->db, 0, ch->commitment_number,
-                                 ch->latest_commitment_sig,
-                                 signed_tx.data, signed_tx.len);
-    tx_buf_free(&signed_tx);
+static int client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
+    if (!cbd || !cbd->db) return 0;
+    return client_persist_latest_commitment(cbd->db, 0, ch);
 }
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -882,10 +860,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Attach persistence so revocation secrets received later land in
                the revocation_secrets table (needed for standalone watchtower). */
             channel_set_persist(ch, cbd->db, client_idx);
+            /* The signed commitment 0 received at channel open goes into the
+               same transaction as the factory and channel rows: a channel is
+               never on disk without a broadcastable commitment for it. */
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
-                persist_save_tree_nodes(cbd->db, factory, 0)) {
+                persist_save_tree_nodes(cbd->db, factory, 0) &&
+                client_persist_commitment_sig(ch, cbd)) {
                 /* Save signed distribution TX if available */
                 if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
                     persist_save_distribution_tx(cbd->db, 0,
@@ -900,13 +882,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         memset(pcs, 0, 32);
                     }
                 }
-                /* #313 self-custody: persist the INITIAL commitment here too, so a
-                   funded-but-never-transacted channel stays force-closeable when the
-                   LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
-                   to signed_commitments on the first payment, leaving a never-used
-                   channel unrecoverable in a cold mass-exit (Frontier B). */
-                client_persist_commitment_sig(ch, cbd);
-                persist_commit(cbd->db);
+                if (!persist_commit(cbd->db)) {
+                    fprintf(stderr, "Client %u: initial persist commit failed\n", my_index);
+                    return 0;
+                }
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
                 if (factory && my_index >= 1 && my_index < FACTORY_MAX_SIGNERS) {
@@ -915,15 +894,17 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     extern uint32_t g_routing_fee_ppm;  /* defined in client.c */
                     cbd->routing_fee_ppm = g_routing_fee_ppm;
                 }
-                printf("Client %u: persisted factory + channel + basepoints%s to DB\n",
-                       my_index, ch->has_latest_commitment_sig ? " + initial commitment"
-                                                               : " (no commitment sig yet)");
+                printf("Client %u: persisted factory + channel + basepoints"
+                       " + initial commitment to DB\n", my_index);
             } else {
+                /* Without a durable commitment the channel must not be used. */
                 fprintf(stderr, "Client %u: initial persist failed, rolling back\n", my_index);
                 persist_rollback(cbd->db);
+                return 0;
             }
         } else {
             fprintf(stderr, "Client %u: persist_begin failed for initial save\n", my_index);
+            return 0;
         }
     }
 
@@ -1966,7 +1947,8 @@ handle_message:
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
                         persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
-                        persist_save_tree_nodes(cbd->db, factory, 0)) {
+                        persist_save_tree_nodes(cbd->db, factory, 0) &&
+                        client_persist_commitment_sig(ch, cbd)) {
                         /* Save signed distribution TX if available */
                         if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
                             persist_save_distribution_tx(cbd->db, 0,

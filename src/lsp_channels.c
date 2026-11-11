@@ -693,6 +693,28 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return 1;
 }
 
+/* Channel open: sign the client's commitment 0 and send it as
+   COMMITMENT_SIGNED, so the client can exit unilaterally with its opening
+   balance before any payment has moved.  Uses nonce index 0 of the pools just
+   exchanged; nothing is revoked, so no REVOKE_AND_ACK follows. */
+static int lsp_send_initial_commitment(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c) {
+    lsp_channel_entry_t *entry = &mgr->entries[c];
+    unsigned char psig32[32];
+    uint32_t nonce_idx;
+    if (!channel_create_commitment_partial_sig(&entry->channel, psig32, &nonce_idx)) {
+        fprintf(stderr, "LSP: create initial commitment partial sig failed for client %zu\n", c);
+        return 0;
+    }
+    cJSON *cs = wire_build_commitment_signed(entry->channel_id,
+                                               entry->channel.commitment_number,
+                                               psig32, nonce_idx);
+    int ok = wire_send(lsp->client_fds[c], MSG_COMMITMENT_SIGNED, cs);
+    cJSON_Delete(cs);
+    if (!ok)
+        fprintf(stderr, "LSP: failed to send initial COMMITMENT_SIGNED to client %zu\n", c);
+    return ok;
+}
+
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
@@ -809,6 +831,11 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
             channel_set_remote_pubnonces(&mgr->entries[c].channel,
                 (const unsigned char (*)[66])client_nonces, client_nonce_count);
+
+            if (!lsp_send_initial_commitment(mgr, lsp, c)) {
+                free(nonce_fds); free(nonce_ready);
+                return 0;
+            }
 
             nonce_fds[c] = -1;  /* mark as received */
             nonces_received++;
