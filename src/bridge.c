@@ -384,6 +384,29 @@ uint64_t bridge_add_pending(bridge_t *br, const unsigned char *payment_hash32) {
     return 0;
 }
 
+uint64_t bridge_add_pending_upstream(bridge_t *br,
+                                      const unsigned char *payment_hash32,
+                                      const char *upstream_id) {
+    if (!upstream_id || strlen(upstream_id) >=
+            sizeof(br->pending_inbound[0].upstream_id))
+        upstream_id = "";
+    for (size_t i = 0; upstream_id[0] && i < BRIDGE_MAX_PENDING; i++) {
+        bridge_pending_htlc_t *e = &br->pending_inbound[i];
+        if (e->pending && strcmp(e->upstream_id, upstream_id) == 0 &&
+            memcmp(e->payment_hash, payment_hash32, 32) == 0)
+            return e->htlc_id;
+    }
+    uint64_t id = bridge_add_pending(br, payment_hash32);
+    for (size_t i = 0; id != 0 && i < BRIDGE_MAX_PENDING; i++) {
+        bridge_pending_htlc_t *e = &br->pending_inbound[i];
+        if (e->pending && e->htlc_id == id) {
+            strcpy(e->upstream_id, upstream_id);
+            break;
+        }
+    }
+    return id;
+}
+
 static void free_pending(bridge_t *br, bridge_pending_htlc_t *e) {
     memset(e, 0, sizeof(*e));
     if (br->n_pending > 0) br->n_pending--;
@@ -600,8 +623,13 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         uint64_t amount_msat = (uint64_t)am->valuedouble;
         uint32_t cltv_expiry = (uint32_t)ce->valuedouble;
 
+        cJSON *up = cJSON_GetObjectItem(json, "upstream_id");
+        const char *upstream_id =
+            (up && cJSON_IsString(up)) ? up->valuestring : "";
+
         /* Assign htlc_id and track */
-        uint64_t htlc_id = bridge_add_pending(br, payment_hash);
+        uint64_t htlc_id = bridge_add_pending_upstream(br, payment_hash,
+                                                        upstream_id);
         if (htlc_id == 0) {
             /* Table full: the LSP cannot be asked, so tell the plugin to
                fail this HTLC rather than leave it held with no id. */
@@ -622,6 +650,8 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         /* Forward to LSP */
         cJSON *msg = wire_build_bridge_add_htlc(payment_hash, amount_msat,
                                                   cltv_expiry, htlc_id);
+        if (strlen(upstream_id) < sizeof(br->pending_inbound[0].upstream_id))
+            cJSON_AddStringToObject(msg, "upstream_id", upstream_id);
         int ok = wire_send(br->lsp_fd, MSG_BRIDGE_ADD_HTLC, msg);
         cJSON_Delete(msg);
         cJSON_Delete(json);

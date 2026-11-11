@@ -5154,13 +5154,22 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     /* Check if this HTLC originated from the bridge */
-    uint64_t bridge_htlc_id = lsp_channels_get_bridge_origin(mgr, payment_hash);
-    if (bridge_htlc_id > 0 && mgr->bridge_fd >= 0) {
-        /* Back-propagate to bridge instead of intra-factory */
-        cJSON *fulfill = wire_build_bridge_fulfill_htlc(payment_hash, preimage,
-                                                          bridge_htlc_id);
-        wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, fulfill);
-        cJSON_Delete(fulfill);
+    uint64_t bridge_htlc_id = lsp_channels_settle_bridge_origin(mgr, payment_hash,
+                                                                 preimage);
+    if (bridge_htlc_id > 0) {
+        /* Back-propagate to bridge instead of intra-factory.  With the
+           bridge away the fulfil is kept and given when the Lightning node
+           offers the HTLC again. */
+        if (mgr->bridge_fd >= 0) {
+            cJSON *fulfill = wire_build_bridge_fulfill_htlc(payment_hash, preimage,
+                                                              bridge_htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, fulfill);
+            cJSON_Delete(fulfill);
+        } else {
+            fprintf(stderr, "LSP: bridge not connected, fulfil for htlc_id=%llu "
+                    "held for a repeat offer\n",
+                    (unsigned long long)bridge_htlc_id);
+        }
         printf("LSP: HTLC fulfilled via bridge (htlc_id=%llu)\n",
                (unsigned long long)bridge_htlc_id);
         /* Commit the payee persist transaction (bridge = no sender debit) */

@@ -271,6 +271,62 @@ int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
     return 0;
 }
 
+uint64_t lsp_channels_settle_bridge_origin(lsp_channel_mgr_t *mgr,
+                                             const unsigned char *payment_hash32,
+                                             const unsigned char *preimage32) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        htlc_origin_t *o = &mgr->htlc_origins[i];
+        if (!o->active || o->bridge_htlc_id == 0) continue;
+        if (memcmp(o->payment_hash, payment_hash32, 32) != 0) continue;
+
+        bridge_fulfilled_t *f = &mgr->bridge_fulfilled[mgr->bridge_fulfilled_next];
+        memcpy(f->payment_hash, payment_hash32, 32);
+        memcpy(f->preimage, preimage32, 32);
+        memcpy(f->upstream_id, o->upstream_id, sizeof(f->upstream_id));
+        mgr->bridge_fulfilled_next =
+            (mgr->bridge_fulfilled_next + 1) % LSP_BRIDGE_FULFILLED_MAX;
+        if (mgr->n_bridge_fulfilled < LSP_BRIDGE_FULFILLED_MAX)
+            mgr->n_bridge_fulfilled++;
+        break;
+    }
+    return lsp_channels_get_bridge_origin(mgr, payment_hash32);
+}
+
+/* The inbound origin in flight for this hash, or NULL. */
+static htlc_origin_t *inbound_origin(lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        htlc_origin_t *o = &mgr->htlc_origins[i];
+        if (o->active && o->bridge_htlc_id > 0 &&
+            memcmp(o->payment_hash, payment_hash32, 32) == 0)
+            return o;
+    }
+    return NULL;
+}
+
+/* 1 if an HTLC offered by the bridge is the one `o` already stands for.
+   With both identities known they must be equal.  An origin restored from
+   the database has none; it is recognised by the HTLC the client was
+   offered for it, which carries the same amount and expiry. */
+static int same_upstream_htlc(lsp_channel_mgr_t *mgr, htlc_origin_t *o,
+                               const char *upstream_id, uint64_t amount_msat,
+                               uint32_t cltv_expiry) {
+    if (!upstream_id[0]) return 0;
+    if (o->upstream_id[0])
+        return strcmp(o->upstream_id, upstream_id) == 0;
+    if (o->sender_idx >= mgr->n_channels) return 0;
+    const channel_t *ch = &mgr->entries[o->sender_idx].channel;
+    for (size_t i = 0; i < ch->n_htlcs; i++) {
+        const htlc_t *h = &ch->htlcs[i];
+        if (h->id == o->sender_htlc_id && h->direction == HTLC_OFFERED &&
+            h->state == HTLC_STATE_ACTIVE &&
+            memcmp(h->payment_hash, o->payment_hash, 32) == 0)
+            return h->amount_sats == amount_msat / 1000 &&
+                   amount_msat % 1000 == 0 && h->cltv_expiry == cltv_expiry;
+    }
+    return 0;
+}
+
 int lsp_channels_hash_in_flight(const lsp_channel_mgr_t *mgr,
                                  const unsigned char *payment_hash32) {
     for (size_t i = 0; i < mgr->n_htlc_origins; i++)
@@ -383,6 +439,48 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                (unsigned long long)amount_msat, cltv_expiry,
                (unsigned long long)htlc_id,
                is_keysend ? ", keysend" : "");
+
+        char upstream_id[BRIDGE_UPSTREAM_ID_MAX] = "";
+        {
+            cJSON *up = cJSON_GetObjectItem(msg->json, "upstream_id");
+            if (up && cJSON_IsString(up) &&
+                strlen(up->valuestring) < sizeof(upstream_id))
+                strcpy(upstream_id, up->valuestring);
+        }
+
+        /* The Lightning node offers an HTLC again when it comes back from a
+           restart with the HTLC still unresolved.  That is not a second
+           payment: the client already has it (or has already fulfilled
+           it), so attach the new offer to what is there. */
+        {
+            htlc_origin_t *prev = inbound_origin(mgr, payment_hash);
+            if (prev && same_upstream_htlc(mgr, prev, upstream_id, amount_msat,
+                                           cltv_expiry)) {
+                prev->bridge_htlc_id = htlc_id;
+                memcpy(prev->upstream_id, upstream_id, sizeof(prev->upstream_id));
+                if (mgr->persist)
+                    persist_save_htlc_origin((persist_t *)mgr->persist,
+                        payment_hash, htlc_id, 0,
+                        prev->sender_idx, prev->sender_htlc_id);
+                printf("LSP: bridge HTLC offered again, still in flight "
+                       "(htlc_id now %llu)\n", (unsigned long long)htlc_id);
+                return 1;
+            }
+            for (size_t i = 0; !prev && upstream_id[0] &&
+                               i < mgr->n_bridge_fulfilled; i++) {
+                const bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
+                if (memcmp(f->payment_hash, payment_hash, 32) != 0 ||
+                    strcmp(f->upstream_id, upstream_id) != 0)
+                    continue;
+                cJSON *again = wire_build_bridge_fulfill_htlc(payment_hash,
+                                                               f->preimage, htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, again);
+                cJSON_Delete(again);
+                printf("LSP: bridge HTLC offered again after it was "
+                       "fulfilled, fulfil repeated\n");
+                return 1;
+            }
+        }
 
         /* Look up invoice to find dest_client */
         size_t dest_idx;
@@ -549,6 +647,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 org->cltv_expiry = cltv_expiry;
                 org->sender_idx = dest_idx;
                 org->sender_htlc_id = dest_htlc_id;
+                memcpy(org->upstream_id, upstream_id, sizeof(org->upstream_id));
                 /* Re-persist with updated sender/cltv fields so timeout
                    routing works after crash (the initial persist only
                    stored bridge_htlc_id with zeroed sender fields) */

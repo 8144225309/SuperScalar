@@ -50,7 +50,8 @@ ROUTE_HINT = None  # "node_id/scid/fee_base/fee_ppm/cltv_delta" for factory chan
 bridge_sock = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
 # payment_hash -> {"rpc_id": hook request to answer,
-#                  "factory_invoice": True if CLN holds this hash's invoice}
+#                  "factory_invoice": True if CLN holds this hash's invoice,
+#                  "upstream": CLN's own name for the HTLC ("" if unknown)}
 pending_htlcs = {}
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
@@ -694,6 +695,20 @@ def _read_varint(data, offset):
         return int.from_bytes(data[offset+1:offset+9], 'big'), offset + 9
 
 
+def upstream_id(htlc):
+    """CLN's own name for an incoming HTLC: "<short_channel_id>:<id>".
+
+    CLN calls the hook again for every HTLC still unresolved when it
+    restarts.  The name is the same then, which is how the LSP tells the
+    same HTLC offered again from a second HTLC for the same payment hash.
+    Returns "" if CLN does not report both parts."""
+    scid = htlc.get("short_channel_id")
+    hid = htlc.get("id")
+    if scid is None or hid is None or isinstance(hid, bool):
+        return ""
+    return f"{scid}:{hid}"
+
+
 def handle_htlc_accepted(rpc_id, params):
     """Handle the htlc_accepted hook from CLN.
     Forwards HTLCs for registered factory invoices to the bridge.
@@ -705,6 +720,7 @@ def handle_htlc_accepted(rpc_id, params):
     raw_amt = htlc.get("amount_msat", 0)
     amount_msat = int(str(raw_amt).replace("msat", ""))
     cltv_expiry = htlc.get("cltv_expiry", 0)
+    upstream = upstream_id(htlc)
 
     # The invoice list could not be read yet, so the registry below may be
     # missing factory invoices.  Try again now.
@@ -760,10 +776,17 @@ def handle_htlc_accepted(rpc_id, params):
 
     # Register pending HTLC keyed by payment_hash (no counter desync risk)
     with lock:
-        duplicate = payment_hash in pending_htlcs
+        held = pending_htlcs.get(payment_hash)
+        # The same HTLC offered again takes over the entry (the answer has
+        # to go to the latest hook call) and is offered to the LSP again,
+        # which attaches it to what it already has.
+        again = held is not None and upstream != "" and \
+            held.get("upstream") == upstream
+        duplicate = held is not None and not again
         if not duplicate:
             pending_htlcs[payment_hash] = {"rpc_id": rpc_id,
-                                           "factory_invoice": is_ours}
+                                           "factory_invoice": is_ours,
+                                           "upstream": upstream}
     if duplicate:
         # A second HTLC for a hash that is already with the LSP: a further
         # part of a split payment, or a repeat.  The LSP takes an invoice
@@ -783,7 +806,8 @@ def handle_htlc_accepted(rpc_id, params):
         "method": "htlc_accepted",
         "payment_hash": payment_hash,
         "amount_msat": amount_msat,
-        "cltv_expiry": cltv_expiry
+        "cltv_expiry": cltv_expiry,
+        "upstream_id": upstream
     }
     if keysend_preimage:
         bridge_msg["keysend"] = True

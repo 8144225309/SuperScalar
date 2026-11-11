@@ -4468,3 +4468,216 @@ int test_bridge_inbound_beyond_pending_limit(void) {
     close(plugin_sv[0]); close(plugin_sv[1]);
     return 1;
 }
+
+/* ---- An inbound HTLC offered again re-attaches; a second one is refused ---- */
+
+/* Hand the LSP an inbound bridge HTLC carrying the plugin's name for it.
+   Returns the type of the bridge message it answered with (0 = none) and,
+   for a failure, the reason. */
+static int offer_bridge_htlc_as(lsp_channel_mgr_t *mgr, lsp_t *lsp, int bridge_peer_fd,
+                                const unsigned char *hash, uint64_t amount_msat,
+                                uint32_t cltv_expiry, uint64_t htlc_id,
+                                const char *upstream_id, char *reason,
+                                size_t reason_cap, unsigned char *preimage_out) {
+    cJSON *add = wire_build_bridge_add_htlc(hash, amount_msat, cltv_expiry, htlc_id);
+    if (upstream_id) cJSON_AddStringToObject(add, "upstream_id", upstream_id);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_ADD_HTLC;
+    msg.json = add;
+    int handled = lsp_channels_handle_bridge_msg(mgr, lsp, &msg);
+    cJSON_Delete(add);
+    reason[0] = '\0';
+    if (!handled) return -1;
+
+    wire_msg_t reply;
+    if (!wire_recv_timeout(bridge_peer_fd, &reply, 1)) return 0;
+    unsigned char h[32]; uint64_t id = 0;
+    int type = reply.msg_type;
+    if (type == MSG_BRIDGE_FAIL_HTLC) {
+        if (!wire_parse_bridge_fail_htlc(reply.json, h, reason, reason_cap, &id) ||
+            id != htlc_id) type = -1;
+    } else if (type == MSG_BRIDGE_FULFILL_HTLC) {
+        if (!wire_parse_bridge_fulfill_htlc(reply.json, h, preimage_out, &id) ||
+            id != htlc_id) type = -1;
+    }
+    cJSON_Delete(reply.json);
+    return type;
+}
+
+int test_lsp_inbound_replay_reattaches(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 2;
+    mgr.bridge_fd = sv[0];
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.invoices && mgr.htlc_origins && lsp, "alloc");
+
+    unsigned char preimage[32], hash[32], got[32];
+    memset(preimage, 0x44, 32);
+    sha256(preimage, 32, hash);
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, 5000000),
+                "register invoice");
+    char reason[128];
+
+    /* The HTLC is with client 1: 5,000 sat, expiry 500, known to the
+       Lightning node as HTLC 5 on channel 100x1x0. */
+    channel_t *ch = &mgr.entries[1].channel;
+    ch->local_amount = 100000;
+    uint64_t client_htlc;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 5000, hash, 500, &client_htlc),
+                "HTLC with the client");
+    htlc_origin_t *o = lsp_channels_track_bridge_origin(&mgr, hash, 90);
+    TEST_ASSERT(o != NULL, "origin");
+    o->sender_idx = 1; o->sender_htlc_id = client_htlc; o->cltv_expiry = 500;
+    strcpy(o->upstream_id, "100x1x0:5");
+
+    /* The node restarts and offers the same HTLC again, under a new id */
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 91,
+                                         "100x1x0:5", reason, sizeof(reason), got),
+                   0, "same HTLC again: no failure, no second offer");
+    TEST_ASSERT_EQ(o->bridge_htlc_id, 91, "origin now answers to the new id");
+    TEST_ASSERT(o->active, "origin still open");
+    TEST_ASSERT_EQ(ch->n_htlcs, 1, "client not offered a second HTLC");
+    TEST_ASSERT_EQ(mgr.n_htlc_origins, 1, "no second origin");
+
+    /* A different HTLC for the same hash is still refused, and so is one
+       the plugin cannot name */
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 92,
+                                         "100x1x0:6", reason, sizeof(reason), got),
+                   MSG_BRIDGE_FAIL_HTLC, "second HTLC failed");
+    TEST_ASSERT(strcmp(reason, "duplicate_payment_hash") == 0, "as a duplicate");
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 93,
+                                         "", reason, sizeof(reason), got),
+                   MSG_BRIDGE_FAIL_HTLC, "unnamed HTLC failed");
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 94,
+                                         NULL, reason, sizeof(reason), got),
+                   MSG_BRIDGE_FAIL_HTLC, "HTLC without identity failed");
+    TEST_ASSERT_EQ(o->bridge_htlc_id, 91, "the first HTLC keeps its origin");
+
+    /* The client fulfils: the fulfil goes to the id of the latest offer */
+    TEST_ASSERT_EQ(lsp_channels_settle_bridge_origin(&mgr, hash, preimage), 91,
+                   "fulfil is for the re-attached id");
+    TEST_ASSERT(!o->active, "origin closed");
+
+    /* If the node never got that answer and offers the HTLC once more, it
+       gets the fulfil again; nobody is offered anything */
+    memset(got, 0, 32);
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 95,
+                                         "100x1x0:5", reason, sizeof(reason), got),
+                   MSG_BRIDGE_FULFILL_HTLC, "fulfil repeated");
+    TEST_ASSERT_MEM_EQ(got, preimage, 32, "with the preimage");
+    TEST_ASSERT_EQ(ch->n_htlcs, 1, "client not offered anything");
+    TEST_ASSERT_EQ(lsp_channels_settle_bridge_origin(&mgr, hash, preimage), 0,
+                   "no origin was opened for the repeat");
+
+    free(ch->htlcs);
+    close(sv[0]); close(sv[1]);
+    free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
+    return 1;
+}
+
+int test_lsp_inbound_replay_restored_origin(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 2;
+    mgr.bridge_fd = sv[0];
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.invoices && mgr.htlc_origins && lsp, "alloc");
+
+    unsigned char preimage[32], hash[32], got[32];
+    memset(preimage, 0x45, 32);
+    sha256(preimage, 32, hash);
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, 5000000),
+                "register invoice");
+    char reason[128];
+
+    /* As after an LSP restart: the origin is known, the node's name for
+       the HTLC is not. */
+    channel_t *ch = &mgr.entries[1].channel;
+    ch->local_amount = 100000;
+    uint64_t client_htlc;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 5000, hash, 500, &client_htlc),
+                "HTLC with the client");
+    htlc_origin_t *o = lsp_channels_track_bridge_origin(&mgr, hash, 90);
+    TEST_ASSERT(o != NULL, "origin");
+    o->sender_idx = 1; o->sender_htlc_id = client_htlc;
+
+    /* An offer that does not match the HTLC the client holds is refused */
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 6000000, 500, 91,
+                                         "100x1x0:5", reason, sizeof(reason), got),
+                   MSG_BRIDGE_FAIL_HTLC, "other amount refused");
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 501, 92,
+                                         "100x1x0:5", reason, sizeof(reason), got),
+                   MSG_BRIDGE_FAIL_HTLC, "other expiry refused");
+    TEST_ASSERT_EQ(o->bridge_htlc_id, 90, "origin unchanged");
+
+    /* One that matches it is the same HTLC: adopted, with its name */
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 93,
+                                         "100x1x0:5", reason, sizeof(reason), got),
+                   0, "matching offer re-attached");
+    TEST_ASSERT_EQ(o->bridge_htlc_id, 93, "origin answers to the new id");
+    TEST_ASSERT(strcmp(o->upstream_id, "100x1x0:5") == 0, "identity adopted");
+
+    /* From then on only that HTLC matches */
+    TEST_ASSERT_EQ(offer_bridge_htlc_as(&mgr, lsp, sv[1], hash, 5000000, 500, 94,
+                                         "100x1x0:7", reason, sizeof(reason), got),
+                   MSG_BRIDGE_FAIL_HTLC, "another HTLC refused");
+    TEST_ASSERT(strcmp(reason, "duplicate_payment_hash") == 0, "as a duplicate");
+
+    free(ch->htlcs);
+    close(sv[0]); close(sv[1]);
+    free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
+    return 1;
+}
+
+int test_bridge_replay_keeps_pending_id(void) {
+    int lsp_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+    bridge_t br;
+    bridge_init(&br);
+    br.lsp_fd = lsp_sv[1];
+
+    static const char *offers[] = { "100x1x0:5", "100x1x0:5", "100x1x0:6", "", "" };
+    uint64_t ids[5];
+    for (int i = 0; i < 5; i++) {
+        char line[512];
+        snprintf(line, sizeof(line),
+                 "{\"method\":\"htlc_accepted\",\"payment_hash\":\"%064x\","
+                 "\"amount_msat\":5000000,\"cltv_expiry\":500,"
+                 "\"upstream_id\":\"%s\"}", 0xabc, offers[i]);
+        TEST_ASSERT(bridge_handle_plugin_msg(&br, line), "htlc_accepted handled");
+        wire_msg_t m;
+        TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &m, 5), "forwarded to LSP");
+        unsigned char ph[32]; uint64_t amt; uint32_t cltv;
+        TEST_ASSERT(wire_parse_bridge_add_htlc(m.json, ph, &amt, &cltv, &ids[i]),
+                    "parse ADD_HTLC");
+        cJSON *up = cJSON_GetObjectItem(m.json, "upstream_id");
+        TEST_ASSERT(up && cJSON_IsString(up) &&
+                    strcmp(up->valuestring, offers[i]) == 0,
+                    "identity passed on to the LSP");
+        cJSON_Delete(m.json);
+    }
+    TEST_ASSERT(ids[0] != 0, "id assigned");
+    TEST_ASSERT_EQ(ids[1], ids[0], "same HTLC offered again keeps its id");
+    TEST_ASSERT(ids[2] != ids[0], "another HTLC for the hash gets its own");
+    TEST_ASSERT(ids[3] != ids[0] && ids[3] != ids[2], "an unnamed HTLC gets its own");
+    TEST_ASSERT(ids[4] != ids[3], "unnamed HTLCs are never merged");
+    TEST_ASSERT_EQ(br.n_pending, 4, "four HTLCs pending");
+
+    close(lsp_sv[0]); close(lsp_sv[1]);
+    return 1;
+}

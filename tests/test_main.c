@@ -1295,6 +1295,9 @@ extern int test_lsp_pay_result_failure(void);
 extern int test_lsp_outbound_one_pay_per_hash(void);
 extern int test_bridge_pending_table(void);
 extern int test_bridge_inbound_beyond_pending_limit(void);
+extern int test_lsp_inbound_replay_reattaches(void);
+extern int test_lsp_inbound_replay_restored_origin(void);
+extern int test_bridge_replay_keeps_pending_id(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -3227,6 +3230,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_outbound_one_pay_per_hash);
     RUN_TEST(test_bridge_pending_table);
     RUN_TEST(test_bridge_inbound_beyond_pending_limit);
+    RUN_TEST(test_lsp_inbound_replay_reattaches);
+    RUN_TEST(test_lsp_inbound_replay_restored_origin);
+    RUN_TEST(test_bridge_replay_keeps_pending_id);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);

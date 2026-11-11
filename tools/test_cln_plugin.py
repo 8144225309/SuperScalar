@@ -417,12 +417,17 @@ class OutboundPayResolutionTest(PluginTestCase):
 
 
 def htlc(payment_hash=PAYMENT_HASH, amount_msat=5_000_000, cltv_expiry=500,
-         **onion):
-    """htlc_accepted hook parameters.  Extra keywords go into the onion; a
-    short_channel_id there makes it a forward."""
-    return {"htlc": {"payment_hash": payment_hash, "amount_msat": amount_msat,
-                     "cltv_expiry": cltv_expiry},
-            "onion": dict(onion)}
+         channel=None, htlc_id=None, **onion):
+    """htlc_accepted hook parameters.  channel/htlc_id are CLN's name for
+    the incoming HTLC.  Extra keywords go into the onion; a short_channel_id
+    there makes it a forward."""
+    h = {"payment_hash": payment_hash, "amount_msat": amount_msat,
+         "cltv_expiry": cltv_expiry}
+    if channel is not None:
+        h["short_channel_id"] = channel
+    if htlc_id is not None:
+        h["id"] = htlc_id
+    return {"htlc": h, "onion": dict(onion)}
 
 
 CONTINUE = {"result": "continue"}
@@ -455,10 +460,12 @@ class InboundHtlcTest(PluginTestCase):
 
     def test_factory_invoice_htlc_goes_to_the_lsp_with_its_amount(self):
         self.register()
-        cln_plugin.handle_htlc_accepted(1, htlc(amount_msat=5_000_000))
+        cln_plugin.handle_htlc_accepted(1, htlc(amount_msat=5_000_000,
+                                                channel="100x1x0", htlc_id=5))
         self.assertEqual(self.to_lsp(), [{
             "method": "htlc_accepted", "payment_hash": PAYMENT_HASH,
-            "amount_msat": 5_000_000, "cltv_expiry": 500}])
+            "amount_msat": 5_000_000, "cltv_expiry": 500,
+            "upstream_id": "100x1x0:5"}])
         self.assertEqual(self.hook_answers(), [])   # held until the LSP answers
 
     def test_amount_is_what_the_htlc_delivers_not_the_onion_forward_amount(self):
@@ -541,6 +548,41 @@ class InboundHtlcTest(PluginTestCase):
         self.assertEqual(len(self.to_lsp()), 1)
         # The first one is still the LSP's to resolve.
         self.assertEqual(cln_plugin.pending_htlcs[PAYMENT_HASH]["rpc_id"], 12)
+
+    def test_same_htlc_offered_again_is_reattached_not_failed(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(30, htlc(channel="100x1x0", htlc_id=5))
+        cln_plugin.handle_htlc_accepted(31, htlc(channel="100x1x0", htlc_id=5))
+        # Nothing is failed, the LSP is offered it again under the same name,
+        self.assertEqual(self.hook_answers(), [])
+        self.assertEqual([m["upstream_id"] for m in self.to_lsp()],
+                         ["100x1x0:5", "100x1x0:5"])
+        # and the LSP's answer goes to the latest hook call.
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertEqual(self.hook_answers(), [
+            (31, {"result": "resolve", "payment_key": PREIMAGE})])
+
+    def test_another_htlc_for_the_hash_is_still_failed(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(32, htlc(channel="100x1x0", htlc_id=5))
+        cln_plugin.handle_htlc_accepted(33, htlc(channel="100x1x0", htlc_id=6))
+        cln_plugin.handle_htlc_accepted(34, htlc(channel="200x2x0", htlc_id=5))
+        self.assertEqual(self.hook_answers(), [(33, fail("0017")),
+                                               (34, fail("0017"))])
+        self.assertEqual(len(self.to_lsp()), 1)
+        self.assertEqual(cln_plugin.pending_htlcs[PAYMENT_HASH]["rpc_id"], 32)
+
+    def test_htlcs_cln_does_not_name_are_never_merged(self):
+        self.register()
+        self.assertEqual(cln_plugin.upstream_id({"payment_hash": "x"}), "")
+        self.assertEqual(cln_plugin.upstream_id({"short_channel_id": "1x1x1"}), "")
+        self.assertEqual(cln_plugin.upstream_id({"short_channel_id": "1x1x1",
+                                                 "id": 0}), "1x1x1:0")
+        cln_plugin.handle_htlc_accepted(35, htlc())
+        cln_plugin.handle_htlc_accepted(36, htlc())
+        self.assertEqual(self.hook_answers(), [(36, fail("0017"))])
 
     def test_second_htlc_for_a_forward_in_flight_is_left_to_cln(self):
         cln_plugin.handle_htlc_accepted(14, htlc(short_channel_id="1x1x1"))

@@ -137,8 +137,23 @@ typedef struct {
     size_t sender_idx;           /* originating client index (Phase 17) */
     uint64_t sender_htlc_id;    /* HTLC id on sender's channel (Phase 17) */
     uint32_t cltv_expiry;       /* timelock for bridge HTLC timeout */
+    /* Which HTLC on the Lightning node this is ("<channel>:<id>" as the
+       plugin reports it; "" if unknown).  The node offers an unresolved
+       HTLC again after it restarts; this tells that apart from a second
+       HTLC for the same hash. */
+    #define BRIDGE_UPSTREAM_ID_MAX 64
+    char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
     int active;
 } htlc_origin_t;
+
+/* An inbound bridge HTLC the client has fulfilled: kept so the fulfil can
+   be given again if the Lightning node offers the same HTLC once more
+   (it never received, or lost, the first answer). */
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
+} bridge_fulfilled_t;
 
 typedef struct {
     lsp_channel_entry_t *entries;
@@ -159,6 +174,10 @@ typedef struct {
                                     are refused.  Set after init. */
     /* Payment hashes of the most recent outside payments that completed
        (ring buffer): a client is not charged a second time for one. */
+    #define LSP_BRIDGE_FULFILLED_MAX 32
+    bridge_fulfilled_t bridge_fulfilled[LSP_BRIDGE_FULFILLED_MAX];
+    size_t n_bridge_fulfilled;
+    size_t bridge_fulfilled_next;
     #define LSP_OUTBOUND_PAID_MAX 64
     unsigned char outbound_paid[LSP_OUTBOUND_PAID_MAX][32];
     size_t n_outbound_paid;
@@ -574,6 +593,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id);
+
+/* The client fulfilled an HTLC that came in through the bridge: close its
+   origin, remember the preimage for a replay, and return the bridge's
+   htlc_id for the fulfil (0 if the hash did not come from the bridge). */
+uint64_t lsp_channels_settle_bridge_origin(lsp_channel_mgr_t *mgr,
+                                             const unsigned char *payment_hash32,
+                                             const unsigned char *preimage32);
 
 /* 1 if an HTLC for payment_hash32 is in flight through the bridge in either
    direction. */

@@ -21,6 +21,7 @@ typedef struct {
     unsigned char payment_hash[32];
     uint64_t htlc_id;
     int pending;
+    char upstream_id[64];   /* the plugin's name for the HTLC; "" if none */
 } bridge_pending_htlc_t;
 
 typedef struct {
@@ -141,6 +142,13 @@ int bridge_run(bridge_t *br);
 /* Add a pending inbound HTLC.  Returns the htlc_id assigned to it (never
    0), or 0 if BRIDGE_MAX_PENDING HTLCs are already pending. */
 uint64_t bridge_add_pending(bridge_t *br, const unsigned char *payment_hash32);
+
+/* As bridge_add_pending, for an HTLC the plugin identifies as upstream_id.
+   An HTLC that is already pending under the same hash and the same
+   (non-empty) identity is the same HTLC offered again and keeps its id. */
+uint64_t bridge_add_pending_upstream(bridge_t *br,
+                                      const unsigned char *payment_hash32,
+                                      const char *upstream_id);
 
 /* Find and free a pending HTLC by payment_hash.  Returns 1 and sets
    *htlc_id_out if one was pending, 0 otherwise. */
