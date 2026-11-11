@@ -456,6 +456,20 @@ uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
     return id;
 }
 
+/* An inbound bridge HTLC could not be handed to the client after all: take
+   it off the client's channel, close its origin and tell the bridge, so
+   that the plugin fails the upstream HTLC and nothing stays reserved. */
+static void inbound_rollback(lsp_channel_mgr_t *mgr, channel_t *dest_ch,
+                              uint64_t dest_htlc_id, htlc_origin_t *origin,
+                              const unsigned char *payment_hash,
+                              uint64_t bridge_htlc_id, const char *reason) {
+    channel_fail_htlc(dest_ch, dest_htlc_id);
+    lsp_channels_origin_close(mgr, origin);
+    cJSON *fail = wire_build_bridge_fail_htlc(payment_hash, reason, bridge_htlc_id);
+    wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+    cJSON_Delete(fail);
+}
+
 int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      const wire_msg_t *msg) {
     if (!mgr || !lsp || !msg) return 0;
@@ -639,6 +653,17 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 1;
         }
 
+        /* Without an origin the fulfil could never find its way back to
+           the bridge: refuse before anything is offered to the client. */
+        if (!lsp_channels_origin_slot_free(mgr)) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "too_many_pending_payments", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            fprintf(stderr, "LSP: bridge HTLC rejected — origin table full\n");
+            return 1;
+        }
+
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
         /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
@@ -706,7 +731,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
             free(old_dest_htlcs);
-            return 0;
+            inbound_rollback(mgr, dest_ch, dest_htlc_id, org, payment_hash,
+                             htlc_id, "client_unreachable");
+            return 1;
         }
         cJSON_Delete(fwd);
 
@@ -716,7 +743,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t nonce_idx;
             if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
                 free(old_dest_htlcs);
-                return 0;
+                inbound_rollback(mgr, dest_ch, dest_htlc_id, org, payment_hash,
+                                 htlc_id, "commitment_failed");
+                return 1;
             }
             cJSON *cs = wire_build_commitment_signed(
                 mgr->entries[dest_idx].channel_id,
@@ -724,7 +753,9 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (!wire_send(lsp->client_fds[dest_idx], MSG_COMMITMENT_SIGNED, cs)) {
                 cJSON_Delete(cs);
                 free(old_dest_htlcs);
-                return 0;
+                inbound_rollback(mgr, dest_ch, dest_htlc_id, org, payment_hash,
+                                 htlc_id, "client_unreachable");
+                return 1;
             }
             cJSON_Delete(cs);
         }
@@ -739,12 +770,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    state is consistent and bridge can retry later. */
                 fprintf(stderr, "LSP: bridge HTLC rollback — client %zu disconnected during commit\n",
                         dest_idx);
-                channel_fail_htlc(dest_ch, dest_htlc_id);
-                /* Notify bridge of failure */
-                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
-                    "client_disconnected", htlc_id);
-                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
-                cJSON_Delete(fail);
+                inbound_rollback(mgr, dest_ch, dest_htlc_id, org, payment_hash,
+                                 htlc_id, "client_disconnected");
                 if (ack_msg.json) cJSON_Delete(ack_msg.json);
                 free(old_dest_htlcs);
                 return 1;  /* handled (not a fatal error) */

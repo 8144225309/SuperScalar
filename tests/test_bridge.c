@@ -5120,3 +5120,76 @@ int test_lsp_same_hash_inbound_and_outbound(void) {
     pay_fixture_free(&f);
     return 1;
 }
+
+/* ---- Inbound HTLC: no origin, no offer; a failed offer leaves nothing behind ---- */
+
+int test_lsp_inbound_origin_table_and_rollback(void) {
+    int sv[2], cl[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 1;
+    mgr.bridge_fd = sv[0];
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(2, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = 2;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.invoices && mgr.htlc_origins && lsp, "alloc");
+    int client_fd = cl[0];
+    lsp->client_fds = &client_fd;
+    shutdown(cl[1], SHUT_WR);          /* the client never answers */
+
+    unsigned char preimage[32], hash[32], other[2][32];
+    memset(preimage, 0x46, 32);
+    sha256(preimage, 32, hash);
+    memset(other[0], 0x47, 32);
+    memset(other[1], 0x48, 32);
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 0, 5000000),
+                "register invoice");
+    channel_t *ch = &mgr.entries[0].channel;
+    ch->local_amount = 100000;
+    char reason[128];
+    wire_msg_t stray;
+
+    /* Origin table full: refused, and the client is offered nothing */
+    htlc_origin_t *a = lsp_channels_track_bridge_origin(&mgr, other[0], 1);
+    htlc_origin_t *b = lsp_channels_track_bridge_origin(&mgr, other[1], 2);
+    TEST_ASSERT(a && b && !lsp_channels_origin_slot_free(&mgr), "table full");
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash, 5000000, 500, 70,
+                                   reason, sizeof(reason)), "failed back");
+    TEST_ASSERT(strcmp(reason, "too_many_pending_payments") == 0,
+                "refused for want of an origin");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "no HTLC offered to the client");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "nothing reserved");
+    TEST_ASSERT(!wire_recv_timeout(cl[1], &stray, 1), "client sent nothing");
+
+    /* With room, the HTLC is offered; the client does not complete the
+       commitment, so it is taken back: failure to the bridge, origin
+       closed, balance restored, nothing in flight. */
+    a->active = 0;
+    TEST_ASSERT(offer_bridge_htlc(&mgr, lsp, sv[1], hash, 5000000, 500, 71,
+                                   reason, sizeof(reason)), "failed back");
+    TEST_ASSERT(strcmp(reason, "client_disconnected") == 0 ||
+                strcmp(reason, "commitment_failed") == 0 ||
+                strcmp(reason, "client_unreachable") == 0, "offer rolled back");
+    TEST_ASSERT(!lsp_channels_hash_in_flight(&mgr, hash), "no origin left for it");
+    TEST_ASSERT(lsp_channels_origin_slot_free(&mgr), "its origin slot is free again");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "LSP balance restored");
+    int still_active = 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) still_active++;
+    TEST_ASSERT_EQ(still_active, 0, "no HTLC left with the client");
+    TEST_ASSERT(b->active && b->bridge_htlc_id == 2, "other origin untouched");
+
+    /* The invoice can be paid again afterwards */
+    size_t dest;
+    TEST_ASSERT(lsp_channels_lookup_invoice(&mgr, hash, &dest), "invoice still open");
+
+    free(ch->htlcs);
+    close(sv[0]); close(sv[1]); close(cl[0]); close(cl[1]);
+    free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
+    return 1;
+}
