@@ -1497,6 +1497,88 @@ class KeysendTest(PluginTestCase):
         self.assertEqual(self.hook_answers(), [(43, {"result": "continue"})])
 
 
+def peer_channel(state, scid="100x1x0", **extra):
+    return dict({"short_channel_id": scid, "state": state}, **extra)
+
+
+class HtlcOnClosedChannelTest(PluginTestCase):
+    """A held hook is not answered once the HTLC's channel is closed
+    unilaterally or on-chain."""
+
+    def hook_answers(self):
+        return [(m["id"], m["result"]) for m in self.to_cln if "id" in m]
+
+    def hold(self, rpc_id=4):
+        cln_plugin.registered_invoices.add(PAYMENT_HASH)
+        cln_plugin.handle_htlc_accepted(rpc_id, htlc(channel="100x1x0",
+                                                     htlc_id=5))
+
+    def lsp_says(self, result):
+        msg = {"method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+               "htlc_id": 1, "result": result}
+        if result == "fulfill":
+            msg["preimage"] = PREIMAGE
+        else:
+            msg["reason"] = "timeout"
+        cln_plugin.handle_bridge_msg(msg)
+
+    def test_gone_states(self):
+        for state in ("AWAITING_UNILATERAL", "FUNDING_SPEND_SEEN", "ONCHAIN",
+                      "CLOSINGD_COMPLETE"):
+            self.use_cln(listpeerchannels={"channels": [
+                peer_channel("CHANNELD_NORMAL", "7x7x7"),
+                peer_channel(state)]})
+            self.assertFalse(cln_plugin.htlc_still_held("100x1x0:5"), state)
+
+    def test_channel_known_by_its_alias(self):
+        self.use_cln(listpeerchannels={"channels": [
+            {"state": "ONCHAIN", "alias": {"local": "100x1x0",
+                                           "remote": "9x9x9"}}]})
+        self.assertFalse(cln_plugin.htlc_still_held("100x1x0:5"))
+
+    def test_answer_goes_ahead_unless_the_channel_is_known_gone(self):
+        for reply in ({"channels": [peer_channel("CHANNELD_NORMAL")]},
+                      {"channels": [peer_channel("CHANNELD_SHUTTING_DOWN")]},
+                      {"channels": [peer_channel("ONCHAIN", "7x7x7")]},
+                      {"channels": []}, {}, {"channels": "?"},
+                      cln_plugin.ClnRpcError("down", -1),
+                      subprocess.TimeoutExpired(cmd="lightning-cli", timeout=15)):
+            self.use_cln(listpeerchannels=reply)
+            self.assertTrue(cln_plugin.htlc_still_held("100x1x0:5"), reply)
+        self.assertTrue(cln_plugin.htlc_still_held(""))
+
+    def test_fulfil_is_not_passed_to_cln_for_a_channel_gone_on_chain(self):
+        self.hold()
+        self.use_cln(listpeerchannels={"channels": [peer_channel("ONCHAIN")]})
+        self.lsp_says("fulfill")
+        self.assertEqual(self.hook_answers(), [])
+        # the LSP is told, so that it stops repeating the fulfil, and the
+        # invoice is closed
+        self.assertEqual(
+            [m for m in self.to_bridge if m.get("method") == "htlc_resolved"],
+            [{"method": "htlc_resolved", "payment_hash": PAYMENT_HASH}])
+        self.assertIn(PAYMENT_HASH, cln_plugin.settled_invoices)
+        self.assertEqual(cln_plugin.pending_htlcs, {})
+        self.assertEqual(cln_plugin.forwarded_htlcs, {})
+
+    def test_fail_is_not_passed_to_cln_for_a_channel_gone_on_chain(self):
+        self.hold()
+        self.use_cln(listpeerchannels={"channels": [
+            peer_channel("AWAITING_UNILATERAL")]})
+        self.lsp_says("fail")
+        self.assertEqual(self.hook_answers(), [])
+        self.assertNotIn(PAYMENT_HASH, cln_plugin.settled_invoices)
+
+    def test_live_channel_is_answered(self):
+        self.hold()
+        self.use_cln(listpeerchannels={"channels": [
+            peer_channel("CHANNELD_NORMAL")]})
+        self.lsp_says("fulfill")
+        self.assertEqual(self.hook_answers(), [
+            (4, {"result": "resolve", "payment_key": PREIMAGE})])
+        self.assertEqual(self.cln.calls_to("listpeerchannels"), [{}])
+
+
 class FakeBridge:
     """The bridge's end of a new connection, as a socket for the plugin.
     `secret` is what this peer holds (None: it holds none and bluffs)."""

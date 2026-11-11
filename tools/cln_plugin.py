@@ -519,6 +519,39 @@ def own_invoice_reason(decoded, payment_hash):
     return None
 
 
+# Channel states in which CLN no longer has the channel's HTLCs in hand
+CHANNEL_GONE_STATES = ("AWAITING_UNILATERAL", "FUNDING_SPEND_SEEN", "ONCHAIN",
+                       "CLOSINGD_COMPLETE")
+
+
+def htlc_still_held(upstream):
+    """False only if CLN demonstrably no longer holds the incoming HTLC
+    named `upstream`: its channel has been closed unilaterally or is
+    on-chain.
+
+    Answering a held htlc_accepted hook for such an HTLC makes CLN v26.06.9
+    abort, so the answer is withheld then.  If CLN does not name the HTLC,
+    cannot be asked, or does not list the channel, the answer goes ahead as
+    before."""
+    scid = (upstream or "").rpartition(":")[0]
+    if not scid:
+        return True
+    try:
+        channels = cln_rpc("listpeerchannels", timeout=15).get("channels", [])
+    except Exception:
+        return True
+    if not isinstance(channels, list):
+        return True
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        alias = ch.get("alias") if isinstance(ch.get("alias"), dict) else {}
+        if scid in (ch.get("short_channel_id"), alias.get("local"),
+                    alias.get("remote")):
+            return ch.get("state") not in CHANNEL_GONE_STATES
+    return True
+
+
 def recover_registered_invoices():
     """Rebuild registered_invoices from CLN's invoice list (the set is lost
     when the plugin restarts; the invoices are not).  Returns True once the
@@ -670,6 +703,22 @@ def handle_bridge_msg(msg):
                 settle = held["factory_invoice"]
             else:
                 settle = False
+
+        if held is not None and not htlc_still_held(held.get("upstream", "")):
+            # The channel this HTLC came in on is no longer live.  CLN can
+            # not take an answer for it any more.
+            log(f"ERROR: HTLC {held.get('upstream')} for {payment_hash[:16]}... "
+                f"is no longer held by CLN (channel closed or on-chain); the "
+                f"LSP's {result} cannot be applied"
+                + (" and the incoming payment may be lost" if result == "fulfill" else ""))
+            if settle:
+                _mark_settled(payment_hash, msg.get("preimage", ""),
+                              held.get("upstream", ""))
+            if result == "fulfill":
+                send_to_bridge({"method": "htlc_resolved",
+                                "payment_hash": payment_hash})
+            _forget_forwarded(held.get("upstream", ""))
+            return
 
         if held is None:
             log(f"No pending HTLC for hash {payment_hash[:16]}...")
