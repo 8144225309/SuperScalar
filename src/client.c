@@ -2220,6 +2220,10 @@ int client_run_with_channels(secp256k1_context *ctx,
        SF-followup #145: factory ptr is registered with g_client_active_factory
        once it's initialized below, so MSG_FUNDING_REORG can find it. */
     factory_t *factory = calloc(1, sizeof(factory_t));
+    /* The channel lives for the rest of this function once initialised; its
+       heap arrays are released on both exit paths below. */
+    channel_t channel;
+    int channel_ready = 0;
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
@@ -2777,7 +2781,6 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
 
         /* Initialize client-side channel */
-        channel_t channel;
         if (!client_init_channel(&channel, ctx, factory, keypair, my_index,
                                   &lsp_pay_bp, &lsp_delay_bp,
                                   &lsp_revoc_bp, &lsp_htlc_bp,
@@ -2785,6 +2788,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client %u: channel init failed\n", my_index);
             goto fail;
         }
+        channel_ready = 1;
         memset(bp_ps, 0, 32); memset(bp_ds, 0, 32);
         memset(bp_rs, 0, 32); memset(bp_hs, 0, 32);
 
@@ -2891,6 +2895,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     printf("Client %u: cooperative close complete!\n", my_index);
 
 done:
+    if (channel_ready) channel_cleanup(&channel);
     free(nonce_entries);
     factory_free(factory);
     free(factory);
@@ -2898,6 +2903,7 @@ done:
     return 1;
 
 fail:
+    if (channel_ready) channel_cleanup(&channel);
     free(nonce_entries);
     factory_free(factory);
     free(factory);

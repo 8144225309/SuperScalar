@@ -3477,11 +3477,13 @@ int main(int argc, char *argv[]) {
 
             printf("LSP recovery: daemon shutdown complete\n");
             jit_channels_cleanup(mgr);
+            lsp_channels_cleanup(mgr);
             free(mgr);
             persist_close(&db);
             lsp_cleanup(lsp_rp);
             
             free(lsp_rp);
+            ladder_free(rec_lad_p);
             free(rec_lad_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
