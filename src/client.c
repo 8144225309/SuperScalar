@@ -531,6 +531,70 @@ int client_fulfill_payment(int fd, channel_t *ch,
 
 /* --- Cooperative close ceremony (extracted for reuse) --- */
 
+int client_close_script(const secp256k1_context *ctx,
+                         const secp256k1_pubkey *my_pubkey,
+                         unsigned char *spk_out34) {
+    secp256k1_xonly_pubkey xonly;
+    if (!ctx || !my_pubkey || !spk_out34) return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, my_pubkey))
+        return 0;
+    build_p2tr_script_pubkey(spk_out34, &xonly);
+    return 1;
+}
+
+int client_close_outputs_acceptable(const secp256k1_context *ctx,
+                                     const secp256k1_pubkey *my_pubkey,
+                                     const channel_t *ch,
+                                     const tx_output_t *outputs,
+                                     size_t n_outputs) {
+    /* No channel in this factory: the client holds no balance. */
+    if (!ch) return 1;
+    if (!outputs) return 0;
+
+    /* The proposed outputs settle balances only.  An HTLC still in flight is
+       not represented by any output, so signing now would forfeit it (an
+       incoming one the client can claim, or an outgoing one that may yet be
+       refunded).  Wait for it to resolve, or exit with the commitment. */
+    for (size_t i = 0; i < ch->n_htlcs; i++) {
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) {
+            fprintf(stderr, "Client: REFUSING cooperative close — %zu HTLC(s) "
+                    "still pending on the channel\n", ch->n_htlcs);
+            return 0;
+        }
+    }
+
+    /* A balance below the dust limit cannot be paid by a standard output. */
+    uint64_t my_balance = ch->local_amount;
+    if (my_balance < CHANNEL_DUST_LIMIT_SATS) return 1;
+
+    /* The balance must be paid to the script this client derives from its own
+       key.  Amounts sent to any other script are not the client's, however
+       large, so only outputs carrying exactly this script are counted. */
+    unsigned char my_spk[34];
+    if (!client_close_script(ctx, my_pubkey, my_spk)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — cannot derive "
+                "own close script\n");
+        return 0;
+    }
+    uint64_t paid_to_me = 0;
+    for (size_t i = 0; i < n_outputs; i++) {
+        if (outputs[i].script_pubkey_len != sizeof(my_spk) ||
+            memcmp(outputs[i].script_pubkey, my_spk, sizeof(my_spk)) != 0)
+            continue;
+        if (outputs[i].amount_sats > UINT64_MAX - paid_to_me) return 0;
+        paid_to_me += outputs[i].amount_sats;
+    }
+    if (paid_to_me < my_balance) {
+        fprintf(stderr, "Client: REFUSING cooperative close — outputs pay %llu "
+                "sats to this client's script, channel balance is %llu sats "
+                "(force-close instead)\n",
+                (unsigned long long)paid_to_me,
+                (unsigned long long)my_balance);
+        return 0;
+    }
+    return 1;
+}
+
 /* MEDIUM-1: cap on LSP-driven re-PROPOSE recursion depth. The LSP is untrusted;
    without a cap a malicious/looping LSP that streams CLOSE_PROPOSE could exhaust
    the client's stack. On exceed, the client aborts the coop close and can still
@@ -654,32 +718,27 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             if (!initial_msg) cJSON_Delete(msg.json);
             return 0;
         }
+        if (!(amt->valuedouble >= 0.0) || amt->valuedouble > 2.1e15) {
+            fprintf(stderr, "Client: close output %zu amount out of range\n", i);
+            free(close_outputs);
+            if (!initial_msg) cJSON_Delete(msg.json);
+            return 0;
+        }
         close_outputs[i].amount_sats = (uint64_t)amt->valuedouble;
         close_outputs[i].script_pubkey_len = (size_t)wire_json_get_hex(
             item, "spk", close_outputs[i].script_pubkey, 34);
     }
     if (!initial_msg) cJSON_Delete(msg.json);
 
-    /* Verify cooperative close outputs before signing.
-       The client must receive at least its channel balance.  If the LSP
-       short-changes the close outputs, the client refuses to sign and
-       can force-close instead (using the pre-signed commitment TX). */
-    if (ch && ch->local_amount > 0) {
-        uint64_t my_balance = ch->local_amount;
-        int found = 0;
-        for (size_t i = 0; i < n_outputs; i++) {
-            if (close_outputs[i].amount_sats >= my_balance) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            fprintf(stderr, "Client: REFUSING cooperative close — no output "
-                    ">= channel balance %llu sats (force-close instead)\n",
-                    (unsigned long long)my_balance);
-            free(close_outputs);
-            return 0;
-        }
+    /* Verify the proposed outputs before contributing a nonce or a signature.
+       Refusing changes nothing on the channel: the client still holds its
+       signed commitment and can exit unilaterally. */
+    if (!client_close_outputs_acceptable(ctx, my_pubkey, ch,
+                                          close_outputs, n_outputs)) {
+        free(close_outputs);
+        client_send_error(fd, "cooperative close refused: proposed outputs do "
+                              "not pay this client its channel balance");
+        return 0;
     }
 
     tx_buf_t close_unsigned;
@@ -2664,6 +2723,8 @@ int client_run_with_channels(secp256k1_context *ctx,
     printf("Client %u: factory creation complete!\n", my_index);
 
     /* === Channel Operations Phase === */
+    channel_t channel;
+    const channel_t *close_ch = NULL;   /* set once the channel is open */
     if (channel_cb) {
         /* Basepoint exchange: receive LSP's basepoints */
         secp256k1_pubkey lsp_pay_bp, lsp_delay_bp, lsp_revoc_bp, lsp_htlc_bp;
@@ -2777,7 +2838,6 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
 
         /* Initialize client-side channel */
-        channel_t channel;
         if (!client_init_channel(&channel, ctx, factory, keypair, my_index,
                                   &lsp_pay_bp, &lsp_delay_bp,
                                   &lsp_revoc_bp, &lsp_htlc_bp,
@@ -2785,6 +2845,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client %u: channel init failed\n", my_index);
             goto fail;
         }
+        close_ch = &channel;
         memset(bp_ps, 0, 32); memset(bp_ds, 0, 32);
         memset(bp_rs, 0, 32); memset(bp_hs, 0, 32);
 
@@ -2884,7 +2945,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
                                     factory, n_participants, NULL, 0,
-                                    NULL, 0)) {
+                                    close_ch, 0)) {
         goto fail;
     }
 

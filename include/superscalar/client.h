@@ -81,12 +81,34 @@ int client_run_with_channels(secp256k1_context *ctx,
                               client_verify_funding_fn verify_funding,
                               void *verify_ctx);
 
+/* The scriptPubKey a client is paid to in a cooperative close: P2TR whose
+   output key is the client's own factory key.  The client derives it from
+   its own key; it is never taken from the LSP's proposal.  Writes 34 bytes.
+   Returns 1 on success. */
+int client_close_script(const secp256k1_context *ctx,
+                         const secp256k1_pubkey *my_pubkey,
+                         unsigned char *spk_out34);
+
+/* Decide whether a cooperative-close proposal is safe for this client to sign.
+   Returns 1 only if no HTLC is pending on ch and the outputs carrying the
+   client's own close script sum to at least ch->local_amount (no output is
+   required for a balance below the dust limit).  Outputs to any other script
+   are ignored regardless of amount.  ch == NULL (no channel) returns 1. */
+int client_close_outputs_acceptable(const secp256k1_context *ctx,
+                                     const secp256k1_pubkey *my_pubkey,
+                                     const channel_t *ch,
+                                     const tx_output_t *outputs,
+                                     size_t n_outputs);
+
 /* Perform the cooperative close ceremony on an already-received CLOSE_PROPOSE.
    If initial_msg is non-NULL, it is the already-received CLOSE_PROPOSE message;
    otherwise we recv it from the wire.
-   If ch is non-NULL, the client verifies its close output >= ch->local_amount
-   before signing.  Pass NULL to skip balance verification (legacy callers).
-   Returns 1 on success. */
+   ch is the client's channel in this factory.  Before signing, the client
+   requires the proposal to pay at least ch->local_amount to its own close
+   script (client_close_script) and refuses while any HTLC is pending; see
+   client_close_outputs_acceptable.  Pass NULL only when the client never
+   opened a channel in this factory and so holds no balance.
+   Returns 1 on success, 0 on refusal or failure. */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
                                const secp256k1_pubkey *my_pubkey,

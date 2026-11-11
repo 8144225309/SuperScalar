@@ -3920,6 +3920,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_bip158_callback_fires);
     RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
     RUN_TEST(test_reorg_bip158_noop);
+
+    printf("\n=== Client Signing Checks ===\n");
+    extern int test_client_close_outputs_acceptable(void);
+    extern int test_client_close_refuses_unpaid_proposal(void);
+    extern int test_client_close_honest_ceremony(void);
+    RUN_TEST(test_client_close_outputs_acceptable);
+    RUN_TEST(test_client_close_refuses_unpaid_proposal);
+    RUN_TEST(test_client_close_honest_ceremony);
 }
 
 extern int regtest_init_faucet(void);
@@ -4049,6 +4057,8 @@ static void run_regtest_tests(void) {
     printf("\n=== Security Model Gap Tests (Regtest) ===\n");
     RUN_TEST(test_regtest_htlc_wrong_preimage_rejected);
     RUN_TEST(test_regtest_funding_double_spend_rejected);
+    extern int test_regtest_coop_close_refuses_lsp_payee(void);
+    RUN_TEST(test_regtest_coop_close_refuses_lsp_payee);
 
     printf("\n=== Regtest Fee Estimation ===\n");
     RUN_TEST(test_regtest_fee_estimation_parsing);

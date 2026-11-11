@@ -958,22 +958,20 @@ int test_regtest_intra_factory_payment(void) {
 
     /* Cooperative close */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -2644,23 +2642,20 @@ int test_regtest_lsp_restart_recovery(void) {
 
     /* Phase 8: Cooperative close on regtest */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats =
-            close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&rec_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
                                         n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
@@ -3259,23 +3254,20 @@ int test_regtest_crash_double_recovery(void) {
 
     /* Cooperative close on regtest */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats =
-            close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&rec_mgr2, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
                                         n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
