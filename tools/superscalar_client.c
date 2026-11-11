@@ -2052,16 +2052,13 @@ handle_message:
             printf("Client %u: JIT channel %08x migrating to factory %u\n",
                    my_index, mig_jit_id, mig_factory_id);
 
-            if (cbd->jit_ch && cbd->jit_ch->jit_channel_id == mig_jit_id) {
-                cbd->jit_ch->state = JIT_STATE_CLOSED;
-                /* Remove watchtower entries for JIT channel */
-                if (cbd->wt)
-                    watchtower_remove_channel(cbd->wt, 0);
-                /* Remove from persistence */
-                if (cbd->db)
-                    persist_delete_jit_channel(cbd->db, mig_jit_id);
+            if (cbd->jit_ch &&
+                jit_client_handle_migrate(cbd->jit_ch, mig_jit_id,
+                                           cbd->wt, cbd->db))
                 printf("Client %u: JIT channel closed (migrated)\n", my_index);
-            }
+            else
+                printf("Client %u: JIT channel record kept "
+                       "(funding output not seen spent)\n", my_index);
             break;
         }
 

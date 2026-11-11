@@ -80,6 +80,14 @@ int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 int   regtest_outpoint_unspent(regtest_t *rt,
                                  const char *txid_hex_display,
                                  uint32_t vout);
+
+/* Chain-only view of an outpoint (mempool ignored).
+   Returns 1 if its transaction is confirmed and the output was spent by a
+   confirmed transaction, 0 if it is unspent on chain or its transaction is
+   unconfirmed, -1 if the node cannot tell (RPC error, unknown transaction). */
+int   regtest_outpoint_spent_confirmed(regtest_t *rt,
+                                         const char *txid_hex_display,
+                                         uint32_t vout);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
 /*
  * Batch confirmations for n_txids display-order hex txids.

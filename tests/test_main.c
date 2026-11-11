@@ -1576,6 +1576,8 @@ extern int test_jit_create_refused_when_disabled(void);
 extern int test_jit_expiry_trigger_refused_when_disabled(void);
 extern int test_lsps2_buy_refused_when_jit_disabled(void);
 extern int test_lsps_peer_request_refuses_buy(void);
+extern int test_jit_migrate_keeps_unspent_channel(void);
+extern int test_jit_client_migrate_keeps_factory_watch(void);
 
 /* Per-Leaf Advance */
 extern int test_factory_advance_leaf_left(void);
@@ -3515,6 +3517,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_expiry_trigger_refused_when_disabled);
     RUN_TEST(test_lsps2_buy_refused_when_jit_disabled);
     RUN_TEST(test_lsps_peer_request_refuses_buy);
+    RUN_TEST(test_jit_migrate_keeps_unspent_channel);
+    RUN_TEST(test_jit_client_migrate_keeps_factory_watch);
 
     printf("\n=== Per-Leaf Advance ===\n");
     RUN_TEST(test_factory_advance_leaf_left);

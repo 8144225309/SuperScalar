@@ -566,6 +566,14 @@ int test_jit_cooperative_close_key_mismatch(void) {
 
 /* --- Step 7b: Migration Tests --- */
 
+/* A chain on which every queried outpoint was spent by a confirmed
+   transaction. */
+static int migrate_chain_spent(chain_backend_t *self, const char *txid_hex,
+                               uint32_t vout) {
+    (void)self; (void)txid_hex; (void)vout;
+    return 1;
+}
+
 int test_jit_migrate_lifecycle(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
@@ -586,12 +594,19 @@ int test_jit_migrate_lifecycle(void) {
     jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 1;
     jits[0].channel.local_amount = 5000;
     jits[0].channel.remote_amount = 3000;
+    memset(jits[0].funding_txid_hex, 'b', 64);
     mgr.n_jit_channels = 1;
+
+    /* The JIT funding output has been spent on chain. */
+    chain_backend_t spent_chain;
+    memset(&spent_chain, 0, sizeof(spent_chain));
+    spent_chain.is_outpoint_spent_confirmed = migrate_chain_spent;
+    mgr.chain_be = &spent_chain;
 
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "JIT should be active before migrate");
 
     /* Migrate (no LSP/fd needed for state transition test) */
-    jit_channel_migrate(&mgr, NULL, 1, 0);
+    TEST_ASSERT_EQ(jit_channel_migrate(&mgr, NULL, 1, 0), 1, "migrate retires the channel");
 
     /* JIT channel should be closed */
     TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "JIT should be closed");
@@ -630,9 +645,17 @@ int test_jit_migrate_no_balance_hack(void) {
     jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 0;
     jits[0].channel.local_amount = 15000;
     jits[0].channel.remote_amount = 12000;
+    memset(jits[0].funding_txid_hex, 'c', 64);
     mgr.n_jit_channels = 1;
 
-    jit_channel_migrate(&mgr, NULL, 0, 0);
+    /* The JIT funding output has been spent on chain. */
+    chain_backend_t spent_chain;
+    memset(&spent_chain, 0, sizeof(spent_chain));
+    spent_chain.is_outpoint_spent_confirmed = migrate_chain_spent;
+    mgr.chain_be = &spent_chain;
+
+    TEST_ASSERT_EQ(jit_channel_migrate(&mgr, NULL, 0, 0), 1, "migrate retires the channel");
+    TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "JIT should be closed");
 
     TEST_ASSERT_EQ((long)mgr.entries[0].channel.local_amount, 100000,
                    "factory local unchanged");
@@ -1517,5 +1540,176 @@ int test_lsps_peer_request_refuses_buy(void) {
                 "still nothing written to factory client 0");
 
     jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+/* --- A JIT channel whose funding output is still on chain is not forgotten --- */
+
+/* What the fake chain says about the outpoint: 1 = spent by a confirmed
+   transaction, 0 = unspent, -1 = cannot tell. */
+static int g_fake_spent_answer;
+static int g_fake_spent_queries;
+
+static int fake_outpoint_spent_confirmed(chain_backend_t *self,
+                                         const char *txid_hex, uint32_t vout) {
+    (void)self; (void)txid_hex; (void)vout;
+    g_fake_spent_queries++;
+    return g_fake_spent_answer;
+}
+
+static size_t jit_rows_in_db(persist_t *p) {
+    jit_channel_t *loaded = calloc(4, sizeof(jit_channel_t));
+    size_t count = 0;
+    persist_load_jit_channels(p, loaded, 4, &count);
+    free(loaded);
+    return count;
+}
+
+static void fill_open_jit(jit_channel_t *jit, size_t client_idx) {
+    memset(jit, 0, sizeof(*jit));
+    jit->client_idx = client_idx;
+    jit->state = JIT_STATE_OPEN;
+    jit->jit_channel_id = JIT_CHANNEL_ID_BASE | (uint32_t)client_idx;
+    jit->funding_amount = 50000;
+    jit->funding_confirmed = 1;
+    memset(jit->funding_txid_hex, 'a', 64);
+    jit->funding_txid_hex[64] = '\0';
+    jit->funding_vout = 1;
+    jit->channel.local_amount = 30000;
+    jit->channel.remote_amount = 20000;
+}
+
+int test_jit_migrate_keeps_unspent_channel(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 2), "fixture");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open db");
+    fx.mgr.persist = &db;
+    fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+
+    jit_channel_t *jits = (jit_channel_t *)fx.mgr.jit_channels;
+    fill_open_jit(&jits[0], 1);
+    fx.mgr.n_jit_channels = 1;
+    TEST_ASSERT(persist_save_jit_channel(&db, &jits[0]), "save jit row");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row present before");
+
+    /* Unspent, then "cannot tell": the channel and its row stay, and the
+       client is told nothing. */
+    for (int answer = 0; answer >= -1; answer--) {
+        g_fake_spent_answer = answer;
+        g_fake_spent_queries = 0;
+        TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                       "a channel still on chain is not retired");
+        TEST_ASSERT_EQ(g_fake_spent_queries, 1, "the chain was asked");
+        TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+        TEST_ASSERT(jit_channel_is_active(&fx.mgr, 1), "channel still active");
+        TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+        TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
+    }
+
+    /* A backend that cannot answer the question, and no backend at all. */
+    fx.chain.is_outpoint_spent_confirmed = NULL;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "kept when the backend has no chain-only spent query");
+    fx.mgr.chain_be = NULL;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "kept when there is no chain backend");
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
+
+    /* Confirmed spent: retired, row deleted, client told. */
+    fx.mgr.chain_be = &fx.chain;
+    fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    g_fake_spent_answer = 1;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 1,
+                   "a channel whose output is confirmed spent is retired");
+    TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "state is CLOSED");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 0, "row is deleted");
+    TEST_ASSERT(gate_fd_readable(fx.peer_fd[1], 1000), "client is told");
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(fx.peer_fd[1], &msg), "recv");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_JIT_MIGRATE, "JIT_MIGRATE");
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50), "other client untouched");
+
+    fx.mgr.persist = NULL;
+    persist_close(&db);
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+static size_t wt_entries_for(const watchtower_t *wt, uint32_t channel_id) {
+    size_t n = 0;
+    for (size_t i = 0; i < wt->n_entries; i++)
+        if (wt->entries[i].channel_id == channel_id) n++;
+    return n;
+}
+
+int test_jit_client_migrate_keeps_factory_watch(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open db");
+
+    /* The client watchtower: its factory channel is channel id 0. */
+    watchtower_t wt;
+    watchtower_init(&wt, 1, NULL, NULL, NULL);
+    chain_backend_t chain;
+    memset(&chain, 0, sizeof(chain));
+    chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    wt.chain = &chain;
+
+    jit_channel_t jit;
+    fill_open_jit(&jit, 0);
+    TEST_ASSERT(persist_save_jit_channel(&db, &jit), "save jit row");
+
+    unsigned char spk[34];
+    memset(spk, 0, sizeof(spk));
+    spk[0] = 0x51; spk[1] = 0x20;
+    unsigned char txid[32];
+    for (unsigned char cn = 0; cn < 3; cn++) {
+        memset(txid, 0x40 + cn, 32);
+        TEST_ASSERT(watchtower_watch(&wt, 0, cn, txid, 0, 10000, spk, 34),
+                    "watch a revoked factory-channel commitment");
+    }
+    memset(txid, 0x77, 32);
+    TEST_ASSERT(watchtower_watch(&wt, jit.jit_channel_id, 0, txid, 0, 9000, spk, 34),
+                "an entry under the JIT channel id");
+    TEST_ASSERT_EQ((long)wt.n_entries, 4, "4 entries");
+
+    /* Output not seen spent: nothing changes. */
+    for (int answer = 0; answer >= -1; answer--) {
+        g_fake_spent_answer = answer;
+        TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, &wt, &db), 0,
+                       "record kept while the output is not seen spent");
+        TEST_ASSERT(jit.state == JIT_STATE_OPEN, "state stays OPEN");
+        TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+        TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
+    }
+    /* No chain view at all. */
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, NULL, &db), 0,
+                   "record kept without a chain view");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+
+    /* A message naming some other channel changes nothing either. */
+    g_fake_spent_answer = 1;
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, 0, &wt, &db), 0,
+                   "a message for channel id 0 is not for the JIT channel");
+    TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+
+    /* Output confirmed spent: the JIT record goes, the factory channel's
+       watch entries all stay. */
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, &wt, &db), 1,
+                   "record closed once the output is confirmed spent");
+    TEST_ASSERT(jit.state == JIT_STATE_CLOSED, "state is CLOSED");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 0, "row is deleted");
+    TEST_ASSERT_EQ((long)wt_entries_for(&wt, 0), 3,
+                   "every factory-channel watch entry is still there");
+    TEST_ASSERT_EQ((long)wt_entries_for(&wt, jit.jit_channel_id), 0,
+                   "only the JIT channel's entry was removed");
+
+    wt.chain = NULL;
+    watchtower_cleanup(&wt);
+    persist_close(&db);
     return 1;
 }

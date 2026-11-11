@@ -76,11 +76,30 @@ int jit_channel_is_active(void *mgr_ptr, size_t client_idx);
 channel_t *jit_get_effective_channel(void *mgr_ptr, size_t client_idx,
                                       uint32_t *channel_id_out);
 
-/* Migrate a JIT channel balance into a new factory channel.
-   Cooperatively closes the JIT channel and adjusts factory channel balance.
-   Returns 1 on success. */
+/* 1 if the chain backend (chain_backend_t *) shows the JIT funding output
+   spent by a confirmed transaction.  0 if it is still unspent, spent only in
+   the mempool, or the backend cannot tell (including a NULL backend). */
+int jit_funding_spent_confirmed(void *chain_be_ptr, const jit_channel_t *jit);
+
+/* Retire a JIT channel after a rotation.
+   Only a channel whose funding output is confirmed spent is retired: it is
+   marked CLOSED, its record is deleted and the client is told with
+   MSG_JIT_MIGRATE.  A channel whose funding output is still on chain stays
+   OPEN, keeps its record, and the client is not told anything.
+   Returns 1 if the channel was retired, 0 if it was kept (or none is open). */
 int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
                          size_t client_idx, uint32_t target_factory_id);
+
+/* Client side of MSG_JIT_MIGRATE for the client's JIT channel record `jit`.
+   The record is closed and its persisted row deleted only when the message
+   names this channel and the client's own chain view (the watchtower's chain
+   backend) shows the funding output spent by a confirmed transaction;
+   otherwise the record and its row are left as they are.  Watch entries are
+   removed only under the JIT channel's own id, never the factory channel's.
+   wt_ptr is a watchtower_t * (may be NULL), db_ptr a persist_t * (may be
+   NULL).  Returns 1 if the record was closed, 0 if it was kept. */
+int jit_client_handle_migrate(jit_channel_t *jit, uint32_t migrate_jit_id,
+                               void *wt_ptr, void *db_ptr);
 
 /* Check JIT channels in FUNDING state; transition to OPEN when confirmed.
    Returns number of channels that transitioned. */
