@@ -218,8 +218,8 @@ broadcasts the funding transaction before the client has signed anything, so
 a client that stops responding leaves the LSP's coins in a 2-of-2 output, and
 the channel cannot yet carry payments. Do not enable it with funds you are
 not prepared to lose. `--test-jit` implies the flag. JIT channels that were
-opened earlier are still loaded, watched and closed whether or not the flag
-is given.
+opened earlier are still loaded at start-up and closed at rotation whether or
+not the flag is given.
 
 ### Placement Modes Explained
 

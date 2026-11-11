@@ -6,6 +6,17 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### JIT channels are off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer opens JIT channels unless started with `--enable-jit-experimental`.** Without the flag it sends no JIT offer and funds nothing when its factories expire, and it answers `lsps2.buy` from a factory client with a JSON-RPC error (`-32601`). The flag is unsafe and for testing only: an open funds a 2-of-2 output before the client has signed anything, and the channel cannot carry payments yet. It is refused on mainnet. `--test-jit` implies it.
+- **`--no-jit` is removed.** JIT opens are off by default, so the flag had nothing left to do; like any unknown option it is now ignored.
+- **`lsps2.buy` from an outside peer (the BOLT #8 listener) is always refused**, and LSPS replies to outside peers are sent over the peer's encrypted transport.
+- **A client that does not accept JIT offers now says so.** New wire message `JIT_REJECT` (`0x57`); the LSP stops waiting as soon as it arrives. Messages a client sends while an offer is pending are handled afterwards instead of being dropped.
+- **A JIT channel whose funding output is still unspent is kept across a rotation**, by the LSP and by the client. Before, both sides deleted their record of it. The client no longer removes its factory channel's watchtower entries when it is told a JIT channel was migrated.
+- JIT channels opened earlier are still loaded at start-up and closed at rotation whether or not the flag is given.
+
 ### Key handling and start-up safety
 
 Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a refusal, so existing start-up scripts may need adjusting.
