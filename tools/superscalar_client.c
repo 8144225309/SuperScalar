@@ -7,6 +7,7 @@
 #include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
@@ -69,7 +70,8 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     } else if (hd_mnemonic) {
         /* 2. Derive seed from provided mnemonic */
         if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
-            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            fprintf(stderr, "Client: HD wallet: invalid recovery phrase: %s\n",
+                    bip39_status_str(bip39_check(hd_mnemonic)));
             memset(seed, 0, sizeof(seed));
             return 0;
         }
@@ -2327,6 +2329,10 @@ static void usage(const char *prog) {
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
+        "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
+        "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
+        "                                    (outside regtest) and must match it.  The lookup is a direct HTTP\n"
+        "                                    connection: refused together with --tor-proxy / --tor-only.\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
@@ -2747,42 +2753,40 @@ int main(int argc, char *argv[]) {
     if (use_json_log)
         ss_log_set_json(1);
 
-    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
-       test/cheat scaffolding flags on mainnet (footgun guard). */
-    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port while the exact-"mainnet" guards
-       would not fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
         }
-        /* G2 (gap-scan): mirror the LSP -- also refuse cheat/kill/crash ENV vars on
-           mainnet (SS_CHEAT_* are gate-inert, but SUPERSCALAR_CRASH* -> abort() is
-           env-driven; fail LOUD rather than silently accept a crash knob). */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
+        network = canonical;
+    }
+    /* A recovery phrase with a typo would derive a different, empty wallet
+       without any error: refuse it before anything is derived from it. */
+    if (hd_mnemonic) {
+        bip39_status_t mn_status = bip39_check(hd_mnemonic);
+        if (mn_status != BIP39_OK) {
+            fprintf(stderr, "Error: invalid --hd-mnemonic: %s\n",
+                    bip39_status_str(mn_status));
+            return 1;
+        }
+    }
+    /* Defense-bypass cheats are inert unless this is regtest. */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    /* Mainnet refuses test/cheat scaffolding in the arguments and in the
+       environment (see network.h). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        if (!network_gate_no_test_scaffolding(network, argc, argv, environ,
+                                              gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
     }
 
@@ -3245,6 +3249,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -3260,8 +3271,10 @@ int main(int argc, char *argv[]) {
             }
             secure_zero(mnemonic, sizeof(mnemonic));
         } else {
-            if (!bip39_validate(from_mnemonic)) {
-                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+            bip39_status_t mn_status = bip39_check(from_mnemonic);
+            if (mn_status != BIP39_OK) {
+                fprintf(stderr, "Error: invalid --from-mnemonic: %s\n",
+                        bip39_status_str(mn_status));
                 return 1;
             }
             if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
@@ -3278,22 +3291,26 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
-    }
-
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
-        return 1;
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding, and a
+       database for persistent state. */
+    {
+        extern char **environ;
+        char gate_err[512];
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_CLIENT,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
+        }
     }
 
     /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
@@ -3308,6 +3325,26 @@ int main(int argc, char *argv[]) {
             "       Without it, an adversarial LSP could claim a larger\n"
             "       funding_amount than actually exists; see audit 2026-05-17.\n",
             network);
+        return 1;
+    }
+
+    /* Every network except regtest needs the LSP's key pinned with
+       --lsp-pubkey.  Checked here, before a keyfile or anything else is
+       created; the endpoint resolution below enforces the same rule. */
+    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
+        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                "(prevents MITM attacks)\n");
+        return 1;
+    }
+
+    /* The well-known lookup is a direct HTTP connection.  With Tor in use it
+       would reveal this host to the LSP's domain, so the two are not combined. */
+    if (lsp_domain && (tor_proxy_arg || tor_only)) {
+        fprintf(stderr,
+            "Error: --lsp DOMAIN cannot be used with --tor-proxy / --tor-only.\n"
+            "  The lookup of /.well-known/lsps.json is a direct clearnet HTTP\n"
+            "  connection and would bypass Tor. Give the LSP's address with\n"
+            "  --host and --port (and its key with --lsp-pubkey) instead.\n");
         return 1;
     }
 
@@ -3346,20 +3383,33 @@ int main(int argc, char *argv[]) {
     } else if (keyfile_path) {
         secp256k1_context *tmp_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        if (keyfile_load(keyfile_path, seckey, passphrase)) {
-            printf("Client: loaded key from %s\n", keyfile_path);
-            key_loaded = 1;
-        } else {
-            printf("Client: generating new key and saving to %s\n", keyfile_path);
-            if (keyfile_generate(keyfile_path, seckey, passphrase, tmp_ctx)) {
-                key_loaded = 1;
-            } else {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(tmp_ctx);
-                return 1;
-            }
-        }
+        /* A new key is only ever created when no file exists at the path. */
+        keyfile_open_result_t kf_res =
+            keyfile_load_or_generate(keyfile_path, seckey, passphrase, tmp_ctx);
         secp256k1_context_destroy(tmp_ctx);
+        switch (kf_res) {
+        case KEYFILE_OPEN_LOADED:
+            printf("Client: loaded key from %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("Client: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            return 1;
+        case KEYFILE_OPEN_INSECURE_MODE:
+            fprintf(stderr, "Error: refusing to start with keyfile %s: its permissions\n"
+                "  let every user read it (details above).\n", keyfile_path);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            return 1;
+        }
+        key_loaded = 1;
     }
 
     if (!key_loaded) {
@@ -3390,40 +3440,63 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Bootstrap from well-known endpoint: overrides --host, --port, --lsp-pubkey */
-    static char wk_host_buf[256];
-    static char wk_pubkey_buf[128];
-    if (lsp_domain) {
-        uint16_t wk_port = 0;
-        printf("Client: fetching /.well-known/lsps.json from %s ...\n",
-               lsp_domain);
-        if (!lsp_wellknown_fetch_http(lsp_domain,
-                                      wk_host_buf, sizeof(wk_host_buf),
-                                      &wk_port, wk_pubkey_buf,
-                                      sizeof(wk_pubkey_buf))) {
+    /* Where to connect, and which key authenticates the LSP.  With --lsp the
+       well-known endpoint supplies the host and port.  Its response travels
+       over plain HTTP, so the public key in it is not proof of anything and
+       never becomes the pinned key: only --lsp-pubkey does, and every network
+       except regtest requires it. */
+    static lsp_endpoint_t lsp_endpoint;
+    {
+        if (lsp_domain)
+            printf("Client: fetching /.well-known/lsps.json from %s ...\n",
+                   lsp_domain);
+        lsp_endpoint_status_t ep_status = lsp_wellknown_resolve_endpoint(
+            lsp_domain, 80, host, port, lsp_pubkey_hex,
+            strcmp(network, "regtest") != 0, &lsp_endpoint);
+
+        if (lsp_domain && ep_status != LSP_ENDPOINT_FETCH_FAILED) {
+            printf("Client: bootstrapped from %s -> %s:%d\n",
+                   lsp_domain, lsp_endpoint.host, lsp_endpoint.port);
+            if (lsp_endpoint.pinned_pubkey_hex)
+                printf("Client: advertised LSP pubkey matches --lsp-pubkey\n");
+            else if (ep_status != LSP_ENDPOINT_PIN_MISMATCH)
+                printf("Client: %s advertises LSP pubkey %s\n"
+                       "Client: that key was fetched over unauthenticated HTTP and is NOT trusted.\n"
+                       "Client: confirm it with the LSP operator out of band, then pass it\n"
+                       "Client: with --lsp-pubkey.\n",
+                       lsp_domain, lsp_endpoint.advertised_pubkey_hex);
+        }
+
+        switch (ep_status) {
+        case LSP_ENDPOINT_OK:
+            break;
+        case LSP_ENDPOINT_FETCH_FAILED:
             fprintf(stderr, "Client: failed to fetch well-known from %s\n",
                     lsp_domain);
+            break;
+        case LSP_ENDPOINT_PIN_MISMATCH:
+            fprintf(stderr,
+                "Error: --lsp-pubkey does not match the key advertised by %s.\n"
+                "  --lsp-pubkey: %s\n"
+                "  advertised:   %s\n"
+                "  Either the LSP has changed its key (confirm the new key with the\n"
+                "  operator out of band) or the response did not come from your LSP.\n",
+                lsp_domain, lsp_pubkey_hex, lsp_endpoint.advertised_pubkey_hex);
+            break;
+        case LSP_ENDPOINT_PIN_REQUIRED:
+            fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                    "(prevents MITM attacks)\n");
+            break;
+        }
+        if (ep_status != LSP_ENDPOINT_OK) {
             memset(seckey, 0, 32);
             report_close(&rpt);
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        host = wk_host_buf;
-        port = (int)wk_port;
-        if (!lsp_pubkey_hex)
-            lsp_pubkey_hex = wk_pubkey_buf;
-        printf("Client: bootstrapped from %s -> %s:%d pubkey %s\n",
-               lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
-    }
-
-    /* Require --lsp-pubkey on non-regtest to prevent MITM */
-    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
-        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
-                "(prevents MITM attacks)\n");
-        memset(seckey, 0, 32);
-        report_close(&rpt);
-        secp256k1_context_destroy(ctx);
-        return 1;
+        host = lsp_endpoint.host;
+        port = lsp_endpoint.port;
+        lsp_pubkey_hex = lsp_endpoint.pinned_pubkey_hex;
     }
 
     /* NK authentication: pin LSP static pubkey if provided */

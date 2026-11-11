@@ -81,6 +81,14 @@ echo "LSP_KEY=$LSP_KEY"
 
 **Keep your key safe.** With BIP39, you can recover from the 24 words. Without it, if the keyfile is lost and you have active factories, you'll need to wait for CLTV timeout to recover funds.
 
+**How the keyfile is handled**
+
+- **A keyfile is never overwritten.** `--generate-mnemonic` and `--from-mnemonic` refuse to run if anything already exists at `--keyfile`. A normal start creates a key only when nothing exists at the path.
+- **A keyfile that is there but cannot be loaded is an error.** With a wrong or missing `--passphrase`, or a damaged file, the daemon exits and leaves the file untouched; it does not start with a new key. To start over with a new key, move the old file away first.
+- **A recovery phrase is checked before use.** `--from-mnemonic` and `--hd-mnemonic` accept 12, 15, 18, 21 or 24 lower-case words from the BIP39 English list with a valid checksum (extra spaces are ignored) and exit with the reason otherwise.
+- **Keyfiles are private.** New keyfiles are created with mode `0600`. An existing keyfile that group or others can access is tightened to `0600` at start-up, with a warning, when it is a regular file owned by the user running the daemon, has no other hard links and is not reached through a symbolic link. Otherwise its mode is left alone: a keyfile readable only by its group (for example `root:superscalar 0640`, read by the service user) is used with a warning; a keyfile readable by every user is refused with an error naming the mode. For a mounted secret, set the mount's file mode to `0400` or `0440`.
+- **Writing a keyfile needs a writable directory.** The file is written under a temporary name (`<keyfile>.ss-partial.XXXXXX`) in the same directory and then moved into place, so the directory must be writable and a crash never leaves a half-written key. A `--keyfile` path that is a symbolic link can be read but is never written to.
+
 ## 4. Start the LSP
 
 ### Minimal (Regtest)
@@ -184,13 +192,13 @@ Press **Ctrl+C**. The LSP will:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--keyfile` | none | Encrypted keyfile path (alternative to --seckey) |
+| `--keyfile` | none | Encrypted keyfile path (alternative to --seckey; required on mainnet, where `--seckey` is refused). Created if nothing exists at the path; never overwritten. See "How the keyfile is handled" in section 3 |
 | `--passphrase` | none | Keyfile decryption passphrase |
 | `--encrypt-db` | off (forced on mainnet) | Encrypt secret columns (HD seed, revocation/channel secrets) at rest |
 | `--tor-proxy` | none | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 | `--tor-control` | none | Tor control port for hidden service creation |
-| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
-| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words |
+| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit. Refuses if `--keyfile` already exists |
+| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words (validated first). Refuses if `--keyfile` already exists |
 | `--mnemonic-passphrase` | "" | Optional BIP39 passphrase for seed derivation |
 | `--max-conn-rate` | 10 | Max inbound connections per minute per IP |
 | `--max-handshakes` | 4 | Max concurrent handshakes |
@@ -226,8 +234,8 @@ Press **Ctrl+C**. The LSP will:
 | `--cltv-timeout` | auto | Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest) |
 | `--regtest` | off | Shorthand for `--network regtest` |
 | `--i-accept-the-risk` | off | Required for mainnet operation |
-| `--backup` | — | Create encrypted backup and exit (passphrase via `SUPERSCALAR_BACKUP_PASSPHRASE` env) |
-| `--restore` | — | Restore from encrypted backup and exit |
+| `--backup PATH` | — | Create encrypted backup of `--db` and `--keyfile` at PATH and exit (passphrase via `SUPERSCALAR_BACKUP_PASSPHRASE` env) |
+| `--restore PATH` | — | Restore `--db` and `--keyfile` from the backup at PATH and exit. Never overwrites: see section 6 |
 | `--backup-verify` | — | Verify backup integrity and exit |
 | `--fee-bump-after` | 6 | Blocks before first RBF fee bump on funding TX |
 | `--fee-bump-max` | 3 | Maximum number of fee bump attempts |
@@ -275,11 +283,22 @@ export SUPERSCALAR_BACKUP_PASSPHRASE="your-secure-passphrase"
 # Verify a backup without restoring
 ./superscalar_lsp --backup-verify /path/to/backup.bak
 
-# Restore from backup
-./superscalar_lsp --restore /path/to/backup.bak
+# Restore from backup: --db and --keyfile name where the two files are written
+./superscalar_lsp --restore /path/to/backup.bak --db lsp.db --keyfile lsp.key
 ```
 
-Backup format (v2): `[magic][version][salt][iterations][nonce][ciphertext][tag]` using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations) and ChaCha20-Poly1305 AEAD encryption. V1 backups (`SSBK0001`) are auto-detected and can still be decrypted. The passphrase never touches disk.
+Backup format (v2): `[magic][version][iterations][salt][nonce][ciphertext][tag]` using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations) and ChaCha20-Poly1305 AEAD encryption. V1 backups (`SSBK0001`) are auto-detected and can still be decrypted. The passphrase never touches disk. A backup whose stored iteration count is outside 100,000 to 10,000,000 is rejected.
+
+**Restore never overwrites.** `--restore` exits with an error, naming the file in the way, if any of these exists:
+
+- the database (`--db`), or its SQLite sidecar files `<db>-wal`, `<db>-shm` or `<db>-journal`;
+- the keyfile (`--keyfile`).
+
+Stop the LSP, move the old database (with its sidecar files) and the old keyfile out of the way, then restore. Both files are written completely before either appears; the keyfile is put in place first, then the database. If the restore fails, neither file is normally left behind. If the process is killed between the two steps, or the keyfile cannot be removed again after a failure (an error names it), the keyfile is left without the database: delete it before running `--restore` again.
+
+**Failed writes are reported.** `--backup` and `--restore` write to a temporary file (`<name>.ss-partial.XXXXXX`) in the destination directory and move it into place only when it is complete on disk. On a full disk or any other write error they print `FAILED` and exit non-zero, and an older backup at the same path is left intact. The destination directory must be writable, and a destination that is a symbolic link is refused.
+
+**Permissions.** Backups, restored databases and restored keyfiles are created with mode `0600`. When a backup is read (`--backup-verify`, `--restore`), and when the keyfile is read for `--backup`, a file that group or others can access is tightened to `0600` with a warning, under the same conditions as for keyfiles (section 3): a regular file owned by the current user, with no other hard links, not reached through a symbolic link. Otherwise its mode is left alone and it is still read, so a backup on read-only media can be restored.
 
 Schedule regular backups in production. Keep backups on a separate machine.
 
@@ -308,6 +327,10 @@ For defense-in-depth, run `superscalar_watchtower` on a separate machine. It ope
   --rpcpassword YOUR_PASS
 ```
 
+On mainnet the watchtower, like the LSP and the client, starts only with `--i-accept-the-risk` and refuses `--cheat-*` / `--test-*` flags and `SS_CHEAT*`, `SS_KILL*` and `SUPERSCALAR_CRASH*` environment variables. `--network bitcoin` is another spelling of `--network mainnet` and is treated identically by all three daemons.
+
+The systemd unit in `tools/deploy/superscalar-watchtower.service` passes `$SS_WATCHTOWER_ARGS` from `/etc/superscalar/env`; for a mainnet watchtower set `SS_WATCHTOWER_ARGS=--i-accept-the-risk` there.
+
 The watchtower prints heartbeat messages and broadcasts the relevant pre-signed response automatically if a breach is detected. Because it holds no secrets and no keys, a compromised watchtower cannot construct any new transaction — verifiable with `nm` (see [`watchtower-trustless-schema.md`](watchtower-trustless-schema.md)). To fund CPFP fee-bumping of the anyone-can-spend P2A anchors under fee pressure, pass `--bump-wallet` (a wallet the bumper spends its own UTXOs from; the watchtower still signs nothing of the protocol).
 
 ### Watchtower flags
@@ -315,7 +338,8 @@ The watchtower prints heartbeat messages and broadcasts the relevant pre-signed 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--wt-db PATH` | **required** | Path to the watchtower response DB (pre-signed penalty/sweep/poison TXs; contains **no secrets**) |
-| `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
+| `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / testnet4 / mainnet. An unknown name is refused |
+| `--i-accept-the-risk` | off | Required for mainnet operation. On mainnet the watchtower also refuses `--cheat-*` / `--test-*` flags and `SS_CHEAT*`, `SS_KILL*`, `SUPERSCALAR_CRASH*` environment variables |
 | `--poll-interval N` | 30 | Seconds between block scans |
 | `--cli-path PATH` | bitcoin-cli | Path to bitcoin-cli binary |
 | `--rpcuser USER` | rpcuser | Bitcoin RPC username |
@@ -325,7 +349,6 @@ The watchtower prints heartbeat messages and broadcasts the relevant pre-signed 
 | `--bump-wallet NAME` | — | Funded wallet the CPFP fee-bumper draws UTXOs from (to CPFP the P2A anchor; the WT holds no protocol keys) |
 | `--max-bump-fee SATS` | — | Cap on cumulative RBF fee bumps for the penalty broadcast |
 | `--bump-budget-pct N` | — | Percentage of channel value to budget for fee bumps |
-| `--inspect-db` | off | Diagnostic: dump factory state, breach detections, and chain-state assertions; exits without polling. Useful for forensics on a captured DB. |
 | `--version` | — | Show version and exit |
 | `--help` | — | Show help and exit |
 
