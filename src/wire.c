@@ -1824,6 +1824,16 @@ cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
     return j;
 }
 
+cJSON *wire_build_bridge_fulfill_ack(const unsigned char *payment_hash32) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    return j;
+}
+
+int wire_parse_bridge_fulfill_ack(const cJSON *json, unsigned char *payment_hash32) {
+    return wire_json_get_hex(json, "payment_hash", payment_hash32, 32) == 32;
+}
+
 cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id,
                                           const char *rejected_reason) {
     cJSON *j = cJSON_CreateObject();

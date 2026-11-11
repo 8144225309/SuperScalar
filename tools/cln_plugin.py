@@ -493,8 +493,11 @@ def bridge_reader():
             log(f"Bridge reconnected; {held} HTLC(s) still awaiting the LSP")
         else:
             log("Bridge reconnected")
-        # Results the LSP has not acknowledged go out again.
+        # Results the LSP has not acknowledged go out again, and so do the
+        # HTLCs we hold: whatever was said over the old connection may not
+        # have arrived.
         resend_pay_results()
+        reannounce_held_htlcs()
 
 
 def handle_bridge_msg(msg):
@@ -518,6 +521,13 @@ def handle_bridge_msg(msg):
 
         if held is None:
             log(f"No pending HTLC for hash {payment_hash[:16]}...")
+            # A fulfil repeated for an HTLC we already resolved: say so, or
+            # the LSP keeps repeating it.
+            with lock:
+                done = payment_hash in settled_invoices
+            if result == "fulfill" and done:
+                send_to_bridge({"method": "htlc_resolved",
+                                "payment_hash": payment_hash})
             return
         rpc_id = held["rpc_id"]
 
@@ -535,6 +545,10 @@ def handle_bridge_msg(msg):
                     "payment_key": preimage
                 }
             })
+            # Tell the LSP the node has the preimage; until then it keeps
+            # the fulfil and repeats it.
+            send_to_bridge({"method": "htlc_resolved",
+                            "payment_hash": payment_hash})
             if settle:
                 _spawn(_drop_cln_invoice, payment_hash)
         else:
@@ -1091,6 +1105,21 @@ def _read_varint(data, offset):
         return int.from_bytes(data[offset+1:offset+9], 'big'), offset + 9
 
 
+def reannounce_held_htlcs():
+    """Offer the HTLCs we hold to the LSP again (after a reconnect).
+
+    The LSP recognises each by CLN's name for it: one it already has is
+    re-attached, one it has fulfilled gets its fulfil again.  An HTLC CLN
+    did not name is left out: the LSP could not tell it from a second HTLC
+    and would refuse it."""
+    with lock:
+        held = [dict(e["msg"]) for e in pending_htlcs.values()
+                if e.get("upstream") and e.get("msg")]
+    for msg in held:
+        send_to_bridge(msg)
+    return len(held)
+
+
 def upstream_id(htlc):
     """CLN's own name for an incoming HTLC: "<short_channel_id>:<id>".
 
@@ -1218,6 +1247,9 @@ def handle_htlc_accepted(rpc_id, params):
         bridge_msg["keysend"] = True
         bridge_msg["preimage"] = keysend_preimage
         bridge_msg["dest_client"] = KEYSEND_DEFAULT_CLIENT
+    with lock:
+        if payment_hash in pending_htlcs:
+            pending_htlcs[payment_hash]["msg"] = dict(bridge_msg)
 
     log(f"Forwarding HTLC {payment_hash[:16]}... to bridge"
         f"{' (keysend)' if keysend_preimage else ''}")

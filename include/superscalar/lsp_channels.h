@@ -155,6 +155,8 @@ typedef struct {
     unsigned char payment_hash[32];
     unsigned char preimage[32];
     char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
+    uint64_t bridge_htlc_id;
+    int undelivered;    /* the bridge has not confirmed this fulfil yet */
 } bridge_fulfilled_t;
 
 typedef struct {
@@ -629,6 +631,14 @@ htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
 uint64_t lsp_channels_settle_bridge_origin(lsp_channel_mgr_t *mgr,
                                              const unsigned char *payment_hash32,
                                              const unsigned char *preimage32);
+
+/* Fulfils the bridge has not confirmed (BRIDGE_FULFILL_ACK) are kept in the
+   database as well and sent again: when the bridge connects, on its
+   heartbeat, and when the node offers the HTLC again.
+   lsp_channels_flush_bridge_fulfils sends them; it returns how many.
+   lsp_channels_load_bridge_fulfils restores them after a restart. */
+size_t lsp_channels_flush_bridge_fulfils(lsp_channel_mgr_t *mgr);
+size_t lsp_channels_load_bridge_fulfils(lsp_channel_mgr_t *mgr);
 
 /* 1 if an HTLC for payment_hash32 is in flight through the bridge in either
    direction. */

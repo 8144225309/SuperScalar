@@ -274,25 +274,100 @@ int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
     return 0;
 }
 
+/* Fulfils older than this are no longer worth repeating: the upstream HTLC
+   has long expired. */
+#define BRIDGE_FULFIL_MAX_AGE_SECS (14 * 24 * 3600)
+
+/* The ring entry for a new fulfil: one whose fulfil was confirmed, if any;
+   otherwise the oldest. */
+static bridge_fulfilled_t *fulfilled_slot(lsp_channel_mgr_t *mgr) {
+    for (size_t k = 0; k < LSP_BRIDGE_FULFILLED_MAX; k++) {
+        size_t i = (mgr->bridge_fulfilled_next + k) % LSP_BRIDGE_FULFILLED_MAX;
+        if (i < mgr->n_bridge_fulfilled && mgr->bridge_fulfilled[i].undelivered)
+            continue;
+        mgr->bridge_fulfilled_next = (i + 1) % LSP_BRIDGE_FULFILLED_MAX;
+        if (i >= mgr->n_bridge_fulfilled) mgr->n_bridge_fulfilled = i + 1;
+        return &mgr->bridge_fulfilled[i];
+    }
+    fprintf(stderr, "LSP: WARNING — %d unconfirmed bridge fulfils, the oldest "
+            "is no longer repeated from memory\n", LSP_BRIDGE_FULFILLED_MAX);
+    bridge_fulfilled_t *f = &mgr->bridge_fulfilled[mgr->bridge_fulfilled_next];
+    mgr->bridge_fulfilled_next =
+        (mgr->bridge_fulfilled_next + 1) % LSP_BRIDGE_FULFILLED_MAX;
+    return f;
+}
+
 uint64_t lsp_channels_settle_bridge_origin(lsp_channel_mgr_t *mgr,
                                              const unsigned char *payment_hash32,
                                              const unsigned char *preimage32) {
-    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
-        htlc_origin_t *o = &mgr->htlc_origins[i];
-        if (!o->active || o->bridge_htlc_id == 0) continue;
-        if (memcmp(o->payment_hash, payment_hash32, 32) != 0) continue;
-
-        bridge_fulfilled_t *f = &mgr->bridge_fulfilled[mgr->bridge_fulfilled_next];
+    htlc_origin_t *o = lsp_channels_find_origin(mgr, payment_hash32, 0);
+    if (o) {
+        bridge_fulfilled_t *f = fulfilled_slot(mgr);
+        memset(f, 0, sizeof(*f));
         memcpy(f->payment_hash, payment_hash32, 32);
         memcpy(f->preimage, preimage32, 32);
         memcpy(f->upstream_id, o->upstream_id, sizeof(f->upstream_id));
-        mgr->bridge_fulfilled_next =
-            (mgr->bridge_fulfilled_next + 1) % LSP_BRIDGE_FULFILLED_MAX;
-        if (mgr->n_bridge_fulfilled < LSP_BRIDGE_FULFILLED_MAX)
-            mgr->n_bridge_fulfilled++;
-        break;
+        f->bridge_htlc_id = o->bridge_htlc_id;
+        f->undelivered = 1;
+        if (mgr->persist) {
+            persist_bridge_fulfil_t row;
+            memset(&row, 0, sizeof(row));
+            memcpy(row.payment_hash, payment_hash32, 32);
+            memcpy(row.preimage, preimage32, 32);
+            snprintf(row.upstream_id, sizeof(row.upstream_id), "%s", f->upstream_id);
+            row.bridge_htlc_id = f->bridge_htlc_id;
+            persist_save_bridge_fulfil((persist_t *)mgr->persist, &row);
+        }
     }
     return lsp_channels_get_bridge_origin(mgr, payment_hash32);
+}
+
+size_t lsp_channels_flush_bridge_fulfils(lsp_channel_mgr_t *mgr) {
+    if (mgr->bridge_fd < 0) return 0;
+    size_t sent = 0;
+    for (size_t i = 0; i < mgr->n_bridge_fulfilled; i++) {
+        const bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
+        if (!f->undelivered) continue;
+        cJSON *again = wire_build_bridge_fulfill_htlc(f->payment_hash, f->preimage,
+                                                       f->bridge_htlc_id);
+        wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, again);
+        cJSON_Delete(again);
+        sent++;
+    }
+    if (sent)
+        printf("LSP: repeated %zu unconfirmed fulfil(s) to the bridge\n", sent);
+    return sent;
+}
+
+size_t lsp_channels_load_bridge_fulfils(lsp_channel_mgr_t *mgr) {
+    if (!mgr->persist) return 0;
+    persist_bridge_fulfil_t rows[LSP_BRIDGE_FULFILLED_MAX];
+    size_t n = persist_load_bridge_fulfils((persist_t *)mgr->persist, rows,
+                                            LSP_BRIDGE_FULFILLED_MAX,
+                                            BRIDGE_FULFIL_MAX_AGE_SECS);
+    for (size_t i = 0; i < n; i++) {
+        bridge_fulfilled_t *f = fulfilled_slot(mgr);
+        memset(f, 0, sizeof(*f));
+        memcpy(f->payment_hash, rows[i].payment_hash, 32);
+        memcpy(f->preimage, rows[i].preimage, 32);
+        snprintf(f->upstream_id, sizeof(f->upstream_id), "%s", rows[i].upstream_id);
+        f->bridge_htlc_id = rows[i].bridge_htlc_id;
+        f->undelivered = 1;
+    }
+    if (n)
+        printf("LSP: loaded %zu unconfirmed bridge fulfil(s) from DB\n", n);
+    return n;
+}
+
+static void bridge_fulfil_confirmed(lsp_channel_mgr_t *mgr,
+                                     const unsigned char *payment_hash32) {
+    for (size_t i = 0; i < mgr->n_bridge_fulfilled; i++) {
+        bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
+        if (memcmp(f->payment_hash, payment_hash32, 32) == 0)
+            f->undelivered = 0;
+    }
+    if (mgr->persist)
+        persist_delete_bridge_fulfil((persist_t *)mgr->persist, payment_hash32);
 }
 
 /* The inbound origin in flight for this hash, or NULL. */
@@ -542,10 +617,11 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
             for (size_t i = 0; !prev && upstream_id[0] &&
                                i < mgr->n_bridge_fulfilled; i++) {
-                const bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
+                bridge_fulfilled_t *f = &mgr->bridge_fulfilled[i];
                 if (memcmp(f->payment_hash, payment_hash, 32) != 0 ||
                     strcmp(f->upstream_id, upstream_id) != 0)
                     continue;
+                f->bridge_htlc_id = htlc_id;
                 cJSON *again = wire_build_bridge_fulfill_htlc(payment_hash,
                                                                f->preimage, htlc_id);
                 wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, again);
@@ -1127,13 +1203,23 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     case MSG_BRIDGE_HELLO:
-        /* Bridge heartbeat ping — send ACK back, no-op otherwise */
+        /* Bridge heartbeat ping — send ACK back, and take the occasion to
+           repeat fulfils it has not confirmed */
         {
             cJSON *ack = wire_build_bridge_hello_ack();
             wire_send(mgr->bridge_fd, MSG_BRIDGE_HELLO_ACK, ack);
             cJSON_Delete(ack);
         }
+        lsp_channels_flush_bridge_fulfils(mgr);
         return 1;
+
+    case MSG_BRIDGE_FULFILL_ACK: {
+        unsigned char payment_hash[32];
+        if (!wire_parse_bridge_fulfill_ack(msg->json, payment_hash))
+            return 0;
+        bridge_fulfil_confirmed(mgr, payment_hash);
+        return 1;
+    }
 
     default:
         fprintf(stderr, "LSP: unexpected bridge msg 0x%02x\n", msg->msg_type);

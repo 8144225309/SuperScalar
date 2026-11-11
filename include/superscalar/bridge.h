@@ -8,6 +8,8 @@
 #include <time.h>
 
 #define BRIDGE_MAX_PENDING 256
+/* Messages kept for the plugin while it is not connected */
+#define BRIDGE_PLUGIN_QUEUE_MAX 1024
 
 /* The bridge and the CLN plugin share a secret: 32 random bytes, kept as
    64 hex characters in a file only its owner can read.  It never crosses
@@ -81,6 +83,11 @@ typedef struct {
     char lsp_host[256];                 /* saved for reconnect */
     int lsp_port;                       /* saved for reconnect */
     int reconnect_attempts;             /* consecutive failed attempts */
+
+    /* Messages for the plugin that could not be delivered because it was
+       not connected, oldest first.  Sent when it is back. */
+    char *plugin_queue[BRIDGE_PLUGIN_QUEUE_MAX];
+    size_t plugin_queue_len;
 
     /* Plugin read buffer (avoids 1-byte-at-a-time syscalls) */
     char plugin_read_buf[4096];
@@ -158,9 +165,20 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line);
    Returns allocated string (caller must free), or NULL on error. */
 char *bridge_read_plugin_line(bridge_t *br);
 
-/* Send newline-delimited JSON to plugin.
-   Returns 1 on success. */
+/* Send a message to the plugin.  If the plugin is not connected, or the
+   write fails, the message is queued and goes out when the plugin is back
+   (bridge_flush_plugin_queue, called after it authenticates).  Returns 1
+   once the message is sent or queued. */
 int bridge_send_plugin_json(bridge_t *br, cJSON *json);
+
+/* Send queued messages to the connected plugin.  Returns how many went. */
+size_t bridge_flush_plugin_queue(bridge_t *br);
+
+/* Read and handle one message from the plugin.  A lost connection or a
+   message that cannot be handled drops the plugin connection (it reconnects
+   and repeats what matters); pending HTLCs and the queue are kept.
+   Returns 1 if a message was handled, 0 if the connection was dropped. */
+int bridge_service_plugin(bridge_t *br);
 
 /* Run the bridge event loop (select on lsp_fd + plugin_fd).
    Runs until error or shutdown. Returns 0 on error. */

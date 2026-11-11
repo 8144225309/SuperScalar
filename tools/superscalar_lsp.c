@@ -3215,6 +3215,7 @@ int main(int argc, char *argv[]) {
                 }
                 if (n_orig > 0)
                     printf("LSP recovery: loaded %zu HTLC origins from DB\n", n_orig);
+                lsp_channels_load_bridge_fulfils(mgr);
             }
 
             /* Initialize watchtower */
@@ -4483,6 +4484,7 @@ accept_new_factory:
             }
             if (n_orig > 0)
                 printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+            lsp_channels_load_bridge_fulfils(mgr);
         }
 
         /* Do NOT override channel.fee_rate_sat_per_kvb with --fee-rate:

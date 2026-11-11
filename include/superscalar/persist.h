@@ -740,6 +740,21 @@ int persist_save_htlc_origin(persist_t *p,
                               const unsigned char *payment_hash32,
                               uint64_t bridge_htlc_id, uint64_t request_id,
                               size_t sender_idx, uint64_t sender_htlc_id);
+/* Fulfils of inbound bridge HTLCs that the bridge has not confirmed yet.
+   Kept until it does, so a fulfil the client gave while the bridge or the
+   Lightning node was away is not lost with a restart. */
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    char upstream_id[64];
+    uint64_t bridge_htlc_id;
+} persist_bridge_fulfil_t;
+int persist_save_bridge_fulfil(persist_t *p, const persist_bridge_fulfil_t *f);
+int persist_delete_bridge_fulfil(persist_t *p, const unsigned char *payment_hash32);
+/* Oldest first; rows older than max_age_secs (0 = no limit) are deleted. */
+size_t persist_load_bridge_fulfils(persist_t *p, persist_bridge_fulfil_t *out,
+                                    size_t max, uint64_t max_age_secs);
+
 /* Origins by row: two origins can share a payment hash (one in each
    direction), so a row is updated and closed by its id, never by hash.
    persist_insert_htlc_origin returns the new row id (0 on failure). */

@@ -15,6 +15,8 @@
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
+static void plugin_send_if_connected(bridge_t *br, cJSON *json);
+
 void bridge_init(bridge_t *br) {
     memset(br, 0, sizeof(*br));
     br->lsp_fd = -1;
@@ -454,8 +456,10 @@ int bridge_service_pending_plugin(bridge_t *br) {
 
         cJSON *ack = cJSON_CreateObject();
         cJSON_AddStringToObject(ack, "method", "auth_ok");
-        bridge_send_plugin_json(br, ack);
+        plugin_send_if_connected(br, ack);
         cJSON_Delete(ack);
+        /* What arrived for the plugin while it was away */
+        bridge_flush_plugin_queue(br);
         return 1;
     }
 }
@@ -529,22 +533,89 @@ int bridge_release_pending(bridge_t *br, uint64_t htlc_id) {
     return 0;
 }
 
-/* Send newline-delimited JSON to plugin */
-int bridge_send_plugin_json(bridge_t *br, cJSON *json) {
-    if (br->plugin_fd < 0) return 0;
+static void plugin_drop_connection(bridge_t *br) {
+    if (br->plugin_fd >= 0) wire_close(br->plugin_fd);
+    br->plugin_fd = -1;
+    br->plugin_read_len = 0;
+    br->plugin_read_pos = 0;
+}
 
+/* Write one message line to the connected plugin. */
+static int plugin_write_line(bridge_t *br, const char *str) {
+    if (br->plugin_fd < 0) return 0;
+    return write_all(br->plugin_fd, str, strlen(str)) &&
+           write_all(br->plugin_fd, "\n", 1);
+}
+
+static void plugin_enqueue(bridge_t *br, char *str) {
+    if (br->plugin_queue_len == BRIDGE_PLUGIN_QUEUE_MAX) {
+        fprintf(stderr, "Bridge: ERROR — %d messages waiting for the plugin, "
+                "dropping the oldest\n", BRIDGE_PLUGIN_QUEUE_MAX);
+        free(br->plugin_queue[0]);
+        memmove(br->plugin_queue, br->plugin_queue + 1,
+                (BRIDGE_PLUGIN_QUEUE_MAX - 1) * sizeof(char *));
+        br->plugin_queue_len--;
+    }
+    br->plugin_queue[br->plugin_queue_len++] = str;
+}
+
+size_t bridge_flush_plugin_queue(bridge_t *br) {
+    size_t sent = 0;
+    while (sent < br->plugin_queue_len && br->plugin_fd >= 0) {
+        if (!plugin_write_line(br, br->plugin_queue[sent])) {
+            plugin_drop_connection(br);
+            break;
+        }
+        free(br->plugin_queue[sent++]);
+    }
+    memmove(br->plugin_queue, br->plugin_queue + sent,
+            (br->plugin_queue_len - sent) * sizeof(char *));
+    br->plugin_queue_len -= sent;
+    return sent;
+}
+
+/* Send a message to the plugin, or keep it for when the plugin is back */
+int bridge_send_plugin_json(bridge_t *br, cJSON *json) {
     char *str = cJSON_PrintUnformatted(json);
     if (!str) return 0;
+    /* Order matters: nothing overtakes what is already waiting */
+    if (br->plugin_fd >= 0 && br->plugin_queue_len == 0 &&
+        plugin_write_line(br, str)) {
+        free(str);
+        return 1;
+    }
+    if (br->plugin_fd >= 0 && br->plugin_queue_len == 0)
+        plugin_drop_connection(br);     /* the write failed */
+    plugin_enqueue(br, str);
+    if (br->plugin_fd >= 0) bridge_flush_plugin_queue(br);
+    return 1;
+}
 
-    size_t len = strlen(str);
-    /* Write JSON + newline */
-    ssize_t w = write(br->plugin_fd, str, len);
+/* Send only if the plugin is there: for messages it will ask for again. */
+static void plugin_send_if_connected(bridge_t *br, cJSON *json) {
+    char *str = cJSON_PrintUnformatted(json);
+    if (!str) return;
+    if (br->plugin_fd >= 0 && !plugin_write_line(br, str))
+        plugin_drop_connection(br);
     free(str);
-    if (w != (ssize_t)len) return 0;
+}
 
-    char nl = '\n';
-    w = write(br->plugin_fd, &nl, 1);
-    return w == 1;
+int bridge_service_plugin(bridge_t *br) {
+    char *line = bridge_read_plugin_line(br);
+    if (!line) {
+        fprintf(stderr, "Bridge: plugin connection lost\n");
+        plugin_drop_connection(br);
+        return 0;
+    }
+    int ok = bridge_handle_plugin_msg(br, line);
+    free(line);
+    if (!ok) {
+        fprintf(stderr, "Bridge: could not handle a plugin message, dropping "
+                "the plugin connection\n");
+        plugin_drop_connection(br);
+        return 0;
+    }
+    return 1;
 }
 
 /* Read one newline-delimited line from plugin_fd (buffered) */
@@ -686,7 +757,7 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         cJSON_AddNumberToObject(j, "request_id", (double)request_id);
         cJSON_AddStringToObject(j, "status", reason[0] ? "rejected" : "applied");
         if (reason[0]) cJSON_AddStringToObject(j, "reason", reason);
-        bridge_send_plugin_json(br, j);
+        plugin_send_if_connected(br, j);
         cJSON_Delete(j);
         return 1;
     }
@@ -766,6 +837,20 @@ int bridge_handle_plugin_msg(bridge_t *br, const char *line) {
         cJSON_Delete(json);
         fprintf(stderr, "Bridge: forwarded ADD_HTLC to LSP (%llu msat, ok=%d)\n",
                 (unsigned long long)amount_msat, ok);
+        return ok;
+    }
+
+    if (strcmp(method->valuestring, "htlc_resolved") == 0) {
+        /* The node took the preimage: the LSP can stop repeating the fulfil */
+        unsigned char payment_hash[32];
+        if (wire_json_get_hex(json, "payment_hash", payment_hash, 32) != 32) {
+            cJSON_Delete(json);
+            return 0;
+        }
+        cJSON *msg = wire_build_bridge_fulfill_ack(payment_hash);
+        int ok = wire_send(br->lsp_fd, MSG_BRIDGE_FULFILL_ACK, msg);
+        cJSON_Delete(msg);
+        cJSON_Delete(json);
         return ok;
     }
 
@@ -921,10 +1006,11 @@ int bridge_run(bridge_t *br) {
                 return 0;
             }
             br->last_lsp_activity = time(NULL);
-            if (!bridge_handle_lsp_msg(br, &msg)) {
-                cJSON_Delete(msg.json);
-                return 0;
-            }
+            /* A message that cannot be handled is logged, not fatal: the
+               bridge keeps its pending HTLCs and its queue */
+            if (!bridge_handle_lsp_msg(br, &msg))
+                fprintf(stderr, "Bridge: could not handle LSP msg 0x%02x\n",
+                        msg.msg_type);
             cJSON_Delete(msg.json);
         }
 
@@ -938,20 +1024,8 @@ int bridge_run(bridge_t *br) {
                 memchr(br->plugin_read_buf + br->plugin_read_pos, '\n',
                        br->plugin_read_len - br->plugin_read_pos))) {
             plugin_readable = 0;
-            char *line = bridge_read_plugin_line(br);
-            if (!line) {
-                fprintf(stderr, "Bridge: plugin connection lost\n");
-                wire_close(br->plugin_fd);
-                br->plugin_fd = -1;
-                br->plugin_read_len = 0;
-                br->plugin_read_pos = 0;
+            if (!bridge_service_plugin(br))
                 break;
-            }
-            if (!bridge_handle_plugin_msg(br, line)) {
-                free(line);
-                return 0;
-            }
-            free(line);
         }
     }
 }
@@ -981,6 +1055,9 @@ int bridge_reconnect_lsp(bridge_t *br) {
 }
 
 void bridge_cleanup(bridge_t *br) {
+    for (size_t i = 0; i < br->plugin_queue_len; i++)
+        free(br->plugin_queue[i]);
+    br->plugin_queue_len = 0;
     if (br->lsp_fd >= 0) wire_close(br->lsp_fd);
     if (br->plugin_fd >= 0) wire_close(br->plugin_fd);
     if (br->plugin_pending_fd >= 0) wire_close(br->plugin_pending_fd);

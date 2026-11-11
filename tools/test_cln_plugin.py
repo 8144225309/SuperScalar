@@ -890,6 +890,55 @@ class InboundHtlcTest(PluginTestCase):
         self.assertEqual(list(cln_plugin.settled_invoices),
                          [f"{i:064x}" for i in (2, 3, 4)])
 
+    # --- telling the LSP, and telling it again ---
+
+    def resolved_acks(self):
+        return [m for m in self.to_bridge if m.get("method") == "htlc_resolved"]
+
+    def test_fulfil_is_confirmed_to_the_lsp(self):
+        self.fulfil(50)
+        self.assertEqual(self.resolved_acks(), [
+            {"method": "htlc_resolved", "payment_hash": PAYMENT_HASH}])
+        # The LSP repeats the fulfil (our confirmation was lost): confirmed
+        # again, CLN is not answered twice.
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertEqual(len(self.resolved_acks()), 2)
+        self.assertEqual(len(self.hook_answers()), 1)
+
+    def test_fulfil_for_an_unknown_htlc_is_not_confirmed(self):
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": OTHER_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertEqual(self.resolved_acks(), [])
+        self.assertEqual(self.hook_answers(), [])
+
+    def test_failure_is_not_confirmed_as_a_fulfil(self):
+        self.register()
+        cln_plugin.handle_htlc_accepted(51, htlc())
+        self.lsp_fails("insufficient_funds")
+        self.assertEqual(self.resolved_acks(), [])
+
+    def test_held_htlcs_are_offered_again_after_a_reconnect(self):
+        self.register()
+        self.register(OTHER_HASH)
+        cln_plugin.handle_htlc_accepted(52, htlc(channel="100x1x0", htlc_id=5))
+        cln_plugin.handle_htlc_accepted(53, htlc(payment_hash=OTHER_HASH))  # unnamed
+        first = self.to_lsp()[0]
+        self.to_bridge.clear()
+        self.assertEqual(cln_plugin.reannounce_held_htlcs(), 1)
+        # The named one goes out again exactly as before; the unnamed one,
+        # which the LSP could only refuse, does not.
+        self.assertEqual(self.to_lsp(), [first])
+        self.assertEqual(self.hook_answers(), [])
+        # Resolved HTLCs are not offered again.
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.to_bridge.clear()
+        self.assertEqual(cln_plugin.reannounce_held_htlcs(), 0)
+
     # --- HTLCs that never reach the LSP ---
 
     def test_own_invoice_of_the_node_is_left_to_cln(self):

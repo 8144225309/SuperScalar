@@ -3806,6 +3806,18 @@ static int read_line(int fd, char *buf, size_t cap) {
     return 0;
 }
 
+/* One message from the bridge, as the plugin receives it */
+static int plugin_read_msg(bridge_t *br, int fd, char *buf, size_t cap) {
+    (void)br;
+    return read_line(fd, buf, cap);
+}
+
+/* One message to the bridge, as the plugin sends it */
+static int plugin_send_msg(bridge_t *br, int fd, const char *json) {
+    (void)br;
+    return send_str(fd, json) && send_str(fd, "\n");
+}
+
 static void hex_of(const unsigned char *in, size_t len, char *out) {
     hex_encode(in, len, out);
 }
@@ -5310,5 +5322,226 @@ int test_lsp_outbound_htlc_returned(void) {
     TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC returned");
 
     pay_fixture_free(&f);
+    return 1;
+}
+
+/* ---- A fulfil is kept, and repeated, until the bridge confirms it ---- */
+
+/* Read one BRIDGE_FULFILL_HTLC from the bridge link; 1 if it is for `hash`
+   with `preimage` */
+static int next_fulfil_is(int bridge_peer, const unsigned char *hash,
+                          const unsigned char *preimage, uint64_t *id_out) {
+    wire_msg_t m;
+    unsigned char h[32], p[32];
+    if (!wire_recv_timeout(bridge_peer, &m, 1)) return 0;
+    int ok = m.msg_type == MSG_BRIDGE_FULFILL_HTLC &&
+             wire_parse_bridge_fulfill_htlc(m.json, h, p, id_out) &&
+             memcmp(h, hash, 32) == 0 && memcmp(p, preimage, 32) == 0;
+    cJSON_Delete(m.json);
+    return ok;
+}
+
+static void deliver_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp, uint8_t type,
+                               cJSON *json) {
+    wire_msg_t m;
+    m.msg_type = type;
+    m.json = json;
+    lsp_channels_handle_bridge_msg(mgr, lsp, &m);
+    cJSON_Delete(json);
+}
+
+int test_lsp_fulfil_kept_until_confirmed(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.n_channels = 1;
+    mgr.bridge_fd = -1;                      /* the bridge is away */
+    mgr.persist = &db;
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.htlc_origins && lsp, "alloc");
+
+    unsigned char preimage[32], hash[32];
+    memset(preimage, 0x49, 32);
+    sha256(preimage, 32, hash);
+    htlc_origin_t *o = lsp_channels_track_bridge_origin(&mgr, hash, 90);
+    TEST_ASSERT(o != NULL, "origin");
+    strcpy(o->upstream_id, "100x1x0:5");
+    lsp_channels_origin_save(&mgr, o);
+
+    /* The client fulfils while the bridge is away */
+    TEST_ASSERT_EQ(lsp_channels_settle_bridge_origin(&mgr, hash, preimage), 90, "settled");
+    TEST_ASSERT_EQ(lsp_channels_flush_bridge_fulfils(&mgr), 0, "nobody to send it to");
+    persist_bridge_fulfil_t rows[4];
+    TEST_ASSERT_EQ(persist_load_bridge_fulfils(&db, rows, 4, 0), 1, "fulfil is on disk");
+    TEST_ASSERT(memcmp(rows[0].preimage, preimage, 32) == 0 &&
+                strcmp(rows[0].upstream_id, "100x1x0:5") == 0 &&
+                rows[0].bridge_htlc_id == 90, "with preimage, name and id");
+
+    /* The bridge connects: the fulfil goes out, and again on each flush and
+       on the bridge's heartbeat, until it is confirmed */
+    mgr.bridge_fd = sv[0];
+    uint64_t id = 0;
+    TEST_ASSERT_EQ(lsp_channels_flush_bridge_fulfils(&mgr), 1, "sent on connect");
+    TEST_ASSERT(next_fulfil_is(sv[1], hash, preimage, &id) && id == 90, "the fulfil");
+    TEST_ASSERT_EQ(lsp_channels_flush_bridge_fulfils(&mgr), 1, "sent again");
+    TEST_ASSERT(next_fulfil_is(sv[1], hash, preimage, &id), "the fulfil again");
+    {
+        deliver_bridge_msg(&mgr, lsp, MSG_BRIDGE_HELLO, wire_build_bridge_hello(NULL));
+        wire_msg_t m;
+        TEST_ASSERT(wire_recv_timeout(sv[1], &m, 1) &&
+                    m.msg_type == MSG_BRIDGE_HELLO_ACK, "heartbeat answered");
+        cJSON_Delete(m.json);
+        TEST_ASSERT(next_fulfil_is(sv[1], hash, preimage, &id), "and the fulfil repeated");
+    }
+
+    /* A restart in between loses nothing */
+    {
+        lsp_channel_mgr_t again;
+        memset(&again, 0, sizeof(again));
+        again.persist = &db;
+        again.bridge_fd = sv[0];
+        TEST_ASSERT_EQ(lsp_channels_load_bridge_fulfils(&again), 1, "restored from disk");
+        TEST_ASSERT_EQ(lsp_channels_flush_bridge_fulfils(&again), 1, "and sent");
+        TEST_ASSERT(next_fulfil_is(sv[1], hash, preimage, &id) && id == 90, "the fulfil");
+        TEST_ASSERT(lsp_channels_hash_spent_or_busy(&again, hash),
+                    "the hash stays spent across the restart");
+    }
+
+    /* Confirmed: no longer sent, no longer on disk */
+    deliver_bridge_msg(&mgr, lsp, MSG_BRIDGE_FULFILL_ACK,
+                       wire_build_bridge_fulfill_ack(hash));
+    TEST_ASSERT_EQ(lsp_channels_flush_bridge_fulfils(&mgr), 0, "nothing left to send");
+    TEST_ASSERT_EQ(persist_load_bridge_fulfils(&db, rows, 4, 0), 0, "nothing left on disk");
+    wire_msg_t stray;
+    TEST_ASSERT(!wire_recv_timeout(sv[1], &stray, 1), "bridge sent nothing more");
+
+    /* More unconfirmed fulfils than the memory holds: none of the others
+       pushes an unconfirmed one out while a confirmed slot is free */
+    for (int i = 0; i < LSP_BRIDGE_FULFILLED_MAX - 1; i++) {
+        unsigned char p[32], h[32];
+        memset(p, 0, 32); p[0] = (unsigned char)(i + 1);
+        sha256(p, 32, h);
+        TEST_ASSERT(lsp_channels_track_bridge_origin(&mgr, h, 200 + i), "origin");
+        TEST_ASSERT(lsp_channels_settle_bridge_origin(&mgr, h, p) == (uint64_t)(200 + i),
+                    "settled");
+    }
+    TEST_ASSERT_EQ(lsp_channels_flush_bridge_fulfils(&mgr),
+                   (size_t)(LSP_BRIDGE_FULFILLED_MAX - 1),
+                   "every unconfirmed fulfil is still repeated");
+
+    close(sv[0]); close(sv[1]);
+    free(mgr.entries); free(mgr.htlc_origins); free(lsp);
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- The bridge keeps messages for a plugin that is away ---- */
+
+int test_bridge_queues_for_absent_plugin(void) {
+    bridge_t br;
+    bridge_init(&br);
+    int lsp_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+    br.lsp_fd = lsp_sv[1];
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
+
+    /* No plugin: a fulfil, a failure and a pay request from the LSP are
+       accepted and kept, in order */
+    unsigned char h1[32], h2[32], pre[32];
+    memset(h1, 0x51, 32); memset(h2, 0x52, 32); memset(pre, 0x53, 32);
+    wire_msg_t m;
+    m.msg_type = MSG_BRIDGE_FULFILL_HTLC;
+    m.json = wire_build_bridge_fulfill_htlc(h1, pre, 4);
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &m), "fulfil accepted without a plugin");
+    cJSON_Delete(m.json);
+    m.msg_type = MSG_BRIDGE_FAIL_HTLC;
+    m.json = wire_build_bridge_fail_htlc(h2, "no", 5);
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &m), "failure accepted without a plugin");
+    cJSON_Delete(m.json);
+    m.msg_type = MSG_BRIDGE_SEND_PAY;
+    m.json = wire_build_bridge_send_pay("lnbcrt1pinvoice", h1, 9, 1000, 100);
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &m), "pay request accepted without a plugin");
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(br.plugin_queue_len, 3, "three messages waiting");
+
+    /* An ack is not kept: the plugin asks again */
+    m.msg_type = MSG_BRIDGE_PAY_RESULT_ACK;
+    m.json = wire_build_bridge_pay_result_ack(9, NULL);
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &m), "ack accepted");
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(br.plugin_queue_len, 3, "ack not queued");
+
+    /* The plugin connects and authenticates: it gets them, in order */
+    int plugin = connect_plugin_port(&br);
+    TEST_ASSERT(plugin >= 0, "connect");
+    unsigned char nb[32];
+    TEST_ASSERT_EQ(plugin_handshake(&br, plugin, TEST_PLUGIN_SECRET,
+                                     BRIDGE_AUTH_ROLE_PLUGIN, nb, NULL), 1, "authenticated");
+    TEST_ASSERT_EQ(br.plugin_queue_len, 0, "queue emptied");
+    char line[1024];
+    TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)) &&
+                strstr(line, "\"auth_ok\""), "auth_ok first");
+    TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)) &&
+                strstr(line, "\"fulfill\"") && strstr(line, "\"htlc_id\":4"), "then the fulfil");
+    TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)) &&
+                strstr(line, "\"fail\"") && strstr(line, "\"htlc_id\":5"), "then the failure");
+    TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)) &&
+                strstr(line, "\"pay_request\"") && strstr(line, "\"request_id\":9"),
+                "then the pay request");
+
+    /* A plugin message the bridge cannot handle costs the plugin its
+       connection, nothing else: pending HTLCs stay, the bridge goes on */
+    TEST_ASSERT(plugin_send_msg(&br, plugin,
+        "{\"method\":\"htlc_accepted\",\"payment_hash\":"
+        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
+        "\"amount_msat\":5000000,\"cltv_expiry\":500,\"upstream_id\":\"1x1x1:1\"}"),
+        "send htlc_accepted");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "plugin data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 1, "good message handled");
+    TEST_ASSERT_EQ(br.n_pending, 1, "one HTLC pending");
+    TEST_ASSERT(plugin_send_msg(&br, plugin, "{\"method\":\"no_such_thing\"}"), "send junk");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "plugin data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "bad message: connection dropped");
+    TEST_ASSERT_EQ(br.plugin_fd, -1, "plugin gone");
+    TEST_ASSERT_EQ(br.n_pending, 1, "pending HTLC kept");
+    TEST_ASSERT(br.plugin_listen_fd >= 0, "still listening");
+
+    /* What the LSP says meanwhile waits for the plugin's return */
+    m.msg_type = MSG_BRIDGE_FULFILL_HTLC;
+    m.json = wire_build_bridge_fulfill_htlc(h1, pre, 4);
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &m), "fulfil accepted");
+    cJSON_Delete(m.json);
+    TEST_ASSERT_EQ(br.plugin_queue_len, 1, "kept for the plugin");
+
+    /* The plugin confirms a fulfil: the LSP is told */
+    close(plugin);
+    plugin = connect_plugin_port(&br);
+    TEST_ASSERT(plugin >= 0, "reconnect");
+    TEST_ASSERT_EQ(plugin_handshake(&br, plugin, TEST_PLUGIN_SECRET,
+                                     BRIDGE_AUTH_ROLE_PLUGIN, nb, NULL), 1, "authenticated");
+    wire_msg_t drain;
+    while (wire_recv_timeout(lsp_sv[0], &drain, 1)) cJSON_Delete(drain.json);
+    TEST_ASSERT(bridge_handle_plugin_msg(&br,
+        "{\"method\":\"htlc_resolved\",\"payment_hash\":"
+        "\"5151515151515151515151515151515151515151515151515151515151515151\"}"),
+        "htlc_resolved handled");
+    wire_msg_t ack;
+    TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &ack, 5), "LSP told");
+    unsigned char ah[32];
+    TEST_ASSERT(ack.msg_type == MSG_BRIDGE_FULFILL_ACK &&
+                wire_parse_bridge_fulfill_ack(ack.json, ah) &&
+                memcmp(ah, h1, 32) == 0, "BRIDGE_FULFILL_ACK for the hash");
+    cJSON_Delete(ack.json);
+
+    close(plugin);
+    close(lsp_sv[0]);
+    bridge_cleanup(&br);
     return 1;
 }

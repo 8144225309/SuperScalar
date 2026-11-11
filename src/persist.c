@@ -262,6 +262,13 @@ static const char *SCHEMA_SQL =
     "  active INTEGER DEFAULT 1,"
     "  created_at INTEGER DEFAULT (strftime('%s','now'))"
     ");"
+    "CREATE TABLE IF NOT EXISTS bridge_fulfils ("
+    "  payment_hash TEXT PRIMARY KEY,"
+    "  preimage TEXT NOT NULL,"
+    "  upstream_id TEXT NOT NULL DEFAULT '',"
+    "  bridge_htlc_id INTEGER DEFAULT 0,"
+    "  created_at INTEGER DEFAULT (strftime('%s','now'))"
+    ");"
     "CREATE TABLE IF NOT EXISTS htlc_origins ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  payment_hash TEXT NOT NULL,"
@@ -4713,6 +4720,78 @@ int persist_deactivate_htlc_origin(persist_t *p,
     int ok7 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok7;
+}
+
+int persist_save_bridge_fulfil(persist_t *p, const persist_bridge_fulfil_t *f) {
+    if (!p || !p->db || !f) return 0;
+    char hash_hex[65], pre_hex[65];
+    hex_encode(f->payment_hash, 32, hash_hex);
+    hex_encode(f->preimage, 32, pre_hex);
+    const char *sql =
+        "INSERT OR REPLACE INTO bridge_fulfils "
+        "(payment_hash, preimage, upstream_id, bridge_htlc_id) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, pre_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, f->upstream_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)f->bridge_htlc_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_delete_bridge_fulfil(persist_t *p, const unsigned char *payment_hash32) {
+    if (!p || !p->db || !payment_hash32) return 0;
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM bridge_fulfils WHERE payment_hash = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_bridge_fulfils(persist_t *p, persist_bridge_fulfil_t *out,
+                                    size_t max, uint64_t max_age_secs) {
+    if (!p || !p->db || !out) return 0;
+    sqlite3_stmt *stmt;
+    if (max_age_secs > 0 &&
+        sqlite3_prepare_v2(p->db,
+            "DELETE FROM bridge_fulfils "
+            "WHERE created_at < strftime('%s','now') - ?;",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)max_age_secs);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT payment_hash, preimage, upstream_id, bridge_htlc_id "
+            "FROM bridge_fulfils ORDER BY created_at, rowid;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max) {
+        persist_bridge_fulfil_t *f = &out[count];
+        memset(f, 0, sizeof(*f));
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 0);
+        const char *pre_hex = (const char *)sqlite3_column_text(stmt, 1);
+        const char *up = (const char *)sqlite3_column_text(stmt, 2);
+        if (!hash_hex || !pre_hex ||
+            hex_decode(hash_hex, f->payment_hash, 32) != 32 ||
+            hex_decode(pre_hex, f->preimage, 32) != 32)
+            continue;
+        if (up) snprintf(f->upstream_id, sizeof(f->upstream_id), "%s", up);
+        f->bridge_htlc_id = (uint64_t)sqlite3_column_int64(stmt, 3);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 int64_t persist_insert_htlc_origin(persist_t *p,

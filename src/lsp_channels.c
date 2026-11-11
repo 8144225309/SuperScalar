@@ -5179,7 +5179,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             cJSON_Delete(fulfill);
         } else {
             fprintf(stderr, "LSP: bridge not connected, fulfil for htlc_id=%llu "
-                    "held for a repeat offer\n",
+                    "kept until the bridge is back\n",
                     (unsigned long long)bridge_htlc_id);
         }
         printf("LSP: HTLC fulfilled via bridge (htlc_id=%llu)\n",
@@ -6940,6 +6940,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (lsp->bridge_fd >= 0) wire_close(lsp->bridge_fd);
                 lsp->bridge_fd = qfd;
                 mgr->bridge_fd = qfd;
+                /* fulfils the bridge never confirmed go out again */
+                lsp_channels_flush_bridge_fulfils(mgr);
                 printf("LSP: bridge connected (deferred, fd=%d)\n", qfd);
             } else if (qtype == MSG_HELLO) {
                 /* HELLO from known client — try reconnect */
@@ -7876,6 +7878,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 wire_close(lsp->bridge_fd);
                             lsp->bridge_fd = new_fd;
                             mgr->bridge_fd = new_fd;
+                            /* fulfils the bridge never confirmed go out again */
+                            lsp_channels_flush_bridge_fulfils(mgr);
                             printf("LSP: bridge connected in daemon loop (fd=%d)\n", new_fd);
                         } else if (peek.msg_type == MSG_RECONNECT) {
                             /* Client reconnect — use pre-read message */
