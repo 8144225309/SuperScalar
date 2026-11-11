@@ -983,7 +983,17 @@ def init_state(attempts=10):
     try:
         if not node_id:
             raise StateFileError("cannot ask CLN for this node's id (getinfo)")
-        return load_state(node_id)
+        restored = load_state(node_id)
+        # The state must also be writable from the first moment: a plugin
+        # that cannot record a payment must not be asked to make one.
+        path = os.path.expanduser(BRIDGE_STATE_FILE)
+        try:
+            os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        except OSError as e:
+            raise StateFileError(f"cannot create the directory of {path}: {e}")
+        if not save_state():
+            raise StateFileError(f"cannot write {path}")
+        return restored
     except StateFileError as e:
         message = (f"FATAL: {e}. The SuperScalar plugin is not starting. Its "
                    f"state file records outside payments in flight and HTLCs "

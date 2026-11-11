@@ -853,6 +853,28 @@ class StateFileTest(PluginTestCase):
         with open(self.path()) as f:
             self.assertEqual(f.read(), "{ not json")
 
+    def test_state_directory_is_created_and_the_file_written_at_start(self):
+        nested = os.path.join(self.state_dir.name, "new", "dir", "state.json")
+        self.use_cln()
+        with mock.patch.object(cln_plugin, "BRIDGE_STATE_FILE", nested):
+            self.assertEqual(cln_plugin.init_state(), 0)
+            self.assertTrue(os.path.isfile(nested))
+            self.assertEqual(os.stat(os.path.dirname(nested)).st_mode & 0o777, 0o700)
+
+    def test_plugin_stops_when_the_state_cannot_be_written(self):
+        blocker = os.path.join(self.state_dir.name, "file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        self.use_cln()
+        logged = []
+        with mock.patch.object(cln_plugin, "BRIDGE_STATE_FILE",
+                               os.path.join(blocker, "state.json")), \
+                mock.patch.object(cln_plugin, "log", logged.append), \
+                mock.patch.object(cln_plugin.sys, "stderr"), \
+                self.assertRaises(SystemExit):
+            cln_plugin.init_state()
+        self.assertTrue(any("FATAL" in line for line in logged))
+
     def test_plugin_stops_when_the_node_cannot_be_identified(self):
         self.use_cln(getinfo=cln_plugin.ClnRpcError("Connection refused"))
         with mock.patch.object(cln_plugin.sys, "stderr"), \
