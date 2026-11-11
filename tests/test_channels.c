@@ -1937,43 +1937,66 @@ int test_cltv_delta_enforcement(void) {
     uint32_t fwd;
 
     /* cltv_expiry below delta: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd, 0, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd, 0, 0, 0) == 0,
                 "cltv 30 should be rejected");
 
     /* cltv_expiry == delta: rejected (need strictly >) */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT, &fwd, 0, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT, &fwd, 0, 0, 0) == 0,
                 "cltv == delta should be rejected");
 
     /* cltv_expiry == 0: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd, 0, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd, 0, 0, 0) == 0,
                 "cltv 0 should be rejected");
 
     /* cltv_expiry = delta + 1: passes, fwd = 1 */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT + 1, &fwd, 0, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT + 1, &fwd, 0, 0, 0) == 1,
                 "cltv delta+1 should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)1, "fwd should be 1");
 
     /* cltv_expiry = 500: passes, fwd = 460 */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0, 0, 0) == 1,
                 "cltv 500 should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
 
     /* NULL fwd_cltv_out: just validates without writing */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL, 0, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL, 0, 0, 0) == 1,
                 "NULL out should still return 1");
 
     /* cltv_expiry at factory timeout: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 1000, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 1000, 0, 0) == 0,
                 "cltv at factory timeout should be rejected");
 
     /* cltv_expiry past factory timeout: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1000, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1000, 0, 0) == 0,
                 "cltv past factory timeout should be rejected");
 
     /* cltv_expiry below factory timeout: passes */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 1000, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 1000, 0, 0) == 1,
                 "cltv below factory timeout should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
+
+    /* With the chain tip known, the delta is measured from the tip:
+       an expiry of 1000 with delta 40 needs the tip below 960. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 0, 0, 959) == 1,
+                "expiry 41 blocks past the tip should pass");
+    TEST_ASSERT_EQ(fwd, (uint32_t)960, "fwd should be 960");
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 0, 0, 960) == 0,
+                "expiry exactly delta past the tip should be rejected");
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 0, 0, 1000) == 0,
+                "expiry at the tip should be rejected");
+
+    /* An expiry far in the past is larger than the delta as a bare number
+       but must not pass against the real tip. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0, 0, 800000) == 0,
+                "expiry below the tip should be rejected");
+
+    /* Tip + delta beyond 32 bits does not wrap around. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(100, &fwd, 0, 0, UINT32_MAX - 10) == 0,
+                "no wrap-around near UINT32_MAX");
+
+    /* The factory timeout still bounds the expiry from above. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1400, 0, 1000) == 0,
+                "expiry past factory timeout rejected with tip known");
 
     return 1;
 }
@@ -4027,10 +4050,10 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Verify it's used correctly in validation */
     uint32_t fwd;
-    TEST_ASSERT(lsp_validate_cltv_for_forward(delta + 10, &fwd, 0, delta) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(delta + 10, &fwd, 0, delta, 0) == 1,
                 "cltv above delta passes");
     TEST_ASSERT_EQ(fwd, 10, "forwarded = cltv - delta");
-    TEST_ASSERT(lsp_validate_cltv_for_forward(delta - 1, &fwd, 0, delta) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(delta - 1, &fwd, 0, delta, 0) == 0,
                 "cltv below delta rejected");
 
     /* NULL factory returns default */
