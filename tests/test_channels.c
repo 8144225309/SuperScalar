@@ -4441,6 +4441,9 @@ int test_client_ps_double_spend_defense_refuses(void) {
 
     /* Wire the defense into client_handle_leaf_advance. */
     client_set_persist(&db);
+    /* Tree advances are refused outright unless the harness opt-in is set;
+       set it so the proposal reaches the double-spend check. */
+    client_set_allow_tree_advance(1);
 
     /* Build a valid LEAF_ADVANCE_PROPOSE from the LSP (index 0) so the
        handler can parse it and proceed far enough to hit our check. */
@@ -4475,6 +4478,7 @@ int test_client_ps_double_spend_defense_refuses(void) {
     TEST_ASSERT(rc == 0, "handler REFUSES when parent already signed");
 
     /* Cleanup — reset the global persist hook. */
+    client_set_allow_tree_advance(0);
     client_set_persist(NULL);
     cJSON_Delete(propose_json);
     close(pipefd[0]);
@@ -4589,6 +4593,9 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
+            /* Step (3) below runs advance ceremonies against these clients,
+               which they refuse without the harness opt-in. */
+            client_set_allow_tree_advance(1);
             int ok = client_run_with_channels(child_ctx, &child_kp,
                                                "127.0.0.1", port,
                                                payment_client_cb,
@@ -4669,10 +4676,19 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
         }
     }
 
-    /* (2) the entry point refuses a leaf with client funds on it. */
+    /* (2) the entry points refuse while a channel is open on the tree they
+       would replace -- whatever the channel's balances are. */
     if (lsp_ok) {
         LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
-                  "advance refused while the channel holds client funds");
+                  "advance refused while a channel is open on the leaf");
+        channel_t *ch1 = &ch_mgr.entries[1].channel;
+        uint64_t keep_remote = ch1->remote_amount;
+        ch1->remote_amount = 0;
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
+                  "advance refused for an open channel with no client balance");
+        ch1->remote_amount = keep_remote;
+        LEAF_STEP(lsp_factory_tick_root(&ch_mgr, lsp, 0) == -1,
+                  "root tick refused while channels are open");
         for (int l = 0; l < 2; l++)
             LEAF_STEP(leaf_snapshot_matches(&lsp->factory, l, &before[l]),
                       "refused advance changed nothing");
@@ -4700,6 +4716,44 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
         LEAF_STEP(memcmp(ch_mgr.entries[1].channel.funding_txid,
                          chan_funding_txid[1], 32) == 0,
                   "advance does not re-anchor the channel");
+    }
+
+    /* (4) DW leaves only: a leaf advance that exhausts the leaf rolls over
+       into a whole-tree state advance, which replaces leaf 0 as well.  The
+       guard therefore looks at every channel of the factory for it, and with
+       the override the state-advance ceremony runs against both clients. */
+    if (lsp_ok && arity_code == FACTORY_ARITY_1) {
+        uint32_t max_states = lsp->factory.leaf_layers[1].config.max_states;
+        while (lsp_ok && lsp->factory.leaf_layers[1].current_state + 1 < max_states)
+            LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 1) == 1,
+                      "advance up to the last leaf state");
+        uint32_t epoch_before = lsp->factory.counter.current_epoch;
+        unsigned char leaf0_txid[32];
+        memcpy(leaf0_txid,
+               lsp->factory.nodes[lsp->factory.leaf_node_indices[0]].txid, 32);
+        /* Only leaf 0's channel counts as open now: the rollover must still
+           be refused, because it replaces leaf 0 too. */
+        uint64_t keep_funding = ch_mgr.entries[1].channel.funding_amount;
+        ch_mgr.entries[1].channel.funding_amount = 0;
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
+                  "rollover refused for an open channel on another leaf");
+        ch_mgr.entries[1].channel.funding_amount = keep_funding;
+        LEAF_STEP(lsp->factory.counter.current_epoch == epoch_before &&
+                  memcmp(leaf0_txid,
+                         lsp->factory.nodes[lsp->factory.leaf_node_indices[0]].txid,
+                         32) == 0,
+                  "refused rollover changed nothing");
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 1) == 1,
+                  "state-advance ceremony with override");
+        LEAF_STEP(lsp->factory.counter.current_epoch == epoch_before + 1,
+                  "root advanced one epoch");
+        LEAF_STEP(memcmp(leaf0_txid,
+                         lsp->factory.nodes[lsp->factory.leaf_node_indices[0]].txid,
+                         32) != 0,
+                  "state advance replaced the other leaf too");
+        LEAF_STEP(memcmp(ch_mgr.entries[0].channel.funding_txid,
+                         chan_funding_txid[0], 32) == 0,
+                  "state advance does not re-anchor channels");
     }
 
     /* Cooperative close so the clients exit cleanly (never broadcast).  Every
@@ -4747,4 +4801,128 @@ int test_payment_leaves_leaf_untouched_arity_ps(void) {
 
 int test_payment_leaves_leaf_untouched_arity1(void) {
     return run_payment_leaf_untouched(FACTORY_ARITY_1, 50);
+}
+
+/* ---- The client refuses every tree advance ----
+
+   Each of the three handlers is given a proposal on a socketpair whose far
+   end only reads.  Without the harness opt-in the client must answer with a
+   single MSG_ERROR -- no nonce message -- and leave its factory untouched.
+   With the opt-in the same leaf proposal gets a nonce, which shows the
+   refusal is what stopped it. */
+
+/* Runs one handler; returns its result and, in types[] and *n, every message
+   type the client sent. */
+static int run_advance_handler(int which, secp256k1_context *ctx,
+                                const secp256k1_keypair *kp, factory_t *f,
+                                uint8_t *types, size_t max, size_t *n) {
+    *n = 0;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    shutdown(sv[0], SHUT_WR);   /* the handler's first read sees EOF */
+    wire_msg_t propose;
+    memset(&propose, 0, sizeof(propose));
+    int rc;
+    if (which == 0) {
+        propose.msg_type = MSG_LEAF_ADVANCE_PROPOSE;
+        propose.json = wire_build_leaf_advance_propose(0, NULL, NULL);
+        rc = client_handle_leaf_advance(sv[1], ctx, kp, f, 1, &propose);
+    } else if (which == 1) {
+        propose.msg_type = MSG_STATE_ADV_PROPOSE_INTENT;
+        propose.json = cJSON_CreateObject();
+        rc = client_handle_state_advance(sv[1], ctx, kp, f, 1, &propose);
+    } else {
+        propose.msg_type = MSG_SUBFACTORY_PROPOSE_INTENT;
+        propose.json = cJSON_CreateObject();
+        rc = client_handle_subfactory_advance(sv[1], ctx, kp, f, 1, &propose);
+    }
+    cJSON_Delete(propose.json);
+    close(sv[1]);
+    wire_msg_t reply;
+    memset(&reply, 0, sizeof(reply));
+    while (wire_recv(sv[0], &reply)) {
+        if (*n < max) types[*n] = reply.msg_type;
+        (*n)++;
+        if (reply.json) cJSON_Delete(reply.json);
+        memset(&reply, 0, sizeof(reply));
+    }
+    close(sv[0]);
+    return rc;
+}
+
+int test_client_refuses_tree_advances(void) {
+    secp256k1_context *ctx = test_ctx();
+    const size_t N = 3;
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    for (size_t i = 0; i < N; i++) {
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys[i]), "keypair");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]), "pubkey");
+    }
+    unsigned char fund_spk[34];
+    {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, N);
+        unsigned char ser[32], tweak[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey tw_xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xo, NULL, &tw_pk);
+        build_p2tr_script_pubkey(fund_spk, &tw_xo);
+    }
+    unsigned char fund_txid[32];
+    memset(fund_txid, 0x3E, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, N, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fund_txid, 0, 500000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign PS tree");
+
+    leaf_snapshot_t snap[2];
+    for (int l = 0; l < 2; l++) leaf_snapshot_take(f, l, &snap[l]);
+
+    client_set_persist(NULL);
+    client_set_allow_tree_advance(0);
+    int ok = 1;
+    const char *why = "";
+    static const char *const names[3] = { "leaf advance", "state advance",
+                                          "sub-factory advance" };
+    for (int which = 0; which < 3 && ok; which++) {
+        uint8_t types[4];
+        size_t n = 0;
+        int rc = run_advance_handler(which, ctx, &kps[1], f, types, 4, &n);
+        if (rc != 0) { ok = 0; why = "handler did not refuse"; }
+        else if (n != 1 || types[0] != MSG_ERROR) {
+            ok = 0; why = "refusal is not a single MSG_ERROR (a nonce may have been sent)";
+        } else if (!leaf_snapshot_matches(f, 0, &snap[0]) ||
+                   !leaf_snapshot_matches(f, 1, &snap[1])) {
+            ok = 0; why = "refused advance changed the factory";
+        }
+        if (!ok) printf("  FAIL: %s: %s\n", names[which], why);
+    }
+
+    /* With the opt-in the leaf proposal is answered with the client's nonce. */
+    if (ok) {
+        client_set_allow_tree_advance(1);
+        uint8_t types[4];
+        size_t n = 0;
+        (void)run_advance_handler(0, ctx, &kps[1], f, types, 4, &n);
+        client_set_allow_tree_advance(0);
+        if (n < 1 || types[0] != MSG_LEAF_ADVANCE_CLIENT_PUBNONCE) {
+            ok = 0;
+            printf("  FAIL: with the opt-in the leaf advance did not proceed "
+                   "(%zu message(s), first 0x%02x)\n", n, n ? types[0] : 0);
+        }
+    }
+
+    for (int l = 0; l < 2; l++) free(snap[l].signed_tx);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return ok;
 }
