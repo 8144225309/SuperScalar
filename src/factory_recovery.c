@@ -7,6 +7,9 @@
  * Design: topological broadcast (BFS passes).  A tree node is broadcastable
  * when its parent is confirmed (or, for the root/kickoff node, the factory
  * funding TX is confirmed).  Passes repeat until no new broadcasts occur.
+ *
+ * The node set is sized from the persisted tree itself.  A tree that cannot
+ * be loaded completely is an error, never a shorter tree.
  */
 
 #include "superscalar/factory_recovery.h"
@@ -22,53 +25,130 @@
 #include <secp256k1_schnorrsig.h>
 #include <sqlite3.h>
 #include <cJSON.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ------------------------------------------------------------------ */
 /* Internal node representation                                         */
 /* ------------------------------------------------------------------ */
 
-#define FR_MAX_NODES 128
-
 typedef struct {
     int32_t  node_index;
     int32_t  parent_index;   /* -1 = root (no parent in this factory tree) */
+    uint32_t nsequence;      /* nSequence of the node's input */
     char     txid[65];
-    char     type[16];       /* "kickoff", "state", "leaf", etc. */
+    char     type[16];       /* "kickoff" or "state" */
     char    *signed_tx_hex;  /* heap-allocated; NULL if unsigned */
     int      confs;          /* -2=unchecked, -1=not found, 0=mempool, >=1=confirmed */
+    int      target;         /* this run has to publish the node */
+    int      sent;           /* accepted by the node during this run */
+    int      rejected;       /* refused although its parent was deep enough */
 } fr_node_t;
 
-static void fr_nodes_free(fr_node_t *nodes, int n)
+/* A factory's whole persisted tree.  nodes[i].node_index == i. */
+typedef struct {
+    fr_node_t *nodes;
+    int        n;
+} fr_tree_t;
+
+static void fr_tree_free(fr_tree_t *t)
 {
-    for (int i = 0; i < n; i++)
-        free(nodes[i].signed_tx_hex);
+    if (!t) return;
+    for (int i = 0; i < t->n; i++)
+        free(t->nodes[i].signed_tx_hex);
+    free(t->nodes);
+    t->nodes = NULL;
+    t->n = 0;
+}
+
+static void fr_why(char *why, size_t cap, const char *fmt, ...)
+{
+    if (!why || !cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, cap, fmt, ap);
+    va_end(ap);
 }
 
 /* ------------------------------------------------------------------ */
 /* DB helpers                                                           */
 /* ------------------------------------------------------------------ */
 
-/* Load all tree nodes for factory_id.  Returns count, -1 on error. */
-static int load_nodes_for_factory(sqlite3 *db, uint32_t factory_id,
-                                  fr_node_t *nodes, int max)
+/*
+ * Load every tree node of factory_id.
+ *
+ * Returns 1 with the tree in *t, 0 if the factory has no tree nodes, -1 if
+ * the tree is not complete and self-consistent (why says what is wrong):
+ * the rows must be exactly node_index 0..COUNT-1, every parent must be
+ * another row of the same tree, and every node must reach a root.
+ */
+static int fr_tree_load(sqlite3 *db, uint32_t factory_id, fr_tree_t *t,
+                        char *why, size_t why_cap)
 {
+    t->nodes = NULL;
+    t->n = 0;
+
     sqlite3_stmt *stmt;
-    const char *sql =
-        "SELECT node_index, parent_index, txid, type, signed_tx_hex "
-        "FROM tree_nodes WHERE factory_id=? ORDER BY node_index ASC";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*), MIN(node_index), MAX(node_index) "
+            "FROM tree_nodes WHERE factory_id=?",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        fr_why(why, why_cap, "cannot read tree_nodes: %s", sqlite3_errmsg(db));
         return -1;
+    }
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_int64 count = -1, min_idx = 0, max_idx = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count   = sqlite3_column_int64(stmt, 0);
+        min_idx = sqlite3_column_int64(stmt, 1);
+        max_idx = sqlite3_column_int64(stmt, 2);
+    }
+    sqlite3_finalize(stmt);
+    if (count < 0) {
+        fr_why(why, why_cap, "cannot count tree_nodes: %s", sqlite3_errmsg(db));
+        return -1;
+    }
+    if (count == 0) return 0;
+    if (min_idx != 0 || max_idx != count - 1 || count > INT32_MAX) {
+        fr_why(why, why_cap,
+               "tree is incomplete: %lld node(s) stored with indices %lld..%lld",
+               (long long)count, (long long)min_idx, (long long)max_idx);
+        return -1;
+    }
+
+    fr_node_t *nodes = calloc((size_t)count, sizeof(*nodes));
+    if (!nodes) {
+        fr_why(why, why_cap, "out of memory for %lld tree nodes",
+               (long long)count);
+        return -1;
+    }
+    t->nodes = nodes;
+
+    if (sqlite3_prepare_v2(db,
+            "SELECT node_index, parent_index, txid, type, signed_tx_hex, "
+            "nsequence FROM tree_nodes WHERE factory_id=? "
+            "ORDER BY node_index ASC",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        fr_why(why, why_cap, "cannot read tree_nodes: %s", sqlite3_errmsg(db));
+        fr_tree_free(t);
+        return -1;
+    }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
 
-    int count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && count < max) {
-        fr_node_t *nd = &nodes[count];
-        memset(nd, 0, sizeof(*nd));
-
-        nd->node_index = sqlite3_column_int(stmt, 0);
+    int rc;
+    int bad = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (t->n >= count ||
+            sqlite3_column_int64(stmt, 0) != (sqlite3_int64)t->n) {
+            fr_why(why, why_cap, "tree is incomplete: node %d is missing", t->n);
+            bad = 1;
+            break;
+        }
+        fr_node_t *nd = &nodes[t->n];
+        nd->node_index = (int32_t)t->n;
 
         if (sqlite3_column_type(stmt, 1) == SQLITE_NULL)
             nd->parent_index = -1;
@@ -76,20 +156,67 @@ static int load_nodes_for_factory(sqlite3 *db, uint32_t factory_id,
             nd->parent_index = sqlite3_column_int(stmt, 1);
 
         const char *txid = (const char *)sqlite3_column_text(stmt, 2);
-        if (txid) strncpy(nd->txid, txid, sizeof(nd->txid) - 1);
+        if (txid) snprintf(nd->txid, sizeof(nd->txid), "%s", txid);
 
         const char *type = (const char *)sqlite3_column_text(stmt, 3);
-        if (type) strncpy(nd->type, type, sizeof(nd->type) - 1);
+        if (type) snprintf(nd->type, sizeof(nd->type), "%s", type);
 
         const char *hex = (const char *)sqlite3_column_text(stmt, 4);
-        if (hex && hex[0])
+        if (hex && hex[0]) {
             nd->signed_tx_hex = strdup(hex);
+            if (!nd->signed_tx_hex) {
+                fr_why(why, why_cap, "out of memory loading node %d", t->n);
+                t->n++;
+                bad = 1;
+                break;
+            }
+        }
 
+        nd->nsequence = (uint32_t)sqlite3_column_int64(stmt, 5);
         nd->confs = -2;
-        count++;
+        t->n++;
     }
     sqlite3_finalize(stmt);
-    return count;
+
+    if (!bad && rc != SQLITE_DONE) {
+        fr_why(why, why_cap, "reading tree_nodes failed after %d of %lld: %s",
+               t->n, (long long)count, sqlite3_errmsg(db));
+        bad = 1;
+    }
+    if (!bad && t->n != count) {
+        fr_why(why, why_cap, "tree is incomplete: loaded %d of %lld nodes",
+               t->n, (long long)count);
+        bad = 1;
+    }
+
+    /* Every parent is a row of this tree, and every node reaches a root. */
+    for (int i = 0; !bad && i < t->n; i++) {
+        int32_t par = nodes[i].parent_index;
+        if (par < -1 || par >= t->n || par == i) {
+            fr_why(why, why_cap,
+                   "tree is incomplete: node %d names parent %d, which is not "
+                   "in the tree", i, (int)par);
+            bad = 1;
+        }
+    }
+    for (int i = 0; !bad && i < t->n; i++) {
+        int steps = 0;
+        for (int32_t at = i; at >= 0; at = nodes[at].parent_index) {
+            if (++steps > t->n) {
+                fr_why(why, why_cap,
+                       "tree is inconsistent: node %d never reaches the root",
+                       i);
+                bad = 1;
+                break;
+            }
+        }
+    }
+
+    if (bad) {
+        fr_tree_free(t);
+        return -1;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -102,46 +229,79 @@ static int get_confs(chain_backend_t *chain, const char *txid)
     return chain->get_confirmations(chain, txid);
 }
 
-static void refresh_confs(chain_backend_t *chain, fr_node_t *nodes, int n)
+/* Refresh confirmations; targets_only leaves the nodes a run does not have
+   to publish unqueried. */
+static void refresh_confs(chain_backend_t *chain, fr_tree_t *t,
+                          int targets_only)
 {
     if (!chain) return;
+    fr_node_t *nodes = t->nodes;
+    int n = t->n;
+    int done = 0;
 
     /* Try batch method first (single RPC round-trip) */
-    if (chain->get_confirmations_batch) {
-        const char *txids[256];
-        int confs[256];
-        int count = 0;
-        int map[256];  /* map batch index -> node index */
-        for (int i = 0; i < n && count < 256; i++) {
-            if (nodes[i].txid[0]) {
-                txids[count] = nodes[i].txid;
-                map[count] = i;
-                count++;
-            } else {
-                nodes[i].confs = -1;
+    if (chain->get_confirmations_batch && n > 0) {
+        const char **txids = calloc((size_t)n, sizeof(*txids));
+        int *confs = calloc((size_t)n, sizeof(*confs));
+        int *map = calloc((size_t)n, sizeof(*map));  /* batch index -> node */
+        if (txids && confs && map) {
+            int count = 0;
+            for (int i = 0; i < n; i++) {
+                if (targets_only && !nodes[i].target) continue;
+                if (nodes[i].txid[0]) {
+                    txids[count] = nodes[i].txid;
+                    map[count] = i;
+                    count++;
+                }
+            }
+            if (count > 0 && chain->get_confirmations_batch(chain,
+                    txids, (size_t)count, confs)) {
+                for (int i = 0; i < n; i++)
+                    if (!nodes[i].txid[0] &&
+                        (!targets_only || nodes[i].target))
+                        nodes[i].confs = -1;
+                for (int j = 0; j < count; j++)
+                    nodes[map[j]].confs = confs[j];
+                done = 1;
             }
         }
-        if (count > 0 && chain->get_confirmations_batch(chain,
-                txids, (size_t)count, confs)) {
-            for (int j = 0; j < count; j++)
-                nodes[map[j]].confs = confs[j];
-            return;
-        }
+        free(txids);
+        free(confs);
+        free(map);
     }
 
     /* Fallback: individual queries */
+    if (!done) {
+        for (int i = 0; i < n; i++) {
+            if (targets_only && !nodes[i].target) continue;
+            nodes[i].confs = nodes[i].txid[0]
+                             ? get_confs(chain, nodes[i].txid)
+                             : -1;
+        }
+    }
+
+    /* A transaction that is in the chain or the mempool has all of its
+       ancestors there too, at least as deep.  A backend that only looks a
+       limited number of blocks back can stop seeing an old ancestor; take
+       its depth from the descendant it does see. */
     for (int i = 0; i < n; i++) {
-        nodes[i].confs = nodes[i].txid[0]
-                         ? get_confs(chain, nodes[i].txid)
-                         : -1;
+        if (nodes[i].confs < 0) continue;
+        int depth = nodes[i].confs;
+        for (int32_t at = nodes[i].parent_index; at >= 0;
+             at = nodes[at].parent_index) {
+            if (nodes[at].confs >= depth) break;
+            nodes[at].confs = depth;
+        }
     }
 }
 
-static fr_node_t *find_node(fr_node_t *nodes, int n, int32_t idx)
+/* Blocks the node's parent must be buried before the node is final
+   (BIP 68 height lock), 0 when it has no relative lock. */
+static int relative_lock_blocks(uint32_t nsequence)
 {
-    for (int i = 0; i < n; i++)
-        if (nodes[i].node_index == idx) return &nodes[i];
-    return NULL;
+    if (nsequence & 0x80000000u) return 0;   /* lock disabled */
+    if (nsequence & 0x00400000u) return 0;   /* time-based: not used here */
+    return (int)(nsequence & 0xFFFFu);
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,14 +344,14 @@ static int broadcast_node(chain_backend_t *chain, persist_t *p,
    chain_funding_confs (1 on regtest, configurable on other networks,
    default 6 on mainnet) so factory recovery on mainnet waits for
    reorg-safe depth before declaring the factory fully settled. */
-static int all_leaves_confirmed(chain_backend_t *chain, fr_node_t *nodes, int n)
+static int all_leaves_confirmed(chain_backend_t *chain, const fr_tree_t *t)
 {
     int min_confs = chain ? chain_funding_confs(chain, chain->is_regtest) : 1;
     int found = 0;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(nodes[i].type, "leaf") == 0) {
+    for (int i = 0; i < t->n; i++) {
+        if (strcmp(t->nodes[i].type, "leaf") == 0) {
             found = 1;
-            if (nodes[i].confs < min_confs) return 0;
+            if (t->nodes[i].confs < min_confs) return 0;
         }
     }
     return found;
@@ -201,59 +361,106 @@ static int all_leaves_confirmed(chain_backend_t *chain, fr_node_t *nodes, int n)
 /* Core per-factory recovery                                            */
 /* ------------------------------------------------------------------ */
 
-/* Returns number of TXs broadcast. */
-/* allow_root_broadcast: 0 = do NOT broadcast ANY tree node during this
-   pass. This is the safe mode for startup / reorg scans: an active
-   factory's tree should never be force-published just because the
-   funding confirmed. Crash recovery of an in-progress force-close must
-   be re-triggered explicitly by the operator via factory_recovery_run.
-   1 = explicit operator-requested force-close; OK to broadcast from
-   the root down. */
+/*
+ * One pass over one factory.
+ *
+ * allow_broadcast: 0 = do NOT broadcast ANY tree node during this pass.
+ * This is the safe mode for startup / reorg scans: an active factory's tree
+ * should never be force-published just because the funding confirmed.
+ * 1 = explicit operator-requested force-close; OK to broadcast from the
+ * root down.
+ *
+ * leaf_txid: NULL publishes the whole tree.  Otherwise only the path from
+ * the root to the node with that txid is published.
+ *
+ * Returns 1 if the pass ran without error (res says how far it got), 0 if
+ * the factory has no tree, -1 on error (why says which).
+ */
 static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
                                 uint32_t factory_id, const char *funding_txid,
-                                int allow_root_broadcast)
+                                int allow_broadcast, const char *leaf_txid,
+                                factory_recovery_result_t *res,
+                                char *why, size_t why_cap)
 {
-    fr_node_t nodes[FR_MAX_NODES];
-    int n = load_nodes_for_factory(p->db, factory_id, nodes, FR_MAX_NODES);
-    if (n <= 0) return 0;
+    factory_recovery_result_t local;
+    if (!res) res = &local;
+    memset(res, 0, sizeof(*res));
+    res->leaf_node = -1;
+    res->first_unpublished = -1;
+
+    fr_tree_t tree;
+    int loaded = fr_tree_load(p->db, factory_id, &tree, why, why_cap);
+    if (loaded <= 0) return loaded;
+
+    fr_node_t *nodes = tree.nodes;
+    int n = tree.n;
+    res->n_tree_nodes = n;
+
+    /* Which nodes this run has to publish. */
+    if (leaf_txid) {
+        int leaf = -1;
+        for (int i = 0; i < n && leaf < 0; i++)
+            if (nodes[i].txid[0] && strcasecmp(nodes[i].txid, leaf_txid) == 0)
+                leaf = i;
+        if (leaf < 0) {
+            fr_why(why, why_cap,
+                   "leaf %.16s... is not one of the %d persisted tree nodes",
+                   leaf_txid, n);
+            fr_tree_free(&tree);
+            return -1;
+        }
+        res->leaf_node = leaf;
+        for (int32_t at = leaf; at >= 0; at = nodes[at].parent_index)
+            nodes[at].target = 1;
+    } else {
+        for (int i = 0; i < n; i++) nodes[i].target = 1;
+    }
+
+    int missing = -1;
+    for (int i = 0; i < n; i++) {
+        if (!nodes[i].target) continue;
+        res->n_target++;
+        if (!nodes[i].signed_tx_hex && missing < 0) missing = i;
+    }
+    if (missing >= 0 && allow_broadcast) {
+        fr_why(why, why_cap, "node %d has no signed transaction stored",
+               missing);
+        /* An exit path with a hole cannot be completed: publish nothing.
+           A whole-tree run still publishes the nodes it does have. */
+        if (leaf_txid) {
+            fr_tree_free(&tree);
+            return -1;
+        }
+    }
 
     int funding_confs = get_confs(chain, funding_txid);
-    refresh_confs(chain, nodes, n);
+    refresh_confs(chain, &tree, /* targets_only = */ 1);
 
-    /* Track which nodes were broadcast this call to avoid re-sending the
-     * same TX repeatedly when it is already in the mempool (send_raw_tx
-     * can succeed multiple times for a mempool TX, which would spin the
-     * progress loop forever). */
-    int broadcast_done[FR_MAX_NODES];
-    memset(broadcast_done, 0, sizeof(broadcast_done));
-
-    int total_broadcast = 0;
-    int progress = 1;
+    int progress = allow_broadcast;
     while (progress) {
         progress = 0;
         for (int i = 0; i < n; i++) {
             fr_node_t *nd = &nodes[i];
-            /* Skip if already confirmed or already broadcast this call */
-            if (nd->confs >= 1 || broadcast_done[i]) continue;
-            if (!nd->signed_tx_hex) continue; /* not yet signed — skip */
+            /* Skip if already confirmed or already tried this call
+             * (send_raw_tx can succeed again for a mempool TX, which would
+             * spin this loop forever). */
+            if (!nd->target || nd->confs >= 1 || nd->sent || nd->rejected)
+                continue;
+            if (!nd->signed_tx_hex) continue; /* not signed — skip */
 
             /* Determine whether parent is confirmed (or just broadcast
-             * this call — in-mempool parent is sufficient for child). */
-            /* Gate on explicit force-close request. Scan mode (startup /
-               reorg) just refreshes confs and never broadcasts — otherwise
-               a fresh, healthy factory gets its tree force-published the
-               moment the funding TX confirms. */
-            if (!allow_root_broadcast) continue;
-
+             * this call — in-mempool parent is sufficient for a child
+             * without a relative lock). */
             int parent_ok = 0;
+            int parent_depth = 0;
             if (nd->parent_index < 0) {
                 /* Root node (kickoff): depends on the factory funding TX. */
                 parent_ok = (funding_confs >= chain_funding_confs(chain, chain->is_regtest));
+                parent_depth = funding_confs;
             } else {
-                fr_node_t *par = find_node(nodes, n, nd->parent_index);
-                int par_i = par ? (int)(par - nodes) : -1;
-                parent_ok = par && ((par->confs >= 1) ||
-                                    (par_i >= 0 && broadcast_done[par_i]));
+                fr_node_t *par = &nodes[nd->parent_index];
+                parent_ok = (par->confs >= 1) || par->sent;
+                parent_depth = par->confs;
             }
             if (!parent_ok) continue;
 
@@ -261,24 +468,47 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
             if (ok) {
                 /* Treat as in-mempool so children can be queued in same pass */
                 nd->confs = 0;
-                broadcast_done[i] = 1;
-                total_broadcast++;
+                nd->sent = 1;
+                res->n_broadcast++;
                 progress = 1;
+            } else if (parent_depth >= 1 &&
+                       parent_depth >= relative_lock_blocks(nd->nsequence) &&
+                       get_confs(chain, nd->txid) < 0) {
+                /* Not a timelock wait: the parent is deep enough and the
+                   node is still nowhere to be seen. */
+                nd->rejected = 1;
             }
         }
     }
 
     /* Re-check confirmations after broadcasts and auto-close if done */
-    refresh_confs(chain, nodes, n);
-    if (all_leaves_confirmed(chain, nodes, n)) {
+    refresh_confs(chain, &tree, /* targets_only = */ 1);
+    if (!leaf_txid && all_leaves_confirmed(chain, &tree)) {
         persist_mark_factory_closed(p, factory_id);
         printf("LSP recovery: factory %u fully settled — marked closed\n",
                factory_id);
         fflush(stdout);
     }
 
-    fr_nodes_free(nodes, n);
-    return total_broadcast;
+    res->first_unpublished = -1;
+    for (int i = 0; i < n; i++) {
+        fr_node_t *nd = &nodes[i];
+        if (!nd->target) continue;
+        if (nd->confs >= 1) {
+            res->n_confirmed++;
+        } else if (nd->confs == 0 || nd->sent) {
+            res->n_in_mempool++;
+        } else {
+            if (nd->rejected) res->n_rejected++;
+            else              res->n_waiting++;
+            if (res->first_unpublished < 0) res->first_unpublished = i;
+        }
+    }
+    res->published =
+        (res->n_confirmed + res->n_in_mempool == res->n_target);
+
+    fr_tree_free(&tree);
+    return (missing >= 0 && allow_broadcast) ? -1 : 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -305,9 +535,14 @@ int factory_recovery_scan(persist_t *p, chain_backend_t *chain)
                fid, state ? state : "?", ftxid ? ftxid : "none");
         fflush(stdout);
 
-        if (ftxid && ftxid[0])
-            do_factory_recovery(p, chain, fid, ftxid,
-                                /* allow_root_broadcast = */ 0);
+        if (ftxid && ftxid[0]) {
+            char why[160] = {0};
+            if (do_factory_recovery(p, chain, fid, ftxid,
+                                    /* allow_broadcast = */ 0, NULL, NULL,
+                                    why, sizeof(why)) < 0) {
+                fprintf(stderr, "LSP recovery: factory %u: %s\n", fid, why);
+            }
+        }
 
         count++;
     }
@@ -350,21 +585,26 @@ cJSON *factory_recovery_list(persist_t *p, chain_backend_t *chain)
         cJSON_AddNumberToObject(fobj, "created_at",          (double)created);
 
         /* Tree node stats */
-        fr_node_t nodes[FR_MAX_NODES];
-        int n_nodes = load_nodes_for_factory(p->db, fid, nodes, FR_MAX_NODES);
+        fr_tree_t tree;
+        char why[160] = {0};
+        int loaded = fr_tree_load(p->db, fid, &tree, why, sizeof(why));
+        int n_nodes = 0;
         int n_confirmed = 0, n_leaf = 0, n_leaf_confirmed = 0;
-        if (n_nodes > 0) {
-            if (chain) refresh_confs(chain, nodes, n_nodes);
-            for (int i = 0; i < n_nodes; i++) {
-                if (chain && nodes[i].confs >= 1) n_confirmed++;
-                if (strcmp(nodes[i].type, "leaf") == 0) {
+        if (loaded > 0) {
+            n_nodes = tree.n;
+            if (chain) refresh_confs(chain, &tree, /* targets_only = */ 0);
+            for (int i = 0; i < tree.n; i++) {
+                if (chain && tree.nodes[i].confs >= 1) n_confirmed++;
+                if (strcmp(tree.nodes[i].type, "leaf") == 0) {
                     n_leaf++;
-                    if (chain && nodes[i].confs >= 1) n_leaf_confirmed++;
+                    if (chain && tree.nodes[i].confs >= 1) n_leaf_confirmed++;
                 }
             }
-            fr_nodes_free(nodes, n_nodes);
+            fr_tree_free(&tree);
+        } else if (loaded < 0) {
+            cJSON_AddStringToObject(fobj, "tree_error", why);
         }
-        cJSON_AddNumberToObject(fobj, "n_tree_nodes",        (double)(n_nodes < 0 ? 0 : n_nodes));
+        cJSON_AddNumberToObject(fobj, "n_tree_nodes",        (double)n_nodes);
         cJSON_AddNumberToObject(fobj, "n_confirmed",         (double)n_confirmed);
         cJSON_AddNumberToObject(fobj, "n_leaf",              (double)n_leaf);
         cJSON_AddNumberToObject(fobj, "n_leaf_confirmed",    (double)n_leaf_confirmed);
@@ -378,10 +618,46 @@ cJSON *factory_recovery_list(persist_t *p, chain_backend_t *chain)
     return arr;
 }
 
+int factory_recovery_client_leaf(persist_t *p, uint32_t factory_id,
+                                 char txid_out[65])
+{
+    if (txid_out) txid_out[0] = '\0';
+    if (!p || !p->db || !txid_out) return -1;
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT DISTINCT funding_txid FROM channels "
+            "WHERE factory_id=? AND funding_txid IS NOT NULL "
+            "  AND funding_txid != ''",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    int found = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        if (found == 0 && t) snprintf(txid_out, 65, "%s", t);
+        found++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE || found > 1) {
+        txid_out[0] = '\0';
+        return -1;
+    }
+    return found;
+}
+
 int factory_recovery_run(persist_t *p, chain_backend_t *chain,
-                         uint32_t factory_id,
+                         uint32_t factory_id, const char *leaf_txid,
+                         factory_recovery_result_t *res,
                          char *status_out, size_t cap)
 {
+    if (res) {
+        memset(res, 0, sizeof(*res));
+        res->leaf_node = -1;
+        res->first_unpublished = -1;
+    }
     if (!p || !p->db) {
         if (status_out && cap) snprintf(status_out, cap, "persist not available");
         return 0;
@@ -416,13 +692,39 @@ int factory_recovery_run(persist_t *p, chain_backend_t *chain,
         return 0;
     }
 
-    int n = do_factory_recovery(p, chain, factory_id, funding_txid,
-                                /* allow_root_broadcast = */ 1);
-    if (status_out && cap) {
-        snprintf(status_out, cap, "factory %u (state=%s): broadcast %d TX%s",
-                 factory_id, state[0] ? state : "?", n, n == 1 ? "" : "s");
+    factory_recovery_result_t local;
+    if (!res) res = &local;
+    char why[160] = {0};
+    int rc = do_factory_recovery(p, chain, factory_id, funding_txid,
+                                 /* allow_broadcast = */ 1, leaf_txid, res,
+                                 why, sizeof(why));
+    if (rc == 0)
+        snprintf(why, sizeof(why), "no tree nodes stored");
+    if (rc <= 0) {
+        res->published = 0;
+        if (status_out && cap)
+            snprintf(status_out, cap, "factory %u (state=%s): ERROR: %s",
+                     factory_id, state[0] ? state : "?", why);
+        return 0;
     }
-    return n > 0 ? 1 : 0;
+
+    if (status_out && cap) {
+        char scope[48];
+        if (leaf_txid)
+            snprintf(scope, sizeof(scope), "exit path to node %d",
+                     res->leaf_node);
+        else
+            snprintf(scope, sizeof(scope), "whole tree");
+        snprintf(status_out, cap,
+                 "factory %u (state=%s): broadcast %d TX%s; %s: %d of %d "
+                 "confirmed, %d in mempool, %d waiting, %d rejected "
+                 "(%d tree nodes)",
+                 factory_id, state[0] ? state : "?",
+                 res->n_broadcast, res->n_broadcast == 1 ? "" : "s", scope,
+                 res->n_confirmed, res->n_target, res->n_in_mempool,
+                 res->n_waiting, res->n_rejected, res->n_tree_nodes);
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -477,17 +779,20 @@ static int64_t read_varint(const unsigned char *buf, size_t len, size_t *pos)
 }
 
 /*
- * Parse a raw segwit Bitcoin TX (as hex) and extract outputs.
- * Fills amounts_out[] and spks_out[][34] up to max entries.
- * spk_lens_out[i] is set to the actual scriptPubKey length.
- * Returns number of outputs parsed, -1 on error.
+ * Parse a raw segwit Bitcoin TX (as hex) and extract every output.
+ * Allocates *amounts_out, *spks_out and *spk_lens_out, one entry per output
+ * (caller frees all three).  spk_lens_out[i] is the scriptPubKey length,
+ * capped at the 34 bytes kept.
+ * Returns number of outputs parsed, -1 on error (nothing left allocated).
  */
 static int tx_parse_outputs(const char *hex,
-                             uint64_t *amounts_out,
-                             unsigned char (*spks_out)[34],
-                             size_t *spk_lens_out,
-                             int max)
+                             uint64_t **amounts_out,
+                             unsigned char (**spks_out)[34],
+                             size_t **spk_lens_out)
 {
+    *amounts_out = NULL;
+    *spks_out = NULL;
+    *spk_lens_out = NULL;
     size_t hex_len = strlen(hex);
     if (hex_len % 2 != 0) return -1;
     size_t len = hex_len / 2;
@@ -531,31 +836,49 @@ static int tx_parse_outputs(const char *hex,
 
     /* Output count */
     int64_t n_outputs = read_varint(tx, len, &pos);
-    if (n_outputs < 0) { free(tx); return -1; }
+    /* An output is at least 9 bytes, so the TX length bounds the count. */
+    if (n_outputs < 0 || (uint64_t)n_outputs > (uint64_t)(len - pos) / 9) {
+        free(tx);
+        return -1;
+    }
+
+    size_t n_alloc = n_outputs > 0 ? (size_t)n_outputs : 1;
+    uint64_t *amounts = calloc(n_alloc, sizeof(*amounts));
+    unsigned char (*spks)[34] = calloc(n_alloc, sizeof(*spks));
+    size_t *spk_lens = calloc(n_alloc, sizeof(*spk_lens));
+    if (!amounts || !spks || !spk_lens) {
+        free(amounts); free(spks); free(spk_lens); free(tx);
+        return -1;
+    }
+#define TX_PARSE_FAIL() do { \
+        free(amounts); free(spks); free(spk_lens); free(tx); return -1; \
+    } while (0)
 
     int count = 0;
     for (int64_t i = 0; i < n_outputs; i++) {
-        if (pos + 8 > len) { free(tx); return -1; }
+        if (pos + 8 > len) TX_PARSE_FAIL();
         uint64_t amount = 0;
         for (int b = 0; b < 8; b++) amount |= ((uint64_t)tx[pos+b] << (8*b));
         pos += 8;
 
         int64_t spk_len = read_varint(tx, len, &pos);
-        if (spk_len < 0) { free(tx); return -1; }
-        if (pos + (size_t)spk_len > len) { free(tx); return -1; }
+        if (spk_len < 0) TX_PARSE_FAIL();
+        if (pos + (size_t)spk_len > len) TX_PARSE_FAIL();
 
-        if (count < max) {
-            amounts_out[count] = amount;
-            size_t copy = (size_t)spk_len < 34 ? (size_t)spk_len : 34;
-            memcpy(spks_out[count], tx + pos, copy);
-            spk_lens_out[count] = copy;
-            count++;
-        }
+        amounts[count] = amount;
+        size_t copy = (size_t)spk_len < 34 ? (size_t)spk_len : 34;
+        memcpy(spks[count], tx + pos, copy);
+        spk_lens[count] = copy;
+        count++;
         pos += (size_t)spk_len;
     }
+#undef TX_PARSE_FAIL
 
     (void)segwit;
     free(tx);
+    *amounts_out = amounts;
+    *spks_out = spks;
+    *spk_lens_out = spk_lens;
     return count;
 }
 
@@ -631,12 +954,14 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
            fail harmlessly at broadcast with "inputs-missingorspent". */
 
         /* Parse outputs from the raw TX */
-#define MAX_LEAF_OUTS 8
-        uint64_t amounts[MAX_LEAF_OUTS];
-        unsigned char spks[MAX_LEAF_OUTS][34];
-        size_t spk_lens[MAX_LEAF_OUTS];
-        int n_outs = tx_parse_outputs(hex, amounts, spks, spk_lens, MAX_LEAF_OUTS);
-        if (n_outs <= 0) continue;
+        uint64_t *amounts = NULL;
+        unsigned char (*spks)[34] = NULL;
+        size_t *spk_lens = NULL;
+        int n_outs = tx_parse_outputs(hex, &amounts, &spks, &spk_lens);
+        if (n_outs <= 0) {
+            free(amounts); free(spks); free(spk_lens);
+            continue;
+        }
 
         /* Convert txid to internal-order bytes (display txid is reversed) */
         unsigned char txid_internal[32];
@@ -1023,6 +1348,9 @@ cJSON *factory_sweep_run(persist_t *p, chain_backend_t *chain,
 
             cJSON_AddItemToArray(results, entry);
         }
+        free(amounts);
+        free(spks);
+        free(spk_lens);
     }
     sqlite3_finalize(stmt);
     return results;

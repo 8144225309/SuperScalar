@@ -246,7 +246,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--force-close` | off | Broadcast your factory tree on-chain from the local DB (unilateral exit) |
+| `--force-close` | off | Unilateral exit from the local DB: publish the tree transactions on the path to your leaf, then your commitment. One pass per run: exit status `0` = commitment accepted (so the whole path is published), `2` = run it again after the next block (tree levels mature one timelock at a time), `1` = the exit cannot be completed from this DB |
 | `--sweep-to-local` | off | After force-close, sweep your `to_local` outputs once CSV maturity hits |
 | `--sweep-dest ADDR` | (wallet) | Destination address for swept funds (defaults to your bitcoind wallet) |
 

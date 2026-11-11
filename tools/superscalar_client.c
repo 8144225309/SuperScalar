@@ -2472,7 +2472,10 @@ static void usage(const char *prog) {
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
-        "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --force-close                     Unilateral exit from --db without the LSP: publish the tree path\n"
+        "                                    to this client's leaf, then its commitment. One pass per run;\n"
+        "                                    exit status 0 = commitment accepted, 2 = run again after the next\n"
+        "                                    block, 1 = the exit cannot be completed from this DB\n"
         "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
@@ -2486,6 +2489,195 @@ static void usage(const char *prog) {
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
         prog);
+}
+
+/* Result of one unilateral-exit pass. Also the --force-close exit status. */
+#define CLIENT_EXIT_PUBLISHED   0   /* the commitment is in the mempool or a block */
+#define CLIENT_EXIT_FAILED      1   /* the exit cannot be completed from this DB */
+#define CLIENT_EXIT_IN_PROGRESS 2   /* run again after the next block */
+
+/* Read a Bitcoin varint. Returns 0 if it runs past the buffer. */
+static int exit_read_varint(const unsigned char *b, size_t len, size_t *pos,
+                            uint64_t *v) {
+    if (*pos >= len) return 0;
+    unsigned char first = b[(*pos)++];
+    size_t w = first < 0xFD ? 0 : first == 0xFD ? 2 : first == 0xFE ? 4 : 8;
+    if (w == 0) { *v = first; return 1; }
+    if (len - *pos < w) return 0;
+    *v = 0;
+    for (size_t i = 0; i < w; i++) *v |= (uint64_t)b[*pos + i] << (8 * i);
+    *pos += w;
+    return 1;
+}
+
+/* Txid (display hex) of a serialized transaction, with or without witness. */
+static int exit_tx_txid(const unsigned char *tx, size_t len, char out[65]) {
+    if (len < 10) return 0;
+    size_t pos = 4;
+    int segwit = (tx[4] == 0x00 && tx[5] == 0x01);
+    if (segwit) pos += 2;
+    size_t body = pos;
+    uint64_t n, sl;
+    if (!exit_read_varint(tx, len, &pos, &n)) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (len - pos < 36) return 0;
+        pos += 36;
+        if (!exit_read_varint(tx, len, &pos, &sl) || len - pos < 4 ||
+            sl > len - pos - 4) return 0;
+        pos += (size_t)sl + 4;
+    }
+    if (!exit_read_varint(tx, len, &pos, &n)) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (len - pos < 8) return 0;
+        pos += 8;
+        if (!exit_read_varint(tx, len, &pos, &sl) || sl > len - pos) return 0;
+        pos += (size_t)sl;
+    }
+    size_t body_len = pos - body;
+    if (len < 4 || pos > len - 4) return 0;
+    unsigned char *strip = malloc(body_len + 8);
+    if (!strip) return 0;
+    memcpy(strip, tx, 4);
+    memcpy(strip + 4, tx + body, body_len);
+    memcpy(strip + 4 + body_len, tx + len - 4, 4);
+    unsigned char h[32];
+    sha256_double(strip, body_len + 8, h);
+    free(strip);
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[2 * i]     = hx[h[31 - i] >> 4];
+        out[2 * i + 1] = hx[h[31 - i] & 0xF];
+    }
+    out[64] = '\0';
+    return 1;
+}
+
+/* The channel's latest signed commitment TX, whatever its size (caller frees). */
+static unsigned char *exit_load_commitment(persist_t *db, size_t *len_out,
+                                           uint64_t *cn_out) {
+    size_t len = 0, got = 0;
+    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, NULL, &len, 0) || len == 0)
+        return NULL;
+    unsigned char *buf = malloc(len);
+    if (!buf) return NULL;
+    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, buf, &got, len) ||
+        got != len) {
+        free(buf);
+        return NULL;
+    }
+    *len_out = len;
+    return buf;
+}
+
+/* One pass of this client's unilateral exit from its own DB: publish the
+   tree transactions on the path from the factory root to this client's leaf,
+   then the client's signed commitment, then (as the nLockTime fallback) the
+   distribution TX. Tree levels mature one relative timelock at a time, so the
+   caller repeats the pass after new blocks until it returns
+   CLIENT_EXIT_PUBLISHED: the commitment has been accepted, which a node only
+   does once the whole path below it is in the mempool or a block. */
+static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    int state;
+
+    /* The exit path ends at the tree node that funds this client's channel.
+       A DB that does not name it gets the whole tree published instead. */
+    char leaf_txid[65] = {0};
+    int have_leaf = (factory_recovery_client_leaf(db, 0, leaf_txid) == 1);
+    if (!have_leaf)
+        printf("Force-close: DB does not name this client's channel funding "
+               "output; publishing the whole factory tree\n");
+
+    char fr_status[512] = {0};
+    factory_recovery_result_t fr;
+    int ran = factory_recovery_run(db, chain, 0, have_leaf ? leaf_txid : NULL,
+                                   &fr, fr_status, sizeof(fr_status));
+    printf("Force-close: %s (run=%d)\n", fr_status, ran);
+    if (!ran) {
+        fprintf(stderr, "Force-close: ERROR: the exit path cannot be "
+                "published: %s\n", fr_status);
+        state = CLIENT_EXIT_FAILED;
+    } else if (!fr.published) {
+        printf("Force-close: exit path not fully published: %d of %d "
+               "transactions out, node %d is next (%d waiting for a parent "
+               "confirmation or relative timelock, %d rejected)\n",
+               fr.n_confirmed + fr.n_in_mempool, fr.n_target,
+               fr.first_unpublished, fr.n_waiting, fr.n_rejected);
+        if (fr.n_rejected)
+            fprintf(stderr, "Force-close: WARNING: %d exit-path transaction(s) "
+                    "were refused although their parent is confirmed deep "
+                    "enough\n", fr.n_rejected);
+        state = CLIENT_EXIT_IN_PROGRESS;
+    } else {
+        state = CLIENT_EXIT_PUBLISHED;
+    }
+
+    /* The signed commitment TX spends the leaf: it pays this client's balance.
+       It is offered on every pass, whatever this node can still see of the
+       tree: once a node accepts it, its leaf and everything above are out. */
+    size_t commit_len = 0;
+    uint64_t sig_cn = 0;
+    unsigned char *commit_tx = exit_load_commitment(db, &commit_len, &sig_cn);
+    if (!commit_tx) {
+        printf("Force-close: no signed commitment TX in DB\n");
+        fprintf(stderr, "Force-close: ERROR: without a signed commitment "
+                "this DB cannot claim the channel balance\n");
+        state = CLIENT_EXIT_FAILED;
+    } else {
+        char *tx_hex = malloc(commit_len * 2 + 1);
+        char commit_txid[65] = {0};
+        int commit_out = 0;
+        if (tx_hex) {
+            hex_encode(commit_tx, commit_len, tx_hex);
+            if (chain->send_raw_tx(chain, tx_hex, commit_txid)) {
+                printf("Force-close: commitment TX broadcast: %s (cn=%llu)\n",
+                       commit_txid, (unsigned long long)sig_cn);
+                commit_out = 1;
+            } else if (exit_tx_txid(commit_tx, commit_len, commit_txid) &&
+                       chain->get_confirmations(chain, commit_txid) >= 0) {
+                printf("Force-close: commitment TX already published: %s "
+                       "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
+                commit_out = 1;
+            } else {
+                printf("Force-close: commitment TX broadcast failed "
+                       "(may need tree to confirm first)\n");
+            }
+            free(tx_hex);
+        }
+        if (commit_out)
+            state = CLIENT_EXIT_PUBLISHED;
+        else if (state == CLIENT_EXIT_PUBLISHED)
+            state = CLIENT_EXIT_IN_PROGRESS;
+    }
+    free(commit_tx);
+
+    /* Broadcast distribution TX as nLockTime fallback */
+    {
+        size_t dist_len = 0;
+        unsigned char *dist_tx = NULL;
+        if (persist_load_distribution_tx(db, 0, NULL, &dist_len, 0) &&
+            dist_len > 0 && (dist_tx = malloc(dist_len)) != NULL) {
+            size_t got = 0;
+            char *tx_hex = malloc(dist_len * 2 + 1);
+            if (tx_hex &&
+                persist_load_distribution_tx(db, 0, dist_tx, &got, dist_len) &&
+                got == dist_len) {
+                hex_encode(dist_tx, dist_len, tx_hex);
+                char dist_txid[65];
+                if (chain->send_raw_tx(chain, tx_hex, dist_txid))
+                    printf("Force-close: distribution TX broadcast: %s\n",
+                           dist_txid);
+                else
+                    printf("Force-close: distribution TX not yet mature "
+                           "(nLockTime not reached)\n");
+            }
+            free(tx_hex);
+            free(dist_tx);
+        } else {
+            printf("Force-close: no distribution TX in DB\n");
+        }
+    }
+    return state;
 }
 
 /* Item-1 CLOSE policy: force-close on the last fully-verified state, reusing the
@@ -2525,27 +2717,17 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    char fr_status[256] = {0};
-    int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-    fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
-    /* Broadcast the signed commitment TX (last verified state) if present. */
-    unsigned char signed_tx_data[4096];
-    size_t signed_tx_len = 0;
-    uint64_t sig_cn = 0;
-    if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL, signed_tx_data,
-                                    &signed_tx_len, sizeof(signed_tx_data)) &&
-        signed_tx_len > 0) {
-        char *tx_hex = malloc(signed_tx_len * 2 + 1);
-        if (tx_hex) {
-            extern void hex_encode(const unsigned char *, size_t, char *);
-            hex_encode(signed_tx_data, signed_tx_len, tx_hex);
-            char commit_txid[65];
-            if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
-                fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
-                        "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
-            free(tx_hex);
-        }
-    }
+    int state = client_exit_pass(&db, &chain);
+    if (state == CLIENT_EXIT_FAILED)
+        fprintf(stderr, "Client: CLOSE policy force-close FAILED: the exit "
+                "cannot be completed from %s (see above)\n", db_path);
+    else if (state == CLIENT_EXIT_IN_PROGRESS)
+        fprintf(stderr, "Client: CLOSE policy force-close started; run "
+                "--force-close --db %s after each new block until it reports "
+                "COMPLETE\n", db_path);
+    else
+        fprintf(stderr, "Client: CLOSE policy force-close: exit path and "
+                "commitment published\n");
     persist_close(&db);
     return 1;
 }
@@ -2989,70 +3171,23 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
-           signed factory tree is published root-down. factory_recovery_scan() is the
-           passive startup/reorg scan that never broadcasts. Call repeatedly (caller
-           mines between passes) so each tree level matures its CSV; the root spends
-           the funding directly, so no distribution TX is required. */
-        char fr_status[256] = {0};
-        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-        printf("Force-close: %s (run=%d)\n", fr_status, result);
-
-        /* Broadcast signed commitment TX if available */
-        {
-            unsigned char signed_tx_data[4096];
-            size_t signed_tx_len = 0;
-            uint64_t sig_cn = 0;
-            if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
-                                             signed_tx_data, &signed_tx_len,
-                                             sizeof(signed_tx_data)) &&
-                signed_tx_len > 0) {
-                char *tx_hex = malloc(signed_tx_len * 2 + 1);
-                if (tx_hex) {
-                    extern void hex_encode(const unsigned char *, size_t, char *);
-                    hex_encode(signed_tx_data, signed_tx_len, tx_hex);
-                    char commit_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
-                        printf("Force-close: commitment TX broadcast: %s "
-                               "(cn=%llu)\n", commit_txid,
-                               (unsigned long long)sig_cn);
-                    else
-                        printf("Force-close: commitment TX broadcast failed "
-                               "(may need tree to confirm first)\n");
-                    free(tx_hex);
-                }
-            } else {
-                printf("Force-close: no signed commitment TX in DB\n");
-            }
-        }
-
-        /* Broadcast distribution TX as nLockTime fallback */
-        {
-            unsigned char dist_tx_data[8192];
-            size_t dist_tx_len = 0;
-            if (persist_load_distribution_tx(&db, 0,
-                                              dist_tx_data, &dist_tx_len,
-                                              sizeof(dist_tx_data)) &&
-                dist_tx_len > 0) {
-                char *tx_hex = malloc(dist_tx_len * 2 + 1);
-                if (tx_hex) {
-                    extern void hex_encode(const unsigned char *, size_t, char *);
-                    hex_encode(dist_tx_data, dist_tx_len, tx_hex);
-                    char dist_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
-                        printf("Force-close: distribution TX broadcast: %s\n",
-                               dist_txid);
-                    else
-                        printf("Force-close: distribution TX not yet mature "
-                               "(nLockTime not reached)\n");
-                    free(tx_hex);
-                }
-            } else {
-                printf("Force-close: no distribution TX in DB\n");
-            }
-        }
-
+        /* EXPLICIT operator force-close: publish this client's exit path
+           root-down, then its commitment. factory_recovery_scan() is the
+           passive startup/reorg scan that never broadcasts. Call repeatedly
+           (caller mines between passes) so each tree level matures its CSV;
+           the root spends the funding directly, so no distribution TX is
+           required. */
+        int exit_state = client_exit_pass(&db, &chain);
         persist_close(&db);
+        if (exit_state == CLIENT_EXIT_FAILED) {
+            printf("=== CLIENT FORCE-CLOSE FAILED ===\n");
+            return CLIENT_EXIT_FAILED;
+        }
+        if (exit_state == CLIENT_EXIT_IN_PROGRESS) {
+            printf("=== CLIENT FORCE-CLOSE IN PROGRESS: run --force-close again "
+                   "after the next block ===\n");
+            return CLIENT_EXIT_IN_PROGRESS;
+        }
         printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
         return 0;
     }
