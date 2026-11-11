@@ -4320,7 +4320,7 @@ static void pay_fixture_free(pay_fixture_t *f) {
     if (f->client_fd >= 0) close(f->client_fd);
     close(f->client_peer);
     close(f->mgr.bridge_fd); close(f->bridge_peer);
-    free(f->mgr.entries[0].channel.htlcs);
+    channel_cleanup(&f->mgr.entries[0].channel);
     free(f->mgr.entries);
     free(f->mgr.htlc_origins);
     free(f->lsp);
@@ -5947,7 +5947,7 @@ int test_channel_rollback_htlc(void) {
     TEST_ASSERT(channel_fail_htlc(&ch, b), "fail the first");
     TEST_ASSERT(!channel_rollback_htlc(&ch, b), "a failed HTLC is not rolled back");
     TEST_ASSERT_EQ(ch.local_amount, 100000, "all amounts back");
-    free(ch.htlcs);
+    channel_cleanup(&ch);
     return 1;
 }
 
@@ -6049,7 +6049,7 @@ int test_client_handles_update_fail_htlc(void) {
     cJSON_Delete(bogus);
     TEST_ASSERT_EQ(client_ch.local_amount, 100000, "balance untouched");
 
-    free(client_ch.htlcs); free(lsp_ch->htlcs);
+    channel_cleanup(&client_ch); channel_cleanup(lsp_ch);
     if (client_fd >= 0) close(client_fd);
     close(cl[1]); close(br[0]); close(br[1]);
     free(mgr.entries); free(mgr.htlc_origins); free(lsp);
