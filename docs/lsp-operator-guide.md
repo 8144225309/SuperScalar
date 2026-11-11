@@ -565,17 +565,30 @@ protection is the plugin's, so it has limits:
   The payment then fails and the client is refunded, long before the
   client's own HTLC would have expired, and the operator bears the cost of a
   channel close.
-- **A channel that goes on-chain while its incoming HTLC is held.** CLN
-  v26.06.9 aborted (`SIGABRT` in `htlc_accepted_hook_final`) when the plugin
-  answered a held `htlc_accepted` hook after the HTLC's channel had gone
-  on-chain. Before answering, the plugin now asks `listpeerchannels` for the
-  channel's state and does not answer if it is `AWAITING_UNILATERAL`,
-  `FUNDING_SPEND_SEEN`, `ONCHAIN` or `CLOSINGD_COMPLETE`; it logs an error
-  instead. If the LSP's answer was a fulfil, the factory client has been
-  paid and the node has to claim the incoming HTLC on-chain by other means:
-  the preimage is in the plugin's state file under `settled` when CLN held
-  the invoice. The check and the answer are two steps; a channel that closes
+- **A channel that is closed and forgotten while its incoming HTLC is
+  held.** CLN v26.06.9 aborted (`SIGABRT` in `htlc_accepted_hook_final`) when
+  a held `htlc_accepted` hook was answered after the HTLC's channel had been
+  closed on-chain and CLN had logged `onchaind complete, forgetting peer`.
+  Before answering, the plugin asks `listpeerchannels`; if CLN answers and no
+  longer lists the channel, the plugin does not answer the hook. A channel
+  that is still listed gets its answer in every state, including
+  `AWAITING_UNILATERAL` and `ONCHAIN`: while a channel is being closed, the
+  answer is how CLN learns the preimage it needs to claim the HTLC. Which
+  closing states are safe to answer in has not been established from CLN's
+  source for this version; only the forgotten-channel case was observed and
+  only that case is guarded. If the withheld answer was a fulfil, the
+  factory client has been paid and the incoming payment has not been
+  settled. The plugin then keeps the preimage in its state file under
+  `unresolved`, logs an error, and reports `htlc_unresolved` to the LSP. The
+  LSP logs `the Lightning node could not take the fulfil` with the payment
+  hash, the upstream HTLC and the preimage, keeps the fulfil in its database
+  and does not treat it as delivered. Recovering the money is up to the
+  operator. The check and the answer are two steps; a channel forgotten
   between them is not caught.
+- **An inbound HTLC that nears its expiry while the bridge is away** is
+  failed back to the client. The Lightning node still holds its HTLC; the
+  LSP keeps the failure on record and tells the bridge when it is connected
+  again, or when the plugin offers the held HTLC again.
 - **Keepalive messages.** The LSP's waits for a client's reply in the bridge
   paths skip keepalive pings and pongs. The waits in the reconnect
   retransmission and in the operator-initiated payment commands do not yet:
@@ -589,6 +602,35 @@ protection is the plugin's, so it has limits:
   for the plugin. The plugin offers its held HTLCs again when it reconnects
   and the LSP repeats unconfirmed fulfils, which covers both; a pay request
   that was only in the bridge's queue is lost, and its client HTLC stays held.
+
+### Known limits of channel updates in this release
+
+The LSP and a client change a channel's state with a short exchange: the
+change (an HTLC added, fulfilled or failed), the LSP's commitment signature,
+the client's revocation, the LSP's revocation. The following holds for every
+such exchange, not only for the bridge:
+
+- **A connection lost in the middle.** When the client reconnects, the LSP
+  sends the pending commitment signature again but not the change it belongs
+  to (the fulfil or fail itself). A client that never received the change
+  cannot verify that signature, and the two sides can fail to converge on
+  the same state.
+- **Messages that arrive out of turn.** While the LSP is waiting for a
+  client's reply, any other message that client sends is dropped, not queued.
+  A request sent at that moment is lost and has to be sent again.
+- **Signatures before storage.** The LSP sends its commitment signature
+  before the new state is durably saved. A crash between the two leaves the
+  client with a signature for a state the LSP does not remember.
+
+What is checked: a revocation whose secret does not match the point the
+client committed to is refused, the exchange counts as not done and the
+client is disconnected; the LSP starts no second exchange on a channel while
+one is in progress (a result from the Lightning node for that channel waits
+its turn); a client can fail only an HTLC it received, and takes back an HTLC
+of its own only if the LSP has signed nothing that contains it.
+
+The three limits above are being addressed by moving every channel update
+onto one routine. They are not fixed in this release.
 
 ### Live-node checklist
 
@@ -618,9 +660,11 @@ deploy.
       the HTLC as CLN would without the plugin.
 - [x] The hook registration `"before": ["keysend"]` is honoured: the plugin
       sees a keysend before CLN's keysend plugin does.
-- [ ] The hook must not be answered once the HTLC's channel has gone
-      on-chain (CLN aborts); `listpeerchannels` returns `short_channel_id`,
-      `alias` and `state` for a channel in every state up to `ONCHAIN`.
+- [ ] The hook must not be answered once CLN has forgotten the HTLC's
+      channel (CLN aborts). `listpeerchannels` lists a channel under
+      `short_channel_id` or `alias` for as long as CLN can take the answer,
+      and answering with the preimage while the channel is closing lets CLN
+      claim the HTLC on-chain.
 
 Invoices
 - [x] `invoice` accepts `preimage`, `cltv`, `expiry` and
