@@ -766,6 +766,16 @@ int persist_update_htlc_origin(persist_t *p, int64_t row_id,
                                 uint64_t bridge_htlc_id, uint64_t request_id,
                                 size_t sender_idx, uint64_t sender_htlc_id);
 int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id);
+/* What else has to survive a restart for the origin in row `row_id`: the
+   HTLC's expiry, its name on the Lightning node, and whether its failure
+   still has to be reported to the bridge. */
+int persist_save_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t cltv_expiry,
+                                     const char *upstream_id, int fail_pending);
+int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t *cltv_expiry_out,
+                                     char *upstream_id_out, size_t upstream_len,
+                                     int *fail_pending_out);
 /* As persist_load_htlc_origins, also returning each row's id. */
 size_t persist_load_htlc_origins_ids(persist_t *p,
                                       unsigned char (*hashes_out)[32],

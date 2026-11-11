@@ -6256,6 +6256,198 @@ int test_lsp_inbound_timeout_reaches_bridge_later(void) {
     return 1;
 }
 
+/* ---- No accepted revocation: the HTLC is failed and nothing goes on ---- */
+
+int test_lsp_unrevoked_htlc_is_failed(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    unsigned char good[32], bad[32];
+    memset(good, 0x33, 32);
+    memset(bad, 0x34, 32);
+    secp256k1_pubkey committed;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &committed, good), "point");
+
+    /* The fixture's client has offered an HTLC (commitment 1).  Its
+       revocation of commitment 0 is what lets the payment go on. */
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    ch->ctx = ctx;
+    channel_set_remote_pcp(ch, 0, &committed);
+    uint64_t remote_before = ch->remote_amount;
+    TEST_ASSERT(!lsp_channels_peer_revoked(ch), "nothing revoked yet");
+
+    /* A refused secret leaves it unrevoked */
+    int ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, bad);
+    TEST_ASSERT_EQ(ok, 0, "refused");
+    TEST_ASSERT(!lsp_channels_peer_revoked(ch), "still unrevoked");
+
+    /* ...and the payment stops there: the HTLC is failed in the LSP's
+       state, the sender is not charged, the connection is gone */
+    lsp_channels_abort_unrevoked_htlc(&f.mgr, f.lsp, 0, ch, f.htlc_id);
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC failed");
+    TEST_ASSERT(ch->remote_amount > remote_before, "sender has its amount back");
+    TEST_ASSERT_EQ(ch->local_amount, 100000, "LSP gained nothing");
+    TEST_ASSERT_EQ(f.client_fd, -1, "client disconnected");
+    ch->ctx = NULL;
+    pay_fixture_free(&f);
+
+    /* An unparseable revocation is the same case: nothing was stored.
+       The connection is still open then and is dropped by the abort. */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT(!lsp_channels_peer_revoked(ch), "unrevoked");
+    TEST_ASSERT(f.client_fd >= 0, "connected");
+    lsp_channels_abort_unrevoked_htlc(&f.mgr, f.lsp, 0, ch, f.htlc_id);
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC failed");
+    TEST_ASSERT_EQ(f.client_fd, -1, "client disconnected");
+    pay_fixture_free(&f);
+
+    /* The right secret: revoked, and it is the revocation of the latest
+       commitment that counts */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    ch = &f.mgr.entries[0].channel;
+    ch->ctx = ctx;
+    channel_set_remote_pcp(ch, 0, &committed);
+    ok = lsp_channels_accept_revocation(&f.mgr, f.lsp, ch, good);
+    TEST_ASSERT_EQ(ok, 1, "accepted");
+    TEST_ASSERT(lsp_channels_peer_revoked(ch), "revoked");
+    unsigned char h[32];
+    memset(h, 0x36, 32);
+    uint64_t next;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 1000, h, 500, &next), "next HTLC");
+    TEST_ASSERT(!lsp_channels_peer_revoked(ch), "the new commitment's predecessor is not");
+    ch->ctx = NULL;
+    pay_fixture_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- A bridge message handled during a wait finds the channel busy ---- */
+
+int test_lsp_bridge_msg_during_wait_is_deferred(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+
+    /* The LSP is waiting for this client's reply when the pay result for
+       its channel arrives on the bridge connection */
+    cJSON *res = wire_build_bridge_pay_result(7, 1, f.preimage);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_PAY_RESULT;
+    msg.json = res;
+    lsp_channels_handle_bridge_msg_during_wait(&f.mgr, f.lsp, f.client_fd, &msg);
+    cJSON_Delete(res);
+    TEST_ASSERT(pay_untouched(&f), "not applied during the wait");
+    TEST_ASSERT_EQ(f.mgr.n_bridge_deferred, 1, "kept");
+    TEST_ASSERT_EQ(f.mgr.entries[0].exchange_in_progress, 0, "busy mark removed after");
+    uint64_t rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 0, "not acknowledged");
+    size_t ran = lsp_channels_run_deferred_bridge_msgs(&f.mgr, f.lsp);
+    TEST_ASSERT_EQ(ran, 1, "applied afterwards");
+    TEST_ASSERT_EQ(f.mgr.entries[0].channel.n_htlcs, 0, "HTLC fulfilled");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "acknowledged then");
+    pay_fixture_free(&f);
+
+    /* While waiting for some other connection, the result is applied at once */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    res = wire_build_bridge_pay_result(7, 1, f.preimage);
+    msg.json = res;
+    lsp_channels_handle_bridge_msg_during_wait(&f.mgr, f.lsp, f.client_fd + 1000, &msg);
+    cJSON_Delete(res);
+    TEST_ASSERT_EQ(f.mgr.n_bridge_deferred, 0, "nothing deferred");
+    TEST_ASSERT_EQ(f.mgr.entries[0].channel.n_htlcs, 0, "HTLC fulfilled");
+    pay_fixture_free(&f);
+    return 1;
+}
+
+/* ---- A pending inbound fail survives a restart ---- */
+
+int test_lsp_pending_fail_survives_restart(void) {
+    unsigned char h[32];
+    memset(h, 0x62, 32);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    f.mgr.persist = &db;
+    htlc_origin_t *o = add_inbound_origin(&f, h);
+    TEST_ASSERT(o != NULL, "inbound HTLC in flight");
+    lsp_channels_origin_save(&f.mgr, o);
+    TEST_ASSERT(o->db_id != 0, "origin saved");
+
+    /* What a restart before the timeout gets back: expiry and upstream name */
+    {
+        lsp_channel_mgr_t again;
+        memset(&again, 0, sizeof(again));
+        again.persist = &db;
+        again.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+        again.htlc_origins_cap = MAX_HTLC_ORIGINS;
+        size_t n = lsp_channels_restore_origins(&again);
+        TEST_ASSERT_EQ(n, 1, "one origin restored");
+        htlc_origin_t *r = &again.htlc_origins[0];
+        TEST_ASSERT(r->active && r->bridge_htlc_id == 31 && r->sender_idx == 0 &&
+                    r->sender_htlc_id == o->sender_htlc_id, "the origin");
+        TEST_ASSERT_EQ(r->cltv_expiry, 500, "with its expiry");
+        TEST_ASSERT(strcmp(r->upstream_id, "1x1x1:0") == 0, "and its upstream name");
+        TEST_ASSERT_EQ(r->fail_pending, 0, "no failure pending yet");
+        free(again.htlc_origins);
+    }
+
+    /* Timeout with the bridge away, then a restart, still without it */
+    int bridge_fd = f.mgr.bridge_fd;
+    f.mgr.bridge_fd = -1;
+    lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, 495);
+    TEST_ASSERT(o->active && o->fail_pending, "fail waits for the bridge");
+
+    lsp_channel_mgr_t again;
+    memset(&again, 0, sizeof(again));
+    again.persist = &db;
+    again.bridge_fd = -1;
+    again.n_channels = 1;
+    again.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    again.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    again.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    TEST_ASSERT(again.entries && again.htlc_origins, "alloc");
+    size_t n = lsp_channels_restore_origins(&again);
+    TEST_ASSERT_EQ(n, 1, "origin restored");
+    htlc_origin_t *r = &again.htlc_origins[0];
+    TEST_ASSERT(r->active && r->fail_pending, "with its pending failure");
+    TEST_ASSERT(lsp_channels_bridge_htlc_pending(&again, h), "hash still in use");
+
+    /* Nothing to send to, nothing changes */
+    lsp_channels_check_bridge_htlc_timeouts(&again, f.lsp, 496);
+    TEST_ASSERT(r->active && r->fail_pending, "still pending without the bridge");
+
+    /* The bridge connects: the failure is delivered and the origin closed,
+       in the database too */
+    again.bridge_fd = bridge_fd;
+    size_t sent = lsp_channels_flush_bridge_fails(&again);
+    TEST_ASSERT_EQ(sent, 1, "delivered");
+    uint64_t id = 0;
+    TEST_ASSERT(next_bridge_fail(&f, h, &id) && id == 31, "BRIDGE_FAIL_HTLC for it");
+    TEST_ASSERT(!r->active, "origin closed");
+    TEST_ASSERT(!lsp_channels_bridge_htlc_pending(&again, h), "hash free again");
+    {
+        lsp_channel_mgr_t third;
+        memset(&third, 0, sizeof(third));
+        third.persist = &db;
+        third.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+        third.htlc_origins_cap = MAX_HTLC_ORIGINS;
+        size_t left = lsp_channels_restore_origins(&third);
+        TEST_ASSERT_EQ(left, 0, "nothing left in the database");
+        free(third.htlc_origins);
+    }
+
+    free(again.entries); free(again.htlc_origins);
+    f.mgr.bridge_fd = bridge_fd;
+    f.mgr.persist = NULL;
+    pay_fixture_free(&f);
+    persist_close(&db);
+    return 1;
+}
+
 /* ---- A fulfil the node could not take stays on record ---- */
 
 int test_lsp_unresolved_fulfil_is_kept(void) {

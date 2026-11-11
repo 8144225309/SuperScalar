@@ -499,21 +499,9 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 fprintf(stderr, "LSP: bridge disconnected during ceremony\n");
                 mgr->bridge_fd = -1;
             } else {
-                /* The channel of the client whose reply is awaited here is
-                   in the middle of an exchange: bridge messages that would
-                   start another one on it are put aside. */
-                size_t busy = mgr->n_channels;
-                for (size_t bi = 0; lsp && lsp->client_fds && bi < mgr->n_channels; bi++)
-                    if (lsp->client_fds[bi] == client_fd) { busy = bi; break; }
-                int was_busy = busy < mgr->n_channels
-                    ? mgr->entries[busy].exchange_in_progress : 0;
-                if (busy < mgr->n_channels)
-                    mgr->entries[busy].exchange_in_progress = 1;
                 servicing = 1;
-                lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
+                lsp_channels_handle_bridge_msg_during_wait(mgr, lsp, client_fd, &bmsg);
                 servicing = 0;
-                if (busy < mgr->n_channels)
-                    mgr->entries[busy].exchange_in_progress = was_busy;
                 cJSON_Delete(bmsg.json);
             }
         }
@@ -1039,6 +1027,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 cJSON_Delete(ack_msg.json);
                 free(old_sender_htlcs);
                 free(old_sender_ptlcs);
+                lsp_channels_abort_unrevoked_htlc(mgr, lsp, sender_idx, sender_ch,
+                                                   new_htlc_id);
                 return 0;
             }
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
@@ -1083,6 +1073,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     free(old_sender_htlcs);
     free(old_sender_ptlcs);
+
+    /* Without the sender's revocation (it did not parse, or was refused)
+       its payment is not made: the HTLC is failed, nothing is recorded and
+       nothing is forwarded. */
+    if (!lsp_channels_peer_revoked(sender_ch)) {
+        lsp_channels_abort_unrevoked_htlc(mgr, lsp, sender_idx, sender_ch,
+                                           new_htlc_id);
+        return 0;
+    }
 
     /* Persist sender channel balance + HTLC atomically (crash-state protection) */
     if (mgr->persist) {
@@ -6117,39 +6116,41 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     fprintf(stderr, "LSP reconnect: retransmitted pending CS "
                             "(cn=%llu) to client %zu\n",
                             (unsigned long long)ch->commitment_number, c);
-                    /* Wait for RAA before RECONNECT_ACK */
+                    /* The pending commitment is settled by the client's
+                       revocation and by nothing else.  Without one that
+                       parses and matches, it stays pending and this
+                       reconnect is refused: the client is disconnected. */
                     wire_msg_t pcs_raa;
-                    if (wire_recv_timeout(new_fd, &pcs_raa, 30) &&
-                        pcs_raa.msg_type == MSG_REVOKE_AND_ACK) {
+                    int pcs_revoked = 0;
+                    if (lsp_channels_recv_client_reply(new_fd, &pcs_raa,
+                                                        MSG_REVOKE_AND_ACK, 30)) {
                         uint32_t pcs_ack_id;
                         unsigned char pcs_rev[32], pcs_np[33];
                         if (wire_parse_revoke_and_ack(pcs_raa.json, &pcs_ack_id,
-                                                        pcs_rev, pcs_np)) {
-                            uint64_t old_pcn = ch->commitment_number - 1;
-                            if (!channel_receive_revocation(ch, old_pcn, pcs_rev)) {
-                                fprintf(stderr, "LSP reconnect: ERROR — invalid "
-                                        "revocation secret for commitment %llu "
-                                        "from client %zu; commitment stays "
-                                        "pending, reconnect refused\n",
-                                        (unsigned long long)old_pcn, c);
-                                cJSON_Delete(pcs_raa.json);
-                                cJSON_Delete(pcs_cs);
-                                return 0;
-                            }
-                        }
-                        cJSON_Delete(pcs_raa.json);
-                        persist_save_pending_cs(pcs_db,
-                            mgr->entries[c].channel_id, 0); /* clear */
-                    } else {
-                        if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
-                        fprintf(stderr, "LSP reconnect: RAA timeout after CS retransmit "
-                                "(client %zu) — clearing stale pending_cs\n", c);
-                        /* Clear pending_cs to prevent infinite retransmit on
-                           every future reconnect.  The client already processed
-                           the CS on the first attempt. */
-                        persist_save_pending_cs(pcs_db,
-                            mgr->entries[c].channel_id, 0);
+                                                        pcs_rev, pcs_np) &&
+                            channel_receive_revocation(ch,
+                                ch->commitment_number - 1, pcs_rev))
+                            pcs_revoked = 1;
+                        secure_zero(pcs_rev, 32);
                     }
+                    if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
+                    if (!pcs_revoked) {
+                        fprintf(stderr, "LSP reconnect: ERROR — no valid "
+                                "revocation from client %zu for the pending "
+                                "commitment %llu; it stays pending, the "
+                                "reconnect is refused and the client "
+                                "disconnected\n", c,
+                                (unsigned long long)ch->commitment_number);
+                        cJSON_Delete(pcs_cs);
+                        wire_close(new_fd);
+                        lsp->client_fds[c] = -1;
+                        if (mgr->readiness)
+                            readiness_clear((readiness_tracker_t *)mgr->readiness,
+                                            (uint32_t)c);
+                        return 0;
+                    }
+                    persist_save_pending_cs(pcs_db,
+                        mgr->entries[c].channel_id, 0);
                 }
                 cJSON_Delete(pcs_cs);
             }
@@ -6612,11 +6613,11 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             free(pfds);
             return 0;
         }
+        /* Bridge messages put aside during an exchange (idle ticks too) */
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
+
         if (ret == 0)
             continue;  /* idle tick -- stay patient; loop_deadline bounds the wait */
-
-        /* Bridge messages put aside during an exchange */
-        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {
@@ -7893,6 +7894,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             } /* if (tnow - last_periodic >= 5) */
         } /* periodic checks block */
 
+        /* Bridge messages put aside during an exchange (idle ticks too) */
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
+
         if (ret == 0) continue;
 
         /* Handle new connections on listen_fd (bridge or client reconnect) */
@@ -8006,9 +8010,6 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Handle admin RPC request */
         if (admin_rpc_slot >= 0 && (pfds[admin_rpc_slot].revents & POLLIN))
             admin_rpc_service((admin_rpc_t *)mgr->admin_rpc);
-
-        /* Bridge messages put aside during an exchange */
-        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
 
         /* Handle bridge messages */
         if (bridge_slot >= 0 && (pfds[bridge_slot].revents & POLLIN)) {

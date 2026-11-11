@@ -1323,6 +1323,9 @@ extern int test_lsp_pay_result_waits_for_busy_channel(void);
 extern int test_lsp_client_cannot_fail_its_own_htlc(void);
 extern int test_lsp_inbound_timeout_reaches_bridge_later(void);
 extern int test_lsp_unresolved_fulfil_is_kept(void);
+extern int test_lsp_unrevoked_htlc_is_failed(void);
+extern int test_lsp_bridge_msg_during_wait_is_deferred(void);
+extern int test_lsp_pending_fail_survives_restart(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -1383,6 +1386,7 @@ extern int test_client_persist_reload(void);
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
 extern int test_reconnect_commitment_mismatch_rollback(void);
 extern int test_reconnect_commitment_mismatch_reject(void);
+extern int test_reconnect_pending_commitment_needs_revocation(void);
 extern int test_reconnect_htlc_replay(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
@@ -3283,6 +3287,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_client_cannot_fail_its_own_htlc);
     RUN_TEST(test_lsp_inbound_timeout_reaches_bridge_later);
     RUN_TEST(test_lsp_unresolved_fulfil_is_kept);
+    RUN_TEST(test_lsp_unrevoked_htlc_is_failed);
+    RUN_TEST(test_lsp_bridge_msg_during_wait_is_deferred);
+    RUN_TEST(test_lsp_pending_fail_survives_restart);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);
@@ -3339,6 +3346,7 @@ static void run_unit_tests(void) {
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
     RUN_TEST(test_reconnect_commitment_mismatch_rollback);
     RUN_TEST(test_reconnect_commitment_mismatch_reject);
+    RUN_TEST(test_reconnect_pending_commitment_needs_revocation);
     RUN_TEST(test_reconnect_htlc_replay);
     RUN_TEST(test_client_handle_async_msg);
 

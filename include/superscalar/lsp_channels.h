@@ -147,7 +147,8 @@ typedef struct {
     char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
     int expiry_warned;          /* outbound: unresolved-near-expiry logged */
     int fail_pending;           /* inbound: failed towards the client, the
-                                   bridge has still to be told */
+                                   bridge has still to be told (saved with
+                                   the origin) */
     int64_t db_id;              /* its row in the database, 0 if not saved */
     int active;
 } htlc_origin_t;
@@ -688,6 +689,31 @@ size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp)
 int lsp_channels_accept_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     channel_t *ch,
                                     const unsigned char *secret32);
+
+/* 1 if the client's revocation of the commitment before the channel's
+   current one has been accepted and stored. */
+int lsp_channels_peer_revoked(const channel_t *ch);
+
+/* The client did not revoke its previous commitment after being offered or
+   offering HTLC `htlc_id`: the HTLC is failed in the LSP's state and the
+   client's connection is dropped.  The caller must stop there: nothing is
+   recorded as paid and nothing is forwarded on the strength of that HTLC. */
+void lsp_channels_abort_unrevoked_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                        size_t client_idx, channel_t *ch,
+                                        uint64_t htlc_id);
+
+/* Handle a bridge message that arrived while the LSP waits for the reply of
+   the client on `waiting_client_fd`.  That client's channel counts as busy
+   for the duration, so the message starts no second exchange on it. */
+void lsp_channels_handle_bridge_msg_during_wait(lsp_channel_mgr_t *mgr,
+                                                 lsp_t *lsp,
+                                                 int waiting_client_fd,
+                                                 const wire_msg_t *msg);
+
+/* Restore the HTLC origins in flight from the database, with their expiry,
+   their name on the Lightning node and whether a failure still has to be
+   reported to the bridge.  Returns how many. */
+size_t lsp_channels_restore_origins(lsp_channel_mgr_t *mgr);
 size_t lsp_channels_load_bridge_fulfils(lsp_channel_mgr_t *mgr);
 
 /* 1 if an HTLC for payment_hash32 is in flight through the bridge in either

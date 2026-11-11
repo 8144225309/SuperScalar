@@ -63,7 +63,7 @@ static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (!wire_recv_timeout(mgr->bridge_fd, &bmsg, 15)) {
                 mgr->bridge_fd = -1;
             } else {
-                lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
+                lsp_channels_handle_bridge_msg_during_wait(mgr, lsp, fd, &bmsg);
                 cJSON_Delete(bmsg.json);
             }
             if (!FD_ISSET(fd, &rfds))
@@ -292,6 +292,13 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     free(old_dest_htlcs);
     old_dest_htlcs = NULL;
+    /* Without the destination's revocation the HTLC is not offered: no
+       fulfil is awaited for it and nothing is recorded. */
+    if (!lsp_channels_peer_revoked(dest_ch)) {
+        lsp_channels_abort_unrevoked_htlc(mgr, lsp, to_client, dest_ch,
+                                           dest_htlc_id);
+        return 0;
+    }
 
     /* Persist dest channel balance + HTLC + PCS/PCP */
     if (mgr->persist) {
@@ -645,6 +652,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     free(old_sender_htlcs);
     old_sender_htlcs = NULL;
+    /* Without the sender's revocation its payment is not made: the HTLC is
+       failed, nothing is recorded and the destination is not touched. */
+    if (!lsp_channels_peer_revoked(sender_ch)) {
+        lsp_channels_abort_unrevoked_htlc(mgr, lsp, from_client, sender_ch,
+                                           sender_htlc_id);
+        return 0;
+    }
 
     /* Persist sender channel balance + HTLC + PCS/PCP */
     if (mgr->persist) {
@@ -781,6 +795,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
     free(old_dest_htlcs);
     old_dest_htlcs = NULL;
+    /* Without the destination's revocation the HTLC is not offered: no
+       fulfil is awaited for it and nothing is recorded. */
+    if (!lsp_channels_peer_revoked(dest_ch)) {
+        lsp_channels_abort_unrevoked_htlc(mgr, lsp, to_client, dest_ch,
+                                           dest_htlc_id);
+        return 0;
+    }
 
     /* Persist dest channel balance + HTLC + PCS/PCP */
     if (mgr->persist) {
@@ -1379,6 +1400,11 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
     free(old_htlcs);
+    if (!lsp_channels_peer_revoked(sender_ch)) {
+        lsp_channels_abort_unrevoked_htlc(mgr, lsp, from_client, sender_ch,
+                                           htlc_id);
+        return 0;
+    }
 
     printf("Pending HTLC added on channel %zu (htlc_id=%llu, amount=%llu sats, "
            "cltv=%u)\n", from_client, (unsigned long long)htlc_id,

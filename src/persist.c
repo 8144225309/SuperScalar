@@ -279,6 +279,12 @@ static const char *SCHEMA_SQL =
     "  active INTEGER DEFAULT 1,"
     "  created_at INTEGER DEFAULT (strftime('%s','now'))"
     ");"
+    "CREATE TABLE IF NOT EXISTS htlc_origin_details ("
+    "  origin_id INTEGER PRIMARY KEY,"
+    "  cltv_expiry INTEGER DEFAULT 0,"
+    "  upstream_id TEXT NOT NULL DEFAULT '',"
+    "  fail_pending INTEGER DEFAULT 0"
+    ");"
     "CREATE TABLE IF NOT EXISTS client_invoices ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  payment_hash TEXT NOT NULL,"
@@ -4822,6 +4828,53 @@ int persist_update_htlc_origin(persist_t *p, int64_t row_id,
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+int persist_save_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t cltv_expiry,
+                                     const char *upstream_id, int fail_pending) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO htlc_origin_details "
+        "(origin_id, cltv_expiry, upstream_id, fail_pending) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)cltv_expiry);
+    sqlite3_bind_text(stmt, 3, upstream_id ? upstream_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, fail_pending ? 1 : 0);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t *cltv_expiry_out,
+                                     char *upstream_id_out, size_t upstream_len,
+                                     int *fail_pending_out) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "SELECT cltv_expiry, upstream_id, fail_pending "
+        "FROM htlc_origin_details WHERE origin_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        if (cltv_expiry_out)
+            *cltv_expiry_out = (uint32_t)sqlite3_column_int64(stmt, 0);
+        if (upstream_id_out && upstream_len > 0) {
+            const unsigned char *up = sqlite3_column_text(stmt, 1);
+            snprintf(upstream_id_out, upstream_len, "%s", up ? (const char *)up : "");
+        }
+        if (fail_pending_out)
+            *fail_pending_out = sqlite3_column_int(stmt, 2);
+    }
+    sqlite3_finalize(stmt);
+    return found;
 }
 
 int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id) {

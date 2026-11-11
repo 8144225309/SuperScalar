@@ -553,6 +553,40 @@ void lsp_channels_origin_save(lsp_channel_mgr_t *mgr, htlc_origin_t *origin) {
         persist_update_htlc_origin(db, origin->db_id,
             origin->bridge_htlc_id, origin->request_id,
             origin->sender_idx, origin->sender_htlc_id);
+    if (origin->db_id != 0)
+        persist_save_htlc_origin_detail(db, origin->db_id, origin->cltv_expiry,
+                                         origin->upstream_id, origin->fail_pending);
+}
+
+size_t lsp_channels_restore_origins(lsp_channel_mgr_t *mgr) {
+    if (!mgr->persist || !mgr->htlc_origins) return 0;
+    persist_t *db = (persist_t *)mgr->persist;
+    static unsigned char hashes[MAX_HTLC_ORIGINS][32];
+    static uint64_t bridge_ids[MAX_HTLC_ORIGINS], request_ids[MAX_HTLC_ORIGINS];
+    static size_t senders[MAX_HTLC_ORIGINS];
+    static uint64_t htlc_ids[MAX_HTLC_ORIGINS];
+    static int64_t row_ids[MAX_HTLC_ORIGINS];
+    size_t n = persist_load_htlc_origins_ids(db, hashes, bridge_ids, request_ids,
+                                              senders, htlc_ids, row_ids,
+                                              MAX_HTLC_ORIGINS);
+    size_t restored = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (mgr->n_htlc_origins >= mgr->htlc_origins_cap) break;
+        htlc_origin_t *o = &mgr->htlc_origins[mgr->n_htlc_origins++];
+        memset(o, 0, sizeof(*o));
+        memcpy(o->payment_hash, hashes[i], 32);
+        o->bridge_htlc_id = bridge_ids[i];
+        o->request_id = request_ids[i];
+        o->sender_idx = senders[i];
+        o->sender_htlc_id = htlc_ids[i];
+        o->db_id = row_ids[i];
+        o->active = 1;
+        persist_load_htlc_origin_detail(db, o->db_id, &o->cltv_expiry,
+                                         o->upstream_id, sizeof(o->upstream_id),
+                                         &o->fail_pending);
+        restored++;
+    }
+    return restored;
 }
 
 void lsp_channels_origin_close(lsp_channel_mgr_t *mgr, htlc_origin_t *origin) {
@@ -636,6 +670,48 @@ int lsp_channels_accept_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             readiness_clear((readiness_tracker_t *)mgr->readiness, (uint32_t)idx);
     }
     return 0;
+}
+
+int lsp_channels_peer_revoked(const channel_t *ch) {
+    if (!ch || ch->commitment_number == 0) return 0;
+    uint64_t old_cn = ch->commitment_number - 1;
+    return ch->received_revocation_valid != NULL &&
+           old_cn < ch->revocations_cap &&
+           ch->received_revocation_valid[old_cn];
+}
+
+void lsp_channels_abort_unrevoked_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                        size_t client_idx, channel_t *ch,
+                                        uint64_t htlc_id) {
+    fprintf(stderr, "LSP: ERROR — client %zu did not revoke its previous "
+            "commitment for HTLC %llu; the HTLC is failed and the payment "
+            "goes no further\n", client_idx, (unsigned long long)htlc_id);
+    channel_fail_htlc(ch, htlc_id);
+    if (lsp && lsp->client_fds && client_idx < mgr->n_channels &&
+        lsp->client_fds[client_idx] >= 0) {
+        wire_close(lsp->client_fds[client_idx]);
+        lsp->client_fds[client_idx] = -1;
+        if (mgr->readiness)
+            readiness_clear((readiness_tracker_t *)mgr->readiness,
+                            (uint32_t)client_idx);
+    }
+}
+
+void lsp_channels_handle_bridge_msg_during_wait(lsp_channel_mgr_t *mgr,
+                                                 lsp_t *lsp,
+                                                 int waiting_client_fd,
+                                                 const wire_msg_t *msg) {
+    size_t busy = mgr->n_channels;
+    for (size_t i = 0; lsp && lsp->client_fds && waiting_client_fd >= 0 &&
+                       i < mgr->n_channels; i++)
+        if (lsp->client_fds[i] == waiting_client_fd) { busy = i; break; }
+    int was_busy = busy < mgr->n_channels
+        ? mgr->entries[busy].exchange_in_progress : 0;
+    if (busy < mgr->n_channels)
+        mgr->entries[busy].exchange_in_progress = 1;
+    lsp_channels_handle_bridge_msg(mgr, lsp, msg);
+    if (busy < mgr->n_channels)
+        mgr->entries[busy].exchange_in_progress = was_busy;
 }
 
 /* Put a bridge message aside until its channel is free again. */
@@ -1505,9 +1581,12 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
                                         "htlc_timeout");
                 }
                 /* The Lightning node holds its HTLC until it hears the
-                   verdict.  The origin stays open (and in the database)
-                   until the bridge has been told: now, or when it is back. */
+                   verdict.  The origin stays open until the bridge has been
+                   told (now, or when it is back), and the pending failure
+                   is written to the database with it, so that a restart in
+                   between does not lose it. */
                 origin->fail_pending = 1;
+                lsp_channels_origin_save(mgr, origin);
             }
             if (mgr->bridge_fd >= 0) {
                 cJSON *fail = wire_build_bridge_fail_htlc(origin->payment_hash,
