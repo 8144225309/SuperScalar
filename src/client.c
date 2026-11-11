@@ -2967,6 +2967,80 @@ fail:
 }
 
 
+int client_leaf_realloc_acceptable(const factory_t *factory,
+                                    uint32_t my_index, int leaf_side,
+                                    const uint64_t *amounts, size_t n_amounts) {
+    if (!factory || !amounts || my_index == 0) return 0;
+    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
+    size_t node_idx = factory->leaf_node_indices[leaf_side];
+    const factory_node_t *leaf = &factory->nodes[node_idx];
+
+    /* Only a signer of this leaf is ever asked to sign it. */
+    if (factory_find_signer_slot(factory, node_idx, my_index) < 0) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — not a signer of "
+                "leaf %d\n", my_index, leaf_side);
+        return 0;
+    }
+
+    /* A trailing P2A anchor is fixed and not part of the reallocation. */
+    size_t n_realloc = leaf->n_outputs;
+    if (n_realloc >= 1 &&
+        leaf->outputs[n_realloc - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(leaf->outputs[n_realloc - 1].script_pubkey,
+               P2A_SPK, P2A_SPK_LEN) == 0)
+        n_realloc--;
+    if (n_amounts != n_realloc) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — %zu amounts for "
+                "%zu outputs\n", my_index, n_amounts, n_realloc);
+        return 0;
+    }
+
+    /* The proposal may only redistribute what the leaf already holds. */
+    uint64_t current_total = 0, new_total = 0;
+    for (size_t i = 0; i < n_realloc; i++) {
+        if (amounts[i] < CHANNEL_DUST_LIMIT_SATS ||
+            amounts[i] > UINT64_MAX - new_total) {
+            fprintf(stderr, "Client %u: REFUSING leaf realloc — output %zu "
+                    "amount out of range\n", my_index, i);
+            return 0;
+        }
+        new_total += amounts[i];
+        current_total += leaf->outputs[i].amount_sats;
+    }
+    if (new_total != current_total) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — amounts sum to "
+                "%llu, leaf holds %llu\n", my_index,
+                (unsigned long long)new_total,
+                (unsigned long long)current_total);
+        return 0;
+    }
+
+    /* Locate this client's channel output from its own copy of the tree; the
+       proposal carries amounts only and gets no say in which one is ours. */
+    size_t my_node;
+    uint32_t my_vout;
+    if (!factory_client_to_leaf(factory, (size_t)(my_index - 1),
+                                 &my_node, &my_vout) ||
+        my_node != node_idx || my_vout >= n_realloc) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — own channel "
+                "output is not on leaf %d\n", my_index, leaf_side);
+        return 0;
+    }
+
+    /* A reallocation moves LSP liquidity stock toward channels.  It must
+       never reduce the output that funds this client's channel: every
+       commitment the client holds spends that output at its current value. */
+    uint64_t my_current = leaf->outputs[my_vout].amount_sats;
+    if (amounts[my_vout] < my_current) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — would shrink own "
+                "channel output from %llu to %llu sats\n", my_index,
+                (unsigned long long)my_current,
+                (unsigned long long)amounts[my_vout]);
+        return 0;
+    }
+    return 1;
+}
+
 int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 factory_t *factory,
@@ -2988,9 +3062,16 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
     }
     int wire_poison_offered = (propose_rc == 2);
 
+    /* Check the proposal against our own tree before touching any local
+       state, so a refusal leaves the signed leaf exactly as it was. */
+    if (!client_leaf_realloc_acceptable(factory, my_index, leaf_side,
+                                         amounts, n_amounts)) {
+        client_send_error(fd, "leaf reallocation refused");
+        return 0;
+    }
+
     /* Snapshot OLD leaf state BEFORE the realloc — needed to deterministically
        prep the wire-ceremony poison TX in lockstep with the LSP. */
-    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
     size_t pre_node_idx_r = factory->leaf_node_indices[leaf_side];
     factory_node_t *pre_leaf_r = &factory->nodes[pre_node_idx_r];
     unsigned char pre_old_leaf_txid_r[32];

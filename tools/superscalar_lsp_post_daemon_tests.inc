@@ -1119,12 +1119,17 @@
                 orig_total += orig_amounts[k];
             }
 
-            /* Build redistributed amounts: shift 20% from slot 1 to slot 2 */
-            uint64_t shift = orig_amounts[1] / 5;
+            /* Build redistributed amounts: move 20% of the L-stock (slot 2)
+               into the second client's channel output (slot 1).  Stock may
+               only flow toward channels; clients refuse to sign a realloc
+               that shrinks their own output. */
+            uint64_t shift = orig_amounts[2] / 5;
+            if (orig_amounts[2] - shift < 546)
+                shift = orig_amounts[2] > 546 ? orig_amounts[2] - 546 : 0;
             uint64_t new_amounts[3];
             new_amounts[0] = orig_amounts[0];
-            new_amounts[1] = orig_amounts[1] - shift;
-            new_amounts[2] = orig_amounts[2] + shift;
+            new_amounts[1] = orig_amounts[1] + shift;
+            new_amounts[2] = orig_amounts[2] - shift;
 
             printf("Reallocating leaf 0: [%llu, %llu, %llu] → [%llu, %llu, %llu]\n",
                    (unsigned long long)orig_amounts[0],

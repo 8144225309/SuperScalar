@@ -204,6 +204,16 @@ int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
 
+/* Decide whether an LSP-proposed leaf reallocation is safe for this client
+   to sign.  Evaluated entirely against the client's own tree: the client
+   must be a signer of the leaf, the amounts must cover exactly the leaf's
+   reallocatable outputs and conserve their total, and the output funding
+   this client's channel (located with factory_client_to_leaf, never from the
+   message) must not be smaller than it is now.  Returns 1 if acceptable. */
+int client_leaf_realloc_acceptable(const factory_t *factory,
+                                    uint32_t my_index, int leaf_side,
+                                    const uint64_t *amounts, size_t n_amounts);
+
 /* Handle a LEAF_REALLOC_PROPOSE from the LSP.
    Reads PROPOSE, sends NONCE, reads ALL_NONCES, sends PSIG, reads DONE.
    Updates local factory amounts.
