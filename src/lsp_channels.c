@@ -587,8 +587,68 @@ static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 }
 
+int lsp_channels_defer_msg(lsp_channel_mgr_t *mgr, size_t client_idx,
+                            wire_msg_t *msg) {
+    if (!mgr || !msg) return 0;
+    if (mgr->n_deferred_msgs >= LSP_DEFERRED_MSGS_MAX) return 0;
+    if (mgr->n_deferred_msgs == mgr->deferred_msgs_cap) {
+        size_t cap = mgr->deferred_msgs_cap ? mgr->deferred_msgs_cap * 2 : 8;
+        lsp_deferred_msg_t *q = realloc(mgr->deferred_msgs, cap * sizeof(*q));
+        if (!q) return 0;
+        mgr->deferred_msgs = q;
+        mgr->deferred_msgs_cap = cap;
+    }
+    lsp_deferred_msg_t *slot = &mgr->deferred_msgs[mgr->n_deferred_msgs++];
+    slot->client_idx = client_idx;
+    slot->msg = *msg;
+    msg->json = NULL;
+    return 1;
+}
+
+size_t lsp_channels_deferred_count(const lsp_channel_mgr_t *mgr) {
+    return mgr ? mgr->n_deferred_msgs : 0;
+}
+
+int lsp_channels_drain_deferred(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || mgr->n_deferred_msgs == 0) return 0;
+
+    /* Detach first: a handler may hold further messages, which then wait
+       for the next drain. */
+    lsp_deferred_msg_t *q = mgr->deferred_msgs;
+    size_t n = mgr->n_deferred_msgs;
+    mgr->deferred_msgs = NULL;
+    mgr->n_deferred_msgs = 0;
+    mgr->deferred_msgs_cap = 0;
+
+    int handled = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t c = q[i].client_idx;
+        if (lsp && c < mgr->n_channels && lsp->client_fds[c] >= 0) {
+            if (!lsp_channels_handle_msg(mgr, lsp, c, &q[i].msg))
+                fprintf(stderr, "LSP: handle_msg failed for held msg 0x%02x "
+                        "from client %zu\n", q[i].msg.msg_type, c);
+            handled++;
+        }
+        if (q[i].msg.json) cJSON_Delete(q[i].msg.json);
+    }
+    free(q);
+    return handled;
+}
+
+void lsp_channels_free_deferred(lsp_channel_mgr_t *mgr) {
+    if (!mgr) return;
+    for (size_t i = 0; i < mgr->n_deferred_msgs; i++)
+        if (mgr->deferred_msgs[i].msg.json)
+            cJSON_Delete(mgr->deferred_msgs[i].msg.json);
+    free(mgr->deferred_msgs);
+    mgr->deferred_msgs = NULL;
+    mgr->n_deferred_msgs = 0;
+    mgr->deferred_msgs_cap = 0;
+}
+
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr) {
     if (!mgr) return;
+    lsp_channels_free_deferred(mgr);
     if (mgr->entries) {
         for (size_t i = 0; i < mgr->n_channels; i++)
             channel_cleanup(&mgr->entries[i].channel);
@@ -5442,6 +5502,13 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
+    case MSG_JIT_REJECT:
+        /* A decline that arrives when no offer is pending (the LSP already
+           gave up waiting): nothing to do. */
+        printf("LSP: client %zu declined a JIT offer that is no longer pending\n",
+               client_idx);
+        return 1;
+
     case MSG_LSPS_REQUEST: {
         lsps_ctx_t lsps_ctx = {
             .mgr        = mgr,
@@ -6856,6 +6923,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     while (!(*shutdown_flag)) {
+        /* Messages held back during a blocking exchange come first, so each
+           client's messages are handled in the order they arrived. */
+        lsp_channels_drain_deferred(mgr, lsp);
+
         /* Drain any connections queued during ceremonies */
         while (mgr->n_pending_reconnects > 0) {
             mgr->n_pending_reconnects--;
@@ -7636,6 +7707,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             /* JIT channel trigger: factory expired + client online + no JIT */
             lsp_channels_jit_expiry_trigger(mgr, lsp);
+            /* Anything a client sent while an offer was pending is handled
+               before newer messages are read below. */
+            lsp_channels_drain_deferred(mgr, lsp);
 
             /* Check JIT funding confirmation (FUNDING → OPEN) */
             jit_channels_check_funding(mgr);

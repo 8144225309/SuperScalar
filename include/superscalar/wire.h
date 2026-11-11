@@ -71,6 +71,7 @@
 #define MSG_JIT_ACCEPT          0x52  /* Client -> LSP: accept JIT channel */
 #define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
 #define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
+#define MSG_JIT_REJECT          0x57  /* Client -> LSP: decline a JIT channel offer */
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
@@ -879,6 +880,13 @@ cJSON *wire_build_jit_accept(size_t client_idx,
 int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
                             size_t *client_idx,
                             secp256k1_pubkey *client_pubkey);
+
+/* Client -> LSP: JIT_REJECT {client_idx, reason}.  The client declines the
+   offer; the LSP stops waiting for JIT_ACCEPT. */
+cJSON *wire_build_jit_reject(size_t client_idx, const char *reason);
+
+int wire_parse_jit_reject(const cJSON *json, size_t *client_idx,
+                            char *reason, size_t reason_len);
 
 /* LSP -> Client: JIT_READY {jit_channel_id, funding_txid, vout, amount,
                               local_amount, remote_amount} */

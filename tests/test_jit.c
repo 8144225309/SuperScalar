@@ -1713,3 +1713,139 @@ int test_jit_client_migrate_keeps_factory_watch(void) {
     persist_close(&db);
     return 1;
 }
+
+/* --- Declining an offer, and messages that arrive while one is pending --- */
+
+int test_jit_reject_round_trip(void) {
+    cJSON *j = wire_build_jit_reject(3, "not accepted");
+    TEST_ASSERT(j != NULL, "build");
+    size_t idx = 0;
+    char reason[32];
+    TEST_ASSERT(wire_parse_jit_reject(j, &idx, reason, sizeof(reason)), "parse");
+    TEST_ASSERT_EQ((long)idx, 3, "client_idx");
+    TEST_ASSERT(strcmp(reason, "not accepted") == 0, "reason");
+    cJSON_Delete(j);
+
+    j = cJSON_CreateObject();
+    TEST_ASSERT(!wire_parse_jit_reject(j, &idx, reason, sizeof(reason)),
+                "client_idx is required");
+    cJSON_Delete(j);
+
+    TEST_ASSERT(strcmp(wire_msg_type_name(MSG_JIT_REJECT), "JIT_REJECT") == 0,
+                "JIT_REJECT name");
+    return 1;
+}
+
+typedef struct {
+    int fd;
+    int n_other;        /* unrelated messages to send before the decline */
+} reject_peer_t;
+
+/* Takes the offer, optionally sends unrelated messages, then declines. */
+static void *peer_decline_offer(void *arg) {
+    reject_peer_t *p = (reject_peer_t *)arg;
+    static int ok = 1;
+    wire_msg_t msg;
+    if (!wire_recv(p->fd, &msg)) return NULL;
+    int is_offer = msg.msg_type == MSG_JIT_OFFER;
+    cJSON_Delete(msg.json);
+    if (!is_offer) return NULL;
+
+    for (int i = 0; i < p->n_other; i++) {
+        cJSON *pong = cJSON_CreateObject();
+        cJSON_AddNumberToObject(pong, "seq", 100 + i);
+        wire_send(p->fd, MSG_PONG, pong);
+        cJSON_Delete(pong);
+    }
+    cJSON *rej = wire_build_jit_reject(0, "not accepted");
+    wire_send(p->fd, MSG_JIT_REJECT, rej);
+    cJSON_Delete(rej);
+    return &ok;
+}
+
+int test_jit_reject_ends_wait(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    fx.mgr.jit_enabled = 1;
+
+    reject_peer_t peer = { .fd = fx.peer_fd[0], .n_other = 0 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, peer_decline_offer, &peer);
+
+    time_t t0 = time(NULL);
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "a declined offer opens nothing");
+    time_t waited = time(NULL) - t0;
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "client received the offer and declined");
+    TEST_ASSERT(waited < 10, "the LSP stops waiting when the client declines");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "nothing held");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+int test_jit_wait_holds_other_messages(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    fx.mgr.jit_enabled = 1;
+
+    reject_peer_t peer = { .fd = fx.peer_fd[0], .n_other = 2 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, peer_decline_offer, &peer);
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "a declined offer opens nothing");
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "client received the offer and declined");
+
+    /* Both unrelated messages were kept, in order, with their content. */
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 2,
+                   "messages sent during the wait are held, not dropped");
+    for (int i = 0; i < 2; i++) {
+        const lsp_deferred_msg_t *d = &fx.mgr.deferred_msgs[i];
+        TEST_ASSERT_EQ((long)d->client_idx, 0, "held for client 0");
+        TEST_ASSERT_EQ(d->msg.msg_type, MSG_PONG, "type preserved");
+        const cJSON *seq = cJSON_GetObjectItem(d->msg.json, "seq");
+        TEST_ASSERT(seq && (int)seq->valuedouble == 100 + i, "content and order preserved");
+    }
+
+    /* The main loop then handles them through the normal dispatcher. */
+    fx.mgr.entries[0].offline_detected = 1;
+    fx.mgr.entries[0].last_message_time = 0;
+    TEST_ASSERT_EQ(lsp_channels_drain_deferred(&fx.mgr, fx.lsp), 2, "both handled");
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "queue is empty");
+    TEST_ASSERT(fx.mgr.entries[0].last_message_time != 0 &&
+                fx.mgr.entries[0].offline_detected == 0,
+                "the dispatcher saw the held messages");
+    TEST_ASSERT_EQ(lsp_channels_drain_deferred(&fx.mgr, fx.lsp), 0, "nothing left");
+
+    /* A held message whose client has gone is dropped at drain time, and a
+       full queue refuses further messages without taking them. */
+    wire_msg_t m = { .msg_type = MSG_PONG, .json = cJSON_CreateObject() };
+    TEST_ASSERT(lsp_channels_defer_msg(&fx.mgr, 0, &m), "hold one");
+    TEST_ASSERT(m.json == NULL, "the queue owns the message");
+    close(fx.lsp->client_fds[0]);
+    fx.lsp->client_fds[0] = -1;
+    TEST_ASSERT_EQ(lsp_channels_drain_deferred(&fx.mgr, fx.lsp), 0,
+                   "not dispatched for a disconnected client");
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "queue is empty");
+
+    for (int i = 0; i < LSP_DEFERRED_MSGS_MAX; i++) {
+        wire_msg_t f = { .msg_type = MSG_PONG, .json = cJSON_CreateObject() };
+        TEST_ASSERT(lsp_channels_defer_msg(&fx.mgr, 0, &f), "fill");
+    }
+    wire_msg_t extra = { .msg_type = MSG_PONG, .json = cJSON_CreateObject() };
+    TEST_ASSERT(!lsp_channels_defer_msg(&fx.mgr, 0, &extra), "full queue refuses");
+    TEST_ASSERT(extra.json != NULL, "a refused message stays with the caller");
+    cJSON_Delete(extra.json);
+    lsp_channels_free_deferred(&fx.mgr);
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "freed");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}

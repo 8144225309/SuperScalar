@@ -1835,6 +1835,10 @@ handle_message:
             if (!cbd->auto_accept_jit) {
                 printf("Client %u: rejecting JIT offer "
                        "(use --auto-accept-jit to enable)\n", my_index);
+                /* Tell the LSP, so it does not wait out its timeout. */
+                cJSON *reject = wire_build_jit_reject(jit_cidx, "not accepted");
+                wire_send(fd, MSG_JIT_REJECT, reject);
+                cJSON_Delete(reject);
                 break;
             }
 

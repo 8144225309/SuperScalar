@@ -112,6 +112,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x52: return "JIT_ACCEPT";
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
+    case 0x57: return "JIT_REJECT";
     case 0x55: return "STATE_ADVANCE_PROPOSE";
     case 0x73: return "SUBFACTORY_PROPOSE";
     case 0x74: return "SUBFACTORY_NONCE";
@@ -2333,6 +2334,26 @@ int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
         if (!hex_to_pubkey(ctx, client_pubkey, pk->valuestring))
             return 0;
     }
+    return 1;
+}
+
+cJSON *wire_build_jit_reject(size_t client_idx, const char *reason) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "client_idx", (double)client_idx);
+    cJSON_AddStringToObject(j, "reason", reason ? reason : "");
+    return j;
+}
+
+int wire_parse_jit_reject(const cJSON *json, size_t *client_idx,
+                            char *reason, size_t reason_len) {
+    cJSON *ci = cJSON_GetObjectItem(json, "client_idx");
+    cJSON *rs = cJSON_GetObjectItem(json, "reason");
+    if (!wire_check_nonneg(ci))
+        return 0;
+    *client_idx = (size_t)ci->valuedouble;
+    if (reason && reason_len > 0)
+        snprintf(reason, reason_len, "%s",
+                 (rs && cJSON_IsString(rs) && rs->valuestring) ? rs->valuestring : "");
     return 1;
 }
 

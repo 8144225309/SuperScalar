@@ -161,11 +161,21 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     }
     cJSON_Delete(offer);
 
-    /* Wait for MSG_JIT_ACCEPT — drain any stale messages (e.g. REGISTER_INVOICE
-       from demo phase) that arrive before the accept.  30s total timeout. */
+    /* Wait for the client's answer: MSG_JIT_ACCEPT, or MSG_JIT_REJECT which
+       ends the wait at once.  Any other message the client sends meanwhile
+       belongs to the normal message flow: it is held for the caller's loop
+       (lsp_channels_drain_deferred), never dropped.  30s total timeout. */
     wire_msg_t accept_msg;
     int got_accept = 0;
     for (int attempt = 0; attempt < 30; attempt++) {
+        if (lsp_channels_deferred_count(mgr) >= LSP_DEFERRED_MSGS_MAX) {
+            /* No room to hold another message: stop reading and give up,
+               leaving whatever is unread on the connection. */
+            fprintf(stderr, "LSP JIT: too many messages held while waiting for "
+                    "client %zu; abandoning the offer\n", client_idx);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(lsp->client_fds[client_idx], &rfds);
@@ -181,10 +191,25 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
             got_accept = 1;
             break;
         }
-        /* Discard stale message and keep waiting */
-        fprintf(stderr, "LSP JIT: discarding stale msg 0x%02x while waiting for JIT_ACCEPT\n",
-                accept_msg.msg_type);
-        cJSON_Delete(accept_msg.json);
+        if (accept_msg.msg_type == MSG_JIT_REJECT) {
+            size_t rej_idx = 0;
+            char rej_reason[128] = "";
+            wire_parse_jit_reject(accept_msg.json, &rej_idx,
+                                    rej_reason, sizeof(rej_reason));
+            printf("LSP JIT: client %zu declined the JIT offer (%s)\n",
+                   client_idx, rej_reason);
+            cJSON_Delete(accept_msg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        /* Not an answer to the offer: hold it for the main loop. */
+        if (!lsp_channels_defer_msg(mgr, client_idx, &accept_msg)) {
+            fprintf(stderr, "LSP JIT: cannot hold msg 0x%02x from client %zu; "
+                    "abandoning the offer\n", accept_msg.msg_type, client_idx);
+            cJSON_Delete(accept_msg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
     }
     if (!got_accept) {
         fprintf(stderr, "LSP JIT: timeout waiting for JIT_ACCEPT from client %zu\n",
@@ -932,4 +957,5 @@ void jit_channels_cleanup(void *mgr_ptr) {
         mgr->jit_channels = NULL;
     }
     mgr->n_jit_channels = 0;
+    lsp_channels_free_deferred(mgr);
 }

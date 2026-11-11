@@ -126,6 +126,13 @@ typedef struct {
     size_t n_jit_channels;
     size_t jit_channels_cap;
     int jit_enabled;               /* 1 = JIT opens allowed (experimental opt-in); default 0 */
+
+    /* Client messages read while a blocking exchange was waiting for a
+       different message.  Handled, in arrival order, by
+       lsp_channels_drain_deferred(). */
+    struct lsp_deferred_msg *deferred_msgs;
+    size_t n_deferred_msgs;
+    size_t deferred_msgs_cap;
     uint64_t jit_funding_sats;     /* per-client JIT funding amount */
 
     /* Factory arity (Upgrade 2) */
@@ -218,6 +225,33 @@ typedef struct {
    lsp_seckey32: LSP's secret key (used to derive channel basepoints).
    Returns 1 on success. */
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr);
+
+/* --- Messages held back during a blocking exchange --- */
+
+typedef struct lsp_deferred_msg {
+    size_t client_idx;
+    wire_msg_t msg;
+} lsp_deferred_msg_t;
+
+/* Most messages that may be held at once. */
+#define LSP_DEFERRED_MSGS_MAX 256
+
+/* Hold a message from client_idx for later handling.  On success (1) the
+   queue owns msg->json and msg->json is set to NULL.  Returns 0, leaving msg
+   untouched, if the queue is full or memory is exhausted. */
+int lsp_channels_defer_msg(lsp_channel_mgr_t *mgr, size_t client_idx,
+                            wire_msg_t *msg);
+
+/* Number of messages currently held. */
+size_t lsp_channels_deferred_count(const lsp_channel_mgr_t *mgr);
+
+/* Pass every held message to lsp_channels_handle_msg(), oldest first, and
+   empty the queue.  A message whose client has disconnected is dropped.
+   Returns the number of messages handled. */
+int lsp_channels_drain_deferred(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Free the queue and everything in it without handling. */
+void lsp_channels_free_deferred(lsp_channel_mgr_t *mgr);
 
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
