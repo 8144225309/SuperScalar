@@ -10,22 +10,38 @@
 # on chain would no longer carry the output the commitments spend and the
 # clients' balances would be stranded.
 #
-# Two scenarios per invocation:
+# Three scenarios per invocation:
 #
-#   lsp_exit      the LSP routes the payment and force-closes the factory
-#                 itself; each client then force-closes from its own DB.
-#   client_exit   the LSP is killed after the payment; the clients force-close
-#                 alone (tree + commitment from their own DBs).  Afterwards a
-#                 standalone watchtower runs on the LSP's watch DB and the LSP
-#                 is restarted on its DB: neither may treat a leaf as a stale
-#                 state or report a balance mismatch.
+#   lsp_exit          the LSP routes the payment and force-closes the factory
+#                     itself; each client then force-closes from its own DB.
+#   client_exit       the LSP is killed after the payment; the clients
+#                     force-close alone (tree + commitment from their own
+#                     DBs).  Afterwards a standalone watchtower runs on the
+#                     LSP's watch DB and the LSP is restarted on its DB:
+#                     neither may treat a leaf as a stale state or report a
+#                     balance mismatch.
+#   advance_refused   after the payment the LSP proposes a leaf advance
+#                     (--test-leaf-advance) to clients started WITHOUT
+#                     --test-allow-tree-advance.  The client must refuse, the
+#                     LSP's attempt must fail, and the clients must still be
+#                     able to force-close alone.
 #
-# Checks, in both scenarios:
-#   - the payment settled and no leaf-advance ceremony ran (logs);
-#   - no PS chain entry beyond chain[0] and no advanced per-leaf DW state in
-#     any DB; LSP and client agree on each channel's funding outpoint;
-#   - each client's latest commitment confirms, spends that funding outpoint,
-#     and pays the client exactly its channel balance.
+# Checks, in every scenario:
+#   - the payment settled and no leaf advance completed (logs); in the first
+#     two scenarios none may even be proposed;
+#   - no PS chain entry beyond chain[0] and no advanced DW state in any DB
+#     (a query that fails or returns nothing where a row must exist is a
+#     failure); each client's persisted tree still holds the leaf its channel
+#     is funded by; LSP and client agree on each channel's funding outpoint;
+#   - each client's latest commitment confirms and spends that outpoint; its
+#     outputs are exactly {client balance, LSP balance less the anchor, the
+#     anchor}, and the output paying the client is a taproot script that no
+#     other output shares.  (The script itself is derived from per-commitment
+#     keys the test cannot recompute, so it is identified by role, not
+#     recomputed.)
+#   - a payment client that ends on its own (its LSP exited) ends the way a
+#     client that lost its LSP does: "disconnected", status 1.  Any other
+#     status (a signal, a sanitizer exit code) is a failure.
 #
 # The leaf type is the LSP's default unless ARITY is set (ARITY=1 runs the
 # per-client DW leaf: `--arity 1`).
@@ -41,8 +57,11 @@
 #   BUILD_DIR   directory holding superscalar_lsp / superscalar_client /
 #               superscalar_watchtower (argument, or $BUILD_DIR, or ./build)
 #   ARITY       leaf arity passed to the LSP (default: unset = LSP default)
-#   RPCPORT     RPC port of the private bitcoind (default 18643)
-#   PORT        first LSP listen port (default 29975)
+#   RPCPORT     RPC port of the private bitcoind (default 18643 + ARITY)
+#   PORT        first LSP listen port; three consecutive ports are used
+#               (default 29975 + 10 * ARITY)
+#               The defaults differ per ARITY and the work directory is
+#               unique per run, so runs for different arities do not collide.
 #   KEEP_TMP=1  keep the work directory
 #
 # Requires bitcoind, bitcoin-cli, sqlite3 and python3 in PATH.
@@ -54,8 +73,11 @@ CLIENT_BIN="$BUILD_DIR/superscalar_client"
 WT_BIN="$BUILD_DIR/superscalar_watchtower"
 
 ARITY="${ARITY:-}"
-RPCPORT="${RPCPORT:-18643}"
-PORT="${PORT:-29975}"
+case "${ARITY:-0}" in
+    ''|*[!0-9]*) echo "FAIL: ARITY must be a number"; exit 1 ;;
+esac
+RPCPORT="${RPCPORT:-$((18643 + ${ARITY:-0}))}"
+PORT="${PORT:-$((29975 + 10 * ${ARITY:-0}))}"
 AMOUNT="${AMOUNT:-200000}"
 FEE="${FEE:-1100}"
 PAY_SATS=5000
@@ -80,13 +102,15 @@ BCLI="bitcoin-cli -regtest -datadir=$BTC_DIR -rpcuser=$RU -rpcpassword=$RP -rpcp
 RPC_ARGS=(--rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPCPORT")
 
 PIDS=()
+CLIENT_PIDS=()
 MINER_PID=""
 FAILS=0
 kill_procs(){
     [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null
     MINER_PID=""
-    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
+    for p in "${PIDS[@]:-}" "${CLIENT_PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
     PIDS=()
+    CLIENT_PIDS=()
     wait 2>/dev/null
 }
 cleanup(){
@@ -109,7 +133,12 @@ stop_miner(){ [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null; wait "$MI
 sk(){ printf "%064x" $(( $1 + 2 )); }
 confs(){ $BCLI getrawtransaction "$1" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1; }
 
-# txfield <rawhex> <field>: txid | in_txid | in_vout | pays <sats> (vout index paying exactly <sats>, or -1)
+# txfield <rawhex> <field>: txid | in_txid | in_vout |
+#   pays <sats>            vout index paying exactly <sats>, or -1
+#   shape <local> <remote> "ok" when the outputs are exactly: one paying
+#                          <local> to a taproot script no other output uses,
+#                          one P2A anchor, and one paying the rest of
+#                          <local>+<remote>; otherwise a description
 txfield(){
     $BCLI decoderawtransaction "$1" 2>/dev/null | python3 -c '
 import json, sys
@@ -123,6 +152,22 @@ elif f == "pays":
     want = int(sys.argv[2])
     hits = [o["n"] for o in d["vout"] if int(round(o["value"] * 1e8)) == want]
     print(hits[0] if hits else -1)
+elif f == "shape":
+    local, remote = int(sys.argv[2]), int(sys.argv[3])
+    outs = [(int(round(o["value"] * 1e8)), o["scriptPubKey"]["hex"],
+             o["scriptPubKey"].get("type", "")) for o in d["vout"]]
+    anchors = [o for o in outs if o[1] == "51024e73"]
+    mine = [o for o in outs if o[0] == local and o[1] != "51024e73"]
+    problems = []
+    if len(outs) != 3: problems.append("%d outputs, expected 3" % len(outs))
+    if len(anchors) != 1: problems.append("%d anchor outputs" % len(anchors))
+    if len(mine) != 1: problems.append("%d outputs of %d sats" % (len(mine), local))
+    if sum(o[0] for o in outs) != local + remote:
+        problems.append("outputs sum to %d, balances to %d" % (sum(o[0] for o in outs), local + remote))
+    if len(mine) == 1:
+        if mine[0][2] != "witness_v1_taproot": problems.append("client output is %s" % mine[0][2])
+        if sum(1 for o in outs if o[1] == mine[0][1]) != 1: problems.append("client script is shared")
+    print("ok" if not problems else "; ".join(problems))
 ' "${@:2}" 2>/dev/null
 }
 
@@ -141,18 +186,41 @@ ARITY_ARGS=()
 [ -n "$ARITY" ] && ARITY_ARGS=(--arity "$ARITY")
 echo "=== payment must not advance the leaf (leaf type: ${ARITY:+--arity }${ARITY:-LSP default}) ==="
 
-# no_advance_in_db <db> <label>
+# no_advance_in_db <db> <label> <lsp|client>
+# Every query must succeed.  The LSP writes its DW counter row when the
+# factory is created, so there it must exist and read epoch 0 with every leaf
+# at state 0.  A client writes that row only when it takes part in an advance,
+# so there it must be absent or all zero, and the client's persisted tree must
+# still contain the leaf transaction its channel is funded by.
 no_advance_in_db(){
-    local db=$1 label=$2 n ls
-    n=$(sqlite3 "$db" "SELECT COUNT(*) FROM ps_leaf_chains WHERE chain_pos >= 1;" 2>/dev/null)
-    if [ "${n:-x}" = 0 ]; then note_ok "$label: no PS chain entry beyond chain[0]"
-    else note_fail "$label: $n PS chain entr(ies) with chain_pos >= 1"; fi
-    ls=$(sqlite3 "$db" "SELECT leaf_states FROM dw_counter_state;" 2>/dev/null | tr -d '0,\n ')
-    if [ -z "$ls" ]; then note_ok "$label: per-leaf DW states all at 0"
-    else note_fail "$label: per-leaf DW state advanced ($(sqlite3 "$db" 'SELECT leaf_states FROM dw_counter_state;' 2>/dev/null))"; fi
+    local db=$1 label=$2 role=$3 n dw rc
+    n=$(sqlite3 "$db" "SELECT COUNT(*) FROM ps_leaf_chains WHERE chain_pos >= 1;" 2>/dev/null); rc=$?
+    if [ "$rc" = 0 ] && [ "$n" = 0 ]; then note_ok "$label: no PS chain entry beyond chain[0]"
+    else note_fail "$label: PS chain query rc=$rc, entries with chain_pos >= 1: '${n}'"; fi
+
+    dw=$(sqlite3 "$db" "SELECT current_epoch || ':' || leaf_states FROM dw_counter_state;" 2>/dev/null); rc=$?
+    if [ "$rc" != 0 ]; then
+        note_fail "$label: DW counter query failed (rc=$rc)"
+    elif [ -z "$dw" ]; then
+        if [ "$role" = lsp ]; then note_fail "$label: no DW counter row"
+        else note_ok "$label: no DW counter row (never took part in an advance)"; fi
+    elif [ -z "$(printf '%s' "$dw" | tr -d '0,:\n ')" ]; then
+        note_ok "$label: DW counter at epoch 0, every leaf at state 0 ($dw)"
+    else
+        note_fail "$label: DW counter advanced (epoch:leaf_states = $dw)"
+    fi
+
+    if [ "$role" = client ]; then
+        n=$(sqlite3 "$db" "SELECT COUNT(*) FROM tree_nodes WHERE txid = (SELECT funding_txid FROM channels LIMIT 1);" 2>/dev/null); rc=$?
+        if [ "$rc" = 0 ] && [ "${n:-0}" -ge 1 ] 2>/dev/null; then
+            note_ok "$label: persisted tree holds the leaf that funds the channel"
+        else
+            note_fail "$label: persisted tree does not hold the channel's funding leaf (rc=$rc, n='${n}')"
+        fi
+    fi
 }
 
-# run_scenario <lsp_exit|client_exit> <port>
+# run_scenario <lsp_exit|client_exit|advance_refused> <port>
 run_scenario(){
     local MODE=$1 LPORT=$2
     local D="$TMPDIR/$MODE"
@@ -164,12 +232,11 @@ run_scenario(){
         ${ARITY_ARGS[@]+"${ARITY_ARGS[@]}"} --amount "$AMOUNT" --fee-rate "$FEE" --confirm-timeout 600
         --seckey "$LSP_SECKEY" "${RPC_ARGS[@]}" --wallet "$WALLET" --db "$D/lsp.db")
     local LSP_RUN=(--payments 1)
-    if [ "$MODE" = lsp_exit ]; then
-        LSP_RUN+=(--force-close)
-    else
-        LSP_ARGS+=(--wt-db "$D/wt.db")
-        LSP_RUN+=(--daemon)
-    fi
+    case "$MODE" in
+        lsp_exit)        LSP_RUN+=(--force-close) ;;
+        client_exit)     LSP_ARGS+=(--wt-db "$D/wt.db"); LSP_RUN+=(--daemon) ;;
+        advance_refused) LSP_RUN+=(--test-leaf-advance) ;;
+    esac
 
     "$LSP_BIN" "${LSP_ARGS[@]}" "${LSP_RUN[@]}" > "$D/lsp.log" 2>&1 &
     local LSP_PID=$!
@@ -191,22 +258,56 @@ run_scenario(){
             --seckey "$(sk $i)" --fee-rate "$FEE" --lsp-balance-pct 50 \
             --lsp-pubkey "$LSP_PUB" --participant-id $((i + 1)) "${RPC_ARGS[@]}" \
             --wallet "$WALLET" --db "$D/c$i.db" "${CX[@]}" > "$D/c$i.log" 2>&1 &
-        PIDS+=($!)
+        CLIENT_PIDS+=($!)
         sleep 0.5
     done
     start_miner
 
-    if [ "$MODE" = lsp_exit ]; then
+    if [ "$MODE" != client_exit ]; then
         for _ in $(seq 1 450); do kill -0 "$LSP_PID" 2>/dev/null || break; sleep 2; done
         if kill -0 "$LSP_PID" 2>/dev/null; then
             tail -30 "$D/lsp.log"; note_fail "$MODE: LSP still running after 900s"; kill_procs; return
         fi
         wait "$LSP_PID"; local rc=$?
-        if [ "$rc" = 0 ] && grep -q "FORCE CLOSE COMPLETE" "$D/lsp.log"; then
-            note_ok "LSP routed the payment and force-closed (rc=0)"
+        if [ "$MODE" = lsp_exit ]; then
+            if [ "$rc" = 0 ] && grep -q "FORCE CLOSE COMPLETE" "$D/lsp.log"; then
+                note_ok "LSP routed the payment and force-closed (rc=0)"
+            else
+                tail -30 "$D/lsp.log"; note_fail "$MODE: LSP force-close did not complete (rc=$rc)"
+            fi
         else
-            tail -30 "$D/lsp.log"; note_fail "$MODE: LSP force-close did not complete (rc=$rc)"
+            if grep -q "LEAF_ADVANCE_PROPOSE sent" "$D/lsp.log"; then
+                note_ok "LSP proposed a leaf advance after the payment"
+            else
+                tail -30 "$D/lsp.log"; note_fail "$MODE: LSP never proposed the leaf advance"
+            fi
+            if cat "$D/c0.log" "$D/c1.log" | grep -q "REFUSING leaf advance"; then
+                note_ok "client refused the leaf advance"
+            else
+                note_fail "$MODE: no client refused the leaf advance"
+            fi
+            if [ "$rc" != 0 ] && grep -qE "LEAF ADVANCE TEST: .* returned 0" "$D/lsp.log" && \
+               ! grep -q "LEAF ADVANCE TEST PASSED" "$D/lsp.log"; then
+                note_ok "LSP's advance attempt failed (rc=$rc)"
+            else
+                tail -30 "$D/lsp.log"; note_fail "$MODE: LSP's advance attempt did not fail (rc=$rc)"
+            fi
         fi
+        # The LSP is gone, so the payment clients end on their own.
+        for i in 0 1; do
+            local cpid=${CLIENT_PIDS[$i]} crc
+            for _ in $(seq 1 60); do kill -0 "$cpid" 2>/dev/null || break; sleep 1; done
+            if kill -0 "$cpid" 2>/dev/null; then
+                note_fail "$MODE: payment client $i still running 60s after the LSP exited"
+            else
+                wait "$cpid"; crc=$?
+                if [ "$crc" = 1 ] && grep -q "daemon recv failed (disconnected)" "$D/c$i.log"; then
+                    note_ok "payment client $i ended on the LSP's disconnect (status 1)"
+                else
+                    tail -5 "$D/c$i.log"; note_fail "$MODE: payment client $i exited $crc"
+                fi
+            fi
+        done
     else
         for _ in $(seq 1 300); do
             grep -q "entering daemon mode" "$D/lsp.log" 2>/dev/null && break
@@ -227,22 +328,26 @@ run_scenario(){
     else
         note_fail "$MODE: payment did not settle"
     fi
-    local ADV_RE="LEAF_ADVANCE_PROPOSE|leaf [0-9]+ advanced|leaf [0-9]+ advance (confirmed|complete)"
+    # A completed advance in any scenario; a proposed one too unless this
+    # scenario is the one where the LSP proposes it on purpose.
+    local ADV_RE="leaf [0-9]+ advanced|leaf [0-9]+ advance complete"
+    [ "$MODE" = advance_refused ] || ADV_RE="LEAF_ADVANCE_PROPOSE|$ADV_RE"
     local ADV
     ADV=$(cat "$D/lsp.log" "$D/c0.log" "$D/c1.log" 2>/dev/null | grep -cE "$ADV_RE")
-    if [ "$ADV" = 0 ]; then note_ok "no leaf-advance ceremony in LSP or client logs"
+    if [ "$ADV" = 0 ]; then note_ok "no leaf advance took place (LSP and client logs)"
     else
         note_fail "$MODE: leaf-advance ceremony ran after the payment ($ADV log lines)"
         cat "$D/lsp.log" "$D/c0.log" "$D/c1.log" | grep -E "$ADV_RE" | head -6 | sed 's/^/         /'
     fi
-    no_advance_in_db "$D/lsp.db" "LSP DB"
-    no_advance_in_db "$D/c0.db" "client 0 DB"
-    no_advance_in_db "$D/c1.db" "client 1 DB"
+    no_advance_in_db "$D/lsp.db" "LSP DB" lsp
+    no_advance_in_db "$D/c0.db" "client 0 DB" client
+    no_advance_in_db "$D/c1.db" "client 1 DB" client
 
     # ---- balances and funding outpoints, from the DBs ----
-    local -a BAL FTXID FVOUT CHEX CTXID
+    local -a BAL LSPBAL FTXID FVOUT CHEX CTXID
     for i in 0 1; do
         BAL[$i]=$(sqlite3 "$D/c$i.db" "SELECT local_amount FROM channels LIMIT 1;" 2>/dev/null)
+        LSPBAL[$i]=$(sqlite3 "$D/c$i.db" "SELECT remote_amount FROM channels LIMIT 1;" 2>/dev/null)
         FTXID[$i]=$(sqlite3 "$D/c$i.db" "SELECT funding_txid FROM channels LIMIT 1;" 2>/dev/null)
         FVOUT[$i]=$(sqlite3 "$D/c$i.db" "SELECT funding_vout FROM channels LIMIT 1;" 2>/dev/null)
         CHEX[$i]=$(sqlite3 "$D/c$i.db" "SELECT signed_tx_hex FROM signed_commitments ORDER BY commitment_number DESC LIMIT 1;" 2>/dev/null)
@@ -299,13 +404,14 @@ run_scenario(){
         leaf_conf=$(confs "${FTXID[$i]}")
         if [ "${leaf_conf:-0}" -ge 1 ]; then note_ok "client $i leaf ${FTXID[$i]:0:16}... is the transaction on chain"
         else note_fail "$MODE: client $i leaf ${FTXID[$i]} is not on chain"; fi
-        local v
+        local v shape
         v=$(txfield "${CHEX[$i]}" pays "${BAL[$i]}")
-        if [ "${v:--1}" -ge 0 ]; then
-            note_ok "client $i to_local = ${BAL[$i]} sats (commitment output $v)"
+        shape=$(txfield "${CHEX[$i]}" shape "${BAL[$i]}" "${LSPBAL[$i]:-0}")
+        if [ "${v:--1}" -ge 0 ] && [ "$shape" = ok ]; then
+            note_ok "client $i to_local = ${BAL[$i]} sats (output $v: own taproot script; the other outputs are the LSP's balance and the anchor)"
             CTXID[$i]="${CTXID[$i]}:$v"
         else
-            note_fail "$MODE: client $i commitment has no output of ${BAL[$i]} sats"
+            note_fail "$MODE: client $i commitment outputs are not {client ${BAL[$i]}, LSP, anchor}: ${shape:-no decode}"
         fi
     done
 
@@ -357,6 +463,7 @@ run_scenario(){
 
 run_scenario lsp_exit "$PORT"
 run_scenario client_exit $((PORT + 1))
+run_scenario advance_refused $((PORT + 2))
 
 # When the binaries are sanitizer builds, none of them may have reported
 # anything (processes that were killed outright report nothing).
@@ -371,7 +478,7 @@ fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then
-    printf '\033[32m=== PASS: payment left the leaf untouched; both clients exited with their balances ===\033[0m\n'
+    printf '\033[32m=== PASS: payment left the leaf untouched; a proposed advance was refused; both clients exited with their balances ===\033[0m\n'
     exit 0
 fi
 printf '\033[31m=== FAIL: %d check(s) failed ===\033[0m\n' "$FAILS"
