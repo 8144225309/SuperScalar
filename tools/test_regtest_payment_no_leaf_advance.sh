@@ -278,10 +278,12 @@ run_scenario(){
 
     # ---- unilateral exit by each client, from its own DB ----
     for i in 0 1; do
-        local pass c=""
+        local pass c="" fc_rc
         for pass in $(seq 1 40); do
             "$CLIENT_BIN" --network regtest --cli-path bitcoin-cli "${RPC_ARGS[@]}" \
                 --force-close --db "$D/c$i.db" >> "$D/fc_c$i.log" 2>&1
+            fc_rc=$?
+            [ "$fc_rc" = 0 ] || note_fail "$MODE: client $i --force-close pass $pass exited $fc_rc"
             mine 6
             [ -n "${CTXID[$i]}" ] && c=$(confs "${CTXID[$i]}")
             [ "${c:-0}" -ge 1 ] && break
@@ -355,6 +357,17 @@ run_scenario(){
 
 run_scenario lsp_exit "$PORT"
 run_scenario client_exit $((PORT + 1))
+
+# When the binaries are sanitizer builds, none of them may have reported
+# anything (processes that were killed outright report nothing).
+SAN_RE="ERROR: (Address|Leak|Thread|Memory)Sanitizer|SUMMARY: [A-Za-z]*Sanitizer|runtime error:"
+SAN_LOGS=$(grep -lE "$SAN_RE" "$TMPDIR"/*/*.log 2>/dev/null)
+if [ -z "$SAN_LOGS" ]; then
+    note_ok "no sanitizer report in any daemon log"
+else
+    note_fail "sanitizer report in: $(echo $SAN_LOGS)"
+    grep -hE "$SAN_RE" $SAN_LOGS | sort | uniq -c | head -8 | sed 's/^/         /'
+fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then
