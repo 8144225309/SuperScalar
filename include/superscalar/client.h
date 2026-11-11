@@ -99,7 +99,8 @@ int client_close_script(const secp256k1_context *ctx,
        ch->local_amount (no output is required for a balance below the dust
        limit).
    Outputs to any other script are ignored regardless of amount.
-   ch == NULL (no channel) returns 1. */
+   ch == NULL means the client never opened a channel in this factory; it is
+   then owed nothing and any outputs are acceptable (returns 1). */
 int client_close_outputs_acceptable(const secp256k1_context *ctx,
                                      const secp256k1_pubkey *my_pubkey,
                                      const channel_t *ch,
@@ -113,7 +114,9 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
    requires the proposal to pay at least ch->local_amount to its own close
    script (client_close_script) and refuses while any HTLC is pending; see
    client_close_outputs_acceptable.  Pass NULL only when the client never
-   opened a channel in this factory and so holds no balance.
+   opened a channel in this factory and so holds no balance; with NULL the
+   client still refuses if the database set with client_set_persist holds a
+   channel for this factory.
    Returns 1 on success, 0 on refusal or failure. */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -288,8 +291,9 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const wire_msg_t *propose_msg);
 
 /* Set (or clear) the persistence handle used for the PS double-spend
-   defense. Pass NULL to disable. Must be called before any PS advance
-   happens; safe to call once at startup. */
+   defense and for the checks the close ceremony makes against the client's
+   own records. Pass NULL to disable. Must be called before any PS advance
+   or close happens; safe to call once at startup. */
 void client_set_persist(persist_t *persist);
 
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.

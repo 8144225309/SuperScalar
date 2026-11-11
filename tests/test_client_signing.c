@@ -16,6 +16,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
+#include "superscalar/persist.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -406,6 +407,83 @@ int test_client_close_refuses_unpaid_proposal(void) {
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A client with no channel signs any close: it is owed nothing.  But if its
+   own database holds a channel for this factory, it was started without its
+   state and must refuse rather than sign its balance away. */
+int test_client_close_without_channel(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    tx_output_t all_to_lsp;
+    cs_output(&all_to_lsp, CS_FUNDING - 1000, lsp_spk);
+
+    int rc = -1;
+    uint8_t sent = 0;
+
+    /* No database, no channel: nothing is owed, the client takes part. */
+    client_set_persist(NULL);
+    TEST_ASSERT(cs_run_client_close(ctx, &kps[1], &pks[1], f, NULL,
+                                     &all_to_lsp, 1, &rc, &sent), "run");
+    TEST_ASSERT(sent == MSG_CLOSE_NONCE, "client without a channel signs");
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    client_set_persist(&db);
+
+    /* The factory is on record, with no channel in it. */
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(!persist_factory_has_channel(&db, f->funding_txid,
+                                              f->funding_vout),
+                "no channel on record");
+    int ok = cs_run_client_close(ctx, &kps[1], &pks[1], f, NULL,
+                                  &all_to_lsp, 1, &rc, &sent);
+    int signed_without_record = ok && sent == MSG_CLOSE_NONCE;
+
+    /* A channel is on record for this factory. */
+    channel_t ch;
+    cs_channel(&ch, 100000);
+    int saved = persist_save_channel(&db, &ch, 0, 0);
+    int has = persist_factory_has_channel(&db, f->funding_txid,
+                                           f->funding_vout);
+    int rc2 = -1;
+    uint8_t sent2 = 0;
+    int ok2 = cs_run_client_close(ctx, &kps[1], &pks[1], f, NULL,
+                                   &all_to_lsp, 1, &rc2, &sent2);
+
+    /* The record is for a different factory: this one has no channel. */
+    unsigned char other_txid[32];
+    memset(other_txid, 0xBB, 32);
+    int has_other = persist_factory_has_channel(&db, other_txid,
+                                                 f->funding_vout);
+    int has_other_vout = persist_factory_has_channel(&db, f->funding_txid,
+                                                      f->funding_vout + 1);
+
+    client_set_persist(NULL);
+    persist_close(&db);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+
+    TEST_ASSERT(signed_without_record,
+                "client signs when its records hold no channel");
+    TEST_ASSERT(saved && has, "channel on record for this factory");
+    TEST_ASSERT(ok2, "run");
+    TEST_ASSERT(sent2 != MSG_CLOSE_NONCE, "client reveals no nonce");
+    TEST_ASSERT(rc2 == 0 && sent2 == MSG_ERROR,
+                "client started without its recorded channel refuses");
+    TEST_ASSERT(!has_other && !has_other_vout,
+                "a channel of another factory does not count");
     return 1;
 }
 

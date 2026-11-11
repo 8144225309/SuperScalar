@@ -3925,10 +3925,12 @@ static void run_unit_tests(void) {
     extern int test_client_close_outputs_acceptable(void);
     extern int test_client_close_refuses_unbalanced_channel(void);
     extern int test_client_close_refuses_unpaid_proposal(void);
+    extern int test_client_close_without_channel(void);
     extern int test_client_close_honest_ceremony(void);
     RUN_TEST(test_client_close_outputs_acceptable);
     RUN_TEST(test_client_close_refuses_unbalanced_channel);
     RUN_TEST(test_client_close_refuses_unpaid_proposal);
+    RUN_TEST(test_client_close_without_channel);
     RUN_TEST(test_client_close_honest_ceremony);
     extern int test_client_leaf_realloc_acceptable(void);
     extern int test_client_leaf_realloc_handler_refuses_all(void);

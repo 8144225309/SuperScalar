@@ -560,7 +560,11 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
                                      const channel_t *ch,
                                      const tx_output_t *outputs,
                                      size_t n_outputs) {
-    /* No channel in this factory: the client holds no balance. */
+    /* No channel: the client never opened one in this factory, so it holds
+       no commitment and no balance there and is owed nothing, whatever the
+       outputs are.  This is only true if there really is no channel; the
+       ceremony refuses when the client's own records say otherwise (see
+       client_close_without_channel_ok). */
     if (!ch) return 1;
     if (!outputs) return 0;
 
@@ -627,6 +631,17 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
         return 0;
     }
     return 1;
+}
+
+/* A close with no channel is signed only by a client that is owed nothing.
+   If the client's own database holds a channel for this factory, it does
+   have a balance and was merely started without it; signing would give that
+   balance away.  Returns 1 if signing without a channel is safe. */
+static int client_close_without_channel_ok(const factory_t *factory) {
+    if (!g_client_persist) return 1;
+    return !persist_factory_has_channel(g_client_persist,
+                                         factory->funding_txid,
+                                         factory->funding_vout);
 }
 
 /* MEDIUM-1: cap on LSP-driven re-PROPOSE recursion depth. The LSP is untrusted;
@@ -767,6 +782,15 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     /* Verify the proposed outputs before contributing a nonce or a signature.
        Refusing changes nothing on the channel: the client still holds its
        signed commitment and can exit unilaterally. */
+    if (!ch && !client_close_without_channel_ok(factory)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — a channel is "
+                "on record for this factory but this client was started "
+                "without it\n");
+        free(close_outputs);
+        client_send_error(fd, "cooperative close refused: client was started "
+                              "without its channel state");
+        return 0;
+    }
     if (!client_close_outputs_acceptable(ctx, my_pubkey, ch,
                                           close_outputs, n_outputs)) {
         free(close_outputs);

@@ -2683,6 +2683,30 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     return ok;
 }
 
+int persist_factory_has_channel(persist_t *p,
+                                 const unsigned char funding_txid[32],
+                                 uint32_t funding_vout) {
+    if (!p || !p->db || !funding_txid) return 0;
+
+    /* factories.funding_txid is stored as display-order hex. */
+    unsigned char txid_display[32];
+    for (size_t i = 0; i < 32; i++) txid_display[i] = funding_txid[31 - i];
+    char txid_hex[65];
+    hex_encode(txid_display, 32, txid_hex);
+
+    const char *sql =
+        "SELECT 1 FROM channels c JOIN factories f ON f.id = c.factory_id "
+        "WHERE f.funding_txid = ? AND f.funding_vout = ? LIMIT 1;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)funding_vout);
+    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 int persist_load_channel_state(persist_t *p, uint32_t channel_id,
                                  uint64_t *local_amount,
                                  uint64_t *remote_amount,

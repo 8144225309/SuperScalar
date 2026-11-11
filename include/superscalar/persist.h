@@ -316,6 +316,12 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
 /* Load channel core state (balances, commitment_number).
    Channel must already be initialized via channel_init() with the correct
    keys. This overwrites balances and commitment_number. */
+/* 1 if a channel is stored for the factory funded by this outpoint
+   (funding_txid in internal byte order), 0 otherwise. */
+int persist_factory_has_channel(persist_t *p,
+                                 const unsigned char funding_txid[32],
+                                 uint32_t funding_vout);
+
 int persist_load_channel_state(persist_t *p, uint32_t channel_id,
                                  uint64_t *local_amount,
                                  uint64_t *remote_amount,
