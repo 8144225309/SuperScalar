@@ -44,6 +44,7 @@ class FakeCln:
         # No earlier payment for the hash unless a test says otherwise.
         replies.setdefault("listsendpays", {"payments": []})
         replies.setdefault("getinfo", {"id": OWN_NODE})
+        replies.setdefault("listpeerchannels", {"channels": []})
         self.replies = {m: list(r) if isinstance(r, list) else [r]
                         for m, r in replies.items()}
         self.calls = []
@@ -105,12 +106,15 @@ class PluginTestCase(unittest.TestCase):
         p = mock.patch.object(cln_plugin, "registry_recovered", True)
         p.start()
         self.addCleanup(p.stop)
+        # No test reaches a real lightning-cli.
+        self.cln = self.use_cln()
 
     def use_cln(self, **replies):
         fake = FakeCln(**replies)
         p = mock.patch.object(cln_plugin, "cln_rpc", fake)
         p.start()
         self.addCleanup(p.stop)
+        self.cln = fake
         return fake
 
     def install_clock(self):
@@ -1772,6 +1776,23 @@ class BridgeAuthTest(PluginTestCase):
             self.assertEqual(cln_plugin.read_bridge_secret(), self.SECRET)
 
 
+PAY_SUCCESS_OUTPUT = """\
+# ->036bfdade73046b59427613052e410888875770bb7dcda73f7390f2c5bfc7cc21c: Success: preimage=4eb94a6316a7b07ac6062e17d5808f28a7db7d2ca382f050beb4c2f60828b73d
+{
+   "payment_preimage": "4eb94a6316a7b07ac6062e17d5808f28a7db7d2ca382f050beb4c2f60828b73d",
+   "amount_msat": 2000000,
+   "amount_sent_msat": 2000000,
+   "parts": 1,
+   "destination": "036bfdade73046b59427613052e410888875770bb7dcda73f7390f2c5bfc7cc21c",
+   "payment_hash": "852b119c7945b53ccb091fb9099d435c5934748d8013937d5a87503e1b37bfaf",
+   "status": "complete",
+   "created_at": 1794393302.674747989
+}
+"""
+PAY_FAILURE_OUTPUT = ('{"code": 203, "message": "Destination said it doesn\'t '
+                      'know invoice: incorrect_or_unknown_payment_details"}\n')
+
+
 class ClnRpcTest(unittest.TestCase):
     def run_with(self, returncode, stdout, stderr=""):
         completed = subprocess.CompletedProcess([], returncode, stdout, stderr)
@@ -1786,7 +1807,39 @@ class ClnRpcTest(unittest.TestCase):
         result, run = self.run_with(0, '{"status": "complete"}')
         self.assertEqual(result, {"status": "complete"})
         argv = run.call_args[0][0]
-        self.assertEqual(argv[-4:], ["-k", "pay", f"bolt11={BOLT11}", "maxfee=5"])
+        self.assertEqual(argv[-6:], ["-N", "none", "-k", "pay",
+                                     f"bolt11={BOLT11}", "maxfee=5"])
+
+    def test_pay_reply_after_a_notification_line(self):
+        # what lightning-cli v26.06.9 printed for a successful pay
+        result, _ = self.run_with(0, PAY_SUCCESS_OUTPUT)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(
+            result["payment_preimage"],
+            "4eb94a6316a7b07ac6062e17d5808f28a7db7d2ca382f050beb4c2f60828b73d")
+        self.assertEqual(
+            result["payment_hash"],
+            "852b119c7945b53ccb091fb9099d435c5934748d8013937d5a87503e1b37bfaf")
+        self.assertEqual(result["amount_sent_msat"], 2000000)
+
+    def test_pay_failure_output(self):
+        err, _ = self.run_with(1, PAY_FAILURE_OUTPUT)
+        self.assertIsInstance(err, cln_plugin.ClnRpcError)
+        self.assertEqual(err.code, 203)
+        self.assertIn("incorrect_or_unknown_payment_details", str(err))
+
+    def test_error_reply_after_a_notification_line(self):
+        err, _ = self.run_with(1, "# trying\n\n" + PAY_FAILURE_OUTPUT)
+        self.assertEqual(err.code, 203)
+
+    def test_output_without_a_reply(self):
+        for text in ("", "# ->03ab: Success: preimage=00\n", "# a\nnot json"):
+            with self.assertRaises(ValueError):
+                cln_plugin.parse_cli_output(text)
+
+    def test_plain_reply(self):
+        self.assertEqual(cln_plugin.parse_cli_output('{"a": 1}\n'), {"a": 1})
+        self.assertEqual(cln_plugin.parse_cli_output("\n# n\n# m\n[1]"), [1])
 
     def test_error_reply_raises_with_code(self):
         err, _ = self.run_with(1, '{"code": 210, "message": "Ran out of routes"}')

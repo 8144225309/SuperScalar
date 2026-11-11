@@ -166,11 +166,25 @@ class ClnRpcError(Exception):
         self.code = code
 
 
+def parse_cli_output(text):
+    """The JSON reply in what lightning-cli printed.
+
+    lightning-cli prints notifications a command emits on stdout, ahead of
+    the reply, as lines starting with "# " (`pay` does on every success).
+    Those lines are not part of the reply.  Raises ValueError if no JSON
+    value is left."""
+    lines = text.splitlines()
+    while lines and (lines[0].startswith("#") or not lines[0].strip()):
+        lines.pop(0)
+    return json.loads("\n".join(lines))
+
+
 def cln_rpc(method, params=None, timeout=60):
     """Call a CLN RPC method through lightning-cli with keyword parameters.
     Returns the decoded result.  Raises ClnRpcError if CLN reports an error
     and subprocess.TimeoutExpired if lightning-cli does not return in time."""
-    args = ["-k", method]
+    # -N none: no notification lines; they are skipped anyway if printed.
+    args = ["-N", "none", "-k", method]
     for key, value in (params or {}).items():
         args.append(f"{key}={value}")
     result = subprocess.run(cli_cmd(*args), capture_output=True, text=True,
@@ -179,13 +193,13 @@ def cln_rpc(method, params=None, timeout=60):
         code = None
         message = (result.stdout or result.stderr or "").strip()[:300]
         try:
-            err = json.loads(result.stdout)
+            err = parse_cli_output(result.stdout)
             code = err.get("code")
             message = err.get("message", message)
         except (ValueError, AttributeError):
             pass
         raise ClnRpcError(message, code)
-    return json.loads(result.stdout)
+    return parse_cli_output(result.stdout)
 
 
 def _msat(value):
@@ -1717,33 +1731,20 @@ def main():
             rpc_id = request["id"]
             # Pay directly via lightning-cli (reuses existing _do_pay path)
             def _pay_and_respond(bolt11_str, rpc_id_val):
+                status = {"status": "failed"}
                 try:
-                    result = subprocess.run(
-                        cli_cmd("pay", bolt11_str),
-                        capture_output=True, text=True, timeout=600
-                    )
-                    if result.returncode == 0:
-                        pay_result = json.loads(result.stdout)
-                        preimage = pay_result.get("payment_preimage", "00" * 32)
-                        send_to_cln({
-                            "jsonrpc": "2.0",
-                            "id": rpc_id_val,
-                            "result": {"status": "complete", "payment_preimage": preimage}
-                        })
+                    pay_result = cln_rpc("pay", {"bolt11": bolt11_str},
+                                         timeout=600)
+                    preimage = pay_result.get("payment_preimage", "")
+                    if pay_result.get("status") == "complete" and preimage:
+                        status = {"status": "complete",
+                                  "payment_preimage": preimage}
                     else:
-                        log(f"superscalar-pay failed: {result.stderr[:100]}")
-                        send_to_cln({
-                            "jsonrpc": "2.0",
-                            "id": rpc_id_val,
-                            "result": {"status": "failed"}
-                        })
+                        status = {"status": pay_result.get("status", "pending")}
                 except Exception as e:
-                    log(f"superscalar-pay exception: {e}")
-                    send_to_cln({
-                        "jsonrpc": "2.0",
-                        "id": rpc_id_val,
-                        "result": {"status": "failed"}
-                    })
+                    log(f"superscalar-pay failed: {type(e).__name__}: {e}")
+                send_to_cln({"jsonrpc": "2.0", "id": rpc_id_val,
+                             "result": status})
             t = threading.Thread(target=_pay_and_respond,
                                  args=(bolt11, rpc_id), daemon=True)
             t.start()
