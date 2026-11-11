@@ -1,4 +1,5 @@
 #include "superscalar/regtest.h"
+#include "superscalar/network.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,7 +178,7 @@ static void build_cli_prefix(const regtest_t *rt, char *buf, size_t buf_len) {
         return;
     }
 
-    if (strcmp(rt->network, "mainnet") == 0) {
+    if (network_is_mainnet(rt->network)) {
         snprintf(buf, buf_len,
             "%s -rpcuser=%s -rpcpassword=%s",
             rt->cli_path, rt->rpcuser, rt->rpcpassword);
@@ -280,7 +281,7 @@ static char **build_argv(const regtest_t *rt, const char *method,
 
     args[n++] = strdup(rt->cli_path);
 
-    if (strcmp(rt->network, "mainnet") != 0) {
+    if (!network_is_mainnet(rt->network)) {
         char net_flag[32];
         snprintf(net_flag, sizeof(net_flag), "-%s", rt->network);
         args[n++] = strdup(net_flag);
@@ -973,6 +974,7 @@ int regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *address)
 }
 
 int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
+    if (!rt || !tx_hex) return 0;
     char *params = (char *)malloc(strlen(tx_hex) + 4);
     if (!params) return 0;
     snprintf(params, strlen(tx_hex) + 4, "\"%s\"", tx_hex);
@@ -1681,7 +1683,7 @@ int regtest_network_safe_confirmation_depth(const regtest_t *rt) {
     if (strcmp(rt->network, "signet") == 0)  return 3;
     if (strcmp(rt->network, "testnet4") == 0) return 3;
     if (strcmp(rt->network, "testnet") == 0)  return 3;
-    if (strcmp(rt->network, "mainnet") == 0)  return 6;
+    if (network_is_mainnet(rt->network))      return 6;
     return 6;  /* unknown network → conservative */
 }
 
@@ -1696,7 +1698,7 @@ int regtest_network_mempool_freeze_seconds(const regtest_t *rt) {
     if (strcmp(rt->network, "signet") == 0)  return 2 * 3600;
     if (strcmp(rt->network, "testnet4") == 0) return 24 * 3600;
     if (strcmp(rt->network, "testnet") == 0)  return 24 * 3600;
-    if (strcmp(rt->network, "mainnet") == 0)  return 7 * 86400;
+    if (network_is_mainnet(rt->network))      return 7 * 86400;
     return 7 * 86400;
 }
 

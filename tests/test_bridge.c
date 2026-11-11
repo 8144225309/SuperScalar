@@ -1357,22 +1357,20 @@ int test_regtest_bridge_payment(void) {
 
     /* Cooperative close */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1808,18 +1806,17 @@ int test_regtest_bridge_out(void) {
 
     /* Cooperative close (sanity: factory still closes after the pay-out). */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per = close_total / n_total;
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t co[5];
-        for (size_t i = 0; i < n_total; i++) {
-            co[i].amount_sats = per;
-            memcpy(co[i].script_pubkey, fund_spk, 34);
-            co[i].script_pubkey_len = 34;
-        }
-        co[n_total - 1].amount_sats = close_total - per * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           co, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
         tx_buf_t close_tx; tx_buf_init(&close_tx, 512);
-        if (lsp_run_cooperative_close(lsp, &close_tx, co, n_total, 0)) {
+        if (n_total > 0 &&
+            lsp_run_cooperative_close(lsp, &close_tx, co, n_total, 0)) {
             char close_hex[close_tx.len * 2 + 1];
             hex_encode(close_tx.data, close_tx.len, close_hex);
             char close_txid[65];
@@ -2150,22 +2147,20 @@ int test_regtest_bridge_invoice_flow(void) {
 
     /* Cooperative close */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -2306,10 +2301,12 @@ int test_tor_password_file(void) {
 
     /* Test with password that has no trailing newline */
     f = fopen(tmpfile, "w");
+    TEST_ASSERT(f != NULL, "fopen w failed");
     fprintf(f, "no_newline");
     fclose(f);
 
     f = fopen(tmpfile, "r");
+    TEST_ASSERT(f != NULL, "fopen r failed");
     TEST_ASSERT(fgets(buf, sizeof(buf), f) != NULL, "fgets failed");
     buf[strcspn(buf, "\r\n")] = '\0';
     fclose(f);
@@ -2994,24 +2991,23 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
         }
     }
 
-    /* Cooperative close: 65 equal-share outputs to the funding SPK
-       (we're not exercising per-party deltas here — that's covered by
-       the dedicated N=64 lifecycle tests). */
+    /* Cooperative close: every party is paid its channel balance at its own
+       close script (clients refuse to sign anything less). */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 5000;  /* 5000 sat fee */
         size_t n_total = N;
-        uint64_t per_party = close_total / n_total;
 
         tx_output_t *close_outputs = calloc(n_total, sizeof(tx_output_t));
         if (!close_outputs) lsp_ok = 0;
         if (lsp_ok) {
-            for (size_t i = 0; i < n_total; i++) {
-                close_outputs[i].amount_sats = per_party;
-                memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-                close_outputs[i].script_pubkey_len = 34;
+            n_total = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                        close_outputs, 5000,
+                                                        NULL, 0);
+            if (n_total == 0) {
+                fprintf(stderr, "LSP-n64: build close outputs failed\n");
+                lsp_ok = 0;
             }
-            close_outputs[n_total - 1].amount_sats =
-                close_total - per_party * (n_total - 1);
+        }
+        if (lsp_ok) {
 
             tx_buf_t close_tx;
             tx_buf_init(&close_tx, 4096);

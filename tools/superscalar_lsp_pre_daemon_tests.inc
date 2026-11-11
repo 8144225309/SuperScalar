@@ -217,7 +217,7 @@
             printf("--- Phase 2: PTLC-Assisted Close ---\n");
 
             /* Build pubkey array and aggregate */
-            secp256k1_pubkey exh_pks[FACTORY_MAX_SIGNERS];
+            secp256k1_pubkey exh_pks[FACTORY_MAX_SIGNERS] = {0};
             for (size_t ti = 0; ti < n_total; ti++) {
                 if (!secp256k1_keypair_pub(ctx, &exh_pks[ti], &exh_kps[ti])) {
                     fprintf(stderr, "DW EXHIBITION: keypair pub failed\n");
