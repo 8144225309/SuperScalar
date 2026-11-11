@@ -3794,6 +3794,59 @@ static int offer_first_line(bridge_t *br, int fd, const char *first_line) {
     return bridge_service_pending_plugin(br);
 }
 
+/* Read one line from the bridge on a client socket. */
+static int read_line(int fd, char *buf, size_t cap) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        if (read(fd, buf + n, 1) != 1) return 0;
+        if (buf[n] == '\n') { buf[n] = '\0'; return 1; }
+        n++;
+    }
+    return 0;
+}
+
+static void hex_of(const unsigned char *in, size_t len, char *out) {
+    hex_encode(in, len, out);
+}
+
+/* The plugin's side of the handshake up to and including its response,
+   computed with `secret`.  Leaves the bridge's nonce and proof in *_out.
+   Returns the result of servicing the response (1 = accepted). */
+static int plugin_handshake(bridge_t *br, int fd, const char *secret,
+                            const char *response_role,
+                            unsigned char bridge_nonce_out[32],
+                            int *bridge_proof_ok_out) {
+    unsigned char np[32], proof[32], expect[32];
+    char hex[65], line[512];
+    for (int i = 0; i < 32; i++) np[i] = (unsigned char)(0xA0 + i);
+    hex_of(np, 32, hex);
+    snprintf(line, sizeof(line), "{\"method\":\"auth_hello\",\"nonce\":\"%s\"}\n", hex);
+    if (offer_first_line(br, fd, line) != 0) return -10;   /* challenge is out */
+
+    if (!read_line(fd, line, sizeof(line))) return -11;
+    cJSON *ch = cJSON_Parse(line);
+    if (!ch) return -12;
+    cJSON *m = cJSON_GetObjectItem(ch, "method");
+    int ok = m && cJSON_IsString(m) && strcmp(m->valuestring, "auth_challenge") == 0 &&
+             wire_json_get_hex(ch, "nonce", bridge_nonce_out, 32) == 32 &&
+             wire_json_get_hex(ch, "proof", proof, 32) == 32;
+    cJSON_Delete(ch);
+    if (!ok) return -13;
+    /* what a plugin holding the bridge's real secret expects to see */
+    bridge_plugin_auth_proof(br->plugin_secret, BRIDGE_AUTH_ROLE_BRIDGE, np,
+                              bridge_nonce_out, expect);
+    if (bridge_proof_ok_out)
+        *bridge_proof_ok_out = memcmp(proof, expect, 32) == 0;
+
+    if (!bridge_plugin_auth_proof(secret, response_role, np, bridge_nonce_out, proof))
+        return -14;
+    hex_of(proof, 32, hex);
+    snprintf(line, sizeof(line), "{\"method\":\"auth_response\",\"proof\":\"%s\"}\n", hex);
+    if (!send_str(fd, line)) return -15;
+    if (!wait_readable(br->plugin_pending_fd)) return -16;
+    return bridge_service_pending_plugin(br);
+}
+
 int test_bridge_plugin_auth(void) {
     bridge_t br;
     bridge_init(&br);
@@ -3803,40 +3856,77 @@ int test_bridge_plugin_auth(void) {
     TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
     TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
 
-    char good[256], line[512];
-    snprintf(good, sizeof(good), "{\"method\":\"auth\",\"token\":\"%s\"}\n",
-             TEST_PLUGIN_SECRET);
+    char line[1024];
+    unsigned char nb1[32], nb2[32];
+    int bridge_ok = 0;
 
-    /* Wrong secrets: a different one, one differing only in its last
-       character, a truncated one, an empty one. */
-    static const char *bad_tokens[] = {
-        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeef0",
-        "00112233445566778899aabbccddeeff",
-        "",
-    };
-    for (size_t i = 0; i < sizeof(bad_tokens) / sizeof(bad_tokens[0]); i++) {
-        int c = connect_plugin_port(&br);
-        TEST_ASSERT(c >= 0, "connect");
-        snprintf(line, sizeof(line), "{\"method\":\"auth\",\"token\":\"%s\"}\n",
-                 bad_tokens[i]);
-        TEST_ASSERT_EQ(offer_first_line(&br, c, line), -1, "wrong secret dropped");
-        TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
-        TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
-        TEST_ASSERT(peer_closed(c), "connection closed, nothing sent to it");
-        close(c);
+    /* The proof is a keyed MAC over role and both nonces */
+    {
+        unsigned char a[32], b[32], p1[32], p2[32];
+        memset(a, 1, 32); memset(b, 2, 32);
+        TEST_ASSERT(bridge_plugin_auth_proof(TEST_PLUGIN_SECRET, "plugin", a, b, p1), "proof");
+        TEST_ASSERT(bridge_plugin_auth_proof(TEST_PLUGIN_SECRET, "bridge", a, b, p2), "proof");
+        TEST_ASSERT(memcmp(p1, p2, 32) != 0, "roles give different proofs");
+        TEST_ASSERT(bridge_plugin_auth_proof(TEST_PLUGIN_SECRET, "plugin", b, a, p2), "proof");
+        TEST_ASSERT(memcmp(p1, p2, 32) != 0, "nonce order matters");
+        TEST_ASSERT(bridge_plugin_auth_proof(
+            "ff112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "plugin", a, b, p2), "proof");
+        TEST_ASSERT(memcmp(p1, p2, 32) != 0, "secret matters");
+        TEST_ASSERT(!bridge_plugin_auth_proof("abc", "plugin", a, b, p2), "bad secret");
+
+        /* Fixed values the plugin's implementation is tested against too */
+        char hex[65];
+        hex_of(p1, 32, hex);
+        TEST_ASSERT(strcmp(hex, "7f0ce9d7bbc1eb564d7696fb9dc9cd3d"
+                                "8ba0f4c0ef0da075860610dcc7ad929e") == 0,
+                    "plugin proof, known answer");
+        TEST_ASSERT(bridge_plugin_auth_proof(TEST_PLUGIN_SECRET, "bridge", a, b, p2), "proof");
+        hex_of(p2, 32, hex);
+        TEST_ASSERT(strcmp(hex, "3b505ab3809df5713d5f24a15bda1465"
+                                "e41680ccf6ec56a5763c789ed46f5aa1") == 0,
+                    "bridge proof, known answer");
     }
 
-    /* A connection that starts talking without authenticating is dropped
-       and its message goes nowhere. */
-    static const char *unauthenticated[] = {
+    /* A plugin with another secret is dropped; so is one that answers
+       with the bridge's kind of proof (its own challenge reflected). */
+    {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        TEST_ASSERT_EQ(plugin_handshake(&br, c,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            BRIDGE_AUTH_ROLE_PLUGIN, nb1, &bridge_ok), -1, "wrong secret dropped");
+        TEST_ASSERT(bridge_ok, "the bridge proved itself to the plugin");
+        TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
+        TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
+        TEST_ASSERT(peer_closed(c), "connection closed, nothing more sent");
+        close(c);
+
+        c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        TEST_ASSERT_EQ(plugin_handshake(&br, c, TEST_PLUGIN_SECRET,
+            BRIDGE_AUTH_ROLE_BRIDGE, nb2, &bridge_ok), -1, "reflected proof dropped");
+        TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
+        TEST_ASSERT(peer_closed(c), "connection closed");
+        close(c);
+        TEST_ASSERT(memcmp(nb1, nb2, 32) != 0, "a fresh bridge nonce per connection");
+    }
+
+    /* A connection that does not open with auth_hello is dropped and gets
+       nothing: neither a challenge nor any use of its message.  That
+       includes presenting the secret itself. */
+    snprintf(line, sizeof(line), "{\"method\":\"auth\",\"token\":\"%s\"}\n",
+             TEST_PLUGIN_SECRET);
+    const char *unauthenticated[] = {
+        line,
         "{\"method\":\"htlc_accepted\",\"payment_hash\":"
         "\"abababababababababababababababababababababababababababababababab\","
         "\"amount_msat\":5000000,\"cltv_expiry\":500}\n",
         "{\"method\":\"pay_result\",\"request_id\":1,\"success\":true,\"preimage\":"
         "\"abababababababababababababababababababababababababababababababab\"}\n",
-        "{\"token\":\"00112233445566778899aabbccddeeff"
-        "00112233445566778899aabbccddeeff\"}\n",
+        "{\"method\":\"auth_hello\",\"nonce\":\"abcd\"}\n",
+        "{\"method\":\"auth_response\",\"proof\":"
+        "\"abababababababababababababababababababababababababababababababab\"}\n",
         "not json\n",
     };
     for (size_t i = 0; i < sizeof(unauthenticated) / sizeof(unauthenticated[0]); i++) {
@@ -3845,14 +3935,32 @@ int test_bridge_plugin_auth(void) {
         TEST_ASSERT_EQ(offer_first_line(&br, c, unauthenticated[i]), -1,
                        "unauthenticated message dropped");
         TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
-        TEST_ASSERT(peer_closed(c), "connection closed");
+        TEST_ASSERT(peer_closed(c), "connection closed, nothing sent to it");
         close(c);
     }
     wire_msg_t stray;
     TEST_ASSERT(!wire_recv_timeout(lsp_sv[0], &stray, 1),
                 "nothing from unauthenticated peers reached the LSP");
 
-    /* A first line too long to be an auth message is dropped. */
+    /* After the challenge, anything but the right response is dropped */
+    {
+        int c = connect_plugin_port(&br);
+        TEST_ASSERT(c >= 0, "connect");
+        TEST_ASSERT_EQ(offer_first_line(&br, c,
+            "{\"method\":\"auth_hello\",\"nonce\":"
+            "\"0101010101010101010101010101010101010101010101010101010101010101\"}\n"),
+            0, "challenge sent");
+        TEST_ASSERT(read_line(c, line, sizeof(line)), "challenge received");
+        TEST_ASSERT(send_str(c, "{\"method\":\"pay_result\",\"request_id\":1,"
+                                "\"success\":false}\n"), "send");
+        TEST_ASSERT(wait_readable(br.plugin_pending_fd), "data pending");
+        TEST_ASSERT_EQ(bridge_service_pending_plugin(&br), -1,
+                       "message instead of a response dropped");
+        TEST_ASSERT_EQ(br.plugin_fd, -1, "not accepted as the plugin");
+        close(c);
+    }
+
+    /* A line too long to be a handshake message is dropped. */
     {
         int c = connect_plugin_port(&br);
         TEST_ASSERT(c >= 0, "connect");
@@ -3889,42 +3997,26 @@ int test_bridge_plugin_auth(void) {
         close(c);
     }
 
-    /* The right secret, arriving in two pieces and followed at once by a
-       plugin message. */
+    /* The real plugin: both proofs check out. */
     int plugin = connect_plugin_port(&br);
     TEST_ASSERT(plugin >= 0, "connect");
-    TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
-    TEST_ASSERT(bridge_accept_plugin(&br), "accept");
-    TEST_ASSERT_EQ(br.plugin_fd, -1, "not the plugin before authenticating");
-    TEST_ASSERT(write(plugin, good, 20) == 20, "send first part");
-    TEST_ASSERT(wait_readable(br.plugin_pending_fd), "data pending");
-    TEST_ASSERT_EQ(bridge_service_pending_plugin(&br), 0, "auth line incomplete");
-    TEST_ASSERT_EQ(br.plugin_fd, -1, "still not the plugin");
-    snprintf(line, sizeof(line), "%s{\"method\":\"invoice_bolt11\",\"payment_hash\":"
-             "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
-             "\"bolt11\":\"lnbcrt1ptest\"}\n", good + 20);
-    TEST_ASSERT(send_str(plugin, line), "send rest + next message");
-    int r = 0;
-    for (int tries = 0; tries < 10 && r == 0; tries++) {
-        TEST_ASSERT(wait_readable(br.plugin_pending_fd), "data pending");
-        r = bridge_service_pending_plugin(&br);
-    }
-    TEST_ASSERT_EQ(r, 1, "right secret accepted");
+    TEST_ASSERT_EQ(plugin_handshake(&br, plugin, TEST_PLUGIN_SECRET,
+                                     BRIDGE_AUTH_ROLE_PLUGIN, nb1, &bridge_ok),
+                   1, "right secret accepted");
+    TEST_ASSERT(bridge_ok, "the bridge proved itself first");
     TEST_ASSERT(br.plugin_fd >= 0, "now the plugin");
     TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
+    TEST_ASSERT(read_line(plugin, line, sizeof(line)), "auth reply");
+    TEST_ASSERT(strstr(line, "\"auth_ok\"") != NULL, "auth_ok sent");
 
-    /* It is told so... */
-    char buf[256];
-    ssize_t n = read(plugin, buf, sizeof(buf) - 1);
-    TEST_ASSERT(n > 0, "auth reply");
-    buf[n] = '\0';
-    TEST_ASSERT(strstr(buf, "\"auth_ok\"") != NULL, "auth_ok sent");
-
-    /* ...and the message behind the auth line is ordinary plugin traffic.
-       (If more than the auth line has arrived it is already buffered.) */
+    /* The secret itself was never needed on the wire, and a message sent
+       now is ordinary plugin traffic. */
+    TEST_ASSERT(send_str(plugin, "{\"method\":\"invoice_bolt11\",\"payment_hash\":"
+        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
+        "\"bolt11\":\"lnbcrt1ptest\"}\n"), "send plugin message");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "plugin data");
     char *next = bridge_read_plugin_line(&br);
-    TEST_ASSERT(next != NULL, "message after auth available");
-    TEST_ASSERT(strstr(next, "\"invoice_bolt11\"") != NULL, "message intact");
+    TEST_ASSERT(next != NULL, "message available");
     TEST_ASSERT(bridge_handle_plugin_msg(&br, next), "message handled");
     free(next);
     wire_msg_t fwd;
@@ -3932,13 +4024,15 @@ int test_bridge_plugin_auth(void) {
     TEST_ASSERT_EQ(fwd.msg_type, MSG_INVOICE_BOLT11, "INVOICE_BOLT11");
     cJSON_Delete(fwd.json);
 
-    /* While it is connected nobody else gets in, right secret or not, and
-       the plugin keeps its connection. */
+    /* While it is connected nobody else gets in, and the plugin keeps its
+       connection. */
     int live_fd = br.plugin_fd;
     for (int i = 0; i < 2; i++) {
         int c = connect_plugin_port(&br);
         TEST_ASSERT(c >= 0, "connect");
-        TEST_ASSERT(send_str(c, good), "second connection sends the secret");
+        TEST_ASSERT(send_str(c, "{\"method\":\"auth_hello\",\"nonce\":"
+            "\"0101010101010101010101010101010101010101010101010101010101010101\"}\n"),
+            "second connection starts a handshake");
         TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
         TEST_ASSERT(!bridge_accept_plugin(&br), "second connection refused");
         TEST_ASSERT_EQ(br.plugin_fd, live_fd, "plugin connection unchanged");

@@ -18,9 +18,11 @@ answered "continue" for an HTLC paying one, CLN would settle the invoice
 itself and the factory client would never be paid.  HTLCs for factory
 invoices are therefore only ever resolved (on the LSP's word) or failed.
 
-The bridge only talks to a plugin that presents its shared secret.  The
-bridge writes the secret to a file (mode 0600) when it first starts; this
-plugin reads the same file and sends the secret as its first message.
+The bridge and this plugin share a secret, which the bridge writes to a file
+(mode 0600) when it first starts.  The secret never crosses the link: each
+side sends a random nonce and proves knowledge of the secret with an HMAC
+over both nonces.  The plugin checks the bridge's proof first and takes no
+message from a peer that has not given it.
 
 Usage:
   lightningd --plugin=/path/to/cln_plugin.py \
@@ -31,9 +33,11 @@ Usage:
 """
 
 import hashlib
+import hmac
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -195,19 +199,97 @@ def send_to_bridge(msg):
 
 
 def read_bridge_secret():
-    """Read the bridge's shared secret (64 hex characters) from
-    BRIDGE_SECRET_FILE.  Returns None if it is missing or malformed."""
+    """Read the shared secret (64 hex characters) from BRIDGE_SECRET_FILE.
+
+    The file must be a regular file owned by the user this plugin runs as,
+    with no access for group or others; anything else could have been
+    written or read by someone else.  Returns None if it cannot be used."""
     path = os.path.expanduser(BRIDGE_SECRET_FILE)
     try:
-        with open(path, "r") as f:
-            secret = f.read(256).strip()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as e:
         log(f"Cannot read bridge secret {path}: {e}")
         return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() \
+                or st.st_mode & 0o077:
+            log(f"Bridge secret {path} must be a regular file owned by this "
+                f"user with mode 0600")
+            return None
+        secret = os.read(fd, 256).decode("ascii", "replace").strip()
+    except OSError as e:
+        log(f"Cannot read bridge secret {path}: {e}")
+        return None
+    finally:
+        os.close(fd)
     if not _is_hash(secret):
         log(f"Bridge secret {path} is not 64 hex characters")
         return None
     return secret
+
+
+AUTH_LABEL = b"superscalar-bridge-plugin-auth-v1/"
+AUTH_TIMEOUT = 10   # seconds the bridge has for each handshake step
+
+
+def auth_proof(secret, role, plugin_nonce, bridge_nonce):
+    """What one side sends to show it knows the secret: HMAC-SHA256 keyed
+    with the secret over the side's role and both nonces (hex)."""
+    return hmac.new(bytes.fromhex(secret),
+                    AUTH_LABEL + role + b"/" + plugin_nonce + bridge_nonce,
+                    hashlib.sha256).hexdigest()
+
+
+def _recv_line(sock, limit=1024):
+    """Read one newline-terminated line, a byte at a time so nothing past
+    it is consumed.  Returns None if the peer closes or sends too much."""
+    line = b""
+    while len(line) < limit:
+        c = sock.recv(1)
+        if not c:
+            return None
+        if c == b"\n":
+            return line
+        line += c
+    return None
+
+
+def authenticate_bridge(sock, secret):
+    """Run the handshake on a fresh connection.  Returns True only if the
+    peer proved it holds the secret; our own proof is sent after that and
+    the secret itself is never sent."""
+    plugin_nonce = os.urandom(32)
+    sock.sendall((json.dumps({"method": "auth_hello",
+                              "nonce": plugin_nonce.hex()}) + "\n").encode())
+    try:
+        challenge = json.loads(_recv_line(sock) or b"null")
+    except ValueError:
+        challenge = None
+    if not isinstance(challenge, dict) \
+            or challenge.get("method") != "auth_challenge" \
+            or not _is_hash(challenge.get("nonce")) \
+            or not _is_hash(challenge.get("proof")):
+        log("Bridge did not answer the handshake")
+        return False
+    bridge_nonce = bytes.fromhex(challenge["nonce"])
+    expected = auth_proof(secret, b"bridge", plugin_nonce, bridge_nonce)
+    if not hmac.compare_digest(expected, challenge["proof"].lower()):
+        log("Peer on the bridge port does not hold the bridge secret")
+        return False
+
+    sock.sendall((json.dumps({
+        "method": "auth_response",
+        "proof": auth_proof(secret, b"plugin", plugin_nonce, bridge_nonce)
+    }) + "\n").encode())
+    try:
+        accepted = json.loads(_recv_line(sock) or b"null")
+    except ValueError:
+        accepted = None
+    if not isinstance(accepted, dict) or accepted.get("method") != "auth_ok":
+        log("Bridge did not accept our proof")
+        return False
+    return True
 
 
 # BOLT #4 failure codes for the htlc_accepted hook (hex, no data)
@@ -256,25 +338,35 @@ def recover_registered_invoices():
 
 
 def connect_bridge():
-    """Connect to the SuperScalar bridge daemon and authenticate.
+    """Connect to the SuperScalar bridge daemon and authenticate it.
 
     The secret is read afresh on every attempt (the bridge may have been
-    started, and the file created, after this plugin) and sent as the first
-    message; the bridge drops the connection if it is wrong."""
+    started, and the file created, after this plugin).  The connection only
+    becomes the bridge link, from which messages are read and acted on,
+    once the peer has proven that it holds the secret."""
     global bridge_sock
     secret = read_bridge_secret()
     if secret is None:
         return False
+    sock = None
     try:
-        sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT))
-        auth = json.dumps({"method": "auth", "token": secret}) + "\n"
-        sock.sendall(auth.encode())
+        sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT),
+                                        timeout=AUTH_TIMEOUT)
+        if not authenticate_bridge(sock, secret):
+            sock.close()
+            return False
+        sock.settimeout(None)
         with lock:
             bridge_sock = sock
         log(f"Connected to bridge at {BRIDGE_HOST}:{BRIDGE_PORT}")
         return True
     except Exception as e:
         log(f"Failed to connect to bridge: {e}")
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
         return False
 
 
@@ -330,10 +422,7 @@ def handle_bridge_msg(msg):
     """Handle a message from the bridge."""
     method = msg.get("method", "")
 
-    if method == "auth_ok":
-        log("Bridge accepted our secret")
-
-    elif method == "htlc_resolve":
+    if method == "htlc_resolve":
         payment_hash = msg.get("payment_hash", "")
         result = msg.get("result")
         log(f"htlc_resolve: hash={payment_hash[:16]}... result={result}")

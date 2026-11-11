@@ -9,9 +9,24 @@
 
 #define BRIDGE_MAX_PENDING 256
 
-/* The CLN plugin proves itself with a shared secret: 32 random bytes, kept
-   as 64 hex characters in a file only its owner can read. */
+/* The bridge and the CLN plugin share a secret: 32 random bytes, kept as
+   64 hex characters in a file only its owner can read.  It never crosses
+   the link.  Each side sends a random nonce and proves it knows the secret
+   with HMAC-SHA256(secret, label || plugin nonce || bridge nonce), where
+   the label names the side giving the proof:
+
+     plugin -> bridge  {"method":"auth_hello","nonce":<plugin nonce>}
+     bridge -> plugin  {"method":"auth_challenge","nonce":<bridge nonce>,
+                        "proof":<bridge's proof>}
+     plugin -> bridge  {"method":"auth_response","proof":<plugin's proof>}
+     bridge -> plugin  {"method":"auth_ok"}
+
+   The plugin checks the bridge's proof before it answers, and the bridge
+   treats the connection as the plugin only after the plugin's proof. */
 #define BRIDGE_PLUGIN_SECRET_HEX_LEN 64
+#define BRIDGE_AUTH_NONCE_LEN        32
+#define BRIDGE_AUTH_ROLE_BRIDGE      "bridge"
+#define BRIDGE_AUTH_ROLE_PLUGIN      "plugin"
 #define BRIDGE_PLUGIN_BIND_DEFAULT   "127.0.0.1"
 /* Seconds a new connection has to present the secret. */
 #define BRIDGE_PLUGIN_AUTH_TIMEOUT   10
@@ -34,8 +49,11 @@ typedef struct {
        to it as plugin traffic. */
     int plugin_pending_fd;               /* accepted, not yet authenticated */
     time_t plugin_pending_since;
-    char plugin_pending_buf[512];        /* its first line, as it arrives */
+    char plugin_pending_buf[512];        /* its current line, as it arrives */
     size_t plugin_pending_len;
+    int plugin_pending_challenged;       /* 1 once our challenge is out */
+    unsigned char plugin_nonce_peer[BRIDGE_AUTH_NONCE_LEN];
+    unsigned char plugin_nonce_own[BRIDGE_AUTH_NONCE_LEN];
     char plugin_secret[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
     int has_plugin_secret;
 
@@ -109,11 +127,20 @@ int bridge_listen_plugin(bridge_t *br, const char *bind_addr, int plugin_port);
    Returns 1 if a connection is now pending, 0 otherwise. */
 int bridge_accept_plugin(bridge_t *br);
 
-/* Read what the pending connection has sent.  Its first line must be
-   {"method":"auth","token":"<secret>"}; the token is compared in constant
-   time.  Returns 1 once it is authenticated (it is then plugin_fd), 0 if
-   the line is not complete yet, -1 if the connection was dropped. */
+/* Read what the pending connection has sent and take the handshake one
+   step further: answer its auth_hello with our challenge and proof, then
+   check the proof in its auth_response in constant time.  Returns 1 once
+   it is authenticated (it is then plugin_fd), 0 while the handshake is
+   still under way, -1 if the connection was dropped. */
 int bridge_service_pending_plugin(bridge_t *br);
+
+/* The proof one side gives: HMAC-SHA256 keyed with the secret over
+   "superscalar-bridge-plugin-auth-v1/" role "/" plugin nonce bridge nonce.
+   Returns 0 if secret_hex is not a 64-hex secret. */
+int bridge_plugin_auth_proof(const char *secret_hex, const char *role,
+                              const unsigned char *plugin_nonce,
+                              const unsigned char *bridge_nonce,
+                              unsigned char proof_out[32]);
 
 /* Drop a pending connection that has not authenticated within
    BRIDGE_PLUGIN_AUTH_TIMEOUT seconds of `now`.  Returns 1 if dropped. */

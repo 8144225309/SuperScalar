@@ -1,4 +1,5 @@
 #include "superscalar/bridge.h"
+#include "superscalar/noise.h"
 #include <secp256k1.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
+
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
 void bridge_init(bridge_t *br) {
     memset(br, 0, sizeof(*br));
@@ -122,11 +125,47 @@ static int is_secret_hex(const char *s) {
 
 /* Compare two n-byte buffers without an early exit, so the time taken does
    not reveal how many leading bytes matched. */
-static int ct_equal(const char *a, const char *b, size_t n) {
+static int ct_equal(const unsigned char *a, const unsigned char *b, size_t n) {
     unsigned char diff = 0;
     for (size_t i = 0; i < n; i++)
-        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+        diff |= a[i] ^ b[i];
     return diff == 0;
+}
+
+static int read_random(unsigned char *out, size_t len) {
+    int rfd = open("/dev/urandom", O_RDONLY);
+    if (rfd < 0) return 0;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = read(rfd, out + got, len - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(rfd);
+    return got == len;
+}
+
+int bridge_plugin_auth_proof(const char *secret_hex, const char *role,
+                              const unsigned char *plugin_nonce,
+                              const unsigned char *bridge_nonce,
+                              unsigned char proof_out[32]) {
+    static const char label[] = "superscalar-bridge-plugin-auth-v1/";
+    unsigned char key[BRIDGE_PLUGIN_SECRET_HEX_LEN / 2];
+    unsigned char msg[sizeof(label) + 16 + 2 * BRIDGE_AUTH_NONCE_LEN];
+    size_t role_len = role ? strlen(role) : 0;
+    if (!is_secret_hex(secret_hex) || role_len == 0 || role_len > 15 ||
+        hex_decode(secret_hex, key, sizeof(key)) != (int)sizeof(key))
+        return 0;
+    size_t n = 0;
+    memcpy(msg + n, label, sizeof(label) - 1); n += sizeof(label) - 1;
+    memcpy(msg + n, role, role_len);           n += role_len;
+    msg[n++] = '/';
+    memcpy(msg + n, plugin_nonce, BRIDGE_AUTH_NONCE_LEN); n += BRIDGE_AUTH_NONCE_LEN;
+    memcpy(msg + n, bridge_nonce, BRIDGE_AUTH_NONCE_LEN); n += BRIDGE_AUTH_NONCE_LEN;
+    hmac_sha256(proof_out, key, sizeof(key), msg, n);
+    memset(key, 0, sizeof(key));
+    return 1;
 }
 
 static int write_all(int fd, const char *buf, size_t len) {
@@ -142,17 +181,7 @@ static int write_all(int fd, const char *buf, size_t len) {
 
 static int secret_create(const char *path, char *out_hex) {
     unsigned char raw[BRIDGE_PLUGIN_SECRET_HEX_LEN / 2];
-    int rfd = open("/dev/urandom", O_RDONLY);
-    if (rfd < 0) return 0;
-    size_t got = 0;
-    while (got < sizeof(raw)) {
-        ssize_t r = read(rfd, raw + got, sizeof(raw) - got);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        got += (size_t)r;
-    }
-    close(rfd);
-    if (got != sizeof(raw)) return 0;
+    if (!read_random(raw, sizeof(raw))) return 0;
 
     static const char digits[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(raw); i++) {
@@ -268,7 +297,10 @@ static void drop_pending_plugin(bridge_t *br) {
         wire_close(br->plugin_pending_fd);
     br->plugin_pending_fd = -1;
     br->plugin_pending_len = 0;
+    br->plugin_pending_challenged = 0;
     memset(br->plugin_pending_buf, 0, sizeof(br->plugin_pending_buf));
+    memset(br->plugin_nonce_peer, 0, sizeof(br->plugin_nonce_peer));
+    memset(br->plugin_nonce_own, 0, sizeof(br->plugin_nonce_own));
 }
 
 int bridge_accept_plugin(bridge_t *br) {
@@ -286,6 +318,7 @@ int bridge_accept_plugin(bridge_t *br) {
     br->plugin_pending_fd = fd;
     br->plugin_pending_since = time(NULL);
     br->plugin_pending_len = 0;
+    br->plugin_pending_challenged = 0;
     return 1;
 }
 
@@ -297,20 +330,64 @@ int bridge_expire_pending_plugin(bridge_t *br, time_t now) {
     return 1;
 }
 
-/* 1 if `line` is the auth message carrying this bridge's secret. */
-static int plugin_auth_line_ok(const bridge_t *br, const char *line) {
+/* A 32-byte value given as 64 hex characters in a JSON string field. */
+static int json_get_hex32(const cJSON *json, const char *name,
+                           unsigned char out[32]) {
+    cJSON *item = cJSON_GetObjectItem(json, name);
+    return item && cJSON_IsString(item) &&
+           strlen(item->valuestring) == 64 &&
+           hex_decode(item->valuestring, out, 32) == 32;
+}
+
+static int json_method_is(const cJSON *json, const char *name) {
+    cJSON *method = cJSON_GetObjectItem(json, "method");
+    return method && cJSON_IsString(method) &&
+           strcmp(method->valuestring, name) == 0;
+}
+
+/* First line of a new connection: its nonce.  Answer with ours and the
+   proof that this is the bridge.  Returns 1 if the challenge went out. */
+static int plugin_auth_hello(bridge_t *br, const char *line) {
     if (!br->has_plugin_secret) return 0;
     cJSON *json = cJSON_Parse(line);
     if (!json) return 0;
-    int ok = 0;
-    cJSON *method = cJSON_GetObjectItem(json, "method");
-    cJSON *token = cJSON_GetObjectItem(json, "token");
-    if (method && cJSON_IsString(method) &&
-        strcmp(method->valuestring, "auth") == 0 &&
-        token && cJSON_IsString(token) &&
-        strlen(token->valuestring) == BRIDGE_PLUGIN_SECRET_HEX_LEN)
-        ok = ct_equal(token->valuestring, br->plugin_secret,
-                      BRIDGE_PLUGIN_SECRET_HEX_LEN);
+    int ok = json_method_is(json, "auth_hello") &&
+             json_get_hex32(json, "nonce", br->plugin_nonce_peer);
+    cJSON_Delete(json);
+    if (!ok) return 0;
+
+    unsigned char proof[32];
+    if (!read_random(br->plugin_nonce_own, sizeof(br->plugin_nonce_own)) ||
+        !bridge_plugin_auth_proof(br->plugin_secret, BRIDGE_AUTH_ROLE_BRIDGE,
+                                   br->plugin_nonce_peer, br->plugin_nonce_own,
+                                   proof))
+        return 0;
+
+    cJSON *ch = cJSON_CreateObject();
+    cJSON_AddStringToObject(ch, "method", "auth_challenge");
+    wire_json_add_hex(ch, "nonce", br->plugin_nonce_own,
+                      sizeof(br->plugin_nonce_own));
+    wire_json_add_hex(ch, "proof", proof, sizeof(proof));
+    char *str = cJSON_PrintUnformatted(ch);
+    cJSON_Delete(ch);
+    if (!str) return 0;
+    ok = write_all(br->plugin_pending_fd, str, strlen(str)) &&
+         write_all(br->plugin_pending_fd, "\n", 1);
+    free(str);
+    return ok;
+}
+
+/* Second line: the proof that the other side is the plugin. */
+static int plugin_auth_response_ok(const bridge_t *br, const char *line) {
+    cJSON *json = cJSON_Parse(line);
+    if (!json) return 0;
+    unsigned char given[32], expected[32];
+    int ok = json_method_is(json, "auth_response") &&
+             json_get_hex32(json, "proof", given) &&
+             bridge_plugin_auth_proof(br->plugin_secret, BRIDGE_AUTH_ROLE_PLUGIN,
+                                       br->plugin_nonce_peer,
+                                       br->plugin_nonce_own, expected) &&
+             ct_equal(given, expected, sizeof(expected));
     cJSON_Delete(json);
     return ok;
 }
@@ -327,46 +404,60 @@ int bridge_service_pending_plugin(bridge_t *br) {
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
         return 0;
     if (n <= 0) {
-        /* Closed, failed, or a first line too long to be an auth message. */
+        /* Closed, failed, or a line too long to be a handshake message. */
         drop_pending_plugin(br);
         return -1;
     }
     br->plugin_pending_len += (size_t)n;
 
-    char *nl = memchr(br->plugin_pending_buf, '\n', br->plugin_pending_len);
-    if (!nl) {
-        if (br->plugin_pending_len == sizeof(br->plugin_pending_buf)) {
+    for (;;) {
+        char *nl = memchr(br->plugin_pending_buf, '\n', br->plugin_pending_len);
+        if (!nl) {
+            if (br->plugin_pending_len == sizeof(br->plugin_pending_buf)) {
+                drop_pending_plugin(br);
+                return -1;
+            }
+            return 0;
+        }
+        *nl = '\0';
+        size_t used = (size_t)(nl - br->plugin_pending_buf) + 1;
+        size_t rest = br->plugin_pending_len - used;
+
+        if (!br->plugin_pending_challenged) {
+            if (!plugin_auth_hello(br, br->plugin_pending_buf)) {
+                fprintf(stderr, "Bridge: plugin connection did not start "
+                        "the handshake\n");
+                drop_pending_plugin(br);
+                return -1;
+            }
+            br->plugin_pending_challenged = 1;
+            memmove(br->plugin_pending_buf, br->plugin_pending_buf + used, rest);
+            br->plugin_pending_len = rest;
+            continue;
+        }
+
+        if (!plugin_auth_response_ok(br, br->plugin_pending_buf)) {
+            fprintf(stderr, "Bridge: plugin connection failed authentication\n");
             drop_pending_plugin(br);
             return -1;
         }
-        return 0;
-    }
 
-    *nl = '\0';
-    if (!plugin_auth_line_ok(br, br->plugin_pending_buf)) {
-        fprintf(stderr, "Bridge: plugin connection failed authentication\n");
+        /* Authenticated: this is the plugin.  Anything it sent after its
+           proof is ordinary plugin traffic. */
+        memcpy(br->plugin_read_buf, br->plugin_pending_buf + used, rest);
+        br->plugin_read_len = rest;
+        br->plugin_read_pos = 0;
+        br->plugin_fd = br->plugin_pending_fd;
+        br->plugin_pending_fd = -1;
         drop_pending_plugin(br);
-        return -1;
+        printf("Bridge: plugin connected and authenticated\n");
+
+        cJSON *ack = cJSON_CreateObject();
+        cJSON_AddStringToObject(ack, "method", "auth_ok");
+        bridge_send_plugin_json(br, ack);
+        cJSON_Delete(ack);
+        return 1;
     }
-
-    /* Authenticated: this is the plugin.  Anything it sent after the auth
-       line is ordinary plugin traffic. */
-    size_t used = (size_t)(nl - br->plugin_pending_buf) + 1;
-    size_t rest = br->plugin_pending_len - used;
-    memcpy(br->plugin_read_buf, br->plugin_pending_buf + used, rest);
-    br->plugin_read_len = rest;
-    br->plugin_read_pos = 0;
-    br->plugin_fd = br->plugin_pending_fd;
-    br->plugin_pending_fd = -1;
-    br->plugin_pending_len = 0;
-    memset(br->plugin_pending_buf, 0, sizeof(br->plugin_pending_buf));
-    printf("Bridge: plugin connected and authenticated\n");
-
-    cJSON *ack = cJSON_CreateObject();
-    cJSON_AddStringToObject(ack, "method", "auth_ok");
-    bridge_send_plugin_json(br, ack);
-    cJSON_Delete(ack);
-    return 1;
 }
 
 uint64_t bridge_add_pending(bridge_t *br, const unsigned char *payment_hash32) {

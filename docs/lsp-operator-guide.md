@@ -423,14 +423,17 @@ The LSP automatically accepts bridge connections on its main port.
 The bridge connects to the LSP and listens on `--plugin-port` for the CLN plugin.
 
 The plugin port is bound to `127.0.0.1` unless `--plugin-bind` names another
-address, and only a plugin that presents the bridge's shared secret is
-accepted. On first start the bridge writes a random secret to
+address. The bridge and the plugin authenticate each other with a shared
+secret. On first start the bridge writes a random secret to
 `--plugin-secret-file` (default `~/.superscalar/bridge-plugin.secret`, mode
-`0600`); the plugin reads the same file. If CLN runs as a different user or on
-another host, copy the file there (keep it `0600`) and point the plugin at it
-with `--superscalar-bridge-secret-file`. The link itself is not encrypted, so
-keep it on loopback or a trusted network. Only one plugin connection is served
-at a time; further connections are closed.
+`0600`); the plugin reads the same file. The secret is never sent: each side
+sends a random nonce and proves it holds the secret with an HMAC over both
+nonces, the plugin checks the bridge first, and neither side acts on a message
+from a peer that has not passed. Both sides refuse a secret file that is not a
+regular file owned by their own user with no group or other permissions. The
+link itself is not encrypted and messages after the handshake are not
+individually authenticated, so keep it on loopback or a trusted network. Only
+one plugin connection is served at a time; further connections are closed.
 
 ### Step 3: Start CLN with the Plugin
 
@@ -522,7 +525,8 @@ lightning-cli plugin list | grep cln_plugin
 | "bridge socketpair failed" | Check file descriptor limits: `ulimit -n 4096` |
 | "no --lsp-pubkey, using unauthenticated NN handshake" | Add `--lsp-pubkey` with the LSP's static pubkey for production |
 | Plugin not connecting | Verify `--superscalar-bridge-port` matches `--plugin-port` |
-| Bridge logs `plugin connection failed authentication` | The plugin's `--superscalar-bridge-secret-file` does not hold the secret in the bridge's `--plugin-secret-file` |
+| Bridge logs `plugin connection failed authentication`, or the plugin logs `Peer on the bridge port does not hold the bridge secret` | The plugin's `--superscalar-bridge-secret-file` does not hold the secret in the bridge's `--plugin-secret-file` |
+| Plugin logs `Bridge secret ... must be a regular file owned by this user with mode 0600` | Fix the owner and mode of the plugin's copy of the secret file |
 | "INVOICE_BOLT11 for unknown hash" | Client must send `MSG_REGISTER_INVOICE` before the external payment arrives |
 | Bridge heartbeat timeout | Check network connectivity between bridge and LSP; default timeout is 30 seconds |
 | "htlc_accepted hook timeout" | Increase CLN's hook timeout or check bridge ↔ LSP latency |

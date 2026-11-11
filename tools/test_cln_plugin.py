@@ -670,17 +670,60 @@ class InboundHtlcTest(PluginTestCase):
             (21, {"result": "resolve", "payment_key": PREIMAGE})])
 
 
+class FakeBridge:
+    """The bridge's end of a new connection, as a socket for the plugin.
+    `secret` is what this peer holds (None: it holds none and bluffs)."""
+
+    def __init__(self, secret, instead_of_challenge=None, accept=True):
+        self.secret = secret
+        self.instead_of_challenge = instead_of_challenge
+        self.accept = accept
+        self.sent = []            # decoded lines the plugin sent
+        self.raw = b""
+        self.inbox = b""
+        self.nonce = bytes(range(32))
+        self.closed = False
+        self.timeout = "unset"
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def close(self):
+        self.closed = True
+
+    def recv(self, n):
+        out, self.inbox = self.inbox[:n], self.inbox[n:]
+        return out
+
+    def _reply(self, obj):
+        self.inbox += (json.dumps(obj) + "\n").encode()
+
+    def sendall(self, data):
+        self.raw += data
+        for line in data.split(b"\n"):
+            if not line:
+                continue
+            msg = json.loads(line)
+            self.sent.append(msg)
+            if msg["method"] == "auth_hello":
+                self.plugin_nonce = bytes.fromhex(msg["nonce"])
+                if self.instead_of_challenge is not None:
+                    self._reply(self.instead_of_challenge)
+                    continue
+                key = self.secret or "00" * 32
+                self._reply({
+                    "method": "auth_challenge", "nonce": self.nonce.hex(),
+                    "proof": cln_plugin.auth_proof(
+                        key, b"bridge", self.plugin_nonce, self.nonce)})
+            elif msg["method"] == "auth_response" and self.accept:
+                self._reply({"method": "auth_ok"})
+
+
 class BridgeAuthTest(PluginTestCase):
-    """The plugin presents the bridge's shared secret before anything else."""
+    """Neither side sends the secret; the plugin answers, and listens to,
+    only a peer that has proven it holds it."""
 
     SECRET = "5c" * 32
-
-    class FakeSocket:
-        def __init__(self):
-            self.sent = b""
-
-        def sendall(self, data):
-            self.sent += data
 
     def setUp(self):
         super().setUp()
@@ -693,49 +736,152 @@ class BridgeAuthTest(PluginTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def write_secret(self, text):
+    def write_secret(self, text, mode=0o600):
         with open(self.secret_path, "w") as f:
             f.write(text)
+        os.chmod(self.secret_path, mode)
 
-    def connect(self):
-        sock = self.FakeSocket()
+    def connect(self, bridge):
         with mock.patch.object(cln_plugin.socket, "create_connection",
-                               return_value=sock) as create:
+                               return_value=bridge) as create:
             ok = cln_plugin.connect_bridge()
-        return ok, sock, create
+        return ok, create
 
-    def test_secret_is_the_first_message(self):
+    def test_handshake_with_the_real_bridge(self):
         self.write_secret(self.SECRET + "\n")
-        ok, sock, create = self.connect()
+        bridge = FakeBridge(self.SECRET)
+        ok, create = self.connect(bridge)
         self.assertTrue(ok)
         create.assert_called_once()
-        first_line, rest = sock.sent.split(b"\n", 1)
-        self.assertEqual(json.loads(first_line),
-                         {"method": "auth", "token": self.SECRET})
-        self.assertEqual(rest, b"")
-        self.assertIs(cln_plugin.bridge_sock, sock)
+        self.assertEqual([m["method"] for m in bridge.sent],
+                         ["auth_hello", "auth_response"])
+        self.assertEqual(bridge.sent[1]["proof"], cln_plugin.auth_proof(
+            self.SECRET, b"plugin", bridge.plugin_nonce, bridge.nonce))
+        self.assertIs(cln_plugin.bridge_sock, bridge)
+        self.assertIsNone(bridge.timeout)       # blocking reads from here on
+        self.assertEqual(bridge.inbox, b"")     # nothing swallowed
+
+    def test_proofs_match_the_bridge_implementation(self):
+        # The same fixed values are asserted in the bridge's C tests.
+        secret = "00112233445566778899aabbccddeeff" * 2
+        np, nb = b"" * 32, b"" * 32
+        self.assertEqual(
+            cln_plugin.auth_proof(secret, b"plugin", np, nb),
+            "7f0ce9d7bbc1eb564d7696fb9dc9cd3d8ba0f4c0ef0da075860610dcc7ad929e")
+        self.assertEqual(
+            cln_plugin.auth_proof(secret, b"bridge", np, nb),
+            "3b505ab3809df5713d5f24a15bda1465e41680ccf6ec56a5763c789ed46f5aa1")
+
+    def test_the_secret_is_never_sent(self):
+        self.write_secret(self.SECRET)
+        for bridge in (FakeBridge(self.SECRET), FakeBridge(None),
+                       FakeBridge("ab" * 32)):
+            self.connect(bridge)
+            self.assertNotIn(self.SECRET.encode(), bridge.raw.lower())
+            self.assertNotIn(bytes.fromhex(self.SECRET), bridge.raw)
+
+    def test_a_fresh_nonce_every_time(self):
+        self.write_secret(self.SECRET)
+        first, second = FakeBridge(self.SECRET), FakeBridge(self.SECRET)
+        self.connect(first)
+        self.connect(second)
+        self.assertNotEqual(first.sent[0]["nonce"], second.sent[0]["nonce"])
+        self.assertEqual(len(bytes.fromhex(first.sent[0]["nonce"])), 32)
+
+    def test_peer_without_the_secret_gets_no_proof_and_no_link(self):
+        self.write_secret(self.SECRET)
+        # Something else listening on the bridge's port.
+        for impostor in (FakeBridge(None), FakeBridge("ab" * 32)):
+            ok, _ = self.connect(impostor)
+            self.assertFalse(ok)
+            # It saw our nonce and nothing derived from the secret.
+            self.assertEqual([m["method"] for m in impostor.sent], ["auth_hello"])
+            self.assertIsNone(cln_plugin.bridge_sock)
+            self.assertTrue(impostor.closed)
+
+    def test_messages_from_an_unproven_peer_are_not_acted_on(self):
+        self.write_secret(self.SECRET)
+        handled = []
+        pay = {"method": "pay_request", "bolt11": BOLT11, "request_id": 1,
+               "payment_hash": PAYMENT_HASH, "max_total_msat": 10 ** 9,
+               "max_delay": 100}
+        for first_reply in (pay, {"method": "auth_ok"},
+                            {"method": "auth_challenge", "nonce": "zz",
+                             "proof": "00" * 32},
+                            {"method": "auth_challenge",
+                             "nonce": "11" * 32}, [1, 2], "text"):
+            impostor = FakeBridge(None, instead_of_challenge=first_reply)
+            with mock.patch.object(cln_plugin, "handle_bridge_msg",
+                                   handled.append):
+                ok, _ = self.connect(impostor)
+            self.assertFalse(ok, first_reply)
+            self.assertEqual(len(impostor.sent), 1)
+            self.assertIsNone(cln_plugin.bridge_sock)
+        self.assertEqual(handled, [])
+
+    def test_reflected_plugin_proof_is_not_a_bridge_proof(self):
+        self.write_secret(self.SECRET)
+
+        class Reflector(FakeBridge):
+            def sendall(self, data):
+                msg = json.loads(data)
+                self.sent.append(msg)
+                if msg["method"] == "auth_hello":
+                    nonce = bytes.fromhex(msg["nonce"])
+                    # the proof the *plugin* would give for these nonces
+                    self._reply({
+                        "method": "auth_challenge", "nonce": self.nonce.hex(),
+                        "proof": cln_plugin.auth_proof(
+                            BridgeAuthTest.SECRET, b"plugin", nonce, self.nonce)})
+
+        ok, _ = self.connect(Reflector(None))
+        self.assertFalse(ok)
+
+    def test_bridge_that_rejects_our_proof_is_not_used(self):
+        self.write_secret(self.SECRET)
+        bridge = FakeBridge(self.SECRET, accept=False)
+        ok, _ = self.connect(bridge)
+        self.assertFalse(ok)
+        self.assertIsNone(cln_plugin.bridge_sock)
 
     def test_secret_is_read_again_on_every_connect(self):
         self.write_secret("aa" * 32)
-        _, first, _ = self.connect()
+        self.assertTrue(self.connect(FakeBridge("aa" * 32))[0])
         self.write_secret("bb" * 32)
-        _, second, _ = self.connect()
-        self.assertEqual(json.loads(first.sent)["token"], "aa" * 32)
-        self.assertEqual(json.loads(second.sent)["token"], "bb" * 32)
+        self.assertTrue(self.connect(FakeBridge("bb" * 32))[0])
+        self.assertFalse(self.connect(FakeBridge("aa" * 32))[0])
 
-    def test_no_connection_without_a_secret(self):
-        ok, sock, create = self.connect()   # file does not exist
-        self.assertFalse(ok)
-        create.assert_not_called()
-        self.assertIsNone(cln_plugin.bridge_sock)
+    def test_no_connection_without_a_usable_secret_file(self):
+        def refused():
+            bridge = FakeBridge(self.SECRET)
+            ok, create = self.connect(bridge)
+            create.assert_not_called()
+            return not ok and bridge.raw == b""
 
-    def test_no_connection_with_a_malformed_secret(self):
+        self.assertTrue(refused(), "missing file")
         for text in ("", "short", "zz" * 32, "5c" * 33):
             self.write_secret(text)
-            ok, sock, create = self.connect()
-            self.assertFalse(ok, text)
-            create.assert_not_called()
-            self.assertEqual(sock.sent, b"")
+            self.assertTrue(refused(), text)
+        # Readable by group or others: someone else may know it.
+        for mode in (0o640, 0o604, 0o660, 0o644):
+            self.write_secret(self.SECRET, mode)
+            self.assertTrue(refused(), oct(mode))
+        # Owned by another user.
+        self.write_secret(self.SECRET)
+        with mock.patch.object(cln_plugin.os, "geteuid",
+                               return_value=os.geteuid() + 1):
+            self.assertTrue(refused(), "foreign owner")
+        # A symlink, or not a regular file.
+        real = os.path.join(self.dir.name, "real.secret")
+        os.rename(self.secret_path, real)
+        os.symlink(real, self.secret_path)
+        self.assertTrue(refused(), "symlink")
+        os.unlink(self.secret_path)
+        os.mkdir(self.secret_path)
+        self.assertTrue(refused(), "directory")
+        os.rmdir(self.secret_path)
+        os.rename(real, self.secret_path)
+        self.assertTrue(self.connect(FakeBridge(self.SECRET))[0])
 
     def test_home_directory_is_expanded(self):
         with mock.patch.object(cln_plugin, "BRIDGE_SECRET_FILE",
