@@ -81,46 +81,66 @@ int bip39_entropy_to_mnemonic(const unsigned char *entropy, size_t entropy_len,
     return 1;
 }
 
-size_t bip39_mnemonic_to_entropy(const char *mnemonic,
-                                  unsigned char *entropy_out, size_t entropy_max) {
-    if (!mnemonic || !entropy_out) return 0;
+#define BIP39_MAX_WORDS 24
+/* Longest wordlist entry is 8 letters. */
+#define BIP39_MAX_WORD_LEN 8
 
-    /* Tokenize words — work on a copy */
-    size_t mlen = strlen(mnemonic);
-    char *copy = malloc(mlen + 1);
-    if (!copy) return 0;
-    memcpy(copy, mnemonic, mlen + 1);
+static int is_separator(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
 
-    /* Count and collect word indices */
-    int indices[24];
+/* Split a phrase into wordlist indices.  Words may be separated, preceded and
+   followed by any amount of ASCII whitespace.  Rejects words that are not in
+   the wordlist and phrases whose length is not 12, 15, 18, 21 or 24 words. */
+static bip39_status_t parse_words(const char *mnemonic,
+                                  int indices[BIP39_MAX_WORDS], size_t *n_words_out) {
     size_t n_words = 0;
+    const char *p = mnemonic;
 
-    char *saveptr = NULL;
-    char *tok = strtok_r(copy, " \t\n", &saveptr);
-    while (tok && n_words < 24) {
-        int idx = word_index(tok);
-        if (idx < 0) { free(copy); return 0; } /* unknown word */
+    for (;;) {
+        while (is_separator(*p)) p++;
+        if (*p == '\0') break;
+
+        const char *start = p;
+        while (*p != '\0' && !is_separator(*p)) p++;
+        size_t len = (size_t)(p - start);
+
+        if (len > BIP39_MAX_WORD_LEN) return BIP39_ERR_UNKNOWN_WORD;
+        char word[BIP39_MAX_WORD_LEN + 1];
+        memcpy(word, start, len);
+        word[len] = '\0';
+        int idx = word_index(word);
+        secure_zero(word, sizeof(word));
+        if (idx < 0) return BIP39_ERR_UNKNOWN_WORD;
+
+        if (n_words == BIP39_MAX_WORDS) return BIP39_ERR_WORD_COUNT;
         indices[n_words++] = idx;
-        tok = strtok_r(NULL, " \t\n", &saveptr);
     }
-    free(copy);
 
-    /* Valid word counts: 12, 15, 18, 21, 24 */
-    if (n_words < 12 || n_words > 24 || n_words % 3 != 0)
-        return 0;
+    if (n_words < 12 || n_words % 3 != 0) return BIP39_ERR_WORD_COUNT;
+
+    *n_words_out = n_words;
+    return BIP39_OK;
+}
+
+/* Parse and checksum-verify a phrase.  On success fills indices/n_words and,
+   if entropy_out is non-NULL, the entropy (up to 32 bytes) and its length. */
+static bip39_status_t decode(const char *mnemonic,
+                             int indices[BIP39_MAX_WORDS], size_t *n_words_out,
+                             unsigned char *entropy_out, size_t *entropy_len_out) {
+    if (!mnemonic) return BIP39_ERR_WORD_COUNT;
+
+    size_t n_words = 0;
+    bip39_status_t st = parse_words(mnemonic, indices, &n_words);
+    if (st != BIP39_OK) return st;
 
     size_t total_bits = n_words * 11;
     size_t cs_bits = total_bits / 33;  /* ENT/32 = cs_bits, total = ENT + cs */
-    size_t ent_bits = total_bits - cs_bits;
-    size_t ent_bytes = ent_bits / 8;
+    size_t ent_bytes = (total_bits - cs_bits) / 8;
 
-    if (ent_bytes > entropy_max) return 0;
-
-    /* Reconstruct bit buffer from 11-bit indices */
-    size_t buf_len = (total_bits + 7) / 8;
-    unsigned char *buf = calloc(buf_len, 1);
-    if (!buf) return 0;
-
+    /* Reconstruct bit buffer from 11-bit indices: 24 words = 264 bits = 33 bytes */
+    unsigned char buf[33];
+    memset(buf, 0, sizeof(buf));
     for (size_t w = 0; w < n_words; w++) {
         int idx = indices[w];
         size_t bit_offset = w * 11;
@@ -132,30 +152,98 @@ size_t bip39_mnemonic_to_entropy(const char *mnemonic,
         }
     }
 
-    /* Extract entropy (first ent_bytes) */
-    memcpy(entropy_out, buf, ent_bytes);
-
-    /* Verify checksum */
+    /* Compare the first cs_bits of SHA-256(entropy) with the checksum bits */
     unsigned char hash[32];
-    sha256(entropy_out, ent_bytes, hash);
-
-    /* Compare first cs_bits of hash with extracted checksum bits */
-    unsigned char cs_from_data = buf[ent_bytes];
-    unsigned char cs_from_hash = hash[0];
-    /* Mask to cs_bits */
+    sha256(buf, ent_bytes, hash);
     unsigned char mask = (unsigned char)(0xFF << (8 - cs_bits));
+    int cs_ok = (buf[ent_bytes] & mask) == (hash[0] & mask);
 
-    free(buf);
+    if (cs_ok) {
+        if (entropy_out) memcpy(entropy_out, buf, ent_bytes);
+        if (entropy_len_out) *entropy_len_out = ent_bytes;
+        if (n_words_out) *n_words_out = n_words;
+    }
+    secure_zero(buf, sizeof(buf));
+    secure_zero(hash, sizeof(hash));
+    return cs_ok ? BIP39_OK : BIP39_ERR_CHECKSUM;
+}
 
-    if ((cs_from_data & mask) != (cs_from_hash & mask))
-        return 0;  /* checksum mismatch */
+size_t bip39_mnemonic_to_entropy(const char *mnemonic,
+                                  unsigned char *entropy_out, size_t entropy_max) {
+    if (!mnemonic || !entropy_out) return 0;
 
+    int indices[BIP39_MAX_WORDS];
+    unsigned char entropy[32];
+    size_t ent_bytes = 0;
+    bip39_status_t st = decode(mnemonic, indices, NULL, entropy, &ent_bytes);
+    secure_zero(indices, sizeof(indices));
+
+    if (st == BIP39_OK && ent_bytes <= entropy_max)
+        memcpy(entropy_out, entropy, ent_bytes);
+    else
+        ent_bytes = 0;
+    secure_zero(entropy, sizeof(entropy));
     return ent_bytes;
 }
 
+bip39_status_t bip39_check(const char *mnemonic) {
+    int indices[BIP39_MAX_WORDS];
+    bip39_status_t st = decode(mnemonic, indices, NULL, NULL, NULL);
+    secure_zero(indices, sizeof(indices));
+    return st;
+}
+
+const char *bip39_status_str(bip39_status_t status) {
+    switch (status) {
+    case BIP39_OK:
+        return "valid";
+    case BIP39_ERR_WORD_COUNT:
+        return "a recovery phrase has 12, 15, 18, 21 or 24 words";
+    case BIP39_ERR_UNKNOWN_WORD:
+        return "it contains a word that is not in the BIP39 English wordlist "
+               "(words are lower-case)";
+    case BIP39_ERR_CHECKSUM:
+        return "the checksum does not match (a word is wrong or out of order)";
+    }
+    return "invalid";
+}
+
 int bip39_validate(const char *mnemonic) {
-    unsigned char entropy[32];
-    return bip39_mnemonic_to_entropy(mnemonic, entropy, sizeof(entropy)) > 0;
+    return bip39_check(mnemonic) == BIP39_OK;
+}
+
+int bip39_normalize(const char *mnemonic, char *out, size_t out_max) {
+    if (!out || out_max == 0) return 0;
+    out[0] = '\0';
+
+    int indices[BIP39_MAX_WORDS];
+    size_t n_words = 0;
+    if (decode(mnemonic, indices, &n_words, NULL, NULL) != BIP39_OK) {
+        secure_zero(indices, sizeof(indices));
+        return 0;
+    }
+
+    size_t pos = 0;
+    int ok = 1;
+    for (size_t w = 0; w < n_words && ok; w++) {
+        const char *word = bip39_wordlist_en[indices[w]];
+        size_t wlen = strlen(word);
+        if (pos + (w > 0) + wlen >= out_max) {
+            ok = 0;
+            break;
+        }
+        if (w > 0) out[pos++] = ' ';
+        memcpy(out + pos, word, wlen);
+        pos += wlen;
+    }
+    secure_zero(indices, sizeof(indices));
+
+    if (!ok) {
+        secure_zero(out, out_max);
+        return 0;
+    }
+    out[pos] = '\0';
+    return 1;
 }
 
 int bip39_generate(int word_count, char *mnemonic_out, size_t mnemonic_max) {
@@ -183,20 +271,31 @@ int bip39_mnemonic_to_seed(const char *mnemonic, const char *passphrase,
                             unsigned char *seed_out) {
     if (!mnemonic || !seed_out) return 0;
 
+    /* The seed is a hash of the phrase text, so any phrase would "work" and a
+       typo would silently give a different wallet.  Only a phrase that passes
+       validation is used, in its canonical single-space form. */
+    char words[BIP39_MAX_WORDS * (BIP39_MAX_WORD_LEN + 1)];
+    if (!bip39_normalize(mnemonic, words, sizeof(words))) return 0;
+
     /* Salt = "mnemonic" + passphrase */
     const char *pass = passphrase ? passphrase : "";
     size_t salt_len = 8 + strlen(pass);
     char *salt = malloc(salt_len + 1);
-    if (!salt) return 0;
+    if (!salt) {
+        secure_zero(words, sizeof(words));
+        return 0;
+    }
     memcpy(salt, "mnemonic", 8);
     memcpy(salt + 8, pass, strlen(pass));
     salt[salt_len] = '\0';
 
-    int ok = PKCS5_PBKDF2_HMAC(mnemonic, (int)strlen(mnemonic),
+    int ok = PKCS5_PBKDF2_HMAC(words, (int)strlen(words),
                                  (const unsigned char *)salt, (int)salt_len,
                                  2048, EVP_sha512(),
                                  64, seed_out);
 
+    secure_zero(words, sizeof(words));
+    secure_zero(salt, salt_len);
     free(salt);
     return ok == 1;
 }

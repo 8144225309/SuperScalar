@@ -250,3 +250,203 @@ int test_bip39_keyfile_integration(void) {
     remove("/tmp/test_bip39_kf2.key");
     return 1;
 }
+
+/* Official BIP39 English test vectors (trezor/python-mnemonic vectors.json,
+   passphrase "TREZOR"): entropy, mnemonic, seed. */
+static const struct {
+    const char *entropy_hex;
+    const char *mnemonic;
+    const char *seed_hex;
+} BIP39_VECTORS[] = {
+    { "00000000000000000000000000000000",
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon about",
+      "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553"
+      "1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04" },
+    { "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+      "legal winner thank year wave sausage worth useful legal winner thank yellow",
+      "2e8905819b8723fe2c1d161860e5ee1830318dbf49a83bd451cfb8440c28bd6f"
+      "a457fe1296106559a3c80937a1c1069be3a3a5bd381ee6260e8d9739fce1f607" },
+    { "80808080808080808080808080808080",
+      "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+      "d71de856f81a8acc65e6fc851a38d4d7ec216fd0796d0a6827a3ad6ed5511a30"
+      "fa280f12eb2e47ed2ac03b5c462a0358d18d69fe4f985ec81778c1b370b652a8" },
+    { "ffffffffffffffffffffffffffffffff",
+      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+      "ac27495480225222079d7be181583751e86f571027b0497b5b5d11218e0a8a13"
+      "332572917f0f8e5a589620c6f15b11c61dee327651a14c34e18231052e48c069" },
+    { "000000000000000000000000000000000000000000000000",
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon abandon abandon abandon abandon abandon abandon agent",
+      "035895f2f481b1b0f01fcf8c289c794660b289981a78f8106447707fdd9666ca"
+      "06da5a9a565181599b79f53b844d8a71dd9f439c52a3d7b3e8a79c906ac845fa" },
+    { "0000000000000000000000000000000000000000000000000000000000000000",
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon abandon abandon abandon abandon abandon abandon abandon "
+      "abandon abandon abandon abandon abandon art",
+      "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd30971"
+      "70af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8" },
+    { "8080808080808080808080808080808080808080808080808080808080808080",
+      "letter advice cage absurd amount doctor acoustic avoid letter advice cage "
+      "absurd amount doctor acoustic avoid letter advice cage absurd amount doctor "
+      "acoustic bless",
+      "c0c519bd0e91a2ed54357d9d1ebef6f5af218a153624cf4f2da911a0ed8f7a09"
+      "e2ef61af0aca007096df430022f7a2b6fb91661a9589097069720d015e4e982f" },
+    { "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo "
+      "zoo zoo zoo zoo vote",
+      "dd48c104698c30cfe2b6142103248622fb7bb0ff692eebb00089b32d22484e16"
+      "13912f0a5b694407be899ffd31ed3992c456cdf60f5d4564b8ba3f05a69890ad" },
+    { "9e885d952ad362caeb4efe34a8e91bd2",
+      "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic",
+      "274ddc525802f7c828d8ef7ddbcdc5304e87ac3535913611fbbfa986d0c9e547"
+      "6c91689f9c8a54fd55bd38606aa6a8595ad213d4c9c9f9aca3fb217069a41028" },
+    { "f585c11aec520db57dd353c69554b21a89b20fb0650966fa0a9d6f74fd989d8f",
+      "void come effort suffer camp survey warrior heavy shoot primary clutch crush "
+      "open amazing screen patrol group space point ten exist slush involve unfold",
+      "01f5bced59dec48e362f2c45b5de68b9fd6c92c6634f44d6d40aab69056506f0"
+      "e35524a518034ddc1192e1dacd32c1ed3eaa3c3b131c88ed8e7e54c49a5d0998" },
+};
+#define N_BIP39_VECTORS (sizeof(BIP39_VECTORS) / sizeof(BIP39_VECTORS[0]))
+
+/* Every official vector: entropy -> mnemonic, mnemonic -> entropy, validity
+   and seed. */
+int test_bip39_official_vectors(void) {
+    for (size_t i = 0; i < N_BIP39_VECTORS; i++) {
+        size_t ent_len = strlen(BIP39_VECTORS[i].entropy_hex) / 2;
+        unsigned char entropy[32], recovered[32], expected_seed[64], seed[64];
+        TEST_ASSERT(hex_to_bytes(BIP39_VECTORS[i].entropy_hex, entropy, ent_len),
+                    "entropy hex");
+        TEST_ASSERT(hex_to_bytes(BIP39_VECTORS[i].seed_hex, expected_seed, 64),
+                    "seed hex");
+
+        char mnemonic[512];
+        TEST_ASSERT(bip39_entropy_to_mnemonic(entropy, ent_len, mnemonic, sizeof(mnemonic)),
+                    "entropy_to_mnemonic");
+        TEST_ASSERT(strcmp(mnemonic, BIP39_VECTORS[i].mnemonic) == 0,
+                    "mnemonic matches vector");
+
+        TEST_ASSERT(bip39_check(BIP39_VECTORS[i].mnemonic) == BIP39_OK, "vector is valid");
+        TEST_ASSERT(bip39_mnemonic_to_entropy(BIP39_VECTORS[i].mnemonic, recovered,
+                                              sizeof(recovered)) == ent_len,
+                    "entropy length");
+        TEST_ASSERT(memcmp(recovered, entropy, ent_len) == 0, "entropy matches vector");
+
+        TEST_ASSERT(bip39_mnemonic_to_seed(BIP39_VECTORS[i].mnemonic, "TREZOR", seed),
+                    "mnemonic_to_seed");
+        TEST_ASSERT(memcmp(seed, expected_seed, 64) == 0, "seed matches vector");
+    }
+    return 1;
+}
+
+/* Each kind of defect is reported as what it is. */
+int test_bip39_check_reports_reason(void) {
+    /* Valid 12-word vector with one word changed to another wordlist word. */
+    TEST_ASSERT(bip39_check("legal winner thank year wave sausage worth useful "
+                            "legal winner thank year") == BIP39_ERR_CHECKSUM,
+                "substituted word breaks the checksum");
+    /* Two words swapped. */
+    TEST_ASSERT(bip39_check("winner legal thank year wave sausage worth useful "
+                            "legal winner thank yellow") == BIP39_ERR_CHECKSUM,
+                "swapped words break the checksum");
+    /* A one-letter typo. */
+    TEST_ASSERT(bip39_check("legal winner thank year wave sausage worth usefull "
+                            "legal winner thank yellow") == BIP39_ERR_UNKNOWN_WORD,
+                "misspelt word is unknown");
+    TEST_ASSERT(bip39_check("Legal winner thank year wave sausage worth useful "
+                            "legal winner thank yellow") == BIP39_ERR_UNKNOWN_WORD,
+                "capitalised word is unknown");
+    TEST_ASSERT(bip39_check("legal winner thank year wave sausage worth useful "
+                            "legal winner thank yellowyellowyellow") == BIP39_ERR_UNKNOWN_WORD,
+                "overlong word is unknown");
+
+    TEST_ASSERT(bip39_check(NULL) == BIP39_ERR_WORD_COUNT, "NULL");
+    TEST_ASSERT(bip39_check("") == BIP39_ERR_WORD_COUNT, "empty phrase");
+    TEST_ASSERT(bip39_check("   \t\n") == BIP39_ERR_WORD_COUNT, "whitespace only");
+    TEST_ASSERT(bip39_check("legal winner thank year wave sausage worth useful "
+                            "legal winner thank") == BIP39_ERR_WORD_COUNT,
+                "11 words");
+    TEST_ASSERT(bip39_check("legal winner thank year wave sausage worth useful "
+                            "legal winner thank yellow abandon") == BIP39_ERR_WORD_COUNT,
+                "13 words");
+
+    /* A valid 24-word phrase followed by more words is not a valid phrase. */
+    char long_phrase[512];
+    snprintf(long_phrase, sizeof(long_phrase), "%s abandon", BIP39_VECTORS[5].mnemonic);
+    TEST_ASSERT(bip39_check(long_phrase) == BIP39_ERR_WORD_COUNT, "25 words");
+    TEST_ASSERT(!bip39_validate(long_phrase), "25 words do not validate");
+    unsigned char entropy[32];
+    TEST_ASSERT(bip39_mnemonic_to_entropy(long_phrase, entropy, sizeof(entropy)) == 0,
+                "25 words give no entropy");
+
+    for (int st = BIP39_OK; st <= BIP39_ERR_CHECKSUM; st++) {
+        const char *msg = bip39_status_str((bip39_status_t)st);
+        TEST_ASSERT(msg != NULL && msg[0] != '\0', "every status has a message");
+    }
+    return 1;
+}
+
+/* A phrase that fails validation must never produce a seed: the wallet it
+   would open is not the one the user is trying to recover. */
+int test_bip39_seed_refuses_invalid_mnemonic(void) {
+    static const char *const bad[] = {
+        /* substituted word (checksum) */
+        "legal winner thank year wave sausage worth useful legal winner thank year",
+        /* misspelt word */
+        "legal winner thank year wave sausage worth usefull legal winner thank yellow",
+        /* a word missing */
+        "legal winner thank year wave sausage worth useful legal winner thank",
+        /* swapped words */
+        "winner legal thank year wave sausage worth useful legal winner thank yellow",
+        "",
+    };
+    static const unsigned char untouched[64] = { 0 };
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        unsigned char seed[64];
+        memset(seed, 0, sizeof(seed));
+        TEST_ASSERT(!bip39_mnemonic_to_seed(bad[i], "", seed),
+                    "invalid mnemonic must not yield a seed");
+        TEST_ASSERT(memcmp(seed, untouched, 64) == 0, "seed buffer not written");
+
+        char norm[256];
+        TEST_ASSERT(!bip39_normalize(bad[i], norm, sizeof(norm)),
+                    "invalid mnemonic does not normalise");
+        TEST_ASSERT(norm[0] == '\0', "no normalised text for an invalid mnemonic");
+    }
+    return 1;
+}
+
+/* Extra whitespace is not part of the phrase: the same words always give the
+   same seed, the one from the official vector. */
+int test_bip39_whitespace_normalized(void) {
+    const char *canonical = BIP39_VECTORS[1].mnemonic;
+    static const char *const variants[] = {
+        "  legal winner thank year wave sausage worth useful legal winner thank yellow",
+        "legal winner thank year wave sausage worth useful legal winner thank yellow\n",
+        "legal  winner thank year wave sausage worth useful legal winner thank yellow",
+        "legal\twinner thank year wave sausage worth useful legal winner thank yellow",
+        " legal winner\nthank year  wave sausage\tworth useful legal winner thank yellow \r\n",
+    };
+
+    unsigned char expected[64];
+    TEST_ASSERT(hex_to_bytes(BIP39_VECTORS[1].seed_hex, expected, 64), "seed hex");
+
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+        TEST_ASSERT(bip39_check(variants[i]) == BIP39_OK, "variant is valid");
+
+        char norm[256];
+        TEST_ASSERT(bip39_normalize(variants[i], norm, sizeof(norm)), "normalize");
+        TEST_ASSERT(strcmp(norm, canonical) == 0, "normalised to the canonical phrase");
+
+        unsigned char seed[64];
+        TEST_ASSERT(bip39_mnemonic_to_seed(variants[i], "TREZOR", seed), "seed");
+        TEST_ASSERT(memcmp(seed, expected, 64) == 0,
+                    "whitespace variant gives the vector seed");
+    }
+
+    char small[16];
+    TEST_ASSERT(!bip39_normalize(canonical, small, sizeof(small)),
+                "output buffer too small is an error");
+    return 1;
+}
