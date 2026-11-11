@@ -1909,6 +1909,11 @@ extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
 extern int test_keyfile_wrong_passphrase_v2(void);
 extern int test_keyfile_created_owner_only(void);
+extern int test_keyfile_load_or_generate_new_path(void);
+extern int test_keyfile_wrong_passphrase_keeps_file(void);
+extern int test_keyfile_corrupt_file_kept(void);
+extern int test_keyfile_generate_refuses_existing(void);
+extern int test_keyfile_save_replaces_atomically(void);
 
 /* Mainnet Audit: HD Key Derivation */
 extern int test_hd_master_from_seed(void);
@@ -3808,6 +3813,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_keyfile_v1_compat);
     RUN_TEST(test_keyfile_wrong_passphrase_v2);
     RUN_TEST(test_keyfile_created_owner_only);
+    RUN_TEST(test_keyfile_load_or_generate_new_path);
+    RUN_TEST(test_keyfile_wrong_passphrase_keeps_file);
+    RUN_TEST(test_keyfile_corrupt_file_kept);
+    RUN_TEST(test_keyfile_generate_refuses_existing);
+    RUN_TEST(test_keyfile_save_replaces_atomically);
 
     printf("\n=== Mainnet Audit: HD Key Derivation ===\n");
     RUN_TEST(test_hd_master_from_seed);

@@ -2389,6 +2389,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -2802,17 +2809,27 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else if (keyfile_path) {
-        /* Try to load from keyfile */
-        if (keyfile_load(keyfile_path, lsp_seckey, passphrase)) {
+        /* Load the keyfile; a new key is only ever created when no file
+           exists at the path. */
+        switch (keyfile_load_or_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
+        case KEYFILE_OPEN_LOADED:
             printf("LSP: loaded key from %s\n", keyfile_path);
-        } else {
-            /* File doesn't exist or wrong passphrase — generate new key */
-            printf("LSP: generating new key and saving to %s\n", keyfile_path);
-            if (!keyfile_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(ctx);
-                return 1;
-            }
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("LSP: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     } else if (is_regtest) {
         /* Deterministic default key — regtest only */

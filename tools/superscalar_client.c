@@ -3207,6 +3207,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -3308,20 +3315,29 @@ int main(int argc, char *argv[]) {
     } else if (keyfile_path) {
         secp256k1_context *tmp_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        if (keyfile_load(keyfile_path, seckey, passphrase)) {
-            printf("Client: loaded key from %s\n", keyfile_path);
-            key_loaded = 1;
-        } else {
-            printf("Client: generating new key and saving to %s\n", keyfile_path);
-            if (keyfile_generate(keyfile_path, seckey, passphrase, tmp_ctx)) {
-                key_loaded = 1;
-            } else {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(tmp_ctx);
-                return 1;
-            }
-        }
+        /* A new key is only ever created when no file exists at the path. */
+        keyfile_open_result_t kf_res =
+            keyfile_load_or_generate(keyfile_path, seckey, passphrase, tmp_ctx);
         secp256k1_context_destroy(tmp_ctx);
+        switch (kf_res) {
+        case KEYFILE_OPEN_LOADED:
+            printf("Client: loaded key from %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("Client: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            return 1;
+        }
+        key_loaded = 1;
     }
 
     if (!key_loaded) {

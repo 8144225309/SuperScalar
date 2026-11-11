@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <stdint.h>
+#include <sys/stat.h>
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -48,13 +51,27 @@ static int derive_key_v2(unsigned char *key_out32, const char *passphrase,
     return ok == 1;
 }
 
-int keyfile_save(const char *path, const unsigned char *seckey32,
-                 const char *passphrase) {
+/* Encrypt seckey32 and write it to path in v2 format.  replace selects whether
+   a file already at path is replaced or makes the call fail. */
+static int keyfile_write(const char *path, const unsigned char *seckey32,
+                         const char *passphrase, int replace) {
     if (!path || !seckey32 || !passphrase) return 0;
 
+    /* v2 format: [magic:4][iters_BE:4][salt:16][nonce:12][ct:32][tag:16] = 84 bytes */
+    unsigned char file[KEYFILE_SIZE_V2];
+    unsigned char *salt = file + 8;
+    unsigned char *nonce = file + 24;
+    unsigned char *ciphertext = file + 36;
+    unsigned char *tag = file + 68;
+
+    memcpy(file, KEYFILE_MAGIC, 4);
+    uint32_t iters = KEYFILE_PBKDF2_ITERATIONS;
+    file[4] = (unsigned char)((iters >> 24) & 0xFF);
+    file[5] = (unsigned char)((iters >> 16) & 0xFF);
+    file[6] = (unsigned char)((iters >> 8) & 0xFF);
+    file[7] = (unsigned char)(iters & 0xFF);
+
     /* Generate random salt and nonce */
-    unsigned char salt[16];
-    unsigned char nonce[12];
     FILE *urand = fopen("/dev/urandom", "rb");
     if (!urand) return 0;
     if (fread(salt, 1, 16, urand) != 16 ||
@@ -70,36 +87,16 @@ int keyfile_save(const char *path, const unsigned char *seckey32,
         return 0;
     }
 
-    /* Encrypt */
-    unsigned char ciphertext[32];
-    unsigned char tag[16];
-    aead_encrypt(ciphertext, tag, seckey32, 32, NULL, 0, enc_key, nonce);
-
-    /* Write v2 format: [magic:4][iters_BE:4][salt:16][nonce:12][ct:32][tag:16] = 84 bytes */
-    FILE *fp = secure_file_open_private(path);
-    if (!fp) {
-        secure_zero(enc_key, 32);
-        return 0;
-    }
-
-    unsigned char header[8];
-    memcpy(header, KEYFILE_MAGIC, 4);
-    uint32_t iters = KEYFILE_PBKDF2_ITERATIONS;
-    header[4] = (unsigned char)((iters >> 24) & 0xFF);
-    header[5] = (unsigned char)((iters >> 16) & 0xFF);
-    header[6] = (unsigned char)((iters >> 8) & 0xFF);
-    header[7] = (unsigned char)(iters & 0xFF);
-
-    size_t written = 0;
-    written += fwrite(header, 1, 8, fp);
-    written += fwrite(salt, 1, 16, fp);
-    written += fwrite(nonce, 1, 12, fp);
-    written += fwrite(ciphertext, 1, 32, fp);
-    written += fwrite(tag, 1, 16, fp);
-    fclose(fp);
-
+    int ok = aead_encrypt(ciphertext, tag, seckey32, 32, NULL, 0, enc_key, nonce);
     secure_zero(enc_key, 32);
-    return (written == KEYFILE_SIZE_V2) ? 1 : 0;
+    if (!ok) return 0;
+
+    return secure_file_write_atomic(path, file, sizeof(file), replace);
+}
+
+int keyfile_save(const char *path, const unsigned char *seckey32,
+                 const char *passphrase) {
+    return keyfile_write(path, seckey32, passphrase, 1);
 }
 
 int keyfile_load(const char *path, unsigned char *seckey32_out,
@@ -175,8 +172,8 @@ int keyfile_generate(const char *path, unsigned char *seckey32_out,
 
     if (!valid) return 0;
 
-    /* Save to file (v2 format) */
-    if (!keyfile_save(path, seckey, passphrase)) {
+    /* Save to file (v2 format); never over a file that is already there */
+    if (!keyfile_write(path, seckey, passphrase, 0)) {
         secure_zero(seckey, 32);
         return 0;
     }
@@ -184,6 +181,30 @@ int keyfile_generate(const char *path, unsigned char *seckey32_out,
     memcpy(seckey32_out, seckey, 32);
     secure_zero(seckey, 32);
     return 1;
+}
+
+int keyfile_exists(const char *path) {
+    if (!path) return 0;
+    struct stat st;
+    /* Anything at the path counts, and so does a path that cannot be
+       examined: only a definite "not there" allows a new key to be made. */
+    return !(lstat(path, &st) != 0 && errno == ENOENT);
+}
+
+keyfile_open_result_t keyfile_load_or_generate(const char *path,
+                                               unsigned char *seckey32_out,
+                                               const char *passphrase,
+                                               secp256k1_context *ctx) {
+    if (!path || !seckey32_out || !passphrase || !ctx)
+        return KEYFILE_OPEN_GENERATE_FAILED;
+
+    if (keyfile_exists(path)) {
+        return keyfile_load(path, seckey32_out, passphrase)
+                   ? KEYFILE_OPEN_LOADED : KEYFILE_OPEN_LOAD_FAILED;
+    }
+
+    return keyfile_generate(path, seckey32_out, passphrase, ctx)
+               ? KEYFILE_OPEN_GENERATED : KEYFILE_OPEN_GENERATE_FAILED;
 }
 
 int keyfile_needs_upgrade(const char *path) {
@@ -212,7 +233,7 @@ int keyfile_generate_from_seed(const char *path, unsigned char *seckey32_out,
     if (!hd_key_derive_path(seed, seed_len, dp, derived_key))
         return 0;
 
-    if (!keyfile_save(path, derived_key, passphrase)) {
+    if (!keyfile_write(path, derived_key, passphrase, 0)) {
         secure_zero(derived_key, 32);
         return 0;
     }

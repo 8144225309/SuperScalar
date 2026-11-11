@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #define TEST_ASSERT(cond, msg) do { \
@@ -316,5 +317,192 @@ int test_keyfile_created_owner_only(void) {
     TEST_ASSERT_EQ(mode_resaved, 0600, "rewritten keyfile mode");
 
     unlink(path);
+    return 1;
+}
+
+/* Read a whole (small) file; returns its length, or -1 if it cannot be read. */
+static long slurp(const char *path, unsigned char *buf, size_t max) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    size_t n = fread(buf, 1, max, fp);
+    fclose(fp);
+    return (long)n;
+}
+
+static int spit(const char *path, const unsigned char *buf, size_t len) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return 0;
+    size_t n = fwrite(buf, 1, len, fp);
+    return fclose(fp) == 0 && n == len;
+}
+
+/* No file at the path: a key is created; the next start loads that same key. */
+int test_keyfile_load_or_generate_new_path(void) {
+    const char *path = "/tmp/test_keyfile_open_new.key";
+    unlink(path);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char first[32], second[32];
+    TEST_ASSERT_EQ(keyfile_load_or_generate(path, first, "pw", ctx),
+                   KEYFILE_OPEN_GENERATED, "first start creates the key");
+    TEST_ASSERT(keyfile_exists(path), "keyfile exists after creation");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(path, second, "pw", ctx),
+                   KEYFILE_OPEN_LOADED, "second start loads the key");
+    TEST_ASSERT(memcmp(first, second, 32) == 0, "same key on both starts");
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* A wrong (or empty) passphrase must fail the start-up and must not cost the
+   operator the key that is in the file. */
+int test_keyfile_wrong_passphrase_keeps_file(void) {
+    const char *path = "/tmp/test_keyfile_open_wrongpw.key";
+    unlink(path);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char original[32];
+    TEST_ASSERT(keyfile_generate(path, original, "right-pass", ctx), "generate");
+
+    unsigned char before[128], after[128];
+    long before_len = slurp(path, before, sizeof(before));
+    TEST_ASSERT_EQ(before_len, KEYFILE_SIZE_V2, "keyfile size");
+
+    static const char *const wrong[] = { "wrong-pass", "" };
+    for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); i++) {
+        unsigned char out[32];
+        TEST_ASSERT_EQ(keyfile_load_or_generate(path, out, wrong[i], ctx),
+                       KEYFILE_OPEN_LOAD_FAILED, "wrong passphrase is an error");
+        long after_len = slurp(path, after, sizeof(after));
+        TEST_ASSERT_EQ(after_len, before_len, "keyfile length unchanged");
+        TEST_ASSERT(memcmp(before, after, (size_t)before_len) == 0,
+                    "keyfile bytes unchanged");
+    }
+
+    unsigned char reloaded[32];
+    TEST_ASSERT(keyfile_load(path, reloaded, "right-pass"),
+                "original key still loads with the right passphrase");
+    TEST_ASSERT(memcmp(original, reloaded, 32) == 0, "original key intact");
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* A file that is not a loadable keyfile (truncated, garbage, empty) is left
+   exactly as it is: it may be the only remaining copy of a damaged key. */
+int test_keyfile_corrupt_file_kept(void) {
+    const char *path = "/tmp/test_keyfile_open_corrupt.key";
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char garbage[40];
+    memset(garbage, 0x5A, sizeof(garbage));
+    static const size_t lens[] = { sizeof(garbage), 0 };
+
+    for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        unlink(path);
+        TEST_ASSERT(spit(path, garbage, lens[i]), "write unloadable file");
+
+        unsigned char out[32], after[128];
+        TEST_ASSERT_EQ(keyfile_load_or_generate(path, out, "pw", ctx),
+                       KEYFILE_OPEN_LOAD_FAILED, "unloadable file is an error");
+        long after_len = slurp(path, after, sizeof(after));
+        TEST_ASSERT_EQ(after_len, (long)lens[i], "file length unchanged");
+        TEST_ASSERT(memcmp(garbage, after, lens[i]) == 0, "file bytes unchanged");
+    }
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* The generators create key material; neither may replace an existing file. */
+int test_keyfile_generate_refuses_existing(void) {
+    const char *path = "/tmp/test_keyfile_noclobber.key";
+    unlink(path);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char original[32], out[32];
+    TEST_ASSERT(keyfile_generate(path, original, "pw", ctx), "generate");
+
+    unsigned char before[128], after[128];
+    long before_len = slurp(path, before, sizeof(before));
+    TEST_ASSERT_EQ(before_len, KEYFILE_SIZE_V2, "keyfile size");
+
+    TEST_ASSERT(!keyfile_generate(path, out, "pw", ctx),
+                "keyfile_generate refuses an existing file");
+
+    unsigned char seed[16];
+    memset(seed, 0x07, sizeof(seed));
+    TEST_ASSERT(!keyfile_generate_from_seed(path, out, "pw", seed, sizeof(seed), NULL),
+                "keyfile_generate_from_seed refuses an existing file");
+
+    TEST_ASSERT_EQ(slurp(path, after, sizeof(after)), before_len, "length unchanged");
+    TEST_ASSERT(memcmp(before, after, (size_t)before_len) == 0, "bytes unchanged");
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* keyfile_save replaces the file in one step and leaves no temporary file
+   behind, on success or on failure. */
+int test_keyfile_save_replaces_atomically(void) {
+    const char *dir = "/tmp/test_keyfile_atomic.d";
+    const char *path = "/tmp/test_keyfile_atomic.d/node.key";
+    unlink(path);
+    rmdir(dir);
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "mkdir");
+
+    unsigned char key_a[32], key_b[32], loaded[32];
+    memset(key_a, 0x11, 32);
+    memset(key_b, 0x22, 32);
+
+    TEST_ASSERT(keyfile_save(path, key_a, "pw"), "first save");
+    struct stat st_a, st_b;
+    TEST_ASSERT(stat(path, &st_a) == 0, "stat first");
+
+    TEST_ASSERT(keyfile_save(path, key_b, "pw"), "second save");
+    TEST_ASSERT(stat(path, &st_b) == 0, "stat second");
+    /* Replaced by rename of a complete new file, not rewritten in place. */
+    TEST_ASSERT(st_a.st_ino != st_b.st_ino, "file replaced, not truncated");
+    TEST_ASSERT(keyfile_load(path, loaded, "pw"), "load after replace");
+    TEST_ASSERT(memcmp(loaded, key_b, 32) == 0, "new key stored");
+
+    /* The path is a directory: the save fails and nothing is left behind. */
+    TEST_ASSERT(!keyfile_save(dir, key_a, "pw"), "save onto a directory fails");
+
+    int entries = 0;
+    DIR *d = opendir(dir);
+    TEST_ASSERT(d != NULL, "opendir");
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+            entries++;
+    }
+    closedir(d);
+    TEST_ASSERT_EQ(entries, 1, "only the keyfile is in its directory");
+
+    d = opendir("/tmp");
+    TEST_ASSERT(d != NULL, "opendir /tmp");
+    int stray = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "test_keyfile_atomic.d.tmp", 25) == 0)
+            stray++;
+    }
+    closedir(d);
+    TEST_ASSERT_EQ(stray, 0, "no temporary file left after a failed save");
+
+    unlink(path);
+    rmdir(dir);
     return 1;
 }

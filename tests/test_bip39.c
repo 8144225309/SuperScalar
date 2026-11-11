@@ -211,6 +211,9 @@ int test_bip39_keyfile_integration(void) {
     const char *keyfile_path = "/tmp/test_bip39_keyfile.key";
     const char *passphrase = "test-pass";
 
+    remove(keyfile_path);
+    remove("/tmp/test_bip39_kf2.key");
+
     /* Derive BIP39 seed */
     unsigned char seed[64];
     TEST_ASSERT(bip39_mnemonic_to_seed(mnemonic, "", seed),
