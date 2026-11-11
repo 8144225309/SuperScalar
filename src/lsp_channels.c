@@ -1888,7 +1888,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Collect channel indices that live on this leaf node. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;
@@ -2037,16 +2037,23 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 node->outputs[0].amount_sats,
                 /* poison_tx */ poison_snapshot, poison_snapshot_len);
         } else {
-            uint32_t leaf_states[8];
-            for (int i = 0; i < f->n_leaf_nodes; i++)
+            /* One entry per leaf: n_leaf_nodes is not bounded by a small
+               constant (a fixed [8] array overflowed past 8 leaves). */
+            uint32_t *leaf_states = calloc(f->n_leaf_nodes > 0 ? (size_t)f->n_leaf_nodes : 1,
+                                           sizeof(uint32_t));
+            for (int i = 0; leaf_states && i < f->n_leaf_nodes; i++)
                 leaf_states[i] = f->leaf_layers[i].current_state;
-            uint32_t layer_states[DW_MAX_LAYERS];
+            uint32_t layer_states[DW_MAX_LAYERS] = {0};
             for (uint32_t i = 0; i < f->counter.n_layers; i++)
                 layer_states[i] = f->counter.layers[i].config.max_states;
-            persist_save_dw_counter_with_leaves(
-                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-                f->counter.n_layers, layer_states,
-                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+            if (leaf_states)
+                persist_save_dw_counter_with_leaves(
+                    (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+                    f->counter.n_layers, layer_states,
+                    f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+            else
+                fprintf(stderr, "LSP: per-leaf DW state not persisted (out of memory)\n");
+            free(leaf_states);
         }
     }
 
@@ -2722,7 +2729,7 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                        "(%zu bytes, L-stock %llu sats)\n", affected[k], poison_len,
                        (unsigned long long)poison_old_l_amount[k]);
             }
-            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
             size_t n_leaf_ch = 0;
             for (size_t cc = 0; cc < mgr->n_channels; cc++) {
                 size_t c_node; uint32_t c_vout;
@@ -3362,7 +3369,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        (#258), reproduced end-to-end by tools/test_regtest_cheat_realloc.sh. */
     if (mgr->watchtower && realloc_had_signed && node->is_signed &&
         node->signed_tx.len > 0) {
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t cc = 0; cc < mgr->n_channels; cc++) {
             size_t c_node;
@@ -3487,16 +3494,22 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 14: Persist per-leaf DW state */
     if (mgr->persist) {
-        uint32_t leaf_states[8];
-        for (int i = 0; i < f->n_leaf_nodes; i++)
+        /* One entry per leaf (a fixed [8] array overflowed past 8 leaves). */
+        uint32_t *leaf_states = calloc(f->n_leaf_nodes > 0 ? (size_t)f->n_leaf_nodes : 1,
+                                       sizeof(uint32_t));
+        for (int i = 0; leaf_states && i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].config.max_states;
-        persist_save_dw_counter_with_leaves(
-            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-            f->counter.n_layers, layer_states,
-            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        if (leaf_states)
+            persist_save_dw_counter_with_leaves(
+                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+                f->counter.n_layers, layer_states,
+                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        else
+            fprintf(stderr, "LSP: per-leaf DW state not persisted (out of memory)\n");
+        free(leaf_states);
     }
 
     printf("LSP: leaf %d realloc complete (node %zu), amounts=[", leaf_side, node_idx);
@@ -8213,7 +8226,7 @@ int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
            what watchtower wants for old_txid32. */
 
         /* Collect channel ids on this leaf. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;

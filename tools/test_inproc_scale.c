@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
      * (avoids a connect-before-listen race). */
     int rc = 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
-    if (!lsp_init(lsp, ctx, &kps[0], port, (size_t)N)) {
+    if (!lsp || !lsp_init(lsp, ctx, &kps[0], port, (size_t)N)) {
         fprintf(stderr, "[scale] lsp_init failed\n");
         free(lsp); return 1;
     }

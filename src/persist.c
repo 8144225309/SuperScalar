@@ -2405,10 +2405,10 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    /* Release any prior tree state (caller may reuse f across loads).
-       factory_init_from_pubkeys memsets f, which would leak existing tx_bufs. */
-    if (f->n_nodes > 0)
-        factory_free(f);
+    /* Release any prior tree state and arrays (caller may reuse f across
+       loads, or pre-allocate its arrays).  factory_init_from_pubkeys memsets
+       f, which would leak them.  factory_free is a no-op on a zeroed factory. */
+    factory_free(f);
 
     /* Reconstruct factory */
     factory_init_from_pubkeys(f, ctx, pubkeys, n_participants,

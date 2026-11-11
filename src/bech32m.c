@@ -181,7 +181,7 @@ int bech32m_decode(const char *str,
     if (total5_len > BECH32M_MAX_DATA5) return 0;
 
     /* Decode all characters after separator to 5-bit values */
-    uint8_t vals[BECH32M_MAX_DATA5];
+    uint8_t vals[BECH32M_MAX_DATA5] = {0};
     for (size_t i = 0; i < total5_len; i++) {
         unsigned char c = (unsigned char)tolower((unsigned char)str[hrp_len + 1 + i]);
         if (c >= 128 || charset_rev[c] < 0) return 0;

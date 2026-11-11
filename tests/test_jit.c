@@ -1071,7 +1071,8 @@ static void *jit_client_handler(void *arg) {
     if (!wire_recv(c->fd, &msg) || msg.msg_type != MSG_JIT_READY) return NULL;
     cJSON_Delete(msg.json);
 
-    return (void *)1;
+    static int client_ok = 1;  /* any non-NULL value signals success to pthread_join */
+    return &client_ok;
 }
 
 int test_regtest_jit_daemon_trigger(void) {

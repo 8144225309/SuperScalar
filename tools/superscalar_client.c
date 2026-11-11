@@ -1934,7 +1934,7 @@ handle_message:
             printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
 
             /* Save pubkeys from current factory */
-            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS];
+            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS] = {0};
             for (size_t pi = 0; pi < n_participants; pi++)
                 saved_pubkeys[pi] = factory->pubkeys[pi];
 
