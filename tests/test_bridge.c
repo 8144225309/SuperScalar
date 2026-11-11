@@ -4779,13 +4779,17 @@ int test_bridge_replay_keeps_pending_id(void) {
 
 /* ---- Outbound pay results are acknowledged; open pays outlive expiry ---- */
 
-/* The request id of the PAY_RESULT_ACK waiting on the bridge link, 0 if none */
+/* The request id of the PAY_RESULT_ACK waiting on the bridge link, 0 if
+   none; its rejection reason ("" = applied) is left in last_ack_reason. */
+static char last_ack_reason[64];
 static uint64_t next_pay_ack(pay_fixture_t *f) {
     wire_msg_t m;
     uint64_t rid = 0;
+    strcpy(last_ack_reason, "?");
     if (!wire_recv_timeout(f->bridge_peer, &m, 1)) return 0;
     if (m.msg_type != MSG_BRIDGE_PAY_RESULT_ACK ||
-        !wire_parse_bridge_pay_result_ack(m.json, &rid))
+        !wire_parse_bridge_pay_result_ack(m.json, &rid, last_ack_reason,
+                                           sizeof(last_ack_reason)))
         rid = 0;
     cJSON_Delete(m.json);
     return rid;
@@ -4797,14 +4801,21 @@ int test_lsp_pay_result_acknowledged(void) {
     unsigned char wrong[32];
     memset(wrong, 0x72, 32);
 
-    /* A result that settles nothing is not acknowledged: it has to come
-       again, corrected */
+    /* A "success" with the wrong preimage is rejected for good: answered
+       so that it is not repeated, while the HTLC stays held and the origin
+       open */
+    uint64_t rid;
     TEST_ASSERT(deliver_pay_result(&f, 7, 1, wrong), "handled");
-    TEST_ASSERT_EQ(next_pay_ack(&f), 0, "wrong preimage: no ack");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "wrong preimage answered");
+    TEST_ASSERT(strcmp(last_ack_reason, "preimage_mismatch") == 0, "as rejected");
+    TEST_ASSERT(pay_untouched(&f), "HTLC held, origin open");
 
-    /* The applied result is acknowledged */
+    /* The applied result is acknowledged as applied */
     TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
-    TEST_ASSERT_EQ(next_pay_ack(&f), 7, "applied result acknowledged");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "applied result acknowledged");
+    TEST_ASSERT(last_ack_reason[0] == '\0', "as applied");
 
     /* A repeat (the first ack was lost) is acknowledged again and changes
        nothing */
@@ -4886,7 +4897,7 @@ int test_bridge_forwards_pay_result_ack(void) {
     bridge_init(&br);
     br.plugin_fd = sv[1];
 
-    cJSON *ack = wire_build_bridge_pay_result_ack(31);
+    cJSON *ack = wire_build_bridge_pay_result_ack(31, NULL);
     wire_msg_t msg;
     msg.msg_type = MSG_BRIDGE_PAY_RESULT_ACK;
     msg.json = ack;
@@ -4904,7 +4915,23 @@ int test_bridge_forwards_pay_result_ack(void) {
                 "pay_result_ack");
     TEST_ASSERT(rid && cJSON_IsNumber(rid) && (uint64_t)rid->valuedouble == 31,
                 "request id");
+    cJSON *st = cJSON_GetObjectItem(fwd, "status");
+    TEST_ASSERT(st && cJSON_IsString(st) && strcmp(st->valuestring, "applied") == 0,
+                "status applied");
     cJSON_Delete(fwd);
+
+    /* A rejection reaches the plugin with its reason */
+    {
+        cJSON *rej = wire_build_bridge_pay_result_ack(32, "preimage_mismatch");
+        wire_msg_t rm; rm.msg_type = MSG_BRIDGE_PAY_RESULT_ACK; rm.json = rej;
+        TEST_ASSERT(bridge_handle_lsp_msg(&br, &rm), "rejection handled");
+        cJSON_Delete(rej);
+        n = read(sv[0], buf, sizeof(buf) - 1);
+        TEST_ASSERT(n > 0, "plugin told");
+        buf[n] = '\0';
+        TEST_ASSERT(strstr(buf, "\"rejected\"") && strstr(buf, "preimage_mismatch") &&
+                    strstr(buf, "\"request_id\":32"), "status and reason forwarded");
+    }
 
     /* With the plugin away the ack is dropped, not an error: the plugin
        will repeat its result */
@@ -5191,5 +5218,97 @@ int test_lsp_inbound_origin_table_and_rollback(void) {
     free(ch->htlcs);
     close(sv[0]); close(sv[1]); close(cl[0]); close(cl[1]);
     free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
+    return 1;
+}
+
+/* ---- Pay results that cannot be used are rejected once, not left hanging ---- */
+
+int test_lsp_pay_result_rejections(void) {
+    pay_fixture_t f;
+    channel_t *ch;
+    uint64_t rid;
+    wire_msg_t stray;
+
+    /* The client's HTLC is gone when a success arrives */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT(channel_fail_htlc(ch, f.htlc_id), "HTLC removed");
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "answered");
+    TEST_ASSERT(strcmp(last_ack_reason, "no_htlc") == 0, "rejected: no HTLC");
+    TEST_ASSERT(!f.mgr.htlc_origins[0].active, "origin closed: nothing left to settle");
+    TEST_ASSERT(!lsp_channels_outbound_was_paid(&f.mgr, f.hash), "not counted as paid");
+    TEST_ASSERT(!wire_recv_timeout(f.client_peer, &stray, 1), "client told nothing");
+    pay_fixture_free(&f);
+
+    /* ...or when a failure arrives */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT(channel_fail_htlc(ch, f.htlc_id), "HTLC removed");
+    TEST_ASSERT(deliver_pay_result(&f, 7, 0, NULL), "handled");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "answered");
+    TEST_ASSERT(strcmp(last_ack_reason, "no_htlc") == 0, "rejected: no HTLC");
+    TEST_ASSERT(!f.mgr.htlc_origins[0].active, "origin closed");
+    TEST_ASSERT(!wire_recv_timeout(f.client_peer, &stray, 1), "client told nothing");
+    pay_fixture_free(&f);
+
+    /* The origin names a client that does not exist */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    f.mgr.htlc_origins[0].sender_idx = 9;
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    rid = next_pay_ack(&f);
+    TEST_ASSERT_EQ(rid, 7, "answered");
+    TEST_ASSERT(strcmp(last_ack_reason, "no_channel") == 0, "rejected: no channel");
+    pay_fixture_free(&f);
+
+    /* The ack wire format */
+    {
+        char reason[32]; uint64_t r = 0;
+        cJSON *a = wire_build_bridge_pay_result_ack(5, NULL);
+        TEST_ASSERT(wire_parse_bridge_pay_result_ack(a, &r, reason, sizeof(reason)) &&
+                    r == 5 && reason[0] == '\0', "applied round-trips");
+        cJSON_ReplaceItemInObject(a, "status", cJSON_CreateString("maybe"));
+        TEST_ASSERT(!wire_parse_bridge_pay_result_ack(a, &r, reason, sizeof(reason)),
+                    "unknown status rejected");
+        cJSON_Delete(a);
+        a = wire_build_bridge_pay_result_ack(6, "no_htlc");
+        TEST_ASSERT(wire_parse_bridge_pay_result_ack(a, &r, reason, sizeof(reason)) &&
+                    r == 6 && strcmp(reason, "no_htlc") == 0, "rejected round-trips");
+        cJSON_Delete(a);
+    }
+    return 1;
+}
+
+/* ---- A pay that could not be requested gives the HTLC back ---- */
+
+int test_lsp_outbound_htlc_returned(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+
+    lsp_channels_fail_outbound_htlc(&f.mgr, f.lsp, &f.mgr.htlc_origins[0], 0,
+                                     f.htlc_id, "bridge_unavailable");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC returned");
+    TEST_ASSERT_EQ(ch->remote_amount, 100000, "client refunded");
+    TEST_ASSERT(!f.mgr.htlc_origins[0].active, "origin closed");
+    TEST_ASSERT(!lsp_channels_hash_in_flight(&f.mgr, f.hash), "hash free again");
+    wire_msg_t m;
+    TEST_ASSERT(wire_recv_timeout(f.client_peer, &m, 5), "client told");
+    uint64_t fid = 0; char reason[64];
+    TEST_ASSERT(m.msg_type == MSG_UPDATE_FAIL_HTLC &&
+                wire_parse_update_fail_htlc(m.json, &fid, reason, sizeof(reason)) &&
+                fid == f.htlc_id && strcmp(reason, "bridge_unavailable") == 0,
+                "UPDATE_FAIL_HTLC with the reason");
+    cJSON_Delete(m.json);
+
+    /* Without an origin (table was full) the HTLC is still returned */
+    uint64_t second;
+    TEST_ASSERT(channel_add_htlc(ch, HTLC_RECEIVED, 3000, f.hash, 500, &second), "HTLC");
+    lsp_channels_fail_outbound_htlc(&f.mgr, f.lsp, NULL, 0, second, "bridge_unavailable");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC returned");
+
+    pay_fixture_free(&f);
     return 1;
 }

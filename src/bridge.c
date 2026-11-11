@@ -677,11 +677,15 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         /* The LSP has the result: the plugin can stop repeating it.  If the
            plugin is away it simply repeats the result and is told again. */
         uint64_t request_id;
-        if (!wire_parse_bridge_pay_result_ack(msg->json, &request_id))
+        char reason[64];
+        if (!wire_parse_bridge_pay_result_ack(msg->json, &request_id,
+                                                reason, sizeof(reason)))
             return 0;
         cJSON *j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "method", "pay_result_ack");
         cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+        cJSON_AddStringToObject(j, "status", reason[0] ? "rejected" : "applied");
+        if (reason[0]) cJSON_AddStringToObject(j, "reason", reason);
         bridge_send_plugin_json(br, j);
         cJSON_Delete(j);
         return 1;

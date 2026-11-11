@@ -548,11 +548,26 @@ void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
        fulfilled;
      - failure: the client's HTLC is failed back.  The plugin reports
        failure only when the node can no longer complete the payment;
-     - anything else, or no result: the HTLC stays held.  It is never failed
-       on a timer (see lsp_channels_check_bridge_htlc_timeouts), because a
-       payment that completed must not be refunded.
-   Each result that was applied, or that had nothing left to apply to, is
-   answered with BRIDGE_PAY_RESULT_ACK; the plugin repeats it until then. */
+     - no result: the HTLC stays held.  It is never failed on a timer (see
+       lsp_channels_expire_htlcs), because a payment that completed must
+       not be refunded;
+     - a result that cannot be used is rejected, once and for good:
+         preimage_mismatch  a "success" whose preimage is not the HTLC's.
+                            The HTLC stays held and the origin open: the
+                            node claims a payment it cannot prove, and
+                            whether to refund is an operator's decision;
+         no_htlc            the client's HTLC is no longer there to settle
+                            (the origin is closed, nothing is left to do);
+         no_channel         the origin names a client that does not exist.
+   Every result is answered with BRIDGE_PAY_RESULT_ACK, "applied" or
+   "rejected" with the reason; the plugin repeats a result until it is
+   answered and never after. */
+
+/* Give a client back the HTLC it offered for an outside payment that was
+   never requested from the Lightning node, and close its origin. */
+void lsp_channels_fail_outbound_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      htlc_origin_t *origin, size_t client_idx,
+                                      uint64_t htlc_id, const char *reason);
 
 /* Amount of the registered invoice for payment_hash32, in msat (0 = the
    invoice names no amount).  Returns 1 if the invoice is registered. */

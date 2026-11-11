@@ -703,10 +703,17 @@ cJSON *wire_build_bridge_send_pay(const char *bolt11,
                                     uint64_t max_total_msat,
                                     uint32_t max_delay);
 
-/* LSP → Bridge: BRIDGE_PAY_RESULT_ACK {request_id}.  The result for this
-   request has been dealt with and need not be sent again. */
-cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id);
-int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id);
+/* LSP → Bridge: BRIDGE_PAY_RESULT_ACK {request_id, status, reason}.  The
+   result for this request has been dealt with and need not be sent again.
+   status "applied": it settled the client's HTLC (or there was nothing
+   left to settle).  status "rejected": it could not be used, for `reason`;
+   sending it again will not change that and an operator has to look.
+   rejected_reason NULL builds an "applied" ack; the parser leaves reason
+   empty for one. */
+cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id,
+                                          const char *rejected_reason);
+int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id,
+                                       char *reason, size_t reason_len);
 
 /* Bridge → LSP: BRIDGE_PAY_RESULT {request_id, success, preimage} */
 cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,

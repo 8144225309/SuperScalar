@@ -1824,16 +1824,31 @@ cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
     return j;
 }
 
-cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id) {
+cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id,
+                                          const char *rejected_reason) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    cJSON_AddStringToObject(j, "status", rejected_reason ? "rejected" : "applied");
+    if (rejected_reason)
+        cJSON_AddStringToObject(j, "reason", rejected_reason);
     return j;
 }
 
-int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id) {
+int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id,
+                                       char *reason, size_t reason_len) {
     cJSON *ri = cJSON_GetObjectItem(json, "request_id");
-    if (!wire_check_nonneg(ri)) return 0;
+    cJSON *st = cJSON_GetObjectItem(json, "status");
+    if (!wire_check_nonneg(ri) || !st || !cJSON_IsString(st)) return 0;
+    int rejected = strcmp(st->valuestring, "rejected") == 0;
+    if (!rejected && strcmp(st->valuestring, "applied") != 0) return 0;
     *request_id = (uint64_t)ri->valuedouble;
+    if (reason && reason_len > 0) {
+        cJSON *re = cJSON_GetObjectItem(json, "reason");
+        snprintf(reason, reason_len, "%s",
+                 !rejected ? "" :
+                 (re && cJSON_IsString(re) && re->valuestring[0]) ? re->valuestring
+                                                                  : "rejected");
+    }
     return 1;
 }
 

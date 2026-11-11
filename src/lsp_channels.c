@@ -1096,34 +1096,42 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Invoice checked above: route outbound via the bridge, telling it the
        hash the invoice must carry and the most it may spend. */
-    if (pay_outside && mgr->bridge_fd >= 0) {
+    if (pay_outside) {
         uint64_t request_id = mgr->next_request_id++;
-        cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
-                                                  payment_hash, request_id,
-                                                  outside_budget_msat,
-                                                  outside_max_delay);
-        int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
-        cJSON_Delete(pay);
-        if (!ok) return 0;
 
-        /* Track origin for when PAY_RESULT comes back: request_id and the
-           sender's HTLC go into the entry the tracker filled. */
+        /* Record the payment, in memory and in the database, before asking
+           for it: once the request is out its result must always find the
+           client's HTLC, also after a restart. */
         htlc_origin_t *out_origin = lsp_channels_track_outbound_pay(
             mgr, payment_hash, request_id, sender_idx, new_htlc_id, cltv_expiry);
-        if (out_origin) {
-            /* Persist origin + counter atomically */
-            if (mgr->persist) {
-                persist_t *db = (persist_t *)mgr->persist;
-                int own_txn = !persist_in_transaction(db);
-                if (own_txn) persist_begin(db);
-                lsp_channels_origin_save(mgr, out_origin);
-                persist_save_counter(db,
-                                      "next_request_id", mgr->next_request_id);
-                if (own_txn) persist_commit(db);
-            }
-        } else if (mgr->persist) {
-            persist_save_counter((persist_t *)mgr->persist,
-                                  "next_request_id", mgr->next_request_id);
+        if (mgr->persist) {
+            persist_t *db = (persist_t *)mgr->persist;
+            int own_txn = !persist_in_transaction(db);
+            if (own_txn) persist_begin(db);
+            lsp_channels_origin_save(mgr, out_origin);
+            persist_save_counter(db, "next_request_id", mgr->next_request_id);
+            if (own_txn) persist_commit(db);
+        }
+
+        int ok = 0;
+        if (out_origin && mgr->bridge_fd >= 0) {
+            cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
+                                                      payment_hash, request_id,
+                                                      outside_budget_msat,
+                                                      outside_max_delay);
+            ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
+            cJSON_Delete(pay);
+        }
+        if (!ok) {
+            /* The request did not go out (a partly written frame is not a
+               request), so nothing can be in flight on the outside: give
+               the client its HTLC back. */
+            fprintf(stderr, "LSP: outside payment %llu for client %zu could "
+                    "not be requested, HTLC returned\n",
+                    (unsigned long long)request_id, sender_idx);
+            lsp_channels_fail_outbound_htlc(mgr, lsp, out_origin, sender_idx,
+                                             new_htlc_id, "bridge_unavailable");
+            return 1;
         }
         printf("LSP: HTLC from client %zu routed to bridge (bolt11)\n", sender_idx);
         return 1;

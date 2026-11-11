@@ -590,7 +590,8 @@ def handle_bridge_msg(msg):
         t.start()
 
     elif method == "pay_result_ack":
-        _pay_acknowledged(msg.get("request_id"))
+        _pay_acknowledged(msg.get("request_id"), msg.get("status", "applied"),
+                          str(msg.get("reason", "")))
 
     elif method == "pay_result":
         # Response from bridge for a superscalar-pay RPC call
@@ -764,6 +765,8 @@ def load_state():
                 "started": rec.get("started", 0),
                 "result": rec.get("result"),
             }
+            if rec.get("rejected"):
+                open_pays[request_id]["rejected"] = rec["rejected"]
             restored += 1
     return restored
 
@@ -797,22 +800,47 @@ def _send_pay_result(request_id, success, preimage=None):
 
 
 def resend_pay_results():
-    """Send every recorded result that has not been acknowledged yet."""
+    """Send every recorded result that has not been answered yet."""
     with pays_lock:
         waiting = [(rid, dict(rec["result"]))
-                   for rid, rec in open_pays.items() if rec.get("result")]
+                   for rid, rec in open_pays.items()
+                   if rec.get("result") and not rec.get("rejected")]
     for request_id, result in waiting:
         send_to_bridge({"method": "pay_result", "request_id": request_id,
                         **result})
     return len(waiting)
 
 
-def _pay_acknowledged(request_id):
-    """The LSP has the result for this request: nothing left to remember."""
+def _pay_acknowledged(request_id, status="applied", reason=""):
+    """The LSP answered the result for this request.
+
+    applied: nothing left to remember.  An ack for a payment that has no
+    result yet is not believed: the payment may still be in flight, and its
+    record is what lets a restart find out how it ended.
+
+    rejected: the LSP could not use the result (for instance a preimage it
+    does not accept).  Repeating it changes nothing, so it is not sent
+    again; the record is kept, marked, for the operator."""
     with pays_lock:
-        known = open_pays.pop(request_id, None) is not None
-    if known:
-        save_state()
+        rec = open_pays.get(request_id)
+        if rec is None:
+            return
+        if not rec.get("result"):
+            log(f"WARNING: LSP acknowledged request_id={request_id}, which "
+                f"has no result yet; keeping it")
+            return
+        if status == "rejected":
+            already = rec.get("rejected")
+            rec["rejected"] = reason or "rejected"
+        else:
+            del open_pays[request_id]
+    if status == "rejected":
+        if not already:
+            log(f"ERROR: the LSP REJECTED the result of outside payment "
+                f"request_id={request_id} (success="
+                f"{rec['result'].get('success')}): {reason or 'no reason'}. "
+                f"It will not be sent again. Operator action needed.")
+    save_state()
 
 
 def result_retrier():

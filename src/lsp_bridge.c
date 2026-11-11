@@ -456,6 +456,29 @@ uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
     return id;
 }
 
+void lsp_channels_fail_outbound_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      htlc_origin_t *origin, size_t client_idx,
+                                      uint64_t htlc_id, const char *reason) {
+    if (client_idx < mgr->n_channels) {
+        channel_t *ch = &mgr->entries[client_idx].channel;
+        if (channel_fail_htlc(ch, htlc_id)) {
+            cJSON *fail = wire_build_update_fail_htlc(htlc_id, reason);
+            wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            if (mgr->persist) {
+                persist_t *db = (persist_t *)mgr->persist;
+                int own_txn = !persist_in_transaction(db);
+                if (own_txn) persist_begin(db);
+                persist_update_channel_balance(db, (uint32_t)client_idx,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+                persist_delete_htlc(db, (uint32_t)client_idx, htlc_id);
+                if (own_txn) persist_commit(db);
+            }
+        }
+    }
+    lsp_channels_origin_close(mgr, origin);
+}
+
 /* An inbound bridge HTLC could not be handed to the client after all: take
    it off the client's channel, close its origin and tell the bridge, so
    that the plugin fails the upstream HTLC and nothing stays reserved. */
@@ -873,6 +896,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         printf("LSP: bridge pay result: request_id=%llu success=%d\n",
                (unsigned long long)request_id, success);
+        const char *rejected = NULL;   /* why the result could not be used */
 
         /* Find the originating HTLC by request_id (outbound origins only:
            request ids start at 1 and inbound origins carry none) */
@@ -884,21 +908,33 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             size_t client_idx = mgr->htlc_origins[i].sender_idx;
             uint64_t htlc_id_val = mgr->htlc_origins[i].sender_htlc_id;
 
-            if (client_idx >= mgr->n_channels) return 1;
+            if (client_idx >= mgr->n_channels) {
+                fprintf(stderr, "LSP: ERROR — bridge pay result %llu rejected: "
+                        "origin names client %zu, which does not exist\n",
+                        (unsigned long long)request_id, client_idx);
+                lsp_channels_origin_close(mgr, &mgr->htlc_origins[i]);
+                rejected = "no_channel";
+                break;
+            }
             channel_t *ch = &mgr->entries[client_idx].channel;
 
             /* A success is only a success with the preimage of the hash the
                client's HTLC is locked to.  Anything else settles nothing:
-               the HTLC stays as it is and the origin stays open for the
-               real result. */
+               the HTLC stays held and the origin open.  The node says the
+               payment went through but cannot prove it, so neither
+               claiming nor refunding the client is safe here. */
             if (success) {
                 unsigned char check[32];
                 sha256(preimage, 32, check);
                 if (memcmp(check, mgr->htlc_origins[i].payment_hash, 32) != 0) {
-                    fprintf(stderr, "LSP: bridge pay result %llu ignored — "
-                            "preimage does not match the payment hash\n",
-                            (unsigned long long)request_id);
-                    return 1;
+                    fprintf(stderr, "LSP: ERROR — bridge pay result %llu rejected: "
+                            "preimage does not match the payment hash.  HTLC "
+                            "%llu of client %zu stays held; operator action "
+                            "needed\n",
+                            (unsigned long long)request_id,
+                            (unsigned long long)htlc_id_val, client_idx);
+                    rejected = "preimage_mismatch";
+                    break;
                 }
             }
 
@@ -915,12 +951,14 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 /* Fulfill the HTLC on the client's channel; the client is
                    told nothing unless that worked */
                 if (!channel_fulfill_htlc(ch, htlc_id_val, preimage)) {
-                    fprintf(stderr, "LSP: bridge pay result %llu ignored — "
+                    fprintf(stderr, "LSP: ERROR — bridge pay result %llu rejected: "
                             "no HTLC %llu to fulfil on client %zu\n",
                             (unsigned long long)request_id,
                             (unsigned long long)htlc_id_val, client_idx);
                     free(old_htlcs);
-                    return 1;
+                    lsp_channels_origin_close(mgr, &mgr->htlc_origins[i]);
+                    rejected = "no_htlc";
+                    break;
                 }
                 mgr->htlc_origins[i].active = 0;
                 lsp_channels_note_outbound_paid(mgr,
@@ -1018,11 +1056,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             } else {
                 /* Fail the HTLC */
                 if (!channel_fail_htlc(ch, htlc_id_val)) {
-                    fprintf(stderr, "LSP: bridge pay result %llu ignored — "
+                    fprintf(stderr, "LSP: ERROR — bridge pay result %llu rejected: "
                             "no HTLC %llu to fail on client %zu\n",
                             (unsigned long long)request_id,
                             (unsigned long long)htlc_id_val, client_idx);
-                    return 1;
+                    lsp_channels_origin_close(mgr, &mgr->htlc_origins[i]);
+                    rejected = "no_htlc";
+                    break;
                 }
                 mgr->htlc_origins[i].active = 0;
                 cJSON *fail = wire_build_update_fail_htlc(htlc_id_val, "bridge_pay_failed");
@@ -1052,11 +1092,11 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             break;
         }
 
-        /* The result has been applied, or there is no open payment with
-           this id left to apply it to.  Either way it need not be sent
-           again.  (A result that was ignored above is not acknowledged.) */
+        /* Every result gets its answer, so the plugin stops repeating it:
+           applied (or nothing left to apply it to), or rejected with the
+           reason. */
         if (mgr->bridge_fd >= 0) {
-            cJSON *ack = wire_build_bridge_pay_result_ack(request_id);
+            cJSON *ack = wire_build_bridge_pay_result_ack(request_id, rejected);
             wire_send(mgr->bridge_fd, MSG_BRIDGE_PAY_RESULT_ACK, ack);
             cJSON_Delete(ack);
         }

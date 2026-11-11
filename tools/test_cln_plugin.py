@@ -638,6 +638,37 @@ class PayResultDeliveryTest(PluginTestCase):
         self.assertEqual(cln.calls_to("pay"), [])
         self.assert_pay_failed(9)
 
+    def test_ack_for_a_payment_still_in_flight_does_not_drop_it(self):
+        cln_plugin._open_pay(7, PAYMENT_HASH)
+        self.ack(7)
+        self.assertIn(7, cln_plugin.open_pays)
+        # Its record is still on disk for a restart to pick up.
+        self.restart_plugin()
+        cln_plugin.load_state()
+        self.assertIn(7, cln_plugin.open_pays)
+
+    def test_rejected_result_is_kept_but_not_repeated(self):
+        logged = []
+        self.use_cln(decode=decoded_invoice(4_000_000),
+                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        with mock.patch.object(cln_plugin, "log", logged.append):
+            for _ in range(2):
+                cln_plugin.handle_bridge_msg({
+                    "method": "pay_result_ack", "request_id": 7,
+                    "status": "rejected", "reason": "preimage_mismatch"})
+        # Said once, loudly, with the reason.
+        self.assertEqual(len(logged), 1)
+        self.assertIn("REJECTED", logged[0])
+        self.assertIn("preimage_mismatch", logged[0])
+        # Not sent again, but not forgotten either, also after a restart.
+        self.assertEqual(cln_plugin.resend_pay_results(), 0)
+        self.assertEqual(len(self.pay_results()), 1)
+        self.restart_plugin()
+        cln_plugin.load_state()
+        self.assertEqual(cln_plugin.open_pays[7]["rejected"], "preimage_mismatch")
+        self.assertEqual(cln_plugin.resend_pay_results(), 0)
+
     def test_no_invoice_is_created_for_a_hash_being_paid(self):
         started = []
 
