@@ -580,6 +580,10 @@ typedef struct {
        Once close_state.signed_close is set the factory is frozen: the loop
        acts on nothing but a close proposal. */
     client_close_state_t close_state;
+    /* How a close ceremony that did not complete ended (see
+       daemon_close_outcome): the process must not report success. */
+    int     close_refused;          /* 1 = this client refused the LSP's proposal */
+    int     close_incomplete;       /* 1 = failed after this client had signed */
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -861,6 +865,30 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
 }
 
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
+/* A close ceremony ended without completing.  Record why, so that main()
+   does not report a clean exit, and tell the operator what is left to do.
+   Nothing is broadcast from here: a unilateral exit is the operator's call. */
+static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
+    if (cbd->close_state.refused) {
+        cbd->close_refused = 1;
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE REFUSED. This client did not sign "
+            "what the LSP proposed (reason above); its channel is unchanged. "
+            "Unless the LSP proposes an acceptable close after a restart, "
+            "the factory needs a unilateral exit: run this client with "
+            "--force-close and the same --db to broadcast it.\n", my_index);
+    } else if (cbd->close_state.signed_close) {
+        cbd->close_incomplete = 1;
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED after this client "
+            "signed it. The LSP may still broadcast that close (it pays this "
+            "client %llu sats), so the channel is frozen. Restart to let the "
+            "LSP propose the close again, or run with --force-close and the "
+            "same --db to exit unilaterally.\n", my_index,
+            (unsigned long long)cbd->close_state.paid_sats);
+    }
+}
+
 /* This client's own chain tip height, 0 if no chain backend can tell. */
 static uint32_t client_tool_chain_tip(void *ctx) {
     watchtower_t *wt = (watchtower_t *)ctx;
@@ -1535,14 +1563,17 @@ handle_message:
             break;
         }
 
-        case MSG_CLOSE_PROPOSE:
+        case MSG_CLOSE_PROPOSE: {
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
-            client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
+            int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
                                       factory, n_participants, &msg,
                                       client_chain_tip(), ch,
                                       &cbd->close_state, 0);
             cJSON_Delete(msg.json);
+            if (!close_ok)
+                daemon_close_outcome(cbd, my_index);
             return 2;  /* close already handled */
+        }
 
         case MSG_CREATE_INVOICE: {
             /* LSP asks us to create an invoice (Phase 17) */
@@ -3739,6 +3770,10 @@ int main(int argc, char *argv[]) {
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
+        /* A close that was refused, or left incomplete after signing, is
+           not a clean exit. */
+        if (cbd.close_refused || cbd.close_incomplete)
+            ok = 0;
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
@@ -3785,6 +3820,8 @@ int main(int argc, char *argv[]) {
             if (cbd.force_close_requested)
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
+            if (cbd.close_refused || cbd.close_incomplete)
+                ok = 0;
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */
             multi_payment_data_t data = { actions, n_actions, 0 };
