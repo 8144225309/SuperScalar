@@ -334,10 +334,19 @@ uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
 
 /* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
 
-/* Cooperatively redistribute output amounts on an arity-2 leaf.
-   All 3 signers (LSP + 2 clients) must agree.  amounts[] must sum
-   to the current leaf output total; each amount >= 546 sats.
-   Performs a 2-round MuSig2 ceremony over the wire.
+/* Why the LSP offers no operation that reallocates a leaf: a reallocation
+   replaces the leaf transaction, the clients' channels cannot yet be moved
+   to the new leaf output, and so clients refuse to co-sign one. */
+#define LSP_LEAF_REALLOC_UNAVAILABLE \
+    "not available until channels can follow a reallocated leaf"
+
+/* Run the leaf reallocation ceremony: propose new output amounts for a leaf
+   to its clients and collect a MuSig2 signature for the new leaf state.
+   amounts[] must sum to the current leaf output total; each amount >= 546
+   sats.  Clients currently refuse every proposal (see
+   LSP_LEAF_REALLOC_UNAVAILABLE), so this fails; nothing that serves users
+   calls it.  When the ceremony fails for any reason the LSP's leaf is put
+   back exactly as it was before the call.
    Returns 1 on success, 0 on failure. */
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts);
@@ -405,9 +414,10 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    int channel_idx_in_sub,
                                    uint64_t delta_sats);
 
-/* Buy inbound liquidity from L-stock for a client (arity-2 only).
-   Moves amount_sats from L-stock to client's channel, increasing inbound capacity.
-   Returns 1 on success. */
+/* Buy inbound liquidity from L-stock for a client.  This needs a leaf
+   reallocation, so it is refused: the call reports
+   LSP_LEAF_REALLOC_UNAVAILABLE, contacts no client, leaves the leaf and the
+   channel untouched and returns 0. */
 int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 size_t client_idx, uint64_t amount_sats);
 

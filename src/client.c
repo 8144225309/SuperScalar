@@ -44,6 +44,27 @@ void client_set_persist(persist_t *p) {
     g_client_persist = p;
 }
 
+static client_chain_tip_fn g_client_chain_tip_fn = NULL;
+static void *g_client_chain_tip_ctx = NULL;
+
+void client_set_chain_tip_source(client_chain_tip_fn fn, void *ctx) {
+    g_client_chain_tip_fn = fn;
+    g_client_chain_tip_ctx = ctx;
+}
+
+uint32_t client_chain_tip(void) {
+    return g_client_chain_tip_fn
+           ? g_client_chain_tip_fn(g_client_chain_tip_ctx) : 0;
+}
+
+static unsigned g_client_chain_tip_attempts = CLIENT_CHAIN_TIP_ATTEMPTS;
+static unsigned g_client_chain_tip_retry_ms = CLIENT_CHAIN_TIP_RETRY_MS;
+
+void client_set_chain_tip_retry(unsigned attempts, unsigned delay_ms) {
+    g_client_chain_tip_attempts = attempts ? attempts : 1;
+    g_client_chain_tip_retry_ms = delay_ms;
+}
+
 /* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
    If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
 static uint16_t g_min_profit_bps = 0;
@@ -72,6 +93,38 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
     }
 }
 
+/* Both sides of the conservation invariant for ch: what the channel state
+   accounts for (balances plus every active HTLC and PTLC) and what the
+   funding output holds once the base commitment fee is taken off.  Returns 1
+   if they agree. */
+static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
+                                     uint64_t *expected_out,
+                                     uint64_t *base_commit_fee_out) {
+    uint64_t sum = ch->local_amount + ch->remote_amount;
+    for (size_t h = 0; h < ch->n_htlcs; h++) {
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
+            sum += ch->htlcs[h].amount_sats;
+            sum += ch->htlcs[h].fee_at_add;
+        }
+    }
+    for (size_t t = 0; t < ch->n_ptlcs; t++) {
+        if (ch->ptlcs[t].state == PTLC_STATE_ACTIVE) {
+            sum += ch->ptlcs[t].amount_sats;
+            sum += ch->ptlcs[t].fee_at_add;
+        }
+    }
+    /* Base commit-tx fee: matches fee_for_commitment_tx(fe, 0) in src/fee.c
+       (154 vB × fee_rate_sat_per_kvb, rounded up per compute_fee). */
+    uint64_t base_commit_fee =
+        (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+    uint64_t expected = ch->funding_amount > base_commit_fee
+                        ? ch->funding_amount - base_commit_fee : 0;
+    if (sum_out) *sum_out = sum;
+    if (expected_out) *expected_out = expected;
+    if (base_commit_fee_out) *base_commit_fee_out = base_commit_fee;
+    return sum == expected;
+}
+
 /* Client-side conservation invariant check (defense-in-depth).
    The commitment signature already prevents exploitation, but this catches
    bugs in the balance arithmetic itself.
@@ -82,22 +135,15 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
    usable balance at init time (lsp_channels_init, src/lsp_channels.c:203-204),
    so the invariant must account for it — otherwise the check trips by
    exactly base_commit_fee on every balanced channel. */
+int client_channel_balanced(const channel_t *ch) {
+    return ch && ch->funding_amount != 0 &&
+           client_channel_conserved(ch, NULL, NULL, NULL);
+}
+
 static void client_check_conservation(const channel_t *ch, const char *context) {
     if (!ch || ch->funding_amount == 0) return;
-    uint64_t sum = ch->local_amount + ch->remote_amount;
-    for (size_t h = 0; h < ch->n_htlcs; h++) {
-        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
-            sum += ch->htlcs[h].amount_sats;
-            sum += ch->htlcs[h].fee_at_add;
-        }
-    }
-    /* Base commit-tx fee: matches fee_for_commitment_tx(fe, 0) in src/fee.c
-       (154 vB × fee_rate_sat_per_kvb, rounded up per compute_fee). */
-    uint64_t base_commit_fee =
-        (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
-    uint64_t expected = ch->funding_amount > base_commit_fee
-                        ? ch->funding_amount - base_commit_fee : 0;
-    if (sum != expected) {
+    uint64_t sum, expected, base_commit_fee;
+    if (!client_channel_conserved(ch, &sum, &expected, &base_commit_fee)) {
         fprintf(stderr, "CLIENT CONSERVATION VIOLATION (%s): "
                 "local=%llu remote=%llu htlc_sum=%llu total=%llu "
                 "expected=%llu funding=%llu base_commit_fee=%llu "
@@ -609,6 +655,264 @@ int client_fulfill_payment(int fd, channel_t *ch,
 
 /* --- Cooperative close ceremony (extracted for reuse) --- */
 
+int client_close_script(const secp256k1_context *ctx,
+                         const secp256k1_pubkey *my_pubkey,
+                         unsigned char *spk_out34) {
+    secp256k1_xonly_pubkey xonly;
+    if (!ctx || !my_pubkey || !spk_out34) return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, my_pubkey))
+        return 0;
+    build_p2tr_script_pubkey(spk_out34, &xonly);
+    return 1;
+}
+
+int client_close_amount_to_client(const secp256k1_context *ctx,
+                                   const secp256k1_pubkey *my_pubkey,
+                                   const tx_output_t *outputs,
+                                   size_t n_outputs,
+                                   uint64_t *paid_sats_out,
+                                   size_t *n_paying_out) {
+    /* Amounts sent to any other script are not the client's, however large,
+       so only outputs carrying exactly its own script are counted.  An
+       output below the dust limit is not counted either: it is not relayed
+       as part of a standard transaction and costs more to spend than it
+       holds, so a balance split into such outputs is not paid at all. */
+    unsigned char my_spk[34];
+    uint64_t paid = 0;
+    size_t n_paying = 0;
+    if (!paid_sats_out || (!outputs && n_outputs > 0)) return 0;
+    if (!client_close_script(ctx, my_pubkey, my_spk)) return 0;
+    for (size_t i = 0; i < n_outputs; i++) {
+        if (outputs[i].script_pubkey_len != sizeof(my_spk) ||
+            memcmp(outputs[i].script_pubkey, my_spk, sizeof(my_spk)) != 0)
+            continue;
+        if (outputs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
+        if (outputs[i].amount_sats > UINT64_MAX - paid) return 0;
+        paid += outputs[i].amount_sats;
+        n_paying++;
+    }
+    *paid_sats_out = paid;
+    if (n_paying_out) *n_paying_out = n_paying;
+    return 1;
+}
+
+int client_close_locktime_acceptable(uint32_t locktime, uint32_t tip_height) {
+    if (locktime == 0) return 1;             /* no lock at all */
+    if (locktime >= 500000000u) return 0;    /* time-based lock */
+    if (tip_height == 0) return 0;           /* nothing to judge a height by */
+    if (locktime <= tip_height) return 1;
+    return locktime - tip_height <= CLIENT_CLOSE_LOCKTIME_MARGIN;
+}
+
+void client_close_state_init(client_close_state_t *cs, persist_t *db,
+                              const factory_t *factory) {
+    if (!cs) return;
+    memset(cs, 0, sizeof(*cs));
+    cs->db = db;
+    if (db && factory) {
+        int r = persist_load_close_signed(db, factory->funding_txid,
+                                           factory->funding_vout,
+                                           &cs->paid_sats, cs->sighash);
+        if (r > 0) cs->signed_close = 1;
+        else if (r < 0) cs->record_error = 1;
+    }
+}
+
+/* What this client's records say about a signed cooperative close of the
+   factory: 1 signed, 0 not signed (or no database), -1 cannot be read.  A
+   factory with a signed close is frozen: see client_close_state_t. */
+static int client_factory_close_record(const factory_t *factory) {
+    if (!g_client_persist || !factory) return 0;
+    return persist_load_close_signed(g_client_persist, factory->funding_txid,
+                                      factory->funding_vout, NULL, NULL);
+}
+
+int client_close_state_frozen(client_close_state_t *cs,
+                               const factory_t *factory) {
+    if (!cs) return 1;
+    if (cs->signed_close) return 1;
+    if (!cs->record_error) return 0;
+    /* The record could not be read.  Look again: if the error has passed,
+       the answer is whatever the record says; if not, the factory stays
+       frozen, because a signed close cannot be ruled out. */
+    int r = (cs->db && factory)
+        ? persist_load_close_signed(cs->db, factory->funding_txid,
+                                     factory->funding_vout,
+                                     &cs->paid_sats, cs->sighash)
+        : -1;
+    if (r < 0) return 1;
+    cs->record_error = 0;
+    if (r > 0) cs->signed_close = 1;
+    return cs->signed_close;
+}
+
+int client_close_signed_for_factory(const factory_t *factory) {
+    client_close_state_t cs;
+    client_close_state_init(&cs, g_client_persist, factory);
+    return client_close_state_frozen(&cs, factory);
+}
+
+int client_close_frozen_allows_msg(uint8_t msg_type) {
+    return msg_type == MSG_CLOSE_PROPOSE ||
+           msg_type == MSG_PING || msg_type == MSG_PONG ||
+           msg_type == MSG_LSP_REVOKE_AND_ACK;
+}
+
+/* Refuse a leaf or state advance of a factory whose close was signed, or
+   whose close record cannot be read.  Returns 1 if the advance was refused
+   (an error was sent to the LSP). */
+static int client_refuse_advance_if_close_signed(int fd,
+                                                  const factory_t *factory,
+                                                  uint32_t my_index,
+                                                  const char *what) {
+    int r = client_factory_close_record(factory);
+    if (r == 0) return 0;
+    if (r > 0) {
+        fprintf(stderr, "Client %u: REFUSING %s — a cooperative close of this "
+                "factory was already signed\n", my_index, what);
+        client_send_error(fd, "refused: this client already signed a "
+                              "cooperative close of the factory");
+    } else {
+        fprintf(stderr, "Client %u: REFUSING %s — cannot read this client's "
+                "record of signed closes\n", my_index, what);
+        client_send_error(fd, "refused: client cannot read its close record");
+    }
+    return 1;
+}
+
+int client_close_outputs_acceptable(const secp256k1_context *ctx,
+                                     const secp256k1_pubkey *my_pubkey,
+                                     const channel_t *ch,
+                                     const tx_output_t *outputs,
+                                     size_t n_outputs) {
+    /* No channel: the client never opened one in this factory, so it holds
+       no commitment and no balance there and is owed nothing, whatever the
+       outputs are.  This is only true if there really is no channel; the
+       ceremony refuses when the client's own records say otherwise (see
+       client_close_without_channel_ok). */
+    if (!ch) return 1;
+    if (!outputs) return 0;
+
+    /* The proposed outputs settle balances only.  An HTLC or PTLC still in
+       flight is not represented by any output, so signing now would forfeit
+       it (an incoming one the client can claim, or an outgoing one that may
+       yet be refunded).  Wait for it to resolve, or exit with the
+       commitment. */
+    size_t n_active = 0, n_active_ptlcs = 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) n_active++;
+    for (size_t i = 0; i < ch->n_ptlcs; i++)
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE) n_active_ptlcs++;
+    if (n_active > 0 || n_active_ptlcs > 0) {
+        fprintf(stderr, "Client: REFUSING cooperative close — %zu HTLC(s) "
+                "and %zu PTLC(s) still pending on the channel\n",
+                n_active, n_active_ptlcs);
+        return 0;
+    }
+
+    /* The balances must account for the whole funding output.  The HTLC and
+       PTLC lists are not restored when a channel is reloaded, so one that was
+       in flight then is invisible to the check above; what gives it away is
+       that its amount is in neither balance.  A close paying local_amount
+       would hand that amount to the LSP, so a channel whose state does not
+       add up is never closed cooperatively. */
+    uint64_t accounted = 0, expected = 0;
+    if (ch->funding_amount == 0 ||
+        !client_channel_conserved(ch, &accounted, &expected, NULL)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — channel state "
+                "accounts for %llu sats (local %llu, remote %llu) but the "
+                "funding output holds %llu after the commitment fee; an HTLC "
+                "or PTLC may be unresolved\n",
+                (unsigned long long)accounted,
+                (unsigned long long)ch->local_amount,
+                (unsigned long long)ch->remote_amount,
+                (unsigned long long)expected);
+        return 0;
+    }
+
+    /* A balance below the dust limit cannot be paid by a standard output. */
+    uint64_t my_balance = ch->local_amount;
+    if (my_balance < CHANNEL_DUST_LIMIT_SATS) return 1;
+
+    /* The balance must be paid to the script this client derives from its own
+       key, in one output: that is what the LSP builds for every client, and
+       a payout spread over several outputs only costs the client fees to
+       collect. */
+    uint64_t paid_to_me = 0;
+    size_t n_paying = 0;
+    if (!client_close_amount_to_client(ctx, my_pubkey, outputs, n_outputs,
+                                        &paid_to_me, &n_paying)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — cannot total "
+                "the outputs paying this client's close script\n");
+        return 0;
+    }
+    if (n_paying > 1) {
+        fprintf(stderr, "Client: REFUSING cooperative close — the balance is "
+                "split over %zu outputs to this client's script; it must be "
+                "paid in one\n", n_paying);
+        return 0;
+    }
+    if (paid_to_me < my_balance) {
+        fprintf(stderr, "Client: REFUSING cooperative close — outputs pay %llu "
+                "sats to this client's script, channel balance is %llu sats "
+                "(force-close instead)\n",
+                (unsigned long long)paid_to_me,
+                (unsigned long long)my_balance);
+        return 0;
+    }
+    return 1;
+}
+
+/* A close with no channel is signed only by a client that is owed nothing.
+   If the client's own database holds a channel for this factory, it does
+   have a balance and was merely started without it; signing would give that
+   balance away.  With no database there is nothing that could have carried
+   a channel over from an earlier run (reconnecting to a factory needs the
+   database), so a client with neither is owed nothing.
+   Returns 1 if a channel is on record, 0 if none is, -1 if the records
+   cannot be read. */
+static int client_close_channel_on_record(persist_t *db,
+                                           const factory_t *factory) {
+    if (!db) return 0;
+    return persist_factory_has_channel(db, factory->funding_txid,
+                                        factory->funding_vout);
+}
+
+/* End the ceremony by refusing what the LSP proposed.  The channel is left
+   as it was; the client can still exit with its commitment. */
+static void client_close_refuse(int fd, client_close_state_t *cs,
+                                 const char *reason) {
+    cs->refused = 1;
+    client_send_error(fd, reason);
+}
+
+/* End the ceremony because the client could not check the proposal.  This
+   is not a judgement of the terms: nothing is signed or recorded, the
+   channel stays fully usable, and the LSP is told to try again. */
+static void client_close_unverifiable(int fd, client_close_state_t *cs,
+                                       const char *reason) {
+    cs->unverifiable = 1;
+    client_send_error(fd, reason);
+}
+
+/* The chain tip to judge a proposal's nLockTime by.  Starts from the tip the
+   caller supplied; while that tip does not make the nLockTime acceptable and
+   a height could become acceptable (the backend may have been unreachable,
+   or be a few blocks behind), asks the tip source again for a bounded time. */
+static uint32_t client_close_tip_for(uint32_t locktime, uint32_t tip) {
+    if (!g_client_chain_tip_fn) return tip;
+    if (locktime == 0 || locktime >= 500000000u) return tip;
+    for (unsigned attempt = 1;
+         !client_close_locktime_acceptable(locktime, tip) &&
+         attempt <= g_client_chain_tip_attempts; attempt++) {
+        if (attempt > 1 && g_client_chain_tip_retry_ms > 0)
+            usleep((useconds_t)g_client_chain_tip_retry_ms * 1000);
+        uint32_t now = client_chain_tip();
+        if (now > tip) tip = now;
+    }
+    return tip;
+}
+
 /* MEDIUM-1: cap on LSP-driven re-PROPOSE recursion depth. The LSP is untrusted;
    without a cap a malicious/looping LSP that streams CLOSE_PROPOSE could exhaust
    the client's stack. On exceed, the client aborts the coop close and can still
@@ -623,9 +927,37 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const wire_msg_t *initial_msg,
                                uint32_t current_height,
                                const channel_t *ch,
+                               client_close_state_t *cs,
                                int repropose_depth) {
     wire_msg_t msg;
     int got_propose = 0;
+
+    client_close_state_t own_cs;
+    if (!cs) {
+        client_close_state_init(&own_cs, g_client_persist, factory);
+        cs = &own_cs;
+    }
+    cs->refused = 0;
+    cs->unverifiable = 0;
+
+    /* The record of closes already signed decides what may be signed now.
+       If it could not be read, try once more, and sign nothing without it. */
+    if (cs->record_error) {
+        int r = cs->db
+            ? persist_load_close_signed(cs->db, factory->funding_txid,
+                                         factory->funding_vout,
+                                         &cs->paid_sats, cs->sighash)
+            : -1;
+        if (r < 0) {
+            fprintf(stderr, "Client: cooperative close NOT signed — cannot "
+                    "read this client's record of signed closes\n");
+            client_close_unverifiable(fd, cs, "cooperative close not signed: "
+                "client cannot read its close record, try again");
+            return 0;
+        }
+        cs->record_error = 0;
+        if (r > 0) cs->signed_close = 1;
+    }
 
     if (initial_msg && initial_msg->msg_type == MSG_CLOSE_PROPOSE) {
         /* Use already-received CLOSE_PROPOSE */
@@ -649,6 +981,15 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             if (msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE ||
                 msg.msg_type == MSG_STATE_ADVANCE_PROPOSE ||
                 msg.msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
+                if (cs->signed_close) {
+                    fprintf(stderr, "Client: REFUSING leaf/state advance — a "
+                            "cooperative close of this factory was already "
+                            "signed\n");
+                    cJSON_Delete(msg.json);
+                    client_close_refuse(fd, cs, "refused: this client already "
+                        "signed a cooperative close of the factory");
+                    return 0;
+                }
                 /* Participate in the (per-leaf or whole-tree state-advance)
                    ceremony inline.  Derive my_index from the factory's pubkey
                    list. */
@@ -705,10 +1046,40 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         return 0;
     }
 
-    /* Extract nLockTime height from CLOSE_PROPOSE (anti-fee-sniping). */
+    /* nLockTime of the proposed close (the LSP sets it to its chain height
+       against fee sniping).  It must be near the client's own tip: a close
+       that cannot confirm for a long time is a signed transaction the LSP
+       could hold back and use later. */
     cJSON *ht = cJSON_GetObjectItem(msg.json, "current_height");
-    uint32_t close_height = (ht && cJSON_IsNumber(ht))
-                            ? (uint32_t)ht->valuedouble : current_height;
+    if (!ht || !cJSON_IsNumber(ht) || !(ht->valuedouble >= 0.0) ||
+        ht->valuedouble > 4294967295.0) {
+        fprintf(stderr, "Client: malformed CLOSE_PROPOSE (nLockTime)\n");
+        if (!initial_msg) cJSON_Delete(msg.json);
+        return 0;
+    }
+    uint32_t close_height = (uint32_t)ht->valuedouble;
+    current_height = client_close_tip_for(close_height, current_height);
+    if (!client_close_locktime_acceptable(close_height, current_height)) {
+        if (!initial_msg) cJSON_Delete(msg.json);
+        if (current_height == 0 && close_height < 500000000u) {
+            /* No tip to judge the height by: the client cannot tell an
+               honest nLockTime from a far-future one.  That says nothing
+               about the proposal, so it is not a refusal of its terms. */
+            fprintf(stderr, "Client: cooperative close NOT signed — nLockTime "
+                    "%u cannot be verified: this client has no chain tip "
+                    "right now\n", close_height);
+            client_close_unverifiable(fd, cs, "cooperative close not signed: "
+                "client cannot verify locktime, try again");
+            return 0;
+        }
+        fprintf(stderr, "Client: REFUSING cooperative close — nLockTime "
+                "%u is more than %d blocks above this client's chain "
+                "tip %u\n", close_height, CLIENT_CLOSE_LOCKTIME_MARGIN,
+                current_height);
+        client_close_refuse(fd, cs, "cooperative close refused: nLockTime is "
+                                    "not near this client's chain tip");
+        return 0;
+    }
 
     size_t n_outputs = (size_t)cJSON_GetArraySize(outputs_arr);
     if (n_outputs == 0 || n_outputs > FACTORY_MAX_SIGNERS) {
@@ -732,32 +1103,64 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
             if (!initial_msg) cJSON_Delete(msg.json);
             return 0;
         }
+        if (!(amt->valuedouble >= 0.0) || amt->valuedouble > 2.1e15) {
+            fprintf(stderr, "Client: close output %zu amount out of range\n", i);
+            free(close_outputs);
+            if (!initial_msg) cJSON_Delete(msg.json);
+            return 0;
+        }
         close_outputs[i].amount_sats = (uint64_t)amt->valuedouble;
         close_outputs[i].script_pubkey_len = (size_t)wire_json_get_hex(
             item, "spk", close_outputs[i].script_pubkey, 34);
     }
     if (!initial_msg) cJSON_Delete(msg.json);
 
-    /* Verify cooperative close outputs before signing.
-       The client must receive at least its channel balance.  If the LSP
-       short-changes the close outputs, the client refuses to sign and
-       can force-close instead (using the pre-signed commitment TX). */
-    if (ch && ch->local_amount > 0) {
-        uint64_t my_balance = ch->local_amount;
-        int found = 0;
-        for (size_t i = 0; i < n_outputs; i++) {
-            if (close_outputs[i].amount_sats >= my_balance) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            fprintf(stderr, "Client: REFUSING cooperative close — no output "
-                    ">= channel balance %llu sats (force-close instead)\n",
-                    (unsigned long long)my_balance);
+    /* Verify the proposed outputs before contributing a nonce or a signature.
+       Refusing changes nothing on the channel: the client still holds its
+       signed commitment and can exit unilaterally. */
+    if (!ch) {
+        int on_record = client_close_channel_on_record(cs->db, factory);
+        if (on_record < 0) {
+            fprintf(stderr, "Client: cooperative close NOT signed — cannot "
+                    "read this client's channel records\n");
             free(close_outputs);
+            client_close_unverifiable(fd, cs, "cooperative close not signed: "
+                "client cannot read its channel records, try again");
             return 0;
         }
+        if (on_record > 0) {
+            fprintf(stderr, "Client: REFUSING cooperative close — a channel "
+                    "is on record for this factory but this client was "
+                    "started without it\n");
+            free(close_outputs);
+            client_close_refuse(fd, cs, "cooperative close refused: client "
+                                        "was started without its channel state");
+            return 0;
+        }
+    }
+    if (!client_close_outputs_acceptable(ctx, my_pubkey, ch,
+                                          close_outputs, n_outputs)) {
+        free(close_outputs);
+        client_close_refuse(fd, cs, "cooperative close refused: proposed "
+            "outputs do not pay this client its channel balance");
+        return 0;
+    }
+
+    /* If a close of this factory was signed before, the LSP may still hold
+       it.  A replacement must pay this client at least as much, or the LSP
+       could choose whichever of the two suits it. */
+    uint64_t paid_to_me = 0;
+    if (!client_close_amount_to_client(ctx, my_pubkey, close_outputs,
+                                        n_outputs, &paid_to_me, NULL) ||
+        (cs->signed_close && paid_to_me < cs->paid_sats)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — it pays this "
+                "client %llu sats, a close signed earlier pays %llu\n",
+                (unsigned long long)paid_to_me,
+                (unsigned long long)cs->paid_sats);
+        free(close_outputs);
+        client_close_refuse(fd, cs, "cooperative close refused: an earlier "
+                                    "signed close pays this client more");
+        return 0;
     }
 
     tx_buf_t close_unsigned;
@@ -821,6 +1224,16 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         if (all_nonces_msg.msg_type == MSG_LEAF_ADVANCE_PROPOSE ||
             all_nonces_msg.msg_type == MSG_STATE_ADVANCE_PROPOSE ||
             all_nonces_msg.msg_type == MSG_STATE_ADV_PROPOSE_INTENT) {
+            if (cs->signed_close) {
+                fprintf(stderr, "Client: REFUSING leaf/state advance — a "
+                        "cooperative close of this factory was already "
+                        "signed\n");
+                cJSON_Delete(all_nonces_msg.json);
+                tx_buf_free(&close_unsigned);
+                client_close_refuse(fd, cs, "refused: this client already "
+                    "signed a cooperative close of the factory");
+                return 0;
+            }
             uint32_t my_idx = UINT32_MAX;
             for (size_t p = 0; p < factory->n_participants; p++) {
                 unsigned char a[33], b[33]; size_t la = 33, lb = 33;
@@ -888,6 +1301,25 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         return 0;
     }
 
+    /* Record the close before the partial signature exists.  Once the
+       signature is out, the LSP may be able to complete this close at any
+       time, so from here on the factory is frozen for this client (see
+       client_close_state_t).  If the record cannot be written, nothing is
+       signed. */
+    if (cs->db && !persist_save_close_signed(cs->db, factory->funding_txid,
+                                              factory->funding_vout,
+                                              paid_to_me, close_sighash)) {
+        fprintf(stderr, "Client: REFUSING cooperative close — cannot record "
+                "the close before signing it\n");
+        tx_buf_free(&close_unsigned);
+        client_close_refuse(fd, cs, "cooperative close refused: client could "
+                                    "not record the close");
+        return 0;
+    }
+    cs->signed_close = 1;
+    cs->paid_sats = paid_to_me;
+    memcpy(cs->sighash, close_sighash, 32);
+
     secp256k1_musig_partial_sig close_psig;
     if (!musig_create_partial_sig(ctx, &close_psig, &close_secnonce,
                                    keypair, &close_session)) {
@@ -952,7 +1384,7 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         tx_buf_free(&close_unsigned);
         int _r = client_do_close_ceremony(fd, ctx, keypair, my_pubkey, factory,
                                            n_participants, &done_msg, current_height, ch,
-                                           repropose_depth + 1);
+                                           cs, repropose_depth + 1);
         cJSON_Delete(done_msg.json);
         return _r;
     }
@@ -2747,6 +3179,8 @@ int client_run_with_channels(secp256k1_context *ctx,
     printf("Client %u: factory creation complete!\n", my_index);
 
     /* === Channel Operations Phase === */
+    channel_t channel;
+    const channel_t *close_ch = NULL;   /* set once the channel is open */
     if (channel_cb) {
         /* Basepoint exchange: receive LSP's basepoints */
         secp256k1_pubkey lsp_pay_bp, lsp_delay_bp, lsp_revoc_bp, lsp_htlc_bp;
@@ -2860,7 +3294,6 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
 
         /* Initialize client-side channel */
-        channel_t channel;
         if (!client_init_channel(&channel, ctx, factory, keypair, my_index,
                                   &lsp_pay_bp, &lsp_delay_bp,
                                   &lsp_revoc_bp, &lsp_htlc_bp,
@@ -2868,6 +3301,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client %u: channel init failed\n", my_index);
             goto fail;
         }
+        close_ch = &channel;
         memset(bp_ps, 0, 32); memset(bp_ds, 0, 32);
         memset(bp_rs, 0, 32); memset(bp_hs, 0, 32);
 
@@ -2974,8 +3408,8 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     /* === Cooperative Close Ceremony === */
     if (!client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                    factory, n_participants, NULL, 0,
-                                    NULL, 0)) {
+                                    factory, n_participants, NULL,
+                                    client_chain_tip(), close_ch, NULL, 0)) {
         goto fail;
     }
 
@@ -2997,277 +3431,100 @@ fail:
 }
 
 
+int client_leaf_realloc_acceptable(const factory_t *factory,
+                                    uint32_t my_index, int leaf_side,
+                                    const uint64_t *amounts, size_t n_amounts) {
+    if (!factory || !amounts || my_index == 0) return 0;
+    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
+    size_t node_idx = factory->leaf_node_indices[leaf_side];
+    const factory_node_t *leaf = &factory->nodes[node_idx];
+
+    /* Only a signer of this leaf is ever asked to sign it. */
+    if (factory_find_signer_slot(factory, node_idx, my_index) < 0) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — not a signer of "
+                "leaf %d\n", my_index, leaf_side);
+        return 0;
+    }
+
+    /* A trailing P2A anchor is fixed and not part of the reallocation. */
+    size_t n_realloc = leaf->n_outputs;
+    if (n_realloc >= 1 &&
+        leaf->outputs[n_realloc - 1].script_pubkey_len == P2A_SPK_LEN &&
+        memcmp(leaf->outputs[n_realloc - 1].script_pubkey,
+               P2A_SPK, P2A_SPK_LEN) == 0)
+        n_realloc--;
+    if (n_amounts != n_realloc) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — %zu amounts for "
+                "%zu outputs\n", my_index, n_amounts, n_realloc);
+        return 0;
+    }
+
+    /* The proposal may only redistribute what the leaf already holds. */
+    uint64_t current_total = 0, new_total = 0;
+    for (size_t i = 0; i < n_realloc; i++) {
+        if (amounts[i] < CHANNEL_DUST_LIMIT_SATS ||
+            amounts[i] > UINT64_MAX - new_total) {
+            fprintf(stderr, "Client %u: REFUSING leaf realloc — output %zu "
+                    "amount out of range\n", my_index, i);
+            return 0;
+        }
+        new_total += amounts[i];
+        current_total += leaf->outputs[i].amount_sats;
+    }
+    if (new_total != current_total) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — amounts sum to "
+                "%llu, leaf holds %llu\n", my_index,
+                (unsigned long long)new_total,
+                (unsigned long long)current_total);
+        return 0;
+    }
+
+    /* Locate this client's channel output from its own copy of the tree; the
+       proposal carries amounts only and gets no say in which one is ours. */
+    size_t my_node;
+    uint32_t my_vout;
+    if (!factory_client_to_leaf(factory, (size_t)(my_index - 1),
+                                 &my_node, &my_vout) ||
+        my_node != node_idx || my_vout >= n_realloc) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — own channel "
+                "output is not on leaf %d\n", my_index, leaf_side);
+        return 0;
+    }
+
+    /* A reallocation moves LSP liquidity stock toward channels.  It must
+       never reduce the output that funds this client's channel: every
+       commitment the client holds spends that output at its current value. */
+    uint64_t my_current = leaf->outputs[my_vout].amount_sats;
+    if (amounts[my_vout] < my_current) {
+        fprintf(stderr, "Client %u: REFUSING leaf realloc — would shrink own "
+                "channel output from %llu to %llu sats\n", my_index,
+                (unsigned long long)my_current,
+                (unsigned long long)amounts[my_vout]);
+        return 0;
+    }
+    return 1;
+}
+
 int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 factory_t *factory,
                                 uint32_t my_index,
                                 const wire_msg_t *propose_msg) {
-    /* Parse REALLOC_PROPOSE (state + optional poison nonce) */
-    int leaf_side;
-    uint64_t amounts[FACTORY_MAX_OUTPUTS];
-    size_t n_amounts;
-    unsigned char lsp_pubnonce_ser[66], lsp_poison_pn_ser[66];
+    (void)ctx; (void)keypair; (void)factory; (void)propose_msg;
 
-    int propose_rc = wire_parse_leaf_realloc_propose(propose_msg->json, &leaf_side,
-                                                       amounts, FACTORY_MAX_OUTPUTS,
-                                                       &n_amounts, lsp_pubnonce_ser,
-                                                       lsp_poison_pn_ser);
-    if (propose_rc == 0) {
-        fprintf(stderr, "Client %u: failed to parse REALLOC_PROPOSE\n", my_index);
-        return 0;
-    }
-    int wire_poison_offered = (propose_rc == 2);
-
-    /* Snapshot OLD leaf state BEFORE the realloc — needed to deterministically
-       prep the wire-ceremony poison TX in lockstep with the LSP. */
-    if (leaf_side < 0 || leaf_side >= factory->n_leaf_nodes) return 0;
-    size_t pre_node_idx_r = factory->leaf_node_indices[leaf_side];
-    factory_node_t *pre_leaf_r = &factory->nodes[pre_node_idx_r];
-    unsigned char pre_old_leaf_txid_r[32];
-    memcpy(pre_old_leaf_txid_r, pre_leaf_r->txid, 32);
-    int pre_old_n_outputs_r = pre_leaf_r->n_outputs;
-    /* #81 mirror: use_tree_anchor makes the L-stock the SECOND-to-last output (the
-       240-sat P2A anchor is last). Read the real L-stock, not the anchor. */
-    int pre_anchor_r = (pre_old_n_outputs_r >= 2 &&
-        pre_leaf_r->outputs[pre_old_n_outputs_r - 1].script_pubkey_len == P2A_SPK_LEN &&
-        memcmp(pre_leaf_r->outputs[pre_old_n_outputs_r - 1].script_pubkey,
-               P2A_SPK, P2A_SPK_LEN) == 0) ? 1 : 0;
-    int pre_l_vout_r = pre_old_n_outputs_r - 1 - pre_anchor_r;
-    uint64_t pre_old_l_amount_r = (pre_l_vout_r >= 0 &&
-                                   (pre_old_n_outputs_r - pre_anchor_r) >= 2)
-                                  ? pre_leaf_r->outputs[pre_l_vout_r].amount_sats
-                                  : 0;
-    int pre_had_signed_r = (pre_leaf_r->is_signed && pre_leaf_r->signed_tx.len > 0);
-
-    const uint64_t REALLOC_POISON_FEE_SATS = 1000;
-    int realloc_poison_prepared = 0;
-    if (wire_poison_offered && pre_had_signed_r && (pre_old_n_outputs_r - pre_anchor_r) >= 2 &&
-        pre_old_l_amount_r > REALLOC_POISON_FEE_SATS +
-                             (uint64_t)(pre_leaf_r->n_signers - 1) * 330u) {
-        if (factory_session_prepare_poison_tx_leaf(
-                factory, pre_node_idx_r,
-                pre_old_leaf_txid_r, (uint32_t)pre_l_vout_r,
-                pre_old_l_amount_r, REALLOC_POISON_FEE_SATS,
-                NULL /* #53-B3b: client mirrors LSP; daemon hashlock off -> key-path */)) {
-            realloc_poison_prepared = 1;
-        }
-    }
-
-    /* Advance local DW + set amounts */
-    int rc = factory_advance_leaf_unsigned(factory, leaf_side);
-    if (rc <= 0) {
-        fprintf(stderr, "Client %u: leaf advance for realloc failed\n", my_index);
-        factory_session_reset_poison(factory, pre_node_idx_r);
-        return 0;
-    }
-    if (!factory_set_leaf_amounts(factory, leaf_side, amounts, n_amounts)) {
-        fprintf(stderr, "Client %u: set_leaf_amounts failed\n", my_index);
-        factory_session_reset_poison(factory, pre_node_idx_r);
-        return 0;
-    }
-
-    size_t node_idx = factory->leaf_node_indices[leaf_side];
-
-    /* Init both signing sessions */
-    if (!factory_session_init_node(factory, node_idx)) {
-        fprintf(stderr, "Client %u: realloc state session_init_node failed (node %zu)\n",
-                my_index, node_idx);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    if (realloc_poison_prepared &&
-        !factory_session_init_node_poison(factory, node_idx)) {
-        fprintf(stderr, "Client %u: realloc poison session_init failed — degrading\n", my_index);
-        factory_session_reset_poison(factory, node_idx);
-        realloc_poison_prepared = 0;
-    }
-
-    /* NOTE: Do NOT set the LSP nonce here.  The ALL_NONCES message
-       (received after we send our nonce) contains ALL signers' nonces
-       including the LSP's.  Setting the LSP nonce early would increment
-       nonces_collected, and the ALL_NONCES loop would set it again,
-       pushing nonces_collected past n_signers and failing finalize. */
-
-    /* Generate own nonce */
-    int my_slot = factory_find_signer_slot(factory, node_idx, my_index);
-    if (my_slot < 0) {
-        fprintf(stderr, "Client %u: realloc self not signer on node %zu (pidx=%u)\n",
-                my_index, node_idx, my_index);
-        return 0;
-    }
-
-    unsigned char my_seckey[32];
-    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
-        fprintf(stderr, "Client %u: realloc keypair_sec failed\n", my_index);
-        return 0;
-    }
-
-    /* Set LSP nonces (state + poison if offered) */
-    int lsp_slot_r = factory_find_signer_slot(factory, node_idx, 0);
-    if (lsp_slot_r < 0) {
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    /* (LSP nonce will be set via ALL_NONCES below — same as before) */
-
-    secp256k1_pubkey my_pubkey;
-    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
-
-    secp256k1_musig_secnonce my_secnonce, my_poison_secnonce;
-    secp256k1_musig_pubnonce my_pubnonce, my_poison_pubnonce;
-    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
-                               my_seckey, &my_pubkey,
-                               &factory->nodes[node_idx].keyagg.cache)) {
-        fprintf(stderr, "Client %u: realloc state nonce_gen failed\n", my_index);
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    if (realloc_poison_prepared &&
-        !musig_generate_nonce(ctx, &my_poison_secnonce, &my_poison_pubnonce,
-                                my_seckey, &my_pubkey,
-                                &factory->nodes[node_idx].keyagg.cache)) {
-        fprintf(stderr, "Client %u: realloc poison nonce_gen failed — degrading\n", my_index);
-        factory_session_reset_poison(factory, node_idx);
-        realloc_poison_prepared = 0;
-    }
-
-    /* Send REALLOC_NONCE (state + optional poison) */
-    unsigned char my_pubnonce_ser[66], my_poison_pn_ser[66];
-    musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
-    if (realloc_poison_prepared)
-        musig_pubnonce_serialize(ctx, my_poison_pn_ser, &my_poison_pubnonce);
-    cJSON *nonce_msg = wire_build_leaf_realloc_nonce(
-        my_pubnonce_ser, realloc_poison_prepared ? my_poison_pn_ser : NULL);
-    if (!wire_send(fd, MSG_LEAF_REALLOC_NONCE, nonce_msg)) {
-        fprintf(stderr, "Client %u: realloc send NONCE failed\n", my_index);
-        cJSON_Delete(nonce_msg);
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    cJSON_Delete(nonce_msg);
-
-    /* Receive REALLOC_ALL_NONCES (state + optional poison) */
-    wire_msg_t all_msg;
-    if (!wire_recv(fd, &all_msg) || all_msg.msg_type != MSG_LEAF_REALLOC_ALL_NONCES) {
-        fprintf(stderr, "Client %u: expected REALLOC_ALL_NONCES, got 0x%02x\n",
-                my_index, all_msg.msg_type);
-        if (all_msg.json) cJSON_Delete(all_msg.json);
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-
-    unsigned char all_pubnonces[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pubnonces[FACTORY_MAX_SIGNERS][66];
-    size_t n_signers;
-    int an_parse_rc = wire_parse_leaf_realloc_all_nonces(
-        all_msg.json, all_pubnonces,
-        realloc_poison_prepared ? all_poison_pubnonces : NULL,
-        FACTORY_MAX_SIGNERS, &n_signers);
-    cJSON_Delete(all_msg.json);
-    if (an_parse_rc == 0) {
-        fprintf(stderr, "Client %u: realloc parse all_nonces failed\n", my_index);
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    if (realloc_poison_prepared && an_parse_rc < 2) {
-        factory_session_reset_poison(factory, node_idx);
-        realloc_poison_prepared = 0;
-    }
-
-    /* Set all nonces (state + poison if prepared) */
-    for (size_t i = 0; i < n_signers; i++) {
-        secp256k1_musig_pubnonce pn;
-        if (!musig_pubnonce_parse(ctx, &pn, all_pubnonces[i])) {
-            fprintf(stderr, "Client %u: realloc parse nonce[%zu] failed\n", my_index, i);
-            memset(my_seckey, 0, 32);
-            factory_session_reset_poison(factory, node_idx);
-            return 0;
-        }
-        if (!factory_session_set_nonce(factory, node_idx, i, &pn)) {
-            fprintf(stderr, "Client %u: realloc set_nonce[%zu] failed\n", my_index, i);
-            memset(my_seckey, 0, 32);
-            factory_session_reset_poison(factory, node_idx);
-            return 0;
-        }
-        if (realloc_poison_prepared) {
-            secp256k1_musig_pubnonce ppn;
-            if (!musig_pubnonce_parse(ctx, &ppn, all_poison_pubnonces[i]) ||
-                !factory_session_set_nonce_poison(factory, node_idx, i, &ppn)) {
-                fprintf(stderr, "Client %u: realloc poison set_nonce[%zu] failed — degrading\n",
-                        my_index, i);
-                factory_session_reset_poison(factory, node_idx);
-                realloc_poison_prepared = 0;
-            }
-        }
-    }
-
-    /* Finalize both sessions */
-    if (!factory_session_finalize_node(factory, node_idx)) {
-        fprintf(stderr, "Client %u: realloc state session_finalize failed (node %zu)\n",
-                my_index, node_idx);
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    if (realloc_poison_prepared &&
-        !factory_session_finalize_node_poison(factory, node_idx)) {
-        fprintf(stderr, "Client %u: realloc poison session_finalize failed — degrading\n", my_index);
-        factory_session_reset_poison(factory, node_idx);
-        realloc_poison_prepared = 0;
-    }
-
-    /* Create partial sigs (state + poison if prepared) */
-    secp256k1_musig_partial_sig my_psig, my_poison_psig;
-    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
-                                    &factory->nodes[node_idx].signing_session)) {
-        fprintf(stderr, "Client %u: realloc state partial_sig creation failed\n", my_index);
-        memset(my_seckey, 0, 32);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    if (realloc_poison_prepared &&
-        !musig_create_partial_sig(ctx, &my_poison_psig, &my_poison_secnonce, keypair,
-                                    &factory->nodes[node_idx].poison_signing_session)) {
-        fprintf(stderr, "Client %u: realloc poison partial_sig creation failed — degrading\n",
-                my_index);
-        factory_session_reset_poison(factory, node_idx);
-        realloc_poison_prepared = 0;
-    }
-    memset(my_seckey, 0, 32);
-
-    /* Send REALLOC_PSIG (state + poison if prepared) */
-    unsigned char my_psig_ser[32], my_poison_psig_ser[32];
-    musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
-    if (realloc_poison_prepared)
-        musig_partial_sig_serialize(ctx, my_poison_psig_ser, &my_poison_psig);
-    cJSON *psig_json = wire_build_leaf_realloc_psig(
-        my_psig_ser, realloc_poison_prepared ? my_poison_psig_ser : NULL);
-    if (!wire_send(fd, MSG_LEAF_REALLOC_PSIG, psig_json)) {
-        fprintf(stderr, "Client %u: realloc wire_send PSIG failed\n", my_index);
-        cJSON_Delete(psig_json);
-        factory_session_reset_poison(factory, node_idx);
-        return 0;
-    }
-    cJSON_Delete(psig_json);
-    factory_session_reset_poison(factory, node_idx);
-
-    /* Receive REALLOC_DONE */
-    wire_msg_t done_msg;
-    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_LEAF_REALLOC_DONE) {
-        fprintf(stderr, "Client %u: expected REALLOC_DONE, got 0x%02x\n",
-                my_index, done_msg.msg_type);
-        if (done_msg.json) cJSON_Delete(done_msg.json);
-        return 0;
-    }
-    cJSON_Delete(done_msg.json);
-
-    printf("Client %u: leaf %d realloc complete\n", my_index, leaf_side);
-    return 1;
+    /* A reallocation replaces the leaf transaction, so the outpoint funding
+       this client's channel changes.  The ceremony gives the client neither
+       the completed signature of the new leaf nor commitments spending the
+       new outpoint, while the LSP ends up holding a new leaf that supersedes
+       the one the client's commitments spend.  Co-signing would leave the
+       client without a unilateral exit whatever the amounts are, so every
+       proposal is refused.  Nothing local is touched: the signed leaf, its
+       state counter and the channel stay exactly as they were. */
+    fprintf(stderr, "Client %u: REFUSING leaf realloc — the channel cannot "
+            "be moved to a reallocated leaf\n", my_index);
+    client_send_error(fd, "leaf reallocation refused: client does not sign "
+                          "leaf reallocations");
+    return 0;
 }
 
 /* Sub-factory chain extension client handler (Gap E followup Phase 2b,
@@ -4094,6 +4351,9 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const secp256k1_keypair *keypair,
                                        factory_t *factory, uint32_t my_index,
                                        const wire_msg_t *propose_msg) {
+    if (client_refuse_advance_if_close_signed(fd, factory, my_index,
+                                               "sub-factory advance"))
+        return 0;
     return client_handle_subfactory_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
@@ -4634,6 +4894,9 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory, uint32_t my_index,
                                  const wire_msg_t *propose_msg) {
+    if (client_refuse_advance_if_close_signed(fd, factory, my_index,
+                                               "leaf advance"))
+        return 0;
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
@@ -5114,6 +5377,9 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
                                   factory_t *factory,
                                   uint32_t my_index,
                                   const wire_msg_t *propose_msg) {
+    if (client_refuse_advance_if_close_signed(fd, factory, my_index,
+                                               "state advance"))
+        return 0;
     return client_handle_state_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 

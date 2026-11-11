@@ -333,6 +333,18 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     (void)keypair; (void)n_participants;
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
 
+    /* A cooperative close of this factory was signed and may still be
+       completed by the LSP: no payment is started or accepted any more.
+       Returning hands over to the close ceremony, the only thing left that
+       this client takes part in. */
+    if (client_close_signed_for_factory(factory)) {
+        fprintf(stderr, "Client %u: a cooperative close of this factory was "
+                "signed earlier; the channel is frozen and no payment is "
+                "run. Only a close or a unilateral exit (--force-close) can "
+                "follow.\n", my_index);
+        return 1;
+    }
+
     /* Derive HTLC cltv from factory timeout (must expire before factory) */
     uint32_t htlc_cltv = factory->cltv_timeout > 40
                         ? factory->cltv_timeout - 40 : 500;
@@ -578,6 +590,13 @@ typedef struct {
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
+    /* Cooperative closes this client has signed for the current factory.
+       Once client_close_state_frozen() says so the factory is frozen: the loop
+       acts on nothing but a close proposal. */
+    client_close_state_t close_state;
+    /* 1 = a close ceremony ended without completing (see
+       daemon_close_outcome): the process must not report success. */
+    int     close_not_completed;
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -837,6 +856,51 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
 }
 
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
+/* A close ceremony ended without completing.  Record why, so that main()
+   does not report a clean exit, and tell the operator what is left to do.
+   Nothing is broadcast from here: a unilateral exit is the operator's call. */
+static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
+    cbd->close_not_completed = 1;
+    if (cbd->close_state.refused) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE REFUSED. This client did not sign "
+            "what the LSP proposed (reason above); its channel is unchanged. "
+            "Unless the LSP proposes an acceptable close after a restart, "
+            "the factory needs a unilateral exit: run this client with "
+            "--force-close and the same --db to broadcast it.\n", my_index);
+    } else if (cbd->close_state.signed_close) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED after this client "
+            "signed it. The LSP may still broadcast that close (it pays this "
+            "client %llu sats), so the channel is frozen. Restart to let the "
+            "LSP propose the close again, or run with --force-close and the "
+            "same --db to exit unilaterally.\n", my_index,
+            (unsigned long long)cbd->close_state.paid_sats);
+    } else if (cbd->close_state.record_error) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. This client's record "
+            "of signed closes cannot be read from its database, so it signed "
+            "nothing and treats the channel as frozen. Repair the database "
+            "and restart, or run with --force-close and the same --db to "
+            "exit unilaterally.\n", my_index);
+    } else {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. The ceremony failed "
+            "before this client signed anything (reason above). The factory "
+            "is still open and the channel is unchanged and still usable: "
+            "restart this client to carry on or to let the LSP propose the "
+            "close again.\n", my_index);
+    }
+}
+
+/* This client's own chain tip height, 0 if no chain backend can tell. */
+static uint32_t client_tool_chain_tip(void *ctx) {
+    watchtower_t *wt = (watchtower_t *)ctx;
+    if (!wt || !wt->chain || !wt->chain->get_block_height) return 0;
+    int h = wt->chain->get_block_height(wt->chain);
+    return h > 0 ? (uint32_t)h : 0;
+}
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -946,6 +1010,29 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             cJSON_Delete(stale_imsg.json);
     }
 
+    /* Load what this client has already signed for this factory.  The same
+       cbd is reused across reconnects and rotations, so this runs on every
+       entry, against the factory now in use. */
+    client_close_state_init(&cbd->close_state, cbd->db, factory);
+    if (client_close_state_frozen(&cbd->close_state, factory)) {
+        if (cbd->close_state.signed_close)
+            fprintf(stderr, "Client %u: a cooperative close of this factory "
+                    "was signed earlier (paying this client %llu sats) and "
+                    "may still be completed by the LSP. The channel is "
+                    "frozen: only a close paying at least that much will be "
+                    "signed. Use --force-close to exit unilaterally.\n",
+                    my_index,
+                    (unsigned long long)cbd->close_state.paid_sats);
+        else
+            fprintf(stderr, "Client %u: this client's record of signed "
+                    "closes CANNOT BE READ from its database, so it cannot "
+                    "rule out that a close of this factory was signed. The "
+                    "channel is treated as frozen until the record can be "
+                    "read: no payment or state change is processed and no "
+                    "close is signed. Repair the database, or use "
+                    "--force-close to exit unilaterally.\n", my_index);
+    }
+
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
     /* Log factory lifecycle once (Tier 2) */
@@ -979,7 +1066,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
        revocation + FULFILL.  Fired once, here, immediately after CHANNEL_READY
        (the LSP --demo loop is already "waiting for payments" by this point —
        same timing the old standalone_channel_cb used successfully). */
-    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated) {
+    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated &&
+        !client_close_state_frozen(&cbd->close_state, factory)) {
         uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
                                 ? factory->cltv_timeout - 40 : 500;
         for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
@@ -1034,7 +1122,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         {
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
-                if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
+                if (imsg.msg_type == MSG_COMMITMENT_SIGNED &&
+                    !client_close_state_frozen(&cbd->close_state, factory)) {
                     /* Save old state for deferred watchtower registration.
                        LSP revocation arrives later as MSG_LSP_REVOKE_AND_ACK. */
                     if (cbd->wt) {
@@ -1110,6 +1199,32 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
 handle_message:
+        /* A cooperative close of this factory was signed and may still be
+           completed by the LSP, or the record that would say so cannot be
+           read.  Nothing that changes the channel or the factory tree is
+           acted on any more: only a close proposal (which the ceremony
+           accepts if it pays at least as much, and does not sign while the
+           record is unreadable), keepalives and the LSP's own revocations,
+           which only add to what this client can prove.  Everything else is
+           dropped unanswered.  The record is read again here while it is
+           unreadable, so an error that passes lifts the freeze. */
+        if (!client_close_frozen_allows_msg(msg.msg_type) &&
+            client_close_state_frozen(&cbd->close_state, factory)) {
+            if (cbd->close_state.signed_close)
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
+                        "cooperative close of this factory was already "
+                        "signed; only a close or a unilateral exit "
+                        "(--force-close) can follow\n", my_index,
+                        msg.msg_type);
+            else
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — this "
+                        "client's record of signed closes cannot be read, "
+                        "so the channel is treated as frozen\n", my_index,
+                        msg.msg_type);
+            if (msg.json) cJSON_Delete(msg.json);
+            continue;
+        }
+
         switch (msg.msg_type) {
         case MSG_UPDATE_ADD_HTLC: {
             /* Save pre-add state (this is the OLD commitment being revoked) */
@@ -1474,12 +1589,33 @@ handle_message:
             break;
         }
 
-        case MSG_CLOSE_PROPOSE:
+        case MSG_CLOSE_PROPOSE: {
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
-            client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                      factory, n_participants, &msg, 0, ch, 0);
+            int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
+                                      factory, n_participants, &msg,
+                                      client_chain_tip(), ch,
+                                      &cbd->close_state, 0);
             cJSON_Delete(msg.json);
+            if (!close_ok && cbd->close_state.unverifiable &&
+                !client_close_state_frozen(&cbd->close_state, factory)) {
+                /* The client could not check the proposal (no chain tip).
+                   It signed and recorded nothing, now or earlier, and told
+                   the LSP to try again, so this is neither a close nor a
+                   refusal: keep serving the channel.  If a close of this
+                   factory is on record from before, or the record cannot be
+                   read, the channel is frozen and this is a close that did
+                   not complete, handled below. */
+                fprintf(stderr,
+                    "Client %u: cooperative close NOT signed: this client "
+                    "could not verify the proposal (reason above) and asked "
+                    "the LSP to try again. The channel is unchanged and still "
+                    "usable; staying connected.\n", my_index);
+                break;
+            }
+            if (!close_ok)
+                daemon_close_outcome(cbd, my_index);
             return 2;  /* close already handled */
+        }
 
         case MSG_CREATE_INVOICE: {
             /* LSP asks us to create an invoice (Phase 17) */
@@ -2030,13 +2166,12 @@ handle_message:
         }
 
         case MSG_LEAF_REALLOC_PROPOSE: {
-            /* LSP proposes leaf reallocation — run the full ceremony
-               (nonce exchange + partial sig exchange + done confirmation). */
+            /* LSP proposes a leaf reallocation.  The client refuses every
+               one (see client_handle_leaf_realloc): it answers with an error
+               and its leaf and channel are unchanged, so the loop goes on. */
             wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
-            if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
-                                              my_index, &propose_msg)) {
-                fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
-            }
+            client_handle_leaf_realloc(fd, ctx, keypair, factory,
+                                        my_index, &propose_msg);
             cJSON_Delete(msg.json);
             break;
         }
@@ -3562,6 +3697,10 @@ int main(int argc, char *argv[]) {
 
     watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, client_fee_ptr,
                       use_db ? &db : NULL);
+    /* The close ceremony bounds a proposal's nLockTime by this client's own
+       chain tip, read from whatever chain backend the watchtower ends up
+       with (bitcoind RPC, or the light client attached below). */
+    client_set_chain_tip_source(client_tool_chain_tip, &client_wt);
 
     /* Attach BIP 158 light client as chain backend (overrides regtest backend) */
     if (light_client_arg) {
@@ -3745,6 +3884,9 @@ int main(int argc, char *argv[]) {
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
+        /* A close that did not complete is not a clean exit. */
+        if (cbd.close_not_completed)
+            ok = 0;
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
@@ -3791,6 +3933,8 @@ int main(int argc, char *argv[]) {
             if (cbd.force_close_requested)
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
+            if (cbd.close_not_completed)
+                ok = 0;
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */
             multi_payment_data_t data = { actions, n_actions, 0 };
