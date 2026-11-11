@@ -108,8 +108,10 @@ static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
         }
     }
     for (size_t t = 0; t < ch->n_ptlcs; t++) {
-        if (ch->ptlcs[t].state == PTLC_STATE_ACTIVE)
+        if (ch->ptlcs[t].state == PTLC_STATE_ACTIVE) {
             sum += ch->ptlcs[t].amount_sats;
+            sum += ch->ptlcs[t].fee_at_add;
+        }
     }
     /* Base commit-tx fee: matches fee_for_commitment_tx(fe, 0) in src/fee.c
        (154 vB × fee_rate_sat_per_kvb, rounded up per compute_fee). */
@@ -133,6 +135,11 @@ static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
    usable balance at init time (lsp_channels_init, src/lsp_channels.c:203-204),
    so the invariant must account for it — otherwise the check trips by
    exactly base_commit_fee on every balanced channel. */
+int client_channel_balanced(const channel_t *ch) {
+    return ch && ch->funding_amount != 0 &&
+           client_channel_conserved(ch, NULL, NULL, NULL);
+}
+
 static void client_check_conservation(const channel_t *ch, const char *context) {
     if (!ch || ch->funding_amount == 0) return;
     uint64_t sum, expected, base_commit_fee;
@@ -642,9 +649,29 @@ static int client_factory_close_record(const factory_t *factory) {
                                       factory->funding_vout, NULL, NULL);
 }
 
+int client_close_state_frozen(client_close_state_t *cs,
+                               const factory_t *factory) {
+    if (!cs) return 1;
+    if (cs->signed_close) return 1;
+    if (!cs->record_error) return 0;
+    /* The record could not be read.  Look again: if the error has passed,
+       the answer is whatever the record says; if not, the factory stays
+       frozen, because a signed close cannot be ruled out. */
+    int r = (cs->db && factory)
+        ? persist_load_close_signed(cs->db, factory->funding_txid,
+                                     factory->funding_vout,
+                                     &cs->paid_sats, cs->sighash)
+        : -1;
+    if (r < 0) return 1;
+    cs->record_error = 0;
+    if (r > 0) cs->signed_close = 1;
+    return cs->signed_close;
+}
+
 int client_close_signed_for_factory(const factory_t *factory) {
-    /* Unreadable counts as signed: the freeze fails closed. */
-    return client_factory_close_record(factory) != 0;
+    client_close_state_t cs;
+    client_close_state_init(&cs, g_client_persist, factory);
+    return client_close_state_frozen(&cs, factory);
 }
 
 int client_close_frozen_allows_msg(uint8_t msg_type) {

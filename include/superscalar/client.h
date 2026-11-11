@@ -170,9 +170,24 @@ typedef struct {
 void client_close_state_init(client_close_state_t *cs, persist_t *db,
                               const factory_t *factory);
 
-/* 1 if the database set with client_set_persist shows, or cannot rule out,
-   that this client has signed a cooperative close of the factory. */
+/* The freeze condition, in one place: 1 if this client must treat the
+   factory as frozen, because a close of it was signed (cs->signed_close) or
+   because the record that would say so cannot be read (cs->record_error).
+   Not being able to tell is not the same as nothing having been signed.
+   While the record is unreadable it is read again on every call, so an
+   error that passes clears itself; cs is updated with what was found.
+   Every message loop of the client tool gates on this. */
+int client_close_state_frozen(client_close_state_t *cs,
+                               const factory_t *factory);
+
+/* client_close_state_frozen for a caller that keeps no state: reads the
+   database set with client_set_persist. */
 int client_close_signed_for_factory(const factory_t *factory);
+
+/* 1 if the state of ch accounts for the whole funding output: local +
+   remote + every active HTLC and PTLC with the commitment fee taken for it
+   when it was added == funding_amount - base commitment fee. */
+int client_channel_balanced(const channel_t *ch);
 
 /* While a signed close of the factory is outstanding, a client acts only on
    a close proposal, keepalives and the LSP's own revocations (which only add

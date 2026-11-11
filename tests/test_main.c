@@ -3948,6 +3948,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_close_repropose_changed_outputs);
     RUN_TEST(test_client_close_record_survives_restart);
     RUN_TEST(test_client_close_record_unreadable);
+    extern int test_conservation_counts_ptlc_fee(void);
+    RUN_TEST(test_conservation_counts_ptlc_fee);
     RUN_TEST(test_client_close_honest_ceremony);
     RUN_TEST(test_client_run_with_channels_checks_close);
     extern int test_client_leaf_realloc_acceptable(void);

@@ -589,7 +589,7 @@ typedef struct {
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
     /* Cooperative closes this client has signed for the current factory.
-       Once close_state.signed_close is set the factory is frozen: the loop
+       Once client_close_state_frozen() says so the factory is frozen: the loop
        acts on nothing but a close proposal. */
     client_close_state_t close_state;
     /* 1 = a close ceremony ended without completing (see
@@ -896,6 +896,13 @@ static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
             "LSP propose the close again, or run with --force-close and the "
             "same --db to exit unilaterally.\n", my_index,
             (unsigned long long)cbd->close_state.paid_sats);
+    } else if (cbd->close_state.record_error) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. This client's record "
+            "of signed closes cannot be read from its database, so it signed "
+            "nothing and treats the channel as frozen. Repair the database "
+            "and restart, or run with --force-close and the same --db to "
+            "exit unilaterally.\n", my_index);
     } else {
         fprintf(stderr,
             "Client %u: COOPERATIVE CLOSE NOT COMPLETED. The ceremony failed "
@@ -1024,13 +1031,24 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
        cbd is reused across reconnects and rotations, so this runs on every
        entry, against the factory now in use. */
     client_close_state_init(&cbd->close_state, cbd->db, factory);
-    if (cbd->close_state.signed_close)
-        fprintf(stderr, "Client %u: a cooperative close of this factory was "
-                "signed earlier (paying this client %llu sats) and may still "
-                "be completed by the LSP. The channel is frozen: only a close "
-                "paying at least that much will be signed. Use --force-close "
-                "to exit unilaterally.\n", my_index,
-                (unsigned long long)cbd->close_state.paid_sats);
+    if (client_close_state_frozen(&cbd->close_state, factory)) {
+        if (cbd->close_state.signed_close)
+            fprintf(stderr, "Client %u: a cooperative close of this factory "
+                    "was signed earlier (paying this client %llu sats) and "
+                    "may still be completed by the LSP. The channel is "
+                    "frozen: only a close paying at least that much will be "
+                    "signed. Use --force-close to exit unilaterally.\n",
+                    my_index,
+                    (unsigned long long)cbd->close_state.paid_sats);
+        else
+            fprintf(stderr, "Client %u: this client's record of signed "
+                    "closes CANNOT BE READ from its database, so it cannot "
+                    "rule out that a close of this factory was signed. The "
+                    "channel is treated as frozen until the record can be "
+                    "read: no payment or state change is processed and no "
+                    "close is signed. Repair the database, or use "
+                    "--force-close to exit unilaterally.\n", my_index);
+    }
 
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
@@ -1066,7 +1084,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
        (the LSP --demo loop is already "waiting for payments" by this point —
        same timing the old standalone_channel_cb used successfully). */
     if (cbd && cbd->scripted_actions && !cbd->scripted_initiated &&
-        !cbd->close_state.signed_close) {
+        !client_close_state_frozen(&cbd->close_state, factory)) {
         uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
                                 ? factory->cltv_timeout - 40 : 500;
         for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
@@ -1122,7 +1140,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
                 if (imsg.msg_type == MSG_COMMITMENT_SIGNED &&
-                    !cbd->close_state.signed_close) {
+                    !client_close_state_frozen(&cbd->close_state, factory)) {
                     /* Save old state for deferred watchtower registration.
                        LSP revocation arrives later as MSG_LSP_REVOKE_AND_ACK. */
                     if (cbd->wt) {
@@ -1199,17 +1217,27 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
 handle_message:
         /* A cooperative close of this factory was signed and may still be
-           completed by the LSP.  Nothing that changes the channel or the
-           factory tree is acted on any more: only a close proposal (which
-           the ceremony accepts if it pays at least as much), keepalives and
-           the LSP's own revocations, which only add to what this client can
-           prove.  Everything else is dropped unanswered. */
-        if (cbd->close_state.signed_close &&
-            !client_close_frozen_allows_msg(msg.msg_type)) {
-            fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
-                    "cooperative close of this factory was already signed; "
-                    "only a close or a unilateral exit (--force-close) can "
-                    "follow\n", my_index, msg.msg_type);
+           completed by the LSP, or the record that would say so cannot be
+           read.  Nothing that changes the channel or the factory tree is
+           acted on any more: only a close proposal (which the ceremony
+           accepts if it pays at least as much, and does not sign while the
+           record is unreadable), keepalives and the LSP's own revocations,
+           which only add to what this client can prove.  Everything else is
+           dropped unanswered.  The record is read again here while it is
+           unreadable, so an error that passes lifts the freeze. */
+        if (!client_close_frozen_allows_msg(msg.msg_type) &&
+            client_close_state_frozen(&cbd->close_state, factory)) {
+            if (cbd->close_state.signed_close)
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
+                        "cooperative close of this factory was already "
+                        "signed; only a close or a unilateral exit "
+                        "(--force-close) can follow\n", my_index,
+                        msg.msg_type);
+            else
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — this "
+                        "client's record of signed closes cannot be read, "
+                        "so the channel is treated as frozen\n", my_index,
+                        msg.msg_type);
             if (msg.json) cJSON_Delete(msg.json);
             continue;
         }
@@ -1585,11 +1613,15 @@ handle_message:
                                       client_chain_tip(), ch,
                                       &cbd->close_state, 0);
             cJSON_Delete(msg.json);
-            if (!close_ok && cbd->close_state.unverifiable) {
-                /* The client could not check the proposal (no chain tip, or
-                   its own records unreadable).  It signed and recorded
-                   nothing and told the LSP to try again, so this is neither
-                   a close nor a refusal: keep serving the channel. */
+            if (!close_ok && cbd->close_state.unverifiable &&
+                !client_close_state_frozen(&cbd->close_state, factory)) {
+                /* The client could not check the proposal (no chain tip).
+                   It signed and recorded nothing, now or earlier, and told
+                   the LSP to try again, so this is neither a close nor a
+                   refusal: keep serving the channel.  If a close of this
+                   factory is on record from before, or the record cannot be
+                   read, the channel is frozen and this is a close that did
+                   not complete, handled below. */
                 fprintf(stderr,
                     "Client %u: cooperative close NOT signed: this client "
                     "could not verify the proposal (reason above) and asked "

@@ -8044,8 +8044,10 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
             }
         }
         for (size_t p = 0; p < ch->n_ptlcs; p++) {
-            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE)
+            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE) {
                 sum += ch->ptlcs[p].amount_sats;
+                sum += ch->ptlcs[p].fee_at_add;
+            }
         }
 
         /* Match lsp_channels_init: base commit_fee (154 vB × fee_rate)

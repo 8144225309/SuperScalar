@@ -17,6 +17,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
 #include "superscalar/persist.h"
+#include "superscalar/ptlc_commit.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -1416,6 +1417,15 @@ CS_DEADLINE_TEST(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC) {
     client_close_state_t cs;
     client_close_state_init(&cs, &db, f);
     TEST_ASSERT(cs.record_error && !cs.signed_close, "state knows it is blind");
+    TEST_ASSERT(client_close_state_frozen(&cs, f) == 1,
+                "a factory whose close record cannot be read is frozen");
+    TEST_ASSERT(cs.record_error && !cs.signed_close,
+                "still blind after looking again");
+    TEST_ASSERT(!client_close_frozen_allows_msg(MSG_UPDATE_ADD_HTLC) &&
+                !client_close_frozen_allows_msg(MSG_COMMITMENT_SIGNED) &&
+                !client_close_frozen_allows_msg(MSG_LEAF_ADVANCE_PROPOSE) &&
+                client_close_frozen_allows_msg(MSG_CLOSE_PROPOSE),
+                "a frozen factory acts on a close proposal, not on updates");
     {
         cs_lsp_msg_t msgs[2] = { cs_msg_propose(outs, 2, 0),
                                  cs_msg_all_nonces(ctx, pks) };
@@ -1461,6 +1471,41 @@ CS_DEADLINE_TEST(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC) {
                     "leaf advance is refused when the record cannot be read");
     }
     client_set_persist(NULL);
+
+    /* The error passes: the table is back.  Looking again lifts the freeze
+       when nothing was signed, and finds the record when something was. */
+    {
+        static const char *recreate =
+            "CREATE TABLE client_close_signed ("
+            "  funding_txid BLOB NOT NULL, funding_vout INTEGER NOT NULL,"
+            "  paid_sats INTEGER NOT NULL, sighash BLOB NOT NULL,"
+            "  PRIMARY KEY (funding_txid, funding_vout));";
+        TEST_ASSERT(sqlite3_exec(db.db, recreate, NULL, NULL, NULL) ==
+                    SQLITE_OK, "table back");
+        client_close_state_t blind = cs;   /* record_error still set */
+        TEST_ASSERT(blind.record_error, "state was blind");
+        TEST_ASSERT(client_close_state_frozen(&blind, f) == 0 &&
+                    !blind.record_error && !blind.signed_close,
+                    "readable and empty: the freeze lifts");
+
+        unsigned char sighash[32];
+        memset(sighash, 0x77, 32);
+        TEST_ASSERT(persist_save_close_signed(&db, f->funding_txid,
+                                               f->funding_vout, 123456,
+                                               sighash), "save a record");
+        client_close_state_t blind2 = cs;
+        TEST_ASSERT(client_close_state_frozen(&blind2, f) == 1 &&
+                    blind2.signed_close && blind2.paid_sats == 123456 &&
+                    !blind2.record_error,
+                    "readable with a record: frozen as signed");
+        client_close_state_t fresh;
+        client_close_state_init(&fresh, &db, f);
+        TEST_ASSERT(client_close_state_frozen(&fresh, f) == 1, "frozen");
+        client_close_state_t none;
+        client_close_state_init(&none, NULL, f);
+        TEST_ASSERT(client_close_state_frozen(&none, f) == 0,
+                    "no database, nothing signed: not frozen");
+    }
     persist_close(&db);
 
     /* 2. The channel records are gone and the client runs without a
@@ -2135,6 +2180,75 @@ int test_client_leaf_realloc_acceptable(void) {
     free(f);
     secp256k1_context_destroy(ctx);
     return 1;
+}
+
+/* The conservation invariant counts, for every HTLC and PTLC in flight, both
+   its amount and the commitment fee taken from the funder when it was
+   added.  The HTLC and the PTLC here are added with the channel's own
+   functions, so the fees are the ones the channel really deducts. */
+int test_conservation_counts_ptlc_fee(void) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    channel_t ch;
+    TEST_ASSERT(cs_client_channel(&ch, ctx, f, kps, pks), "open channel");
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.entries = calloc(1, sizeof(lsp_channel_entry_t));
+    TEST_ASSERT(mgr.entries != NULL, "alloc");
+    mgr.n_channels = 1;
+    int pass = 1;
+#define CS_CHECK(cond, msg) do { \
+        if (pass && !(cond)) { \
+            printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+            pass = 0; \
+        } \
+    } while (0)
+/* The LSP-side check reads the same channel state. */
+#define CS_LSP_VIEW_OK() \
+    (mgr.entries[0].channel = ch, lsp_channels_check_conservation(&mgr) == 1)
+
+    CS_CHECK(client_channel_balanced(&ch), "fresh channel adds up");
+    CS_CHECK(CS_LSP_VIEW_OK(), "fresh channel adds up (LSP check)");
+
+    unsigned char payment_hash[32];
+    memset(payment_hash, 0x5A, 32);
+    uint64_t htlc_id = 0, ptlc_id = 0;
+    CS_CHECK(channel_add_htlc(&ch, HTLC_OFFERED, 20000, payment_hash, 500,
+                               &htlc_id), "offer HTLC");
+    CS_CHECK(client_channel_balanced(&ch), "adds up with an HTLC in flight");
+    CS_CHECK(CS_LSP_VIEW_OK(), "adds up with an HTLC in flight (LSP check)");
+
+    uint64_t before = ch.local_amount + ch.remote_amount;
+    CS_CHECK(channel_add_ptlc(&ch, PTLC_OFFERED, 10000, &pks[2], 500,
+                               &ptlc_id), "offer PTLC");
+    CS_CHECK(ch.n_ptlcs == 1 && ch.ptlcs[0].fee_at_add > 0,
+             "the PTLC carries a commitment fee");
+    CS_CHECK(before - (ch.local_amount + ch.remote_amount) ==
+             10000 + ch.ptlcs[0].fee_at_add,
+             "amount and fee both left the balances");
+    CS_CHECK(client_channel_balanced(&ch), "adds up with a PTLC in flight");
+    CS_CHECK(CS_LSP_VIEW_OK(), "adds up with a PTLC in flight (LSP check)");
+
+    /* A sat missing is still noticed. */
+    ch.remote_amount -= 1;
+    CS_CHECK(!client_channel_balanced(&ch), "one sat short does not add up");
+    CS_CHECK(!CS_LSP_VIEW_OK(), "one sat short does not add up (LSP check)");
+    ch.remote_amount += 1;
+#undef CS_LSP_VIEW_OK
+#undef CS_CHECK
+
+    free(mgr.entries);
+    channel_cleanup(&ch);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return pass;
 }
 
 /* Build a REALLOC_PROPOSE carrying a well-formed LSP nonce. */
