@@ -615,6 +615,11 @@ such exchange, not only for the bridge:
   to (the fulfil or fail itself). A client that never received the change
   cannot verify that signature, and the two sides can fail to converge on
   the same state.
+  A commitment that is pending at reconnect is settled only by the client's
+  valid revocation: if the client does not send one (it cannot, if it never
+  received the change), the LSP keeps the commitment pending, refuses the
+  reconnect and closes the connection. Such a client cannot reconnect until
+  the operator deals with the channel.
 - **Messages that arrive out of turn.** While the LSP is waiting for a
   client's reply, any other message that client sends is dropped, not queued.
   A request sent at that moment is lost and has to be sent again.
@@ -622,14 +627,24 @@ such exchange, not only for the bridge:
   before the new state is durably saved. A crash between the two leaves the
   client with a signature for a state the LSP does not remember.
 
+- **An inbound HTLC failed near its expiry.** The LSP tells the Lightning
+  node to fail the incoming HTLC as soon as it has failed the HTLC towards
+  the client; it does not first wait for the client's revocation of the
+  state that still contained it.
+- **A fulfil the Lightning node could not take** stays on the LSP's record
+  until the node acknowledges it; nothing else clears it, and it is offered
+  to the node again after each LSP start. The LSP drops such records after
+  14 days. The plugin's state file keeps the preimage.
+
 What is checked: a revocation whose secret does not match the point the
 client committed to is refused, the exchange counts as not done and the
-client is disconnected; the LSP starts no second exchange on a channel while
+client is disconnected, and an HTLC whose addition the client did not
+revoke for is failed and goes no further; the LSP starts no second exchange on a channel while
 one is in progress (a result from the Lightning node for that channel waits
 its turn); a client can fail only an HTLC it received, and takes back an HTLC
 of its own only if the LSP has signed nothing that contains it.
 
-The three limits above are being addressed by moving every channel update
+These limits are being addressed by moving every channel update
 onto one routine. They are not fixed in this release.
 
 ### Live-node checklist
