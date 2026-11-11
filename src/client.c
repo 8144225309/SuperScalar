@@ -525,6 +525,17 @@ static int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_ind
         if (msg.json) cJSON_Delete(msg.json);
         return 0;
     }
+    /* The commitment about to be signed must account for the whole funding
+       output: balances == funding - base commitment fee.  The cooperative
+       close check relies on that holding from the first state on. */
+    uint64_t accounted = 0, expected = 0;
+    if (!client_channel_conserved(ch, &accounted, &expected, NULL)) {
+        fprintf(stderr, "Client %u: opening balances account for %llu sats, "
+                "funding minus commitment fee is %llu\n", my_index,
+                (unsigned long long)accounted, (unsigned long long)expected);
+        cJSON_Delete(msg.json);
+        return 0;
+    }
     int ok = client_handle_initial_commitment_signed(ch, &msg);
     cJSON_Delete(msg.json);
     if (!ok)
