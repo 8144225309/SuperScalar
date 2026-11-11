@@ -143,29 +143,34 @@ int backup_create(const char *db_path, const char *keyfile_path,
 
     if (!enc_ok) { free(ciphertext); return 0; }
 
-    /* Write backup file (v2: magic + version + iters_BE + salt + nonce + ct + tag) */
-    FILE *fp = secure_file_open_private(backup_path);
-    if (!fp) { free(ciphertext); return 0; }
+    /* Assemble the file (v2: magic + version + iters_BE + salt + nonce + ct + tag)
+       and write it in one atomic step: a failed write is reported and leaves
+       a backup already at backup_path intact. */
+    size_t out_len = BACKUP_HEADER_LEN + pt_len + BACKUP_TAG_LEN;
+    unsigned char *out = malloc(out_len);
+    if (!out) { free(ciphertext); return 0; }
 
-    size_t written = 0;
-    written += fwrite(BACKUP_MAGIC, 1, BACKUP_MAGIC_LEN, fp);
-    unsigned char ver = BACKUP_VERSION;
-    written += fwrite(&ver, 1, 1, fp);
-    unsigned char iters_be[4];
+    unsigned char *o = out;
+    memcpy(o, BACKUP_MAGIC, BACKUP_MAGIC_LEN);
+    o += BACKUP_MAGIC_LEN;
+    *o++ = BACKUP_VERSION;
     uint32_t iters = BACKUP_PBKDF2_ITERATIONS;
-    iters_be[0] = (unsigned char)(iters >> 24);
-    iters_be[1] = (unsigned char)(iters >> 16);
-    iters_be[2] = (unsigned char)(iters >> 8);
-    iters_be[3] = (unsigned char)(iters);
-    written += fwrite(iters_be, 1, 4, fp);
-    written += fwrite(salt, 1, BACKUP_SALT_LEN, fp);
-    written += fwrite(nonce, 1, BACKUP_NONCE_LEN, fp);
-    written += fwrite(ciphertext, 1, pt_len, fp);
-    written += fwrite(tag, 1, BACKUP_TAG_LEN, fp);
-    fclose(fp);
+    *o++ = (unsigned char)(iters >> 24);
+    *o++ = (unsigned char)(iters >> 16);
+    *o++ = (unsigned char)(iters >> 8);
+    *o++ = (unsigned char)(iters);
+    memcpy(o, salt, BACKUP_SALT_LEN);
+    o += BACKUP_SALT_LEN;
+    memcpy(o, nonce, BACKUP_NONCE_LEN);
+    o += BACKUP_NONCE_LEN;
+    memcpy(o, ciphertext, pt_len);
+    o += pt_len;
+    memcpy(o, tag, BACKUP_TAG_LEN);
     free(ciphertext);
 
-    return (written == BACKUP_HEADER_LEN + pt_len + BACKUP_TAG_LEN) ? 1 : 0;
+    int written = secure_file_write_atomic(backup_path, out, out_len, 1);
+    free(out);
+    return written;
 }
 
 /* Internal: decrypt backup, return plaintext. Auto-detects v1/v2. Caller frees. */
@@ -271,10 +276,10 @@ int backup_verify(const char *backup_path, const unsigned char *passphrase,
     /* Validate internal structure: must have at least 8 bytes for two length fields */
     int valid = 0;
     if (pt_len >= 8) {
-        uint32_t db_len = read_u32_le(pt);
-        if (4 + db_len + 4 <= pt_len) {
-            uint32_t kf_len = read_u32_le(pt + 4 + db_len);
-            if (4 + db_len + 4 + kf_len == pt_len)
+        size_t db_len = read_u32_le(pt);
+        if (db_len <= pt_len - 8) {
+            size_t kf_len = read_u32_le(pt + 4 + db_len);
+            if (kf_len == pt_len - 8 - db_len)
                 valid = 1;
         }
     }
@@ -284,41 +289,76 @@ int backup_verify(const char *backup_path, const unsigned char *passphrase,
     return valid;
 }
 
+const char *backup_restore_blocked_by(const char *dest_db_path,
+                                     const char *dest_keyfile_path,
+                                     char *buf, size_t buf_len) {
+    if (!dest_db_path || !dest_keyfile_path || !buf || buf_len == 0) return NULL;
+
+    /* The SQLite sidecars count too: a write-ahead log left over from another
+       database would be replayed into the restored one. */
+    static const char *const db_suffixes[] = { "", "-wal", "-shm" };
+    for (size_t i = 0; i < sizeof(db_suffixes) / sizeof(db_suffixes[0]); i++) {
+        int n = snprintf(buf, buf_len, "%s%s", dest_db_path, db_suffixes[i]);
+        if (n < 0 || (size_t)n >= buf_len || secure_file_exists(buf)) return buf;
+    }
+    int n = snprintf(buf, buf_len, "%s", dest_keyfile_path);
+    if (n < 0 || (size_t)n >= buf_len || secure_file_exists(buf)) return buf;
+    return NULL;
+}
+
 int backup_restore(const char *backup_path, const char *dest_db_path,
                    const char *dest_keyfile_path, const unsigned char *passphrase,
                    size_t passphrase_len) {
     if (!dest_db_path || !dest_keyfile_path) return 0;
 
+    /* A restore never replaces anything: the files already there may be the
+       only copy of a key or of channel state. */
+    char blocker[4096];
+    if (backup_restore_blocked_by(dest_db_path, dest_keyfile_path,
+                                  blocker, sizeof(blocker)))
+        return 0;
+
     size_t pt_len = 0;
     unsigned char *pt = backup_decrypt(backup_path, passphrase, passphrase_len, &pt_len);
     if (!pt) return 0;
 
-    /* Parse plaintext */
-    if (pt_len < 8) { free(pt); return 0; }
+    /* Parse plaintext: [db_len:4][db_data][kf_len:4][kf_data] */
+    int ok = 0;
+    char *staged_db = NULL, *staged_kf = NULL;
+    if (pt_len < 8) goto done;
 
-    uint32_t db_len = read_u32_le(pt);
-    if (4 + db_len + 4 > pt_len) { free(pt); return 0; }
+    size_t db_len = read_u32_le(pt);
+    if (db_len > pt_len - 8) goto done;
 
-    uint32_t kf_len = read_u32_le(pt + 4 + db_len);
-    if (4 + db_len + 4 + kf_len != pt_len) { free(pt); return 0; }
+    size_t kf_len = read_u32_le(pt + 4 + db_len);
+    if (kf_len != pt_len - 8 - db_len) goto done;
 
     const unsigned char *db_data = pt + 4;
     const unsigned char *kf_data = pt + 4 + db_len + 4;
 
-    /* Write DB */
-    FILE *fp = secure_file_open_private(dest_db_path);
-    if (!fp) { secure_zero(pt, pt_len); free(pt); return 0; }
-    size_t w = fwrite(db_data, 1, db_len, fp);
-    fclose(fp);
-    if (w != db_len) { secure_zero(pt, pt_len); free(pt); return 0; }
+    /* Write both files completely before either appears at its destination,
+       so a failed write leaves nothing behind. */
+    staged_db = secure_file_stage(dest_db_path, db_data, db_len);
+    if (!staged_db) goto done;
+    staged_kf = secure_file_stage(dest_keyfile_path, kf_data, kf_len);
+    if (!staged_kf) goto done;
 
-    /* Write keyfile */
-    fp = secure_file_open_private(dest_keyfile_path);
-    if (!fp) { secure_zero(pt, pt_len); free(pt); return 0; }
-    w = fwrite(kf_data, 1, kf_len, fp);
-    fclose(fp);
+    int db_placed = secure_file_commit(staged_db, dest_db_path, 0);
+    staged_db = NULL;
+    if (!db_placed) goto done;
 
-    int ok = (w == kf_len);
+    int kf_placed = secure_file_commit(staged_kf, dest_keyfile_path, 0);
+    staged_kf = NULL;
+    if (!kf_placed) {
+        /* Nothing was at dest_db_path before this call: take it back out. */
+        remove(dest_db_path);
+        goto done;
+    }
+    ok = 1;
+
+done:
+    secure_file_discard(staged_db);
+    secure_file_discard(staged_kf);
     secure_zero(pt, pt_len);
     free(pt);
     return ok;

@@ -1756,6 +1756,8 @@ extern int test_backup_v2_roundtrip(void);
 extern int test_backup_v1_compat(void);
 extern int test_backup_v2_wrong_passphrase(void);
 extern int test_backup_files_owner_only(void);
+extern int test_backup_restore_refuses_existing(void);
+extern int test_backup_failed_write_reported(void);
 
 /* UTXO Coin Selection (Mainnet Gap #1) */
 extern int test_coin_select_basic(void);
@@ -1926,6 +1928,14 @@ extern int test_keyfile_wrong_passphrase_keeps_file(void);
 extern int test_keyfile_corrupt_file_kept(void);
 extern int test_keyfile_generate_refuses_existing(void);
 extern int test_keyfile_save_replaces_atomically(void);
+extern int test_keyfile_symlink_path(void);
+extern int test_secure_file_mode_owner_only(void);
+extern int test_secure_file_create_only(void);
+extern int test_secure_file_failed_write_keeps_old(void);
+extern int test_secure_file_refuses_symlink(void);
+extern int test_secure_file_refuses_dangling_symlink(void);
+extern int test_secure_file_stage_commit_discard(void);
+extern int test_secure_file_removes_stale_temporaries(void);
 
 /* Mainnet Audit: HD Key Derivation */
 extern int test_hd_master_from_seed(void);
@@ -3670,6 +3680,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_backup_v1_compat);
     RUN_TEST(test_backup_v2_wrong_passphrase);
     RUN_TEST(test_backup_files_owner_only);
+    RUN_TEST(test_backup_restore_refuses_existing);
+    RUN_TEST(test_backup_failed_write_reported);
 
     printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
     RUN_TEST(test_coin_select_basic);
@@ -3844,6 +3856,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_keyfile_corrupt_file_kept);
     RUN_TEST(test_keyfile_generate_refuses_existing);
     RUN_TEST(test_keyfile_save_replaces_atomically);
+    RUN_TEST(test_keyfile_symlink_path);
+    RUN_TEST(test_secure_file_mode_owner_only);
+    RUN_TEST(test_secure_file_create_only);
+    RUN_TEST(test_secure_file_failed_write_keeps_old);
+    RUN_TEST(test_secure_file_refuses_symlink);
+    RUN_TEST(test_secure_file_refuses_dangling_symlink);
+    RUN_TEST(test_secure_file_stage_commit_discard);
+    RUN_TEST(test_secure_file_removes_stale_temporaries);
 
     printf("\n=== Mainnet Audit: HD Key Derivation ===\n");
     RUN_TEST(test_hd_master_from_seed);

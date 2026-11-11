@@ -31,7 +31,9 @@
 #define BACKUP_HEADER_LEN (BACKUP_MAGIC_LEN + 1 + 4 + BACKUP_SALT_LEN + BACKUP_NONCE_LEN)
 
 /* Create an encrypted backup of DB + keyfile.
-   Returns 1 on success, 0 on error. */
+   The backup is written atomically with mode 0600; a backup already at
+   backup_path is replaced only once the new one is complete on disk.
+   Returns 1 on success, 0 on error (including a failed write). */
 int backup_create(const char *db_path, const char *keyfile_path,
                   const char *backup_path, const unsigned char *passphrase,
                   size_t passphrase_len);
@@ -42,9 +44,20 @@ int backup_verify(const char *backup_path, const unsigned char *passphrase,
                   size_t passphrase_len);
 
 /* Restore DB + keyfile from encrypted backup.
+   A restore never replaces anything: it fails without writing if anything
+   exists at dest_db_path, at its SQLite sidecars (dest_db_path + "-wal" and
+   "-shm") or at dest_keyfile_path.  Both files are written with mode 0600 and
+   appear only once both are complete on disk; on error neither is left
+   behind.
    Returns 1 on success, 0 on error. */
 int backup_restore(const char *backup_path, const char *dest_db_path,
                    const char *dest_keyfile_path, const unsigned char *passphrase,
                    size_t passphrase_len);
+
+/* The first path that stops a restore to these destinations because
+   something already exists there, written to buf; NULL if nothing does. */
+const char *backup_restore_blocked_by(const char *dest_db_path,
+                                     const char *dest_keyfile_path,
+                                     char *buf, size_t buf_len);
 
 #endif /* SUPERSCALAR_BACKUP_H */

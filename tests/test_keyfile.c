@@ -496,7 +496,7 @@ int test_keyfile_save_replaces_atomically(void) {
     TEST_ASSERT(d != NULL, "opendir /tmp");
     int stray = 0;
     while ((de = readdir(d)) != NULL) {
-        if (strncmp(de->d_name, "test_keyfile_atomic.d.tmp", 25) == 0)
+        if (strncmp(de->d_name, "test_keyfile_atomic.d.", 22) == 0)
             stray++;
     }
     closedir(d);
@@ -504,5 +504,62 @@ int test_keyfile_save_replaces_atomically(void) {
 
     unlink(path);
     rmdir(dir);
+    return 1;
+}
+
+/* A keyfile path that is a symbolic link is never written through: saving
+   over the link and generating at it both fail, and the link's target is
+   neither replaced nor created.  Reading a key through a link is fine. */
+int test_keyfile_symlink_path(void) {
+    const char *target = "/tmp/test_keyfile_symlink_target.key";
+    const char *link_path = "/tmp/test_keyfile_symlink.key";
+    const char *dangling = "/tmp/test_keyfile_symlink_dangling.key";
+    const char *missing = "/tmp/test_keyfile_symlink_missing.key";
+    unlink(target);
+    unlink(link_path);
+    unlink(dangling);
+    unlink(missing);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char key_a[32], key_b[32], out[32];
+    memset(key_a, 0x31, 32);
+    memset(key_b, 0x32, 32);
+    TEST_ASSERT(keyfile_save(target, key_a, "pw"), "save target");
+    TEST_ASSERT(symlink(target, link_path) == 0, "symlink");
+    TEST_ASSERT(symlink(missing, dangling) == 0, "dangling symlink");
+
+    unsigned char before[128], after[128];
+    long before_len = slurp(target, before, sizeof(before));
+
+    TEST_ASSERT(keyfile_load(link_path, out, "pw"), "load through a symlink");
+    TEST_ASSERT(memcmp(out, key_a, 32) == 0, "key read through the link");
+
+    TEST_ASSERT(!keyfile_save(link_path, key_b, "pw"), "save over a symlink is refused");
+    TEST_ASSERT(!keyfile_generate(link_path, out, "pw", ctx),
+                "generate at a symlink is refused");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(link_path, out, "wrong", ctx),
+                   KEYFILE_OPEN_LOAD_FAILED, "unloadable key behind a symlink is an error");
+    TEST_ASSERT_EQ(slurp(target, after, sizeof(after)), before_len, "target length unchanged");
+    TEST_ASSERT(memcmp(before, after, (size_t)before_len) == 0, "target bytes unchanged");
+
+    /* A dangling link is something at the path, so no key is generated, and
+       nothing is created where the link points. */
+    TEST_ASSERT(keyfile_exists(dangling), "a dangling link counts as existing");
+    TEST_ASSERT(!keyfile_save(dangling, key_b, "pw"), "save over a dangling link is refused");
+    TEST_ASSERT(!keyfile_generate(dangling, out, "pw", ctx),
+                "generate at a dangling link is refused");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(dangling, out, "pw", ctx),
+                   KEYFILE_OPEN_LOAD_FAILED, "a dangling link is an error, not a new key");
+    struct stat st;
+    TEST_ASSERT(lstat(missing, &st) != 0, "nothing created at the link target");
+    TEST_ASSERT(lstat(dangling, &st) == 0 && S_ISLNK(st.st_mode), "link still a link");
+    TEST_ASSERT(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode), "link still a link");
+
+    secp256k1_context_destroy(ctx);
+    unlink(target);
+    unlink(link_path);
+    unlink(dangling);
     return 1;
 }

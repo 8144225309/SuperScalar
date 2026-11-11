@@ -2345,6 +2345,15 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: --restore requires --db and --keyfile (destination paths)\n");
                 return 1;
             }
+            char blocker[4096];
+            if (backup_restore_blocked_by(db_path, keyfile_path,
+                                          blocker, sizeof(blocker))) {
+                fprintf(stderr,
+                    "Error: %s already exists; --restore never overwrites.\n"
+                    "  Move the existing database (with its -wal and -shm files) and\n"
+                    "  keyfile away first, then run --restore again.\n", blocker);
+                return 1;
+            }
             int ok = backup_restore(restore_path_arg, db_path, keyfile_path,
                                      (const unsigned char *)bp, bp_len);
             printf("Backup restore: %s\n", ok ? "OK" : "FAILED");

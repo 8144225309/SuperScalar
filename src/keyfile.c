@@ -6,9 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <stdint.h>
-#include <sys/stat.h>
 #include <openssl/evp.h>
 
 /* From noise.c */
@@ -184,11 +182,9 @@ int keyfile_generate(const char *path, unsigned char *seckey32_out,
 }
 
 int keyfile_exists(const char *path) {
-    if (!path) return 0;
-    struct stat st;
     /* Anything at the path counts, and so does a path that cannot be
        examined: only a definite "not there" allows a new key to be made. */
-    return !(lstat(path, &st) != 0 && errno == ENOENT);
+    return secure_file_exists(path);
 }
 
 keyfile_open_result_t keyfile_load_or_generate(const char *path,

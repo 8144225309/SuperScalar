@@ -2,6 +2,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include "superscalar/backup.h"
 
@@ -57,7 +60,9 @@ int test_backup_create_verify_restore(void) {
     TEST_ASSERT(backup_verify(bak_path, pass, pass_len),
                 "backup_verify failed");
 
-    /* Restore */
+    /* Restore (to paths with nothing at them) */
+    remove(rest_db);
+    remove(rest_kf);
     TEST_ASSERT(backup_restore(bak_path, rest_db, rest_kf, pass, pass_len),
                 "backup_restore failed");
 
@@ -190,7 +195,9 @@ int test_backup_v2_roundtrip(void) {
     /* Verify */
     TEST_ASSERT(backup_verify(bak_path, pass, pass_len), "v2 verify failed");
 
-    /* Restore */
+    /* Restore (to paths with nothing at them) */
+    remove(rest_db);
+    remove(rest_kf);
     TEST_ASSERT(backup_restore(bak_path, rest_db, rest_kf, pass, pass_len),
                 "v2 restore failed");
 
@@ -288,8 +295,8 @@ static int file_mode(const char *path) {
 }
 
 /* A backup contains the keyfile and the database, and a restore writes both
-   back out: all three files must be owner-only whatever the umask is, and
-   whatever mode a file already at the destination had. */
+   back out: all three files must be owner-only whatever the umask is, and a
+   permissive backup that is replaced must not pass its mode on. */
 int test_backup_files_owner_only(void) {
     const char *db_path = "/tmp/test_bak_mode_db.sqlite";
     const char *kf_path = "/tmp/test_bak_mode_kf.key";
@@ -312,32 +319,188 @@ int test_backup_files_owner_only(void) {
 
     int created = backup_create(db_path, kf_path, bak_path, pass, pass_len);
     int mode_bak = file_mode(bak_path);
+    int chmod_ok = chmod(bak_path, 0644) == 0;
+    int recreated = backup_create(db_path, kf_path, bak_path, pass, pass_len);
+    int mode_bak2 = file_mode(bak_path);
     int restored = backup_restore(bak_path, rest_db, rest_kf, pass, pass_len);
     int mode_db = file_mode(rest_db);
     int mode_kf = file_mode(rest_kf);
-
-    /* Permissive files already at the destinations must not keep their mode. */
-    int chmod_ok = chmod(bak_path, 0644) == 0 && chmod(rest_db, 0644) == 0 &&
-                   chmod(rest_kf, 0644) == 0;
-    int recreated = backup_create(db_path, kf_path, bak_path, pass, pass_len);
-    int mode_bak2 = file_mode(bak_path);
-    int restored2 = backup_restore(bak_path, rest_db, rest_kf, pass, pass_len);
-    int mode_db2 = file_mode(rest_db);
-    int mode_kf2 = file_mode(rest_kf);
 
     umask(old_umask);
 
     TEST_ASSERT(created, "backup_create");
     TEST_ASSERT(mode_bak == 0600, "new backup file must be mode 0600");
-    TEST_ASSERT(restored, "backup_restore");
-    TEST_ASSERT(mode_db == 0600, "restored database must be mode 0600");
-    TEST_ASSERT(mode_kf == 0600, "restored keyfile must be mode 0600");
     TEST_ASSERT(chmod_ok, "chmod 0644");
     TEST_ASSERT(recreated, "backup_create over existing file");
     TEST_ASSERT(mode_bak2 == 0600, "rewritten backup file must be mode 0600");
-    TEST_ASSERT(restored2, "backup_restore over existing files");
-    TEST_ASSERT(mode_db2 == 0600, "rewritten database must be mode 0600");
-    TEST_ASSERT(mode_kf2 == 0600, "rewritten keyfile must be mode 0600");
+    TEST_ASSERT(restored, "backup_restore");
+    TEST_ASSERT(mode_db == 0600, "restored database must be mode 0600");
+    TEST_ASSERT(mode_kf == 0600, "restored keyfile must be mode 0600");
+
+    remove(db_path);
+    remove(kf_path);
+    remove(bak_path);
+    remove(rest_db);
+    remove(rest_kf);
+    return 1;
+}
+
+static int file_holds(const char *path, const unsigned char *data, size_t len) {
+    unsigned char buf[4096];
+    size_t n = read_test_file(path, buf, sizeof(buf));
+    return n == len && memcmp(buf, data, len) == 0;
+}
+
+static int path_exists(const char *path) {
+    struct stat st;
+    return lstat(path, &st) == 0;
+}
+
+/* Number of directory entries in dir whose name starts with prefix. */
+static int count_with_prefix(const char *dir, const char *prefix) {
+    int n = 0;
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, prefix, strlen(prefix)) == 0) n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/* Every file write fails while the limit is in force (file size limit of
+   zero), the way a full disk or an exhausted quota fails it. */
+static struct rlimit saved_fsize_limit;
+static void (*saved_xfsz_handler)(int);
+
+static void disk_writes_fail(void) {
+    struct rlimit no_writes;
+    saved_xfsz_handler = signal(SIGXFSZ, SIG_IGN);
+    getrlimit(RLIMIT_FSIZE, &saved_fsize_limit);
+    no_writes = saved_fsize_limit;
+    no_writes.rlim_cur = 0;
+    setrlimit(RLIMIT_FSIZE, &no_writes);
+}
+
+static void disk_writes_work(void) {
+    setrlimit(RLIMIT_FSIZE, &saved_fsize_limit);
+    signal(SIGXFSZ, saved_xfsz_handler);
+}
+
+/* A restore never replaces anything.  If the database, one of its SQLite
+   sidecars or the keyfile is already there, it fails and every existing file
+   is left exactly as it was. */
+int test_backup_restore_refuses_existing(void) {
+    const char *db_path = "/tmp/test_bak_noclobber_src_db.sqlite";
+    const char *kf_path = "/tmp/test_bak_noclobber_src_kf.key";
+    const char *bak_path = "/tmp/test_bak_noclobber.bak";
+    const char *rest_db = "/tmp/test_bak_noclobber_db.sqlite";
+    const char *rest_wal = "/tmp/test_bak_noclobber_db.sqlite-wal";
+    const char *rest_shm = "/tmp/test_bak_noclobber_db.sqlite-shm";
+    const char *rest_kf = "/tmp/test_bak_noclobber_kf.key";
+    const char *const dests[] = { rest_db, rest_wal, rest_shm, rest_kf };
+
+    static const unsigned char backed_up_db[] = "database inside the backup";
+    static const unsigned char backed_up_kf[] = "keyfile inside the backup";
+    static const unsigned char live[] = "live file that must survive";
+    const unsigned char *pass = (const unsigned char *)"noclobber-pass";
+    size_t pass_len = strlen((const char *)pass);
+
+    TEST_ASSERT(write_test_file(db_path, backed_up_db, sizeof(backed_up_db) - 1), "write db");
+    TEST_ASSERT(write_test_file(kf_path, backed_up_kf, sizeof(backed_up_kf) - 1), "write kf");
+    TEST_ASSERT(backup_create(db_path, kf_path, bak_path, pass, pass_len), "backup_create");
+
+    /* One existing destination at a time is enough to stop the restore. */
+    for (size_t blocker = 0; blocker < 4; blocker++) {
+        for (size_t i = 0; i < 4; i++) remove(dests[i]);
+        TEST_ASSERT(write_test_file(dests[blocker], live, sizeof(live) - 1), "live file");
+
+        char blocked_by[256];
+        const char *reported = backup_restore_blocked_by(rest_db, rest_kf,
+                                                         blocked_by, sizeof(blocked_by));
+        TEST_ASSERT(reported != NULL && strcmp(reported, dests[blocker]) == 0,
+                    "the existing file is named as the blocker");
+
+        TEST_ASSERT(!backup_restore(bak_path, rest_db, rest_kf, pass, pass_len),
+                    "restore over an existing file is refused");
+        TEST_ASSERT(file_holds(dests[blocker], live, sizeof(live) - 1),
+                    "existing file is untouched");
+        for (size_t i = 0; i < 4; i++) {
+            if (i != blocker)
+                TEST_ASSERT(!path_exists(dests[i]), "no other destination was created");
+        }
+    }
+
+    /* Nothing in the way: the restore goes through. */
+    for (size_t i = 0; i < 4; i++) remove(dests[i]);
+    char blocked_by[256];
+    TEST_ASSERT(backup_restore_blocked_by(rest_db, rest_kf, blocked_by,
+                                          sizeof(blocked_by)) == NULL,
+                "no blocker with clear destinations");
+    TEST_ASSERT(backup_restore(bak_path, rest_db, rest_kf, pass, pass_len), "restore");
+    TEST_ASSERT(file_holds(rest_db, backed_up_db, sizeof(backed_up_db) - 1), "restored db");
+    TEST_ASSERT(file_holds(rest_kf, backed_up_kf, sizeof(backed_up_kf) - 1), "restored keyfile");
+
+    remove(db_path);
+    remove(kf_path);
+    remove(bak_path);
+    for (size_t i = 0; i < 4; i++) remove(dests[i]);
+    return 1;
+}
+
+/* When the disk refuses the write, backup and restore must say so, must not
+   leave empty or partial files, and must not damage a backup that was
+   already there. */
+int test_backup_failed_write_reported(void) {
+    const char *db_path = "/tmp/test_bak_wfail_src_db.sqlite";
+    const char *kf_path = "/tmp/test_bak_wfail_src_kf.key";
+    const char *bak_path = "/tmp/test_bak_wfail.bak";
+    const char *new_bak = "/tmp/test_bak_wfail_new.bak";
+    const char *rest_db = "/tmp/test_bak_wfail_db.sqlite";
+    const char *rest_kf = "/tmp/test_bak_wfail_kf.key";
+
+    static const unsigned char db_data[] = "write failure test database";
+    static const unsigned char kf_data[] = "write failure test keyfile";
+    const unsigned char *pass = (const unsigned char *)"wfail-pass";
+    size_t pass_len = strlen((const char *)pass);
+
+    remove(bak_path);
+    remove(new_bak);
+    remove(rest_db);
+    remove(rest_kf);
+    TEST_ASSERT(write_test_file(db_path, db_data, sizeof(db_data) - 1), "write db");
+    TEST_ASSERT(write_test_file(kf_path, kf_data, sizeof(kf_data) - 1), "write kf");
+    TEST_ASSERT(backup_create(db_path, kf_path, bak_path, pass, pass_len), "backup_create");
+
+    unsigned char good_backup[4096];
+    size_t good_len = read_test_file(bak_path, good_backup, sizeof(good_backup));
+    TEST_ASSERT(good_len > BACKUP_HEADER_LEN + BACKUP_TAG_LEN, "backup written");
+
+    disk_writes_fail();
+    int recreate_result = backup_create(db_path, kf_path, bak_path, pass, pass_len);
+    int create_result = backup_create(db_path, kf_path, new_bak, pass, pass_len);
+    int restore_result = backup_restore(bak_path, rest_db, rest_kf, pass, pass_len);
+    disk_writes_work();
+
+    TEST_ASSERT(!recreate_result, "failed backup over an existing one is reported");
+    TEST_ASSERT(file_holds(bak_path, good_backup, good_len),
+                "existing backup is intact after the failed write");
+    TEST_ASSERT(backup_verify(bak_path, pass, pass_len), "existing backup still verifies");
+
+    TEST_ASSERT(!create_result, "failed backup to a new path is reported");
+    TEST_ASSERT(!path_exists(new_bak), "no empty backup file left");
+
+    TEST_ASSERT(!restore_result, "failed restore is reported");
+    TEST_ASSERT(!path_exists(rest_db), "no empty database left");
+    TEST_ASSERT(!path_exists(rest_kf), "no empty keyfile left");
+    TEST_ASSERT(count_with_prefix("/tmp", "test_bak_wfail") == 3,
+                "only the two sources and the backup remain");
+
+    /* With the disk working again the same restore succeeds. */
+    TEST_ASSERT(backup_restore(bak_path, rest_db, rest_kf, pass, pass_len), "restore");
+    TEST_ASSERT(file_holds(rest_db, db_data, sizeof(db_data) - 1), "restored db");
+    TEST_ASSERT(file_holds(rest_kf, kf_data, sizeof(kf_data) - 1), "restored keyfile");
 
     remove(db_path);
     remove(kf_path);

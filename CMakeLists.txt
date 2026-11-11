@@ -310,6 +310,7 @@ add_executable(test_superscalar
     tests/test_property.c
     tests/test_backup.c
     tests/test_keyfile.c
+    tests/test_secure_file.c
     tests/test_bip39.c
     tests/test_rate_limit.c
     tests/test_fee_estimator.c
