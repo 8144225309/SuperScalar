@@ -102,6 +102,72 @@ static size_t fivebit_to_bytes(const uint8_t *in, size_t in_len,
     return pos;
 }
 
+/* Pack 5-bit groups into bytes, zero-padding the last byte.  This is the
+   form the data part takes in the signed message. */
+static size_t fivebit_pack_padded(const uint8_t *in, size_t in_len,
+                                   unsigned char *out, size_t out_cap) {
+    uint32_t acc = 0; int bits = 0; size_t pos = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        acc = (acc << 5) | in[i]; bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            if (pos >= out_cap) return 0;
+            out[pos++] = (unsigned char)((acc >> bits) & 0xff);
+        }
+    }
+    if (bits > 0) {
+        if (pos >= out_cap) return 0;
+        out[pos++] = (unsigned char)((acc << (8 - bits)) & 0xff);
+    }
+    return pos;
+}
+
+/* SHA256(hrp || data part without signature, packed to bytes): the message
+   an invoice signature commits to. */
+static int invoice_sighash(const char *hrp, size_t hrp_len,
+                            const uint8_t *d5, size_t d5_len,
+                            unsigned char sighash[32]) {
+    size_t cap = hrp_len + (d5_len * 5 + 7) / 8;
+    uint8_t *msg = (uint8_t *)malloc(cap ? cap : 1);
+    if (!msg) return 0;
+    memcpy(msg, hrp, hrp_len);
+    size_t n = fivebit_pack_padded(d5, d5_len, msg + hrp_len, cap - hrp_len);
+    if (d5_len > 0 && n == 0) { free(msg); return 0; }
+    sha256(msg, hrp_len + n, sighash);
+    free(msg);
+    return 1;
+}
+
+/* Big-endian value of a tagged field's 5-bit groups.  Returns 0 if it does
+   not fit in 64 bits (leading zero groups are allowed). */
+static int field_to_u64(const uint8_t *f5, size_t len, uint64_t *out) {
+    uint64_t v = 0;
+    for (size_t k = 0; k < len; k++) {
+        if (v >> 59) return 0;
+        v = (v << 5) | f5[k];
+    }
+    *out = v;
+    return 1;
+}
+
+/* Minimal big-endian 5-bit encoding of v (at least one group). */
+static size_t u64_to_field(uint64_t v, uint8_t *f5, size_t cap) {
+    size_t n = 1;
+    while (n < 13 && (v >> (5 * n)) != 0) n++;
+    if (n > cap) return 0;
+    for (size_t k = 0; k < n; k++)
+        f5[k] = (uint8_t)((v >> (5 * (n - 1 - k))) & 0x1f);
+    return n;
+}
+
+/* Even (mandatory) feature bits this reader understands. */
+static int feature_bit_known(size_t bit) {
+    return bit == BOLT11_FEATURE_VAR_ONION ||
+           bit == BOLT11_FEATURE_PAYMENT_SECRET ||
+           bit == BOLT11_FEATURE_BASIC_MPP ||
+           bit == 48 /* payment_metadata */;
+}
+
 /* ---- Read N bits from a 5-bit array at bit offset *off ---- */
 static uint64_t read_bits(const uint8_t *d5, size_t d5_len,
                            size_t *off, int nbits) {
@@ -131,14 +197,14 @@ static void write_bits(uint8_t *d5, size_t d5_cap,
     }
 }
 
-/* ---- Parse network from HRP ---- */
+/* ---- Parse network and amount from HRP ---- */
 static int parse_network(const char *hrp, size_t hrp_len,
-                          char network_out[8], uint64_t *amount_msat_out) {
+                          char network_out[8], uint64_t *amount_msat_out,
+                          int *has_amount_out) {
     /* HRP = "ln" + network + optional_amount */
     if (hrp_len < 4) return 0;
     if (hrp[0] != 'l' || hrp[1] != 'n') return 0;
 
-    /* networks: bc, bs, tb, bcrt */
     static const char *nets[] = {"bc", "bs", "tb", "tbs", "tb4", "bcrt", NULL};
     int net_len = 0;
     for (int i = 0; nets[i]; i++) {
@@ -157,36 +223,43 @@ static int parse_network(const char *hrp, size_t hrp_len,
     }
     if (net_len == 0) return 0;
 
-    /* Parse optional amount (digits + optional multiplier) */
     *amount_msat_out = 0;
+    *has_amount_out = 0;
     size_t amt_start = (size_t)(2 + net_len);
     if (amt_start == hrp_len) return 1; /* no amount */
 
+    /* A positive decimal integer with no leading zeros... */
+    if (hrp[amt_start] == '0') return 0;
     uint64_t n = 0;
     size_t i = amt_start;
-    while (i < hrp_len && isdigit((unsigned char)hrp[i]))
-        n = n * 10 + (uint64_t)(hrp[i++] - '0');
+    while (i < hrp_len && isdigit((unsigned char)hrp[i])) {
+        uint64_t digit = (uint64_t)(hrp[i++] - '0');
+        if (n > (UINT64_MAX - digit) / 10) return 0;
+        n = n * 10 + digit;
+    }
+    if (i == amt_start) return 0;
 
-    /* multiplier */
-    uint64_t msat = 0;
+    /* ...followed by at most one multiplier.  1 BTC = 10^11 msat. */
+    uint64_t scale;
     if (i == hrp_len) {
-        /* no multiplier: n is in BTC; convert to msat */
-        msat = n * 100000000ULL * 1000ULL;
+        scale = 100000000000ULL;             /* BTC */
     } else if (i == hrp_len - 1) {
         switch (hrp[i]) {
-        /* 1 BTC = 10^11 msat */
-        case 'm': msat = n * 100000000ULL;   break; /* milli-BTC */
-        case 'u': msat = n * 100000ULL;      break; /* micro-BTC */
-        case 'n': msat = n * 100ULL;         break; /* nano-BTC */
-        case 'p':                                   /* pico-BTC = 0.1 msat */
+        case 'm': scale = 100000000ULL; break;   /* milli-BTC */
+        case 'u': scale = 100000ULL;    break;   /* micro-BTC */
+        case 'n': scale = 100ULL;       break;   /* nano-BTC */
+        case 'p':                                /* pico-BTC = 0.1 msat */
             if (n % 10 != 0) return 0;
-            msat = n / 10;
+            n /= 10;
+            scale = 1;
             break;
         default: return 0;
         }
     } else return 0;
 
-    *amount_msat_out = msat;
+    if (n > UINT64_MAX / scale) return 0;
+    *amount_msat_out = n * scale;
+    *has_amount_out = 1;
     return 1;
 }
 
@@ -228,8 +301,16 @@ int bolt11_decode(secp256k1_context *ctx,
     out->expiry = 3600;
     out->min_final_cltv_expiry = 18;
 
-    /* Find the last '1' separator */
+    /* All lower case or all upper case, never both */
     size_t slen = strlen(invoice_str);
+    int has_lower = 0, has_upper = 0;
+    for (size_t i = 0; i < slen; i++) {
+        if (islower((unsigned char)invoice_str[i])) has_lower = 1;
+        if (isupper((unsigned char)invoice_str[i])) has_upper = 1;
+    }
+    if (has_lower && has_upper) return 0;
+
+    /* Find the last '1' separator */
     int sep = -1;
     for (int i = (int)slen - 1; i >= 0; i--) {
         if (invoice_str[i] == '1') { sep = i; break; }
@@ -245,7 +326,7 @@ int bolt11_decode(secp256k1_context *ctx,
 
     /* Decode 5-bit values after separator */
     size_t d5_total = slen - hrp_len - 1;
-    if (d5_total < 110) return 0; /* 35-bit ts + 104 sig bits minimum */
+    if (d5_total < 7 + 104 + 6) return 0; /* timestamp + signature + checksum */
     uint8_t d5[4096];
     if (d5_total > sizeof(d5)) return 0;
     for (size_t i = 0; i < d5_total; i++) {
@@ -263,65 +344,58 @@ int bolt11_decode(secp256k1_context *ctx,
     if (chk != encoded_chk) return 0;
 
     /* Parse network + amount from HRP */
-    uint64_t hrp_amount = 0;
-    if (!parse_network(hrp, hrp_len, out->network, &hrp_amount)) return 0;
-    if (hrp_amount > 0) {
-        out->amount_msat = hrp_amount;
-        out->has_amount = 1;
-    }
+    if (!parse_network(hrp, hrp_len, out->network, &out->amount_msat,
+                       &out->has_amount))
+        return 0;
 
     /* DATA section: timestamp (35 bits) + tagged fields + signature (520 bits) */
-    /* Signature is the last 520 bits = 104 5-bit groups */
-    if (d5_data < 7 + 104) return 0; /* 35 bits + at least 104 for sig */
     size_t sig5_start = d5_data - 104;
+    size_t end_bits = sig5_start * 5;
 
     size_t off = 0;
-    out->timestamp = (uint32_t)read_bits(d5, sig5_start, &off, 35);
+    uint64_t timestamp = read_bits(d5, sig5_start, &off, 35);
+    if (timestamp > UINT32_MAX) return 0;
+    out->timestamp = (uint32_t)timestamp;
 
-    /* Parse tagged fields */
-    while (off < sig5_start * 5) {
-        if (off + 15 > sig5_start * 5) break;
+    int seen_p = 0, seen_s = 0, seen_n = 0;
+
+    /* Tagged fields fill the data part exactly */
+    while (off < end_bits) {
+        if (off + 15 > end_bits) return 0;
         uint8_t tag    = (uint8_t)read_bits(d5, sig5_start, &off, 5);
-        uint64_t flen  = read_bits(d5, sig5_start, &off, 10);
-        if (off + flen * 5 > sig5_start * 5) break;
+        size_t fdata5_len = (size_t)read_bits(d5, sig5_start, &off, 10);
+        if (off + fdata5_len * 5 > end_bits) return 0;
 
-        /* Extract field bits to a temporary 5-bit array */
-        uint8_t fdata5[512];
-        size_t fdata5_len = (size_t)flen;
-        if (fdata5_len > sizeof(fdata5)) { off += flen * 5; continue; }
+        uint8_t fdata5[1024];
         for (size_t k = 0; k < fdata5_len; k++)
             fdata5[k] = (uint8_t)read_bits(d5, sig5_start, &off, 5);
 
         switch (tag) {
-        case 1: { /* p: payment_hash (52 5-bit groups = 32 bytes) */
-            if (fdata5_len == 52) {
-                unsigned char tmp[32];
-                if (fivebit_to_bytes(fdata5, 52, tmp, 32) == 32)
-                    memcpy(out->payment_hash, tmp, 32);
-            }
+        case 1: { /* p: payment_hash, exactly once, 52 groups = 32 bytes */
+            if (seen_p || fdata5_len != 52) return 0;
+            if (fivebit_to_bytes(fdata5, 52, out->payment_hash, 32) != 32)
+                return 0;
+            seen_p = 1;
             break;
         }
-        case 6: { /* x: expiry */
-            uint64_t exp = 0;
-            for (size_t k = 0; k < fdata5_len; k++)
-                exp = (exp << 5) | fdata5[k];
+        case 6: { /* x: expiry in seconds */
+            uint64_t exp;
+            if (!field_to_u64(fdata5, fdata5_len, &exp) || exp > UINT32_MAX)
+                return 0;
             out->expiry = (uint32_t)exp;
             break;
         }
-        case 23: { /* h: description_hash (52 groups = 32 bytes) */
-            if (fdata5_len == 52) {
-                unsigned char tmp[32];
-                if (fivebit_to_bytes(fdata5, 52, tmp, 32) == 32) {
-                    memcpy(out->description_hash, tmp, 32);
-                    out->has_description_hash = 1;
-                }
-            }
+        case 23: { /* h: description_hash, 52 groups = 32 bytes */
+            if (fdata5_len != 52) return 0;
+            if (fivebit_to_bytes(fdata5, 52, out->description_hash, 32) != 32)
+                return 0;
+            out->has_description_hash = 1;
             break;
         }
         case 24: { /* c: min_final_cltv_expiry */
-            uint64_t clv = 0;
-            for (size_t k = 0; k < fdata5_len; k++)
-                clv = (clv << 5) | fdata5[k];
+            uint64_t clv;
+            if (!field_to_u64(fdata5, fdata5_len, &clv) || clv > INT32_MAX)
+                return 0;
             out->min_final_cltv_expiry = (int)clv;
             break;
         }
@@ -340,25 +414,19 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
-        case 16: { /* s: payment_secret (52 5-bit groups = 32 bytes) */
-            if (fdata5_len == 52) {
-                unsigned char tmp[32];
-                if (fivebit_to_bytes(fdata5, 52, tmp, 32) == 32) {
-                    memcpy(out->payment_secret, tmp, 32);
-                    out->has_payment_secret = 1;
-                }
-            }
+        case 16: { /* s: payment_secret, exactly once, 52 groups = 32 bytes */
+            if (seen_s || fdata5_len != 52) return 0;
+            if (fivebit_to_bytes(fdata5, 52, out->payment_secret, 32) != 32)
+                return 0;
+            out->has_payment_secret = 1;
+            seen_s = 1;
             break;
         }
-        case 19: { /* n: payee pubkey (53 5-bit groups = 33 bytes) */
-            if (fdata5_len == 53) {
-                unsigned char tmp[33];
-                if (fivebit_to_bytes(fdata5, 53, tmp, 33) == 33)
-                    memcpy(out->payee_pubkey, tmp, 33);
-            }
-            break;
-        }
-        case 18: { /* reserved / unknown tag 18 */
+        case 19: { /* n: payee pubkey, at most once, 53 groups = 33 bytes */
+            if (seen_n || fdata5_len != 53) return 0;
+            if (fivebit_to_bytes(fdata5, 53, out->payee_pubkey, 33) != 33)
+                return 0;
+            seen_n = 1;
             break;
         }
         case 27: { /* m: payment_metadata */
@@ -373,19 +441,25 @@ int bolt11_decode(secp256k1_context *ctx,
             }
             break;
         }
-        case 5: { /* 9: feature bits */
-            if (fdata5_len <= 4) {
-                uint16_t feat = 0;
-                for (size_t k = 0; k < fdata5_len; k++)
-                    feat = (uint16_t)((feat << 5) | fdata5[k]);
-                out->features = feat;
+        case 5: { /* 9: feature bits, numbered from the last bit of the field */
+            uint16_t feat = 0;
+            for (size_t k = 0; k < fdata5_len; k++) {
+                for (int b = 0; b < 5; b++) {
+                    if (!((fdata5[k] >> b) & 1)) continue;
+                    size_t bit = (fdata5_len - 1 - k) * 5 + (size_t)b;
+                    /* An even bit is mandatory: the invoice cannot be paid
+                       correctly without understanding it. */
+                    if (bit % 2 == 0 && !feature_bit_known(bit)) return 0;
+                    if (bit < 16) feat |= (uint16_t)(1u << bit);
+                }
             }
+            out->features = feat;
             break;
         }
         case 3: { /* r: route hints */
             if (out->n_hints >= BOLT11_MAX_ROUTE_HINTS) break;
             /* Each hop hint: pubkey(33) + scid(8) + fee_base(4) + fee_ppm(4) + cltv(2) = 51 bytes */
-            unsigned char rbytes[512];
+            unsigned char rbytes[640];
             size_t rlen = fivebit_to_bytes(fdata5, fdata5_len, rbytes, sizeof(rbytes));
             size_t roff = 0;
             bolt11_route_hint_t *rh = &out->hints[out->n_hints++];
@@ -404,8 +478,8 @@ int bolt11_decode(secp256k1_context *ctx,
                                ((uint32_t)rbytes[roff+1] << 16) |
                                ((uint32_t)rbytes[roff+2] <<  8) |
                                 (uint32_t)rbytes[roff+3]; roff += 4;
-                hop->cltv_expiry_delta = ((uint16_t)rbytes[roff] << 8) |
-                                          rbytes[roff+1]; roff += 2;
+                hop->cltv_expiry_delta = (uint16_t)(((uint16_t)rbytes[roff] << 8) |
+                                          rbytes[roff+1]); roff += 2;
             }
             break;
         }
@@ -415,51 +489,38 @@ int bolt11_decode(secp256k1_context *ctx,
         }
     }
 
-    /* ---- Verify signature ---- */
-    /* Signature: last 104 5-bit groups = 65 bytes:
-       recovery_flag(1 bit) [stored in last 5-bit group as high bit]
-       sig(64 bytes) */
-    unsigned char sig65[65];
-    /* 104 * 5 = 520 bits; convert the 520 bits to bytes */
-    uint8_t *sig5 = d5 + sig5_start;
-    /* sig5 encodes: 512 bits of ECDSA sig + 8 bits of recovery flag → 65 bytes */
+    /* A payment hash and a payment secret are required */
+    if (!seen_p || !seen_s) return 0;
+
+    /* ---- Verify signature ----
+       Last 104 groups = 65 bytes: R (32) || S (32) || recovery id (1). */
     unsigned char sig_bytes[66];
-    size_t sbs = fivebit_to_bytes(sig5, 104, sig_bytes, sizeof(sig_bytes));
-    if (sbs < 65) return 0;
-    /* CLN convention: last byte of sig_bytes is the recovery flag (0 or 1) */
-    sig65[0] = sig_bytes[64]; /* recovery flag */
-    memcpy(sig65 + 1, sig_bytes, 64);
+    if (fivebit_to_bytes(d5 + sig5_start, 104, sig_bytes, sizeof(sig_bytes)) != 65)
+        return 0;
+    int recovery_id = sig_bytes[64];
+    if (recovery_id > 3) return 0;
 
-    /* Sighash: SHA256(hrp_bytes || data5_without_sig) */
-    /* hrp_bytes = raw bytes of HRP as-is */
     unsigned char sighash[32];
-    {
-        /* msg = hrp_bytes || data5_bits_flattened_to_bytes (data portion only, not sig) */
-        /* Per BOLT #11: hash = SHA256(HRP as ASCII bytes || 5-bit data as bytes with leftover) */
-        /* Exact: SHA256(hrp_ascii_bytes || data5_including_sig_as_8bit_with_padding) */
-        /* Actually per spec: sign over SHA256(hrp || data5_without_sig) where data5_without_sig */
-        /* is the raw bech32 5-bit stream bytes (0x00..0x1f per group) packed 8 per 5 */
-        /* CLN approach: msg = hrp_bytes || data5_bytes (raw 5-bit values, not decoded) */
-        /* where data5_bytes = the raw 5-bit octets in a byte array */
-        uint8_t *msg = (uint8_t *)malloc(hrp_len + sig5_start);
-        if (!msg) return 0;
-        memcpy(msg, hrp, hrp_len);
-        memcpy(msg + hrp_len, d5, sig5_start);
-        sha256(msg, hrp_len + sig5_start, sighash);
-        free(msg);
-    }
+    if (!invoice_sighash(hrp, hrp_len, d5, sig5_start, sighash)) return 0;
 
-    /* Recover pubkey */
     secp256k1_ecdsa_recoverable_signature rec_sig;
-    int recovery_id = sig65[0] & 0x01;
     if (!secp256k1_ecdsa_recoverable_signature_parse_compact(
-            ctx, &rec_sig, sig65 + 1, recovery_id)) return 0;
+            ctx, &rec_sig, sig_bytes, recovery_id)) return 0;
 
-    secp256k1_pubkey recovered_pub;
-    if (!secp256k1_ecdsa_recover(ctx, &recovered_pub, &rec_sig, sighash)) return 0;
-
-    /* If 'n' tagged field was absent, use recovered key */
-    if (out->payee_pubkey[0] == 0x00) {
+    if (seen_n) {
+        /* The payee is named: the signature must verify against that key
+           (which also requires it to be in canonical low-S form). */
+        secp256k1_pubkey named;
+        secp256k1_ecdsa_signature sig;
+        if (!secp256k1_ec_pubkey_parse(ctx, &named, out->payee_pubkey, 33))
+            return 0;
+        secp256k1_ecdsa_recoverable_signature_convert(ctx, &sig, &rec_sig);
+        if (!secp256k1_ecdsa_verify(ctx, &sig, sighash, &named)) return 0;
+    } else {
+        /* Otherwise the payee is whoever signed */
+        secp256k1_pubkey recovered_pub;
+        if (!secp256k1_ecdsa_recover(ctx, &recovered_pub, &rec_sig, sighash))
+            return 0;
         size_t publen = 33;
         secp256k1_ec_pubkey_serialize(ctx, out->payee_pubkey, &publen,
                                       &recovered_pub, SECP256K1_EC_COMPRESSED);
@@ -538,26 +599,25 @@ int bolt11_encode(const bolt11_invoice_t *inv,
 
     /* x: expiry (if non-default) */
     if (inv->expiry != 3600) {
-        uint8_t f[8];
-        size_t f_len = 0;
-        uint32_t exp = inv->expiry;
-        /* minimal encoding */
-        if (exp < (1u << 5))       { f_len = 1; f[0] = (uint8_t)exp; }
-        else if (exp < (1u << 10)) { f_len = 2; f[0] = (uint8_t)(exp >> 5); f[1] = (uint8_t)(exp & 0x1f); }
-        else if (exp < (1u << 15)) { f_len = 3; f[0] = (uint8_t)(exp >> 10); f[1] = (uint8_t)((exp >> 5) & 0x1f); f[2] = (uint8_t)(exp & 0x1f); }
-        else                       { f_len = 4; f[0] = (uint8_t)(exp >> 15); f[1] = (uint8_t)((exp >> 10) & 0x1f); f[2] = (uint8_t)((exp >> 5) & 0x1f); f[3] = (uint8_t)(exp & 0x1f); }
+        uint8_t f[13];
+        size_t f_len = u64_to_field(inv->expiry, f, sizeof(f));
         WRITE_FIELD(6, f, f_len);
     }
 
     /* c: min_final_cltv_expiry */
     if (inv->min_final_cltv_expiry != 18) {
-        uint8_t f[4];
-        size_t f_len = 0;
-        int clv = inv->min_final_cltv_expiry;
-        if (clv < 32)      { f_len = 1; f[0] = (uint8_t)clv; }
-        else if (clv < 1024){ f_len = 2; f[0] = (uint8_t)(clv >> 5); f[1] = (uint8_t)(clv & 0x1f); }
-        else               { f_len = 3; f[0] = (uint8_t)(clv >> 10); f[1] = (uint8_t)((clv >> 5) & 0x1f); f[2] = (uint8_t)(clv & 0x1f); }
+        if (inv->min_final_cltv_expiry < 0) return 0;
+        uint8_t f[13];
+        size_t f_len = u64_to_field((uint64_t)inv->min_final_cltv_expiry,
+                                     f, sizeof(f));
         WRITE_FIELD(24, f, f_len);
+    }
+
+    /* 9: feature bits */
+    if (inv->features != 0) {
+        uint8_t f[13];
+        size_t f_len = u64_to_field(inv->features, f, sizeof(f));
+        WRITE_FIELD(5, f, f_len);
     }
 
     /* n: payee pubkey (tag 19 = bech32 'n') */
@@ -599,16 +659,9 @@ int bolt11_encode(const bolt11_invoice_t *inv,
     /* Pad to byte boundary */
     size_t d5_len = (off + 4) / 5; /* number of 5-bit groups */
 
-    /* Sign: sighash = SHA256(hrp_bytes || d5[0..d5_len]) */
+    /* Sign SHA256(hrp || data part packed to bytes) */
     unsigned char sighash[32];
-    {
-        uint8_t *msg = (uint8_t *)malloc(hrp_len + d5_len);
-        if (!msg) return 0;
-        memcpy(msg, hrp, hrp_len);
-        memcpy(msg + hrp_len, d5, d5_len);
-        sha256(msg, hrp_len + d5_len, sighash);
-        free(msg);
-    }
+    if (!invoice_sighash(hrp, hrp_len, d5, d5_len, sighash)) return 0;
 
     /* Sign with recoverable ECDSA */
     secp256k1_ecdsa_recoverable_signature rec_sig;

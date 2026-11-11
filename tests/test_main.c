@@ -304,7 +304,10 @@ extern int test_bolt11_metadata_roundtrip(void);
 extern int test_bolt11_no_metadata(void);
 extern int test_bolt11_metadata_truncated(void);
 extern int test_bolt11_full_roundtrip_with_metadata(void);
-extern int test_bolt11_spec_vectors(void);
+extern int test_bolt11_spec_valid_examples(void);
+extern int test_bolt11_spec_invalid_examples(void);
+extern int test_bolt11_reader_strictness(void);
+extern int test_bolt11_encode_signature_and_payee(void);
 extern int test_bolt11_amount_units_and_fields(void);
 extern int test_pathfind_two_hops(void);
 extern int test_pathfind_one_hop(void);
@@ -2271,7 +2274,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt11_no_metadata);
     RUN_TEST(test_bolt11_metadata_truncated);
     RUN_TEST(test_bolt11_full_roundtrip_with_metadata);
-    RUN_TEST(test_bolt11_spec_vectors);
+    RUN_TEST(test_bolt11_spec_valid_examples);
+    RUN_TEST(test_bolt11_spec_invalid_examples);
+    RUN_TEST(test_bolt11_reader_strictness);
+    RUN_TEST(test_bolt11_encode_signature_and_payee);
     RUN_TEST(test_bolt11_amount_units_and_fields);
 
     printf("\n=== Pathfinding (Dijkstra) ===\n");
