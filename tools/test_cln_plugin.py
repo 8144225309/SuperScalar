@@ -38,6 +38,8 @@ class FakeCln:
     scripted list of replies (the last reply repeats) and records calls."""
 
     def __init__(self, **replies):
+        # No earlier payment for the hash unless a test says otherwise.
+        replies.setdefault("listsendpays", {"payments": []})
         self.replies = {m: list(r) if isinstance(r, list) else [r]
                         for m, r in replies.items()}
         self.calls = []
@@ -75,6 +77,14 @@ class PluginTestCase(unittest.TestCase):
         self.sleeps = self.install_clock()
         cln_plugin.pending_htlcs.clear()
         cln_plugin.pending_pays.clear()
+        cln_plugin.open_pays.clear()
+        self.state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state_dir.cleanup)
+        p = mock.patch.object(
+            cln_plugin, "BRIDGE_STATE_FILE",
+            os.path.join(self.state_dir.name, "bridge-plugin.state.json"))
+        p.start()
+        self.addCleanup(p.stop)
         cln_plugin.registered_invoices.clear()
         p = mock.patch.object(cln_plugin, "registry_recovered", True)
         p.start()
@@ -99,8 +109,10 @@ class PluginTestCase(unittest.TestCase):
             if len(sleeps) > 500:
                 raise AssertionError("plugin never stopped polling")
 
+        self.clock = clock
         for name, repl in (("sleep", fake_sleep),
-                           ("monotonic", lambda: clock["now"])):
+                           ("monotonic", lambda: clock["now"]),
+                           ("time", lambda: clock["now"])):
             p = mock.patch.object(cln_plugin.time, name, repl)
             p.start()
             self.addCleanup(p.stop)
@@ -414,6 +426,188 @@ class OutboundPayResolutionTest(PluginTestCase):
         self.assertEqual(self.pay_results(), [{
             "method": "pay_result", "request_id": 29, "success": True,
             "preimage": PREIMAGE}])
+
+
+class PayResultDeliveryTest(PluginTestCase):
+    """A result is kept and repeated until the LSP acknowledges it, across
+    link outages and plugin restarts."""
+
+    def ack(self, request_id):
+        cln_plugin.handle_bridge_msg({"method": "pay_result_ack",
+                                      "request_id": request_id})
+
+    def restart_plugin(self):
+        """Forget everything in memory, as a new process would."""
+        cln_plugin.open_pays.clear()
+        self.to_bridge.clear()
+
+    def run_inline(self):
+        p = mock.patch.object(cln_plugin, "_spawn",
+                              lambda target, *args: target(*args))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_result_is_repeated_until_acknowledged(self):
+        self.use_cln(decode=decoded_invoice(4_000_000),
+                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        expected = {"method": "pay_result", "request_id": 7, "success": True,
+                    "preimage": PREIMAGE}
+        self.assertEqual(self.pay_results(), [expected])
+        self.assertEqual(cln_plugin.resend_pay_results(), 1)
+        self.assertEqual(cln_plugin.resend_pay_results(), 1)
+        self.assertEqual(self.pay_results(), [expected] * 3)
+        self.ack(7)
+        self.assertEqual(cln_plugin.resend_pay_results(), 0)
+        self.assertEqual(self.pay_results(), [expected] * 3)
+        self.assertEqual(cln_plugin.open_pays, {})
+
+    def test_result_reported_while_the_link_is_down_is_not_lost(self):
+        self.use_cln(decode=decoded_invoice(4_000_000),
+                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+        with mock.patch.object(cln_plugin, "send_to_bridge", lambda m: False):
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(self.pay_results(), [])
+        # The link comes back.
+        cln_plugin.resend_pay_results()
+        self.assertEqual(self.pay_results(), [{
+            "method": "pay_result", "request_id": 7, "success": True,
+            "preimage": PREIMAGE}])
+
+    def test_refusals_are_repeated_until_acknowledged_too(self):
+        self.use_cln(decode=decoded_invoice(4_000_000, payment_hash=OTHER_HASH))
+        cln_plugin._do_pay(BOLT11, 8, PAYMENT_HASH, 4_000_000, 144)
+        cln_plugin.resend_pay_results()
+        self.assertEqual([m["success"] for m in self.pay_results()], [False, False])
+        self.ack(8)
+        self.assertEqual(cln_plugin.resend_pay_results(), 0)
+
+    def test_undelivered_result_survives_a_restart(self):
+        self.use_cln(decode=decoded_invoice(4_000_000),
+                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+        with mock.patch.object(cln_plugin, "send_to_bridge", lambda m: False):
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.restart_plugin()
+        self.assertEqual(cln_plugin.recover_open_pays(), 1)
+        cln_plugin.resend_pay_results()
+        self.assertEqual(self.pay_results(), [{
+            "method": "pay_result", "request_id": 7, "success": True,
+            "preimage": PREIMAGE}])
+        # Once acknowledged it is gone from disk as well.
+        self.ack(7)
+        self.restart_plugin()
+        self.assertEqual(cln_plugin.recover_open_pays(), 0)
+
+    def test_payment_in_flight_at_restart_is_followed_to_its_end(self):
+        self.run_inline()
+        # `pay` was running when the plugin died: nothing was reported.
+        cln = self.use_cln(decode=decoded_invoice(4_000_000),
+                           pay=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(self.pay_results(), [])
+        self.restart_plugin()
+
+        cln = self.use_cln(listpays=[listed("pending"), listed("pending"),
+                                     listed("complete")])
+        self.assertEqual(cln_plugin.recover_open_pays(), 1)
+        self.assertEqual(cln.calls_to("pay"), [])       # never paid again
+        self.assertEqual(len(cln.calls_to("listpays")), 3)
+        self.assertEqual(self.pay_results(), [{
+            "method": "pay_result", "request_id": 7, "success": True,
+            "preimage": PREIMAGE}])
+
+    def test_payment_that_failed_while_the_plugin_was_down(self):
+        self.run_inline()
+        self.use_cln(decode=decoded_invoice(4_000_000), pay=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.restart_plugin()
+        # Long after the request: no attempt can still start.
+        self.clock["now"] += 3600
+        self.use_cln(listpays=listed("failed"))
+        cln_plugin.recover_open_pays()
+        self.assertEqual(self.sleeps, [])
+        self.assert_pay_failed(7)
+
+    def test_restart_right_after_the_request_waits_out_the_retry_window(self):
+        self.run_inline()
+        self.use_cln(decode=decoded_invoice(4_000_000), pay=KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.restart_plugin()
+        # CLN's pay may still be between attempts: "none yet" is not final.
+        self.use_cln(listpays=listed())
+        cln_plugin.recover_open_pays()
+        window = cln_plugin.PAY_RETRY_FOR + cln_plugin.PAY_SETTLE_GRACE
+        self.assertGreaterEqual(sum(self.sleeps), window)
+        self.assert_pay_failed(7)
+
+    def test_repeated_request_is_not_paid_twice(self):
+        cln = self.use_cln(decode=decoded_invoice(4_000_000),
+                           pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(len(cln.calls_to("pay")), 1)
+        # The known result goes out again instead.
+        self.assertEqual([m["success"] for m in self.pay_results()], [True, True])
+
+    def test_second_request_for_a_hash_being_paid_is_refused(self):
+        self.use_cln(decode=decoded_invoice(4_000_000),
+                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        cln = self.use_cln(decode=decoded_invoice(4_000_000),
+                           pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 8, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(cln.calls_to("pay"), [])
+        self.assertEqual(self.pay_results()[-1], {
+            "method": "pay_result", "request_id": 8, "success": False,
+            "preimage": "00" * 32})
+
+    def test_invoice_the_node_already_paid_is_not_charged_again(self):
+        # No record of our own (state lost), but CLN has paid this hash.
+        for status in ("complete", "pending"):
+            self.to_bridge.clear()
+            cln_plugin.open_pays.clear()
+            cln = self.use_cln(
+                decode=decoded_invoice(4_000_000),
+                pay={"status": "complete", "payment_preimage": PREIMAGE},
+                listsendpays={"payments": [{"payment_hash": PAYMENT_HASH,
+                                            "status": status}]})
+            cln_plugin._do_pay(BOLT11, 9, PAYMENT_HASH, 4_000_000, 144)
+            self.assertEqual(cln.calls_to("listsendpays"),
+                             [{"payment_hash": PAYMENT_HASH}])
+            self.assertEqual(cln.calls_to("pay"), [], status)
+            self.assert_pay_failed(9)
+
+    def test_earlier_failed_attempts_do_not_block_a_new_payment(self):
+        cln = self.use_cln(
+            decode=decoded_invoice(4_000_000),
+            pay={"status": "complete", "payment_preimage": PREIMAGE},
+            listsendpays={"payments": [{"payment_hash": PAYMENT_HASH,
+                                        "status": "failed"}]})
+        cln_plugin._do_pay(BOLT11, 9, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(len(cln.calls_to("pay")), 1)
+
+    def test_no_payment_when_earlier_payments_cannot_be_checked(self):
+        cln = self.use_cln(
+            decode=decoded_invoice(4_000_000),
+            pay={"status": "complete", "payment_preimage": PREIMAGE},
+            listsendpays=cln_plugin.ClnRpcError("Connection refused"))
+        cln_plugin._do_pay(BOLT11, 9, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(cln.calls_to("pay"), [])
+        self.assert_pay_failed(9)
+
+    def test_state_file_is_private_and_tolerates_damage(self):
+        self.use_cln(decode=decoded_invoice(4_000_000),
+                     pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        path = cln_plugin.BRIDGE_STATE_FILE
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path, "w") as f:
+            f.write("{ not json")
+        self.restart_plugin()
+        self.assertEqual(cln_plugin.recover_open_pays(), 0)
 
 
 def htlc(payment_hash=PAYMENT_HASH, amount_msat=5_000_000, cltv_expiry=500,

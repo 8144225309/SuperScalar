@@ -673,6 +673,20 @@ int bridge_handle_lsp_msg(bridge_t *br, const wire_msg_t *msg) {
         return ok;
     }
 
+    case MSG_BRIDGE_PAY_RESULT_ACK: {
+        /* The LSP has the result: the plugin can stop repeating it.  If the
+           plugin is away it simply repeats the result and is told again. */
+        uint64_t request_id;
+        if (!wire_parse_bridge_pay_result_ack(msg->json, &request_id))
+            return 0;
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "method", "pay_result_ack");
+        cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+        bridge_send_plugin_json(br, j);
+        cJSON_Delete(j);
+        return 1;
+    }
+
     case MSG_BRIDGE_HELLO_ACK:
         /* Heartbeat response from LSP — update activity timestamp */
         br->last_lsp_activity = time(NULL);

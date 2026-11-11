@@ -47,6 +47,9 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9736
 # File holding the secret the bridge expects (written by superscalar_bridge)
 BRIDGE_SECRET_FILE = "~/.superscalar/bridge-plugin.secret"
+# Where this plugin keeps what must survive its own restart: the outside
+# payments it was asked to make and has not yet seen acknowledged.
+BRIDGE_STATE_FILE = "~/.superscalar/bridge-plugin.state.json"
 LIGHTNING_CLI = "lightning-cli"
 LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
 KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend (overridable via plugin option)
@@ -80,6 +83,15 @@ PAY_RETRY_FOR = 60
 PAY_CLI_TIMEOUT = 600      # how long to wait for `pay` itself to return
 PAY_POLL_INTERVAL = 10     # seconds between listpays polls while unresolved
 PAY_SETTLE_GRACE = 30      # slack added to PAY_RETRY_FOR before trusting "failed"
+RESULT_RETRY_INTERVAL = 15 # seconds between repeats of an unacknowledged result
+
+# Outside payments requested by the bridge, until the LSP acknowledges their
+# result: request_id -> {"payment_hash": hex, "started": unix time,
+#                        "result": None | {"success": bool, "preimage": hex}}
+# Kept in BRIDGE_STATE_FILE so that a restart neither forgets a payment that
+# is still in flight nor loses a result that was not delivered.
+open_pays = {}
+pays_lock = threading.RLock()
 
 
 _KNOWN_NETWORKS = {"bitcoin", "testnet", "signet", "regtest", "testnet4", "liquidv1"}
@@ -416,6 +428,8 @@ def bridge_reader():
             log(f"Bridge reconnected; {held} HTLC(s) still awaiting the LSP")
         else:
             log("Bridge reconnected")
+        # Results the LSP has not acknowledged go out again.
+        resend_pay_results()
 
 
 def handle_bridge_msg(msg):
@@ -487,6 +501,9 @@ def handle_bridge_msg(msg):
             daemon=True
         )
         t.start()
+
+    elif method == "pay_result_ack":
+        _pay_acknowledged(msg.get("request_id"))
 
     elif method == "pay_result":
         # Response from bridge for a superscalar-pay RPC call
@@ -605,13 +622,159 @@ def _preimage_matches(preimage, payment_hash):
     return hashlib.sha256(bytes.fromhex(preimage)).hexdigest() == payment_hash.lower()
 
 
+def save_state():
+    """Write open_pays to BRIDGE_STATE_FILE (atomically, mode 0600)."""
+    path = os.path.expanduser(BRIDGE_STATE_FILE)
+    tmp = path + ".tmp"
+    with pays_lock:
+        data = json.dumps({"pays": {str(k): v for k, v in open_pays.items()}})
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        log(f"Cannot save plugin state to {path}: {e}")
+        return False
+
+
+def load_state():
+    """Read open_pays back from BRIDGE_STATE_FILE.  Returns how many
+    payments were restored."""
+    path = os.path.expanduser(BRIDGE_STATE_FILE)
+    try:
+        with open(path, "r") as f:
+            pays = json.load(f).get("pays", {})
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError, AttributeError) as e:
+        log(f"Cannot read plugin state {path}: {e}")
+        return 0
+    restored = 0
+    with pays_lock:
+        for key, rec in pays.items():
+            try:
+                request_id = int(key)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            open_pays[request_id] = {
+                "payment_hash": rec.get("payment_hash", ""),
+                "started": rec.get("started", 0),
+                "result": rec.get("result"),
+            }
+            restored += 1
+    return restored
+
+
+def _open_pay(request_id, payment_hash):
+    """Note that a payment was requested.  Returns False if this request id
+    is already known (the request is a repeat and must not be paid again)."""
+    with pays_lock:
+        if request_id in open_pays:
+            return False
+        open_pays[request_id] = {"payment_hash": payment_hash,
+                                 "started": time.time(), "result": None}
+    save_state()
+    return True
+
+
 def _send_pay_result(request_id, success, preimage=None):
-    send_to_bridge({
-        "method": "pay_result",
-        "request_id": request_id,
-        "success": bool(success),
-        "preimage": preimage if success else "00" * 32
-    })
+    """Record the final outcome of a payment and tell the bridge.
+
+    The result stays recorded, and is repeated by resend_pay_results(),
+    until the LSP acknowledges it: a result sent while the link is down, or
+    just before a restart, is not lost."""
+    result = {"success": bool(success),
+              "preimage": preimage if success else "00" * 32}
+    with pays_lock:
+        rec = open_pays.setdefault(
+            request_id, {"payment_hash": "", "started": time.time()})
+        rec["result"] = result
+    save_state()
+    send_to_bridge({"method": "pay_result", "request_id": request_id, **result})
+
+
+def resend_pay_results():
+    """Send every recorded result that has not been acknowledged yet."""
+    with pays_lock:
+        waiting = [(rid, dict(rec["result"]))
+                   for rid, rec in open_pays.items() if rec.get("result")]
+    for request_id, result in waiting:
+        send_to_bridge({"method": "pay_result", "request_id": request_id,
+                        **result})
+    return len(waiting)
+
+
+def _pay_acknowledged(request_id):
+    """The LSP has the result for this request: nothing left to remember."""
+    with pays_lock:
+        known = open_pays.pop(request_id, None) is not None
+    if known:
+        save_state()
+
+
+def result_retrier():
+    """Repeat unacknowledged results for as long as the plugin runs."""
+    while True:
+        time.sleep(RESULT_RETRY_INTERVAL)
+        try:
+            resend_pay_results()
+        except Exception as e:
+            log(f"resend_pay_results error: {e}")
+
+
+def _spawn(target, *args):
+    threading.Thread(target=target, args=args, daemon=True).start()
+
+
+def recover_open_pays():
+    """After a restart: pick the payments that were open back up.
+
+    One that already has its result only needs delivering.  One without
+    was in flight (or about to start) when the plugin stopped; CLN is asked
+    what became of it, and it is followed until CLN has settled it."""
+    restored = load_state()
+    with pays_lock:
+        unresolved = [(rid, rec["payment_hash"], rec.get("started", 0))
+                      for rid, rec in open_pays.items() if not rec.get("result")]
+    for request_id, payment_hash, started in unresolved:
+        if not _is_hash(payment_hash):
+            # It was refused before anything was sent; only the answer is
+            # missing.
+            _send_pay_result(request_id, False)
+            continue
+        log(f"Resuming outside payment request_id={request_id}")
+        _spawn(_follow_pay, request_id, payment_hash, started, False)
+    return restored
+
+
+def _hash_in_use(payment_hash, request_id):
+    """Why a new payment for payment_hash must not be started, or None.
+
+    CLN answers `pay` for an invoice it already paid with the old preimage
+    and pays nothing; the LSP would charge its client for that a second
+    time.  The same goes for a hash another request is still paying."""
+    with pays_lock:
+        for rid, rec in open_pays.items():
+            if rid != request_id and rec.get("payment_hash") == payment_hash \
+                    and not (rec.get("result") and
+                             not rec["result"].get("success")):
+                return f"request {rid} is already paying this hash"
+    try:
+        sent = cln_rpc("listsendpays", {"payment_hash": payment_hash},
+                       timeout=30).get("payments", [])
+    except Exception as e:
+        return f"cannot check earlier payments: {type(e).__name__}: {e}"
+    for p in sent if isinstance(sent, list) else []:
+        status = p.get("status") if isinstance(p, dict) else None
+        if status in ("complete", "pending"):
+            return f"the node already has a {status} payment for this hash"
+    return None
 
 
 def _pay_state(payment_hash):
@@ -663,6 +826,15 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
     attempt has failed, and the bridge hears nothing in the meantime."""
     log(f"Pay start: request_id={request_id}, bolt11_len={len(bolt11)}, "
         f"bolt11_prefix={bolt11[:20]}...")
+    if isinstance(request_id, bool) or not isinstance(request_id, int):
+        log("Pay request without a usable request id ignored")
+        return
+    if not _open_pay(request_id, payment_hash if _is_hash(payment_hash) else ""):
+        # A repeat of a request we already have: never pay twice.  If its
+        # result is known it is on its way again.
+        log(f"Pay request_id={request_id} is already known; not paying again")
+        resend_pay_results()
+        return
     try:
         decoded = cln_rpc("decode", {"string": bolt11}, timeout=30)
     except Exception as e:
@@ -671,13 +843,15 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
         return
     amount_msat, why = check_pay_request(decoded, payment_hash, max_total_msat,
                                          max_delay)
+    if not why:
+        why = _hash_in_use(payment_hash, request_id)
     if why:
         log(f"Pay refused for request_id={request_id}: {why}")
         _send_pay_result(request_id, False)
         return
 
     # From here on CLN may have HTLCs out for this hash.
-    started = time.monotonic()
+    started = time.time()
     pay_ended = False   # True once CLN itself said the pay command is over
     try:
         pay_result = cln_rpc(
@@ -709,7 +883,13 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
         log(f"Pay exception for request_id={request_id}: "
             f"{type(e).__name__}: {e}")
 
-    # Not complete.  Follow the payment until CLN has settled it either way.
+    _follow_pay(request_id, payment_hash, started, pay_ended)
+
+
+def _follow_pay(request_id, payment_hash, started, pay_ended):
+    """Follow a payment that is not known to be complete until CLN has
+    settled it either way, then report.  `started` is when it was requested
+    (unix time); `pay_ended` says CLN itself declared the pay command over."""
     polls = 0
     while True:
         state, preimage = _pay_state(payment_hash)
@@ -720,7 +900,7 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
         # "failed"/"none" only count once no new attempt can start: either
         # CLN ended the command, or its retry window is long past.
         no_new_attempts = pay_ended or \
-            time.monotonic() - started >= PAY_RETRY_FOR + PAY_SETTLE_GRACE
+            time.time() - started >= PAY_RETRY_FOR + PAY_SETTLE_GRACE
         if state in ("failed", "none") and no_new_attempts:
             log(f"Pay failed for request_id={request_id} (listpays: {state})")
             _send_pay_result(request_id, False)
@@ -939,7 +1119,7 @@ def read_requests():
 
 
 def main():
-    global BRIDGE_HOST, BRIDGE_PORT, BRIDGE_SECRET_FILE, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT, ROUTE_HINT
+    global BRIDGE_HOST, BRIDGE_PORT, BRIDGE_SECRET_FILE, BRIDGE_STATE_FILE, LIGHTNING_CLI, LIGHTNING_DIR, KEYSEND_DEFAULT_CLIENT, ROUTE_HINT
 
     # CLN plugin main loop: read JSON-RPC requests
     for request in read_requests():
@@ -969,6 +1149,12 @@ def main():
                             "type": "string",
                             "default": "~/.superscalar/bridge-plugin.secret",
                             "description": "File with the secret the SuperScalar bridge expects"
+                        },
+                        {
+                            "name": "superscalar-bridge-state-file",
+                            "type": "string",
+                            "default": "~/.superscalar/bridge-plugin.state.json",
+                            "description": "Where the plugin keeps outside payments that are not yet settled with the LSP"
                         },
                         {
                             "name": "superscalar-lightning-cli",
@@ -1009,6 +1195,8 @@ def main():
             BRIDGE_PORT = int(config.get("superscalar-bridge-port", BRIDGE_PORT))
             BRIDGE_SECRET_FILE = config.get("superscalar-bridge-secret-file",
                                             BRIDGE_SECRET_FILE)
+            BRIDGE_STATE_FILE = config.get("superscalar-bridge-state-file",
+                                           BRIDGE_STATE_FILE)
             LIGHTNING_CLI = config.get("superscalar-lightning-cli", LIGHTNING_CLI)
             KEYSEND_DEFAULT_CLIENT = int(config.get("superscalar-keysend-client",
                                                       KEYSEND_DEFAULT_CLIENT))
@@ -1039,6 +1227,12 @@ def main():
             # but CLN still has the invoices with "superscalar-" labels.
             # If this fails it is retried when the next HTLC arrives.
             recover_registered_invoices()
+
+            # Outside payments that were open when the plugin last stopped:
+            # deliver their results, or find out what became of them.
+            recover_open_pays()
+            resend_pay_results()
+            threading.Thread(target=result_retrier, daemon=True).start()
 
             log(f"Plugin initialized (bridge={'connected' if connected else 'disconnected'}, "
                 f"cli={LIGHTNING_CLI}, dir={LIGHTNING_DIR})")

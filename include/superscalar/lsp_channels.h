@@ -143,6 +143,7 @@ typedef struct {
        HTLC for the same hash. */
     #define BRIDGE_UPSTREAM_ID_MAX 64
     char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
+    int expiry_warned;          /* outbound: unresolved-near-expiry logged */
     int active;
 } htlc_origin_t;
 
@@ -540,6 +541,17 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr);
 
 /* Set bridge fd in channel manager. */
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
+
+/* How outside payments end (BRIDGE_PAY_RESULT):
+     - success with the preimage of the HTLC's hash: the client's HTLC is
+       fulfilled;
+     - failure: the client's HTLC is failed back.  The plugin reports
+       failure only when the node can no longer complete the payment;
+     - anything else, or no result: the HTLC stays held.  It is never failed
+       on a timer (see lsp_channels_check_bridge_htlc_timeouts), because a
+       payment that completed must not be refunded.
+   Each result that was applied, or that had nothing left to apply to, is
+   answered with BRIDGE_PAY_RESULT_ACK; the plugin repeats it until then. */
 
 /* Amount of the registered invoice for payment_hash32, in msat (0 = the
    invoice names no amount).  Returns 1 if the invoice is registered. */

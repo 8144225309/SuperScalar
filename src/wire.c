@@ -1824,6 +1824,19 @@ cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
     return j;
 }
 
+cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    return j;
+}
+
+int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id) {
+    cJSON *ri = cJSON_GetObjectItem(json, "request_id");
+    if (!wire_check_nonneg(ri)) return 0;
+    *request_id = (uint64_t)ri->valuedouble;
+    return 1;
+}
+
 cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
                                     const unsigned char *preimage32,
                                     uint64_t amount_msat, size_t dest_client) {

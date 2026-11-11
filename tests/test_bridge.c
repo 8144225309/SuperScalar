@@ -4775,3 +4775,140 @@ int test_bridge_replay_keeps_pending_id(void) {
     close(lsp_sv[0]); close(lsp_sv[1]);
     return 1;
 }
+
+/* ---- Outbound pay results are acknowledged; open pays outlive expiry ---- */
+
+/* The request id of the PAY_RESULT_ACK waiting on the bridge link, 0 if none */
+static uint64_t next_pay_ack(pay_fixture_t *f) {
+    wire_msg_t m;
+    uint64_t rid = 0;
+    if (!wire_recv_timeout(f->bridge_peer, &m, 1)) return 0;
+    if (m.msg_type != MSG_BRIDGE_PAY_RESULT_ACK ||
+        !wire_parse_bridge_pay_result_ack(m.json, &rid))
+        rid = 0;
+    cJSON_Delete(m.json);
+    return rid;
+}
+
+int test_lsp_pay_result_acknowledged(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    unsigned char wrong[32];
+    memset(wrong, 0x72, 32);
+
+    /* A result that settles nothing is not acknowledged: it has to come
+       again, corrected */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, wrong), "handled");
+    TEST_ASSERT_EQ(next_pay_ack(&f), 0, "wrong preimage: no ack");
+
+    /* The applied result is acknowledged */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(next_pay_ack(&f), 7, "applied result acknowledged");
+
+    /* A repeat (the first ack was lost) is acknowledged again and changes
+       nothing */
+    channel_t *ch = &f.mgr.entries[0].channel;
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(next_pay_ack(&f), 7, "repeat acknowledged");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "credited once");
+
+    /* So is a result for a payment this LSP has no record of */
+    TEST_ASSERT(deliver_pay_result(&f, 4242, 0, NULL), "handled");
+    TEST_ASSERT_EQ(next_pay_ack(&f), 4242, "unknown request acknowledged");
+
+    pay_fixture_free(&f);
+
+    /* A failure that was applied is acknowledged too */
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    TEST_ASSERT(deliver_pay_result(&f, 7, 0, NULL), "handled");
+    TEST_ASSERT_EQ(next_pay_ack(&f), 7, "applied failure acknowledged");
+    pay_fixture_free(&f);
+    return 1;
+}
+
+int test_lsp_outbound_pay_held_past_expiry(void) {
+    pay_fixture_t f;
+    TEST_ASSERT(pay_fixture_init(&f), "fixture");
+    channel_t *ch = &f.mgr.entries[0].channel;
+    htlc_origin_t *o = &f.mgr.htlc_origins[0];
+    wire_msg_t stray;
+
+    /* The client's HTLC expires at 500.  Well before, near, at and past
+       that height, with no result from the Lightning node, nothing is
+       failed and nobody is told anything. */
+    static const uint32_t heights[] = { 100, 459, 460, 499, 500, 501, 100000 };
+    for (size_t i = 0; i < sizeof(heights) / sizeof(heights[0]); i++) {
+        lsp_channels_check_bridge_htlc_timeouts(&f.mgr, f.lsp, heights[i]);
+        TEST_ASSERT(o->active, "origin stays open");
+        TEST_ASSERT_EQ(ch->n_htlcs, 1, "client HTLC still held");
+        TEST_ASSERT_EQ(ch->remote_amount, 96000, "client not refunded");
+        TEST_ASSERT_EQ(o->expiry_warned, heights[i] >= 460,
+                       "warned once the expiry is near");
+    }
+    TEST_ASSERT(!wire_recv_timeout(f.client_peer, &stray, 1), "client told nothing");
+    TEST_ASSERT(!wire_recv_timeout(f.bridge_peer, &stray, 1), "bridge told nothing");
+
+    /* The result still settles it when it finally arrives */
+    TEST_ASSERT(deliver_pay_result(&f, 7, 1, f.preimage), "handled");
+    TEST_ASSERT_EQ(ch->n_htlcs, 0, "HTLC fulfilled");
+    TEST_ASSERT_EQ(ch->local_amount, 104000, "LSP credited");
+    TEST_ASSERT_EQ(next_pay_ack(&f), 7, "acknowledged");
+
+    pay_fixture_free(&f);
+    return 1;
+}
+
+int test_bridge_forwards_pay_result_ack(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    bridge_t br;
+    bridge_init(&br);
+    br.plugin_fd = sv[1];
+
+    cJSON *ack = wire_build_bridge_pay_result_ack(31);
+    wire_msg_t msg;
+    msg.msg_type = MSG_BRIDGE_PAY_RESULT_ACK;
+    msg.json = ack;
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &msg), "ack handled");
+
+    char buf[256];
+    ssize_t n = read(sv[0], buf, sizeof(buf) - 1);
+    TEST_ASSERT(n > 0, "plugin told");
+    buf[n] = '\0';
+    cJSON *fwd = cJSON_Parse(buf);
+    TEST_ASSERT(fwd != NULL, "parse");
+    cJSON *m = cJSON_GetObjectItem(fwd, "method");
+    cJSON *rid = cJSON_GetObjectItem(fwd, "request_id");
+    TEST_ASSERT(m && cJSON_IsString(m) && strcmp(m->valuestring, "pay_result_ack") == 0,
+                "pay_result_ack");
+    TEST_ASSERT(rid && cJSON_IsNumber(rid) && (uint64_t)rid->valuedouble == 31,
+                "request id");
+    cJSON_Delete(fwd);
+
+    /* With the plugin away the ack is dropped, not an error: the plugin
+       will repeat its result */
+    br.plugin_fd = -1;
+    TEST_ASSERT(bridge_handle_lsp_msg(&br, &msg), "ack without plugin is not fatal");
+    cJSON_Delete(ack);
+
+    /* A pay result that claims success without a preimage goes nowhere */
+    int lsp_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+    br.lsp_fd = lsp_sv[1];
+    TEST_ASSERT(bridge_handle_plugin_msg(&br,
+        "{\"method\":\"pay_result\",\"request_id\":5,\"success\":true}"),
+        "handled");
+    TEST_ASSERT(bridge_handle_plugin_msg(&br,
+        "{\"method\":\"pay_result\",\"request_id\":5,\"success\":true,"
+        "\"preimage\":\"abcd\"}"), "handled");
+    wire_msg_t stray;
+    TEST_ASSERT(!wire_recv_timeout(lsp_sv[0], &stray, 1), "not forwarded to the LSP");
+    TEST_ASSERT(bridge_handle_plugin_msg(&br,
+        "{\"method\":\"pay_result\",\"request_id\":5,\"success\":false}"), "handled");
+    TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &stray, 5), "a failure is forwarded");
+    TEST_ASSERT_EQ(stray.msg_type, MSG_BRIDGE_PAY_RESULT, "PAY_RESULT");
+    cJSON_Delete(stray.json);
+
+    close(sv[0]); close(sv[1]); close(lsp_sv[0]); close(lsp_sv[1]);
+    return 1;
+}

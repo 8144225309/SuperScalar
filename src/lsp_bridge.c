@@ -816,7 +816,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             size_t client_idx = mgr->htlc_origins[i].sender_idx;
             uint64_t htlc_id_val = mgr->htlc_origins[i].sender_htlc_id;
 
-            if (client_idx >= mgr->n_channels) break;
+            if (client_idx >= mgr->n_channels) return 1;
             channel_t *ch = &mgr->entries[client_idx].channel;
 
             /* A success is only a success with the preimage of the hash the
@@ -983,6 +983,15 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
             break;
         }
+
+        /* The result has been applied, or there is no open payment with
+           this id left to apply it to.  Either way it need not be sent
+           again.  (A result that was ignored above is not acknowledged.) */
+        if (mgr->bridge_fd >= 0) {
+            cJSON *ack = wire_build_bridge_pay_result_ack(request_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_PAY_RESULT_ACK, ack);
+            cJSON_Delete(ack);
+        }
         return 1;
     }
 
@@ -1030,8 +1039,29 @@ void lsp_channels_check_bridge_htlc_timeouts(lsp_channel_mgr_t *mgr,
     for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
         htlc_origin_t *origin = &mgr->htlc_origins[i];
         if (!origin->active) continue;
-        if (origin->bridge_htlc_id == 0) continue;
         if (origin->cltv_expiry == 0) continue;
+
+        /* Outbound: the client's HTLC pays for an outside payment whose
+           outcome only the Lightning node knows.  It is settled by that
+           node's result and by nothing else: failing it here on a timer
+           would refund a client whose payment may have gone through.  The
+           route was limited so that the outside payment is decided before
+           this point, and the plugin repeats the result until it is
+           acknowledged, so an origin still open here means the node or the
+           bridge is unreachable.  Say so once and keep holding. */
+        if (origin->bridge_htlc_id == 0) {
+            if (origin->request_id != 0 && !origin->expiry_warned &&
+                current_height + FACTORY_CLTV_DELTA_DEFAULT >= origin->cltv_expiry) {
+                fprintf(stderr, "LSP: WARNING — outside payment %llu still "
+                        "unresolved at height %u, client HTLC expires at %u; "
+                        "holding it until the Lightning node reports the "
+                        "outcome\n",
+                        (unsigned long long)origin->request_id,
+                        current_height, origin->cltv_expiry);
+                origin->expiry_warned = 1;
+            }
+            continue;
+        }
 
         /* Fail back if current height is within FACTORY_CLTV_DELTA_DEFAULT of expiry */
         if (current_height + FACTORY_CLTV_DELTA_DEFAULT >= origin->cltv_expiry) {
