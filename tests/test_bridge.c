@@ -3806,16 +3806,33 @@ static int read_line(int fd, char *buf, size_t cap) {
     return 0;
 }
 
-/* One message from the bridge, as the plugin receives it */
+/* The plugin's end of the session set up by the last plugin_handshake */
+static unsigned char t_session_key[32];
+static uint64_t t_session_rx, t_session_tx;
+
+/* One message from the bridge, as the plugin receives it: the line must
+   carry the MAC for the next counter value; it is stripped. */
 static int plugin_read_msg(bridge_t *br, int fd, char *buf, size_t cap) {
     (void)br;
-    return read_line(fd, buf, cap);
+    char raw[2048], mac[65];
+    if (!read_line(fd, raw, sizeof(raw))) return 0;
+    if (strlen(raw) < 66 || raw[64] != ' ') return 0;
+    bridge_plugin_line_mac(t_session_key, "b2p", t_session_rx, raw + 65, mac);
+    if (memcmp(raw, mac, 64) != 0) return 0;
+    t_session_rx++;
+    size_t n = strlen(raw + 65);
+    if (n >= cap) return 0;
+    memcpy(buf, raw + 65, n + 1);
+    return 1;
 }
 
 /* One message to the bridge, as the plugin sends it */
 static int plugin_send_msg(bridge_t *br, int fd, const char *json) {
     (void)br;
-    return send_str(fd, json) && send_str(fd, "\n");
+    char mac[65];
+    bridge_plugin_line_mac(t_session_key, "p2b", t_session_tx++, json, mac);
+    return send_str(fd, mac) && send_str(fd, " ") && send_str(fd, json) &&
+           send_str(fd, "\n");
 }
 
 static void hex_of(const unsigned char *in, size_t len, char *out) {
@@ -3857,6 +3874,10 @@ static int plugin_handshake(bridge_t *br, int fd, const char *secret,
     snprintf(line, sizeof(line), "{\"method\":\"auth_response\",\"proof\":\"%s\"}\n", hex);
     if (!send_str(fd, line)) return -15;
     if (!wait_readable(br->plugin_pending_fd)) return -16;
+    /* the session both ends now share (if this side used the right secret) */
+    bridge_plugin_session_key(secret, np, bridge_nonce_out, t_session_key);
+    t_session_rx = 0;
+    t_session_tx = 0;
     return bridge_service_pending_plugin(br);
 }
 
@@ -4019,14 +4040,14 @@ int test_bridge_plugin_auth(void) {
     TEST_ASSERT(bridge_ok, "the bridge proved itself first");
     TEST_ASSERT(br.plugin_fd >= 0, "now the plugin");
     TEST_ASSERT_EQ(br.plugin_pending_fd, -1, "no longer pending");
-    TEST_ASSERT(read_line(plugin, line, sizeof(line)), "auth reply");
+    TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)), "authentic reply");
     TEST_ASSERT(strstr(line, "\"auth_ok\"") != NULL, "auth_ok sent");
 
     /* The secret itself was never needed on the wire, and a message sent
        now is ordinary plugin traffic. */
-    TEST_ASSERT(send_str(plugin, "{\"method\":\"invoice_bolt11\",\"payment_hash\":"
+    TEST_ASSERT(plugin_send_msg(&br, plugin, "{\"method\":\"invoice_bolt11\",\"payment_hash\":"
         "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
-        "\"bolt11\":\"lnbcrt1ptest\"}\n"), "send plugin message");
+        "\"bolt11\":\"lnbcrt1ptest\"}"), "send plugin message");
     TEST_ASSERT(wait_readable(br.plugin_fd), "plugin data");
     char *next = bridge_read_plugin_line(&br);
     TEST_ASSERT(next != NULL, "message available");
@@ -5584,5 +5605,203 @@ int test_bridge_reports_lsp_key(void) {
     close(plugin);
     bridge_cleanup(&br);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- After the handshake every line is authenticated ---- */
+
+static int authenticated_plugin(bridge_t *br) {
+    unsigned char nb[32];
+    int fd = connect_plugin_port(br);
+    if (fd < 0) return -1;
+    if (plugin_handshake(br, fd, TEST_PLUGIN_SECRET, BRIDGE_AUTH_ROLE_PLUGIN,
+                         nb, NULL) != 1) { close(fd); return -1; }
+    char line[512];
+    if (!plugin_read_msg(br, fd, line, sizeof(line)) || !strstr(line, "\"auth_ok\"")) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int test_bridge_plugin_line_auth(void) {
+    static const char INVOICE_MSG[] =
+        "{\"method\":\"invoice_bolt11\",\"payment_hash\":"
+        "\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\","
+        "\"bolt11\":\"lnbcrt1ptest\"}";
+    bridge_t br;
+    bridge_init(&br);
+    int lsp_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, lsp_sv) == 0, "socketpair");
+    br.lsp_fd = lsp_sv[1];
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
+    wire_msg_t fwd;
+    char mac[65], line[1024];
+
+    /* Fixed values the plugin's implementation is tested against too */
+    {
+        unsigned char a[32], b[32], key[32];
+        char hex[65];
+        memset(a, 1, 32); memset(b, 2, 32);
+        TEST_ASSERT(bridge_plugin_session_key(TEST_PLUGIN_SECRET, a, b, key), "key");
+        hex_of(key, 32, hex);
+        TEST_ASSERT(strcmp(hex, "b82c8f11332731da93b2a74578dcd74f"
+                                "3ad5c53f993fa73c6035fbffb026f7bd") == 0, "session key");
+        bridge_plugin_line_mac(key, "p2b", 5, "{\"method\":\"x\"}", mac);
+        TEST_ASSERT(strcmp(mac, "156441f14fd282e5f8452c617350d874"
+                                "d86aa147c30ae1db48f05c1ad3d9778f") == 0, "plugin line MAC");
+        bridge_plugin_line_mac(key, "b2p", 5, "{\"method\":\"x\"}", mac);
+        TEST_ASSERT(strcmp(mac, "a79dbb5cfe974d96c51faa83d5f96604"
+                                "18cc3aaa2aafa87337c5d71587a7ded9") == 0, "bridge line MAC");
+        bridge_plugin_line_mac(key, "p2b", 6, "{\"method\":\"x\"}", mac);
+        TEST_ASSERT(strcmp(mac, "1788b7bfdb453e6a307a0824b5aa678b"
+                                "4448fe3c7a6a7f89e09986b08c358ff8") == 0, "counter matters");
+        TEST_ASSERT(!bridge_plugin_session_key("abc", a, b, key), "bad secret");
+    }
+
+    /* Authentic lines are handled, in order */
+    int plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin authenticated");
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(plugin_send_msg(&br, plugin, INVOICE_MSG), "send");
+        TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+        TEST_ASSERT_EQ(bridge_service_plugin(&br), 1, "authentic line handled");
+        TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &fwd, 5), "forwarded to LSP");
+        cJSON_Delete(fwd.json);
+    }
+    TEST_ASSERT_EQ(br.plugin_rx_seq, 3, "three lines counted");
+
+    /* What the bridge sends carries its own MACs, counted separately */
+    {
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "method", "htlc_resolve");
+        TEST_ASSERT(bridge_send_plugin_json(&br, j), "send");
+        TEST_ASSERT(bridge_send_plugin_json(&br, j), "send");
+        cJSON_Delete(j);
+        TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)), "authentic");
+        TEST_ASSERT(plugin_read_msg(&br, plugin, line, sizeof(line)), "authentic");
+        TEST_ASSERT_EQ(br.plugin_tx_seq, 3, "auth_ok and two messages");
+    }
+
+    /* A line without a MAC, as something that only passed the handshake
+       along would have to send it, ends the connection and goes nowhere */
+    TEST_ASSERT(send_str(plugin, INVOICE_MSG) && send_str(plugin, "\n"), "send bare");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "bare line: connection dropped");
+    TEST_ASSERT_EQ(br.plugin_fd, -1, "plugin gone");
+    TEST_ASSERT(!br.plugin_session, "session ended");
+    TEST_ASSERT(!wire_recv_timeout(lsp_sv[0], &fwd, 1), "nothing forwarded");
+    close(plugin);
+
+    /* A line with somebody else's MAC */
+    plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin authenticated");
+    {
+        unsigned char other[32];
+        memset(other, 0x99, 32);
+        bridge_plugin_line_mac(other, "p2b", 0, INVOICE_MSG, mac);
+        snprintf(line, sizeof(line), "%s %s\n", mac, INVOICE_MSG);
+        TEST_ASSERT(send_str(plugin, line), "send forged");
+        TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+        TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "forged line: dropped");
+    }
+    close(plugin);
+
+    /* A changed line under a genuine MAC */
+    plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin authenticated");
+    bridge_plugin_line_mac(t_session_key, "p2b", 0, INVOICE_MSG, mac);
+    snprintf(line, sizeof(line), "%s %s\n", mac, INVOICE_MSG);
+    *strstr(line, "lnbcrt1ptest") = 'L';
+    TEST_ASSERT(send_str(plugin, line), "send altered");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "altered line: dropped");
+    close(plugin);
+
+    /* A genuine line sent twice (replay), and one sent out of turn */
+    plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin authenticated");
+    bridge_plugin_line_mac(t_session_key, "p2b", 0, INVOICE_MSG, mac);
+    snprintf(line, sizeof(line), "%s %s\n", mac, INVOICE_MSG);
+    TEST_ASSERT(send_str(plugin, line), "send");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 1, "first time: handled");
+    TEST_ASSERT(wire_recv_timeout(lsp_sv[0], &fwd, 5), "forwarded");
+    cJSON_Delete(fwd.json);
+    TEST_ASSERT(send_str(plugin, line), "send again");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "replayed line: dropped");
+    TEST_ASSERT(!wire_recv_timeout(lsp_sv[0], &fwd, 1), "not forwarded twice");
+    close(plugin);
+
+    plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin authenticated");
+    bridge_plugin_line_mac(t_session_key, "p2b", 1, INVOICE_MSG, mac);   /* skips 0 */
+    snprintf(line, sizeof(line), "%s %s\n", mac, INVOICE_MSG);
+    TEST_ASSERT(send_str(plugin, line), "send");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "line out of turn: dropped");
+    close(plugin);
+
+    /* A line the bridge sent cannot be sent back to it */
+    plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin authenticated");
+    bridge_plugin_line_mac(t_session_key, "b2p", 0, INVOICE_MSG, mac);
+    snprintf(line, sizeof(line), "%s %s\n", mac, INVOICE_MSG);
+    TEST_ASSERT(send_str(plugin, line), "send");
+    TEST_ASSERT(wait_readable(br.plugin_fd), "data");
+    TEST_ASSERT_EQ(bridge_service_plugin(&br), 0, "reflected line: dropped");
+    close(plugin);
+
+    close(lsp_sv[0]);
+    bridge_cleanup(&br);
+    return 1;
+}
+
+/* ---- A silent connection cannot keep the plugin out ---- */
+
+int test_bridge_plugin_silent_connection_replaced(void) {
+    bridge_t br;
+    bridge_init(&br);
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
+    TEST_ASSERT(BRIDGE_PLUGIN_AUTH_TIMEOUT <= 5, "short handshake deadline");
+
+    /* Something connects and says nothing */
+    int squatter = connect_plugin_port(&br);
+    TEST_ASSERT(squatter >= 0, "connect");
+    TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
+    TEST_ASSERT(bridge_accept_plugin(&br), "accepted as pending");
+    int squatter_fd = br.plugin_pending_fd;
+
+    /* The plugin arrives: it takes the pending slot and authenticates */
+    int plugin = authenticated_plugin(&br);
+    TEST_ASSERT(plugin >= 0, "plugin got in past the silent connection");
+    TEST_ASSERT(br.plugin_fd >= 0 && br.plugin_fd != squatter_fd, "plugin is the plugin");
+    TEST_ASSERT(peer_closed(squatter), "silent connection closed");
+    close(squatter);
+    close(plugin);
+    bridge_cleanup(&br);
+
+    /* A connection in the middle of the handshake is not displaced */
+    bridge_init(&br);
+    TEST_ASSERT(bridge_set_plugin_secret(&br, TEST_PLUGIN_SECRET), "set secret");
+    TEST_ASSERT(bridge_listen_plugin(&br, NULL, 0), "listen");
+    int first = connect_plugin_port(&br);
+    TEST_ASSERT(first >= 0, "connect");
+    TEST_ASSERT_EQ(offer_first_line(&br, first,
+        "{\"method\":\"auth_hello\",\"nonce\":"
+        "\"0101010101010101010101010101010101010101010101010101010101010101\"}\n"),
+        0, "challenge sent");
+    int pending_fd = br.plugin_pending_fd;
+    int second = connect_plugin_port(&br);
+    TEST_ASSERT(second >= 0, "connect");
+    TEST_ASSERT(wait_readable(br.plugin_listen_fd), "incoming");
+    TEST_ASSERT(!bridge_accept_plugin(&br), "newcomer refused");
+    TEST_ASSERT_EQ(br.plugin_pending_fd, pending_fd, "handshake in progress kept");
+    TEST_ASSERT(peer_closed(second), "newcomer closed");
+    close(first); close(second);
+    bridge_cleanup(&br);
     return 1;
 }

@@ -24,14 +24,27 @@
      bridge -> plugin  {"method":"auth_ok"}
 
    The plugin checks the bridge's proof before it answers, and the bridge
-   treats the connection as the plugin only after the plugin's proof. */
+   treats the connection as the plugin only after the plugin's proof.
+
+   The handshake alone would not stop a process that sits between the two
+   and passes it along.  So both sides derive a session key,
+   HMAC-SHA256(secret, session label || plugin nonce || bridge nonce), and
+   every line after the handshake, auth_ok included, is sent as
+
+     <mac> <json>
+
+   where mac = HMAC-SHA256(session key, direction || counter || json) in
+   hex, direction is "b2p" or "p2b" and counter is the 64-bit big-endian
+   number of lines sent so far in that direction.  A line whose MAC does
+   not verify (altered, injected, replayed, reordered or dropped before
+   it) ends the connection. */
 #define BRIDGE_PLUGIN_SECRET_HEX_LEN 64
 #define BRIDGE_AUTH_NONCE_LEN        32
 #define BRIDGE_AUTH_ROLE_BRIDGE      "bridge"
 #define BRIDGE_AUTH_ROLE_PLUGIN      "plugin"
 #define BRIDGE_PLUGIN_BIND_DEFAULT   "127.0.0.1"
 /* Seconds a new connection has to present the secret. */
-#define BRIDGE_PLUGIN_AUTH_TIMEOUT   10
+#define BRIDGE_PLUGIN_AUTH_TIMEOUT   3
 
 /* Pending inbound HTLC (from CLN plugin, waiting for LSP resolution) */
 typedef struct {
@@ -54,6 +67,11 @@ typedef struct {
     char plugin_pending_buf[512];        /* its current line, as it arrives */
     size_t plugin_pending_len;
     int plugin_pending_challenged;       /* 1 once our challenge is out */
+    /* Set once the plugin has authenticated: lines carry a MAC from then on */
+    int plugin_session;
+    unsigned char plugin_session_key[32];
+    uint64_t plugin_tx_seq;              /* lines sent to the plugin */
+    uint64_t plugin_rx_seq;              /* lines received from it */
     unsigned char plugin_nonce_peer[BRIDGE_AUTH_NONCE_LEN];
     unsigned char plugin_nonce_own[BRIDGE_AUTH_NONCE_LEN];
     char plugin_secret[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
@@ -113,6 +131,19 @@ void bridge_set_pubkey(bridge_t *br, const secp256k1_pubkey *pk);
    Returns 1 on success. */
 int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port);
 
+/* The session key for the lines that follow a handshake.
+   Returns 0 if secret_hex is not a 64-hex secret. */
+int bridge_plugin_session_key(const char *secret_hex,
+                               const unsigned char *plugin_nonce,
+                               const unsigned char *bridge_nonce,
+                               unsigned char key_out[32]);
+
+/* The MAC of one line: direction is "b2p" or "p2b", seq the number of
+   lines sent before it in that direction.  mac_hex_out gets 64 hex
+   characters and a terminator. */
+void bridge_plugin_line_mac(const unsigned char key[32], const char *direction,
+                             uint64_t seq, const char *line, char mac_hex_out[65]);
+
 /* Read the plugin shared secret from `path`, creating the file with a fresh
    random secret (mode 0600) if it does not exist.  An existing file must be
    a regular file owned by this user, not accessible by group or others, and
@@ -131,8 +162,10 @@ int bridge_set_plugin_secret(bridge_t *br, const char *secret_hex);
 int bridge_listen_plugin(bridge_t *br, const char *bind_addr, int plugin_port);
 
 /* Accept a connection on the plugin port (blocking).  The connection is
-   held as pending until it authenticates; it is closed immediately if a
-   plugin is already connected or another connection is pending.
+   held as pending until it authenticates.  It is closed immediately if a
+   plugin is already connected, or if another connection is in the middle
+   of the handshake; a pending connection that has not sent its opening
+   line yet is replaced, so a silent connection cannot keep the plugin out.
    Returns 1 if a connection is now pending, 0 otherwise. */
 int bridge_accept_plugin(bridge_t *br);
 

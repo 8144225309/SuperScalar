@@ -22,7 +22,10 @@ The bridge and this plugin share a secret, which the bridge writes to a file
 (mode 0600) when it first starts.  The secret never crosses the link: each
 side sends a random nonce and proves knowledge of the secret with an HMAC
 over both nonces.  The plugin checks the bridge's proof first and takes no
-message from a peer that has not given it.
+message from a peer that has not given it.  Every line after that carries a
+MAC under a session key derived from the secret and both nonces, with a
+per-direction counter, so nothing between the two can add, change, replay
+or drop a message unnoticed.
 
 Usage:
   lightningd --plugin=/path/to/cln_plugin.py \
@@ -38,6 +41,7 @@ import json
 import os
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -56,6 +60,9 @@ LIGHTNING_DIR = None   # set from CLN init, passed to lightning-cli
 KEYSEND_DEFAULT_CLIENT = 0  # default dest_client for keysend (overridable via plugin option)
 ROUTE_HINT = None  # "node_id/scid/fee_base/fee_ppm/cltv_delta" for factory channels
 bridge_sock = None
+# Session of the current bridge connection, set with bridge_sock:
+# {"key": bytes, "tx": lines sent, "rx": lines received}
+bridge_session = None
 # Keyed by payment_hash (hex string) — immune to htlc_id counter desync
 # payment_hash -> {"rpc_id": hook request to answer,
 #                  "factory_invoice": True if CLN holds this hash's invoice,
@@ -230,17 +237,51 @@ def send_to_cln(response):
         sys.stdout.flush()
 
 
+def session_key(secret, plugin_nonce, bridge_nonce):
+    """The key both ends derive for the lines after the handshake."""
+    return hmac.new(bytes.fromhex(secret),
+                    b"superscalar-bridge-plugin-session-v1/" +
+                    plugin_nonce + bridge_nonce, hashlib.sha256).digest()
+
+
+def line_mac(key, direction, seq, line):
+    """MAC of one line (bytes): direction is b"p2b" or b"b2p", seq the number
+    of lines sent before it in that direction."""
+    return hmac.new(key, direction + struct.pack(">Q", seq) + line,
+                    hashlib.sha256).hexdigest()
+
+
+def seal_line(session, msg):
+    """One message as it goes to the bridge: "<mac> <json>\\n"."""
+    line = json.dumps(msg).encode()
+    mac = line_mac(session["key"], b"p2b", session["tx"], line)
+    session["tx"] += 1
+    return mac.encode() + b" " + line + b"\n"
+
+
+def open_line(session, raw):
+    """Check one line from the bridge (bytes, without the newline) and
+    return its message.  Raises ValueError if it does not carry the MAC for
+    the next counter value: it was altered, injected, replayed, or
+    something before it is missing."""
+    mac, sep, line = raw.partition(b" ")
+    expected = line_mac(session["key"], b"b2p", session["rx"], line)
+    if not sep or not hmac.compare_digest(expected.encode(), mac.lower()):
+        raise ValueError("bridge line failed authentication")
+    session["rx"] += 1
+    return json.loads(line)
+
+
 def send_to_bridge(msg):
-    """Send newline-delimited JSON to bridge (thread-safe)."""
-    global bridge_sock
+    """Send one authenticated message to the bridge (thread-safe)."""
     with lock:
         sock = bridge_sock
-    if sock is None:
+        session = bridge_session
+    if sock is None or session is None:
         return False
     try:
-        data = json.dumps(msg) + "\n"
         with send_lock:
-            sock.sendall(data.encode())
+            sock.sendall(seal_line(session, msg))
         return True
     except Exception as e:
         log(f"send_to_bridge error: {e}")
@@ -290,12 +331,21 @@ def auth_proof(secret, role, plugin_nonce, bridge_nonce):
                     hashlib.sha256).hexdigest()
 
 
-def _recv_line(sock, limit=1024):
+def _recv_line(sock, deadline, limit=1024):
     """Read one newline-terminated line, a byte at a time so nothing past
-    it is consumed.  Returns None if the peer closes or sends too much."""
+    it is consumed.  `deadline` (time.monotonic()) bounds the whole line,
+    however slowly the bytes come.  Returns None if the peer closes, sends
+    too much or runs out of time."""
     line = b""
     while len(line) < limit:
-        c = sock.recv(1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(remaining)
+        try:
+            c = sock.recv(1)
+        except socket.timeout:
+            return None
         if not c:
             return None
         if c == b"\n":
@@ -305,14 +355,18 @@ def _recv_line(sock, limit=1024):
 
 
 def authenticate_bridge(sock, secret):
-    """Run the handshake on a fresh connection.  Returns True only if the
-    peer proved it holds the secret; our own proof is sent after that and
-    the secret itself is never sent."""
+    """Run the handshake on a fresh connection.
+
+    Returns the session for the connection if the peer proved that it
+    holds the secret, else None.  Our own proof is sent only after the
+    peer's checked out, the secret itself is never sent, and the whole
+    exchange has AUTH_TIMEOUT seconds."""
+    deadline = time.monotonic() + AUTH_TIMEOUT
     plugin_nonce = os.urandom(32)
     sock.sendall((json.dumps({"method": "auth_hello",
                               "nonce": plugin_nonce.hex()}) + "\n").encode())
     try:
-        challenge = json.loads(_recv_line(sock) or b"null")
+        challenge = json.loads(_recv_line(sock, deadline) or b"null")
     except ValueError:
         challenge = None
     if not isinstance(challenge, dict) \
@@ -320,25 +374,33 @@ def authenticate_bridge(sock, secret):
             or not _is_hash(challenge.get("nonce")) \
             or not _is_hash(challenge.get("proof")):
         log("Bridge did not answer the handshake")
-        return False
+        return None
     bridge_nonce = bytes.fromhex(challenge["nonce"])
     expected = auth_proof(secret, b"bridge", plugin_nonce, bridge_nonce)
     if not hmac.compare_digest(expected, challenge["proof"].lower()):
         log("Peer on the bridge port does not hold the bridge secret")
-        return False
+        return None
 
     sock.sendall((json.dumps({
         "method": "auth_response",
         "proof": auth_proof(secret, b"plugin", plugin_nonce, bridge_nonce)
     }) + "\n").encode())
+
+    # The answer is the first line of the session: it has to carry the MAC
+    # only the holder of the secret can make for these nonces.  A peer that
+    # merely passed the handshake along cannot.
+    session = {"key": session_key(secret, plugin_nonce, bridge_nonce),
+               "tx": 0, "rx": 0}
     try:
-        accepted = json.loads(_recv_line(sock) or b"null")
+        accepted = open_line(session, _recv_line(sock, deadline) or b"")
     except ValueError:
         accepted = None
     if not isinstance(accepted, dict) or accepted.get("method") != "auth_ok":
         log("Bridge did not accept our proof")
-        return False
-    return check_lsp_identity(accepted.get("lsp_pubkey", ""))
+        return None
+    if not check_lsp_identity(accepted.get("lsp_pubkey", "")):
+        return None
+    return session
 
 
 # BOLT #4 failure codes for the htlc_accepted hook (hex, no data)
@@ -473,7 +535,7 @@ def connect_bridge():
     started, and the file created, after this plugin).  The connection only
     becomes the bridge link, from which messages are read and acted on,
     once the peer has proven that it holds the secret."""
-    global bridge_sock
+    global bridge_sock, bridge_session
     secret = read_bridge_secret()
     if secret is None:
         return False
@@ -481,12 +543,14 @@ def connect_bridge():
     try:
         sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT),
                                         timeout=AUTH_TIMEOUT)
-        if not authenticate_bridge(sock, secret):
+        session = authenticate_bridge(sock, secret)
+        if session is None:
             sock.close()
             return False
         sock.settimeout(None)
         with lock:
             bridge_sock = sock
+            bridge_session = session
         log(f"Connected to bridge at {BRIDGE_HOST}:{BRIDGE_PORT}")
         return True
     except Exception as e:
@@ -502,14 +566,16 @@ def connect_bridge():
 def bridge_reader():
     """Read responses from bridge and resolve pending HTLCs/pays.
     Reconnects automatically on disconnect."""
-    global bridge_sock
+    global bridge_sock, bridge_session
     while True:
         buf = b""
+        sock = None
         while True:
             try:
                 with lock:
                     sock = bridge_sock
-                if sock is None:
+                    session = bridge_session
+                if sock is None or session is None:
                     break
                 data = sock.recv(4096)
                 if not data:
@@ -518,8 +584,8 @@ def bridge_reader():
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    msg = json.loads(line)
-                    handle_bridge_msg(msg)
+                    # A line that is not authentic ends the connection
+                    handle_bridge_msg(open_line(session, line))
             except Exception as e:
                 log(f"bridge_reader error: {e}")
                 break
@@ -527,6 +593,12 @@ def bridge_reader():
         # Connection lost — attempt reconnect
         with lock:
             bridge_sock = None
+            bridge_session = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
         log("Bridge disconnected, will retry in 5s...")
         time.sleep(5)
         while not connect_bridge():

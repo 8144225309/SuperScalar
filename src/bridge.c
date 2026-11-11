@@ -127,6 +127,49 @@ int bridge_connect_lsp(bridge_t *br, const char *lsp_host, int lsp_port) {
     return 1;
 }
 
+/* --- Plugin link session --- */
+
+int bridge_plugin_session_key(const char *secret_hex,
+                               const unsigned char *plugin_nonce,
+                               const unsigned char *bridge_nonce,
+                               unsigned char key_out[32]) {
+    static const char label[] = "superscalar-bridge-plugin-session-v1/";
+    unsigned char key[BRIDGE_PLUGIN_SECRET_HEX_LEN / 2];
+    unsigned char msg[sizeof(label) + 2 * BRIDGE_AUTH_NONCE_LEN];
+    if (!secret_hex || strlen(secret_hex) != BRIDGE_PLUGIN_SECRET_HEX_LEN ||
+        hex_decode(secret_hex, key, sizeof(key)) != (int)sizeof(key))
+        return 0;
+    size_t n = sizeof(label) - 1;
+    memcpy(msg, label, n);
+    memcpy(msg + n, plugin_nonce, BRIDGE_AUTH_NONCE_LEN); n += BRIDGE_AUTH_NONCE_LEN;
+    memcpy(msg + n, bridge_nonce, BRIDGE_AUTH_NONCE_LEN); n += BRIDGE_AUTH_NONCE_LEN;
+    hmac_sha256(key_out, key, sizeof(key), msg, n);
+    memset(key, 0, sizeof(key));
+    return 1;
+}
+
+void bridge_plugin_line_mac(const unsigned char key[32], const char *direction,
+                             uint64_t seq, const char *line, char mac_hex_out[65]) {
+    static const char digits[] = "0123456789abcdef";
+    size_t line_len = strlen(line);
+    unsigned char *msg = (unsigned char *)malloc(3 + 8 + line_len + 1);
+    unsigned char mac[32];
+    memset(mac, 0, sizeof(mac));
+    if (msg) {
+        memcpy(msg, direction, 3);
+        for (int i = 0; i < 8; i++)
+            msg[3 + i] = (unsigned char)(seq >> (56 - 8 * i));
+        memcpy(msg + 11, line, line_len);
+        hmac_sha256(mac, key, 32, msg, 11 + line_len);
+        free(msg);
+    }
+    for (size_t i = 0; i < 32; i++) {
+        mac_hex_out[2 * i]     = digits[mac[i] >> 4];
+        mac_hex_out[2 * i + 1] = digits[mac[i] & 0x0f];
+    }
+    mac_hex_out[64] = '\0';
+}
+
 /* --- Plugin shared secret --- */
 
 static int is_secret_hex(const char *s) {
@@ -326,12 +369,18 @@ int bridge_accept_plugin(bridge_t *br) {
         fprintf(stderr, "Bridge: failed to accept plugin\n");
         return 0;
     }
-    /* One plugin at a time: a newcomer never displaces or joins it. */
-    if (br->plugin_fd >= 0 || br->plugin_pending_fd >= 0) {
+    /* One plugin at a time: a newcomer never displaces or joins it, nor a
+       connection that is in the middle of proving itself. */
+    if (br->plugin_fd >= 0 ||
+        (br->plugin_pending_fd >= 0 && br->plugin_pending_challenged)) {
         fprintf(stderr, "Bridge: rejected extra connection on plugin port\n");
         wire_close(fd);
         return 0;
     }
+    /* A connection that has said nothing yet gives way: holding the port
+       open in silence must not keep the real plugin out. */
+    if (br->plugin_pending_fd >= 0)
+        drop_pending_plugin(br);
     br->plugin_pending_fd = fd;
     br->plugin_pending_since = time(NULL);
     br->plugin_pending_len = 0;
@@ -466,6 +515,13 @@ int bridge_service_pending_plugin(bridge_t *br) {
         br->plugin_read_pos = 0;
         br->plugin_fd = br->plugin_pending_fd;
         br->plugin_pending_fd = -1;
+        /* From here on every line in either direction is authenticated
+           under a key only the two holders of the secret can derive. */
+        bridge_plugin_session_key(br->plugin_secret, br->plugin_nonce_peer,
+                                   br->plugin_nonce_own, br->plugin_session_key);
+        br->plugin_session = 1;
+        br->plugin_tx_seq = 0;
+        br->plugin_rx_seq = 0;
         drop_pending_plugin(br);
         printf("Bridge: plugin connected and authenticated\n");
 
@@ -554,11 +610,23 @@ static void plugin_drop_connection(bridge_t *br) {
     br->plugin_fd = -1;
     br->plugin_read_len = 0;
     br->plugin_read_pos = 0;
+    br->plugin_session = 0;
+    memset(br->plugin_session_key, 0, sizeof(br->plugin_session_key));
 }
 
-/* Write one message line to the connected plugin. */
+/* Write one message line to the connected plugin, with its MAC once the
+   plugin has authenticated. */
 static int plugin_write_line(bridge_t *br, const char *str) {
     if (br->plugin_fd < 0) return 0;
+    if (br->plugin_session) {
+        char mac[65];
+        bridge_plugin_line_mac(br->plugin_session_key, "b2p", br->plugin_tx_seq,
+                                str, mac);
+        if (!write_all(br->plugin_fd, mac, 64) ||
+            !write_all(br->plugin_fd, " ", 1))
+            return 0;
+        br->plugin_tx_seq++;
+    }
     return write_all(br->plugin_fd, str, strlen(str)) &&
            write_all(br->plugin_fd, "\n", 1);
 }
@@ -634,8 +702,37 @@ int bridge_service_plugin(bridge_t *br) {
     return 1;
 }
 
-/* Read one newline-delimited line from plugin_fd (buffered) */
+static char *read_plugin_raw_line(bridge_t *br);
+
+/* Read one message line from the plugin.  Once it has authenticated the
+   line must carry the MAC for the next counter value; the MAC is checked
+   in constant time and stripped.  NULL if the connection is lost or the
+   line is not authentic (the caller drops the connection). */
 char *bridge_read_plugin_line(bridge_t *br) {
+    char *line = read_plugin_raw_line(br);
+    if (!line || !br->plugin_session) return line;
+
+    char expect[65];
+    size_t len = strlen(line);
+    int ok = len > 65 && line[64] == ' ';
+    if (ok) {
+        bridge_plugin_line_mac(br->plugin_session_key, "p2b", br->plugin_rx_seq,
+                                line + 65, expect);
+        ok = ct_equal((const unsigned char *)line,
+                      (const unsigned char *)expect, 64);
+    }
+    if (!ok) {
+        fprintf(stderr, "Bridge: plugin line failed authentication\n");
+        free(line);
+        return NULL;
+    }
+    br->plugin_rx_seq++;
+    memmove(line, line + 65, len - 65 + 1);
+    return line;
+}
+
+/* Read one newline-delimited line from plugin_fd (buffered) */
+static char *read_plugin_raw_line(bridge_t *br) {
     if (br->plugin_fd < 0) return NULL;
 
     size_t cap = 4096;
@@ -1076,6 +1173,8 @@ void bridge_cleanup(bridge_t *br) {
     br->plugin_queue_len = 0;
     if (br->lsp_fd >= 0) wire_close(br->lsp_fd);
     if (br->plugin_fd >= 0) wire_close(br->plugin_fd);
+    br->plugin_session = 0;
+    memset(br->plugin_session_key, 0, sizeof(br->plugin_session_key));
     if (br->plugin_pending_fd >= 0) wire_close(br->plugin_pending_fd);
     if (br->plugin_listen_fd >= 0) wire_close(br->plugin_listen_fd);
     br->lsp_fd = -1;

@@ -70,6 +70,7 @@ class PluginTestCase(unittest.TestCase):
     def setUp(self):
         self.to_bridge = []
         self.to_cln = []
+        self.real_send_to_bridge = cln_plugin.send_to_bridge
         for target, repl in (
             ("send_to_bridge", lambda msg: self.to_bridge.append(msg) or True),
             ("send_to_cln", self.to_cln.append),
@@ -1376,8 +1377,9 @@ class FakeBridge:
     `secret` is what this peer holds (None: it holds none and bluffs)."""
 
     def __init__(self, secret, instead_of_challenge=None, accept=True,
-                 lsp_pubkey=""):
+                 lsp_pubkey="", ok_mac="good"):
         self.lsp_pubkey = lsp_pubkey
+        self.ok_mac = ok_mac    # how auth_ok is authenticated: good/none/bad
         self.secret = secret
         self.instead_of_challenge = instead_of_challenge
         self.accept = accept
@@ -1406,6 +1408,8 @@ class FakeBridge:
         for line in data.split(b"\n"):
             if not line:
                 continue
+            if not line.startswith(b"{"):       # a session line: "<mac> <json>"
+                line = line.split(b" ", 1)[1]
             msg = json.loads(line)
             self.sent.append(msg)
             if msg["method"] == "auth_hello":
@@ -1419,7 +1423,17 @@ class FakeBridge:
                     "proof": cln_plugin.auth_proof(
                         key, b"bridge", self.plugin_nonce, self.nonce)})
             elif msg["method"] == "auth_response" and self.accept:
-                self._reply({"method": "auth_ok", "lsp_pubkey": self.lsp_pubkey})
+                line = json.dumps({"method": "auth_ok",
+                                   "lsp_pubkey": self.lsp_pubkey}).encode()
+                self.key = cln_plugin.session_key(
+                    self.secret or "00" * 32, self.plugin_nonce, self.nonce)
+                mac = cln_plugin.line_mac(self.key, b"b2p", 0, line).encode()
+                if self.ok_mac == "bad":
+                    mac = cln_plugin.line_mac(b"k" * 32, b"b2p", 0, line).encode()
+                if self.ok_mac == "none":
+                    self.inbox += line + b"\n"
+                else:
+                    self.inbox += mac + b" " + line + b"\n"
 
 
 class BridgeAuthTest(PluginTestCase):
@@ -1434,7 +1448,7 @@ class BridgeAuthTest(PluginTestCase):
         self.addCleanup(self.dir.cleanup)
         self.secret_path = os.path.join(self.dir.name, "bridge-plugin.secret")
         for name, value in (("BRIDGE_SECRET_FILE", self.secret_path),
-                            ("bridge_sock", None)):
+                            ("bridge_sock", None), ("bridge_session", None)):
             p = mock.patch.object(cln_plugin, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -1558,6 +1572,136 @@ class BridgeAuthTest(PluginTestCase):
         self.assertIsNone(cln_plugin.bridge_sock)
         self.assertTrue(other.closed)
         self.assertTrue(self.connect(FakeBridge(self.SECRET, lsp_pubkey=lsp_a))[0])
+
+    def test_peer_that_only_passes_the_handshake_along_gets_no_link(self):
+        self.write_secret(self.SECRET)
+        # Something between the plugin and the real bridge forwards the
+        # challenge and the response faithfully, so both proofs are genuine.
+        # It does not know the session key, so the first line of the
+        # session, which it would now have to speak itself, gives it away.
+        for how in ("none", "bad"):
+            relay = FakeBridge(self.SECRET, ok_mac=how)
+            ok, _ = self.connect(relay)
+            self.assertFalse(ok, how)
+            self.assertIsNone(cln_plugin.bridge_sock)
+            self.assertIsNone(cln_plugin.bridge_session)
+            self.assertTrue(relay.closed)
+
+    def test_session_keys_and_macs_match_the_bridge_implementation(self):
+        # The same fixed values are asserted in the bridge's C tests.
+        secret = "00112233445566778899aabbccddeeff" * 2
+        key = cln_plugin.session_key(secret, b"\x01" * 32, b"\x02" * 32)
+        self.assertEqual(key.hex(),
+            "b82c8f11332731da93b2a74578dcd74f3ad5c53f993fa73c6035fbffb026f7bd")
+        line = b'{"method":"x"}'
+        self.assertEqual(cln_plugin.line_mac(key, b"p2b", 5, line),
+            "156441f14fd282e5f8452c617350d874d86aa147c30ae1db48f05c1ad3d9778f")
+        self.assertEqual(cln_plugin.line_mac(key, b"b2p", 5, line),
+            "a79dbb5cfe974d96c51faa83d5f9660418cc3aaa2aafa87337c5d71587a7ded9")
+        self.assertEqual(cln_plugin.line_mac(key, b"p2b", 6, line),
+            "1788b7bfdb453e6a307a0824b5aa678b4448fe3c7a6a7f89e09986b08c358ff8")
+
+    def test_every_line_sent_carries_the_next_mac(self):
+        self.write_secret(self.SECRET)
+        bridge = FakeBridge(self.SECRET)
+        self.assertTrue(self.connect(bridge)[0])
+        sent_before = len(bridge.raw)
+        for n in range(3):
+            self.assertTrue(self.real_send_to_bridge({"method": "pay_result",
+                                                      "request_id": n}))
+        lines = bridge.raw[sent_before:].split(b"\n")[:-1]
+        self.assertEqual(len(lines), 3)
+        for n, raw in enumerate(lines):
+            mac, line = raw.split(b" ", 1)
+            self.assertEqual(json.loads(line)["request_id"], n)
+            self.assertEqual(mac.decode(),
+                             cln_plugin.line_mac(bridge.key, b"p2b", n, line))
+        # Without a session nothing is sent.
+        cln_plugin.bridge_session = None
+        self.assertFalse(self.real_send_to_bridge({"method": "pay_result"}))
+
+    def test_lines_received_must_carry_the_next_mac(self):
+        key = b"s" * 32
+        session = {"key": key, "tx": 0, "rx": 0}
+
+        def sealed(seq, msg, direction=b"b2p", with_key=key):
+            line = json.dumps(msg).encode()
+            return cln_plugin.line_mac(with_key, direction, seq, line).encode() \
+                + b" " + line
+
+        first = sealed(0, {"method": "htlc_resolve", "n": 0})
+        self.assertEqual(cln_plugin.open_line(session, first)["n"], 0)
+        self.assertEqual(cln_plugin.open_line(
+            session, sealed(1, {"method": "htlc_resolve", "n": 1}))["n"], 1)
+        bad = [
+            first,                                           # replayed
+            sealed(3, {"method": "pay_request"}),            # one was dropped
+            sealed(2, {"method": "pay_request"}, with_key=b"x" * 32),
+            sealed(2, {"method": "pay_request"}, direction=b"p2b"),  # our own
+            sealed(2, {"method": "pay_request"}).replace(b"pay_request",
+                                                         b"pay_requesT"),
+            b'{"method": "pay_request"}',                    # no MAC at all
+            b"",
+        ]
+        for raw in bad:
+            with self.assertRaises(ValueError, msg=raw):
+                cln_plugin.open_line(session, raw)
+            self.assertEqual(session["rx"], 2)
+        # The genuine next line is still accepted afterwards.
+        self.assertEqual(cln_plugin.open_line(
+            session, sealed(2, {"method": "pay_request"}))["method"], "pay_request")
+
+    def test_reader_drops_the_link_on_a_line_that_is_not_authentic(self):
+        self.write_secret(self.SECRET)
+        bridge = FakeBridge(self.SECRET)
+        self.assertTrue(self.connect(bridge)[0])
+        handled = []
+
+        class Stop(Exception):
+            pass
+
+        def no_reconnect():
+            raise Stop()
+
+        pay = json.dumps({"method": "pay_request", "bolt11": BOLT11,
+                          "request_id": 1}).encode()
+        good = cln_plugin.line_mac(bridge.key, b"b2p", 1, pay).encode() + b" " + pay
+        bridge.inbox = good + b"\n" + pay + b"\n" + good + b"\n"
+        with mock.patch.object(cln_plugin, "handle_bridge_msg", handled.append), \
+                mock.patch.object(cln_plugin, "connect_bridge", no_reconnect), \
+                self.assertRaises(Stop):
+            cln_plugin.bridge_reader()
+        # The authentic line was acted on; the bare one after it ended the
+        # link, so neither it nor anything behind it was.
+        self.assertEqual([m["request_id"] for m in handled], [1])
+        self.assertIsNone(cln_plugin.bridge_sock)
+        self.assertTrue(bridge.closed)
+
+    def test_handshake_has_one_deadline_for_all_of_it(self):
+        self.write_secret(self.SECRET)
+
+        class Trickle(FakeBridge):
+            """Answers one byte at a time, each just inside the timeout."""
+            def __init__(self, test, secret):
+                super().__init__(secret)
+                self.test = test
+                self.timeouts = []
+
+            def settimeout(self, t):
+                self.timeouts.append(t)
+
+            def recv(self, n):
+                self.test.clock["now"] += 0.5
+                return super().recv(n)
+
+        slow = Trickle(self, self.SECRET)
+        ok, _ = self.connect(slow)
+        self.assertFalse(ok)
+        # Each wait was only for what was left of the one deadline.
+        waits = [t for t in slow.timeouts if t is not None]
+        self.assertTrue(all(t <= cln_plugin.AUTH_TIMEOUT for t in waits))
+        self.assertLess(min(waits), 1.0)
+        self.assertLessEqual(len(waits), 2 * cln_plugin.AUTH_TIMEOUT + 2)
 
     def test_secret_is_read_again_on_every_connect(self):
         self.write_secret("aa" * 32)
