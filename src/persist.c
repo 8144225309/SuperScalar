@@ -2731,27 +2731,35 @@ int persist_load_close_signed(persist_t *p,
                                uint32_t funding_vout,
                                uint64_t *paid_sats_out,
                                unsigned char sighash_out[32]) {
-    if (!p || !p->db || !funding_txid) return 0;
+    /* "No record" must mean exactly that: the query ran and found no row.
+       Anything else is reported as an error so the caller can refuse to act
+       as if nothing had been signed. */
+    if (!p || !p->db || !funding_txid) return -1;
     const char *sql =
         "SELECT paid_sats, sighash FROM client_close_signed "
         "WHERE funding_txid = ? AND funding_vout = ?;";
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_blob(stmt, 1, funding_txid, 32, SQLITE_STATIC);
     sqlite3_bind_int64(stmt, 2, (sqlite3_int64)funding_vout);
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
         sqlite3_finalize(stmt);
         return 0;
     }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    const void *blob = sqlite3_column_blob(stmt, 1);
+    if (!blob || sqlite3_column_bytes(stmt, 1) != 32) {
+        sqlite3_finalize(stmt);
+        return -1;   /* a row is there but cannot be trusted */
+    }
     if (paid_sats_out)
         *paid_sats_out = (uint64_t)sqlite3_column_int64(stmt, 0);
-    if (sighash_out) {
-        const void *blob = sqlite3_column_blob(stmt, 1);
-        if (blob && sqlite3_column_bytes(stmt, 1) == 32)
-            memcpy(sighash_out, blob, 32);
-        else
-            memset(sighash_out, 0, 32);
-    }
+    if (sighash_out)
+        memcpy(sighash_out, blob, 32);
     sqlite3_finalize(stmt);
     return 1;
 }
@@ -2759,7 +2767,7 @@ int persist_load_close_signed(persist_t *p,
 int persist_factory_has_channel(persist_t *p,
                                  const unsigned char funding_txid[32],
                                  uint32_t funding_vout) {
-    if (!p || !p->db || !funding_txid) return 0;
+    if (!p || !p->db || !funding_txid) return -1;
 
     /* factories.funding_txid is stored as display-order hex. */
     unsigned char txid_display[32];
@@ -2772,12 +2780,13 @@ int persist_factory_has_channel(persist_t *p,
         "WHERE f.funding_txid = ? AND f.funding_vout = ? LIMIT 1;";
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
-        return 0;
+        return -1;
     sqlite3_bind_text(stmt, 1, txid_hex, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, (int)funding_vout);
-    int found = (sqlite3_step(stmt) == SQLITE_ROW);
+    int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return found;
+    if (rc == SQLITE_ROW) return 1;
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int persist_load_channel_state(persist_t *p, uint32_t channel_id,

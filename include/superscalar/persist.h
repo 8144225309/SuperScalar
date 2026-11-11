@@ -327,8 +327,11 @@ int persist_save_close_signed(persist_t *p,
                                uint64_t paid_sats,
                                const unsigned char sighash[32]);
 
-/* Load the record for a factory.  Returns 1 if one exists (outputs may be
-   NULL), 0 if the client has not signed a close of that factory. */
+/* Load the record for a factory (outputs may be NULL).  Returns 1 if one
+   exists, 0 if the query ran and the client has not signed a close of that
+   factory, and -1 if the record could not be read (no handle, a failed
+   query, a malformed row).  -1 is not "no record": callers must not sign on
+   it. */
 int persist_load_close_signed(persist_t *p,
                                const unsigned char funding_txid[32],
                                uint32_t funding_vout,
@@ -336,7 +339,8 @@ int persist_load_close_signed(persist_t *p,
                                unsigned char sighash_out[32]);
 
 /* 1 if a channel is stored for the factory funded by this outpoint
-   (funding_txid in internal byte order), 0 otherwise. */
+   (funding_txid in internal byte order), 0 if the query ran and found none,
+   -1 if the records could not be read. */
 int persist_factory_has_channel(persist_t *p,
                                  const unsigned char funding_txid[32],
                                  uint32_t funding_vout);

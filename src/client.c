@@ -57,6 +57,14 @@ uint32_t client_chain_tip(void) {
            ? g_client_chain_tip_fn(g_client_chain_tip_ctx) : 0;
 }
 
+static unsigned g_client_chain_tip_attempts = CLIENT_CHAIN_TIP_ATTEMPTS;
+static unsigned g_client_chain_tip_retry_ms = CLIENT_CHAIN_TIP_RETRY_MS;
+
+void client_set_chain_tip_retry(unsigned attempts, unsigned delay_ms) {
+    g_client_chain_tip_attempts = attempts ? attempts : 1;
+    g_client_chain_tip_retry_ms = delay_ms;
+}
+
 /* Minimum acceptable profit share in basis points (set via client_set_min_profit_bps).
    If > 0 and the LSP offers less, the client refuses to sign the factory tree. */
 static uint16_t g_min_profit_bps = 0;
@@ -86,8 +94,9 @@ void client_set_lsp_pubkey(const secp256k1_pubkey *pubkey) {
 }
 
 /* Both sides of the conservation invariant for ch: what the channel state
-   accounts for (balances plus every active HTLC) and what the funding output
-   holds once the base commitment fee is taken off.  Returns 1 if they agree. */
+   accounts for (balances plus every active HTLC and PTLC) and what the
+   funding output holds once the base commitment fee is taken off.  Returns 1
+   if they agree. */
 static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
                                      uint64_t *expected_out,
                                      uint64_t *base_commit_fee_out) {
@@ -97,6 +106,10 @@ static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
             sum += ch->htlcs[h].amount_sats;
             sum += ch->htlcs[h].fee_at_add;
         }
+    }
+    for (size_t t = 0; t < ch->n_ptlcs; t++) {
+        if (ch->ptlcs[t].state == PTLC_STATE_ACTIVE)
+            sum += ch->ptlcs[t].amount_sats;
     }
     /* Base commit-tx fee: matches fee_for_commitment_tx(fe, 0) in src/fee.c
        (154 vB × fee_rate_sat_per_kvb, rounded up per compute_fee). */
@@ -572,21 +585,29 @@ int client_close_amount_to_client(const secp256k1_context *ctx,
                                    const secp256k1_pubkey *my_pubkey,
                                    const tx_output_t *outputs,
                                    size_t n_outputs,
-                                   uint64_t *paid_sats_out) {
+                                   uint64_t *paid_sats_out,
+                                   size_t *n_paying_out) {
     /* Amounts sent to any other script are not the client's, however large,
-       so only outputs carrying exactly its own script are counted. */
+       so only outputs carrying exactly its own script are counted.  An
+       output below the dust limit is not counted either: it is not relayed
+       as part of a standard transaction and costs more to spend than it
+       holds, so a balance split into such outputs is not paid at all. */
     unsigned char my_spk[34];
     uint64_t paid = 0;
+    size_t n_paying = 0;
     if (!paid_sats_out || (!outputs && n_outputs > 0)) return 0;
     if (!client_close_script(ctx, my_pubkey, my_spk)) return 0;
     for (size_t i = 0; i < n_outputs; i++) {
         if (outputs[i].script_pubkey_len != sizeof(my_spk) ||
             memcmp(outputs[i].script_pubkey, my_spk, sizeof(my_spk)) != 0)
             continue;
+        if (outputs[i].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
         if (outputs[i].amount_sats > UINT64_MAX - paid) return 0;
         paid += outputs[i].amount_sats;
+        n_paying++;
     }
     *paid_sats_out = paid;
+    if (n_paying_out) *n_paying_out = n_paying;
     return 1;
 }
 
@@ -603,32 +624,54 @@ void client_close_state_init(client_close_state_t *cs, persist_t *db,
     if (!cs) return;
     memset(cs, 0, sizeof(*cs));
     cs->db = db;
-    if (db && factory &&
-        persist_load_close_signed(db, factory->funding_txid,
-                                   factory->funding_vout,
-                                   &cs->paid_sats, cs->sighash))
-        cs->signed_close = 1;
+    if (db && factory) {
+        int r = persist_load_close_signed(db, factory->funding_txid,
+                                           factory->funding_vout,
+                                           &cs->paid_sats, cs->sighash);
+        if (r > 0) cs->signed_close = 1;
+        else if (r < 0) cs->record_error = 1;
+    }
 }
 
-/* 1 if this client's records show it has signed a cooperative close of the
-   factory.  Such a factory is frozen: see client_close_state_t. */
-static int client_factory_close_signed(const factory_t *factory) {
-    return g_client_persist && factory &&
-           persist_load_close_signed(g_client_persist, factory->funding_txid,
+/* What this client's records say about a signed cooperative close of the
+   factory: 1 signed, 0 not signed (or no database), -1 cannot be read.  A
+   factory with a signed close is frozen: see client_close_state_t. */
+static int client_factory_close_record(const factory_t *factory) {
+    if (!g_client_persist || !factory) return 0;
+    return persist_load_close_signed(g_client_persist, factory->funding_txid,
                                       factory->funding_vout, NULL, NULL);
 }
 
-/* Refuse a leaf or state advance of a factory whose close was signed.
-   Returns 1 if the advance was refused (an error was sent to the LSP). */
+int client_close_signed_for_factory(const factory_t *factory) {
+    /* Unreadable counts as signed: the freeze fails closed. */
+    return client_factory_close_record(factory) != 0;
+}
+
+int client_close_frozen_allows_msg(uint8_t msg_type) {
+    return msg_type == MSG_CLOSE_PROPOSE ||
+           msg_type == MSG_PING || msg_type == MSG_PONG ||
+           msg_type == MSG_LSP_REVOKE_AND_ACK;
+}
+
+/* Refuse a leaf or state advance of a factory whose close was signed, or
+   whose close record cannot be read.  Returns 1 if the advance was refused
+   (an error was sent to the LSP). */
 static int client_refuse_advance_if_close_signed(int fd,
                                                   const factory_t *factory,
                                                   uint32_t my_index,
                                                   const char *what) {
-    if (!client_factory_close_signed(factory)) return 0;
-    fprintf(stderr, "Client %u: REFUSING %s — a cooperative close of this "
-            "factory was already signed\n", my_index, what);
-    client_send_error(fd, "refused: this client already signed a cooperative "
-                          "close of the factory");
+    int r = client_factory_close_record(factory);
+    if (r == 0) return 0;
+    if (r > 0) {
+        fprintf(stderr, "Client %u: REFUSING %s — a cooperative close of this "
+                "factory was already signed\n", my_index, what);
+        client_send_error(fd, "refused: this client already signed a "
+                              "cooperative close of the factory");
+    } else {
+        fprintf(stderr, "Client %u: REFUSING %s — cannot read this client's "
+                "record of signed closes\n", my_index, what);
+        client_send_error(fd, "refused: client cannot read its close record");
+    }
     return 1;
 }
 
@@ -645,22 +688,26 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
     if (!ch) return 1;
     if (!outputs) return 0;
 
-    /* The proposed outputs settle balances only.  An HTLC still in flight is
-       not represented by any output, so signing now would forfeit it (an
-       incoming one the client can claim, or an outgoing one that may yet be
-       refunded).  Wait for it to resolve, or exit with the commitment. */
-    size_t n_active = 0;
+    /* The proposed outputs settle balances only.  An HTLC or PTLC still in
+       flight is not represented by any output, so signing now would forfeit
+       it (an incoming one the client can claim, or an outgoing one that may
+       yet be refunded).  Wait for it to resolve, or exit with the
+       commitment. */
+    size_t n_active = 0, n_active_ptlcs = 0;
     for (size_t i = 0; i < ch->n_htlcs; i++)
         if (ch->htlcs[i].state == HTLC_STATE_ACTIVE) n_active++;
-    if (n_active > 0) {
+    for (size_t i = 0; i < ch->n_ptlcs; i++)
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE) n_active_ptlcs++;
+    if (n_active > 0 || n_active_ptlcs > 0) {
         fprintf(stderr, "Client: REFUSING cooperative close — %zu HTLC(s) "
-                "still pending on the channel\n", n_active);
+                "and %zu PTLC(s) still pending on the channel\n",
+                n_active, n_active_ptlcs);
         return 0;
     }
 
-    /* The balances must account for the whole funding output.  The HTLC list
-       is not restored when a channel is reloaded, so an HTLC that was in
-       flight then is invisible to the check above; what gives it away is
+    /* The balances must account for the whole funding output.  The HTLC and
+       PTLC lists are not restored when a channel is reloaded, so one that was
+       in flight then is invisible to the check above; what gives it away is
        that its amount is in neither balance.  A close paying local_amount
        would hand that amount to the LSP, so a channel whose state does not
        add up is never closed cooperatively. */
@@ -670,7 +717,7 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
         fprintf(stderr, "Client: REFUSING cooperative close — channel state "
                 "accounts for %llu sats (local %llu, remote %llu) but the "
                 "funding output holds %llu after the commitment fee; an HTLC "
-                "may be unresolved\n",
+                "or PTLC may be unresolved\n",
                 (unsigned long long)accounted,
                 (unsigned long long)ch->local_amount,
                 (unsigned long long)ch->remote_amount,
@@ -683,12 +730,21 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
     if (my_balance < CHANNEL_DUST_LIMIT_SATS) return 1;
 
     /* The balance must be paid to the script this client derives from its own
-       key. */
+       key, in one output: that is what the LSP builds for every client, and
+       a payout spread over several outputs only costs the client fees to
+       collect. */
     uint64_t paid_to_me = 0;
+    size_t n_paying = 0;
     if (!client_close_amount_to_client(ctx, my_pubkey, outputs, n_outputs,
-                                        &paid_to_me)) {
+                                        &paid_to_me, &n_paying)) {
         fprintf(stderr, "Client: REFUSING cooperative close — cannot total "
                 "the outputs paying this client's close script\n");
+        return 0;
+    }
+    if (n_paying > 1) {
+        fprintf(stderr, "Client: REFUSING cooperative close — the balance is "
+                "split over %zu outputs to this client's script; it must be "
+                "paid in one\n", n_paying);
         return 0;
     }
     if (paid_to_me < my_balance) {
@@ -705,12 +761,16 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
 /* A close with no channel is signed only by a client that is owed nothing.
    If the client's own database holds a channel for this factory, it does
    have a balance and was merely started without it; signing would give that
-   balance away.  Returns 1 if signing without a channel is safe. */
-static int client_close_without_channel_ok(persist_t *db,
-                                            const factory_t *factory) {
-    if (!db) return 1;
-    return !persist_factory_has_channel(db, factory->funding_txid,
-                                         factory->funding_vout);
+   balance away.  With no database there is nothing that could have carried
+   a channel over from an earlier run (reconnecting to a factory needs the
+   database), so a client with neither is owed nothing.
+   Returns 1 if a channel is on record, 0 if none is, -1 if the records
+   cannot be read. */
+static int client_close_channel_on_record(persist_t *db,
+                                           const factory_t *factory) {
+    if (!db) return 0;
+    return persist_factory_has_channel(db, factory->funding_txid,
+                                        factory->funding_vout);
 }
 
 /* End the ceremony by refusing what the LSP proposed.  The channel is left
@@ -719,6 +779,33 @@ static void client_close_refuse(int fd, client_close_state_t *cs,
                                  const char *reason) {
     cs->refused = 1;
     client_send_error(fd, reason);
+}
+
+/* End the ceremony because the client could not check the proposal.  This
+   is not a judgement of the terms: nothing is signed or recorded, the
+   channel stays fully usable, and the LSP is told to try again. */
+static void client_close_unverifiable(int fd, client_close_state_t *cs,
+                                       const char *reason) {
+    cs->unverifiable = 1;
+    client_send_error(fd, reason);
+}
+
+/* The chain tip to judge a proposal's nLockTime by.  Starts from the tip the
+   caller supplied; while that tip does not make the nLockTime acceptable and
+   a height could become acceptable (the backend may have been unreachable,
+   or be a few blocks behind), asks the tip source again for a bounded time. */
+static uint32_t client_close_tip_for(uint32_t locktime, uint32_t tip) {
+    if (!g_client_chain_tip_fn) return tip;
+    if (locktime == 0 || locktime >= 500000000u) return tip;
+    for (unsigned attempt = 1;
+         !client_close_locktime_acceptable(locktime, tip) &&
+         attempt <= g_client_chain_tip_attempts; attempt++) {
+        if (attempt > 1 && g_client_chain_tip_retry_ms > 0)
+            usleep((useconds_t)g_client_chain_tip_retry_ms * 1000);
+        uint32_t now = client_chain_tip();
+        if (now > tip) tip = now;
+    }
+    return tip;
 }
 
 /* MEDIUM-1: cap on LSP-driven re-PROPOSE recursion depth. The LSP is untrusted;
@@ -746,6 +833,26 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         cs = &own_cs;
     }
     cs->refused = 0;
+    cs->unverifiable = 0;
+
+    /* The record of closes already signed decides what may be signed now.
+       If it could not be read, try once more, and sign nothing without it. */
+    if (cs->record_error) {
+        int r = cs->db
+            ? persist_load_close_signed(cs->db, factory->funding_txid,
+                                         factory->funding_vout,
+                                         &cs->paid_sats, cs->sighash)
+            : -1;
+        if (r < 0) {
+            fprintf(stderr, "Client: cooperative close NOT signed — cannot "
+                    "read this client's record of signed closes\n");
+            client_close_unverifiable(fd, cs, "cooperative close not signed: "
+                "client cannot read its close record, try again");
+            return 0;
+        }
+        cs->record_error = 0;
+        if (r > 0) cs->signed_close = 1;
+    }
 
     if (initial_msg && initial_msg->msg_type == MSG_CLOSE_PROPOSE) {
         /* Use already-received CLOSE_PROPOSE */
@@ -846,17 +953,24 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         return 0;
     }
     uint32_t close_height = (uint32_t)ht->valuedouble;
+    current_height = client_close_tip_for(close_height, current_height);
     if (!client_close_locktime_acceptable(close_height, current_height)) {
-        if (current_height == 0)
-            fprintf(stderr, "Client: REFUSING cooperative close — nLockTime "
-                    "%u cannot be checked: this client has no chain tip\n",
-                    close_height);
-        else
-            fprintf(stderr, "Client: REFUSING cooperative close — nLockTime "
-                    "%u is more than %d blocks above this client's chain "
-                    "tip %u\n", close_height, CLIENT_CLOSE_LOCKTIME_MARGIN,
-                    current_height);
         if (!initial_msg) cJSON_Delete(msg.json);
+        if (current_height == 0 && close_height < 500000000u) {
+            /* No tip to judge the height by: the client cannot tell an
+               honest nLockTime from a far-future one.  That says nothing
+               about the proposal, so it is not a refusal of its terms. */
+            fprintf(stderr, "Client: cooperative close NOT signed — nLockTime "
+                    "%u cannot be verified: this client has no chain tip "
+                    "right now\n", close_height);
+            client_close_unverifiable(fd, cs, "cooperative close not signed: "
+                "client cannot verify locktime, try again");
+            return 0;
+        }
+        fprintf(stderr, "Client: REFUSING cooperative close — nLockTime "
+                "%u is more than %d blocks above this client's chain "
+                "tip %u\n", close_height, CLIENT_CLOSE_LOCKTIME_MARGIN,
+                current_height);
         client_close_refuse(fd, cs, "cooperative close refused: nLockTime is "
                                     "not near this client's chain tip");
         return 0;
@@ -899,14 +1013,25 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     /* Verify the proposed outputs before contributing a nonce or a signature.
        Refusing changes nothing on the channel: the client still holds its
        signed commitment and can exit unilaterally. */
-    if (!ch && !client_close_without_channel_ok(cs->db, factory)) {
-        fprintf(stderr, "Client: REFUSING cooperative close — a channel is "
-                "on record for this factory but this client was started "
-                "without it\n");
-        free(close_outputs);
-        client_close_refuse(fd, cs, "cooperative close refused: client was "
-                                    "started without its channel state");
-        return 0;
+    if (!ch) {
+        int on_record = client_close_channel_on_record(cs->db, factory);
+        if (on_record < 0) {
+            fprintf(stderr, "Client: cooperative close NOT signed — cannot "
+                    "read this client's channel records\n");
+            free(close_outputs);
+            client_close_unverifiable(fd, cs, "cooperative close not signed: "
+                "client cannot read its channel records, try again");
+            return 0;
+        }
+        if (on_record > 0) {
+            fprintf(stderr, "Client: REFUSING cooperative close — a channel "
+                    "is on record for this factory but this client was "
+                    "started without it\n");
+            free(close_outputs);
+            client_close_refuse(fd, cs, "cooperative close refused: client "
+                                        "was started without its channel state");
+            return 0;
+        }
     }
     if (!client_close_outputs_acceptable(ctx, my_pubkey, ch,
                                           close_outputs, n_outputs)) {
@@ -921,7 +1046,7 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
        could choose whichever of the two suits it. */
     uint64_t paid_to_me = 0;
     if (!client_close_amount_to_client(ctx, my_pubkey, close_outputs,
-                                        n_outputs, &paid_to_me) ||
+                                        n_outputs, &paid_to_me, NULL) ||
         (cs->signed_close && paid_to_me < cs->paid_sats)) {
         fprintf(stderr, "Client: REFUSING cooperative close — it pays this "
                 "client %llu sats, a close signed earlier pays %llu\n",

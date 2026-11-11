@@ -89,14 +89,18 @@ int client_close_script(const secp256k1_context *ctx,
                          const secp256k1_pubkey *my_pubkey,
                          unsigned char *spk_out34);
 
-/* Total of the outputs carrying this client's own close script.  Returns 1
-   and writes the sum, 0 if the script cannot be derived or the sum
-   overflows. */
+/* What a proposed close pays this client: the outputs that carry its own
+   close script and are at or above the dust limit.  An output below the dust
+   limit is not a payment the client can count on and is ignored.  Writes
+   their total and how many there are; an honest LSP pays each client with
+   exactly one output (lsp_channels_build_close_outputs).  Returns 1 on
+   success, 0 if the script cannot be derived or the total overflows. */
 int client_close_amount_to_client(const secp256k1_context *ctx,
                                    const secp256k1_pubkey *my_pubkey,
                                    const tx_output_t *outputs,
                                    size_t n_outputs,
-                                   uint64_t *paid_sats_out);
+                                   uint64_t *paid_sats_out,
+                                   size_t *n_paying_out);
 
 /* How many blocks the nLockTime of a proposed close may lie above the
    client's own chain tip.  The LSP sets nLockTime to its current height; the
@@ -122,6 +126,15 @@ typedef uint32_t (*client_chain_tip_fn)(void *ctx);
 void client_set_chain_tip_source(client_chain_tip_fn fn, void *ctx);
 uint32_t client_chain_tip(void);
 
+/* A chain backend can be briefly unreachable or a few blocks behind.  When
+   the tip a close proposal has to be judged by is unknown, or too low for
+   the proposal's nLockTime, the close ceremony asks the source again, up to
+   `attempts` times in all, `delay_ms` apart, before it decides.  Defaults:
+   CLIENT_CHAIN_TIP_ATTEMPTS and CLIENT_CHAIN_TIP_RETRY_MS. */
+#define CLIENT_CHAIN_TIP_ATTEMPTS 5
+#define CLIENT_CHAIN_TIP_RETRY_MS 1000
+void client_set_chain_tip_retry(unsigned attempts, unsigned delay_ms);
+
 /* What the client knows about cooperative closes it has signed for one
    factory.
 
@@ -140,22 +153,43 @@ typedef struct {
     unsigned char sighash[32];  /* sighash of that close transaction */
     int refused;                /* set by client_do_close_ceremony: 1 if it
                                    ended by refusing what the LSP proposed */
+    int unverifiable;           /* set by client_do_close_ceremony: 1 if it
+                                   ended because the client could not check
+                                   the proposal (no chain tip, or its own
+                                   records unreadable).  Nothing was signed
+                                   or recorded; the same proposal may be
+                                   acceptable when tried again */
+    int record_error;           /* set by client_close_state_init: the record
+                                   could not be read from db */
     persist_t *db;              /* where the record is kept, or NULL */
 } client_close_state_t;
 
-/* Reset cs and load the record for factory from db (db may be NULL). */
+/* Reset cs and load the record for factory from db (db may be NULL).  If
+   the record cannot be read, cs->record_error is set and the ceremony will
+   not sign until it can be. */
 void client_close_state_init(client_close_state_t *cs, persist_t *db,
                               const factory_t *factory);
 
+/* 1 if the database set with client_set_persist shows, or cannot rule out,
+   that this client has signed a cooperative close of the factory. */
+int client_close_signed_for_factory(const factory_t *factory);
+
+/* While a signed close of the factory is outstanding, a client acts only on
+   a close proposal, keepalives and the LSP's own revocations (which only add
+   to what the client can prove).  Returns 1 if a message of this type may
+   still be processed.  Shared by every message loop of the client tool. */
+int client_close_frozen_allows_msg(uint8_t msg_type);
+
 /* Decide whether a cooperative-close proposal is safe for this client to sign.
    Returns 1 only if
-     - no HTLC is pending on ch,
+     - no HTLC or PTLC is pending on ch,
      - the channel state accounts for the whole funding output: local +
        remote + active HTLCs == funding_amount - base commitment fee (an HTLC
        missing from the list makes this fail), and
-     - the outputs carrying the client's own close script sum to at least
-       ch->local_amount (no output is required for a balance below the dust
-       limit).
+     - exactly one output at or above the dust limit carries the client's
+       own close script, and it pays at least ch->local_amount (no output is
+       required for a balance below the dust limit; more than one is always
+       refused).
    Outputs to any other script are ignored regardless of amount.
    ch == NULL means the client never opened a channel in this factory; it is
    then owed nothing and any outputs are acceptable (returns 1). */
@@ -174,16 +208,25 @@ int client_close_outputs_acceptable(const secp256k1_context *ctx,
    client_close_outputs_acceptable.  Pass NULL only when the client never
    opened a channel in this factory and so holds no balance; with NULL the
    client still refuses if its database holds a channel for this factory.
+   A client with no database at all cannot have carried a channel over from
+   an earlier run (reconnecting to a factory needs the database), so with no
+   database and no channel it is owed nothing and may sign.
    current_height is the client's own chain tip (0 if unknown); the proposal's
-   nLockTime must satisfy client_close_locktime_acceptable against it.
+   nLockTime must satisfy client_close_locktime_acceptable against it.  If it
+   does not, the tip source is asked again for a bounded time
+   (client_set_chain_tip_retry).  A height that still cannot be judged
+   because no tip is known ends the ceremony as unverifiable, not refused.
    cs is the client's close state for this factory.  The ceremony records
    the close in it (and in cs->db) before sending the partial signature;
    once cs->signed_close is set it refuses leaf and state advances that
    arrive during the ceremony and any proposal paying the client less than
    cs->paid_sats.  Pass NULL to use a state private to this call, loaded
    from and saved to the database set with client_set_persist.
-   Returns 1 on success, 0 on refusal or failure; cs->refused tells the two
-   apart. */
+   Returns 1 on success and 0 otherwise.  cs->refused: the client declined
+   the terms.  cs->unverifiable: the client could not check the proposal;
+   nothing was signed or recorded and the LSP may try again.  Neither: the
+   ceremony failed for another reason (malformed or unexpected message, LSP
+   error, lost connection). */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
                                const secp256k1_pubkey *my_pubkey,

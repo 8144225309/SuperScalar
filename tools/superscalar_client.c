@@ -331,6 +331,18 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     (void)keypair; (void)n_participants;
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
 
+    /* A cooperative close of this factory was signed and may still be
+       completed by the LSP: no payment is started or accepted any more.
+       Returning hands over to the close ceremony, the only thing left that
+       this client takes part in. */
+    if (client_close_signed_for_factory(factory)) {
+        fprintf(stderr, "Client %u: a cooperative close of this factory was "
+                "signed earlier; the channel is frozen and no payment is "
+                "run. Only a close or a unilateral exit (--force-close) can "
+                "follow.\n", my_index);
+        return 1;
+    }
+
     /* Derive HTLC cltv from factory timeout (must expire before factory) */
     uint32_t htlc_cltv = factory->cltv_timeout > 40
                         ? factory->cltv_timeout - 40 : 500;
@@ -580,10 +592,9 @@ typedef struct {
        Once close_state.signed_close is set the factory is frozen: the loop
        acts on nothing but a close proposal. */
     client_close_state_t close_state;
-    /* How a close ceremony that did not complete ended (see
+    /* 1 = a close ceremony ended without completing (see
        daemon_close_outcome): the process must not report success. */
-    int     close_refused;          /* 1 = this client refused the LSP's proposal */
-    int     close_incomplete;       /* 1 = failed after this client had signed */
+    int     close_not_completed;
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -869,8 +880,8 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
    does not report a clean exit, and tell the operator what is left to do.
    Nothing is broadcast from here: a unilateral exit is the operator's call. */
 static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
+    cbd->close_not_completed = 1;
     if (cbd->close_state.refused) {
-        cbd->close_refused = 1;
         fprintf(stderr,
             "Client %u: COOPERATIVE CLOSE REFUSED. This client did not sign "
             "what the LSP proposed (reason above); its channel is unchanged. "
@@ -878,7 +889,6 @@ static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
             "the factory needs a unilateral exit: run this client with "
             "--force-close and the same --db to broadcast it.\n", my_index);
     } else if (cbd->close_state.signed_close) {
-        cbd->close_incomplete = 1;
         fprintf(stderr,
             "Client %u: COOPERATIVE CLOSE NOT COMPLETED after this client "
             "signed it. The LSP may still broadcast that close (it pays this "
@@ -886,6 +896,13 @@ static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
             "LSP propose the close again, or run with --force-close and the "
             "same --db to exit unilaterally.\n", my_index,
             (unsigned long long)cbd->close_state.paid_sats);
+    } else {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. The ceremony failed "
+            "before this client signed anything (reason above). The factory "
+            "is still open and the channel is unchanged and still usable: "
+            "restart this client to carry on or to let the LSP propose the "
+            "close again.\n", my_index);
     }
 }
 
@@ -1188,9 +1205,7 @@ handle_message:
            the LSP's own revocations, which only add to what this client can
            prove.  Everything else is dropped unanswered. */
         if (cbd->close_state.signed_close &&
-            msg.msg_type != MSG_CLOSE_PROPOSE &&
-            msg.msg_type != MSG_PING && msg.msg_type != MSG_PONG &&
-            msg.msg_type != MSG_LSP_REVOKE_AND_ACK) {
+            !client_close_frozen_allows_msg(msg.msg_type)) {
             fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
                     "cooperative close of this factory was already signed; "
                     "only a close or a unilateral exit (--force-close) can "
@@ -1570,6 +1585,18 @@ handle_message:
                                       client_chain_tip(), ch,
                                       &cbd->close_state, 0);
             cJSON_Delete(msg.json);
+            if (!close_ok && cbd->close_state.unverifiable) {
+                /* The client could not check the proposal (no chain tip, or
+                   its own records unreadable).  It signed and recorded
+                   nothing and told the LSP to try again, so this is neither
+                   a close nor a refusal: keep serving the channel. */
+                fprintf(stderr,
+                    "Client %u: cooperative close NOT signed: this client "
+                    "could not verify the proposal (reason above) and asked "
+                    "the LSP to try again. The channel is unchanged and still "
+                    "usable; staying connected.\n", my_index);
+                break;
+            }
             if (!close_ok)
                 daemon_close_outcome(cbd, my_index);
             return 2;  /* close already handled */
@@ -3770,9 +3797,8 @@ int main(int argc, char *argv[]) {
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
-        /* A close that was refused, or left incomplete after signing, is
-           not a clean exit. */
-        if (cbd.close_refused || cbd.close_incomplete)
+        /* A close that did not complete is not a clean exit. */
+        if (cbd.close_not_completed)
             ok = 0;
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
@@ -3820,7 +3846,7 @@ int main(int argc, char *argv[]) {
             if (cbd.force_close_requested)
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
-            if (cbd.close_refused || cbd.close_incomplete)
+            if (cbd.close_not_completed)
                 ok = 0;
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */

@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <time.h>
+#include <sqlite3.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -321,6 +322,23 @@ int test_client_close_outputs_acceptable(void) {
     ch.htlcs = NULL;
     ch.n_htlcs = 0;
 
+    /* A PTLC in flight is no different: it has no output either. */
+    ptlc_t pending_ptlc;
+    memset(&pending_ptlc, 0, sizeof(pending_ptlc));
+    pending_ptlc.state = PTLC_STATE_ACTIVE;
+    pending_ptlc.amount_sats = 2000;
+    ch.local_amount -= pending_ptlc.amount_sats;
+    ch.ptlcs = &pending_ptlc;
+    ch.n_ptlcs = 1;
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "close with a pending PTLC must be refused");
+    pending_ptlc.state = PTLC_STATE_FAILED;
+    ch.local_amount += pending_ptlc.amount_sats;
+    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 2),
+                "a resolved PTLC does not block the close");
+    ch.ptlcs = NULL;
+    ch.n_ptlcs = 0;
+
     /* A balance below the dust limit cannot have an output. */
     cs_channel(&ch, CHANNEL_DUST_LIMIT_SATS - 1);
     TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 1),
@@ -416,9 +434,10 @@ int test_client_close_refuses_unbalanced_channel(void) {
     return 1;
 }
 
-/* The balance may be paid in several outputs; what counts is their sum, and
-   only outputs carrying the client's own script are part of it. */
-int test_client_close_sums_outputs_to_own_script(void) {
+/* The balance must arrive in one output to the client's own script, at or
+   above the dust limit.  Outputs below the dust limit are not counted, and a
+   payout spread over several outputs is refused whatever it adds up to. */
+int test_client_close_single_payout_output(void) {
     secp256k1_context *ctx = cs_ctx();
     secp256k1_keypair kps[CS_N];
     secp256k1_pubkey pks[CS_N];
@@ -429,53 +448,109 @@ int test_client_close_sums_outputs_to_own_script(void) {
         TEST_ASSERT(client_close_script(ctx, &pks[i], spk[i]), "close script");
 
     const uint64_t balance = 100000;
+    const uint64_t dust = CHANNEL_DUST_LIMIT_SATS;
     channel_t ch;
     cs_channel(&ch, balance);
-    tx_output_t outs[5];
+    tx_output_t outs[8];
     uint64_t paid = 0;
+    size_t n_paying = 0;
 
-    /* 60000 + 30000 + 10000 to the client, interleaved with others. */
-    cs_output(&outs[0], 60000, spk[1]);
-    cs_output(&outs[1], 500000, spk[0]);
-    cs_output(&outs[2], 30000, spk[1]);
-    cs_output(&outs[3], 250000, spk[2]);
-    cs_output(&outs[4], 10000, spk[1]);
-    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
-                paid == 100000, "three own outputs are summed");
-    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
-                "balance split over three outputs is accepted");
+    /* One output, among others that are not the client's. */
+    cs_output(&outs[0], 500000, spk[0]);
+    cs_output(&outs[1], balance, spk[1]);
+    cs_output(&outs[2], 250000, spk[2]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 3, &paid,
+                                               &n_paying) &&
+                paid == balance && n_paying == 1, "one paying output");
+    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 3),
+                "balance in one output is accepted");
 
-    /* One sat short in total. */
-    cs_output(&outs[4], 9999, spk[1]);
-    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
-                paid == 99999, "sum is one sat short");
-    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
-                "a sum one sat short is refused");
+    /* The same amount in two outputs. */
+    cs_output(&outs[1], 60000, spk[1]);
+    cs_output(&outs[3], 40000, spk[1]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 4, &paid,
+                                               &n_paying) &&
+                paid == balance && n_paying == 2, "two paying outputs");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 4),
+                "balance split over two outputs is refused");
 
-    /* The missing part paid to another client's script does not count. */
-    cs_output(&outs[4], 10000, spk[2]);
-    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
-                paid == 90000, "another client's output is not summed");
-    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
-                "sum completed by another script is refused");
+    /* More than the balance, still in two outputs. */
+    cs_output(&outs[3], 90000, spk[1]);
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 4),
+                "a generous split is refused as well");
 
-    /* Nor does an own-script output with a truncated script. */
-    cs_output(&outs[4], 10000, spk[1]);
-    outs[4].script_pubkey_len = 33;
-    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid) &&
-                paid == 90000, "truncated script is not summed");
+    /* Dust split: the last part of the balance in an output below dust. */
+    cs_output(&outs[1], balance - (dust - 1), spk[1]);
+    cs_output(&outs[3], dust - 1, spk[1]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 4, &paid,
+                                               &n_paying) &&
+                paid == balance - (dust - 1) && n_paying == 1,
+                "sub-dust output is not counted");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 4),
+                "balance completed by a sub-dust output is refused");
 
-    /* No output of its own at all. */
-    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[3], outs, 5, &paid) &&
-                paid == 0, "a client with no output is paid nothing");
+    /* The whole balance as a pile of sub-dust outputs. */
+    {
+        channel_t small;
+        cs_channel(&small, 5 * (dust - 1));
+        for (int i = 0; i < 5; i++) cs_output(&outs[i], dust - 1, spk[1]);
+        cs_output(&outs[5], 500000, spk[0]);
+        TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 6, &paid,
+                                                   &n_paying) &&
+                    paid == 0 && n_paying == 0, "sub-dust outputs pay nothing");
+        TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &small,
+                                                      outs, 6),
+                    "balance paid only in sub-dust outputs is refused");
+    }
 
-    /* A sum that overflows cannot be trusted. */
-    cs_output(&outs[0], UINT64_MAX, spk[1]);
-    cs_output(&outs[2], 1, spk[1]);
-    TEST_ASSERT(!client_close_amount_to_client(ctx, &pks[1], outs, 5, &paid),
-                "overflowing sum is an error");
-    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 5),
-                "overflowing sum is refused");
+    /* One full output; a stray sub-dust output to the same script changes
+       nothing. */
+    cs_output(&outs[0], 500000, spk[0]);
+    cs_output(&outs[1], balance, spk[1]);
+    cs_output(&outs[2], dust - 1, spk[1]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 3, &paid,
+                                               &n_paying) &&
+                paid == balance && n_paying == 1, "stray dust is ignored");
+    TEST_ASSERT(client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 3),
+                "full output plus stray dust is accepted");
+
+    /* An output at exactly the dust limit counts. */
+    cs_output(&outs[2], dust, spk[1]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 3, &paid,
+                                               &n_paying) &&
+                paid == balance + dust && n_paying == 2,
+                "output at the dust limit is counted");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 3),
+                "a second output at the dust limit is a split");
+
+    /* Another client's output, or a truncated script, is not this client's. */
+    cs_output(&outs[1], balance - 10000, spk[1]);
+    cs_output(&outs[2], 10000, spk[2]);
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 3, &paid,
+                                               &n_paying) &&
+                paid == balance - 10000 && n_paying == 1,
+                "another client's output is not counted");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 3),
+                "balance completed by another script is refused");
+    cs_output(&outs[2], 10000, spk[1]);
+    outs[2].script_pubkey_len = 33;
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[1], outs, 3, &paid,
+                                               &n_paying) &&
+                paid == balance - 10000 && n_paying == 1,
+                "truncated script is not counted");
+    TEST_ASSERT(client_close_amount_to_client(ctx, &pks[3], outs, 3, &paid,
+                                               &n_paying) &&
+                paid == 0 && n_paying == 0,
+                "a client with no output is paid nothing");
+
+    /* A total that overflows cannot be trusted. */
+    cs_output(&outs[1], UINT64_MAX, spk[1]);
+    cs_output(&outs[2], dust, spk[1]);
+    TEST_ASSERT(!client_close_amount_to_client(ctx, &pks[1], outs, 3, &paid,
+                                                &n_paying),
+                "overflowing total is an error");
+    TEST_ASSERT(!client_close_outputs_acceptable(ctx, &pks[1], &ch, outs, 3),
+                "overflowing total is refused");
 
     secp256k1_context_destroy(ctx);
     return 1;
@@ -916,13 +991,15 @@ CS_DEADLINE_TEST(test_client_close_locktime_bound, CS_UNIT_DEADLINE_SEC) {
     cs_output(&outs[0], CS_FUNDING - 1000 - balance, lsp_spk);
     cs_output(&outs[1], balance, my_spk);
 
-    struct { uint32_t locktime, tip; int signs; } cases[] = {
-        { tip + margin + 1, tip, 0 },   /* too far ahead */
-        { tip,              0,   0 },   /* client has no tip */
-        { 500000000u,       tip, 0 },   /* time-based */
-        { tip + margin,     tip, 1 },
-        { tip,              tip, 1 },
-        { 0,                0,   1 },
+    enum { CS_REFUSES, CS_SIGNS, CS_CANNOT_VERIFY };
+    struct { uint32_t locktime, tip; int expect; } cases[] = {
+        { tip + margin + 1, tip, CS_REFUSES },        /* too far ahead */
+        { 500000000u,       tip, CS_REFUSES },        /* time-based */
+        { 500000000u,       0,   CS_REFUSES },        /* time-based, no tip */
+        { tip,              0,   CS_CANNOT_VERIFY },  /* client has no tip */
+        { tip + margin,     tip, CS_SIGNS },
+        { tip,              tip, CS_SIGNS },
+        { 0,                0,   CS_SIGNS },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         client_close_state_t cs;
@@ -934,18 +1011,130 @@ CS_DEADLINE_TEST(test_client_close_locktime_bound, CS_UNIT_DEADLINE_SEC) {
         TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
                                                 &cs, cases[i].tip, msgs, 1,
                                                 &rc, sent, &n_sent), "run");
-        if (cases[i].signs) {
+        if (cases[i].expect == CS_SIGNS) {
             TEST_ASSERT(n_sent >= 1 && sent[0] == MSG_CLOSE_NONCE,
                         "acceptable nLockTime: client takes part");
-            TEST_ASSERT(!cs.refused, "no refusal recorded");
+            TEST_ASSERT(!cs.refused && !cs.unverifiable, "no refusal recorded");
         } else {
             TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
-                        "unacceptable nLockTime: refused, no nonce");
-            TEST_ASSERT(cs.refused, "refusal recorded");
+                        "nLockTime not accepted: error sent, no nonce");
             TEST_ASSERT(!cs.signed_close, "nothing was signed");
+            if (cases[i].expect == CS_REFUSES)
+                TEST_ASSERT(cs.refused && !cs.unverifiable,
+                            "unacceptable nLockTime is a refusal");
+            else
+                TEST_ASSERT(cs.unverifiable && !cs.refused,
+                            "no tip: cannot verify, not a refusal");
         }
     }
 
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A scripted chain tip source: answers cs_tip_before for the first
+   cs_tip_changes_after queries and cs_tip_after from then on. */
+static int cs_tip_calls;
+static int cs_tip_changes_after;
+static uint32_t cs_tip_before, cs_tip_after;
+static uint32_t cs_tip_source(void *ctx) {
+    (void)ctx;
+    cs_tip_calls++;
+    return cs_tip_calls > cs_tip_changes_after ? cs_tip_after : cs_tip_before;
+}
+
+/* The chain backend may be unreachable for a moment or a few blocks behind.
+   The client asks again for a bounded time.  If it still has no tip it says
+   "cannot verify, try again" and neither signs nor records anything; that is
+   not a refusal.  A tip that is known and stays too low is a refusal. */
+CS_DEADLINE_TEST(test_client_close_tip_retry, CS_UNIT_DEADLINE_SEC) {
+    const uint32_t tip = 800000;
+    const int attempts = 4;
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+    const uint64_t balance = 120000;
+    channel_t ch;
+    cs_channel(&ch, balance);
+    tx_output_t outs[2];
+    cs_output(&outs[0], CS_FUNDING - 1000 - balance, lsp_spk);
+    cs_output(&outs[1], balance, my_spk);
+
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    client_set_chain_tip_source(cs_tip_source, NULL);
+    client_set_chain_tip_retry((unsigned)attempts, 5);
+
+    /* { tip before, tip after, changes after n queries, nLockTime,
+         expected: 1 signs, 0 refuses, 2 cannot verify, expected queries } */
+    struct { uint32_t before, after; int changes_after; uint32_t locktime;
+             int expect, queries; } cases[] = {
+        { 0,        tip, 2,   tip, 1, 3 },         /* backend comes back */
+        { 0,        0,   0,   tip, 2, attempts },  /* never comes back */
+        { tip - 20, tip, 2,   tip, 1, 3 },         /* behind, catches up */
+        { tip - 20, tip - 20, 0, tip, 0, attempts },  /* stays behind */
+        { tip - 3,  tip - 3,  0, tip, 1, 1 },      /* behind within margin */
+        { 0,        0,   0,   0,   1, 0 },         /* no lock: tip not needed */
+        { 0,        0,   0,   500000000u, 0, 0 },  /* time lock: no point */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cs_tip_calls = 0;
+        cs_tip_before = cases[i].before;
+        cs_tip_after = cases[i].after;
+        cs_tip_changes_after = cases[i].changes_after;
+
+        client_close_state_t cs;
+        client_close_state_init(&cs, &db, f);
+        cs_lsp_msg_t msgs[1] = { cs_msg_propose(outs, 2, cases[i].locktime) };
+        int rc = -1;
+        uint8_t sent[CS_MAX_SENT];
+        size_t n_sent = 0;
+        /* The caller's own reading of the tip was 0 as well. */
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                                                &cs, 0, msgs, 1, &rc, sent,
+                                                &n_sent), "run");
+        if (cs_tip_calls != cases[i].queries)
+            printf("  case %zu: %d tip queries, expected %d\n", i,
+                   cs_tip_calls, cases[i].queries);
+        TEST_ASSERT(cs_tip_calls == cases[i].queries,
+                    "tip is asked for a bounded number of times");
+        if (cases[i].expect == 1) {
+            TEST_ASSERT(n_sent >= 1 && sent[0] == MSG_CLOSE_NONCE,
+                        "client takes part once the tip allows it");
+            TEST_ASSERT(!cs.refused && !cs.unverifiable, "no refusal");
+        } else {
+            TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                        "error sent, no nonce");
+            if (cases[i].expect == 2)
+                TEST_ASSERT(cs.unverifiable && !cs.refused,
+                            "no tip after retrying: cannot verify");
+            else
+                TEST_ASSERT(cs.refused && !cs.unverifiable,
+                            "known tip too low or time lock: refused");
+        }
+        /* Nothing is signed in any of these runs (the script ends after the
+           proposal), so nothing may be on record and nothing is frozen. */
+        TEST_ASSERT(!cs.signed_close, "nothing signed");
+        TEST_ASSERT(persist_load_close_signed(&db, f->funding_txid,
+                                               f->funding_vout, NULL,
+                                               NULL) == 0,
+                    "nothing recorded");
+    }
+
+    client_set_chain_tip_source(NULL, NULL);
+    client_set_chain_tip_retry(CLIENT_CHAIN_TIP_ATTEMPTS,
+                               CLIENT_CHAIN_TIP_RETRY_MS);
+    persist_close(&db);
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
@@ -1086,6 +1275,229 @@ CS_DEADLINE_TEST(test_client_close_records_signed_close, CS_UNIT_DEADLINE_SEC) {
     return 1;
 }
 
+/* After the client signed, the LSP may propose different outputs.  What
+   matters to the client stays the same: its one output must pay at least
+   what the signed close pays. */
+CS_DEADLINE_TEST(test_client_close_repropose_changed_outputs,
+                 CS_UNIT_DEADLINE_SEC) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char spk[CS_N][34];
+    for (int i = 0; i < CS_N; i++)
+        TEST_ASSERT(client_close_script(ctx, &pks[i], spk[i]), "close script");
+
+    const uint64_t balance = 120000, first = balance + 500;
+    channel_t ch;
+    cs_channel(&ch, balance);
+
+    tx_output_t original[2];
+    cs_output(&original[0], CS_FUNDING - 1000 - first, spk[0]);
+    cs_output(&original[1], first, spk[1]);
+
+    /* Different fee, another party's output added, the client's own output
+       moved and raised. */
+    tx_output_t changed[3];
+    cs_output(&changed[0], first + 200, spk[1]);
+    cs_output(&changed[1], 300000, spk[2]);
+    cs_output(&changed[2], CS_FUNDING - 3000 - 300000 - first - 200, spk[0]);
+
+    /* Same total for the client, now in two outputs. */
+    tx_output_t split[3];
+    cs_output(&split[0], CS_FUNDING - 1000 - first, spk[0]);
+    cs_output(&split[1], first - 20000, spk[1]);
+    cs_output(&split[2], 20000, spk[1]);
+
+    /* Other outputs changed, the client's output one sat lower: still above
+       its balance, below what it already signed for. */
+    tx_output_t lower[3];
+    cs_output(&lower[0], CS_FUNDING - 2000 - first, spk[0]);
+    cs_output(&lower[1], first - 1, spk[1]);
+    cs_output(&lower[2], 800, spk[3]);
+
+    int rc = -1;
+    uint8_t sent[CS_MAX_SENT];
+    size_t n_sent = 0;
+
+    {
+        client_close_state_t cs;
+        client_close_state_init(&cs, NULL, f);
+        cs_lsp_msg_t msgs[5] = { cs_msg_propose(original, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_propose(changed, 3, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_done() };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 5, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 1 && n_sent == 4 && sent[0] == MSG_CLOSE_NONCE &&
+                    sent[1] == MSG_CLOSE_PSIG && sent[2] == MSG_CLOSE_NONCE &&
+                    sent[3] == MSG_CLOSE_PSIG,
+                    "changed outputs paying more in one output are signed");
+        TEST_ASSERT(cs.signed_close && cs.paid_sats == first + 200,
+                    "record follows the close signed last");
+    }
+    {
+        client_close_state_t cs;
+        client_close_state_init(&cs, NULL, f);
+        cs_lsp_msg_t msgs[4] = { cs_msg_propose(original, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_propose(split, 3, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 4, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 3 && sent[1] == MSG_CLOSE_PSIG &&
+                    sent[2] == MSG_ERROR && cs.refused,
+                    "re-proposal splitting the payout is refused");
+        TEST_ASSERT(cs.paid_sats == first, "record unchanged");
+    }
+    {
+        client_close_state_t cs;
+        client_close_state_init(&cs, NULL, f);
+        cs_lsp_msg_t msgs[4] = { cs_msg_propose(original, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks),
+                                 cs_msg_propose(lower, 3, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 4, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 3 && sent[1] == MSG_CLOSE_PSIG &&
+                    sent[2] == MSG_ERROR && cs.refused,
+                    "re-proposal paying one sat less is refused");
+        TEST_ASSERT(cs.paid_sats == first, "record unchanged");
+    }
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* When the client's own records cannot be read it must not act as if they
+   were empty: it signs no close and takes part in no advance. */
+CS_DEADLINE_TEST(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC) {
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    TEST_ASSERT(cs_keys(ctx, kps, pks), "keys");
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f != NULL, "alloc");
+    TEST_ASSERT(cs_build_factory(f, ctx, kps, pks), "build factory");
+
+    unsigned char lsp_spk[34], my_spk[34];
+    TEST_ASSERT(client_close_script(ctx, &pks[0], lsp_spk), "lsp script");
+    TEST_ASSERT(client_close_script(ctx, &pks[1], my_spk), "client script");
+    const uint64_t balance = 120000;
+    channel_t ch;
+    cs_channel(&ch, balance);
+    tx_output_t outs[2];
+    cs_output(&outs[0], CS_FUNDING - 1000 - balance, lsp_spk);
+    cs_output(&outs[1], balance, my_spk);
+
+    int rc = -1;
+    uint8_t sent[CS_MAX_SENT];
+    size_t n_sent = 0;
+
+    /* 1. The table of signed closes is gone. */
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    TEST_ASSERT(persist_load_close_signed(&db, f->funding_txid,
+                                           f->funding_vout, NULL, NULL) == 0,
+                "readable and empty: no record");
+    TEST_ASSERT(sqlite3_exec(db.db, "DROP TABLE client_close_signed;",
+                             NULL, NULL, NULL) == SQLITE_OK, "drop table");
+    TEST_ASSERT(persist_load_close_signed(&db, f->funding_txid,
+                                           f->funding_vout, NULL, NULL) == -1,
+                "unreadable is reported as an error, not as no record");
+
+    client_close_state_t cs;
+    client_close_state_init(&cs, &db, f);
+    TEST_ASSERT(cs.record_error && !cs.signed_close, "state knows it is blind");
+    {
+        cs_lsp_msg_t msgs[2] = { cs_msg_propose(outs, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        &cs, 0, msgs, 2, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                    "no nonce and no signature without the record");
+        TEST_ASSERT(cs.unverifiable && !cs.refused && !cs.signed_close,
+                    "ends as cannot-verify");
+    }
+    /* A caller that passes no state reads through client_set_persist. */
+    client_set_persist(&db);
+    {
+        cs_lsp_msg_t msgs[2] = { cs_msg_propose(outs, 2, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, &ch,
+                        NULL, 0, msgs, 2, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                    "same without a caller-supplied state");
+    }
+    TEST_ASSERT(client_close_signed_for_factory(f) == 1,
+                "the freeze applies when the record cannot be read");
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        wire_msg_t propose;
+        memset(&propose, 0, sizeof(propose));
+        propose.msg_type = MSG_LEAF_ADVANCE_PROPOSE;
+        propose.json = cJSON_CreateObject();
+        shutdown(sv[0], SHUT_WR);
+        int hrc = client_handle_leaf_advance(sv[1], ctx, &kps[1], f, 1, &propose);
+        cJSON_Delete(propose.json);
+        close(sv[1]);
+        wire_msg_t reply;
+        memset(&reply, 0, sizeof(reply));
+        uint8_t got = 0;
+        if (wire_recv(sv[0], &reply)) {
+            got = reply.msg_type;
+            if (reply.json) cJSON_Delete(reply.json);
+        }
+        close(sv[0]);
+        TEST_ASSERT(hrc == 0 && got == MSG_ERROR,
+                    "leaf advance is refused when the record cannot be read");
+    }
+    client_set_persist(NULL);
+    persist_close(&db);
+
+    /* 2. The channel records are gone and the client runs without a
+       channel: it cannot tell whether it has one. */
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, NULL), "open in-memory db");
+    TEST_ASSERT(persist_factory_has_channel(&db2, f->funding_txid,
+                                             f->funding_vout) == 0,
+                "readable and empty: no channel");
+    TEST_ASSERT(sqlite3_exec(db2.db, "PRAGMA foreign_keys=OFF;"
+                                     "DROP TABLE channels;",
+                             NULL, NULL, NULL) == SQLITE_OK, "drop table");
+    TEST_ASSERT(persist_factory_has_channel(&db2, f->funding_txid,
+                                             f->funding_vout) == -1,
+                "unreadable is reported as an error, not as no channel");
+    {
+        client_close_state_t cs2;
+        client_close_state_init(&cs2, &db2, f);
+        TEST_ASSERT(!cs2.record_error, "close record itself is readable");
+        tx_output_t all_to_lsp;
+        cs_output(&all_to_lsp, CS_FUNDING - 1000, lsp_spk);
+        cs_lsp_msg_t msgs[2] = { cs_msg_propose(&all_to_lsp, 1, 0),
+                                 cs_msg_all_nonces(ctx, pks) };
+        TEST_ASSERT(cs_run_client_close_script(ctx, &kps[1], &pks[1], f, NULL,
+                        &cs2, 0, msgs, 2, &rc, sent, &n_sent), "run");
+        TEST_ASSERT(rc == 0 && n_sent == 1 && sent[0] == MSG_ERROR,
+                    "no channel and unreadable channel records: no nonce");
+        TEST_ASSERT(cs2.unverifiable && !cs2.refused, "ends as cannot-verify");
+    }
+    persist_close(&db2);
+
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* The record of a signed close is written to the client's database before
    the signature is sent, and a restarted client finds it there. */
 CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC) {
@@ -1109,8 +1521,13 @@ CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC
     cs_output(&pay_exact[0], CS_FUNDING - 1000 - balance, lsp_spk);
     cs_output(&pay_exact[1], balance, my_spk);
 
+    /* A database file, closed and opened again between the two runs. */
+    char db_path[] = "/tmp/ss_close_record_XXXXXX";
+    int db_fd = mkstemp(db_path);
+    TEST_ASSERT(db_fd >= 0, "temporary database file");
+    close(db_fd);
     persist_t db;
-    TEST_ASSERT(persist_open(&db, NULL), "open in-memory db");
+    TEST_ASSERT(persist_open(&db, db_path), "open database file");
     int rc = -1;
     uint8_t sent[CS_MAX_SENT];
     size_t n_sent = 0;
@@ -1135,9 +1552,14 @@ CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC
         CS_CHECK(n_sent == 2 && sent[1] == MSG_CLOSE_PSIG, "client signed");
     }
 
-    /* "Restart": a fresh state loaded from the same database. */
+    /* Restart: the database is closed, opened again from the file, and a
+       fresh state is loaded from it. */
+    persist_close(&db);
+    memset(&db, 0, sizeof(db));
+    CS_CHECK(persist_open(&db, db_path), "reopen database file");
     client_close_state_t reloaded;
     client_close_state_init(&reloaded, &db, f);
+    CS_CHECK(!reloaded.record_error, "record readable after reopening");
     CS_CHECK(reloaded.signed_close, "record found after restart");
     CS_CHECK(reloaded.paid_sats == generous, "payout on record");
     CS_CHECK(memcmp(reloaded.sighash, cs.sighash, 32) == 0, "sighash on record");
@@ -1219,6 +1641,14 @@ CS_DEADLINE_TEST(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC
 #undef CS_CHECK
 
     persist_close(&db);
+    {
+        static const char *suffix[] = { "", "-wal", "-shm", "-journal" };
+        for (size_t i = 0; i < sizeof(suffix) / sizeof(suffix[0]); i++) {
+            char file[sizeof(db_path) + 16];
+            snprintf(file, sizeof(file), "%s%s", db_path, suffix[i]);
+            unlink(file);
+        }
+    }
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);

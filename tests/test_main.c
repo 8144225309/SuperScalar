@@ -3923,7 +3923,10 @@ static void run_unit_tests(void) {
 
     printf("\n=== Client Signing Checks ===\n");
     extern int test_client_close_outputs_acceptable(void);
-    extern int test_client_close_sums_outputs_to_own_script(void);
+    extern int test_client_close_single_payout_output(void);
+    extern int test_client_close_tip_retry(void);
+    extern int test_client_close_repropose_changed_outputs(void);
+    extern int test_client_close_record_unreadable(void);
     extern int test_client_close_refuses_unbalanced_channel(void);
     extern int test_client_close_after_reconnect_with_htlc_in_flight(void);
     extern int test_client_run_with_channels_checks_close(void);
@@ -3934,14 +3937,17 @@ static void run_unit_tests(void) {
     extern int test_client_close_record_survives_restart(void);
     extern int test_client_close_honest_ceremony(void);
     RUN_TEST(test_client_close_outputs_acceptable);
-    RUN_TEST(test_client_close_sums_outputs_to_own_script);
+    RUN_TEST(test_client_close_single_payout_output);
     RUN_TEST(test_client_close_refuses_unbalanced_channel);
     RUN_TEST(test_client_close_after_reconnect_with_htlc_in_flight);
     RUN_TEST(test_client_close_refuses_unpaid_proposal);
     RUN_TEST(test_client_close_without_channel);
     RUN_TEST(test_client_close_locktime_bound);
+    RUN_TEST(test_client_close_tip_retry);
     RUN_TEST(test_client_close_records_signed_close);
+    RUN_TEST(test_client_close_repropose_changed_outputs);
     RUN_TEST(test_client_close_record_survives_restart);
+    RUN_TEST(test_client_close_record_unreadable);
     RUN_TEST(test_client_close_honest_ceremony);
     RUN_TEST(test_client_run_with_channels_checks_close);
     extern int test_client_leaf_realloc_acceptable(void);
