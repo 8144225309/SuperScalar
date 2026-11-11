@@ -22,6 +22,7 @@ PREIMAGE = "11" * 32
 PAYMENT_HASH = hashlib.sha256(bytes.fromhex(PREIMAGE)).hexdigest()
 OTHER_HASH = "ab" * 32
 BOLT11 = "lnbcrt40u1pexampleinvoice"
+OWN_NODE = "02" + "cd" * 32
 
 
 def decoded_invoice(amount_msat=4_000_000, payment_hash=PAYMENT_HASH, **extra):
@@ -40,6 +41,7 @@ class FakeCln:
     def __init__(self, **replies):
         # No earlier payment for the hash unless a test says otherwise.
         replies.setdefault("listsendpays", {"payments": []})
+        replies.setdefault("getinfo", {"id": OWN_NODE})
         self.replies = {m: list(r) if isinstance(r, list) else [r]
                         for m, r in replies.items()}
         self.calls = []
@@ -79,6 +81,13 @@ class PluginTestCase(unittest.TestCase):
         cln_plugin.pending_pays.clear()
         cln_plugin.open_pays.clear()
         self.state_dir = tempfile.TemporaryDirectory()
+        cln_plugin.settled_invoices.clear()
+        cln_plugin.invoice_labels.clear()
+        for name, value in (("NODE_ID", None),
+                            ("_spawn", lambda target, *args: target(*args))):
+            p = mock.patch.object(cln_plugin, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         self.addCleanup(self.state_dir.cleanup)
         p = mock.patch.object(
             cln_plugin, "BRIDGE_STATE_FILE",
@@ -552,6 +561,37 @@ class PayResultDeliveryTest(PluginTestCase):
         # The known result goes out again instead.
         self.assertEqual([m["success"] for m in self.pay_results()], [True, True])
 
+    def test_invoice_payable_to_this_node_is_not_paid(self):
+        cln = self.use_cln(decode=decoded_invoice(4_000_000, payee=OWN_NODE.upper()),
+                           pay={"status": "complete", "payment_preimage": PREIMAGE})
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(cln.calls_to("pay"), [])
+        self.assert_pay_failed(7)
+
+    def test_invoice_of_a_factory_client_is_not_paid_outside(self):
+        for where in (cln_plugin.registered_invoices, cln_plugin.settled_invoices):
+            self.to_bridge.clear()
+            cln_plugin.open_pays.clear()
+            cln_plugin.registered_invoices.clear()
+            cln_plugin.settled_invoices.clear()
+            if isinstance(where, set):
+                where.add(PAYMENT_HASH)
+            else:
+                where[PAYMENT_HASH] = True
+            cln = self.use_cln(
+                decode=decoded_invoice(4_000_000, payee="03" + "ee" * 32),
+                pay={"status": "complete", "payment_preimage": PREIMAGE})
+            cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+            self.assertEqual(cln.calls_to("pay"), [])
+            self.assert_pay_failed(7)
+
+    def test_other_payees_are_paid_even_if_the_node_id_is_unknown(self):
+        cln = self.use_cln(decode=decoded_invoice(4_000_000, payee="03" + "ee" * 32),
+                           pay={"status": "complete", "payment_preimage": PREIMAGE},
+                           getinfo=cln_plugin.ClnRpcError("Connection refused"))
+        cln_plugin._do_pay(BOLT11, 7, PAYMENT_HASH, 4_000_000, 144)
+        self.assertEqual(len(cln.calls_to("pay")), 1)
+
     def test_second_request_for_a_hash_being_paid_is_refused(self):
         self.use_cln(decode=decoded_invoice(4_000_000),
                      pay={"status": "complete", "payment_preimage": PREIMAGE})
@@ -726,6 +766,71 @@ class InboundHtlcTest(PluginTestCase):
         cln_plugin.handle_htlc_accepted(10, htlc(short_channel_id="1x1x1"))
         self.lsp_fails("insufficient_funds")
         self.assertEqual(self.hook_answers(), [(10, fail())])
+
+    # --- a fulfilled invoice stays closed ---
+
+    def fulfil(self, rpc_id):
+        self.register()
+        cln_plugin.handle_htlc_accepted(rpc_id, htlc())
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+
+    def test_later_htlc_for_a_fulfilled_invoice_is_failed_not_continued(self):
+        self.fulfil(40)
+        # CLN still has the invoice; the registry no longer does.
+        self.assertNotIn(PAYMENT_HASH, cln_plugin.registered_invoices)
+        cln_plugin.handle_htlc_accepted(41, htlc())
+        cln_plugin.handle_htlc_accepted(42, htlc(short_channel_id="1x1x1"))
+        self.assertEqual(self.hook_answers()[1:], [(41, fail()), (42, fail())])
+        self.assertEqual(len(self.to_lsp()), 1)
+
+    def test_fulfilled_invoice_stays_closed_across_a_restart(self):
+        self.fulfil(43)
+        cln_plugin.settled_invoices.clear()
+        cln_plugin.registered_invoices.clear()
+        cln_plugin.load_state()
+        # CLN lists the invoice as unpaid: it is not taken back in...
+        self.use_cln(listinvoices={"invoices": [
+            {"label": "superscalar-aa-1", "status": "unpaid",
+             "payment_hash": PAYMENT_HASH}]})
+        cln_plugin.recover_registered_invoices()
+        self.assertEqual(cln_plugin.registered_invoices, set())
+        # ...and an HTLC for it is failed.
+        cln_plugin.handle_htlc_accepted(44, htlc())
+        self.assertEqual(self.hook_answers()[-1], (44, fail()))
+
+    def test_cln_copy_of_a_fulfilled_invoice_is_deleted(self):
+        cln = self.use_cln(delinvoice={})
+        cln_plugin.invoice_labels[PAYMENT_HASH] = "superscalar-aa-1"
+        self.fulfil(45)
+        self.assertEqual(cln.calls_to("delinvoice"),
+                         [{"label": "superscalar-aa-1", "status": "unpaid"}])
+        # A failed delete changes nothing else: the hash stays closed.
+        cln_plugin.settled_invoices.clear()
+        cln_plugin.invoice_labels[OTHER_HASH] = "superscalar-bb-2"
+        self.use_cln(delinvoice=cln_plugin.ClnRpcError("no such invoice"))
+        cln_plugin.registered_invoices.add(OTHER_HASH)
+        cln_plugin.handle_htlc_accepted(46, htlc(payment_hash=OTHER_HASH))
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": OTHER_HASH,
+            "htlc_id": 2, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertIn(OTHER_HASH, cln_plugin.settled_invoices)
+
+    def test_fulfilled_forward_is_not_remembered_as_an_invoice(self):
+        cln_plugin.handle_htlc_accepted(47, htlc(short_channel_id="1x1x1"))
+        cln_plugin.handle_bridge_msg({
+            "method": "htlc_resolve", "payment_hash": PAYMENT_HASH,
+            "htlc_id": 1, "result": "fulfill", "preimage": PREIMAGE})
+        self.assertEqual(cln_plugin.settled_invoices, {})
+
+    def test_settled_memory_is_bounded(self):
+        with mock.patch.object(cln_plugin, "SETTLED_MAX", 3), \
+                mock.patch.object(cln_plugin, "save_state", lambda: True):
+            for i in range(5):
+                cln_plugin._mark_settled(f"{i:064x}")
+        self.assertEqual(list(cln_plugin.settled_invoices),
+                         [f"{i:064x}" for i in (2, 3, 4)])
 
     # --- HTLCs that never reach the LSP ---
 

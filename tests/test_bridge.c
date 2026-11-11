@@ -4912,3 +4912,60 @@ int test_bridge_forwards_pay_result_ack(void) {
     close(sv[0]); close(sv[1]); close(lsp_sv[0]); close(lsp_sv[1]);
     return 1;
 }
+
+/* ---- An invoice of one of the LSP's own clients is not paid outside ---- */
+
+int test_lsp_outbound_internal_invoice_refused(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    TEST_ASSERT(ctx != NULL, "ctx");
+    int cl[2], br[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, cl) == 0, "socketpair");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, br) == 0, "socketpair");
+
+    lsp_channel_mgr_t mgr;
+    memset(&mgr, 0, sizeof(mgr));
+    mgr.ctx = ctx;
+    mgr.n_channels = 2;
+    mgr.entries = calloc(2, sizeof(lsp_channel_entry_t));
+    mgr.invoices = calloc(MAX_INVOICE_REGISTRY, sizeof(invoice_entry_t));
+    mgr.invoices_cap = MAX_INVOICE_REGISTRY;
+    mgr.htlc_origins = calloc(MAX_HTLC_ORIGINS, sizeof(htlc_origin_t));
+    mgr.htlc_origins_cap = MAX_HTLC_ORIGINS;
+    mgr.bridge_fd = br[0];
+    mgr.next_request_id = 1;
+    snprintf(mgr.network, sizeof(mgr.network), "regtest");
+    chain_backend_t tip;
+    memset(&tip, 0, sizeof(tip));
+    tip.get_block_height = fixed_tip_get_block_height;
+    fixed_tip_height = 100;
+    mgr.chain_be = &tip;
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(mgr.entries && mgr.invoices && mgr.htlc_origins && lsp, "alloc");
+    int client_fds[2] = { cl[0], -1 };
+    lsp->client_fds = client_fds;
+
+    /* Client 1 has an invoice out; client 0 tries to pay it as an outside
+       invoice. */
+    unsigned char preimage[32], hash[32];
+    memset(preimage, 0x53, 32);
+    sha256(preimage, 32, hash);
+    TEST_ASSERT(lsp_channels_register_invoice(&mgr, hash, preimage, 1, 4000000),
+                "client 1's invoice");
+    char inv[2048], reason[128];
+    TEST_ASSERT(make_out_invoice(ctx, "bcrt", 4000000, hash, (uint32_t)time(NULL),
+                                  3600, 18, inv, sizeof(inv)), "encode");
+    TEST_ASSERT(offer_outside_htlc(&mgr, lsp, cl[1], hash, 4000000, inv,
+                                    reason, sizeof(reason)), "HTLC failed back");
+    TEST_ASSERT(strcmp(reason, "invoice_is_internal") == 0,
+                "own client's invoice not paid through the Lightning node");
+    wire_msg_t stray;
+    TEST_ASSERT(!wire_recv_timeout(br[1], &stray, 1), "nothing sent to bridge");
+    TEST_ASSERT_EQ(mgr.next_request_id, 1, "no pay requested");
+    TEST_ASSERT_EQ(mgr.entries[0].channel.n_htlcs, 0, "no HTLC taken");
+
+    close(cl[0]); close(cl[1]); close(br[0]); close(br[1]);
+    free(mgr.entries); free(mgr.invoices); free(mgr.htlc_origins); free(lsp);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

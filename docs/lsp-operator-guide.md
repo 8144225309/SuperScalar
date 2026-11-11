@@ -475,6 +475,47 @@ directory it cannot create, or a secret file it cannot create or will not
 accept. The message says which. `start_bridge.sh` and the systemd unit do not
 restart it on that status.
 
+### What the bridge checks do not cover
+
+Core Lightning holds every factory invoice together with its preimage (that
+is how it produces the BOLT11 string). The plugin therefore never lets CLN
+handle an HTLC for a factory invoice, deletes CLN's copy once the LSP has
+fulfilled it, and keeps fulfilled hashes closed across restarts. That
+protection is the plugin's, so it has limits:
+
+- **Plugin not loaded.** If `lightningd` runs without the plugin (disabled,
+  crashed with CLN configured to carry on, or started before it was
+  installed), CLN settles any HTLC for an unpaid factory invoice by itself:
+  the payer is charged and the node keeps the money, while the factory client
+  is not paid. Run the plugin as `important-plugin=` so that CLN stops when
+  it does, and do not start `lightningd` without it while factory invoices
+  are outstanding.
+- **Self-payment.** A factory client paying another factory client's invoice
+  as an outside payment is refused by the LSP (`invoice_is_internal`) and by
+  the plugin (invoice issued by, or payable to, this node). Both checks rely
+  on the registries of the running LSP and plugin; an invoice neither still
+  knows is not recognised.
+- **Multi-part payments** to a factory invoice are refused part by part; the
+  payer has to send the full amount in one HTLC.
+- **HTLC replay** after a `lightningd` restart is matched by CLN's own HTLC
+  name (`short_channel_id` and `id` in the `htlc_accepted` hook). A CLN that
+  does not report both cannot be matched, and the repeat is refused.
+- **Deadlines.** The check that an HTLC's expiry is far enough past the
+  current block height is applied to outside payments only, not yet to
+  inbound and factory-internal HTLCs.
+- **The plugin link** is authenticated at connection time; it is not
+  encrypted and later messages are not individually authenticated.
+
+The following are covered by unit tests with CLN's RPC mocked and have not
+been exercised against a running Core Lightning node: `pay` with `maxfee`,
+`maxdelay` and `retry_for`; the shape of `decode`, `listpays`, `listsendpays`,
+`listinvoices`, `delinvoice` and `getinfo` replies; `htlc_accepted` being
+called again for unresolved HTLCs after a restart, with the same
+`short_channel_id` and `id`; HTLCs staying held across a bridge reconnect;
+the failure codes returned from the hook; and the plugin's state file across
+a real `lightningd` restart. Test these on regtest or signet before relying
+on the bridge.
+
 ### Bridge Daemon Flags
 
 | Flag | Default | Description |

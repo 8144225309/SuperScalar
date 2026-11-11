@@ -62,6 +62,14 @@ bridge_sock = None
 pending_htlcs = {}
 pending_pays = {}    # request_id -> rpc_id for superscalar-pay responses
 registered_invoices = set()   # payment_hash hex strings for factory clients
+# Factory invoices the LSP has fulfilled through this plugin (payment_hash,
+# oldest first).  CLN still holds such an invoice as unpaid, with its
+# preimage: a later HTLC for the hash must never be left to CLN.  Kept in
+# BRIDGE_STATE_FILE; the CLN invoice itself is deleted as well when possible.
+settled_invoices = {}
+SETTLED_MAX = 20000
+invoice_labels = {}  # payment_hash -> CLN label of the factory invoice
+NODE_ID = None       # this CLN node's id (from getinfo), once known
 # True once registered_invoices has been rebuilt from CLN's invoice list.
 # Until then an unlisted hash may still be a factory invoice.
 registry_recovered = False
@@ -324,6 +332,59 @@ def hook_fail(rpc_id, failure_message=FAIL_TEMPORARY_NODE):
                             "failure_message": failure_message}})
 
 
+def _mark_settled(payment_hash):
+    """The LSP fulfilled this factory invoice: remember it for good."""
+    with lock:
+        settled_invoices[payment_hash] = True
+        while len(settled_invoices) > SETTLED_MAX:
+            del settled_invoices[next(iter(settled_invoices))]
+    save_state()
+
+
+def _drop_cln_invoice(payment_hash):
+    """Delete CLN's copy of a fulfilled factory invoice, so that CLN cannot
+    settle a later HTLC for it from its own preimage even when this plugin
+    is not running."""
+    with lock:
+        label = invoice_labels.pop(payment_hash, None)
+    if not label:
+        return
+    try:
+        cln_rpc("delinvoice", {"label": label, "status": "unpaid"}, timeout=30)
+    except Exception as e:
+        log(f"Could not delete fulfilled invoice {label}: "
+            f"{type(e).__name__}: {e}")
+
+
+def own_node_id():
+    """This node's id, or None while CLN cannot be asked."""
+    global NODE_ID
+    if NODE_ID is None:
+        try:
+            node = cln_rpc("getinfo", timeout=10).get("id")
+            if isinstance(node, str) and node:
+                NODE_ID = node.lower()
+        except Exception as e:
+            log(f"getinfo failed: {type(e).__name__}: {e}")
+    return NODE_ID
+
+
+def own_invoice_reason(decoded, payment_hash):
+    """Why an invoice must not be paid as an outside payment because it is
+    one of ours, or None.  Paying an invoice of this very node would send
+    the money out and straight back in, with CLN settling it from its own
+    copy of the preimage."""
+    with lock:
+        ours = payment_hash in registered_invoices or \
+            payment_hash in settled_invoices
+    if ours:
+        return "invoice was issued by this node for a factory client"
+    node = own_node_id()
+    if node and str(decoded.get("payee", "")).lower() == node:
+        return "invoice is payable to this node itself"
+    return None
+
+
 def recover_registered_invoices():
     """Rebuild registered_invoices from CLN's invoice list (the set is lost
     when the plugin restarts; the invoices are not).  Returns True once the
@@ -340,7 +401,11 @@ def recover_registered_invoices():
             if inv.get("status") == "unpaid" and \
                inv.get("label", "").startswith("superscalar-"):
                 ph = inv.get("payment_hash", "")
-                if ph and ph not in registered_invoices:
+                if ph:
+                    invoice_labels[ph] = inv.get("label", "")
+                # Already fulfilled by the LSP: it stays closed.
+                if ph and ph not in settled_invoices and \
+                        ph not in registered_invoices:
                     registered_invoices.add(ph)
                     recovered += 1
         registry_recovered = True
@@ -447,6 +512,9 @@ def handle_bridge_msg(msg):
             # through to CLN.
             if held is not None and result == "fulfill":
                 registered_invoices.discard(payment_hash)
+                settle = held["factory_invoice"]
+            else:
+                settle = False
 
         if held is None:
             log(f"No pending HTLC for hash {payment_hash[:16]}...")
@@ -455,6 +523,10 @@ def handle_bridge_msg(msg):
 
         if result == "fulfill":
             preimage = msg.get("preimage", "")
+            # Closed for good before CLN is answered: no later HTLC for this
+            # hash is ever passed on to CLN, which still has the invoice.
+            if settle:
+                _mark_settled(payment_hash)
             send_to_cln({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
@@ -463,6 +535,8 @@ def handle_bridge_msg(msg):
                     "payment_key": preimage
                 }
             })
+            if settle:
+                _spawn(_drop_cln_invoice, payment_hash)
         else:
             reason = msg.get("reason", "unknown")
             # The LSP does not know this hash.  If it is not one of our
@@ -552,6 +626,7 @@ def _create_cln_invoice(payment_hash, preimage_hex, amount_msat):
             bolt11 = inv_result.get("bolt11", "")
             with lock:
                 registered_invoices.add(payment_hash)
+                invoice_labels[payment_hash] = label
             log(f"Created CLN invoice for {payment_hash[:16]}...")
             # Send BOLT11 back to bridge for forwarding to client
             send_to_bridge({
@@ -627,7 +702,10 @@ def save_state():
     path = os.path.expanduser(BRIDGE_STATE_FILE)
     tmp = path + ".tmp"
     with pays_lock:
-        data = json.dumps({"pays": {str(k): v for k, v in open_pays.items()}})
+        pays = {str(k): v for k, v in open_pays.items()}
+    with lock:
+        settled = list(settled_invoices)
+    data = json.dumps({"pays": pays, "settled": settled})
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -647,12 +725,18 @@ def load_state():
     path = os.path.expanduser(BRIDGE_STATE_FILE)
     try:
         with open(path, "r") as f:
-            pays = json.load(f).get("pays", {})
+            state = json.load(f)
+        pays = state.get("pays", {})
+        settled = state.get("settled", [])
     except FileNotFoundError:
         return 0
     except (OSError, ValueError, AttributeError) as e:
         log(f"Cannot read plugin state {path}: {e}")
         return 0
+    with lock:
+        for ph in settled if isinstance(settled, list) else []:
+            if _is_hash(ph):
+                settled_invoices[ph] = True
     restored = 0
     with pays_lock:
         for key, rec in pays.items():
@@ -844,6 +928,8 @@ def _do_pay(bolt11, request_id, payment_hash, max_total_msat, max_delay):
     amount_msat, why = check_pay_request(decoded, payment_hash, max_total_msat,
                                          max_delay)
     if not why:
+        why = own_invoice_reason(decoded, payment_hash)
+    if not why:
         why = _hash_in_use(payment_hash, request_id)
     if why:
         log(f"Pay refused for request_id={request_id}: {why}")
@@ -999,8 +1085,17 @@ def handle_htlc_accepted(rpc_id, params):
     # Check if this HTLC is for a registered factory invoice
     with lock:
         is_ours = payment_hash in registered_invoices
+        was_settled = payment_hash in settled_invoices
         n_registered = len(registered_invoices)
         registry_known = registry_recovered
+
+    if was_settled:
+        # A factory invoice that was already paid and fulfilled.  CLN may
+        # still hold it as unpaid; "continue" would let CLN take a second
+        # payment that no factory client receives.
+        log(f"HTLC for already fulfilled invoice {payment_hash[:16]}... — failing")
+        hook_fail(rpc_id)
+        return
 
     # Check for keysend TLV if not a registered invoice
     keysend_preimage = None
@@ -1221,6 +1316,9 @@ def main():
 
             global _can_log_to_cln
             _can_log_to_cln = True
+
+            # What must survive a restart: fulfilled invoices, open payments.
+            load_state()
 
             # Re-populate registered_invoices from CLN's invoice DB.
             # On plugin restart (CLN restart), the in-memory set is empty

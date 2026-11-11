@@ -904,6 +904,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     lsp->factory.cltv_timeout, &outside_max_delay);
             if (chk != BRIDGE_PAY_OK)
                 why = lsp_bridge_pay_check_str(chk);
+            /* An invoice this LSP registered for one of its own clients is
+               paid inside the factory (dest_client), never by sending the
+               money out through the Lightning node and back in. */
+            else if (lsp_channels_invoice_amount(mgr, payment_hash, NULL))
+                why = "invoice_is_internal";
             /* One outside payment per hash: a second HTLC for a hash that
                is being paid, or was paid, would be charged for nothing. */
             else if (lsp_channels_hash_in_flight(mgr, payment_hash))
