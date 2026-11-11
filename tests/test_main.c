@@ -1391,6 +1391,8 @@ extern int test_reconnect_nonce_reexchange(void);
 extern int test_initial_commitment_signed_at_open(void);
 extern int test_initial_commitment_rejects_invalid(void);
 extern int test_initial_commitment_persist_reload(void);
+extern int test_initial_commitment_recv_checks_conservation(void);
+extern int test_rotation_commitment_carries_balance(void);
 extern int test_client_persist_reload(void);
 
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
@@ -3399,6 +3401,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_initial_commitment_signed_at_open);
     RUN_TEST(test_initial_commitment_rejects_invalid);
     RUN_TEST(test_initial_commitment_persist_reload);
+    RUN_TEST(test_initial_commitment_recv_checks_conservation);
+    RUN_TEST(test_rotation_commitment_carries_balance);
     RUN_TEST(test_client_persist_reload);
 
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");

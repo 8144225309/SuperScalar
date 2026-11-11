@@ -693,6 +693,14 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return 1;
 }
 
+int lsp_channel_carry_client_balance(channel_t *ch, uint64_t client_balance) {
+    uint64_t usable = ch->local_amount + ch->remote_amount;
+    if (client_balance > usable) return 0;
+    ch->remote_amount = client_balance;
+    ch->local_amount = usable - client_balance;
+    return 1;
+}
+
 /* Channel open: sign the client's commitment 0 and send it as
    COMMITMENT_SIGNED, so the client can exit unilaterally with its opening
    balance before any payment has moved.  Uses nonce index 0 of the pools just

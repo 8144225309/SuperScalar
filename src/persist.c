@@ -6920,6 +6920,20 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
 }
 
 
+int persist_delete_commitment_sig(persist_t *p, uint32_t channel_id)
+{
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM signed_commitments WHERE channel_id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 /* --- Distribution TX (schema v14) --- */
 
 int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,

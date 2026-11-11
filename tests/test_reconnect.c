@@ -3405,3 +3405,123 @@ int test_initial_commitment_persist_reload(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Initial commitment over the wire: conservation and rotation ---- */
+
+static int initial_commitment_send(int fd, channel_t *lsp_ch) {
+    wire_msg_t m;
+    if (!initial_commitment_msg(lsp_ch, 0, 0, &m)) return 0;
+    int ok = wire_send(fd, MSG_COMMITMENT_SIGNED, m.json);
+    cJSON_Delete(m.json);
+    return ok;
+}
+
+/* Opening balances that do not account for the whole funding output are
+   refused even though the LSP's signature over them is valid; a keepalive
+   ping ahead of the signature is skipped; a closed connection is a failure. */
+int test_initial_commitment_recv_checks_conservation(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    int sv[2];
+
+    /* 1000 sat missing from the client's side, on both views */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+    lsp_ch.remote_amount -= 1000;
+    client_ch.local_amount -= 1000;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP sends commitment 0");
+    TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "unbalanced opening state refused");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    /* balanced state, with a ping in front */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 2");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    {
+        cJSON *ping = cJSON_CreateObject();
+        TEST_ASSERT(wire_send(sv[0], MSG_PING, ping), "send ping");
+        cJSON_Delete(ping);
+    }
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP sends commitment 0");
+    TEST_ASSERT(client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "balanced opening state accepted after a ping");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 1, "signature held");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    /* peer gone before the signature arrives */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 3");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 3");
+    close(sv[0]);
+    TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "closed connection is a failure");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored on EOF");
+    close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Rotation: the LSP carries the client's balance into the new channel
+   without touching the channel's funding amount or fee rate, so the client,
+   which derives both from its own copy of the tree, verifies commitment 0.
+   Sizing the channel from a fee rate the client does not share (here a live
+   estimate of 2562 sat/kvB) produces a signature the client rejects. */
+int test_rotation_commitment_carries_balance(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    int sv[2];
+
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+    uint64_t usable = lsp_ch.local_amount + lsp_ch.remote_amount;
+    uint64_t funding = lsp_ch.funding_amount;
+    uint64_t rate = lsp_ch.fee_rate_sat_per_kvb;
+
+    TEST_ASSERT(!lsp_channel_carry_client_balance(&lsp_ch, usable + 1),
+                "a balance larger than the channel is not carried");
+    TEST_ASSERT_EQ(lsp_ch.remote_amount, 39846, "default split kept");
+
+    /* the old channel held 30000 sat for the client and was smaller overall */
+    TEST_ASSERT(lsp_channel_carry_client_balance(&lsp_ch, 30000), "carry 30000 sat");
+    TEST_ASSERT_EQ(lsp_ch.remote_amount, 30000, "client balance carried");
+    TEST_ASSERT_EQ(lsp_ch.local_amount, usable - 30000, "LSP holds the rest");
+    TEST_ASSERT_EQ(lsp_ch.funding_amount, funding, "funding amount is the leaf output");
+    TEST_ASSERT_EQ(lsp_ch.fee_rate_sat_per_kvb, rate, "fee rate unchanged");
+
+    /* the client takes the balances from CHANNEL_READY, everything else from the tree */
+    client_ch.local_amount = lsp_ch.remote_amount;
+    client_ch.remote_amount = lsp_ch.local_amount;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP signs commitment 0");
+    TEST_ASSERT(client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "client verifies commitment 0 of the rotated channel");
+    TEST_ASSERT(initial_commitment_sig_valid(ctx, &client_ch, spk,
+                                             client_ch.latest_commitment_sig),
+                "signature spends the new leaf output");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    /* LSP sizes the channel from its own fee estimate instead */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 2");
+    lsp_ch.fee_rate_sat_per_kvb = 2562;
+    lsp_ch.funding_amount = lsp_ch.local_amount + lsp_ch.remote_amount
+                            + (2562 * 154 + 999) / 1000;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP signs with its own values");
+    TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "client rejects a signature over values it does not share");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

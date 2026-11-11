@@ -1295,6 +1295,11 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
                                  const unsigned char *signed_tx,
                                  size_t signed_tx_len);
 
+/* Remove the stored signed commitment of a channel (used when the factory it
+   spends from has been replaced and the transaction can no longer confirm).
+   Returns 1 on success, also when there was no row. */
+int persist_delete_commitment_sig(persist_t *p, uint32_t channel_id);
+
 /* Load the latest commitment TX signature. Returns 1 if found. */
 int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
                                  uint64_t *commitment_number_out,

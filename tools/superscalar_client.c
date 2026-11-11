@@ -597,6 +597,11 @@ typedef struct {
     /* 1 = a close ceremony ended without completing (see
        daemon_close_outcome): the process must not report success. */
     int     close_not_completed;
+    /* 1 = a rotation stopped after the new factory was written to the
+       database but before its channel and commitment 0 were: the database
+       no longer matches a usable channel, so the client must not reconnect
+       from it or report success. */
+    int     rotation_not_completed;
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -855,6 +860,23 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
     cJSON_Delete(rev_msg.json);
 }
 
+/* A rotation ended with the new factory on disk but without a saved channel
+   and commitment 0 for it.  Say what is and is not recoverable and make the
+   process stop instead of reconnecting from a database that no longer
+   describes a usable channel. */
+static void rotation_stopped(daemon_cb_data_t *cbd, uint32_t my_index,
+                              const factory_t *factory, const char *why) {
+    fprintf(stderr,
+            "Client %u: ROTATION NOT COMPLETED: %s.\n"
+            "  The new factory, its signed tree and its distribution transaction are in the\n"
+            "  database; there is no signed commitment for a channel in it.  Do not publish\n"
+            "  the factory tree.  The distribution transaction pays this client when the\n"
+            "  factory expires (block %u) if the tree has not been published; before that,\n"
+            "  funds move only with the LSP's cooperation.  Not reconnecting.\n",
+            my_index, why, factory ? factory->cltv_timeout : 0);
+    if (cbd) cbd->rotation_not_completed = 1;
+}
+
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
 /* A close ceremony ended without completing.  Record why, so that main()
    does not report a clean exit, and tell the operator what is left to do.
@@ -945,6 +967,19 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         persist_save_local_pcs(cbd->db, 0, cn, pcs);
                         memset(pcs, 0, 32);
                     }
+                }
+                /* The LSP's per-commitment points for commitments 0 and 1,
+                   received with its basepoints: a client that restarts
+                   before its first payment needs them to verify the LSP's
+                   revocation of commitment 0. */
+                for (uint64_t cn = 0; cn <= 1; cn++) {
+                    secp256k1_pubkey pcp;
+                    unsigned char ser[33];
+                    size_t slen = 33;
+                    if (channel_get_remote_pcp(ch, cn, &pcp) &&
+                        secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                                      SECP256K1_EC_COMPRESSED))
+                        persist_save_remote_pcp(cbd->db, 0, cn, ser);
                 }
                 if (!persist_commit(cbd->db)) {
                     fprintf(stderr, "Client %u: initial persist commit failed\n", my_index);
@@ -2102,6 +2137,9 @@ handle_message:
                                              factory, ch, &msg)) {
                 fprintf(stderr, "Client %u: factory rotation failed\n", my_index);
                 cJSON_Delete(msg.json);
+                if (client_rotation_new_factory_saved())
+                    rotation_stopped(cbd, my_index, factory,
+                                     "the channel in the new factory was not opened");
                 return 0;
             }
             cJSON_Delete(msg.json);
@@ -2149,14 +2187,22 @@ handle_message:
                                     persist_save_remote_pcp(cbd->db, 0, cn, ser);
                             }
                         }
-                        persist_commit(cbd->db);
+                        if (!persist_commit(cbd->db)) {
+                            rotation_stopped(cbd, my_index, factory,
+                                             "the new channel and its commitment could not be saved");
+                            return 0;
+                        }
                         printf("Client %u: persisted rotated factory + channel + basepoints + PCS\n", my_index);
                     } else {
-                        fprintf(stderr, "Client %u: rotation persist failed, rolling back\n", my_index);
                         persist_rollback(cbd->db);
+                        rotation_stopped(cbd, my_index, factory,
+                                         "the new channel and its commitment could not be saved");
+                        return 0;
                     }
                 } else {
-                    fprintf(stderr, "Client %u: persist_begin failed for rotation\n", my_index);
+                    rotation_stopped(cbd, my_index, factory,
+                                     "the new channel and its commitment could not be saved");
+                    return 0;
                 }
             }
 
@@ -2474,6 +2520,13 @@ static void usage(const char *prog) {
    #313 self-custody recovery path from the client's persisted DB. Called after the
    daemon loop exits on a detected LSP revocation forgery. Returns 1 if a recovery
    run was executed, 0 if it could not (no DB / no chain backend). */
+/* 1 if the database holds a signed commitment for the client's channel. */
+static int client_db_has_commitment(persist_t *db) {
+    uint64_t cn = 0;
+    size_t len = 0;
+    return persist_load_commitment_sig(db, 0, &cn, NULL, NULL, &len, 0) && len > 0;
+}
+
 static int client_force_close_from_db(const char *db_path, const char *network,
                                       const char *cli_path, const char *rpcuser,
                                       const char *rpcpassword, const char *datadir,
@@ -2507,9 +2560,14 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    char fr_status[256] = {0};
-    int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-    fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
+    if (!client_db_has_commitment(&db)) {
+        fprintf(stderr, "Client: CLOSE policy force-close: no signed commitment in DB; "
+                "NOT publishing the factory tree\n");
+    } else {
+        char fr_status[256] = {0};
+        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+        fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
+    }
     /* Broadcast the signed commitment TX (last verified state) if present. */
     unsigned char signed_tx_data[4096];
     size_t signed_tx_len = 0;
@@ -2976,9 +3034,19 @@ int main(int argc, char *argv[]) {
            passive startup/reorg scan that never broadcasts. Call repeatedly (caller
            mines between passes) so each tree level matures its CSV; the root spends
            the funding directly, so no distribution TX is required. */
-        char fr_status[256] = {0};
-        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-        printf("Force-close: %s (run=%d)\n", fr_status, result);
+        /* Publishing the tree spends the factory funding output, after which
+           the distribution transaction can never confirm.  Without a signed
+           commitment the client could not claim its channel output either, so
+           in that case the tree is left alone and only the distribution
+           transaction is tried. */
+        if (!client_db_has_commitment(&db)) {
+            printf("Force-close: no signed commitment in DB; NOT publishing the "
+                   "factory tree\n");
+        } else {
+            char fr_status[256] = {0};
+            int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
+            printf("Force-close: %s (run=%d)\n", fr_status, result);
+        }
 
         /* Broadcast signed commitment TX if available */
         {
@@ -3902,6 +3970,10 @@ int main(int argc, char *argv[]) {
                                             daemon_channel_cb, &cbd);
             }
             if (g_shutdown) break;
+            if (cbd.rotation_not_completed) {
+                ok = 0;
+                break;
+            }
             if (cbd.lsp_forgery_detected &&
                 cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
                 fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
@@ -3923,7 +3995,7 @@ int main(int argc, char *argv[]) {
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
         /* A close that did not complete is not a clean exit. */
-        if (cbd.close_not_completed)
+        if (cbd.close_not_completed || cbd.rotation_not_completed)
             ok = 0;
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */

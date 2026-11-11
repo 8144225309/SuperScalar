@@ -302,6 +302,20 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
    verify (the channel must not be used). */
 int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg);
 
+/* Channel open and rotation: receive the LSP's COMMITMENT_SIGNED for
+   commitment 0 from fd (keepalive pings are skipped) and accept it only if
+   the channel's opening balances account for the whole funding output
+   (balances == funding - base commitment fee) and the signature verifies.
+   Returns 1 if ch now holds a signed commitment 0, 0 otherwise. */
+int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index);
+
+/* 1 if the last client_do_factory_rotation call wrote the new factory, its
+   signed tree and its distribution transaction to the database (it does so
+   as soon as the tree is verified, before channel set-up).  When the call
+   then fails, the database describes the new factory but holds no channel
+   state or commitment for it. */
+int client_rotation_new_factory_saved(void);
+
 /* Write the channel's latest fully signed commitment transaction
    (ch->latest_commitment_sig over the commitment at ch->commitment_number)
    to the signed_commitments table, so it can be broadcast from the database

@@ -518,13 +518,52 @@ int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg
     return 1;
 }
 
+static int g_rotation_new_factory_saved = 0;
+
+int client_rotation_new_factory_saved(void) {
+    return g_rotation_new_factory_saved;
+}
+
+/* Rotation: write the new factory, its signed tree and its distribution
+   transaction as soon as the client holds them, and drop the commitment of
+   the channel in the replaced factory, which can no longer confirm.  From
+   here until commitment 0 of the new channel is stored the database holds no
+   commitment: the client's way out of the new factory in that window is the
+   distribution transaction at the factory's expiry.  Returns 0 if a database
+   is attached and the write failed. */
+static int client_rotation_save_factory(factory_t *f, secp256k1_context *ctx,
+                                         uint32_t my_index) {
+    persist_t *db = g_client_persist;
+    if (!db) return 1;
+    if (!persist_begin(db)) return 0;
+    int ok = persist_save_factory(db, f, ctx, 0) &&
+             persist_save_tree_nodes(db, f, 0) &&
+             persist_delete_commitment_sig(db, 0);
+    if (ok && f->dist_tx_ready && f->dist_unsigned_tx.len > 0)
+        ok = persist_save_distribution_tx(db, 0, f->dist_unsigned_tx.data,
+                                          f->dist_unsigned_tx.len);
+    if (!ok) { persist_rollback(db); return 0; }
+    if (!persist_commit(db)) return 0;
+    g_rotation_new_factory_saved = 1;
+    printf("Client %u: new factory, signed tree%s saved before channel set-up\n",
+           my_index, (f->dist_tx_ready && f->dist_unsigned_tx.len > 0)
+                     ? " and distribution TX" : "");
+    return 1;
+}
+
 /* Channel open: receive the LSP's COMMITMENT_SIGNED for commitment 0, which
    the LSP sends right after the nonce exchange. */
-static int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index) {
+int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index) {
     wire_msg_t msg;
-    if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
-        msg.msg_type != MSG_COMMITMENT_SIGNED) {
-        fprintf(stderr, "Client %u: expected initial COMMITMENT_SIGNED\n", my_index);
+    memset(&msg, 0, sizeof(msg));
+    if (!wire_recv_skip_ping(fd, &msg)) {
+        fprintf(stderr, "Client %u: connection lost waiting for the initial "
+                "COMMITMENT_SIGNED\n", my_index);
+        return 0;
+    }
+    if (check_msg_error(&msg) || msg.msg_type != MSG_COMMITMENT_SIGNED) {
+        fprintf(stderr, "Client %u: expected initial COMMITMENT_SIGNED, got 0x%02x\n",
+                my_index, msg.msg_type);
         if (msg.json) cJSON_Delete(msg.json);
         return 0;
     }
@@ -1534,6 +1573,7 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
     wire_msg_t msg;
+    g_rotation_new_factory_saved = 0;
 
     /* Parse FACTORY_PROPOSE from initial_propose */
     const cJSON *pj = initial_propose->json;
@@ -1902,6 +1942,13 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
                             "signature verification\n");
             free(secnonces); free(nonce_entries); return 0;
         }
+    }
+
+    /* Durable before anything else can fail. */
+    if (!client_rotation_save_factory(factory_out, ctx, my_index)) {
+        fprintf(stderr, "Client %u: could not save the new factory; stopping the "
+                "rotation\n", my_index);
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     /* Basepoint exchange: receive LSP's basepoints */
