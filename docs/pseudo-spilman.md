@@ -45,6 +45,21 @@ leaf-level state advances (which only the LSP triggers), NOT to HTLC
 flow. Verified by regtest tests `test_regtest_htlc_force_to_local_arity_ps`
 and `test_regtest_htlc_breach_arity_ps`.
 
+**Payments never advance a leaf.** A payment moves balances inside the
+inner channels and leaves the factory tree untouched. The channel's
+funding outpoint is output 0 of the leaf transaction that existed when the
+channel opened; a leaf advance (PS: a new chain transaction spending that
+output; DW: a new leaf txid with a lower nSequence) replaces that
+transaction and does **not** move the channel onto the new outpoint, so
+commitments signed before the advance cannot be broadcast after the
+advanced leaf confirms. `lsp_channels_advance_ps_leaf` therefore refuses
+to advance a leaf while a channel on it holds client funds (a client
+balance or an in-flight HTLC); the override argument exists only for the
+harness flags that exercise the ceremony (`--test-leaf-advance`,
+`--test-wire-leaf-advance`, `--test-ps-advance`, `--test-tier-b-rollover`).
+Verified by `tools/test_regtest_payment_no_leaf_advance.sh` and the unit
+tests `test_payment_leaves_leaf_untouched_arity_ps` / `_arity1`.
+
 ## Why PS is non-revocable
 
 Decker–Wattenhofer leaves order their states using **decrementing
