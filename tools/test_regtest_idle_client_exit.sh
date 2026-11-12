@@ -164,13 +164,13 @@ run_scenario(){
         *)         echo "unknown scenario '$SC'"; return 1 ;;
     esac
     local H0; H0=$("${BCLI[@]}" getblockcount)
-    local ACTIVE=3000
-    { [ "$SC" = rotate ] || [ "$SC" = rotate_stopped ]; } && ACTIVE=45
+    local ACTIVE=3000 ROT
+    ROT=(); { [ "$SC" = rotate ] || [ "$SC" = rotate_stopped ]; } && { ACTIVE=45; ROT=(--enable-rotation-experimental); }
     local LSPARGS=(--network regtest --port "$P" --clients $N --amount $AMOUNT
         --active-blocks $ACTIVE --dying-blocks 300 --cltv-timeout $((H0 + 3500))
         --step-blocks 5 --states-per-layer 2 --fee-rate $FEE --lsp-balance-pct 50
         --confirm-timeout 600 --seckey "$LSP_SECKEY" "${RPC[@]}" --wallet $WALLET
-        --db "$D/lsp.db" --daemon)
+        --db "$D/lsp.db" --daemon "${ROT[@]}")
     [ "$SC" = mixed ] && LSPARGS+=(--payments 1)
     if [ "$SC" = rotate ] || [ "$SC" = reconnect ]; then
         LSPARGS+=(--cli)
