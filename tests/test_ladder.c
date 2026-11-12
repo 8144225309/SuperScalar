@@ -2674,6 +2674,7 @@ int test_rotation_postponed_on_fees_changes_nothing(void) {
     lsp->n_clients = 4;
     lsp->client_fds = calloc(4, sizeof(int));
     lsp->client_pubkeys = calloc(4, sizeof(secp256k1_pubkey));
+    /* cppcheck-suppress memleak ; TEST_ASSERT leaks on failure — test-only, process exits */
     TEST_ASSERT(lsp->client_fds && lsp->client_pubkeys, "lsp arrays");
     TEST_ASSERT(secp256k1_keypair_pub(ctx, &lsp->lsp_pubkey, &lsp_kp), "lsp pk");
     turnover_client_t cl[4];
@@ -2724,6 +2725,7 @@ int test_rotation_postponed_on_fees_changes_nothing(void) {
     TEST_ASSERT(mgr->entries, "entries");
     /* an HTLC in flight on client 0's channel */
     mgr->entries[0].channel.htlcs = calloc(1, sizeof(htlc_t));
+    /* cppcheck-suppress memleak ; TEST_ASSERT leaks on failure — test-only, process exits */
     TEST_ASSERT(mgr->entries[0].channel.htlcs, "htlcs");
     mgr->entries[0].channel.htlcs_cap = 1;
     mgr->entries[0].channel.n_htlcs = 1;
