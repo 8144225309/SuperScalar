@@ -33,6 +33,12 @@
 #                      transaction, next to the untouched old factory and
 #                      commitment, and its --force-close must NOT publish
 #                      the new factory's tree.  No exit is attempted.
+#   scenario "pending_exit": no payments; after the kill every client's
+#                      database is given a pending-rotation record while its
+#                      factory is still unspent.  --force-close must exit
+#                      through that factory and keep doing so on later passes,
+#                      when the funding output has been spent by the client's
+#                      own root transaction.
 #   scenario "reconnect": client 4 is restarted right after channel open,
 #                      then pays and is paid.  Both payments must succeed and
 #                      the client must stay up (commitment 0 took nonce index
@@ -60,7 +66,8 @@
 # covers, and this test would fail on a node with the default relay floor.
 #
 # Usage: bash tools/test_regtest_idle_client_exit.sh [BUILD_DIR]
-# Env:   SCENARIOS ("idle mixed rotate rotate_stopped reconnect")  RPCPORT (18543)
+# Env:   SCENARIOS ("idle mixed rotate rotate_stopped pending_exit reconnect")
+#        RPCPORT (18543)
 #        PORT (29961)  KEEP (0)
 set -uo pipefail
 
@@ -68,7 +75,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${1:-$(dirname "$SCRIPT_DIR")/build}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
-SCENARIOS="${SCENARIOS:-idle mixed rotate rotate_stopped reconnect}"
+SCENARIOS="${SCENARIOS:-idle mixed rotate rotate_stopped pending_exit reconnect}"
 RPCPORT="${RPCPORT:-18543}"
 PORT="${PORT:-29961}"
 KEEP="${KEEP:-0}"
@@ -145,6 +152,7 @@ run_scenario(){
         mixed)     echo "=== scenario 'mixed': LSP + $N clients, client 1 pays client 2, clients 3 and 4 idle ===" ;;
         rotate)    echo "=== scenario 'rotate': LSP + $N clients, one payment, factory rotation, then exit from the new factory ===" ;;
         rotate_stopped) echo "=== scenario 'rotate_stopped': LSP + $N clients, the LSP dies mid-rotation before commitment 0 ===" ;;
+        pending_exit) echo "=== scenario 'pending_exit': LSP + $N clients, no payments, exit with a rotation recorded as pending ===" ;;
         reconnect) echo "=== scenario 'reconnect': LSP + $N clients, client 4 restarted after open, then payments ===" ;;
         *)         echo "unknown scenario '$SC'"; return 1 ;;
     esac
@@ -321,12 +329,24 @@ run_scenario(){
             echo "  client $i after rotation: $(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT 'commitment_number=' || commitment_number FROM signed_commitments;" 2>/dev/null | head -1 | grep . || echo "NO signed commitment") balance=$(bal_of "$D/c$i.db")"
         done
         [ "$have" -eq $N ] || red "  only $have of $N clients hold a signed commitment 0 for the new factory"
+        for i in $(seq 1 $N); do
+            n=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT count(*) FROM factories WHERE id = 1;" 2>/dev/null)
+            [ "${n:-1}" = 0 ] || { red "  CHECK FAIL client $i still has a pending-rotation record after a completed rotation"; restart_ok=0; }
+        done
         sleep 5
     fi
     sleep 5
 
     echo "  killing the LSP and all clients"
     kill_ss
+
+    if [ "$SC" = pending_exit ]; then
+        for i in $(seq 1 $N); do
+            sqlite3 "$D/c$i.db" "CREATE TEMP TABLE t AS SELECT * FROM factories WHERE id = 0; UPDATE t SET id = 1; INSERT INTO factories SELECT * FROM t;" \
+                || { red "  CHECK FAIL could not add the pending record to client $i's database"; restart_ok=0; }
+        done
+        echo "  pending-rotation record added to every client database (factory still unspent)"
+    fi
 
     # Each client exits alone from its database; mine between passes so each
     # tree level matures.
@@ -358,6 +378,13 @@ run_scenario(){
     done
     echo "  $conf of $N commitments confirmed after $pass force-close pass(es) (height $("${BCLI[@]}" getblockcount))"
     mine 2
+    if [ "$SC" = pending_exit ]; then
+        for i in $(seq 1 $N); do
+            if grep -q "is unspent, exiting through it" "$D/fc_c$i.log" && grep -q "own root transaction of the factory being left is on chain, continuing" "$D/fc_c$i.log"; then
+                echo "  ok   client $i exited through the unspent factory and continued after its own root spent the funding"
+            else red "  CHECK FAIL client $i: force-close did not follow the old factory through ($(grep -c "rotation pending" "$D/fc_c$i.log") pending lines)"; restart_ok=0; fi
+        done
+    fi
 
     BCLI_STR="${BCLI[*]}" PRE_BAL="$PRE_BAL" python3 - "$D" "$N" "$SC" "$PAY_AMT" <<'PYEOF'
 import sys, os, json, sqlite3, subprocess
