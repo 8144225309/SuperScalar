@@ -284,6 +284,11 @@ int client_dist_settles(client_dist_status_t s) {
            s == CLIENT_DIST_CONFIRMED || s == CLIENT_DIST_REFUSED;
 }
 
+int client_dist_may_exit(int confs, int close_confs, int has_jit,
+                         size_t n_watched) {
+    return close_confs > 0 && confs >= close_confs && !has_jit && n_watched == 0;
+}
+
 client_dist_status_t client_dist_step(chain_backend_t *chain,
                                       const client_dist_tx_t *d,
                                       client_dist_send_fn send, int *tip_out,
@@ -447,7 +452,7 @@ client_dist_status_t client_dist_watch(client_dist_watch_t *w, persist_t *db,
     }
 
     int tip = -1;
-    client_dist_status_t s = client_dist_step(chain, &w->d, send, &tip, NULL);
+    client_dist_status_t s = client_dist_step(chain, &w->d, send, &tip, &w->confs);
     if (!w->reported || s != w->last || s == CLIENT_DIST_BROADCAST) {
         if (s != CLIENT_DIST_NOT_YET || w->reported)
             report(out, "Client: ", s, &w->d, tip);

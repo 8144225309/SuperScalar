@@ -346,3 +346,13 @@ int test_client_dist_step_spent_and_confirmed(void) {
     fixture_free(&fx);
     return 1;
 }
+
+int test_client_dist_daemon_exit_rule(void) {
+    T_ASSERT(client_dist_may_exit(6, 6, 0, 0), "buried, nothing to watch");
+    T_ASSERT(!client_dist_may_exit(1, 6, 0, 0), "one confirmation of six");
+    T_ASSERT(!client_dist_may_exit(-1, 1, 0, 0), "unknown depth");
+    T_ASSERT(!client_dist_may_exit(6, 6, 1, 0), "open JIT channel");
+    T_ASSERT(!client_dist_may_exit(6, 6, 0, 3), "watched revoked commitments");
+    T_ASSERT(!client_dist_may_exit(6, 0, 0, 0), "no close depth");
+    return 1;
+}

@@ -7,6 +7,9 @@
 #               Nobody may publish the distribution TX before its nLockTime;
 #               once the chain reaches it the daemons publish it, it confirms,
 #               it spends the factory funding output, and the daemons exit.
+#   expirywatch As expiry, after demo payments: the daemons see the TX
+#               confirmed but keep running, since they still watch revoked
+#               commitments.
 #   forceclose  LSP and daemons killed.  At the nLockTime a client's
 #               --force-close publishes the distribution TX and none of the
 #               tree (which would make it invalid); a second client's
@@ -36,7 +39,7 @@ set -uo pipefail
 BUILD_DIR="${1:-build}"
 shift || true
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(expiry forceclose rpcroot cltv sweep)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(expiry expirywatch forceclose rpcroot cltv sweep)
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
@@ -183,6 +186,34 @@ scenario_expiry() {
     [ $alive -eq 0 ] && pass "daemons exited once settled" || fail "$alive daemons still running"
     grep -qa "non-final" "$d"/c*.log && fail "a client sent it before its nLockTime (non-final)" ||
         pass "no client sent it early"
+    kill_clients
+}
+
+scenario_expirywatch() {
+    local d=$T/expirywatch
+    say "=== expirywatch: settled daemons keep watching revoked commitments"
+    factory_up "$d" 29969 --daemon --demo --active-blocks 20 --dying-blocks 10 || return
+    wait_grep "$d/lsp.log" "entering daemon mode" 600 mine || { fail "LSP not in daemon mode"; return; }
+    clients_ready "$d" || return
+    sleep 5
+    stop "$LSP_PID"; say "LSP killed"
+    local hex txid lt i w
+    hex=$(dist_hex "$d/c0.db"); txid=$(txid_of "$hex"); lt=$(locktime_of "$hex")
+    w=$(sqlite3 "$d/c0.db" "SELECT count(*) FROM old_commitments;")
+    [ "${w:-0}" -gt 0 ] && pass "client 0 watches $w revoked commitment(s)" || fail "no revoked commitments to watch"
+    while [ "$(height)" -lt "$lt" ]; do mine 1; done
+    mine 1
+    local ok=0
+    for i in $(seq 0 $((NCLI - 1))); do
+        wait_grep "$d/c$i.log" "distribution TX $txid is confirmed" 90 mine && ok=$((ok + 1))
+    done
+    [ $ok -eq $NCLI ] && pass "every daemon saw it confirmed" || fail "$ok of $NCLI daemons saw it confirmed"
+    sleep 15
+    local alive=0
+    for p in "${CLIENT_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=$((alive + 1)); done
+    [ $alive -eq $NCLI ] && pass "all daemons still running" || fail "$((NCLI - alive)) daemon(s) exited with revoked commitments to watch"
+    grep -q "still running" "$d/c0.log" && pass "$(grep -m1 -o "still running.*" "$d/c0.log")" ||
+        fail "no report of what is still watched"
     kill_clients
 }
 
@@ -350,7 +381,7 @@ echo "=========== client exits without the LSP (build: $BUILD_DIR) ==========="
 node_up
 for s in "${SCENARIOS[@]}"; do
     case $s in
-        expiry|forceclose|rpcroot|sweep|cltv) "scenario_$s" ;;
+        expiry|expirywatch|forceclose|rpcroot|sweep|cltv) "scenario_$s" ;;
         *) echo "unknown scenario $s"; exit 2 ;;
     esac
 done

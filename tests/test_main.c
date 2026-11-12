@@ -1369,6 +1369,7 @@ extern int test_client_dist_verify_accepts_signed(void);
 extern int test_client_dist_verify_rejects(void);
 extern int test_client_dist_step_never_early(void);
 extern int test_client_dist_step_spent_and_confirmed(void);
+extern int test_client_dist_daemon_exit_rule(void);
 extern int test_cli_static_near_root_parses_1(void);
 extern int test_cli_static_near_root_parses_zero_disabled(void);
 extern int test_cli_static_near_root_rejects_negative(void);
@@ -3384,6 +3385,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_dist_verify_rejects);
     RUN_TEST(test_client_dist_step_never_early);
     RUN_TEST(test_client_dist_step_spent_and_confirmed);
+    RUN_TEST(test_client_dist_daemon_exit_rule);
     RUN_TEST(test_cli_static_near_root_parses_1);
     RUN_TEST(test_cli_static_near_root_parses_zero_disabled);
     RUN_TEST(test_cli_static_near_root_rejects_negative);

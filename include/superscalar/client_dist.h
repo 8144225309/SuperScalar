@@ -91,6 +91,13 @@ client_dist_status_t client_dist_step(chain_backend_t *chain,
    funding output known unspent (sent, or refused and sent again later). */
 int client_dist_settles(client_dist_status_t s);
 
+/* 1 if a daemon whose distribution TX has confs confirmations may stop:
+   confs reaches close_confs (an unknown count, -1, never does), and
+   nothing is left to watch: no open JIT channel, no watched revoked
+   commitment, no pending penalty (n_watched counts the last two). */
+int client_dist_may_exit(int confs, int close_confs, int has_jit,
+                         size_t n_watched);
+
 const char *client_dist_status_str(client_dist_status_t s);
 
 /* Daemon watch: re-reads the stored TX (re-verifying it only when it
@@ -104,6 +111,7 @@ typedef struct {
     int checked;                /* raw/raw_state are set */
     int loaded;                 /* 1 verified, -1 unusable, 0 none */
     client_dist_status_t last;
+    int confs;                  /* confirmations at the last check, -1 unknown */
     int reported;               /* last has been reported */
     time_t last_check;
 } client_dist_watch_t;

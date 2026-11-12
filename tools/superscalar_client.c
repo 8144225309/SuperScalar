@@ -3990,13 +3990,33 @@ int main(int argc, char *argv[]) {
                    detect on-chain breaches even when the LSP is unreachable. */
                 if (cbd.wt)
                     watchtower_check(cbd.wt);
-                /* The factory's end date pays the members without the LSP. */
+                /* The factory's end date pays the members without the LSP.
+                   Once its TX is buried to the close depth and nothing is
+                   left to watch, the daemon stops; otherwise it keeps
+                   running the watchtower. */
                 if (use_db &&
                     client_dist_tick(&db, cbd.wt, ctx) == CLIENT_DIST_CONFIRMED) {
-                    printf("Client: the factory is settled by its distribution "
-                           "TX; nothing left to do, exiting\n");
-                    ok = 1;
-                    break;
+                    chain_backend_t *cb = cbd.wt ? cbd.wt->chain : NULL;
+                    size_t watched = cbd.wt ? cbd.wt->n_entries + cbd.wt->n_pending : 0;
+                    if (client_dist_may_exit(g_dist_watch.confs,
+                                             chain_close_confs(cb, cb && cb->is_regtest),
+                                             cbd.jit_ch != NULL, watched)) {
+                        printf("Client: the factory is settled by its distribution "
+                               "TX (%d confirmations); nothing left to watch, "
+                               "exiting\n", g_dist_watch.confs);
+                        ok = 1;
+                        break;
+                    }
+                    static int keep_reported = 0;
+                    if (!keep_reported) {
+                        keep_reported = 1;
+                        printf("Client: the factory is settled by its distribution "
+                               "TX; still running: %d confirmations (close depth %d), %zu "
+                               "watched commitment(s)/penalty(ies), JIT channel %s\n",
+                               g_dist_watch.confs,
+                               chain_close_confs(cb, cb && cb->is_regtest), watched,
+                               cbd.jit_ch ? "open" : "none");
+                    }
                 }
                 sleep(1);
             } else {
