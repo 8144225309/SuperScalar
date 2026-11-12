@@ -765,6 +765,9 @@ static int run_sf_steps(const char *dbpath, int hashlock, const sf_opts_t *steps
         persist_t db;
         if (!persist_open(&db, dbpath)) _exit(3);
         client_set_persist(&db);
+        /* Tree advances are refused unless the harness opts in; opt in so
+           the proposals reach the record-and-refuse path under test. */
+        client_set_allow_tree_advance(1);
         sf_hook_state_t st;
         memset(&st, 0, sizeof st);
         st.dbpath = dbpath;
@@ -803,6 +806,7 @@ static int run_sf_steps(const char *dbpath, int hashlock, const sf_opts_t *steps
             if (!rc) break;  /* the LSP stops at a failed advance too */
         }
         lsp_crash_set_target(NULL);
+        client_set_allow_tree_advance(0);
         client_set_persist(NULL);
         persist_test_set_ps_hook(NULL, NULL);
         persist_close(&db);
