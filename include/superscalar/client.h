@@ -59,6 +59,18 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
+/* This member's own ceiling on the factory's pre-signed tree rate (sat/kvB):
+   a FACTORY_PROPOSE (creation or rotation) above it is refused, so an LSP
+   cannot spend a member's channel on pre-signed fees.  Default
+   CLIENT_DEFAULT_MAX_TREE_FEE_RATE (10 sat/vB); 0 = no ceiling.  Set from
+   --max-tree-fee-rate; nothing has to match the LSP. */
+#define CLIENT_DEFAULT_MAX_TREE_FEE_RATE 10000
+void client_set_max_tree_fee_rate(uint64_t sat_per_kvb);
+uint64_t client_max_tree_fee_rate(void);
+
+/* 1 if sat_per_kvb is within this member's ceiling (0 is always). */
+int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb);
+
 /* What the chain says about a transaction output. */
 typedef struct {
     uint64_t      amount_sats;

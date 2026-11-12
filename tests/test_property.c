@@ -436,7 +436,7 @@ int test_prop_persist_factory_roundtrip(void) {
         f->step_blocks = step;
         f->states_per_layer = states;
         f->cltv_timeout = 1000 + (rand_r(&seed) % 9000);
-        f->fee_per_tx = 300;
+        f->tree_fee_rate = 1500;
         f->leaf_arity = 2;
         /* Generate random funding txid */
         for (int i = 0; i < 32; i++)

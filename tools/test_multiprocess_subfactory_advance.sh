@@ -158,7 +158,7 @@ stdbuf -oL "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" \
     --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --demo --lsp-balance-pct 50 \

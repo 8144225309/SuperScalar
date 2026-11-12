@@ -154,6 +154,32 @@ static int hd_get_change_spk(wallet_source_t *self,
     return 1;
 }
 
+/* Key index of the wallet's scriptPubKey spk, 0xFFFFFFFF if not the wallet's. */
+static uint32_t hd_key_index_of(wallet_source_hd_t *ws, const unsigned char *spk,
+                                size_t spk_len)
+{
+    if (!spk || spk_len != 34) return 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < ws->n_spks; i++)
+        if (memcmp(ws->spks[i], spk, 34) == 0) return i;
+    /* Cache miss — try deriving up to next_index */
+    unsigned char tmp_spk[34];
+    for (uint32_t i = ws->n_spks; i < ws->next_index + ws->lookahead; i++) {
+        if (!wallet_source_hd_derive(ws, i, tmp_spk, NULL)) break;
+        if (memcmp(tmp_spk, spk, 34) == 0) return i;
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* -----------------------------------------------------------------------
+ * vtable: owns_coin
+ * --------------------------------------------------------------------- */
+static int hd_owns_coin(wallet_source_t *self, const char *txid_hex,
+                        uint32_t vout, const unsigned char *spk, size_t spk_len)
+{
+    (void)txid_hex; (void)vout;
+    return hd_key_index_of((wallet_source_hd_t *)self, spk, spk_len) != 0xFFFFFFFFu;
+}
+
 /* -----------------------------------------------------------------------
  * vtable: sign_input
  *
@@ -170,22 +196,7 @@ static int hd_sign_input(wallet_source_t *self,
     wallet_source_hd_t *ws = (wallet_source_hd_t *)self;
     if (!ws->ctx || !tx || !tx_len || !spk || spk_len != 34) return 0;
 
-    /* Find which key_index this SPK belongs to */
-    uint32_t key_index = 0xFFFFFFFFu;
-    for (uint32_t i = 0; i < ws->n_spks; i++) {
-        if (memcmp(ws->spks[i], spk, 34) == 0) {
-            key_index = i;
-            break;
-        }
-    }
-    if (key_index == 0xFFFFFFFFu) {
-        /* Cache miss — try deriving up to next_index */
-        unsigned char tmp_spk[34];
-        for (uint32_t i = ws->n_spks; i < ws->next_index + ws->lookahead; i++) {
-            if (!wallet_source_hd_derive(ws, i, tmp_spk, NULL)) break;
-            if (memcmp(tmp_spk, spk, 34) == 0) { key_index = i; break; }
-        }
-    }
+    uint32_t key_index = hd_key_index_of(ws, spk, spk_len);
     if (key_index == 0xFFFFFFFFu) return 0;
 
     /* Derive tweaked private key for this index */
@@ -384,6 +395,7 @@ int wallet_source_hd_init(wallet_source_hd_t *ws,
     ws->base.get_change_spk = hd_get_change_spk;
     ws->base.sign_input     = hd_sign_input;
     ws->base.release_utxo   = hd_release_utxo;
+    ws->base.owns_coin      = hd_owns_coin;
     ws->base.free           = hd_free;
     ws->base.type           = WALLET_SOURCE_HD;
     ws->ctx      = ctx;

@@ -34,7 +34,7 @@ echo "=== SIGNET: sub-factory breach x STANDALONE trustless WT (0.1 sat/vB) ==="
 echo "  [$(ts)] height $(tip), amount=$AMOUNT, k=$PS_SUB_ARITY, fee=$FEE_RATE. signet ~10min/block — multi-hour."
 pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null||true; sleep 1
 "$LSP_BIN" --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
-    --port $LSP_PORT --clients $N_CLIENTS --arity 3 --ps-subfactory-arity $PS_SUB_ARITY \
+    --port $LSP_PORT --clients $N_CLIENTS --arity 3 --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $AMOUNT --fee-rate $FEE_RATE --confirm-timeout $CONFIRM_TIMEOUT \
     --seckey "$LSP_SECKEY" --wallet "$WALLET" --db "$LSP_DB" --wt-db "$WT_DB" \
     --demo --lsp-balance-pct 50 --cheat-daemon-sub > "$LSP_LOG" 2>&1 &

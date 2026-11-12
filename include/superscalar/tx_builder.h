@@ -33,6 +33,19 @@ int build_unsigned_tx_with_locktime(
     size_t n_outputs
 );
 
+/* As build_unsigned_tx_with_locktime, with an explicit nVersion. */
+int build_unsigned_tx_with_locktime_v(
+    tx_buf_t *out,
+    unsigned char *txid_out32,
+    const unsigned char *funding_txid,
+    uint32_t funding_vout,
+    uint32_t nsequence,
+    uint32_t nlocktime,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nVersion
+);
+
 /* Build unsigned single-input tx (nVersion=2, nLockTime=0). */
 int build_unsigned_tx(
     tx_buf_t *out,

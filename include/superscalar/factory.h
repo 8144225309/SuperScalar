@@ -38,6 +38,15 @@
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
+/* nVersion of every factory tree transaction.  TRUC (BIP 431, nVersion 3):
+   a TRUC parent may sit below the node's minimum relay feerate when it is
+   relayed as a package with a child that pays for it, and its keyless P2A
+   anchor can only be spent by a single child of at most 1000 vB that a
+   higher-paying sibling may evict, so the anchor cannot be used to pin the
+   exit.  Bitcoin Core relays non-TRUC parents in a package only if they meet
+   the minimum relay feerate on their own. */
+#define FACTORY_TREE_TX_VERSION 3u
+
 /* Default CSV (BIP-68 relative locktime) on the L-stock SPK's L&CSV
    script-path leaf, in blocks.  Spec source: ZmnSCPxj's t/1242 doesn't
    pin a value; the rationale is "long enough that watchtowers / clients
@@ -159,6 +168,10 @@ typedef struct {
 
     /* Input amount from parent output */
     uint64_t input_amount;
+
+    /* Miner fee this node's tx pays (input_amount - sum(outputs)): the
+       factory's tree_fee_rate for its exact vsize. */
+    uint64_t fee_sats;
 
     /* Timeout script path (staggered per-node CLTV) */
     int has_taptree;
@@ -351,9 +364,14 @@ typedef struct {
     uint16_t step_blocks;
     uint32_t states_per_layer;
 
-    /* Fee per transaction */
-    uint64_t fee_per_tx;
-    fee_estimator_t *fee;  /* if set, overrides fee_per_tx with computed fees */
+    /* Rate (sat/kvB) every pre-signed tree transaction pays, for its exact
+       vsize: a factory term, carried in FACTORY_PROPOSE (the LSP and every
+       member build the tree at it).  factory_init* set
+       FACTORY_DEFAULT_TREE_FEE_RATE; 0 is allowed.  The fee the network asks
+       for beyond it is paid at broadcast time by a child on the anchor. */
+    uint64_t tree_fee_rate;
+    /* 1: factory_build_tree logs nothing (trial builds while planning). */
+    int build_quiet;
 
     /* CLTV timeout (absolute block height) */
     uint32_t cltv_timeout;
@@ -754,6 +772,57 @@ int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
 int factory_set_placement_mode(factory_t *f, placement_mode_t mode);
 
 int factory_build_tree(factory_t *f);
+
+/* Default pre-signed tree rate (sat/kvB): 0.1 sat/vB, Bitcoin Core's
+   default -minrelaytxfee since 29.1.  The rate is a factory term the LSP
+   proposes (FACTORY_PROPOSE tree_fee_rate, --tree-fee-rate) and every member
+   checks; 0 is allowed.  Nothing derives it from a fee estimate. */
+#define FACTORY_DEFAULT_TREE_FEE_RATE 100
+
+/* Value of the P2A anchor on every tree transaction and the distribution TX:
+   0 (ephemeral dust, Bitcoin Core 29+) when the factory's rate is 0, so that
+   transaction pays no fee at all, else ANCHOR_OUTPUT_AMOUNT. */
+uint64_t factory_tree_anchor_sats(const factory_t *f);
+
+/* Fee paid by a tree transaction with n_inputs taproot key-path inputs and
+   n_p2tr P2TR outputs, plus the P2A anchor when with_anchor is set: exactly
+   the factory's tree_fee_rate for that exact vsize. */
+uint64_t factory_tree_tx_fee(const factory_t *f, size_t n_inputs, size_t n_p2tr,
+                             int with_anchor);
+
+/* Fee paid by one pseudo-Spilman leaf chain advance (chain[1] onward). */
+uint64_t factory_ps_chain_fee(const factory_t *f);
+
+/* Amount one PS leaf chain advance takes out of the channel output: its fee
+   plus the P2A anchor it carries when tree anchors are on. */
+uint64_t factory_ps_chain_reserve(const factory_t *f);
+
+/* Largest transaction TRUC policy accepts (BIP 431). */
+#define TRUC_MAX_VSIZE 10000
+
+/* Most clients a factory with a distribution TX can have: that TX (nVersion
+   3, one P2TR output per client plus the anchor) must stay within
+   TRUC_MAX_VSIZE, the only way a transaction below the relay floor is
+   relayed with a child.  230 clients take 9971 vB, 231 take 10014. */
+#define FACTORY_MAX_DIST_CLIENTS 230
+
+/* Virtual size of the signed distribution TX of a factory with n_clients
+   clients. */
+size_t factory_distribution_tx_vsize(size_t n_clients);
+
+/* Fee paid by that distribution TX: the tree rate for its exact vsize. */
+uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients);
+
+/* Check every built node, and the distribution TX when one is built, from
+   the transaction bytes and the parent outputs, independently of the code
+   that sized them: nVersion 3, a P2A anchor (last) worth
+   factory_tree_anchor_sats, a fee of exactly the agreed tree_fee_rate for
+   the exact signed vsize.  At rate 0 every node must carry the anchor (it
+   has no other way to get a fee).  The LSP and every member run this before
+   signing anything.  Returns 1 if all hold; otherwise 0 with the reason in
+   why (optional). */
+int factory_check_tree_fees(const factory_t *f, char *why, size_t why_len);
+
 int factory_sign_all(factory_t *f);
 
 /* nLockTime of the factory's distribution transaction: the factory's CLTV
@@ -1080,6 +1149,7 @@ typedef struct {
     int ps_chain_len;
     unsigned char ps_prev_txid[32];
     uint64_t ps_prev_chan_amount;
+    uint64_t fee_sats;
 } factory_leaf_snapshot_t;
 
 /* Capture the state of leaf leaf_side.  Returns 1 on success; the snapshot

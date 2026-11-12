@@ -75,6 +75,16 @@ int channel_add_ptlc(channel_t *ch, ptlc_direction_t dir,
         return 0;
     }
 
+    /* A PTLC at or above dust is a commitment output: one more must keep
+       the commitment relayable. */
+    if (amount_sats >= CHANNEL_DUST_LIMIT_SATS &&
+        channel_commit_htlc_outputs(ch) >= channel_max_commit_htlc_outputs()) {
+        fprintf(stderr, "channel_add_ptlc: refused — the commitment already "
+                "carries %zu HTLC/PTLC outputs, the most that fit in %d vB\n",
+                channel_commit_htlc_outputs(ch), CHANNEL_MAX_COMMIT_VSIZE);
+        return 0;
+    }
+
     /* #182: deduct amount + per-PTLC commit fee from the sender. Mirrors
        channel_add_htlc balance accounting; without this the commit TX
        outputs exceed funding and broadcast fails with bad-txns-in-belowout. */
@@ -100,7 +110,7 @@ int channel_add_ptlc(channel_t *ch, ptlc_direction_t dir,
         }
     }
     /* Per-PTLC commit fee — same 43 vB shape as HTLCs. */
-    uint64_t per_ptlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    uint64_t per_ptlc_fee = (ch->commit_fee_rate_sat_per_kvb * 43 + 999) / 1000;
     uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
     if (amount_sats > 0 && *funder_bal < per_ptlc_fee) {
         /* Rollback amount deduction. */
