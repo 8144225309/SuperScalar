@@ -7,6 +7,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/shachain.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/types.h"   /* secure_zero */
 #include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include "superscalar/regtest.h"  /* CL7: regtest_send_raw_tx + regtest_t */
 #include <secp256k1_schnorrsig.h>
@@ -4330,16 +4331,78 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    from the public function when SS_MUSIG_STATELESS=1 and the LSP sent a
    PROPOSE_INTENT (new opcode 0x7D) instead of legacy PROPOSE (0x73). */
 /* Phase 1e.1.e: MULTI-INPUT stateless sub-factory advance (client side).
-   Mirrors client_handle_subfactory_advance_stateless looped per input.
+   The only sub-factory advance ceremony: every sub chain tx is multi-input,
+   and client_handle_subfactory_advance_stateless dispatches every accepted
+   PROPOSE_INTENT here.
    STATELESS INVARIANT: each per-input client secnonce is generated once and
-   consumed/zeroed by musig_create_partial_sig before the DONE recv. */
-static int client_handle_subfactory_advance_stateless_multi(
+   consumed/zeroed by musig_create_partial_sig before the DONE recv.
+
+   PS record-and-refuse, per input.  chain[N+1] spends EVERY output of
+   chain[N] and nothing revokes it, so the only thing stopping the LSP from
+   getting a second, different chain[N+1] co-signed (another delta_sats or
+   channel_idx, proposed after this client restarted from chain[N]) is this
+   client refusing to sign a different spend of an outpoint it has already
+   signed a spend of.  Same rules as the leaf (docs/pseudo-spilman.md,
+   "Record-and-refuse"), applied to every input this client signs (its own
+   channel input and the N-of-N sales-stock input):
+     sighash_i -> check_i, for every signed input, before any nonce
+     -> nonces -> bind (input i's session message == sighash_i)
+     -> partial sig i (kept in *sec) -> INSERT every signed input, ascending
+     -> our psigs into the sessions -> CLIENT_FINAL_PSIGS.
+   Any error refuses; a row with a different sighash refuses; a row with the
+   same sighash is an idempotent retry.
+
+   Multi-input atomicity: the INSERTs are separate autocommit statements, so
+   a failure after input a was recorded but before input b was leaves a's
+   row behind -- and aborts: nothing is sent.  That partial set is safe.
+   Each per-input sighash (SIGHASH_DEFAULT) commits to the whole transaction,
+   so a's row names exactly the transaction we were signing.  The identical
+   retry passes a (same sighash) and records b.  Any different spend of
+   chain[N] also spends a -- every sub chain tx spends all of chain[N]'s
+   outputs -- and is refused at a's pre-sign check, before any nonce.
+   Every ceremony inserts in ascending input order over the same input set,
+   so one that loses an INSERT race to a different spend loses it at its
+   first input and records nothing. */
+
+/* The secrets of one stateless multi-input sub-factory ceremony: the
+   per-input secnonces and our per-input partial sigs (n_inputs <=
+   FACTORY_MAX_OUTPUTS, checked by the dispatcher), plus the poison
+   side-channel's.  Owned by the wrapper below so that every exit zeroes
+   them, as leaf_adv_secrets_t does for the leaf ceremony. */
+typedef struct {
+    secp256k1_musig_secnonce secnonces[FACTORY_MAX_OUTPUTS];
+    secp256k1_musig_partial_sig psigs[FACTORY_MAX_OUTPUTS];
+    unsigned char psig_ser[FACTORY_MAX_OUTPUTS * 32];
+    secp256k1_musig_secnonce poison_secnonce;
+    secp256k1_musig_partial_sig poison_psig;
+    unsigned char poison_psig_ser[32];
+} sf_adv_secrets_t;
+
+/* Take back our own partial sigs from the per-input sessions of inputs
+   [0, upto): used when placing them fails partway, so that no partial sig
+   of ours is left in a session for a ceremony that sends nothing. */
+static void sf_clear_own_psigs(factory_t *factory, size_t sub_node_i,
+                               uint32_t my_index, size_t upto) {
+    factory_node_t *sub = &factory->nodes[sub_node_i];
+    for (size_t j = 0; j < upto && j < (size_t)FACTORY_MAX_OUTPUTS; j++) {
+        int s = factory_session_get_input_signer_slot(factory, sub_node_i, j, my_index);
+        if (s < 0) continue;
+        secure_zero(&sub->input_partial_sigs[j * (size_t)FACTORY_MAX_SIGNERS + (size_t)s],
+                    sizeof(secp256k1_musig_partial_sig));
+        if (sub->input_partial_sigs_received[j] > 0)
+            sub->input_partial_sigs_received[j]--;
+    }
+}
+
+static int subfactory_advance_multi_ceremony(
         int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
         factory_t *factory, uint32_t my_index, size_t sub_node_i,
         factory_node_t *sub, uint32_t n_inputs_u,
-        int leaf_side, int sub_idx, int channel_idx, uint64_t delta_sats) {
+        int leaf_side, int sub_idx, int channel_idx, uint64_t delta_sats,
+        sf_adv_secrets_t *sec) {
+    persist_t *persist = g_client_persist;
     size_t n_inputs = (size_t)n_inputs_u;
-    if (n_inputs < 1) {
+    if (n_inputs < 2 || n_inputs > FACTORY_MAX_OUTPUTS) {
         fprintf(stderr, "Client-stateless MULTI %u: n_inputs=%zu invalid\n",
                 my_index, n_inputs);
         return 0;
@@ -4375,6 +4438,15 @@ static int client_handle_subfactory_advance_stateless_multi(
         factory_session_reset_poison(factory, sub_node_i);
         return 0;
     }
+    /* The tx just built spends ps_n_prev_outputs inputs; we sign and record
+       exactly the inputs it has, so the declared count must match it. */
+    if (sub->ps_n_prev_outputs != n_inputs) {
+        fprintf(stderr, "Client-stateless MULTI %u: chain tx spends %zu inputs, "
+                "PROPOSE_INTENT declared %zu -- refusing\n",
+                my_index, sub->ps_n_prev_outputs, n_inputs);
+        factory_session_reset_poison(factory, sub_node_i);
+        return 0;
+    }
 
     /* Init one state session per input + (when prepared) poison session. */
     for (size_t i = 0; i < n_inputs; i++) {
@@ -4399,6 +4471,85 @@ static int client_handle_subfactory_advance_stateless_multi(
         return 0;
     }
 
+    /* PS record-and-refuse, part 1 of 2 (part 2 is the durable INSERT of
+       every signed input right before CLIENT_FINAL_PSIGS).  For EVERY input
+       this client signs, compute the BIP-341 sighash of the proposed spend
+       of (chain[N] txid, i) and consult client_ps_signed_inputs -- all of
+       them before any nonce exists.  The sighash comes from the unsigned tx
+       and the per-input prevouts the local advance just captured; it is
+       bound below to the message each input's session actually signs.  An
+       input that cannot be checked, or of which we already signed a
+       DIFFERENT spend, refuses the whole advance. */
+    /* With a persist handle the record is mandatory.  If this node were not
+       an advanced PS sub-factory chain (factory_session_init_node_input
+       already requires one), refuse rather than skip the record silently. */
+    if (persist && !(sub->is_ps_leaf && sub->ps_chain_len > 0 &&
+                     factory_node_uses_multi_input(factory, sub_node_i))) {
+        fprintf(stderr, "Client-stateless MULTI %u: sub node %zu is not an advanced PS "
+                "sub-factory chain -- refusing to sign without a record\n",
+                my_index, sub_node_i);
+        factory_session_reset_poison(factory, sub_node_i);
+        return 0;
+    }
+    const int ps_record_active = (persist != NULL);
+    unsigned char ps_sighash[FACTORY_MAX_OUTPUTS][32];
+    char ps_parent_hex[65] = {0};
+    memset(ps_sighash, 0, sizeof ps_sighash);
+    if (ps_record_active) {
+        for (int b = 0; b < 32; b++)
+            snprintf(ps_parent_hex + 2 * b, 3, "%02x", sub->ps_prev_txid[b]);
+        const unsigned char *prev_spks[FACTORY_MAX_OUTPUTS];
+        uint32_t prev_seqs[FACTORY_MAX_OUTPUTS];
+        for (size_t j = 0; j < n_inputs; j++) {
+            prev_spks[j] = sub->ps_prev_spks[j];
+            prev_seqs[j] = sub->nsequence;  /* every input shares nsequence */
+        }
+        for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_input_signs(factory, sub_node_i, i, my_index))
+                continue;  /* not ours: nothing signed, nothing recorded */
+            if (persist_test_ps_hook_fire(PERSIST_TEST_PS_SIGHASH) ||
+                !compute_taproot_sighash_multi(ps_sighash[i],
+                    sub->unsigned_tx.data, sub->unsigned_tx.len, (uint32_t)i,
+                    n_inputs, prev_spks, sub->ps_prev_spk_lens,
+                    sub->ps_prev_amounts, prev_seqs)) {
+                fprintf(stderr,
+                        "Client-stateless MULTI %u: cannot compute the sighash to record "
+                        "for (%s:%zu) -- refusing to sign.\n", my_index, ps_parent_hex, i);
+                factory_session_reset_poison(factory, sub_node_i);
+                return 0;
+            }
+            unsigned char prev_sighash[32];
+            int chk = persist_check_ps_signed_input(persist, /* factory_id = */ 0,
+                                                    sub->ps_prev_txid, (uint32_t)i,
+                                                    prev_sighash);
+            if (chk == PS_SIGNED_INPUT_ERROR) {
+                fprintf(stderr,
+                        "Client-stateless MULTI %u: cannot read client_ps_signed_inputs for "
+                        "(%s:%zu) -- refusing to sign (fail closed).\n",
+                        my_index, ps_parent_hex, i);
+                factory_session_reset_poison(factory, sub_node_i);
+                return 0;
+            }
+            if (chk == PS_SIGNED_INPUT_FOUND) {
+                if (memcmp(prev_sighash, ps_sighash[i], 32) != 0) {
+                    fprintf(stderr,
+                            "Client-stateless MULTI %u: REFUSING PS double-spend -- already "
+                            "signed a DIFFERENT TX spending (%s:%zu) (sub node %zu).\n",
+                            my_index, ps_parent_hex, i, sub_node_i);
+                    factory_session_reset_poison(factory, sub_node_i);
+                    return 0;
+                }
+                /* Same sighash: a retry of the identical chain tx (e.g. we
+                   crashed after recording, before FINAL_PSIGS reached the
+                   LSP).  Re-signed below with a fresh nonce; the stored
+                   partial sig is never replayed. */
+                printf("Client-stateless MULTI %u: input (%s:%zu) matches our recorded "
+                       "signing -- idempotent retry, re-signing the same spend\n",
+                       my_index, ps_parent_hex, i);
+            }
+        }
+    }
+
     /* Gen own per-input secnonces + pubnonces; set own nonce on each input. */
     unsigned char my_seckey[32];
     secp256k1_pubkey my_pubkey;
@@ -4408,35 +4559,34 @@ static int client_handle_subfactory_advance_stateless_multi(
     }
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    secp256k1_musig_secnonce *my_secnonces =
-        calloc(n_inputs, sizeof(secp256k1_musig_secnonce));
     unsigned char *my_pn_flat = calloc(n_inputs, 66);
-    if (!my_secnonces || !my_pn_flat) {
-        memset(my_seckey, 0, 32);
-        free(my_secnonces); free(my_pn_flat);
+    if (!my_pn_flat) {
+        secure_zero(my_seckey, sizeof my_seckey);
+        factory_session_reset_poison(factory, sub_node_i);
         return 0;
     }
     /* SF-MULTI-KEYAGG (#283): gen nonce against per-input keyagg cache, but
        only for inputs this client signs.  Channel input j (0..k-1) is signed
        only by LSP + client at sub->signer_indices[j+1]; sales-stock (input k)
        is N-of-N.  For inputs we do NOT sign, write a 66-byte zero pubnonce as
-       a skipped-input wire marker and leave my_secnonces[i] zero so the later
-       per-input loop also skips us. */
+       a skipped-input wire marker and leave sec->secnonces[i] zero so the
+       later per-input loop also skips us. */
     for (size_t i = 0; i < n_inputs; i++) {
         if (!factory_session_input_signs(factory, sub_node_i, i, my_index)) {
             /* Skipped input: 66 zero bytes on wire, no musig nonce gen, no
                secnonce held to consume.  my_pn_flat slot already zero from
-               calloc; my_secnonces[i] already zero. */
+               calloc; sec->secnonces[i] already zero. */
             continue;
         }
         secp256k1_musig_pubnonce my_pubnonce_i;
-        if (!musig_generate_nonce(ctx, &my_secnonces[i], &my_pubnonce_i,
+        if (!musig_generate_nonce(ctx, &sec->secnonces[i], &my_pubnonce_i,
                                    my_seckey, &my_pubkey,
                                    &sub->input_keyaggs[i].cache)) {
             fprintf(stderr, "Client-stateless MULTI %u: nonce gen input %zu failed\n",
                     my_index, i);
-            memset(my_seckey, 0, 32);
-            free(my_secnonces); free(my_pn_flat);
+            secure_zero(my_seckey, sizeof my_seckey);
+            free(my_pn_flat);
+            factory_session_reset_poison(factory, sub_node_i);
             return 0;
         }
         musig_pubnonce_serialize(ctx, my_pn_flat + i * 66, &my_pubnonce_i);
@@ -4447,8 +4597,8 @@ static int client_handle_subfactory_advance_stateless_multi(
                                              (size_t)my_slot_i, &my_pubnonce_i)) {
             fprintf(stderr, "Client-stateless MULTI %u: set own nonce input %zu (slot=%d) failed\n",
                     my_index, i, my_slot_i);
-            memset(my_seckey, 0, 32);
-            free(my_secnonces); free(my_pn_flat);
+            secure_zero(my_seckey, sizeof my_seckey);
+            free(my_pn_flat);
             factory_session_reset_poison(factory, sub_node_i);
             return 0;
         }
@@ -4456,22 +4606,21 @@ static int client_handle_subfactory_advance_stateless_multi(
 
     /* Poison (single-input side-channel): gen own poison secnonce + set own
        poison nonce while my_seckey is still live. */
-    secp256k1_musig_secnonce my_poison_secnonce;
     unsigned char my_poison_pn_ser[66] = {0};
     if (poison_prepared_c) {
         secp256k1_musig_pubnonce my_poison_pubnonce;
-        if (!musig_generate_nonce(ctx, &my_poison_secnonce, &my_poison_pubnonce,
+        if (!musig_generate_nonce(ctx, &sec->poison_secnonce, &my_poison_pubnonce,
                                     my_seckey, &my_pubkey, &sub->keyagg.cache) ||
             !factory_session_set_nonce_poison(factory, sub_node_i,
                                                 (size_t)my_slot, &my_poison_pubnonce)) {
-            memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
+            secure_zero(&sec->poison_secnonce, sizeof sec->poison_secnonce);
             factory_session_reset_poison(factory, sub_node_i);
             poison_prepared_c = 0;
         } else {
             musig_pubnonce_serialize(ctx, my_poison_pn_ser, &my_poison_pubnonce);
         }
     }
-    memset(my_seckey, 0, 32);
+    secure_zero(my_seckey, sizeof my_seckey);
 
     /* Send CLIENT_PUBNONCES with n_inputs own pubnonces (+ poison nonce). */
     cJSON *cpn_json = wire_build_subfactory_client_pubnonces(
@@ -4480,8 +4629,6 @@ static int client_handle_subfactory_advance_stateless_multi(
     if (!wire_send(fd, MSG_SUBFACTORY_CLIENT_PUBNONCES, cpn_json)) {
         cJSON_Delete(cpn_json);
         fprintf(stderr, "Client-stateless MULTI %u: send CLIENT_PUBNONCES failed\n", my_index);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        free(my_secnonces);
         factory_session_reset_poison(factory, sub_node_i);
         return 0;
     }
@@ -4493,8 +4640,6 @@ static int client_handle_subfactory_advance_stateless_multi(
         fprintf(stderr, "Client-stateless MULTI %u: expected LSP_RESPONSE, got 0x%02x\n",
                 my_index, lr_msg.json ? lr_msg.msg_type : 0);
         if (lr_msg.json) cJSON_Delete(lr_msg.json);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        free(my_secnonces);
         factory_session_reset_poison(factory, sub_node_i);
         return 0;
     }
@@ -4506,7 +4651,7 @@ static int client_handle_subfactory_advance_stateless_multi(
     if (!lsp_pn_flat || !lsp_psig_flat || !all_pn_per_input) {
         cJSON_Delete(lr_msg.json);
         free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
-        free(my_secnonces);
+        factory_session_reset_poison(factory, sub_node_i);
         return 0;
     }
     unsigned char all_poison_pn_sub[FACTORY_MAX_SIGNERS][66];
@@ -4524,8 +4669,6 @@ static int client_handle_subfactory_advance_stateless_multi(
     if (lr_rc == 0) {
         cJSON_Delete(lr_msg.json);
         free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        free(my_secnonces);
         factory_session_reset_poison(factory, sub_node_i);
         fprintf(stderr, "Client-stateless MULTI %u: parse LSP_RESPONSE failed\n", my_index);
         return 0;
@@ -4536,7 +4679,7 @@ static int client_handle_subfactory_advance_stateless_multi(
         (lr_rc < 2 || got_poison_len != (uint32_t)(sub->n_signers * 66))) {
         fprintf(stderr, "Client-stateless MULTI %u: LSP omitted poison fields -- "
                 "degrading\n", my_index);
-        memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
+        secure_zero(&sec->poison_secnonce, sizeof sec->poison_secnonce);
         factory_session_reset_poison(factory, sub_node_i);
         poison_prepared_c = 0;
     }
@@ -4553,16 +4696,12 @@ static int client_handle_subfactory_advance_stateless_multi(
        The matrix is indexed [node-level slot s][input i] (unchanged wire
        layout); we translate each row's participant index through
        factory_session_get_input_signer_slot.  Rows for participants outside
-       the per-input signer set carry zero placeholders and MUST be skipped. */
-    unsigned char *my_psig_flat = calloc(n_inputs, 32);
-    if (!my_psig_flat) {
-        free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
-        free(my_secnonces);
-        return 0;
-    }
+       the per-input signer set carry zero placeholders and MUST be skipped.
+       Our partial sigs stay in *sec -- not in the sessions, not on the wire
+       -- until part 2 of the record-and-refuse has recorded them. */
     for (size_t i = 0; i < n_inputs; i++) {
         if (!factory_session_input_signs(factory, sub_node_i, i, my_index)) {
-            /* Skipped input: nothing to sign, my_psig_flat slot stays zero. */
+            /* Skipped input: nothing to sign, sec->psig_ser slot stays zero. */
             continue;
         }
         int my_slot_i = factory_session_get_input_signer_slot(
@@ -4612,27 +4751,34 @@ static int client_handle_subfactory_advance_stateless_multi(
                     my_index, i);
             goto fail;
         }
-        secp256k1_musig_partial_sig my_psig_i;
-        if (!musig_create_partial_sig(ctx, &my_psig_i, &my_secnonces[i], keypair,
+        /* Bind the record to what is actually signed: the sighash checked in
+           part 1, which part 2 records for this input, must be the message
+           this input's MuSig2 session signs (fixed by
+           factory_session_finalize_node_input).  If they differ, the record
+           would describe a different spend than the signature -- refuse. */
+        if (ps_record_active &&
+            memcmp(ps_sighash[i], sub->input_signing_sessions[i].msg32, 32) != 0) {
+            fprintf(stderr,
+                    "Client-stateless MULTI %u: the sighash recorded for (%s:%zu) is not "
+                    "the message this session signs -- refusing to sign.\n",
+                    my_index, ps_parent_hex, i);
+            goto fail;
+        }
+        if (!musig_create_partial_sig(ctx, &sec->psigs[i], &sec->secnonces[i], keypair,
                                        &sub->input_signing_sessions[i])) {
             fprintf(stderr, "Client-stateless MULTI %u: create_partial_sig input %zu failed\n",
                     my_index, i);
             goto fail;
         }
-        /* my_secnonces[i] zeroed by musig_create_partial_sig. */
-        if (!factory_session_set_partial_sig_input(factory, sub_node_i, i,
-                                                    (size_t)my_slot_i, &my_psig_i)) {
-            fprintf(stderr, "Client-stateless MULTI %u: set own psig input %zu "
-                    "(per_input_slot=%d) failed\n", my_index, i, my_slot_i);
-            goto fail;
-        }
-        musig_partial_sig_serialize(ctx, my_psig_flat + i * 32, &my_psig_i);
+        /* sec->secnonces[i] consumed + zeroed by musig_create_partial_sig. */
     }
 
     /* Poison (single-input): set every signer's poison nonce from the forwarded
        matrix (own already set), finalize, create own poison psig (zeros the
-       poison secnonce before the DONE recv). */
-    unsigned char my_poison_psig_ser[32] = {0};
+       poison secnonce before the DONE recv).  The poison spends chain[N]'s
+       sales-stock -- the same outpoint as our state input k -- on purpose
+       (it is the penalty for broadcasting the superseded chain[N]), so it is
+       neither checked nor recorded in client_ps_signed_inputs. */
     if (poison_prepared_c) {
         int pz_ok = 1;
         for (size_t scs = 0; scs < sub->n_signers && pz_ok; scs++) {
@@ -4642,19 +4788,18 @@ static int client_handle_subfactory_advance_stateless_multi(
                 !factory_session_set_nonce_poison(factory, sub_node_i, scs, &ppn))
                 pz_ok = 0;
         }
-        secp256k1_musig_partial_sig my_poison_psig;
         pz_ok = pz_ok &&
             factory_session_finalize_node_poison(factory, sub_node_i) &&
-            musig_create_partial_sig(ctx, &my_poison_psig, &my_poison_secnonce,
+            musig_create_partial_sig(ctx, &sec->poison_psig, &sec->poison_secnonce,
                                        keypair, &sub->poison_signing_session);
-        memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
+        secure_zero(&sec->poison_secnonce, sizeof sec->poison_secnonce);
         if (!pz_ok) {
             fprintf(stderr, "Client-stateless MULTI %u: poison sign failed -- "
                     "degrading\n", my_index);
             factory_session_reset_poison(factory, sub_node_i);
             poison_prepared_c = 0;
         } else {
-            musig_partial_sig_serialize(ctx, my_poison_psig_ser, &my_poison_psig);
+            musig_partial_sig_serialize(ctx, sec->poison_psig_ser, &sec->poison_psig);
         }
     }
 
@@ -4672,12 +4817,71 @@ static int client_handle_subfactory_advance_stateless_multi(
     }
 
     free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
-    free(my_secnonces);  /* all entries already zeroed by create_partial_sig */
+    lsp_pn_flat = NULL; lsp_psig_flat = NULL; all_pn_per_input = NULL;  /* fail: frees again */
+
+    /* PS record-and-refuse, part 2 of 2: durably record every input we signed
+       BEFORE any of our partial sigs goes anywhere -- before they enter the
+       per-input sessions, before CLIENT_FINAL_PSIGS.  One plain INSERT per
+       signed input, ascending, each under the table's PRIMARY KEY (first
+       record wins and is never overwritten; an identical row is an
+       idempotent success).  Autocommit on WAL + synchronous=FULL, so
+       PS_SAVE_RECORDED means the row is fsync'd.  Anything else on ANY input
+       aborts right here: nothing is sent, and our partial sigs exist only in
+       *sec, which the wrapper zeroes.  A row already written for an earlier
+       input stays; it names exactly the transaction we were signing, so it
+       lets the identical retry through and refuses every different spend of
+       chain[N] (see the header comment). */
+    lsp_crash_checkpoint("ps_sub_record_pre_save");
+    if (ps_record_active) {
+        for (size_t i = 0; i < n_inputs; i++) {
+            if (!factory_session_input_signs(factory, sub_node_i, i, my_index))
+                continue;
+            unsigned char psig_buf[36];
+            memset(psig_buf, 0, sizeof psig_buf);
+            musig_partial_sig_serialize(ctx, psig_buf, &sec->psigs[i]);
+            int saved = persist_save_ps_signed_input(persist, /* factory_id = */ 0,
+                (int)sub_node_i, sub->ps_prev_txid, (uint32_t)i,
+                ps_sighash[i], psig_buf);
+            secure_zero(psig_buf, sizeof psig_buf);
+            if (saved != PS_SAVE_RECORDED) {
+                if (saved == PS_SAVE_CONFLICT)
+                    fprintf(stderr,
+                            "Client-stateless MULTI %u: REFUSING PS double-spend -- a "
+                            "DIFFERENT spend of (%s:%zu) was recorded concurrently; "
+                            "discarding our signatures, nothing sent.\n",
+                            my_index, ps_parent_hex, i);
+                else
+                    fprintf(stderr,
+                            "Client-stateless MULTI %u: could not durably record our "
+                            "signature for (%s:%zu) (rc=%d) -- aborting before "
+                            "CLIENT_FINAL_PSIGS, nothing sent.\n",
+                            my_index, ps_parent_hex, i, saved);
+                goto fail;
+            }
+        }
+    }
+    lsp_crash_checkpoint("ps_sub_record_post_save");
+
+    /* Recorded: our partial sigs may now enter the sessions and leave. */
+    for (size_t i = 0; i < n_inputs; i++) {
+        if (!factory_session_input_signs(factory, sub_node_i, i, my_index))
+            continue;  /* psig_ser slot stays zero: skipped-input marker */
+        int my_slot_i = factory_session_get_input_signer_slot(
+            factory, sub_node_i, i, my_index);
+        if (my_slot_i < 0 ||
+            !factory_session_set_partial_sig_input(factory, sub_node_i, i,
+                                                    (size_t)my_slot_i, &sec->psigs[i])) {
+            fprintf(stderr, "Client-stateless MULTI %u: set own psig input %zu "
+                    "(per_input_slot=%d) failed\n", my_index, i, my_slot_i);
+            sf_clear_own_psigs(factory, sub_node_i, my_index, i);
+            goto fail;
+        }
+        musig_partial_sig_serialize(ctx, sec->psig_ser + i * 32, &sec->psigs[i]);
+    }
 
     /* Send CLIENT_FINAL_PSIGS with n_inputs psigs (+ poison psig). */
     cJSON *fp_json = wire_build_subfactory_client_final_psigs(
-        my_psig_flat, (uint32_t)n_inputs, poison_prepared_c ? my_poison_psig_ser : NULL);
-    free(my_psig_flat);
+        sec->psig_ser, (uint32_t)n_inputs, poison_prepared_c ? sec->poison_psig_ser : NULL);
     if (!wire_send(fd, MSG_SUBFACTORY_CLIENT_FINAL_PSIGS, fp_json)) {
         cJSON_Delete(fp_json);
         fprintf(stderr, "Client-stateless MULTI %u: send CLIENT_FINAL_PSIGS failed\n", my_index);
@@ -4685,6 +4889,7 @@ static int client_handle_subfactory_advance_stateless_multi(
         return 0;
     }
     cJSON_Delete(fp_json);
+    lsp_crash_checkpoint("ps_sub_record_post_final");
 
     /* Wait for DONE.  #53: when this advance co-signed a script-path (hashlock) poison,
        DONE carries the LSP's AGGREGATED poison Schnorr sig -- the client cannot aggregate
@@ -4733,7 +4938,6 @@ static int client_handle_subfactory_advance_stateless_multi(
        superseded state.  Do NOT reset the poison session yet -- the template persist + the
        reveal persist below read sub->poison_* (the next advance's prep resets it,
        mirroring the leaf client). */
-    persist_t *persist = g_client_persist;
     if (persist && sub->poison_is_scriptpath && sub->poison_has_agg_sig) {
         uint32_t superseded_state = (sub->l_stock_state_counter > 0)
                                     ? sub->l_stock_state_counter - 1u : 0u;
@@ -4797,11 +5001,28 @@ static int client_handle_subfactory_advance_stateless_multi(
     return 1;
 
 fail:
+    /* Secrets (secnonces, our partial sigs) are zeroed by the wrapper. */
     free(lsp_pn_flat); free(lsp_psig_flat); free(all_pn_per_input);
-    free(my_secnonces); free(my_psig_flat);
-    if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
     factory_session_reset_poison(factory, sub_node_i);
     return 0;
+}
+
+static int client_handle_subfactory_advance_stateless_multi(
+        int fd, secp256k1_context *ctx, const secp256k1_keypair *keypair,
+        factory_t *factory, uint32_t my_index, size_t sub_node_i,
+        factory_node_t *sub, uint32_t n_inputs_u,
+        int leaf_side, int sub_idx, int channel_idx, uint64_t delta_sats) {
+    sf_adv_secrets_t sec;
+    memset(&sec, 0, sizeof sec);
+    int ok = subfactory_advance_multi_ceremony(fd, ctx, keypair, factory, my_index,
+                                               sub_node_i, sub, n_inputs_u,
+                                               leaf_side, sub_idx, channel_idx,
+                                               delta_sats, &sec);
+    /* The single exit for this ceremony's secrets (see sf_adv_secrets_t):
+       every per-input secnonce and partial sig, and the poison's, on every
+       path. */
+    secure_zero(&sec, sizeof sec);
+    return ok;
 }
 
 static int client_handle_subfactory_advance_stateless(int fd,
@@ -4829,11 +5050,56 @@ static int client_handle_subfactory_advance_stateless(int fd,
     size_t sub_node_i = (size_t)sub_node_id;
     factory_node_t *sub = &factory->nodes[sub_node_i];
 
+    /* PS record-and-refuse preconditions -- refuse before anything changes
+       locally.
+
+       1. Input count.  The chain tx a sub-factory advance builds spends EVERY
+          output of chain[N] (factory_subfactory_chain_advance_unsigned ->
+          rebuild_node_tx: one input per chain[N] output, i.e. sub->n_outputs
+          of them, and an advance needs n_outputs >= 2), and this client signs
+          and records it per input.  A PROPOSE_INTENT declaring any other input
+          count does not describe the transaction we would build.  An honest
+          LSP never sends one (lsp_subfactory_chain_advance_stateless sends
+          every sub with n_outputs > 1 down its multi-input ceremony with
+          n_inputs = n_outputs).  There is no single-input sub-factory
+          ceremony: the one n_inputs == 1 used to select signed the
+          node-level session, whose message (compute_node_sighash's
+          single-prevout preimage) is not the BIP-341 sighash of any input of
+          that tx, without any record, and was removed.
+
+       2. Which sub-factory.  The local advance mutates the sub-factory that
+          (leaf_side, sub_idx) names; the signing and the record use
+          subfactory_id.  They must be the same node, or we would advance one
+          sub-factory and sign another. */
+    if (sub->type != NODE_PS_SUBFACTORY || n_inputs < 2 ||
+        (size_t)n_inputs != sub->n_outputs) {
+        fprintf(stderr, "Client-stateless subfactory %u: PROPOSE_INTENT declares "
+                "n_inputs=%u but advancing sub node %u spends %zu outputs -- "
+                "REFUSING (sub chain advances are signed and recorded per input)\n",
+                my_index, n_inputs, sub_node_id, sub->n_outputs);
+        return 0;
+    }
+    {
+        int named = -1;
+        if (leaf_side >= 0 && leaf_side < factory->n_leaf_nodes && sub_idx >= 0) {
+            const factory_node_t *lf =
+                &factory->nodes[factory->leaf_node_indices[leaf_side]];
+            if (sub_idx < lf->n_subfactories && sub_idx < FACTORY_MAX_OUTPUTS)
+                named = lf->subfactory_node_indices[sub_idx];
+        }
+        if (named < 0 || (uint32_t)named != sub_node_id) {
+            fprintf(stderr, "Client-stateless subfactory %u: PROPOSE_INTENT names sub "
+                    "node %u but leaf %d / sub %d is node %d -- REFUSING\n",
+                    my_index, sub_node_id, leaf_side, sub_idx, named);
+            return 0;
+        }
+    }
+
     /* #53 sub-factory hashlock: mirror the sub's NEW-state H from PROPOSE_INTENT (the
-       client has no seed) BEFORE the local sub-advance.  Both single- and multi-input
-       paths route through factory_subfactory_chain_advance_unsigned -> Phase 0, which
-       reads this via apply_l_stock_hashlock's client-mirror branch to build the SAME
-       sales-stock SPK as the LSP (else the chain tx diverges + the co-sign fails).
+       client has no seed) BEFORE the local sub-advance.  The multi-input ceremony routes
+       through factory_subfactory_chain_advance_unsigned -> Phase 0, which reads this via
+       apply_l_stock_hashlock's client-mirror branch to build the SAME sales-stock SPK as
+       the LSP (else the chain tx diverges + the co-sign fails).
        Set here, not in poison-prep: factory_set_node_l_stock_hash updates only
        f->node_l_stock_hashes[], NOT sub->l_stock_hash, so the poison-prep below still
        snapshots H_old.  Absent field (hashlock off) -> no-op.  Mirrors leaf client.c ~3607. */
@@ -4844,299 +5110,10 @@ static int client_handle_subfactory_advance_stateless(int fd,
             factory_set_node_l_stock_hash(factory, sub_node_i, h_new);
     }
 
-    /* Phase 1e.1.e: MULTI-INPUT now runs through the STATELESS path too.
-       Dispatch to the looped-per-input handler; single-input keeps the
-       existing flow below. */
-    if (n_inputs > 1) {
-        return client_handle_subfactory_advance_stateless_multi(
-            fd, ctx, keypair, factory, my_index, sub_node_i, sub,
-            n_inputs, leaf_side, sub_idx, channel_idx, delta_sats);
-    }
-
-    /* #53 fail-closed downgrade guard: the hashlock sales-stock poison is wired ONLY in
-       the multi-input ceremony.  A real sub-advance is always multi-input, so an honest
-       LSP never sends a single-input PROPOSE_INTENT for a hashlock sub.  Refuse here so a
-       MALICIOUS LSP cannot force the single-input path (which has no fail-closed guard /
-       reveal) to make this client revoke the old sub state without recourse. */
-    /* NOTE: use sub->has_l_stock_hash, NOT factory->use_hashlock_poison -- the latter is
-       LSP-only (set by factory_enable_hashlock_poison); the client learns hashlock is on
-       purely from the LSP-shipped per-node hash that apply_l_stock_hashlock mirrored onto
-       sub->has_l_stock_hash at factory build.  This is also why the multi-input client
-       guard keys on has_l_stock_hash. */
-    if (sub->has_l_stock_hash) {
-        fprintf(stderr, "Client-stateless subfactory %u: hashlock poison ON but LSP sent a "
-                        "single-input PROPOSE_INTENT -- REFUSING (downgrade attempt; "
-                        "hashlock sub poison is multi-input only)\n", my_index);
-        return 0;
-    }
-
-    /* k>=2 (multi-client sub-factory) is supported: the LSP forwards the full
-       all-signer pubnonce matrix in LSP_RESPONSE (Gap A), and the co-signer
-       nonce loop below sets every other signer's nonce before finalize. The
-       client sends its CLIENT_FINAL_PSIGS for the LSP to aggregate (no local
-       complete, so no Gap B needed). Matching LSP-side refusal removed in
-       d7bdfe4. */
-
-    /* Poison prep (deterministic; matches the LSP minus the watchtower gate,
-       which is LSP-only): snapshot the soon-to-be-stale chain[N-1] state
-       BEFORE advance_unsigned mutates sub->txid / sub->outputs[], then build
-       the same single-input L-stock poison TX so both sides reach a
-       byte-identical sighash.  poison_prepared_c is cleared if anything
-       degrades or the LSP fails to reciprocate poison fields. */
-    const uint64_t POISON_FEE_SATS = 1000;
-    int poison_prepared_c = 0;
-    {
-        size_t old_n_chans = (sub->n_outputs > 0) ? sub->n_outputs - 1 : 0;
-        uint64_t old_sstock = (sub->n_outputs > 0)
-            ? sub->outputs[sub->n_outputs - 1].amount_sats : 0;
-        if (old_sstock > POISON_FEE_SATS + (uint64_t)old_n_chans * 330u) {
-            unsigned char old_chain_txid[32];
-            memcpy(old_chain_txid, sub->txid, 32);
-            if (factory_session_prepare_poison_tx_subfactory(
-                    factory, sub_node_i, old_chain_txid, (uint32_t)old_n_chans,
-                    old_sstock, POISON_FEE_SATS, NULL)) {
-                poison_prepared_c = 1;  /* init_node_poison after state init */
-            }
-        }
-    }
-
-    /* Phase 1e.1.b amendment: PROPOSE_INTENT now carries the advance params
-       (leaf_side, sub_idx, channel_idx, delta_sats).  Apply the advance
-       locally so unsigned_tx matches LSP's deterministically. */
-    if (!factory_subfactory_chain_advance_unsigned(factory, leaf_side, sub_idx,
-                                                     channel_idx, delta_sats)) {
-        fprintf(stderr,
-            "Client-stateless subfactory %u: chain_advance_unsigned failed "
-            "(leaf=%d sub=%d ch=%d delta=%llu)\n",
-            my_index, leaf_side, sub_idx, channel_idx,
-            (unsigned long long)delta_sats);
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-
-    /* Init state session + (when prepared) poison session. */
-    if (!factory_session_init_node(factory, sub_node_i)) {
-        fprintf(stderr, "Client-stateless subfactory %u: session_init failed\n", my_index);
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    if (poison_prepared_c &&
-        !factory_session_init_node_poison(factory, sub_node_i)) {
-        factory_session_reset_poison(factory, sub_node_i);
-        poison_prepared_c = 0;
-    }
-
-    int my_slot = factory_find_signer_slot(factory, sub_node_i, my_index);
-    int lsp_slot = factory_find_signer_slot(factory, sub_node_i, 0);
-    if (my_slot < 0 || lsp_slot < 0) {
-        fprintf(stderr, "Client-stateless subfactory %u: slot lookup failed (my=%d lsp=%d)\n",
-                my_index, my_slot, lsp_slot);
-        return 0;
-    }
-
-    /* Gen own secnonce + pubnonce. */
-    unsigned char my_seckey[32];
-    secp256k1_pubkey my_pubkey;
-    if (!secp256k1_keypair_sec(ctx, my_seckey, keypair)) {
-        fprintf(stderr, "Client-stateless subfactory %u: keypair_sec failed\n", my_index);
-        return 0;
-    }
-    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
-
-    secp256k1_musig_secnonce my_secnonce, my_poison_secnonce;
-    secp256k1_musig_pubnonce my_pubnonce;
-    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
-                                my_seckey, &my_pubkey,
-                                &sub->keyagg.cache)) {
-        memset(my_seckey, 0, 32);
-        fprintf(stderr, "Client-stateless subfactory %u: nonce gen failed\n", my_index);
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    /* Poison: own nonce (my_seckey still live this scope). */
-    unsigned char my_poison_pn_ser[66] = {0};
-    if (poison_prepared_c) {
-        secp256k1_musig_pubnonce my_poison_pubnonce;
-        if (!musig_generate_nonce(ctx, &my_poison_secnonce, &my_poison_pubnonce,
-                                    my_seckey, &my_pubkey, &sub->keyagg.cache) ||
-            !factory_session_set_nonce_poison(factory, sub_node_i,
-                                                (size_t)my_slot, &my_poison_pubnonce)) {
-            memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-            factory_session_reset_poison(factory, sub_node_i);
-            poison_prepared_c = 0;
-        } else {
-            musig_pubnonce_serialize(ctx, my_poison_pn_ser, &my_poison_pubnonce);
-        }
-    }
-    memset(my_seckey, 0, 32);
-    if (!factory_session_set_nonce(factory, sub_node_i, (size_t)my_slot, &my_pubnonce)) {
-        fprintf(stderr, "Client-stateless subfactory %u: set own nonce failed\n", my_index);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-
-    /* Send CLIENT_PUBNONCES with own pubnonce (+ poison nonce when prepared). */
-    unsigned char my_pubnonce_ser[66];
-    musig_pubnonce_serialize(ctx, my_pubnonce_ser, &my_pubnonce);
-    cJSON *cpn_json = wire_build_subfactory_client_pubnonces(
-        my_pubnonce_ser, 1, poison_prepared_c ? my_poison_pn_ser : NULL);
-    if (!wire_send(fd, MSG_SUBFACTORY_CLIENT_PUBNONCES, cpn_json)) {
-        cJSON_Delete(cpn_json);
-        fprintf(stderr, "Client-stateless subfactory %u: send CLIENT_PUBNONCES failed\n",
-                my_index);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    cJSON_Delete(cpn_json);
-
-    /* Wait for LSP_RESPONSE with lsp_pubnonce + lsp_psig. */
-    wire_msg_t lr_msg;
-    if (!wire_recv(fd, &lr_msg) || lr_msg.msg_type != MSG_SUBFACTORY_LSP_RESPONSE) {
-        fprintf(stderr,
-            "Client-stateless subfactory %u: expected LSP_RESPONSE, got 0x%02x\n",
-            my_index, lr_msg.json ? lr_msg.msg_type : 0);
-        if (lr_msg.json) cJSON_Delete(lr_msg.json);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    unsigned char lsp_pubnonce_ser[66], lsp_psig_ser[32];
-    unsigned char all_pn_sub[FACTORY_MAX_SIGNERS][66];
-    unsigned char all_poison_pn_sub[FACTORY_MAX_SIGNERS][66];
-    unsigned char lsp_poison_psig_ser[32];
-    uint32_t got_all_pn_len = 0, got_poison_len = 0;
-    memset(all_poison_pn_sub, 0, sizeof(all_poison_pn_sub));
-    int lr_rc = wire_parse_subfactory_lsp_response(lr_msg.json,
-                                              lsp_pubnonce_ser, lsp_psig_ser, 1,
-                                              (unsigned char *)all_pn_sub,
-                                              (uint32_t)sizeof(all_pn_sub),
-                                              &got_all_pn_len,
-                                              poison_prepared_c ? (unsigned char *)all_poison_pn_sub : NULL,
-                                              poison_prepared_c ? (uint32_t)sizeof(all_poison_pn_sub) : 0,
-                                              poison_prepared_c ? &got_poison_len : NULL,
-                                              poison_prepared_c ? lsp_poison_psig_ser : NULL);
-    if (lr_rc == 0) {
-        cJSON_Delete(lr_msg.json);
-        fprintf(stderr, "Client-stateless subfactory %u: parse LSP_RESPONSE failed\n",
-                my_index);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    cJSON_Delete(lr_msg.json);
-    /* LSP did not reciprocate poison (rc<2 or wrong matrix length) -> degrade. */
-    if (poison_prepared_c &&
-        (lr_rc < 2 || got_poison_len != (uint32_t)(sub->n_signers * 66))) {
-        fprintf(stderr, "Client-stateless subfactory %u: LSP omitted poison fields "
-                "-- degrading local poison\n", my_index);
-        memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        factory_session_reset_poison(factory, sub_node_i);
-        poison_prepared_c = 0;
-    }
-
-    /* Set LSP nonce, then (k>=2) every OTHER signer's nonce from the forwarded
-       matrix (own already set in Step 5, LSP set just below), then finalize. */
-    secp256k1_musig_pubnonce lsp_pubnonce;
-    if (!musig_pubnonce_parse(ctx, &lsp_pubnonce, lsp_pubnonce_ser) ||
-        !factory_session_set_nonce(factory, sub_node_i, (size_t)lsp_slot, &lsp_pubnonce)) {
-        fprintf(stderr, "Client-stateless subfactory %u: set LSP nonce failed\n", my_index);
-        return 0;
-    }
-    if (got_all_pn_len == (uint32_t)(sub->n_signers * 66)) {
-        for (size_t s = 0; s < sub->n_signers; s++) {
-            if (s == (size_t)my_slot || s == (size_t)lsp_slot) continue;
-            secp256k1_musig_pubnonce pn_s;
-            if (!musig_pubnonce_parse(ctx, &pn_s, all_pn_sub[s]) ||
-                !factory_session_set_nonce(factory, sub_node_i, s, &pn_s)) {
-                fprintf(stderr,
-                    "Client-stateless subfactory %u: set co-signer nonce[%zu] failed\n",
-                    my_index, s);
-                return 0;
-            }
-        }
-    }
-    if (!factory_session_finalize_node(factory, sub_node_i)) {
-        fprintf(stderr, "Client-stateless subfactory %u: finalize_node failed\n", my_index);
-        if (poison_prepared_c) memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-
-    /* Poison: set every signer's poison nonce from the forwarded matrix (the
-       poison session is N-of-N like state), finalize.  Own poison nonce was set
-       in Step 5; set the rest here.  Degrade this leaf if any step fails. */
-    unsigned char my_poison_psig_ser[32] = {0};
-    if (poison_prepared_c) {
-        int pz_ok = 1;
-        for (size_t s = 0; s < sub->n_signers && pz_ok; s++) {
-            if (s == (size_t)my_slot) continue;  /* own already set */
-            secp256k1_musig_pubnonce ppn;
-            if (!musig_pubnonce_parse(ctx, &ppn, all_poison_pn_sub[s]) ||
-                !factory_session_set_nonce_poison(factory, sub_node_i, s, &ppn))
-                pz_ok = 0;
-        }
-        secp256k1_musig_partial_sig my_poison_psig;
-        pz_ok = pz_ok &&
-            factory_session_finalize_node_poison(factory, sub_node_i) &&
-            musig_create_partial_sig(ctx, &my_poison_psig, &my_poison_secnonce,
-                                       keypair, &sub->poison_signing_session);
-        /* Zero own poison secnonce on every path BEFORE the DONE recv. */
-        memset(&my_poison_secnonce, 0, sizeof(my_poison_secnonce));
-        if (!pz_ok) {
-            fprintf(stderr, "Client-stateless subfactory %u: poison sign failed "
-                    "-- degrading\n", my_index);
-            factory_session_reset_poison(factory, sub_node_i);
-            poison_prepared_c = 0;
-        } else {
-            musig_partial_sig_serialize(ctx, my_poison_psig_ser, &my_poison_psig);
-        }
-    }
-
-    /* Create own partial_sig (zeros own secnonce). */
-    secp256k1_musig_partial_sig my_psig;
-    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
-                                    &sub->signing_session)) {
-        fprintf(stderr, "Client-stateless subfactory %u: create_partial_sig failed\n",
-                my_index);
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    /* my_secnonce + my_poison_secnonce zeroed by musig_create_partial_sig.
-       INVARIANT: we no longer hold any client secnonce (state or poison). */
-
-    /* Send CLIENT_FINAL_PSIGS with own psig (+ poison psig).  LSP aggregates
-       and completes both the state and poison sessions. */
-    unsigned char my_psig_ser[32];
-    musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
-    cJSON *fp_json = wire_build_subfactory_client_final_psigs(
-        my_psig_ser, 1, poison_prepared_c ? my_poison_psig_ser : NULL);
-    if (!wire_send(fd, MSG_SUBFACTORY_CLIENT_FINAL_PSIGS, fp_json)) {
-        cJSON_Delete(fp_json);
-        fprintf(stderr, "Client-stateless subfactory %u: send CLIENT_FINAL_PSIGS failed\n",
-                my_index);
-        factory_session_reset_poison(factory, sub_node_i);
-        return 0;
-    }
-    cJSON_Delete(fp_json);
-    /* Local poison state handed off via the wire; free our copy. */
-    if (poison_prepared_c) factory_session_reset_poison(factory, sub_node_i);
-
-    /* Wait for DONE. */
-    wire_msg_t done_msg;
-    if (!wire_recv(fd, &done_msg) || done_msg.msg_type != MSG_SUBFACTORY_DONE) {
-        fprintf(stderr,
-            "Client-stateless subfactory %u: expected DONE, got 0x%02x\n",
-            my_index, done_msg.json ? done_msg.msg_type : 0);
-        if (done_msg.json) cJSON_Delete(done_msg.json);
-        return 0;
-    }
-    if (done_msg.json) cJSON_Delete(done_msg.json);
-
-    printf("Client-stateless subfactory %u: advance done (sub_node=%u)\n",
-           my_index, sub_node_id);
-    return 1;
+    /* Every accepted PROPOSE_INTENT is multi-input (checked above). */
+    return client_handle_subfactory_advance_stateless_multi(
+        fd, ctx, keypair, factory, my_index, sub_node_i, sub,
+        n_inputs, leaf_side, sub_idx, channel_idx, delta_sats);
 }
 
 int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
@@ -5161,12 +5138,28 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
 
    Scope: state TX only.  Poison TX deferred (TODO).  See the LSP-side
    header for the full rationale. */
-static int client_handle_leaf_advance_stateless(int fd,
-                                                  secp256k1_context *ctx,
-                                                  const secp256k1_keypair *keypair,
-                                                  factory_t *factory,
-                                                  uint32_t my_index,
-                                                  const wire_msg_t *propose_msg) {
+/* The secrets of one stateless leaf-advance ceremony.  They live in the
+   wrapper (client_handle_leaf_advance_stateless, below) rather than on the
+   ceremony's own stack, so that EVERY exit -- success, refusal, or any of
+   the failure returns -- goes through the one place that zeroes them.
+   musig_create_partial_sig consumes the state secnonce, but the poison
+   secnonce is consumed only if the poison is still prepared when we sign
+   (it degrades on several earlier failures), and the returns between nonce
+   generation and signing consume neither. */
+typedef struct {
+    secp256k1_musig_secnonce secnonce;
+    secp256k1_musig_secnonce poison_secnonce;
+    secp256k1_musig_partial_sig psig;
+    secp256k1_musig_partial_sig poison_psig;
+} leaf_adv_secrets_t;
+
+static int leaf_advance_stateless_ceremony(int fd,
+                                           secp256k1_context *ctx,
+                                           const secp256k1_keypair *keypair,
+                                           factory_t *factory,
+                                           uint32_t my_index,
+                                           const wire_msg_t *propose_msg,
+                                           leaf_adv_secrets_t *sec) {
     persist_t *persist = g_client_persist;
     int leaf_side;
     /* Parse PROPOSE.  In stateless mode the parser returns 3 (no pubnonce
@@ -5260,21 +5253,66 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
 
-    /* PS double-spend defense -- same as legacy path. */
-    if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
+    /* PS record-and-refuse, part 1 of 2 (part 2 is the durable INSERT right
+       after we sign, before our partial sig enters the signing session).
+       Order: sighash -> check -> nonces -> bind (session message == sighash)
+       -> partial sig -> INSERT -> into session + complete -> FINAL send.
+       PS leaves are non-revocable,
+       so this client's refusal to co-sign a SECOND, DIFFERENT spend of the
+       same chain parent (ps_prev_txid:0) is the only thing stopping the LSP
+       from confirming a stale leaf state.  Every failure in here refuses.
+
+       The sighash comes first: it needs only the unsigned tx and the prev
+       output, both known right after the local advance, and it is what the
+       record is compared on -- a retry of the identical spend (same sighash)
+       is allowed, anything else on this parent is not.  If it cannot be
+       computed there is nothing to record against, so nothing is signed. */
+    const int ps_record_active =
+        (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0);
+    unsigned char ps_sighash[32] = {0};
+    char ps_parent_hex[65] = {0};
+    if (ps_record_active) {
+        for (int i = 0; i < 32; i++)
+            snprintf(ps_parent_hex + 2 * i, 3, "%02x", ps_node->ps_prev_txid[i]);
+        if (persist_test_ps_hook_fire(PERSIST_TEST_PS_SIGHASH) ||
+            !compute_taproot_sighash(ps_sighash,
+                ps_node->unsigned_tx.data, ps_node->unsigned_tx.len, 0,
+                ps_node->outputs[0].script_pubkey,
+                ps_node->outputs[0].script_pubkey_len,
+                ps_node->ps_prev_chan_amount, ps_node->nsequence)) {
+            fprintf(stderr,
+                    "Client-stateless %u: cannot compute the sighash to record for "
+                    "(%s:0) -- refusing to sign.\n", my_index, ps_parent_hex);
+            return 0;
+        }
         unsigned char prev_sighash[32];
-        int already = persist_check_ps_signed_input(
+        int chk = persist_check_ps_signed_input(
             persist, /* factory_id = */ 0,
             ps_node->ps_prev_txid, /* parent_vout = */ 0,
             prev_sighash);
-        if (already) {
-            char hex[65];
-            for (int i = 0; i < 32; i++)
-                snprintf(hex + 2 * i, 3, "%02x", ps_node->ps_prev_txid[i]);
+        if (chk == PS_SIGNED_INPUT_ERROR) {
             fprintf(stderr,
-                    "Client-stateless %u: REFUSING PS double-spend -- already signed "
-                    "a TX spending (%s:0).\n", my_index, hex);
+                    "Client-stateless %u: cannot read client_ps_signed_inputs for "
+                    "(%s:0) -- refusing to sign (fail closed).\n",
+                    my_index, ps_parent_hex);
             return 0;
+        }
+        if (chk == PS_SIGNED_INPUT_FOUND) {
+            if (memcmp(prev_sighash, ps_sighash, 32) != 0) {
+                fprintf(stderr,
+                        "Client-stateless %u: REFUSING PS double-spend -- already "
+                        "signed a DIFFERENT TX spending (%s:0).\n",
+                        my_index, ps_parent_hex);
+                return 0;
+            }
+            /* Same sighash: a retry of the identical spend (e.g. we crashed
+               after recording but before FINAL reached the LSP).  Re-signing
+               the same message with a fresh nonce is safe.  The stored
+               partial sig is NOT replayed: it is bound to the old session's
+               aggregate nonce and would not verify against the new one. */
+            printf("Client-stateless %u: PS advance for (%s:0) matches our "
+                   "recorded signing -- idempotent retry, re-signing the same "
+                   "spend\n", my_index, ps_parent_hex);
         }
     }
 
@@ -5337,9 +5375,8 @@ static int client_handle_leaf_advance_stateless(int fd,
     }
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
-    secp256k1_musig_secnonce my_secnonce;
     secp256k1_musig_pubnonce my_pubnonce;
-    if (!musig_generate_nonce(ctx, &my_secnonce, &my_pubnonce,
+    if (!musig_generate_nonce(ctx, &sec->secnonce, &my_pubnonce,
                                 my_seckey, &my_pubkey,
                                 &factory->nodes[node_idx].keyagg.cache)) {
         memset(my_seckey, 0, 32);
@@ -5347,10 +5384,9 @@ static int client_handle_leaf_advance_stateless(int fd,
         factory_session_reset_poison(factory, node_idx);
         return 0;
     }
-    secp256k1_musig_secnonce my_poison_secnonce;
     secp256k1_musig_pubnonce my_poison_pubnonce;
     if (leaf_poison_prepared_c &&
-        !musig_generate_nonce(ctx, &my_poison_secnonce, &my_poison_pubnonce,
+        !musig_generate_nonce(ctx, &sec->poison_secnonce, &my_poison_pubnonce,
                                 my_seckey, &my_pubkey,
                                 &factory->nodes[node_idx].keyagg.cache)) {
         fprintf(stderr, "Client-stateless %u: poison nonce gen failed -- degrading\n",
@@ -5452,17 +5488,31 @@ static int client_handle_leaf_advance_stateless(int fd,
         leaf_poison_prepared_c = 0;
     }
 
-    /* Step 5: create own partial_sig (zeroes own secnonce, both state + poison). */
-    secp256k1_musig_partial_sig my_psig;
-    if (!musig_create_partial_sig(ctx, &my_psig, &my_secnonce, keypair,
+    /* Bind the record to what is actually signed: the sighash we checked and
+       are about to record must be the message this MuSig2 session signs
+       (fixed by factory_session_finalize_node).  If they differ, the record
+       would describe a different spend than the signature -- refuse. */
+    if (ps_record_active &&
+        memcmp(ps_sighash, factory->nodes[node_idx].signing_session.msg32, 32) != 0) {
+        fprintf(stderr,
+                "Client-stateless %u: the sighash recorded for (%s:0) is not the "
+                "message this session signs -- refusing to sign.\n",
+                my_index, ps_parent_hex);
+        factory_session_reset_poison(factory, node_idx);
+        return 0;
+    }
+
+    /* Step 5: create own partial_sig.  This consumes + zeroes the state
+       secnonce, and the poison secnonce only if the poison is still
+       prepared; the wrapper zeroes both on every exit regardless. */
+    if (!musig_create_partial_sig(ctx, &sec->psig, &sec->secnonce, keypair,
                                     &factory->nodes[node_idx].signing_session)) {
         fprintf(stderr, "Client-stateless %u: create_partial_sig failed\n", my_index);
         factory_session_reset_poison(factory, node_idx);
         return 0;
     }
-    secp256k1_musig_partial_sig my_poison_psig;
     if (leaf_poison_prepared_c &&
-        !musig_create_partial_sig(ctx, &my_poison_psig, &my_poison_secnonce, keypair,
+        !musig_create_partial_sig(ctx, &sec->poison_psig, &sec->poison_secnonce, keypair,
                                     &factory->nodes[node_idx].poison_signing_session)) {
         fprintf(stderr, "Client-stateless %u: poison partial_sig failed -- degrading\n",
                 my_index);
@@ -5470,13 +5520,53 @@ static int client_handle_leaf_advance_stateless(int fd,
         leaf_poison_prepared_c = 0;
     }
 
+    /* PS record-and-refuse, part 2 of 2: durably record what we just signed
+       BEFORE our partial sig goes anywhere -- before it enters the signing
+       session (set_partial_sig), before complete_node, before FINAL.  Plain
+       INSERT under the table's PRIMARY KEY -- the arbiter between two
+       ceremonies that both passed the pre-sign check for this parent: the
+       first record wins and is never overwritten.  The connection is
+       autocommit (this function opens no transaction) on WAL +
+       synchronous=FULL, so PS_SAVE_RECORDED means the row is fsync'd.  Any
+       other outcome aborts right here: our partial sig then exists only in
+       *sec, which the wrapper zeroes on return, so it never leaves this
+       process and is never left in the factory's session. */
+    lsp_crash_checkpoint("ps_record_pre_save");
+    if (ps_record_active) {
+        unsigned char psig_buf[36];
+        unsigned char my_psig_ser[32];
+        musig_partial_sig_serialize(ctx, my_psig_ser, &sec->psig);
+        memset(psig_buf, 0, 36);
+        memcpy(psig_buf, my_psig_ser, 32);
+        int saved = persist_save_ps_signed_input(persist, /* factory_id = */ 0,
+            (int)node_idx, ps_node->ps_prev_txid, 0,
+            ps_sighash, psig_buf);
+        secure_zero(my_psig_ser, sizeof my_psig_ser);
+        secure_zero(psig_buf, sizeof psig_buf);
+        if (saved != PS_SAVE_RECORDED) {
+            if (saved == PS_SAVE_CONFLICT)
+                fprintf(stderr,
+                        "Client-stateless %u: REFUSING PS double-spend -- a DIFFERENT "
+                        "spend of (%s:0) was recorded concurrently; discarding our "
+                        "signature, nothing sent.\n", my_index, ps_parent_hex);
+            else
+                fprintf(stderr,
+                        "Client-stateless %u: could not durably record our signature "
+                        "for (%s:0) (rc=%d) -- aborting before FINAL, nothing sent.\n",
+                        my_index, ps_parent_hex, saved);
+            factory_session_reset_poison(factory, node_idx);
+            return 0;
+        }
+    }
+    lsp_crash_checkpoint("ps_record_post_save");
+
     /* Step 6: parse LSP's psig and set both psigs into the session. */
     secp256k1_musig_partial_sig lsp_psig;
     if (!musig_partial_sig_parse(ctx, &lsp_psig, lsp_psig_ser)) {
         fprintf(stderr, "Client-stateless %u: parse LSP psig failed\n", my_index);
         return 0;
     }
-    if (!factory_session_set_partial_sig(factory, node_idx, (size_t)my_slot, &my_psig)) {
+    if (!factory_session_set_partial_sig(factory, node_idx, (size_t)my_slot, &sec->psig)) {
         fprintf(stderr, "Client-stateless %u: set own partial_sig failed\n", my_index);
         factory_session_reset_poison(factory, node_idx);
         return 0;
@@ -5490,34 +5580,13 @@ static int client_handle_leaf_advance_stateless(int fd,
         secp256k1_musig_partial_sig lsp_poison_psig;
         if (!musig_partial_sig_parse(ctx, &lsp_poison_psig, lsp_poison_psig_ser) ||
             !factory_session_set_partial_sig_poison(factory, node_idx,
-                                                     (size_t)my_slot, &my_poison_psig) ||
+                                                     (size_t)my_slot, &sec->poison_psig) ||
             !factory_session_set_partial_sig_poison(factory, node_idx,
                                                      (size_t)lsp_slot, &lsp_poison_psig)) {
             fprintf(stderr, "Client-stateless %u: poison psig set failed -- degrading\n",
                     my_index);
             factory_session_reset_poison(factory, node_idx);
             leaf_poison_prepared_c = 0;
-        }
-    }
-
-    /* PS defense: record what we just signed BEFORE shipping FINAL.  A
-       crash after record + before send is safe -- a retry sees the row
-       and refuses.  Same shape as legacy path. */
-    if (persist && ps_node->is_ps_leaf && ps_node->ps_chain_len > 0) {
-        unsigned char sighash[32];
-        if (compute_taproot_sighash(sighash,
-                ps_node->unsigned_tx.data, ps_node->unsigned_tx.len, 0,
-                ps_node->outputs[0].script_pubkey,
-                ps_node->outputs[0].script_pubkey_len,
-                ps_node->ps_prev_chan_amount, ps_node->nsequence)) {
-            unsigned char psig_buf[36];
-            unsigned char my_psig_ser[32];
-            musig_partial_sig_serialize(ctx, my_psig_ser, &my_psig);
-            memset(psig_buf, 0, 36);
-            memcpy(psig_buf, my_psig_ser, 32);
-            persist_save_ps_signed_input(persist, /* factory_id = */ 0,
-                (int)node_idx, ps_node->ps_prev_txid, 0,
-                sighash, psig_buf);
         }
     }
 
@@ -5589,6 +5658,7 @@ static int client_handle_leaf_advance_stateless(int fd,
         return 0;
     }
     cJSON_Delete(fin_json);
+    lsp_crash_checkpoint("ps_record_post_final");
 
     /* #59 Phase 1: FINAL is sent — the advance is committed and the old state is
        superseded.  Persist the poison TEMPLATE now (revocation_secret stays NULL),
@@ -5682,6 +5752,22 @@ static int client_handle_leaf_advance_stateless(int fd,
 
     printf("Client-stateless %u: leaf %d advance complete\n", my_index, leaf_side);
     return 1;
+}
+
+static int client_handle_leaf_advance_stateless(int fd,
+                                                  secp256k1_context *ctx,
+                                                  const secp256k1_keypair *keypair,
+                                                  factory_t *factory,
+                                                  uint32_t my_index,
+                                                  const wire_msg_t *propose_msg) {
+    leaf_adv_secrets_t sec;
+    memset(&sec, 0, sizeof sec);
+    int ok = leaf_advance_stateless_ceremony(fd, ctx, keypair, factory, my_index,
+                                             propose_msg, &sec);
+    /* The single exit for this ceremony's secrets (see leaf_adv_secrets_t):
+       both secnonces and both of our partial sigs, on every path. */
+    secure_zero(&sec, sizeof sec);
+    return ok;
 }
 
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
