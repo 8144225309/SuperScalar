@@ -156,7 +156,7 @@ env $ASAN_ENV \
     --port $LSP_PORT \
     --clients $N_CLIENTS \
     --arity 3 \
-    --ps-subfactory-arity $PS_SUB_ARITY \
+    --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $FUNDING_SATS \
     --fee-rate 1000 \
     --confirm-timeout 600 \

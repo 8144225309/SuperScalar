@@ -72,9 +72,25 @@ int build_unsigned_tx_with_locktime(
     const tx_output_t *outputs,
     size_t n_outputs
 ) {
+    return build_unsigned_tx_with_locktime_v(out, txid_out32, funding_txid,
+                                             funding_vout, nsequence, nlocktime,
+                                             outputs, n_outputs, 2);
+}
+
+int build_unsigned_tx_with_locktime_v(
+    tx_buf_t *out,
+    unsigned char *txid_out32,
+    const unsigned char *funding_txid,
+    uint32_t funding_vout,
+    uint32_t nsequence,
+    uint32_t nlocktime,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nVersion
+) {
     tx_buf_reset(out);
 
-    tx_buf_write_u32_le(out, 2);           /* nVersion */
+    tx_buf_write_u32_le(out, nVersion);    /* nVersion */
     tx_buf_write_varint(out, 1);           /* 1 input */
     tx_buf_write_bytes(out, funding_txid, 32);
     tx_buf_write_u32_le(out, funding_vout);

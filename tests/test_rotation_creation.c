@@ -160,6 +160,8 @@ static int rc_run_creation(int mode) {
     }
 
     int created = 0;
+    /* the agreed tree rate (factory_free cleared it) */
+    if (lsp) lsp->factory.tree_fee_rate = FACTORY_DEFAULT_TREE_FEE_RATE;
     if (!fail)
         created = lsp_run_factory_creation(lsp, fake_txid, 0, amount, spk, 34,
                                            10, 4, /*cltv*/ 500);

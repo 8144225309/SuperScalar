@@ -578,6 +578,7 @@ int chan_open_inbound_v2(peer_mgr_t *mgr, int peer_idx,
 
     ch_out->to_self_delay = their_delay;
     ch_out->fee_rate_sat_per_kvb = 1000;
+    ch_out->commit_fee_rate_sat_per_kvb = 1000;
     if (ch_out->ctx == NULL) ch_out->ctx = ctx;
 
     /* Build accept_channel2 (type 79):
