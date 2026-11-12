@@ -215,7 +215,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--tor-proxy HOST:PORT` | none | SOCKS5 proxy for Tor connections (e.g. `127.0.0.1:9050`) |
 | `--tor-only` | off | Refuse all non-`.onion` outbound connections (hard privacy mode) |
 | `--daemon` | off | Stay running (auto-fulfill, watchtower, reconnect) |
-| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP. Without it the client declines every offer with an explicit reject message. JIT channels are experimental. |
 | `--min-profit-bps N` | 0 | Refuse factory proposal if LSP's profit share for this client < N bps |
 | `--i-accept-the-risk` | off | Required for mainnet operation (`--network mainnet` or its other spelling `--network bitcoin`). Mainnet also requires `--db` and refuses `--seckey` and test/cheat flags |
 

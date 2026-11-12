@@ -2371,3 +2371,46 @@ int test_wire_queue_done_empty(void) {
     cJSON_Delete(j);
     return 1;
 }
+
+/* Every "#define MSG_<NAME> 0x.." in wire.h must have its own value: two
+   messages sharing an id are indistinguishable on the wire. */
+int test_wire_msg_ids_unique(void) {
+#ifndef SS_SOURCE_DIR
+#error "SS_SOURCE_DIR must be defined for test_superscalar"
+#endif
+    const char *path = SS_SOURCE_DIR "/include/superscalar/wire.h";
+    FILE *f = fopen(path, "r");
+    TEST_ASSERT(f != NULL, "open include/superscalar/wire.h");
+
+    static char names[256][64];
+    int seen[256];
+    memset(seen, 0, sizeof(seen));
+    int n_ids = 0, dup = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char name[64];
+        unsigned int id;
+        if (sscanf(line, "#define MSG_%63[A-Z0-9_] 0x%x", name, &id) != 2)
+            continue;
+        if (id > 0xFF) {
+            printf("  wire.h: MSG_%s = 0x%x does not fit the one-byte type\n", name, id);
+            dup = 1;
+            continue;
+        }
+        if (seen[id]) {
+            printf("  wire.h: id 0x%02X used by MSG_%s and MSG_%s\n",
+                   id, names[id], name);
+            dup = 1;
+        }
+        seen[id] = 1;
+        snprintf(names[id], sizeof(names[id]), "%s", name);
+        n_ids++;
+    }
+    fclose(f);
+    TEST_ASSERT(n_ids >= 100, "the message id table was read");
+    TEST_ASSERT(!dup, "wire message ids are unique");
+    TEST_ASSERT(seen[MSG_JIT_REJECT] && seen[MSG_BRIDGE_PAY_RESULT_ACK] &&
+                MSG_JIT_REJECT != MSG_BRIDGE_PAY_RESULT_ACK,
+                "JIT_REJECT and BRIDGE_PAY_RESULT_ACK have their own ids");
+    return 1;
+}

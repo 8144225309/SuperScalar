@@ -99,6 +99,17 @@ int network_gate_watchtower_db(const char *network, int have_wt_db,
     return 0;
 }
 
+int network_gate_no_experimental_jit(const char *network, int enable_jit,
+                                     char *err_buf, size_t err_buf_len) {
+    if (!network_is_mainnet(network) || !enable_jit) return 1;
+    if (err_buf && err_buf_len)
+        snprintf(err_buf, err_buf_len,
+            "Error: --enable-jit-experimental is refused on mainnet.\n"
+            "JIT channels are experimental: an open can leave the LSP's funds\n"
+            "in an output it cannot spend alone.\n");
+    return 0;
+}
+
 int network_startup_gates(const network_startup_t *startup,
                           char *err_buf, size_t err_buf_len) {
     if (!startup) return 0;
@@ -123,6 +134,10 @@ int network_startup_gates(const network_startup_t *startup,
         return 0;
     if (!network_gate_no_test_scaffolding(network, startup->argc, startup->argv,
                                           startup->envp, err_buf, err_buf_len))
+        return 0;
+    if (!network_gate_no_experimental_jit(network,
+                                          startup->enable_jit_experimental,
+                                          err_buf, err_buf_len))
         return 0;
     if (holds_key &&
         !network_gate_db(network, startup->have_db, err_buf, err_buf_len))
