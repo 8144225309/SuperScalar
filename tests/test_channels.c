@@ -5039,7 +5039,12 @@ int test_forward_into_full_channel_fails_back(void) {
         fflush(stdout);
         pid_t pid = fork();
         if (pid == 0) {
-            usleep(100000 * (c + 1));
+            /* The funding script is derived from the participants in key
+               order.  The LSP orders the members by these slot hints, not by
+               connection order; the clients connect in reverse so the test
+               never depends on which one the LSP accepts first. */
+            usleep(100000 * (2 - c));
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
