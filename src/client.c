@@ -339,16 +339,11 @@ static void client_send_error(int fd, const char *reason) {
    rejected anyway. */
 static int g_client_funding_pending_reorg = 0;
 
-/* SF-followup #145: client-side mirror of LSP's factory_reset_all_subfactory_
-   chains call from #208's reorg handler.  When MSG_FUNDING_REORG arrives with
-   frozen=1 the LSP has already reset its in-memory ps_chain_len for advanced
-   sub-factories; the client must do the same so subsequent recovery /
-   force-close paths don't reference invalid chain[N] state whose parent
-   chain[N-1] is no longer on chain.  Set at the entry of client_run_with_
-   channels / client_run_reconnect to point at the active factory_t, cleared
-   on exit.  When NULL (pre-factory bootstrap), the reorg notification is
-   recorded in the freeze flag but no reset happens (there's nothing to
-   reset). */
+/* SF-followup #145: the client's active factory_t.  Set at the entry of
+   client_run_with_channels / client_run_reconnect, cleared on exit; NULL
+   during pre-factory bootstrap.  (It used to let MSG_FUNDING_REORG wipe the
+   sub-factory chain state, mirroring the LSP's reorg handler; neither side
+   does that any more, since the chains are off-chain until a force-close.) */
 /* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): de-static'd so
  * src/client_reconnect.c (extracted) can write it on reconnect. */
 factory_t *g_client_active_factory = NULL;
@@ -379,16 +374,9 @@ int client_handle_async_msg(const wire_msg_t *msg) {
                 "frozen=%d (LSP says funding %s)\n",
                 txid_hex, frozen,
                 frozen ? "reorged out" : "back on chain");
-        /* SF-followup #145: on frozen=1 the LSP has reset its in-memory
-           ps_chain_len for advanced sub-factories; mirror that so recovery /
-           force-close paths don't reference invalid chain[N] state. */
-        if (frozen && g_client_active_factory) {
-            int n_reset = factory_reset_all_subfactory_chains(
-                g_client_active_factory);
-            if (n_reset > 0)
-                fprintf(stderr, "Client: reset ps_chain_len on %d "
-                        "sub-factor(ies) after funding reorg\n", n_reset);
-        }
+        /* Sub-factory chain state is kept: the LSP no longer wipes it on a
+           reorg (chains are off-chain until a force-close), and wiping it
+           here left chain[N] signed bytes without the chain state. */
         return 1;
     }
     if (msg->msg_type == MSG_CEREMONY_ABORT) {
