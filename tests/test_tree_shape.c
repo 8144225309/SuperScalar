@@ -12,6 +12,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
 #include "superscalar/musig.h"
+#include "superscalar/persist.h"
 #include <secp256k1_schnorrsig.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1300,5 +1301,140 @@ int test_tree_shape_capacity_build(void) {
     TEST_ASSERT(!factory_capacity_funding_amount(t.f, &amount), "no amount for k=2 leaves");
     TEST_ASSERT(!factory_build_tree(t.f), "k=2 leaves refuse capacities");
     ts_close(&t);
+    return 1;
+}
+
+
+/* ---- Capacity sizing at the agreed tree rate ---- */
+
+/* The capacity tree is sized with the per-node fee of the agreed tree rate
+   (exact vsize) and the anchor (0 sat at rate 0, else 240): the funding is
+   exactly what it needs, one sat either way is refused, every node pays
+   its exact fee and conserves value. */
+int test_tree_shape_capacity_rates(void) {
+    static const uint64_t rates[] = { 0, 100, 1000 };
+    for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+        factory_t *f = t.f;
+        f->tree_fee_rate = rates[r];
+        TEST_ASSERT(ts_set_caps(f, 20000), "capacities");
+        uint64_t need = f->funding_amount_sats;
+        unsigned char spk[34], txid[32];
+        memset(txid, 0xAA, 32);
+        TEST_ASSERT(factory_compute_funding_spk(f, spk), "spk");
+        TEST_ASSERT(factory_set_funding(f, txid, 0, need + 1, spk, 34) &&
+                    !factory_build_tree(f), "one sat over refused");
+        TEST_ASSERT(factory_set_funding(f, txid, 0, need - 1, spk, 34) &&
+                    !factory_build_tree(f), "one sat under refused");
+        TEST_ASSERT(factory_set_funding(f, txid, 0, need, spk, 34) &&
+                    factory_build_tree(f), "exact funding builds");
+        char why[200];
+        TEST_ASSERT(factory_check_tree_fees(f, why, sizeof(why)), why);
+        TEST_ASSERT(ts_conserves(f), "every node conserves value");
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            const factory_node_t *n = &f->nodes[i];
+            const tx_output_t *last = &n->outputs[n->n_outputs - 1];
+            if (last->script_pubkey_len == P2A_SPK_LEN)
+                TEST_ASSERT_EQ(last->amount_sats, rates[r] == 0 ? 0 : 240, "anchor amount");
+            if (rates[r] == 0) TEST_ASSERT_EQ(n->fee_sats, 0, "no fee at rate 0");
+        }
+        for (size_t c = 0; c < s.n_clients; c++) {
+            size_t ni;
+            uint32_t vout;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vout), "leaf");
+            TEST_ASSERT_EQ(f->nodes[ni].outputs[vout].amount_sats, ts_cap(c + 1), "capacity");
+        }
+        TEST_ASSERT(factory_sign_all(f) && factory_verify_all(f), "sign + verify");
+        ts_close(&t);
+    }
+    return 1;
+}
+
+/* ---- Reload of the per-member terms ---- */
+
+/* A built, signed capacities + leaf stock + channel script factory saved
+   into db (row and signed tree). */
+static int ts_terms_factory(ts_tree_t *t, persist_t *db) {
+    ts_shape_t s = { "N=4 PS anchors cltv", 4, {3}, 1, 0, 1, 1000, 0, 0 };
+    if (!ts_open_b(t, &s, 0)) return 0;
+    factory_t *f = t->f;
+    unsigned char spk[34];
+    secp256k1_pubkey o[2] = { f->pubkeys[0], f->pubkeys[2] };
+    return ts_keypath_spk(t->ctx, o, 2, spk) &&
+           factory_set_leaf_channel_spk(f, 2, spk, 34) &&
+           ts_set_caps(f, 25000) &&
+           factory_build_tree(f) && factory_sign_all(f) &&
+           persist_open(db, NULL) &&
+           persist_save_factory(db, f, f->ctx, 0) && persist_save_tree_nodes(db, f, 0);
+}
+
+/* The reload rebuilds exactly the signed tree: every node txid, and every
+   member's channel output (amount and script). */
+int test_tree_shape_terms_reload(void) {
+    ts_tree_t t;
+    persist_t db;
+    memset(&db, 0, sizeof(db));
+    TEST_ASSERT(ts_terms_factory(&t, &db), "setup");
+    factory_t *f = t.f;
+    factory_t *g = calloc(1, sizeof(*g));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, f->ctx), "reload");
+    TEST_ASSERT_EQ(g->n_nodes, f->n_nodes, "node count");
+    for (size_t i = 0; i < f->n_nodes; i++)
+        TEST_ASSERT(memcmp(f->nodes[i].txid, g->nodes[i].txid, 32) == 0, "node txid");
+    TEST_ASSERT(g->member_capacity && g->leaf_stock_sats == 25000, "terms restored");
+    for (size_t c = 0; c + 1 < f->n_participants; c++) {
+        size_t a, b;
+        uint32_t va, vb;
+        TEST_ASSERT(factory_client_to_leaf(f, c, &a, &va) &&
+                    factory_client_to_leaf(g, c, &b, &vb) && va == vb, "leaf");
+        TEST_ASSERT_EQ(g->nodes[b].outputs[vb].amount_sats, ts_cap(c + 1), "capacity");
+        TEST_ASSERT(memcmp(f->nodes[a].outputs[va].script_pubkey,
+                           g->nodes[b].outputs[vb].script_pubkey, 34) == 0, "script");
+    }
+    factory_free(g);
+    free(g);
+    persist_close(&db);
+    ts_close(&t);
+    return 1;
+}
+
+/* Edited terms in the DB are refused at reload, never rebuilt into another
+   tree: one capacity changed, a capacity moved between two members (same
+   funding), the stock changed, a channel script dropped. */
+int test_tree_shape_terms_edit_refused(void) {
+    static const char *edits[] = {
+        "UPDATE factories SET member_capacities = '27920,35838,43757,51676';",
+        "UPDATE factories SET member_capacities = '28919,34838,43757,51676';",
+        "UPDATE factories SET leaf_stock_sats = 25001;",
+        "UPDATE factories SET channel_scripts = NULL;",
+    };
+    for (size_t e = 0; e < sizeof(edits) / sizeof(edits[0]); e++) {
+        ts_tree_t t;
+        persist_t db;
+        memset(&db, 0, sizeof(db));
+        TEST_ASSERT(ts_terms_factory(&t, &db), "setup");
+        char *got = NULL;
+        sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(db.db, "SELECT member_capacities FROM factories WHERE id=0;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                got = strdup((const char *)sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+        }
+        TEST_ASSERT(got && strcmp(got, "27919,35838,43757,51676") == 0, "stored capacities");
+        free(got);
+        TEST_ASSERT(sqlite3_exec(db.db, edits[e], NULL, NULL, NULL) == SQLITE_OK, "edit");
+        factory_t *g = calloc(1, sizeof(*g));
+        TEST_ASSERT(g != NULL, "alloc");
+        int loaded = persist_load_factory(&db, 0, g, t.f->ctx);
+        factory_free(g);
+        free(g);
+        persist_close(&db);
+        ts_close(&t);
+        if (loaded) printf("  edit %zu was loaded\n", e);
+        TEST_ASSERT(!loaded, "edited terms refused");
+    }
     return 1;
 }
