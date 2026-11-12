@@ -388,7 +388,9 @@ run_scenario(){
             "$CLIENT_BIN" --network regtest --cli-path bitcoin-cli "${RPC_ARGS[@]}" \
                 --force-close --db "$D/c$i.db" >> "$D/fc_c$i.log" 2>&1
             fc_rc=$?
-            [ "$fc_rc" = 0 ] || note_fail "$MODE: client $i --force-close pass $pass exited $fc_rc"
+            # 0 = commitment accepted, 2 = path still maturing; anything else
+            # (1 = the exit cannot be completed, or a sanitizer exit code) fails
+            [ "$fc_rc" = 0 ] || [ "$fc_rc" = 2 ] || note_fail "$MODE: client $i --force-close pass $pass exited $fc_rc"
             mine 6
             [ -n "${CTXID[$i]}" ] && c=$(confs "${CTXID[$i]}")
             [ "${c:-0}" -ge 1 ] && break

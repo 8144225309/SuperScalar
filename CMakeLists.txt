@@ -35,8 +35,11 @@ if(_n_san GREATER 1)
 endif()
 if(ENABLE_SANITIZERS)
     add_library(project_sanitizers INTERFACE)
+    # Undefined behaviour aborts instead of printing and carrying on, so a
+    # test that hits it fails.
     target_compile_options(project_sanitizers INTERFACE
-        -fsanitize=address,undefined -fno-omit-frame-pointer)
+        -fsanitize=address,undefined -fno-sanitize-recover=undefined
+        -fno-omit-frame-pointer)
     target_link_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined)
 endif()
@@ -371,6 +374,7 @@ add_executable(test_superscalar
     tests/test_invoice.c
     tests/test_ln_dispatch.c
     tests/test_admin_rpc.c
+    tests/test_factory_recovery.c
     tests/test_chain_safety.c
     tests/test_onion_message.c
     tests/test_scb_recovery.c
@@ -491,7 +495,8 @@ if(ENABLE_FUZZING)
         target_include_directories(${fuzz_name} PRIVATE ${cjson_SOURCE_DIR})
         target_link_libraries(${fuzz_name} superscalar secp256k1 cjson SQLite::SQLite3)
         target_compile_options(${fuzz_name} PRIVATE
-            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+            -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+            -fno-omit-frame-pointer)
         target_link_options(${fuzz_name} PRIVATE
             -fsanitize=fuzzer,address,undefined)
     endforeach()

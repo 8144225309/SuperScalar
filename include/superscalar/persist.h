@@ -117,6 +117,14 @@ int persist_in_transaction(const persist_t *p);
    Called by factory_recovery_scan() when all leaf TXs are confirmed. */
 int persist_mark_factory_closed(persist_t *p, uint32_t factory_id);
 
+/* Client: keep the signed leaf transaction (node node_index of factory
+   factory_id, txid in display hex) that this client's channel is funded by,
+   before an advance replaces it in tree_nodes.  The first copy of a txid is
+   kept.  Returns 1 on success. */
+int persist_save_funding_leaf(persist_t *p, uint32_t factory_id,
+                              uint32_t node_index, const char *txid_display_hex,
+                              const unsigned char *signed_tx, size_t len);
+
 /* SF-WAL #157: force a passive WAL checkpoint so external SQLite readers
    (dashboard) see committed writes within heartbeat-tick granularity.
    Best-effort; never blocks. */

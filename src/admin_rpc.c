@@ -833,13 +833,25 @@ static cJSON *method_recoverfactory(admin_rpc_t *rpc, const cJSON *params,
         if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
     }
 
-    char status[256] = {0};
-    int ok = factory_recovery_run(p, chain, factory_id, status, sizeof(status));
+    char status[384] = {0};
+    factory_recovery_result_t res;
+    int ok = factory_recovery_run(p, chain, factory_id, NULL, &res,
+                                  status, sizeof(status));
+    if (!ok) {
+        snprintf(errmsg, errcap, "%s", status[0] ? status : "recovery failed");
+        return NULL;
+    }
 
     cJSON *r = cJSON_CreateObject();
     cJSON_AddNumberToObject(r, "factory_id",       (double)factory_id);
     cJSON_AddStringToObject(r, "status",           status[0] ? status : "no action needed");
-    cJSON_AddBoolToObject  (r, "broadcasts_made",  ok);
+    cJSON_AddBoolToObject  (r, "broadcasts_made",  res.n_broadcast > 0);
+    cJSON_AddBoolToObject  (r, "published",        res.published);
+    cJSON_AddNumberToObject(r, "n_tree_nodes",     (double)res.n_tree_nodes);
+    cJSON_AddNumberToObject(r, "n_confirmed",      (double)res.n_confirmed);
+    cJSON_AddNumberToObject(r, "n_in_mempool",     (double)res.n_in_mempool);
+    cJSON_AddNumberToObject(r, "n_waiting",        (double)res.n_waiting);
+    cJSON_AddNumberToObject(r, "n_rejected",       (double)res.n_rejected);
     return r;
 }
 
