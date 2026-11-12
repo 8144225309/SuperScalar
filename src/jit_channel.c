@@ -883,6 +883,14 @@ int jit_channels_revalidate_funding(void *mgr_ptr) {
 
         int conf = regtest_get_confirmations(mgr->watchtower->rt,
                                                jits[i].funding_txid_hex);
+        if (conf == REGTEST_CONF_RPC_ERROR) {
+            /* bitcoind did not answer: the funding state is unknown, so
+               the channel stays as it is. */
+            fprintf(stderr, "JIT revalidation: channel %08x funding state "
+                    "unknown (bitcoind unreachable), no change\n",
+                    jits[i].jit_channel_id);
+            continue;
+        }
         if (conf < 0) {
             fprintf(stderr, "JIT revalidation: channel %08x funding tx gone, "
                     "reverting to FUNDING state\n", jits[i].jit_channel_id);
@@ -934,6 +942,12 @@ int jit_channel_force_close(void *mgr_ptr, size_t client_idx,
     }
 
     int fund_confs = chain_be->get_confirmations(chain_be, fund_hex);
+    if (fund_confs == REGTEST_CONF_RPC_ERROR) {
+        /* bitcoind did not answer: not a funding that never confirmed. */
+        fprintf(stderr, "LSP JIT force-close: client %zu — funding state "
+                "unknown (bitcoind unreachable), not closing\n", client_idx);
+        return 0;
+    }
     if (fund_confs < 0) {
         /* Funding TX not found — JIT never confirmed, nothing to close */
         printf("LSP JIT force-close: client %zu — funding not on-chain, "

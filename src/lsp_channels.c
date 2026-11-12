@@ -3415,58 +3415,482 @@ int lsp_persist_ps_chain0_all(void *persist, factory_t *f) {
     return saved;
 }
 
-/* R5 (mainnet pre-flight): revalidate each factory channel's funding UTXO
-   against the active chain.  Sets ch->funding_pending_reorg = 1 when the
-   funding TX is no longer findable (reorged out); clears the flag back to
-   0 when a confirmed observation returns.  Mirrors jit_channels_revalidate
-   _funding() (src/jit_channel.c:752) for the factory-channel case.
+/* ---- R1 reorg detection (declarations and rules in lsp_channels.h) ---- */
 
-   Returns the number of channels whose flag state changed (toggled either
-   direction).  Caller may persist or notify clients on a non-zero return.
+/* A chain tip whose branch is not in the main chain and was (or may have
+   been) connected: "valid-fork" (fully validated, typically disconnected by
+   a reorg) or "invalid" (invalidateblock, or a block that failed validation
+   and may never have been connected). */
+static int reorg_tip_disconnected(const regtest_chain_tip_t *t) {
+    return t->branchlen > 0 &&
+           (strcmp(t->status, "valid-fork") == 0 ||
+            strcmp(t->status, "invalid") == 0);
+}
 
-   Intended call sites (separate PRs will wire these up):
-     1. Daemon startup recovery (one-shot scan, like jit_channels_*)
-     2. R1's reorg handler in lsp_run_state_advance (defense after watchtower_on_reorg)
-     3. Periodic heartbeat (cheap defense)
-*/
-int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+static int reorg_tip_seen(const lsp_reorg_state_t *st, const char *hash) {
+    for (size_t i = 0; i < st->n_seen; i++)
+        if (strcmp(st->seen[i], hash) == 0) return 1;
+    return 0;
+}
+
+int lsp_reorg_needs_hash_at_last(const lsp_reorg_state_t *st, int32_t cur_height) {
+    return st && st->height > 0 && st->hash[0] && cur_height > st->height;
+}
+
+int lsp_reorg_needs_tips(const lsp_reorg_state_t *st, int32_t cur_height,
+                         const char *cur_hash) {
+    if (!st || cur_height <= 0 || !cur_hash || !cur_hash[0]) return 0;
+    /* First observation too: it seeds st->seen. */
+    return st->height <= 0 || !st->hash[0] || cur_height != st->height ||
+           strcmp(cur_hash, st->hash) != 0;
+}
+
+lsp_reorg_kind_t lsp_reorg_classify(const lsp_reorg_state_t *st,
+                                    int32_t cur_height, const char *cur_hash,
+                                    const lsp_reorg_view_t *view) {
+    static const lsp_reorg_view_t no_view;
+    if (!view) view = &no_view;
+    if (cur_height <= 0 || !cur_hash || !cur_hash[0])
+        return LSP_REORG_INCONCLUSIVE;              /* tip read failed */
+    if (!st || st->height <= 0 || !st->hash[0])
+        return LSP_REORG_NONE;                      /* first observation */
+    const int32_t last = st->height;
+    if (cur_height < last)
+        return LSP_REORG_HEIGHT_REGRESSION;
+    if (cur_height == last && strcmp(cur_hash, st->hash) == 0)
+        return LSP_REORG_NONE;                      /* tip unchanged */
+    if (cur_height == last)
+        return LSP_REORG_SAME_HEIGHT;
+    /* cur_height > last */
+    if (!view->hash_at_last || !view->hash_at_last[0])
+        return LSP_REORG_INCONCLUSIVE;
+    if (strcmp(view->hash_at_last, st->hash) != 0) {
+        if (!view->hash_at_next || !view->hash_at_next[0])
+            return LSP_REORG_INCONCLUSIVE;
+        if (strcmp(view->hash_at_next, st->hash) != 0)
+            return LSP_REORG_FORWARD;
+        /* st->hash is the active block at last + 1: the pair was read across
+           a block arrival and nothing at `last` was replaced.  Go on to the
+           chain-tips check. */
+    }
+    /* Stored tip still in the main chain: was a block built on it after it
+       was stored, and disconnected before this poll? */
+    if (!view->tips)
+        return LSP_REORG_INCONCLUSIVE;
+    for (size_t i = 0; i < view->n_tips; i++) {
+        const regtest_chain_tip_t *t = &view->tips[i];
+        if (!reorg_tip_disconnected(t)) continue;
+        int32_t fork_height = t->height - t->branchlen;
+        if (fork_height >= last && t->height > last &&
+            !reorg_tip_seen(st, t->hash))
+            return LSP_REORG_UNSEEN_BLOCK;
+    }
+    return LSP_REORG_NONE;
+}
+
+void lsp_reorg_state_advance(lsp_reorg_state_t *st, int32_t cur_height,
+                             const char *cur_hash,
+                             const regtest_chain_tip_t *tips, size_t n_tips) {
+    if (!st || cur_height <= 0 || !cur_hash || !cur_hash[0]) return;
+    st->height = cur_height;
+    snprintf(st->hash, sizeof(st->hash), "%s", cur_hash);
+    /* Disconnected tips already above the new stored tip would qualify as
+       UNSEEN_BLOCK on the next poll (e.g. the branch a HEIGHT_REGRESSION just
+       reported).  They are accounted for now. */
+    for (size_t i = 0; tips && i < n_tips; i++) {
+        const regtest_chain_tip_t *t = &tips[i];
+        if (!reorg_tip_disconnected(t) || !t->hash[0]) continue;
+        int32_t fork_height = t->height - t->branchlen;
+        if (fork_height < cur_height || t->height <= cur_height) continue;
+        if (reorg_tip_seen(st, t->hash)) continue;
+        snprintf(st->seen[st->seen_next], sizeof(st->seen[0]), "%s", t->hash);
+        st->seen_next = (st->seen_next + 1) % LSP_REORG_SEEN_MAX;
+        if (st->n_seen < LSP_REORG_SEEN_MAX) st->n_seen++;
+    }
+}
+
+int32_t lsp_reorg_fork_height(const lsp_reorg_state_t *prev,
+                              lsp_reorg_kind_t kind, int32_t cur_height,
+                              const lsp_reorg_view_t *view) {
+    if (kind <= LSP_REORG_NONE || !prev) return -1;
+    if (view && view->tips) {
+        for (size_t i = 0; i < view->n_tips; i++) {
+            const regtest_chain_tip_t *t = &view->tips[i];
+            if (t->branchlen > 0 && strcmp(t->hash, prev->hash) == 0)
+                return t->height - t->branchlen;
+        }
+        if (kind == LSP_REORG_UNSEEN_BLOCK) {
+            int32_t lowest = -1;
+            for (size_t i = 0; i < view->n_tips; i++) {
+                const regtest_chain_tip_t *t = &view->tips[i];
+                if (!reorg_tip_disconnected(t)) continue;
+                int32_t fh = t->height - t->branchlen;
+                if (fh >= prev->height && t->height > prev->height &&
+                    !reorg_tip_seen(prev, t->hash) &&
+                    (lowest < 0 || fh < lowest))
+                    lowest = fh;
+            }
+            if (lowest >= 0) return lowest;
+        }
+    }
+    int32_t low = cur_height < prev->height ? cur_height : prev->height;
+    return low > 0 ? low - 1 : 0;
+}
+
+int lsp_reorg_rollback_subfactory_chains(factory_t *f, int32_t fork_height) {
+    return factory_reset_subfactory_chains_above_height(
+        f, fork_height > 0 ? (uint32_t)fork_height : 0);
+}
+
+int lsp_reorg_state_load(void *persist, const char *detector,
+                         lsp_reorg_state_t *st) {
+    if (!persist || !detector || !st) return 0;
+    int32_t h = 0;
+    char hash[65];
+    if (!persist_load_reorg_tip((persist_t *)persist, detector, &h, hash) || h <= 0)
+        return 0;
+    memset(st, 0, sizeof(*st));
+    st->height = h;
+    memcpy(st->hash, hash, 65);
+    st->fork_height = -1;
+    return 1;
+}
+
+int lsp_reorg_state_save(void *persist, const char *detector,
+                         const lsp_reorg_state_t *st) {
+    if (!persist || !detector || !st || st->height <= 0 || !st->hash[0])
+        return 0;
+    return persist_save_reorg_tip((persist_t *)persist, detector,
+                                  st->height, st->hash);
+}
+
+#define LSP_REORG_MAX_TIPS 64
+
+lsp_reorg_kind_t lsp_reorg_poll(regtest_t *rt, lsp_reorg_state_t *st,
+                                int32_t *cur_height, char cur_hash[65]) {
+    int h = -1;
+    cur_hash[0] = '\0';
+    if (!regtest_get_tip(rt, &h, cur_hash)) {
+        *cur_height = -1;
+        return LSP_REORG_INCONCLUSIVE;
+    }
+    *cur_height = h;
+
+    lsp_reorg_view_t view = {0};
+    char at_last[65] = {0}, at_next[65] = {0};
+    if (lsp_reorg_needs_hash_at_last(st, h)) {
+        if (regtest_get_block_hash(rt, st->height, at_last, sizeof(at_last)) &&
+            at_last[0])
+            view.hash_at_last = at_last;
+        if (view.hash_at_last && strcmp(at_last, st->hash) != 0) {
+            if (h == st->height + 1)
+                snprintf(at_next, sizeof(at_next), "%s", cur_hash);
+            else if (!regtest_get_block_hash(rt, st->height + 1, at_next,
+                                             sizeof(at_next)))
+                at_next[0] = '\0';
+            if (at_next[0]) view.hash_at_next = at_next;
+        }
+    }
+    regtest_chain_tip_t tips[LSP_REORG_MAX_TIPS];
+    size_t n_tips = 0;
+    if (lsp_reorg_needs_tips(st, h, cur_hash) &&
+        regtest_get_chain_tips(rt, tips, LSP_REORG_MAX_TIPS, &n_tips)) {
+        view.tips = tips;
+        view.n_tips = n_tips;
+    }
+    lsp_reorg_kind_t kind = lsp_reorg_classify(st, h, cur_hash, &view);
+    int32_t fork = lsp_reorg_fork_height(st, kind, h, &view);
+    if (kind != LSP_REORG_INCONCLUSIVE)
+        lsp_reorg_state_advance(st, h, cur_hash, view.tips, view.n_tips);
+    st->fork_height = fork;
+    return kind;
+}
+
+const char *lsp_reorg_kind_str(lsp_reorg_kind_t kind) {
+    switch (kind) {
+    case LSP_REORG_HEIGHT_REGRESSION: return "HEIGHT_REGRESSION";
+    case LSP_REORG_SAME_HEIGHT:       return "SAME_HEIGHT";
+    case LSP_REORG_FORWARD:           return "FORWARD_REORG";
+    case LSP_REORG_UNSEEN_BLOCK:      return "UNSEEN_BLOCK_REORG";
+    case LSP_REORG_INCONCLUSIVE:      return "INCONCLUSIVE";
+    default:                          return "";
+    }
+}
+
+/* Display-order hex of an internal-order txid. */
+static void reval_txid_hex(const unsigned char txid[32], char out[65]) {
     extern void hex_encode(const unsigned char *, size_t, char *);
     extern void reverse_bytes(unsigned char *, size_t);
+    unsigned char disp[32];
+    memcpy(disp, txid, 32);
+    reverse_bytes(disp, 32);
+    hex_encode(disp, 32, out);
+    out[64] = '\0';
+}
+
+typedef enum {
+    REVAL_CONFIRMED,   /* >= 1 confirmation in the active chain */
+    REVAL_PENDING,     /* in the mempool, younger than the freeze threshold */
+    REVAL_STALE,       /* in the mempool past regtest_network_mempool_freeze_seconds() */
+    REVAL_GONE,        /* neither confirmed nor in the mempool */
+    REVAL_UNKNOWN,     /* bitcoind could not be reached: no state change */
+} reval_state_t;
+
+/* State of one funding TX.  conf == 0 alone does not mean "in the mempool":
+   with -txindex, getrawtransaction still returns a TX whose block was
+   disconnected (and a wallet still lists it) with "confirmations": 0, so
+   the mempool is checked as well.  A block connecting between the two RPCs
+   can make a just-confirmed TX look GONE for one call; the next per-block
+   re-check corrects it. */
+static reval_state_t reval_funding_state(regtest_t *rt, const char *txid_hex,
+                                         int *conf_out) {
+    int conf = regtest_get_confirmations(rt, txid_hex);
+    *conf_out = conf;
+    if (conf == REGTEST_CONF_RPC_ERROR) return REVAL_UNKNOWN;
+    if (conf >= 1) return REVAL_CONFIRMED;
+    if (conf < 0) return REVAL_GONE;
+    int age = regtest_get_mempool_entry_seconds_ago(rt, txid_hex);
+    if (age < 0 && regtest_last_rpc_unreachable()) return REVAL_UNKNOWN;
+    if (age < 0) return REVAL_GONE;
+    return age >= regtest_network_mempool_freeze_seconds(rt) ? REVAL_STALE
+                                                             : REVAL_PENDING;
+}
+
+/* ---- factory funding anchor (mgr->funding_anchor_*) ---- */
+
+static int reval_anchor_known(const lsp_channel_mgr_t *mgr, const char *fund_hex) {
+    return mgr->funding_anchor_height > 0 && mgr->funding_anchor_block[0] &&
+           strcmp(mgr->funding_anchor_txid, fund_hex) == 0;
+}
+
+static void reval_anchor_set(lsp_channel_mgr_t *mgr, const char *fund_hex,
+                             int32_t height, const char *block_hash, int save) {
+    snprintf(mgr->funding_anchor_txid, sizeof(mgr->funding_anchor_txid), "%s", fund_hex);
+    mgr->funding_anchor_height = height;
+    snprintf(mgr->funding_anchor_block, sizeof(mgr->funding_anchor_block), "%s", block_hash);
+    if (save && mgr->persist)
+        persist_save_funding_anchor((persist_t *)mgr->persist, fund_hex,
+                                    height, block_hash);
+}
+
+static void reval_anchor_load(lsp_channel_mgr_t *mgr, const char *fund_hex) {
+    if (reval_anchor_known(mgr, fund_hex) || !mgr->persist) return;
+    int32_t h = 0;
+    char hash[65];
+    if (persist_load_funding_anchor((persist_t *)mgr->persist, fund_hex, &h, hash) &&
+        h > 0)
+        reval_anchor_set(mgr, fund_hex, h, hash, 0);
+}
+
+void (*lsp_channels_test_anchor_hook)(void *arg) = NULL;
+void *lsp_channels_test_anchor_hook_arg = NULL;
+
+/* From an unspent output with conf >= 1 evaluated at `bestblock`: the
+   confirming block is at height(bestblock) - conf + 1.  The chain can
+   change between the gettxout read and the block-hash lookup (a reorg that
+   also drops the funding TX), so the block now at that height is recorded
+   only if it contains the funding TX. */
+static int reval_anchor_from_txout(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                                   const char *fund_hex, int conf,
+                                   const char *bestblock) {
+    if (conf < 1 || !bestblock[0]) return 0;
+    if (lsp_channels_test_anchor_hook)
+        lsp_channels_test_anchor_hook(lsp_channels_test_anchor_hook_arg);
+    int best_h = regtest_get_block_header_height(rt, bestblock);
+    if (best_h <= 0) return 0;
+    int32_t h = best_h - conf + 1;
+    char hash[65] = {0};
+    if (h <= 0 || !regtest_get_block_hash(rt, h, hash, sizeof(hash)) || !hash[0])
+        return 0;
+    if (reval_anchor_known(mgr, fund_hex) && mgr->funding_anchor_height == h &&
+        strcmp(mgr->funding_anchor_block, hash) == 0)
+        return 1;
+    if (regtest_block_contains_tx(rt, hash, fund_hex) != 1)
+        return 0;                    /* chain moved: record nothing */
+    reval_anchor_set(mgr, fund_hex, h, hash, 1);
+    return 1;
+}
+
+int lsp_channels_note_funding_anchor(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    static const unsigned char zero32[32] = {0};
+    if (!mgr || !lsp || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+    if (memcmp(lsp->factory.funding_txid, zero32, 32) == 0) return 0;
+    char fund_hex[65];
+    reval_txid_hex(lsp->factory.funding_txid, fund_hex);
+    reval_anchor_load(mgr, fund_hex);
+    if (reval_anchor_known(mgr, fund_hex)) return 1;
+    int conf = -1;
+    char best[65];
+    if (regtest_get_txout(mgr->watchtower->rt, fund_hex,
+                          lsp->factory.funding_vout, &conf, best) == 1 && conf >= 1)
+        return reval_anchor_from_txout(mgr, mgr->watchtower->rt, fund_hex,
+                                       conf, best);
+    return 0;
+}
+
+/* State of the factory funding TX, without -txindex or a scan depth:
+     1. gettxout on the funding output (mempool included).  Unspent: its
+        confirmations decide (>= 1 CONFIRMED, and the anchor is recorded;
+        0 in the mempool -> PENDING / STALE by age).
+     2. No unspent output: spent (factory closed, or its tree on chain) or
+        gone.  If the recorded anchor block is still in the active chain,
+        the funding TX is confirmed: CONFIRMED.  If the anchor block left the
+        chain, so did the TX unless it was mined again after the fork, which
+        a normal lookup finds near the tip: reval_funding_state().
+     3. No anchor and no unspent output: a confirmed-and-spent funding TX
+        deeper than this node can see (no -txindex, not a wallet TX) looks
+        the same as a vanished one, so only a definite answer from
+        reval_funding_state() counts; "not found" (-1) is UNKNOWN.  A
+        conflicted wallet TX (REGTEST_CONF_CONFLICTED) is definite: GONE. */
+static reval_state_t reval_factory_funding(lsp_channel_mgr_t *mgr, regtest_t *rt,
+                                           const factory_t *f,
+                                           const char *fund_hex, int *conf_out) {
+    reval_anchor_load(mgr, fund_hex);
+    int conf = -1;
+    char best[65];
+    int r = regtest_get_txout(rt, fund_hex, f->funding_vout, &conf, best);
+    if (r < 0) {
+        *conf_out = REGTEST_CONF_RPC_ERROR;
+        return REVAL_UNKNOWN;
+    }
+    if (r == 1) {
+        *conf_out = conf;
+        if (conf >= 1) {
+            int keep = 0;
+            if (reval_anchor_known(mgr, fund_hex)) {
+                char at[65] = {0};
+                keep = regtest_get_block_hash(rt, mgr->funding_anchor_height,
+                                              at, sizeof(at)) &&
+                       strcmp(at, mgr->funding_anchor_block) == 0;
+            }
+            if (!keep)
+                reval_anchor_from_txout(mgr, rt, fund_hex, conf, best);
+            return REVAL_CONFIRMED;
+        }
+        int age = regtest_get_mempool_entry_seconds_ago(rt, fund_hex);
+        if (age < 0 && regtest_last_rpc_unreachable()) return REVAL_UNKNOWN;
+        if (age < 0) return REVAL_PENDING;   /* mined or dropped since gettxout */
+        return age >= regtest_network_mempool_freeze_seconds(rt) ? REVAL_STALE
+                                                                 : REVAL_PENDING;
+    }
+    if (reval_anchor_known(mgr, fund_hex)) {
+        char at[65] = {0};
+        if (!regtest_get_block_hash(rt, mgr->funding_anchor_height, at, sizeof(at))) {
+            if (regtest_last_rpc_unreachable()) {
+                *conf_out = REGTEST_CONF_RPC_ERROR;
+                return REVAL_UNKNOWN;
+            }
+            at[0] = '\0';                    /* chain now shorter than the anchor */
+        }
+        if (at[0] && strcmp(at, mgr->funding_anchor_block) == 0) {
+            int tip = regtest_get_block_height(rt);
+            *conf_out = tip >= mgr->funding_anchor_height
+                      ? tip - mgr->funding_anchor_height + 1 : 1;
+            return REVAL_CONFIRMED;
+        }
+        return reval_funding_state(rt, fund_hex, conf_out);
+    }
+    reval_state_t st = reval_funding_state(rt, fund_hex, conf_out);
+    if (st == REVAL_GONE && *conf_out == -1) return REVAL_UNKNOWN;
+    return st;
+}
+
+static int lsp_channels_any_funding_frozen(const lsp_channel_mgr_t *mgr) {
+    if (!mgr || !mgr->entries) return 0;
+    for (size_t c = 0; c < mgr->n_channels; c++)
+        if (mgr->entries[c].channel.funding_pending_reorg) return 1;
+    return 0;
+}
+
+int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr) {
+    return mgr && (mgr->funding_anchor_unconfirmed ||
+                   lsp_channels_any_funding_frozen(mgr));
+}
+
+/* R5 (mainnet pre-flight): revalidate each factory channel's funding
+   against the active chain, and freeze (funding_pending_reorg = 1)
+   channels whose funding TX is gone; unfreeze them when it confirms again.
+
+   What is checked: a factory channel's ch->funding_txid is its LEAF state
+   transaction (lsp_channels_init: funding_txid = state_node->txid).  That
+   transaction lives in the off-chain factory tree and is normally never
+   broadcast, so it must not be looked up.  What backs every channel of a
+   factory is the factory's funding transaction (lsp->factory.funding_txid).
+   All channels in mgr are built from lsp->factory (lsp_channels_init /
+   lsp_channels_init_from_db are called with &lsp->factory, and again after
+   every rotation, which replaces lsp->factory); ladder factories other than
+   the active one have no entries in mgr.  A leaf TX can only be on chain if
+   the factory funding TX is, so the leaf is never consulted.
+
+   Per call, the factory funding TX is classified once
+   (reval_factory_funding: its output via gettxout, else its recorded
+   confirming block, see mgr->funding_anchor_*):
+     - CONFIRMED: frozen channels are unfrozen.
+     - GONE (not confirmed, not in the mempool) or STALE (in the mempool past
+       the per-network threshold): channels are frozen.
+     - PENDING: no change.
+     - UNKNOWN (bitcoind unreachable): no change at all, including
+       mgr->funding_anchor_unconfirmed.
+   mgr->funding_anchor_unconfirmed is set when the result was not CONFIRMED;
+   while it (or any freeze) is set the daemon loop calls this again on every
+   new block (lsp_channels_funding_recheck_due), so PENDING turns into a
+   freeze or an all-clear without waiting for another reorg.
+
+   When lsp is NULL or the factory has no funding txid set, ch->funding_txid
+   itself is checked per channel (the pre-factory behaviour).  JIT channels
+   are handled by jit_channels_revalidate_funding() (src/jit_channel.c).
+
+   Returns the number of channels whose flag changed.  Each change is
+   persisted (v31) and sent to the client as MSG_FUNDING_REORG.
+   Callers: the R1 reorg handlers (daemon loop, heartbeat) and the daemon
+   loop's per-block re-check. */
+int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !mgr->watchtower || !mgr->watchtower->rt) return 0;
+    regtest_t *rt = mgr->watchtower->rt;
     int changed = 0;
+    int any_unconfirmed = 0;
+    int any_unknown = 0;
+
+    static const unsigned char zero32[32] = {0};
+    const factory_t *f = lsp ? &lsp->factory : NULL;
+    int use_factory = f && memcmp(f->funding_txid, zero32, 32) != 0;
+    char fund_hex[65] = {0};
+    int fund_conf = -1;
+    reval_state_t fund_state = REVAL_GONE;
+    if (use_factory) {
+        reval_txid_hex(f->funding_txid, fund_hex);
+        fund_state = reval_factory_funding(mgr, rt, f, fund_hex, &fund_conf);
+    }
+
     for (size_t c = 0; c < mgr->n_channels; c++) {
         channel_t *ch = &mgr->entries[c].channel;
-        /* Compute display-order hex txid for the chain query. */
-        unsigned char disp[32];
-        memcpy(disp, ch->funding_txid, 32);
-        reverse_bytes(disp, 32);
-        char txid_hex[65];
-        hex_encode(disp, 32, txid_hex);
-        txid_hex[64] = '\0';
-        int conf = regtest_get_confirmations(mgr->watchtower->rt, txid_hex);
-        int new_state = -1;
-        /* R5 #128: proactive mempool-expiry freeze.  If the TX is in
-           mempool but unconfirmed (conf == 0) AND it has been there
-           longer than the network-specific threshold, treat it as
-           effectively reorged-out.  Pairs with the reactive `conf < 0`
-           freeze below — together they catch "evicted already" and
-           "about to be evicted". */
-        int mempool_age_freeze = 0;
-        if (conf == 0) {
-            int age = regtest_get_mempool_entry_seconds_ago(
-                mgr->watchtower->rt, txid_hex);
-            int threshold = regtest_network_mempool_freeze_seconds(
-                mgr->watchtower->rt);
-            if (age >= threshold)
-                mempool_age_freeze = 1;
+        char own_hex[65];
+        const char *txid_hex;   /* the TX the decision was based on */
+        int conf;
+        reval_state_t st;
+        if (use_factory) {
+            txid_hex = fund_hex;
+            conf = fund_conf;
+            st = fund_state;
+        } else {
+            reval_txid_hex(ch->funding_txid, own_hex);
+            txid_hex = own_hex;
+            st = reval_funding_state(rt, own_hex, &conf);
         }
-        if ((conf < 0 || mempool_age_freeze) && !ch->funding_pending_reorg) {
+        if (st == REVAL_UNKNOWN) {
+            any_unknown = 1;
+            continue;
+        }
+        if (st != REVAL_CONFIRMED) any_unconfirmed = 1;
+
+        int new_state = -1;
+        if ((st == REVAL_GONE || st == REVAL_STALE) && !ch->funding_pending_reorg) {
             fprintf(stderr,
-                "LSP revalidate: channel %zu funding %.16s... %s — "
+                "LSP revalidate: channel %zu %s %.16s... %s — "
                 "FREEZING (funding_pending_reorg=1)\n",
-                c, txid_hex,
-                mempool_age_freeze ? "stale in mempool past timeout"
-                                   : "not on chain");
+                c, use_factory ? "factory funding" : "funding", txid_hex,
+                st == REVAL_STALE ? "stale in mempool past timeout"
+                                  : "not on chain or in mempool");
             ch->funding_pending_reorg = 1;
             changed++;
             new_state = 1;
@@ -3474,11 +3898,11 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             if (mgr->persist)
                 persist_update_channel_funding_reorg(
                     (persist_t *)mgr->persist, (uint32_t)c, 1);
-        } else if (conf >= 1 && ch->funding_pending_reorg) {
+        } else if (st == REVAL_CONFIRMED && ch->funding_pending_reorg) {
             fprintf(stderr,
-                "LSP revalidate: channel %zu funding %.16s... back on chain "
+                "LSP revalidate: channel %zu %s %.16s... back on chain "
                 "(%d confs) — UNFREEZING (funding_pending_reorg=0)\n",
-                c, txid_hex, conf);
+                c, use_factory ? "factory funding" : "funding", txid_hex, conf);
             ch->funding_pending_reorg = 0;
             changed++;
             new_state = 0;
@@ -3501,6 +3925,12 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             }
         }
     }
+    if (any_unknown)
+        fprintf(stderr, "LSP revalidate: funding state unknown (bitcoind "
+                "unreachable, or a spent funding output with no recorded "
+                "block) — no change\n");
+    else
+        mgr->funding_anchor_unconfirmed = any_unconfirmed;
     return changed;
 }
 
@@ -7694,55 +8124,54 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 /* Check block height / factory lifecycle (fast: 1 RPC call).
                    watchtower_check is deferred to once per 60s (below). */
                 if (mgr->watchtower && mgr->watchtower->rt) {
-                    int height = regtest_get_block_height(mgr->watchtower->rt);
-                /* Reorg detection (R1): catches three kinds of reorg the daemon
-                   must react to.  Tracking just height — the prior implementation
-                   — missed (2) and (3), which are the common cases when a
-                   competing chain wins.
-                     1. HEIGHT_REGRESSION: tip went backward.
-                     2. SAME_HEIGHT:       tip stayed at last height but hash changed.
-                     3. FORWARD_REORG:     tip advanced but the block we knew at
-                                           last_height is no longer canonical —
-                                           a fork beneath our last tip became active. */
-                {
-                    static int32_t daemon_last_height = 0;
-                    static char    daemon_last_tip_hash[65] = {0};
-                    char cur_tip_hash[65] = {0};
-                    regtest_get_best_block_hash(mgr->watchtower->rt, cur_tip_hash);
-
-                    int reorg_kind = 0;
-                    const char *reorg_kind_str = "";
-                    if (daemon_last_height > 0 && height > 0 &&
-                        height < daemon_last_height) {
-                        reorg_kind = 1;
-                        reorg_kind_str = "HEIGHT_REGRESSION";
-                    } else if (daemon_last_height > 0 && height == daemon_last_height &&
-                               daemon_last_tip_hash[0] && cur_tip_hash[0] &&
-                               strcmp(cur_tip_hash, daemon_last_tip_hash) != 0) {
-                        reorg_kind = 2;
-                        reorg_kind_str = "SAME_HEIGHT";
-                    } else if (daemon_last_height > 0 && height > daemon_last_height &&
-                               daemon_last_tip_hash[0]) {
-                        char prev_hash_now[65] = {0};
-                        if (regtest_get_block_hash(mgr->watchtower->rt,
-                                                    daemon_last_height,
-                                                    prev_hash_now,
-                                                    sizeof(prev_hash_now)) &&
-                            prev_hash_now[0] &&
-                            strcmp(prev_hash_now, daemon_last_tip_hash) != 0) {
-                            reorg_kind = 3;
-                            reorg_kind_str = "FORWARD_REORG";
-                        }
+                    /* Reorg detection (R1).  lsp_reorg_poll() reads the tip
+                       height and hash from ONE getblockchaininfo call (two
+                       separate RPCs race with block arrival and can store
+                       (H, hash of H+1)), classifies the change against the
+                       stored tip and advances it, unless the result is
+                       INCONCLUSIVE (a read failed; retried next poll).
+                       Reported kinds (lsp_reorg_kind_t):
+                         HEIGHT_REGRESSION   tip went backward
+                         SAME_HEIGHT         same height, different hash
+                         FORWARD_REORG       tip advanced, the block at the
+                                             stored height was replaced
+                         UNSEEN_BLOCK_REORG  stored tip still canonical, a
+                                             block built on it after it was
+                                             stored was disconnected */
+                    static lsp_reorg_state_t daemon_reorg;
+                    static int daemon_reorg_loaded = 0;
+                    /* Resume from the tip stored before a restart, so a
+                       reorg while the LSP was down is reported (and
+                       handled) on the first poll. */
+                    if (!daemon_reorg_loaded) {
+                        daemon_reorg_loaded = 1;
+                        if (mgr->persist &&
+                            lsp_reorg_state_load(mgr->persist, "daemon",
+                                                 &daemon_reorg))
+                            fprintf(stderr, "LSP: reorg detector resumes from "
+                                    "stored tip %d %.16s\n", daemon_reorg.height,
+                                    daemon_reorg.hash);
                     }
+                    const int32_t daemon_prev_height = daemon_reorg.height;
+                    char daemon_prev_hash[65];
+                    memcpy(daemon_prev_hash, daemon_reorg.hash, 65);
+                    int32_t height32 = -1;
+                    char cur_tip_hash[65] = {0};
+                    lsp_reorg_kind_t reorg_kind = lsp_reorg_poll(
+                        mgr->watchtower->rt, &daemon_reorg, &height32,
+                        cur_tip_hash);
+                    int height = (int)height32;
+                {
+                    const char *reorg_kind_str = lsp_reorg_kind_str(reorg_kind);
 
-                    if (reorg_kind) {
-                        int depth_proxy = (reorg_kind == 1)
-                            ? (daemon_last_height - height) : 0;
+                    if (reorg_kind > LSP_REORG_NONE) {
+                        int depth_proxy = (reorg_kind == LSP_REORG_HEIGHT_REGRESSION)
+                            ? (daemon_prev_height - height) : 0;
                         fprintf(stderr, "LSP: REORG detected (%s) — "
                                 "height %d → %d (depth %d) hash %.16s → %.16s\n",
-                                reorg_kind_str, daemon_last_height, height,
+                                reorg_kind_str, daemon_prev_height, height,
                                 depth_proxy,
-                                daemon_last_tip_hash[0] ? daemon_last_tip_hash : "?",
+                                daemon_prev_hash[0] ? daemon_prev_hash : "?",
                                 cur_tip_hash[0] ? cur_tip_hash : "?");
                         /* CL6: persist reorg event for test evidence */
                         if (mgr->persist) {
@@ -7750,8 +8179,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             snprintf(det, sizeof(det),
                                      "%s height_%d->%d hash_%.16s->%.16s",
                                      reorg_kind_str,
-                                     daemon_last_height, height,
-                                     daemon_last_tip_hash[0] ? daemon_last_tip_hash : "?",
+                                     daemon_prev_height, height,
+                                     daemon_prev_hash[0] ? daemon_prev_hash : "?",
                                      cur_tip_hash[0] ? cur_tip_hash : "?");
                             persist_log_broadcast((persist_t *)mgr->persist,
                                                    "", "reorg_detected",
@@ -7759,21 +8188,24 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                         }
                         /* Re-validate watchtower entries */
                         watchtower_on_reorg(mgr->watchtower, height,
-                                           daemon_last_height);
-                        /* Drop in-memory sub-factory chain advance state.
-                           A reorg of chain[N-1] would invalidate chain[N]'s
-                           prev-output reference; resetting forces force-close
-                           to fall back to chain[0] (v23/PR #144 path), which
-                           spends the factory leaf output directly. DB rows
-                           in ps_subfactory_chains are preserved for forensics. */
+                                           daemon_prev_height);
+                        /* Sub-factory chains: roll back only entries that were
+                           observed confirmed above the fork height.  Chains are
+                           off-chain until a force-close, so a reorg leaves them
+                           as they are; nothing records confirmation heights for
+                           them yet, so in practice nothing is rolled back here.
+                           (Wiping every chain on each alarm left
+                           chain[N] signed bytes without the chain state, broke
+                           force-close of advanced sub-factories and let the
+                           next advance overwrite a DB chain row.) */
                         {
-                            int n_sub_reset =
-                                factory_reset_all_subfactory_chains(&lsp->factory);
+                            int n_sub_reset = lsp_reorg_rollback_subfactory_chains(
+                                &lsp->factory, daemon_reorg.fork_height);
                             if (n_sub_reset > 0)
                                 fprintf(stderr,
-                                    "LSP reorg: reset chain advance state for "
-                                    "%d sub-factory(s); force-close falls back "
-                                    "to chain[0]\n", n_sub_reset);
+                                    "LSP reorg: rolled back %d sub-factory "
+                                    "chain(s) confirmed above height %d\n",
+                                    n_sub_reset, daemon_reorg.fork_height);
                         }
                         /* R5 (mainnet pre-flight): revalidate each factory
                            channel's funding UTXO.  Sets funding_pending_reorg
@@ -7795,8 +8227,37 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                   chain_rec);
                         }
                     }
-                    if (height > 0) daemon_last_height = height;
-                    if (cur_tip_hash[0]) memcpy(daemon_last_tip_hash, cur_tip_hash, 65);
+                    /* Record the factory funding's confirming block once
+                       (cheap after that), so revalidation does not need
+                       -txindex. */
+                    if (reorg_kind != LSP_REORG_INCONCLUSIVE && height > 0 &&
+                        (height != daemon_prev_height ||
+                         strcmp(cur_tip_hash, daemon_prev_hash) != 0))
+                        lsp_channels_note_funding_anchor(mgr, lsp);
+                    /* On each new block, re-check the funding anchor while a
+                       channel is frozen or the factory funding has not yet
+                       re-confirmed after a reorg
+                       (lsp_channels_funding_recheck_due).  Unfreezing, and a
+                       later freeze of a funding TX left unconfirmed by a
+                       reorg, otherwise waited for the next detected reorg. */
+                    if (reorg_kind == LSP_REORG_NONE && height > 0 &&
+                        (height != daemon_prev_height ||
+                         strcmp(cur_tip_hash, daemon_prev_hash) != 0) &&
+                        lsp_channels_funding_recheck_due(mgr)) {
+                        int thw = lsp_channels_revalidate_funding(mgr, lsp);
+                        if (thw)
+                            fprintf(stderr, "LSP: new-block revalidate "
+                                    "flipped funding_pending_reorg on %d "
+                                    "channel(s)\n", thw);
+                    }
+                    /* Store the new tip only now that the handler above has
+                       run: a restart in the middle of handling a reorg then
+                       compares against the previous tip and reports the
+                       reorg again. */
+                    if (reorg_kind != LSP_REORG_INCONCLUSIVE && mgr->persist &&
+                        (daemon_reorg.height != daemon_prev_height ||
+                         strcmp(daemon_reorg.hash, daemon_prev_hash) != 0))
+                        lsp_reorg_state_save(mgr->persist, "daemon", &daemon_reorg);
                 }
                 if (height > 0) {
                     /* Expired HTLCs and inbound bridge HTLCs near their
@@ -8349,50 +8810,29 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     int hb_height = 0;
                     const char *fstate_str = "?";
                     if (mgr->watchtower && mgr->watchtower->rt) {
-                        hb_height = regtest_get_block_height(mgr->watchtower->rt);
-                        /* Reorg detection (R1): same three-kind scheme as the
-                           main loop's check above — height-regress, same-height,
-                           and forward-reorg.  Uses mgr->last_known_tip_hash to
-                           catch the latter two (mainnet pre-flight). */
+                        /* Reorg detection (R1): lsp_reorg_poll() as in the main
+                           loop, against the heartbeat's own stored tip
+                           (mgr->hb_reorg). */
+                        const int32_t hb_prev_height = mgr->hb_reorg.height;
+                        char hb_prev_hash[65];
+                        memcpy(hb_prev_hash, mgr->hb_reorg.hash, 65);
+                        int32_t hb_h32 = -1;
                         char hb_cur_hash[65] = {0};
-                        regtest_get_best_block_hash(mgr->watchtower->rt, hb_cur_hash);
+                        lsp_reorg_kind_t hb_reorg_kind = lsp_reorg_poll(
+                            mgr->watchtower->rt, &mgr->hb_reorg, &hb_h32,
+                            hb_cur_hash);
+                        hb_height = (int)hb_h32;
+                        const char *hb_reorg_str = lsp_reorg_kind_str(hb_reorg_kind);
 
-                        int hb_reorg_kind = 0;
-                        const char *hb_reorg_str = "";
-                        if (mgr->last_known_height > 0 && hb_height > 0 &&
-                            hb_height < mgr->last_known_height) {
-                            hb_reorg_kind = 1;
-                            hb_reorg_str = "HEIGHT_REGRESSION";
-                        } else if (mgr->last_known_height > 0 &&
-                                   hb_height == mgr->last_known_height &&
-                                   mgr->last_known_tip_hash[0] && hb_cur_hash[0] &&
-                                   strcmp(hb_cur_hash, mgr->last_known_tip_hash) != 0) {
-                            hb_reorg_kind = 2;
-                            hb_reorg_str = "SAME_HEIGHT";
-                        } else if (mgr->last_known_height > 0 &&
-                                   hb_height > mgr->last_known_height &&
-                                   mgr->last_known_tip_hash[0]) {
-                            char hb_prev_now[65] = {0};
-                            if (regtest_get_block_hash(mgr->watchtower->rt,
-                                                        mgr->last_known_height,
-                                                        hb_prev_now,
-                                                        sizeof(hb_prev_now)) &&
-                                hb_prev_now[0] &&
-                                strcmp(hb_prev_now, mgr->last_known_tip_hash) != 0) {
-                                hb_reorg_kind = 3;
-                                hb_reorg_str = "FORWARD_REORG";
-                            }
-                        }
-
-                        if (hb_reorg_kind) {
-                            int depth_proxy = (hb_reorg_kind == 1)
-                                ? (mgr->last_known_height - hb_height) : 0;
+                        if (hb_reorg_kind > LSP_REORG_NONE) {
+                            int depth_proxy = (hb_reorg_kind == LSP_REORG_HEIGHT_REGRESSION)
+                                ? (hb_prev_height - hb_height) : 0;
                             fprintf(stderr,
                                 "ALERT: chain reorg detected (%s) tip %d → %d "
                                 "(depth %d) hash %.16s → %.16s\n",
-                                hb_reorg_str, mgr->last_known_height, hb_height,
+                                hb_reorg_str, hb_prev_height, hb_height,
                                 depth_proxy,
-                                mgr->last_known_tip_hash[0] ? mgr->last_known_tip_hash : "?",
+                                hb_prev_hash[0] ? hb_prev_hash : "?",
                                 hb_cur_hash[0] ? hb_cur_hash : "?");
                             /* CL6: persist reorg event for test evidence */
                             if (mgr->persist) {
@@ -8400,8 +8840,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 snprintf(det, sizeof(det),
                                          "%s height_%d->%d hash_%.16s->%.16s",
                                          hb_reorg_str,
-                                         mgr->last_known_height, hb_height,
-                                         mgr->last_known_tip_hash[0] ? mgr->last_known_tip_hash : "?",
+                                         hb_prev_height, hb_height,
+                                         hb_prev_hash[0] ? hb_prev_hash : "?",
                                          hb_cur_hash[0] ? hb_cur_hash : "?");
                                 persist_log_broadcast((persist_t *)mgr->persist,
                                                        "", "reorg_detected",
@@ -8410,7 +8850,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             /* Fire chain backend reorg callback if set */
                             chain_backend_t *cbe = (chain_backend_t *)mgr->chain_be;
                             if (cbe && cbe->reorg_cb)
-                                cbe->reorg_cb(hb_height, mgr->last_known_height,
+                                cbe->reorg_cb(hb_height, hb_prev_height,
                                               cbe->reorg_cb_ctx);
                             /* R5: revalidate factory channels' funding UTXOs. */
                             int hb_frz = lsp_channels_revalidate_funding(mgr, lsp);
@@ -8419,10 +8859,6 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         "flipped funding_pending_reorg on %d "
                                         "channel(s)\n", hb_frz);
                         }
-                        if (hb_height > mgr->last_known_height)
-                            mgr->last_known_height = hb_height;
-                        if (hb_cur_hash[0])
-                            memcpy(mgr->last_known_tip_hash, hb_cur_hash, 65);
                         factory_state_t fs = factory_get_state(
                             &lsp->factory, (uint32_t)hb_height);
                         fstate_str = (fs == FACTORY_ACTIVE) ? "ACTIVE" :

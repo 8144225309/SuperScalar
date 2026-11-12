@@ -3683,9 +3683,11 @@ int factory_reset_all_subfactory_chains(factory_t *f) {
 }
 
 /* #146: height-aware reset.  Walks PS sub-factories and resets only those
-   whose latest confirmation is now above the safe height (i.e., possibly
-   reorged out).  Legacy entries with confirmed_height == 0 are reset
-   conservatively — better-safe-than-sorry until they're stamped. */
+   whose latest chain entry was observed confirmed above the safe height
+   (its confirming block may have been disconnected).  Entries with
+   confirmed_height == 0 were never observed on chain: sub-factory chains
+   stay off-chain until a force-close, so no reorg can have removed them,
+   and they are left intact. */
 int factory_reset_subfactory_chains_above_height(factory_t *f,
                                                   uint32_t reorg_max_safe_height)
 {
@@ -3696,11 +3698,12 @@ int factory_reset_subfactory_chains_above_height(factory_t *f,
         if (node->type != NODE_PS_SUBFACTORY) continue;
         if (node->ps_chain_len == 0) continue;
 
-        /* Keep state when confirmation is at-or-below the safe height
-           AND we have a real confirmation record.  Reset otherwise:
-             - confirmed_height == 0 → no record → conservative reset
+        /* Keep state unless the entry was observed confirmed above the
+           safe height:
+             - confirmed_height == 0 → never on chain → keep
+             - confirmed_height <= reorg_max_safe_height → still confirmed
              - confirmed_height > reorg_max_safe_height → reorged out */
-        if (node->ps_chain_confirmed_height > 0 &&
+        if (node->ps_chain_confirmed_height == 0 ||
             node->ps_chain_confirmed_height <= reorg_max_safe_height) {
             continue;
         }

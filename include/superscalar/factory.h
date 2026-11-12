@@ -1068,9 +1068,10 @@ int factory_reset_all_subfactory_chains(factory_t *f);
 /* #146: height-aware variant.  Only resets sub-factory chain state for
    nodes whose ps_chain_confirmed_height > reorg_max_safe_height (i.e.,
    their latest confirmation is no longer on the active chain).  Nodes
-   with ps_chain_confirmed_height == 0 (legacy / unset) are reset
-   conservatively (matches pre-#146 behavior) so a missing confirmation
-   record never silently leaves stale state.  Returns the count reset.
+   with ps_chain_confirmed_height == 0 were never observed on chain (chains
+   are off-chain until a force-close) and are left intact.  Like the
+   reset-all variant it clears the chain length and prev-txid but not the
+   node's signed_tx.  Returns the count reset.
 
    reorg_max_safe_height is the highest block height that's still
    confirmed on the new tip — typically the new tip height itself minus
