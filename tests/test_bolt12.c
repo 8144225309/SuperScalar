@@ -261,7 +261,7 @@ int test_persist_schema_v3(void)
     persist_t p;
     ASSERT(persist_open(&p, ":memory:"), "open in-memory DB");
     ASSERT(persist_schema_version(&p) == PERSIST_SCHEMA_VERSION, "schema version is current");
-    ASSERT(PERSIST_SCHEMA_VERSION == 41, "schema version is 41 (v41 adds factories.tree_fee_rate, created_block, active_blocks and dying_blocks; v40 adds the factories tree-shape columns; v39 adds factories.use_hashlock_poison for #59 restart-resume; v38 adds #53-B3b l_stock_poison_reveals; v37 adds the #327 at-rest field-encryption marker)");
+    ASSERT(PERSIST_SCHEMA_VERSION == 42, "schema version is 42 (v42 adds factories.member_capacities, leaf_stock_sats and channel_scripts; v41 adds factories.tree_fee_rate, created_block, active_blocks and dying_blocks; v40 adds the factories tree-shape columns; v39 adds factories.use_hashlock_poison for #59 restart-resume; v38 adds #53-B3b l_stock_poison_reveals; v37 adds the #327 at-rest field-encryption marker)");
     persist_close(&p);
     return 1;
 }
