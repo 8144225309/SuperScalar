@@ -234,8 +234,7 @@ def report_from_lsp_json(report_data, rpc=None):
             lines.append("- **Signers:** {} (indices: {})".format(
                 node.get("n_signers", "?"), node.get("signer_indices", [])))
 
-            has_tap = node.get("has_taptree", False)
-            lines.append("- **Taproot tree:** {}".format("yes" if has_tap else "key-path only"))
+            lines.append("- **Taproot tree:** key-path only")
 
             agg = node.get("agg_pubkey", "")
             if agg:

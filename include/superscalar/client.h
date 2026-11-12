@@ -395,6 +395,13 @@ int client_send_payment(int fd, channel_t *ch, uint64_t amount_sats,
 
 /* Handle incoming COMMITMENT_SIGNED from LSP.
    Verifies and sends REVOKE_AND_ACK back. Returns 1 on success. */
+/* Co-sign the LSP's own commitment at ch's current number into msg
+   (host_commit_psig, host_commit_nonce_index).  Returns 1 if attached. */
+int client_add_host_commit_sig(channel_t *ch, cJSON *msg);
+/* 1 if every LSP commitment this member co-signed below its current number
+   is revoked; client_fulfill_payment releases no preimage before. */
+int client_host_old_commitments_revoked(const channel_t *ch);
+
 int client_handle_commitment_signed(int fd, channel_t *ch,
                                       secp256k1_context *ctx,
                                       const wire_msg_t *msg);

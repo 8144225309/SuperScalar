@@ -243,6 +243,9 @@ static void usage(const char *prog) {
         "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
         "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
         "                      an open can strand the LSP's funds. Refused on mainnet.\n"
+        "  --no-force-exit     Do not push members' channels on chain before the end\n"
+        "                      date; every member still open is then paid its\n"
+        "                      capacity by the end-date payouts\n"
         "  --enable-rotation-experimental  UNSAFE, testing only: allow factory rotation\n"
         "                      (automatic when a factory turns DYING in daemon mode, CLI\n"
         "                      'rotate'). Off by default: a DYING factory keeps serving\n"
@@ -672,7 +675,6 @@ static void report_factory_tree(report_t *rpt, secp256k1_context *ctx,
         report_add_int(rpt, "dw_layer_index", node->dw_layer_index);
         report_add_uint(rpt, "nsequence", node->nsequence);
         report_add_uint(rpt, "input_amount", node->input_amount);
-        report_add_bool(rpt, "has_taptree", node->has_taptree);
 
         /* Aggregate pubkey */
         {
@@ -687,9 +689,6 @@ static void report_factory_tree(report_t *rpt, secp256k1_context *ctx,
             if (secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->tweaked_pubkey))
                 report_add_hex(rpt, "tweaked_pubkey", xonly_ser, 32);
         }
-
-        if (node->has_taptree)
-            report_add_hex(rpt, "merkle_root", node->merkle_root, 32);
 
         report_add_hex(rpt, "spending_spk", node->spending_spk, 34);
 
@@ -1406,7 +1405,6 @@ int main(int argc, char *argv[]) {
        keys on public signet) instead of the weak byte-fill scaffold. */
     unsigned char breach_client_seckeys[128][32];
     int n_breach_client_seckeys = 0;
-    int test_expiry = 0;
     int test_distrib = 0;
     int test_turnover = 0;
     int test_rotation = 0;
@@ -1418,6 +1416,7 @@ int main(int argc, char *argv[]) {
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
     int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
+    int no_force_exit = 0;                /* --no-force-exit: leave silent members to their end-date payouts */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 3;              /* with --arity: 1, 2 = DW; 3 = PS.  Without
                                         any shape option the advanceless default
@@ -1667,8 +1666,6 @@ int main(int argc, char *argv[]) {
             cltv_timeout_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--breach-test") == 0)
             breach_test = 1;
-        else if (strcmp(argv[i], "--test-expiry") == 0)
-            test_expiry = 1;
         else if (strcmp(argv[i], "--test-distrib") == 0)
             test_distrib = 1;
         else if (strcmp(argv[i], "--test-turnover") == 0)
@@ -1813,6 +1810,8 @@ int main(int argc, char *argv[]) {
             enable_jit_experimental = 1;
         else if (strcmp(argv[i], "--enable-rotation-experimental") == 0)
             enable_rotation_experimental = 1;
+        else if (strcmp(argv[i], "--no-force-exit") == 0)
+            no_force_exit = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -3440,6 +3439,24 @@ int main(int argc, char *argv[]) {
                there, but only with the opt-in. */
             lsp_channels_set_rotation(mgr, enable_rotation_experimental, 1);
             mgr->rot_attempted_mask = 0;
+            /* The forced-exit window of the recovered factory, from its own
+               shape (the same rule as at creation). */
+            {
+                const factory_t *rf = &lsp_rp->factory;
+                uint16_t rst = rf->counter.n_layers ? rf->counter.layers[0].config.step_blocks
+                                                    : step_blocks;
+                uint32_t rsp = rf->counter.n_layers ? rf->counter.layers[0].config.max_states
+                                                    : (uint32_t)states_per_layer;
+                uint32_t rex = cli_factory_exit_blocks(
+                    rf->n_level_arity > 0 ? rf->level_arity : NULL, rf->n_level_arity,
+                    rf->leaf_arity, rf->ps_subfactory_arity > 1 ? rf->ps_subfactory_arity : 1,
+                    rf->n_participants - 1, rf->static_threshold_depth, rst, rsp);
+                mgr->force_exit_height = no_force_exit ? 0 :
+                    cli_factory_force_exit_height(rf->cltv_timeout, rex);
+                if (mgr->force_exit_height > 0)
+                    printf("LSP recovery: end date %u; members not closed with are pushed "
+                           "on chain from block %u\n", rf->cltv_timeout, mgr->force_exit_height);
+            }
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
             mgr->rebalance_threshold_pct = (uint16_t)rebalance_threshold;
@@ -4552,7 +4569,7 @@ accept_new_factory:
     }
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
-    if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
+    if (n_payments > 0 || daemon_mode || demo_mode || breach_test ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
         test_ptlc_basic || test_ptlc_breach || test_ptlc_restart || test_ptlc_chain || test_ptlc_breach_chain || test_htlc_force_close || test_multi_htlc_force_close || test_full_settlement ||
@@ -4749,6 +4766,12 @@ accept_new_factory:
         /* With the opt-in, rotation is automatic in daemon mode. */
         lsp_channels_set_rotation(mgr, enable_rotation_experimental, daemon_mode);
         mgr->rot_attempted_mask = 0;
+        /* The forced-exit window before the end date. */
+        mgr->force_exit_height = no_force_exit ? 0 :
+            cli_factory_force_exit_height(lsp_p->factory.cltv_timeout, factory_exit_blocks);
+        if (mgr->force_exit_height > 0)
+            printf("LSP: end date %u; members not closed with are pushed on chain "
+                   "from block %u\n", lsp_p->factory.cltv_timeout, mgr->force_exit_height);
         mgr->cli_enabled = cli_mode;
         mgr->test_bad_settlement = test_bad_settlement;
         mgr->economic_mode = (economic_mode_t)economic_mode_arg;
@@ -4832,7 +4855,7 @@ accept_new_factory:
         }
 
         /* Capture initial balances before demo (for breach test) */
-        if ((breach_test || test_expiry) && mgr->n_channels > 0) {
+        if (breach_test && mgr->n_channels > 0) {
             init_local = mgr->entries[0].channel.local_amount;
             init_remote = mgr->entries[0].channel.remote_amount;
         }

@@ -577,6 +577,14 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
             client_handle_commitment_signed(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
+            /* The LSP's revocation of its previous commitment: a member
+               releases no preimage before it (the daemon applies it in
+               client_recv_lsp_revocation). */
+            wire_msg_t rv;
+            memset(&rv, 0, sizeof(rv));
+            if (wire_recv_timeout(fd, &rv, 10) && rv.msg_type == MSG_LSP_REVOKE_AND_ACK)
+                client_handle_lsp_revoke_and_ack(ch, ctx, &rv);
+            if (rv.json) cJSON_Delete(rv.json);
         } else {
             cJSON_Delete(msg.json);
         }

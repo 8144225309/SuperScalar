@@ -148,10 +148,11 @@ static const unsigned char *leaf_channel_spk(const factory_t *f, uint32_t client
     return f->chan_spks[client_idx].spk;
 }
 
-/* A member's channel output script: the caller's if set, else
-   MuSig(member, LSP) [+ the CLTV recovery leaf chan_merkle_root]. */
+/* A member's channel output script: the caller's if set, else the
+   key-path-only P2TR of MuSig(member, LSP).  No script path: neither side can
+   spend a channel output alone.  At the end date the member is paid through
+   the output's pre-signed payout (factory_build_payouts). */
 static int build_channel_spk(const factory_t *f, uint32_t client_idx,
-                             const unsigned char *chan_merkle_root,
                              unsigned char spk_out[34]) {
     const unsigned char *custom = leaf_channel_spk(f, client_idx);
     if (custom) {
@@ -161,8 +162,7 @@ static int build_channel_spk(const factory_t *f, uint32_t client_idx,
     secp256k1_pubkey pks[2] = { f->pubkeys[client_idx], f->pubkeys[0] };
     musig_keyagg_t ka;
     secp256k1_xonly_pubkey tw;
-    return build_musig_p2tr_spk(f->ctx, spk_out, &tw, NULL, &ka, pks, 2,
-                                chan_merkle_root);
+    return build_musig_p2tr_spk(f->ctx, spk_out, &tw, NULL, &ka, pks, 2, NULL);
 }
 
 /* A PS leaf past chain[0] signs the spend of the previous chain TX's channel
@@ -178,9 +178,10 @@ static const musig_keyagg_t *node_sign_keyagg(const factory_node_t *node) {
     return node_signs_ps_chan_key(node) ? &node->ps_chan_keyagg : &node->keyagg;
 }
 
+/* Tree outputs are key-path only: no node input has a script tree. */
 static const unsigned char *node_sign_merkle(const factory_node_t *node) {
-    if (node_signs_ps_chan_key(node)) return NULL;
-    return node->has_taptree ? node->merkle_root : NULL;
+    (void)node;
+    return NULL;
 }
 
 static const secp256k1_xonly_pubkey *node_sign_output_key(const factory_node_t *node) {
@@ -230,7 +231,10 @@ static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
 }
 
 /* Add a node to the factory. Returns node index or -1 on error.
-   node_cltv: if > 0, build CLTV timeout taptree for this node's spending_spk. */
+   The output the node spends (spending_spk) is the key-path-only P2TR of the
+   node's signers: no script path, so the host cannot spend it alone at any
+   height.  Where the output carries value for members at the end date, a
+   pre-signed payout spends it (factory_build_payouts). */
 static int add_node(
     factory_t *f,
     factory_node_type_t type,
@@ -238,8 +242,7 @@ static int add_node(
     size_t n_signers,
     int parent_index,
     uint32_t parent_vout,
-    int dw_layer_index,
-    uint32_t node_cltv
+    int dw_layer_index
 ) {
     if (f->n_nodes >= f->config.max_nodes) return -1;
 
@@ -263,8 +266,6 @@ static int add_node(
     node->parent_index = parent_index;
     node->parent_vout = parent_vout;
     node->dw_layer_index = dw_layer_index;
-    node->has_taptree = (node_cltv > 0) ? 1 : 0;
-    node->cltv_timeout = node_cltv;
 
     tx_buf_init(&node->unsigned_tx, 256);
     tx_buf_init(&node->signed_tx, 512);
@@ -277,27 +278,10 @@ static int add_node(
     for (size_t i = 0; i < n_signers; i++)
         pks[i] = f->pubkeys[signer_indices[i]];
 
-    if (node->has_taptree) {
-        /* Build CLTV timeout script leaf using LSP pubkey (index 0) */
-        secp256k1_xonly_pubkey lsp_xonly;
-        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]))
-            { free(pks); return -1; }
-
-        if (!tapscript_build_cltv_timeout(&node->timeout_leaf, node_cltv,
-                                          &lsp_xonly, f->ctx))
-            { free(pks); return -1; }
-        tapscript_merkle_root(node->merkle_root, &node->timeout_leaf, 1);
-
-        /* Tweak internal key with merkle root */
-        if (!build_musig_p2tr_spk(f->ctx, node->spending_spk, &node->tweaked_pubkey,
-                                   &node->output_parity, &node->keyagg, pks, n_signers,
-                                   node->merkle_root))
-            { free(pks); return -1; }
-    } else {
-        if (!build_musig_p2tr_spk(f->ctx, node->spending_spk, &node->tweaked_pubkey,
-                                   NULL, &node->keyagg, pks, n_signers, NULL))
-            { free(pks); return -1; }
-    }
+    if (!build_musig_p2tr_spk(f->ctx, node->spending_spk, &node->tweaked_pubkey,
+                               &node->output_parity, &node->keyagg, pks, n_signers,
+                               NULL))
+        { free(pks); return -1; }
     free(pks);
 
     node->spending_spk_len = 34;
@@ -694,40 +678,18 @@ static int setup_leaf_outputs(
 
     node->n_outputs = 3;
 
-    /*
-     * Build the CLTV recovery merkle root for channel outputs (once, reused
-     * for both channels on this leaf node).  When cltv_timeout > 0 we embed a
-     * single-leaf taptree whose script is:
-     *   <cltv_timeout> OP_CLTV OP_DROP <lsp_xonly> OP_CHECKSIG
-     * so the LSP can sweep the output unilaterally after the factory expires,
-     * without requiring the client to cooperate.  When cltv_timeout == 0 the
-     * outputs remain key-path-only (pure MuSig2 spend).
-     */
-    unsigned char chan_cltv_merkle[32];
-    tapscript_leaf_t chan_cltv_leaf;
-    const unsigned char *chan_merkle_root = NULL;
-    if (f->cltv_timeout > 0) {
-        secp256k1_xonly_pubkey lsp_xonly;
-        if (secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) &&
-            tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
-                                         &lsp_xonly, f->ctx)) {
-            tapscript_merkle_root(chan_cltv_merkle, &chan_cltv_leaf, 1);
-            chan_merkle_root = chan_cltv_merkle;
-        }
-    }
-
-    /* Channel A: MuSig(client_a, LSP) [+ CLTV recovery leaf] */
+    /* Channel A: MuSig(client_a, LSP), key path only */
     {
-        if (!build_channel_spk(f, client_a_idx, chan_merkle_root,
+        if (!build_channel_spk(f, client_a_idx,
                                node->outputs[0].script_pubkey))
             return 0;
         node->outputs[0].script_pubkey_len = 34;
         node->outputs[0].amount_sats = chan_amt[0];
     }
 
-    /* Channel B: MuSig(client_b, LSP) [+ CLTV recovery leaf] */
+    /* Channel B: MuSig(client_b, LSP), key path only */
     {
-        if (!build_channel_spk(f, client_b_idx, chan_merkle_root,
+        if (!build_channel_spk(f, client_b_idx,
                                node->outputs[1].script_pubkey))
             return 0;
         node->outputs[1].script_pubkey_len = 34;
@@ -1342,6 +1304,29 @@ int factory_set_leaf_channel_spk(factory_t *f, uint32_t participant_idx,
                 "(got %zu bytes)\n", spk_len);
         return 0;
     }
+    /* The output needs an end-date payout co-signed by the member and the
+       LSP, so its key must be theirs: MuSig2(member, LSP), key path only, in
+       either key order. */
+    {
+        int ok = 0;
+        secp256k1_pubkey orders[2][2] = {
+            { f->pubkeys[participant_idx], f->pubkeys[0] },
+            { f->pubkeys[0], f->pubkeys[participant_idx] },
+        };
+        for (int o = 0; o < 2 && !ok; o++) {
+            unsigned char cand[34];
+            musig_keyagg_t ka;
+            secp256k1_xonly_pubkey tw;
+            if (build_musig_p2tr_spk(f->ctx, cand, &tw, NULL, &ka, orders[o], 2, NULL) &&
+                memcmp(cand, spk, 34) == 0)
+                ok = 1;
+        }
+        if (!ok) {
+            fprintf(stderr, "factory_set_leaf_channel_spk: script of participant %u is "
+                    "not the key-path P2TR of MuSig2(member, LSP)\n", participant_idx);
+            return 0;
+        }
+    }
     if (!f->chan_spks) {
         f->chan_spks = calloc(f->config.max_signers, sizeof(*f->chan_spks));
         if (!f->chan_spks) return 0;
@@ -1534,23 +1519,9 @@ static int setup_single_leaf_outputs(
 
     node->n_outputs = 2;
 
-    /* CLTV recovery leaf (same construction as setup_leaf_outputs) */
-    unsigned char chan_cltv_merkle[32];
-    tapscript_leaf_t chan_cltv_leaf;
-    const unsigned char *chan_merkle_root = NULL;
-    if (f->cltv_timeout > 0) {
-        secp256k1_xonly_pubkey lsp_xonly;
-        if (secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) &&
-            tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
-                                         &lsp_xonly, f->ctx)) {
-            tapscript_merkle_root(chan_cltv_merkle, &chan_cltv_leaf, 1);
-            chan_merkle_root = chan_cltv_merkle;
-        }
-    }
-
-    /* Channel: MuSig(client, LSP) [+ CLTV recovery leaf] */
+    /* Channel: MuSig(client, LSP), key path only */
     {
-        if (!build_channel_spk(f, client_idx, chan_merkle_root,
+        if (!build_channel_spk(f, client_idx,
                                node->outputs[0].script_pubkey))
             return 0;
         node->outputs[0].script_pubkey_len = 34;
@@ -1760,8 +1731,7 @@ static int setup_ps_leaf_with_subfactories(
         int sub_idx = add_node(f, NODE_PS_SUBFACTORY,
                                 sub_signers, n_in_sub + 1,
                                 leaf_node_idx, si,
-                                -1,    /* no DW layer for sub-factory */
-                                0);    /* no per-node CLTV at this phase */
+                                -1);   /* no DW layer for sub-factory */
         if (sub_idx < 0) {
             fprintf(stderr, "Factory: add sub-factory node %u failed\n", si);
             return 0;
@@ -1800,7 +1770,6 @@ static int setup_ps_leaf_with_subfactories(
 
 /* ---- Generalized N-participant tree builder ---- */
 
-#define TIMEOUT_STEP_BLOCKS 5
 
 /* Compute tree depth (number of binary splits above the leaves).
    n_clients = n_participants - 1 (excluding LSP).
@@ -1854,8 +1823,8 @@ static int compute_leaf_count(size_t n_clients, factory_arity_t arity) {
 
 /* Set up N-way leaf outputs for arity A >= 2.
    Produces n_outputs = n_client + 1: one MuSig(client_i, LSP) channel per
-   client, plus one L-stock output at the LAST index.  Each channel output
-   may include the CLTV recovery script-path leaf (when f->cltv_timeout > 0). */
+   client, plus one L-stock output at the LAST index.  Channel outputs are
+   key path only. */
 static int setup_nway_leaf_outputs(
     factory_t *f,
     factory_node_t *node,
@@ -1881,24 +1850,9 @@ static int setup_nway_leaf_outputs(
 
     node->n_outputs = n_outputs;
 
-    /* Build CLTV recovery merkle root for channel outputs (reused across all
-       channels on this leaf). */
-    unsigned char chan_cltv_merkle[32];
-    tapscript_leaf_t chan_cltv_leaf;
-    const unsigned char *chan_merkle_root = NULL;
-    if (f->cltv_timeout > 0) {
-        secp256k1_xonly_pubkey lsp_xonly;
-        if (secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]) &&
-            tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
-                                         &lsp_xonly, f->ctx)) {
-            tapscript_merkle_root(chan_cltv_merkle, &chan_cltv_leaf, 1);
-            chan_merkle_root = chan_cltv_merkle;
-        }
-    }
-
     /* One channel per client: vout 0..n_client-1 = MuSig(client_i, LSP). */
     for (size_t i = 0; i < n_client; i++) {
-        if (!build_channel_spk(f, client_indices[i], chan_merkle_root,
+        if (!build_channel_spk(f, client_indices[i],
                                node->outputs[i].script_pubkey))
             return 0;
         node->outputs[i].script_pubkey_len = 34;
@@ -2050,25 +2004,6 @@ static int build_subtree(
     for (size_t i = 0; i < n_clients; i++)
         signers[n_signers++] = client_indices[i];
 
-    /* Compute CLTVs from depth.
-       Root kickoff gets cltv=0 (no timeout). Root state gets longest CLTV.
-       Each subsequent level gets progressively shorter CLTVs.
-       ko_cltv = base - (2*depth - 1) * step   (for depth > 0)
-       st_cltv = base - (2*depth) * step */
-    uint32_t cltv = f->cltv_timeout;
-    uint32_t step = TIMEOUT_STEP_BLOCKS;
-    uint32_t ko_cltv, st_cltv;
-
-    if (depth == 0) {
-        ko_cltv = 0;  /* root kickoff has no timeout */
-        st_cltv = cltv;  /* root state gets longest CLTV */
-    } else {
-        uint32_t ko_offset = (uint32_t)(2 * depth - 1) * step;
-        uint32_t st_offset = (uint32_t)(2 * depth) * step;
-        ko_cltv = (cltv > ko_offset) ? cltv - ko_offset : 0;
-        st_cltv = (cltv > st_offset) ? cltv - st_offset : 0;
-    }
-
     /* DW layer index for state nodes: depth maps to (depth - static_threshold).
        Kickoff nodes get dw_layer_index = -1.
        When static-near-root is enabled, depths in [0, threshold) become
@@ -2113,7 +2048,7 @@ static int build_subtree(
 
         /* Create the kickoff node ONLY (no paired state).  No DW layer. */
         int ko_idx = add_node(f, NODE_KICKOFF, signers, n_signers,
-                              parent_state_idx, parent_vout, -1, ko_cltv);
+                              parent_state_idx, parent_vout, -1);
         if (ko_idx < 0) return 0;
         f->nodes[ko_idx].is_static_only = 1;
         f->nodes[ko_idx].input_amount = input_amount;
@@ -2182,12 +2117,12 @@ static int build_subtree(
 
     /* Add kickoff node */
     int ko_idx = add_node(f, NODE_KICKOFF, signers, n_signers,
-                          parent_state_idx, parent_vout, -1, ko_cltv);
+                          parent_state_idx, parent_vout, -1);
     if (ko_idx < 0) return 0;
 
     /* Add state node */
     int st_idx = add_node(f, NODE_STATE, signers, n_signers,
-                          ko_idx, 0, dw_layer, st_cltv);
+                          ko_idx, 0, dw_layer);
     if (st_idx < 0) return 0;
 
     /* Wire kickoff → state output */
@@ -2445,7 +2380,12 @@ int factory_build_tree(factory_t *f) {
         return 0;
 
     /* Build all unsigned transactions top-down */
-    return build_all_unsigned_txs(f);
+    if (!build_all_unsigned_txs(f))
+        return 0;
+
+    /* The end-date payout of every shared output: the members' claim at T0
+       on any part of the tree that is on chain. */
+    return factory_build_payouts(f);
 }
 
 /* Total value of the outputs a node's current tx spends. */
@@ -2936,7 +2876,6 @@ int factory_verify_all(factory_t *f) {
 int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
                              const unsigned char sighash[32]) {
     if (!f || f->n_nodes == 0) return 0;
-    if (f->nodes[0].has_taptree) return 1;   /* mr=NULL close key can't be matched; skip */
     return secp256k1_schnorrsig_verify(f->ctx, sig64, sighash, 32,
                                        &f->nodes[0].tweaked_pubkey);
 }
@@ -3011,6 +2950,9 @@ int factory_sign_all(factory_t *f) {
 
     /* Step 5: Complete (aggregate + finalize witness) */
     if (!factory_sessions_complete(f)) goto fail;
+
+    /* Every key is held here: sign the end-date payouts too. */
+    if (!factory_sign_payouts_local(f)) goto fail;
 
     memset(secnonces, 0, total_slots * sizeof(secp256k1_musig_secnonce));
     free(secnonces);
@@ -3809,9 +3751,9 @@ int factory_session_finalize_node(factory_t *f, size_t node_idx) {
                                             sighash, mr, NULL);
     if (!ok)
         fprintf(stderr, "finalize_node %zu: musig_session_finalize_nonces failed "
-                "(n_signers=%zu, nonces_collected=%d, has_taptree=%d)\n",
+                "(n_signers=%zu, nonces_collected=%d)\n",
                 node_idx, node->n_signers,
-                node->signing_session.nonces_collected, node->has_taptree);
+                node->signing_session.nonces_collected);
     return ok;
 }
 
@@ -3896,32 +3838,6 @@ static int ensure_input_sessions_alloc(factory_node_t *node) {
     return 1;
 }
 
-/* SF-MULTI-KEYAGG (#283): recompute the per-channel CLTV taproot merkle
-   root used by sub-factory channel outputs.  Mirrors the chan_merkle_root
-   computation in setup_nway_leaf_outputs (~line 1240).  Returns 1 with
-   has_merkle = 1 + merkle_root32 populated when f->cltv_timeout > 0;
-   returns 1 with has_merkle = 0 (key-path only) otherwise.  Returns 0 on
-   secp256k1/tapscript failure. */
-static int compute_factory_chan_cltv_merkle(const factory_t *f,
-                                              unsigned char *merkle_root32,
-                                              int *has_merkle_out) {
-    if (!f || !merkle_root32 || !has_merkle_out) return 0;
-    *has_merkle_out = 0;
-    if (f->cltv_timeout == 0) return 1;
-    secp256k1_xonly_pubkey lsp_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL,
-                                              &f->pubkeys[0]))
-        return 0;
-    tapscript_leaf_t chan_cltv_leaf;
-    if (!tapscript_build_cltv_timeout(&chan_cltv_leaf, f->cltv_timeout,
-                                        &lsp_xonly, f->ctx))
-        return 0;
-    if (!tapscript_merkle_root(merkle_root32, &chan_cltv_leaf, 1))
-        return 0;
-    *has_merkle_out = 1;
-    return 1;
-}
-
 /* SF-MULTI-KEYAGG (#283): recompute the L-stock CSV taproot merkle root
    used by sub-factory sales-stock outputs (and leaf-level L-stock outputs).
    Mirrors build_l_stock_spk's CSV merkle construction.  Returns 1 with
@@ -3951,13 +3867,13 @@ static int compute_factory_lstock_merkle(const factory_t *f,
  * Inputs 0..ps_n_prev_outputs-2 (channel inputs):
  *   keyagg = MuSig({f->pubkeys[node->signer_indices[i+1]], f->pubkeys[0]})
  *   signer order = {client, LSP}  (matches setup_nway_leaf_outputs)
- *   merkle_root = factory channel-CLTV merkle (when cltv_timeout > 0).
+ *   merkle_root = none (channel outputs are key path only).
  *   n_signers = 2.
  *
  * Input ps_n_prev_outputs-1 (sales-stock input):
  *   keyagg = node->keyagg  (sub-factory N-of-N).
  *   signer order = node->signer_indices[]  (LSP at slot 0, clients 1..k).
- *   merkle_root = node->has_taptree ? node->merkle_root : NULL.
+ *   merkle_root = the L-stock CSV merkle.
  *   n_signers = node->n_signers.
  *
  * Stores results into node->input_keyaggs[input_idx],
@@ -3991,8 +3907,8 @@ static int derive_input_keyagg(const factory_t *f,
         return 1;
     }
 
-    /* Channel input i: per-channel keyagg {client_i, LSP} + factory chan
-       CLTV merkle (when cltv_timeout > 0).  setup_nway_leaf_outputs builds
+    /* Channel input i: per-channel keyagg {client_i, LSP}, key path only.
+       setup_nway_leaf_outputs builds
        channel SPKs as MuSig({client, LSP}) — signer order MUST match. */
     if (input_idx + 1 >= node->n_signers) return 0;  /* signer_indices[i+1] must exist */
     uint32_t client_participant = node->signer_indices[input_idx + 1];
@@ -4005,13 +3921,8 @@ static int derive_input_keyagg(const factory_t *f,
     node->input_signer_indices[input_idx][0] = client_participant;
     node->input_signer_indices[input_idx][1] = 0;
 
-    int has_merkle = 0;
-    if (!compute_factory_chan_cltv_merkle(f,
-                                            node->input_merkle_root[input_idx],
-                                            &has_merkle))
-        return 0;
-    node->input_has_merkle_root[input_idx] = has_merkle;
-    if (!has_merkle) memset(node->input_merkle_root[input_idx], 0, 32);
+    node->input_has_merkle_root[input_idx] = 0;
+    memset(node->input_merkle_root[input_idx], 0, 32);
     return 1;
 }
 
@@ -4069,9 +3980,8 @@ int factory_session_finalize_node_input(factory_t *f, size_t node_idx, size_t in
                 node_idx, input_idx);
         return 0;
     }
-    /* SF-MULTI-KEYAGG (#283): per-input merkle root.  Channel inputs use the
-       factory channel-CLTV merkle (or NULL when cltv_timeout=0); sales-stock
-       input uses the sub-factory's own merkle (or NULL when no taptree). */
+    /* SF-MULTI-KEYAGG (#283): per-input merkle root.  Channel inputs are key
+       path only (NULL); the sales-stock input uses the L-stock CSV merkle. */
     const unsigned char *mr = node->input_has_merkle_root[input_idx]
                               ? node->input_merkle_root[input_idx]
                               : NULL;
@@ -5656,79 +5566,6 @@ int factory_find_leaf_for_client(const factory_t *f, uint32_t client_idx) {
     return -1;
 }
 
-int factory_build_timeout_spend_tx(
-    const factory_t *f,
-    const unsigned char *parent_txid,
-    uint32_t parent_vout,
-    uint64_t spend_amount,
-    int target_node_idx,
-    const secp256k1_keypair *lsp_keypair,
-    const unsigned char *dest_spk,
-    size_t dest_spk_len,
-    uint64_t fee_sats,
-    tx_buf_t *signed_tx_out)
-{
-    if (!f || !parent_txid || !lsp_keypair || !dest_spk || !signed_tx_out)
-        return 0;
-    if (target_node_idx < 0 || (size_t)target_node_idx >= f->n_nodes)
-        return 0;
-
-    const factory_node_t *target = &f->nodes[target_node_idx];
-    if (!target->has_taptree)
-        return 0;
-    if (fee_sats >= spend_amount)
-        return 0;
-
-    /* Build output */
-    tx_output_t tout;
-    tout.amount_sats = spend_amount - fee_sats;
-    memcpy(tout.script_pubkey, dest_spk, dest_spk_len);
-    tout.script_pubkey_len = dest_spk_len;
-
-    /* Build unsigned tx with locktime = CLTV timeout */
-    tx_buf_t utx;
-    tx_buf_init(&utx, 256);
-    if (!build_unsigned_tx_with_locktime(&utx, NULL,
-            parent_txid, parent_vout, 0xFFFFFFFEu,
-            target->cltv_timeout, &tout, 1)) {
-        tx_buf_free(&utx);
-        return 0;
-    }
-
-    /* Compute tapscript sighash */
-    unsigned char sighash[32];
-    compute_tapscript_sighash(sighash, utx.data, utx.len, 0,
-        target->spending_spk, target->spending_spk_len,
-        spend_amount, 0xFFFFFFFEu, &target->timeout_leaf);
-
-    /* Sign with LSP keypair (single signer, NOT MuSig) */
-    unsigned char sig[64], aux[32];
-    memset(aux, 0, 32);
-    if (!secp256k1_schnorrsig_sign32(f->ctx, sig, sighash,
-                                       lsp_keypair, aux)) {
-        tx_buf_free(&utx);
-        return 0;
-    }
-
-    /* Build control block */
-    unsigned char cb[65];
-    size_t cb_len;
-    tapscript_build_control_block(cb, &cb_len,
-        target->output_parity,
-        &target->keyagg.agg_pubkey, f->ctx);
-
-    /* Finalize script-path tx */
-    if (!finalize_script_path_tx(signed_tx_out, utx.data, utx.len, sig,
-            target->timeout_leaf.script, target->timeout_leaf.script_len,
-            cb, cb_len)) {
-        tx_buf_free(&utx);
-        return 0;
-    }
-
-    tx_buf_free(&utx);
-    return 1;
-}
-
 static uint32_t shape_timed_levels(const uint8_t *level_arities,
                                    size_t n_level_arity,
                                    factory_arity_t leaf_arity, size_t ps_cap,
@@ -5939,6 +5776,7 @@ void factory_free(factory_t *f) {
     f->n_nodes = 0;
     /* Factory-level distribution signing session's dynamic pubnonces. */
     musig_session_free(&f->dist_signing_session);
+    factory_free_payouts(f);
     /* Free the dynamic node arrays (were inline).  NULL after free so a second
        factory_free / a detached copy is a no-op (free(NULL) is safe). */
     free(f->nodes);                    f->nodes = NULL;
@@ -5962,6 +5800,9 @@ uint64_t factory_derive_scid(const factory_t *f, int leaf_index, uint32_t output
 }
 
 void factory_detach_txbufs(factory_t *f) {
+    /* The copy does not own the original's payouts. */
+    f->payouts = NULL;
+    f->n_payouts = 0;
     /* This is called right after a factory_t struct copy (e.g. a ladder entry
        ← lsp->factory).  The dynamic node arrays were shallow-shared by that
        copy; give this copy its OWN arrays so (a) factory_free is independent

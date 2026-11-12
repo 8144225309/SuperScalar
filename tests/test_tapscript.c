@@ -1,5 +1,6 @@
 #include "superscalar/tapscript.h"
 #include "superscalar/factory.h"
+#include "superscalar/tx_builder.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
 #include <stdio.h>
@@ -276,22 +277,6 @@ int test_factory_tree_with_timeout(void) {
     TEST_ASSERT(factory_build_tree(f), "build tree with timeout");
     TEST_ASSERT_EQ(f->n_nodes, 6, "6 nodes");
 
-    /* All non-root nodes should have taptree (staggered CLTVs).
-       DFS order: ko_root[0], st_root[1], ko_left[2], st_left[3], ko_right[4], st_right[5] */
-    TEST_ASSERT(f->nodes[0].has_taptree == 0, "kickoff_root no taptree");
-    TEST_ASSERT(f->nodes[1].has_taptree == 1, "state_root has taptree");
-    TEST_ASSERT(f->nodes[2].has_taptree == 1, "kickoff_left has taptree");
-    TEST_ASSERT(f->nodes[3].has_taptree == 1, "state_left has taptree");
-    TEST_ASSERT(f->nodes[4].has_taptree == 1, "kickoff_right has taptree");
-    TEST_ASSERT(f->nodes[5].has_taptree == 1, "state_right has taptree");
-
-    /* Verify per-node staggered CLTV values (DFS order) */
-    TEST_ASSERT_EQ(f->nodes[1].cltv_timeout, 1000, "state_root cltv = 1000 (root)");
-    TEST_ASSERT_EQ(f->nodes[2].cltv_timeout, 995, "kickoff_left cltv = 995 (mid ko)");
-    TEST_ASSERT_EQ(f->nodes[3].cltv_timeout, 990, "state_left cltv = 990 (leaf)");
-    TEST_ASSERT_EQ(f->nodes[4].cltv_timeout, 995, "kickoff_right cltv = 995 (mid ko)");
-    TEST_ASSERT_EQ(f->nodes[5].cltv_timeout, 990, "state_right cltv = 990 (leaf)");
-
     /* Build factory WITHOUT cltv_timeout for comparison */
     factory_t *f2 = calloc(1, sizeof(factory_t));
     if (!f2) return 0;
@@ -300,17 +285,17 @@ int test_factory_tree_with_timeout(void) {
     factory_set_funding(f2, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f2), "build tree without timeout");
 
-    /* spending_spk of taptree nodes should differ between f and f2 */
-    TEST_ASSERT(memcmp(f->nodes[1].spending_spk, f2->nodes[1].spending_spk, 34) != 0,
-                "state_root spk differs with taptree");
-    TEST_ASSERT(memcmp(f->nodes[2].spending_spk, f2->nodes[2].spending_spk, 34) != 0,
-                "kickoff_left spk differs with taptree");
-    TEST_ASSERT(memcmp(f->nodes[3].spending_spk, f2->nodes[3].spending_spk, 34) != 0,
-                "state_left spk differs with taptree");
-
-    /* spending_spk of kickoff_root should be SAME (no taptree on either) */
-    TEST_ASSERT(memcmp(f->nodes[0].spending_spk, f2->nodes[0].spending_spk, 34) == 0,
-                "kickoff_root spk same without taptree");
+    /* The end date changes no tree output: no node input has a script path
+       (in particular none the host could spend alone after the CLTV), so
+       every output script is the same with and without a CLTV. */
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        TEST_ASSERT(memcmp(f->nodes[i].spending_spk, f2->nodes[i].spending_spk, 34) == 0,
+                    "node input script independent of the CLTV");
+        for (size_t v = 0; v < f->nodes[i].n_outputs; v++)
+            TEST_ASSERT(memcmp(f->nodes[i].outputs[v].script_pubkey,
+                               f2->nodes[i].outputs[v].script_pubkey, 34) == 0,
+                        "node output script independent of the CLTV");
+    }
 
     /* All 6 txs should sign and verify via key-path */
     TEST_ASSERT(factory_sign_all(f), "sign all with timeout");
@@ -359,372 +344,6 @@ int test_factory_tree_with_timeout(void) {
     return 1;
 }
 
-/* ---- Regtest helper: find vout matching expected_spk ---- */
-
-static int find_funding_vout(
-    regtest_t *rt,
-    const char *txid_hex,
-    const unsigned char *expected_spk,
-    size_t expected_spk_len,
-    int *vout_out,
-    uint64_t *amount_out
-) {
-    char params[256];
-    snprintf(params, sizeof(params), "\"%s\" true true", txid_hex);
-    char *result = regtest_exec(rt, "gettransaction", params);
-    if (!result) return 0;
-
-    char expected_hex[69];
-    hex_encode(expected_spk, expected_spk_len, expected_hex);
-
-    cJSON *json = cJSON_Parse(result);
-    free(result);
-    if (!json) return 0;
-
-    cJSON *decoded = cJSON_GetObjectItem(json, "decoded");
-    if (!decoded) { cJSON_Delete(json); return 0; }
-
-    cJSON *vouts = cJSON_GetObjectItem(decoded, "vout");
-    if (!vouts || !cJSON_IsArray(vouts)) { cJSON_Delete(json); return 0; }
-
-    int found = 0;
-    int arr_size = cJSON_GetArraySize(vouts);
-    for (int i = 0; i < arr_size; i++) {
-        cJSON *vout_obj = cJSON_GetArrayItem(vouts, i);
-        if (!vout_obj) continue;
-
-        cJSON *n_item = cJSON_GetObjectItem(vout_obj, "n");
-        cJSON *value_item = cJSON_GetObjectItem(vout_obj, "value");
-        cJSON *spk_obj = cJSON_GetObjectItem(vout_obj, "scriptPubKey");
-        if (!n_item || !value_item || !spk_obj) continue;
-
-        cJSON *hex_item = cJSON_GetObjectItem(spk_obj, "hex");
-        if (!hex_item || !cJSON_IsString(hex_item)) continue;
-
-        if (strcmp(hex_item->valuestring, expected_hex) == 0) {
-            *vout_out = n_item->valueint;
-            *amount_out = (uint64_t)(value_item->valuedouble * 100000000.0 + 0.5);
-            found = 1;
-            break;
-        }
-    }
-
-    cJSON_Delete(json);
-    return found;
-}
-
-/* ---- Regtest helper: get current block height ---- */
-
-static int get_block_height(regtest_t *rt) {
-    char *result = regtest_exec(rt, "getblockcount", "");
-    if (!result) return -1;
-    int h = atoi(result);
-    free(result);
-    return h;
-}
-
-/* ---- Regtest test 6: timeout spend ---- */
-
-int test_regtest_timeout_spend(void) {
-    secp256k1_context *ctx = test_ctx();
-    regtest_t rt;
-    if (!regtest_init(&rt)) {
-        printf("  FAIL: bitcoind not running\n");
-        secp256k1_context_destroy(ctx);
-        return 0;
-    }
-    regtest_create_wallet(&rt, "test_timeout");
-
-    char mine_addr[128];
-    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
-    if (!regtest_fund_from_faucet(&rt, 1.0))
-        regtest_mine_blocks(&rt, 101, mine_addr);
-
-    secp256k1_keypair kps[5];
-    if (!make_keypairs(ctx, kps)) return 0;
-
-    /* Get LSP xonly pubkey */
-    secp256k1_xonly_pubkey lsp_xonly;
-    if (!secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &kps[0])) return 0;
-
-    /* Compute funding spk (5-of-5, key-path-only for the funding output) */
-    secp256k1_pubkey all_pks[5];
-    for (int i = 0; i < 5; i++) {
-        if (!secp256k1_keypair_pub(ctx, &all_pks[i], &kps[i])) return 0;
-    }
-
-    musig_keyagg_t fund_ka;
-    musig_aggregate_keys(ctx, &fund_ka, all_pks, 5);
-
-    unsigned char ik_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, ik_ser, &fund_ka.agg_pubkey)) return 0;
-    unsigned char fund_tweak[32];
-    sha256_tagged("TapTweak", ik_ser, 32, fund_tweak);
-
-    musig_keyagg_t fund_tmp = fund_ka;
-    secp256k1_pubkey fund_tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &fund_tweaked_pk,
-                                             &fund_tmp.cache, fund_tweak)) return 0;
-    secp256k1_xonly_pubkey fund_tweaked_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &fund_tweaked_xonly, NULL,
-                                         &fund_tweaked_pk)) return 0;
-    unsigned char fund_spk[34];
-    build_p2tr_script_pubkey(fund_spk, &fund_tweaked_xonly);
-
-    /* Derive bech32m address */
-    unsigned char tw_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &fund_tweaked_xonly)) return 0;
-    char key_hex[65];
-    hex_encode(tw_ser, 32, key_hex);
-
-    char params[512];
-    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
-    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
-    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
-
-    char checksummed_desc[256];
-    {
-        char *dstart = strstr(desc_result, "\"descriptor\"");
-        TEST_ASSERT(dstart != NULL, "find descriptor");
-        dstart = strchr(dstart + 12, '"');
-        TEST_ASSERT(dstart != NULL, "descriptor value start");
-        dstart++;
-        char *dend = strchr(dstart, '"');
-        TEST_ASSERT(dend != NULL, "descriptor value end");
-        size_t dlen = (size_t)(dend - dstart);
-        memcpy(checksummed_desc, dstart, dlen);
-        checksummed_desc[dlen] = '\0';
-    }
-    free(desc_result);
-
-    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
-    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
-    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
-
-    char factory_addr[128];
-    {
-        char *start = strchr(addr_result, '"');
-        TEST_ASSERT(start != NULL, "addr quote");
-        start++;
-        char *end = strchr(start, '"');
-        TEST_ASSERT(end != NULL, "addr end quote");
-        size_t len = (size_t)(end - start);
-        memcpy(factory_addr, start, len);
-        factory_addr[len] = '\0';
-    }
-    free(addr_result);
-
-    /* Fund factory */
-    char funding_txid_hex[65];
-    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
-                "fund factory");
-    regtest_mine_blocks(&rt, 1, mine_addr);
-
-    /* Find factory vout */
-    unsigned char fund_txid_bytes[32];
-    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
-    reverse_bytes(fund_txid_bytes, 32);
-
-    uint64_t fund_amount = 0;
-    int found_vout = -1;
-    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
-                                   &found_vout, &fund_amount),
-                "find factory vout");
-    printf("  Factory funded: %s vout=%d amount=%lu\n",
-           funding_txid_hex, found_vout, (unsigned long)fund_amount);
-
-    /* Set cltv_timeout = current_height + 10 */
-    int current_height = get_block_height(&rt);
-    TEST_ASSERT(current_height > 0, "get block height");
-    uint32_t cltv_timeout = (uint32_t)current_height + 10;
-    printf("  Current height=%d, cltv_timeout=%u\n", current_height, cltv_timeout);
-
-    /* Init factory with timeout, build tree, then advance to max state (all delays = 0).
-       factory_build_tree reinitializes the DW counter, so advances must happen after. */
-    factory_t *f = calloc(1, sizeof(factory_t));
-    if (!f) return 0;
-    factory_init(f, ctx, kps, 5, 1, 4);
-    f->cltv_timeout = cltv_timeout;
-
-    factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
-                         fund_amount, fund_spk, 34);
-
-    TEST_ASSERT(factory_build_tree(f), "build tree");
-    TEST_ASSERT(factory_sign_all(f), "sign all");
-
-    for (int i = 0; i < 15; i++)
-        TEST_ASSERT(factory_advance(f), "advance to max epoch");
-    printf("  Tree built: %zu nodes, kickoff_left has_taptree=%d\n",
-           f->n_nodes, f->nodes[2].has_taptree);
-
-    /* Broadcast kickoff_root (node 0), mine 1 block */
-    {
-        char *tx_hex = (char *)malloc(f->nodes[0].signed_tx.len * 2 + 1);
-        hex_encode(f->nodes[0].signed_tx.data, f->nodes[0].signed_tx.len, tx_hex);
-        char txid[65];
-        int sent = regtest_send_raw_tx(&rt, tx_hex, txid);
-        free(tx_hex);
-        TEST_ASSERT(sent, "broadcast kickoff_root");
-        printf("  Broadcast kickoff_root: %s\n", txid);
-    }
-    regtest_mine_blocks(&rt, 1, mine_addr);
-
-    /* Broadcast state_root (node 1), mine 1 block (nSeq=0 since maxed) */
-    {
-        char *tx_hex = (char *)malloc(f->nodes[1].signed_tx.len * 2 + 1);
-        hex_encode(f->nodes[1].signed_tx.data, f->nodes[1].signed_tx.len, tx_hex);
-        char txid[65];
-        int sent = regtest_send_raw_tx(&rt, tx_hex, txid);
-        free(tx_hex);
-        TEST_ASSERT(sent, "broadcast state_root");
-        printf("  Broadcast state_root: %s\n", txid);
-    }
-    regtest_mine_blocks(&rt, 1, mine_addr);
-
-    /* DON'T broadcast kickoff_left (simulate uncooperative clients).
-       Instead, mine until height >= cltv_timeout, then spend via timeout path. */
-
-    /* state_root output 0 is the one we want to spend via timeout.
-       It pays to kickoff_left's spending_spk (which has the taptree). */
-    factory_node_t *state_root = &f->nodes[1];
-    factory_node_t *kickoff_left = &f->nodes[2];
-
-    /* Get state_root txid in display order */
-    unsigned char sr_txid_display[32];
-    memcpy(sr_txid_display, state_root->txid, 32);
-    reverse_bytes(sr_txid_display, 32);
-
-    /* Mine until we pass cltv_timeout */
-    int height_now = get_block_height(&rt);
-    int blocks_needed = (int)cltv_timeout - height_now;
-    if (blocks_needed > 0) {
-        printf("  Mining %d blocks to reach cltv_timeout...\n", blocks_needed);
-        regtest_mine_blocks(&rt, blocks_needed, mine_addr);
-    }
-
-    height_now = get_block_height(&rt);
-    printf("  Height after mining: %d (need >= %u)\n", height_now, cltv_timeout);
-    TEST_ASSERT(height_now >= (int)cltv_timeout, "height >= cltv_timeout");
-
-    /* Construct timeout tx:
-       - Input: state_root txid : vout 0
-       - nSequence: 0xFFFFFFFE (enables nLockTime)
-       - nLockTime: cltv_timeout
-       - Output: LSP's own P2TR address (minus fee) */
-
-    /* LSP output key (single key, key-path-only) */
-    secp256k1_xonly_pubkey lsp_tweaked;
-    unsigned char lsp_out_spk[34];
-    {
-        unsigned char lsp_ik[32];
-        if (!secp256k1_xonly_pubkey_serialize(ctx, lsp_ik, &lsp_xonly)) return 0;
-        unsigned char lsp_tw[32];
-        sha256_tagged("TapTweak", lsp_ik, 32, lsp_tw);
-        secp256k1_pubkey lsp_tw_full;
-        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tw_full, &lsp_xonly, lsp_tw)) return 0;
-        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tweaked, NULL, &lsp_tw_full)) return 0;
-        build_p2tr_script_pubkey(lsp_out_spk, &lsp_tweaked);
-    }
-
-    uint64_t timeout_output_amount = state_root->outputs[0].amount_sats - 500;
-
-    tx_output_t timeout_out;
-    timeout_out.amount_sats = timeout_output_amount;
-    memcpy(timeout_out.script_pubkey, lsp_out_spk, 34);
-    timeout_out.script_pubkey_len = 34;
-
-    /* Build unsigned timeout tx with nLockTime */
-    tx_buf_t timeout_unsigned;
-    tx_buf_init(&timeout_unsigned, 256);
-    TEST_ASSERT(build_unsigned_tx_locktime(&timeout_unsigned, NULL,
-                                            state_root->txid, 0,
-                                            0xFFFFFFFE, cltv_timeout,
-                                            &timeout_out, 1),
-                "build timeout tx");
-
-    /* Compute script-path sighash */
-    unsigned char timeout_sighash[32];
-    TEST_ASSERT(compute_tapscript_sighash(timeout_sighash,
-                    timeout_unsigned.data, timeout_unsigned.len,
-                    0,
-                    kickoff_left->spending_spk, kickoff_left->spending_spk_len,
-                    state_root->outputs[0].amount_sats,
-                    0xFFFFFFFE,
-                    &kickoff_left->timeout_leaf),
-                "compute timeout sighash");
-
-    /* Sign with LSP private key (single Schnorr sig, no MuSig) */
-    unsigned char timeout_sig[64];
-    {
-        unsigned char lsp_seckey[32];
-        if (!secp256k1_keypair_sec(ctx, lsp_seckey, &kps[0])) return 0;
-
-        secp256k1_keypair lsp_signkp;
-        if (!secp256k1_keypair_create(ctx, &lsp_signkp, lsp_seckey)) return 0;
-        memset(lsp_seckey, 0, 32);
-
-        /* Sign with BIP-340 schnorrsig */
-        unsigned char aux_rand[32];
-        memset(aux_rand, 0x42, 32);
-        int sig_ok = secp256k1_schnorrsig_sign32(ctx, timeout_sig, timeout_sighash,
-                                                   &lsp_signkp, aux_rand);
-        TEST_ASSERT(sig_ok, "schnorr sign timeout");
-
-        /* Verify against the LSP xonly pubkey (not the tweaked one!) */
-        int verify_ok = secp256k1_schnorrsig_verify(ctx, timeout_sig, timeout_sighash,
-                                                      32, &lsp_xonly);
-        TEST_ASSERT(verify_ok, "verify timeout sig");
-    }
-
-    /* Build control block */
-    unsigned char control_block[33];
-    size_t cb_len = 0;
-    TEST_ASSERT(tapscript_build_control_block(control_block, &cb_len,
-                    kickoff_left->output_parity,
-                    &kickoff_left->keyagg.agg_pubkey, ctx),
-                "build control block");
-
-    /* Finalize with script-path witness */
-    tx_buf_t timeout_signed;
-    tx_buf_init(&timeout_signed, 512);
-    TEST_ASSERT(finalize_script_path_tx(&timeout_signed,
-                    timeout_unsigned.data, timeout_unsigned.len,
-                    timeout_sig,
-                    kickoff_left->timeout_leaf.script,
-                    kickoff_left->timeout_leaf.script_len,
-                    control_block, cb_len),
-                "finalize script path tx");
-
-    /* Broadcast timeout tx */
-    char *timeout_hex = (char *)malloc(timeout_signed.len * 2 + 1);
-    hex_encode(timeout_signed.data, timeout_signed.len, timeout_hex);
-
-    char timeout_txid[65];
-    int sent = regtest_send_raw_tx(&rt, timeout_hex, timeout_txid);
-    if (!sent) {
-        printf("  FAIL: timeout tx broadcast failed\n");
-        printf("  Tx hex: %s\n", timeout_hex);
-    }
-    free(timeout_hex);
-    TEST_ASSERT(sent, "broadcast timeout tx");
-    printf("  Broadcast timeout tx: %s\n", timeout_txid);
-
-    /* Mine 1 block and verify confirmed */
-    regtest_mine_blocks(&rt, 1, mine_addr);
-    int conf = regtest_get_confirmations(&rt, timeout_txid);
-    printf("  Timeout tx confirmations: %d\n", conf);
-    TEST_ASSERT(conf > 0, "timeout tx confirmed");
-
-    printf("  Timeout script-path spend confirmed on regtest!\n");
-
-    tx_buf_free(&timeout_unsigned);
-    tx_buf_free(&timeout_signed);
-    factory_free(f);
-    free(f);
-    secp256k1_context_destroy(ctx);
-    return 1;
-}
-
 /* ---- Unit test 7: multi-level staggered timeout ---- */
 
 int test_multi_level_timeout_unit(void) {
@@ -766,34 +385,32 @@ int test_multi_level_timeout_unit(void) {
     TEST_ASSERT(factory_build_tree(f), "build tree");
     TEST_ASSERT_EQ(f->n_nodes, 6, "6 nodes");
 
-    /* Verify each taptree node has correct CLTV in its timeout_leaf script */
-    for (size_t i = 1; i < f->n_nodes; i++) {
-        factory_node_t *node = &f->nodes[i];
-        TEST_ASSERT(node->has_taptree == 1, "node has taptree");
-        TEST_ASSERT(node->timeout_leaf.script_len > 0, "script non-empty");
-
-        /* Verify OP_CLTV (0xb1) present */
-        int found = 0;
-        for (size_t j = 0; j < node->timeout_leaf.script_len; j++) {
-            if (node->timeout_leaf.script[j] == 0xb1) { found = 1; break; }
-        }
-        TEST_ASSERT(found, "OP_CLTV in script");
+    /* No CLTV anywhere in the tree: the end date lives only in the payouts.
+       Every payout has nLockTime = the CLTV, a final-enabling nSequence, and
+       no output for the host. */
+    unsigned char host_spk[34];
+    {
+        secp256k1_xonly_pubkey hx, ht;
+        unsigned char ser[32], tw[32];
+        secp256k1_pubkey full;
+        TEST_ASSERT(secp256k1_keypair_xonly_pub(ctx, &hx, NULL, &kps[0]), "host key");
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &hx);
+        sha256_tagged("TapTweak", ser, 32, tw);
+        TEST_ASSERT(secp256k1_xonly_pubkey_tweak_add(ctx, &full, &hx, tw), "tweak");
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &ht, NULL, &full);
+        build_p2tr_script_pubkey(host_spk, &ht);
     }
-
-    /* Verify CLTV ordering: leaf < mid ko < root (DFS order) */
-    TEST_ASSERT(f->nodes[3].cltv_timeout < f->nodes[2].cltv_timeout,
-                "state_left cltv < kickoff_left cltv");
-    TEST_ASSERT(f->nodes[5].cltv_timeout < f->nodes[4].cltv_timeout,
-                "state_right cltv < kickoff_right cltv");
-    TEST_ASSERT(f->nodes[2].cltv_timeout < f->nodes[1].cltv_timeout,
-                "mid cltv < root cltv");
-
-    /* Verify exact values: step=5, DFS order */
-    TEST_ASSERT_EQ(f->nodes[1].cltv_timeout, 1000, "state_root = base");
-    TEST_ASSERT_EQ(f->nodes[2].cltv_timeout, 995,  "kickoff_left = base-5");
-    TEST_ASSERT_EQ(f->nodes[3].cltv_timeout, 990,  "state_left = base-10");
-    TEST_ASSERT_EQ(f->nodes[4].cltv_timeout, 995,  "kickoff_right = base-5");
-    TEST_ASSERT_EQ(f->nodes[5].cltv_timeout, 990,  "state_right = base-10");
+    TEST_ASSERT(f->n_payouts > 0, "payouts built");
+    for (size_t pi = 0; pi < f->n_payouts; pi++) {
+        const factory_payout_t *p = &f->payouts[pi];
+        const tx_buf_t *u = &p->unsigned_tx;
+        TEST_ASSERT(u->len > 10, "payout tx");
+        uint32_t lt = (uint32_t)u->data[u->len - 4] | ((uint32_t)u->data[u->len - 3] << 8) |
+                      ((uint32_t)u->data[u->len - 2] << 16) | ((uint32_t)u->data[u->len - 1] << 24);
+        TEST_ASSERT_EQ(lt, 1000, "payout nLockTime is the end date");
+        for (size_t k = 0; k + 34 <= u->len; k++)
+            TEST_ASSERT(memcmp(u->data + k, host_spk, 34) != 0, "no payout pays the host");
+    }
 
     /* All 6 txs should sign and verify via key-path */
     TEST_ASSERT(factory_sign_all(f), "sign all");

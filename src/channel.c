@@ -321,21 +321,6 @@ void channel_cleanup(channel_t *ch) {
     ch->revocations_cap = 0;
 }
 
-void channel_set_cltv_merkle_root(channel_t *ch, uint32_t cltv_timeout,
-                                   const secp256k1_pubkey *lsp_pubkey) {
-    if (!ch || !lsp_pubkey || cltv_timeout == 0) return;
-    secp256k1_xonly_pubkey lsp_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &lsp_xonly, NULL, lsp_pubkey))
-        return;
-    tapscript_leaf_t cltv_leaf;
-    if (!tapscript_build_cltv_timeout(&cltv_leaf, cltv_timeout, &lsp_xonly, ch->ctx))
-        return;
-    tapscript_compute_leaf_hash(&cltv_leaf);
-    if (!tapscript_merkle_root(ch->chan_merkle_root, &cltv_leaf, 1))
-        return;
-    ch->has_chan_merkle_root = 1;
-}
-
 int channel_set_local_basepoints(channel_t *ch,
                                    const unsigned char *payment_secret32,
                                    const unsigned char *delayed_payment_secret32,
@@ -932,10 +917,9 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
        under fee pressure).  The commitment is pre-signed at a fixed fee and is
        not RBF-able once both parties sign; a keyless Pay-to-Anchor output lets
        whoever force-closes attach a high-fee child to pull the commitment into a
-       block.  The 240-sat cost is moved OUT of the funder's (to_remote) output,
-       so the output sum -- and thus the implicit miner fee, the agreed rate
-       for the commitment's exact size -- is unchanged and to_local (the broadcaster's recoverable balance) is
-       untouched.  Presence + funding source are a pure function of the shared
+       block.  The 240-sat cost is moved OUT of the funder's output, so the
+       output sum -- and thus the implicit miner fee, the agreed rate for the
+       commitment's exact size -- is unchanged.  Presence + funding source are a pure function of the shared
        channel fee-rate + balances, so both co-signers build an identical tx
        (matching sighash).  Appended LAST: to_local[0]/to_remote[1]/HTLC indices
        and the count-bounded watchtower output parsers are unaffected.  Gated on a
@@ -947,10 +931,17 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
     if (ch->use_cpfp_anchor) {
         uint64_t anchor = ANCHOR_OUTPUT_AMOUNT;
         int placed = 0;
-        if (outputs[1].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
-            outputs[1].amount_sats -= anchor; placed = 1;   /* funder (to_remote) funds it */
-        } else if (outputs[0].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
-            outputs[0].amount_sats -= anchor; placed = 1;   /* fallback: to_local funds it */
+        /* The funder's output funds it, whichever side's commitment this is:
+           the member's commitment takes it from the LSP's to_remote as
+           before, and the LSP's own commitment (which the member co-signs so
+           the LSP can close by itself) from the LSP's to_local, never from
+           the member's balance.  channel_build_commitment_tx_for_remote
+           flips funder_is_local with the view, so both builders agree. */
+        size_t fo = ch->funder_is_local ? 0 : 1;
+        if (outputs[fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
+            outputs[fo].amount_sats -= anchor; placed = 1;
+        } else if (outputs[1 - fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
+            outputs[1 - fo].amount_sats -= anchor; placed = 1;   /* fallback */
         }
         if (placed) {
             memcpy(outputs[out_idx].script_pubkey, P2A_SPK, P2A_SPK_LEN);
@@ -1035,9 +1026,10 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
         rv.ptlcs = ptlc_copy;
     }
 
-    /* Swap amounts */
+    /* Swap amounts, and which side funded the channel */
     rv.local_amount = ch->remote_amount;
     rv.remote_amount = ch->local_amount;
+    rv.funder_is_local = !ch->funder_is_local;
 
     /* Swap basepoints: remote's "local" = our "remote" and vice versa */
     rv.local_delayed_payment_basepoint = ch->remote_delayed_payment_basepoint;
@@ -1095,7 +1087,7 @@ int channel_sign_commitment(const channel_t *ch,
     musig_keyagg_t keyagg_copy = ch->funding_keyagg;
     unsigned char sig64[64];
     {
-        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        const unsigned char *mr = NULL;   /* channel outputs are key path only */
         if (!musig_sign_taproot(ch->ctx, sig64, sighash, kps, 2, &keyagg_copy, mr))
             return 0;
     }
@@ -1592,7 +1584,7 @@ int channel_create_commitment_partial_sig(
 
     /* Finalize with taproot tweak; use CLTV taptree root if present */
     {
-        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        const unsigned char *mr = NULL;   /* channel outputs are key path only */
         if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, mr, NULL))
             return 0;
     }
@@ -1673,7 +1665,7 @@ int channel_verify_and_aggregate_commitment_sig(
     }
 
     {
-        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        const unsigned char *mr = NULL;   /* channel outputs are key path only */
         if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, mr, NULL)) {
             fprintf(stderr, "verify_agg: finalize_nonces failed\n");
             return 0;
@@ -2099,7 +2091,7 @@ int channel_build_cooperative_close_tx(
     musig_keyagg_t keyagg_copy = ch->funding_keyagg;
     unsigned char sig64[64];
     {
-        const unsigned char *mr = ch->has_chan_merkle_root ? ch->chan_merkle_root : NULL;
+        const unsigned char *mr = NULL;   /* channel outputs are key path only */
         if (!musig_sign_taproot(ch->ctx, sig64, sighash, kps, 2,
                                  &keyagg_copy, mr)) {
             tx_buf_free(&unsigned_tx);
@@ -2149,114 +2141,43 @@ void channel_update_funding(channel_t *ch,
 
 #include "superscalar/tapscript.h"
 
-/* SF-CH #154 helper: try one (ordering, cltv) combination and return 1+set
-   outputs on match. */
-static int channel_funding_keyagg_try_combo(
-    const secp256k1_context *ctx,
-    const secp256k1_pubkey *pks_ordered,  /* 2 elements */
-    uint32_t my_idx_for_this_order,
-    uint32_t cltv_timeout,
-    const secp256k1_pubkey *cltv_leaf_lsp_pubkey,
-    const unsigned char *target_xonly,
-    musig_keyagg_t *keyagg_out,
-    uint32_t *my_signer_idx_out,
-    unsigned char *merkle_root_out32,
-    int *has_merkle_root_out)
-{
-    unsigned char chan_cltv_merkle[32];
-    const unsigned char *merkle_root = NULL;
-    if (cltv_timeout > 0) {
-        secp256k1_xonly_pubkey lsp_xonly;
-        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL,
-                                                 cltv_leaf_lsp_pubkey))
-            return 0;
-        tapscript_leaf_t leaf;
-        if (!tapscript_build_cltv_timeout(&leaf, cltv_timeout, &lsp_xonly, ctx))
-            return 0;
-        if (!tapscript_merkle_root(chan_cltv_merkle, &leaf, 1))
-            return 0;
-        merkle_root = chan_cltv_merkle;
-    }
-
-    musig_keyagg_t ka;
-    if (!musig_aggregate_keys(ctx, &ka, pks_ordered, 2))
-        return 0;
-
-    unsigned char internal_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
-        return 0;
-
-    unsigned char tweak[32];
-    if (merkle_root) {
-        unsigned char buf[64];
-        memcpy(buf, internal_ser, 32);
-        memcpy(buf + 32, merkle_root, 32);
-        sha256_tagged("TapTweak", buf, 64, tweak);
-    } else {
-        sha256_tagged("TapTweak", internal_ser, 32, tweak);
-    }
-
-    secp256k1_pubkey tweaked_full;
-    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full,
-                                          &ka.agg_pubkey, tweak))
-        return 0;
-    secp256k1_xonly_pubkey tweaked_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL,
-                                            &tweaked_full))
-        return 0;
-    unsigned char tx_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, tx_ser, &tweaked_xonly))
-        return 0;
-
-    if (memcmp(tx_ser, target_xonly, 32) != 0)
-        return 0;
-
-    *keyagg_out = ka;
-    *my_signer_idx_out = my_idx_for_this_order;
-    if (merkle_root) {
-        memcpy(merkle_root_out32, merkle_root, 32);
-        *has_merkle_root_out = 1;
-    } else {
-        *has_merkle_root_out = 0;
-    }
-    return 1;
-}
-
+/* SF-CH #154: a factory channel output is the key-path-only P2TR of
+   MuSig2(member, LSP) in one of two key orders (PS leaves put the LSP first,
+   the other leaf kinds the member).  Find the order whose aggregate matches
+   funding_spk. */
 int channel_discover_funding_keyagg(
     const secp256k1_context *ctx,
     const secp256k1_pubkey *my_pubkey,
     const secp256k1_pubkey *peer_pubkey,
-    const secp256k1_pubkey *cltv_leaf_lsp_pubkey,
-    uint32_t factory_cltv,
-    uint32_t node_cltv,
     const unsigned char *funding_spk,
     size_t funding_spk_len,
     musig_keyagg_t *keyagg_out,
-    uint32_t *my_signer_idx_out,
-    unsigned char *merkle_root_out32,
-    int *has_merkle_root_out)
+    uint32_t *my_signer_idx_out)
 {
     if (funding_spk_len != 34 || funding_spk[0] != 0x51 || funding_spk[1] != 0x20)
         return 0;
-    const unsigned char *target_xonly = funding_spk + 2;
-
-    /* Two orderings × up to two cltv sources. */
     secp256k1_pubkey orderings[2][2] = {
-        { *my_pubkey, *peer_pubkey },   /* order_idx=0 → "my" at signer_idx=0 */
-        { *peer_pubkey, *my_pubkey }    /* order_idx=1 → "my" at signer_idx=1 */
+        { *my_pubkey, *peer_pubkey },   /* "my" at signer_idx 0 */
+        { *peer_pubkey, *my_pubkey }    /* "my" at signer_idx 1 */
     };
-    const uint32_t my_idx_for_order[2] = { 0, 1 };
-    uint32_t cltvs[2] = { factory_cltv, node_cltv };
-
-    for (int oi = 0; oi < 2; oi++) {
-        for (int ci = 0; ci < 2; ci++) {
-            if (ci == 1 && cltvs[0] == cltvs[1]) continue;
-            if (channel_funding_keyagg_try_combo(
-                    ctx, orderings[oi], my_idx_for_order[oi],
-                    cltvs[ci], cltv_leaf_lsp_pubkey, target_xonly,
-                    keyagg_out, my_signer_idx_out,
-                    merkle_root_out32, has_merkle_root_out))
-                return 1;
+    for (uint32_t oi = 0; oi < 2; oi++) {
+        musig_keyagg_t ka;
+        if (!musig_aggregate_keys(ctx, &ka, orderings[oi], 2))
+            return 0;
+        unsigned char internal_ser[32], tweak[32], tw_ser[32];
+        if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
+            return 0;
+        sha256_tagged("TapTweak", internal_ser, 32, tweak);
+        secp256k1_pubkey tweaked_full;
+        secp256k1_xonly_pubkey tweaked_xonly;
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full, &ka.agg_pubkey, tweak) ||
+            !secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_full) ||
+            !secp256k1_xonly_pubkey_serialize(ctx, tw_ser, &tweaked_xonly))
+            return 0;
+        if (memcmp(tw_ser, funding_spk + 2, 32) == 0) {
+            *keyagg_out = ka;
+            *my_signer_idx_out = oi;
+            return 1;
         }
     }
     return 0;

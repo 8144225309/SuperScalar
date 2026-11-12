@@ -481,3 +481,37 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
     client_dist_free(&d);
     return settles;
 }
+
+/* End-date payouts: from the end date on, publish the payout of every shared
+   output on this member's path that is on chain and unspent.  The tree being
+   partly or wholly on chain kills the distribution TX; these are then the
+   member's claim, with no message from the host.  Returns how many are in
+   the mempool or were sent now. */
+#define CLIENT_PAYOUT_MAX_ROWS 64
+int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory_id,
+                         client_dist_send_fn send, FILE *out) {
+    if (!db || !chain || !chain->get_block_height || !chain->is_outpoint_unspent) return 0;
+    int tip = chain->get_block_height(chain);
+    if (tip <= 0) return 0;
+    persist_payout_row_t rows[CLIENT_PAYOUT_MAX_ROWS];
+    size_t n = persist_load_payouts(db, factory_id, rows, CLIENT_PAYOUT_MAX_ROWS);
+    int sent = 0;
+    for (size_t i = 0; i < n; i++) {
+        if ((uint32_t)tip < rows[i].locktime) continue;   /* the next block is > tip */
+        if (chain->is_outpoint_unspent(chain, rows[i].prev_txid_hex, rows[i].prev_vout) != 1)
+            continue;
+        char *hex = malloc(rows[i].tx_len * 2 + 1);
+        if (!hex) continue;
+        hex_encode(rows[i].tx, rows[i].tx_len, hex);
+        char txid[65] = "";
+        int ok = send ? send(chain, hex, txid)
+                      : (chain->send_raw_tx && chain->send_raw_tx(chain, hex, txid));
+        free(hex);
+        if (out)
+            fprintf(out, "Client: end-date payout of %s:%u %s%s\n", rows[i].prev_txid_hex,
+                    rows[i].prev_vout, ok ? "broadcast: " : "not accepted", ok ? txid : "");
+        if (ok) sent++;
+    }
+    persist_free_payout_rows(rows, n);
+    return sent;
+}

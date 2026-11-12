@@ -202,8 +202,7 @@ uint32_t cli_factory_exit_blocks(const uint8_t *level_arities, size_t n_level_ar
                                                  states_per_layer);
     uint32_t depth = 1;
     while (depth < 32 && ((size_t)1 << (depth - 1)) < n_clients) depth++;
-    uint64_t total = ewt + (2u * depth + 3u) +
-                     2u * (uint64_t)depth * CLI_FACTORY_TIMEOUT_STEP;
+    uint64_t total = ewt + (2u * depth + 3u);
     return total > UINT32_MAX / 2 ? UINT32_MAX / 2 : (uint32_t)total;
 }
 
@@ -213,14 +212,13 @@ int cli_validate_factory_cltv(uint32_t cltv_timeout, uint32_t created,
                               char *err_buf, size_t err_buf_len)
 {
     uint64_t expired = (uint64_t)created + active_blocks + dying_blocks;
-    uint64_t exit_by = (uint64_t)created + exit_blocks + CLI_FACTORY_CLTV_MARGIN;
-    uint64_t need = expired > exit_by + 1 ? expired : exit_by + 1;
+    uint64_t need = expired + exit_blocks + CLI_FACTORY_CLTV_MARGIN;
     if ((uint64_t)cltv_timeout >= need) return 1;
     cli_set_err(err_buf, err_buf_len,
         "Error: factory CLTV timeout %u is too early: a factory created at "
         "block %u with %u active and %u dying blocks expires at block %llu, "
-        "and a member's exit can take %u blocks (+%u margin); its "
-        "distribution TX and timeout paths must not be valid before then. "
+        "and the LSP's forced exit of a member can take %u blocks (+%u margin) "
+        "after that, before the end-date payouts are valid. "
         "Use --cltv-timeout %llu or later (or leave it unset).",
         (unsigned)cltv_timeout, (unsigned)created, (unsigned)active_blocks,
         (unsigned)dying_blocks, (unsigned long long)expired,
@@ -239,8 +237,7 @@ int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
     cli_set_err(err_buf, err_buf_len,
         "factory CLTV timeout %u is not safely in the future: chain tip %u, "
         "and a member's exit from this tree can take %u blocks (+%u margin); "
-        "the distribution TX and the LSP's timeout paths would be valid "
-        "before the exit could confirm",
+        "the end-date payouts would be valid before the exit could confirm",
         (unsigned)cltv_timeout, (unsigned)tip, (unsigned)exit_blocks,
         (unsigned)CLI_FACTORY_CLTV_MARGIN);
     return 0;
@@ -248,6 +245,13 @@ int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
 
 uint32_t cli_factory_auto_cltv_offset(uint32_t base_offset, uint32_t exit_blocks)
 {
-    uint32_t need = exit_blocks + CLI_FACTORY_CLTV_MARGIN + CLI_FACTORY_TIP_SKEW + 1;
-    return base_offset > need ? base_offset : need;
+    uint64_t off = (uint64_t)base_offset + exit_blocks + CLI_FACTORY_CLTV_MARGIN +
+                   CLI_FACTORY_TIP_SKEW;
+    return off > UINT32_MAX / 2 ? UINT32_MAX / 2 : (uint32_t)off;
+}
+
+uint32_t cli_factory_force_exit_height(uint32_t cltv_timeout, uint32_t exit_blocks)
+{
+    uint64_t back = (uint64_t)exit_blocks + CLI_FACTORY_CLTV_MARGIN;
+    return (uint64_t)cltv_timeout > back ? (uint32_t)(cltv_timeout - back) : 0;
 }

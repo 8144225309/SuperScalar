@@ -138,4 +138,10 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
                             client_dist_send_fn send, FILE *out,
                             client_dist_status_t *status_out);
 
+/* End-date payouts stored for factory_id: once the tip has reached their
+   nLockTime, send each one whose shared output is on chain and unspent.
+   Returns the number sent. */
+int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory_id,
+                         client_dist_send_fn send, FILE *out);
+
 #endif /* SUPERSCALAR_CLIENT_DIST_H */

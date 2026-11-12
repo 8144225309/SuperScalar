@@ -226,6 +226,9 @@ typedef struct {
     int rot_leaf_arity;            /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
     int rot_enabled;               /* 1 = rotation may run (--enable-rotation-experimental);
                                       default 0: every rotation path is refused */
+    uint32_t force_exit_height;    /* the LSP pushes every member's channel on
+                                      chain from this height (0 = never): the
+                                      end date minus a forced exit and margin */
     int rot_auto_rotate;           /* 1 = rotate automatically when a factory turns
                                       DYING; only ever set together with rot_enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
@@ -767,6 +770,28 @@ size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp)
    committed to and was stored.  Otherwise nothing is stored, the error is
    logged and the client's connection is dropped: the caller must not go on
    with the exchange (no watchtower entry, no revocation of its own). */
+/* The LSP's own latest commitment of ch, fully signed with the member's
+   co-signature (lsp_take_host_commit_sig) at ch's current number; 0 when it
+   holds none for that number. */
+int lsp_signed_host_commitment(const channel_t *ch, tx_buf_t *out,
+                               char txid_hex_out[65]);
+
+/* The LSP's forced exit of member c's channel before the end date, one step
+   per call (call once a block): publish the next pre-signed transaction of
+   the member's path whose parent is confirmed and whose relative lock has
+   passed; once the path is confirmed, the LSP's own latest commitment.
+   Returns 1 when that commitment is confirmed, 0 while in progress, -1 when
+   the LSP holds no signed commitment for the channel. */
+int lsp_force_exit_step(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                        chain_backend_t *chain);
+
+/* Take the member's signature over the LSP's own commitment from json
+   (REVOKE_AND_ACK or HOST_COMMITMENT_SIG); 0 only if it does not verify. */
+int lsp_take_host_commit_sig(channel_t *ch, const cJSON *json);
+/* wire_parse_revoke_and_ack plus lsp_take_host_commit_sig for ch. */
+int lsp_parse_member_revoke(channel_t *ch, const cJSON *json, uint32_t *channel_id,
+                            unsigned char *rev_secret, unsigned char *next_point);
+
 int lsp_channels_accept_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     channel_t *ch,
                                     const unsigned char *secret32);

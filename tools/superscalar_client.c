@@ -1003,8 +1003,16 @@ static int client_dist_send_cpfp(chain_backend_t *chain, const char *tx_hex,
 static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
                                              secp256k1_context *ctx) {
     if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
-    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, client_dist_send_cpfp,
-                             10, stdout);
+    client_dist_status_t s = client_dist_watch(&g_dist_watch, db, ctx, wt->chain,
+                                               client_dist_send_cpfp, 10, stdout);
+    /* The tree is (partly) on chain: claim this member's share through the
+       end-date payout of each shared output on its path that is unspent. */
+    static time_t last_payout_check;
+    if (s == CLIENT_DIST_FUNDING_SPENT && time(NULL) - last_payout_check >= 10) {
+        last_payout_check = time(NULL);
+        client_payouts_claim(db, wt->chain, 0, client_dist_send_cpfp, stdout);
+    }
+    return s;
 }
 
 static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
@@ -1040,7 +1048,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
                 persist_save_tree_nodes(cbd->db, factory, 0) &&
-                client_persist_commitment_sig(ch, cbd)) {
+                client_persist_commitment_sig(ch, cbd) &&
+                /* The end-date payouts on this member's path, with the tree:
+                   the member never holds a tree without its claim at T0. */
+                persist_save_payouts(cbd->db, 0, factory, my_index)) {
                 /* Save the verified signed distribution TX */
                 if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0) {
                     persist_save_distribution_tx(cbd->db, 0,
@@ -2253,6 +2264,7 @@ handle_message:
                         persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
                         persist_save_tree_nodes(cbd->db, factory, 0) &&
                         client_persist_commitment_sig(ch, cbd) &&
+                        persist_save_payouts(cbd->db, 0, factory, my_index) &&
                         persist_delete_factory_record(cbd->db,
                             CLIENT_ROTATION_PENDING_FACTORY_ID)) {
                         int rot_ok = 1;

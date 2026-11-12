@@ -263,7 +263,7 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(dest_ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point) &&
             lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
@@ -414,7 +414,7 @@ int lsp_channels_lsppay(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                MSG_REVOKE_AND_ACK, &ack, 60)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
-                if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
+                if (lsp_parse_member_revoke(dest_ch, ack.json, &ack_chan_id,
                                                 rev_secret, next_point) &&
                     lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
@@ -621,7 +621,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(sender_ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point) &&
             lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
@@ -764,7 +764,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(dest_ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point) &&
             lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
@@ -902,7 +902,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                MSG_REVOKE_AND_ACK, &ack, 60)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
-                if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
+                if (lsp_parse_member_revoke(dest_ch, ack.json, &ack_chan_id,
                                                 rev_secret, next_point) &&
                     lsp_channels_accept_revocation(mgr, lsp, dest_ch, rev_secret)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
@@ -1010,7 +1010,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                MSG_REVOKE_AND_ACK, &ack, 60)) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
-                if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
+                if (lsp_parse_member_revoke(sender_ch, ack.json, &ack_chan_id,
                                                 rev_secret, next_point) &&
                     lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
@@ -1371,7 +1371,7 @@ int lsp_channels_add_pending_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(sender_ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point) &&
             lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;

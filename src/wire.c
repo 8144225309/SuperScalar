@@ -104,6 +104,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4E: return "PTLC_COMPLETE";
     case 0x4F: return "CHANNEL_BASEPOINTS";
     case 0x50: return "LSP_REVOKE_AND_ACK";
+    case 0x96: return "HOST_COMMITMENT_SIG";
     case 0x51: return "JIT_OFFER";
     case 0x60: return "PATH_NONCE_BUNDLE";
     case 0x61: return "PATH_ALL_NONCES";
@@ -789,6 +790,20 @@ cJSON *wire_build_factory_ready(const factory_t *f) {
     if (f->dist_tx_ready == 2 && f->dist_signed_tx.len > 0) {
         wire_json_add_hex(j, "distribution_tx_hex",
                           f->dist_signed_tx.data, f->dist_signed_tx.len);
+    }
+    /* The end-date payout signatures, one per payout in payout order.  Each
+       member rebuilds every payout from its own tree, so 64 bytes each is
+       all it needs; it refuses the factory unless every payout on its path
+       verifies.  Sent only when all are signed. */
+    if (f->n_payouts > 0 && factory_payouts_all_signed(f, 0)) {
+        unsigned char *sigs = malloc(f->n_payouts * 64);
+        if (sigs) {
+            for (size_t pi = 0; pi < f->n_payouts; pi++)
+                memcpy(sigs + pi * 64, f->payouts[pi].sig, 64);
+            cJSON_AddNumberToObject(j, "n_payouts", (double)f->n_payouts);
+            wire_json_add_hex(j, "payout_sigs", sigs, f->n_payouts * 64);
+            free(sigs);
+        }
     }
     return j;
 }

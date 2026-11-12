@@ -60,6 +60,177 @@
    gathers per-client partial sigs over MuSig2 lands.  This is a
    SECURITY GAP for multi-process deployments — the watchtower can
    detect breaches but cannot redistribute L-stock to clients. */
+
+/* The member's partial signature over the LSP's own commitment at ch's
+   current number, carried in json (REVOKE_AND_ACK, or HOST_COMMITMENT_SIG at
+   channel open): verify it, aggregate the LSP's commitment signature and keep
+   it (and persist it), so the LSP can close the channel by itself before the
+   end date.  A message without one leaves the LSP with no signed commitment
+   at this number.  Returns 0 only for a signature that does not verify. */
+int lsp_take_host_commit_sig(channel_t *ch, const cJSON *json) {
+    if (!ch || !json) return 0;
+    unsigned char psig[32], sig[64];
+    const cJSON *ni = cJSON_GetObjectItem(json, "host_commit_nonce_index");
+    if (wire_json_get_hex(json, "host_commit_psig", psig, 32) != 32 ||
+        !ni || !cJSON_IsNumber(ni)) {
+        ch->has_latest_commitment_sig = 0;
+        fprintf(stderr, "LSP: no signature over the LSP's commitment %llu; it cannot "
+                "close this channel alone until the next update\n",
+                (unsigned long long)ch->commitment_number);
+        return 1;
+    }
+    if (!channel_verify_and_aggregate_commitment_sig(ch, psig, (uint32_t)ni->valuedouble,
+                                                     sig)) {
+        ch->has_latest_commitment_sig = 0;
+        fprintf(stderr, "LSP: the member's signature over the LSP's commitment %llu "
+                "does not verify -- refusing the update\n",
+                (unsigned long long)ch->commitment_number);
+        return 0;
+    }
+    memcpy(ch->latest_commitment_sig, sig, 64);
+    ch->has_latest_commitment_sig = 1;
+    ch->latest_commitment_sig_cn = ch->commitment_number;
+    if (ch->persist_db)
+        persist_save_host_commitment((persist_t *)ch->persist_db, ch->persist_channel_id,
+                                     ch->commitment_number, sig);
+    return 1;
+}
+
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern void reverse_bytes(unsigned char *data, size_t len);
+
+int lsp_signed_host_commitment(const channel_t *ch, tx_buf_t *out,
+                               char txid_hex_out[65]) {
+    if (!ch || !out || !ch->has_latest_commitment_sig ||
+        ch->latest_commitment_sig_cn != ch->commitment_number)
+        return 0;
+    tx_buf_t u;
+    tx_buf_init(&u, 512);
+    unsigned char txid[32];
+    int ok = channel_build_commitment_tx(ch, &u, txid) &&
+             finalize_signed_tx(out, u.data, u.len, ch->latest_commitment_sig);
+    tx_buf_free(&u);
+    if (ok && txid_hex_out) {
+        /* channel_build_commitment_tx gives the txid in internal order */
+        unsigned char disp[32];
+        memcpy(disp, txid, 32);
+        reverse_bytes(disp, 32);
+        hex_encode(disp, 32, txid_hex_out);
+    }
+    return ok;
+}
+
+static int fe_send(chain_backend_t *chain, const tx_buf_t *t, char txid[65]) {
+    char *hex = malloc(t->len * 2 + 1);
+    if (!hex) return 0;
+    hex_encode(t->data, t->len, hex);
+    int ok = cpfp_send_default(chain, hex, txid) != CPFP_FAILED;
+    free(hex);
+    return ok;
+}
+
+int lsp_force_exit_step(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
+                        chain_backend_t *chain) {
+    if (!mgr || !lsp || c >= mgr->n_channels || !chain || !chain->get_confirmations)
+        return -1;
+    channel_t *ch = &mgr->entries[c].channel;
+    tx_buf_t commit;
+    tx_buf_init(&commit, 512);
+    char commit_txid[65];
+    if (!lsp_signed_host_commitment(ch, &commit, commit_txid)) {
+        tx_buf_free(&commit);
+        return -1;
+    }
+    int cconf = chain->get_confirmations(chain, commit_txid);
+    if (cconf >= 1) { tx_buf_free(&commit); return 1; }
+
+    const factory_t *f = &lsp->factory;
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    int path[64];
+    size_t n = factory_client_to_leaf(f, c, &leaf, &vout)
+               ? factory_collect_path_to_root(f, (int)leaf, path, 64) : 0;
+    int parent_confs = 1000000;   /* the funding output: assumed buried */
+    for (size_t k = 0; k < n; k++) {
+        const factory_node_t *x = &f->nodes[path[k]];
+        unsigned char disp[32];
+        char hex[65];
+        memcpy(disp, x->txid, 32);
+        reverse_bytes(disp, 32);
+        hex_encode(disp, 32, hex);
+        int conf = chain->get_confirmations(chain, hex);
+        if (conf >= 1) { parent_confs = conf; continue; }
+        /* The output this node spends is already spent by something else (a
+           cooperative close, the distribution TX, a member's own exit): there
+           is nothing left to push on this path. */
+        if (chain->is_outpoint_unspent) {
+            unsigned char pt[32];
+            char pth[65];
+            uint32_t pv = 0;
+            if (x->parent_index < 0) {
+                memcpy(pt, f->funding_txid, 32);
+                pv = f->funding_vout;
+            } else {
+                memcpy(pt, f->nodes[x->parent_index].txid, 32);
+                pv = x->parent_vout;
+            }
+            reverse_bytes(pt, 32);
+            hex_encode(pt, 32, pth);
+            if (parent_confs >= 1 && chain->is_outpoint_unspent(chain, pth, pv) == 0 &&
+                !(chain->is_in_mempool && chain->is_in_mempool(chain, hex))) {
+                tx_buf_free(&commit);
+                return 1;
+            }
+        }
+        if (chain->is_in_mempool && chain->is_in_mempool(chain, hex)) {
+            tx_buf_free(&commit);
+            return 0;
+        }
+        uint32_t ns = x->nsequence;
+        int lock = (!(ns & 0x80000000u) && !(ns & 0x00400000u)) ? (int)(ns & 0xFFFFu) : 0;
+        if (parent_confs < 1 || parent_confs < lock) { tx_buf_free(&commit); return 0; }
+        char sent[65] = "";
+        int ok = x->is_signed && fe_send(chain, &x->signed_tx, sent);
+        printf("LSP forced exit: member %zu path node %d %s%s\n", c + 1, path[k],
+               ok ? "broadcast " : "not accepted", ok ? sent : "");
+        fflush(stdout);
+        tx_buf_free(&commit);
+        return 0;
+    }
+    if (chain->is_in_mempool && chain->is_in_mempool(chain, commit_txid)) {
+        tx_buf_free(&commit);
+        return 0;
+    }
+    /* The channel output is spent by another commitment (the member's own
+       exit): the channel is settled. */
+    if (chain->is_outpoint_unspent) {
+        unsigned char ct[32];
+        char cth[65];
+        memcpy(ct, ch->funding_txid, 32);
+        reverse_bytes(ct, 32);
+        hex_encode(ct, 32, cth);
+        if (chain->is_outpoint_unspent(chain, cth, ch->funding_vout) == 0) {
+            tx_buf_free(&commit);
+            return 1;
+        }
+    }
+    char sent[65] = "";
+    int ok = parent_confs >= 1 && fe_send(chain, &commit, sent);
+    printf("LSP forced exit: member %zu LSP commitment %llu %s%s\n", c + 1,
+           (unsigned long long)ch->commitment_number, ok ? "broadcast " : "not accepted",
+           ok ? sent : "");
+    fflush(stdout);
+    tx_buf_free(&commit);
+    return 0;
+}
+
+int lsp_parse_member_revoke(channel_t *ch, const cJSON *json, uint32_t *channel_id,
+                            unsigned char *rev_secret, unsigned char *next_point) {
+    if (!wire_parse_revoke_and_ack(json, channel_id, rev_secret, next_point))
+        return 0;
+    return lsp_take_host_commit_sig(ch, json);
+}
+
 /* Send the LSP's own revocation secret to a client after each commitment update.
    This enables bidirectional revocation so clients can detect LSP breaches.
    old_cn: the commitment number whose secret is being revealed. */
@@ -290,30 +461,19 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         {
             musig_keyagg_t ka;
             uint32_t signer_idx;
-            unsigned char merkle[32];
-            int has_merkle = 0;
             if (!channel_discover_funding_keyagg(
-                    ctx, &lsp_pubkey, client_pubkey, &lsp_pubkey,
-                    factory->cltv_timeout, state_node->cltv_timeout,
+                    ctx, &lsp_pubkey, client_pubkey,
                     funding_spk, funding_spk_len,
-                    &ka, &signer_idx, merkle, &has_merkle)) {
+                    &ka, &signer_idx)) {
                 fprintf(stderr,
-                        "LSP: channel %zu funding_keyagg discovery failed — "
-                        "no combination of ordering [client,LSP]/[LSP,client] "
-                        "and cltv (factory=%u, node=%u) produces the on-chain "
-                        "funding_spk. Cannot proceed: on-chain spends would "
-                        "fail Schnorr verify.\n",
-                        c, factory->cltv_timeout, state_node->cltv_timeout);
+                        "LSP: channel %zu funding_keyagg discovery failed: "
+                        "neither key order [client,LSP]/[LSP,client] produces "
+                        "the on-chain funding_spk. Cannot proceed: on-chain "
+                        "spends would fail Schnorr verify.\n", c);
                 return 0;
             }
             entry->channel.funding_keyagg = ka;
             entry->channel.local_funding_signer_idx = signer_idx;
-            if (has_merkle) {
-                memcpy(entry->channel.chan_merkle_root, merkle, 32);
-                entry->channel.has_chan_merkle_root = 1;
-            } else {
-                entry->channel.has_chan_merkle_root = 0;
-            }
         }
 
         /* Generate random basepoint secrets */
@@ -1062,6 +1222,23 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                 free(nonce_fds); free(nonce_ready);
                 return 0;
             }
+            /* The member co-signs the LSP's commitment 0 in turn. */
+            {
+                wire_msg_t hs;
+                memset(&hs, 0, sizeof(hs));
+                int got = wire_recv_timeout(lsp->client_fds[c], &hs, 30) &&
+                          hs.msg_type == MSG_HOST_COMMITMENT_SIG;
+                int took = got && hs.json &&
+                           lsp_take_host_commit_sig(&mgr->entries[c].channel, hs.json) &&
+                           mgr->entries[c].channel.has_latest_commitment_sig;
+                if (hs.json) cJSON_Delete(hs.json);
+                if (!took) {
+                    fprintf(stderr, "LSP: client %zu did not sign the LSP's commitment 0 "
+                            "-- channel not opened\n", c);
+                    free(nonce_fds); free(nonce_ready);
+                    return 0;
+                }
+            }
 
             nonce_fds[c] = -1;  /* mark as received */
             nonces_received++;
@@ -1297,7 +1474,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Parse and verify revocation secret */
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(sender_ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
             if (!channel_verify_revocation_secret(sender_ch, old_cn, rev_secret)) {
@@ -1603,7 +1780,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(dest_ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
             if (!channel_verify_revocation_secret(dest_ch, old_cn, rev_secret)) {
@@ -5389,7 +5566,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
-        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+        if (lsp_parse_member_revoke(ch, ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point) &&
             lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
             uint64_t old_cn = ch->commitment_number - 1;
@@ -5535,7 +5712,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 ack_msg.msg_type == MSG_REVOKE_AND_ACK) {
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
-                if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                if (lsp_parse_member_revoke(sender_ch, ack_msg.json, &ack_chan_id,
                                                 rev_secret, next_point) &&
                     lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
@@ -6090,7 +6267,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 }
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
-                if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                if (lsp_parse_member_revoke(dest_ch, ack_msg.json, &ack_chan_id,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
                     if (!channel_verify_revocation_secret(dest_ch, old_cn, rev_secret)) {
@@ -6400,7 +6577,7 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                         MSG_REVOKE_AND_ACK, 30)) {
                         uint32_t pcs_ack_id;
                         unsigned char pcs_rev[32], pcs_np[33];
-                        if (wire_parse_revoke_and_ack(pcs_raa.json, &pcs_ack_id,
+                        if (lsp_parse_member_revoke(ch, pcs_raa.json, &pcs_ack_id,
                                                         pcs_rev, pcs_np) &&
                             channel_receive_revocation(ch,
                                 ch->commitment_number - 1, pcs_rev))
@@ -6720,7 +6897,7 @@ int lsp_channels_settle_via_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         {
             uint32_t ack_ch_id;
             unsigned char rev_secret[32], next_point[33];
-            if (wire_parse_revoke_and_ack(ack.json, &ack_ch_id,
+            if (lsp_parse_member_revoke(ch, ack.json, &ack_ch_id,
                                             rev_secret, next_point) &&
                 lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
                 secp256k1_pubkey next_pcp;
@@ -7627,6 +7804,24 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                        still in flight. */
                     lsp_channels_expire_htlcs(mgr, lsp, (uint32_t)height);
 
+                    /* The end date approaches and the factory is still open:
+                       push every member's channel on chain while the LSP's
+                       commitments can still confirm before the end-date
+                       payouts become valid.  Once the funding output is spent
+                       by anything but the tree there is nothing to push. */
+                    if (mgr->force_exit_height > 0 &&
+                        (uint32_t)height >= mgr->force_exit_height &&
+                        (uint32_t)height < lsp->factory.cltv_timeout &&
+                        mgr->watchtower && mgr->watchtower->chain) {
+                        chain_backend_t *fe_chain = mgr->watchtower->chain;
+                        for (size_t fc = 0; fc < mgr->n_channels; fc++) {
+                            int r = lsp_force_exit_step(mgr, lsp, fc, fe_chain);
+                            if (r < 0)
+                                fprintf(stderr, "LSP forced exit: no signed LSP "
+                                        "commitment for member %zu; it is paid at "
+                                        "the end date\n", fc + 1);
+                        }
+                    }
                     /* Profit settlement: handled above via chain_be (works
                        without watchtower). Removed from watchtower block. */
                     /* Factory lifecycle monitoring */

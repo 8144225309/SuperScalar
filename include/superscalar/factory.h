@@ -180,12 +180,7 @@ typedef struct {
        factory's tree_fee_rate for its exact vsize. */
     uint64_t fee_sats;
 
-    /* Timeout script path (staggered per-node CLTV) */
-    int has_taptree;
-    uint32_t cltv_timeout;    /* per-node absolute CLTV for timeout script-path */
-    tapscript_leaf_t timeout_leaf;
-    unsigned char merkle_root[32];
-    int output_parity;        /* parity of tweaked output key */
+    int output_parity;        /* parity of tweaked output key (key path only) */
 
     /* Split-round signing state.  partial_sigs is dynamic (sized to n_signers in
        factory_build_tree) — subtree-sized, and lets the root node exceed the old
@@ -522,7 +517,84 @@ typedef struct {
     secp256k1_musig_partial_sig *dist_partial_sigs;  /* dynamic, sized to config.max_signers */
     int dist_partial_sigs_received;
     tx_buf_t dist_signed_tx;       /* fully-signed distribution TX (dist_tx_ready==2) */
+    /* End-date payouts of the tree's shared outputs (factory_payout.c);
+       rebuilt by factory_build_tree. */
+    struct factory_payout *payouts;
+    size_t n_payouts;
 } factory_t;
+
+/* --- End-date payouts (factory_payout.c) ---------------------------------
+   One pre-signed payout per shared tree output whose value belongs to members
+   at the end date T0 (f->cltv_timeout): nLockTime T0, spends the output by key
+   path, pays the members under it (their capacity plus an equal share of the
+   rest), nothing to the host, one P2A anchor.  Kickoff outputs into their own
+   state transaction and anchors have none; the funding output's payout is the
+   distribution transaction. */
+typedef enum {
+    PAYOUT_TREE = 1,     /* output a child tree transaction spends */
+    PAYOUT_CHANNEL = 2,  /* a member's channel output */
+    PAYOUT_STOCK = 3     /* host liquidity (stock) output */
+} payout_kind_t;
+
+typedef struct factory_payout {
+    uint32_t node_idx;               /* node whose output is paid out */
+    uint32_t vout;
+    int kind;                        /* payout_kind_t */
+    uint32_t n_signers;
+    uint32_t *signer_indices;        /* participants, in keyagg order */
+    musig_keyagg_t keyagg;
+    unsigned char merkle_root[32];   /* output taptree (stock only) */
+    int has_merkle;
+    secp256k1_xonly_pubkey output_key;
+    uint32_t n_members;
+    uint32_t *members;               /* participants paid, ascending */
+    tx_buf_t unsigned_tx;
+    unsigned char sighash[32];
+    musig_signing_session_t session;
+    secp256k1_musig_partial_sig *partial_sigs;
+    int partial_sigs_received;
+    tx_buf_t signed_tx;
+    unsigned char sig[64];
+    int is_signed;
+} factory_payout_t;
+
+/* Build (or rebuild) every payout from the built tree; signatures are
+   dropped.  0 if some output cannot get one (e.g. a channel output that is
+   not MuSig2(member, host), or capacities above an output's value). */
+int factory_build_payouts(factory_t *f);
+void factory_free_payouts(factory_t *f);
+/* Index of the payout of (node_idx, vout), or -1. */
+int factory_find_payout(const factory_t *f, uint32_t node_idx, uint32_t vout);
+/* Signer slot of participant in payout pi, or -1. */
+int factory_payout_signer_slot(const factory_t *f, size_t pi, uint32_t participant);
+/* 1 if participant is paid by payout pi (the output is on its path). */
+int factory_payout_on_path(const factory_t *f, size_t pi, uint32_t participant);
+/* Fee of a payout paying n_members, at the factory's tree rate. */
+uint64_t factory_payout_fee(const factory_t *f, size_t n_members);
+/* Where payouts and the distribution transaction pay a member. */
+int factory_member_payout_spk(const factory_t *f, uint32_t participant,
+                              unsigned char spk_out[34]);
+int factory_payout_session_init(factory_t *f, size_t pi);
+int factory_payout_session_set_nonce(factory_t *f, size_t pi, size_t slot,
+                                     const secp256k1_musig_pubnonce *pn);
+int factory_payout_session_finalize(factory_t *f, size_t pi);
+int factory_payout_session_set_partial_sig(factory_t *f, size_t pi, size_t slot,
+                                           const secp256k1_musig_partial_sig *ps);
+int factory_payout_session_complete(factory_t *f, size_t pi);
+/* Verify sig64 under payout pi's output key and attach it. */
+int factory_payout_attach_sig(factory_t *f, size_t pi, const unsigned char sig64[64]);
+/* Sign every payout with f->keypairs (single process, every key held). */
+int factory_sign_payouts_local(factory_t *f);
+/* 1 if every payout is signed (participant 0) or every payout on
+   participant's path is. */
+int factory_payouts_all_signed(const factory_t *f, uint32_t participant);
+/* Ceremony helpers: payouts participant signs; byte offset of payout pi in
+   the payout nonce matrix (every payout's signers in slot order, 66 bytes
+   each; factory_payout_nonce_offset(f, f->n_payouts) is its length);
+   re-init every payout session. */
+size_t factory_payout_count_for_signer(const factory_t *f, uint32_t participant);
+size_t factory_payout_nonce_offset(const factory_t *f, size_t pi);
+int factory_payout_sessions_init(factory_t *f);
 
 /* Allocate the dynamic arrays (participants / per-leaf / per-node) at config
    defaults for a factory_t that was built BY HAND — calloc'd or stack-zeroed and
@@ -777,25 +849,16 @@ int factory_set_funding(factory_t *f,
    setting placement and profiles.  Returns 0 on failure. */
 int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
 
-/* Use spk (a 34-byte P2TR, OP_1 <32 bytes>) verbatim as the channel output
-   of member participant_idx (1..n_participants-1) in its leaf, in place of
-   the default MuSig2(member, LSP) output with the LSP-only CLTV recovery
-   leaf.  spk == NULL restores the default.  Returns 0, changing nothing, for
-   any other script or index.  Call after factory_init*, before
-   factory_build_tree; members without a script keep the default, so a
-   factory with none set builds exactly as before.
-
-   For callers whose channel engine holds two-sided commitments over the
-   channel output (e.g. a standard taproot channel funding output, MuSig2 key
-   path only).  The reference LSP and client keep the default: they hold no
-   commitment for the LSP's side, which then relies on the CLTV recovery
-   leaf.
-
-   One-member pseudo-Spilman leaf (k = 1): the chain extension spends the
-   channel output, so spk must be the key-path-only P2TR (BIP-86 tweak, no
-   script tree) of the MuSig2 key of the LSP and the member, in either key
-   order; the extension is then signed and verified over that key.
-   factory_build_tree refuses any other script there, and refuses a script
+/* Use spk verbatim as the channel output of member participant_idx
+   (1..n_participants-1) in its leaf, in place of the default.  Every channel
+   output is the key-path-only P2TR (BIP-86 tweak, no script tree) of the
+   MuSig2 key of the member and the LSP: the default puts the member first
+   (the LSP first on a one-member pseudo-Spilman leaf), and spk may only
+   choose the other key order.  The channel output's end-date payout is
+   co-signed by those two keys, so no other script is accepted.  spk == NULL
+   restores the default.  Returns 0, changing nothing, for any other script
+   or index.  Call after factory_init*, before factory_build_tree; members
+   without a script keep the default.  factory_build_tree refuses a script
    for a member of a PS sub-factory leaf (k > 1). */
 int factory_set_leaf_channel_spk(factory_t *f, uint32_t participant_idx,
                                  const unsigned char *spk, size_t spk_len);
@@ -1379,22 +1442,6 @@ size_t factory_get_subtree_clients(const factory_t *f, int node_idx,
 /* Find the leaf state node index for a client participant index.
    Returns leaf state node index, or -1 if not found. */
 int factory_find_leaf_for_client(const factory_t *f, uint32_t client_idx);
-
-/* Build a signed timeout script-path spend for a factory node.
-   Spends parent_txid:parent_vout via target_node's CLTV timeout leaf.
-   LSP signs alone: <cltv> OP_CLTV OP_DROP <LSP_key> OP_CHECKSIG.
-   Returns 1 on success. */
-int factory_build_timeout_spend_tx(
-    const factory_t *f,
-    const unsigned char *parent_txid,   /* 32 bytes, internal order */
-    uint32_t parent_vout,
-    uint64_t spend_amount,              /* sats on the output being spent */
-    int target_node_idx,                /* node whose spending_spk is the output */
-    const secp256k1_keypair *lsp_keypair,
-    const unsigned char *dest_spk,      /* destination P2TR scriptPubKey */
-    size_t dest_spk_len,
-    uint64_t fee_sats,
-    tx_buf_t *signed_tx_out);
 
 /* --- Factory lifecycle (Phase 8) --- */
 

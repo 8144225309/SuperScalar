@@ -1406,6 +1406,30 @@ int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
                                   size_t *signed_tx_len_out,
                                   size_t max_len);
 
+/* --- The LSP's own commitment signature (co-signed by the member) --- */
+int persist_save_host_commitment(persist_t *p, uint32_t channel_id,
+                                 uint64_t commitment_number, const unsigned char sig64[64]);
+int persist_load_host_commitment(persist_t *p, uint32_t channel_id,
+                                 uint64_t *commitment_number_out, unsigned char sig64_out[64]);
+
+/* --- End-date payouts --- */
+typedef struct {
+    char prev_txid_hex[65];   /* the shared output it spends, display order */
+    uint32_t prev_vout;
+    uint32_t locktime;        /* the factory's end date */
+    unsigned char *tx;        /* signed payout (heap) */
+    size_t tx_len;
+} persist_payout_row_t;
+
+/* Store every signed payout on participant's path (0 = every payout); 0 if
+   one of them is not signed. */
+int persist_save_payouts(persist_t *p, uint32_t factory_id, const factory_t *f,
+                         uint32_t participant);
+/* Load up to max_rows payouts of factory_id; free with persist_free_payout_rows. */
+size_t persist_load_payouts(persist_t *p, uint32_t factory_id,
+                            persist_payout_row_t *rows, size_t max_rows);
+void persist_free_payout_rows(persist_payout_row_t *rows, size_t n);
+
 /* --- Pending sweeps (schema v12) --- */
 /* persist_save_sweep / persist_load_sweeps / persist_delete_sweep
    are declared in sweeper.h (which has the sweep_entry_t struct). */
