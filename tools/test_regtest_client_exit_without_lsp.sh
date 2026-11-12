@@ -16,8 +16,10 @@
 #               --sweep-to-local sweeps its to_local output.  Commitments pay
 #               a fixed 154 sat for 167 vB, below the default relay floor, so
 #               this scenario restarts the node with a 0.5 sat/vB floor.
-#   cltv        The LSP refuses a --cltv-timeout in the past, and one inside
-#               the factory's lifetime, before it funds anything.
+#   cltv        The LSP refuses a --cltv-timeout in the past, one inside the
+#               factory's lifetime and one a block short of a member's exit,
+#               before it funds anything; the earliest allowed one is
+#               accepted by the LSP and by every member.
 #
 # Run inside the regtest sandbox (REGTEST_CONF names a conf whose node this
 # script starts if it is not running).  Needs sqlite3.
@@ -270,9 +272,9 @@ scenario_cltv() {
     grep -qE "funded [0-9]+ sats|funding TX broadcast" "$d/past/lsp.log" && fail "LSP funded before refusing" ||
         pass "nothing funded"
     kill_clients
-    # inside the lifetime: 20 active + 10 dying, timeout 20 blocks after creation
+    # inside the lifetime: 300 active + 50 dying, timeout 200 blocks after creation
     h=$(height)
-    factory_up "$d/life" 29965 --active-blocks 20 --dying-blocks 10 --cltv-timeout $((h + 102 + 20)) || return
+    factory_up "$d/life" 29965 --active-blocks 300 --dying-blocks 50 --cltv-timeout $((h + 103 + 200)) || return
     for _ in $(seq 1 60); do kill -0 "$LSP_PID" 2>/dev/null || break; sleep 1; done
     if kill -0 "$LSP_PID" 2>/dev/null; then fail "LSP accepted a timeout inside the factory lifetime"; stop "$LSP_PID"
     else
@@ -285,6 +287,30 @@ scenario_cltv() {
     local tx1
     tx1=$($BCLI -rpcwallet=$WALLET getwalletinfo | python3 -c 'import json,sys;print(json.load(sys.stdin)["txcount"])')
     [ "$tx0" = "$tx1" ] && pass "no wallet transaction" || fail "wallet transactions $tx0 -> $tx1"
+    # The floor is judged at the block the factory will be created at (103
+    # blocks on: 101, one more ensure_funded may mine, the funding block), and
+    # a member's exit from the default shape takes 99 blocks (+6 margin): the
+    # earliest timeout is h + 103 + 106.  One block less is refused before
+    # anything is funded; the earliest one is accepted by LSP and members.
+    h=$(height)
+    factory_up "$d/edge" 29966 --cltv-timeout $((h + 103 + 105)) || return
+    for _ in $(seq 1 60); do kill -0 "$LSP_PID" 2>/dev/null || break; sleep 1; done
+    if kill -0 "$LSP_PID" 2>/dev/null; then fail "LSP accepted a timeout one block below the floor"; stop "$LSP_PID"
+    else
+        grep -q "is too early" "$d/edge/lsp.log" && pass "one block below the floor refused" ||
+            fail "LSP exited without the refusal: $(tail -2 "$d/edge/lsp.log" | tr '\n' ' ')"
+    fi
+    grep -qE "funded [0-9]+ sats|funding TX broadcast" "$d/edge/lsp.log" && fail "LSP funded before refusing" ||
+        pass "nothing funded"
+    kill_clients
+    h=$(height)
+    factory_up "$d/floor" 29967 --daemon --cltv-timeout $((h + 103 + 106)) || return
+    if wait_grep "$d/floor/lsp.log" "entering daemon mode" 400; then  # no mining: members judge by their own tip
+        pass "the earliest timeout is accepted by the LSP and every member"
+    else
+        fail "factory at the floor not created: $(grep -ahE "too early|REFUSING|WARNING" "$d/floor/"*.log | head -2 | tr '\n' ' ')"
+    fi
+    stop "$LSP_PID"; kill_clients
 }
 
 echo "=========== client exits without the LSP (build: $BUILD_DIR) ==========="
