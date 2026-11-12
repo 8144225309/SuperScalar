@@ -1429,6 +1429,8 @@ extern int test_tree_fee_every_node_pays_relay(void);
 extern int test_tree_fee_arity2_leaf_210vb(void);
 extern int test_tree_fee_static_root_64_clients(void);
 extern int test_cpfp_exit_needs_child_reported(void);
+extern int test_distribution_fee_from_lsp_share(void);
+extern int test_distribution_above_truc_paid_high(void);
 extern int test_tree_fee_ps_chains(void);
 extern int test_tree_fee_distribution_tx(void);
 extern int test_tree_fee_poison_floor(void);
@@ -3468,6 +3470,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tree_fee_arity2_leaf_210vb);
     RUN_TEST(test_tree_fee_static_root_64_clients);
     RUN_TEST(test_cpfp_exit_needs_child_reported);
+    RUN_TEST(test_distribution_fee_from_lsp_share);
+    RUN_TEST(test_distribution_above_truc_paid_high);
     RUN_TEST(test_tree_fee_ps_chains);
     RUN_TEST(test_tree_fee_distribution_tx);
     RUN_TEST(test_tree_fee_poison_floor);

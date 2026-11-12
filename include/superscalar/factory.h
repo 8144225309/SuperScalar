@@ -797,8 +797,25 @@ uint64_t factory_ps_chain_fee(const factory_t *f);
    plus the P2A anchor it carries when tree anchors are on. */
 uint64_t factory_ps_chain_reserve(const factory_t *f);
 
+/* Lowest rate (sat/kvB) a distribution TX above TRUC_MAX_VSIZE (about 231
+   clients and more) is signed at.  Such a TX is nVersion 2: a node takes it
+   in a package only if it meets the minimum relay fee on its own, and with
+   no TRUC limits anyone can attach a large child to its anchor to pin it.
+   It is signed at this rate, or the tree rate when that is higher, and the
+   fee comes from the LSP's share (factory_compute_distribution_outputs*).
+   LSP and clients must use the same value.  20 sat/vB. */
+#define FACTORY_DIST_NON_TRUC_FEE_RATE 20000
+void factory_set_dist_non_truc_fee_rate(uint64_t sat_per_kvb);
+uint64_t factory_dist_non_truc_fee_rate(void);
+
+/* Rate (sat/kvB) the distribution TX of a factory with n_clients clients is
+   signed at: the tree fee rate, raised to factory_dist_non_truc_fee_rate()
+   when that TX is not TRUC (factory_distribution_tx_version). */
+uint64_t factory_distribution_fee_rate(const factory_t *f, size_t n_clients);
+
 /* Fee paid by the distribution TX of a factory with n_clients clients
-   (n_clients P2TR outputs + the P2A anchor). */
+   (n_clients P2TR outputs + the P2A anchor), at
+   factory_distribution_fee_rate. */
 uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients);
 
 /* Largest transaction TRUC policy accepts (BIP 431). */

@@ -1184,3 +1184,189 @@ int test_cpfp_exit_needs_child_reported(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+
+/* ---- distribution TX: fee and anchor from the LSP's share ------------- */
+
+#ifndef FACTORY_DIST_NON_TRUC_FEE_RATE
+#define FACTORY_DIST_NON_TRUC_FEE_RATE 20000
+#endif
+
+/* A client's channel capacity: its channel output in its leaf. */
+static uint64_t chan_capacity(const factory_t *f, size_t ci) {
+    size_t node = 0;
+    uint32_t vout = 0;
+    if (!factory_client_to_leaf(f, ci, &node, &vout) ||
+        vout >= f->nodes[node].n_outputs) return 0;
+    return f->nodes[node].outputs[vout].amount_sats;
+}
+
+/* Client payouts of a built distribution TX (its outputs but the anchor). */
+static int dist_payouts(const factory_t *f, uint64_t *pay, size_t n) {
+    cpfp_tx_info_t ti;
+    unsigned char *buf = malloc(f->dist_unsigned_tx.len + 1);
+    if (!buf) return 0;
+    memcpy(buf, f->dist_unsigned_tx.data, f->dist_unsigned_tx.len);
+    int ok = cpfp_parse_tx(buf, f->dist_unsigned_tx.len, &ti);
+    free(buf);
+    if (!ok) return 0;
+    /* outputs follow: version(4) vin(1) input(41) vout-count varint */
+    const unsigned char *d = f->dist_unsigned_tx.data;
+    size_t pos = 4 + 1 + 41;
+    size_t nout = d[pos];
+    pos += (nout < 0xfd) ? 1 : 3;
+    if (nout >= 0xfd) nout = (size_t)d[pos - 2] | ((size_t)d[pos - 1] << 8);
+    if (nout != n + 1) return 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t v = 0;
+        for (int b = 0; b < 8; b++) v |= (uint64_t)d[pos + b] << (8 * b);
+        pay[i] = v;
+        pos += 8;
+        size_t sl = d[pos];
+        pos += 1 + sl;
+    }
+    return 1;
+}
+
+/* The distribution TX pays every client at least its full channel capacity;
+   its fee and P2A anchor come out of what is left above the capacities (the
+   LSP's share), never out of one client.  A set of client amounts that does
+   not leave room for them is refused, not scaled down. */
+int test_distribution_fee_from_lsp_share(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    const size_t nc = 8;
+    shape_t sh = { "arity2", 2, {0}, 0, 0, 0 };
+    secp256k1_keypair *kps = calloc(nc + 1, sizeof(*kps));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc");
+    TEST_ASSERT(make_factory(ctx, f, kps, nc, &sh, 0, 4000000), "init");
+    TEST_ASSERT(factory_build_tree(f), "build");
+    uint64_t fee = factory_distribution_fee(f, nc);
+    tx_output_t outs[16];
+
+    /* equal split: every client the same (the anchor is not client 0's) */
+    size_t n = factory_compute_distribution_outputs(f, outs, 16, fee);
+    TEST_ASSERT_EQ(n, nc, "outputs");
+    TEST_ASSERT(factory_build_distribution_tx_unsigned(f, outs, n, 500), "build dist");
+    uint64_t pay[16];
+    TEST_ASSERT(dist_payouts(f, pay, nc), "parse dist");
+    uint64_t lo = UINT64_MAX, hi = 0, sum = 0;
+    for (size_t i = 0; i < nc; i++) {
+        if (pay[i] < lo) lo = pay[i];
+        if (pay[i] > hi) hi = pay[i];
+        sum += pay[i];
+        TEST_ASSERT(pay[i] >= chan_capacity(f, i), "at least the channel capacity");
+    }
+    printf("  equal split: payouts %llu..%llu, fee %llu, anchor %d\n",
+           (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)fee,
+           ANCHOR_OUTPUT_AMOUNT);
+    TEST_ASSERT(hi - lo < nc, "client 0 does not pay the anchor");
+    TEST_ASSERT_EQ(sum + ANCHOR_OUTPUT_AMOUNT + fee, f->funding_amount_sats,
+                   "funding = payouts + anchor + fee");
+
+    /* per-client amounts (capacities): each gets its amount plus a share of
+       the rest; the fee and anchor come from the rest */
+    uint64_t cap[16];
+    uint64_t caps = 0;
+    for (size_t i = 0; i < nc; i++) { cap[i] = chan_capacity(f, i); caps += cap[i]; }
+    n = factory_compute_distribution_outputs_balanced(f, outs, 16, fee, cap, nc);
+    TEST_ASSERT_EQ(n, nc, "balanced outputs");
+    TEST_ASSERT(factory_build_distribution_tx_unsigned(f, outs, n, 500), "build balanced");
+    TEST_ASSERT(dist_payouts(f, pay, nc), "parse balanced");
+    for (size_t i = 0; i < nc; i++)
+        TEST_ASSERT(pay[i] >= cap[i], "balanced: at least the amount asked");
+
+    /* amounts that leave no room for the fee and the anchor: refused */
+    uint64_t over[16];
+    uint64_t room = f->funding_amount_sats - caps;   /* the LSP's share */
+    for (size_t i = 0; i < nc; i++) over[i] = cap[i];
+    over[0] += room - fee - ANCHOR_OUTPUT_AMOUNT + 1;
+    TEST_ASSERT_EQ(factory_compute_distribution_outputs_balanced(f, outs, 16, fee, over, nc),
+                   0, "one sat short of fee + anchor: refused, not scaled down");
+    over[0] -= 1;
+    TEST_ASSERT_EQ(factory_compute_distribution_outputs_balanced(f, outs, 16, fee, over, nc),
+                   nc, "exactly enough: built");
+    for (size_t i = 0; i < nc; i++) over[i] = cap[i] * 2;
+    TEST_ASSERT_EQ(factory_compute_distribution_outputs_balanced(f, outs, 16, fee, over, nc),
+                   0, "amounts above the funding: refused, not scaled down");
+
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A distribution TX above the TRUC limit (about 231 clients and more) is
+   nVersion 2: it cannot go in as a package below the minimum relay fee and
+   its anchor can be pinned.  It is signed at a high rate instead, at least
+   FACTORY_DIST_NON_TRUC_FEE_RATE, paid from the LSP's share; a factory whose
+   funding cannot carry that fee within the pre-signed bound is refused before
+   funding. */
+int test_distribution_above_truc_paid_high(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    const size_t nc = 240;
+    TEST_ASSERT_EQ(factory_distribution_tx_version(nc), 2, "240 clients: not TRUC");
+    TEST_ASSERT_EQ(factory_distribution_tx_version(200), 3, "200 clients: TRUC");
+    shape_t sh = { "arity2", 2, {0}, 0, 0, 0 };
+    secp256k1_keypair *kps = calloc(nc + 1, sizeof(*kps));
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc");
+    TEST_ASSERT(make_factory(ctx, f, kps, nc, &sh, 0, 100000000), "init");
+    TEST_ASSERT(factory_build_tree(f), "build");
+    size_t vs = fee_keypath_tx_vsize(1, nc, 1);
+    uint64_t fee = factory_distribution_fee(f, nc);
+    printf("  %zu clients: distribution TX %zu vB, fee %llu sat (tree rate %llu)\n", nc, vs,
+           (unsigned long long)fee, (unsigned long long)f->tree_fee_rate);
+    TEST_ASSERT_EQ(fee, fee_presigned(FACTORY_DIST_NON_TRUC_FEE_RATE, vs),
+                   "signed at the non-TRUC rate, not the tree rate");
+    char why[200];
+    TEST_ASSERT(factory_check_presigned_fee_bounds(f, why, sizeof(why)), why);
+    tx_output_t *outs = calloc(nc + 1, sizeof(tx_output_t));
+    TEST_ASSERT(outs, "alloc");
+    size_t n = factory_compute_distribution_outputs(f, outs, nc + 1, fee);
+    TEST_ASSERT_EQ(n, nc, "outputs");
+    TEST_ASSERT(factory_build_distribution_tx_unsigned(f, outs, n, 500), "build dist");
+    TEST_ASSERT_EQ(f->dist_unsigned_tx.data[0], 2, "nVersion 2");
+    uint64_t *pay = calloc(nc, sizeof(uint64_t));
+    TEST_ASSERT(pay && dist_payouts(f, pay, nc), "parse dist");
+    for (size_t i = 0; i < nc; i++)
+        TEST_ASSERT(pay[i] >= chan_capacity(f, i), "every client at least its capacity");
+    /* a higher tree rate wins */
+    factory_free(f);
+    memset(f, 0, sizeof(*f));
+    TEST_ASSERT(make_factory(ctx, f, kps, nc, &sh, 30000, 100000000), "init 30 sat/vB");
+    TEST_ASSERT(factory_build_tree(f), "build");
+    TEST_ASSERT_EQ(factory_distribution_fee(f, nc), fee_presigned(30000, vs),
+                   "a tree rate above it is used");
+    factory_free(f);
+    free(f);
+    free(pay);
+    free(outs);
+
+    /* Before funding: 800000 sat for 240 clients carries the distribution TX
+       at the tree floor (13 ksat) but not at 20 sat/vB (206 ksat, above 25%
+       of the funding): the LSP refuses the factory. */
+    lsp_t *lsp = plan_lsp(ctx, nc);
+    TEST_ASSERT(lsp, "lsp");
+    factory_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.leaf_arity = FACTORY_ARITY_2;
+    cfg.tree_fee_rate = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
+    uint64_t max_rate = 0, asked = 0;
+    int planned = lsp_plan_tree_fee_rate(lsp, &cfg, nc, 800000, 4, 4, 500,
+                                         &max_rate, &asked, why, sizeof(why));
+    printf("  plan for %zu clients at 800000 sat: %d (%s)\n", nc, planned, why);
+    TEST_ASSERT(!planned, "refused before funding");
+    planned = lsp_plan_tree_fee_rate(lsp, &cfg, nc, 4000000, 4, 4, 500,
+                                     &max_rate, &asked, why, sizeof(why));
+    TEST_ASSERT(planned, "4000000 sat carries it");
+    free(lsp->client_pubkeys);
+    free(lsp);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+

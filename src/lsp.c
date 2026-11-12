@@ -601,6 +601,23 @@ static int trial_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
     } else {
         ok = factory_check_presigned_fee_bounds(t, why, why_len);
     }
+    if (ok && cltv_timeout > 0) {
+        /* the distribution TX's fee and anchor must come from the LSP's
+           share, every client keeping its full channel capacity */
+        tx_output_t *douts = calloc(n_clients + 1, sizeof(tx_output_t));
+        if (!douts ||
+            factory_compute_distribution_outputs_balanced(t, douts, n_clients + 1,
+                factory_distribution_fee(t, n_clients), lsp->dist_client_amounts,
+                lsp->dist_n_client_amounts) != n_clients) {
+            snprintf(why, why_len, "the distribution TX fee (%llu sat at %llu "
+                     "sat/kvB) and anchor do not fit in the LSP's share above "
+                     "the clients' channel capacities",
+                     (unsigned long long)factory_distribution_fee(t, n_clients),
+                     (unsigned long long)factory_distribution_fee_rate(t, n_clients));
+            ok = 0;
+        }
+        free(douts);
+    }
     if (rate_used) *rate_used = t->tree_fee_rate;
     factory_free(t);
     free(t);

@@ -2465,15 +2465,20 @@ int test_regtest_inversion_of_timeout_default(void) {
                     "no dist output pays the LSP's P2TR");
     }
 
-    /* Assert (C): each client's output is within 2 sats of (funding-fee)/N_clients.
-       (Remainder from integer division folds into output[0], up to N_clients-1.) */
+    /* Assert (C): each client is paid within rounding of
+       (funding - fee - anchor)/N_clients: the P2A anchor comes out of the
+       whole pool.  Output 0 also carries the anchor amount, which
+       factory_build_distribution_tx takes from it for the anchor output;
+       the integer-division remainder folds into output 0 too. */
     uint64_t budget = fund_amount - dist_fee;
-    uint64_t per_expected = budget / (N - 1);
+    uint64_t per_expected = (budget - ANCHOR_OUTPUT_AMOUNT) / (N - 1);
     uint64_t total_out = 0;
     for (size_t i = 0; i < n_dist; i++) {
-        uint64_t diff = (dist_outs[i].amount_sats > per_expected)
-            ? (dist_outs[i].amount_sats - per_expected)
-            : (per_expected - dist_outs[i].amount_sats);
+        uint64_t paid = dist_outs[i].amount_sats -
+                        (i == 0 ? (uint64_t)ANCHOR_OUTPUT_AMOUNT : 0);
+        uint64_t diff = (paid > per_expected)
+            ? (paid - per_expected)
+            : (per_expected - paid);
         TEST_ASSERT(diff <= (N - 1),
                     "client output within rounding of per_expected");
         total_out += dist_outs[i].amount_sats;

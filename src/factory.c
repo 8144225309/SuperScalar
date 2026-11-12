@@ -554,8 +554,27 @@ uint64_t factory_ps_chain_reserve(const factory_t *f) {
     return fee + (node_gets_anchor(f, 1) ? (uint64_t)ANCHOR_OUTPUT_AMOUNT : 0);
 }
 
+static uint64_t g_dist_non_truc_fee_rate = FACTORY_DIST_NON_TRUC_FEE_RATE;
+
+void factory_set_dist_non_truc_fee_rate(uint64_t sat_per_kvb) {
+    g_dist_non_truc_fee_rate = sat_per_kvb;
+}
+
+uint64_t factory_dist_non_truc_fee_rate(void) {
+    return g_dist_non_truc_fee_rate;
+}
+
+uint64_t factory_distribution_fee_rate(const factory_t *f, size_t n_clients) {
+    uint64_t r = factory_tree_fee_rate(f);
+    if (factory_distribution_tx_version(n_clients) != FACTORY_TREE_TX_VERSION &&
+        r < g_dist_non_truc_fee_rate)
+        r = g_dist_non_truc_fee_rate;
+    return r;
+}
+
 uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients) {
-    return factory_tree_tx_fee(f, 1, n_clients, 1);
+    return fee_presigned(factory_distribution_fee_rate(f, n_clients),
+                         fee_keypath_tx_vsize(1, n_clients, 1));
 }
 
 uint32_t factory_distribution_tx_version(size_t n_clients) {
@@ -2209,10 +2228,11 @@ int factory_check_presigned_fee_bounds(const factory_t *f, char *why,
         size_t n_clients = f->n_participants - 1;
         uint64_t dfee = factory_distribution_fee(f, n_clients);
         size_t dvsize = fee_keypath_tx_vsize(1, n_clients, 1);
-        if (dfee == FEE_INVALID || !fee_within_rate(dfee, rate, dvsize)) {
+        uint64_t drate = factory_distribution_fee_rate(f, n_clients);
+        if (dfee == FEE_INVALID || !fee_within_rate(dfee, drate, dvsize)) {
             snprintf(why, why_len, "distribution TX fee %llu sat for %zu vB does "
                      "not match the agreed %llu sat/kvB", (unsigned long long)dfee,
-                     dvsize, (unsigned long long)rate);
+                     dvsize, (unsigned long long)drate);
             return 0;
         }
         if (dfee > cap) {
@@ -4914,6 +4934,18 @@ int factory_session_complete_dist(factory_t *f) {
    Emits exactly (n_participants - 1) client outputs. Output index 0
    corresponds to participant 1 (first client), index 1 → participant 2,
    etc. The LSP (participant 0) is deliberately skipped. */
+/* Channel capacity of client ci (its channel output in its leaf); 0 when the
+   tree is not built. */
+static uint64_t dist_client_capacity(const factory_t *f, size_t ci) {
+    size_t node = 0;
+    uint32_t vout = 0;
+    if (f->n_nodes == 0 || !factory_client_to_leaf(f, ci, &node, &vout) ||
+        node >= f->n_nodes || !f->nodes[node].is_built ||
+        vout >= f->nodes[node].n_outputs)
+        return 0;
+    return f->nodes[node].outputs[vout].amount_sats;
+}
+
 size_t factory_compute_distribution_outputs(
     const factory_t *f,
     tx_output_t *outputs_out,
@@ -4923,9 +4955,26 @@ size_t factory_compute_distribution_outputs(
     if (!f || !outputs_out || f->n_participants < 2) return 0;
     size_t n_clients = f->n_participants - 1;
     if (max_outputs < n_clients) return 0;
-    if (f->funding_amount_sats <= fee_sats) return 0;
+    /* With the tree built, every client is paid its channel capacity plus an
+       equal share of the rest: a client in a shallower leaf has a larger
+       channel than an equal split of the funding would pay it. */
+    {
+        uint64_t cap[FACTORY_MAX_SIGNERS];
+        size_t have = 0;
+        for (size_t ci = 0; ci < n_clients && ci < FACTORY_MAX_SIGNERS; ci++) {
+            cap[ci] = dist_client_capacity(f, ci);
+            if (cap[ci] > 0) have++;
+        }
+        if (have == n_clients)
+            return factory_compute_distribution_outputs_balanced(
+                f, outputs_out, max_outputs, fee_sats, cap, n_clients);
+    }
+    /* No tree: an equal split.  The fee and the P2A anchor come out of the
+       whole pool, never out of one client. */
+    if (f->funding_amount_sats <= fee_sats ||
+        f->funding_amount_sats - fee_sats <= ANCHOR_OUTPUT_AMOUNT) return 0;
 
-    uint64_t budget = f->funding_amount_sats - fee_sats;
+    uint64_t budget = f->funding_amount_sats - fee_sats - ANCHOR_OUTPUT_AMOUNT;
     uint64_t per_client = budget / n_clients;
     uint64_t remainder = budget - per_client * n_clients;
 
@@ -4958,9 +5007,11 @@ size_t factory_compute_distribution_outputs(
 
     /* Fold integer-division remainder into the first client's output so
        the total never underpays — if any sats would be left stranded by
-       the division, the first client eats the surplus. */
-    if (n > 0 && remainder > 0)
-        outputs_out[0].amount_sats += remainder;
+       the division, the first client eats the surplus.  The anchor amount
+       goes on it too: factory_build_distribution_tx takes the anchor from
+       output 0, and it was already reserved from the pool above. */
+    if (n > 0)
+        outputs_out[0].amount_sats += remainder + ANCHOR_OUTPUT_AMOUNT;
 
     return n;
 }
@@ -4987,18 +5038,29 @@ size_t factory_compute_distribution_outputs_balanced(
     if (!f || !outputs_out || f->n_participants < 2) return 0;
     size_t n_clients = f->n_participants - 1;
     if (max_outputs < n_clients) return 0;
-    if (f->funding_amount_sats <= fee_sats) return 0;
+    if (f->funding_amount_sats <= fee_sats ||
+        f->funding_amount_sats - fee_sats <= ANCHOR_OUTPUT_AMOUNT) return 0;
 
     /* Sum requested client amounts; if they add up to less than the
        budget, split the surplus equally across clients (this absorbs the
        leaf L-stock shares that the account_limits don't account for).
-       If they add up to MORE than the budget (over-commit bug at factory
-       creation), scale proportionally so nothing overflows the funding. */
+       The fee and the anchor come out of what is left above the requested
+       amounts (the LSP's share): amounts that do not leave room for them
+       are refused, never scaled down -- every client gets its full
+       amount. */
     uint64_t requested = 0;
     for (size_t ci = 0; ci < n_client_amounts && ci < n_clients; ci++)
         requested += client_amounts[ci];
 
-    uint64_t budget = f->funding_amount_sats - fee_sats;
+    uint64_t budget = f->funding_amount_sats - fee_sats - ANCHOR_OUTPUT_AMOUNT;
+    if (requested > budget) {
+        fprintf(stderr, "factory: distribution TX refused: client amounts of %llu "
+                "sat leave less than its fee (%llu sat) and anchor out of the "
+                "%llu sat funding\n", (unsigned long long)requested,
+                (unsigned long long)fee_sats,
+                (unsigned long long)f->funding_amount_sats);
+        return 0;
+    }
 
     size_t n = 0;
     for (size_t i = 1; i < f->n_participants && n < n_clients; i++) {
@@ -5025,23 +5087,21 @@ size_t factory_compute_distribution_outputs_balanced(
 
         size_t ci = i - 1;
         uint64_t amt = (ci < n_client_amounts) ? client_amounts[ci] : 0;
-        if (requested > budget && requested > 0) {
-            amt = (amt * budget) / requested;  /* proportional scale-down */
-        }
         outputs_out[n].amount_sats = amt;
         n++;
     }
 
     /* Spread any surplus (budget > Σ client_amounts — the L-stock share)
-       equally across clients. Remainder of that division goes to first. */
-    if (n > 0 && requested <= budget) {
+       equally across clients. Remainder of that division goes to first,
+       with the anchor amount that factory_build_distribution_tx takes from
+       output 0 (already reserved from the surplus above). */
+    if (n > 0) {
         uint64_t surplus = budget - requested;
         uint64_t per = surplus / n;
         uint64_t rem = surplus - per * n;
         for (size_t j = 0; j < n; j++)
             outputs_out[j].amount_sats += per;
-        if (rem > 0)
-            outputs_out[0].amount_sats += rem;
+        outputs_out[0].amount_sats += rem + ANCHOR_OUTPUT_AMOUNT;
     }
 
     return n;
