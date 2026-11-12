@@ -346,7 +346,11 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
 /* Reconnect to LSP using persisted state from SQLite.
    Loads factory + channel from DB, sends MSG_RECONNECT, receives
    MSG_RECONNECT_ACK, re-exchanges nonces, then calls channel_cb.
-   Returns 1 on success. */
+   Returns 1 on success, 0 when the attempt failed or the connection was lost
+   (the caller may try again), and CLIENT_RECONNECT_REFUSED when the stored
+   factory does not load as the signed tree: every further attempt is
+   refused the same way, so the caller must stop. */
+#define CLIENT_RECONNECT_REFUSED (-1)
 int client_run_reconnect(secp256k1_context *ctx,
                            const secp256k1_keypair *keypair,
                            const char *host, int port,
