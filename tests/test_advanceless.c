@@ -265,6 +265,91 @@ static int al_reload_matches(persist_t *db, secp256k1_context *ctx, const factor
     return ok;
 }
 
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern void reverse_bytes(unsigned char *data, size_t len);
+
+/* Store, as the row of leaf state `node_idx`, a self-consistent variant of its
+   signed tx: 1000 sats moved out of its first output (so the row differs from
+   the rebuild, as an advanced leaf's does) and its input pointed at
+   prev_txid:prev_vout (internal order; NULL keeps the parent output).  The
+   row's txid, amounts and signed bytes agree with each other; its signature
+   is not checked here.  Writes the new txid (internal order) to txid_out. */
+static int al_craft_leaf_row(persist_t *db, const factory_t *f, size_t node_idx,
+                             const unsigned char *prev_txid, uint32_t prev_vout,
+                             unsigned char txid_out[32]) {
+    const factory_node_t *node = &f->nodes[node_idx];
+    size_t len = node->signed_tx.len;
+    if (len < 60) return 0;
+    unsigned char *b = malloc(len);
+    if (!b) return 0;
+    memcpy(b, node->signed_tx.data, len);
+    /* version | 00 01 | n_in=1 | prev(32) vout(4) | script 0 | seq(4) | n_out */
+    if (b[4] != 0 || b[5] != 1 || b[6] != 1 || b[43] != 0 || b[48] > 16) { free(b); return 0; }
+    if (prev_txid) {
+        memcpy(b + 7, prev_txid, 32);
+        for (int k = 0; k < 4; k++) b[39 + k] = (unsigned char)(prev_vout >> (8 * k));
+    }
+    uint64_t a0 = 0;
+    for (int k = 0; k < 8; k++) a0 |= (uint64_t)b[49 + k] << (8 * k);
+    a0 -= 1000;
+    for (int k = 0; k < 8; k++) b[49 + k] = (unsigned char)(a0 >> (8 * k));
+    size_t pos = 49;
+    for (int o = 0; o < b[48]; o++) {
+        pos += 8;
+        if (b[pos] >= 0xFD) { free(b); return 0; }
+        pos += 1 + b[pos];
+    }
+    size_t nw_len = 4 + (pos - 6) + 4;
+    unsigned char *nw = malloc(nw_len);
+    if (!nw) { free(b); return 0; }
+    memcpy(nw, b, 4);
+    memcpy(nw + 4, b + 6, pos - 6);
+    memcpy(nw + 4 + (pos - 6), b + len - 4, 4);
+    sha256_double(nw, nw_len, txid_out);
+    free(nw);
+    char amounts[16 * 21 + 1] = "";
+    for (size_t o = 0; o < node->n_outputs; o++) {
+        size_t off = strlen(amounts);
+        snprintf(amounts + off, sizeof(amounts) - off, "%s%llu", o ? "," : "",
+                 (unsigned long long)(o == 0 ? a0 : node->outputs[o].amount_sats));
+    }
+    unsigned char disp[32];
+    memcpy(disp, txid_out, 32);
+    reverse_bytes(disp, 32);
+    char txid_hex[65];
+    hex_encode(disp, 32, txid_hex);
+    char *tx_hex = malloc(len * 2 + 1);
+    if (!tx_hex) { free(b); return 0; }
+    hex_encode(b, len, tx_hex);
+    free(b);
+    sqlite3_stmt *st;
+    int ok = sqlite3_prepare_v2(db->db, "UPDATE tree_nodes SET txid = ?, signed_tx_hex = ?, "
+                                "output_amounts = ? WHERE factory_id = 0 AND node_index = ?;",
+                                -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(st, 1, txid_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, tx_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, amounts, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 4, (int)node_idx);
+        ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db->db) == 1;
+        sqlite3_finalize(st);
+    }
+    free(tx_hex);
+    return ok;
+}
+
+/* Load and return the in-memory txid of node `idx` (0 if the load fails). */
+static int al_load_node_txid(persist_t *db, secp256k1_context *ctx, size_t idx,
+                             unsigned char out[32]) {
+    factory_t *g = calloc(1, sizeof(*g));
+    if (!g) return 0;
+    int ok = persist_load_factory(db, 0, g, ctx) && idx < g->n_nodes;
+    if (ok) memcpy(out, g->nodes[idx].txid, 32);
+    if (g->nodes) factory_free(g);
+    free(g);
+    return ok;
+}
+
 static int al_load_refused(persist_t *db, secp256k1_context *ctx) {
     factory_t *g = calloc(1, sizeof(*g));
     if (!g) return 0;
@@ -361,6 +446,34 @@ int test_advanceless_persist_reload(void) {
             TEST_ASSERT(sqlite3_exec(db.db, "DELETE FROM tree_nodes;", NULL, NULL, NULL) == SQLITE_OK,
                         "drop the tree");
             AL_CHECK(al_load_refused(&db, ctx), "factory without a tree refused");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+            TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
+
+            /* A leaf state that moved on: what it may spend. */
+            size_t leaf = f->leaf_node_indices[1];
+            unsigned char crafted[32], loaded[32];
+            /* its parent's output (a re-allocation): loaded from its bytes */
+            TEST_ASSERT(al_craft_leaf_row(&db, f, leaf, NULL, 0, crafted), "craft (parent)");
+            AL_CHECK(al_load_node_txid(&db, ctx, leaf, loaded) &&
+                     memcmp(loaded, crafted, 32) == 0, "leaf spending its parent loads");
+            /* its own creation state (a chain advance) */
+            TEST_ASSERT(al_craft_leaf_row(&db, f, leaf, f->nodes[leaf].txid, 0, crafted),
+                        "craft (own chain)");
+            AL_CHECK(al_load_node_txid(&db, ctx, leaf, loaded) &&
+                     memcmp(loaded, crafted, 32) == 0, "leaf spending its own state loads");
+            /* anything else: another leaf's state, or an unknown outpoint */
+            TEST_ASSERT(al_craft_leaf_row(&db, f, leaf, f->nodes[f->leaf_node_indices[2]].txid,
+                                          0, crafted), "craft (other leaf)");
+            AL_CHECK(al_load_refused(&db, ctx), "leaf spending another leaf refused");
+            unsigned char junk[32];
+            memset(junk, 0x42, 32);
+            TEST_ASSERT(al_craft_leaf_row(&db, f, leaf, junk, 3, crafted), "craft (junk)");
+            AL_CHECK(al_load_refused(&db, ctx), "leaf spending an unknown output refused");
+            /* the parent's txid at another of its outputs */
+            TEST_ASSERT(al_craft_leaf_row(&db, f, leaf, f->nodes[f->nodes[leaf].parent_index].txid,
+                                          f->nodes[leaf].parent_vout + 1, crafted),
+                        "craft (wrong vout)");
+            AL_CHECK(al_load_refused(&db, ctx), "leaf spending its parent's other output refused");
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
         }

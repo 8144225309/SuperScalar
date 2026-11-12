@@ -2365,6 +2365,22 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
     return rc == SQLITE_DONE ? 1 : 0;
 }
 
+int persist_factory_is_closed(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT state FROM factories WHERE id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int closed = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *s = (const char *)sqlite3_column_text(stmt, 0);
+        closed = s && strcmp(s, "closed") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return closed;
+}
+
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
@@ -2537,6 +2553,39 @@ static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
     return 1;
 }
 
+/* 1 when `prev` (internal order) is the txid of a state of node `idx`'s own
+   chain that precedes its stored state `self` (internal order): a row of
+   ps_leaf_chains / ps_subfactory_chains with a lower chain_pos than the row
+   holding `self`. */
+static int prev_is_earlier_chain_state(persist_t *p, uint32_t factory_id,
+                                       const factory_node_t *node, size_t idx,
+                                       const unsigned char *self,
+                                       const unsigned char *prev) {
+    const char *sql = node->type == NODE_PS_SUBFACTORY
+        ? "SELECT chain_pos, txid FROM ps_subfactory_chains "
+          "WHERE factory_id = ? AND sub_node_idx = ? ORDER BY chain_pos;"
+        : "SELECT chain_pos, txid FROM ps_leaf_chains "
+          "WHERE factory_id = ? AND leaf_node_idx = ? ORDER BY chain_pos;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int(st, 2, (int)idx);
+    char self_hex[65], prev_hex[65];
+    unsigned char d[32];
+    memcpy(d, self, 32); reverse_bytes(d, 32); hex_encode(d, 32, self_hex);
+    memcpy(d, prev, 32); reverse_bytes(d, 32); hex_encode(d, 32, prev_hex);
+    long self_pos = -1, prev_pos = -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        long pos = (long)sqlite3_column_int64(st, 0);
+        const char *t = (const char *)sqlite3_column_text(st, 1);
+        if (!t) continue;
+        if (self_pos < 0 && strcmp(t, self_hex) == 0) self_pos = pos;
+        if (prev_pos < 0 && strcmp(t, prev_hex) == 0) prev_pos = pos;
+    }
+    sqlite3_finalize(st);
+    return self_pos >= 0 && prev_pos >= 0 && prev_pos < self_pos;
+}
+
 /* Check that the tree persist_load_factory just rebuilt is the signed tree
    the DB holds in tree_nodes, and make the signed bytes the source of truth.
 
@@ -2552,8 +2601,9 @@ static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
    node whose signed state legitimately moved on after creation (its stored
    nSequence or amounts differ from the rebuild): a state node of a tree with
    DW state (an advance), or a leaf or PS sub-factory state (a chain advance
-   or re-allocation; such a node may spend an earlier state of its own chain
-   instead of its parent).  A kickoff never moves on, and in a tree without DW
+   or re-allocation; such a node spends either its parent's stored output, or
+   its own creation state, or an earlier state of its own chain stored in
+   ps_leaf_chains / ps_subfactory_chains, and nothing else).  A kickoff never moves on, and in a tree without DW
    state no interior node does: a difference there refuses the load.  With
    hashlock L-stock poison a node with an L-stock output (and its subtree) is
    also compared by chain only, since its script commits to hashes the DB does
@@ -2666,17 +2716,27 @@ static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
     }
     /* The stored rows form one signed chain from the funding output. */
     for (size_t i = 0; ok && i < n; i++) {
-        if (!has_tx[i] || spends_own_chain[i]) continue;
+        if (!has_tx[i]) continue;
         int par = f->nodes[i].parent_index;
         const unsigned char *want = par < 0 ? f->funding_txid : stored_txid[par];
         uint32_t want_vout = par < 0 ? f->funding_vout : f->nodes[i].parent_vout;
-        if (par >= (int)n || memcmp(stx[i].prev_txid, want, 32) != 0 ||
-            stx[i].prev_vout != want_vout) {
-            bad = (long)i;
-            why = par < 0 ? "does not spend the factory funding output"
-                          : "does not spend its parent's stored output";
-            ok = 0;
-        }
+        if (par < (int)n && memcmp(stx[i].prev_txid, want, 32) == 0 &&
+            stx[i].prev_vout == want_vout)
+            continue;
+        /* A leaf or sub-factory state that moved on may instead spend its own
+           creation state (the rebuilt node) or an earlier stored state of its
+           own chain. */
+        if (spends_own_chain[i] &&
+            (memcmp(stx[i].prev_txid, f->nodes[i].txid, 32) == 0 ||
+             prev_is_earlier_chain_state(p, factory_id, &f->nodes[i], i,
+                                         stored_txid[i], stx[i].prev_txid)))
+            continue;
+        bad = (long)i;
+        why = par < 0 ? "does not spend the factory funding output"
+            : spends_own_chain[i]
+                ? "spends neither its parent's stored output nor an earlier state of its own chain"
+                : "does not spend its parent's stored output";
+        ok = 0;
     }
     size_t exempt = 0;
     for (size_t i = 0; ok && i < n; i++) {
