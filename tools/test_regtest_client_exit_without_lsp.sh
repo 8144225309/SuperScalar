@@ -30,6 +30,10 @@
 #               before it funds anything; the earliest allowed one is
 #               accepted by the LSP and by every member.
 #
+# After each drill the on-chain invariants are checked from the LSP's and the
+# members' databases (tools/invariants/check_chain.py; SS_CHECK_INVARIANTS=0
+# skips that).
+#
 # Run inside the regtest sandbox (REGTEST_CONF names a conf whose node this
 # script starts if it is not running).  Needs sqlite3.
 # Usage: test_regtest_client_exit_without_lsp.sh BUILD_DIR [SCENARIO...]
@@ -66,6 +70,15 @@ say()  { echo "[$(date +%T) h=$($BCLI getblockcount 2>/dev/null)] $*"; }
 fail() { echo "  FAIL: $*"; FAILS=$((FAILS + 1)); }
 pass() { echo "  ok: $*"; }
 stop() { kill -9 "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
+. "$(dirname "$0")/invariants/hook.sh"
+inv_check() { # DIR -- on-chain invariants of the drill in DIR
+    ss_invariants_on || return 0
+    if ss_check_invariants "$1" --conf "$REGTEST_CONF" --wallet $WALLET; then
+        pass "on-chain invariants hold (conservation, balances, revocation, exit)"
+    else
+        fail "on-chain invariants violated (see above)"
+    fi
+}
 mine() { $BCLI generatetoaddress "${1:-1}" "$MINE_ADDR" >/dev/null 2>&1 || true; }
 height() { $BCLI getblockcount; }
 client_sk() { printf "%064x" $(( $1 + 2 )); }
@@ -187,6 +200,7 @@ scenario_expiry() {
     grep -qa "non-final" "$d"/c*.log && fail "a client sent it before its nLockTime (non-final)" ||
         pass "no client sent it early"
     kill_clients
+    inv_check "$d"
 }
 
 scenario_expirywatch() {
@@ -215,6 +229,7 @@ scenario_expirywatch() {
     grep -q "still running" "$d/c0.log" && pass "$(grep -m1 -o "still running.*" "$d/c0.log")" ||
         fail "no report of what is still watched"
     kill_clients
+    inv_check "$d"
 }
 
 scenario_forceclose() {
@@ -246,6 +261,7 @@ scenario_forceclose() {
         pass "no tree node broadcast"
     [ "$(spender_of "${fund%:*}" "${fund#*:}")" = "$txid" ] &&
         pass "funding spent by the distribution TX" || fail "funding not spent by the distribution TX"
+    inv_check "$d"
 }
 
 scenario_rpcroot() {
@@ -273,6 +289,7 @@ scenario_rpcroot() {
         pass "the spent funding output was seen over HTTP RPC" ||
         fail "funding state not seen: $(grep -m1 "distribution TX" "$d/fc1.log" | cut -c1-140)"
     [ "$(confs "$txid")" = -1 ] && pass "no distribution TX on chain" || fail "distribution TX on chain"
+    inv_check "$d"
 }
 
 scenario_sweep() {
@@ -315,6 +332,7 @@ scenario_sweep() {
             fail "client $i sweep: $(grep -aE "ERROR|Sweep:" "$d/sweep$i.log" | tail -2 | tr '\n' ' ')"
         fi
     done
+    inv_check "$d"
 }
 
 scenario_cltv() {

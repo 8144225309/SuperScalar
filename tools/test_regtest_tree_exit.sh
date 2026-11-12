@@ -51,6 +51,10 @@
 # GRIEF=wallet: the same with children funded from a third party's own bitcoind
 # wallet; needs TREE_FEE_RATE > 0), AMOUNT, PORT.
 #
+# After the exit the on-chain invariants are checked from the LSP's and the
+# members' databases (tools/invariants/check_chain.py; SS_CHECK_INVARIANTS=0
+# skips it).
+#
 # Also checked on every run: no tree tx is ever in the mempool on an
 # unconfirmed parent (TRUC: that would take the parent's only descendant slot,
 # which its CPFP child needs); every tree tx and the co-signed distribution TX
@@ -108,6 +112,7 @@ trap cleanup EXIT
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
 fail(){ red "FAIL: $*"; exit 1; }
+. "$(dirname "$0")/invariants/hook.sh"
 mine(){ $BCLI -rpcwallet=$WALLET generatetoaddress "${1:-1}" "$MINE_ADDR" >/dev/null 2>&1 || true; }
 sk(){ printf "00000000000000000000000000000000000000000000000000000000000000%02x" $(( $1 + 2 )); }
 confs(){ $BCLI getrawtransaction "$1" true 2>/dev/null | python3 -c "import json,sys
@@ -531,6 +536,13 @@ if [ "$SWEEP" = 1 ] && [ "$OK" = 1 ]; then
         [ "$(confs "$st")" -ge 1 ] && [ "$sv" -gt 0 ] && [ "$sv" -lt "${CLOCAL[$i]}" ] && NSW=$((NSW+1)) || OK=0
     done
     echo "  to_local swept: $NSW/$NEX"
+fi
+if ss_invariants_on; then
+    if ss_check_invariants "$TMPDIR" --conf "$REGTEST_CONF" --wallet "$WALLET"; then
+        echo "  on-chain invariants hold (conservation, balances, revocation, exit)"
+    else
+        red "  on-chain invariants violated (see above)"; OK=0
+    fi
 fi
 if [ "$OK" = 1 ]; then
     green "PASS: tree exit (arity=$ARITY clients=$N_CLIENTS tree_fee_rate=$TREE_FEE_RATE minrelay=$MINRELAY wallet=$CLIENT_WALLET nowallet='$NOWALLET' solo=$SOLO client_fee_est=${CLIENT_FEE_EST:-none} grief=$GRIEF sweep=$SWEEP): $TC/${#TREE[@]} tree txs + $CC commitments confirmed, balances paid, $CHU idle channels intact, $PKG CPFP packages ($TREE_PKG tree, $ANCHOR_ONLY anchor-only children)"

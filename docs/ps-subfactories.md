@@ -157,6 +157,17 @@ Shipping the foundation first lets reviewers evaluate the data
 structures + tree shape against the t/1242 spec before the dynamic
 extension ceremony commits to a particular protocol direction.
 
+## Double-spend defense on chain extensions
+
+A sub-factory chain[N+1] spends every output of chain[N] and is not
+revocable, and the LSP chooses which channel grows and by how much.  The
+client therefore records each input it signs in `client_ps_signed_inputs`
+before its partial signatures leave the process, and refuses to sign a
+different spend of any recorded outpoint — the PS leaf's record-and-refuse
+rule, applied per input.  Details, including multi-input atomicity and the
+crash points: `docs/pseudo-spilman.md`, "Sub-factory chain advances:
+per-input record".
+
 ## Cross-references
 
 - `docs/pseudo-spilman.md` — the existing 1-client-per-leaf design
