@@ -29,3 +29,16 @@ With `--db-dir`, the checker reads `lsp.db` and `c<N>.db` from that
 directory. It writes a JSON report to stdout, or to the file given with
 `--json`. The summary and any violations go to stderr. It exits 0 when every
 check passes, 1 on a violation, and 2 on a usage or RPC error.
+
+## In the scenario scripts
+
+The following scripts source `hook.sh` and run the checker at the end of each
+drill:
+
+- `test_regtest_advanceless.sh`
+- `test_regtest_client_exit_without_lsp.sh`
+- `test_regtest_tree_exit.sh`
+
+A violation fails the scenario. The report is written to
+`invariants.json` in the drill directory. Set `SS_CHECK_INVARIANTS=0` to skip
+the check.
