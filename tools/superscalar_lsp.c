@@ -4551,7 +4551,8 @@ accept_new_factory:
         strncpy(g_admin_rpc.network, network, sizeof(g_admin_rpc.network) - 1);
     }
     int channels_active = 0;
-    uint64_t init_local = 0, init_remote = 0;
+    /* Initial balance of every channel: the channels do not all start with the same split. */
+    uint64_t init_local_ch[LSP_MAX_CLIENTS] = {0}, init_remote_ch[LSP_MAX_CLIENTS] = {0};
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
@@ -4833,8 +4834,10 @@ accept_new_factory:
 
         /* Capture initial balances before demo (for breach test) */
         if ((breach_test || test_expiry) && mgr->n_channels > 0) {
-            init_local = mgr->entries[0].channel.local_amount;
-            init_remote = mgr->entries[0].channel.remote_amount;
+            for (size_t q = 0; q < mgr->n_channels && q < LSP_MAX_CLIENTS; q++) {
+                init_local_ch[q] = mgr->entries[q].channel.local_amount;
+                init_remote_ch[q] = mgr->entries[q].channel.remote_amount;
+            }
         }
 
         if (demo_mode) {
