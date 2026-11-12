@@ -260,7 +260,7 @@ def test_dw_advance():
     """--demo --test-dw-advance: advance DW counter, re-sign tree, force-close."""
     print(f"\n{ts()} === TEST: --demo --test-dw-advance ===")
     addr = rpc('getnewaddress', '', 'bech32m', wallet=WALLET)
-    rc, log = run_lsp(['--demo', '--test-dw-advance'], mine_addr=addr, timeout=180)
+    rc, log = run_lsp(['--arity', '3', '--demo', '--test-dw-advance'], mine_addr=addr, timeout=180)
     has_before = 'before advance' in log.lower()
     has_after = 'after advance' in log.lower()
     has_confirm = 'confirmed' in log.lower()

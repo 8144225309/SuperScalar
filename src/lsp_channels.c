@@ -8437,6 +8437,8 @@ int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                            int allow_live_channel) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
+    if (factory_refuses_refresh_in_place(f, "LSP: root tick"))
+        return -1;
     if (!allow_live_channel) {
         int c = first_open_channel(mgr, f, 1, 0);
         if (c >= 0) {

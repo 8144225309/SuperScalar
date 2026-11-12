@@ -767,6 +767,44 @@ int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
                              const unsigned char sighash[32]);
 extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in production */
 
+/* 1 if some built state transaction counts down on a Decker-Wattenhofer
+   layer (a relative lock that a refresh in place can shorten).  0 for an
+   advanceless tree (every interior level static, pseudo-Spilman leaves),
+   where an advance or a rollover changes no transaction. */
+int factory_has_dw_state(const factory_t *f);
+
+/* The advanceless shape for n_clients: every interior level static
+   (kickoff only, no DW state), one member per pseudo-Spilman leaf.
+     depth d    = fewest fan-out levels such that 15^d >= n_clients (15
+                  children per node: FACTORY_MAX_OUTPUTS less the anchor);
+     fan-out a  = the smallest a >= 4 with a^d >= n_clients (the narrowest
+                  fan-out that reaches every client in d levels, so no node
+                  carries more outputs than it needs);
+     arities    = d entries of a, then 3 (PS leaves);
+     static     = d (--static-near-root: every level above the leaves).
+   e.g. 4 -> "4,3" static 1, 64 -> "8,8,3" static 2, 255 -> "7,7,7,3" static 3.
+   A single client gets "3" static 0 (the root is its leaf).  Writes
+   d + 1 entries to arities_out; returns 1, or 0 for n_clients == 0 or a
+   shape that would not fit FACTORY_MAX_LEVELS. */
+int factory_advanceless_shape(size_t n_clients,
+                              uint8_t arities_out[FACTORY_MAX_LEVELS],
+                              size_t *n_arities_out,
+                              uint32_t *static_near_root_out);
+
+/* The one refusal for extending a factory's life in place. */
+#define FACTORY_EXTEND_REFUSED_MSG \
+    "refused: this factory has no Decker-Wattenhofer state layer, so its " \
+    "root cannot advance or roll over; its life is extended only by " \
+    "rotating to a new factory (a new funding output)"
+
+/* Logs FACTORY_EXTEND_REFUSED_MSG prefixed with `who` and returns 1 when
+   factory_has_dw_state(f) is 0; returns 0 (nothing logged) otherwise.
+   Every refresh-in-place entry point (root tick, whole-counter advance,
+   leaf rollover) checks it first. */
+int factory_refuses_refresh_in_place(const factory_t *f, const char *who);
+
+/* Advance the whole DW counter and re-sign every node.  Refused (returns 0)
+   for a factory without DW state (factory_refuses_refresh_in_place). */
 int factory_advance(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
@@ -786,7 +824,8 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
    by block-height progression instead.  Caller (LSP) wires this into a
    block-polling loop and runs Tier B on rc=-1.
    Returns -1 on epoch rollover (trees rebuilt; run Tier B);
-   0 otherwise (no rollover or fully exhausted). */
+   0 otherwise (no rollover or fully exhausted).  A factory without DW state
+   is refused: 0, nothing changed (factory_refuses_refresh_in_place). */
 int factory_tick_root(factory_t *f);
 
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242 k² PS).
