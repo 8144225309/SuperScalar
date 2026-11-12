@@ -929,6 +929,21 @@ static int lsp_send_initial_commitment(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
 
+    /* Each member refuses a split other than the one FACTORY_PROPOSE stated
+       (lsp_opening_balance_pct): the channel manager must use the same. */
+    {
+        uint16_t pct = lsp_opening_balance_pct(lsp);
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            const channel_t *ch = &mgr->entries[c].channel;
+            uint64_t usable = ch->local_amount + ch->remote_amount;
+            if (ch->local_amount != usable * pct / 100)
+                fprintf(stderr, "LSP: WARNING channel %zu opens LSP %llu / member %llu, "
+                        "not the proposed %u%% split; the member will refuse it\n",
+                        c, (unsigned long long)ch->local_amount,
+                        (unsigned long long)ch->remote_amount, (unsigned)pct);
+        }
+    }
+
     /* Phase 1: batch-send CHANNEL_READY + SCID + nonces to ALL clients */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];

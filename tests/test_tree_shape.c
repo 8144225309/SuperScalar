@@ -11,6 +11,8 @@
 #include "superscalar/dw_state.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
+#include "superscalar/musig.h"
+#include "superscalar/persist.h"
 #include <secp256k1_schnorrsig.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -854,5 +856,585 @@ int test_tree_shape_placement_setter(void) {
     TEST_ASSERT_EQ(t.f->placement_mode, PLACEMENT_TIMEZONE_CLUSTER, "refused mode changes nothing");
     TEST_ASSERT(factory_build_tree(t.f), "build");
     ts_close(&t);
+    return 1;
+}
+
+
+/* ---- Member to leaf under placement ---- */
+
+/* factory_client_to_leaf finds each member's channel where the placement
+   put it: the leaf (or PS sub-factory) whose signers include the member,
+   at the member's slot.  Profiles here make the timezone-cluster placement
+   reverse the members. */
+int test_tree_shape_client_to_leaf_placement(void) {
+    static const ts_shape_t shapes[] = {
+        { "N=6 arity 2", 6, {2}, 1, 0, 1, 1000, 0, 0 },
+        { "N=5 arity 2", 5, {2}, 1, 0, 0, 0, 0, 0 },
+        { "N=4 arity 1", 4, {1}, 1, 0, 1, 1000, 0, 0 },
+        { "N=4 PS", 4, {3}, 1, 0, 1, 1000, 0, 0 },
+        { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 },
+        { "N=8 2,4", 8, {2, 4}, 2, 0, 1, 1000, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const ts_shape_t *s = &shapes[i];
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
+        factory_t *f = t.f;
+        for (size_t p = 1; p < f->n_participants; p++)
+            f->profiles[p].timezone_bucket = (uint8_t)(20 - p);
+        unsigned char spk[34], txid[32];
+        memset(txid, 0xAA, 32);
+        TEST_ASSERT(factory_set_placement_mode(f, PLACEMENT_TIMEZONE_CLUSTER) &&
+                    factory_compute_funding_spk(f, spk) &&
+                    factory_set_funding(f, txid, 0, f->funding_amount_sats, spk, 34),
+                    "fund");
+        TEST_ASSERT(factory_build_tree(f), s->name);
+        for (size_t c = 0; c < s->n_clients; c++) {
+            size_t ni;
+            uint32_t vout;
+            if (!factory_client_to_leaf(f, c, &ni, &vout)) {
+                printf("  %s: member %zu not found\n", s->name, c + 1);
+                return 0;
+            }
+            const factory_node_t *n = &f->nodes[ni];
+            if (vout + 1 >= n->n_signers || n->signer_indices[vout + 1] != c + 1) {
+                printf("  %s: member %zu mapped to node %zu vout %u (signer %u)\n",
+                       s->name, c + 1, ni, vout,
+                       vout + 1 < n->n_signers ? n->signer_indices[vout + 1] : 0);
+                return 0;
+            }
+        }
+        ts_close(&t);
+    }
+    return 1;
+}
+
+
+/* ---- Caller channel scripts ---- */
+
+/* Key-path-only P2TR (BIP-86 tweak) of the MuSig2 key of pks, in this order. */
+static int ts_keypath_spk(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                          size_t n, unsigned char spk[34]) {
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, n)) return 0;
+    unsigned char internal[32], tweak[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal, &ka.agg_pubkey)) return 0;
+    sha256_tagged("TapTweak", internal, 32, tweak);
+    secp256k1_pubkey full;
+    secp256k1_xonly_pubkey out;
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &full, &ka.agg_pubkey, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &out, NULL, &full))
+        return 0;
+    build_p2tr_script_pubkey(spk, &out);
+    return 1;
+}
+
+/* A P2TR the factory knows nothing about (a key outside the factory). */
+static int ts_foreign_spk(secp256k1_context *ctx, unsigned char tag, unsigned char spk[34]) {
+    unsigned char sk[32];
+    memset(sk, tag, 32);
+    secp256k1_keypair kp;
+    secp256k1_pubkey pk;
+    return secp256k1_keypair_create(ctx, &kp, sk) &&
+           secp256k1_keypair_pub(ctx, &pk, &kp) &&
+           ts_keypath_spk(ctx, &pk, 1, spk);
+}
+
+/* Not setting a channel script (or clearing one) builds every pinned shape
+   exactly as before; the setter refuses anything but a member's P2TR. */
+int test_tree_shape_channel_spk_default(void) {
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(ts_pinned) / sizeof(ts_pinned[0]); i++) {
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, &ts_pinned[i].s, 0), "setup");
+        TEST_ASSERT(t.f->chan_spks == NULL, "no channel scripts by default");
+        unsigned char spk[34];
+        TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+        TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 1, spk, 34), "set");
+        TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 1, NULL, 0), "clear");
+        char hex[65];
+        if (!factory_build_tree(t.f)) {
+            printf("\n    %s: build failed", ts_pinned[i].s.name);
+            bad++;
+        } else {
+            ts_digest(t.f, hex);
+            if (strcmp(hex, ts_pinned[i].digest) != 0) {
+                printf("\n    %s: digest %s", ts_pinned[i].s.name, hex);
+                bad++;
+            }
+        }
+        ts_close(&t);
+    }
+    if (bad) printf("\n");
+    TEST_ASSERT_EQ(bad, 0, "default channel scripts keep the pinned txids");
+
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    unsigned char spk[34], bad_spk[34];
+    TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+    unsigned char p2wsh[34] = { 0x00, 0x20 };
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, p2wsh, 34), "P2WSH refused");
+    memcpy(bad_spk, spk, 34); bad_spk[1] = 0x21;
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, bad_spk, 34), "OP_1 <33> refused");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, spk, 33), "33 bytes refused");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, spk, 35), "35 bytes refused");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 0, spk, 34), "the LSP has no channel");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 5, spk, 34), "not a member");
+    TEST_ASSERT(t.f->chan_spks == NULL, "refused scripts store nothing");
+    ts_close(&t);
+    return 1;
+}
+
+/* Signature over node's signed tx (key-path witness) against output key
+   spk[2..34) and the BIP-341 sighash of spending prev_spk / prev_amount. */
+static int ts_keypath_sig_ok(secp256k1_context *ctx, const factory_node_t *node,
+                             const unsigned char *prev_spk, uint64_t prev_amount) {
+    unsigned char sighash[32], sig[64];
+    if (node->signed_tx.len < 70) return 0;
+    if (!compute_taproot_sighash(sighash, node->unsigned_tx.data, node->unsigned_tx.len,
+                                 0, prev_spk, 34, prev_amount, node->nsequence))
+        return 0;
+    memcpy(sig, node->signed_tx.data + node->signed_tx.len - 68, 64);
+    secp256k1_xonly_pubkey key;
+    if (!secp256k1_xonly_pubkey_parse(ctx, &key, prev_spk + 2)) return 0;
+    return secp256k1_schnorrsig_verify(ctx, sig, sighash, 32, &key);
+}
+
+/* A member's channel script is used verbatim as its channel output, the
+   other members keep the default, and the tree signs and verifies.  On a
+   one-member PS leaf the chain extension spends that output: it is built
+   over the script and signed by key path over its MuSig2 key. */
+int test_tree_shape_channel_spk_verbatim(void) {
+    static const ts_shape_t shapes[] = {
+        { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 },
+        { "N=3 arity 1", 3, {1}, 1, 0, 1, 1000, 0, 0 },
+        { "N=8 2,4", 8, {2, 4}, 2, 0, 1, 1000, 0, 0 },
+        { "N=5 arity 2 no cltv", 5, {2}, 1, 0, 0, 0, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const ts_shape_t *s = &shapes[i];
+        ts_tree_t ref, t;
+        TEST_ASSERT(ts_open(&ref, s) && ref.built, s->name);
+        TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
+        unsigned char spk[34];
+        TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+        TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 2, spk, 34), "set member 2");
+        TEST_ASSERT(factory_build_tree(t.f), s->name);
+        for (size_t c = 0; c < s->n_clients; c++) {
+            size_t ni, rni;
+            uint32_t vout, rvout;
+            TEST_ASSERT(factory_client_to_leaf(t.f, c, &ni, &vout) &&
+                        factory_client_to_leaf(ref.f, c, &rni, &rvout), "leaf");
+            const tx_output_t *o = &t.f->nodes[ni].outputs[vout];
+            const tx_output_t *r = &ref.f->nodes[rni].outputs[rvout];
+            TEST_ASSERT_EQ(o->script_pubkey_len, 34, "channel script length");
+            TEST_ASSERT_EQ(o->amount_sats, r->amount_sats, "channel amount unchanged");
+            if (c + 1 == 2)
+                TEST_ASSERT(memcmp(o->script_pubkey, spk, 34) == 0, "script verbatim");
+            else
+                TEST_ASSERT(memcmp(o->script_pubkey, r->script_pubkey, 34) == 0,
+                            "other members keep the default");
+        }
+        TEST_ASSERT(factory_sign_all(t.f) && factory_verify_all(t.f), "sign + verify");
+        ts_close(&t);
+        ts_close(&ref);
+    }
+
+    /* One-member PS leaves: member 1 in key order (LSP, member), member 2 in
+       (member, LSP). */
+    ts_shape_t ps = { "N=4 PS anchors cltv", 4, {3}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &ps, 0), "PS setup");
+    factory_t *f = t.f;
+    unsigned char spk1[34], spk2[34];
+    secp256k1_pubkey o1[2] = { f->pubkeys[0], f->pubkeys[1] };
+    secp256k1_pubkey o2[2] = { f->pubkeys[2], f->pubkeys[0] };
+    TEST_ASSERT(ts_keypath_spk(t.ctx, o1, 2, spk1) && ts_keypath_spk(t.ctx, o2, 2, spk2), "keys");
+    TEST_ASSERT(factory_set_leaf_channel_spk(f, 1, spk1, 34) &&
+                factory_set_leaf_channel_spk(f, 2, spk2, 34), "set");
+    TEST_ASSERT(factory_build_tree(f), "PS build");
+    TEST_ASSERT(factory_sign_all(f) && factory_verify_all(f), "PS sign + verify");
+    for (uint32_t m = 1; m <= 2; m++) {
+        const unsigned char *want = m == 1 ? spk1 : spk2;
+        size_t ni;
+        uint32_t vout;
+        TEST_ASSERT(factory_client_to_leaf(f, m - 1, &ni, &vout), "leaf");
+        factory_node_t *node = &f->nodes[ni];
+        TEST_ASSERT(node->is_ps_leaf && vout == 0, "PS channel at vout 0");
+        TEST_ASSERT(memcmp(node->outputs[0].script_pubkey, want, 34) == 0, "PS script verbatim");
+        int side = -1;
+        for (int l = 0; l < f->n_leaf_nodes; l++)
+            if (f->leaf_node_indices[l] == ni) side = l;
+        TEST_ASSERT(side >= 0, "leaf side");
+        unsigned char prev_txid[32];
+        memcpy(prev_txid, node->txid, 32);
+        uint64_t prev_amount = node->outputs[0].amount_sats;
+        for (int step = 0; step < 2; step++) {
+            TEST_ASSERT_EQ(factory_advance_leaf_unsigned(f, side), 1, "chain extension");
+            TEST_ASSERT(memcmp(node->ps_prev_txid, prev_txid, 32) == 0,
+                        "extension spends the previous chain tx");
+            TEST_ASSERT(memcmp(node->outputs[0].script_pubkey, want, 34) == 0,
+                        "extension pays the same script");
+            TEST_ASSERT(factory_sign_node(f, ni), "sign extension");
+            TEST_ASSERT(ts_keypath_sig_ok(t.ctx, node, want, prev_amount),
+                        "extension signature verifies against the channel script");
+            TEST_ASSERT(factory_verify_all(f), "verify all");
+            memcpy(prev_txid, node->txid, 32);
+            prev_amount = node->outputs[0].amount_sats;
+        }
+    }
+    ts_close(&t);
+
+    /* PS: a script the leaf's signers cannot spend, and any script on a k > 1
+       sub-factory leaf, are refused at build. */
+    TEST_ASSERT(ts_open_b(&t, &ps, 0), "PS setup");
+    unsigned char foreign[34];
+    TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, foreign), "script");
+    TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 3, foreign, 34), "set");
+    TEST_ASSERT(!factory_build_tree(t.f), "PS refuses a foreign channel key");
+    ts_close(&t);
+    ts_shape_t psk = { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 };
+    TEST_ASSERT(ts_open_b(&t, &psk, 0), "PS k=2 setup");
+    secp256k1_pubkey o3[2] = { t.f->pubkeys[0], t.f->pubkeys[3] };
+    TEST_ASSERT(ts_keypath_spk(t.ctx, o3, 2, spk1), "key");
+    TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 3, spk1, 34), "set");
+    TEST_ASSERT(!factory_build_tree(t.f), "sub-factory leaves take no channel script");
+    ts_close(&t);
+    return 1;
+}
+
+
+/* ---- Per-member channel capacities ---- */
+
+/* Capacity of participant p in the capacity tests: unequal, every one
+   different. */
+static uint64_t ts_cap(size_t p) { return 20000 + 7919 * (uint64_t)p; }
+
+/* Set capacities (and stock) and fund the factory at exactly what they need. */
+static int ts_set_caps(factory_t *f, uint64_t stock) {
+    size_t n = f->n_participants - 1;
+    uint64_t *caps = calloc(n, sizeof(*caps));
+    if (!caps) return 0;
+    for (size_t i = 0; i < n; i++) caps[i] = ts_cap(i + 1);
+    int ok = factory_set_member_capacities(f, caps, n) && factory_set_leaf_stock(f, stock);
+    free(caps);
+    uint64_t amount;
+    unsigned char spk[34], txid[32];
+    memset(txid, 0xAA, 32);
+    return ok && factory_capacity_funding_amount(f, &amount) &&
+           factory_compute_funding_spk(f, spk) &&
+           factory_set_funding(f, txid, 0, amount, spk, 34);
+}
+
+/* Value conservation: every node's input is its outputs plus the fee. */
+static int ts_conserves(const factory_t *f) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *n = &f->nodes[i];
+        uint64_t in = n->parent_index < 0 ? f->funding_amount_sats
+                    : f->nodes[n->parent_index].outputs[n->parent_vout].amount_sats;
+        uint64_t out = 0;
+        for (size_t o = 0; o < n->n_outputs; o++) out += n->outputs[o].amount_sats;
+        if (in != out + n->fee_sats) return 0;
+    }
+    return 1;
+}
+
+/* Not setting capacities (or clearing them) builds every pinned shape as
+   before; the setters refuse a wrong count, dust and below-dust stock. */
+int test_tree_shape_capacity_default(void) {
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(ts_pinned) / sizeof(ts_pinned[0]); i++) {
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, &ts_pinned[i].s, 0), "setup");
+        TEST_ASSERT(t.f->member_capacity == NULL, "no capacities by default");
+        size_t n = t.f->n_participants - 1;
+        uint64_t *caps = calloc(n, sizeof(*caps));
+        TEST_ASSERT(caps != NULL, "alloc");
+        for (size_t c = 0; c < n; c++) caps[c] = 10000;
+        TEST_ASSERT(factory_set_member_capacities(t.f, caps, n), "set");
+        free(caps);
+        TEST_ASSERT(factory_set_member_capacities(t.f, NULL, 0), "clear");
+        char hex[65];
+        if (!factory_build_tree(t.f)) {
+            printf("\n    %s: build failed", ts_pinned[i].s.name);
+            bad++;
+        } else {
+            ts_digest(t.f, hex);
+            if (strcmp(hex, ts_pinned[i].digest) != 0) {
+                printf("\n    %s: digest %s", ts_pinned[i].s.name, hex);
+                bad++;
+            }
+        }
+        ts_close(&t);
+    }
+    if (bad) printf("\n");
+    TEST_ASSERT_EQ(bad, 0, "default capacities keep the pinned txids");
+
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    uint64_t caps[5] = { 30000, 40000, 50000, 60000, 70000 };
+    TEST_ASSERT(!factory_set_member_capacities(t.f, caps, 3), "3 capacities for 4 members");
+    TEST_ASSERT(!factory_set_member_capacities(t.f, caps, 5), "5 capacities for 4 members");
+    caps[2] = CHANNEL_DUST_LIMIT_SATS - 1;
+    TEST_ASSERT(!factory_set_member_capacities(t.f, caps, 4), "dust capacity refused");
+    TEST_ASSERT(t.f->member_capacity == NULL, "refused capacities store nothing");
+    TEST_ASSERT(!factory_set_leaf_stock(t.f, CHANNEL_DUST_LIMIT_SATS - 1), "dust stock refused");
+    uint64_t amount;
+    TEST_ASSERT(!factory_capacity_funding_amount(t.f, &amount), "no amount without capacities");
+    ts_close(&t);
+    return 1;
+}
+
+/* With capacities every member's channel output is its capacity, every leaf
+   stock the configured stock, every node conserves value, the funding is
+   exactly what the tree needs, and the tree signs and verifies.  A funding
+   output of any other amount, and PS sub-factory leaves, are refused.  The
+   distribution TX pays each member its full capacity plus its leaf's stock
+   share. */
+int test_tree_shape_capacity_build(void) {
+    static const ts_shape_t shapes[] = {
+        { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 },
+        { "N=5 arity 2", 5, {2}, 1, 0, 0, 0, 0, 0 },
+        { "N=3 arity 1", 3, {1}, 1, 0, 1, 1000, 0, 0 },
+        { "N=6 PS", 6, {3}, 1, 0, 1, 1000, 0, 0 },
+        { "N=8 2,4", 8, {2, 4}, 2, 0, 1, 1000, 0, 0 },
+        { "N=12 2,4 static 1", 12, {2, 4}, 2, 1, 1, 1000, 0, 0 },
+        { "N=7 3,4 static 1", 7, {3, 4}, 2, 1, 1, 1000, 0, 0 },
+        { "N=12 timezone ties", 12, {2}, 1, 0, 0, 0, 0, 1 },
+    };
+    const uint64_t stock = 25000;
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const ts_shape_t *s = &shapes[i];
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
+        factory_t *f = t.f;
+        TEST_ASSERT(ts_set_caps(f, stock), s->name);
+        TEST_ASSERT(factory_build_tree(f), s->name);
+        for (size_t c = 0; c < s->n_clients; c++) {
+            size_t ni;
+            uint32_t vout;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vout), "leaf");
+            TEST_ASSERT_EQ(f->nodes[ni].outputs[vout].amount_sats, ts_cap(c + 1),
+                           "channel output is the member's capacity");
+        }
+        for (int l = 0; l < f->n_leaf_nodes; l++) {
+            const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[l]];
+            size_t stock_vout = leaf->n_signers - 1;   /* after the channels */
+            TEST_ASSERT_EQ(leaf->outputs[stock_vout].amount_sats, stock, "leaf stock");
+        }
+        TEST_ASSERT(ts_conserves(f), "every node conserves value");
+        TEST_ASSERT(factory_sign_all(f) && factory_verify_all(f), "sign + verify");
+
+        tx_output_t outs[FACTORY_MAX_SIGNERS + 1];
+        uint64_t dist_fee = factory_distribution_fee(f, s->n_clients);
+        size_t nd = factory_compute_distribution_outputs_balanced(
+            f, outs, FACTORY_MAX_SIGNERS + 1, dist_fee, NULL, 0);
+        TEST_ASSERT_EQ(nd, s->n_clients, "one distribution output per member");
+        /* The rule: capacities first; the rest pays the stock shares (pro
+           rata when it cannot pay them all) and then an equal split; member 1
+           also carries the anchor the distribution TX takes from output 0. */
+        uint64_t budget = f->funding_amount_sats - dist_fee - factory_tree_anchor_sats(f);
+        uint64_t caps_sum = 0, share[FACTORY_MAX_SIGNERS] = {0}, shares = 0;
+        for (size_t c = 0; c < s->n_clients; c++) caps_sum += ts_cap(c + 1);
+        for (int l = 0; l < f->n_leaf_nodes; l++) {
+            const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[l]];
+            size_t m = leaf->n_signers - 1;
+            for (size_t j = 1; j < leaf->n_signers; j++)
+                share[leaf->signer_indices[j] - 1] += stock / m + (j == 1 ? stock % m : 0);
+            shares += stock;
+        }
+        TEST_ASSERT(budget >= caps_sum, "budget covers the capacities");
+        uint64_t rest = budget - caps_sum, given = 0;
+        if (rest < shares) {
+            for (size_t c = 0; c < s->n_clients; c++) {
+                share[c] = share[c] * rest / shares;
+                given += share[c];
+            }
+            share[0] += rest - given;
+            rest = 0;
+        } else {
+            rest -= shares;
+        }
+        uint64_t total = 0;
+        for (size_t c = 0; c < s->n_clients; c++) {
+            uint64_t want = ts_cap(c + 1) + share[c] + rest / s->n_clients +
+                            (c == 0 ? rest % s->n_clients + factory_tree_anchor_sats(f) : 0);
+            TEST_ASSERT_EQ(outs[c].amount_sats, want,
+                           "full capacity + leaf stock share + equal rest");
+            TEST_ASSERT(outs[c].amount_sats >= ts_cap(c + 1), "never below capacity");
+            total += outs[c].amount_sats;
+        }
+        TEST_ASSERT_EQ(total, f->funding_amount_sats - dist_fee, "distribution total");
+        ts_close(&t);
+    }
+
+    /* Funding one sat off what the capacities need is refused. */
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    TEST_ASSERT(ts_set_caps(t.f, 0), "caps, default stock");
+    unsigned char spk[34], txid[32];
+    memset(txid, 0xAA, 32);
+    TEST_ASSERT(factory_compute_funding_spk(t.f, spk), "spk");
+    uint64_t need = t.f->funding_amount_sats;
+    TEST_ASSERT(factory_set_funding(t.f, txid, 0, need + 1, spk, 34), "fund +1");
+    TEST_ASSERT(!factory_build_tree(t.f), "one sat over refused");
+    TEST_ASSERT(factory_set_funding(t.f, txid, 0, need - 1, spk, 34), "fund -1");
+    TEST_ASSERT(!factory_build_tree(t.f), "one sat under refused");
+    TEST_ASSERT(factory_set_funding(t.f, txid, 0, need, spk, 34), "fund exact");
+    TEST_ASSERT(factory_build_tree(t.f), "exact funding builds");
+    size_t ni;
+    uint32_t vout;
+    TEST_ASSERT(factory_client_to_leaf(t.f, 0, &ni, &vout), "leaf");
+    TEST_ASSERT_EQ(t.f->nodes[ni].outputs[2].amount_sats, CHANNEL_DUST_LIMIT_SATS,
+                   "default stock is the dust limit");
+    ts_close(&t);
+
+    ts_shape_t psk = { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 };
+    TEST_ASSERT(ts_open_b(&t, &psk, 0), "PS k=2 setup");
+    uint64_t caps[8];
+    for (size_t c = 0; c < 8; c++) caps[c] = 30000;
+    TEST_ASSERT(factory_set_member_capacities(t.f, caps, 8), "set");
+    uint64_t amount;
+    TEST_ASSERT(!factory_capacity_funding_amount(t.f, &amount), "no amount for k=2 leaves");
+    TEST_ASSERT(!factory_build_tree(t.f), "k=2 leaves refuse capacities");
+    ts_close(&t);
+    return 1;
+}
+
+
+/* ---- Capacity sizing at the agreed tree rate ---- */
+
+/* The capacity tree is sized with the per-node fee of the agreed tree rate
+   (exact vsize) and the anchor (0 sat at rate 0, else 240): the funding is
+   exactly what it needs, one sat either way is refused, every node pays
+   its exact fee and conserves value. */
+int test_tree_shape_capacity_rates(void) {
+    static const uint64_t rates[] = { 0, 100, 1000 };
+    for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+        factory_t *f = t.f;
+        f->tree_fee_rate = rates[r];
+        TEST_ASSERT(ts_set_caps(f, 20000), "capacities");
+        uint64_t need = f->funding_amount_sats;
+        unsigned char spk[34], txid[32];
+        memset(txid, 0xAA, 32);
+        TEST_ASSERT(factory_compute_funding_spk(f, spk), "spk");
+        TEST_ASSERT(factory_set_funding(f, txid, 0, need + 1, spk, 34) &&
+                    !factory_build_tree(f), "one sat over refused");
+        TEST_ASSERT(factory_set_funding(f, txid, 0, need - 1, spk, 34) &&
+                    !factory_build_tree(f), "one sat under refused");
+        TEST_ASSERT(factory_set_funding(f, txid, 0, need, spk, 34) &&
+                    factory_build_tree(f), "exact funding builds");
+        char why[200];
+        TEST_ASSERT(factory_check_tree_fees(f, why, sizeof(why)), why);
+        TEST_ASSERT(ts_conserves(f), "every node conserves value");
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            const factory_node_t *n = &f->nodes[i];
+            const tx_output_t *last = &n->outputs[n->n_outputs - 1];
+            if (last->script_pubkey_len == P2A_SPK_LEN)
+                TEST_ASSERT_EQ(last->amount_sats, rates[r] == 0 ? 0 : 240, "anchor amount");
+            if (rates[r] == 0) TEST_ASSERT_EQ(n->fee_sats, 0, "no fee at rate 0");
+        }
+        for (size_t c = 0; c < s.n_clients; c++) {
+            size_t ni;
+            uint32_t vout;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vout), "leaf");
+            TEST_ASSERT_EQ(f->nodes[ni].outputs[vout].amount_sats, ts_cap(c + 1), "capacity");
+        }
+        TEST_ASSERT(factory_sign_all(f) && factory_verify_all(f), "sign + verify");
+        ts_close(&t);
+    }
+    return 1;
+}
+
+/* ---- Reload of the per-member terms ---- */
+
+/* A built, signed capacities + leaf stock + channel script factory saved
+   into db (row and signed tree). */
+static int ts_terms_factory(ts_tree_t *t, persist_t *db) {
+    ts_shape_t s = { "N=4 PS anchors cltv", 4, {3}, 1, 0, 1, 1000, 0, 0 };
+    if (!ts_open_b(t, &s, 0)) return 0;
+    factory_t *f = t->f;
+    unsigned char spk[34];
+    secp256k1_pubkey o[2] = { f->pubkeys[0], f->pubkeys[2] };
+    return ts_keypath_spk(t->ctx, o, 2, spk) &&
+           factory_set_leaf_channel_spk(f, 2, spk, 34) &&
+           ts_set_caps(f, 25000) &&
+           factory_build_tree(f) && factory_sign_all(f) &&
+           persist_open(db, NULL) &&
+           persist_save_factory(db, f, f->ctx, 0) && persist_save_tree_nodes(db, f, 0);
+}
+
+/* The reload rebuilds exactly the signed tree: every node txid, and every
+   member's channel output (amount and script). */
+int test_tree_shape_terms_reload(void) {
+    ts_tree_t t;
+    persist_t db;
+    memset(&db, 0, sizeof(db));
+    TEST_ASSERT(ts_terms_factory(&t, &db), "setup");
+    factory_t *f = t.f;
+    factory_t *g = calloc(1, sizeof(*g));
+    TEST_ASSERT(g && persist_load_factory(&db, 0, g, f->ctx), "reload");
+    TEST_ASSERT_EQ(g->n_nodes, f->n_nodes, "node count");
+    for (size_t i = 0; i < f->n_nodes; i++)
+        TEST_ASSERT(memcmp(f->nodes[i].txid, g->nodes[i].txid, 32) == 0, "node txid");
+    TEST_ASSERT(g->member_capacity && g->leaf_stock_sats == 25000, "terms restored");
+    for (size_t c = 0; c + 1 < f->n_participants; c++) {
+        size_t a, b;
+        uint32_t va, vb;
+        TEST_ASSERT(factory_client_to_leaf(f, c, &a, &va) &&
+                    factory_client_to_leaf(g, c, &b, &vb) && va == vb, "leaf");
+        TEST_ASSERT_EQ(g->nodes[b].outputs[vb].amount_sats, ts_cap(c + 1), "capacity");
+        TEST_ASSERT(memcmp(f->nodes[a].outputs[va].script_pubkey,
+                           g->nodes[b].outputs[vb].script_pubkey, 34) == 0, "script");
+    }
+    factory_free(g);
+    free(g);
+    persist_close(&db);
+    ts_close(&t);
+    return 1;
+}
+
+/* Edited terms in the DB are refused at reload, never rebuilt into another
+   tree: one capacity changed, a capacity moved between two members (same
+   funding), the stock changed, a channel script dropped. */
+int test_tree_shape_terms_edit_refused(void) {
+    static const char *edits[] = {
+        "UPDATE factories SET member_capacities = '27920,35838,43757,51676';",
+        "UPDATE factories SET member_capacities = '28919,34838,43757,51676';",
+        "UPDATE factories SET leaf_stock_sats = 25001;",
+        "UPDATE factories SET channel_scripts = NULL;",
+    };
+    for (size_t e = 0; e < sizeof(edits) / sizeof(edits[0]); e++) {
+        ts_tree_t t;
+        persist_t db;
+        memset(&db, 0, sizeof(db));
+        TEST_ASSERT(ts_terms_factory(&t, &db), "setup");
+        char *got = NULL;
+        sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(db.db, "SELECT member_capacities FROM factories WHERE id=0;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+                got = strdup((const char *)sqlite3_column_text(st, 0));
+            sqlite3_finalize(st);
+        }
+        TEST_ASSERT(got && strcmp(got, "27919,35838,43757,51676") == 0, "stored capacities");
+        free(got);
+        TEST_ASSERT(sqlite3_exec(db.db, edits[e], NULL, NULL, NULL) == SQLITE_OK, "edit");
+        factory_t *g = calloc(1, sizeof(*g));
+        TEST_ASSERT(g != NULL, "alloc");
+        int loaded = persist_load_factory(&db, 0, g, t.f->ctx);
+        factory_free(g);
+        free(g);
+        persist_close(&db);
+        ts_close(&t);
+        if (loaded) printf("  edit %zu was loaded\n", e);
+        TEST_ASSERT(!loaded, "edited terms refused");
+    }
     return 1;
 }

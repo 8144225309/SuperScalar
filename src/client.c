@@ -75,6 +75,113 @@ void client_set_min_profit_bps(uint16_t bps) {
     g_min_profit_bps = bps;
 }
 
+/* Channel capacity terms (client_set_capacity_terms); 0 = not set. */
+static uint64_t g_expect_capacity = 0;
+static uint64_t g_min_capacity = 0;
+
+void client_set_capacity_terms(uint64_t expect_sats, uint64_t min_sats) {
+    g_expect_capacity = expect_sats;
+    g_min_capacity = min_sats;
+}
+
+static uint16_t g_max_lsp_balance_pct = 100;
+
+void client_set_max_lsp_balance_pct(uint16_t pct) {
+    g_max_lsp_balance_pct = pct > 100 ? 100 : pct;
+}
+
+/* With member capacities the distribution TX follows the capacity rule
+   (factory_compute_distribution_outputs_balanced without amounts): per-client
+   amounts from the LSP are accepted only when they are exactly those. */
+static int client_dist_amounts_acceptable(const factory_t *f, const uint64_t *amounts,
+                                          size_t n_amounts, uint32_t my_index) {
+    if (!f->member_capacity || n_amounts == 0) return 1;
+    tx_output_t outs[FACTORY_MAX_SIGNERS + 1];
+    size_t nd = factory_compute_distribution_outputs_balanced(
+        f, outs, FACTORY_MAX_SIGNERS + 1,
+        factory_distribution_fee(f, f->n_participants - 1), NULL, 0);
+    int ok = nd > 0 && nd == n_amounts;
+    for (size_t i = 0; ok && i < nd; i++)
+        ok = amounts[i] == outs[i].amount_sats;
+    if (!ok)
+        fprintf(stderr, "Client %u: REFUSING — distribution amounts are not the "
+                "capacity-rule amounts\n", my_index);
+    return ok;
+}
+
+/* Per-member capacities and leaf stock from a FACTORY_PROPOSE. */
+typedef struct {
+    int present;
+    size_t n;
+    uint64_t caps[FACTORY_MAX_SIGNERS];
+    uint64_t leaf_stock;
+} client_capacity_terms_t;
+
+static int client_json_sats(const cJSON *v, uint64_t *out) {
+    if (!v || !cJSON_IsNumber(v)) return 0;
+    double d = v->valuedouble;
+    if (d < 0 || d > 2100000000000000.0 || d != (double)(uint64_t)d) return 0;
+    *out = (uint64_t)d;
+    return 1;
+}
+
+/* Returns 0 on a malformed list; absent fields leave t->present 0. */
+static int client_parse_capacity_terms(const cJSON *j, client_capacity_terms_t *t) {
+    memset(t, 0, sizeof(*t));
+    const cJSON *caps = cJSON_GetObjectItem(j, "capacities");
+    if (!caps) return 1;
+    if (!cJSON_IsArray(caps)) return 0;
+    int n = cJSON_GetArraySize(caps);
+    if (n < 1 || n >= FACTORY_MAX_SIGNERS) return 0;
+    for (int i = 0; i < n; i++)
+        if (!client_json_sats(cJSON_GetArrayItem(caps, i), &t->caps[i])) return 0;
+    if (!client_json_sats(cJSON_GetObjectItem(j, "leaf_stock"), &t->leaf_stock))
+        return 0;
+    t->n = (size_t)n;
+    t->present = 1;
+    return 1;
+}
+
+static int client_apply_capacity_terms(factory_t *f, const client_capacity_terms_t *t) {
+    if (!t->present) return 1;
+    return factory_set_member_capacities(f, t->caps, t->n) &&
+           factory_set_leaf_stock(f, t->leaf_stock);
+}
+
+/* The member's own channel output in the built tree: logged, and checked
+   against the capacity terms.  Returns 0 to refuse the factory. */
+static int client_capacity_acceptable(const factory_t *f, uint32_t my_index) {
+    size_t ni;
+    uint32_t vout;
+    if (my_index == 0 || !factory_client_to_leaf(f, my_index - 1, &ni, &vout) ||
+        vout >= f->nodes[ni].n_outputs) {
+        fprintf(stderr, "Client %u: no channel output for this member\n", my_index);
+        return 0;
+    }
+    uint64_t cap = f->nodes[ni].outputs[vout].amount_sats;
+    if (f->member_capacity && cap != f->member_capacity[my_index]) {
+        fprintf(stderr, "Client %u: REFUSING — channel output %llu sats, proposed "
+                "capacity %llu\n", my_index, (unsigned long long)cap,
+                (unsigned long long)f->member_capacity[my_index]);
+        return 0;
+    }
+    printf("Client %u: channel capacity %llu sats%s\n", my_index,
+           (unsigned long long)cap, f->member_capacity ? " (proposed)" : "");
+    if (g_expect_capacity > 0 && cap != g_expect_capacity) {
+        fprintf(stderr, "Client %u: REFUSING — channel capacity %llu sats, expected "
+                "%llu (--expect-capacity)\n", my_index, (unsigned long long)cap,
+                (unsigned long long)g_expect_capacity);
+        return 0;
+    }
+    if (g_min_capacity > 0 && cap < g_min_capacity) {
+        fprintf(stderr, "Client %u: REFUSING — channel capacity %llu sats below "
+                "minimum %llu (--min-capacity)\n", my_index, (unsigned long long)cap,
+                (unsigned long long)g_min_capacity);
+        return 0;
+    }
+    return 1;
+}
+
 static uint64_t g_max_tree_fee_rate = CLIENT_DEFAULT_MAX_TREE_FEE_RATE;
 
 void client_set_max_tree_fee_rate(uint64_t sat_per_kvb) {
@@ -672,6 +779,23 @@ int client_dist_locktime_acceptable(const factory_t *f, uint32_t offered) {
 
 uint64_t client_member_channel_capacity(const factory_t *f, uint32_t my_index) {
     if (!f || my_index == 0) return 0;
+    /* Member capacities: the distribution owes the member its capacity-rule
+       payout (full capacity + its leaf stock share + its share of the rest,
+       factory_compute_distribution_outputs_balanced), which is never less
+       than the capacity itself. */
+    if (f->member_capacity) {
+        if (my_index >= f->n_participants || f->n_participants - 1 > FACTORY_MAX_SIGNERS)
+            return 0;
+        tx_output_t outs[FACTORY_MAX_SIGNERS + 1];
+        size_t nd = factory_compute_distribution_outputs_balanced(
+            f, outs, FACTORY_MAX_SIGNERS + 1,
+            factory_distribution_fee(f, f->n_participants - 1), NULL, 0);
+        if (nd != f->n_participants - 1) return 0;
+        /* output 0 carries the anchor the distribution TX takes from it */
+        uint64_t pay = outs[my_index - 1].amount_sats -
+                       (my_index == 1 ? factory_tree_anchor_sats(f) : 0);
+        return pay >= f->member_capacity[my_index] ? pay : 0;
+    }
     size_t lnode;
     uint32_t lvout;
     if (!factory_client_to_leaf(f, (size_t)(my_index - 1), &lnode, &lvout) ||
@@ -2121,6 +2245,14 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         }
     }
 
+    client_capacity_terms_t rot_caps;
+    if (!client_parse_capacity_terms(pj, &rot_caps)) {
+        fprintf(stderr, "Client %u: rotation FACTORY_PROPOSE has malformed capacities\n",
+                my_index);
+        free(rot_hashes);
+        return 0;
+    }
+
     /* Build factory locally */
     factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
@@ -2148,6 +2280,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (rot_n_hashes > 0)
         factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
     free(rot_hashes);
+    if (!client_apply_capacity_terms(factory_out, &rot_caps)) {
+        fprintf(stderr, "Client %u: rotation capacities refused\n", my_index);
+        return 0;
+    }
     if (!factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                              funding_spk, spk_len)) {
         printf("Client %u: rotation funding script refused\n", my_index);
@@ -2166,6 +2302,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     printf("Client %u: rotation tree OK (%zu nodes)\n", my_index, factory_out->n_nodes);
     fflush(stdout);
+    if (!client_capacity_acceptable(factory_out, my_index) ||
+        !client_dist_amounts_acceptable(factory_out, rot_dist_amounts,
+                                        rot_n_dist_amounts, my_index))
+        return 0;
     /* Nothing is signed for, or recorded about, a factory whose funding
        output has not been checked against the client's own derivation. */
     if (!client_check_factory_funding(factory_out, my_index, &my_pubkey)) {
@@ -2804,6 +2944,9 @@ static int client_factory_creation_stateless_signing(
                     }
                 }
             }
+            if (ok && !client_dist_amounts_acceptable(factory, dist_amounts, n_amt,
+                                                      my_index))
+                ok = 0;
             /* Rebuild the IDENTICAL unsigned dist TX from the LSP-sent amounts,
                then co-sign over our own computed sighash. */
             if (ok) {
@@ -3224,6 +3367,26 @@ int client_run_with_channels(secp256k1_context *ctx,
             if (v && cJSON_IsNumber(v)) profiles[pi].timezone_bucket = (uint8_t)v->valuedouble;
         }
     }
+    /* Channel terms fixed before signing: the per-member capacities and the
+       opening balance split (the LSP's share of every channel, percent). */
+    client_capacity_terms_t cap_terms;
+    int cap_terms_ok = client_parse_capacity_terms(msg.json, &cap_terms);
+    int open_lsp_pct = -1;
+    {
+        cJSON *bp = cJSON_GetObjectItem(msg.json, "lsp_balance_pct");
+        if (bp && cJSON_IsNumber(bp) && bp->valuedouble >= 0 &&
+            bp->valuedouble <= 100 && bp->valuedouble == (double)(int)bp->valuedouble)
+            open_lsp_pct = (int)bp->valuedouble;
+    }
+    if (!cap_terms_ok || open_lsp_pct < 0) {
+        fprintf(stderr, "Client: FACTORY_PROPOSE has malformed or missing channel "
+                "terms (capacities / lsp_balance_pct)\n");
+        client_send_error(fd, "malformed channel terms");
+        cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+
     /* Parse per-client distribution amounts (optional, for rotation) */
     uint64_t init_dist_amounts[FACTORY_MAX_SIGNERS];
     size_t init_n_dist_amounts = 0;
@@ -3374,7 +3537,8 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_node_l_stock_hash(factory, parsed_node_h_idx[nh], parsed_node_h[nh]);
     free(parsed_node_h_idx);
     free(parsed_node_h);
-    if (!factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
+    if (!client_apply_capacity_terms(factory, &cap_terms) ||
+        !factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
                              funding_spk, spk_len) ||
         !factory_build_tree(factory)) {
         fprintf(stderr, "Client: factory_build_tree failed\n");
@@ -3384,8 +3548,27 @@ int client_run_with_channels(secp256k1_context *ctx,
         wire_close(fd);
         return 0;
     }
+    if (open_lsp_pct > (int)g_max_lsp_balance_pct) {
+        fprintf(stderr, "Client %u: REFUSING — opening split gives the LSP %d%% "
+                "(maximum %u%%, --max-lsp-balance-pct)\n", my_index, open_lsp_pct,
+                (unsigned)g_max_lsp_balance_pct);
+        client_send_error(fd, "opening_split_refused");
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
     if (!client_check_tree_fees(factory, tree_fee_rate, my_index)) {
         client_send_error(fd, "tree_fee_rejected");
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
+    if (!client_capacity_acceptable(factory, my_index) ||
+        !client_dist_amounts_acceptable(factory, init_dist_amounts,
+                                        init_n_dist_amounts, my_index)) {
+        client_send_error(fd, "channel_capacity_refused");
         factory_free(factory);
         free(factory);
         wire_close(fd);
@@ -3402,6 +3585,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         wire_close(fd);
         return 0;
     }
+    printf("Client %u: opening split — LSP %d%% of the channel\n", my_index, open_lsp_pct);
 
     /* Initialize signing sessions */
     if (!factory_sessions_init(factory)) {
@@ -3899,14 +4083,26 @@ int client_run_with_channels(secp256k1_context *ctx,
         memset(bp_ps, 0, 32); memset(bp_ds, 0, 32);
         memset(bp_rs, 0, 32); memset(bp_hs, 0, 32);
 
-        /* Use LSP-provided initial amounts from CHANNEL_READY.
-           The LSP computes these with its own fee estimator (which may differ
-           from the client's static default).  Trusting the LSP's split ensures
-           both sides build identical commitment transactions. */
-        if (bal_local > 0 || bal_remote > 0) {
-            channel.local_amount  = bal_remote / 1000;  /* client balance = LSP remote */
-            channel.remote_amount = bal_local  / 1000;  /* LSP balance   = LSP local  */
+        /* The opening split must be the one proposed before signing: the
+           LSP's lsp_balance_pct share of the channel output less the
+           commitment fee (as lsp_channels_init computes it), the rest the
+           member's. */
+        {
+            uint64_t usable = channel.local_amount + channel.remote_amount;
+            uint64_t want_lsp = usable * (uint64_t)open_lsp_pct / 100;
+            uint64_t want_member = usable - want_lsp;
+            if (bal_local != want_lsp * 1000 || bal_remote != want_member * 1000) {
+                fprintf(stderr, "Client %u: REFUSING channel — opening split LSP %llu / "
+                        "member %llu msat, proposed LSP %llu / member %llu sats "
+                        "(%d%%)\n", my_index, (unsigned long long)bal_local,
+                        (unsigned long long)bal_remote, (unsigned long long)want_lsp,
+                        (unsigned long long)want_member, open_lsp_pct);
+                client_send_error(fd, "opening_split_mismatch");
+                goto fail;
+            }
         }
+        channel.local_amount  = bal_remote / 1000;  /* client balance = LSP remote */
+        channel.remote_amount = bal_local  / 1000;  /* LSP balance   = LSP local  */
 
         /* Override local_pcs[0,1] with the pre-generated secrets we already sent */
         channel_set_local_pcs(&channel, 0, pcs_secret0);

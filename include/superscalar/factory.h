@@ -87,6 +87,13 @@ typedef struct {
     uint8_t  timezone_bucket;     /* 0-23 hour of peak activity */
 } participant_profile_t;
 
+/* A caller-supplied channel output script for one member
+   (factory_set_leaf_channel_spk). */
+typedef struct {
+    unsigned char spk[34];   /* P2TR: OP_1 <32-byte output key> */
+    uint8_t set;             /* 0 = the default channel script */
+} factory_chan_spk_t;
+
 /* Runtime-configurable limits (Mainnet Gap #6).
    Pass to factory_init_with_config(). NULL = defaults (same as #define values). */
 typedef struct {
@@ -265,6 +272,13 @@ typedef struct {
     uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX
                                           (legacy 1-input shape; for multi-input PS sub-factory
                                           chain advances see ps_prev_amounts[] below) */
+    /* One-member PS leaf with a caller channel script: the chain extension
+       (ps_chain_len > 0) spends that output by key path, so it is signed over
+       this MuSig2 key (no script tree) and verified against its output key,
+       not over the node's own keyagg / merkle root. */
+    int has_ps_chan_key;
+    musig_keyagg_t ps_chan_keyagg;
+    secp256k1_xonly_pubkey ps_chan_output_key;
     /* #146: height-aware reset.  Block height at which the latest chain
        entry was observed confirmed (0 = unset / legacy).  Used by
        factory_reset_subfactory_chains_above_height to leave chain state
@@ -482,6 +496,13 @@ typedef struct {
     placement_mode_t placement_mode;  /* client ordering strategy */
     economic_mode_t  economic_mode;   /* fee distribution model */
     participant_profile_t *profiles;  /* dynamic, sized to config.max_signers */
+    /* Caller channel output scripts by participant index; NULL until
+       factory_set_leaf_channel_spk sets one (sized to config.max_signers). */
+    factory_chan_spk_t *chan_spks;
+    /* Per-member channel capacity in sats by participant index; NULL = the
+       budget is split by tree shape (factory_set_member_capacities). */
+    uint64_t *member_capacity;
+    uint64_t leaf_stock_sats;   /* host stock per leaf with capacities (0 = default) */
 
     /* Runtime config (Mainnet Gap #6) — stored limits for this factory */
     factory_config_t config;
@@ -717,22 +738,12 @@ int factory_sign_l_stock_cooperative_spend(
    built tree.  Returns 1 on success, 0 if the client_idx is out of range
    or doesn't appear in any leaf's signer_indices.
 
-   Behavior is arity-aware:
-
-   - Mixed-arity factories (n_level_arity > 0): walks
-     factory->leaf_node_indices[] and matches my_index = client_idx + 1
-     against each leaf's signer_indices[].  vout = position in
-     signer_indices minus 1 (signer_indices[0] == 0 is the LSP).  This
-     is the only correct mapping when leaves can hold > 2 channels.
-
-   - Uniform ARITY_1 and ARITY_PS: each client owns its own leaf at
-     vout 0.  PS leaves are built 1-client-per-leaf (n_signers=2 = LSP +
-     1 client) with chained TXs replacing the per-state DW machine; the
-     mapping is identical to arity-1 here.
-
-   - Uniform ARITY_2: 2 clients per leaf, layout [vout 0 = client A's
-     channel, vout 1 = client B's channel, vout 2 = L-stock]; client_idx
-     i maps to (leaf i/2, vout i%2).
+   The channel is on the leaf whose signer_indices[] include participant
+   client_idx + 1 -- for PS leaves with sub-factories (k > 1), on that
+   sub-factory node -- at vout = its position in signer_indices minus 1
+   (signer_indices[0] == 0 is the LSP).  The leaf is looked up rather than
+   computed from the index because the placement mode and profiles decide
+   which leaf a member lands on.
 
    Use this from any code that previously open-coded the mapping
    (src/client.c::client_init_channel, src/lsp_channels.c::client_to_leaf,
@@ -765,6 +776,52 @@ int factory_set_funding(factory_t *f,
    order the configured placement mode and profiles put them).  Call after
    setting placement and profiles.  Returns 0 on failure. */
 int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
+
+/* Use spk (a 34-byte P2TR, OP_1 <32 bytes>) verbatim as the channel output
+   of member participant_idx (1..n_participants-1) in its leaf, in place of
+   the default MuSig2(member, LSP) output with the LSP-only CLTV recovery
+   leaf.  spk == NULL restores the default.  Returns 0, changing nothing, for
+   any other script or index.  Call after factory_init*, before
+   factory_build_tree; members without a script keep the default, so a
+   factory with none set builds exactly as before.
+
+   For callers whose channel engine holds two-sided commitments over the
+   channel output (e.g. a standard taproot channel funding output, MuSig2 key
+   path only).  The reference LSP and client keep the default: they hold no
+   commitment for the LSP's side, which then relies on the CLTV recovery
+   leaf.
+
+   One-member pseudo-Spilman leaf (k = 1): the chain extension spends the
+   channel output, so spk must be the key-path-only P2TR (BIP-86 tweak, no
+   script tree) of the MuSig2 key of the LSP and the member, in either key
+   order; the extension is then signed and verified over that key.
+   factory_build_tree refuses any other script there, and refuses a script
+   for a member of a PS sub-factory leaf (k > 1). */
+int factory_set_leaf_channel_spk(factory_t *f, uint32_t participant_idx,
+                                 const unsigned char *spk, size_t spk_len);
+
+/* Give every member its own channel capacity: capacity_sats[i] is the
+   channel output of participant i + 1, n_members == n_participants - 1, each
+   at least CHANNEL_DUST_LIMIT_SATS.  factory_build_tree then sizes the tree
+   bottom-up: each leaf's channel outputs are its members' capacities and its
+   host stock output is factory_set_leaf_stock's amount, and every node's
+   value is the sum of its outputs plus its fee and anchor.  The funding
+   amount must be exactly factory_capacity_funding_amount.  capacity_sats ==
+   NULL restores the default (the funding split equally by tree shape, the
+   same transactions as before).  Returns 0, changing nothing, on a wrong
+   count or a capacity below dust.  Not available for PS sub-factory leaves
+   (k > 1): factory_build_tree refuses that combination. */
+int factory_set_member_capacities(factory_t *f, const uint64_t *capacity_sats,
+                                  size_t n_members);
+
+/* Host stock (L-stock) output of every leaf when member capacities are set;
+   0 = CHANNEL_DUST_LIMIT_SATS.  Returns 0 for a nonzero amount below dust. */
+int factory_set_leaf_stock(factory_t *f, uint64_t stock_sats);
+
+/* The funding amount factory_build_tree needs for the configured member
+   capacities, leaf stock, shape, fee and anchors.  Returns 0 when no
+   capacities are set or the shape cannot carry them. */
+int factory_capacity_funding_amount(const factory_t *f, uint64_t *amount_out);
 
 /* Set the client placement strategy for factory_build_tree.  Returns 0,
    changing nothing, for a mode that is not a placement_mode_t value.  The
@@ -1410,6 +1467,10 @@ size_t factory_compute_distribution_outputs(
    balance (client_amounts[0..n_clients-1]) instead of equal split.
    LSP gets funding - sum(client_amounts) - fee.
    client_amounts may be NULL to fall back to equal split. */
+/* (With member capacities and no client_amounts, each member receives its
+   full capacity plus an equal share of its leaf's host stock, and any rest
+   of the budget is split equally; capacities are never scaled down -- 0 is
+   returned when the budget cannot cover them.) */
 size_t factory_compute_distribution_outputs_balanced(
     const factory_t *f,
     tx_output_t *outputs_out,
