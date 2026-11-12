@@ -187,3 +187,39 @@ int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
         (unsigned)CLI_ARITY_MAINNET_MIN_STEP_BLOCKS);
     return 0;
 }
+
+int cli_validate_factory_cltv(uint32_t cltv_timeout, uint32_t height,
+                              uint32_t active_blocks, uint32_t dying_blocks,
+                              char *err_buf, size_t err_buf_len)
+{
+    uint64_t expired = (uint64_t)height + active_blocks + dying_blocks;
+    if ((uint64_t)cltv_timeout >= expired) return 1;
+    cli_set_err(err_buf, err_buf_len,
+        "Error: factory CLTV timeout %u is too early: a factory created at "
+        "block %u with %u active and %u dying blocks expires at block %llu, "
+        "and its distribution TX and timeout paths must not be valid before "
+        "then. Use --cltv-timeout %llu or later (or leave it unset).",
+        (unsigned)cltv_timeout, (unsigned)height, (unsigned)active_blocks,
+        (unsigned)dying_blocks, (unsigned long long)expired,
+        (unsigned long long)expired);
+    return 0;
+}
+
+int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
+                               uint16_t step_blocks, uint32_t states_per_layer,
+                               char *err_buf, size_t err_buf_len)
+{
+    if (tip == 0) return 1;
+    uint64_t layer = states_per_layer > 1
+                     ? (uint64_t)step_blocks * (states_per_layer - 1) : 0;
+    if ((uint64_t)cltv_timeout > (uint64_t)tip + layer) return 1;
+    cli_set_err(err_buf, err_buf_len,
+        "factory CLTV timeout %u is not safely in the future: chain tip %u, "
+        "and one DW layer at the first state takes %llu blocks (step %u x %u); "
+        "the distribution TX and the LSP's timeout paths would be valid before "
+        "the tree could be published",
+        (unsigned)cltv_timeout, (unsigned)tip, (unsigned long long)layer,
+        (unsigned)step_blocks,
+        (unsigned)(states_per_layer > 1 ? states_per_layer - 1 : 0));
+    return 0;
+}

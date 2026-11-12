@@ -1,4 +1,5 @@
 #include "superscalar/client.h"
+#include "superscalar/cli_arity.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
@@ -2562,6 +2563,18 @@ int client_run_with_channels(secp256k1_context *ctx,
     uint64_t fee_per_tx = (uint64_t)fpt_item->valuedouble;
     cJSON *arity_item = cJSON_GetObjectItem(msg.json, "leaf_arity");
     int leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
+    {
+        char cltv_err[320];
+        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(),
+                                        step_blocks, states_per_layer,
+                                        cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "Client: REFUSING factory: %s\n", cltv_err);
+            client_send_error(fd, "factory CLTV timeout is not safely in the future");
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            return 0;
+        }
+    }
 
     /* Parse variable level_arity array (4A), fall back to leaf_arity */
     uint8_t level_arities[FACTORY_MAX_LEVELS];

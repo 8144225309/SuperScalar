@@ -283,7 +283,7 @@ static void usage(const char *prog) {
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
         "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
-        "  --cltv-timeout N    Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest)\n"
+        "  --cltv-timeout N    Factory CLTV timeout (absolute block height, at least creation + active + dying blocks; auto: that, minimum +35 on regtest, +10 elsewhere)\n"
         "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
@@ -3782,6 +3782,28 @@ accept_new_factory:
         return 1;
     }
 
+    /* An explicit --cltv-timeout is checked before any coins move.  On
+       regtest the factory is created 102 blocks later (the blocks mined
+       below), elsewhere at least one block later (the funding confirmation). */
+    if (cltv_timeout_arg > 0 && rt_ok) {
+        int h = regtest_get_block_height(&rt);
+        char cltv_err[512];
+        uint32_t at = (uint32_t)h + (is_regtest ? 102u : 1u);
+        if (h > 0 &&
+            (!cli_validate_factory_cltv((uint32_t)cltv_timeout_arg, at,
+                                        active_blocks, dying_blocks,
+                                        cltv_err, sizeof(cltv_err)) ||
+             !cli_validate_proposed_cltv((uint32_t)cltv_timeout_arg, at,
+                                         step_blocks, (uint32_t)states_per_layer,
+                                         cltv_err, sizeof(cltv_err)))) {
+            fprintf(stderr, "%s\n", cltv_err);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
     /* === Phase 2: Compute funding address === */
     size_t n_total = 1 + lsp_p->n_clients;
     secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
@@ -4047,9 +4069,32 @@ accept_new_factory:
         if (cltv_timeout_arg > 0) {
             cltv_timeout = (uint32_t)cltv_timeout_arg;
         } else if (cur_height > 0) {
-            /* Auto: regtest +35 blocks, non-regtest = factory lifetime + 10 block buffer */
-            int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
+            /* Auto: the factory lifetime, at least 35 blocks on regtest,
+               plus a 10-block buffer elsewhere; and past the first DW
+               layer's delay, which clients check */
+            uint32_t life = active_blocks + dying_blocks;
+            uint32_t offset = is_regtest ? (life > 35 ? life : 35) : life + 10;
+            uint32_t layer = states_per_layer > 1
+                             ? (uint32_t)step_blocks * (uint32_t)(states_per_layer - 1) : 0;
+            if (offset <= layer) offset = layer + 1;
             cltv_timeout = (uint32_t)cur_height + offset;
+        }
+        char cltv_err[512];
+        if (cur_height > 0 &&
+            (!cli_validate_factory_cltv(cltv_timeout, (uint32_t)cur_height,
+                                        active_blocks, dying_blocks,
+                                        cltv_err, sizeof(cltv_err)) ||
+             !cli_validate_proposed_cltv(cltv_timeout, (uint32_t)cur_height,
+                                         step_blocks, (uint32_t)states_per_layer,
+                                         cltv_err, sizeof(cltv_err)))) {
+            fprintf(stderr, "%s\nLSP: refusing to create the factory. Its funding "
+                    "output %s:%u is already confirmed; it is spendable only by "
+                    "all members together.\n", cltv_err, funding_txid_hex,
+                    funding_vout);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     }
 

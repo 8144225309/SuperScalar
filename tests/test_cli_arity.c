@@ -322,3 +322,48 @@ int test_cli_step_floor_signet_allows_small(void) {
 }
 
 /* End-of-file public test list (referenced from test_main.c) */
+
+/* ---- factory CLTV timeout floors ---- */
+
+int test_cli_factory_cltv_floor(void) {
+    char err[512] = {0};
+    /* created at 209, 60 active + 20 dying: EXPIRED from 289 */
+    T_ASSERT(cli_validate_factory_cltv(302, 209, 60, 20, err, sizeof(err)),
+             "a timeout after the lifetime is accepted");
+    T_ASSERT(cli_validate_factory_cltv(289, 209, 60, 20, err, sizeof(err)),
+             "a timeout at the EXPIRED block is accepted");
+    T_ASSERT(!cli_validate_factory_cltv(288, 209, 60, 20, err, sizeof(err)),
+             "a timeout inside the lifetime is refused");
+    T_ASSERT_SUBSTR(err, "expires at block 289");
+    T_ASSERT_SUBSTR(err, "--cltv-timeout 289 or later");
+    /* the trace case: 162 while the chain is at 211 */
+    T_ASSERT(!cli_validate_factory_cltv(162, 211, 20, 10, err, sizeof(err)),
+             "a timeout in the past is refused");
+    /* regtest auto (+35 over 20 + 10) and mainnet auto (+lifetime + 10) */
+    T_ASSERT(cli_validate_factory_cltv(211 + 35, 211, 20, 10, err, sizeof(err)),
+             "regtest default accepted");
+    T_ASSERT(cli_validate_factory_cltv(900000 + 4320 + 432 + 10, 900000, 4320, 432,
+                                       err, sizeof(err)), "mainnet default accepted");
+    T_ASSERT(!cli_validate_factory_cltv(100, 0xFFFFFFF0u, 0xFFFFFFF0u, 5, err, sizeof(err)),
+             "no wrap-around");
+    return 1;
+}
+
+int test_cli_proposed_cltv_floor(void) {
+    char err[512] = {0};
+    /* step 10, 4 states: the first state of a layer waits 30 blocks */
+    T_ASSERT(cli_validate_proposed_cltv(211 + 35, 211, 10, 4, err, sizeof(err)),
+             "regtest default accepted");
+    T_ASSERT(!cli_validate_proposed_cltv(211 + 30, 211, 10, 4, err, sizeof(err)),
+             "a timeout within one layer's delay is refused");
+    T_ASSERT_SUBSTR(err, "not safely in the future");
+    T_ASSERT(!cli_validate_proposed_cltv(162, 211, 10, 4, err, sizeof(err)),
+             "a timeout in the past is refused");
+    T_ASSERT(!cli_validate_proposed_cltv(211, 211, 1, 2, err, sizeof(err)),
+             "a timeout at the tip is refused");
+    T_ASSERT(cli_validate_proposed_cltv(213, 211, 1, 2, err, sizeof(err)),
+             "step 1, 2 states: two blocks ahead is enough");
+    T_ASSERT(cli_validate_proposed_cltv(5, 0, 10, 4, err, sizeof(err)),
+             "unknown tip is not judged");
+    return 1;
+}

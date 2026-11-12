@@ -1363,6 +1363,8 @@ extern int test_cli_arity_rejects_negative(void);
 extern int test_cli_arity_rejects_non_numeric(void);
 extern int test_cli_arity_rejects_mixed_with_oversize_entry(void);
 extern int test_cli_arity_rejects_empty(void);
+extern int test_cli_factory_cltv_floor(void);
+extern int test_cli_proposed_cltv_floor(void);
 extern int test_client_dist_verify_accepts_signed(void);
 extern int test_client_dist_verify_rejects(void);
 extern int test_client_dist_step_never_early(void);
@@ -3376,6 +3378,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cli_arity_rejects_non_numeric);
     RUN_TEST(test_cli_arity_rejects_mixed_with_oversize_entry);
     RUN_TEST(test_cli_arity_rejects_empty);
+    RUN_TEST(test_cli_factory_cltv_floor);
+    RUN_TEST(test_cli_proposed_cltv_floor);
     RUN_TEST(test_client_dist_verify_accepts_signed);
     RUN_TEST(test_client_dist_verify_rejects);
     RUN_TEST(test_client_dist_step_never_early);

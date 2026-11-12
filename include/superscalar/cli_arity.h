@@ -82,6 +82,26 @@ int cli_validate_shape_for_bolt2016(
 int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
                                     char *err_buf, size_t err_buf_len);
 
+/* Factory expiry floor (LSP).  From cltv_timeout on the distribution TX is
+   valid and the LSP's timeout paths in the tree are open, so it must not
+   come before the end of the factory's own lifetime: a factory created at
+   block `height` is EXPIRED from height + active_blocks + dying_blocks on.
+   Returns 1 if cltv_timeout is at or after that block; otherwise writes an
+   error to err_buf and returns 0. */
+int cli_validate_factory_cltv(uint32_t cltv_timeout, uint32_t height,
+                              uint32_t active_blocks, uint32_t dying_blocks,
+                              char *err_buf, size_t err_buf_len);
+
+/* Factory expiry floor as a client can check a proposal, which does not
+   carry the lifetime: cltv_timeout must lie beyond the client's chain tip
+   by more than the longest delay of one DW layer at the factory's first
+   state, step_blocks * (states_per_layer - 1).  A factory failing it has
+   its distribution TX and timeout paths valid before even one layer of the
+   tree could confirm.  tip == 0 (unknown) is not judged and passes. */
+int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
+                               uint16_t step_blocks, uint32_t states_per_layer,
+                               char *err_buf, size_t err_buf_len);
+
 #ifdef __cplusplus
 }
 #endif
