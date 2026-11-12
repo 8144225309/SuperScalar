@@ -787,7 +787,7 @@ int factory_recovery_scan(persist_t *p, chain_backend_t *chain)
         fflush(stdout);
 
         if (ftxid && ftxid[0]) {
-            char why[160] = {0};
+            char why[256] = {0};
             if (do_factory_recovery(p, chain, fid, ftxid,
                                     /* allow_broadcast = */ 0, NULL, NULL,
                                     why, sizeof(why)) < 0) {
@@ -837,7 +837,7 @@ cJSON *factory_recovery_list(persist_t *p, chain_backend_t *chain)
 
         /* Tree node stats */
         fr_tree_t tree;
-        char why[160] = {0};
+        char why[256] = {0};
         int loaded = fr_tree_load(p->db, fid, &tree, why, sizeof(why));
         int n_nodes = 0;
         int n_confirmed = 0, n_leaf = 0, n_leaf_confirmed = 0;
@@ -964,7 +964,7 @@ int factory_recovery_run(persist_t *p, chain_backend_t *chain,
 
     factory_recovery_result_t local;
     if (!res) res = &local;
-    char why[160] = {0};
+    char why[256] = {0};
     int rc = do_factory_recovery(p, chain, factory_id, funding_txid,
                                  /* allow_broadcast = */ 1, leaf_txid, res,
                                  why, sizeof(why));
