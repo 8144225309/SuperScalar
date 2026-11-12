@@ -2419,19 +2419,26 @@ static int parse_level_arity(const char *s, uint8_t out[FACTORY_MAX_LEVELS],
     return 1;
 }
 
-/* A node's output amounts as tree_nodes stores them (comma-separated sats),
+/* Output amounts as tree_nodes stores them (comma-separated sats),
    malloc'd; NULL on allocation failure. */
-static char *format_output_amounts(const factory_node_t *node) {
+static char *format_amounts(const uint64_t *amounts, size_t n) {
     /* sized for every output (20 digits + comma each) */
-    size_t cap = node->n_outputs * 21 + 1;
+    size_t cap = n * 21 + 1;
     char *buf = malloc(cap);
     if (!buf) return NULL;
     size_t len = 0;
     buf[0] = '\0';
-    for (size_t o = 0; o < node->n_outputs; o++)
+    for (size_t o = 0; o < n; o++)
         len += (size_t)snprintf(buf + len, cap - len, "%s%llu", o > 0 ? "," : "",
-                                (unsigned long long)node->outputs[o].amount_sats);
+                                (unsigned long long)amounts[o]);
     return buf;
+}
+
+static char *format_output_amounts(const factory_node_t *node) {
+    uint64_t a[FACTORY_MAX_OUTPUTS];
+    size_t n = node->n_outputs < FACTORY_MAX_OUTPUTS ? node->n_outputs : FACTORY_MAX_OUTPUTS;
+    for (size_t o = 0; o < n; o++) a[o] = node->outputs[o].amount_sats;
+    return format_amounts(a, n);
 }
 
 /* A node whose outputs carry an L-stock script: a leaf state or a PS
@@ -2443,26 +2450,122 @@ static int node_has_l_stock(const factory_t *f, size_t idx) {
     return 0;
 }
 
-/* Check that the tree persist_load_factory just rebuilt is the signed tree
-   the DB holds in tree_nodes: the same number of nodes, and for each node the
-   same type, parent and parent output, and the same txid.
+/* What check_rebuilt_tree needs from a signed transaction: its txid (over the
+   non-witness serialization), its first input, and its output amounts. */
+typedef struct {
+    unsigned char txid[32];        /* internal byte order */
+    unsigned char prev_txid[32];   /* first input, internal byte order */
+    uint32_t prev_vout;
+    uint32_t sequence;
+    size_t n_out;
+    uint64_t amounts[FACTORY_MAX_OUTPUTS];
+} stored_tx_t;
 
-   Two kinds of node are exempt from the txid comparison (never from the
-   others), together with everything below them, because their stored row may
-   legitimately differ from a rebuild at the creation state:
-     - a node whose stored nSequence or output amounts differ from the rebuilt
-       ones: it was advanced or re-allocated after creation and its row holds
-       that later state;
-     - with hashlock L-stock poison, a node carrying an L-stock output: its
-       script commits to hashes the DB does not hold.
-   A factory with no tree_nodes rows has nothing signed to compare and passes.
-   Returns 1 on a match, 0 (logged) otherwise. */
+static int rd_varint(const unsigned char *b, size_t len, size_t *pos, uint64_t *v) {
+    if (*pos >= len) return 0;
+    unsigned char c = b[(*pos)++];
+    size_t n = c < 0xFD ? 0 : c == 0xFD ? 2 : c == 0xFE ? 4 : 8;
+    if (n == 0) { *v = c; return 1; }
+    if (len - *pos < n) return 0;
+    uint64_t r = 0;
+    for (size_t i = 0; i < n; i++) r |= (uint64_t)b[*pos + i] << (8 * i);
+    *pos += n;
+    *v = r;
+    return 1;
+}
+
+static int skip_bytes(size_t len, size_t *pos, uint64_t n) {
+    if (n > len - *pos) return 0;
+    *pos += (size_t)n;
+    return 1;
+}
+
+static uint32_t rd_le32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/* Parse a serialized (segwit or legacy) transaction.  1 on success. */
+static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
+    size_t pos = 4;
+    uint64_t n_in, n_out, v;
+    if (len < 10) return 0;
+    int segwit = (b[4] == 0x00 && b[5] == 0x01);
+    if (segwit) pos = 6;
+    size_t body_start = pos;
+    if (!rd_varint(b, len, &pos, &n_in) || n_in == 0 || n_in > 1000) return 0;
+    for (uint64_t i = 0; i < n_in; i++) {
+        if (len - pos < 36) return 0;
+        if (i == 0) {
+            memcpy(o->prev_txid, b + pos, 32);
+            o->prev_vout = rd_le32(b + pos + 32);
+        }
+        pos += 36;
+        if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+        if (len - pos < 4) return 0;
+        if (i == 0) o->sequence = rd_le32(b + pos);
+        pos += 4;
+    }
+    if (!rd_varint(b, len, &pos, &n_out) || n_out > FACTORY_MAX_OUTPUTS) return 0;
+    o->n_out = (size_t)n_out;
+    for (uint64_t i = 0; i < n_out; i++) {
+        if (len - pos < 8) return 0;
+        uint64_t a = 0;
+        for (int k = 0; k < 8; k++) a |= (uint64_t)b[pos + k] << (8 * k);
+        o->amounts[i] = a;
+        pos += 8;
+        if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+    }
+    size_t body_end = pos;
+    if (segwit) {
+        for (uint64_t i = 0; i < n_in; i++) {
+            uint64_t items;
+            if (!rd_varint(b, len, &pos, &items)) return 0;
+            for (uint64_t k = 0; k < items; k++)
+                if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+        }
+    }
+    if (len - pos != 4) return 0;   /* nLockTime, and nothing after it */
+    size_t nw_len = 4 + (body_end - body_start) + 4;
+    unsigned char *nw = malloc(nw_len);
+    if (!nw) return 0;
+    memcpy(nw, b, 4);
+    memcpy(nw + 4, b + body_start, body_end - body_start);
+    memcpy(nw + 4 + (body_end - body_start), b + pos, 4);
+    sha256_double(nw, nw_len, o->txid);
+    free(nw);
+    return 1;
+}
+
+/* Check that the tree persist_load_factory just rebuilt is the signed tree
+   the DB holds in tree_nodes, and make the signed bytes the source of truth.
+
+   The DB must hold one row per rebuilt node (a factory with no rows is
+   refused: nothing would tie the rebuild to what was signed).  Each row must
+   have the rebuilt node's type, parent and parent output.  Each row's signed
+   transaction must hash to the row's txid, carry the row's nSequence and
+   output amounts, and spend its parent's stored txid at the row's parent
+   output; the root spends the factory's funding outpoint.  So the stored
+   rows form one signed chain from the funding output.
+
+   Then every node's rebuilt txid must equal the stored one, except below a
+   node whose signed state legitimately moved on after creation (its stored
+   nSequence or amounts differ from the rebuild): a state node of a tree with
+   DW state (an advance), or a leaf or PS sub-factory state (a chain advance
+   or re-allocation; such a node may spend an earlier state of its own chain
+   instead of its parent).  A kickoff never moves on, and in a tree without DW
+   state no interior node does: a difference there refuses the load.  With
+   hashlock L-stock poison a node with an L-stock output (and its subtree) is
+   also compared by chain only, since its script commits to hashes the DB does
+   not hold.  For such nodes the stored txid and signed transaction replace
+   the rebuilt ones.  A row without signed bytes is accepted only where the
+   rebuild matches it exactly.  Returns 1 on a match, 0 (logged) otherwise. */
 static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
-                                      const factory_t *f, int hashlock) {
+                                      factory_t *f, int hashlock) {
     const char *sql =
         "SELECT node_index, type, parent_index, parent_vout, nsequence, "
-        "output_amounts, txid FROM tree_nodes WHERE factory_id = ? "
-        "ORDER BY node_index;";
+        "output_amounts, txid, signed_tx_hex FROM tree_nodes "
+        "WHERE factory_id = ? ORDER BY node_index;";
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "persist_load_factory: cannot read tree_nodes: %s\n",
@@ -2472,15 +2575,19 @@ static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
     sqlite3_bind_int(st, 1, (int)factory_id);
 
     size_t n = f->n_nodes;
-    unsigned char *changed = calloc(n ? n : 1, 1);   /* row differs from creation */
-    unsigned char *txid_ok = calloc(n ? n : 1, 1);
-    if (!changed || !txid_ok) {
-        free(changed); free(txid_ok);
-        sqlite3_finalize(st);
-        return 0;
-    }
+    unsigned char (*stored_txid)[32] = calloc(n ? n : 1, 32);   /* internal order */
+    unsigned char *seen = calloc(n ? n : 1, 1);
+    unsigned char *changed = calloc(n ? n : 1, 1);
+    unsigned char *has_tx = calloc(n ? n : 1, 1);
+    unsigned char *spends_own_chain = calloc(n ? n : 1, 1);
+    stored_tx_t *stx = calloc(n ? n : 1, sizeof(stored_tx_t));
+    tx_buf_t *sbytes = calloc(n ? n : 1, sizeof(tx_buf_t));
+    int ok = stored_txid && seen && changed && has_tx && spends_own_chain && stx && sbytes;
+    int has_dw = factory_has_dw_state(f);
     size_t rows = 0;
-    int ok = 1;
+    const char *why = ok ? NULL : "out of memory";
+    long bad = -1;
+
     while (ok && sqlite3_step(st) == SQLITE_ROW) {
         int idx = sqlite3_column_int(st, 0);
         const char *type = (const char *)sqlite3_column_text(st, 1);
@@ -2489,44 +2596,90 @@ static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
         uint32_t nseq = (uint32_t)sqlite3_column_int64(st, 4);
         const char *amounts = (const char *)sqlite3_column_text(st, 5);
         const char *txid = (const char *)sqlite3_column_text(st, 6);
+        const char *shex = (const char *)sqlite3_column_text(st, 7);
         rows++;
-        if (idx < 0 || (size_t)idx >= n) {
-            fprintf(stderr, "persist_load_factory: signed tree node %d does not "
-                    "exist in the rebuilt tree (%zu nodes)\n", idx, n);
-            ok = 0;
-            break;
+        bad = idx;
+        if (idx < 0 || (size_t)idx >= n || seen[idx]) {
+            why = "is not a node of the rebuilt tree"; ok = 0; break;
         }
+        seen[idx] = 1;
         const factory_node_t *node = &f->nodes[idx];
         const char *want_type = node->type == NODE_KICKOFF ? "kickoff" : "state";
         if (!type || strcmp(type, want_type) != 0 || parent != node->parent_index ||
             pvout != (int)node->parent_vout) {
-            fprintf(stderr, "persist_load_factory: signed tree node %d (%s, parent "
-                    "%d:%d) differs from the rebuilt node (%s, parent %d:%u)\n",
-                    idx, type ? type : "?", parent, pvout, want_type,
-                    node->parent_index, (unsigned)node->parent_vout);
-            ok = 0;
-            break;
+            why = "has a different type or parent from the rebuilt node"; ok = 0; break;
+        }
+        if (!txid || strlen(txid) != 64 || hex_decode(txid, stored_txid[idx], 32) != 32) {
+            why = "has no valid txid"; ok = 0; break;
+        }
+        reverse_bytes(stored_txid[idx], 32);
+        if (!amounts) { why = "has no output amounts"; ok = 0; break; }
+        if (shex && *shex) {
+            size_t hl = strlen(shex);
+            if (hl % 2 || hl / 2 > 400000) { why = "has a malformed signed tx"; ok = 0; break; }
+            tx_buf_init(&sbytes[idx], hl / 2);
+            if (hex_decode(shex, sbytes[idx].data, hl / 2) != (int)(hl / 2) ||
+                !parse_stored_tx(sbytes[idx].data, hl / 2, &stx[idx])) {
+                why = "has a malformed signed tx"; ok = 0; break;
+            }
+            sbytes[idx].len = hl / 2;
+            if (memcmp(stx[idx].txid, stored_txid[idx], 32) != 0) {
+                why = "has a signed tx that does not hash to its txid"; ok = 0; break;
+            }
+            if (stx[idx].sequence != nseq) {
+                why = "has a signed tx with a different nSequence"; ok = 0; break;
+            }
+            /* the row's amounts are those of its signed tx */
+            char *signed_amts = format_amounts(stx[idx].amounts, stx[idx].n_out);
+            int same = signed_amts && strcmp(signed_amts, amounts) == 0;
+            free(signed_amts);
+            if (!same) { why = "has a signed tx with different output amounts"; ok = 0; break; }
+            has_tx[idx] = 1;
         }
         char *amt_buf = format_output_amounts(node);
-        if (!amt_buf) { ok = 0; break; }
-        if (nseq != node->nsequence || !amounts || strcmp(amounts, amt_buf) != 0)
+        if (!amt_buf) { why = "out of memory"; ok = 0; break; }
+        if (nseq != node->nsequence || strcmp(amounts, amt_buf) != 0)
             changed[idx] = 1;
         free(amt_buf);
-        unsigned char disp[32];
-        memcpy(disp, node->txid, 32);
-        reverse_bytes(disp, 32);
-        char hex[65];
-        hex_encode(disp, 32, hex);
-        txid_ok[idx] = (txid && strcmp(txid, hex) == 0);
     }
     sqlite3_finalize(st);
-    if (ok && rows > 0 && rows != n) {
-        fprintf(stderr, "persist_load_factory: the DB holds %zu signed tree nodes, "
-                "the rebuilt tree has %zu\n", rows, n);
-        ok = 0;
+
+    if (ok && rows == 0) {
+        bad = -1; why = "no signed tree is stored for this factory"; ok = 0;
+    }
+    if (ok && rows != n) {
+        bad = -1; why = "the number of stored nodes differs from the rebuilt tree"; ok = 0;
+    }
+    /* A node may move on only where an advance can move it. */
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!changed[i]) continue;
+        int may_move = f->nodes[i].type != NODE_KICKOFF &&
+                       (has_dw || node_has_l_stock(f, i));
+        if (!may_move || !has_tx[i]) {
+            bad = (long)i;
+            why = !may_move ? "differs from the rebuild where no advance can change it"
+                            : "differs from the rebuild and has no signed tx";
+            ok = 0;
+        }
+        else if (node_has_l_stock(f, i))
+            spends_own_chain[i] = 1;
+    }
+    /* The stored rows form one signed chain from the funding output. */
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!has_tx[i] || spends_own_chain[i]) continue;
+        int par = f->nodes[i].parent_index;
+        const unsigned char *want = par < 0 ? f->funding_txid : stored_txid[par];
+        uint32_t want_vout = par < 0 ? f->funding_vout : f->nodes[i].parent_vout;
+        if (par >= (int)n || memcmp(stx[i].prev_txid, want, 32) != 0 ||
+            stx[i].prev_vout != want_vout) {
+            bad = (long)i;
+            why = par < 0 ? "does not spend the factory funding output"
+                          : "does not spend its parent's stored output";
+            ok = 0;
+        }
     }
     size_t exempt = 0;
-    for (size_t i = 0; ok && rows > 0 && i < n; i++) {
+    for (size_t i = 0; ok && i < n; i++) {
         int skip = 0;
         for (int j = (int)i; j >= 0 && (size_t)j < n; j = f->nodes[j].parent_index) {
             if (changed[j] || (hashlock && node_has_l_stock(f, (size_t)j))) {
@@ -2534,24 +2687,47 @@ static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
                 break;
             }
         }
-        if (skip) { exempt++; continue; }
-        if (!txid_ok[i]) {
-            fprintf(stderr, "persist_load_factory: rebuilt tree node %zu has a "
-                    "different txid from the signed one in the DB\n", i);
+        if (!skip) {
+            if (memcmp(f->nodes[i].txid, stored_txid[i], 32) != 0) {
+                bad = (long)i; why = "has a different txid from the rebuilt node"; ok = 0;
+            }
+            continue;
+        }
+        if (!has_tx[i]) {
+            bad = (long)i; why = "cannot be checked against the rebuild and has no signed tx";
             ok = 0;
+            continue;
+        }
+        exempt++;
+        /* The signed bytes are what the members committed to (a PS leaf or
+           sub-factory is then brought to its latest chain state below). */
+        factory_node_t *node = &f->nodes[i];
+        {
+            memcpy(node->txid, stored_txid[i], 32);
+            tx_buf_free(&node->signed_tx);
+            tx_buf_init(&node->signed_tx, sbytes[i].len);
+            memcpy(node->signed_tx.data, sbytes[i].data, sbytes[i].len);
+            node->signed_tx.len = sbytes[i].len;
+            node->is_signed = 1;
         }
     }
-    free(changed);
-    free(txid_ok);
+
+    for (size_t i = 0; sbytes && i < n; i++) tx_buf_free(&sbytes[i]);
+    free(sbytes); free(stx); free(spends_own_chain); free(has_tx);
+    free(changed); free(seen); free(stored_txid);
     if (!ok) {
+        if (bad >= 0)
+            fprintf(stderr, "persist_load_factory: signed tree node %ld %s\n", bad, why);
+        else
+            fprintf(stderr, "persist_load_factory: %s\n", why);
         fprintf(stderr, "persist_load_factory: factory %u: the tree rebuilt from "
                 "the DB is not the signed tree; refusing to load it\n", factory_id);
         return 0;
     }
     if (exempt > 0)
         printf("persist: factory %u tree verified against the signed tree "
-               "(%zu node(s) changed since creation, checked by structure only)\n",
-               factory_id, exempt);
+               "(%zu node(s) changed since creation, loaded from their signed "
+               "transactions)\n", factory_id, exempt);
     return 1;
 }
 

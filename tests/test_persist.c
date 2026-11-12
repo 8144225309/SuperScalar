@@ -1086,8 +1086,9 @@ int test_persist_factory_round_trip(void) {
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
-    /* Save factory */
+    /* Save factory and its tree (a factory is never stored without one) */
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
 
     /* Load factory into new struct */
     factory_t *f2 = calloc(1, sizeof(factory_t));
@@ -1515,6 +1516,7 @@ int test_lsp_recovery_round_trip(void) {
     memset(fake_txid, 0xAB, 32);
     factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    f->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels the normal way */
@@ -1550,6 +1552,7 @@ int test_lsp_recovery_round_trip(void) {
     /* Persist: factory, channels, basepoints */
     TEST_ASSERT(persist_begin(&db), "begin");
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
     for (size_t c = 0; c < 4; c++) {
         TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                            (uint32_t)c), "save channel");
@@ -2033,6 +2036,7 @@ int test_persist_crash_stress(void) {
     memset(fake_txid, 0xAB, 32);
     factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    f->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels */
@@ -2063,6 +2067,7 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT(persist_open(&db, path), "c1 open");
         TEST_ASSERT(persist_begin(&db), "c1 begin");
         TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "c1 save factory");
+        TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "c1 save tree");
         for (size_t c = 0; c < 4; c++) {
             TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                                (uint32_t)c), "c1 save ch");

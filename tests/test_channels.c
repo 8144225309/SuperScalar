@@ -2467,7 +2467,8 @@ int test_regtest_lsp_restart_recovery(void) {
         fprintf(stderr, "LSP: persist_begin failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !persist_save_factory(&db, &lsp->factory, ctx, 0)) {
+    if (lsp_ok && (!persist_save_factory(&db, &lsp->factory, ctx, 0) ||
+                   !persist_save_tree_nodes(&db, &lsp->factory, 0))) {
         fprintf(stderr, "LSP: persist_save_factory failed\n");
         lsp_ok = 0;
     }
@@ -3032,7 +3033,8 @@ int test_regtest_crash_double_recovery(void) {
         fprintf(stderr, "LSP: persist_begin failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !persist_save_factory(&db, &lsp->factory, ctx, 0)) {
+    if (lsp_ok && (!persist_save_factory(&db, &lsp->factory, ctx, 0) ||
+                   !persist_save_tree_nodes(&db, &lsp->factory, 0))) {
         fprintf(stderr, "LSP: persist_save_factory failed\n");
         lsp_ok = 0;
     }

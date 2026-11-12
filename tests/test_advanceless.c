@@ -285,6 +285,7 @@ int test_advanceless_persist_reload(void) {
         else
             TEST_ASSERT(al_build(f, ctx, kps, shapes[k].n, shapes[k].a, shapes[k].na,
                                  shapes[k].st), "build");
+        TEST_ASSERT(factory_sign_all(f), "sign the tree");
         persist_t db;
         TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
         TEST_ASSERT_EQ(persist_schema_version(&db), 40, "schema 40");
@@ -315,6 +316,63 @@ int test_advanceless_persist_reload(void) {
             TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET level_arity = '8,x';",
                                      NULL, NULL, NULL) == SQLITE_OK, "corrupt list");
             TEST_ASSERT(al_load_refused(&db, ctx), "corrupt level_arity refused");
+            TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "re-save factory");
+            TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
+
+            /* One edited nSequence: the row no longer matches its signed tx,
+               and a kickoff never moves on. */
+            TEST_ASSERT(sqlite3_exec(db.db, "UPDATE tree_nodes SET nsequence = nsequence - 1 "
+                                     "WHERE node_index = 0;", NULL, NULL, NULL) == SQLITE_OK,
+                        "edit root nSequence");
+            TEST_ASSERT(al_load_refused(&db, ctx), "edited nSequence refused");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+            /* A leaf state's nSequence edited too. */
+            char q[128];
+            snprintf(q, sizeof(q), "UPDATE tree_nodes SET nsequence = 5 WHERE node_index = %zu;",
+                     f->leaf_node_indices[0]);
+            TEST_ASSERT(sqlite3_exec(db.db, q, NULL, NULL, NULL) == SQLITE_OK, "edit leaf");
+            TEST_ASSERT(al_load_refused(&db, ctx), "edited leaf nSequence refused");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+            /* Fee-rule drift: every rebuilt amount differs from the signed tree,
+               from the root down. */
+            TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET fee_per_tx = fee_per_tx + 1;",
+                                     NULL, NULL, NULL) == SQLITE_OK, "drift fee");
+            TEST_ASSERT(al_load_refused(&db, ctx), "changed root amounts refused");
+            TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "re-save factory");
+            TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
+            /* A signed tx that is not the row's: the root row's bytes swapped
+               for the next node's. */
+            TEST_ASSERT(sqlite3_exec(db.db, "UPDATE tree_nodes SET signed_tx_hex = "
+                                     "(SELECT signed_tx_hex FROM tree_nodes WHERE node_index = 1) "
+                                     "WHERE node_index = 0;", NULL, NULL, NULL) == SQLITE_OK,
+                        "swap signed tx");
+            TEST_ASSERT(al_load_refused(&db, ctx), "foreign signed tx refused");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+            /* No stored tree at all. */
+            TEST_ASSERT(sqlite3_exec(db.db, "DELETE FROM tree_nodes;", NULL, NULL, NULL) == SQLITE_OK,
+                        "drop the tree");
+            TEST_ASSERT(al_load_refused(&db, ctx), "factory without a tree refused");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+            TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
+        }
+        if (k == 3) {
+            /* A legitimate refresh of a DW tree: the advanced signed states
+               are loaded from their signed transactions. */
+            TEST_ASSERT(factory_advance(f), "advance the DW tree");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save advanced tree");
+            factory_t *g = calloc(1, sizeof(*g));
+            TEST_ASSERT(g && persist_load_factory(&db, 0, g, ctx), "advanced tree loads");
+            for (size_t i = 0; i < f->n_nodes; i++)
+                TEST_ASSERT(memcmp(g->nodes[i].txid, f->nodes[i].txid, 32) == 0,
+                            "loaded node is the advanced signed one");
+            factory_free(g);
+            free(g);
+            /* The advanced root state's row pointed at another output of the
+               root kickoff: its signed tx does not spend it. */
+            TEST_ASSERT(sqlite3_exec(db.db, "UPDATE tree_nodes SET parent_vout = 1 "
+                                     "WHERE node_index = 1;", NULL, NULL, NULL) == SQLITE_OK,
+                        "repoint the advanced state");
+            TEST_ASSERT(al_load_refused(&db, ctx), "advanced state off its parent refused");
         }
         persist_close(&db);
         factory_free(f);
