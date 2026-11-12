@@ -117,13 +117,15 @@ outval(){ $BCLI getrawtransaction "$1" true 2>/dev/null | python3 -c "import jso
 try: print(int(round(json.load(sys.stdin)['vout'][$2]['value']*1e8)))
 except Exception: print(-1)"; }
 
-if ! $BCLI getblockcount >/dev/null 2>&1; then
-    # no node yet (CI writes the conf and leaves starting it to the harness)
-    echo "--- starting bitcoind -txindex from $REGTEST_CONF ---"
-    bitcoind -conf="$REGTEST_CONF" -daemon -txindex=1 >/dev/null
-    for i in $(seq 1 60); do $BCLI getblockcount >/dev/null 2>&1 && break; sleep 1; done
-    $BCLI getblockcount >/dev/null 2>&1 || fail "bitcoind did not start"
-fi
+# (Re)start the node with -txindex and its default relay floor: a run with
+# MINRELAY leaves it running with a raised -minrelaytxfee, and the next run on
+# the same node (CI runs them in sequence) must not inherit that.
+echo "--- (re)starting bitcoind -txindex from $REGTEST_CONF ---"
+$BCLI stop >/dev/null 2>&1 && for i in $(seq 1 30); do sleep 1; $BCLI getblockcount >/dev/null 2>&1 || break; done
+sleep 2
+bitcoind -conf="$REGTEST_CONF" -daemon -txindex=1 >/dev/null
+for i in $(seq 1 60); do $BCLI getblockcount >/dev/null 2>&1 && break; sleep 1; done
+$BCLI getblockcount >/dev/null 2>&1 || fail "bitcoind did not start"
 $BCLI -named createwallet wallet_name=$WALLET load_on_startup=false >/dev/null 2>&1 || $BCLI loadwallet $WALLET >/dev/null 2>&1 || true
 MINE_ADDR=$($BCLI -rpcwallet=$WALLET -named getnewaddress address_type=bech32m)
 mine 110
@@ -260,7 +262,7 @@ if [ "$GRIEF" = wallet ]; then
     done
     mine 1
 fi
-declare -a GRIEFED GCHILD
+GRIEFED=(); GCHILD=()
 grief_all(){
     for t in "${TREE[@]}"; do
         local dc
@@ -320,6 +322,7 @@ count_confirmed(){
 }
 NUNCONF_PARENT=0
 NOCOIN_SEEN=0
+TC=0; CC=0
 if [ "$SOLO" = 1 ]; then
     echo "--- the clients exit one at a time ($EXIT_ORDER), each running --force-close alone ---"
     ORDER="$EXIT_ORDER"
