@@ -1226,6 +1226,8 @@ int test_regtest_wire_factory(void) {
         if (pid == 0) {
             /* Child: run client ceremony */
             usleep(100000 * (c + 1));  /* stagger connections: 100ms, 200ms, ... */
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1432,6 +1434,8 @@ int test_regtest_wire_factory_arity1(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1650,6 +1654,8 @@ int test_regtest_wire_factory_mixed_arity(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
