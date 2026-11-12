@@ -34,6 +34,32 @@ int   regtest_get_block_height(regtest_t *rt);
    with the current best-block hash hex. Returns 1 on success, 0 on error. */
 int   regtest_get_best_block_hash(regtest_t *rt, char *hash_out_buf);
 
+/* Read the chain tip's height and hash from ONE getblockchaininfo call, so
+   the pair is always consistent.  Calling regtest_get_block_height() and
+   regtest_get_best_block_hash() back to back is racy: a block connected
+   between the two RPCs pairs height H with the hash of block H+1.
+   On success writes *height_out and hash_out (64 hex chars + NUL) and
+   returns 1.  On error sets *height_out = -1, hash_out[0] = 0, returns 0. */
+int   regtest_get_tip(regtest_t *rt, int *height_out, char hash_out[65]);
+
+/* One entry of getchaintips.  status is bitcoind's string: "active",
+   "valid-fork" (fully validated, not in the main chain: typically blocks
+   that were disconnected by a reorg), "invalid", "valid-headers",
+   "headers-only".  The branch forks off the main chain at
+   height - branchlen. */
+typedef struct {
+    int  height;
+    int  branchlen;
+    char status[16];
+    char hash[65];
+} regtest_chain_tip_t;
+
+/* getchaintips.  Writes up to max entries (bitcoind lists them by height,
+   highest first) to out and the number written to *n_out.  Returns 1 on
+   success, 0 on error. */
+int   regtest_get_chain_tips(regtest_t *rt, regtest_chain_tip_t *out,
+                             size_t max, size_t *n_out);
+
 /* Get the block hash at a given height. Writes 64 hex chars + NUL to hash_out.
    Returns 1 on success, 0 on error. */
 int   regtest_get_block_hash(regtest_t *rt, int height,
@@ -90,6 +116,17 @@ int   regtest_parse_gettxout(const char *result);
 int   regtest_outpoint_unspent(regtest_t *rt,
                                  const char *txid_hex_display,
                                  uint32_t vout);
+/* Confirmations of txid: >= 1 confirmed in the active chain, 0 known but
+   unconfirmed (mempool; with -txindex also a TX whose block was
+   disconnected), -1 not found, REGTEST_CONF_RPC_ERROR (-2) when bitcoind
+   could not be reached, so the answer is unknown (the lookup stops at the
+   first call that got no answer), REGTEST_CONF_CONFLICTED (-3) for a
+   wallet TX that conflicts with a confirmed TX (the wallet's negative
+   confirmations), which can never confirm.
+   Without -txindex a non-wallet TX deeper than rt->scan_depth blocks is
+   reported as not found. */
+#define REGTEST_CONF_RPC_ERROR (-2)
+#define REGTEST_CONF_CONFLICTED (-3)
 
 /* Chain-only view of an outpoint (mempool ignored).
    Returns 1 if its transaction is confirmed and the output was spent by a
@@ -99,6 +136,28 @@ int   regtest_outpoint_spent_confirmed(regtest_t *rt,
                                          const char *txid_hex_display,
                                          uint32_t vout);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
+
+/* 1 when the most recent regtest_exec() on this thread got no answer from
+   bitcoind (connection failure, timeout, bitcoin-cli unable to connect or
+   to run); 0 when bitcoind answered, even with an RPC error. */
+int   regtest_last_rpc_unreachable(void);
+
+/* gettxout txid:vout, mempool included.  Returns 1 when the output is
+   unspent (confirmations: >= 1 in a block, 0 in the mempool; bestblock is
+   the tip it was evaluated at), 0 when there is no unspent output (spent,
+   or the TX is in neither the chain nor the mempool), -1 when bitcoind
+   could not be reached or answered with an error.  Needs no -txindex. */
+int   regtest_get_txout(regtest_t *rt, const char *txid_hex, uint32_t vout,
+                        int *confirmations, char bestblock_out[65]);
+
+/* Height of a block by hash (getblockheader), -1 on error. */
+int   regtest_get_block_header_height(regtest_t *rt, const char *block_hash);
+
+/* 1 when the block block_hash contains txid_hex, 0 when it does not (or
+   bitcoind answered with an error), -1 when bitcoind could not be reached.
+   getrawtransaction with a block hash: needs no -txindex. */
+int   regtest_block_contains_tx(regtest_t *rt, const char *block_hash,
+                                const char *txid_hex);
 /*
  * Batch confirmations for n_txids display-order hex txids.
  * Fetches each block only once (getblock hash 1), O(scan_depth) RPCs total.
