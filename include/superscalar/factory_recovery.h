@@ -31,7 +31,8 @@
  * Never broadcasts: an active factory's tree must not be published just
  * because its funding confirmed.  For each factory it refreshes the tree
  * nodes' confirmations and marks the factory 'closed' in the DB if all
- * leaf nodes are confirmed.
+ * leaf nodes are confirmed.  'closed' says the tree is on chain, not that
+ * the channel outputs of its leaves have been spent.
  *
  * chain may be NULL — in that case the scan is a no-op (returns 0).
  * Returns number of factories examined.
@@ -66,11 +67,32 @@ typedef struct {
     int n_waiting;          /* parent not confirmed yet, or a relative
                                timelock still running: run again later */
     int n_rejected;         /* refused although the parent is buried deep
-                               enough for the node's relative timelock */
+                               enough and any height lock has passed:
+                               waiting will not cure it (fee below the
+                               node's floor, input spent by another
+                               transaction, policy) */
     int published;          /* 1 = every target is confirmed or in mempool */
     int leaf_node;          /* exit-path run: node index of the leaf, else -1 */
+    int retained_leaf;      /* the leaf is a kept earlier version of that node */
     int first_unpublished;  /* lowest target node not yet published, or -1 */
+    int reject_node;        /* first rejected node, or -1 */
+    char reject_why[96];    /* why it was rejected */
 } factory_recovery_result_t;
+
+/* What recovery reads from a serialized transaction. */
+typedef struct {
+    char     txid[65];       /* display hex */
+    char     prev_txid[65];  /* first input's outpoint, display hex */
+    uint32_t prev_vout;
+    uint32_t nsequence;      /* first input */
+    uint32_t locktime;
+    size_t   n_outputs;
+} factory_recovery_tx_info_t;
+
+/* Parse a serialized transaction (with or without witness).  Returns 1 on
+   success. */
+int factory_recovery_tx_info(const unsigned char *tx, size_t len,
+                             factory_recovery_tx_info_t *out);
 
 /*
  * Run one force-close pass for one factory: broadcast every target tree
@@ -80,7 +102,13 @@ typedef struct {
  *
  * leaf_txid NULL publishes the whole tree.  Otherwise it is the txid
  * (display hex) of one tree node, and only the path from the root to that
- * node is published: a client's unilateral exit.
+ * node is published: a client's unilateral exit.  When the tree has moved
+ * past that txid (an advance replaced the leaf), the copy the client kept
+ * in client_funding_leaf is published in place of the current row; without
+ * one the run is an error, because the current row spends the output the
+ * client's commitment needs.  A node waiting on its relative or absolute
+ * height lock counts as waiting; one refused for any other reason as
+ * rejected, with the reason in res.
  *
  * The tree is loaded in full, whatever its size.  The pass is an error, and
  * nothing is reported as published, when the persisted tree is incomplete
@@ -98,10 +126,11 @@ int factory_recovery_run(persist_t *p, chain_backend_t *chain,
                          char *status_out, size_t cap);
 
 /*
- * Find the tree node a client's channel is funded by: the funding txid of
+ * Find the leaf a client exits through: the transaction its latest signed
+ * commitment spends, or, without a readable commitment, the funding txid of
  * the channel rows of factory_id.  Writes it to txid_out (display hex).
- * Returns 1 if the DB names exactly one such transaction (a client DB),
- * 0 if it names none, -1 if it names several or on a DB error.
+ * Returns 1 if found, 0 if the DB names none, -1 if the channel rows name
+ * several or on a DB error.
  */
 int factory_recovery_client_leaf(persist_t *p, uint32_t factory_id,
                                  char txid_out[65]);

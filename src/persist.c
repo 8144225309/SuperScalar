@@ -1396,6 +1396,28 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* Client copy of the signed leaf transaction its channel is funded by,
+       kept when a leaf advance replaces that leaf in tree_nodes.  The
+       client's commitments keep spending this transaction's output, so a
+       unilateral exit has to publish it.  CREATE TABLE IF NOT EXISTS is
+       idempotent, so no version gate. */
+    {
+        char *fl_err = NULL;
+        if (sqlite3_exec(p->db,
+                "CREATE TABLE IF NOT EXISTS client_funding_leaf ("
+                "  factory_id INTEGER NOT NULL,"
+                "  node_index INTEGER NOT NULL,"
+                "  txid TEXT NOT NULL,"            /* display hex */
+                "  signed_tx_hex TEXT NOT NULL,"
+                "  PRIMARY KEY (factory_id, txid)"
+                ");",
+                NULL, NULL, &fl_err) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: client_funding_leaf table error: %s\n",
+                    fl_err ? fl_err : "unknown");
+            sqlite3_free(fl_err);
+        }
+    }
+
     /* Client record of a cooperative close it has co-signed: one row per
        factory, keyed by the factory's funding outpoint.  Written before the
        client releases its partial signature, so a client that restarts
@@ -1654,6 +1676,30 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
     if (own_txn && !persist_commit(p)) return 0;
     return 1;
+}
+
+int persist_save_funding_leaf(persist_t *p, uint32_t factory_id,
+                              uint32_t node_index, const char *txid_display_hex,
+                              const unsigned char *signed_tx, size_t len) {
+    if (!p || !p->db || !txid_display_hex || !signed_tx || len == 0) return 0;
+    char *tx_hex = malloc(len * 2 + 1);
+    if (!tx_hex) return 0;
+    hex_encode(signed_tx, len, tx_hex);
+    sqlite3_stmt *stmt;
+    int ok = 0;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR IGNORE INTO client_funding_leaf "
+            "(factory_id, node_index, txid, signed_tx_hex) VALUES (?, ?, ?, ?);",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, (int)factory_id);
+        sqlite3_bind_int(stmt, 2, (int)node_index);
+        sqlite3_bind_text(stmt, 3, txid_display_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, tx_hex, -1, SQLITE_TRANSIENT);
+        ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+    }
+    free(tx_hex);
+    return ok;
 }
 
 int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
