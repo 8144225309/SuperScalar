@@ -136,6 +136,13 @@ Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a
 - **`--sweep-to-local` for any client:** the sweep loaded the channel stored under id 0 and initialised the channel of participant 1, so only that client could sweep; it now uses the client's own channel and participant index, and its fee follows `--fee-rate` (it is signed at sweep time), not the factory's pre-signed rate.
 - **Fee results checked:** commitment, JIT close and rotation close fees that cannot be computed (`FEE_INVALID`) fail the operation instead of wrapping into balances; a fee API's rates are clamped to 10000 sat/vB.
 
+### Pseudo-Spilman record-and-refuse fails closed
+
+- The client's PS signing refusal (`client_ps_signed_inputs`) fails closed: a lookup error, a sighash that cannot be computed or does not match the session's message, or a record insert that fails or loses to a conflicting record now aborts the advance before `MSG_LEAF_ADVANCE_FINAL` is sent. Previously each of these let the client sign, or send, without a durable record.
+- The record is a plain `INSERT` (first record wins) written before our partial sig enters the signing session, and a stored record with the same sighash is an idempotent retry rather than a refusal, so a crash between record and send no longer gets the LSP's identical retry refused.
+- The client now honours `SUPERSCALAR_CRASH_AT` at three checkpoints on this path: `ps_record_pre_save`, `ps_record_post_save`, `ps_record_post_final`. Operator-set and inert when unset; an empty value aborts at every checkpoint.
+- Tests in `tests/test_ps_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Record-and-refuse: ordering and failure semantics".
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
