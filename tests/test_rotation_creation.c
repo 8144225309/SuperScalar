@@ -121,7 +121,9 @@ static int rc_run_creation(int mode) {
         pid_t pid = fork();
         if (pid == 0) {
             alarm(90);                      /* never outlive a broken parent */
-            usleep(100000 * (c + 1));
+            usleep(100000 * (4 - c));  /* reverse key order: the hint decides */
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *cctx = rc_ctx();
             secp256k1_keypair ckp;
             if (!secp256k1_keypair_create(cctx, &ckp, rc_seckeys[c + 1])) _exit(2);
