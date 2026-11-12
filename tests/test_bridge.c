@@ -1283,7 +1283,7 @@ int test_regtest_bridge_payment(void) {
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1361,12 +1361,14 @@ int test_regtest_bridge_payment(void) {
 
                     /* Verify channel balance: client 0's remote increased */
                     channel_t *ch0 = &ch_mgr.entries[0].channel;
-    fee_estimator_static_t fe;
-                    fee_estimator_static_init(&fe, 1000);
-                    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
+                    uint64_t commit_fee =
+                        fee_commitment_tx_at(ch0->commit_fee_rate_sat_per_kvb, 0);
                     uint64_t usable = ch0->funding_amount > commit_fee ?
                                       ch0->funding_amount - commit_fee : 0;
-                    uint64_t orig_remote = usable / 2;
+                    /* The opening split of lsp_channels_init (and the client's
+                       channel): LSP local = usable * pct / 100 at the default
+                       50, the client the rest (the odd sat). */
+                    uint64_t orig_remote = usable - (usable * 50) / 100;
                     TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
                                    "payee remote balance increased");
 
@@ -1783,7 +1785,7 @@ int test_regtest_bridge_out(void) {
     int lsp_ok = 1;
     if (!lsp_accept_clients(lsp)) { fprintf(stderr, "LSP: accept failed\n"); lsp_ok = 0; }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
-                                            fund_spk, 34, 10, 4, 0)) {
+                                            fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
     }
 
@@ -2065,7 +2067,7 @@ int test_regtest_bridge_invoice_flow(void) {
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2188,12 +2190,14 @@ int test_regtest_bridge_invoice_flow(void) {
 
                     /* Verify channel balance: client 0's remote increased */
                     channel_t *ch0 = &ch_mgr.entries[0].channel;
-    fee_estimator_static_t fe;
-                    fee_estimator_static_init(&fe, 1000);
-                    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
+                    uint64_t commit_fee =
+                        fee_commitment_tx_at(ch0->commit_fee_rate_sat_per_kvb, 0);
                     uint64_t usable = ch0->funding_amount > commit_fee ?
                                       ch0->funding_amount - commit_fee : 0;
-                    uint64_t orig_remote = usable / 2;
+                    /* The opening split of lsp_channels_init (and the client's
+                       channel): LSP local = usable * pct / 100 at the default
+                       50, the client the rest (the odd sat). */
+                    uint64_t orig_remote = usable - (usable * 50) / 100;
                     TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
                                    "payee remote balance increased");
 
@@ -2956,14 +2960,14 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
         uint8_t arities[3] = { 2, 4, 8 };
         factory_set_level_arity(&lsp->factory, arities, 3);
         factory_set_static_near_root(&lsp->factory, 1);
-        lsp->factory.fee_per_tx = 1000;
+        lsp->factory.tree_fee_rate = 5000;
     }
 
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP-n64: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2974,13 +2978,13 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
                        "n64 mixed-arity preserved (n_level_arity=3)");
         TEST_ASSERT_EQ(lsp->factory.static_threshold_depth, 1,
                        "n64 static_threshold=1 preserved");
-        TEST_ASSERT(lsp->factory.fee_per_tx >= 1000,
-                    "n64 fee_per_tx >= 1000 preserved");
+        TEST_ASSERT_EQ(lsp->factory.tree_fee_rate, 5000,
+                    "n64 tree_fee_rate preserved across the creation re-init");
         TEST_ASSERT(lsp->factory.n_leaf_nodes == 8,
                     "n64 mixed {2,4,8} -> 8 leaves at depth 2");
-        printf("  [bridge-n64] factory: %zu nodes, %d leaves, fee_per_tx=%llu\n",
+        printf("  [bridge-n64] factory: %zu nodes, %d leaves, tree_fee_rate=%llu\n",
                lsp->factory.n_nodes, lsp->factory.n_leaf_nodes,
-               (unsigned long long)lsp->factory.fee_per_tx);
+               (unsigned long long)lsp->factory.tree_fee_rate);
     }
 
     lsp_channel_mgr_t ch_mgr;

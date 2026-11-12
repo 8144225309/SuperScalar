@@ -65,6 +65,8 @@ static int harness_channel_cb(int fd, channel_t *channel, uint32_t my_index,
 }
 
 int main(int argc, char **argv) {
+    client_set_allow_unverified_funding(1);   /* chainless creation */
+
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     if (argc < 2) {

@@ -50,6 +50,23 @@ static uint64_t query_estimatesmartfee(regtest_t *rt, int target_blocks)
     return sat_per_kvb;
 }
 
+/* The node's own relay floor (getnetworkinfo relayfee, sat/kvB); 0 if it
+   cannot be read. */
+static uint64_t query_relayfee(regtest_t *rt)
+{
+    char *result = regtest_exec(rt, "getnetworkinfo", "");
+    if (!result) return 0;
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json) return 0;
+    cJSON *rf = cJSON_GetObjectItem(json, "relayfee");
+    uint64_t sat_per_kvb = 0;
+    if (rf && cJSON_IsNumber(rf) && rf->valuedouble > 0)
+        sat_per_kvb = (uint64_t)(rf->valuedouble * 100000000.0 + 0.5);
+    cJSON_Delete(json);
+    return sat_per_kvb;
+}
+
 static uint64_t rpc_get_rate(fee_estimator_t *self, fee_target_t target)
 {
     fee_estimator_rpc_t *fe = (fee_estimator_rpc_t *)self;
@@ -67,10 +84,17 @@ static uint64_t rpc_get_rate(fee_estimator_t *self, fee_target_t target)
             fe->last_updated = now;
         }
     }
-    /* Fall back to 1 sat/vB when estimatesmartfee is unavailable (e.g. regtest).
-       This matches the client's static default and prevents channel balance
-       mismatches when the two sides compute commit fees independently. */
-    return fe->cached[idx] > 0 ? fe->cached[idx] : 1000;
+    /* No estimate (e.g. regtest, or a node without fee history): the node's
+       own relay floor, the least it accepts (FEE_FLOOR_SAT_PER_KVB when it
+       reports none), except for URGENT, the target of deadline-bound spends:
+       at least FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB.  (Commitment fees do not
+       depend on this: both sides use the factory's agreed rate.) */
+    if (fe->cached[idx] > 0) return fe->cached[idx];
+    uint64_t floor = query_relayfee((regtest_t *)fe->rt);
+    if (floor == 0) floor = FEE_FLOOR_SAT_PER_KVB;
+    if (target == FEE_TARGET_URGENT && floor < FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB)
+        return FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB;
+    return floor;
 }
 
 static void rpc_update(fee_estimator_t *self)

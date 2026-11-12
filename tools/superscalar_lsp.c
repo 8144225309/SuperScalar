@@ -8,6 +8,7 @@
 #include "superscalar/report.h"
 #include "superscalar/persist.h"
 #include "superscalar/fee.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/network.h"
@@ -195,6 +196,12 @@ static void usage(const char *prog) {
         "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
         "  --demo              Run demo payment sequence after channels ready\n"
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
+        "  --tree-fee-rate N   Rate in sat/kvB every pre-signed factory tx pays (tree nodes,\n"
+        "                      distribution TX, commitments): a factory term the members\n"
+        "                      check (default 100 = 0.1 sat/vB; 0 = no fee, every tx goes\n"
+        "                      out with a CPFP child)\n"
+        "  --allow-anchorless-tree  Tests only: fund a tree with nodes that carry no P2A\n"
+        "                      anchor (n-way leaves, sub-factories) and cannot be bumped\n"
         "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
@@ -203,7 +210,7 @@ static void usage(const char *prog) {
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
         "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
-        "  --cltv-timeout N    Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest)\n"
+        "  --cltv-timeout N    Factory CLTV timeout (absolute block height, at least creation + active + dying blocks and past a member exit; auto: that, minimum +35 on regtest, +10 elsewhere)\n"
         "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
@@ -228,18 +235,20 @@ static void usage(const char *prog) {
         "                      'rotate'). Off by default: a DYING factory keeps serving\n"
         "                      its channels until it expires. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
-        "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
-        "                       Comma-separated activates TRUE N-way mixed arity per level\n"
-        "                       (root..leaves). Each value must be 1-15. Canonical shapes:\n"
-        "                       up to 16 clients => 3 (uniform PS); 17-32 => 3,4; 33-64 =>\n"
-        "                       3,4,8 (or 2,4,8 for DW leaves); 65-128 => 2,4,8 (with\n"
-        "                       --static-near-root 1 or 2). See docs/factory-arity.md.\n"
+        "  --arity N|N,N,...   Tree shape.  Without --arity, --static-near-root and\n"
+        "                       --ps-subfactory-arity the LSP builds the ADVANCELESS tree:\n"
+        "                       every interior level static (kickoff only, no DW state),\n"
+        "                       one member per pseudo-Spilman leaf, depth = fewest levels\n"
+        "                       with 15^depth >= clients, fan-out = smallest F >= 4 with\n"
+        "                       F^depth >= clients (4 clients => 4,3 static 1; 64 => 8,8,3\n"
+        "                       static 2; 255 => 7,7,7,3 static 3).  Its life is extended\n"
+        "                       only by rotation.  Explicit shapes: 1=DW, 2=DW, 3=PS\n"
+        "                       (uniform); a comma list sets the arity per level (root..\n"
+        "                       leaves, each 1-15).  See docs/factory-arity.md.\n"
         "  --static-near-root N  Top N tree depths are kickoff-only (no paired NODE_STATE,\n"
-        "                       no DW counter, only CLTV timeout escape). Reduces total\n"
-        "                       CSV consumption from those layers to zero. Range 0..7\n"
-        "                       (FACTORY_MAX_LEVELS-1); 0 = disabled (default). Canonical\n"
-        "                       128-client deployment is --arity 2,4,8 --static-near-root 2\n"
-        "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
+        "                       no DW counter, only CLTV timeout escape). Range 0..7\n"
+        "                       (FACTORY_MAX_LEVELS-1).  With --arity and no\n"
+        "                       --static-near-root the shape keeps DW state on every level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --enable-hashlock-poison  Build the factory with hashlock-gated L-stock\n"
@@ -291,7 +300,8 @@ static void usage(const char *prog) {
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --safe-confs N      Set ALL confirmation depths at once (shorthand).\n"
-        "  --funding-confs N   Funding TX depth before acting (default: %d, CLN=3, LND=1-6)\n"
+        "  --funding-confs N   Funding TX depth before acting (default: 6 mainnet,\n"
+        "                      3 signet/testnet/testnet4; clients use the same default)\n"
         "  --close-confs N     Close TX depth before removing entries (default: %d, LDK=6)\n"
         "  --penalty-confs N   Penalty TX depth before removing breach entry (default: %d)\n"
         "  --sweep-confs N     HTLC sweep depth before considering settled (default: %d)\n"
@@ -370,7 +380,7 @@ static void usage(const char *prog) {
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS,
-        CONF_DEFAULT_FUNDING, CONF_DEFAULT_CLOSE,
+        CONF_DEFAULT_CLOSE,
         CONF_DEFAULT_PENALTY, CONF_DEFAULT_SWEEP,
         LSP_MAX_CLIENTS);
 }
@@ -743,7 +753,11 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
         hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
 
         char txid_out[65];
-        int ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+        (void)rt;  /* broadcasts go through the CPFP default set up in main */
+        cpfp_result_t res = cpfp_send_default(NULL, tx_hex, txid_out);
+        int ok = res != CPFP_FAILED;
+        if (res == CPFP_PARENT_ONLY)
+            printf("  node[%zu] is in the mempool without its CPFP child\n", i);
 
         /* Audit log */
         if (g_db) {
@@ -910,7 +924,10 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
     int bcast_limit = is_regtest ? 60 : confirm_timeout;
     const int CSV_RETRY_INTERVAL_SECS = 60;
     for (int attempt = 0; bcast_waited < bcast_limit; attempt++) {
-        ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+        cpfp_result_t res = cpfp_send_default(NULL, tx_hex, txid_out);
+        ok = res != CPFP_FAILED;
+        if (res == CPFP_PARENT_ONLY)
+            printf("  %s is in the mempool without its CPFP child\n", log_source);
         if (ok) break;
         if (attempt == 0) {
             printf("  %s broadcast pending (waiting for BIP68)...\n", log_source);
@@ -933,9 +950,9 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         persist_log_broadcast(g_db, ok ? txid_out : "?", log_source, tx_hex,
                               ok ? "ok" : "failed");
     }
-    free(tx_hex);
 
     if (!ok) {
+        free(tx_hex);
         fprintf(stderr, "force-close: %s broadcast failed after retries\n", log_source);
         return 0;
     }
@@ -952,15 +969,31 @@ static int broadcast_one_signed_tx(regtest_t *rt, const char *mine_addr,
         printf("  %s broadcast OK (txid=%.16s...), waiting for stable confirmation...\n",
                log_source, txid_out);
         fflush(stdout);
-        if (!regtest_wait_for_stable_confirmation(rt, txid_out,
-                                                    /*target_depth=*/1,
-                                                    /*max_reorg_depth=*/3,
-                                                    confirm_timeout)) {
+        /* Wait in slices and send the tx again between them: the CPFP path
+           raises its package (a new or replacing anchor child) when it pays
+           less than the urgent estimate or the mempool minimum has risen. */
+        const int REBUMP_INTERVAL_SECS = 600;
+        int waited = 0, confirmed = 0;
+        while (!confirmed && waited < confirm_timeout) {
+            int slice = confirm_timeout - waited;
+            if (slice > REBUMP_INTERVAL_SECS) slice = REBUMP_INTERVAL_SECS;
+            confirmed = regtest_wait_for_stable_confirmation(rt, txid_out,
+                                                             /*target_depth=*/1,
+                                                             /*max_reorg_depth=*/3,
+                                                             slice);
+            waited += slice;
+            if (!confirmed && waited < confirm_timeout) {
+                char again[65];
+                cpfp_send_default(NULL, tx_hex, again);
+            }
+        }
+        if (!confirmed) {
             fprintf(stderr,
                     "  %s confirmation wait timed out or stuck on reorg — "
                     "downstream may need to re-broadcast\n", log_source);
         }
     }
+    free(tx_hex);
 
     if (display_txid_internal_be) {
         unsigned char disp[32];
@@ -1333,6 +1366,8 @@ int main(int argc, char *argv[]) {
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
     uint64_t fee_rate = 1000;  /* sat/kvB, default 1 sat/vB */
+    uint64_t tree_fee_rate_arg = FACTORY_DEFAULT_TREE_FEE_RATE;  /* --tree-fee-rate */
+    int allow_anchorless_tree = 0;   /* --allow-anchorless-tree (tests) */
     int bump_budget_pct = 0;       /* --bump-budget-pct (0 = default 50%) */
     uint64_t max_bump_fee = 0;     /* --max-bump-fee (0 = default 50000 sats) */
     const char *seckey_hex = NULL;
@@ -1371,12 +1406,15 @@ int main(int argc, char *argv[]) {
     int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
     int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
-    int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
-                                        (1, 2 = legacy DW; 3 = PS canonical) */
+    int leaf_arity = 3;              /* with --arity: 1, 2 = DW; 3 = PS.  Without
+                                        any shape option the advanceless default
+                                        replaces it (factory_advanceless_shape) */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
-    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only.
-                                        0 = disabled (default for backward compat) */
+    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only. */
+    int shape_given = 0;             /* --arity / --static-near-root /
+                                        --ps-subfactory-arity on the command
+                                        line; otherwise the advanceless shape */
     int force_close = 0;
     int test_burn = 0;
     int enable_hashlock_poison = 0;  /* #53 Phase 3: hashlock-gated L-stock poison */
@@ -1580,6 +1618,10 @@ int main(int argc, char *argv[]) {
             demo_mode = 1;
         else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
             fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--tree-fee-rate") == 0 && i + 1 < argc)
+            tree_fee_rate_arg = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--allow-anchorless-tree") == 0)
+            allow_anchorless_tree = 1;
         else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc)
             backup_dir = argv[++i];
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
@@ -1732,8 +1774,10 @@ int main(int argc, char *argv[]) {
             test_subfactory_advance = 1;
             cheat_subfactory_after_advance = 1;
         }
-        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc) {
             ps_subfactory_arity_arg = atoi(argv[++i]);
+            shape_given = 1;
+        }
         else if (strcmp(argv[i], "--test-jit") == 0)
             test_jit = 1;
         else if (strcmp(argv[i], "--test-lsps2") == 0)
@@ -1785,6 +1829,7 @@ int main(int argc, char *argv[]) {
             uint8_t parsed[FACTORY_MAX_LEVELS];
             size_t n_parsed = 0;
             int parsed_leaf = 0;
+            shape_given = 1;
             if (!cli_parse_arity_spec(arity_str, parsed, FACTORY_MAX_LEVELS,
                                        &n_parsed, &parsed_leaf,
                                        err, sizeof(err))) {
@@ -1808,6 +1853,7 @@ int main(int argc, char *argv[]) {
                Phase 4: parsing delegated to cli_parse_static_near_root(). */
             char err[256];
             uint32_t v = 0;
+            shape_given = 1;
             if (!cli_parse_static_near_root(argv[++i], &v, err, sizeof(err))) {
                 fprintf(stderr, "%s\n", err);
                 return 1;
@@ -2460,6 +2506,7 @@ int main(int argc, char *argv[]) {
             .have_wt_db = wt_db_path != NULL,
             .enable_jit_experimental = enable_jit_experimental,
             .enable_rotation_experimental = enable_rotation_experimental,
+            .allow_anchorless_tree = allow_anchorless_tree,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -2556,6 +2603,36 @@ int main(int argc, char *argv[]) {
                 FACTORY_MAX_SIGNERS - 1);
         return 1;
     }
+    /* Default tree: the advanceless shape for this many clients (see
+       factory_advanceless_shape and --help). */
+    if (!shape_given) {
+        uint8_t dflt[FACTORY_MAX_LEVELS];
+        size_t n_dflt = 0;
+        uint32_t dflt_static = 0;
+        if (!factory_advanceless_shape((size_t)n_clients, dflt, &n_dflt, &dflt_static)) {
+            fprintf(stderr, "Error: no advanceless tree shape for %d clients\n", n_clients);
+            return 1;
+        }
+        if (n_dflt == 1) {
+            leaf_arity = dflt[0];
+            n_level_arity = 0;
+        } else {
+            memcpy(level_arities, dflt, n_dflt);
+            n_level_arity = n_dflt;
+            leaf_arity = dflt[n_dflt - 1];
+        }
+        static_near_root = dflt_static;
+        char shape_str[FACTORY_MAX_LEVELS * 4 + 1] = "";
+        for (size_t k = 0; k < n_dflt; k++) {
+            size_t off = strlen(shape_str);
+            snprintf(shape_str + off, sizeof(shape_str) - off, "%s%u",
+                     k ? "," : "", (unsigned)dflt[k]);
+        }
+        printf("LSP: tree shape: advanceless default for %d clients "
+               "(--arity %s --static-near-root %u)\n",
+               n_clients, shape_str, (unsigned)dflt_static);
+    }
+
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
        in mixed mode the LAST entry can be any 1..15 since interior arities
        are pure fan-out (Phase 2). */
@@ -2594,6 +2671,14 @@ int main(int argc, char *argv[]) {
         printf("LSP: shape ewt = %u blocks (BOLT 2016 ceiling = %u)\n",
                ewt, CLI_ARITY_BOLT2016_CEILING);
     }
+    /* Worst-case blocks a member's exit takes from creation; the factory
+       timeout must leave that much room, and members check it too. */
+    uint32_t factory_exit_blocks = cli_factory_exit_blocks(
+        n_level_arity > 0 ? level_arities : NULL, n_level_arity,
+        (factory_arity_t)leaf_arity,
+        (uint32_t)(ps_subfactory_arity_arg > 1 ? ps_subfactory_arity_arg : 1),
+        (size_t)n_clients, static_near_root,
+        step_blocks, (uint32_t)states_per_layer);
 
     /* Mainnet DW-step safety floor: reject a too-small --step-blocks on
        mainnet (thin reorg / fee-race margin).  Non-mainnet chains pass so
@@ -2901,6 +2986,10 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    if (rt_ok && !cpfp_check_node_version(&rt)) {
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
     /* Auto-create/load wallet (handles "already exists" gracefully) */
     if (rt_ok)
         regtest_create_wallet(&rt, wallet_name ? wallet_name : "superscalar_lsp");
@@ -2984,9 +3073,15 @@ int main(int argc, char *argv[]) {
         chain_be = (chain_backend_t *)&g_bip158;
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
     }
+    /* Pre-signed txs (tree, distribution TX, commitments) go out through the
+       CPFP path: alone when they pay enough, else as a package with a child
+       spending their P2A anchor, funded from this wallet. */
+    cpfp_set_default(rt_ok ? &rt : NULL, wallet_src, fee_est, max_bump_fee);
 
-    /* Apply confirmation depth overrides.
-       --safe-confs sets all four; per-operation flags override individually. */
+    /* Funding depth defaults per network, the same default the client uses.
+       Then the overrides: --safe-confs sets all four; per-operation flags
+       override individually. */
+    chain_be->conf.funding = network_funding_confs(network, 0);
     if (safe_confs_arg > 0) {
         conf_targets_set_all(&chain_be->conf, safe_confs_arg);
         printf("LSP: all confirmation depths set to %d (--safe-confs)\n",
@@ -3006,7 +3101,28 @@ int main(int argc, char *argv[]) {
     if (use_db && daemon_mode) {
         factory_t *rec_f = calloc(1, sizeof(factory_t));
         if (!rec_f) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
-        if (persist_load_factory(&db, 0, rec_f, ctx)) {
+        int rec_loaded = persist_load_factory(&db, 0, rec_f, ctx);
+        if (!rec_loaded) {
+            free(rec_f);
+            rec_f = NULL;
+            if (persist_has_factory(&db, 0) && persist_factory_is_closed(&db, 0)) {
+                /* A closed factory is history: nothing is left to serve. */
+                printf("LSP: the closed factory in %s is not loaded; "
+                       "starting a new factory\n", db_path);
+            } else if (persist_has_factory(&db, 0)) {
+                /* The DB holds a factory this LSP must keep serving (its
+                   members' exits, the distribution TX, the watchtower), but it
+                   cannot be loaded as the signed tree (reason above).  Never
+                   fall through to a new factory over it. */
+                fprintf(stderr, "LSP: the factory in %s cannot be loaded "
+                        "(see above); refusing to start\n", db_path);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+        if (rec_loaded) {
             if (rec_f->n_participants < 2) {
                 fprintf(stderr, "LSP recovery: corrupt factory (n_participants=%zu)\n",
                         rec_f->n_participants);
@@ -3040,6 +3156,7 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+            lsp_rp->allow_anchorless_tree = allow_anchorless_tree;
             g_lsp = lsp_rp;
             /* Recovery path uses persisted state — require_slot_hints would
                only kick in for new client reconnections; honor same policy
@@ -3067,11 +3184,10 @@ int main(int argc, char *argv[]) {
             for (size_t i = 0; i < rec_n_clients; i++)
                 lsp_rp->client_pubkeys[i] = rec_f->pubkeys[i + 1];
 
-            /* Copy factory and set fee estimator */
+            /* Copy factory (its agreed tree rate comes from the row) */
             lsp_rp->factory = *rec_f;
             free(rec_f);
             rec_f = NULL;
-            lsp_rp->factory.fee = fee_est;
 
             /* #59 restart-resume: a reloaded hashlock-poison factory (the persisted
                use_hashlock_poison intent) must re-derive its DETERMINISTIC L-stock
@@ -3117,8 +3233,14 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Set factory lifecycle from current block height */
-            {
+            /* The factory keeps the lifecycle it was created with (its expiry
+               does not move on a restart); one with none recorded starts
+               from the current block height. */
+            if (lsp_rp->factory.active_blocks > 0) {
+                printf("LSP recovery: factory created at block %u (active %u, dying %u "
+                       "blocks)\n", lsp_rp->factory.created_block,
+                       lsp_rp->factory.active_blocks, lsp_rp->factory.dying_blocks);
+            } else {
                 int cur_height = regtest_get_block_height(&rt);
                 if (cur_height > 0)
                     factory_set_lifecycle(&lsp_rp->factory, (uint32_t)cur_height,
@@ -3232,9 +3354,30 @@ int main(int argc, char *argv[]) {
                 lf->factory_id = rec_lad.next_factory_id++;
                 lf->is_initialized = 1;
                 lf->is_funded = 1;
-                lf->cached_state = factory_get_state(&lsp_rp->factory,
-                                                       rec_lad.current_block);
+                /* Starts as ACTIVE: the daemon's first block sees the real
+                   state as a transition, so a factory found DYING starts its
+                   rotation and one found EXPIRED gets its distribution TX
+                   sent, as without the restart. */
+                lf->cached_state = FACTORY_ACTIVE;
                 tx_buf_init(&lf->distribution_tx, 256);
+                size_t dlen = 0;
+                if (persist_load_distribution_tx(&db, 0, NULL, &dlen, 0) && dlen > 0) {
+                    tx_buf_free(&lf->distribution_tx);
+                    tx_buf_init(&lf->distribution_tx, dlen);
+                    cpfp_tx_info_t dti;
+                    if (persist_load_distribution_tx(&db, 0, lf->distribution_tx.data,
+                                                     &dlen, dlen) &&
+                        cpfp_parse_tx(lf->distribution_tx.data, dlen, &dti) &&
+                        dti.n_inputs == 1 &&
+                        memcmp(dti.in_txid[0], lf->factory.funding_txid, 32) == 0 &&
+                        dti.in_vout[0] == lf->factory.funding_vout) {
+                        lf->distribution_tx.len = dlen;
+                        printf("LSP recovery: distribution TX %s loaded\n", dti.txid_hex);
+                    } else {
+                        fprintf(stderr, "LSP recovery: the stored distribution TX does not "
+                                "spend this factory's funding; not used\n");
+                    }
+                }
                 rec_lad.n_factories = 1;
             }
             mgr->ladder = &rec_lad;
@@ -3253,6 +3396,7 @@ int main(int argc, char *argv[]) {
             /* Wire rotation parameters */
             memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
             mgr->rot_fee_est = fee_est;
+            mgr->rot_tree_fee_rate = tree_fee_rate_arg;
             memcpy(mgr->rot_fund_spk, lsp_rp->factory.funding_spk,
                    lsp_rp->factory.funding_spk_len);
             mgr->rot_fund_spk_len = lsp_rp->factory.funding_spk_len;
@@ -3458,6 +3602,7 @@ accept_new_factory:
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    lsp_p->allow_anchorless_tree = allow_anchorless_tree;
     g_lsp = lsp_p;
     /* Task #205: plumb the optional persist handle so lsp_run_factory_creation
        can call the SF-CEREMONY-HELPERS API.  g_db is NULL unless --db was
@@ -3739,6 +3884,18 @@ accept_new_factory:
     /* The tree shape, placement and participant profiles: the root kickoff
        aggregates the participants in placement order, so they are set
        before the funding script is derived from them. */
+    /* lsp_p->factory is configured here, before the creation ceremony runs
+       factory_init on it, so its dynamic arrays (profiles included) must be
+       allocated first: lsp_init leaves them NULL. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        lsp_cleanup(lsp_p);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    /* The agreed tree rate: the capacity funding amount and the ceremony
+       both size the tree with it. */
+    lsp_p->factory.tree_fee_rate = tree_fee_rate_arg;
     if (n_level_arity > 0) {
         if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
             fprintf(stderr, "Error: --arity shape refused by the factory\n");
@@ -3823,6 +3980,30 @@ accept_new_factory:
         printf("LSP: clients with --min-profit-bps > 0 should REFUSE\n");
     }
 
+    /* An explicit --cltv-timeout is checked before any coins move, against
+       the block the factory will be created at: on regtest up to 103 blocks
+       later (the blocks mined below), elsewhere after the funding
+       confirmations plus a margin.  The creation check judges it by the same
+       block, so it cannot refuse a factory that is already funded. */
+    uint32_t cltv_planned_created = 0;
+    if (cltv_timeout_arg > 0 && rt_ok) {
+        int h = regtest_get_block_height(&rt);
+        char cltv_err[512];
+        if (h > 0)
+            cltv_planned_created = (uint32_t)h + (is_regtest ? 103u
+                : (uint32_t)chain_funding_confs(chain_be, 0) + CLI_FACTORY_CLTV_MARGIN);
+        if (h > 0 &&
+            !cli_validate_factory_cltv((uint32_t)cltv_timeout_arg, cltv_planned_created,
+                                       active_blocks, dying_blocks, factory_exit_blocks,
+                                       cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "%s\n", cltv_err);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
     /* === Phase 2: Compute funding address === */
     size_t n_total = 1 + lsp_p->n_clients;
     unsigned char fund_spk[34];
@@ -3855,6 +4036,25 @@ accept_new_factory:
         fund_addr[68] = '\0';
     }
     printf("LSP: funding address: %s\n", fund_addr);
+
+
+    /* Before any funding: the tree and distribution TX this factory would
+       have, built and checked as every member will check them (exact
+       agreed rate, anchors, distribution TX within TRUC limits).  A shape,
+       rate or client count that fails is refused here, nothing funded. */
+    {
+        char why[256];
+        uint64_t min_usable = 0;
+        if (!lsp_plan_tree(lsp_p, &lsp_p->factory, lsp_p->n_clients, funding_sats,
+                           step_blocks, states_per_layer, tree_fee_rate_arg,
+                           &min_usable, why, sizeof(why))) {
+            fprintf(stderr, "LSP: refusing to fund the factory: %s; nothing was funded\n",
+                    why);
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
 
     /* === Phase 3: Fund the factory === */
     char mine_addr[128] = {0};
@@ -4049,9 +4249,37 @@ accept_new_factory:
         if (cltv_timeout_arg > 0) {
             cltv_timeout = (uint32_t)cltv_timeout_arg;
         } else if (cur_height > 0) {
-            /* Auto: regtest +35 blocks, non-regtest = factory lifetime + 10 block buffer */
-            int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
+            /* Auto: the factory lifetime, at least 35 blocks on regtest,
+               plus a 10-block buffer elsewhere; and past a member's exit */
+            uint32_t life = active_blocks + dying_blocks;
+            uint32_t offset = cli_factory_auto_cltv_offset(
+                is_regtest ? (life > 35 ? life : 35) : life + 10, factory_exit_blocks);
             cltv_timeout = (uint32_t)cur_height + offset;
+        }
+        /* An explicit timeout was checked against the planned creation block
+           before funding; it is judged by the same block here. */
+        uint32_t created_for_check = cur_height > 0 ? (uint32_t)cur_height : 0;
+        if (cltv_timeout_arg > 0 && cltv_planned_created > 0) {
+            if (created_for_check > cltv_planned_created)
+                fprintf(stderr, "LSP: WARNING: the factory is created at block %u, "
+                        "%u blocks later than planned; its CLTV timeout %u leaves "
+                        "that much less room\n", created_for_check,
+                        created_for_check - cltv_planned_created, cltv_timeout);
+            created_for_check = cltv_planned_created;
+        }
+        char cltv_err[512];
+        if (created_for_check > 0 &&
+            !cli_validate_factory_cltv(cltv_timeout, created_for_check,
+                                       active_blocks, dying_blocks, factory_exit_blocks,
+                                       cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "%s\nLSP: refusing to create the factory. Its funding "
+                    "output %s:%u is already confirmed; it is spendable only by "
+                    "all members together.\n", cltv_err, funding_txid_hex,
+                    funding_vout);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     }
 
@@ -4202,9 +4430,6 @@ accept_new_factory:
         printf(" blocks)\n");
     }
 
-    /* Set fee estimator on factory (for computed fees) */
-    lsp_p->factory.fee = fee_est;
-
     /* === Ladder manager initialization (Tier 2) === */
     ladder_t *lad = calloc(1, sizeof(ladder_t));
     if (!lad) { fprintf(stderr, "LSP: alloc failed\n"); lsp_cleanup(lsp_p); return 1; }
@@ -4277,6 +4502,14 @@ accept_new_factory:
                     lsp_p->factory.created_block, lsp_p->factory.active_blocks,
                     lsp_p->factory.dying_blocks, 0);
             }
+            /* The co-signed distribution TX: after a restart the LSP still
+               broadcasts it at expiry. */
+            if (init_ok && lad->factories[0].distribution_tx.len > 0 &&
+                !persist_save_distribution_tx(&db, 0, lad->factories[0].distribution_tx.data,
+                                              lad->factories[0].distribution_tx.len)) {
+                fprintf(stderr, "LSP: warning: failed to persist the distribution TX\n");
+                init_ok = 0;
+            }
             if (init_ok)
                 persist_commit(&db);
             else
@@ -4289,7 +4522,7 @@ accept_new_factory:
     report_add_uint(&rpt, "n_nodes", lsp_p->factory.n_nodes);
     report_add_uint(&rpt, "n_participants", lsp_p->factory.n_participants);
     report_add_uint(&rpt, "step_blocks", lsp_p->factory.step_blocks);
-    report_add_uint(&rpt, "fee_per_tx", lsp_p->factory.fee_per_tx);
+    report_add_uint(&rpt, "tree_fee_rate", lsp_p->factory.tree_fee_rate);
     report_factory_tree(&rpt, ctx, &lsp_p->factory);
     report_end_section(&rpt);
     report_flush(&rpt);
@@ -4490,6 +4723,7 @@ accept_new_factory:
         /* Wire rotation parameters for continuous ladder (Gap #3) */
         memcpy(mgr->rot_lsp_seckey, lsp_seckey, 32);
         mgr->rot_fee_est = fee_est;
+        mgr->rot_tree_fee_rate = tree_fee_rate_arg;
         memcpy(mgr->rot_fund_spk, fund_spk, 34);
         mgr->rot_fund_spk_len = 34;
         snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr), "%s", fund_addr);
@@ -4601,7 +4835,8 @@ accept_new_factory:
                via split-round MuSig2 with all participants.  Skip when
                --test-burn is set so the burn test can broadcast the
                correctly-signed epoch-0 tree. */
-            if (!test_burn && dw_counter_advance(&lsp_p->factory.counter)) {
+            if (!test_burn && factory_has_dw_state(&lsp_p->factory) &&
+                dw_counter_advance(&lsp_p->factory.counter)) {
                 uint32_t epoch = dw_counter_epoch(&lsp_p->factory.counter);
                 printf("LSP: DW advanced to epoch %u (delays:", epoch);
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++) {

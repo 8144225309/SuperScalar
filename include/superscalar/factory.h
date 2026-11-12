@@ -38,6 +38,15 @@
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
+/* nVersion of every factory tree transaction.  TRUC (BIP 431, nVersion 3):
+   a TRUC parent may sit below the node's minimum relay feerate when it is
+   relayed as a package with a child that pays for it, and its keyless P2A
+   anchor can only be spent by a single child of at most 1000 vB that a
+   higher-paying sibling may evict, so the anchor cannot be used to pin the
+   exit.  Bitcoin Core relays non-TRUC parents in a package only if they meet
+   the minimum relay feerate on their own. */
+#define FACTORY_TREE_TX_VERSION 3u
+
 /* Default CSV (BIP-68 relative locktime) on the L-stock SPK's L&CSV
    script-path leaf, in blocks.  Spec source: ZmnSCPxj's t/1242 doesn't
    pin a value; the rationale is "long enough that watchtowers / clients
@@ -166,6 +175,10 @@ typedef struct {
 
     /* Input amount from parent output */
     uint64_t input_amount;
+
+    /* Miner fee this node's tx pays (input_amount - sum(outputs)): the
+       factory's tree_fee_rate for its exact vsize. */
+    uint64_t fee_sats;
 
     /* Timeout script path (staggered per-node CLTV) */
     int has_taptree;
@@ -365,9 +378,14 @@ typedef struct {
     uint16_t step_blocks;
     uint32_t states_per_layer;
 
-    /* Fee per transaction */
-    uint64_t fee_per_tx;
-    fee_estimator_t *fee;  /* if set, overrides fee_per_tx with computed fees */
+    /* Rate (sat/kvB) every pre-signed tree transaction pays, for its exact
+       vsize: a factory term, carried in FACTORY_PROPOSE (the LSP and every
+       member build the tree at it).  factory_init* set
+       FACTORY_DEFAULT_TREE_FEE_RATE; 0 is allowed.  The fee the network asks
+       for beyond it is paid at broadcast time by a child on the anchor. */
+    uint64_t tree_fee_rate;
+    /* 1: factory_build_tree logs nothing (trial builds while planning). */
+    int build_quiet;
 
     /* CLTV timeout (absolute block height) */
     uint32_t cltv_timeout;
@@ -811,7 +829,64 @@ int factory_capacity_funding_amount(const factory_t *f, uint64_t *amount_out);
 int factory_set_placement_mode(factory_t *f, placement_mode_t mode);
 
 int factory_build_tree(factory_t *f);
+
+/* Default pre-signed tree rate (sat/kvB): 0.1 sat/vB, Bitcoin Core's
+   default -minrelaytxfee since 29.1.  The rate is a factory term the LSP
+   proposes (FACTORY_PROPOSE tree_fee_rate, --tree-fee-rate) and every member
+   checks; 0 is allowed.  Nothing derives it from a fee estimate. */
+#define FACTORY_DEFAULT_TREE_FEE_RATE 100
+
+/* Value of the P2A anchor on every tree transaction and the distribution TX:
+   0 (ephemeral dust, Bitcoin Core 29+) when the factory's rate is 0, so that
+   transaction pays no fee at all, else ANCHOR_OUTPUT_AMOUNT. */
+uint64_t factory_tree_anchor_sats(const factory_t *f);
+
+/* Fee paid by a tree transaction with n_inputs taproot key-path inputs and
+   n_p2tr P2TR outputs, plus the P2A anchor when with_anchor is set: exactly
+   the factory's tree_fee_rate for that exact vsize. */
+uint64_t factory_tree_tx_fee(const factory_t *f, size_t n_inputs, size_t n_p2tr,
+                             int with_anchor);
+
+/* Fee paid by one pseudo-Spilman leaf chain advance (chain[1] onward). */
+uint64_t factory_ps_chain_fee(const factory_t *f);
+
+/* Amount one PS leaf chain advance takes out of the channel output: its fee
+   plus the P2A anchor it carries when tree anchors are on. */
+uint64_t factory_ps_chain_reserve(const factory_t *f);
+
+/* Largest transaction TRUC policy accepts (BIP 431). */
+#define TRUC_MAX_VSIZE 10000
+
+/* Most clients a factory with a distribution TX can have: that TX (nVersion
+   3, one P2TR output per client plus the anchor) must stay within
+   TRUC_MAX_VSIZE, the only way a transaction below the relay floor is
+   relayed with a child.  230 clients take 9971 vB, 231 take 10014. */
+#define FACTORY_MAX_DIST_CLIENTS 230
+
+/* Virtual size of the signed distribution TX of a factory with n_clients
+   clients. */
+size_t factory_distribution_tx_vsize(size_t n_clients);
+
+/* Fee paid by that distribution TX: the tree rate for its exact vsize. */
+uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients);
+
+/* Check every built node, and the distribution TX when one is built, from
+   the transaction bytes and the parent outputs, independently of the code
+   that sized them: nVersion 3, a P2A anchor (last) worth
+   factory_tree_anchor_sats, a fee of exactly the agreed tree_fee_rate for
+   the exact signed vsize.  At rate 0 every node must carry the anchor (it
+   has no other way to get a fee).  The LSP and every member run this before
+   signing anything.  Returns 1 if all hold; otherwise 0 with the reason in
+   why (optional). */
+int factory_check_tree_fees(const factory_t *f, char *why, size_t why_len);
+
 int factory_sign_all(factory_t *f);
+
+/* nLockTime of the factory's distribution transaction: the factory's CLTV
+   timeout.  The LSP announces this value and every client requires it. */
+static inline uint32_t factory_distribution_locktime(const factory_t *f) {
+    return f ? f->cltv_timeout : 0;
+}
 int factory_verify_all(factory_t *f);
 
 /* Bounded fresh-nonce retry (#48): max sign+verify attempts per ceremony before
@@ -824,6 +899,44 @@ int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
                              const unsigned char sighash[32]);
 extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in production */
 
+/* 1 if some built state transaction counts down on a Decker-Wattenhofer
+   layer (a relative lock that a refresh in place can shorten).  0 for an
+   advanceless tree (every interior level static, pseudo-Spilman leaves),
+   where an advance or a rollover changes no transaction. */
+int factory_has_dw_state(const factory_t *f);
+
+/* The advanceless shape for n_clients: every interior level static
+   (kickoff only, no DW state), one member per pseudo-Spilman leaf.
+     depth d    = fewest fan-out levels such that 15^d >= n_clients (15
+                  children per node: FACTORY_MAX_OUTPUTS less the anchor);
+     fan-out a  = the smallest a >= 4 with a^d >= n_clients (the narrowest
+                  fan-out that reaches every client in d levels, so no node
+                  carries more outputs than it needs);
+     arities    = d entries of a, then 3 (PS leaves);
+     static     = d (--static-near-root: every level above the leaves).
+   e.g. 4 -> "4,3" static 1, 64 -> "8,8,3" static 2, 255 -> "7,7,7,3" static 3.
+   A single client gets "3" static 0 (the root is its leaf).  Writes
+   d + 1 entries to arities_out; returns 1, or 0 for n_clients == 0 or a
+   shape that would not fit FACTORY_MAX_LEVELS. */
+int factory_advanceless_shape(size_t n_clients,
+                              uint8_t arities_out[FACTORY_MAX_LEVELS],
+                              size_t *n_arities_out,
+                              uint32_t *static_near_root_out);
+
+/* The one refusal for extending a factory's life in place. */
+#define FACTORY_EXTEND_REFUSED_MSG \
+    "refused: this factory has no Decker-Wattenhofer state layer, so its " \
+    "root cannot advance or roll over; its life is extended only by " \
+    "rotating to a new factory (a new funding output)"
+
+/* Logs FACTORY_EXTEND_REFUSED_MSG prefixed with `who` and returns 1 when
+   factory_has_dw_state(f) is 0; returns 0 (nothing logged) otherwise.
+   Every refresh-in-place entry point (root tick, whole-counter advance,
+   leaf rollover) checks it first. */
+int factory_refuses_refresh_in_place(const factory_t *f, const char *who);
+
+/* Advance the whole DW counter and re-sign every node.  Refused (returns 0)
+   for a factory without DW state (factory_refuses_refresh_in_place). */
 int factory_advance(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
@@ -843,7 +956,8 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
    by block-height progression instead.  Caller (LSP) wires this into a
    block-polling loop and runs Tier B on rc=-1.
    Returns -1 on epoch rollover (trees rebuilt; run Tier B);
-   0 otherwise (no rollover or fully exhausted). */
+   0 otherwise (no rollover or fully exhausted).  A factory without DW state
+   is refused: 0, nothing changed (factory_refuses_refresh_in_place). */
 int factory_tick_root(factory_t *f);
 
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242 k² PS).
@@ -1092,6 +1206,7 @@ typedef struct {
     int ps_chain_len;
     unsigned char ps_prev_txid[32];
     uint64_t ps_prev_chan_amount;
+    uint64_t fee_sats;
 } factory_leaf_snapshot_t;
 
 /* Capture the state of leaf leaf_side.  Returns 1 on success; the snapshot

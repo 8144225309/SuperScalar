@@ -98,7 +98,7 @@ echo "  wallet balance  : $BAL_SATS sats (OK)"
 # 800/160 to avoid backpressure.
 nohup "$LSP_BIN" \
     --network "$NETWORK" --port "$PORT" \
-    --clients "$N_CLIENTS" --arity "$ARITY" \
+    --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree \
     --static-near-root "$STATIC_NEAR_ROOT" \
     --amount "$AMOUNT" \
     --active-blocks 50 --dying-blocks 20 \

@@ -9,6 +9,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/ladder.h"
+#include "superscalar/cli_arity.h"
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
@@ -41,6 +42,9 @@ int lsp_rotation_should_retry(const lsp_channel_mgr_t *mgr,
         return 0;   /* fallback already done */
     if (retries >= max_ret)
         return -1;  /* exhausted — time for fallback */
+    /* Postponed on fees (no retry used): try again on every new block */
+    if (mgr->rot_postponed[idx] == 1)
+        return cur_height != mgr->rot_last_attempt_block[idx] ? 1 : 0;
     /* Reorg guard: if height went backward, allow immediate retry */
     if (cur_height < mgr->rot_last_attempt_block[idx])
         return 1;  /* height regressed (reorg) — safe to retry now */
@@ -58,17 +62,67 @@ void lsp_rotation_record_failure(lsp_channel_mgr_t *mgr,
     uint32_t idx = factory_id % 8;
     mgr->rot_retry_count[idx]++;
     mgr->rot_last_attempt_block[idx] = cur_height;
+    mgr->rot_postponed[idx] = 0;
+}
+
+void lsp_rotation_record_postponed(lsp_channel_mgr_t *mgr, uint32_t factory_id,
+                                   uint32_t cur_height, int expired) {
+    uint32_t idx = factory_id % 8;
+    mgr->rot_last_attempt_block[idx] = cur_height;
+    if (!expired) {
+        mgr->rot_postponed[idx] = 1;
+        return;
+    }
+    /* Past the factory's expiry nothing is gained by waiting: the retry
+       budget is spent, so the next retry tick takes the distribution-TX
+       fallback. */
+    uint32_t max_ret = mgr->rot_max_retries > 0 ? mgr->rot_max_retries : 3;
+    if (mgr->rot_retry_count[idx] < max_ret)
+        mgr->rot_retry_count[idx] = (uint8_t)max_ret;
+    mgr->rot_postponed[idx] = 2;
 }
 
 void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id) {
     uint32_t idx = factory_id % 8;
     mgr->rot_retry_count[idx] = 0;
     mgr->rot_last_attempt_block[idx] = 0;
+    mgr->rot_postponed[idx] = 0;
     /* Clear attempted mask so retry logic won't fire for this factory */
     mgr->rot_attempted_mask &= ~(1u << (factory_id & 31));
 }
 
 /* --- Factory rotation --- */
+
+static void rotation_mark_aborted(persist_t *db, const unsigned char *cer_id) {
+    persist_update_ceremony_state(db, cer_id, PERSIST_CEREMONY_STATE_ABORTED);
+    persist_update_ceremony_artifacts(db, cer_id, NULL, NULL, NULL,
+                                       /*has_abort_reason*/ 1,
+                                       PERSIST_CEREMONY_PHASE_REFUSED);
+}
+
+/* The old factory's cooperative close does not fit at the current fee
+   estimate: nothing has been sent or changed yet.  The ROTATE ceremony is
+   recorded ABORTED and the attempt is not counted as a failure: it is tried
+   again on the next block while the factory is DYING; once it has EXPIRED,
+   the distribution TX is its exit. */
+static int rotation_postpone(lsp_channel_mgr_t *mgr, ladder_factory_t *dying,
+                             persist_t *db, const unsigned char *cer_id,
+                             int cer_persisted) {
+    ladder_t *lad = (ladder_t *)mgr->ladder;
+    int expired = dying->cached_state == FACTORY_EXPIRED;
+    if (cer_persisted)
+        rotation_mark_aborted(db, cer_id);
+    lsp_rotation_record_postponed(mgr, dying->factory_id, lad->current_block, expired);
+    if (expired)
+        fprintf(stderr, "LSP rotate: factory %u has expired with its rotation still "
+                "postponed: no more retries, its distribution TX is the exit\n",
+                dying->factory_id);
+    else
+        fprintf(stderr, "LSP rotate: rotation of factory %u postponed, nothing "
+                "changed: the factory stays open and the rotation is tried again "
+                "on the next block\n", dying->factory_id);
+    return LSP_ROTATE_POSTPONED;
+}
 
 void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic) {
     if (!mgr) return;
@@ -189,35 +243,6 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     printf("LSP rotate: starting rotation for factory %u\n", dying_id);
     fflush(stdout);
 
-    /* Drain any in-flight HTLCs before rotation.
-       If HTLCs are mid-flight during rotation, they get stranded because
-       the old factory is freed. Fail them cleanly first. */
-    {
-        int htlcs_pending = 0;
-        for (size_t c = 0; c < mgr->n_channels; c++) {
-            channel_t *ch = &mgr->entries[c].channel;
-            for (size_t h = 0; h < ch->n_htlcs; h++) {
-                if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
-                    htlcs_pending++;
-            }
-        }
-        if (htlcs_pending > 0) {
-            printf("LSP rotate: draining %d in-flight HTLCs before rotation\n",
-                   htlcs_pending);
-            for (size_t c = 0; c < mgr->n_channels; c++) {
-                channel_t *ch = &mgr->entries[c].channel;
-                for (size_t h = 0; h < ch->n_htlcs; ) {
-                    if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
-                        channel_fail_htlc(ch, ch->htlcs[h].id);
-                        /* channel_fail_htlc removes the entry, don't increment h */
-                    } else {
-                        h++;
-                    }
-                }
-            }
-        }
-    }
-
     /* Build combined keypair/pubkey arrays for adaptor protocol */
     size_t n_total = 1 + lsp->n_clients;
     secp256k1_keypair rot_kps[FACTORY_MAX_SIGNERS];
@@ -297,6 +322,136 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             rot_cer_persisted = 1;
         }
         lsp_crash_checkpoint("rotate_pending_nonces");
+    }
+
+    /* No chain: nothing could be closed or funded. */
+    regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
+    chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
+    wallet_source_t *wallet_src = (wallet_source_t *)mgr->wallet_src;
+    if (!rt && !chain_be) {
+        fprintf(stderr, "LSP rotate: no chain connection\n");
+        if (rot_cer_persisted)
+            rotation_mark_aborted(rot_db, rot_cer_id);
+        return 0;
+    }
+
+    /* Settle what the rotation needs before anything irreversible (failing
+       HTLCs, handing over client keys, closing JIT channels, closing the old
+       factory).
+
+       Every channel balance is carried into the new factory, so it must fit
+       a channel of the new tree.  The tree's pre-signed rate is the agreed
+       term (rot_tree_fee_rate), not a market rate, so the new capacity
+       depends only on the shape, the clients and the funding: a balance that
+       does not fit now never will, and the attempt fails with nothing
+       changed (it uses a retry like any other failure).  Checked only when
+       enough clients are online for a rotation to go ahead; with fewer, the
+       rotation's own client-count checks below handle it.
+
+       A full close needs every client online, and its fee, which follows
+       the fee market, must leave half the funding.  When it does not, the
+       rotation is postponed with nothing changed: the old factory stays open
+       and the rotation is tried again on the next block without using a
+       retry (lsp_rotation_record_postponed). */
+    size_t n_online_now = 0;
+    for (size_t i = 0; i < lsp->n_clients; i++)
+        if (lsp->client_fds[i] >= 0)
+            n_online_now++;
+    /* the fewest clients a rotation can go ahead with: two for a partial
+       rotation (some clients offline) or an arity-2 tree, else one */
+    size_t min_rot_clients =
+        (n_online_now < lsp->n_clients ||
+         mgr->rot_leaf_arity == FACTORY_ARITY_2) ? 2 : 1;
+    uint64_t close_fee = 0;
+    {
+        if (n_online_now >= min_rot_clients) {
+            factory_t *tmpl = calloc(1, sizeof(factory_t));
+            if (!tmpl) return 0;
+            tmpl->leaf_arity = (factory_arity_t)mgr->rot_leaf_arity;
+            uint64_t carried = 0, new_cap = 0;
+            size_t worst = 0;
+            for (size_t c = 0; c < mgr->n_channels; c++) {
+                const channel_t *och = &mgr->entries[c].channel;
+                uint64_t tot = och->local_amount + och->remote_amount;
+                if (tot > carried) { carried = tot; worst = c; }
+            }
+            char why[256];
+            int planned = lsp_plan_tree(lsp, tmpl, n_online_now,
+                                        mgr->rot_funding_sats,
+                                        mgr->rot_step_blocks,
+                                        mgr->rot_states_per_layer,
+                                        mgr->rot_tree_fee_rate, &new_cap,
+                                        why, sizeof(why));
+            free(tmpl);
+            if (!planned || new_cap < carried) {
+                if (!planned)
+                    fprintf(stderr, "LSP rotate: cannot rotate factory %u: a new "
+                            "%zu-client factory of %llu sat at %llu sat/kvB: %s\n",
+                            dying_id, n_online_now,
+                            (unsigned long long)mgr->rot_funding_sats,
+                            (unsigned long long)mgr->rot_tree_fee_rate, why);
+                else
+                    fprintf(stderr, "LSP rotate: cannot rotate factory %u: channel %zu "
+                            "carries %llu sat, more than the %llu sat a channel of the "
+                            "new factory holds\n", dying_id, worst,
+                            (unsigned long long)carried, (unsigned long long)new_cap);
+                if (rot_cer_persisted)
+                    rotation_mark_aborted(rot_db, rot_cer_id);
+                return LSP_ROTATE_FAILED;
+            }
+        }
+        if (n_online_now == lsp->n_clients) {
+            /* the LSP pays the close (signed now, at the current estimate):
+               exact size, one key-path input, one P2TR output per party */
+            size_t close_vsize = fee_keypath_tx_vsize(1, n_total, 0);
+            close_fee = fee_estimate(fe, close_vsize);
+            if (close_fee == 0) {
+                close_fee = (close_vsize * FEE_FLOOR_SAT_PER_KVB + 999) / 1000;
+                if (close_fee == 0) close_fee = 1;
+                fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
+                        "using %.1f sat/vB floor (%llu sats)\n",
+                        (double)FEE_FLOOR_SAT_PER_KVB / 1000.0,
+                        (unsigned long long)close_fee);
+            }
+            if (close_fee == FEE_INVALID ||
+                close_fee >= lsp->factory.funding_amount_sats / 2) {
+                fprintf(stderr, "LSP rotate: postponing the rotation of factory %u: "
+                        "its cooperative close fee is %s (funding %llu sat)\n",
+                        dying_id, close_fee == FEE_INVALID ? "not computable"
+                                                           : "above half the funding",
+                        (unsigned long long)lsp->factory.funding_amount_sats);
+                return rotation_postpone(mgr, dying, rot_db, rot_cer_id, rot_cer_persisted);
+            }
+        }
+    }
+
+    /* Drain any in-flight HTLCs before rotation.
+       If HTLCs are mid-flight during rotation, they get stranded because
+       the old factory is freed. Fail them cleanly first. */
+    {
+        int htlcs_pending = 0;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            channel_t *ch = &mgr->entries[c].channel;
+            for (size_t h = 0; h < ch->n_htlcs; h++) {
+                if (ch->htlcs[h].state == HTLC_STATE_ACTIVE)
+                    htlcs_pending++;
+            }
+        }
+        if (htlcs_pending > 0) {
+            printf("LSP rotate: draining %d in-flight HTLCs before rotation\n",
+                   htlcs_pending);
+            for (size_t c = 0; c < mgr->n_channels; c++) {
+                channel_t *ch = &mgr->entries[c].channel;
+                for (size_t h = 0; h < ch->n_htlcs; ) {
+                    if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) {
+                        channel_fail_htlc(ch, ch->htlcs[h].id);
+                        /* channel_fail_htlc removes the entry, don't increment h */
+                    } else {
+                        h++;
+                    }
+                }
+            }
+        }
     }
 
     /* --- Phase A: PTLC key turnover over wire --- */
@@ -610,20 +765,6 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     }
 
     /* --- Phase B: Cooperative close OR partial retirement --- */
-    regtest_t *rt = mgr->watchtower ? mgr->watchtower->rt : NULL;
-    chain_backend_t *chain_be = (chain_backend_t *)mgr->chain_be;
-    wallet_source_t *wallet_src = (wallet_source_t *)mgr->wallet_src;
-    if (!rt && !chain_be) {
-        fprintf(stderr, "LSP rotate: no chain connection\n");
-        if (rot_cer_persisted) {
-            persist_update_ceremony_state(rot_db, rot_cer_id,
-                                           PERSIST_CEREMONY_STATE_ABORTED);
-            persist_update_ceremony_artifacts(rot_db, rot_cer_id, NULL, NULL, NULL,
-                                               /*has_abort_reason*/ 1,
-                                               PERSIST_CEREMONY_PHASE_REFUSED);
-        }
-        return 0;
-    }
 
     /* #245 Gap A: Phase B is about to commit the close/partial-retire TX.
        Bump state to PENDING_SIGS so a crash here re-enters with the right
@@ -665,15 +806,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
 
         tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
-        size_t close_vsize = 68 + 43 * n_total;
-        uint64_t close_fee = fee_estimate(fe, close_vsize);
-        if (close_fee == 0) {
-            close_fee = (close_vsize * FEE_FLOOR_SAT_PER_KVB + 999) / 1000;
-            if (close_fee == 0) close_fee = 1;
-            fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
-                    "using %.1f sat/vB floor (%llu sats)\n",
-                    (double)FEE_FLOOR_SAT_PER_KVB / 1000.0,
-                    (unsigned long long)close_fee);
+        /* close_fee was settled before Phase A (every client online then). */
+        if (close_fee == 0 || close_fee == FEE_INVALID) {
+            fprintf(stderr, "LSP rotate: no close fee settled for factory %u\n", dying_id);
+            return 0;
         }
         size_t n_close = lsp_channels_build_close_outputs(mgr, &lsp->factory,
                                                             rot_outputs, close_fee,
@@ -1065,13 +1201,20 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     /* Restore arity on the zeroed struct so lsp_run_factory_creation's
        saved_arity = f->leaf_arity picks it up correctly. */
     lsp->factory.leaf_arity = saved_arity;
+    /* The new tree is built at the agreed rate (the ceremony signs it). */
+    lsp->factory.tree_fee_rate = mgr->rot_tree_fee_rate;
 
     /* Compute cltv_timeout for new factory */
     uint32_t new_cltv = 0;
     {
         int cur_h = regtest_get_block_height(rt);
         if (cur_h > 0) {
-            int offset = mgr->rot_is_regtest ? 35 : 1008;
+            /* Members refuse a timeout that leaves no room for their exit. */
+            uint32_t offset = cli_factory_auto_cltv_offset(
+                mgr->rot_is_regtest ? 35 : 1008,
+                cli_factory_exit_blocks(NULL, 0, saved_arity, 1, lsp->n_clients, 0,
+                                        mgr->rot_step_blocks,
+                                        mgr->rot_states_per_layer));
             new_cltv = (uint32_t)cur_h + offset;
         }
     }
@@ -1120,7 +1263,6 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             factory_set_lifecycle(&lsp->factory, (uint32_t)cur_h,
                                   lad->active_blocks, lad->dying_blocks);
     }
-    lsp->factory.fee = fe;
 
     /* Evict expired factories if at max capacity */
     if (lad->n_factories >= LADDER_MAX_FACTORIES)
@@ -1164,8 +1306,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             fprintf(stderr, "LSP rotate: persist_begin failed\n");
             return 0;
         }
+        /* with its co-signed distribution TX, broadcast at expiry even
+           after a restart */
+        int has_dist = lsp->factory.dist_tx_ready == 2 &&
+                       lsp->factory.dist_signed_tx.len > 0;
         if (!persist_save_factory(db, &lsp->factory, mgr->ctx, 0) ||
-            !persist_save_tree_nodes(db, &lsp->factory, 0)) {
+            !persist_save_tree_nodes(db, &lsp->factory, 0) ||
+            (has_dist && !persist_save_distribution_tx(db, 0,
+                                                       lsp->factory.dist_signed_tx.data,
+                                                       lsp->factory.dist_signed_tx.len))) {
             fprintf(stderr, "LSP rotate: factory persist failed, rolling back\n");
             persist_rollback(db);
             return 0;
@@ -1205,6 +1354,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     unsigned char saved_seckey[32];
     memcpy(saved_seckey, mgr->rot_lsp_seckey, 32);
     void *saved_fee_est = mgr->rot_fee_est;
+    uint64_t saved_tree_fee_rate = mgr->rot_tree_fee_rate;
     unsigned char saved_fund_spk[34];
     memcpy(saved_fund_spk, mgr->rot_fund_spk, 34);
     size_t saved_fund_spk_len = mgr->rot_fund_spk_len;
@@ -1260,6 +1410,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     memcpy(mgr->rot_lsp_seckey, saved_seckey, 32);
     secure_zero(saved_seckey, 32);
     mgr->rot_fee_est = saved_fee_est;
+    mgr->rot_tree_fee_rate = saved_tree_fee_rate;
     memcpy(mgr->rot_fund_spk, saved_fund_spk, 34);
     mgr->rot_fund_spk_len = saved_fund_spk_len;
     memcpy(mgr->rot_fund_addr, saved_fund_addr, 128);
@@ -1287,29 +1438,20 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->cli_enabled = saved_cli_enabled;
     mgr->confirm_timeout_secs = saved_confirm_timeout;
 
-    /* Restore channel balances from old factory (carry across rotation).
-       Only apply if the old (usable) balance fits within the new channel
-       capacity.  funding_amount is the GROSS on-chain amount; the base
-       commitment fee is reserved from it, so the conservation invariant
-       (lsp_channels.c) checks local + remote + htlc_sum == funding_amount -
-       base_commit_fee.  The carried local/remote is a usable total, so the
-       gross funding_amount must add the base commit fee back — otherwise the
-       checker sees a deficit of exactly base_commit_fee on every channel and
-       the LSP refuses all new HTLCs after a rotation.  Use the same fee rate
-       the channels are about to be set to below (and that the checker reads
-       from ch->fee_rate_sat_per_kvb). */
-    uint64_t rot_fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
-    uint64_t rot_base_commit_fee = (rot_fee_rate * 154 + 999) / 1000;
+    /* Carry each client's balance into its new channel.  The new channel is
+       built by lsp_channels_init exactly like a channel at first open: its
+       funding amount is the new tree's leaf output and its fee rate the fixed
+       channel default.  The client derives the same two values from its own
+       copy of the tree, so the commitment the LSP signs below is the one the
+       client verifies.  The client's balance moves over unchanged; whatever
+       else the new leaf holds is the LSP's side. */
     for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
-        channel_t *ch = &mgr->entries[c].channel;
-        uint64_t old_total = saved_ch_local[c] + saved_ch_remote[c];
-        uint64_t new_usable = ch->local_amount + ch->remote_amount;
-        if (old_total > 0 && old_total <= new_usable) {
-            ch->local_amount = saved_ch_local[c];
-            ch->remote_amount = saved_ch_remote[c];
-            ch->funding_amount = old_total + rot_base_commit_fee;
-        }
-        /* else: new factory has different capacity, keep default split */
+        if (saved_ch_local[c] + saved_ch_remote[c] == 0) continue;
+        if (!lsp_channel_carry_client_balance(&mgr->entries[c].channel,
+                                              saved_ch_remote[c]))
+            fprintf(stderr, "LSP rotate: client %zu balance %llu does not fit the "
+                    "new channel; keeping the default split\n", c,
+                    (unsigned long long)saved_ch_remote[c]);
     }
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {
@@ -1317,11 +1459,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
-    /* Set fee rate on all new channels — the same rate used above to size
-       the restored channels' gross funding_amount, so the conservation
-       checker reads a consistent base_commit_fee. */
-    for (size_t c = 0; c < mgr->n_channels; c++)
-        mgr->entries[c].channel.fee_rate_sat_per_kvb = rot_fee_rate;
+    /* Drill checkpoint: the new factory is funded and its tree signed, the
+       clients have not yet received CHANNEL_READY or commitment 0. */
+    lsp_crash_checkpoint("rotate_channel_setup");
 
     if (!lsp_channels_send_ready(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: send_ready failed\n");
@@ -1421,10 +1561,18 @@ int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!readiness_all_ready(rt))
         return 0;
 
+    /* Postponed on fees at this block: wait for the next one. */
+    uint32_t idx = rt->factory_id % 8;
+    if (mgr->rot_postponed[idx] == 1 && mgr->ladder &&
+        ((ladder_t *)mgr->ladder)->current_block == mgr->rot_last_attempt_block[idx])
+        return 0;
+
     printf("LSP rotate: all %zu clients ready — firing async rotation ceremony\n",
            rt->n_clients);
 
     int result = lsp_channels_rotate_factory(mgr, lsp);
+    if (result == LSP_ROTATE_POSTPONED)
+        return 0;   /* nothing happened: the clients stay ready */
     readiness_reset(rt);
-    return result ? 1 : 0;
+    return result == LSP_ROTATE_OK ? 1 : 0;
 }

@@ -214,6 +214,7 @@ typedef struct {
     /* Continuous ladder rotation (set once at daemon startup) */
     unsigned char rot_lsp_seckey[32];
     void *rot_fee_est;              /* fee_estimator_t* — avoids header dependency */
+    uint64_t rot_tree_fee_rate;     /* --tree-fee-rate: the agreed rate of rotated factories */
     unsigned char rot_fund_spk[34];
     size_t rot_fund_spk_len;
     char rot_fund_addr[128];
@@ -234,6 +235,9 @@ typedef struct {
     uint32_t rot_last_attempt_block[8]; /* block height of last failed attempt */
     uint32_t rot_max_retries;           /* 0 = default (3); after N failures, broadcast dist TX */
     uint32_t rot_retry_base_delay;      /* 0 = default (10 blocks); doubles per retry */
+    uint8_t  rot_postponed[8];          /* 1 = last attempt postponed on fees (no retry
+                                           used): tried again on the next block;
+                                           2 = still postponed when the factory expired */
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
@@ -416,6 +420,14 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 /* Send CHANNEL_READY to all clients. Returns 1 on success. */
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
+/* Rotation: carry a client's balance from its old channel into the freshly
+   initialised channel ch of the new factory.  The channel keeps the funding
+   amount of its leaf output and its fee rate, exactly as at channel open, so
+   both sides build the same commitment; the client gets client_balance and
+   the LSP the rest of the usable amount.  Returns 0 and leaves the default
+   split if client_balance does not fit in the new channel. */
+int lsp_channel_carry_client_balance(channel_t *ch, uint64_t client_balance);
+
 /* Handle an incoming channel message from a client.
    Dispatches based on msg_type. Returns 1 on success, 0 on error. */
 int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
@@ -584,13 +596,24 @@ void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automati
 /* Perform a full factory rotation: PTLC turnover → cooperative close →
    fund new factory → create new factory → reinitialize channels.
    All parameters come from mgr->rot_* fields.
-   Refused (returns 0, nothing done) unless mgr->rot_enabled.
-   Returns 1 on success, 0 on failure. */
+   Refused (LSP_ROTATE_FAILED, nothing done) unless mgr->rot_enabled.
+   Otherwise returns LSP_ROTATE_OK, LSP_ROTATE_FAILED, or LSP_ROTATE_POSTPONED: the
+   old factory's cooperative close would cost more than half its funding at
+   the current fee estimate; nothing was sent or changed, and the
+   postponement is already recorded (lsp_rotation_record_postponed): not a
+   failed attempt.  A replacement factory that cannot be built, or whose
+   channels cannot hold the carried balances, is LSP_ROTATE_FAILED, also
+   with nothing sent or changed: its shape, client count, funding and agreed
+   tree rate do not change with the fee market. */
+#define LSP_ROTATE_FAILED    0
+#define LSP_ROTATE_OK        1
+#define LSP_ROTATE_POSTPONED 2
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* Fire ceremony if all clients are ready (async-rotation mode).
-   Resets the readiness tracker regardless of outcome.
-   Returns 1 if ceremony was fired, 0 if not all clients ready yet. */
+   Resets the readiness tracker once the ceremony ran, unless it was
+   postponed (then the clients stay ready and it fires again on a later
+   block).  Returns 1 if the rotation completed, else 0. */
 int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* --- Reconnection (Phase 16) --- */

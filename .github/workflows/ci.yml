@@ -28,7 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Cache CMake deps
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/_deps
           key: cmake-deps-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -188,19 +188,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Cache Bitcoin Core binary
         id: btc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
-          path: bitcoin-28.1
-          key: bitcoin-core-28.1-x86_64
-      - name: Download Bitcoin Core 28.1
+          path: bitcoin-30.3
+          key: bitcoin-core-30.3-x86_64
+      - name: Download Bitcoin Core 30.3
         if: steps.btc-cache.outputs.cache-hit != 'true'
         run: |
-          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
-          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/SHA256SUMS
-          grep "bitcoin-28.1-x86_64-linux-gnu.tar.gz" SHA256SUMS | sha256sum -c -
-          tar xzf bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          wget -q https://bitcoincore.org/bin/bitcoin-core-30.3/bitcoin-30.3-x86_64-linux-gnu.tar.gz
+          echo "4753cd70416c629a2090503e8545a3c05e94a0f5037f8fb97b4c35c6e1afee0e  bitcoin-30.3-x86_64-linux-gnu.tar.gz" | sha256sum -c -
+          tar xzf bitcoin-30.3-x86_64-linux-gnu.tar.gz
       - name: Install Bitcoin Core
-        run: sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+        run: sudo install -m 0755 bitcoin-30.3/bin/bitcoind bitcoin-30.3/bin/bitcoin-cli /usr/local/bin/
       - name: Configure regtest
         run: |
           mkdir -p ~/.bitcoin
@@ -242,19 +241,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev sqlite3 python3
       - name: Cache Bitcoin Core binary
         id: btc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
-          path: bitcoin-28.1
-          key: bitcoin-core-28.1-x86_64
-      - name: Download Bitcoin Core 28.1
+          path: bitcoin-30.3
+          key: bitcoin-core-30.3-x86_64
+      - name: Download Bitcoin Core 30.3
         if: steps.btc-cache.outputs.cache-hit != 'true'
         run: |
-          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-x86_64-linux-gnu.tar.gz
-          wget -q https://bitcoincore.org/bin/bitcoin-core-28.1/SHA256SUMS
-          grep "bitcoin-28.1-x86_64-linux-gnu.tar.gz" SHA256SUMS | sha256sum -c -
-          tar xzf bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          wget -q https://bitcoincore.org/bin/bitcoin-core-30.3/bitcoin-30.3-x86_64-linux-gnu.tar.gz
+          echo "4753cd70416c629a2090503e8545a3c05e94a0f5037f8fb97b4c35c6e1afee0e  bitcoin-30.3-x86_64-linux-gnu.tar.gz" | sha256sum -c -
+          tar xzf bitcoin-30.3-x86_64-linux-gnu.tar.gz
       - name: Install Bitcoin Core
-        run: sudo install -m 0755 bitcoin-28.1/bin/bitcoind bitcoin-28.1/bin/bitcoin-cli /usr/local/bin/
+        run: sudo install -m 0755 bitcoin-30.3/bin/bitcoind bitcoin-30.3/bin/bitcoin-cli /usr/local/bin/
       - name: Configure regtest
         # The bash harnesses (set -euo pipefail) grep `^datadir=` from this
         # conf with no `|| true` fallback — under pipefail, an empty match
@@ -372,6 +370,131 @@ jobs:
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true
 
+  regtest-tree-exit:
+    runs-on: ubuntu-latest
+    name: Regtest whole-tree exit
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev sqlite3
+      - name: Cache Bitcoin Core binary
+        id: btc-cache
+        uses: actions/cache@v4
+        with:
+          path: bitcoin-30.3
+          key: bitcoin-core-30.3-x86_64
+      - name: Download Bitcoin Core 30.3
+        if: steps.btc-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://bitcoincore.org/bin/bitcoin-core-30.3/bitcoin-30.3-x86_64-linux-gnu.tar.gz
+          echo "4753cd70416c629a2090503e8545a3c05e94a0f5037f8fb97b4c35c6e1afee0e  bitcoin-30.3-x86_64-linux-gnu.tar.gz" | sha256sum -c -
+          tar xzf bitcoin-30.3-x86_64-linux-gnu.tar.gz
+      - name: Install Bitcoin Core
+        run: sudo install -m 0755 bitcoin-30.3/bin/bitcoind bitcoin-30.3/bin/bitcoin-cli /usr/local/bin/
+      # The harness checks confirmations of non-wallet txs (txindex) and
+      # starts bitcoind itself from this conf; with MINRELAY it restarts the
+      # node with a raised -minrelaytxfee.
+      - name: Configure regtest
+        run: |
+          mkdir -p ~/.bitcoin
+          cat > ~/.bitcoin/bitcoin.conf <<CONF
+          regtest=1
+          server=1
+          txindex=1
+          datadir=/home/runner/.bitcoin
+          rpcuser=rpcuser
+          rpcpassword=rpcpass
+          fallbackfee=0.00001
+          [regtest]
+          rpcport=18443
+          CONF
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build --parallel
+      # Bitcoin Core 30 default policy (0.1 sat/vB relay floor), the default
+      # agreed tree rate of 0.1 sat/vB: the clients exit one at a time, every
+      # pre-signed tx relays on its own, client 3 has no wallet coin, every
+      # party is paid on chain and each client sweeps its to_local.
+      - name: Tree exit at the default rate, one client at a time
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 SOLO=1 NOWALLET=3 SWEEP=1 bash tools/test_regtest_tree_exit.sh build
+      # Rate 0: no pre-signed tx pays a fee and every anchor is 0-value
+      # (ephemeral dust): every tree tx goes in as a package with a child.  A
+      # client with no wallet coin exiting first gets the "needs a fee-paying
+      # child" result; once the tree is out it completes, its commitment's
+      # 240-sat anchor paying for itself.
+      - name: Tree exit at rate 0, packages only
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 TREE_FEE_RATE=0 SOLO=1 EXIT_ORDER="1 2 3" EXPECT_NOCOIN=0 NOWALLET=0 PORT=29977 bash tools/test_regtest_tree_exit.sh build
+      # A fee spike after signing: the node's floor rises to 0.5 sat/vB, above
+      # the agreed rate; the client without a coin gets in with anchor-only
+      # children, the others with wallet-funded ones.
+      - name: Tree exit through a fee spike
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 MINRELAY=500 NOWALLET=3 PORT=29978 bash tools/test_regtest_tree_exit.sh build
+      # A third party attaches a cheap child to the anchor of every tree tx in
+      # the mempool (anchor-only, then funded from its own wallet); the
+      # clients' retries at a raised fee estimate must outbid those children.
+      - name: Tree exit, anchor children attached by a third party
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 GRIEF=1 CLIENT_FEE_EST=static:30 PORT=29979 bash tools/test_regtest_tree_exit.sh build
+      - name: Tree exit, wallet-funded anchor children of a third party
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 GRIEF=wallet CLIENT_FEE_EST=static:30 PORT=29981 bash tools/test_regtest_tree_exit.sh build
+      # The node's floor at 5 sat/vB: the tree only gets in as CPFP packages
+      # with wallet-funded children.
+      - name: Tree exit, min relay fee far above the agreed rate
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 MINRELAY=5000 PORT=29976 bash tools/test_regtest_tree_exit.sh build
+      # A member whose ceiling is below the proposed rate refuses to sign.
+      - name: Tree rate above a member's ceiling refused
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          ARITY=2 N_CLIENTS=4 TREE_FEE_RATE=2000 CLIENT_MAX_TREE_RATE=1000 EXPECT_REFUSE=1 PORT=29982 bash tools/test_regtest_tree_exit.sh build
+      # The LSP's distribution TX at factory expiry: refused until final, in
+      # as a package below the block minimum feerate, re-bumped when the fee
+      # estimate rises, confirmed; the LSP is restarted from its DB twice
+      # along the way (before the TX is final, and with it in the mempool).
+      - name: Distribution TX at expiry, retried and re-bumped
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_regtest_dist_expiry.sh build
+      # A rotation that meets a fee spike is postponed with nothing changed
+      # and without using its retries, then completes once the spike is over.
+      - name: Rotation postponed through a fee spike
+        env:
+          REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_regtest_rotation_fee_postpone.sh build
+      - name: Stop bitcoind
+        if: always()
+        run: bitcoin-cli -regtest stop 2>/dev/null || true
+
   coverage:
     runs-on: ubuntu-latest
     name: Coverage
@@ -403,7 +526,7 @@ jobs:
           LINES=$(grep 'lines' coverage-summary.txt | grep -oP '[\d.]+%' | head -1)
           echo "### Coverage: $LINES" >> $GITHUB_STEP_SUMMARY
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: build/coverage_report/
@@ -432,7 +555,7 @@ jobs:
       # The corpus each run grows is kept for the next one (a new cache entry
       # per run, restored from the newest earlier entry of the same target).
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -450,7 +573,7 @@ jobs:
             -max_total_time=300 -timeout=60 -artifact_prefix=artifacts/
       - name: Upload reproducer
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-reproducer-${{ matrix.target }}
           path: build/artifacts/

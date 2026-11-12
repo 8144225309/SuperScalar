@@ -32,7 +32,9 @@ N_CLIENTS="${N_CLIENTS:-4}"
 AMOUNT="${AMOUNT:-200000}"
 PORT="${PORT:-29958}"
 FEE="${FEE:-1100}"
-DIST_FEE_SATS=500   # must match lsp.c factory_compute_distribution_outputs_balanced fee arg
+# The dist TX pays its exact vsize at the factory's tree fee rate (logged by
+# the LSP); computed below once the tx is decoded.
+DIST_FEE_SATS=0
 LSP_SECKEY="0000000000000000000000000000000000000000000000000000000000000001"
 LSP_PUB="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 REGTEST_CONF="${REGTEST_CONF:-/var/lib/bitcoind-regtest/bitcoin.conf}"
@@ -200,6 +202,10 @@ echo "  dist TX confirmations: $CONF"
 
 # --- assertions ---
 FEE_PAID=$(( AMOUNT - DIST_OUTSUM ))
+TREE_RATE=$(grep -aoE "tree fee rate [0-9]+ sat/kvB" "$LSP_LOG" | head -1 | grep -oE "[0-9]+")
+DIST_VSIZE=$($BCLI decoderawtransaction "$DIST_HEX" | jget "d['vsize']")
+DIST_FEE_SATS=$(( (${TREE_RATE:-0} * ${DIST_VSIZE:-0} + 999) / 1000 ))
+echo "  dist TX vsize $DIST_VSIZE vB at tree fee rate ${TREE_RATE:-?} sat/kvB"
 echo
 echo "=== offline-recovery accounting ==="
 echo "  dist TX confirmed         : ${CONF} confs"
@@ -211,7 +217,8 @@ echo "  on-chain fee (funding-Sigma): $FEE_PAID sats (expected $DIST_FEE_SATS)"
 if [ "${CONF:-0}" -ge 1 ] \
    && [ "$DIST_TR_N" -eq "$N_CLIENTS" ] \
    && [ "$DIST_OUTSUM" -eq $((AMOUNT - DIST_FEE_SATS)) ] \
-   && [ "$FEE_PAID" -eq "$DIST_FEE_SATS" ]; then
+   && [ "$FEE_PAID" -eq "$DIST_FEE_SATS" ] \
+   && [ "$FEE_PAID" -ge "${DIST_VSIZE:-1000000}" ]; then
     UTXO2=$($BCLI gettxout "$FUND_TXID" "$FUND_VOUT" 2>/dev/null)
     [ -z "$UTXO2" ] || fail "funding UTXO still unspent after dist broadcast -- dist TX did not spend it"
     green "PASS: with EVERYONE offline forever, the co-signed distribution TX confirmed at the factory CLTV,"

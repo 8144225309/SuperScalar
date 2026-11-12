@@ -95,6 +95,7 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
     lsp->max_connections = (int)cap;
     lsp->listen_fd = -1;
     lsp->bridge_fd = -1;
+    lsp->factory.tree_fee_rate = FACTORY_DEFAULT_TREE_FEE_RATE;
 
     for (size_t i = 0; i < cap; i++)
         lsp->client_fds[i] = -1;
@@ -327,7 +328,7 @@ typedef struct {
     uint8_t level_arity[FACTORY_MAX_LEVELS];
     uint32_t static_threshold;
     uint32_t ps_subfactory_arity;
-    uint64_t fee_per_tx;
+    uint64_t tree_fee_rate;       /* the agreed pre-signed rate (sat/kvB) */
     placement_mode_t placement;
     economic_mode_t econ;
     participant_profile_t *profiles;   /* heap copy; NULL when the source had none */
@@ -361,7 +362,7 @@ static int creation_template_capture(lsp_creation_template_t *t,
         memcpy(t->level_arity, f->level_arity, t->n_level_arity * sizeof(uint8_t));
     t->static_threshold = f->static_threshold_depth;
     t->ps_subfactory_arity = f->ps_subfactory_arity;
-    t->fee_per_tx = f->fee_per_tx;
+    t->tree_fee_rate = f->tree_fee_rate;
     t->placement = f->placement_mode;
     t->econ = f->economic_mode;
     if (f->profiles && f->config.max_signers > 0) {
@@ -399,7 +400,7 @@ static void creation_template_restore(factory_t *f,
     memcpy(f->level_arity, t->level_arity, sizeof(f->level_arity));
     f->static_threshold_depth = t->static_threshold;
     f->ps_subfactory_arity = t->ps_subfactory_arity;
-    f->fee_per_tx = t->fee_per_tx;
+    f->tree_fee_rate = t->tree_fee_rate;
     f->placement_mode = t->placement;
     f->economic_mode = t->econ;
     if (t->profiles && f->profiles) {
@@ -466,8 +467,9 @@ static int creation_configure(lsp_t *lsp, factory_t *f,
         factory_set_static_near_root(f, t->static_threshold);
     if (t->ps_subfactory_arity > 1)
         factory_set_ps_subfactory_arity(f, t->ps_subfactory_arity);
-    if (t->fee_per_tx > 200)
-        f->fee_per_tx = t->fee_per_tx;
+    /* The agreed tree fee rate must be in place before the tree is built
+       and signed: factory_init_from_pubkeys reset it to the default. */
+    f->tree_fee_rate = t->tree_fee_rate;
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
     if (!creation_template_apply_order(f, t)) {
@@ -615,17 +617,155 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
     return 1;
 }
 
-/* Build the UNSIGNED distribution TX for f (outputs balanced per the caller's
-   lsp->dist_client_amounts).  Returns 1 if it was built. */
-static int lsp_build_dist_unsigned(lsp_t *lsp, factory_t *f) {
-    tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
-    size_t n_dist = factory_compute_distribution_outputs_balanced(f,
-        dist_outputs, FACTORY_MAX_SIGNERS + 1, 500,
-        lsp->dist_client_amounts, lsp->dist_n_client_amounts);
-    if (n_dist > 0 && f->cltv_timeout > 0)
-        return factory_build_distribution_tx_unsigned(
-            f, dist_outputs, n_dist, f->cltv_timeout);
-    return 0;
+/* Tree shape settings that factory_init_from_pubkeys resets. */
+typedef struct {
+    factory_arity_t leaf_arity;
+    size_t n_level_arity;
+    uint8_t level_arity[FACTORY_MAX_LEVELS];
+    uint32_t static_threshold;
+    uint32_t ps_subfactory_arity;
+    placement_mode_t placement;
+    economic_mode_t econ;
+} tree_shape_t;
+
+static void tree_shape_of(const factory_t *f, tree_shape_t *s) {
+    memset(s, 0, sizeof(*s));
+    s->leaf_arity = f->leaf_arity;
+    s->n_level_arity = f->n_level_arity <= FACTORY_MAX_LEVELS ? f->n_level_arity : 0;
+    if (s->n_level_arity > 0)
+        memcpy(s->level_arity, f->level_arity, s->n_level_arity * sizeof(uint8_t));
+    s->static_threshold = f->static_threshold_depth;
+    s->ps_subfactory_arity = f->ps_subfactory_arity;
+    s->placement = f->placement_mode;
+    s->econ = f->economic_mode;
+}
+
+static void tree_shape_apply(factory_t *f, const tree_shape_t *s) {
+    if (s->n_level_arity > 0) {
+        factory_set_level_arity(f, s->level_arity, s->n_level_arity);
+    } else if (s->leaf_arity == FACTORY_ARITY_1) {
+        factory_set_arity(f, FACTORY_ARITY_1);
+    } else if (s->leaf_arity == FACTORY_ARITY_PS) {
+        factory_set_arity(f, FACTORY_ARITY_PS);
+    }
+    if (s->static_threshold > 0)
+        factory_set_static_near_root(f, s->static_threshold);
+    if (s->ps_subfactory_arity > 1)
+        factory_set_ps_subfactory_arity(f, s->ps_subfactory_arity);
+    f->placement_mode = s->placement;
+    f->economic_mode = s->econ;
+}
+
+int lsp_plan_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                  uint64_t funding_amount, uint16_t step_blocks,
+                  uint32_t states_per_layer, uint64_t rate,
+                  uint64_t *min_usable_out, char *why, size_t why_len) {
+    char dummy[8];
+    if (!why || why_len == 0) { why = dummy; why_len = sizeof(dummy); }
+    why[0] = '\0';
+    if (min_usable_out) *min_usable_out = 0;
+    if (!lsp || !cfg || n_clients == 0 || n_clients > lsp->n_clients ||
+        n_clients + 1 > FACTORY_MAX_SIGNERS) {
+        snprintf(why, why_len, "%zu clients", n_clients);
+        return 0;
+    }
+    if (n_clients > FACTORY_MAX_DIST_CLIENTS) {
+        snprintf(why, why_len, "%zu clients: the distribution TX would not fit a "
+                 "%d vB TRUC transaction (at most %d clients)", n_clients,
+                 TRUC_MAX_VSIZE, FACTORY_MAX_DIST_CLIENTS);
+        return 0;
+    }
+    secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+    pks[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n_clients; i++)
+        pks[i + 1] = lsp->client_pubkeys[i];
+    factory_t *t = calloc(1, sizeof(factory_t));
+    if (!t) { snprintf(why, why_len, "out of memory"); return 0; }
+    tree_shape_t shape;
+    tree_shape_of(cfg, &shape);
+    factory_init_from_pubkeys(t, lsp->ctx, pks, n_clients + 1, step_blocks,
+                              states_per_layer);
+    tree_shape_apply(t, &shape);
+    t->tree_fee_rate = rate;
+    t->use_tree_anchor = 1;
+    t->build_quiet = 1;
+    /* The LSP's member capacities, when they are for these clients: the
+       planned tree is then the capacity tree. */
+    if (lsp->member_capacities && lsp->n_member_capacities == n_clients &&
+        (!factory_set_member_capacities(t, lsp->member_capacities, n_clients) ||
+         !factory_set_leaf_stock(t, lsp->leaf_stock_sats))) {
+        snprintf(why, why_len, "member capacities refused");
+        factory_free(t);
+        free(t);
+        return 0;
+    }
+    t->cltv_timeout = 1;   /* any CLTV: a distribution TX exists */
+    /* a placeholder outpoint, but the real funding script: factory_build_tree
+       refuses any other */
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x5a, sizeof(txid));
+    int ok = factory_compute_funding_spk(t, spk) &&
+             factory_set_funding(t, txid, 0, funding_amount, spk, sizeof(spk)) &&
+             factory_build_tree(t);
+    if (!ok)
+        snprintf(why, why_len, "no %zu-client tree of this shape can be built from "
+                 "%llu sat at %llu sat/kvB", n_clients,
+                 (unsigned long long)funding_amount, (unsigned long long)rate);
+    /* the same distribution TX the ceremony co-signs, so the check covers it */
+    if (ok) {
+        tx_output_t *douts = calloc(n_clients + 1, sizeof(tx_output_t));
+        size_t nd = douts ? factory_compute_distribution_outputs_balanced(t, douts,
+                                n_clients + 1, factory_distribution_fee(t, n_clients),
+                                lsp->dist_client_amounts, lsp->dist_n_client_amounts) : 0;
+        if (nd == 0 || !factory_build_distribution_tx_unsigned(t, douts, nd, 1)) {
+            snprintf(why, why_len, "the distribution TX cannot be built");
+            ok = 0;
+        }
+        free(douts);
+    }
+    if (ok && !factory_check_tree_fees(t, why, why_len))
+        ok = 0;
+    /* A node without an anchor cannot be bumped: it relays only while the
+       agreed rate meets the node's floor. */
+    if (ok && !lsp->allow_anchorless_tree) {
+        for (size_t i = 0; i < t->n_nodes; i++) {
+            const factory_node_t *n = &t->nodes[i];
+            int has = 0;
+            for (size_t k = 0; k < n->n_outputs; k++)
+                if (n->outputs[k].script_pubkey_len == P2A_SPK_LEN &&
+                    memcmp(n->outputs[k].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0)
+                    has = 1;
+            if (!has) {
+                snprintf(why, why_len, "tree node %zu (%s) has no P2A anchor: it could "
+                         "not be fee-bumped (n-way leaves and sub-factories carry none "
+                         "yet; --allow-anchorless-tree accepts it for tests)", i,
+                         n->type == NODE_PS_SUBFACTORY ? "sub-factory" : "leaf");
+                ok = 0;
+                break;
+            }
+        }
+    }
+    /* the base commitment fee lsp_channels_init reserves (the agreed rate) */
+    uint64_t commit_fee = fee_commitment_tx_at(rate, 0);
+    uint64_t min_usable = UINT64_MAX;
+    for (size_t c = 0; ok && c < n_clients; c++) {
+        size_t node_idx = 0;
+        uint32_t vout = 0;
+        if (!factory_client_to_leaf(t, c, &node_idx, &vout) ||
+            vout >= t->nodes[node_idx].n_outputs) {
+            snprintf(why, why_len, "client %zu has no channel output", c);
+            ok = 0;
+            break;
+        }
+        uint64_t amt = t->nodes[node_idx].outputs[vout].amount_sats;
+        uint64_t usable = amt > commit_fee ? amt - commit_fee : 0;
+        if (usable < min_usable) min_usable = usable;
+    }
+    factory_free(t);
+    free(t);
+    if (!ok || min_usable == UINT64_MAX) return 0;
+    if (min_usable_out) *min_usable_out = min_usable;
+    return 1;
 }
 
 /* Phase 1e.3.b scaffolding: stub for the reversed-flow stateless factory
@@ -729,6 +869,17 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         creation_template_free(&tmpl);
         return 0;
     }
+    {
+        char why[200];
+        if (!factory_check_tree_fees(f, why, sizeof(why))) {
+            fprintf(stderr, "LSP-stateless factory creation: refusing to sign: %s\n",
+                    why);
+            creation_template_restore(f, &tmpl);
+            creation_template_free(&tmpl);
+            return 0;
+        }
+    }
+    printf("LSP: tree fee rate %llu sat/kvB\n", (unsigned long long)f->tree_fee_rate);
 
     /* Send FACTORY_PROPOSE to all clients (tree shape) */
     cJSON *propose = wire_build_factory_propose(f);
@@ -770,7 +921,22 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
        net that lets ANYONE broadcast at the factory CLTV to pay every client
        when all parties go offline.  (Legacy rotation also re-signs it later.)
        Proven e2e by tools/test_regtest_all_offline_recovery.sh (#54 G1c). */
-    (void)lsp_build_dist_unsigned(lsp, f);
+    if (f->cltv_timeout > 0) {
+        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS + 1];
+        uint64_t dist_fee = factory_distribution_fee(f, f->n_participants - 1);
+        size_t n_dist = factory_compute_distribution_outputs_balanced(f,
+            dist_outputs, FACTORY_MAX_SIGNERS + 1, dist_fee,
+            lsp->dist_client_amounts, lsp->dist_n_client_amounts);
+        if (n_dist == 0 ||
+            !factory_build_distribution_tx_unsigned(f, dist_outputs, n_dist,
+                                                    f->cltv_timeout)) {
+            fprintf(stderr, "LSP-stateless factory creation: cannot build the "
+                    "distribution TX (fee %llu sat, funding %llu sat); aborting\n",
+                    (unsigned long long)dist_fee,
+                    (unsigned long long)f->funding_amount_sats);
+            goto fail_pre;
+        }
+    }
 
     /* ---- Reversed stateless signing exchange ---- */
 
@@ -830,6 +996,9 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     size_t dist_row = (size_t)f->n_nodes * mtx_stride;  /* byte offset of the dist row */
     dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
                    factory_session_init_dist(f));
+    /* Test hook, inert unless superscalar_cheat_allowed() (regtest only):
+       leave the distribution TX out of the creation ceremony. */
+    if (superscalar_cheat_allowed() && getenv("SS_CHEAT_DIST_OMIT")) dist_active = 0;
 
     lsp_crash_checkpoint("factory_creation_propose");
 
@@ -1001,8 +1170,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             wire_json_add_hex(response, "all_dist_pubnonces",
                               all_pn + dist_row, (size_t)f->n_participants * 66);
             wire_json_add_hex(response, "lsp_dist_psig", lsp_dist_psig, 32);
+            /* Test hook, inert unless superscalar_cheat_allowed() (regtest
+               only): announce a different locktime. */
             cJSON_AddNumberToObject(response, "dist_nlocktime",
-                                    (double)f->cltv_timeout);
+                                    (double)(factory_distribution_locktime(f) +
+                                             ((superscalar_cheat_allowed() &&
+                                               getenv("SS_CHEAT_DIST_LOCKTIME"))
+                                                  ? 1u : 0u)));
             size_t namt = lsp->dist_n_client_amounts;
             if (namt > 0 && namt <= (size_t)f->n_participants) {
                 unsigned char *amt_le = calloc(namt, 8);

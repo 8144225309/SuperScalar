@@ -143,14 +143,15 @@ static int ot_run(int mode, int member_ok[4], const char **fail_out) {
                 fail = "channel output is not the member's capacity";
         }
         tx_output_t douts[8];
-        size_t nd = factory_compute_distribution_outputs_balanced(f, douts, 8, 500, NULL, 0);
+        uint64_t dist_fee = factory_distribution_fee(f, 4);
+        size_t nd = factory_compute_distribution_outputs_balanced(f, douts, 8, dist_fee, NULL, 0);
         uint64_t dsum = 0;
         if (nd != 4) fail = "distribution outputs";
         for (size_t c = 0; !fail && c < nd; c++) {
             dsum += douts[c].amount_sats;
             if (douts[c].amount_sats < ot_caps[c]) fail = "distribution below capacity";
         }
-        if (!fail && dsum != amount - 500) fail = "distribution total";
+        if (!fail && dsum != amount - dist_fee) fail = "distribution total";
         if (!fail && f->dist_tx_ready != 2) fail = "distribution TX not co-signed";
     }
     int mgr_live = 0;

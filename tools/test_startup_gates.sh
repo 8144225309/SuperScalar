@@ -65,6 +65,8 @@ for NET in mainnet bitcoin; do
     expect_refusal "refused on mainnet" "$LSP" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --test-allow-tree-advance
+    expect_refusal "--enable-rotation-experimental is refused on mainnet" \
+        "$CLIENT" --network "$NET" --i-accept-the-risk --enable-rotation-experimental
     expect_refusal "refused on mainnet" \
         "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db" --test-flag
     expect_refusal "refused on mainnet" \
@@ -84,6 +86,10 @@ for NET in mainnet bitcoin; do
         "$LSP" --network "$NET" --i-accept-the-risk --enable-rotation-experimental
     expect_refusal "--test-rotation is test/cheat scaffolding and is refused on mainnet" \
         "$LSP" --network "$NET" --i-accept-the-risk --test-rotation
+
+    # A tree with nodes that cannot be fee-bumped: tests only.
+    expect_refusal "--allow-anchorless-tree is refused on mainnet" \
+        "$LSP" --network "$NET" --i-accept-the-risk --allow-anchorless-tree
 
     # Persistent state: --db for LSP and client, --wt-db for the LSP.
     expect_refusal "mainnet requires --db" "$LSP" --network "$NET" --i-accept-the-risk

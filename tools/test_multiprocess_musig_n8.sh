@@ -207,7 +207,7 @@ stdbuf -oL "$LSP_BIN" \
     --port "$LSP_PORT" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" \
-    --arity "$ARITY" \
+    --arity "$ARITY" --allow-anchorless-tree \
     "${SNR_ARGS[@]}" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \

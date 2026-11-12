@@ -157,6 +157,7 @@ add_library(superscalar
     src/fee_estimator_blocks.c
     src/fee_estimator_api.c
     src/wallet_source_rpc.c
+    src/cpfp.c
     src/wallet_source_hd.c
     src/lsp_fund.c
     src/superscalar_sdk.c
@@ -230,6 +231,7 @@ add_library(superscalar
     src/invoice.c
     src/admin_rpc.c
     src/factory_recovery.c
+    src/client_dist.c
     src/sweeper.c
     src/scb.c
     src/onion_message.c
@@ -310,6 +312,8 @@ add_executable(test_superscalar
     tests/test_reconnect.c
     tests/test_client_watchtower.c
     tests/test_cpfp.c
+    tests/test_tree_fees.c
+    tests/test_regtest_cpfp.c
     tests/test_jit.c
     tests/test_ceremony.c
     tests/test_crash_checkpoint.c
@@ -382,7 +386,9 @@ add_executable(test_superscalar
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_cli_arity.c
+    tests/test_client_dist.c
     tests/test_tree_shape.c
+    tests/test_advanceless.c
     tests/test_network.c
     tests/test_prometheus.c
 )

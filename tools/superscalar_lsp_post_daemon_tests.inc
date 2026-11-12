@@ -1929,14 +1929,9 @@
         /* Restore Factory 0 balances if they fit in new channel capacity (same
            rule as src/lsp_rotation.c:902-911). */
         for (size_t c = 0; c < mgr2->n_channels && c < rot_saved_n_channels; c++) {
-            channel_t *ch = &mgr2->entries[c].channel;
-            uint64_t old_total = rot_saved_ch_local[c] + rot_saved_ch_remote[c];
-            uint64_t new_usable = ch->local_amount + ch->remote_amount;
-            if (old_total > 0 && old_total <= new_usable) {
-                ch->local_amount   = rot_saved_ch_local[c];
-                ch->remote_amount  = rot_saved_ch_remote[c];
-                ch->funding_amount = old_total;
-            }
+            if (rot_saved_ch_local[c] + rot_saved_ch_remote[c] == 0) continue;
+            lsp_channel_carry_client_balance(&mgr2->entries[c].channel,
+                                             rot_saved_ch_remote[c]);
         }
         if (!lsp_channels_exchange_basepoints(mgr2, lsp_p)) {
             fprintf(stderr, "ROTATION: basepoint exchange for Factory 1 failed\n");

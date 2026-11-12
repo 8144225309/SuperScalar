@@ -104,6 +104,11 @@ extern int test_factory_split_round_with_pool(void);
 extern int test_factory_advance_split_round(void);
 extern int test_factory_multi_input_keyagg(void);
 extern int test_regtest_factory_tree(void);
+extern int test_regtest_recovery_waits_for_confirmed_parent(void);
+extern int test_regtest_cpfp_parent_accepted_child_rejected(void);
+extern int test_regtest_cpfp_rebump_in_mempool(void);
+extern int test_regtest_wt_escalator_replaces_own_child(void);
+extern int test_regtest_cpfp_outbid_foreign_wallet_child(void);
 
 extern int test_bip158_backend_init(void);
 extern int test_bip158_script_registry(void);
@@ -488,9 +493,6 @@ extern int test_scb_load_empty_file(void);
 extern int test_force_close_msg_error_no_wt(void);
 extern int test_force_close_msg_error_wired(void);
 extern int test_force_close_msg_error_return(void);
-extern int test_fee_anchor_guard_null(void);
-extern int test_fee_anchor_guard_low_rate(void);
-extern int test_fee_anchor_guard_normal_rate(void);
 extern int test_watchtower_init_fee_est(void);
 extern int test_watchtower_build_cpfp_no_wallet(void);
 extern int test_watchtower_add_pending(void);
@@ -1077,6 +1079,8 @@ extern int test_htlc_offered_scripts(void);
 extern int test_htlc_received_scripts(void);
 extern int test_htlc_control_block_2leaf(void);
 extern int test_htlc_add_fulfill(void);
+extern int test_htlc_count_capped_at_relay_limit(void);
+extern int test_commitment_anchor_at_rate_0(void);
 extern int test_htlc_add_fail(void);
 extern int test_htlc_commitment_tx(void);
 extern int test_htlc_success_spend(void);
@@ -1327,6 +1331,9 @@ extern int test_bridge_forwards_pay_result_ack(void);
 extern int test_lsp_outbound_internal_invoice_refused(void);
 extern int test_lsp_same_hash_inbound_and_outbound(void);
 extern int test_persist_htlc_origin_rows(void);
+extern int test_persist_signed_tx_loaders_never_overreport(void);
+extern int test_autosettle_sends_large_commitment(void);
+extern int test_persist_factory_without_tree_rate_refused(void);
 extern int test_lsp_inbound_origin_table_and_rollback(void);
 extern int test_lsp_pay_result_rejections(void);
 extern int test_lsp_outbound_htlc_returned(void);
@@ -1368,6 +1375,11 @@ extern int test_cli_command_parsing(void);
 
 /* Phase 4 (mixed-arity plan) — CLI arity parsing + BOLT-2016 ceiling tests */
 extern int test_tree_shape_txids_pinned(void);
+extern int test_advanceless_shape_rule(void);
+extern int test_advanceless_default_tree(void);
+extern int test_advanceless_refuses_refresh(void);
+extern int test_advanceless_persist_reload(void);
+extern int test_advanceless_reload_tree_rate(void);
 extern int test_tree_shape_dw_layers_deep(void);
 extern int test_tree_shape_static_leaf(void);
 extern int test_tree_shape_ewt_matches_tx(void);
@@ -1395,6 +1407,13 @@ extern int test_cli_arity_rejects_negative(void);
 extern int test_cli_arity_rejects_non_numeric(void);
 extern int test_cli_arity_rejects_mixed_with_oversize_entry(void);
 extern int test_cli_arity_rejects_empty(void);
+extern int test_cli_factory_cltv_floor(void);
+extern int test_cli_proposed_cltv_floor(void);
+extern int test_client_dist_verify_accepts_signed(void);
+extern int test_client_dist_verify_rejects(void);
+extern int test_client_dist_step_never_early(void);
+extern int test_client_dist_step_spent_and_confirmed(void);
+extern int test_client_dist_daemon_exit_rule(void);
 extern int test_cli_static_near_root_parses_1(void);
 extern int test_cli_static_near_root_parses_zero_disabled(void);
 extern int test_cli_static_near_root_rejects_negative(void);
@@ -1422,6 +1441,21 @@ extern int test_prometheus_client_counter(void);
 extern int test_reconnect_wire(void);
 extern int test_reconnect_pubkey_match(void);
 extern int test_reconnect_nonce_reexchange(void);
+extern int test_initial_commitment_signed_at_open(void);
+extern int test_initial_commitment_rejects_invalid(void);
+extern int test_initial_commitment_persist_reload(void);
+extern int test_initial_commitment_recv_checks_conservation(void);
+extern int test_rotation_commitment_carries_balance(void);
+extern int test_distribution_tx_verification(void);
+extern int test_client_funding_check(void);
+extern int test_client_factory_ready_handler(void);
+extern int test_client_distribution_exit_checks(void);
+extern int test_client_force_close_plan(void);
+extern int test_client_funding_depth_and_order(void);
+extern int test_client_rotation_disabled(void);
+extern void client_set_allow_unverified_funding(int allow);
+extern void client_set_allow_rotation(int allow);
+extern int test_rotation_pending_record(void);
 extern int test_client_persist_reload(void);
 
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
@@ -1448,6 +1482,20 @@ extern int test_fee_penalty_tx(void);
 extern int test_fee_factory_tx(void);
 extern int test_fee_commitment_tx(void);
 extern int test_fee_cpfp_tx(void);
+extern int test_tree_fee_arity2_leaf_210vb(void);
+extern int test_tree_fee_every_node_exact_rate(void);
+extern int test_tree_fee_checker_rejects_wrong_fee(void);
+extern int test_commitment_fee_exact_vsize(void);
+extern int test_tree_fee_lsp_plan_before_funding(void);
+extern int test_cpfp_exit_needs_child_reported(void);
+extern int test_distribution_fee_from_lsp_share(void);
+extern int test_tree_fee_ps_chains(void);
+extern int test_tree_fee_distribution_tx(void);
+extern int test_tree_fee_client_policy(void);
+extern int test_tree_fee_overflow_fails(void);
+extern int test_cpfp_parse_and_fee_math(void);
+extern int test_cpfp_anchor_only_child(void);
+extern int test_cpfp_wallet_child_reaches_package_rate(void);
 extern int test_fee_update_from_node_null(void);
 extern int test_watchtower_watch_and_check(void);
 extern int test_persist_old_commitments(void);
@@ -1802,6 +1850,8 @@ extern int test_rotation_retry_backoff(void);
 extern int test_rotation_retry_success_resets(void);
 extern int test_rotation_retry_defaults(void);
 extern int test_rotation_retry_factory_id_collision(void);
+extern int test_rotation_postponed_on_fees_changes_nothing(void);
+extern int test_distribution_tx_state_without_txindex(void);
 
 /* Profit Settlement tests */
 extern int test_profit_settlement_calculation(void);
@@ -2009,6 +2059,7 @@ extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
 extern int test_payment_leaves_leaf_untouched_arity_ps(void);
 extern int test_payment_leaves_leaf_untouched_arity1(void);
+extern int test_forward_into_full_channel_fails_back(void);
 extern int test_client_refuses_tree_advances(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
@@ -2025,6 +2076,7 @@ extern int test_regtest_ps_old_state_response(void);
 /* Mainnet Audit: Password-Hardened KDF */
 extern int test_network_is_mainnet(void);
 extern int test_network_canonical(void);
+extern int test_network_funding_confs(void);
 extern int test_network_gate_risk_accepted(void);
 extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
@@ -2069,6 +2121,7 @@ extern int test_fee_estimator_blocks_floor_only(void);
 extern int test_fee_estimator_blocks_target_ordering(void);
 extern int test_feefilter_p2p_parse(void);
 extern int test_fee_estimator_api_parse(void);
+extern int test_fee_estimator_api_clamps_absurd(void);
 extern int test_fee_estimator_api_ttl(void);
 extern int test_wallet_source_stub(void);
 extern int test_ss_config_default(void);
@@ -2615,9 +2668,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_force_close_msg_error_no_wt);
     RUN_TEST(test_force_close_msg_error_wired);
     RUN_TEST(test_force_close_msg_error_return);
-    RUN_TEST(test_fee_anchor_guard_null);
-    RUN_TEST(test_fee_anchor_guard_low_rate);
-    RUN_TEST(test_fee_anchor_guard_normal_rate);
     RUN_TEST(test_watchtower_init_fee_est);
     RUN_TEST(test_watchtower_build_cpfp_no_wallet);
     RUN_TEST(test_watchtower_add_pending);
@@ -3199,6 +3249,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_received_scripts);
     RUN_TEST(test_htlc_control_block_2leaf);
     RUN_TEST(test_htlc_add_fulfill);
+    RUN_TEST(test_htlc_count_capped_at_relay_limit);
+    RUN_TEST(test_commitment_anchor_at_rate_0);
     RUN_TEST(test_htlc_add_fail);
     RUN_TEST(test_htlc_commitment_tx);
     RUN_TEST(test_htlc_success_spend);
@@ -3388,6 +3440,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_outbound_internal_invoice_refused);
     RUN_TEST(test_lsp_same_hash_inbound_and_outbound);
     RUN_TEST(test_persist_htlc_origin_rows);
+    RUN_TEST(test_persist_signed_tx_loaders_never_overreport);
+    RUN_TEST(test_autosettle_sends_large_commitment);
+    RUN_TEST(test_persist_factory_without_tree_rate_refused);
     RUN_TEST(test_lsp_inbound_origin_table_and_rollback);
     RUN_TEST(test_lsp_pay_result_rejections);
     RUN_TEST(test_lsp_outbound_htlc_returned);
@@ -3443,6 +3498,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tree_shape_channel_spk_verbatim);
     RUN_TEST(test_tree_shape_capacity_default);
     RUN_TEST(test_tree_shape_capacity_build);
+    RUN_TEST(test_advanceless_shape_rule);
+    RUN_TEST(test_advanceless_default_tree);
+    RUN_TEST(test_advanceless_refuses_refresh);
+    RUN_TEST(test_advanceless_persist_reload);
+    RUN_TEST(test_advanceless_reload_tree_rate);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);
@@ -3453,6 +3513,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cli_arity_rejects_non_numeric);
     RUN_TEST(test_cli_arity_rejects_mixed_with_oversize_entry);
     RUN_TEST(test_cli_arity_rejects_empty);
+    RUN_TEST(test_cli_factory_cltv_floor);
+    RUN_TEST(test_cli_proposed_cltv_floor);
+    RUN_TEST(test_client_dist_verify_accepts_signed);
+    RUN_TEST(test_client_dist_verify_rejects);
+    RUN_TEST(test_client_dist_step_never_early);
+    RUN_TEST(test_client_dist_step_spent_and_confirmed);
+    RUN_TEST(test_client_dist_daemon_exit_rule);
     RUN_TEST(test_cli_static_near_root_parses_1);
     RUN_TEST(test_cli_static_near_root_parses_zero_disabled);
     RUN_TEST(test_cli_static_near_root_rejects_negative);
@@ -3481,6 +3548,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_wire);
     RUN_TEST(test_reconnect_pubkey_match);
     RUN_TEST(test_reconnect_nonce_reexchange);
+    RUN_TEST(test_initial_commitment_signed_at_open);
+    RUN_TEST(test_initial_commitment_rejects_invalid);
+    RUN_TEST(test_initial_commitment_persist_reload);
+    RUN_TEST(test_initial_commitment_recv_checks_conservation);
+    RUN_TEST(test_rotation_commitment_carries_balance);
+    RUN_TEST(test_distribution_tx_verification);
+    RUN_TEST(test_client_funding_check);
+    RUN_TEST(test_client_factory_ready_handler);
+    RUN_TEST(test_client_distribution_exit_checks);
+    RUN_TEST(test_client_force_close_plan);
+    RUN_TEST(test_client_funding_depth_and_order);
+    RUN_TEST(test_client_rotation_disabled);
+    client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
+    RUN_TEST(test_rotation_pending_record);
     RUN_TEST(test_client_persist_reload);
 
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
@@ -3507,6 +3589,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_fee_init_default);
     RUN_TEST(test_fee_penalty_tx);
     RUN_TEST(test_fee_factory_tx);
+    printf("\n=== Pre-signed tree fees + anchor CPFP ===\n");
+    RUN_TEST(test_tree_fee_arity2_leaf_210vb);
+    RUN_TEST(test_tree_fee_every_node_exact_rate);
+    RUN_TEST(test_tree_fee_checker_rejects_wrong_fee);
+    RUN_TEST(test_commitment_fee_exact_vsize);
+    RUN_TEST(test_tree_fee_lsp_plan_before_funding);
+    RUN_TEST(test_cpfp_exit_needs_child_reported);
+    RUN_TEST(test_distribution_fee_from_lsp_share);
+    RUN_TEST(test_tree_fee_ps_chains);
+    RUN_TEST(test_tree_fee_distribution_tx);
+    RUN_TEST(test_tree_fee_client_policy);
+    RUN_TEST(test_tree_fee_overflow_fails);
+    RUN_TEST(test_cpfp_parse_and_fee_math);
+    RUN_TEST(test_cpfp_anchor_only_child);
+    RUN_TEST(test_cpfp_wallet_child_reaches_package_rate);
     RUN_TEST(test_fee_commitment_tx);
     RUN_TEST(test_fee_cpfp_tx);
     RUN_TEST(test_fee_update_from_node_null);
@@ -3850,6 +3947,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_retry_success_resets);
     RUN_TEST(test_rotation_retry_defaults);
     RUN_TEST(test_rotation_retry_factory_id_collision);
+    RUN_TEST(test_rotation_postponed_on_fees_changes_nothing);
+    RUN_TEST(test_distribution_tx_state_without_txindex);
 
     printf("\n=== Profit Settlement ===\n");
     RUN_TEST(test_profit_settlement_calculation);
@@ -4058,6 +4157,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_with_real_htlc);
     RUN_TEST(test_payment_leaves_leaf_untouched_arity_ps);
     RUN_TEST(test_payment_leaves_leaf_untouched_arity1);
+    RUN_TEST(test_forward_into_full_channel_fails_back);
     RUN_TEST(test_client_refuses_tree_advances);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
@@ -4074,6 +4174,7 @@ static void run_unit_tests(void) {
     printf("\n=== Network Names & Mainnet Start-up Gates ===\n");
     RUN_TEST(test_network_is_mainnet);
     RUN_TEST(test_network_canonical);
+    RUN_TEST(test_network_funding_confs);
     RUN_TEST(test_network_gate_risk_accepted);
     RUN_TEST(test_network_gate_cmdline_seckey);
     RUN_TEST(test_network_gate_no_test_scaffolding);
@@ -4120,6 +4221,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_fee_estimator_blocks_target_ordering);
     RUN_TEST(test_feefilter_p2p_parse);
     RUN_TEST(test_fee_estimator_api_parse);
+    RUN_TEST(test_fee_estimator_api_clamps_absurd);
     RUN_TEST(test_fee_estimator_api_ttl);
     RUN_TEST(test_wallet_source_stub);
     RUN_TEST(test_ss_config_default);
@@ -4256,6 +4358,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_counts_ptlc_fee);
     RUN_TEST(test_client_close_honest_ceremony);
     RUN_TEST(test_client_run_with_channels_checks_close);
+    extern int test_lsp_dist_cheats_need_cheat_gate(void);
+    RUN_TEST(test_lsp_dist_cheats_need_cheat_gate);
     extern int test_client_leaf_realloc_acceptable(void);
     extern int test_client_leaf_realloc_handler_refuses_all(void);
     extern int test_client_leaf_realloc_ceremony_refused(void);
@@ -4412,11 +4516,22 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);
 
+    printf("\n=== Regtest Pre-signed TRUC Broadcast ===\n");
+    RUN_TEST(test_regtest_recovery_waits_for_confirmed_parent);
+    RUN_TEST(test_regtest_cpfp_parent_accepted_child_rejected);
+    RUN_TEST(test_regtest_cpfp_rebump_in_mempool);
+    RUN_TEST(test_regtest_wt_escalator_replaces_own_child);
+    RUN_TEST(test_regtest_cpfp_outbid_foreign_wallet_child);
+
     regtest_faucet_health_report();
 }
 
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
+
+    /* In-process ceremonies have no chain to look a funding output up in. */
+    client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
 
     if (argc < 2)
         run_unit = 1;

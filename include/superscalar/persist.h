@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 39
+#define PERSIST_SCHEMA_VERSION 41
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -137,6 +137,10 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
 /* Check if a factory row exists in the database.  Returns 1 if present. */
 int persist_has_factory(persist_t *p, uint32_t factory_id);
+
+/* 1 if the factories row `factory_id` exists with state 'closed' (its tree is
+   fully on chain or the factory was otherwise settled). */
+int persist_factory_is_closed(persist_t *p, uint32_t factory_id);
 
 /* --- Pseudo-Spilman leaf chain persistence --- */
 
@@ -1303,7 +1307,28 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
                                  const unsigned char *signed_tx,
                                  size_t signed_tx_len);
 
-/* Load the latest commitment TX signature. Returns 1 if found. */
+/* Remove a factory's row, participants, tree nodes and distribution
+   transaction.  Channel-level rows are not touched.  Returns 1 on success,
+   also when nothing was stored under that id. */
+int persist_delete_factory_record(persist_t *p, uint32_t factory_id);
+
+/* Txid (64 hex characters plus NUL, display order) and output count of a
+   stored tree node.  Returns 1 if the node is on record. */
+int persist_load_tree_node_txid(persist_t *p, uint32_t factory_id,
+                                 uint32_t node_index, char *txid_hex65,
+                                 uint32_t *n_outputs_out);
+
+/* Funding outpoint (txid as 64 hex characters plus NUL, display order) and
+   CLTV timeout of a stored factory.  Returns 1 if the factory is on record. */
+int persist_load_factory_outpoint(persist_t *p, uint32_t factory_id,
+                                   char *txid_hex65, uint32_t *vout_out,
+                                   uint32_t *cltv_timeout_out);
+
+
+/* Load the latest commitment TX signature. Returns 1 if found.  With
+   signed_tx_out NULL, *signed_tx_len_out is the stored TX's length; with a
+   buffer smaller than the stored TX, returns 0 and sets *signed_tx_len_out
+   to 0. */
 int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
                                  uint64_t *commitment_number_out,
                                  unsigned char *sig64_out,
@@ -1318,7 +1343,9 @@ int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,
                                   const unsigned char *signed_tx,
                                   size_t signed_tx_len);
 
-/* Load the signed distribution TX. Returns 1 if found. */
+/* Load the signed distribution TX. Returns 1 if found.  With signed_tx_out
+   NULL, *signed_tx_len_out is the stored TX's length; with a buffer smaller
+   than the stored TX, returns 0 and sets *signed_tx_len_out to 0. */
 int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
                                   unsigned char *signed_tx_out,
                                   size_t *signed_tx_len_out,

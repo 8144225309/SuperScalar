@@ -15,6 +15,13 @@
 /* 1 if network names Bitcoin mainnet ("mainnet" or "bitcoin"), else 0. */
 int network_is_mainnet(const char *network);
 
+/* Confirmations a factory's funding output needs before the factory is used:
+   override if it is positive, otherwise the chain's default (regtest 1,
+   mainnet 6, every other chain 3).  The LSP waits for this depth and the
+   client refuses a factory whose funding output is less deep, so with the
+   defaults both sides agree. */
+int network_funding_confs(const char *network, int override);
+
 /* The canonical name of a supported chain: "bitcoin" maps to "mainnet", the
    other supported names map to themselves.  Returns a static string, or NULL
    if network is NULL or not a supported chain.  The daemons canonicalise
@@ -49,6 +56,7 @@ typedef struct {
     int have_wt_db;           /* --wt-db given */
     int enable_jit_experimental; /* --enable-jit-experimental given (LSP) */
     int enable_rotation_experimental; /* --enable-rotation-experimental given (LSP) */
+    int allow_anchorless_tree;   /* --allow-anchorless-tree given (LSP, tests) */
     int argc;                 /* the daemon's own argc/argv */
     char *const *argv;
     char *const *envp;        /* its environment (NULL-terminated), or NULL */
@@ -92,6 +100,12 @@ int network_gate_watchtower_db(const char *network, int have_wt_db,
    opt-in is refused on mainnet. */
 int network_gate_no_experimental_jit(const char *network, int enable_jit,
                                      char *err_buf, size_t err_buf_len);
+
+/* A tree node without a P2A anchor cannot be fee-bumped: the factory exit
+   then depends on the agreed rate meeting every node's relay floor.
+   --allow-anchorless-tree (tests) is refused on mainnet. */
+int network_gate_no_anchorless_tree(const char *network, int allow_anchorless,
+                                    char *err_buf, size_t err_buf_len);
 
 /* Factory rotation is experimental: the close of the old factory can pay the
    members' balances to the LSP.  The opt-in is refused on mainnet. */

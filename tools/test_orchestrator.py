@@ -448,7 +448,7 @@ class Orchestrator:
             "--host", "127.0.0.1",
             "--network", self.network,
             "--db", self._client_db(index),
-            "--daemon",
+            "--daemon", "--enable-rotation-experimental",
             "--fee-rate", "1000",
             "--cli-path", self.chain.cli_path,
             "--rpcuser", self.rpcuser,
@@ -1851,7 +1851,7 @@ def scenario_dw_advance(orch):
     orch._log("=== SCENARIO: dw_advance ===")
     orch._log("LSP runs demo then DW advance test (advance counter, re-sign, force-close).")
 
-    orch.start_lsp(["--demo", "--test-dw-advance"])
+    orch.start_lsp(["--arity", "3", "--demo", "--test-dw-advance"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 

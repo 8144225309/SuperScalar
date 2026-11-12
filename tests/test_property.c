@@ -436,7 +436,7 @@ int test_prop_persist_factory_roundtrip(void) {
         f->step_blocks = step;
         f->states_per_layer = states;
         f->cltv_timeout = 1000 + (rand_r(&seed) % 9000);
-        f->fee_per_tx = 300;
+        f->tree_fee_rate = 1500;
         f->leaf_arity = 2;
         /* Generate random funding txid */
         for (int i = 0; i < 32; i++)
@@ -456,9 +456,17 @@ int test_prop_persist_factory_roundtrip(void) {
             }
         }
 
-        /* Save */
+        /* Build the tree the factory row stands for, then save both */
+        f->ctx = ctx;
+        f->use_tree_anchor = 1;
+        unsigned char fspk[34];
+        TEST_ASSERT(factory_compute_funding_spk(f, fspk), "funding spk");
+        TEST_ASSERT(factory_set_funding(f, f->funding_txid, f->funding_vout,
+                                        amount, fspk, 34), "set funding");
+        TEST_ASSERT(factory_build_tree(f), "build tree");
         uint32_t fid = (uint32_t)(trial + 1);
-        int saved = persist_save_factory(&db, f, ctx, fid);
+        int saved = persist_save_factory(&db, f, ctx, fid) &&
+                    persist_save_tree_nodes(&db, f, fid);
         TEST_ASSERT(saved, "persist_save_factory failed");
 
         /* Load and compare */
