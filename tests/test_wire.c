@@ -1252,7 +1252,7 @@ int test_regtest_wire_factory(void) {
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
