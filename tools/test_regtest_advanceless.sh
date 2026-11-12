@@ -405,8 +405,9 @@ run_lifecycle(){
     fi
     # the same factory marked closed is history: the LSP starts a new one
     sqlite3 "$D/lsp_bad.db" "UPDATE factories SET state = 'closed';"
-    timeout 20 "$LSP_BIN" "${bad_args[@]}" > "$D/lsp_closed.log" 2>&1 < /dev/null; rc=$?
-    if [ "$rc" = 124 ] && grep -aq "closed factory in .* is not loaded" "$D/lsp_closed.log" &&
+    # (it then waits for clients; SIGKILL after 20 s: rc 137)
+    timeout -s KILL 20 "$LSP_BIN" "${bad_args[@]}" > "$D/lsp_closed.log" 2>&1 < /dev/null; rc=$?
+    if [ "$rc" = 137 ] && grep -aq "closed factory in .* is not loaded" "$D/lsp_closed.log" &&
        grep -aq "waiting for $N clients" "$D/lsp_closed.log"; then
         note_ok "a closed factory that does not reload is history: the LSP starts and waits for a new factory"
     else
