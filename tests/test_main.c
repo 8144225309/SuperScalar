@@ -4268,6 +4268,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_counts_ptlc_fee);
     RUN_TEST(test_client_close_honest_ceremony);
     RUN_TEST(test_client_run_with_channels_checks_close);
+    extern int test_lsp_dist_cheats_need_cheat_gate(void);
+    RUN_TEST(test_lsp_dist_cheats_need_cheat_gate);
     extern int test_client_leaf_realloc_acceptable(void);
     extern int test_client_leaf_realloc_handler_refuses_all(void);
     extern int test_client_leaf_realloc_ceremony_refused(void);
