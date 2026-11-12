@@ -3255,17 +3255,16 @@ int main(int argc, char *argv[]) {
         }
 
         /* Load commitment sig to get the signed commitment TX */
-        unsigned char commit_tx_data[4096];
         size_t commit_tx_len = 0;
         uint64_t sig_cn = 0;
-        if (!persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
-                                          commit_tx_data, &commit_tx_len,
-                                          sizeof(commit_tx_data)) ||
-            commit_tx_len == 0) {
+        unsigned char *commit_tx_data =
+            exit_load_commitment(&db, &commit_tx_len, &sig_cn);
+        if (!commit_tx_data) {
             fprintf(stderr, "ERROR: no signed commitment TX in DB\n");
             persist_close(&db);
             return 1;
         }
+        free(commit_tx_data);
         printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
                (unsigned long long)sig_cn, commit_tx_len);
 

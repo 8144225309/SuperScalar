@@ -2,8 +2,9 @@
 # test_regtest_large_tree_exit.sh — unilateral client exit from a factory whose
 # tree has more than 128 transactions (regtest, real daemons).
 #
-# One LSP and N client processes build a factory. A few clients pay each
-# other, so they hold signed commitments. Then every SuperScalar process is
+# One LSP and N client processes build a factory, by default with one client
+# per pseudo-Spilman leaf. A few clients pay each other, so they hold signed
+# commitments. Then every SuperScalar process is
 # stopped and the clients on the HIGHEST-index leaves exit on their own with
 # `superscalar_client --force-close`, one pass per block, with nothing but
 # their own DB and a bitcoind.
@@ -28,16 +29,16 @@
 # Core's default 1 sat/vB floor and would not relay otherwise.
 #
 # Usage: bash tools/test_regtest_large_tree_exit.sh [BUILD_DIR]
-# Env:   N_CLIENTS (72)  ARITY (2)  STATIC_NEAR_ROOT (0)  CLIENTS_PER_LEAF (2)
-#        PAYMENTS (2)  AMOUNT (300000 sat per client)
-#        The defaults are two-client leaves: 72 clients, 142 tree transactions.
-#        One client per pseudo-Spilman leaf crosses 128 with fewer processes:
-#          N_CLIENTS=36 ARITY=3 CLIENTS_PER_LEAF=1                        (142)
-#          N_CLIENTS=64 ARITY=8,7,3 STATIC_NEAR_ROOT=2 CLIENTS_PER_LEAF=1 (153)
-#        Those shapes only pass when a settled payment leaves the payer's and
-#        the payee's leaf transaction untouched; the script stops with a
-#        precondition failure when a leaf was replaced after the channel
-#        opened.
+# Env:   N_CLIENTS (64)  ARITY (8,7,3)  STATIC_NEAR_ROOT (2)
+#        CLIENTS_PER_LEAF (1)  PAYMENTS (3)  AMOUNT (300000 sat per client)
+#        The defaults are 64 clients, each on its own pseudo-Spilman leaf:
+#        153 tree transactions. Other shapes that cross 128:
+#          N_CLIENTS=36 ARITY=3 STATIC_NEAR_ROOT=0 PAYMENTS=2             (142)
+#          N_CLIENTS=72 ARITY=2 STATIC_NEAR_ROOT=0 CLIENTS_PER_LEAF=2 PAYMENTS=2
+#                                          (two-client leaves, 142)
+#        The script stops with a precondition failure when the transaction
+#        that funds an exiting client's channel is no longer in that client's
+#        tree.
 #        PORT (29975) RPCPORT (18743) DEADLINE (1500 s) MAX_PASSES (120)
 #        RELAY_FLOOR (0.000001 BTC/kvB)
 #        WORK_DIR (mktemp) BTC_DIR ($WORK_DIR/bitcoind) KEEP_WORK (0)
@@ -50,11 +51,11 @@ LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 EXIT_CLIENT_BIN="${EXIT_CLIENT_BIN:-$CLIENT_BIN}"
 
-N_CLIENTS="${N_CLIENTS:-72}"
-ARITY="${ARITY:-2}"
-STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-0}"
-CLIENTS_PER_LEAF="${CLIENTS_PER_LEAF:-2}"
-PAYMENTS="${PAYMENTS:-2}"
+N_CLIENTS="${N_CLIENTS:-64}"
+ARITY="${ARITY:-8,7,3}"
+STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-2}"
+CLIENTS_PER_LEAF="${CLIENTS_PER_LEAF:-1}"
+PAYMENTS="${PAYMENTS:-3}"
 PAY_AMT="${PAY_AMT:-10000}"
 AMOUNT="${AMOUNT:-$(( N_CLIENTS * 300000 ))}"
 FEE_RATE="${FEE_RATE:-1000}"
@@ -217,6 +218,13 @@ def q(db, sql):
     r = c.execute(sql).fetchall(); c.close(); return r
 bad = 0
 nodes = q("lsp.db", "SELECT node_index, txid FROM tree_nodes WHERE factory_id=0")
+# every node's stored signer and output lists are complete, however wide
+lists = q("lsp.db", "SELECT node_index, n_signers, signer_indices, n_outputs, output_amounts FROM tree_nodes WHERE factory_id=0")
+short = [r[0] for r in lists if len([x for x in (r[2] or "").split(",") if x]) != r[1]
+         or len([x for x in (r[4] or "").split(",") if x]) != r[3]]
+print("  widest node: %d signers, %d outputs" % (max(r[1] for r in lists), max(r[3] for r in lists)))
+if short:
+    print("  FAIL: stored signer/output lists are cut short for nodes %s" % short[:10]); bad = 1
 chans = q("lsp.db", "SELECT slot, funding_txid FROM channels WHERE factory_id=0")
 txids = {t for _, t in nodes}
 print("  tree transactions: %d" % len(nodes))

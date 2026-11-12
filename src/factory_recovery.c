@@ -46,6 +46,7 @@ typedef struct {
     int      target;         /* this run has to publish the node */
     int      sent;           /* accepted by the node during this run */
     int      rejected;       /* refused although its parent was deep enough */
+    int      is_leaf;        /* "state" node that no other node spends */
 } fr_node_t;
 
 /* A factory's whole persisted tree.  nodes[i].node_index == i. */
@@ -216,6 +217,14 @@ static int fr_tree_load(sqlite3 *db, uint32_t factory_id, fr_tree_t *t,
         fr_tree_free(t);
         return -1;
     }
+
+    /* Tree rows are typed "kickoff" or "state" only: a leaf is a state node
+       that is nobody's parent. */
+    for (int i = 0; i < t->n; i++)
+        nodes[i].is_leaf = (strcmp(nodes[i].type, "state") == 0);
+    for (int i = 0; i < t->n; i++)
+        if (nodes[i].parent_index >= 0)
+            nodes[nodes[i].parent_index].is_leaf = 0;
     return 1;
 }
 
@@ -349,10 +358,9 @@ static int all_leaves_confirmed(chain_backend_t *chain, const fr_tree_t *t)
     int min_confs = chain ? chain_funding_confs(chain, chain->is_regtest) : 1;
     int found = 0;
     for (int i = 0; i < t->n; i++) {
-        if (strcmp(t->nodes[i].type, "leaf") == 0) {
-            found = 1;
-            if (t->nodes[i].confs < min_confs) return 0;
-        }
+        if (!t->nodes[i].is_leaf) continue;
+        found = 1;
+        if (t->nodes[i].confs < min_confs) return 0;
     }
     return found;
 }
@@ -595,7 +603,7 @@ cJSON *factory_recovery_list(persist_t *p, chain_backend_t *chain)
             if (chain) refresh_confs(chain, &tree, /* targets_only = */ 0);
             for (int i = 0; i < tree.n; i++) {
                 if (chain && tree.nodes[i].confs >= 1) n_confirmed++;
-                if (strcmp(tree.nodes[i].type, "leaf") == 0) {
+                if (tree.nodes[i].is_leaf) {
                     n_leaf++;
                     if (chain && tree.nodes[i].confs >= 1) n_leaf_confirmed++;
                 }

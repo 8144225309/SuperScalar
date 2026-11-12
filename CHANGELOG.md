@@ -14,7 +14,9 @@ All notable changes to SuperScalar are documented here.
 - **`--force-close` exit status says how far the exit got:** `0` = the commitment is in the mempool or a block (so the whole path is out), `2` = run it again after the next block, `1` = the exit cannot be completed from this DB (incomplete tree, or no signed commitment). Before, it always exited `0`.
 - `recoverfactory` returns an error instead of `broadcasts_made: false` when it cannot run, and reports `published`, `n_tree_nodes`, `n_confirmed`, `n_in_mempool`, `n_waiting` and `n_rejected`.
 - `sweepfactory` considers every output of a leaf transaction; it used to look at the first 8 only.
-- `--force-close` loads the commitment and the distribution transaction at their stored size instead of into 4 kB and 8 kB buffers.
+- `--force-close` and `--sweep-to-local` load the commitment, and `--force-close` the distribution transaction, at their stored size instead of into 4 kB and 8 kB buffers.
+- **A fully published factory is now marked `closed`.** Recovery looked for tree nodes of a type that is never stored, so it never found a leaf and never closed a factory. A leaf is now a state node that no other node spends; once all of them are confirmed at the funding depth, the start-up scan and a whole-tree `recoverfactory` mark the factory `closed`, and `listfactories` reports real `n_leaf` / `n_leaf_confirmed` counts.
+- The `signer_indices` and `output_amounts` columns of a stored tree node are written in full; they were cut at 127 and 255 characters (about 45 signers).
 
 ### Key handling and start-up safety
 

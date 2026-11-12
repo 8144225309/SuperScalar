@@ -4039,29 +4039,47 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
         sqlite3_bind_int(stmt, 6, node->dw_layer_index);
         sqlite3_bind_int(stmt, 7, (int)node->n_signers);
 
-        /* signer_indices as comma-separated */
-        char signers_buf[128];
+        /* signer_indices as comma-separated; sized for every signer
+           (10 digits + comma each) */
+        size_t signers_cap = node->n_signers * 11 + 1;
+        char *signers_buf = malloc(signers_cap);
+        if (!signers_buf) {
+            sqlite3_finalize(stmt);
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
+        size_t signers_len = 0;
         signers_buf[0] = '\0';
         for (size_t s = 0; s < node->n_signers; s++) {
-            char tmp[16];
-            snprintf(tmp, sizeof(tmp), "%s%u", s > 0 ? "," : "",
-                     node->signer_indices[s]);
-            strncat(signers_buf, tmp, sizeof(signers_buf) - strlen(signers_buf) - 1);
+            signers_len += (size_t)snprintf(signers_buf + signers_len,
+                                            signers_cap - signers_len, "%s%u",
+                                            s > 0 ? "," : "",
+                                            node->signer_indices[s]);
         }
         sqlite3_bind_text(stmt, 8, signers_buf, -1, SQLITE_TRANSIENT);
+        free(signers_buf);
 
         sqlite3_bind_int(stmt, 9, (int)node->n_outputs);
 
         /* output_amounts as comma-separated sats */
-        char amounts_buf[256];
+        /* sized for every output (20 digits + comma each) */
+        size_t amounts_cap = node->n_outputs * 21 + 1;
+        char *amounts_buf = malloc(amounts_cap);
+        if (!amounts_buf) {
+            sqlite3_finalize(stmt);
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
+        size_t amounts_len = 0;
         amounts_buf[0] = '\0';
         for (size_t o = 0; o < node->n_outputs; o++) {
-            char tmp[32];
-            snprintf(tmp, sizeof(tmp), "%s%llu", o > 0 ? "," : "",
-                     (unsigned long long)node->outputs[o].amount_sats);
-            strncat(amounts_buf, tmp, sizeof(amounts_buf) - strlen(amounts_buf) - 1);
+            amounts_len += (size_t)snprintf(amounts_buf + amounts_len,
+                                            amounts_cap - amounts_len, "%s%llu",
+                                            o > 0 ? "," : "",
+                                            (unsigned long long)node->outputs[o].amount_sats);
         }
         sqlite3_bind_text(stmt, 10, amounts_buf, -1, SQLITE_TRANSIENT);
+        free(amounts_buf);
 
         sqlite3_bind_int64(stmt, 11, (sqlite3_int64)node->nsequence);
         sqlite3_bind_int64(stmt, 12, (sqlite3_int64)node->input_amount);

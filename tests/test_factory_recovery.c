@@ -171,6 +171,22 @@ static int frt_build_db(persist_t *db, int n, int leaf_node)
     return 1;
 }
 
+static int frt_state_cb(void *out, int n, char **vals, char **cols)
+{
+    (void)cols;
+    if (n > 0 && vals[0]) snprintf((char *)out, 16, "%s", vals[0]);
+    return 0;
+}
+
+/* The factory row's state column. */
+static int frt_factory_state_is(persist_t *db, const char *want)
+{
+    char state[16] = {0};
+    sqlite3_exec(db->db, "SELECT state FROM factories WHERE id=0;",
+                 frt_state_cb, state, NULL);
+    return strcmp(state, want) == 0;
+}
+
 /* Run passes, one block apart, until the run reports itself published. */
 static int frt_run_until_published(persist_t *db, chain_backend_t *be,
                                    frt_chain_t *c, const char *leaf,
@@ -198,6 +214,11 @@ int test_factory_recovery_publishes_tree_beyond_128_nodes(void)
 
     factory_recovery_result_t res;
     char status[512] = {0};
+    ASSERT(factory_recovery_run(&db, &be, 0, NULL, &res, status,
+                                sizeof(status)), "first pass runs");
+    ASSERT(frt_factory_state_is(&db, "active"),
+           "factory stays active while leaves are unconfirmed");
+    frt_mine(c);
     int ok = frt_run_until_published(&db, &be, c, NULL, &res, status,
                                      sizeof(status));
     if (!ok) printf("  status: %s\n", status);
@@ -212,13 +233,27 @@ int test_factory_recovery_publishes_tree_beyond_128_nodes(void)
         ASSERT(c->sends[i] == 1, "every node broadcast exactly once");
     }
 
+    /* Once every leaf (a state node nobody spends) is confirmed, the scan
+       marks the factory closed. */
+    frt_mine(c);
+    ASSERT(frt_factory_state_is(&db, "active"), "not closed before the scan");
+    factory_recovery_scan(&db, &be);
+    ASSERT(frt_factory_state_is(&db, "closed"),
+           "factory closed once all leaves are confirmed");
+
     /* listfactories reports the same tree. */
     cJSON *list = factory_recovery_list(&db, &be);
     cJSON *f0 = cJSON_GetArrayItem(list, 0);
     cJSON *nn = f0 ? cJSON_GetObjectItem(f0, "n_tree_nodes") : NULL;
+    cJSON *nl = f0 ? cJSON_GetObjectItem(f0, "n_leaf") : NULL;
+    cJSON *nc = f0 ? cJSON_GetObjectItem(f0, "n_leaf_confirmed") : NULL;
     int listed = (nn && cJSON_IsNumber(nn)) ? nn->valueint : -1;
+    int leaves = (nl && cJSON_IsNumber(nl)) ? nl->valueint : -1;
+    int leaves_conf = (nc && cJSON_IsNumber(nc)) ? nc->valueint : -1;
     cJSON_Delete(list);
     ASSERT(listed == FRT_NODES, "listfactories counts all 389 nodes");
+    ASSERT(leaves == 129, "129 childless state nodes are leaves");
+    ASSERT(leaves_conf == leaves, "every leaf is reported confirmed");
 
     persist_close(&db);
     free(c);
@@ -269,6 +304,8 @@ int test_factory_recovery_client_path_above_128(void)
     ASSERT(res.n_tree_nodes == FRT_NODES, "whole tree loaded");
     ASSERT(res.n_target == path_len, "target is exactly the path");
     ASSERT(c->confs[leaf] >= 0, "leaf node 388 is on chain or in mempool");
+    ASSERT(frt_factory_state_is(&db, "active"),
+           "one client's exit does not close the factory");
     for (int i = 0; i < FRT_NODES; i++) {
         if (on_path[i]) {
             ASSERT(c->sends[i] == 1, "every path node broadcast once");
