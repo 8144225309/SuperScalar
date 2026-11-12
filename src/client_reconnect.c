@@ -462,9 +462,12 @@ int client_run_reconnect(secp256k1_context *ctx,
     }
     if (cb_ret == 1) {
         /* Run close ceremony */
+        client_close_state_t close_state;
+        client_close_state_init(&close_state, db, factory);
         int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
                                                   factory, n_participants,
-                                                  NULL, 0, &channel, 0);
+                                                  NULL, client_chain_tip(),
+                                                  &channel, &close_state, 0);
         factory_free(factory); free(factory);
         wire_close(fd);
         return close_ok;

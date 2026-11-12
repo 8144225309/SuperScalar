@@ -61,10 +61,29 @@ typedef struct {
 } musig_nonce_pool_t;
 
 /* --- Signing session (one per transaction being signed) --- */
-#define MUSIG_SESSION_MAX_SIGNERS 128  /* the factory signing group is the LSP + up to 127 clients = 128 signers; a 128th client would be the 129th signer, which is out of design (the LSP is one of the 128) */
+#define MUSIG_SESSION_MAX_SIGNERS 256  /* max signers in one MuSig2 signing
+   session = LSP + up to 255 clients.  Raised 128 -> 256: MuSig2/Schnorr has no
+   such limit (verified by aggregating + signing + BIP-340-verifying up to 2048
+   signers), and the distributed session path (set_pubnonce/finalize/partial/agg)
+   is valgrind-clean at 256 with clean rejection past it.  See the standalone
+   proofs tools/test_musig_scale.c and tools/test_musig_session_scale.c.
+   secp256k1's aggregation takes size_t; this fixed array is the only cap. */
+
+#define MUSIG_SESSION_SMALL 8  /* sessions with <= this many signers use the inline
+                                  buffer: no heap, safe on uninitialized stack
+                                  sessions, no free needed (channel 2-of-2 etc.).
+                                  Larger sessions (big factory subtree nodes) are
+                                  heap-allocated to n_signers and MUST be released
+                                  with musig_session_free — factory_free does. */
 
 typedef struct {
-    secp256k1_musig_pubnonce pubnonces[MUSIG_SESSION_MAX_SIGNERS];
+    secp256k1_musig_pubnonce *pubnonces; /* points at pubnonces_small when
+                                            n_signers <= MUSIG_SESSION_SMALL, else a
+                                            heap array sized to n_signers (subtree
+                                            size, not the global max — keeps a large
+                                            factory's tree O(N log N), not O(N^2)). */
+    size_t pubnonces_cap;                /* usable capacity of pubnonces[] */
+    secp256k1_musig_pubnonce pubnonces_small[MUSIG_SESSION_SMALL];
     secp256k1_musig_aggnonce aggnonce;
     secp256k1_musig_session session;
     secp256k1_musig_keyagg_cache cache;  /* working copy, potentially tweaked */
@@ -74,6 +93,10 @@ typedef struct {
     int nonces_collected;                /* count of pubnonces received */
     int session_ready;                   /* nonce_process completed */
 } musig_signing_session_t;
+
+/* Free the dynamic pubnonces of a session (idempotent; safe on a zero-inited
+   or already-freed session).  Does not touch the enclosing struct otherwise. */
+void musig_session_free(musig_signing_session_t *session);
 
 /* --- Nonce pool functions --- */
 

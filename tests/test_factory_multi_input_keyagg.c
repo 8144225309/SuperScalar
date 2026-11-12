@@ -238,8 +238,8 @@ int test_factory_multi_input_keyagg(void)
         /* Recompute the per-input BIP-341 sighash via the same helper the
            library uses for finalize. */
         unsigned char sighash[32];
-        const unsigned char *spks[FACTORY_MAX_OUTPUTS];
-        uint32_t seqs[FACTORY_MAX_OUTPUTS];
+        const unsigned char *spks[FACTORY_MAX_OUTPUTS] = {0};
+        uint32_t seqs[FACTORY_MAX_OUTPUTS] = {0};
         for (size_t j = 0; j < n_inp; j++) {
             spks[j] = sub->ps_prev_spks[j];
             seqs[j] = sub->nsequence;

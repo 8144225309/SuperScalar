@@ -75,11 +75,26 @@ int   regtest_fund_address_with_fee_rate(regtest_t *rt, const char *address,
 int   regtest_fund_address(regtest_t *rt, const char *address, double btc_amount, char *txid_out);
 int   regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out);
 
+/* Classify the text a gettxout call returned.  1: an unspent output (a JSON
+   object with value and scriptPubKey); 0: no such unspent output (the JSON
+   literal null); -1: anything else, including empty text, which is also
+   what a failed call returns. */
+int   regtest_parse_gettxout(const char *result);
+
 /* SF-RR #150: query whether an outpoint is unspent via gettxout.
-   Returns 1 if unspent, 0 if spent/missing, -1 on RPC error. */
+   Returns 1 if unspent, 0 if spent/missing, -1 on RPC error or an answer
+   that is not one of those two. */
 int   regtest_outpoint_unspent(regtest_t *rt,
                                  const char *txid_hex_display,
                                  uint32_t vout);
+
+/* Chain-only view of an outpoint (mempool ignored).
+   Returns 1 if its transaction is confirmed and the output was spent by a
+   confirmed transaction, 0 if it is unspent on chain or its transaction is
+   unconfirmed, -1 if the node cannot tell (RPC error, unknown transaction). */
+int   regtest_outpoint_spent_confirmed(regtest_t *rt,
+                                         const char *txid_hex_display,
+                                         uint32_t vout);
 int   regtest_get_confirmations(regtest_t *rt, const char *txid);
 /*
  * Batch confirmations for n_txids display-order hex txids.

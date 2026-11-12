@@ -250,9 +250,17 @@ int compute_taproot_sighash(
     unsigned char sha_sequences[32];
     sha256(seq_le, 4, sha_sequences);
 
-    /* outputs hash: skip output_count varint at offset 46 */
+    /* outputs hash: skip the output_count varint at offset 46.  The varint is
+       1 byte for < 253 outputs, but 3 bytes (0xfd + u16) for 253..65535 and
+       5 bytes (0xfe + u32) beyond — a large cooperative close (>=253 clients)
+       has a multi-byte count, and assuming 1 byte here mis-hashes the outputs
+       and yields an invalid key-path signature. Decode the varint length. */
     size_t out_start = 46;
-    out_start++; /* 1-byte varint for count < 253 */
+    unsigned char cnt_tag = unsigned_tx[out_start];
+    if (cnt_tag < 0xfd)       out_start += 1;
+    else if (cnt_tag == 0xfd) out_start += 3;
+    else if (cnt_tag == 0xfe) out_start += 5;
+    else                      out_start += 9;
     size_t outputs_data_len = tx_len - 4 - out_start;
     unsigned char sha_outputs[32];
     sha256(unsigned_tx + out_start, outputs_data_len, sha_outputs);

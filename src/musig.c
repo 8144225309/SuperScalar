@@ -274,15 +274,34 @@ void musig_session_init(
     const musig_keyagg_t *keyagg,
     size_t n_signers
 ) {
+    /* NEVER reads the incoming struct (an uninitialized stack session is safe).
+       Small sessions (<= MUSIG_SESSION_SMALL signers: channel 2-of-2, adaptor,
+       most factory nodes) use the inline buffer — no heap, no free needed, the
+       exact pre-refactor behavior.  Large sessions (big subtree nodes) heap-
+       allocate to n_signers, which is what keeps the whole tree O(N log N);
+       their owners must musig_session_free (factory_free does), and any RE-init
+       of a live large session must free first (factory sign sites do). */
     memset(session, 0, sizeof(*session));
+    if (n_signers == 0) n_signers = 1;
+    if (n_signers <= MUSIG_SESSION_SMALL) {
+        session->pubnonces = session->pubnonces_small;
+        session->pubnonces_cap = MUSIG_SESSION_SMALL;
+    } else {
+        session->pubnonces = calloc(n_signers, sizeof(secp256k1_musig_pubnonce));
+        session->pubnonces_cap = session->pubnonces ? n_signers : 0;
+    }
     memcpy(&session->cache, &keyagg->cache, sizeof(secp256k1_musig_keyagg_cache));
     memcpy(&session->agg_pubkey, &keyagg->agg_pubkey, sizeof(secp256k1_xonly_pubkey));
-    /* Defense-in-depth: pubnonces[]/partial_sigs[] are [MUSIG_SESSION_MAX_SIGNERS].
-       Clamp so a caller that passes more than the max can never drive an OOB read
-       in the finalize loop (design max is 128 = LSP + 127 clients). */
-    if (n_signers > MUSIG_SESSION_MAX_SIGNERS)
-        n_signers = MUSIG_SESSION_MAX_SIGNERS;
     session->n_signers = n_signers;
+}
+
+void musig_session_free(musig_signing_session_t *session)
+{
+    if (!session) return;
+    if (session->pubnonces && session->pubnonces != session->pubnonces_small)
+        free(session->pubnonces);
+    session->pubnonces = NULL;
+    session->pubnonces_cap = 0;
 }
 
 int musig_session_set_pubnonce(
@@ -292,7 +311,7 @@ int musig_session_set_pubnonce(
 ) {
     if (signer_index >= session->n_signers)
         return 0;
-    if (signer_index >= MUSIG_SESSION_MAX_SIGNERS)
+    if (signer_index >= session->pubnonces_cap)
         return 0;
 
     memcpy(&session->pubnonces[signer_index], pubnonce,
@@ -311,13 +330,19 @@ int musig_session_finalize_nonces(
     if ((size_t)session->nonces_collected != session->n_signers)
         return 0;
 
-    /* Build pointer array for nonce aggregation */
-    const secp256k1_musig_pubnonce *ptrs[MUSIG_SESSION_MAX_SIGNERS];
+    /* Build pointer array for nonce aggregation (heap: n_signers can exceed the
+       old fixed 256 for a large in-process factory). */
+    const secp256k1_musig_pubnonce **ptrs =
+        malloc(session->n_signers * sizeof(*ptrs));
+    if (!ptrs) return 0;
     for (size_t i = 0; i < session->n_signers; i++)
         ptrs[i] = &session->pubnonces[i];
 
-    if (!secp256k1_musig_nonce_agg(ctx, &session->aggnonce, ptrs, session->n_signers))
+    if (!secp256k1_musig_nonce_agg(ctx, &session->aggnonce, ptrs, session->n_signers)) {
+        free(ptrs);
         return 0;
+    }
+    free(ptrs);
 
     /* Apply taproot tweak to a LOCAL copy of the cache.
        Do not modify session->cache in-place before nonce_process succeeds —
@@ -354,12 +379,17 @@ int musig_session_finalize_nonces_untweaked(
     if ((size_t)session->nonces_collected != session->n_signers)
         return 0;
 
-    const secp256k1_musig_pubnonce *ptrs[MUSIG_SESSION_MAX_SIGNERS];
+    const secp256k1_musig_pubnonce **ptrs =
+        malloc(session->n_signers * sizeof(*ptrs));
+    if (!ptrs) return 0;
     for (size_t i = 0; i < session->n_signers; i++)
         ptrs[i] = &session->pubnonces[i];
 
-    if (!secp256k1_musig_nonce_agg(ctx, &session->aggnonce, ptrs, session->n_signers))
+    if (!secp256k1_musig_nonce_agg(ctx, &session->aggnonce, ptrs, session->n_signers)) {
+        free(ptrs);
         return 0;
+    }
+    free(ptrs);
 
     memcpy(session->msg32, msg32, 32);
 
@@ -415,15 +445,17 @@ int musig_aggregate_partial_sigs(
     if (!session->session_ready)
         return 0;
 
-    const secp256k1_musig_partial_sig *ptrs[MUSIG_SESSION_MAX_SIGNERS];
-    if (n_sigs > MUSIG_SESSION_MAX_SIGNERS)
-        return 0;
+    const secp256k1_musig_partial_sig **ptrs =
+        malloc(n_sigs * sizeof(*ptrs));
+    if (!ptrs) return 0;
 
     for (size_t i = 0; i < n_sigs; i++)
         ptrs[i] = &partial_sigs[i];
 
-    return secp256k1_musig_partial_sig_agg(ctx, sig64_out, &session->session,
-                                            ptrs, n_sigs);
+    int ret = secp256k1_musig_partial_sig_agg(ctx, sig64_out, &session->session,
+                                              ptrs, n_sigs);
+    free(ptrs);
+    return ret;
 }
 
 /* --- Ad-hoc single nonce generation --- */

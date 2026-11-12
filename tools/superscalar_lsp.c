@@ -10,6 +10,7 @@
 #include "superscalar/fee.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/dw_state.h"
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
@@ -103,9 +104,6 @@ static bolt11_invoice_table_t g_invoice_tbl;
 /* CLTV watchdog: pointer to the active channel manager, set after each alloc */
 static lsp_channel_mgr_t *g_channel_mgr = NULL;
 
-/* LSPS0 context for bolt8_server callback */
-static lsps_ctx_t  g_lsps_ctx;
-
 /* LSPS2 JIT pending channel intercept table */
 static lsps2_pending_table_t g_lsps2_pending;
 
@@ -124,90 +122,13 @@ static void *ln_dispatch_thread(void *arg) {
     return NULL;
 }
 
-/* Gap 3: callback from ln_dispatch when JIT cost is covered.
- * Opens a JIT channel for the client then relays the pending HTLC. */
-static void on_jit_open(void *cb_ctx, uint64_t scid,
-                         uint64_t out_amount_msat,
-                         size_t in_peer_idx, uint64_t in_htlc_id)
-{
-    (void)cb_ctx; (void)in_peer_idx; (void)in_htlc_id;
-    /* SCID encodes client_idx: (0x800000 << 40) | ((client_idx+1) << 16) | block */
-    size_t client_idx = (size_t)(((scid >> 16) & 0xFFFFFF) - 1);
-
-    /* Open the JIT channel (no-op if already open) */
-    if (!jit_channel_is_active(g_channel_mgr, client_idx))
-        jit_channel_create(g_channel_mgr, g_lsp, client_idx,
-                            out_amount_msat * 2, "lsps2-jit");
-
-    fprintf(stderr, "LSP: JIT channel opened for client %zu (scid=0x%llx)\n",
-            client_idx, (unsigned long long)scid);
-}
-
-/* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
+/* LSPS0 adapter for the BOLT #8 listener.  Requests from outside peers are
+   answered without any channel context (see lsps_peer_request). */
 static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
                            const char *json_req, char *resp_buf, size_t resp_cap)
 {
-    (void)state;
-    if (!json_req || !resp_buf || resp_cap == 0) return 0;
-    lsps_ctx_t *ctx = (lsps_ctx_t *)userdata;
-
-    cJSON *json = cJSON_Parse(json_req);
-    if (!json) {
-        cJSON *err = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
-        if (err) {
-            char *s = cJSON_PrintUnformatted(err);
-            if (s) {
-                size_t n = strlen(s);
-                if (n < resp_cap) { memcpy(resp_buf, s, n + 1); free(s); cJSON_Delete(err); return (int)n; }
-                free(s);
-            }
-            cJSON_Delete(err);
-        }
-        return 0;
-    }
-
-    int id = 0;
-    const char *method = lsps_parse_request(json, &id);
-    cJSON *resp = NULL;
-
-    if (!method) {
-        resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
-    } else if (strcmp(method, "lsps1_get_info") == 0) {
-        lsps1_info_t info;
-        memset(&info, 0, sizeof(info));
-        info.min_channel_balance_msat = 100000000ULL;
-        info.max_channel_balance_msat = 10000000000ULL;
-        info.min_confirmations        = 1;
-        info.base_fee_msat            = 1000;
-        info.fee_ppm                  = 500;
-        resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
-    } else if (strcmp(method, "lsps2_get_info") == 0) {
-        lsps2_fee_params_t params;
-        memset(&params, 0, sizeof(params));
-        params.min_fee_msat             = 1000;
-        params.fee_ppm                  = 500;
-        params.min_channel_balance_msat = 100000000ULL;
-        params.max_channel_balance_msat = 10000000000ULL;
-        resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
-    } else if (lsps_handle_request(ctx, fd, json)) {
-        cJSON_Delete(json);
-        return 0;
-    } else {
-        resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
-    }
-
-    cJSON_Delete(json);
-    int written = 0;
-    if (resp) {
-        char *s = cJSON_PrintUnformatted(resp);
-        if (s) {
-            size_t n = strlen(s);
-            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
-            free(s);
-        }
-        cJSON_Delete(resp);
-    }
-    return written;
+    (void)userdata; (void)fd; (void)state;
+    return lsps_peer_request(json_req, resp_buf, resp_cap);
 }
 
 /* Chain monitoring: called by bip158_backend after each new block is processed */
@@ -282,7 +203,7 @@ static void usage(const char *prog) {
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
         "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
-        "  --cltv-timeout N    Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest)\n"
+        "  --cltv-timeout N    Factory CLTV timeout (absolute block height, at least creation + active + dying blocks and past a member exit; auto: that, minimum +35 on regtest, +10 elsewhere)\n"
         "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
@@ -295,23 +216,32 @@ static void usage(const char *prog) {
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
         "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
-        "  --no-jit            Disable JIT channel fallback\n"
+        "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
+        "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
+        "                      an open can strand the LSP's funds. Refused on mainnet.\n"
+        "  --enable-rotation-experimental  UNSAFE, testing only: allow factory rotation\n"
+        "                      (automatic when a factory turns DYING in daemon mode, CLI\n"
+        "                      'rotate'). Off by default: a DYING factory keeps serving\n"
+        "                      its channels until it expires. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
-        "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
-        "                       Comma-separated activates TRUE N-way mixed arity per level\n"
-        "                       (root..leaves). Each value must be 1-15. Canonical shapes:\n"
-        "                       up to 16 clients => 3 (uniform PS); 17-32 => 3,4; 33-64 =>\n"
-        "                       3,4,8 (or 2,4,8 for DW leaves); 65-128 => 2,4,8 (with\n"
-        "                       --static-near-root 1 or 2). See docs/factory-arity.md.\n"
+        "  --arity N|N,N,...   Tree shape.  Without --arity, --static-near-root and\n"
+        "                       --ps-subfactory-arity the LSP builds the ADVANCELESS tree:\n"
+        "                       every interior level static (kickoff only, no DW state),\n"
+        "                       one member per pseudo-Spilman leaf, depth = fewest levels\n"
+        "                       with 15^depth >= clients, fan-out = smallest F >= 4 with\n"
+        "                       F^depth >= clients (4 clients => 4,3 static 1; 64 => 8,8,3\n"
+        "                       static 2; 255 => 7,7,7,3 static 3).  Its life is extended\n"
+        "                       only by rotation.  Explicit shapes: 1=DW, 2=DW, 3=PS\n"
+        "                       (uniform); a comma list sets the arity per level (root..\n"
+        "                       leaves, each 1-15).  See docs/factory-arity.md.\n"
         "  --static-near-root N  Top N tree depths are kickoff-only (no paired NODE_STATE,\n"
-        "                       no DW counter, only CLTV timeout escape). Reduces total\n"
-        "                       CSV consumption from those layers to zero. Range 0..7\n"
-        "                       (FACTORY_MAX_LEVELS-1); 0 = disabled (default). Canonical\n"
-        "                       128-client deployment is --arity 2,4,8 --static-near-root 2\n"
-        "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
+        "                       no DW counter, only CLTV timeout escape). Range 0..7\n"
+        "                       (FACTORY_MAX_LEVELS-1).  With --arity and no\n"
+        "                       --static-near-root the shape keeps DW state on every level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --enable-hashlock-poison  Build the factory with hashlock-gated L-stock\n"
@@ -347,6 +277,7 @@ static void usage(const char *prog) {
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
@@ -354,6 +285,7 @@ static void usage(const char *prog) {
         "  --test-splice-client-seckey HEX  Client[0] secret key for test-only MuSig2 signing\n"
         "  --test-lightclient  Run in BIP 157/158 light-client mode and verify filter sync\n"
         "  --test-jit          After demo: create JIT channels for all clients\n"
+        "                      (implies --enable-jit-experimental)\n"
         "  --test-lsps2        After demo: wait for client LSPS2 buy flow\n"
         "  --test-bolt12       After demo: BOLT12 offer codec + signature test\n"
         "  --test-buy-liquidity After demo: buy inbound liquidity from L-stock\n"
@@ -361,7 +293,8 @@ static void usage(const char *prog) {
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --safe-confs N      Set ALL confirmation depths at once (shorthand).\n"
-        "  --funding-confs N   Funding TX depth before acting (default: %d, CLN=3, LND=1-6)\n"
+        "  --funding-confs N   Funding TX depth before acting (default: 6 mainnet,\n"
+        "                      3 signet/testnet/testnet4; clients use the same default)\n"
         "  --close-confs N     Close TX depth before removing entries (default: %d, LDK=6)\n"
         "  --penalty-confs N   Penalty TX depth before removing breach entry (default: %d)\n"
         "  --sweep-confs N     HTLC sweep depth before considering settled (default: %d)\n"
@@ -403,6 +336,7 @@ static void usage(const char *prog) {
         "                          api:URL     custom HTTP/HTTPS endpoint (mempool.space-compatible JSON)\n"
         "                          static:N    fixed N sat/vByte (e.g. static:10)\n"
         "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
+        "                      (needs --enable-rotation-experimental)\n"
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
@@ -435,7 +369,7 @@ static void usage(const char *prog) {
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS,
-        CONF_DEFAULT_FUNDING, CONF_DEFAULT_CLOSE,
+        CONF_DEFAULT_CLOSE,
         CONF_DEFAULT_PENALTY, CONF_DEFAULT_SWEEP,
         LSP_MAX_CLIENTS);
 }
@@ -502,6 +436,95 @@ static int advance_chain(regtest_t *rt, int n, const char *mine_addr,
    the LSP's listen socket for client reconnections.  This prevents clients
    from disconnecting during long confirmation waits on signet/testnet.
    Returns 1 on confirmed, 0 on timeout. */
+/* Cooperative-close CONVERGENCE GATE (2026-07 N=127 flagship fix).
+   An N-of-N MuSig2 cooperative close needs a LIVE fd for EVERY client: the
+   CLOSE_PROPOSE send loop (src/lsp.c) fails the whole ceremony on the first dead
+   fd, and you cannot skip a client (its partial signature is required). Over a
+   daemon-mode soak clients transiently drop (the LSP sets client_fds[c] = -1) and
+   auto-reconnect every 1s (tools/superscalar_client.c). This gate, run right
+   before the ceremony, services the listen socket until every client fd is live,
+   so CLOSE_PROPOSE reaches all N. Bounded by timeout_secs; on timeout it returns
+   the count still down and the caller proceeds unchanged (the ceremony then fails
+   cleanly to the existing force-close fallback, i.e. never worse than today).
+   Mirrors wait_for_confirmation_servicing's accept/handshake/ping servicing. */
+static size_t wait_for_all_clients_reconnected(int timeout_secs, lsp_t *lsp,
+                                               lsp_channel_mgr_t *mgr) {
+    if (!lsp) return 0;
+    time_t t_start = time(NULL), last_ping = 0, last_log = 0;
+    while (1) {
+        size_t n_down = 0, first_down = (size_t)-1;
+        for (size_t i = 0; i < lsp->n_clients; i++)
+            if (lsp->client_fds[i] < 0) { n_down++; if (first_down == (size_t)-1) first_down = i; }
+        if (n_down == 0) {
+            printf("LSP: close convergence -- all %zu clients connected; proceeding to ceremony\n",
+                   lsp->n_clients);
+            fflush(stdout);
+            return 0;
+        }
+        time_t tnow = time(NULL);
+        if ((int)(tnow - t_start) >= timeout_secs) {
+            fprintf(stderr, "LSP: close convergence TIMEOUT after %ds -- %zu client(s) still "
+                    "disconnected (first: client %zu); ceremony may fall back to force-close\n",
+                    timeout_secs, n_down, first_down);
+            return n_down;
+        }
+        if (tnow - last_log >= 5) {
+            printf("LSP: close convergence -- waiting for %zu/%zu clients to reconnect "
+                   "(first down: client %zu, %ds/%ds)\n",
+                   n_down, lsp->n_clients, first_down, (int)(tnow - t_start), timeout_secs);
+            fflush(stdout);
+            last_log = tnow;
+        }
+        if (tnow - last_ping >= 20) {
+            cJSON *ping = cJSON_CreateObject();
+            for (size_t i = 0; i < lsp->n_clients; i++)
+                if (lsp->client_fds[i] >= 0) wire_send(lsp->client_fds[i], MSG_PING, ping);
+            cJSON_Delete(ping);
+            last_ping = tnow;
+        }
+        size_t pfds_cap = 1 + lsp->n_clients;
+        struct pollfd *pfds = (struct pollfd *)calloc(pfds_cap, sizeof(struct pollfd));
+        if (!pfds) { sleep(1); continue; }
+        int nfds = 0, listen_idx = -1;
+        if (lsp->listen_fd >= 0) {
+            listen_idx = nfds; pfds[nfds].fd = lsp->listen_fd; pfds[nfds].events = POLLIN; nfds++;
+        }
+        for (size_t i = 0; i < lsp->n_clients; i++)
+            if (lsp->client_fds[i] >= 0) { pfds[nfds].fd = lsp->client_fds[i]; pfds[nfds].events = POLLIN; nfds++; }
+        int pret = poll(pfds, (nfds_t)nfds, 2000);
+        if (pret > 0) {
+            for (int fi = 0; fi < nfds; fi++) {
+                if (!(pfds[fi].revents & POLLIN)) continue;
+                if (fi == listen_idx) {
+                    int new_fd = wire_accept(lsp->listen_fd);
+                    if (new_fd >= 0) {
+                        int hs_ok;
+                        if (lsp->use_nk)
+                            hs_ok = wire_noise_handshake_nk_responder(new_fd, mgr ? mgr->ctx : NULL, lsp->nk_seckey);
+                        else
+                            hs_ok = wire_noise_handshake_responder(new_fd, mgr ? mgr->ctx : NULL);
+                        if (hs_ok && mgr)
+                            lsp_channels_handle_reconnect(mgr, lsp, new_fd);
+                        else
+                            wire_close(new_fd);
+                    }
+                } else {
+                    wire_msg_t cmsg;
+                    if (wire_recv(pfds[fi].fd, &cmsg)) {
+                        if (cmsg.msg_type == MSG_PING) {
+                            cJSON *pong = cJSON_CreateObject();
+                            wire_send(pfds[fi].fd, MSG_PONG, pong);
+                            cJSON_Delete(pong);
+                        }
+                        if (cmsg.json) cJSON_Delete(cmsg.json);
+                    }
+                }
+            }
+        }
+        free(pfds);
+    }
+}
+
 static int wait_for_confirmation_servicing(regtest_t *rt, const char *txid_hex,
                                             int timeout_secs, lsp_t *lsp,
                                             lsp_channel_mgr_t *mgr) {
@@ -1133,7 +1156,8 @@ static int attach_hd_wallet(watchtower_t *wt, persist_t *db_ptr,
     } else if (hd_mnemonic) {
         /* 2. Derive seed from provided mnemonic */
         if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
-            fprintf(stderr, "LSP: HD wallet: bip39_mnemonic_to_seed failed\n");
+            fprintf(stderr, "LSP: HD wallet: invalid recovery phrase: %s\n",
+                    bip39_status_str(bip39_check(hd_mnemonic)));
             memset(seed, 0, sizeof(seed));
             return 0;
         }
@@ -1343,14 +1367,18 @@ int main(int argc, char *argv[]) {
     int32_t active_blocks_arg = -1;  /* -1 = auto */
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
-    int no_jit = 0;
+    int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
+    int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
-    int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
-                                        (1, 2 = legacy DW; 3 = PS canonical) */
+    int leaf_arity = 3;              /* with --arity: 1, 2 = DW; 3 = PS.  Without
+                                        any shape option the advanceless default
+                                        replaces it (factory_advanceless_shape) */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
-    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only.
-                                        0 = disabled (default for backward compat) */
+    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only. */
+    int shape_given = 0;             /* --arity / --static-near-root /
+                                        --ps-subfactory-arity on the command
+                                        line; otherwise the advanceless shape */
     int force_close = 0;
     int test_burn = 0;
     int enable_hashlock_poison = 0;  /* #53 Phase 3: hashlock-gated L-stock poison */
@@ -1703,8 +1731,10 @@ int main(int argc, char *argv[]) {
             test_subfactory_advance = 1;
             cheat_subfactory_after_advance = 1;
         }
-        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc) {
             ps_subfactory_arity_arg = atoi(argv[++i]);
+            shape_given = 1;
+        }
         else if (strcmp(argv[i], "--test-jit") == 0)
             test_jit = 1;
         else if (strcmp(argv[i], "--test-lsps2") == 0)
@@ -1723,8 +1753,10 @@ int main(int argc, char *argv[]) {
             dying_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--jit-amount") == 0 && i + 1 < argc)
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--no-jit") == 0)
-            no_jit = 1;
+        else if (strcmp(argv[i], "--enable-jit-experimental") == 0)
+            enable_jit_experimental = 1;
+        else if (strcmp(argv[i], "--enable-rotation-experimental") == 0)
+            enable_rotation_experimental = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -1754,6 +1786,7 @@ int main(int argc, char *argv[]) {
             uint8_t parsed[FACTORY_MAX_LEVELS];
             size_t n_parsed = 0;
             int parsed_leaf = 0;
+            shape_given = 1;
             if (!cli_parse_arity_spec(arity_str, parsed, FACTORY_MAX_LEVELS,
                                        &n_parsed, &parsed_leaf,
                                        err, sizeof(err))) {
@@ -1777,6 +1810,7 @@ int main(int argc, char *argv[]) {
                Phase 4: parsing delegated to cli_parse_static_near_root(). */
             char err[256];
             uint32_t v = 0;
+            shape_given = 1;
             if (!cli_parse_static_near_root(argv[++i], &v, err, sizeof(err))) {
                 fprintf(stderr, "%s\n", err);
                 return 1;
@@ -2157,6 +2191,29 @@ int main(int argc, char *argv[]) {
 
     if (!network)
         network = "regtest";  /* default to regtest */
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
+        }
+        network = canonical;
+    }
+    /* A recovery phrase with a typo would derive a different, empty wallet
+       without any error: refuse it before anything is derived from it. */
+    if (hd_mnemonic) {
+        bip39_status_t mn_status = bip39_check(hd_mnemonic);
+        if (mn_status != BIP39_OK) {
+            fprintf(stderr, "Error: invalid --hd-mnemonic: %s\n",
+                    bip39_status_str(mn_status));
+            return 1;
+        }
+    }
     int is_regtest = (strcmp(network, "regtest") == 0);
     /* #9 cheat-gate: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are inert
        unless this is regtest, even if the env var is set directly. */
@@ -2185,8 +2242,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (fee_rate < 1000) {
-        int is_mainnet = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-        if (is_mainnet) {
+        if (network_is_mainnet(network)) {
             fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
                     "default minrelaytxfee (1 sat/vB).\n"
                     "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or use package relay "
@@ -2230,6 +2286,15 @@ int main(int argc, char *argv[]) {
         if (restore_path_arg) {
             if (!db_path || !keyfile_path) {
                 fprintf(stderr, "Error: --restore requires --db and --keyfile (destination paths)\n");
+                return 1;
+            }
+            char blocker[4096];
+            if (backup_restore_blocked_by(db_path, keyfile_path,
+                                          blocker, sizeof(blocker))) {
+                fprintf(stderr,
+                    "Error: %s already exists; --restore never overwrites.\n"
+                    "  Move the existing database (with its -wal, -shm and -journal\n"
+                    "  files) and keyfile away first, then run --restore again.\n", blocker);
                 return 1;
             }
             int ok = backup_restore(restore_path_arg, db_path, keyfile_path,
@@ -2300,6 +2365,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -2315,8 +2387,10 @@ int main(int argc, char *argv[]) {
             }
             secure_zero(mnemonic, sizeof(mnemonic));
         } else {
-            if (!bip39_validate(from_mnemonic)) {
-                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+            bip39_status_t mn_status = bip39_check(from_mnemonic);
+            if (mn_status != BIP39_OK) {
+                fprintf(stderr, "Error: invalid --from-mnemonic: %s\n",
+                        bip39_status_str(mn_status));
                 return 1;
             }
             if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
@@ -2356,93 +2430,51 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
-    }
-
-    /* #327a: refuse cmdline --seckey on mainnet. Process args are visible to
-       any local user via `ps` / /proc/<pid>/cmdline and persist in shell
-       history — an unacceptable key-exposure vector for a node holding real
-       funds. Mainnet operators must use the encrypted --keyfile (PBKDF2-600K
-       + AEAD at rest). Regtest/signet/testnet keep --seckey for convenience. */
-    if ((strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0) && seckey_hex) {
-        fprintf(stderr,
-            "Error: --seckey is refused on mainnet (visible via ps / shell history).\n"
-            "Use --keyfile PATH (encrypted at rest); create one with --generate-mnemonic\n"
-            "or --from-mnemonic, optionally protected by --passphrase.\n");
-        return 1;
-    }
-
-    /* #9: refuse ALL test/cheat scaffolding flags on mainnet (footgun guard on
-       top of --i-accept-the-risk). Detection cheats are self-harming and
-       defense-bypass cheats are theft; neither belongs on a mainnet node. */
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port (chain_backend_rpc.c) while the
-       exact-"mainnet" guards would NOT fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
-        }
-        /* #9: also refuse cheat/kill/crash ENV vars on mainnet (not just args).
-           The library gate (superscalar_cheat_allowed) already makes them inert,
-           but fail LOUD so a misconfigured mainnet node never starts with a
-           defense-bypass or crash-injection knob lurking in its environment. */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    /* G1 (gap-scan): prefix, not exact, so SUPERSCALAR_CRASH_ALLOW
-                       (gates peer-sent MSG_FORCE_OUT/MSG_ROTATE) is caught too. */
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding in the
+       arguments or the environment, and persistent state for both the node
+       (--db) and the trustless watchtower (--wt-db). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_LSP,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .have_wt_db = wt_db_path != NULL,
+            .enable_jit_experimental = enable_jit_experimental,
+            .enable_rotation_experimental = enable_rotation_experimental,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
     }
 
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
+    /* The JIT test mode opens a JIT channel itself, so it carries the opt-in
+       (--test-* is refused on mainnet by the gates above). */
+    if (test_jit)
+        enable_jit_experimental = 1;
+    if (enable_jit_experimental)
+        fprintf(stderr, "WARNING: --enable-jit-experimental: JIT channel opens are "
+                "enabled. This is unsafe and for testing only.\n");
+
+    /* Likewise the rotation test modes carry the rotation opt-in. */
+    if (test_rotation || test_partial_rotation)
+        enable_rotation_experimental = 1;
+    if (async_rotation && !enable_rotation_experimental) {
+        fprintf(stderr, "Error: --async-rotation needs --enable-rotation-experimental "
+                "(factory rotation is off by default).\n");
         return 1;
     }
-    /* SF-WT-TRUSTLESS Phase 2c PR-E (#248): mainnet also requires --wt-db
-       so the operator runs a trustless watchtower binary (the only WT
-       mode in v0.2.0) against this LSP's pre-signed response TXs.
-       Without --wt-db the LSP can still run on mainnet but loses
-       trustless WT support — flag this as an error so operators can't
-       accidentally deploy mainnet without it. */
-    if (strcmp(network, "mainnet") == 0 && !wt_db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --wt-db for the trustless watchtower.\n"
-            "v0.2.0 removed the legacy --db-only watchtower mode; the LSP\n"
-            "must populate wt.db so a standalone trustless WT can broadcast\n"
-            "penalty TXs on breach without ever opening lsp.db.\n"
-            "See docs/watchtower-trustless-schema.md for the model.\n");
-        return 1;
-    }
+    if (enable_rotation_experimental)
+        fprintf(stderr, "WARNING: --enable-rotation-experimental: factory rotation is "
+                "enabled. This is unsafe and for testing only.\n");
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
@@ -2462,17 +2494,84 @@ int main(int argc, char *argv[]) {
     uint32_t dying_blocks = (dying_blocks_arg > 0) ? (uint32_t)dying_blocks_arg
                             : (is_regtest ? 10 : 432);
 
-    /* The factory signing group is the LSP plus every client, and a MuSig
-       session holds at most MUSIG_SESSION_MAX_SIGNERS (128) signers, so the
-       supported maximum is 127 clients.  Reject the 129th signer here with a
-       clear message instead of failing deep inside the root signing ceremony
-       (set_pubnonce rejects slot 128 and finalize_nonces never completes). */
-    if (n_clients < 1 || n_clients + 1 > MUSIG_SESSION_MAX_SIGNERS) {
+    /* Client-count cap.  LOAD-BEARING — do not lift without the work below.
+       The signing group is the LSP plus every client, so n_participants =
+       n_clients + 1.  The crypto no longer caps that: musig sessions size their
+       pubnonces to the actual signer count, and factory_t's arrays auto-fit via
+       factory_config_fit().  BUT the daemon path still declares 51 FIXED
+       [FACTORY_MAX_SIGNERS] arrays.  With n_participants = 257 those overflow:
+       removing this check produced `*** stack smashing detected ***` (SIGABRT)
+       during factory creation at N=256 on regtest — a memory-corruption crash,
+       not a clean refusal.
+
+       The 51, counted (an earlier revision of this comment said "~53" with a
+       file list that actually summed to 37 and omitted lsp_rotation.c entirely
+       — do not trust it, re-count with:
+         grep -rnE '\[FACTORY_MAX_SIGNERS *\]' --include=*.c --include=*.h \
+              src/ tools/ include/          # minus the ~9 comment-only hits):
+
+         46 STACK LOCALS  — lsp_channels.c 12, client.c 11, lsp_rotation.c 8,
+                            lsp.c 7, ladder.c 3, superscalar_lsp.c 3,
+                            persist.c 1, superscalar_client.c 1
+          5 STRUCT MEMBERS in shared headers — the harder half, since these
+                            change sizeof() for every user of the type:
+                            ceremony.h:29, readiness.h:27, ladder.h:19+20, and
+                            factory.h:291 input_signer_indices, which is 2-D
+                            [FACTORY_MAX_OUTPUTS][FACTORY_MAX_SIGNERS].  Only
+                            the second dimension scales with the signer count:
+                            FACTORY_MAX_OUTPUTS is a fixed 16, so this is
+                            16*N*4 bytes — 16 KB today, 64 KB at N=1024.
+                            Linear, and not a blocker; convert it for
+                            consistency, not for size.
+
+       So this bound is what makes an over-large --clients a clear error instead
+       of a smash.  Lifting it requires converting those 51 sites to heap
+       allocations sized to n_participants (see
+       docs/design/distributed-scale-512.md); it is NOT just a config change.
+       Measured today with real daemons: N=224 completes a full onboard ->
+       LN-seed -> economy -> 225-output cooperative close with exact per-client
+       reconciliation (~5.5 GB swarm); N=255 reaches FACTORY LIVE. Beyond the
+       array work, the next limits in order are wall-clock (seeding is serialized,
+       ~O(N) round-trips), per-client RSS (~21 MB + ~0.085 MB/N), and `ulimit -n`
+       on the LSP (~N+20). */
+    if (n_clients < 1 || n_clients + 1 > FACTORY_MAX_SIGNERS) {
         fprintf(stderr, "Error: --clients must be 1..%d "
-                "(the LSP co-signs every factory: clients + 1 <= %d-signer MuSig cap)\n",
-                MUSIG_SESSION_MAX_SIGNERS - 1, MUSIG_SESSION_MAX_SIGNERS);
+                "(the LSP co-signs every factory, and the daemon still has fixed "
+                "[FACTORY_MAX_SIGNERS] arrays; lifting this needs those made "
+                "dynamic — see docs/design/distributed-scale-512.md)\n",
+                FACTORY_MAX_SIGNERS - 1);
         return 1;
     }
+    /* Default tree: the advanceless shape for this many clients (see
+       factory_advanceless_shape and --help). */
+    if (!shape_given) {
+        uint8_t dflt[FACTORY_MAX_LEVELS];
+        size_t n_dflt = 0;
+        uint32_t dflt_static = 0;
+        if (!factory_advanceless_shape((size_t)n_clients, dflt, &n_dflt, &dflt_static)) {
+            fprintf(stderr, "Error: no advanceless tree shape for %d clients\n", n_clients);
+            return 1;
+        }
+        if (n_dflt == 1) {
+            leaf_arity = dflt[0];
+            n_level_arity = 0;
+        } else {
+            memcpy(level_arities, dflt, n_dflt);
+            n_level_arity = n_dflt;
+            leaf_arity = dflt[n_dflt - 1];
+        }
+        static_near_root = dflt_static;
+        char shape_str[FACTORY_MAX_LEVELS * 4 + 1] = "";
+        for (size_t k = 0; k < n_dflt; k++) {
+            size_t off = strlen(shape_str);
+            snprintf(shape_str + off, sizeof(shape_str) - off, "%s%u",
+                     k ? "," : "", (unsigned)dflt[k]);
+        }
+        printf("LSP: tree shape: advanceless default for %d clients "
+               "(--arity %s --static-near-root %u)\n",
+               n_clients, shape_str, (unsigned)dflt_static);
+    }
+
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
        in mixed mode the LAST entry can be any 1..15 since interior arities
        are pure fan-out (Phase 2). */
@@ -2498,6 +2597,8 @@ int main(int argc, char *argv[]) {
         factory_arity_t fa = (factory_arity_t)leaf_arity;
         const uint8_t *la_ptr = (n_level_arity > 0) ? level_arities : NULL;
         if (!cli_validate_shape_for_bolt2016(la_ptr, n_level_arity, fa,
+                                              (uint32_t)(ps_subfactory_arity_arg > 1
+                                                         ? ps_subfactory_arity_arg : 1),
                                               (size_t)n_clients,
                                               static_near_root,
                                               step_blocks,
@@ -2509,6 +2610,14 @@ int main(int argc, char *argv[]) {
         printf("LSP: shape ewt = %u blocks (BOLT 2016 ceiling = %u)\n",
                ewt, CLI_ARITY_BOLT2016_CEILING);
     }
+    /* Worst-case blocks a member's exit takes from creation; the factory
+       timeout must leave that much room, and members check it too. */
+    uint32_t factory_exit_blocks = cli_factory_exit_blocks(
+        n_level_arity > 0 ? level_arities : NULL, n_level_arity,
+        (factory_arity_t)leaf_arity,
+        (uint32_t)(ps_subfactory_arity_arg > 1 ? ps_subfactory_arity_arg : 1),
+        (size_t)n_clients, static_near_root,
+        step_blocks, (uint32_t)states_per_layer);
 
     /* Mainnet DW-step safety floor: reject a too-small --step-blocks on
        mainnet (thin reorg / fee-race margin).  Non-mainnet chains pass so
@@ -2676,17 +2785,32 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else if (keyfile_path) {
-        /* Try to load from keyfile */
-        if (keyfile_load(keyfile_path, lsp_seckey, passphrase)) {
+        /* Load the keyfile; a new key is only ever created when no file
+           exists at the path. */
+        switch (keyfile_load_or_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
+        case KEYFILE_OPEN_LOADED:
             printf("LSP: loaded key from %s\n", keyfile_path);
-        } else {
-            /* File doesn't exist or wrong passphrase — generate new key */
-            printf("LSP: generating new key and saving to %s\n", keyfile_path);
-            if (!keyfile_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(ctx);
-                return 1;
-            }
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("LSP: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        case KEYFILE_OPEN_INSECURE_MODE:
+            fprintf(stderr, "Error: refusing to start with keyfile %s: its permissions\n"
+                "  let every user read it (details above).\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     } else if (is_regtest) {
         /* Deterministic default key — regtest only */
@@ -2763,8 +2887,7 @@ int main(int argc, char *argv[]) {
        --encrypt-db. This must run after the key is final and before any secret
        column is read or written (recovery's channel init is later). */
     if (use_db) {
-        int mainnet_db = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-        if (mainnet_db) encrypt_db = 1;
+        if (network_is_mainnet(network)) encrypt_db = 1;
         if (encrypt_db) {
             persist_set_encryption_key(&db, lsp_seckey);
             if (!persist_apply_encryption(&db)) {
@@ -2886,8 +3009,10 @@ int main(int argc, char *argv[]) {
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
     }
 
-    /* Apply confirmation depth overrides.
-       --safe-confs sets all four; per-operation flags override individually. */
+    /* Funding depth defaults per network, the same default the client uses.
+       Then the overrides: --safe-confs sets all four; per-operation flags
+       override individually. */
+    chain_be->conf.funding = network_funding_confs(network, 0);
     if (safe_confs_arg > 0) {
         conf_targets_set_all(&chain_be->conf, safe_confs_arg);
         printf("LSP: all confirmation depths set to %d (--safe-confs)\n",
@@ -2907,7 +3032,28 @@ int main(int argc, char *argv[]) {
     if (use_db && daemon_mode) {
         factory_t *rec_f = calloc(1, sizeof(factory_t));
         if (!rec_f) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
-        if (persist_load_factory(&db, 0, rec_f, ctx)) {
+        int rec_loaded = persist_load_factory(&db, 0, rec_f, ctx);
+        if (!rec_loaded) {
+            free(rec_f);
+            rec_f = NULL;
+            if (persist_has_factory(&db, 0) && persist_factory_is_closed(&db, 0)) {
+                /* A closed factory is history: nothing is left to serve. */
+                printf("LSP: the closed factory in %s is not loaded; "
+                       "starting a new factory\n", db_path);
+            } else if (persist_has_factory(&db, 0)) {
+                /* The DB holds a factory this LSP must keep serving (its
+                   members' exits, the distribution TX, the watchtower), but it
+                   cannot be loaded as the signed tree (reason above).  Never
+                   fall through to a new factory over it. */
+                fprintf(stderr, "LSP: the factory in %s cannot be loaded "
+                        "(see above); refusing to start\n", db_path);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+        if (rec_loaded) {
             if (rec_f->n_participants < 2) {
                 fprintf(stderr, "LSP recovery: corrupt factory (n_participants=%zu)\n",
                         rec_f->n_participants);
@@ -3068,25 +3214,10 @@ int main(int argc, char *argv[]) {
             }
 
             {
-                unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
-                uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
-                size_t orig_sender[MAX_HTLC_ORIGINS];
-                uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-                size_t n_orig = persist_load_htlc_origins(&db,
-                    orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                    MAX_HTLC_ORIGINS);
-                for (size_t i = 0; i < n_orig; i++) {
-                    if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                    htlc_origin_t *o = &mgr->htlc_origins[mgr->n_htlc_origins++];
-                    memcpy(o->payment_hash, orig_hashes[i], 32);
-                    o->bridge_htlc_id = orig_bridge[i];
-                    o->request_id = orig_req[i];
-                    o->sender_idx = orig_sender[i];
-                    o->sender_htlc_id = orig_htlc[i];
-                    o->active = 1;
-                }
+                size_t n_orig = lsp_channels_restore_origins(mgr);
                 if (n_orig > 0)
-                    printf("LSP recovery: loaded %zu HTLC origins from DB\n", n_orig);
+                    printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+                lsp_channels_load_bridge_fulfils(mgr);
             }
 
             /* Initialize watchtower */
@@ -3104,6 +3235,8 @@ int main(int argc, char *argv[]) {
             watchtower_register_autosettle(&rec_wt,
                                             watchtower_autosettle_leaf_channels);
             mgr->watchtower = &rec_wt;
+            snprintf(mgr->network, sizeof(mgr->network), "%s",
+                     network ? network : "");
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) rec_wt.max_bump_fee_sat = max_bump_fee;
@@ -3174,7 +3307,7 @@ int main(int argc, char *argv[]) {
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS] = {0};
                 for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
                     all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
@@ -3219,7 +3352,9 @@ int main(int argc, char *argv[]) {
             mgr->rot_leaf_arity = leaf_arity;
             mgr->rot_is_regtest = is_regtest;
             mgr->rot_funding_sats = funding_sats;
-            mgr->rot_auto_rotate = 1;
+            /* Recovery resumes the daemon loop: rotation is automatic
+               there, but only with the opt-in. */
+            lsp_channels_set_rotation(mgr, enable_rotation_experimental, 1);
             mgr->rot_attempted_mask = 0;
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
@@ -3227,7 +3362,7 @@ int main(int argc, char *argv[]) {
 
             /* JIT Channel Fallback */
             jit_channels_init(mgr);
-            if (no_jit) mgr->jit_enabled = 0;
+            mgr->jit_enabled = enable_jit_experimental;
             mgr->jit_funding_sats = (jit_amount_arg > 0) ?
                 (uint64_t)jit_amount_arg :
                 (funding_sats / (uint64_t)rec_n_clients);
@@ -3359,11 +3494,13 @@ int main(int argc, char *argv[]) {
 
             printf("LSP recovery: daemon shutdown complete\n");
             jit_channels_cleanup(mgr);
+            lsp_channels_cleanup(mgr);
             free(mgr);
             persist_close(&db);
             lsp_cleanup(lsp_rp);
             
             free(lsp_rp);
+            ladder_free(rec_lad_p);
             free(rec_lad_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
@@ -3520,11 +3657,8 @@ accept_new_factory:
             g_ln_dispatch.invoices = &g_invoice_tbl;
 
             /* Wire LSPS0 callback */
-            memset(&g_lsps_ctx, 0, sizeof(g_lsps_ctx));
-            g_lsps_ctx.mgr = g_channel_mgr;
-            g_lsps_ctx.lsp = g_lsp;
             g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
-            g_bolt8_cfg.cb_userdata      = &g_lsps_ctx;
+            g_bolt8_cfg.cb_userdata      = NULL;
 
             /* Wire Tor proxy for .onion outbound peers */
             if (tor_proxy_arg) {
@@ -3556,7 +3690,7 @@ accept_new_factory:
             g_ln_dispatch.watchtower  = &g_watchtower;
             g_ln_dispatch.scb_path    = scb_path_arg; /* NULL = disabled */
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
-    g_ln_dispatch.jit_open_cb = on_jit_open;
+    g_ln_dispatch.jit_open_cb = NULL;
     g_ln_dispatch.jit_cb_ctx  = NULL;
     g_ln_dispatch.network     = network;
 
@@ -3673,6 +3807,30 @@ accept_new_factory:
         lsp_cleanup(lsp_p);
         secp256k1_context_destroy(ctx);
         return 1;
+    }
+
+    /* An explicit --cltv-timeout is checked before any coins move, against
+       the block the factory will be created at: on regtest up to 103 blocks
+       later (the blocks mined below), elsewhere after the funding
+       confirmations plus a margin.  The creation check judges it by the same
+       block, so it cannot refuse a factory that is already funded. */
+    uint32_t cltv_planned_created = 0;
+    if (cltv_timeout_arg > 0 && rt_ok) {
+        int h = regtest_get_block_height(&rt);
+        char cltv_err[512];
+        if (h > 0)
+            cltv_planned_created = (uint32_t)h + (is_regtest ? 103u
+                : (uint32_t)chain_funding_confs(chain_be, 0) + CLI_FACTORY_CLTV_MARGIN);
+        if (h > 0 &&
+            !cli_validate_factory_cltv((uint32_t)cltv_timeout_arg, cltv_planned_created,
+                                       active_blocks, dying_blocks, factory_exit_blocks,
+                                       cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "%s\n", cltv_err);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* === Phase 2: Compute funding address === */
@@ -3940,17 +4098,48 @@ accept_new_factory:
         if (cltv_timeout_arg > 0) {
             cltv_timeout = (uint32_t)cltv_timeout_arg;
         } else if (cur_height > 0) {
-            /* Auto: regtest +35 blocks, non-regtest = factory lifetime + 10 block buffer */
-            int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
+            /* Auto: the factory lifetime, at least 35 blocks on regtest,
+               plus a 10-block buffer elsewhere; and past a member's exit */
+            uint32_t life = active_blocks + dying_blocks;
+            uint32_t offset = cli_factory_auto_cltv_offset(
+                is_regtest ? (life > 35 ? life : 35) : life + 10, factory_exit_blocks);
             cltv_timeout = (uint32_t)cur_height + offset;
+        }
+        /* An explicit timeout was checked against the planned creation block
+           before funding; it is judged by the same block here. */
+        uint32_t created_for_check = cur_height > 0 ? (uint32_t)cur_height : 0;
+        if (cltv_timeout_arg > 0 && cltv_planned_created > 0) {
+            if (created_for_check > cltv_planned_created)
+                fprintf(stderr, "LSP: WARNING: the factory is created at block %u, "
+                        "%u blocks later than planned; its CLTV timeout %u leaves "
+                        "that much less room\n", created_for_check,
+                        created_for_check - cltv_planned_created, cltv_timeout);
+            created_for_check = cltv_planned_created;
+        }
+        char cltv_err[512];
+        if (created_for_check > 0 &&
+            !cli_validate_factory_cltv(cltv_timeout, created_for_check,
+                                       active_blocks, dying_blocks, factory_exit_blocks,
+                                       cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "%s\nLSP: refusing to create the factory. Its funding "
+                    "output %s:%u is already confirmed; it is spendable only by "
+                    "all members together.\n", cltv_err, funding_txid_hex,
+                    funding_vout);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     }
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (n_level_arity > 0)
-        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
+            fprintf(stderr, "Error: --arity shape refused by the factory\n");
+            return 1;
+        }
+    } else if (leaf_arity == 1)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
@@ -3964,10 +4153,20 @@ accept_new_factory:
     if (ps_subfactory_arity_arg > 0)
         factory_set_ps_subfactory_arity(&lsp_p->factory,
                                           (uint32_t)ps_subfactory_arity_arg);
-    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
+        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
+        return 1;
+    }
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* Populate default profiles from CLI config */
+    /* Populate default profiles from CLI config.  The shape setters above
+       allocate the factory's arrays, but not every shape calls one (a plain
+       --arity 2 without --static-near-root does not), so make sure they exist
+       before writing the profiles. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        return 1;
+    }
     for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
         lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
@@ -4167,16 +4366,18 @@ accept_new_factory:
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
-        /* Copy signed distribution TX from ceremony (if available) */
+        /* Copy the co-signed distribution TX from the ceremony, as rotation
+           does for the factories it creates.  The unsigned one cannot be
+           relayed; without a signed copy the LSP broadcasts nothing (every
+           member holds its own co-signed copy). */
         tx_buf_init(&lf->distribution_tx, 256);
-        if (lsp_p->factory.dist_tx_ready && lsp_p->factory.dist_unsigned_tx.len > 0) {
-            /* dist_unsigned_tx holds the signed version after ceremony */
+        if (lsp_p->factory.dist_tx_ready == 2 && lsp_p->factory.dist_signed_tx.len > 0) {
             tx_buf_free(&lf->distribution_tx);
-            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_unsigned_tx.len);
-            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_unsigned_tx.data,
-                   lsp_p->factory.dist_unsigned_tx.len);
-            lf->distribution_tx.len = lsp_p->factory.dist_unsigned_tx.len;
-            printf("LSP: distribution TX stored (%zu bytes)\n",
+            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_signed_tx.len);
+            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_signed_tx.data,
+                   lsp_p->factory.dist_signed_tx.len);
+            lf->distribution_tx.len = lsp_p->factory.dist_signed_tx.len;
+            printf("LSP: signed distribution TX stored (%zu bytes)\n",
                    lf->distribution_tx.len);
         }
         lad->n_factories = 1;
@@ -4200,7 +4401,7 @@ accept_new_factory:
             }
             if (init_ok) {
                 /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
-                uint32_t init_layers[DW_MAX_LAYERS];
+                uint32_t init_layers[DW_MAX_LAYERS] = {0};
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                     init_layers[li] = lsp_p->factory.counter.layers[li].config.max_states;
                 persist_save_dw_counter(&db, 0, 0, lsp_p->factory.counter.n_layers, init_layers);
@@ -4332,25 +4533,10 @@ accept_new_factory:
                 printf("LSP: loaded %zu invoices from DB\n", n_inv);
 
             /* Load HTLC origins */
-            unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
-            uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
-            size_t orig_sender[MAX_HTLC_ORIGINS];
-            uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-            size_t n_orig = persist_load_htlc_origins(&db,
-                orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                MAX_HTLC_ORIGINS);
-            for (size_t i = 0; i < n_orig; i++) {
-                if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
-                memcpy(origin->payment_hash, orig_hashes[i], 32);
-                origin->bridge_htlc_id = orig_bridge[i];
-                origin->request_id = orig_req[i];
-                origin->sender_idx = orig_sender[i];
-                origin->sender_htlc_id = orig_htlc[i];
-                origin->active = 1;
-            }
+            size_t n_orig = lsp_channels_restore_origins(mgr);
             if (n_orig > 0)
                 printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+            lsp_channels_load_bridge_fulfils(mgr);
         }
 
         /* Do NOT override channel.fee_rate_sat_per_kvb with --fee-rate:
@@ -4417,6 +4603,8 @@ accept_new_factory:
            TU so it doesn't appear in the trustless WT binary). */
         watchtower_register_autosettle(&wt, watchtower_autosettle_leaf_channels);
         mgr->watchtower = &wt;
+        snprintf(mgr->network, sizeof(mgr->network), "%s",
+                 network ? network : "");
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
@@ -4446,7 +4634,8 @@ accept_new_factory:
         mgr->rot_leaf_arity = leaf_arity;
         mgr->rot_is_regtest = is_regtest;
         mgr->rot_funding_sats = funding_sats;
-        mgr->rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
+        /* With the opt-in, rotation is automatic in daemon mode. */
+        lsp_channels_set_rotation(mgr, enable_rotation_experimental, daemon_mode);
         mgr->rot_attempted_mask = 0;
         mgr->cli_enabled = cli_mode;
         mgr->test_bad_settlement = test_bad_settlement;
@@ -4457,7 +4646,7 @@ accept_new_factory:
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(mgr);
-        if (no_jit) mgr->jit_enabled = 0;
+        mgr->jit_enabled = enable_jit_experimental;
         mgr->jit_funding_sats = (jit_amount_arg > 0) ?
             (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
 
@@ -4547,7 +4736,8 @@ accept_new_factory:
                via split-round MuSig2 with all participants.  Skip when
                --test-burn is set so the burn test can broadcast the
                correctly-signed epoch-0 tree. */
-            if (!test_burn && dw_counter_advance(&lsp_p->factory.counter)) {
+            if (!test_burn && factory_has_dw_state(&lsp_p->factory) &&
+                dw_counter_advance(&lsp_p->factory.counter)) {
                 uint32_t epoch = dw_counter_epoch(&lsp_p->factory.counter);
                 printf("LSP: DW advanced to epoch %u (delays:", epoch);
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++) {
@@ -4558,7 +4748,7 @@ accept_new_factory:
                 }
                 printf(" blocks)\n");
                 if (use_db) {
-                    uint32_t layer_states[DW_MAX_LAYERS];
+                    uint32_t layer_states[DW_MAX_LAYERS] = {0};
                     for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                         layer_states[li] = lsp_p->factory.counter.layers[li].current_state;
                     persist_save_dw_counter(&db, 0, epoch,
@@ -4738,6 +4928,16 @@ accept_new_factory:
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
+
+    /* SS close convergence gate: wait for every client fd to be live before the
+       all-N ceremony so CLOSE_PROPOSE reaches all N (see wait_for_all_clients_reconnected).
+       Bounded; override via SS_CLOSE_CONVERGE_SEC. Safe: on timeout we proceed as before. */
+    {
+        int _conv_to = 180;
+        const char *_ct = getenv("SS_CLOSE_CONVERGE_SEC");
+        if (_ct) { int _v = atoi(_ct); if (_v > 0) _conv_to = _v; }
+        wait_for_all_clients_reconnected(_conv_to, lsp_p, mgr);
+    }
 
     /* #48 Phase C: bounded fresh-nonce retry for the cooperative close. A
        ceremony-time verify failure (Phase B) returns 0 after a SOFT abort
