@@ -2013,6 +2013,7 @@ extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
 extern int test_network_gate_db(void);
 extern int test_network_gate_no_experimental_jit(void);
+extern int test_network_gate_no_experimental_rotation(void);
 extern int test_network_mainnet_step_floor_alias(void);
 extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
@@ -2121,6 +2122,8 @@ extern int test_readiness_beyond_64(void);
 extern int test_rotation_readiness_null(void);
 extern int test_rotation_readiness_none_connected(void);
 extern int test_rotation_readiness_partial(void);
+extern int test_rotation_refused_without_opt_in(void);
+extern int test_rotation_triggers_refused_without_opt_in(void);
 
 static void run_unit_tests(void) {
     /* Task #104: tests opt in to real PTLC creation; production build leaves
@@ -4042,6 +4045,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_network_gate_no_test_scaffolding);
     RUN_TEST(test_network_gate_db);
     RUN_TEST(test_network_gate_no_experimental_jit);
+    RUN_TEST(test_network_gate_no_experimental_rotation);
     RUN_TEST(test_network_mainnet_step_floor_alias);
     RUN_TEST(test_network_startup_gates_per_role);
 
@@ -4173,6 +4177,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_readiness_null);
     RUN_TEST(test_rotation_readiness_none_connected);
     RUN_TEST(test_rotation_readiness_partial);
+    RUN_TEST(test_rotation_refused_without_opt_in);
+    RUN_TEST(test_rotation_triggers_refused_without_opt_in);
 
     /* === Reorg Resistance === */
     printf("\n=== Reorg Resistance ===\n");

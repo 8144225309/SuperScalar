@@ -194,7 +194,8 @@ CHECKPOINTS=(
     # inline Factory-1 creation — also folded into the v0.2.1 follow-up.
     # Factory rotation — PRODUCTION lsp_channels_rotate_factory(), driven by
     # the daemon's own DYING trigger (NOT --test-rotation, which is a separate
-    # hand-rolled demo): --daemon sets rot_auto_rotate=1 and, with no
+    # hand-rolled demo): --daemon --enable-rotation-experimental sets
+    # rot_auto_rotate=1 and, with no
     # --async-rotation, mgr->readiness is NULL so the LEGACY SYNCHRONOUS path
     # calls lsp_channels_rotate_factory() directly on the ACTIVE->DYING
     # transition.  --active-blocks 6 + the matrix's 2s miner reaches DYING in
@@ -203,10 +204,10 @@ CHECKPOINTS=(
     # rotate_pending_nonces kill (which fires just after the ceremony row is
     # saved, BEFORE Phase A) expects parts=0; later checkpoints expect all 4.
     # Probe-verified: state=PENDING_NONCES(0) parts=0/0/0 at the first kill.
-    "rotate_pending_nonces|--daemon --active-blocks 6 --dying-blocks 120|propose|4|2|0|360|1"
-    "rotate_nonces_aggregated|--daemon --active-blocks 6 --dying-blocks 120|nonced|4|2|4|420|1"
-    "rotate_pending_sigs|--daemon --active-blocks 6 --dying-blocks 120|signed|4|2|4|420|1"
-    "rotate_finalize_partial|--daemon --active-blocks 6 --dying-blocks 120|finalize_partial|4|2|4|480|1"
+    "rotate_pending_nonces|--daemon --enable-rotation-experimental --active-blocks 6 --dying-blocks 120|propose|4|2|0|360|1"
+    "rotate_nonces_aggregated|--daemon --enable-rotation-experimental --active-blocks 6 --dying-blocks 120|nonced|4|2|4|420|1"
+    "rotate_pending_sigs|--daemon --enable-rotation-experimental --active-blocks 6 --dying-blocks 120|signed|4|2|4|420|1"
+    "rotate_finalize_partial|--daemon --enable-rotation-experimental --active-blocks 6 --dying-blocks 120|finalize_partial|4|2|4|480|1"
 )
 
 # Optional filter — run only checkpoints matching this glob (default: all).

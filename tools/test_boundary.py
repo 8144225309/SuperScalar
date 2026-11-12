@@ -626,7 +626,8 @@ lsp_rot_cmd = [LSP, "--seckey", LSP_SECKEY, "--amount", "200000", "--clients", "
                "--wallet", WALLET, "--port", str(TEST_PORT+5), "--network", "regtest",
                "--rpcuser", "rpcuser", "--rpcpassword", "rpcpass", "--fee-rate", "1000",
                "--db", "/tmp/boundary_test.db", "--report", "/tmp/boundary_report.json",
-               "--daemon", "--cli", "--active-blocks", "5", "--dying-blocks", "3"]
+               "--daemon", "--cli", "--enable-rotation-experimental",
+               "--active-blocks", "5", "--dying-blocks", "3"]
 lsp_rot = subprocess.Popen(lsp_rot_cmd, stdin=subprocess.PIPE, stdout=lsp_rot_log,
                             stderr=subprocess.STDOUT, env=env)
 time.sleep(2)

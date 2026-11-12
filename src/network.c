@@ -110,6 +110,17 @@ int network_gate_no_experimental_jit(const char *network, int enable_jit,
     return 0;
 }
 
+int network_gate_no_experimental_rotation(const char *network, int enable_rotation,
+                                          char *err_buf, size_t err_buf_len) {
+    if (!network_is_mainnet(network) || !enable_rotation) return 1;
+    if (err_buf && err_buf_len)
+        snprintf(err_buf, err_buf_len,
+            "Error: --enable-rotation-experimental is refused on mainnet.\n"
+            "Factory rotation is experimental: the close of the old factory can\n"
+            "pay the members' balances to the LSP wallet.\n");
+    return 0;
+}
+
 int network_startup_gates(const network_startup_t *startup,
                           char *err_buf, size_t err_buf_len) {
     if (!startup) return 0;
@@ -138,6 +149,10 @@ int network_startup_gates(const network_startup_t *startup,
     if (!network_gate_no_experimental_jit(network,
                                           startup->enable_jit_experimental,
                                           err_buf, err_buf_len))
+        return 0;
+    if (!network_gate_no_experimental_rotation(network,
+                                               startup->enable_rotation_experimental,
+                                               err_buf, err_buf_len))
         return 0;
     if (holds_key &&
         !network_gate_db(network, startup->have_db, err_buf, err_buf_len))
