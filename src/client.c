@@ -1381,6 +1381,27 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+/* Parse FACTORY_PROPOSE's per-level arity list.  Returns 0 for a list the
+   factory cannot take as sent (more than FACTORY_MAX_LEVELS entries, or an
+   entry that is not an arity 1..FACTORY_MAX_OUTPUTS); a shortened or altered
+   list would build a different tree than the LSP's. */
+static int client_parse_level_arity(const cJSON *arr,
+                                    uint8_t out[FACTORY_MAX_LEVELS],
+                                    size_t *n_out) {
+    *n_out = 0;
+    if (!arr || !cJSON_IsArray(arr)) return 1;
+    int n = cJSON_GetArraySize(arr);
+    if (n > FACTORY_MAX_LEVELS) return 0;
+    for (int i = 0; i < n; i++) {
+        const cJSON *v = cJSON_GetArrayItem(arr, i);
+        if (!v || !cJSON_IsNumber(v) || v->valuedouble < 1 ||
+            v->valuedouble > FACTORY_MAX_OUTPUTS)
+            return 0;
+        out[(*n_out)++] = (uint8_t)v->valuedouble;
+    }
+    return 1;
+}
+
 /* --- Apply signed tree nodes from MSG_FACTORY_READY --- */
 
 static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
@@ -1507,14 +1528,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     int rot_leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
     uint8_t rot_level_arities[FACTORY_MAX_LEVELS];
     size_t rot_n_level_arity = 0;
-    cJSON *rla_arr = cJSON_GetObjectItem(pj, "level_arity");
-    if (rla_arr && cJSON_IsArray(rla_arr)) {
-        int rla_n = cJSON_GetArraySize(rla_arr);
-        for (int rli = 0; rli < rla_n && rli < FACTORY_MAX_LEVELS; rli++) {
-            cJSON *rlai = cJSON_GetArrayItem(rla_arr, rli);
-            if (rlai && cJSON_IsNumber(rlai))
-                rot_level_arities[rot_n_level_arity++] = (uint8_t)rlai->valuedouble;
-        }
+    if (!client_parse_level_arity(cJSON_GetObjectItem(pj, "level_arity"),
+                                  rot_level_arities, &rot_n_level_arity)) {
+        fprintf(stderr, "Client %u: FACTORY_PROPOSE in rotation has an invalid "
+                "level_arity list\n", my_index);
+        return 0;
     }
     cJSON *rsnr_item = cJSON_GetObjectItem(pj, "static_threshold_depth");
     uint32_t rot_static_threshold =
@@ -2566,14 +2584,11 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* Parse variable level_arity array (4A), fall back to leaf_arity */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;
-    cJSON *la_arr = cJSON_GetObjectItem(msg.json, "level_arity");
-    if (la_arr && cJSON_IsArray(la_arr)) {
-        int la_n = cJSON_GetArraySize(la_arr);
-        for (int li = 0; li < la_n && li < FACTORY_MAX_LEVELS; li++) {
-            cJSON *lai = cJSON_GetArrayItem(la_arr, li);
-            if (lai && cJSON_IsNumber(lai))
-                level_arities[n_level_arity++] = (uint8_t)lai->valuedouble;
-        }
+    if (!client_parse_level_arity(cJSON_GetObjectItem(msg.json, "level_arity"),
+                                  level_arities, &n_level_arity)) {
+        fprintf(stderr, "Client: FACTORY_PROPOSE has an invalid level_arity list\n");
+        cJSON_Delete(msg.json);
+        return 0;
     }
 
     /* Parse static-near-root threshold (Phase 3 mixed-arity).  Backward-

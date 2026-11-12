@@ -1355,6 +1355,16 @@ extern int test_client_daemon_autofulfill(void);
 extern int test_cli_command_parsing(void);
 
 /* Phase 4 (mixed-arity plan) — CLI arity parsing + BOLT-2016 ceiling tests */
+extern int test_tree_shape_txids_pinned(void);
+extern int test_tree_shape_dw_layers_deep(void);
+extern int test_tree_shape_static_leaf(void);
+extern int test_tree_shape_ewt_matches_tx(void);
+extern int test_tree_shape_anchor_room(void);
+extern int test_tree_shape_leaf_kind(void);
+extern int test_tree_shape_mirror_hash_high_index(void);
+extern int test_tree_shape_placement_order(void);
+extern int test_tree_shape_level_list_bound(void);
+extern int test_tree_shape_scale_sign_ewt(void);
 extern int test_cli_arity_uniform_3_parses(void);
 extern int test_cli_arity_mixed_248_parses(void);
 extern int test_cli_arity_rejects_16(void);
@@ -3362,6 +3372,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_daemon_event_loop);
     RUN_TEST(test_client_daemon_autofulfill);
     RUN_TEST(test_cli_command_parsing);
+
+    printf("\n=== Tree Shapes ===\n");
+    RUN_TEST(test_tree_shape_txids_pinned);
+    RUN_TEST(test_tree_shape_dw_layers_deep);
+    RUN_TEST(test_tree_shape_static_leaf);
+    RUN_TEST(test_tree_shape_ewt_matches_tx);
+    RUN_TEST(test_tree_shape_anchor_room);
+    RUN_TEST(test_tree_shape_leaf_kind);
+    RUN_TEST(test_tree_shape_mirror_hash_high_index);
+    RUN_TEST(test_tree_shape_placement_order);
+    RUN_TEST(test_tree_shape_level_list_bound);
+    RUN_TEST(test_tree_shape_scale_sign_ewt);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);

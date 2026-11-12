@@ -515,9 +515,13 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 void factory_set_arity(factory_t *f, factory_arity_t arity);
 
 /* Set variable arity per tree level (4A). arities[0]=root level, etc.
-   Last entry applies to all deeper levels. Clears uniform leaf_arity.
-   Must be called after init, before build_tree. */
-void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
+   Last entry applies to all deeper levels and sets the leaf kind (3 = PS,
+   else DW): a level of the other kind ends a subtree only when it fits one
+   leaf of the last entry, built with the last entry's arity.
+   Must be called after init, before build_tree.  Returns 0, changing
+   nothing, unless 1 <= n <= FACTORY_MAX_LEVELS and every entry is
+   1..FACTORY_MAX_OUTPUTS. */
+int factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
 
 /* Override the default L-stock CSV (BIP-68) blocks.  Must be called
    before factory_build_tree() — otherwise the L-stock SPK is already
@@ -836,9 +840,12 @@ void factory_set_subfactory_chain_confirmed_height(factory_t *f,
                                                     size_t node_idx,
                                                     uint32_t confirmed_height);
 
-/* Compute the factory_early_warning_time (blocks) per BLIP-56.
-   This is the worst-case blocks needed for full unilateral close from
-   the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */
+/* Compute the factory_early_warning_time (blocks) per BLIP-56: the
+   worst-case blocks a full unilateral close needs, i.e. the largest sum of
+   the relative locks (each DW state's longest delay) on any root-to-leaf
+   path of the built tree.  PS leaves contribute 0 blocks (no nSequence at
+   leaf level).  Before factory_build_tree, the same sum for the configured
+   shape. */
 uint32_t factory_early_warning_time(const factory_t *f);
 
 /* Compute the worst-case factory_early_warning_time (blocks) for a given
@@ -854,8 +861,8 @@ uint32_t factory_early_warning_time(const factory_t *f);
    - n_clients: client count (excludes LSP, so factory_clients_only)
    - static_threshold: top N tree depths are kickoff-only (Phase 3)
    - step_blocks / states_per_layer: per-DW-layer config (mainnet 144 / 4)
-   Returns ewt in blocks.  Treats PS leaves as 0-cost at the leaf layer
-   when leaf arity == FACTORY_ARITY_PS. */
+   Returns ewt in blocks: what factory_early_warning_time returns once the
+   shape is built with one client per PS leaf (PS leaves cost 0). */
 uint32_t factory_compute_ewt_for_shape(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
