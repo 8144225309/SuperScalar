@@ -27,7 +27,7 @@ const char *network_canonical(const char *network);
  * supported and applies every mainnet gate that belongs to the daemon's role:
  *
  *   LSP         risk acknowledgement, no --seckey, no test scaffolding,
- *               --db, --wt-db, no experimental JIT channels
+ *               --db, --wt-db, no experimental JIT channels or rotation
  *   client      risk acknowledgement, no --seckey, no test scaffolding, --db
  *   watchtower  risk acknowledgement, no test scaffolding
  *

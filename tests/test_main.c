@@ -1355,6 +1355,21 @@ extern int test_client_daemon_autofulfill(void);
 extern int test_cli_command_parsing(void);
 
 /* Phase 4 (mixed-arity plan) — CLI arity parsing + BOLT-2016 ceiling tests */
+extern int test_tree_shape_txids_pinned(void);
+extern int test_tree_shape_dw_layers_deep(void);
+extern int test_tree_shape_static_leaf(void);
+extern int test_tree_shape_ewt_matches_tx(void);
+extern int test_tree_shape_anchor_room(void);
+extern int test_tree_shape_leaf_kind(void);
+extern int test_tree_shape_mirror_hash_high_index(void);
+extern int test_tree_shape_placement_order(void);
+extern int test_tree_shape_level_list_bound(void);
+extern int test_tree_shape_scale_sign_ewt(void);
+extern int test_tree_shape_ewt_ps_k(void);
+extern int test_tree_shape_per_leaf_rollover(void);
+extern int test_tree_shape_funding_script(void);
+extern int test_tree_shape_session_reinit(void);
+extern int test_tree_shape_placement_setter(void);
 extern int test_cli_arity_uniform_3_parses(void);
 extern int test_cli_arity_mixed_248_parses(void);
 extern int test_cli_arity_rejects_16(void);
@@ -2013,6 +2028,7 @@ extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
 extern int test_network_gate_db(void);
 extern int test_network_gate_no_experimental_jit(void);
+extern int test_network_gate_no_experimental_rotation(void);
 extern int test_network_mainnet_step_floor_alias(void);
 extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
@@ -2121,6 +2137,8 @@ extern int test_readiness_beyond_64(void);
 extern int test_rotation_readiness_null(void);
 extern int test_rotation_readiness_none_connected(void);
 extern int test_rotation_readiness_partial(void);
+extern int test_rotation_refused_without_opt_in(void);
+extern int test_rotation_triggers_refused_without_opt_in(void);
 
 static void run_unit_tests(void) {
     /* Task #104: tests opt in to real PTLC creation; production build leaves
@@ -3390,6 +3408,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_daemon_autofulfill);
     RUN_TEST(test_cli_command_parsing);
 
+    printf("\n=== Tree Shapes ===\n");
+    RUN_TEST(test_tree_shape_txids_pinned);
+    RUN_TEST(test_tree_shape_dw_layers_deep);
+    RUN_TEST(test_tree_shape_static_leaf);
+    RUN_TEST(test_tree_shape_ewt_matches_tx);
+    RUN_TEST(test_tree_shape_anchor_room);
+    RUN_TEST(test_tree_shape_leaf_kind);
+    RUN_TEST(test_tree_shape_mirror_hash_high_index);
+    RUN_TEST(test_tree_shape_placement_order);
+    RUN_TEST(test_tree_shape_level_list_bound);
+    RUN_TEST(test_tree_shape_scale_sign_ewt);
+    RUN_TEST(test_tree_shape_ewt_ps_k);
+    RUN_TEST(test_tree_shape_per_leaf_rollover);
+    RUN_TEST(test_tree_shape_funding_script);
+    RUN_TEST(test_tree_shape_session_reinit);
+    RUN_TEST(test_tree_shape_placement_setter);
+
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);
     RUN_TEST(test_cli_arity_mixed_248_parses);
@@ -4040,6 +4075,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_network_gate_no_test_scaffolding);
     RUN_TEST(test_network_gate_db);
     RUN_TEST(test_network_gate_no_experimental_jit);
+    RUN_TEST(test_network_gate_no_experimental_rotation);
     RUN_TEST(test_network_mainnet_step_floor_alias);
     RUN_TEST(test_network_startup_gates_per_role);
 
@@ -4171,6 +4207,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_readiness_null);
     RUN_TEST(test_rotation_readiness_none_connected);
     RUN_TEST(test_rotation_readiness_partial);
+    RUN_TEST(test_rotation_refused_without_opt_in);
+    RUN_TEST(test_rotation_triggers_refused_without_opt_in);
 
     /* === Reorg Resistance === */
     printf("\n=== Reorg Resistance ===\n");

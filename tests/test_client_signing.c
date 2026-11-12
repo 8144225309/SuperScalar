@@ -31,6 +31,9 @@
 #include <time.h>
 #include <sqlite3.h>
 
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
@@ -1828,10 +1831,11 @@ static int cs_fork_channel_clients(const lsp_t *lsp, int port,
             secp256k1_context *cc = cs_ctx();
             secp256k1_keypair ck;
             if (!secp256k1_keypair_create(cc, &ck, cs_seckeys[c + 1])) _exit(2);
-            /* The funding script is computed from the participants in key
-               order; the LSP orders them by these hints rather than by
-               connection order, so the factory is the one funded. */
+            /* The funding script is the MuSig2 key of the participants in
+               the order the LSP numbers them.  Slot hints make that the key
+               order; connecting in key order keeps it so as well. */
             client_set_slot_hint(c + 1);
+            usleep(200000 * (useconds_t)c);
             int ok = client_run_with_channels(cc, &ck, "127.0.0.1", port,
                                                cs_idle_cb, NULL, NULL, NULL);
             secp256k1_context_destroy(cc);
@@ -1882,6 +1886,14 @@ static int cs_run_inprocess_close(int honest, int *close_rc_out,
     if (!forked) setup_ok = 0;
 
     if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
+    /* Made-up outpoint: fund it at the key of the participants in the order
+       the LSP accepted them. */
+    if (setup_ok) {
+        secp256k1_pubkey order[CS_N];
+        order[0] = lsp->lsp_pubkey;
+        for (int c = 0; c < CS_N - 1; c++) order[c + 1] = lsp->client_pubkeys[c];
+        if (!test_funding_spk_from_pubkeys(ctx, order, CS_N, fund_spk)) setup_ok = 0;
+    }
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
                                                fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */))
         setup_ok = 0;

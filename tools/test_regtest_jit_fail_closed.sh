@@ -7,10 +7,10 @@
 # run with --auto-accept-jit, so an offer would be taken if one were made.
 #
 # The production trigger for a JIT open is "every factory has expired and a
-# client is connected".  A daemon whose clients are all online rotates the
-# factory before it expires, so the scenario takes one client away: the
-# rotation then cannot run, the factory expires, and the other client is
-# still connected.
+# client is connected".  The LSP runs without --enable-rotation-experimental,
+# so the factory is not rotated and expires; the scenario also takes one
+# client away (a rotation could not run without it either), and the other
+# client is still connected.
 #
 #   default    LSP WITHOUT --enable-jit-experimental, driven to that state.
 #              Asserted: the LSP wallet's balance is unchanged, none of its

@@ -70,8 +70,22 @@ void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id) {
 
 /* --- Factory rotation --- */
 
+void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic) {
+    if (!mgr) return;
+    mgr->rot_enabled = enabled ? 1 : 0;
+    mgr->rot_auto_rotate = (enabled && automatic) ? 1 : 0;
+}
+
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr || !lsp || !mgr->ladder) return 0;
+    if (!mgr || !lsp) return 0;
+    /* Every way into a rotation (daemon lifecycle, retries, async readiness,
+       CLI "rotate", MSG_ROTATE) ends here. */
+    if (!mgr->rot_enabled) {
+        fprintf(stderr, "LSP rotate: refused: factory rotation is disabled "
+                "(it runs only with --enable-rotation-experimental)\n");
+        return 0;
+    }
+    if (!mgr->ladder) return 0;
 
     ladder_t *lad = (ladder_t *)mgr->ladder;
     fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
@@ -1110,6 +1124,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     int saved_leaf_arity = mgr->rot_leaf_arity;
     int saved_is_regtest = mgr->rot_is_regtest;
     uint64_t saved_funding_sats = mgr->rot_funding_sats;
+    int saved_rot_enabled = mgr->rot_enabled;
     int saved_auto_rotate = mgr->rot_auto_rotate;
     uint32_t saved_attempted_mask = mgr->rot_attempted_mask;
     uint8_t  saved_retry_count[8];
@@ -1161,6 +1176,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->rot_leaf_arity = saved_leaf_arity;
     mgr->rot_is_regtest = saved_is_regtest;
     mgr->rot_funding_sats = saved_funding_sats;
+    mgr->rot_enabled = saved_rot_enabled;
     mgr->rot_auto_rotate = saved_auto_rotate;
     mgr->rot_attempted_mask = saved_attempted_mask;
     memcpy(mgr->rot_retry_count, saved_retry_count, sizeof(saved_retry_count));

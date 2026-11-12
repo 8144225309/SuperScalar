@@ -6,6 +6,14 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Factory rotation is off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer rotates factories unless started with `--enable-rotation-experimental`.** Before, every `--daemon` LSP rotated a factory automatically when it turned DYING. That rotation is not safe yet: the members hand over their factory keys, the LSP closes the old factory with every output paid to its own wallet, and the new factory reuses the same keys. The flag is for testing only and is refused on mainnet. `--test-rotation` and `--test-partial-rotation` imply it; `--async-rotation` needs it.
+- **Without the flag, a DYING factory keeps serving its channels until it expires.** The LSP logs that it is not rotating. Every way into a rotation is refused: the DYING/EXPIRED trigger and its retries, partial rotation at EXPIRED, the DW-counter trigger, the async-rotation readiness gate, CLI `rotate` and `MSG_ROTATE`.
+- **The LSP broadcasts the co-signed distribution TX of an expired factory once its nLockTime is reached**, retrying at each block until it is accepted. Before, it tried once, at EXPIRED, which with the default `--cltv-timeout` is always before the nLockTime, and for the first factory it held the unsigned TX, so the broadcast never succeeded. Members' own copies are unchanged.
+
 ### JIT channels are off by default
 
 Operator-visible behaviour changes.

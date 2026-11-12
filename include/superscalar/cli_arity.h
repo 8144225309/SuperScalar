@@ -60,6 +60,7 @@ int cli_parse_static_near_root(const char *spec,
 int cli_validate_shape_for_bolt2016(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
+    uint32_t ps_subfactory_arity,
     size_t n_clients,
     uint32_t static_threshold,
     uint16_t step_blocks,

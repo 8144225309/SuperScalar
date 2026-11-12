@@ -1031,7 +1031,7 @@ def scenario_factory_rotation(orch):
 
     # Start LSP with short active/dying periods so rotation triggers quickly.
     # Use slightly longer windows (8+5) to avoid race conditions during setup.
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "8", "--dying-blocks", "5"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-rotation-experimental", "--active-blocks", "8", "--dying-blocks", "5"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -1338,7 +1338,7 @@ def scenario_ladder_breach(orch):
     orch._log("Factory 0 ages → DYING → rotation creates Factory 1 → Factory 0 expires.")
 
     # Start LSP with short active/dying periods
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-rotation-experimental", "--active-blocks", "5", "--dying-blocks", "3"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -1403,7 +1403,7 @@ def scenario_turnover_abort(orch):
 
     # Start LSP with short lifecycle for quick turnover trigger.
     # Use slightly longer windows (8+5) to avoid race conditions during setup.
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "8", "--dying-blocks", "5"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-rotation-experimental", "--active-blocks", "8", "--dying-blocks", "5"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 

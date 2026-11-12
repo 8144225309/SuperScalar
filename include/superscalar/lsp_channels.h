@@ -223,7 +223,10 @@ typedef struct {
     int rot_is_regtest;
     uint64_t rot_funding_sats;
     int rot_leaf_arity;            /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
-    int rot_auto_rotate;           /* 1 = auto-rotate enabled */
+    int rot_enabled;               /* 1 = rotation may run (--enable-rotation-experimental);
+                                      default 0: every rotation path is refused */
+    int rot_auto_rotate;           /* 1 = rotate automatically when a factory turns
+                                      DYING; only ever set together with rot_enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 
     /* Rotation retry with backoff (reset on first attempt to avoid aliasing) */
@@ -581,9 +584,15 @@ int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* --- Continuous Ladder Rotation (Gap #3) --- */
 
+/* Rotation is experimental and off unless the operator opts in: sets
+   mgr->rot_enabled to `enabled`, and mgr->rot_auto_rotate (rotate when a
+   factory turns DYING) to `enabled && automatic`. */
+void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic);
+
 /* Perform a full factory rotation: PTLC turnover → cooperative close →
    fund new factory → create new factory → reinitialize channels.
    All parameters come from mgr->rot_* fields.
+   Refused (returns 0, nothing done) unless mgr->rot_enabled.
    Returns 1 on success, 0 on failure. */
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 

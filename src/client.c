@@ -1812,6 +1812,27 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+/* Parse FACTORY_PROPOSE's per-level arity list.  Returns 0 for a list the
+   factory cannot take as sent (more than FACTORY_MAX_LEVELS entries, or an
+   entry that is not an arity 1..FACTORY_MAX_OUTPUTS); a shortened or altered
+   list would build a different tree than the LSP's. */
+static int client_parse_level_arity(const cJSON *arr,
+                                    uint8_t out[FACTORY_MAX_LEVELS],
+                                    size_t *n_out) {
+    *n_out = 0;
+    if (!arr || !cJSON_IsArray(arr)) return 1;
+    int n = cJSON_GetArraySize(arr);
+    if (n > FACTORY_MAX_LEVELS) return 0;
+    for (int i = 0; i < n; i++) {
+        const cJSON *v = cJSON_GetArrayItem(arr, i);
+        if (!v || !cJSON_IsNumber(v) || v->valuedouble < 1 ||
+            v->valuedouble > FACTORY_MAX_OUTPUTS)
+            return 0;
+        out[(*n_out)++] = (uint8_t)v->valuedouble;
+    }
+    return 1;
+}
+
 /* --- Apply signed tree nodes from MSG_FACTORY_READY --- */
 
 int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_index) {
@@ -1985,14 +2006,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     int rot_leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
     uint8_t rot_level_arities[FACTORY_MAX_LEVELS];
     size_t rot_n_level_arity = 0;
-    cJSON *rla_arr = cJSON_GetObjectItem(pj, "level_arity");
-    if (rla_arr && cJSON_IsArray(rla_arr)) {
-        int rla_n = cJSON_GetArraySize(rla_arr);
-        for (int rli = 0; rli < rla_n && rli < FACTORY_MAX_LEVELS; rli++) {
-            cJSON *rlai = cJSON_GetArrayItem(rla_arr, rli);
-            if (rlai && cJSON_IsNumber(rlai))
-                rot_level_arities[rot_n_level_arity++] = (uint8_t)rlai->valuedouble;
-        }
+    if (!client_parse_level_arity(cJSON_GetObjectItem(pj, "level_arity"),
+                                  rot_level_arities, &rot_n_level_arity)) {
+        fprintf(stderr, "Client %u: FACTORY_PROPOSE in rotation has an invalid "
+                "level_arity list\n", my_index);
+        return 0;
     }
     cJSON *rsnr_item = cJSON_GetObjectItem(pj, "static_threshold_depth");
     uint32_t rot_static_threshold =
@@ -2060,12 +2078,19 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_out->cltv_timeout = cltv_timeout;
     factory_out->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory_out->fee_per_tx = fee_per_tx;
-    factory_out->placement_mode = (placement_mode_t)rot_placement;
+    if (!factory_set_placement_mode(factory_out, (placement_mode_t)rot_placement)) {
+        free(rot_hashes);
+        return 0;
+    }
     factory_out->economic_mode = (economic_mode_t)rot_econ;
     memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
-    if (rot_n_level_arity > 0)
-        factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
-    else if (rot_leaf_arity == 1)
+    if (rot_n_level_arity > 0) {
+        if (!factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity)) {
+            fprintf(stderr, "Client %u: rotation tree shape refused\n", my_index);
+            free(rot_hashes);
+            return 0;
+        }
+    } else if (rot_leaf_arity == 1)
         factory_set_arity(factory_out, FACTORY_ARITY_1);
     else if (rot_leaf_arity == 3)
         factory_set_arity(factory_out, FACTORY_ARITY_PS);
@@ -2074,8 +2099,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (rot_n_hashes > 0)
         factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
     free(rot_hashes);
-    factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
-                        funding_spk, spk_len);
+    if (!factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
+                             funding_spk, spk_len)) {
+        printf("Client %u: rotation funding script refused\n", my_index);
+        fflush(stdout);
+        return 0;
+    }
 
     if (!factory_build_tree(factory_out)) {
         printf("Client %u: ROTATION BUILD_TREE FAILED spk=%zu amt=%llu\n", my_index, spk_len, (unsigned long long)funding_amount);
@@ -3069,14 +3098,11 @@ int client_run_with_channels(secp256k1_context *ctx,
     /* Parse variable level_arity array (4A), fall back to leaf_arity */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;
-    cJSON *la_arr = cJSON_GetObjectItem(msg.json, "level_arity");
-    if (la_arr && cJSON_IsArray(la_arr)) {
-        int la_n = cJSON_GetArraySize(la_arr);
-        for (int li = 0; li < la_n && li < FACTORY_MAX_LEVELS; li++) {
-            cJSON *lai = cJSON_GetArrayItem(la_arr, li);
-            if (lai && cJSON_IsNumber(lai))
-                level_arities[n_level_arity++] = (uint8_t)lai->valuedouble;
-        }
+    if (!client_parse_level_arity(cJSON_GetObjectItem(msg.json, "level_arity"),
+                                  level_arities, &n_level_arity)) {
+        fprintf(stderr, "Client: FACTORY_PROPOSE has an invalid level_arity list\n");
+        cJSON_Delete(msg.json);
+        return 0;
     }
 
     /* Parse static-near-root threshold (Phase 3 mixed-arity).  Backward-
@@ -3193,7 +3219,16 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory->cltv_timeout = cltv_timeout;
     factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory->fee_per_tx = fee_per_tx;
-    factory->placement_mode = (placement_mode_t)placement_mode;
+    if (!factory_set_placement_mode(factory, (placement_mode_t)placement_mode)) {
+        client_send_error(fd, "unknown placement mode");
+        free(parsed_l_stock_hashes);
+        free(parsed_node_h_idx);
+        free(parsed_node_h);
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
     factory->economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory->profiles, profiles, sizeof(profiles));
     /* SF-followup #145: register active factory so MSG_FUNDING_REORG handler
@@ -3230,11 +3265,20 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
 
-    if (n_level_arity > 0)
-        factory_set_level_arity(factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0 &&
+        !factory_set_level_arity(factory, level_arities, n_level_arity)) {
+        fprintf(stderr, "Client: FACTORY_PROPOSE tree shape refused\n");
+        client_send_error(fd, "tree shape refused");
+        free(parsed_l_stock_hashes);
+        free(parsed_node_h_idx);
+        free(parsed_node_h);
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    } else if (n_level_arity == 0 && leaf_arity == 1)
         factory_set_arity(factory, FACTORY_ARITY_1);
-    else if (leaf_arity == 3)
+    else if (n_level_arity == 0 && leaf_arity == 3)
         factory_set_arity(factory, FACTORY_ARITY_PS);
     /* Apply static-near-root after the arity restore: it recomputes the
        DW counter shape based on f->level_arity / f->leaf_arity. */
@@ -3256,10 +3300,9 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_node_l_stock_hash(factory, parsed_node_h_idx[nh], parsed_node_h[nh]);
     free(parsed_node_h_idx);
     free(parsed_node_h);
-    factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
-                        funding_spk, spk_len);
-
-    if (!factory_build_tree(factory)) {
+    if (!factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
+                             funding_spk, spk_len) ||
+        !factory_build_tree(factory)) {
         fprintf(stderr, "Client: factory_build_tree failed\n");
         client_send_error(fd, "factory_build_tree failed");
         factory_free(factory);

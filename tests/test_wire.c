@@ -20,6 +20,12 @@ extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]);
+
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
         printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
@@ -78,6 +84,7 @@ int test_wire_pubkey_only_factory(void) {
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xAA;
     unsigned char fake_spk[34] = {0x51, 0x20};
+    factory_compute_funding_spk(f_ref, fake_spk);
     factory_set_funding(f_ref, fake_txid, 0, 10000000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f_ref), "ref build tree");
 
@@ -933,6 +940,7 @@ int test_basepoint_independence(void) {
     xonly = ka.agg_pubkey;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &xonly);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     factory_build_tree(f);
 
@@ -1010,8 +1018,10 @@ static int run_creation_until_client_error(secp256k1_context *ctx, lsp_t *lsp,
     if (sent) {
         unsigned char txid[32], spk[34];
         memset(txid, 0xAB, sizeof(txid));
-        spk[0] = 0x51; spk[1] = 0x20;
-        memset(spk + 2, 0xCD, 32);
+        secp256k1_pubkey pks[1 + CREATION_TEST_CLIENTS];
+        pks[0] = lsp->lsp_pubkey;
+        for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++) pks[c + 1] = lsp->client_pubkeys[c];
+        if (!test_funding_spk_from_pubkeys(ctx, pks, 1 + CREATION_TEST_CLIENTS, spk)) return 0;
         rc = lsp_run_factory_creation(lsp, txid, 0, 100000, spk, sizeof(spk),
                                       10, 4, 2000000 /* CLTV: a distribution TX is required */);
     }

@@ -820,6 +820,7 @@ def collect_factory_config(cfg):
                 "demo": flag_present("--demo"),
                 "cli": flag_present("--cli"),
                 "jit_experimental": flag_present("--enable-jit-experimental"),
+                "rotation_experimental": flag_present("--enable-rotation-experimental"),
                 "onion": flag_present("--onion"),
                 "tor_only": flag_present("--tor-only"),
                 "i_accept_risk": flag_present("--i-accept-the-risk"),

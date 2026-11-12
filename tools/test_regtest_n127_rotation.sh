@@ -94,7 +94,7 @@ nohup "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
     --wallet "$WALLET" --db "$LSP_DB" \
-    --daemon --async-rotation \
+    --daemon --enable-rotation-experimental --async-rotation \
     > "$LSP_LOG" 2>&1 &
 LSP_PID=$!
 info "LSP pid=$LSP_PID (daemon + --async-rotation), waiting for listen..."
