@@ -14,6 +14,15 @@
 #include <secp256k1.h>
 #include <sqlite3.h>
 
+/* Little-endian reads from the input.  The input buffer has no alignment,
+   so it is never read through a cast to a wider type. */
+static uint64_t rd_le(const uint8_t *p, size_t n) {
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++)
+        v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 32) return 0;
 
@@ -35,12 +44,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (sqlite3_prepare_v2(p.db, sql, -1, &stmt, NULL) == SQLITE_OK) {
             /* Derive values from fuzz input */
             int n_part = (size >= 1) ? (data[0] % 20) : 2;
-            uint32_t vout = (size >= 5) ? *(uint32_t *)(data + 1) : 0;
-            int64_t amount = (size >= 13) ? *(int64_t *)(data + 5) : 0;
-            int step = (size >= 15) ? *(uint16_t *)(data + 13) : 6;
-            int states = (size >= 19) ? *(uint32_t *)(data + 15) : 4;
-            int cltv = (size >= 23) ? *(uint32_t *)(data + 19) : 1000;
-            int64_t fee = (size >= 31) ? *(int64_t *)(data + 23) : 300;
+            uint32_t vout = (size >= 5) ? (uint32_t)rd_le(data + 1, 4) : 0;
+            int64_t amount = (size >= 13) ? (int64_t)rd_le(data + 5, 8) : 0;
+            int step = (size >= 15) ? (int)(uint16_t)rd_le(data + 13, 2) : 6;
+            int states = (size >= 19) ? (int)(uint32_t)rd_le(data + 15, 4) : 4;
+            int cltv = (size >= 23) ? (int)(uint32_t)rd_le(data + 19, 4) : 1000;
+            int64_t fee = (size >= 31) ? (int64_t)rd_le(data + 23, 8) : 300;
             int arity = (size >= 32) ? (data[31] % 3) : 2;
 
             /* Create a hex txid from remaining data */
