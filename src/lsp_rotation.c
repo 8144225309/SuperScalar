@@ -481,7 +481,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
            disconnected and its reconnects are refused).  Without its key
            turnover the rotation is partial, so the dying factory is not
            cooperatively closed; its force-close or expiry is the way out for
-           that client's old channel, which the LSP stops tracking here. */
+           that client's old channel. */
         if (ci < mgr->n_channels && lsp_channels_client_failed(mgr, ci)) {
             printf("LSP rotate: client %zu has a failed channel, leaving it "
                    "out of the new factory\n", ci);
