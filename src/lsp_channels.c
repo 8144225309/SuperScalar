@@ -6709,6 +6709,15 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* Factory rotation moved to lsp_rotation.c */
 
+/* nLockTime of a serialized transaction: its last four bytes, little-endian.
+   0 for a buffer too short to hold one. */
+static uint32_t lsp_dist_tx_locktime(const tx_buf_t *tx) {
+    if (!tx || !tx->data || tx->len < 4) return 0;
+    const unsigned char *p = tx->data + tx->len - 4;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
                                   const char *line,
                                   volatile sig_atomic_t *shutdown_flag) {
@@ -7430,24 +7439,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         lf->factory.dying_blocks,
                                         lf->partial_rotation_done);
                                 }
-                                /* Auto-broadcast distribution TX on EXPIRED */
-                                if (lf->cached_state == FACTORY_EXPIRED &&
-                                    lf->distribution_tx.len > 0 &&
-                                    mgr->chain_be) {
-                                    chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
-                                    char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
-                                    if (dhex) {
-                                        extern void hex_encode(const unsigned char *,
-                                                               size_t, char *);
-                                        hex_encode(lf->distribution_tx.data,
-                                                   lf->distribution_tx.len, dhex);
-                                        char dtxid[65];
-                                        if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                            printf("LSP: distribution TX broadcast: %s\n",
-                                                   dtxid);
-                                        free(dhex);
-                                    }
-                                }
+                                /* The distribution TX of an EXPIRED factory is
+                                   broadcast once its nLockTime is reached (below,
+                                   on every tick). */
 
                                 /* Async rotation: handle EXPIRED with partial ready set.
                                    DYING → EXPIRED means the window closed; rotate
@@ -7477,7 +7471,7 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    started.  The factory keeps serving its
                                    channels until it expires; after that the
                                    members' own exits and the distribution TX
-                                   (broadcast above at EXPIRED) apply. */
+                                   (broadcast at its nLockTime, below) apply. */
                                 if (!mgr->rot_auto_rotate &&
                                     lf->cached_state == FACTORY_DYING) {
                                     printf("LSP: factory %u DYING — not rotating: rotation "
@@ -7491,12 +7485,18 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                     fflush(stdout);
                                 } else if (!mgr->rot_auto_rotate &&
                                            lf->cached_state == FACTORY_EXPIRED) {
-                                    printf("LSP: factory %u EXPIRED — not rotating: rotation "
-                                           "is disabled; distribution TX %s\n",
-                                           lf->factory_id,
-                                           lf->distribution_tx.len > 0 ?
-                                               "broadcast attempted" :
-                                               "not held by this LSP process");
+                                    if (lf->distribution_tx.len > 0)
+                                        printf("LSP: factory %u EXPIRED — not rotating: "
+                                               "rotation is disabled; the distribution TX "
+                                               "is broadcast at its nLockTime (block %u)\n",
+                                               lf->factory_id,
+                                               lsp_dist_tx_locktime(&lf->distribution_tx));
+                                    else
+                                        printf("LSP: factory %u EXPIRED — not rotating: "
+                                               "rotation is disabled; this LSP process holds "
+                                               "no signed distribution TX (members hold "
+                                               "their own co-signed copy)\n",
+                                               lf->factory_id);
                                     fflush(stdout);
                                 }
 
@@ -7589,6 +7589,63 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            /* Distribution TX: an EXPIRED factory's co-signed
+                               nLockTime fallback pays every member.  It cannot
+                               be relayed before its nLockTime (the factory CLTV,
+                               after EXPIRED), so it is broadcast on the first
+                               tick at or past that height; a failed attempt is
+                               retried at the next block. */
+                            if (lf->cached_state == FACTORY_EXPIRED &&
+                                lf->distribution_tx.len > 0 &&
+                                !lf->dist_tx_broadcast &&
+                                !lf->partial_rotation_done &&   /* closed by rotation */
+                                mgr->chain_be &&
+                                (uint32_t)height >=
+                                    lsp_dist_tx_locktime(&lf->distribution_tx) &&
+                                (uint32_t)height != lf->dist_tx_tried_height) {
+                                chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
+                                lf->dist_tx_tried_height = (uint32_t)height;
+                                char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
+                                if (dhex) {
+                                    extern void hex_encode(const unsigned char *,
+                                                           size_t, char *);
+                                    hex_encode(lf->distribution_tx.data,
+                                               lf->distribution_tx.len, dhex);
+                                    char dtxid[65];
+                                    if (_cb->send_raw_tx(_cb, dhex, dtxid)) {
+                                        lf->dist_tx_broadcast = 1;
+                                        printf("LSP: distribution TX broadcast: %s "
+                                               "(factory %u)\n", dtxid, lf->factory_id);
+                                    } else {
+                                        /* Spent funding (a member exited, or
+                                           broadcast this same TX first): there
+                                           is nothing left to broadcast. */
+                                        int unspent = -1;
+                                        if (_cb->is_outpoint_unspent) {
+                                            char fdisp[65];
+                                            for (int bi = 0; bi < 32; bi++)
+                                                snprintf(fdisp + bi * 2, 3, "%02x",
+                                                         lf->factory.funding_txid[31 - bi]);
+                                            unspent = _cb->is_outpoint_unspent(
+                                                _cb, fdisp, lf->factory.funding_vout);
+                                        }
+                                        if (unspent == 0) {
+                                            lf->dist_tx_broadcast = 1;
+                                            printf("LSP: factory %u funding output is already "
+                                                   "spent; its distribution TX is not "
+                                                   "broadcast\n", lf->factory_id);
+                                        } else {
+                                            fprintf(stderr, "LSP: distribution TX of factory "
+                                                    "%u not accepted at height %d (retrying "
+                                                    "at the next block)\n",
+                                                    lf->factory_id, height);
+                                        }
+                                    }
+                                    fflush(stdout);
+                                    free(dhex);
                                 }
                             }
 

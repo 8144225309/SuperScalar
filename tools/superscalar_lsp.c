@@ -4235,16 +4235,18 @@ accept_new_factory:
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
-        /* Copy signed distribution TX from ceremony (if available) */
+        /* Copy the co-signed distribution TX from the ceremony, as rotation
+           does for the factories it creates.  The unsigned one cannot be
+           relayed; without a signed copy the LSP broadcasts nothing (every
+           member holds its own co-signed copy). */
         tx_buf_init(&lf->distribution_tx, 256);
-        if (lsp_p->factory.dist_tx_ready && lsp_p->factory.dist_unsigned_tx.len > 0) {
-            /* dist_unsigned_tx holds the signed version after ceremony */
+        if (lsp_p->factory.dist_tx_ready == 2 && lsp_p->factory.dist_signed_tx.len > 0) {
             tx_buf_free(&lf->distribution_tx);
-            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_unsigned_tx.len);
-            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_unsigned_tx.data,
-                   lsp_p->factory.dist_unsigned_tx.len);
-            lf->distribution_tx.len = lsp_p->factory.dist_unsigned_tx.len;
-            printf("LSP: distribution TX stored (%zu bytes)\n",
+            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_signed_tx.len);
+            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_signed_tx.data,
+                   lsp_p->factory.dist_signed_tx.len);
+            lf->distribution_tx.len = lsp_p->factory.dist_signed_tx.len;
+            printf("LSP: signed distribution TX stored (%zu bytes)\n",
                    lf->distribution_tx.len);
         }
         lad->n_factories = 1;
