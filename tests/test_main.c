@@ -2074,6 +2074,19 @@ extern int test_ps_refusal_conflicting_record_refuses(void);
 extern int test_ps_refusal_same_sighash_record_is_idempotent(void);
 extern int test_ps_refusal_concurrent_record_race_one_signature(void);
 extern int test_ps_refusal_crash_drill_restart_semantics(void);
+extern int test_ps_subfactory_refusal_conflicting_reproposal_refused(void);
+extern int test_ps_subfactory_refusal_identical_retry_after_crash_is_idempotent(void);
+extern int test_ps_subfactory_refusal_check_error_refuses(void);
+extern int test_ps_subfactory_refusal_save_error_aborts_before_final(void);
+extern int test_ps_subfactory_refusal_sighash_failure_refuses(void);
+extern int test_ps_subfactory_refusal_record_race_one_signature(void);
+extern int test_ps_subfactory_refusal_partial_record_blocks_conflict(void);
+extern int test_ps_subfactory_refusal_crash_drill_restart_semantics(void);
+extern int test_ps_subfactory_refusal_input_count_must_match(void);
+extern int test_ps_subfactory_refusal_sub_node_mismatch_refused(void);
+extern int test_ps_subfactory_refusal_second_advance(void);
+extern int test_ps_subfactory_refusal_hashlock_honest_poison_verifies(void);
+extern int test_ps_subfactory_refusal_hashlock_save_error_sends_no_poison(void);
 extern int test_sweep_persist_roundtrip(void);
 
 /* Mainnet Audit: Shell Injection Fix */
@@ -4184,6 +4197,19 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ps_refusal_same_sighash_record_is_idempotent);
     RUN_TEST(test_ps_refusal_concurrent_record_race_one_signature);
     RUN_TEST(test_ps_refusal_crash_drill_restart_semantics);
+    RUN_TEST(test_ps_subfactory_refusal_conflicting_reproposal_refused);
+    RUN_TEST(test_ps_subfactory_refusal_identical_retry_after_crash_is_idempotent);
+    RUN_TEST(test_ps_subfactory_refusal_check_error_refuses);
+    RUN_TEST(test_ps_subfactory_refusal_save_error_aborts_before_final);
+    RUN_TEST(test_ps_subfactory_refusal_sighash_failure_refuses);
+    RUN_TEST(test_ps_subfactory_refusal_record_race_one_signature);
+    RUN_TEST(test_ps_subfactory_refusal_partial_record_blocks_conflict);
+    RUN_TEST(test_ps_subfactory_refusal_crash_drill_restart_semantics);
+    RUN_TEST(test_ps_subfactory_refusal_input_count_must_match);
+    RUN_TEST(test_ps_subfactory_refusal_sub_node_mismatch_refused);
+    RUN_TEST(test_ps_subfactory_refusal_second_advance);
+    RUN_TEST(test_ps_subfactory_refusal_hashlock_honest_poison_verifies);
+    RUN_TEST(test_ps_subfactory_refusal_hashlock_save_error_sends_no_poison);
     RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");

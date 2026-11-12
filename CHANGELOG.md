@@ -149,6 +149,13 @@ Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a
 - The client now honours `SUPERSCALAR_CRASH_AT` at three checkpoints on this path: `ps_record_pre_save`, `ps_record_post_save`, `ps_record_post_final`. Operator-set and inert when unset; an empty value aborts at every checkpoint.
 - Tests in `tests/test_ps_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Record-and-refuse: ordering and failure semantics".
 
+### Pseudo-Spilman sub-factory chain advances: record-and-refuse per input
+
+- The client now records and refuses on PS sub-factory chain advances. A sub-factory chain[N+1] spends every output of chain[N] and the LSP picks `channel_idx` and `delta_sats`, but both client paths sent `MSG_SUBFACTORY_CLIENT_FINAL_PSIGS` with no record, so once the client was back at chain[N] the LSP could get a second, conflicting chain[N+1] co-signed.
+- Each input the client signs is now checked against `client_ps_signed_inputs` before any nonce and recorded (one row per input, the leaf's fail-closed rules) before the partial sigs are sent: a different spend of a recorded outpoint is refused, the identical retry is idempotent, and a failure on any input aborts with nothing sent.
+- A `PROPOSE_INTENT` whose `n_inputs` is not the chain tx's input count, or whose `subfactory_id` is not the sub-factory that `(leaf_side, sub_idx)` names, is refused before any local change. The single-input sub-factory ceremony, which signed, with no record, a message that is not the sighash of any input of the chain tx, is removed.
+- New client crash checkpoints `ps_sub_record_pre_save`, `ps_sub_record_post_save`, `ps_sub_record_post_final`. Tests in `tests/test_ps_subfactory_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Sub-factory chain advances: per-input record".
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.

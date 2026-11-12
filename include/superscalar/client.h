@@ -606,7 +606,22 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
    every co-signer of the sub-factory must participate.  Drives the
    wire ceremony: parses PROPOSE → applies chain advance locally →
    sends NONCE → waits for ALL_NONCES → finalizes session → sends
-   PSIG → waits for DONE.  Returns 1 on success, 0 on any failure. */
+   PSIG → waits for DONE.  Returns 1 on success, 0 on any failure.
+
+   PS double-spend defense (record-and-refuse, per input): chain[N+1]
+   spends every output of chain[N] and is not revocable, and the LSP
+   picks channel_idx and delta_sats.  A PROPOSE_INTENT whose n_inputs is
+   not the number of chain[N] outputs, or whose subfactory_id is not the
+   sub-factory that (leaf_side, sub_idx) names, is refused.  With
+   client_set_persist() set, for every input this client signs the
+   handler computes the BIP-341 sighash and consults
+   client_ps_signed_inputs BEFORE any nonce (error -> refuse; a recorded
+   DIFFERENT spend of that (txid, vout) -> refuse; the same sighash ->
+   idempotent retry), binds each sighash to the session message it signs,
+   and INSERTs one row per signed input BEFORE
+   MSG_SUBFACTORY_CLIENT_FINAL_PSIGS is sent.  If any insert fails or
+   loses to a conflicting record, the ceremony aborts and nothing is sent.
+   Rules: docs/pseudo-spilman.md, "Record-and-refuse". */
 int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const secp256k1_keypair *keypair,
                                        factory_t *factory,
