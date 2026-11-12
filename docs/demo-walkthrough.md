@@ -298,7 +298,6 @@ These flags run after the `--demo` payment sequence to demonstrate specific prot
 |------|---------------|
 | `--breach-test` | LSP broadcasts a revoked commitment, its own watchtower detects and penalizes |
 | `--cheat-daemon` | LSP broadcasts a revoked commitment and sleeps — clients must detect it |
-| `--test-expiry` | Mines past CLTV timeout, LSP recovers funds via timeout script path |
 | `--test-distrib` | Broadcasts the pre-signed distribution TX (nLockTime fallback for clients) |
 | `--test-turnover` | PTLC key turnover via adaptor signatures, LSP closes alone afterward |
 | `--test-rotation` | Full factory rotation: PTLC turnover + close + new factory + payments |

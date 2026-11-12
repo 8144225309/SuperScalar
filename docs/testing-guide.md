@@ -443,7 +443,6 @@ python3 tools/manual_tests.py help
 | `demo` | Basic --demo: factory + 4 payments + cooperative close |
 | `rotation` | --test-rotation: full PTLC turnover + factory rotation |
 | `force_close` | --force-close: broadcast full DW tree on-chain |
-| `expiry` | --test-expiry: mine past CLTV, recover via timeout |
 | `distrib` | --test-distrib: broadcast pre-signed distribution TX |
 | `turnover` | --test-turnover: PTLC key turnover for all clients |
 | `breach` | --breach-test: broadcast revoked commitment + watchtower |

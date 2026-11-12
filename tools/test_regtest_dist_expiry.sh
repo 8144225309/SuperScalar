@@ -9,7 +9,9 @@
 # API served from a local file, so the test can raise its rate mid-run.
 #
 #   1. LSP + N clients build a factory with a short lifetime; the clients
-#      then go away (no rotation can happen).
+#      then go away (no rotation can happen).  The LSP runs with
+#      --no-force-exit: it lets the distribution TX pay the members instead of
+#      pushing them on chain before the end date.
 #   2. The factory expires before its CLTV: the LSP holds the distribution
 #      TX until its nLockTime.  The LSP is killed and restarted from its DB:
 #      it still knows the factory expired and has the distribution TX, and
@@ -84,7 +86,7 @@ PIDS+=($!); sleep 1
 FUNDING_RATE=$((BLOCKMIN + 5000))
 LSP_ARGS=(--network regtest --port $PORT --daemon --clients $N_CLIENTS --arity 2 --amount $AMOUNT
     --fee-rate $FUNDING_RATE --confirm-timeout 600 --step-blocks 2 --states-per-layer 2
-    --active-blocks 20 --dying-blocks 10 --tree-fee-rate 100
+    --active-blocks 20 --dying-blocks 10 --tree-fee-rate 100 --no-force-exit
     --fee-estimator "api:http://127.0.0.1:$API_PORT/fees.json"
     --seckey "$LSP_SECKEY" --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT"
     --wallet "$WALLET" --db "$TMPDIR/lsp.db")

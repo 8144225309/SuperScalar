@@ -554,6 +554,8 @@ class Checker:
                 them = "member:%d" % slot if db.role == "lsp" else "lsp"
                 for c in self.counterparty_commitments(db, int(ch.get("id") or 0)):
                     self.owner.setdefault(c["to_remote"], me)
+                    for tl in c["to_local"]:   # delayed, revocable by `me`
+                        self.owner.setdefault(tl, them + " (to_local)")
                 if db.role == "member":
                     mi = self.member_info(db)
                     if mi and mi[1] and len(mi[1]["vout"]) > 1:
@@ -826,6 +828,8 @@ class Checker:
             elif dist and self.chain.confirmed(dist["txid"]):
                 rec["exit"] = "distribution TX %s" % dist["txid"]
                 self._check_dist_outcome(db, ch, dist, rec)
+            elif self._payout_exit(db) and self._payout_exit(db)[0] == "confirmed":
+                rec["exit"] = "end-date payout %s" % self._payout_exit(db)[1]
             else:
                 f = self._factory_spender(db)
                 if f and f not in self.stored:
@@ -835,6 +839,31 @@ class Checker:
                 else:
                     rec["exit"] = None
         self.report["balances"] = out
+
+    def _payouts(self, db):
+        out = []
+        if "factory_payouts" not in db.tables:
+            return out
+        for r in db.dicts("factory_payouts"):
+            try:
+                out.append(parse_tx(_txt(r["signed_tx_hex"])))
+            except ValueError:
+                continue
+        return out
+
+    def _payout_exit(self, db):
+        """('confirmed', txid) when one of the member's end-date payouts is
+        on chain, ('open', txid) when one spends an on-chain unspent output,
+        else None."""
+        alt = None
+        for t in self._payouts(db):
+            if self.chain.confirmed(t["txid"]):
+                return ("confirmed", t["txid"])
+            fin = t["vin"][0]
+            if (self.chain.output(fin[0], fin[1]) and self.chain.confirmed(fin[0]) and
+                    not self.chain.spender.get((fin[0], fin[1]))):
+                alt = ("open", "%s (nLockTime %d)" % (t["txid"], t["locktime"]))
+        return alt
 
     def _dist(self, db):
         for r in db.dicts("distribution_txs"):
@@ -895,7 +924,11 @@ class Checker:
                     return  # the revocation check covers it
                 got = next(o[0] for o in ctx["vout"] if o[1] == c["to_remote"])
                 lsp_local = remote
-                _, exp = self._expected_pair(lsp_local, local, local > ANCHOR_VALUE + DUST, has_anchor)
+                # the funder (the LSP) funds the anchor from its to_local;
+                # only when that is too small does the member's output
+                exp = local
+                if has_anchor and not lsp_local > ANCHOR_VALUE + DUST:
+                    exp = local - ANCHOR_VALUE
                 rec["to_remote"] = got
                 if got != exp:
                     self.violate("balances", "%s: the LSP's commitment %s pays the member %d, its DB "
@@ -1014,6 +1047,10 @@ class Checker:
             if dist and self.chain.confirmed(dist["txid"]):
                 rec["status"] = "exited (distribution TX)"
                 continue
+            pe = self._payout_exit(db)
+            if pe and pe[0] == "confirmed":
+                rec["status"] = "exited (end-date payout %s)" % pe[1]
+                continue
             fs = self._factory_spender(db)
             if fs and fs not in self.stored:
                 rec["status"] = "exited (factory closed by %s)" % fs
@@ -1039,6 +1076,8 @@ class Checker:
                 if (self.chain.output(fin[0], fin[1]) and self.chain.confirmed(fin[0]) and
                         not self.chain.spender.get((fin[0], fin[1]))):
                     alt = "distribution TX %s (nLockTime %d)" % (dist["txid"], dist["locktime"])
+            if not alt and pe:
+                alt = "end-date payout %s" % pe[1]
             if alt:
                 rec["status"] = "can exit with the %s" % alt
                 rec["commitment_path"] = problems
