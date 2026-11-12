@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -4402,11 +4404,13 @@ int test_conservation_with_real_htlc(void) {
  *      parent_txid=T0, parent_vout=0). This simulates "client has already
  *      co-signed one TX spending T0:0."
  *   3. client_set_persist(&db) wires the defense.
- *   4. Build a wire_msg_t PROPOSE for leaf_side=0 with any valid LSP
- *      pubnonce, invoke client_handle_leaf_advance on a writable fd that
- *      nothing reads from.
- *   5. Assert return value == 0 (refuse). The function bails before any
- *      PSIG is written to fd, so the fd side is moot.
+ *   4. Build a wire_msg_t PROPOSE for leaf_side=0 in the stateless shape
+ *      (no nonce field -- the only shape the handler accepts), invoke
+ *      client_handle_leaf_advance on a writable fd that nothing reads from.
+ *   5. Assert return value == 0 (refuse) AND that nothing reached the fd:
+ *      the refusal must come before CLIENT_PUBNONCE.  rc == 0 alone would
+ *      also hold without the defense, because the handler then fails on
+ *      wire_recv from the pipe's write end.
  */
 int test_client_ps_double_spend_defense_refuses(void) {
     secp256k1_context *ctx = secp256k1_context_create(
@@ -4446,6 +4450,8 @@ int test_client_ps_double_spend_defense_refuses(void) {
 
     factory_t *f = calloc(1, sizeof(factory_t));
     TEST_ASSERT(f, "alloc factory");
+    /* factory_init zeroes *f and allocates its own arrays; no
+       factory_alloc_default_arrays first (that allocation would leak). */
     factory_init(f, ctx, kps, N, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
     factory_set_funding(f, fake_fund_txid, 0, 500000, fund_spk, 34);
@@ -4459,9 +4465,10 @@ int test_client_ps_double_spend_defense_refuses(void) {
     memcpy(expected_parent_txid, f->nodes[leaf_idx].txid, 32);
 
     /* Open an in-memory persist and pre-seed a signed_input row for
-       (parent_txid=expected_parent_txid, parent_vout=0). Dummy sighash /
-       partial_sig — the check only uses the (parent_txid, parent_vout)
-       key, not the stored sighash. */
+       (parent_txid=expected_parent_txid, parent_vout=0) whose sighash is
+       NOT the sighash of the proposed spend: a conflicting prior signing,
+       which the handler must refuse.  (An identical sighash would be an
+       idempotent retry -- tests/test_ps_refusal.c covers that side.) */
     persist_t db;
     TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory persist");
     unsigned char dummy_sighash[32], dummy_psig[36];
@@ -4479,29 +4486,18 @@ int test_client_ps_double_spend_defense_refuses(void) {
        set it so the proposal reaches the double-spend check. */
     client_set_allow_tree_advance(1);
 
-    /* Build a valid LEAF_ADVANCE_PROPOSE from the LSP (index 0) so the
-       handler can parse it and proceed far enough to hit our check. */
-    unsigned char lsp_seckey[32];
-    TEST_ASSERT(secp256k1_keypair_sec(ctx, lsp_seckey, &kps[0]), "lsp seckey");
-    secp256k1_pubkey lsp_pub;
-    secp256k1_keypair_pub(ctx, &lsp_pub, &kps[0]);
-    secp256k1_musig_secnonce lsp_secnonce;
-    secp256k1_musig_pubnonce lsp_pubnonce;
-    TEST_ASSERT(musig_generate_nonce(ctx, &lsp_secnonce, &lsp_pubnonce,
-                                       lsp_seckey, &lsp_pub, NULL),
-                "lsp nonce");
-    memset(lsp_seckey, 0, 32);
-    unsigned char lsp_pubnonce_ser[66];
-    musig_pubnonce_serialize(ctx, lsp_pubnonce_ser, &lsp_pubnonce);
-    cJSON *propose_json = wire_build_leaf_advance_propose(0, lsp_pubnonce_ser, NULL);
+    /* LEAF_ADVANCE_PROPOSE in the stateless shape (no nonce field), the only
+       shape the handler accepts: with a pubnonce present it refuses as
+       "PROPOSE not in stateless shape" before ever reaching the check. */
+    cJSON *propose_json = wire_build_leaf_advance_propose(0, NULL, NULL);
     TEST_ASSERT(propose_json != NULL, "build PROPOSE json");
     wire_msg_t propose = {0};
     propose.msg_type = 0x58;  /* MSG_LEAF_ADVANCE_PROPOSE — unused after
                                   wire_parse consumes the json */
     propose.json = propose_json;
 
-    /* Pipe as the output fd — nothing will be written on the refuse path,
-       but we pass a valid fd in case the function starts to. */
+    /* Pipe as the output fd: on the refuse path nothing may be written to
+       it (checked below). */
     int pipefd[2];
     TEST_ASSERT(pipe(pipefd) == 0, "pipe");
 
@@ -4510,6 +4506,12 @@ int test_client_ps_double_spend_defense_refuses(void) {
                                           /*my_index=*/1, &propose);
 
     TEST_ASSERT(rc == 0, "handler REFUSES when parent already signed");
+    /* ... and it refused BEFORE any nonce: nothing was written for the LSP. */
+    TEST_ASSERT(fcntl(pipefd[0], F_SETFL, O_NONBLOCK) == 0, "pipe nonblocking");
+    unsigned char probe;
+    ssize_t nread = read(pipefd[0], &probe, 1);
+    TEST_ASSERT(nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                "nothing written to the LSP side (refused before CLIENT_PUBNONCE)");
 
     /* Cleanup — reset the global persist hook. */
     client_set_allow_tree_advance(0);

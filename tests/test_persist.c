@@ -3948,10 +3948,69 @@ int test_persist_ps_signed_input_roundtrip(void) {
                                        parent_txid, 0, NULL),
         0, "different factory_id: separate namespace");
 
-    /* The attack-shaped second-save with DIFFERENT sighash is allowed
-       at the persist layer (INSERT OR REPLACE), but the check step
-       prevents reaching it — callers MUST consult the check first. */
+    /* The attack-shaped second save with a DIFFERENT sighash is refused at
+       the persist layer as well (plain INSERT, the first record wins) --
+       test_persist_ps_signed_input_arbiter below. */
     (void)psig_b; (void)sighash_b;
+
+    persist_close(&db);
+    return 1;
+}
+
+/* Record-and-refuse arbiter + error semantics at the persist layer:
+   - re-saving the identical record is idempotent (PS_SAVE_RECORDED),
+   - a different sighash for the same parent is a conflict (PS_SAVE_CONFLICT)
+     and the first record is left untouched (plain INSERT, never OR REPLACE),
+   - an injected lookup / insert failure surfaces as the ERROR code, never as
+     "not found" / "recorded". */
+static int ps_arbiter_fail_point = 0;
+static int ps_arbiter_hook(int point, void *user) {
+    (void)user;
+    return point == ps_arbiter_fail_point;
+}
+
+int test_persist_ps_signed_input_arbiter(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    unsigned char parent[32], sighash_a[32], sighash_b[32], psig_a[36], psig_b[36], out[32];
+    memset(parent, 0xAA, 32);
+    memset(sighash_a, 0xA1, 32);
+    memset(sighash_b, 0xB2, 32);
+    memset(psig_a, 0x01, 36);
+    memset(psig_b, 0x02, 36);
+
+    TEST_ASSERT_EQ(persist_save_ps_signed_input(&db, 0, 3, parent, 0, sighash_a, psig_a),
+                   PS_SAVE_RECORDED, "first record");
+    TEST_ASSERT_EQ(persist_save_ps_signed_input(&db, 0, 3, parent, 0, sighash_a, psig_b),
+                   PS_SAVE_RECORDED, "identical sighash again: idempotent");
+    TEST_ASSERT_EQ(persist_save_ps_signed_input(&db, 0, 3, parent, 0, sighash_b, psig_b),
+                   PS_SAVE_CONFLICT, "different sighash for the same parent: conflict");
+    TEST_ASSERT_EQ(persist_check_ps_signed_input(&db, 0, parent, 0, out),
+                   PS_SIGNED_INPUT_FOUND, "row still there");
+    TEST_ASSERT(memcmp(out, sighash_a, 32) == 0,
+                "the first record won and was not overwritten");
+
+    /* Injected failures must never read as "not found" / "recorded".  The
+       hook is installed around each call so a failing assertion cannot leave
+       it armed for later tests. */
+    ps_arbiter_fail_point = PERSIST_TEST_PS_CHECK;
+    persist_test_set_ps_hook(ps_arbiter_hook, NULL);
+    int chk = persist_check_ps_signed_input(&db, 0, parent, 0, NULL);
+    persist_test_set_ps_hook(NULL, NULL);
+    TEST_ASSERT_EQ(chk, PS_SIGNED_INPUT_ERROR, "check failure is an error, not not-found");
+
+    ps_arbiter_fail_point = PERSIST_TEST_PS_SAVE;
+    persist_test_set_ps_hook(ps_arbiter_hook, NULL);
+    int sav = persist_save_ps_signed_input(&db, 0, 3, parent, 1, sighash_a, psig_a);
+    persist_test_set_ps_hook(NULL, NULL);
+    TEST_ASSERT_EQ(sav, PS_SAVE_ERROR, "save failure is an error, not recorded");
+    ps_arbiter_fail_point = 0;
+
+    TEST_ASSERT_EQ(persist_check_ps_signed_input(&db, 0, parent, 1, NULL),
+                   PS_SIGNED_INPUT_NOT_FOUND, "the failed save left nothing behind");
+    TEST_ASSERT_EQ(persist_check_ps_signed_input(&db, 0, parent, 0, NULL),
+                   PS_SIGNED_INPUT_FOUND, "hook cleared: lookups work again");
 
     persist_close(&db);
     return 1;

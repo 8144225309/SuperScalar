@@ -1512,11 +1512,12 @@
                     }
 
                     /* === SF-A #142: SECOND advance — multi-input ceremony ===
-                       The first advance produced chain[1] which spends a single
-                       sales-stock UTXO (single-input).  Now drive a SECOND
-                       advance so chain[2] spends ALL k+1 outputs of chain[1]
-                       (k channels + sales-stock).  This is the multi-input
-                       MuSig case (#142 SF-A). */
+                       Every sub-factory chain advance is multi-input: the first
+                       one already produced a chain[1] that spends ALL k+1
+                       outputs of chain[0] (k channels + sales-stock).  Now
+                       drive a SECOND advance, so chain[2] spends all k+1
+                       outputs of chain[1] -- the same multi-input MuSig
+                       ceremony, from an already-advanced parent (#142 SF-A). */
                     if (sub_pass && test_subfactory_advance_multi) {
                         printf("\n--- SF-A: SECOND advance (multi-input ceremony) ---\n");
                         fflush(stdout);

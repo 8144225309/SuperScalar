@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -125,6 +126,11 @@ int lsp_accept_clients(lsp_t *lsp) {
     for (size_t k = 0; k < FACTORY_MAX_SIGNERS; k++) hello_slot_hints[k] = 0;
 
     for (size_t i = 0; i < lsp->expected_clients; i++) {
+        if (lsp->stop_flag && *lsp->stop_flag) {
+            fprintf(stderr, "LSP: stop requested while waiting for client %zu "
+                    "of %zu\n", i, lsp->expected_clients);
+            goto accept_fail;
+        }
         /* Timeout: wait for incoming connection with select() */
         if (lsp->accept_timeout_sec > 0) {
             fd_set rfds;
@@ -134,6 +140,7 @@ int lsp_accept_clients(lsp_t *lsp) {
             tv.tv_sec = lsp->accept_timeout_sec;
             tv.tv_usec = 0;
             int sel = select(lsp->listen_fd + 1, &rfds, NULL, NULL, &tv);
+            if (sel < 0 && errno == EINTR) { i--; continue; }
             if (sel <= 0) {
                 fprintf(stderr, "LSP: accept timeout waiting for client %zu (%ds)\n",
                         i, lsp->accept_timeout_sec);
@@ -142,6 +149,7 @@ int lsp_accept_clients(lsp_t *lsp) {
         }
 
         int fd = wire_accept(lsp->listen_fd);
+        if (fd < 0 && errno == EINTR) { i--; continue; }   /* stop_flag decides */
         if (fd < 0) {
             fprintf(stderr, "LSP: accept failed for client %zu\n", i);
             goto accept_fail;

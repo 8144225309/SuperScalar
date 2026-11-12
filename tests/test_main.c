@@ -1379,6 +1379,7 @@ extern int test_advanceless_shape_rule(void);
 extern int test_advanceless_default_tree(void);
 extern int test_advanceless_refuses_refresh(void);
 extern int test_advanceless_persist_reload(void);
+extern int test_persist_reload_verifies_signatures(void);
 extern int test_advanceless_reload_tree_rate(void);
 extern int test_tree_shape_dw_layers_deep(void);
 extern int test_tree_shape_static_leaf(void);
@@ -2055,6 +2056,7 @@ extern int test_b12_po1_payoffer_missing_offer(void);
 extern int test_wt_ptlc1_entry_fields(void);
 extern int test_wt_ptlc2_metadata_store(void);
 extern int test_persist_ps_signed_input_roundtrip(void);
+extern int test_persist_ps_signed_input_arbiter(void);
 extern int test_persist_ps_defense_persists_across_reopen(void);
 extern int test_persist_ps_defense_distinct_parent_txids(void);
 extern int test_persist_ps_defense_independent_inputs(void);
@@ -2069,6 +2071,26 @@ extern int test_payment_leaves_leaf_untouched_arity1(void);
 extern int test_forward_into_full_channel_fails_back(void);
 extern int test_client_refuses_tree_advances(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
+extern int test_ps_refusal_check_error_refuses(void);
+extern int test_ps_refusal_save_error_aborts_before_final(void);
+extern int test_ps_refusal_sighash_failure_aborts(void);
+extern int test_ps_refusal_conflicting_record_refuses(void);
+extern int test_ps_refusal_same_sighash_record_is_idempotent(void);
+extern int test_ps_refusal_concurrent_record_race_one_signature(void);
+extern int test_ps_refusal_crash_drill_restart_semantics(void);
+extern int test_ps_subfactory_refusal_conflicting_reproposal_refused(void);
+extern int test_ps_subfactory_refusal_identical_retry_after_crash_is_idempotent(void);
+extern int test_ps_subfactory_refusal_check_error_refuses(void);
+extern int test_ps_subfactory_refusal_save_error_aborts_before_final(void);
+extern int test_ps_subfactory_refusal_sighash_failure_refuses(void);
+extern int test_ps_subfactory_refusal_record_race_one_signature(void);
+extern int test_ps_subfactory_refusal_partial_record_blocks_conflict(void);
+extern int test_ps_subfactory_refusal_crash_drill_restart_semantics(void);
+extern int test_ps_subfactory_refusal_input_count_must_match(void);
+extern int test_ps_subfactory_refusal_sub_node_mismatch_refused(void);
+extern int test_ps_subfactory_refusal_second_advance(void);
+extern int test_ps_subfactory_refusal_hashlock_honest_poison_verifies(void);
+extern int test_ps_subfactory_refusal_hashlock_save_error_sends_no_poison(void);
 extern int test_sweep_persist_roundtrip(void);
 
 /* Mainnet Audit: Shell Injection Fix */
@@ -2349,6 +2371,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_open_cb_wires);
     RUN_TEST(test_jit_open_cb_on_cost_covered);
     RUN_TEST(test_jit_open_cb_null_guard);
+    extern int test_jit_revalidate_rpc_outage_keeps_open(void);
+    extern int test_jit_force_close_rpc_outage_keeps_open(void);
+    RUN_TEST(test_jit_revalidate_rpc_outage_keeps_open);
+    RUN_TEST(test_jit_force_close_rpc_outage_keeps_open);
+    extern int test_regtest_conf_stops_at_first_unreachable(void);
+    extern int test_regtest_conf_conflicted_wallet_tx(void);
+    RUN_TEST(test_regtest_conf_stops_at_first_unreachable);
+    RUN_TEST(test_regtest_conf_conflicted_wallet_tx);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
@@ -3512,6 +3542,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_advanceless_default_tree);
     RUN_TEST(test_advanceless_refuses_refresh);
     RUN_TEST(test_advanceless_persist_reload);
+    RUN_TEST(test_persist_reload_verifies_signatures);
     RUN_TEST(test_advanceless_reload_tree_rate);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
@@ -4160,6 +4191,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wt_ptlc1_entry_fields);
     RUN_TEST(test_wt_ptlc2_metadata_store);
     RUN_TEST(test_persist_ps_signed_input_roundtrip);
+    RUN_TEST(test_persist_ps_signed_input_arbiter);
     RUN_TEST(test_persist_ps_defense_persists_across_reopen);
     RUN_TEST(test_persist_ps_defense_distinct_parent_txids);
     RUN_TEST(test_persist_ps_defense_independent_inputs);
@@ -4174,6 +4206,26 @@ static void run_unit_tests(void) {
     RUN_TEST(test_forward_into_full_channel_fails_back);
     RUN_TEST(test_client_refuses_tree_advances);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
+    RUN_TEST(test_ps_refusal_check_error_refuses);
+    RUN_TEST(test_ps_refusal_save_error_aborts_before_final);
+    RUN_TEST(test_ps_refusal_sighash_failure_aborts);
+    RUN_TEST(test_ps_refusal_conflicting_record_refuses);
+    RUN_TEST(test_ps_refusal_same_sighash_record_is_idempotent);
+    RUN_TEST(test_ps_refusal_concurrent_record_race_one_signature);
+    RUN_TEST(test_ps_refusal_crash_drill_restart_semantics);
+    RUN_TEST(test_ps_subfactory_refusal_conflicting_reproposal_refused);
+    RUN_TEST(test_ps_subfactory_refusal_identical_retry_after_crash_is_idempotent);
+    RUN_TEST(test_ps_subfactory_refusal_check_error_refuses);
+    RUN_TEST(test_ps_subfactory_refusal_save_error_aborts_before_final);
+    RUN_TEST(test_ps_subfactory_refusal_sighash_failure_refuses);
+    RUN_TEST(test_ps_subfactory_refusal_record_race_one_signature);
+    RUN_TEST(test_ps_subfactory_refusal_partial_record_blocks_conflict);
+    RUN_TEST(test_ps_subfactory_refusal_crash_drill_restart_semantics);
+    RUN_TEST(test_ps_subfactory_refusal_input_count_must_match);
+    RUN_TEST(test_ps_subfactory_refusal_sub_node_mismatch_refused);
+    RUN_TEST(test_ps_subfactory_refusal_second_advance);
+    RUN_TEST(test_ps_subfactory_refusal_hashlock_honest_poison_verifies);
+    RUN_TEST(test_ps_subfactory_refusal_hashlock_save_error_sends_no_poison);
     RUN_TEST(test_sweep_persist_roundtrip);
 
     printf("\n=== Mainnet Audit: Shell Injection Fix ===\n");
@@ -4341,6 +4393,29 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
     RUN_TEST(test_reorg_bip158_noop);
 
+    /* R1 reorg detector: tip read race + classification */
+    extern int test_reorg_tip_race_no_false_forward(void);
+    extern int test_reorg_classify_detects_real_reorgs(void);
+    extern int test_reorg_classify_unseen_block_reorg(void);
+    RUN_TEST(test_reorg_tip_race_no_false_forward);
+    RUN_TEST(test_reorg_classify_detects_real_reorgs);
+    RUN_TEST(test_reorg_classify_unseen_block_reorg);
+    extern int test_reorg_fork_height(void);
+    extern int test_reorg_subfactory_chain_kept_on_shallow_reorg(void);
+    RUN_TEST(test_reorg_fork_height);
+    RUN_TEST(test_reorg_subfactory_chain_kept_on_shallow_reorg);
+
+    /* R5 funding revalidation: re-check decision + restart reload */
+    extern int test_reorg_funding_recheck_due(void);
+    extern int test_reorg_funding_freeze_reloaded_on_restart(void);
+    RUN_TEST(test_reorg_funding_recheck_due);
+    RUN_TEST(test_reorg_funding_freeze_reloaded_on_restart);
+    extern int test_reorg_revalidate_rpc_outage_no_change(void);
+    RUN_TEST(test_reorg_revalidate_rpc_outage_no_change);
+    extern int test_persist_funding_anchor_reorg_tip(void);
+    RUN_TEST(test_persist_funding_anchor_reorg_tip);
+    extern int test_reorg_tip_persisted_detects_downtime_reorg(void);
+    RUN_TEST(test_reorg_tip_persisted_detects_downtime_reorg);
     printf("\n=== Client Signing Checks ===\n");
     extern int test_client_close_outputs_acceptable(void);
     extern int test_client_close_single_payout_output(void);
@@ -4530,6 +4605,24 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);
 
+    printf("\n=== Regtest Reorg Detection & Funding Revalidation ===\n");
+    {
+        extern int test_regtest_reorg_revalidate_factory_funding(void);
+        extern int test_regtest_reorg_tip_snapshot_consistent(void);
+        extern int test_regtest_reorg_unseen_tip_block_detected(void);
+        RUN_TEST(test_regtest_reorg_revalidate_factory_funding);
+        extern int test_regtest_reorg_revalidate_deep_funding(void);
+        RUN_TEST(test_regtest_reorg_revalidate_deep_funding);
+        extern int test_regtest_reorg_revalidate_anchor_race(void);
+        extern int test_regtest_reorg_revalidate_spent_funding_reorged_out(void);
+        extern int test_regtest_reorg_revalidate_conflicted_funding_no_anchor(void);
+        RUN_TEST(test_regtest_reorg_revalidate_anchor_race);
+        RUN_TEST(test_regtest_reorg_revalidate_spent_funding_reorged_out);
+        RUN_TEST(test_regtest_reorg_revalidate_conflicted_funding_no_anchor);
+        RUN_TEST(test_regtest_reorg_unseen_tip_block_detected);
+        /* Mines 300 blocks: keep it last so earlier tests keep subsidy. */
+        RUN_TEST(test_regtest_reorg_tip_snapshot_consistent);
+    }
     printf("\n=== Regtest Pre-signed TRUC Broadcast ===\n");
     RUN_TEST(test_regtest_recovery_waits_for_confirmed_parent);
     RUN_TEST(test_regtest_cpfp_parent_accepted_child_rejected);

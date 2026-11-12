@@ -97,9 +97,12 @@ int client_run_reconnect(secp256k1_context *ctx,
     factory_t *factory = calloc(1, sizeof(factory_t));
     if (!factory) return 0;
     if (!persist_load_factory(db, 0, factory, ctx)) {
-        fprintf(stderr, "Client reconnect: failed to load factory from DB\n");
+        /* Not a lost connection: a retry loads the same rows and is refused
+           the same way. */
+        fprintf(stderr, "Client reconnect: the stored factory was refused "
+                "(see above); refusing to run on it\n");
         free(factory);
-        return 0;
+        return CLIENT_RECONNECT_REFUSED;
     }
     /* SF-followup #145: register active factory for MSG_FUNDING_REORG reset
        (mirror of LSP-side #208). */
