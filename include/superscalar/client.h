@@ -59,6 +59,15 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
+/* Channel capacity terms checked before signing a factory: refuse unless the
+   member's own channel output is exactly expect_sats (0 = any) and at least
+   min_sats (0 = any).  The capacity is logged either way. */
+void client_set_capacity_terms(uint64_t expect_sats, uint64_t min_sats);
+
+/* Refuse a factory whose proposed opening split gives the LSP more than
+   pct percent of each channel (default 100 = any). */
+void client_set_max_lsp_balance_pct(uint16_t pct);
+
 /* This member's own ceiling on the factory's pre-signed tree rate (sat/kvB):
    a FACTORY_PROPOSE (creation or rotation) above it is refused, so an LSP
    cannot spend a member's channel on pre-signed fees.  Default
@@ -124,7 +133,10 @@ int client_dist_locktime_acceptable(const factory_t *f, uint32_t offered);
 /* Full capacity of member my_index's channel in f: its leaf output less the
    base commitment fee, i.e. the channel's two balances together at open.
    This is what the distribution transaction owes the member.  0 if the
-   member has no channel output in f. */
+   member has no channel output in f.  With member capacities
+   (factory_set_member_capacities) it is the member's capacity-rule payout
+   instead: its full capacity plus its share of its leaf's stock and of the
+   rest of the budget. */
 uint64_t client_member_channel_capacity(const factory_t *f, uint32_t my_index);
 
 /* Distribution payout check, shared by every place that accepts or relies on

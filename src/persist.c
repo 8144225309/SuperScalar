@@ -1442,6 +1442,22 @@ int persist_open(persist_t *p, const char *path) {
         for (size_t ci = 0; ci < 3; ci++)
             sqlite3_exec(p->db, lifecycle_cols[ci], NULL, NULL, NULL);
     }
+    /* v42: the per-member terms the tree is sized and scripted from:
+       member_capacities (comma list of sats, participants 1..N; NULL = the
+       split by tree shape), leaf_stock_sats (host stock per leaf with
+       capacities; 0 = default) and channel_scripts (comma list of
+       "participant:hex" caller channel output scripts; NULL = none).  A
+       reload rebuilds the tree from them and persist_check_rebuilt_tree
+       refuses a rebuild that is not the signed tree.  Version-gated (ALTER is
+       not idempotent). */
+    if (db_version < 42) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN member_capacities TEXT;"
+            "ALTER TABLE factories ADD COLUMN leaf_stock_sats INTEGER NOT NULL DEFAULT 0;"
+            "ALTER TABLE factories ADD COLUMN channel_scripts TEXT;",
+            NULL, NULL, NULL);
+    }
+
     /* Client copy of the signed leaf transaction its channel is funded by,
        kept when a leaf advance replaces that leaf in tree_nodes.  The
        client's commitments keep spending this transaction's output, so a
@@ -1670,6 +1686,88 @@ int persist_in_transaction(const persist_t *p) {
 
 /* --- Factory --- */
 
+/* v42 per-member terms as stored text: member capacities as a comma list
+   (participants 1..N), NULL when none are set; channel scripts as a comma
+   list of "participant:hex", NULL when none are set.  malloc'd. */
+static char *format_member_capacities(const factory_t *f) {
+    if (!f->member_capacity || f->n_participants < 2) return NULL;
+    size_t cap = (f->n_participants - 1) * 21 + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+    buf[0] = '\0';
+    for (size_t i = 1; i < f->n_participants; i++)
+        len += (size_t)snprintf(buf + len, cap - len, "%s%llu", i > 1 ? "," : "",
+                                (unsigned long long)f->member_capacity[i]);
+    return buf;
+}
+
+static char *format_channel_scripts(const factory_t *f) {
+    if (!f->chan_spks) return NULL;
+    size_t cap = f->n_participants * (11 + 68 + 1) + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+    int any = 0;
+    buf[0] = '\0';
+    for (size_t i = 1; i < f->n_participants && i < f->config.max_signers; i++) {
+        if (!f->chan_spks[i].set) continue;
+        char hex[69];
+        hex_encode(f->chan_spks[i].spk, 34, hex);
+        len += (size_t)snprintf(buf + len, cap - len, "%s%zu:%s", any ? "," : "", i, hex);
+        any = 1;
+    }
+    if (!any) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Apply stored v42 terms to f (after factory_init, before the build).
+   NULL texts leave the defaults.  Returns 0 on malformed text or terms the
+   factory refuses. */
+static int apply_stored_terms(factory_t *f, const char *caps_txt,
+                              uint64_t leaf_stock, const char *spks_txt) {
+    if (caps_txt) {
+        size_t n = f->n_participants - 1;
+        uint64_t *caps = calloc(n ? n : 1, sizeof(uint64_t));
+        if (!caps) return 0;
+        size_t k = 0;
+        const char *c = caps_txt;
+        int ok = 1;
+        while (ok && *c) {
+            char *end = NULL;
+            unsigned long long v = strtoull(c, &end, 10);
+            if (end == c || k >= n || (*end != ',' && *end != '\0')) { ok = 0; break; }
+            caps[k++] = (uint64_t)v;
+            c = (*end == ',') ? end + 1 : end;
+        }
+        ok = ok && k == n && factory_set_member_capacities(f, caps, n) &&
+             factory_set_leaf_stock(f, leaf_stock);
+        free(caps);
+        if (!ok) return 0;
+    } else if (leaf_stock != 0) {
+        return 0;   /* a stock without capacities was never written */
+    }
+    if (spks_txt) {
+        const char *c = spks_txt;
+        while (*c) {
+            char *end = NULL;
+            unsigned long idx = strtoul(c, &end, 10);
+            if (end == c || *end != ':') return 0;
+            const char *hx = end + 1;
+            if (strlen(hx) < 68 || (hx[68] != ',' && hx[68] != '\0')) return 0;
+            char one[69];
+            memcpy(one, hx, 68);
+            one[68] = '\0';
+            unsigned char spk[34];
+            if (hex_decode(one, spk, 34) != 34 ||
+                !factory_set_leaf_channel_spk(f, (uint32_t)idx, spk, 34))
+                return 0;
+            c = hx[68] == ',' ? hx + 69 : hx + 68;
+        }
+    }
+    return 1;
+}
+
 int persist_save_factory(persist_t *p, const factory_t *f,
                           secp256k1_context *ctx, uint32_t factory_id) {
     if (!p || !p->db || !f || !ctx) return 0;
@@ -1696,8 +1794,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
         " use_hashlock_poison, level_arity, static_threshold_depth, "
         " ps_subfactory_arity, placement_mode, tree_fee_rate, created_block, "
-        " active_blocks, dying_blocks) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " active_blocks, dying_blocks, member_capacities, leaf_stock_sats, "
+        " channel_scripts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1742,8 +1841,19 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 17, (int)f->created_block);
     sqlite3_bind_int(stmt, 18, (int)f->active_blocks);
     sqlite3_bind_int(stmt, 19, (int)f->dying_blocks);
+    /* v42: the per-member terms (see the migration). */
+    char *caps_txt = format_member_capacities(f);
+    char *spks_txt = format_channel_scripts(f);
+    if (caps_txt) sqlite3_bind_text(stmt, 20, caps_txt, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 20);
+    sqlite3_bind_int64(stmt, 21, (sqlite3_int64)f->leaf_stock_sats);
+    if (spks_txt) sqlite3_bind_text(stmt, 22, spks_txt, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 22);
+    int terms_oom = (f->member_capacity && !caps_txt) || (f->chan_spks && !spks_txt);
 
-    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    int ok = !terms_oom && (sqlite3_step(stmt) == SQLITE_DONE);
+    free(caps_txt);
+    free(spks_txt);
     sqlite3_finalize(stmt);
     if (!ok) {
         if (own_txn) persist_rollback(p);
@@ -2877,7 +2987,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         "step_blocks, states_per_layer, cltv_timeout, tree_fee_rate, leaf_arity, "
         "use_hashlock_poison, level_arity, static_threshold_depth, "
         "ps_subfactory_arity, placement_mode, created_block, active_blocks, "
-        "dying_blocks "
+        "dying_blocks, member_capacities, leaf_stock_sats, channel_scripts "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2909,6 +3019,20 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint32_t created_block = (uint32_t)sqlite3_column_int(stmt, 14);
     uint32_t active_blocks = (uint32_t)sqlite3_column_int(stmt, 15);
     uint32_t dying_blocks = (uint32_t)sqlite3_column_int(stmt, 16);
+    /* v42 per-member terms: copied, the statement is finalized before use */
+    static char caps_buf[FACTORY_MAX_SIGNERS * 21 + 1];
+    static char spks_buf[FACTORY_MAX_SIGNERS * 80 + 1];
+    const char *caps_col = (const char *)sqlite3_column_text(stmt, 17);
+    const char *spks_col = (const char *)sqlite3_column_text(stmt, 19);
+    uint64_t leaf_stock = (uint64_t)sqlite3_column_int64(stmt, 18);
+    if ((caps_col && strlen(caps_col) >= sizeof(caps_buf)) ||
+        (spks_col && strlen(spks_col) >= sizeof(spks_buf))) {
+        fprintf(stderr, "persist_load_factory: stored member terms too long\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    const char *caps_txt = caps_col ? strcpy(caps_buf, caps_col) : NULL;
+    const char *spks_txt = spks_col ? strcpy(spks_buf, spks_col) : NULL;
     /* v40 tree shape */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;
@@ -3008,29 +3132,6 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     if (pk_count != n_participants) return 0;
 
-    /* Compute funding SPK from aggregate key of all participants */
-    musig_keyagg_t ka;
-    if (!musig_aggregate_keys(ctx, &ka, pubkeys, n_participants))
-        return 0;
-
-    unsigned char internal_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
-        return 0;
-    unsigned char twk[32];
-    sha256_tagged("TapTweak", internal_ser, 32, twk);
-
-    musig_keyagg_t ka_copy = ka;
-    secp256k1_pubkey tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
-                                                   &ka_copy.cache, twk))
-        return 0;
-    secp256k1_xonly_pubkey tweaked_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk))
-        return 0;
-
-    unsigned char fund_spk[34];
-    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
-
     /* Release any prior tree state and arrays (caller may reuse f across
        loads, or pre-allocate its arrays).  factory_init_from_pubkeys memsets
        f, which would leak them.  factory_free is a no-op on a zeroed factory. */
@@ -3063,8 +3164,18 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         factory_free(f);
         return 0;
     }
+    /* v42: the per-member terms the tree was sized and scripted from. */
+    if (!apply_stored_terms(f, caps_txt, leaf_stock, spks_txt)) {
+        fprintf(stderr, "persist_load_factory: invalid stored member terms\n");
+        factory_free(f);
+        return 0;
+    }
 
-    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+    /* The funding script of the rebuilt root: the participants in the order
+       its placement mode and profiles put them. */
+    unsigned char fund_spk[34];
+    if (!factory_compute_funding_spk(f, fund_spk) ||
+        !factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                              fund_spk, 34) ||
         !factory_build_tree(f)) {
         factory_free(f);

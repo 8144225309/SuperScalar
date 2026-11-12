@@ -916,7 +916,7 @@ int test_failed_channel_mark_persists(void) {
 }
 
 /* jit_channels.revocation_failed is schema v44.  The step adds the column
-   whenever it is missing, so a DB at v41, or at a version between 41 and 44
+   whenever it is missing, so a DB at v42, or at a version between 42 and 44
    written by another schema step, must open, end at the current version
    with the column, and keep its JIT rows. */
 static int rfc_migrate_case(int start_version, int drop_column) {
@@ -973,7 +973,7 @@ static int rfc_migrate_case(int start_version, int drop_column) {
 }
 
 int test_persist_jit_failed_column_migration(void) {
-    TEST_ASSERT(rfc_migrate_case(41, 1), "DB at v41 migrates");
+    TEST_ASSERT(rfc_migrate_case(42, 1), "DB at v42 migrates");
     TEST_ASSERT(rfc_migrate_case(43, 1), "DB at v43 without the column migrates");
     printf("\n  ");
     return 1;
