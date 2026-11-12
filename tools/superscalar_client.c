@@ -3153,20 +3153,6 @@ int main(int argc, char *argv[]) {
         printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
                (unsigned long long)sig_cn, commit_tx_len);
 
-        /* Load channel state (balances + commitment number) */
-        uint64_t local_amt = 0, remote_amt = 0;
-        uint64_t cn = 0;
-        persist_load_channel_state(&db, 0, &local_amt, &remote_amt, &cn);
-
-        /* Load basepoints */
-        unsigned char local_secs[4][32];
-        unsigned char remote_bps_raw[4][33];
-        if (!persist_load_basepoints(&db, 0, local_secs, remote_bps_raw)) {
-            fprintf(stderr, "ERROR: no basepoints in DB\n");
-            persist_close(&db);
-            return 1;
-        }
-
         /* Load factory (needed for funding info) */
         secp256k1_context *sweep_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -3175,19 +3161,6 @@ int main(int argc, char *argv[]) {
         if (!sweep_factory || !persist_load_factory(&db, 0, sweep_factory, sweep_ctx)) {
             fprintf(stderr, "ERROR: failed to load factory from DB\n");
             free(sweep_factory);
-            secp256k1_context_destroy(sweep_ctx);
-            persist_close(&db);
-            return 1;
-        }
-
-        /* Parse remote basepoints */
-        secp256k1_pubkey r_pay, r_delay, r_revoc, r_htlc;
-        if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33)) {
-            fprintf(stderr, "ERROR: failed to parse remote basepoints\n");
-            factory_free(sweep_factory); free(sweep_factory);
             secp256k1_context_destroy(sweep_ctx);
             persist_close(&db);
             return 1;
@@ -3213,9 +3186,61 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
         memset(sweep_seckey, 0, 32);
 
+        /* This client's index in the factory, found from its own key as the
+           reconnect path does; its channel row and basepoints are stored
+           under slot index - 1. */
+        uint32_t sweep_my_index = 0;
+        {
+            secp256k1_pubkey my_pub;
+            unsigned char mine[33], other[33];
+            size_t mine_len = 33;
+            if (secp256k1_keypair_pub(sweep_ctx, &my_pub, &sweep_kp) &&
+                secp256k1_ec_pubkey_serialize(sweep_ctx, mine, &mine_len, &my_pub,
+                                              SECP256K1_EC_COMPRESSED)) {
+                for (size_t k = 1; k < sweep_factory->n_participants; k++) {
+                    size_t other_len = 33;
+                    if (secp256k1_ec_pubkey_serialize(sweep_ctx, other, &other_len,
+                                                      &sweep_factory->pubkeys[k],
+                                                      SECP256K1_EC_COMPRESSED) &&
+                        memcmp(mine, other, 33) == 0) {
+                        sweep_my_index = (uint32_t)k;
+                        break;
+                    }
+                }
+            }
+        }
+        uint64_t local_amt = 0, remote_amt = 0;
+        uint64_t cn = 0;
+        unsigned char local_secs[4][32] = {{0}};
+        unsigned char remote_bps_raw[4][33] = {{0}};
+        secp256k1_pubkey r_pay = {{0}}, r_delay = {{0}}, r_revoc = {{0}}, r_htlc = {{0}};
+        const char *sweep_err = NULL;
+        if (sweep_my_index == 0)
+            sweep_err = "the keyfile's key is not a client of the factory in this DB";
+        else if (!persist_load_channel_state(&db, sweep_my_index - 1, &local_amt,
+                                             &remote_amt, &cn))
+            sweep_err = "no channel state in DB";
+        else if (!persist_load_basepoints(&db, sweep_my_index - 1, local_secs,
+                                          remote_bps_raw))
+            sweep_err = "no basepoints in DB";
+        else if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33))
+            sweep_err = "failed to parse remote basepoints";
+        if (sweep_err) {
+            fprintf(stderr, "ERROR: %s\n", sweep_err);
+            memset(local_secs, 0, sizeof(local_secs));
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+        printf("Sweep: client %u (channel slot %u)\n", sweep_my_index,
+               sweep_my_index - 1);
+
         /* Initialize channel using the same path as reconnect */
         channel_t sweep_ch;
-        uint32_t sweep_my_index = 1; /* default client index */
         if (!client_init_channel(&sweep_ch, sweep_ctx, sweep_factory, &sweep_kp,
                                   sweep_my_index,
                                   &r_pay, &r_delay, &r_revoc, &r_htlc,
