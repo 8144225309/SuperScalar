@@ -125,7 +125,6 @@ int test_factory_multi_input_keyagg(void)
     memset(fake_txid, 0xBE, 32);
 
     factory_t *f = (factory_t *)calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -239,8 +238,8 @@ int test_factory_multi_input_keyagg(void)
         /* Recompute the per-input BIP-341 sighash via the same helper the
            library uses for finalize. */
         unsigned char sighash[32];
-        const unsigned char *spks[FACTORY_MAX_OUTPUTS];
-        uint32_t seqs[FACTORY_MAX_OUTPUTS];
+        const unsigned char *spks[FACTORY_MAX_OUTPUTS] = {0};
+        uint32_t seqs[FACTORY_MAX_OUTPUTS] = {0};
         for (size_t j = 0; j < n_inp; j++) {
             spks[j] = sub->ps_prev_spks[j];
             seqs[j] = sub->nsequence;

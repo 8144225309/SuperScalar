@@ -94,12 +94,167 @@ int client_run_with_channels(secp256k1_context *ctx,
                               client_verify_funding_fn verify_funding,
                               void *verify_ctx);
 
+/* The scriptPubKey a client is paid to in a cooperative close: P2TR whose
+   output key is the client's own factory key.  The client derives it from
+   its own key; it is never taken from the LSP's proposal.  Writes 34 bytes.
+   Returns 1 on success. */
+int client_close_script(const secp256k1_context *ctx,
+                         const secp256k1_pubkey *my_pubkey,
+                         unsigned char *spk_out34);
+
+/* What a proposed close pays this client: the outputs that carry its own
+   close script and are at or above the dust limit.  An output below the dust
+   limit is not a payment the client can count on and is ignored.  Writes
+   their total and how many there are; an honest LSP pays each client with
+   exactly one output (lsp_channels_build_close_outputs).  Returns 1 on
+   success, 0 if the script cannot be derived or the total overflows. */
+int client_close_amount_to_client(const secp256k1_context *ctx,
+                                   const secp256k1_pubkey *my_pubkey,
+                                   const tx_output_t *outputs,
+                                   size_t n_outputs,
+                                   uint64_t *paid_sats_out,
+                                   size_t *n_paying_out);
+
+/* How many blocks the nLockTime of a proposed close may lie above the
+   client's own chain tip.  The LSP sets nLockTime to its current height; the
+   margin only has to absorb the client's view of the chain lagging by a few
+   blocks.  Six blocks is about an hour. */
+#define CLIENT_CLOSE_LOCKTIME_MARGIN 6
+
+/* Decide whether the nLockTime of a proposed close is acceptable.  A signed
+   close that cannot confirm yet is a transaction the LSP can hold back and
+   use later, so the lock must be near the present:
+     - 0 imposes no lock and is always acceptable;
+     - a height is acceptable only if the client knows its chain tip
+       (tip_height != 0) and the height is at most
+       tip_height + CLIENT_CLOSE_LOCKTIME_MARGIN;
+     - a time-based lock (>= 500000000) is never acceptable.
+   Returns 1 if acceptable. */
+int client_close_locktime_acceptable(uint32_t locktime, uint32_t tip_height);
+
+/* Source of the client's own chain tip height, used to bound the nLockTime
+   of close proposals.  fn returns the height, or 0 if it is not known.
+   With no source set the tip is unknown. */
+typedef uint32_t (*client_chain_tip_fn)(void *ctx);
+void client_set_chain_tip_source(client_chain_tip_fn fn, void *ctx);
+uint32_t client_chain_tip(void);
+
+/* A chain backend can be briefly unreachable or a few blocks behind.  When
+   the tip a close proposal has to be judged by is unknown, or too low for
+   the proposal's nLockTime, the close ceremony asks the source again, up to
+   `attempts` times in all, `delay_ms` apart, before it decides.  Defaults:
+   CLIENT_CHAIN_TIP_ATTEMPTS and CLIENT_CHAIN_TIP_RETRY_MS. */
+#define CLIENT_CHAIN_TIP_ATTEMPTS 5
+#define CLIENT_CHAIN_TIP_RETRY_MS 1000
+void client_set_chain_tip_retry(unsigned attempts, unsigned delay_ms);
+
+/* What the client knows about cooperative closes it has signed for one
+   factory.
+
+   Once the client has released a partial signature for a close, the LSP may
+   be able to complete and broadcast that close at any later time, whatever
+   it reports back.  From that moment the factory is frozen for this client:
+   it takes part in no further channel update and no leaf or state advance of
+   that factory, and signs only another close that pays it at least
+   paid_sats.  A unilateral exit stays possible.
+
+   With db set the record is written before the partial signature is sent
+   and client_close_state_init reads it back, so it survives a restart. */
+typedef struct {
+    int signed_close;           /* 1 once a partial signature was released */
+    uint64_t paid_sats;         /* what that close pays this client's script */
+    unsigned char sighash[32];  /* sighash of that close transaction */
+    int refused;                /* set by client_do_close_ceremony: 1 if it
+                                   ended by refusing what the LSP proposed */
+    int unverifiable;           /* set by client_do_close_ceremony: 1 if it
+                                   ended because the client could not check
+                                   the proposal (no chain tip, or its own
+                                   records unreadable).  Nothing was signed
+                                   or recorded; the same proposal may be
+                                   acceptable when tried again */
+    int record_error;           /* set by client_close_state_init: the record
+                                   could not be read from db */
+    persist_t *db;              /* where the record is kept, or NULL */
+} client_close_state_t;
+
+/* Reset cs and load the record for factory from db (db may be NULL).  If
+   the record cannot be read, cs->record_error is set and the ceremony will
+   not sign until it can be. */
+void client_close_state_init(client_close_state_t *cs, persist_t *db,
+                              const factory_t *factory);
+
+/* The freeze condition, in one place: 1 if this client must treat the
+   factory as frozen, because a close of it was signed (cs->signed_close) or
+   because the record that would say so cannot be read (cs->record_error).
+   Not being able to tell is not the same as nothing having been signed.
+   While the record is unreadable it is read again on every call, so an
+   error that passes clears itself; cs is updated with what was found.
+   Every message loop of the client tool gates on this. */
+int client_close_state_frozen(client_close_state_t *cs,
+                               const factory_t *factory);
+
+/* client_close_state_frozen for a caller that keeps no state: reads the
+   database set with client_set_persist. */
+int client_close_signed_for_factory(const factory_t *factory);
+
+/* 1 if the state of ch accounts for the whole funding output: local +
+   remote + every active HTLC and PTLC with the commitment fee taken for it
+   when it was added == funding_amount - base commitment fee. */
+int client_channel_balanced(const channel_t *ch);
+
+/* While a signed close of the factory is outstanding, a client acts only on
+   a close proposal, keepalives and the LSP's own revocations (which only add
+   to what the client can prove).  Returns 1 if a message of this type may
+   still be processed.  Shared by every message loop of the client tool. */
+int client_close_frozen_allows_msg(uint8_t msg_type);
+
+/* Decide whether a cooperative-close proposal is safe for this client to sign.
+   Returns 1 only if
+     - no HTLC or PTLC is pending on ch,
+     - the channel state accounts for the whole funding output: local +
+       remote + active HTLCs == funding_amount - base commitment fee (an HTLC
+       missing from the list makes this fail), and
+     - exactly one output at or above the dust limit carries the client's
+       own close script, and it pays at least ch->local_amount (no output is
+       required for a balance below the dust limit; more than one is always
+       refused).
+   Outputs to any other script are ignored regardless of amount.
+   ch == NULL means the client never opened a channel in this factory; it is
+   then owed nothing and any outputs are acceptable (returns 1). */
+int client_close_outputs_acceptable(const secp256k1_context *ctx,
+                                     const secp256k1_pubkey *my_pubkey,
+                                     const channel_t *ch,
+                                     const tx_output_t *outputs,
+                                     size_t n_outputs);
+
 /* Perform the cooperative close ceremony on an already-received CLOSE_PROPOSE.
    If initial_msg is non-NULL, it is the already-received CLOSE_PROPOSE message;
    otherwise we recv it from the wire.
-   If ch is non-NULL, the client verifies its close output >= ch->local_amount
-   before signing.  Pass NULL to skip balance verification (legacy callers).
-   Returns 1 on success. */
+   ch is the client's channel in this factory.  Before signing, the client
+   requires the proposal to pay at least ch->local_amount to its own close
+   script (client_close_script) and refuses while any HTLC is pending; see
+   client_close_outputs_acceptable.  Pass NULL only when the client never
+   opened a channel in this factory and so holds no balance; with NULL the
+   client still refuses if its database holds a channel for this factory.
+   A client with no database at all cannot have carried a channel over from
+   an earlier run (reconnecting to a factory needs the database), so with no
+   database and no channel it is owed nothing and may sign.
+   current_height is the client's own chain tip (0 if unknown); the proposal's
+   nLockTime must satisfy client_close_locktime_acceptable against it.  If it
+   does not, the tip source is asked again for a bounded time
+   (client_set_chain_tip_retry).  A height that still cannot be judged
+   because no tip is known ends the ceremony as unverifiable, not refused.
+   cs is the client's close state for this factory.  The ceremony records
+   the close in it (and in cs->db) before sending the partial signature;
+   once cs->signed_close is set it refuses leaf and state advances that
+   arrive during the ceremony and any proposal paying the client less than
+   cs->paid_sats.  Pass NULL to use a state private to this call, loaded
+   from and saved to the database set with client_set_persist.
+   Returns 1 on success and 0 otherwise.  cs->refused: the client declined
+   the terms.  cs->unverifiable: the client could not check the proposal;
+   nothing was signed or recorded and the LSP may try again.  Neither: the
+   ceremony failed for another reason (malformed or unexpected message, LSP
+   error, lost connection). */
 int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
                                const secp256k1_pubkey *my_pubkey,
@@ -108,6 +263,7 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
                                const wire_msg_t *initial_msg,
                                uint32_t current_height,
                                const channel_t *ch,
+                               client_close_state_t *cs,
                                int repropose_depth);
 
 /* Reconnect to LSP using persisted state from SQLite.
@@ -183,6 +339,14 @@ int client_parse_forgery_response(const char *s);
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
 
+/* Apply an UPDATE_FAIL_HTLC from the LSP to the channel.
+   An HTLC the LSP never took (uncommitted) is rolled back and nothing
+   follows.  A committed one is failed, the amount returns to whoever
+   offered it, and the LSP's COMMITMENT_SIGNED follows as after a fulfil.
+   Returns 1 if the HTLC was removed; *committed_out says which case. */
+int client_handle_fail_htlc(channel_t *ch, const wire_msg_t *msg,
+                             int *committed_out, uint64_t *htlc_id_out);
+
 /* Handle async / unsolicited LSP->client notifications (MSG_FUNDING_REORG,
    MSG_CEREMONY_ABORT).  Returns 1 if handled (caller still frees msg->json), 0
    otherwise.  Shared by the ceremony recv path (wire_recv_handle_ping) and the
@@ -195,10 +359,26 @@ int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
 
-/* Handle a LEAF_REALLOC_PROPOSE from the LSP.
-   Reads PROPOSE, sends NONCE, reads ALL_NONCES, sends PSIG, reads DONE.
-   Updates local factory amounts.
-   Returns 1 on success. */
+/* Amount rule for an LSP-proposed leaf reallocation.  Evaluated entirely
+   against the client's own tree: the client must be a signer of the leaf,
+   the amounts must cover exactly the leaf's reallocatable outputs and
+   conserve their total, and the output funding this client's channel
+   (located with factory_client_to_leaf, never from the message) must not be
+   smaller than it is now.  Returns 1 if the amounts satisfy the rule.
+
+   Passing this rule does NOT make a reallocation signable.  A reallocation
+   replaces the leaf transaction, and the client's channel and commitments
+   are not moved to the new leaf output, so a client that co-signs one loses
+   its unilateral exit even when its amount is unchanged.  The rule is only
+   one precondition for a future ceremony that also re-anchors the channel;
+   client_handle_leaf_realloc does not consult it and refuses everything. */
+int client_leaf_realloc_acceptable(const factory_t *factory,
+                                    uint32_t my_index, int leaf_side,
+                                    const uint64_t *amounts, size_t n_amounts);
+
+/* Handle a LEAF_REALLOC_PROPOSE from the LSP: always refuse.
+   Sends an error to the LSP, reveals no nonce, produces no signature and
+   leaves the factory untouched.  Always returns 0. */
 int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
                                 const secp256k1_keypair *keypair,
                                 factory_t *factory,
@@ -257,9 +437,19 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const wire_msg_t *propose_msg);
 
 /* Set (or clear) the persistence handle used for the PS double-spend
-   defense. Pass NULL to disable. Must be called before any PS advance
-   happens; safe to call once at startup. */
+   defense, for the checks the close ceremony makes against the client's
+   own records, and for refusing leaf and state advances of a factory whose
+   close this client has already signed. Pass NULL to disable. Must be
+   called before any PS advance or close happens; safe to call once at
+   startup. */
 void client_set_persist(persist_t *persist);
+
+/* The client refuses every leaf, state and sub-factory advance: none of
+   them moves its channel onto the tree they produce, so co-signing one
+   would leave the channel without a unilateral exit.  allow != 0 lifts the
+   refusal for harnesses that exercise those ceremonies with real clients;
+   it must never be set for a client holding real funds.  Off by default. */
+void client_set_allow_tree_advance(int allow);
 
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
    If set (non-NULL), all future connections use Noise NK instead of NN.

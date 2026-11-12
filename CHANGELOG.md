@@ -4,12 +4,65 @@ All notable changes to SuperScalar are documented here.
 
 > **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **40**.
 
-## v0.2.1 — Unreleased
+## Unreleased
 
-### Fixes
+### Key handling and start-up safety
 
-- **LSP crash on a fresh start:** the LSP daemon segfaulted after funding at the default arity, and `lsp_run_factory_creation` crashed on any LSP whose factory had not been through `factory_init` (a fresh `lsp_init`, or the factory released before a rotation). Both read or wrote the factory's dynamic arrays before they were allocated. The ceremony no longer leaks the arrays allocated by pre-init configuration either.
-- **Build:** `test_inproc_factory_lifecycle` links with `-DENABLE_SANITIZERS=ON`.
+Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a refusal, so existing start-up scripts may need adjusting.
+
+**Keyfiles**
+
+- **An existing keyfile that cannot be loaded is now an error.** With a wrong or missing `--passphrase`, or a damaged file, `superscalar_lsp` and `superscalar_client` exit and leave the file untouched. Before, they generated a new key over it, destroying the old one. A key is created only when nothing exists at `--keyfile`.
+- **`--generate-mnemonic` and `--from-mnemonic` refuse an existing keyfile** instead of replacing it.
+- **Keyfiles are written atomically** (temporary file `<keyfile>.ss-partial.XXXXXX`, fsync, rename). The keyfile's directory must be writable; a `--keyfile` path that is a symbolic link can be read but is not written to.
+- **Keyfiles, backups, restored databases and restored keyfiles are created with mode `0600`.** Before, they were created with the umask default (usually world-readable).
+- **Existing keyfiles and backups with loose permissions are tightened to `0600` when read**, with a warning, if they are regular files owned by the current user with one hard link and not reached through a symbolic link. Otherwise the mode is left alone. A keyfile readable only by its group is then used with a warning; **a keyfile readable by every user is refused** with an error naming the mode. Backups are read in either case.
+- A v2 keyfile must be exactly 84 bytes, and the PBKDF2 iteration count stored in a keyfile or backup must be between 100,000 and 10,000,000.
+
+**Recovery phrases**
+
+- **`--hd-mnemonic` and `--from-mnemonic` are validated** (12/15/18/21/24 words, BIP39 English wordlist, checksum; extra whitespace ignored). An invalid phrase stops start-up with the reason. Before, a typo in `--hd-mnemonic` silently opened a different, empty wallet.
+
+**Backup and restore**
+
+- **`--restore` never overwrites.** It refuses if the database, its `-wal`, `-shm` or `-journal` file, or the keyfile already exists. Before, it truncated the live files first. It needs `--db` and `--keyfile` as destinations.
+- **`--backup` and `--restore` report failed writes** (full disk, quota) and no longer leave empty files or print `OK`. An existing backup is replaced only once the new one is complete.
+
+**Mainnet start-up gates**
+
+- **`--network bitcoin` is treated exactly as `--network mainnet`** by every gate and by the library (invoice prefix, P2P magic, `bitcoin-cli` chain flag, checkpoints). Before, it skipped most mainnet gates.
+- **`superscalar_client` refuses `--seckey` on mainnet**, as the LSP already did; use `--keyfile`.
+- **`superscalar_watchtower` requires `--i-accept-the-risk` on mainnet** (new flag), refuses test/cheat flags and environment variables there, and refuses unknown `--network` names. `tools/deploy/superscalar-watchtower.service` now passes `--wt-db` (it still passed the removed `--db`) and takes extra options from `SS_WATCHTOWER_ARGS`.
+
+**Client connection**
+
+- **`--lsp DOMAIN` no longer supplies the LSP's key.** The key in `/.well-known/lsps.json` is fetched over plain HTTP; it is shown as a hint and never pinned. `--lsp-pubkey` is required on every network except regtest, and the client exits if it differs from the advertised key.
+- The `--lsp-pubkey` requirement is checked before a keyfile is created.
+- **`--lsp DOMAIN` is refused together with `--tor-proxy` / `--tor-only`**: the lookup is a direct clearnet connection.
+
+**Tests**
+
+- `tools/test_startup_gates.sh` (run in CI) checks the start-up refusals of the three daemon binaries.
+
+### CI green on `main`
+
+- **Fixed: factory creation crashed when the factory's arrays were freed or never allocated.** `lsp_run_factory_creation` copied the participant profiles out of a NULL pointer (arrays are heap-allocated since PR #451). It crashed the initial ceremony for an LSP set up with `lsp_init()` alone, which is why the Regtest Integration job segfaulted at its 21st test and never ran the rest. It also crashed the creation retry after a failed ceremony, and rotation. Creation now captures and restores the factory's shape, profiles and secret mode NULL-safely, and leaves the factory usable after a failed attempt. This is the creation-side part of PR #463.
+- **Fixed: `superscalar_lsp --arity 2` (without `--static-near-root`) crashed right after funding.** It wrote the default participant profiles into factory arrays that no shape setter had allocated.
+- **Fixed: the sanitizer CI jobs never ran their tests.** `test_inproc_factory_lifecycle` did not link the sanitizer flags, and the LSan suppressions path was relative to the wrong directory. With both fixed, LSan found ~2.6 GB of leaked factory arrays in the unit suite (test code) and two library leaks: `persist_load_factory` with pre-allocated arrays, and the `ladder_create_factory` failure paths.
+- **Fixed: stack overflow persisting per-leaf DW state for factories with more than 8 leaves** (`lsp_channels.c` used a fixed `leaf_states[8]`).
+- **Static analysis:** clean under cppcheck 2.13 (ubuntu-24.04) and 2.19 (ubuntu-26.04): allocation results are checked, arrays filled by possibly-empty loops are zero-initialised, a few library entry points reject NULL, and a duplicate NULL check is gone. The Static Analysis job is pinned to `ubuntu-24.04` so a runner-image change cannot silently change the checker.
+
+### Payments and the factory leaf
+
+- **Payments no longer advance the factory leaf:** on per-client leaves (`--arity 3` Pseudo-Spilman, the default, and `--arity 1`) the LSP re-signed the payee's and the sender's leaf after every settled client-initiated payment. The advanced leaf transaction spends (PS) or replaces (DW) the output the channel is funded by, while the channel's funding outpoint is fixed at open and no commitment is re-signed, so after the advanced leaf confirmed the client's commitment could never be broadcast (`missing-inputs`) and its balance was stranded in the 2-of-2 output. The settlement path now leaves the tree untouched.
+- **Tree advances are refused while a channel depends on the tree.** No leaf, state or sub-factory advance moves a channel onto the tree it produces, so:
+  - *LSP:* `lsp_channels_advance_ps_leaf` and `lsp_factory_tick_root` take an `allow_live_channel` argument and, unless it is set, refuse before changing any state while an open channel is funded by the leaf (whatever its balances), or by any leaf of the factory when the advance would roll over into a whole-tree state advance. Only the `--test-*` / `--cheat-*` harness paths pass the override.
+  - *Client:* `superscalar_client` refuses every leaf, state and sub-factory advance proposal with an error, before touching its tree or producing a nonce, and no longer persists a tree on another party's `LEAF_ADVANCE_DONE`. The harness-only flag `--test-allow-tree-advance` (refused on mainnet like every `--test-*` flag) restores co-signing for the ceremony tests; the harness scripts that drive those ceremonies pass it.
+- **Client and LSP exit-path leaks:** `client_run_with_channels` now releases the channel's arrays on every exit, and the LSP's recovery-mode shutdown releases the channel manager's and the ladder's contents.
+- **Tests:** `tools/test_regtest_payment_no_leaf_advance.sh` (run in CI for the default leaf type and `--arity 1`): real daemons, a payment, then a unilateral exit by the LSP, by the clients alone, and by the clients alone after refusing a proposed leaf advance; both client commitments must confirm with `to_local` equal to the balance. The script runs its own bitcoind with `minrelaytxfee`/`blockmintxfee` lowered to 500 sat/kvB, because a commitment transaction pays a fixed 154 sat for 167 vB, below the default relay floor; the fee itself is not changed here. Unit tests: `test_payment_leaves_leaf_untouched_arity_ps` / `_arity1`, `test_client_refuses_tree_advances`.
+
+### Factory tree fees and unilateral exits
+
 - **Factory tree fees below the minimum relay fee (fund safety):** every tree transaction was pre-signed with a flat 200-sat fee, so a node wider than 200 vB (an arity-2 leaf with its P2A anchor is 210 vB) could never relay and a unilateral exit stalled. Each pre-signed tree transaction (kickoff, state, static kickoff, every leaf shape, PS chain advances, PS sub-factory nodes and their multi-input advances) now pays its exact vsize, anchor included, at one tree fee rate, never below 1250 sat/kvB (minimum relay plus 25%). The distribution TX is sized the same way (it paid a flat 500 sats, below relay from 10 clients up) and always carries its anchor; L-stock poison fees are raised to the same floor.
 - **Tree fee rate agreed before signing:** the LSP attaches its fee estimator before the creation ceremony and the ceremony's re-init no longer drops it; `--tree-fee-rate N` sets the rate explicitly. `FACTORY_PROPOSE` carries `tree_fee_rate` (replacing `fee_per_tx`) and it is persisted (schema v40), so a reloaded factory rebuilds the same tree. Before signing, the client refuses a rate below the floor or above the agreed maximum and recomputes every node's fee from the transaction bytes; the LSP runs the same check.
 - **Agreed maximum tree fee rate:** one protocol maximum, 100000 sat/kvB (`--max-tree-fee-rate` on both daemons; they must agree). The client signs no tree above it, and an LSP whose estimate is above it sizes the tree at the maximum (or lower, see the fee bounds below) and logs that the exit relies on CPFP for the rest. The LSP refuses to start with an explicit `--tree-fee-rate` above it.

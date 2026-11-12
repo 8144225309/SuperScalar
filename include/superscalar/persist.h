@@ -316,6 +316,35 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
 /* Load channel core state (balances, commitment_number).
    Channel must already be initialized via channel_init() with the correct
    keys. This overwrites balances and commitment_number. */
+/* Client record of a cooperative close it has co-signed, keyed by the
+   factory's funding outpoint (funding_txid in internal byte order).
+   paid_sats is what the close pays to the client's own script; sighash is
+   the sighash of the close transaction.  One row per factory: saving again
+   replaces it.  Save returns 1 once the row is written. */
+int persist_save_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t paid_sats,
+                               const unsigned char sighash[32]);
+
+/* Load the record for a factory (outputs may be NULL).  Returns 1 if one
+   exists, 0 if the query ran and the client has not signed a close of that
+   factory, and -1 if the record could not be read (no handle, a failed
+   query, a malformed row).  -1 is not "no record": callers must not sign on
+   it. */
+int persist_load_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t *paid_sats_out,
+                               unsigned char sighash_out[32]);
+
+/* 1 if a channel is stored for the factory funded by this outpoint
+   (funding_txid in internal byte order), 0 if the query ran and found none,
+   -1 if the records could not be read. */
+int persist_factory_has_channel(persist_t *p,
+                                 const unsigned char funding_txid[32],
+                                 uint32_t funding_vout);
+
 int persist_load_channel_state(persist_t *p, uint32_t channel_id,
                                  uint64_t *local_amount,
                                  uint64_t *remote_amount,
@@ -740,6 +769,52 @@ int persist_save_htlc_origin(persist_t *p,
                               const unsigned char *payment_hash32,
                               uint64_t bridge_htlc_id, uint64_t request_id,
                               size_t sender_idx, uint64_t sender_htlc_id);
+/* Fulfils of inbound bridge HTLCs that the bridge has not confirmed yet.
+   Kept until it does, so a fulfil the client gave while the bridge or the
+   Lightning node was away is not lost with a restart. */
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    char upstream_id[64];
+    uint64_t bridge_htlc_id;
+} persist_bridge_fulfil_t;
+int persist_save_bridge_fulfil(persist_t *p, const persist_bridge_fulfil_t *f);
+int persist_delete_bridge_fulfil(persist_t *p, const unsigned char *payment_hash32);
+/* Oldest first; rows older than max_age_secs (0 = no limit) are deleted. */
+size_t persist_load_bridge_fulfils(persist_t *p, persist_bridge_fulfil_t *out,
+                                    size_t max, uint64_t max_age_secs);
+
+/* Origins by row: two origins can share a payment hash (one in each
+   direction), so a row is updated and closed by its id, never by hash.
+   persist_insert_htlc_origin returns the new row id (0 on failure). */
+int64_t persist_insert_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t bridge_htlc_id, uint64_t request_id,
+                                    size_t sender_idx, uint64_t sender_htlc_id);
+int persist_update_htlc_origin(persist_t *p, int64_t row_id,
+                                uint64_t bridge_htlc_id, uint64_t request_id,
+                                size_t sender_idx, uint64_t sender_htlc_id);
+int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id);
+/* What else has to survive a restart for the origin in row `row_id`: the
+   HTLC's expiry, its name on the Lightning node, and whether its failure
+   still has to be reported to the bridge. */
+int persist_save_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t cltv_expiry,
+                                     const char *upstream_id, int fail_pending);
+int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t *cltv_expiry_out,
+                                     char *upstream_id_out, size_t upstream_len,
+                                     int *fail_pending_out);
+/* As persist_load_htlc_origins, also returning each row's id. */
+size_t persist_load_htlc_origins_ids(persist_t *p,
+                                      unsigned char (*hashes_out)[32],
+                                      uint64_t *bridge_ids_out,
+                                      uint64_t *request_ids_out,
+                                      size_t *sender_idxs_out,
+                                      uint64_t *sender_htlc_ids_out,
+                                      int64_t *row_ids_out,
+                                      size_t max_origins);
+
 int persist_deactivate_htlc_origin(persist_t *p,
                                     const unsigned char *payment_hash32);
 size_t persist_load_htlc_origins(persist_t *p,

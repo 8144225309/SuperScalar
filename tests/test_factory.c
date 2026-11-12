@@ -106,7 +106,6 @@ int test_factory_build_tree(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);  /* step=2, states=4 */
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -197,7 +196,6 @@ int test_factory_sign_all(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -261,7 +259,6 @@ int test_factory_sign_all_retry(void) {
     unsigned char fake_txid[32]; memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -309,7 +306,6 @@ int test_factory_advance(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);  /* step=2, states_per_layer=4 */
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -510,7 +506,6 @@ int test_regtest_factory_tree(void) {
     /* Init factory, build tree, then advance to newest state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
 
@@ -598,7 +593,6 @@ int test_factory_sign_split_round_step_by_step(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -714,7 +708,6 @@ int test_factory_split_round_with_pool(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -876,7 +869,6 @@ int test_factory_advance_split_round(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);  /* step=2, states_per_layer=4 */
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -974,7 +966,6 @@ int test_factory_l_stock_with_burn_path(void) {
 
     /* Build factory WITHOUT shachain */
     factory_t *f_plain = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_plain);
     if (!f_plain) return 0;
     factory_init(f_plain, ctx, kps, 5, 2, 4);
     factory_set_funding(f_plain, fake_txid, 0, 100000, fund_spk, 34);
@@ -982,7 +973,6 @@ int test_factory_l_stock_with_burn_path(void) {
 
     /* Build factory WITH shachain */
     factory_t *f_sc = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_sc);
     if (!f_sc) return 0;
     factory_init(f_sc, ctx, kps, 5, 2, 4);
     factory_set_shachain_seed(f_sc, test_shachain_seed);
@@ -1049,7 +1039,6 @@ int test_factory_burn_tx_construction(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_shachain_seed(f, test_shachain_seed);
@@ -1084,7 +1073,6 @@ int test_factory_burn_tx_construction(void) {
        on the L-stock SPK).  Verify the no-shachain case produces a valid
        poison TX too. */
     factory_t *f_no_sc = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_no_sc);
     if (!f_no_sc) return 0;
     factory_init(f_no_sc, ctx, kps, 5, 2, 4);
     factory_set_funding(f_no_sc, fake_txid, 0, 100000, fund_spk, 34);
@@ -1125,7 +1113,6 @@ int test_factory_advance_with_shachain(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_shachain_seed(f, test_shachain_seed);
@@ -1305,7 +1292,6 @@ int test_regtest_burn_tx(void) {
     /* Init factory WITH shachain, build tree, then advance to max state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
     factory_set_shachain_seed(f, test_shachain_seed);
@@ -1440,7 +1426,6 @@ int test_factory_cooperative_close(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -1537,7 +1522,6 @@ int test_factory_cooperative_close_balances(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -1695,7 +1679,6 @@ int test_regtest_factory_coop_close(void) {
 
     /* Init factory, build tree (but don't broadcast tree!) */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
     factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
@@ -1778,7 +1761,6 @@ int test_factory_lifecycle_states(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -1806,6 +1788,7 @@ int test_factory_lifecycle_states(void) {
     TEST_ASSERT(factory_is_expired(f, 4852), "is_expired at 4852");
 
     secp256k1_context_destroy(ctx);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -1825,7 +1808,6 @@ int test_factory_lifecycle_queries(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -1848,6 +1830,7 @@ int test_factory_lifecycle_queries(void) {
     TEST_ASSERT_EQ(factory_blocks_until_expired(f, 130), 0, "until expired at 130");
 
     secp256k1_context_destroy(ctx);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -1867,7 +1850,6 @@ int test_factory_distribution_tx(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -1970,7 +1952,6 @@ int test_factory_distribution_tx_distributed(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -2052,7 +2033,6 @@ int test_factory_distribution_tx_default(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 50000, fund_spk, 34);
@@ -2108,7 +2088,6 @@ int test_factory_advance_leaf_left(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -2158,7 +2137,6 @@ int test_factory_advance_leaf_right(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -2204,7 +2182,6 @@ int test_factory_advance_leaf_independence(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -2250,7 +2227,6 @@ int test_factory_advance_leaf_exhaustion(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -2297,7 +2273,6 @@ int test_factory_advance_leaf_preserves_parent_txids(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -2351,7 +2326,6 @@ int test_factory_build_tree_arity1(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree arity-1");
@@ -2413,7 +2387,6 @@ int test_factory_arity1_leaf_outputs(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2446,7 +2419,6 @@ int test_factory_arity1_sign_all(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2468,7 +2440,6 @@ int test_factory_arity1_advance(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2497,7 +2468,6 @@ int test_factory_arity1_advance_leaf(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2526,7 +2496,6 @@ int test_factory_arity1_leaf_independence(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2559,7 +2528,6 @@ int test_factory_arity1_coop_close(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2594,7 +2562,6 @@ int test_factory_arity1_client_to_leaf(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2622,7 +2589,6 @@ int test_factory_arity1_cltv_strict_ordering(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     f->cltv_timeout = 200;  /* Enough room for 5 tiers of TIMEOUT_STEP_BLOCKS=5 */
@@ -2665,7 +2631,6 @@ int test_factory_arity1_min_funding_reject(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
 
@@ -2700,7 +2665,6 @@ int test_factory_arity1_input_amounts_consistent(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2731,7 +2695,6 @@ int test_factory_arity1_split_round_leaf_advance(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -2869,7 +2832,6 @@ int test_factory_tier_b_state_advance_root_rollover(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     TEST_ASSERT(setup_arity1_factory(f, ctx, kps), "setup arity-1 factory");
     TEST_ASSERT(factory_build_tree(f), "build tree");
@@ -3063,7 +3025,6 @@ int test_factory_build_tree_n3(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[3];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     /* N=3 (LSP + 2 clients), arity-2: 1 leaf with 2 clients, depth=0 */
@@ -3093,7 +3054,6 @@ int test_factory_build_tree_n7(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[7];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     /* N=7 (LSP + 6 clients), arity-2: 3 leaves, depth=2 */
@@ -3125,7 +3085,6 @@ int test_factory_build_tree_n9(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[9];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     /* N=9 (LSP + 8 clients), arity-2: 4 leaves, depth=2 */
@@ -3156,7 +3115,6 @@ int test_factory_build_tree_n16(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[16];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     /* N=16 (LSP + 15 clients), arity-1 only (arity-2 would need 8 leaves, still ok) */
@@ -3187,7 +3145,6 @@ int test_factory_build_tree_n32(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair *kps = calloc(32, sizeof(secp256k1_keypair));
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(kps && f, "alloc n32");
 
     /* N=32, arity-2: 16 leaves, depth=4 */
@@ -3219,7 +3176,6 @@ int test_factory_build_tree_n64(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair *kps = calloc(64, sizeof(secp256k1_keypair));
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(kps && f, "alloc n64");
 
     /* N=64, arity-2: 32 leaves, depth=5 */
@@ -3245,7 +3201,6 @@ int test_factory_build_tree_n128(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair *kps = calloc(128, sizeof(secp256k1_keypair));
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(kps && f, "alloc n128");
 
     /* N=128, arity-2: 64 leaves, depth=6, 254 factory nodes.
@@ -3349,7 +3304,6 @@ int test_regtest_tree_ordering(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -3507,7 +3461,6 @@ int test_regtest_dw_exhaustion_close(void) {
 
     /* Small DW counter for fast exhaustion */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
     factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,
@@ -3591,7 +3544,6 @@ int test_factory_flat_secrets_round_trip(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 10, 8);
 
@@ -3679,7 +3631,6 @@ int test_factory_path_to_root(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -3728,7 +3679,6 @@ int test_factory_subtree_clients(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -3784,7 +3734,6 @@ int test_factory_find_leaf_for_client(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -3834,7 +3783,7 @@ int test_factory_nav_variable_n(void) {
         }
 
         /* Compute funding spk */
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (int i = 0; i < n; i++)
             if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
         musig_keyagg_t ka;
@@ -3855,7 +3804,6 @@ int test_factory_nav_variable_n(void) {
         memset(fake_txid, 0xAA, 32);
 
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         if (!f) return 0;
         factory_init(f, ctx, kps, (size_t)n, 2, 4);
         factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -3908,7 +3856,6 @@ int test_factory_timeout_spend_tx(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->cltv_timeout = 1000;
@@ -3967,7 +3914,6 @@ int test_factory_timeout_spend_mid_node(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->cltv_timeout = 1000;
@@ -4024,7 +3970,6 @@ int test_placement_sequential(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->placement_mode = PLACEMENT_SEQUENTIAL;
@@ -4074,7 +4019,6 @@ int test_placement_inward(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->placement_mode = PLACEMENT_INWARD;
@@ -4137,7 +4081,6 @@ int test_placement_outward(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->placement_mode = PLACEMENT_OUTWARD;
@@ -4204,7 +4147,6 @@ int test_placement_timezone_cluster(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->placement_mode = PLACEMENT_TIMEZONE_CLUSTER;
@@ -4301,6 +4243,7 @@ int test_economic_mode_validation(void) {
     TEST_ASSERT_EQ((long)f->profiles[1].profit_share_bps, 2000, "client 1 bps");
     TEST_ASSERT_EQ((long)f->profiles[4].profit_share_bps, 1000, "client 4 bps");
 
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -4323,7 +4266,6 @@ int test_nonce_pool_factory_creation(void) {
 
     /* Build + sign using standard factory_sign_all (on-demand nonces) */
     factory_t *f1 = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f1);
     if (!f1) return 0;
     factory_init(f1, ctx, kps, 5, 2, 4);
     factory_set_funding(f1, fake_txid, 0, 100000, fund_spk, 34);
@@ -4336,7 +4278,6 @@ int test_nonce_pool_factory_creation(void) {
 
     /* Build + sign using pool-drawn nonces via split-round API */
     factory_t *f2 = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f2);
     if (!f2) return 0;
     factory_init(f2, ctx, kps, 5, 2, 4);
     factory_set_funding(f2, fake_txid, 0, 100000, fund_spk, 34);
@@ -4436,7 +4377,6 @@ int test_factory_count_nodes_for_participant(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -4481,7 +4421,6 @@ int test_factory_sessions_init_path(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -4520,7 +4459,6 @@ int test_factory_rebuild_path_unsigned(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -4567,7 +4505,6 @@ int test_factory_sign_path(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -4648,7 +4585,6 @@ int test_factory_advance_and_rebuild_path(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -4687,7 +4623,6 @@ int test_arity2_leaf_advance(void) {
     memset(fake_txid, 0xBB, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 4, 4);
     factory_set_arity(f, FACTORY_ARITY_2);
@@ -4775,7 +4710,6 @@ int test_distribution_tx_has_anchor(void) {
     memset(fake_txid, 0xCC, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
@@ -4909,7 +4843,6 @@ int test_factory_variable_arity_build(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[9];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     uint8_t arities[] = {1, 1, 2};
     TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 9, arities, 3, 5000000),
@@ -4936,7 +4869,6 @@ int test_factory_variable_arity_sign(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     uint8_t arities[] = {1, 2};
     TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 5, arities, 2, 2000000),
@@ -4963,10 +4895,8 @@ int test_factory_variable_arity_backward_compat(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps1[5], kps2[5];
     factory_t *f1 = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f1);
     if (!f1) return 0;
     factory_t *f2 = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f2);
     if (!f2) { free(f1); return 0; }
 
     TEST_ASSERT(setup_n_factory(f1, ctx, kps1, 5, FACTORY_ARITY_2, 2000000), "setup f1");
@@ -5005,7 +4935,6 @@ int test_factory_derive_scid(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 10, 100);
     f->cltv_timeout = 1000;
@@ -5058,7 +4987,6 @@ int test_factory_set_leaf_amounts(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->placement_mode = PLACEMENT_SEQUENTIAL;
@@ -5132,7 +5060,6 @@ int test_leaf_realloc_signing(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     f->placement_mode = PLACEMENT_SEQUENTIAL;
@@ -5222,7 +5149,6 @@ int test_leaf_realloc_signing_arity1(void) {
     memset(fake_txid, 0xAA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     factory_set_arity(f, FACTORY_ARITY_1);
@@ -5326,7 +5252,6 @@ int test_factory_config_custom(void) {
     cfg.dust_limit_sats = 1000;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     int ok = factory_init_with_config(f, ctx, keypairs, 5, 10, 4, &cfg);
     TEST_ASSERT(ok, "factory_init_with_config should succeed");
@@ -5370,7 +5295,6 @@ int test_factory_config_default(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     int ok = factory_init(f, ctx, keypairs, 3, 10, 4);
     TEST_ASSERT(ok, "factory_init should succeed");
@@ -5420,7 +5344,6 @@ int test_factory_ps_leaf_build(void) {
     memset(fake_txid, 0xBB, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 3, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -5516,7 +5439,6 @@ int test_factory_ps_subfactory_k2_n4(void) {
     memset(fake_txid, 0xDD, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -5655,7 +5577,6 @@ int test_factory_ps_subfactory_chain_extension(void) {
     memset(fake_txid, 0xFE, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -5905,7 +5826,6 @@ int test_factory_ps_subfactory_chain_tx_validity(void) {
     memset(fake_txid, 0xFA, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -6085,7 +6005,6 @@ int test_factory_ps_subfactory_poison_tx_k2_n4(void) {
     memset(fake_txid, 0xDD, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -6200,7 +6119,6 @@ int test_factory_lstock_client_mirror(void) {
     /* LSP: hashlock ON — derives per-node H from its seed. */
     secp256k1_keypair kl[3];
     factory_t *lsp = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(lsp);
     TEST_ASSERT(lsp, "alloc lsp");
     TEST_ASSERT(setup_variable_arity_factory(lsp, ctx, kl, 3, arities, 1, 5000000),
                 "setup lsp");
@@ -6214,7 +6132,6 @@ int test_factory_lstock_client_mirror(void) {
     /* CLIENT: NO seed; mirror the LSP's per-node H (simulated FACTORY_PROPOSE). */
     secp256k1_keypair kc[3];
     factory_t *cli = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(cli);
     TEST_ASSERT(cli, "alloc cli");
     TEST_ASSERT(setup_variable_arity_factory(cli, ctx, kc, 3, arities, 1, 5000000),
                 "setup cli");
@@ -6262,7 +6179,6 @@ int test_factory_lstock_client_mirror(void) {
     /* CONTROL: a client WITHOUT the mirror builds a DIFFERENT (single-leaf) SPK. */
     secp256k1_keypair kb[3];
     factory_t *bare = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(bare);
     TEST_ASSERT(bare, "alloc bare");
     TEST_ASSERT(setup_variable_arity_factory(bare, ctx, kb, 3, arities, 1, 5000000),
                 "setup bare");
@@ -6320,7 +6236,6 @@ int test_factory_subfactory_lstock_per_state_hash(void) {
     memset(fake_txid, 0xFE, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -6382,7 +6297,6 @@ int test_factory_subfactory_lstock_per_state_hash(void) {
 
     /* (d) CONTROL: a non-hashlock sub keeps a STATIC sales-stock SPK across advances. */
     factory_t *g = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(g);
     TEST_ASSERT(g, "alloc control factory");
     factory_init(g, ctx, kps, 5, 6, 10);
     factory_set_arity(g, FACTORY_ARITY_PS);
@@ -6446,7 +6360,6 @@ int test_regtest_lstock_hashlock_poison(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[3];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
 
     uint8_t arities[1] = {2};
@@ -6539,6 +6452,7 @@ int test_regtest_lstock_hashlock_poison(void) {
     /* POSITIVE consensus: the interpreter accepts it. */
     {
         char *p = (char *)malloc(poison.len * 2 + 16);
+        TEST_ASSERT(p, "alloc");
         snprintf(p, poison.len * 2 + 16, "[\"%s\"]", poison_hex);
         char *tma = regtest_exec(&rt, "testmempoolaccept", p);
         free(p);
@@ -6566,11 +6480,14 @@ int test_regtest_lstock_hashlock_poison(void) {
             if (memcmp(poison.data + i, secret, 32) == 0) { off = (int)i; break; }
         TEST_ASSERT(off >= 0, "preimage present in poison witness");
         unsigned char *mangled = (unsigned char *)malloc(poison.len);
+        TEST_ASSERT(mangled, "alloc");
         memcpy(mangled, poison.data, poison.len);
         mangled[off] ^= 0xFF;  /* break SHA256(preimage)==H_s, keep 32-byte length */
         char *mhex = (char *)malloc(poison.len * 2 + 1);
+        TEST_ASSERT(mhex, "alloc");
         hex_encode(mangled, poison.len, mhex);
         char *p = (char *)malloc(poison.len * 2 + 16);
+        TEST_ASSERT(p, "alloc");
         snprintf(p, poison.len * 2 + 16, "[\"%s\"]", mhex);
         char *tma = regtest_exec(&rt, "testmempoolaccept", p);
         free(p); free(mhex); free(mangled);
@@ -6598,6 +6515,7 @@ int test_regtest_lstock_hashlock_poison(void) {
     /* ECONOMIC OUTCOME: broadcast + confirm + the L-stock is redistributed. */
     {
         char *p = (char *)malloc(poison.len * 2 + 16);
+        TEST_ASSERT(p, "alloc");
         snprintf(p, poison.len * 2 + 16, "\"%s\"", poison_hex);
         char *srt = regtest_exec(&rt, "sendrawtransaction", p);
         free(p);
@@ -6642,7 +6560,6 @@ int test_regtest_lstock_poison_ceremony(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[3];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
 
     uint8_t arities[1] = {2};
@@ -6731,8 +6648,10 @@ int test_regtest_lstock_poison_ceremony(void) {
     TEST_ASSERT(factory_assemble_poison_with_secret(f, leaf_idx, secret, &poison),
                 "assemble poison with secret");
     char *phex = (char *)malloc(poison.len * 2 + 1);
+    TEST_ASSERT(phex, "alloc");
     hex_encode(poison.data, poison.len, phex);
     char *p = (char *)malloc(poison.len * 2 + 16);
+    TEST_ASSERT(p, "alloc");
     snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
     char *tma = regtest_exec(&rt, "testmempoolaccept", p);
     free(p);
@@ -6768,8 +6687,10 @@ int test_regtest_lstock_poison_ceremony(void) {
                 "from_template byte-identical to with_secret");
     {
         char *thex = (char *)malloc(poison_tmpl.len * 2 + 1);
+        TEST_ASSERT(thex, "alloc");
         hex_encode(poison_tmpl.data, poison_tmpl.len, thex);
         char *tp = (char *)malloc(poison_tmpl.len * 2 + 16);
+        TEST_ASSERT(tp, "alloc");
         snprintf(tp, poison_tmpl.len * 2 + 16, "[\"%s\"]", thex);
         char *tma2 = regtest_exec(&rt, "testmempoolaccept", tp);
         free(tp);
@@ -6824,7 +6745,6 @@ int test_factory_anchor_lstock_advance(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[3];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
 
     uint8_t arities[1] = {2};
@@ -6890,7 +6810,6 @@ int test_regtest_lstock_poison_old_state(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[3];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
 
     uint8_t arities[1] = {2};
@@ -6993,8 +6912,10 @@ int test_regtest_lstock_poison_old_state(void) {
     tx_buf_free(&bad);
 
     char *phex = (char *)malloc(poison.len * 2 + 1);
+    TEST_ASSERT(phex, "alloc");
     hex_encode(poison.data, poison.len, phex);
     char *p = (char *)malloc(poison.len * 2 + 16);
+    TEST_ASSERT(p, "alloc");
     snprintf(p, poison.len * 2 + 16, "[\"%s\"]", phex);
     char *tma = regtest_exec(&rt, "testmempoolaccept", p);
     free(p);
@@ -7075,7 +6996,6 @@ int test_factory_ps_leaf_build_n64(void) {
     memset(fake_txid, 0xEE, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     /* step=4, states_per_layer=3 — modest values so tree depth with 63
        clients stays within DW_MAX_LAYERS=8. */
@@ -7189,7 +7109,6 @@ int test_factory_ps_build_n128(void) {
     memset(fake_txid, 0xCC, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "factory alloc");
     /* step=4, states_per_layer=3 keeps DW total states modest; the layer count
        (8) is the binding constraint at N=128, not the per-layer state count. */
@@ -7262,7 +7181,6 @@ int test_factory_ps_leaf_advance(void) {
     memset(fake_txid, 0xDD, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
     factory_init(f, ctx, kps, 3, 6, 100);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -7349,7 +7267,6 @@ int test_factory_ps_amount_invariant(void) {
     memset(fake_txid, 0xF1, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
     factory_init(f, ctx, kps, 3, 1, 100);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -7416,7 +7333,6 @@ int test_factory_ps_dust_limit(void) {
     memset(fake_txid, 0xF2, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
     factory_init(f, ctx, kps, 3, 1, 100);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -7470,7 +7386,6 @@ int test_factory_ps_mixed_arity(void) {
     memset(fake_txid, 0xEE, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
     factory_init(f, ctx, kps, 5, 6, 10);
 
@@ -7537,7 +7452,6 @@ int test_factory_ps_split_round_leaf_advance(void) {
     memset(fake_txid, 0xCC, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
     factory_init(f, ctx, kps, 3, 1, 100);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -7681,7 +7595,7 @@ int test_factory_ps_matrix(void) {
 
         unsigned char fund_spk[34];
         {
-            secp256k1_pubkey pks[64];
+            secp256k1_pubkey pks[64] = {0};
             for (size_t i = 0; i < N; i++)
                 secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
             musig_keyagg_t ka;
@@ -7704,7 +7618,6 @@ int test_factory_ps_matrix(void) {
         memset(fake_txid, (unsigned char)(0xC0 + c), 32);
 
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         TEST_ASSERT(f, "alloc factory");
         factory_init(f, ctx, kps, N, 4, 3);
         factory_set_arity(f, FACTORY_ARITY_PS);
@@ -7813,7 +7726,6 @@ int test_factory_nway_n12_arity_2_4(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[12];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
 
     uint8_t arities[2] = {2, 4};
@@ -7872,7 +7784,6 @@ int test_factory_nway_n64_arity_2_4_8(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair *kps = calloc(64, sizeof(secp256k1_keypair));
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(kps && f, "alloc n64");
 
     uint8_t arities[3] = {2, 4, 8};
@@ -7955,7 +7866,6 @@ int test_factory_nway_arity_8_leaf_outputs(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[9];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
 
     uint8_t arities[1] = {8};
@@ -8021,9 +7931,7 @@ int test_factory_nway_backward_compat(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps_legacy[8], kps_nway[8];
     factory_t *f_legacy = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_legacy);
     factory_t *f_nway = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_nway);
     TEST_ASSERT(f_legacy && f_nway, "alloc");
 
     /* Legacy: factory_set_arity(FACTORY_ARITY_2) — uniform arity-2 */
@@ -8114,7 +8022,6 @@ int test_factory_static_near_root_basic(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[12];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
 
     uint8_t arities[2] = {2, 4};
@@ -8200,7 +8107,6 @@ int test_factory_static_near_root_n128_arity_2_4_8_static_2(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair *kps = calloc(128, sizeof(secp256k1_keypair));
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(kps && f, "alloc n128");
 
     /* {2,4,8}: depth 0 arity-2, depth 1 arity-4, depth 2+ arity-8 */
@@ -8303,7 +8209,6 @@ int test_factory_static_near_root_node_nsequence(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[12];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc");
 
     uint8_t arities[2] = {2, 4};
@@ -8358,9 +8263,7 @@ int test_factory_static_near_root_backward_compat(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps_a[12], kps_b[12];
     factory_t *f_a = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_a);
     factory_t *f_b = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_b);
     TEST_ASSERT(f_a && f_b, "alloc");
 
     uint8_t arities[2] = {2, 4};
@@ -8507,7 +8410,6 @@ int test_factory_client_to_leaf_roundtrip(void) {
     {
         secp256k1_keypair kps[5];
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         TEST_ASSERT(f, "alloc arity-1 factory");
         ensure_seckeys_n();
         for (int i = 0; i < 5; i++)
@@ -8536,7 +8438,6 @@ int test_factory_client_to_leaf_roundtrip(void) {
     {
         secp256k1_keypair kps[5];
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         TEST_ASSERT(f, "alloc arity-2 factory");
         ensure_seckeys_n();
         for (int i = 0; i < 5; i++)
@@ -8568,7 +8469,6 @@ int test_factory_client_to_leaf_roundtrip(void) {
     {
         secp256k1_keypair kps[5];
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         TEST_ASSERT(f, "alloc PS factory");
         ensure_seckeys_n();
         for (int i = 0; i < 5; i++)
@@ -8599,7 +8499,6 @@ int test_factory_client_to_leaf_roundtrip(void) {
     {
         secp256k1_keypair kps[12];
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         TEST_ASSERT(f, "alloc mixed {2,4} factory");
         uint8_t arities[2] = { 2, 4 };
         TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, 12, arities, 2,
@@ -8617,7 +8516,6 @@ int test_factory_client_to_leaf_roundtrip(void) {
         const size_t N = 17;  /* 1 LSP + 16 clients */
         secp256k1_keypair *kps = calloc(N, sizeof(secp256k1_keypair));
         factory_t *f = calloc(1, sizeof(factory_t));
-        factory_alloc_default_arrays(f);
         TEST_ASSERT(kps && f, "alloc mixed {2,4,8} factory");
         uint8_t arities[3] = { 2, 4, 8 };
         TEST_ASSERT(setup_variable_arity_factory(f, ctx, kps, N, arities, 3,

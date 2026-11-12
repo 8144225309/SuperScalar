@@ -11,6 +11,7 @@
 #include "superscalar/cpfp.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/dw_state.h"
 #include "superscalar/tor.h"
 #include "superscalar/tapscript.h"
@@ -1251,7 +1252,8 @@ static int attach_hd_wallet(watchtower_t *wt, persist_t *db_ptr,
     } else if (hd_mnemonic) {
         /* 2. Derive seed from provided mnemonic */
         if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
-            fprintf(stderr, "LSP: HD wallet: bip39_mnemonic_to_seed failed\n");
+            fprintf(stderr, "LSP: HD wallet: invalid recovery phrase: %s\n",
+                    bip39_status_str(bip39_check(hd_mnemonic)));
             memset(seed, 0, sizeof(seed));
             return 0;
         }
@@ -2280,6 +2282,29 @@ int main(int argc, char *argv[]) {
 
     if (!network)
         network = "regtest";  /* default to regtest */
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
+        }
+        network = canonical;
+    }
+    /* A recovery phrase with a typo would derive a different, empty wallet
+       without any error: refuse it before anything is derived from it. */
+    if (hd_mnemonic) {
+        bip39_status_t mn_status = bip39_check(hd_mnemonic);
+        if (mn_status != BIP39_OK) {
+            fprintf(stderr, "Error: invalid --hd-mnemonic: %s\n",
+                    bip39_status_str(mn_status));
+            return 1;
+        }
+    }
     int is_regtest = (strcmp(network, "regtest") == 0);
     /* #9 cheat-gate: defense-bypass cheats (e.g. SS_CHEAT_DUST_RACE) are inert
        unless this is regtest, even if the env var is set directly. */
@@ -2318,8 +2343,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (fee_rate < 1000) {
-        int is_mainnet = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-        if (is_mainnet) {
+        if (network_is_mainnet(network)) {
             fprintf(stderr, "WARNING: fee rate %llu sat/kvB (%.1f sat/vB) is below Bitcoin Core "
                     "default minrelaytxfee (1 sat/vB).\n"
                     "  Ensure your bitcoind has -minrelaytxfee=0.0000001 or use package relay "
@@ -2363,6 +2387,15 @@ int main(int argc, char *argv[]) {
         if (restore_path_arg) {
             if (!db_path || !keyfile_path) {
                 fprintf(stderr, "Error: --restore requires --db and --keyfile (destination paths)\n");
+                return 1;
+            }
+            char blocker[4096];
+            if (backup_restore_blocked_by(db_path, keyfile_path,
+                                          blocker, sizeof(blocker))) {
+                fprintf(stderr,
+                    "Error: %s already exists; --restore never overwrites.\n"
+                    "  Move the existing database (with its -wal, -shm and -journal\n"
+                    "  files) and keyfile away first, then run --restore again.\n", blocker);
                 return 1;
             }
             int ok = backup_restore(restore_path_arg, db_path, keyfile_path,
@@ -2433,6 +2466,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -2448,8 +2488,10 @@ int main(int argc, char *argv[]) {
             }
             secure_zero(mnemonic, sizeof(mnemonic));
         } else {
-            if (!bip39_validate(from_mnemonic)) {
-                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+            bip39_status_t mn_status = bip39_check(from_mnemonic);
+            if (mn_status != BIP39_OK) {
+                fprintf(stderr, "Error: invalid --from-mnemonic: %s\n",
+                        bip39_status_str(mn_status));
                 return 1;
             }
             if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
@@ -2489,92 +2531,28 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
-    }
-
-    /* #327a: refuse cmdline --seckey on mainnet. Process args are visible to
-       any local user via `ps` / /proc/<pid>/cmdline and persist in shell
-       history — an unacceptable key-exposure vector for a node holding real
-       funds. Mainnet operators must use the encrypted --keyfile (PBKDF2-600K
-       + AEAD at rest). Regtest/signet/testnet keep --seckey for convenience. */
-    if ((strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0) && seckey_hex) {
-        fprintf(stderr,
-            "Error: --seckey is refused on mainnet (visible via ps / shell history).\n"
-            "Use --keyfile PATH (encrypted at rest); create one with --generate-mnemonic\n"
-            "or --from-mnemonic, optionally protected by --passphrase.\n");
-        return 1;
-    }
-
-    /* #9: refuse ALL test/cheat scaffolding flags on mainnet (footgun guard on
-       top of --i-accept-the-risk). Detection cheats are self-harming and
-       defense-bypass cheats are theft; neither belongs on a mainnet node. */
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port (chain_backend_rpc.c) while the
-       exact-"mainnet" guards would NOT fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding in the
+       arguments or the environment, and persistent state for both the node
+       (--db) and the trustless watchtower (--wt-db). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_LSP,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .have_wt_db = wt_db_path != NULL,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
-        /* #9: also refuse cheat/kill/crash ENV vars on mainnet (not just args).
-           The library gate (superscalar_cheat_allowed) already makes them inert,
-           but fail LOUD so a misconfigured mainnet node never starts with a
-           defense-bypass or crash-injection knob lurking in its environment. */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    /* G1 (gap-scan): prefix, not exact, so SUPERSCALAR_CRASH_ALLOW
-                       (gates peer-sent MSG_FORCE_OUT/MSG_ROTATE) is caught too. */
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
-        }
-    }
-
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
-        return 1;
-    }
-    /* SF-WT-TRUSTLESS Phase 2c PR-E (#248): mainnet also requires --wt-db
-       so the operator runs a trustless watchtower binary (the only WT
-       mode in v0.2.0) against this LSP's pre-signed response TXs.
-       Without --wt-db the LSP can still run on mainnet but loses
-       trustless WT support — flag this as an error so operators can't
-       accidentally deploy mainnet without it. */
-    if (strcmp(network, "mainnet") == 0 && !wt_db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --wt-db for the trustless watchtower.\n"
-            "v0.2.0 removed the legacy --db-only watchtower mode; the LSP\n"
-            "must populate wt.db so a standalone trustless WT can broadcast\n"
-            "penalty TXs on breach without ever opening lsp.db.\n"
-            "See docs/watchtower-trustless-schema.md for the model.\n");
-        return 1;
     }
 
     /* Resolve confirmation timeout */
@@ -2846,17 +2824,32 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else if (keyfile_path) {
-        /* Try to load from keyfile */
-        if (keyfile_load(keyfile_path, lsp_seckey, passphrase)) {
+        /* Load the keyfile; a new key is only ever created when no file
+           exists at the path. */
+        switch (keyfile_load_or_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
+        case KEYFILE_OPEN_LOADED:
             printf("LSP: loaded key from %s\n", keyfile_path);
-        } else {
-            /* File doesn't exist or wrong passphrase — generate new key */
-            printf("LSP: generating new key and saving to %s\n", keyfile_path);
-            if (!keyfile_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(ctx);
-                return 1;
-            }
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("LSP: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        case KEYFILE_OPEN_INSECURE_MODE:
+            fprintf(stderr, "Error: refusing to start with keyfile %s: its permissions\n"
+                "  let every user read it (details above).\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     } else if (is_regtest) {
         /* Deterministic default key — regtest only */
@@ -2933,8 +2926,7 @@ int main(int argc, char *argv[]) {
        --encrypt-db. This must run after the key is final and before any secret
        column is read or written (recovery's channel init is later). */
     if (use_db) {
-        int mainnet_db = (strcmp(network, "mainnet") == 0 || strcmp(network, "bitcoin") == 0);
-        if (mainnet_db) encrypt_db = 1;
+        if (network_is_mainnet(network)) encrypt_db = 1;
         if (encrypt_db) {
             persist_set_encryption_key(&db, lsp_seckey);
             if (!persist_apply_encryption(&db)) {
@@ -3252,25 +3244,10 @@ int main(int argc, char *argv[]) {
             }
 
             {
-                unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
-                uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
-                size_t orig_sender[MAX_HTLC_ORIGINS];
-                uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-                size_t n_orig = persist_load_htlc_origins(&db,
-                    orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                    MAX_HTLC_ORIGINS);
-                for (size_t i = 0; i < n_orig; i++) {
-                    if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                    htlc_origin_t *o = &mgr->htlc_origins[mgr->n_htlc_origins++];
-                    memcpy(o->payment_hash, orig_hashes[i], 32);
-                    o->bridge_htlc_id = orig_bridge[i];
-                    o->request_id = orig_req[i];
-                    o->sender_idx = orig_sender[i];
-                    o->sender_htlc_id = orig_htlc[i];
-                    o->active = 1;
-                }
+                size_t n_orig = lsp_channels_restore_origins(mgr);
                 if (n_orig > 0)
-                    printf("LSP recovery: loaded %zu HTLC origins from DB\n", n_orig);
+                    printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+                lsp_channels_load_bridge_fulfils(mgr);
             }
 
             /* Initialize watchtower */
@@ -3288,6 +3265,8 @@ int main(int argc, char *argv[]) {
             watchtower_register_autosettle(&rec_wt,
                                             watchtower_autosettle_leaf_channels);
             mgr->watchtower = &rec_wt;
+            snprintf(mgr->network, sizeof(mgr->network), "%s",
+                     network ? network : "");
 
             if (bump_budget_pct > 0) rec_wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) rec_wt.max_bump_fee_sat = max_bump_fee;
@@ -3380,7 +3359,7 @@ int main(int argc, char *argv[]) {
             /* Derive funding + mining addresses for rotation */
             {
                 musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
+                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS] = {0};
                 for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
                     all_pks[i] = lsp_rp->factory.pubkeys[i];
                 musig_aggregate_keys(ctx, &ka, all_pks,
@@ -3565,11 +3544,13 @@ int main(int argc, char *argv[]) {
 
             printf("LSP recovery: daemon shutdown complete\n");
             jit_channels_cleanup(mgr);
+            lsp_channels_cleanup(mgr);
             free(mgr);
             persist_close(&db);
             lsp_cleanup(lsp_rp);
             
             free(lsp_rp);
+            ladder_free(rec_lad_p);
             free(rec_lad_p);
             memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx);
@@ -4218,7 +4199,14 @@ accept_new_factory:
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
 
-    /* Populate default profiles from CLI config */
+    /* Populate default profiles from CLI config.  The shape setters above
+       allocate the factory's arrays, but not every shape calls one (a plain
+       --arity 2 without --static-near-root does not), so make sure they exist
+       before writing the profiles. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        return 1;
+    }
     for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
         lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
         if (pi == 0) {
@@ -4451,7 +4439,7 @@ accept_new_factory:
             }
             if (init_ok) {
                 /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
-                uint32_t init_layers[DW_MAX_LAYERS];
+                uint32_t init_layers[DW_MAX_LAYERS] = {0};
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                     init_layers[li] = lsp_p->factory.counter.layers[li].config.max_states;
                 persist_save_dw_counter(&db, 0, 0, lsp_p->factory.counter.n_layers, init_layers);
@@ -4591,25 +4579,10 @@ accept_new_factory:
                 printf("LSP: loaded %zu invoices from DB\n", n_inv);
 
             /* Load HTLC origins */
-            unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
-            uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
-            size_t orig_sender[MAX_HTLC_ORIGINS];
-            uint64_t orig_htlc[MAX_HTLC_ORIGINS];
-            size_t n_orig = persist_load_htlc_origins(&db,
-                orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
-                MAX_HTLC_ORIGINS);
-            for (size_t i = 0; i < n_orig; i++) {
-                if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) break;
-                htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
-                memcpy(origin->payment_hash, orig_hashes[i], 32);
-                origin->bridge_htlc_id = orig_bridge[i];
-                origin->request_id = orig_req[i];
-                origin->sender_idx = orig_sender[i];
-                origin->sender_htlc_id = orig_htlc[i];
-                origin->active = 1;
-            }
+            size_t n_orig = lsp_channels_restore_origins(mgr);
             if (n_orig > 0)
                 printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+            lsp_channels_load_bridge_fulfils(mgr);
         }
 
         /* Do NOT override channel.fee_rate_sat_per_kvb with --fee-rate:
@@ -4676,6 +4649,8 @@ accept_new_factory:
            TU so it doesn't appear in the trustless WT binary). */
         watchtower_register_autosettle(&wt, watchtower_autosettle_leaf_channels);
         mgr->watchtower = &wt;
+        snprintf(mgr->network, sizeof(mgr->network), "%s",
+                 network ? network : "");
 
             if (bump_budget_pct > 0) wt.bump_budget_pct = bump_budget_pct;
             if (max_bump_fee > 0) wt.max_bump_fee_sat = max_bump_fee;
@@ -4818,7 +4793,7 @@ accept_new_factory:
                 }
                 printf(" blocks)\n");
                 if (use_db) {
-                    uint32_t layer_states[DW_MAX_LAYERS];
+                    uint32_t layer_states[DW_MAX_LAYERS] = {0};
                     for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++)
                         layer_states[li] = lsp_p->factory.counter.layers[li].current_state;
                     persist_save_dw_counter(&db, 0, epoch,

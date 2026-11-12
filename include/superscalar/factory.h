@@ -1086,6 +1086,43 @@ void factory_session_reset_poison(factory_t *f, size_t node_idx);
 int factory_set_leaf_amounts(factory_t *f, int leaf_side,
                               const uint64_t *amounts, size_t n_amounts);
 
+/* Everything a per-leaf advance or a change of leaf amounts alters on one
+   leaf: its place in the per-leaf DW counter, its outputs, both transaction
+   buffers and their txid, the L-stock commitment and the PS chain position.
+   A ceremony that advances a leaf and then fails puts the leaf back with it,
+   so the tree stays the one its co-signers still hold. */
+typedef struct {
+    int valid;
+    int per_leaf_enabled;
+    dw_layer_t leaf_layer;
+    tx_output_t outputs[FACTORY_MAX_OUTPUTS];
+    size_t n_outputs;
+    unsigned char txid[32];
+    uint32_t nsequence;
+    int is_built;
+    int is_signed;
+    tx_buf_t unsigned_tx;
+    tx_buf_t signed_tx;
+    unsigned char l_stock_hash[32];
+    int has_l_stock_hash;
+    uint32_t l_stock_state_counter;
+    int ps_chain_len;
+    unsigned char ps_prev_txid[32];
+    uint64_t ps_prev_chan_amount;
+    uint64_t fee_sats;
+} factory_leaf_snapshot_t;
+
+/* Capture the state of leaf leaf_side.  Returns 1 on success; the snapshot
+   owns copies of the transaction buffers until factory_leaf_snapshot_free. */
+int factory_leaf_snapshot(const factory_t *f, int leaf_side,
+                           factory_leaf_snapshot_t *snap);
+
+/* Put leaf leaf_side back exactly as captured.  Returns 1 on success. */
+int factory_leaf_restore(factory_t *f, int leaf_side,
+                          const factory_leaf_snapshot_t *snap);
+
+void factory_leaf_snapshot_free(factory_leaf_snapshot_t *snap);
+
 /* Rebuild a single node's unsigned tx (public wrapper around internal helper). */
 int factory_rebuild_node_tx(factory_t *f, size_t node_idx);
 

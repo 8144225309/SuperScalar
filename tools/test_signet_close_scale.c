@@ -178,7 +178,9 @@ int main(int argc, char **argv) {
 
         FILE *f = fopen(outfile, "w");
         if (!f) { fprintf(stderr, "cannot write %s\n", outfile); return 1; }
-        char *hx = malloc(stx.len * 2 + 1); hex_encode(stx.data, stx.len, hx); hx[stx.len * 2] = 0;
+        char *hx = malloc(stx.len * 2 + 1);
+        if (!hx) { fprintf(stderr, "out of memory\n"); fclose(f); return 1; }
+        hex_encode(stx.data, stx.len, hx); hx[stx.len * 2] = 0;
         fputs(hx, f); fclose(f);
 
         printf("close-scale: signers=%zu funded=%zu outputs=%zu\n", N, M, n_out);
@@ -234,7 +236,9 @@ int main(int argc, char **argv) {
         if (!finalize_signed_tx(&stx, utx.data, utx.len, sig)) { fprintf(stderr, "finalize fail\n"); return 1; }
         FILE *f = fopen(outfile, "w");
         if (!f) { fprintf(stderr, "cannot write %s\n", outfile); return 1; }
-        char *hx = malloc(stx.len * 2 + 1); hex_encode(stx.data, stx.len, hx); hx[stx.len * 2] = 0;
+        char *hx = malloc(stx.len * 2 + 1);
+        if (!hx) { fprintf(stderr, "out of memory\n"); fclose(f); return 1; }
+        hex_encode(stx.data, stx.len, hx); hx[stx.len * 2] = 0;
         fputs(hx, f); fclose(f);
         printf("sweep: signers=%zu in=%llu out=%llu fee=%llu self_verify=OK -> %s\n",
                N, (unsigned long long)amount, (unsigned long long)o.amount_sats, (unsigned long long)fee, outfile);

@@ -180,7 +180,6 @@ int test_reconnect_pubkey_match(void) {
         all_pks[i + 1] = client_pks[i];
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) { free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp); return 0; }
     factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
 
@@ -397,7 +396,6 @@ int test_client_persist_reload(void) {
 
     /* Build factory */
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -567,7 +565,6 @@ int test_balance_reporting(void) {
     }
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -1584,6 +1581,7 @@ int test_keyfile_wrong_passphrase(void) {
 
 int test_keyfile_generate(void) {
     const char *path = "/tmp/test_superscalar_keyfile3.dat";
+    unlink(path);
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -1795,6 +1793,7 @@ int test_factory_lifecycle_daemon_check(void) {
     s = factory_get_state(f, 200);
     TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 200 = EXPIRED");
 
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -1971,7 +1970,8 @@ int test_ladder_daemon_integration(void) {
     ladder_advance_block(lad, 130);
     TEST_ASSERT_EQ(lf->cached_state, FACTORY_EXPIRED, "EXPIRED at 130");
 
-    tx_buf_free(&lf->distribution_tx);
+    ladder_free(lad);   /* the slot's detached factory copy + distribution_tx */
+    factory_free(f);
     free(f);
     free(lad);
     secp256k1_context_destroy(ctx);
@@ -1995,7 +1995,6 @@ int test_distribution_tx_amounts(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -2589,7 +2588,6 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2659,7 +2657,6 @@ int test_reconnect_commitment_mismatch_reject(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2726,6 +2723,188 @@ int test_reconnect_commitment_mismatch_reject(void) {
     return 1;
 }
 
+/* Child for a reconnect with a commitment pending: nonce exchange, then the
+   retransmitted COMMITMENT_SIGNED is answered according to `mode`:
+     0  REVOKE_AND_ACK with `secret` (expects RECONNECT_ACK if `expect_ack`,
+        the connection closed otherwise)
+     1  something that is not a REVOKE_AND_ACK, then nothing
+     2  a REVOKE_AND_ACK that does not parse */
+static void child_reconnect_pending_cs(int fd, int client_idx,
+                                        secp256k1_pubkey lsp_pk,
+                                        unsigned char client_sec[32],
+                                        int mode, const unsigned char *secret,
+                                        int expect_ack) {
+    secp256k1_context *cctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_pubkey cpk;
+    if (!secp256k1_ec_pubkey_create(cctx, &cpk, client_sec)) _exit(1);
+
+    wire_msg_t nm;
+    if (!wire_recv(fd, &nm)) _exit(2);
+    if (nm.msg_type != MSG_CHANNEL_NONCES) _exit(3);
+    cJSON_Delete(nm.json);
+
+    unsigned char nonces[MUSIG_NONCE_POOL_MAX][66];
+    memset(nonces, 0, sizeof(nonces));
+    for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+        secp256k1_musig_secnonce sn;
+        secp256k1_musig_pubnonce pn;
+        musig_keyagg_t ka;
+        secp256k1_pubkey pks[2] = {lsp_pk, cpk};
+        musig_aggregate_keys(cctx, &ka, pks, 2);
+        musig_generate_nonce(cctx, &sn, &pn, client_sec, &cpk, &ka.cache);
+        musig_pubnonce_serialize(cctx, nonces[i], &pn);
+    }
+    cJSON *reply = wire_build_channel_nonces((uint32_t)client_idx,
+        (const unsigned char (*)[66])nonces, MUSIG_NONCE_POOL_MAX);
+    wire_send(fd, MSG_CHANNEL_NONCES, reply);
+    cJSON_Delete(reply);
+
+    /* The pending commitment, sent again */
+    wire_msg_t cs;
+    for (;;) {
+        if (!wire_recv(fd, &cs)) _exit(4);
+        if (cs.msg_type == MSG_COMMITMENT_SIGNED) break;
+        if (cs.msg_type == MSG_RECONNECT_ACK) _exit(7);
+        if (cs.msg_type != MSG_UPDATE_ADD_HTLC) _exit(5);
+        cJSON_Delete(cs.json);      /* the HTLC in flight, sent again */
+    }
+    cJSON_Delete(cs.json);
+
+    if (mode == 0) {
+        cJSON *raa = wire_build_revoke_and_ack((uint32_t)client_idx, secret, cctx, &cpk);
+        wire_send(fd, MSG_REVOKE_AND_ACK, raa);
+        cJSON_Delete(raa);
+    } else if (mode == 1) {
+        cJSON *other = cJSON_CreateObject();
+        wire_send(fd, MSG_REGISTER_INVOICE, other);
+        cJSON_Delete(other);
+        shutdown(fd, SHUT_WR);
+    } else {
+        cJSON *junk = cJSON_CreateObject();
+        cJSON_AddStringToObject(junk, "revocation_secret", "zz");
+        wire_send(fd, MSG_REVOKE_AND_ACK, junk);
+        cJSON_Delete(junk);
+    }
+
+    wire_msg_t after;
+    int got = wire_recv_timeout(fd, &after, 20);
+    int acked = got && after.msg_type == MSG_RECONNECT_ACK;
+    if (got && after.json) cJSON_Delete(after.json);
+    close(fd);
+    secp256k1_context_destroy(cctx);
+    _exit(acked == (expect_ack != 0) ? 0 : 6);
+}
+
+/* A commitment pending at reconnect is settled by the client's valid
+   revocation only; anything else refuses the reconnect, disconnects the
+   client and keeps the commitment pending. */
+int test_reconnect_pending_commitment_needs_revocation(void) {
+    unsigned char good[32], bad[32];
+    memset(good, 0x41, 32);
+    memset(bad, 0x42, 32);
+
+    /* mode: 0 bad secret, 1 other message, 2 unparseable, 3 valid secret */
+    for (int round = 0; round < 4; round++) {
+        secp256k1_context *ctx;
+        unsigned char lsp_sec[32];
+        secp256k1_pubkey lsp_pk;
+        unsigned char client_secs[4][32];
+        secp256k1_pubkey client_pks[4];
+        factory_t *factory = calloc(1, sizeof(factory_t));
+        if (!factory) return 0;
+        lsp_t *lsp = calloc(1, sizeof(lsp_t));
+        if (!lsp) { free(factory); return 0; }
+        lsp_channel_mgr_t mgr;
+        persist_t db;
+        TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                    client_secs, factory, lsp, &mgr, &db),
+                    "setup_reconnect_env failed");
+
+        /* The LSP offered client 2 an HTLC and sent its commitment; the
+           client's revocation of commitment 0 never arrived */
+        channel_t *ch = &mgr.entries[2].channel;
+        unsigned char h[32], htlc_sec[32];
+        memset(h, 0x43, 32);
+        memset(htlc_sec, 0x44, 32);
+        /* keys the two sides exchange when the channel is set up */
+        channel_set_local_htlc_basepoint(ch, htlc_sec);
+        channel_set_remote_basepoints(ch, &client_pks[2], &client_pks[2],
+                                      &client_pks[2]);
+        channel_set_remote_htlc_basepoint(ch, &client_pks[2]);
+        uint64_t hid;
+        TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 1000, h, 500, &hid), "HTLC");
+        TEST_ASSERT_EQ(ch->commitment_number, 1, "commitment 1 pending");
+        secp256k1_pubkey committed;
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &committed, good), "point");
+        channel_set_remote_pcp(ch, 0, &committed);
+        {
+            unsigned char ser[33];
+            size_t slen = 33;
+            secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &committed,
+                                          SECP256K1_EC_COMPRESSED);
+            TEST_ASSERT(persist_save_remote_pcp(&db, 2, 0, ser), "point on record");
+        }
+        /* the point for the commitment being signed (the channel keeps two
+           points in memory: this one and the one to be revoked) */
+        channel_set_remote_pcp(ch, 1, &client_pks[2]);
+        channel_set_persist(ch, &db, 2);
+        TEST_ASSERT(persist_update_channel_balance(&db, 2, ch->local_amount,
+                    ch->remote_amount, 1), "state saved");
+        TEST_ASSERT(persist_save_pending_cs(&db, mgr.entries[2].channel_id, 1),
+                    "commitment recorded as pending");
+
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 1);
+        TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
+        cJSON_Delete(reconn);
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(sv[0]);
+            if (round == 3)
+                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2], 0, good, 1);
+            else
+                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2],
+                                           round, bad, 0);
+            _exit(0);
+        }
+        close(sv[1]);
+        int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
+        uint64_t pending = 0;
+        int has_pending = persist_load_pending_cs(&db, mgr.entries[2].channel_id,
+                                                   &pending) && pending == 1;
+        int status;
+        waitpid(pid, &status, 0);
+        TEST_ASSERT(WIFEXITED(status), "child exited");
+        int child_rc = WEXITSTATUS(status);
+        TEST_ASSERT_EQ(child_rc, 0, "client saw what it should");
+
+        if (round == 3) {
+            TEST_ASSERT_EQ(ok, 1, "valid revocation: reconnect accepted");
+            TEST_ASSERT(!has_pending, "commitment no longer pending");
+            TEST_ASSERT(lsp->client_fds[2] == sv[0], "client connected");
+            TEST_ASSERT(lsp_channels_peer_revoked(ch), "revocation stored");
+        } else {
+            TEST_ASSERT_EQ(ok, 0, "reconnect refused");
+            TEST_ASSERT(has_pending, "commitment still pending");
+            TEST_ASSERT_EQ(lsp->client_fds[2], -1, "client disconnected");
+            TEST_ASSERT(!lsp_channels_peer_revoked(ch), "nothing stored");
+        }
+
+        lsp_channels_cleanup(&mgr);
+        persist_close(&db);
+        free(lsp->client_fds);
+        free(lsp->client_pubkeys);
+        free(lsp);
+        factory_free(factory);
+        free(factory);
+        secp256k1_context_destroy(ctx);
+    }
+    return 1;
+}
+
 /* Test 5C: HTLC replay on reconnect (Gap 2C) */
 int test_reconnect_htlc_replay(void) {
     secp256k1_context *ctx;
@@ -2734,7 +2913,6 @@ int test_reconnect_htlc_replay(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }

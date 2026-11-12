@@ -1862,6 +1862,9 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     if (htlc_id_out)
         *htlc_id_out = h->id;
 
+    ch->has_unsigned_offer = (direction == HTLC_OFFERED);
+    ch->unsigned_offer_id = h->id;
+
     ch->commitment_number++;
     channel_generate_local_pcs(ch, ch->commitment_number + 1);
     return 1;
@@ -1936,6 +1939,30 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
     ch->commitment_number++;
     channel_generate_local_pcs(ch, ch->commitment_number + 1);
     channel_compact_htlcs(ch);
+    return 1;
+}
+
+int channel_rollback_htlc(channel_t *ch, uint64_t htlc_id) {
+    if (ch->n_htlcs == 0 || ch->commitment_number == 0) return 0;
+    htlc_t *h = &ch->htlcs[ch->n_htlcs - 1];
+    if (h->id != htlc_id || h->state != HTLC_STATE_ACTIVE ||
+        htlc_id + 1 != ch->next_htlc_id)
+        return 0;
+    /* Only an HTLC this side offered, and only while the peer has signed
+       nothing that contains it. */
+    if (h->direction != HTLC_OFFERED || !ch->has_unsigned_offer ||
+        ch->unsigned_offer_id != htlc_id)
+        return 0;
+    ch->has_unsigned_offer = 0;
+
+    ch->local_amount += h->amount_sats;
+    uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
+    *funder_bal += h->fee_at_add;
+
+    memset(h, 0, sizeof(*h));
+    ch->n_htlcs--;
+    ch->next_htlc_id--;
+    ch->commitment_number--;
     return 1;
 }
 

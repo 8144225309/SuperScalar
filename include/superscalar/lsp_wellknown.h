@@ -63,6 +63,10 @@ void lsp_wellknown_handle_connection(int fd,
  * Fetch .well-known/lsps.json over plain HTTP from host:80.
  * On success fills host_out, port_out, pubkey_hex_out and returns 1.
  * On error returns 0.
+ *
+ * The response is not authenticated: anyone on the network path can replace
+ * it.  The host and port are only a place to connect to, but the public key
+ * must not be used to authenticate the LSP -- see lsp_wellknown_select_pin().
  */
 int lsp_wellknown_fetch_http(const char *domain,
                               char *host_out,       size_t host_cap,
@@ -78,13 +82,80 @@ int lsp_wellknown_fetch_http_port(const char *domain, uint16_t tcp_port,
                                    uint16_t *port_out,
                                    char *pubkey_hex_out, size_t pubkey_cap);
 
+/* Outcome of lsp_wellknown_select_pin(). */
+typedef enum {
+    LSP_PIN_NONE = 0,   /* the operator configured no key: nothing is pinned */
+    LSP_PIN_CONFIGURED, /* the operator's key is pinned; the advertised key,
+                           if there is one, is the same key */
+    LSP_PIN_MISMATCH    /* the advertised key differs from the operator's key */
+} lsp_pin_result_t;
+
+/*
+ * Choose the LSP public key to pin for the Noise handshake.
+ *
+ * configured_pubkey_hex is the key the operator supplied out of band
+ * (--lsp-pubkey), or NULL.  advertised_pubkey_hex is the key from an
+ * unauthenticated well-known response, or NULL.
+ *
+ * Only the operator's key can be pinned.  The advertised key is never
+ * returned: it is compared with the operator's key (hex case is ignored) and
+ * a difference is reported as LSP_PIN_MISMATCH.  *pin_out is set to
+ * configured_pubkey_hex for LSP_PIN_CONFIGURED and to NULL otherwise.
+ */
+lsp_pin_result_t lsp_wellknown_select_pin(const char *configured_pubkey_hex,
+                                           const char *advertised_pubkey_hex,
+                                           const char **pin_out);
+
+/* Outcome of lsp_wellknown_resolve_endpoint(). */
+typedef enum {
+    LSP_ENDPOINT_OK = 0,
+    LSP_ENDPOINT_FETCH_FAILED,   /* the well-known lookup failed */
+    LSP_ENDPOINT_PIN_MISMATCH,   /* advertised key differs from the operator's */
+    LSP_ENDPOINT_PIN_REQUIRED    /* a pinned key is required and none was configured */
+} lsp_endpoint_status_t;
+
+typedef struct {
+    char        host[256];
+    int         port;
+    const char *pinned_pubkey_hex;          /* the operator's key, or NULL */
+    char        advertised_pubkey_hex[128]; /* from the lookup; "" if none.
+                                               For display only. */
+} lsp_endpoint_t;
+
+/*
+ * Work out where the client connects and which key authenticates the LSP.
+ *
+ * domain (--lsp) may be NULL: then host and port are used as given.
+ * Otherwise the host and port come from the well-known endpoint served at
+ * domain:http_port.  configured_pubkey_hex (--lsp-pubkey) may be NULL.
+ * pin_required says whether connecting without a pinned key is refused.
+ *
+ * out->pinned_pubkey_hex is configured_pubkey_hex or NULL and nothing else:
+ * the advertised key is reported in out->advertised_pubkey_hex but never
+ * pinned, and it does not satisfy pin_required.  out is filled as far as the
+ * resolution got, also when the result is not LSP_ENDPOINT_OK.
+ */
+lsp_endpoint_status_t lsp_wellknown_resolve_endpoint(
+    const char *domain, uint16_t http_port,
+    const char *host, int port,
+    const char *configured_pubkey_hex, int pin_required,
+    lsp_endpoint_t *out);
+
 /*
  * Fork a background process that accepts HTTP connections on tcp_port and
- * serves the .well-known/lsps.json endpoint.  Returns 1 in the parent on
- * success, 0 on error.  The child runs indefinitely; the parent continues.
+ * serves the .well-known/lsps.json endpoint.  Returns the process id of the
+ * server (> 0) in the parent on success, 0 on error.  The child runs until it
+ * is killed; the parent continues.
  * Requires fork() (Linux/macOS).
  */
 int lsp_wellknown_serve_fork(const lsp_wellknown_cfg_t *cfg,
                               uint16_t tcp_port);
+
+/*
+ * Same, on a free port chosen by the operating system, which is written to
+ * *tcp_port_out.  For tests: no fixed port that something else may hold.
+ */
+int lsp_wellknown_serve_fork_any_port(const lsp_wellknown_cfg_t *cfg,
+                                       uint16_t *tcp_port_out);
 
 #endif /* SUPERSCALAR_LSP_WELLKNOWN_H */

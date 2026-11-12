@@ -1076,7 +1076,6 @@ int test_persist_factory_round_trip(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->use_tree_anchor = 1;  /* #56: mirror production — persist_load_factory rebuilds
@@ -1510,7 +1509,6 @@ int test_lsp_recovery_round_trip(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;  /* Client 3 */
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
@@ -1958,6 +1956,7 @@ int test_persist_validate_factory_load(void) {
     loaded = persist_load_factory(&db, 13, f, ctx);
     TEST_ASSERT(loaded == 0, "step_blocks=0 rejected");
 
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
@@ -2027,7 +2026,6 @@ int test_persist_crash_stress(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
@@ -2509,7 +2507,6 @@ int test_persist_crash_dw_state(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], s4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
 
@@ -2535,11 +2532,11 @@ int test_persist_crash_dw_state(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c1 open");
 
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].current_state;
 
-        uint32_t leaf_states[8];
+        uint32_t leaf_states[8] = {0};
         for (int i = 0; i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
 
@@ -2612,11 +2609,11 @@ int test_persist_crash_dw_state(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c2 open");
 
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].current_state;
 
-        uint32_t leaf_states[8];
+        uint32_t leaf_states[8] = {0};
         for (int i = 0; i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
 
@@ -2655,6 +2652,7 @@ int test_persist_crash_dw_state(void) {
         persist_close(&db);
     }
 
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);
@@ -5727,3 +5725,40 @@ int test_lsp_forgery_response_parse(void) {
 }
 
 /* === End revocation verification standard tests =========================== */
+
+/* ---- HTLC origins sharing a payment hash are separate rows ---- */
+
+int test_persist_htlc_origin_rows(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+    unsigned char hash[32];
+    memset(hash, 0x5e, 32);
+
+    /* One inbound and one outbound origin for the same hash */
+    int64_t in_id = persist_insert_htlc_origin(&db, hash, 90, 0, 1, 11);
+    int64_t out_id = persist_insert_htlc_origin(&db, hash, 0, 7, 2, 22);
+    TEST_ASSERT(in_id > 0 && out_id > 0 && in_id != out_id, "two rows");
+
+    TEST_ASSERT(persist_update_htlc_origin(&db, in_id, 91, 0, 1, 12), "update one row");
+
+    unsigned char hashes[4][32];
+    uint64_t bridge[4], req[4], htlc[4];
+    size_t sender[4];
+    int64_t ids[4];
+    TEST_ASSERT_EQ(persist_load_htlc_origins_ids(&db, hashes, bridge, req, sender,
+                                                  htlc, ids, 4), 2, "both active");
+    TEST_ASSERT(ids[0] == in_id && bridge[0] == 91 && htlc[0] == 12,
+                "updated row carries the new values");
+    TEST_ASSERT(ids[1] == out_id && bridge[1] == 0 && req[1] == 7 && htlc[1] == 22,
+                "the other row is unchanged");
+
+    /* Closing the inbound row leaves the outbound one */
+    TEST_ASSERT(persist_deactivate_htlc_origin_id(&db, in_id), "close inbound row");
+    TEST_ASSERT_EQ(persist_load_htlc_origins_ids(&db, hashes, bridge, req, sender,
+                                                  htlc, ids, 4), 1, "one active");
+    TEST_ASSERT(ids[0] == out_id && req[0] == 7, "the outbound row");
+    TEST_ASSERT(!persist_deactivate_htlc_origin_id(&db, 0), "row id 0 is nobody");
+
+    persist_close(&db);
+    return 1;
+}

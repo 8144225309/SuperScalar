@@ -7,6 +7,7 @@
 #include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
@@ -137,7 +138,8 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     } else if (hd_mnemonic) {
         /* 2. Derive seed from provided mnemonic */
         if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
-            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            fprintf(stderr, "Client: HD wallet: invalid recovery phrase: %s\n",
+                    bip39_status_str(bip39_check(hd_mnemonic)));
             memset(seed, 0, sizeof(seed));
             return 0;
         }
@@ -399,6 +401,18 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     (void)keypair; (void)n_participants;
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
 
+    /* A cooperative close of this factory was signed and may still be
+       completed by the LSP: no payment is started or accepted any more.
+       Returning hands over to the close ceremony, the only thing left that
+       this client takes part in. */
+    if (client_close_signed_for_factory(factory)) {
+        fprintf(stderr, "Client %u: a cooperative close of this factory was "
+                "signed earlier; the channel is frozen and no payment is "
+                "run. Only a close or a unilateral exit (--force-close) can "
+                "follow.\n", my_index);
+        return 1;
+    }
+
     /* Derive HTLC cltv from factory timeout (must expire before factory) */
     uint32_t htlc_cltv = factory->cltv_timeout > 40
                         ? factory->cltv_timeout - 40 : 500;
@@ -644,6 +658,13 @@ typedef struct {
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
+    /* Cooperative closes this client has signed for the current factory.
+       Once client_close_state_frozen() says so the factory is frozen: the loop
+       acts on nothing but a close proposal. */
+    client_close_state_t close_state;
+    /* 1 = a close ceremony ended without completing (see
+       daemon_close_outcome): the process must not report success. */
+    int     close_not_completed;
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -925,6 +946,51 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
 }
 
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
+/* A close ceremony ended without completing.  Record why, so that main()
+   does not report a clean exit, and tell the operator what is left to do.
+   Nothing is broadcast from here: a unilateral exit is the operator's call. */
+static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
+    cbd->close_not_completed = 1;
+    if (cbd->close_state.refused) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE REFUSED. This client did not sign "
+            "what the LSP proposed (reason above); its channel is unchanged. "
+            "Unless the LSP proposes an acceptable close after a restart, "
+            "the factory needs a unilateral exit: run this client with "
+            "--force-close and the same --db to broadcast it.\n", my_index);
+    } else if (cbd->close_state.signed_close) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED after this client "
+            "signed it. The LSP may still broadcast that close (it pays this "
+            "client %llu sats), so the channel is frozen. Restart to let the "
+            "LSP propose the close again, or run with --force-close and the "
+            "same --db to exit unilaterally.\n", my_index,
+            (unsigned long long)cbd->close_state.paid_sats);
+    } else if (cbd->close_state.record_error) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. This client's record "
+            "of signed closes cannot be read from its database, so it signed "
+            "nothing and treats the channel as frozen. Repair the database "
+            "and restart, or run with --force-close and the same --db to "
+            "exit unilaterally.\n", my_index);
+    } else {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. The ceremony failed "
+            "before this client signed anything (reason above). The factory "
+            "is still open and the channel is unchanged and still usable: "
+            "restart this client to carry on or to let the LSP propose the "
+            "close again.\n", my_index);
+    }
+}
+
+/* This client's own chain tip height, 0 if no chain backend can tell. */
+static uint32_t client_tool_chain_tip(void *ctx) {
+    watchtower_t *wt = (watchtower_t *)ctx;
+    if (!wt || !wt->chain || !wt->chain->get_block_height) return 0;
+    int h = wt->chain->get_block_height(wt->chain);
+    return h > 0 ? (uint32_t)h : 0;
+}
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -1031,6 +1097,29 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             cJSON_Delete(stale_imsg.json);
     }
 
+    /* Load what this client has already signed for this factory.  The same
+       cbd is reused across reconnects and rotations, so this runs on every
+       entry, against the factory now in use. */
+    client_close_state_init(&cbd->close_state, cbd->db, factory);
+    if (client_close_state_frozen(&cbd->close_state, factory)) {
+        if (cbd->close_state.signed_close)
+            fprintf(stderr, "Client %u: a cooperative close of this factory "
+                    "was signed earlier (paying this client %llu sats) and "
+                    "may still be completed by the LSP. The channel is "
+                    "frozen: only a close paying at least that much will be "
+                    "signed. Use --force-close to exit unilaterally.\n",
+                    my_index,
+                    (unsigned long long)cbd->close_state.paid_sats);
+        else
+            fprintf(stderr, "Client %u: this client's record of signed "
+                    "closes CANNOT BE READ from its database, so it cannot "
+                    "rule out that a close of this factory was signed. The "
+                    "channel is treated as frozen until the record can be "
+                    "read: no payment or state change is processed and no "
+                    "close is signed. Repair the database, or use "
+                    "--force-close to exit unilaterally.\n", my_index);
+    }
+
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
     /* Log factory lifecycle once (Tier 2) */
@@ -1064,7 +1153,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
        revocation + FULFILL.  Fired once, here, immediately after CHANNEL_READY
        (the LSP --demo loop is already "waiting for payments" by this point —
        same timing the old standalone_channel_cb used successfully). */
-    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated) {
+    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated &&
+        !client_close_state_frozen(&cbd->close_state, factory)) {
         uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
                                 ? factory->cltv_timeout - 40 : 500;
         for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
@@ -1119,7 +1209,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         {
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
-                if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
+                if (imsg.msg_type == MSG_COMMITMENT_SIGNED &&
+                    !client_close_state_frozen(&cbd->close_state, factory)) {
                     /* Save old state for deferred watchtower registration.
                        LSP revocation arrives later as MSG_LSP_REVOKE_AND_ACK. */
                     if (cbd->wt) {
@@ -1195,6 +1286,32 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
 handle_message:
+        /* A cooperative close of this factory was signed and may still be
+           completed by the LSP, or the record that would say so cannot be
+           read.  Nothing that changes the channel or the factory tree is
+           acted on any more: only a close proposal (which the ceremony
+           accepts if it pays at least as much, and does not sign while the
+           record is unreadable), keepalives and the LSP's own revocations,
+           which only add to what this client can prove.  Everything else is
+           dropped unanswered.  The record is read again here while it is
+           unreadable, so an error that passes lifts the freeze. */
+        if (!client_close_frozen_allows_msg(msg.msg_type) &&
+            client_close_state_frozen(&cbd->close_state, factory)) {
+            if (cbd->close_state.signed_close)
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
+                        "cooperative close of this factory was already "
+                        "signed; only a close or a unilateral exit "
+                        "(--force-close) can follow\n", my_index,
+                        msg.msg_type);
+            else
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — this "
+                        "client's record of signed closes cannot be read, "
+                        "so the channel is treated as frozen\n", my_index,
+                        msg.msg_type);
+            if (msg.json) cJSON_Delete(msg.json);
+            continue;
+        }
+
         switch (msg.msg_type) {
         case MSG_UPDATE_ADD_HTLC: {
             /* Save pre-add state (this is the OLD commitment being revoked) */
@@ -1514,6 +1631,44 @@ handle_message:
             break;
         }
 
+        case MSG_UPDATE_FAIL_HTLC: {
+            /* The LSP gives an HTLC back.  One it never took is simply
+               dropped.  One that was committed is failed and the commitment
+               exchange follows, exactly as after a fulfil. */
+            uint64_t pre_fail_local = ch->local_amount;
+            uint64_t pre_fail_remote = ch->remote_amount;
+            htlc_t pre_fail_htlcs[MAX_HTLCS];
+            size_t pre_fail_n_htlcs = ch->n_htlcs;
+            if (pre_fail_n_htlcs > 0)
+                memcpy(pre_fail_htlcs, ch->htlcs, pre_fail_n_htlcs * sizeof(htlc_t));
+
+            int fail_committed = 0;
+            uint64_t fail_htlc_id = 0;
+            int fail_ok = client_handle_fail_htlc(ch, &msg, &fail_committed,
+                                                   &fail_htlc_id);
+            cJSON_Delete(msg.json);
+            if (fail_ok && fail_committed) {
+                if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                         ctx, keypair, my_index, &cbd->inbox) &&
+                    msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    client_handle_commitment_signed(fd, ch, ctx, &msg);
+                    client_persist_commitment_sig(ch, cbd);
+                    if (msg.json) cJSON_Delete(msg.json);
+                    client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                        pre_fail_local, pre_fail_remote,
+                        pre_fail_n_htlcs > 0 ? pre_fail_htlcs : NULL, pre_fail_n_htlcs,
+                        keypair, my_index);
+                } else {
+                    if (msg.json) cJSON_Delete(msg.json);
+                }
+            }
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+            break;
+        }
+
         case MSG_LSP_REVOKE_AND_ACK: {
             /* LSP's own revocation, arriving naturally in the daemon loop.
                This happens when a queued CS was processed from the inbox:
@@ -1559,12 +1714,33 @@ handle_message:
             break;
         }
 
-        case MSG_CLOSE_PROPOSE:
+        case MSG_CLOSE_PROPOSE: {
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
-            client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                      factory, n_participants, &msg, 0, ch, 0);
+            int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
+                                      factory, n_participants, &msg,
+                                      client_chain_tip(), ch,
+                                      &cbd->close_state, 0);
             cJSON_Delete(msg.json);
+            if (!close_ok && cbd->close_state.unverifiable &&
+                !client_close_state_frozen(&cbd->close_state, factory)) {
+                /* The client could not check the proposal (no chain tip).
+                   It signed and recorded nothing, now or earlier, and told
+                   the LSP to try again, so this is neither a close nor a
+                   refusal: keep serving the channel.  If a close of this
+                   factory is on record from before, or the record cannot be
+                   read, the channel is frozen and this is a close that did
+                   not complete, handled below. */
+                fprintf(stderr,
+                    "Client %u: cooperative close NOT signed: this client "
+                    "could not verify the proposal (reason above) and asked "
+                    "the LSP to try again. The channel is unchanged and still "
+                    "usable; staying connected.\n", my_index);
+                break;
+            }
+            if (!close_ok)
+                daemon_close_outcome(cbd, my_index);
             return 2;  /* close already handled */
+        }
 
         case MSG_CREATE_INVOICE: {
             /* LSP asks us to create an invoice (Phase 17) */
@@ -2000,7 +2176,7 @@ handle_message:
             printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
 
             /* Save pubkeys from current factory */
-            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS];
+            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS] = {0};
             for (size_t pi = 0; pi < n_participants; pi++)
                 saved_pubkeys[pi] = factory->pubkeys[pi];
 
@@ -2089,6 +2265,13 @@ handle_message:
             if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf advance failed\n", my_index);
+            } else if (cbd && cbd->db &&
+                       !persist_save_tree_nodes(cbd->db, factory, 0)) {
+                /* The ceremony completed (it ends with the LSP's DONE), so
+                   the tree in memory is the advanced one this client signed:
+                   persist it so a crash recovers the current leaf state. */
+                fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
+                        "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2100,27 +2283,25 @@ handle_message:
                Client's factory already has the correct unsigned tx from PROPOSE. */
             int leaf_side;
             if (wire_parse_leaf_advance_done(msg.json, &leaf_side)) {
-                printf("Client %u: leaf %d advance confirmed by LSP\n",
+                /* A DONE seen here is the LSP's broadcast for a leaf whose
+                   ceremony this client took no part in (another client's
+                   leaf, or one it refused).  Nothing was accepted, so
+                   nothing is persisted; an advance this client signed is
+                   persisted where its ceremony completes, above. */
+                printf("Client %u: LSP reports leaf %d advanced\n",
                        my_index, leaf_side);
-                /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
-                   recovers the CURRENT leaf state, not the last-rotation snapshot.
-                   The factory already holds the advanced tx from the PROPOSE ceremony. */
-                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
-                    fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
-                            "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
         }
 
         case MSG_LEAF_REALLOC_PROPOSE: {
-            /* LSP proposes leaf reallocation — run the full ceremony
-               (nonce exchange + partial sig exchange + done confirmation). */
+            /* LSP proposes a leaf reallocation.  The client refuses every
+               one (see client_handle_leaf_realloc): it answers with an error
+               and its leaf and channel are unchanged, so the loop goes on. */
             wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
-            if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
-                                              my_index, &propose_msg)) {
-                fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
-            }
+            client_handle_leaf_realloc(fd, ctx, keypair, factory,
+                                        my_index, &propose_msg);
             cJSON_Delete(msg.json);
             break;
         }
@@ -2360,6 +2541,10 @@ static void usage(const char *prog) {
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
+        "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
+        "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
+        "                                    (outside regtest) and must match it.  The lookup is a direct HTTP\n"
+        "                                    connection: refused together with --tor-proxy / --tor-only.\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
@@ -2376,6 +2561,9 @@ static void usage(const char *prog) {
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --test-allow-tree-advance         Harness only (refused on mainnet): co-sign leaf, state and\n"
+        "                                    sub-factory advances, which are otherwise refused because\n"
+        "                                    they do not move the channel onto the new tree\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
@@ -2753,6 +2941,11 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--test-allow-tree-advance") == 0) {
+            /* Harness only (the --test- prefix is refused on mainnet):
+               co-sign leaf, state and sub-factory advances, which the client
+               otherwise refuses because they do not re-anchor its channel. */
+            client_set_allow_tree_advance(1);
         } else if (strcmp(argv[i], "--force-close") == 0) {
             force_close = 1;
         } else if (strcmp(argv[i], "--sweep-to-local") == 0) {
@@ -2796,42 +2989,40 @@ int main(int argc, char *argv[]) {
     if (use_json_log)
         ss_log_set_json(1);
 
-    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
-       test/cheat scaffolding flags on mainnet (footgun guard). */
-    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port while the exact-"mainnet" guards
-       would not fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
         }
-        /* G2 (gap-scan): mirror the LSP -- also refuse cheat/kill/crash ENV vars on
-           mainnet (SS_CHEAT_* are gate-inert, but SUPERSCALAR_CRASH* -> abort() is
-           env-driven; fail LOUD rather than silently accept a crash knob). */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
+        network = canonical;
+    }
+    /* A recovery phrase with a typo would derive a different, empty wallet
+       without any error: refuse it before anything is derived from it. */
+    if (hd_mnemonic) {
+        bip39_status_t mn_status = bip39_check(hd_mnemonic);
+        if (mn_status != BIP39_OK) {
+            fprintf(stderr, "Error: invalid --hd-mnemonic: %s\n",
+                    bip39_status_str(mn_status));
+            return 1;
+        }
+    }
+    /* Defense-bypass cheats are inert unless this is regtest. */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    /* Mainnet refuses test/cheat scaffolding in the arguments and in the
+       environment (see network.h). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        if (!network_gate_no_test_scaffolding(network, argc, argv, environ,
+                                              gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
     }
 
@@ -3305,6 +3496,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -3320,8 +3518,10 @@ int main(int argc, char *argv[]) {
             }
             secure_zero(mnemonic, sizeof(mnemonic));
         } else {
-            if (!bip39_validate(from_mnemonic)) {
-                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+            bip39_status_t mn_status = bip39_check(from_mnemonic);
+            if (mn_status != BIP39_OK) {
+                fprintf(stderr, "Error: invalid --from-mnemonic: %s\n",
+                        bip39_status_str(mn_status));
                 return 1;
             }
             if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
@@ -3338,22 +3538,26 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
-    }
-
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
-        return 1;
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding, and a
+       database for persistent state. */
+    {
+        extern char **environ;
+        char gate_err[512];
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_CLIENT,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
+        }
     }
 
     /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
@@ -3368,6 +3572,26 @@ int main(int argc, char *argv[]) {
             "       Without it, an adversarial LSP could claim a larger\n"
             "       funding_amount than actually exists; see audit 2026-05-17.\n",
             network);
+        return 1;
+    }
+
+    /* Every network except regtest needs the LSP's key pinned with
+       --lsp-pubkey.  Checked here, before a keyfile or anything else is
+       created; the endpoint resolution below enforces the same rule. */
+    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
+        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                "(prevents MITM attacks)\n");
+        return 1;
+    }
+
+    /* The well-known lookup is a direct HTTP connection.  With Tor in use it
+       would reveal this host to the LSP's domain, so the two are not combined. */
+    if (lsp_domain && (tor_proxy_arg || tor_only)) {
+        fprintf(stderr,
+            "Error: --lsp DOMAIN cannot be used with --tor-proxy / --tor-only.\n"
+            "  The lookup of /.well-known/lsps.json is a direct clearnet HTTP\n"
+            "  connection and would bypass Tor. Give the LSP's address with\n"
+            "  --host and --port (and its key with --lsp-pubkey) instead.\n");
         return 1;
     }
 
@@ -3406,20 +3630,33 @@ int main(int argc, char *argv[]) {
     } else if (keyfile_path) {
         secp256k1_context *tmp_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        if (keyfile_load(keyfile_path, seckey, passphrase)) {
-            printf("Client: loaded key from %s\n", keyfile_path);
-            key_loaded = 1;
-        } else {
-            printf("Client: generating new key and saving to %s\n", keyfile_path);
-            if (keyfile_generate(keyfile_path, seckey, passphrase, tmp_ctx)) {
-                key_loaded = 1;
-            } else {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(tmp_ctx);
-                return 1;
-            }
-        }
+        /* A new key is only ever created when no file exists at the path. */
+        keyfile_open_result_t kf_res =
+            keyfile_load_or_generate(keyfile_path, seckey, passphrase, tmp_ctx);
         secp256k1_context_destroy(tmp_ctx);
+        switch (kf_res) {
+        case KEYFILE_OPEN_LOADED:
+            printf("Client: loaded key from %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("Client: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            return 1;
+        case KEYFILE_OPEN_INSECURE_MODE:
+            fprintf(stderr, "Error: refusing to start with keyfile %s: its permissions\n"
+                "  let every user read it (details above).\n", keyfile_path);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            return 1;
+        }
+        key_loaded = 1;
     }
 
     if (!key_loaded) {
@@ -3450,40 +3687,63 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Bootstrap from well-known endpoint: overrides --host, --port, --lsp-pubkey */
-    static char wk_host_buf[256];
-    static char wk_pubkey_buf[128];
-    if (lsp_domain) {
-        uint16_t wk_port = 0;
-        printf("Client: fetching /.well-known/lsps.json from %s ...\n",
-               lsp_domain);
-        if (!lsp_wellknown_fetch_http(lsp_domain,
-                                      wk_host_buf, sizeof(wk_host_buf),
-                                      &wk_port, wk_pubkey_buf,
-                                      sizeof(wk_pubkey_buf))) {
+    /* Where to connect, and which key authenticates the LSP.  With --lsp the
+       well-known endpoint supplies the host and port.  Its response travels
+       over plain HTTP, so the public key in it is not proof of anything and
+       never becomes the pinned key: only --lsp-pubkey does, and every network
+       except regtest requires it. */
+    static lsp_endpoint_t lsp_endpoint;
+    {
+        if (lsp_domain)
+            printf("Client: fetching /.well-known/lsps.json from %s ...\n",
+                   lsp_domain);
+        lsp_endpoint_status_t ep_status = lsp_wellknown_resolve_endpoint(
+            lsp_domain, 80, host, port, lsp_pubkey_hex,
+            strcmp(network, "regtest") != 0, &lsp_endpoint);
+
+        if (lsp_domain && ep_status != LSP_ENDPOINT_FETCH_FAILED) {
+            printf("Client: bootstrapped from %s -> %s:%d\n",
+                   lsp_domain, lsp_endpoint.host, lsp_endpoint.port);
+            if (lsp_endpoint.pinned_pubkey_hex)
+                printf("Client: advertised LSP pubkey matches --lsp-pubkey\n");
+            else if (ep_status != LSP_ENDPOINT_PIN_MISMATCH)
+                printf("Client: %s advertises LSP pubkey %s\n"
+                       "Client: that key was fetched over unauthenticated HTTP and is NOT trusted.\n"
+                       "Client: confirm it with the LSP operator out of band, then pass it\n"
+                       "Client: with --lsp-pubkey.\n",
+                       lsp_domain, lsp_endpoint.advertised_pubkey_hex);
+        }
+
+        switch (ep_status) {
+        case LSP_ENDPOINT_OK:
+            break;
+        case LSP_ENDPOINT_FETCH_FAILED:
             fprintf(stderr, "Client: failed to fetch well-known from %s\n",
                     lsp_domain);
+            break;
+        case LSP_ENDPOINT_PIN_MISMATCH:
+            fprintf(stderr,
+                "Error: --lsp-pubkey does not match the key advertised by %s.\n"
+                "  --lsp-pubkey: %s\n"
+                "  advertised:   %s\n"
+                "  Either the LSP has changed its key (confirm the new key with the\n"
+                "  operator out of band) or the response did not come from your LSP.\n",
+                lsp_domain, lsp_pubkey_hex, lsp_endpoint.advertised_pubkey_hex);
+            break;
+        case LSP_ENDPOINT_PIN_REQUIRED:
+            fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                    "(prevents MITM attacks)\n");
+            break;
+        }
+        if (ep_status != LSP_ENDPOINT_OK) {
             memset(seckey, 0, 32);
             report_close(&rpt);
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        host = wk_host_buf;
-        port = (int)wk_port;
-        if (!lsp_pubkey_hex)
-            lsp_pubkey_hex = wk_pubkey_buf;
-        printf("Client: bootstrapped from %s -> %s:%d pubkey %s\n",
-               lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
-    }
-
-    /* Require --lsp-pubkey on non-regtest to prevent MITM */
-    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
-        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
-                "(prevents MITM attacks)\n");
-        memset(seckey, 0, 32);
-        report_close(&rpt);
-        secp256k1_context_destroy(ctx);
-        return 1;
+        host = lsp_endpoint.host;
+        port = lsp_endpoint.port;
+        lsp_pubkey_hex = lsp_endpoint.pinned_pubkey_hex;
     }
 
     /* NK authentication: pin LSP static pubkey if provided */
@@ -3606,6 +3866,10 @@ int main(int argc, char *argv[]) {
 
     watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, client_fee_ptr,
                       use_db ? &db : NULL);
+    /* The close ceremony bounds a proposal's nLockTime by this client's own
+       chain tip, read from whatever chain backend the watchtower ends up
+       with (bitcoind RPC, or the light client attached below). */
+    client_set_chain_tip_source(client_tool_chain_tip, &client_wt);
 
     /* Attach BIP 158 light client as chain backend (overrides regtest backend) */
     if (light_client_arg) {
@@ -3789,6 +4053,9 @@ int main(int argc, char *argv[]) {
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
+        /* A close that did not complete is not a clean exit. */
+        if (cbd.close_not_completed)
+            ok = 0;
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
@@ -3835,6 +4102,8 @@ int main(int argc, char *argv[]) {
             if (cbd.force_close_requested)
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
+            if (cbd.close_not_completed)
+                ok = 0;
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */
             multi_payment_data_t data = { actions, n_actions, 0 };

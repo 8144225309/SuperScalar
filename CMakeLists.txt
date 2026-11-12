@@ -162,6 +162,7 @@ add_library(superscalar
     src/crypto_aead.c
     src/noise.c
     src/keyfile.c
+    src/secure_file.c
     src/hd_key.c
     src/jit_channel.c
     src/tor.c
@@ -231,6 +232,7 @@ add_library(superscalar
     src/scb.c
     src/onion_message.c
     src/cli_arity.c
+    src/network.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -288,6 +290,7 @@ add_executable(test_superscalar
     tests/test_channel.c
     tests/test_adaptor.c
     tests/test_ladder.c
+    tests/test_rotation_creation.c
     tests/test_wire.c
     tests/test_channels.c
     tests/spend_helpers.c
@@ -297,6 +300,7 @@ add_executable(test_superscalar
     tests/test_regtest_hybrid_cln.c
     tests/test_persist.c
     tests/test_adversarial_verify.c
+    tests/test_client_signing.c
     tests/test_persist_wt.c
     tests/test_bridge.c
     tests/test_daemon.c
@@ -311,6 +315,7 @@ add_executable(test_superscalar
     tests/test_property.c
     tests/test_backup.c
     tests/test_keyfile.c
+    tests/test_secure_file.c
     tests/test_bip39.c
     tests/test_rate_limit.c
     tests/test_fee_estimator.c
@@ -375,6 +380,7 @@ add_executable(test_superscalar
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_cli_arity.c
+    tests/test_network.c
     tests/test_prometheus.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)

@@ -84,6 +84,14 @@ echo "LSP_KEY=$LSP_KEY"
 
 **Keep your key safe.** With BIP39, you can recover from the 24 words. Without it, if the keyfile is lost and you have active factories, you'll need to wait for CLTV timeout to recover funds.
 
+**How the keyfile is handled**
+
+- **A keyfile is never overwritten.** `--generate-mnemonic` and `--from-mnemonic` refuse to run if anything already exists at `--keyfile`. A normal start creates a key only when nothing exists at the path.
+- **A keyfile that is there but cannot be loaded is an error.** With a wrong or missing `--passphrase`, or a damaged file, the daemon exits and leaves the file untouched; it does not start with a new key. To start over with a new key, move the old file away first.
+- **A recovery phrase is checked before use.** `--from-mnemonic` and `--hd-mnemonic` accept 12, 15, 18, 21 or 24 lower-case words from the BIP39 English list with a valid checksum (extra spaces are ignored) and exit with the reason otherwise.
+- **Keyfiles are private.** New keyfiles are created with mode `0600`. An existing keyfile that group or others can access is tightened to `0600` at start-up, with a warning, when it is a regular file owned by the user running the daemon, has no other hard links and is not reached through a symbolic link. Otherwise its mode is left alone: a keyfile readable only by its group (for example `root:superscalar 0640`, read by the service user) is used with a warning; a keyfile readable by every user is refused with an error naming the mode. For a mounted secret, set the mount's file mode to `0400` or `0440`.
+- **Writing a keyfile needs a writable directory.** The file is written under a temporary name (`<keyfile>.ss-partial.XXXXXX`) in the same directory and then moved into place, so the directory must be writable and a crash never leaves a half-written key. A `--keyfile` path that is a symbolic link can be read but is never written to.
+
 ## 4. Start the LSP
 
 ### Minimal (Regtest)
@@ -189,13 +197,13 @@ Press **Ctrl+C**. The LSP will:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--keyfile` | none | Encrypted keyfile path (alternative to --seckey) |
+| `--keyfile` | none | Encrypted keyfile path (alternative to --seckey; required on mainnet, where `--seckey` is refused). Created if nothing exists at the path; never overwritten. See "How the keyfile is handled" in section 3 |
 | `--passphrase` | none | Keyfile decryption passphrase |
 | `--encrypt-db` | off (forced on mainnet) | Encrypt secret columns (HD seed, revocation/channel secrets) at rest |
 | `--tor-proxy` | none | SOCKS5 proxy for Tor (e.g. `127.0.0.1:9050`) |
 | `--tor-control` | none | Tor control port for hidden service creation |
-| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
-| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words |
+| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit. Refuses if `--keyfile` already exists |
+| `--from-mnemonic` | *(none)* | Derive keyfile from BIP39 mnemonic words (validated first). Refuses if `--keyfile` already exists |
 | `--mnemonic-passphrase` | "" | Optional BIP39 passphrase for seed derivation |
 | `--max-conn-rate` | 10 | Max inbound connections per minute per IP |
 | `--max-handshakes` | 4 | Max concurrent handshakes |
@@ -231,8 +239,8 @@ Press **Ctrl+C**. The LSP will:
 | `--cltv-timeout` | auto | Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest) |
 | `--regtest` | off | Shorthand for `--network regtest` |
 | `--i-accept-the-risk` | off | Required for mainnet operation |
-| `--backup` | — | Create encrypted backup and exit (passphrase via `SUPERSCALAR_BACKUP_PASSPHRASE` env) |
-| `--restore` | — | Restore from encrypted backup and exit |
+| `--backup PATH` | — | Create encrypted backup of `--db` and `--keyfile` at PATH and exit (passphrase via `SUPERSCALAR_BACKUP_PASSPHRASE` env) |
+| `--restore PATH` | — | Restore `--db` and `--keyfile` from the backup at PATH and exit. Never overwrites: see section 6 |
 | `--backup-verify` | — | Verify backup integrity and exit |
 | `--fee-bump-after` | 6 | Blocks before first RBF fee bump on funding TX |
 | `--fee-bump-max` | 3 | Maximum number of fee bump attempts |
@@ -280,11 +288,22 @@ export SUPERSCALAR_BACKUP_PASSPHRASE="your-secure-passphrase"
 # Verify a backup without restoring
 ./superscalar_lsp --backup-verify /path/to/backup.bak
 
-# Restore from backup
-./superscalar_lsp --restore /path/to/backup.bak
+# Restore from backup: --db and --keyfile name where the two files are written
+./superscalar_lsp --restore /path/to/backup.bak --db lsp.db --keyfile lsp.key
 ```
 
-Backup format (v2): `[magic][version][salt][iterations][nonce][ciphertext][tag]` using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations) and ChaCha20-Poly1305 AEAD encryption. V1 backups (`SSBK0001`) are auto-detected and can still be decrypted. The passphrase never touches disk.
+Backup format (v2): `[magic][version][iterations][salt][nonce][ciphertext][tag]` using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations) and ChaCha20-Poly1305 AEAD encryption. V1 backups (`SSBK0001`) are auto-detected and can still be decrypted. The passphrase never touches disk. A backup whose stored iteration count is outside 100,000 to 10,000,000 is rejected.
+
+**Restore never overwrites.** `--restore` exits with an error, naming the file in the way, if any of these exists:
+
+- the database (`--db`), or its SQLite sidecar files `<db>-wal`, `<db>-shm` or `<db>-journal`;
+- the keyfile (`--keyfile`).
+
+Stop the LSP, move the old database (with its sidecar files) and the old keyfile out of the way, then restore. Both files are written completely before either appears; the keyfile is put in place first, then the database. If the restore fails, neither file is normally left behind. If the process is killed between the two steps, or the keyfile cannot be removed again after a failure (an error names it), the keyfile is left without the database: delete it before running `--restore` again.
+
+**Failed writes are reported.** `--backup` and `--restore` write to a temporary file (`<name>.ss-partial.XXXXXX`) in the destination directory and move it into place only when it is complete on disk. On a full disk or any other write error they print `FAILED` and exit non-zero, and an older backup at the same path is left intact. The destination directory must be writable, and a destination that is a symbolic link is refused.
+
+**Permissions.** Backups, restored databases and restored keyfiles are created with mode `0600`. When a backup is read (`--backup-verify`, `--restore`), and when the keyfile is read for `--backup`, a file that group or others can access is tightened to `0600` with a warning, under the same conditions as for keyfiles (section 3): a regular file owned by the current user, with no other hard links, not reached through a symbolic link. Otherwise its mode is left alone and it is still read, so a backup on read-only media can be restored.
 
 Schedule regular backups in production. Keep backups on a separate machine.
 
@@ -313,6 +332,10 @@ For defense-in-depth, run `superscalar_watchtower` on a separate machine. It ope
   --rpcpassword YOUR_PASS
 ```
 
+On mainnet the watchtower, like the LSP and the client, starts only with `--i-accept-the-risk` and refuses `--cheat-*` / `--test-*` flags and `SS_CHEAT*`, `SS_KILL*` and `SUPERSCALAR_CRASH*` environment variables. `--network bitcoin` is another spelling of `--network mainnet` and is treated identically by all three daemons.
+
+The systemd unit in `tools/deploy/superscalar-watchtower.service` passes `$SS_WATCHTOWER_ARGS` from `/etc/superscalar/env`; for a mainnet watchtower set `SS_WATCHTOWER_ARGS=--i-accept-the-risk` there.
+
 The watchtower prints heartbeat messages and broadcasts the relevant pre-signed response automatically if a breach is detected. Because it holds no secrets and no keys, a compromised watchtower cannot construct any new transaction — verifiable with `nm` (see [`watchtower-trustless-schema.md`](watchtower-trustless-schema.md)). To fund CPFP fee-bumping of the anyone-can-spend P2A anchors under fee pressure, pass `--bump-wallet` (a wallet the bumper spends its own UTXOs from; the watchtower still signs nothing of the protocol).
 
 ### Watchtower flags
@@ -320,7 +343,8 @@ The watchtower prints heartbeat messages and broadcasts the relevant pre-signed 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--wt-db PATH` | **required** | Path to the watchtower response DB (pre-signed penalty/sweep/poison TXs; contains **no secrets**) |
-| `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
+| `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / testnet4 / mainnet. An unknown name is refused |
+| `--i-accept-the-risk` | off | Required for mainnet operation. On mainnet the watchtower also refuses `--cheat-*` / `--test-*` flags and `SS_CHEAT*`, `SS_KILL*`, `SUPERSCALAR_CRASH*` environment variables |
 | `--poll-interval N` | 30 | Seconds between block scans |
 | `--cli-path PATH` | bitcoin-cli | Path to bitcoin-cli binary |
 | `--rpcuser USER` | rpcuser | Bitcoin RPC username |
@@ -330,7 +354,6 @@ The watchtower prints heartbeat messages and broadcasts the relevant pre-signed 
 | `--bump-wallet NAME` | — | Funded wallet the CPFP fee-bumper draws UTXOs from (to CPFP the P2A anchor; the WT holds no protocol keys) |
 | `--max-bump-fee SATS` | 50000 | Cap on the fee of one CPFP child (penalty bumps and every pre-signed exit tx) |
 | `--bump-budget-pct N` | — | Percentage of channel value to budget for fee bumps |
-| `--inspect-db` | off | Diagnostic: dump factory state, breach detections, and chain-state assertions; exits without polling. Useful for forensics on a captured DB. |
 | `--version` | — | Show version and exit |
 | `--help` | — | Show help and exit |
 
@@ -427,15 +450,311 @@ The LSP automatically accepts bridge connections on its main port.
 
 The bridge connects to the LSP and listens on `--plugin-port` for the CLN plugin.
 
+The plugin port is bound to `127.0.0.1` unless `--plugin-bind` names another
+address. The bridge and the plugin authenticate each other with a shared
+secret. On first start the bridge writes a random secret to
+`--plugin-secret-file` (default `~/.superscalar/bridge-plugin.secret`, mode
+`0600`); the plugin reads the same file. The secret is never sent: each side
+sends a random nonce and proves it holds the secret with an HMAC over both
+nonces, the plugin checks the bridge first, and neither side acts on a message
+from a peer that has not passed. Both sides refuse a secret file that is not a
+regular file owned by their own user with no group or other permissions. The
+handshake also yields a session key, and every later line in either direction
+carries a MAC under it with a running counter, so a process between the two
+cannot add, alter, replay or drop a message without ending the connection. The
+link is not encrypted (payment hashes, amounts and preimages are readable to
+whoever can see the traffic), so keep it on loopback or a trusted network. Only
+one plugin connection is served at a time; further connections are closed.
+
 ### Step 3: Start CLN with the Plugin
 
 ```bash
 lightningd --network=regtest \
-  --plugin=/path/to/tools/cln_plugin.py \
+  --important-plugin=/path/to/tools/cln_plugin.py \
   --superscalar-bridge-host=127.0.0.1 \
   --superscalar-bridge-port=9736 \
+  --superscalar-bridge-secret-file=~/.superscalar/bridge-plugin.secret \
   --superscalar-lightning-cli=lightning-cli
 ```
+
+Load the plugin with `important-plugin=`, never with `plugin=`. With
+`plugin=`, `lightningd` keeps running when the plugin stops, and it then
+settles HTLCs for unpaid factory invoices by itself (see below).
+
+### Running the plugin as a different user
+
+`lightningd` normally runs under its own account, and both sides insist that
+the secret file belongs to the user reading it. Give each side its own copy:
+
+```bash
+# The bridge (user superscalar) creates its file on first start:
+#   --plugin-secret-file /var/lib/superscalar/bridge-plugin.secret
+# Copy it for lightningd (user cln), owner-only:
+sudo install -o cln -g cln -m 0600 \
+    /var/lib/superscalar/bridge-plugin.secret /var/lib/cln/bridge-plugin.secret
+```
+
+and point the plugin at its copy with
+`superscalar-bridge-secret-file=/var/lib/cln/bridge-plugin.secret`. Repeat the
+copy whenever the bridge's file is recreated. The plugin also needs a writable
+`superscalar-bridge-state-file` (default
+`~/.superscalar/bridge-plugin.state.json`), where it records outside payments
+until the LSP has acknowledged their result. `tools/deploy/start_bridge.sh`
+accepts `--plugin-bind` and `--plugin-secret-file` (or `PLUGIN_BIND` and
+`PLUGIN_SECRET_FILE`), `tools/deploy/superscalar-bridge.service` sets them, and
+`tools/deploy/cln-bridge.conf.example` shows the plugin side.
+
+The bridge exits with status 78 when it cannot run as configured: no
+`--lsp-pubkey`, a `--plugin-bind` that is not an IPv4 address, a secret
+directory it cannot create, or a secret file it cannot create or will not
+accept. The message says which. `start_bridge.sh` and the systemd unit do not
+restart it on that status.
+
+### What the plugin keeps on disk
+
+The plugin's state file (`superscalar-bridge-state-file`) holds what must
+survive a restart of `lightningd`: outside payments that were requested and
+whose result the LSP has not acknowledged, the HTLCs handed to the LSP and not
+yet resolved, and the factory invoices already fulfilled (with the preimage
+given). It is written atomically, mode `0600`, and records the CLN node id and
+the LSP key it belongs to.
+
+The plugin loads it before it does anything else and **stops** if the file
+cannot be read or parsed, belongs to another node, or cannot be written. With
+`important-plugin=` that stops `lightningd`. Do not delete the file to get
+going again without checking it: an open payment in it may still complete on
+the node (and would then never be reported to the LSP), and a held HTLC would
+be treated as new. A bridge that serves a different LSP than the one recorded
+is refused the link.
+
+### What the bridge checks do not cover
+
+Core Lightning holds every factory invoice together with its preimage (that
+is how it produces the BOLT11 string). The plugin therefore never lets CLN
+handle an HTLC for a factory invoice, deletes CLN's copy once the LSP has
+fulfilled it, and keeps fulfilled hashes closed across restarts. That
+protection is the plugin's, so it has limits:
+
+- **Plugin not loaded.** If `lightningd` runs without the plugin, CLN settles
+  any HTLC for an unpaid factory invoice by itself: the payer is charged and
+  the node keeps the money, while the factory client is not paid. This was
+  seen on CLN v26.06.9 with the plugin loaded as `plugin=` and stopped.
+  `important-plugin=` is therefore required: CLN then stops when the plugin
+  does. Do not start `lightningd` without the plugin while factory invoices
+  are outstanding.
+- **Outside payments are not reachable from the stock client.** The LSP pays
+  an outside invoice when a client offers an HTLC that carries the invoice,
+  but `superscalar_client` has no command that sends one. The path is
+  exercised by tests only.
+- **Keysend is refused.** A keysend arriving at the node is failed with
+  `incorrect_or_unknown_payment_details`, whether or not it was meant for a
+  factory client: nothing delivers a keysend's preimage to a factory client,
+  and CLN's own keysend handling would settle it for the node, including one
+  whose payment hash an outside payment in flight is using. The node cannot
+  receive keysends while the plugin is loaded.
+- **An outside payment that fails** is failed back to the client with a full
+  commitment exchange. One that is refused before the LSP takes the HTLC (bad
+  invoice, deadline too close, bridge down) is answered with a failure marked
+  `uncommitted`, and both sides drop the HTLC without a commitment exchange.
+  If the client does not complete an exchange the LSP started, the LSP
+  closes that client's connection and finishes the exchange when the client
+  reconnects.
+- **Invoices from the LSP's own invoice code** (payee is the LSP key, which
+  is not a node in the Lightning graph) can only be paid by a sender that is
+  given a route hint through the Lightning node. Invoices created through the
+  plugin are CLN's own and do not have this limit.
+- **Self-payment.** A factory client paying another factory client's invoice
+  as an outside payment is refused by the LSP (`invoice_is_internal`) and by
+  the plugin (invoice issued by, or payable to, this node). Both checks rely
+  on the registries of the running LSP and plugin.
+- **One use per payment hash.** A hash with an HTLC in flight, or one that was
+  paid in either direction, is not accepted for a new invoice or a new inbound
+  payment. The LSP's memory of completed hashes is bounded (the last 64
+  outside payments, the last 32 inbound fulfils) and is not restored after an
+  LSP restart, except for inbound fulfils the bridge has not yet confirmed.
+- **Multi-part payments** to a factory invoice are refused part by part; the
+  payer has to send the full amount in one HTLC.
+- **HTLC replay** after a `lightningd` restart is matched by CLN's own HTLC
+  name (`short_channel_id` and `id` in the `htlc_accepted` hook). An HTLC CLN
+  does not name cannot be matched: the repeat is refused, and it is not
+  offered to the LSP again after a bridge reconnect.
+- **A pay result the LSP rejects** (for instance a success whose preimage
+  does not match) leaves the client's HTLC held and is logged as an error by
+  the LSP and the plugin. Nothing resolves it automatically.
+- **An outside payment whose result never arrives** (node or bridge down for
+  good) leaves the client's HTLC held; the LSP warns near its expiry, with or
+  without a bridge connection, and does not fail it on a timer.
+- **An outside payment held by the remote side.** The node's own outgoing
+  HTLC must expire well before the client's HTLC does: the LSP keeps back the
+  blocks it needs to claim the client's HTLC in the factory (in one run
+  `pay` was given `maxdelay=17` for a client HTLC that expired more than 100
+  blocks later). If the payee or a hop holds the payment until that earlier
+  expiry, CLN closes its channel unilaterally to take the HTLC back on-chain.
+  The payment then fails and the client is refunded, long before the
+  client's own HTLC would have expired, and the operator bears the cost of a
+  channel close.
+- **A channel that is closed and forgotten while its incoming HTLC is
+  held.** CLN v26.06.9 aborted (`SIGABRT` in `htlc_accepted_hook_final`) when
+  a held `htlc_accepted` hook was answered after the HTLC's channel had been
+  closed on-chain and CLN had logged `onchaind complete, forgetting peer`.
+  Before answering, the plugin asks `listpeerchannels`; if CLN answers and no
+  longer lists the channel, the plugin does not answer the hook. A channel
+  that is still listed gets its answer in every state, including
+  `AWAITING_UNILATERAL` and `ONCHAIN`: while a channel is being closed, the
+  answer is how CLN learns the preimage it needs to claim the HTLC. Which
+  closing states are safe to answer in has not been established from CLN's
+  source for this version; only the forgotten-channel case was observed and
+  only that case is guarded. If the withheld answer was a fulfil, the
+  factory client has been paid and the incoming payment has not been
+  settled. The plugin then keeps the preimage in its state file under
+  `unresolved`, logs an error, and reports `htlc_unresolved` to the LSP. The
+  LSP logs `the Lightning node could not take the fulfil` with the payment
+  hash, the upstream HTLC and the preimage, keeps the fulfil in its database
+  and does not treat it as delivered. Recovering the money is up to the
+  operator. The check and the answer are two steps; a channel forgotten
+  between them is not caught.
+- **An inbound HTLC that nears its expiry while the bridge is away** is
+  failed back to the client. The Lightning node still holds its HTLC; the
+  LSP keeps the failure on record and tells the bridge when it is connected
+  again, or when the plugin offers the held HTLC again.
+- **Keepalive messages.** The LSP's waits for a client's reply in the bridge
+  paths skip keepalive pings and pongs. The waits in the reconnect
+  retransmission and in the operator-initiated payment commands do not yet:
+  a keepalive arriving there is taken for the awaited reply and the exchange
+  is abandoned until the client reconnects.
+- **Deadlines.** The check that an HTLC's expiry is far enough past the
+  current block height is applied to outside payments only, not yet to
+  inbound and factory-internal HTLCs.
+- **The plugin link** is authenticated line by line but not encrypted.
+- **A bridge restart** loses its table of pending inbound HTLCs and its queue
+  for the plugin. The plugin offers its held HTLCs again when it reconnects
+  and the LSP repeats unconfirmed fulfils, which covers both; a pay request
+  that was only in the bridge's queue is lost, and its client HTLC stays held.
+
+### Known limits of channel updates in this release
+
+The LSP and a client change a channel's state with a short exchange: the
+change (an HTLC added, fulfilled or failed), the LSP's commitment signature,
+the client's revocation, the LSP's revocation. The following holds for every
+such exchange, not only for the bridge:
+
+- **A connection lost in the middle.** When the client reconnects, the LSP
+  sends the pending commitment signature again but not the change it belongs
+  to (the fulfil or fail itself). A client that never received the change
+  cannot verify that signature, and the two sides can fail to converge on
+  the same state.
+  A commitment that is pending at reconnect is settled only by the client's
+  valid revocation: if the client does not send one (it cannot, if it never
+  received the change), the LSP keeps the commitment pending, refuses the
+  reconnect and closes the connection. Such a client cannot reconnect until
+  the operator deals with the channel.
+- **Messages that arrive out of turn.** While the LSP is waiting for a
+  client's reply, any other message that client sends is dropped, not queued.
+  A request sent at that moment is lost and has to be sent again.
+- **Signatures before storage.** The LSP sends its commitment signature
+  before the new state is durably saved. A crash between the two leaves the
+  client with a signature for a state the LSP does not remember.
+
+- **An inbound HTLC failed near its expiry.** The LSP tells the Lightning
+  node to fail the incoming HTLC as soon as it has failed the HTLC towards
+  the client; it does not first wait for the client's revocation of the
+  state that still contained it.
+- **A fulfil the Lightning node could not take** stays on the LSP's record
+  until the node acknowledges it; nothing else clears it, and it is offered
+  to the node again after each LSP start. The LSP drops such records after
+  14 days. The plugin's state file keeps the preimage.
+
+What is checked: a revocation whose secret does not match the point the
+client committed to is refused, the exchange counts as not done and the
+client is disconnected, and an HTLC whose addition the client did not
+revoke for is failed and goes no further; the LSP starts no second exchange on a channel while
+one is in progress (a result from the Lightning node for that channel waits
+its turn); a client can fail only an HTLC it received, and takes back an HTLC
+of its own only if the LSP has signed nothing that contains it.
+
+These limits are being addressed by moving every channel update
+onto one routine. They are not fixed in this release.
+
+### Live-node checklist
+
+The code relies on the following behaviour of CLN. Items marked `[x]` were
+seen to hold on regtest against Core Lightning v26.06.9 (one node with the
+plugin, one outside node, two factory clients); the others have not been
+exercised against a running node. Check each again on the CLN version you
+deploy.
+
+`htlc_accepted` hook
+- [x] `htlc.short_channel_id` and `htlc.id` are present and identify the
+      incoming HTLC; `htlc.amount_msat` is the amount received and
+      `htlc.cltv_expiry` its absolute expiry.
+- [x] `onion.payload` is the hop payload as it is in the onion: a BigSize
+      length followed by the TLV stream.
+- [x] After a restart, `lightningd` calls the hook again for every HTLC that
+      was unresolved, with the same `short_channel_id` and `id`.
+- [x] An HTLC stays held for as long as the plugin does not answer, including
+      across a bridge reconnect, and the answer may come from another thread.
+- [x] `{"result": "resolve", "payment_key": ...}` settles the HTLC without the
+      invoice being marked paid; `{"result": "fail", "failure_message":
+      "2002"}` and `"0017"` are accepted as failure messages.
+- [x] `{"result": "fail", "failure_message": "400f" + amount + height}`
+      (the answer to a keysend) reaches the sender as
+      `incorrect_or_unknown_payment_details`.
+- [x] `{"result": "continue"}` for a hash with no invoice forwards or fails
+      the HTLC as CLN would without the plugin.
+- [x] The hook registration `"before": ["keysend"]` is honoured: the plugin
+      sees a keysend before CLN's keysend plugin does.
+- [ ] The hook must not be answered once CLN has forgotten the HTLC's
+      channel (CLN aborts). `listpeerchannels` lists a channel under
+      `short_channel_id` or `alias` for as long as CLN can take the answer,
+      and answering with the preimage while the channel is closing lets CLN
+      claim the HTLC on-chain.
+
+Invoices
+- [x] `invoice` accepts `preimage`, `cltv`, `expiry` and
+      `exposeprivatechannels` together, and returns `bolt11`.
+- [x] `listinvoices` returns `label`, `payment_hash` and `status` (`unpaid`
+      until paid or expired).
+- [x] `delinvoice label=... status=unpaid` removes an invoice whose HTLC was
+      resolved through the hook.
+
+Outside payments
+- [x] `decode` returns `type: "bolt11 invoice"`, `valid`, `payment_hash`,
+      `amount_msat`, `payee` and `min_final_cltv_expiry`.
+- [x] `pay` accepts `maxfee`, `maxdelay` and `retry_for` together; `maxfee`
+      is an absolute amount in millisatoshi and bounds the total fee.
+- [x] `lightning-cli pay` prints a notification line starting with `# `
+      ahead of the JSON reply on success; `lightning-cli -N none` suppresses
+      it. An error is printed as a JSON object with `code` and `message`,
+      with exit status 1.
+- [ ] `pay` starts no new attempt after `retry_for` seconds, and none after
+      it has returned an error; a JSON-RPC error from `pay` means the command
+      is over.
+- [ ] `pay` for an invoice the node already paid returns the old preimage
+      without paying again (the reason the plugin checks `listsendpays`
+      first).
+- [x] `listpays payment_hash=...` reports `pending` while any part is in
+      flight, `failed` only when all parts failed, and `complete` with
+      `preimage`.
+- [x] `listsendpays payment_hash=...` returns `payments` with `status`.
+- [x] `getinfo` returns `id`, and RPC calls work from inside the plugin's
+      `init` handling.
+
+Plugin life cycle
+- [x] With `important-plugin=`, `lightningd` stops when the plugin exits
+      (the plugin exits on an unusable state file).
+- [x] The plugin's options are delivered in `init` as declared, and
+      `lightning-dir` is in `configuration`.
+- [x] `lightning-cli -k` with `--lightning-dir`/`--network` as the plugin
+      builds them reaches the node the plugin runs in.
+
+Deployment
+- [ ] `tools/deploy/superscalar-bridge.service` starts the bridge before
+      `lightningd`, and the copy of the secret file for the `lightningd` user
+      is accepted by the plugin.
+- [ ] End to end on the network you deploy on: an inbound payment to a
+      factory invoice, an outside payment from a factory client, each across
+      a restart of `lightningd`, of the bridge and of the LSP while the HTLC
+      is in flight.
 
 ### Bridge Daemon Flags
 
@@ -444,6 +763,8 @@ lightningd --network=regtest \
 | `--lsp-host HOST` | `127.0.0.1` | LSP hostname or IP address |
 | `--lsp-port PORT` | `9735` | LSP listening port |
 | `--plugin-port PORT` | `9736` | Port the bridge listens on for the CLN plugin |
+| `--plugin-bind ADDR` | `127.0.0.1` | IPv4 address the plugin port binds to |
+| `--plugin-secret-file PATH` | `~/.superscalar/bridge-plugin.secret` | File holding the secret the plugin must present; created (mode `0600`) if missing |
 | `--lsp-pubkey HEX` | *(none)* | LSP static pubkey (33-byte compressed hex) for NK-authenticated Noise handshake |
 | `--tor-proxy HOST:PORT` | `127.0.0.1:9050` | SOCKS5 proxy for connecting to the LSP over Tor |
 
@@ -453,6 +774,8 @@ lightningd --network=regtest \
 |--------|---------|-------------|
 | `--superscalar-bridge-host` | `127.0.0.1` | Bridge daemon hostname |
 | `--superscalar-bridge-port` | `9736` | Bridge daemon port |
+| `--superscalar-bridge-secret-file` | `~/.superscalar/bridge-plugin.secret` | File with the bridge's shared secret (written by the bridge); regular file, owned by the plugin's user, mode `0600` |
+| `--superscalar-bridge-state-file` | `~/.superscalar/bridge-plugin.state.json` | Where the plugin records outside payments until their result is acknowledged |
 | `--superscalar-lightning-cli` | `lightning-cli` | Path to `lightning-cli` binary (used for invoice creation) |
 
 ### Invoice Flow
@@ -513,6 +836,8 @@ lightning-cli plugin list | grep cln_plugin
 | "bridge socketpair failed" | Check file descriptor limits: `ulimit -n 4096` |
 | "no --lsp-pubkey, using unauthenticated NN handshake" | Add `--lsp-pubkey` with the LSP's static pubkey for production |
 | Plugin not connecting | Verify `--superscalar-bridge-port` matches `--plugin-port` |
+| Bridge logs `plugin connection failed authentication`, or the plugin logs `Peer on the bridge port does not hold the bridge secret` | The plugin's `--superscalar-bridge-secret-file` does not hold the secret in the bridge's `--plugin-secret-file` |
+| Plugin logs `Bridge secret ... must be a regular file owned by this user with mode 0600` | Fix the owner and mode of the plugin's copy of the secret file |
 | "INVOICE_BOLT11 for unknown hash" | Client must send `MSG_REGISTER_INVOICE` before the external payment arrives |
 | Bridge heartbeat timeout | Check network connectivity between bridge and LSP; default timeout is 30 seconds |
 | "htlc_accepted hook timeout" | Increase CLN's hook timeout or check bridge ↔ LSP latency |

@@ -266,7 +266,7 @@ int test_rgs_null_safety(void)
     rgs_node_id_t nodes[4];
     rgs_channel_t chans[4];
     rgs_snapshot_t snap;
-    unsigned char blob[256];
+    unsigned char blob[256] = {0};
 
     ASSERT(!rgs_parse(NULL, 100, &snap, nodes, 4, chans, 4), "NULL blob rejected");
     ASSERT(!rgs_parse(blob, 100, NULL, nodes, 4, chans, 4), "NULL snap rejected");

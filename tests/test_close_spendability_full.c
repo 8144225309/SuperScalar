@@ -82,7 +82,7 @@ static int fund_n_party_factory(regtest_t *rt,
                                  uint32_t *out_fund_vout,
                                  uint64_t *out_fund_amount) {
     /* Derive keypairs + pubkeys from deterministic seckeys. */
-    secp256k1_pubkey pks[5];
+    secp256k1_pubkey pks[5] = {0};
     for (size_t i = 0; i < n_participants; i++) {
         if (!secp256k1_keypair_create(ctx, &out_kps[i], N_PARTY_SECKEYS[i])) return 0;
         if (!secp256k1_keypair_pub(ctx, &pks[i], &out_kps[i])) return 0;
@@ -148,7 +148,6 @@ static int run_coop_close_for_arity(regtest_t *rt,
     const size_t N = 5;  /* 1 LSP + 4 clients */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -810,7 +809,6 @@ static int run_ps_chain_close_spendability(regtest_t *rt, secp256k1_context *ctx
     const size_t N = 3;  /* 1 LSP + 2 clients (minimum for PS MuSig) */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -1061,7 +1059,6 @@ static int run_rotation_for_arity(regtest_t *rt, secp256k1_context *ctx,
     const size_t N = 5;
     secp256k1_keypair kpsA[5], kpsB[5];
     factory_t *fA = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(fA);
     factory_t *fB = calloc(1, sizeof(factory_t));
     factory_alloc_default_arrays(fB);
     if (!fA || !fB) { free(fA); free(fB); return 0; }
@@ -1316,7 +1313,6 @@ static int run_full_tree_force_close_for_arity(regtest_t *rt,
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -2419,7 +2415,6 @@ int test_regtest_inversion_of_timeout_default(void) {
     const size_t N = 5;  /* LSP + 4 clients */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -2535,6 +2530,7 @@ int test_regtest_inversion_of_timeout_default(void) {
         regtest_mine_blocks(&rt, 1, mine_addr);
 
     char *dist_hex = malloc(signed_dist.len * 2 + 1);
+    TEST_ASSERT(dist_hex, "alloc dist hex");
     hex_encode(signed_dist.data, signed_dist.len, dist_hex);
     dist_hex[signed_dist.len * 2] = '\0';
     char dist_txid[65];
@@ -2595,7 +2591,6 @@ int test_regtest_old_state_poisoning(void) {
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -2760,7 +2755,6 @@ int test_regtest_kickoff_paired_with_latest_state(void) {
     const size_t N = 5;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -2903,7 +2897,6 @@ int test_regtest_full_force_close_and_sweep_arity1(void) {
     const size_t N = 2;  /* LSP + 1 client (smallest arity-1 factory) */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -3162,7 +3155,6 @@ int test_regtest_full_force_close_and_sweep_arity2(void) {
     const size_t N = 5;  /* LSP + 4 clients → 2 arity-2 leaves */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -3423,7 +3415,6 @@ int test_regtest_full_force_close_and_sweep_arityPS(void) {
     const size_t N = 3;  /* LSP + 2 clients → 2 PS leaves */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) { secp256k1_context_destroy(ctx); return 0; }
 
     unsigned char fund_spk[34];
@@ -3573,7 +3564,7 @@ int test_regtest_full_force_close_and_sweep_arityPS(void) {
 
         /* Build keyagg in signer_indices order: {LSP, client}. */
         secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t s = 0; s < leaf->n_signers; s++) {
             uint32_t sidx = leaf->signer_indices[s];
             signers[s] = kps[sidx];
@@ -3676,7 +3667,6 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
     const size_t N = 3;  /* LSP + 2 clients -> 2 PS leaves of 1 client each */
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -3873,7 +3863,7 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
                     "compute channel sighash");
 
         secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t s = 0; s < leaf0->n_signers; s++) {
             uint32_t sidx = leaf0->signer_indices[s];
             signers[s] = kps[sidx];
@@ -3978,7 +3968,7 @@ static int run_ps_chain_advance_sweep(regtest_t *rt,
                                               0xFFFFFFFEu),
                     "leaf1 channel sighash");
         secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+        secp256k1_pubkey pks[FACTORY_MAX_SIGNERS] = {0};
         for (size_t s = 0; s < leaf1->n_signers; s++) {
             uint32_t sidx = leaf1->signer_indices[s];
             signers[s] = kps[sidx];
@@ -4136,7 +4126,6 @@ static int run_htlc_force_to_local_for_arity(regtest_t *rt,
     const size_t N = n_participants;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -4605,7 +4594,6 @@ static int run_htlc_breach_for_arity(regtest_t *rt,
     const size_t N = n_participants;
     secp256k1_keypair kps[5];
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
 
     unsigned char fund_spk[34];
@@ -5356,7 +5344,6 @@ int test_regtest_mixed_arity_2_4_8_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8}. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);  /* step_blocks=4, states_per_layer=4 */
     /* Wider N-way state nodes are larger TXs than the binary builder's;
@@ -5955,7 +5942,7 @@ static int sweep_ps_channel_n_party(regtest_t *rt,
         tx_buf_free(&cu); return 0;
     }
     secp256k1_keypair signers[FACTORY_MAX_SIGNERS];
-    secp256k1_pubkey  signer_pks[FACTORY_MAX_SIGNERS];
+    secp256k1_pubkey  signer_pks[FACTORY_MAX_SIGNERS] = {0};
     for (size_t s = 0; s < leaf->n_signers; s++) {
         uint32_t sidx = leaf->signer_indices[s];
         signers[s] = kps[sidx];
@@ -6167,7 +6154,7 @@ static int run_ps_full_lifecycle(regtest_t *rt,
            (unsigned long long)total_advance_fees,
            (unsigned long long)total_allocated);
 
-    uint64_t expected_deltas[32];
+    uint64_t expected_deltas[32] = {0};
     for (size_t p = 0; p < N; p++) expected_deltas[p] = per_party_recv[p];
     TEST_ASSERT(econ_assert_wallet_deltas(&econ, expected_deltas, 0),
                 "per-party wallet deltas match expected");
@@ -6672,7 +6659,6 @@ int test_regtest_nway_n64_arity_2_4_8_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -6979,7 +6965,6 @@ int test_regtest_nway_n64_arity_2_4_8_static_threshold_1_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -7294,7 +7279,6 @@ int test_regtest_nway_n64_dw_advance_resign_lifecycle(void) {
 
     /* Build factory with mixed level arity {2, 4, 8} */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* Wider N-way state nodes need more fee than default 200 sats to
@@ -7623,7 +7607,6 @@ int test_regtest_static_near_root_lifecycle(void) {
 
     /* Build factory: arity {2,4}, static_threshold=1 (root kickoff-only) */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     /* PR #104 bumped fee_per_tx to 1000 sats for N-way regtest mempool floor. */
@@ -7923,7 +7906,6 @@ int test_regtest_static_near_root_unilateral_exit(void) {
     TEST_ASSERT(fund_vout != UINT32_MAX, "find fund vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f != NULL, "alloc factory");
     factory_init(f, ctx, kps, N, 4, 4);
     f->tree_fee_rate = 2000;

@@ -272,6 +272,9 @@ extern int test_lsps2_two_independent_entries(void);
 /* PR #17 Phase 2: LSP discovery */
 extern int test_wellknown_json_format(void);
 extern int test_client_bootstrap_from_domain(void);
+extern int test_wellknown_pubkey_never_pins(void);
+extern int test_client_endpoint_resolution(void);
+extern int test_wellknown_serve_fork_ports(void);
 /* PR #17 Phase 3: BOLT #7 gossip */
 extern int test_gossip_node_announcement_sign_verify(void);
 extern int test_gossip_channel_announcement_fields(void);
@@ -309,6 +312,12 @@ extern int test_bolt11_metadata_roundtrip(void);
 extern int test_bolt11_no_metadata(void);
 extern int test_bolt11_metadata_truncated(void);
 extern int test_bolt11_full_roundtrip_with_metadata(void);
+extern int test_bolt11_spec_valid_examples(void);
+extern int test_bolt11_spec_invalid_examples(void);
+extern int test_bolt11_reader_strictness(void);
+extern int test_bolt11_encode_signature_and_payee(void);
+extern int test_bolt11_long_invoice_checksum(void);
+extern int test_bolt11_amount_units_and_fields(void);
 extern int test_pathfind_two_hops(void);
 extern int test_pathfind_one_hop(void);
 extern int test_pathfind_no_route(void);
@@ -895,6 +904,7 @@ extern int test_peer_mgr_channel_scid_field(void);
 extern int test_tor_parse_proxy_arg_basic(void);
 /* PR #22 Phase 2: Invoice receivability */
 extern int test_invoice_create_decode(void);
+extern int test_invoice_feature_bits(void);
 
 /* PR #53 Phase C: stateless invoice wiring */
 extern int test_stateless_invoice_secret_derived(void);
@@ -1122,6 +1132,10 @@ extern int test_ladder_create_factories(void);
 extern int test_ladder_state_transitions(void);
 extern int test_ladder_key_turnover_close(void);
 extern int test_ladder_overlapping(void);
+extern int test_rotation_creation_after_factory_free(void);
+extern int test_rotation_creation_arrays_never_allocated(void);
+extern int test_rotation_creation_carries_profiles(void);
+extern int test_rotation_creation_failure_keeps_template(void);
 extern int test_regtest_ladder_lifecycle(void);
 extern int test_regtest_ladder_ptlc_migration(void);
 extern int test_regtest_ladder_distribution_fallback(void);
@@ -1281,6 +1295,51 @@ extern int test_bridge_htlc_timeout(void);
 extern int test_bridge_invoice_bolt11_round_trip(void);
 extern int test_bridge_bolt11_plugin_to_lsp(void);
 extern int test_bridge_preimage_passthrough(void);
+extern int test_bridge_outbound_budget(void);
+extern int test_bridge_outbound_invoice_check(void);
+extern int test_bridge_pay_request_carries_limits(void);
+extern int test_bridge_operator_pay(void);
+extern int test_lsp_outbound_htlc_refused(void);
+extern int test_bridge_outbound_max_delay(void);
+extern int test_bridge_plugin_secret_file(void);
+extern int test_bridge_plugin_port_loopback(void);
+extern int test_bridge_plugin_auth(void);
+extern int test_lsp_inbound_amount_below_invoice(void);
+extern int test_lsp_outbound_origin_slot_reuse(void);
+extern int test_lsp_pay_result_requires_preimage(void);
+extern int test_lsp_pay_result_failure(void);
+extern int test_lsp_outbound_one_pay_per_hash(void);
+extern int test_bridge_pending_table(void);
+extern int test_bridge_inbound_beyond_pending_limit(void);
+extern int test_lsp_inbound_replay_reattaches(void);
+extern int test_lsp_inbound_replay_restored_origin(void);
+extern int test_bridge_replay_keeps_pending_id(void);
+extern int test_lsp_pay_result_acknowledged(void);
+extern int test_lsp_outbound_pay_held_past_expiry(void);
+extern int test_bridge_forwards_pay_result_ack(void);
+extern int test_lsp_outbound_internal_invoice_refused(void);
+extern int test_lsp_same_hash_inbound_and_outbound(void);
+extern int test_persist_htlc_origin_rows(void);
+extern int test_lsp_inbound_origin_table_and_rollback(void);
+extern int test_lsp_pay_result_rejections(void);
+extern int test_lsp_outbound_htlc_returned(void);
+extern int test_lsp_fulfil_kept_until_confirmed(void);
+extern int test_bridge_queues_for_absent_plugin(void);
+extern int test_bridge_reports_lsp_key(void);
+extern int test_bridge_plugin_line_auth(void);
+extern int test_bridge_plugin_silent_connection_replaced(void);
+extern int test_lsp_recv_client_reply_skips_keepalives(void);
+extern int test_lsp_incomplete_commitment_drops_client(void);
+extern int test_channel_rollback_htlc(void);
+extern int test_client_handles_update_fail_htlc(void);
+extern int test_lsp_refuses_bad_revocation_secret(void);
+extern int test_lsp_pay_result_waits_for_busy_channel(void);
+extern int test_lsp_client_cannot_fail_its_own_htlc(void);
+extern int test_lsp_inbound_timeout_reaches_bridge_later(void);
+extern int test_lsp_unresolved_fulfil_is_kept(void);
+extern int test_lsp_unrevoked_htlc_is_failed(void);
+extern int test_lsp_bridge_msg_during_wait_is_deferred(void);
+extern int test_lsp_pending_fail_survives_restart(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -1341,6 +1400,7 @@ extern int test_client_persist_reload(void);
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
 extern int test_reconnect_commitment_mismatch_rollback(void);
 extern int test_reconnect_commitment_mismatch_reject(void);
+extern int test_reconnect_pending_commitment_needs_revocation(void);
 extern int test_reconnect_htlc_replay(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
@@ -1781,6 +1841,12 @@ extern int test_backup_corrupt_file(void);
 extern int test_backup_v2_roundtrip(void);
 extern int test_backup_v1_compat(void);
 extern int test_backup_v2_wrong_passphrase(void);
+extern int test_backup_files_owner_only(void);
+extern int test_backup_restore_refuses_existing(void);
+extern int test_backup_failed_write_reported(void);
+extern int test_backup_read_tightens_mode(void);
+extern int test_backup_read_leaves_other_files_alone(void);
+extern int test_backup_crafted_files_rejected(void);
 
 /* UTXO Coin Selection (Mainnet Gap #1) */
 extern int test_coin_select_basic(void);
@@ -1859,6 +1925,11 @@ extern int test_bip39_seed_no_passphrase(void);
 extern int test_bip39_vector_7f(void);
 extern int test_bip39_generate(void);
 extern int test_bip39_keyfile_integration(void);
+extern int test_bip39_official_vectors(void);
+extern int test_bip39_15_and_21_words(void);
+extern int test_bip39_check_reports_reason(void);
+extern int test_bip39_seed_refuses_invalid_mnemonic(void);
+extern int test_bip39_whitespace_normalized(void);
 
 /* Mainnet Audit: Atomic DB Transactions */
 extern int test_persist_transaction_commit(void);
@@ -1918,6 +1989,9 @@ extern int test_conservation_balanced(void);
 extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
+extern int test_payment_leaves_leaf_untouched_arity_ps(void);
+extern int test_payment_leaves_leaf_untouched_arity1(void);
+extern int test_client_refuses_tree_advances(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
 
@@ -1931,9 +2005,36 @@ extern int test_regtest_ps_chain_close(void);
 extern int test_regtest_ps_old_state_response(void);
 
 /* Mainnet Audit: Password-Hardened KDF */
+extern int test_network_is_mainnet(void);
+extern int test_network_canonical(void);
+extern int test_network_gate_risk_accepted(void);
+extern int test_network_gate_cmdline_seckey(void);
+extern int test_network_gate_no_test_scaffolding(void);
+extern int test_network_gate_db(void);
+extern int test_network_mainnet_step_floor_alias(void);
+extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
 extern int test_keyfile_v1_compat(void);
 extern int test_keyfile_wrong_passphrase_v2(void);
+extern int test_keyfile_created_owner_only(void);
+extern int test_keyfile_load_or_generate_new_path(void);
+extern int test_keyfile_wrong_passphrase_keeps_file(void);
+extern int test_keyfile_corrupt_file_kept(void);
+extern int test_keyfile_generate_refuses_existing(void);
+extern int test_keyfile_save_replaces_atomically(void);
+extern int test_keyfile_symlink_path(void);
+extern int test_keyfile_load_tightens_mode(void);
+extern int test_keyfile_mode_not_ours_to_change(void);
+extern int test_keyfile_crafted_files_rejected(void);
+extern int test_secure_file_mode_owner_only(void);
+extern int test_secure_file_create_only(void);
+extern int test_secure_file_failed_write_keeps_old(void);
+extern int test_secure_file_refuses_symlink(void);
+extern int test_secure_file_refuses_dangling_symlink(void);
+extern int test_secure_file_stage_commit_discard(void);
+extern int test_secure_file_removes_stale_temporaries(void);
+extern int test_secure_file_open_read(void);
+extern int test_secure_file_restrict(void);
 
 /* Mainnet Audit: HD Key Derivation */
 extern int test_hd_master_from_seed(void);
@@ -2247,6 +2348,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wellknown_json_parse);
     RUN_TEST(test_wellknown_http_serve);
     RUN_TEST(test_client_bootstrap_from_domain);
+    RUN_TEST(test_wellknown_pubkey_never_pins);
+    RUN_TEST(test_client_endpoint_resolution);
+    RUN_TEST(test_wellknown_serve_fork_ports);
 
     printf("\n=== PR #17 Phase 3: BOLT #7 Gossip ===\n");
     RUN_TEST(test_gossip_node_announcement_sign_verify);
@@ -2287,6 +2391,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt11_no_metadata);
     RUN_TEST(test_bolt11_metadata_truncated);
     RUN_TEST(test_bolt11_full_roundtrip_with_metadata);
+    RUN_TEST(test_bolt11_spec_valid_examples);
+    RUN_TEST(test_bolt11_spec_invalid_examples);
+    RUN_TEST(test_bolt11_reader_strictness);
+    RUN_TEST(test_bolt11_encode_signature_and_payee);
+    RUN_TEST(test_bolt11_long_invoice_checksum);
+    RUN_TEST(test_bolt11_amount_units_and_fields);
 
     printf("\n=== Pathfinding (Dijkstra) ===\n");
     RUN_TEST(test_pathfind_two_hops);
@@ -2967,6 +3077,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tor_parse_proxy_arg_basic);
     printf("\n=== PR #22 Phase 2: Invoice Receivability ===\n");
     RUN_TEST(test_invoice_create_decode);
+    RUN_TEST(test_invoice_feature_bits);
     /* PR #53 Phase C: stateless invoice wiring */
     RUN_TEST(test_stateless_invoice_secret_derived);
     RUN_TEST(test_stateless_invoice_secrets_differ);
@@ -3116,6 +3227,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ladder_state_transitions);
     RUN_TEST(test_ladder_key_turnover_close);
     RUN_TEST(test_ladder_overlapping);
+    RUN_TEST(test_rotation_creation_after_factory_free);
+    RUN_TEST(test_rotation_creation_arrays_never_allocated);
+    RUN_TEST(test_rotation_creation_carries_profiles);
+    RUN_TEST(test_rotation_creation_failure_keeps_template);
 
     printf("\n=== Wire Protocol (Phase 9) ===\n");
     RUN_TEST(test_wire_pubkey_only_factory);
@@ -3215,6 +3330,51 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
     RUN_TEST(test_bridge_preimage_passthrough);
     RUN_TEST(test_bridge_keysend_inbound);
+    RUN_TEST(test_bridge_outbound_budget);
+    RUN_TEST(test_bridge_outbound_invoice_check);
+    RUN_TEST(test_bridge_pay_request_carries_limits);
+    RUN_TEST(test_bridge_operator_pay);
+    RUN_TEST(test_lsp_outbound_htlc_refused);
+    RUN_TEST(test_bridge_outbound_max_delay);
+    RUN_TEST(test_bridge_plugin_secret_file);
+    RUN_TEST(test_bridge_plugin_port_loopback);
+    RUN_TEST(test_bridge_plugin_auth);
+    RUN_TEST(test_lsp_inbound_amount_below_invoice);
+    RUN_TEST(test_lsp_outbound_origin_slot_reuse);
+    RUN_TEST(test_lsp_pay_result_requires_preimage);
+    RUN_TEST(test_lsp_pay_result_failure);
+    RUN_TEST(test_lsp_outbound_one_pay_per_hash);
+    RUN_TEST(test_bridge_pending_table);
+    RUN_TEST(test_bridge_inbound_beyond_pending_limit);
+    RUN_TEST(test_lsp_inbound_replay_reattaches);
+    RUN_TEST(test_lsp_inbound_replay_restored_origin);
+    RUN_TEST(test_bridge_replay_keeps_pending_id);
+    RUN_TEST(test_lsp_pay_result_acknowledged);
+    RUN_TEST(test_lsp_outbound_pay_held_past_expiry);
+    RUN_TEST(test_bridge_forwards_pay_result_ack);
+    RUN_TEST(test_lsp_outbound_internal_invoice_refused);
+    RUN_TEST(test_lsp_same_hash_inbound_and_outbound);
+    RUN_TEST(test_persist_htlc_origin_rows);
+    RUN_TEST(test_lsp_inbound_origin_table_and_rollback);
+    RUN_TEST(test_lsp_pay_result_rejections);
+    RUN_TEST(test_lsp_outbound_htlc_returned);
+    RUN_TEST(test_lsp_fulfil_kept_until_confirmed);
+    RUN_TEST(test_bridge_queues_for_absent_plugin);
+    RUN_TEST(test_bridge_reports_lsp_key);
+    RUN_TEST(test_bridge_plugin_line_auth);
+    RUN_TEST(test_bridge_plugin_silent_connection_replaced);
+    RUN_TEST(test_lsp_recv_client_reply_skips_keepalives);
+    RUN_TEST(test_lsp_incomplete_commitment_drops_client);
+    RUN_TEST(test_channel_rollback_htlc);
+    RUN_TEST(test_client_handles_update_fail_htlc);
+    RUN_TEST(test_lsp_refuses_bad_revocation_secret);
+    RUN_TEST(test_lsp_pay_result_waits_for_busy_channel);
+    RUN_TEST(test_lsp_client_cannot_fail_its_own_htlc);
+    RUN_TEST(test_lsp_inbound_timeout_reaches_bridge_later);
+    RUN_TEST(test_lsp_unresolved_fulfil_is_kept);
+    RUN_TEST(test_lsp_unrevoked_htlc_is_failed);
+    RUN_TEST(test_lsp_bridge_msg_during_wait_is_deferred);
+    RUN_TEST(test_lsp_pending_fail_survives_restart);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);
@@ -3271,6 +3431,7 @@ static void run_unit_tests(void) {
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
     RUN_TEST(test_reconnect_commitment_mismatch_rollback);
     RUN_TEST(test_reconnect_commitment_mismatch_reject);
+    RUN_TEST(test_reconnect_pending_commitment_needs_revocation);
     RUN_TEST(test_reconnect_htlc_replay);
     RUN_TEST(test_client_handle_async_msg);
 
@@ -3700,6 +3861,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_backup_v2_roundtrip);
     RUN_TEST(test_backup_v1_compat);
     RUN_TEST(test_backup_v2_wrong_passphrase);
+    RUN_TEST(test_backup_files_owner_only);
+    RUN_TEST(test_backup_restore_refuses_existing);
+    RUN_TEST(test_backup_failed_write_reported);
+    RUN_TEST(test_backup_read_tightens_mode);
+    RUN_TEST(test_backup_read_leaves_other_files_alone);
+    RUN_TEST(test_backup_crafted_files_rejected);
 
     printf("\n=== UTXO Coin Selection (Mainnet Gap #1) ===\n");
     RUN_TEST(test_coin_select_basic);
@@ -3780,6 +3947,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bip39_vector_7f);
     RUN_TEST(test_bip39_generate);
     RUN_TEST(test_bip39_keyfile_integration);
+    RUN_TEST(test_bip39_official_vectors);
+    RUN_TEST(test_bip39_15_and_21_words);
+    RUN_TEST(test_bip39_check_reports_reason);
+    RUN_TEST(test_bip39_seed_refuses_invalid_mnemonic);
+    RUN_TEST(test_bip39_whitespace_normalized);
 
     printf("\n=== Mainnet Audit: Atomic DB Transactions ===\n");
     RUN_TEST(test_persist_transaction_commit);
@@ -3839,6 +4011,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_violated);
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
+    RUN_TEST(test_payment_leaves_leaf_untouched_arity_ps);
+    RUN_TEST(test_payment_leaves_leaf_untouched_arity1);
+    RUN_TEST(test_client_refuses_tree_advances);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
 
@@ -3851,10 +4026,39 @@ static void run_unit_tests(void) {
     RUN_TEST(test_regtest_ps_chain_close);
     RUN_TEST(test_regtest_ps_old_state_response);
 
+    printf("\n=== Network Names & Mainnet Start-up Gates ===\n");
+    RUN_TEST(test_network_is_mainnet);
+    RUN_TEST(test_network_canonical);
+    RUN_TEST(test_network_gate_risk_accepted);
+    RUN_TEST(test_network_gate_cmdline_seckey);
+    RUN_TEST(test_network_gate_no_test_scaffolding);
+    RUN_TEST(test_network_gate_db);
+    RUN_TEST(test_network_mainnet_step_floor_alias);
+    RUN_TEST(test_network_startup_gates_per_role);
+
     printf("\n=== Mainnet Audit: Password-Hardened KDF ===\n");
     RUN_TEST(test_keyfile_v2_roundtrip);
     RUN_TEST(test_keyfile_v1_compat);
     RUN_TEST(test_keyfile_wrong_passphrase_v2);
+    RUN_TEST(test_keyfile_created_owner_only);
+    RUN_TEST(test_keyfile_load_or_generate_new_path);
+    RUN_TEST(test_keyfile_wrong_passphrase_keeps_file);
+    RUN_TEST(test_keyfile_corrupt_file_kept);
+    RUN_TEST(test_keyfile_generate_refuses_existing);
+    RUN_TEST(test_keyfile_save_replaces_atomically);
+    RUN_TEST(test_keyfile_symlink_path);
+    RUN_TEST(test_keyfile_load_tightens_mode);
+    RUN_TEST(test_keyfile_mode_not_ours_to_change);
+    RUN_TEST(test_keyfile_crafted_files_rejected);
+    RUN_TEST(test_secure_file_mode_owner_only);
+    RUN_TEST(test_secure_file_create_only);
+    RUN_TEST(test_secure_file_failed_write_keeps_old);
+    RUN_TEST(test_secure_file_refuses_symlink);
+    RUN_TEST(test_secure_file_refuses_dangling_symlink);
+    RUN_TEST(test_secure_file_stage_commit_discard);
+    RUN_TEST(test_secure_file_removes_stale_temporaries);
+    RUN_TEST(test_secure_file_open_read);
+    RUN_TEST(test_secure_file_restrict);
 
     printf("\n=== Mainnet Audit: HD Key Derivation ===\n");
     RUN_TEST(test_hd_master_from_seed);
@@ -3972,6 +4176,48 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_bip158_callback_fires);
     RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
     RUN_TEST(test_reorg_bip158_noop);
+
+    printf("\n=== Client Signing Checks ===\n");
+    extern int test_client_close_outputs_acceptable(void);
+    extern int test_client_close_single_payout_output(void);
+    extern int test_client_close_tip_retry(void);
+    extern int test_client_close_repropose_changed_outputs(void);
+    extern int test_client_close_record_unreadable(void);
+    extern int test_client_close_refuses_unbalanced_channel(void);
+    extern int test_client_close_after_reconnect_with_htlc_in_flight(void);
+    extern int test_client_run_with_channels_checks_close(void);
+    extern int test_client_close_refuses_unpaid_proposal(void);
+    extern int test_client_close_without_channel(void);
+    extern int test_client_close_locktime_bound(void);
+    extern int test_client_close_records_signed_close(void);
+    extern int test_client_close_record_survives_restart(void);
+    extern int test_client_close_honest_ceremony(void);
+    RUN_TEST(test_client_close_outputs_acceptable);
+    RUN_TEST(test_client_close_single_payout_output);
+    RUN_TEST(test_client_close_refuses_unbalanced_channel);
+    RUN_TEST(test_client_close_after_reconnect_with_htlc_in_flight);
+    RUN_TEST(test_client_close_refuses_unpaid_proposal);
+    RUN_TEST(test_client_close_without_channel);
+    RUN_TEST(test_client_close_locktime_bound);
+    RUN_TEST(test_client_close_tip_retry);
+    RUN_TEST(test_client_close_records_signed_close);
+    RUN_TEST(test_client_close_repropose_changed_outputs);
+    RUN_TEST(test_client_close_record_survives_restart);
+    RUN_TEST(test_client_close_record_unreadable);
+    extern int test_conservation_counts_ptlc_fee(void);
+    RUN_TEST(test_conservation_counts_ptlc_fee);
+    RUN_TEST(test_client_close_honest_ceremony);
+    RUN_TEST(test_client_run_with_channels_checks_close);
+    extern int test_client_leaf_realloc_acceptable(void);
+    extern int test_client_leaf_realloc_handler_refuses_all(void);
+    extern int test_client_leaf_realloc_ceremony_refused(void);
+    extern int test_client_leaf_realloc_identity_refused(void);
+    RUN_TEST(test_client_leaf_realloc_acceptable);
+    RUN_TEST(test_client_leaf_realloc_handler_refuses_all);
+    RUN_TEST(test_client_leaf_realloc_ceremony_refused);
+    RUN_TEST(test_client_leaf_realloc_identity_refused);
+    extern int test_lsp_buy_liquidity_refused(void);
+    RUN_TEST(test_lsp_buy_liquidity_refused);
 }
 
 extern int regtest_init_faucet(void);
@@ -4101,6 +4347,8 @@ static void run_regtest_tests(void) {
     printf("\n=== Security Model Gap Tests (Regtest) ===\n");
     RUN_TEST(test_regtest_htlc_wrong_preimage_rejected);
     RUN_TEST(test_regtest_funding_double_spend_rejected);
+    extern int test_regtest_coop_close_refuses_lsp_payee(void);
+    RUN_TEST(test_regtest_coop_close_refuses_lsp_payee);
 
     printf("\n=== Regtest Fee Estimation ===\n");
     RUN_TEST(test_regtest_fee_estimation_parsing);
