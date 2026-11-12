@@ -74,6 +74,7 @@
 #define MSG_JIT_ACCEPT          0x52  /* Client -> LSP: accept JIT channel */
 #define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
 #define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
+#define MSG_JIT_REJECT          0x90  /* Client -> LSP: decline a JIT channel offer */
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
@@ -926,6 +927,13 @@ int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
                             size_t *client_idx,
                             secp256k1_pubkey *client_pubkey);
 
+/* Client -> LSP: JIT_REJECT {client_idx, reason}.  The client declines the
+   offer; the LSP stops waiting for JIT_ACCEPT. */
+cJSON *wire_build_jit_reject(size_t client_idx, const char *reason);
+
+int wire_parse_jit_reject(const cJSON *json, size_t *client_idx,
+                            char *reason, size_t reason_len);
+
 /* LSP -> Client: JIT_READY {jit_channel_id, funding_txid, vout, amount,
                               local_amount, remote_amount} */
 cJSON *wire_build_jit_ready(uint32_t jit_channel_id,
@@ -939,14 +947,18 @@ int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
                            uint64_t *local_amount, uint64_t *remote_amount);
 
 /* LSP -> Client: JIT_MIGRATE {jit_channel_id, target_factory_id,
-                                local_balance, remote_balance} */
+                                local_balance, remote_balance, close_txid} */
 cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
                                 uint32_t target_factory_id,
-                                uint64_t local_balance, uint64_t remote_balance);
+                                uint64_t local_balance, uint64_t remote_balance,
+                                const char *close_txid);
 
+/* close_txid (64 hex characters) names the transaction that closed the JIT
+   channel; it is required.  close_txid_out must hold at least 65 bytes. */
 int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
                              uint32_t *target_factory_id,
-                             uint64_t *local_balance, uint64_t *remote_balance);
+                             uint64_t *local_balance, uint64_t *remote_balance,
+                             char *close_txid_out);
 
 /* --- Per-Leaf Advance message builders (Upgrade 2) --- */
 

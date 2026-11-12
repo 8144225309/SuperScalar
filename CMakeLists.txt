@@ -35,8 +35,11 @@ if(_n_san GREATER 1)
 endif()
 if(ENABLE_SANITIZERS)
     add_library(project_sanitizers INTERFACE)
+    # Undefined behaviour aborts instead of printing and carrying on, so a
+    # test that hits it fails.
     target_compile_options(project_sanitizers INTERFACE
-        -fsanitize=address,undefined -fno-omit-frame-pointer)
+        -fsanitize=address,undefined -fno-sanitize-recover=undefined
+        -fno-omit-frame-pointer)
     target_link_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined)
 endif()
@@ -372,6 +375,7 @@ add_executable(test_superscalar
     tests/test_invoice.c
     tests/test_ln_dispatch.c
     tests/test_admin_rpc.c
+    tests/test_factory_recovery.c
     tests/test_chain_safety.c
     tests/test_onion_message.c
     tests/test_scb_recovery.c
@@ -379,12 +383,15 @@ add_executable(test_superscalar
     tests/test_reorg.c
     tests/test_cli_arity.c
     tests/test_client_dist.c
+    tests/test_tree_shape.c
     tests/test_network.c
     tests/test_prometheus.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings)
+# Lets a test read the project's own headers (wire message id table).
+target_compile_definitions(test_superscalar PRIVATE SS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings ${CMAKE_DL_LIBS})
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_superscalar PRIVATE project_sanitizers)
 endif()
@@ -490,7 +497,8 @@ if(ENABLE_FUZZING)
         target_include_directories(${fuzz_name} PRIVATE ${cjson_SOURCE_DIR})
         target_link_libraries(${fuzz_name} superscalar secp256k1 cjson SQLite::SQLite3)
         target_compile_options(${fuzz_name} PRIVATE
-            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+            -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+            -fno-omit-frame-pointer)
         target_link_options(${fuzz_name} PRIVATE
             -fsanitize=fuzzer,address,undefined)
     endforeach()

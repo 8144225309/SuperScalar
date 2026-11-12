@@ -5,6 +5,8 @@
 #include "factory.h"
 #include "fee_estimator.h"
 #include "persist.h"
+#include "chain_backend.h"
+#include <stdio.h>
 #include "wire.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
@@ -57,20 +59,96 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
-/* Optional callback to verify the funding TX on-chain before signing the
-   factory tree.  If provided to client_run_with_channels, called after
-   FACTORY_PROPOSE is parsed and before any tree signing.  Return 1 if the
-   funding TX at txid:vout has at least expected_sats, 0 to abort.
-   ctx is the opaque pointer passed alongside the callback. */
+/* What the chain says about a transaction output. */
+typedef struct {
+    uint64_t      amount_sats;
+    unsigned char spk[64];
+    size_t        spk_len;
+    int           confirmations;   /* 0 = mempool only */
+    int           unspent;         /* 1 unspent, 0 spent, -1 could not tell */
+} client_funding_output_t;
+
+/* Chain lookup used to verify a factory funding output before the client
+   signs anything for the factory.  Fills *out and returns 1 if the output
+   txid32:vout (txid in internal byte order) is known to the chain source,
+   0 if it is not or the source failed.  The decision is not the callback's:
+   client_check_factory_funding compares the result with what the client
+   derived itself. */
 typedef int (*client_verify_funding_fn)(const unsigned char *txid32,
                                          uint32_t vout,
-                                         uint64_t expected_sats,
+                                         client_funding_output_t *out,
                                          void *ctx);
+
+/* Funding check for a factory the client has built from a proposal, used
+   for the first factory and for every rotation, before any signature:
+     - the client's own key sits at its index in the participant set;
+     - the funding script in the proposal is the script the client derives
+       from that participant set (the root node's spending script);
+     - the chain lookup finds the output with EXACTLY that script and
+       EXACTLY the proposed amount, unspent, with at least one confirmation
+       (an unconfirmed funding output is never accepted).
+   Without a lookup the factory is refused, unless
+   client_set_allow_unverified_funding(1) was called.  Returns 1 to proceed. */
+int client_check_factory_funding(const factory_t *f, uint32_t my_index,
+                                  const secp256k1_pubkey *my_pubkey);
+
+/* Harness only: accept factories without any chain lookup (in-process tests
+   and regtest scaffolds without RPC credentials).  Off by default. */
+void client_set_allow_unverified_funding(int allow);
+
+/* FACTORY_READY handler.  Every tree node the LSP sends must be the client's
+   own transaction for that node carrying one signature that verifies; the
+   client's own serialization is what gets stored.  Every node this client
+   signs for (its path from the root to its leaf) must be present.  A signed
+   distribution transaction, if sent, must pass
+   client_verify_distribution_tx against the client's own build.  Returns
+   the number of nodes applied, or -1 to refuse the factory. */
+int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_index);
+
+/* 1 if offered is the distribution transaction locktime this client derives
+   for f (factory_distribution_locktime). */
+int client_dist_locktime_acceptable(const factory_t *f, uint32_t offered);
+
+/* Full capacity of member my_index's channel in f: its leaf output less the
+   base commitment fee, i.e. the channel's two balances together at open.
+   This is what the distribution transaction owes the member.  0 if the
+   member has no channel output in f. */
+uint64_t client_member_channel_capacity(const factory_t *f, uint32_t my_index);
+
+/* Distribution payout check, shared by every place that accepts or relies on
+   a distribution transaction: 1 if tx pays the key-path-only taproot output
+   of member_pubkey at least required_sats in total. */
+int client_distribution_pays_member(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t tx_len,
+                                     const secp256k1_pubkey *member_pubkey,
+                                     uint64_t required_sats);
+
+/* The condition for accepting factory f, at first open and at rotation: f
+   carries a fully co-signed, verified distribution transaction
+   (dist_tx_ready == 2) that pays member my_index (key my_pubkey) at least
+   its full channel capacity. */
+int client_factory_exit_acceptable(const secp256k1_context *ctx, const factory_t *f,
+                                    uint32_t my_index,
+                                    const secp256k1_pubkey *my_pubkey);
+
+/* Depth the funding output must have before a factory is accepted.  The
+   client tool sets network_funding_confs(network, --funding-confs), whose
+   default is the depth the LSP waits for by default; library default 1. */
+void client_set_funding_min_confs(int confs);
+
+/* Factory rotation is experimental and off unless enabled
+   (--enable-rotation-experimental, refused on mainnet).  While off the
+   client refuses ROTATION_BEGIN, the key turnover and rotation proposals. */
+void client_set_allow_rotation(int allow);
+int client_rotation_allowed(void);
 
 /* Run the full ceremony with optional channel operations.
    If channel_cb is NULL, behaves identically to client_run_ceremony
    (creates factory then immediately closes).
    If channel_cb is non-NULL, calls it after CHANNEL_READY and before close.
+   verify_funding is the chain lookup for client_check_factory_funding; with
+   NULL the factory is refused unless unverified funding was allowed.
+   (Historic wording follows.)
    If verify_funding is non-NULL, called to verify the on-chain funding TX
    before signing the factory tree.  Pass verify_ctx for the callback. */
 int client_run_with_channels(secp256k1_context *ctx,
@@ -292,6 +370,83 @@ int client_send_payment(int fd, channel_t *ch, uint64_t amount_sats,
 int client_handle_commitment_signed(int fd, channel_t *ch,
                                       secp256k1_context *ctx,
                                       const wire_msg_t *msg);
+
+/* Channel open: handle the LSP's COMMITMENT_SIGNED for commitment 0.
+   Verifies the LSP's partial signature over the client's initial commitment
+   transaction, aggregates it with the client's own and stores the result in
+   ch->latest_commitment_sig.  Nothing is revoked and no REVOKE_AND_ACK is
+   sent: there is no earlier commitment.  Returns 1 on success; 0 if the
+   message is malformed, is not for commitment 0, or the signature does not
+   verify (the channel must not be used). */
+int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg);
+
+/* Channel open and rotation: receive the LSP's COMMITMENT_SIGNED for
+   commitment 0 from fd (keepalive pings are skipped) and accept it only if
+   the channel's opening balances account for the whole funding output
+   (balances == funding - base commitment fee) and the signature verifies.
+   Returns 1 if ch now holds a signed commitment 0, 0 otherwise. */
+int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index);
+
+/* A rotation in progress keeps the factory being left under id 0, with its
+   channel and commitment, and stores the factory being entered under this
+   id until the new channel's commitment 0 is saved.  A factory on record
+   under this id therefore means "a rotation started and did not finish": it
+   is the durable marker the client checks at start-up and in --force-close. */
+#define CLIENT_ROTATION_PENDING_FACTORY_ID 1u
+
+/* Store f (verified tree, verified signed distribution transaction) as the
+   pending factory.  Nothing recorded for factory 0 is changed.  One database
+   transaction.  Returns 1 on success. */
+int client_rotation_save_pending(persist_t *db, const factory_t *f,
+                                  secp256k1_context *ctx);
+
+/* 1 if the last client_do_factory_rotation call stored a pending factory. */
+int client_rotation_new_factory_saved(void);
+
+/* Chain lookup used when a rotation proposes a new factory (the same
+   callback client_run_with_channels takes for the first factory, which also
+   installs it). */
+void client_set_funding_verifier(client_verify_funding_fn fn, void *ctx);
+
+/* Distribution transaction check.  signed_tx is what the LSP sent;
+   unsigned_tx and sighash32 are the client's own construction of the same
+   transaction; funding_spk34 is the factory funding script.  Returns 1 only
+   if signed_tx is byte for byte the client's transaction carrying one
+   key-path signature that verifies under the funding output key. */
+int client_verify_distribution_tx(const secp256k1_context *ctx,
+                                   const unsigned char *unsigned_tx, size_t unsigned_len,
+                                   const unsigned char *sighash32,
+                                   const unsigned char *funding_spk34,
+                                   const unsigned char *signed_tx, size_t signed_len);
+
+/* Amount a (signed or unsigned, single-input) transaction pays to the
+   key-path-only taproot output of pubkey; 0 if it has no such output. */
+uint64_t client_tx_amount_to_pubkey(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t len,
+                                     const secp256k1_pubkey *pubkey);
+
+/* What --force-close may publish.  Returns
+     1  publish the tree of factory 0 and the stored commitment;
+     0  publish no tree; *dist_factory_out names the factory whose
+        distribution transaction may be offered;
+    -1  the chain could not be read well enough to decide: publish nothing.
+   A tree is published only when a commitment for a channel in it is on
+   disk.  With a rotation pending, the factory being left is used while its
+   funding output is unspent AND after this client's own root transaction
+   has spent it (the exit is then under way and must be continued); only a
+   funding output spent by something else moves the client to the pending
+   factory's distribution transaction.  Lines describing the decision go to
+   out. */
+int client_force_close_plan(persist_t *db, chain_backend_t *chain,
+                             uint32_t *dist_factory_out, FILE *out);
+
+/* Write the channel's latest fully signed commitment transaction
+   (ch->latest_commitment_sig over the commitment at ch->commitment_number)
+   to the signed_commitments table, so it can be broadcast from the database
+   alone.  Returns 1 if the row was written, 0 otherwise (including when the
+   channel holds no commitment signature). */
+int client_persist_latest_commitment(persist_t *db, uint32_t channel_id,
+                                       const channel_t *ch);
 
 /* Revocation-verification standard (client side): verify the LSP's revealed
    per-commitment secret against the LSP's committed per-commitment point, then

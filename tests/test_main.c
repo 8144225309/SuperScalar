@@ -468,6 +468,14 @@ extern int test_admin_rpc_listfunds(void);
 extern int test_admin_rpc_listfactories_no_persist(void);
 extern int test_admin_rpc_recoverfactory_no_persist(void);
 extern int test_admin_rpc_sweepfactory_no_persist(void);
+extern int test_factory_recovery_publishes_tree_beyond_128_nodes(void);
+extern int test_factory_recovery_client_path_above_128(void);
+extern int test_factory_recovery_incomplete_tree_is_error(void);
+extern int test_factory_recovery_refused_path_node_never_succeeds(void);
+extern int test_factory_recovery_height_lock_waits(void);
+extern int test_factory_recovery_exit_leaf_from_commitment(void);
+extern int test_factory_recovery_kept_leaf_after_advance(void);
+extern int test_factory_recovery_exit_leaf_missing_is_error(void);
 extern int test_admin_rpc_sweepfactory_missing_dest(void);
 
 
@@ -1355,6 +1363,21 @@ extern int test_client_daemon_autofulfill(void);
 extern int test_cli_command_parsing(void);
 
 /* Phase 4 (mixed-arity plan) — CLI arity parsing + BOLT-2016 ceiling tests */
+extern int test_tree_shape_txids_pinned(void);
+extern int test_tree_shape_dw_layers_deep(void);
+extern int test_tree_shape_static_leaf(void);
+extern int test_tree_shape_ewt_matches_tx(void);
+extern int test_tree_shape_anchor_room(void);
+extern int test_tree_shape_leaf_kind(void);
+extern int test_tree_shape_mirror_hash_high_index(void);
+extern int test_tree_shape_placement_order(void);
+extern int test_tree_shape_level_list_bound(void);
+extern int test_tree_shape_scale_sign_ewt(void);
+extern int test_tree_shape_ewt_ps_k(void);
+extern int test_tree_shape_per_leaf_rollover(void);
+extern int test_tree_shape_funding_script(void);
+extern int test_tree_shape_session_reinit(void);
+extern int test_tree_shape_placement_setter(void);
 extern int test_cli_arity_uniform_3_parses(void);
 extern int test_cli_arity_mixed_248_parses(void);
 extern int test_cli_arity_rejects_16(void);
@@ -1397,6 +1420,21 @@ extern int test_prometheus_client_counter(void);
 extern int test_reconnect_wire(void);
 extern int test_reconnect_pubkey_match(void);
 extern int test_reconnect_nonce_reexchange(void);
+extern int test_initial_commitment_signed_at_open(void);
+extern int test_initial_commitment_rejects_invalid(void);
+extern int test_initial_commitment_persist_reload(void);
+extern int test_initial_commitment_recv_checks_conservation(void);
+extern int test_rotation_commitment_carries_balance(void);
+extern int test_distribution_tx_verification(void);
+extern int test_client_funding_check(void);
+extern int test_client_factory_ready_handler(void);
+extern int test_client_distribution_exit_checks(void);
+extern int test_client_force_close_plan(void);
+extern int test_client_funding_depth_and_order(void);
+extern int test_client_rotation_disabled(void);
+extern void client_set_allow_unverified_funding(int allow);
+extern void client_set_allow_rotation(int allow);
+extern int test_rotation_pending_record(void);
 extern int test_client_persist_reload(void);
 
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
@@ -1634,6 +1672,17 @@ extern int test_jit_persist_skip_closed(void);
 extern int test_jit_multiple_channels(void);
 extern int test_jit_multiple_watchtower_indices(void);
 extern int test_jit_funding_confirmation_transition(void);
+extern int test_jit_create_refused_when_disabled(void);
+extern int test_jit_expiry_trigger_refused_when_disabled(void);
+extern int test_lsps2_buy_refused_when_jit_disabled(void);
+extern int test_lsps_peer_request_refuses_buy(void);
+extern int test_jit_migrate_keeps_unspent_channel(void);
+extern int test_jit_client_migrate_keeps_factory_watch(void);
+extern int test_jit_reject_round_trip(void);
+extern int test_wire_msg_ids_unique(void);
+extern int test_gettxout_answer_classified(void);
+extern int test_jit_reject_ends_wait(void);
+extern int test_jit_wait_holds_other_messages(void);
 
 /* Per-Leaf Advance */
 extern int test_factory_advance_leaf_left(void);
@@ -1989,10 +2038,13 @@ extern int test_regtest_ps_old_state_response(void);
 /* Mainnet Audit: Password-Hardened KDF */
 extern int test_network_is_mainnet(void);
 extern int test_network_canonical(void);
+extern int test_network_funding_confs(void);
 extern int test_network_gate_risk_accepted(void);
 extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
 extern int test_network_gate_db(void);
+extern int test_network_gate_no_experimental_jit(void);
+extern int test_network_gate_no_experimental_rotation(void);
 extern int test_network_mainnet_step_floor_alias(void);
 extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
@@ -2101,6 +2153,8 @@ extern int test_readiness_beyond_64(void);
 extern int test_rotation_readiness_null(void);
 extern int test_rotation_readiness_none_connected(void);
 extern int test_rotation_readiness_partial(void);
+extern int test_rotation_refused_without_opt_in(void);
+extern int test_rotation_triggers_refused_without_opt_in(void);
 
 static void run_unit_tests(void) {
     /* Task #104: tests opt in to real PTLC creation; production build leaves
@@ -2556,6 +2610,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_admin_rpc_listfactories_no_persist);
     RUN_TEST(test_admin_rpc_recoverfactory_no_persist);
     RUN_TEST(test_admin_rpc_sweepfactory_no_persist);
+    RUN_TEST(test_factory_recovery_publishes_tree_beyond_128_nodes);
+    RUN_TEST(test_factory_recovery_client_path_above_128);
+    RUN_TEST(test_factory_recovery_incomplete_tree_is_error);
+    RUN_TEST(test_factory_recovery_refused_path_node_never_succeeds);
+    RUN_TEST(test_factory_recovery_height_lock_waits);
+    RUN_TEST(test_factory_recovery_exit_leaf_from_commitment);
+    RUN_TEST(test_factory_recovery_kept_leaf_after_advance);
+    RUN_TEST(test_factory_recovery_exit_leaf_missing_is_error);
     RUN_TEST(test_admin_rpc_sweepfactory_missing_dest);
 
     printf("\n=== PR #28: Chain Safety ===\n");
@@ -3370,6 +3432,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_daemon_autofulfill);
     RUN_TEST(test_cli_command_parsing);
 
+    printf("\n=== Tree Shapes ===\n");
+    RUN_TEST(test_tree_shape_txids_pinned);
+    RUN_TEST(test_tree_shape_dw_layers_deep);
+    RUN_TEST(test_tree_shape_static_leaf);
+    RUN_TEST(test_tree_shape_ewt_matches_tx);
+    RUN_TEST(test_tree_shape_anchor_room);
+    RUN_TEST(test_tree_shape_leaf_kind);
+    RUN_TEST(test_tree_shape_mirror_hash_high_index);
+    RUN_TEST(test_tree_shape_placement_order);
+    RUN_TEST(test_tree_shape_level_list_bound);
+    RUN_TEST(test_tree_shape_scale_sign_ewt);
+    RUN_TEST(test_tree_shape_ewt_ps_k);
+    RUN_TEST(test_tree_shape_per_leaf_rollover);
+    RUN_TEST(test_tree_shape_funding_script);
+    RUN_TEST(test_tree_shape_session_reinit);
+    RUN_TEST(test_tree_shape_placement_setter);
+
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);
     RUN_TEST(test_cli_arity_mixed_248_parses);
@@ -3414,6 +3493,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_wire);
     RUN_TEST(test_reconnect_pubkey_match);
     RUN_TEST(test_reconnect_nonce_reexchange);
+    RUN_TEST(test_initial_commitment_signed_at_open);
+    RUN_TEST(test_initial_commitment_rejects_invalid);
+    RUN_TEST(test_initial_commitment_persist_reload);
+    RUN_TEST(test_initial_commitment_recv_checks_conservation);
+    RUN_TEST(test_rotation_commitment_carries_balance);
+    RUN_TEST(test_distribution_tx_verification);
+    RUN_TEST(test_client_funding_check);
+    RUN_TEST(test_client_factory_ready_handler);
+    RUN_TEST(test_client_distribution_exit_checks);
+    RUN_TEST(test_client_force_close_plan);
+    RUN_TEST(test_client_funding_depth_and_order);
+    RUN_TEST(test_client_rotation_disabled);
+    client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
+    RUN_TEST(test_rotation_pending_record);
     RUN_TEST(test_client_persist_reload);
 
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
@@ -3633,6 +3727,17 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_multiple_channels);
     RUN_TEST(test_jit_multiple_watchtower_indices);
     RUN_TEST(test_jit_funding_confirmation_transition);
+    RUN_TEST(test_jit_create_refused_when_disabled);
+    RUN_TEST(test_jit_expiry_trigger_refused_when_disabled);
+    RUN_TEST(test_lsps2_buy_refused_when_jit_disabled);
+    RUN_TEST(test_lsps_peer_request_refuses_buy);
+    RUN_TEST(test_jit_migrate_keeps_unspent_channel);
+    RUN_TEST(test_jit_client_migrate_keeps_factory_watch);
+    RUN_TEST(test_jit_reject_round_trip);
+    RUN_TEST(test_wire_msg_ids_unique);
+    RUN_TEST(test_gettxout_answer_classified);
+    RUN_TEST(test_jit_reject_ends_wait);
+    RUN_TEST(test_jit_wait_holds_other_messages);
 
     printf("\n=== Per-Leaf Advance ===\n");
     RUN_TEST(test_factory_advance_leaf_left);
@@ -3996,10 +4101,13 @@ static void run_unit_tests(void) {
     printf("\n=== Network Names & Mainnet Start-up Gates ===\n");
     RUN_TEST(test_network_is_mainnet);
     RUN_TEST(test_network_canonical);
+    RUN_TEST(test_network_funding_confs);
     RUN_TEST(test_network_gate_risk_accepted);
     RUN_TEST(test_network_gate_cmdline_seckey);
     RUN_TEST(test_network_gate_no_test_scaffolding);
     RUN_TEST(test_network_gate_db);
+    RUN_TEST(test_network_gate_no_experimental_jit);
+    RUN_TEST(test_network_gate_no_experimental_rotation);
     RUN_TEST(test_network_mainnet_step_floor_alias);
     RUN_TEST(test_network_startup_gates_per_role);
 
@@ -4131,6 +4239,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_readiness_null);
     RUN_TEST(test_rotation_readiness_none_connected);
     RUN_TEST(test_rotation_readiness_partial);
+    RUN_TEST(test_rotation_refused_without_opt_in);
+    RUN_TEST(test_rotation_triggers_refused_without_opt_in);
 
     /* === Reorg Resistance === */
     printf("\n=== Reorg Resistance ===\n");
@@ -4174,6 +4284,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_counts_ptlc_fee);
     RUN_TEST(test_client_close_honest_ceremony);
     RUN_TEST(test_client_run_with_channels_checks_close);
+    extern int test_lsp_dist_cheats_need_cheat_gate(void);
+    RUN_TEST(test_lsp_dist_cheats_need_cheat_gate);
     extern int test_client_leaf_realloc_acceptable(void);
     extern int test_client_leaf_realloc_handler_refuses_all(void);
     extern int test_client_leaf_realloc_ceremony_refused(void);
@@ -4335,6 +4447,10 @@ static void run_regtest_tests(void) {
 
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
+
+    /* In-process ceremonies have no chain to look a funding output up in. */
+    client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
 
     if (argc < 2)
         run_unit = 1;

@@ -4,6 +4,7 @@
  */
 
 #include "superscalar/client_dist.h"
+#include "superscalar/client.h"
 #include "superscalar/factory.h"
 #include "superscalar/sha256.h"
 #include "superscalar/tx_builder.h"
@@ -86,7 +87,6 @@ int client_dist_verify(const secp256k1_context *ctx,
         set_err(err, errlen, "bad output count");
         return 0;
     }
-    size_t outputs_start = pos;
     for (uint64_t i = 0; i < n_out; i++) {
         uint64_t spk_len = 0;
         if (tx_len - pos < 8) { set_err(err, errlen, "truncated output"); return 0; }
@@ -130,41 +130,14 @@ int client_dist_verify(const secp256k1_context *ctx,
         set_err(err, errlen, m);
         return 0;
     }
-    if (member_pubkey) {
-        /* BIP-86: output key = P + H_TapTweak(P) G, no script tree */
-        unsigned char ser[32], tweak[32], spk[34];
-        secp256k1_xonly_pubkey xonly, tweaked;
-        secp256k1_pubkey full;
-        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, member_pubkey) ||
-            !secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) {
-            set_err(err, errlen, "member key unusable");
-            return 0;
-        }
-        sha256_tagged("TapTweak", ser, 32, tweak);
-        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &full, &xonly, tweak) ||
-            !secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &full)) {
-            set_err(err, errlen, "member key unusable");
-            return 0;
-        }
-        build_p2tr_script_pubkey(spk, &tweaked);
-        uint64_t paid = 0;
-        size_t q = outputs_start;
-        for (uint64_t i = 0; i < n_out; i++) {
-            uint64_t amt = 0, sl = 0;
-            for (int b = 7; b >= 0; b--) amt = (amt << 8) | tx[q + (size_t)b];
-            q += 8;
-            rd_varint(tx, tx_len, &q, &sl);
-            if (sl == 34 && memcmp(tx + q, spk, 34) == 0) paid += amt;
-            q += (size_t)sl;
-        }
-        if (paid < member_min_sats) {
-            char m[128];
-            snprintf(m, sizeof(m), "pays this member %llu sat, less than its "
-                     "channel's %llu", (unsigned long long)paid,
-                     (unsigned long long)member_min_sats);
-            set_err(err, errlen, m);
-            return 0;
-        }
+    if (member_pubkey &&
+        !client_distribution_pays_member(ctx, tx, tx_len, member_pubkey,
+                                         member_min_sats)) {
+        char m[128];
+        snprintf(m, sizeof(m), "pays this member less than its channel "
+                 "capacity of %llu sat", (unsigned long long)member_min_sats);
+        set_err(err, errlen, m);
+        return 0;
     }
     if (sequence == 0xFFFFFFFFu) {
         set_err(err, errlen, "input nSequence disables its nLockTime");
@@ -254,20 +227,23 @@ int client_dist_load(persist_t *db, secp256k1_context *ctx, uint32_t factory_id,
         set_err(err, errlen, "factory record unreadable");
         return -1;
     }
-    /* This member: the client whose channel row the DB holds. */
+    /* This member: the client whose channel row the DB holds; it must be
+       paid at least its channel capacity. */
     const secp256k1_pubkey *member = NULL;
     uint64_t member_min = 0;
     for (size_t slot = 0; slot + 1 < f->n_participants; slot++) {
         uint64_t la = 0, ra = 0, cn = 0;
         if (persist_load_channel_state(db, (uint32_t)slot, &la, &ra, &cn)) {
             member = &f->pubkeys[slot + 1];
-            member_min = la + ra;
+            member_min = client_member_channel_capacity(f, (uint32_t)slot + 1);
             break;
         }
     }
     int ok = 0;
     if (!member)
         set_err(err, errlen, "no channel record for this member");
+    else if (member_min == 0)
+        set_err(err, errlen, "this member has no channel output in the factory");
     else
         ok = client_dist_verify(ctx, tx, len, f->funding_txid, f->funding_vout,
                                 f->funding_amount_sats, f->funding_spk,
@@ -470,7 +446,9 @@ void client_dist_watch_free(client_dist_watch_t *w) {
 }
 
 int client_dist_force_close(persist_t *db, chain_backend_t *chain,
-                            client_dist_send_fn send, FILE *out) {
+                            client_dist_send_fn send, FILE *out,
+                            client_dist_status_t *status_out) {
+    if (status_out) *status_out = CLIENT_DIST_NONE;
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
                                                       SECP256K1_CONTEXT_VERIFY);
     if (!ctx) return 0;
@@ -490,6 +468,7 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
     int tip = -1;
     client_dist_status_t s = client_dist_step(chain, &d, send, &tip, NULL);
     report(out, "Force-close: ", s, &d, tip);
+    if (status_out) *status_out = s;
     int settles = client_dist_settles(s);
     if (settles)
         fprintf(out, "Force-close: the distribution TX is this factory's exit; "

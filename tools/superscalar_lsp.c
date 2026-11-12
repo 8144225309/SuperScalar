@@ -104,9 +104,6 @@ static bolt11_invoice_table_t g_invoice_tbl;
 /* CLTV watchdog: pointer to the active channel manager, set after each alloc */
 static lsp_channel_mgr_t *g_channel_mgr = NULL;
 
-/* LSPS0 context for bolt8_server callback */
-static lsps_ctx_t  g_lsps_ctx;
-
 /* LSPS2 JIT pending channel intercept table */
 static lsps2_pending_table_t g_lsps2_pending;
 
@@ -125,90 +122,13 @@ static void *ln_dispatch_thread(void *arg) {
     return NULL;
 }
 
-/* Gap 3: callback from ln_dispatch when JIT cost is covered.
- * Opens a JIT channel for the client then relays the pending HTLC. */
-static void on_jit_open(void *cb_ctx, uint64_t scid,
-                         uint64_t out_amount_msat,
-                         size_t in_peer_idx, uint64_t in_htlc_id)
-{
-    (void)cb_ctx; (void)in_peer_idx; (void)in_htlc_id;
-    /* SCID encodes client_idx: (0x800000 << 40) | ((client_idx+1) << 16) | block */
-    size_t client_idx = (size_t)(((scid >> 16) & 0xFFFFFF) - 1);
-
-    /* Open the JIT channel (no-op if already open) */
-    if (!jit_channel_is_active(g_channel_mgr, client_idx))
-        jit_channel_create(g_channel_mgr, g_lsp, client_idx,
-                            out_amount_msat * 2, "lsps2-jit");
-
-    fprintf(stderr, "LSP: JIT channel opened for client %zu (scid=0x%llx)\n",
-            client_idx, (unsigned long long)scid);
-}
-
-/* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
+/* LSPS0 adapter for the BOLT #8 listener.  Requests from outside peers are
+   answered without any channel context (see lsps_peer_request). */
 static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
                            const char *json_req, char *resp_buf, size_t resp_cap)
 {
-    (void)state;
-    if (!json_req || !resp_buf || resp_cap == 0) return 0;
-    lsps_ctx_t *ctx = (lsps_ctx_t *)userdata;
-
-    cJSON *json = cJSON_Parse(json_req);
-    if (!json) {
-        cJSON *err = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
-        if (err) {
-            char *s = cJSON_PrintUnformatted(err);
-            if (s) {
-                size_t n = strlen(s);
-                if (n < resp_cap) { memcpy(resp_buf, s, n + 1); free(s); cJSON_Delete(err); return (int)n; }
-                free(s);
-            }
-            cJSON_Delete(err);
-        }
-        return 0;
-    }
-
-    int id = 0;
-    const char *method = lsps_parse_request(json, &id);
-    cJSON *resp = NULL;
-
-    if (!method) {
-        resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
-    } else if (strcmp(method, "lsps1_get_info") == 0) {
-        lsps1_info_t info;
-        memset(&info, 0, sizeof(info));
-        info.min_channel_balance_msat = 100000000ULL;
-        info.max_channel_balance_msat = 10000000000ULL;
-        info.min_confirmations        = 1;
-        info.base_fee_msat            = 1000;
-        info.fee_ppm                  = 500;
-        resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
-    } else if (strcmp(method, "lsps2_get_info") == 0) {
-        lsps2_fee_params_t params;
-        memset(&params, 0, sizeof(params));
-        params.min_fee_msat             = 1000;
-        params.fee_ppm                  = 500;
-        params.min_channel_balance_msat = 100000000ULL;
-        params.max_channel_balance_msat = 10000000000ULL;
-        resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
-    } else if (lsps_handle_request(ctx, fd, json)) {
-        cJSON_Delete(json);
-        return 0;
-    } else {
-        resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
-    }
-
-    cJSON_Delete(json);
-    int written = 0;
-    if (resp) {
-        char *s = cJSON_PrintUnformatted(resp);
-        if (s) {
-            size_t n = strlen(s);
-            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
-            free(s);
-        }
-        cJSON_Delete(resp);
-    }
-    return written;
+    (void)userdata; (void)fd; (void)state;
+    return lsps_peer_request(json_req, resp_buf, resp_cap);
 }
 
 /* Chain monitoring: called by bip158_backend after each new block is processed */
@@ -296,10 +216,17 @@ static void usage(const char *prog) {
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
         "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
-        "  --no-jit            Disable JIT channel fallback\n"
+        "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
+        "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
+        "                      an open can strand the LSP's funds. Refused on mainnet.\n"
+        "  --enable-rotation-experimental  UNSAFE, testing only: allow factory rotation\n"
+        "                      (automatic when a factory turns DYING in daemon mode, CLI\n"
+        "                      'rotate'). Off by default: a DYING factory keeps serving\n"
+        "                      its channels until it expires. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
         "                       Comma-separated activates TRUE N-way mixed arity per level\n"
@@ -348,6 +275,7 @@ static void usage(const char *prog) {
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
@@ -355,6 +283,7 @@ static void usage(const char *prog) {
         "  --test-splice-client-seckey HEX  Client[0] secret key for test-only MuSig2 signing\n"
         "  --test-lightclient  Run in BIP 157/158 light-client mode and verify filter sync\n"
         "  --test-jit          After demo: create JIT channels for all clients\n"
+        "                      (implies --enable-jit-experimental)\n"
         "  --test-lsps2        After demo: wait for client LSPS2 buy flow\n"
         "  --test-bolt12       After demo: BOLT12 offer codec + signature test\n"
         "  --test-buy-liquidity After demo: buy inbound liquidity from L-stock\n"
@@ -362,7 +291,8 @@ static void usage(const char *prog) {
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --safe-confs N      Set ALL confirmation depths at once (shorthand).\n"
-        "  --funding-confs N   Funding TX depth before acting (default: %d, CLN=3, LND=1-6)\n"
+        "  --funding-confs N   Funding TX depth before acting (default: 6 mainnet,\n"
+        "                      3 signet/testnet/testnet4; clients use the same default)\n"
         "  --close-confs N     Close TX depth before removing entries (default: %d, LDK=6)\n"
         "  --penalty-confs N   Penalty TX depth before removing breach entry (default: %d)\n"
         "  --sweep-confs N     HTLC sweep depth before considering settled (default: %d)\n"
@@ -404,6 +334,7 @@ static void usage(const char *prog) {
         "                          api:URL     custom HTTP/HTTPS endpoint (mempool.space-compatible JSON)\n"
         "                          static:N    fixed N sat/vByte (e.g. static:10)\n"
         "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
+        "                      (needs --enable-rotation-experimental)\n"
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
@@ -436,7 +367,7 @@ static void usage(const char *prog) {
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS,
-        CONF_DEFAULT_FUNDING, CONF_DEFAULT_CLOSE,
+        CONF_DEFAULT_CLOSE,
         CONF_DEFAULT_PENALTY, CONF_DEFAULT_SWEEP,
         LSP_MAX_CLIENTS);
 }
@@ -1434,7 +1365,8 @@ int main(int argc, char *argv[]) {
     int32_t active_blocks_arg = -1;  /* -1 = auto */
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
-    int no_jit = 0;
+    int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
+    int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
                                         (1, 2 = legacy DW; 3 = PS canonical) */
@@ -1814,8 +1746,10 @@ int main(int argc, char *argv[]) {
             dying_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--jit-amount") == 0 && i + 1 < argc)
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--no-jit") == 0)
-            no_jit = 1;
+        else if (strcmp(argv[i], "--enable-jit-experimental") == 0)
+            enable_jit_experimental = 1;
+        else if (strcmp(argv[i], "--enable-rotation-experimental") == 0)
+            enable_rotation_experimental = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -2501,6 +2435,8 @@ int main(int argc, char *argv[]) {
             .seckey_on_cmdline = seckey_hex != NULL,
             .have_db = db_path != NULL,
             .have_wt_db = wt_db_path != NULL,
+            .enable_jit_experimental = enable_jit_experimental,
+            .enable_rotation_experimental = enable_rotation_experimental,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -2510,6 +2446,26 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+    /* The JIT test mode opens a JIT channel itself, so it carries the opt-in
+       (--test-* is refused on mainnet by the gates above). */
+    if (test_jit)
+        enable_jit_experimental = 1;
+    if (enable_jit_experimental)
+        fprintf(stderr, "WARNING: --enable-jit-experimental: JIT channel opens are "
+                "enabled. This is unsafe and for testing only.\n");
+
+    /* Likewise the rotation test modes carry the rotation opt-in. */
+    if (test_rotation || test_partial_rotation)
+        enable_rotation_experimental = 1;
+    if (async_rotation && !enable_rotation_experimental) {
+        fprintf(stderr, "Error: --async-rotation needs --enable-rotation-experimental "
+                "(factory rotation is off by default).\n");
+        return 1;
+    }
+    if (enable_rotation_experimental)
+        fprintf(stderr, "WARNING: --enable-rotation-experimental: factory rotation is "
+                "enabled. This is unsafe and for testing only.\n");
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
@@ -2602,6 +2558,8 @@ int main(int argc, char *argv[]) {
         factory_arity_t fa = (factory_arity_t)leaf_arity;
         const uint8_t *la_ptr = (n_level_arity > 0) ? level_arities : NULL;
         if (!cli_validate_shape_for_bolt2016(la_ptr, n_level_arity, fa,
+                                              (uint32_t)(ps_subfactory_arity_arg > 1
+                                                         ? ps_subfactory_arity_arg : 1),
                                               (size_t)n_clients,
                                               static_near_root,
                                               step_blocks,
@@ -2617,7 +2575,9 @@ int main(int argc, char *argv[]) {
        timeout must leave that much room, and members check it too. */
     uint32_t factory_exit_blocks = cli_factory_exit_blocks(
         n_level_arity > 0 ? level_arities : NULL, n_level_arity,
-        (factory_arity_t)leaf_arity, (size_t)n_clients, static_near_root,
+        (factory_arity_t)leaf_arity,
+        (uint32_t)(ps_subfactory_arity_arg > 1 ? ps_subfactory_arity_arg : 1),
+        (size_t)n_clients, static_near_root,
         step_blocks, (uint32_t)states_per_layer);
 
     /* Mainnet DW-step safety floor: reject a too-small --step-blocks on
@@ -3010,8 +2970,10 @@ int main(int argc, char *argv[]) {
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
     }
 
-    /* Apply confirmation depth overrides.
-       --safe-confs sets all four; per-operation flags override individually. */
+    /* Funding depth defaults per network, the same default the client uses.
+       Then the overrides: --safe-confs sets all four; per-operation flags
+       override individually. */
+    chain_be->conf.funding = network_funding_confs(network, 0);
     if (safe_confs_arg > 0) {
         conf_targets_set_all(&chain_be->conf, safe_confs_arg);
         printf("LSP: all confirmation depths set to %d (--safe-confs)\n",
@@ -3330,7 +3292,9 @@ int main(int argc, char *argv[]) {
             mgr->rot_leaf_arity = leaf_arity;
             mgr->rot_is_regtest = is_regtest;
             mgr->rot_funding_sats = funding_sats;
-            mgr->rot_auto_rotate = 1;
+            /* Recovery resumes the daemon loop: rotation is automatic
+               there, but only with the opt-in. */
+            lsp_channels_set_rotation(mgr, enable_rotation_experimental, 1);
             mgr->rot_attempted_mask = 0;
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
@@ -3338,7 +3302,7 @@ int main(int argc, char *argv[]) {
 
             /* JIT Channel Fallback */
             jit_channels_init(mgr);
-            if (no_jit) mgr->jit_enabled = 0;
+            mgr->jit_enabled = enable_jit_experimental;
             mgr->jit_funding_sats = (jit_amount_arg > 0) ?
                 (uint64_t)jit_amount_arg :
                 (funding_sats / (uint64_t)rec_n_clients);
@@ -3633,11 +3597,8 @@ accept_new_factory:
             g_ln_dispatch.invoices = &g_invoice_tbl;
 
             /* Wire LSPS0 callback */
-            memset(&g_lsps_ctx, 0, sizeof(g_lsps_ctx));
-            g_lsps_ctx.mgr = g_channel_mgr;
-            g_lsps_ctx.lsp = g_lsp;
             g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
-            g_bolt8_cfg.cb_userdata      = &g_lsps_ctx;
+            g_bolt8_cfg.cb_userdata      = NULL;
 
             /* Wire Tor proxy for .onion outbound peers */
             if (tor_proxy_arg) {
@@ -3669,7 +3630,7 @@ accept_new_factory:
             g_ln_dispatch.watchtower  = &g_watchtower;
             g_ln_dispatch.scb_path    = scb_path_arg; /* NULL = disabled */
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
-    g_ln_dispatch.jit_open_cb = on_jit_open;
+    g_ln_dispatch.jit_open_cb = NULL;
     g_ln_dispatch.jit_cb_ctx  = NULL;
     g_ln_dispatch.network     = network;
 
@@ -4113,9 +4074,12 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (n_level_arity > 0)
-        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
+            fprintf(stderr, "Error: --arity shape refused by the factory\n");
+            return 1;
+        }
+    } else if (leaf_arity == 1)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
@@ -4129,7 +4093,10 @@ accept_new_factory:
     if (ps_subfactory_arity_arg > 0)
         factory_set_ps_subfactory_arity(&lsp_p->factory,
                                           (uint32_t)ps_subfactory_arity_arg);
-    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
+        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
+        return 1;
+    }
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
     /* Populate default profiles from CLI config.  The shape setters above
@@ -4339,16 +4306,18 @@ accept_new_factory:
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
-        /* Copy signed distribution TX from ceremony (if available) */
+        /* Copy the co-signed distribution TX from the ceremony, as rotation
+           does for the factories it creates.  The unsigned one cannot be
+           relayed; without a signed copy the LSP broadcasts nothing (every
+           member holds its own co-signed copy). */
         tx_buf_init(&lf->distribution_tx, 256);
-        if (lsp_p->factory.dist_tx_ready && lsp_p->factory.dist_unsigned_tx.len > 0) {
-            /* dist_unsigned_tx holds the signed version after ceremony */
+        if (lsp_p->factory.dist_tx_ready == 2 && lsp_p->factory.dist_signed_tx.len > 0) {
             tx_buf_free(&lf->distribution_tx);
-            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_unsigned_tx.len);
-            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_unsigned_tx.data,
-                   lsp_p->factory.dist_unsigned_tx.len);
-            lf->distribution_tx.len = lsp_p->factory.dist_unsigned_tx.len;
-            printf("LSP: distribution TX stored (%zu bytes)\n",
+            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_signed_tx.len);
+            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_signed_tx.data,
+                   lsp_p->factory.dist_signed_tx.len);
+            lf->distribution_tx.len = lsp_p->factory.dist_signed_tx.len;
+            printf("LSP: signed distribution TX stored (%zu bytes)\n",
                    lf->distribution_tx.len);
         }
         lad->n_factories = 1;
@@ -4605,7 +4574,8 @@ accept_new_factory:
         mgr->rot_leaf_arity = leaf_arity;
         mgr->rot_is_regtest = is_regtest;
         mgr->rot_funding_sats = funding_sats;
-        mgr->rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
+        /* With the opt-in, rotation is automatic in daemon mode. */
+        lsp_channels_set_rotation(mgr, enable_rotation_experimental, daemon_mode);
         mgr->rot_attempted_mask = 0;
         mgr->cli_enabled = cli_mode;
         mgr->test_bad_settlement = test_bad_settlement;
@@ -4616,7 +4586,7 @@ accept_new_factory:
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(mgr);
-        if (no_jit) mgr->jit_enabled = 0;
+        mgr->jit_enabled = enable_jit_experimental;
         mgr->jit_funding_sats = (jit_amount_arg > 0) ?
             (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
 

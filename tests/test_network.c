@@ -28,6 +28,20 @@ int test_network_is_mainnet(void) {
     return 1;
 }
 
+/* The funding depth both daemons default to, and the override. */
+int test_network_funding_confs(void) {
+    TEST_ASSERT(network_funding_confs("regtest", 0) == 1, "regtest default 1");
+    TEST_ASSERT(network_funding_confs("signet", 0) == 3, "signet default 3");
+    TEST_ASSERT(network_funding_confs("testnet", 0) == 3, "testnet default 3");
+    TEST_ASSERT(network_funding_confs("testnet4", 0) == 3, "testnet4 default 3");
+    for (size_t i = 0; i < N_MAINNET; i++)
+        TEST_ASSERT(network_funding_confs(MAINNET_NAMES[i], 0) == 6, "mainnet default 6");
+    TEST_ASSERT(network_funding_confs("mainnet", 2) == 2, "override wins");
+    TEST_ASSERT(network_funding_confs("regtest", 4) == 4, "override wins on regtest");
+    TEST_ASSERT(network_funding_confs("signet", -1) == 3, "non-positive override ignored");
+    return 1;
+}
+
 int test_network_canonical(void) {
     const char *c = network_canonical("bitcoin");
     TEST_ASSERT(c && strcmp(c, "mainnet") == 0, "bitcoin canonicalises to mainnet");
@@ -152,6 +166,80 @@ int test_network_gate_db(void) {
                     "test chains may run without --db");
         TEST_ASSERT(network_gate_watchtower_db(OTHER_NAMES[i], 0, err, sizeof(err)),
                     "test chains may run without --wt-db");
+    }
+    return 1;
+}
+
+int test_network_gate_no_experimental_jit(void) {
+    char err[512];
+    char *const clean_argv[] = { "daemon", "--db", "x.db", NULL };
+    for (size_t i = 0; i < N_MAINNET; i++) {
+        err[0] = (char)0;
+        TEST_ASSERT(!network_gate_no_experimental_jit(MAINNET_NAMES[i], 1, err, sizeof(err)),
+                    "the JIT opt-in is refused on mainnet");
+        TEST_ASSERT(strstr(err, "--enable-jit-experimental") != NULL,
+                    "message names the flag");
+        TEST_ASSERT(network_gate_no_experimental_jit(MAINNET_NAMES[i], 0, err, sizeof(err)),
+                    "mainnet without the opt-in passes");
+
+        /* The LSP start-up check applies it. */
+        network_startup_t st = {
+            .role = NETWORK_ROLE_LSP, .network = MAINNET_NAMES[i], .accept_risk = 1,
+            .seckey_on_cmdline = 0, .have_db = 1, .have_wt_db = 1,
+            .argc = 3, .argv = clean_argv, .envp = NULL,
+        };
+        TEST_ASSERT(network_startup_gates(&st, err, sizeof(err)),
+                    "a complete mainnet start passes");
+        st.enable_jit_experimental = 1;
+        TEST_ASSERT(!network_startup_gates(&st, err, sizeof(err)),
+                    "a mainnet start with the JIT opt-in is refused");
+    }
+    for (size_t i = 0; i < N_OTHER; i++)
+        TEST_ASSERT(network_gate_no_experimental_jit(OTHER_NAMES[i], 1, err, sizeof(err)),
+                    "test chains may opt in");
+    return 1;
+}
+
+int test_network_gate_no_experimental_rotation(void) {
+    char err[512];
+    char *const clean_argv[] = { "daemon", "--db", "x.db", NULL };
+    for (size_t i = 0; i < N_MAINNET; i++) {
+        err[0] = (char)0;
+        TEST_ASSERT(!network_gate_no_experimental_rotation(MAINNET_NAMES[i], 1,
+                                                           err, sizeof(err)),
+                    "the rotation opt-in is refused on mainnet");
+        TEST_ASSERT(strstr(err, "--enable-rotation-experimental") != NULL,
+                    "message names the flag");
+        TEST_ASSERT(network_gate_no_experimental_rotation(MAINNET_NAMES[i], 0,
+                                                          err, sizeof(err)),
+                    "mainnet without the opt-in passes");
+
+        /* The start-up check applies it. */
+        network_startup_t st = {
+            .role = NETWORK_ROLE_LSP, .network = MAINNET_NAMES[i], .accept_risk = 1,
+            .seckey_on_cmdline = 0, .have_db = 1, .have_wt_db = 1,
+            .argc = 3, .argv = clean_argv, .envp = NULL,
+        };
+        TEST_ASSERT(network_startup_gates(&st, err, sizeof(err)),
+                    "a complete mainnet start passes");
+        st.enable_rotation_experimental = 1;
+        err[0] = (char)0;
+        TEST_ASSERT(!network_startup_gates(&st, err, sizeof(err)),
+                    "a mainnet start with the rotation opt-in is refused");
+        TEST_ASSERT(strstr(err, "--enable-rotation-experimental") != NULL,
+                    "refused by the rotation gate");
+    }
+    for (size_t i = 0; i < N_OTHER; i++) {
+        TEST_ASSERT(network_gate_no_experimental_rotation(OTHER_NAMES[i], 1,
+                                                          err, sizeof(err)),
+                    "test chains may opt in");
+        network_startup_t st = {
+            .role = NETWORK_ROLE_LSP, .network = OTHER_NAMES[i],
+            .enable_rotation_experimental = 1,
+            .argc = 3, .argv = clean_argv, .envp = NULL,
+        };
+        TEST_ASSERT(network_startup_gates(&st, err, sizeof(err)),
+                    "a test-chain start with the rotation opt-in passes");
     }
     return 1;
 }

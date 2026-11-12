@@ -442,7 +442,10 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         return 0;
     }
     if (t->n_level_arity > 0) {
-        factory_set_level_arity(f, t->level_arity, t->n_level_arity);
+        if (!factory_set_level_arity(f, t->level_arity, t->n_level_arity)) {
+            fprintf(stderr, "%s: saved tree shape refused\n", who);
+            return 0;
+        }
     } else if (t->leaf_arity == FACTORY_ARITY_1) {
         factory_set_arity(f, FACTORY_ARITY_1);
     } else if (t->leaf_arity == FACTORY_ARITY_PS) {
@@ -456,7 +459,10 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         f->fee_per_tx = t->fee_per_tx;
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
-    f->placement_mode = t->placement;
+    if (!factory_set_placement_mode(f, t->placement)) {
+        fprintf(stderr, "%s: saved placement mode refused\n", who);
+        return 0;
+    }
     f->economic_mode = t->econ;
     if (t->profiles) {
         size_t n = t->n_profiles < f->config.max_signers ? t->n_profiles
@@ -496,8 +502,11 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         }
     }
 
-    factory_set_funding(f, funding_txid, funding_vout, funding_amount,
-                        funding_spk, funding_spk_len);
+    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+                             funding_spk, funding_spk_len)) {
+        fprintf(stderr, "%s: funding script refused\n", who);
+        return 0;
+    }
 
     if (!factory_build_tree(f)) {
         fprintf(stderr, "%s: factory_build_tree failed\n", who);
@@ -717,6 +726,9 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     size_t dist_row = (size_t)f->n_nodes * mtx_stride;  /* byte offset of the dist row */
     dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
                    factory_session_init_dist(f));
+    /* Test hook, inert unless superscalar_cheat_allowed() (regtest only):
+       leave the distribution TX out of the creation ceremony. */
+    if (superscalar_cheat_allowed() && getenv("SS_CHEAT_DIST_OMIT")) dist_active = 0;
 
     lsp_crash_checkpoint("factory_creation_propose");
 
@@ -888,8 +900,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             wire_json_add_hex(response, "all_dist_pubnonces",
                               all_pn + dist_row, (size_t)f->n_participants * 66);
             wire_json_add_hex(response, "lsp_dist_psig", lsp_dist_psig, 32);
+            /* Test hook, inert unless superscalar_cheat_allowed() (regtest
+               only): announce a different locktime. */
             cJSON_AddNumberToObject(response, "dist_nlocktime",
-                                    (double)f->cltv_timeout);
+                                    (double)(factory_distribution_locktime(f) +
+                                             ((superscalar_cheat_allowed() &&
+                                               getenv("SS_CHEAT_DIST_LOCKTIME"))
+                                                  ? 1u : 0u)));
             size_t namt = lsp->dist_n_client_amounts;
             if (namt > 0 && namt <= (size_t)f->n_participants) {
                 unsigned char *amt_le = calloc(namt, 8);

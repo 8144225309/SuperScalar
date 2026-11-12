@@ -18,6 +18,7 @@
 #include "superscalar/sha256.h"
 #include "superscalar/persist.h"
 #include "superscalar/ptlc_commit.h"
+#include "superscalar/crash_inject.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -30,6 +31,9 @@
 #include <errno.h>
 #include <time.h>
 #include <sqlite3.h>
+
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -1828,6 +1832,11 @@ static int cs_fork_channel_clients(const lsp_t *lsp, int port,
             secp256k1_context *cc = cs_ctx();
             secp256k1_keypair ck;
             if (!secp256k1_keypair_create(cc, &ck, cs_seckeys[c + 1])) _exit(2);
+            /* The funding script is the MuSig2 key of the participants in
+               the order the LSP numbers them.  Slot hints make that the key
+               order; connecting in key order keeps it so as well. */
+            client_set_slot_hint(c + 1);
+            usleep(200000 * (useconds_t)c);
             int ok = client_run_with_channels(cc, &ck, "127.0.0.1", port,
                                                cs_idle_cb, NULL, NULL, NULL);
             secp256k1_context_destroy(cc);
@@ -1878,8 +1887,16 @@ static int cs_run_inprocess_close(int honest, int *close_rc_out,
     if (!forked) setup_ok = 0;
 
     if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
+    /* Made-up outpoint: fund it at the key of the participants in the order
+       the LSP accepted them. */
+    if (setup_ok) {
+        secp256k1_pubkey order[CS_N];
+        order[0] = lsp->lsp_pubkey;
+        for (int c = 0; c < CS_N - 1; c++) order[c + 1] = lsp->client_pubkeys[c];
+        if (!test_funding_spk_from_pubkeys(ctx, order, CS_N, fund_spk)) setup_ok = 0;
+    }
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
-                                               fund_spk, 34, 10, 4, 0))
+                                               fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */))
         setup_ok = 0;
 
     lsp_channel_mgr_t ch_mgr;
@@ -1927,6 +1944,84 @@ static int cs_run_inprocess_close(int honest, int *close_rc_out,
     signal(SIGPIPE, old_sigpipe);
     secp256k1_context_destroy(ctx);
     return setup_ok;
+}
+
+/* Run factory creation only, LSP and four clients over loopback TCP, on a
+   made-up funding outpoint with a CLTV timeout, so a distribution TX is
+   required.  Reports the LSP's creation result and whether the LSP holds a
+   signed distribution TX afterwards.  Returns 1 if the setup before the
+   ceremony worked. */
+static int cs_run_inprocess_creation(int *creation_rc_out, int *dist_signed_out) {
+    *creation_rc_out = -1;
+    *dist_signed_out = 0;
+
+    secp256k1_context *ctx = cs_ctx();
+    secp256k1_keypair kps[CS_N];
+    secp256k1_pubkey pks[CS_N];
+    unsigned char fund_spk[34], fund_txid[32];
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    int port = 0;
+    if (!lsp || !cs_keys(ctx, kps, pks) ||
+        !lsp_init(lsp, ctx, &kps[0], 0, CS_N - 1)) {
+        free(lsp);
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+    memset(fund_txid, 0xAB, 32);
+    factory_alloc_default_arrays(&lsp->factory);
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    pid_t child[CS_N - 1];
+    int setup_ok = cs_lsp_listen(lsp, &port);
+    int forked = setup_ok && cs_fork_channel_clients(lsp, port, child);
+    if (!forked) setup_ok = 0;
+    if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
+    if (setup_ok) {
+        secp256k1_pubkey order[CS_N];
+        order[0] = lsp->lsp_pubkey;
+        for (int c = 0; c < CS_N - 1; c++) order[c + 1] = lsp->client_pubkeys[c];
+        if (!test_funding_spk_from_pubkeys(ctx, order, CS_N, fund_spk)) setup_ok = 0;
+    }
+    if (setup_ok) {
+        *creation_rc_out = lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
+                                                    fund_spk, 34, 10, 4, 2000000);
+        *dist_signed_out = lsp->factory.dist_tx_ready == 2 &&
+                           lsp->factory.dist_signed_tx.len > 0;
+    }
+
+    lsp_cleanup(lsp);
+    free(lsp);
+    if (forked) cs_reap(child, CS_N - 1, 0, NULL);
+    signal(SIGPIPE, old_sigpipe);
+    secp256k1_context_destroy(ctx);
+    return setup_ok;
+}
+
+/* The LSP test hooks SS_CHEAT_DIST_OMIT and SS_CHEAT_DIST_LOCKTIME have no
+   effect unless cheats are allowed: with the env var set and the cheat gate
+   off, factory creation completes with a signed distribution TX.  With the
+   gate on the hook fires and no signed distribution TX comes out of it. */
+static int test_lsp_dist_cheats_need_cheat_gate_body(void) {
+    static const char *const hooks[] = { "SS_CHEAT_DIST_OMIT",
+                                         "SS_CHEAT_DIST_LOCKTIME" };
+    for (size_t h = 0; h < sizeof(hooks) / sizeof(hooks[0]); h++) {
+        int rc = -1, dist_signed = 0;
+        TEST_ASSERT(setenv(hooks[h], "1", 1) == 0, "setenv");
+
+        superscalar_set_cheat_gate(0);
+        TEST_ASSERT(cs_run_inprocess_creation(&rc, &dist_signed), "setup (gate off)");
+        TEST_ASSERT(rc == 1, "gate off: factory creation completes");
+        TEST_ASSERT(dist_signed, "gate off: the distribution TX is signed");
+
+        superscalar_set_cheat_gate(1);
+        TEST_ASSERT(cs_run_inprocess_creation(&rc, &dist_signed), "setup (gate on)");
+        superscalar_set_cheat_gate(0);
+        TEST_ASSERT(rc == 0 || !dist_signed,
+                    "gate on: the hook fires, no signed distribution TX");
+
+        unsetenv(hooks[h]);
+    }
+    return 1;
 }
 
 /* client_run_with_channels hands the channel it opened to the close
@@ -2023,7 +2118,7 @@ static int test_regtest_coop_close_refuses_lsp_payee_body(void) {
     if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, fund_vout,
                                                fund_amount, fund_spk, 34,
-                                               10, 4, 0))
+                                               10, 4, 2000000 /* CLTV: a distribution TX is required */))
         setup_ok = 0;
 
     lsp_channel_mgr_t ch_mgr;
@@ -2581,6 +2676,7 @@ CS_DEADLINE_ENTRY(test_client_close_record_unreadable, CS_UNIT_DEADLINE_SEC)
 CS_DEADLINE_ENTRY(test_client_close_record_survives_restart, CS_UNIT_DEADLINE_SEC)
 CS_DEADLINE_ENTRY(test_client_close_honest_ceremony, CS_UNIT_DEADLINE_SEC)
 CS_DEADLINE_ENTRY(test_client_run_with_channels_checks_close, CS_UNIT_DEADLINE_SEC)
+CS_DEADLINE_ENTRY(test_lsp_dist_cheats_need_cheat_gate, CS_UNIT_DEADLINE_SEC)
 CS_DEADLINE_ENTRY(test_regtest_coop_close_refuses_lsp_payee, CS_REGTEST_DEADLINE_SEC)
 CS_DEADLINE_ENTRY(test_client_leaf_realloc_handler_refuses_all, CS_UNIT_DEADLINE_SEC)
 CS_DEADLINE_ENTRY(test_client_leaf_realloc_ceremony_refused, CS_UNIT_DEADLINE_SEC)

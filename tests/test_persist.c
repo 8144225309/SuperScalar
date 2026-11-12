@@ -1513,6 +1513,7 @@ int test_lsp_recovery_round_trip(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2030,6 +2031,7 @@ int test_persist_crash_stress(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -3448,6 +3450,7 @@ int test_ptlc_commitment_output(void) {
 
     /* Build commitment tx WITHOUT PTLC */
     tx_buf_t tx1;
+    tx_buf_init(&tx1, 512);
     unsigned char txid1[32];
     int r1 = channel_build_commitment_tx(&ch, &tx1, txid1);
     TEST_ASSERT(r1, "PTLC_CO1: commitment without PTLC");
@@ -3464,6 +3467,7 @@ int test_ptlc_commitment_output(void) {
 
     /* Build commitment tx WITH PTLC */
     tx_buf_t tx2;
+    tx_buf_init(&tx2, 512);
     unsigned char txid2[32];
     int r2 = channel_build_commitment_tx(&ch, &tx2, txid2);
     TEST_ASSERT(r2, "PTLC_CO1: commitment with PTLC");
@@ -5742,5 +5746,113 @@ int test_persist_htlc_origin_rows(void) {
     TEST_ASSERT(!persist_deactivate_htlc_origin_id(&db, 0), "row id 0 is nobody");
 
     persist_close(&db);
+    return 1;
+}
+
+/* ---- Rotation: the pending factory record ---- */
+
+#include "superscalar/client.h"
+
+static factory_t *pending_test_factory(secp256k1_context *ctx, unsigned char txid_byte) {
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i])) return NULL;
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char ser[32], tweak[32], fund_spk[34];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey)) return NULL;
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    musig_keyagg_t kc = ka;
+    secp256k1_pubkey tw;
+    secp256k1_xonly_pubkey twx;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw, &kc.cache, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &twx, NULL, &tw)) return NULL;
+    build_p2tr_script_pubkey(fund_spk, &twx);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return NULL;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->use_tree_anchor = 1;
+    unsigned char txid[32];
+    memset(txid, txid_byte, 32);
+    factory_set_funding(f, txid, 1, 1000000, fund_spk, 34);
+    if (!factory_build_tree(f)) { factory_free(f); free(f); return NULL; }
+    return f;
+}
+
+/* Recording the factory being entered leaves everything about the factory
+   being left in place, survives a reopen (it is the "rotation not finished"
+   marker), and is removed without touching the current factory. */
+int test_rotation_pending_record(void) {
+    secp256k1_context *ctx = test_ctx();
+    char path[96];
+    snprintf(path, sizeof(path), "/tmp/test_superscalar_rotpending_%d.db", (int)getpid());
+    unlink(path);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+
+    factory_t *old_f = pending_test_factory(ctx, 0xA1);
+    factory_t *new_f = pending_test_factory(ctx, 0xB2);
+    TEST_ASSERT(old_f && new_f, "factories");
+    unsigned char sig[64], tx[80], dist[60];
+    memset(sig, 0x33, 64); memset(tx, 0x44, 80); memset(dist, 0x55, 60);
+    TEST_ASSERT(persist_save_factory(&db, old_f, ctx, 0), "old factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, old_f, 0), "old tree");
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 7, sig, tx, 80), "old commitment");
+    TEST_ASSERT(persist_save_distribution_tx(&db, 0, dist, 60), "old distribution tx");
+    TEST_ASSERT(!persist_has_factory(&db, CLIENT_ROTATION_PENDING_FACTORY_ID),
+                "no rotation pending");
+
+    /* the new factory arrives with a verified distribution transaction */
+    unsigned char ndist[70];
+    memset(ndist, 0x66, 70);
+    tx_buf_free(&new_f->dist_unsigned_tx);
+    tx_buf_init(&new_f->dist_unsigned_tx, 70);
+    memcpy(new_f->dist_unsigned_tx.data, ndist, 70);
+    new_f->dist_unsigned_tx.len = 70;
+    new_f->dist_tx_ready = 2;
+    TEST_ASSERT(client_rotation_save_pending(&db, new_f, ctx), "save pending");
+    persist_close(&db);
+
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen");
+    TEST_ASSERT(persist_has_factory(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID),
+                "pending record survives a reopen");
+    char txid_hex[65];
+    uint32_t vout = 9, cltv = 0;
+    TEST_ASSERT(persist_load_factory_outpoint(&db2, 0, txid_hex, &vout, &cltv), "old outpoint");
+    TEST_ASSERT(strncmp(txid_hex, "a1a1a1a1", 8) == 0 && vout == 1, "factory 0 is still the old factory");
+    TEST_ASSERT(persist_load_factory_outpoint(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                              txid_hex, &vout, &cltv), "pending outpoint");
+    TEST_ASSERT(strncmp(txid_hex, "b2b2b2b2", 8) == 0, "pending record is the new factory");
+    uint64_t cn = 0;
+    unsigned char got[128];
+    size_t got_len = 0;
+    TEST_ASSERT(persist_load_commitment_sig(&db2, 0, &cn, NULL, got, &got_len, sizeof(got)) &&
+                cn == 7 && got_len == 80, "old commitment untouched");
+    TEST_ASSERT(persist_load_distribution_tx(&db2, 0, got, &got_len, sizeof(got)) &&
+                got_len == 60, "old distribution tx untouched");
+    TEST_ASSERT(persist_load_distribution_tx(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                             got, &got_len, sizeof(got)) &&
+                got_len == 70 && got[0] == 0x66, "new distribution tx recorded");
+
+    /* an unverified distribution transaction is never recorded */
+    new_f->dist_tx_ready = 1;
+    TEST_ASSERT(client_rotation_save_pending(&db2, new_f, ctx), "save pending again");
+    TEST_ASSERT(!persist_load_distribution_tx(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                              got, &got_len, sizeof(got)) || got_len == 0,
+                "unverified distribution tx not recorded");
+
+    TEST_ASSERT(persist_delete_factory_record(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID),
+                "remove pending record");
+    TEST_ASSERT(!persist_has_factory(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID), "marker gone");
+    TEST_ASSERT(persist_has_factory(&db2, 0), "current factory kept");
+    persist_close(&db2);
+    unlink(path);
+    { char side[112];
+      snprintf(side, sizeof(side), "%s-wal", path); unlink(side);
+      snprintf(side, sizeof(side), "%s-shm", path); unlink(side); }
+    factory_free(old_f); free(old_f);
+    factory_free(new_f); free(new_f);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

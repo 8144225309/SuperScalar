@@ -15,6 +15,13 @@
 /* 1 if network names Bitcoin mainnet ("mainnet" or "bitcoin"), else 0. */
 int network_is_mainnet(const char *network);
 
+/* Confirmations a factory's funding output needs before the factory is used:
+   override if it is positive, otherwise the chain's default (regtest 1,
+   mainnet 6, every other chain 3).  The LSP waits for this depth and the
+   client refuses a factory whose funding output is less deep, so with the
+   defaults both sides agree. */
+int network_funding_confs(const char *network, int override);
+
 /* The canonical name of a supported chain: "bitcoin" maps to "mainnet", the
    other supported names map to themselves.  Returns a static string, or NULL
    if network is NULL or not a supported chain.  The daemons canonicalise
@@ -27,7 +34,7 @@ const char *network_canonical(const char *network);
  * supported and applies every mainnet gate that belongs to the daemon's role:
  *
  *   LSP         risk acknowledgement, no --seckey, no test scaffolding,
- *               --db, --wt-db
+ *               --db, --wt-db, no experimental JIT channels or rotation
  *   client      risk acknowledgement, no --seckey, no test scaffolding, --db
  *   watchtower  risk acknowledgement, no test scaffolding
  *
@@ -47,6 +54,8 @@ typedef struct {
     int seckey_on_cmdline;    /* --seckey given */
     int have_db;              /* --db given */
     int have_wt_db;           /* --wt-db given */
+    int enable_jit_experimental; /* --enable-jit-experimental given (LSP) */
+    int enable_rotation_experimental; /* --enable-rotation-experimental given (LSP) */
     int argc;                 /* the daemon's own argc/argv */
     char *const *argv;
     char *const *envp;        /* its environment (NULL-terminated), or NULL */
@@ -85,5 +94,15 @@ int network_gate_db(const char *network, int have_db,
 /* A mainnet LSP needs the watchtower database. */
 int network_gate_watchtower_db(const char *network, int have_wt_db,
                                char *err_buf, size_t err_buf_len);
+
+/* Opening JIT channels is experimental and can lose the LSP's funds: the
+   opt-in is refused on mainnet. */
+int network_gate_no_experimental_jit(const char *network, int enable_jit,
+                                     char *err_buf, size_t err_buf_len);
+
+/* Factory rotation is experimental: the close of the old factory can pay the
+   members' balances to the LSP.  The opt-in is refused on mainnet. */
+int network_gate_no_experimental_rotation(const char *network, int enable_rotation,
+                                          char *err_buf, size_t err_buf_len);
 
 #endif /* SUPERSCALAR_NETWORK_H */

@@ -128,6 +128,7 @@ int cli_parse_static_near_root(const char *spec,
 int cli_validate_shape_for_bolt2016(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
+    uint32_t ps_subfactory_arity,
     size_t n_clients,
     uint32_t static_threshold,
     uint16_t step_blocks,
@@ -136,7 +137,7 @@ int cli_validate_shape_for_bolt2016(
     char *err_buf, size_t err_buf_len)
 {
     uint32_t ewt = factory_compute_ewt_for_shape(
-        level_arities, n_level_arity, leaf_arity,
+        level_arities, n_level_arity, leaf_arity, ps_subfactory_arity,
         n_clients, static_threshold, step_blocks, states_per_layer);
     if (ewt_out) *ewt_out = ewt;
     if (ewt <= CLI_ARITY_BOLT2016_CEILING) return 1;
@@ -189,12 +190,14 @@ int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
 }
 
 uint32_t cli_factory_exit_blocks(const uint8_t *level_arities, size_t n_level_arity,
-                                 factory_arity_t leaf_arity, size_t n_clients,
+                                 factory_arity_t leaf_arity,
+                                 uint32_t ps_subfactory_arity, size_t n_clients,
                                  uint32_t static_threshold, uint16_t step_blocks,
                                  uint32_t states_per_layer)
 {
     uint64_t ewt = factory_compute_ewt_for_shape(level_arities, n_level_arity,
-                                                 leaf_arity, n_clients,
+                                                 leaf_arity, ps_subfactory_arity,
+                                                 n_clients,
                                                  static_threshold, step_blocks,
                                                  states_per_layer);
     uint32_t depth = 1;

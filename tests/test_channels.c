@@ -328,6 +328,12 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
     (void)ctx; (void)keypair; (void)factory; (void)n_participants;
 
+    if (!ch->has_latest_commitment_sig || ch->commitment_number != 0) {
+        fprintf(stderr, "Client %u: channel handed over without a signed "
+                "commitment 0\n", my_index);
+        return 0;
+    }
+
     for (size_t i = 0; i < data->n_actions; i++) {
         scripted_action_t *act = &data->actions[i];
 
@@ -477,6 +483,12 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                                void *user_data) {
     payment_test_data_t *data = (payment_test_data_t *)user_data;
     (void)ctx; (void)keypair; (void)factory; (void)n_participants;
+
+    if (!ch->has_latest_commitment_sig || ch->commitment_number != 0) {
+        fprintf(stderr, "Client %u: channel handed over without a signed "
+                "commitment 0\n", my_index);
+        return 0;
+    }
 
     if (data->is_sender) {
         /* Client A (index 1): send payment to Client B (index 2, = client_idx 1) */
@@ -763,7 +775,7 @@ int test_regtest_intra_factory_payment(void) {
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1158,7 +1170,7 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1587,7 +1599,7 @@ static int run_scale_payment_ring(int n_clients, int arity_code,
         lsp->factory.leaf_arity = (factory_arity_t)arity_code;
 
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
-                                            fund_spk, 34, 10, 4, 0)) {
+                                            fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
     }
     if (lsp_ok)
@@ -1950,6 +1962,7 @@ int test_fee_estimator_wiring(void) {
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2018,6 +2031,7 @@ int test_fee_estimator_null_fallback(void) {
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2364,7 +2378,7 @@ int test_regtest_lsp_restart_recovery(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2937,7 +2951,7 @@ int test_regtest_crash_double_recovery(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -3408,7 +3422,7 @@ int test_regtest_tcp_reconnect(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -4619,7 +4633,7 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
     LEAF_STEP(lsp_accept_clients(lsp), "accept clients");
     lsp->factory.leaf_arity = (factory_arity_t)arity_code;
     LEAF_STEP(lsp_run_factory_creation(lsp, funding_txid, funding_vout,
-                                        funding_amount, fund_spk, 34, 10, 4, 0),
+                                        funding_amount, fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */),
               "factory creation");
     LEAF_STEP((int)lsp->factory.leaf_arity == arity_code, "requested leaf arity kept");
     LEAF_STEP(lsp->factory.n_leaf_nodes == 2, "one leaf per client");

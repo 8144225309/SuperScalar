@@ -19,6 +19,13 @@ const char *network_canonical(const char *network) {
     return NULL;
 }
 
+int network_funding_confs(const char *network, int override) {
+    if (override > 0) return override;
+    if (network && strcmp(network, "regtest") == 0) return 1;
+    if (network_is_mainnet(network)) return 6;
+    return 3;
+}
+
 static int has_prefix(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
@@ -99,6 +106,28 @@ int network_gate_watchtower_db(const char *network, int have_wt_db,
     return 0;
 }
 
+int network_gate_no_experimental_jit(const char *network, int enable_jit,
+                                     char *err_buf, size_t err_buf_len) {
+    if (!network_is_mainnet(network) || !enable_jit) return 1;
+    if (err_buf && err_buf_len)
+        snprintf(err_buf, err_buf_len,
+            "Error: --enable-jit-experimental is refused on mainnet.\n"
+            "JIT channels are experimental: an open can leave the LSP's funds\n"
+            "in an output it cannot spend alone.\n");
+    return 0;
+}
+
+int network_gate_no_experimental_rotation(const char *network, int enable_rotation,
+                                          char *err_buf, size_t err_buf_len) {
+    if (!network_is_mainnet(network) || !enable_rotation) return 1;
+    if (err_buf && err_buf_len)
+        snprintf(err_buf, err_buf_len,
+            "Error: --enable-rotation-experimental is refused on mainnet.\n"
+            "Factory rotation is experimental: the close of the old factory can\n"
+            "pay the members' balances to the LSP wallet.\n");
+    return 0;
+}
+
 int network_startup_gates(const network_startup_t *startup,
                           char *err_buf, size_t err_buf_len) {
     if (!startup) return 0;
@@ -123,6 +152,14 @@ int network_startup_gates(const network_startup_t *startup,
         return 0;
     if (!network_gate_no_test_scaffolding(network, startup->argc, startup->argv,
                                           startup->envp, err_buf, err_buf_len))
+        return 0;
+    if (!network_gate_no_experimental_jit(network,
+                                          startup->enable_jit_experimental,
+                                          err_buf, err_buf_len))
+        return 0;
+    if (!network_gate_no_experimental_rotation(network,
+                                               startup->enable_rotation_experimental,
+                                               err_buf, err_buf_len))
         return 0;
     if (holds_key &&
         !network_gate_db(network, startup->have_db, err_buf, err_buf_len))

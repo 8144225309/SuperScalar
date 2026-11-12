@@ -65,6 +65,8 @@ for NET in mainnet bitcoin; do
     expect_refusal "refused on mainnet" "$LSP" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --cheat-daemon
     expect_refusal "refused on mainnet" "$CLIENT" --network "$NET" --i-accept-the-risk --test-allow-tree-advance
+    expect_refusal "--enable-rotation-experimental is refused on mainnet" \
+        "$CLIENT" --network "$NET" --i-accept-the-risk --enable-rotation-experimental
     expect_refusal "refused on mainnet" \
         "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db" --test-flag
     expect_refusal "refused on mainnet" \
@@ -73,6 +75,17 @@ for NET in mainnet bitcoin; do
         env SUPERSCALAR_CRASH_ALLOW=1 "$CLIENT" --network "$NET" --i-accept-the-risk
     expect_refusal "refused on mainnet" \
         env SS_KILL_AT=1 "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db"
+
+    # Experimental JIT channels: the LSP opt-in.
+    expect_refusal "--enable-jit-experimental is refused on mainnet" \
+        "$LSP" --network "$NET" --i-accept-the-risk --enable-jit-experimental
+
+    # Experimental factory rotation: the LSP opt-in, and the test mode that
+    # implies it.
+    expect_refusal "--enable-rotation-experimental is refused on mainnet" \
+        "$LSP" --network "$NET" --i-accept-the-risk --enable-rotation-experimental
+    expect_refusal "--test-rotation is test/cheat scaffolding and is refused on mainnet" \
+        "$LSP" --network "$NET" --i-accept-the-risk --test-rotation
 
     # Persistent state: --db for LSP and client, --wt-db for the LSP.
     expect_refusal "mainnet requires --db" "$LSP" --network "$NET" --i-accept-the-risk
@@ -93,6 +106,10 @@ expect_refusal "--lsp-pubkey required" \
     "$CLIENT" --network signet --seckey "$KEY" --rpcuser u --rpcpassword p
 expect_refusal "--lsp-pubkey required" \
     "$CLIENT" --network signet --keyfile "$F/new.key" --rpcuser u --rpcpassword p
+
+# Async rotation is a rotation option: it needs the rotation opt-in.
+expect_refusal "--async-rotation needs --enable-rotation-experimental" \
+    "$LSP" --network regtest --async-rotation
 
 # The well-known lookup is a direct connection: refused when Tor is in use.
 expect_refusal "cannot be used with --tor-proxy" \

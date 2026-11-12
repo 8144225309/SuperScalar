@@ -6,6 +6,39 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Factory rotation is off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer rotates factories unless started with `--enable-rotation-experimental`.** Before, every `--daemon` LSP rotated a factory automatically when it turned DYING. That rotation is not safe yet: the members hand over their factory keys, the LSP closes the old factory with every output paid to its own wallet, and the new factory reuses the same keys. The flag is for testing only and is refused on mainnet. `--test-rotation` and `--test-partial-rotation` imply it; `--async-rotation` needs it.
+- **Without the flag, a DYING factory keeps serving its channels until it expires.** The LSP logs that it is not rotating. Every way into a rotation is refused: the DYING/EXPIRED trigger and its retries, partial rotation at EXPIRED, the DW-counter trigger, the async-rotation readiness gate, CLI `rotate` and `MSG_ROTATE`.
+- **The LSP broadcasts the co-signed distribution TX of an expired factory once its nLockTime is reached**, retrying at each block until it is accepted. Before, it tried once, at EXPIRED, which with the default `--cltv-timeout` is always before the nLockTime, and for the first factory it held the unsigned TX, so the broadcast never succeeded. Members' own copies are unchanged.
+
+### JIT channels are off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer opens JIT channels unless started with `--enable-jit-experimental`.** Without the flag it sends no JIT offer and funds nothing when its factories expire, and it answers `lsps2.buy` and `lsps2.get_info` from a factory client with a JSON-RPC error (`-32601`). The flag is unsafe and for testing only: an open funds a 2-of-2 output before the client has signed anything, and the channel cannot carry payments yet. It is refused on mainnet. `--test-jit` implies it.
+- **`--no-jit` is removed.** JIT opens are off by default, so the flag had nothing left to do; like any unknown option it is now ignored.
+- **`lsps2.buy` and `lsps2.get_info` from an outside peer (the BOLT #8 listener) are always refused**, and LSPS replies to outside peers are sent over the peer's encrypted transport.
+- **A client that does not accept JIT offers now says so.** New wire message `JIT_REJECT` (`0x90`); the LSP stops waiting as soon as it arrives. Messages a client sends while an offer is pending are handled afterwards instead of being dropped.
+- **A JIT channel is kept across a rotation**, by the LSP and by the client, unless the cooperative close the LSP broadcast for it has the close depth (`--close-confs`) and its funding output is spent. Before, both sides deleted their record of it, and its watch entries, whatever had happened on chain. `JIT_MIGRATE` now names that close. The client no longer removes its factory channel's watchtower entries when it is told a JIT channel was migrated.
+- JIT channels opened earlier are still loaded at start-up and closed at rotation whether or not the flag is given.
+
+### Unilateral exit from large factories
+
+- **Force-close no longer stops at 128 tree transactions.** `superscalar_client --force-close`, the `recoverfactory` RPC and `listfactories` read at most the first 128 tree nodes of a factory. A client whose path to its leaf contained a node with index 128 or higher (factories from about 33 one-client leaves or 65 two-client leaves upwards) never published that part of its path, reported no error, and its commitment could not confirm. The tree is now loaded in full whatever its size.
+- **An incomplete tree is an error.** If the stored tree has missing nodes, a parent that is not in the tree, or a node on the path without a signed transaction, force-close and `recoverfactory` fail with the reason, and an exit path with such a hole broadcasts nothing. `listfactories` reports it as `tree_error`.
+- **`superscalar_client --force-close` publishes only the client's own path** (factory root to its leaf) instead of every tree transaction it has, then its commitment.
+- **`--force-close` exit status says how far the exit got:** `0` = the commitment is in the mempool or a block (so the whole path is out), `2` = run it again after the next block, `3` = stuck: a transaction was refused for a reason waiting will not cure (fee below the node's floor, input spent by another transaction), with the reason printed, `1` = the exit cannot be completed from this DB (incomplete tree, no signed commitment, or the leaf the commitment spends is not stored). Before, it always exited `0`.
+- `recoverfactory` returns an error instead of `broadcasts_made: false` when it cannot run, and reports `published`, `n_tree_nodes`, `n_confirmed`, `n_in_mempool`, `n_waiting` and `n_rejected`.
+- `sweepfactory` considers every output of a leaf transaction; it used to look at the first 8 only.
+- `--force-close` and `--sweep-to-local` load the commitment, and `--force-close` the distribution transaction, at their stored size instead of into 4 kB and 8 kB buffers.
+- **A client can exit after a leaf advance.** An advance replaces the client's leaf in its DB while its channel and commitments keep spending the old leaf's output. `--force-close` used to publish the replacement, which spends that same output (for a pseudo-Spilman leaf chain[1] spends chain[0]:0; for a DW leaf the newer state spends the same parent output), so the client's own exit made its commitment unspendable while every pass reported `COMPLETE`. The client now keeps the leaf its channel is funded by (table `client_funding_leaf`) when an advance is proposed, the exit leaf is the transaction the stored commitment spends, and the exit publishes the kept copy instead of the current row. Without a kept copy it publishes nothing and exits `1`. DBs written before this change hold no kept copy.
+- **Refusals are told apart from waits.** A tree transaction behind a height lock (nLockTime) that has not passed is not offered and counts as waiting. One refused although its parent is deep enough and its lock has passed is reported with the reason (input spent by another transaction, or refused although its input is unspent: fee below the node's floor or policy), and `--force-close` exits `3`. A commitment counts as published when an output of it is in the UTXO set, so a node without a transaction index that no longer sees an old commitment does not report the exit as in progress forever.
+- **A fully published factory is now marked `closed`.** Recovery looked for tree nodes of a type that is never stored, so it never found a leaf and never closed a factory. A leaf is now a state node that no other node spends; once all of them are confirmed at the funding depth, the start-up scan and a whole-tree `recoverfactory` mark the factory `closed`, and `listfactories` reports real `n_leaf` / `n_leaf_confirmed` counts. `closed` means the tree is on chain; the channel outputs of its leaves may still be unspent, so it is not a signal that every client has been paid out.
+- The `signer_indices` and `output_amounts` columns of a stored tree node are written in full; they were cut at 127 and 255 characters (about 45 signers).
+
 ### Key handling and start-up safety
 
 Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a refusal, so existing start-up scripts may need adjusting.

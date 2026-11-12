@@ -268,8 +268,8 @@ static int cb_rpc_send_raw_tx(chain_backend_t *self, const char *tx_hex,
     return 1;
 }
 
-/* gettxout with the mempool included: 1 unspent, 0 spent (or never existed:
-   bitcoind answers null), -1 when the node cannot be asked. */
+/* 1 if txid:vout is in the UTXO set (or created by a mempool transaction),
+   0 if it is not, -1 on error.  Needs no txindex. */
 static int cb_rpc_is_outpoint_unspent(chain_backend_t *self,
                                       const char *txid_hex_display,
                                       uint32_t vout)
@@ -278,12 +278,12 @@ static int cb_rpc_is_outpoint_unspent(chain_backend_t *self,
     cJSON *params = cJSON_CreateArray();
     cJSON_AddItemToArray(params, cJSON_CreateString(txid_hex_display));
     cJSON_AddItemToArray(params, cJSON_CreateNumber((double)vout));
-    cJSON_AddItemToArray(params, cJSON_CreateBool(1));
+    cJSON_AddItemToArray(params, cJSON_CreateBool(1));  /* include mempool */
     cJSON *result = rpc_call(rpc, "gettxout", params);
     if (!result) return -1;
-    int r = cJSON_IsObject(result) ? 1 : cJSON_IsNull(result) ? 0 : -1;
+    int unspent = !cJSON_IsNull(result);
     cJSON_Delete(result);
-    return r;
+    return unspent;
 }
 
 static int cb_rpc_register_script(chain_backend_t *self,
@@ -335,8 +335,8 @@ int chain_backend_rpc_init(chain_backend_t *backend,
     backend->get_confirmations       = cb_rpc_get_confirmations;
     backend->get_confirmations_batch = cb_rpc_get_confirmations_batch;
     backend->is_in_mempool           = cb_rpc_is_in_mempool;
-    backend->is_outpoint_unspent     = cb_rpc_is_outpoint_unspent;
     backend->send_raw_tx             = cb_rpc_send_raw_tx;
+    backend->is_outpoint_unspent     = cb_rpc_is_outpoint_unspent;
     backend->register_script         = cb_rpc_register_script;
     backend->unregister_script       = cb_rpc_unregister_script;
     backend->ctx                     = rpc;

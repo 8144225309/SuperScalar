@@ -51,8 +51,8 @@ typedef int (*client_dist_send_fn)(chain_backend_t *chain, const char *tx_hex,
    this client included, signed this transaction.  It is also bound to what
    this member agreed to: the nLockTime equals expected_locktime (the
    factory's CLTV timeout; 0 skips this), and when member_pubkey is given an
-   output pays at least member_min_sats to that key's BIP-86 P2TR script
-   (how the distribution outputs pay members).  On success fills *out
+   output pays at least member_min_sats to that key
+   (client_distribution_pays_member).  On success fills *out
    (out->tx is a copy) and returns 1; otherwise writes the reason to err. */
 int client_dist_verify(const secp256k1_context *ctx,
                        const unsigned char *tx, size_t tx_len,
@@ -67,7 +67,8 @@ int client_dist_verify(const secp256k1_context *ctx,
 /* Read factory_id's distribution TX and factory from db and verify it,
    bound to the factory's CLTV timeout and to this member: the member is
    the client whose channel row the DB holds, and an output must pay its key
-   at least that channel's balances together.  1 = loaded and verified,
+   at least that member's channel capacity (client_member_channel_capacity).
+   1 = loaded and verified,
    0 = none stored, -1 = stored but not usable (reason in err). */
 int client_dist_load(persist_t *db, secp256k1_context *ctx, uint32_t factory_id,
                      client_dist_tx_t *out, char *err, size_t errlen);
@@ -134,6 +135,7 @@ void client_dist_watch_free(client_dist_watch_t *w);
    exit: TX not yet due, funding output spent or its state unknown, or no
    usable TX. */
 int client_dist_force_close(persist_t *db, chain_backend_t *chain,
-                            client_dist_send_fn send, FILE *out);
+                            client_dist_send_fn send, FILE *out,
+                            client_dist_status_t *status_out);
 
 #endif /* SUPERSCALAR_CLIENT_DIST_H */

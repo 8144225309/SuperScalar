@@ -20,6 +20,12 @@ extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
 
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]);
+
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
         printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
@@ -78,6 +84,7 @@ int test_wire_pubkey_only_factory(void) {
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xAA;
     unsigned char fake_spk[34] = {0x51, 0x20};
+    factory_compute_funding_spk(f_ref, fake_spk);
     factory_set_funding(f_ref, fake_txid, 0, 10000000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f_ref), "ref build tree");
 
@@ -933,6 +940,7 @@ int test_basepoint_independence(void) {
     xonly = ka.agg_pubkey;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &xonly);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     factory_build_tree(f);
 
@@ -1010,10 +1018,12 @@ static int run_creation_until_client_error(secp256k1_context *ctx, lsp_t *lsp,
     if (sent) {
         unsigned char txid[32], spk[34];
         memset(txid, 0xAB, sizeof(txid));
-        spk[0] = 0x51; spk[1] = 0x20;
-        memset(spk + 2, 0xCD, 32);
+        secp256k1_pubkey pks[1 + CREATION_TEST_CLIENTS];
+        pks[0] = lsp->lsp_pubkey;
+        for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++) pks[c + 1] = lsp->client_pubkeys[c];
+        if (!test_funding_spk_from_pubkeys(ctx, pks, 1 + CREATION_TEST_CLIENTS, spk)) return 0;
         rc = lsp_run_factory_creation(lsp, txid, 0, 100000, spk, sizeof(spk),
-                                      10, 4, 0);
+                                      10, 4, 2000000 /* CLTV: a distribution TX is required */);
     }
 
     wire_msg_t m;
@@ -1242,7 +1252,7 @@ int test_regtest_wire_factory(void) {
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2359,5 +2369,48 @@ int test_wire_queue_done_empty(void) {
     TEST_ASSERT(ok == 1, "empty ok");
     TEST_ASSERT(count == 0, "count 0");
     cJSON_Delete(j);
+    return 1;
+}
+
+/* Every "#define MSG_<NAME> 0x.." in wire.h must have its own value: two
+   messages sharing an id are indistinguishable on the wire. */
+int test_wire_msg_ids_unique(void) {
+#ifndef SS_SOURCE_DIR
+#error "SS_SOURCE_DIR must be defined for test_superscalar"
+#endif
+    const char *path = SS_SOURCE_DIR "/include/superscalar/wire.h";
+    FILE *f = fopen(path, "r");
+    TEST_ASSERT(f != NULL, "open include/superscalar/wire.h");
+
+    static char names[256][64];
+    int seen[256];
+    memset(seen, 0, sizeof(seen));
+    int n_ids = 0, dup = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char name[64];
+        unsigned int id;
+        if (sscanf(line, "#define MSG_%63[A-Z0-9_] 0x%x", name, &id) != 2)
+            continue;
+        if (id > 0xFF) {
+            printf("  wire.h: MSG_%s = 0x%x does not fit the one-byte type\n", name, id);
+            dup = 1;
+            continue;
+        }
+        if (seen[id]) {
+            printf("  wire.h: id 0x%02X used by MSG_%s and MSG_%s\n",
+                   id, names[id], name);
+            dup = 1;
+        }
+        seen[id] = 1;
+        snprintf(names[id], sizeof(names[id]), "%s", name);
+        n_ids++;
+    }
+    fclose(f);
+    TEST_ASSERT(n_ids >= 100, "the message id table was read");
+    TEST_ASSERT(!dup, "wire message ids are unique");
+    TEST_ASSERT(seen[MSG_JIT_REJECT] && seen[MSG_BRIDGE_PAY_RESULT_ACK] &&
+                MSG_JIT_REJECT != MSG_BRIDGE_PAY_RESULT_ACK,
+                "JIT_REJECT and BRIDGE_PAY_RESULT_ACK have their own ids");
     return 1;
 }
