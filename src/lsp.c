@@ -889,7 +889,7 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
                               all_pn + dist_row, (size_t)f->n_participants * 66);
             wire_json_add_hex(response, "lsp_dist_psig", lsp_dist_psig, 32);
             cJSON_AddNumberToObject(response, "dist_nlocktime",
-                                    (double)f->cltv_timeout);
+                                    (double)factory_distribution_locktime(f));
             size_t namt = lsp->dist_n_client_amounts;
             if (namt > 0 && namt <= (size_t)f->n_participants) {
                 unsigned char *amt_le = calloc(namt, 8);

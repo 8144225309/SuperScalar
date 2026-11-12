@@ -1396,6 +1396,11 @@ extern int test_initial_commitment_persist_reload(void);
 extern int test_initial_commitment_recv_checks_conservation(void);
 extern int test_rotation_commitment_carries_balance(void);
 extern int test_distribution_tx_verification(void);
+extern int test_client_funding_check(void);
+extern int test_client_factory_ready_handler(void);
+extern int test_client_distribution_exit_checks(void);
+extern int test_client_force_close_plan(void);
+extern void client_set_allow_unverified_funding(int allow);
 extern int test_rotation_pending_record(void);
 extern int test_client_persist_reload(void);
 
@@ -3413,6 +3418,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_initial_commitment_recv_checks_conservation);
     RUN_TEST(test_rotation_commitment_carries_balance);
     RUN_TEST(test_distribution_tx_verification);
+    RUN_TEST(test_client_funding_check);
+    RUN_TEST(test_client_factory_ready_handler);
+    RUN_TEST(test_client_distribution_exit_checks);
+    RUN_TEST(test_client_force_close_plan);
+    client_set_allow_unverified_funding(1);
     RUN_TEST(test_rotation_pending_record);
     RUN_TEST(test_client_persist_reload);
 
@@ -4335,6 +4345,9 @@ static void run_regtest_tests(void) {
 
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
+
+    /* In-process ceremonies have no chain to look a funding output up in. */
+    client_set_allow_unverified_funding(1);
 
     if (argc < 2)
         run_unit = 1;

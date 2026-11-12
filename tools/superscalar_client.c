@@ -127,37 +127,14 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     return 1;
 }
 
-/* --- Funding TX no-op verifier for in-process test scaffolds (#197 follow-up).
- *
- * The hard refusal added in #197 (no chain backend → refuse to sign factory)
- * is the right production posture but breaks regtest harness tests that
- * intentionally run without --rpcuser (testing LSP/client wire flow with the
- * client trusting the in-process test orchestrator).  This no-op verifier
- * lets the regtest harness opt out of on-chain verification while keeping
- * the production refusal intact for mainnet/testnet4/signet.
- *
- * Wire the no-op via the --network=regtest path below ONLY when the operator
- * also did NOT pass --rpcuser/--rpcpassword.  Production deployments on
- * regtest can still use the real verifier by supplying --rpcuser. */
-static int verify_funding_noop_regtest(const unsigned char *txid32,
-                                         uint32_t vout,
-                                         uint64_t expected_sats, void *ctx) {
-    (void)txid32; (void)vout; (void)expected_sats; (void)ctx;
-    fprintf(stderr, "Client: REGTEST no-op funding verifier (network=regtest, "
-            "no --rpcuser) — trusting LSP claim of %llu sats; THIS IS UNSAFE "
-            "ON ANY PRODUCTION NETWORK.\n", (unsigned long long)expected_sats);
-    return 1;
-}
-
-/* --- Funding TX on-chain verification callback ---
- * Called by client_run_with_channels() between FACTORY_PROPOSE parsing and
- * tree signing.  Uses the RPC chain backend to query the funding TX and
- * confirm the output amount matches the LSP's claim.
- * ctx is a regtest_t* (same RPC backend used for force-close and sweep). */
+/* --- Funding output lookup over RPC ---
+ * Chain source for client_check_factory_funding(): reports what bitcoind
+ * knows about the output; the library decides.  ctx is a regtest_t* (same
+ * RPC backend used for force-close and sweep). */
 static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
-                                uint64_t expected_sats, void *ctx) {
+                                client_funding_output_t *out, void *ctx) {
     regtest_t *rt = (regtest_t *)ctx;
-    if (!rt) return 0;
+    if (!rt || !out) return 0;
 
     /* Convert internal-order txid to display hex */
     unsigned char disp[32];
@@ -173,37 +150,31 @@ static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
         fprintf(stderr, "verify_funding: TX %s not found on-chain\n", txid_hex);
         return 0;
     }
-    if (confs < 1) {
-        fprintf(stderr, "verify_funding: TX %s in mempool but not confirmed\n",
-                txid_hex);
-        /* Allow mempool TX — LSP may have just broadcast */
-    }
-
-    /* Query the actual output amount.
-     * regtest_get_tx_output tries getrawtransaction, then gettransaction
-     * (wallet-aware, no -txindex needed), then block-scan. */
-    uint64_t actual_sats = 0;
-    unsigned char dummy_spk[256];
-    size_t dummy_spk_len = 0;
-    if (!regtest_get_tx_output(rt, txid_hex, vout, &actual_sats,
-                                dummy_spk, &dummy_spk_len)) {
-        fprintf(stderr, "verify_funding: cannot query output %s:%u\n",
-                txid_hex, vout);
+    /* regtest_get_tx_output tries getrawtransaction, then gettransaction
+       (wallet-aware, no -txindex needed), then block-scan. */
+    unsigned char spk[256];
+    size_t spk_len = 0;
+    uint64_t sats = 0;
+    if (!regtest_get_tx_output(rt, txid_hex, vout, &sats, spk, &spk_len) ||
+        spk_len > sizeof(out->spk)) {
+        fprintf(stderr, "verify_funding: cannot query output %s:%u\n", txid_hex, vout);
         return 0;
     }
-    if (actual_sats < expected_sats) {
-        fprintf(stderr, "verify_funding: output %s:%u has %llu sats, "
-                "LSP claimed %llu sats\n",
-                txid_hex, vout,
-                (unsigned long long)actual_sats,
-                (unsigned long long)expected_sats);
-        return 0;
-    }
-    printf("Client: funding TX verified on-chain: %s:%u = %llu sats (>= %llu)\n",
-           txid_hex, vout,
-           (unsigned long long)actual_sats,
-           (unsigned long long)expected_sats);
+    out->amount_sats = sats;
+    memcpy(out->spk, spk, spk_len);
+    out->spk_len = spk_len;
+    out->confirmations = confs;
+    out->unspent = regtest_outpoint_unspent(rt, txid_hex, vout);
     return 1;
+}
+
+/* Regtest scaffolds may run without --rpcuser; there is then nothing to look
+   the funding output up with, and the client says so and proceeds without
+   the check.  Never reached on any other network. */
+static void allow_unverified_funding_regtest(void) {
+    fprintf(stderr, "Client: REGTEST without --rpcuser — funding outputs are NOT "
+            "verified; THIS IS UNSAFE ON ANY PRODUCTION NETWORK.\n");
+    client_set_allow_unverified_funding(1);
 }
 
 /*
@@ -876,8 +847,8 @@ static void rotation_pending_notice(persist_t *db) {
             "    transaction, and no commitment for a channel in it.\n"
             "  --force-close picks the exit that still exists: while the first funding\n"
             "  output is unspent it publishes that factory's tree and the commitment;\n"
-            "  once it is spent it publishes nothing of the new tree and offers the new\n"
-            "  factory's distribution transaction, valid from block %u.  Until then the\n"
+            "  once something else has spent it, it publishes nothing of the new tree and\n"
+            "  offers the new factory's distribution transaction (nLockTime %u).  Until then the\n"
             "  funds in the new factory move only with the LSP's cooperation.\n"
             "  The client does not connect while this record exists.\n",
             old_txid, old_vout, new_txid, new_vout, new_cltv);
@@ -2177,31 +2148,36 @@ handle_message:
                         client_persist_commitment_sig(ch, cbd) &&
                         persist_delete_factory_record(cbd->db,
                             CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+                        int rot_ok = 1;
                         /* Save the verified signed distribution TX */
-                        if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0) {
-                            persist_save_distribution_tx(cbd->db, 0,
+                        if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0)
+                            rot_ok = persist_save_distribution_tx(cbd->db, 0,
                                 factory->dist_unsigned_tx.data,
                                 factory->dist_unsigned_tx.len);
-                        }
                         /* Save initial PCS for the new rotated channel so they
                            survive crash before first payment on the new factory */
-                        for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
+                        for (uint64_t cn = 0; rot_ok && cn < ch->n_local_pcs; cn++) {
                             unsigned char pcs[32];
                             if (channel_get_local_pcs(ch, cn, pcs)) {
-                                persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                                rot_ok = persist_save_local_pcs(cbd->db, 0, cn, pcs);
                                 memset(pcs, 0, 32);
                             }
                         }
                         /* Save remote PCPs (LSP's per-commitment points) */
-                        for (uint64_t cn = 0; cn <= ch->commitment_number + 1; cn++) {
+                        for (uint64_t cn = 0; rot_ok && cn <= ch->commitment_number + 1; cn++) {
                             secp256k1_pubkey pcp;
-                            if (channel_get_remote_pcp(ch, cn, &pcp)) {
-                                unsigned char ser[33];
-                                size_t slen = 33;
-                                if (secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
-                                        &pcp, SECP256K1_EC_COMPRESSED))
-                                    persist_save_remote_pcp(cbd->db, 0, cn, ser);
-                            }
+                            unsigned char ser[33];
+                            size_t slen = 33;
+                            rot_ok = channel_get_remote_pcp(ch, cn, &pcp) &&
+                                     secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
+                                         &pcp, SECP256K1_EC_COMPRESSED) &&
+                                     persist_save_remote_pcp(cbd->db, 0, cn, ser);
+                        }
+                        if (!rot_ok) {
+                            persist_rollback(cbd->db);
+                            rotation_stopped(cbd, my_index, factory,
+                                             "the new channel and its commitment could not be saved");
+                            return 0;
                         }
                         if (!persist_commit(cbd->db)) {
                             rotation_stopped(cbd, my_index, factory,
@@ -2545,48 +2521,6 @@ static void usage(const char *prog) {
    #313 self-custody recovery path from the client's persisted DB. Called after the
    daemon loop exits on a detected LSP revocation forgery. Returns 1 if a recovery
    run was executed, 0 if it could not (no DB / no chain backend). */
-/* 1 if the database holds a signed commitment for the client's channel. */
-static int client_db_has_commitment(persist_t *db) {
-    uint64_t cn = 0;
-    size_t len = 0;
-    return persist_load_commitment_sig(db, 0, &cn, NULL, NULL, &len, 0) && len > 0;
-}
-
-/* Decide what a force-close may publish.  Returns 1 if the tree of factory 0
-   and the stored commitment are to be broadcast.  *dist_factory_out is the
-   factory whose distribution transaction is offered afterwards.
-   Publishing a tree spends that factory's funding output, after which its
-   distribution transaction can never confirm; so a tree is published only
-   when a commitment for a channel in it is on disk.  With a rotation
-   pending, the factory being left is used while its funding output is still
-   unspent; once that is spent only the new factory's distribution
-   transaction is left and nothing of the new tree is published. */
-static int client_force_close_plan(persist_t *db, chain_backend_t *chain,
-                                    uint32_t *dist_factory_out, FILE *out) {
-    *dist_factory_out = 0;
-    if (!persist_has_factory(db, CLIENT_ROTATION_PENDING_FACTORY_ID)) {
-        if (client_db_has_commitment(db)) return 1;
-        fprintf(out, "Force-close: no signed commitment in DB; NOT publishing the "
-                     "factory tree\n");
-        return 0;
-    }
-    char txid[65] = {0};
-    uint32_t vout = 0;
-    int unspent = persist_load_factory_outpoint(db, 0, txid, &vout, NULL) &&
-                  chain->is_outpoint_unspent &&
-                  chain->is_outpoint_unspent(chain, txid, vout) == 1;
-    if (unspent && client_db_has_commitment(db)) {
-        fprintf(out, "Force-close: rotation pending; the factory being left (%s:%u) "
-                     "is unspent, exiting through it\n", txid, vout);
-        return 1;
-    }
-    *dist_factory_out = CLIENT_ROTATION_PENDING_FACTORY_ID;
-    fprintf(out, "Force-close: rotation pending and the factory being left is spent; "
-                 "NOT publishing the factory tree of the new factory (no commitment "
-                 "for it)\n");
-    return 0;
-}
-
 static int client_force_close_from_db(const char *db_path, const char *network,
                                       const char *cli_path, const char *rpcuser,
                                       const char *rpcpassword, const char *datadir,
@@ -2621,7 +2555,7 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         return 0;
     }
     uint32_t plan_dist = 0;
-    if (!client_force_close_plan(&db, &chain, &plan_dist, stderr)) {
+    if (client_force_close_plan(&db, &chain, &plan_dist, stderr) != 1) {
         persist_close(&db);
         return 0;
     } else {
@@ -3106,7 +3040,13 @@ int main(int argc, char *argv[]) {
            in that case the tree is left alone and only the distribution
            transaction is tried. */
         uint32_t dist_factory = 0;
-        int publish = client_force_close_plan(&db, &chain, &dist_factory, stdout);
+        int plan = client_force_close_plan(&db, &chain, &dist_factory, stdout);
+        int publish = (plan == 1);
+        if (plan < 0) {
+            persist_close(&db);
+            printf("=== CLIENT FORCE-CLOSE: nothing published ===\n");
+            return 1;
+        }
         if (publish) {
             char fr_status[256] = {0};
             int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
@@ -4017,15 +3957,10 @@ int main(int argc, char *argv[]) {
                 vctx = &verify_rt;
             }
         }
-        /* #197 follow-up: regtest scaffolds may legitimately run without
-           --rpcuser; install a no-op verifier so the hard refusal in
-           src/client.c doesn't break in-process test harnesses. The no-op
-           ONLY fires on network=regtest. Production networks still hit
-           the hard refusal in src/client.c if vfn stays NULL. */
-        if (!vfn && strcmp(network, "regtest") == 0) {
-            vfn = verify_funding_noop_regtest;
-            vctx = NULL;
-        }
+        /* Without a chain source the library refuses every factory, except
+           on regtest without --rpcuser. */
+        if (!vfn && strcmp(network, "regtest") == 0)
+            allow_unverified_funding_regtest();
 
         /* A rotation after a reconnect checks the new funding output with
            the same verifier as the first factory. */
@@ -4085,11 +4020,8 @@ int main(int argc, char *argv[]) {
                 sa_vctx = &sa_verify_rt;
             }
         }
-        /* #197 follow-up: regtest scaffold opt-out (no-op verifier). */
-        if (!sa_vfn && strcmp(network, "regtest") == 0) {
-            sa_vfn = verify_funding_noop_regtest;
-            sa_vctx = NULL;
-        }
+        if (!sa_vfn && strcmp(network, "regtest") == 0)
+            allow_unverified_funding_regtest();
 
         if (n_actions > 0) {
             /* Scripted --send/--recv now run through the SAME proven daemon

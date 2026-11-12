@@ -6941,6 +6941,26 @@ int persist_delete_factory_record(persist_t *p, uint32_t factory_id)
     return 1;
 }
 
+int persist_load_tree_node_txid(persist_t *p, uint32_t factory_id,
+                                 uint32_t node_index, char *txid_hex65)
+{
+    if (!p || !p->db || !txid_hex65) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid FROM tree_nodes WHERE factory_id = ? AND node_index = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_index);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        if (t && strlen(t) == 64) { memcpy(txid_hex65, t, 65); found = 1; }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 int persist_load_factory_outpoint(persist_t *p, uint32_t factory_id,
                                    char *txid_hex65, uint32_t *vout_out,
                                    uint32_t *cltv_timeout_out)

@@ -8529,3 +8529,352 @@ int test_factory_client_to_leaf_roundtrip(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ==========================================================================
+ * Client handlers: funding check, FACTORY_READY, distribution exit,
+ * force-close plan
+ * ========================================================================== */
+
+#include "superscalar/client.h"
+#include "superscalar/persist.h"
+#include "superscalar/wire.h"
+#include "superscalar/chain_backend.h"
+#include "cJSON.h"
+
+/* A 5-party factory whose funding script is the one its own root spends.
+   with_keys: built from keypairs (can sign, the LSP side of a test) or from
+   public keys only (a client's copy). */
+static factory_t *handler_factory(secp256k1_context *ctx, const secp256k1_keypair *kps,
+                                   int with_keys) {
+    unsigned char txid[32], spk[34];
+    memset(txid, 0xAA, 32);
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return NULL;
+    memset(spk, 0, sizeof(spk));
+    for (int pass = 0; pass < 2; pass++) {
+        factory_t *f = calloc(1, sizeof(factory_t));
+        if (!f) return NULL;
+        if (with_keys) factory_init(f, ctx, kps, 5, 2, 4);
+        else factory_init_from_pubkeys(f, ctx, pks, 5, 2, 4);
+        if (pass == 0) { spk[0] = 0x51; spk[1] = 0x20; }
+        factory_set_funding(f, txid, 0, 100000, spk, 34);
+        if (!factory_build_tree(f)) { factory_free(f); free(f); return NULL; }
+        if (pass == 1) return f;
+        memcpy(spk, f->nodes[0].spending_spk, 34);   /* learn the real script */
+        factory_free(f); free(f);
+    }
+    return NULL;
+}
+
+static struct {
+    int found, confirmations, unspent, calls;
+    uint64_t amount;
+    unsigned char spk[34];
+} g_fake_chain;
+
+static int fake_funding_lookup(const unsigned char *txid32, uint32_t vout,
+                               client_funding_output_t *out, void *ctx) {
+    (void)txid32; (void)vout; (void)ctx;
+    g_fake_chain.calls++;
+    if (!g_fake_chain.found) return 0;
+    out->amount_sats = g_fake_chain.amount;
+    memcpy(out->spk, g_fake_chain.spk, 34);
+    out->spk_len = 34;
+    out->confirmations = g_fake_chain.confirmations;
+    out->unspent = g_fake_chain.unspent;
+    return 1;
+}
+
+static void fake_chain_good(const factory_t *f) {
+    memset(&g_fake_chain, 0, sizeof(g_fake_chain));
+    g_fake_chain.found = 1;
+    g_fake_chain.confirmations = 1;
+    g_fake_chain.unspent = 1;
+    g_fake_chain.amount = f->funding_amount_sats;
+    memcpy(g_fake_chain.spk, f->nodes[0].spending_spk, 34);
+}
+
+/* The funding check binds the factory to one on-chain output: script derived
+   by the client, exact amount, unspent, confirmed.  No chain source refuses. */
+int test_client_funding_check(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+    secp256k1_pubkey me, other;
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &me, &kps[2]), "my key");
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &other, &kps[3]), "other key");
+    factory_t *f = handler_factory(ctx, kps, 0);
+    TEST_ASSERT(f, "factory");
+
+    client_set_allow_unverified_funding(0);
+    client_set_funding_verifier(fake_funding_lookup, NULL);
+
+    fake_chain_good(f);
+    TEST_ASSERT(client_check_factory_funding(f, 2, &me), "matching output accepted");
+    TEST_ASSERT_EQ(g_fake_chain.calls, 1, "chain consulted");
+
+    /* an output the LSP controls alone */
+    fake_chain_good(f);
+    g_fake_chain.spk[10] ^= 0x01;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "other script on chain refused");
+
+    /* the proposal names another script and the chain agrees with the proposal */
+    fake_chain_good(f);
+    f->funding_spk[10] ^= 0x01;
+    memcpy(g_fake_chain.spk, f->funding_spk, 34);
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me),
+                "proposed script that is not this participant set refused");
+    TEST_ASSERT_EQ(g_fake_chain.calls, 0, "refused before the chain is consulted");
+    f->funding_spk[10] ^= 0x01;
+
+    fake_chain_good(f);
+    g_fake_chain.amount += 1;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "one sat more refused");
+    fake_chain_good(f);
+    g_fake_chain.amount -= 1;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "one sat less refused");
+
+    fake_chain_good(f);
+    g_fake_chain.unspent = 0;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "spent output refused");
+    fake_chain_good(f);
+    g_fake_chain.unspent = -1;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "unknown spent status refused");
+    fake_chain_good(f);
+    g_fake_chain.confirmations = 0;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "unconfirmed output refused");
+    fake_chain_good(f);
+    g_fake_chain.found = 0;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "unknown output refused");
+
+    fake_chain_good(f);
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &other), "someone else's key at my index refused");
+    TEST_ASSERT(!client_check_factory_funding(f, 0, &me), "index 0 refused");
+
+    /* no chain source */
+    client_set_funding_verifier(NULL, NULL);
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "no chain source refused");
+    client_set_allow_unverified_funding(1);
+    TEST_ASSERT(client_check_factory_funding(f, 2, &me), "harness opt-out accepted");
+
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+static cJSON *ready_node_item(cJSON *json, int node_idx, int *pos_out) {
+    cJSON *arr = cJSON_GetObjectItem(json, "signed_txs");
+    int n = cJSON_GetArraySize(arr);
+    for (int i = 0; i < n; i++) {
+        cJSON *it = cJSON_GetArrayItem(arr, i);
+        cJSON *idx = cJSON_GetObjectItem(it, "node_idx");
+        if (idx && (int)idx->valuedouble == node_idx) { if (pos_out) *pos_out = i; return it; }
+    }
+    return NULL;
+}
+
+/* 1 if a FACTORY_READY built from lsp_f, after mutate() changed it, is refused
+   by a fresh client copy of the factory. */
+static int ready_refused(secp256k1_context *ctx, const secp256k1_keypair *kps,
+                         const factory_t *lsp_f, int mutation) {
+    factory_t *cf = handler_factory(ctx, kps, 0);
+    if (!cf) return -2;
+    cJSON *json = wire_build_factory_ready(lsp_f);
+    if (!json) return -2;
+    cJSON *arr = cJSON_GetObjectItem(json, "signed_txs");
+    int pos = -1;
+    cJSON *root = ready_node_item(json, 0, &pos);
+    if (!arr || !root) return -2;
+    char *hex = NULL;
+    switch (mutation) {
+    case 1:   /* a node on the client's path is missing */
+        cJSON_DeleteItemFromArray(arr, pos);
+        break;
+    case 2:   /* transaction body differs from the client's own */
+    case 3:   /* signature does not verify */
+        hex = strdup(cJSON_GetObjectItem(root, "tx_hex")->valuestring);
+        {
+            size_t at = (mutation == 2) ? 20 : strlen(hex) - 20;
+            hex[at] = (hex[at] == '0') ? '1' : '0';
+        }
+        cJSON_ReplaceItemInObject(root, "tx_hex", cJSON_CreateString(hex));
+        free(hex);
+        break;
+    case 4:   /* no nodes at all */
+        while (cJSON_GetArraySize(arr) > 0) cJSON_DeleteItemFromArray(arr, 0);
+        break;
+    case 5:   /* a distribution transaction the client cannot check */
+        cJSON_AddStringToObject(json, "distribution_tx_hex", "0200000000");
+        break;
+    default: break;
+    }
+    int r = client_apply_factory_ready(cf, json, 2);
+    cJSON_Delete(json);
+    factory_free(cf); free(cf);
+    return r < 0;
+}
+
+/* FACTORY_READY: accepted only when every node on the client's path is there,
+   is the client's own transaction and carries a valid signature; what is kept
+   is the client's serialization. */
+int test_client_factory_ready_handler(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+    factory_t *lsp_f = handler_factory(ctx, kps, 1);
+    TEST_ASSERT(lsp_f, "LSP factory");
+    TEST_ASSERT(factory_sign_all(lsp_f), "sign all");
+
+    factory_t *cf = handler_factory(ctx, kps, 0);
+    TEST_ASSERT(cf, "client factory");
+    cJSON *json = wire_build_factory_ready(lsp_f);
+    TEST_ASSERT(json, "FACTORY_READY");
+    int n = client_apply_factory_ready(cf, json, 2);
+    cJSON_Delete(json);
+    TEST_ASSERT(n > 0, "honest FACTORY_READY accepted");
+    for (size_t i = 0; i < cf->n_nodes; i++) {
+        if (factory_find_signer_slot(cf, i, 2) < 0) continue;
+        TEST_ASSERT(cf->nodes[i].is_signed, "path node signed");
+        tx_buf_t own;
+        tx_buf_init(&own, 512);
+        TEST_ASSERT(finalize_signed_tx(&own, cf->nodes[i].unsigned_tx.data,
+                        cf->nodes[i].unsigned_tx.len,
+                        cf->nodes[i].signed_tx.data + cf->nodes[i].signed_tx.len - 68),
+                    "rebuild");
+        TEST_ASSERT(own.len == cf->nodes[i].signed_tx.len &&
+                    memcmp(own.data, cf->nodes[i].signed_tx.data, own.len) == 0,
+                    "stored bytes are the client's own serialization");
+        tx_buf_free(&own);
+    }
+    factory_free(cf); free(cf);
+
+    TEST_ASSERT_EQ(ready_refused(ctx, kps, lsp_f, 0), 0, "unmodified message is not refused");
+    TEST_ASSERT_EQ(ready_refused(ctx, kps, lsp_f, 1), 1, "missing path node refused");
+    TEST_ASSERT_EQ(ready_refused(ctx, kps, lsp_f, 2), 1, "foreign transaction body refused");
+    TEST_ASSERT_EQ(ready_refused(ctx, kps, lsp_f, 3), 1, "invalid signature refused");
+    TEST_ASSERT_EQ(ready_refused(ctx, kps, lsp_f, 4), 1, "message without nodes refused");
+    TEST_ASSERT_EQ(ready_refused(ctx, kps, lsp_f, 5), 1, "uncheckable distribution tx refused");
+
+    factory_free(lsp_f); free(lsp_f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Distribution transaction: locktime must be the factory's, and a rotation
+   needs a verified one paying the client at least its balance. */
+int test_client_distribution_exit_checks(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+    factory_t *f = handler_factory(ctx, kps, 0);
+    TEST_ASSERT(f, "factory");
+    f->cltv_timeout = 500;
+    TEST_ASSERT_EQ(factory_distribution_locktime(f), 500, "locktime is the CLTV timeout");
+    TEST_ASSERT(client_dist_locktime_acceptable(f, 500), "the factory's locktime accepted");
+    TEST_ASSERT(!client_dist_locktime_acceptable(f, 501), "a later locktime refused");
+    TEST_ASSERT(!client_dist_locktime_acceptable(f, 499), "an earlier locktime refused");
+    TEST_ASSERT(!client_dist_locktime_acceptable(f, 0), "no locktime refused");
+
+    secp256k1_pubkey me;
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &me, &kps[2]), "my key");
+    tx_output_t out;
+    memset(&out, 0, sizeof(out));
+    {
+        secp256k1_xonly_pubkey x, tw;
+        secp256k1_pubkey full;
+        unsigned char ser[32], twk[32];
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &x, NULL, &me), "xonly");
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &x);
+        sha256_tagged("TapTweak", ser, 32, twk);
+        TEST_ASSERT(secp256k1_xonly_pubkey_tweak_add(ctx, &full, &x, twk), "tweak");
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &tw, NULL, &full), "xonly 2");
+        build_p2tr_script_pubkey(out.script_pubkey, &tw);
+        out.script_pubkey_len = 34;
+        out.amount_sats = 29000;
+    }
+    tx_buf_free(&f->dist_unsigned_tx);
+    tx_buf_init(&f->dist_unsigned_tx, 256);
+    TEST_ASSERT(build_unsigned_tx_with_locktime(&f->dist_unsigned_tx, NULL, f->funding_txid,
+                                                0, 0xFFFFFFFEu, 500, &out, 1), "dist tx");
+    f->dist_tx_ready = 2;
+    TEST_ASSERT(client_rotation_exit_acceptable(ctx, f, &me, 29000), "pays the balance: accepted");
+    TEST_ASSERT(!client_rotation_exit_acceptable(ctx, f, &me, 29001), "pays less than the balance: refused");
+    f->dist_tx_ready = 1;
+    TEST_ASSERT(!client_rotation_exit_acceptable(ctx, f, &me, 1000), "unverified transaction: refused");
+    f->dist_tx_ready = 0;
+    TEST_ASSERT(!client_rotation_exit_acceptable(ctx, f, &me, 0), "no transaction: refused");
+
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+static struct { int unspent, root_confs; } g_fake_fc;
+static int fake_fc_unspent(chain_backend_t *self, const char *txid, uint32_t vout) {
+    (void)self; (void)txid; (void)vout; return g_fake_fc.unspent;
+}
+static int fake_fc_confs(chain_backend_t *self, const char *txid) {
+    (void)self; (void)txid; return g_fake_fc.root_confs;
+}
+
+/* --force-close: what may be published in each state of the database and
+   the chain. */
+int test_client_force_close_plan(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+    factory_t *f = handler_factory(ctx, kps, 0);
+    TEST_ASSERT(f, "factory");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "db");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "factory 0");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "tree 0");
+    chain_backend_t chain;
+    memset(&chain, 0, sizeof(chain));
+    chain.is_outpoint_unspent = fake_fc_unspent;
+    chain.get_confirmations = fake_fc_confs;
+    uint32_t dist = 99;
+    FILE *sink = fopen("/dev/null", "w");
+    TEST_ASSERT(sink, "sink");
+
+    g_fake_fc.unspent = 1; g_fake_fc.root_confs = -1;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 0,
+                   "no commitment: no tree");
+    TEST_ASSERT_EQ(dist, 0, "own factory's distribution tx offered");
+
+    unsigned char sig[64], tx[80];
+    memset(sig, 1, 64); memset(tx, 2, 80);
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 0, sig, tx, 80), "commitment");
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
+                   "commitment, no rotation pending: publish");
+
+    TEST_ASSERT(client_rotation_save_pending(&db, f, ctx), "pending record");
+    g_fake_fc.unspent = 1; g_fake_fc.root_confs = -1;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
+                   "pending, old funding unspent: exit through the old factory");
+    g_fake_fc.unspent = 0; g_fake_fc.root_confs = 0;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
+                   "pending, old funding spent by our own root (mempool): continue");
+    g_fake_fc.unspent = 0; g_fake_fc.root_confs = 3;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
+                   "pending, our own root confirmed: continue");
+    g_fake_fc.unspent = 0; g_fake_fc.root_confs = -1;
+    dist = 99;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 0,
+                   "pending, old funding spent by something else: no tree");
+    TEST_ASSERT_EQ(dist, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                   "the new factory's distribution tx offered");
+    g_fake_fc.unspent = -1; g_fake_fc.root_confs = -1;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), -1,
+                   "chain error is not 'spent'");
+    chain.is_outpoint_unspent = NULL;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), -1,
+                   "missing callback is not 'spent'");
+
+    fclose(sink);
+    persist_close(&db);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
