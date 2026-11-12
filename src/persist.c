@@ -1418,6 +1418,24 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v40: the tree shape.  leaf_arity alone does not determine the tree: the
+       per-level arity list, the static-near-root depth, the PS sub-factory
+       arity and the placement mode do too, and a reload that rebuilt the tree
+       without them produced transactions nobody signed.  level_arity is the
+       comma list ("8,8,3"), NULL for a uniform tree.  A row written before v40
+       gets the defaults (uniform, no static levels, k=1, timezone-cluster
+       placement = 3); persist_load_factory refuses it if its rebuilt tree does
+       not match the signed tree_nodes rows.  Version-gated (ALTER is not
+       idempotent). */
+    if (db_version < 40) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN level_arity TEXT;"
+            "ALTER TABLE factories ADD COLUMN static_threshold_depth INTEGER NOT NULL DEFAULT 0;"
+            "ALTER TABLE factories ADD COLUMN ps_subfactory_arity INTEGER NOT NULL DEFAULT 1;"
+            "ALTER TABLE factories ADD COLUMN placement_mode INTEGER NOT NULL DEFAULT 3;",
+            NULL, NULL, NULL);
+    }
+
     /* Client record of a cooperative close it has co-signed: one row per
        factory, keyed by the factory's funding outpoint.  Written before the
        client releases its partial signature, so a client that restarts
@@ -1611,8 +1629,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         "INSERT OR REPLACE INTO factories "
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
         " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
-        " use_hashlock_poison) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " use_hashlock_poison, level_arity, static_threshold_depth, "
+        " ps_subfactory_arity, placement_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1631,6 +1650,21 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
     sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
     sqlite3_bind_int(stmt, 11, f->use_hashlock_poison ? 1 : 0);  /* #59 restart-resume */
+    /* v40: the rest of the tree shape (see the migration). */
+    char la_buf[FACTORY_MAX_LEVELS * 4 + 1];
+    la_buf[0] = '\0';
+    for (size_t i = 0; i < f->n_level_arity && i < FACTORY_MAX_LEVELS; i++) {
+        size_t off = strlen(la_buf);
+        snprintf(la_buf + off, sizeof(la_buf) - off, "%s%u",
+                 i ? "," : "", (unsigned)f->level_arity[i]);
+    }
+    if (f->n_level_arity > 0)
+        sqlite3_bind_text(stmt, 12, la_buf, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 12);
+    sqlite3_bind_int(stmt, 13, (int)f->static_threshold_depth);
+    sqlite3_bind_int(stmt, 14, (int)(f->ps_subfactory_arity ? f->ps_subfactory_arity : 1));
+    sqlite3_bind_int(stmt, 15, (int)f->placement_mode);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2361,6 +2395,166 @@ size_t persist_list_active_factory_ids(persist_t *p,
     return count;
 }
 
+/* Parse a stored level_arity list ("8,8,3"): 1..FACTORY_MAX_LEVELS entries,
+   each 1..FACTORY_MAX_OUTPUTS.  1 on success. */
+static int parse_level_arity(const char *s, uint8_t out[FACTORY_MAX_LEVELS],
+                             size_t *n_out) {
+    size_t n = 0;
+    *n_out = 0;
+    while (*s) {
+        if (n >= FACTORY_MAX_LEVELS || *s < '0' || *s > '9') return 0;
+        unsigned v = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (unsigned)(*s - '0');
+            if (v > FACTORY_MAX_OUTPUTS) return 0;
+            s++;
+        }
+        if (v < 1) return 0;
+        out[n++] = (uint8_t)v;
+        if (*s == ',') { s++; if (!*s) return 0; }
+        else if (*s) return 0;
+    }
+    if (n == 0) return 0;
+    *n_out = n;
+    return 1;
+}
+
+/* A node's output amounts as tree_nodes stores them (comma-separated sats),
+   malloc'd; NULL on allocation failure. */
+static char *format_output_amounts(const factory_node_t *node) {
+    /* sized for every output (20 digits + comma each) */
+    size_t cap = node->n_outputs * 21 + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+    buf[0] = '\0';
+    for (size_t o = 0; o < node->n_outputs; o++)
+        len += (size_t)snprintf(buf + len, cap - len, "%s%llu", o > 0 ? "," : "",
+                                (unsigned long long)node->outputs[o].amount_sats);
+    return buf;
+}
+
+/* A node whose outputs carry an L-stock script: a leaf state or a PS
+   sub-factory node. */
+static int node_has_l_stock(const factory_t *f, size_t idx) {
+    if (f->nodes[idx].type == NODE_PS_SUBFACTORY) return 1;
+    for (int i = 0; i < f->n_leaf_nodes; i++)
+        if (f->leaf_node_indices[i] == idx) return 1;
+    return 0;
+}
+
+/* Check that the tree persist_load_factory just rebuilt is the signed tree
+   the DB holds in tree_nodes: the same number of nodes, and for each node the
+   same type, parent and parent output, and the same txid.
+
+   Two kinds of node are exempt from the txid comparison (never from the
+   others), together with everything below them, because their stored row may
+   legitimately differ from a rebuild at the creation state:
+     - a node whose stored nSequence or output amounts differ from the rebuilt
+       ones: it was advanced or re-allocated after creation and its row holds
+       that later state;
+     - with hashlock L-stock poison, a node carrying an L-stock output: its
+       script commits to hashes the DB does not hold.
+   A factory with no tree_nodes rows has nothing signed to compare and passes.
+   Returns 1 on a match, 0 (logged) otherwise. */
+static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
+                                      const factory_t *f, int hashlock) {
+    const char *sql =
+        "SELECT node_index, type, parent_index, parent_vout, nsequence, "
+        "output_amounts, txid FROM tree_nodes WHERE factory_id = ? "
+        "ORDER BY node_index;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "persist_load_factory: cannot read tree_nodes: %s\n",
+                sqlite3_errmsg(p->db));
+        return 0;
+    }
+    sqlite3_bind_int(st, 1, (int)factory_id);
+
+    size_t n = f->n_nodes;
+    unsigned char *changed = calloc(n ? n : 1, 1);   /* row differs from creation */
+    unsigned char *txid_ok = calloc(n ? n : 1, 1);
+    if (!changed || !txid_ok) {
+        free(changed); free(txid_ok);
+        sqlite3_finalize(st);
+        return 0;
+    }
+    size_t rows = 0;
+    int ok = 1;
+    while (ok && sqlite3_step(st) == SQLITE_ROW) {
+        int idx = sqlite3_column_int(st, 0);
+        const char *type = (const char *)sqlite3_column_text(st, 1);
+        int parent = sqlite3_column_int(st, 2);
+        int pvout = sqlite3_column_int(st, 3);
+        uint32_t nseq = (uint32_t)sqlite3_column_int64(st, 4);
+        const char *amounts = (const char *)sqlite3_column_text(st, 5);
+        const char *txid = (const char *)sqlite3_column_text(st, 6);
+        rows++;
+        if (idx < 0 || (size_t)idx >= n) {
+            fprintf(stderr, "persist_load_factory: signed tree node %d does not "
+                    "exist in the rebuilt tree (%zu nodes)\n", idx, n);
+            ok = 0;
+            break;
+        }
+        const factory_node_t *node = &f->nodes[idx];
+        const char *want_type = node->type == NODE_KICKOFF ? "kickoff" : "state";
+        if (!type || strcmp(type, want_type) != 0 || parent != node->parent_index ||
+            pvout != (int)node->parent_vout) {
+            fprintf(stderr, "persist_load_factory: signed tree node %d (%s, parent "
+                    "%d:%d) differs from the rebuilt node (%s, parent %d:%u)\n",
+                    idx, type ? type : "?", parent, pvout, want_type,
+                    node->parent_index, (unsigned)node->parent_vout);
+            ok = 0;
+            break;
+        }
+        char *amt_buf = format_output_amounts(node);
+        if (!amt_buf) { ok = 0; break; }
+        if (nseq != node->nsequence || !amounts || strcmp(amounts, amt_buf) != 0)
+            changed[idx] = 1;
+        free(amt_buf);
+        unsigned char disp[32];
+        memcpy(disp, node->txid, 32);
+        reverse_bytes(disp, 32);
+        char hex[65];
+        hex_encode(disp, 32, hex);
+        txid_ok[idx] = (txid && strcmp(txid, hex) == 0);
+    }
+    sqlite3_finalize(st);
+    if (ok && rows > 0 && rows != n) {
+        fprintf(stderr, "persist_load_factory: the DB holds %zu signed tree nodes, "
+                "the rebuilt tree has %zu\n", rows, n);
+        ok = 0;
+    }
+    size_t exempt = 0;
+    for (size_t i = 0; ok && rows > 0 && i < n; i++) {
+        int skip = 0;
+        for (int j = (int)i; j >= 0 && (size_t)j < n; j = f->nodes[j].parent_index) {
+            if (changed[j] || (hashlock && node_has_l_stock(f, (size_t)j))) {
+                skip = 1;
+                break;
+            }
+        }
+        if (skip) { exempt++; continue; }
+        if (!txid_ok[i]) {
+            fprintf(stderr, "persist_load_factory: rebuilt tree node %zu has a "
+                    "different txid from the signed one in the DB\n", i);
+            ok = 0;
+        }
+    }
+    free(changed);
+    free(txid_ok);
+    if (!ok) {
+        fprintf(stderr, "persist_load_factory: factory %u: the tree rebuilt from "
+                "the DB is not the signed tree; refusing to load it\n", factory_id);
+        return 0;
+    }
+    if (exempt > 0)
+        printf("persist: factory %u tree verified against the signed tree "
+               "(%zu node(s) changed since creation, checked by structure only)\n",
+               factory_id, exempt);
+    return 1;
+}
+
 int persist_load_factory(persist_t *p, uint32_t factory_id,
                           factory_t *f, secp256k1_context *ctx) {
     if (!p || !p->db || !f || !ctx) return 0;
@@ -2368,7 +2562,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
         "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
-        "use_hashlock_poison "
+        "use_hashlock_poison, level_arity, static_threshold_depth, "
+        "ps_subfactory_arity, placement_mode "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2396,6 +2591,26 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
                                                      FACTORY_ARITY_2;
     int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
+    /* v40 tree shape */
+    uint8_t level_arities[FACTORY_MAX_LEVELS];
+    size_t n_level_arity = 0;
+    const char *la_text = (const char *)sqlite3_column_text(stmt, 10);
+    if (la_text && !parse_level_arity(la_text, level_arities, &n_level_arity)) {
+        fprintf(stderr, "persist_load_factory: invalid level_arity '%s'\n", la_text);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    int static_threshold_raw = sqlite3_column_int(stmt, 11);
+    int ps_subfactory_raw = sqlite3_column_int(stmt, 12);
+    int placement_raw = sqlite3_column_int(stmt, 13);
+    if (static_threshold_raw < 0 || static_threshold_raw >= FACTORY_MAX_LEVELS ||
+        ps_subfactory_raw < 0 || ps_subfactory_raw > FACTORY_MAX_OUTPUTS - 1) {
+        fprintf(stderr, "persist_load_factory: invalid tree shape "
+                "(static_threshold_depth %d, ps_subfactory_arity %d)\n",
+                static_threshold_raw, ps_subfactory_raw);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
 
     /* Data validation (Phase 2: item 2.6) */
     if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
@@ -2498,15 +2713,36 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (restore parity) */
     f->fee_per_tx = fee_per_tx;
-    if (leaf_arity == FACTORY_ARITY_1)
+    /* The shape, applied in the order FACTORY_PROPOSE applies it on the
+       client (client.c): arity, then static levels, then sub-factory arity. */
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(f, level_arities, n_level_arity)) {
+            factory_free(f);
+            return 0;
+        }
+    } else if (leaf_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);
     else if (leaf_arity == FACTORY_ARITY_PS)
         factory_set_arity(f, FACTORY_ARITY_PS);
     /* FACTORY_ARITY_2 is the default from factory_init_from_pubkeys */
+    if (static_threshold_raw > 0)
+        factory_set_static_near_root(f, (uint32_t)static_threshold_raw);
+    if (ps_subfactory_raw > 1)
+        factory_set_ps_subfactory_arity(f, (uint32_t)ps_subfactory_raw);
+    if (!factory_set_placement_mode(f, (placement_mode_t)placement_raw)) {
+        factory_free(f);
+        return 0;
+    }
 
     if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                              fund_spk, 34) ||
         !factory_build_tree(f)) {
+        factory_free(f);
+        return 0;
+    }
+
+    /* The rebuilt tree must be the tree whose transactions were signed. */
+    if (!persist_check_rebuilt_tree(p, factory_id, f, loaded_use_hashlock_poison)) {
         factory_free(f);
         return 0;
     }
@@ -4107,21 +4343,11 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
         sqlite3_bind_int(stmt, 9, (int)node->n_outputs);
 
         /* output_amounts as comma-separated sats */
-        /* sized for every output (20 digits + comma each) */
-        size_t amounts_cap = node->n_outputs * 21 + 1;
-        char *amounts_buf = malloc(amounts_cap);
+        char *amounts_buf = format_output_amounts(node);
         if (!amounts_buf) {
             sqlite3_finalize(stmt);
             if (own_txn) persist_rollback(p);
             return 0;
-        }
-        size_t amounts_len = 0;
-        amounts_buf[0] = '\0';
-        for (size_t o = 0; o < node->n_outputs; o++) {
-            amounts_len += (size_t)snprintf(amounts_buf + amounts_len,
-                                            amounts_cap - amounts_len, "%s%llu",
-                                            o > 0 ? "," : "",
-                                            (unsigned long long)node->outputs[o].amount_sats);
         }
         sqlite3_bind_text(stmt, 10, amounts_buf, -1, SQLITE_TRANSIENT);
         free(amounts_buf);
