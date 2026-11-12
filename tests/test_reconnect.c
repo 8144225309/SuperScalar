@@ -207,7 +207,13 @@ int test_reconnect_pubkey_match(void) {
     }
 
     /* Send MSG_RECONNECT from sv[1] as client 2 (index 2) */
-    TEST_ASSERT(test_auth_secure_pair(sv[0], sv[1], NULL), "secure pair");
+    if (!test_auth_secure_pair(sv[0], sv[1], NULL)) {
+        printf("  FAIL: %s: secure pair\n", __func__);
+        lsp_channels_cleanup(&mgr);
+        factory_free(factory); free(factory);
+        free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp);
+        return 0;
+    }
     {
         cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 0);
         /* cppcheck-suppress memleak ; TEST_ASSERT leaks on failure — test-only, process exits */
