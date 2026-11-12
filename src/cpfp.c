@@ -858,6 +858,12 @@ void cpfp_set_default_target(fee_target_t target) {
     g_cpfp_target = target;
 }
 
+fee_target_t cpfp_commitment_exit_target(const cpfp_tx_info_t *ti) {
+    if (!ti) return FEE_TARGET_URGENT;
+    size_t base = 2 + (ti->anchor_vout >= 0 ? 1 : 0);
+    return ti->n_outputs > base ? FEE_TARGET_URGENT : FEE_TARGET_NORMAL;
+}
+
 void cpfp_set_default(regtest_t *rt, wallet_source_t *wallet, fee_estimator_t *urgent,
                       uint64_t max_child_fee) {
     g_cpfp_rt = rt;

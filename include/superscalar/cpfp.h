@@ -137,6 +137,12 @@ void cpfp_set_default(regtest_t *rt, wallet_source_t *wallet,
    timeout far ahead, uses FEE_TARGET_NORMAL. */
 void cpfp_set_default_target(fee_target_t target);
 
+/* Target for broadcasting a commitment ti: FEE_TARGET_URGENT when it has
+   HTLC/PTLC outputs (outputs besides to_local, to_remote and the anchor:
+   each must be claimed before its CLTV/CSV deadline), else
+   FEE_TARGET_NORMAL. */
+fee_target_t cpfp_commitment_exit_target(const cpfp_tx_info_t *ti);
+
 /* Broadcast with the defaults set by cpfp_set_default; without them, a plain
    cb->send_raw_tx (CPFP_SENT_ALONE or CPFP_FAILED; a refused tx with a P2A
    anchor records CPFP_NEED_PACKAGE_RELAY). */

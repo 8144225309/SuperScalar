@@ -2472,6 +2472,7 @@ int main(int argc, char *argv[]) {
             .have_wt_db = wt_db_path != NULL,
             .enable_jit_experimental = enable_jit_experimental,
             .enable_rotation_experimental = enable_rotation_experimental,
+            .allow_anchorless_tree = allow_anchorless_tree,
             .argc = argc,
             .argv = argv,
             .envp = environ,

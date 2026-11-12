@@ -1343,6 +1343,25 @@ int test_commitment_anchor_at_rate_0(void) {
     TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "one side funds it");
     TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti) && ti.anchor_vout >= 0, "anchored");
 
+    /* exit target: a commitment without HTLC outputs takes the 6-block rate,
+       one with an HTLC output the urgent rate */
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "rebuild");
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti), "parse");
+    TEST_ASSERT_EQ(cpfp_commitment_exit_target(&ti), FEE_TARGET_NORMAL, "no HTLC: NORMAL");
+    {
+        unsigned char h[32];
+        memset(h, 0x42, 32);
+        uint64_t hid;
+        ch.local_amount = 60000;
+        ch.remote_amount = 40000;
+        TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 10000, h, 500000, &hid), "add HTLC");
+        TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "build with HTLC");
+        TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti), "parse");
+        TEST_ASSERT_EQ(cpfp_commitment_exit_target(&ti), FEE_TARGET_URGENT,
+                       "pending HTLC output: URGENT");
+        TEST_ASSERT(channel_fail_htlc(&ch, hid), "fail it back");
+    }
+
     /* neither can: never built at rate 0 */
     ch.local_amount = 500;
     ch.remote_amount = 500;

@@ -2708,8 +2708,19 @@ static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
         if (tx_hex) {
             hex_encode(commit_tx, commit_len, tx_hex);
             /* through the CPFP path: alone when it pays the node's floor,
-               else as a package with a child on its anchor */
-            if (cpfp_send_default(chain, tx_hex, sent_txid) != CPFP_FAILED) {
+               else as a package with a child on its anchor.  With HTLC/PTLC
+               outputs the exit races their deadlines: urgent rate. */
+            cpfp_tx_info_t cti;
+            fee_target_t ctarget = cpfp_parse_tx(commit_tx, commit_len, &cti)
+                                   ? cpfp_commitment_exit_target(&cti)
+                                   : FEE_TARGET_URGENT;
+            cpfp_set_default_target(ctarget);
+            if (ctarget == FEE_TARGET_URGENT)
+                printf("Force-close: commitment carries HTLC/PTLC outputs: "
+                       "urgent fee target\n");
+            int csent = cpfp_send_default(chain, tx_hex, sent_txid) != CPFP_FAILED;
+            cpfp_set_default_target(FEE_TARGET_NORMAL);
+            if (csent) {
                 printf("Force-close: commitment TX broadcast: %s (cn=%llu)\n",
                        sent_txid, (unsigned long long)sig_cn);
                 commit_out = 1;
