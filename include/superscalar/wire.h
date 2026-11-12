@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <cJSON.h>
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
 
 /* --- Message types --- */
 #define MSG_HELLO              0x01
@@ -75,6 +77,10 @@
 #define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
 #define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
 #define MSG_JIT_REJECT          0x90  /* Client -> LSP: decline a JIT channel offer */
+
+/* Client authentication (wire_client_auth_*) */
+#define MSG_CLIENT_AUTH_CHALLENGE 0x91 /* LSP -> Client: prove the key you named */
+#define MSG_CLIENT_AUTH_PROOF     0x92 /* Client -> LSP: signature over the challenge */
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
@@ -825,6 +831,71 @@ int wire_parse_reconnect_ack(const cJSON *json, uint32_t *channel_id,
                                 uint64_t *local_amount_msat,
                                 uint64_t *remote_amount_msat,
                                 uint64_t *commitment_number);
+
+/* --- Client authentication ---
+
+   HELLO and MSG_RECONNECT only name a client key.  Before the LSP acts on
+   either in any way, the peer proves it holds that key on this connection:
+
+     LSP -> client   MSG_CLIENT_AUTH_CHALLENGE {challenge}  32 random bytes
+     client -> LSP   MSG_CLIENT_AUTH_PROOF     {sig}        BIP340, 64 bytes
+
+   sig is a signature by the named key over
+
+     SHA256_tagged("SuperScalar/client-auth",
+                   len(protocol_id) || protocol_id || purpose ||
+                   challenge || pubkey || session_hash)
+
+   protocol_id   WIRE_CLIENT_AUTH_PROTOCOL_ID, prefixed by its length (1 byte)
+   purpose       the message being proven: MSG_HELLO or MSG_RECONNECT
+   challenge     the 32 bytes the LSP drew for this attempt
+   pubkey        the named key, 33 bytes compressed
+   session_hash  the Noise session binding of the connection
+                 (wire_get_session_hash), 32 bytes
+
+   The LSP draws a fresh challenge for every attempt and forgets it after
+   that attempt, and no two connections share a session binding, so a
+   proof is good for one attempt on one connection only.  There is no
+   unauthenticated form: a peer that does not answer with a valid proof
+   is refused. */
+#define WIRE_CLIENT_AUTH_PROTOCOL_ID "superscalar/client-auth/1"
+#define WIRE_CLIENT_AUTH_TIMEOUT_SEC 15
+
+int wire_client_auth_digest(const secp256k1_context *ctx,
+                            const unsigned char challenge[32],
+                            uint8_t purpose,
+                            const secp256k1_pubkey *pubkey,
+                            const unsigned char session_hash[32],
+                            unsigned char out32[32]);
+
+int wire_client_auth_sign(const secp256k1_context *ctx,
+                          const secp256k1_keypair *keypair,
+                          const unsigned char challenge[32],
+                          uint8_t purpose,
+                          const unsigned char session_hash[32],
+                          unsigned char sig64[64]);
+
+int wire_client_auth_verify(const secp256k1_context *ctx,
+                            const unsigned char sig64[64],
+                            const unsigned char challenge[32],
+                            uint8_t purpose,
+                            const secp256k1_pubkey *pubkey,
+                            const unsigned char session_hash[32]);
+
+/* LSP side: send a fresh challenge on fd, read the answer and check it is
+   a proof of pubkey for purpose on fd's encrypted session.  Returns 1 only
+   then; 0 for an fd without an encrypted session, no or a wrong answer.
+   Does not close fd. */
+int wire_client_auth_challenge(const secp256k1_context *ctx, int fd,
+                               uint8_t purpose,
+                               const secp256k1_pubkey *pubkey);
+
+/* Client side: wait up to timeout_sec for the LSP challenge on fd and
+   answer it with a proof of keypair for purpose.  Returns 1 once the proof
+   is sent. */
+int wire_client_auth_respond(const secp256k1_context *ctx, int fd,
+                             const secp256k1_keypair *keypair,
+                             uint8_t purpose, int timeout_sec);
 
 /* --- Invoice messages (Phase 17) --- */
 

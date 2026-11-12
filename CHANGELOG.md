@@ -6,6 +6,12 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Client authentication
+
+Wire protocol change: a client without it is refused.
+
+- **A client proves its key before the LSP acts on a HELLO or `MSG_RECONNECT`.** Both messages only name a client key, and the Noise NK handshake authenticates the LSP, not the client. The LSP now answers each of them with `MSG_CLIENT_AUTH_CHALLENGE` (0x91), 32 fresh random bytes, and the client returns `MSG_CLIENT_AUTH_PROOF` (0x92), a BIP340 signature by the named key over `SHA256_tagged("SuperScalar/client-auth", protocol id || message type || challenge || pubkey || session binding)`. The session binding is a hash both ends derive from their Noise handshake (`wire_get_session_hash`), so a proof is good for one challenge on one connection only. The check runs on the first HELLO of a factory, on every `MSG_RECONNECT`, and on a HELLO from a known client that the LSP turns into a reconnect, before the LSP touches the client's channel, nonces or existing connection. A peer that does not prove the key is dropped and the client's live connection is left as it is.
+
 ### Tree builder
 
 - **The factory is funded at the key its root spends.** The root kickoff aggregates the participants in placement order (`factory_compute_funding_spk`), but the LSP funding address, the rotation funding address and the persisted-factory reload derived the key from the participants in index order. With a placement mode and profiles that reorder the clients, the root could not spend the funding output (since PR #486 the build refuses it). All three now use `factory_compute_funding_spk`; new `lsp_compute_funding_spk` / `lsp_compute_funding_spk_for` give the script for an LSP's participants. A partial rotation funds the key of the cooperative clients it builds the new factory for, and aborts if one of them disconnects before the ceremony. `factory_client_to_leaf` now finds a member's channel in the built tree for every shape, so channels open on the leaf the placement put the member on.

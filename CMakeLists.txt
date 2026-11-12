@@ -310,6 +310,8 @@ add_executable(test_superscalar
     tests/test_bridge.c
     tests/test_daemon.c
     tests/test_reconnect.c
+    tests/test_client_auth.c
+    tests/test_auth_util.c
     tests/test_client_watchtower.c
     tests/test_cpfp.c
     tests/test_tree_fees.c

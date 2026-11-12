@@ -212,6 +212,16 @@ int lsp_accept_clients(lsp_t *lsp) {
             i--; continue;
         }
 
+        /* The client proves it holds the key it named, on this connection,
+           before it takes a slot. */
+        if (!wire_client_auth_challenge(lsp->ctx, fd, MSG_HELLO,
+                                        &lsp->client_pubkeys[i])) {
+            fprintf(stderr, "LSP: HELLO from client %zu does not prove its key -- dropping, retrying slot\n", i);
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            i--; continue;
+        }
+
         /* Optional slot_hint for deterministic keyagg ordering */
         cJSON *sh_item = cJSON_GetObjectItem(msg.json, "slot_hint");
         if (sh_item && cJSON_IsNumber(sh_item))

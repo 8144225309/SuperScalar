@@ -3178,6 +3178,15 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
     cJSON_Delete(hello);
 
+    /* Prove our key on this connection.  The LSP may take a while to reach
+       our HELLO (serial accept of many clients), so wait as long as for
+       HELLO_ACK below. */
+    if (!wire_client_auth_respond(ctx, fd, keypair, MSG_HELLO, 600)) {
+        fprintf(stderr, "Client: no key challenge from LSP, or cannot answer it\n");
+        wire_close(fd);
+        return 0;
+    }
+
     /* Receive HELLO_ACK.  Issue #3: LSP serial accept loop with N>=64
        clients can take >120s (default wire timeout) before our HELLO_ACK
        is sent.  10-minute window covers N=128 with 4s/client handshakes

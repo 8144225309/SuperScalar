@@ -3510,6 +3510,7 @@ int test_regtest_tcp_reconnect(void) {
             cJSON *rm = wire_build_reconnect(rc, &rp, pre_commit);
             if (!wire_send(rfd, MSG_RECONNECT, rm)) { cJSON_Delete(rm); wire_close(rfd); _exit(13); }
             cJSON_Delete(rm);
+            if (!wire_client_auth_respond(rc, rfd, &rk, MSG_RECONNECT, 30)) { wire_close(rfd); _exit(16); }
 
             /* Recv CHANNEL_NONCES */
             wire_msg_t nm;
