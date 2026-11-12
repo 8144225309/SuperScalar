@@ -468,6 +468,14 @@ extern int test_admin_rpc_listfunds(void);
 extern int test_admin_rpc_listfactories_no_persist(void);
 extern int test_admin_rpc_recoverfactory_no_persist(void);
 extern int test_admin_rpc_sweepfactory_no_persist(void);
+extern int test_factory_recovery_publishes_tree_beyond_128_nodes(void);
+extern int test_factory_recovery_client_path_above_128(void);
+extern int test_factory_recovery_incomplete_tree_is_error(void);
+extern int test_factory_recovery_refused_path_node_never_succeeds(void);
+extern int test_factory_recovery_height_lock_waits(void);
+extern int test_factory_recovery_exit_leaf_from_commitment(void);
+extern int test_factory_recovery_kept_leaf_after_advance(void);
+extern int test_factory_recovery_exit_leaf_missing_is_error(void);
 extern int test_admin_rpc_sweepfactory_missing_dest(void);
 
 
@@ -2579,6 +2587,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_admin_rpc_listfactories_no_persist);
     RUN_TEST(test_admin_rpc_recoverfactory_no_persist);
     RUN_TEST(test_admin_rpc_sweepfactory_no_persist);
+    RUN_TEST(test_factory_recovery_publishes_tree_beyond_128_nodes);
+    RUN_TEST(test_factory_recovery_client_path_above_128);
+    RUN_TEST(test_factory_recovery_incomplete_tree_is_error);
+    RUN_TEST(test_factory_recovery_refused_path_node_never_succeeds);
+    RUN_TEST(test_factory_recovery_height_lock_waits);
+    RUN_TEST(test_factory_recovery_exit_leaf_from_commitment);
+    RUN_TEST(test_factory_recovery_kept_leaf_after_advance);
+    RUN_TEST(test_factory_recovery_exit_leaf_missing_is_error);
     RUN_TEST(test_admin_rpc_sweepfactory_missing_dest);
 
     printf("\n=== PR #28: Chain Safety ===\n");

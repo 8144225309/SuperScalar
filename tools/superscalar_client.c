@@ -923,6 +923,9 @@ static uint32_t client_tool_chain_tip(void *ctx) {
     return h > 0 ? (uint32_t)h : 0;
 }
 
+static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
+                                     const channel_t *ch, uint32_t my_index);
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -2190,6 +2193,11 @@ handle_message:
         }
 
         case MSG_LEAF_ADVANCE_PROPOSE: {
+            /* The advance replaces the leaf in the tree, but this channel and
+               its commitments stay on the current leaf's output: keep that
+               transaction so a unilateral exit can still publish it. */
+            if (cbd && cbd->db)
+                client_keep_funding_leaf(cbd->db, factory, ch, my_index);
             /* CL1.G: delegate to client_handle_leaf_advance in src/client.c
                which includes the wire-ceremony poison TX MuSig round and the
                cl7_cheat_tx adversarial-client cheat hook. Was: inline state-only
@@ -2484,7 +2492,11 @@ static void usage(const char *prog) {
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
-        "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --force-close                     Unilateral exit from --db without the LSP: publish the tree path\n"
+        "                                    to this client's leaf, then its commitment. One pass per run;\n"
+        "                                    exit status 0 = commitment accepted, 2 = run again after the next\n"
+        "                                    block, 3 = refused for a reason waiting will not cure (needs the\n"
+        "                                    operator), 1 = the exit cannot be completed from this DB\n"
         "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
@@ -2501,6 +2513,200 @@ static void usage(const char *prog) {
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
         prog);
+}
+
+/* Result of one unilateral-exit pass. Also the --force-close exit status. */
+#define CLIENT_EXIT_PUBLISHED   0   /* the commitment is in the mempool or a block */
+#define CLIENT_EXIT_FAILED      1   /* the exit cannot be completed from this DB */
+#define CLIENT_EXIT_IN_PROGRESS 2   /* run again after the next block */
+#define CLIENT_EXIT_STUCK       3   /* refused for a reason waiting will not
+                                       cure: needs the operator */
+
+/* The channel's latest signed commitment TX, whatever its size (caller frees). */
+static unsigned char *exit_load_commitment(persist_t *db, size_t *len_out,
+                                           uint64_t *cn_out) {
+    size_t len = 0, got = 0;
+    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, NULL, &len, 0) || len == 0)
+        return NULL;
+    unsigned char *buf = malloc(len);
+    if (!buf) return NULL;
+    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, buf, &got, len) ||
+        got != len) {
+        free(buf);
+        return NULL;
+    }
+    *len_out = len;
+    return buf;
+}
+
+/* Keep the signed leaf transaction that funds ch, in client_funding_leaf, so
+   it survives an advance that replaces it in tree_nodes. */
+static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
+                                     const channel_t *ch, uint32_t my_index) {
+    if (!db || !factory || !ch || my_index < 1) return;
+    size_t node_idx;
+    uint32_t vout;
+    if (!factory_client_to_leaf(factory, (size_t)(my_index - 1), &node_idx, &vout))
+        return;
+    const factory_node_t *node = &factory->nodes[node_idx];
+    if (!node->is_signed || node->signed_tx.len == 0) return;
+    if (memcmp(node->txid, ch->funding_txid, 32) != 0) return;
+    char txid_hex[65];
+    for (int i = 0; i < 32; i++)
+        snprintf(txid_hex + 2 * i, 3, "%02x", node->txid[31 - i]);
+    if (persist_save_funding_leaf(db, 0, (uint32_t)node_idx, txid_hex,
+                                  node->signed_tx.data, node->signed_tx.len))
+        printf("Client %u: kept leaf %.16s... (node %zu) that funds this "
+               "channel\n", my_index, txid_hex, node_idx);
+    else
+        fprintf(stderr, "Client %u: ERROR: could not keep leaf %.16s... that "
+                "funds this channel; a unilateral exit after the advance "
+                "will fail\n", my_index, txid_hex);
+}
+
+/* One pass of this client's unilateral exit from its own DB: publish the
+   tree transactions on the path from the factory root to this client's leaf,
+   then the client's signed commitment, then (as the nLockTime fallback) the
+   distribution TX. Tree levels mature one relative timelock at a time, so the
+   caller repeats the pass after new blocks until it returns
+   CLIENT_EXIT_PUBLISHED: the commitment has been accepted, which a node only
+   does once the whole path below it is in the mempool or a block. */
+static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    int state;
+
+    /* The exit path ends at the tree node that funds this client's channel.
+       A DB that does not name it gets the whole tree published instead. */
+    char leaf_txid[65] = {0};
+    int have_leaf = (factory_recovery_client_leaf(db, 0, leaf_txid) == 1);
+    if (!have_leaf)
+        printf("Force-close: DB does not name this client's channel funding "
+               "output; publishing the whole factory tree\n");
+
+    char fr_status[512] = {0};
+    factory_recovery_result_t fr;
+    int ran = factory_recovery_run(db, chain, 0, have_leaf ? leaf_txid : NULL,
+                                   &fr, fr_status, sizeof(fr_status));
+    printf("Force-close: %s (run=%d)\n", fr_status, ran);
+    if (!ran) {
+        fprintf(stderr, "Force-close: ERROR: the exit path cannot be "
+                "published: %s\n", fr_status);
+        state = CLIENT_EXIT_FAILED;
+    } else if (!fr.published) {
+        printf("Force-close: exit path not fully published: %d of %d "
+               "transactions out, node %d is next (%d waiting for a parent "
+               "confirmation or a timelock, %d rejected)\n",
+               fr.n_confirmed + fr.n_in_mempool, fr.n_target,
+               fr.first_unpublished, fr.n_waiting, fr.n_rejected);
+        if (fr.n_rejected) {
+            fprintf(stderr, "Force-close: STUCK: exit-path node %d: %s\n",
+                    fr.reject_node, fr.reject_why);
+            state = CLIENT_EXIT_STUCK;
+        } else {
+            state = CLIENT_EXIT_IN_PROGRESS;
+        }
+    } else {
+        state = CLIENT_EXIT_PUBLISHED;
+    }
+
+    /* The signed commitment TX spends the leaf: it pays this client's balance.
+       It is offered on every pass, whatever this node can still see of the
+       tree: once a node accepts it, its leaf and everything above are out. */
+    size_t commit_len = 0;
+    uint64_t sig_cn = 0;
+    unsigned char *commit_tx = exit_load_commitment(db, &commit_len, &sig_cn);
+    factory_recovery_tx_info_t ci;
+    if (!commit_tx || !factory_recovery_tx_info(commit_tx, commit_len, &ci)) {
+        printf("Force-close: no signed commitment TX in DB\n");
+        fprintf(stderr, "Force-close: ERROR: without a signed commitment "
+                "this DB cannot claim the channel balance\n");
+        state = CLIENT_EXIT_FAILED;
+    } else {
+        char *tx_hex = malloc(commit_len * 2 + 1);
+        char sent_txid[65] = {0};
+        int commit_out = 0;
+        const char *stuck_why = NULL;
+        if (tx_hex) {
+            hex_encode(commit_tx, commit_len, tx_hex);
+            if (chain->send_raw_tx(chain, tx_hex, sent_txid)) {
+                printf("Force-close: commitment TX broadcast: %s (cn=%llu)\n",
+                       sent_txid, (unsigned long long)sig_cn);
+                commit_out = 1;
+            } else if (chain->get_confirmations(chain, ci.txid) >= 0) {
+                commit_out = 1;
+            } else if (chain->is_outpoint_unspent) {
+                /* A backend without a transaction index stops seeing a
+                   transaction some blocks after it confirmed; an unspent
+                   output of it is still in the UTXO set. */
+                for (size_t v = 0; v < ci.n_outputs && !commit_out; v++)
+                    if (chain->is_outpoint_unspent(chain, ci.txid,
+                                                   (uint32_t)v) == 1)
+                        commit_out = 1;
+                if (!commit_out &&
+                    chain->get_confirmations(chain, ci.prev_txid) >= 1) {
+                    int in = chain->is_outpoint_unspent(chain, ci.prev_txid,
+                                                        ci.prev_vout);
+                    int height = chain->get_block_height(chain);
+                    int locked = ci.locktime > 0 && ci.locktime < 500000000u &&
+                                 height >= 0 && (uint32_t)height < ci.locktime;
+                    if (in == 0)
+                        stuck_why = "the leaf output it spends is already "
+                                    "spent by another transaction (or this "
+                                    "commitment and every output of it are "
+                                    "already spent)";
+                    else if (in == 1 && !locked)
+                        stuck_why = "it was refused although the leaf output "
+                                    "it spends is unspent and confirmed (fee "
+                                    "below the node's floor, or policy)";
+                }
+            }
+            if (commit_out && !sent_txid[0])
+                printf("Force-close: commitment TX already published: %s "
+                       "(cn=%llu)\n", ci.txid, (unsigned long long)sig_cn);
+            else if (!commit_out)
+                printf("Force-close: commitment TX broadcast failed "
+                       "(may need tree to confirm first)\n");
+            free(tx_hex);
+        }
+        if (commit_out) {
+            state = CLIENT_EXIT_PUBLISHED;
+        } else if (stuck_why) {
+            fprintf(stderr, "Force-close: STUCK: commitment %s: %s\n",
+                    ci.txid, stuck_why);
+            if (state != CLIENT_EXIT_FAILED) state = CLIENT_EXIT_STUCK;
+        } else if (state == CLIENT_EXIT_PUBLISHED) {
+            state = CLIENT_EXIT_IN_PROGRESS;
+        }
+    }
+    free(commit_tx);
+
+    /* Broadcast distribution TX as nLockTime fallback */
+    {
+        size_t dist_len = 0;
+        unsigned char *dist_tx = NULL;
+        if (persist_load_distribution_tx(db, 0, NULL, &dist_len, 0) &&
+            dist_len > 0 && (dist_tx = malloc(dist_len)) != NULL) {
+            size_t got = 0;
+            char *tx_hex = malloc(dist_len * 2 + 1);
+            if (tx_hex &&
+                persist_load_distribution_tx(db, 0, dist_tx, &got, dist_len) &&
+                got == dist_len) {
+                hex_encode(dist_tx, dist_len, tx_hex);
+                char dist_txid[65];
+                if (chain->send_raw_tx(chain, tx_hex, dist_txid))
+                    printf("Force-close: distribution TX broadcast: %s\n",
+                           dist_txid);
+                else
+                    printf("Force-close: distribution TX not yet mature "
+                           "(nLockTime not reached)\n");
+            }
+            free(tx_hex);
+            free(dist_tx);
+        } else {
+            printf("Force-close: no distribution TX in DB\n");
+        }
+    }
+    return state;
 }
 
 /* Item-1 CLOSE policy: force-close on the last fully-verified state, reusing the
@@ -2540,27 +2746,21 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    char fr_status[256] = {0};
-    int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-    fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
-    /* Broadcast the signed commitment TX (last verified state) if present. */
-    unsigned char signed_tx_data[4096];
-    size_t signed_tx_len = 0;
-    uint64_t sig_cn = 0;
-    if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL, signed_tx_data,
-                                    &signed_tx_len, sizeof(signed_tx_data)) &&
-        signed_tx_len > 0) {
-        char *tx_hex = malloc(signed_tx_len * 2 + 1);
-        if (tx_hex) {
-            extern void hex_encode(const unsigned char *, size_t, char *);
-            hex_encode(signed_tx_data, signed_tx_len, tx_hex);
-            char commit_txid[65];
-            if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
-                fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
-                        "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
-            free(tx_hex);
-        }
-    }
+    int state = client_exit_pass(&db, &chain);
+    if (state == CLIENT_EXIT_FAILED)
+        fprintf(stderr, "Client: CLOSE policy force-close FAILED: the exit "
+                "cannot be completed from %s (see above)\n", db_path);
+    else if (state == CLIENT_EXIT_IN_PROGRESS)
+        fprintf(stderr, "Client: CLOSE policy force-close started; run "
+                "--force-close --db %s after each new block until it reports "
+                "COMPLETE\n", db_path);
+    else if (state == CLIENT_EXIT_STUCK)
+        fprintf(stderr, "Client: CLOSE policy force-close STUCK: part of the "
+                "exit was refused for a reason waiting will not cure (see "
+                "above)\n");
+    else
+        fprintf(stderr, "Client: CLOSE policy force-close: exit path and "
+                "commitment published\n");
     persist_close(&db);
     return 1;
 }
@@ -3009,70 +3209,28 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
-           signed factory tree is published root-down. factory_recovery_scan() is the
-           passive startup/reorg scan that never broadcasts. Call repeatedly (caller
-           mines between passes) so each tree level matures its CSV; the root spends
-           the funding directly, so no distribution TX is required. */
-        char fr_status[256] = {0};
-        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-        printf("Force-close: %s (run=%d)\n", fr_status, result);
-
-        /* Broadcast signed commitment TX if available */
-        {
-            unsigned char signed_tx_data[4096];
-            size_t signed_tx_len = 0;
-            uint64_t sig_cn = 0;
-            if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
-                                             signed_tx_data, &signed_tx_len,
-                                             sizeof(signed_tx_data)) &&
-                signed_tx_len > 0) {
-                char *tx_hex = malloc(signed_tx_len * 2 + 1);
-                if (tx_hex) {
-                    extern void hex_encode(const unsigned char *, size_t, char *);
-                    hex_encode(signed_tx_data, signed_tx_len, tx_hex);
-                    char commit_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
-                        printf("Force-close: commitment TX broadcast: %s "
-                               "(cn=%llu)\n", commit_txid,
-                               (unsigned long long)sig_cn);
-                    else
-                        printf("Force-close: commitment TX broadcast failed "
-                               "(may need tree to confirm first)\n");
-                    free(tx_hex);
-                }
-            } else {
-                printf("Force-close: no signed commitment TX in DB\n");
-            }
-        }
-
-        /* Broadcast distribution TX as nLockTime fallback */
-        {
-            unsigned char dist_tx_data[8192];
-            size_t dist_tx_len = 0;
-            if (persist_load_distribution_tx(&db, 0,
-                                              dist_tx_data, &dist_tx_len,
-                                              sizeof(dist_tx_data)) &&
-                dist_tx_len > 0) {
-                char *tx_hex = malloc(dist_tx_len * 2 + 1);
-                if (tx_hex) {
-                    extern void hex_encode(const unsigned char *, size_t, char *);
-                    hex_encode(dist_tx_data, dist_tx_len, tx_hex);
-                    char dist_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
-                        printf("Force-close: distribution TX broadcast: %s\n",
-                               dist_txid);
-                    else
-                        printf("Force-close: distribution TX not yet mature "
-                               "(nLockTime not reached)\n");
-                    free(tx_hex);
-                }
-            } else {
-                printf("Force-close: no distribution TX in DB\n");
-            }
-        }
-
+        /* EXPLICIT operator force-close: publish this client's exit path
+           root-down, then its commitment. factory_recovery_scan() is the
+           passive startup/reorg scan that never broadcasts. Call repeatedly
+           (caller mines between passes) so each tree level matures its CSV;
+           the root spends the funding directly, so no distribution TX is
+           required. */
+        int exit_state = client_exit_pass(&db, &chain);
         persist_close(&db);
+        if (exit_state == CLIENT_EXIT_FAILED) {
+            printf("=== CLIENT FORCE-CLOSE FAILED ===\n");
+            return CLIENT_EXIT_FAILED;
+        }
+        if (exit_state == CLIENT_EXIT_STUCK) {
+            printf("=== CLIENT FORCE-CLOSE STUCK: needs the operator (see the "
+                   "STUCK line) ===\n");
+            return CLIENT_EXIT_STUCK;
+        }
+        if (exit_state == CLIENT_EXIT_IN_PROGRESS) {
+            printf("=== CLIENT FORCE-CLOSE IN PROGRESS: run --force-close again "
+                   "after the next block ===\n");
+            return CLIENT_EXIT_IN_PROGRESS;
+        }
         printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
         return 0;
     }
@@ -3126,17 +3284,16 @@ int main(int argc, char *argv[]) {
         }
 
         /* Load commitment sig to get the signed commitment TX */
-        unsigned char commit_tx_data[4096];
         size_t commit_tx_len = 0;
         uint64_t sig_cn = 0;
-        if (!persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
-                                          commit_tx_data, &commit_tx_len,
-                                          sizeof(commit_tx_data)) ||
-            commit_tx_len == 0) {
+        unsigned char *commit_tx_data =
+            exit_load_commitment(&db, &commit_tx_len, &sig_cn);
+        if (!commit_tx_data) {
             fprintf(stderr, "ERROR: no signed commitment TX in DB\n");
             persist_close(&db);
             return 1;
         }
+        free(commit_tx_data);
         printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
                (unsigned long long)sig_cn, commit_tx_len);
 

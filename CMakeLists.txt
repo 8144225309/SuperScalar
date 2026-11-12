@@ -371,6 +371,7 @@ add_executable(test_superscalar
     tests/test_invoice.c
     tests/test_ln_dispatch.c
     tests/test_admin_rpc.c
+    tests/test_factory_recovery.c
     tests/test_chain_safety.c
     tests/test_onion_message.c
     tests/test_scb_recovery.c
