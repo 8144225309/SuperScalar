@@ -7,6 +7,7 @@
 #include "superscalar/crash_inject.h"   /* #9 superscalar_set_cheat_gate() */
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/network.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
@@ -27,6 +28,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/lsp_wellknown.h"
 #include "superscalar/factory_recovery.h"
+#include "superscalar/client_dist.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,7 +71,8 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     } else if (hd_mnemonic) {
         /* 2. Derive seed from provided mnemonic */
         if (!bip39_mnemonic_to_seed(hd_mnemonic, hd_passphrase ? hd_passphrase : "", seed)) {
-            fprintf(stderr, "Client: HD wallet: bip39_mnemonic_to_seed failed\n");
+            fprintf(stderr, "Client: HD wallet: invalid recovery phrase: %s\n",
+                    bip39_status_str(bip39_check(hd_mnemonic)));
             memset(seed, 0, sizeof(seed));
             return 0;
         }
@@ -125,37 +128,14 @@ static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
     return 1;
 }
 
-/* --- Funding TX no-op verifier for in-process test scaffolds (#197 follow-up).
- *
- * The hard refusal added in #197 (no chain backend → refuse to sign factory)
- * is the right production posture but breaks regtest harness tests that
- * intentionally run without --rpcuser (testing LSP/client wire flow with the
- * client trusting the in-process test orchestrator).  This no-op verifier
- * lets the regtest harness opt out of on-chain verification while keeping
- * the production refusal intact for mainnet/testnet4/signet.
- *
- * Wire the no-op via the --network=regtest path below ONLY when the operator
- * also did NOT pass --rpcuser/--rpcpassword.  Production deployments on
- * regtest can still use the real verifier by supplying --rpcuser. */
-static int verify_funding_noop_regtest(const unsigned char *txid32,
-                                         uint32_t vout,
-                                         uint64_t expected_sats, void *ctx) {
-    (void)txid32; (void)vout; (void)expected_sats; (void)ctx;
-    fprintf(stderr, "Client: REGTEST no-op funding verifier (network=regtest, "
-            "no --rpcuser) — trusting LSP claim of %llu sats; THIS IS UNSAFE "
-            "ON ANY PRODUCTION NETWORK.\n", (unsigned long long)expected_sats);
-    return 1;
-}
-
-/* --- Funding TX on-chain verification callback ---
- * Called by client_run_with_channels() between FACTORY_PROPOSE parsing and
- * tree signing.  Uses the RPC chain backend to query the funding TX and
- * confirm the output amount matches the LSP's claim.
- * ctx is a regtest_t* (same RPC backend used for force-close and sweep). */
+/* --- Funding output lookup over RPC ---
+ * Chain source for client_check_factory_funding(): reports what bitcoind
+ * knows about the output; the library decides.  ctx is a regtest_t* (same
+ * RPC backend used for force-close and sweep). */
 static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
-                                uint64_t expected_sats, void *ctx) {
+                                client_funding_output_t *out, void *ctx) {
     regtest_t *rt = (regtest_t *)ctx;
-    if (!rt) return 0;
+    if (!rt || !out) return 0;
 
     /* Convert internal-order txid to display hex */
     unsigned char disp[32];
@@ -171,37 +151,31 @@ static int verify_funding_rpc(const unsigned char *txid32, uint32_t vout,
         fprintf(stderr, "verify_funding: TX %s not found on-chain\n", txid_hex);
         return 0;
     }
-    if (confs < 1) {
-        fprintf(stderr, "verify_funding: TX %s in mempool but not confirmed\n",
-                txid_hex);
-        /* Allow mempool TX — LSP may have just broadcast */
-    }
-
-    /* Query the actual output amount.
-     * regtest_get_tx_output tries getrawtransaction, then gettransaction
-     * (wallet-aware, no -txindex needed), then block-scan. */
-    uint64_t actual_sats = 0;
-    unsigned char dummy_spk[256];
-    size_t dummy_spk_len = 0;
-    if (!regtest_get_tx_output(rt, txid_hex, vout, &actual_sats,
-                                dummy_spk, &dummy_spk_len)) {
-        fprintf(stderr, "verify_funding: cannot query output %s:%u\n",
-                txid_hex, vout);
+    /* regtest_get_tx_output tries getrawtransaction, then gettransaction
+       (wallet-aware, no -txindex needed), then block-scan. */
+    unsigned char spk[256];
+    size_t spk_len = 0;
+    uint64_t sats = 0;
+    if (!regtest_get_tx_output(rt, txid_hex, vout, &sats, spk, &spk_len) ||
+        spk_len > sizeof(out->spk)) {
+        fprintf(stderr, "verify_funding: cannot query output %s:%u\n", txid_hex, vout);
         return 0;
     }
-    if (actual_sats < expected_sats) {
-        fprintf(stderr, "verify_funding: output %s:%u has %llu sats, "
-                "LSP claimed %llu sats\n",
-                txid_hex, vout,
-                (unsigned long long)actual_sats,
-                (unsigned long long)expected_sats);
-        return 0;
-    }
-    printf("Client: funding TX verified on-chain: %s:%u = %llu sats (>= %llu)\n",
-           txid_hex, vout,
-           (unsigned long long)actual_sats,
-           (unsigned long long)expected_sats);
+    out->amount_sats = sats;
+    memcpy(out->spk, spk, spk_len);
+    out->spk_len = spk_len;
+    out->confirmations = confs;
+    out->unspent = regtest_outpoint_unspent(rt, txid_hex, vout);
     return 1;
+}
+
+/* Regtest scaffolds may run without --rpcuser; there is then nothing to look
+   the funding output up with, and the client says so and proceeds without
+   the check.  Never reached on any other network. */
+static void allow_unverified_funding_regtest(void) {
+    fprintf(stderr, "Client: REGTEST without --rpcuser — funding outputs are NOT "
+            "verified; THIS IS UNSAFE ON ANY PRODUCTION NETWORK.\n");
+    client_set_allow_unverified_funding(1);
 }
 
 /*
@@ -330,6 +304,18 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                    void *user_data) {
     (void)keypair; (void)n_participants;
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
+
+    /* A cooperative close of this factory was signed and may still be
+       completed by the LSP: no payment is started or accepted any more.
+       Returning hands over to the close ceremony, the only thing left that
+       this client takes part in. */
+    if (client_close_signed_for_factory(factory)) {
+        fprintf(stderr, "Client %u: a cooperative close of this factory was "
+                "signed earlier; the channel is frozen and no payment is "
+                "run. Only a close or a unilateral exit (--force-close) can "
+                "follow.\n", my_index);
+        return 1;
+    }
 
     /* Derive HTLC cltv from factory timeout (must expire before factory) */
     uint32_t htlc_cltv = factory->cltv_timeout > 40
@@ -576,6 +562,18 @@ typedef struct {
     int     lsp_forgery_detected;   /* 1 once a forged LSP revocation is refused */
     int     force_close_requested;  /* 1 = CLOSE policy wants a force-close after the loop */
     const char *poison_db_path;     /* db path for the poisoned-LSP sentinel file (#20) */
+    /* Cooperative closes this client has signed for the current factory.
+       Once client_close_state_frozen() says so the factory is frozen: the loop
+       acts on nothing but a close proposal. */
+    client_close_state_t close_state;
+    /* 1 = a close ceremony ended without completing (see
+       daemon_close_outcome): the process must not report success. */
+    int     close_not_completed;
+    /* 1 = a rotation stopped after the new factory was written to the
+       database but before its channel and commitment 0 were: the database
+       no longer matches a usable channel, so the client must not reconnect
+       from it or report success. */
+    int     rotation_not_completed;
 } daemon_cb_data_t;
 
 /* SF-PTLC-TURNOVER-AUTH #196: rotation-context state for the PTLC turnover
@@ -597,10 +595,18 @@ typedef struct {
 } client_rotation_ctx_t;
 
 static client_rotation_ctx_t g_rotation_ctx;
+static void rotation_ctx_clear(void);
 
 static void rotation_ctx_set(const unsigned char *dying_txid,
                               const unsigned char *new_nonce,
                               uint64_t epoch) {
+    if (!client_rotation_allowed()) {
+        fprintf(stderr, "Client: REFUSING ROTATION_BEGIN — factory rotation is not "
+                "enabled (--enable-rotation-experimental); the key turnover that "
+                "follows will be refused\n");
+        rotation_ctx_clear();
+        return;
+    }
     memcpy(g_rotation_ctx.dying_factory_txid, dying_txid, 32);
     memcpy(g_rotation_ctx.new_factory_nonce,  new_nonce,  32);
     g_rotation_ctx.rotation_epoch = epoch;
@@ -716,31 +722,9 @@ static int recv_or_handle_ptlc(int fd, wire_msg_t *msg, int timeout_sec,
 /* Persist the latest commitment TX signature to DB.
    Call after each client_handle_commitment_signed so the client can
    broadcast the commitment TX independently for trustless force-close. */
-static void client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
-    if (!cbd || !cbd->db || !ch->has_latest_commitment_sig) return;
-
-    /* Build signed commitment TX from stored sig */
-    tx_buf_t unsigned_tx;
-    tx_buf_init(&unsigned_tx, 512);
-    unsigned char txid[32];
-    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
-        tx_buf_free(&unsigned_tx);
-        return;
-    }
-    tx_buf_t signed_tx;
-    tx_buf_init(&signed_tx, 512);
-    if (!finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len,
-                             ch->latest_commitment_sig)) {
-        tx_buf_free(&unsigned_tx);
-        tx_buf_free(&signed_tx);
-        return;
-    }
-    tx_buf_free(&unsigned_tx);
-
-    persist_save_commitment_sig(cbd->db, 0, ch->commitment_number,
-                                 ch->latest_commitment_sig,
-                                 signed_tx.data, signed_tx.len);
-    tx_buf_free(&signed_tx);
+static int client_persist_commitment_sig(channel_t *ch, daemon_cb_data_t *cbd) {
+    if (!cbd || !cbd->db) return 0;
+    return client_persist_latest_commitment(cbd->db, 0, ch);
 }
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -856,7 +840,97 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
     cJSON_Delete(rev_msg.json);
 }
 
+/* A rotation ended with the new factory recorded as pending but without a
+   saved channel and commitment 0 for it.  Say what is and is not recoverable
+   and make the process stop instead of reconnecting. */
+static void rotation_pending_notice(persist_t *db) {
+    char old_txid[65] = {0}, new_txid[65] = {0};
+    uint32_t old_vout = 0, new_vout = 0, new_cltv = 0;
+    persist_load_factory_outpoint(db, 0, old_txid, &old_vout, NULL);
+    persist_load_factory_outpoint(db, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                  new_txid, &new_vout, &new_cltv);
+    fprintf(stderr,
+            "  A rotation was started and did not finish.  The database holds\n"
+            "    the factory being left   %s:%u  with this client's channel and commitment,\n"
+            "    the factory being entered %s:%u  with its signed tree and distribution\n"
+            "    transaction, and no commitment for a channel in it.\n"
+            "  --force-close picks the exit that still exists: while the first funding\n"
+            "  output is unspent it publishes that factory's tree and the commitment;\n"
+            "  once something else has spent it, it publishes nothing of the new tree and\n"
+            "  offers the new factory's distribution transaction (nLockTime %u).  Until then the\n"
+            "  funds in the new factory move only with the LSP's cooperation.\n"
+            "  The client does not connect while this record exists.\n",
+            old_txid, old_vout, new_txid, new_vout, new_cltv);
+}
+
+static void rotation_stopped(daemon_cb_data_t *cbd, uint32_t my_index,
+                              const factory_t *factory, const char *why) {
+    (void)factory;
+    fprintf(stderr, "Client %u: ROTATION NOT COMPLETED: %s.\n", my_index, why);
+    if (cbd && cbd->db) rotation_pending_notice(cbd->db);
+    if (cbd) cbd->rotation_not_completed = 1;
+}
+
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
+/* A close ceremony ended without completing.  Record why, so that main()
+   does not report a clean exit, and tell the operator what is left to do.
+   Nothing is broadcast from here: a unilateral exit is the operator's call. */
+static void daemon_close_outcome(daemon_cb_data_t *cbd, uint32_t my_index) {
+    cbd->close_not_completed = 1;
+    if (cbd->close_state.refused) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE REFUSED. This client did not sign "
+            "what the LSP proposed (reason above); its channel is unchanged. "
+            "Unless the LSP proposes an acceptable close after a restart, "
+            "the factory needs a unilateral exit: run this client with "
+            "--force-close and the same --db to broadcast it.\n", my_index);
+    } else if (cbd->close_state.signed_close) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED after this client "
+            "signed it. The LSP may still broadcast that close (it pays this "
+            "client %llu sats), so the channel is frozen. Restart to let the "
+            "LSP propose the close again, or run with --force-close and the "
+            "same --db to exit unilaterally.\n", my_index,
+            (unsigned long long)cbd->close_state.paid_sats);
+    } else if (cbd->close_state.record_error) {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. This client's record "
+            "of signed closes cannot be read from its database, so it signed "
+            "nothing and treats the channel as frozen. Repair the database "
+            "and restart, or run with --force-close and the same --db to "
+            "exit unilaterally.\n", my_index);
+    } else {
+        fprintf(stderr,
+            "Client %u: COOPERATIVE CLOSE NOT COMPLETED. The ceremony failed "
+            "before this client signed anything (reason above). The factory "
+            "is still open and the channel is unchanged and still usable: "
+            "restart this client to carry on or to let the LSP propose the "
+            "close again.\n", my_index);
+    }
+}
+
+/* This client's own chain tip height, 0 if no chain backend can tell. */
+static uint32_t client_tool_chain_tip(void *ctx) {
+    watchtower_t *wt = (watchtower_t *)ctx;
+    if (!wt || !wt->chain || !wt->chain->get_block_height) return 0;
+    int h = wt->chain->get_block_height(wt->chain);
+    return h > 0 ? (uint32_t)h : 0;
+}
+
+/* The factory's distribution TX: broadcast by this client once it is due
+   and the factory is still open.  Checked from the daemon loop and from the
+   reconnect loop, so it does not depend on the LSP being reachable. */
+static client_dist_watch_t g_dist_watch;
+
+static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
+                                             secp256k1_context *ctx) {
+    if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
+    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, NULL, 10, stdout);
+}
+
+static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
+                                     const channel_t *ch, uint32_t my_index);
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -880,12 +954,16 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Attach persistence so revocation secrets received later land in
                the revocation_secrets table (needed for standalone watchtower). */
             channel_set_persist(ch, cbd->db, client_idx);
+            /* The signed commitment 0 received at channel open goes into the
+               same transaction as the factory and channel rows: a channel is
+               never on disk without a broadcastable commitment for it. */
             if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                 persist_save_channel(cbd->db, ch, 0, client_idx) &&
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
-                persist_save_tree_nodes(cbd->db, factory, 0)) {
-                /* Save signed distribution TX if available */
-                if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                persist_save_tree_nodes(cbd->db, factory, 0) &&
+                client_persist_commitment_sig(ch, cbd)) {
+                /* Save the verified signed distribution TX */
+                if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0) {
                     persist_save_distribution_tx(cbd->db, 0,
                         factory->dist_unsigned_tx.data,
                         factory->dist_unsigned_tx.len);
@@ -898,13 +976,23 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                         memset(pcs, 0, 32);
                     }
                 }
-                /* #313 self-custody: persist the INITIAL commitment here too, so a
-                   funded-but-never-transacted channel stays force-closeable when the
-                   LSP vanishes.  The aggregated 2-of-2 sig is otherwise only written
-                   to signed_commitments on the first payment, leaving a never-used
-                   channel unrecoverable in a cold mass-exit (Frontier B). */
-                client_persist_commitment_sig(ch, cbd);
-                persist_commit(cbd->db);
+                /* The LSP's per-commitment points for commitments 0 and 1,
+                   received with its basepoints: a client that restarts
+                   before its first payment needs them to verify the LSP's
+                   revocation of commitment 0. */
+                for (uint64_t cn = 0; cn <= 1; cn++) {
+                    secp256k1_pubkey pcp;
+                    unsigned char ser[33];
+                    size_t slen = 33;
+                    if (channel_get_remote_pcp(ch, cn, &pcp) &&
+                        secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &pcp,
+                                                      SECP256K1_EC_COMPRESSED))
+                        persist_save_remote_pcp(cbd->db, 0, cn, ser);
+                }
+                if (!persist_commit(cbd->db)) {
+                    fprintf(stderr, "Client %u: initial persist commit failed\n", my_index);
+                    return 0;
+                }
                 cbd->saved_initial = 1;
                 /* Extract fee terms for client-side settlement verification */
                 if (factory && my_index >= 1 && my_index < FACTORY_MAX_SIGNERS) {
@@ -913,15 +1001,17 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     extern uint32_t g_routing_fee_ppm;  /* defined in client.c */
                     cbd->routing_fee_ppm = g_routing_fee_ppm;
                 }
-                printf("Client %u: persisted factory + channel + basepoints%s to DB\n",
-                       my_index, ch->has_latest_commitment_sig ? " + initial commitment"
-                                                               : " (no commitment sig yet)");
+                printf("Client %u: persisted factory + channel + basepoints"
+                       " + initial commitment to DB\n", my_index);
             } else {
+                /* Without a durable commitment the channel must not be used. */
                 fprintf(stderr, "Client %u: initial persist failed, rolling back\n", my_index);
                 persist_rollback(cbd->db);
+                return 0;
             }
         } else {
             fprintf(stderr, "Client %u: persist_begin failed for initial save\n", my_index);
+            return 0;
         }
     }
 
@@ -963,6 +1053,29 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             cJSON_Delete(stale_imsg.json);
     }
 
+    /* Load what this client has already signed for this factory.  The same
+       cbd is reused across reconnects and rotations, so this runs on every
+       entry, against the factory now in use. */
+    client_close_state_init(&cbd->close_state, cbd->db, factory);
+    if (client_close_state_frozen(&cbd->close_state, factory)) {
+        if (cbd->close_state.signed_close)
+            fprintf(stderr, "Client %u: a cooperative close of this factory "
+                    "was signed earlier (paying this client %llu sats) and "
+                    "may still be completed by the LSP. The channel is "
+                    "frozen: only a close paying at least that much will be "
+                    "signed. Use --force-close to exit unilaterally.\n",
+                    my_index,
+                    (unsigned long long)cbd->close_state.paid_sats);
+        else
+            fprintf(stderr, "Client %u: this client's record of signed "
+                    "closes CANNOT BE READ from its database, so it cannot "
+                    "rule out that a close of this factory was signed. The "
+                    "channel is treated as frozen until the record can be "
+                    "read: no payment or state change is processed and no "
+                    "close is signed. Repair the database, or use "
+                    "--force-close to exit unilaterally.\n", my_index);
+    }
+
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
     /* Log factory lifecycle once (Tier 2) */
@@ -996,7 +1109,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
        revocation + FULFILL.  Fired once, here, immediately after CHANNEL_READY
        (the LSP --demo loop is already "waiting for payments" by this point —
        same timing the old standalone_channel_cb used successfully). */
-    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated) {
+    if (cbd && cbd->scripted_actions && !cbd->scripted_initiated &&
+        !client_close_state_frozen(&cbd->close_state, factory)) {
         uint32_t sc_htlc_cltv = factory && factory->cltv_timeout > 40
                                 ? factory->cltv_timeout - 40 : 500;
         for (size_t si = 0; si < cbd->n_scripted_actions; si++) {
@@ -1051,7 +1165,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         {
             wire_msg_t imsg;
             while (client_inbox_pop(&cbd->inbox, &imsg)) {
-                if (imsg.msg_type == MSG_COMMITMENT_SIGNED) {
+                if (imsg.msg_type == MSG_COMMITMENT_SIGNED &&
+                    !client_close_state_frozen(&cbd->close_state, factory)) {
                     /* Save old state for deferred watchtower registration.
                        LSP revocation arrives later as MSG_LSP_REVOKE_AND_ACK. */
                     if (cbd->wt) {
@@ -1097,6 +1212,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
             }
+            if (cbd && cbd->db)
+                client_dist_tick(cbd->db, cbd->wt, ctx);
             /* Periodic fee settlement verification: compare expected share
                (from tracked routing volume) to actual balance increase. */
             static time_t last_fee_check = 0;
@@ -1127,6 +1244,32 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
 handle_message:
+        /* A cooperative close of this factory was signed and may still be
+           completed by the LSP, or the record that would say so cannot be
+           read.  Nothing that changes the channel or the factory tree is
+           acted on any more: only a close proposal (which the ceremony
+           accepts if it pays at least as much, and does not sign while the
+           record is unreadable), keepalives and the LSP's own revocations,
+           which only add to what this client can prove.  Everything else is
+           dropped unanswered.  The record is read again here while it is
+           unreadable, so an error that passes lifts the freeze. */
+        if (!client_close_frozen_allows_msg(msg.msg_type) &&
+            client_close_state_frozen(&cbd->close_state, factory)) {
+            if (cbd->close_state.signed_close)
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — a "
+                        "cooperative close of this factory was already "
+                        "signed; only a close or a unilateral exit "
+                        "(--force-close) can follow\n", my_index,
+                        msg.msg_type);
+            else
+                fprintf(stderr, "Client %u: ignoring message 0x%02x — this "
+                        "client's record of signed closes cannot be read, "
+                        "so the channel is treated as frozen\n", my_index,
+                        msg.msg_type);
+            if (msg.json) cJSON_Delete(msg.json);
+            continue;
+        }
+
         switch (msg.msg_type) {
         case MSG_UPDATE_ADD_HTLC: {
             /* Save pre-add state (this is the OLD commitment being revoked) */
@@ -1446,6 +1589,44 @@ handle_message:
             break;
         }
 
+        case MSG_UPDATE_FAIL_HTLC: {
+            /* The LSP gives an HTLC back.  One it never took is simply
+               dropped.  One that was committed is failed and the commitment
+               exchange follows, exactly as after a fulfil. */
+            uint64_t pre_fail_local = ch->local_amount;
+            uint64_t pre_fail_remote = ch->remote_amount;
+            htlc_t pre_fail_htlcs[MAX_HTLCS];
+            size_t pre_fail_n_htlcs = ch->n_htlcs;
+            if (pre_fail_n_htlcs > 0)
+                memcpy(pre_fail_htlcs, ch->htlcs, pre_fail_n_htlcs * sizeof(htlc_t));
+
+            int fail_committed = 0;
+            uint64_t fail_htlc_id = 0;
+            int fail_ok = client_handle_fail_htlc(ch, &msg, &fail_committed,
+                                                   &fail_htlc_id);
+            cJSON_Delete(msg.json);
+            if (fail_ok && fail_committed) {
+                if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                         ctx, keypair, my_index, &cbd->inbox) &&
+                    msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    client_handle_commitment_signed(fd, ch, ctx, &msg);
+                    client_persist_commitment_sig(ch, cbd);
+                    if (msg.json) cJSON_Delete(msg.json);
+                    client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                        pre_fail_local, pre_fail_remote,
+                        pre_fail_n_htlcs > 0 ? pre_fail_htlcs : NULL, pre_fail_n_htlcs,
+                        keypair, my_index);
+                } else {
+                    if (msg.json) cJSON_Delete(msg.json);
+                }
+            }
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+            break;
+        }
+
         case MSG_LSP_REVOKE_AND_ACK: {
             /* LSP's own revocation, arriving naturally in the daemon loop.
                This happens when a queued CS was processed from the inbox:
@@ -1491,12 +1672,33 @@ handle_message:
             break;
         }
 
-        case MSG_CLOSE_PROPOSE:
+        case MSG_CLOSE_PROPOSE: {
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
-            client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
-                                      factory, n_participants, &msg, 0, ch, 0);
+            int close_ok = client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
+                                      factory, n_participants, &msg,
+                                      client_chain_tip(), ch,
+                                      &cbd->close_state, 0);
             cJSON_Delete(msg.json);
+            if (!close_ok && cbd->close_state.unverifiable &&
+                !client_close_state_frozen(&cbd->close_state, factory)) {
+                /* The client could not check the proposal (no chain tip).
+                   It signed and recorded nothing, now or earlier, and told
+                   the LSP to try again, so this is neither a close nor a
+                   refusal: keep serving the channel.  If a close of this
+                   factory is on record from before, or the record cannot be
+                   read, the channel is frozen and this is a close that did
+                   not complete, handled below. */
+                fprintf(stderr,
+                    "Client %u: cooperative close NOT signed: this client "
+                    "could not verify the proposal (reason above) and asked "
+                    "the LSP to try again. The channel is unchanged and still "
+                    "usable; staying connected.\n", my_index);
+                break;
+            }
+            if (!close_ok)
+                daemon_close_outcome(cbd, my_index);
             return 2;  /* close already handled */
+        }
 
         case MSG_CREATE_INVOICE: {
             /* LSP asks us to create an invoice (Phase 17) */
@@ -1697,6 +1899,10 @@ handle_message:
             if (!cbd->auto_accept_jit) {
                 printf("Client %u: rejecting JIT offer "
                        "(use --auto-accept-jit to enable)\n", my_index);
+                /* Tell the LSP, so it does not wait out its timeout. */
+                cJSON *reject = wire_build_jit_reject(jit_cidx, "not accepted");
+                wire_send(fd, MSG_JIT_REJECT, reject);
+                cJSON_Delete(reject);
                 break;
             }
 
@@ -1903,8 +2109,10 @@ handle_message:
             /* LSP requests migration of JIT channel to factory */
             uint32_t mig_jit_id, mig_factory_id;
             uint64_t mig_local, mig_remote;
+            char mig_close_txid[65];
             if (!wire_parse_jit_migrate(msg.json, &mig_jit_id, &mig_factory_id,
-                                          &mig_local, &mig_remote)) {
+                                          &mig_local, &mig_remote,
+                                          mig_close_txid)) {
                 fprintf(stderr, "Client %u: bad JIT_MIGRATE\n", my_index);
                 cJSON_Delete(msg.json);
                 break;
@@ -1914,16 +2122,13 @@ handle_message:
             printf("Client %u: JIT channel %08x migrating to factory %u\n",
                    my_index, mig_jit_id, mig_factory_id);
 
-            if (cbd->jit_ch && cbd->jit_ch->jit_channel_id == mig_jit_id) {
-                cbd->jit_ch->state = JIT_STATE_CLOSED;
-                /* Remove watchtower entries for JIT channel */
-                if (cbd->wt)
-                    watchtower_remove_channel(cbd->wt, 0);
-                /* Remove from persistence */
-                if (cbd->db)
-                    persist_delete_jit_channel(cbd->db, mig_jit_id);
+            if (cbd->jit_ch &&
+                jit_client_handle_migrate(cbd->jit_ch, mig_jit_id,
+                                           mig_close_txid, cbd->wt, cbd->db))
                 printf("Client %u: JIT channel closed (migrated)\n", my_index);
-            }
+            else
+                printf("Client %u: JIT channel record kept "
+                       "(close not seen confirmed)\n", my_index);
             break;
         }
 
@@ -1932,7 +2137,7 @@ handle_message:
             printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
 
             /* Save pubkeys from current factory */
-            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS];
+            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS] = {0};
             for (size_t pi = 0; pi < n_participants; pi++)
                 saved_pubkeys[pi] = factory->pubkeys[pi];
 
@@ -1945,6 +2150,9 @@ handle_message:
                                              factory, ch, &msg)) {
                 fprintf(stderr, "Client %u: factory rotation failed\n", my_index);
                 cJSON_Delete(msg.json);
+                if (client_rotation_new_factory_saved())
+                    rotation_stopped(cbd, my_index, factory,
+                                     "the channel in the new factory was not opened");
                 return 0;
             }
             cJSON_Delete(msg.json);
@@ -1964,41 +2172,57 @@ handle_message:
                     if (persist_save_factory(cbd->db, factory, ctx, 0) &&
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
                         persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
-                        persist_save_tree_nodes(cbd->db, factory, 0)) {
-                        /* Save signed distribution TX if available */
-                        if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
-                            persist_save_distribution_tx(cbd->db, 0,
+                        persist_save_tree_nodes(cbd->db, factory, 0) &&
+                        client_persist_commitment_sig(ch, cbd) &&
+                        persist_delete_factory_record(cbd->db,
+                            CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+                        int rot_ok = 1;
+                        /* Save the verified signed distribution TX */
+                        if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0)
+                            rot_ok = persist_save_distribution_tx(cbd->db, 0,
                                 factory->dist_unsigned_tx.data,
                                 factory->dist_unsigned_tx.len);
-                        }
                         /* Save initial PCS for the new rotated channel so they
                            survive crash before first payment on the new factory */
-                        for (uint64_t cn = 0; cn < ch->n_local_pcs; cn++) {
+                        for (uint64_t cn = 0; rot_ok && cn < ch->n_local_pcs; cn++) {
                             unsigned char pcs[32];
                             if (channel_get_local_pcs(ch, cn, pcs)) {
-                                persist_save_local_pcs(cbd->db, 0, cn, pcs);
+                                rot_ok = persist_save_local_pcs(cbd->db, 0, cn, pcs);
                                 memset(pcs, 0, 32);
                             }
                         }
                         /* Save remote PCPs (LSP's per-commitment points) */
-                        for (uint64_t cn = 0; cn <= ch->commitment_number + 1; cn++) {
+                        for (uint64_t cn = 0; rot_ok && cn <= ch->commitment_number + 1; cn++) {
                             secp256k1_pubkey pcp;
-                            if (channel_get_remote_pcp(ch, cn, &pcp)) {
-                                unsigned char ser[33];
-                                size_t slen = 33;
-                                if (secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
-                                        &pcp, SECP256K1_EC_COMPRESSED))
-                                    persist_save_remote_pcp(cbd->db, 0, cn, ser);
-                            }
+                            unsigned char ser[33];
+                            size_t slen = 33;
+                            rot_ok = channel_get_remote_pcp(ch, cn, &pcp) &&
+                                     secp256k1_ec_pubkey_serialize(ctx, ser, &slen,
+                                         &pcp, SECP256K1_EC_COMPRESSED) &&
+                                     persist_save_remote_pcp(cbd->db, 0, cn, ser);
                         }
-                        persist_commit(cbd->db);
+                        if (!rot_ok) {
+                            persist_rollback(cbd->db);
+                            rotation_stopped(cbd, my_index, factory,
+                                             "the new channel and its commitment could not be saved");
+                            return 0;
+                        }
+                        if (!persist_commit(cbd->db)) {
+                            rotation_stopped(cbd, my_index, factory,
+                                             "the new channel and its commitment could not be saved");
+                            return 0;
+                        }
                         printf("Client %u: persisted rotated factory + channel + basepoints + PCS\n", my_index);
                     } else {
-                        fprintf(stderr, "Client %u: rotation persist failed, rolling back\n", my_index);
                         persist_rollback(cbd->db);
+                        rotation_stopped(cbd, my_index, factory,
+                                         "the new channel and its commitment could not be saved");
+                        return 0;
                     }
                 } else {
-                    fprintf(stderr, "Client %u: persist_begin failed for rotation\n", my_index);
+                    rotation_stopped(cbd, my_index, factory,
+                                     "the new channel and its commitment could not be saved");
+                    return 0;
                 }
             }
 
@@ -2011,6 +2235,11 @@ handle_message:
         }
 
         case MSG_LEAF_ADVANCE_PROPOSE: {
+            /* The advance replaces the leaf in the tree, but this channel and
+               its commitments stay on the current leaf's output: keep that
+               transaction so a unilateral exit can still publish it. */
+            if (cbd && cbd->db)
+                client_keep_funding_leaf(cbd->db, factory, ch, my_index);
             /* CL1.G: delegate to client_handle_leaf_advance in src/client.c
                which includes the wire-ceremony poison TX MuSig round and the
                cl7_cheat_tx adversarial-client cheat hook. Was: inline state-only
@@ -2021,6 +2250,13 @@ handle_message:
             if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf advance failed\n", my_index);
+            } else if (cbd && cbd->db &&
+                       !persist_save_tree_nodes(cbd->db, factory, 0)) {
+                /* The ceremony completed (it ends with the LSP's DONE), so
+                   the tree in memory is the advanced one this client signed:
+                   persist it so a crash recovers the current leaf state. */
+                fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
+                        "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2032,27 +2268,25 @@ handle_message:
                Client's factory already has the correct unsigned tx from PROPOSE. */
             int leaf_side;
             if (wire_parse_leaf_advance_done(msg.json, &leaf_side)) {
-                printf("Client %u: leaf %d advance confirmed by LSP\n",
+                /* A DONE seen here is the LSP's broadcast for a leaf whose
+                   ceremony this client took no part in (another client's
+                   leaf, or one it refused).  Nothing was accepted, so
+                   nothing is persisted; an advance this client signed is
+                   persisted where its ceremony completes, above. */
+                printf("Client %u: LSP reports leaf %d advanced\n",
                        my_index, leaf_side);
-                /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
-                   recovers the CURRENT leaf state, not the last-rotation snapshot.
-                   The factory already holds the advanced tx from the PROPOSE ceremony. */
-                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
-                    fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
-                            "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
         }
 
         case MSG_LEAF_REALLOC_PROPOSE: {
-            /* LSP proposes leaf reallocation — run the full ceremony
-               (nonce exchange + partial sig exchange + done confirmation). */
+            /* LSP proposes a leaf reallocation.  The client refuses every
+               one (see client_handle_leaf_realloc): it answers with an error
+               and its leaf and channel are unchanged, so the loop goes on. */
             wire_msg_t propose_msg = { .msg_type = msg.msg_type, .json = msg.json };
-            if (!client_handle_leaf_realloc(fd, ctx, keypair, factory,
-                                              my_index, &propose_msg)) {
-                fprintf(stderr, "Client %u: leaf realloc failed\n", my_index);
-            }
+            client_handle_leaf_realloc(fd, ctx, keypair, factory,
+                                        my_index, &propose_msg);
             cJSON_Delete(msg.json);
             break;
         }
@@ -2182,8 +2416,10 @@ handle_message:
                     return 2;
                 }
 
-                /* If buy test requested, send lsps2.buy using returned fee params */
-                if (ok && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
+                /* If buy test requested, send lsps2.buy using the returned fee
+                   params (none if get_info was refused: the purchase must
+                   then be refused as well, which the test observes). */
+                if (cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
                     cJSON *buy_req = cJSON_CreateObject();
                     if (buy_req) {
                         cJSON_AddStringToObject(buy_req, "jsonrpc", "2.0");
@@ -2193,7 +2429,8 @@ handle_message:
                         if (params) {
                             /* opening_fee_params: forward the params object from get_info */
                             cJSON *fee_params = cJSON_CreateObject();
-                            cJSON *min_fee = cJSON_GetObjectItem(result, "min_fee_msat");
+                            cJSON *min_fee = result
+                                ? cJSON_GetObjectItem(result, "min_fee_msat") : NULL;
                             if (fee_params && min_fee)
                                 cJSON_AddNumberToObject(fee_params, "min_fee_msat",
                                                         min_fee->valuedouble);
@@ -2289,11 +2526,19 @@ static void usage(const char *prog) {
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
+        "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
+        "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
+        "                                    (outside regtest) and must match it.  The lookup is a direct HTTP\n"
+        "                                    connection: refused together with --tor-proxy / --tor-only.\n"
         "  --tor-proxy HOST:PORT             SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
         "  --generate-mnemonic               Generate 24-word BIP39 mnemonic, derive key, save to --keyfile, then exit\n"
         "  --from-mnemonic WORDS             Restore key from BIP39 mnemonic, save to --keyfile, then exit\n"
         "  --mnemonic-passphrase P           BIP39 passphrase for seed derivation (default: empty)\n"
-        "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
+        "  --force-close                     Unilateral exit from --db without the LSP: publish the tree path\n"
+        "                                    to this client's leaf, then its commitment. One pass per run;\n"
+        "                                    exit status 0 = commitment accepted, 2 = run again after the next\n"
+        "                                    block, 3 = refused for a reason waiting will not cure (needs the\n"
+        "                                    operator), 1 = the exit cannot be completed from this DB\n"
         "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
@@ -2301,12 +2546,198 @@ static void usage(const char *prog) {
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --funding-confs N                 Confirmations a factory's funding output needs before the\n"
+        "                                    client accepts the factory (default: regtest 1, signet,\n"
+        "                                    testnet and testnet4 3, mainnet 6; the LSP's default too)\n"
+        "  --enable-rotation-experimental    UNSAFE, testing only: take part in factory rotation\n"
+        "                                    (refused on mainnet). Off by default: the client refuses\n"
+        "                                    the key turnover and rotation proposals.\n"
+        "  --test-allow-tree-advance         Harness only (refused on mainnet): co-sign leaf, state and\n"
+        "                                    sub-factory advances, which are otherwise refused because\n"
+        "                                    they do not move the channel onto the new tree\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
         "  --version                         Show version and exit\n"
         "  --help                            Show this help\n",
         prog);
+}
+
+/* Result of one unilateral-exit pass. Also the --force-close exit status. */
+#define CLIENT_EXIT_PUBLISHED   0   /* the commitment is in the mempool or a block */
+#define CLIENT_EXIT_FAILED      1   /* the exit cannot be completed from this DB */
+#define CLIENT_EXIT_IN_PROGRESS 2   /* run again after the next block */
+#define CLIENT_EXIT_STUCK       3   /* refused for a reason waiting will not
+                                       cure: needs the operator */
+
+/* The channel's latest signed commitment TX, whatever its size (caller frees). */
+static unsigned char *exit_load_commitment(persist_t *db, size_t *len_out,
+                                           uint64_t *cn_out) {
+    size_t len = 0, got = 0;
+    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, NULL, &len, 0) || len == 0)
+        return NULL;
+    unsigned char *buf = malloc(len);
+    if (!buf) return NULL;
+    if (!persist_load_commitment_sig(db, 0, cn_out, NULL, buf, &got, len) ||
+        got != len) {
+        free(buf);
+        return NULL;
+    }
+    *len_out = len;
+    return buf;
+}
+
+/* Keep the signed leaf transaction that funds ch, in client_funding_leaf, so
+   it survives an advance that replaces it in tree_nodes. */
+static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
+                                     const channel_t *ch, uint32_t my_index) {
+    if (!db || !factory || !ch || my_index < 1) return;
+    size_t node_idx;
+    uint32_t vout;
+    if (!factory_client_to_leaf(factory, (size_t)(my_index - 1), &node_idx, &vout))
+        return;
+    const factory_node_t *node = &factory->nodes[node_idx];
+    if (!node->is_signed || node->signed_tx.len == 0) return;
+    if (memcmp(node->txid, ch->funding_txid, 32) != 0) return;
+    char txid_hex[65];
+    for (int i = 0; i < 32; i++)
+        snprintf(txid_hex + 2 * i, 3, "%02x", node->txid[31 - i]);
+    if (persist_save_funding_leaf(db, 0, (uint32_t)node_idx, txid_hex,
+                                  node->signed_tx.data, node->signed_tx.len))
+        printf("Client %u: kept leaf %.16s... (node %zu) that funds this "
+               "channel\n", my_index, txid_hex, node_idx);
+    else
+        fprintf(stderr, "Client %u: ERROR: could not keep leaf %.16s... that "
+                "funds this channel; a unilateral exit after the advance "
+                "will fail\n", my_index, txid_hex);
+}
+
+/* One pass of this client's unilateral exit from its own DB.  Once the
+   factory's distribution TX is due (its nLockTime reached, the funding output
+   known unspent) or already published, it is the exit: the tree would spend
+   the funding output and make it invalid, so nothing of the tree is
+   published and the pass returns CLIENT_EXIT_PUBLISHED when the TX is in the
+   mempool or a block, CLIENT_EXIT_STUCK when the node refuses it.  Otherwise
+   it publishes the tree transactions on the path from the factory root to
+   this client's leaf, then the client's signed commitment. Tree levels
+   mature one relative timelock at a time, so the caller repeats the pass
+   after new blocks until it returns CLIENT_EXIT_PUBLISHED: the commitment
+   has been accepted, which a node only does once the whole path below it is
+   in the mempool or a block. */
+static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
+    extern void hex_encode(const unsigned char *, size_t, char *);
+    int state;
+
+    client_dist_status_t dist_status = CLIENT_DIST_NONE;
+    if (client_dist_force_close(db, chain, NULL, stdout, &dist_status))
+        return dist_status == CLIENT_DIST_REFUSED ? CLIENT_EXIT_STUCK
+                                                  : CLIENT_EXIT_PUBLISHED;
+
+    /* The exit path ends at the tree node that funds this client's channel.
+       A DB that does not name it gets the whole tree published instead. */
+    char leaf_txid[65] = {0};
+    int have_leaf = (factory_recovery_client_leaf(db, 0, leaf_txid) == 1);
+    if (!have_leaf)
+        printf("Force-close: DB does not name this client's channel funding "
+               "output; publishing the whole factory tree\n");
+
+    char fr_status[512] = {0};
+    factory_recovery_result_t fr;
+    int ran = factory_recovery_run(db, chain, 0, have_leaf ? leaf_txid : NULL,
+                                   &fr, fr_status, sizeof(fr_status));
+    printf("Force-close: %s (run=%d)\n", fr_status, ran);
+    if (!ran) {
+        fprintf(stderr, "Force-close: ERROR: the exit path cannot be "
+                "published: %s\n", fr_status);
+        state = CLIENT_EXIT_FAILED;
+    } else if (!fr.published) {
+        printf("Force-close: exit path not fully published: %d of %d "
+               "transactions out, node %d is next (%d waiting for a parent "
+               "confirmation or a timelock, %d rejected)\n",
+               fr.n_confirmed + fr.n_in_mempool, fr.n_target,
+               fr.first_unpublished, fr.n_waiting, fr.n_rejected);
+        if (fr.n_rejected) {
+            fprintf(stderr, "Force-close: STUCK: exit-path node %d: %s\n",
+                    fr.reject_node, fr.reject_why);
+            state = CLIENT_EXIT_STUCK;
+        } else {
+            state = CLIENT_EXIT_IN_PROGRESS;
+        }
+    } else {
+        state = CLIENT_EXIT_PUBLISHED;
+    }
+
+    /* The signed commitment TX spends the leaf: it pays this client's balance.
+       It is offered on every pass, whatever this node can still see of the
+       tree: once a node accepts it, its leaf and everything above are out. */
+    size_t commit_len = 0;
+    uint64_t sig_cn = 0;
+    unsigned char *commit_tx = exit_load_commitment(db, &commit_len, &sig_cn);
+    factory_recovery_tx_info_t ci;
+    if (!commit_tx || !factory_recovery_tx_info(commit_tx, commit_len, &ci)) {
+        printf("Force-close: no signed commitment TX in DB\n");
+        fprintf(stderr, "Force-close: ERROR: without a signed commitment "
+                "this DB cannot claim the channel balance\n");
+        state = CLIENT_EXIT_FAILED;
+    } else {
+        char *tx_hex = malloc(commit_len * 2 + 1);
+        char sent_txid[65] = {0};
+        int commit_out = 0;
+        const char *stuck_why = NULL;
+        if (tx_hex) {
+            hex_encode(commit_tx, commit_len, tx_hex);
+            if (chain->send_raw_tx(chain, tx_hex, sent_txid)) {
+                printf("Force-close: commitment TX broadcast: %s (cn=%llu)\n",
+                       sent_txid, (unsigned long long)sig_cn);
+                commit_out = 1;
+            } else if (chain->get_confirmations(chain, ci.txid) >= 0) {
+                commit_out = 1;
+            } else if (chain->is_outpoint_unspent) {
+                /* A backend without a transaction index stops seeing a
+                   transaction some blocks after it confirmed; an unspent
+                   output of it is still in the UTXO set. */
+                for (size_t v = 0; v < ci.n_outputs && !commit_out; v++)
+                    if (chain->is_outpoint_unspent(chain, ci.txid,
+                                                   (uint32_t)v) == 1)
+                        commit_out = 1;
+                if (!commit_out &&
+                    chain->get_confirmations(chain, ci.prev_txid) >= 1) {
+                    int in = chain->is_outpoint_unspent(chain, ci.prev_txid,
+                                                        ci.prev_vout);
+                    int height = chain->get_block_height(chain);
+                    int locked = ci.locktime > 0 && ci.locktime < 500000000u &&
+                                 height >= 0 && (uint32_t)height < ci.locktime;
+                    if (in == 0)
+                        stuck_why = "the leaf output it spends is already "
+                                    "spent by another transaction (or this "
+                                    "commitment and every output of it are "
+                                    "already spent)";
+                    else if (in == 1 && !locked)
+                        stuck_why = "it was refused although the leaf output "
+                                    "it spends is unspent and confirmed (fee "
+                                    "below the node's floor, or policy)";
+                }
+            }
+            if (commit_out && !sent_txid[0])
+                printf("Force-close: commitment TX already published: %s "
+                       "(cn=%llu)\n", ci.txid, (unsigned long long)sig_cn);
+            else if (!commit_out)
+                printf("Force-close: commitment TX broadcast failed "
+                       "(may need tree to confirm first)\n");
+            free(tx_hex);
+        }
+        if (commit_out) {
+            state = CLIENT_EXIT_PUBLISHED;
+        } else if (stuck_why) {
+            fprintf(stderr, "Force-close: STUCK: commitment %s: %s\n",
+                    ci.txid, stuck_why);
+            if (state != CLIENT_EXIT_FAILED) state = CLIENT_EXIT_STUCK;
+        } else if (state == CLIENT_EXIT_PUBLISHED) {
+            state = CLIENT_EXIT_IN_PROGRESS;
+        }
+    }
+    free(commit_tx);
+    return state;
 }
 
 /* Item-1 CLOSE policy: force-close on the last fully-verified state, reusing the
@@ -2346,27 +2777,26 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    char fr_status[256] = {0};
-    int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-    fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
-    /* Broadcast the signed commitment TX (last verified state) if present. */
-    unsigned char signed_tx_data[4096];
-    size_t signed_tx_len = 0;
-    uint64_t sig_cn = 0;
-    if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL, signed_tx_data,
-                                    &signed_tx_len, sizeof(signed_tx_data)) &&
-        signed_tx_len > 0) {
-        char *tx_hex = malloc(signed_tx_len * 2 + 1);
-        if (tx_hex) {
-            extern void hex_encode(const unsigned char *, size_t, char *);
-            hex_encode(signed_tx_data, signed_tx_len, tx_hex);
-            char commit_txid[65];
-            if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
-                fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
-                        "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
-            free(tx_hex);
-        }
+    uint32_t plan_dist = 0;
+    if (client_force_close_plan(&db, &chain, &plan_dist, stderr) != 1) {
+        persist_close(&db);
+        return 0;
     }
+    int state = client_exit_pass(&db, &chain);
+    if (state == CLIENT_EXIT_FAILED)
+        fprintf(stderr, "Client: CLOSE policy force-close FAILED: the exit "
+                "cannot be completed from %s (see above)\n", db_path);
+    else if (state == CLIENT_EXIT_IN_PROGRESS)
+        fprintf(stderr, "Client: CLOSE policy force-close started; run "
+                "--force-close --db %s after each new block until it reports "
+                "COMPLETE\n", db_path);
+    else if (state == CLIENT_EXIT_STUCK)
+        fprintf(stderr, "Client: CLOSE policy force-close STUCK: part of the "
+                "exit was refused for a reason waiting will not cure (see "
+                "above)\n");
+    else
+        fprintf(stderr, "Client: CLOSE policy force-close: exit path and "
+                "commitment published\n");
     persist_close(&db);
     return 1;
 }
@@ -2434,6 +2864,8 @@ int main(int argc, char *argv[]) {
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
     const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
+    int enable_rotation_experimental = 0; /* --enable-rotation-experimental */
+    int funding_confs_arg = 0;            /* --funding-confs, 0 = network default */
     int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
@@ -2666,6 +3098,21 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--enable-rotation-experimental") == 0) {
+            enable_rotation_experimental = 1;
+        } else if (strcmp(argv[i], "--funding-confs") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v < 1 || v > 1000) {
+                fprintf(stderr, "Error: --funding-confs needs a number from 1 to 1000\n");
+                return 1;
+            }
+            funding_confs_arg = (int)v;
+        } else if (strcmp(argv[i], "--test-allow-tree-advance") == 0) {
+            /* Harness only (the --test- prefix is refused on mainnet):
+               co-sign leaf, state and sub-factory advances, which the client
+               otherwise refuses because they do not re-anchor its channel. */
+            client_set_allow_tree_advance(1);
         } else if (strcmp(argv[i], "--force-close") == 0) {
             force_close = 1;
         } else if (strcmp(argv[i], "--sweep-to-local") == 0) {
@@ -2709,42 +3156,40 @@ int main(int argc, char *argv[]) {
     if (use_json_log)
         ss_log_set_json(1);
 
-    /* #9 cheat-gate: defense-bypass cheats inert unless regtest; refuse all
-       test/cheat scaffolding flags on mainnet (footgun guard). */
-    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
-    /* G5 (gap-scan): reject unknown network strings -- an unrecognized --network
-       silently defaults to the mainnet RPC port while the exact-"mainnet" guards
-       would not fire. Allowlist the known chains. */
-    if (strcmp(network, "regtest") != 0 && strcmp(network, "testnet") != 0 &&
-        strcmp(network, "testnet4") != 0 && strcmp(network, "signet") != 0 &&
-        strcmp(network, "mainnet") != 0 && strcmp(network, "bitcoin") != 0) {
-        fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
-                "testnet4|signet|mainnet).\n", network);
-        return 1;
-    }
-    if (strcmp(network, "mainnet") == 0) {
-        for (int ci = 1; ci < argc; ci++) {
-            if (strncmp(argv[ci], "--cheat-", 8) == 0 ||
-                strncmp(argv[ci], "--test-", 7) == 0) {
-                fprintf(stderr, "Error: %s is test/cheat scaffolding and is "
-                        "refused on mainnet.\n", argv[ci]);
-                return 1;
-            }
+    /* Canonicalise the chain name once ("bitcoin" is mainnet), so that every
+       check below and in the library sees one spelling.  An unrecognised name
+       is refused: it would otherwise select the mainnet RPC port by default
+       while none of the mainnet gates fire. */
+    {
+        const char *canonical = network_canonical(network);
+        if (!canonical) {
+            fprintf(stderr, "Error: unknown --network '%s' (expected regtest|testnet|"
+                    "testnet4|signet|mainnet).\n", network);
+            return 1;
         }
-        /* G2 (gap-scan): mirror the LSP -- also refuse cheat/kill/crash ENV vars on
-           mainnet (SS_CHEAT_* are gate-inert, but SUPERSCALAR_CRASH* -> abort() is
-           env-driven; fail LOUD rather than silently accept a crash knob). */
-        {
-            extern char **environ;
-            for (char **e = environ; e && *e; e++) {
-                if (strncmp(*e, "SS_CHEAT", 8) == 0 ||
-                    strncmp(*e, "SS_KILL", 7) == 0 ||
-                    strncmp(*e, "SUPERSCALAR_CRASH", 17) == 0) {
-                    fprintf(stderr, "Error: test/cheat env var (%.40s) is refused "
-                            "on mainnet.\n", *e);
-                    return 1;
-                }
-            }
+        network = canonical;
+    }
+    /* A recovery phrase with a typo would derive a different, empty wallet
+       without any error: refuse it before anything is derived from it. */
+    if (hd_mnemonic) {
+        bip39_status_t mn_status = bip39_check(hd_mnemonic);
+        if (mn_status != BIP39_OK) {
+            fprintf(stderr, "Error: invalid --hd-mnemonic: %s\n",
+                    bip39_status_str(mn_status));
+            return 1;
+        }
+    }
+    /* Defense-bypass cheats are inert unless this is regtest. */
+    superscalar_set_cheat_gate(strcmp(network, "regtest") == 0);
+    /* Mainnet refuses test/cheat scaffolding in the arguments and in the
+       environment (see network.h). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        if (!network_gate_no_test_scaffolding(network, argc, argv, environ,
+                                              gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
         }
     }
 
@@ -2812,70 +3257,71 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
-           signed factory tree is published root-down. factory_recovery_scan() is the
-           passive startup/reorg scan that never broadcasts. Call repeatedly (caller
-           mines between passes) so each tree level matures its CSV; the root spends
-           the funding directly, so no distribution TX is required. */
-        char fr_status[256] = {0};
-        int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
-        printf("Force-close: %s (run=%d)\n", fr_status, result);
-
-        /* Broadcast signed commitment TX if available */
-        {
-            unsigned char signed_tx_data[4096];
-            size_t signed_tx_len = 0;
-            uint64_t sig_cn = 0;
-            if (persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
-                                             signed_tx_data, &signed_tx_len,
-                                             sizeof(signed_tx_data)) &&
-                signed_tx_len > 0) {
-                char *tx_hex = malloc(signed_tx_len * 2 + 1);
-                if (tx_hex) {
-                    extern void hex_encode(const unsigned char *, size_t, char *);
-                    hex_encode(signed_tx_data, signed_tx_len, tx_hex);
-                    char commit_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, commit_txid))
-                        printf("Force-close: commitment TX broadcast: %s "
-                               "(cn=%llu)\n", commit_txid,
-                               (unsigned long long)sig_cn);
-                    else
-                        printf("Force-close: commitment TX broadcast failed "
-                               "(may need tree to confirm first)\n");
-                    free(tx_hex);
+        /* Publishing the tree spends the factory funding output, after which
+           the distribution transaction can never confirm.  Without a signed
+           commitment for a channel in it the client could not claim its
+           channel output either, so in that case the tree is left alone and
+           only a distribution transaction is offered. */
+        uint32_t dist_factory = 0;
+        int plan = client_force_close_plan(&db, &chain, &dist_factory, stdout);
+        if (plan < 0) {
+            persist_close(&db);
+            printf("=== CLIENT FORCE-CLOSE: nothing published ===\n");
+            return 1;
+        }
+        if (plan == 0) {
+            /* Broadcast distribution TX as nLockTime fallback */
+            {
+                unsigned char dist_tx_data[8192];
+                size_t dist_tx_len = 0;
+                if (persist_load_distribution_tx(&db, dist_factory,
+                                                  dist_tx_data, &dist_tx_len,
+                                                  sizeof(dist_tx_data)) &&
+                    dist_tx_len > 0) {
+                    char *tx_hex = malloc(dist_tx_len * 2 + 1);
+                    if (tx_hex) {
+                        extern void hex_encode(const unsigned char *, size_t, char *);
+                        hex_encode(dist_tx_data, dist_tx_len, tx_hex);
+                        char dist_txid[65];
+                        if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
+                            printf("Force-close: distribution TX broadcast: %s\n",
+                                   dist_txid);
+                        else
+                            printf("Force-close: distribution TX not yet mature "
+                                   "(nLockTime not reached)\n");
+                        free(tx_hex);
+                    }
+                } else {
+                    printf("Force-close: no distribution TX in DB\n");
                 }
-            } else {
-                printf("Force-close: no signed commitment TX in DB\n");
             }
+            persist_close(&db);
+            printf("=== CLIENT FORCE-CLOSE: no tree published ===\n");
+            return 0;
         }
 
-        /* Broadcast distribution TX as nLockTime fallback */
-        {
-            unsigned char dist_tx_data[8192];
-            size_t dist_tx_len = 0;
-            if (persist_load_distribution_tx(&db, 0,
-                                              dist_tx_data, &dist_tx_len,
-                                              sizeof(dist_tx_data)) &&
-                dist_tx_len > 0) {
-                char *tx_hex = malloc(dist_tx_len * 2 + 1);
-                if (tx_hex) {
-                    extern void hex_encode(const unsigned char *, size_t, char *);
-                    hex_encode(dist_tx_data, dist_tx_len, tx_hex);
-                    char dist_txid[65];
-                    if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
-                        printf("Force-close: distribution TX broadcast: %s\n",
-                               dist_txid);
-                    else
-                        printf("Force-close: distribution TX not yet mature "
-                               "(nLockTime not reached)\n");
-                    free(tx_hex);
-                }
-            } else {
-                printf("Force-close: no distribution TX in DB\n");
-            }
-        }
-
+        /* EXPLICIT operator force-close: publish this client's exit path
+           root-down, then its commitment. factory_recovery_scan() is the
+           passive startup/reorg scan that never broadcasts. Call repeatedly
+           (caller mines between passes) so each tree level matures its CSV;
+           the root spends the funding directly, so no distribution TX is
+           required. */
+        int exit_state = client_exit_pass(&db, &chain);
         persist_close(&db);
+        if (exit_state == CLIENT_EXIT_FAILED) {
+            printf("=== CLIENT FORCE-CLOSE FAILED ===\n");
+            return CLIENT_EXIT_FAILED;
+        }
+        if (exit_state == CLIENT_EXIT_STUCK) {
+            printf("=== CLIENT FORCE-CLOSE STUCK: needs the operator (see the "
+                   "STUCK line) ===\n");
+            return CLIENT_EXIT_STUCK;
+        }
+        if (exit_state == CLIENT_EXIT_IN_PROGRESS) {
+            printf("=== CLIENT FORCE-CLOSE IN PROGRESS: run --force-close again "
+                   "after the next block ===\n");
+            return CLIENT_EXIT_IN_PROGRESS;
+        }
         printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
         return 0;
     }
@@ -2929,33 +3375,18 @@ int main(int argc, char *argv[]) {
         }
 
         /* Load commitment sig to get the signed commitment TX */
-        unsigned char commit_tx_data[4096];
         size_t commit_tx_len = 0;
         uint64_t sig_cn = 0;
-        if (!persist_load_commitment_sig(&db, 0, &sig_cn, NULL,
-                                          commit_tx_data, &commit_tx_len,
-                                          sizeof(commit_tx_data)) ||
-            commit_tx_len == 0) {
+        unsigned char *commit_tx_data =
+            exit_load_commitment(&db, &commit_tx_len, &sig_cn);
+        if (!commit_tx_data) {
             fprintf(stderr, "ERROR: no signed commitment TX in DB\n");
             persist_close(&db);
             return 1;
         }
+        free(commit_tx_data);
         printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
                (unsigned long long)sig_cn, commit_tx_len);
-
-        /* Load channel state (balances + commitment number) */
-        uint64_t local_amt = 0, remote_amt = 0;
-        uint64_t cn = 0;
-        persist_load_channel_state(&db, 0, &local_amt, &remote_amt, &cn);
-
-        /* Load basepoints */
-        unsigned char local_secs[4][32];
-        unsigned char remote_bps_raw[4][33];
-        if (!persist_load_basepoints(&db, 0, local_secs, remote_bps_raw)) {
-            fprintf(stderr, "ERROR: no basepoints in DB\n");
-            persist_close(&db);
-            return 1;
-        }
 
         /* Load factory (needed for funding info) */
         secp256k1_context *sweep_ctx = secp256k1_context_create(
@@ -2965,19 +3396,6 @@ int main(int argc, char *argv[]) {
         if (!sweep_factory || !persist_load_factory(&db, 0, sweep_factory, sweep_ctx)) {
             fprintf(stderr, "ERROR: failed to load factory from DB\n");
             free(sweep_factory);
-            secp256k1_context_destroy(sweep_ctx);
-            persist_close(&db);
-            return 1;
-        }
-
-        /* Parse remote basepoints */
-        secp256k1_pubkey r_pay, r_delay, r_revoc, r_htlc;
-        if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33)) {
-            fprintf(stderr, "ERROR: failed to parse remote basepoints\n");
-            factory_free(sweep_factory); free(sweep_factory);
             secp256k1_context_destroy(sweep_ctx);
             persist_close(&db);
             return 1;
@@ -3003,9 +3421,61 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
         memset(sweep_seckey, 0, 32);
 
+        /* This client's index in the factory, found from its own key as the
+           reconnect path does; its channel row and basepoints are stored
+           under slot index - 1. */
+        uint32_t sweep_my_index = 0;
+        {
+            secp256k1_pubkey my_pub;
+            unsigned char mine[33], other[33];
+            size_t mine_len = 33;
+            if (secp256k1_keypair_pub(sweep_ctx, &my_pub, &sweep_kp) &&
+                secp256k1_ec_pubkey_serialize(sweep_ctx, mine, &mine_len, &my_pub,
+                                              SECP256K1_EC_COMPRESSED)) {
+                for (size_t k = 1; k < sweep_factory->n_participants; k++) {
+                    size_t other_len = 33;
+                    if (secp256k1_ec_pubkey_serialize(sweep_ctx, other, &other_len,
+                                                      &sweep_factory->pubkeys[k],
+                                                      SECP256K1_EC_COMPRESSED) &&
+                        memcmp(mine, other, 33) == 0) {
+                        sweep_my_index = (uint32_t)k;
+                        break;
+                    }
+                }
+            }
+        }
+        uint64_t local_amt = 0, remote_amt = 0;
+        uint64_t cn = 0;
+        unsigned char local_secs[4][32] = {{0}};
+        unsigned char remote_bps_raw[4][33] = {{0}};
+        secp256k1_pubkey r_pay = {{0}}, r_delay = {{0}}, r_revoc = {{0}}, r_htlc = {{0}};
+        const char *sweep_err = NULL;
+        if (sweep_my_index == 0)
+            sweep_err = "the keyfile's key is not a client of the factory in this DB";
+        else if (!persist_load_channel_state(&db, sweep_my_index - 1, &local_amt,
+                                             &remote_amt, &cn))
+            sweep_err = "no channel state in DB";
+        else if (!persist_load_basepoints(&db, sweep_my_index - 1, local_secs,
+                                          remote_bps_raw))
+            sweep_err = "no basepoints in DB";
+        else if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33))
+            sweep_err = "failed to parse remote basepoints";
+        if (sweep_err) {
+            fprintf(stderr, "ERROR: %s\n", sweep_err);
+            memset(local_secs, 0, sizeof(local_secs));
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
+        printf("Sweep: client %u (channel slot %u)\n", sweep_my_index,
+               sweep_my_index - 1);
+
         /* Initialize channel using the same path as reconnect */
         channel_t sweep_ch;
-        uint32_t sweep_my_index = 1; /* default client index */
         if (!client_init_channel(&sweep_ch, sweep_ctx, sweep_factory, &sweep_kp,
                                   sweep_my_index,
                                   &r_pay, &r_delay, &r_revoc, &r_htlc,
@@ -3207,6 +3677,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: --keyfile required for mnemonic operations\n");
             return 1;
         }
+        if (keyfile_exists(keyfile_path)) {
+            fprintf(stderr,
+                "Error: keyfile %s already exists; refusing to overwrite it.\n"
+                "  Move the file away first, or choose another --keyfile path.\n",
+                keyfile_path);
+            return 1;
+        }
         unsigned char seed[64];
         if (generate_mnemonic) {
             char mnemonic[1024];
@@ -3222,8 +3699,10 @@ int main(int argc, char *argv[]) {
             }
             secure_zero(mnemonic, sizeof(mnemonic));
         } else {
-            if (!bip39_validate(from_mnemonic)) {
-                fprintf(stderr, "Error: invalid mnemonic (bad word or checksum)\n");
+            bip39_status_t mn_status = bip39_check(from_mnemonic);
+            if (mn_status != BIP39_OK) {
+                fprintf(stderr, "Error: invalid --from-mnemonic: %s\n",
+                        bip39_status_str(mn_status));
                 return 1;
             }
             if (!bip39_mnemonic_to_seed(from_mnemonic, mnemonic_passphrase, seed)) {
@@ -3240,23 +3719,32 @@ int main(int argc, char *argv[]) {
         return ok ? 0 : 1;
     }
 
-    /* Mainnet safety guard: refuse unless explicitly acknowledged */
-    if (strcmp(network, "mainnet") == 0 && !accept_risk) {
-        fprintf(stderr,
-            "Error: mainnet operation refused.\n"
-            "SuperScalar is a PROTOTYPE. Running on mainnet risks loss of funds.\n"
-            "If you understand this risk, pass --i-accept-the-risk\n");
-        return 1;
+    /* Mainnet start-up gates (see network.h): explicit risk acknowledgement,
+       no secret key on the command line, no test/cheat scaffolding, and a
+       database for persistent state. */
+    {
+        extern char **environ;
+        char gate_err[512];
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_CLIENT,
+            .network = network,
+            .accept_risk = accept_risk,
+            .seckey_on_cmdline = seckey_hex != NULL,
+            .have_db = db_path != NULL,
+            .enable_rotation_experimental = enable_rotation_experimental,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
+        }
     }
-
-    /* Mainnet requires --db for revocation secret persistence */
-    if (strcmp(network, "mainnet") == 0 && !db_path) {
-        fprintf(stderr,
-            "Error: mainnet requires --db for persistent state.\n"
-            "Without a database, revocation secrets are lost on crash\n"
-            "and breach penalties cannot be constructed.\n");
-        return 1;
-    }
+    client_set_allow_rotation(enable_rotation_experimental);
+    if (enable_rotation_experimental)
+        fprintf(stderr, "WARNING: --enable-rotation-experimental: factory rotation is "
+                "enabled. This is unsafe and for testing only.\n");
 
     /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
        backend so the client can verify the funding TX on-chain before
@@ -3270,6 +3758,26 @@ int main(int argc, char *argv[]) {
             "       Without it, an adversarial LSP could claim a larger\n"
             "       funding_amount than actually exists; see audit 2026-05-17.\n",
             network);
+        return 1;
+    }
+
+    /* Every network except regtest needs the LSP's key pinned with
+       --lsp-pubkey.  Checked here, before a keyfile or anything else is
+       created; the endpoint resolution below enforces the same rule. */
+    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
+        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                "(prevents MITM attacks)\n");
+        return 1;
+    }
+
+    /* The well-known lookup is a direct HTTP connection.  With Tor in use it
+       would reveal this host to the LSP's domain, so the two are not combined. */
+    if (lsp_domain && (tor_proxy_arg || tor_only)) {
+        fprintf(stderr,
+            "Error: --lsp DOMAIN cannot be used with --tor-proxy / --tor-only.\n"
+            "  The lookup of /.well-known/lsps.json is a direct clearnet HTTP\n"
+            "  connection and would bypass Tor. Give the LSP's address with\n"
+            "  --host and --port (and its key with --lsp-pubkey) instead.\n");
         return 1;
     }
 
@@ -3308,20 +3816,33 @@ int main(int argc, char *argv[]) {
     } else if (keyfile_path) {
         secp256k1_context *tmp_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        if (keyfile_load(keyfile_path, seckey, passphrase)) {
-            printf("Client: loaded key from %s\n", keyfile_path);
-            key_loaded = 1;
-        } else {
-            printf("Client: generating new key and saving to %s\n", keyfile_path);
-            if (keyfile_generate(keyfile_path, seckey, passphrase, tmp_ctx)) {
-                key_loaded = 1;
-            } else {
-                fprintf(stderr, "Error: failed to generate keyfile\n");
-                secp256k1_context_destroy(tmp_ctx);
-                return 1;
-            }
-        }
+        /* A new key is only ever created when no file exists at the path. */
+        keyfile_open_result_t kf_res =
+            keyfile_load_or_generate(keyfile_path, seckey, passphrase, tmp_ctx);
         secp256k1_context_destroy(tmp_ctx);
+        switch (kf_res) {
+        case KEYFILE_OPEN_LOADED:
+            printf("Client: loaded key from %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_GENERATED:
+            printf("Client: generated new key and saved it to %s\n", keyfile_path);
+            break;
+        case KEYFILE_OPEN_LOAD_FAILED:
+            fprintf(stderr,
+                "Error: keyfile %s exists but could not be loaded\n"
+                "  (wrong --passphrase, or the file is corrupt or unreadable).\n"
+                "  The file has not been modified. To create a new key instead,\n"
+                "  move the file away first.\n", keyfile_path);
+            return 1;
+        case KEYFILE_OPEN_INSECURE_MODE:
+            fprintf(stderr, "Error: refusing to start with keyfile %s: its permissions\n"
+                "  let every user read it (details above).\n", keyfile_path);
+            return 1;
+        default:
+            fprintf(stderr, "Error: failed to generate keyfile %s\n", keyfile_path);
+            return 1;
+        }
+        key_loaded = 1;
     }
 
     if (!key_loaded) {
@@ -3352,40 +3873,63 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Bootstrap from well-known endpoint: overrides --host, --port, --lsp-pubkey */
-    static char wk_host_buf[256];
-    static char wk_pubkey_buf[128];
-    if (lsp_domain) {
-        uint16_t wk_port = 0;
-        printf("Client: fetching /.well-known/lsps.json from %s ...\n",
-               lsp_domain);
-        if (!lsp_wellknown_fetch_http(lsp_domain,
-                                      wk_host_buf, sizeof(wk_host_buf),
-                                      &wk_port, wk_pubkey_buf,
-                                      sizeof(wk_pubkey_buf))) {
+    /* Where to connect, and which key authenticates the LSP.  With --lsp the
+       well-known endpoint supplies the host and port.  Its response travels
+       over plain HTTP, so the public key in it is not proof of anything and
+       never becomes the pinned key: only --lsp-pubkey does, and every network
+       except regtest requires it. */
+    static lsp_endpoint_t lsp_endpoint;
+    {
+        if (lsp_domain)
+            printf("Client: fetching /.well-known/lsps.json from %s ...\n",
+                   lsp_domain);
+        lsp_endpoint_status_t ep_status = lsp_wellknown_resolve_endpoint(
+            lsp_domain, 80, host, port, lsp_pubkey_hex,
+            strcmp(network, "regtest") != 0, &lsp_endpoint);
+
+        if (lsp_domain && ep_status != LSP_ENDPOINT_FETCH_FAILED) {
+            printf("Client: bootstrapped from %s -> %s:%d\n",
+                   lsp_domain, lsp_endpoint.host, lsp_endpoint.port);
+            if (lsp_endpoint.pinned_pubkey_hex)
+                printf("Client: advertised LSP pubkey matches --lsp-pubkey\n");
+            else if (ep_status != LSP_ENDPOINT_PIN_MISMATCH)
+                printf("Client: %s advertises LSP pubkey %s\n"
+                       "Client: that key was fetched over unauthenticated HTTP and is NOT trusted.\n"
+                       "Client: confirm it with the LSP operator out of band, then pass it\n"
+                       "Client: with --lsp-pubkey.\n",
+                       lsp_domain, lsp_endpoint.advertised_pubkey_hex);
+        }
+
+        switch (ep_status) {
+        case LSP_ENDPOINT_OK:
+            break;
+        case LSP_ENDPOINT_FETCH_FAILED:
             fprintf(stderr, "Client: failed to fetch well-known from %s\n",
                     lsp_domain);
+            break;
+        case LSP_ENDPOINT_PIN_MISMATCH:
+            fprintf(stderr,
+                "Error: --lsp-pubkey does not match the key advertised by %s.\n"
+                "  --lsp-pubkey: %s\n"
+                "  advertised:   %s\n"
+                "  Either the LSP has changed its key (confirm the new key with the\n"
+                "  operator out of band) or the response did not come from your LSP.\n",
+                lsp_domain, lsp_pubkey_hex, lsp_endpoint.advertised_pubkey_hex);
+            break;
+        case LSP_ENDPOINT_PIN_REQUIRED:
+            fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
+                    "(prevents MITM attacks)\n");
+            break;
+        }
+        if (ep_status != LSP_ENDPOINT_OK) {
             memset(seckey, 0, 32);
             report_close(&rpt);
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        host = wk_host_buf;
-        port = (int)wk_port;
-        if (!lsp_pubkey_hex)
-            lsp_pubkey_hex = wk_pubkey_buf;
-        printf("Client: bootstrapped from %s -> %s:%d pubkey %s\n",
-               lsp_domain, wk_host_buf, wk_port, wk_pubkey_buf);
-    }
-
-    /* Require --lsp-pubkey on non-regtest to prevent MITM */
-    if (strcmp(network, "regtest") != 0 && !lsp_pubkey_hex) {
-        fprintf(stderr, "ERROR: --lsp-pubkey required on non-regtest networks "
-                "(prevents MITM attacks)\n");
-        memset(seckey, 0, 32);
-        report_close(&rpt);
-        secp256k1_context_destroy(ctx);
-        return 1;
+        host = lsp_endpoint.host;
+        port = lsp_endpoint.port;
+        lsp_pubkey_hex = lsp_endpoint.pinned_pubkey_hex;
     }
 
     /* NK authentication: pin LSP static pubkey if provided */
@@ -3457,6 +4001,13 @@ int main(int argc, char *argv[]) {
            consult client_ps_signed_inputs and refuse to sign a second
            TX spending the same parent UTXO. ZmnSCPxj §PS wide leaves. */
         client_set_persist(&db);
+
+        if (persist_has_factory(&db, CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+            fprintf(stderr, "Client: ROTATION NOT COMPLETED (recorded in %s).\n", db_path);
+            rotation_pending_notice(&db);
+            persist_close(&db);
+            return 1;
+        }
     }
 
     signal(SIGINT, sigint_handler);
@@ -3507,6 +4058,10 @@ int main(int argc, char *argv[]) {
 
     watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, client_fee_ptr,
                       use_db ? &db : NULL);
+    /* The close ceremony bounds a proposal's nLockTime by this client's own
+       chain tip, read from whatever chain backend the watchtower ends up
+       with (bitcoind RPC, or the light client attached below). */
+    client_set_chain_tip_source(client_tool_chain_tip, &client_wt);
 
     /* Attach BIP 158 light client as chain backend (overrides regtest backend) */
     if (light_client_arg) {
@@ -3645,15 +4200,18 @@ int main(int argc, char *argv[]) {
                 vctx = &verify_rt;
             }
         }
-        /* #197 follow-up: regtest scaffolds may legitimately run without
-           --rpcuser; install a no-op verifier so the hard refusal in
-           src/client.c doesn't break in-process test harnesses. The no-op
-           ONLY fires on network=regtest. Production networks still hit
-           the hard refusal in src/client.c if vfn stays NULL. */
-        if (!vfn && strcmp(network, "regtest") == 0) {
-            vfn = verify_funding_noop_regtest;
-            vctx = NULL;
-        }
+        /* Without a chain source the library refuses every factory.  The
+           only exception is regtest without --rpcuser (harness). */
+        if (!rpcuser && strcmp(network, "regtest") == 0)
+            allow_unverified_funding_regtest();
+        else if (!vfn)
+            fprintf(stderr, "Client: RPC connection unavailable — funding outputs cannot "
+                    "be verified, so every factory will be refused\n");
+        client_set_funding_min_confs(network_funding_confs(network, funding_confs_arg));
+
+        /* A rotation after a reconnect checks the new funding output with
+           the same verifier as the first factory. */
+        client_set_funding_verifier(vfn, vctx);
 
         while (!g_shutdown) {
             if (first_run || !use_db) {
@@ -3670,6 +4228,10 @@ int main(int argc, char *argv[]) {
                                             daemon_channel_cb, &cbd);
             }
             if (g_shutdown) break;
+            if (cbd.rotation_not_completed) {
+                ok = 0;
+                break;
+            }
             if (cbd.lsp_forgery_detected &&
                 cbd.lsp_forgery_response != LSP_FORGERY_CONTINUE) {
                 fprintf(stderr, "Client: LSP revocation forgery — not reconnecting "
@@ -3682,14 +4244,46 @@ int main(int argc, char *argv[]) {
                    detect on-chain breaches even when the LSP is unreachable. */
                 if (cbd.wt)
                     watchtower_check(cbd.wt);
+                /* The factory's end date pays the members without the LSP.
+                   Once its TX is buried to the close depth and nothing is
+                   left to watch, the daemon stops; otherwise it keeps
+                   running the watchtower. */
+                if (use_db &&
+                    client_dist_tick(&db, cbd.wt, ctx) == CLIENT_DIST_CONFIRMED) {
+                    chain_backend_t *cb = cbd.wt ? cbd.wt->chain : NULL;
+                    size_t watched = cbd.wt ? cbd.wt->n_entries + cbd.wt->n_pending : 0;
+                    if (client_dist_may_exit(g_dist_watch.confs,
+                                             chain_close_confs(cb, cb && cb->is_regtest),
+                                             cbd.jit_ch != NULL, watched)) {
+                        printf("Client: the factory is settled by its distribution "
+                               "TX (%d confirmations); nothing left to watch, "
+                               "exiting\n", g_dist_watch.confs);
+                        ok = 1;
+                        break;
+                    }
+                    static int keep_reported = 0;
+                    if (!keep_reported) {
+                        keep_reported = 1;
+                        printf("Client: the factory is settled by its distribution "
+                               "TX; still running: %d confirmations (close depth %d), %zu "
+                               "watched commitment(s)/penalty(ies), JIT channel %s\n",
+                               g_dist_watch.confs,
+                               chain_close_confs(cb, cb && cb->is_regtest), watched,
+                               cbd.jit_ch ? "open" : "none");
+                    }
+                }
                 sleep(1);
             } else {
                 break;  /* clean exit */
             }
         }
+        client_dist_watch_free(&g_dist_watch);
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
+        /* A close that did not complete is not a clean exit. */
+        if (cbd.close_not_completed || cbd.rotation_not_completed)
+            ok = 0;
     } else if (n_actions > 0 || expect_channels) {
         /* Funding verification (if RPC available) — shared by both sub-paths. */
         regtest_t sa_verify_rt;
@@ -3702,11 +4296,12 @@ int main(int argc, char *argv[]) {
                 sa_vctx = &sa_verify_rt;
             }
         }
-        /* #197 follow-up: regtest scaffold opt-out (no-op verifier). */
-        if (!sa_vfn && strcmp(network, "regtest") == 0) {
-            sa_vfn = verify_funding_noop_regtest;
-            sa_vctx = NULL;
-        }
+        if (!rpcuser && strcmp(network, "regtest") == 0)
+            allow_unverified_funding_regtest();
+        else if (!sa_vfn)
+            fprintf(stderr, "Client: RPC connection unavailable — funding outputs cannot "
+                    "be verified, so every factory will be refused\n");
+        client_set_funding_min_confs(network_funding_confs(network, funding_confs_arg));
 
         if (n_actions > 0) {
             /* Scripted --send/--recv now run through the SAME proven daemon
@@ -3736,6 +4331,8 @@ int main(int argc, char *argv[]) {
             if (cbd.force_close_requested)
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
+            if (cbd.close_not_completed)
+                ok = 0;
         } else {
             /* Bare --channels (no scripted payment): unchanged legacy path. */
             multi_payment_data_t data = { actions, n_actions, 0 };

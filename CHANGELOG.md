@@ -2,7 +2,106 @@
 
 All notable changes to SuperScalar are documented here.
 
-> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **39**.
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **40**.
+
+## Unreleased
+
+### The default tree is advanceless
+
+Operator-visible behaviour changes.
+
+- **Without `--arity`, `--static-near-root` and `--ps-subfactory-arity` the LSP builds the advanceless tree**: every interior level static (kickoff only, no Decker-Wattenhofer state), one member per pseudo-Spilman leaf, no relative lock anywhere in the tree.  Depth is the fewest levels with `15^depth >= clients`; the fan-out is the smallest `F >= 4` with `F^depth >= clients` (4 clients: `--arity 4,3 --static-near-root 1`, 9 transactions; 64: `8,8,3` static 2, 137; 255: `7,7,7,3` static 3).  The LSP logs the shape it chose.  Before, the default was the uniform pseudo-Spilman tree with DW state on every interior level.  Every other shape is still available with an explicit `--arity`; `--arity` alone keeps DW state on every level.
+- **A factory without DW state is never refreshed in place.**  The root tick, the whole-counter advance, the root rollover of a leaf advance (DW or pseudo-Spilman), a member's root-driven Tier B and `--test-tier-b-rollover` refuse it with one message pointing to rotation; such a factory's life is extended only by rotating to a new funding output.  `--demo` no longer advances the DW counter of such a factory.
+- **The tree shape is stored with the factory** (schema v40: `level_arity`, `static_threshold_depth`, `ps_subfactory_arity`, `placement_mode`).  A restarted LSP and a reconnecting member used to rebuild every factory as a uniform tree; for any other shape that tree had different transactions from the signed one, and commitments signed after the restart spent a leaf output that can never exist.  The reload now rebuilds the stored shape and ties it to the signed tree in the database: every stored transaction must hash to its txid and spend its parent's stored output (the root the funding outpoint), and every rebuilt txid must match, except below a state that an advance or re-allocation moved on (a DW state, or a leaf or sub-factory state), which is loaded from its signed transaction; a kickoff, or an interior node of a tree without DW state, never differs.  **Any mismatch, or a factory with no stored tree, refuses the load.**  A factory stored before v40 loads with the default shape columns and is refused only if that rebuild does not match its signed tree.
+- **An LSP whose DB holds a factory it cannot load stops** (exit 1, with the reason) instead of waiting for clients for a new factory.
+
+### Factory rotation is off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer rotates factories unless started with `--enable-rotation-experimental`.** Before, every `--daemon` LSP rotated a factory automatically when it turned DYING. That rotation is not safe yet: the members hand over their factory keys, the LSP closes the old factory with every output paid to its own wallet, and the new factory reuses the same keys. The flag is for testing only and is refused on mainnet. `--test-rotation` and `--test-partial-rotation` imply it; `--async-rotation` needs it.
+- **Without the flag, a DYING factory keeps serving its channels until it expires.** The LSP logs that it is not rotating. Every way into a rotation is refused: the DYING/EXPIRED trigger and its retries, partial rotation at EXPIRED, the DW-counter trigger, the async-rotation readiness gate, CLI `rotate` and `MSG_ROTATE`.
+- **The LSP broadcasts the co-signed distribution TX of an expired factory once its nLockTime is reached**, retrying at each block until it is accepted. Before, it tried once, at EXPIRED, which with the default `--cltv-timeout` is always before the nLockTime, and for the first factory it held the unsigned TX, so the broadcast never succeeded. Members' own copies are unchanged.
+
+### JIT channels are off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer opens JIT channels unless started with `--enable-jit-experimental`.** Without the flag it sends no JIT offer and funds nothing when its factories expire, and it answers `lsps2.buy` and `lsps2.get_info` from a factory client with a JSON-RPC error (`-32601`). The flag is unsafe and for testing only: an open funds a 2-of-2 output before the client has signed anything, and the channel cannot carry payments yet. It is refused on mainnet. `--test-jit` implies it.
+- **`--no-jit` is removed.** JIT opens are off by default, so the flag had nothing left to do; like any unknown option it is now ignored.
+- **`lsps2.buy` and `lsps2.get_info` from an outside peer (the BOLT #8 listener) are always refused**, and LSPS replies to outside peers are sent over the peer's encrypted transport.
+- **A client that does not accept JIT offers now says so.** New wire message `JIT_REJECT` (`0x90`); the LSP stops waiting as soon as it arrives. Messages a client sends while an offer is pending are handled afterwards instead of being dropped.
+- **A JIT channel is kept across a rotation**, by the LSP and by the client, unless the cooperative close the LSP broadcast for it has the close depth (`--close-confs`) and its funding output is spent. Before, both sides deleted their record of it, and its watch entries, whatever had happened on chain. `JIT_MIGRATE` now names that close. The client no longer removes its factory channel's watchtower entries when it is told a JIT channel was migrated.
+- JIT channels opened earlier are still loaded at start-up and closed at rotation whether or not the flag is given.
+
+### Unilateral exit from large factories
+
+- **Force-close no longer stops at 128 tree transactions.** `superscalar_client --force-close`, the `recoverfactory` RPC and `listfactories` read at most the first 128 tree nodes of a factory. A client whose path to its leaf contained a node with index 128 or higher (factories from about 33 one-client leaves or 65 two-client leaves upwards) never published that part of its path, reported no error, and its commitment could not confirm. The tree is now loaded in full whatever its size.
+- **An incomplete tree is an error.** If the stored tree has missing nodes, a parent that is not in the tree, or a node on the path without a signed transaction, force-close and `recoverfactory` fail with the reason, and an exit path with such a hole broadcasts nothing. `listfactories` reports it as `tree_error`.
+- **`superscalar_client --force-close` publishes only the client's own path** (factory root to its leaf) instead of every tree transaction it has, then its commitment.
+- **`--force-close` exit status says how far the exit got:** `0` = the commitment is in the mempool or a block (so the whole path is out), `2` = run it again after the next block, `3` = stuck: a transaction was refused for a reason waiting will not cure (fee below the node's floor, input spent by another transaction), with the reason printed, `1` = the exit cannot be completed from this DB (incomplete tree, no signed commitment, or the leaf the commitment spends is not stored). Before, it always exited `0`.
+- `recoverfactory` returns an error instead of `broadcasts_made: false` when it cannot run, and reports `published`, `n_tree_nodes`, `n_confirmed`, `n_in_mempool`, `n_waiting` and `n_rejected`.
+- `sweepfactory` considers every output of a leaf transaction; it used to look at the first 8 only.
+- `--force-close` and `--sweep-to-local` load the commitment, and `--force-close` the distribution transaction, at their stored size instead of into 4 kB and 8 kB buffers.
+- **A client can exit after a leaf advance.** An advance replaces the client's leaf in its DB while its channel and commitments keep spending the old leaf's output. `--force-close` used to publish the replacement, which spends that same output (for a pseudo-Spilman leaf chain[1] spends chain[0]:0; for a DW leaf the newer state spends the same parent output), so the client's own exit made its commitment unspendable while every pass reported `COMPLETE`. The client now keeps the leaf its channel is funded by (table `client_funding_leaf`) when an advance is proposed, the exit leaf is the transaction the stored commitment spends, and the exit publishes the kept copy instead of the current row. Without a kept copy it publishes nothing and exits `1`. DBs written before this change hold no kept copy.
+- **Refusals are told apart from waits.** A tree transaction behind a height lock (nLockTime) that has not passed is not offered and counts as waiting. One refused although its parent is deep enough and its lock has passed is reported with the reason (input spent by another transaction, or refused although its input is unspent: fee below the node's floor or policy), and `--force-close` exits `3`. A commitment counts as published when an output of it is in the UTXO set, so a node without a transaction index that no longer sees an old commitment does not report the exit as in progress forever.
+- **A fully published factory is now marked `closed`.** Recovery looked for tree nodes of a type that is never stored, so it never found a leaf and never closed a factory. A leaf is now a state node that no other node spends; once all of them are confirmed at the funding depth, the start-up scan and a whole-tree `recoverfactory` mark the factory `closed`, and `listfactories` reports real `n_leaf` / `n_leaf_confirmed` counts. `closed` means the tree is on chain; the channel outputs of its leaves may still be unspent, so it is not a signal that every client has been paid out.
+- The `signer_indices` and `output_amounts` columns of a stored tree node are written in full; they were cut at 127 and 255 characters (about 45 signers).
+
+### Key handling and start-up safety
+
+Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a refusal, so existing start-up scripts may need adjusting.
+
+**Keyfiles**
+
+- **An existing keyfile that cannot be loaded is now an error.** With a wrong or missing `--passphrase`, or a damaged file, `superscalar_lsp` and `superscalar_client` exit and leave the file untouched. Before, they generated a new key over it, destroying the old one. A key is created only when nothing exists at `--keyfile`.
+- **`--generate-mnemonic` and `--from-mnemonic` refuse an existing keyfile** instead of replacing it.
+- **Keyfiles are written atomically** (temporary file `<keyfile>.ss-partial.XXXXXX`, fsync, rename). The keyfile's directory must be writable; a `--keyfile` path that is a symbolic link can be read but is not written to.
+- **Keyfiles, backups, restored databases and restored keyfiles are created with mode `0600`.** Before, they were created with the umask default (usually world-readable).
+- **Existing keyfiles and backups with loose permissions are tightened to `0600` when read**, with a warning, if they are regular files owned by the current user with one hard link and not reached through a symbolic link. Otherwise the mode is left alone. A keyfile readable only by its group is then used with a warning; **a keyfile readable by every user is refused** with an error naming the mode. Backups are read in either case.
+- A v2 keyfile must be exactly 84 bytes, and the PBKDF2 iteration count stored in a keyfile or backup must be between 100,000 and 10,000,000.
+
+**Recovery phrases**
+
+- **`--hd-mnemonic` and `--from-mnemonic` are validated** (12/15/18/21/24 words, BIP39 English wordlist, checksum; extra whitespace ignored). An invalid phrase stops start-up with the reason. Before, a typo in `--hd-mnemonic` silently opened a different, empty wallet.
+
+**Backup and restore**
+
+- **`--restore` never overwrites.** It refuses if the database, its `-wal`, `-shm` or `-journal` file, or the keyfile already exists. Before, it truncated the live files first. It needs `--db` and `--keyfile` as destinations.
+- **`--backup` and `--restore` report failed writes** (full disk, quota) and no longer leave empty files or print `OK`. An existing backup is replaced only once the new one is complete.
+
+**Mainnet start-up gates**
+
+- **`--network bitcoin` is treated exactly as `--network mainnet`** by every gate and by the library (invoice prefix, P2P magic, `bitcoin-cli` chain flag, checkpoints). Before, it skipped most mainnet gates.
+- **`superscalar_client` refuses `--seckey` on mainnet**, as the LSP already did; use `--keyfile`.
+- **`superscalar_watchtower` requires `--i-accept-the-risk` on mainnet** (new flag), refuses test/cheat flags and environment variables there, and refuses unknown `--network` names. `tools/deploy/superscalar-watchtower.service` now passes `--wt-db` (it still passed the removed `--db`) and takes extra options from `SS_WATCHTOWER_ARGS`.
+
+**Client connection**
+
+- **`--lsp DOMAIN` no longer supplies the LSP's key.** The key in `/.well-known/lsps.json` is fetched over plain HTTP; it is shown as a hint and never pinned. `--lsp-pubkey` is required on every network except regtest, and the client exits if it differs from the advertised key.
+- The `--lsp-pubkey` requirement is checked before a keyfile is created.
+- **`--lsp DOMAIN` is refused together with `--tor-proxy` / `--tor-only`**: the lookup is a direct clearnet connection.
+
+**Tests**
+
+- `tools/test_startup_gates.sh` (run in CI) checks the start-up refusals of the three daemon binaries.
+
+### CI green on `main`
+
+- **Fixed: factory creation crashed when the factory's arrays were freed or never allocated.** `lsp_run_factory_creation` copied the participant profiles out of a NULL pointer (arrays are heap-allocated since PR #451). It crashed the initial ceremony for an LSP set up with `lsp_init()` alone, which is why the Regtest Integration job segfaulted at its 21st test and never ran the rest. It also crashed the creation retry after a failed ceremony, and rotation. Creation now captures and restores the factory's shape, profiles and secret mode NULL-safely, and leaves the factory usable after a failed attempt. This is the creation-side part of PR #463.
+- **Fixed: `superscalar_lsp --arity 2` (without `--static-near-root`) crashed right after funding.** It wrote the default participant profiles into factory arrays that no shape setter had allocated.
+- **Fixed: the sanitizer CI jobs never ran their tests.** `test_inproc_factory_lifecycle` did not link the sanitizer flags, and the LSan suppressions path was relative to the wrong directory. With both fixed, LSan found ~2.6 GB of leaked factory arrays in the unit suite (test code) and two library leaks: `persist_load_factory` with pre-allocated arrays, and the `ladder_create_factory` failure paths.
+- **Fixed: stack overflow persisting per-leaf DW state for factories with more than 8 leaves** (`lsp_channels.c` used a fixed `leaf_states[8]`).
+- **Static analysis:** clean under cppcheck 2.13 (ubuntu-24.04) and 2.19 (ubuntu-26.04): allocation results are checked, arrays filled by possibly-empty loops are zero-initialised, a few library entry points reject NULL, and a duplicate NULL check is gone. The Static Analysis job is pinned to `ubuntu-24.04` so a runner-image change cannot silently change the checker.
+
+### Payments and the factory leaf
+
+- **Payments no longer advance the factory leaf:** on per-client leaves (`--arity 3` Pseudo-Spilman, the default, and `--arity 1`) the LSP re-signed the payee's and the sender's leaf after every settled client-initiated payment. The advanced leaf transaction spends (PS) or replaces (DW) the output the channel is funded by, while the channel's funding outpoint is fixed at open and no commitment is re-signed, so after the advanced leaf confirmed the client's commitment could never be broadcast (`missing-inputs`) and its balance was stranded in the 2-of-2 output. The settlement path now leaves the tree untouched.
+- **Tree advances are refused while a channel depends on the tree.** No leaf, state or sub-factory advance moves a channel onto the tree it produces, so:
+  - *LSP:* `lsp_channels_advance_ps_leaf` and `lsp_factory_tick_root` take an `allow_live_channel` argument and, unless it is set, refuse before changing any state while an open channel is funded by the leaf (whatever its balances), or by any leaf of the factory when the advance would roll over into a whole-tree state advance. Only the `--test-*` / `--cheat-*` harness paths pass the override.
+  - *Client:* `superscalar_client` refuses every leaf, state and sub-factory advance proposal with an error, before touching its tree or producing a nonce, and no longer persists a tree on another party's `LEAF_ADVANCE_DONE`. The harness-only flag `--test-allow-tree-advance` (refused on mainnet like every `--test-*` flag) restores co-signing for the ceremony tests; the harness scripts that drive those ceremonies pass it.
+- **Client and LSP exit-path leaks:** `client_run_with_channels` now releases the channel's arrays on every exit, and the LSP's recovery-mode shutdown releases the channel manager's and the ladder's contents.
+- **Tests:** `tools/test_regtest_payment_no_leaf_advance.sh` (run in CI for the default leaf type and `--arity 1`): real daemons, a payment, then a unilateral exit by the LSP, by the clients alone, and by the clients alone after refusing a proposed leaf advance; both client commitments must confirm with `to_local` equal to the balance. The script runs its own bitcoind with `minrelaytxfee`/`blockmintxfee` lowered to 500 sat/kvB, because a commitment transaction pays a fixed 154 sat for 167 vB, below the default relay floor; the fee itself is not changed here. Unit tests: `test_payment_leaves_leaf_untouched_arity_ps` / `_arity1`, `test_client_refuses_tree_advances`.
 
 ## v0.2.0 — 2026-07-02
 

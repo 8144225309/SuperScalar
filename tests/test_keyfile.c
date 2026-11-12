@@ -1,9 +1,12 @@
 #include "superscalar/keyfile.h"
 #include <secp256k1.h>
+#include <openssl/evp.h>
 #include <secp256k1_extrakeys.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -279,5 +282,461 @@ int test_keyfile_from_seed(void) {
     unlink(path1);
     unlink(path2);
     unlink(path3);
+    return 1;
+}
+
+/* Mode bits of a file, or -1 if it cannot be stat'ed. */
+static int file_mode(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int)(st.st_mode & 07777);
+}
+
+/* The keyfile holds the node's secret key: it must be owner-only whatever the
+   umask is, and whatever mode a file already at that path had. */
+int test_keyfile_created_owner_only(void) {
+    const char *path = "/tmp/test_keyfile_mode.key";
+    unlink(path);
+
+    unsigned char seckey[32];
+    memset(seckey, 0x42, 32);
+
+    mode_t old_umask = umask(0);
+    int saved = keyfile_save(path, seckey, "pass");
+    int mode_fresh = file_mode(path);
+
+    /* A permissive file already at the path must not keep its mode. */
+    int chmod_ok = (chmod(path, 0644) == 0);
+    int resaved = keyfile_save(path, seckey, "pass");
+    int mode_resaved = file_mode(path);
+    umask(old_umask);
+
+    TEST_ASSERT(saved, "keyfile_save");
+    TEST_ASSERT_EQ(mode_fresh, 0600, "new keyfile mode");
+    TEST_ASSERT(chmod_ok, "chmod 0644");
+    TEST_ASSERT(resaved, "keyfile_save over existing file");
+    TEST_ASSERT_EQ(mode_resaved, 0600, "rewritten keyfile mode");
+
+    unlink(path);
+    return 1;
+}
+
+/* Read a whole (small) file; returns its length, or -1 if it cannot be read. */
+static long slurp(const char *path, unsigned char *buf, size_t max) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    size_t n = fread(buf, 1, max, fp);
+    fclose(fp);
+    return (long)n;
+}
+
+static int spit(const char *path, const unsigned char *buf, size_t len) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return 0;
+    size_t n = fwrite(buf, 1, len, fp);
+    return fclose(fp) == 0 && n == len;
+}
+
+/* No file at the path: a key is created; the next start loads that same key. */
+int test_keyfile_load_or_generate_new_path(void) {
+    const char *path = "/tmp/test_keyfile_open_new.key";
+    unlink(path);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char first[32], second[32];
+    TEST_ASSERT_EQ(keyfile_load_or_generate(path, first, "pw", ctx),
+                   KEYFILE_OPEN_GENERATED, "first start creates the key");
+    TEST_ASSERT(keyfile_exists(path), "keyfile exists after creation");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(path, second, "pw", ctx),
+                   KEYFILE_OPEN_LOADED, "second start loads the key");
+    TEST_ASSERT(memcmp(first, second, 32) == 0, "same key on both starts");
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* A wrong (or empty) passphrase must fail the start-up and must not cost the
+   operator the key that is in the file. */
+int test_keyfile_wrong_passphrase_keeps_file(void) {
+    const char *path = "/tmp/test_keyfile_open_wrongpw.key";
+    unlink(path);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char original[32];
+    TEST_ASSERT(keyfile_generate(path, original, "right-pass", ctx), "generate");
+
+    unsigned char before[128], after[128];
+    long before_len = slurp(path, before, sizeof(before));
+    TEST_ASSERT_EQ(before_len, KEYFILE_SIZE_V2, "keyfile size");
+
+    static const char *const wrong[] = { "wrong-pass", "" };
+    for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); i++) {
+        unsigned char out[32];
+        TEST_ASSERT_EQ(keyfile_load_or_generate(path, out, wrong[i], ctx),
+                       KEYFILE_OPEN_LOAD_FAILED, "wrong passphrase is an error");
+        long after_len = slurp(path, after, sizeof(after));
+        TEST_ASSERT_EQ(after_len, before_len, "keyfile length unchanged");
+        TEST_ASSERT(memcmp(before, after, (size_t)before_len) == 0,
+                    "keyfile bytes unchanged");
+    }
+
+    unsigned char reloaded[32];
+    TEST_ASSERT(keyfile_load(path, reloaded, "right-pass"),
+                "original key still loads with the right passphrase");
+    TEST_ASSERT(memcmp(original, reloaded, 32) == 0, "original key intact");
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* A file that is not a loadable keyfile (truncated, garbage, empty) is left
+   exactly as it is: it may be the only remaining copy of a damaged key. */
+int test_keyfile_corrupt_file_kept(void) {
+    const char *path = "/tmp/test_keyfile_open_corrupt.key";
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char garbage[40];
+    memset(garbage, 0x5A, sizeof(garbage));
+    static const size_t lens[] = { sizeof(garbage), 0 };
+
+    for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        unlink(path);
+        TEST_ASSERT(spit(path, garbage, lens[i]), "write unloadable file");
+
+        unsigned char out[32], after[128];
+        TEST_ASSERT_EQ(keyfile_load_or_generate(path, out, "pw", ctx),
+                       KEYFILE_OPEN_LOAD_FAILED, "unloadable file is an error");
+        long after_len = slurp(path, after, sizeof(after));
+        TEST_ASSERT_EQ(after_len, (long)lens[i], "file length unchanged");
+        TEST_ASSERT(memcmp(garbage, after, lens[i]) == 0, "file bytes unchanged");
+    }
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* The generators create key material; neither may replace an existing file. */
+int test_keyfile_generate_refuses_existing(void) {
+    const char *path = "/tmp/test_keyfile_noclobber.key";
+    unlink(path);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char original[32], out[32];
+    TEST_ASSERT(keyfile_generate(path, original, "pw", ctx), "generate");
+
+    unsigned char before[128], after[128];
+    long before_len = slurp(path, before, sizeof(before));
+    TEST_ASSERT_EQ(before_len, KEYFILE_SIZE_V2, "keyfile size");
+
+    TEST_ASSERT(!keyfile_generate(path, out, "pw", ctx),
+                "keyfile_generate refuses an existing file");
+
+    unsigned char seed[16];
+    memset(seed, 0x07, sizeof(seed));
+    TEST_ASSERT(!keyfile_generate_from_seed(path, out, "pw", seed, sizeof(seed), NULL),
+                "keyfile_generate_from_seed refuses an existing file");
+
+    TEST_ASSERT_EQ(slurp(path, after, sizeof(after)), before_len, "length unchanged");
+    TEST_ASSERT(memcmp(before, after, (size_t)before_len) == 0, "bytes unchanged");
+
+    secp256k1_context_destroy(ctx);
+    unlink(path);
+    return 1;
+}
+
+/* keyfile_save replaces the file in one step and leaves no temporary file
+   behind, on success or on failure. */
+int test_keyfile_save_replaces_atomically(void) {
+    const char *dir = "/tmp/test_keyfile_atomic.d";
+    const char *path = "/tmp/test_keyfile_atomic.d/node.key";
+    unlink(path);
+    rmdir(dir);
+    TEST_ASSERT(mkdir(dir, 0700) == 0, "mkdir");
+
+    unsigned char key_a[32], key_b[32], loaded[32];
+    memset(key_a, 0x11, 32);
+    memset(key_b, 0x22, 32);
+
+    TEST_ASSERT(keyfile_save(path, key_a, "pw"), "first save");
+    struct stat st_a, st_b;
+    TEST_ASSERT(stat(path, &st_a) == 0, "stat first");
+
+    TEST_ASSERT(keyfile_save(path, key_b, "pw"), "second save");
+    TEST_ASSERT(stat(path, &st_b) == 0, "stat second");
+    /* Replaced by rename of a complete new file, not rewritten in place. */
+    TEST_ASSERT(st_a.st_ino != st_b.st_ino, "file replaced, not truncated");
+    TEST_ASSERT(keyfile_load(path, loaded, "pw"), "load after replace");
+    TEST_ASSERT(memcmp(loaded, key_b, 32) == 0, "new key stored");
+
+    /* The path is a directory: the save fails and nothing is left behind. */
+    TEST_ASSERT(!keyfile_save(dir, key_a, "pw"), "save onto a directory fails");
+
+    int entries = 0;
+    DIR *d = opendir(dir);
+    TEST_ASSERT(d != NULL, "opendir");
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+            entries++;
+    }
+    closedir(d);
+    TEST_ASSERT_EQ(entries, 1, "only the keyfile is in its directory");
+
+    d = opendir("/tmp");
+    TEST_ASSERT(d != NULL, "opendir /tmp");
+    int stray = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "test_keyfile_atomic.d.", 22) == 0)
+            stray++;
+    }
+    closedir(d);
+    TEST_ASSERT_EQ(stray, 0, "no temporary file left after a failed save");
+
+    unlink(path);
+    rmdir(dir);
+    return 1;
+}
+
+/* A keyfile path that is a symbolic link is never written through: saving
+   over the link and generating at it both fail, and the link's target is
+   neither replaced nor created.  Reading a key through a link is fine. */
+int test_keyfile_symlink_path(void) {
+    const char *target = "/tmp/test_keyfile_symlink_target.key";
+    const char *link_path = "/tmp/test_keyfile_symlink.key";
+    const char *dangling = "/tmp/test_keyfile_symlink_dangling.key";
+    const char *missing = "/tmp/test_keyfile_symlink_missing.key";
+    unlink(target);
+    unlink(link_path);
+    unlink(dangling);
+    unlink(missing);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char key_a[32], key_b[32], out[32];
+    memset(key_a, 0x31, 32);
+    memset(key_b, 0x32, 32);
+    TEST_ASSERT(keyfile_save(target, key_a, "pw"), "save target");
+    TEST_ASSERT(symlink(target, link_path) == 0, "symlink");
+    TEST_ASSERT(symlink(missing, dangling) == 0, "dangling symlink");
+
+    unsigned char before[128], after[128];
+    long before_len = slurp(target, before, sizeof(before));
+
+    TEST_ASSERT(keyfile_load(link_path, out, "pw"), "load through a symlink");
+    TEST_ASSERT(memcmp(out, key_a, 32) == 0, "key read through the link");
+
+    TEST_ASSERT(!keyfile_save(link_path, key_b, "pw"), "save over a symlink is refused");
+    TEST_ASSERT(!keyfile_generate(link_path, out, "pw", ctx),
+                "generate at a symlink is refused");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(link_path, out, "wrong", ctx),
+                   KEYFILE_OPEN_LOAD_FAILED, "unloadable key behind a symlink is an error");
+    TEST_ASSERT_EQ(slurp(target, after, sizeof(after)), before_len, "target length unchanged");
+    TEST_ASSERT(memcmp(before, after, (size_t)before_len) == 0, "target bytes unchanged");
+
+    /* A dangling link is something at the path, so no key is generated, and
+       nothing is created where the link points. */
+    TEST_ASSERT(keyfile_exists(dangling), "a dangling link counts as existing");
+    TEST_ASSERT(!keyfile_save(dangling, key_b, "pw"), "save over a dangling link is refused");
+    TEST_ASSERT(!keyfile_generate(dangling, out, "pw", ctx),
+                "generate at a dangling link is refused");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(dangling, out, "pw", ctx),
+                   KEYFILE_OPEN_LOAD_FAILED, "a dangling link is an error, not a new key");
+    struct stat st;
+    TEST_ASSERT(lstat(missing, &st) != 0, "nothing created at the link target");
+    TEST_ASSERT(lstat(dangling, &st) == 0 && S_ISLNK(st.st_mode), "link still a link");
+    TEST_ASSERT(lstat(link_path, &st) == 0 && S_ISLNK(st.st_mode), "link still a link");
+
+    secp256k1_context_destroy(ctx);
+    unlink(target);
+    unlink(link_path);
+    unlink(dangling);
+    return 1;
+}
+
+/* A keyfile left group- or world-readable (written by an older build, or
+   copied carelessly) is tightened to 0600 when it is loaded. */
+int test_keyfile_load_tightens_mode(void) {
+    const char *path = "/tmp/test_keyfile_loose.key";
+    unlink(path);
+
+    unsigned char key[32], out[32];
+    memset(key, 0x51, 32);
+    TEST_ASSERT(keyfile_save(path, key, "pw"), "save");
+
+    static const int loose_modes[] = { 0644, 0640, 0666 };
+    for (size_t i = 0; i < sizeof(loose_modes) / sizeof(loose_modes[0]); i++) {
+        TEST_ASSERT(chmod(path, (mode_t)loose_modes[i]) == 0, "loosen");
+        TEST_ASSERT(keyfile_load(path, out, "pw"), "load");
+        TEST_ASSERT(memcmp(out, key, 32) == 0, "key loaded");
+        TEST_ASSERT_EQ(file_mode(path), 0600, "keyfile tightened on load");
+    }
+
+    /* Also when the passphrase is wrong: the file is exposed either way. */
+    TEST_ASSERT(chmod(path, 0644) == 0, "loosen");
+    TEST_ASSERT(!keyfile_load(path, out, "wrong"), "wrong passphrase");
+    TEST_ASSERT_EQ(file_mode(path), 0600, "keyfile tightened on a failed load");
+
+    /* Only a regular file is a keyfile. */
+    TEST_ASSERT(!keyfile_load("/tmp", out, "pw"), "a directory is not loaded");
+
+    unlink(path);
+    return 1;
+}
+
+/* A keyfile whose mode is not ours to change keeps its mode.  If only its
+   group can read it, it is used; if every user can read it, it is refused
+   with its own result, not reported as a wrong passphrase. */
+int test_keyfile_mode_not_ours_to_change(void) {
+    const char *target = "/tmp/test_keyfile_shared_target.key";
+    const char *link_path = "/tmp/test_keyfile_shared_link.key";
+    const char *hard = "/tmp/test_keyfile_shared_hard.key";
+    const char *not_a_key = "/tmp/test_keyfile_shared_other.bin";
+    unlink(target);
+    unlink(link_path);
+    unlink(hard);
+    unlink(not_a_key);
+
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char key[32], out[32];
+    memset(key, 0x61, 32);
+    TEST_ASSERT(keyfile_save(target, key, "pw"), "save");
+    TEST_ASSERT(symlink(target, link_path) == 0, "symlink");
+
+    /* Through a link, group-readable: used, mode kept. */
+    TEST_ASSERT(chmod(target, 0640) == 0, "group-readable");
+    memset(out, 0, 32);
+    TEST_ASSERT_EQ(keyfile_load_or_generate(link_path, out, "pw", ctx),
+                   KEYFILE_OPEN_LOADED, "group-readable key behind a link is used");
+    TEST_ASSERT(memcmp(out, key, 32) == 0, "key loaded");
+    TEST_ASSERT_EQ(file_mode(target), 0640, "mode behind a link kept");
+
+    /* Through a link, world-readable: refused as such, mode kept. */
+    TEST_ASSERT(chmod(target, 0644) == 0, "world-readable");
+    memset(out, 0, 32);
+    TEST_ASSERT_EQ(keyfile_load_or_generate(link_path, out, "pw", ctx),
+                   KEYFILE_OPEN_INSECURE_MODE, "world-readable key behind a link is refused");
+    TEST_ASSERT(!keyfile_load(link_path, out, "pw"), "keyfile_load refuses it too");
+    static const unsigned char zero[32] = { 0 };
+    TEST_ASSERT(memcmp(out, zero, 32) == 0, "no key material returned");
+    TEST_ASSERT_EQ(file_mode(target), 0644, "mode behind a link kept");
+
+    /* A second hard link: same rules. */
+    TEST_ASSERT(link(target, hard) == 0, "hard link");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                   KEYFILE_OPEN_INSECURE_MODE, "world-readable hard-linked key is refused");
+    TEST_ASSERT_EQ(file_mode(target), 0644, "hard-linked file kept");
+    TEST_ASSERT(chmod(target, 0640) == 0, "group-readable");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                   KEYFILE_OPEN_LOADED, "group-readable hard-linked key is used");
+    TEST_ASSERT_EQ(file_mode(target), 0640, "hard-linked file kept");
+    TEST_ASSERT(unlink(hard) == 0, "remove hard link");
+
+    /* Owned by another user (the service-account case).  Only root can set
+       that up. */
+    if (geteuid() == 0) {
+        TEST_ASSERT(chown(target, 65534, 65534) == 0, "give the keyfile away");
+        TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                       KEYFILE_OPEN_LOADED, "another user's group-readable key is used");
+        TEST_ASSERT_EQ(file_mode(target), 0640, "another user's file kept");
+        TEST_ASSERT(chmod(target, 0644) == 0, "world-readable");
+        TEST_ASSERT_EQ(keyfile_load_or_generate(target, out, "pw", ctx),
+                       KEYFILE_OPEN_INSECURE_MODE, "another user's world-readable key is refused");
+        TEST_ASSERT_EQ(file_mode(target), 0644, "another user's file kept");
+    }
+
+    /* A file that is not a keyfile is not touched at all. */
+    unsigned char junk[200];
+    memset(junk, 0x5A, sizeof(junk));
+    TEST_ASSERT(spit(not_a_key, junk, sizeof(junk)), "unrelated file");
+    TEST_ASSERT(chmod(not_a_key, 04755) == 0, "setuid mode");
+    TEST_ASSERT_EQ(keyfile_load_or_generate(not_a_key, out, "pw", ctx),
+                   KEYFILE_OPEN_LOAD_FAILED, "an unrelated file is just not a keyfile");
+    TEST_ASSERT_EQ(file_mode(not_a_key), 04755, "unrelated file's mode kept");
+
+    secp256k1_context_destroy(ctx);
+    unlink(target);
+    unlink(link_path);
+    unlink(not_a_key);
+    return 1;
+}
+
+/* Build a v2 keyfile by hand with the given iteration count, correctly
+   encrypted under pass. */
+static int craft_keyfile(unsigned char out[KEYFILE_SIZE_V2], uint32_t iters,
+                         const unsigned char seckey[32], const char *pass) {
+    memcpy(out, KEYFILE_MAGIC, 4);
+    out[4] = (unsigned char)(iters >> 24);
+    out[5] = (unsigned char)(iters >> 16);
+    out[6] = (unsigned char)(iters >> 8);
+    out[7] = (unsigned char)iters;
+    memset(out + 8, 0x35, 16);   /* salt */
+    memset(out + 24, 0x46, 12);  /* nonce */
+
+    unsigned char enc_key[32];
+    if (PKCS5_PBKDF2_HMAC(pass, (int)strlen(pass), out + 8, 16, (int)iters,
+                          EVP_sha256(), 32, enc_key) != 1)
+        return 0;
+    return aead_encrypt(out + 36, out + 68, seckey, 32, NULL, 0, enc_key, out + 24);
+}
+
+/* Hand-made keyfiles with an iteration count outside the accepted range are
+   rejected, also when the passphrase is right; so are files with bytes
+   missing or added. */
+int test_keyfile_crafted_files_rejected(void) {
+    const char *path = "/tmp/test_keyfile_crafted.key";
+    unsigned char key[32], out[32], file[KEYFILE_SIZE_V2 + 1];
+    memset(key, 0x77, 32);
+    unlink(path);
+
+    TEST_ASSERT(craft_keyfile(file, KEYFILE_PBKDF2_MIN_ITERATIONS, key, "pw"), "craft");
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2), "write");
+    TEST_ASSERT(chmod(path, 0600) == 0, "mode");
+    TEST_ASSERT(keyfile_load(path, out, "pw"),
+                "a hand-made keyfile at the minimum iteration count loads");
+    TEST_ASSERT(memcmp(out, key, 32) == 0, "key recovered");
+
+    TEST_ASSERT(craft_keyfile(file, 1000, key, "pw"), "craft a weak keyfile");
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2), "write");
+    TEST_ASSERT(!keyfile_load(path, out, "pw"),
+                "iteration count below the minimum is refused");
+
+    static const uint32_t bad_iters[] = {
+        0, 1, KEYFILE_PBKDF2_MIN_ITERATIONS - 1, KEYFILE_PBKDF2_MAX_ITERATIONS + 1,
+        0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu
+    };
+    TEST_ASSERT(craft_keyfile(file, KEYFILE_PBKDF2_MIN_ITERATIONS, key, "pw"), "craft");
+    for (size_t i = 0; i < sizeof(bad_iters) / sizeof(bad_iters[0]); i++) {
+        file[4] = (unsigned char)(bad_iters[i] >> 24);
+        file[5] = (unsigned char)(bad_iters[i] >> 16);
+        file[6] = (unsigned char)(bad_iters[i] >> 8);
+        file[7] = (unsigned char)bad_iters[i];
+        TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2), "write");
+        TEST_ASSERT(!keyfile_load(path, out, "pw"),
+                    "out-of-range iteration count is refused");
+    }
+
+    /* One byte short, and one byte long. */
+    TEST_ASSERT(craft_keyfile(file, KEYFILE_PBKDF2_MIN_ITERATIONS, key, "pw"), "craft");
+    file[KEYFILE_SIZE_V2] = 0;
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2 - 1), "write short");
+    TEST_ASSERT(!keyfile_load(path, out, "pw"), "short keyfile is refused");
+    TEST_ASSERT(spit(path, file, KEYFILE_SIZE_V2 + 1), "write long");
+    TEST_ASSERT(!keyfile_load(path, out, "pw"), "keyfile with trailing data is refused");
+
+    unlink(path);
     return 1;
 }

@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# test_regtest_realloc.sh — happy-path leaf-realloc on regtest.
+# test_regtest_realloc.sh — clients refuse a leaf reallocation on regtest.
 #
-# Validates --test-realloc end-to-end without any adversarial overlay:
-#   1. LSP + 2 clients create a k=2 PS factory (arity=2)
-#   2. LSP drives the leaf-realloc ceremony (lsp_realloc_leaf)
-#   3. Test PASSES when "LEAF REALLOC TEST: PASS" lands in the LSP log
-#      AND no breach_detections row appears (proves the run was honest)
+# Validates --test-realloc end-to-end:
+#   1. LSP + 2 clients create an arity-2 factory
+#   2. LSP proposes a leaf reallocation (lsp_realloc_leaf) that moves L-stock
+#      toward a client's channel output
+#   3. Both clients refuse: a reallocation replaces the leaf transaction and
+#      nothing moves their channel to the new leaf output, so co-signing would
+#      cost them their unilateral exit
+#   4. Test PASSES when "LEAF REALLOC TEST: PASS" lands in the LSP log (the
+#      LSP's ceremony failed and it holds no signed replacement leaf), both
+#      client logs show the refusal, and no breach_detections row appears
 #
-# Why this exists alongside test_regtest_cheat_realloc.sh: the cheat
-# variant exercises the happy path too (the cheat fires AFTER honest
-# realloc completes), but it bundles the adversarial assertion in the
-# PASS criterion.  This script is the diagnostic-clarity version —
-# "is leaf realloc itself working" without cheat-engine noise.
-#
-# Mirrors the cheat-realloc setup (N=2, arity=2, funding 200k sats,
-# port 29958 to stay distinct).  Uses build-release per memory
-# feedback_asan_long_running.md — ASan binaries are unstable in
-# >30min RPC polling and we don't need leak coverage here.
+# N=2, arity=2, funding 200k sats, port 29958.
 #
 # Wall time: typically <60s.
 
@@ -74,7 +70,7 @@ $BCLI loadwallet ss_cheat_leaf_miner >/dev/null 2>&1 || true
 MINE_ADDR=$($BCLI -rpcwallet=ss_cheat_leaf_miner -named getnewaddress address_type=bech32m)
 $BCLI -rpcwallet=ss_cheat_leaf_miner generatetoaddress 101 "$MINE_ADDR" >/dev/null 2>&1 || true
 
-echo "=== Leaf realloc happy-path test ==="
+echo "=== Leaf realloc refusal test ==="
 echo "  build   : $BUILD_DIR"
 echo "  port    : $LSP_PORT"
 echo "  clients : $N_CLIENTS  arity=2  funding=$FUNDING_SATS sats"
@@ -82,7 +78,7 @@ echo "  tip     : $($BCLI getblockcount)"
 
 # --- LSP ---
 echo
-echo "--- LSP daemon (--demo --test-realloc; NO cheat overlay) ---"
+echo "--- LSP daemon (--demo --test-realloc) ---"
 "$LSP_BIN" \
     --network regtest \
     --port "$LSP_PORT" \
@@ -166,36 +162,45 @@ LSP_EXIT=0
 wait $LSP_PID 2>/dev/null || LSP_EXIT=$?
 echo "--- LSP exit=$LSP_EXIT ---"
 
-# --- Honest-run invariants ---
+# --- Refusal checks ---
 echo
-echo "=== Honest-run checks (no cheat overlay was set) ==="
+echo "=== Refusal checks ==="
 BREACH_ROWS=$(sqlite3 "$LSP_DB" "SELECT count(*) FROM breach_detections;" 2>/dev/null || echo "?")
-echo "  breach_detections rows : $BREACH_ROWS  (want 0 — no cheat fired)"
-# Happy-path realloc mutates leaf state but does NOT broadcast — only
-# force-close or the cheat variant produces a broadcast_log row.  Print
-# this for diagnostic visibility; do not assert on it.
-BCAST_REALLOC=$(sqlite3 "$LSP_DB" \
-    "SELECT count(*) FROM broadcast_log WHERE source LIKE '%realloc%';" \
-    2>/dev/null || echo "?")
-echo "  broadcast_log realloc  : $BCAST_REALLOC  (informational; expect 0 on happy path)"
+echo "  breach_detections rows : $BREACH_ROWS  (want 0)"
+REFUSALS=0
+for i in $(seq 0 $((N_CLIENTS - 1))); do
+    if grep -q "REFUSING leaf realloc" "$TMPDIR/client_${i}.log" 2>/dev/null; then
+        REFUSALS=$((REFUSALS + 1))
+    else
+        echo "  client $i log has no realloc refusal"
+    fi
+    if grep -q "realloc complete" "$TMPDIR/client_${i}.log" 2>/dev/null; then
+        echo "FAIL: client $i completed a leaf reallocation"
+        exit 1
+    fi
+done
+echo "  clients that refused   : $REFUSALS  (want $N_CLIENTS)"
 
 case "$VERDICT" in
     "LEAF REALLOC TEST: PASS")
-        if [ "$BREACH_ROWS" = "0" ]; then
-            echo
-            echo "=== PASS: realloc happy path validated, no spurious breach ==="
-            exit 0
-        else
+        if [ "$BREACH_ROWS" != "0" ]; then
             echo "FAIL: PASS marker present but $BREACH_ROWS breach row(s) — should be 0"
             exit 1
         fi
+        if [ "$REFUSALS" != "$N_CLIENTS" ]; then
+            echo "FAIL: PASS marker present but only $REFUSALS of $N_CLIENTS clients logged a refusal"
+            exit 1
+        fi
+        echo
+        echo "=== PASS: both clients refused the leaf reallocation ==="
+        exit 0
         ;;
     "LEAF REALLOC TEST: SKIP")
         echo "FAIL: realloc was skipped — check arity/n_clients gate"
         exit 1
         ;;
     "LEAF REALLOC TEST: FAIL")
-        echo "FAIL: realloc reported FAIL"
+        echo "FAIL: realloc test reported FAIL"
         tail -30 "$LSP_LOG"
         exit 1
         ;;

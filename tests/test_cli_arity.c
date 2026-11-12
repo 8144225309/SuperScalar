@@ -179,7 +179,7 @@ int test_cli_shape_uniform_ps_8_passes(void) {
        layer = 2 layers * 144 * 3 = 864 blocks, well under 2016. */
     char err[512] = {0};
     uint32_t ewt = 0;
-    int ok = cli_validate_shape_for_bolt2016(NULL, 0, FACTORY_ARITY_PS,
+    int ok = cli_validate_shape_for_bolt2016(NULL, 0, FACTORY_ARITY_PS, 1,
                                               8, 0, 144, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(ok, "N=8 uniform PS must pass BOLT-2016");
@@ -193,7 +193,7 @@ int test_cli_shape_binary_n128_rejected(void) {
     char err[512] = {0};
     uint32_t ewt = 0;
     factory_arity_t fa = FACTORY_ARITY_2;
-    int ok = cli_validate_shape_for_bolt2016(NULL, 0, fa,
+    int ok = cli_validate_shape_for_bolt2016(NULL, 0, fa, 1,
                                               128, 0, 144, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(!ok, "N=128 uniform arity-2 must be rejected");
@@ -213,7 +213,7 @@ int test_cli_shape_arity_2_4_n64_passes(void) {
     uint8_t arities[] = { 2, 4 };
     char err[512] = {0};
     uint32_t ewt = 0;
-    int ok = cli_validate_shape_for_bolt2016(arities, 2, FACTORY_ARITY_2,
+    int ok = cli_validate_shape_for_bolt2016(arities, 2, FACTORY_ARITY_2, 1,
                                               64, 0, 144, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(ok, "--arity 2,4 N=64 should pass (ewt=1728)");
@@ -226,7 +226,7 @@ int test_cli_shape_uniform_arity2_n64_rejected(void) {
        Exceeds BOLT 2016 — the canonical reason to use mixed arity. */
     char err[512] = {0};
     uint32_t ewt = 0;
-    int ok = cli_validate_shape_for_bolt2016(NULL, 0, FACTORY_ARITY_2,
+    int ok = cli_validate_shape_for_bolt2016(NULL, 0, FACTORY_ARITY_2, 1,
                                               64, 0, 144, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(!ok, "uniform arity-2 N=64 must be rejected");
@@ -241,7 +241,7 @@ int test_cli_shape_mixed_248_n64_passes(void) {
     uint8_t arities[] = { 2, 4, 8 };
     char err[512] = {0};
     uint32_t ewt = 0;
-    int ok = cli_validate_shape_for_bolt2016(arities, 3, FACTORY_ARITY_2,
+    int ok = cli_validate_shape_for_bolt2016(arities, 3, FACTORY_ARITY_2, 1,
                                               64, 0, 144, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(ok, "--arity 2,4,8 N=64 must pass BOLT-2016");
@@ -258,7 +258,7 @@ int test_cli_shape_mixed_248_static2_n128_passes(void) {
     uint8_t arities[] = { 2, 4, 8 };
     char err[512] = {0};
     uint32_t ewt = 0;
-    int ok = cli_validate_shape_for_bolt2016(arities, 3, FACTORY_ARITY_2,
+    int ok = cli_validate_shape_for_bolt2016(arities, 3, FACTORY_ARITY_2, 1,
                                               128, 2, 144, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(ok, "--arity 2,4,8 --static-near-root 2 N=128 must pass");
@@ -274,7 +274,7 @@ int test_cli_shape_regtest_step10_always_passes(void) {
        capped layers * 30 = 240) is well under 2016. */
     char err[512] = {0};
     uint32_t ewt = 0;
-    int ok = cli_validate_shape_for_bolt2016(NULL, 0, FACTORY_ARITY_2,
+    int ok = cli_validate_shape_for_bolt2016(NULL, 0, FACTORY_ARITY_2, 1,
                                               128, 0, 10, 4,
                                               &ewt, err, sizeof(err));
     T_ASSERT(ok, "regtest step_blocks=10 keeps budget non-binding");
@@ -322,3 +322,58 @@ int test_cli_step_floor_signet_allows_small(void) {
 }
 
 /* End-of-file public test list (referenced from test_main.c) */
+
+/* ---- factory CLTV timeout floors ---- */
+
+int test_cli_factory_cltv_floor(void) {
+    char err[512] = {0};
+    /* 4 clients, PS leaves, step 10, 4 states: ewt 60 (two DW layers of
+       30), depth bound 3 -> 9 transactions and 30 blocks of staggering */
+    uint32_t exit4 = cli_factory_exit_blocks(NULL, 0, FACTORY_ARITY_PS, 1, 4, 0, 10, 4);
+    T_ASSERT(exit4 == 99, "exit blocks of the default regtest shape");
+    T_ASSERT(cli_factory_exit_blocks(NULL, 0, FACTORY_ARITY_PS, 1, 64, 0, 10, 4) > exit4,
+             "a deeper tree needs more");
+    T_ASSERT(cli_factory_exit_blocks(NULL, 0, FACTORY_ARITY_PS, 1, 4, 0, 1, 2) < exit4,
+             "short DW delays need less");
+    /* created at 209, 60 active + 20 dying: EXPIRED from 289; exit 99+6 */
+    T_ASSERT(cli_validate_factory_cltv(209 + 106, 209, 60, 20, exit4, err, sizeof(err)),
+             "a timeout past the lifetime and the exit is accepted");
+    T_ASSERT(!cli_validate_factory_cltv(209 + 105, 209, 60, 20, exit4, err, sizeof(err)),
+             "a timeout within a member exit is refused");
+    T_ASSERT_SUBSTR(err, "--cltv-timeout 315 or later");
+    T_ASSERT(cli_validate_factory_cltv(289, 209, 60, 20, 10, err, sizeof(err)),
+             "a timeout at the EXPIRED block is accepted when the exit fits");
+    T_ASSERT(!cli_validate_factory_cltv(288, 209, 60, 20, 10, err, sizeof(err)),
+             "a timeout inside the lifetime is refused");
+    T_ASSERT_SUBSTR(err, "expires at block 289");
+    /* the trace case: 162 while the chain is at 211 */
+    T_ASSERT(!cli_validate_factory_cltv(162, 211, 20, 10, exit4, err, sizeof(err)),
+             "a timeout in the past is refused");
+    /* the automatic offset satisfies both rules */
+    uint32_t off = cli_factory_auto_cltv_offset(35, exit4);
+    T_ASSERT(off == 112, "regtest auto offset raised to the exit and tip skew");
+    T_ASSERT(cli_validate_factory_cltv(211 + off, 211, 20, 10, exit4, err, sizeof(err)),
+             "regtest auto accepted");
+    T_ASSERT(cli_factory_auto_cltv_offset(4320 + 432 + 10, exit4) == 4762,
+             "mainnet lifetime dominates");
+    T_ASSERT(!cli_validate_factory_cltv(100, 0xFFFFFFF0u, 0xFFFFFFF0u, 5, 0, err, sizeof(err)),
+             "no wrap-around");
+    return 1;
+}
+
+int test_cli_proposed_cltv_floor(void) {
+    char err[512] = {0};
+    uint32_t exit4 = cli_factory_exit_blocks(NULL, 0, FACTORY_ARITY_PS, 1, 4, 0, 10, 4);
+    T_ASSERT(cli_validate_proposed_cltv(211 + 106, 211, exit4, err, sizeof(err)),
+             "the LSP auto timeout is accepted");
+    T_ASSERT(!cli_validate_proposed_cltv(211 + 105, 211, exit4, err, sizeof(err)),
+             "a timeout within the exit plus margin is refused");
+    T_ASSERT_SUBSTR(err, "not safely in the future");
+    T_ASSERT(!cli_validate_proposed_cltv(211 + 35, 211, exit4, err, sizeof(err)),
+             "the old regtest +35 is refused for this shape");
+    T_ASSERT(!cli_validate_proposed_cltv(162, 211, exit4, err, sizeof(err)),
+             "a timeout in the past is refused");
+    T_ASSERT(cli_validate_proposed_cltv(5, 0, exit4, err, sizeof(err)),
+             "unknown tip is not judged");
+    return 1;
+}

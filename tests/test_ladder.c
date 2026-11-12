@@ -9,6 +9,12 @@
 #include <stdlib.h>
 
 #include "superscalar/sha256.h"
+
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
@@ -789,7 +795,6 @@ int test_regtest_ladder_distribution_fallback(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid, (uint32_t)found_vout,
@@ -1005,13 +1010,13 @@ int test_rotation_context_save_restore(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
 
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -1181,7 +1186,6 @@ int test_regtest_ptlc_no_coop_close(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid, (uint32_t)found_vout,
@@ -1349,7 +1353,6 @@ int test_regtest_all_offline_recovery(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid, (uint32_t)found_vout,
@@ -1621,8 +1624,10 @@ int test_ladder_restructure_fewer_clients(void) {
     online_kps[0] = client_kps[0];
     online_kps[1] = client_kps[1];
 
+    unsigned char fund_spk2[34];
+    TEST_ASSERT(test_funding_spk_from_keys(ctx, &lsp_kp, online_kps, 2, fund_spk2), "funding spk 2");
     int result_2 = ladder_create_factory(lad, online_kps, 2, 100000,
-                                          fake_txid2, 0, fund_spk, 34);
+                                          fake_txid2, 0, fund_spk2, 34);
     TEST_ASSERT(result_2, "3 participants (LSP+2) succeeds");
     TEST_ASSERT_EQ(lad->n_factories, 2, "2 factories after LSP+2");
 
@@ -2024,7 +2029,6 @@ int test_regtest_funding_double_spend_rejected(void) {
 
     /* Init factory, build tree, sign all (creates kickoff tx) */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 1, 4);
     factory_set_funding(f, fund_txid_bytes, (uint32_t)found_vout,

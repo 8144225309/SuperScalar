@@ -44,7 +44,9 @@ typedef struct {
     uint32_t current_epoch;
 } dw_counter_t;
 
-void     dw_counter_init(dw_counter_t *ctr, uint32_t n_layers,
+/* Returns false, leaving the counter unchanged, unless
+   1 <= n_layers <= DW_MAX_LAYERS. */
+bool     dw_counter_init(dw_counter_t *ctr, uint32_t n_layers,
                           uint16_t step_blocks, uint32_t states_per_layer);
 bool     dw_counter_advance(dw_counter_t *ctr);
 bool     dw_counter_is_exhausted(const dw_counter_t *ctr);

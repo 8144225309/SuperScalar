@@ -7,6 +7,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+
+/* Exit status for a configuration the bridge cannot run with.  Restarting
+   does not help, so supervisors stop on it (sysexits.h EX_CONFIG). */
+#define EXIT_BAD_CONFIG 78
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 
@@ -15,11 +22,21 @@ static void usage(const char *prog) {
             "  --lsp-host HOST       LSP host (default: 127.0.0.1)\n"
             "  --lsp-port PORT       LSP port (default: 9735)\n"
             "  --plugin-port PORT    Plugin listen port (default: 9736)\n"
+            "  --plugin-bind ADDR    IPv4 address the plugin port binds to\n"
+            "                        (default: 127.0.0.1; the plugin link is not\n"
+            "                        encrypted)\n"
+            "  --plugin-secret-file PATH\n"
+            "                        File holding the secret the CLN plugin must\n"
+            "                        present; created with mode 0600 if missing\n"
+            "                        (default: $HOME/.superscalar/bridge-plugin.secret)\n"
             "  --lsp-pubkey HEX      LSP static pubkey (33-byte hex) for NK authentication\n"
             "  --insecure-no-auth    allow UNAUTHENTICATED NN transport (MITM-exposed;\n"
             "                        testing only -- production MUST use --lsp-pubkey)\n"
             "  --tor-proxy HOST:PORT SOCKS5 proxy for Tor (default: 127.0.0.1:9050)\n"
             "  --version             Show version and exit\n"
+            "Exits with status 78 when it cannot run as configured (unknown option,\n"
+            "missing or invalid LSP key, invalid Tor proxy, unusable secret file or\n"
+            "bind address); do not restart it on that.\n"
             "  --help                Show this help\n", prog);
 }
 
@@ -27,6 +44,8 @@ int main(int argc, char *argv[]) {
     const char *lsp_host = "127.0.0.1";
     int lsp_port = 9735;
     int plugin_port = 9736;
+    const char *plugin_bind = NULL;         /* NULL = loopback */
+    const char *plugin_secret_file = NULL;  /* NULL = default under $HOME */
     const char *lsp_pubkey_hex = NULL;
     const char *tor_proxy_arg = NULL;
     int insecure_no_auth = 0;   /* #5: explicit opt-in to unauthenticated NN */
@@ -35,11 +54,13 @@ int main(int argc, char *argv[]) {
         {"lsp-host",    required_argument, 0, 'h'},
         {"lsp-port",    required_argument, 0, 'l'},
         {"plugin-port", required_argument, 0, 'p'},
+        {"plugin-bind", required_argument, 0, 'b'},
+        {"plugin-secret-file", required_argument, 0, 's'},
         {"lsp-pubkey",  required_argument, 0, 'k'},
         {"tor-proxy",   required_argument, 0, 't'},
         {"insecure-no-auth", no_argument,  0, 'I'},
         {"version",     no_argument,       0, 'v'},
-        {"help",        no_argument,       0, '?'},
+        {"help",        no_argument,       0, 'H'},
         {0, 0, 0, 0}
     };
 
@@ -49,13 +70,19 @@ int main(int argc, char *argv[]) {
         case 'h': lsp_host = optarg; break;
         case 'l': lsp_port = atoi(optarg); break;
         case 'p': plugin_port = atoi(optarg); break;
+        case 'b': plugin_bind = optarg; break;
+        case 's': plugin_secret_file = optarg; break;
         case 'k': lsp_pubkey_hex = optarg; break;
         case 't': tor_proxy_arg = optarg; break;
         case 'I': insecure_no_auth = 1; break;
         case 'v':
             printf("superscalar_bridge %s\n", SUPERSCALAR_VERSION);
             return 0;
-        default: usage(argv[0]); return 1;
+        case 'H': usage(argv[0]); return 0;
+        default:
+            /* an option the bridge does not know: a configuration error */
+            usage(argv[0]);
+            return EXIT_BAD_CONFIG;
         }
     }
 
@@ -66,7 +93,7 @@ int main(int argc, char *argv[]) {
         if (!tor_parse_proxy_arg(tor_proxy_arg, proxy_host, sizeof(proxy_host),
                                   &proxy_port)) {
             fprintf(stderr, "Error: invalid --tor-proxy format (use HOST:PORT)\n");
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         wire_set_proxy(proxy_host, proxy_port);
         printf("Bridge: Tor SOCKS5 proxy set to %s:%d\n", proxy_host, proxy_port);
@@ -74,7 +101,8 @@ int main(int argc, char *argv[]) {
 
     printf("SuperScalar Bridge Daemon\n");
     printf("  LSP: %s:%d\n", lsp_host, lsp_port);
-    printf("  Plugin port: %d\n", plugin_port);
+    printf("  Plugin port: %s:%d\n",
+           plugin_bind ? plugin_bind : BRIDGE_PLUGIN_BIND_DEFAULT, plugin_port);
 
     bridge_t br;
     bridge_init(&br);
@@ -88,13 +116,13 @@ int main(int argc, char *argv[]) {
         if (hex_decode(lsp_pubkey_hex, pk_buf, 33) != 33) {
             fprintf(stderr, "Error: --lsp-pubkey must be 33-byte compressed pubkey hex\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         secp256k1_pubkey lsp_pk;
         if (!secp256k1_ec_pubkey_parse(ctx, &lsp_pk, pk_buf, 33)) {
             fprintf(stderr, "Error: invalid --lsp-pubkey\n");
             secp256k1_context_destroy(ctx);
-            return 1;
+            return EXIT_BAD_CONFIG;
         }
         bridge_set_lsp_pubkey(&br, &lsp_pk);
         printf("Bridge: NK authentication enabled (pinned LSP pubkey)\n");
@@ -113,8 +141,48 @@ int main(int argc, char *argv[]) {
             "transport is MITM-exposed.  Pass --lsp-pubkey HEX (the LSP prints it at\n"
             "startup) for authenticated NK transport, or --insecure-no-auth to override\n"
             "for testing only.\n");
-        return 1;
+        return EXIT_BAD_CONFIG;
     }
+
+    if (plugin_bind && plugin_bind[0]) {
+        struct in_addr parsed;
+        if (inet_pton(AF_INET, plugin_bind, &parsed) != 1) {
+            fprintf(stderr, "Error: --plugin-bind '%s' is not an IPv4 address\n",
+                    plugin_bind);
+            return EXIT_BAD_CONFIG;
+        }
+    }
+
+    /* Shared secret the CLN plugin must present on the plugin port. */
+    char secret_path_buf[1024];
+    if (!plugin_secret_file) {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) {
+            fprintf(stderr, "Error: HOME is not set; pass --plugin-secret-file\n");
+            return EXIT_BAD_CONFIG;
+        }
+        snprintf(secret_path_buf, sizeof(secret_path_buf), "%s/.superscalar", home);
+        if (mkdir(secret_path_buf, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "Error: cannot create %s for the plugin secret: %s\n"
+                    "Create the directory, or name a writable file with "
+                    "--plugin-secret-file.\n",
+                    secret_path_buf, strerror(errno));
+            return EXIT_BAD_CONFIG;
+        }
+        snprintf(secret_path_buf, sizeof(secret_path_buf),
+                 "%s/.superscalar/bridge-plugin.secret", home);
+        plugin_secret_file = secret_path_buf;
+    }
+    char plugin_secret[BRIDGE_PLUGIN_SECRET_HEX_LEN + 1];
+    if (!bridge_plugin_secret_load(plugin_secret_file, plugin_secret)) {
+        fprintf(stderr, "Error: no usable plugin secret at %s\n"
+                "The file must be creatable there, or already exist as a regular "
+                "file owned by this user with mode 0600.\n",
+                plugin_secret_file);
+        return EXIT_BAD_CONFIG;
+    }
+    printf("Bridge: plugin secret file: %s\n", plugin_secret_file);
+    bridge_set_plugin_secret(&br, plugin_secret);
 
     /* Supervisor loop: restart bridge on failure with escalating backoff.
        Max 5 restarts before giving up. Backoff: 5s, 10s, 20s, 40s, 60s. */
@@ -130,6 +198,7 @@ int main(int argc, char *argv[]) {
             backoff_sec = backoff_sec * 2 > 60 ? 60 : backoff_sec * 2;
             bridge_cleanup(&br);
             bridge_init(&br);
+            bridge_set_plugin_secret(&br, plugin_secret);
             if (lsp_pubkey_set) {
                 secp256k1_context *rctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
                 secp256k1_pubkey rpk;
@@ -145,7 +214,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        if (!bridge_listen_plugin(&br, plugin_port)) {
+        if (!bridge_listen_plugin(&br, plugin_bind, plugin_port)) {
             fprintf(stderr, "Bridge: failed to listen for plugin\n");
             restart_count++;
             continue;
