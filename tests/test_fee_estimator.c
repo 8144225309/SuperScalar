@@ -281,6 +281,33 @@ int test_fee_estimator_api_parse(void)
     return 1;
 }
 
+/* An API answering absurd values (huge, negative, not numbers) cannot make
+   the estimator return more than FEE_API_MAX_SAT_PER_KVB or wrap around. */
+static const char *g_absurd_json =
+    "{\"fastestFee\":1e300,\"halfHourFee\":5000000000000000,"
+    "\"hourFee\":-4,\"economyFee\":\"x\",\"minimumFee\":0.00001}";
+
+static char *absurd_http_get(const char *url, void *ctx)
+{
+    (void)url; (void)ctx;
+    return strdup(g_absurd_json);
+}
+
+int test_fee_estimator_api_clamps_absurd(void)
+{
+    fee_estimator_api_t fe;
+    fee_estimator_api_init(&fe, "http://mock.invalid/fees", absurd_http_get, NULL);
+    ASSERT(fe.base.get_rate(&fe.base, FEE_TARGET_URGENT) == FEE_API_MAX_SAT_PER_KVB,
+           "1e300 sat/vB clamped to the maximum");
+    ASSERT(fe.base.get_rate(&fe.base, FEE_TARGET_NORMAL) == FEE_API_MAX_SAT_PER_KVB,
+           "5e15 sat/vB clamped to the maximum");
+    ASSERT(fe.base.get_rate(&fe.base, FEE_TARGET_ECONOMY) == FEE_FLOOR_SAT_PER_KVB,
+           "a non-number leaves the floor");
+    ASSERT(fe.base.get_rate(&fe.base, FEE_TARGET_MINIMUM) == FEE_FLOOR_SAT_PER_KVB,
+           "a tiny rate is raised to the floor");
+    return 1;
+}
+
 /* -----------------------------------------------------------------------
  * Test 7: fee_estimator_api_t — cache hit within TTL; re-fetch after TTL.
  * --------------------------------------------------------------------- */

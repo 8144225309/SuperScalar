@@ -221,6 +221,11 @@ static int build_and_broadcast_state_tx(
     }
 
     char *tx_hex = (char *)malloc(signed_buf.len * 2 + 1);
+    if (!tx_hex) {
+        tx_buf_free(&unsigned_buf);
+        tx_buf_free(&signed_buf);
+        return 0;
+    }
     hex_encode(signed_buf.data, signed_buf.len, tx_hex);
 
     int ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
@@ -502,6 +507,7 @@ int test_regtest_musig_onchain(void) {
                 "finalize signed tx");
 
     char *tx_hex = (char *)malloc(signed_buf.len * 2 + 1);
+    TEST_ASSERT(tx_hex, "alloc tx hex");
     hex_encode(signed_buf.data, signed_buf.len, tx_hex);
 
     char txid_out[65];
@@ -1764,7 +1770,7 @@ int test_regtest_ps_chain_close(void) {
     TEST_ASSERT_GOTO(regtest_get_tx_output(&rt, c2_bcast_txid, 0,
                                       &final_amt, final_spk, &fsl),
                 "chain[2] channel output exists");
-    uint64_t expected_amt = initial_channel - 2 * f->fee_per_tx;
+    uint64_t expected_amt = initial_channel - 2 * factory_ps_chain_reserve(f);
     printf("  Final channel output: %lu sats  expected=%lu  P2TR=%d\n",
            (unsigned long)final_amt, (unsigned long)expected_amt, fsl == 34);
     TEST_ASSERT_GOTO(fsl == 34, "final output is P2TR");

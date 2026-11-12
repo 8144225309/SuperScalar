@@ -116,7 +116,7 @@ echo
 echo "--- LSP daemon (--demo --cheat-daemon-sub) ---"
 env $SS_ASAN_ENV "$LSP_BIN" \
     --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 \
-    --ps-subfactory-arity $PS_SUB_ARITY \
+    --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $FUNDING_SATS \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \
@@ -140,7 +140,7 @@ done
 echo
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
-    env $SS_ASAN_ENV "$CLIENT_BIN" \
+    env $SS_ASAN_ENV "$CLIENT_BIN" --test-allow-tree-advance \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --host 127.0.0.1 --port $LSP_PORT \
         --network regtest \

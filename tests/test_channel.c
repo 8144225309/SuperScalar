@@ -1,6 +1,8 @@
 #include "superscalar/channel.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
+#include "superscalar/ptlc_commit.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
 #include <stdio.h>
@@ -854,7 +856,6 @@ int test_regtest_channel_unilateral(void) {
     /* Build factory tree, then advance to max state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
 
@@ -1298,6 +1299,181 @@ int test_htlc_control_block_2leaf(void) {
     TEST_ASSERT_MEM_EQ(control_block + 33, timeout_leaf.leaf_hash, 32,
                        "sibling hash in control block");
 
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test: a commitment at rate 0 always has its anchor ---- */
+
+/* At rate 0 a commitment pays no fee: only a child on its 240-sat anchor can
+   get it mined.  It is built with the anchor whenever a balance can fund it,
+   and never built (so never signed) when neither can. */
+int test_commitment_anchor_at_rate_0(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk), "compute funding spk");
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBD, 32);
+    channel_t ch;
+    TEST_ASSERT(setup_channel_with_htlc(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                          100000, 50000, 50000,
+                                          local_funding_secret,
+                                          &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+    ch.use_cpfp_anchor = 1;
+    channel_set_commit_fee_rate(&ch, 0);
+    tx_buf_t tx;
+    tx_buf_init(&tx, 256);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "build at rate 0");
+    /* last output: the 240-sat P2A anchor; no fee: outputs = funding */
+    cpfp_tx_info_t ti;
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti), "parse");
+    TEST_ASSERT_EQ(ti.anchor_vout, (int)ti.n_outputs - 1, "anchor last");
+    TEST_ASSERT_EQ(ti.anchor_amount, ANCHOR_OUTPUT_AMOUNT, "240-sat anchor at rate 0");
+    TEST_ASSERT_EQ(ti.out_total, ch.local_amount + ch.remote_amount, "no fee at rate 0");
+
+    /* only one side can fund it: still anchored */
+    ch.local_amount = 500;
+    ch.remote_amount = 99500;
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "one side funds it");
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti) && ti.anchor_vout >= 0, "anchored");
+
+    /* exit target: a commitment without HTLC outputs takes the 6-block rate,
+       one with an HTLC output the urgent rate */
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "rebuild");
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti), "parse");
+    TEST_ASSERT_EQ(cpfp_commitment_exit_target(&ti), FEE_TARGET_NORMAL, "no HTLC: NORMAL");
+    {
+        unsigned char h[32];
+        memset(h, 0x42, 32);
+        uint64_t hid;
+        ch.local_amount = 60000;
+        ch.remote_amount = 40000;
+        TEST_ASSERT(channel_add_htlc(&ch, HTLC_OFFERED, 10000, h, 500000, &hid), "add HTLC");
+        TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "build with HTLC");
+        TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti), "parse");
+        TEST_ASSERT_EQ(cpfp_commitment_exit_target(&ti), FEE_TARGET_URGENT,
+                       "pending HTLC output: URGENT");
+        TEST_ASSERT(channel_fail_htlc(&ch, hid), "fail it back");
+    }
+
+    /* neither can: never built at rate 0 */
+    ch.local_amount = 500;
+    ch.remote_amount = 500;
+    TEST_ASSERT(!channel_build_commitment_tx(&ch, &tx, txid),
+                "an anchorless zero-fee commitment is refused");
+    /* at a non-zero rate it pays its fee and may go without the anchor */
+    channel_set_commit_fee_rate(&ch, 1000);
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "fee-paying, no anchor");
+    tx_buf_free(&tx);
+    channel_cleanup(&ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test: HTLC/PTLC outputs capped at a relayable commitment ---- */
+
+/* A commitment is TRUC, so nodes relay it only up to 10000 vB.  MAX_HTLCS
+   (483) HTLC outputs would make it about 21 kvB: the commitment could not be
+   broadcast, and a member could make the other party's exit unrelayable by
+   filling the channel with small HTLCs.  Adds stop at the most outputs that
+   fit; the largest commitment fits; the builder refuses anything above. */
+int test_htlc_count_capped_at_relay_limit(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk), "compute funding spk");
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBC, 32);
+
+    size_t max = channel_max_commit_htlc_outputs();
+    TEST_ASSERT(max < MAX_HTLCS, "the relay limit binds below MAX_HTLCS");
+    TEST_ASSERT(fee_keypath_tx_vsize(1, 2 + max, 1) <= CHANNEL_MAX_COMMIT_VSIZE,
+                "max outputs fit");
+    TEST_ASSERT(fee_keypath_tx_vsize(1, 2 + max + 1, 1) > CHANNEL_MAX_COMMIT_VSIZE,
+                "one more does not");
+    TEST_ASSERT_EQ(max, 228, "228 HTLC/PTLC outputs");
+
+    channel_t ch;
+    TEST_ASSERT(setup_channel_with_htlc(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                          4000000, 2000000, 2000000,
+                                          local_funding_secret,
+                                          &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+    ch.fee_rate_sat_per_kvb = 1000;
+
+    /* Fill from both sides, half offered and half received. */
+    size_t n = 0;
+    for (;;) {
+        unsigned char h[32];
+        memset(h, 0, 32);
+        h[0] = (unsigned char)(n & 0xff);
+        h[1] = (unsigned char)(n >> 8);
+        uint64_t id;
+        htlc_direction_t dir = (n % 2) ? HTLC_RECEIVED : HTLC_OFFERED;
+        if (!channel_add_htlc(&ch, dir, 1000, h, 500000, &id)) break;
+        n++;
+        TEST_ASSERT(n <= max, "no add past the cap");
+    }
+    TEST_ASSERT_EQ(n, max, "adds stop exactly at the cap");
+    TEST_ASSERT_EQ(channel_commit_htlc_outputs(&ch), max, "outputs counted");
+
+    /* The refused add changed nothing. */
+    uint64_t local_before = ch.local_amount, remote_before = ch.remote_amount;
+    size_t n_before = ch.n_htlcs;
+    unsigned char h2[32];
+    memset(h2, 0xEE, 32);
+    uint64_t id2;
+    TEST_ASSERT(!channel_add_htlc(&ch, HTLC_OFFERED, 5000, h2, 500000, &id2),
+                "add past the cap refused");
+    TEST_ASSERT_EQ(ch.local_amount, local_before, "local balance untouched");
+    TEST_ASSERT_EQ(ch.remote_amount, remote_before, "remote balance untouched");
+    TEST_ASSERT_EQ(ch.n_htlcs, n_before, "no HTLC added");
+
+    /* A non-dust PTLC counts too; a zero-amount one (no output) does not. */
+    int ptlc_was = ptlc_safety_is_enabled();
+    ptlc_safety_set_enabled(1);
+    uint64_t pid;
+    TEST_ASSERT(!channel_add_ptlc(&ch, PTLC_OFFERED, 5000, NULL, 500000, &pid),
+                "non-dust PTLC past the cap refused");
+    TEST_ASSERT(channel_add_ptlc(&ch, PTLC_OFFERED, 0, NULL, 500000, &pid),
+                "zero-amount PTLC is no output: accepted");
+    ptlc_safety_set_enabled(ptlc_was);
+
+    /* The largest commitment stays within the limit.  (The remote view goes
+       through the same builder, channel_build_commitment_tx_impl.) */
+    tx_buf_t tx;
+    tx_buf_init(&tx, 256);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "build max commitment");
+    size_t vsize = (4 * tx.len + 2 + 66 + 3) / 4;   /* + one key-path signature */
+    printf("  %zu HTLC outputs: commitment %zu vB (limit %d)\n", max, vsize,
+           CHANNEL_MAX_COMMIT_VSIZE);
+    TEST_ASSERT(vsize <= CHANNEL_MAX_COMMIT_VSIZE, "max commitment relayable");
+
+    /* One output more, however it got there, is never built. */
+    if (ch.n_htlcs >= ch.htlcs_cap) {
+        htlc_t *g = realloc(ch.htlcs, (ch.htlcs_cap + 1) * sizeof(htlc_t));
+        TEST_ASSERT(g, "grow");
+        ch.htlcs = g;
+        ch.htlcs_cap++;
+    }
+    ch.htlcs[ch.n_htlcs] = ch.htlcs[0];
+    ch.htlcs[ch.n_htlcs].id = 999999;
+    ch.n_htlcs++;
+    TEST_ASSERT(!channel_build_commitment_tx(&ch, &tx, txid),
+                "commitment above the limit refused");
+
+    tx_buf_free(&tx);
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }
@@ -2468,7 +2644,6 @@ int test_regtest_channel_coop_close(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -2824,10 +2999,15 @@ int test_htlc_max_count_enforcement(void) {
                                           &local_fund_pk, &remote_fund_pk),
                 "setup channel");
 
-    /* Add MAX_HTLCS HTLCs */
-    for (int i = 0; i < MAX_HTLCS; i++) {
+    /* Every HTLC is at least dust, so each is a commitment output and the
+       binding limit is the most outputs a relayable commitment carries,
+       below MAX_HTLCS. */
+    int max = (int)channel_max_commit_htlc_outputs();
+    TEST_ASSERT(max > 0 && max < MAX_HTLCS, "commitment output limit below MAX_HTLCS");
+    for (int i = 0; i < max; i++) {
         unsigned char pre[32];
         memset(pre, (unsigned char)(i + 1), 32);
+        pre[1] = (unsigned char)(i >> 8);
         unsigned char ph[32];
         sha256(pre, 32, ph);
         uint64_t id;
@@ -2835,15 +3015,15 @@ int test_htlc_max_count_enforcement(void) {
                                        (uint32_t)(500000 + i), &id),
                     "add htlc within limit");
     }
-    TEST_ASSERT_EQ(ch.n_htlcs, MAX_HTLCS, "n_htlcs at max");
+    TEST_ASSERT_EQ(ch.n_htlcs, (size_t)max, "n_htlcs at max");
 
-    /* 17th HTLC must be rejected */
+    /* One more must be rejected */
     unsigned char overflow_pre[32] = { [0 ... 31] = 0xFF };
     unsigned char overflow_ph[32];
     sha256(overflow_pre, 32, overflow_ph);
     TEST_ASSERT(!channel_add_htlc(&ch, HTLC_OFFERED, 1000, overflow_ph,
                                     600000, NULL),
-                "HTLC beyond MAX_HTLCS rejected");
+                "HTLC beyond the commitment output limit rejected");
 
     secp256k1_context_destroy(ctx);
     channel_cleanup(&ch);
@@ -2947,7 +3127,6 @@ int test_factory_advance_past_exhaustion(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, keypairs, 5, 10, 4);
 
@@ -2958,6 +3137,7 @@ int test_factory_advance_past_exhaustion(void) {
     memset(fake_txid, 0xAA, 32);
     unsigned char fund_spk[34] = {0x51, 0x20};
     memset(fund_spk + 2, 0xCC, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
     f->cltv_timeout = 200;
 
@@ -3065,7 +3245,6 @@ int test_regtest_channel_penalty(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -3699,7 +3878,6 @@ int test_regtest_penalty_with_htlcs(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 

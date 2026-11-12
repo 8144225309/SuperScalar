@@ -10,6 +10,9 @@
 
 #define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
 #define MAX_HTLCS 483              /* BOLT #2 maximum */
+/* Largest commitment transaction nodes relay: commitments are TRUC
+   (nVersion 3), and BIP 431 limits a TRUC transaction to 10000 vB. */
+#define CHANNEL_MAX_COMMIT_VSIZE 10000
 #define DEFAULT_HTLCS_CAP 64      /* initial allocation for dynamic htlc arrays */
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
@@ -121,6 +124,11 @@ typedef struct {
     /* Config */
     uint32_t to_self_delay;
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
+    /* sat/kvB the commitment pays (fee_commitment_tx_at): both co-signers
+       use it for the base fee reserved out of the funding and for each
+       HTLC/PTLC output.  A factory channel takes the factory's agreed tree
+       rate; channel_init sets 1000. */
+    uint64_t commit_fee_rate_sat_per_kvb;
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
     int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
@@ -200,6 +208,12 @@ typedef struct {
        without the LSP's cooperation. */
     unsigned char latest_commitment_sig[64];
     int           has_latest_commitment_sig;
+
+    /* The HTLC this side offered last, for as long as no commitment that
+       contains it has been accepted from the peer.  Only such an HTLC can be
+       taken back by channel_rollback_htlc. */
+    int           has_unsigned_offer;
+    uint64_t      unsigned_offer_id;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
@@ -389,6 +403,9 @@ int channel_build_penalty_tx_script_path(const channel_t *ch,
    Default is 1000 sat/kvB (1 sat/vB). */
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb);
 
+/* Set the rate the commitment pays (commit_fee_rate_sat_per_kvb). */
+void channel_set_commit_fee_rate(channel_t *ch, uint64_t sat_per_kvb);
+
 /* Attach a persistence target for revocation secrets.  After this is set,
    channel_receive_revocation_flat() writes each received secret to the
    revocation_secrets table under the given channel_id.  db is a persist_t*
@@ -458,6 +475,18 @@ void channel_set_remote_htlc_basepoint(channel_t *ch,
 
 /* --- HTLC operations --- */
 
+/* Most HTLC and PTLC outputs one commitment can carry within
+   CHANNEL_MAX_COMMIT_VSIZE: the largest n for which a commitment with one
+   key-path input, to_local, to_remote, n P2TR HTLC/PTLC outputs and the P2A
+   anchor fits (228).  Below MAX_HTLCS, so it is the binding limit. */
+size_t channel_max_commit_htlc_outputs(void);
+
+/* Outputs ch's commitment carries for HTLCs and PTLCs: the active ones at
+   or above the dust limit. */
+size_t channel_commit_htlc_outputs(const channel_t *ch);
+
+/* Refuses (returns 0, nothing changed) an HTLC that would take the
+   commitment past channel_max_commit_htlc_outputs(). */
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out);
@@ -469,6 +498,13 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id);
 
 /* Fail all HTLCs whose cltv_expiry <= current_height. Returns count failed. */
 int channel_check_htlc_timeouts(channel_t *ch, uint32_t current_height);
+
+/* Undo channel_add_htlc for an HTLC the peer refused before taking it: the
+   amount and fee go back, the HTLC is removed and the commitment number and
+   HTLC id counter return to what they were, as if it had never been added.
+   Only the most recently added HTLC can be rolled back, and only while it
+   is the latest change to the channel.  Returns 1 on success. */
+int channel_rollback_htlc(channel_t *ch, uint64_t htlc_id);
 
 /* --- HTLC resolution transactions --- */
 

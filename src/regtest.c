@@ -1,4 +1,5 @@
 #include "superscalar/regtest.h"
+#include "superscalar/network.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -192,7 +193,7 @@ static void build_cli_prefix(const regtest_t *rt, char *buf, size_t buf_len) {
         return;
     }
 
-    if (strcmp(rt->network, "mainnet") == 0) {
+    if (network_is_mainnet(rt->network)) {
         snprintf(buf, buf_len,
             "%s -rpcuser=%s -rpcpassword=%s",
             rt->cli_path, rt->rpcuser, rt->rpcpassword);
@@ -295,7 +296,7 @@ static char **build_argv(const regtest_t *rt, const char *method,
 
     args[n++] = strdup(rt->cli_path);
 
-    if (strcmp(rt->network, "mainnet") != 0) {
+    if (!network_is_mainnet(rt->network)) {
         char net_flag[32];
         snprintf(net_flag, sizeof(net_flag), "-%s", rt->network);
         args[n++] = strdup(net_flag);
@@ -1142,6 +1143,7 @@ int regtest_mine_for_balance(regtest_t *rt, double min_btc, const char *address)
 }
 
 int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
+    if (!rt || !tx_hex) return 0;
     char *params = (char *)malloc(strlen(tx_hex) + 4);
     if (!params) return 0;
     snprintf(params, strlen(tx_hex) + 4, "\"%s\"", tx_hex);
@@ -1286,6 +1288,14 @@ static int regtest_get_confirmations_inner(regtest_t *rt, const char *txid) {
     return -1;
 }
 #undef REGTEST_CONF_RETURN_IF_UNREACHABLE
+
+char *regtest_exec_quiet(const regtest_t *rt, const char *method, const char *params) {
+    int prev = g_regtest_poll_quiet;
+    g_regtest_poll_quiet = 1;
+    char *r = regtest_exec(rt, method, params);
+    g_regtest_poll_quiet = prev;
+    return r;
+}
 
 int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     /* Poll-loop quiet scope: suppress -5/-19 noise. Task #200. */
@@ -1561,6 +1571,21 @@ int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
     return 0;
 }
 
+int regtest_parse_gettxout(const char *result) {
+    if (!result) return -1;
+    const char *end = NULL;
+    cJSON *j = cJSON_ParseWithOpts(result, &end, 1);
+    if (!j) return -1;
+    int r = -1;
+    if (cJSON_IsNull(j))
+        r = 0;
+    else if (cJSON_IsObject(j) && cJSON_GetObjectItem(j, "value") &&
+             cJSON_GetObjectItem(j, "scriptPubKey"))
+        r = 1;
+    cJSON_Delete(j);
+    return r;
+}
+
 /* SF-RR #150: check outpoint unspent via bitcoin-cli gettxout. */
 int regtest_outpoint_unspent(regtest_t *rt, const char *txid_hex_display,
                               uint32_t vout) {
@@ -1570,9 +1595,27 @@ int regtest_outpoint_unspent(regtest_t *rt, const char *txid_hex_display,
              txid_hex_display, (unsigned)vout);
     char *result = regtest_exec(rt, "gettxout", params);
     if (!result) return -1;
-    int spent = (result[0] == '\0' || strncmp(result, "null", 4) == 0);
+    int r = regtest_parse_gettxout(result);
     free(result);
-    return spent ? 0 : 1;
+    return r;
+}
+
+int regtest_outpoint_spent_confirmed(regtest_t *rt,
+                                      const char *txid_hex_display,
+                                      uint32_t vout) {
+    if (!rt || !txid_hex_display) return -1;
+    int confs = regtest_get_confirmations(rt, txid_hex_display);
+    if (confs < 0) return -1;
+    if (confs == 0) return 0;
+    char params[128];
+    snprintf(params, sizeof(params), "%s %u false",
+             txid_hex_display, (unsigned)vout);
+    char *result = regtest_exec(rt, "gettxout", params);
+    if (!result) return -1;
+    int r = regtest_parse_gettxout(result);
+    free(result);
+    if (r < 0) return -1;
+    return r == 0 ? 1 : 0;
 }
 
 int regtest_get_raw_tx(regtest_t *rt, const char *txid,
@@ -1870,7 +1913,7 @@ int regtest_network_safe_confirmation_depth(const regtest_t *rt) {
     if (strcmp(rt->network, "signet") == 0)  return 3;
     if (strcmp(rt->network, "testnet4") == 0) return 3;
     if (strcmp(rt->network, "testnet") == 0)  return 3;
-    if (strcmp(rt->network, "mainnet") == 0)  return 6;
+    if (network_is_mainnet(rt->network))      return 6;
     return 6;  /* unknown network → conservative */
 }
 
@@ -1885,7 +1928,7 @@ int regtest_network_mempool_freeze_seconds(const regtest_t *rt) {
     if (strcmp(rt->network, "signet") == 0)  return 2 * 3600;
     if (strcmp(rt->network, "testnet4") == 0) return 24 * 3600;
     if (strcmp(rt->network, "testnet") == 0)  return 24 * 3600;
-    if (strcmp(rt->network, "mainnet") == 0)  return 7 * 86400;
+    if (network_is_mainnet(rt->network))      return 7 * 86400;
     return 7 * 86400;
 }
 
@@ -1989,7 +2032,9 @@ void regtest_release_utxo(regtest_t *rt, const char *txid_hex, uint32_t vout) {
     char params[160];
     snprintf(params, sizeof(params),
              "true [{\"txid\":\"%s\",\"vout\":%u}]", txid_hex, vout);
-    char *r = regtest_exec(rt, "lockunspent", params);
+    /* After a successful broadcast the wallet has already dropped the lock
+       of the now-spent coin and refuses this ("expected unspent output"). */
+    char *r = regtest_exec_quiet(rt, "lockunspent", params);
     if (r) free(r);
 }
 

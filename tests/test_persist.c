@@ -1076,7 +1076,6 @@ int test_persist_factory_round_trip(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->use_tree_anchor = 1;  /* #56: mirror production — persist_load_factory rebuilds
@@ -1086,9 +1085,11 @@ int test_persist_factory_round_trip(void) {
     fake_txid[0] = 0xDD;
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
+    factory_set_lifecycle(f, 1234, 4320, 432);
 
-    /* Save factory */
+    /* Save factory and its tree (a factory is never stored without one) */
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
 
     /* Load factory into new struct */
     factory_t *f2 = calloc(1, sizeof(factory_t));
@@ -1101,6 +1102,23 @@ int test_persist_factory_round_trip(void) {
     TEST_ASSERT_EQ(f2->step_blocks, 10, "step_blocks");
     TEST_ASSERT_EQ(f2->funding_amount_sats, 1000000, "funding_amount");
     TEST_ASSERT_EQ(f2->n_nodes, f->n_nodes, "n_nodes");
+    /* the lifecycle survives a restart: the expiry does not move */
+    TEST_ASSERT_EQ(f2->created_block, 1234, "created_block");
+    TEST_ASSERT_EQ(f2->active_blocks, 4320, "active_blocks");
+    TEST_ASSERT_EQ(f2->dying_blocks, 432, "dying_blocks");
+
+    /* the co-signed distribution TX is kept for the same factory id */
+    {
+        unsigned char dtx[120], back[120];
+        for (size_t i = 0; i < sizeof(dtx); i++) dtx[i] = (unsigned char)(i * 7 + 1);
+        size_t blen = 0;
+        TEST_ASSERT(!persist_load_distribution_tx(&db, 0, NULL, &blen, 0), "none yet");
+        TEST_ASSERT(persist_save_distribution_tx(&db, 0, dtx, sizeof(dtx)), "save dist");
+        TEST_ASSERT(persist_load_distribution_tx(&db, 0, NULL, &blen, 0), "dist length");
+        TEST_ASSERT_EQ(blen, sizeof(dtx), "dist length matches");
+        TEST_ASSERT(persist_load_distribution_tx(&db, 0, back, &blen, sizeof(back)), "load dist");
+        TEST_ASSERT(memcmp(back, dtx, sizeof(dtx)) == 0, "dist bytes match");
+    }
 
     /* Verify txids match (the tree was rebuilt, so all node txids should match) */
     for (size_t i = 0; i < f->n_nodes; i++) {
@@ -1492,11 +1510,10 @@ int test_lsp_recovery_round_trip(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;  /* Client 3 */
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
 
     /* Set funding (need valid funding for channel init) */
     musig_keyagg_t ka;
@@ -1515,7 +1532,9 @@ int test_lsp_recovery_round_trip(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    f->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels the normal way */
@@ -1551,6 +1570,7 @@ int test_lsp_recovery_round_trip(void) {
     /* Persist: factory, channels, basepoints */
     TEST_ASSERT(persist_begin(&db), "begin");
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
     for (size_t c = 0; c < 4; c++) {
         TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                            (uint32_t)c), "save channel");
@@ -1940,6 +1960,7 @@ int test_persist_validate_factory_load(void) {
     loaded = persist_load_factory(&db, 13, f, ctx);
     TEST_ASSERT(loaded == 0, "step_blocks=0 rejected");
 
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     persist_close(&db);
@@ -2009,11 +2030,10 @@ int test_persist_crash_stress(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], extra_sec4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = 200;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
 
     /* Compute funding SPK */
     musig_keyagg_t ka;
@@ -2032,7 +2052,9 @@ int test_persist_crash_stress(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    f->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels */
@@ -2063,6 +2085,7 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT(persist_open(&db, path), "c1 open");
         TEST_ASSERT(persist_begin(&db), "c1 begin");
         TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "c1 save factory");
+        TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "c1 save tree");
         for (size_t c = 0; c < 4; c++) {
             TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                                (uint32_t)c), "c1 save ch");
@@ -2366,7 +2389,7 @@ int test_persist_crash_stress(void) {
     }
 
     /* ===== Cycle 4: Extreme values ===== */
-    uint64_t commit_fee = f->fee_per_tx;
+    uint64_t commit_fee = 500;
     mgr.entries[0].channel.local_amount = 0;
     mgr.entries[0].channel.remote_amount = f->funding_amount_sats / 4 - commit_fee;
     mgr.entries[0].channel.commitment_number = 200;
@@ -2491,7 +2514,6 @@ int test_persist_crash_dw_state(void) {
     if (!secp256k1_ec_pubkey_create(ctx, &pks[4], s4)) return 0;
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
 
@@ -2517,11 +2539,11 @@ int test_persist_crash_dw_state(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c1 open");
 
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].current_state;
 
-        uint32_t leaf_states[8];
+        uint32_t leaf_states[8] = {0};
         for (int i = 0; i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
 
@@ -2594,11 +2616,11 @@ int test_persist_crash_dw_state(void) {
         persist_t db;
         TEST_ASSERT(persist_open(&db, path), "dw c2 open");
 
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].current_state;
 
-        uint32_t leaf_states[8];
+        uint32_t leaf_states[8] = {0};
         for (int i = 0; i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
 
@@ -2637,6 +2659,7 @@ int test_persist_crash_dw_state(void) {
         persist_close(&db);
     }
 
+    factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
     unlink(path);
@@ -3450,6 +3473,7 @@ int test_ptlc_commitment_output(void) {
 
     /* Build commitment tx WITHOUT PTLC */
     tx_buf_t tx1;
+    tx_buf_init(&tx1, 512);
     unsigned char txid1[32];
     int r1 = channel_build_commitment_tx(&ch, &tx1, txid1);
     TEST_ASSERT(r1, "PTLC_CO1: commitment without PTLC");
@@ -3466,6 +3490,7 @@ int test_ptlc_commitment_output(void) {
 
     /* Build commitment tx WITH PTLC */
     tx_buf_t tx2;
+    tx_buf_init(&tx2, 512);
     unsigned char txid2[32];
     int r2 = channel_build_commitment_tx(&ch, &tx2, txid2);
     TEST_ASSERT(r2, "PTLC_CO1: commitment with PTLC");
@@ -5709,3 +5734,327 @@ int test_lsp_forgery_response_parse(void) {
 }
 
 /* === End revocation verification standard tests =========================== */
+
+/* ---- HTLC origins sharing a payment hash are separate rows ---- */
+
+int test_persist_htlc_origin_rows(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+    unsigned char hash[32];
+    memset(hash, 0x5e, 32);
+
+    /* One inbound and one outbound origin for the same hash */
+    int64_t in_id = persist_insert_htlc_origin(&db, hash, 90, 0, 1, 11);
+    int64_t out_id = persist_insert_htlc_origin(&db, hash, 0, 7, 2, 22);
+    TEST_ASSERT(in_id > 0 && out_id > 0 && in_id != out_id, "two rows");
+
+    TEST_ASSERT(persist_update_htlc_origin(&db, in_id, 91, 0, 1, 12), "update one row");
+
+    unsigned char hashes[4][32];
+    uint64_t bridge[4], req[4], htlc[4];
+    size_t sender[4];
+    int64_t ids[4];
+    TEST_ASSERT_EQ(persist_load_htlc_origins_ids(&db, hashes, bridge, req, sender,
+                                                  htlc, ids, 4), 2, "both active");
+    TEST_ASSERT(ids[0] == in_id && bridge[0] == 91 && htlc[0] == 12,
+                "updated row carries the new values");
+    TEST_ASSERT(ids[1] == out_id && bridge[1] == 0 && req[1] == 7 && htlc[1] == 22,
+                "the other row is unchanged");
+
+    /* Closing the inbound row leaves the outbound one */
+    TEST_ASSERT(persist_deactivate_htlc_origin_id(&db, in_id), "close inbound row");
+    TEST_ASSERT_EQ(persist_load_htlc_origins_ids(&db, hashes, bridge, req, sender,
+                                                  htlc, ids, 4), 1, "one active");
+    TEST_ASSERT(ids[0] == out_id && req[0] == 7, "the outbound row");
+    TEST_ASSERT(!persist_deactivate_htlc_origin_id(&db, 0), "row id 0 is nobody");
+
+    persist_close(&db);
+    return 1;
+}
+
+
+/* A stored distribution TX or commitment larger than the caller's buffer:
+   the loader fails and reports no length, so the caller never hex-encodes or
+   broadcasts bytes it was not given.  A NULL buffer asks for the length. */
+int test_persist_signed_tx_loaders_never_overreport(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    size_t big = 9000;   /* a distribution TX of about 200 clients */
+    unsigned char *tx = malloc(big);
+    unsigned char *back = malloc(big);
+    TEST_ASSERT(tx && back, "alloc");
+    for (size_t i = 0; i < big; i++) tx[i] = (unsigned char)(i * 13 + 5);
+
+    TEST_ASSERT(persist_save_distribution_tx(&db, 0, tx, big), "save dist");
+    size_t len = 12345;
+    TEST_ASSERT(persist_load_distribution_tx(&db, 0, NULL, &len, 0), "length query");
+    TEST_ASSERT_EQ(len, big, "length query reports the stored size");
+    len = 12345;
+    memset(back, 0xAA, big);
+    TEST_ASSERT(!persist_load_distribution_tx(&db, 0, back, &len, 8192),
+                "a buffer too small fails");
+    TEST_ASSERT_EQ(len, 0, "no length reported for bytes not copied");
+    TEST_ASSERT(back[0] == 0xAA && back[8191] == 0xAA, "buffer untouched");
+    len = 0;
+    TEST_ASSERT(persist_load_distribution_tx(&db, 0, back, &len, big), "exact fit loads");
+    TEST_ASSERT_EQ(len, big, "full length");
+    TEST_ASSERT(memcmp(back, tx, big) == 0, "bytes match");
+
+    size_t cbig = 5000;  /* a commitment with about 110 HTLC outputs */
+    unsigned char sig[64];
+    memset(sig, 0x11, 64);
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 7, sig, tx, cbig), "save commitment");
+    uint64_t cn = 0;
+    len = 12345;
+    TEST_ASSERT(persist_load_commitment_sig(&db, 0, &cn, NULL, NULL, &len, 0),
+                "commitment length query");
+    TEST_ASSERT_EQ(len, cbig, "commitment length");
+    len = 12345;
+    memset(back, 0xAA, big);
+    TEST_ASSERT(!persist_load_commitment_sig(&db, 0, &cn, NULL, back, &len, 4096),
+                "a commitment buffer too small fails");
+    TEST_ASSERT_EQ(len, 0, "no commitment length reported for bytes not copied");
+    TEST_ASSERT(back[0] == 0xAA, "commitment buffer untouched");
+    len = 0;
+    TEST_ASSERT(persist_load_commitment_sig(&db, 0, &cn, NULL, back, &len, cbig),
+                "commitment loads into a buffer of its size");
+    TEST_ASSERT_EQ(len, cbig, "commitment length");
+    TEST_ASSERT_EQ(cn, 7, "commitment number");
+    TEST_ASSERT(memcmp(back, tx, cbig) == 0, "commitment bytes match");
+
+    free(tx);
+    free(back);
+    persist_close(&db);
+    return 1;
+}
+
+
+/* The LSP's in-process watchtower auto-settles each channel of a confirmed
+   leaf from its DB.  A commitment with many HTLC outputs is larger than
+   4096 bytes (about 90 HTLCs); it must still be broadcast whole. */
+#include "superscalar/watchtower.h"
+#include "superscalar/chain_backend.h"
+extern int watchtower_autosettle_leaf_channels(struct watchtower_s *wt,
+                                               watchtower_entry_t *e);
+static size_t g_as_hex_len;
+static int g_as_sends;
+static int as_send(chain_backend_t *self, const char *hex, char *txid_out) {
+    (void)self;
+    g_as_hex_len = strlen(hex);
+    g_as_sends++;
+    if (txid_out) { memset(txid_out, '0', 64); txid_out[64] = '\0'; }
+    return 1;
+}
+int test_autosettle_sends_large_commitment(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    size_t big = 5000;
+    unsigned char *tx = malloc(big);
+    TEST_ASSERT(tx, "alloc");
+    for (size_t i = 0; i < big; i++) tx[i] = (unsigned char)(i * 3 + 1);
+    unsigned char sig[64];
+    memset(sig, 0x22, 64);
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 3, sig, tx, big), "save");
+    chain_backend_t chain;
+    memset(&chain, 0, sizeof(chain));
+    chain.send_raw_tx = as_send;
+    watchtower_t *wt = calloc(1, sizeof(watchtower_t));
+    TEST_ASSERT(wt, "wt");
+    wt->db = &db;
+    wt->chain = &chain;
+    watchtower_entry_t e;
+    memset(&e, 0, sizeof(e));
+    uint32_t ids[1] = { 0 };
+    e.leaf_channel_ids = ids;
+    e.n_leaf_channels = 1;
+    g_as_hex_len = 0;
+    g_as_sends = 0;
+    TEST_ASSERT_EQ(watchtower_autosettle_leaf_channels(wt, &e), 1, "channel settled");
+    TEST_ASSERT_EQ(g_as_sends, 1, "one broadcast");
+    TEST_ASSERT_EQ(g_as_hex_len, big * 2, "the whole commitment broadcast");
+    free(wt);
+    free(tx);
+    persist_close(&db);
+    return 1;
+}
+
+
+/* A factory row without a tree fee rate (one written before schema v41, or
+   damaged) cannot rebuild the tree that was signed: built at the floor rate
+   instead, every tree txid would differ from the signed ones.  The loader
+   refuses it. */
+int test_persist_factory_without_tree_rate_refused(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i])) return 0;
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys[i]), "keypair");
+    factory_init(f, ctx, kps, 5, 10, 4);
+    f->use_tree_anchor = 1;
+    f->tree_fee_rate = 3000;
+    unsigned char fake_txid[32] = {0};
+    fake_txid[0] = 0xDE;
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign tree");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
+
+    factory_t *f2 = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f2, "alloc");
+    TEST_ASSERT(persist_load_factory(&db, 0, f2, ctx), "a row with its rate loads");
+    TEST_ASSERT_EQ(f2->tree_fee_rate, 3000, "rate loaded");
+    TEST_ASSERT(memcmp(f2->nodes[0].txid, f->nodes[0].txid, 32) == 0, "same tree");
+    factory_free(f2);
+
+    /* a row holding another rate (0 is a valid one) rebuilds a tree that
+       was not signed: refused (test_advanceless_reload_tree_rate loads
+       factories signed at 100 and at 0) */
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = 0 WHERE id = 0;",
+                             NULL, NULL, NULL) == SQLITE_OK, "rate 0");
+    memset(f2, 0, sizeof(*f2));
+    TEST_ASSERT(!persist_load_factory(&db, 0, f2, ctx), "a row at another rate is refused");
+    factory_free(f2);
+
+    /* what a row migrated from schema v40 holds: NULL */
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = NULL WHERE id = 0;",
+                             NULL, NULL, NULL) == SQLITE_OK, "clear the rate");
+    memset(f2, 0, sizeof(*f2));
+    TEST_ASSERT(!persist_load_factory(&db, 0, f2, ctx),
+                "a row without a tree fee rate is refused");
+    factory_free(f2);
+    free(f2);
+    factory_free(f);
+    free(f);
+    persist_close(&db);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Rotation: the pending factory record ---- */
+
+#include "superscalar/client.h"
+
+static factory_t *pending_test_factory(secp256k1_context *ctx, unsigned char txid_byte) {
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i])) return NULL;
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char ser[32], tweak[32], fund_spk[34];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey)) return NULL;
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    musig_keyagg_t kc = ka;
+    secp256k1_pubkey tw;
+    secp256k1_xonly_pubkey twx;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw, &kc.cache, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &twx, NULL, &tw)) return NULL;
+    build_p2tr_script_pubkey(fund_spk, &twx);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return NULL;
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->use_tree_anchor = 1;
+    unsigned char txid[32];
+    memset(txid, txid_byte, 32);
+    factory_set_funding(f, txid, 1, 1000000, fund_spk, 34);
+    if (!factory_build_tree(f)) { factory_free(f); free(f); return NULL; }
+    return f;
+}
+
+/* Recording the factory being entered leaves everything about the factory
+   being left in place, survives a reopen (it is the "rotation not finished"
+   marker), and is removed without touching the current factory. */
+int test_rotation_pending_record(void) {
+    secp256k1_context *ctx = test_ctx();
+    char path[96];
+    snprintf(path, sizeof(path), "/tmp/test_superscalar_rotpending_%d.db", (int)getpid());
+    unlink(path);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open");
+
+    factory_t *old_f = pending_test_factory(ctx, 0xA1);
+    factory_t *new_f = pending_test_factory(ctx, 0xB2);
+    TEST_ASSERT(old_f && new_f, "factories");
+    unsigned char sig[64], tx[80], dist[60];
+    memset(sig, 0x33, 64); memset(tx, 0x44, 80); memset(dist, 0x55, 60);
+    TEST_ASSERT(persist_save_factory(&db, old_f, ctx, 0), "old factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, old_f, 0), "old tree");
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 7, sig, tx, 80), "old commitment");
+    TEST_ASSERT(persist_save_distribution_tx(&db, 0, dist, 60), "old distribution tx");
+    TEST_ASSERT(!persist_has_factory(&db, CLIENT_ROTATION_PENDING_FACTORY_ID),
+                "no rotation pending");
+
+    /* the new factory arrives with a verified distribution transaction */
+    unsigned char ndist[70];
+    memset(ndist, 0x66, 70);
+    tx_buf_free(&new_f->dist_unsigned_tx);
+    tx_buf_init(&new_f->dist_unsigned_tx, 70);
+    memcpy(new_f->dist_unsigned_tx.data, ndist, 70);
+    new_f->dist_unsigned_tx.len = 70;
+    new_f->dist_tx_ready = 2;
+    TEST_ASSERT(client_rotation_save_pending(&db, new_f, ctx), "save pending");
+    persist_close(&db);
+
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen");
+    TEST_ASSERT(persist_has_factory(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID),
+                "pending record survives a reopen");
+    char txid_hex[65];
+    uint32_t vout = 9, cltv = 0;
+    TEST_ASSERT(persist_load_factory_outpoint(&db2, 0, txid_hex, &vout, &cltv), "old outpoint");
+    TEST_ASSERT(strncmp(txid_hex, "a1a1a1a1", 8) == 0 && vout == 1, "factory 0 is still the old factory");
+    TEST_ASSERT(persist_load_factory_outpoint(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                              txid_hex, &vout, &cltv), "pending outpoint");
+    TEST_ASSERT(strncmp(txid_hex, "b2b2b2b2", 8) == 0, "pending record is the new factory");
+    uint64_t cn = 0;
+    unsigned char got[128];
+    size_t got_len = 0;
+    TEST_ASSERT(persist_load_commitment_sig(&db2, 0, &cn, NULL, got, &got_len, sizeof(got)) &&
+                cn == 7 && got_len == 80, "old commitment untouched");
+    TEST_ASSERT(persist_load_distribution_tx(&db2, 0, got, &got_len, sizeof(got)) &&
+                got_len == 60, "old distribution tx untouched");
+    TEST_ASSERT(persist_load_distribution_tx(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                             got, &got_len, sizeof(got)) &&
+                got_len == 70 && got[0] == 0x66, "new distribution tx recorded");
+
+    /* an unverified distribution transaction is never recorded */
+    new_f->dist_tx_ready = 1;
+    TEST_ASSERT(client_rotation_save_pending(&db2, new_f, ctx), "save pending again");
+    TEST_ASSERT(!persist_load_distribution_tx(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                              got, &got_len, sizeof(got)) || got_len == 0,
+                "unverified distribution tx not recorded");
+
+    TEST_ASSERT(persist_delete_factory_record(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID),
+                "remove pending record");
+    TEST_ASSERT(!persist_has_factory(&db2, CLIENT_ROTATION_PENDING_FACTORY_ID), "marker gone");
+    TEST_ASSERT(persist_has_factory(&db2, 0), "current factory kept");
+    persist_close(&db2);
+    unlink(path);
+    { char side[112];
+      snprintf(side, sizeof(side), "%s-wal", path); unlink(side);
+      snprintf(side, sizeof(side), "%s-shm", path); unlink(side); }
+    factory_free(old_f); free(old_f);
+    factory_free(new_f); free(new_f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

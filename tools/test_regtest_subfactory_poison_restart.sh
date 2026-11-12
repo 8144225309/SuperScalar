@@ -100,7 +100,7 @@ env $SS_ASAN_ENV SS_MUSIG_STATELESS="${SS_MUSIG_STATELESS:-1}" "$LSP_BIN" \
     --network regtest --port "$LSP_PORT_RUN1" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \
@@ -120,7 +120,7 @@ done
 
 # Clients — same bracket-safe pattern as k2_breach
 for i in $(seq 0 $((N_CLIENTS - 1))); do
-    env $SS_ASAN_ENV "$CLIENT_BIN" \
+    env $SS_ASAN_ENV "$CLIENT_BIN" --test-allow-tree-advance \
         --network regtest --host 127.0.0.1 --port "$LSP_PORT_RUN1" \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $((i + 1)) --daemon \
@@ -188,7 +188,7 @@ env $SS_ASAN_ENV SS_MUSIG_STATELESS="${SS_MUSIG_STATELESS:-1}" "$LSP_BIN" \
     --network regtest --port "$LSP_PORT_RUN2" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \

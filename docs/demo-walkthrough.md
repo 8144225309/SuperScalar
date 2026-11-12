@@ -389,7 +389,9 @@ cd build
   --lsp-pubkey <LSP_PUBKEY_FROM_TERMINAL_2>
 ```
 
-You should see "Bridge: connected to LSP" and "Bridge: listening for plugin on port 9736".
+You should see "Bridge: connected to LSP" and "Bridge: listening for plugin on 127.0.0.1:9736".
+On first start the bridge also writes the secret the plugin must present to
+`~/.superscalar/bridge-plugin.secret`; the plugin in Terminal 8 reads it from there.
 
 ### Terminal 8: CLN with Plugin
 

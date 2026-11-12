@@ -10,7 +10,7 @@
  *   test_reorg_revalidate_rpc_outage_no_change
  *                                           bitcoind unreachable during
  *                                           revalidation: nothing changes
- *   test_persist_funding_anchor_reorg_tip   v40 tables round trip
+ *   test_persist_funding_anchor_reorg_tip   v43 tables round trip
  *   test_reorg_tip_persisted_detects_downtime_reorg
  *                                           the detector's stored tip,
  *                                           reloaded after a restart,
@@ -151,7 +151,7 @@ static int build_factory(secp256k1_context *ctx, factory_t *f,
     factory_alloc_default_arrays(f);
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = cltv;
-    f->fee_per_tx = 500;
+    f->tree_fee_rate = 2000;
     factory_set_funding(f, txid, vout, amt, fund_spk, 34);
     return factory_build_tree(f);
 }

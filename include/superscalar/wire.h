@@ -45,6 +45,9 @@
 #define MSG_BRIDGE_SEND_PAY     0x45  /* LSP → Bridge: outbound via CLN */
 #define MSG_BRIDGE_PAY_RESULT   0x46  /* Bridge → LSP: sendpay result */
 #define MSG_BRIDGE_REGISTER     0x47  /* LSP → Bridge: register invoice */
+#define MSG_BRIDGE_PAY_RESULT_ACK 0x57 /* LSP → Bridge: pay result recorded */
+#define MSG_BRIDGE_FULFILL_ACK  0x8E  /* Bridge → LSP: fulfil reached the node */
+#define MSG_BRIDGE_FULFILL_UNRESOLVED 0x8F /* Bridge → LSP: node could not take the fulfil */
 
 /* Reconnection messages (Phase 16) */
 #define MSG_RECONNECT           0x48  /* Client → LSP: reconnect with pubkey */
@@ -71,6 +74,7 @@
 #define MSG_JIT_ACCEPT          0x52  /* Client -> LSP: accept JIT channel */
 #define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
 #define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
+#define MSG_JIT_REJECT          0x90  /* Client -> LSP: decline a JIT channel offer */
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
@@ -325,7 +329,9 @@ cJSON *wire_build_hello_ack(const secp256k1_context *ctx,
                             const secp256k1_pubkey *all_pubkeys, size_t n);
 
 /* LSP → Client: FACTORY_PROPOSE {funding_txid, funding_vout, funding_amount,
-                                   step_blocks, states_per_layer, cltv_timeout, fee_per_tx} */
+                                   step_blocks, states_per_layer, cltv_timeout,
+                                   tree_fee_rate, leaf_arity, ...}
+   tree_fee_rate: the sat/kvB rate every pre-signed tree tx is sized at. */
 cJSON *wire_build_factory_propose(const factory_t *f);
 
 /* Client → LSP: NONCE_BUNDLE {entries: [{node_idx, slot, pubnonce_hex}...]} */
@@ -457,6 +463,15 @@ int wire_parse_update_fulfill_htlc(const cJSON *json, uint64_t *htlc_id,
 
 int wire_parse_update_fail_htlc(const cJSON *json, uint64_t *htlc_id,
                                   char *reason, size_t reason_len);
+
+/* UPDATE_FAIL_HTLC for an HTLC the receiver of the ADD never took into its
+   channel state ({..., "uncommitted": true}).  The sender of the ADD drops
+   the HTLC from its own state; no commitment exchange follows.  Without the
+   flag the HTLC was committed on both sides and a COMMITMENT_SIGNED follows,
+   as after a fulfil. */
+cJSON *wire_build_update_fail_htlc_uncommitted(uint64_t htlc_id, const char *reason);
+/* 1 if a parsed UPDATE_FAIL_HTLC carries the uncommitted flag. */
+int wire_update_fail_htlc_is_uncommitted(const cJSON *json);
 
 int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
                                 unsigned char pubnonces_out[][66],
@@ -691,10 +706,42 @@ cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
 cJSON *wire_build_bridge_fail_htlc(const unsigned char *payment_hash32,
                                      const char *reason, uint64_t htlc_id);
 
-/* LSP → Bridge: BRIDGE_SEND_PAY {bolt11, payment_hash, request_id} */
+/* LSP → Bridge: BRIDGE_SEND_PAY {bolt11, payment_hash, request_id,
+   max_total_msat, max_delay}.  payment_hash is the hash the invoice must
+   carry, max_total_msat is the most the paying node may spend on it, routing
+   fees included, and max_delay is the longest the payment may be locked up,
+   in blocks; the plugin enforces all three. */
 cJSON *wire_build_bridge_send_pay(const char *bolt11,
                                     const unsigned char *payment_hash32,
-                                    uint64_t request_id);
+                                    uint64_t request_id,
+                                    uint64_t max_total_msat,
+                                    uint32_t max_delay);
+
+/* Bridge → LSP: BRIDGE_FULFILL_ACK {payment_hash}.  The Lightning node has
+   resolved the HTLC with the preimage; the fulfil need not be sent again. */
+cJSON *wire_build_bridge_fulfill_ack(const unsigned char *payment_hash32);
+int wire_parse_bridge_fulfill_ack(const cJSON *json, unsigned char *payment_hash32);
+
+/* Bridge → LSP: BRIDGE_FULFILL_UNRESOLVED {payment_hash, reason}.  The
+   Lightning node could not be given the preimage for its HTLC; the fulfil
+   has not settled anything upstream. */
+cJSON *wire_build_bridge_fulfill_unresolved(const unsigned char *payment_hash32,
+                                             const char *reason);
+int wire_parse_bridge_fulfill_unresolved(const cJSON *json,
+                                          unsigned char *payment_hash32,
+                                          char *reason, size_t reason_len);
+
+/* LSP → Bridge: BRIDGE_PAY_RESULT_ACK {request_id, status, reason}.  The
+   result for this request has been dealt with and need not be sent again.
+   status "applied": it settled the client's HTLC (or there was nothing
+   left to settle).  status "rejected": it could not be used, for `reason`;
+   sending it again will not change that and an operator has to look.
+   rejected_reason NULL builds an "applied" ack; the parser leaves reason
+   empty for one. */
+cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id,
+                                          const char *rejected_reason);
+int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id,
+                                       char *reason, size_t reason_len);
 
 /* Bridge → LSP: BRIDGE_PAY_RESULT {request_id, success, preimage} */
 cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
@@ -736,7 +783,9 @@ int wire_parse_bridge_fail_htlc(const cJSON *json,
 int wire_parse_bridge_send_pay(const cJSON *json,
                                  char *bolt11, size_t bolt11_len,
                                  unsigned char *payment_hash32,
-                                 uint64_t *request_id);
+                                 uint64_t *request_id,
+                                 uint64_t *max_total_msat,
+                                 uint32_t *max_delay);
 
 int wire_parse_bridge_pay_result(const cJSON *json,
                                    uint64_t *request_id, int *success,
@@ -880,6 +929,13 @@ int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
                             size_t *client_idx,
                             secp256k1_pubkey *client_pubkey);
 
+/* Client -> LSP: JIT_REJECT {client_idx, reason}.  The client declines the
+   offer; the LSP stops waiting for JIT_ACCEPT. */
+cJSON *wire_build_jit_reject(size_t client_idx, const char *reason);
+
+int wire_parse_jit_reject(const cJSON *json, size_t *client_idx,
+                            char *reason, size_t reason_len);
+
 /* LSP -> Client: JIT_READY {jit_channel_id, funding_txid, vout, amount,
                               local_amount, remote_amount} */
 cJSON *wire_build_jit_ready(uint32_t jit_channel_id,
@@ -893,14 +949,18 @@ int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
                            uint64_t *local_amount, uint64_t *remote_amount);
 
 /* LSP -> Client: JIT_MIGRATE {jit_channel_id, target_factory_id,
-                                local_balance, remote_balance} */
+                                local_balance, remote_balance, close_txid} */
 cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
                                 uint32_t target_factory_id,
-                                uint64_t local_balance, uint64_t remote_balance);
+                                uint64_t local_balance, uint64_t remote_balance,
+                                const char *close_txid);
 
+/* close_txid (64 hex characters) names the transaction that closed the JIT
+   channel; it is required.  close_txid_out must hold at least 65 bytes. */
 int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
                              uint32_t *target_factory_id,
-                             uint64_t *local_balance, uint64_t *remote_balance);
+                             uint64_t *local_balance, uint64_t *remote_balance,
+                             char *close_txid_out);
 
 /* --- Per-Leaf Advance message builders (Upgrade 2) --- */
 

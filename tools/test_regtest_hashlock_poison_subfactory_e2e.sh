@@ -156,7 +156,7 @@ env $ASAN_ENV \
     --port $LSP_PORT \
     --clients $N_CLIENTS \
     --arity 3 \
-    --ps-subfactory-arity $PS_SUB_ARITY \
+    --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $FUNDING_SATS \
     --fee-rate 1000 \
     --confirm-timeout 600 \
@@ -186,7 +186,7 @@ echo
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     env $ASAN_ENV \
-    "$CLIENT_BIN" \
+    "$CLIENT_BIN" --test-allow-tree-advance \
         --network regtest \
         --host 127.0.0.1 --port $LSP_PORT \
         --seckey "${CLIENT_SECKEYS[$i]}" \

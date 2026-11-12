@@ -121,6 +121,18 @@ struct chain_backend {
                                   uint32_t vout);
 
     /*
+     * Chain-only view of an outpoint (txid:vout); the mempool is ignored.
+     * Returns 1 if the transaction that created the outpoint is confirmed
+     * and the output has been spent by a confirmed transaction, 0 if the
+     * output is still unspent on chain or its transaction is not confirmed,
+     * -1 if this cannot be determined.
+     * Optional — may be NULL; callers must treat NULL like -1.
+     */
+    int  (*is_outpoint_spent_confirmed)(chain_backend_t *self,
+                                         const char *txid_hex_display,
+                                         uint32_t vout);
+
+    /*
      * Broadcast a raw transaction. Writes the resulting txid (64 hex chars
      * + NUL) to txid_out if non-NULL. Returns 1 on success, 0 on failure.
      */

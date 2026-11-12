@@ -217,7 +217,7 @@
             printf("--- Phase 2: PTLC-Assisted Close ---\n");
 
             /* Build pubkey array and aggregate */
-            secp256k1_pubkey exh_pks[FACTORY_MAX_SIGNERS];
+            secp256k1_pubkey exh_pks[FACTORY_MAX_SIGNERS] = {0};
             for (size_t ti = 0; ti < n_total; ti++) {
                 if (!secp256k1_keypair_pub(ctx, &exh_pks[ti], &exh_kps[ti])) {
                     fprintf(stderr, "DW EXHIBITION: keypair pub failed\n");
@@ -408,12 +408,16 @@
                     exhibition_pass = 0;
                 } else {
                     /* Build Factory 1 locally */
+                    int exh_shape_ok = 1;
                     if (n_level_arity > 0)
-                        factory_set_level_arity(exh_f1, level_arities, n_level_arity);
+                        exh_shape_ok = factory_set_level_arity(exh_f1, level_arities, n_level_arity);
                     else if (leaf_arity == 1)
                         factory_set_arity(exh_f1, FACTORY_ARITY_1);
 
-                    if (!factory_init(exh_f1, ctx, exh_kps, n_total,
+                    if (!exh_shape_ok) {
+                        fprintf(stderr, "DW EXHIBITION Phase 3: tree shape refused\n");
+                        exhibition_pass = 0;
+                    } else if (!factory_init(exh_f1, ctx, exh_kps, n_total,
                                       step_blocks, states_per_layer)) {
                         fprintf(stderr, "DW EXHIBITION Phase 3: factory_init failed\n");
                         exhibition_pass = 0;
@@ -426,10 +430,9 @@
                             exh_f1->cltv_timeout = (uint32_t)cur_h + offset;
                         }
 
-                        factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout,
-                                            exh_fund_amount, fund_spk, 34);
-
-                        if (!factory_build_tree(exh_f1)) {
+                        if (!factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout,
+                                                 exh_fund_amount, fund_spk, 34) ||
+                            !factory_build_tree(exh_f1)) {
                             fprintf(stderr, "DW EXHIBITION Phase 3: factory_build_tree failed\n");
                             factory_free(exh_f1);
                             exhibition_pass = 0;
@@ -448,9 +451,12 @@
                                     /* Full re-init for clean state */
                                     factory_free(exh_f1);
                                     memset(exh_f1, 0, sizeof(*exh_f1));
-                                    if (n_level_arity > 0)
-                                        factory_set_level_arity(exh_f1, level_arities, n_level_arity);
-                                    else if (leaf_arity == 1)
+                                    if (n_level_arity > 0) {
+                                        if (!factory_set_level_arity(exh_f1, level_arities, n_level_arity)) {
+                                            fprintf(stderr, "DW EXHIBITION Phase 3: tree shape refused\n");
+                                            break;
+                                        }
+                                    } else if (leaf_arity == 1)
                                         factory_set_arity(exh_f1, FACTORY_ARITY_1);
                                     factory_init(exh_f1, ctx, exh_kps, n_total, step_blocks, states_per_layer);
                                     {
@@ -458,8 +464,11 @@
                                         if (cltv_timeout_arg > 0) exh_f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
                                         else if (cur_h2 > 0) exh_f1->cltv_timeout = (uint32_t)cur_h2 + (uint32_t)(is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10));
                                     }
-                                    factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout, exh_fund_amount, fund_spk, 34);
-                                    factory_build_tree(exh_f1);
+                                    if (!factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout, exh_fund_amount, fund_spk, 34) ||
+                                        !factory_build_tree(exh_f1)) {
+                                        fprintf(stderr, "DW EXHIBITION Phase 3: factory_build_tree failed (retry)\n");
+                                        break;
+                                    }
                                 }
                             }
                             if (!sign_ok) {
@@ -472,7 +481,6 @@
                             if (cur_h > 0)
                                 factory_set_lifecycle(exh_f1, (uint32_t)cur_h,
                                                       active_blocks, dying_blocks);
-                            exh_f1->fee = fee_est;
 
                             /* Record Factory 1 initial (max) nSequence */
                             for (size_t ni = 0; ni < exh_f1->n_nodes; ni++) {
@@ -663,7 +671,8 @@
             int tier_b_fired_in_loop = 0;
             uint32_t epoch_at_loop_start = lsp_p->factory.counter.current_epoch;
             for (int ac = 0; ac < advance_count_arg; ac++) {
-                int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, cl1_cheat_side);
+                int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, cl1_cheat_side,
+                                /* allow_live_channel */ 1);
                 if (adv_rc != 1) {
                     fprintf(stderr, "LEAF ADVANCE TEST: lsp_channels_advance_ps_leaf(%d) returned %d at iter %d\n",
                             cl1_cheat_side, adv_rc, ac);
@@ -1066,13 +1075,15 @@
             ladder_factory_t *lf1 = &lad->factories[1];
             factory_t *f1 = &lf1->factory;
             memset(f1, 0, sizeof(factory_t));
+            int f1_shape_ok = 1;
             if (n_level_arity > 0)
-                factory_set_level_arity(f1, level_arities, n_level_arity);
+                f1_shape_ok = factory_set_level_arity(f1, level_arities, n_level_arity);
             else if (leaf_arity == 1)
                 factory_set_arity(f1, FACTORY_ARITY_1);
 
-            if (!factory_init(f1, ctx, all_kps, n_total, step_blocks, 4)) {
-                fprintf(stderr, "DUAL FACTORY TEST: factory_init failed\n");
+            if (!f1_shape_ok || !factory_init(f1, ctx, all_kps, n_total, step_blocks, 4)) {
+                fprintf(stderr, "DUAL FACTORY TEST: %s failed\n",
+                        f1_shape_ok ? "factory_init" : "tree shape");
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);
@@ -1092,10 +1103,9 @@
                 }
             }
 
-            factory_set_funding(f1, fund2_txid, fund2_vout, fund2_amount,
-                                fund_spk, 34);
-
-            if (!factory_build_tree(f1)) {
+            if (!factory_set_funding(f1, fund2_txid, fund2_vout, fund2_amount,
+                                     fund_spk, 34) ||
+                !factory_build_tree(f1)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_build_tree failed\n");
                 factory_free(f1);
                 jit_channels_cleanup(mgr);
@@ -1123,7 +1133,6 @@
                     factory_set_lifecycle(f1, (uint32_t)cur_h,
                                           active_blocks, dying_blocks);
             }
-            f1->fee = fee_est;
 
             printf("Factory 1 created: %zu nodes signed\n", f1->n_nodes);
 
@@ -1734,10 +1743,18 @@
             int rollover_pass = 1;
 
             /* CL2-TB: enable on FACTORY_ARITY_PS (arity 3) too.
-               lsp_channels_advance_ps_leaf is a 1-line wrapper around
-               lsp_advance_leaf which works for any arity. The gate was
-               stale (predated PS arity introduction). */
-            if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
+               lsp_channels_advance_ps_leaf drives lsp_advance_leaf, which
+               works for any per-client leaf arity. The gate was stale
+               (predated PS arity introduction). */
+            if (factory_refuses_refresh_in_place(&lsp_p->factory,
+                                                 "--test-tier-b-rollover")) {
+                /* An advanceless tree has nothing to roll over: the test
+                   needs a shape with DW layers (e.g. --arity 3 without
+                   --static-near-root). */
+                printf("TIER B ROLLOVER TEST: REFUSED (the tree has no DW state "
+                       "layer; run it on a shape with one)\n");
+                rollover_pass = 0;
+            } else if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
                 lsp_p->factory.leaf_arity != FACTORY_ARITY_PS) {
                 printf("  SKIP: --test-tier-b-rollover requires --arity 1 (DW) or --arity 3 (PS)\n");
                 printf("TIER B ROLLOVER TEST: SKIP (gate=arity)\n");
@@ -1890,7 +1907,8 @@
                         printf("  tick %d/%d: lsp_factory_tick_root...\n",
                                it + 1, n_iters);
                         fflush(stdout);
-                        int rc = lsp_factory_tick_root(mgr, lsp_p);
+                        int rc = lsp_factory_tick_root(mgr, lsp_p,
+                                /* allow_live_channel */ 1);
                         if (rc < 0) {
                             printf("  FAIL: lsp_factory_tick_root returned %d on tick %d\n",
                                    rc, it + 1);
@@ -1958,7 +1976,8 @@
                                     "(the WT-armed immediately-superseded state) before final rollover\n",
                                     lsp_p->factory.n_nodes);
                         }
-                        int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                        int rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0,
+                                /* allow_live_channel */ 1);
                         if (rc != 1) {
                             printf("  FAIL: advance returned %d on iter %d\n", rc, it + 1);
                             rollover_pass = 0;
@@ -2166,7 +2185,8 @@
                             printf("  F1: driving 1 PS leaf advance on leaf 0 to "
                                    "verify new chain[0] is spendable...\n");
                             fflush(stdout);
-                            int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0);
+                            int adv_rc = lsp_channels_advance_ps_leaf(mgr, lsp_p, 0,
+                                /* allow_live_channel */ 1);
                             if (adv_rc != 1) {
                                 printf("  FAIL (F1): post-rollover leaf advance "
                                        "returned %d (expected 1) — new chain[0] "
@@ -2229,7 +2249,8 @@
                 reverse_bytes(root_txid_rev, 32);
                 hex_encode(root_txid_rev, 32, root_txid_hex);
                 watchtower_add_pending_tx(&g_watchtower, root_txid_hex,
-                                           1, WATCHTOWER_ANCHOR_AMOUNT);
+                                           1, WATCHTOWER_ANCHOR_AMOUNT,
+                                           lsp_p->factory.funding_amount_sats);
             }
 
             /* Skip cooperative close — factory already spent */
@@ -2581,7 +2602,7 @@
                 fflush(stderr);
             }
 
-            int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_str);
+            int sent = cpfp_send_default(NULL, commit_hex, commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, sent ? commit_txid_str : "?",
                     "htlc_commitment", commit_hex, sent ? "ok" : "failed");
@@ -3639,7 +3660,7 @@
             }
             hex_encode(pc_commit_signed.data, pc_commit_signed.len, pc_commit_hex);
             char pc_commit_txid_str[65];
-            int pc_sent = regtest_send_raw_tx(&rt, pc_commit_hex,
+            int pc_sent = cpfp_send_default(NULL, pc_commit_hex,
                                                 pc_commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, pc_sent ? pc_commit_txid_str : "?",
@@ -4194,7 +4215,7 @@ bc_oom:
 
                 char *chex = malloc(cs.len * 2 + 1);
                 hex_encode(cs.data, cs.len, chex);
-                int csent = regtest_send_raw_tx(&rt, chex, commit_txids[ci]);
+                int csent = cpfp_send_default(NULL, chex, commit_txids[ci]);
                 if (g_db) {
                     char label[64];
                     snprintf(label, sizeof(label), "multi_htlc_commit_%zu", ci);
@@ -4402,7 +4423,7 @@ bc_oom:
                 char *chex = malloc(cs.len * 2 + 1);
                 hex_encode(cs.data, cs.len, chex);
                 char ctxid_str[65];
-                int csent = regtest_send_raw_tx(&rt, chex, ctxid_str);
+                int csent = cpfp_send_default(NULL, chex, ctxid_str);
                 if (g_db) {
                     char label[64];
                     snprintf(label, sizeof(label), "settlement_commit_%zu", ci);
@@ -4491,7 +4512,8 @@ bc_oom:
             int psa_pass = 1;
             for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
                 printf("PS advance: leaf %d...\n", li);
-                int arc = lsp_channels_advance_ps_leaf(mgr, lsp_p, li);
+                int arc = lsp_channels_advance_ps_leaf(mgr, lsp_p, li,
+                                /* allow_live_channel */ 1);
                 if (!arc) {
                     fprintf(stderr, "PS ADVANCE TEST: lsp_advance_leaf failed for leaf %d\n", li);
                     psa_pass = 0;
@@ -4503,7 +4525,7 @@ bc_oom:
                 for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
                     size_t nidx = psa_f->leaf_node_indices[li];
                     factory_node_t *node = &psa_f->nodes[nidx];
-                    uint64_t expected_amt = pre_amounts[li] - psa_f->fee_per_tx;
+                    uint64_t expected_amt = pre_amounts[li] - factory_ps_chain_reserve(psa_f);
                     printf("  Leaf %d post-advance: chain_len=%d, n_outputs=%zu, chan_amount=%llu (expected %llu)\n",
                            li, node->ps_chain_len, node->n_outputs,
                            (unsigned long long)node->outputs[0].amount_sats,

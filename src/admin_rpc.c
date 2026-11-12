@@ -476,18 +476,11 @@ static cJSON *method_pay_bridge(admin_rpc_t *rpc, const cJSON *params,
         return NULL;
     }
 
-    /* Send bolt11 directly to bridge — bridge handles routing via CLN */
-    uint64_t request_id = mgr->next_request_id++;
-    unsigned char dummy_hash[32] = {0};
-    cJSON *pay_msg = wire_build_bridge_send_pay(bolt11_str, dummy_hash, request_id);
-    if (!pay_msg) {
-        snprintf(errmsg, errcap, "failed to build bridge pay message");
-        return NULL;
-    }
-    int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay_msg);
-    cJSON_Delete(pay_msg);
-    if (!ok) {
-        snprintf(errmsg, errcap, "bridge send failed");
+    /* Hand the invoice to the bridge — CLN does the routing */
+    uint64_t request_id = 0;
+    const char *err = NULL;
+    if (!lsp_channels_operator_pay(mgr, bolt11_str, &request_id, &err)) {
+        snprintf(errmsg, errcap, "%s", err ? err : "bridge pay failed");
         return NULL;
     }
 
@@ -840,13 +833,25 @@ static cJSON *method_recoverfactory(admin_rpc_t *rpc, const cJSON *params,
         if (cJSON_IsNumber(f)) factory_id = (uint32_t)f->valuedouble;
     }
 
-    char status[256] = {0};
-    int ok = factory_recovery_run(p, chain, factory_id, status, sizeof(status));
+    char status[384] = {0};
+    factory_recovery_result_t res;
+    int ok = factory_recovery_run(p, chain, factory_id, NULL, &res,
+                                  status, sizeof(status));
+    if (!ok) {
+        snprintf(errmsg, errcap, "%s", status[0] ? status : "recovery failed");
+        return NULL;
+    }
 
     cJSON *r = cJSON_CreateObject();
     cJSON_AddNumberToObject(r, "factory_id",       (double)factory_id);
     cJSON_AddStringToObject(r, "status",           status[0] ? status : "no action needed");
-    cJSON_AddBoolToObject  (r, "broadcasts_made",  ok);
+    cJSON_AddBoolToObject  (r, "broadcasts_made",  res.n_broadcast > 0);
+    cJSON_AddBoolToObject  (r, "published",        res.published);
+    cJSON_AddNumberToObject(r, "n_tree_nodes",     (double)res.n_tree_nodes);
+    cJSON_AddNumberToObject(r, "n_confirmed",      (double)res.n_confirmed);
+    cJSON_AddNumberToObject(r, "n_in_mempool",     (double)res.n_in_mempool);
+    cJSON_AddNumberToObject(r, "n_waiting",        (double)res.n_waiting);
+    cJSON_AddNumberToObject(r, "n_rejected",       (double)res.n_rejected);
     return r;
 }
 

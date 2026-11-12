@@ -158,7 +158,7 @@ stdbuf -oL "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" \
     --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --demo --lsp-balance-pct 50 \
@@ -194,7 +194,7 @@ echo "--- $N_CLIENTS client daemons ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     CLIENT_LOG="$TMPDIR/client_${i}.log"
     CLIENT_DB="$TMPDIR/client_${i}.db"
-    stdbuf -oL "$CLIENT_BIN" \
+    stdbuf -oL "$CLIENT_BIN" --test-allow-tree-advance \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --host 127.0.0.1 --port "$LSP_PORT" \
         --network regtest \

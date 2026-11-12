@@ -206,8 +206,6 @@ int test_lsp_channel_init(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -231,8 +229,8 @@ int test_lsp_channel_init(void) {
         TEST_ASSERT(entry->channel.local_amount > 0, "local_amount > 0");
         TEST_ASSERT(entry->channel.remote_amount > 0, "remote_amount > 0");
         /* local + remote = funding_amount - commit_fee */
-        fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
-        uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
+        uint64_t commit_fee =
+            fee_commitment_tx_at(entry->channel.commit_fee_rate_sat_per_kvb, 0);
         TEST_ASSERT_EQ(entry->channel.local_amount + entry->channel.remote_amount,
                         entry->channel.funding_amount - commit_fee, "balance sum");
     }
@@ -305,52 +303,20 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
-/* Helper: receive next non-bookkeeping message.
-   Transparently consumes:
-     - MSG_LSP_REVOKE_AND_ACK (0x50): bidirectional revocations, 9 sites per payment.
-     - MSG_LEAF_ADVANCE_PROPOSE (0x58) + MSG_LEAF_ADVANCE_DONE (0x5A): the
-       post-HTLC-fulfill per-leaf advance ceremony that FACTORY_ARITY_1 and
-       FACTORY_ARITY_PS trigger in lsp_channels.c:2259. The client must
-       participate (send LEAF_ADVANCE_PSIG) or the LSP hangs waiting.
-       We delegate to client_handle_leaf_advance which handles the full
-       PROPOSE → PSIG → DONE sub-ceremony.
-   Returns 1 on success with out populated with the next payment-flow msg. */
-static int recv_skip_revocations_ex(int fd, wire_msg_t *out,
-                                      secp256k1_context *ctx,
-                                      const secp256k1_keypair *keypair,
-                                      factory_t *factory,
-                                      uint32_t my_index) {
+/* Helper: receive the next payment-flow message, transparently consuming
+   MSG_LSP_REVOKE_AND_ACK (0x50), the LSP's half of the bidirectional
+   revocation exchange.  Nothing else is skipped: a payment triggers no
+   factory-tree ceremony, so any other message is handed to the caller.
+   Returns 1 on success with out populated. */
+static int recv_skip_revocations(int fd, wire_msg_t *out) {
     for (;;) {
         if (!wire_recv(fd, out)) return 0;
         if (out->msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
             cJSON_Delete(out->json);
             continue;
         }
-        if (out->msg_type == 0x58) {  /* MSG_LEAF_ADVANCE_PROPOSE */
-            /* Handle the leaf advance in-line. client_handle_leaf_advance
-               consumes PROPOSE, sends PSIG, waits for DONE. */
-            if (ctx && keypair && factory) {
-                if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
-                                                  my_index, out)) {
-                    cJSON_Delete(out->json);
-                    return 0;
-                }
-            }
-            cJSON_Delete(out->json);
-            continue;
-        }
-        if (out->msg_type == 0x5A) {  /* MSG_LEAF_ADVANCE_DONE — stray */
-            cJSON_Delete(out->json);
-            continue;
-        }
         return 1;
     }
-}
-/* Back-compat wrapper: callers without ctx/keypair/factory fall through
-   to the old revocation-only behavior. Leaf-advance will then be
-   unhandled (original pre-fix behavior). */
-static int recv_skip_revocations(int fd, wire_msg_t *out) {
-    return recv_skip_revocations_ex(fd, out, NULL, NULL, NULL, 0);
 }
 
 static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -361,6 +327,12 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                                      void *user_data) {
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
     (void)ctx; (void)keypair; (void)factory; (void)n_participants;
+
+    if (!ch->has_latest_commitment_sig || ch->commitment_number != 0) {
+        fprintf(stderr, "Client %u: channel handed over without a signed "
+                "commitment 0\n", my_index);
+        return 0;
+    }
 
     for (size_t i = 0; i < data->n_actions; i++) {
         scripted_action_t *act = &data->actions[i];
@@ -377,7 +349,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for COMMITMENT_SIGNED (acknowledging HTLC) */
             wire_msg_t msg;
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv failed after send\n", my_index);
                 return 0;
             }
@@ -392,7 +364,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Wait for FULFILL_HTLC */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
             }
@@ -414,7 +386,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -430,7 +402,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for ADD_HTLC from LSP */
             wire_msg_t msg;
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv ADD_HTLC failed\n", my_index);
                 return 0;
             }
@@ -445,7 +417,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit failed\n", my_index);
                 return 0;
             }
@@ -477,7 +449,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             client_fulfill_payment(fd, ch, htlc_id, act->preimage);
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!recv_skip_revocations_ex(fd, &msg, ctx, keypair, factory, my_index)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -486,50 +458,6 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
-            }
-        }
-
-        /* Drain any pending LEAF_ADVANCE_PROPOSE that the LSP sent for this
-           client after the HTLC fulfill committed (src/lsp_channels.c:2259 —
-           FACTORY_ARITY_1 and FACTORY_ARITY_PS trigger a per-leaf MuSig
-           advance after every fulfill). Without this, the next action's
-           ADD_HTLC races the LSP's advance ceremony and the LSP drops our
-           ADD_HTLC with 'expected LEAF_ADVANCE_PSIG from client N, got 0x31'.
-
-           Only drain BETWEEN actions, not after the last action — otherwise
-           we'd consume MSG_CLOSE_PROPOSE or similar post-payment traffic the
-           caller expects. */
-        if (i + 1 < data->n_actions) {
-            wire_msg_t drain_msg;
-            while (1) {
-                wire_set_timeout(fd, 2);
-                int got = wire_recv(fd, &drain_msg);
-                wire_set_timeout(fd, WIRE_DEFAULT_TIMEOUT_SEC);
-                if (!got) break;  /* timeout / no more drainable messages */
-                if (drain_msg.msg_type == 0x58) {  /* LEAF_ADVANCE_PROPOSE */
-                    if (ctx && keypair && factory &&
-                        !client_handle_leaf_advance(fd, ctx, keypair, factory,
-                                                       my_index, &drain_msg)) {
-                        cJSON_Delete(drain_msg.json);
-                        fprintf(stderr, "Client %u: leaf_advance drain failed\n",
-                                my_index);
-                        return 0;
-                    }
-                    cJSON_Delete(drain_msg.json);
-                    continue;
-                }
-                cJSON_Delete(drain_msg.json);
-                if (drain_msg.msg_type == 0x50 ||       /* REVOKE_AND_ACK */
-                    drain_msg.msg_type == 0x5A)          /* LEAF_ADVANCE_DONE */
-                    continue;
-                /* Not a drainable noise message — stop draining. This
-                   message is now consumed; the next action will expect to
-                   see it and may stall. That's a test-ordering issue, not a
-                   drain bug. Do not drain anything the next action expects. */
-                fprintf(stderr,
-                    "Client %u: drain consumed unexpected msg 0x%02x — "
-                    "test may stall\n", my_index, drain_msg.msg_type);
-                break;
             }
         }
     }
@@ -555,6 +483,12 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                                void *user_data) {
     payment_test_data_t *data = (payment_test_data_t *)user_data;
     (void)ctx; (void)keypair; (void)factory; (void)n_participants;
+
+    if (!ch->has_latest_commitment_sig || ch->commitment_number != 0) {
+        fprintf(stderr, "Client %u: channel handed over without a signed "
+                "commitment 0\n", my_index);
+        return 0;
+    }
 
     if (data->is_sender) {
         /* Client A (index 1): send payment to Client B (index 2, = client_idx 1) */
@@ -808,6 +742,8 @@ int test_regtest_intra_factory_payment(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -841,7 +777,7 @@ int test_regtest_intra_factory_payment(void) {
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -930,8 +866,8 @@ int test_regtest_intra_factory_payment(void) {
                Channel B (LSP view): LSP sent 5000 to B
                  -> local decreased by 5000, remote increased by 5000 */
             /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
-            fee_estimator_static_t _fe2; fee_estimator_static_init(&_fe2, 1000);
-            uint64_t commit_fee_ab = fee_for_commitment_tx((fee_estimator_t *)&_fe2, 0);
+            uint64_t commit_fee_ab =
+                fee_commitment_tx_at(ch_a->commit_fee_rate_sat_per_kvb, 0);
             uint64_t usable_a = ch_a->funding_amount > commit_fee_ab ?
                                 ch_a->funding_amount - commit_fee_ab : 0;
             uint64_t a_orig = usable_a / 2;
@@ -958,22 +894,20 @@ int test_regtest_intra_factory_payment(void) {
 
     /* Cooperative close */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
         } else {
@@ -1202,6 +1136,8 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1238,7 +1174,7 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1288,8 +1224,7 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
         channel_t *ch_d = &ch_mgr.entries[3].channel;
 
         /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
-        fee_estimator_static_t _fe3; fee_estimator_static_init(&_fe3, 1000);
-        uint64_t cfe = fee_for_commitment_tx((fee_estimator_t *)&_fe3, 0);
+        uint64_t cfe = fee_commitment_tx_at(ch_a->commit_fee_rate_sat_per_kvb, 0);
         uint64_t a_orig = (ch_a->funding_amount > cfe ?
                            ch_a->funding_amount - cfe : 0) / 2;
         uint64_t b_orig = (ch_b->funding_amount > cfe ?
@@ -1299,18 +1234,24 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
         uint64_t d_orig = (ch_d->funding_amount > cfe ?
                            ch_d->funding_amount - cfe : 0) / 2;
 
+        /* The remote side gets the rest of the usable amount (an odd usable
+           amount leaves it one sat more than local). */
+        uint64_t a_rem = ch_a->funding_amount - cfe - a_orig;
+        uint64_t b_rem = ch_b->funding_amount - cfe - b_orig;
+        uint64_t c_rem = ch_c->funding_amount - cfe - c_orig;
+        uint64_t d_rem = ch_d->funding_amount - cfe - d_orig;
         /* A: +2000 local (received from A), -600 local (sent to A) = net +1400 */
         uint64_t exp_a_local = a_orig + 2000 - 600;
-        uint64_t exp_a_remote = a_orig - 2000 + 600;
+        uint64_t exp_a_remote = a_rem - 2000 + 600;
         /* B: -2000 local (sent to B), +1500 local (received from B) = net -500 */
         uint64_t exp_b_local = b_orig - 2000 + 1500;
-        uint64_t exp_b_remote = b_orig + 2000 - 1500;
+        uint64_t exp_b_remote = b_rem + 2000 - 1500;
         /* C: -1500 local (sent to C), +1000 local (received from C) = net -500 */
         uint64_t exp_c_local = c_orig - 1500 + 1000;
-        uint64_t exp_c_remote = c_orig + 1500 - 1000;
+        uint64_t exp_c_remote = c_rem + 1500 - 1000;
         /* D: -1000 local (sent to D), +600 local (received from D) = net -400 */
         uint64_t exp_d_local = d_orig - 1000 + 600;
-        uint64_t exp_d_remote = d_orig + 1000 - 600;
+        uint64_t exp_d_remote = d_rem + 1000 - 600;
 
         printf("LSP: Channel A: local=%llu remote=%llu (exp %llu/%llu)\n",
                (unsigned long long)ch_a->local_amount,
@@ -1667,7 +1608,7 @@ static int run_scale_payment_ring(int n_clients, int arity_code,
         lsp->factory.leaf_arity = (factory_arity_t)arity_code;
 
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
-                                            fund_spk, 34, 10, 4, 0)) {
+                                            fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
     }
     if (lsp_ok)
@@ -1831,8 +1772,6 @@ int test_fee_policy_balance_split(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -1840,9 +1779,8 @@ int test_fee_policy_balance_split(void) {
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
-    fee_estimator_static_t fe;
-    fee_estimator_static_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
+    /* the commitment fee at the factory's agreed rate */
+    uint64_t commit_fee = fee_commitment_tx_at(f->tree_fee_rate, 0);
 
     /* Test 1: Default 50-50 split (pct=0 means default 50) */
     {
@@ -1931,43 +1869,66 @@ int test_cltv_delta_enforcement(void) {
     uint32_t fwd;
 
     /* cltv_expiry below delta: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd, 0, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(30, &fwd, 0, 0, 0) == 0,
                 "cltv 30 should be rejected");
 
     /* cltv_expiry == delta: rejected (need strictly >) */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT, &fwd, 0, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT, &fwd, 0, 0, 0) == 0,
                 "cltv == delta should be rejected");
 
     /* cltv_expiry == 0: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd, 0, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(0, &fwd, 0, 0, 0) == 0,
                 "cltv 0 should be rejected");
 
     /* cltv_expiry = delta + 1: passes, fwd = 1 */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT + 1, &fwd, 0, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(FACTORY_CLTV_DELTA_DEFAULT + 1, &fwd, 0, 0, 0) == 1,
                 "cltv delta+1 should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)1, "fwd should be 1");
 
     /* cltv_expiry = 500: passes, fwd = 460 */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0, 0, 0) == 1,
                 "cltv 500 should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
 
     /* NULL fwd_cltv_out: just validates without writing */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL, 0, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, NULL, 0, 0, 0) == 1,
                 "NULL out should still return 1");
 
     /* cltv_expiry at factory timeout: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 1000, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 1000, 0, 0) == 0,
                 "cltv at factory timeout should be rejected");
 
     /* cltv_expiry past factory timeout: rejected */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1000, 0) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1000, 0, 0) == 0,
                 "cltv past factory timeout should be rejected");
 
     /* cltv_expiry below factory timeout: passes */
-    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 1000, 0) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 1000, 0, 0) == 1,
                 "cltv below factory timeout should pass");
     TEST_ASSERT_EQ(fwd, (uint32_t)460, "fwd should be 460");
+
+    /* With the chain tip known, the delta is measured from the tip:
+       an expiry of 1000 with delta 40 needs the tip below 960. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 0, 0, 959) == 1,
+                "expiry 41 blocks past the tip should pass");
+    TEST_ASSERT_EQ(fwd, (uint32_t)960, "fwd should be 960");
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 0, 0, 960) == 0,
+                "expiry exactly delta past the tip should be rejected");
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1000, &fwd, 0, 0, 1000) == 0,
+                "expiry at the tip should be rejected");
+
+    /* An expiry far in the past is larger than the delta as a bare number
+       but must not pass against the real tip. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(500, &fwd, 0, 0, 800000) == 0,
+                "expiry below the tip should be rejected");
+
+    /* Tip + delta beyond 32 bits does not wrap around. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(100, &fwd, 0, 0, UINT32_MAX - 10) == 0,
+                "no wrap-around near UINT32_MAX");
+
+    /* The factory timeout still bounds the expiry from above. */
+    TEST_ASSERT(lsp_validate_cltv_for_forward(1500, &fwd, 1400, 0, 1000) == 0,
+                "expiry past factory timeout rejected with tip known");
 
     return 1;
 }
@@ -2004,13 +1965,12 @@ int test_fee_estimator_wiring(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2021,12 +1981,14 @@ int test_fee_estimator_wiring(void) {
     mgr.lsp_balance_pct = 50;
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec, 4), "init with fee");
 
-    /* channel.fee_rate_sat_per_kvb must NOT be wired from the fee estimator —
-     * client always uses the default 1000 sat/kvB from channel_init, so both
-     * sides must agree on the same value or commitment sighashes diverge. */
+    /* channel.fee_rate_sat_per_kvb must NOT be wired from the fee estimator:
+     * it is the factory's agreed rate, which the client also uses, or the
+     * commitment sighashes diverge. */
     for (size_t c = 0; c < 4; c++) {
+        TEST_ASSERT_EQ(mgr.entries[c].channel.commit_fee_rate_sat_per_kvb, f->tree_fee_rate,
+                       "commitment uses the agreed tree rate (not wired from estimator)");
         TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)1000,
-                       "channel uses default 1000 sat/kvB (not wired from estimator)");
+                       "penalty/HTLC rate stays at the channel default");
     }
 
     /* Conservation invariant under high live-fee-rate: the LSP-side init must
@@ -2037,14 +1999,14 @@ int test_fee_estimator_wiring(void) {
      * constant -241 sat gap because the LSP init read estimatesmartfee's
      * ~2562 sat/kvB while channel_init pinned ch->fee_rate at 1000). */
     {
-        uint64_t expected_commit_fee = fee_at_1000;  /* 154 sats at 1000 rate */
+        uint64_t expected_commit_fee = fee_commitment_tx_at(f->tree_fee_rate, 0);
         for (size_t c = 0; c < 4; c++) {
             channel_t *ch = &mgr.entries[c].channel;
             uint64_t expected_usable = ch->funding_amount - expected_commit_fee;
             uint64_t actual_sum = ch->local_amount + ch->remote_amount;
             TEST_ASSERT_EQ(actual_sum, expected_usable,
-                           "conservation: local+remote == funding - 154 (not - "
-                           "fee_at_live_rate); see task #262");
+                           "conservation: local+remote == funding - fee at the agreed "
+                           "rate (not at the live rate); see task #262");
         }
         /* Also exercise the LSP-side check directly. */
         TEST_ASSERT(lsp_channels_check_conservation(&mgr),
@@ -2074,13 +2036,12 @@ int test_fee_estimator_null_fallback(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, all_kps, 5, 10, 4);
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2091,10 +2052,10 @@ int test_fee_estimator_null_fallback(void) {
     mgr.lsp_balance_pct = 50;
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec, 4), "init with NULL fee");
 
-    /* All channels should have default fee rate */
+    /* All channels have the agreed tree rate */
     for (size_t c = 0; c < 4; c++) {
-        TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)1000,
-                       "channel has default 1000 sat/kvB");
+        TEST_ASSERT_EQ(mgr.entries[c].channel.commit_fee_rate_sat_per_kvb, f->tree_fee_rate,
+                       "commitment has the agreed tree rate");
     }
 
     lsp_channels_cleanup(&mgr);
@@ -2397,6 +2358,8 @@ int test_regtest_lsp_restart_recovery(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
@@ -2427,7 +2390,7 @@ int test_regtest_lsp_restart_recovery(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2528,7 +2491,8 @@ int test_regtest_lsp_restart_recovery(void) {
         fprintf(stderr, "LSP: persist_begin failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !persist_save_factory(&db, &lsp->factory, ctx, 0)) {
+    if (lsp_ok && (!persist_save_factory(&db, &lsp->factory, ctx, 0) ||
+                   !persist_save_tree_nodes(&db, &lsp->factory, 0))) {
         fprintf(stderr, "LSP: persist_save_factory failed\n");
         lsp_ok = 0;
     }
@@ -2644,23 +2608,20 @@ int test_regtest_lsp_restart_recovery(void) {
 
     /* Phase 8: Cooperative close on regtest */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats =
-            close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&rec_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
                                         n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
@@ -2762,6 +2723,7 @@ int test_profit_settlement_calculation(void) {
 
     TEST_ASSERT_EQ(mgr.accumulated_fees_sats, 0, "fees reset after settlement");
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -2803,6 +2765,7 @@ int test_settlement_trigger_at_interval(void) {
     TEST_ASSERT_EQ(settled, 0, "no settlement with zero fees");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -2839,6 +2802,7 @@ int test_on_close_includes_unsettled(void) {
     TEST_ASSERT_EQ(share1, 900, "client 1 unsettled share (per-channel)");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -2970,6 +2934,8 @@ int test_regtest_crash_double_recovery(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
@@ -3000,7 +2966,7 @@ int test_regtest_crash_double_recovery(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -3093,7 +3059,8 @@ int test_regtest_crash_double_recovery(void) {
         fprintf(stderr, "LSP: persist_begin failed\n");
         lsp_ok = 0;
     }
-    if (lsp_ok && !persist_save_factory(&db, &lsp->factory, ctx, 0)) {
+    if (lsp_ok && (!persist_save_factory(&db, &lsp->factory, ctx, 0) ||
+                   !persist_save_tree_nodes(&db, &lsp->factory, 0))) {
         fprintf(stderr, "LSP: persist_save_factory failed\n");
         lsp_ok = 0;
     }
@@ -3259,23 +3226,20 @@ int test_regtest_crash_double_recovery(void) {
 
     /* Cooperative close on regtest */
     if (lsp_ok) {
-        uint64_t close_total = funding_amount - 500;
-        size_t n_total = 5;
-        uint64_t per_party = close_total / n_total;
-
+        /* Pay every party its channel balance at its own close script;
+           clients refuse to sign anything less. */
         tx_output_t close_outputs[5];
-        for (size_t i = 0; i < n_total; i++) {
-            close_outputs[i].amount_sats = per_party;
-            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-            close_outputs[i].script_pubkey_len = 34;
-        }
-        close_outputs[n_total - 1].amount_sats =
-            close_total - per_party * (n_total - 1);
+        size_t n_total = lsp_channels_build_close_outputs(&rec_mgr2, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        if (n_total == 0)
+            fprintf(stderr, "LSP: build close outputs failed\n");
 
         tx_buf_t close_tx;
         tx_buf_init(&close_tx, 512);
 
-        if (!lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
+        if (n_total == 0 ||
+            !lsp_run_cooperative_close(lsp, &close_tx, close_outputs,
                                         n_total, 0)) {
             fprintf(stderr, "LSP: cooperative close failed\n");
             lsp_ok = 0;
@@ -3444,6 +3408,8 @@ int test_regtest_tcp_reconnect(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
@@ -3474,7 +3440,7 @@ int test_regtest_tcp_reconnect(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -3831,6 +3797,7 @@ int test_fee_accumulation_and_settlement(void) {
                    "LSP local decreased by per-channel share");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -3869,8 +3836,7 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             factory_t *f = calloc(1, sizeof(factory_t));
-            factory_alloc_default_arrays(f);
-            factory_alloc_default_arrays(f);
+            TEST_ASSERT(f && factory_alloc_default_arrays(f), "alloc factory");
             f->economic_mode = (economic_mode_t)configs[ci].econ;
             f->n_participants = 3;
             f->profiles[0].profit_share_bps = configs[ci].lsp_bps;
@@ -3942,6 +3908,7 @@ int test_fee_levels_and_profit_split(void) {
             }
 
             free(mgr.entries);
+            factory_free(f);
             free(f);
         }
     }
@@ -4013,8 +3980,7 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Factory with step_blocks=6, states_per_layer=2, 5 participants */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
+    TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, 5, 6, 2);
 
     uint32_t delta = lsp_compute_factory_cltv_delta(f);
@@ -4028,10 +3994,10 @@ int test_cltv_delta_from_tree_depth(void) {
 
     /* Verify it's used correctly in validation */
     uint32_t fwd;
-    TEST_ASSERT(lsp_validate_cltv_for_forward(delta + 10, &fwd, 0, delta) == 1,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(delta + 10, &fwd, 0, delta, 0) == 1,
                 "cltv above delta passes");
     TEST_ASSERT_EQ(fwd, 10, "forwarded = cltv - delta");
-    TEST_ASSERT(lsp_validate_cltv_for_forward(delta - 1, &fwd, 0, delta) == 0,
+    TEST_ASSERT(lsp_validate_cltv_for_forward(delta - 1, &fwd, 0, delta, 0) == 0,
                 "cltv below delta rejected");
 
     /* NULL factory returns default */
@@ -4174,6 +4140,7 @@ int test_close_outputs_wallet_spk(void) {
                 "override beats lsp_close_spk: client 0 uses override");
 
     free(mgr.entries);
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -4206,8 +4173,6 @@ int test_lsp_close_spk_derived(void) {
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32] = {0};
@@ -4349,11 +4314,12 @@ int test_conservation_with_real_htlc(void) {
     channel_t *ch = &mgr.entries[0].channel;
     ch->funding_amount = 100000;
     /* Conservation invariant is local+remote+Σhtlc == funding - base_commit_fee.
-       base_commit_fee at 1 sat/vB is 154 sats (154 vB * 1000/1000 rounded up),
+       base_commit_fee at 1 sat/vB is 167 sats (167 vB * 1000/1000 rounded up),
        which lsp_channels_init deducts from the funder side before splitting. */
-    ch->local_amount = 49846;
+    ch->local_amount = 49833;
     ch->remote_amount = 50000;
     ch->fee_rate_sat_per_kvb = 1000;  /* 1 sat/vB */
+    ch->commit_fee_rate_sat_per_kvb = 1000;
     ch->funder_is_local = 1;
     /* channel_add_htlc needs local_pcs for commitment_number generation */
     ch->local_pcs = calloc(16, 32);
@@ -4381,8 +4347,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
                 "conservation OK during in-flight HTLC");
 
-    /* Verify exact balance: local = 49846 - 10000 (htlc) - 43 (fee) = 39803 */
-    TEST_ASSERT(ch->local_amount == 49846 - 10000 - expected_fee,
+    /* Verify exact balance: local = 49833 - 10000 (htlc) - 43 (fee) = 39803 */
+    TEST_ASSERT(ch->local_amount == 49833 - 10000 - expected_fee,
                 "local balance correct after add");
     TEST_ASSERT(ch->remote_amount == 50000,
                 "remote balance unchanged");
@@ -4396,7 +4362,7 @@ int test_conservation_with_real_htlc(void) {
     sha256(preimage, 32, hash);
     /* Re-add with correct hash */
     ch->n_htlcs = 0;
-    ch->local_amount = 49846;
+    ch->local_amount = 49833;
     ch->remote_amount = 50000;
     ch->commitment_number = 0;
     TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 10000, hash, 500, &htlc_id) == 1,
@@ -4404,8 +4370,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(channel_fulfill_htlc(ch, htlc_id, preimage) == 1,
                 "fulfill HTLC succeeds");
 
-    /* After fulfill: local = 49846 - 10000 - 43 + 43 = 39846, remote = 50000 + 10000 = 60000 */
-    TEST_ASSERT(ch->local_amount == 39846,
+    /* After fulfill: local = 49833 - 10000 - 43 + 43 = 39833, remote = 50000 + 10000 = 60000 */
+    TEST_ASSERT(ch->local_amount == 39833,
                 "local balance correct after fulfill");
     TEST_ASSERT(ch->remote_amount == 60000,
                 "remote balance correct after fulfill");
@@ -4478,8 +4444,6 @@ int test_client_ps_double_spend_defense_refuses(void) {
     memset(fake_fund_txid, 0x7A, 32);
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
-    factory_alloc_default_arrays(f);
     TEST_ASSERT(f, "alloc factory");
     factory_init(f, ctx, kps, N, 6, 10);
     factory_set_arity(f, FACTORY_ARITY_PS);
@@ -4510,6 +4474,9 @@ int test_client_ps_double_spend_defense_refuses(void) {
 
     /* Wire the defense into client_handle_leaf_advance. */
     client_set_persist(&db);
+    /* Tree advances are refused outright unless the harness opt-in is set;
+       set it so the proposal reaches the double-spend check. */
+    client_set_allow_tree_advance(1);
 
     /* Build a valid LEAF_ADVANCE_PROPOSE from the LSP (index 0) so the
        handler can parse it and proceed far enough to hit our check. */
@@ -4544,6 +4511,7 @@ int test_client_ps_double_spend_defense_refuses(void) {
     TEST_ASSERT(rc == 0, "handler REFUSES when parent already signed");
 
     /* Cleanup — reset the global persist hook. */
+    client_set_allow_tree_advance(0);
     client_set_persist(NULL);
     cJSON_Delete(propose_json);
     close(pipefd[0]);
@@ -4555,3 +4523,650 @@ int test_client_ps_double_spend_defense_refuses(void) {
     return 1;
 }
 
+/* ---- A settled payment leaves the factory leaf untouched ----
+
+   In-process: LSP + 2 clients over TCP on a per-client-leaf factory, no chain
+   backend (the funding outpoint is synthetic; nothing is broadcast).  Client A
+   pays client B through the LSP's normal message handler, then:
+
+     1. both leaf nodes must be exactly what they were before the payment
+        (txid, signed bytes, PS chain length, DW leaf state);
+     2. the leaf-advance entry point must refuse a leaf whose channel holds
+        client funds, without changing anything;
+     3. with the explicit override the same entry point must run the ceremony
+        and replace the leaf transaction, while the channel keeps its funding
+        outpoint -- the reason for the refusal in (2). */
+
+typedef struct {
+    unsigned char txid[32];
+    unsigned char *signed_tx;
+    size_t signed_tx_len;
+    int ps_chain_len;
+    uint32_t dw_state;
+    uint32_t epoch;
+} leaf_snapshot_t;
+
+static void leaf_snapshot_take(const factory_t *f, int leaf_side, leaf_snapshot_t *out) {
+    const factory_node_t *n = &f->nodes[f->leaf_node_indices[leaf_side]];
+    memset(out, 0, sizeof(*out));
+    memcpy(out->txid, n->txid, 32);
+    if (n->is_signed && n->signed_tx.len > 0) {
+        out->signed_tx = malloc(n->signed_tx.len);
+        if (out->signed_tx) {
+            memcpy(out->signed_tx, n->signed_tx.data, n->signed_tx.len);
+            out->signed_tx_len = n->signed_tx.len;
+        }
+    }
+    out->ps_chain_len = n->ps_chain_len;
+    out->dw_state = f->leaf_layers[leaf_side].current_state;
+    out->epoch = f->counter.current_epoch;
+}
+
+static int leaf_snapshot_matches(const factory_t *f, int leaf_side, const leaf_snapshot_t *snap) {
+    const factory_node_t *n = &f->nodes[f->leaf_node_indices[leaf_side]];
+    if (memcmp(snap->txid, n->txid, 32) != 0) return 0;
+    if (snap->ps_chain_len != n->ps_chain_len) return 0;
+    if (snap->dw_state != f->leaf_layers[leaf_side].current_state) return 0;
+    if (snap->epoch != f->counter.current_epoch) return 0;
+    if (snap->signed_tx_len != (n->is_signed ? n->signed_tx.len : 0)) return 0;
+    if (snap->signed_tx_len > 0 &&
+        memcmp(snap->signed_tx, n->signed_tx.data, snap->signed_tx_len) != 0) return 0;
+    return 1;
+}
+
+static int run_payment_leaf_untouched(int arity_code, int port_bias) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+
+    /* Funding SPK: key-path P2TR over the 3-of-3 aggregate. */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 3);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0xC7, 32);
+    const uint32_t funding_vout = 0;
+    const uint64_t funding_amount = 1000000;
+
+    unsigned char preimage[32] = { [0 ... 31] = 0x5D };
+    unsigned char payment_hash[32];
+    sha256(preimage, 32, payment_hash);
+
+    payment_test_data_t sender_data, payee_data;
+    memset(&sender_data, 0, sizeof(sender_data));
+    memset(&payee_data, 0, sizeof(payee_data));
+    memcpy(sender_data.payment_hash, payment_hash, 32);
+    sender_data.is_sender = 1;
+    memcpy(payee_data.payment_hash, payment_hash, 32);
+    memcpy(payee_data.preimage, preimage, 32);
+
+    int port = 21300 + (getpid() % 1000) + port_bias;
+
+    pid_t child_pids[2];
+    for (int c = 0; c < 2; c++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
+            /* Step (3) below runs advance ceremonies against these clients,
+               which they refuse without the harness opt-in. */
+            client_set_allow_tree_advance(1);
+            int ok = client_run_with_channels(child_ctx, &child_kp,
+                                               "127.0.0.1", port,
+                                               payment_client_cb,
+                                               c == 0 ? &sender_data : &payee_data,
+                                               NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 2);
+    int lsp_ok = 1;
+    const char *why = "";
+#define LEAF_STEP(cond, msg) do { \
+        if (lsp_ok && !(cond)) { lsp_ok = 0; why = (msg); } \
+    } while (0)
+
+    LEAF_STEP(lsp_accept_clients(lsp), "accept clients");
+    lsp->factory.leaf_arity = (factory_arity_t)arity_code;
+    LEAF_STEP(lsp_run_factory_creation(lsp, funding_txid, funding_vout,
+                                        funding_amount, fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */),
+              "factory creation");
+    LEAF_STEP((int)lsp->factory.leaf_arity == arity_code, "requested leaf arity kept");
+    LEAF_STEP(lsp->factory.n_leaf_nodes == 2, "one leaf per client");
+
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    LEAF_STEP(lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 2), "channel init");
+    LEAF_STEP(lsp_channels_exchange_basepoints(&ch_mgr, lsp), "basepoint exchange");
+    LEAF_STEP(lsp_channels_send_ready(&ch_mgr, lsp), "channel_ready");
+
+    leaf_snapshot_t before[2];
+    memset(before, 0, sizeof(before));
+    unsigned char chan_funding_txid[2][32];
+    uint64_t remote_before[2] = {0, 0};
+    if (lsp_ok) {
+        for (int l = 0; l < 2; l++) {
+            leaf_snapshot_take(&lsp->factory, l, &before[l]);
+            memcpy(chan_funding_txid[l], ch_mgr.entries[l].channel.funding_txid, 32);
+            remote_before[l] = ch_mgr.entries[l].channel.remote_amount;
+            /* The channel is funded by output 0 of its leaf transaction. */
+            LEAF_STEP(memcmp(chan_funding_txid[l], before[l].txid, 32) == 0,
+                      "channel funded by its leaf");
+        }
+    }
+
+    /* The payment: ADD_HTLC from client A, FULFILL_HTLC from client B, both
+       through the LSP's message handler (the settlement path). */
+    for (int step = 0; step < 2 && lsp_ok; step++) {
+        wire_msg_t msg;
+        uint8_t want = step == 0 ? MSG_UPDATE_ADD_HTLC : MSG_UPDATE_FULFILL_HTLC;
+        if (!wire_recv(lsp->client_fds[step], &msg)) {
+            lsp_ok = 0; why = "recv payment message";
+            break;
+        }
+        LEAF_STEP(msg.msg_type == want, "payment message type");
+        LEAF_STEP(lsp_channels_handle_msg(&ch_mgr, lsp, (size_t)step, &msg),
+                  "handle payment message");
+        cJSON_Delete(msg.json);
+    }
+
+    /* (1) payment settled, leaves untouched. */
+    if (lsp_ok) {
+        LEAF_STEP(ch_mgr.entries[0].channel.remote_amount == remote_before[0] - 5000,
+                  "sender debited");
+        LEAF_STEP(ch_mgr.entries[1].channel.remote_amount == remote_before[1] + 5000,
+                  "payee credited");
+        for (int l = 0; l < 2; l++) {
+            LEAF_STEP(leaf_snapshot_matches(&lsp->factory, l, &before[l]),
+                      "leaf unchanged by the payment");
+            LEAF_STEP(memcmp(ch_mgr.entries[l].channel.funding_txid,
+                             lsp->factory.nodes[lsp->factory.leaf_node_indices[l]].txid,
+                             32) == 0,
+                      "channel still funded by the current leaf transaction");
+        }
+    }
+
+    /* (2) the entry points refuse while a channel is open on the tree they
+       would replace -- whatever the channel's balances are. */
+    if (lsp_ok) {
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
+                  "advance refused while a channel is open on the leaf");
+        channel_t *ch1 = &ch_mgr.entries[1].channel;
+        uint64_t keep_remote = ch1->remote_amount;
+        ch1->remote_amount = 0;
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
+                  "advance refused for an open channel with no client balance");
+        ch1->remote_amount = keep_remote;
+        LEAF_STEP(lsp_factory_tick_root(&ch_mgr, lsp, 0) == -1,
+                  "root tick refused while channels are open");
+        for (int l = 0; l < 2; l++)
+            LEAF_STEP(leaf_snapshot_matches(&lsp->factory, l, &before[l]),
+                      "refused advance changed nothing");
+    }
+
+    /* (3) the ceremony itself still works through the entry point when the
+       override is given: leaf 1 is replaced, leaf 0 is not, and the channel
+       on leaf 1 is left pointing at the replaced transaction. */
+    if (lsp_ok) {
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 1) == 1,
+                  "advance ceremony with override");
+        const factory_node_t *n1 =
+            &lsp->factory.nodes[lsp->factory.leaf_node_indices[1]];
+        LEAF_STEP(memcmp(n1->txid, before[1].txid, 32) != 0,
+                  "advanced leaf has a new txid");
+        LEAF_STEP(n1->is_signed && n1->signed_tx.len > 0, "advanced leaf is signed");
+        if (arity_code == FACTORY_ARITY_PS)
+            LEAF_STEP(n1->ps_chain_len == before[1].ps_chain_len + 1,
+                      "PS chain extended by one");
+        else
+            LEAF_STEP(lsp->factory.leaf_layers[1].current_state == before[1].dw_state + 1,
+                      "DW leaf state advanced by one");
+        LEAF_STEP(leaf_snapshot_matches(&lsp->factory, 0, &before[0]),
+                  "other leaf untouched by the advance");
+        LEAF_STEP(memcmp(ch_mgr.entries[1].channel.funding_txid,
+                         chan_funding_txid[1], 32) == 0,
+                  "advance does not re-anchor the channel");
+    }
+
+    /* (4) DW leaves only: a leaf advance that exhausts the leaf rolls over
+       into a whole-tree state advance, which replaces leaf 0 as well.  The
+       guard therefore looks at every channel of the factory for it, and with
+       the override the state-advance ceremony runs against both clients. */
+    if (lsp_ok && arity_code == FACTORY_ARITY_1) {
+        uint32_t max_states = lsp->factory.leaf_layers[1].config.max_states;
+        while (lsp_ok && lsp->factory.leaf_layers[1].current_state + 1 < max_states)
+            LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 1) == 1,
+                      "advance up to the last leaf state");
+        uint32_t epoch_before = lsp->factory.counter.current_epoch;
+        unsigned char leaf0_txid[32];
+        memcpy(leaf0_txid,
+               lsp->factory.nodes[lsp->factory.leaf_node_indices[0]].txid, 32);
+        /* Only leaf 0's channel counts as open now: the rollover must still
+           be refused, because it replaces leaf 0 too. */
+        uint64_t keep_funding = ch_mgr.entries[1].channel.funding_amount;
+        ch_mgr.entries[1].channel.funding_amount = 0;
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 0) == 0,
+                  "rollover refused for an open channel on another leaf");
+        ch_mgr.entries[1].channel.funding_amount = keep_funding;
+        LEAF_STEP(lsp->factory.counter.current_epoch == epoch_before &&
+                  memcmp(leaf0_txid,
+                         lsp->factory.nodes[lsp->factory.leaf_node_indices[0]].txid,
+                         32) == 0,
+                  "refused rollover changed nothing");
+        LEAF_STEP(lsp_channels_advance_ps_leaf(&ch_mgr, lsp, 1, 1) == 1,
+                  "state-advance ceremony with override");
+        LEAF_STEP(lsp->factory.counter.current_epoch == epoch_before + 1,
+                  "root advanced one epoch");
+        LEAF_STEP(memcmp(leaf0_txid,
+                         lsp->factory.nodes[lsp->factory.leaf_node_indices[0]].txid,
+                         32) != 0,
+                  "state advance replaced the other leaf too");
+        LEAF_STEP(memcmp(ch_mgr.entries[0].channel.funding_txid,
+                         chan_funding_txid[0], 32) == 0,
+                  "state advance does not re-anchor channels");
+    }
+
+    /* Cooperative close so the clients exit cleanly (never broadcast).  Every
+       party is paid its channel balance at its own close script. */
+    if (lsp_ok) {
+        tx_output_t close_outputs[3];
+        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500,
+                                                           NULL, 0);
+        LEAF_STEP(n_close == 3, "build close outputs");
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+        LEAF_STEP(lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_close, 0),
+                  "cooperative close");
+        tx_buf_free(&close_tx);
+    }
+#undef LEAF_STEP
+
+    for (int l = 0; l < 2; l++) free(before[l].signed_tx);
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+
+    int all_children_ok = 1;
+    for (int c = 0; c < 2; c++) {
+        int status;
+        if (!lsp_ok) kill(child_pids[c], SIGKILL);
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            all_children_ok = 0;
+    }
+    secp256k1_context_destroy(ctx);
+
+    if (!lsp_ok) {
+        printf("  FAIL: %s (arity code %d): %s\n", __func__, arity_code, why);
+        return 0;
+    }
+    TEST_ASSERT(all_children_ok, "both clients completed");
+    return 1;
+}
+
+int test_payment_leaves_leaf_untouched_arity_ps(void) {
+    return run_payment_leaf_untouched(FACTORY_ARITY_PS, 0);
+}
+
+int test_payment_leaves_leaf_untouched_arity1(void) {
+    return run_payment_leaf_untouched(FACTORY_ARITY_1, 50);
+}
+
+/* ---- The client refuses every tree advance ----
+
+   Each of the three handlers is given a proposal on a socketpair whose far
+   end only reads.  Without the harness opt-in the client must answer with a
+   single MSG_ERROR -- no nonce message -- and leave its factory untouched.
+   With the opt-in the same leaf proposal gets a nonce, which shows the
+   refusal is what stopped it. */
+
+/* Runs one handler; returns its result and, in types[] and *n, every message
+   type the client sent. */
+static int run_advance_handler(int which, secp256k1_context *ctx,
+                                const secp256k1_keypair *kp, factory_t *f,
+                                uint8_t *types, size_t max, size_t *n) {
+    *n = 0;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    shutdown(sv[0], SHUT_WR);   /* the handler's first read sees EOF */
+    wire_msg_t propose;
+    memset(&propose, 0, sizeof(propose));
+    int rc;
+    if (which == 0) {
+        propose.msg_type = MSG_LEAF_ADVANCE_PROPOSE;
+        propose.json = wire_build_leaf_advance_propose(0, NULL, NULL);
+        rc = client_handle_leaf_advance(sv[1], ctx, kp, f, 1, &propose);
+    } else if (which == 1) {
+        propose.msg_type = MSG_STATE_ADV_PROPOSE_INTENT;
+        propose.json = cJSON_CreateObject();
+        rc = client_handle_state_advance(sv[1], ctx, kp, f, 1, &propose);
+    } else {
+        propose.msg_type = MSG_SUBFACTORY_PROPOSE_INTENT;
+        propose.json = cJSON_CreateObject();
+        rc = client_handle_subfactory_advance(sv[1], ctx, kp, f, 1, &propose);
+    }
+    cJSON_Delete(propose.json);
+    close(sv[1]);
+    wire_msg_t reply;
+    memset(&reply, 0, sizeof(reply));
+    while (wire_recv(sv[0], &reply)) {
+        if (*n < max) types[*n] = reply.msg_type;
+        (*n)++;
+        if (reply.json) cJSON_Delete(reply.json);
+        memset(&reply, 0, sizeof(reply));
+    }
+    close(sv[0]);
+    return rc;
+}
+
+int test_client_refuses_tree_advances(void) {
+    secp256k1_context *ctx = test_ctx();
+    const size_t N = 3;
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    for (size_t i = 0; i < N; i++) {
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys[i]), "keypair");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]), "pubkey");
+    }
+    unsigned char fund_spk[34];
+    {
+        musig_keyagg_t ka;
+        musig_aggregate_keys(ctx, &ka, pks, N);
+        unsigned char ser[32], tweak[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey);
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw_pk;
+        secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tw_pk, &ka.cache, tweak);
+        secp256k1_xonly_pubkey tw_xo;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tw_xo, NULL, &tw_pk);
+        build_p2tr_script_pubkey(fund_spk, &tw_xo);
+    }
+    unsigned char fund_txid[32];
+    memset(fund_txid, 0x3E, 32);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc factory");
+    factory_init(f, ctx, kps, N, 6, 10);
+    factory_set_arity(f, FACTORY_ARITY_PS);
+    factory_set_funding(f, fund_txid, 0, 500000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build PS tree");
+    TEST_ASSERT(factory_sign_all(f), "sign PS tree");
+
+    leaf_snapshot_t snap[2];
+    for (int l = 0; l < 2; l++) leaf_snapshot_take(f, l, &snap[l]);
+
+    client_set_persist(NULL);
+    client_set_allow_tree_advance(0);
+    int ok = 1;
+    const char *why = "";
+    static const char *const names[3] = { "leaf advance", "state advance",
+                                          "sub-factory advance" };
+    for (int which = 0; which < 3 && ok; which++) {
+        uint8_t types[4];
+        size_t n = 0;
+        int rc = run_advance_handler(which, ctx, &kps[1], f, types, 4, &n);
+        if (rc != 0) { ok = 0; why = "handler did not refuse"; }
+        else if (n != 1 || types[0] != MSG_ERROR) {
+            ok = 0; why = "refusal is not a single MSG_ERROR (a nonce may have been sent)";
+        } else if (!leaf_snapshot_matches(f, 0, &snap[0]) ||
+                   !leaf_snapshot_matches(f, 1, &snap[1])) {
+            ok = 0; why = "refused advance changed the factory";
+        }
+        if (!ok) printf("  FAIL: %s: %s\n", names[which], why);
+    }
+
+    /* With the opt-in the leaf proposal is answered with the client's nonce. */
+    if (ok) {
+        client_set_allow_tree_advance(1);
+        uint8_t types[4];
+        size_t n = 0;
+        (void)run_advance_handler(0, ctx, &kps[1], f, types, 4, &n);
+        client_set_allow_tree_advance(0);
+        if (n < 1 || types[0] != MSG_LEAF_ADVANCE_CLIENT_PUBNONCE) {
+            ok = 0;
+            printf("  FAIL: with the opt-in the leaf advance did not proceed "
+                   "(%zu message(s), first 0x%02x)\n", n, n ? types[0] : 0);
+        }
+    }
+
+    for (int l = 0; l < 2; l++) free(snap[l].signed_tx);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return ok;
+}
+
+
+/* ---- A payment to a client whose channel cannot take another HTLC ---- */
+
+/* Client side: client 1 pays client 2 and must be told the payment failed,
+   and end with its HTLC gone; client 2 does nothing. */
+typedef struct {
+    unsigned char payment_hash[32];
+    int got_fail;
+} fullfwd_data_t;
+
+static int fullfwd_client_cb(int fd, channel_t *ch, uint32_t my_index,
+                             secp256k1_context *ctx,
+                             const secp256k1_keypair *keypair,
+                             factory_t *factory, size_t n_participants,
+                             void *user_data) {
+    (void)keypair; (void)factory; (void)n_participants;
+    fullfwd_data_t *d = (fullfwd_data_t *)user_data;
+    if (my_index != 1) return 1;
+    if (!client_send_payment(fd, ch, 5000, d->payment_hash, 500, 1)) return 0;
+    for (int i = 0; i < 6; i++) {
+        wire_msg_t msg;
+        if (!recv_skip_revocations(fd, &msg)) return 0;
+        if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
+            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            cJSON_Delete(msg.json);
+            if (d->got_fail) break;      /* the fail's commitment */
+        } else if (msg.msg_type == MSG_UPDATE_FAIL_HTLC) {
+            int committed = 0;
+            uint64_t fid = 0;
+            int ok = client_handle_fail_htlc(ch, &msg, &committed, &fid);
+            cJSON_Delete(msg.json);
+            if (!ok) return 0;
+            d->got_fail = 1;
+            printf("Client %u: payment failed back (%s)\n", my_index,
+                   committed ? "committed" : "never committed");
+            if (!committed) break;
+        } else {
+            fprintf(stderr, "Client %u: unexpected msg 0x%02x\n", my_index,
+                    msg.msg_type);
+            cJSON_Delete(msg.json);
+            return 0;
+        }
+    }
+    for (size_t h = 0; h < ch->n_htlcs; h++)
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) return 0;
+    return d->got_fail;
+}
+
+/* The LSP forwards a payment between two clients.  When the payee's channel
+   already carries the most HTLC outputs a relayable commitment can hold,
+   the forward cannot be added there: the payment must fail back to the
+   payer, whose HTLC must not stay locked in its channel. */
+int test_forward_into_full_channel_fails_back(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 3);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache,
+                                                tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk))
+        return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0xC9, 32);
+    const uint64_t funding_amount = 2000000;
+
+    fullfwd_data_t data;
+    memset(&data, 0, sizeof(data));
+    memset(data.payment_hash, 0x6E, 32);
+
+    int port = 21300 + (getpid() % 1000) + 120;
+    pid_t child_pids[2];
+    for (int c = 0; c < 2; c++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* The funding script is derived from the participants in key
+               order.  The LSP orders the members by these slot hints, not by
+               connection order; the clients connect in reverse so the test
+               never depends on which one the LSP accepts first. */
+            usleep(100000 * (2 - c));
+            client_set_slot_hint(c + 1);
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
+            int ok = client_run_with_channels(child_ctx, &child_kp, "127.0.0.1", port,
+                                               fullfwd_client_cb, &data, NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 2);
+    int lsp_ok = 1;
+    const char *why = "";
+#define FF_STEP(cond, msg) do { \
+        if (lsp_ok && !(cond)) { lsp_ok = 0; why = (msg); } \
+    } while (0)
+    FF_STEP(lsp_accept_clients(lsp), "accept clients");
+    lsp->factory.leaf_arity = FACTORY_ARITY_PS;
+    FF_STEP(lsp_run_factory_creation(lsp, funding_txid, 0, funding_amount, fund_spk, 34,
+                                      10, 4, 2000000 /* CLTV: a distribution TX is required */),
+            "factory creation");
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    FF_STEP(lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 2), "channel init");
+    FF_STEP(lsp_channels_exchange_basepoints(&ch_mgr, lsp), "basepoint exchange");
+    FF_STEP(lsp_channels_send_ready(&ch_mgr, lsp), "channel_ready");
+
+    /* Fill the payee's channel (the LSP's copy) up to the cap. */
+    channel_t *dest = &ch_mgr.entries[1].channel;
+    channel_t *sender = &ch_mgr.entries[0].channel;
+    uint64_t dest_local0 = 0, dest_remote0 = 0, sender_local0 = 0, sender_remote0 = 0;
+    size_t dest_n0 = 0;
+    if (lsp_ok) {
+        dest_local0 = dest->local_amount;
+        dest_remote0 = dest->remote_amount;
+        dest_n0 = dest->n_htlcs;
+        sender_local0 = sender->local_amount;
+        sender_remote0 = sender->remote_amount;
+        size_t max = channel_max_commit_htlc_outputs();
+        for (size_t i = 0; lsp_ok && channel_commit_htlc_outputs(dest) < max; i++) {
+            unsigned char h[32];
+            memset(h, 0x11, 32);
+            h[0] = (unsigned char)i;
+            h[1] = (unsigned char)(i >> 8);
+            uint64_t id;
+            FF_STEP(channel_add_htlc(dest, HTLC_OFFERED, 600, h, 400, &id),
+                    "fill the payee's channel");
+        }
+        FF_STEP(channel_commit_htlc_outputs(dest) == max, "payee's channel at the cap");
+    }
+
+    /* The payment arrives from client 0 for client 1. */
+    int handled = -1;
+    if (lsp_ok) {
+        wire_msg_t msg;
+        if (!wire_recv(lsp->client_fds[0], &msg)) { lsp_ok = 0; why = "recv add"; }
+        else {
+            FF_STEP(msg.msg_type == MSG_UPDATE_ADD_HTLC, "add message");
+            handled = lsp_channels_handle_msg(&ch_mgr, lsp, 0, &msg);
+            cJSON_Delete(msg.json);
+        }
+    }
+    if (lsp_ok) {
+        printf("  handle_msg returned %d; sender HTLCs: %zu\n", handled, sender->n_htlcs);
+        FF_STEP(handled == 1, "a full payee channel is a payment failure, not an error");
+        int active = 0;
+        for (size_t h = 0; h < sender->n_htlcs; h++)
+            if (sender->htlcs[h].state == HTLC_STATE_ACTIVE &&
+                memcmp(sender->htlcs[h].payment_hash, data.payment_hash, 32) == 0)
+                active++;
+        FF_STEP(active == 0, "the payer's HTLC is not left in its channel");
+        FF_STEP(sender->local_amount == sender_local0 &&
+                sender->remote_amount == sender_remote0, "the payer's balance is back");
+    }
+
+    /* Take the filler HTLCs out again (only the LSP's copy had them) and
+       close cooperatively so both clients exit. */
+    if (lsp_ok) {
+        dest->n_htlcs = dest_n0;
+        dest->local_amount = dest_local0;
+        dest->remote_amount = dest_remote0;
+        tx_output_t close_outputs[3];
+        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500, NULL, 0);
+        FF_STEP(n_close == 3, "close outputs");
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+        FF_STEP(lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_close, 0),
+                "cooperative close");
+        tx_buf_free(&close_tx);
+    }
+#undef FF_STEP
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    int children_ok = 1;
+    for (int c = 0; c < 2; c++) {
+        int status;
+        if (!lsp_ok) kill(child_pids[c], SIGKILL);
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) children_ok = 0;
+    }
+    secp256k1_context_destroy(ctx);
+    if (!lsp_ok) {
+        printf("  FAIL: %s: %s\n", __func__, why);
+        return 0;
+    }
+    TEST_ASSERT(children_ok, "the payer was told and both clients completed");
+    return 1;
+}

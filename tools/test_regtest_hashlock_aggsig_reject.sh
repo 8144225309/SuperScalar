@@ -47,7 +47,7 @@ $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 
 echo "--- LSP (--enable-hashlock-poison --cheat-daemon-sub + SS_CHEAT_BAD_POISON_AGGSIG=1) ---"
 env $ASAN_ENV SS_CHEAT_BAD_POISON_AGGSIG=1 "$LSP_BIN" \
-    --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 --ps-subfactory-arity $PS_SUB_ARITY \
+    --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $AMOUNT --fee-rate 1000 --confirm-timeout 600 --step-blocks 1 \
     --seckey "$LSP_SECKEY" --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET --db "$LSP_DB" --wt-db "$WT_DB" --cli-path "$(which bitcoin-cli)" \
@@ -56,7 +56,7 @@ LSP_PID=$!; PIDS+=($LSP_PID)
 for i in $(seq 1 60); do sleep 1; grep -q "listening on port $LSP_PORT" "$LSP_LOG" 2>/dev/null && break; kill -0 $LSP_PID 2>/dev/null || { echo "FAIL: LSP died"; tail -20 "$LSP_LOG"; exit 1; }; done
 
 for i in $(seq 0 $((N_CLIENTS-1))); do
-  env $ASAN_ENV "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $LSP_PORT \
+  env $ASAN_ENV "$CLIENT_BIN" --test-allow-tree-advance --network regtest --host 127.0.0.1 --port $LSP_PORT \
       --seckey "${CLIENT_SECKEYS[$i]}" --fee-rate 1000 --lsp-pubkey "$LSP_PUBKEY" --participant-id $((i+1)) --daemon \
       --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} --wallet $MINER_WALLET \
       --cli-path "$(which bitcoin-cli)" --db "$TMPDIR/client_${i}.db" > "$TMPDIR/client_${i}.log" 2>&1 &
