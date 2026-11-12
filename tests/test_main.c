@@ -52,6 +52,25 @@ static const char *test_filter = NULL;  /* if non-NULL, only run tests whose
     } \
 } while(0)
 
+/* Channel-update engine */
+extern int test_cu_schema_v46(void);
+extern int test_cu_apply_rules(void);
+extern int test_cu_round_add_fulfil(void);
+extern int test_cu_round_fail_and_fee(void);
+extern int test_cu_verify_failures(void);
+extern int test_cu_reconcile_table(void);
+extern int test_cu_crash_every_point(void);
+extern int test_cu_disconnect_every_send(void);
+extern int test_cu_lost_raa_reconciles(void);
+extern int test_cu_mid_round_queued(void);
+extern int test_cu_collision_host_wins(void);
+extern int test_cu_refuse_offer(void);
+extern int test_cu_data_loss(void);
+extern int test_cu_no_txn_across_calls(void);
+extern int test_cu_deadline_goes_onchain(void);
+extern int test_cu_penalty_failure_aborts(void);
+extern int test_cu_one_commitment_per_number(void);
+
 extern int test_dw_layer_init(void);
 extern int test_dw_delay_for_state(void);
 extern int test_dw_nsequence_for_state(void);
@@ -2213,6 +2232,25 @@ static void run_unit_tests(void) {
     RUN_TEST(test_dw_counter_init);
     RUN_TEST(test_dw_counter_advance);
     RUN_TEST(test_dw_counter_full_cycle);
+
+    printf("\n=== Channel-update engine ===\n");
+    RUN_TEST(test_cu_schema_v46);
+    RUN_TEST(test_cu_apply_rules);
+    RUN_TEST(test_cu_round_add_fulfil);
+    RUN_TEST(test_cu_round_fail_and_fee);
+    RUN_TEST(test_cu_verify_failures);
+    RUN_TEST(test_cu_reconcile_table);
+    RUN_TEST(test_cu_crash_every_point);
+    RUN_TEST(test_cu_disconnect_every_send);
+    RUN_TEST(test_cu_lost_raa_reconciles);
+    RUN_TEST(test_cu_mid_round_queued);
+    RUN_TEST(test_cu_collision_host_wins);
+    RUN_TEST(test_cu_refuse_offer);
+    RUN_TEST(test_cu_data_loss);
+    RUN_TEST(test_cu_no_txn_across_calls);
+    RUN_TEST(test_cu_deadline_goes_onchain);
+    RUN_TEST(test_cu_penalty_failure_aborts);
+    RUN_TEST(test_cu_one_commitment_per_number);
 
     printf("\n=== MuSig2 ===\n");
     RUN_TEST(test_musig_aggregate_keys);
