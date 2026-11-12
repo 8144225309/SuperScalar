@@ -18,7 +18,7 @@ Operator-visible behaviour changes.
 ### Reload and shutdown fixes
 
 - **A member whose stored factory is refused on reload stops.**  The member daemon used to treat the refusal as a lost connection and reload the same rows every second.  It now logs that the stored factory cannot be loaded and exits 1.
-- **A stored tree signature is checked on reload.**  Every stored tree transaction's key-path signature is verified against the output it spends (the funding output for the root, the parent's stored output otherwise); a signature that does not verify refuses the load for the LSP and the members.  The txid does not cover the witness, so a changed signature used to load and was found only when the transaction was broadcast.  A leaf or sub-factory state that spends an earlier state of its own chain is not covered by this check.
+- **A stored tree signature is checked on reload.**  Every stored tree transaction's key-path signature is verified against the output it spends (the funding output for the root, the parent's stored output otherwise); a signature that does not verify refuses the load for the LSP and the members.  The txid does not cover the witness, so a changed signature used to load and was found only when the transaction was broadcast.
 - **SIGINT and SIGTERM stop an LSP that is waiting for its members.**  The handlers are installed without `SA_RESTART`, so a blocked `accept()` or read returns; the LSP leaves the accept loop or the factory ceremony and exits 1 without writing a factory.
 
 ### Factory rotation is off by default
