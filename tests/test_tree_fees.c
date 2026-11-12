@@ -804,7 +804,11 @@ static lsp_t *plan_lsp(secp256k1_context *ctx, size_t n) {
         secp256k1_keypair kp;
         secp256k1_pubkey pk;
         if (!secp256k1_keypair_create(ctx, &kp, sk) ||
-            !secp256k1_keypair_pub(ctx, &pk, &kp)) return NULL;
+            !secp256k1_keypair_pub(ctx, &pk, &kp)) {
+            free(lsp->client_pubkeys);
+            free(lsp);
+            return NULL;
+        }
         if (i == 0) lsp->lsp_pubkey = pk; else lsp->client_pubkeys[i - 1] = pk;
     }
     return lsp;
