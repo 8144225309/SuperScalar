@@ -23,6 +23,16 @@
 #                      client must hold a signed commitment 0 for its channel
 #                      in the NEW factory, carrying its balance, and exit
 #                      with it.
+#   scenario "rotate_stopped": the LSP dies during a rotation after the new
+#                      tree is signed but before any client has commitment 0
+#                      of its new channel (SUPERSCALAR_CRASH_AT checkpoint
+#                      rotate_channel_setup).  Every client must report that
+#                      the rotation did not complete and exit non-zero, and
+#                      refuse to start again.  Its database must hold the
+#                      new factory as a pending record with its distribution
+#                      transaction, next to the untouched old factory and
+#                      commitment, and its --force-close must NOT publish
+#                      the new factory's tree.  No exit is attempted.
 #   scenario "reconnect": client 4 is restarted right after channel open,
 #                      then pays and is paid.  Both payments must succeed and
 #                      the client must stay up (commitment 0 took nonce index
@@ -50,7 +60,7 @@
 # covers, and this test would fail on a node with the default relay floor.
 #
 # Usage: bash tools/test_regtest_idle_client_exit.sh [BUILD_DIR]
-# Env:   SCENARIOS ("idle mixed rotate reconnect")  RPCPORT (18543)
+# Env:   SCENARIOS ("idle mixed rotate rotate_stopped reconnect")  RPCPORT (18543)
 #        PORT (29961)  KEEP (0)
 set -uo pipefail
 
@@ -58,7 +68,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${1:-$(dirname "$SCRIPT_DIR")/build}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
-SCENARIOS="${SCENARIOS:-idle mixed rotate reconnect}"
+SCENARIOS="${SCENARIOS:-idle mixed rotate rotate_stopped reconnect}"
 RPCPORT="${RPCPORT:-18543}"
 PORT="${PORT:-29961}"
 KEEP="${KEEP:-0}"
@@ -134,12 +144,13 @@ run_scenario(){
         idle)      echo "=== scenario 'idle': LSP + $N clients, no payments ===" ;;
         mixed)     echo "=== scenario 'mixed': LSP + $N clients, client 1 pays client 2, clients 3 and 4 idle ===" ;;
         rotate)    echo "=== scenario 'rotate': LSP + $N clients, one payment, factory rotation, then exit from the new factory ===" ;;
+        rotate_stopped) echo "=== scenario 'rotate_stopped': LSP + $N clients, the LSP dies mid-rotation before commitment 0 ===" ;;
         reconnect) echo "=== scenario 'reconnect': LSP + $N clients, client 4 restarted after open, then payments ===" ;;
         *)         echo "unknown scenario '$SC'"; return 1 ;;
     esac
     local H0; H0=$("${BCLI[@]}" getblockcount)
     local ACTIVE=3000
-    [ "$SC" = rotate ] && ACTIVE=45
+    { [ "$SC" = rotate ] || [ "$SC" = rotate_stopped ]; } && ACTIVE=45
     local LSPARGS=(--network regtest --port "$P" --clients $N --amount $AMOUNT
         --active-blocks $ACTIVE --dying-blocks 300 --cltv-timeout $((H0 + 3500))
         --step-blocks 5 --states-per-layer 2 --fee-rate $FEE --lsp-balance-pct 50
@@ -150,6 +161,8 @@ run_scenario(){
         LSPARGS+=(--cli)
         mkfifo "$D/cli.fifo"; exec 9<>"$D/cli.fifo"
         "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 <&9 &
+    elif [ "$SC" = rotate_stopped ]; then
+        SUPERSCALAR_CRASH_AT=rotate_channel_setup "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
     else
         "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
     fi
@@ -232,6 +245,47 @@ run_scenario(){
         b4=$(bal_of "$D/c4.db")
         if [ -n "$base" ] && [ "${b4:-0}" -eq $((base - 3000)) ]; then echo "  ok   client 4 balance $b4 sat = $base - 5000 + 2000"
         else red "  CHECK FAIL client 4 balance ${b4:-none} sat, expected $((base - 3000))"; ok=0; fi
+        kill_ss
+        [ "$ok" = 1 ]; return $?
+    fi
+
+    if [ "$SC" = rotate_stopped ]; then
+        local ok=1 rc fop
+        [ "$have" -eq $N ] || ok=0
+        mine 45
+        wait_log "lsp_crash_checkpoint: HIT 'rotate_channel_setup'" "$D/lsp.log" 600 "the LSP to die mid-rotation" || { grep -aE "LSP rotate:|DYING" "$D/lsp.log" | tail -8; return 1; }
+        echo "  LSP died at the checkpoint (height $("${BCLI[@]}" getblockcount))"
+        for i in $(seq 1 $N); do
+            for _ in $(seq 1 60); do kill -0 "${CPID[$i]}" 2>/dev/null || break; sleep 1; done
+            if kill -0 "${CPID[$i]}" 2>/dev/null; then red "  CHECK FAIL client $i is still running (it must stop, not reconnect)"; ok=0; continue; fi
+            wait "${CPID[$i]}" 2>/dev/null; rc=$?
+            if grep -q "ROTATION NOT COMPLETED" "$D/c$i.log" && [ "$rc" -ne 0 ]; then
+                echo "  ok   client $i reported the rotation as not completed and exited with status $rc"
+            else red "  CHECK FAIL client $i: exit status $rc, 'ROTATION NOT COMPLETED' $(grep -c "ROTATION NOT COMPLETED" "$D/c$i.log") time(s)"; ok=0; fi
+        done
+        stop_miner
+        # a restarted client finds the record and does not connect
+        for i in $(seq 1 $N); do
+            start_client "$i"
+            for _ in $(seq 1 30); do kill -0 "${CPID[$i]}" 2>/dev/null || break; sleep 1; done
+            if kill -0 "${CPID[$i]}" 2>/dev/null; then red "  CHECK FAIL client $i started again although its rotation is unfinished"; ok=0; continue; fi
+            wait "${CPID[$i]}" 2>/dev/null; rc=$?
+            if [ "$rc" -ne 0 ] && [ "$(grep -c "ROTATION NOT COMPLETED" "$D/c$i.log")" -ge 2 ] && ! grep -q "reconnecting from persisted state" "$D/c$i.log"; then
+                echo "  ok   client $i refuses to start again (status $rc)"
+            else red "  CHECK FAIL client $i restart: status $rc"; tail -3 "$D/c$i.log" | sed 's/^/    /'; ok=0; fi
+        done
+        for i in $(seq 1 $N); do
+            n=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT (SELECT count(*) FROM signed_commitments) || ' ' || (SELECT count(*) FROM factories WHERE id = 1) || (SELECT count(*) FROM distribution_txs WHERE factory_id = 1);" 2>/dev/null)
+            timeout 180 "$CLIENT_BIN" --network regtest --cli-path bitcoin-cli "${RPC[@]}" \
+                --force-close --db "$D/c$i.db" >> "$D/fc_c$i.log" 2>&1 </dev/null
+            if [ "$n" = "1 11" ] && grep -q "NOT publishing the factory tree" "$D/fc_c$i.log" && ! grep -q "broadcast node" "$D/fc_c$i.log"; then
+                echo "  ok   client $i: old commitment kept, new factory and its distribution TX recorded as pending, force-close left the new tree unpublished"
+            else red "  CHECK FAIL client $i: commitments/distribution rows '$n', force-close log: $(grep -E "Force-close:" "$D/fc_c$i.log" | head -2 | tr '\n' ' ')"; ok=0; fi
+        done
+        mine 2
+        fop=$(sqlite3 "file:$D/c1.db?mode=ro" "SELECT funding_txid || ' ' || funding_vout FROM factories WHERE id = 1;" 2>/dev/null)
+        if [ -n "$fop" ] && [ -n "$("${BCLI[@]}" gettxout $fop 2>/dev/null)" ]; then echo "  ok   the new factory's funding output ($fop) is still unspent"
+        else red "  CHECK FAIL the new factory's funding output ($fop) is spent or unknown"; ok=0; fi
         kill_ss
         [ "$ok" = 1 ]; return $?
     fi
@@ -332,7 +386,7 @@ def sats(v): return int(round(v * 1e8))
 
 lsp_db = os.path.join(D, "lsp.db")
 # the factory the clients are in now, as client 1 recorded it
-fac = q(os.path.join(D, "c1.db"), "SELECT funding_txid, funding_vout, funding_amount FROM factories ORDER BY id DESC LIMIT 1")
+fac = q(os.path.join(D, "c1.db"), "SELECT funding_txid, funding_vout, funding_amount FROM factories WHERE id = 0")
 if not fac:
     print("  CHECK FAIL no factory row in client 1's database"); sys.exit(1)
 fund_op, F = (fac[0][0], fac[0][1]), fac[0][2]
