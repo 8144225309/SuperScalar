@@ -148,7 +148,6 @@ static int build_factory(secp256k1_context *ctx, factory_t *f,
                          secp256k1_pubkey pks[5], const unsigned char txid[32],
                          uint32_t vout, uint64_t amt,
                          const unsigned char fund_spk[34], uint32_t cltv) {
-    factory_alloc_default_arrays(f);
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     f->cltv_timeout = cltv;
     f->tree_fee_rate = 2000;
