@@ -377,6 +377,7 @@ add_executable(test_superscalar
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_cli_arity.c
+    tests/test_tree_shape.c
     tests/test_network.c
     tests/test_prometheus.c
 )
@@ -384,7 +385,7 @@ target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
 # Lets a test read the project's own headers (wire message id table).
 target_compile_definitions(test_superscalar PRIVATE SS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings)
+target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings ${CMAKE_DL_LIBS})
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_superscalar PRIVATE project_sanitizers)
 endif()

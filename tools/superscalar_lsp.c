@@ -2534,6 +2534,8 @@ int main(int argc, char *argv[]) {
         factory_arity_t fa = (factory_arity_t)leaf_arity;
         const uint8_t *la_ptr = (n_level_arity > 0) ? level_arities : NULL;
         if (!cli_validate_shape_for_bolt2016(la_ptr, n_level_arity, fa,
+                                              (uint32_t)(ps_subfactory_arity_arg > 1
+                                                         ? ps_subfactory_arity_arg : 1),
                                               (size_t)n_clients,
                                               static_near_root,
                                               step_blocks,
@@ -3984,9 +3986,12 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (n_level_arity > 0)
-        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
+            fprintf(stderr, "Error: --arity shape refused by the factory\n");
+            return 1;
+        }
+    } else if (leaf_arity == 1)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
@@ -4000,7 +4005,10 @@ accept_new_factory:
     if (ps_subfactory_arity_arg > 0)
         factory_set_ps_subfactory_arity(&lsp_p->factory,
                                           (uint32_t)ps_subfactory_arity_arg);
-    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
+        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
+        return 1;
+    }
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
     /* Populate default profiles from CLI config.  The shape setters above
