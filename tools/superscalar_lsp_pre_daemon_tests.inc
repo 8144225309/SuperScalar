@@ -481,7 +481,6 @@
                             if (cur_h > 0)
                                 factory_set_lifecycle(exh_f1, (uint32_t)cur_h,
                                                       active_blocks, dying_blocks);
-                            exh_f1->fee = fee_est;
 
                             /* Record Factory 1 initial (max) nSequence */
                             for (size_t ni = 0; ni < exh_f1->n_nodes; ni++) {
@@ -1134,7 +1133,6 @@
                     factory_set_lifecycle(f1, (uint32_t)cur_h,
                                           active_blocks, dying_blocks);
             }
-            f1->fee = fee_est;
 
             printf("Factory 1 created: %zu nodes signed\n", f1->n_nodes);
 
@@ -2252,7 +2250,8 @@
                 reverse_bytes(root_txid_rev, 32);
                 hex_encode(root_txid_rev, 32, root_txid_hex);
                 watchtower_add_pending_tx(&g_watchtower, root_txid_hex,
-                                           1, WATCHTOWER_ANCHOR_AMOUNT);
+                                           1, WATCHTOWER_ANCHOR_AMOUNT,
+                                           lsp_p->factory.funding_amount_sats);
             }
 
             /* Skip cooperative close — factory already spent */
@@ -2604,7 +2603,7 @@
                 fflush(stderr);
             }
 
-            int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_str);
+            int sent = cpfp_send_default(NULL, commit_hex, commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, sent ? commit_txid_str : "?",
                     "htlc_commitment", commit_hex, sent ? "ok" : "failed");
@@ -3662,7 +3661,7 @@
             }
             hex_encode(pc_commit_signed.data, pc_commit_signed.len, pc_commit_hex);
             char pc_commit_txid_str[65];
-            int pc_sent = regtest_send_raw_tx(&rt, pc_commit_hex,
+            int pc_sent = cpfp_send_default(NULL, pc_commit_hex,
                                                 pc_commit_txid_str);
             if (g_db)
                 persist_log_broadcast(g_db, pc_sent ? pc_commit_txid_str : "?",
@@ -4217,7 +4216,7 @@ bc_oom:
 
                 char *chex = malloc(cs.len * 2 + 1);
                 hex_encode(cs.data, cs.len, chex);
-                int csent = regtest_send_raw_tx(&rt, chex, commit_txids[ci]);
+                int csent = cpfp_send_default(NULL, chex, commit_txids[ci]);
                 if (g_db) {
                     char label[64];
                     snprintf(label, sizeof(label), "multi_htlc_commit_%zu", ci);
@@ -4425,7 +4424,7 @@ bc_oom:
                 char *chex = malloc(cs.len * 2 + 1);
                 hex_encode(cs.data, cs.len, chex);
                 char ctxid_str[65];
-                int csent = regtest_send_raw_tx(&rt, chex, ctxid_str);
+                int csent = cpfp_send_default(NULL, chex, ctxid_str);
                 if (g_db) {
                     char label[64];
                     snprintf(label, sizeof(label), "settlement_commit_%zu", ci);
@@ -4527,7 +4526,7 @@ bc_oom:
                 for (int li = 0; li < psa_f->n_leaf_nodes; li++) {
                     size_t nidx = psa_f->leaf_node_indices[li];
                     factory_node_t *node = &psa_f->nodes[nidx];
-                    uint64_t expected_amt = pre_amounts[li] - psa_f->fee_per_tx;
+                    uint64_t expected_amt = pre_amounts[li] - factory_ps_chain_reserve(psa_f);
                     printf("  Leaf %d post-advance: chain_len=%d, n_outputs=%zu, chan_amount=%llu (expected %llu)\n",
                            li, node->ps_chain_len, node->n_outputs,
                            (unsigned long long)node->outputs[0].amount_sats,

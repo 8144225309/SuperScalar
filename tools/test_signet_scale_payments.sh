@@ -93,7 +93,7 @@ echo "  clients=$N_CLIENTS arity=$ARITY static=$STATIC_NEAR_ROOT amount=$AMOUNT 
 # --- Launch LSP (route payments, cooperative close; NOT --force-close) ---
 nohup "$LSP_BIN" \
     --network signet --port "$PORT" \
-    --clients "$N_CLIENTS" --arity "$ARITY" \
+    --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree \
     --static-near-root "$STATIC_NEAR_ROOT" \
     --amount "$AMOUNT" \
     --active-blocks 50 --dying-blocks 20 \

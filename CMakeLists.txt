@@ -157,6 +157,7 @@ add_library(superscalar
     src/fee_estimator_blocks.c
     src/fee_estimator_api.c
     src/wallet_source_rpc.c
+    src/cpfp.c
     src/wallet_source_hd.c
     src/lsp_fund.c
     src/superscalar_sdk.c
@@ -312,6 +313,8 @@ add_executable(test_superscalar
     tests/test_reconnect.c
     tests/test_client_watchtower.c
     tests/test_cpfp.c
+    tests/test_tree_fees.c
+    tests/test_regtest_cpfp.c
     tests/test_jit.c
     tests/test_ceremony.c
     tests/test_crash_checkpoint.c

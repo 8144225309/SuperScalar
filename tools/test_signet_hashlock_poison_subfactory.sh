@@ -55,7 +55,7 @@ pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null||true; sleep 1
 
 # --- LSP (hashlock poison + sub cheat), self-funds from the signet wallet ---
 "$LSP_BIN" --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
-    --port $LSP_PORT --clients $N_CLIENTS --arity 3 --ps-subfactory-arity $PS_SUB_ARITY \
+    --port $LSP_PORT --clients $N_CLIENTS --arity 3 --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $AMOUNT --fee-rate $FEE_RATE --confirm-timeout $CONFIRM_TIMEOUT \
     --seckey "$LSP_SECKEY" --wallet "$WALLET" --db "$LSP_DB" --wt-db "$WT_DB" \
     --enable-hashlock-poison --demo --lsp-balance-pct 50 --cheat-daemon-sub > "$LSP_LOG" 2>&1 &

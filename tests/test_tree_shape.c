@@ -243,39 +243,41 @@ static uint32_t ts_shape_ewt(const ts_shape_t *s) {
 /* ---- Pinned tree txids ---- */
 
 /* Shapes valid and correct before the tree-shape fixes, with the digest of
-   their tree txids computed on the parent commit.  Any change here changes a
-   pre-signed tree. */
+   their tree txids.  Computed under the agreed-rate fee model: every tree tx
+   nVersion 3, paying FACTORY_DEFAULT_TREE_FEE_RATE (100 sat/kvB) for its exact
+   signed vsize, with the P2A anchor (240 sat) where the shape enables anchors.
+   Any change here changes a pre-signed tree. */
 static const struct { ts_shape_t s; const char *digest; } ts_pinned[] = {
     { { "N=4 arity 2", 4, {2}, 1, 0, 0, 0, 0, 0 },
-      "7e71097b7f9c82214a54e4320ca437ede0e18ebc20c030b7574e33c4734011ca" },
+      "d23da2e91ef537a7b35e4c447652552342c9e8b4a7ec880fea0101ac0515b464" },
     { { "N=4 arity 2 anchors cltv", 4, {2}, 1, 0, 1, 1000, 0, 0 },
-      "21827ef8c63d382504344cb5fe8bd19ec46bd5e6902b6e182bade0cb4b886f07" },
+      "8f242297bc0b62043af73db843273e16b9e13318ed5cec5c3b744ed94f146230" },
     { { "N=4 arity 1", 4, {1}, 1, 0, 0, 0, 0, 0 },
-      "5de4bda50947eff1f2b8ffd7edd3fe154fdb8ad6a4ada71f6fa2e30e143ea433" },
+      "4dff4366b9afad6d57e2341dd23412641a7bbe9fc06d4075962972b1b2a8f38e" },
     { { "N=16 PS", 16, {3}, 1, 0, 0, 0, 0, 0 },
-      "31d37e9c569b53cdefd98b40d741e1b5dd68cf298fc6d8ebc48f7c5bd1bb0ad0" },
+      "ebc52fd824db50215db6332c47bca7496dfdb9481791f8ac0965d08dd4da07a7" },
     { { "N=16 PS anchors cltv", 16, {3}, 1, 0, 1, 1000, 0, 0 },
-      "9207fd44692b9a924868674384739074758bec06724699e74397b97d03623fbb" },
+      "4af71776ddc349ac6a54f2f266e9b9c51faa2b3fb54863184cced4a0fb71a8a4" },
     { { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 },
-      "47462529fe4b39bc117d6230c42a68fbb71a4abe820688c3567d63f6a44265c0" },
+      "6f6095ac538f88d593cfee9bf5657e502e41e10e87a257551cdf78827a97400b" },
     { { "N=64 8,7,3 static 2", 64, {8, 7, 3}, 3, 2, 0, 0, 0, 0 },
-      "6f54cb8326268a07f160f092b131fe8d2a9d597e29be5c87f0e80279dfdf2a37" },
+      "394fa378c1f282c51dbab717b4204e676b0992a2820b0df56ea61bd73a9585b0" },
     { { "N=64 8,7,3 static 2 anchors", 64, {8, 7, 3}, 3, 2, 1, 1000, 0, 0 },
-      "6f986a0677ffd1abd6f56c484f46fd3c8cac40a4bdaa537f8fddc2a135f13f99" },
+      "7f1b7bbd27a2d324b791d80cb5844033ae60a1133725f2fc5ee6e24d45b00008" },
     { { "N=128 2,4,8 static 2", 128, {2, 4, 8}, 3, 2, 0, 0, 0, 0 },
-      "c91ceae6be824903b7af299914d5044e570407a1ed393a7cef7d4928b3c903ec" },
+      "460c8bc7e7a5effe6ff1cae9d21a0f4d1af7f6c485aa0fe8674d49a92512ff8b" },
     { { "N=7 3,4 static 1", 7, {3, 4}, 2, 1, 1, 1000, 0, 0 },
-      "9f4d4a47d85998de1939982483234b74be9cc4ac31b48da02bdb6419d37c8150" },
+      "00555e2b7b4a6ce3a48b050dfc70cfee66344eedf03947c1155b808625dfc1bc" },
     { { "N=12 2,4 static 1", 12, {2, 4}, 2, 1, 0, 0, 0, 0 },
-      "402d433582f149a93a4e33d60f5b76d07a9a794ae0bde46bf22a3ac898871a34" },
+      "53a1541b5d3d001c461ba27c9411f6701b800ab1901e5e0bc2bf84ef479045b1" },
     { { "N=12 timezone ties", 12, {2}, 1, 0, 0, 0, 0, 1 },
-      "97bcf891efa4e86590ae2209f9ded01d0b342e779666cdf68dbe25f2c11feb07" },
+      "09b04bcf208ec6771a3adb46ce131c3e9f09d3459d826e9dee8976bac7706197" },
     { { "N=257 factory_init default", 257, {0}, 0, 0, 0, 0, 0, 0 },
-      "9f0c10facc67acfdf79d750237770266362a74bd701add5b589a1d60a4162127" },
+      "83d4d16fbe7b54b9ed8a0d8072d6d0aa0acf3360f64d0902f75f4d36c8b83eeb" },
     { { "N=300 PS", 300, {3}, 1, 0, 1, 1000, 0, 0 },
-      "0db45178004e1291dfe6afdeb67267ce489173768df5fd503ccbd8fb0d9eddbc" },
+      "5f61855510cda94e6e0a976d9f30160c199f184878eb49fe9f2e125cfb75bc42" },
     { { "N=300 arity 2", 300, {2}, 1, 0, 1, 1000, 0, 0 },
-      "b9c53205b2dc3790b03a2c679cce748a33b8006785c616c2660bbba85eaea01e" },
+      "46cb60f975bd6f2df18b998a24cb6bfe9297b56a948630ef42b98c2c7afc1360" },
 };
 
 int test_tree_shape_txids_pinned(void) {
