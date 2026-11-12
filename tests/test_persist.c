@@ -3448,6 +3448,7 @@ int test_ptlc_commitment_output(void) {
 
     /* Build commitment tx WITHOUT PTLC */
     tx_buf_t tx1;
+    tx_buf_init(&tx1, 512);
     unsigned char txid1[32];
     int r1 = channel_build_commitment_tx(&ch, &tx1, txid1);
     TEST_ASSERT(r1, "PTLC_CO1: commitment without PTLC");
@@ -3464,6 +3465,7 @@ int test_ptlc_commitment_output(void) {
 
     /* Build commitment tx WITH PTLC */
     tx_buf_t tx2;
+    tx_buf_init(&tx2, 512);
     unsigned char txid2[32];
     int r2 = channel_build_commitment_tx(&ch, &tx2, txid2);
     TEST_ASSERT(r2, "PTLC_CO1: commitment with PTLC");
