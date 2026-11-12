@@ -28,6 +28,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/lsp_wellknown.h"
 #include "superscalar/factory_recovery.h"
+#include "superscalar/client_dist.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -923,6 +924,17 @@ static uint32_t client_tool_chain_tip(void *ctx) {
     return h > 0 ? (uint32_t)h : 0;
 }
 
+/* The factory's distribution TX: broadcast by this client once it is due
+   and the factory is still open.  Checked from the daemon loop and from the
+   reconnect loop, so it does not depend on the LSP being reachable. */
+static client_dist_watch_t g_dist_watch;
+
+static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
+                                             secp256k1_context *ctx) {
+    if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
+    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, NULL, 10, stdout);
+}
+
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                secp256k1_context *ctx,
                                const secp256k1_keypair *keypair,
@@ -1188,6 +1200,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
             }
+            if (cbd && cbd->db)
+                client_dist_tick(cbd->db, cbd->wt, ctx);
             /* Periodic fee settlement verification: compare expected share
                (from tracked routing volume) to actual balance increase. */
             static time_t last_fee_check = 0;
@@ -3002,6 +3016,11 @@ int main(int argc, char *argv[]) {
             persist_close(&db);
             return 1;
         }
+        if (client_dist_force_close(&db, &chain, NULL, stdout)) {
+            persist_close(&db);
+            printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
+            return 0;
+        }
 
         /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
            signed factory tree is published root-down. factory_recovery_scan() is the
@@ -3946,12 +3965,23 @@ int main(int argc, char *argv[]) {
                    detect on-chain breaches even when the LSP is unreachable. */
                 if (cbd.wt)
                     watchtower_check(cbd.wt);
+                /* The factory's end date pays the members without the LSP. */
+                if (use_db &&
+                    client_dist_tick(&db, cbd.wt, ctx) == CLIENT_DIST_CONFIRMED) {
+                    printf("Client: the factory is settled by its distribution "
+                           "TX; nothing left to do, exiting\n");
+                    ok = 1;
+                    break;
+                }
                 sleep(1);
             } else {
                 break;  /* clean exit */
             }
         }
-        if (cbd.force_close_requested)
+        client_dist_watch_free(&g_dist_watch);
+        /* A due distribution TX is the exit; the tree would make it invalid. */
+        if (cbd.force_close_requested &&
+            !(use_db && client_dist_force_close(&db, client_wt.chain, NULL, stderr)))
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);
         /* A close that did not complete is not a clean exit. */
@@ -4000,7 +4030,8 @@ int main(int argc, char *argv[]) {
             ok = client_run_with_channels(ctx, &kp, host, port,
                                           daemon_channel_cb, &cbd,
                                           sa_vfn, sa_vctx);
-            if (cbd.force_close_requested)
+            if (cbd.force_close_requested &&
+                !(use_db && client_dist_force_close(&db, client_wt.chain, NULL, stderr)))
                 client_force_close_from_db(db_path, network, cli_path,
                                            rpcuser, rpcpassword, datadir, rpcport);
             if (cbd.close_not_completed)
