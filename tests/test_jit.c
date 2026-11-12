@@ -1472,6 +1472,31 @@ int test_lsps2_buy_refused_when_jit_disabled(void) {
     TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
     TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
 
+    /* Without the channel manager (as in the ceremony phases), and with
+       no context at all, both are refused the same way. */
+    {
+        lsps_ctx_t no_mgr = { .mgr = NULL, .lsp = fx.lsp, .client_idx = 0 };
+        const lsps_ctx_t *ctxs[2] = { &no_mgr, NULL };
+        for (int k = 0; k < 2; k++) {
+            cJSON *b = gate_build_lsps2_buy(50 + k);
+            cJSON *g = cJSON_Parse("{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"lsps2.get_info\"}");
+            cJSON *rb = lsps_dispatch_request(ctxs[k], b);
+            cJSON *rg = lsps_dispatch_request(ctxs[k], g);
+            const cJSON *eb = rb ? cJSON_GetObjectItem(rb, "error") : NULL;
+            const cJSON *eg = rg ? cJSON_GetObjectItem(rg, "error") : NULL;
+            const cJSON *cb = eb ? cJSON_GetObjectItem(eb, "code") : NULL;
+            const cJSON *cg = eg ? cJSON_GetObjectItem(eg, "code") : NULL;
+            TEST_ASSERT(cb && (int)cb->valuedouble == LSPS_ERR_METHOD_NOT_FOUND,
+                        "lsps2.buy without the channel manager is -32601");
+            TEST_ASSERT(cg && (int)cg->valuedouble == LSPS_ERR_METHOD_NOT_FOUND &&
+                        !cJSON_GetObjectItem(rg, "result"),
+                        "lsps2.get_info without the channel manager is -32601, no terms");
+            cJSON_Delete(rb); cJSON_Delete(rg); cJSON_Delete(b); cJSON_Delete(g);
+        }
+        TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50), "nothing sent to the client");
+        TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    }
+
     /* The terms are not advertised either. */
     const char *info_req = "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"lsps2.get_info\"}";
     cJSON *info = cJSON_Parse(info_req);

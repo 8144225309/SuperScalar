@@ -159,8 +159,10 @@ cJSON *lsps_dispatch_request(const lsps_ctx_t *ctx, const cJSON *json)
             }
         }
     } else if (strcmp(method, "lsps2.get_info") == 0 &&
-               ctx && ctx->mgr && !jit_channels_enabled(ctx->mgr)) {
-        /* No terms are offered for a purchase that would be refused. */
+               (!ctx || !ctx->mgr || !jit_channels_enabled(ctx->mgr))) {
+        /* No terms are offered for a purchase that would be refused, which
+           includes every request handled without the channel manager
+           (ceremony phases). */
         response = lsps_build_error(req_id, LSPS_ERR_METHOD_NOT_FOUND,
                                      "lsps2 is not enabled on this LSP");
     } else if (strcmp(method, "lsps2.get_info") == 0) {
@@ -174,9 +176,10 @@ cJSON *lsps_dispatch_request(const lsps_ctx_t *ctx, const cJSON *json)
     } else if (strcmp(method, "lsps2.buy") == 0) {
         const cJSON *params = cJSON_GetObjectItemCaseSensitive(json, "params");
         uint64_t amount_msat = 0, fee_msat = 0;
-        if (ctx && ctx->mgr && !jit_channels_enabled(ctx->mgr)) {
+        if (!ctx || !ctx->mgr || !jit_channels_enabled(ctx->mgr)) {
             /* Refused before anything is sent to the client's channel
-               connection and before any wallet action. */
+               connection and before any wallet action.  Without the channel
+               manager (ceremony phases) nothing can be opened either. */
             response = lsps_build_error(req_id, LSPS_ERR_METHOD_NOT_FOUND,
                                          "lsps2.buy is not enabled on this LSP");
         } else if (!params || !lsps2_parse_buy(params, &amount_msat, &fee_msat)) {
