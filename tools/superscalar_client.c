@@ -2485,6 +2485,7 @@ static void usage(const char *prog) {
         "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
         "  --expect-capacity SATS            Refuse factory unless this member's channel is exactly SATS\n"
         "  --min-capacity SATS               Refuse factory if this member's channel is below SATS\n"
+        "  --max-lsp-balance-pct N           Refuse factory if the LSP opens with more than N%% of a channel\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
         "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
@@ -3042,6 +3043,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--expect-capacity") == 0 && i + 1 < argc) {
             expect_capacity = (uint64_t)strtoull(argv[++i], NULL, 10);
             client_set_capacity_terms(expect_capacity, min_capacity);
+        } else if (strcmp(argv[i], "--max-lsp-balance-pct") == 0 && i + 1 < argc) {
+            client_set_max_lsp_balance_pct((uint16_t)atoi(argv[++i]));
         } else if (strcmp(argv[i], "--min-capacity") == 0 && i + 1 < argc) {
             min_capacity = (uint64_t)strtoull(argv[++i], NULL, 10);
             client_set_capacity_terms(expect_capacity, min_capacity);

@@ -1142,6 +1142,7 @@ extern int test_rotation_creation_failure_keeps_template(void);
 extern int test_rotation_creation_placement_funding(void);
 extern int test_open_terms_split_bound(void);
 extern int test_open_terms_capacity(void);
+extern int test_open_terms_member_policy(void);
 extern int test_regtest_ladder_lifecycle(void);
 extern int test_regtest_ladder_ptlc_migration(void);
 extern int test_regtest_ladder_distribution_fallback(void);
@@ -3262,6 +3263,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_creation_placement_funding);
     RUN_TEST(test_open_terms_split_bound);
     RUN_TEST(test_open_terms_capacity);
+    RUN_TEST(test_open_terms_member_policy);
 
     printf("\n=== Wire Protocol (Phase 9) ===\n");
     RUN_TEST(test_wire_pubkey_only_factory);

@@ -818,22 +818,40 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     secp256k1_pubkey new_pks[LSP_MAX_CLIENTS];
     size_t n_new = rotation_new_clients(lsp, lad, dying_id, partial,
                                         new_idx, new_pks);
-    if (partial && lsp->member_capacities) {
-        /* The capacities are per member of the dying factory. */
-        printf("LSP rotate: partial rotation — new factory without member capacities\n");
-        lsp->member_capacities = NULL;
-        lsp->n_member_capacities = 0;
-    }
     if (n_new < (partial ? 2u : 1u) || (!partial && n_new != lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: only %zu clients for the new factory\n", n_new);
         return 0;
     }
+    /* Member capacities carry over to the members that rotate (a partial
+       rotation keeps theirs, in their new order).  They are switched in
+       with the client arrays below; here only to derive the funding. */
+    const uint64_t *saved_caps = lsp->member_capacities;
+    size_t saved_n_caps = lsp->n_member_capacities;
+    if (saved_caps && saved_n_caps != lsp->n_clients) {
+        fprintf(stderr, "LSP rotate: %zu member capacities for %zu clients\n",
+                saved_n_caps, lsp->n_clients);
+        return 0;
+    }
+    uint64_t new_caps[LSP_MAX_CLIENTS];
+    for (size_t i = 0; saved_caps && i < n_new; i++)
+        new_caps[i] = saved_caps[new_idx[i]];
+    uint64_t rot_fund_sats = mgr->rot_funding_sats;
     {
         factory_t fresh;
         memset(&fresh, 0, sizeof(fresh));
-        if (!lsp_compute_funding_spk_for(lsp, &fresh, new_pks, n_new,
-                                         mgr->rot_fund_spk)) {
-            fprintf(stderr, "LSP rotate: funding script derivation failed\n");
+        if (saved_caps) {
+            lsp->member_capacities = new_caps;
+            lsp->n_member_capacities = n_new;
+        }
+        int spk_ok = lsp_compute_funding_spk_for(lsp, &fresh, new_pks, n_new,
+                                                 mgr->rot_fund_spk);
+        int amt_ok = !saved_caps ||
+                     lsp_compute_funding_amount_for(lsp, &fresh, new_pks, n_new,
+                                                    &rot_fund_sats);
+        lsp->member_capacities = saved_caps;
+        lsp->n_member_capacities = saved_n_caps;
+        if (!spk_ok || !amt_ok) {
+            fprintf(stderr, "LSP rotate: funding script / amount derivation failed\n");
             return 0;
         }
         mgr->rot_fund_spk_len = 34;
@@ -852,7 +870,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     } else if (rt) {
         double bal = regtest_get_balance(rt);
-        double needed = (double)mgr->rot_funding_sats / 100000000.0;
+        double needed = (double)rot_fund_sats / 100000000.0;
         if (bal < needed) {
             fprintf(stderr, "LSP rotate: insufficient balance %.8f (need %.8f)\n",
                     bal, needed);
@@ -863,7 +881,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     char fund_txid_hex[65];
     if (rt) {
-        double funding_btc = (double)mgr->rot_funding_sats / 100000000.0;
+        double funding_btc = (double)rot_fund_sats / 100000000.0;
         if (!regtest_fund_address(rt, mgr->rot_fund_addr, funding_btc, fund_txid_hex)) {
             fprintf(stderr, "LSP rotate: fund new factory failed\n");
             return 0;
@@ -875,7 +893,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
         if (!lsp_fund_spk(wallet_src, chain_be,
                           mgr->rot_fund_spk, mgr->rot_fund_spk_len,
-                          mgr->rot_funding_sats, 0, fund_txid_hex)) {
+                          rot_fund_sats, 0, fund_txid_hex)) {
             fprintf(stderr, "LSP rotate: light-client fund new factory failed\n");
             return 0;
         }
@@ -945,7 +963,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     } else {
         /* Light-client: lsp_fund_spk always puts target at vout=0 */
         fund_vout = 0;
-        fund_amount = mgr->rot_funding_sats;
+        fund_amount = rot_fund_sats;
     }
     if (fund_amount == 0) {
         fprintf(stderr, "LSP rotate: could not find funding output\n");
@@ -989,9 +1007,16 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
             lsp->n_clients = (size_t)mgr->n_channels;
+            lsp->member_capacities = saved_caps;
+            lsp->n_member_capacities = saved_n_caps;
             return 0;
         }
         lsp->n_clients = n_online;
+        if (saved_caps) {
+            memcpy(lsp->rotated_capacities, new_caps, n_new * sizeof(uint64_t));
+            lsp->member_capacities = lsp->rotated_capacities;
+            lsp->n_member_capacities = n_new;
+        }
         printf("LSP rotate: remapped %zu/%zu cooperative clients for new factory\n",
                n_online, n_coop);
     } else {
@@ -1025,6 +1050,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                 memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
                 memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
                 lsp->n_clients = (size_t)mgr->n_channels;
+                lsp->member_capacities = saved_caps;
+                lsp->n_member_capacities = saved_n_caps;
             }
             return 0;
         }
@@ -1059,8 +1086,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     uint64_t rot_dist_amounts[FACTORY_MAX_SIGNERS];
     for (size_t c = 0; c < mgr->n_channels && c < FACTORY_MAX_SIGNERS; c++)
         rot_dist_amounts[c] = mgr->entries[c].channel.funding_amount;
-    lsp->dist_client_amounts = rot_dist_amounts;
-    lsp->dist_n_client_amounts = mgr->n_channels;
+    lsp->dist_client_amounts = lsp->member_capacities ? NULL : rot_dist_amounts;
+    lsp->dist_n_client_amounts = lsp->member_capacities ? 0 : mgr->n_channels;
 
     /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients) */
     if (!lsp_run_factory_creation(lsp,
@@ -1076,6 +1103,8 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             memcpy(lsp->client_fds, saved_client_fds, sizeof(saved_client_fds));
             memcpy(lsp->client_pubkeys, saved_client_pks, sizeof(saved_client_pks));
             lsp->n_clients = (size_t)mgr->n_channels;
+            lsp->member_capacities = saved_caps;
+            lsp->n_member_capacities = saved_n_caps;
         }
         lsp->dist_client_amounts = NULL;
         lsp->dist_n_client_amounts = 0;

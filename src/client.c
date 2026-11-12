@@ -82,6 +82,30 @@ void client_set_capacity_terms(uint64_t expect_sats, uint64_t min_sats) {
     g_min_capacity = min_sats;
 }
 
+static uint16_t g_max_lsp_balance_pct = 100;
+
+void client_set_max_lsp_balance_pct(uint16_t pct) {
+    g_max_lsp_balance_pct = pct > 100 ? 100 : pct;
+}
+
+/* With member capacities the distribution TX follows the capacity rule
+   (factory_compute_distribution_outputs_balanced without amounts): per-client
+   amounts from the LSP are accepted only when they are exactly those. */
+static int client_dist_amounts_acceptable(const factory_t *f, const uint64_t *amounts,
+                                          size_t n_amounts, uint32_t my_index) {
+    if (!f->member_capacity || n_amounts == 0) return 1;
+    tx_output_t outs[FACTORY_MAX_SIGNERS + 1];
+    size_t nd = factory_compute_distribution_outputs_balanced(
+        f, outs, FACTORY_MAX_SIGNERS + 1, 500, NULL, 0);
+    int ok = nd > 0 && nd == n_amounts;
+    for (size_t i = 0; ok && i < nd; i++)
+        ok = amounts[i] == outs[i].amount_sats;
+    if (!ok)
+        fprintf(stderr, "Client %u: REFUSING — distribution amounts are not the "
+                "capacity-rule amounts\n", my_index);
+    return ok;
+}
+
 /* Per-member capacities and leaf stock from a FACTORY_PROPOSE. */
 typedef struct {
     int present;
@@ -1723,7 +1747,9 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     printf("Client %u: rotation tree OK (%zu nodes)\n", my_index, factory_out->n_nodes);
     fflush(stdout);
-    if (!client_capacity_acceptable(factory_out, my_index))
+    if (!client_capacity_acceptable(factory_out, my_index) ||
+        !client_dist_amounts_acceptable(factory_out, rot_dist_amounts,
+                                        rot_n_dist_amounts, my_index))
         return 0;
     if (!factory_sessions_init(factory_out)) {
         printf("Client %u: ROTATION SESSIONS_INIT FAILED\n", my_index);
@@ -2337,6 +2363,9 @@ static int client_factory_creation_stateless_signing(
             /* SECURITY: this client must not co-sign a dist TX that shorts its own
                payout.  Verify amounts[my client idx] >= its channel balance minus
                a small fee/anchor tolerance. */
+            if (ok && !client_dist_amounts_acceptable(factory, dist_amounts, n_amt,
+                                                      my_index))
+                ok = 0;
             if (ok && n_amt > 0) {
                 size_t ci = (size_t)(my_index - 1);
                 uint64_t my_amt = (ci < n_amt) ? dist_amounts[ci] : 0;
@@ -2947,7 +2976,19 @@ int client_run_with_channels(secp256k1_context *ctx,
         wire_close(fd);
         return 0;
     }
-    if (!client_capacity_acceptable(factory, my_index)) {
+    if (open_lsp_pct > (int)g_max_lsp_balance_pct) {
+        fprintf(stderr, "Client %u: REFUSING — opening split gives the LSP %d%% "
+                "(maximum %u%%, --max-lsp-balance-pct)\n", my_index, open_lsp_pct,
+                (unsigned)g_max_lsp_balance_pct);
+        client_send_error(fd, "opening_split_refused");
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
+    if (!client_capacity_acceptable(factory, my_index) ||
+        !client_dist_amounts_acceptable(factory, init_dist_amounts,
+                                        init_n_dist_amounts, my_index)) {
         client_send_error(fd, "channel_capacity_refused");
         factory_free(factory);
         free(factory);

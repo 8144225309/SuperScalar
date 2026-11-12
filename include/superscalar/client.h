@@ -62,6 +62,10 @@ void client_set_min_profit_bps(uint16_t bps);
    min_sats (0 = any).  The capacity is logged either way. */
 void client_set_capacity_terms(uint64_t expect_sats, uint64_t min_sats);
 
+/* Refuse a factory whose proposed opening split gives the LSP more than
+   pct percent of each channel (default 100 = any). */
+void client_set_max_lsp_balance_pct(uint16_t pct);
+
 /* Optional callback to verify the funding TX on-chain before signing the
    factory tree.  If provided to client_run_with_channels, called after
    FACTORY_PROPOSE is parsed and before any tree signing.  Return 1 if the

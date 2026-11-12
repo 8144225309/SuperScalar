@@ -40,6 +40,8 @@ static const unsigned char ot_seckeys[5][32] = {
 #define OT_TAMPER_SPLIT 1   /* LSP sends member 2 a split other than proposed */
 #define OT_CAPACITY     2   /* unequal capacities, each member expects its own */
 #define OT_CAP_REFUSE   3   /* member 3's minimum is above its capacity */
+#define OT_CAP_DIST     4   /* LSP sends dist_amounts other than the capacity rule */
+#define OT_MAX_PCT      5   /* member 4 accepts at most 60% for the LSP */
 
 /* Channel capacities of members 1..4 (OT_CAPACITY / OT_CAP_REFUSE). */
 static const uint64_t ot_caps[4] = { 40000, 90000, 150000, 65000 };
@@ -85,8 +87,10 @@ static int ot_run(int mode, int member_ok[4], const char **fail_out) {
             secp256k1_context *cctx = ot_ctx();
             secp256k1_keypair ckp;
             if (!secp256k1_keypair_create(cctx, &ckp, ot_seckeys[c + 1])) _exit(2);
-            if (mode == OT_CAPACITY || mode == OT_CAP_REFUSE)
+            if (mode == OT_CAPACITY || mode == OT_CAP_REFUSE || mode == OT_CAP_DIST)
                 client_set_capacity_terms(ot_caps[c], 0);
+            if (mode == OT_MAX_PCT && c == 3)
+                client_set_max_lsp_balance_pct(60);
             if (mode == OT_CAP_REFUSE && c == 2)
                 client_set_capacity_terms(0, ot_caps[c] + 1);
             int ok = client_run_with_channels(cctx, &ckp, "127.0.0.1", port,
@@ -106,7 +110,12 @@ static int ot_run(int mode, int member_ok[4], const char **fail_out) {
     uint64_t amount = 1000000;
     if (!fail) {
         lsp->lsp_balance_pct = OT_LSP_PCT;
-        if (mode == OT_CAPACITY || mode == OT_CAP_REFUSE) {
+        if (mode == OT_CAP_DIST) {
+            /* The bare capacities: short of the capacity rule's stock shares. */
+            lsp->dist_client_amounts = ot_caps;
+            lsp->dist_n_client_amounts = 4;
+        }
+        if (mode == OT_CAPACITY || mode == OT_CAP_REFUSE || mode == OT_CAP_DIST) {
             lsp->member_capacities = ot_caps;
             lsp->n_member_capacities = 4;
             lsp->leaf_stock_sats = OT_STOCK;
@@ -117,7 +126,7 @@ static int ot_run(int mode, int member_ok[4], const char **fail_out) {
     if (!fail && !lsp_compute_funding_spk(lsp, spk)) fail = "funding spk";
     int created = !fail && lsp_run_factory_creation(lsp, fake_txid, 0, amount, spk, 34,
                                                     10, 4, /*cltv*/ 500);
-    if (!fail && mode == OT_CAP_REFUSE) {
+    if (!fail && (mode == OT_CAP_REFUSE || mode == OT_CAP_DIST || mode == OT_MAX_PCT)) {
         if (created) fail = "creation succeeded over a member's refusal";
         else fail = "refused";   /* expected: stop here */
     } else if (!fail && !created) {
@@ -221,5 +230,20 @@ int test_open_terms_capacity(void) {
     TEST_ASSERT(ot_run(OT_CAP_REFUSE, ok, &fail), "run");
     TEST_ASSERT(fail && strcmp(fail, "refused") == 0, "creation refused");
     TEST_ASSERT(!ok[2], "member 3 refused a capacity below its minimum");
+    return 1;
+}
+
+/* Member policy: with capacities, distribution amounts other than the
+   capacity rule's are refused; a member bounding the LSP's opening share
+   refuses a larger one.  Either refusal stops the creation. */
+int test_open_terms_member_policy(void) {
+    int ok[4];
+    const char *fail = NULL;
+    TEST_ASSERT(ot_run(OT_CAP_DIST, ok, &fail), "run");
+    TEST_ASSERT(fail && strcmp(fail, "refused") == 0, "dist amounts: creation refused");
+    for (int c = 0; c < 4; c++) TEST_ASSERT(!ok[c], "member refused the dist amounts");
+    TEST_ASSERT(ot_run(OT_MAX_PCT, ok, &fail), "run");
+    TEST_ASSERT(fail && strcmp(fail, "refused") == 0, "max pct: creation refused");
+    TEST_ASSERT(!ok[3], "member 4 refused a 70% LSP share");
     return 1;
 }

@@ -530,15 +530,22 @@ int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]) {
                                        lsp->n_clients, spk_out);
 }
 
-int lsp_compute_funding_amount(lsp_t *lsp, uint64_t *amount_out) {
+int lsp_compute_funding_amount_for(lsp_t *lsp, const factory_t *order_from,
+                                   const secp256k1_pubkey *client_pubkeys,
+                                   size_t n_clients, uint64_t *amount_out) {
     if (!lsp || !amount_out || !lsp->member_capacities) return 0;
-    factory_t *scratch = creation_scratch(lsp, &lsp->factory, lsp->client_pubkeys,
-                                          lsp->n_clients);
+    factory_t *scratch = creation_scratch(lsp, order_from, client_pubkeys, n_clients);
     if (!scratch) return 0;
     int ok = factory_capacity_funding_amount(scratch, amount_out);
     factory_free(scratch);
     free(scratch);
     return ok;
+}
+
+int lsp_compute_funding_amount(lsp_t *lsp, uint64_t *amount_out) {
+    if (!lsp) return 0;
+    return lsp_compute_funding_amount_for(lsp, &lsp->factory, lsp->client_pubkeys,
+                                          lsp->n_clients, amount_out);
 }
 
 uint16_t lsp_opening_balance_pct(const lsp_t *lsp) {

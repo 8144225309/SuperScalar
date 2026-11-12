@@ -4317,7 +4317,7 @@ accept_new_factory:
         /* Set fee policy before init (init preserves these across memset) */
         mgr->fee = fee_est;
         mgr->routing_fee_ppm = routing_fee_ppm;
-        mgr->lsp_balance_pct = lsp_balance_pct;
+        mgr->lsp_balance_pct = lsp_opening_balance_pct(lsp_p);   /* the proposed split */
         mgr->placement_mode = (placement_mode_t)placement_mode_arg;
         mgr->economic_mode = (economic_mode_t)economic_mode_arg;
         mgr->default_profit_bps = default_profit_bps;

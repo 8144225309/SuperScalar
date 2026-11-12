@@ -85,6 +85,9 @@ typedef struct {
     const uint64_t *member_capacities;
     size_t n_member_capacities;
     uint64_t leaf_stock_sats;
+    /* Storage a partial rotation points member_capacities at: the
+       capacities of the members that rotate, in their new order. */
+    uint64_t rotated_capacities[LSP_MAX_CLIENTS];
 
     /* When set, lsp_accept_clients refuses to proceed unless every client's
        HELLO included a valid slot_hint forming a permutation of 1..n_clients.
@@ -141,6 +144,11 @@ int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]);
    (factory_capacity_funding_amount of the factory creation will build).
    Returns 1 on success. */
 int lsp_compute_funding_amount(lsp_t *lsp, uint64_t *amount_out);
+
+/* The same for given clients (as lsp_compute_funding_spk_for). */
+int lsp_compute_funding_amount_for(lsp_t *lsp, const factory_t *order_from,
+                                   const secp256k1_pubkey *client_pubkeys,
+                                   size_t n_clients, uint64_t *amount_out);
 
 /* The opening split sent in FACTORY_PROPOSE: lsp_balance_pct, 0 -> 50,
    capped at 100 (as lsp_channels_init applies it). */
