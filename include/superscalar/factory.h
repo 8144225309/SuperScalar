@@ -78,6 +78,13 @@ typedef struct {
     uint8_t  timezone_bucket;     /* 0-23 hour of peak activity */
 } participant_profile_t;
 
+/* A caller-supplied channel output script for one member
+   (factory_set_leaf_channel_spk). */
+typedef struct {
+    unsigned char spk[34];   /* P2TR: OP_1 <32-byte output key> */
+    uint8_t set;             /* 0 = the default channel script */
+} factory_chan_spk_t;
+
 /* Runtime-configurable limits (Mainnet Gap #6).
    Pass to factory_init_with_config(). NULL = defaults (same as #define values). */
 typedef struct {
@@ -252,6 +259,13 @@ typedef struct {
     uint64_t ps_prev_chan_amount;      /* amount_sats of the channel output spent by current TX
                                           (legacy 1-input shape; for multi-input PS sub-factory
                                           chain advances see ps_prev_amounts[] below) */
+    /* One-member PS leaf with a caller channel script: the chain extension
+       (ps_chain_len > 0) spends that output by key path, so it is signed over
+       this MuSig2 key (no script tree) and verified against its output key,
+       not over the node's own keyagg / merkle root. */
+    int has_ps_chan_key;
+    musig_keyagg_t ps_chan_keyagg;
+    secp256k1_xonly_pubkey ps_chan_output_key;
     /* #146: height-aware reset.  Block height at which the latest chain
        entry was observed confirmed (0 = unset / legacy).  Used by
        factory_reset_subfactory_chains_above_height to leave chain state
@@ -464,6 +478,9 @@ typedef struct {
     placement_mode_t placement_mode;  /* client ordering strategy */
     economic_mode_t  economic_mode;   /* fee distribution model */
     participant_profile_t *profiles;  /* dynamic, sized to config.max_signers */
+    /* Caller channel output scripts by participant index; NULL until
+       factory_set_leaf_channel_spk sets one (sized to config.max_signers). */
+    factory_chan_spk_t *chan_spks;
 
     /* Runtime config (Mainnet Gap #6) — stored limits for this factory */
     factory_config_t config;
@@ -737,6 +754,29 @@ int factory_set_funding(factory_t *f,
    order the configured placement mode and profiles put them).  Call after
    setting placement and profiles.  Returns 0 on failure. */
 int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
+
+/* Use spk (a 34-byte P2TR, OP_1 <32 bytes>) verbatim as the channel output
+   of member participant_idx (1..n_participants-1) in its leaf, in place of
+   the default MuSig2(member, LSP) output with the LSP-only CLTV recovery
+   leaf.  spk == NULL restores the default.  Returns 0, changing nothing, for
+   any other script or index.  Call after factory_init*, before
+   factory_build_tree; members without a script keep the default, so a
+   factory with none set builds exactly as before.
+
+   For callers whose channel engine holds two-sided commitments over the
+   channel output (e.g. a standard taproot channel funding output, MuSig2 key
+   path only).  The reference LSP and client keep the default: they hold no
+   commitment for the LSP's side, which then relies on the CLTV recovery
+   leaf.
+
+   One-member pseudo-Spilman leaf (k = 1): the chain extension spends the
+   channel output, so spk must be the key-path-only P2TR (BIP-86 tweak, no
+   script tree) of the MuSig2 key of the LSP and the member, in either key
+   order; the extension is then signed and verified over that key.
+   factory_build_tree refuses any other script there, and refuses a script
+   for a member of a PS sub-factory leaf (k > 1). */
+int factory_set_leaf_channel_spk(factory_t *f, uint32_t participant_idx,
+                                 const unsigned char *spk, size_t spk_len);
 
 /* Set the client placement strategy for factory_build_tree.  Returns 0,
    changing nothing, for a mode that is not a placement_mode_t value.  The

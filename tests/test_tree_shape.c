@@ -11,6 +11,7 @@
 #include "superscalar/dw_state.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/sha256.h"
+#include "superscalar/musig.h"
 #include <secp256k1_schnorrsig.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -902,5 +903,200 @@ int test_tree_shape_client_to_leaf_placement(void) {
         }
         ts_close(&t);
     }
+    return 1;
+}
+
+
+/* ---- Caller channel scripts ---- */
+
+/* Key-path-only P2TR (BIP-86 tweak) of the MuSig2 key of pks, in this order. */
+static int ts_keypath_spk(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                          size_t n, unsigned char spk[34]) {
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, n)) return 0;
+    unsigned char internal[32], tweak[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal, &ka.agg_pubkey)) return 0;
+    sha256_tagged("TapTweak", internal, 32, tweak);
+    secp256k1_pubkey full;
+    secp256k1_xonly_pubkey out;
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &full, &ka.agg_pubkey, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &out, NULL, &full))
+        return 0;
+    build_p2tr_script_pubkey(spk, &out);
+    return 1;
+}
+
+/* A P2TR the factory knows nothing about (a key outside the factory). */
+static int ts_foreign_spk(secp256k1_context *ctx, unsigned char tag, unsigned char spk[34]) {
+    unsigned char sk[32];
+    memset(sk, tag, 32);
+    secp256k1_keypair kp;
+    secp256k1_pubkey pk;
+    return secp256k1_keypair_create(ctx, &kp, sk) &&
+           secp256k1_keypair_pub(ctx, &pk, &kp) &&
+           ts_keypath_spk(ctx, &pk, 1, spk);
+}
+
+/* Not setting a channel script (or clearing one) builds every pinned shape
+   exactly as before; the setter refuses anything but a member's P2TR. */
+int test_tree_shape_channel_spk_default(void) {
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(ts_pinned) / sizeof(ts_pinned[0]); i++) {
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, &ts_pinned[i].s, 0), "setup");
+        TEST_ASSERT(t.f->chan_spks == NULL, "no channel scripts by default");
+        unsigned char spk[34];
+        TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+        TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 1, spk, 34), "set");
+        TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 1, NULL, 0), "clear");
+        char hex[65];
+        if (!factory_build_tree(t.f)) {
+            printf("\n    %s: build failed", ts_pinned[i].s.name);
+            bad++;
+        } else {
+            ts_digest(t.f, hex);
+            if (strcmp(hex, ts_pinned[i].digest) != 0) {
+                printf("\n    %s: digest %s", ts_pinned[i].s.name, hex);
+                bad++;
+            }
+        }
+        ts_close(&t);
+    }
+    if (bad) printf("\n");
+    TEST_ASSERT_EQ(bad, 0, "default channel scripts keep the pinned txids");
+
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    unsigned char spk[34], bad_spk[34];
+    TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+    unsigned char p2wsh[34] = { 0x00, 0x20 };
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, p2wsh, 34), "P2WSH refused");
+    memcpy(bad_spk, spk, 34); bad_spk[1] = 0x21;
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, bad_spk, 34), "OP_1 <33> refused");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, spk, 33), "33 bytes refused");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 1, spk, 35), "35 bytes refused");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 0, spk, 34), "the LSP has no channel");
+    TEST_ASSERT(!factory_set_leaf_channel_spk(t.f, 5, spk, 34), "not a member");
+    TEST_ASSERT(t.f->chan_spks == NULL, "refused scripts store nothing");
+    ts_close(&t);
+    return 1;
+}
+
+/* Signature over node's signed tx (key-path witness) against output key
+   spk[2..34) and the BIP-341 sighash of spending prev_spk / prev_amount. */
+static int ts_keypath_sig_ok(secp256k1_context *ctx, const factory_node_t *node,
+                             const unsigned char *prev_spk, uint64_t prev_amount) {
+    unsigned char sighash[32], sig[64];
+    if (node->signed_tx.len < 70) return 0;
+    if (!compute_taproot_sighash(sighash, node->unsigned_tx.data, node->unsigned_tx.len,
+                                 0, prev_spk, 34, prev_amount, node->nsequence))
+        return 0;
+    memcpy(sig, node->signed_tx.data + node->signed_tx.len - 68, 64);
+    secp256k1_xonly_pubkey key;
+    if (!secp256k1_xonly_pubkey_parse(ctx, &key, prev_spk + 2)) return 0;
+    return secp256k1_schnorrsig_verify(ctx, sig, sighash, 32, &key);
+}
+
+/* A member's channel script is used verbatim as its channel output, the
+   other members keep the default, and the tree signs and verifies.  On a
+   one-member PS leaf the chain extension spends that output: it is built
+   over the script and signed by key path over its MuSig2 key. */
+int test_tree_shape_channel_spk_verbatim(void) {
+    static const ts_shape_t shapes[] = {
+        { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 },
+        { "N=3 arity 1", 3, {1}, 1, 0, 1, 1000, 0, 0 },
+        { "N=8 2,4", 8, {2, 4}, 2, 0, 1, 1000, 0, 0 },
+        { "N=5 arity 2 no cltv", 5, {2}, 1, 0, 0, 0, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const ts_shape_t *s = &shapes[i];
+        ts_tree_t ref, t;
+        TEST_ASSERT(ts_open(&ref, s) && ref.built, s->name);
+        TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
+        unsigned char spk[34];
+        TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, spk), "script");
+        TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 2, spk, 34), "set member 2");
+        TEST_ASSERT(factory_build_tree(t.f), s->name);
+        for (size_t c = 0; c < s->n_clients; c++) {
+            size_t ni, rni;
+            uint32_t vout, rvout;
+            TEST_ASSERT(factory_client_to_leaf(t.f, c, &ni, &vout) &&
+                        factory_client_to_leaf(ref.f, c, &rni, &rvout), "leaf");
+            const tx_output_t *o = &t.f->nodes[ni].outputs[vout];
+            const tx_output_t *r = &ref.f->nodes[rni].outputs[rvout];
+            TEST_ASSERT_EQ(o->script_pubkey_len, 34, "channel script length");
+            TEST_ASSERT_EQ(o->amount_sats, r->amount_sats, "channel amount unchanged");
+            if (c + 1 == 2)
+                TEST_ASSERT(memcmp(o->script_pubkey, spk, 34) == 0, "script verbatim");
+            else
+                TEST_ASSERT(memcmp(o->script_pubkey, r->script_pubkey, 34) == 0,
+                            "other members keep the default");
+        }
+        TEST_ASSERT(factory_sign_all(t.f) && factory_verify_all(t.f), "sign + verify");
+        ts_close(&t);
+        ts_close(&ref);
+    }
+
+    /* One-member PS leaves: member 1 in key order (LSP, member), member 2 in
+       (member, LSP). */
+    ts_shape_t ps = { "N=4 PS anchors cltv", 4, {3}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &ps, 0), "PS setup");
+    factory_t *f = t.f;
+    unsigned char spk1[34], spk2[34];
+    secp256k1_pubkey o1[2] = { f->pubkeys[0], f->pubkeys[1] };
+    secp256k1_pubkey o2[2] = { f->pubkeys[2], f->pubkeys[0] };
+    TEST_ASSERT(ts_keypath_spk(t.ctx, o1, 2, spk1) && ts_keypath_spk(t.ctx, o2, 2, spk2), "keys");
+    TEST_ASSERT(factory_set_leaf_channel_spk(f, 1, spk1, 34) &&
+                factory_set_leaf_channel_spk(f, 2, spk2, 34), "set");
+    TEST_ASSERT(factory_build_tree(f), "PS build");
+    TEST_ASSERT(factory_sign_all(f) && factory_verify_all(f), "PS sign + verify");
+    for (uint32_t m = 1; m <= 2; m++) {
+        const unsigned char *want = m == 1 ? spk1 : spk2;
+        size_t ni;
+        uint32_t vout;
+        TEST_ASSERT(factory_client_to_leaf(f, m - 1, &ni, &vout), "leaf");
+        factory_node_t *node = &f->nodes[ni];
+        TEST_ASSERT(node->is_ps_leaf && vout == 0, "PS channel at vout 0");
+        TEST_ASSERT(memcmp(node->outputs[0].script_pubkey, want, 34) == 0, "PS script verbatim");
+        int side = -1;
+        for (int l = 0; l < f->n_leaf_nodes; l++)
+            if (f->leaf_node_indices[l] == ni) side = l;
+        TEST_ASSERT(side >= 0, "leaf side");
+        unsigned char prev_txid[32];
+        memcpy(prev_txid, node->txid, 32);
+        uint64_t prev_amount = node->outputs[0].amount_sats;
+        for (int step = 0; step < 2; step++) {
+            TEST_ASSERT_EQ(factory_advance_leaf_unsigned(f, side), 1, "chain extension");
+            TEST_ASSERT(memcmp(node->ps_prev_txid, prev_txid, 32) == 0,
+                        "extension spends the previous chain tx");
+            TEST_ASSERT(memcmp(node->outputs[0].script_pubkey, want, 34) == 0,
+                        "extension pays the same script");
+            TEST_ASSERT(factory_sign_node(f, ni), "sign extension");
+            TEST_ASSERT(ts_keypath_sig_ok(t.ctx, node, want, prev_amount),
+                        "extension signature verifies against the channel script");
+            TEST_ASSERT(factory_verify_all(f), "verify all");
+            memcpy(prev_txid, node->txid, 32);
+            prev_amount = node->outputs[0].amount_sats;
+        }
+    }
+    ts_close(&t);
+
+    /* PS: a script the leaf's signers cannot spend, and any script on a k > 1
+       sub-factory leaf, are refused at build. */
+    TEST_ASSERT(ts_open_b(&t, &ps, 0), "PS setup");
+    unsigned char foreign[34];
+    TEST_ASSERT(ts_foreign_spk(t.ctx, 0x77, foreign), "script");
+    TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 3, foreign, 34), "set");
+    TEST_ASSERT(!factory_build_tree(t.f), "PS refuses a foreign channel key");
+    ts_close(&t);
+    ts_shape_t psk = { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 };
+    TEST_ASSERT(ts_open_b(&t, &psk, 0), "PS k=2 setup");
+    secp256k1_pubkey o3[2] = { t.f->pubkeys[0], t.f->pubkeys[3] };
+    TEST_ASSERT(ts_keypath_spk(t.ctx, o3, 2, spk1), "key");
+    TEST_ASSERT(factory_set_leaf_channel_spk(t.f, 3, spk1, 34), "set");
+    TEST_ASSERT(!factory_build_tree(t.f), "sub-factory leaves take no channel script");
+    ts_close(&t);
     return 1;
 }

@@ -139,6 +139,55 @@ static int build_musig_p2tr_spk(
     return 1;
 }
 
+/* The caller's channel output script for this member, or NULL for the
+   default. */
+static const unsigned char *leaf_channel_spk(const factory_t *f, uint32_t client_idx) {
+    if (!f->chan_spks || client_idx == 0 || client_idx >= f->n_participants ||
+        client_idx >= f->config.max_signers || !f->chan_spks[client_idx].set)
+        return NULL;
+    return f->chan_spks[client_idx].spk;
+}
+
+/* A member's channel output script: the caller's if set, else
+   MuSig(member, LSP) [+ the CLTV recovery leaf chan_merkle_root]. */
+static int build_channel_spk(const factory_t *f, uint32_t client_idx,
+                             const unsigned char *chan_merkle_root,
+                             unsigned char spk_out[34]) {
+    const unsigned char *custom = leaf_channel_spk(f, client_idx);
+    if (custom) {
+        memcpy(spk_out, custom, 34);
+        return 1;
+    }
+    secp256k1_pubkey pks[2] = { f->pubkeys[client_idx], f->pubkeys[0] };
+    musig_keyagg_t ka;
+    secp256k1_xonly_pubkey tw;
+    return build_musig_p2tr_spk(f->ctx, spk_out, &tw, NULL, &ka, pks, 2,
+                                chan_merkle_root);
+}
+
+/* A PS leaf past chain[0] signs the spend of the previous chain TX's channel
+   output; with a caller channel script that is the channel's key (key path
+   only).  Every other node input is signed over the node's own keyagg and
+   taptree. */
+static int node_signs_ps_chan_key(const factory_node_t *node) {
+    return node->is_ps_leaf && node->ps_chain_len > 0 &&
+           node->type != NODE_PS_SUBFACTORY && node->has_ps_chan_key;
+}
+
+static const musig_keyagg_t *node_sign_keyagg(const factory_node_t *node) {
+    return node_signs_ps_chan_key(node) ? &node->ps_chan_keyagg : &node->keyagg;
+}
+
+static const unsigned char *node_sign_merkle(const factory_node_t *node) {
+    if (node_signs_ps_chan_key(node)) return NULL;
+    return node->has_taptree ? node->merkle_root : NULL;
+}
+
+static const secp256k1_xonly_pubkey *node_sign_output_key(const factory_node_t *node) {
+    return node_signs_ps_chan_key(node) ? &node->ps_chan_output_key
+                                        : &node->tweaked_pubkey;
+}
+
 /* (build_single_p2tr_spk removed — was only used by the legacy
    shachain-hashlock L-stock SPK; the canonical or(N-of-N, L&CSV)
    structure does not need it.) */
@@ -582,11 +631,8 @@ static int setup_leaf_outputs(
 
     /* Channel A: MuSig(client_a, LSP) [+ CLTV recovery leaf] */
     {
-        secp256k1_pubkey pks[2] = { f->pubkeys[client_a_idx], f->pubkeys[0] };
-        musig_keyagg_t ka;
-        secp256k1_xonly_pubkey tw;
-        if (!build_musig_p2tr_spk(f->ctx, node->outputs[0].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
+        if (!build_channel_spk(f, client_a_idx, chan_merkle_root,
+                               node->outputs[0].script_pubkey))
             return 0;
         node->outputs[0].script_pubkey_len = 34;
         node->outputs[0].amount_sats = per_output;
@@ -594,11 +640,8 @@ static int setup_leaf_outputs(
 
     /* Channel B: MuSig(client_b, LSP) [+ CLTV recovery leaf] */
     {
-        secp256k1_pubkey pks[2] = { f->pubkeys[client_b_idx], f->pubkeys[0] };
-        musig_keyagg_t ka;
-        secp256k1_xonly_pubkey tw;
-        if (!build_musig_p2tr_spk(f->ctx, node->outputs[1].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
+        if (!build_channel_spk(f, client_b_idx, chan_merkle_root,
+                               node->outputs[1].script_pubkey))
             return 0;
         node->outputs[1].script_pubkey_len = 34;
         node->outputs[1].amount_sats = per_output;
@@ -1191,6 +1234,33 @@ int factory_set_placement_mode(factory_t *f, placement_mode_t mode) {
     return 0;
 }
 
+int factory_set_leaf_channel_spk(factory_t *f, uint32_t participant_idx,
+                                 const unsigned char *spk, size_t spk_len) {
+    if (!f || participant_idx == 0 || participant_idx >= f->n_participants ||
+        f->config.max_signers == 0 || participant_idx >= f->config.max_signers) {
+        fprintf(stderr, "factory_set_leaf_channel_spk: participant %u is not a member\n",
+                participant_idx);
+        return 0;
+    }
+    if (!spk) {
+        if (f->chan_spks) memset(&f->chan_spks[participant_idx], 0,
+                                 sizeof(f->chan_spks[participant_idx]));
+        return 1;
+    }
+    if (spk_len != 34 || spk[0] != 0x51 || spk[1] != 0x20) {
+        fprintf(stderr, "factory_set_leaf_channel_spk: script is not a 34-byte P2TR "
+                "(got %zu bytes)\n", spk_len);
+        return 0;
+    }
+    if (!f->chan_spks) {
+        f->chan_spks = calloc(f->config.max_signers, sizeof(*f->chan_spks));
+        if (!f->chan_spks) return 0;
+    }
+    memcpy(f->chan_spks[participant_idx].spk, spk, 34);
+    f->chan_spks[participant_idx].set = 1;
+    return 1;
+}
+
 int factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
     if (!f) return 0;
     if (!arities || n == 0 || n > FACTORY_MAX_LEVELS) {
@@ -1333,11 +1403,8 @@ static int setup_single_leaf_outputs(
 
     /* Channel: MuSig(client, LSP) [+ CLTV recovery leaf] */
     {
-        secp256k1_pubkey pks[2] = { f->pubkeys[client_idx], f->pubkeys[0] };
-        musig_keyagg_t ka;
-        secp256k1_xonly_pubkey tw;
-        if (!build_musig_p2tr_spk(f->ctx, node->outputs[0].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
+        if (!build_channel_spk(f, client_idx, chan_merkle_root,
+                               node->outputs[0].script_pubkey))
             return 0;
         node->outputs[0].script_pubkey_len = 34;
         node->outputs[0].amount_sats = per_output;
@@ -1353,6 +1420,34 @@ static int setup_single_leaf_outputs(
     return 1;
 }
 
+/* A one-member PS leaf's chain extension spends the channel output, so a
+   caller channel script there must be one the leaf's two signers can spend
+   by key path: the key-path-only P2TR of MuSig2(LSP, member), in either key
+   order.  Records that key on the node for the extension's signing. */
+static int bind_ps_channel_key(const factory_t *f, factory_node_t *node,
+                               uint32_t client_idx, const unsigned char *spk) {
+    secp256k1_pubkey orders[2][2] = {
+        { f->pubkeys[0], f->pubkeys[client_idx] },
+        { f->pubkeys[client_idx], f->pubkeys[0] },
+    };
+    for (int o = 0; o < 2; o++) {
+        unsigned char cand[34];
+        musig_keyagg_t ka;
+        secp256k1_xonly_pubkey tw;
+        if (!build_musig_p2tr_spk(f->ctx, cand, &tw, NULL, &ka, orders[o], 2, NULL))
+            return 0;
+        if (memcmp(cand, spk, 34) == 0) {
+            node->ps_chan_keyagg = ka;
+            node->ps_chan_output_key = tw;
+            node->has_ps_chan_key = 1;
+            return 1;
+        }
+    }
+    fprintf(stderr, "Factory: PS leaf channel script of participant %u is not the "
+            "key-path P2TR of MuSig2(LSP, member)\n", client_idx);
+    return 0;
+}
+
 /* Set up pseudo-Spilman leaf outputs.
    vout 0 (channel): uses node->spending_spk — the factory-consensus N-party
    MuSig P2TR already set by add_node().  This is critical: factory_sign_node()
@@ -1365,7 +1460,6 @@ static int setup_ps_leaf_outputs(
     uint32_t client_idx,
     uint64_t input_amount
 ) {
-    (void)client_idx;  /* PS leaves use the factory consensus key for vout 0 */
 
     uint64_t output_total = input_amount > f->fee_per_tx + FACTORY_ANCHOR_COST(f)
                             ? input_amount - f->fee_per_tx - FACTORY_ANCHOR_COST(f) : 0;
@@ -1381,10 +1475,20 @@ static int setup_ps_leaf_outputs(
     node->n_outputs = 2;
 
     /* vout 0: channel output — factory-consensus key so chain[1]+ signatures
-       (signed with node->keyagg) verify correctly on-chain. */
-    memcpy(node->outputs[0].script_pubkey, node->spending_spk,
-           node->spending_spk_len);
-    node->outputs[0].script_pubkey_len = node->spending_spk_len;
+       (signed with node->keyagg) verify correctly on-chain.  A caller
+       channel script is used verbatim; the chain extension is then signed
+       over its key (bind_ps_channel_key). */
+    const unsigned char *custom = leaf_channel_spk(f, client_idx);
+    if (custom) {
+        if (!bind_ps_channel_key(f, node, client_idx, custom))
+            return 0;
+        memcpy(node->outputs[0].script_pubkey, custom, 34);
+        node->outputs[0].script_pubkey_len = 34;
+    } else {
+        memcpy(node->outputs[0].script_pubkey, node->spending_spk,
+               node->spending_spk_len);
+        node->outputs[0].script_pubkey_len = node->spending_spk_len;
+    }
     node->outputs[0].amount_sats = per_output;
 
     /* vout 1: L-stock SPK = or(N-of-N keyagg, L&CSV) per t/1242 */
@@ -1444,6 +1548,15 @@ static int setup_ps_leaf_with_subfactories(
     if (k <= 1) return 0;
     if (n_leaf_clients == 0) return 0;
     if (n_leaf_clients > (size_t)k * (size_t)k) return 0;
+    /* A sub-factory chain advance re-spends its channel outputs over keys the
+       factory derives (derive_input_keyagg): no caller channel scripts. */
+    for (size_t i = 0; i < n_leaf_clients; i++) {
+        if (leaf_channel_spk(f, leaf_client_indices[i])) {
+            fprintf(stderr, "Factory: PS k=%u sub-factory leaves take no caller "
+                    "channel script (participant %u)\n", k, leaf_client_indices[i]);
+            return 0;
+        }
+    }
 
     /* Distribute clients into k sub-factories: ceil(n / k) clients each
        (last sub-factory gets the remainder when n_leaf_clients < k²). */
@@ -1644,11 +1757,8 @@ static int setup_nway_leaf_outputs(
 
     /* One channel per client: vout 0..n_client-1 = MuSig(client_i, LSP). */
     for (size_t i = 0; i < n_client; i++) {
-        secp256k1_pubkey pks[2] = { f->pubkeys[client_indices[i]], f->pubkeys[0] };
-        musig_keyagg_t ka;
-        secp256k1_xonly_pubkey tw;
-        if (!build_musig_p2tr_spk(f->ctx, node->outputs[i].script_pubkey,
-                                   &tw, NULL, &ka, pks, 2, chan_merkle_root))
+        if (!build_channel_spk(f, client_indices[i], chan_merkle_root,
+                               node->outputs[i].script_pubkey))
             return 0;
         node->outputs[i].script_pubkey_len = 34;
         node->outputs[i].amount_sats = per_output;
@@ -2122,7 +2232,7 @@ int factory_sessions_init(factory_t *f) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_built) return 0;
         musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
-        musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+        musig_session_init(&node->signing_session, node_sign_keyagg(node), node->n_signers);
         node->partial_sigs_received = 0;
     }
     return 1;
@@ -2143,7 +2253,7 @@ int factory_sessions_finalize(factory_t *f) {
         if (!compute_node_sighash(f, node, sighash))
             return 0;
 
-        const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+        const unsigned char *mr = node_sign_merkle(node);
         if (!musig_session_finalize_nonces(f->ctx, &node->signing_session,
                                             sighash, mr, NULL))
             return 0;
@@ -2260,7 +2370,7 @@ int factory_sessions_init_path(factory_t *f, int leaf_node_idx) {
         factory_node_t *node = &f->nodes[path[i]];
         if (!node->is_built) return 0;
         musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
-        musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+        musig_session_init(&node->signing_session, node_sign_keyagg(node), node->n_signers);
         node->partial_sigs_received = 0;
     }
     return 1;
@@ -2278,7 +2388,7 @@ int factory_sessions_finalize_path(factory_t *f, int leaf_node_idx) {
         if (!compute_node_sighash(f, node, sighash))
             return 0;
 
-        const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+        const unsigned char *mr = node_sign_merkle(node);
         if (!musig_session_finalize_nonces(f->ctx, &node->signing_session,
                                             sighash, mr, NULL))
             return 0;
@@ -2395,7 +2505,7 @@ int factory_verify_all(factory_t *f) {
         memcpy(sig, node->signed_tx.data + node->signed_tx.len - 68, 64);
 
         if (!secp256k1_schnorrsig_verify(f->ctx, sig, sighash, 32,
-                                          &node->tweaked_pubkey)) {
+                                          node_sign_output_key(node))) {
             fprintf(stderr, "factory_verify_all: node %zu sig INVALID\n", i);
             return 0;
         }
@@ -2452,7 +2562,7 @@ int factory_sign_all(factory_t *f) {
 
             secp256k1_musig_pubnonce pubnonce;
             if (!musig_generate_nonce(f->ctx, &secnonces[offset + j], &pubnonce,
-                                       seckey, &pk, &node->keyagg.cache))
+                                       seckey, &pk, &node_sign_keyagg(node)->cache))
                 goto fail;
 
             memset(seckey, 0, 32);
@@ -2733,7 +2843,7 @@ int factory_sign_node(factory_t *f, size_t node_idx) {
 
     /* Init session */
     musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
-    musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+    musig_session_init(&node->signing_session, node_sign_keyagg(node), node->n_signers);
     node->partial_sigs_received = 0;
 
     /* Allocate secnonces */
@@ -2755,7 +2865,7 @@ int factory_sign_node(factory_t *f, size_t node_idx) {
 
         secp256k1_musig_pubnonce pubnonce;
         if (!musig_generate_nonce(f->ctx, &secnonces[j], &pubnonce,
-                                   seckey, &pk, &node->keyagg.cache))
+                                   seckey, &pk, &node_sign_keyagg(node)->cache))
             goto fail;
 
         memset(seckey, 0, 32);
@@ -2770,7 +2880,7 @@ int factory_sign_node(factory_t *f, size_t node_idx) {
         if (!compute_node_sighash(f, node, sighash))
             goto fail;
 
-        const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+        const unsigned char *mr = node_sign_merkle(node);
         if (!musig_session_finalize_nonces(f->ctx, &node->signing_session,
                                             sighash, mr, NULL))
             goto fail;
@@ -3225,7 +3335,7 @@ int factory_session_init_node(factory_t *f, size_t node_idx) {
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->is_built) return 0;
     musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
-    musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+    musig_session_init(&node->signing_session, node_sign_keyagg(node), node->n_signers);
     node->partial_sigs_received = 0;
     return 1;
 }
@@ -3240,7 +3350,7 @@ int factory_session_finalize_node(factory_t *f, size_t node_idx) {
         return 0;
     }
 
-    const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+    const unsigned char *mr = node_sign_merkle(node);
     int ok = musig_session_finalize_nonces(f->ctx, &node->signing_session,
                                             sighash, mr, NULL);
     if (!ok)
@@ -5195,6 +5305,7 @@ void factory_free(factory_t *f) {
     free(f->keypairs);          f->keypairs = NULL;
     free(f->pubkeys);           f->pubkeys = NULL;
     free(f->profiles);          f->profiles = NULL;
+    free(f->chan_spks);         f->chan_spks = NULL;
     free(f->dist_partial_sigs); f->dist_partial_sigs = NULL;
     /* Per-leaf arrays (were fixed [FACTORY_MAX_LEAVES]). */
     free(f->leaf_layers);       f->leaf_layers = NULL;
@@ -5281,6 +5392,11 @@ void factory_detach_txbufs(factory_t *f) {
         participant_profile_t *pr = malloc(ms * sizeof(*pr));
         if (pr && f->profiles) memcpy(pr, f->profiles, ms * sizeof(*pr));
         f->profiles = pr;
+        if (f->chan_spks) {
+            factory_chan_spk_t *cs = malloc(ms * sizeof(*cs));
+            if (cs) memcpy(cs, f->chan_spks, ms * sizeof(*cs));
+            f->chan_spks = cs;
+        }
         secp256k1_musig_partial_sig *dp = malloc(ms * sizeof(*dp));
         if (dp && f->dist_partial_sigs) memcpy(dp, f->dist_partial_sigs, ms * sizeof(*dp));
         f->dist_partial_sigs = dp;
