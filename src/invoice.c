@@ -8,6 +8,7 @@
  */
 
 #include "superscalar/invoice.h"
+#include "superscalar/network.h"
 #include "superscalar/bolt11.h"
 #include "superscalar/sha256.h"
 #include "superscalar/stateless_invoice.h"
@@ -94,7 +95,7 @@ int invoice_create(bolt11_invoice_table_t *tbl,
 
     /* Network prefix */
     const char *pfx = "bcrt";  /* default regtest */
-    if (strcmp(network, "mainnet") == 0) pfx = "bc";
+    if (network_is_mainnet(network)) pfx = "bc";
     else if (strcmp(network, "testnet") == 0) pfx = "tb";
     else if (strcmp(network, "signet") == 0)  pfx = "tbs";
     else if (strcmp(network, "testnet4") == 0) pfx = "tb";
@@ -120,7 +121,9 @@ int invoice_create(bolt11_invoice_table_t *tbl,
     }
 
     /* Mandatory BOLT #11 v1.1 features */
-    inv.features = (1 << BOLT11_FEATURE_PAYMENT_SECRET);
+    /* payment_secret depends on var_onion_optin (BOLT #9): set both */
+    inv.features = (1 << BOLT11_FEATURE_VAR_ONION) |
+                   (1 << BOLT11_FEATURE_PAYMENT_SECRET);
 
     if (!bolt11_encode(&inv, node_privkey, ctx, bech32_out, out_cap)) {
         e->active = 0;
@@ -173,7 +176,7 @@ int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
     bolt11_invoice_t inv;
     memset(&inv, 0, sizeof(inv));
     const char *pfx2 = "bcrt";
-    if (strcmp(network, "mainnet") == 0) pfx2 = "bc";
+    if (network_is_mainnet(network)) pfx2 = "bc";
     else if (strcmp(network, "testnet") == 0) pfx2 = "tb";
     else if (strcmp(network, "signet") == 0) pfx2 = "tbs";
     else if (strcmp(network, "testnet4") == 0) pfx2 = "tb";
@@ -191,7 +194,9 @@ int invoice_create_with_hint(bolt11_invoice_table_t *tbl,
     inv.has_metadata = 1;
     if (description)
         strncpy(inv.description, description, sizeof(inv.description) - 1);
-    inv.features = (1 << BOLT11_FEATURE_PAYMENT_SECRET);
+    /* payment_secret depends on var_onion_optin (BOLT #9): set both */
+    inv.features = (1 << BOLT11_FEATURE_VAR_ONION) |
+                   (1 << BOLT11_FEATURE_PAYMENT_SECRET);
 
     /* Add route hint */
     bolt11_route_hint_t *h = &inv.hints[0];

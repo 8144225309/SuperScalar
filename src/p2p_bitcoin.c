@@ -1,4 +1,5 @@
 #include "superscalar/p2p_bitcoin.h"
+#include "superscalar/network.h"
 #include "superscalar/sha256.h"
 #include "superscalar/wire.h"    /* wire_connect_direct_internal */
 #include <string.h>
@@ -15,7 +16,7 @@
 
 static void set_magic(uint8_t magic[4], const char *network)
 {
-    if (network && strcmp(network, "mainnet") == 0) {
+    if (network_is_mainnet(network)) {
         magic[0]=0xF9; magic[1]=0xBE; magic[2]=0xB4; magic[3]=0xD9;
     } else if (network && (strcmp(network, "testnet") == 0 ||
                             strcmp(network, "testnet3") == 0)) {

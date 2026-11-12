@@ -33,8 +33,10 @@ uint32_t dw_current_nsequence(const dw_layer_t *layer) {
 
 /* --- Multi-layer counter --- */
 
-void dw_counter_init(dw_counter_t *ctr, uint32_t n_layers,
+bool dw_counter_init(dw_counter_t *ctr, uint32_t n_layers,
                       uint16_t step_blocks, uint32_t states_per_layer) {
+    if (n_layers == 0 || n_layers > DW_MAX_LAYERS)
+        return false;  /* counter left unchanged */
     ctr->n_layers = n_layers;
     ctr->current_epoch = 0;
 
@@ -44,6 +46,7 @@ void dw_counter_init(dw_counter_t *ctr, uint32_t n_layers,
 
     for (uint32_t i = 0; i < n_layers; i++)
         dw_layer_init(&ctr->layers[i], step_blocks, states_per_layer);
+    return true;
 }
 
 bool dw_counter_advance(dw_counter_t *ctr) {

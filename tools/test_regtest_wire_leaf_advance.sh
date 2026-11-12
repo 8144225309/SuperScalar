@@ -136,7 +136,7 @@ run_one() {
         local CLIENT_LOG="/tmp/${TAG}_client${n}.log"
         SS_MUSIG_STATELESS=$stateless \
         ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
-        "$CLIENT_BIN" \
+        "$CLIENT_BIN" --test-allow-tree-advance \
             --network regtest \
             --host 127.0.0.1 --port "$LSP_PORT" \
             --lsp-pubkey "$LSP_PUBKEY" \

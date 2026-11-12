@@ -234,8 +234,8 @@ int main(int argc, char **argv) {
         unsigned char txid_le[32];
         if (hex_decode(txid_hex, txid_le, 32) != 32) { fprintf(stderr, "bad txid\n"); return 1; }
         reverse_bytes(txid_le, 32);
-        factory_set_funding(f, txid_le, vout, amount, fund_spk, 34);
-        if (!factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
+        if (!factory_set_funding(f, txid_le, vout, amount, fund_spk, 34) ||
+            !factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
         printf("  factory: tree built (%zu nodes, %zu-signer PS)\n", f->n_nodes, ns);
         if (!factory_sign_all_with_retry(f, 3)) { fprintf(stderr, "factory_sign_all FAILED\n"); return 1; }
         printf("  factory: all nodes signed\n");
@@ -243,6 +243,7 @@ int main(int argc, char **argv) {
         /* --- Settlement distribution: M funded clients (varied), LSP gets remainder.
                (Milestone 1: models payment outcome; faithful HTLC flow is next.) --- */
         tx_output_t *outs = calloc(M + 1, sizeof(tx_output_t));
+        if (!outs) { fprintf(stderr, "out of memory\n"); return 1; }
         size_t n_out = 1; uint64_t client_sum = 0;
         for (size_t i = 1; i <= M; i++) {
             uint64_t amt = 700 + (uint64_t)(i % 600);
@@ -264,7 +265,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "factory_build_cooperative_close FAILED\n"); return 1;
         }
         FILE *fp = fopen(outfile, "w"); if (!fp) { fprintf(stderr, "cannot write %s\n", outfile); return 1; }
-        char *hx = malloc(close_tx.len * 2 + 1); hex_encode(close_tx.data, close_tx.len, hx); hx[close_tx.len * 2] = 0;
+        char *hx = malloc(close_tx.len * 2 + 1);
+        if (!hx) { fprintf(stderr, "out of memory\n"); fclose(fp); return 1; }
+        hex_encode(close_tx.data, close_tx.len, hx); hx[close_tx.len * 2] = 0;
         fputs(hx, fp); fclose(fp);
         printf("inproc-lifecycle: signers=%zu funded=%zu outputs=%zu  close_tx=%zu B  conserves=%s\n",
                ns, M, n_out, close_tx.len,
@@ -322,8 +325,8 @@ int main(int argc, char **argv) {
         unsigned char txid_le[32];
         if (hex_decode(txid_hex, txid_le, 32) != 32) { fprintf(stderr, "bad txid\n"); return 1; }
         reverse_bytes(txid_le, 32);
-        factory_set_funding(f, txid_le, vout, amount, fund_spk, 34);
-        if (!factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
+        if (!factory_set_funding(f, txid_le, vout, amount, fund_spk, 34) ||
+            !factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
         if (!factory_sign_all_with_retry(f, 3)) { fprintf(stderr, "factory_sign_all FAILED\n"); return 1; }
         printf("  factory: %zu nodes, %zu-signer PS, all signed\n", f->n_nodes, ns);
 
@@ -520,7 +523,9 @@ int main(int argc, char **argv) {
         }
 
         FILE *fp = fopen(outfile, "w"); if (!fp) { fprintf(stderr, "cannot write %s\n", outfile); return 1; }
-        char *hx = malloc(close_tx.len * 2 + 1); hex_encode(close_tx.data, close_tx.len, hx); hx[close_tx.len * 2] = 0;
+        char *hx = malloc(close_tx.len * 2 + 1);
+        if (!hx) { fprintf(stderr, "out of memory\n"); fclose(fp); return 1; }
+        hex_encode(close_tx.data, close_tx.len, hx); hx[close_tx.len * 2] = 0;
         fputs(hx, fp); fclose(fp); free(hx);
 
         printf("inproc-pay: N=%zu channels=%zu payments=%zu (skipped %zu) gross_moved=%llu sats\n",

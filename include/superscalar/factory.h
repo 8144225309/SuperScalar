@@ -515,9 +515,13 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 void factory_set_arity(factory_t *f, factory_arity_t arity);
 
 /* Set variable arity per tree level (4A). arities[0]=root level, etc.
-   Last entry applies to all deeper levels. Clears uniform leaf_arity.
-   Must be called after init, before build_tree. */
-void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
+   Last entry applies to all deeper levels and sets the leaf kind (3 = PS,
+   else DW): a level of the other kind ends a subtree only when it fits one
+   leaf of the last entry, built with the last entry's arity.
+   Must be called after init, before build_tree.  Returns 0, changing
+   nothing, unless 1 <= n <= FACTORY_MAX_LEVELS and every entry is
+   1..FACTORY_MAX_OUTPUTS. */
+int factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
 
 /* Override the default L-stock CSV (BIP-68) blocks.  Must be called
    before factory_build_tree() — otherwise the L-stock SPK is already
@@ -729,13 +733,34 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
    depths, capped at DW_MAX_LAYERS. */
 void factory_set_static_near_root(factory_t *f, uint32_t threshold);
 
-void factory_set_funding(factory_t *f,
-                         const unsigned char *txid, uint32_t vout,
-                         uint64_t amount_sats,
-                         const unsigned char *spk, size_t spk_len);
+/* Record the funding outpoint.  Returns 0, changing nothing, unless spk is a
+   34-byte P2TR (OP_1 <32 bytes>).  factory_build_tree then refuses to build
+   unless spk is exactly the key-path P2TR of the root signers' MuSig2 key
+   (factory_compute_funding_spk). */
+int factory_set_funding(factory_t *f,
+                        const unsigned char *txid, uint32_t vout,
+                        uint64_t amount_sats,
+                        const unsigned char *spk, size_t spk_len);
+
+/* The funding script factory_build_tree accepts: the key-path P2TR of the
+   MuSig2 aggregate of the root signers (the LSP, then the clients in the
+   order the configured placement mode and profiles put them).  Call after
+   setting placement and profiles.  Returns 0 on failure. */
+int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
+
+/* Set the client placement strategy for factory_build_tree.  Returns 0,
+   changing nothing, for a mode that is not a placement_mode_t value.  The
+   default is PLACEMENT_TIMEZONE_CLUSTER. */
+int factory_set_placement_mode(factory_t *f, placement_mode_t mode);
 
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
+
+/* nLockTime of the factory's distribution transaction: the factory's CLTV
+   timeout.  The LSP announces this value and every client requires it. */
+static inline uint32_t factory_distribution_locktime(const factory_t *f) {
+    return f ? f->cltv_timeout : 0;
+}
 int factory_verify_all(factory_t *f);
 
 /* Bounded fresh-nonce retry (#48): max sign+verify attempts per ceremony before
@@ -748,6 +773,44 @@ int factory_verify_close_sig(const factory_t *f, const unsigned char sig64[64],
                              const unsigned char sighash[32]);
 extern int g_factory_test_force_verify_fail;   /* TEST-ONLY seam; always 0 in production */
 
+/* 1 if some built state transaction counts down on a Decker-Wattenhofer
+   layer (a relative lock that a refresh in place can shorten).  0 for an
+   advanceless tree (every interior level static, pseudo-Spilman leaves),
+   where an advance or a rollover changes no transaction. */
+int factory_has_dw_state(const factory_t *f);
+
+/* The advanceless shape for n_clients: every interior level static
+   (kickoff only, no DW state), one member per pseudo-Spilman leaf.
+     depth d    = fewest fan-out levels such that 15^d >= n_clients (15
+                  children per node: FACTORY_MAX_OUTPUTS less the anchor);
+     fan-out a  = the smallest a >= 4 with a^d >= n_clients (the narrowest
+                  fan-out that reaches every client in d levels, so no node
+                  carries more outputs than it needs);
+     arities    = d entries of a, then 3 (PS leaves);
+     static     = d (--static-near-root: every level above the leaves).
+   e.g. 4 -> "4,3" static 1, 64 -> "8,8,3" static 2, 255 -> "7,7,7,3" static 3.
+   A single client gets "3" static 0 (the root is its leaf).  Writes
+   d + 1 entries to arities_out; returns 1, or 0 for n_clients == 0 or a
+   shape that would not fit FACTORY_MAX_LEVELS. */
+int factory_advanceless_shape(size_t n_clients,
+                              uint8_t arities_out[FACTORY_MAX_LEVELS],
+                              size_t *n_arities_out,
+                              uint32_t *static_near_root_out);
+
+/* The one refusal for extending a factory's life in place. */
+#define FACTORY_EXTEND_REFUSED_MSG \
+    "refused: this factory has no Decker-Wattenhofer state layer, so its " \
+    "root cannot advance or roll over; its life is extended only by " \
+    "rotating to a new factory (a new funding output)"
+
+/* Logs FACTORY_EXTEND_REFUSED_MSG prefixed with `who` and returns 1 when
+   factory_has_dw_state(f) is 0; returns 0 (nothing logged) otherwise.
+   Every refresh-in-place entry point (root tick, whole-counter advance,
+   leaf rollover) checks it first. */
+int factory_refuses_refresh_in_place(const factory_t *f, const char *who);
+
+/* Advance the whole DW counter and re-sign every node.  Refused (returns 0)
+   for a factory without DW state (factory_refuses_refresh_in_place). */
 int factory_advance(factory_t *f);
 
 /* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
@@ -767,7 +830,8 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
    by block-height progression instead.  Caller (LSP) wires this into a
    block-polling loop and runs Tier B on rc=-1.
    Returns -1 on epoch rollover (trees rebuilt; run Tier B);
-   0 otherwise (no rollover or fully exhausted). */
+   0 otherwise (no rollover or fully exhausted).  A factory without DW state
+   is refused: 0, nothing changed (factory_refuses_refresh_in_place). */
 int factory_tick_root(factory_t *f);
 
 /* Sub-factory chain extension (Gap E followup Phase 2, t/1242 k² PS).
@@ -836,9 +900,12 @@ void factory_set_subfactory_chain_confirmed_height(factory_t *f,
                                                     size_t node_idx,
                                                     uint32_t confirmed_height);
 
-/* Compute the factory_early_warning_time (blocks) per BLIP-56.
-   This is the worst-case blocks needed for full unilateral close from
-   the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */
+/* Compute the factory_early_warning_time (blocks) per BLIP-56: the
+   worst-case blocks a full unilateral close needs, i.e. the largest sum of
+   the relative locks (each DW state's longest delay) on any root-to-leaf
+   path of the built tree.  PS leaves contribute 0 blocks (no nSequence at
+   leaf level).  Before factory_build_tree, the same sum for the configured
+   shape. */
 uint32_t factory_early_warning_time(const factory_t *f);
 
 /* Compute the worst-case factory_early_warning_time (blocks) for a given
@@ -851,14 +918,17 @@ uint32_t factory_early_warning_time(const factory_t *f);
    - level_arities: per-level arity array; NULL or n_level_arity==0 means
      uniform leaf_arity
    - leaf_arity: used when level_arities is NULL/empty (3 = PS, 1/2 = DW)
+   - ps_subfactory_arity: k of factory_set_ps_subfactory_arity (0 or 1 =
+     one client per PS leaf, k > 1 = k² clients per PS leaf)
    - n_clients: client count (excludes LSP, so factory_clients_only)
    - static_threshold: top N tree depths are kickoff-only (Phase 3)
    - step_blocks / states_per_layer: per-DW-layer config (mainnet 144 / 4)
-   Returns ewt in blocks.  Treats PS leaves as 0-cost at the leaf layer
-   when leaf arity == FACTORY_ARITY_PS. */
+   Returns ewt in blocks: what factory_early_warning_time returns once the
+   shape is built (PS leaves cost 0). */
 uint32_t factory_compute_ewt_for_shape(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
+    uint32_t ps_subfactory_arity,
     size_t n_clients,
     uint32_t static_threshold,
     uint16_t step_blocks,
@@ -986,6 +1056,42 @@ void factory_session_reset_poison(factory_t *f, size_t node_idx);
    No amount may be below dust (546 sats).  Rebuilds the unsigned tx. */
 int factory_set_leaf_amounts(factory_t *f, int leaf_side,
                               const uint64_t *amounts, size_t n_amounts);
+
+/* Everything a per-leaf advance or a change of leaf amounts alters on one
+   leaf: its place in the per-leaf DW counter, its outputs, both transaction
+   buffers and their txid, the L-stock commitment and the PS chain position.
+   A ceremony that advances a leaf and then fails puts the leaf back with it,
+   so the tree stays the one its co-signers still hold. */
+typedef struct {
+    int valid;
+    int per_leaf_enabled;
+    dw_layer_t leaf_layer;
+    tx_output_t outputs[FACTORY_MAX_OUTPUTS];
+    size_t n_outputs;
+    unsigned char txid[32];
+    uint32_t nsequence;
+    int is_built;
+    int is_signed;
+    tx_buf_t unsigned_tx;
+    tx_buf_t signed_tx;
+    unsigned char l_stock_hash[32];
+    int has_l_stock_hash;
+    uint32_t l_stock_state_counter;
+    int ps_chain_len;
+    unsigned char ps_prev_txid[32];
+    uint64_t ps_prev_chan_amount;
+} factory_leaf_snapshot_t;
+
+/* Capture the state of leaf leaf_side.  Returns 1 on success; the snapshot
+   owns copies of the transaction buffers until factory_leaf_snapshot_free. */
+int factory_leaf_snapshot(const factory_t *f, int leaf_side,
+                           factory_leaf_snapshot_t *snap);
+
+/* Put leaf leaf_side back exactly as captured.  Returns 1 on success. */
+int factory_leaf_restore(factory_t *f, int leaf_side,
+                          const factory_leaf_snapshot_t *snap);
+
+void factory_leaf_snapshot_free(factory_leaf_snapshot_t *snap);
 
 /* Rebuild a single node's unsigned tx (public wrapper around internal helper). */
 int factory_rebuild_node_tx(factory_t *f, size_t node_idx);

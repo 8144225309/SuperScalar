@@ -854,7 +854,6 @@ int test_regtest_channel_unilateral(void) {
     /* Build factory tree, then advance to max state (all delays = 0).
        factory_build_tree reinitializes the DW counter, so advances must happen after. */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
 
@@ -2468,7 +2467,6 @@ int test_regtest_channel_coop_close(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -2947,7 +2945,6 @@ int test_factory_advance_past_exhaustion(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, keypairs, 5, 10, 4);
 
@@ -2958,6 +2955,7 @@ int test_factory_advance_past_exhaustion(void) {
     memset(fake_txid, 0xAA, 32);
     unsigned char fund_spk[34] = {0x51, 0x20};
     memset(fund_spk + 2, 0xCC, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
     f->cltv_timeout = 200;
 
@@ -3065,7 +3063,6 @@ int test_regtest_channel_penalty(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -3699,7 +3696,6 @@ int test_regtest_penalty_with_htlcs(void) {
                 "find factory vout");
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 

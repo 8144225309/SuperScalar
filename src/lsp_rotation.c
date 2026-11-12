@@ -9,6 +9,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/ladder.h"
+#include "superscalar/cli_arity.h"
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
@@ -70,8 +71,22 @@ void lsp_rotation_record_success(lsp_channel_mgr_t *mgr, uint32_t factory_id) {
 
 /* --- Factory rotation --- */
 
+void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic) {
+    if (!mgr) return;
+    mgr->rot_enabled = enabled ? 1 : 0;
+    mgr->rot_auto_rotate = (enabled && automatic) ? 1 : 0;
+}
+
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr || !lsp || !mgr->ladder) return 0;
+    if (!mgr || !lsp) return 0;
+    /* Every way into a rotation (daemon lifecycle, retries, async readiness,
+       CLI "rotate", MSG_ROTATE) ends here. */
+    if (!mgr->rot_enabled) {
+        fprintf(stderr, "LSP rotate: refused: factory rotation is disabled "
+                "(it runs only with --enable-rotation-experimental)\n");
+        return 0;
+    }
+    if (!mgr->ladder) return 0;
 
     ladder_t *lad = (ladder_t *)mgr->ladder;
     fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
@@ -966,7 +981,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     {
         int cur_h = regtest_get_block_height(rt);
         if (cur_h > 0) {
-            int offset = mgr->rot_is_regtest ? 35 : 1008;
+            /* Members refuse a timeout that leaves no room for their exit. */
+            uint32_t offset = cli_factory_auto_cltv_offset(
+                mgr->rot_is_regtest ? 35 : 1008,
+                cli_factory_exit_blocks(NULL, 0, saved_arity, 1, lsp->n_clients, 0,
+                                        mgr->rot_step_blocks,
+                                        mgr->rot_states_per_layer));
             new_cltv = (uint32_t)cur_h + offset;
         }
     }
@@ -1091,6 +1111,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     void *saved_jit = mgr->jit_channels;
     size_t saved_n_jit = mgr->n_jit_channels;
     int saved_jit_enabled = mgr->jit_enabled;
+    struct lsp_deferred_msg *saved_deferred = mgr->deferred_msgs;
+    size_t saved_n_deferred = mgr->n_deferred_msgs;
+    size_t saved_deferred_cap = mgr->deferred_msgs_cap;
     uint64_t saved_jit_funding = mgr->jit_funding_sats;
     unsigned char saved_seckey[32];
     memcpy(saved_seckey, mgr->rot_lsp_seckey, 32);
@@ -1107,6 +1130,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     int saved_leaf_arity = mgr->rot_leaf_arity;
     int saved_is_regtest = mgr->rot_is_regtest;
     uint64_t saved_funding_sats = mgr->rot_funding_sats;
+    int saved_rot_enabled = mgr->rot_enabled;
     int saved_auto_rotate = mgr->rot_auto_rotate;
     uint32_t saved_attempted_mask = mgr->rot_attempted_mask;
     uint8_t  saved_retry_count[8];
@@ -1158,6 +1182,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->rot_leaf_arity = saved_leaf_arity;
     mgr->rot_is_regtest = saved_is_regtest;
     mgr->rot_funding_sats = saved_funding_sats;
+    mgr->rot_enabled = saved_rot_enabled;
     mgr->rot_auto_rotate = saved_auto_rotate;
     mgr->rot_attempted_mask = saved_attempted_mask;
     memcpy(mgr->rot_retry_count, saved_retry_count, sizeof(saved_retry_count));
@@ -1168,33 +1193,27 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->jit_channels = saved_jit;
     mgr->n_jit_channels = saved_n_jit;
     mgr->jit_enabled = saved_jit_enabled;
+    mgr->deferred_msgs = saved_deferred;
+    mgr->n_deferred_msgs = saved_n_deferred;
+    mgr->deferred_msgs_cap = saved_deferred_cap;
     mgr->jit_funding_sats = saved_jit_funding;
     mgr->cli_enabled = saved_cli_enabled;
     mgr->confirm_timeout_secs = saved_confirm_timeout;
 
-    /* Restore channel balances from old factory (carry across rotation).
-       Only apply if the old (usable) balance fits within the new channel
-       capacity.  funding_amount is the GROSS on-chain amount; the base
-       commitment fee is reserved from it, so the conservation invariant
-       (lsp_channels.c) checks local + remote + htlc_sum == funding_amount -
-       base_commit_fee.  The carried local/remote is a usable total, so the
-       gross funding_amount must add the base commit fee back — otherwise the
-       checker sees a deficit of exactly base_commit_fee on every channel and
-       the LSP refuses all new HTLCs after a rotation.  Use the same fee rate
-       the channels are about to be set to below (and that the checker reads
-       from ch->fee_rate_sat_per_kvb). */
-    uint64_t rot_fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
-    uint64_t rot_base_commit_fee = (rot_fee_rate * 154 + 999) / 1000;
+    /* Carry each client's balance into its new channel.  The new channel is
+       built by lsp_channels_init exactly like a channel at first open: its
+       funding amount is the new tree's leaf output and its fee rate the fixed
+       channel default.  The client derives the same two values from its own
+       copy of the tree, so the commitment the LSP signs below is the one the
+       client verifies.  The client's balance moves over unchanged; whatever
+       else the new leaf holds is the LSP's side. */
     for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
-        channel_t *ch = &mgr->entries[c].channel;
-        uint64_t old_total = saved_ch_local[c] + saved_ch_remote[c];
-        uint64_t new_usable = ch->local_amount + ch->remote_amount;
-        if (old_total > 0 && old_total <= new_usable) {
-            ch->local_amount = saved_ch_local[c];
-            ch->remote_amount = saved_ch_remote[c];
-            ch->funding_amount = old_total + rot_base_commit_fee;
-        }
-        /* else: new factory has different capacity, keep default split */
+        if (saved_ch_local[c] + saved_ch_remote[c] == 0) continue;
+        if (!lsp_channel_carry_client_balance(&mgr->entries[c].channel,
+                                              saved_ch_remote[c]))
+            fprintf(stderr, "LSP rotate: client %zu balance %llu does not fit the "
+                    "new channel; keeping the default split\n", c,
+                    (unsigned long long)saved_ch_remote[c]);
     }
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {
@@ -1202,11 +1221,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
-    /* Set fee rate on all new channels — the same rate used above to size
-       the restored channels' gross funding_amount, so the conservation
-       checker reads a consistent base_commit_fee. */
-    for (size_t c = 0; c < mgr->n_channels; c++)
-        mgr->entries[c].channel.fee_rate_sat_per_kvb = rot_fee_rate;
+    /* Drill checkpoint: the new factory is funded and its tree signed, the
+       clients have not yet received CHANNEL_READY or commitment 0. */
+    lsp_crash_checkpoint("rotate_channel_setup");
 
     if (!lsp_channels_send_ready(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: send_ready failed\n");
@@ -1263,11 +1280,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
-    /* Migrate any active JIT channels into the new factory */
+    /* Retire JIT channels whose funding output has been spent.  One that is
+       still on chain stays open with its record. */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         if (jit_channel_is_active(mgr, c)) {
-            printf("LSP rotate: migrating JIT channel for client %zu\n", c);
-            jit_channel_migrate(mgr, lsp, c, 0);
+            if (jit_channel_migrate(mgr, lsp, c, 0))
+                printf("LSP rotate: retired JIT channel for client %zu\n", c);
+            else
+                fprintf(stderr, "LSP rotate: JIT channel for client %zu is "
+                        "still on chain; left open\n", c);
         }
     }
 
