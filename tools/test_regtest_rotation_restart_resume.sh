@@ -62,7 +62,7 @@ grep -q listening "$TMP/lsp1.log" || { echo "RESUME-FAIL: LSP1 never listened"; 
 
 for N in 1 2 3 4; do
   SK=$(printf "%064x" $((N + 1)))
-  "$BUILD/superscalar_client" --network regtest --host 127.0.0.1 --port $PORT --daemon \
+  "$BUILD/superscalar_client" --network regtest --host 127.0.0.1 --port $PORT --daemon --enable-rotation-experimental \
     --seckey "$SK" --fee-rate 1100 --lsp-balance-pct 50 --lsp-pubkey $LSP_PUB \
     --participant-id $N --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
     --wallet "$WALLET" --db "$TMP/c${N}.db" > "$TMP/c${N}.log" 2>&1 &

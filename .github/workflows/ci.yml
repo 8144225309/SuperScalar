@@ -51,6 +51,7 @@ jobs:
           ASAN_OPTIONS: ${{ matrix.sanitizers && 'detect_leaks=1' || 'detect_leaks=0' }}
           LSAN_OPTIONS: ${{ matrix.sanitizers && format('exitcode=23:suppressions={0}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0', github.workspace) || '' }}
           TSAN_OPTIONS: ${{ matrix.tsan && format('halt_on_error=1:second_deadlock_stack=1:suppressions={0}/test/sanitizer_suppressions/tsan.supp:print_suppressions=0', github.workspace) || '' }}
+          UBSAN_OPTIONS: ${{ matrix.sanitizers && 'halt_on_error=1:print_stacktrace=1' || '' }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           cd build && ./test_superscalar --unit
@@ -92,6 +93,20 @@ jobs:
         # anything.  No node is needed: every case exits at the start-up check.
         if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
         run: tools/test_startup_gates.sh build
+
+  # A pull request may raise PERSIST_SCHEMA_VERSION by one (with its
+  # migration) or leave it alone; anything else fails.
+  schema-version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: Schema version
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: PERSIST_SCHEMA_VERSION changed by at most +1
+        run: tools/check_schema_version.sh "origin/${{ github.base_ref }}"
 
   arm64-build-test:
     runs-on: ubuntu-latest
@@ -285,6 +300,7 @@ jobs:
           # runtime — without the override ASan aborts at libinit.
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -298,6 +314,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -309,6 +326,7 @@ jobs:
           # runtime — without the override ASan aborts at libinit.
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -323,6 +341,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -342,6 +361,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
           LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           bash tools/test_regtest_payment_no_leaf_advance.sh build
@@ -512,28 +532,48 @@ jobs:
           path: build/coverage_report/
 
   fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_wire_recv, fuzz_wire_parse_json, fuzz_tx_sighash,
+                 fuzz_persist_load, fuzz_hex_decode,
+                 fuzz_noise_handshake, fuzz_aead_decrypt]
     runs-on: ubuntu-latest
-    name: Fuzz Testing
-    timeout-minutes: 60
+    name: Fuzz (${{ matrix.target }})
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libssl-dev clang
-      - name: Build fuzz targets
+      - name: Build fuzz target
         run: |
           CC=clang cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_FUZZING=ON \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build build --parallel --target fuzz_wire_recv fuzz_wire_parse_json \
-            fuzz_tx_sighash fuzz_persist_load fuzz_hex_decode \
-            fuzz_noise_handshake fuzz_aead_decrypt
-      - name: Run fuzz (5 min each)
+          cmake --build build --parallel --target ${{ matrix.target }}
+      # The corpus each run grows is kept for the next one (a new cache entry
+      # per run, restored from the newest earlier entry of the same target).
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: build/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # A crash, a leak, undefined behaviour or an input that runs longer
+      # than -timeout seconds fails the job; the input that caused it is
+      # uploaded below.
+      - name: Run fuzz (5 min)
         run: |
           cd build
-          for target in fuzz_wire_recv fuzz_wire_parse_json fuzz_tx_sighash \
-                        fuzz_persist_load fuzz_hex_decode \
-                        fuzz_noise_handshake fuzz_aead_decrypt; do
-              mkdir -p corpus/$target
-              timeout 300 ./$target corpus/$target/ -max_total_time=300 || true
-          done
+          mkdir -p corpus/${{ matrix.target }} artifacts
+          SEEDS=""
+          if [ -d ../fuzz/corpus/${{ matrix.target }} ]; then SEEDS=../fuzz/corpus/${{ matrix.target }}; fi
+          ./${{ matrix.target }} corpus/${{ matrix.target }}/ $SEEDS \
+            -max_total_time=300 -timeout=60 -artifact_prefix=artifacts/
+      - name: Upload reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-reproducer-${{ matrix.target }}
+          path: build/artifacts/

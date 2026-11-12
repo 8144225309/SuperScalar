@@ -882,6 +882,9 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
     size_t dist_row = (size_t)f->n_nodes * mtx_stride;  /* byte offset of the dist row */
     dist_active = (f->dist_tx_ready >= 1 && f->dist_unsigned_tx.len > 0 &&
                    factory_session_init_dist(f));
+    /* Test hook, inert unless superscalar_cheat_allowed() (regtest only):
+       leave the distribution TX out of the creation ceremony. */
+    if (superscalar_cheat_allowed() && getenv("SS_CHEAT_DIST_OMIT")) dist_active = 0;
 
     lsp_crash_checkpoint("factory_creation_propose");
 
@@ -1053,8 +1056,13 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
             wire_json_add_hex(response, "all_dist_pubnonces",
                               all_pn + dist_row, (size_t)f->n_participants * 66);
             wire_json_add_hex(response, "lsp_dist_psig", lsp_dist_psig, 32);
+            /* Test hook, inert unless superscalar_cheat_allowed() (regtest
+               only): announce a different locktime. */
             cJSON_AddNumberToObject(response, "dist_nlocktime",
-                                    (double)f->cltv_timeout);
+                                    (double)(factory_distribution_locktime(f) +
+                                             ((superscalar_cheat_allowed() &&
+                                               getenv("SS_CHEAT_DIST_LOCKTIME"))
+                                                  ? 1u : 0u)));
             size_t namt = lsp->dist_n_client_amounts;
             if (namt > 0 && namt <= (size_t)f->n_participants) {
                 unsigned char *amt_le = calloc(namt, 8);

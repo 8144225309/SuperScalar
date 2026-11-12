@@ -115,7 +115,7 @@ for i in $(seq 1 "$N_CLIENTS"); do
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$i" \
         --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
         --wallet "$WALLET" --db "/tmp/ss_${TAG}_c${SK:60:4}.db" \
-        --daemon \
+        --daemon --enable-rotation-experimental \
         > "/tmp/ss_${TAG}_c${SK:60:4}.log" 2>&1 &
     sleep 0.2
 done

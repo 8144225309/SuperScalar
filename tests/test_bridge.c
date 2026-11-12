@@ -1283,7 +1283,7 @@ int test_regtest_bridge_payment(void) {
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1785,7 +1785,7 @@ int test_regtest_bridge_out(void) {
     int lsp_ok = 1;
     if (!lsp_accept_clients(lsp)) { fprintf(stderr, "LSP: accept failed\n"); lsp_ok = 0; }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
-                                            fund_spk, 34, 10, 4, 0)) {
+                                            fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
     }
 
@@ -2067,7 +2067,7 @@ int test_regtest_bridge_invoice_flow(void) {
     if (lsp_ok && !lsp_run_factory_creation(lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4, 0)) {
+                                             fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2967,7 +2967,7 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP-n64: factory creation failed\n");
         lsp_ok = 0;
     }

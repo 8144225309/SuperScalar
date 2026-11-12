@@ -1023,7 +1023,7 @@ static int run_creation_until_client_error(secp256k1_context *ctx, lsp_t *lsp,
         for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++) pks[c + 1] = lsp->client_pubkeys[c];
         if (!test_funding_spk_from_pubkeys(ctx, pks, 1 + CREATION_TEST_CLIENTS, spk)) return 0;
         rc = lsp_run_factory_creation(lsp, txid, 0, 100000, spk, sizeof(spk),
-                                      10, 4, 0);
+                                      10, 4, 2000000 /* CLTV: a distribution TX is required */);
     }
 
     wire_msg_t m;
@@ -1252,7 +1252,7 @@ int test_regtest_wire_factory(void) {
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }

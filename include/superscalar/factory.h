@@ -824,6 +824,12 @@ uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients);
 int factory_check_tree_fees(const factory_t *f, char *why, size_t why_len);
 
 int factory_sign_all(factory_t *f);
+
+/* nLockTime of the factory's distribution transaction: the factory's CLTV
+   timeout.  The LSP announces this value and every client requires it. */
+static inline uint32_t factory_distribution_locktime(const factory_t *f) {
+    return f ? f->cltv_timeout : 0;
+}
 int factory_verify_all(factory_t *f);
 
 /* Bounded fresh-nonce retry (#48): max sign+verify attempts per ceremony before

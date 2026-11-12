@@ -338,7 +338,7 @@ run_scenario() {
         local hex_last
         hex_last=$(printf "%02x" $((N + 1)))
         local sk="00000000000000000000000000000000000000000000000000000000000000${hex_last}"
-        "$CLIENT_BIN" --test-allow-tree-advance \
+        "$CLIENT_BIN" --test-allow-tree-advance --enable-rotation-experimental \
             --network regtest --host 127.0.0.1 --port "$port" --daemon \
             --seckey "$sk" --fee-rate 1100 --lsp-balance-pct 50 \
             --lsp-pubkey "$LSP_PUB" --participant-id "$((N - 1 + pid_base))" \
