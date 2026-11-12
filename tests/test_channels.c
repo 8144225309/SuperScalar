@@ -5060,7 +5060,8 @@ int test_forward_into_full_channel_fails_back(void) {
     FF_STEP(lsp_accept_clients(lsp), "accept clients");
     lsp->factory.leaf_arity = FACTORY_ARITY_PS;
     FF_STEP(lsp_run_factory_creation(lsp, funding_txid, 0, funding_amount, fund_spk, 34,
-                                      10, 4, 0), "factory creation");
+                                      10, 4, 2000000 /* CLTV: a distribution TX is required */),
+            "factory creation");
     lsp_channel_mgr_t ch_mgr;
     memset(&ch_mgr, 0, sizeof(ch_mgr));
     FF_STEP(lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 2), "channel init");
