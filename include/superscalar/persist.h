@@ -1300,10 +1300,11 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
    also when nothing was stored under that id. */
 int persist_delete_factory_record(persist_t *p, uint32_t factory_id);
 
-/* Txid (64 hex characters plus NUL, display order) of a stored tree node.
-   Returns 1 if the node is on record. */
+/* Txid (64 hex characters plus NUL, display order) and output count of a
+   stored tree node.  Returns 1 if the node is on record. */
 int persist_load_tree_node_txid(persist_t *p, uint32_t factory_id,
-                                 uint32_t node_index, char *txid_hex65);
+                                 uint32_t node_index, char *txid_hex65,
+                                 uint32_t *n_outputs_out);
 
 /* Funding outpoint (txid as 64 hex characters plus NUL, display order) and
    CLTV timeout of a stored factory.  Returns 1 if the factory is on record. */

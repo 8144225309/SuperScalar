@@ -8762,8 +8762,13 @@ int test_client_factory_ready_handler(void) {
     return 1;
 }
 
-/* Distribution transaction: locktime must be the factory's, and a rotation
-   needs a verified one paying the client at least its balance. */
+#include <sys/socket.h>
+#include <unistd.h>
+
+/* The distribution transaction a factory is accepted with: the factory's
+   locktime, fully co-signed, and paying the member its full channel
+   capacity (one rule, client_distribution_pays_member, for first open and
+   rotation). */
 int test_client_distribution_exit_checks(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair kps[5];
@@ -8779,6 +8784,13 @@ int test_client_distribution_exit_checks(void) {
 
     secp256k1_pubkey me;
     TEST_ASSERT(secp256k1_keypair_pub(ctx, &me, &kps[2]), "my key");
+    uint64_t cap = client_member_channel_capacity(f, 2);
+    size_t lnode; uint32_t lvout;
+    TEST_ASSERT(factory_client_to_leaf(f, 1, &lnode, &lvout), "leaf of member 2");
+    TEST_ASSERT_EQ(cap, f->nodes[lnode].outputs[lvout].amount_sats - 154,
+                   "capacity = leaf output less the base commitment fee");
+    TEST_ASSERT_EQ(client_member_channel_capacity(f, 0), 0, "the LSP has no member channel");
+
     tx_output_t out;
     memset(&out, 0, sizeof(out));
     {
@@ -8792,31 +8804,50 @@ int test_client_distribution_exit_checks(void) {
         TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &tw, NULL, &full), "xonly 2");
         build_p2tr_script_pubkey(out.script_pubkey, &tw);
         out.script_pubkey_len = 34;
-        out.amount_sats = 29000;
     }
+    for (int pass = 0; pass < 2; pass++) {
+        out.amount_sats = pass == 0 ? cap : cap - 1;
+        tx_buf_free(&f->dist_unsigned_tx);
+        tx_buf_init(&f->dist_unsigned_tx, 256);
+        TEST_ASSERT(build_unsigned_tx_with_locktime(&f->dist_unsigned_tx, NULL, f->funding_txid,
+                                                    0, 0xFFFFFFFEu, 500, &out, 1), "dist tx");
+        TEST_ASSERT_EQ(client_distribution_pays_member(ctx, f->dist_unsigned_tx.data,
+                           f->dist_unsigned_tx.len, &me, cap), pass == 0,
+                       "pays the capacity: yes / one sat short: no");
+        f->dist_tx_ready = 2;
+        TEST_ASSERT_EQ(client_factory_exit_acceptable(ctx, f, 2, &me), pass == 0,
+                       "factory accepted only when its distribution TX pays the capacity");
+    }
+    out.amount_sats = cap;
     tx_buf_free(&f->dist_unsigned_tx);
     tx_buf_init(&f->dist_unsigned_tx, 256);
     TEST_ASSERT(build_unsigned_tx_with_locktime(&f->dist_unsigned_tx, NULL, f->funding_txid,
-                                                0, 0xFFFFFFFEu, 500, &out, 1), "dist tx");
-    f->dist_tx_ready = 2;
-    TEST_ASSERT(client_rotation_exit_acceptable(ctx, f, &me, 29000), "pays the balance: accepted");
-    TEST_ASSERT(!client_rotation_exit_acceptable(ctx, f, &me, 29001), "pays less than the balance: refused");
+                                                0, 0xFFFFFFFEu, 500, &out, 1), "dist tx 2");
     f->dist_tx_ready = 1;
-    TEST_ASSERT(!client_rotation_exit_acceptable(ctx, f, &me, 1000), "unverified transaction: refused");
+    TEST_ASSERT(!client_factory_exit_acceptable(ctx, f, 2, &me), "built but not co-signed: refused");
     f->dist_tx_ready = 0;
-    TEST_ASSERT(!client_rotation_exit_acceptable(ctx, f, &me, 0), "no transaction: refused");
+    TEST_ASSERT(!client_factory_exit_acceptable(ctx, f, 2, &me), "no distribution TX: refused");
+    f->dist_tx_ready = 2;
+    secp256k1_pubkey other;
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &other, &kps[3]), "other key");
+    TEST_ASSERT(!client_factory_exit_acceptable(ctx, f, 3, &other), "pays someone else: refused");
 
     factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;
 }
 
-static struct { int unspent, root_confs; } g_fake_fc;
+static struct { int funding_unspent, own_unspent, other; char root[65]; } g_fake_fc;
 static int fake_fc_unspent(chain_backend_t *self, const char *txid, uint32_t vout) {
-    (void)self; (void)txid; (void)vout; return g_fake_fc.unspent;
+    (void)self; (void)vout;
+    if (strcmp(txid, g_fake_fc.root) == 0) return g_fake_fc.own_unspent;
+    /* the funding outpoint and every other tree node */
+    if (strlen(txid) == 64 && txid[0] == 'a' && txid[1] == 'a' && txid[63] == 'a')
+        return g_fake_fc.funding_unspent;
+    return g_fake_fc.other;
 }
-static int fake_fc_confs(chain_backend_t *self, const char *txid) {
-    (void)self; (void)txid; return g_fake_fc.root_confs;
+static int fake_fc_confs_never(chain_backend_t *self, const char *txid) {
+    (void)self; (void)txid; return -1;   /* no index: the root is never "found" */
 }
 
 /* --force-close: what may be published in each state of the database and
@@ -8831,50 +8862,138 @@ int test_client_force_close_plan(void) {
     TEST_ASSERT(persist_open(&db, NULL), "db");
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "factory 0");
     TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "tree 0");
+    uint32_t nout = 0;
+    TEST_ASSERT(persist_load_tree_node_txid(&db, 0, 0, g_fake_fc.root, &nout), "root txid");
+    TEST_ASSERT(nout >= 1, "root has outputs");
+    char ftx[65];
+    uint32_t fv = 0;
+    TEST_ASSERT(persist_load_factory_outpoint(&db, 0, ftx, &fv, NULL) &&
+                ftx[0] == 'a' && ftx[63] == 'a', "funding txid is the fixture's");
     chain_backend_t chain;
     memset(&chain, 0, sizeof(chain));
     chain.is_outpoint_unspent = fake_fc_unspent;
-    chain.get_confirmations = fake_fc_confs;
+    chain.get_confirmations = fake_fc_confs_never;
     uint32_t dist = 99;
     FILE *sink = fopen("/dev/null", "w");
     TEST_ASSERT(sink, "sink");
 
-    g_fake_fc.unspent = 1; g_fake_fc.root_confs = -1;
+    g_fake_fc.funding_unspent = 1; g_fake_fc.own_unspent = 0; g_fake_fc.other = 0;
     TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 0,
                    "no commitment: no tree");
     TEST_ASSERT_EQ(dist, 0, "own factory's distribution tx offered");
+
+    TEST_ASSERT(client_rotation_save_pending(&db, f, ctx), "pending record");
+    dist = 99;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 0,
+                   "pending, old funding unspent, no commitment: no tree");
+    TEST_ASSERT_EQ(dist, 0, "the old factory's distribution tx offered");
 
     unsigned char sig[64], tx[80];
     memset(sig, 1, 64); memset(tx, 2, 80);
     TEST_ASSERT(persist_save_commitment_sig(&db, 0, 0, sig, tx, 80), "commitment");
     TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
-                   "commitment, no rotation pending: publish");
-
-    TEST_ASSERT(client_rotation_save_pending(&db, f, ctx), "pending record");
-    g_fake_fc.unspent = 1; g_fake_fc.root_confs = -1;
-    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
                    "pending, old funding unspent: exit through the old factory");
-    g_fake_fc.unspent = 0; g_fake_fc.root_confs = 0;
+
+    g_fake_fc.funding_unspent = 0; g_fake_fc.own_unspent = 1;
     TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
-                   "pending, old funding spent by our own root (mempool): continue");
-    g_fake_fc.unspent = 0; g_fake_fc.root_confs = 3;
-    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 1,
-                   "pending, our own root confirmed: continue");
-    g_fake_fc.unspent = 0; g_fake_fc.root_confs = -1;
+                   "pending, funding spent by our own root (found via its outputs, "
+                   "no index needed): continue");
+    g_fake_fc.funding_unspent = 0; g_fake_fc.own_unspent = 0; g_fake_fc.other = 0;
     dist = 99;
     TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), 0,
-                   "pending, old funding spent by something else: no tree");
+                   "pending, funding spent by something else: no tree");
     TEST_ASSERT_EQ(dist, CLIENT_ROTATION_PENDING_FACTORY_ID,
                    "the new factory's distribution tx offered");
-    g_fake_fc.unspent = -1; g_fake_fc.root_confs = -1;
+    g_fake_fc.funding_unspent = -1;
     TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), -1,
                    "chain error is not 'spent'");
+    g_fake_fc.funding_unspent = 0; g_fake_fc.own_unspent = -1; g_fake_fc.other = -1;
+    TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), -1,
+                   "error looking at our own tree is not 'spent by another'");
     chain.is_outpoint_unspent = NULL;
     TEST_ASSERT_EQ(client_force_close_plan(&db, &chain, &dist, sink), -1,
                    "missing callback is not 'spent'");
 
     fclose(sink);
     persist_close(&db);
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Funding depth and the order of the funding checks. */
+int test_client_funding_depth_and_order(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+    secp256k1_pubkey me, other;
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &me, &kps[2]), "my key");
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &other, &kps[3]), "other key");
+    factory_t *f = handler_factory(ctx, kps, 0);
+    TEST_ASSERT(f, "factory");
+
+    client_set_allow_unverified_funding(0);
+    client_set_funding_verifier(fake_funding_lookup, NULL);
+    client_set_funding_min_confs(3);
+    fake_chain_good(f);
+    g_fake_chain.confirmations = 2;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "2 of 3 confirmations refused");
+    g_fake_chain.confirmations = 3;
+    TEST_ASSERT(client_check_factory_funding(f, 2, &me), "3 of 3 confirmations accepted");
+    client_set_funding_min_confs(1);
+    TEST_ASSERT_EQ(chain_funding_confs(NULL, 1), 1, "regtest depth");
+    TEST_ASSERT_EQ(chain_funding_confs(NULL, 0), CONF_DEFAULT_FUNDING, "default depth elsewhere");
+
+    /* without a chain lookup (regtest opt-out) the participant-set checks still run */
+    client_set_funding_verifier(NULL, NULL);
+    client_set_allow_unverified_funding(1);
+    TEST_ASSERT(client_check_factory_funding(f, 2, &me), "opt-out: honest proposal accepted");
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &other), "opt-out: wrong key at my index refused");
+    f->funding_spk[9] ^= 1;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "opt-out: foreign funding script refused");
+    f->funding_spk[9] ^= 1;
+
+    factory_free(f); free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Rotation is refused unless enabled: the proposal handler answers with an
+   error and returns before anything is parsed or stored. */
+int test_client_rotation_disabled(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    if (!make_keypairs(ctx, kps)) return 0;
+    factory_t *f = handler_factory(ctx, kps, 0);
+    TEST_ASSERT(f, "factory");
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) TEST_ASSERT(secp256k1_keypair_pub(ctx, &pks[i], &kps[i]), "pk");
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    wire_msg_t propose;
+    memset(&propose, 0, sizeof(propose));
+    propose.msg_type = MSG_FACTORY_PROPOSE;
+    propose.json = wire_build_factory_propose(f);
+    TEST_ASSERT(propose.json, "proposal");
+    channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+
+    client_set_allow_rotation(0);
+    TEST_ASSERT(!client_rotation_allowed(), "off");
+    TEST_ASSERT(!client_do_factory_rotation(sv[1], ctx, &kps[2], 2, 5, pks, f, &ch, &propose),
+                "proposal refused while rotation is off");
+    wire_msg_t reply;
+    memset(&reply, 0, sizeof(reply));
+    TEST_ASSERT(wire_recv(sv[0], &reply) && reply.msg_type == MSG_ERROR, "LSP gets an error");
+    cJSON *m = reply.json ? cJSON_GetObjectItem(reply.json, "message") : NULL;
+    TEST_ASSERT(m && cJSON_IsString(m) && strstr(m->valuestring, "rotation_not_enabled"),
+                "error says rotation is not enabled");
+    cJSON_Delete(reply.json);
+    client_set_allow_rotation(1);
+    TEST_ASSERT(client_rotation_allowed(), "on");
+
+    cJSON_Delete(propose.json);
+    close(sv[0]); close(sv[1]);
     factory_free(f); free(f);
     secp256k1_context_destroy(ctx);
     return 1;

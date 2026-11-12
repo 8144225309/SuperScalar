@@ -1400,7 +1400,10 @@ extern int test_client_funding_check(void);
 extern int test_client_factory_ready_handler(void);
 extern int test_client_distribution_exit_checks(void);
 extern int test_client_force_close_plan(void);
+extern int test_client_funding_depth_and_order(void);
+extern int test_client_rotation_disabled(void);
 extern void client_set_allow_unverified_funding(int allow);
+extern void client_set_allow_rotation(int allow);
 extern int test_rotation_pending_record(void);
 extern int test_client_persist_reload(void);
 
@@ -3434,7 +3437,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_client_factory_ready_handler);
     RUN_TEST(test_client_distribution_exit_checks);
     RUN_TEST(test_client_force_close_plan);
+    RUN_TEST(test_client_funding_depth_and_order);
+    RUN_TEST(test_client_rotation_disabled);
     client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
     RUN_TEST(test_rotation_pending_record);
     RUN_TEST(test_client_persist_reload);
 
@@ -4372,6 +4378,7 @@ int main(int argc, char *argv[]) {
 
     /* In-process ceremonies have no chain to look a funding output up in. */
     client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
 
     if (argc < 2)
         run_unit = 1;

@@ -594,10 +594,18 @@ typedef struct {
 } client_rotation_ctx_t;
 
 static client_rotation_ctx_t g_rotation_ctx;
+static void rotation_ctx_clear(void);
 
 static void rotation_ctx_set(const unsigned char *dying_txid,
                               const unsigned char *new_nonce,
                               uint64_t epoch) {
+    if (!client_rotation_allowed()) {
+        fprintf(stderr, "Client: REFUSING ROTATION_BEGIN — factory rotation is not "
+                "enabled (--enable-rotation-experimental); the key turnover that "
+                "follows will be refused\n");
+        rotation_ctx_clear();
+        return;
+    }
     memcpy(g_rotation_ctx.dying_factory_txid, dying_txid, 32);
     memcpy(g_rotation_ctx.new_factory_nonce,  new_nonce,  32);
     g_rotation_ctx.rotation_epoch = epoch;
@@ -2512,6 +2520,9 @@ static void usage(const char *prog) {
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --enable-rotation-experimental    UNSAFE, testing only: take part in factory rotation\n"
+        "                                    (refused on mainnet). Off by default: the client refuses\n"
+        "                                    the key turnover and rotation proposals.\n"
         "  --test-allow-tree-advance         Harness only (refused on mainnet): co-sign leaf, state and\n"
         "                                    sub-factory advances, which are otherwise refused because\n"
         "                                    they do not move the channel onto the new tree\n"
@@ -2654,6 +2665,7 @@ int main(int argc, char *argv[]) {
     memset(lc_fallbacks, 0, sizeof(lc_fallbacks));
     int n_lc_fallbacks = 0;
     const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
+    int enable_rotation_experimental = 0; /* --enable-rotation-experimental */
     int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
@@ -2886,6 +2898,8 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--enable-rotation-experimental") == 0) {
+            enable_rotation_experimental = 1;
         } else if (strcmp(argv[i], "--test-allow-tree-advance") == 0) {
             /* Harness only (the --test- prefix is refused on mainnet):
                co-sign leaf, state and sub-factory advances, which the client
@@ -3499,6 +3513,7 @@ int main(int argc, char *argv[]) {
             .accept_risk = accept_risk,
             .seckey_on_cmdline = seckey_hex != NULL,
             .have_db = db_path != NULL,
+            .enable_rotation_experimental = enable_rotation_experimental,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -3508,6 +3523,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+    client_set_allow_rotation(enable_rotation_experimental);
+    if (enable_rotation_experimental)
+        fprintf(stderr, "WARNING: --enable-rotation-experimental: factory rotation is "
+                "enabled. This is unsafe and for testing only.\n");
 
     /* SF-FUND-VERIFY-REFUSE #197: production networks require a chain
        backend so the client can verify the funding TX on-chain before
@@ -3963,10 +3982,14 @@ int main(int argc, char *argv[]) {
                 vctx = &verify_rt;
             }
         }
-        /* Without a chain source the library refuses every factory, except
-           on regtest without --rpcuser. */
-        if (!vfn && strcmp(network, "regtest") == 0)
+        /* Without a chain source the library refuses every factory.  The
+           only exception is regtest without --rpcuser (harness). */
+        if (!rpcuser && strcmp(network, "regtest") == 0)
             allow_unverified_funding_regtest();
+        else if (!vfn)
+            fprintf(stderr, "Client: RPC connection unavailable — funding outputs cannot "
+                    "be verified, so every factory will be refused\n");
+        client_set_funding_min_confs(chain_funding_confs(NULL, strcmp(network, "regtest") == 0));
 
         /* A rotation after a reconnect checks the new funding output with
            the same verifier as the first factory. */
@@ -4026,8 +4049,12 @@ int main(int argc, char *argv[]) {
                 sa_vctx = &sa_verify_rt;
             }
         }
-        if (!sa_vfn && strcmp(network, "regtest") == 0)
+        if (!rpcuser && strcmp(network, "regtest") == 0)
             allow_unverified_funding_regtest();
+        else if (!sa_vfn)
+            fprintf(stderr, "Client: RPC connection unavailable — funding outputs cannot "
+                    "be verified, so every factory will be refused\n");
+        client_set_funding_min_confs(chain_funding_confs(NULL, strcmp(network, "regtest") == 0));
 
         if (n_actions > 0) {
             /* Scripted --send/--recv now run through the SAME proven daemon

@@ -109,12 +109,38 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
    for f (factory_distribution_locktime). */
 int client_dist_locktime_acceptable(const factory_t *f, uint32_t offered);
 
-/* 1 if f carries a verified signed distribution transaction paying
-   my_pubkey at least balance_sats: the condition for leaving a factory
-   for f. */
-int client_rotation_exit_acceptable(const secp256k1_context *ctx, const factory_t *f,
-                                     const secp256k1_pubkey *my_pubkey,
-                                     uint64_t balance_sats);
+/* Full capacity of member my_index's channel in f: its leaf output less the
+   base commitment fee, i.e. the channel's two balances together at open.
+   This is what the distribution transaction owes the member.  0 if the
+   member has no channel output in f. */
+uint64_t client_member_channel_capacity(const factory_t *f, uint32_t my_index);
+
+/* Distribution payout check, shared by every place that accepts or relies on
+   a distribution transaction: 1 if tx pays the key-path-only taproot output
+   of member_pubkey at least required_sats in total. */
+int client_distribution_pays_member(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t tx_len,
+                                     const secp256k1_pubkey *member_pubkey,
+                                     uint64_t required_sats);
+
+/* The condition for accepting factory f, at first open and at rotation: f
+   carries a fully co-signed, verified distribution transaction
+   (dist_tx_ready == 2) that pays member my_index (key my_pubkey) at least
+   its full channel capacity. */
+int client_factory_exit_acceptable(const secp256k1_context *ctx, const factory_t *f,
+                                    uint32_t my_index,
+                                    const secp256k1_pubkey *my_pubkey);
+
+/* Depth the funding output must have before a factory is accepted.  The
+   client tool sets chain_funding_confs() for its network (the depth the LSP
+   waits for); default 1. */
+void client_set_funding_min_confs(int confs);
+
+/* Factory rotation is experimental and off unless enabled
+   (--enable-rotation-experimental, refused on mainnet).  While off the
+   client refuses ROTATION_BEGIN, the key turnover and rotation proposals. */
+void client_set_allow_rotation(int allow);
+int client_rotation_allowed(void);
 
 /* Run the full ceremony with optional channel operations.
    If channel_cb is NULL, behaves identically to client_run_ceremony
