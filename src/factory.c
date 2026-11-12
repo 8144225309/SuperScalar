@@ -60,6 +60,19 @@ static int cmp_uptime_asc(const void *a, const void *b) {
     return (ia > ib) - (ia < ib);
 }
 
+/* Order clients[] (participant indices, ascending on entry) by the
+   factory's placement strategy. */
+static void apply_placement(const factory_t *f, uint32_t *clients, size_t n_clients) {
+    int (*cmp)(const void *, const void *) = NULL;
+    if (f->placement_mode == PLACEMENT_INWARD) cmp = cmp_balance_desc;
+    else if (f->placement_mode == PLACEMENT_OUTWARD) cmp = cmp_uptime_asc;
+    else if (f->placement_mode == PLACEMENT_TIMEZONE_CLUSTER) cmp = cmp_timezone_cluster;
+    if (!cmp || n_clients < 2) return;
+    g_sort_factory = f;
+    qsort(clients, n_clients, sizeof(uint32_t), cmp);
+    g_sort_factory = NULL;
+}
+
 #include "superscalar/sha256.h"
 extern void reverse_bytes(unsigned char *, size_t);
 
@@ -1201,6 +1214,20 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
     }
 }
 
+int factory_set_placement_mode(factory_t *f, placement_mode_t mode) {
+    if (!f) return 0;
+    switch (mode) {
+    case PLACEMENT_SEQUENTIAL:
+    case PLACEMENT_INWARD:
+    case PLACEMENT_OUTWARD:
+    case PLACEMENT_TIMEZONE_CLUSTER:
+        f->placement_mode = mode;
+        return 1;
+    }
+    fprintf(stderr, "factory_set_placement_mode: unknown mode %d\n", (int)mode);
+    return 0;
+}
+
 int factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n) {
     if (!f) return 0;
     if (!arities || n == 0 || n > FACTORY_MAX_LEVELS) {
@@ -1264,20 +1291,48 @@ void factory_set_static_near_root(factory_t *f, uint32_t threshold) {
     f->per_leaf_enabled = 0;
 }
 
-void factory_set_funding(factory_t *f,
-                         const unsigned char *txid, uint32_t vout,
-                         uint64_t amount_sats,
-                         const unsigned char *spk, size_t spk_len) {
-    if (!f) return;
-    if (spk_len > sizeof(f->funding_spk)) {
-        fprintf(stderr, "factory_set_funding: spk_len %zu exceeds buffer\n", spk_len);
-        return;
+int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]) {
+    if (!f || !f->ctx || !f->pubkeys || !f->profiles || f->n_participants == 0 || !spk_out)
+        return 0;
+    /* The root signers in the order build_subtree aggregates them: the LSP,
+       then the clients in placement order. */
+    size_t n = f->n_participants;
+    uint32_t *order = malloc(n * sizeof(uint32_t));
+    secp256k1_pubkey *pks = malloc(n * sizeof(secp256k1_pubkey));
+    int ok = 0;
+    if (order && pks) {
+        for (size_t i = 0; i < n; i++) order[i] = (uint32_t)i;
+        apply_placement(f, order + 1, n - 1);
+        for (size_t i = 0; i < n; i++) pks[i] = f->pubkeys[order[i]];
+        musig_keyagg_t ka;
+        secp256k1_xonly_pubkey tweaked;
+        ok = build_musig_p2tr_spk(f->ctx, spk_out, &tweaked, NULL, &ka, pks, n, NULL);
+    }
+    free(order);
+    free(pks);
+    return ok;
+}
+
+int factory_set_funding(factory_t *f,
+                        const unsigned char *txid, uint32_t vout,
+                        uint64_t amount_sats,
+                        const unsigned char *spk, size_t spk_len) {
+    if (!f) return 0;
+    /* The root kickoff spends this output by key path, so it must be a
+       P2TR (OP_1 <32 bytes>); factory_build_tree checks the key itself
+       against the root's MuSig2 key once the root is built. */
+    if (!txid || !spk || spk_len != sizeof(f->funding_spk) ||
+        spk[0] != 0x51 || spk[1] != 0x20) {
+        fprintf(stderr, "factory_set_funding: funding script is not a %zu-byte P2TR "
+                "(got %zu bytes)\n", sizeof(f->funding_spk), spk ? spk_len : 0);
+        return 0;
     }
     memcpy(f->funding_txid, txid, 32);
     f->funding_vout = vout;
     f->funding_amount_sats = amount_sats;
     memcpy(f->funding_spk, spk, spk_len);
     f->funding_spk_len = spk_len;
+    return 1;
 }
 
 /* Set up single-client leaf outputs: 1 channel + 1 L-stock */
@@ -2029,18 +2084,18 @@ int factory_build_tree(factory_t *f) {
         clients[i] = (uint32_t)(i + 1);
 
     /* Apply placement strategy */
-    if (f->placement_mode == PLACEMENT_INWARD && n_clients > 1) {
-        g_sort_factory = f;
-        qsort(clients, n_clients, sizeof(uint32_t), cmp_balance_desc);
-        g_sort_factory = NULL;
-    } else if (f->placement_mode == PLACEMENT_OUTWARD && n_clients > 1) {
-        g_sort_factory = f;
-        qsort(clients, n_clients, sizeof(uint32_t), cmp_uptime_asc);
-        g_sort_factory = NULL;
-    } else if (f->placement_mode == PLACEMENT_TIMEZONE_CLUSTER && n_clients > 1) {
-        g_sort_factory = f;
-        qsort(clients, n_clients, sizeof(uint32_t), cmp_timezone_cluster);
-        g_sort_factory = NULL;
+    apply_placement(f, clients, n_clients);
+
+    /* The root kickoff's input is the funding output: refuse to build (and so
+       to sign) over a funding script other than the key-path P2TR of the
+       root signers' MuSig2 key.  Checked before any node is built. */
+    unsigned char root_spk[34];
+    if (!factory_compute_funding_spk(f, root_spk) ||
+        f->funding_spk_len != sizeof(root_spk) ||
+        memcmp(f->funding_spk, root_spk, sizeof(root_spk)) != 0) {
+        fprintf(stderr, "factory_build_tree: funding script is not the key-path P2TR "
+                "of the root signers' MuSig2 key\n");
+        return 0;
     }
 
     /* Build the tree recursively */
@@ -2714,6 +2769,7 @@ int factory_sign_node(factory_t *f, size_t node_idx) {
     if (!node->is_built) return 0;
 
     /* Init session */
+    musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
     musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
     node->partial_sigs_received = 0;
 
@@ -3205,6 +3261,7 @@ int factory_session_init_node(factory_t *f, size_t node_idx) {
     if (node_idx >= f->n_nodes) return 0;
     factory_node_t *node = &f->nodes[node_idx];
     if (!node->is_built) return 0;
+    musig_session_free(&node->signing_session);   /* re-init of a live session: release first */
     musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
     node->partial_sigs_received = 0;
     return 1;

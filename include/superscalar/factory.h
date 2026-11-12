@@ -733,10 +733,25 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
    depths, capped at DW_MAX_LAYERS. */
 void factory_set_static_near_root(factory_t *f, uint32_t threshold);
 
-void factory_set_funding(factory_t *f,
-                         const unsigned char *txid, uint32_t vout,
-                         uint64_t amount_sats,
-                         const unsigned char *spk, size_t spk_len);
+/* Record the funding outpoint.  Returns 0, changing nothing, unless spk is a
+   34-byte P2TR (OP_1 <32 bytes>).  factory_build_tree then refuses to build
+   unless spk is exactly the key-path P2TR of the root signers' MuSig2 key
+   (factory_compute_funding_spk). */
+int factory_set_funding(factory_t *f,
+                        const unsigned char *txid, uint32_t vout,
+                        uint64_t amount_sats,
+                        const unsigned char *spk, size_t spk_len);
+
+/* The funding script factory_build_tree accepts: the key-path P2TR of the
+   MuSig2 aggregate of the root signers (the LSP, then the clients in the
+   order the configured placement mode and profiles put them).  Call after
+   setting placement and profiles.  Returns 0 on failure. */
+int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
+
+/* Set the client placement strategy for factory_build_tree.  Returns 0,
+   changing nothing, for a mode that is not a placement_mode_t value.  The
+   default is PLACEMENT_TIMEZONE_CLUSTER. */
+int factory_set_placement_mode(factory_t *f, placement_mode_t mode);
 
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);

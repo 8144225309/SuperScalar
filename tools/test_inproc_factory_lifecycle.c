@@ -234,8 +234,8 @@ int main(int argc, char **argv) {
         unsigned char txid_le[32];
         if (hex_decode(txid_hex, txid_le, 32) != 32) { fprintf(stderr, "bad txid\n"); return 1; }
         reverse_bytes(txid_le, 32);
-        factory_set_funding(f, txid_le, vout, amount, fund_spk, 34);
-        if (!factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
+        if (!factory_set_funding(f, txid_le, vout, amount, fund_spk, 34) ||
+            !factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
         printf("  factory: tree built (%zu nodes, %zu-signer PS)\n", f->n_nodes, ns);
         if (!factory_sign_all_with_retry(f, 3)) { fprintf(stderr, "factory_sign_all FAILED\n"); return 1; }
         printf("  factory: all nodes signed\n");
@@ -325,8 +325,8 @@ int main(int argc, char **argv) {
         unsigned char txid_le[32];
         if (hex_decode(txid_hex, txid_le, 32) != 32) { fprintf(stderr, "bad txid\n"); return 1; }
         reverse_bytes(txid_le, 32);
-        factory_set_funding(f, txid_le, vout, amount, fund_spk, 34);
-        if (!factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
+        if (!factory_set_funding(f, txid_le, vout, amount, fund_spk, 34) ||
+            !factory_build_tree(f)) { fprintf(stderr, "factory_build_tree FAILED\n"); return 1; }
         if (!factory_sign_all_with_retry(f, 3)) { fprintf(stderr, "factory_sign_all FAILED\n"); return 1; }
         printf("  factory: %zu nodes, %zu-signer PS, all signed\n", f->n_nodes, ns);
 

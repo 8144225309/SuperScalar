@@ -1367,6 +1367,9 @@ extern int test_tree_shape_level_list_bound(void);
 extern int test_tree_shape_scale_sign_ewt(void);
 extern int test_tree_shape_ewt_ps_k(void);
 extern int test_tree_shape_per_leaf_rollover(void);
+extern int test_tree_shape_funding_script(void);
+extern int test_tree_shape_session_reinit(void);
+extern int test_tree_shape_placement_setter(void);
 extern int test_cli_arity_uniform_3_parses(void);
 extern int test_cli_arity_mixed_248_parses(void);
 extern int test_cli_arity_rejects_16(void);
@@ -3388,6 +3391,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tree_shape_scale_sign_ewt);
     RUN_TEST(test_tree_shape_ewt_ps_k);
     RUN_TEST(test_tree_shape_per_leaf_rollover);
+    RUN_TEST(test_tree_shape_funding_script);
+    RUN_TEST(test_tree_shape_session_reinit);
+    RUN_TEST(test_tree_shape_placement_setter);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);

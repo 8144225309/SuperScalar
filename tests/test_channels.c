@@ -1950,6 +1950,7 @@ int test_fee_estimator_wiring(void) {
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2018,6 +2019,7 @@ int test_fee_estimator_null_fallback(void) {
     unsigned char fake_txid[32], fake_spk[34];
     memset(fake_txid, 0xBB, 32);
     memset(fake_spk, 0xCC, 34);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 

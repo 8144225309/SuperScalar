@@ -2458,10 +2458,9 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         factory_set_arity(f, FACTORY_ARITY_PS);
     /* FACTORY_ARITY_2 is the default from factory_init_from_pubkeys */
 
-    factory_set_funding(f, funding_txid, funding_vout, funding_amount,
-                         fund_spk, 34);
-
-    if (!factory_build_tree(f)) {
+    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+                             fund_spk, 34) ||
+        !factory_build_tree(f)) {
         factory_free(f);
         return 0;
     }

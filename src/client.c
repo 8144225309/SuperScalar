@@ -1600,7 +1600,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_out->cltv_timeout = cltv_timeout;
     factory_out->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory_out->fee_per_tx = fee_per_tx;
-    factory_out->placement_mode = (placement_mode_t)rot_placement;
+    if (!factory_set_placement_mode(factory_out, (placement_mode_t)rot_placement)) {
+        free(rot_hashes);
+        return 0;
+    }
     factory_out->economic_mode = (economic_mode_t)rot_econ;
     memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
     if (rot_n_level_arity > 0) {
@@ -1618,8 +1621,12 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     if (rot_n_hashes > 0)
         factory_set_l_stock_hashes(factory_out, rot_hashes, rot_n_hashes);
     free(rot_hashes);
-    factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
-                        funding_spk, spk_len);
+    if (!factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
+                             funding_spk, spk_len)) {
+        printf("Client %u: rotation funding script refused\n", my_index);
+        fflush(stdout);
+        return 0;
+    }
 
     if (!factory_build_tree(factory_out)) {
         printf("Client %u: ROTATION BUILD_TREE FAILED spk=%zu amt=%llu\n", my_index, spk_len, (unsigned long long)funding_amount);
@@ -2738,7 +2745,16 @@ int client_run_with_channels(secp256k1_context *ctx,
     factory->cltv_timeout = cltv_timeout;
     factory->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches LSP) */
     factory->fee_per_tx = fee_per_tx;
-    factory->placement_mode = (placement_mode_t)placement_mode;
+    if (!factory_set_placement_mode(factory, (placement_mode_t)placement_mode)) {
+        client_send_error(fd, "unknown placement mode");
+        free(parsed_l_stock_hashes);
+        free(parsed_node_h_idx);
+        free(parsed_node_h);
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
     factory->economic_mode = (economic_mode_t)economic_mode;
     memcpy(factory->profiles, profiles, sizeof(profiles));
     /* SF-followup #145: register active factory so MSG_FUNDING_REORG handler
@@ -2810,10 +2826,9 @@ int client_run_with_channels(secp256k1_context *ctx,
         factory_set_node_l_stock_hash(factory, parsed_node_h_idx[nh], parsed_node_h[nh]);
     free(parsed_node_h_idx);
     free(parsed_node_h);
-    factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
-                        funding_spk, spk_len);
-
-    if (!factory_build_tree(factory)) {
+    if (!factory_set_funding(factory, funding_txid, funding_vout, funding_amount,
+                             funding_spk, spk_len) ||
+        !factory_build_tree(factory)) {
         fprintf(stderr, "Client: factory_build_tree failed\n");
         client_send_error(fd, "factory_build_tree failed");
         factory_free(factory);

@@ -4076,7 +4076,10 @@ accept_new_factory:
     if (ps_subfactory_arity_arg > 0)
         factory_set_ps_subfactory_arity(&lsp_p->factory,
                                           (uint32_t)ps_subfactory_arity_arg);
-    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
+        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
+        return 1;
+    }
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
     /* Populate default profiles from CLI config.  The shape setters above

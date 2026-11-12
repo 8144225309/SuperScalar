@@ -430,10 +430,9 @@
                             exh_f1->cltv_timeout = (uint32_t)cur_h + offset;
                         }
 
-                        factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout,
-                                            exh_fund_amount, fund_spk, 34);
-
-                        if (!factory_build_tree(exh_f1)) {
+                        if (!factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout,
+                                                 exh_fund_amount, fund_spk, 34) ||
+                            !factory_build_tree(exh_f1)) {
                             fprintf(stderr, "DW EXHIBITION Phase 3: factory_build_tree failed\n");
                             factory_free(exh_f1);
                             exhibition_pass = 0;
@@ -465,8 +464,11 @@
                                         if (cltv_timeout_arg > 0) exh_f1->cltv_timeout = (uint32_t)cltv_timeout_arg;
                                         else if (cur_h2 > 0) exh_f1->cltv_timeout = (uint32_t)cur_h2 + (uint32_t)(is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10));
                                     }
-                                    factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout, exh_fund_amount, fund_spk, 34);
-                                    factory_build_tree(exh_f1);
+                                    if (!factory_set_funding(exh_f1, exh_fund_txid_bytes, exh_fund_vout, exh_fund_amount, fund_spk, 34) ||
+                                        !factory_build_tree(exh_f1)) {
+                                        fprintf(stderr, "DW EXHIBITION Phase 3: factory_build_tree failed (retry)\n");
+                                        break;
+                                    }
                                 }
                             }
                             if (!sign_ok) {
@@ -1102,10 +1104,9 @@
                 }
             }
 
-            factory_set_funding(f1, fund2_txid, fund2_vout, fund2_amount,
-                                fund_spk, 34);
-
-            if (!factory_build_tree(f1)) {
+            if (!factory_set_funding(f1, fund2_txid, fund2_vout, fund2_amount,
+                                     fund_spk, 34) ||
+                !factory_build_tree(f1)) {
                 fprintf(stderr, "DUAL FACTORY TEST: factory_build_tree failed\n");
                 factory_free(f1);
                 jit_channels_cleanup(mgr);

@@ -99,6 +99,33 @@ static secp256k1_keypair *ts_keys(secp256k1_context *ctx, size_t n) {
     return kps;
 }
 
+/* Funding script for a factory of these participants (default placement,
+   no profiles): what factory_compute_funding_spk gives once they are in a
+   factory.  For tests that hand keys to a constructor (ladder, LSP). */
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]) {
+    factory_t *f = calloc(1, sizeof(*f));
+    if (!f) return 0;
+    factory_init_from_pubkeys(f, ctx, pks, n, 10, 4);
+    int ok = factory_compute_funding_spk(f, spk);
+    factory_free(f);
+    free(f);
+    return ok;
+}
+
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]) {
+    secp256k1_pubkey *pks = calloc(n_clients + 1, sizeof(*pks));
+    if (!pks) return 0;
+    int ok = secp256k1_keypair_pub(ctx, &pks[0], lsp_kp);
+    for (size_t i = 0; ok && i < n_clients; i++)
+        ok = secp256k1_keypair_pub(ctx, &pks[i + 1], &client_kps[i]);
+    ok = ok && test_funding_spk_from_pubkeys(ctx, pks, n_clients + 1, spk);
+    free(pks);
+    return ok;
+}
+
 /* Initialize and shape a factory (no build).  Returns 0 on setup failure. */
 static int ts_setup(factory_t *f, secp256k1_context *ctx, const secp256k1_keypair *kps,
                     const ts_shape_t *s) {
@@ -120,9 +147,8 @@ static int ts_setup(factory_t *f, secp256k1_context *ctx, const secp256k1_keypai
     }
     unsigned char txid[32], spk[34];
     memset(txid, 0xAA, 32);
-    spk[0] = 0x51; spk[1] = 0x20; memset(spk + 2, 0x5A, 32);
-    factory_set_funding(f, txid, 0, (uint64_t)s->n_clients * 200000 + 1000000, spk, 34);
-    return 1;
+    if (!factory_compute_funding_spk(f, spk)) return 0;
+    return factory_set_funding(f, txid, 0, (uint64_t)s->n_clients * 200000 + 1000000, spk, 34);
 }
 
 typedef struct {
@@ -552,7 +578,15 @@ int test_tree_shape_placement_order(void) {
                 ts_tree_t t;
                 TEST_ASSERT(ts_open_b(&t, &shapes[k], 0), "setup");
                 factory_t *f = t.f;
-                f->placement_mode = modes[m];
+                TEST_ASSERT(factory_set_placement_mode(f, modes[m]), "placement");
+                if (modes[m] != PLACEMENT_TIMEZONE_CLUSTER) {
+                    /* equal contributions / uptimes: clients stay in index order */
+                    unsigned char spk[34], txid[32];
+                    memset(txid, 0xAA, 32);
+                    TEST_ASSERT(factory_compute_funding_spk(f, spk) &&
+                                factory_set_funding(f, txid, 0, f->funding_amount_sats, spk, 34),
+                                "index-order funding");
+                }
                 g_ts_qsort_reverse = rev;
                 int ok = factory_build_tree(f);
                 g_ts_qsort_reverse = 0;
@@ -739,5 +773,84 @@ int test_tree_shape_per_leaf_rollover(void) {
             ts_close(&t);
         }
     }
+    return 1;
+}
+
+/* ---- Funding script ---- */
+
+/* The root kickoff spends the funding output by key path: a script other
+   than the key-path P2TR of the root signers' MuSig2 key is refused (at
+   factory_set_funding for its form, at factory_build_tree for its key) and
+   nothing is built or signed over it. */
+int test_tree_shape_funding_script(void) {
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    factory_t *f = t.f;
+    unsigned char good[34], txid[32], keep[34];
+    memset(txid, 0xAA, 32);
+    TEST_ASSERT(factory_compute_funding_spk(f, good), "funding spk");
+    TEST_ASSERT(memcmp(f->funding_spk, good, 34) == 0, "setup used the factory's own key");
+    memcpy(keep, f->funding_spk, 34);
+
+    unsigned char p2wpkh[22] = { 0x00, 0x14 };
+    TEST_ASSERT(!factory_set_funding(f, txid, 0, 1800000, p2wpkh, 22), "22-byte script refused");
+    unsigned char not_tr[34];
+    memcpy(not_tr, good, 34); not_tr[0] = 0x00;
+    TEST_ASSERT(!factory_set_funding(f, txid, 0, 1800000, not_tr, 34), "non-P2TR 34-byte script refused");
+    TEST_ASSERT(!factory_set_funding(f, txid, 0, 1800000, NULL, 34), "NULL script refused");
+    TEST_ASSERT(memcmp(f->funding_spk, keep, 34) == 0 && f->funding_spk_len == 34,
+                "refused script changes nothing");
+
+    unsigned char wrong[34];
+    memcpy(wrong, good, 34); wrong[33] ^= 1;
+    TEST_ASSERT(factory_set_funding(f, txid, 0, 1800000, wrong, 34), "P2TR form accepted");
+    TEST_ASSERT(!factory_build_tree(f), "build refused over another key");
+    TEST_ASSERT_EQ(f->n_nodes, 0, "nothing built");
+
+    TEST_ASSERT(factory_set_funding(f, txid, 0, 1800000, good, 34), "own key");
+    TEST_ASSERT(factory_build_tree(f), "build over the factory's own key");
+    TEST_ASSERT(memcmp(f->nodes[0].spending_spk, good, 34) == 0, "root spends the funding script");
+    TEST_ASSERT(factory_sign_all(f), "sign");
+    ts_close(&t);
+    return 1;
+}
+
+/* ---- Session re-initialisation ---- */
+
+/* Re-initialising a node's signing session releases the previous one (the
+   21-signer root uses a heap nonce array; LSan reports it otherwise). */
+int test_tree_shape_session_reinit(void) {
+    ts_shape_t s = { "N=20 arity 2", 20, {2}, 1, 0, 0, 0, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open(&t, &s) && t.built, "build");
+    TEST_ASSERT(t.f->nodes[0].n_signers > MUSIG_SESSION_SMALL, "root uses a heap nonce array");
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(factory_session_init_node(t.f, 0), "session init");
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(factory_sign_node(t.f, 0), "sign node");
+    ts_close(&t);
+    return 1;
+}
+
+/* ---- Placement setter ---- */
+
+int test_tree_shape_placement_setter(void) {
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 0, 0, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    TEST_ASSERT_EQ(t.f->placement_mode, PLACEMENT_TIMEZONE_CLUSTER, "default placement");
+    static const placement_mode_t ok[] = {
+        PLACEMENT_SEQUENTIAL, PLACEMENT_INWARD, PLACEMENT_OUTWARD, PLACEMENT_TIMEZONE_CLUSTER
+    };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        TEST_ASSERT(factory_set_placement_mode(t.f, ok[i]), "known mode");
+        TEST_ASSERT_EQ(t.f->placement_mode, ok[i], "mode set");
+    }
+    TEST_ASSERT(!factory_set_placement_mode(t.f, (placement_mode_t)4), "mode 4 refused");
+    TEST_ASSERT(!factory_set_placement_mode(t.f, (placement_mode_t)-1), "mode -1 refused");
+    TEST_ASSERT_EQ(t.f->placement_mode, PLACEMENT_TIMEZONE_CLUSTER, "refused mode changes nothing");
+    TEST_ASSERT(factory_build_tree(t.f), "build");
+    ts_close(&t);
     return 1;
 }
