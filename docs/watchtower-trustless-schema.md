@@ -33,7 +33,7 @@ The LSP DB contains secret columns the WT does NOT need:
 - `channels.revocation_secret`  (32 bytes, per-channel)
 - `signing_rounds.partial_signature`  (per-round, 36 bytes)
 - `ceremony_participants.revocation_secret`  (32 bytes, per participant)
-- `client_ps_signed_inputs.partial_sig`  (36 bytes, per leaf)
+- `client_ps_signed_inputs.partial_sig`  (32-byte partial sig zero-padded to 36, per signed PS parent)
 - `factory_node` material that would allow re-signing state
 
 A compromised WT binary, a malicious operator at the WT host, or anyone

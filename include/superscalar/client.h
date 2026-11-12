@@ -358,7 +358,11 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
 /* Reconnect to LSP using persisted state from SQLite.
    Loads factory + channel from DB, sends MSG_RECONNECT, receives
    MSG_RECONNECT_ACK, re-exchanges nonces, then calls channel_cb.
-   Returns 1 on success. */
+   Returns 1 on success, 0 when the attempt failed or the connection was lost
+   (the caller may try again), and CLIENT_RECONNECT_REFUSED when the stored
+   factory does not load as the signed tree: every further attempt is
+   refused the same way, so the caller must stop. */
+#define CLIENT_RECONNECT_REFUSED (-1)
 int client_run_reconnect(secp256k1_context *ctx,
                            const secp256k1_keypair *keypair,
                            const char *host, int port,
@@ -576,14 +580,21 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    Advances local leaf state, generates partial sig, sends LEAF_ADVANCE_PSIG,
    waits for LEAF_ADVANCE_DONE. Returns 1 on success.
 
-   PS double-spend defense: if client_set_persist() has been called with
-   a non-NULL handle, the PS advance path consults client_ps_signed_inputs
-   before signing and REFUSES if this client has already co-signed a TX
-   spending the same (parent_txid, parent_vout). See ZmnSCPxj §"Pseudo-
-   Spilman wide leaves" — PS has no revocation, so the client's refusal
-   is the only thing preventing an LSP double-spend. When no persist is
-   set, the defense is skipped (tests / in-process usage only — real
-   clients must call client_set_persist at startup). */
+   PS double-spend defense (record-and-refuse): if client_set_persist() has
+   been called with a non-NULL handle, the PS advance path computes the
+   sighash of the proposed spend, consults client_ps_signed_inputs BEFORE
+   any nonce exists, and REFUSES if this client has already co-signed a
+   DIFFERENT TX spending the same (parent_txid, parent_vout) -- or if that
+   lookup fails at all.  A matching sighash is an idempotent retry and is
+   re-signed.  After signing, the record is INSERTed (durable; first record
+   wins) BEFORE MSG_LEAF_ADVANCE_FINAL is sent; if the insert fails, or
+   loses to a conflicting record, the ceremony aborts and nothing is sent.
+   See ZmnSCPxj §"Pseudo-Spilman wide leaves" — PS has no revocation, so
+   the client's refusal is the only thing preventing an LSP double-spend.
+   When no persist is set, the defense is skipped (tests / in-process usage
+   only — real clients must call client_set_persist at startup).  The full
+   rule: docs/pseudo-spilman.md, "Record-and-refuse: ordering and failure
+   semantics". */
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory,
@@ -616,7 +627,22 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
    every co-signer of the sub-factory must participate.  Drives the
    wire ceremony: parses PROPOSE → applies chain advance locally →
    sends NONCE → waits for ALL_NONCES → finalizes session → sends
-   PSIG → waits for DONE.  Returns 1 on success, 0 on any failure. */
+   PSIG → waits for DONE.  Returns 1 on success, 0 on any failure.
+
+   PS double-spend defense (record-and-refuse, per input): chain[N+1]
+   spends every output of chain[N] and is not revocable, and the LSP
+   picks channel_idx and delta_sats.  A PROPOSE_INTENT whose n_inputs is
+   not the number of chain[N] outputs, or whose subfactory_id is not the
+   sub-factory that (leaf_side, sub_idx) names, is refused.  With
+   client_set_persist() set, for every input this client signs the
+   handler computes the BIP-341 sighash and consults
+   client_ps_signed_inputs BEFORE any nonce (error -> refuse; a recorded
+   DIFFERENT spend of that (txid, vout) -> refuse; the same sighash ->
+   idempotent retry), binds each sighash to the session message it signs,
+   and INSERTs one row per signed input BEFORE
+   MSG_SUBFACTORY_CLIENT_FINAL_PSIGS is sent.  If any insert fails or
+   loses to a conflicting record, the ceremony aborts and nothing is sent.
+   Rules: docs/pseudo-spilman.md, "Record-and-refuse". */
 int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
                                        const secp256k1_keypair *keypair,
                                        factory_t *factory,

@@ -4406,6 +4406,14 @@ int main(int argc, char *argv[]) {
                                             daemon_channel_cb, &cbd);
             }
             if (g_shutdown) break;
+            if (ok == CLIENT_RECONNECT_REFUSED) {
+                /* The stored factory is not the signed tree.  Waiting and
+                   loading it again changes nothing: stop, non-zero. */
+                fprintf(stderr, "Client: the stored factory cannot be loaded "
+                        "(reason above); stopping, not retrying\n");
+                ok = 0;
+                break;
+            }
             if (cbd.rotation_not_completed) {
                 ok = 0;
                 break;
