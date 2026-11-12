@@ -15,6 +15,12 @@ Operator-visible behaviour changes.
 - **The tree shape is stored with the factory** (schema v40: `level_arity`, `static_threshold_depth`, `ps_subfactory_arity`, `placement_mode`).  A restarted LSP and a reconnecting member used to rebuild every factory as a uniform tree; for any other shape that tree had different transactions from the signed one, and commitments signed after the restart spent a leaf output that can never exist.  The reload now rebuilds the stored shape and ties it to the signed tree in the database: every stored transaction must hash to its txid and spend its parent's stored output (the root the funding outpoint), and every rebuilt txid must match, except below a state that an advance or re-allocation moved on (a DW state, or a leaf or sub-factory state), which is loaded from its signed transaction; a kickoff, or an interior node of a tree without DW state, never differs.  **Any mismatch, or a factory with no stored tree, refuses the load.**  A factory stored before v40 loads with the default shape columns and is refused only if that rebuild does not match its signed tree.
 - **An LSP whose DB holds a factory it cannot load stops** (exit 1, with the reason) instead of waiting for clients for a new factory.
 
+### Reload and shutdown fixes
+
+- **A member whose stored factory is refused on reload stops.**  The member daemon used to treat the refusal as a lost connection and reload the same rows every second.  It now logs that the stored factory cannot be loaded and exits 1.
+- **A stored tree signature is checked on reload.**  Every stored tree transaction's key-path signature is verified against the output it spends (the funding output for the root, the parent's stored output otherwise); a signature that does not verify refuses the load for the LSP and the members.  The txid does not cover the witness, so a changed signature used to load and was found only when the transaction was broadcast.  A leaf or sub-factory state that spends an earlier state of its own chain is not covered by this check.
+- **SIGINT and SIGTERM stop an LSP that is waiting for its members.**  The handlers are installed without `SA_RESTART`, so a blocked `accept()` or read returns; the LSP leaves the accept loop or the factory ceremony and exits 1 without writing a factory.
+
 ### Factory rotation is off by default
 
 Operator-visible behaviour changes.
