@@ -73,6 +73,19 @@ typedef struct {
     const uint64_t *dist_client_amounts;
     size_t dist_n_client_amounts;
 
+    /* LSP share (percent) of each channel at opening; 0 = 50.  Sent in
+       FACTORY_PROPOSE; members refuse a CHANNEL_READY with another split, so
+       it must be the channel manager's lsp_balance_pct. */
+    uint16_t lsp_balance_pct;
+
+    /* Optional per-member channel capacities (sat, n_member_capacities ==
+       n_clients, in client order) and host stock per leaf, applied to every
+       factory lsp_run_factory_creation builds (factory_set_member_capacities).
+       NULL = the default split.  Borrowed; fund lsp_compute_funding_amount. */
+    const uint64_t *member_capacities;
+    size_t n_member_capacities;
+    uint64_t leaf_stock_sats;
+
     /* When set, lsp_accept_clients refuses to proceed unless every client's
        HELLO included a valid slot_hint forming a permutation of 1..n_clients.
        Without slot_hints the funding-address derivation depends on TCP accept
@@ -123,6 +136,15 @@ int lsp_accept_clients(lsp_t *lsp);
    Set placement and profiles first, then fund this script.  Returns 1 on
    success. */
 int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]);
+
+/* With member_capacities set: the funding amount creation needs for them
+   (factory_capacity_funding_amount of the factory creation will build).
+   Returns 1 on success. */
+int lsp_compute_funding_amount(lsp_t *lsp, uint64_t *amount_out);
+
+/* The opening split sent in FACTORY_PROPOSE: lsp_balance_pct, 0 -> 50,
+   capped at 100 (as lsp_channels_init applies it). */
+uint16_t lsp_opening_balance_pct(const lsp_t *lsp);
 
 /* The same for a factory not yet set up on lsp: the LSP and client_pubkeys
    (in that order, as creation will see them in lsp->client_pubkeys), ordered

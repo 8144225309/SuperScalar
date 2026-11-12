@@ -2483,6 +2483,8 @@ static void usage(const char *prog) {
         "  --light-client-fallback HOST:PORT Add a fallback peer (up to 7 total).\n"
         "  --auto-accept-jit                 Auto-accept JIT channel offers (default: off)\n"
         "  --min-profit-bps N                Refuse factory if profit share < N bps (default: 0 = accept any)\n"
+        "  --expect-capacity SATS            Refuse factory unless this member's channel is exactly SATS\n"
+        "  --min-capacity SATS               Refuse factory if this member's channel is below SATS\n"
         "  --lsp-pubkey HEX                  LSP static pubkey (33-byte hex) for NK authentication\n"
         "  --lsp DOMAIN                      Look up the LSP host and port at http://DOMAIN/.well-known/lsps.json.\n"
         "                                    The key served there is not trusted: --lsp-pubkey is still required\n"
@@ -2832,6 +2834,7 @@ int main(int argc, char *argv[]) {
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
     int force_close = 0;              /* --force-close: broadcast factory tree from DB */
+    uint64_t expect_capacity = 0, min_capacity = 0;   /* --expect-capacity / --min-capacity */
     const char *log_file_path = NULL; /* --log-file PATH */
     int use_syslog = 0;               /* --syslog */
     int use_json_log = 0;              /* --json-log */
@@ -3036,6 +3039,12 @@ int main(int argc, char *argv[]) {
             auto_accept_jit = 1;
         } else if (strcmp(argv[i], "--min-profit-bps") == 0 && i + 1 < argc) {
             client_set_min_profit_bps((uint16_t)atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--expect-capacity") == 0 && i + 1 < argc) {
+            expect_capacity = (uint64_t)strtoull(argv[++i], NULL, 10);
+            client_set_capacity_terms(expect_capacity, min_capacity);
+        } else if (strcmp(argv[i], "--min-capacity") == 0 && i + 1 < argc) {
+            min_capacity = (uint64_t)strtoull(argv[++i], NULL, 10);
+            client_set_capacity_terms(expect_capacity, min_capacity);
         } else if (strcmp(argv[i], "--participant-id") == 0 && i + 1 < argc) {
             client_set_slot_hint(atoi(argv[++i]));
         } else if (strcmp(argv[i], "--test-lsps2") == 0) {

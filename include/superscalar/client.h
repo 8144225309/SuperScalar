@@ -57,6 +57,11 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
+/* Channel capacity terms checked before signing a factory: refuse unless the
+   member's own channel output is exactly expect_sats (0 = any) and at least
+   min_sats (0 = any).  The capacity is logged either way. */
+void client_set_capacity_terms(uint64_t expect_sats, uint64_t min_sats);
+
 /* Optional callback to verify the funding TX on-chain before signing the
    factory tree.  If provided to client_run_with_channels, called after
    FACTORY_PROPOSE is parsed and before any tree signing.  Return 1 if the

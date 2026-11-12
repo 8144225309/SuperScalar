@@ -1100,3 +1100,186 @@ int test_tree_shape_channel_spk_verbatim(void) {
     ts_close(&t);
     return 1;
 }
+
+
+/* ---- Per-member channel capacities ---- */
+
+/* Capacity of participant p in the capacity tests: unequal, every one
+   different. */
+static uint64_t ts_cap(size_t p) { return 20000 + 7919 * (uint64_t)p; }
+
+/* Set capacities (and stock) and fund the factory at exactly what they need. */
+static int ts_set_caps(factory_t *f, uint64_t stock) {
+    size_t n = f->n_participants - 1;
+    uint64_t *caps = calloc(n, sizeof(*caps));
+    if (!caps) return 0;
+    for (size_t i = 0; i < n; i++) caps[i] = ts_cap(i + 1);
+    int ok = factory_set_member_capacities(f, caps, n) && factory_set_leaf_stock(f, stock);
+    free(caps);
+    uint64_t amount;
+    unsigned char spk[34], txid[32];
+    memset(txid, 0xAA, 32);
+    return ok && factory_capacity_funding_amount(f, &amount) &&
+           factory_compute_funding_spk(f, spk) &&
+           factory_set_funding(f, txid, 0, amount, spk, 34);
+}
+
+/* Value conservation: every node's input is its outputs plus the fee. */
+static int ts_conserves(const factory_t *f) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *n = &f->nodes[i];
+        uint64_t in = n->parent_index < 0 ? f->funding_amount_sats
+                    : f->nodes[n->parent_index].outputs[n->parent_vout].amount_sats;
+        uint64_t out = 0;
+        for (size_t o = 0; o < n->n_outputs; o++) out += n->outputs[o].amount_sats;
+        if (in != out + f->fee_per_tx) return 0;
+    }
+    return 1;
+}
+
+/* Not setting capacities (or clearing them) builds every pinned shape as
+   before; the setters refuse a wrong count, dust and below-dust stock. */
+int test_tree_shape_capacity_default(void) {
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(ts_pinned) / sizeof(ts_pinned[0]); i++) {
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, &ts_pinned[i].s, 0), "setup");
+        TEST_ASSERT(t.f->member_capacity == NULL, "no capacities by default");
+        size_t n = t.f->n_participants - 1;
+        uint64_t *caps = calloc(n, sizeof(*caps));
+        TEST_ASSERT(caps != NULL, "alloc");
+        for (size_t c = 0; c < n; c++) caps[c] = 10000;
+        TEST_ASSERT(factory_set_member_capacities(t.f, caps, n), "set");
+        free(caps);
+        TEST_ASSERT(factory_set_member_capacities(t.f, NULL, 0), "clear");
+        char hex[65];
+        if (!factory_build_tree(t.f)) {
+            printf("\n    %s: build failed", ts_pinned[i].s.name);
+            bad++;
+        } else {
+            ts_digest(t.f, hex);
+            if (strcmp(hex, ts_pinned[i].digest) != 0) {
+                printf("\n    %s: digest %s", ts_pinned[i].s.name, hex);
+                bad++;
+            }
+        }
+        ts_close(&t);
+    }
+    if (bad) printf("\n");
+    TEST_ASSERT_EQ(bad, 0, "default capacities keep the pinned txids");
+
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    uint64_t caps[5] = { 30000, 40000, 50000, 60000, 70000 };
+    TEST_ASSERT(!factory_set_member_capacities(t.f, caps, 3), "3 capacities for 4 members");
+    TEST_ASSERT(!factory_set_member_capacities(t.f, caps, 5), "5 capacities for 4 members");
+    caps[2] = CHANNEL_DUST_LIMIT_SATS - 1;
+    TEST_ASSERT(!factory_set_member_capacities(t.f, caps, 4), "dust capacity refused");
+    TEST_ASSERT(t.f->member_capacity == NULL, "refused capacities store nothing");
+    TEST_ASSERT(!factory_set_leaf_stock(t.f, CHANNEL_DUST_LIMIT_SATS - 1), "dust stock refused");
+    uint64_t amount;
+    TEST_ASSERT(!factory_capacity_funding_amount(t.f, &amount), "no amount without capacities");
+    ts_close(&t);
+    return 1;
+}
+
+/* With capacities every member's channel output is its capacity, every leaf
+   stock the configured stock, every node conserves value, the funding is
+   exactly what the tree needs, and the tree signs and verifies.  A funding
+   output of any other amount, and PS sub-factory leaves, are refused.  The
+   distribution TX pays each member its full capacity plus its leaf's stock
+   share. */
+int test_tree_shape_capacity_build(void) {
+    static const ts_shape_t shapes[] = {
+        { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 },
+        { "N=5 arity 2", 5, {2}, 1, 0, 0, 0, 0, 0 },
+        { "N=3 arity 1", 3, {1}, 1, 0, 1, 1000, 0, 0 },
+        { "N=6 PS", 6, {3}, 1, 0, 1, 1000, 0, 0 },
+        { "N=8 2,4", 8, {2, 4}, 2, 0, 1, 1000, 0, 0 },
+        { "N=12 2,4 static 1", 12, {2, 4}, 2, 1, 1, 1000, 0, 0 },
+        { "N=7 3,4 static 1", 7, {3, 4}, 2, 1, 1, 1000, 0, 0 },
+        { "N=12 timezone ties", 12, {2}, 1, 0, 0, 0, 0, 1 },
+    };
+    const uint64_t stock = 25000;
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const ts_shape_t *s = &shapes[i];
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
+        factory_t *f = t.f;
+        TEST_ASSERT(ts_set_caps(f, stock), s->name);
+        TEST_ASSERT(factory_build_tree(f), s->name);
+        for (size_t c = 0; c < s->n_clients; c++) {
+            size_t ni;
+            uint32_t vout;
+            TEST_ASSERT(factory_client_to_leaf(f, c, &ni, &vout), "leaf");
+            TEST_ASSERT_EQ(f->nodes[ni].outputs[vout].amount_sats, ts_cap(c + 1),
+                           "channel output is the member's capacity");
+        }
+        for (int l = 0; l < f->n_leaf_nodes; l++) {
+            const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[l]];
+            size_t stock_vout = leaf->n_signers - 1;   /* after the channels */
+            TEST_ASSERT_EQ(leaf->outputs[stock_vout].amount_sats, stock, "leaf stock");
+        }
+        TEST_ASSERT(ts_conserves(f), "every node conserves value");
+        TEST_ASSERT(factory_sign_all(f) && factory_verify_all(f), "sign + verify");
+
+        tx_output_t outs[FACTORY_MAX_SIGNERS + 1];
+        size_t nd = factory_compute_distribution_outputs_balanced(
+            f, outs, FACTORY_MAX_SIGNERS + 1, 500, NULL, 0);
+        TEST_ASSERT_EQ(nd, s->n_clients, "one distribution output per member");
+        uint64_t total = 0, rest = f->funding_amount_sats - 500;
+        for (size_t c = 0; c < s->n_clients; c++) rest -= ts_cap(c + 1);
+        rest -= stock * (uint64_t)f->n_leaf_nodes;
+        for (size_t c = 0; c < s->n_clients; c++) {
+            uint64_t share = 0;
+            for (int l = 0; l < f->n_leaf_nodes; l++) {
+                const factory_node_t *leaf = &f->nodes[f->leaf_node_indices[l]];
+                size_t m = leaf->n_signers - 1;
+                for (size_t j = 1; j < leaf->n_signers; j++)
+                    if (leaf->signer_indices[j] == c + 1)
+                        share = stock / m + (j == 1 ? stock % m : 0);
+            }
+            uint64_t want = ts_cap(c + 1) + share + rest / s->n_clients +
+                            (c == 0 ? rest % s->n_clients : 0);
+            TEST_ASSERT_EQ(outs[c].amount_sats, want,
+                           "full capacity + leaf stock share + equal rest");
+            total += outs[c].amount_sats;
+        }
+        TEST_ASSERT_EQ(total, f->funding_amount_sats - 500, "distribution total");
+        ts_close(&t);
+    }
+
+    /* Funding one sat off what the capacities need is refused. */
+    ts_shape_t s = { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 };
+    ts_tree_t t;
+    TEST_ASSERT(ts_open_b(&t, &s, 0), "setup");
+    TEST_ASSERT(ts_set_caps(t.f, 0), "caps, default stock");
+    unsigned char spk[34], txid[32];
+    memset(txid, 0xAA, 32);
+    TEST_ASSERT(factory_compute_funding_spk(t.f, spk), "spk");
+    uint64_t need = t.f->funding_amount_sats;
+    TEST_ASSERT(factory_set_funding(t.f, txid, 0, need + 1, spk, 34), "fund +1");
+    TEST_ASSERT(!factory_build_tree(t.f), "one sat over refused");
+    TEST_ASSERT(factory_set_funding(t.f, txid, 0, need - 1, spk, 34), "fund -1");
+    TEST_ASSERT(!factory_build_tree(t.f), "one sat under refused");
+    TEST_ASSERT(factory_set_funding(t.f, txid, 0, need, spk, 34), "fund exact");
+    TEST_ASSERT(factory_build_tree(t.f), "exact funding builds");
+    size_t ni;
+    uint32_t vout;
+    TEST_ASSERT(factory_client_to_leaf(t.f, 0, &ni, &vout), "leaf");
+    TEST_ASSERT_EQ(t.f->nodes[ni].outputs[2].amount_sats, CHANNEL_DUST_LIMIT_SATS,
+                   "default stock is the dust limit");
+    ts_close(&t);
+
+    ts_shape_t psk = { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 };
+    TEST_ASSERT(ts_open_b(&t, &psk, 0), "PS k=2 setup");
+    uint64_t caps[8];
+    for (size_t c = 0; c < 8; c++) caps[c] = 30000;
+    TEST_ASSERT(factory_set_member_capacities(t.f, caps, 8), "set");
+    uint64_t amount;
+    TEST_ASSERT(!factory_capacity_funding_amount(t.f, &amount), "no amount for k=2 leaves");
+    TEST_ASSERT(!factory_build_tree(t.f), "k=2 leaves refuse capacities");
+    ts_close(&t);
+    return 1;
+}

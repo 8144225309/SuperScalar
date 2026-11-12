@@ -481,6 +481,10 @@ typedef struct {
     /* Caller channel output scripts by participant index; NULL until
        factory_set_leaf_channel_spk sets one (sized to config.max_signers). */
     factory_chan_spk_t *chan_spks;
+    /* Per-member channel capacity in sats by participant index; NULL = the
+       budget is split by tree shape (factory_set_member_capacities). */
+    uint64_t *member_capacity;
+    uint64_t leaf_stock_sats;   /* host stock per leaf with capacities (0 = default) */
 
     /* Runtime config (Mainnet Gap #6) — stored limits for this factory */
     factory_config_t config;
@@ -777,6 +781,29 @@ int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
    for a member of a PS sub-factory leaf (k > 1). */
 int factory_set_leaf_channel_spk(factory_t *f, uint32_t participant_idx,
                                  const unsigned char *spk, size_t spk_len);
+
+/* Give every member its own channel capacity: capacity_sats[i] is the
+   channel output of participant i + 1, n_members == n_participants - 1, each
+   at least CHANNEL_DUST_LIMIT_SATS.  factory_build_tree then sizes the tree
+   bottom-up: each leaf's channel outputs are its members' capacities and its
+   host stock output is factory_set_leaf_stock's amount, and every node's
+   value is the sum of its outputs plus its fee and anchor.  The funding
+   amount must be exactly factory_capacity_funding_amount.  capacity_sats ==
+   NULL restores the default (the funding split equally by tree shape, the
+   same transactions as before).  Returns 0, changing nothing, on a wrong
+   count or a capacity below dust.  Not available for PS sub-factory leaves
+   (k > 1): factory_build_tree refuses that combination. */
+int factory_set_member_capacities(factory_t *f, const uint64_t *capacity_sats,
+                                  size_t n_members);
+
+/* Host stock (L-stock) output of every leaf when member capacities are set;
+   0 = CHANNEL_DUST_LIMIT_SATS.  Returns 0 for a nonzero amount below dust. */
+int factory_set_leaf_stock(factory_t *f, uint64_t stock_sats);
+
+/* The funding amount factory_build_tree needs for the configured member
+   capacities, leaf stock, shape, fee and anchors.  Returns 0 when no
+   capacities are set or the shape cannot carry them. */
+int factory_capacity_funding_amount(const factory_t *f, uint64_t *amount_out);
 
 /* Set the client placement strategy for factory_build_tree.  Returns 0,
    changing nothing, for a mode that is not a placement_mode_t value.  The
@@ -1324,6 +1351,10 @@ size_t factory_compute_distribution_outputs(
    balance (client_amounts[0..n_clients-1]) instead of equal split.
    LSP gets funding - sum(client_amounts) - fee.
    client_amounts may be NULL to fall back to equal split. */
+/* (With member capacities and no client_amounts, each member receives its
+   full capacity plus an equal share of its leaf's host stock, and any rest
+   of the budget is split equally; capacities are never scaled down -- 0 is
+   returned when the budget cannot cover them.) */
 size_t factory_compute_distribution_outputs_balanced(
     const factory_t *f,
     tx_output_t *outputs_out,

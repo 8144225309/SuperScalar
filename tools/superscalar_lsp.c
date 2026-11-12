@@ -304,6 +304,10 @@ static void usage(const char *prog) {
         "  --accept-timeout N  Max seconds to wait for each client connection (default: 0 = no timeout)\n"
         "  --routing-fee-ppm N Routing fee in parts-per-million (default: 0 = free)\n"
         "  --lsp-balance-pct N LSP's share of channel capacity, 0-100 (default: 100)\n"
+        "  --capacities LIST   Channel capacity of each client in sats, comma-separated in\n"
+        "                      client order; the funding amount follows from them\n"
+        "                      (replaces --amount)\n"
+        "  --leaf-stock SATS   Host stock per leaf with --capacities (default: dust limit)\n"
         "                    Note: pass 50 with --demo if you want clients to have a balance to send payments from.\n"
         "  --placement-mode M  Client placement: sequential, inward, outward, timezone-cluster (default: timezone-cluster)\n"
         "  --economic-mode M   Fee model: lsp-takes-all, profit-shared (default: lsp-takes-all)\n"
@@ -1421,6 +1425,9 @@ int main(int argc, char *argv[]) {
     const char *funding_txid_override = NULL; /* --funding-txid: skip wallet funding, use existing UTXO */
     uint64_t routing_fee_ppm = 0;    /* 0 = zero-fee (no routing fee) */
     uint16_t lsp_balance_pct = 100;  /* 100 = LSP retains all capacity (production default) */
+    uint64_t member_caps[FACTORY_MAX_SIGNERS];
+    size_t n_member_caps = 0;        /* --capacities: per-client channel capacity */
+    uint64_t leaf_stock_arg = 0;     /* --leaf-stock */
     int accept_risk = 0;             /* --i-accept-the-risk for mainnet */
     int encrypt_db = 0;              /* --encrypt-db: at-rest field encryption (#327; auto-on for mainnet) */
     int placement_mode_arg = 3;      /* 0=sequential, 1=inward, 2=outward, 3=timezone-cluster */
@@ -2027,6 +2034,23 @@ int main(int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--routing-fee-ppm") == 0 && i + 1 < argc)
             routing_fee_ppm = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--capacities") == 0 && i + 1 < argc) {
+            const char *cp = argv[++i];
+            n_member_caps = 0;
+            while (*cp) {
+                char *end = NULL;
+                unsigned long long v = strtoull(cp, &end, 10);
+                if (end == cp || n_member_caps >= FACTORY_MAX_SIGNERS ||
+                    (*end != ',' && *end != '\0')) {
+                    fprintf(stderr, "Error: --capacities takes comma-separated sats\n");
+                    return 1;
+                }
+                member_caps[n_member_caps++] = (uint64_t)v;
+                cp = (*end == ',') ? end + 1 : end;
+            }
+        }
+        else if (strcmp(argv[i], "--leaf-stock") == 0 && i + 1 < argc)
+            leaf_stock_arg = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--lsp-balance-pct") == 0 && i + 1 < argc) {
             lsp_balance_pct = (uint16_t)atoi(argv[++i]);
             if (lsp_balance_pct > 100) {
@@ -3739,6 +3763,31 @@ accept_new_factory:
         return 1;
     }
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
+
+    /* The opening split every member checks its CHANNEL_READY against (the
+       channel manager is given the same value). */
+    lsp_p->lsp_balance_pct = lsp_balance_pct;
+
+    /* Per-member capacities: the funding amount is what the tree they size
+       needs. */
+    if (n_member_caps > 0) {
+        if (n_member_caps != (size_t)n_clients) {
+            fprintf(stderr, "Error: --capacities lists %zu clients, --clients is %d\n",
+                    n_member_caps, n_clients);
+            return 1;
+        }
+        lsp_p->member_capacities = member_caps;
+        lsp_p->n_member_capacities = n_member_caps;
+        lsp_p->leaf_stock_sats = leaf_stock_arg;
+        uint64_t need = 0;
+        if (!lsp_compute_funding_amount(lsp_p, &need)) {
+            fprintf(stderr, "Error: --capacities / --leaf-stock refused for this tree shape\n");
+            return 1;
+        }
+        printf("LSP: member capacities need a funding output of %llu sats\n",
+               (unsigned long long)need);
+        funding_sats = need;
+    }
 
     /* Populate default profiles from CLI config.  The shape setters above
        allocate the factory's arrays, but not every shape calls one (a plain

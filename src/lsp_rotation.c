@@ -818,6 +818,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     secp256k1_pubkey new_pks[LSP_MAX_CLIENTS];
     size_t n_new = rotation_new_clients(lsp, lad, dying_id, partial,
                                         new_idx, new_pks);
+    if (partial && lsp->member_capacities) {
+        /* The capacities are per member of the dying factory. */
+        printf("LSP rotate: partial rotation — new factory without member capacities\n");
+        lsp->member_capacities = NULL;
+        lsp->n_member_capacities = 0;
+    }
     if (n_new < (partial ? 2u : 1u) || (!partial && n_new != lsp->n_clients)) {
         fprintf(stderr, "LSP rotate: only %zu clients for the new factory\n", n_new);
         return 0;

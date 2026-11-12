@@ -647,6 +647,16 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
     cJSON_AddNumberToObject(j, "placement_mode", (double)f->placement_mode);
     cJSON_AddNumberToObject(j, "economic_mode", (double)f->economic_mode);
 
+    /* Per-member channel capacities (participants 1..N in order) and the
+       host stock per leaf: the members size the tree from them. */
+    if (f->member_capacity) {
+        cJSON *caps = cJSON_CreateArray();
+        for (size_t i = 1; i < f->n_participants; i++)
+            cJSON_AddItemToArray(caps, cJSON_CreateNumber((double)f->member_capacity[i]));
+        cJSON_AddItemToObject(j, "capacities", caps);
+        cJSON_AddNumberToObject(j, "leaf_stock", (double)f->leaf_stock_sats);
+    }
+
     /* Participant profiles */
     cJSON *profiles = cJSON_CreateArray();
     for (size_t i = 0; i < f->n_participants; i++) {

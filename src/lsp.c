@@ -431,52 +431,13 @@ static int creation_template_apply_order(factory_t *f,
     return 1;
 }
 
-int lsp_compute_funding_spk_for(lsp_t *lsp, const factory_t *order_from,
-                                const secp256k1_pubkey *client_pubkeys,
-                                size_t n_clients, unsigned char spk_out[34]) {
-    if (!lsp || !order_from || !client_pubkeys || !spk_out || n_clients == 0 ||
-        n_clients + 1 > FACTORY_MAX_SIGNERS)
-        return 0;
-    size_t n_total = 1 + n_clients;
-    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
-    all_pubkeys[0] = lsp->lsp_pubkey;
-    for (size_t i = 0; i < n_clients; i++)
-        all_pubkeys[i + 1] = client_pubkeys[i];
-
-    lsp_creation_template_t tmpl;
-    if (!creation_template_capture(&tmpl, order_from)) return 0;
-    factory_t *scratch = calloc(1, sizeof(*scratch));
-    int ok = 0;
-    if (scratch) {
-        /* The participants, placement and profiles creation builds the root
-           from (factory_setup_for_creation); the DW parameters do not enter
-           the root key. */
-        factory_init_from_pubkeys(scratch, lsp->ctx, all_pubkeys, n_total, 1, 2);
-        ok = scratch->pubkeys && scratch->profiles &&
-             creation_template_apply_order(scratch, &tmpl) &&
-             factory_compute_funding_spk(scratch, spk_out);
-        factory_free(scratch);
-        free(scratch);
-    }
-    creation_template_free(&tmpl);
-    return ok;
-}
-
-int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]) {
-    if (!lsp) return 0;
-    return lsp_compute_funding_spk_for(lsp, &lsp->factory, lsp->client_pubkeys,
-                                       lsp->n_clients, spk_out);
-}
-
-/* Build f from scratch for n_total participants (all_pubkeys[0] = LSP) over
-   the given funding outpoint, apply the template, and build the tree.
-   Returns 1 on success. */
-static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
+/* Initialise f from scratch for n_total participants (all_pubkeys[0] = LSP)
+   and apply the template, the fee, the anchors and the LSP's member
+   capacities: everything that decides the tree's shape, amounts and root
+   signer order.  Returns 1 on success. */
+static int creation_configure(lsp_t *lsp, factory_t *f,
         const lsp_creation_template_t *t,
         const secp256k1_pubkey *all_pubkeys, size_t n_total,
-        const unsigned char *funding_txid, uint32_t funding_vout,
-        uint64_t funding_amount,
-        const unsigned char *funding_spk, size_t funding_spk_len,
         uint16_t step_blocks, uint32_t states_per_layer,
         uint32_t cltv_timeout, const char *who) {
     /* Release whatever arrays f still owns (a no-op on a factory_free'd or
@@ -514,6 +475,93 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         return 0;
     }
     f->economic_mode = t->econ;
+    if (lsp->member_capacities &&
+        (!factory_set_member_capacities(f, lsp->member_capacities,
+                                        lsp->n_member_capacities) ||
+         !factory_set_leaf_stock(f, lsp->leaf_stock_sats))) {
+        fprintf(stderr, "%s: member capacities refused\n", who);
+        return 0;
+    }
+    return 1;
+}
+
+/* A scratch factory configured exactly as creation will configure one for
+   these participants, from order_from's template; NULL on failure.  Free
+   with factory_free + free. */
+static factory_t *creation_scratch(lsp_t *lsp, const factory_t *order_from,
+                                   const secp256k1_pubkey *client_pubkeys,
+                                   size_t n_clients) {
+    if (!lsp || !order_from || !client_pubkeys || n_clients == 0 ||
+        n_clients + 1 > FACTORY_MAX_SIGNERS)
+        return NULL;
+    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    all_pubkeys[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n_clients; i++)
+        all_pubkeys[i + 1] = client_pubkeys[i];
+    lsp_creation_template_t tmpl;
+    if (!creation_template_capture(&tmpl, order_from)) return NULL;
+    factory_t *scratch = calloc(1, sizeof(*scratch));
+    /* The DW parameters and CLTV enter neither the root key nor the amounts. */
+    if (scratch && !creation_configure(lsp, scratch, &tmpl, all_pubkeys,
+                                       n_clients + 1, 1, 2, 0, "LSP")) {
+        factory_free(scratch);
+        free(scratch);
+        scratch = NULL;
+    }
+    creation_template_free(&tmpl);
+    return scratch;
+}
+
+int lsp_compute_funding_spk_for(lsp_t *lsp, const factory_t *order_from,
+                                const secp256k1_pubkey *client_pubkeys,
+                                size_t n_clients, unsigned char spk_out[34]) {
+    if (!spk_out) return 0;
+    factory_t *scratch = creation_scratch(lsp, order_from, client_pubkeys, n_clients);
+    if (!scratch) return 0;
+    int ok = factory_compute_funding_spk(scratch, spk_out);
+    factory_free(scratch);
+    free(scratch);
+    return ok;
+}
+
+int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]) {
+    if (!lsp) return 0;
+    return lsp_compute_funding_spk_for(lsp, &lsp->factory, lsp->client_pubkeys,
+                                       lsp->n_clients, spk_out);
+}
+
+int lsp_compute_funding_amount(lsp_t *lsp, uint64_t *amount_out) {
+    if (!lsp || !amount_out || !lsp->member_capacities) return 0;
+    factory_t *scratch = creation_scratch(lsp, &lsp->factory, lsp->client_pubkeys,
+                                          lsp->n_clients);
+    if (!scratch) return 0;
+    int ok = factory_capacity_funding_amount(scratch, amount_out);
+    factory_free(scratch);
+    free(scratch);
+    return ok;
+}
+
+uint16_t lsp_opening_balance_pct(const lsp_t *lsp) {
+    uint16_t pct = lsp ? lsp->lsp_balance_pct : 0;
+    if (pct == 0) pct = 50;   /* as lsp_channels_init */
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
+/* Build f from scratch for n_total participants (all_pubkeys[0] = LSP) over
+   the given funding outpoint, apply the template, and build the tree.
+   Returns 1 on success. */
+static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
+        const lsp_creation_template_t *t,
+        const secp256k1_pubkey *all_pubkeys, size_t n_total,
+        const unsigned char *funding_txid, uint32_t funding_vout,
+        uint64_t funding_amount,
+        const unsigned char *funding_spk, size_t funding_spk_len,
+        uint16_t step_blocks, uint32_t states_per_layer,
+        uint32_t cltv_timeout, const char *who) {
+    if (!creation_configure(lsp, f, t, all_pubkeys, n_total, step_blocks,
+                            states_per_layer, cltv_timeout, who))
+        return 0;
     if (t->has_shachain) {
         if (t->use_flat && t->secrets)
             factory_set_flat_secrets(f, (const unsigned char (*)[32])t->secrets,
@@ -677,6 +725,10 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
 
     /* Send FACTORY_PROPOSE to all clients (tree shape) */
     cJSON *propose = wire_build_factory_propose(f);
+    /* The opening balance split of every channel, so each member checks its
+       CHANNEL_READY against terms it saw before signing. */
+    cJSON_AddNumberToObject(propose, "lsp_balance_pct",
+                            (double)lsp_opening_balance_pct(lsp));
     if (lsp->dist_client_amounts && lsp->dist_n_client_amounts > 0) {
         cJSON *da = cJSON_CreateArray();
         for (size_t i = 0; i < lsp->dist_n_client_amounts; i++)
