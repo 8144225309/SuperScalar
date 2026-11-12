@@ -3025,7 +3025,11 @@ int main(int argc, char *argv[]) {
         if (!rec_loaded) {
             free(rec_f);
             rec_f = NULL;
-            if (persist_has_factory(&db, 0)) {
+            if (persist_has_factory(&db, 0) && persist_factory_is_closed(&db, 0)) {
+                /* A closed factory is history: nothing is left to serve. */
+                printf("LSP: the closed factory in %s is not loaded; "
+                       "starting a new factory\n", db_path);
+            } else if (persist_has_factory(&db, 0)) {
                 /* The DB holds a factory this LSP must keep serving (its
                    members' exits, the distribution TX, the watchtower), but it
                    cannot be loaded as the signed tree (reason above).  Never

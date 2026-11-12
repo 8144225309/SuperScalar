@@ -34,6 +34,7 @@
 #     on the member's path from the root is the signed one and is on chain;
 #   - an LSP started on a copy of that DB with the factory's static depth
 #     lost refuses to load it and exits 1 instead of starting a new factory;
+#     with that factory marked closed it starts and waits for a new one;
 #   - expiry: every member holds the same distribution TX; it confirms once
 #     its nLockTime is reached and pays every member at least its creation
 #     balance (the members' outputs add up to the factory funding less the
@@ -401,6 +402,16 @@ run_lifecycle(){
     else
         tail -8 "$D/lsp_bad.log" | sed 's/^/         /'
         note_fail "LSP with an unloadable factory: rc=$rc"
+    fi
+    # the same factory marked closed is history: the LSP starts a new one
+    sqlite3 "$D/lsp_bad.db" "UPDATE factories SET state = 'closed';"
+    timeout 20 "$LSP_BIN" "${bad_args[@]}" > "$D/lsp_closed.log" 2>&1 < /dev/null; rc=$?
+    if [ "$rc" = 124 ] && grep -aq "closed factory in .* is not loaded" "$D/lsp_closed.log" &&
+       grep -aq "waiting for $N clients" "$D/lsp_closed.log"; then
+        note_ok "a closed factory that does not reload is history: the LSP starts and waits for a new factory"
+    else
+        tail -8 "$D/lsp_closed.log" | sed 's/^/         /'
+        note_fail "LSP with an unloadable closed factory: rc=$rc"
     fi
 }
 

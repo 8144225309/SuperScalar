@@ -138,6 +138,10 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 /* Check if a factory row exists in the database.  Returns 1 if present. */
 int persist_has_factory(persist_t *p, uint32_t factory_id);
 
+/* 1 if the factories row `factory_id` exists with state 'closed' (its tree is
+   fully on chain or the factory was otherwise settled). */
+int persist_factory_is_closed(persist_t *p, uint32_t factory_id);
+
 /* --- Pseudo-Spilman leaf chain persistence --- */
 
 /* Save one PS chain entry (call after each PS leaf advance).
