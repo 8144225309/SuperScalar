@@ -37,6 +37,21 @@ green(){ printf '\033[32m%s\033[0m\n' "$*"; }; red(){ printf '\033[31m%s\033[0m\
 mine(){ $BCLI -rpcwallet=$WALLET generatetoaddress "${1:-1}" "$MINE_ADDR" >/dev/null 2>&1||true; }
 # breach-launcher seckeys MUST equal the breach-test's client_fills (0x22 + i*0x11)
 sk(){ local b; b=$(printf "%02x" $((34 + $1 * 17))); printf "${b}%.0s" {1..32}; }
+# The ground-truth check below reads each breach transaction with
+# getrawtransaction, which finds a confirmed transaction only with -txindex:
+# without it every breach reads as unpenalized.  Start the node with
+# -txindex=1, or restart a running node that has no transaction index.
+if ! $BCLI getindexinfo txindex 2>/dev/null | grep -q '"txindex"'; then
+    if $BCLI getblockcount >/dev/null 2>&1; then
+        $BCLI stop >/dev/null 2>&1 || true
+        for i in $(seq 1 60); do $BCLI getblockcount >/dev/null 2>&1 || break; sleep 1; done
+    fi
+    bitcoind -regtest -conf="$REGTEST_CONF" -daemon -txindex=1 >/dev/null || fail "cannot start bitcoind -txindex=1"
+    for i in $(seq 1 60); do $BCLI getblockcount >/dev/null 2>&1 && break; sleep 1; done
+fi
+for i in $(seq 1 120); do $BCLI getindexinfo txindex 2>/dev/null | grep -q '"synced": *true' && break; sleep 1; done
+$BCLI getindexinfo txindex 2>/dev/null | grep -q '"synced": *true' || fail "bitcoind transaction index not synced"
+
 $BCLI -named createwallet wallet_name=$WALLET load_on_startup=false 2>/dev/null || $BCLI loadwallet $WALLET 2>/dev/null || true
 MINE_ADDR=$($BCLI -rpcwallet=$WALLET -named getnewaddress address_type=bech32m); mine 101
 
