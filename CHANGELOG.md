@@ -6,6 +6,14 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### A member decides its HTLCs from its own state
+
+Operator-visible behaviour changes.
+
+- **An add from the LSP is always an incoming HTLC.** A member books an HTLC as its own (offered) only when it sent the add itself (`client_send_payment`). `client_handle_add_htlc` refuses an `UPDATE_ADD_HTLC` from the LSP that claims to be the member's own payment (it carries `dest_client`): nothing is booked and no balance changes, and the client daemon signs nothing for it. A payment the LSP starts on a member's behalf (`--demo` payments, `rebalance`, CLI `pay`, all through `lsp_channels_initiate_payment`) therefore no longer completes; member-initiated payments, `lsppay` and invoice payments are unchanged.
+- **The preimage goes out only for an HTLC that pays the invoice.** Before it fulfils, the client daemon requires the HTLC to carry at least the invoiced amount (BOLT 4: never less) and to expire at least `CLIENT_MIN_FINAL_CLTV_DELTA` (18) blocks after its own chain tip (`client_htlc_pays_invoice`, `client_settle_invoice_htlc`). Otherwise it fails the HTLC back with `incorrect_or_unknown_payment_details`, keeps the preimage and leaves the invoice open. Without a chain tip the HTLC is failed.
+- **No invoice without fresh randomness.** Invoice preimages come from `getrandom`, else `/dev/urandom` (`client_new_invoice_preimage`). If neither can be read, no invoice is created and the client answers the LSP's `CREATE_INVOICE` with `MSG_ERROR`; the fixed fallback preimage is gone.
+
 ### Tree builder
 
 - **The factory is funded at the key its root spends.** The root kickoff aggregates the participants in placement order (`factory_compute_funding_spk`), but the LSP funding address, the rotation funding address and the persisted-factory reload derived the key from the participants in index order. With a placement mode and profiles that reorder the clients, the root could not spend the funding output (since PR #486 the build refuses it). All three now use `factory_compute_funding_spk`; new `lsp_compute_funding_spk` / `lsp_compute_funding_spk_for` give the script for an LSP's participants. A partial rotation funds the key of the cooperative clients it builds the new factory for, and aborts if one of them disconnects before the ceremony. `factory_client_to_leaf` now finds a member's channel in the built tree for every shape, so channels open on the leaf the placement put the member on.
