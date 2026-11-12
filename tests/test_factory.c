@@ -8545,6 +8545,7 @@ int test_factory_client_to_leaf_roundtrip(void) {
  * ========================================================================== */
 
 #include "superscalar/client.h"
+#include "superscalar/network.h"
 #include "superscalar/persist.h"
 #include "superscalar/wire.h"
 #include "superscalar/chain_backend.h"
@@ -8944,6 +8945,18 @@ int test_client_funding_depth_and_order(void) {
     TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "2 of 3 confirmations refused");
     g_fake_chain.confirmations = 3;
     TEST_ASSERT(client_check_factory_funding(f, 2, &me), "3 of 3 confirmations accepted");
+    /* The client tool's setting: the network default, or --funding-confs.
+       Fewer confirmations than that are refused. */
+    client_set_funding_min_confs(network_funding_confs("mainnet", 0));
+    g_fake_chain.confirmations = 5;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "mainnet: 5 of 6 refused");
+    g_fake_chain.confirmations = 6;
+    TEST_ASSERT(client_check_factory_funding(f, 2, &me), "mainnet: 6 of 6 accepted");
+    client_set_funding_min_confs(network_funding_confs("signet", 10));
+    g_fake_chain.confirmations = 9;
+    TEST_ASSERT(!client_check_factory_funding(f, 2, &me), "--funding-confs 10: 9 refused");
+    g_fake_chain.confirmations = 10;
+    TEST_ASSERT(client_check_factory_funding(f, 2, &me), "--funding-confs 10: 10 accepted");
     client_set_funding_min_confs(1);
     TEST_ASSERT_EQ(chain_funding_confs(NULL, 1), 1, "regtest depth");
     TEST_ASSERT_EQ(chain_funding_confs(NULL, 0), CONF_DEFAULT_FUNDING, "default depth elsewhere");

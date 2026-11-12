@@ -19,6 +19,13 @@ const char *network_canonical(const char *network) {
     return NULL;
 }
 
+int network_funding_confs(const char *network, int override) {
+    if (override > 0) return override;
+    if (network && strcmp(network, "regtest") == 0) return 1;
+    if (network_is_mainnet(network)) return 6;
+    return 3;
+}
+
 static int has_prefix(const char *s, const char *prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }

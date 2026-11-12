@@ -291,7 +291,8 @@ static void usage(const char *prog) {
         "  --test-large-factory Use --clients 8 for 8-client factory (combine with --demo)\n"
         "  --confirm-timeout N Confirmation wait timeout in seconds (default: 3600 regtest, 259200 non-regtest)\n"
         "  --safe-confs N      Set ALL confirmation depths at once (shorthand).\n"
-        "  --funding-confs N   Funding TX depth before acting (default: %d, CLN=3, LND=1-6)\n"
+        "  --funding-confs N   Funding TX depth before acting (default: 6 mainnet,\n"
+        "                      3 signet/testnet/testnet4; clients use the same default)\n"
         "  --close-confs N     Close TX depth before removing entries (default: %d, LDK=6)\n"
         "  --penalty-confs N   Penalty TX depth before removing breach entry (default: %d)\n"
         "  --sweep-confs N     HTLC sweep depth before considering settled (default: %d)\n"
@@ -366,7 +367,7 @@ static void usage(const char *prog) {
         "  --version           Show version and exit\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS,
-        CONF_DEFAULT_FUNDING, CONF_DEFAULT_CLOSE,
+        CONF_DEFAULT_CLOSE,
         CONF_DEFAULT_PENALTY, CONF_DEFAULT_SWEEP,
         LSP_MAX_CLIENTS);
 }
@@ -2961,8 +2962,10 @@ int main(int argc, char *argv[]) {
         wallet_src = g_hd_wallet ? &g_hd_wallet->base : NULL;
     }
 
-    /* Apply confirmation depth overrides.
-       --safe-confs sets all four; per-operation flags override individually. */
+    /* Funding depth defaults per network, the same default the client uses.
+       Then the overrides: --safe-confs sets all four; per-operation flags
+       override individually. */
+    chain_be->conf.funding = network_funding_confs(network, 0);
     if (safe_confs_arg > 0) {
         conf_targets_set_all(&chain_be->conf, safe_confs_arg);
         printf("LSP: all confirmation depths set to %d (--safe-confs)\n",

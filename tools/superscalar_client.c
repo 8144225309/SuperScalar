@@ -2532,6 +2532,9 @@ static void usage(const char *prog) {
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --funding-confs N                 Confirmations a factory's funding output needs before the\n"
+        "                                    client accepts the factory (default: regtest 1, signet,\n"
+        "                                    testnet and testnet4 3, mainnet 6; the LSP's default too)\n"
         "  --enable-rotation-experimental    UNSAFE, testing only: take part in factory rotation\n"
         "                                    (refused on mainnet). Off by default: the client refuses\n"
         "                                    the key turnover and rotation proposals.\n"
@@ -2865,6 +2868,7 @@ int main(int argc, char *argv[]) {
     int n_lc_fallbacks = 0;
     const char *pay_offer_str = NULL;  /* --pay-offer BECH32M_OFFER */
     int enable_rotation_experimental = 0; /* --enable-rotation-experimental */
+    int funding_confs_arg = 0;            /* --funding-confs, 0 = network default */
     int test_lsps2 = 0;               /* --test-lsps2: send lsps2.get_info, verify response */
     int test_lsps2_buy = 0;           /* --test-lsps2-buy: also send lsps2.buy, verify scid */
     int test_splice = 0;              /* --test-splice: exit cleanly after SPLICE_LOCKED */
@@ -3099,6 +3103,14 @@ int main(int argc, char *argv[]) {
             mnemonic_passphrase = argv[++i];
         } else if (strcmp(argv[i], "--enable-rotation-experimental") == 0) {
             enable_rotation_experimental = 1;
+        } else if (strcmp(argv[i], "--funding-confs") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v < 1 || v > 1000) {
+                fprintf(stderr, "Error: --funding-confs needs a number from 1 to 1000\n");
+                return 1;
+            }
+            funding_confs_arg = (int)v;
         } else if (strcmp(argv[i], "--test-allow-tree-advance") == 0) {
             /* Harness only (the --test- prefix is refused on mainnet):
                co-sign leaf, state and sub-factory advances, which the client
@@ -4173,7 +4185,7 @@ int main(int argc, char *argv[]) {
         else if (!vfn)
             fprintf(stderr, "Client: RPC connection unavailable — funding outputs cannot "
                     "be verified, so every factory will be refused\n");
-        client_set_funding_min_confs(chain_funding_confs(NULL, strcmp(network, "regtest") == 0));
+        client_set_funding_min_confs(network_funding_confs(network, funding_confs_arg));
 
         /* A rotation after a reconnect checks the new funding output with
            the same verifier as the first factory. */
@@ -4238,7 +4250,7 @@ int main(int argc, char *argv[]) {
         else if (!sa_vfn)
             fprintf(stderr, "Client: RPC connection unavailable — funding outputs cannot "
                     "be verified, so every factory will be refused\n");
-        client_set_funding_min_confs(chain_funding_confs(NULL, strcmp(network, "regtest") == 0));
+        client_set_funding_min_confs(network_funding_confs(network, funding_confs_arg));
 
         if (n_actions > 0) {
             /* Scripted --send/--recv now run through the SAME proven daemon

@@ -132,8 +132,8 @@ int client_factory_exit_acceptable(const secp256k1_context *ctx, const factory_t
                                     const secp256k1_pubkey *my_pubkey);
 
 /* Depth the funding output must have before a factory is accepted.  The
-   client tool sets chain_funding_confs() for its network (the depth the LSP
-   waits for); default 1. */
+   client tool sets network_funding_confs(network, --funding-confs), whose
+   default is the depth the LSP waits for by default; library default 1. */
 void client_set_funding_min_confs(int confs);
 
 /* Factory rotation is experimental and off unless enabled
