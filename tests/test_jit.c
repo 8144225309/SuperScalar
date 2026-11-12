@@ -1876,3 +1876,26 @@ int test_jit_wait_holds_other_messages(void) {
     jit_gate_fixture_free(&fx);
     return 1;
 }
+
+/* --- What counts as "spent" in a gettxout answer --- */
+
+int test_gettxout_answer_classified(void) {
+    /* A literal null is the only "no such unspent output". */
+    TEST_ASSERT_EQ(regtest_parse_gettxout("null"), 0, "null");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("null\n"), 0, "null with newline");
+    /* A failed call (no bitcoin-cli, HTTP error falling back to an exec that
+       fails) returns empty text or an error message: unknown, never spent. */
+    TEST_ASSERT_EQ(regtest_parse_gettxout(""), -1, "empty text is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("\n"), -1, "blank text is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout(NULL), -1, "no answer is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout(
+        "error: Could not connect to the server 127.0.0.1:18443\n"), -1,
+        "an error message is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("nullx"), -1, "trailing junk is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("{}"), -1, "an object without an output is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout(
+        "{\"bestblock\":\"00\",\"confirmations\":3,\"value\":0.0005,"
+        "\"scriptPubKey\":{\"hex\":\"5120\"},\"coinbase\":false}"), 1,
+        "an output object is unspent");
+    return 1;
+}

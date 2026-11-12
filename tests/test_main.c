@@ -1635,6 +1635,7 @@ extern int test_jit_migrate_keeps_unspent_channel(void);
 extern int test_jit_client_migrate_keeps_factory_watch(void);
 extern int test_jit_reject_round_trip(void);
 extern int test_wire_msg_ids_unique(void);
+extern int test_gettxout_answer_classified(void);
 extern int test_jit_reject_ends_wait(void);
 extern int test_jit_wait_holds_other_messages(void);
 
@@ -3638,6 +3639,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_client_migrate_keeps_factory_watch);
     RUN_TEST(test_jit_reject_round_trip);
     RUN_TEST(test_wire_msg_ids_unique);
+    RUN_TEST(test_gettxout_answer_classified);
     RUN_TEST(test_jit_reject_ends_wait);
     RUN_TEST(test_jit_wait_holds_other_messages);
 
