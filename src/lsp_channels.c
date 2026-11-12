@@ -5951,6 +5951,38 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* --- Reconnection (Phase 16) --- */
 
+/* A replayed forward that did not complete: put the destination channel back
+   to the state the database holds (the balance is persisted only after the
+   client's revocation), take the replayed HTLC out of the database and drop
+   the connection.  The client's next reconnect starts from the persisted
+   state and the forward is replayed again; left as it is, the channel would
+   stay a commitment ahead of the client with an HTLC the client never took,
+   and every later update on it would fail. */
+static void replay_rollback(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t idx,
+                            uint64_t old_local, uint64_t old_remote,
+                            const htlc_t *old_htlcs, size_t old_n_htlcs,
+                            uint64_t old_cn, uint64_t htlc_id) {
+    channel_t *ch = &mgr->entries[idx].channel;
+    ch->local_amount = old_local;
+    ch->remote_amount = old_remote;
+    if (old_n_htlcs > 0 && old_htlcs)
+        memcpy(ch->htlcs, old_htlcs, old_n_htlcs * sizeof(htlc_t));
+    ch->n_htlcs = old_n_htlcs;
+    ch->commitment_number = old_cn;
+    if (mgr->persist)
+        persist_delete_htlc((persist_t *)mgr->persist, (uint32_t)idx, htlc_id);
+    fprintf(stderr, "LSP: replay of HTLC %llu to client %zu did not complete; "
+            "the channel is back at commitment %llu and the connection is "
+            "dropped\n", (unsigned long long)htlc_id, idx,
+            (unsigned long long)old_cn);
+    if (lsp->client_fds[idx] >= 0) {
+        wire_close(lsp->client_fds[idx]);
+        lsp->client_fds[idx] = -1;
+    }
+    if (mgr->readiness)
+        readiness_clear((readiness_tracker_t *)mgr->readiness, (uint32_t)idx);
+}
+
 /* Replay pending HTLC forwards to a reconnected client (Gap 2C).
    Scans all channels for ACTIVE RECEIVED HTLCs whose invoice destination
    matches the reconnected client. For each unforwarded HTLC, re-does the
@@ -6000,6 +6032,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             uint64_t old_dest_local = dest_ch->local_amount;
             uint64_t old_dest_remote = dest_ch->remote_amount;
             size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+            uint64_t old_dest_cn = dest_ch->commitment_number;
             htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
                 ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
             if (old_dest_n_htlcs > 0 && !old_dest_htlcs) continue;
@@ -6031,12 +6064,17 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             }
 
             /* Send ADD_HTLC to dest */
-            cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, htlc->amount_sats,
+            /* The wire carries msat. */
+            cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id,
+                                                       htlc->amount_sats * 1000,
                                                        htlc->payment_hash, htlc->cltv_expiry);
             if (!wire_send(lsp->client_fds[reconnected_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
                 cJSON_Delete(fwd);
+                replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                old_dest_cn, dest_htlc_id);
                 free(old_dest_htlcs);
-                continue;
+                return;
             }
             cJSON_Delete(fwd);
 
@@ -6047,16 +6085,22 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
                     fprintf(stderr, "LSP: replay partial sig failed for client %zu\n",
                             reconnected_idx);
+                    replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                    old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                    old_dest_cn, dest_htlc_id);
                     free(old_dest_htlcs);
-                    continue;
+                    return;
                 }
                 cJSON *cs = wire_build_commitment_signed(
                     mgr->entries[reconnected_idx].channel_id,
                     dest_ch->commitment_number, psig32, nonce_idx);
                 if (!wire_send(lsp->client_fds[reconnected_idx], MSG_COMMITMENT_SIGNED, cs)) {
                     cJSON_Delete(cs);
+                    replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                    old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                    old_dest_cn, dest_htlc_id);
                     free(old_dest_htlcs);
-                    continue;
+                    return;
                 }
                 cJSON_Delete(cs);
             }
@@ -6070,8 +6114,11 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                     if (ack_msg.json) cJSON_Delete(ack_msg.json);
                     fprintf(stderr, "LSP: replay REVOKE_AND_ACK timeout for client %zu\n",
                             reconnected_idx);
+                    replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                    old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                    old_dest_cn, dest_htlc_id);
                     free(old_dest_htlcs);
-                    continue;
+                    return;
                 }
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
@@ -6084,8 +6131,11 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                                 reconnected_idx, (unsigned long)old_cn);
                         secure_zero(rev_secret, 32);
                         cJSON_Delete(ack_msg.json);
+                        replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                        old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                        old_dest_cn, dest_htlc_id);
                         free(old_dest_htlcs);
-                        continue;
+                        return;
                     }
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
@@ -6452,6 +6502,7 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Replay any pending HTLC forwards to this client (Gap 2C) */
     replay_pending_htlcs(mgr, lsp, c);
+    if (lsp->client_fds[c] < 0) return 0;   /* a replay failed: the client reconnects again */
 
     if (mgr->readiness)
         readiness_set_connected((readiness_tracker_t *)mgr->readiness,
