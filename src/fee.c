@@ -75,14 +75,13 @@ uint64_t fee_for_cpfp_child(fee_estimator_t *fe)
 
 uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs)
 {
-    /* Commitment tx: 154 vB base + 43 vB per active HTLC — NORMAL */
     if (!fe || !fe->get_rate) return 0;
     return fee_commitment_tx_at(fe->get_rate(fe, FEE_TARGET_NORMAL), n_htlcs);
 }
 
 uint64_t fee_commitment_tx_at(uint64_t sat_per_kvb, size_t n_htlcs)
 {
-    return compute_fee(sat_per_kvb, 154 + 43 * n_htlcs);
+    return compute_fee(sat_per_kvb, fee_commitment_tx_vsize(n_htlcs));
 }
 
 static size_t varint_len(size_t n)
@@ -115,18 +114,7 @@ uint64_t fee_at_rate(uint64_t sat_per_kvb, size_t vsize)
     return compute_fee(sat_per_kvb, vsize);
 }
 
-uint64_t fee_presigned(uint64_t sat_per_kvb, size_t vsize)
+size_t fee_commitment_tx_vsize(size_t n_htlcs)
 {
-    if (sat_per_kvb < FEE_PRESIGNED_FLOOR_SAT_PER_KVB)
-        sat_per_kvb = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
-    return compute_fee(sat_per_kvb, vsize);
-}
-
-int fee_should_use_anchor(fee_estimator_t *fe)
-{
-    /* At sub-1-sat/vB rates the 240-sat P2A anchor costs more than the
-       entire TX fee, making CPFP uneconomical.  Skip anchors below
-       1000 sat/kvB and rely on the low base rate for relay. */
-    if (!fe || !fe->get_rate) return 1;  /* default: include anchor */
-    return fe->get_rate(fe, FEE_TARGET_URGENT) >= 1000;
+    return fee_keypath_tx_vsize(1, 2 + n_htlcs, 1);
 }

@@ -178,7 +178,9 @@ static void write_input(tx_buf_t *t, const unsigned char *txid32, uint32_t vout)
 static int build_anchor_only(const cpfp_tx_info_t *parent, uint32_t version,
                              tx_buf_t *child_out, uint64_t *fee_out) {
     /* P2A input, a 0-value OP_RETURN output padded so the tx meets the 65-byte
-       minimum non-witness size; the whole anchor value is fee. */
+       minimum non-witness size; the whole anchor value is fee.  A 0-value
+       anchor pays nothing: no such child. */
+    if (parent->anchor_amount == 0) return 0;
     static const unsigned char op_return[5] = { 0x6a, 0x03, 0x53, 0x53, 0x41 };
     tx_buf_reset(child_out);
     tx_buf_write_u32_le(child_out, version);
@@ -250,7 +252,7 @@ const char *cpfp_need_text(cpfp_need_t n) {
                "confirmed on-chain coin in the bitcoind wallet named by --wallet";
     case CPFP_NEED_PACKAGE_RELAY:
         return "no package relay backend: the fee-paying child can only be sent "
-               "with it through bitcoind RPC (submitpackage, Bitcoin Core 28+)";
+               "with it through bitcoind RPC (submitpackage, Bitcoin Core 29.1+)";
     default:
         return "none";
     }
@@ -434,13 +436,14 @@ static uint64_t mempool_floor(regtest_t *rt) {
     return a > b ? a : b;
 }
 
-/* The node's incremental relay feerate (sat/kvB); Core's default if unknown. */
+/* The node's incremental relay feerate (sat/kvB); Core's default (100
+   sat/kvB since 29.1) if it does not report one. */
 static uint64_t incremental_rate(regtest_t *rt) {
     cJSON *j = rpc_json(rt, "getnetworkinfo", "", 0);
     cJSON *v = j ? cJSON_GetObjectItem(j, "incrementalfee") : NULL;
     uint64_t r = (v && cJSON_IsNumber(v)) ? btc_to_sat(v->valuedouble) : 0;
     cJSON_Delete(j);
-    return r > 0 ? r : FEE_MIN_RELAY_SAT_PER_KVB;
+    return r > 0 ? r : FEE_FLOOR_SAT_PER_KVB;
 }
 
 /* Sum of the values of the outputs tx spends, or UINT64_MAX when one of
@@ -652,8 +655,6 @@ static cpfp_result_t bump_in_mempool(regtest_t *rt, wallet_source_t *wallet,
     }
 
     spec.pkg_rate = need + need / 10;
-    if (spec.pkg_rate < FEE_PRESIGNED_FLOOR_SAT_PER_KVB)
-        spec.pkg_rate = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
     spec.incr_rate = incremental_rate(rt);
     spec.max_fee = max_fee;
     if (spender[0])
@@ -757,8 +758,6 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
     spec.base_fee = parent_fee;
     spec.base_vsize = ti.vsize;
     spec.pkg_rate = need + need / 10;
-    if (spec.pkg_rate < FEE_PRESIGNED_FLOOR_SAT_PER_KVB)
-        spec.pkg_rate = FEE_PRESIGNED_FLOOR_SAT_PER_KVB;
     spec.max_fee = max_child_fee;
     tx_buf_t child;
     tx_buf_init(&child, 256);
@@ -769,6 +768,9 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
                      &lock)) {
         tx_buf_free(&child);
         fprintf(stderr, "CPFP: could not build a child for %s\n", ti.txid_hex);
+        /* No coin, and the anchor alone (0-value at rate 0) cannot pay. */
+        if (g_child_no_coin)
+            need_record(CPFP_NEED_COIN, ti.txid_hex);
         return CPFP_FAILED;
     }
     char *child_hex = malloc(child.len * 2 + 1);

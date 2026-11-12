@@ -239,19 +239,15 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
             entry->close_spk_len = 34;
         }
 
-        /* Commitment tx fee: pinned at the channel's stored fee_rate (1000
-           sat/kvB; channel_init at src/channel.c:282). Using the live fee
-           estimator here would diverge from the client's symmetric
-           client_check_conservation (which reads ch->fee_rate_sat_per_kvb=1000
-           and computes base_commit_fee=154) -- concretely, a 2562 sat/kvB live
-           rate produced a constant -241 sat conservation gap on testnet4 that
-           crashed PS_ADVANCE quorums (3e V3 / V3b, task #262). Real fee
-           bumping at broadcast time happens via CPFP on the factory tree, not
-           via this initial accounting deduction. */
-        fee_estimator_static_t _fe_default;
-        fee_estimator_static_init(&_fe_default, 1000);
-        fee_estimator_t *_fe = &_fe_default.base;
-        uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
+        /* Commitment tx fee: the factory's agreed rate for the commitment's
+           exact size (fee_commitment_tx_at), the channel's commitment rate
+           below.
+           Never the live estimator: the client computes the same deduction
+           (client_init_channel, client_check_conservation) from the same
+           agreed rate, and a live rate diverged from it on testnet4 (a
+           constant -241 sat conservation gap, task #262).  What the network
+           asks for beyond it is paid at broadcast time by a CPFP child. */
+        uint64_t commit_fee = fee_commitment_tx_at(factory->tree_fee_rate, 0);
         if (commit_fee == FEE_INVALID) {
             fprintf(stderr, "lsp_channels_init: commitment fee not computable\n");
             return 0;
@@ -280,8 +276,8 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Attach persistence so revocation secrets land in revocation_secrets
            and a standalone watchtower can hydrate this channel. */
         channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
-        /* fee_rate stays at channel_init default (1000); commit_fee above is
-           pinned to the same rate to maintain the conservation invariant. */
+        /* the agreed rate the commit_fee above was computed at */
+        channel_set_commit_fee_rate(&entry->channel, factory->tree_fee_rate);
 
         /* SF-CH #154: factory leaf outputs use DIFFERENT keyagg orderings
            depending on leaf type (setup_leaf_outputs / setup_single_leaf_outputs
@@ -3781,10 +3777,7 @@ static int lsp_realloc_leaf_ceremony(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint16_t pct = mgr->lsp_balance_pct;
         if (pct == 0) pct = 50;
         if (pct > 100) pct = 100;
-        fee_estimator_static_t _fe_realloc;
-        fee_estimator_t *_fe_ra = mgr->fee ? (fee_estimator_t *)mgr->fee : NULL;
-        if (!_fe_ra) { fee_estimator_static_init(&_fe_realloc, 1000); _fe_ra = &_fe_realloc.base; }
-        uint64_t commit_fee_ra = fee_commitment_tx_at(factory_lsp_fee_rate(_fe_ra), 0);
+        uint64_t commit_fee_ra = fee_commitment_tx_at(entry->channel.commit_fee_rate_sat_per_kvb, 0);
         if (commit_fee_ra == FEE_INVALID) {
             fprintf(stderr, "LSP realloc: commitment fee not computable\n");
             return 0;
@@ -8322,13 +8315,11 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
             }
         }
 
-        /* Match lsp_channels_init: base commit_fee (154 vB × fee_rate)
-           was deducted from usable balance at init time, so the invariant
-           compares against (funding − base_commit_fee), not funding. See
-           fee_for_commitment_tx(fe, 0) in src/fee.c and the symmetric fix
-           in client_check_conservation (src/client.c). */
-        uint64_t base_commit_fee =
-            (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+        /* Match lsp_channels_init: the base commit_fee at the channel's
+           agreed rate was deducted from usable balance at init time, so the
+           invariant compares against (funding − base_commit_fee), not
+           funding.  Same function as client_check_conservation. */
+        uint64_t base_commit_fee = fee_commitment_tx_at(ch->commit_fee_rate_sat_per_kvb, 0);
         uint64_t expected = ch->funding_amount > base_commit_fee
                             ? ch->funding_amount - base_commit_fee : 0;
 

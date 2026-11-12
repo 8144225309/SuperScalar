@@ -5913,8 +5913,16 @@ int test_persist_factory_without_tree_rate_refused(void) {
     TEST_ASSERT(memcmp(f2->nodes[0].txid, f->nodes[0].txid, 32) == 0, "same tree");
     factory_free(f2);
 
-    /* what a row migrated from schema v39 holds: the column default */
+    /* rate 0 is a valid agreed rate */
     TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = 0 WHERE id = 0;",
+                             NULL, NULL, NULL) == SQLITE_OK, "rate 0");
+    memset(f2, 0, sizeof(*f2));
+    TEST_ASSERT(persist_load_factory(&db, 0, f2, ctx), "a row at rate 0 loads");
+    TEST_ASSERT_EQ(f2->tree_fee_rate, 0, "rate 0 loaded");
+    factory_free(f2);
+
+    /* what a row migrated from schema v39 holds: NULL */
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = NULL WHERE id = 0;",
                              NULL, NULL, NULL) == SQLITE_OK, "clear the rate");
     memset(f2, 0, sizeof(*f2));
     TEST_ASSERT(!persist_load_factory(&db, 0, f2, ctx),

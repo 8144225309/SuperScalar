@@ -280,7 +280,8 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->local_amount = local_amount;
     ch->remote_amount = remote_amount;
     ch->to_self_delay = to_self_delay;
-    ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB (Bitcoin Core minrelaytxfee) */
+    ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB for penalty/HTLC txs */
+    ch->commit_fee_rate_sat_per_kvb = 1000;
     ch->funder_is_local = 0;
     ch->commitment_number = 0;
 
@@ -932,15 +933,18 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
        not RBF-able once both parties sign; a keyless Pay-to-Anchor output lets
        whoever force-closes attach a high-fee child to pull the commitment into a
        block.  The 240-sat cost is moved OUT of the funder's (to_remote) output,
-       so the output sum -- and thus the implicit ~154-sat miner fee -- is
-       unchanged and to_local (the broadcaster's recoverable balance) is
+       so the output sum -- and thus the implicit miner fee, the agreed rate
+       for the commitment's exact size -- is unchanged and to_local (the broadcaster's recoverable balance) is
        untouched.  Presence + funding source are a pure function of the shared
        channel fee-rate + balances, so both co-signers build an identical tx
        (matching sighash).  Appended LAST: to_local[0]/to_remote[1]/HTLC indices
        and the count-bounded watchtower output parsers are unaffected.  Gated on a
        negotiated per-channel flag (option_anchors style) so both co-signers agree
-       and legacy/unit channels keep the anchorless format. */
-    if (ch->use_cpfp_anchor && ch->fee_rate_sat_per_kvb >= 1000) {
+       and legacy/unit channels keep the anchorless format.  Present at every
+       rate: the lower the agreed rate, the more the commitment needs a child
+       (at rate 0 it pays no fee and relays only with one; the anchor stays
+       240 sat, above dust). */
+    if (ch->use_cpfp_anchor) {
         uint64_t anchor = ANCHOR_OUTPUT_AMOUNT;
         int placed = 0;
         if (outputs[1].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
@@ -1110,6 +1114,11 @@ int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb) {
     if (!ch) return;
     ch->fee_rate_sat_per_kvb = fee_rate_sat_per_kvb;
+}
+
+void channel_set_commit_fee_rate(channel_t *ch, uint64_t sat_per_kvb) {
+    if (!ch) return;
+    ch->commit_fee_rate_sat_per_kvb = sat_per_kvb;
 }
 
 void channel_set_persist(channel_t *ch, void *db, uint32_t channel_id) {
@@ -1877,13 +1886,14 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
         ch->remote_amount -= amount_sats;
     }
 
-    /* Dynamic fee: each HTLC adds 43 vB to commitment tx */
-    uint64_t per_htlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    /* Dynamic fee: each HTLC adds 43 vB to commitment tx, at the
+       commitment's rate */
+    uint64_t per_htlc_fee = (ch->commit_fee_rate_sat_per_kvb * 43 + 999) / 1000;
     uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
     if (*funder_bal < per_htlc_fee) {
         fprintf(stderr, "channel_add_htlc: refused — funder_bal %" PRIu64
-                " < per_htlc_fee %" PRIu64 " (fee_rate %" PRIu64 " sat/kvB)\n",
-                *funder_bal, per_htlc_fee, ch->fee_rate_sat_per_kvb);
+                " < per_htlc_fee %" PRIu64 " (commit fee rate %" PRIu64 " sat/kvB)\n",
+                *funder_bal, per_htlc_fee, ch->commit_fee_rate_sat_per_kvb);
         /* Rollback HTLC amount deduction */
         if (direction == HTLC_OFFERED) ch->local_amount += amount_sats;
         else ch->remote_amount += amount_sats;

@@ -2552,10 +2552,8 @@ static void usage(const char *prog) {
         "  --force-close                     Broadcast factory tree from DB (recover funds without LSP)\n"
         "  --wallet NAME                     bitcoind wallet that funds CPFP children on exit\n"
         "                                      (default: none; a bump spends the P2A anchor alone)\n"
-        "  --max-tree-fee-rate N             Refuse a factory whose tree fee rate exceeds N sat/kvB\n"
-        "  --max-signed-tree-fee-rate N      This client's own ceiling on the tree fee rate (sat/kvB;\n"
-        "                                    default 10000 on mainnet, none elsewhere; 0 = none)\n"
-        "                                      (default 100000, the LSP default; 0 = no ceiling)\n"
+        "  --max-tree-fee-rate N             Refuse a factory whose pre-signed rate exceeds N sat/kvB\n"
+        "                                      (default 10000 = 10 sat/vB; 0 = no ceiling)\n"
         "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
@@ -2842,8 +2840,6 @@ int main(int argc, char *argv[]) {
             g_client_wallet_name = argv[++i];
         else if (strcmp(argv[i], "--max-tree-fee-rate") == 0 && i + 1 < argc)
             client_set_max_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
-        else if (strcmp(argv[i], "--max-signed-tree-fee-rate") == 0 && i + 1 < argc)
-            client_set_max_signed_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--cheat-client") == 0 && i + 1 < argc) {
             /* CL7: adversarial client cheat. SIDE = 0 (left) or 1 (right).
                Sets env var read by client_handle_leaf_advance. */
@@ -3260,15 +3256,26 @@ int main(int argc, char *argv[]) {
         printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
                (unsigned long long)sig_cn, commit_tx_len);
 
+        /* Load basepoints.  The client's channel is stored under its slot in
+           the factory (participant index - 1), not always 0: take the one
+           channel this DB holds. */
+        unsigned char local_secs[4][32];
+        unsigned char remote_bps_raw[4][33];
+        uint32_t sweep_chan_id = 0;
+        int have_bps = 0;
+        for (uint32_t cid = 0; cid < FACTORY_MAX_SIGNERS && !have_bps; cid++) {
+            if (persist_load_basepoints(&db, cid, local_secs, remote_bps_raw)) {
+                sweep_chan_id = cid;
+                have_bps = 1;
+            }
+        }
+
         /* Load channel state (balances + commitment number) */
         uint64_t local_amt = 0, remote_amt = 0;
         uint64_t cn = 0;
-        persist_load_channel_state(&db, 0, &local_amt, &remote_amt, &cn);
+        persist_load_channel_state(&db, sweep_chan_id, &local_amt, &remote_amt, &cn);
 
-        /* Load basepoints */
-        unsigned char local_secs[4][32];
-        unsigned char remote_bps_raw[4][33];
-        if (!persist_load_basepoints(&db, 0, local_secs, remote_bps_raw)) {
+        if (!have_bps) {
             fprintf(stderr, "ERROR: no basepoints in DB\n");
             persist_close(&db);
             return 1;
@@ -3320,9 +3327,36 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
         memset(sweep_seckey, 0, 32);
 
-        /* Initialize channel using the same path as reconnect */
+        /* Initialize channel using the same path as reconnect, for this
+           client's own participant index in the factory */
         channel_t sweep_ch;
-        uint32_t sweep_my_index = 1; /* default client index */
+        uint32_t sweep_my_index = 0;
+        {
+            secp256k1_pubkey my_pk;
+            unsigned char a[33], b[33];
+            size_t al = 33, bl = 33;
+            if (secp256k1_keypair_pub(sweep_ctx, &my_pk, &sweep_kp) &&
+                secp256k1_ec_pubkey_serialize(sweep_ctx, a, &al, &my_pk,
+                                              SECP256K1_EC_COMPRESSED)) {
+                for (size_t pi = 1; pi < sweep_factory->n_participants; pi++) {
+                    bl = 33;
+                    if (secp256k1_ec_pubkey_serialize(sweep_ctx, b, &bl,
+                                                      &sweep_factory->pubkeys[pi],
+                                                      SECP256K1_EC_COMPRESSED) &&
+                        memcmp(a, b, 33) == 0) {
+                        sweep_my_index = (uint32_t)pi;
+                        break;
+                    }
+                }
+            }
+        }
+        if (sweep_my_index == 0) {
+            fprintf(stderr, "ERROR: this key is not a client of the factory in the DB\n");
+            factory_free(sweep_factory); free(sweep_factory);
+            secp256k1_context_destroy(sweep_ctx);
+            persist_close(&db);
+            return 1;
+        }
         if (!client_init_channel(&sweep_ch, sweep_ctx, sweep_factory, &sweep_kp,
                                   sweep_my_index,
                                   &r_pay, &r_delay, &r_revoc, &r_htlc,
@@ -3457,7 +3491,10 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Build sweep TX */
+        /* Build sweep TX.  It is signed now, by this client alone: its fee
+           follows --fee-rate, not the factory's pre-signed rate the
+           commitment above was rebuilt at (which may be 0). */
+        channel_set_fee_rate(&sweep_ch, fee_rate > 0 ? (uint64_t)fee_rate : 1000);
         tx_buf_t sweep_tx;
         tx_buf_init(&sweep_tx, 256);
         if (!channel_build_to_local_sweep(&sweep_ch, &sweep_tx,
@@ -3582,7 +3619,6 @@ int main(int argc, char *argv[]) {
             .argv = argv,
             .envp = environ,
         };
-        client_apply_network_defaults(network);
         if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
             fputs(gate_err, stderr);
             return 1;

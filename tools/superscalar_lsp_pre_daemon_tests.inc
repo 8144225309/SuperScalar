@@ -472,7 +472,6 @@
                             if (cur_h > 0)
                                 factory_set_lifecycle(exh_f1, (uint32_t)cur_h,
                                                       active_blocks, dying_blocks);
-                            exh_f1->fee = fee_est;
 
                             /* Record Factory 1 initial (max) nSequence */
                             for (size_t ni = 0; ni < exh_f1->n_nodes; ni++) {
@@ -1124,7 +1123,6 @@
                     factory_set_lifecycle(f1, (uint32_t)cur_h,
                                           active_blocks, dying_blocks);
             }
-            f1->fee = fee_est;
 
             printf("Factory 1 created: %zu nodes signed\n", f1->n_nodes);
 

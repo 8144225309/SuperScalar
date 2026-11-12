@@ -229,8 +229,8 @@ int test_lsp_channel_init(void) {
         TEST_ASSERT(entry->channel.local_amount > 0, "local_amount > 0");
         TEST_ASSERT(entry->channel.remote_amount > 0, "remote_amount > 0");
         /* local + remote = funding_amount - commit_fee */
-        fee_estimator_static_t _fe; fee_estimator_static_init(&_fe, 1000);
-        uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&_fe, 0);
+        uint64_t commit_fee =
+            fee_commitment_tx_at(entry->channel.commit_fee_rate_sat_per_kvb, 0);
         TEST_ASSERT_EQ(entry->channel.local_amount + entry->channel.remote_amount,
                         entry->channel.funding_amount - commit_fee, "balance sum");
     }
@@ -852,8 +852,8 @@ int test_regtest_intra_factory_payment(void) {
                Channel B (LSP view): LSP sent 5000 to B
                  -> local decreased by 5000, remote increased by 5000 */
             /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
-            fee_estimator_static_t _fe2; fee_estimator_static_init(&_fe2, 1000);
-            uint64_t commit_fee_ab = fee_for_commitment_tx((fee_estimator_t *)&_fe2, 0);
+            uint64_t commit_fee_ab =
+                fee_commitment_tx_at(ch_a->commit_fee_rate_sat_per_kvb, 0);
             uint64_t usable_a = ch_a->funding_amount > commit_fee_ab ?
                                 ch_a->funding_amount - commit_fee_ab : 0;
             uint64_t a_orig = usable_a / 2;
@@ -1208,8 +1208,7 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
         channel_t *ch_d = &ch_mgr.entries[3].channel;
 
         /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
-        fee_estimator_static_t _fe3; fee_estimator_static_init(&_fe3, 1000);
-        uint64_t cfe = fee_for_commitment_tx((fee_estimator_t *)&_fe3, 0);
+        uint64_t cfe = fee_commitment_tx_at(ch_a->commit_fee_rate_sat_per_kvb, 0);
         uint64_t a_orig = (ch_a->funding_amount > cfe ?
                            ch_a->funding_amount - cfe : 0) / 2;
         uint64_t b_orig = (ch_b->funding_amount > cfe ?
@@ -1764,9 +1763,8 @@ int test_fee_policy_balance_split(void) {
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
-    fee_estimator_static_t fe;
-    fee_estimator_static_init(&fe, 1000);
-    uint64_t commit_fee = fee_for_commitment_tx((fee_estimator_t *)&fe, 0);
+    /* the commitment fee at the factory's agreed rate */
+    uint64_t commit_fee = fee_commitment_tx_at(f->tree_fee_rate, 0);
 
     /* Test 1: Default 50-50 split (pct=0 means default 50) */
     {
@@ -1966,12 +1964,14 @@ int test_fee_estimator_wiring(void) {
     mgr.lsp_balance_pct = 50;
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec, 4), "init with fee");
 
-    /* channel.fee_rate_sat_per_kvb must NOT be wired from the fee estimator —
-     * client always uses the default 1000 sat/kvB from channel_init, so both
-     * sides must agree on the same value or commitment sighashes diverge. */
+    /* channel.fee_rate_sat_per_kvb must NOT be wired from the fee estimator:
+     * it is the factory's agreed rate, which the client also uses, or the
+     * commitment sighashes diverge. */
     for (size_t c = 0; c < 4; c++) {
+        TEST_ASSERT_EQ(mgr.entries[c].channel.commit_fee_rate_sat_per_kvb, f->tree_fee_rate,
+                       "commitment uses the agreed tree rate (not wired from estimator)");
         TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)1000,
-                       "channel uses default 1000 sat/kvB (not wired from estimator)");
+                       "penalty/HTLC rate stays at the channel default");
     }
 
     /* Conservation invariant under high live-fee-rate: the LSP-side init must
@@ -1982,14 +1982,14 @@ int test_fee_estimator_wiring(void) {
      * constant -241 sat gap because the LSP init read estimatesmartfee's
      * ~2562 sat/kvB while channel_init pinned ch->fee_rate at 1000). */
     {
-        uint64_t expected_commit_fee = fee_at_1000;  /* 154 sats at 1000 rate */
+        uint64_t expected_commit_fee = fee_commitment_tx_at(f->tree_fee_rate, 0);
         for (size_t c = 0; c < 4; c++) {
             channel_t *ch = &mgr.entries[c].channel;
             uint64_t expected_usable = ch->funding_amount - expected_commit_fee;
             uint64_t actual_sum = ch->local_amount + ch->remote_amount;
             TEST_ASSERT_EQ(actual_sum, expected_usable,
-                           "conservation: local+remote == funding - 154 (not - "
-                           "fee_at_live_rate); see task #262");
+                           "conservation: local+remote == funding - fee at the agreed "
+                           "rate (not at the live rate); see task #262");
         }
         /* Also exercise the LSP-side check directly. */
         TEST_ASSERT(lsp_channels_check_conservation(&mgr),
@@ -2034,10 +2034,10 @@ int test_fee_estimator_null_fallback(void) {
     mgr.lsp_balance_pct = 50;
     TEST_ASSERT(lsp_channels_init(&mgr, ctx, f, lsp_sec, 4), "init with NULL fee");
 
-    /* All channels should have default fee rate */
+    /* All channels have the agreed tree rate */
     for (size_t c = 0; c < 4; c++) {
-        TEST_ASSERT_EQ(mgr.entries[c].channel.fee_rate_sat_per_kvb, (uint64_t)1000,
-                       "channel has default 1000 sat/kvB");
+        TEST_ASSERT_EQ(mgr.entries[c].channel.commit_fee_rate_sat_per_kvb, f->tree_fee_rate,
+                       "commitment has the agreed tree rate");
     }
 
     lsp_channels_cleanup(&mgr);
@@ -4288,11 +4288,12 @@ int test_conservation_with_real_htlc(void) {
     channel_t *ch = &mgr.entries[0].channel;
     ch->funding_amount = 100000;
     /* Conservation invariant is local+remote+Σhtlc == funding - base_commit_fee.
-       base_commit_fee at 1 sat/vB is 154 sats (154 vB * 1000/1000 rounded up),
+       base_commit_fee at 1 sat/vB is 167 sats (167 vB * 1000/1000 rounded up),
        which lsp_channels_init deducts from the funder side before splitting. */
-    ch->local_amount = 49846;
+    ch->local_amount = 49833;
     ch->remote_amount = 50000;
     ch->fee_rate_sat_per_kvb = 1000;  /* 1 sat/vB */
+    ch->commit_fee_rate_sat_per_kvb = 1000;
     ch->funder_is_local = 1;
     /* channel_add_htlc needs local_pcs for commitment_number generation */
     ch->local_pcs = calloc(16, 32);
@@ -4320,8 +4321,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(lsp_channels_check_conservation(&mgr) == 1,
                 "conservation OK during in-flight HTLC");
 
-    /* Verify exact balance: local = 49846 - 10000 (htlc) - 43 (fee) = 39803 */
-    TEST_ASSERT(ch->local_amount == 49846 - 10000 - expected_fee,
+    /* Verify exact balance: local = 49833 - 10000 (htlc) - 43 (fee) = 39803 */
+    TEST_ASSERT(ch->local_amount == 49833 - 10000 - expected_fee,
                 "local balance correct after add");
     TEST_ASSERT(ch->remote_amount == 50000,
                 "remote balance unchanged");
@@ -4335,7 +4336,7 @@ int test_conservation_with_real_htlc(void) {
     sha256(preimage, 32, hash);
     /* Re-add with correct hash */
     ch->n_htlcs = 0;
-    ch->local_amount = 49846;
+    ch->local_amount = 49833;
     ch->remote_amount = 50000;
     ch->commitment_number = 0;
     TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 10000, hash, 500, &htlc_id) == 1,
@@ -4343,8 +4344,8 @@ int test_conservation_with_real_htlc(void) {
     TEST_ASSERT(channel_fulfill_htlc(ch, htlc_id, preimage) == 1,
                 "fulfill HTLC succeeds");
 
-    /* After fulfill: local = 49846 - 10000 - 43 + 43 = 39846, remote = 50000 + 10000 = 60000 */
-    TEST_ASSERT(ch->local_amount == 39846,
+    /* After fulfill: local = 49833 - 10000 - 43 + 43 = 39833, remote = 50000 + 10000 = 60000 */
+    TEST_ASSERT(ch->local_amount == 39833,
                 "local balance correct after fulfill");
     TEST_ASSERT(ch->remote_amount == 60000,
                 "remote balance correct after fulfill");

@@ -5021,7 +5021,7 @@ int test_factory_set_leaf_amounts(void) {
     TEST_ASSERT(check_total == total, "total conserved");
 
     /* Wrong sum should fail */
-    uint64_t bad_amounts[3] = { total / 2, total / 4, total / 4 + 1 };
+    uint64_t bad_amounts[3] = { total / 2, total / 4, total - total / 2 - total / 4 + 1 };
     TEST_ASSERT(!factory_set_leaf_amounts(f, 0, bad_amounts, 3),
                 "reject bad sum");
 

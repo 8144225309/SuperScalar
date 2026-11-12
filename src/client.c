@@ -1,5 +1,4 @@
 #include "superscalar/client.h"
-#include "superscalar/network.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
@@ -74,63 +73,46 @@ void client_set_min_profit_bps(uint16_t bps) {
     g_min_profit_bps = bps;
 }
 
+static uint64_t g_max_tree_fee_rate = CLIENT_DEFAULT_MAX_TREE_FEE_RATE;
+
 void client_set_max_tree_fee_rate(uint64_t sat_per_kvb) {
-    factory_set_max_tree_fee_rate(sat_per_kvb);
+    g_max_tree_fee_rate = sat_per_kvb;
 }
 
-static uint64_t g_max_signed_tree_fee_rate = 0;
-static int g_max_signed_tree_fee_rate_set = 0;
-
-void client_set_max_signed_tree_fee_rate(uint64_t sat_per_kvb) {
-    g_max_signed_tree_fee_rate = sat_per_kvb;
-    g_max_signed_tree_fee_rate_set = 1;
-}
-
-uint64_t client_max_signed_tree_fee_rate(void) {
-    return g_max_signed_tree_fee_rate;
-}
-
-void client_apply_network_defaults(const char *network) {
-    if (!g_max_signed_tree_fee_rate_set && network_is_mainnet(network))
-        g_max_signed_tree_fee_rate = CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE;
-}
-
-/* the lower of the protocol maximum and the client's own ceiling; 0 = none */
-static uint64_t client_tree_fee_rate_ceiling(void) {
-    uint64_t max = factory_max_tree_fee_rate();
-    uint64_t own = g_max_signed_tree_fee_rate;
-    if (own > 0 && (max == 0 || own < max)) max = own;
-    return max;
+uint64_t client_max_tree_fee_rate(void) {
+    return g_max_tree_fee_rate;
 }
 
 int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb) {
-    uint64_t max = client_tree_fee_rate_ceiling();
-    if (sat_per_kvb < FEE_PRESIGNED_FLOOR_SAT_PER_KVB) return 0;
-    if (max > 0 && sat_per_kvb > max) return 0;
-    return 1;
+    return g_max_tree_fee_rate == 0 || sat_per_kvb <= g_max_tree_fee_rate;
 }
 
 /* Fee check on a tree the client built from FACTORY_PROPOSE, before it signs
-   anything: the agreed rate must be within the client's bounds, every node
-   must pay at least the pre-signed floor for its real size, and no exit path
-   may pay more than the sanity bounds of factory_check_presigned_fee_bounds. */
+   anything: the proposed rate must be within the member's own ceiling, and
+   every node (and the distribution TX once built) must pay exactly that rate
+   for its exact size (factory_check_tree_fees). */
 static int client_check_tree_fees(const factory_t *f, uint64_t proposed_rate,
                                   uint32_t my_index) {
     if (!client_tree_fee_rate_acceptable(proposed_rate)) {
-        fprintf(stderr, "Client %u: REFUSING — tree fee rate %llu sat/kvB outside "
-                "[%d, %llu]\n", my_index, (unsigned long long)proposed_rate,
-                FEE_PRESIGNED_FLOOR_SAT_PER_KVB,
-                (unsigned long long)client_tree_fee_rate_ceiling());
+        fprintf(stderr, "Client %u: REFUSING — tree fee rate %llu sat/kvB above this "
+                "member's ceiling of %llu sat/kvB (--max-tree-fee-rate)\n", my_index,
+                (unsigned long long)proposed_rate,
+                (unsigned long long)g_max_tree_fee_rate);
         return 0;
     }
-    size_t bad = 0;
-    if (!factory_check_tree_fees(f, FEE_PRESIGNED_FLOOR_SAT_PER_KVB, &bad)) {
-        fprintf(stderr, "Client %u: REFUSING — tree node %zu pays below the "
-                "relay floor\n", my_index, bad);
+    if (f->cltv_timeout > 0 && f->n_participants - 1 > FACTORY_MAX_DIST_CLIENTS) {
+        fprintf(stderr, "Client %u: REFUSING — %zu clients: the distribution TX "
+                "would not fit a %d vB TRUC transaction (at most %d clients)\n",
+                my_index, f->n_participants - 1, TRUC_MAX_VSIZE,
+                FACTORY_MAX_DIST_CLIENTS);
         return 0;
     }
     char why[200];
-    if (!factory_check_presigned_fee_bounds(f, why, sizeof(why))) {
+    if (f->tree_fee_rate != proposed_rate || !factory_check_tree_fees(f, why, sizeof(why))) {
+        if (f->tree_fee_rate != proposed_rate)
+            snprintf(why, sizeof(why), "tree built at %llu sat/kvB, %llu proposed",
+                     (unsigned long long)f->tree_fee_rate,
+                     (unsigned long long)proposed_rate);
         fprintf(stderr, "Client %u: REFUSING — %s\n", my_index, why);
         return 0;
     }
@@ -177,10 +159,8 @@ static int client_channel_conserved(const channel_t *ch, uint64_t *sum_out,
             sum += ch->ptlcs[t].fee_at_add;
         }
     }
-    /* Base commit-tx fee: matches fee_for_commitment_tx(fe, 0) in src/fee.c
-       (154 vB × fee_rate_sat_per_kvb, rounded up per compute_fee). */
-    uint64_t base_commit_fee =
-        (ch->fee_rate_sat_per_kvb * 154 + 999) / 1000;
+    /* Base commit-tx fee at the channel's agreed rate (fee_commitment_tx_at). */
+    uint64_t base_commit_fee = fee_commitment_tx_at(ch->commit_fee_rate_sat_per_kvb, 0);
     uint64_t expected = ch->funding_amount > base_commit_fee
                         ? ch->funding_amount - base_commit_fee : 0;
     if (sum_out) *sum_out = sum;
@@ -400,13 +380,12 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     /* LSP pubkey (participant 0) */
     const secp256k1_pubkey *lsp_pubkey = &factory->pubkeys[0];
 
-    /* Commitment tx fee: must match lsp_channels_init so both sides agree. */
-    fee_estimator_static_t _fe_default;
-    fee_estimator_t *_fe = fee_est;
-    if (!_fe) { fee_estimator_static_init(&_fe_default, 1000); _fe = &_fe_default.base; }
-    uint64_t commit_fee = fee_for_commitment_tx(_fe, 0);
+    /* Commitment tx fee: the factory's agreed rate for the commitment's exact
+       size, as lsp_channels_init computes it, so both sides agree. */
+    (void)fee_est;
+    uint64_t commit_fee = fee_commitment_tx_at(factory->tree_fee_rate, 0);
     if (commit_fee == FEE_INVALID) {
-        fprintf(stderr, "client: commitment fee not computable at the current estimate\n");
+        fprintf(stderr, "client: commitment fee not computable at the agreed rate\n");
         return 0;
     }
     uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
@@ -431,6 +410,7 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     }
     ch->funder_is_local = 0;  /* LSP (remote) is the funder */
     ch->use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor on commitments (matches LSP side) */
+    channel_set_commit_fee_rate(ch, factory->tree_fee_rate);  /* the agreed rate */
 
     /* Set local basepoints from caller-provided random secrets */
     channel_set_local_basepoints(ch, local_pay_sec32, local_delay_sec32, local_revoc_sec32);

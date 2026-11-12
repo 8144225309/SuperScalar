@@ -41,11 +41,6 @@ struct fee_estimator {
     void     (*free)(fee_estimator_t *self);
 };
 
-/* Returns 1 if P2A anchors should be included at this estimator's URGENT
-   rate.  At sub-1-sat/vB the 240-sat anchor costs more than the TX fee
-   itself, making CPFP uneconomical.  Pass NULL to default to 1 (use anchor). */
-int fee_should_use_anchor(fee_estimator_t *fe);
-
 /* -----------------------------------------------------------------------
  * Static (constant-rate) implementation
  * All targets return the same sat_per_kvb.  update/free are NULL.

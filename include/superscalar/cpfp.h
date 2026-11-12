@@ -14,7 +14,8 @@
  *
  * The child is funded from a wallet_source_t (wallet UTXO + change).  With no
  * wallet, or no spendable UTXO, the child spends the anchor alone and pays its
- * 240 sats as fee into an OP_RETURN output.
+ * 240 sats as fee into an OP_RETURN output.  A 0-value anchor (a tx signed at
+ * rate 0, ephemeral dust) pays nothing that way: such a parent needs a coin.
  */
 
 #include <stdint.h>
@@ -113,8 +114,10 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
 
 /* Oldest Bitcoin Core (getnetworkinfo "version") that relays the exit:
    TRUC transactions, P2A anchors and 1-parent-1-child package relay
-   through submitpackage all need 28.0. */
-#define CPFP_MIN_NODE_VERSION 280000
+   (submitpackage) need 28.0, the 0-value ephemeral anchor of a tree signed
+   at rate 0 needs 29.0, and 29.1 lowered the default relay floors to 100
+   sat/kvB, the default tree rate. */
+#define CPFP_MIN_NODE_VERSION 290100
 
 /* 0, after an error naming the version, when the node behind rt is older
    than CPFP_MIN_NODE_VERSION; 1 otherwise (also when rt is NULL or the

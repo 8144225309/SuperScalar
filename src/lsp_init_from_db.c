@@ -125,13 +125,9 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
             entry->close_spk_len = 34;
         }
 
-        /* Commitment tx fee: pinned at 1000 sat/kvB to match channel_init
-           (src/channel.c:282) and client_check_conservation (src/client.c).
-           See sister site in lsp_channels_init for full rationale. */
-        fee_estimator_static_t _fe_default2;
-        fee_estimator_static_init(&_fe_default2, 1000);
-        fee_estimator_t *_fe2 = &_fe_default2.base;
-        uint64_t commit_fee = fee_for_commitment_tx(_fe2, 0);
+        /* Commitment tx fee at the factory's agreed rate (see the sister
+           site in lsp_channels_init). */
+        uint64_t commit_fee = fee_commitment_tx_at(factory->tree_fee_rate, 0);
         if (commit_fee == FEE_INVALID) {
             fprintf(stderr, "lsp_channels_init_from_db: commitment fee not computable\n");
             return 0;
@@ -158,8 +154,7 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.use_cpfp_anchor = 1;  /* #56: P2A CPFP anchor (matches client; restore parity) */
         /* Attach persistence (see lsp_channels_init for rationale). */
         channel_set_persist(&entry->channel, mgr->persist, (uint32_t)c);
-        /* fee_rate stays at channel_init default (1000); commit_fee above is
-           pinned to the same rate to maintain the conservation invariant. */
+        channel_set_commit_fee_rate(&entry->channel, factory->tree_fee_rate);
 
         /* SF-CH #154: auto-discover funding keyagg ordering (see comment in
            lsp_channels_init for full rationale). */

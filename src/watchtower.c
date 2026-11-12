@@ -58,12 +58,10 @@ static void wt_save_pending(watchtower_t *wt, const watchtower_pending_t *p) {
 }
 
 /* Authoritative check: does this serialised penalty TX contain a P2A anchor
- * at vout 1?  The build-time `use_anchor` decision (fee_should_use_anchor at
- * registration) can differ from the broadcast-time re-evaluation if the fee
- * estimator's URGENT rate crossed the 1 sat/vB threshold in between.  When
- * that happens we'd otherwise track CPFP against an output that doesn't
- * exist, and bitcoind rejects the child with bad-txns-inputs-missingorspent.
- * This helper inspects the bytes directly so the two decisions can't drift.
+ * at vout 1?  Penalties are always built with
+ * the anchor, but entries restored from storage may predate that; tracking
+ * CPFP against an output that does not exist gets the child rejected with
+ * bad-txns-inputs-missingorspent, so the bytes are inspected directly.
  *
  * Penalty TX format assumed (channel_build_penalty_tx, V3/TRUC, segwit):
  *   [4 version][1 marker=0x00][1 flag=0x01]
@@ -556,7 +554,7 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                 if (wt->n_entries > 0) {
                     watchtower_entry_t *just_added =
                         &wt->entries[wt->n_entries - 1];
-                    int use_anchor = fee_should_use_anchor(wt->fee);
+                    int use_anchor = 1;  /* always: a low-rate tx needs its anchor most */
                     tx_buf_t penalty;
                     tx_buf_init(&penalty, 512);
                     if (channel_build_penalty_tx(ch, &penalty,
@@ -725,7 +723,7 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                the HTLC metadata (direction, payment_hash, cltv_expiry) —
                same shim watchtower_check uses on the lazy-build path. */
             if (wt->db && wt->db->db && entry->n_htlc_outputs > 0 && ch) {
-                int use_anchor_h = fee_should_use_anchor(wt->fee);
+                int use_anchor_h = 1;  /* always: a low-rate tx needs its anchor most */
 
                 /* Save + restore ch->htlcs[0] across the per-output build loop. */
                 size_t wt_saved_n = ch->n_htlcs;
@@ -893,7 +891,7 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                store the signed bytes keyed on the breach txid.  Uses the same
                ch->ptlcs[0] shim the watchtower_check lazy-build path uses. */
             if (wt->wt_db && wt->wt_db->db && entry->n_ptlc_outputs > 0 && ch) {
-                int use_anchor_p = fee_should_use_anchor(wt->fee);
+                int use_anchor_p = 1;  /* always: a low-rate tx needs its anchor most */
                 size_t wt_saved_np = ch->n_ptlcs;
                 ptlc_t wt_saved_p0 = {0};
                 if (wt_saved_np > 0 && ch->ptlcs)
@@ -1339,7 +1337,7 @@ int watchtower_check(watchtower_t *wt) {
            wt->channels[] was removed in A3.2 along with the field. */
         tx_buf_t penalty_tx;
         tx_buf_init(&penalty_tx, 512);
-        int use_anchor = fee_should_use_anchor(wt->fee);
+        int use_anchor = 1;  /* always: a low-rate tx needs its anchor most */
 
         if (!e->signed_penalty_tx || e->signed_penalty_tx_len == 0) {
             fprintf(stderr,
@@ -1405,10 +1403,9 @@ int watchtower_check(watchtower_t *wt) {
         /* Track in pending for CPFP bump if anchor is active.
            Use authoritative byte-inspection of the pre-built penalty TX
            (penalty_tx_has_p2a_anchor) rather than re-deriving use_anchor —
-           the build-time and broadcast-time fee_should_use_anchor() can
-           disagree when the URGENT fee rate crosses 1 sat/vB in between,
-           which produces ghost-anchor pending entries whose CPFP child
-           bitcoind rejects with bad-txns-inputs-missingorspent.
+           a stored penalty may have been built without one, and a
+           ghost-anchor pending entry gets its CPFP child rejected with
+           bad-txns-inputs-missingorspent.
            SF-WTC #149: dropped `ch &&` gate.  csv_delay now sourced from
            e->csv_delay (persisted at watch-registration), falling back to
            live ch->to_self_delay for legacy entries pre v32, and to the

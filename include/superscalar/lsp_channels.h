@@ -214,7 +214,7 @@ typedef struct {
     /* Continuous ladder rotation (set once at daemon startup) */
     unsigned char rot_lsp_seckey[32];
     void *rot_fee_est;              /* fee_estimator_t* — avoids header dependency */
-    uint64_t rot_tree_fee_rate;     /* --tree-fee-rate for rotated factories (0 = estimator) */
+    uint64_t rot_tree_fee_rate;     /* --tree-fee-rate: the agreed rate of rotated factories */
     unsigned char rot_fund_spk[34];
     size_t rot_fund_spk_len;
     char rot_fund_addr[128];
@@ -545,10 +545,10 @@ int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    old factory's cooperative close would cost more than half its funding at
    the current fee estimate; nothing was sent or changed, and the
    postponement is already recorded (lsp_rotation_record_postponed): not a
-   failed attempt.  A replacement factory whose pre-signed exit fees exceed
-   the bound even at the floor rate is LSP_ROTATE_FAILED, also with nothing
-   sent or changed: its shape, client count and funding do not change with
-   the fee market. */
+   failed attempt.  A replacement factory that cannot be built, or whose
+   channels cannot hold the carried balances, is LSP_ROTATE_FAILED, also
+   with nothing sent or changed: its shape, client count, funding and agreed
+   tree rate do not change with the fee market. */
 #define LSP_ROTATE_FAILED    0
 #define LSP_ROTATE_OK        1
 #define LSP_ROTATE_POSTPONED 2

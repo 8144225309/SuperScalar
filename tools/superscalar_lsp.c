@@ -276,11 +276,10 @@ static void usage(const char *prog) {
         "  --cli               Enable interactive CLI in daemon mode (pay/status/rotate/close)\n"
         "  --demo              Run demo payment sequence after channels ready\n"
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
-        "  --tree-fee-rate N   Fee rate in sat/kvB the factory tree's pre-signed txs are sized at\n"
-        "                      (default: the fee estimator's 6-block rate, at most\n"
-        "                      --max-tree-fee-rate; never below 1250)\n"
-        "  --max-tree-fee-rate N  Highest tree fee rate in sat/kvB; must match the clients'\n"
-        "                      --max-tree-fee-rate (default 100000; 0 = none)\n"
+        "  --tree-fee-rate N   Rate in sat/kvB every pre-signed factory tx pays (tree nodes,\n"
+        "                      distribution TX, commitments): a factory term the members\n"
+        "                      check (default 100 = 0.1 sat/vB; 0 = no fee, every tx goes\n"
+        "                      out with a CPFP child)\n"
         "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
@@ -1428,7 +1427,7 @@ int main(int argc, char *argv[]) {
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
     uint64_t fee_rate = 1000;  /* sat/kvB, default 1 sat/vB */
-    uint64_t tree_fee_rate_arg = 0;  /* --tree-fee-rate; 0 = estimator */
+    uint64_t tree_fee_rate_arg = FACTORY_DEFAULT_TREE_FEE_RATE;  /* --tree-fee-rate */
     int bump_budget_pct = 0;       /* --bump-budget-pct (0 = default 50%) */
     uint64_t max_bump_fee = 0;     /* --max-bump-fee (0 = default 50000 sats) */
     const char *seckey_hex = NULL;
@@ -1674,8 +1673,6 @@ int main(int argc, char *argv[]) {
             fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--tree-fee-rate") == 0 && i + 1 < argc)
             tree_fee_rate_arg = (uint64_t)strtoull(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--max-tree-fee-rate") == 0 && i + 1 < argc)
-            factory_set_max_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc)
             backup_dir = argv[++i];
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
@@ -2325,16 +2322,6 @@ int main(int argc, char *argv[]) {
     }
     if (use_json_log)
         ss_log_set_json(1);
-
-    /* --- Tree fee rate: an explicit rate must be one the clients sign --- */
-    if (tree_fee_rate_arg > 0 && factory_max_tree_fee_rate() > 0 &&
-        tree_fee_rate_arg > factory_max_tree_fee_rate()) {
-        fprintf(stderr, "ERROR: --tree-fee-rate %llu is above the maximum tree fee "
-                "rate %llu sat/kvB that clients sign (--max-tree-fee-rate)\n",
-                (unsigned long long)tree_fee_rate_arg,
-                (unsigned long long)factory_max_tree_fee_rate());
-        return 1;
-    }
 
     /* --- Validate fee rate floor --- */
     if (fee_rate < FEE_FLOOR_SAT_PER_KVB) {
@@ -3138,11 +3125,10 @@ int main(int argc, char *argv[]) {
             for (size_t i = 0; i < rec_n_clients; i++)
                 lsp_rp->client_pubkeys[i] = rec_f->pubkeys[i + 1];
 
-            /* Copy factory and set fee estimator */
+            /* Copy factory (its agreed tree rate comes from the row) */
             lsp_rp->factory = *rec_f;
             free(rec_f);
             rec_f = NULL;
-            lsp_rp->factory.fee = fee_est;
 
             /* #59 restart-resume: a reloaded hashlock-poison factory (the persisted
                use_hashlock_poison intent) must re-derive its DETERMINISTIC L-stock
@@ -3943,9 +3929,7 @@ accept_new_factory:
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    /* The tree's pre-signed fees are fixed when the ceremony signs it, so the
-       rate (explicit, else the estimator) must be in place before it runs. */
-    lsp_p->factory.fee = fee_est;
+    /* The agreed tree rate must be in place before the ceremony signs. */
     lsp_p->factory.tree_fee_rate = tree_fee_rate_arg;
     if (n_level_arity > 0)
         factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
@@ -3966,35 +3950,15 @@ accept_new_factory:
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* Every signer refuses a tree whose pre-signed exit fees exceed
-       FACTORY_MAX_EXIT_FEE_PCT of the funding (factory_check_presigned_fee_bounds).
-       That bound depends only on the tree shape, the client count, the rate
-       and the funding, so it is settled here, before any funding is
-       broadcast: a factory that fails it even at the floor rate is never
-       funded, and a rate above what it allows is lowered to the highest rate
-       that passes (the clients accept it: it passes their check). */
-    {
-        uint64_t max_rate = 0, asked_rate = 0;
-        char why[256];
-        if (!lsp_plan_tree_fee_rate(lsp_p, &lsp_p->factory, lsp_p->n_clients,
-                                    funding_sats, step_blocks, states_per_layer,
-                                    /* any CLTV: a distribution TX exists */ 1,
-                                    &max_rate, &asked_rate, why, sizeof(why))) {
-            fprintf(stderr, "LSP: refusing to fund the factory: its pre-signed exit "
-                    "fees would exceed %d%% of the %llu sat funding (%s); nothing "
-                    "was funded.  Fund more per client or wait for lower fees.\n",
-                    FACTORY_MAX_EXIT_FEE_PCT, (unsigned long long)funding_sats, why);
-            lsp_cleanup(lsp_p);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        lsp_p->factory.tree_fee_rate_max = max_rate;
-        if (asked_rate > max_rate)
-            printf("LSP: a tree fee rate of %llu sat/kvB would put more than %d%% of the "
-                   "%llu sat funding into pre-signed exit fees; the tree is sized at "
-                   "%llu sat/kvB at most\n", (unsigned long long)asked_rate,
-                   FACTORY_MAX_EXIT_FEE_PCT, (unsigned long long)funding_sats,
-                   (unsigned long long)max_rate);
+    /* A factory with a distribution TX pays every client an output of it,
+       which must fit one TRUC transaction: refused before any funding. */
+    if (lsp_p->n_clients > FACTORY_MAX_DIST_CLIENTS) {
+        fprintf(stderr, "LSP: refusing to fund the factory: %zu clients, more than the "
+                "%d whose distribution TX fits in %d vB (TRUC); nothing was funded\n",
+                lsp_p->n_clients, FACTORY_MAX_DIST_CLIENTS, TRUC_MAX_VSIZE);
+        lsp_cleanup(lsp_p);
+        secp256k1_context_destroy(ctx);
+        return 1;
     }
 
     /* === Phase 3: Fund the factory === */
@@ -4376,9 +4340,6 @@ accept_new_factory:
         }
         printf(" blocks)\n");
     }
-
-    /* Set fee estimator on factory (for computed fees) */
-    lsp_p->factory.fee = fee_est;
 
     /* === Ladder manager initialization (Tier 2) === */
     ladder_t *lad = calloc(1, sizeof(ladder_t));

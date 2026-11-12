@@ -57,30 +57,16 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
-/* Highest tree fee rate (sat/kvB) the client agrees to sign.  The tree's
-   pre-signed fees come out of the factory funding, so an LSP proposing an
-   extreme rate shrinks every channel.  This is the protocol maximum the LSP
-   clamps its estimate to (factory_set_max_tree_fee_rate; default
-   FACTORY_MAX_TREE_FEE_RATE); 0 = no ceiling.  Whatever the ceiling, the
-   client refuses a rate below FEE_PRESIGNED_FLOOR_SAT_PER_KVB: a tree that
-   cannot relay cannot be exited. */
-#define CLIENT_DEFAULT_MAX_TREE_FEE_RATE FACTORY_MAX_TREE_FEE_RATE
+/* This member's own ceiling on the factory's pre-signed tree rate (sat/kvB):
+   a FACTORY_PROPOSE (creation or rotation) above it is refused, so an LSP
+   cannot spend a member's channel on pre-signed fees.  Default
+   CLIENT_DEFAULT_MAX_TREE_FEE_RATE (10 sat/vB); 0 = no ceiling.  Set from
+   --max-tree-fee-rate; nothing has to match the LSP. */
+#define CLIENT_DEFAULT_MAX_TREE_FEE_RATE 10000
 void client_set_max_tree_fee_rate(uint64_t sat_per_kvb);
+uint64_t client_max_tree_fee_rate(void);
 
-/* The client's own ceiling on the tree fee rate, below the protocol
-   maximum: every sat of the tree's pre-signed fees comes out of the factory
-   funding, so a client that signs whatever rate the LSP proposes lets the
-   LSP spend its channel on fees.  0 = none (only the protocol maximum).
-   --max-signed-tree-fee-rate sets it; client_apply_network_defaults gives
-   mainnet CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE when it was not set. */
-#define CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE 10000   /* 10 sat/vB */
-void client_set_max_signed_tree_fee_rate(uint64_t sat_per_kvb);
-uint64_t client_max_signed_tree_fee_rate(void);
-/* Network defaults for settings the operator did not give. */
-void client_apply_network_defaults(const char *network);
-
-/* 1 if the client would sign a tree at sat_per_kvb: at least the pre-signed
-   floor, at most the protocol maximum and the client's own ceiling. */
+/* 1 if sat_per_kvb is within this member's ceiling (0 is always). */
 int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb);
 
 /* Optional callback to verify the funding TX on-chain before signing the

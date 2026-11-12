@@ -226,7 +226,7 @@ static void cs_output(tx_output_t *o, uint64_t amount, const unsigned char *spk3
 /* ---- Cooperative close ---- */
 
 #define CS_CHAN_FUNDING 400000  /* sats in the leaf output funding a channel */
-#define CS_COMMIT_FEE 154       /* base commitment fee at 1000 sat/kvB */
+#define CS_COMMIT_FEE 167       /* base commitment fee at 1000 sat/kvB (167 vB) */
 
 /* A channel whose state adds up: the client holds `local`, the LSP the rest
    of the funding output. */
@@ -234,6 +234,7 @@ static void cs_channel(channel_t *ch, uint64_t local) {
     memset(ch, 0, sizeof(*ch));
     ch->funding_amount = CS_CHAN_FUNDING;
     ch->fee_rate_sat_per_kvb = 1000;
+    ch->commit_fee_rate_sat_per_kvb = 1000;
     ch->local_amount = local;
     ch->remote_amount = CS_CHAN_FUNDING - CS_COMMIT_FEE - local;
 }

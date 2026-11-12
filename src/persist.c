@@ -1396,14 +1396,22 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
-    /* v40: the rate (sat/kvB) the tree's pre-signed txs were sized at.  The
-       tree is rebuilt from it on load, so it must match what was signed.
-       fee_per_tx keeps the mean per-node fee, for reporting. */
+    /* v40: the agreed rate (sat/kvB) every pre-signed tree tx pays.  The
+       tree is rebuilt from it on load, so it must match what was signed.  0
+       is a valid rate, so rows written before v40 (whose trees paid a flat
+       per-node fee) get NULL and are refused on load.  fee_per_tx keeps the
+       mean per-node fee, for reporting. */
     if (db_version < 40) {
         sqlite3_exec(p->db,
-            "ALTER TABLE factories ADD COLUMN tree_fee_rate INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE factories ADD COLUMN tree_fee_rate INTEGER;",
             NULL, NULL, NULL);
     }
+    /* v40 (cont.): the rate a channel's commitment pays (the factory's
+       agreed rate), separate from the penalty/HTLC rate fee_rate_sat_per_kvb.
+       Rows written before it get 1000, the rate both were then. */
+    sqlite3_exec(p->db,
+        "ALTER TABLE channels ADD COLUMN commit_fee_rate_sat_per_kvb INTEGER NOT NULL DEFAULT 1000;",
+        NULL, NULL, NULL);
     /* v40 (cont.): the factory's lifecycle (block it was created at, ACTIVE
        and DYING lengths), so a restart keeps its expiry instead of starting
        a new lifetime; 0 = not recorded.  Added whenever missing (an ALTER of
@@ -2375,6 +2383,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint16_t step_blocks = (uint16_t)sqlite3_column_int(stmt, 4);
     uint32_t states_per_layer = (uint32_t)sqlite3_column_int(stmt, 5);
     uint32_t cltv_timeout = (uint32_t)sqlite3_column_int(stmt, 6);
+    int has_tree_fee_rate = sqlite3_column_type(stmt, 7) != SQLITE_NULL;
     uint64_t tree_fee_rate = (uint64_t)sqlite3_column_int64(stmt, 7);
     int leaf_arity_raw = sqlite3_column_int(stmt, 8);
     factory_arity_t leaf_arity =
@@ -2409,14 +2418,14 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         return 0;
     }
     /* The tree is rebuilt at the rate it was signed at.  A row without one
-       (written before schema v40, where the column defaults to 0) would be
-       rebuilt at the floor rate: different amounts, different txids, and no
-       signature for any of them. */
-    if (tree_fee_rate < FEE_PRESIGNED_FLOOR_SAT_PER_KVB) {
-        fprintf(stderr, "persist_load_factory: ERROR: factory %u has no tree fee "
-                "rate (%llu sat/kvB; written before schema v40?): its signed tree "
-                "cannot be rebuilt from this row; refusing to load it\n",
-                factory_id, (unsigned long long)tree_fee_rate);
+       was written before schema v40, when every node paid a flat per-node
+       fee: rebuilt at an agreed rate it would have different amounts and
+       txids, and no signature for any of them. */
+    if (!has_tree_fee_rate) {
+        fprintf(stderr, "persist_load_factory: ERROR: factory %u was written before "
+                "schema v40 (flat per-node tree fees, no agreed tree rate): its signed "
+                "tree cannot be rebuilt from this row; refusing to load it\n",
+                factory_id);
         sqlite3_finalize(stmt);
         return 0;
     }
@@ -2740,8 +2749,8 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
         "(id, factory_id, slot, local_amount, remote_amount, funding_amount, "
         " commitment_number, funding_txid, funding_vout, state, "
         " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
-        " funding_pending_reorg) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?);";
+        " funding_pending_reorg, commit_fee_rate_sat_per_kvb) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -2760,6 +2769,7 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     sqlite3_bind_int64(stmt, 11, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
     sqlite3_bind_int(stmt, 12, ch->use_revocation_leaf);
     sqlite3_bind_int(stmt, 13, ch->funding_pending_reorg);
+    sqlite3_bind_int64(stmt, 14, (sqlite3_int64)ch->commit_fee_rate_sat_per_kvb);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);

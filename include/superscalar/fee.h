@@ -46,26 +46,31 @@ uint64_t fee_for_htlc_tx(fee_estimator_t *fe);
 /* CPFP child tx is ~264 vB (2-in keypath, 1-out P2TR) — uses URGENT rate. */
 uint64_t fee_for_cpfp_child(fee_estimator_t *fe);
 
-/* Commitment tx is 154 vB base + 43 vB per active HTLC — uses NORMAL rate. */
+/* fee_commitment_tx_at at fe's NORMAL rate (0 without a rate): for a
+   channel whose rate follows an estimate (JIT).  Factory channels use the
+   factory's agreed rate. */
 uint64_t fee_for_commitment_tx(fee_estimator_t *fe, size_t n_htlcs);
 
-/* The same commitment fee at a given rate (sat/kvB). */
+/* Virtual size of a signed commitment with n_htlcs HTLC/PTLC outputs: one
+   key-path input, to_local, to_remote, the HTLC outputs and the P2A anchor
+   (167 vB with none). */
+size_t fee_commitment_tx_vsize(size_t n_htlcs);
+
+/* Fee of that commitment at the channel's agreed rate (sat/kvB): the one
+   place the commitment fee is computed, by both co-signers.  The base fee
+   (n_htlcs 0) is reserved out of the channel funding; each HTLC/PTLC output
+   adds fee_commitment_tx_at(rate, n + 1) - fee_commitment_tx_at(rate, n). */
 uint64_t fee_commitment_tx_at(uint64_t sat_per_kvb, size_t n_htlcs);
 
 /* -----------------------------------------------------------------------
  * Exact sizing for pre-signed transactions
  *
- * A pre-signed transaction cannot be re-signed when it is broadcast, so its
- * fee must be sized from its real virtual size and must never fall below what
- * nodes relay.  Bitcoin Core rejects any transaction whose fee is below
- * -minrelaytxfee x vsize (default 1000 sat/kvB), even inside a package unless
- * the transaction is TRUC (nVersion 3).
+ * A pre-signed transaction pays exactly its agreed rate for its real virtual
+ * size; whatever more the network asks for at broadcast time is paid by a
+ * child on its P2A anchor (cpfp.h).  The relay floor is read from the node
+ * (getnetworkinfo relayfee), FEE_FLOOR_SAT_PER_KVB only when it reports
+ * none.
  * --------------------------------------------------------------------- */
-
-/* Bitcoin Core default -minrelaytxfee (sat/kvB). */
-#define FEE_MIN_RELAY_SAT_PER_KVB        1000
-/* Floor for every pre-signed transaction: min relay plus a 25% margin. */
-#define FEE_PRESIGNED_FLOOR_SAT_PER_KVB  1250
 
 /* Serialized sizes used by the vsize helpers. */
 #define FEE_P2TR_OUTPUT_BYTES     43   /* 8 amount + 1 len + 34 spk */
@@ -85,9 +90,5 @@ size_t fee_keypath_tx_vsize(size_t n_inputs, size_t n_p2tr, size_t n_p2a);
 
 /* ceil(sat_per_kvb * vsize / 1000); FEE_INVALID above FEE_MAX_SATS. */
 uint64_t fee_at_rate(uint64_t sat_per_kvb, size_t vsize);
-
-/* Fee for a pre-signed transaction of the given vsize at sat_per_kvb, never
-   below FEE_PRESIGNED_FLOOR_SAT_PER_KVB; FEE_INVALID above FEE_MAX_SATS. */
-uint64_t fee_presigned(uint64_t sat_per_kvb, size_t vsize);
 
 #endif /* SUPERSCALAR_FEE_H */

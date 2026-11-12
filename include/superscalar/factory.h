@@ -169,8 +169,8 @@ typedef struct {
     /* Input amount from parent output */
     uint64_t input_amount;
 
-    /* Miner fee this node's tx pays (input_amount - sum(outputs)), sized from
-       its exact vsize at the factory's tree_fee_rate. */
+    /* Miner fee this node's tx pays (input_amount - sum(outputs)): the
+       factory's tree_fee_rate for its exact vsize. */
     uint64_t fee_sats;
 
     /* Timeout script path (staggered per-node CLTV) */
@@ -364,20 +364,12 @@ typedef struct {
     uint16_t step_blocks;
     uint32_t states_per_layer;
 
-    /* Fee rate (sat/kvB) every pre-signed tree transaction is sized at.  Each
-       node pays fee_presigned(tree_fee_rate, its exact vsize), so no node falls
-       below FEE_PRESIGNED_FLOOR_SAT_PER_KVB.  Carried in FACTORY_PROPOSE: the
-       LSP and every client must build the tree at the same rate.  0 = take it
-       from `fee` (NORMAL target, clamped to factory_max_tree_fee_rate) in
-       factory_build_tree, else the floor; factory_build_tree writes the rate
-       it used back here. */
+    /* Rate (sat/kvB) every pre-signed tree transaction pays, for its exact
+       vsize: a factory term, carried in FACTORY_PROPOSE (the LSP and every
+       member build the tree at it).  factory_init* set
+       FACTORY_DEFAULT_TREE_FEE_RATE; 0 is allowed.  The fee the network asks
+       for beyond it is paid at broadcast time by a child on the anchor. */
     uint64_t tree_fee_rate;
-    fee_estimator_t *fee;  /* LSP side: source of tree_fee_rate when it is 0 */
-    /* LSP side: highest tree fee rate that keeps this factory's pre-signed
-       fees within factory_check_presigned_fee_bounds for its funding (set
-       before funding, see lsp_plan_tree_fee_rate); factory_build_tree lowers
-       a higher rate to it.  0 = no such limit. */
-    uint64_t tree_fee_rate_max;
     /* 1: factory_build_tree logs nothing (trial builds while planning). */
     int build_quiet;
 
@@ -762,31 +754,20 @@ void factory_set_funding(factory_t *f,
 
 int factory_build_tree(factory_t *f);
 
-/* Highest tree fee rate (sat/kvB) the protocol agrees on: a client signs no
-   tree above it (client_tree_fee_rate_acceptable) and an LSP whose estimator
-   is above it sizes the tree at it, relying on CPFP through the anchors for
-   the rest.  100 sat/vB. */
-#define FACTORY_MAX_TREE_FEE_RATE 100000
+/* Default pre-signed tree rate (sat/kvB): 0.1 sat/vB, Bitcoin Core's
+   default -minrelaytxfee since 29.1.  The rate is a factory term the LSP
+   proposes (FACTORY_PROPOSE tree_fee_rate, --tree-fee-rate) and every member
+   checks; 0 is allowed.  Nothing derives it from a fee estimate. */
+#define FACTORY_DEFAULT_TREE_FEE_RATE 100
 
-/* Process-wide value of that maximum (default FACTORY_MAX_TREE_FEE_RATE;
-   0 = none), shared by the LSP clamp and the client acceptance check.  Set
-   from --max-tree-fee-rate on both daemons; LSP and clients must agree. */
-void factory_set_max_tree_fee_rate(uint64_t sat_per_kvb);
-uint64_t factory_max_tree_fee_rate(void);
-
-/* Rate (sat/kvB) for the transactions the LSP sizes and pays for itself
-   from an estimate: the rotation's cooperative close, JIT and reallocated
-   channel commitments, the JIT close.  fe's NORMAL rate, clamped to
-   factory_max_tree_fee_rate() as the tree is; 0 when fe gives no rate. */
-uint64_t factory_lsp_fee_rate(fee_estimator_t *fe);
-
-/* Effective tree fee rate (sat/kvB): tree_fee_rate, floored at
-   FEE_PRESIGNED_FLOOR_SAT_PER_KVB. */
-uint64_t factory_tree_fee_rate(const factory_t *f);
+/* Value of the P2A anchor on every tree transaction and the distribution TX:
+   0 (ephemeral dust, Bitcoin Core 29+) when the factory's rate is 0, so that
+   transaction pays no fee at all, else ANCHOR_OUTPUT_AMOUNT. */
+uint64_t factory_tree_anchor_sats(const factory_t *f);
 
 /* Fee paid by a tree transaction with n_inputs taproot key-path inputs and
-   n_p2tr P2TR outputs, plus the P2A anchor when with_anchor is set, at the
-   factory's tree fee rate (exact vsize, floored). */
+   n_p2tr P2TR outputs, plus the P2A anchor when with_anchor is set: exactly
+   the factory's tree_fee_rate for that exact vsize. */
 uint64_t factory_tree_tx_fee(const factory_t *f, size_t n_inputs, size_t n_p2tr,
                              int with_anchor);
 
@@ -797,59 +778,31 @@ uint64_t factory_ps_chain_fee(const factory_t *f);
    plus the P2A anchor it carries when tree anchors are on. */
 uint64_t factory_ps_chain_reserve(const factory_t *f);
 
-/* Lowest rate (sat/kvB) a distribution TX above TRUC_MAX_VSIZE (about 231
-   clients and more) is signed at.  Such a TX is nVersion 2: a node takes it
-   in a package only if it meets the minimum relay fee on its own, and with
-   no TRUC limits anyone can attach a large child to its anchor to pin it.
-   It is signed at this rate, or the tree rate when that is higher, and the
-   fee comes from the LSP's share (factory_compute_distribution_outputs*).
-   LSP and clients must use the same value.  20 sat/vB. */
-#define FACTORY_DIST_NON_TRUC_FEE_RATE 20000
-void factory_set_dist_non_truc_fee_rate(uint64_t sat_per_kvb);
-uint64_t factory_dist_non_truc_fee_rate(void);
-
-/* Rate (sat/kvB) the distribution TX of a factory with n_clients clients is
-   signed at: the tree fee rate, raised to factory_dist_non_truc_fee_rate()
-   when that TX is not TRUC (factory_distribution_tx_version). */
-uint64_t factory_distribution_fee_rate(const factory_t *f, size_t n_clients);
-
-/* Fee paid by the distribution TX of a factory with n_clients clients
-   (n_clients P2TR outputs + the P2A anchor), at
-   factory_distribution_fee_rate. */
-uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients);
-
 /* Largest transaction TRUC policy accepts (BIP 431). */
 #define TRUC_MAX_VSIZE 10000
 
-/* nVersion of the distribution TX: TRUC while it fits under TRUC_MAX_VSIZE
-   (about 230 clients), else 2.  Above that size it can only be bumped while
-   it meets the minimum relay feerate on its own. */
-uint32_t factory_distribution_tx_version(size_t n_clients);
+/* Most clients a factory with a distribution TX can have: that TX (nVersion
+   3, one P2TR output per client plus the anchor) must stay within
+   TRUC_MAX_VSIZE, the only way a transaction below the relay floor is
+   relayed with a child.  230 clients take 9971 vB, 231 take 10014. */
+#define FACTORY_MAX_DIST_CLIENTS 230
 
-/* Recompute every built node's fee from its unsigned transaction bytes
-   (input amount minus outputs, over the exact vsize with key-path
-   witnesses) and check it pays at least min_sat_per_kvb.  Returns 1 if every
-   node does; otherwise 0, with the first failing node index in *bad_node_out
-   (optional).  Both sides run this before signing the tree. */
-int factory_check_tree_fees(const factory_t *f, uint64_t min_sat_per_kvb,
-                            size_t *bad_node_out);
+/* Virtual size of the signed distribution TX of a factory with n_clients
+   clients. */
+size_t factory_distribution_tx_vsize(size_t n_clients);
 
-/* Most an exit path may pay in pre-signed fees, in percent of the factory
-   funding (see factory_check_presigned_fee_bounds). */
-#define FACTORY_MAX_EXIT_FEE_PCT 25
+/* Fee paid by that distribution TX: the tree rate for its exact vsize. */
+uint64_t factory_distribution_fee(const factory_t *f, size_t n_clients);
 
-/* Sanity bounds on what the pre-signed exit transactions pay, recomputed from
-   the built transactions independently of the fee helpers that sized them.
-   The LSP and every client run this before signing anything:
-   - no tree node pays more than ceil(tree fee rate x its real vsize / 1000);
-   - the whole tree (every node: the complete unilateral exit) pays at most
-     FACTORY_MAX_EXIT_FEE_PCT percent of the funding in fees;
-   - when the factory has a distribution TX (cltv_timeout > 0), its fee is
-     payable, matches the tree fee rate for its size, and is at most
-     FACTORY_MAX_EXIT_FEE_PCT percent of the funding.
-   Returns 1 if all hold; otherwise 0 with the reason in why (optional). */
-int factory_check_presigned_fee_bounds(const factory_t *f, char *why,
-                                       size_t why_len);
+/* Check every built node, and the distribution TX when one is built, from
+   the transaction bytes and the parent outputs, independently of the code
+   that sized them: nVersion 3, a P2A anchor (last) worth
+   factory_tree_anchor_sats, a fee of exactly the agreed tree_fee_rate for
+   the exact signed vsize.  At rate 0 every node must carry the anchor (it
+   has no other way to get a fee).  The LSP and every member run this before
+   signing anything.  Returns 1 if all hold; otherwise 0 with the reason in
+   why (optional). */
+int factory_check_tree_fees(const factory_t *f, char *why, size_t why_len);
 
 int factory_sign_all(factory_t *f);
 int factory_verify_all(factory_t *f);

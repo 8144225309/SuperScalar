@@ -9,9 +9,6 @@
  * FC1:  test_force_close_msg_error_no_wt   — MSG_ERROR with NULL watchtower → no crash
  * FC2:  test_force_close_msg_error_wired   — MSG_ERROR with watchtower → entry registered
  * FC3:  test_force_close_msg_error_return  — MSG_ERROR returns 17
- * FE1:  test_fee_anchor_guard_null         — fee_should_use_anchor(NULL) == 1
- * FE2:  test_fee_anchor_guard_low_rate     — 0-rate estimator → returns 0
- * FE3:  test_fee_anchor_guard_normal_rate  — 1000+ sat/kvB → returns 1
  * CS1:  test_watchtower_init_fee_est       — watchtower_init with fee_est != NULL
  * CS2:  test_watchtower_build_cpfp_no_wlt  — build_cpfp_tx with NULL wallet → 0
  * CS3:  test_watchtower_add_pending        — add_pending_tx creates entry
@@ -256,38 +253,6 @@ int test_force_close_msg_error_return(void)
 
     int r = ln_dispatch_process_msg(&d, -1, msg, sizeof(msg));
     ASSERT(r == 17, "FC3: MSG_ERROR always returns 17");
-    return 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Fee estimator anchor guard tests                                    */
-/* ------------------------------------------------------------------ */
-
-int test_fee_anchor_guard_null(void)
-{
-    /* NULL fee estimator → default to 1 (use anchor) */
-    int result = fee_should_use_anchor(NULL);
-    ASSERT(result == 1, "FE1: NULL fee_est → use anchor");
-    return 1;
-}
-
-int test_fee_anchor_guard_low_rate(void)
-{
-    /* 0-rate static estimator → below 1000 sat/kvB → don't use anchor */
-    fee_estimator_static_t fe;
-    fee_estimator_static_init(&fe, 0);
-    int result = fee_should_use_anchor(&fe.base);
-    ASSERT(result == 0, "FE2: 0-rate → don't use anchor");
-    return 1;
-}
-
-int test_fee_anchor_guard_normal_rate(void)
-{
-    /* 10000 sat/kvB (10 sat/vB) → should use anchor */
-    fee_estimator_static_t fe;
-    fee_estimator_static_init(&fe, 10000);
-    int result = fee_should_use_anchor(&fe.base);
-    ASSERT(result == 1, "FE3: 10000 sat/kvB → use anchor");
     return 1;
 }
 

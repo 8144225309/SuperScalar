@@ -2641,9 +2641,9 @@ static void pp_advance(ladder_t *lad, uint32_t h) {
    current estimate postpones it: not a failed attempt, retried on every
    block while the factory is DYING with the retry budget intact; only once
    the factory has expired does the next retry tick fall back to the
-   distribution TX.  A replacement tree whose pre-signed fees exceed the
-   bound even at the floor rate does not depend on the fee market: that
-   attempt fails and uses a retry. */
+   distribution TX.  A replacement tree that cannot be built at the agreed
+   rate does not depend on the fee market: that attempt fails and uses a
+   retry. */
 int test_rotation_postponed_on_fees_changes_nothing(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_keypair lsp_kp, client_kps[4];
@@ -2716,6 +2716,7 @@ int test_rotation_postponed_on_fees_changes_nothing(void) {
     mgr->rot_fee_est = &fe.base;
     memcpy(mgr->rot_lsp_seckey, lsp_sec, 32);
     mgr->rot_leaf_arity = FACTORY_ARITY_2;
+    mgr->rot_tree_fee_rate = FACTORY_DEFAULT_TREE_FEE_RATE;
     mgr->rot_step_blocks = 4;
     mgr->rot_states_per_layer = 4;
     mgr->rot_max_retries = 3;
@@ -2743,15 +2744,15 @@ int test_rotation_postponed_on_fees_changes_nothing(void) {
 
     /* 1. the new factory's tree fits (enough funding), but the full close of
           the old one would cost more than half its 50000 sat funding at the
-          clamped spike rate (283 vB x 100 sat/vB): postponed */
+          spike rate (283 vB x 300 sat/vB): postponed */
     mgr->rot_funding_sats = 1000000;
     lsp->factory.funding_amount_sats = 50000;
     int rc1 = lsp_channels_rotate_factory(mgr, lsp);
     int retry_same = lsp_rotation_should_retry(mgr, 0, 110);
     int retry_next = lsp_rotation_should_retry(mgr, 0, 111);
-    /* 2. the new factory's pre-signed fees exceed the bound even at the
-          floor rate: the attempt fails, and the daemon records the failure */
-    mgr->rot_funding_sats = 5000;
+    /* 2. the new factory's tree cannot be built from its funding: the
+          attempt fails, and the daemon records the failure */
+    mgr->rot_funding_sats = 1500;
     pp_advance(lad, 111);
     int rc2 = lsp_channels_rotate_factory(mgr, lsp);
     lsp_rotation_record_failure(mgr, 0, 111);
@@ -2796,7 +2797,7 @@ int test_rotation_postponed_on_fees_changes_nothing(void) {
            g_pp_wallet, g_pp_sends, cer[0], cer[1], (unsigned)count_dying,
            (unsigned)mgr->rot_retry_count[0]);
     TEST_ASSERT_EQ(rc1, LSP_ROTATE_POSTPONED, "close fee: postponed");
-    TEST_ASSERT_EQ(rc2, LSP_ROTATE_FAILED, "tree fees above the bound at the floor: failed");
+    TEST_ASSERT_EQ(rc2, LSP_ROTATE_FAILED, "no buildable replacement tree: failed");
     TEST_ASSERT(all_postponed, "postponed on every block of the spike");
     TEST_ASSERT(expired, "factory expired at 120");
     TEST_ASSERT_EQ(rc4, LSP_ROTATE_POSTPONED, "postponed after expiry");

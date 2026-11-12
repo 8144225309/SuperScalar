@@ -662,65 +662,38 @@ int test_fee_penalty_tx(void) {
     return 1;
 }
 
-/* Test 10: factory tx fee follows the exact vsize, anchor included, and never
-   drops below the pre-signed floor. */
+/* Test 10: factory tx fee follows the exact vsize, anchor included, at
+   exactly the given rate (no floor). */
 int test_fee_factory_tx(void) {
     /* 1-in key-path: 10.5 overhead + 57.5 input = 68; + 43 per P2TR, + 13 P2A */
     TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 1, 0), 111, "1 P2TR: 111 vB");
     TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 3, 0), 197, "3 P2TR: 197 vB");
     TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 3, 1), 210, "3 P2TR + P2A: 210 vB");
     TEST_ASSERT_EQ(fee_keypath_tx_vsize(3, 3, 0), 312, "3-in 3-out: 312 vB");
-
-    /* At 1 sat/vB the 1250 sat/kvB floor applies: ceil(1.25 * vsize) */
-    uint64_t fee1 = fee_presigned(1000, fee_keypath_tx_vsize(1, 1, 0));
-    uint64_t fee3a = fee_presigned(1000, fee_keypath_tx_vsize(1, 3, 1));
-    TEST_ASSERT_EQ(fee1, 139, "1 output at floor");
-    TEST_ASSERT_EQ(fee3a, 263, "3 outputs + anchor at floor");
-    TEST_ASSERT(fee3a >= 210, "pays min relay for 210 vB");
-
-    /* 5 sat/vB: above the floor */
-    TEST_ASSERT_EQ(fee_presigned(5000, fee_keypath_tx_vsize(1, 3, 1)), 1050,
-                   "5 sat/vB x 210 vB");
-    TEST_ASSERT_EQ(fee_presigned(0, 210), 263, "rate 0 still pays the floor");
-    TEST_ASSERT_EQ(fee_at_rate(1000, 210), 210, "fee_at_rate is plain ceil");
+    TEST_ASSERT_EQ(fee_at_rate(100, 210), 21, "0.1 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_at_rate(1000, 210), 210, "1 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_at_rate(5000, 210), 1050, "5 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_at_rate(0, 210), 0, "rate 0 pays nothing");
     return 1;
 }
 
-/* Test: commitment tx fee scales with n_htlcs */
+/* Test: commitment tx fee follows the exact vsize (167 vB + 43 per HTLC,
+   the anchor included) */
 int test_fee_commitment_tx(void) {
     fee_estimator_static_t fe;
     fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
-
-    /* 154 vB base at 1 sat/vB */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 0), 154,
-                   "0 HTLCs: 154 vB = 154 sats");
-    /* 154 + 43 = 197 */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 1), 197,
-                   "1 HTLC: 197 vB = 197 sats");
-    /* 154 + 86 = 240 */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 2), 240,
-                   "2 HTLCs: 240 vB = 240 sats");
-    /* 154 + 129 = 283 */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 3), 283,
-                   "3 HTLCs: 283 vB = 283 sats");
-
-    /* Must scale with HTLC count */
-    TEST_ASSERT(fee_for_commitment_tx((fee_estimator_t *)&fe, 3) >
-                fee_for_commitment_tx((fee_estimator_t *)&fe, 1),
-                "fee scales up with HTLC count");
-
-    /* NULL guard */
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 0), 167,
+                   "0 HTLCs: 167 vB = 167 sats");
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 1), 210,
+                   "1 HTLC: 210 vB");
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 2), 253,
+                   "2 HTLCs: 253 vB");
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 3), 296,
+                   "3 HTLCs: 296 vB");
     TEST_ASSERT_EQ(fee_for_commitment_tx(NULL, 0), 0, "NULL fe returns 0");
-
-    /* At 5 sat/vB (5000 sat/kvB): 5000*154/1000 = 770 */
-    fee_estimator_static_t fe5;
-    fee_estimator_static_init(&fe5, 5000);
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe5, 0), 770,
-                   "0 HTLCs at 5 sat/vB = 770");
-    /* 5000*240/1000 = 1200 — matches regtest fee_estimation_parsing output */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe5, 2), 1200,
-                   "2 HTLCs at 5 sat/vB = 1200");
-
+    TEST_ASSERT_EQ(fee_commitment_tx_at(5000, 0), 835, "0 HTLCs at 5 sat/vB");
+    TEST_ASSERT_EQ(fee_commitment_tx_at(5000, 2), 1265, "2 HTLCs at 5 sat/vB");
+    TEST_ASSERT_EQ(fee_commitment_tx_at(100, 0), 17, "0 HTLCs at 0.1 sat/vB");
     return 1;
 }
 

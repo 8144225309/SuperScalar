@@ -124,6 +124,11 @@ typedef struct {
     /* Config */
     uint32_t to_self_delay;
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
+    /* sat/kvB the commitment pays (fee_commitment_tx_at): both co-signers
+       use it for the base fee reserved out of the funding and for each
+       HTLC/PTLC output.  A factory channel takes the factory's agreed tree
+       rate; channel_init sets 1000. */
+    uint64_t commit_fee_rate_sat_per_kvb;
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
     int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
@@ -397,6 +402,9 @@ int channel_build_penalty_tx_script_path(const channel_t *ch,
 /* Set the fee rate (sat/kvB) used for penalty/HTLC transactions.
    Default is 1000 sat/kvB (1 sat/vB). */
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb);
+
+/* Set the rate the commitment pays (commit_fee_rate_sat_per_kvb). */
+void channel_set_commit_fee_rate(channel_t *ch, uint64_t sat_per_kvb);
 
 /* Attach a persistence target for revocation secrets.  After this is set,
    channel_receive_revocation_flat() writes each received secret to the

@@ -218,7 +218,7 @@ int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
     {
         const char *cfg_sql =
             "SELECT to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
-            "       funding_pending_reorg "
+            "       funding_pending_reorg, commit_fee_rate_sat_per_kvb "
             "FROM channels WHERE id = ?;";
         sqlite3_stmt *cfg_stmt;
         if (sqlite3_prepare_v2(p->db, cfg_sql, -1, &cfg_stmt, NULL) == SQLITE_OK) {
@@ -228,9 +228,12 @@ int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
                 out_ch->fee_rate_sat_per_kvb = (uint64_t)sqlite3_column_int64(cfg_stmt, 1);
                 out_ch->use_revocation_leaf = sqlite3_column_int(cfg_stmt, 2);
                 out_ch->funding_pending_reorg = sqlite3_column_int(cfg_stmt, 3);
+                out_ch->commit_fee_rate_sat_per_kvb =
+                    (uint64_t)sqlite3_column_int64(cfg_stmt, 4);
             } else {
                 out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
                 out_ch->fee_rate_sat_per_kvb = 1000;
+                out_ch->commit_fee_rate_sat_per_kvb = 1000;
                 out_ch->use_revocation_leaf = 0;
                 out_ch->funding_pending_reorg = 0;
             }
@@ -238,6 +241,7 @@ int persist_load_channel_for_watchtower(persist_t *p, uint32_t channel_id,
         } else {
             out_ch->to_self_delay = CHANNEL_DEFAULT_CSV_DELAY;
             out_ch->fee_rate_sat_per_kvb = 1000;
+            out_ch->commit_fee_rate_sat_per_kvb = 1000;
             out_ch->use_revocation_leaf = 0;
             out_ch->funding_pending_reorg = 0;
         }
