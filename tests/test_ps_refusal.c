@@ -297,6 +297,9 @@ static int run_ceremony(const char *dbpath, const ceremony_opts_t *o,
         persist_t db;
         if (!persist_open(&db, dbpath)) _exit(3);
         client_set_persist(&db);
+        /* Tree advances are refused unless the harness opts in; opt in so
+           the proposal reaches the record-and-refuse path under test. */
+        client_set_allow_tree_advance(1);
         child_hook_state_t st;
         memset(&st, 0, sizeof st);
         st.o = o;
@@ -318,6 +321,7 @@ static int run_ceremony(const char *dbpath, const ceremony_opts_t *o,
         propose.json = wire_build_leaf_advance_propose(0, NULL, NULL);
         int rc = client_handle_leaf_advance(sv[1], ctx, &kps[1], f, 1, &propose);
         cJSON_Delete(propose.json);
+        client_set_allow_tree_advance(0);
         client_set_persist(NULL);
         persist_test_set_ps_hook(NULL, NULL);
         persist_close(&db);

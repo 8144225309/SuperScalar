@@ -180,7 +180,6 @@ int test_reconnect_pubkey_match(void) {
         all_pks[i + 1] = client_pks[i];
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) { free(lsp->client_fds); free(lsp->client_pubkeys); free(lsp); return 0; }
     factory_init_from_pubkeys(factory, ctx, all_pks, 5, 10, 4);
 
@@ -189,6 +188,7 @@ int test_reconnect_pubkey_match(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     factory_build_tree(factory);
     lsp->factory = *factory;
@@ -397,7 +397,6 @@ int test_client_persist_reload(void) {
 
     /* Build factory */
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -406,7 +405,9 @@ int test_client_persist_reload(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
+    factory->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
     /* Initialize a channel (client 0 = participant index 1) */
@@ -425,6 +426,7 @@ int test_client_persist_reload(void) {
 
     /* Save factory */
     TEST_ASSERT(persist_save_factory(&db, factory, ctx, 0), "persist_save_factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, factory, 0), "persist_save_tree_nodes");
 
     /* Save channel */
     TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "persist_save_channel");
@@ -567,7 +569,6 @@ int test_balance_reporting(void) {
     }
 
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, pks, 5, 10, 4);
 
@@ -576,6 +577,7 @@ int test_balance_reporting(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
@@ -1581,6 +1583,7 @@ int test_keyfile_wrong_passphrase(void) {
 
 int test_keyfile_generate(void) {
     const char *path = "/tmp/test_superscalar_keyfile3.dat";
+    unlink(path);
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -1792,6 +1795,7 @@ int test_factory_lifecycle_daemon_check(void) {
     s = factory_get_state(f, 200);
     TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 200 = EXPIRED");
 
+    factory_free(f);
     free(f);
     return 1;
 }
@@ -1927,6 +1931,12 @@ int test_dw_counter_tracks_advance(void) {
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
 
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]);
+
 /* Test: ladder daemon integration — advance block, verify state transitions */
 int test_ladder_daemon_integration(void) {
     secp256k1_context *ctx = test_ctx();
@@ -1968,7 +1978,8 @@ int test_ladder_daemon_integration(void) {
     ladder_advance_block(lad, 130);
     TEST_ASSERT_EQ(lf->cached_state, FACTORY_EXPIRED, "EXPIRED at 130");
 
-    tx_buf_free(&lf->distribution_tx);
+    ladder_free(lad);   /* the slot's detached factory copy + distribution_tx */
+    factory_free(f);
     free(f);
     free(lad);
     secp256k1_context_destroy(ctx);
@@ -1992,7 +2003,6 @@ int test_distribution_tx_amounts(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 1, 4);
 
@@ -2001,6 +2011,7 @@ int test_distribution_tx_amounts(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     factory_set_lifecycle(f, 100, 20, 10);
     f->cltv_timeout = 135;
@@ -2071,6 +2082,7 @@ int test_turnover_extract_and_close(void) {
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
 
+    TEST_ASSERT(test_funding_spk_from_pubkeys(ctx, pks, 5, fake_spk), "funding spk");
     TEST_ASSERT(ladder_create_factory(lad, &kps[1], 4, 100000,
                                         fake_txid, 0, fake_spk, 34),
                 "ladder_create_factory");
@@ -2287,8 +2299,8 @@ int test_multi_factory_ladder_monitor(void) {
     /* Factory 0: created at block 100 */
     unsigned char txid0[32];
     memset(txid0, 0xF0, 32);
-    unsigned char spk[34] = {0x51, 0x20};
-    memset(spk + 2, 0xAA, 32);
+    unsigned char spk[34];
+    TEST_ASSERT(test_funding_spk_from_keys(ctx, &lsp_kp, client_kps, 4, spk), "funding spk");
     TEST_ASSERT(ladder_create_factory(lad, client_kps, 4,
                 100000, txid0, 0, spk, 34), "create factory 0");
     lad->factories[0].factory.created_block = 100;
@@ -2500,6 +2512,7 @@ static int setup_reconnect_env(secp256k1_context **ctx_out,
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     factory_build_tree(factory);
 
@@ -2586,7 +2599,6 @@ int test_reconnect_commitment_mismatch_rollback(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2656,7 +2668,6 @@ int test_reconnect_commitment_mismatch_reject(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2723,6 +2734,188 @@ int test_reconnect_commitment_mismatch_reject(void) {
     return 1;
 }
 
+/* Child for a reconnect with a commitment pending: nonce exchange, then the
+   retransmitted COMMITMENT_SIGNED is answered according to `mode`:
+     0  REVOKE_AND_ACK with `secret` (expects RECONNECT_ACK if `expect_ack`,
+        the connection closed otherwise)
+     1  something that is not a REVOKE_AND_ACK, then nothing
+     2  a REVOKE_AND_ACK that does not parse */
+static void child_reconnect_pending_cs(int fd, int client_idx,
+                                        secp256k1_pubkey lsp_pk,
+                                        unsigned char client_sec[32],
+                                        int mode, const unsigned char *secret,
+                                        int expect_ack) {
+    secp256k1_context *cctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    secp256k1_pubkey cpk;
+    if (!secp256k1_ec_pubkey_create(cctx, &cpk, client_sec)) _exit(1);
+
+    wire_msg_t nm;
+    if (!wire_recv(fd, &nm)) _exit(2);
+    if (nm.msg_type != MSG_CHANNEL_NONCES) _exit(3);
+    cJSON_Delete(nm.json);
+
+    unsigned char nonces[MUSIG_NONCE_POOL_MAX][66];
+    memset(nonces, 0, sizeof(nonces));
+    for (size_t i = 0; i < MUSIG_NONCE_POOL_MAX; i++) {
+        secp256k1_musig_secnonce sn;
+        secp256k1_musig_pubnonce pn;
+        musig_keyagg_t ka;
+        secp256k1_pubkey pks[2] = {lsp_pk, cpk};
+        musig_aggregate_keys(cctx, &ka, pks, 2);
+        musig_generate_nonce(cctx, &sn, &pn, client_sec, &cpk, &ka.cache);
+        musig_pubnonce_serialize(cctx, nonces[i], &pn);
+    }
+    cJSON *reply = wire_build_channel_nonces((uint32_t)client_idx,
+        (const unsigned char (*)[66])nonces, MUSIG_NONCE_POOL_MAX);
+    wire_send(fd, MSG_CHANNEL_NONCES, reply);
+    cJSON_Delete(reply);
+
+    /* The pending commitment, sent again */
+    wire_msg_t cs;
+    for (;;) {
+        if (!wire_recv(fd, &cs)) _exit(4);
+        if (cs.msg_type == MSG_COMMITMENT_SIGNED) break;
+        if (cs.msg_type == MSG_RECONNECT_ACK) _exit(7);
+        if (cs.msg_type != MSG_UPDATE_ADD_HTLC) _exit(5);
+        cJSON_Delete(cs.json);      /* the HTLC in flight, sent again */
+    }
+    cJSON_Delete(cs.json);
+
+    if (mode == 0) {
+        cJSON *raa = wire_build_revoke_and_ack((uint32_t)client_idx, secret, cctx, &cpk);
+        wire_send(fd, MSG_REVOKE_AND_ACK, raa);
+        cJSON_Delete(raa);
+    } else if (mode == 1) {
+        cJSON *other = cJSON_CreateObject();
+        wire_send(fd, MSG_REGISTER_INVOICE, other);
+        cJSON_Delete(other);
+        shutdown(fd, SHUT_WR);
+    } else {
+        cJSON *junk = cJSON_CreateObject();
+        cJSON_AddStringToObject(junk, "revocation_secret", "zz");
+        wire_send(fd, MSG_REVOKE_AND_ACK, junk);
+        cJSON_Delete(junk);
+    }
+
+    wire_msg_t after;
+    int got = wire_recv_timeout(fd, &after, 20);
+    int acked = got && after.msg_type == MSG_RECONNECT_ACK;
+    if (got && after.json) cJSON_Delete(after.json);
+    close(fd);
+    secp256k1_context_destroy(cctx);
+    _exit(acked == (expect_ack != 0) ? 0 : 6);
+}
+
+/* A commitment pending at reconnect is settled by the client's valid
+   revocation only; anything else refuses the reconnect, disconnects the
+   client and keeps the commitment pending. */
+int test_reconnect_pending_commitment_needs_revocation(void) {
+    unsigned char good[32], bad[32];
+    memset(good, 0x41, 32);
+    memset(bad, 0x42, 32);
+
+    /* mode: 0 bad secret, 1 other message, 2 unparseable, 3 valid secret */
+    for (int round = 0; round < 4; round++) {
+        secp256k1_context *ctx;
+        unsigned char lsp_sec[32];
+        secp256k1_pubkey lsp_pk;
+        unsigned char client_secs[4][32];
+        secp256k1_pubkey client_pks[4];
+        factory_t *factory = calloc(1, sizeof(factory_t));
+        if (!factory) return 0;
+        lsp_t *lsp = calloc(1, sizeof(lsp_t));
+        if (!lsp) { free(factory); return 0; }
+        lsp_channel_mgr_t mgr;
+        persist_t db;
+        TEST_ASSERT(setup_reconnect_env(&ctx, lsp_sec, &lsp_pk, client_pks,
+                    client_secs, factory, lsp, &mgr, &db),
+                    "setup_reconnect_env failed");
+
+        /* The LSP offered client 2 an HTLC and sent its commitment; the
+           client's revocation of commitment 0 never arrived */
+        channel_t *ch = &mgr.entries[2].channel;
+        unsigned char h[32], htlc_sec[32];
+        memset(h, 0x43, 32);
+        memset(htlc_sec, 0x44, 32);
+        /* keys the two sides exchange when the channel is set up */
+        channel_set_local_htlc_basepoint(ch, htlc_sec);
+        channel_set_remote_basepoints(ch, &client_pks[2], &client_pks[2],
+                                      &client_pks[2]);
+        channel_set_remote_htlc_basepoint(ch, &client_pks[2]);
+        uint64_t hid;
+        TEST_ASSERT(channel_add_htlc(ch, HTLC_OFFERED, 1000, h, 500, &hid), "HTLC");
+        TEST_ASSERT_EQ(ch->commitment_number, 1, "commitment 1 pending");
+        secp256k1_pubkey committed;
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &committed, good), "point");
+        channel_set_remote_pcp(ch, 0, &committed);
+        {
+            unsigned char ser[33];
+            size_t slen = 33;
+            secp256k1_ec_pubkey_serialize(ctx, ser, &slen, &committed,
+                                          SECP256K1_EC_COMPRESSED);
+            TEST_ASSERT(persist_save_remote_pcp(&db, 2, 0, ser), "point on record");
+        }
+        /* the point for the commitment being signed (the channel keeps two
+           points in memory: this one and the one to be revoked) */
+        channel_set_remote_pcp(ch, 1, &client_pks[2]);
+        channel_set_persist(ch, &db, 2);
+        TEST_ASSERT(persist_update_channel_balance(&db, 2, ch->local_amount,
+                    ch->remote_amount, 1), "state saved");
+        TEST_ASSERT(persist_save_pending_cs(&db, mgr.entries[2].channel_id, 1),
+                    "commitment recorded as pending");
+
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        cJSON *reconn = wire_build_reconnect(ctx, &client_pks[2], 1);
+        TEST_ASSERT(wire_send(sv[1], MSG_RECONNECT, reconn), "send reconnect");
+        cJSON_Delete(reconn);
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(sv[0]);
+            if (round == 3)
+                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2], 0, good, 1);
+            else
+                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2],
+                                           round, bad, 0);
+            _exit(0);
+        }
+        close(sv[1]);
+        int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
+        uint64_t pending = 0;
+        int has_pending = persist_load_pending_cs(&db, mgr.entries[2].channel_id,
+                                                   &pending) && pending == 1;
+        int status;
+        waitpid(pid, &status, 0);
+        TEST_ASSERT(WIFEXITED(status), "child exited");
+        int child_rc = WEXITSTATUS(status);
+        TEST_ASSERT_EQ(child_rc, 0, "client saw what it should");
+
+        if (round == 3) {
+            TEST_ASSERT_EQ(ok, 1, "valid revocation: reconnect accepted");
+            TEST_ASSERT(!has_pending, "commitment no longer pending");
+            TEST_ASSERT(lsp->client_fds[2] == sv[0], "client connected");
+            TEST_ASSERT(lsp_channels_peer_revoked(ch), "revocation stored");
+        } else {
+            TEST_ASSERT_EQ(ok, 0, "reconnect refused");
+            TEST_ASSERT(has_pending, "commitment still pending");
+            TEST_ASSERT_EQ(lsp->client_fds[2], -1, "client disconnected");
+            TEST_ASSERT(!lsp_channels_peer_revoked(ch), "nothing stored");
+        }
+
+        lsp_channels_cleanup(&mgr);
+        persist_close(&db);
+        free(lsp->client_fds);
+        free(lsp->client_pubkeys);
+        free(lsp);
+        factory_free(factory);
+        free(factory);
+        secp256k1_context_destroy(ctx);
+    }
+    return 1;
+}
+
 /* Test 5C: HTLC replay on reconnect (Gap 2C) */
 int test_reconnect_htlc_replay(void) {
     secp256k1_context *ctx;
@@ -2731,7 +2924,6 @@ int test_reconnect_htlc_replay(void) {
     unsigned char client_secs[4][32];
     secp256k1_pubkey client_pks[4];
     factory_t *factory = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(factory);
     if (!factory) return 0;
     lsp_t *lsp = calloc(1, sizeof(lsp_t));
     if (!lsp) { free(factory); return 0; }
@@ -2984,5 +3176,466 @@ int test_regtest_argv_tokenization(void) {
                 "output should contain method");
     free(result);
 
+    return 1;
+}
+
+/* ---- Initial commitment at channel open ---- */
+
+#include "superscalar/tx_builder.h"
+#include <secp256k1_schnorrsig.h>
+
+/* An LSP-side and a client-side channel_t over one 2-of-2 taproot funding
+   output, with basepoints, per-commitment points 0/1 and nonce pools
+   exchanged: the state both sides hold right after the channel-open nonce
+   exchange. */
+static int initial_commitment_pair(secp256k1_context *ctx,
+                                    channel_t *lsp_ch, channel_t *client_ch,
+                                    unsigned char *funding_spk34) {
+    unsigned char lsp_sec[32], client_sec[32], txid[32];
+    memset(lsp_sec, 0x31, 32);
+    memset(client_sec, 0x32, 32);
+    memset(txid, 0xC4, 32);
+    secp256k1_pubkey lsp_pk, client_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &lsp_pk, lsp_sec) ||
+        !secp256k1_ec_pubkey_create(ctx, &client_pk, client_sec)) return 0;
+
+    secp256k1_pubkey order[2] = { client_pk, lsp_pk };
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, order, 2)) return 0;
+    unsigned char ser[32], twk[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, ser, &ka.agg_pubkey)) return 0;
+    sha256_tagged("TapTweak", ser, 32, twk);
+    secp256k1_pubkey tweaked;
+    secp256k1_xonly_pubkey out_key;
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked, &ka.agg_pubkey, twk) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &out_key, NULL, &tweaked)) return 0;
+    build_p2tr_script_pubkey(funding_spk34, &out_key);
+
+    if (!channel_init(lsp_ch, ctx, lsp_sec, &lsp_pk, &client_pk, txid, 0,
+                       100000, funding_spk34, 34, 60000, 39846, 144) ||
+        !channel_init(client_ch, ctx, client_sec, &client_pk, &lsp_pk, txid, 0,
+                       100000, funding_spk34, 34, 39846, 60000, 144)) return 0;
+    lsp_ch->funder_is_local = 1;
+    client_ch->funder_is_local = 0;
+    if (!channel_generate_random_basepoints(lsp_ch) ||
+        !channel_generate_random_basepoints(client_ch)) return 0;
+    channel_set_remote_basepoints(lsp_ch, &client_ch->local_payment_basepoint,
+        &client_ch->local_delayed_payment_basepoint,
+        &client_ch->local_revocation_basepoint);
+    channel_set_remote_basepoints(client_ch, &lsp_ch->local_payment_basepoint,
+        &lsp_ch->local_delayed_payment_basepoint,
+        &lsp_ch->local_revocation_basepoint);
+    channel_set_remote_htlc_basepoint(lsp_ch, &client_ch->local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(client_ch, &lsp_ch->local_htlc_basepoint);
+    for (uint64_t cn = 0; cn < 2; cn++) {
+        secp256k1_pubkey p;
+        if (!channel_get_per_commitment_point(client_ch, cn, &p)) return 0;
+        channel_set_remote_pcp(lsp_ch, cn, &p);
+        if (!channel_get_per_commitment_point(lsp_ch, cn, &p)) return 0;
+        channel_set_remote_pcp(client_ch, cn, &p);
+    }
+
+    if (!channel_init_nonce_pool(lsp_ch, 4) || !channel_init_nonce_pool(client_ch, 4))
+        return 0;
+    unsigned char nonces[4][66];
+    for (size_t i = 0; i < 4; i++)
+        musig_pubnonce_serialize(ctx, nonces[i], &lsp_ch->local_nonce_pool.nonces[i].pubnonce);
+    channel_set_remote_pubnonces(client_ch, (const unsigned char (*)[66])nonces, 4);
+    for (size_t i = 0; i < 4; i++)
+        musig_pubnonce_serialize(ctx, nonces[i], &client_ch->local_nonce_pool.nonces[i].pubnonce);
+    channel_set_remote_pubnonces(lsp_ch, (const unsigned char (*)[66])nonces, 4);
+    return 1;
+}
+
+/* The LSP's COMMITMENT_SIGNED for the client's commitment 0, as sent at
+   channel open.  psig_xor corrupts the partial signature when non-zero. */
+static int initial_commitment_msg(channel_t *lsp_ch, uint64_t claimed_cn,
+                                   unsigned char psig_xor, wire_msg_t *msg) {
+    unsigned char psig[32];
+    uint32_t nidx;
+    if (!channel_create_commitment_partial_sig(lsp_ch, psig, &nidx)) return 0;
+    psig[7] ^= psig_xor;
+    msg->msg_type = MSG_COMMITMENT_SIGNED;
+    msg->json = wire_build_commitment_signed(0, claimed_cn, psig, nidx);
+    return msg->json != NULL;
+}
+
+/* 1 if sig64 is a valid key-path signature for the client's current
+   commitment transaction spending the funding output. */
+static int initial_commitment_sig_valid(secp256k1_context *ctx, const channel_t *client_ch,
+                                         const unsigned char *funding_spk34,
+                                         const unsigned char *sig64) {
+    tx_buf_t tx;
+    tx_buf_init(&tx, 512);
+    unsigned char txid[32], sighash[32];
+    int ok = channel_build_commitment_tx(client_ch, &tx, txid) &&
+             compute_taproot_sighash(sighash, tx.data, tx.len, 0, funding_spk34, 34,
+                                     client_ch->funding_amount, 0xFFFFFFFE);
+    tx_buf_free(&tx);
+    secp256k1_xonly_pubkey out_key;
+    return ok && secp256k1_xonly_pubkey_parse(ctx, &out_key, funding_spk34 + 2) &&
+           secp256k1_schnorrsig_verify(ctx, sig64, sighash, 32, &out_key);
+}
+
+/* The client accepts the LSP's signature for commitment 0 and then holds a
+   fully signed commitment transaction whose first output is its balance. */
+int test_initial_commitment_signed_at_open(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "no signature before open completes");
+
+    wire_msg_t msg;
+    TEST_ASSERT(initial_commitment_msg(&lsp_ch, 0, 0, &msg), "LSP signs commitment 0");
+    TEST_ASSERT(client_handle_initial_commitment_signed(&client_ch, &msg),
+                "client accepts initial commitment");
+    cJSON_Delete(msg.json);
+
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 1, "signature held");
+    TEST_ASSERT_EQ(client_ch.commitment_number, 0, "still at commitment 0");
+    TEST_ASSERT(initial_commitment_sig_valid(ctx, &client_ch, spk,
+                                             client_ch.latest_commitment_sig),
+                "aggregated signature spends the funding output");
+
+    /* output 0 of the client's commitment is its to_local = opening balance */
+    tx_buf_t tx;
+    tx_buf_init(&tx, 512);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&client_ch, &tx, txid), "build commitment");
+    uint64_t out0 = 0;
+    for (int b = 7; b >= 0; b--) out0 = (out0 << 8) | tx.data[47 + b];
+    tx_buf_free(&tx);
+    TEST_ASSERT_EQ(out0, client_ch.local_amount, "to_local equals opening balance");
+
+    /* both sides consumed exactly one nonce, at the same index */
+    TEST_ASSERT_EQ(lsp_ch.remote_nonce_next, 1, "LSP nonce index advanced");
+    TEST_ASSERT_EQ(client_ch.remote_nonce_next, 1, "client nonce index advanced");
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A COMMITMENT_SIGNED that is not for commitment 0, is of another type, or
+   carries a bad partial signature leaves the client without a commitment. */
+int test_initial_commitment_rejects_invalid(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+
+    wire_msg_t msg;
+    TEST_ASSERT(initial_commitment_msg(&lsp_ch, 1, 0, &msg), "build message for commitment 1");
+    TEST_ASSERT(!client_handle_initial_commitment_signed(&client_ch, &msg),
+                "commitment number 1 rejected");
+    msg.msg_type = MSG_REVOKE_AND_ACK;
+    TEST_ASSERT(!client_handle_initial_commitment_signed(&client_ch, &msg),
+                "wrong message type rejected");
+    cJSON_Delete(msg.json);
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored");
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 2");
+    TEST_ASSERT(initial_commitment_msg(&lsp_ch, 0, 0x01, &msg), "build corrupted message");
+    TEST_ASSERT(!client_handle_initial_commitment_signed(&client_ch, &msg),
+                "bad partial signature rejected");
+    cJSON_Delete(msg.json);
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored after bad signature");
+
+    /* and nothing can be persisted for a channel without a signature */
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory DB");
+    TEST_ASSERT(!client_persist_latest_commitment(&db, 0, &client_ch),
+                "no signature, nothing persisted");
+    uint64_t cn = 99;
+    TEST_ASSERT(!persist_load_commitment_sig(&db, 0, &cn, NULL, NULL, NULL, 0),
+                "signed_commitments stays empty");
+    persist_close(&db);
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* The commitment received at open is written to the database and is read
+   back, complete and valid, by a fresh process that has only the file. */
+int test_initial_commitment_persist_reload(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+
+    wire_msg_t msg;
+    TEST_ASSERT(initial_commitment_msg(&lsp_ch, 0, 0, &msg), "LSP signs commitment 0");
+    TEST_ASSERT(client_handle_initial_commitment_signed(&client_ch, &msg), "client accepts");
+    cJSON_Delete(msg.json);
+
+    char path[96];
+    snprintf(path, sizeof(path), "/tmp/test_superscalar_initcommit_%d.db", (int)getpid());
+    unlink(path);
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, path), "open DB file");
+    TEST_ASSERT(client_persist_latest_commitment(&db, 0, &client_ch), "persist commitment 0");
+    persist_close(&db);
+
+    /* expected bytes: the unsigned commitment finalized with the signature */
+    tx_buf_t unsigned_tx, expect;
+    tx_buf_init(&unsigned_tx, 512);
+    tx_buf_init(&expect, 512);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&client_ch, &unsigned_tx, txid), "build commitment");
+    TEST_ASSERT(finalize_signed_tx(&expect, unsigned_tx.data, unsigned_tx.len,
+                                   client_ch.latest_commitment_sig), "finalize");
+    tx_buf_free(&unsigned_tx);
+
+    persist_t db2;
+    TEST_ASSERT(persist_open(&db2, path), "reopen DB file");
+    uint64_t cn = 99;
+    unsigned char sig[64], tx[4096];
+    size_t tx_len = 0;
+    memset(sig, 0, sizeof(sig));
+    TEST_ASSERT(persist_load_commitment_sig(&db2, 0, &cn, sig, tx, &tx_len, sizeof(tx)),
+                "commitment row present after reopen");
+    persist_close(&db2);
+    unlink(path);
+    { char side[112];
+      snprintf(side, sizeof(side), "%s-wal", path); unlink(side);
+      snprintf(side, sizeof(side), "%s-shm", path); unlink(side); }
+
+    TEST_ASSERT_EQ(cn, 0, "row is for commitment 0");
+    TEST_ASSERT_MEM_EQ(sig, client_ch.latest_commitment_sig, 64, "signature round-trips");
+    TEST_ASSERT_EQ(tx_len, expect.len, "signed tx length");
+    TEST_ASSERT_MEM_EQ(tx, expect.data, expect.len, "signed tx bytes");
+    tx_buf_free(&expect);
+    TEST_ASSERT(initial_commitment_sig_valid(ctx, &client_ch, spk, sig),
+                "reloaded signature spends the funding output");
+
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Initial commitment over the wire: conservation and rotation ---- */
+
+static int initial_commitment_send(int fd, channel_t *lsp_ch) {
+    wire_msg_t m;
+    if (!initial_commitment_msg(lsp_ch, 0, 0, &m)) return 0;
+    int ok = wire_send(fd, MSG_COMMITMENT_SIGNED, m.json);
+    cJSON_Delete(m.json);
+    return ok;
+}
+
+/* Opening balances that do not account for the whole funding output are
+   refused even though the LSP's signature over them is valid; a keepalive
+   ping ahead of the signature is skipped; a closed connection is a failure. */
+int test_initial_commitment_recv_checks_conservation(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    int sv[2];
+
+    /* 1000 sat missing from the client's side, on both views */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+    lsp_ch.remote_amount -= 1000;
+    client_ch.local_amount -= 1000;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP sends commitment 0");
+    TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "unbalanced opening state refused");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    /* balanced state, with a ping in front */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 2");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    {
+        cJSON *ping = cJSON_CreateObject();
+        TEST_ASSERT(wire_send(sv[0], MSG_PING, ping), "send ping");
+        cJSON_Delete(ping);
+    }
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP sends commitment 0");
+    TEST_ASSERT(client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "balanced opening state accepted after a ping");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 1, "signature held");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    /* peer gone before the signature arrives */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 3");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 3");
+    close(sv[0]);
+    TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "closed connection is a failure");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored on EOF");
+    close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Rotation: the LSP carries the client's balance into the new channel
+   without touching the channel's funding amount or fee rate, so the client,
+   which derives both from its own copy of the tree, verifies commitment 0.
+   Sizing the channel from a fee rate the client does not share (here a live
+   estimate of 2562 sat/kvB) produces a signature the client rejects. */
+int test_rotation_commitment_carries_balance(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    int sv[2];
+
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+    uint64_t usable = lsp_ch.local_amount + lsp_ch.remote_amount;
+    uint64_t funding = lsp_ch.funding_amount;
+    uint64_t rate = lsp_ch.fee_rate_sat_per_kvb;
+
+    TEST_ASSERT(!lsp_channel_carry_client_balance(&lsp_ch, usable + 1),
+                "a balance larger than the channel is not carried");
+    TEST_ASSERT_EQ(lsp_ch.remote_amount, 39846, "default split kept");
+
+    /* the old channel held 30000 sat for the client and was smaller overall */
+    TEST_ASSERT(lsp_channel_carry_client_balance(&lsp_ch, 30000), "carry 30000 sat");
+    TEST_ASSERT_EQ(lsp_ch.remote_amount, 30000, "client balance carried");
+    TEST_ASSERT_EQ(lsp_ch.local_amount, usable - 30000, "LSP holds the rest");
+    TEST_ASSERT_EQ(lsp_ch.funding_amount, funding, "funding amount is the leaf output");
+    TEST_ASSERT_EQ(lsp_ch.fee_rate_sat_per_kvb, rate, "fee rate unchanged");
+
+    /* the client takes the balances from CHANNEL_READY, everything else from the tree */
+    client_ch.local_amount = lsp_ch.remote_amount;
+    client_ch.remote_amount = lsp_ch.local_amount;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP signs commitment 0");
+    TEST_ASSERT(client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "client verifies commitment 0 of the rotated channel");
+    TEST_ASSERT(initial_commitment_sig_valid(ctx, &client_ch, spk,
+                                             client_ch.latest_commitment_sig),
+                "signature spends the new leaf output");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+
+    /* LSP sizes the channel from its own fee estimate instead */
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 2");
+    lsp_ch.fee_rate_sat_per_kvb = 2562;
+    lsp_ch.funding_amount = lsp_ch.local_amount + lsp_ch.remote_amount
+                            + (2562 * 154 + 999) / 1000;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
+    TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP signs with its own values");
+    TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),
+                "client rejects a signature over values it does not share");
+    TEST_ASSERT_EQ(client_ch.has_latest_commitment_sig, 0, "nothing stored");
+    close(sv[0]); close(sv[1]);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Rotation: distribution transaction check ---- */
+
+/* The distribution transaction the LSP hands over is accepted only if it is
+   byte for byte the client's own transaction with a signature that verifies
+   under the funding key. */
+int test_distribution_tx_verification(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+
+    /* any transaction spending the 2-of-2 output will do: use the commitment,
+       whose aggregated signature we can produce */
+    wire_msg_t msg;
+    TEST_ASSERT(initial_commitment_msg(&lsp_ch, 0, 0, &msg), "sign");
+    TEST_ASSERT(client_handle_initial_commitment_signed(&client_ch, &msg), "aggregate");
+    cJSON_Delete(msg.json);
+
+    tx_buf_t utx, stx;
+    tx_buf_init(&utx, 512);
+    tx_buf_init(&stx, 512);
+    unsigned char txid[32], sighash[32];
+    TEST_ASSERT(channel_build_commitment_tx(&client_ch, &utx, txid), "unsigned tx");
+    TEST_ASSERT(compute_taproot_sighash(sighash, utx.data, utx.len, 0, spk, 34,
+                                        client_ch.funding_amount, 0xFFFFFFFE), "sighash");
+    TEST_ASSERT(finalize_signed_tx(&stx, utx.data, utx.len,
+                                   client_ch.latest_commitment_sig), "signed tx");
+
+    TEST_ASSERT(client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                              stx.data, stx.len),
+                "own transaction with a valid signature accepted");
+
+    /* an output amount changed by the sender */
+    unsigned char *bad = malloc(stx.len);
+    TEST_ASSERT(bad, "alloc");
+    memcpy(bad, stx.data, stx.len);
+    bad[49] ^= 0x01;
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               bad, stx.len),
+                "different outputs rejected");
+    /* right bytes, signature that does not verify */
+    memcpy(bad, stx.data, stx.len);
+    bad[stx.len - 4 - 10] ^= 0x01;
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               bad, stx.len),
+                "invalid signature rejected");
+    /* the unsigned transaction passed off as signed */
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               utx.data, utx.len),
+                "unsigned transaction rejected");
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               stx.data, 20),
+                "truncated transaction rejected");
+    free(bad);
+
+    /* what a transaction pays to a participant's key-path output */
+    unsigned char sk[32];
+    memset(sk, 0x41, 32);
+    secp256k1_pubkey me, other;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &me, sk), "pubkey");
+    memset(sk, 0x42, 32);
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &other, sk), "pubkey 2");
+    tx_output_t outs[2];
+    memset(outs, 0, sizeof(outs));
+    for (int i = 0; i < 2; i++) {
+        secp256k1_xonly_pubkey x, tw;
+        secp256k1_pubkey full;
+        unsigned char ser[32], twk[32];
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &x, NULL, i ? &other : &me), "xonly");
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &x);
+        sha256_tagged("TapTweak", ser, 32, twk);
+        TEST_ASSERT(secp256k1_xonly_pubkey_tweak_add(ctx, &full, &x, twk), "tweak");
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &tw, NULL, &full), "xonly 2");
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &tw);
+        outs[i].script_pubkey_len = 34;
+        outs[i].amount_sats = i ? 70000 : 29000;
+    }
+    tx_buf_t dtx, dstx;
+    tx_buf_init(&dtx, 256);
+    tx_buf_init(&dstx, 256);
+    unsigned char ftxid[32];
+    memset(ftxid, 0x5A, 32);
+    TEST_ASSERT(build_unsigned_tx_with_locktime(&dtx, NULL, ftxid, 0, 0xFFFFFFFEu, 900,
+                                                outs, 2), "distribution-shaped tx");
+    TEST_ASSERT_EQ(client_tx_amount_to_pubkey(ctx, dtx.data, dtx.len, &me), 29000,
+                   "amount paid to this client (unsigned form)");
+    unsigned char zero_sig[64] = {0};
+    TEST_ASSERT(finalize_signed_tx(&dstx, dtx.data, dtx.len, zero_sig), "signed form");
+    TEST_ASSERT_EQ(client_tx_amount_to_pubkey(ctx, dstx.data, dstx.len, &me), 29000,
+                   "amount paid to this client (signed form)");
+    TEST_ASSERT_EQ(client_tx_amount_to_pubkey(ctx, dtx.data, dtx.len, &lsp_ch.local_funding_pubkey), 0,
+                   "nothing for a key without an output");
+
+    tx_buf_free(&utx); tx_buf_free(&stx); tx_buf_free(&dtx); tx_buf_free(&dstx);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
     return 1;
 }

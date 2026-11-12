@@ -560,3 +560,26 @@ int test_sl2_end_to_end(void)
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ================================================================== */
+/* Invoices carry payment_secret together with var_onion_optin        */
+/* ================================================================== */
+int test_invoice_feature_bits(void)
+{
+    iv_setup();
+
+    bolt11_invoice_table_t tbl;
+    invoice_init(&tbl);
+    const uint16_t want = (1u << BOLT11_FEATURE_VAR_ONION) |
+                          (1u << BOLT11_FEATURE_PAYMENT_SECRET);
+
+    char bech32[1024];
+    bolt11_invoice_t decoded;
+    ASSERT(invoice_create(&tbl, g_ctx, g_privkey, "regtest",
+                           50000, "Feature bits", 3600, bech32, sizeof(bech32)),
+           "invoice_create succeeds");
+    ASSERT(bolt11_decode(g_ctx, bech32, &decoded), "bolt11_decode succeeds");
+    ASSERT(decoded.features == want, "var_onion and payment_secret both set");
+    ASSERT(decoded.has_payment_secret, "payment secret present");
+    return 1;
+}

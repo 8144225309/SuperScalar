@@ -262,6 +262,13 @@ static const char *SCHEMA_SQL =
     "  active INTEGER DEFAULT 1,"
     "  created_at INTEGER DEFAULT (strftime('%s','now'))"
     ");"
+    "CREATE TABLE IF NOT EXISTS bridge_fulfils ("
+    "  payment_hash TEXT PRIMARY KEY,"
+    "  preimage TEXT NOT NULL,"
+    "  upstream_id TEXT NOT NULL DEFAULT '',"
+    "  bridge_htlc_id INTEGER DEFAULT 0,"
+    "  created_at INTEGER DEFAULT (strftime('%s','now'))"
+    ");"
     "CREATE TABLE IF NOT EXISTS htlc_origins ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  payment_hash TEXT NOT NULL,"
@@ -271,6 +278,12 @@ static const char *SCHEMA_SQL =
     "  sender_htlc_id INTEGER DEFAULT 0,"
     "  active INTEGER DEFAULT 1,"
     "  created_at INTEGER DEFAULT (strftime('%s','now'))"
+    ");"
+    "CREATE TABLE IF NOT EXISTS htlc_origin_details ("
+    "  origin_id INTEGER PRIMARY KEY,"
+    "  cltv_expiry INTEGER DEFAULT 0,"
+    "  upstream_id TEXT NOT NULL DEFAULT '',"
+    "  fail_pending INTEGER DEFAULT 0"
     ");"
     "CREATE TABLE IF NOT EXISTS client_invoices ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -1395,6 +1408,69 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* Client copy of the signed leaf transaction its channel is funded by,
+       kept when a leaf advance replaces that leaf in tree_nodes.  The
+       client's commitments keep spending this transaction's output, so a
+       unilateral exit has to publish it.  CREATE TABLE IF NOT EXISTS is
+       idempotent, so no version gate. */
+    {
+        char *fl_err = NULL;
+        if (sqlite3_exec(p->db,
+                "CREATE TABLE IF NOT EXISTS client_funding_leaf ("
+                "  factory_id INTEGER NOT NULL,"
+                "  node_index INTEGER NOT NULL,"
+                "  txid TEXT NOT NULL,"            /* display hex */
+                "  signed_tx_hex TEXT NOT NULL,"
+                "  PRIMARY KEY (factory_id, txid)"
+                ");",
+                NULL, NULL, &fl_err) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: client_funding_leaf table error: %s\n",
+                    fl_err ? fl_err : "unknown");
+            sqlite3_free(fl_err);
+        }
+    }
+
+    /* v40: the tree shape.  leaf_arity alone does not determine the tree: the
+       per-level arity list, the static-near-root depth, the PS sub-factory
+       arity and the placement mode do too, and a reload that rebuilt the tree
+       without them produced transactions nobody signed.  level_arity is the
+       comma list ("8,8,3"), NULL for a uniform tree.  A row written before v40
+       gets the defaults (uniform, no static levels, k=1, timezone-cluster
+       placement = 3); persist_load_factory refuses it if its rebuilt tree does
+       not match the signed tree_nodes rows.  Version-gated (ALTER is not
+       idempotent). */
+    if (db_version < 40) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN level_arity TEXT;"
+            "ALTER TABLE factories ADD COLUMN static_threshold_depth INTEGER NOT NULL DEFAULT 0;"
+            "ALTER TABLE factories ADD COLUMN ps_subfactory_arity INTEGER NOT NULL DEFAULT 1;"
+            "ALTER TABLE factories ADD COLUMN placement_mode INTEGER NOT NULL DEFAULT 3;",
+            NULL, NULL, NULL);
+    }
+
+    /* Client record of a cooperative close it has co-signed: one row per
+       factory, keyed by the factory's funding outpoint.  Written before the
+       client releases its partial signature, so a client that restarts
+       still knows the LSP may hold a signed close of that factory.
+       CREATE TABLE IF NOT EXISTS is idempotent, so no version gate. */
+    {
+        char *cs_err = NULL;
+        if (sqlite3_exec(p->db,
+                "CREATE TABLE IF NOT EXISTS client_close_signed ("
+                "  funding_txid BLOB NOT NULL,"    /* 32 bytes, internal order */
+                "  funding_vout INTEGER NOT NULL,"
+                "  paid_sats INTEGER NOT NULL,"    /* to the client's script */
+                "  sighash BLOB NOT NULL,"         /* 32 bytes, close sighash */
+                "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+                "  PRIMARY KEY (funding_txid, funding_vout)"
+                ");",
+                NULL, NULL, &cs_err) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: client_close_signed table error: %s\n",
+                    cs_err ? cs_err : "unknown");
+            sqlite3_free(cs_err);
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];
@@ -1565,8 +1641,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         "INSERT OR REPLACE INTO factories "
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
         " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
-        " use_hashlock_poison) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " use_hashlock_poison, level_arity, static_threshold_depth, "
+        " ps_subfactory_arity, placement_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1585,6 +1662,21 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
     sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
     sqlite3_bind_int(stmt, 11, f->use_hashlock_poison ? 1 : 0);  /* #59 restart-resume */
+    /* v40: the rest of the tree shape (see the migration). */
+    char la_buf[FACTORY_MAX_LEVELS * 4 + 1];
+    la_buf[0] = '\0';
+    for (size_t i = 0; i < f->n_level_arity && i < FACTORY_MAX_LEVELS; i++) {
+        size_t off = strlen(la_buf);
+        snprintf(la_buf + off, sizeof(la_buf) - off, "%s%u",
+                 i ? "," : "", (unsigned)f->level_arity[i]);
+    }
+    if (f->n_level_arity > 0)
+        sqlite3_bind_text(stmt, 12, la_buf, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 12);
+    sqlite3_bind_int(stmt, 13, (int)f->static_threshold_depth);
+    sqlite3_bind_int(stmt, 14, (int)(f->ps_subfactory_arity ? f->ps_subfactory_arity : 1));
+    sqlite3_bind_int(stmt, 15, (int)f->placement_mode);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -1630,6 +1722,30 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
     if (own_txn && !persist_commit(p)) return 0;
     return 1;
+}
+
+int persist_save_funding_leaf(persist_t *p, uint32_t factory_id,
+                              uint32_t node_index, const char *txid_display_hex,
+                              const unsigned char *signed_tx, size_t len) {
+    if (!p || !p->db || !txid_display_hex || !signed_tx || len == 0) return 0;
+    char *tx_hex = malloc(len * 2 + 1);
+    if (!tx_hex) return 0;
+    hex_encode(signed_tx, len, tx_hex);
+    sqlite3_stmt *stmt;
+    int ok = 0;
+    if (sqlite3_prepare_v2(p->db,
+            "INSERT OR IGNORE INTO client_funding_leaf "
+            "(factory_id, node_index, txid, signed_tx_hex) VALUES (?, ?, ?, ?);",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, (int)factory_id);
+        sqlite3_bind_int(stmt, 2, (int)node_index);
+        sqlite3_bind_text(stmt, 3, txid_display_hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, tx_hex, -1, SQLITE_TRANSIENT);
+        ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+    }
+    free(tx_hex);
+    return ok;
 }
 
 int persist_mark_factory_closed(persist_t *p, uint32_t factory_id) {
@@ -2331,6 +2447,22 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
     return memcmp(stored, sighash, 32) == 0 ? PS_SAVE_RECORDED : PS_SAVE_CONFLICT;
 }
 
+int persist_factory_is_closed(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT state FROM factories WHERE id = ?;", -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int closed = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *s = (const char *)sqlite3_column_text(stmt, 0);
+        closed = s && strcmp(s, "closed") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return closed;
+}
+
 int persist_has_factory(persist_t *p, uint32_t factory_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
@@ -2361,6 +2493,386 @@ size_t persist_list_active_factory_ids(persist_t *p,
     return count;
 }
 
+/* Parse a stored level_arity list ("8,8,3"): 1..FACTORY_MAX_LEVELS entries,
+   each 1..FACTORY_MAX_OUTPUTS.  1 on success. */
+static int parse_level_arity(const char *s, uint8_t out[FACTORY_MAX_LEVELS],
+                             size_t *n_out) {
+    size_t n = 0;
+    *n_out = 0;
+    while (*s) {
+        if (n >= FACTORY_MAX_LEVELS || *s < '0' || *s > '9') return 0;
+        unsigned v = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (unsigned)(*s - '0');
+            if (v > FACTORY_MAX_OUTPUTS) return 0;
+            s++;
+        }
+        if (v < 1) return 0;
+        out[n++] = (uint8_t)v;
+        if (*s == ',') { s++; if (!*s) return 0; }
+        else if (*s) return 0;
+    }
+    if (n == 0) return 0;
+    *n_out = n;
+    return 1;
+}
+
+/* Output amounts as tree_nodes stores them (comma-separated sats),
+   malloc'd; NULL on allocation failure. */
+static char *format_amounts(const uint64_t *amounts, size_t n) {
+    /* sized for every output (20 digits + comma each) */
+    size_t cap = n * 21 + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+    buf[0] = '\0';
+    for (size_t o = 0; o < n; o++)
+        len += (size_t)snprintf(buf + len, cap - len, "%s%llu", o > 0 ? "," : "",
+                                (unsigned long long)amounts[o]);
+    return buf;
+}
+
+static char *format_output_amounts(const factory_node_t *node) {
+    uint64_t a[FACTORY_MAX_OUTPUTS];
+    size_t n = node->n_outputs < FACTORY_MAX_OUTPUTS ? node->n_outputs : FACTORY_MAX_OUTPUTS;
+    for (size_t o = 0; o < n; o++) a[o] = node->outputs[o].amount_sats;
+    return format_amounts(a, n);
+}
+
+/* A node whose outputs carry an L-stock script: a leaf state or a PS
+   sub-factory node. */
+static int node_has_l_stock(const factory_t *f, size_t idx) {
+    if (f->nodes[idx].type == NODE_PS_SUBFACTORY) return 1;
+    for (int i = 0; i < f->n_leaf_nodes; i++)
+        if (f->leaf_node_indices[i] == idx) return 1;
+    return 0;
+}
+
+/* What check_rebuilt_tree needs from a signed transaction: its txid (over the
+   non-witness serialization), its first input, and its output amounts. */
+typedef struct {
+    unsigned char txid[32];        /* internal byte order */
+    unsigned char prev_txid[32];   /* first input, internal byte order */
+    uint32_t prev_vout;
+    uint32_t sequence;
+    size_t n_out;
+    uint64_t amounts[FACTORY_MAX_OUTPUTS];
+} stored_tx_t;
+
+static int rd_varint(const unsigned char *b, size_t len, size_t *pos, uint64_t *v) {
+    if (*pos >= len) return 0;
+    unsigned char c = b[(*pos)++];
+    size_t n = c < 0xFD ? 0 : c == 0xFD ? 2 : c == 0xFE ? 4 : 8;
+    if (n == 0) { *v = c; return 1; }
+    if (len - *pos < n) return 0;
+    uint64_t r = 0;
+    for (size_t i = 0; i < n; i++) r |= (uint64_t)b[*pos + i] << (8 * i);
+    *pos += n;
+    *v = r;
+    return 1;
+}
+
+static int skip_bytes(size_t len, size_t *pos, uint64_t n) {
+    if (n > len - *pos) return 0;
+    *pos += (size_t)n;
+    return 1;
+}
+
+static uint32_t rd_le32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/* Parse a serialized (segwit or legacy) transaction.  1 on success. */
+static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
+    size_t pos = 4;
+    uint64_t n_in, n_out, v;
+    if (len < 10) return 0;
+    int segwit = (b[4] == 0x00 && b[5] == 0x01);
+    if (segwit) pos = 6;
+    size_t body_start = pos;
+    if (!rd_varint(b, len, &pos, &n_in) || n_in == 0 || n_in > 1000) return 0;
+    for (uint64_t i = 0; i < n_in; i++) {
+        if (len - pos < 36) return 0;
+        if (i == 0) {
+            memcpy(o->prev_txid, b + pos, 32);
+            o->prev_vout = rd_le32(b + pos + 32);
+        }
+        pos += 36;
+        if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+        if (len - pos < 4) return 0;
+        if (i == 0) o->sequence = rd_le32(b + pos);
+        pos += 4;
+    }
+    if (!rd_varint(b, len, &pos, &n_out) || n_out > FACTORY_MAX_OUTPUTS) return 0;
+    o->n_out = (size_t)n_out;
+    for (uint64_t i = 0; i < n_out; i++) {
+        if (len - pos < 8) return 0;
+        uint64_t a = 0;
+        for (int k = 0; k < 8; k++) a |= (uint64_t)b[pos + k] << (8 * k);
+        o->amounts[i] = a;
+        pos += 8;
+        if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+    }
+    size_t body_end = pos;
+    if (segwit) {
+        for (uint64_t i = 0; i < n_in; i++) {
+            uint64_t items;
+            if (!rd_varint(b, len, &pos, &items)) return 0;
+            for (uint64_t k = 0; k < items; k++)
+                if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+        }
+    }
+    if (len - pos != 4) return 0;   /* nLockTime, and nothing after it */
+    size_t nw_len = 4 + (body_end - body_start) + 4;
+    unsigned char *nw = malloc(nw_len);
+    if (!nw) return 0;
+    memcpy(nw, b, 4);
+    memcpy(nw + 4, b + body_start, body_end - body_start);
+    memcpy(nw + 4 + (body_end - body_start), b + pos, 4);
+    sha256_double(nw, nw_len, o->txid);
+    free(nw);
+    return 1;
+}
+
+/* 1 when `prev` (internal order) is the txid of a state of node `idx`'s own
+   chain that precedes its stored state `self` (internal order): a row of
+   ps_leaf_chains / ps_subfactory_chains with a lower chain_pos than the row
+   holding `self`. */
+static int prev_is_earlier_chain_state(persist_t *p, uint32_t factory_id,
+                                       const factory_node_t *node, size_t idx,
+                                       const unsigned char *self,
+                                       const unsigned char *prev) {
+    const char *sql = node->type == NODE_PS_SUBFACTORY
+        ? "SELECT chain_pos, txid FROM ps_subfactory_chains "
+          "WHERE factory_id = ? AND sub_node_idx = ? ORDER BY chain_pos;"
+        : "SELECT chain_pos, txid FROM ps_leaf_chains "
+          "WHERE factory_id = ? AND leaf_node_idx = ? ORDER BY chain_pos;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, (int)factory_id);
+    sqlite3_bind_int(st, 2, (int)idx);
+    char self_hex[65], prev_hex[65];
+    unsigned char d[32];
+    memcpy(d, self, 32); reverse_bytes(d, 32); hex_encode(d, 32, self_hex);
+    memcpy(d, prev, 32); reverse_bytes(d, 32); hex_encode(d, 32, prev_hex);
+    long self_pos = -1, prev_pos = -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        long pos = (long)sqlite3_column_int64(st, 0);
+        const char *t = (const char *)sqlite3_column_text(st, 1);
+        if (!t) continue;
+        if (self_pos < 0 && strcmp(t, self_hex) == 0) self_pos = pos;
+        if (prev_pos < 0 && strcmp(t, prev_hex) == 0) prev_pos = pos;
+    }
+    sqlite3_finalize(st);
+    return self_pos >= 0 && prev_pos >= 0 && prev_pos < self_pos;
+}
+
+/* Check that the tree persist_load_factory just rebuilt is the signed tree
+   the DB holds in tree_nodes, and make the signed bytes the source of truth.
+
+   The DB must hold one row per rebuilt node (a factory with no rows is
+   refused: nothing would tie the rebuild to what was signed).  Each row must
+   have the rebuilt node's type, parent and parent output.  Each row's signed
+   transaction must hash to the row's txid, carry the row's nSequence and
+   output amounts, and spend its parent's stored txid at the row's parent
+   output; the root spends the factory's funding outpoint.  So the stored
+   rows form one signed chain from the funding output.
+
+   Then every node's rebuilt txid must equal the stored one, except below a
+   node whose signed state legitimately moved on after creation (its stored
+   nSequence or amounts differ from the rebuild): a state node of a tree with
+   DW state (an advance), or a leaf or PS sub-factory state (a chain advance
+   or re-allocation; such a node spends either its parent's stored output, or
+   its own creation state, or an earlier state of its own chain stored in
+   ps_leaf_chains / ps_subfactory_chains, and nothing else).  A kickoff never moves on, and in a tree without DW
+   state no interior node does: a difference there refuses the load.  With
+   hashlock L-stock poison a node with an L-stock output (and its subtree) is
+   also compared by chain only, since its script commits to hashes the DB does
+   not hold.  For such nodes the stored txid and signed transaction replace
+   the rebuilt ones.  A row without signed bytes is accepted only where the
+   rebuild matches it exactly.  Returns 1 on a match, 0 (logged) otherwise. */
+static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
+                                      factory_t *f, int hashlock) {
+    const char *sql =
+        "SELECT node_index, type, parent_index, parent_vout, nsequence, "
+        "output_amounts, txid, signed_tx_hex FROM tree_nodes "
+        "WHERE factory_id = ? ORDER BY node_index;";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "persist_load_factory: cannot read tree_nodes: %s\n",
+                sqlite3_errmsg(p->db));
+        return 0;
+    }
+    sqlite3_bind_int(st, 1, (int)factory_id);
+
+    size_t n = f->n_nodes;
+    unsigned char (*stored_txid)[32] = calloc(n ? n : 1, 32);   /* internal order */
+    unsigned char *seen = calloc(n ? n : 1, 1);
+    unsigned char *changed = calloc(n ? n : 1, 1);
+    unsigned char *has_tx = calloc(n ? n : 1, 1);
+    unsigned char *spends_own_chain = calloc(n ? n : 1, 1);
+    stored_tx_t *stx = calloc(n ? n : 1, sizeof(stored_tx_t));
+    tx_buf_t *sbytes = calloc(n ? n : 1, sizeof(tx_buf_t));
+    int ok = stored_txid && seen && changed && has_tx && spends_own_chain && stx && sbytes;
+    int has_dw = factory_has_dw_state(f);
+    size_t rows = 0;
+    const char *why = ok ? NULL : "out of memory";
+    long bad = -1;
+
+    while (ok && sqlite3_step(st) == SQLITE_ROW) {
+        int idx = sqlite3_column_int(st, 0);
+        const char *type = (const char *)sqlite3_column_text(st, 1);
+        int parent = sqlite3_column_int(st, 2);
+        int pvout = sqlite3_column_int(st, 3);
+        uint32_t nseq = (uint32_t)sqlite3_column_int64(st, 4);
+        const char *amounts = (const char *)sqlite3_column_text(st, 5);
+        const char *txid = (const char *)sqlite3_column_text(st, 6);
+        const char *shex = (const char *)sqlite3_column_text(st, 7);
+        rows++;
+        bad = idx;
+        if (idx < 0 || (size_t)idx >= n || seen[idx]) {
+            why = "is not a node of the rebuilt tree"; ok = 0; break;
+        }
+        seen[idx] = 1;
+        const factory_node_t *node = &f->nodes[idx];
+        const char *want_type = node->type == NODE_KICKOFF ? "kickoff" : "state";
+        if (!type || strcmp(type, want_type) != 0 || parent != node->parent_index ||
+            pvout != (int)node->parent_vout) {
+            why = "has a different type or parent from the rebuilt node"; ok = 0; break;
+        }
+        if (!txid || strlen(txid) != 64 || hex_decode(txid, stored_txid[idx], 32) != 32) {
+            why = "has no valid txid"; ok = 0; break;
+        }
+        reverse_bytes(stored_txid[idx], 32);
+        if (!amounts) { why = "has no output amounts"; ok = 0; break; }
+        if (shex && *shex) {
+            size_t hl = strlen(shex);
+            if (hl % 2 || hl / 2 > 400000) { why = "has a malformed signed tx"; ok = 0; break; }
+            tx_buf_init(&sbytes[idx], hl / 2);
+            if (hex_decode(shex, sbytes[idx].data, hl / 2) != (int)(hl / 2) ||
+                !parse_stored_tx(sbytes[idx].data, hl / 2, &stx[idx])) {
+                why = "has a malformed signed tx"; ok = 0; break;
+            }
+            sbytes[idx].len = hl / 2;
+            if (memcmp(stx[idx].txid, stored_txid[idx], 32) != 0) {
+                why = "has a signed tx that does not hash to its txid"; ok = 0; break;
+            }
+            if (stx[idx].sequence != nseq) {
+                why = "has a signed tx with a different nSequence"; ok = 0; break;
+            }
+            /* the row's amounts are those of its signed tx */
+            char *signed_amts = format_amounts(stx[idx].amounts, stx[idx].n_out);
+            int same = signed_amts && strcmp(signed_amts, amounts) == 0;
+            free(signed_amts);
+            if (!same) { why = "has a signed tx with different output amounts"; ok = 0; break; }
+            has_tx[idx] = 1;
+        }
+        char *amt_buf = format_output_amounts(node);
+        if (!amt_buf) { why = "out of memory"; ok = 0; break; }
+        if (nseq != node->nsequence || strcmp(amounts, amt_buf) != 0)
+            changed[idx] = 1;
+        free(amt_buf);
+    }
+    sqlite3_finalize(st);
+
+    if (ok && rows == 0) {
+        bad = -1; why = "no signed tree is stored for this factory"; ok = 0;
+    }
+    if (ok && rows != n) {
+        bad = -1; why = "the number of stored nodes differs from the rebuilt tree"; ok = 0;
+    }
+    /* A node may move on only where an advance can move it. */
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!changed[i]) continue;
+        int may_move = f->nodes[i].type != NODE_KICKOFF &&
+                       (has_dw || node_has_l_stock(f, i));
+        if (!may_move || !has_tx[i]) {
+            bad = (long)i;
+            why = !may_move ? "differs from the rebuild where no advance can change it"
+                            : "differs from the rebuild and has no signed tx";
+            ok = 0;
+        }
+        else if (node_has_l_stock(f, i))
+            spends_own_chain[i] = 1;
+    }
+    /* The stored rows form one signed chain from the funding output. */
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!has_tx[i]) continue;
+        int par = f->nodes[i].parent_index;
+        const unsigned char *want = par < 0 ? f->funding_txid : stored_txid[par];
+        uint32_t want_vout = par < 0 ? f->funding_vout : f->nodes[i].parent_vout;
+        if (par < (int)n && memcmp(stx[i].prev_txid, want, 32) == 0 &&
+            stx[i].prev_vout == want_vout)
+            continue;
+        /* A leaf or sub-factory state that moved on may instead spend its own
+           creation state (the rebuilt node) or an earlier stored state of its
+           own chain. */
+        if (spends_own_chain[i] &&
+            (memcmp(stx[i].prev_txid, f->nodes[i].txid, 32) == 0 ||
+             prev_is_earlier_chain_state(p, factory_id, &f->nodes[i], i,
+                                         stored_txid[i], stx[i].prev_txid)))
+            continue;
+        bad = (long)i;
+        why = par < 0 ? "does not spend the factory funding output"
+            : spends_own_chain[i]
+                ? "spends neither its parent's stored output nor an earlier state of its own chain"
+                : "does not spend its parent's stored output";
+        ok = 0;
+    }
+    size_t exempt = 0;
+    for (size_t i = 0; ok && i < n; i++) {
+        int skip = 0;
+        for (int j = (int)i; j >= 0 && (size_t)j < n; j = f->nodes[j].parent_index) {
+            if (changed[j] || (hashlock && node_has_l_stock(f, (size_t)j))) {
+                skip = 1;
+                break;
+            }
+        }
+        if (!skip) {
+            if (memcmp(f->nodes[i].txid, stored_txid[i], 32) != 0) {
+                bad = (long)i; why = "has a different txid from the rebuilt node"; ok = 0;
+            }
+            continue;
+        }
+        if (!has_tx[i]) {
+            bad = (long)i; why = "cannot be checked against the rebuild and has no signed tx";
+            ok = 0;
+            continue;
+        }
+        exempt++;
+        /* The signed bytes are what the members committed to (a PS leaf or
+           sub-factory is then brought to its latest chain state below). */
+        factory_node_t *node = &f->nodes[i];
+        {
+            memcpy(node->txid, stored_txid[i], 32);
+            tx_buf_free(&node->signed_tx);
+            tx_buf_init(&node->signed_tx, sbytes[i].len);
+            memcpy(node->signed_tx.data, sbytes[i].data, sbytes[i].len);
+            node->signed_tx.len = sbytes[i].len;
+            node->is_signed = 1;
+        }
+    }
+
+    for (size_t i = 0; sbytes && i < n; i++) tx_buf_free(&sbytes[i]);
+    free(sbytes); free(stx); free(spends_own_chain); free(has_tx);
+    free(changed); free(seen); free(stored_txid);
+    if (!ok) {
+        if (bad >= 0)
+            fprintf(stderr, "persist_load_factory: signed tree node %ld %s\n", bad, why);
+        else
+            fprintf(stderr, "persist_load_factory: %s\n", why);
+        fprintf(stderr, "persist_load_factory: factory %u: the tree rebuilt from "
+                "the DB is not the signed tree; refusing to load it\n", factory_id);
+        return 0;
+    }
+    if (exempt > 0)
+        printf("persist: factory %u tree verified against the signed tree "
+               "(%zu node(s) changed since creation, loaded from their signed "
+               "transactions)\n", factory_id, exempt);
+    return 1;
+}
+
 int persist_load_factory(persist_t *p, uint32_t factory_id,
                           factory_t *f, secp256k1_context *ctx) {
     if (!p || !p->db || !f || !ctx) return 0;
@@ -2368,7 +2880,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
         "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
-        "use_hashlock_poison "
+        "use_hashlock_poison, level_arity, static_threshold_depth, "
+        "ps_subfactory_arity, placement_mode "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2396,6 +2909,26 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
                                                      FACTORY_ARITY_2;
     int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
+    /* v40 tree shape */
+    uint8_t level_arities[FACTORY_MAX_LEVELS];
+    size_t n_level_arity = 0;
+    const char *la_text = (const char *)sqlite3_column_text(stmt, 10);
+    if (la_text && !parse_level_arity(la_text, level_arities, &n_level_arity)) {
+        fprintf(stderr, "persist_load_factory: invalid level_arity '%s'\n", la_text);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    int static_threshold_raw = sqlite3_column_int(stmt, 11);
+    int ps_subfactory_raw = sqlite3_column_int(stmt, 12);
+    int placement_raw = sqlite3_column_int(stmt, 13);
+    if (static_threshold_raw < 0 || static_threshold_raw >= FACTORY_MAX_LEVELS ||
+        ps_subfactory_raw < 0 || ps_subfactory_raw > FACTORY_MAX_OUTPUTS - 1) {
+        fprintf(stderr, "persist_load_factory: invalid tree shape "
+                "(static_threshold_depth %d, ps_subfactory_arity %d)\n",
+                static_threshold_raw, ps_subfactory_raw);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
 
     /* Data validation (Phase 2: item 2.6) */
     if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
@@ -2487,10 +3020,10 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
 
-    /* Release any prior tree state (caller may reuse f across loads).
-       factory_init_from_pubkeys memsets f, which would leak existing tx_bufs. */
-    if (f->n_nodes > 0)
-        factory_free(f);
+    /* Release any prior tree state and arrays (caller may reuse f across
+       loads, or pre-allocate its arrays).  factory_init_from_pubkeys memsets
+       f, which would leak them.  factory_free is a no-op on a zeroed factory. */
+    factory_free(f);
 
     /* Reconstruct factory */
     factory_init_from_pubkeys(f, ctx, pubkeys, n_participants,
@@ -2498,16 +3031,36 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (restore parity) */
     f->fee_per_tx = fee_per_tx;
-    if (leaf_arity == FACTORY_ARITY_1)
+    /* The shape, applied in the order FACTORY_PROPOSE applies it on the
+       client (client.c): arity, then static levels, then sub-factory arity. */
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(f, level_arities, n_level_arity)) {
+            factory_free(f);
+            return 0;
+        }
+    } else if (leaf_arity == FACTORY_ARITY_1)
         factory_set_arity(f, FACTORY_ARITY_1);
     else if (leaf_arity == FACTORY_ARITY_PS)
         factory_set_arity(f, FACTORY_ARITY_PS);
     /* FACTORY_ARITY_2 is the default from factory_init_from_pubkeys */
+    if (static_threshold_raw > 0)
+        factory_set_static_near_root(f, (uint32_t)static_threshold_raw);
+    if (ps_subfactory_raw > 1)
+        factory_set_ps_subfactory_arity(f, (uint32_t)ps_subfactory_raw);
+    if (!factory_set_placement_mode(f, (placement_mode_t)placement_raw)) {
+        factory_free(f);
+        return 0;
+    }
 
-    factory_set_funding(f, funding_txid, funding_vout, funding_amount,
-                         fund_spk, 34);
+    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+                             fund_spk, 34) ||
+        !factory_build_tree(f)) {
+        factory_free(f);
+        return 0;
+    }
 
-    if (!factory_build_tree(f)) {
+    /* The rebuilt tree must be the tree whose transactions were signed. */
+    if (!persist_check_rebuilt_tree(p, factory_id, f, loaded_use_hashlock_poison)) {
         factory_free(f);
         return 0;
     }
@@ -2763,6 +3316,89 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+int persist_save_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t paid_sats,
+                               const unsigned char sighash[32]) {
+    if (!p || !p->db || !funding_txid || !sighash) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO client_close_signed "
+        "(funding_txid, funding_vout, paid_sats, sighash) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_blob(stmt, 1, funding_txid, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)funding_vout);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)paid_sats);
+    sqlite3_bind_blob(stmt, 4, sighash, 32, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 1 : 0;
+}
+
+int persist_load_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t *paid_sats_out,
+                               unsigned char sighash_out[32]) {
+    /* "No record" must mean exactly that: the query ran and found no row.
+       Anything else is reported as an error so the caller can refuse to act
+       as if nothing had been signed. */
+    if (!p || !p->db || !funding_txid) return -1;
+    const char *sql =
+        "SELECT paid_sats, sighash FROM client_close_signed "
+        "WHERE funding_txid = ? AND funding_vout = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_blob(stmt, 1, funding_txid, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)funding_vout);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    const void *blob = sqlite3_column_blob(stmt, 1);
+    if (!blob || sqlite3_column_bytes(stmt, 1) != 32) {
+        sqlite3_finalize(stmt);
+        return -1;   /* a row is there but cannot be trusted */
+    }
+    if (paid_sats_out)
+        *paid_sats_out = (uint64_t)sqlite3_column_int64(stmt, 0);
+    if (sighash_out)
+        memcpy(sighash_out, blob, 32);
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
+int persist_factory_has_channel(persist_t *p,
+                                 const unsigned char funding_txid[32],
+                                 uint32_t funding_vout) {
+    if (!p || !p->db || !funding_txid) return -1;
+
+    /* factories.funding_txid is stored as display-order hex. */
+    unsigned char txid_display[32];
+    for (size_t i = 0; i < 32; i++) txid_display[i] = funding_txid[31 - i];
+    char txid_hex[65];
+    hex_encode(txid_display, 32, txid_hex);
+
+    const char *sql =
+        "SELECT 1 FROM channels c JOIN factories f ON f.id = c.factory_id "
+        "WHERE f.funding_txid = ? AND f.funding_vout = ? LIMIT 1;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(stmt, 1, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)funding_vout);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) return 1;
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 int persist_load_channel_state(persist_t *p, uint32_t channel_id,
@@ -4002,29 +4638,37 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
         sqlite3_bind_int(stmt, 6, node->dw_layer_index);
         sqlite3_bind_int(stmt, 7, (int)node->n_signers);
 
-        /* signer_indices as comma-separated */
-        char signers_buf[128];
+        /* signer_indices as comma-separated; sized for every signer
+           (10 digits + comma each) */
+        size_t signers_cap = node->n_signers * 11 + 1;
+        char *signers_buf = malloc(signers_cap);
+        if (!signers_buf) {
+            sqlite3_finalize(stmt);
+            if (own_txn) persist_rollback(p);
+            return 0;
+        }
+        size_t signers_len = 0;
         signers_buf[0] = '\0';
         for (size_t s = 0; s < node->n_signers; s++) {
-            char tmp[16];
-            snprintf(tmp, sizeof(tmp), "%s%u", s > 0 ? "," : "",
-                     node->signer_indices[s]);
-            strncat(signers_buf, tmp, sizeof(signers_buf) - strlen(signers_buf) - 1);
+            signers_len += (size_t)snprintf(signers_buf + signers_len,
+                                            signers_cap - signers_len, "%s%u",
+                                            s > 0 ? "," : "",
+                                            node->signer_indices[s]);
         }
         sqlite3_bind_text(stmt, 8, signers_buf, -1, SQLITE_TRANSIENT);
+        free(signers_buf);
 
         sqlite3_bind_int(stmt, 9, (int)node->n_outputs);
 
         /* output_amounts as comma-separated sats */
-        char amounts_buf[256];
-        amounts_buf[0] = '\0';
-        for (size_t o = 0; o < node->n_outputs; o++) {
-            char tmp[32];
-            snprintf(tmp, sizeof(tmp), "%s%llu", o > 0 ? "," : "",
-                     (unsigned long long)node->outputs[o].amount_sats);
-            strncat(amounts_buf, tmp, sizeof(amounts_buf) - strlen(amounts_buf) - 1);
+        char *amounts_buf = format_output_amounts(node);
+        if (!amounts_buf) {
+            sqlite3_finalize(stmt);
+            if (own_txn) persist_rollback(p);
+            return 0;
         }
         sqlite3_bind_text(stmt, 10, amounts_buf, -1, SQLITE_TRANSIENT);
+        free(amounts_buf);
 
         sqlite3_bind_int64(stmt, 11, (sqlite3_int64)node->nsequence);
         sqlite3_bind_int64(stmt, 12, (sqlite3_int64)node->input_amount);
@@ -4797,6 +5441,167 @@ int persist_deactivate_htlc_origin(persist_t *p,
     return ok7;
 }
 
+int persist_save_bridge_fulfil(persist_t *p, const persist_bridge_fulfil_t *f) {
+    if (!p || !p->db || !f) return 0;
+    char hash_hex[65], pre_hex[65];
+    hex_encode(f->payment_hash, 32, hash_hex);
+    hex_encode(f->preimage, 32, pre_hex);
+    const char *sql =
+        "INSERT OR REPLACE INTO bridge_fulfils "
+        "(payment_hash, preimage, upstream_id, bridge_htlc_id) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, pre_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, f->upstream_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)f->bridge_htlc_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_delete_bridge_fulfil(persist_t *p, const unsigned char *payment_hash32) {
+    if (!p || !p->db || !payment_hash32) return 0;
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "DELETE FROM bridge_fulfils WHERE payment_hash = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_bridge_fulfils(persist_t *p, persist_bridge_fulfil_t *out,
+                                    size_t max, uint64_t max_age_secs) {
+    if (!p || !p->db || !out) return 0;
+    sqlite3_stmt *stmt;
+    if (max_age_secs > 0 &&
+        sqlite3_prepare_v2(p->db,
+            "DELETE FROM bridge_fulfils "
+            "WHERE created_at < strftime('%s','now') - ?;",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)max_age_secs);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT payment_hash, preimage, upstream_id, bridge_htlc_id "
+            "FROM bridge_fulfils ORDER BY created_at, rowid;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max) {
+        persist_bridge_fulfil_t *f = &out[count];
+        memset(f, 0, sizeof(*f));
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 0);
+        const char *pre_hex = (const char *)sqlite3_column_text(stmt, 1);
+        const char *up = (const char *)sqlite3_column_text(stmt, 2);
+        if (!hash_hex || !pre_hex ||
+            hex_decode(hash_hex, f->payment_hash, 32) != 32 ||
+            hex_decode(pre_hex, f->preimage, 32) != 32)
+            continue;
+        if (up) snprintf(f->upstream_id, sizeof(f->upstream_id), "%s", up);
+        f->bridge_htlc_id = (uint64_t)sqlite3_column_int64(stmt, 3);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int64_t persist_insert_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t bridge_htlc_id, uint64_t request_id,
+                                    size_t sender_idx, uint64_t sender_htlc_id) {
+    if (!persist_save_htlc_origin(p, payment_hash32, bridge_htlc_id, request_id,
+                                   sender_idx, sender_htlc_id))
+        return 0;
+    return (int64_t)sqlite3_last_insert_rowid(p->db);
+}
+
+int persist_update_htlc_origin(persist_t *p, int64_t row_id,
+                                uint64_t bridge_htlc_id, uint64_t request_id,
+                                size_t sender_idx, uint64_t sender_htlc_id) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "UPDATE htlc_origins SET bridge_htlc_id = ?, request_id = ?, "
+        "sender_idx = ?, sender_htlc_id = ? WHERE id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)bridge_htlc_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)request_id);
+    sqlite3_bind_int(stmt, 3, (int)sender_idx);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)sender_htlc_id);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)row_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_save_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t cltv_expiry,
+                                     const char *upstream_id, int fail_pending) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "INSERT OR REPLACE INTO htlc_origin_details "
+        "(origin_id, cltv_expiry, upstream_id, fail_pending) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)cltv_expiry);
+    sqlite3_bind_text(stmt, 3, upstream_id ? upstream_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, fail_pending ? 1 : 0);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t *cltv_expiry_out,
+                                     char *upstream_id_out, size_t upstream_len,
+                                     int *fail_pending_out) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql =
+        "SELECT cltv_expiry, upstream_id, fail_pending "
+        "FROM htlc_origin_details WHERE origin_id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        found = 1;
+        if (cltv_expiry_out)
+            *cltv_expiry_out = (uint32_t)sqlite3_column_int64(stmt, 0);
+        if (upstream_id_out && upstream_len > 0) {
+            const unsigned char *up = sqlite3_column_text(stmt, 1);
+            snprintf(upstream_id_out, upstream_len, "%s", up ? (const char *)up : "");
+        }
+        if (fail_pending_out)
+            *fail_pending_out = sqlite3_column_int(stmt, 2);
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id) {
+    if (!p || !p->db || row_id <= 0) return 0;
+    const char *sql = "UPDATE htlc_origins SET active = 0 WHERE id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)row_id);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 size_t persist_load_htlc_origins(persist_t *p,
                                   unsigned char (*hashes_out)[32],
                                   uint64_t *bridge_ids_out,
@@ -4804,10 +5609,24 @@ size_t persist_load_htlc_origins(persist_t *p,
                                   size_t *sender_idxs_out,
                                   uint64_t *sender_htlc_ids_out,
                                   size_t max_origins) {
+    return persist_load_htlc_origins_ids(p, hashes_out, bridge_ids_out,
+                                          request_ids_out, sender_idxs_out,
+                                          sender_htlc_ids_out, NULL, max_origins);
+}
+
+size_t persist_load_htlc_origins_ids(persist_t *p,
+                                      unsigned char (*hashes_out)[32],
+                                      uint64_t *bridge_ids_out,
+                                      uint64_t *request_ids_out,
+                                      size_t *sender_idxs_out,
+                                      uint64_t *sender_htlc_ids_out,
+                                      int64_t *row_ids_out,
+                                      size_t max_origins) {
     if (!p || !p->db) return 0;
 
     const char *sql =
-        "SELECT payment_hash, bridge_htlc_id, request_id, sender_idx, sender_htlc_id "
+        "SELECT payment_hash, bridge_htlc_id, request_id, sender_idx, "
+        "sender_htlc_id, id "
         "FROM htlc_origins WHERE active = 1 ORDER BY id;";
 
     sqlite3_stmt *stmt;
@@ -4827,6 +5646,8 @@ size_t persist_load_htlc_origins(persist_t *p,
             sender_idxs_out[count] = (size_t)sqlite3_column_int(stmt, 3);
         if (sender_htlc_ids_out)
             sender_htlc_ids_out[count] = (uint64_t)sqlite3_column_int64(stmt, 4);
+        if (row_ids_out)
+            row_ids_out[count] = (int64_t)sqlite3_column_int64(stmt, 5);
         count++;
     }
 
@@ -6705,6 +7526,77 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
+
+int persist_delete_factory_record(persist_t *p, uint32_t factory_id)
+{
+    if (!p || !p->db) return 0;
+    static const char *const sqls[] = {
+        "DELETE FROM factories WHERE id = ?;",
+        "DELETE FROM factory_participants WHERE factory_id = ?;",
+        "DELETE FROM tree_nodes WHERE factory_id = ?;",
+        "DELETE FROM distribution_txs WHERE factory_id = ?;",
+    };
+    for (size_t i = 0; i < sizeof(sqls) / sizeof(sqls[0]); i++) {
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(p->db, sqls[i], -1, &stmt, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_int(stmt, 1, (int)factory_id);
+        int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+int persist_load_tree_node_txid(persist_t *p, uint32_t factory_id,
+                                 uint32_t node_index, char *txid_hex65,
+                                 uint32_t *n_outputs_out)
+{
+    if (!p || !p->db || !txid_hex65) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid, n_outputs FROM tree_nodes WHERE factory_id = ? AND node_index = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_index);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        if (t && strlen(t) == 64) {
+            memcpy(txid_hex65, t, 65);
+            if (n_outputs_out) *n_outputs_out = (uint32_t)sqlite3_column_int(stmt, 1);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+int persist_load_factory_outpoint(persist_t *p, uint32_t factory_id,
+                                   char *txid_hex65, uint32_t *vout_out,
+                                   uint32_t *cltv_timeout_out)
+{
+    if (!p || !p->db || !txid_hex65) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT funding_txid, funding_vout, cltv_timeout FROM factories WHERE id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        if (t && strlen(t) == 64) {
+            memcpy(txid_hex65, t, 65);
+            if (vout_out) *vout_out = (uint32_t)sqlite3_column_int(stmt, 1);
+            if (cltv_timeout_out) *cltv_timeout_out = (uint32_t)sqlite3_column_int(stmt, 2);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
 
 /* --- Distribution TX (schema v14) --- */
 

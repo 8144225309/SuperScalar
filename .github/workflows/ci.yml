@@ -28,7 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Cache CMake deps
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/_deps
           key: cmake-deps-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -44,10 +44,14 @@ jobs:
       - name: Unit tests
         env:
           # ASan: leaks fail the job (exitcode=23). Suppressions in test/sanitizer_suppressions/lsan.supp.
+          # The suppression paths are absolute: the step runs the binary from build/,
+          # and a relative path made LSan abort with "failed to read suppressions
+          # file" (exit 23) as soon as it had any leak to classify.
           # TSan: data races fail the job (halt_on_error=1). Suppressions in test/sanitizer_suppressions/tsan.supp.
           ASAN_OPTIONS: ${{ matrix.sanitizers && 'detect_leaks=1' || 'detect_leaks=0' }}
-          LSAN_OPTIONS: ${{ matrix.sanitizers && 'exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0' || '' }}
-          TSAN_OPTIONS: ${{ matrix.tsan && 'halt_on_error=1:second_deadlock_stack=1:suppressions=test/sanitizer_suppressions/tsan.supp:print_suppressions=0' || '' }}
+          LSAN_OPTIONS: ${{ matrix.sanitizers && format('exitcode=23:suppressions={0}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0', github.workspace) || '' }}
+          TSAN_OPTIONS: ${{ matrix.tsan && format('halt_on_error=1:second_deadlock_stack=1:suppressions={0}/test/sanitizer_suppressions/tsan.supp:print_suppressions=0', github.workspace) || '' }}
+          UBSAN_OPTIONS: ${{ matrix.sanitizers && 'halt_on_error=1:print_stacktrace=1' || '' }}
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           cd build && ./test_superscalar --unit
@@ -65,17 +69,44 @@ jobs:
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           ./build/test_inproc_scale 4
+      - name: CLN plugin unit tests
+        # Plugin logic with the CLN RPC and bridge socket mocked; no node needed.
+        if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
+        run: python3 -m unittest -v tools/test_cln_plugin.py
       - name: CLN-bridge secure-by-default (#5 finding 1)
         # The bridge must REFUSE to start without --lsp-pubkey (unauthenticated NN
         # is MITM-exposed) unless --insecure-no-auth is explicitly passed.
         if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
         run: |
-          if ./build/superscalar_bridge >/tmp/br.out 2>&1; then
+          rc=0; ./build/superscalar_bridge >/tmp/br.out 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "FAIL: bridge started WITHOUT --lsp-pubkey"; cat /tmp/br.out; exit 1
           fi
+          # A configuration error is reported as 78 so supervisors do not loop
+          [ "$rc" -eq 78 ] || { echo "FAIL: exit status $rc, expected 78"; exit 1; }
           grep -q "refusing to start without --lsp-pubkey" /tmp/br.out || {
             echo "FAIL: missing secure-by-default refusal"; cat /tmp/br.out; exit 1; }
           echo "OK: bridge refuses unauthenticated NN startup by default"
+      - name: Daemon start-up gates
+        # Each daemon must refuse an unsafe mainnet start (either spelling of
+        # the chain name), an unknown chain and an unpinned LSP before it does
+        # anything.  No node is needed: every case exits at the start-up check.
+        if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
+        run: tools/test_startup_gates.sh build
+
+  # A pull request may raise PERSIST_SCHEMA_VERSION by one (with its
+  # migration) or leave it alone; anything else fails.
+  schema-version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: Schema version
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: PERSIST_SCHEMA_VERSION changed by at most +1
+        run: tools/check_schema_version.sh "origin/${{ github.base_ref }}"
 
   arm64-build-test:
     runs-on: ubuntu-latest
@@ -104,7 +135,11 @@ jobs:
             '
 
   static-analysis:
-    runs-on: ubuntu-latest
+    # Pinned: cppcheck comes from the runner image's apt archive, so
+    # ubuntu-latest silently changes the checker (24.04 ships 2.13, 26.04
+    # ships 2.19, which adds checks) and turns the job red without a code
+    # change.  The tree is clean under both; bump the pin deliberately.
+    runs-on: ubuntu-24.04
     name: Static Analysis
     # cppcheck on tools/superscalar_lsp.c can take 12-18 min on the
     # GitHub Actions runner under load; the rest of the corpus finishes
@@ -131,6 +166,7 @@ jobs:
         run: cmake --build build --parallel
       - name: Run cppcheck
         run: |
+          cppcheck --version
           cppcheck --enable=warning,performance,portability \
             --suppress=missingInclude \
             --suppress=unusedFunction \
@@ -152,7 +188,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Cache Bitcoin Core binary
         id: btc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: bitcoin-28.1
           key: bitcoin-core-28.1-x86_64
@@ -203,10 +239,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev sqlite3 python3
       - name: Cache Bitcoin Core binary
         id: btc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: bitcoin-28.1
           key: bitcoin-core-28.1-x86_64
@@ -265,7 +301,8 @@ jobs:
           # which preloads libstdbuf.so via LD_PRELOAD before the ASan
           # runtime — without the override ASan aborts at libinit.
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -278,7 +315,8 @@ jobs:
       - name: Multi-process k² sub-factory BREACH (under ASan+LSan)
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -289,7 +327,8 @@ jobs:
           # which preloads libstdbuf.so via LD_PRELOAD before the ASan
           # runtime — without the override ASan aborts at libinit.
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
@@ -303,11 +342,32 @@ jobs:
       - name: Multi-process distribution co-signed-path regression (under ASan+LSan)
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
-          LSAN_OPTIONS: exitcode=23:suppressions=test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           REGTEST_CONF: /home/runner/.bitcoin/bitcoin.conf
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           bash tools/test_regtest_distribution.sh build
+      # A payment must leave the factory leaf untouched: real daemons, one
+      # client-initiated payment, then a unilateral exit (LSP first, clients
+      # alone, and clients alone after refusing a leaf advance the LSP
+      # proposes).  Both client commitments must confirm and pay each client
+      # its balance.  Runs for the default leaf type and --arity 1.
+      # The script starts and stops its own bitcoind (private datadir and RPC
+      # port), independent of the node configured above.  That node runs with
+      # minrelaytxfee/blockmintxfee lowered to 500 sat/kvB, because a
+      # commitment transaction pays a fixed 154 sat for 167 vB, below the
+      # default relay floor; without that the exit could not be exercised.
+      # The script needs the sqlite3 CLI and python3 (installed above).
+      - name: Payment then unilateral exit, leaf untouched (under ASan+LSan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_regtest_payment_no_leaf_advance.sh build
+          ARITY=1 bash tools/test_regtest_payment_no_leaf_advance.sh build
       - name: Stop bitcoind
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true
@@ -343,34 +403,54 @@ jobs:
           LINES=$(grep 'lines' coverage-summary.txt | grep -oP '[\d.]+%' | head -1)
           echo "### Coverage: $LINES" >> $GITHUB_STEP_SUMMARY
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: build/coverage_report/
 
   fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_wire_recv, fuzz_wire_parse_json, fuzz_tx_sighash,
+                 fuzz_persist_load, fuzz_hex_decode,
+                 fuzz_noise_handshake, fuzz_aead_decrypt]
     runs-on: ubuntu-latest
-    name: Fuzz Testing
-    timeout-minutes: 60
+    name: Fuzz (${{ matrix.target }})
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libssl-dev clang
-      - name: Build fuzz targets
+      - name: Build fuzz target
         run: |
           CC=clang cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_FUZZING=ON \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build build --parallel --target fuzz_wire_recv fuzz_wire_parse_json \
-            fuzz_tx_sighash fuzz_persist_load fuzz_hex_decode \
-            fuzz_noise_handshake fuzz_aead_decrypt
-      - name: Run fuzz (5 min each)
+          cmake --build build --parallel --target ${{ matrix.target }}
+      # The corpus each run grows is kept for the next one (a new cache entry
+      # per run, restored from the newest earlier entry of the same target).
+      - name: Restore corpus
+        uses: actions/cache@v6
+        with:
+          path: build/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # A crash, a leak, undefined behaviour or an input that runs longer
+      # than -timeout seconds fails the job; the input that caused it is
+      # uploaded below.
+      - name: Run fuzz (5 min)
         run: |
           cd build
-          for target in fuzz_wire_recv fuzz_wire_parse_json fuzz_tx_sighash \
-                        fuzz_persist_load fuzz_hex_decode \
-                        fuzz_noise_handshake fuzz_aead_decrypt; do
-              mkdir -p corpus/$target
-              timeout 300 ./$target corpus/$target/ -max_total_time=300 || true
-          done
+          mkdir -p corpus/${{ matrix.target }} artifacts
+          SEEDS=""
+          if [ -d ../fuzz/corpus/${{ matrix.target }} ]; then SEEDS=../fuzz/corpus/${{ matrix.target }}; fi
+          ./${{ matrix.target }} corpus/${{ matrix.target }}/ $SEEDS \
+            -max_total_time=300 -timeout=60 -artifact_prefix=artifacts/
+      - name: Upload reproducer
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-reproducer-${{ matrix.target }}
+          path: build/artifacts/

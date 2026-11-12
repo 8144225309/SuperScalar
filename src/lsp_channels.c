@@ -500,7 +500,7 @@ static int recv_timeout_service_bridge(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 mgr->bridge_fd = -1;
             } else {
                 servicing = 1;
-                lsp_channels_handle_bridge_msg(mgr, lsp, &bmsg);
+                lsp_channels_handle_bridge_msg_during_wait(mgr, lsp, client_fd, &bmsg);
                 servicing = 0;
                 cJSON_Delete(bmsg.json);
             }
@@ -587,8 +587,68 @@ static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 }
 
+int lsp_channels_defer_msg(lsp_channel_mgr_t *mgr, size_t client_idx,
+                            wire_msg_t *msg) {
+    if (!mgr || !msg) return 0;
+    if (mgr->n_deferred_msgs >= LSP_DEFERRED_MSGS_MAX) return 0;
+    if (mgr->n_deferred_msgs == mgr->deferred_msgs_cap) {
+        size_t cap = mgr->deferred_msgs_cap ? mgr->deferred_msgs_cap * 2 : 8;
+        lsp_deferred_msg_t *q = realloc(mgr->deferred_msgs, cap * sizeof(*q));
+        if (!q) return 0;
+        mgr->deferred_msgs = q;
+        mgr->deferred_msgs_cap = cap;
+    }
+    lsp_deferred_msg_t *slot = &mgr->deferred_msgs[mgr->n_deferred_msgs++];
+    slot->client_idx = client_idx;
+    slot->msg = *msg;
+    msg->json = NULL;
+    return 1;
+}
+
+size_t lsp_channels_deferred_count(const lsp_channel_mgr_t *mgr) {
+    return mgr ? mgr->n_deferred_msgs : 0;
+}
+
+int lsp_channels_drain_deferred(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || mgr->n_deferred_msgs == 0) return 0;
+
+    /* Detach first: a handler may hold further messages, which then wait
+       for the next drain. */
+    lsp_deferred_msg_t *q = mgr->deferred_msgs;
+    size_t n = mgr->n_deferred_msgs;
+    mgr->deferred_msgs = NULL;
+    mgr->n_deferred_msgs = 0;
+    mgr->deferred_msgs_cap = 0;
+
+    int handled = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t c = q[i].client_idx;
+        if (lsp && c < mgr->n_channels && lsp->client_fds[c] >= 0) {
+            if (!lsp_channels_handle_msg(mgr, lsp, c, &q[i].msg))
+                fprintf(stderr, "LSP: handle_msg failed for held msg 0x%02x "
+                        "from client %zu\n", q[i].msg.msg_type, c);
+            handled++;
+        }
+        if (q[i].msg.json) cJSON_Delete(q[i].msg.json);
+    }
+    free(q);
+    return handled;
+}
+
+void lsp_channels_free_deferred(lsp_channel_mgr_t *mgr) {
+    if (!mgr) return;
+    for (size_t i = 0; i < mgr->n_deferred_msgs; i++)
+        if (mgr->deferred_msgs[i].msg.json)
+            cJSON_Delete(mgr->deferred_msgs[i].msg.json);
+    free(mgr->deferred_msgs);
+    mgr->deferred_msgs = NULL;
+    mgr->n_deferred_msgs = 0;
+    mgr->deferred_msgs_cap = 0;
+}
+
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr) {
     if (!mgr) return;
+    lsp_channels_free_deferred(mgr);
     if (mgr->entries) {
         for (size_t i = 0; i < mgr->n_channels; i++)
             channel_cleanup(&mgr->entries[i].channel);
@@ -691,6 +751,36 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     free(bp_ready);
 
     return 1;
+}
+
+int lsp_channel_carry_client_balance(channel_t *ch, uint64_t client_balance) {
+    uint64_t usable = ch->local_amount + ch->remote_amount;
+    if (client_balance > usable) return 0;
+    ch->remote_amount = client_balance;
+    ch->local_amount = usable - client_balance;
+    return 1;
+}
+
+/* Channel open: sign the client's commitment 0 and send it as
+   COMMITMENT_SIGNED, so the client can exit unilaterally with its opening
+   balance before any payment has moved.  Uses nonce index 0 of the pools just
+   exchanged; nothing is revoked, so no REVOKE_AND_ACK follows. */
+static int lsp_send_initial_commitment(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c) {
+    lsp_channel_entry_t *entry = &mgr->entries[c];
+    unsigned char psig32[32];
+    uint32_t nonce_idx;
+    if (!channel_create_commitment_partial_sig(&entry->channel, psig32, &nonce_idx)) {
+        fprintf(stderr, "LSP: create initial commitment partial sig failed for client %zu\n", c);
+        return 0;
+    }
+    cJSON *cs = wire_build_commitment_signed(entry->channel_id,
+                                               entry->channel.commitment_number,
+                                               psig32, nonce_idx);
+    int ok = wire_send(lsp->client_fds[c], MSG_COMMITMENT_SIGNED, cs);
+    cJSON_Delete(cs);
+    if (!ok)
+        fprintf(stderr, "LSP: failed to send initial COMMITMENT_SIGNED to client %zu\n", c);
+    return ok;
 }
 
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
@@ -810,6 +900,11 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             channel_set_remote_pubnonces(&mgr->entries[c].channel,
                 (const unsigned char (*)[66])client_nonces, client_nonce_count);
 
+            if (!lsp_send_initial_commitment(mgr, lsp, c)) {
+                free(nonce_fds); free(nonce_ready);
+                return 0;
+            }
+
             nonce_fds[c] = -1;  /* mark as received */
             nonces_received++;
             mgr->entries[c].ready = 1;
@@ -842,9 +937,12 @@ uint32_t lsp_compute_factory_cltv_delta(const void *factory_ptr) {
 
 int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
                                    uint32_t factory_cltv_timeout,
-                                   uint32_t cltv_delta) {
+                                   uint32_t cltv_delta,
+                                   uint32_t current_height) {
     if (cltv_delta == 0) cltv_delta = FACTORY_CLTV_DELTA_DEFAULT;
-    if (cltv_expiry <= cltv_delta)
+    /* cltv_expiry is an absolute height: the delta has to fit between the
+       chain tip and the expiry, not between zero and the expiry. */
+    if ((uint64_t)cltv_expiry <= (uint64_t)current_height + cltv_delta)
         return 0;
     /* Reject HTLCs that expire at or past factory timeout — funds would be trapped */
     if (factory_cltv_timeout > 0 && cltv_expiry >= factory_cltv_timeout)
@@ -869,6 +967,64 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     uint64_t amount_sats = amount_msat / 1000;
     if (amount_sats == 0) return 0;
+
+    /* Destination: dest_client for a factory-internal payment, or a bolt11
+       invoice to be paid on the outside through the bridge. */
+    cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
+    cJSON *bolt11_item = cJSON_GetObjectItem(json, "bolt11");
+    int pay_outside = (!dest_item || !cJSON_IsNumber(dest_item)) &&
+                      bolt11_item && cJSON_IsString(bolt11_item);
+    uint64_t outside_budget_msat = 0;
+    uint32_t outside_max_delay = 0;
+
+    /* An outside payment is only attempted for an invoice that this HTLC
+       actually funds.  Anything else is refused before the HTLC is taken. */
+    if (pay_outside) {
+        const char *why = NULL;
+        if (mgr->bridge_fd < 0) {
+            why = "bridge_unavailable";
+        } else {
+            uint32_t min_final_cltv = 0;
+            bridge_pay_check_t chk = lsp_bridge_check_outbound_invoice(
+                mgr->ctx, bolt11_item->valuestring, payment_hash, amount_sats,
+                mgr->routing_fee_ppm, lsp_channels_network(mgr),
+                (uint64_t)time(NULL), NULL, &outside_budget_msat,
+                &min_final_cltv);
+            /* The HTLC must outlive the outside route by the blocks the LSP
+               needs to claim it in the factory once the preimage is known. */
+            if (chk == BRIDGE_PAY_OK)
+                chk = lsp_bridge_outbound_max_delay(
+                    cltv_expiry, lsp_channels_chain_height(mgr), min_final_cltv,
+                    lsp_compute_factory_cltv_delta(&lsp->factory),
+                    lsp->factory.cltv_timeout, &outside_max_delay);
+            if (chk != BRIDGE_PAY_OK)
+                why = lsp_bridge_pay_check_str(chk);
+            /* An invoice this LSP registered for one of its own clients is
+               paid inside the factory (dest_client), never by sending the
+               money out through the Lightning node and back in. */
+            else if (lsp_channels_invoice_amount(mgr, payment_hash, NULL))
+                why = "invoice_is_internal";
+            /* One outside payment per hash: a second HTLC for a hash that
+               is being paid, or was paid, would be charged for nothing. */
+            else if (lsp_channels_hash_in_flight(mgr, payment_hash))
+                why = "payment_hash_in_flight";
+            else if (lsp_channels_outbound_was_paid(mgr, payment_hash))
+                why = "invoice_already_paid";
+            else if (!lsp_channels_origin_slot_free(mgr))
+                why = "too_many_pending_payments";
+        }
+        if (why) {
+            fprintf(stderr, "LSP: outside payment from client %zu refused: %s\n",
+                    sender_idx, why);
+            /* Refused before the HTLC was taken into the channel: the
+               client drops it from its own state and no commitment
+               exchange follows. */
+            cJSON *fail = wire_build_update_fail_htlc_uncommitted(htlc_id, why);
+            wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            return 1;  /* a payment failure, not a protocol error */
+        }
+    }
 
     channel_t *sender_ch = &mgr->entries[sender_idx].channel;
 
@@ -901,8 +1057,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                            payment_hash, cltv_expiry, &new_htlc_id)) {
         fprintf(stderr, "LSP: add_htlc failed for client %zu (insufficient funds?)\n",
                 sender_idx);
-        /* Send fail back */
-        cJSON *fail = wire_build_update_fail_htlc(htlc_id, "insufficient funds");
+        /* Send fail back: the HTLC was not taken, so the client drops it
+           and no commitment follows */
+        cJSON *fail = wire_build_update_fail_htlc_uncommitted(htlc_id,
+                                                               "insufficient funds");
         wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
         cJSON_Delete(fail);
         free(old_sender_htlcs);
@@ -964,6 +1122,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 cJSON_Delete(ack_msg.json);
                 free(old_sender_htlcs);
                 free(old_sender_ptlcs);
+                lsp_channels_abort_unrevoked_htlc(mgr, lsp, sender_idx, sender_ch,
+                                                   new_htlc_id);
                 return 0;
             }
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
@@ -1009,6 +1169,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     free(old_sender_htlcs);
     free(old_sender_ptlcs);
 
+    /* Without the sender's revocation (it did not parse, or was refused)
+       its payment is not made: the HTLC is failed, nothing is recorded and
+       nothing is forwarded. */
+    if (!lsp_channels_peer_revoked(sender_ch)) {
+        lsp_channels_abort_unrevoked_htlc(mgr, lsp, sender_idx, sender_ch,
+                                           new_htlc_id);
+        return 0;
+    }
+
     /* Persist sender channel balance + HTLC atomically (crash-state protection) */
     if (mgr->persist) {
         persist_t *db = (persist_t *)mgr->persist;
@@ -1036,42 +1205,44 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (sender_batch)
         persist_commit((persist_t *)mgr->persist);
 
-    /* Find destination: check dest_client field, then bolt11 for bridge routing */
-    cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
-    cJSON *bolt11_item = cJSON_GetObjectItem(json, "bolt11");
-
-    /* If bolt11 present and bridge connected, route outbound via bridge */
-    if ((!dest_item || !cJSON_IsNumber(dest_item)) &&
-        bolt11_item && cJSON_IsString(bolt11_item) && mgr->bridge_fd >= 0) {
+    /* Invoice checked above: route outbound via the bridge, telling it the
+       hash the invoice must carry and the most it may spend. */
+    if (pay_outside) {
         uint64_t request_id = mgr->next_request_id++;
-        cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
-                                                  payment_hash, request_id);
-        int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
-        cJSON_Delete(pay);
-        if (!ok) return 0;
 
-        /* Track origin for when PAY_RESULT comes back */
-        lsp_channels_track_bridge_origin(mgr, payment_hash, 0);
-        /* Store request_id + sender info for back-propagation */
-        if (mgr->n_htlc_origins > 0) {
-            htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins - 1];
-            origin->request_id = request_id;
-            origin->sender_idx = sender_idx;
-            origin->sender_htlc_id = new_htlc_id;
-            /* Persist origin + counter atomically */
-            if (mgr->persist) {
-                persist_t *db = (persist_t *)mgr->persist;
-                int own_txn = !persist_in_transaction(db);
-                if (own_txn) persist_begin(db);
-                persist_save_htlc_origin(db,
-                    payment_hash, 0, request_id, sender_idx, new_htlc_id);
-                persist_save_counter(db,
-                                      "next_request_id", mgr->next_request_id);
-                if (own_txn) persist_commit(db);
-            }
-        } else if (mgr->persist) {
-            persist_save_counter((persist_t *)mgr->persist,
-                                  "next_request_id", mgr->next_request_id);
+        /* Record the payment, in memory and in the database, before asking
+           for it: once the request is out its result must always find the
+           client's HTLC, also after a restart. */
+        htlc_origin_t *out_origin = lsp_channels_track_outbound_pay(
+            mgr, payment_hash, request_id, sender_idx, new_htlc_id, cltv_expiry);
+        if (mgr->persist) {
+            persist_t *db = (persist_t *)mgr->persist;
+            int own_txn = !persist_in_transaction(db);
+            if (own_txn) persist_begin(db);
+            lsp_channels_origin_save(mgr, out_origin);
+            persist_save_counter(db, "next_request_id", mgr->next_request_id);
+            if (own_txn) persist_commit(db);
+        }
+
+        int ok = 0;
+        if (out_origin && mgr->bridge_fd >= 0) {
+            cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
+                                                      payment_hash, request_id,
+                                                      outside_budget_msat,
+                                                      outside_max_delay);
+            ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
+            cJSON_Delete(pay);
+        }
+        if (!ok) {
+            /* The request did not go out (a partly written frame is not a
+               request), so nothing can be in flight on the outside: give
+               the client its HTLC back. */
+            fprintf(stderr, "LSP: outside payment %llu for client %zu could "
+                    "not be requested, HTLC returned\n",
+                    (unsigned long long)request_id, sender_idx);
+            lsp_channels_fail_outbound_htlc(mgr, lsp, out_origin, sender_idx,
+                                             new_htlc_id, "bridge_unavailable");
+            return 1;
         }
         printf("LSP: HTLC from client %zu routed to bridge (bolt11)\n", sender_idx);
         return 1;
@@ -1150,7 +1321,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint32_t fwd_cltv_expiry;
     if (!lsp_validate_cltv_for_forward(cltv_expiry, &fwd_cltv_expiry,
                                         lsp->factory.cltv_timeout,
-                                        factory_delta)) {
+                                        factory_delta, 0)) {
         fprintf(stderr, "LSP: cltv_expiry %u rejected (delta %u, factory timeout %u)\n",
                 cltv_expiry, factory_delta, lsp->factory.cltv_timeout);
         free(old_dest_htlcs);
@@ -1888,7 +2059,7 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
 
         /* Collect channel indices that live on this leaf node. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;
@@ -2037,16 +2208,23 @@ static int lsp_advance_leaf_stateless(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 node->outputs[0].amount_sats,
                 /* poison_tx */ poison_snapshot, poison_snapshot_len);
         } else {
-            uint32_t leaf_states[8];
-            for (int i = 0; i < f->n_leaf_nodes; i++)
+            /* One entry per leaf: n_leaf_nodes is not bounded by a small
+               constant (a fixed [8] array overflowed past 8 leaves). */
+            uint32_t *leaf_states = calloc(f->n_leaf_nodes > 0 ? (size_t)f->n_leaf_nodes : 1,
+                                           sizeof(uint32_t));
+            for (int i = 0; leaf_states && i < f->n_leaf_nodes; i++)
                 leaf_states[i] = f->leaf_layers[i].current_state;
-            uint32_t layer_states[DW_MAX_LAYERS];
+            uint32_t layer_states[DW_MAX_LAYERS] = {0};
             for (uint32_t i = 0; i < f->counter.n_layers; i++)
                 layer_states[i] = f->counter.layers[i].config.max_states;
-            persist_save_dw_counter_with_leaves(
-                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-                f->counter.n_layers, layer_states,
-                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+            if (leaf_states)
+                persist_save_dw_counter_with_leaves(
+                    (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+                    f->counter.n_layers, layer_states,
+                    f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+            else
+                fprintf(stderr, "LSP: per-leaf DW state not persisted (out of memory)\n");
+            free(leaf_states);
         }
     }
 
@@ -2722,7 +2900,7 @@ static int lsp_run_state_advance_stateless(lsp_channel_mgr_t *mgr,
                        "(%zu bytes, L-stock %llu sats)\n", affected[k], poison_len,
                        (unsigned long long)poison_old_l_amount[k]);
             }
-            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+            uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
             size_t n_leaf_ch = 0;
             for (size_t cc = 0; cc < mgr->n_channels; cc++) {
                 size_t c_node; uint32_t c_vout;
@@ -2949,10 +3127,49 @@ int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     return changed;
 }
 
-/* Cooperatively redistribute output amounts on an arity-2 leaf (3-of-3).
-   LSP proposes new amounts; both clients agree via 2-round MuSig2 ceremony. */
+static int lsp_realloc_leaf_ceremony(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int leaf_side, const uint64_t *amounts,
+                                      size_t n_amounts);
+
+/* Cooperatively redistribute output amounts on a leaf.  The ceremony
+   advances the LSP's own copy of the leaf before it asks the clients, so a
+   ceremony that fails (a client refuses, times out or sends a bad
+   signature) would leave the LSP on a leaf state nobody else holds and with
+   no signature for it.  The leaf is captured first and put back on failure. */
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts) {
+    if (!mgr || !lsp || !amounts) return 0;
+    factory_t *f = &lsp->factory;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    factory_leaf_snapshot_t before;
+    if (!factory_leaf_snapshot(f, leaf_side, &before)) {
+        fprintf(stderr, "LSP realloc: cannot capture leaf %d before the "
+                "ceremony\n", leaf_side);
+        return 0;
+    }
+    uint32_t root_epoch_before = f->counter.current_epoch;
+
+    int ok = lsp_realloc_leaf_ceremony(mgr, lsp, leaf_side, amounts, n_amounts);
+
+    /* If the leaf counter was exhausted the root advanced and the whole tree
+       was rebuilt for a new epoch; that is not undone leaf by leaf. */
+    if (!ok && f->counter.current_epoch == root_epoch_before) {
+        factory_session_reset_poison(f, f->leaf_node_indices[leaf_side]);
+        if (factory_leaf_restore(f, leaf_side, &before))
+            fprintf(stderr, "LSP realloc: ceremony failed — leaf %d restored "
+                    "to its state before the proposal\n", leaf_side);
+        else
+            fprintf(stderr, "LSP realloc: ceremony failed and leaf %d could "
+                    "NOT be restored\n", leaf_side);
+    }
+    factory_leaf_snapshot_free(&before);
+    return ok;
+}
+
+static int lsp_realloc_leaf_ceremony(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int leaf_side, const uint64_t *amounts,
+                                      size_t n_amounts) {
     factory_t *f = &lsp->factory;
 
     /* Generalized to N-of-N MuSig.  Works for any leaf arity where the
@@ -3362,7 +3579,7 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
        (#258), reproduced end-to-end by tools/test_regtest_cheat_realloc.sh. */
     if (mgr->watchtower && realloc_had_signed && node->is_signed &&
         node->signed_tx.len > 0) {
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t cc = 0; cc < mgr->n_channels; cc++) {
             size_t c_node;
@@ -3487,16 +3704,22 @@ int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Step 14: Persist per-leaf DW state */
     if (mgr->persist) {
-        uint32_t leaf_states[8];
-        for (int i = 0; i < f->n_leaf_nodes; i++)
+        /* One entry per leaf (a fixed [8] array overflowed past 8 leaves). */
+        uint32_t *leaf_states = calloc(f->n_leaf_nodes > 0 ? (size_t)f->n_leaf_nodes : 1,
+                                       sizeof(uint32_t));
+        for (int i = 0; leaf_states && i < f->n_leaf_nodes; i++)
             leaf_states[i] = f->leaf_layers[i].current_state;
-        uint32_t layer_states[DW_MAX_LAYERS];
+        uint32_t layer_states[DW_MAX_LAYERS] = {0};
         for (uint32_t i = 0; i < f->counter.n_layers; i++)
             layer_states[i] = f->counter.layers[i].config.max_states;
-        persist_save_dw_counter_with_leaves(
-            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
-            f->counter.n_layers, layer_states,
-            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        if (leaf_states)
+            persist_save_dw_counter_with_leaves(
+                (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+                f->counter.n_layers, layer_states,
+                f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+        else
+            fprintf(stderr, "LSP: per-leaf DW state not persisted (out of memory)\n");
+        free(leaf_states);
     }
 
     printf("LSP: leaf %d realloc complete (node %zu), amounts=[", leaf_side, node_idx);
@@ -4885,91 +5108,19 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 /* Buy inbound liquidity from L-stock for a client.
-   Moves amount_sats from the L-stock output (last vout on the leaf) to
-   the client's channel output, then adjusts channel balance so purchased
-   sats become LSP local_amount (= client's inbound capacity).
 
-   Generalized in PR #123 (Gap C-followup) to work for any leaf arity
-   that has an L-stock output (i.e., n_outputs >= 2 — at least 1 channel
-   + L-stock).  PS leaves post-advance (n_outputs == 1, no L-stock) are
-   correctly rejected. */
+   Selling L-stock moves sats from the leaf's L-stock output to the client's
+   channel output, which is a leaf reallocation.  Clients refuse to co-sign
+   one, because their channel cannot yet be moved to the new leaf output, so
+   the request is refused here, before anything is proposed to a client or
+   changed on the leaf. */
 int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 size_t client_idx, uint64_t amount_sats) {
-    if (!mgr || !lsp) return 0;
-    factory_t *f = &lsp->factory;
-    if (client_idx >= mgr->n_channels || amount_sats == 0) {
-        fprintf(stderr, "buy_liquidity: invalid client %zu or amount 0\n", client_idx);
-        return 0;
-    }
-
-    /* Map client to leaf */
-    size_t node_idx;
-    uint32_t vout;
-    client_to_leaf(client_idx, f, &node_idx, &vout);
-    factory_node_t *ln = &f->nodes[node_idx];
-    if (ln->n_outputs < 2) {
-        fprintf(stderr, "buy_liquidity: leaf %zu has %zu outputs, need >= 2 (channels + L-stock)\n",
-                node_idx, ln->n_outputs);
-        return 0;
-    }
-
-    /* L-stock is the LAST output on the leaf (canonical layout for both
-       uniform-arity and mixed-arity factories). */
-    size_t lstock_vout = ln->n_outputs - 1;
-    if (vout == lstock_vout) {
-        fprintf(stderr, "buy_liquidity: client %zu maps to L-stock vout, not a channel\n", client_idx);
-        return 0;
-    }
-
-    /* Validate L-stock has enough (keep >= 546 dust) */
-    uint64_t lstock = ln->outputs[lstock_vout].amount_sats;
-    if (lstock < 546 + amount_sats) {
-        fprintf(stderr, "buy_liquidity: amount %llu exceeds L-stock %llu (dust limit)\n",
-                (unsigned long long)amount_sats, (unsigned long long)lstock);
-        return 0;
-    }
-
-    /* Find which leaf_side this client's leaf is at.  We need this for
-       lsp_realloc_leaf which takes leaf_side (index into
-       f->leaf_node_indices[]), not raw node_idx. */
-    int leaf_side = -1;
-    for (int i = 0; i < f->n_leaf_nodes; i++) {
-        if (f->leaf_node_indices[i] == node_idx) { leaf_side = i; break; }
-    }
-    if (leaf_side < 0) {
-        fprintf(stderr, "buy_liquidity: node %zu not found in leaf_node_indices\n", node_idx);
-        return 0;
-    }
-
-    /* Build new amounts: add to client's output, subtract from L-stock */
-    uint64_t new_amounts[FACTORY_MAX_OUTPUTS];
-    for (size_t k = 0; k < ln->n_outputs; k++)
-        new_amounts[k] = ln->outputs[k].amount_sats;
-    new_amounts[vout] += amount_sats;
-    new_amounts[lstock_vout] -= amount_sats;
-
-    /* Perform the reallocation (DW advance + MuSig2 re-sign) */
-    if (!lsp_realloc_leaf(mgr, lsp, leaf_side, new_amounts, ln->n_outputs)) {
-        fprintf(stderr, "buy_liquidity: realloc failed\n");
-        return 0;
-    }
-
-    /* Override balance split: purchased sats go to LSP local_amount
-       (= client's inbound capacity) */
-    size_t fd_idx = client_idx;
-    if (fd_idx < mgr->n_channels) {
-        lsp_channel_entry_t *entry = &mgr->entries[fd_idx];
-        uint64_t add_msat = amount_sats * 1000;
-        entry->channel.local_amount += add_msat;
-        if (entry->channel.remote_amount >= add_msat)
-            entry->channel.remote_amount -= add_msat;
-        else
-            entry->channel.remote_amount = 0;
-    }
-
-    printf("LSP: buy_liquidity client %zu: +%llu sats inbound from L-stock\n",
-           client_idx, (unsigned long long)amount_sats);
-    return 1;
+    (void)mgr; (void)lsp;
+    fprintf(stderr, "buy_liquidity: refused for client %zu (%llu sats): "
+            LSP_LEAF_REALLOC_UNAVAILABLE "\n",
+            client_idx, (unsigned long long)amount_sats);
+    return 0;
 }
 
 /* Handle FULFILL_HTLC from a client (the payee reveals the preimage). */
@@ -5038,9 +5189,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint32_t ack_chan_id;
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                        rev_secret, next_point)) {
+                                        rev_secret, next_point) &&
+            lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
             uint64_t old_cn = ch->commitment_number - 1;
-            channel_receive_revocation(ch, old_cn, rev_secret);
             /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                No-op today (n_ptlcs == 0 at all current callsites); defensive
                for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -5106,13 +5257,22 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     /* Check if this HTLC originated from the bridge */
-    uint64_t bridge_htlc_id = lsp_channels_get_bridge_origin(mgr, payment_hash);
-    if (bridge_htlc_id > 0 && mgr->bridge_fd >= 0) {
-        /* Back-propagate to bridge instead of intra-factory */
-        cJSON *fulfill = wire_build_bridge_fulfill_htlc(payment_hash, preimage,
-                                                          bridge_htlc_id);
-        wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, fulfill);
-        cJSON_Delete(fulfill);
+    uint64_t bridge_htlc_id = lsp_channels_settle_bridge_origin(mgr, payment_hash,
+                                                                 preimage);
+    if (bridge_htlc_id > 0) {
+        /* Back-propagate to bridge instead of intra-factory.  With the
+           bridge away the fulfil is kept and given when the Lightning node
+           offers the HTLC again. */
+        if (mgr->bridge_fd >= 0) {
+            cJSON *fulfill = wire_build_bridge_fulfill_htlc(payment_hash, preimage,
+                                                              bridge_htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, fulfill);
+            cJSON_Delete(fulfill);
+        } else {
+            fprintf(stderr, "LSP: bridge not connected, fulfil for htlc_id=%llu "
+                    "kept until the bridge is back\n",
+                    (unsigned long long)bridge_htlc_id);
+        }
         printf("LSP: HTLC fulfilled via bridge (htlc_id=%llu)\n",
                (unsigned long long)bridge_htlc_id);
         /* Commit the payee persist transaction (bridge = no sender debit) */
@@ -5121,7 +5281,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
-    int sender_found = -1;
     for (size_t s = 0; s < mgr->n_channels; s++) {
         if (s == client_idx) continue;
         channel_t *sender_ch = &mgr->entries[s].channel;
@@ -5176,9 +5335,9 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
-                                                rev_secret, next_point)) {
+                                                rev_secret, next_point) &&
+                    lsp_channels_accept_revocation(mgr, lsp, sender_ch, rev_secret)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
-                    channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
                        No-op today (n_ptlcs == 0 at all current callsites); defensive
                        for when CLN-bLIP56 (#172) wires real PTLC flow through here. */
@@ -5223,7 +5382,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
-            sender_found = (int)s;
             break;
         }
     }
@@ -5233,18 +5391,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (fulfill_txn_started && mgr->persist)
         persist_commit((persist_t *)mgr->persist);
 
-    /* Per-leaf advance: after payment settles, advance both affected leaves.
-       Arity-1 (DW) and Arity-PS both use per-leaf 2-of-2 signing, so only
-       the involved clients' leaves need to be re-signed, not the entire tree. */
-    if (lsp->factory.leaf_arity == FACTORY_ARITY_1 ||
-        lsp->factory.leaf_arity == FACTORY_ARITY_PS) {
-        /* Advance payee's leaf */
-        lsp_advance_leaf(mgr, lsp, (int)client_idx);
-        /* Advance sender's leaf (if found via intra-factory routing) */
-        if (sender_found >= 0 && sender_found != (int)client_idx)
-            lsp_advance_leaf(mgr, lsp, sender_found);
-    }
-
+    /* A settled payment moves balances inside the channels only; nothing the
+       leaf transaction commits to has changed, so the factory tree is left
+       untouched.  Advancing the leaf here would replace the transaction whose
+       output funds the channel while both sides' commitments keep spending
+       the old outpoint. */
     return 1;
 }
 
@@ -5269,6 +5420,23 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wire_parse_update_fail_htlc(msg->json, &htlc_id, reason, sizeof(reason)))
             return 0;
         channel_t *ch = &mgr->entries[client_idx].channel;
+        /* A client can only give back an HTLC the LSP offered to it.  One
+           the client offered itself is the LSP's to resolve: failing it here
+           would refund the client for a payment that may still go through
+           (an outside payment in flight above all). */
+        const htlc_t *target = NULL;
+        for (size_t hi = 0; hi < ch->n_htlcs; hi++)
+            if (ch->htlcs[hi].id == htlc_id &&
+                ch->htlcs[hi].state == HTLC_STATE_ACTIVE)
+                target = &ch->htlcs[hi];
+        if (!target || target->direction != HTLC_OFFERED ||
+            lsp_channels_htlc_awaits_outside_pay(mgr, client_idx, htlc_id)) {
+            fprintf(stderr, "LSP: PROTOCOL ERROR — client %zu sent "
+                    "UPDATE_FAIL_HTLC for HTLC %llu, which is %s; ignored\n",
+                    client_idx, (unsigned long long)htlc_id,
+                    target ? "not one it received" : "not active");
+            return 0;
+        }
         channel_fail_htlc(ch, htlc_id);
         /* Delete failed HTLC from persistence */
         if (mgr->persist)
@@ -5326,6 +5494,17 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (!wire_parse_register_invoice(msg->json, payment_hash, preimage,
                                            &amount_msat, &dest_client))
             return 0;
+        /* A hash with an HTLC in flight, or one already paid in either
+           direction, cannot become an invoice: tell the client there will
+           be none (an empty BOLT11 string). */
+        if (lsp_channels_hash_spent_or_busy(mgr, payment_hash)) {
+            fprintf(stderr, "LSP: register_invoice from client %zu refused — "
+                    "payment hash is in use or already paid\n", client_idx);
+            cJSON *none = wire_build_invoice_bolt11(payment_hash, "");
+            wire_send(lsp->client_fds[client_idx], MSG_INVOICE_BOLT11, none);
+            cJSON_Delete(none);
+            return 1;
+        }
         if (!lsp_channels_register_invoice(mgr, payment_hash, preimage,
                                              dest_client, amount_msat)) {
             fprintf(stderr, "LSP: register_invoice failed\n");
@@ -5461,6 +5640,13 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                client_idx, channel_id);
         return 1;
     }
+
+    case MSG_JIT_REJECT:
+        /* A decline that arrives when no offer is pending (the LSP already
+           gave up waiting): nothing to do. */
+        printf("LSP: client %zu declined a JIT offer that is no longer pending\n",
+               client_idx);
+        return 1;
 
     case MSG_LSPS_REQUEST: {
         lsps_ctx_t lsps_ctx = {
@@ -6003,30 +6189,41 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     fprintf(stderr, "LSP reconnect: retransmitted pending CS "
                             "(cn=%llu) to client %zu\n",
                             (unsigned long long)ch->commitment_number, c);
-                    /* Wait for RAA before RECONNECT_ACK */
+                    /* The pending commitment is settled by the client's
+                       revocation and by nothing else.  Without one that
+                       parses and matches, it stays pending and this
+                       reconnect is refused: the client is disconnected. */
                     wire_msg_t pcs_raa;
-                    if (wire_recv_timeout(new_fd, &pcs_raa, 30) &&
-                        pcs_raa.msg_type == MSG_REVOKE_AND_ACK) {
+                    int pcs_revoked = 0;
+                    if (lsp_channels_recv_client_reply(new_fd, &pcs_raa,
+                                                        MSG_REVOKE_AND_ACK, 30)) {
                         uint32_t pcs_ack_id;
                         unsigned char pcs_rev[32], pcs_np[33];
                         if (wire_parse_revoke_and_ack(pcs_raa.json, &pcs_ack_id,
-                                                        pcs_rev, pcs_np)) {
-                            uint64_t old_pcn = ch->commitment_number - 1;
-                            channel_receive_revocation(ch, old_pcn, pcs_rev);
-                        }
-                        cJSON_Delete(pcs_raa.json);
-                        persist_save_pending_cs(pcs_db,
-                            mgr->entries[c].channel_id, 0); /* clear */
-                    } else {
-                        if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
-                        fprintf(stderr, "LSP reconnect: RAA timeout after CS retransmit "
-                                "(client %zu) — clearing stale pending_cs\n", c);
-                        /* Clear pending_cs to prevent infinite retransmit on
-                           every future reconnect.  The client already processed
-                           the CS on the first attempt. */
-                        persist_save_pending_cs(pcs_db,
-                            mgr->entries[c].channel_id, 0);
+                                                        pcs_rev, pcs_np) &&
+                            channel_receive_revocation(ch,
+                                ch->commitment_number - 1, pcs_rev))
+                            pcs_revoked = 1;
+                        secure_zero(pcs_rev, 32);
                     }
+                    if (pcs_raa.json) cJSON_Delete(pcs_raa.json);
+                    if (!pcs_revoked) {
+                        fprintf(stderr, "LSP reconnect: ERROR — no valid "
+                                "revocation from client %zu for the pending "
+                                "commitment %llu; it stays pending, the "
+                                "reconnect is refused and the client "
+                                "disconnected\n", c,
+                                (unsigned long long)ch->commitment_number);
+                        cJSON_Delete(pcs_cs);
+                        wire_close(new_fd);
+                        lsp->client_fds[c] = -1;
+                        if (mgr->readiness)
+                            readiness_clear((readiness_tracker_t *)mgr->readiness,
+                                            (uint32_t)c);
+                        return 0;
+                    }
+                    persist_save_pending_cs(pcs_db,
+                        mgr->entries[c].channel_id, 0);
                 }
                 cJSON_Delete(pcs_cs);
             }
@@ -6323,14 +6520,15 @@ int lsp_channels_settle_via_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             uint32_t ack_ch_id;
             unsigned char rev_secret[32], next_point[33];
             if (wire_parse_revoke_and_ack(ack.json, &ack_ch_id,
-                                            rev_secret, next_point)) {
-                uint64_t old_cn = ch->commitment_number - 1;
-                channel_receive_revocation(ch, old_cn, rev_secret);
+                                            rev_secret, next_point) &&
+                lsp_channels_accept_revocation(mgr, lsp, ch, rev_secret)) {
                 secp256k1_pubkey next_pcp;
                 if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                     channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
             }
             cJSON_Delete(ack.json);
+            /* a refused revocation secret ends the exchange here */
+            if (lsp->client_fds[i] < 0) continue;
         }
 
         /* Send LSP's own revocation */
@@ -6488,6 +6686,9 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             free(pfds);
             return 0;
         }
+        /* Bridge messages put aside during an exchange (idle ticks too) */
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
+
         if (ret == 0)
             continue;  /* idle tick -- stay patient; loop_deadline bounds the wait */
 
@@ -6542,6 +6743,15 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 }
 
 /* Factory rotation moved to lsp_rotation.c */
+
+/* nLockTime of a serialized transaction: its last four bytes, little-endian.
+   0 for a buffer too short to hold one. */
+static uint32_t lsp_dist_tx_locktime(const tx_buf_t *tx) {
+    if (!tx || !tx->data || tx->len < 4) return 0;
+    const unsigned char *p = tx->data + tx->len - 4;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 
 int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
                                   const char *line,
@@ -6675,12 +6885,18 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             ladder_t *lad = (ladder_t *)mgr->ladder;
             printf("  Ladder factories: %zu\n", lad->n_factories);
         }
-        /* JIT channels */
-        if (mgr->jit_enabled && mgr->n_jit_channels > 0)
+        /* JIT channels: listed whether or not new opens are enabled */
+        if (mgr->n_jit_channels > 0)
             printf("  JIT channels: %zu\n", mgr->n_jit_channels);
         printf("---\n");
         fflush(stdout);
     } else if (strcmp(line, "rotate") == 0) {
+        if (!mgr->rot_enabled) {
+            printf("CLI: rotation is disabled (start the LSP with "
+                   "--enable-rotation-experimental)\n");
+            fflush(stdout);
+            return 1;
+        }
         printf("CLI: forcing rotation\n");
         fflush(stdout);
         if (lsp_channels_rotate_factory(mgr, lsp))
@@ -6732,7 +6948,8 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("  status                       Show factory/channel/bridge state\n");
         printf("  rotate                       Force factory rotation\n");
         printf("  close                        Cooperative close and shutdown\n");
-        printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n");
+        printf("  buy_liquidity <client> <sats> Buy inbound liquidity from L-stock\n"
+               "                               (" LSP_LEAF_REALLOC_UNAVAILABLE ")\n");
         printf("  pay_external <client> <bolt11> Pay external LN invoice via bridge\n");
         printf("  help                         Show this help\n");
     } else if (strncmp(line, "buy_liquidity ", 14) == 0) {
@@ -6745,12 +6962,12 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             } else if (amt == 0) {
                 printf("CLI: amount must be > 0\n");
             } else {
-                printf("CLI: buying %llu sats inbound for client %u\n", amt, client);
-                fflush(stdout);
+                /* Refused up front; see lsp_channels_buy_liquidity. */
                 if (lsp_channels_buy_liquidity(mgr, lsp, (size_t)client, (uint64_t)amt))
                     printf("CLI: buy_liquidity succeeded\n");
                 else
-                    printf("CLI: buy_liquidity FAILED\n");
+                    printf("CLI: buy_liquidity refused: "
+                           LSP_LEAF_REALLOC_UNAVAILABLE "\n");
             }
         } else {
             printf("CLI: usage: buy_liquidity <client> <amount_sats>\n");
@@ -6768,17 +6985,14 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             } else {
                 printf("CLI: paying external invoice from client %u...\n", from);
                 fflush(stdout);
-                /* Send bolt11 to bridge for outbound payment */
-                uint64_t request_id = mgr->next_request_id++;
-                unsigned char dummy_hash[32] = {0};
-                cJSON *pay_msg = wire_build_bridge_send_pay(bolt11,
-                                                             dummy_hash, request_id);
-                if (wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay_msg))
+                uint64_t request_id = 0;
+                const char *err = NULL;
+                if (lsp_channels_operator_pay(mgr, bolt11, &request_id, &err))
                     printf("CLI: pay_external sent to bridge (request %llu)\n",
                            (unsigned long long)request_id);
                 else
-                    printf("CLI: pay_external bridge send FAILED\n");
-                cJSON_Delete(pay_msg);
+                    printf("CLI: pay_external FAILED: %s\n",
+                           err ? err : "unknown");
             }
         } else {
             printf("CLI: usage: pay_external <from_client> <bolt11_invoice>\n");
@@ -6790,6 +7004,52 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     }
     fflush(stdout);
     return 1;
+}
+
+/* Once every factory has expired, offer a JIT channel to each connected
+   client that has none.  Does nothing, and sends nothing, unless opening JIT
+   channels is enabled on this manager.  Returns the number of opens
+   attempted. */
+int lsp_channels_jit_expiry_trigger(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp || !jit_channels_enabled(mgr)) return 0;
+
+    int all_expired = 1;
+    if (mgr->ladder) {
+        ladder_t *lad = (ladder_t *)mgr->ladder;
+        for (size_t fi = 0; fi < lad->n_factories; fi++) {
+            if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
+                all_expired = 0;
+                break;
+            }
+        }
+        if (lad->n_factories == 0)
+            all_expired = 0; /* no factories at all != expired */
+    } else {
+        /* Single-factory mode: check main factory */
+        if (mgr->watchtower && mgr->watchtower->rt) {
+            int h = regtest_get_block_height(mgr->watchtower->rt);
+            factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
+            all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
+        } else {
+            all_expired = 0;
+        }
+    }
+    if (!all_expired) return 0;
+
+    int attempted = 0;
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (lsp->client_fds[c] < 0 || jit_channel_is_active(mgr, c))
+            continue;
+        uint64_t jit_amt = mgr->jit_funding_sats;
+        if (jit_amt == 0)
+            jit_amt = mgr->rot_funding_sats / mgr->n_channels;
+        if (jit_amt == 0) continue;
+        printf("LSP: opening JIT channel for client %zu (factory expired)\n", c);
+        fflush(stdout);
+        jit_channel_create(mgr, lsp, c, jit_amt, "factory_expired");
+        attempted++;
+    }
+    return attempted;
 }
 
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
@@ -6829,6 +7089,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     while (!(*shutdown_flag)) {
+        /* Messages held back during a blocking exchange come first, so each
+           client's messages are handled in the order they arrived. */
+        lsp_channels_drain_deferred(mgr, lsp);
+
         /* Drain any connections queued during ceremonies */
         while (mgr->n_pending_reconnects > 0) {
             mgr->n_pending_reconnects--;
@@ -6863,6 +7127,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 if (lsp->bridge_fd >= 0) wire_close(lsp->bridge_fd);
                 lsp->bridge_fd = qfd;
                 mgr->bridge_fd = qfd;
+                /* fulfils the bridge never confirmed go out again */
+                lsp_channels_flush_bridge_fulfils(mgr);
                 printf("LSP: bridge connected (deferred, fd=%d)\n", qfd);
             } else if (qtype == MSG_HELLO) {
                 /* HELLO from known client — try reconnect */
@@ -7152,61 +7418,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     if (cur_tip_hash[0]) memcpy(daemon_last_tip_hash, cur_tip_hash, 65);
                 }
                 if (height > 0) {
-                    for (size_t c = 0; c < mgr->n_channels; c++) {
-                        channel_t *ch = &mgr->entries[c].channel;
-                        int n_failed = channel_check_htlc_timeouts(ch, (uint32_t)height);
-                        if (n_failed > 0) {
-                            printf("LSP: auto-failed %d expired HTLCs on channel %zu "
-                                   "(height=%d)\n", n_failed, c, height);
-                            /* Delete failed HTLCs from persistence (atomic batch) */
-                            if (mgr->persist) {
-                                persist_t *db = (persist_t *)mgr->persist;
-                                int own_txn = !persist_in_transaction(db);
-                                if (own_txn) persist_begin(db);
-                                for (size_t h = 0; h < ch->n_htlcs; h++) {
-                                    if (ch->htlcs[h].state == HTLC_STATE_FAILED)
-                                        persist_delete_htlc(db,
-                                                            (uint32_t)c, ch->htlcs[h].id);
-                                }
-                                if (own_txn) persist_commit(db);
-                            }
-                        }
-                    }
-
-                    /* Bridge HTLC timeout check: fail back bridge HTLCs approaching
-                       their CLTV deadline to avoid on-chain resolution.
-                       Safety margin: fail 10 blocks before expiry. */
-                    if (mgr->htlc_origins && mgr->bridge_fd >= 0) {
-                        for (size_t oi = 0; oi < mgr->n_htlc_origins; oi++) {
-                            htlc_origin_t *orig = &mgr->htlc_origins[oi];
-                            if (!orig->active || orig->cltv_expiry == 0) continue;
-                            if ((uint32_t)height + 10 >= orig->cltv_expiry) {
-                                fprintf(stderr, "LSP: bridge HTLC timeout — failing back "
-                                        "htlc_id=%llu (height=%d, cltv=%u)\n",
-                                        (unsigned long long)orig->bridge_htlc_id,
-                                        height, orig->cltv_expiry);
-                                unsigned char zero_hash[32] = {0};
-                                cJSON *fail = wire_build_bridge_fail_htlc(
-                                    zero_hash, "cltv_expiry_too_soon",
-                                    orig->bridge_htlc_id);
-                                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
-                                cJSON_Delete(fail);
-                                /* Also fail the channel-side HTLC if still active */
-                                for (size_t c = 0; c < mgr->n_channels; c++) {
-                                    channel_t *ch = &mgr->entries[c].channel;
-                                    for (size_t h = 0; h < ch->n_htlcs; h++) {
-                                        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE &&
-                                            memcmp(ch->htlcs[h].payment_hash,
-                                                   orig->payment_hash, 32) == 0) {
-                                            channel_fail_htlc(ch, ch->htlcs[h].id);
-                                            break;
-                                        }
-                                    }
-                                }
-                                orig->active = 0;
-                            }
-                        }
-                    }
+                    /* Expired HTLCs and inbound bridge HTLCs near their
+                       deadline; never an HTLC whose outside payment is
+                       still in flight. */
+                    lsp_channels_expire_htlcs(mgr, lsp, (uint32_t)height);
 
                     /* Profit settlement: handled above via chain_be (works
                        without watchtower). Removed from watchtower block. */
@@ -7259,29 +7474,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         lf->factory.dying_blocks,
                                         lf->partial_rotation_done);
                                 }
-                                /* Auto-broadcast distribution TX on EXPIRED */
-                                if (lf->cached_state == FACTORY_EXPIRED &&
-                                    lf->distribution_tx.len > 0 &&
-                                    mgr->chain_be) {
-                                    chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
-                                    char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
-                                    if (dhex) {
-                                        extern void hex_encode(const unsigned char *,
-                                                               size_t, char *);
-                                        hex_encode(lf->distribution_tx.data,
-                                                   lf->distribution_tx.len, dhex);
-                                        char dtxid[65];
-                                        if (_cb->send_raw_tx(_cb, dhex, dtxid))
-                                            printf("LSP: distribution TX broadcast: %s\n",
-                                                   dtxid);
-                                        free(dhex);
-                                    }
-                                }
+                                /* The distribution TX of an EXPIRED factory is
+                                   broadcast once its nLockTime is reached (below,
+                                   on every tick). */
 
                                 /* Async rotation: handle EXPIRED with partial ready set.
                                    DYING → EXPIRED means the window closed; rotate
                                    with whoever showed up (n_ready >= 2). */
-                                if (lf->cached_state == FACTORY_EXPIRED &&
+                                if (mgr->rot_auto_rotate &&
+                                    lf->cached_state == FACTORY_EXPIRED &&
                                     old_states[fi] == FACTORY_DYING &&
                                     mgr->readiness) {
                                     readiness_tracker_t *rt =
@@ -7299,6 +7500,39 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                lf->factory_id, n_ready);
                                     }
                                     readiness_reset(rt);
+                                }
+
+                                /* Rotation off (the default): nothing is
+                                   started.  The factory keeps serving its
+                                   channels until it expires; after that the
+                                   members' own exits and the distribution TX
+                                   (broadcast at its nLockTime, below) apply. */
+                                if (!mgr->rot_auto_rotate &&
+                                    lf->cached_state == FACTORY_DYING) {
+                                    printf("LSP: factory %u DYING — not rotating: rotation "
+                                           "is disabled (--enable-rotation-experimental "
+                                           "not given). Channels stay in service until "
+                                           "the factory expires in %u blocks; then members "
+                                           "can exit and the distribution TX pays them\n",
+                                           lf->factory_id,
+                                           factory_blocks_until_expired(&lf->factory,
+                                                                        (uint32_t)height));
+                                    fflush(stdout);
+                                } else if (!mgr->rot_auto_rotate &&
+                                           lf->cached_state == FACTORY_EXPIRED) {
+                                    if (lf->distribution_tx.len > 0)
+                                        printf("LSP: factory %u EXPIRED — not rotating: "
+                                               "rotation is disabled; the distribution TX "
+                                               "is broadcast at its nLockTime (block %u)\n",
+                                               lf->factory_id,
+                                               lsp_dist_tx_locktime(&lf->distribution_tx));
+                                    else
+                                        printf("LSP: factory %u EXPIRED — not rotating: "
+                                               "rotation is disabled; this LSP process holds "
+                                               "no signed distribution TX (members hold "
+                                               "their own co-signed copy)\n",
+                                               lf->factory_id);
+                                    fflush(stdout);
                                 }
 
                                 /* Auto-rotate when factory enters DYING
@@ -7390,6 +7624,63 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            /* Distribution TX: an EXPIRED factory's co-signed
+                               nLockTime fallback pays every member.  It cannot
+                               be relayed before its nLockTime (the factory CLTV,
+                               after EXPIRED), so it is broadcast on the first
+                               tick at or past that height; a failed attempt is
+                               retried at the next block. */
+                            if (lf->cached_state == FACTORY_EXPIRED &&
+                                lf->distribution_tx.len > 0 &&
+                                !lf->dist_tx_broadcast &&
+                                !lf->partial_rotation_done &&   /* closed by rotation */
+                                mgr->chain_be &&
+                                (uint32_t)height >=
+                                    lsp_dist_tx_locktime(&lf->distribution_tx) &&
+                                (uint32_t)height != lf->dist_tx_tried_height) {
+                                chain_backend_t *_cb = (chain_backend_t *)mgr->chain_be;
+                                lf->dist_tx_tried_height = (uint32_t)height;
+                                char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
+                                if (dhex) {
+                                    extern void hex_encode(const unsigned char *,
+                                                           size_t, char *);
+                                    hex_encode(lf->distribution_tx.data,
+                                               lf->distribution_tx.len, dhex);
+                                    char dtxid[65];
+                                    if (_cb->send_raw_tx(_cb, dhex, dtxid)) {
+                                        lf->dist_tx_broadcast = 1;
+                                        printf("LSP: distribution TX broadcast: %s "
+                                               "(factory %u)\n", dtxid, lf->factory_id);
+                                    } else {
+                                        /* Spent funding (a member exited, or
+                                           broadcast this same TX first): there
+                                           is nothing left to broadcast. */
+                                        int unspent = -1;
+                                        if (_cb->is_outpoint_unspent) {
+                                            char fdisp[65];
+                                            for (int bi = 0; bi < 32; bi++)
+                                                snprintf(fdisp + bi * 2, 3, "%02x",
+                                                         lf->factory.funding_txid[31 - bi]);
+                                            unspent = _cb->is_outpoint_unspent(
+                                                _cb, fdisp, lf->factory.funding_vout);
+                                        }
+                                        if (unspent == 0) {
+                                            lf->dist_tx_broadcast = 1;
+                                            printf("LSP: factory %u funding output is already "
+                                                   "spent; its distribution TX is not "
+                                                   "broadcast\n", lf->factory_id);
+                                        } else {
+                                            fprintf(stderr, "LSP: distribution TX of factory "
+                                                    "%u not accepted at height %d (retrying "
+                                                    "at the next block)\n",
+                                                    lf->factory_id, height);
+                                        }
+                                    }
+                                    fflush(stdout);
+                                    free(dhex);
                                 }
                             }
 
@@ -7582,8 +7873,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t epoch = dw_counter_epoch(&lsp->factory.counter);
                 uint32_t total = lsp->factory.counter.total_states;
                 if (total > 0 && epoch >= (total * 3) / 4) {
-                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed\n",
-                           epoch, total);
+                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed%s\n",
+                           epoch, total,
+                           mgr->rot_auto_rotate ? "" :
+                               " (rotation is disabled; not rotating)");
                     if (mgr->rot_auto_rotate) {
                         lsp_channels_rotate_factory(mgr, lsp);
                     }
@@ -7608,47 +7901,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
 
             /* JIT channel trigger: factory expired + client online + no JIT */
-            if (mgr->jit_enabled) {
-                int all_expired = 1;
-                if (mgr->ladder) {
-                    ladder_t *lad = (ladder_t *)mgr->ladder;
-                    for (size_t fi = 0; fi < lad->n_factories; fi++) {
-                        if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
-                            all_expired = 0;
-                            break;
-                        }
-                    }
-                    if (lad->n_factories == 0)
-                        all_expired = 0; /* no factories at all != expired */
-                } else {
-                    /* Single-factory mode: check main factory */
-                    if (mgr->watchtower && mgr->watchtower->rt) {
-                        int h = regtest_get_block_height(mgr->watchtower->rt);
-                        factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
-                        all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
-                    } else {
-                        all_expired = 0;
-                    }
-                }
-
-                if (all_expired) {
-                    for (size_t c = 0; c < mgr->n_channels; c++) {
-                        if (lsp->client_fds[c] >= 0 &&
-                            !jit_channel_is_active(mgr, c)) {
-                            uint64_t jit_amt = mgr->jit_funding_sats;
-                            if (jit_amt == 0)
-                                jit_amt = mgr->rot_funding_sats / mgr->n_channels;
-                            if (jit_amt > 0) {
-                                printf("LSP: opening JIT channel for client %zu "
-                                       "(factory expired)\n", c);
-                                fflush(stdout);
-                                jit_channel_create(mgr, lsp, c, jit_amt,
-                                                    "factory_expired");
-                            }
-                        }
-                    }
-                }
-            }
+            lsp_channels_jit_expiry_trigger(mgr, lsp);
+            /* Anything a client sent while an offer was pending is handled
+               before newer messages are read below. */
+            lsp_channels_drain_deferred(mgr, lsp);
 
             /* Check JIT funding confirmation (FUNDING → OPEN) */
             jit_channels_check_funding(mgr);
@@ -7667,8 +7923,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 }
             }
 
-            /* Check bridge HTLC timeouts */
-            if (mgr->bridge_fd >= 0 && mgr->watchtower && mgr->watchtower->rt) {
+            /* Check bridge HTLC timeouts.  Also with the bridge away: an
+               outside payment that is still unresolved near its expiry is
+               reported exactly then. */
+            if (mgr->watchtower && mgr->watchtower->rt) {
                 int bh = regtest_get_block_height(mgr->watchtower->rt);
                 if (bh > 0)
                     lsp_channels_check_bridge_htlc_timeouts(mgr, lsp, (uint32_t)bh);
@@ -7816,6 +8074,9 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             } /* if (tnow - last_periodic >= 5) */
         } /* periodic checks block */
 
+        /* Bridge messages put aside during an exchange (idle ticks too) */
+        lsp_channels_run_deferred_bridge_msgs(mgr, lsp);
+
         if (ret == 0) continue;
 
         /* Handle new connections on listen_fd (bridge or client reconnect) */
@@ -7850,6 +8111,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 wire_close(lsp->bridge_fd);
                             lsp->bridge_fd = new_fd;
                             mgr->bridge_fd = new_fd;
+                            /* fulfils the bridge never confirmed go out again */
+                            lsp_channels_flush_bridge_fulfils(mgr);
                             printf("LSP: bridge connected in daemon loop (fd=%d)\n", new_fd);
                         } else if (peek.msg_type == MSG_RECONNECT) {
                             /* Client reconnect — use pre-read message */
@@ -8076,8 +8339,10 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
             }
         }
         for (size_t p = 0; p < ch->n_ptlcs; p++) {
-            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE)
+            if (ch->ptlcs[p].state == PTLC_STATE_ACTIVE) {
                 sum += ch->ptlcs[p].amount_sats;
+                sum += ch->ptlcs[p].fee_at_add;
+            }
         }
 
         /* Match lsp_channels_init: base commit_fee (154 vB × fee_rate)
@@ -8112,8 +8377,78 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
 }
 
 
-/* Public wrapper: advance one PS leaf via the production wire ceremony. */
-int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
+/* --- Guard for tree advances that do not re-anchor channels ---
+
+   A channel's funding outpoint is an output of the leaf transaction that
+   existed when the channel opened.  A leaf advance replaces that transaction
+   (PS: a chain transaction spending the previous channel output; DW: a new
+   leaf txid with a lower nSequence), and a whole-tree state advance replaces
+   every state node, so every leaf of the factory.  None of these ceremonies
+   moves a channel onto the new outpoint or re-signs a commitment, so once
+   the new tree is on chain the commitments held by both sides spend an
+   output that does not exist.  That strands the channel whatever its
+   balances are: a channel whose client side is empty is stranded on its
+   next inbound payment, and the LSP's side is stranded with it.
+
+   Returns the index of the first open channel (funding amount non-zero)
+   funded by leaf node `leaf_node`, or by any leaf when `whole_factory` is
+   set; -1 if there is none. */
+static int first_open_channel(const lsp_channel_mgr_t *mgr, const factory_t *f,
+                               int whole_factory, size_t leaf_node) {
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (mgr->entries[c].channel.funding_amount == 0) continue;
+        if (!whole_factory) {
+            size_t c_node;
+            uint32_t c_vout;
+            if (!factory_client_to_leaf(f, c, &c_node, &c_vout)) continue;
+            if (c_node != leaf_node) continue;
+        }
+        return (int)c;
+    }
+    return -1;
+}
+
+/* 1 if advancing this leaf once more exhausts it, so that
+   factory_advance_leaf_unsigned advances the root and the caller re-signs the
+   whole tree (mirrors the two rollover conditions there). */
+static int leaf_advance_rolls_root(const factory_t *f, int leaf_side) {
+    const factory_node_t *node = &f->nodes[f->leaf_node_indices[leaf_side]];
+    if (node->is_ps_leaf)
+        return (uint32_t)(node->ps_chain_len + 1) > f->states_per_layer;
+    return dw_is_exhausted(&f->leaf_layers[leaf_side]);
+}
+
+/* Public entry point: advance one leaf (arity-1 DW or PS) via the wire
+   ceremony.
+
+   Refused, before any state is touched or any message is sent, while an open
+   channel is funded by this leaf -- or by any leaf of the factory when this
+   advance would exhaust the leaf and roll over into a whole-tree state
+   advance (see the guard above).
+
+   allow_live_channel != 0 skips that check.  It exists for harnesses that
+   exercise the ceremony itself; nothing that serves real client funds may
+   pass it. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side,
+                                  int allow_live_channel) {
+    if (!mgr || !lsp) return 0;
+    const factory_t *f = &lsp->factory;
+    if (!allow_live_channel && leaf_side >= 0 && leaf_side < f->n_leaf_nodes) {
+        int whole = leaf_advance_rolls_root(f, leaf_side);
+        int c = first_open_channel(mgr, f, whole, f->leaf_node_indices[leaf_side]);
+        if (c >= 0) {
+            const channel_t *ch = &mgr->entries[c].channel;
+            fprintf(stderr,
+                    "LSP: leaf %d advance refused -- open channel %d is funded "
+                    "by %s (funding %llu sats, %zu HTLC(s), %zu PTLC(s)); the "
+                    "advance would not re-anchor it\n",
+                    leaf_side, c,
+                    whole ? "the tree this advance would re-sign" : "this leaf",
+                    (unsigned long long)ch->funding_amount,
+                    ch->n_htlcs, ch->n_ptlcs);
+            return 0;
+        }
+    }
     return lsp_advance_leaf(mgr, lsp, leaf_side);
 }
 
@@ -8123,16 +8458,33 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
    root counter rolls over, drives the Tier B ceremony to re-sign every
    non-PS-leaf node for the new epoch.
 
-   Caller wires this into a block-driven polling loop (e.g., every
-   step_blocks blocks, or based on observed block height progression).
+   A rollover replaces every leaf of the factory without re-anchoring any
+   channel, so the tick is refused, before the counter is touched, while any
+   channel of the factory is open (see the guard above).
+   allow_live_channel != 0 skips that check; it is for harnesses that
+   exercise the ceremony itself.
 
    Returns:
      1 = ceremony completed (epoch advanced + non-PS-leaf nodes re-signed),
      0 = nothing to do (no rollover this tick),
-    -1 = ceremony failed (caller may retry next tick). */
-int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    -1 = refused, or ceremony failed (caller may retry next tick). */
+int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                           int allow_live_channel) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
+    if (factory_refuses_refresh_in_place(f, "LSP: root tick"))
+        return -1;
+    if (!allow_live_channel) {
+        int c = first_open_channel(mgr, f, 1, 0);
+        if (c >= 0) {
+            fprintf(stderr,
+                    "LSP: root tick refused -- open channel %d is funded by "
+                    "the tree a rollover would re-sign (funding %llu sats); "
+                    "the state advance would not re-anchor it\n",
+                    c, (unsigned long long)mgr->entries[c].channel.funding_amount);
+            return -1;
+        }
+    }
     int rc = factory_tick_root(f);
     if (rc != -1) {
         return 0;
@@ -8213,7 +8565,7 @@ int lsp_channels_rehydrate_watchtower_from_chains(lsp_channel_mgr_t *mgr) {
            what watchtower wants for old_txid32. */
 
         /* Collect channel ids on this leaf. */
-        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS];
+        uint32_t leaf_ch_ids[FACTORY_MAX_SIGNERS] = {0};
         size_t n_leaf_ch = 0;
         for (size_t c = 0; c < mgr->n_channels; c++) {
             size_t c_node; uint32_t c_vout;

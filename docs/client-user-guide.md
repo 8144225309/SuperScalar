@@ -32,6 +32,14 @@ echo "Save this: $MY_KEY"
 
 With BIP39, you can recover your key from the 24 words at any time. Without it, if you lose your key, you lose access to your channel balance. The LSP cannot recover it for you — though your funds will eventually be recoverable via the CLTV timeout path.
 
+**How the keyfile is handled**
+
+- **A keyfile is never overwritten.** `--generate-mnemonic` and `--from-mnemonic` refuse to run if anything already exists at `--keyfile`. A normal start creates a key only when nothing exists at the path.
+- **A keyfile that is there but cannot be loaded is an error.** With a wrong or missing `--passphrase`, or a damaged file, the daemon exits and leaves the file untouched; it does not start with a new key. To start over with a new key, move the old file away first.
+- **A recovery phrase is checked before use.** `--from-mnemonic` and `--hd-mnemonic` accept 12, 15, 18, 21 or 24 lower-case words from the BIP39 English list with a valid checksum (extra spaces are ignored) and exit with the reason otherwise.
+- **Keyfiles are private.** New keyfiles are created with mode `0600`. An existing keyfile that group or others can access is tightened to `0600` at start-up, with a warning, when it is a regular file owned by the user running the daemon, has no other hard links and is not reached through a symbolic link. Otherwise its mode is left alone: a keyfile readable only by its group (for example `root:superscalar 0640`, read by the service user) is used with a warning; a keyfile readable by every user is refused with an error naming the mode. For a mounted secret, set the mount's file mode to `0400` or `0440`.
+- **Writing a keyfile needs a writable directory.** The file is written under a temporary name (`<keyfile>.ss-partial.XXXXXX`) in the same directory and then moved into place, so the directory must be writable and a crash never leaves a half-written key. A `--keyfile` path that is a symbolic link can be read but is never written to.
+
 ## 2. Connect to the LSP
 
 ### Basic Connection (Regtest)
@@ -186,11 +194,11 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--seckey HEX` | **required** | Your 32-byte secret key (hex) |
-| `--keyfile PATH` | none | Encrypted keyfile path (alternative to `--seckey`) |
+| `--seckey HEX` | **required** unless `--keyfile` | Your 32-byte secret key (hex). Refused on mainnet (visible in `ps` and shell history): use `--keyfile` there |
+| `--keyfile PATH` | none | Encrypted keyfile path (alternative to `--seckey`). Created if nothing exists at the path; never overwritten. See "How the keyfile is handled" in section 1 |
 | `--passphrase PASS` | none | Keyfile passphrase |
-| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit |
-| `--from-mnemonic WORDS` | *(none)* | Derive keyfile from BIP39 mnemonic words |
+| `--generate-mnemonic` | off | Generate 24-word BIP39 mnemonic, derive keyfile, and exit. Refuses if `--keyfile` already exists |
+| `--from-mnemonic WORDS` | *(none)* | Derive keyfile from BIP39 mnemonic words (validated first). Refuses if `--keyfile` already exists |
 | `--mnemonic-passphrase PASS` | "" | Optional BIP39 passphrase for seed derivation |
 
 ### Connection
@@ -199,17 +207,17 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 |------|---------|-------------|
 | `--host HOST` | 127.0.0.1 | LSP hostname or IP (supports `.onion`) |
 | `--port PORT` | 9735 | LSP port |
-| `--lsp HOST:PORT` | — | Shorthand: sets both `--host` and `--port` from a single string |
-| `--lsp-pubkey HEX` | none | LSP static pubkey for NK authentication (33-byte compressed hex) |
+| `--lsp DOMAIN` | — | Look up `--host` and `--port` at `http://DOMAIN/.well-known/lsps.json`. The public key served there is fetched over unauthenticated HTTP and is never trusted: `--lsp-pubkey` is still required outside regtest, and the client refuses to connect if the two differ. The lookup is a direct HTTP connection, so `--lsp` is refused together with `--tor-proxy` or `--tor-only`: give `--host` and `--port` instead |
+| `--lsp-pubkey HEX` | none | LSP static pubkey for NK authentication (33-byte compressed hex). Required on every network except regtest; the client checks this before it creates a keyfile or connects |
 | `--participant-id N` | auto | Explicit client slot ID in the factory (auto-assigned by LSP if omitted) |
 | `--network MODE` | regtest | Bitcoin network: regtest / signet / testnet / testnet4 / mainnet |
 | `--regtest` | off | Shorthand for `--network regtest` |
 | `--tor-proxy HOST:PORT` | none | SOCKS5 proxy for Tor connections (e.g. `127.0.0.1:9050`) |
 | `--tor-only` | off | Refuse all non-`.onion` outbound connections (hard privacy mode) |
 | `--daemon` | off | Stay running (auto-fulfill, watchtower, reconnect) |
-| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP. Without it the client declines every offer with an explicit reject message. JIT channels are experimental. |
 | `--min-profit-bps N` | 0 | Refuse factory proposal if LSP's profit share for this client < N bps |
-| `--i-accept-the-risk` | off | Required for mainnet operation |
+| `--i-accept-the-risk` | off | Required for mainnet operation (`--network mainnet` or its other spelling `--network bitcoin`). Mainnet also requires `--db` and refuses `--seckey` and test/cheat flags |
 
 ### Persistence + Bitcoin RPC
 
@@ -238,7 +246,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--force-close` | off | Broadcast your factory tree on-chain from the local DB (unilateral exit) |
+| `--force-close` | off | Unilateral exit from the local DB: publish the tree transactions on the path to your leaf, then your commitment. One pass per run: exit status `0` = commitment accepted (so the whole path is published), `2` = run it again after the next block (tree levels mature one timelock at a time), `3` = refused for a reason waiting will not cure (fee below the node's floor, input spent by another transaction; the STUCK line says which), `1` = the exit cannot be completed from this DB |
 | `--sweep-to-local` | off | After force-close, sweep your `to_local` outputs once CSV maturity hits |
 | `--sweep-dest ADDR` | (wallet) | Destination address for swept funds (defaults to your bitcoind wallet) |
 
