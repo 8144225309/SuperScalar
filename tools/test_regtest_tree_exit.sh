@@ -37,6 +37,10 @@
 # to sign the proposed tree; checks the refusal and stops), EXPECT_NO_FUNDING
 # (1 = the LSP must refuse before funding: the pre-signed fees exceed the
 # bound even at the floor rate; checks nothing paid the funding address),
+# EXPECT_STUCK (1 = the clients cannot pay for the exit: with MINRELAY above
+# what a pre-signed tx and its anchor-only child pay, and CLIENT_WALLET=0,
+# every client's --force-close must exit 1 saying the tx needs a fee-paying
+# child and no wallet coin is available, and nothing may claim completion),
 # GRIEF (1 = after
 # the first force-close pass, before any block, attach a 240-sat anchor-only
 # child to every tree tx in the mempool, as anyone can; the next passes, with
@@ -66,6 +70,7 @@ LSP_MAX_TREE_RATE="${LSP_MAX_TREE_RATE:-}"
 EXPECT_TREE_RATE="${EXPECT_TREE_RATE:-0}"
 EXPECT_REFUSE="${EXPECT_REFUSE:-0}"
 EXPECT_NO_FUNDING="${EXPECT_NO_FUNDING:-0}"
+EXPECT_STUCK="${EXPECT_STUCK:-0}"
 GRIEF="${GRIEF:-0}"
 AMOUNT="${AMOUNT:-$((N_CLIENTS * 60000))}"
 PORT="${PORT:-29975}"
@@ -281,8 +286,30 @@ for pass in $(seq 1 60); do
     [ "$GRIEF" != 0 ] && [ "$pass" = 1 ] && POPT=("${WBASE[@]}")
     for i in $(seq 0 $((N_CLIENTS-1))); do
         "$CLIENT_BIN" --network regtest --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
-            "${POPT[@]}" --force-close --db "$TMPDIR/c${i}.db" >> "$TMPDIR/fc_${i}.log" 2>&1
+            "${POPT[@]}" --force-close --db "$TMPDIR/c${i}.db" > "$TMPDIR/fc_last_${i}.log" 2>&1
+        FCRC[$i]=$?
+        cat "$TMPDIR/fc_last_${i}.log" >> "$TMPDIR/fc_${i}.log"
     done
+    if [ "$EXPECT_STUCK" = 1 ]; then
+        NSTUCK=0
+        for i in $(seq 0 $((N_CLIENTS-1))); do
+            if [ "${FCRC[$i]}" = 1 ] &&
+               grep -q "needs a fee-paying child: no wallet coin available" "$TMPDIR/fc_last_${i}.log" &&
+               grep -q "FORCE-CLOSE STUCK" "$TMPDIR/fc_last_${i}.log" &&
+               ! grep -q "FORCE-CLOSE COMPLETE" "$TMPDIR/fc_last_${i}.log"; then
+                NSTUCK=$((NSTUCK+1))
+            fi
+        done
+        echo "  pass $pass: $NSTUCK/$N_CLIENTS clients report a stuck exit (status 1, no wallet coin)"
+        grep -a "CPFP: ERROR" "$TMPDIR/fc_last_0.log" | head -1
+        if [ "$NSTUCK" -eq "$N_CLIENTS" ]; then
+            green "PASS: without a wallet coin every client's exit stops with status 1 and says the pre-signed tx needs a fee-paying child (minrelay=$MINRELAY)"
+            exit 0
+        fi
+        [ "$pass" -ge 3 ] && { tail -15 "$TMPDIR/fc_last_0.log"; fail "the clients did not report the stuck exit"; }
+        mine 3
+        continue
+    fi
     for t in "${TREE[@]}"; do
         d=$($BCLI getmempoolentry "$t" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['depends']))" 2>/dev/null)
         if [ -n "$d" ] && [ "$d" -gt 0 ]; then

@@ -1105,3 +1105,82 @@ int test_tree_fee_plan_fewer_clients_no_worse(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+
+/* A pre-signed exit tx that needs a fee-paying child it cannot get is
+   reported with the reason, never as a quiet failure. */
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+static int need_send_ok;
+static int need_send(chain_backend_t *self, const char *hex, char *txid_out) {
+    (void)self; (void)hex;
+    if (txid_out) { memset(txid_out, '0', 64); txid_out[64] = '\0'; }
+    return need_send_ok;
+}
+int test_cpfp_exit_needs_child_reported(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair kps[5];
+    factory_t *f = calloc(1, sizeof(factory_t));
+    cpfp_tx_info_t pi;
+    size_t li;
+    TEST_ASSERT(f && make_parent(ctx, f, kps, &pi, &li), "parent");
+    const factory_node_t *n = &f->nodes[li];
+    char *hex = malloc(n->signed_tx.len * 2 + 1);
+    TEST_ASSERT(hex, "alloc");
+    hex_encode(n->signed_tx.data, n->signed_tx.len, hex);
+
+    /* The anchor alone: 263 + 240 sat for 210 + 65 vB = 1829 sat/kvB. */
+    TEST_ASSERT(!cpfp_anchor_alone_short(263, 210, 240, 1000), "enough at 1 sat/vB");
+    TEST_ASSERT(!cpfp_anchor_alone_short(263, 210, 240, 1829), "enough at its own rate");
+    TEST_ASSERT(cpfp_anchor_alone_short(263, 210, 240, 1830), "short just above");
+    TEST_ASSERT(cpfp_anchor_alone_short(263, 210, 240, 5000), "short at 5 sat/vB");
+    /* the root seen at a 5 sat/vB floor: 395 < 945 */
+    TEST_ASSERT(cpfp_anchor_alone_short(155, 124, 240, 5000), "root short at 5 sat/vB");
+
+    /* No RPC: the chain backend refuses the tx, which carries an anchor. */
+    chain_backend_t cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.send_raw_tx = need_send;
+    cpfp_set_default(NULL, NULL, NULL, 0);
+    cpfp_need_clear();
+    need_send_ok = 1;
+    char txid[65];
+    TEST_ASSERT(cpfp_send_default(&cb, hex, txid) == CPFP_SENT_ALONE, "accepted alone");
+    TEST_ASSERT_EQ(cpfp_need_seen(), CPFP_NEED_NONE, "nothing needed");
+    need_send_ok = 0;
+    TEST_ASSERT(cpfp_send_default(&cb, hex, txid) == CPFP_FAILED, "refused");
+    TEST_ASSERT_EQ(cpfp_need_seen(), CPFP_NEED_PACKAGE_RELAY,
+                   "refused with an anchor and no package relay: reported");
+    TEST_ASSERT(strstr(cpfp_need_text(CPFP_NEED_PACKAGE_RELAY), "package relay") != NULL,
+                "relay text");
+    TEST_ASSERT(strstr(cpfp_need_text(CPFP_NEED_COIN), "--wallet") != NULL,
+                "coin text names --wallet");
+    cpfp_need_clear();
+    TEST_ASSERT_EQ(cpfp_need_seen(), CPFP_NEED_NONE, "cleared");
+
+    /* A refused tx without an anchor is not a package matter. */
+    tx_output_t o;
+    memset(&o, 0, sizeof(o));
+    o.amount_sats = 1000;
+    o.script_pubkey[0] = 0x51; o.script_pubkey[1] = 0x20;
+    memset(o.script_pubkey + 2, 0x33, 32);
+    o.script_pubkey_len = 34;
+    tx_buf_t plain;
+    tx_buf_init(&plain, 128);
+    unsigned char in_txid[32];
+    memset(in_txid, 0x44, 32);
+    TEST_ASSERT(build_unsigned_tx(&plain, NULL, in_txid, 0, 0xfffffffd, &o, 1), "plain tx");
+    char *phex = malloc(plain.len * 2 + 1);
+    TEST_ASSERT(phex, "alloc");
+    hex_encode(plain.data, plain.len, phex);
+    TEST_ASSERT(cpfp_send_default(&cb, phex, txid) == CPFP_FAILED, "plain refused");
+    TEST_ASSERT_EQ(cpfp_need_seen(), CPFP_NEED_NONE, "no anchor: not reported as a package need");
+
+    free(phex);
+    tx_buf_free(&plain);
+    free(hex);
+    factory_free(f);
+    free(f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

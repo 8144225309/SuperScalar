@@ -2617,6 +2617,7 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
+    cpfp_need_clear();
     char fr_status[256] = {0};
     int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
     fprintf(stderr, "Client: CLOSE policy force-close: %s (run=%d)\n", fr_status, result);
@@ -2635,9 +2636,19 @@ static int client_force_close_from_db(const char *db_path, const char *network,
             if (cpfp_send_default(&chain, tx_hex, commit_txid))
                 fprintf(stderr, "Client: CLOSE policy commitment TX broadcast: %s "
                         "(cn=%llu)\n", commit_txid, (unsigned long long)sig_cn);
+            else if (cpfp_need_seen() == CPFP_NEED_NONE)
+                fprintf(stderr, "Client: CLOSE policy: commitment TX not accepted "
+                        "yet (cn=%llu); its tree path may not be confirmed: run "
+                        "--force-close again after the next block\n",
+                        (unsigned long long)sig_cn);
             free(tx_hex);
         }
     }
+    if (cpfp_need_seen() != CPFP_NEED_NONE)
+        fprintf(stderr, "Client: CLOSE policy: ERROR: the unilateral exit cannot "
+                "complete: a pre-signed transaction needs a fee-paying child: %s. "
+                "Provide it and run --force-close with the same --db.\n",
+                cpfp_need_text(cpfp_need_seen()));
     persist_close(&db);
     return 1;
 }
@@ -3100,6 +3111,7 @@ int main(int argc, char *argv[]) {
             persist_close(&db);
             return 1;
         }
+        cpfp_need_clear();
 
         /* #313 GAP2: EXPLICIT operator force-close (allow_root_broadcast=1) so the
            signed factory tree is published root-down. factory_recovery_scan() is the
@@ -3128,6 +3140,11 @@ int main(int argc, char *argv[]) {
                         printf("Force-close: commitment TX broadcast: %s "
                                "(cn=%llu)\n", commit_txid,
                                (unsigned long long)sig_cn);
+                    else if (cpfp_need_seen() != CPFP_NEED_NONE)
+                        fprintf(stderr, "Force-close: ERROR: the commitment TX "
+                                "(cn=%llu) needs a fee-paying child: %s\n",
+                                (unsigned long long)sig_cn,
+                                cpfp_need_text(cpfp_need_seen()));
                     else
                         printf("Force-close: commitment TX broadcast failed "
                                "(may need tree to confirm first)\n");
@@ -3165,6 +3182,13 @@ int main(int argc, char *argv[]) {
         }
 
         persist_close(&db);
+        if (cpfp_need_seen() != CPFP_NEED_NONE) {
+            /* Not something another pass fixes: the operator must act. */
+            fprintf(stderr, "=== CLIENT FORCE-CLOSE STUCK: a pre-signed "
+                    "transaction needs a fee-paying child: %s ===\n",
+                    cpfp_need_text(cpfp_need_seen()));
+            return 1;
+        }
         printf("=== CLIENT FORCE-CLOSE COMPLETE ===\n");
         return 0;
     }

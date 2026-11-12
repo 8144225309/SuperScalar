@@ -130,8 +130,36 @@ void cpfp_set_default(regtest_t *rt, wallet_source_t *wallet,
                       fee_estimator_t *urgent, uint64_t max_child_fee);
 
 /* Broadcast with the defaults set by cpfp_set_default; without them, a plain
-   cb->send_raw_tx (CPFP_SENT_ALONE or CPFP_FAILED). */
+   cb->send_raw_tx (CPFP_SENT_ALONE or CPFP_FAILED; a refused tx with a P2A
+   anchor records CPFP_NEED_PACKAGE_RELAY). */
 cpfp_result_t cpfp_send_default(chain_backend_t *cb, const char *tx_hex,
                                 char *txid_out);
+
+/* A pre-signed transaction that pays less than the node needs gets in only
+   with a child that pays for it.  When none could be made, the broadcast
+   functions above print why and record it here: */
+typedef enum {
+    CPFP_NEED_NONE = 0,
+    /* the anchor alone cannot pay what the package needs and no wallet coin
+       was available to fund the child (no wallet, or nothing spendable) */
+    CPFP_NEED_COIN = 1,
+    /* the chain backend refused the tx on its own and cannot relay a package
+       (no bitcoind RPC, so no submitpackage) */
+    CPFP_NEED_PACKAGE_RELAY = 2,
+} cpfp_need_t;
+
+/* The first such reason recorded since cpfp_need_clear (CPFP_NEED_NONE if
+   none). */
+cpfp_need_t cpfp_need_seen(void);
+void cpfp_need_clear(void);
+
+/* What the operator has to provide, for cpfp_need_t n. */
+const char *cpfp_need_text(cpfp_need_t n);
+
+/* 1 if a package of a parent paying parent_fee for parent_vsize and an
+   anchor-only child (CPFP_ANCHOR_ONLY_CHILD_VSIZE, paying anchor_amount)
+   stays below need_rate (sat/kvB): only a wallet coin can make up the rest. */
+int cpfp_anchor_alone_short(uint64_t parent_fee, size_t parent_vsize,
+                            uint64_t anchor_amount, uint64_t need_rate);
 
 #endif /* SUPERSCALAR_CPFP_H */

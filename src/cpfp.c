@@ -235,6 +235,39 @@ static int build_wallet_child(wallet_source_t *w, const cpfp_tx_info_t *parent,
     return ok;
 }
 
+/* ---- why an exit could not get its fee-paying child -------------------- */
+
+static cpfp_need_t g_need_seen;
+static int g_child_no_coin;   /* build_child fell back to the anchor alone */
+
+cpfp_need_t cpfp_need_seen(void) { return g_need_seen; }
+void cpfp_need_clear(void) { g_need_seen = CPFP_NEED_NONE; }
+
+const char *cpfp_need_text(cpfp_need_t n) {
+    switch (n) {
+    case CPFP_NEED_COIN:
+        return "no wallet coin available: a unilateral exit needs a small "
+               "confirmed on-chain coin in the bitcoind wallet named by --wallet";
+    case CPFP_NEED_PACKAGE_RELAY:
+        return "no package relay backend: the fee-paying child can only be sent "
+               "with it through bitcoind RPC (submitpackage, Bitcoin Core 28+)";
+    default:
+        return "none";
+    }
+}
+
+static void need_record(cpfp_need_t n, const char *txid_hex) {
+    if (g_need_seen == CPFP_NEED_NONE) g_need_seen = n;
+    fprintf(stderr, "CPFP: ERROR: %s needs a fee-paying child: %s\n",
+            txid_hex ? txid_hex : "the transaction", cpfp_need_text(n));
+}
+
+int cpfp_anchor_alone_short(uint64_t parent_fee, size_t parent_vsize,
+                            uint64_t anchor_amount, uint64_t need_rate) {
+    uint64_t want = fee_at_rate(need_rate, parent_vsize + CPFP_ANCHOR_ONLY_CHILD_VSIZE);
+    return want == FEE_INVALID || parent_fee + anchor_amount < want;
+}
+
 /* Build a child for parent under spec.  With a wallet: spends spec's coin if
    it has one (falling back to a coin from get_utxo when the wallet cannot sign
    it), plus the anchor, into a change output.  Without one, or when the
@@ -248,6 +281,7 @@ static int build_child(wallet_source_t *wallet, const cpfp_tx_info_t *parent,
                        uint64_t *fee_out, int *used_wallet_out, int *capped_out,
                        coin_lock_t *lock) {
     if (lock) lock->held = 0;
+    g_child_no_coin = 0;
     if (!parent || !child_out || parent->anchor_vout < 0) return 0;
     uint32_t version = parent->version == 3 ? 3u : 2u;
     if (used_wallet_out) *used_wallet_out = 0;
@@ -339,6 +373,7 @@ static int build_child(wallet_source_t *wallet, const cpfp_tx_info_t *parent,
             }
         }
     }
+    g_child_no_coin = 1;
     if (spec->replaces) {
         uint64_t need = spec_fee(spec, CPFP_ANCHOR_ONLY_CHILD_VSIZE, NULL);
         if (need == FEE_INVALID || need > parent->anchor_amount) {
@@ -636,6 +671,7 @@ static cpfp_result_t bump_in_mempool(regtest_t *rt, wallet_source_t *wallet,
             fprintf(stderr, "CPFP: %s is in the mempool at %llu sat/kvB, below %llu; "
                     "no child could bump it\n", ti->txid_hex,
                     (unsigned long long)best, (unsigned long long)need);
+            if (g_child_no_coin) need_record(CPFP_NEED_COIN, ti->txid_hex);
             return CPFP_BUMP_FAILED;
         }
         /* the reused coin went into this child (a fresh one stays locked) */
@@ -772,6 +808,12 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
     } else {
         fprintf(stderr, "CPFP: submitpackage for %s failed: %s\n", ti.txid_hex, r);
         if (already_known(r)) res = CPFP_KNOWN;
+        else if (!used_wallet && g_child_no_coin &&
+                 (strstr(r, "fee not met") || strstr(r, "fee too low") ||
+                  strstr(r, "insufficient fee")) &&
+                 cpfp_anchor_alone_short(parent_fee, ti.vsize, ti.anchor_amount,
+                                         mempool_floor(rt)))
+            need_record(CPFP_NEED_COIN, ti.txid_hex);
     }
     cJSON_Delete(j);
     free(r);
@@ -825,7 +867,23 @@ cpfp_result_t cpfp_send_default(chain_backend_t *cb, const char *tx_hex,
         return cpfp_send_presigned(g_cpfp_rt, g_cpfp_wallet, target,
                                    g_cpfp_max_child_fee, tx_hex, txid_out);
     }
-    if (cb && cb->send_raw_tx)
-        return cb->send_raw_tx(cb, tx_hex, txid_out) ? CPFP_SENT_ALONE : CPFP_FAILED;
+    if (cb && cb->send_raw_tx) {
+        if (cb->send_raw_tx(cb, tx_hex, txid_out)) return CPFP_SENT_ALONE;
+        /* Refused on its own.  A pre-signed tx with a P2A anchor is sized
+           to be relayed with a child when it pays less than the node needs,
+           and this backend cannot send one. */
+        size_t len = strlen(tx_hex) / 2;
+        unsigned char *tx = malloc(len ? len : 1);
+        cpfp_tx_info_t ti;
+        if (tx && hex_decode(tx_hex, tx, len) == (int)len &&
+            cpfp_parse_tx(tx, len, &ti) && ti.anchor_vout >= 0) {
+            fprintf(stderr, "CPFP: %s refused by the chain backend; if it pays "
+                    "less than the node's minimum relay fee it cannot be sent "
+                    "without a child\n", ti.txid_hex);
+            need_record(CPFP_NEED_PACKAGE_RELAY, ti.txid_hex);
+        }
+        free(tx);
+        return CPFP_FAILED;
+    }
     return CPFP_FAILED;
 }
