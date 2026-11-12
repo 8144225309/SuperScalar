@@ -255,9 +255,17 @@ int lsps_peer_request(const char *json_req, char *resp_buf, size_t resp_cap)
                no terms are advertised for it. */
             resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND,
                                      "lsps2 is not available on this connection");
+        } else if (strcmp(method, "lsps1.create_order") == 0 ||
+                   strcmp(method, "lsps1.get_order") == 0) {
+            /* Orders live in a table the channel manager's thread also
+               updates, and an unauthenticated peer could fill it: not
+               offered on this connection. */
+            resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND,
+                                     "lsps1 orders are not available on this connection");
         } else {
             /* No channel context: nothing below can reach the channel
-               manager or a factory client's connection. */
+               manager, a factory client's connection or shared state
+               (lsps1.get_info only formats constants). */
             resp = lsps_dispatch_request(NULL, json);
         }
         cJSON_Delete(json);

@@ -1559,6 +1559,46 @@ int test_lsps_peer_request_refuses_buy(void) {
                          LSPS_ERR_METHOD_NOT_FOUND && !has_result,
                 "the other spelling is refused as well");
 
+    /* Orders are not taken from, or shown to, an outside peer. */
+    for (int k = 0; k < 2; k++) {
+        const char *rq = k == 0
+            ? "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"lsps1.create_order\","
+              "\"params\":{\"channel_balance_msat\":1000000,\"confirms_within_blocks\":1}}"
+            : "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"lsps1.get_order\","
+              "\"params\":{\"order_id\":\"1\"}}";
+        n = lsps_peer_request(rq, reply, sizeof(reply));
+        TEST_ASSERT(n > 0, "the order request is answered");
+        TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result),
+                       LSPS_ERR_METHOD_NOT_FOUND, "an order request from a peer is refused");
+        TEST_ASSERT(!has_result && id == 10 + k, "no order in the reply");
+    }
+    /* The table was not touched: an order a factory client then creates
+       gets the next id the table would have given, which a local order
+       made before shows. */
+    {
+        cJSON *a = cJSON_Parse("{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"lsps1.create_order\","
+                               "\"params\":{\"channel_balance_msat\":1000000}}");
+        cJSON *r1 = lsps_dispatch_request(NULL, a);
+        for (int k = 0; k < 3; k++) {
+            n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"lsps1.create_order\","
+                                  "\"params\":{\"channel_balance_msat\":1000000}}",
+                                  reply, sizeof(reply));
+            TEST_ASSERT(n > 0, "answered");
+        }
+        cJSON *r2 = lsps_dispatch_request(NULL, a);
+        const cJSON *res1 = cJSON_GetObjectItem(r1, "result");
+        const cJSON *res2 = cJSON_GetObjectItem(r2, "result");
+        const cJSON *o1 = res1 ? cJSON_GetObjectItem(res1, "order_id") : NULL;
+        const cJSON *o2 = res2 ? cJSON_GetObjectItem(res2, "order_id") : NULL;
+        TEST_ASSERT(o1 && o2 && cJSON_IsString(o1) && cJSON_IsString(o2),
+                    "local orders are created");
+        TEST_ASSERT_EQ(atoi(o2->valuestring), atoi(o1->valuestring) + 1,
+                       "peer requests in between created no order");
+        cJSON_Delete(r1);
+        cJSON_Delete(r2);
+        cJSON_Delete(a);
+    }
+
     /* Other read-only methods are still answered, through the reply buffer. */
     n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"lsps1.get_info\"}",
                           reply, sizeof(reply));
