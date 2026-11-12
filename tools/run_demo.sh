@@ -251,13 +251,13 @@ run_lsp_clients() {
     sleep 2
 
     step "Starting 4 clients..."
-    $CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
+    $CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --network $NETWORK --daemon --enable-rotation-experimental --lsp-pubkey $LSP_PUBKEY &
     c1_pid=$!; PIDS+=($c1_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
+    $CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --network $NETWORK --daemon --enable-rotation-experimental --lsp-pubkey $LSP_PUBKEY &
     c2_pid=$!; PIDS+=($c2_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
+    $CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --network $NETWORK --daemon --enable-rotation-experimental --lsp-pubkey $LSP_PUBKEY &
     c3_pid=$!; PIDS+=($c3_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --network $NETWORK --daemon --lsp-pubkey $LSP_PUBKEY &
+    $CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --network $NETWORK --daemon --enable-rotation-experimental --lsp-pubkey $LSP_PUBKEY &
     c4_pid=$!; PIDS+=($c4_pid)
 
     wait_for_pid "$lsp_pid" "$label"
@@ -301,7 +301,7 @@ run_client_breach() {
         local logfile="$log_dir/client_${i}.log"
         > "$logfile"  # truncate
         $CLIENT_BIN --seckey ${!keyvar} --port $PORT --network $NETWORK \
-            --lsp-pubkey $LSP_PUBKEY --daemon > "$logfile" 2>&1 &
+            --lsp-pubkey $LSP_PUBKEY --daemon --enable-rotation-experimental > "$logfile" 2>&1 &
         c_pids+=($!)
         PIDS+=(${c_pids[-1]})
         sleep 0.3

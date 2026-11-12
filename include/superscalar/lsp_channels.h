@@ -26,14 +26,82 @@
 uint32_t lsp_compute_factory_cltv_delta(const void *factory_ptr);
 
 /* Validate and adjust cltv_expiry for HTLC forwarding through a factory channel.
-   Returns 1 if cltv_expiry has enough room for the delta, 0 if too low.
+   cltv_expiry is an absolute block height, so it is measured against the
+   chain tip: returns 1 only if cltv_expiry > current_height + cltv_delta.
+   Pass current_height = 0 when the tip is not known; the HTLC must then at
+   least exceed cltv_delta itself.
    Rejects HTLCs whose cltv_expiry >= factory_cltv_timeout (funds would be
    trapped past factory expiry). Pass 0 for factory_cltv_timeout to skip check.
    cltv_delta is the minimum safety margin computed by lsp_compute_factory_cltv_delta.
    On success, *fwd_cltv_out = cltv_expiry - cltv_delta. */
 int lsp_validate_cltv_for_forward(uint32_t cltv_expiry, uint32_t *fwd_cltv_out,
                                    uint32_t factory_cltv_timeout,
-                                   uint32_t cltv_delta);
+                                   uint32_t cltv_delta,
+                                   uint32_t current_height);
+
+/* --- Outbound payments through the bridge --- */
+
+/* Outcome of checking an invoice against the HTLC a client offered for it. */
+typedef enum {
+    BRIDGE_PAY_OK = 0,
+    BRIDGE_PAY_BAD_INVOICE,          /* does not decode */
+    BRIDGE_PAY_WRONG_NETWORK,        /* invoice is for another chain */
+    BRIDGE_PAY_HASH_MISMATCH,        /* invoice hash != HTLC hash */
+    BRIDGE_PAY_NO_AMOUNT,            /* amountless invoices are refused */
+    BRIDGE_PAY_AMOUNT_EXCEEDS_HTLC,  /* invoice asks for more than the HTLC funds */
+    BRIDGE_PAY_EXPIRED,
+    BRIDGE_PAY_NO_CHAIN_HEIGHT,      /* tip unknown: deadline cannot be judged */
+    BRIDGE_PAY_CLTV_OUT_OF_BOUNDS     /* HTLC expires too soon for the route, or past the factory */
+} bridge_pay_check_t;
+
+/* Short reason string for a check result (used as the HTLC failure reason). */
+const char *lsp_bridge_pay_check_str(bridge_pay_check_t r);
+
+/* 1 if a BOLT #11 network prefix ("bc", "tb", "tbs", "bcrt") belongs to the
+   named chain ("mainnet", "testnet", "testnet4", "signet", "regtest"). */
+int lsp_bridge_invoice_network_ok(const char *network, const char *invoice_hrp);
+
+/* What is left of an offered HTLC for the outside payment once the LSP's
+   routing fee (routing_fee_ppm, rounded up) is taken: the most that may be
+   spent on the invoice and its routing fees together.  Returns 0 when the
+   fee consumes the whole HTLC. */
+uint64_t lsp_bridge_outbound_budget_msat(uint64_t htlc_amount_sats,
+                                           uint64_t routing_fee_ppm);
+
+/* Check an invoice a client asked the LSP to pay against the HTLC it offered.
+   The invoice must decode, be for `network`, carry exactly the HTLC's payment
+   hash, state an amount no greater than the HTLC amount minus the LSP's fee,
+   and not be expired at `now` (unix seconds).
+   On BRIDGE_PAY_OK the outputs (each optional) are filled:
+     invoice_msat_out    the invoice amount
+     budget_msat_out     lsp_bridge_outbound_budget_msat() for this HTLC
+     min_final_cltv_out  the invoice's min_final_cltv_expiry */
+bridge_pay_check_t lsp_bridge_check_outbound_invoice(
+    secp256k1_context *ctx, const char *bolt11,
+    const unsigned char *htlc_payment_hash32, uint64_t htlc_amount_sats,
+    uint64_t routing_fee_ppm, const char *network, uint64_t now,
+    uint64_t *invoice_msat_out, uint64_t *budget_msat_out,
+    uint32_t *min_final_cltv_out);
+
+/* How long the outside payment may stay locked up, given the HTLC the client
+   offered for it.  The HTLC must expire later than
+       current_height + min_final_cltv + forward_margin
+   (the invoice's final-hop requirement plus the blocks the LSP keeps for
+   itself to claim the client's HTLC after the outside payment settles) and
+   before factory_cltv_timeout (0 = no limit).
+   On success returns BRIDGE_PAY_OK and sets *max_delay_out to the largest
+   total route delay, in blocks from the current tip, that still leaves
+   forward_margin before the client's HTLC expires. */
+bridge_pay_check_t lsp_bridge_outbound_max_delay(uint32_t htlc_cltv_expiry,
+                                                  uint32_t current_height,
+                                                  uint32_t min_final_cltv,
+                                                  uint32_t forward_margin,
+                                                  uint32_t factory_cltv_timeout,
+                                                  uint32_t *max_delay_out);
+
+/* Route delay allowed for operator-initiated pays, which have no client
+   HTLC to bound them (Core Lightning's own default). */
+#define LSP_BRIDGE_OPERATOR_MAX_DELAY 2016
 
 /* Per-client channel entry managed by the LSP */
 typedef struct {
@@ -42,12 +110,13 @@ typedef struct {
     int ready;                  /* 1 after CHANNEL_READY sent */
     time_t last_message_time;   /* epoch timestamp of last wire message */
     int offline_detected;        /* 1 if declared offline */
-    int session_unauthenticated; /* 1 if the current session was opened by
-                                    MSG_RECONNECT, which does not prove the
-                                    client's identity */
+    int session_from_reconnect; /* 1 if the current session was opened by
+                                   MSG_RECONNECT */
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
     size_t close_spk_len;       /* 34 when populated, 0 if unset */
     uint64_t accumulated_fees_sats; /* routing fees earned on THIS channel */
+    int exchange_in_progress;   /* the LSP is waiting for this client's reply:
+                                   no other exchange may start on the channel */
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
@@ -72,8 +141,32 @@ typedef struct {
     size_t sender_idx;           /* originating client index (Phase 17) */
     uint64_t sender_htlc_id;    /* HTLC id on sender's channel (Phase 17) */
     uint32_t cltv_expiry;       /* timelock for bridge HTLC timeout */
+    /* Which HTLC on the Lightning node this is ("<channel>:<id>" as the
+       plugin reports it; "" if unknown).  The node offers an unresolved
+       HTLC again after it restarts; this tells that apart from a second
+       HTLC for the same hash. */
+    #define BRIDGE_UPSTREAM_ID_MAX 64
+    char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
+    int expiry_warned;          /* outbound: unresolved-near-expiry logged */
+    int fail_pending;           /* inbound: failed towards the client, the
+                                   bridge has still to be told (saved with
+                                   the origin) */
+    int64_t db_id;              /* its row in the database, 0 if not saved */
     int active;
 } htlc_origin_t;
+
+/* An inbound bridge HTLC the client has fulfilled: kept so the fulfil can
+   be given again if the Lightning node offers the same HTLC once more
+   (it never received, or lost, the first answer). */
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    char upstream_id[BRIDGE_UPSTREAM_ID_MAX];
+    uint64_t bridge_htlc_id;
+    int undelivered;    /* the bridge has not confirmed this fulfil yet */
+    int unresolved;     /* the Lightning node could not take it: kept, not
+                           repeated until the next start */
+} bridge_fulfilled_t;
 
 typedef struct {
     lsp_channel_entry_t *entries;
@@ -90,6 +183,23 @@ typedef struct {
     size_t n_htlc_origins;
     size_t htlc_origins_cap;
     uint64_t next_request_id;    /* for outbound pay correlation */
+    char network[16];            /* chain name; invoices for any other chain
+                                    are refused.  Set after init. */
+    /* Payment hashes of the most recent outside payments that completed
+       (ring buffer): a client is not charged a second time for one. */
+    #define LSP_BRIDGE_FULFILLED_MAX 32
+    bridge_fulfilled_t bridge_fulfilled[LSP_BRIDGE_FULFILLED_MAX];
+    size_t n_bridge_fulfilled;
+    size_t bridge_fulfilled_next;
+    /* Bridge messages that arrived for a channel with an exchange in
+       progress; handled once the channel is free. */
+    #define LSP_BRIDGE_DEFERRED_MAX 16
+    struct { uint8_t msg_type; void *json; } bridge_deferred[LSP_BRIDGE_DEFERRED_MAX];
+    size_t n_bridge_deferred;
+    #define LSP_OUTBOUND_PAID_MAX 64
+    unsigned char outbound_paid[LSP_OUTBOUND_PAID_MAX][32];
+    size_t n_outbound_paid;
+    size_t outbound_paid_next;
 
     /* Watchtower (Phase 18) */
     watchtower_t *watchtower;
@@ -106,6 +216,7 @@ typedef struct {
     /* Continuous ladder rotation (set once at daemon startup) */
     unsigned char rot_lsp_seckey[32];
     void *rot_fee_est;              /* fee_estimator_t* — avoids header dependency */
+    uint64_t rot_tree_fee_rate;     /* --tree-fee-rate: the agreed rate of rotated factories */
     unsigned char rot_fund_spk[34];
     size_t rot_fund_spk_len;
     char rot_fund_addr[128];
@@ -115,7 +226,10 @@ typedef struct {
     int rot_is_regtest;
     uint64_t rot_funding_sats;
     int rot_leaf_arity;            /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
-    int rot_auto_rotate;           /* 1 = auto-rotate enabled */
+    int rot_enabled;               /* 1 = rotation may run (--enable-rotation-experimental);
+                                      default 0: every rotation path is refused */
+    int rot_auto_rotate;           /* 1 = rotate automatically when a factory turns
+                                      DYING; only ever set together with rot_enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 
     /* Rotation retry with backoff (reset on first attempt to avoid aliasing) */
@@ -123,12 +237,22 @@ typedef struct {
     uint32_t rot_last_attempt_block[8]; /* block height of last failed attempt */
     uint32_t rot_max_retries;           /* 0 = default (3); after N failures, broadcast dist TX */
     uint32_t rot_retry_base_delay;      /* 0 = default (10 blocks); doubles per retry */
+    uint8_t  rot_postponed[8];          /* 1 = last attempt postponed on fees (no retry
+                                           used): tried again on the next block;
+                                           2 = still postponed when the factory expired */
 
     /* JIT Channel Fallback (Gap #2) */
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
     size_t n_jit_channels;
     size_t jit_channels_cap;
-    int jit_enabled;               /* 1 = JIT enabled (default), 0 = --no-jit */
+    int jit_enabled;               /* 1 = JIT opens allowed (experimental opt-in); default 0 */
+
+    /* Client messages read while a blocking exchange was waiting for a
+       different message.  Handled, in arrival order, by
+       lsp_channels_drain_deferred(). */
+    struct lsp_deferred_msg *deferred_msgs;
+    size_t n_deferred_msgs;
+    size_t deferred_msgs_cap;
     uint64_t jit_funding_sats;     /* per-client JIT funding amount */
 
     /* Factory arity (Upgrade 2) */
@@ -222,6 +346,33 @@ typedef struct {
    Returns 1 on success. */
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr);
 
+/* --- Messages held back during a blocking exchange --- */
+
+typedef struct lsp_deferred_msg {
+    size_t client_idx;
+    wire_msg_t msg;
+} lsp_deferred_msg_t;
+
+/* Most messages that may be held at once. */
+#define LSP_DEFERRED_MSGS_MAX 256
+
+/* Hold a message from client_idx for later handling.  On success (1) the
+   queue owns msg->json and msg->json is set to NULL.  Returns 0, leaving msg
+   untouched, if the queue is full or memory is exhausted. */
+int lsp_channels_defer_msg(lsp_channel_mgr_t *mgr, size_t client_idx,
+                            wire_msg_t *msg);
+
+/* Number of messages currently held. */
+size_t lsp_channels_deferred_count(const lsp_channel_mgr_t *mgr);
+
+/* Pass every held message to lsp_channels_handle_msg(), oldest first, and
+   empty the queue.  A message whose client has disconnected is dropped.
+   Returns the number of messages handled. */
+int lsp_channels_drain_deferred(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Free the queue and everything in it without handling. */
+void lsp_channels_free_deferred(lsp_channel_mgr_t *mgr);
+
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
                        const factory_t *factory,
@@ -271,6 +422,14 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 /* Send CHANNEL_READY to all clients. Returns 1 on success. */
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
+/* Rotation: carry a client's balance from its old channel into the freshly
+   initialised channel ch of the new factory.  The channel keeps the funding
+   amount of its leaf output and its fee rate, exactly as at channel open, so
+   both sides build the same commitment; the client gets client_balance and
+   the LSP the rest of the usable amount.  Returns 0 and leaves the default
+   split if client_balance does not fit in the new channel. */
+int lsp_channel_carry_client_balance(channel_t *ch, uint64_t client_balance);
+
 /* Handle an incoming channel message from a client.
    Dispatches based on msg_type. Returns 1 on success, 0 on error. */
 int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
@@ -299,6 +458,11 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
    Returns 1 on success, 0 on error. */
 int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                   size_t expected_msgs);
+
+/* Once every factory has expired, offer a JIT channel to each connected
+   client that has none.  Does nothing unless opening JIT channels is enabled
+   (mgr->jit_enabled).  Returns the number of opens attempted. */
+int lsp_channels_jit_expiry_trigger(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* Run a daemon event loop handling channel messages until shutdown.
    Loops on select() with 5-second timeout checking *shutdown_flag.
@@ -337,10 +501,19 @@ uint64_t lsp_channels_unsettled_share(const lsp_channel_mgr_t *mgr,
 
 /* --- Leaf-Level Fund Reallocation (Upgrade 3) --- */
 
-/* Cooperatively redistribute output amounts on an arity-2 leaf.
-   All 3 signers (LSP + 2 clients) must agree.  amounts[] must sum
-   to the current leaf output total; each amount >= 546 sats.
-   Performs a 2-round MuSig2 ceremony over the wire.
+/* Why the LSP offers no operation that reallocates a leaf: a reallocation
+   replaces the leaf transaction, the clients' channels cannot yet be moved
+   to the new leaf output, and so clients refuse to co-sign one. */
+#define LSP_LEAF_REALLOC_UNAVAILABLE \
+    "not available until channels can follow a reallocated leaf"
+
+/* Run the leaf reallocation ceremony: propose new output amounts for a leaf
+   to its clients and collect a MuSig2 signature for the new leaf state.
+   amounts[] must sum to the current leaf output total; each amount >= 546
+   sats.  Clients currently refuse every proposal (see
+   LSP_LEAF_REALLOC_UNAVAILABLE), so this fails; nothing that serves users
+   calls it.  When the ceremony fails for any reason the LSP's leaf is put
+   back exactly as it was before the call.
    Returns 1 on success, 0 on failure. */
 int lsp_realloc_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                       int leaf_side, const uint64_t *amounts, size_t n_amounts);
@@ -408,23 +581,41 @@ int lsp_subfactory_chain_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    int channel_idx_in_sub,
                                    uint64_t delta_sats);
 
-/* Buy inbound liquidity from L-stock for a client (arity-2 only).
-   Moves amount_sats from L-stock to client's channel, increasing inbound capacity.
-   Returns 1 on success. */
+/* Buy inbound liquidity from L-stock for a client.  This needs a leaf
+   reallocation, so it is refused: the call reports
+   LSP_LEAF_REALLOC_UNAVAILABLE, contacts no client, leaves the leaf and the
+   channel untouched and returns 0. */
 int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 size_t client_idx, uint64_t amount_sats);
 
 /* --- Continuous Ladder Rotation (Gap #3) --- */
 
+/* Rotation is experimental and off unless the operator opts in: sets
+   mgr->rot_enabled to `enabled`, and mgr->rot_auto_rotate (rotate when a
+   factory turns DYING) to `enabled && automatic`. */
+void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic);
+
 /* Perform a full factory rotation: PTLC turnover → cooperative close →
    fund new factory → create new factory → reinitialize channels.
    All parameters come from mgr->rot_* fields.
-   Returns 1 on success, 0 on failure. */
+   Refused (LSP_ROTATE_FAILED, nothing done) unless mgr->rot_enabled.
+   Otherwise returns LSP_ROTATE_OK, LSP_ROTATE_FAILED, or LSP_ROTATE_POSTPONED: the
+   old factory's cooperative close would cost more than half its funding at
+   the current fee estimate; nothing was sent or changed, and the
+   postponement is already recorded (lsp_rotation_record_postponed): not a
+   failed attempt.  A replacement factory that cannot be built, or whose
+   channels cannot hold the carried balances, is LSP_ROTATE_FAILED, also
+   with nothing sent or changed: its shape, client count, funding and agreed
+   tree rate do not change with the fee market. */
+#define LSP_ROTATE_FAILED    0
+#define LSP_ROTATE_OK        1
+#define LSP_ROTATE_POSTPONED 2
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* Fire ceremony if all clients are ready (async-rotation mode).
-   Resets the readiness tracker regardless of outcome.
-   Returns 1 if ceremony was fired, 0 if not all clients ready yet. */
+   Resets the readiness tracker once the ceremony ran, unless it was
+   postponed (then the clients stay ready and it fires again on a later
+   block).  Returns 1 if the rotation completed, else 0. */
 int lsp_check_rotation_readiness(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* --- Reconnection (Phase 16) --- */
@@ -449,6 +640,81 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr);
 /* Set bridge fd in channel manager. */
 void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd);
 
+/* How outside payments end (BRIDGE_PAY_RESULT):
+     - success with the preimage of the HTLC's hash: the client's HTLC is
+       fulfilled;
+     - failure: the client's HTLC is failed back.  The plugin reports
+       failure only when the node can no longer complete the payment;
+     - no result: the HTLC stays held.  It is never failed on a timer (see
+       lsp_channels_expire_htlcs), because a payment that completed must
+       not be refunded;
+     - a result that cannot be used is rejected, once and for good:
+         preimage_mismatch  a "success" whose preimage is not the HTLC's.
+                            The HTLC stays held and the origin open: the
+                            node claims a payment it cannot prove, and
+                            whether to refund is an operator's decision;
+         no_htlc            the client's HTLC is no longer there to settle
+                            (the origin is closed, nothing is left to do);
+         no_channel         the origin names a client that does not exist.
+   Every result is answered with BRIDGE_PAY_RESULT_ACK, "applied" or
+   "rejected" with the reason; the plugin repeats a result until it is
+   answered and never after. */
+
+/* Wait up to timeout_sec for a message of type `expected` from a client.
+   Keepalives that arrive first are dealt with (a ping is answered, a pong
+   dropped); any other message that is not the expected one is logged and
+   dropped.  Returns 1 with the message, 0 on timeout or a lost connection. */
+int lsp_channels_recv_client_reply(int fd, wire_msg_t *msg, uint8_t expected,
+                                    int timeout_sec);
+
+/* After an HTLC on a client's channel was fulfilled or failed (and the
+   client told): sign the new commitment, send COMMITMENT_SIGNED, take the
+   client's REVOKE_AND_ACK and send the LSP's own revocation.  old_* is the
+   channel as it was before the change, for the watchtower.
+   Returns 1 when the exchange completed.  If it did not, the client's
+   connection is dropped, so nothing further happens on a channel whose
+   commitment is in doubt until the client reconnects and the pending
+   commitment is sent again. */
+int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                     size_t client_idx,
+                                     uint64_t old_local, uint64_t old_remote,
+                                     const htlc_t *old_htlcs, size_t old_n_htlcs);
+
+/* Give a client back the HTLC it offered for an outside payment that was
+   never requested from the Lightning node, and close its origin.  The HTLC
+   is in the commitment, so the commitment exchange follows. */
+void lsp_channels_fail_outbound_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      htlc_origin_t *origin, size_t client_idx,
+                                      uint64_t htlc_id, const char *reason);
+
+/* Amount of the registered invoice for payment_hash32, in msat (0 = the
+   invoice names no amount).  Returns 1 if the invoice is registered. */
+int lsp_channels_invoice_amount(lsp_channel_mgr_t *mgr,
+                                 const unsigned char *payment_hash32,
+                                 uint64_t *amount_msat_out);
+
+/* 1 if an HTLC that came in through the bridge for payment_hash32 is still
+   unresolved. */
+int lsp_channels_bridge_htlc_pending(const lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32);
+
+/* Chain the LSP runs on, for invoice checks: mgr->network if set, else the
+   watchtower's chain connection, else NULL. */
+const char *lsp_channels_network(const lsp_channel_mgr_t *mgr);
+
+/* Current chain tip height from the chain backend (or the watchtower's chain
+   connection); 0 if neither is available. */
+uint32_t lsp_channels_chain_height(const lsp_channel_mgr_t *mgr);
+
+/* Ask the bridge to pay an invoice out of the LSP's own Lightning node on the
+   operator's instruction (no client HTLC backs it).  The invoice must decode,
+   be for this chain, state an amount and be unexpired; the node is allowed
+   the invoice amount plus a small routing-fee allowance.  Returns 1 and sets
+   *request_id_out on success; on failure returns 0 and points *err_out at a
+   static reason string. */
+int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
+                               uint64_t *request_id_out, const char **err_out);
+
 /* Register an invoice (payment_hash → dest_client) for bridge inbound routing. */
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32,
@@ -466,9 +732,124 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      const wire_msg_t *msg);
 
 /* Track that an HTLC came from the bridge (for back-propagation). */
-void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
+/* Record that an HTLC for payment_hash32 came in through the bridge
+   (bridge_htlc_id > 0) or went out through it (bridge_htlc_id == 0).
+   Returns the origin entry that was filled (an earlier free slot is reused
+   before the table grows), or NULL if the table is full.  The caller
+   completes the entry and writes it with lsp_channels_origin_save. */
+htlc_origin_t *lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
                                         const unsigned char *payment_hash32,
                                         uint64_t bridge_htlc_id);
+
+/* The client fulfilled an HTLC that came in through the bridge: close its
+   origin, remember the preimage for a replay, and return the bridge's
+   htlc_id for the fulfil (0 if the hash did not come from the bridge). */
+uint64_t lsp_channels_settle_bridge_origin(lsp_channel_mgr_t *mgr,
+                                             const unsigned char *payment_hash32,
+                                             const unsigned char *preimage32);
+
+/* Fulfils the bridge has not confirmed (BRIDGE_FULFILL_ACK) are kept in the
+   database as well and sent again: when the bridge connects, on its
+   heartbeat, and when the node offers the HTLC again.
+   lsp_channels_flush_bridge_fulfils sends them; it returns how many.
+   lsp_channels_load_bridge_fulfils restores them after a restart. */
+size_t lsp_channels_flush_bridge_fulfils(lsp_channel_mgr_t *mgr);
+
+/* Tell the bridge about inbound HTLCs that were failed while it was away.
+   Returns how many. */
+size_t lsp_channels_flush_bridge_fails(lsp_channel_mgr_t *mgr);
+
+/* Handle the bridge messages that were put aside because their channel had
+   an exchange in progress.  Does nothing while any channel still has one.
+   Returns how many were handled. */
+size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+
+/* 1 if the client's revocation of the commitment before the channel's
+   current one has been accepted and stored. */
+int lsp_channels_peer_revoked(const channel_t *ch);
+
+/* The client did not revoke its previous commitment after being offered or
+   offering HTLC `htlc_id`: the HTLC is failed in the LSP's state and the
+   client's connection is dropped.  The caller must stop there: nothing is
+   recorded as paid and nothing is forwarded on the strength of that HTLC. */
+void lsp_channels_abort_unrevoked_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                        size_t client_idx, channel_t *ch,
+                                        uint64_t htlc_id);
+
+/* Handle a bridge message that arrived while the LSP waits for the reply of
+   the client on `waiting_client_fd`.  That client's channel counts as busy
+   for the duration, so the message starts no second exchange on it. */
+void lsp_channels_handle_bridge_msg_during_wait(lsp_channel_mgr_t *mgr,
+                                                 lsp_t *lsp,
+                                                 int waiting_client_fd,
+                                                 const wire_msg_t *msg);
+
+/* Restore the HTLC origins in flight from the database, with their expiry,
+   their name on the Lightning node and whether a failure still has to be
+   reported to the bridge.  Returns how many. */
+size_t lsp_channels_restore_origins(lsp_channel_mgr_t *mgr);
+size_t lsp_channels_load_bridge_fulfils(lsp_channel_mgr_t *mgr);
+
+/* 1 if an HTLC for payment_hash32 is in flight through the bridge in either
+   direction. */
+int lsp_channels_hash_in_flight(const lsp_channel_mgr_t *mgr,
+                                 const unsigned char *payment_hash32);
+
+/* Remember / look up an outside payment that completed. */
+void lsp_channels_note_outbound_paid(lsp_channel_mgr_t *mgr,
+                                      const unsigned char *payment_hash32);
+int lsp_channels_outbound_was_paid(const lsp_channel_mgr_t *mgr,
+                                    const unsigned char *payment_hash32);
+
+/* 1 if HTLC htlc_id on client client_idx's channel pays for an outside
+   payment whose result has not arrived yet. */
+int lsp_channels_htlc_awaits_outside_pay(const lsp_channel_mgr_t *mgr,
+                                          size_t client_idx, uint64_t htlc_id);
+
+/* The per-block expiry pass of the daemon loop.
+   - Channel HTLCs that have reached their expiry are failed, except those
+     that pay for an outside payment still in flight: only the Lightning
+     node's result may settle those (a timer could refund a payment that
+     went through).
+   - Inbound bridge HTLCs within 10 blocks of their expiry are failed back
+     to the bridge.  Outbound origins are left alone. */
+void lsp_channels_expire_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                uint32_t height);
+
+/* The open origin for payment_hash32 in one direction: outbound != 0 for
+   an outside payment requested by a client, 0 for an HTLC that came in
+   through the bridge.  One hash can have one of each; they are never
+   interchangeable.  NULL if there is none. */
+htlc_origin_t *lsp_channels_find_origin(lsp_channel_mgr_t *mgr,
+                                         const unsigned char *payment_hash32,
+                                         int outbound);
+
+/* Write an origin to the database (insert the first time, update after). */
+void lsp_channels_origin_save(lsp_channel_mgr_t *mgr, htlc_origin_t *origin);
+
+/* Close an origin, in memory and its own row in the database. */
+void lsp_channels_origin_close(lsp_channel_mgr_t *mgr, htlc_origin_t *origin);
+
+/* 1 if payment_hash32 must not be used for a new invoice or a new inbound
+   payment: an HTLC for it is in flight in either direction, an outside
+   payment for it completed, or an inbound one was fulfilled (its preimage
+   is known outside). */
+int lsp_channels_hash_spent_or_busy(const lsp_channel_mgr_t *mgr,
+                                     const unsigned char *payment_hash32);
+
+/* 1 if another origin can be recorded. */
+int lsp_channels_origin_slot_free(const lsp_channel_mgr_t *mgr);
+
+/* Record an outside payment requested for a client's HTLC, so that the
+   bridge's result for request_id finds its way back to that HTLC.
+   Returns the origin entry, or NULL if the table is full. */
+htlc_origin_t *lsp_channels_track_outbound_pay(lsp_channel_mgr_t *mgr,
+                                        const unsigned char *payment_hash32,
+                                        uint64_t request_id,
+                                        size_t sender_idx,
+                                        uint64_t sender_htlc_id,
+                                        uint32_t cltv_expiry);
 
 /* Check bridge HTLC timeouts: fail back any HTLC whose cltv_expiry is
    approaching (within FACTORY_CLTV_DELTA blocks of current height).
@@ -538,14 +919,27 @@ typedef struct {
 int lsp_channels_batch_rebalance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    const rebalance_entry_t *entries, size_t n_entries);
 
-/* Advance one PS leaf via the production wire ceremony (PROPOSE->PSIG->DONE).
-   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip. */
-int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side);
+/* Advance one leaf (arity-1 DW or PS) via the wire ceremony.
+   leaf_side: 0..n_leaf_nodes-1. Returns 1 on success, 0 on failure/skip/refusal.
+
+   The advance replaces the transaction that funds the leaf's channel and does
+   not re-anchor the channel, so it is refused (no state change, nothing sent)
+   while an open channel is funded by the leaf, whatever its balances -- or by
+   any leaf of the factory when the advance would exhaust this leaf and roll
+   over into a whole-tree state advance.  allow_live_channel != 0 skips that
+   check; it is for harnesses that exercise the ceremony itself.
+   Payments never advance a leaf. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side,
+                                  int allow_live_channel);
 
 /* Tick the factory's root counter forward (PS Tier B trigger).
    For PS factories, root rollover is block-driven (leaves chain-extend).
    On rollover, drives Tier B ceremony to re-sign every non-PS-leaf node
-   for the new epoch.  Returns 1 = ceremony complete, 0 = no rollover,
-   -1 = ceremony failed.  See src/lsp_channels.c for caller wiring. */
-int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+   for the new epoch.  A rollover replaces every leaf without re-anchoring
+   any channel, so the tick is refused (counter untouched) while any channel
+   of the factory is open, unless allow_live_channel != 0 (harnesses only).
+   Returns 1 = ceremony complete, 0 = no rollover,
+   -1 = refused or ceremony failed. */
+int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                           int allow_live_channel);
 #endif /* SUPERSCALAR_LSP_CHANNELS_H */

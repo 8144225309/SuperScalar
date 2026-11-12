@@ -15,8 +15,8 @@
                    reconnect, pending COMMITMENT_SIGNED retransmit
    LSP -> client:  client_accept_lsp_revocation (both client daemon paths)
    Also: a revoked commitment that cannot be watched fails the channel, and
-   which failures are persisted (not those caused on a session opened by an
-   unauthenticated reconnect).
+   which failures are persisted (not those caused on a session opened by a
+   reconnect).
 */
 
 #include "superscalar/channel.h"
@@ -690,7 +690,7 @@ int test_lsp_reconnect_retransmit_rejects_invalid_revocation(void) {
     TEST_ASSERT(r.acks == 0, "no RECONNECT_ACK");
     TEST_ASSERT(r.stored == 0, "garbage secret not stored");
     TEST_ASSERT(r.failed == CHANNEL_FAILED_SESSION, "channel failed for this process");
-    TEST_ASSERT(r.persisted == 0, "failure from an unauthenticated session not persisted");
+    TEST_ASSERT(r.persisted == 0, "failure from a reconnect session not persisted");
     TEST_ASSERT(r.refused_again, "further reconnects refused");
 
     memset(&r, 0, sizeof r);
@@ -709,8 +709,7 @@ int test_lsp_reconnect_retransmit_rejects_invalid_revocation(void) {
 /* Which failures are persisted: a failure caused by the peer on a session
    from the factory or rotation ceremony (the client signed with its key)
    survives a restart; on a session opened by MSG_RECONNECT it lives in
-   memory only, so an impostor cannot fail an honest client's channel for
-   good; a failure the peer did not cause is persisted either way.  JIT
+   memory only; a failure the peer did not cause is persisted either way.  JIT
    channels follow the same rules, and a client with any failed channel is
    refused as a whole. */
 int test_failed_mark_durable_vs_reconnect_session(void) {
@@ -758,7 +757,7 @@ int test_failed_mark_durable_vs_reconnect_session(void) {
     TEST_ASSERT(persist_channel_is_failed(&f->db, 0) == 1, "factory mark persisted");
 
     /* Client 1's session was opened by MSG_RECONNECT. */
-    f->mgr.entries[1].session_unauthenticated = 1;
+    f->mgr.entries[1].session_from_reconnect = 1;
     lsp_channels_fail_channel(&f->mgr, &f->lsp, 1, NULL, 1, "test");
     TEST_ASSERT(f->mgr.entries[1].channel.revocation_failed == CHANNEL_FAILED_SESSION,
                 "failure kept in memory");
@@ -773,7 +772,7 @@ int test_failed_mark_durable_vs_reconnect_session(void) {
                 "re-saving keeps each mark as it is");
 
     /* Not caused by the peer (the watch could not be registered): durable
-       even on the unauthenticated session. */
+       even on the reconnect session. */
     lsp_channels_fail_channel(&f->mgr, &f->lsp, 1, &jits[1].channel, 0, "test");
     TEST_ASSERT(jits[1].channel.revocation_failed == CHANNEL_FAILED_DURABLE,
                 "local failure is durable");
@@ -916,11 +915,10 @@ int test_failed_channel_mark_persists(void) {
     return 1;
 }
 
-/* jit_channels.revocation_failed is schema v41.  A DB from main (v39), or
-   from the change that takes v40 (funding_anchors, reorg_tips), lacks the
-   column; one from an earlier build of this change may already have it at
-   v40.  Each must open, end at the current version with the column, and
-   keep its JIT rows. */
+/* jit_channels.revocation_failed is schema v44.  The step adds the column
+   whenever it is missing, so a DB at v41, or at a version between 41 and 44
+   written by another schema step, must open, end at the current version
+   with the column, and keep its JIT rows. */
 static int rfc_migrate_case(int start_version, int drop_column) {
     char path[96];
     snprintf(path, sizeof path, "/tmp/test_ss_jitmig_%d_%d_%d.db",
@@ -975,9 +973,8 @@ static int rfc_migrate_case(int start_version, int drop_column) {
 }
 
 int test_persist_jit_failed_column_migration(void) {
-    TEST_ASSERT(rfc_migrate_case(39, 1), "DB at v39 (main) migrates");
-    TEST_ASSERT(rfc_migrate_case(40, 1), "DB at v40 without the column migrates");
-    TEST_ASSERT(rfc_migrate_case(40, 0), "DB at v40 that already has the column opens");
+    TEST_ASSERT(rfc_migrate_case(41, 1), "DB at v41 migrates");
+    TEST_ASSERT(rfc_migrate_case(43, 1), "DB at v43 without the column migrates");
     printf("\n  ");
     return 1;
 }

@@ -37,7 +37,7 @@ PS_SUB_ARITY="${PS_SUB_ARITY:-0}"
 # unilateral exit.
 FORCE_CLOSE="${FORCE_CLOSE:-0}"
 EXTRA_LSP_FLAGS=""
-[ "$PS_SUB_ARITY" -gt 0 ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --ps-subfactory-arity $PS_SUB_ARITY"
+[ "$PS_SUB_ARITY" -gt 0 ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY"
 [ "$FORCE_CLOSE" = "1" ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --force-close"
 TMPSUFFIX=""
 [ "$PS_SUB_ARITY" -gt 0 ] && TMPSUFFIX="-k${PS_SUB_ARITY}"
@@ -128,7 +128,7 @@ done
 
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
-    "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $LSP_PORT \
+    "$CLIENT_BIN" --test-allow-tree-advance --network regtest --host 127.0.0.1 --port $LSP_PORT \
         --seckey "${CLIENT_SECKEYS[$i]}" --fee-rate 1000 \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $((i + 1)) --daemon \
         --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \

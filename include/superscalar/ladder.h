@@ -13,7 +13,11 @@ typedef struct {
     factory_state_t cached_state;  /* last computed state */
     int is_funded;                 /* funding confirmed on-chain */
     int is_initialized;            /* factory_init + build_tree done */
-    tx_buf_t distribution_tx;      /* pre-signed nLockTime fallback */
+    tx_buf_t distribution_tx;      /* co-signed nLockTime fallback (empty if the
+                                      LSP does not hold a signed copy) */
+    int dist_tx_broadcast;         /* 1 = done: the LSP broadcast distribution_tx,
+                                      or the funding output is already spent */
+    uint32_t dist_tx_tried_height; /* last height a broadcast was attempted at */
 
     /* Per-client key turnover state */
     int client_departed[FACTORY_MAX_SIGNERS];     /* 1 if PTLC complete */
@@ -21,6 +25,11 @@ typedef struct {
     size_t n_departed;
 
     int partial_rotation_done;   /* 1 = old factory retired via partial rotation */
+
+    /* distribution TX broadcast (at expiry or as the rotation fallback) and
+       not yet confirmed: sent again / re-bumped on every block */
+    int dist_pending;
+    char dist_txid[65];
 } ladder_factory_t;
 
 typedef struct {

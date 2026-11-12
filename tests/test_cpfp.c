@@ -574,7 +574,7 @@ int test_watchtower_add_pending_tx(void)
 
     int r = watchtower_add_pending_tx(&wt,
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        1, 240);
+        1, 240, 0);
     TEST_ASSERT(r == 1, "add_pending_tx returns 1");
     TEST_ASSERT_EQ((long)wt.n_pending, 1L, "n_pending = 1");
     TEST_ASSERT(strncmp(wt.pending[0].txid, "cccc", 4) == 0, "txid stored");
@@ -601,7 +601,7 @@ int test_watchtower_add_pending_tx_full(void)
     char txid[65];
     for (size_t i = 0; i < WATCHTOWER_MAX_PENDING; i++) {
         snprintf(txid, sizeof(txid), "%064zx", i);
-        TEST_ASSERT(watchtower_add_pending_tx(&wt, txid, 1, 240) == 1,
+        TEST_ASSERT(watchtower_add_pending_tx(&wt, txid, 1, 240, 0) == 1,
                     "add within capacity");
     }
     TEST_ASSERT_EQ((long)wt.n_pending, (long)WATCHTOWER_MAX_PENDING,
@@ -609,7 +609,7 @@ int test_watchtower_add_pending_tx_full(void)
 
     int r = watchtower_add_pending_tx(&wt,
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-        1, 240);
+        1, 240, 0);
     TEST_ASSERT(r == 0, "add with full table returns 0");
     TEST_ASSERT_EQ((long)wt.n_pending, (long)WATCHTOWER_MAX_PENDING,
                    "n_pending unchanged");
@@ -631,7 +631,7 @@ int test_watchtower_add_pending_bump_mechanics(void)
 
     TEST_ASSERT(watchtower_add_pending_tx(&wt,
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        1, 240) == 1, "add ok");
+        1, 240, 0) == 1, "add ok");
     TEST_ASSERT_EQ((long)wt.n_pending, 1L, "1 pending entry");
     TEST_ASSERT_EQ((long)wt.pending[0].cycles_in_mempool, 0L, "starts at 0");
 
@@ -662,7 +662,7 @@ int test_watchtower_add_pending_persists(void)
 
     const char *txid =
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    TEST_ASSERT(watchtower_add_pending_tx(&wt, txid, 1, 240) == 1,
+    TEST_ASSERT(watchtower_add_pending_tx(&wt, txid, 1, 240, 0) == 1,
                 "add with db returns 1");
     TEST_ASSERT_EQ((long)wt.n_pending, 1L, "n_pending = 1");
 

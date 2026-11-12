@@ -48,7 +48,8 @@ MADDR=$($BCLI -rpcwallet="$WALLET" -named getnewaddress address_type=bech32m 2>/
 $BCLI -rpcwallet="$WALLET" generatetoaddress 101 "$MADDR" >/dev/null 2>&1
 echo "wallet balance: $($BCLI -rpcwallet=$WALLET getbalance) BTC ; mine_addr=$MADDR"
 
-LSP_ARGS=(--network regtest --port $PORT --daemon --active-blocks 6 --dying-blocks 120
+LSP_ARGS=(--network regtest --port $PORT --daemon --enable-rotation-experimental
+  --active-blocks 6 --dying-blocks 120
   --lsp-balance-pct 50 --clients 4 --arity 2 --amount $AMOUNT --fee-rate 1100
   --confirm-timeout 86400 --seckey $LSP_SECKEY
   --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 --wallet "$WALLET" --db "$DB")
@@ -61,7 +62,7 @@ grep -q listening "$TMP/lsp1.log" || { echo "RESUME-FAIL: LSP1 never listened"; 
 
 for N in 1 2 3 4; do
   SK=$(printf "%064x" $((N + 1)))
-  "$BUILD/superscalar_client" --network regtest --host 127.0.0.1 --port $PORT --daemon \
+  "$BUILD/superscalar_client" --network regtest --host 127.0.0.1 --port $PORT --daemon --enable-rotation-experimental \
     --seckey "$SK" --fee-rate 1100 --lsp-balance-pct 50 --lsp-pubkey $LSP_PUB \
     --participant-id $N --rpcuser rpcuser --rpcpassword rpcpass --rpcport 18443 \
     --wallet "$WALLET" --db "$TMP/c${N}.db" > "$TMP/c${N}.log" 2>&1 &

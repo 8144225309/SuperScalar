@@ -415,6 +415,13 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip);
 /* Build a CPFP child tx to bump a stuck penalty tx.
    Uses anchor output from penalty tx + wallet UTXO.
    Returns 1 on success, 0 on failure. */
+/* Broadcast a pre-signed tx: through bitcoind RPC (wt->rt) it goes alone
+   when it pays enough, else as a package with a CPFP child on its P2A
+   anchor funded from wt->wallet, at the URGENT rate; without RPC, a plain
+   send through the chain backend.  Returns 1 if it is in the mempool or a
+   block. */
+int watchtower_send_presigned(watchtower_t *wt, const char *hex, char *txid_out);
+
 int watchtower_build_cpfp_tx(watchtower_t *wt,
                                tx_buf_t *cpfp_tx_out,
                                const char *parent_txid,
@@ -422,12 +429,15 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                uint64_t anchor_amount,
                                uint64_t target_feerate_kvb);
 
-/* Phase L: register any broadcast tx for CPFP monitoring.
-   Mirrors what penalty-tx broadcast does internally. Returns 1 on success.
-   Returns 0 if table full or wt/txid_hex is NULL. */
+/* Register a broadcast tx for CPFP monitoring: the escalator raises its
+   package through the anchor until it confirms.  value_sats: what the tx
+   moves (its fee budget is bump_budget_pct of it, at most max_bump_fee_sat);
+   0 = not known, the budget is then max_bump_fee_sat.  Returns 1 on success,
+   0 if the table is full or wt/txid_hex is NULL. */
 int watchtower_add_pending_tx(watchtower_t *wt,
                                const char *txid_hex,
                                uint32_t anchor_vout,
-                               uint64_t anchor_amount);
+                               uint64_t anchor_amount,
+                               uint64_t value_sats);
 
 #endif /* SUPERSCALAR_WATCHTOWER_H */

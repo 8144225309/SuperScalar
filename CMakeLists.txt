@@ -35,8 +35,11 @@ if(_n_san GREATER 1)
 endif()
 if(ENABLE_SANITIZERS)
     add_library(project_sanitizers INTERFACE)
+    # Undefined behaviour aborts instead of printing and carrying on, so a
+    # test that hits it fails.
     target_compile_options(project_sanitizers INTERFACE
-        -fsanitize=address,undefined -fno-omit-frame-pointer)
+        -fsanitize=address,undefined -fno-sanitize-recover=undefined
+        -fno-omit-frame-pointer)
     target_link_options(project_sanitizers INTERFACE
         -fsanitize=address,undefined)
 endif()
@@ -154,6 +157,7 @@ add_library(superscalar
     src/fee_estimator_blocks.c
     src/fee_estimator_api.c
     src/wallet_source_rpc.c
+    src/cpfp.c
     src/wallet_source_hd.c
     src/lsp_fund.c
     src/superscalar_sdk.c
@@ -161,6 +165,7 @@ add_library(superscalar
     src/crypto_aead.c
     src/noise.c
     src/keyfile.c
+    src/secure_file.c
     src/hd_key.c
     src/jit_channel.c
     src/tor.c
@@ -226,10 +231,12 @@ add_library(superscalar
     src/invoice.c
     src/admin_rpc.c
     src/factory_recovery.c
+    src/client_dist.c
     src/sweeper.c
     src/scb.c
     src/onion_message.c
     src/cli_arity.c
+    src/network.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -287,6 +294,7 @@ add_executable(test_superscalar
     tests/test_channel.c
     tests/test_adaptor.c
     tests/test_ladder.c
+    tests/test_rotation_creation.c
     tests/test_wire.c
     tests/test_channels.c
     tests/spend_helpers.c
@@ -296,6 +304,7 @@ add_executable(test_superscalar
     tests/test_regtest_hybrid_cln.c
     tests/test_persist.c
     tests/test_adversarial_verify.c
+    tests/test_client_signing.c
     tests/test_persist_wt.c
     tests/test_bridge.c
     tests/test_daemon.c
@@ -304,12 +313,15 @@ add_executable(test_superscalar
     tests/test_revocation_failclosed.c
     tests/test_watchtower_capacity.c
     tests/test_cpfp.c
+    tests/test_tree_fees.c
+    tests/test_regtest_cpfp.c
     tests/test_jit.c
     tests/test_ceremony.c
     tests/test_crash_checkpoint.c
     tests/test_property.c
     tests/test_backup.c
     tests/test_keyfile.c
+    tests/test_secure_file.c
     tests/test_bip39.c
     tests/test_rate_limit.c
     tests/test_fee_estimator.c
@@ -368,17 +380,24 @@ add_executable(test_superscalar
     tests/test_invoice.c
     tests/test_ln_dispatch.c
     tests/test_admin_rpc.c
+    tests/test_factory_recovery.c
     tests/test_chain_safety.c
     tests/test_onion_message.c
     tests/test_scb_recovery.c
     tests/test_bolt9_features.c
     tests/test_reorg.c
     tests/test_cli_arity.c
+    tests/test_client_dist.c
+    tests/test_tree_shape.c
+    tests/test_advanceless.c
+    tests/test_network.c
     tests/test_prometheus.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings)
+# Lets a test read the project's own headers (wire message id table).
+target_compile_definitions(test_superscalar PRIVATE SS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings ${CMAKE_DL_LIBS})
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_superscalar PRIVATE project_sanitizers)
 endif()
@@ -484,7 +503,8 @@ if(ENABLE_FUZZING)
         target_include_directories(${fuzz_name} PRIVATE ${cjson_SOURCE_DIR})
         target_link_libraries(${fuzz_name} superscalar secp256k1 cjson SQLite::SQLite3)
         target_compile_options(${fuzz_name} PRIVATE
-            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+            -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
+            -fno-omit-frame-pointer)
         target_link_options(${fuzz_name} PRIVATE
             -fsanitize=fuzzer,address,undefined)
     endforeach()
@@ -531,3 +551,6 @@ add_executable(test_inproc_factory_lifecycle tools/test_inproc_factory_lifecycle
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_inproc_factory_lifecycle PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(test_inproc_factory_lifecycle PRIVATE superscalar superscalar_secrets project_warnings)
+if(ENABLE_SANITIZERS)
+    target_link_libraries(test_inproc_factory_lifecycle PRIVATE project_sanitizers)
+endif()

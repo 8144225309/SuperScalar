@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 41
+#define PERSIST_SCHEMA_VERSION 44
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -117,6 +117,14 @@ int persist_in_transaction(const persist_t *p);
    Called by factory_recovery_scan() when all leaf TXs are confirmed. */
 int persist_mark_factory_closed(persist_t *p, uint32_t factory_id);
 
+/* Client: keep the signed leaf transaction (node node_index of factory
+   factory_id, txid in display hex) that this client's channel is funded by,
+   before an advance replaces it in tree_nodes.  The first copy of a txid is
+   kept.  Returns 1 on success. */
+int persist_save_funding_leaf(persist_t *p, uint32_t factory_id,
+                              uint32_t node_index, const char *txid_display_hex,
+                              const unsigned char *signed_tx, size_t len);
+
 /* SF-WAL #157: force a passive WAL checkpoint so external SQLite readers
    (dashboard) see committed writes within heartbeat-tick granularity.
    Best-effort; never blocks. */
@@ -129,6 +137,10 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
 /* Check if a factory row exists in the database.  Returns 1 if present. */
 int persist_has_factory(persist_t *p, uint32_t factory_id);
+
+/* 1 if the factories row `factory_id` exists with state 'closed' (its tree is
+   fully on chain or the factory was otherwise settled). */
+int persist_factory_is_closed(persist_t *p, uint32_t factory_id);
 
 /* --- Pseudo-Spilman leaf chain persistence --- */
 
@@ -316,6 +328,35 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
 /* Load channel core state (balances, commitment_number).
    Channel must already be initialized via channel_init() with the correct
    keys. This overwrites balances and commitment_number. */
+/* Client record of a cooperative close it has co-signed, keyed by the
+   factory's funding outpoint (funding_txid in internal byte order).
+   paid_sats is what the close pays to the client's own script; sighash is
+   the sighash of the close transaction.  One row per factory: saving again
+   replaces it.  Save returns 1 once the row is written. */
+int persist_save_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t paid_sats,
+                               const unsigned char sighash[32]);
+
+/* Load the record for a factory (outputs may be NULL).  Returns 1 if one
+   exists, 0 if the query ran and the client has not signed a close of that
+   factory, and -1 if the record could not be read (no handle, a failed
+   query, a malformed row).  -1 is not "no record": callers must not sign on
+   it. */
+int persist_load_close_signed(persist_t *p,
+                               const unsigned char funding_txid[32],
+                               uint32_t funding_vout,
+                               uint64_t *paid_sats_out,
+                               unsigned char sighash_out[32]);
+
+/* 1 if a channel is stored for the factory funded by this outpoint
+   (funding_txid in internal byte order), 0 if the query ran and found none,
+   -1 if the records could not be read. */
+int persist_factory_has_channel(persist_t *p,
+                                 const unsigned char funding_txid[32],
+                                 uint32_t funding_vout);
+
 int persist_load_channel_state(persist_t *p, uint32_t channel_id,
                                  uint64_t *local_amount,
                                  uint64_t *remote_amount,
@@ -774,6 +815,52 @@ int persist_save_htlc_origin(persist_t *p,
                               const unsigned char *payment_hash32,
                               uint64_t bridge_htlc_id, uint64_t request_id,
                               size_t sender_idx, uint64_t sender_htlc_id);
+/* Fulfils of inbound bridge HTLCs that the bridge has not confirmed yet.
+   Kept until it does, so a fulfil the client gave while the bridge or the
+   Lightning node was away is not lost with a restart. */
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    char upstream_id[64];
+    uint64_t bridge_htlc_id;
+} persist_bridge_fulfil_t;
+int persist_save_bridge_fulfil(persist_t *p, const persist_bridge_fulfil_t *f);
+int persist_delete_bridge_fulfil(persist_t *p, const unsigned char *payment_hash32);
+/* Oldest first; rows older than max_age_secs (0 = no limit) are deleted. */
+size_t persist_load_bridge_fulfils(persist_t *p, persist_bridge_fulfil_t *out,
+                                    size_t max, uint64_t max_age_secs);
+
+/* Origins by row: two origins can share a payment hash (one in each
+   direction), so a row is updated and closed by its id, never by hash.
+   persist_insert_htlc_origin returns the new row id (0 on failure). */
+int64_t persist_insert_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t bridge_htlc_id, uint64_t request_id,
+                                    size_t sender_idx, uint64_t sender_htlc_id);
+int persist_update_htlc_origin(persist_t *p, int64_t row_id,
+                                uint64_t bridge_htlc_id, uint64_t request_id,
+                                size_t sender_idx, uint64_t sender_htlc_id);
+int persist_deactivate_htlc_origin_id(persist_t *p, int64_t row_id);
+/* What else has to survive a restart for the origin in row `row_id`: the
+   HTLC's expiry, its name on the Lightning node, and whether its failure
+   still has to be reported to the bridge. */
+int persist_save_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t cltv_expiry,
+                                     const char *upstream_id, int fail_pending);
+int persist_load_htlc_origin_detail(persist_t *p, int64_t row_id,
+                                     uint32_t *cltv_expiry_out,
+                                     char *upstream_id_out, size_t upstream_len,
+                                     int *fail_pending_out);
+/* As persist_load_htlc_origins, also returning each row's id. */
+size_t persist_load_htlc_origins_ids(persist_t *p,
+                                      unsigned char (*hashes_out)[32],
+                                      uint64_t *bridge_ids_out,
+                                      uint64_t *request_ids_out,
+                                      size_t *sender_idxs_out,
+                                      uint64_t *sender_htlc_ids_out,
+                                      int64_t *row_ids_out,
+                                      size_t max_origins);
+
 int persist_deactivate_htlc_origin(persist_t *p,
                                     const unsigned char *payment_hash32);
 size_t persist_load_htlc_origins(persist_t *p,
@@ -1254,7 +1341,28 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
                                  const unsigned char *signed_tx,
                                  size_t signed_tx_len);
 
-/* Load the latest commitment TX signature. Returns 1 if found. */
+/* Remove a factory's row, participants, tree nodes and distribution
+   transaction.  Channel-level rows are not touched.  Returns 1 on success,
+   also when nothing was stored under that id. */
+int persist_delete_factory_record(persist_t *p, uint32_t factory_id);
+
+/* Txid (64 hex characters plus NUL, display order) and output count of a
+   stored tree node.  Returns 1 if the node is on record. */
+int persist_load_tree_node_txid(persist_t *p, uint32_t factory_id,
+                                 uint32_t node_index, char *txid_hex65,
+                                 uint32_t *n_outputs_out);
+
+/* Funding outpoint (txid as 64 hex characters plus NUL, display order) and
+   CLTV timeout of a stored factory.  Returns 1 if the factory is on record. */
+int persist_load_factory_outpoint(persist_t *p, uint32_t factory_id,
+                                   char *txid_hex65, uint32_t *vout_out,
+                                   uint32_t *cltv_timeout_out);
+
+
+/* Load the latest commitment TX signature. Returns 1 if found.  With
+   signed_tx_out NULL, *signed_tx_len_out is the stored TX's length; with a
+   buffer smaller than the stored TX, returns 0 and sets *signed_tx_len_out
+   to 0. */
 int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
                                  uint64_t *commitment_number_out,
                                  unsigned char *sig64_out,
@@ -1269,7 +1377,9 @@ int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,
                                   const unsigned char *signed_tx,
                                   size_t signed_tx_len);
 
-/* Load the signed distribution TX. Returns 1 if found. */
+/* Load the signed distribution TX. Returns 1 if found.  With signed_tx_out
+   NULL, *signed_tx_len_out is the stored TX's length; with a buffer smaller
+   than the stored TX, returns 0 and sets *signed_tx_len_out to 0. */
 int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
                                   unsigned char *signed_tx_out,
                                   size_t *signed_tx_len_out,

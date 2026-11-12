@@ -1,7 +1,9 @@
 #include "superscalar/version.h"
 #include "superscalar/watchtower.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/persist_wt.h"
 #include "superscalar/regtest.h"
+#include "superscalar/network.h"
 #include "superscalar/fee.h"
 #include "superscalar/channel.h"
 #include <secp256k1.h>
@@ -34,6 +36,7 @@ static void usage(const char *prog) {
         "                      response TXs and watch metadata.  No secrets.  Populated\n"
         "                      by the LSP at revocation / advance / force-close time.\n"
         "  --network MODE      Network: regtest, signet, testnet, testnet4, mainnet\n"
+        "  --i-accept-the-risk Required for mainnet operation\n"
         "  --poll-interval N   Seconds between block checks (default: 30)\n"
         "  --cli-path PATH     Path to bitcoin-cli (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username\n"
@@ -61,6 +64,7 @@ int main(int argc, char *argv[]) {
        trustless mode as the only mode. */
     const char *wt_db_path = NULL;
     const char *network = "regtest";
+    int accept_risk = 0;
     int poll_interval = 30;
     const char *cli_path = NULL;
     const char *rpcuser = NULL;
@@ -92,6 +96,8 @@ int main(int argc, char *argv[]) {
             wt_db_path = argv[++i];
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
             network = argv[++i];
+        else if (strcmp(argv[i], "--i-accept-the-risk") == 0)
+            accept_risk = 1;
         else if (strcmp(argv[i], "--poll-interval") == 0 && i + 1 < argc)
             poll_interval = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cli-path") == 0 && i + 1 < argc)
@@ -131,6 +137,29 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Refuse a chain name that is not supported, and apply the mainnet
+       start-up gates (see network.h): explicit risk acknowledgement and no
+       test/cheat scaffolding in the arguments or the environment.  Then use
+       the canonical chain name everywhere ("bitcoin" is mainnet). */
+    {
+        extern char **environ;
+        char gate_err[512];
+        network_startup_t startup = {
+            .role = NETWORK_ROLE_WATCHTOWER,
+            .network = network,
+            .accept_risk = accept_risk,
+            .have_wt_db = 1,
+            .argc = argc,
+            .argv = argv,
+            .envp = environ,
+        };
+        if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
+            fputs(gate_err, stderr);
+            return 1;
+        }
+        network = network_canonical(network);
+    }
+
     /* Initialize bitcoin RPC connection */
     regtest_t rt;
     int rt_ok;
@@ -144,6 +173,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: cannot connect to bitcoind\n");
         return 1;
     }
+    /* Responses are TRUC transactions with P2A anchors, broadcast as
+       packages: an older node cannot relay them. */
+    if (!cpfp_check_node_version(&rt)) return 1;
 
     /* #52: point the CPFP fee-bumper at a FUNDED wallet. Without this, regtest_exec
        runs listunspent on the node's default wallet (empty for a standalone WT) ->

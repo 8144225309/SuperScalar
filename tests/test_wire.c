@@ -12,12 +12,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 #include "superscalar/sha256.h"
+
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]);
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -71,13 +78,13 @@ int test_wire_pubkey_only_factory(void) {
 
     /* Build factory with keypairs (reference) */
     factory_t *f_ref = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_ref);
     if (!f_ref) return 0;
     factory_init(f_ref, ctx, kps, 5, 10, 4);
 
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xAA;
     unsigned char fake_spk[34] = {0x51, 0x20};
+    factory_compute_funding_spk(f_ref, fake_spk);
     factory_set_funding(f_ref, fake_txid, 0, 10000000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(f_ref), "ref build tree");
 
@@ -88,7 +95,6 @@ int test_wire_pubkey_only_factory(void) {
     }
 
     factory_t *f_pk = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_pk);
     if (!f_pk) return 0;
     factory_init_from_pubkeys(f_pk, ctx, pks, 5, 10, 4);
     factory_set_funding(f_pk, fake_txid, 0, 10000000, fake_spk, 34);
@@ -634,7 +640,6 @@ int test_wire_close_unsigned(void) {
 
     /* Build reference factory */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 10, 4);
 
@@ -702,7 +707,6 @@ int test_wire_distributed_signing(void) {
 
     /* Build reference factory with all keypairs, sign it the old way */
     factory_t *f_ref = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f_ref);
     if (!f_ref) return 0;
     factory_init(f_ref, ctx, kps, 5, 10, 4);
 
@@ -924,7 +928,6 @@ int test_basepoint_independence(void) {
 
     /* Build a factory for testing */
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
     unsigned char fake_txid[32];
@@ -937,6 +940,7 @@ int test_basepoint_independence(void) {
     xonly = ka.agg_pubkey;
     unsigned char fund_spk[34];
     build_p2tr_script_pubkey(fund_spk, &xonly);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     factory_build_tree(f);
 
@@ -977,6 +981,130 @@ int test_basepoint_independence(void) {
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- LSP creation ceremony on a factory that was never initialized ---- */
+
+/* Runs lsp_run_factory_creation against two clients on socketpairs.  The
+   first client's end has already queued an MSG_ERROR, so the ceremony sends
+   FACTORY_PROPOSE and then aborts on its first read.  Returns 1 and the
+   PROPOSE the first client received in *propose_out (caller frees) on that
+   expected path, 0 otherwise. */
+#define CREATION_TEST_CLIENTS 2
+static int run_creation_until_client_error(secp256k1_context *ctx, lsp_t *lsp,
+                                           const secp256k1_keypair *client_kps,
+                                           cJSON **propose_out) {
+    *propose_out = NULL;
+    int peer[CREATION_TEST_CLIENTS];
+    for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        /* A failed ceremony must not leave the test blocked in wire_recv. */
+        struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        lsp->client_fds[c] = sv[0];   /* closed by lsp_cleanup */
+        peer[c] = sv[1];
+        if (!secp256k1_keypair_pub(ctx, &lsp->client_pubkeys[c], &client_kps[c]))
+            return 0;
+    }
+    lsp->n_clients = CREATION_TEST_CLIENTS;
+
+    cJSON *err = wire_build_error("test: abort after propose");
+    int sent = wire_send(peer[0], MSG_ERROR, err);
+    cJSON_Delete(err);
+
+    int rc = -1;
+    if (sent) {
+        unsigned char txid[32], spk[34];
+        memset(txid, 0xAB, sizeof(txid));
+        secp256k1_pubkey pks[1 + CREATION_TEST_CLIENTS];
+        pks[0] = lsp->lsp_pubkey;
+        for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++) pks[c + 1] = lsp->client_pubkeys[c];
+        if (!test_funding_spk_from_pubkeys(ctx, pks, 1 + CREATION_TEST_CLIENTS, spk)) return 0;
+        rc = lsp_run_factory_creation(lsp, txid, 0, 100000, spk, sizeof(spk),
+                                      10, 4, 2000000 /* CLTV: a distribution TX is required */);
+    }
+
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    int got = (rc == 0) && wire_recv(peer[0], &m);
+    for (size_t c = 0; c < CREATION_TEST_CLIENTS; c++)
+        close(peer[c]);
+    if (!got || m.msg_type != MSG_FACTORY_PROPOSE || !m.json) {
+        if (m.json) cJSON_Delete(m.json);
+        return 0;
+    }
+    *propose_out = m.json;
+    return 1;
+}
+
+/* lsp_init leaves lsp->factory zeroed (no dynamic arrays).  The creation
+   ceremony must accept that and build the factory itself. */
+int test_lsp_factory_creation_from_fresh_lsp(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    TEST_ASSERT(make_keypairs(ctx, kps), "keypairs");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "alloc lsp");
+    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CREATION_TEST_CLIENTS), "lsp_init");
+    TEST_ASSERT(lsp->factory.profiles == NULL, "lsp_init leaves arrays unallocated");
+
+    cJSON *propose = NULL;
+    int ok = run_creation_until_client_error(ctx, lsp, &kps[1], &propose);
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(ok, "ceremony sends FACTORY_PROPOSE, then aborts on the client error");
+    cJSON *profiles = cJSON_GetObjectItem(propose, "profiles");
+    int n = cJSON_IsArray(profiles) ? cJSON_GetArraySize(profiles) : -1;
+    cJSON_Delete(propose);
+    TEST_ASSERT_EQ(n, 1 + CREATION_TEST_CLIENTS, "one profile per participant");
+    return 1;
+}
+
+/* Profiles configured on lsp->factory before the ceremony (as the LSP daemon
+   does from its CLI flags) must reach the clients, and the arrays the
+   configuration allocated must be released when the ceremony re-initializes
+   the factory (LeakSanitizer catches that under ENABLE_SANITIZERS). */
+int test_lsp_factory_creation_keeps_preset_profiles(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    TEST_ASSERT(make_keypairs(ctx, kps), "keypairs");
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    TEST_ASSERT(lsp, "alloc lsp");
+    TEST_ASSERT(lsp_init(lsp, ctx, &kps[0], 0, CREATION_TEST_CLIENTS), "lsp_init");
+    TEST_ASSERT(factory_alloc_default_arrays(&lsp->factory), "alloc arrays");
+    lsp->factory.economic_mode = ECON_PROFIT_SHARED;
+    lsp->factory.profiles[0].participant_idx = 0;
+    lsp->factory.profiles[0].profit_share_bps = 8766;
+    lsp->factory.profiles[1].participant_idx = 1;
+    lsp->factory.profiles[1].profit_share_bps = 1234;
+    lsp->factory.profiles[1].contribution_sats = 50000;
+
+    cJSON *propose = NULL;
+    int ok = run_creation_until_client_error(ctx, lsp, &kps[1], &propose);
+    lsp_cleanup(lsp);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    TEST_ASSERT(ok, "ceremony sends FACTORY_PROPOSE, then aborts on the client error");
+
+    cJSON *econ = cJSON_GetObjectItem(propose, "economic_mode");
+    cJSON *profiles = cJSON_GetObjectItem(propose, "profiles");
+    cJSON *p0 = cJSON_IsArray(profiles) ? cJSON_GetArrayItem(profiles, 0) : NULL;
+    cJSON *p1 = cJSON_IsArray(profiles) ? cJSON_GetArrayItem(profiles, 1) : NULL;
+    cJSON *bps0 = p0 ? cJSON_GetObjectItem(p0, "profit_bps") : NULL;
+    cJSON *bps1 = p1 ? cJSON_GetObjectItem(p1, "profit_bps") : NULL;
+    cJSON *contrib1 = p1 ? cJSON_GetObjectItem(p1, "contribution") : NULL;
+    long v_econ = cJSON_IsNumber(econ) ? (long)econ->valuedouble : -1;
+    long v_bps0 = cJSON_IsNumber(bps0) ? (long)bps0->valuedouble : -1;
+    long v_bps1 = cJSON_IsNumber(bps1) ? (long)bps1->valuedouble : -1;
+    long v_contrib1 = cJSON_IsNumber(contrib1) ? (long)contrib1->valuedouble : -1;
+    cJSON_Delete(propose);
+    TEST_ASSERT_EQ(v_econ, ECON_PROFIT_SHARED, "economic mode proposed");
+    TEST_ASSERT_EQ(v_bps0, 8766, "LSP profit share proposed");
+    TEST_ASSERT_EQ(v_bps1, 1234, "client profit share proposed");
+    TEST_ASSERT_EQ(v_contrib1, 50000, "client contribution proposed");
     return 1;
 }
 
@@ -1098,6 +1226,8 @@ int test_regtest_wire_factory(void) {
         if (pid == 0) {
             /* Child: run client ceremony */
             usleep(100000 * (c + 1));  /* stagger connections: 100ms, 200ms, ... */
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1124,7 +1254,7 @@ int test_regtest_wire_factory(void) {
                                              funding_txid, funding_vout,
                                              funding_amount,
                                              fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1304,6 +1434,8 @@ int test_regtest_wire_factory_arity1(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1522,6 +1654,8 @@ int test_regtest_wire_factory_mixed_arity(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1751,7 +1885,6 @@ int test_placement_profiles_wire_round_trip(void) {
     }
 
     factory_t *f = calloc(1, sizeof(factory_t));
-    factory_alloc_default_arrays(f);
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 2, 4);
     unsigned char fake_txid[32];
@@ -2242,5 +2375,48 @@ int test_wire_queue_done_empty(void) {
     TEST_ASSERT(ok == 1, "empty ok");
     TEST_ASSERT(count == 0, "count 0");
     cJSON_Delete(j);
+    return 1;
+}
+
+/* Every "#define MSG_<NAME> 0x.." in wire.h must have its own value: two
+   messages sharing an id are indistinguishable on the wire. */
+int test_wire_msg_ids_unique(void) {
+#ifndef SS_SOURCE_DIR
+#error "SS_SOURCE_DIR must be defined for test_superscalar"
+#endif
+    const char *path = SS_SOURCE_DIR "/include/superscalar/wire.h";
+    FILE *f = fopen(path, "r");
+    TEST_ASSERT(f != NULL, "open include/superscalar/wire.h");
+
+    static char names[256][64];
+    int seen[256];
+    memset(seen, 0, sizeof(seen));
+    int n_ids = 0, dup = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char name[64];
+        unsigned int id;
+        if (sscanf(line, "#define MSG_%63[A-Z0-9_] 0x%x", name, &id) != 2)
+            continue;
+        if (id > 0xFF) {
+            printf("  wire.h: MSG_%s = 0x%x does not fit the one-byte type\n", name, id);
+            dup = 1;
+            continue;
+        }
+        if (seen[id]) {
+            printf("  wire.h: id 0x%02X used by MSG_%s and MSG_%s\n",
+                   id, names[id], name);
+            dup = 1;
+        }
+        seen[id] = 1;
+        snprintf(names[id], sizeof(names[id]), "%s", name);
+        n_ids++;
+    }
+    fclose(f);
+    TEST_ASSERT(n_ids >= 100, "the message id table was read");
+    TEST_ASSERT(!dup, "wire message ids are unique");
+    TEST_ASSERT(seen[MSG_JIT_REJECT] && seen[MSG_BRIDGE_PAY_RESULT_ACK] &&
+                MSG_JIT_REJECT != MSG_BRIDGE_PAY_RESULT_ACK,
+                "JIT_REJECT and BRIDGE_PAY_RESULT_ACK have their own ids");
     return 1;
 }

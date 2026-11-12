@@ -55,7 +55,7 @@ pkill -9 -f "superscalar_lsp.*--port $LSP_PORT" 2>/dev/null||true; sleep 1
 
 # --- LSP (hashlock poison + sub cheat), self-funds from the signet wallet ---
 "$LSP_BIN" --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
-    --port $LSP_PORT --clients $N_CLIENTS --arity 3 --ps-subfactory-arity $PS_SUB_ARITY \
+    --port $LSP_PORT --clients $N_CLIENTS --arity 3 --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $AMOUNT --fee-rate $FEE_RATE --confirm-timeout $CONFIRM_TIMEOUT \
     --seckey "$LSP_SECKEY" --wallet "$WALLET" --db "$LSP_DB" --wt-db "$WT_DB" \
     --enable-hashlock-poison --demo --lsp-balance-pct 50 --cheat-daemon-sub > "$LSP_LOG" 2>&1 &
@@ -64,7 +64,7 @@ for i in $(seq 1 120); do sleep 2; grep -q "listening on port $LSP_PORT" "$LSP_L
 
 # --- clients (strong keys) ---
 for i in $(seq 0 $((N_CLIENTS-1))); do
-    "$CLIENT_BIN" --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
+    "$CLIENT_BIN" --test-allow-tree-advance --network signet --cli-path bitcoin-cli --rpcuser "$RU" --rpcpassword "$RP" \
         --host 127.0.0.1 --port $LSP_PORT --seckey "${CLIENT_SECKEYS[$i]}" --fee-rate $FEE_RATE \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $((i+1)) --daemon --wallet "$WALLET" \
         --db "$TMPDIR/client_${i}.db" > "$TMPDIR/client_${i}.log" 2>&1 &
