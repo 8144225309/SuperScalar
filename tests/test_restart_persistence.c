@@ -809,6 +809,7 @@ typedef struct {
     int called;
     void *persist_db;
     uint32_t persist_channel_id;
+    int has_commitment_sig;
     int revocation_ok;
 } rs_client_cb_t;
 
@@ -823,6 +824,7 @@ static int rs_client_cb(int fd, channel_t *ch, uint32_t my_index,
     c->called = 1;
     c->persist_db = ch->persist_db;
     c->persist_channel_id = ch->persist_channel_id;
+    c->has_commitment_sig = ch->has_latest_commitment_sig;
     unsigned char secret[32];
     memset(secret, 0x5a, sizeof(secret));
     secp256k1_pubkey pcp;
@@ -839,7 +841,12 @@ static int rs_client_cb(int fd, channel_t *ch, uint32_t my_index,
    reconnect or client restart the LSP's revocation secrets were no longer
    written to revocation_secrets (the standalone watchtower's source).
    Reconnect from a client DB to a fake LSP and check that a revocation
-   received afterwards reaches the DB, under the client's channel id. */
+   received afterwards reaches the DB.
+
+   The client DB holds one channel, under CLIENT_DB_CHANNEL_ID, for every
+   client (client 2 here).  The reconnect reads the channel state, the
+   basepoints and the commitment signature from that id and attaches the
+   DB under it. */
 int test_restart_client_reconnect_attaches_db(void) {
     extern factory_t *g_client_active_factory;
     rs_fixture_t fx;
@@ -868,10 +875,20 @@ int test_restart_client_reconnect_attaches_db(void) {
     TEST_ASSERT(persist_begin(&cdb), "begin");
     TEST_ASSERT(persist_save_factory(&cdb, fx.f, fx.ctx, 0) &&
                 persist_save_tree_nodes(&cdb, fx.f, 0), "save factory");
-    TEST_ASSERT(persist_save_channel(&cdb, &cch, 0, RS_CLIENT_IDX), "save channel");
-    TEST_ASSERT(persist_save_basepoints(&cdb, RS_CLIENT_IDX, &cch), "save basepoints");
-    TEST_ASSERT(persist_update_channel_balance(&cdb, RS_CLIENT_IDX, 40000, 45000,
-                                               RS_CLIENT_CN), "save balance");
+    TEST_ASSERT(persist_save_channel(&cdb, &cch, 0, CLIENT_DB_CHANNEL_ID),
+                "save channel");
+    TEST_ASSERT(persist_save_basepoints(&cdb, CLIENT_DB_CHANNEL_ID, &cch),
+                "save basepoints");
+    TEST_ASSERT(persist_update_channel_balance(&cdb, CLIENT_DB_CHANNEL_ID, 40000,
+                                               45000, RS_CLIENT_CN), "save balance");
+    {
+        unsigned char sig[64], tx[8];
+        memset(sig, 0x33, sizeof(sig));
+        memset(tx, 0x44, sizeof(tx));
+        TEST_ASSERT(persist_save_commitment_sig(&cdb, CLIENT_DB_CHANNEL_ID,
+                                                RS_CLIENT_CN, sig, tx, sizeof(tx)),
+                    "save the signed commitment");
+    }
     TEST_ASSERT(persist_commit(&cdb), "commit");
     channel_cleanup(&cch);
 
@@ -886,7 +903,7 @@ int test_restart_client_reconnect_attaches_db(void) {
     if (pid == 0) rs_fake_lsp(lfd);
     close(lfd);
 
-    rs_client_cb_t cb = { 0, NULL, 0, 0 };
+    rs_client_cb_t cb = { 0, NULL, 0, 0, 0 };
     int ok = client_run_reconnect(fx.ctx, &kp, "127.0.0.1", ntohs(sa.sin_port),
                                   &cdb, rs_client_cb, &cb);
     g_client_active_factory = NULL;  /* client_run_reconnect freed it */
@@ -897,21 +914,23 @@ int test_restart_client_reconnect_attaches_db(void) {
     TEST_ASSERT(ok, "client_run_reconnect");
     TEST_ASSERT(cb.called, "channel callback ran");
     TEST_ASSERT(cb.persist_db == &cdb, "restored channel attached to the DB");
-    TEST_ASSERT_EQ(cb.persist_channel_id, RS_CLIENT_IDX,
-                   "under the client's channel id, as on the first run");
+    TEST_ASSERT_EQ(cb.persist_channel_id, CLIENT_DB_CHANNEL_ID,
+                   "under the client DB's channel id, as on the first run");
+    TEST_ASSERT(cb.has_commitment_sig,
+                "the signed commitment of the stored state was restored");
     TEST_ASSERT(cb.revocation_ok, "revocation accepted");
 
     unsigned char secrets[16][32], want[32];
     uint8_t valid[16];
     size_t n_rev = 0;
     memset(want, 0x5a, sizeof(want));
-    TEST_ASSERT(persist_load_revocations_flat(&cdb, RS_CLIENT_IDX, secrets, valid,
+    TEST_ASSERT(persist_load_revocations_flat(&cdb, CLIENT_DB_CHANNEL_ID, secrets, valid,
                                               16, &n_rev), "load revocations");
     TEST_ASSERT(valid[RS_CLIENT_CN - 1], "revocation secret written after the reconnect");
     TEST_ASSERT(memcmp(secrets[RS_CLIENT_CN - 1], want, 32) == 0,
                 "persisted secret matches");
     unsigned char pcp_ser[33];
-    TEST_ASSERT(persist_load_remote_pcp(&cdb, RS_CLIENT_IDX, RS_CLIENT_CN - 1,
+    TEST_ASSERT(persist_load_remote_pcp(&cdb, CLIENT_DB_CHANNEL_ID, RS_CLIENT_CN - 1,
                                         pcp_ser), "remote PCP written after the reconnect");
 
     persist_close(&cdb);

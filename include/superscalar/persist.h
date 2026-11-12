@@ -444,6 +444,10 @@ int persist_list_subfactory_chain_keys(persist_t *p,
 int persist_list_channel_ids(persist_t *p, uint32_t *ids_out, size_t max,
                                size_t *count_out);
 
+/* A client DB holds one factory channel and keys every per-channel row by
+   this id.  (An LSP DB keys each channel by the client's index.) */
+#define CLIENT_DB_CHANNEL_ID 0
+
 /* Hydrate a channel_t with enough state for channel_build_penalty_tx().
    Zeroes *out_ch, allocates the dynamic arrays channel_init() would, and
    fills in basepoints + revocation secrets + balances from the DB.
