@@ -36,7 +36,7 @@
 #      WALLET(ss_sig_n127) SIGNET_CONF(~/.bitcoin/bitcoin.conf)
 #      Optional: ARITY, STATIC_NEAR_ROOT (tree shape; unset = the LSP's default),
 #      FEE_RATE (--fee-rate; unset = the LSP's default), TREE_FEE_RATE
-#      (--tree-fee-rate once the LSP has it; unset = the LSP's default)
+#      (--tree-fee-rate; unset = the LSP default)
 set -uo pipefail
 SIGNET_CONF="${SIGNET_CONF:-$HOME/.bitcoin/bitcoin.conf}"
 : "${SIGNET_RPCPASS:=$(sed -n 's/^rpcpassword=//p' "$SIGNET_CONF" 2>/dev/null)}"
