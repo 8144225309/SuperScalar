@@ -39,6 +39,9 @@
 #     its nLockTime is reached and pays every member at least its creation
 #     balance (the members' outputs add up to the factory funding less the
 #     distribution fee and the anchor).
+#   - after the lifecycle and the expiry drills: the on-chain invariants from
+#     the LSP's and the members' databases (tools/invariants/check_chain.py;
+#     SS_CHECK_INVARIANTS=0 skips it).
 #
 # The members publish the distribution TX themselves: here the script sends
 # the signed TX stored in a member's DB (distribution_txs).  Without a
@@ -114,6 +117,16 @@ trap cleanup EXIT
 
 note_ok(){ printf '  ok   %s\n' "$*"; }
 note_fail(){ printf '  FAIL %s\n' "$*"; FAILS=$((FAILS + 1)); }
+. "$(dirname "$0")/invariants/hook.sh"
+inv_check(){ # on-chain invariants of the drill in $D
+    ss_invariants_on || return 0
+    if ss_check_invariants "$D" --rpcport "$RPCPORT" --rpcuser "$RU" --rpcpassword "$RP" \
+            --wallet "$WALLET"; then
+        note_ok "on-chain invariants hold (conservation, balances, revocation, exit)"
+    else
+        note_fail "on-chain invariants violated (see above)"
+    fi
+}
 mine(){ $BCLI generatetoaddress "${1:-1}" "$MINE_ADDR" >/dev/null 2>&1 || true; }
 start_miner(){ ( while true; do mine 1; sleep 3; done ) & MINER_PID=$!; }
 stop_miner(){ [ -n "$MINER_PID" ] && kill -9 "$MINER_PID" 2>/dev/null; wait "$MINER_PID" 2>/dev/null; MINER_PID=""; }
@@ -392,6 +405,7 @@ run_lifecycle(){
     for i in $(seq 0 $((N - 1))); do exit_member "$i"; done
     [ "$EXIT_OK" = "$N" ] && note_ok "all $N members exited alone: each commitment confirmed and pays its member exactly its balance" \
         || note_fail "$EXIT_OK of $N members exited with their balance"
+    inv_check
 
     # an LSP whose DB holds a factory it cannot load as the signed tree
     # (here: its static depth lost) must stop, not start a new factory
@@ -463,6 +477,7 @@ run_expiry(){
     done
     [ "$low" = 0 ] && note_ok "every member is paid at least its creation balance ($(txinfo "$hex" outsum) of $funding sats to members)" \
         || note_fail "$low member(s) paid less than their creation balance"
+    inv_check
 }
 
 run_rollover_refused(){
