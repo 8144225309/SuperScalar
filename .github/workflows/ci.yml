@@ -403,7 +403,7 @@ jobs:
           LINES=$(grep 'lines' coverage-summary.txt | grep -oP '[\d.]+%' | head -1)
           echo "### Coverage: $LINES" >> $GITHUB_STEP_SUMMARY
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: build/coverage_report/
@@ -450,7 +450,7 @@ jobs:
             -max_total_time=300 -timeout=60 -artifact_prefix=artifacts/
       - name: Upload reproducer
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-reproducer-${{ matrix.target }}
           path: build/artifacts/
