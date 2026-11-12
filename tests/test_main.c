@@ -70,6 +70,11 @@ extern int test_cu_no_txn_across_calls(void);
 extern int test_cu_deadline_goes_onchain(void);
 extern int test_cu_penalty_failure_aborts(void);
 extern int test_cu_one_commitment_per_number(void);
+extern int test_cu_wire_roundtrip(void);
+extern int test_cu_wire_rejects(void);
+extern int test_cu_real_rounds(void);
+extern int test_regtest_cu_breach_penalty(void);
+extern int test_regtest_cu_unilateral_exit(void);
 
 extern int test_dw_layer_init(void);
 extern int test_dw_delay_for_state(void);
@@ -2273,6 +2278,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cu_deadline_goes_onchain);
     RUN_TEST(test_cu_penalty_failure_aborts);
     RUN_TEST(test_cu_one_commitment_per_number);
+    RUN_TEST(test_cu_wire_roundtrip);
+    RUN_TEST(test_cu_wire_rejects);
+    RUN_TEST(test_cu_real_rounds);
 
     printf("\n=== MuSig2 ===\n");
     RUN_TEST(test_musig_aggregate_keys);
@@ -4600,6 +4608,10 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_bridge_invoice_flow);
     RUN_TEST(test_regtest_bridge_payment_n64_mixed_arity);
     RUN_TEST(test_regtest_bridge_payment_n64_mixed_arity_client8);
+
+    printf("\n=== Regtest Channel-update engine ===\n");
+    RUN_TEST(test_regtest_cu_breach_penalty);
+    RUN_TEST(test_regtest_cu_unilateral_exit);
 
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);

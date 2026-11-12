@@ -335,6 +335,14 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
                                              tx_buf_t *unsigned_tx_out,
                                              unsigned char *txid_out32);
 
+/* Build ch's own commitment (for_remote = 0) or the peer's (1) from ch's
+   balances and HTLCs, keyed by the holder's per-commitment point pcp.  With
+   the P2A anchor on, the funder's output pays for it first:
+   funder_is_holder says whether that is the holder's own output. */
+int channel_build_commitment_at(const channel_t *ch, int for_remote,
+                                const secp256k1_pubkey *pcp, int funder_is_holder,
+                                tx_buf_t *unsigned_tx_out, unsigned char *txid_out32);
+
 int channel_sign_commitment(const channel_t *ch,
                               tx_buf_t *signed_tx_out,
                               const tx_buf_t *unsigned_tx,

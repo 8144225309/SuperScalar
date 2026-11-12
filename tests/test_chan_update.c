@@ -550,7 +550,7 @@ int test_cu_schema_v46(void) {
     TEST_ASSERT_EQ(persist_schema_version(&db), 46, "schema version");
     const char *tables[] = { "chan_update_channel", "chan_update_commitment", "chan_update_signed",
                              "chan_update_signed_void", "chan_update_secret", "chan_update_peer_point",
-                             "chan_update_peer_secret", "chan_update_offer" };
+                             "chan_update_peer_secret", "chan_update_offer", "chan_update_claim" };
     for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
         sqlite3_stmt *st;
         TEST_ASSERT(sqlite3_prepare_v2(db.db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?;",
