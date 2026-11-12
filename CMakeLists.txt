@@ -382,6 +382,7 @@ add_executable(test_superscalar
     tests/test_reorg.c
     tests/test_cli_arity.c
     tests/test_tree_shape.c
+    tests/test_advanceless.c
     tests/test_network.c
     tests/test_prometheus.c
 )
