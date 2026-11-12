@@ -211,6 +211,57 @@ int test_tree_fee_every_node_pays_relay(void) {
     return 1;
 }
 
+/* 64-client trees whose top levels are static kickoffs (no DW state): the
+   static root of such a tree, with several P2TR outputs and the anchor, was
+   pre-signed with the flat 200 sat whatever its size (213 vB seen).  Every
+   node, the root included, pays its own vsize at the tree rate. */
+int test_tree_fee_static_root_64_clients(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    static const shape_t shapes[] = {
+        { "arity2+static1", 2, {0}, 0, 0, 1 },
+        { "arity2+static2", 2, {0}, 0, 0, 2 },
+        { "ps+static1",     3, {0}, 0, 0, 1 },
+        { "ps+static2",     3, {0}, 0, 0, 2 },
+        { "arity1+static1", 1, {0}, 0, 0, 1 },
+        { "mixed{2,4,8}+static1", 0, {2, 4, 8}, 3, 0, 1 },
+        { "mixed{4,4,4}+static1", 0, {4, 4, 4}, 3, 0, 1 },
+    };
+    static const uint64_t rates[] = { 0, 1000, 2000 };
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        for (size_t ri = 0; ri < sizeof(rates) / sizeof(rates[0]); ri++) {
+            const size_t nc = 64;
+            secp256k1_keypair *kps = calloc(nc + 1, sizeof(*kps));
+            factory_t *f = calloc(1, sizeof(factory_t));
+            TEST_ASSERT(kps && f, "alloc");
+            TEST_ASSERT(make_factory(ctx, f, kps, nc, &shapes[si], rates[ri],
+                                     100000000), "init");
+            char label[96];
+            snprintf(label, sizeof(label), "%s n=64 rate=%llu", shapes[si].name,
+                     (unsigned long long)rates[ri]);
+            if (!factory_build_tree(f)) {
+                printf("  FAIL: %s: build_tree\n", label);
+                return 0;
+            }
+            TEST_ASSERT(f->n_nodes > 0 && f->nodes[0].parent_index < 0, "root first");
+            size_t p2tr, p2a;
+            count_outputs(&f->nodes[0], &p2tr, &p2a);
+            size_t vs = fee_keypath_tx_vsize(1, p2tr, p2a);
+            TEST_ASSERT(f->nodes[0].fee_sats >= fee_at_rate(FEE_MIN_RELAY_SAT_PER_KVB, vs),
+                        "root pays the minimum relay fee for its size");
+            if (ri == 0)
+                printf("  %s: root %zu P2TR + %zu P2A, %zu vB, fee %llu sat\n",
+                       label, p2tr, p2a, vs, (unsigned long long)f->nodes[0].fee_sats);
+            if (!check_all_nodes(f, 0, label, shapes[si].n_levels == 0)) return 0;
+            factory_free(f);
+            free(f);
+            free(kps);
+        }
+    }
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
 /* The 4-client arity-2 leaf that used to pay 200 sat for 210 vB. */
 int test_tree_fee_arity2_leaf_210vb(void) {
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
