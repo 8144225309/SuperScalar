@@ -2488,25 +2488,34 @@ int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
 
 cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
                                 uint32_t target_factory_id,
-                                uint64_t local_balance, uint64_t remote_balance) {
+                                uint64_t local_balance, uint64_t remote_balance,
+                                const char *close_txid) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "jit_channel_id", jit_channel_id);
     cJSON_AddNumberToObject(j, "target_factory_id", target_factory_id);
     cJSON_AddNumberToObject(j, "local_balance", (double)local_balance);
     cJSON_AddNumberToObject(j, "remote_balance", (double)remote_balance);
+    cJSON_AddStringToObject(j, "close_txid", close_txid ? close_txid : "");
     return j;
 }
 
 int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
                              uint32_t *target_factory_id,
-                             uint64_t *local_balance, uint64_t *remote_balance) {
+                             uint64_t *local_balance, uint64_t *remote_balance,
+                             char *close_txid_out) {
     cJSON *ji = cJSON_GetObjectItem(json, "jit_channel_id");
     cJSON *tf = cJSON_GetObjectItem(json, "target_factory_id");
     cJSON *lb = cJSON_GetObjectItem(json, "local_balance");
     cJSON *rb = cJSON_GetObjectItem(json, "remote_balance");
+    cJSON *ct = cJSON_GetObjectItem(json, "close_txid");
     if (!wire_check_nonneg(ji) || !wire_check_nonneg(tf) ||
         !wire_check_nonneg(lb) || !wire_check_nonneg(rb))
         return 0;
+    if (!close_txid_out || !ct || !cJSON_IsString(ct) || !ct->valuestring ||
+        strlen(ct->valuestring) != 64 ||
+        strspn(ct->valuestring, "0123456789abcdefABCDEF") != 64)
+        return 0;
+    memcpy(close_txid_out, ct->valuestring, 65);
     *jit_channel_id = (uint32_t)ji->valuedouble;
     *target_factory_id = (uint32_t)tf->valuedouble;
     *local_balance = (uint64_t)lb->valuedouble;

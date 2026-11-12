@@ -31,6 +31,8 @@ typedef struct jit_channel {
     uint32_t created_block;
     uint32_t target_factory_id; /* Factory to migrate into, or 0 */
     char funding_tx_hex[4096]; /* Signed funding tx hex for crash recovery */
+    char close_txid_hex[65];   /* Cooperative close this LSP broadcast for the
+                                  channel, or empty.  Not persisted. */
 } jit_channel_t;
 
 #define JIT_MAX_CHANNELS 16
@@ -76,16 +78,22 @@ int jit_channel_is_active(void *mgr_ptr, size_t client_idx);
 channel_t *jit_get_effective_channel(void *mgr_ptr, size_t client_idx,
                                       uint32_t *channel_id_out);
 
-/* 1 if the chain backend (chain_backend_t *) shows the JIT funding output
-   spent by a confirmed transaction.  0 if it is still unspent, spent only in
-   the mempool, or the backend cannot tell (including a NULL backend). */
-int jit_funding_spent_confirmed(void *chain_be_ptr, const jit_channel_t *jit);
+/* 1 if the chain backend (chain_backend_t *) shows that the JIT channel has
+   been closed by close_txid: that transaction has at least the close depth
+   (chain_close_confs) and the funding output is spent by a confirmed
+   transaction.  0 otherwise, including when the backend cannot tell, has no
+   such queries, is NULL, or close_txid is NULL or empty. */
+int jit_close_confirmed(void *chain_be_ptr, const jit_channel_t *jit,
+                        const char *close_txid);
 
 /* Retire a JIT channel after a rotation.
-   Only a channel whose funding output is confirmed spent is retired: it is
-   marked CLOSED, its record is deleted and the client is told with
-   MSG_JIT_MIGRATE.  A channel whose funding output is still on chain stays
-   OPEN, keeps its record, and the client is not told anything.
+   Only a channel closed by the cooperative close this LSP broadcast for it
+   (jit->close_txid_hex) is retired, once jit_close_confirmed() holds: it is
+   marked CLOSED, its record and watch entries are removed and the client is
+   told with MSG_JIT_MIGRATE, which names the close.  Any other channel,
+   including one whose output was spent by some other transaction (a
+   commitment, say), stays OPEN with its record and watch entries, and the
+   client is not told anything.
    Returns 1 if the channel was retired, 0 if it was kept (or none is open). */
 int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
                          size_t client_idx, uint32_t target_factory_id);
@@ -93,12 +101,13 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
 /* Client side of MSG_JIT_MIGRATE for the client's JIT channel record `jit`.
    The record is closed and its persisted row deleted only when the message
    names this channel and the client's own chain view (the watchtower's chain
-   backend) shows the funding output spent by a confirmed transaction;
+   backend) confirms the close the message names (jit_close_confirmed);
    otherwise the record and its row are left as they are.  Watch entries are
    removed only under the JIT channel's own id, never the factory channel's.
    wt_ptr is a watchtower_t * (may be NULL), db_ptr a persist_t * (may be
    NULL).  Returns 1 if the record was closed, 0 if it was kept. */
 int jit_client_handle_migrate(jit_channel_t *jit, uint32_t migrate_jit_id,
+                               const char *close_txid,
                                void *wt_ptr, void *db_ptr);
 
 /* Check JIT channels in FUNDING state; transition to OPEN when confirmed.

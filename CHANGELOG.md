@@ -14,7 +14,7 @@ Operator-visible behaviour changes.
 - **`--no-jit` is removed.** JIT opens are off by default, so the flag had nothing left to do; like any unknown option it is now ignored.
 - **`lsps2.buy` and `lsps2.get_info` from an outside peer (the BOLT #8 listener) are always refused**, and LSPS replies to outside peers are sent over the peer's encrypted transport.
 - **A client that does not accept JIT offers now says so.** New wire message `JIT_REJECT` (`0x90`); the LSP stops waiting as soon as it arrives. Messages a client sends while an offer is pending are handled afterwards instead of being dropped.
-- **A JIT channel whose funding output is still unspent is kept across a rotation**, by the LSP and by the client. Before, both sides deleted their record of it. The client no longer removes its factory channel's watchtower entries when it is told a JIT channel was migrated.
+- **A JIT channel is kept across a rotation**, by the LSP and by the client, unless the cooperative close the LSP broadcast for it has the close depth (`--close-confs`) and its funding output is spent. Before, both sides deleted their record of it, and its watch entries, whatever had happened on chain. `JIT_MIGRATE` now names that close. The client no longer removes its factory channel's watchtower entries when it is told a JIT channel was migrated.
 - JIT channels opened earlier are still loaded at start-up and closed at rotation whether or not the flag is given.
 
 ### Key handling and start-up safety

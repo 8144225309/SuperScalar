@@ -2083,8 +2083,10 @@ handle_message:
             /* LSP requests migration of JIT channel to factory */
             uint32_t mig_jit_id, mig_factory_id;
             uint64_t mig_local, mig_remote;
+            char mig_close_txid[65];
             if (!wire_parse_jit_migrate(msg.json, &mig_jit_id, &mig_factory_id,
-                                          &mig_local, &mig_remote)) {
+                                          &mig_local, &mig_remote,
+                                          mig_close_txid)) {
                 fprintf(stderr, "Client %u: bad JIT_MIGRATE\n", my_index);
                 cJSON_Delete(msg.json);
                 break;
@@ -2096,11 +2098,11 @@ handle_message:
 
             if (cbd->jit_ch &&
                 jit_client_handle_migrate(cbd->jit_ch, mig_jit_id,
-                                           cbd->wt, cbd->db))
+                                           mig_close_txid, cbd->wt, cbd->db))
                 printf("Client %u: JIT channel closed (migrated)\n", my_index);
             else
                 printf("Client %u: JIT channel record kept "
-                       "(funding output not seen spent)\n", my_index);
+                       "(close not seen confirmed)\n", my_index);
             break;
         }
 

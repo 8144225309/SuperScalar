@@ -175,14 +175,22 @@ int test_jit_ready_round_trip(void) {
 }
 
 int test_jit_migrate_round_trip(void) {
-    cJSON *j = wire_build_jit_migrate(0x8002, 5, 30000, 20000);
+    char close_in[65], close_out[65];
+    memset(close_in, 'a', 64); close_in[64] = '\0';
+    cJSON *j = wire_build_jit_migrate(0x8002, 5, 30000, 20000, close_in);
     TEST_ASSERT(j != NULL, "build jit_migrate");
 
     uint32_t jit_ch_id, factory_id;
     uint64_t local, remote;
     TEST_ASSERT(wire_parse_jit_migrate(j, &jit_ch_id, &factory_id,
-                                         &local, &remote),
+                                         &local, &remote, close_out),
                 "parse jit_migrate");
+    TEST_ASSERT(strcmp(close_out, close_in) == 0, "close_txid mismatch");
+    cJSON *bad = wire_build_jit_migrate(0x8002, 5, 30000, 20000, "");
+    TEST_ASSERT(!wire_parse_jit_migrate(bad, &jit_ch_id, &factory_id,
+                                          &local, &remote, close_out),
+                "a migrate without a close txid is rejected");
+    cJSON_Delete(bad);
 
     TEST_ASSERT_EQ((long)jit_ch_id, 0x8002, "jit_channel_id mismatch");
     TEST_ASSERT_EQ((long)factory_id, 5, "target_factory_id mismatch");
@@ -574,6 +582,12 @@ static int migrate_chain_spent(chain_backend_t *self, const char *txid_hex,
     return 1;
 }
 
+/* ...by a close at the default close depth. */
+static int migrate_chain_close_deep(chain_backend_t *self, const char *txid_hex) {
+    (void)self; (void)txid_hex;
+    return CONF_DEFAULT_CLOSE;
+}
+
 int test_jit_migrate_lifecycle(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
@@ -601,7 +615,9 @@ int test_jit_migrate_lifecycle(void) {
     chain_backend_t spent_chain;
     memset(&spent_chain, 0, sizeof(spent_chain));
     spent_chain.is_outpoint_spent_confirmed = migrate_chain_spent;
+    spent_chain.get_confirmations = migrate_chain_close_deep;
     mgr.chain_be = &spent_chain;
+    memset(jits[0].close_txid_hex, 'd', 64);   /* our cooperative close */
 
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "JIT should be active before migrate");
 
@@ -652,7 +668,9 @@ int test_jit_migrate_no_balance_hack(void) {
     chain_backend_t spent_chain;
     memset(&spent_chain, 0, sizeof(spent_chain));
     spent_chain.is_outpoint_spent_confirmed = migrate_chain_spent;
+    spent_chain.get_confirmations = migrate_chain_close_deep;
     mgr.chain_be = &spent_chain;
+    memset(jits[0].close_txid_hex, 'd', 64);   /* our cooperative close */
 
     TEST_ASSERT_EQ(jit_channel_migrate(&mgr, NULL, 0, 0), 1, "migrate retires the channel");
     TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "JIT should be closed");
@@ -1606,6 +1624,16 @@ static void fill_open_jit(jit_channel_t *jit, size_t client_idx) {
     jit->channel.remote_amount = 20000;
 }
 
+/* Confirmations the fake chain reports for any transaction. */
+static int g_fake_close_confs;
+
+static int fake_close_confirmations(chain_backend_t *self, const char *txid_hex) {
+    (void)self; (void)txid_hex;
+    return g_fake_close_confs;
+}
+
+#define FAKE_CLOSE_TXID "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
 int test_jit_migrate_keeps_unspent_channel(void) {
     jit_gate_fixture_t fx;
     TEST_ASSERT(jit_gate_fixture_init(&fx, 2), "fixture");
@@ -1613,6 +1641,7 @@ int test_jit_migrate_keeps_unspent_channel(void) {
     TEST_ASSERT(persist_open(&db, ":memory:"), "open db");
     fx.mgr.persist = &db;
     fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    fx.chain.get_confirmations = fake_close_confirmations;   /* not regtest: depth 6 */
 
     jit_channel_t *jits = (jit_channel_t *)fx.mgr.jit_channels;
     fill_open_jit(&jits[0], 1);
@@ -1620,8 +1649,20 @@ int test_jit_migrate_keeps_unspent_channel(void) {
     TEST_ASSERT(persist_save_jit_channel(&db, &jits[0]), "save jit row");
     TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row present before");
 
-    /* Unspent, then "cannot tell": the channel and its row stay, and the
-       client is told nothing. */
+    /* Spent, deep, but not by a close of ours (a commitment the client
+       broadcast, say): kept, since a penalty or sweep may still be due. */
+    g_fake_spent_answer = 1;
+    g_fake_close_confs = 100;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "a channel spent by something other than our close is not retired");
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
+
+    /* Our cooperative close was broadcast. */
+    memcpy(jits[0].close_txid_hex, FAKE_CLOSE_TXID, 65);
+
+    /* Output unspent, then "cannot tell": kept. */
     for (int answer = 0; answer >= -1; answer--) {
         g_fake_spent_answer = answer;
         g_fake_spent_queries = 0;
@@ -1634,10 +1675,27 @@ int test_jit_migrate_keeps_unspent_channel(void) {
         TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
     }
 
-    /* A backend that cannot answer the question, and no backend at all. */
+    /* Spent, but our close is not yet at the close depth (6 off regtest). */
+    g_fake_spent_answer = 1;
+    const int shallow[] = { -1, 0, 1, CONF_DEFAULT_CLOSE - 1 };
+    for (size_t i = 0; i < sizeof(shallow) / sizeof(shallow[0]); i++) {
+        g_fake_close_confs = shallow[i];
+        TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                       "a close below the close depth does not retire the channel");
+    }
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+
+    /* A backend that cannot answer either question, and no backend at all. */
+    g_fake_close_confs = CONF_DEFAULT_CLOSE;
     fx.chain.is_outpoint_spent_confirmed = NULL;
     TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
                    "kept when the backend has no chain-only spent query");
+    fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    fx.chain.get_confirmations = NULL;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "kept when the backend has no confirmation query");
+    fx.chain.get_confirmations = fake_close_confirmations;
     fx.mgr.chain_be = NULL;
     TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
                    "kept when there is no chain backend");
@@ -1645,18 +1703,20 @@ int test_jit_migrate_keeps_unspent_channel(void) {
     TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
     TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
 
-    /* Confirmed spent: retired, row deleted, client told. */
+    /* Our close at the close depth and the output spent: retired, row
+       deleted, client told which close it was. */
     fx.mgr.chain_be = &fx.chain;
-    fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
-    g_fake_spent_answer = 1;
     TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 1,
-                   "a channel whose output is confirmed spent is retired");
+                   "a channel closed by our close at the close depth is retired");
     TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "state is CLOSED");
     TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 0, "row is deleted");
     TEST_ASSERT(gate_fd_readable(fx.peer_fd[1], 1000), "client is told");
     wire_msg_t msg;
     TEST_ASSERT(wire_recv(fx.peer_fd[1], &msg), "recv");
     TEST_ASSERT_EQ(msg.msg_type, MSG_JIT_MIGRATE, "JIT_MIGRATE");
+    const cJSON *ct = cJSON_GetObjectItem(msg.json, "close_txid");
+    TEST_ASSERT(ct && cJSON_IsString(ct) && strcmp(ct->valuestring, FAKE_CLOSE_TXID) == 0,
+                "JIT_MIGRATE names the close");
     cJSON_Delete(msg.json);
     TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50), "other client untouched");
 
@@ -1683,6 +1743,7 @@ int test_jit_client_migrate_keeps_factory_watch(void) {
     chain_backend_t chain;
     memset(&chain, 0, sizeof(chain));
     chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    chain.get_confirmations = fake_close_confirmations;     /* not regtest: depth 6 */
     wt.chain = &chain;
 
     jit_channel_t jit;
@@ -1704,30 +1765,45 @@ int test_jit_client_migrate_keeps_factory_watch(void) {
     TEST_ASSERT_EQ((long)wt.n_entries, 4, "4 entries");
 
     /* Output not seen spent: nothing changes. */
+    g_fake_close_confs = 100;
     for (int answer = 0; answer >= -1; answer--) {
         g_fake_spent_answer = answer;
-        TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, &wt, &db), 0,
+        TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                                  FAKE_CLOSE_TXID, &wt, &db), 0,
                        "record kept while the output is not seen spent");
         TEST_ASSERT(jit.state == JIT_STATE_OPEN, "state stays OPEN");
         TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
         TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
     }
+    /* Spent, but the named close is below the close depth, or none named. */
+    g_fake_spent_answer = 1;
+    g_fake_close_confs = CONF_DEFAULT_CLOSE - 1;
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                              FAKE_CLOSE_TXID, &wt, &db), 0,
+                   "record kept while the close is shallower than the close depth");
+    g_fake_close_confs = CONF_DEFAULT_CLOSE;
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, "", &wt, &db), 0,
+                   "record kept when no close is named");
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, NULL, &wt, &db), 0,
+                   "record kept when no close is named (NULL)");
     /* No chain view at all. */
-    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, NULL, &db), 0,
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                              FAKE_CLOSE_TXID, NULL, &db), 0,
                    "record kept without a chain view");
     TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+    TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
 
     /* A message naming some other channel changes nothing either. */
-    g_fake_spent_answer = 1;
-    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, 0, &wt, &db), 0,
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, 0, FAKE_CLOSE_TXID, &wt, &db), 0,
                    "a message for channel id 0 is not for the JIT channel");
     TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
     TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
 
-    /* Output confirmed spent: the JIT record goes, the factory channel's
-       watch entries all stay. */
-    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, &wt, &db), 1,
-                   "record closed once the output is confirmed spent");
+    /* The named close at the close depth and the output spent: the JIT
+       record goes, the factory channel's watch entries all stay. */
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                              FAKE_CLOSE_TXID, &wt, &db), 1,
+                   "record closed once the close is confirmed deep enough");
     TEST_ASSERT(jit.state == JIT_STATE_CLOSED, "state is CLOSED");
     TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 0, "row is deleted");
     TEST_ASSERT_EQ((long)wt_entries_for(&wt, 0), 3,

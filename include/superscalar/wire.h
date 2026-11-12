@@ -947,14 +947,18 @@ int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
                            uint64_t *local_amount, uint64_t *remote_amount);
 
 /* LSP -> Client: JIT_MIGRATE {jit_channel_id, target_factory_id,
-                                local_balance, remote_balance} */
+                                local_balance, remote_balance, close_txid} */
 cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
                                 uint32_t target_factory_id,
-                                uint64_t local_balance, uint64_t remote_balance);
+                                uint64_t local_balance, uint64_t remote_balance,
+                                const char *close_txid);
 
+/* close_txid (64 hex characters) names the transaction that closed the JIT
+   channel; it is required.  close_txid_out must hold at least 65 bytes. */
 int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
                              uint32_t *target_factory_id,
-                             uint64_t *local_balance, uint64_t *remote_balance);
+                             uint64_t *local_balance, uint64_t *remote_balance,
+                             char *close_txid_out);
 
 /* --- Per-Leaf Advance message builders (Upgrade 2) --- */
 

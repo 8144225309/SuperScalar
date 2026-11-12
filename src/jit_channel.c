@@ -655,6 +655,10 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
                 client_idx);
         return 0;
     }
+    /* Remembered so the channel can still be retired once this close is
+       deep enough, if the wait below gives up first. */
+    memcpy(jit->close_txid_hex, close_txid, 64);
+    jit->close_txid_hex[64] = '\0';
 
     /* Confirm */
     if (mgr->rot_is_regtest) {
@@ -705,25 +709,34 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
     return 1;
 }
 
-int jit_funding_spent_confirmed(void *chain_be_ptr, const jit_channel_t *jit) {
+int jit_close_confirmed(void *chain_be_ptr, const jit_channel_t *jit,
+                        const char *close_txid) {
     chain_backend_t *chain = (chain_backend_t *)chain_be_ptr;
-    if (!chain || !jit || !chain->is_outpoint_spent_confirmed) return 0;
+    if (!chain || !jit || !close_txid || close_txid[0] == '\0') return 0;
+    if (!chain->get_confirmations || !chain->is_outpoint_spent_confirmed) return 0;
     if (jit->funding_txid_hex[0] == '\0') return 0;
+    /* The close must be as deep as any other close before state is dropped:
+       a shallower one can still be reorganised away. */
+    int confs = chain->get_confirmations(chain, close_txid);
+    if (confs < chain_close_confs(chain, chain->is_regtest)) return 0;
     return chain->is_outpoint_spent_confirmed(chain, jit->funding_txid_hex,
                                                jit->funding_vout) == 1;
 }
 
 int jit_client_handle_migrate(jit_channel_t *jit, uint32_t migrate_jit_id,
+                               const char *close_txid,
                                void *wt_ptr, void *db_ptr) {
     watchtower_t *wt = (watchtower_t *)wt_ptr;
     persist_t *db = (persist_t *)db_ptr;
     if (!jit || jit->jit_channel_id != migrate_jit_id) return 0;
     if (jit->state == JIT_STATE_NONE || jit->state == JIT_STATE_CLOSED) return 0;
 
-    if (!jit_funding_spent_confirmed(wt ? wt->chain : NULL, jit)) {
-        fprintf(stderr, "JIT channel %08x: LSP announced migration but funding "
-                "output %s:%u is not confirmed spent; keeping the channel "
-                "record\n", jit->jit_channel_id,
+    if (!jit_close_confirmed(wt ? wt->chain : NULL, jit, close_txid)) {
+        fprintf(stderr, "JIT channel %08x: LSP announced migration but close "
+                "%s is not confirmed deep enough, or funding output %s:%u is "
+                "not confirmed spent; keeping the channel record\n",
+                jit->jit_channel_id,
+                (close_txid && close_txid[0]) ? close_txid : "(none)",
                 jit->funding_txid_hex[0] ? jit->funding_txid_hex : "(unknown)",
                 jit->funding_vout);
         return 0;
@@ -748,16 +761,26 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
     jit_channel_t *jit = jit_channel_find(mgr, client_idx);
     if (!jit || jit->state != JIT_STATE_OPEN) return 0;
 
-    /* The record is the only thing that lets the LSP find and close this
-       output later: never drop it while the output is still on chain. */
+    /* The record and the watch entries are what let the LSP find, close or
+       defend this output later.  They go only once the cooperative close the
+       LSP broadcast is deep enough.  An output spent any other way (a
+       commitment, which may need a penalty or a sweep) keeps them. */
     void *chain = mgr->chain_be;
     if (!chain && mgr->watchtower)
         chain = mgr->watchtower->chain;
-    if (!jit_funding_spent_confirmed(chain, jit)) {
+    if (jit->close_txid_hex[0] == '\0') {
         fprintf(stderr, "LSP JIT: channel %08x for client %zu NOT retired: "
-                "funding output %s:%u is not confirmed spent; "
-                "channel stays open and its record is kept\n",
-                jit->jit_channel_id, client_idx,
+                "no cooperative close of it was broadcast; channel stays "
+                "open, its record and watch entries are kept\n",
+                jit->jit_channel_id, client_idx);
+        return 0;
+    }
+    if (!jit_close_confirmed(chain, jit, jit->close_txid_hex)) {
+        fprintf(stderr, "LSP JIT: channel %08x for client %zu NOT retired: "
+                "close %s is not confirmed deep enough or funding output "
+                "%s:%u is not confirmed spent; channel stays open, its "
+                "record and watch entries are kept\n",
+                jit->jit_channel_id, client_idx, jit->close_txid_hex,
                 jit->funding_txid_hex[0] ? jit->funding_txid_hex : "(unknown)",
                 jit->funding_vout);
         return 0;
@@ -771,13 +794,14 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
         cJSON *mig = wire_build_jit_migrate(jit->jit_channel_id,
                                                target_factory_id,
                                                jit->channel.local_amount,
-                                               jit->channel.remote_amount);
+                                               jit->channel.remote_amount,
+                                               jit->close_txid_hex);
         if (lsp->client_fds[client_idx] >= 0)
             wire_send(lsp->client_fds[client_idx], MSG_JIT_MIGRATE, mig);
         cJSON_Delete(mig);
     }
 
-    /* The funding output is gone from the chain: close the record. */
+    /* Closed by our cooperative close, deep enough: drop the record. */
     jit->state = JIT_STATE_CLOSED;
 
     /* Remove watchtower entries for this JIT channel */
