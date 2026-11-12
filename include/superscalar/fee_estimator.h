@@ -26,6 +26,17 @@ typedef enum {
    Bitcoin Core won't relay below this with lowered -minrelaytxfee. */
 #define FEE_FLOOR_SAT_PER_KVB  100
 
+/* URGENT rate (sat/kvB) an estimator without an estimate (a node with no
+   fee history) reports, when the node's own floor is lower: 10 sat/vB.
+   URGENT is the target of deadline-bound spends (penalties, HTLC claims),
+   where too low a guess loses the race; the CPFP escalator raises it from
+   there.  Other targets fall back to the node's floor. */
+#define FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB  10000
+
+/* Highest rate taken from an external fee API: 10000 sat/vB.  A higher (or
+   absurd) value from the API is clamped to it. */
+#define FEE_API_MAX_SAT_PER_KVB  10000000ULL
+
 typedef struct fee_estimator fee_estimator_t;
 struct fee_estimator {
     /* Required.  Returns sat/kvB; 0 = unavailable / estimator not ready. */
@@ -36,11 +47,6 @@ struct fee_estimator {
     /* Optional.  Free heap allocations owned by the impl. */
     void     (*free)(fee_estimator_t *self);
 };
-
-/* Returns 1 if P2A anchors should be included at this estimator's URGENT
-   rate.  At sub-1-sat/vB the 240-sat anchor costs more than the TX fee
-   itself, making CPFP uneconomical.  Pass NULL to default to 1 (use anchor). */
-int fee_should_use_anchor(fee_estimator_t *fe);
 
 /* -----------------------------------------------------------------------
  * Static (constant-rate) implementation

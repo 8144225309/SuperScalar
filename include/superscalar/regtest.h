@@ -26,6 +26,9 @@ int   regtest_init_full(regtest_t *rt, const char *network,
                         const char *rpcpassword, const char *datadir,
                         int rpcport);
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params);
+/* As regtest_exec, without logging the "not found" answers (-5, -19) that
+   are an expected result of a lookup (getmempoolentry of a tx not in it). */
+char *regtest_exec_quiet(const regtest_t *rt, const char *method, const char *params);
 int   regtest_get_block_height(regtest_t *rt);
 /* Reorg-resilience helper (Issue #2): fill hash_out_buf (>= 65 bytes)
    with the current best-block hash hex. Returns 1 on success, 0 on error. */

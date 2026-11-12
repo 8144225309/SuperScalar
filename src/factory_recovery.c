@@ -13,6 +13,7 @@
  */
 
 #include "superscalar/factory_recovery.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
 #include "superscalar/tx_builder.h"
@@ -523,7 +524,7 @@ static int broadcast_node(chain_backend_t *chain, persist_t *p,
     char source[40];
     snprintf(source, sizeof(source), "recovery_node_%d", node->node_index);
 
-    int ok = chain->send_raw_tx(chain, node->signed_tx_hex, result_txid);
+    int ok = cpfp_send_default(chain, node->signed_tx_hex, result_txid);
 
     /* Log every attempt (success or failure) to the broadcast audit table */
     const char *log_txid = result_txid[0] ? result_txid : node->txid;
@@ -671,9 +672,12 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
                 continue;
             if (!nd->signed_tx_hex) continue; /* not signed — skip */
 
-            /* Determine whether parent is confirmed (or just broadcast
-             * this call — in-mempool parent is sufficient for a child
-             * without a relative lock). */
+            /* A child goes out only once its parent is CONFIRMED.  Tree txs
+               are TRUC: an unconfirmed TRUC tx may have one unconfirmed
+               ancestor and one descendant, so a child sent while the parent
+               is in the mempool is either rejected or takes the parent's only
+               descendant slot, which the CPFP child on the parent's anchor
+               needs. */
             int parent_ok = 0;
             int parent_depth = 0;
             if (nd->parent_index < 0) {
@@ -682,7 +686,7 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
                 parent_depth = funding_confs;
             } else {
                 fr_node_t *par = &nodes[nd->parent_index];
-                parent_ok = (par->confs >= 1) || par->sent;
+                parent_ok = par->confs >= 1;
                 parent_depth = par->confs;
             }
             if (!parent_ok) continue;
@@ -694,7 +698,6 @@ static int do_factory_recovery(persist_t *p, chain_backend_t *chain,
 
             int ok = broadcast_node(chain, p, nd, factory_id);
             if (ok) {
-                /* Treat as in-mempool so children can be queued in same pass */
                 nd->confs = 0;
                 nd->sent = 1;
                 res->n_broadcast++;

@@ -56,6 +56,7 @@ typedef struct {
     int have_wt_db;           /* --wt-db given */
     int enable_jit_experimental; /* --enable-jit-experimental given (LSP) */
     int enable_rotation_experimental; /* --enable-rotation-experimental given (LSP) */
+    int allow_anchorless_tree;   /* --allow-anchorless-tree given (LSP, tests) */
     int argc;                 /* the daemon's own argc/argv */
     char *const *argv;
     char *const *envp;        /* its environment (NULL-terminated), or NULL */
@@ -99,6 +100,12 @@ int network_gate_watchtower_db(const char *network, int have_wt_db,
    opt-in is refused on mainnet. */
 int network_gate_no_experimental_jit(const char *network, int enable_jit,
                                      char *err_buf, size_t err_buf_len);
+
+/* A tree node without a P2A anchor cannot be fee-bumped: the factory exit
+   then depends on the agreed rate meeting every node's relay floor.
+   --allow-anchorless-tree (tests) is refused on mainnet. */
+int network_gate_no_anchorless_tree(const char *network, int allow_anchorless,
+                                    char *err_buf, size_t err_buf_len);
 
 /* Factory rotation is experimental: the close of the old factory can pay the
    members' balances to the LSP.  The opt-in is refused on mainnet. */

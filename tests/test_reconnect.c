@@ -667,62 +667,38 @@ int test_fee_penalty_tx(void) {
     return 1;
 }
 
-/* Test 10: factory tx fee scales with n_outputs */
+/* Test 10: factory tx fee follows the exact vsize, anchor included, at
+   exactly the given rate (no floor). */
 int test_fee_factory_tx(void) {
-    fee_estimator_static_t fe;
-    fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
-
-    uint64_t fee1 = fee_for_factory_tx((fee_estimator_t *)&fe, 1);
-    uint64_t fee3 = fee_for_factory_tx((fee_estimator_t *)&fe, 3);
-    uint64_t fee5 = fee_for_factory_tx((fee_estimator_t *)&fe, 5);
-
-    /* fee = (68 + 43*n) at 1 sat/vB: 68 = 10 tx overhead + 58 P2TR keypath input */
-    TEST_ASSERT_EQ(fee1, 111, "1 output: 68+43=111");
-    TEST_ASSERT_EQ(fee3, 197, "3 outputs: 68+129=197");
-    TEST_ASSERT_EQ(fee5, 283, "5 outputs: 68+215=283");
-
-    /* Must scale: more outputs = higher fee */
-    TEST_ASSERT(fee3 > fee1, "fee scales up with outputs");
-    TEST_ASSERT(fee5 > fee3, "fee scales up more");
-
+    /* 1-in key-path: 10.5 overhead + 57.5 input = 68; + 43 per P2TR, + 13 P2A */
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 1, 0), 111, "1 P2TR: 111 vB");
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 3, 0), 197, "3 P2TR: 197 vB");
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(1, 3, 1), 210, "3 P2TR + P2A: 210 vB");
+    TEST_ASSERT_EQ(fee_keypath_tx_vsize(3, 3, 0), 312, "3-in 3-out: 312 vB");
+    TEST_ASSERT_EQ(fee_at_rate(100, 210), 21, "0.1 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_at_rate(1000, 210), 210, "1 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_at_rate(5000, 210), 1050, "5 sat/vB x 210 vB");
+    TEST_ASSERT_EQ(fee_at_rate(0, 210), 0, "rate 0 pays nothing");
     return 1;
 }
 
-/* Test: commitment tx fee scales with n_htlcs */
+/* Test: commitment tx fee follows the exact vsize (167 vB + 43 per HTLC,
+   the anchor included) */
 int test_fee_commitment_tx(void) {
     fee_estimator_static_t fe;
     fee_estimator_static_init(&fe, 1000);  /* 1 sat/vB */
-
-    /* 154 vB base at 1 sat/vB */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 0), 154,
-                   "0 HTLCs: 154 vB = 154 sats");
-    /* 154 + 43 = 197 */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 1), 197,
-                   "1 HTLC: 197 vB = 197 sats");
-    /* 154 + 86 = 240 */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 2), 240,
-                   "2 HTLCs: 240 vB = 240 sats");
-    /* 154 + 129 = 283 */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 3), 283,
-                   "3 HTLCs: 283 vB = 283 sats");
-
-    /* Must scale with HTLC count */
-    TEST_ASSERT(fee_for_commitment_tx((fee_estimator_t *)&fe, 3) >
-                fee_for_commitment_tx((fee_estimator_t *)&fe, 1),
-                "fee scales up with HTLC count");
-
-    /* NULL guard */
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 0), 167,
+                   "0 HTLCs: 167 vB = 167 sats");
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 1), 210,
+                   "1 HTLC: 210 vB");
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 2), 253,
+                   "2 HTLCs: 253 vB");
+    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe, 3), 296,
+                   "3 HTLCs: 296 vB");
     TEST_ASSERT_EQ(fee_for_commitment_tx(NULL, 0), 0, "NULL fe returns 0");
-
-    /* At 5 sat/vB (5000 sat/kvB): 5000*154/1000 = 770 */
-    fee_estimator_static_t fe5;
-    fee_estimator_static_init(&fe5, 5000);
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe5, 0), 770,
-                   "0 HTLCs at 5 sat/vB = 770");
-    /* 5000*240/1000 = 1200 — matches regtest fee_estimation_parsing output */
-    TEST_ASSERT_EQ(fee_for_commitment_tx((fee_estimator_t *)&fe5, 2), 1200,
-                   "2 HTLCs at 5 sat/vB = 1200");
-
+    TEST_ASSERT_EQ(fee_commitment_tx_at(5000, 0), 835, "0 HTLCs at 5 sat/vB");
+    TEST_ASSERT_EQ(fee_commitment_tx_at(5000, 2), 1265, "2 HTLCs at 5 sat/vB");
+    TEST_ASSERT_EQ(fee_commitment_tx_at(100, 0), 17, "0 HTLCs at 0.1 sat/vB");
     return 1;
 }
 
@@ -3212,9 +3188,13 @@ static int initial_commitment_pair(secp256k1_context *ctx,
     build_p2tr_script_pubkey(funding_spk34, &out_key);
 
     if (!channel_init(lsp_ch, ctx, lsp_sec, &lsp_pk, &client_pk, txid, 0,
-                       100000, funding_spk34, 34, 60000, 39846, 144) ||
+                       100000, funding_spk34, 34, 60000, 39983, 144) ||
         !channel_init(client_ch, ctx, client_sec, &client_pk, &lsp_pk, txid, 0,
-                       100000, funding_spk34, 34, 39846, 60000, 144)) return 0;
+                       100000, funding_spk34, 34, 39983, 60000, 144)) return 0;
+    /* commitments at the factory's default agreed rate, 100 sat/kvB: the
+       base commitment (167 vB) pays 17 sat, so the balances hold 99983 */
+    channel_set_commit_fee_rate(lsp_ch, 100);
+    channel_set_commit_fee_rate(client_ch, 100);
     lsp_ch->funder_is_local = 1;
     client_ch->funder_is_local = 0;
     if (!channel_generate_random_basepoints(lsp_ch) ||
@@ -3500,7 +3480,7 @@ int test_rotation_commitment_carries_balance(void) {
 
     TEST_ASSERT(!lsp_channel_carry_client_balance(&lsp_ch, usable + 1),
                 "a balance larger than the channel is not carried");
-    TEST_ASSERT_EQ(lsp_ch.remote_amount, 39846, "default split kept");
+    TEST_ASSERT_EQ(lsp_ch.remote_amount, 39983, "default split kept");
 
     /* the old channel held 30000 sat for the client and was smaller overall */
     TEST_ASSERT(lsp_channel_carry_client_balance(&lsp_ch, 30000), "carry 30000 sat");
@@ -3527,7 +3507,7 @@ int test_rotation_commitment_carries_balance(void) {
     TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair 2");
     lsp_ch.fee_rate_sat_per_kvb = 2562;
     lsp_ch.funding_amount = lsp_ch.local_amount + lsp_ch.remote_amount
-                            + (2562 * 154 + 999) / 1000;
+                            + fee_commitment_tx_at(2562, 0);
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair 2");
     TEST_ASSERT(initial_commitment_send(sv[0], &lsp_ch), "LSP signs with its own values");
     TEST_ASSERT(!client_recv_initial_commitment(sv[1], &client_ch, 1),

@@ -14,6 +14,7 @@
 #include "superscalar/sweeper.h"
 #include "superscalar/chain_backend_rpc.h"
 #include "superscalar/fee.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/jit_channel.h"
 #include "superscalar/musig.h"
 #include "superscalar/tor.h"
@@ -25,6 +26,7 @@
 #include "superscalar/hd_key.h"
 #include "superscalar/bip158_backend.h"
 #include "superscalar/wallet_source_hd.h"
+#include "superscalar/wallet_source.h"
 #include "superscalar/splice.h"
 #include "superscalar/lsp_wellknown.h"
 #include "superscalar/factory_recovery.h"
@@ -52,6 +54,74 @@ static bip158_backend_t g_bip158_client;
 
 /* HD wallet — used when --light-client is active without a bitcoind wallet */
 static wallet_source_hd_t *g_hd_wallet_client = NULL;
+
+/* --wallet: bitcoind wallet that funds CPFP children on exit.  Without it a
+   pre-signed tx that needs a bump gets an anchor-only child. */
+static const char *g_client_wallet_name = NULL;
+static wallet_source_rpc_t g_client_cpfp_wallet;
+static regtest_t g_client_cpfp_rt;
+
+/* --fee-estimator and --fee-rate, read by the exit paths' CPFP target. */
+static const char *g_client_fee_mode = NULL;
+static uint64_t g_client_fee_rate = 1000;
+static fee_estimator_rpc_t g_client_exit_fee_rpc;
+static fee_estimator_static_t g_client_exit_fee_static;
+static fee_estimator_api_t g_client_exit_fee_api;
+
+/* Estimator whose urgent rate is the CPFP target of every pre-signed exit
+   broadcast: --fee-estimator static[:N] or api[:URL] as given, otherwise
+   bitcoind's estimatesmartfee (the blocks estimator has no samples on these
+   paths).  NULL without bitcoind RPC. */
+static fee_estimator_t *client_exit_fee_estimator(regtest_t *rt, const char **mode_out) {
+    const char *m = g_client_fee_mode;
+    if (m && strncmp(m, "static", 6) == 0) {
+        uint64_t r = g_client_fee_rate;
+        if (strncmp(m, "static:", 7) == 0) r = strtoull(m + 7, NULL, 10) * 1000;
+        fee_estimator_static_init(&g_client_exit_fee_static, r);
+        *mode_out = m;
+        return &g_client_exit_fee_static.base;
+    }
+    if (m && strncmp(m, "api", 3) == 0) {
+        fee_estimator_api_init(&g_client_exit_fee_api, m[3] == ':' ? m + 4 : NULL,
+                               NULL, NULL);
+        *mode_out = m;
+        return &g_client_exit_fee_api.base;
+    }
+    if (!rt) { *mode_out = "none"; return NULL; }
+    fee_estimator_rpc_init(&g_client_exit_fee_rpc, rt);
+    *mode_out = "estimatesmartfee";
+    return &g_client_exit_fee_rpc.base;
+}
+
+/* Route this process's pre-signed broadcasts through the CPFP path, on a copy
+   of rt bound to --wallet (the caller's rt keeps its own wallet setting).  A
+   pre-signed tx goes alone only when it pays the mempool minimum and the
+   urgent fee estimate; otherwise it is packaged (or re-bumped) with a child. */
+static int client_setup_cpfp(const regtest_t *rt) {
+    wallet_source_t *w = NULL;
+    fee_estimator_t *urgent = NULL;
+    const char *mode = "none";
+    if (rt && !cpfp_check_node_version((regtest_t *)rt)) return 0;
+    if (rt) {
+        g_client_cpfp_rt = *rt;
+        if (g_client_wallet_name) {
+            memset(g_client_cpfp_rt.wallet, 0, sizeof(g_client_cpfp_rt.wallet));
+            strncpy(g_client_cpfp_rt.wallet, g_client_wallet_name,
+                    sizeof(g_client_cpfp_rt.wallet) - 1);
+            wallet_source_rpc_init(&g_client_cpfp_wallet, &g_client_cpfp_rt);
+            w = &g_client_cpfp_wallet.base;
+        }
+        urgent = client_exit_fee_estimator(&g_client_cpfp_rt, &mode);
+    }
+    cpfp_set_default(rt ? &g_client_cpfp_rt : NULL, w, urgent, 0);
+    /* the exit's deadline is the factory timeout, far ahead: no urgent rate */
+    cpfp_set_default_target(FEE_TARGET_NORMAL);
+    printf("Client: pre-signed broadcasts via %s (CPFP child funding: %s, "
+           "target: 6-block estimate from %s)\n",
+           rt ? "bitcoind RPC, package relay" : "chain backend",
+           w ? g_client_wallet_name : "anchor only", mode);
+    return 1;
+}
 
 static int attach_hd_wallet_client(watchtower_t *wt, persist_t *db_ptr,
                                      secp256k1_context *ctx, const char *network,
@@ -922,10 +992,19 @@ static uint32_t client_tool_chain_tip(void *ctx) {
    reconnect loop, so it does not depend on the LSP being reachable. */
 static client_dist_watch_t g_dist_watch;
 
+/* The distribution TX goes out through the CPFP path, like every pre-signed
+   transaction of this client: alone when it pays the node's floor, else as a
+   package with a child on its anchor. */
+static int client_dist_send_cpfp(chain_backend_t *chain, const char *tx_hex,
+                                  char *txid_out) {
+    return cpfp_send_default(chain, tx_hex, txid_out) != CPFP_FAILED;
+}
+
 static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
                                              secp256k1_context *ctx) {
     if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
-    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, NULL, 10, stdout);
+    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, client_dist_send_cpfp,
+                             10, stdout);
 }
 
 static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
@@ -2509,6 +2588,9 @@ static void usage(const char *prog) {
         "  --channels                        Expect channel phase (for when LSP uses --payments)\n"
         "  --daemon                          Run as long-lived daemon (auto-fulfill HTLCs)\n"
         "  --fee-rate N                      Fee rate in sat/kvB (default 1000 = 1 sat/vB, min 100 = 0.1 sat/vB)\n"
+        "  --fee-estimator MODE              static[:N sat/vB] | api[:URL] | blocks (default: static at\n"
+        "                                      --fee-rate).  Its urgent rate is also the CPFP target of\n"
+        "                                      exit broadcasts (default there: estimatesmartfee)\n"
         "  --report PATH                     Write diagnostic JSON report to PATH\n"
         "  --db PATH                         SQLite database for persistence (default: none)\n"
         "  --network MODE                    Network: regtest, signet, testnet, testnet4, mainnet (default: regtest)\n"
@@ -2538,8 +2620,13 @@ static void usage(const char *prog) {
         "                                    to this client's leaf, then its commitment. One pass per run;\n"
         "                                    exit status 0 = commitment accepted, 2 = run again after the next\n"
         "                                    block, 3 = refused for a reason waiting will not cure (needs the\n"
-        "                                    operator), 1 = the exit cannot be completed from this DB\n"
-        "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
+        "                                    operator), 1 = the exit cannot be completed from this DB, or\n"
+        "                                    it needs a fee-paying child and has no wallet coin (--wallet)\n"
+        "  --wallet NAME                     bitcoind wallet that funds CPFP children on exit\n"
+        "                                      (default: none; a bump spends the P2A anchor alone; an exit\n"
+        "                                      that needs a fee-paying child and has no coin exits 1)\n"
+        "  --max-tree-fee-rate N             Refuse a factory whose pre-signed rate exceeds N sat/kvB\n"
+        "                                      (default 10000 = 10 sat/vB; 0 = no ceiling)\n"        "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
         "                                      halt     = refuse + stop session + alert (default)\n"
         "                                      close    = refuse + force-close on last verified state\n"
@@ -2612,6 +2699,43 @@ static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
                 "will fail\n", my_index, txid_hex);
 }
 
+/* Broadcast the stored distribution TX of factory_id (the nLockTime
+   fallback), through the CPFP path; says when it is not yet final. */
+static void client_send_distribution_tx(persist_t *db, chain_backend_t *chain,
+                                        uint32_t factory_id) {
+    size_t dist_len = 0;
+    unsigned char *dist_tx = NULL;
+    if (persist_load_distribution_tx(db, factory_id, NULL, &dist_len, 0) &&
+        dist_len > 0 && (dist_tx = malloc(dist_len)) != NULL) {
+        size_t got = 0;
+        char *tx_hex = malloc(dist_len * 2 + 1);
+        if (tx_hex &&
+            persist_load_distribution_tx(db, factory_id, dist_tx, &got, dist_len) &&
+            got == dist_len) {
+            hex_encode(dist_tx, dist_len, tx_hex);
+            char dist_txid[65];
+            uint32_t lock = dist_len < 4 ? 0 :
+                            ((uint32_t)dist_tx[dist_len - 4] |
+                             ((uint32_t)dist_tx[dist_len - 3] << 8) |
+                             ((uint32_t)dist_tx[dist_len - 2] << 16) |
+                             ((uint32_t)dist_tx[dist_len - 1] << 24));
+            int height = chain->get_block_height ? chain->get_block_height(chain) : -1;
+            if (height >= 0 && (uint32_t)height < lock)
+                printf("Force-close: distribution TX not yet mature "
+                       "(nLockTime %u, height %d)\n", lock, height);
+            else if (cpfp_send_default(chain, tx_hex, dist_txid) != CPFP_FAILED)
+                printf("Force-close: distribution TX broadcast: %s\n",
+                       dist_txid);
+            else
+                printf("Force-close: distribution TX not accepted\n");
+        }
+        free(tx_hex);
+        free(dist_tx);
+    } else {
+        printf("Force-close: no distribution TX in DB\n");
+    }
+}
+
 /* One pass of this client's unilateral exit from its own DB.  Once the
    factory's distribution TX is due (its nLockTime reached, the funding output
    known unspent) or already published, it is the exit: the tree would spend
@@ -2627,11 +2751,21 @@ static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
 static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
     extern void hex_encode(const unsigned char *, size_t, char *);
     int state;
+    cpfp_need_clear();
 
     client_dist_status_t dist_status = CLIENT_DIST_NONE;
-    if (client_dist_force_close(db, chain, NULL, stdout, &dist_status))
+    if (client_dist_force_close(db, chain, client_dist_send_cpfp, stdout, &dist_status)) {
+        /* Below the node's floor the distribution TX goes in only as a
+           package with a fee-paying child: without a coin for it no further
+           pass helps. */
+        if (cpfp_need_seen() != CPFP_NEED_NONE) {
+            fprintf(stderr, "Force-close: ERROR: the distribution TX needs a "
+                    "fee-paying child: %s\n", cpfp_need_text(cpfp_need_seen()));
+            return CLIENT_EXIT_FAILED;
+        }
         return dist_status == CLIENT_DIST_REFUSED ? CLIENT_EXIT_STUCK
                                                   : CLIENT_EXIT_PUBLISHED;
+    }
 
     /* The exit path ends at the tree node that funds this client's channel.
        A DB that does not name it gets the whole tree published instead. */
@@ -2686,7 +2820,20 @@ static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
         const char *stuck_why = NULL;
         if (tx_hex) {
             hex_encode(commit_tx, commit_len, tx_hex);
-            if (chain->send_raw_tx(chain, tx_hex, sent_txid)) {
+            /* through the CPFP path: alone when it pays the node's floor,
+               else as a package with a child on its anchor.  With HTLC/PTLC
+               outputs the exit races their deadlines: urgent rate. */
+            cpfp_tx_info_t cti;
+            fee_target_t ctarget = cpfp_parse_tx(commit_tx, commit_len, &cti)
+                                   ? cpfp_commitment_exit_target(&cti)
+                                   : FEE_TARGET_URGENT;
+            cpfp_set_default_target(ctarget);
+            if (ctarget == FEE_TARGET_URGENT)
+                printf("Force-close: commitment carries HTLC/PTLC outputs: "
+                       "urgent fee target\n");
+            int csent = cpfp_send_default(chain, tx_hex, sent_txid) != CPFP_FAILED;
+            cpfp_set_default_target(FEE_TARGET_NORMAL);
+            if (csent) {
                 printf("Force-close: commitment TX broadcast: %s (cn=%llu)\n",
                        sent_txid, (unsigned long long)sig_cn);
                 commit_out = 1;
@@ -2737,6 +2884,14 @@ static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
         }
     }
     free(commit_tx);
+    /* A pre-signed tx the node takes only with a fee-paying child, and no
+       child could be funded: no further pass helps, the operator must give
+       the exit an on-chain coin (--wallet) or a package-relay backend. */
+    if (cpfp_need_seen() != CPFP_NEED_NONE) {
+        fprintf(stderr, "Force-close: ERROR: a pre-signed transaction needs a "
+                "fee-paying child: %s\n", cpfp_need_text(cpfp_need_seen()));
+        state = CLIENT_EXIT_FAILED;
+    }
     return state;
 }
 
@@ -2760,16 +2915,24 @@ static int client_force_close_from_db(const char *db_path, const char *network,
     chain_backend_t chain;
     int have_chain = 0;
     regtest_t rt;
+    int have_rt = 0;
     if (strcmp(network, "regtest") == 0) {
         if (regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
             have_chain = 1;
+            have_rt = 1;
         }
     } else if (rpcuser && rpcpassword) {
         if (chain_backend_rpc_init(&chain, "127.0.0.1", rpcport, rpcuser,
                                     rpcpassword, NULL, network))
             have_chain = 1;
+        have_rt = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
+                                    datadir, rpcport);
+    }
+    if (!client_setup_cpfp(have_rt ? &rt : NULL)) {
+        persist_close(&db);
+        return 0;
     }
     if (!have_chain) {
         fprintf(stderr, "Client: CLOSE policy: no chain backend (need regtest or "
@@ -2777,6 +2940,7 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
+    cpfp_need_clear();
     uint32_t plan_dist = 0;
     if (client_force_close_plan(&db, &chain, &plan_dist, stderr) != 1) {
         persist_close(&db);
@@ -2986,6 +3150,10 @@ int main(int argc, char *argv[]) {
             datadir = argv[++i];
         else if (strcmp(argv[i], "--rpcport") == 0 && i + 1 < argc)
             rpcport = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--wallet") == 0 && i + 1 < argc)
+            g_client_wallet_name = argv[++i];
+        else if (strcmp(argv[i], "--max-tree-fee-rate") == 0 && i + 1 < argc)
+            client_set_max_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--cheat-client") == 0 && i + 1 < argc) {
             /* CL7: adversarial client cheat. SIDE = 0 (left) or 1 (right).
                Sets env var read by client_handle_leaf_advance. */
@@ -3193,6 +3361,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    g_client_fee_mode = fee_estimator_arg;
+    g_client_fee_rate = fee_rate > 0 ? (uint64_t)fee_rate : 1000;
+
     /* --- Validate fee rate floor --- */
     if ((uint64_t)fee_rate < FEE_FLOOR_SAT_PER_KVB) {
         fprintf(stderr, "ERROR: --fee-rate %d is below minimum %d sat/kvB (0.1 sat/vB)\n",
@@ -3224,6 +3395,7 @@ int main(int argc, char *argv[]) {
 
         chain_backend_t chain;
         int have_chain = 0;
+        int have_rt = 0;
         regtest_t rt;
         if (strcmp(network, "regtest") == 0) {
             if (!regtest_init_full(&rt, "regtest", cli_path, rpcuser, rpcpassword, datadir, rpcport)) {
@@ -3231,6 +3403,7 @@ int main(int argc, char *argv[]) {
                 persist_close(&db);
                 return 1;
             }
+            have_rt = 1;
             extern void chain_backend_regtest_init(chain_backend_t *, regtest_t *);
             chain_backend_regtest_init(&chain, &rt);
             /* CL7: expose rt to client_handle_leaf_advance for cheat broadcast */
@@ -3243,6 +3416,8 @@ int main(int argc, char *argv[]) {
                                         rpcport, rpcuser, rpcpassword,
                                         NULL, network)) {
                 have_chain = 1;
+                have_rt = regtest_init_full(&rt, network, cli_path, rpcuser,
+                                            rpcpassword, datadir, rpcport);
             } else {
                 fprintf(stderr, "ERROR: chain backend RPC init failed\n");
                 persist_close(&db);
@@ -3256,6 +3431,11 @@ int main(int argc, char *argv[]) {
             persist_close(&db);
             return 1;
         }
+        if (!client_setup_cpfp(have_rt ? &rt : NULL)) {
+            persist_close(&db);
+            return 1;
+        }
+        cpfp_need_clear();
 
         /* Publishing the tree spends the factory funding output, after which
            the distribution transaction can never confirm.  Without a signed
@@ -3271,30 +3451,7 @@ int main(int argc, char *argv[]) {
         }
         if (plan == 0) {
             /* Broadcast distribution TX as nLockTime fallback */
-            {
-                unsigned char dist_tx_data[8192];
-                size_t dist_tx_len = 0;
-                if (persist_load_distribution_tx(&db, dist_factory,
-                                                  dist_tx_data, &dist_tx_len,
-                                                  sizeof(dist_tx_data)) &&
-                    dist_tx_len > 0) {
-                    char *tx_hex = malloc(dist_tx_len * 2 + 1);
-                    if (tx_hex) {
-                        extern void hex_encode(const unsigned char *, size_t, char *);
-                        hex_encode(dist_tx_data, dist_tx_len, tx_hex);
-                        char dist_txid[65];
-                        if (chain.send_raw_tx(&chain, tx_hex, dist_txid))
-                            printf("Force-close: distribution TX broadcast: %s\n",
-                                   dist_txid);
-                        else
-                            printf("Force-close: distribution TX not yet mature "
-                                   "(nLockTime not reached)\n");
-                        free(tx_hex);
-                    }
-                } else {
-                    printf("Force-close: no distribution TX in DB\n");
-                }
-            }
+            client_send_distribution_tx(&db, &chain, dist_factory);
             persist_close(&db);
             printf("=== CLIENT FORCE-CLOSE: no tree published ===\n");
             return 0;
@@ -3610,7 +3767,10 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Build sweep TX */
+        /* Build sweep TX.  It is signed now, by this client alone: its fee
+           follows --fee-rate, not the factory's pre-signed rate the
+           commitment above was rebuilt at (which may be 0). */
+        channel_set_fee_rate(&sweep_ch, fee_rate > 0 ? (uint64_t)fee_rate : 1000);
         tx_buf_t sweep_tx;
         tx_buf_init(&sweep_tx, 256);
         if (!channel_build_to_local_sweep(&sweep_ch, &sweep_tx,
@@ -4017,6 +4177,7 @@ int main(int argc, char *argv[]) {
     regtest_t rt;
     int rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword,
                                   datadir, rpcport);
+    if (rt_ok && !client_setup_cpfp(&rt)) return 1;
     if (!rt_ok)
         fprintf(stderr, "Client: regtest init failed (watchtower/RPC disabled)\n");
     /* CL7.B: expose rt to client_handle_leaf_advance so --cheat-client can

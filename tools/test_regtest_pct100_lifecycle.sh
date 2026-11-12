@@ -187,7 +187,7 @@ echo "=== N=$N_CLIENTS REGTEST pct-100 REALISTIC lifecycle: onboard@0 -> LN seed
 # ---- BIRTH ----
 mkfifo "$FIFO"; exec 3<>"$FIFO"; CLI_FD_OPEN=1
 nohup "$LSP_BIN" --network regtest --port "$PORT" \
-    --clients "$N_CLIENTS" --arity "$ARITY" --static-near-root "$STATIC_NEAR_ROOT" \
+    --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree --static-near-root "$STATIC_NEAR_ROOT" \
     --amount "$AMOUNT" \
     --active-blocks 500 --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
     --fee-rate 1000 --lsp-balance-pct 100 --confirm-timeout 600 \

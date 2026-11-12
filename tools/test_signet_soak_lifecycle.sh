@@ -88,7 +88,7 @@ confs(){ $BCLI getrawtransaction "$1" true 2>/dev/null | grep -oE '"confirmation
 
 launch_lsp(){
     nohup "$LSP_BIN" --network signet --port "$PORT" \
-        --clients "$N_CLIENTS" --arity "$ARITY" --static-near-root "$STATIC_NEAR_ROOT" \
+        --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree --static-near-root "$STATIC_NEAR_ROOT" \
         --amount "$AMOUNT" \
         --active-blocks "$ACTIVE_BLOCKS" --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
         --fee-rate "$FEE_RATE" --lsp-balance-pct 50 --confirm-timeout 86400 \

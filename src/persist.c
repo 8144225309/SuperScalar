@@ -1,5 +1,6 @@
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
@@ -1408,6 +1409,34 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
+    /* v41: the agreed rate (sat/kvB) every pre-signed tree tx pays.  The
+       tree is rebuilt from it on load, so it must match what was signed.  0
+       is a valid rate, so rows written before v41 (whose trees paid a flat
+       per-node fee) get NULL and are refused on load.  fee_per_tx keeps the
+       mean per-node fee, for reporting.  Added whenever missing (an ALTER of
+       a column that exists fails harmlessly), whatever db_version says. */
+    sqlite3_exec(p->db,
+        "ALTER TABLE factories ADD COLUMN tree_fee_rate INTEGER;",
+        NULL, NULL, NULL);
+    /* v41 (cont.): the rate a channel's commitment pays (the factory's
+       agreed rate), separate from the penalty/HTLC rate fee_rate_sat_per_kvb.
+       Rows written before it get 1000, the rate both were then. */
+    sqlite3_exec(p->db,
+        "ALTER TABLE channels ADD COLUMN commit_fee_rate_sat_per_kvb INTEGER NOT NULL DEFAULT 1000;",
+        NULL, NULL, NULL);
+    /* v41 (cont.): the factory's lifecycle (block it was created at, ACTIVE
+       and DYING lengths), so a restart keeps its expiry instead of starting
+       a new lifetime; 0 = not recorded.  Added whenever missing (an ALTER of
+       a column that exists fails harmlessly). */
+    {
+        static const char *lifecycle_cols[] = {
+            "ALTER TABLE factories ADD COLUMN created_block INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE factories ADD COLUMN active_blocks INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE factories ADD COLUMN dying_blocks INTEGER NOT NULL DEFAULT 0;",
+        };
+        for (size_t ci = 0; ci < 3; ci++)
+            sqlite3_exec(p->db, lifecycle_cols[ci], NULL, NULL, NULL);
+    }
     /* Client copy of the signed leaf transaction its channel is funded by,
        kept when a leaf advance replaces that leaf in tree_nodes.  The
        client's commitments keep spending this transaction's output, so a
@@ -1642,8 +1671,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
         " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
         " use_hashlock_poison, level_arity, static_threshold_depth, "
-        " ps_subfactory_arity, placement_mode) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " ps_subfactory_arity, placement_mode, tree_fee_rate, created_block, "
+        " active_blocks, dying_blocks) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1659,7 +1689,13 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 6, (int)f->step_blocks);
     sqlite3_bind_int(stmt, 7, (int)f->states_per_layer);
     sqlite3_bind_int(stmt, 8, (int)f->cltv_timeout);
-    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
+    /* fee_per_tx: mean per-node fee, rounded up, so tree tx count x fee_per_tx
+       is the tree's broadcast cost (the dashboard's projection). */
+    uint64_t tree_fees = 0;
+    for (size_t ni = 0; ni < f->n_nodes; ni++)
+        tree_fees += f->nodes[ni].fee_sats;
+    uint64_t mean_node_fee = f->n_nodes ? (tree_fees + f->n_nodes - 1) / f->n_nodes : 0;
+    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)mean_node_fee);
     sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
     sqlite3_bind_int(stmt, 11, f->use_hashlock_poison ? 1 : 0);  /* #59 restart-resume */
     /* v40: the rest of the tree shape (see the migration). */
@@ -1677,6 +1713,11 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 13, (int)f->static_threshold_depth);
     sqlite3_bind_int(stmt, 14, (int)(f->ps_subfactory_arity ? f->ps_subfactory_arity : 1));
     sqlite3_bind_int(stmt, 15, (int)f->placement_mode);
+    /* v41: the agreed tree rate and the lifecycle. */
+    sqlite3_bind_int64(stmt, 16, (sqlite3_int64)f->tree_fee_rate);
+    sqlite3_bind_int(stmt, 17, (int)f->created_block);
+    sqlite3_bind_int(stmt, 18, (int)f->active_blocks);
+    sqlite3_bind_int(stmt, 19, (int)f->dying_blocks);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2879,9 +2920,10 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
-        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
+        "step_blocks, states_per_layer, cltv_timeout, tree_fee_rate, leaf_arity, "
         "use_hashlock_poison, level_arity, static_threshold_depth, "
-        "ps_subfactory_arity, placement_mode "
+        "ps_subfactory_arity, placement_mode, created_block, active_blocks, "
+        "dying_blocks "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2902,13 +2944,17 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint16_t step_blocks = (uint16_t)sqlite3_column_int(stmt, 4);
     uint32_t states_per_layer = (uint32_t)sqlite3_column_int(stmt, 5);
     uint32_t cltv_timeout = (uint32_t)sqlite3_column_int(stmt, 6);
-    uint64_t fee_per_tx = (uint64_t)sqlite3_column_int64(stmt, 7);
+    int has_tree_fee_rate = sqlite3_column_type(stmt, 7) != SQLITE_NULL;
+    uint64_t tree_fee_rate = (uint64_t)sqlite3_column_int64(stmt, 7);
     int leaf_arity_raw = sqlite3_column_int(stmt, 8);
     factory_arity_t leaf_arity =
         (leaf_arity_raw == (int)FACTORY_ARITY_1)  ? FACTORY_ARITY_1  :
         (leaf_arity_raw == (int)FACTORY_ARITY_PS) ? FACTORY_ARITY_PS :
                                                      FACTORY_ARITY_2;
     int loaded_use_hashlock_poison = sqlite3_column_int(stmt, 9);  /* #59 restart-resume */
+    uint32_t created_block = (uint32_t)sqlite3_column_int(stmt, 14);
+    uint32_t active_blocks = (uint32_t)sqlite3_column_int(stmt, 15);
+    uint32_t dying_blocks = (uint32_t)sqlite3_column_int(stmt, 16);
     /* v40 tree shape */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;
@@ -2952,9 +2998,20 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         sqlite3_finalize(stmt);
         return 0;
     }
+    /* The tree is rebuilt at the rate it was signed at.  A row without one
+       was written before schema v41, when every node paid a flat per-node
+       fee: rebuilt at an agreed rate it would have different amounts and
+       txids, and no signature for any of them. */
+    if (!has_tree_fee_rate) {
+        fprintf(stderr, "persist_load_factory: ERROR: factory %u was written before "
+                "schema v41 (flat per-node tree fees, no agreed tree rate): its signed "
+                "tree cannot be rebuilt from this row; refusing to load it\n",
+                factory_id);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
 
     (void)cltv_timeout;
-    (void)fee_per_tx;
 
     unsigned char funding_txid[32];
     if (txid_hex)
@@ -3030,7 +3087,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                                step_blocks, states_per_layer);
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (restore parity) */
-    f->fee_per_tx = fee_per_tx;
+    factory_set_lifecycle(f, created_block, active_blocks, dying_blocks);
+    f->tree_fee_rate = tree_fee_rate;
     /* The shape, applied in the order FACTORY_PROPOSE applies it on the
        client (client.c): arity, then static levels, then sub-factory arity. */
     if (n_level_arity > 0) {
@@ -3292,8 +3350,8 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
         "(id, factory_id, slot, local_amount, remote_amount, funding_amount, "
         " commitment_number, funding_txid, funding_vout, state, "
         " to_self_delay, fee_rate_sat_per_kvb, use_revocation_leaf, "
-        " funding_pending_reorg) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?);";
+        " funding_pending_reorg, commit_fee_rate_sat_per_kvb) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -3312,6 +3370,7 @@ int persist_save_channel(persist_t *p, const channel_t *ch,
     sqlite3_bind_int64(stmt, 11, (sqlite3_int64)ch->fee_rate_sat_per_kvb);
     sqlite3_bind_int(stmt, 12, ch->use_revocation_leaf);
     sqlite3_bind_int(stmt, 13, ch->funding_pending_reorg);
+    sqlite3_bind_int64(stmt, 14, (sqlite3_int64)ch->commit_fee_rate_sat_per_kvb);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -4861,8 +4920,10 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
                 continue;
         }
 
+        /* Through the CPFP path: a pre-signed tx below the node's floor (a
+           tree at a low or zero agreed rate) gets in only with a child. */
         char txid_out[65] = {0};
-        if (chain->send_raw_tx(chain, raw_hex, txid_out)) {
+        if (cpfp_send_default(chain, raw_hex, txid_out) != CPFP_FAILED) {
             fprintf(stderr, "Watchtower: retry broadcast succeeded: %s\n", txid_out);
             /* Mark as ok */
             const char *upd = "UPDATE broadcast_log SET result='ok', txid=? WHERE id=?;";
@@ -7649,13 +7710,20 @@ int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
         if (tx_hex) {
             size_t hex_len = strlen(tx_hex);
             size_t raw_len = hex_len / 2;
-            if (signed_tx_out && raw_len <= max_len) {
+            if (!signed_tx_out) {
+                /* length query */
+                if (signed_tx_len_out) *signed_tx_len_out = raw_len;
+                found = 1;
+            } else if (raw_len <= max_len) {
                 hex_decode(tx_hex, signed_tx_out, raw_len);
                 if (signed_tx_len_out) *signed_tx_len_out = raw_len;
-            } else if (signed_tx_len_out) {
-                *signed_tx_len_out = raw_len;
+                found = 1;
+            } else {
+                /* Never report bytes that were not copied. */
+                fprintf(stderr, "persist_load_distribution_tx: stored TX is %zu "
+                        "bytes, buffer holds %zu\n", raw_len, max_len);
+                if (signed_tx_len_out) *signed_tx_len_out = 0;
             }
-            found = 1;
         }
     }
     sqlite3_finalize(stmt);

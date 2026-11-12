@@ -73,10 +73,12 @@ lsp_static_args() {
 }
 
 # Build the optional --ps-subfactory-arity LSP CLI fragment.  Empty when 1
-# so default 1-client-per-PS-leaf invocations stay bit-identical.
+# so default 1-client-per-PS-leaf invocations stay bit-identical.  A k > 1
+# shape has k^2 sub-factory nodes, which carry no P2A anchor yet, so the LSP
+# needs --allow-anchorless-tree (refused on mainnet) to fund it.
 lsp_subfactory_args() {
     if [ "${PS_SUBFACTORY_ARITY:-1}" -gt 1 ] 2>/dev/null; then
-        printf -- "--ps-subfactory-arity %s" "$PS_SUBFACTORY_ARITY"
+        printf -- "--allow-anchorless-tree --ps-subfactory-arity %s" "$PS_SUBFACTORY_ARITY"
     fi
 }
 
