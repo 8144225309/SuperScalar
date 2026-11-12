@@ -7006,13 +7006,20 @@ int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
         if (tx_hex) {
             size_t hex_len = strlen(tx_hex);
             size_t raw_len = hex_len / 2;
-            if (signed_tx_out && raw_len <= max_len) {
+            if (!signed_tx_out) {
+                /* length query */
+                if (signed_tx_len_out) *signed_tx_len_out = raw_len;
+                found = 1;
+            } else if (raw_len <= max_len) {
                 hex_decode(tx_hex, signed_tx_out, raw_len);
                 if (signed_tx_len_out) *signed_tx_len_out = raw_len;
-            } else if (signed_tx_len_out) {
-                *signed_tx_len_out = raw_len;
+                found = 1;
+            } else {
+                /* Never report bytes that were not copied. */
+                fprintf(stderr, "persist_load_distribution_tx: stored TX is %zu "
+                        "bytes, buffer holds %zu\n", raw_len, max_len);
+                if (signed_tx_len_out) *signed_tx_len_out = 0;
             }
-            found = 1;
         }
     }
     sqlite3_finalize(stmt);

@@ -1295,7 +1295,10 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
                                  const unsigned char *signed_tx,
                                  size_t signed_tx_len);
 
-/* Load the latest commitment TX signature. Returns 1 if found. */
+/* Load the latest commitment TX signature. Returns 1 if found.  With
+   signed_tx_out NULL, *signed_tx_len_out is the stored TX's length; with a
+   buffer smaller than the stored TX, returns 0 and sets *signed_tx_len_out
+   to 0. */
 int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
                                  uint64_t *commitment_number_out,
                                  unsigned char *sig64_out,
@@ -1310,7 +1313,9 @@ int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,
                                   const unsigned char *signed_tx,
                                   size_t signed_tx_len);
 
-/* Load the signed distribution TX. Returns 1 if found. */
+/* Load the signed distribution TX. Returns 1 if found.  With signed_tx_out
+   NULL, *signed_tx_len_out is the stored TX's length; with a buffer smaller
+   than the stored TX, returns 0 and sets *signed_tx_len_out to 0. */
 int persist_load_distribution_tx(persist_t *p, uint32_t factory_id,
                                   unsigned char *signed_tx_out,
                                   size_t *signed_tx_len_out,

@@ -5762,3 +5762,60 @@ int test_persist_htlc_origin_rows(void) {
     persist_close(&db);
     return 1;
 }
+
+
+/* A stored distribution TX or commitment larger than the caller's buffer:
+   the loader fails and reports no length, so the caller never hex-encodes or
+   broadcasts bytes it was not given.  A NULL buffer asks for the length. */
+int test_persist_signed_tx_loaders_never_overreport(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    size_t big = 9000;   /* a distribution TX of about 200 clients */
+    unsigned char *tx = malloc(big);
+    unsigned char *back = malloc(big);
+    TEST_ASSERT(tx && back, "alloc");
+    for (size_t i = 0; i < big; i++) tx[i] = (unsigned char)(i * 13 + 5);
+
+    TEST_ASSERT(persist_save_distribution_tx(&db, 0, tx, big), "save dist");
+    size_t len = 12345;
+    TEST_ASSERT(persist_load_distribution_tx(&db, 0, NULL, &len, 0), "length query");
+    TEST_ASSERT_EQ(len, big, "length query reports the stored size");
+    len = 12345;
+    memset(back, 0xAA, big);
+    TEST_ASSERT(!persist_load_distribution_tx(&db, 0, back, &len, 8192),
+                "a buffer too small fails");
+    TEST_ASSERT_EQ(len, 0, "no length reported for bytes not copied");
+    TEST_ASSERT(back[0] == 0xAA && back[8191] == 0xAA, "buffer untouched");
+    len = 0;
+    TEST_ASSERT(persist_load_distribution_tx(&db, 0, back, &len, big), "exact fit loads");
+    TEST_ASSERT_EQ(len, big, "full length");
+    TEST_ASSERT(memcmp(back, tx, big) == 0, "bytes match");
+
+    size_t cbig = 5000;  /* a commitment with about 110 HTLC outputs */
+    unsigned char sig[64];
+    memset(sig, 0x11, 64);
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 7, sig, tx, cbig), "save commitment");
+    uint64_t cn = 0;
+    len = 12345;
+    TEST_ASSERT(persist_load_commitment_sig(&db, 0, &cn, NULL, NULL, &len, 0),
+                "commitment length query");
+    TEST_ASSERT_EQ(len, cbig, "commitment length");
+    len = 12345;
+    memset(back, 0xAA, big);
+    TEST_ASSERT(!persist_load_commitment_sig(&db, 0, &cn, NULL, back, &len, 4096),
+                "a commitment buffer too small fails");
+    TEST_ASSERT_EQ(len, 0, "no commitment length reported for bytes not copied");
+    TEST_ASSERT(back[0] == 0xAA, "commitment buffer untouched");
+    len = 0;
+    TEST_ASSERT(persist_load_commitment_sig(&db, 0, &cn, NULL, back, &len, cbig),
+                "commitment loads into a buffer of its size");
+    TEST_ASSERT_EQ(len, cbig, "commitment length");
+    TEST_ASSERT_EQ(cn, 7, "commitment number");
+    TEST_ASSERT(memcmp(back, tx, cbig) == 0, "commitment bytes match");
+
+    free(tx);
+    free(back);
+    persist_close(&db);
+    return 1;
+}
+

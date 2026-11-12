@@ -1321,6 +1321,7 @@ extern int test_bridge_forwards_pay_result_ack(void);
 extern int test_lsp_outbound_internal_invoice_refused(void);
 extern int test_lsp_same_hash_inbound_and_outbound(void);
 extern int test_persist_htlc_origin_rows(void);
+extern int test_persist_signed_tx_loaders_never_overreport(void);
 extern int test_lsp_inbound_origin_table_and_rollback(void);
 extern int test_lsp_pay_result_rejections(void);
 extern int test_lsp_outbound_htlc_returned(void);
@@ -3358,6 +3359,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_outbound_internal_invoice_refused);
     RUN_TEST(test_lsp_same_hash_inbound_and_outbound);
     RUN_TEST(test_persist_htlc_origin_rows);
+    RUN_TEST(test_persist_signed_tx_loaders_never_overreport);
     RUN_TEST(test_lsp_inbound_origin_table_and_rollback);
     RUN_TEST(test_lsp_pay_result_rejections);
     RUN_TEST(test_lsp_outbound_htlc_returned);

@@ -301,6 +301,7 @@ int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
         if (sig64_out && sig_hex && strlen(sig_hex) == 128)
             hex_decode(sig_hex, sig64_out, 64);
 
+        found = 1;
         const char *tx_hex = (const char *)sqlite3_column_text(stmt, 2);
         if (signed_tx_out && tx_hex) {
             size_t hex_len = strlen(tx_hex);
@@ -308,13 +309,17 @@ int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,
             if (raw_len <= max_tx_len) {
                 hex_decode(tx_hex, signed_tx_out, raw_len);
                 if (signed_tx_len_out) *signed_tx_len_out = raw_len;
+            } else {
+                /* Never report bytes that were not copied. */
+                fprintf(stderr, "persist_load_commitment_sig: stored TX is %zu "
+                        "bytes, buffer holds %zu\n", raw_len, max_tx_len);
+                if (signed_tx_len_out) *signed_tx_len_out = 0;
+                found = 0;
             }
         } else if (signed_tx_len_out && !signed_tx_out) {
             const char *txh = (const char *)sqlite3_column_text(stmt, 2);
             if (txh) *signed_tx_len_out = strlen(txh) / 2;
         }
-
-        found = 1;
     }
     sqlite3_finalize(stmt);
     return found;
