@@ -164,10 +164,18 @@ jobs:
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       - name: Build (needed for FetchContent headers)
         run: cmake --build build --parallel
+      - name: Cache cppcheck results
+        uses: actions/cache@v6
+        with:
+          path: .cppcheck-cache
+          key: cppcheck-${{ runner.os }}-${{ hashFiles('src/**', 'include/**', 'tools/**', 'tests/**', 'fuzz/**', 'CMakeLists.txt') }}
+          restore-keys: |
+            cppcheck-${{ runner.os }}-
       - name: Run cppcheck
         run: |
           cppcheck --version
-          cppcheck --enable=warning,performance,portability \
+          mkdir -p .cppcheck-cache
+          cppcheck -j "$(nproc)" --cppcheck-build-dir=.cppcheck-cache             --enable=warning,performance,portability \
             --suppress=missingInclude \
             --suppress=unusedFunction \
             --suppress=duplicateAssignExpression \
