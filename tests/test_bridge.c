@@ -1249,6 +1249,8 @@ int test_regtest_bridge_payment(void) {
         pid_t cpid = fork();
         if (cpid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = secp256k1_context_create(
                 SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
             secp256k1_keypair child_kp;
@@ -1766,6 +1768,8 @@ int test_regtest_bridge_out(void) {
         pid_t cpid = fork();
         if (cpid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = secp256k1_context_create(
                 SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
             secp256k1_keypair child_kp;
@@ -2033,6 +2037,8 @@ int test_regtest_bridge_invoice_flow(void) {
         pid_t cpid = fork();
         if (cpid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = secp256k1_context_create(
                 SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
             secp256k1_keypair child_kp;
@@ -2901,8 +2907,8 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
     bridge_payee_data_t idle_data;
     memset(&idle_data, 0, sizeof(idle_data));
 
-    /* Fork 64 client processes.  Stagger by 30ms so connect order is stable
-       (test_init defaults require_slot_hints=0, so order matters for keyagg). */
+    /* Fork 64 client processes.  Each sends a slot hint, so the LSP orders
+       the members by key slot whatever order they connect in. */
     const int N_CLIENTS = 64;
     pid_t *child_pids = calloc(N_CLIENTS, sizeof(pid_t));
     if (!child_pids) return 0;
@@ -2911,6 +2917,8 @@ static int run_bridge_payment_n64_mixed_arity(size_t payee_client_idx,
         if (cpid == 0) {
             close(pre_listen_fd);  /* child doesn't need the listen socket */
             usleep(30000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = secp256k1_context_create(
                 SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
             secp256k1_keypair child_kp;
