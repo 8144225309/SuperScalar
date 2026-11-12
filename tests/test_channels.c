@@ -4932,3 +4932,206 @@ int test_client_refuses_tree_advances(void) {
     secp256k1_context_destroy(ctx);
     return ok;
 }
+
+
+/* ---- A payment to a client whose channel cannot take another HTLC ---- */
+
+/* Client side: client 1 pays client 2 and must be told the payment failed,
+   and end with its HTLC gone; client 2 does nothing. */
+typedef struct {
+    unsigned char payment_hash[32];
+    int got_fail;
+} fullfwd_data_t;
+
+static int fullfwd_client_cb(int fd, channel_t *ch, uint32_t my_index,
+                             secp256k1_context *ctx,
+                             const secp256k1_keypair *keypair,
+                             factory_t *factory, size_t n_participants,
+                             void *user_data) {
+    (void)keypair; (void)factory; (void)n_participants;
+    fullfwd_data_t *d = (fullfwd_data_t *)user_data;
+    if (my_index != 1) return 1;
+    if (!client_send_payment(fd, ch, 5000, d->payment_hash, 500, 1)) return 0;
+    for (int i = 0; i < 6; i++) {
+        wire_msg_t msg;
+        if (!recv_skip_revocations(fd, &msg)) return 0;
+        if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
+            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            cJSON_Delete(msg.json);
+            if (d->got_fail) break;      /* the fail's commitment */
+        } else if (msg.msg_type == MSG_UPDATE_FAIL_HTLC) {
+            int committed = 0;
+            uint64_t fid = 0;
+            int ok = client_handle_fail_htlc(ch, &msg, &committed, &fid);
+            cJSON_Delete(msg.json);
+            if (!ok) return 0;
+            d->got_fail = 1;
+            printf("Client %u: payment failed back (%s)\n", my_index,
+                   committed ? "committed" : "never committed");
+            if (!committed) break;
+        } else {
+            fprintf(stderr, "Client %u: unexpected msg 0x%02x\n", my_index,
+                    msg.msg_type);
+            cJSON_Delete(msg.json);
+            return 0;
+        }
+    }
+    for (size_t h = 0; h < ch->n_htlcs; h++)
+        if (ch->htlcs[h].state == HTLC_STATE_ACTIVE) return 0;
+    return d->got_fail;
+}
+
+/* The LSP forwards a payment between two clients.  When the payee's channel
+   already carries the most HTLC outputs a relayable commitment can hold,
+   the forward cannot be added there: the payment must fail back to the
+   payer, whose HTLC must not stay locked in its channel. */
+int test_forward_into_full_channel_fails_back(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[3];
+    secp256k1_pubkey pks[3];
+    for (int i = 0; i < 3; i++) {
+        if (!secp256k1_keypair_create(ctx, &kps[i], seckeys[i])) return 0;
+        if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return 0;
+    }
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 3);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache,
+                                                tweak_val)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk))
+        return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+    unsigned char funding_txid[32];
+    memset(funding_txid, 0xC9, 32);
+    const uint64_t funding_amount = 2000000;
+
+    fullfwd_data_t data;
+    memset(&data, 0, sizeof(data));
+    memset(data.payment_hash, 0x6E, 32);
+
+    int port = 21300 + (getpid() % 1000) + 120;
+    pid_t child_pids[2];
+    for (int c = 0; c < 2; c++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
+            int ok = client_run_with_channels(child_ctx, &child_kp, "127.0.0.1", port,
+                                               fullfwd_client_cb, &data, NULL, NULL);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return 0;
+    lsp_init(lsp, ctx, &kps[0], port, 2);
+    int lsp_ok = 1;
+    const char *why = "";
+#define FF_STEP(cond, msg) do { \
+        if (lsp_ok && !(cond)) { lsp_ok = 0; why = (msg); } \
+    } while (0)
+    FF_STEP(lsp_accept_clients(lsp), "accept clients");
+    lsp->factory.leaf_arity = FACTORY_ARITY_PS;
+    FF_STEP(lsp_run_factory_creation(lsp, funding_txid, 0, funding_amount, fund_spk, 34,
+                                      10, 4, 0), "factory creation");
+    lsp_channel_mgr_t ch_mgr;
+    memset(&ch_mgr, 0, sizeof(ch_mgr));
+    FF_STEP(lsp_channels_init(&ch_mgr, ctx, &lsp->factory, seckeys[0], 2), "channel init");
+    FF_STEP(lsp_channels_exchange_basepoints(&ch_mgr, lsp), "basepoint exchange");
+    FF_STEP(lsp_channels_send_ready(&ch_mgr, lsp), "channel_ready");
+
+    /* Fill the payee's channel (the LSP's copy) up to the cap. */
+    channel_t *dest = &ch_mgr.entries[1].channel;
+    channel_t *sender = &ch_mgr.entries[0].channel;
+    uint64_t dest_local0 = 0, dest_remote0 = 0, sender_local0 = 0, sender_remote0 = 0;
+    size_t dest_n0 = 0;
+    if (lsp_ok) {
+        dest_local0 = dest->local_amount;
+        dest_remote0 = dest->remote_amount;
+        dest_n0 = dest->n_htlcs;
+        sender_local0 = sender->local_amount;
+        sender_remote0 = sender->remote_amount;
+        size_t max = channel_max_commit_htlc_outputs();
+        for (size_t i = 0; lsp_ok && channel_commit_htlc_outputs(dest) < max; i++) {
+            unsigned char h[32];
+            memset(h, 0x11, 32);
+            h[0] = (unsigned char)i;
+            h[1] = (unsigned char)(i >> 8);
+            uint64_t id;
+            FF_STEP(channel_add_htlc(dest, HTLC_OFFERED, 600, h, 400, &id),
+                    "fill the payee's channel");
+        }
+        FF_STEP(channel_commit_htlc_outputs(dest) == max, "payee's channel at the cap");
+    }
+
+    /* The payment arrives from client 0 for client 1. */
+    int handled = -1;
+    if (lsp_ok) {
+        wire_msg_t msg;
+        if (!wire_recv(lsp->client_fds[0], &msg)) { lsp_ok = 0; why = "recv add"; }
+        else {
+            FF_STEP(msg.msg_type == MSG_UPDATE_ADD_HTLC, "add message");
+            handled = lsp_channels_handle_msg(&ch_mgr, lsp, 0, &msg);
+            cJSON_Delete(msg.json);
+        }
+    }
+    if (lsp_ok) {
+        printf("  handle_msg returned %d; sender HTLCs: %zu\n", handled, sender->n_htlcs);
+        FF_STEP(handled == 1, "a full payee channel is a payment failure, not an error");
+        int active = 0;
+        for (size_t h = 0; h < sender->n_htlcs; h++)
+            if (sender->htlcs[h].state == HTLC_STATE_ACTIVE &&
+                memcmp(sender->htlcs[h].payment_hash, data.payment_hash, 32) == 0)
+                active++;
+        FF_STEP(active == 0, "the payer's HTLC is not left in its channel");
+        FF_STEP(sender->local_amount == sender_local0 &&
+                sender->remote_amount == sender_remote0, "the payer's balance is back");
+    }
+
+    /* Take the filler HTLCs out again (only the LSP's copy had them) and
+       close cooperatively so both clients exit. */
+    if (lsp_ok) {
+        dest->n_htlcs = dest_n0;
+        dest->local_amount = dest_local0;
+        dest->remote_amount = dest_remote0;
+        tx_output_t close_outputs[3];
+        size_t n_close = lsp_channels_build_close_outputs(&ch_mgr, &lsp->factory,
+                                                           close_outputs, 500, NULL, 0);
+        FF_STEP(n_close == 3, "close outputs");
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+        FF_STEP(lsp_run_cooperative_close(lsp, &close_tx, close_outputs, n_close, 0),
+                "cooperative close");
+        tx_buf_free(&close_tx);
+    }
+#undef FF_STEP
+    lsp_channels_cleanup(&ch_mgr);
+    lsp_cleanup(lsp);
+    free(lsp);
+    int children_ok = 1;
+    for (int c = 0; c < 2; c++) {
+        int status;
+        if (!lsp_ok) kill(child_pids[c], SIGKILL);
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) children_ok = 0;
+    }
+    secp256k1_context_destroy(ctx);
+    if (!lsp_ok) {
+        printf("  FAIL: %s: %s\n", __func__, why);
+        return 0;
+    }
+    TEST_ASSERT(children_ok, "the payer was told and both clients completed");
+    return 1;
+}

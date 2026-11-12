@@ -1996,6 +1996,7 @@ extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
 extern int test_payment_leaves_leaf_untouched_arity_ps(void);
 extern int test_payment_leaves_leaf_untouched_arity1(void);
+extern int test_forward_into_full_channel_fails_back(void);
 extern int test_client_refuses_tree_advances(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
@@ -4023,6 +4024,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_with_real_htlc);
     RUN_TEST(test_payment_leaves_leaf_untouched_arity_ps);
     RUN_TEST(test_payment_leaves_leaf_untouched_arity1);
+    RUN_TEST(test_forward_into_full_channel_fails_back);
     RUN_TEST(test_client_refuses_tree_advances);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);

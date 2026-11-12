@@ -1078,6 +1078,34 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
     }
 
+    /* A payment to another client of this factory needs room for one more
+       HTLC output in the payee's commitment (channel_max_commit_htlc_outputs).
+       Checked before the payer's HTLC is taken into its channel, so a full
+       payee channel is refused like any other payment failure. */
+    if (!pay_outside && dest_item && cJSON_IsNumber(dest_item)) {
+        size_t di = (size_t)dest_item->valuedouble;
+        channel_t *dch = NULL;
+        if (di < mgr->n_channels && di != sender_idx) {
+            if (mgr->entries[di].ready) {
+                dch = &mgr->entries[di].channel;
+            } else {
+                jit_channel_t *dj = jit_channel_find(mgr, di);
+                if (dj && dj->state == JIT_STATE_OPEN) dch = &dj->channel;
+            }
+        }
+        if (dch && channel_commit_htlc_outputs(dch) >= channel_max_commit_htlc_outputs()) {
+            fprintf(stderr, "LSP: payment from client %zu refused: the channel of "
+                    "client %zu already carries %zu HTLC outputs, the most a "
+                    "relayable commitment holds\n", sender_idx, di,
+                    channel_commit_htlc_outputs(dch));
+            cJSON *fail = wire_build_update_fail_htlc_uncommitted(
+                htlc_id, "destination_channel_full");
+            wire_send(lsp->client_fds[sender_idx], MSG_UPDATE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            return 1;  /* a payment failure, not a protocol error */
+        }
+    }
+
     channel_t *sender_ch = &mgr->entries[sender_idx].channel;
 
     /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
@@ -1343,6 +1371,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Apply routing fee (LSP retains the difference in its channel balance) */
     uint64_t fwd_amount_sats = amount_sats;
     uint64_t fwd_amount_msat = amount_msat;
+    uint64_t fwd_fee_sats = 0;   /* routing fee counted for this forward */
     if (mgr->routing_fee_ppm > 0) {
         uint64_t fee_msat = (amount_msat * mgr->routing_fee_ppm + 999999) / 1000000;
         if (fee_msat >= amount_msat) {
@@ -1360,6 +1389,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         uint64_t fee_sats = (fee_msat + 999) / 1000;
         mgr->accumulated_fees_sats += fee_sats;
         mgr->entries[sender_idx].accumulated_fees_sats += fee_sats;
+        fwd_fee_sats = fee_sats;
         if (mgr->persist)
             persist_save_fee_settlement((persist_t *)mgr->persist, 0,
                 mgr->accumulated_fees_sats, mgr->last_settlement_block);
@@ -1384,9 +1414,21 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     uint64_t dest_htlc_id;
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, fwd_amount_sats,
                            payment_hash, fwd_cltv_expiry, &dest_htlc_id)) {
-        fprintf(stderr, "LSP: forward add_htlc failed to client %zu\n", dest_idx);
+        /* The payer's HTLC is already in its commitment: give it back, with
+           the commitment exchange, and do not count the routing fee. */
+        fprintf(stderr, "LSP: forward add_htlc failed to client %zu; failing the "
+                "payment back to client %zu\n", dest_idx, sender_idx);
         free(old_dest_htlcs);
-        return 0;
+        if (fwd_fee_sats > 0) {
+            mgr->accumulated_fees_sats -= fwd_fee_sats;
+            mgr->entries[sender_idx].accumulated_fees_sats -= fwd_fee_sats;
+            if (mgr->persist)
+                persist_save_fee_settlement((persist_t *)mgr->persist, 0,
+                    mgr->accumulated_fees_sats, mgr->last_settlement_block);
+        }
+        lsp_channels_fail_outbound_htlc(mgr, lsp, NULL, sender_idx, new_htlc_id,
+                                         "forward_failed");
+        return 1;  /* a payment failure, not a protocol error */
     }
 
     /* Persist in-flight HTLC BEFORE commitment exchange.
