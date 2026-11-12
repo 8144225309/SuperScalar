@@ -545,7 +545,7 @@ jobs:
       matrix:
         target: [fuzz_wire_recv, fuzz_wire_parse_json, fuzz_tx_sighash,
                  fuzz_persist_load, fuzz_hex_decode,
-                 fuzz_noise_handshake, fuzz_aead_decrypt]
+                 fuzz_noise_handshake, fuzz_aead_decrypt, fuzz_client_msg]
     runs-on: ubuntu-latest
     name: Fuzz (${{ matrix.target }})
     timeout-minutes: 30
