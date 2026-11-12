@@ -535,6 +535,14 @@ int test_cu_real_rounds(void) {
     rnet_t *n = calloc(1, sizeof(*n));
     TEST_ASSERT(n && rnet_init(n, ftxid, 0, 50000123), "open with commitment 0 both ways");
     TEST_ASSERT(rest_ok(n, 0, why, sizeof(why)), why);
+    {
+        /* Only the next unused nonce index is accepted. */
+        unsigned char junk_tx[64] = {0}, psig[32] = {0}, sig[64];
+        uint32_t next = n->s[0].ops.next;
+        TEST_ASSERT(!CU_CHANNEL_OPS.verify_aggregate(&n->s[0].ops, 1, junk_tx, sizeof(junk_tx), psig,
+                                                     next + 1, sig), "a skipped index is refused");
+        TEST_ASSERT_EQ(n->s[0].ops.next, next, "and uses nothing");
+    }
 
     /* The host pays the member 20000.5 sat; the member fulfils. */
     cu_update_t u;

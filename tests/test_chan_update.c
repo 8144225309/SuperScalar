@@ -1123,6 +1123,14 @@ int test_cu_member_cannot_open_round(void) {
     TEST_ASSERT_EQ(n->s[CU_HOST].c->rec.phase, CU_PHASE_SENT, "host round stands");
     TEST_ASSERT_EQ(reconnect(n), CU_OK, "reconnect");
     TEST_ASSERT(at_rest(n, 1, why, sizeof(why)), why);
+
+    /* A round update that acts for the member must be its own offer (INV-28). */
+    memset(&m, 0, sizeof(m));
+    m.type = CU_MSG_ADD;
+    m.channel_id = n->s[1].cfg.channel_id;
+    mk_add(&m.upd, 0, 1000000, 805);
+    m.upd.sender = CU_MEMBER;
+    TEST_ASSERT_EQ(cu_on_message(n->s[CU_MEMBER].c, &m), CU_ERR_PROTOCOL, "a made-up member update is refused");
     net_free(n); free(n);
     return 1;
 }
