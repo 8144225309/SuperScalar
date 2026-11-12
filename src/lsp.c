@@ -442,7 +442,10 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         return 0;
     }
     if (t->n_level_arity > 0) {
-        factory_set_level_arity(f, t->level_arity, t->n_level_arity);
+        if (!factory_set_level_arity(f, t->level_arity, t->n_level_arity)) {
+            fprintf(stderr, "%s: saved tree shape refused\n", who);
+            return 0;
+        }
     } else if (t->leaf_arity == FACTORY_ARITY_1) {
         factory_set_arity(f, FACTORY_ARITY_1);
     } else if (t->leaf_arity == FACTORY_ARITY_PS) {

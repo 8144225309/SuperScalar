@@ -211,7 +211,7 @@ static uint32_t ts_shape_ewt(const ts_shape_t *s) {
                          : s->n_arities > 1 ? (factory_arity_t)s->arities[s->n_arities - 1]
                          : FACTORY_ARITY_2;
     return factory_compute_ewt_for_shape(la, s->n_arities > 1 ? s->n_arities : 0, leaf,
-                                         s->n_clients, s->static_thr, TS_STEP, TS_STATES);
+                                         s->ps_k, s->n_clients, s->static_thr, TS_STEP, TS_STATES);
 }
 
 /* ---- Pinned tree txids ---- */
@@ -475,6 +475,15 @@ int test_tree_shape_leaf_kind(void) {
     TEST_ASSERT_EQ(ts_count_ps_leaves(t.f), 0, "DW leaf");
     ts_close(&t);
 
+    /* DW leaves under a PS level with k=2: 4 clients fit one k^2 PS leaf and
+       one 4-way DW leaf; the leaf is DW (was a k^2 PS leaf). */
+    ts_shape_t d2 = { "N=4 3,4 k=2", 4, {3, 4}, 2, 0, 0, 0, 2, 0 };
+    TEST_ASSERT(ts_open(&t, &d2) && t.built, d2.name);
+    TEST_ASSERT_EQ(t.f->n_leaf_nodes, 1, "1 leaf");
+    TEST_ASSERT_EQ(ts_count_ps_leaves(t.f), 0, "DW leaf");
+    TEST_ASSERT_EQ(t.f->nodes[t.f->leaf_node_indices[0]].n_outputs, 5, "4 channels + L-stock");
+    ts_close(&t);
+
     /* Same kind: a 7-way DW level still takes up to 7 clients as one leaf
        above 4-way leaves. */
     ts_shape_t e = { "N=7 7,4", 7, {7, 4}, 2, 0, 0, 0, 0, 0 };
@@ -656,5 +665,79 @@ int test_tree_shape_scale_sign_ewt(void) {
         ts_close(&t);
     }
     printf("\n");
+    return 1;
+}
+
+/* ---- Shape early-warning time with k^2 PS leaves ---- */
+
+int test_tree_shape_ewt_ps_k(void) {
+    static const struct { ts_shape_t s; uint32_t ewt; } cases[] = {
+        { { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 }, 1 * TS_LOCK },
+        { { "N=16 PS k=2", 16, {3}, 1, 0, 1, 1000, 2, 0 }, 2 * TS_LOCK },
+        { { "N=18 PS k=3", 18, {3}, 1, 0, 1, 1000, 3, 0 }, 1 * TS_LOCK },
+        { { "N=36 PS k=3", 36, {3}, 1, 0, 1, 1000, 3, 0 }, 2 * TS_LOCK },
+        { { "N=64 16,3 k=2", 64, {16, 3}, 2, 0, 0, 0, 2, 0 }, 1 * TS_LOCK },
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        const ts_shape_t *s = &cases[k].s;
+        ts_tree_t t;
+        TEST_ASSERT(ts_open(&t, s) && t.built, s->name);
+        long tx_max = ts_tx_path_max(t.f);
+        uint32_t shape = ts_shape_ewt(s);
+        if (tx_max != (long)cases[k].ewt || shape != cases[k].ewt)
+            printf("\n    %s: txs %ld shape %u expected %u\n", s->name, tx_max, shape, cases[k].ewt);
+        TEST_ASSERT_EQ(tx_max, cases[k].ewt, "tx path max");
+        TEST_ASSERT_EQ(factory_early_warning_time(t.f), tx_max, "factory_early_warning_time");
+        TEST_ASSERT_EQ(shape, tx_max, "factory_compute_ewt_for_shape honours k");
+        ts_close(&t);
+    }
+    return 1;
+}
+
+/* ---- Per-leaf rollover ---- */
+
+/* A per-leaf rollover advances counter layer 0 and resets the leaf to its
+   longest delay.  For a leaf with no DW state above it on layer 0 the reset
+   state would spend the same outpoint as the superseded nSequence-0 state,
+   which would win; such a leaf refuses to roll over and keeps its last
+   state.  Leaves with such an ancestor roll over onto a new outpoint. */
+int test_tree_shape_per_leaf_rollover(void) {
+    static const struct { ts_shape_t s; int rolls; } cases[] = {
+        { { "N=2 arity 2 static 1", 2, {2}, 1, 1, 1, 1000, 0, 0 }, 0 },
+        { { "N=4 arity 2 static 1", 4, {2}, 1, 1, 1, 1000, 0, 0 }, 0 },
+        { { "N=2 arity 2 (root leaf)", 2, {2}, 1, 0, 1, 1000, 0, 0 }, 0 },
+        { { "N=4 arity 2", 4, {2}, 1, 0, 1, 1000, 0, 0 }, 1 },
+        { { "N=8 arity 2 static 1", 8, {2}, 1, 1, 1, 1000, 0, 0 }, 1 },
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        for (int sign = 0; sign < 2; sign++) {
+            ts_tree_t t;
+            TEST_ASSERT(ts_open(&t, &cases[k].s) && t.built, cases[k].s.name);
+            factory_t *f = t.f;
+            if (sign) TEST_ASSERT(factory_sign_all(f), "sign");
+            size_t L = f->leaf_node_indices[0];
+            for (int i = 1; i < TS_STATES; i++) {
+                int rc = sign ? factory_advance_leaf(f, 0) : factory_advance_leaf_unsigned(f, 0);
+                TEST_ASSERT_EQ(rc, 1, "advance within the leaf layer");
+            }
+            TEST_ASSERT_EQ(f->nodes[L].nsequence, 0, "leaf at its last state");
+            unsigned char old_txid[32], old_in[32];
+            memcpy(old_txid, f->nodes[L].txid, 32);
+            memcpy(old_in, f->nodes[f->nodes[L].parent_index].txid, 32);
+            int rc = sign ? factory_advance_leaf(f, 0) : factory_advance_leaf_unsigned(f, 0);
+            if (cases[k].rolls) {
+                TEST_ASSERT_EQ(rc, sign ? 1 : -1, "rollover");
+                TEST_ASSERT(memcmp(old_in, f->nodes[f->nodes[L].parent_index].txid, 32) != 0,
+                            "rolled-over leaf spends a new outpoint");
+                TEST_ASSERT_EQ(f->counter.current_epoch, 1, "epoch moved");
+            } else {
+                TEST_ASSERT_EQ(rc, 0, "rollover refused");
+                TEST_ASSERT(memcmp(old_txid, f->nodes[L].txid, 32) == 0, "leaf state kept");
+                TEST_ASSERT_EQ(f->nodes[L].nsequence, 0, "leaf nSequence kept");
+                TEST_ASSERT_EQ(f->counter.current_epoch, 0, "epoch kept");
+            }
+            ts_close(&t);
+        }
+    }
     return 1;
 }

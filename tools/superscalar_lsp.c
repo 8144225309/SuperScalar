@@ -2602,6 +2602,8 @@ int main(int argc, char *argv[]) {
         factory_arity_t fa = (factory_arity_t)leaf_arity;
         const uint8_t *la_ptr = (n_level_arity > 0) ? level_arities : NULL;
         if (!cli_validate_shape_for_bolt2016(la_ptr, n_level_arity, fa,
+                                              (uint32_t)(ps_subfactory_arity_arg > 1
+                                                         ? ps_subfactory_arity_arg : 1),
                                               (size_t)n_clients,
                                               static_near_root,
                                               step_blocks,
@@ -4055,9 +4057,12 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (n_level_arity > 0)
-        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
+            fprintf(stderr, "Error: --arity shape refused by the factory\n");
+            return 1;
+        }
+    } else if (leaf_arity == 1)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);

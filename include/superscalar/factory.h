@@ -858,14 +858,17 @@ uint32_t factory_early_warning_time(const factory_t *f);
    - level_arities: per-level arity array; NULL or n_level_arity==0 means
      uniform leaf_arity
    - leaf_arity: used when level_arities is NULL/empty (3 = PS, 1/2 = DW)
+   - ps_subfactory_arity: k of factory_set_ps_subfactory_arity (0 or 1 =
+     one client per PS leaf, k > 1 = k² clients per PS leaf)
    - n_clients: client count (excludes LSP, so factory_clients_only)
    - static_threshold: top N tree depths are kickoff-only (Phase 3)
    - step_blocks / states_per_layer: per-DW-layer config (mainnet 144 / 4)
    Returns ewt in blocks: what factory_early_warning_time returns once the
-   shape is built with one client per PS leaf (PS leaves cost 0). */
+   shape is built (PS leaves cost 0). */
 uint32_t factory_compute_ewt_for_shape(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
+    uint32_t ps_subfactory_arity,
     size_t n_clients,
     uint32_t static_threshold,
     uint16_t step_blocks,

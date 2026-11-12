@@ -1603,9 +1603,13 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     factory_out->placement_mode = (placement_mode_t)rot_placement;
     factory_out->economic_mode = (economic_mode_t)rot_econ;
     memcpy(factory_out->profiles, rot_profiles, sizeof(rot_profiles));
-    if (rot_n_level_arity > 0)
-        factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity);
-    else if (rot_leaf_arity == 1)
+    if (rot_n_level_arity > 0) {
+        if (!factory_set_level_arity(factory_out, rot_level_arities, rot_n_level_arity)) {
+            fprintf(stderr, "Client %u: rotation tree shape refused\n", my_index);
+            free(rot_hashes);
+            return 0;
+        }
+    } else if (rot_leaf_arity == 1)
         factory_set_arity(factory_out, FACTORY_ARITY_1);
     else if (rot_leaf_arity == 3)
         factory_set_arity(factory_out, FACTORY_ARITY_PS);
@@ -2771,11 +2775,20 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
 
-    if (n_level_arity > 0)
-        factory_set_level_arity(factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0 &&
+        !factory_set_level_arity(factory, level_arities, n_level_arity)) {
+        fprintf(stderr, "Client: FACTORY_PROPOSE tree shape refused\n");
+        client_send_error(fd, "tree shape refused");
+        free(parsed_l_stock_hashes);
+        free(parsed_node_h_idx);
+        free(parsed_node_h);
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    } else if (n_level_arity == 0 && leaf_arity == 1)
         factory_set_arity(factory, FACTORY_ARITY_1);
-    else if (leaf_arity == 3)
+    else if (n_level_arity == 0 && leaf_arity == 3)
         factory_set_arity(factory, FACTORY_ARITY_PS);
     /* Apply static-near-root after the arity restore: it recomputes the
        DW counter shape based on f->level_arity / f->leaf_arity. */

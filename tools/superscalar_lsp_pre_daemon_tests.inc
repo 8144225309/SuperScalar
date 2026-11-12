@@ -408,12 +408,16 @@
                     exhibition_pass = 0;
                 } else {
                     /* Build Factory 1 locally */
+                    int exh_shape_ok = 1;
                     if (n_level_arity > 0)
-                        factory_set_level_arity(exh_f1, level_arities, n_level_arity);
+                        exh_shape_ok = factory_set_level_arity(exh_f1, level_arities, n_level_arity);
                     else if (leaf_arity == 1)
                         factory_set_arity(exh_f1, FACTORY_ARITY_1);
 
-                    if (!factory_init(exh_f1, ctx, exh_kps, n_total,
+                    if (!exh_shape_ok) {
+                        fprintf(stderr, "DW EXHIBITION Phase 3: tree shape refused\n");
+                        exhibition_pass = 0;
+                    } else if (!factory_init(exh_f1, ctx, exh_kps, n_total,
                                       step_blocks, states_per_layer)) {
                         fprintf(stderr, "DW EXHIBITION Phase 3: factory_init failed\n");
                         exhibition_pass = 0;
@@ -448,9 +452,12 @@
                                     /* Full re-init for clean state */
                                     factory_free(exh_f1);
                                     memset(exh_f1, 0, sizeof(*exh_f1));
-                                    if (n_level_arity > 0)
-                                        factory_set_level_arity(exh_f1, level_arities, n_level_arity);
-                                    else if (leaf_arity == 1)
+                                    if (n_level_arity > 0) {
+                                        if (!factory_set_level_arity(exh_f1, level_arities, n_level_arity)) {
+                                            fprintf(stderr, "DW EXHIBITION Phase 3: tree shape refused\n");
+                                            break;
+                                        }
+                                    } else if (leaf_arity == 1)
                                         factory_set_arity(exh_f1, FACTORY_ARITY_1);
                                     factory_init(exh_f1, ctx, exh_kps, n_total, step_blocks, states_per_layer);
                                     {
@@ -1067,13 +1074,15 @@
             ladder_factory_t *lf1 = &lad->factories[1];
             factory_t *f1 = &lf1->factory;
             memset(f1, 0, sizeof(factory_t));
+            int f1_shape_ok = 1;
             if (n_level_arity > 0)
-                factory_set_level_arity(f1, level_arities, n_level_arity);
+                f1_shape_ok = factory_set_level_arity(f1, level_arities, n_level_arity);
             else if (leaf_arity == 1)
                 factory_set_arity(f1, FACTORY_ARITY_1);
 
-            if (!factory_init(f1, ctx, all_kps, n_total, step_blocks, 4)) {
-                fprintf(stderr, "DUAL FACTORY TEST: factory_init failed\n");
+            if (!f1_shape_ok || !factory_init(f1, ctx, all_kps, n_total, step_blocks, 4)) {
+                fprintf(stderr, "DUAL FACTORY TEST: %s failed\n",
+                        f1_shape_ok ? "factory_init" : "tree shape");
                 jit_channels_cleanup(mgr);
                 if (use_db) persist_close(&db);
                 lsp_cleanup(lsp_p);

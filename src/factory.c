@@ -2825,6 +2825,21 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
     }
 }
 
+/* A per-leaf rollover advances counter layer 0 and resets every leaf layer to
+   its first, longest-delay state.  That is safe for a leaf only when a DW
+   state node above it counts down on layer 0: then the leaf's kickoff spends
+   a new output and the reset leaf state cannot race the superseded one.  A
+   leaf with no such ancestor (the root itself, or a leaf at or above the
+   first DW depth) would re-spend the same output with a longer delay than
+   its superseded state, so the superseded state would win; such a leaf
+   cannot advance past its own layer (the factory has to rotate). */
+static int leaf_rollover_moves_parent(const factory_t *f, size_t leaf_idx) {
+    for (int j = f->nodes[leaf_idx].parent_index; j >= 0; j = f->nodes[j].parent_index)
+        if (node_dw_layer(f, &f->nodes[j]) == &f->counter.layers[0])
+            return 1;
+    return 0;
+}
+
 int factory_advance_leaf(factory_t *f, int leaf_side) {
     if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
@@ -2855,6 +2870,11 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
     /* DW leaf: advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
         /* Leaf exhausted — advance root layer, reset all leaf layers */
+        if (!leaf_rollover_moves_parent(f, node_idx)) {
+            fprintf(stderr, "factory: leaf %d exhausted and no DW state above it "
+                    "moves on rollover; rotate the factory\n", leaf_side);
+            return 0;
+        }
         if (!dw_advance(&f->counter.layers[0]))
             return 0;  /* fully exhausted */
         f->counter.current_epoch++;
@@ -2926,6 +2946,11 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     /* DW leaf: advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
         /* Leaf exhausted — advance root layer, reset all leaf layers */
+        if (!leaf_rollover_moves_parent(f, node_idx)) {
+            fprintf(stderr, "factory: leaf %d exhausted and no DW state above it "
+                    "moves on rollover; rotate the factory\n", leaf_side);
+            return 0;
+        }
         if (!dw_advance(&f->counter.layers[0]))
             return 0;  /* fully exhausted */
         f->counter.current_epoch++;
@@ -5081,13 +5106,18 @@ static uint32_t shape_timed_levels(const uint8_t *level_arities,
 uint32_t factory_compute_ewt_for_shape(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
+    uint32_t ps_subfactory_arity,
     size_t n_clients,
     uint32_t static_threshold,
     uint16_t step_blocks,
     uint32_t states_per_layer)
 {
+    /* PS leaf capacity as ps_leaf_capacity / factory_set_ps_subfactory_arity. */
+    uint32_t k = ps_subfactory_arity;
+    if (k > (uint32_t)(FACTORY_MAX_OUTPUTS - 1)) k = (uint32_t)(FACTORY_MAX_OUTPUTS - 1);
+    size_t ps_cap = (k <= 1) ? 1 : (size_t)k * (size_t)k;
     uint32_t timed = shape_timed_levels(level_arities, n_level_arity, leaf_arity,
-                                        1, n_clients, static_threshold);
+                                        ps_cap, n_clients, static_threshold);
     if (timed == UINT32_MAX) return UINT32_MAX;
     return timed * dw_first_state_delay(step_blocks, states_per_layer);
 }
