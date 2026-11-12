@@ -7,10 +7,20 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <secp256k1.h>
 #include "superscalar/noise.h"
+
+/* The responder answers on a connection whose peer is already closed: that
+   write must fail with EPIPE, as in the daemons (which ignore SIGPIPE), not
+   kill the fuzzer. */
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    (void)argc; (void)argv;
+    signal(SIGPIPE, SIG_IGN);
+    return 0;
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 50) return 0;

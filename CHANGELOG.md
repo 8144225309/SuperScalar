@@ -14,6 +14,17 @@ Operator-visible behaviour changes.
 - **The preimage goes out only for an HTLC that pays the invoice.** Before it fulfils, the client daemon requires the HTLC to carry at least the invoiced amount (BOLT 4: never less) and to expire at least `CLIENT_MIN_FINAL_CLTV_DELTA` (18) blocks after its own chain tip (`client_htlc_pays_invoice`, `client_settle_invoice_htlc`). Otherwise it fails the HTLC back with `incorrect_or_unknown_payment_details`, keeps the preimage and leaves the invoice open. Without a chain tip the HTLC is failed.
 - **No invoice without fresh randomness.** Invoice preimages come from `getrandom`, else `/dev/urandom` (`client_new_invoice_preimage`). If neither can be read, no invoice is created and the client answers the LSP's `CREATE_INVOICE` with `MSG_ERROR`; the fixed fallback preimage is gone.
 
+### Reorg handling fixes (#201, #206, #210)
+
+- **False reorgs:** the tip height and hash were read with two RPCs, so a block arriving between them produced a mismatched pair and a later `FORWARD_REORG` that never happened. Both now come from one `getblockchaininfo` call (`regtest_get_tip`), and classification is a pure function (`lsp_reorg_classify`).
+- **Missed reorgs:** a block mined and replaced between two polls was not reported. `getchaintips` is now checked (`UNSEEN_BLOCK_REORG`), each disconnected branch is reported once, and a failed RPC keeps the stored tip (`INCONCLUSIVE`) instead of skipping the window.
+- **Factory channels frozen after any reorg:** revalidation looked up each channel's off-chain leaf txid, so every factory channel stopped accepting HTLCs and building commitments after any detected reorg and never recovered. It now checks the factory funding transaction (gone = neither confirmed nor in the mempool) and re-checks on every block while a channel is frozen or the funding is unconfirmed.
+- **Persisted freeze reloaded:** the v31 `funding_pending_reorg` column was written but never read back on LSP restart. `lsp_channels_init_from_db` now reloads it, and the first block's re-check clears it when the funding transaction is confirmed.
+- **Funding check independent of `-txindex`:** the factory funding is checked through its output (`gettxout`) and the block that confirmed it (schema v43 `funding_anchors`), so a funding transaction deeper than the lookup scan depth no longer reads as gone.
+- **RPC outage is not a missing funding:** `regtest_get_confirmations` returns `-2` when bitcoind could not be reached, and revalidation then changes nothing.
+- **Sub-factory chains kept:** reorg alarms no longer reset sub-factory chains (they are off-chain until a force-close). Resetting them broke force-close of advanced sub-factories.
+- **Reorgs during downtime:** the detector's last tip is stored (schema v43 `reorg_tips`) and compared on the first poll after a restart.
+
 ### Tree builder
 
 - **The factory is funded at the key its root spends.** The root kickoff aggregates the participants in placement order (`factory_compute_funding_spk`), but the LSP funding address, the rotation funding address and the persisted-factory reload derived the key from the participants in index order. With a placement mode and profiles that reorder the clients, the root could not spend the funding output (since PR #486 the build refuses it). All three now use `factory_compute_funding_spk`; new `lsp_compute_funding_spk` / `lsp_compute_funding_spk_for` give the script for an LSP's participants. A partial rotation funds the key of the cooperative clients it builds the new factory for, and aborts if one of them disconnects before the ceremony. `factory_client_to_leaf` now finds a member's channel in the built tree for every shape, so channels open on the leaf the placement put the member on.
@@ -31,6 +42,12 @@ Operator-visible behaviour changes.
 - **A factory without DW state is never refreshed in place.**  The root tick, the whole-counter advance, the root rollover of a leaf advance (DW or pseudo-Spilman), a member's root-driven Tier B and `--test-tier-b-rollover` refuse it with one message pointing to rotation; such a factory's life is extended only by rotating to a new funding output.  `--demo` no longer advances the DW counter of such a factory.
 - **The tree shape is stored with the factory** (schema v40: `level_arity`, `static_threshold_depth`, `ps_subfactory_arity`, `placement_mode`).  A restarted LSP and a reconnecting member used to rebuild every factory as a uniform tree; for any other shape that tree had different transactions from the signed one, and commitments signed after the restart spent a leaf output that can never exist.  The reload now rebuilds the stored shape and ties it to the signed tree in the database: every stored transaction must hash to its txid and spend its parent's stored output (the root the funding outpoint), and every rebuilt txid must match, except below a state that an advance or re-allocation moved on (a DW state, or a leaf or sub-factory state), which is loaded from its signed transaction; a kickoff, or an interior node of a tree without DW state, never differs.  **Any mismatch, or a factory with no stored tree, refuses the load.**  A factory stored before v40 loads with the default shape columns and is refused only if that rebuild does not match its signed tree.
 - **An LSP whose DB holds a factory it cannot load stops** (exit 1, with the reason) instead of waiting for clients for a new factory.
+
+### Reload and shutdown fixes
+
+- **A member whose stored factory is refused on reload stops.**  The member daemon used to treat the refusal as a lost connection and reload the same rows every second.  It now logs that the stored factory cannot be loaded and exits 1.
+- **A stored tree signature is checked on reload.**  Every stored tree transaction's key-path signature is verified against the output it spends (the funding output for the root, the parent's stored output otherwise); a signature that does not verify refuses the load for the LSP and the members.  The txid does not cover the witness, so a changed signature used to load and was found only when the transaction was broadcast.
+- **SIGINT and SIGTERM stop an LSP that is waiting for its members.**  The handlers are installed without `SA_RESTART`, so a blocked `accept()` or read returns; the LSP leaves the accept loop or the factory ceremony and exits 1 without writing a factory.
 
 ### Factory rotation is off by default
 
@@ -143,6 +160,20 @@ Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a
 - **LSP restart keeps the factory's expiry and its distribution TX:** the factory's lifecycle (creation block, ACTIVE and DYING lengths) and the co-signed distribution TX are persisted (schema v40); after a restart a factory found DYING starts its rotation and one found EXPIRED gets its distribution TX sent and retried as before.
 - **`--sweep-to-local` for any client:** the sweep loaded the channel stored under id 0 and initialised the channel of participant 1, so only that client could sweep; it now uses the client's own channel and participant index, and its fee follows `--fee-rate` (it is signed at sweep time), not the factory's pre-signed rate.
 - **Fee results checked:** commitment, JIT close and rotation close fees that cannot be computed (`FEE_INVALID`) fail the operation instead of wrapping into balances; a fee API's rates are clamped to 10000 sat/vB.
+
+### Pseudo-Spilman record-and-refuse fails closed
+
+- The client's PS signing refusal (`client_ps_signed_inputs`) fails closed: a lookup error, a sighash that cannot be computed or does not match the session's message, or a record insert that fails or loses to a conflicting record now aborts the advance before `MSG_LEAF_ADVANCE_FINAL` is sent. Previously each of these let the client sign, or send, without a durable record.
+- The record is a plain `INSERT` (first record wins) written before our partial sig enters the signing session, and a stored record with the same sighash is an idempotent retry rather than a refusal, so a crash between record and send no longer gets the LSP's identical retry refused.
+- The client now honours `SUPERSCALAR_CRASH_AT` at three checkpoints on this path: `ps_record_pre_save`, `ps_record_post_save`, `ps_record_post_final`. Operator-set and inert when unset; an empty value aborts at every checkpoint.
+- Tests in `tests/test_ps_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Record-and-refuse: ordering and failure semantics".
+
+### Pseudo-Spilman sub-factory chain advances: record-and-refuse per input
+
+- The client now records and refuses on PS sub-factory chain advances. A sub-factory chain[N+1] spends every output of chain[N] and the LSP picks `channel_idx` and `delta_sats`, but both client paths sent `MSG_SUBFACTORY_CLIENT_FINAL_PSIGS` with no record, so once the client was back at chain[N] the LSP could get a second, conflicting chain[N+1] co-signed.
+- Each input the client signs is now checked against `client_ps_signed_inputs` before any nonce and recorded (one row per input, the leaf's fail-closed rules) before the partial sigs are sent: a different spend of a recorded outpoint is refused, the identical retry is idempotent, and a failure on any input aborts with nothing sent.
+- A `PROPOSE_INTENT` whose `n_inputs` is not the chain tx's input count, or whose `subfactory_id` is not the sub-factory that `(leaf_side, sub_idx)` names, is refused before any local change. The single-input sub-factory ceremony, which signed, with no record, a message that is not the sighash of any input of the chain tx, is removed.
+- New client crash checkpoints `ps_sub_record_pre_save`, `ps_sub_record_post_save`, `ps_sub_record_post_final`. Tests in `tests/test_ps_subfactory_refusal.c`; the rules are in `docs/pseudo-spilman.md` §"Sub-factory chain advances: per-input record".
 
 ## v0.2.0 — 2026-07-02
 

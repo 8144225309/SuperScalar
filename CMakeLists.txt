@@ -298,6 +298,8 @@ add_executable(test_superscalar
     tests/test_open_terms.c
     tests/test_wire.c
     tests/test_channels.c
+    tests/test_ps_refusal.c
+    tests/test_ps_subfactory_refusal.c
     tests/spend_helpers.c
     tests/test_close_spendability_full.c
     tests/econ_helpers.c
@@ -386,6 +388,9 @@ add_executable(test_superscalar
     tests/test_scb_recovery.c
     tests/test_bolt9_features.c
     tests/test_reorg.c
+    tests/test_reorg_tip.c
+    tests/test_regtest_funding_reval.c
+    tests/test_chain_lookup_errors.c
     tests/test_cli_arity.c
     tests/test_client_dist.c
     tests/test_tree_shape.c
@@ -486,6 +491,12 @@ endif()
 
 # --- Fuzz targets (libFuzzer + ASan + UBSan) ---
 if(ENABLE_FUZZING)
+    # The library code the targets drive gets coverage feedback and the
+    # sanitizers too, not only the harness files.
+    foreach(fuzz_lib superscalar superscalar_secrets)
+        target_compile_options(${fuzz_lib} PRIVATE
+            -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined)
+    endforeach()
     set(FUZZ_SOURCES
         fuzz/fuzz_wire_recv.c
         fuzz/fuzz_wire_parse_json.c
@@ -494,6 +505,7 @@ if(ENABLE_FUZZING)
         fuzz/fuzz_hex_decode.c
         fuzz/fuzz_noise_handshake.c
         fuzz/fuzz_aead_decrypt.c
+        fuzz/fuzz_client_msg.c
     )
     foreach(fuzz_src ${FUZZ_SOURCES})
         get_filename_component(fuzz_name ${fuzz_src} NAME_WE)
@@ -502,6 +514,11 @@ if(ENABLE_FUZZING)
         target_include_directories(${fuzz_name} PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
         target_include_directories(${fuzz_name} PRIVATE ${cjson_SOURCE_DIR})
         target_link_libraries(${fuzz_name} superscalar secp256k1 cjson SQLite::SQLite3)
+        # The member's message handlers reach its commitment persistence,
+        # which lives in the secret-holding library.
+        if(fuzz_name STREQUAL "fuzz_client_msg")
+            target_link_libraries(${fuzz_name} superscalar_secrets)
+        endif()
         target_compile_options(${fuzz_name} PRIVATE
             -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined
             -fno-omit-frame-pointer)
