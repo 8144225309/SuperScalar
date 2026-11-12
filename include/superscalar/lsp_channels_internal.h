@@ -33,6 +33,14 @@ void lsp_channels_fail_channel(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 /* 1 if the client's factory channel or its JIT channel has failed. */
 int lsp_channels_client_failed(lsp_channel_mgr_t *mgr, size_t client_idx);
 
+/* Before an update replaces client_idx's factory-channel commitment: watch,
+   on that commitment, every HTLC the client offered us (sweeper_watch_htlc),
+   since the client may never revoke it.  A preimage learned later then arms
+   the claim there too (lsp_channels_register_htlc_claim); a verified
+   revocation of that commitment drops the watches.  Returns 1 (also with no
+   sweeper attached), 0 if a watch could not be stored. */
+int lsp_channels_watch_commitment(lsp_channel_mgr_t *mgr, size_t client_idx);
+
 /* Apply a client's REVOKE_AND_ACK for the commitment it just replaced on `ch`:
    parse it, check the next per-commitment point, and store the revocation
    secret (verified at the channel_receive_revocation choke point).  On

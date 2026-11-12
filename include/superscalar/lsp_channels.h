@@ -696,11 +696,14 @@ int lsp_channels_recv_client_reply(int fd, wire_msg_t *msg, uint8_t expected,
    Returns 1 when the exchange completed.  If it did not, the client's
    connection is dropped, so nothing further happens on a channel whose
    commitment is in doubt until the client reconnects and the pending
-   commitment is sent again. */
+   commitment is sent again.  With missing_is_fatal (a fulfil: the client
+   has the preimage) an exchange that does not complete fails the channel
+   instead, since the client may keep the commitment it replaced. */
 int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      size_t client_idx,
                                      uint64_t old_local, uint64_t old_remote,
-                                     const htlc_t *old_htlcs, size_t old_n_htlcs);
+                                     const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                     int missing_is_fatal);
 
 /* Give a client back the HTLC it offered for an outside payment that was
    never requested from the Lightning node, and close its origin.  The HTLC

@@ -731,7 +731,8 @@ size_t lsp_channels_run_deferred_bridge_msgs(lsp_channel_mgr_t *mgr, lsp_t *lsp)
 int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                      size_t client_idx,
                                      uint64_t old_local, uint64_t old_remote,
-                                     const htlc_t *old_htlcs, size_t old_n_htlcs) {
+                                     const htlc_t *old_htlcs, size_t old_n_htlcs,
+                                     int missing_is_fatal) {
     channel_t *ch = &mgr->entries[client_idx].channel;
     int fd = (lsp && lsp->client_fds) ? lsp->client_fds[client_idx] : -1;
     int done = 0;
@@ -771,7 +772,12 @@ int lsp_channels_commit_htlc_update(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         if (ack_msg.json) cJSON_Delete(ack_msg.json);
     }
 
-    if (!done) {
+    if (!done && missing_is_fatal) {
+        /* The client has the preimage and may keep the commitment this
+           update replaced: the channel fails (and is disconnected). */
+        lsp_channels_fail_channel(mgr, lsp, client_idx, ch, fd >= 0,
+            "no revoke_and_ack after a fulfil");
+    } else if (!done) {
         fprintf(stderr, "LSP: ERROR — commitment exchange with client %zu did "
                 "not complete (commitment %llu); dropping its connection until "
                 "it reconnects\n", client_idx,
@@ -811,7 +817,7 @@ static int fail_committed_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(fail);
     }
     lsp_channels_commit_htlc_update(mgr, lsp, client_idx, old_local, old_remote,
-                                     old_htlcs, old_n_htlcs);
+                                     old_htlcs, old_n_htlcs, 0);
     free(old_htlcs);
 
     if (mgr->persist) {
@@ -1340,7 +1346,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    claim cannot be armed, the preimage is not revealed and
                    the result is left unacknowledged, so the plugin repeats
                    it and arming is tried again. */
-                if (lsp_channels_register_htlc_claim(mgr, client_idx,
+                if (!lsp_channels_watch_commitment(mgr, client_idx) ||
+                    lsp_channels_register_htlc_claim(mgr, client_idx,
                                                      htlc_id_val,
                                                      preimage) < 0) {
                     fprintf(stderr, "LSP: CRITICAL: no on-chain claim for "
@@ -1349,6 +1356,17 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             (unsigned long long)htlc_id_val, client_idx);
                     free(old_htlcs);
                     return 0;
+                }
+                /* A failed channel gets no preimage: the HTLC is claimed on
+                   chain from whichever commitment the client broadcasts. */
+                if (ch->revocation_failed) {
+                    fprintf(stderr, "LSP: client %zu channel failed: preimage "
+                            "of HTLC %llu not revealed to it, claimed on chain "
+                            "if it broadcasts\n", client_idx,
+                            (unsigned long long)htlc_id_val);
+                    free(old_htlcs);
+                    rejected = "channel_failed";
+                    break;
                 }
 
                 /* Fulfill the HTLC on the client's channel; the client is
@@ -1377,7 +1395,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                    state has moved). */
                 lsp_channels_commit_htlc_update(mgr, lsp, client_idx,
                                                  old_local, old_remote,
-                                                 old_htlcs, old_n_htlcs);
+                                                 old_htlcs, old_n_htlcs, 1);
                 free(old_htlcs);
 
                 /* Persist balance + commitment_number + PCS/PCP + origin deactivation
