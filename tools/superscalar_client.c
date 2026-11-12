@@ -4027,6 +4027,10 @@ int main(int argc, char *argv[]) {
             vctx = NULL;
         }
 
+        /* A rotation after a reconnect checks the new funding output with
+           the same verifier as the first factory. */
+        client_set_funding_verifier(vfn, vctx);
+
         while (!g_shutdown) {
             if (first_run || !use_db) {
                 ok = client_run_with_channels(ctx, &kp, host, port,
