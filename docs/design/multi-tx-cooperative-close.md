@@ -1,8 +1,31 @@
 # Design proposal: multi-transaction cooperative close (large-factory payout)
 
 Status: **proposal / feature request** (research done, not implemented).
-Motivated by the signer-scaling work (256-signer factory proven; see
+Motivated by the signer-scaling work (MuSig2 signing proven at 256 signers; see
 `tools/test_musig_scale.c`, `tools/test_musig_session_scale.c`).
+
+## 0. Where this stands against the current code
+
+- **Factory size is capped well below the single-tx ceiling.** A factory
+  that carries a co-signed distribution TX is limited to 230 clients: that
+  one-output-per-client transaction must fit a 10 kvB TRUC transaction, and
+  the LSP refuses a larger factory before funding it. A cooperative close of
+  at most 230 clients is about 10 kB, a small fraction of the ~99 KB
+  standardness ceiling in section 1. The case this proposal solves (more than
+  ~2,300 funded clients) cannot arise until that cap is lifted, and the
+  distribution TX hits its own limit first. So this proposal is a follow-on
+  to whatever lifts the 230-client cap, and the same split-then-payout
+  staging would apply to the distribution TX as well as to the close.
+- **The default tree is advanceless.** Without `--arity` the tree has
+  kickoff-only interior levels, one member per pseudo-Spilman leaf and no
+  relative locks (`docs/factory-arity.md`). Where this document says "the
+  Decker-Wattenhofer tree" or "CSV-gated", read "the presigned factory
+  tree": a cooperative payout tree reuses the same machinery, and being
+  freshly signed it needs no relative lock either way.
+- **Fee bumping uses anchors.** Presigned tree transactions carry a
+  pay-to-anchor output and are bumped by a CPFP child at exit; nothing is
+  replaced by RBF. Any payout tree here would follow the same rule (open
+  question 4).
 
 ## 1. Problem
 
@@ -15,7 +38,7 @@ Two facts bound how large that one tx gets:
 
 - **Empty channels cost nothing.** `build_close_outputs` folds every sub-dust
   balance (`< 546` sats, including never-funded 0-balance channels) into the LSP
-  output and emits no output for it (`lsp_channels.c:6156-6162`). So tx size
+  output and emits no output for it. So tx size
   tracks **funded** channels, not signer count. Signing cost tracks *all*
   signers (one 64-byte aggregate — proven to scale to 2048); output count tracks
   *funded* clients only. The two are decoupled.
@@ -57,7 +80,7 @@ Depth-2 handles `K × 2,300` clients (e.g. `K=5` → ~11,500). Deeper/wider tree
 scale further; fanout vs depth is a fee/latency tradeoff.
 
 This is the same **presigned-transaction-tree** primitive the factory already
-uses for the Decker-Wattenhofer tree and unilateral exit — reused as a
+uses for its tree and unilateral exit — reused as a
 **cooperative, CSV-free, freshly-signed** shallow tree at close time.
 
 ## 3. The requester's mechanism — validated, with corrections
@@ -103,8 +126,8 @@ build-today path**; CTV is a future simplification.
 
 ## 5. Relationship to existing code
 
-- The unilateral **force-close already is** a presigned multi-tx walk of the DW
-  tree (topological multi-pass, CSV-gated). The machinery (nodes, per-node
+- The unilateral **force-close already is** a presigned multi-tx walk of the
+  factory tree (topological multi-pass). The machinery (nodes, per-node
   keyaggs, presigned spends) exists.
 - This proposal adds a **cooperative** shallow tree used only at close: fresh
   sub-aggregate keys for buckets, no CSV (cooperative), one extra signing round
@@ -125,9 +148,11 @@ build-today path**; CTV is a future simplification.
    presigned before contributing to the split).
 3. **Fee accounting across the tree** — split outputs must fund payout fees;
    K+1 txs cost more total fee than one; how to distribute the fee fairly.
-4. **Fee-bumping** — presigned txs can't be RBF'd; needs CPFP/anchors. This
-   inherits the fee-race / pinning concerns already tracked for the single-tx
-   close (see the fee-race/pinning/1p1c design work). Anchor outputs per tree tx?
+4. **Fee-bumping** — presigned txs can't be RBF'd; they need an anchor and a
+   CPFP child, as the factory tree does. This inherits the fee-race / pinning
+   concerns already tracked for the single-tx close (see the
+   fee-race/pinning/1p1c design work). One anchor per tree tx, within the
+   TRUC (v3) package limits.
 5. **Broadcast strategy** — package relay (bounded K per package) vs sequential
    (split confirms first). Reorg behavior of the tree.
 6. **Interaction with unilateral exit** — if the cooperative close stalls after
@@ -145,8 +170,8 @@ reusing machinery the factory already has for unilateral exit. It is, however, a
 **real feature** (bucketing, intermediate keys, multi-level ceremony, staged
 broadcast, fee accounting), **not** a small change.
 
-**Recommendation:** keep it **out of the signer-scaling PR** (which stays
-single-tx and validates the ceiling: a ~99 KB / ~2,300-output close that lands
-on signet, plus a ~430 KB oversized close that our code builds and signet
-rejects — pinning the exact limit). Track this multi-tx cooperative close as its
-own feature, scheduled after the scaling harness lands.
+**Recommendation:** keep the cooperative close single-tx for now. With the
+230-client factory limit (section 0) a single close is far inside the
+standardness ceiling, so this is not needed today. Track the multi-tx close as
+its own feature, to be scheduled together with any change that lifts the
+230-client limit.
