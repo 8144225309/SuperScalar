@@ -139,7 +139,8 @@ $BCLI generatetoaddress 6 "$ADDR" > /dev/null
 
 # --- Step 3: LSP (127 clients) with CLI FIFO ---
 mkfifo "$LSP_FIFO"; sleep infinity > "$LSP_FIFO" & FIFO_HOLDER_PID=$!
-FACTORY_CLTV=$(( $($BCLI getblockcount) + 600 ))
+# past the end of --active-blocks 500, plus the 102 blocks the LSP mines first
+FACTORY_CLTV=$(( $($BCLI getblockcount) + 700 ))
 info "starting LSP: $N_CLIENTS clients, cltv=$FACTORY_CLTV"
 stdbuf -oL "$LSP_BIN" \
     --daemon --cli --network regtest --port "$PORT" \

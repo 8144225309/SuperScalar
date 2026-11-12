@@ -9,6 +9,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/ladder.h"
+#include "superscalar/cli_arity.h"
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/musig.h"
@@ -1117,7 +1118,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     {
         int cur_h = regtest_get_block_height(rt);
         if (cur_h > 0) {
-            int offset = mgr->rot_is_regtest ? 35 : 1008;
+            /* Members refuse a timeout that leaves no room for their exit. */
+            uint32_t offset = cli_factory_auto_cltv_offset(
+                mgr->rot_is_regtest ? 35 : 1008,
+                cli_factory_exit_blocks(NULL, 0, saved_arity, 1, lsp->n_clients, 0,
+                                        mgr->rot_step_blocks,
+                                        mgr->rot_states_per_layer));
             new_cltv = (uint32_t)cur_h + offset;
         }
     }

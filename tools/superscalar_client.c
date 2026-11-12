@@ -30,6 +30,7 @@
 #include "superscalar/splice.h"
 #include "superscalar/lsp_wellknown.h"
 #include "superscalar/factory_recovery.h"
+#include "superscalar/client_dist.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -986,6 +987,26 @@ static uint32_t client_tool_chain_tip(void *ctx) {
     return h > 0 ? (uint32_t)h : 0;
 }
 
+/* The factory's distribution TX: broadcast by this client once it is due
+   and the factory is still open.  Checked from the daemon loop and from the
+   reconnect loop, so it does not depend on the LSP being reachable. */
+static client_dist_watch_t g_dist_watch;
+
+/* The distribution TX goes out through the CPFP path, like every pre-signed
+   transaction of this client: alone when it pays the node's floor, else as a
+   package with a child on its anchor. */
+static int client_dist_send_cpfp(chain_backend_t *chain, const char *tx_hex,
+                                  char *txid_out) {
+    return cpfp_send_default(chain, tx_hex, txid_out) != CPFP_FAILED;
+}
+
+static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
+                                             secp256k1_context *ctx) {
+    if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
+    return client_dist_watch(&g_dist_watch, db, ctx, wt->chain, client_dist_send_cpfp,
+                             10, stdout);
+}
+
 static void client_keep_funding_leaf(persist_t *db, const factory_t *factory,
                                      const channel_t *ch, uint32_t my_index);
 
@@ -1270,6 +1291,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 last_wt = tnow;
                 watchtower_check(cbd->wt);
             }
+            if (cbd && cbd->db)
+                client_dist_tick(cbd->db, cbd->wt, ctx);
             /* Periodic fee settlement verification: compare expected share
                (from tracked routing volume) to actual balance increase. */
             static time_t last_fee_check = 0;
@@ -2713,17 +2736,36 @@ static void client_send_distribution_tx(persist_t *db, chain_backend_t *chain,
     }
 }
 
-/* One pass of this client's unilateral exit from its own DB: publish the
-   tree transactions on the path from the factory root to this client's leaf,
-   then the client's signed commitment, then (as the nLockTime fallback) the
-   distribution TX. Tree levels mature one relative timelock at a time, so the
-   caller repeats the pass after new blocks until it returns
-   CLIENT_EXIT_PUBLISHED: the commitment has been accepted, which a node only
-   does once the whole path below it is in the mempool or a block. */
+/* One pass of this client's unilateral exit from its own DB.  Once the
+   factory's distribution TX is due (its nLockTime reached, the funding output
+   known unspent) or already published, it is the exit: the tree would spend
+   the funding output and make it invalid, so nothing of the tree is
+   published and the pass returns CLIENT_EXIT_PUBLISHED when the TX is in the
+   mempool or a block, CLIENT_EXIT_STUCK when the node refuses it.  Otherwise
+   it publishes the tree transactions on the path from the factory root to
+   this client's leaf, then the client's signed commitment. Tree levels
+   mature one relative timelock at a time, so the caller repeats the pass
+   after new blocks until it returns CLIENT_EXIT_PUBLISHED: the commitment
+   has been accepted, which a node only does once the whole path below it is
+   in the mempool or a block. */
 static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
     extern void hex_encode(const unsigned char *, size_t, char *);
     int state;
     cpfp_need_clear();
+
+    client_dist_status_t dist_status = CLIENT_DIST_NONE;
+    if (client_dist_force_close(db, chain, client_dist_send_cpfp, stdout, &dist_status)) {
+        /* Below the node's floor the distribution TX goes in only as a
+           package with a fee-paying child: without a coin for it no further
+           pass helps. */
+        if (cpfp_need_seen() != CPFP_NEED_NONE) {
+            fprintf(stderr, "Force-close: ERROR: the distribution TX needs a "
+                    "fee-paying child: %s\n", cpfp_need_text(cpfp_need_seen()));
+            return CLIENT_EXIT_FAILED;
+        }
+        return dist_status == CLIENT_DIST_REFUSED ? CLIENT_EXIT_STUCK
+                                                  : CLIENT_EXIT_PUBLISHED;
+    }
 
     /* The exit path ends at the tree node that funds this client's channel.
        A DB that does not name it gets the whole tree published instead. */
@@ -2842,9 +2884,6 @@ static int client_exit_pass(persist_t *db, chain_backend_t *chain) {
         }
     }
     free(commit_tx);
-
-    /* Broadcast distribution TX as nLockTime fallback */
-    client_send_distribution_tx(db, chain, 0);
     /* A pre-signed tx the node takes only with a fee-paying child, and no
        child could be funded: no further pass helps, the operator must give
        the exit an on-chain coin (--wallet) or a package-relay backend. */
@@ -3506,31 +3545,6 @@ int main(int argc, char *argv[]) {
         printf("Sweep: loaded commitment TX (cn=%llu, %zu bytes)\n",
                (unsigned long long)sig_cn, commit_tx_len);
 
-        /* Load basepoints.  The client's channel is stored under its slot in
-           the factory (participant index - 1), not always 0: take the one
-           channel this DB holds. */
-        unsigned char local_secs[4][32];
-        unsigned char remote_bps_raw[4][33];
-        uint32_t sweep_chan_id = 0;
-        int have_bps = 0;
-        for (uint32_t cid = 0; cid < FACTORY_MAX_SIGNERS && !have_bps; cid++) {
-            if (persist_load_basepoints(&db, cid, local_secs, remote_bps_raw)) {
-                sweep_chan_id = cid;
-                have_bps = 1;
-            }
-        }
-
-        /* Load channel state (balances + commitment number) */
-        uint64_t local_amt = 0, remote_amt = 0;
-        uint64_t cn = 0;
-        persist_load_channel_state(&db, sweep_chan_id, &local_amt, &remote_amt, &cn);
-
-        if (!have_bps) {
-            fprintf(stderr, "ERROR: no basepoints in DB\n");
-            persist_close(&db);
-            return 1;
-        }
-
         /* Load factory (needed for funding info) */
         secp256k1_context *sweep_ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -3539,19 +3553,6 @@ int main(int argc, char *argv[]) {
         if (!sweep_factory || !persist_load_factory(&db, 0, sweep_factory, sweep_ctx)) {
             fprintf(stderr, "ERROR: failed to load factory from DB\n");
             free(sweep_factory);
-            secp256k1_context_destroy(sweep_ctx);
-            persist_close(&db);
-            return 1;
-        }
-
-        /* Parse remote basepoints */
-        secp256k1_pubkey r_pay, r_delay, r_revoc, r_htlc;
-        if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
-            !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33)) {
-            fprintf(stderr, "ERROR: failed to parse remote basepoints\n");
-            factory_free(sweep_factory); free(sweep_factory);
             secp256k1_context_destroy(sweep_ctx);
             persist_close(&db);
             return 1;
@@ -3577,36 +3578,61 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair_create(sweep_ctx, &sweep_kp, sweep_seckey);
         memset(sweep_seckey, 0, 32);
 
-        /* Initialize channel using the same path as reconnect, for this
-           client's own participant index in the factory */
-        channel_t sweep_ch;
+        /* This client's index in the factory, found from its own key as the
+           reconnect path does; its channel row and basepoints are stored
+           under slot index - 1. */
         uint32_t sweep_my_index = 0;
         {
-            secp256k1_pubkey my_pk;
-            unsigned char a[33], b[33];
-            size_t al = 33, bl = 33;
-            if (secp256k1_keypair_pub(sweep_ctx, &my_pk, &sweep_kp) &&
-                secp256k1_ec_pubkey_serialize(sweep_ctx, a, &al, &my_pk,
+            secp256k1_pubkey my_pub;
+            unsigned char mine[33], other[33];
+            size_t mine_len = 33;
+            if (secp256k1_keypair_pub(sweep_ctx, &my_pub, &sweep_kp) &&
+                secp256k1_ec_pubkey_serialize(sweep_ctx, mine, &mine_len, &my_pub,
                                               SECP256K1_EC_COMPRESSED)) {
-                for (size_t pi = 1; pi < sweep_factory->n_participants; pi++) {
-                    bl = 33;
-                    if (secp256k1_ec_pubkey_serialize(sweep_ctx, b, &bl,
-                                                      &sweep_factory->pubkeys[pi],
+                for (size_t k = 1; k < sweep_factory->n_participants; k++) {
+                    size_t other_len = 33;
+                    if (secp256k1_ec_pubkey_serialize(sweep_ctx, other, &other_len,
+                                                      &sweep_factory->pubkeys[k],
                                                       SECP256K1_EC_COMPRESSED) &&
-                        memcmp(a, b, 33) == 0) {
-                        sweep_my_index = (uint32_t)pi;
+                        memcmp(mine, other, 33) == 0) {
+                        sweep_my_index = (uint32_t)k;
                         break;
                     }
                 }
             }
         }
-        if (sweep_my_index == 0) {
-            fprintf(stderr, "ERROR: this key is not a client of the factory in the DB\n");
+        uint64_t local_amt = 0, remote_amt = 0;
+        uint64_t cn = 0;
+        unsigned char local_secs[4][32] = {{0}};
+        unsigned char remote_bps_raw[4][33] = {{0}};
+        secp256k1_pubkey r_pay = {{0}}, r_delay = {{0}}, r_revoc = {{0}}, r_htlc = {{0}};
+        const char *sweep_err = NULL;
+        if (sweep_my_index == 0)
+            sweep_err = "the keyfile's key is not a client of the factory in this DB";
+        else if (!persist_load_channel_state(&db, sweep_my_index - 1, &local_amt,
+                                             &remote_amt, &cn))
+            sweep_err = "no channel state in DB";
+        else if (!persist_load_basepoints(&db, sweep_my_index - 1, local_secs,
+                                          remote_bps_raw))
+            sweep_err = "no basepoints in DB";
+        else if (!secp256k1_ec_pubkey_parse(sweep_ctx, &r_pay, remote_bps_raw[0], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_delay, remote_bps_raw[1], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_revoc, remote_bps_raw[2], 33) ||
+                 !secp256k1_ec_pubkey_parse(sweep_ctx, &r_htlc, remote_bps_raw[3], 33))
+            sweep_err = "failed to parse remote basepoints";
+        if (sweep_err) {
+            fprintf(stderr, "ERROR: %s\n", sweep_err);
+            memset(local_secs, 0, sizeof(local_secs));
             factory_free(sweep_factory); free(sweep_factory);
             secp256k1_context_destroy(sweep_ctx);
             persist_close(&db);
             return 1;
         }
+        printf("Sweep: client %u (channel slot %u)\n", sweep_my_index,
+               sweep_my_index - 1);
+
+        /* Initialize channel using the same path as reconnect */
+        channel_t sweep_ch;
         if (!client_init_channel(&sweep_ch, sweep_ctx, sweep_factory, &sweep_kp,
                                   sweep_my_index,
                                   &r_pay, &r_delay, &r_revoc, &r_htlc,
@@ -4379,11 +4405,40 @@ int main(int argc, char *argv[]) {
                    detect on-chain breaches even when the LSP is unreachable. */
                 if (cbd.wt)
                     watchtower_check(cbd.wt);
+                /* The factory's end date pays the members without the LSP.
+                   Once its TX is buried to the close depth and nothing is
+                   left to watch, the daemon stops; otherwise it keeps
+                   running the watchtower. */
+                if (use_db &&
+                    client_dist_tick(&db, cbd.wt, ctx) == CLIENT_DIST_CONFIRMED) {
+                    chain_backend_t *cb = cbd.wt ? cbd.wt->chain : NULL;
+                    size_t watched = cbd.wt ? cbd.wt->n_entries + cbd.wt->n_pending : 0;
+                    if (client_dist_may_exit(g_dist_watch.confs,
+                                             chain_close_confs(cb, cb && cb->is_regtest),
+                                             cbd.jit_ch != NULL, watched)) {
+                        printf("Client: the factory is settled by its distribution "
+                               "TX (%d confirmations); nothing left to watch, "
+                               "exiting\n", g_dist_watch.confs);
+                        ok = 1;
+                        break;
+                    }
+                    static int keep_reported = 0;
+                    if (!keep_reported) {
+                        keep_reported = 1;
+                        printf("Client: the factory is settled by its distribution "
+                               "TX; still running: %d confirmations (close depth %d), %zu "
+                               "watched commitment(s)/penalty(ies), JIT channel %s\n",
+                               g_dist_watch.confs,
+                               chain_close_confs(cb, cb && cb->is_regtest), watched,
+                               cbd.jit_ch ? "open" : "none");
+                    }
+                }
                 sleep(1);
             } else {
                 break;  /* clean exit */
             }
         }
+        client_dist_watch_free(&g_dist_watch);
         if (cbd.force_close_requested)
             client_force_close_from_db(db_path, network, cli_path,
                                        rpcuser, rpcpassword, datadir, rpcport);

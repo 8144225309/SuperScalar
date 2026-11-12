@@ -154,8 +154,9 @@ FIFO_HOLDER_PID=$!
 # (lsp_channels.c:849) with > factory_delta (~144) of headroom to unwind the DW
 # tree on-chain. The regtest auto-CLTV is only current+35 -- too short for a
 # standard final_cltv_delta -- so pin the factory to a production-like lifetime
-# (matching --active-blocks 500 below). The CLTV safety check itself is unchanged.
-FACTORY_CLTV=$(( $($BCLI getblockcount) + 500 ))
+# (past the end of --active-blocks 500 below, plus the 102 blocks the LSP mines
+# before creating the factory on regtest). The CLTV safety check itself is unchanged.
+FACTORY_CLTV=$(( $($BCLI getblockcount) + 700 ))
 stdbuf -oL $LSP_BIN \
     --daemon \
     --cli \

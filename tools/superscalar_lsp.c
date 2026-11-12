@@ -210,7 +210,7 @@ static void usage(const char *prog) {
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
         "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
-        "  --cltv-timeout N    Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest)\n"
+        "  --cltv-timeout N    Factory CLTV timeout (absolute block height, at least creation + active + dying blocks and past a member exit; auto: that, minimum +35 on regtest, +10 elsewhere)\n"
         "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
@@ -2608,6 +2608,14 @@ int main(int argc, char *argv[]) {
         printf("LSP: shape ewt = %u blocks (BOLT 2016 ceiling = %u)\n",
                ewt, CLI_ARITY_BOLT2016_CEILING);
     }
+    /* Worst-case blocks a member's exit takes from creation; the factory
+       timeout must leave that much room, and members check it too. */
+    uint32_t factory_exit_blocks = cli_factory_exit_blocks(
+        n_level_arity > 0 ? level_arities : NULL, n_level_arity,
+        (factory_arity_t)leaf_arity,
+        (uint32_t)(ps_subfactory_arity_arg > 1 ? ps_subfactory_arity_arg : 1),
+        (size_t)n_clients, static_near_root,
+        step_blocks, (uint32_t)states_per_layer);
 
     /* Mainnet DW-step safety floor: reject a too-small --step-blocks on
        mainnet (thin reorg / fee-race margin).  Non-mainnet chains pass so
@@ -3815,6 +3823,30 @@ accept_new_factory:
         return 1;
     }
 
+    /* An explicit --cltv-timeout is checked before any coins move, against
+       the block the factory will be created at: on regtest up to 103 blocks
+       later (the blocks mined below), elsewhere after the funding
+       confirmations plus a margin.  The creation check judges it by the same
+       block, so it cannot refuse a factory that is already funded. */
+    uint32_t cltv_planned_created = 0;
+    if (cltv_timeout_arg > 0 && rt_ok) {
+        int h = regtest_get_block_height(&rt);
+        char cltv_err[512];
+        if (h > 0)
+            cltv_planned_created = (uint32_t)h + (is_regtest ? 103u
+                : (uint32_t)chain_funding_confs(chain_be, 0) + CLI_FACTORY_CLTV_MARGIN);
+        if (h > 0 &&
+            !cli_validate_factory_cltv((uint32_t)cltv_timeout_arg, cltv_planned_created,
+                                       active_blocks, dying_blocks, factory_exit_blocks,
+                                       cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "%s\n", cltv_err);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
     /* === Phase 2: Compute funding address === */
     size_t n_total = 1 + lsp_p->n_clients;
     secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
@@ -4138,9 +4170,37 @@ accept_new_factory:
         if (cltv_timeout_arg > 0) {
             cltv_timeout = (uint32_t)cltv_timeout_arg;
         } else if (cur_height > 0) {
-            /* Auto: regtest +35 blocks, non-regtest = factory lifetime + 10 block buffer */
-            int offset = is_regtest ? 35 : (int)(active_blocks + dying_blocks + 10);
+            /* Auto: the factory lifetime, at least 35 blocks on regtest,
+               plus a 10-block buffer elsewhere; and past a member's exit */
+            uint32_t life = active_blocks + dying_blocks;
+            uint32_t offset = cli_factory_auto_cltv_offset(
+                is_regtest ? (life > 35 ? life : 35) : life + 10, factory_exit_blocks);
             cltv_timeout = (uint32_t)cur_height + offset;
+        }
+        /* An explicit timeout was checked against the planned creation block
+           before funding; it is judged by the same block here. */
+        uint32_t created_for_check = cur_height > 0 ? (uint32_t)cur_height : 0;
+        if (cltv_timeout_arg > 0 && cltv_planned_created > 0) {
+            if (created_for_check > cltv_planned_created)
+                fprintf(stderr, "LSP: WARNING: the factory is created at block %u, "
+                        "%u blocks later than planned; its CLTV timeout %u leaves "
+                        "that much less room\n", created_for_check,
+                        created_for_check - cltv_planned_created, cltv_timeout);
+            created_for_check = cltv_planned_created;
+        }
+        char cltv_err[512];
+        if (created_for_check > 0 &&
+            !cli_validate_factory_cltv(cltv_timeout, created_for_check,
+                                       active_blocks, dying_blocks, factory_exit_blocks,
+                                       cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "%s\nLSP: refusing to create the factory. Its funding "
+                    "output %s:%u is already confirmed; it is spendable only by "
+                    "all members together.\n", cltv_err, funding_txid_hex,
+                    funding_vout);
+            lsp_abort_ceremony(lsp_p, "factory CLTV timeout too early");
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
         }
     }
 

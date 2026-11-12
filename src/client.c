@@ -1,4 +1,5 @@
 #include "superscalar/client.h"
+#include "superscalar/cli_arity.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
@@ -2063,6 +2064,18 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     cJSON *rsnr_item = cJSON_GetObjectItem(pj, "static_threshold_depth");
     uint32_t rot_static_threshold =
         (rsnr_item && cJSON_IsNumber(rsnr_item)) ? (uint32_t)rsnr_item->valuedouble : 0;
+    {
+        char cltv_err[320];
+        uint32_t exit_blocks = cli_factory_exit_blocks(
+            rot_n_level_arity > 0 ? rot_level_arities : NULL, rot_n_level_arity,
+            (factory_arity_t)rot_leaf_arity, 1, n_participants - 1,
+            rot_static_threshold, step_blocks, states_per_layer);
+        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+                                        cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "Client %u: REFUSING rotation: %s\n", my_index, cltv_err);
+            return 0;
+        }
+    }
 
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *rpm_item = cJSON_GetObjectItem(pj, "placement_mode");
@@ -3175,6 +3188,25 @@ int client_run_with_channels(secp256k1_context *ctx,
     cJSON *psa_item = cJSON_GetObjectItem(msg.json, "ps_subfactory_arity");
     uint32_t ps_subfactory_arity_in =
         (psa_item && cJSON_IsNumber(psa_item)) ? (uint32_t)psa_item->valuedouble : 0;
+
+    /* The timeout must leave room for this member's exit from the proposed
+       tree, computed from the proposal's shape as the builder does. */
+    {
+        char cltv_err[320];
+        uint32_t exit_blocks = cli_factory_exit_blocks(
+            n_level_arity > 0 ? level_arities : NULL, n_level_arity,
+            (factory_arity_t)leaf_arity,
+            ps_subfactory_arity_in > 1 ? ps_subfactory_arity_in : 1, n_participants - 1,
+            static_threshold_depth, step_blocks, states_per_layer);
+        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+                                        cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "Client: REFUSING factory: %s\n", cltv_err);
+            client_send_error(fd, "factory CLTV timeout is not safely in the future");
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            return 0;
+        }
+    }
 
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *pm_item = cJSON_GetObjectItem(msg.json, "placement_mode");
