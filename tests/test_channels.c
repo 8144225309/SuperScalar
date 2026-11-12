@@ -744,6 +744,8 @@ int test_regtest_intra_factory_payment(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -1136,6 +1138,8 @@ static int run_multi_payment_for_arity(int arity_code, const char *wallet_label,
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) return 0;
@@ -2356,6 +2360,8 @@ int test_regtest_lsp_restart_recovery(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
@@ -2930,6 +2936,8 @@ int test_regtest_crash_double_recovery(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
@@ -3402,6 +3410,8 @@ int test_regtest_tcp_reconnect(void) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (unsigned)(c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]))
@@ -4615,6 +4625,8 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
         pid_t pid = fork();
         if (pid == 0) {
             usleep(100000 * (c + 1));
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *child_ctx = test_ctx();
             secp256k1_keypair child_kp;
             if (!secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1])) _exit(1);
