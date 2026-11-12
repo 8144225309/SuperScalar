@@ -150,7 +150,7 @@ int test_regtest_recovery_waits_for_confirmed_parent(void) {
         /* three passes back to back, nothing mined in between */
         for (int pass = 0; pass < 3; pass++) {
             char status[256];
-            factory_recovery_run(&p, &cb, 0, status, sizeof(status));
+            factory_recovery_run(&p, &cb, 0, NULL, NULL, status, sizeof(status));
             for (size_t i = 0; i < f->n_nodes; i++) {
                 if (mempool_field(&rt, txids[i], "vsize") < 0) continue;
                 int par = f->nodes[i].parent_index;

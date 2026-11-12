@@ -333,10 +333,10 @@ if [ "$SOLO" = 1 ]; then
             fc_run "$i" "$pass"
             if [ "$first" = 1 ] && [ "$i" = "$EXPECT_NOCOIN" ]; then
                 grep -a "CPFP: ERROR" "$TMPDIR/fc_last_${i}.log" | head -1
-                grep -a "FORCE-CLOSE STUCK" "$TMPDIR/fc_last_${i}.log" | head -1
+                grep -a "FORCE-CLOSE FAILED" "$TMPDIR/fc_last_${i}.log" | head -1
                 [ "${FCRC[$i]}" = 1 ] &&
                 grep -q "needs a fee-paying child: no wallet coin available" "$TMPDIR/fc_last_${i}.log" &&
-                grep -q "FORCE-CLOSE STUCK" "$TMPDIR/fc_last_${i}.log" &&
+                grep -q "FORCE-CLOSE FAILED" "$TMPDIR/fc_last_${i}.log" &&
                 ! grep -q "FORCE-CLOSE COMPLETE" "$TMPDIR/fc_last_${i}.log" \
                     || { tail -15 "$TMPDIR/fc_last_${i}.log"; fail "client $i without a coin did not report its stuck exit (status ${FCRC[$i]})"; }
                 green "  client $i, first to exit, no wallet coin, tree at rate 0: --force-close exits 1, 'needs a fee-paying child: no wallet coin available'"
@@ -366,7 +366,7 @@ for pass in $(seq 1 60); do
         for i in $(seq 0 $((N_CLIENTS-1))); do
             if [ "${FCRC[$i]}" = 1 ] &&
                grep -q "needs a fee-paying child: no wallet coin available" "$TMPDIR/fc_last_${i}.log" &&
-               grep -q "FORCE-CLOSE STUCK" "$TMPDIR/fc_last_${i}.log" &&
+               grep -q "FORCE-CLOSE FAILED" "$TMPDIR/fc_last_${i}.log" &&
                ! grep -q "FORCE-CLOSE COMPLETE" "$TMPDIR/fc_last_${i}.log"; then
                 NSTUCK=$((NSTUCK+1))
             fi

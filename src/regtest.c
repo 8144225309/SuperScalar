@@ -1382,6 +1382,21 @@ int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
     return 0;
 }
 
+int regtest_parse_gettxout(const char *result) {
+    if (!result) return -1;
+    const char *end = NULL;
+    cJSON *j = cJSON_ParseWithOpts(result, &end, 1);
+    if (!j) return -1;
+    int r = -1;
+    if (cJSON_IsNull(j))
+        r = 0;
+    else if (cJSON_IsObject(j) && cJSON_GetObjectItem(j, "value") &&
+             cJSON_GetObjectItem(j, "scriptPubKey"))
+        r = 1;
+    cJSON_Delete(j);
+    return r;
+}
+
 /* SF-RR #150: check outpoint unspent via bitcoin-cli gettxout. */
 int regtest_outpoint_unspent(regtest_t *rt, const char *txid_hex_display,
                               uint32_t vout) {
@@ -1391,9 +1406,27 @@ int regtest_outpoint_unspent(regtest_t *rt, const char *txid_hex_display,
              txid_hex_display, (unsigned)vout);
     char *result = regtest_exec(rt, "gettxout", params);
     if (!result) return -1;
-    int spent = (result[0] == '\0' || strncmp(result, "null", 4) == 0);
+    int r = regtest_parse_gettxout(result);
     free(result);
-    return spent ? 0 : 1;
+    return r;
+}
+
+int regtest_outpoint_spent_confirmed(regtest_t *rt,
+                                      const char *txid_hex_display,
+                                      uint32_t vout) {
+    if (!rt || !txid_hex_display) return -1;
+    int confs = regtest_get_confirmations(rt, txid_hex_display);
+    if (confs < 0) return -1;
+    if (confs == 0) return 0;
+    char params[128];
+    snprintf(params, sizeof(params), "%s %u false",
+             txid_hex_display, (unsigned)vout);
+    char *result = regtest_exec(rt, "gettxout", params);
+    if (!result) return -1;
+    int r = regtest_parse_gettxout(result);
+    free(result);
+    if (r < 0) return -1;
+    return r == 0 ? 1 : 0;
 }
 
 int regtest_get_raw_tx(regtest_t *rt, const char *txid,

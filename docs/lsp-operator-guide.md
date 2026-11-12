@@ -188,7 +188,7 @@ Press **Ctrl+C**. The LSP will:
 | `--confirm-timeout` | 3600 (regtest) / 7200 (other) | Max seconds to wait for tx confirmation |
 | `--accept-timeout` | 0 (unlimited) | Max seconds to wait for each client to connect |
 | `--active-blocks` | 20 (regtest) / 4320 (other) | Factory active period in blocks |
-| `--dying-blocks` | 10 (regtest) / 432 (other) | Factory dying period (rotation window) |
+| `--dying-blocks` | 10 (regtest) / 432 (other) | Factory dying period (the rotation window, when rotation is enabled) |
 | `--fee-rate` | 1000 | Fee rate in sat/kvB |
 | `--tree-fee-rate N` | 100 | The factory's agreed pre-signed rate (sat/kvB), proposed in FACTORY_PROPOSE: every tree tx, the distribution TX and the commitments pay exactly it for their size; 0 = no fee (0-value anchors, every exit tx needs a CPFP child). Never taken from a fee estimate. Clients refuse a rate above their own `--max-tree-fee-rate` (default 10000). A factory with more than 230 clients is refused before funding: its distribution TX would not fit a TRUC transaction |
 
@@ -214,8 +214,33 @@ Press **Ctrl+C**. The LSP will:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--no-jit` | off | Disable JIT channel fallback |
-| `--jit-amount` | auto | Per-client JIT channel funding amount |
+| `--enable-jit-experimental` | off | **Unsafe, testing only.** Allow the LSP to open JIT channels: for every connected client once all factories have expired, and when a factory client sends `lsps2.buy`. Refused on mainnet. |
+| `--jit-amount` | auto | Per-client JIT channel funding amount (only used with `--enable-jit-experimental`) |
+
+JIT channels are **disabled by default**. Without `--enable-jit-experimental`
+the LSP never offers a JIT channel, never funds one, and answers `lsps2.buy`
+and `lsps2.get_info` with a JSON-RPC error. The current JIT channel is an experiment: the LSP
+broadcasts the funding transaction before the client has signed anything, so
+a client that stops responding leaves the LSP's coins in a 2-of-2 output, and
+the channel cannot yet carry payments. Do not enable it with funds you are
+not prepared to lose. `--test-jit` implies the flag. JIT channels that were
+opened earlier are still loaded at start-up and closed at rotation whether or
+not the flag is given.
+
+### Factory Rotation
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable-rotation-experimental` | off | **Unsafe, testing only.** Allow factory rotation: automatically when a factory turns DYING (daemon mode), and the CLI `rotate` command. Refused on mainnet. |
+| `--async-rotation` | off | Queue rotation requests and wait for offline clients to reconnect. Needs `--enable-rotation-experimental`. |
+
+Factory rotation is **disabled by default**. In its current form the members
+hand their factory keys to the LSP, the LSP closes the old factory with every
+output, members' balances included, paid to its own wallet, and the new
+factory reuses the same keys. Do not enable it with funds you are not prepared
+to lose. `--test-rotation` and `--test-partial-rotation` imply the flag.
+See [Factory Rotation](#12-factory-rotation) for what happens to a factory
+when rotation is off.
 
 ### Placement Modes Explained
 
@@ -260,7 +285,7 @@ These flags run after the `--demo` payment sequence to test specific protocol fe
 | `--test-expiry` | off | Mine past CLTV, recover via timeout script path |
 | `--test-distrib` | off | Broadcast pre-signed distribution TX (nLockTime fallback) |
 | `--test-turnover` | off | PTLC key turnover, close with extracted keys |
-| `--test-rotation` | off | Full factory rotation lifecycle |
+| `--test-rotation` | off | Full factory rotation lifecycle (implies `--enable-rotation-experimental`) |
 | `--force-close` | off | Broadcast factory tree on-chain, wait for confirmations |
 
 ### Interactive CLI
@@ -273,7 +298,7 @@ When `--cli` is enabled in daemon mode, the LSP reads commands from stdin:
 | `rebalance <from> <to> <amount>` | Rebalance channels within the factory |
 | `invoice <client> <amount>` | Create a BOLT11 invoice for a client (requires bridge) |
 | `status` | Print channel balances, factory state, ladder info |
-| `rotate` | Trigger manual factory rotation |
+| `rotate` | Trigger manual factory rotation (only with `--enable-rotation-experimental`) |
 | `close` | Initiate cooperative close and shutdown |
 | `help` | Show available commands |
 
@@ -853,14 +878,36 @@ The full rollback contract per primitive (realloc, buy-liquidity, bridge HTLC, c
 
 ## 12. Factory Rotation
 
-Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`). Before expiry, the LSP rotates to a new factory:
+Factories have a limited lifetime (`--active-blocks` + `--dying-blocks`).
+
+**Rotation is off by default.** Without `--enable-rotation-experimental` the
+LSP never rotates a factory:
+
+1. When the factory turns DYING the LSP logs
+   `factory N DYING — not rotating: rotation is disabled` and carries on.
+   Channels stay in service: payments between members keep working.
+2. When it turns EXPIRED the LSP logs the block at which the distribution TX
+   becomes valid (its nLockTime, the factory CLTV, `--cltv-timeout`).
+3. From that block on, the LSP broadcasts the distribution TX that the LSP
+   and every member co-signed when the factory was created. It pays every
+   member their share. If it is not accepted, it is retried at the next block.
+4. Members do not depend on the LSP for this: each holds its own co-signed
+   copy of the distribution TX, and can exit unilaterally (`superscalar_client
+   --force-close`) at any time.
+
+The CLI `rotate` command answers that rotation is disabled.
+
+**With `--enable-rotation-experimental`** (testing only, refused on mainnet),
+the LSP rotates to a new factory when the old one turns DYING:
 
 1. PTLC key turnover extracts client keys via adaptor signatures
 2. Old factory is cooperatively closed (LSP can sign alone with extracted keys)
 3. New factory is created with the same clients
 4. Channels resume in the new factory
 
-This happens automatically in daemon mode when `--active-blocks` is reached. You can also trigger it manually with `--test-rotation` for testing.
+This is not safe yet: the close in step 2 pays everything to the LSP wallet,
+and the new factory reuses the extracted keys. `--test-rotation` runs the
+rotation once after the demo, for testing.
 
 ## 13. Troubleshooting
 

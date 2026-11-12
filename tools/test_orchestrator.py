@@ -965,7 +965,8 @@ def scenario_jit_lifecycle(orch):
     orch._log("All 4 clients connect; factory expires → JIT channels triggered.")
 
     # Start LSP with JIT enabled and short lifecycle for quick expiry
-    orch.start_lsp(["--demo", "--daemon", "--jit-amount", "50000",
+    orch.start_lsp(["--demo", "--daemon", "--enable-jit-experimental",
+                     "--jit-amount", "50000",
                      "--active-blocks", "5", "--dying-blocks", "3"])
     time.sleep(orch.timing["lsp_bind"])
 
@@ -1030,7 +1031,7 @@ def scenario_factory_rotation(orch):
 
     # Start LSP with short active/dying periods so rotation triggers quickly.
     # Use slightly longer windows (8+5) to avoid race conditions during setup.
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "8", "--dying-blocks", "5"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-rotation-experimental", "--active-blocks", "8", "--dying-blocks", "5"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -1337,7 +1338,7 @@ def scenario_ladder_breach(orch):
     orch._log("Factory 0 ages → DYING → rotation creates Factory 1 → Factory 0 expires.")
 
     # Start LSP with short active/dying periods
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-rotation-experimental", "--active-blocks", "5", "--dying-blocks", "3"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -1402,7 +1403,7 @@ def scenario_turnover_abort(orch):
 
     # Start LSP with short lifecycle for quick turnover trigger.
     # Use slightly longer windows (8+5) to avoid race conditions during setup.
-    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "8", "--dying-blocks", "5"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-rotation-experimental", "--active-blocks", "8", "--dying-blocks", "5"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
@@ -2171,7 +2172,7 @@ def scenario_lsps2_wire(orch):
     orch.n_clients = 1
 
     # --daemon keeps LSP alive so get_info response arrives before CLOSE_PROPOSE
-    orch.start_lsp(["--demo", "--daemon", "--arity", "1"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-jit-experimental", "--arity", "1"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_client(0, ["--test-lsps2"])
 
@@ -2201,7 +2202,7 @@ def scenario_lsps2_buy(orch):
     orch.n_clients = 1
 
     # --daemon keeps the LSP alive after the demo so jit_channel_create has mgr context
-    orch.start_lsp(["--demo", "--daemon", "--arity", "1"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-jit-experimental", "--arity", "1"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_client(0, ["--test-lsps2-buy"])
 

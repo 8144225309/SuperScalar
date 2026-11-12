@@ -730,8 +730,68 @@ static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 }
 
+int lsp_channels_defer_msg(lsp_channel_mgr_t *mgr, size_t client_idx,
+                            wire_msg_t *msg) {
+    if (!mgr || !msg) return 0;
+    if (mgr->n_deferred_msgs >= LSP_DEFERRED_MSGS_MAX) return 0;
+    if (mgr->n_deferred_msgs == mgr->deferred_msgs_cap) {
+        size_t cap = mgr->deferred_msgs_cap ? mgr->deferred_msgs_cap * 2 : 8;
+        lsp_deferred_msg_t *q = realloc(mgr->deferred_msgs, cap * sizeof(*q));
+        if (!q) return 0;
+        mgr->deferred_msgs = q;
+        mgr->deferred_msgs_cap = cap;
+    }
+    lsp_deferred_msg_t *slot = &mgr->deferred_msgs[mgr->n_deferred_msgs++];
+    slot->client_idx = client_idx;
+    slot->msg = *msg;
+    msg->json = NULL;
+    return 1;
+}
+
+size_t lsp_channels_deferred_count(const lsp_channel_mgr_t *mgr) {
+    return mgr ? mgr->n_deferred_msgs : 0;
+}
+
+int lsp_channels_drain_deferred(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || mgr->n_deferred_msgs == 0) return 0;
+
+    /* Detach first: a handler may hold further messages, which then wait
+       for the next drain. */
+    lsp_deferred_msg_t *q = mgr->deferred_msgs;
+    size_t n = mgr->n_deferred_msgs;
+    mgr->deferred_msgs = NULL;
+    mgr->n_deferred_msgs = 0;
+    mgr->deferred_msgs_cap = 0;
+
+    int handled = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t c = q[i].client_idx;
+        if (lsp && c < mgr->n_channels && lsp->client_fds[c] >= 0) {
+            if (!lsp_channels_handle_msg(mgr, lsp, c, &q[i].msg))
+                fprintf(stderr, "LSP: handle_msg failed for held msg 0x%02x "
+                        "from client %zu\n", q[i].msg.msg_type, c);
+            handled++;
+        }
+        if (q[i].msg.json) cJSON_Delete(q[i].msg.json);
+    }
+    free(q);
+    return handled;
+}
+
+void lsp_channels_free_deferred(lsp_channel_mgr_t *mgr) {
+    if (!mgr) return;
+    for (size_t i = 0; i < mgr->n_deferred_msgs; i++)
+        if (mgr->deferred_msgs[i].msg.json)
+            cJSON_Delete(mgr->deferred_msgs[i].msg.json);
+    free(mgr->deferred_msgs);
+    mgr->deferred_msgs = NULL;
+    mgr->n_deferred_msgs = 0;
+    mgr->deferred_msgs_cap = 0;
+}
+
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr) {
     if (!mgr) return;
+    lsp_channels_free_deferred(mgr);
     if (mgr->entries) {
         for (size_t i = 0; i < mgr->n_channels; i++)
             channel_cleanup(&mgr->entries[i].channel);
@@ -5732,6 +5792,13 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
+    case MSG_JIT_REJECT:
+        /* A decline that arrives when no offer is pending (the LSP already
+           gave up waiting): nothing to do. */
+        printf("LSP: client %zu declined a JIT offer that is no longer pending\n",
+               client_idx);
+        return 1;
+
     case MSG_LSPS_REQUEST: {
         lsps_ctx_t lsps_ctx = {
             .mgr        = mgr,
@@ -6828,6 +6895,15 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* Factory rotation moved to lsp_rotation.c */
 
+/* nLockTime of a serialized transaction: its last four bytes, little-endian.
+   0 for a buffer too short to hold one. */
+static uint32_t lsp_dist_tx_locktime(const tx_buf_t *tx) {
+    if (!tx || !tx->data || tx->len < 4) return 0;
+    const unsigned char *p = tx->data + tx->len - 4;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
                                   const char *line,
                                   volatile sig_atomic_t *shutdown_flag) {
@@ -6960,12 +7036,18 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
             ladder_t *lad = (ladder_t *)mgr->ladder;
             printf("  Ladder factories: %zu\n", lad->n_factories);
         }
-        /* JIT channels */
-        if (mgr->jit_enabled && mgr->n_jit_channels > 0)
+        /* JIT channels: listed whether or not new opens are enabled */
+        if (mgr->n_jit_channels > 0)
             printf("  JIT channels: %zu\n", mgr->n_jit_channels);
         printf("---\n");
         fflush(stdout);
     } else if (strcmp(line, "rotate") == 0) {
+        if (!mgr->rot_enabled) {
+            printf("CLI: rotation is disabled (start the LSP with "
+                   "--enable-rotation-experimental)\n");
+            fflush(stdout);
+            return 1;
+        }
         printf("CLI: forcing rotation\n");
         fflush(stdout);
         int rot_rc = lsp_channels_rotate_factory(mgr, lsp);
@@ -7078,6 +7160,52 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
     return 1;
 }
 
+/* Once every factory has expired, offer a JIT channel to each connected
+   client that has none.  Does nothing, and sends nothing, unless opening JIT
+   channels is enabled on this manager.  Returns the number of opens
+   attempted. */
+int lsp_channels_jit_expiry_trigger(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp || !jit_channels_enabled(mgr)) return 0;
+
+    int all_expired = 1;
+    if (mgr->ladder) {
+        ladder_t *lad = (ladder_t *)mgr->ladder;
+        for (size_t fi = 0; fi < lad->n_factories; fi++) {
+            if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
+                all_expired = 0;
+                break;
+            }
+        }
+        if (lad->n_factories == 0)
+            all_expired = 0; /* no factories at all != expired */
+    } else {
+        /* Single-factory mode: check main factory */
+        if (mgr->watchtower && mgr->watchtower->rt) {
+            int h = regtest_get_block_height(mgr->watchtower->rt);
+            factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
+            all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
+        } else {
+            all_expired = 0;
+        }
+    }
+    if (!all_expired) return 0;
+
+    int attempted = 0;
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (lsp->client_fds[c] < 0 || jit_channel_is_active(mgr, c))
+            continue;
+        uint64_t jit_amt = mgr->jit_funding_sats;
+        if (jit_amt == 0)
+            jit_amt = mgr->rot_funding_sats / mgr->n_channels;
+        if (jit_amt == 0) continue;
+        printf("LSP: opening JIT channel for client %zu (factory expired)\n", c);
+        fflush(stdout);
+        jit_channel_create(mgr, lsp, c, jit_amt, "factory_expired");
+        attempted++;
+    }
+    return attempted;
+}
+
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag) {
     if (!mgr || !lsp || !shutdown_flag) return 0;
@@ -7115,6 +7243,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     while (!(*shutdown_flag)) {
+        /* Messages held back during a blocking exchange come first, so each
+           client's messages are handled in the order they arrived. */
+        lsp_channels_drain_deferred(mgr, lsp);
+
         /* Drain any connections queued during ceremonies */
         while (mgr->n_pending_reconnects > 0) {
             mgr->n_pending_reconnects--;
@@ -7496,18 +7628,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         lf->factory.dying_blocks,
                                         lf->partial_rotation_done);
                                 }
-                                /* Auto-broadcast distribution TX on EXPIRED;
-                                   retried and re-bumped every block until it
-                                   confirms (retry_distribution_txs). */
-                                if (lf->cached_state == FACTORY_EXPIRED &&
-                                    lf->distribution_tx.len > 0 &&
-                                    mgr->chain_be && !lf->dist_pending)
-                                    send_distribution_tx_if_due(mgr, lf, "expiry:");
+                                /* The distribution TX of an EXPIRED factory is
+                                   broadcast once its nLockTime is reached (below,
+                                   on every tick). */
 
                                 /* Async rotation: handle EXPIRED with partial ready set.
                                    DYING → EXPIRED means the window closed; rotate
                                    with whoever showed up (n_ready >= 2). */
-                                if (lf->cached_state == FACTORY_EXPIRED &&
+                                if (mgr->rot_auto_rotate &&
+                                    lf->cached_state == FACTORY_EXPIRED &&
                                     old_states[fi] == FACTORY_DYING &&
                                     mgr->readiness) {
                                     readiness_tracker_t *rt =
@@ -7525,6 +7654,39 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                lf->factory_id, n_ready);
                                     }
                                     readiness_reset(rt);
+                                }
+
+                                /* Rotation off (the default): nothing is
+                                   started.  The factory keeps serving its
+                                   channels until it expires; after that the
+                                   members' own exits and the distribution TX
+                                   (broadcast at its nLockTime, below) apply. */
+                                if (!mgr->rot_auto_rotate &&
+                                    lf->cached_state == FACTORY_DYING) {
+                                    printf("LSP: factory %u DYING — not rotating: rotation "
+                                           "is disabled (--enable-rotation-experimental "
+                                           "not given). Channels stay in service until "
+                                           "the factory expires in %u blocks; then members "
+                                           "can exit and the distribution TX pays them\n",
+                                           lf->factory_id,
+                                           factory_blocks_until_expired(&lf->factory,
+                                                                        (uint32_t)height));
+                                    fflush(stdout);
+                                } else if (!mgr->rot_auto_rotate &&
+                                           lf->cached_state == FACTORY_EXPIRED) {
+                                    if (lf->distribution_tx.len > 0)
+                                        printf("LSP: factory %u EXPIRED — not rotating: "
+                                               "rotation is disabled; the distribution TX "
+                                               "is broadcast at its nLockTime (block %u)\n",
+                                               lf->factory_id,
+                                               lsp_dist_tx_locktime(&lf->distribution_tx));
+                                    else
+                                        printf("LSP: factory %u EXPIRED — not rotating: "
+                                               "rotation is disabled; this LSP process holds "
+                                               "no signed distribution TX (members hold "
+                                               "their own co-signed copy)\n",
+                                               lf->factory_id);
+                                    fflush(stdout);
                                 }
 
                                 /* Auto-rotate when factory enters DYING
@@ -7618,6 +7780,34 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         }
                                     }
                                 }
+                            }
+
+                            /* Distribution TX: an EXPIRED factory's co-signed
+                               nLockTime fallback pays every member.  It cannot
+                               be relayed before its nLockTime (the factory CLTV,
+                               after EXPIRED), so it is broadcast on the first
+                               tick at or past that height; a failed attempt is
+                               retried at the next block. */
+                            if (lf->cached_state == FACTORY_EXPIRED &&
+                                lf->distribution_tx.len > 0 &&
+                                !lf->dist_tx_broadcast &&
+                                !lf->dist_pending &&
+                                !lf->partial_rotation_done &&   /* closed by rotation */
+                                mgr->chain_be &&
+                                (uint32_t)height >=
+                                    lsp_dist_tx_locktime(&lf->distribution_tx) &&
+                                (uint32_t)height != lf->dist_tx_tried_height) {
+                                lf->dist_tx_tried_height = (uint32_t)height;
+                                /* Through the CPFP path (alone when it pays the
+                                   node's floor, else with a child on its anchor:
+                                   at rate 0 it pays nothing).  Not sent when it
+                                   is already confirmed or the funding is spent
+                                   by another transaction (a member exited);
+                                   once sent it is resent / re-bumped on every
+                                   block until it confirms
+                                   (retry_distribution_txs). */
+                                send_distribution_tx_if_due(mgr, lf, "nLockTime:");
+                                lf->dist_tx_broadcast = 1;
                             }
 
                             /* Retry rotation with exponential backoff — runs on
@@ -7808,8 +7998,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t epoch = dw_counter_epoch(&lsp->factory.counter);
                 uint32_t total = lsp->factory.counter.total_states;
                 if (total > 0 && epoch >= (total * 3) / 4) {
-                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed\n",
-                           epoch, total);
+                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed%s\n",
+                           epoch, total,
+                           mgr->rot_auto_rotate ? "" :
+                               " (rotation is disabled; not rotating)");
                     if (mgr->rot_auto_rotate) {
                         lsp_channels_rotate_factory(mgr, lsp);
                     }
@@ -7834,47 +8026,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             }
 
             /* JIT channel trigger: factory expired + client online + no JIT */
-            if (mgr->jit_enabled) {
-                int all_expired = 1;
-                if (mgr->ladder) {
-                    ladder_t *lad = (ladder_t *)mgr->ladder;
-                    for (size_t fi = 0; fi < lad->n_factories; fi++) {
-                        if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
-                            all_expired = 0;
-                            break;
-                        }
-                    }
-                    if (lad->n_factories == 0)
-                        all_expired = 0; /* no factories at all != expired */
-                } else {
-                    /* Single-factory mode: check main factory */
-                    if (mgr->watchtower && mgr->watchtower->rt) {
-                        int h = regtest_get_block_height(mgr->watchtower->rt);
-                        factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
-                        all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
-                    } else {
-                        all_expired = 0;
-                    }
-                }
-
-                if (all_expired) {
-                    for (size_t c = 0; c < mgr->n_channels; c++) {
-                        if (lsp->client_fds[c] >= 0 &&
-                            !jit_channel_is_active(mgr, c)) {
-                            uint64_t jit_amt = mgr->jit_funding_sats;
-                            if (jit_amt == 0)
-                                jit_amt = mgr->rot_funding_sats / mgr->n_channels;
-                            if (jit_amt > 0) {
-                                printf("LSP: opening JIT channel for client %zu "
-                                       "(factory expired)\n", c);
-                                fflush(stdout);
-                                jit_channel_create(mgr, lsp, c, jit_amt,
-                                                    "factory_expired");
-                            }
-                        }
-                    }
-                }
-            }
+            lsp_channels_jit_expiry_trigger(mgr, lsp);
+            /* Anything a client sent while an offer was pending is handled
+               before newer messages are read below. */
+            lsp_channels_drain_deferred(mgr, lsp);
 
             /* Check JIT funding confirmation (FUNDING → OPEN) */
             jit_channels_check_funding(mgr);

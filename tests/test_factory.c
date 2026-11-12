@@ -3563,8 +3563,10 @@ int test_factory_flat_secrets_round_trip(void) {
     TEST_ASSERT(factory_get_revocation_secret(f, 8, bad) == 0, "epoch 8 OOB");
 
     /* Build tree and verify L-stock SPK updates work with flat secrets */
+    unsigned char flat_fund_spk[34];
+    TEST_ASSERT(factory_compute_funding_spk(f, flat_fund_spk), "funding spk");
     factory_set_funding(f, (const unsigned char[32]){0x01}, 0, 1000000,
-                        (const unsigned char[34]){0}, 34);
+                        flat_fund_spk, 34);
     f->cltv_timeout = 200;
     TEST_ASSERT(factory_build_tree(f), "build tree with flat secrets");
 
@@ -4035,6 +4037,7 @@ int test_placement_inward(void) {
     f->profiles[4].participant_idx = 4;
     f->profiles[4].contribution_sats = 20000;  /* highest client */
 
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree inward");
 
@@ -4101,6 +4104,7 @@ int test_placement_outward(void) {
     f->profiles[4].uptime_score = 0.95f;  /* highest uptime */
     f->profiles[4].contribution_sats = 10000;
 
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree outward");
 
@@ -4172,6 +4176,7 @@ int test_placement_timezone_cluster(void) {
     f->profiles[4].timezone_bucket = 3;
     f->profiles[4].uptime_score = 0.6f;
 
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree timezone cluster");
 
@@ -4938,8 +4943,9 @@ int test_factory_derive_scid(void) {
     if (!f) return 0;
     factory_init(f, ctx, kps, 5, 10, 100);
     f->cltv_timeout = 1000;
-    factory_set_funding(f, (unsigned char[32]){0}, 0, 500000,
-                         (unsigned char[34]){0x51, 0x20}, 34);
+    unsigned char scid_fund_spk[34];
+    factory_compute_funding_spk(f, scid_fund_spk);
+    factory_set_funding(f, (unsigned char[32]){0}, 0, 500000, scid_fund_spk, 34);
     factory_build_tree(f);
 
     /* Epoch 0, leaf 0, output 0 */
@@ -8419,6 +8425,7 @@ int test_factory_client_to_leaf_roundtrip(void) {
         factory_set_arity(f, FACTORY_ARITY_1);
         unsigned char fake_txid[32]; memset(fake_txid, 0xBB, 32);
         unsigned char fake_spk[34]; memset(fake_spk, 0, 34);
+        factory_compute_funding_spk(f, fake_spk);
         factory_set_funding(f, fake_txid, 0, 1000000, fake_spk, 34);
         TEST_ASSERT(factory_build_tree(f), "build arity-1 tree");
 
@@ -8446,6 +8453,7 @@ int test_factory_client_to_leaf_roundtrip(void) {
         factory_init(f, ctx, kps, 5, 2, 4);  /* default arity-2 */
         unsigned char fake_txid[32]; memset(fake_txid, 0xCC, 32);
         unsigned char fake_spk[34]; memset(fake_spk, 0, 34);
+        factory_compute_funding_spk(f, fake_spk);
         factory_set_funding(f, fake_txid, 0, 1000000, fake_spk, 34);
         TEST_ASSERT(factory_build_tree(f), "build arity-2 tree");
 
@@ -8478,6 +8486,7 @@ int test_factory_client_to_leaf_roundtrip(void) {
         factory_set_arity(f, FACTORY_ARITY_PS);
         unsigned char fake_txid[32]; memset(fake_txid, 0xDD, 32);
         unsigned char fake_spk[34]; memset(fake_spk, 0, 34);
+        factory_compute_funding_spk(f, fake_spk);
         factory_set_funding(f, fake_txid, 0, 1000000, fake_spk, 34);
         TEST_ASSERT(factory_build_tree(f), "build PS tree");
 

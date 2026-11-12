@@ -443,7 +443,10 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         return 0;
     }
     if (t->n_level_arity > 0) {
-        factory_set_level_arity(f, t->level_arity, t->n_level_arity);
+        if (!factory_set_level_arity(f, t->level_arity, t->n_level_arity)) {
+            fprintf(stderr, "%s: saved tree shape refused\n", who);
+            return 0;
+        }
     } else if (t->leaf_arity == FACTORY_ARITY_1) {
         factory_set_arity(f, FACTORY_ARITY_1);
     } else if (t->leaf_arity == FACTORY_ARITY_PS) {
@@ -458,7 +461,10 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
     f->tree_fee_rate = t->tree_fee_rate;
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
-    f->placement_mode = t->placement;
+    if (!factory_set_placement_mode(f, t->placement)) {
+        fprintf(stderr, "%s: saved placement mode refused\n", who);
+        return 0;
+    }
     f->economic_mode = t->econ;
     if (t->profiles) {
         size_t n = t->n_profiles < f->config.max_signers ? t->n_profiles
@@ -498,8 +504,11 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         }
     }
 
-    factory_set_funding(f, funding_txid, funding_vout, funding_amount,
-                        funding_spk, funding_spk_len);
+    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+                             funding_spk, funding_spk_len)) {
+        fprintf(stderr, "%s: funding script refused\n", who);
+        return 0;
+    }
 
     if (!factory_build_tree(f)) {
         fprintf(stderr, "%s: factory_build_tree failed\n", who);
@@ -581,13 +590,13 @@ int lsp_plan_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
     t->use_tree_anchor = 1;
     t->build_quiet = 1;
     t->cltv_timeout = 1;   /* any CLTV: a distribution TX exists */
+    /* a placeholder outpoint, but the real funding script: factory_build_tree
+       refuses any other */
     unsigned char txid[32], spk[34];
     memset(txid, 0x5a, sizeof(txid));
-    spk[0] = 0x51;
-    spk[1] = 0x20;
-    memset(spk + 2, 0x5a, 32);
-    factory_set_funding(t, txid, 0, funding_amount, spk, sizeof(spk));
-    int ok = factory_build_tree(t);
+    int ok = factory_compute_funding_spk(t, spk) &&
+             factory_set_funding(t, txid, 0, funding_amount, spk, sizeof(spk)) &&
+             factory_build_tree(t);
     if (!ok)
         snprintf(why, why_len, "no %zu-client tree of this shape can be built from "
                  "%llu sat at %llu sat/kvB", n_clients,

@@ -233,8 +233,6 @@ def run_scenario(args: argparse.Namespace) -> int:
     ]
     if args.states_per_layer:
         lsp_argv += ["--states-per-layer", str(args.states_per_layer)]
-    if args.no_jit:
-        lsp_argv.append("--no-jit")
     if args.lsp_balance_pct is not None:
         lsp_argv += ["--lsp-balance-pct", str(args.lsp_balance_pct)]
     if args.demo:
@@ -378,7 +376,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--step-blocks", type=int, default=1)
     p.add_argument("--states-per-layer", type=int, default=0,
                    help="0 = use LSP default")
-    p.add_argument("--no-jit", action="store_true")
     p.add_argument("--run-dir", required=True, help="Directory for logs/db/timeline")
     p.add_argument("--label", default="run")
     p.add_argument("--factory-timeout", type=float, default=600.0)

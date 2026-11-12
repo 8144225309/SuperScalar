@@ -13,7 +13,11 @@ typedef struct {
     factory_state_t cached_state;  /* last computed state */
     int is_funded;                 /* funding confirmed on-chain */
     int is_initialized;            /* factory_init + build_tree done */
-    tx_buf_t distribution_tx;      /* pre-signed nLockTime fallback */
+    tx_buf_t distribution_tx;      /* co-signed nLockTime fallback (empty if the
+                                      LSP does not hold a signed copy) */
+    int dist_tx_broadcast;         /* 1 = done: the LSP broadcast distribution_tx,
+                                      or the funding output is already spent */
+    uint32_t dist_tx_tried_height; /* last height a broadcast was attempted at */
 
     /* Per-client key turnover state */
     int client_departed[FACTORY_MAX_SIGNERS];     /* 1 if PTLC complete */

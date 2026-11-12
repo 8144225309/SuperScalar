@@ -224,7 +224,10 @@ typedef struct {
     int rot_is_regtest;
     uint64_t rot_funding_sats;
     int rot_leaf_arity;            /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
-    int rot_auto_rotate;           /* 1 = auto-rotate enabled */
+    int rot_enabled;               /* 1 = rotation may run (--enable-rotation-experimental);
+                                      default 0: every rotation path is refused */
+    int rot_auto_rotate;           /* 1 = rotate automatically when a factory turns
+                                      DYING; only ever set together with rot_enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 
     /* Rotation retry with backoff (reset on first attempt to avoid aliasing) */
@@ -240,7 +243,14 @@ typedef struct {
     void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
     size_t n_jit_channels;
     size_t jit_channels_cap;
-    int jit_enabled;               /* 1 = JIT enabled (default), 0 = --no-jit */
+    int jit_enabled;               /* 1 = JIT opens allowed (experimental opt-in); default 0 */
+
+    /* Client messages read while a blocking exchange was waiting for a
+       different message.  Handled, in arrival order, by
+       lsp_channels_drain_deferred(). */
+    struct lsp_deferred_msg *deferred_msgs;
+    size_t n_deferred_msgs;
+    size_t deferred_msgs_cap;
     uint64_t jit_funding_sats;     /* per-client JIT funding amount */
 
     /* Factory arity (Upgrade 2) */
@@ -334,6 +344,33 @@ typedef struct {
    Returns 1 on success. */
 void lsp_channels_cleanup(lsp_channel_mgr_t *mgr);
 
+/* --- Messages held back during a blocking exchange --- */
+
+typedef struct lsp_deferred_msg {
+    size_t client_idx;
+    wire_msg_t msg;
+} lsp_deferred_msg_t;
+
+/* Most messages that may be held at once. */
+#define LSP_DEFERRED_MSGS_MAX 256
+
+/* Hold a message from client_idx for later handling.  On success (1) the
+   queue owns msg->json and msg->json is set to NULL.  Returns 0, leaving msg
+   untouched, if the queue is full or memory is exhausted. */
+int lsp_channels_defer_msg(lsp_channel_mgr_t *mgr, size_t client_idx,
+                            wire_msg_t *msg);
+
+/* Number of messages currently held. */
+size_t lsp_channels_deferred_count(const lsp_channel_mgr_t *mgr);
+
+/* Pass every held message to lsp_channels_handle_msg(), oldest first, and
+   empty the queue.  A message whose client has disconnected is dropped.
+   Returns the number of messages handled. */
+int lsp_channels_drain_deferred(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Free the queue and everything in it without handling. */
+void lsp_channels_free_deferred(lsp_channel_mgr_t *mgr);
+
 int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        secp256k1_context *ctx,
                        const factory_t *factory,
@@ -411,6 +448,11 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
    Returns 1 on success, 0 on error. */
 int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                   size_t expected_msgs);
+
+/* Once every factory has expired, offer a JIT channel to each connected
+   client that has none.  Does nothing unless opening JIT channels is enabled
+   (mgr->jit_enabled).  Returns the number of opens attempted. */
+int lsp_channels_jit_expiry_trigger(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* Run a daemon event loop handling channel messages until shutdown.
    Loops on select() with 5-second timeout checking *shutdown_flag.
@@ -538,10 +580,16 @@ int lsp_channels_buy_liquidity(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* --- Continuous Ladder Rotation (Gap #3) --- */
 
+/* Rotation is experimental and off unless the operator opts in: sets
+   mgr->rot_enabled to `enabled`, and mgr->rot_auto_rotate (rotate when a
+   factory turns DYING) to `enabled && automatic`. */
+void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic);
+
 /* Perform a full factory rotation: PTLC turnover → cooperative close →
    fund new factory → create new factory → reinitialize channels.
    All parameters come from mgr->rot_* fields.
-   Returns LSP_ROTATE_OK, LSP_ROTATE_FAILED, or LSP_ROTATE_POSTPONED: the
+   Refused (LSP_ROTATE_FAILED, nothing done) unless mgr->rot_enabled.
+   Otherwise returns LSP_ROTATE_OK, LSP_ROTATE_FAILED, or LSP_ROTATE_POSTPONED: the
    old factory's cooperative close would cost more than half its funding at
    the current fee estimate; nothing was sent or changed, and the
    postponement is already recorded (lsp_rotation_record_postponed): not a

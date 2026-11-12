@@ -238,7 +238,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--tor-proxy HOST:PORT` | none | SOCKS5 proxy for Tor connections (e.g. `127.0.0.1:9050`) |
 | `--tor-only` | off | Refuse all non-`.onion` outbound connections (hard privacy mode) |
 | `--daemon` | off | Stay running (auto-fulfill, watchtower, reconnect) |
-| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP |
+| `--auto-accept-jit` | off | Auto-accept JIT channel offers from LSP. Without it the client declines every offer with an explicit reject message. JIT channels are experimental. |
 | `--min-profit-bps N` | 0 | Refuse factory proposal if LSP's profit share for this client < N bps |
 | `--i-accept-the-risk` | off | Required for mainnet operation (`--network mainnet` or its other spelling `--network bitcoin`). Mainnet also requires `--db` and refuses `--seckey` and test/cheat flags |
 
@@ -272,7 +272,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--force-close` | off | Broadcast your factory tree on-chain from the local DB (unilateral exit); exits 1 when a pre-signed transaction needs a fee-paying child it cannot get |
+| `--force-close` | off | Unilateral exit from the local DB: publish the tree transactions on the path to your leaf, then your commitment. One pass per run: exit status `0` = commitment accepted (so the whole path is published), `2` = run it again after the next block (tree levels mature one timelock at a time), `3` = refused for a reason waiting will not cure (fee below the node's floor, input spent by another transaction; the STUCK line says which), `1` = the exit cannot be completed from this DB, or a pre-signed transaction needs a fee-paying child and no wallet coin is available (the `needs a fee-paying child` line says so; give it a coin with `--wallet`) |
 | `--sweep-to-local` | off | After force-close, sweep your `to_local` outputs once CSV maturity hits |
 | `--sweep-dest ADDR` | (wallet) | Destination address for swept funds (defaults to your bitcoind wallet) |
 

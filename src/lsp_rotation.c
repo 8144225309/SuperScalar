@@ -123,8 +123,22 @@ static int rotation_postpone(lsp_channel_mgr_t *mgr, ladder_factory_t *dying,
     return LSP_ROTATE_POSTPONED;
 }
 
+void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automatic) {
+    if (!mgr) return;
+    mgr->rot_enabled = enabled ? 1 : 0;
+    mgr->rot_auto_rotate = (enabled && automatic) ? 1 : 0;
+}
+
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
-    if (!mgr || !lsp || !mgr->ladder) return 0;
+    if (!mgr || !lsp) return 0;
+    /* Every way into a rotation (daemon lifecycle, retries, async readiness,
+       CLI "rotate", MSG_ROTATE) ends here. */
+    if (!mgr->rot_enabled) {
+        fprintf(stderr, "LSP rotate: refused: factory rotation is disabled "
+                "(it runs only with --enable-rotation-experimental)\n");
+        return 0;
+    }
+    if (!mgr->ladder) return 0;
 
     ladder_t *lad = (ladder_t *)mgr->ladder;
     fee_estimator_t *fe = (fee_estimator_t *)mgr->rot_fee_est;
@@ -1234,6 +1248,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     void *saved_jit = mgr->jit_channels;
     size_t saved_n_jit = mgr->n_jit_channels;
     int saved_jit_enabled = mgr->jit_enabled;
+    struct lsp_deferred_msg *saved_deferred = mgr->deferred_msgs;
+    size_t saved_n_deferred = mgr->n_deferred_msgs;
+    size_t saved_deferred_cap = mgr->deferred_msgs_cap;
     uint64_t saved_jit_funding = mgr->jit_funding_sats;
     unsigned char saved_seckey[32];
     memcpy(saved_seckey, mgr->rot_lsp_seckey, 32);
@@ -1251,6 +1268,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     int saved_leaf_arity = mgr->rot_leaf_arity;
     int saved_is_regtest = mgr->rot_is_regtest;
     uint64_t saved_funding_sats = mgr->rot_funding_sats;
+    int saved_rot_enabled = mgr->rot_enabled;
     int saved_auto_rotate = mgr->rot_auto_rotate;
     uint32_t saved_attempted_mask = mgr->rot_attempted_mask;
     uint8_t  saved_retry_count[8];
@@ -1303,6 +1321,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->rot_leaf_arity = saved_leaf_arity;
     mgr->rot_is_regtest = saved_is_regtest;
     mgr->rot_funding_sats = saved_funding_sats;
+    mgr->rot_enabled = saved_rot_enabled;
     mgr->rot_auto_rotate = saved_auto_rotate;
     mgr->rot_attempted_mask = saved_attempted_mask;
     memcpy(mgr->rot_retry_count, saved_retry_count, sizeof(saved_retry_count));
@@ -1313,6 +1332,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->jit_channels = saved_jit;
     mgr->n_jit_channels = saved_n_jit;
     mgr->jit_enabled = saved_jit_enabled;
+    mgr->deferred_msgs = saved_deferred;
+    mgr->n_deferred_msgs = saved_n_deferred;
+    mgr->deferred_msgs_cap = saved_deferred_cap;
     mgr->jit_funding_sats = saved_jit_funding;
     mgr->cli_enabled = saved_cli_enabled;
     mgr->confirm_timeout_secs = saved_confirm_timeout;
@@ -1419,11 +1441,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
-    /* Migrate any active JIT channels into the new factory */
+    /* Retire JIT channels whose funding output has been spent.  One that is
+       still on chain stays open with its record. */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         if (jit_channel_is_active(mgr, c)) {
-            printf("LSP rotate: migrating JIT channel for client %zu\n", c);
-            jit_channel_migrate(mgr, lsp, c, 0);
+            if (jit_channel_migrate(mgr, lsp, c, 0))
+                printf("LSP rotate: retired JIT channel for client %zu\n", c);
+            else
+                fprintf(stderr, "LSP rotate: JIT channel for client %zu is "
+                        "still on chain; left open\n", c);
         }
     }
 

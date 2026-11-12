@@ -3118,6 +3118,7 @@ int test_factory_advance_past_exhaustion(void) {
     memset(fake_txid, 0xAA, 32);
     unsigned char fund_spk[34] = {0x51, 0x20};
     memset(fund_spk + 2, 0xCC, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fund_spk, 34);
     f->cltv_timeout = 200;
 

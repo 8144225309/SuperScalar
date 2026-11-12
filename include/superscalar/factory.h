@@ -533,9 +533,13 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
 void factory_set_arity(factory_t *f, factory_arity_t arity);
 
 /* Set variable arity per tree level (4A). arities[0]=root level, etc.
-   Last entry applies to all deeper levels. Clears uniform leaf_arity.
-   Must be called after init, before build_tree. */
-void factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
+   Last entry applies to all deeper levels and sets the leaf kind (3 = PS,
+   else DW): a level of the other kind ends a subtree only when it fits one
+   leaf of the last entry, built with the last entry's arity.
+   Must be called after init, before build_tree.  Returns 0, changing
+   nothing, unless 1 <= n <= FACTORY_MAX_LEVELS and every entry is
+   1..FACTORY_MAX_OUTPUTS. */
+int factory_set_level_arity(factory_t *f, const uint8_t *arities, size_t n);
 
 /* Override the default L-stock CSV (BIP-68) blocks.  Must be called
    before factory_build_tree() — otherwise the L-stock SPK is already
@@ -747,10 +751,25 @@ int factory_client_to_leaf(const factory_t *f, size_t client_idx,
    depths, capped at DW_MAX_LAYERS. */
 void factory_set_static_near_root(factory_t *f, uint32_t threshold);
 
-void factory_set_funding(factory_t *f,
-                         const unsigned char *txid, uint32_t vout,
-                         uint64_t amount_sats,
-                         const unsigned char *spk, size_t spk_len);
+/* Record the funding outpoint.  Returns 0, changing nothing, unless spk is a
+   34-byte P2TR (OP_1 <32 bytes>).  factory_build_tree then refuses to build
+   unless spk is exactly the key-path P2TR of the root signers' MuSig2 key
+   (factory_compute_funding_spk). */
+int factory_set_funding(factory_t *f,
+                        const unsigned char *txid, uint32_t vout,
+                        uint64_t amount_sats,
+                        const unsigned char *spk, size_t spk_len);
+
+/* The funding script factory_build_tree accepts: the key-path P2TR of the
+   MuSig2 aggregate of the root signers (the LSP, then the clients in the
+   order the configured placement mode and profiles put them).  Call after
+   setting placement and profiles.  Returns 0 on failure. */
+int factory_compute_funding_spk(const factory_t *f, unsigned char spk_out[34]);
+
+/* Set the client placement strategy for factory_build_tree.  Returns 0,
+   changing nothing, for a mode that is not a placement_mode_t value.  The
+   default is PLACEMENT_TIMEZONE_CLUSTER. */
+int factory_set_placement_mode(factory_t *f, placement_mode_t mode);
 
 int factory_build_tree(factory_t *f);
 
@@ -905,9 +924,12 @@ void factory_set_subfactory_chain_confirmed_height(factory_t *f,
                                                     size_t node_idx,
                                                     uint32_t confirmed_height);
 
-/* Compute the factory_early_warning_time (blocks) per BLIP-56.
-   This is the worst-case blocks needed for full unilateral close from
-   the current state. PS leaves contribute 0 blocks (no nSequence at leaf level). */
+/* Compute the factory_early_warning_time (blocks) per BLIP-56: the
+   worst-case blocks a full unilateral close needs, i.e. the largest sum of
+   the relative locks (each DW state's longest delay) on any root-to-leaf
+   path of the built tree.  PS leaves contribute 0 blocks (no nSequence at
+   leaf level).  Before factory_build_tree, the same sum for the configured
+   shape. */
 uint32_t factory_early_warning_time(const factory_t *f);
 
 /* Compute the worst-case factory_early_warning_time (blocks) for a given
@@ -920,14 +942,17 @@ uint32_t factory_early_warning_time(const factory_t *f);
    - level_arities: per-level arity array; NULL or n_level_arity==0 means
      uniform leaf_arity
    - leaf_arity: used when level_arities is NULL/empty (3 = PS, 1/2 = DW)
+   - ps_subfactory_arity: k of factory_set_ps_subfactory_arity (0 or 1 =
+     one client per PS leaf, k > 1 = k² clients per PS leaf)
    - n_clients: client count (excludes LSP, so factory_clients_only)
    - static_threshold: top N tree depths are kickoff-only (Phase 3)
    - step_blocks / states_per_layer: per-DW-layer config (mainnet 144 / 4)
-   Returns ewt in blocks.  Treats PS leaves as 0-cost at the leaf layer
-   when leaf arity == FACTORY_ARITY_PS. */
+   Returns ewt in blocks: what factory_early_warning_time returns once the
+   shape is built (PS leaves cost 0). */
 uint32_t factory_compute_ewt_for_shape(
     const uint8_t *level_arities, size_t n_level_arity,
     factory_arity_t leaf_arity,
+    uint32_t ps_subfactory_arity,
     size_t n_clients,
     uint32_t static_threshold,
     uint16_t step_blocks,

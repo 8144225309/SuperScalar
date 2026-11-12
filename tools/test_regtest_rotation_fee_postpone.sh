@@ -80,7 +80,7 @@ mkdir -p "$TMPDIR/www"; fees 1
 PIDS+=($!); sleep 1
 
 echo "=== rotation through a fee spike: clients=$N_CLIENTS amount=$AMOUNT spike=${SPIKE} sat/vB ==="
-"$LSP_BIN" --network regtest --port $PORT --daemon --clients $N_CLIENTS --arity 2 --amount $AMOUNT \
+"$LSP_BIN" --network regtest --port $PORT --daemon --enable-rotation-experimental --clients $N_CLIENTS --arity 2 --amount $AMOUNT \
     --fee-rate 1100 --confirm-timeout 600 --step-blocks 2 --states-per-layer 2 \
     --active-blocks 10 --dying-blocks 80 --cltv-timeout $(( $($BCLI getblockcount) + 1000 )) \
     --fee-estimator "api:http://127.0.0.1:$API_PORT/fees.json" \
