@@ -9,7 +9,8 @@ Motivated by the signer-scaling work (MuSig2 signing proven at 256 signers; see
 - **Factory size is capped well below the single-tx ceiling.** A factory
   that carries a co-signed distribution TX is limited to 230 clients: that
   one-output-per-client transaction must fit a 10 kvB TRUC transaction, and
-  the LSP refuses a larger factory before funding it. A cooperative close of
+  the LSP refuses a larger factory before funding it (see `--tree-fee-rate` in
+  `docs/lsp-operator-guide.md`). A cooperative close of
   at most 230 clients is about 10 kB, a small fraction of the ~99 KB
   standardness ceiling in section 1. The case this proposal solves (more than
   ~2,300 funded clients) cannot arise until that cap is lifted, and the
