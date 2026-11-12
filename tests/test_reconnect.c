@@ -188,6 +188,7 @@ int test_reconnect_pubkey_match(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     factory_build_tree(factory);
     lsp->factory = *factory;
@@ -404,6 +405,7 @@ int test_client_persist_reload(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
@@ -573,6 +575,7 @@ int test_balance_reporting(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
@@ -1926,6 +1929,12 @@ int test_dw_counter_tracks_advance(void) {
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
 
+int test_funding_spk_from_pubkeys(secp256k1_context *ctx, const secp256k1_pubkey *pks,
+                                  size_t n, unsigned char spk[34]);
+int test_funding_spk_from_keys(secp256k1_context *ctx, const secp256k1_keypair *lsp_kp,
+                               const secp256k1_keypair *client_kps, size_t n_clients,
+                               unsigned char spk[34]);
+
 /* Test: ladder daemon integration — advance block, verify state transitions */
 int test_ladder_daemon_integration(void) {
     secp256k1_context *ctx = test_ctx();
@@ -2000,6 +2009,7 @@ int test_distribution_tx_amounts(void) {
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(f, fake_spk);
     factory_set_funding(f, fake_txid, 0, 100000, fake_spk, 34);
     factory_set_lifecycle(f, 100, 20, 10);
     f->cltv_timeout = 135;
@@ -2070,6 +2080,7 @@ int test_turnover_extract_and_close(void) {
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
 
+    TEST_ASSERT(test_funding_spk_from_pubkeys(ctx, pks, 5, fake_spk), "funding spk");
     TEST_ASSERT(ladder_create_factory(lad, &kps[1], 4, 100000,
                                         fake_txid, 0, fake_spk, 34),
                 "ladder_create_factory");
@@ -2286,8 +2297,8 @@ int test_multi_factory_ladder_monitor(void) {
     /* Factory 0: created at block 100 */
     unsigned char txid0[32];
     memset(txid0, 0xF0, 32);
-    unsigned char spk[34] = {0x51, 0x20};
-    memset(spk + 2, 0xAA, 32);
+    unsigned char spk[34];
+    TEST_ASSERT(test_funding_spk_from_keys(ctx, &lsp_kp, client_kps, 4, spk), "funding spk");
     TEST_ASSERT(ladder_create_factory(lad, client_kps, 4,
                 100000, txid0, 0, spk, 34), "create factory 0");
     lad->factories[0].factory.created_block = 100;
@@ -2499,6 +2510,7 @@ static int setup_reconnect_env(secp256k1_context **ctx_out,
     memset(fake_spk, 0x51, 1);
     fake_spk[1] = 0x20;
     memset(fake_spk + 2, 0xAA, 32);
+    factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
     factory_build_tree(factory);
 

@@ -60,11 +60,10 @@ int ladder_create_factory(ladder_t *lad,
                           lad->active_blocks, lad->dying_blocks);
 
     /* Set funding */
-    factory_set_funding(&lf->factory, funding_txid, funding_vout,
-                         funding_amount_sats, funding_spk, funding_spk_len);
-
     /* Build tree and sign */
-    if (!factory_build_tree(&lf->factory)) {
+    if (!factory_set_funding(&lf->factory, funding_txid, funding_vout,
+                             funding_amount_sats, funding_spk, funding_spk_len) ||
+        !factory_build_tree(&lf->factory)) {
         factory_free(&lf->factory);
         tx_buf_free(&lf->distribution_tx);
         return 0;

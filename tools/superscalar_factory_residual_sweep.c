@@ -150,8 +150,12 @@ int main(int argc, char **argv) {
     factory_init(f, ctx, kps, n_part, 64, 16);
     factory_set_arity(f, FACTORY_ARITY_PS);
     factory_set_ps_subfactory_arity(f, ps_sub_arity);
-    unsigned char fund_spk_dummy[34] = {0x51,0x20};
-    factory_set_funding(f, fund_txid, fund_vout, fund_amount, fund_spk_dummy, 34);
+    unsigned char fund_spk[34];
+    if (!factory_compute_funding_spk(f, fund_spk) ||
+        !factory_set_funding(f, fund_txid, fund_vout, fund_amount, fund_spk, 34)) {
+        fprintf(stderr, "funding script\n");
+        return 1;
+    }
     f->cltv_timeout = (uint32_t)cltv_timeout;
     /* hashlock: derive the per-factory seed from the LSP master key + funding (the
        same derivation the LSP used), enable, so L-stock SPKs reproduce. */

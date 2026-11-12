@@ -1513,6 +1513,7 @@ int test_lsp_recovery_round_trip(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
@@ -2030,6 +2031,7 @@ int test_persist_crash_stress(void) {
 
     unsigned char fake_txid[32];
     memset(fake_txid, 0xAB, 32);
+    factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
 

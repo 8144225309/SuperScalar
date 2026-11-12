@@ -216,12 +216,17 @@ static void usage(const char *prog) {
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
         "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
         "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
         "                      an open can strand the LSP's funds. Refused on mainnet.\n"
+        "  --enable-rotation-experimental  UNSAFE, testing only: allow factory rotation\n"
+        "                      (automatic when a factory turns DYING in daemon mode, CLI\n"
+        "                      'rotate'). Off by default: a DYING factory keeps serving\n"
+        "                      its channels until it expires. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
         "                       Comma-separated activates TRUE N-way mixed arity per level\n"
@@ -270,6 +275,7 @@ static void usage(const char *prog) {
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
@@ -327,6 +333,7 @@ static void usage(const char *prog) {
         "                          api:URL     custom HTTP/HTTPS endpoint (mempool.space-compatible JSON)\n"
         "                          static:N    fixed N sat/vByte (e.g. static:10)\n"
         "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
+        "                      (needs --enable-rotation-experimental)\n"
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
@@ -1358,6 +1365,7 @@ int main(int argc, char *argv[]) {
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
+    int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
                                         (1, 2 = legacy DW; 3 = PS canonical) */
@@ -1739,6 +1747,8 @@ int main(int argc, char *argv[]) {
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--enable-jit-experimental") == 0)
             enable_jit_experimental = 1;
+        else if (strcmp(argv[i], "--enable-rotation-experimental") == 0)
+            enable_rotation_experimental = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -2425,6 +2435,7 @@ int main(int argc, char *argv[]) {
             .have_db = db_path != NULL,
             .have_wt_db = wt_db_path != NULL,
             .enable_jit_experimental = enable_jit_experimental,
+            .enable_rotation_experimental = enable_rotation_experimental,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -2441,6 +2452,18 @@ int main(int argc, char *argv[]) {
         enable_jit_experimental = 1;
     if (enable_jit_experimental)
         fprintf(stderr, "WARNING: --enable-jit-experimental: JIT channel opens are "
+                "enabled. This is unsafe and for testing only.\n");
+
+    /* Likewise the rotation test modes carry the rotation opt-in. */
+    if (test_rotation || test_partial_rotation)
+        enable_rotation_experimental = 1;
+    if (async_rotation && !enable_rotation_experimental) {
+        fprintf(stderr, "Error: --async-rotation needs --enable-rotation-experimental "
+                "(factory rotation is off by default).\n");
+        return 1;
+    }
+    if (enable_rotation_experimental)
+        fprintf(stderr, "WARNING: --enable-rotation-experimental: factory rotation is "
                 "enabled. This is unsafe and for testing only.\n");
 
     /* Resolve confirmation timeout */
@@ -2534,6 +2557,8 @@ int main(int argc, char *argv[]) {
         factory_arity_t fa = (factory_arity_t)leaf_arity;
         const uint8_t *la_ptr = (n_level_arity > 0) ? level_arities : NULL;
         if (!cli_validate_shape_for_bolt2016(la_ptr, n_level_arity, fa,
+                                              (uint32_t)(ps_subfactory_arity_arg > 1
+                                                         ? ps_subfactory_arity_arg : 1),
                                               (size_t)n_clients,
                                               static_near_root,
                                               step_blocks,
@@ -3256,7 +3281,9 @@ int main(int argc, char *argv[]) {
             mgr->rot_leaf_arity = leaf_arity;
             mgr->rot_is_regtest = is_regtest;
             mgr->rot_funding_sats = funding_sats;
-            mgr->rot_auto_rotate = 1;
+            /* Recovery resumes the daemon loop: rotation is automatic
+               there, but only with the opt-in. */
+            lsp_channels_set_rotation(mgr, enable_rotation_experimental, 1);
             mgr->rot_attempted_mask = 0;
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
@@ -3984,9 +4011,12 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (n_level_arity > 0)
-        factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity);
-    else if (leaf_arity == 1)
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
+            fprintf(stderr, "Error: --arity shape refused by the factory\n");
+            return 1;
+        }
+    } else if (leaf_arity == 1)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
     else if (leaf_arity == 3)
         factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
@@ -4000,7 +4030,10 @@ accept_new_factory:
     if (ps_subfactory_arity_arg > 0)
         factory_set_ps_subfactory_arity(&lsp_p->factory,
                                           (uint32_t)ps_subfactory_arity_arg);
-    lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
+    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
+        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
+        return 1;
+    }
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
     /* Populate default profiles from CLI config.  The shape setters above
@@ -4210,16 +4243,18 @@ accept_new_factory:
         lf->is_funded = 1;
         lf->cached_state = factory_get_state(&lsp_p->factory,
                                                lad->current_block);
-        /* Copy signed distribution TX from ceremony (if available) */
+        /* Copy the co-signed distribution TX from the ceremony, as rotation
+           does for the factories it creates.  The unsigned one cannot be
+           relayed; without a signed copy the LSP broadcasts nothing (every
+           member holds its own co-signed copy). */
         tx_buf_init(&lf->distribution_tx, 256);
-        if (lsp_p->factory.dist_tx_ready && lsp_p->factory.dist_unsigned_tx.len > 0) {
-            /* dist_unsigned_tx holds the signed version after ceremony */
+        if (lsp_p->factory.dist_tx_ready == 2 && lsp_p->factory.dist_signed_tx.len > 0) {
             tx_buf_free(&lf->distribution_tx);
-            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_unsigned_tx.len);
-            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_unsigned_tx.data,
-                   lsp_p->factory.dist_unsigned_tx.len);
-            lf->distribution_tx.len = lsp_p->factory.dist_unsigned_tx.len;
-            printf("LSP: distribution TX stored (%zu bytes)\n",
+            tx_buf_init(&lf->distribution_tx, lsp_p->factory.dist_signed_tx.len);
+            memcpy(lf->distribution_tx.data, lsp_p->factory.dist_signed_tx.data,
+                   lsp_p->factory.dist_signed_tx.len);
+            lf->distribution_tx.len = lsp_p->factory.dist_signed_tx.len;
+            printf("LSP: signed distribution TX stored (%zu bytes)\n",
                    lf->distribution_tx.len);
         }
         lad->n_factories = 1;
@@ -4476,7 +4511,8 @@ accept_new_factory:
         mgr->rot_leaf_arity = leaf_arity;
         mgr->rot_is_regtest = is_regtest;
         mgr->rot_funding_sats = funding_sats;
-        mgr->rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
+        /* With the opt-in, rotation is automatic in daemon mode. */
+        lsp_channels_set_rotation(mgr, enable_rotation_experimental, daemon_mode);
         mgr->rot_attempted_mask = 0;
         mgr->cli_enabled = cli_mode;
         mgr->test_bad_settlement = test_bad_settlement;

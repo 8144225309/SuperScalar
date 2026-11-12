@@ -154,7 +154,7 @@ lsp_cmd = [LSP, "--seckey", LSP_SECKEY, "--amount", "1000000", "--clients", "4",
            "--wallet", WALLET, "--port", str(PORT), "--network", "regtest",
            "--rpcuser", "rpcuser", "--rpcpassword", "rpcpass", "--fee-rate", "1000",
            "--db", "/tmp/stress_lsp.db", "--report", "/tmp/stress_report.json",
-           "--daemon", "--cli"]
+           "--daemon", "--cli", "--enable-rotation-experimental"]
 lsp = subprocess.Popen(lsp_cmd, stdin=subprocess.PIPE, stdout=lsp_log,
                         stderr=subprocess.STDOUT, env=env)
 time.sleep(2)
