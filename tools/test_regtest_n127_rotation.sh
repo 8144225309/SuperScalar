@@ -83,7 +83,7 @@ echo "  clients=$N_CLIENTS arity=$ARITY amount=$AMOUNT active=$ACTIVE_BLOCKS dyi
 
 nohup "$LSP_BIN" \
     --network regtest --port "$PORT" \
-    --clients "$N_CLIENTS" --arity "$ARITY" \
+    --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree \
     --static-near-root 1 \
     --amount "$AMOUNT" \
     --active-blocks "$ACTIVE_BLOCKS" --dying-blocks "$DYING_BLOCKS" \

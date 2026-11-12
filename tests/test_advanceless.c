@@ -62,10 +62,14 @@ static secp256k1_keypair *al_keys(secp256k1_context *ctx, size_t n) {
 
 /* Init a factory of n_clients + 1 with the given shape (n_arities 1 =
    uniform), funded, and build its tree. */
+/* Agreed tree rate (sat/kvB) the al_build trees are built at. */
+static uint64_t g_al_tree_rate = FACTORY_DEFAULT_TREE_FEE_RATE;
+
 static int al_build(factory_t *f, secp256k1_context *ctx, const secp256k1_keypair *kps,
                     size_t n_clients, const uint8_t *arities, size_t n_arities,
                     uint32_t static_thr) {
     if (!factory_init(f, ctx, kps, n_clients + 1, AL_STEP, AL_STATES)) return 0;
+    f->tree_fee_rate = g_al_tree_rate;
     if (n_arities == 1)
         factory_set_arity(f, (factory_arity_t)arities[0]);
     else if (!factory_set_level_arity(f, arities, n_arities))
@@ -382,7 +386,7 @@ int test_advanceless_persist_reload(void) {
         TEST_ASSERT(factory_sign_all(f), "sign the tree");
         persist_t db;
         TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
-        TEST_ASSERT_EQ(persist_schema_version(&db), 40, "schema 40");
+        TEST_ASSERT_EQ(persist_schema_version(&db), PERSIST_SCHEMA_VERSION, "current schema");
         TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
         TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
         TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload = signed tree");
@@ -428,8 +432,8 @@ int test_advanceless_persist_reload(void) {
             AL_CHECK(al_load_refused(&db, ctx), "edited leaf nSequence refused");
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             /* Fee-rule drift: every rebuilt amount differs from the signed tree,
-               from the root down. */
-            TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET fee_per_tx = fee_per_tx + 1;",
+               from the root down (the tree is built at the agreed rate). */
+            TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = tree_fee_rate + 1000;",
                                      NULL, NULL, NULL) == SQLITE_OK, "drift fee");
             AL_CHECK(al_load_refused(&db, ctx), "changed root amounts refused");
             TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "re-save factory");
@@ -503,4 +507,57 @@ int test_advanceless_persist_reload(void) {
     free(kps);
     secp256k1_context_destroy(ctx);
     return !failed;
+}
+
+/* The agreed tree rate is part of the signed tree.  A factory saved at rate
+   100 and one saved at rate 0 reload with that rate applied before the
+   rebuild, and the rebuilt tree passes the check against the stored signed
+   transactions; the same row holding the other rate rebuilds a tree nobody
+   signed and is refused. */
+int test_advanceless_reload_tree_rate(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair *kps = al_keys(ctx, 5);
+    TEST_ASSERT(kps, "keys");
+    static const uint64_t rates[2] = { 100, 0 };
+    for (int k = 0; k < 2; k++) {
+        factory_t *f = calloc(1, sizeof(*f));
+        TEST_ASSERT(f, "alloc");
+        g_al_tree_rate = rates[k];
+        int built = al_build_default(f, ctx, kps, 4);
+        g_al_tree_rate = FACTORY_DEFAULT_TREE_FEE_RATE;
+        TEST_ASSERT(built, "build default");
+        TEST_ASSERT_EQ(f->tree_fee_rate, rates[k], "built at the rate");
+        TEST_ASSERT(factory_sign_all(f), "sign the tree");
+        persist_t db;
+        TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+        TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+        TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
+
+        factory_t *g = calloc(1, sizeof(*g));
+        TEST_ASSERT(g, "alloc");
+        TEST_ASSERT(persist_load_factory(&db, 0, g, ctx), "reload passes the tree check");
+        TEST_ASSERT_EQ(g->tree_fee_rate, rates[k], "rate restored");
+        for (size_t i = 0; i < f->n_nodes; i++) {
+            TEST_ASSERT(memcmp(g->nodes[i].txid, f->nodes[i].txid, 32) == 0,
+                        "rebuilt txid = signed txid");
+            TEST_ASSERT_EQ(g->nodes[i].fee_sats, f->nodes[i].fee_sats, "same fee");
+        }
+        factory_free(g);
+        free(g);
+        TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload = signed tree");
+
+        /* the row says another rate: its rebuild is not the signed tree */
+        TEST_ASSERT(sqlite3_exec(db.db, k == 0 ? "UPDATE factories SET tree_fee_rate = 0;"
+                                               : "UPDATE factories SET tree_fee_rate = 100;",
+                                 NULL, NULL, NULL) == SQLITE_OK, "change the rate");
+        TEST_ASSERT(al_load_refused(&db, ctx), "a different rate is refused");
+
+        persist_close(&db);
+        factory_free(f);
+        free(f);
+    }
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
 }

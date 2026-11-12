@@ -2,6 +2,7 @@
 #include "superscalar/tapscript.h"
 #include "superscalar/fee_estimator.h"
 #include "superscalar/persist.h"
+#include "superscalar/fee.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -279,7 +280,8 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->local_amount = local_amount;
     ch->remote_amount = remote_amount;
     ch->to_self_delay = to_self_delay;
-    ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB (Bitcoin Core minrelaytxfee) */
+    ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB for penalty/HTLC txs */
+    ch->commit_fee_rate_sat_per_kvb = 1000;
     ch->funder_is_local = 0;
     ch->commitment_number = 0;
 
@@ -757,6 +759,15 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             n_active_ptlcs++;
     }
 
+    /* Nothing above the relay limit is built, so nothing above it is signed. */
+    if (n_active_htlcs + n_active_ptlcs > channel_max_commit_htlc_outputs()) {
+        fprintf(stderr, "channel commitment: %zu HTLC/PTLC outputs, more than "
+                "the %zu that fit in %d vB; refusing to build it\n",
+                n_active_htlcs + n_active_ptlcs, channel_max_commit_htlc_outputs(),
+                CHANNEL_MAX_COMMIT_VSIZE);
+        return 0;
+    }
+
     /* +1 slot for the optional P2A CPFP anchor (appended last, see step 7c). */
     tx_output_t *outputs = calloc(3 + n_active_htlcs + n_active_ptlcs, sizeof(tx_output_t));
     if (!outputs) return 0;
@@ -922,15 +933,18 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
        not RBF-able once both parties sign; a keyless Pay-to-Anchor output lets
        whoever force-closes attach a high-fee child to pull the commitment into a
        block.  The 240-sat cost is moved OUT of the funder's (to_remote) output,
-       so the output sum -- and thus the implicit ~154-sat miner fee -- is
-       unchanged and to_local (the broadcaster's recoverable balance) is
+       so the output sum -- and thus the implicit miner fee, the agreed rate
+       for the commitment's exact size -- is unchanged and to_local (the broadcaster's recoverable balance) is
        untouched.  Presence + funding source are a pure function of the shared
        channel fee-rate + balances, so both co-signers build an identical tx
        (matching sighash).  Appended LAST: to_local[0]/to_remote[1]/HTLC indices
        and the count-bounded watchtower output parsers are unaffected.  Gated on a
        negotiated per-channel flag (option_anchors style) so both co-signers agree
-       and legacy/unit channels keep the anchorless format. */
-    if (ch->use_cpfp_anchor && ch->fee_rate_sat_per_kvb >= 1000) {
+       and legacy/unit channels keep the anchorless format.  Present at every
+       rate: the lower the agreed rate, the more the commitment needs a child
+       (at rate 0 it pays no fee and relays only with one; the anchor stays
+       240 sat, above dust). */
+    if (ch->use_cpfp_anchor) {
         uint64_t anchor = ANCHOR_OUTPUT_AMOUNT;
         int placed = 0;
         if (outputs[1].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
@@ -943,6 +957,15 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             outputs[out_idx].script_pubkey_len = P2A_SPK_LEN;
             outputs[out_idx].amount_sats = anchor;
             out_idx++;
+        } else if (ch->commit_fee_rate_sat_per_kvb == 0) {
+            /* Neither balance can fund the anchor and the commitment pays no
+               fee: nothing could ever get it mined.  Such a state is never
+               built, so it is never signed. */
+            fprintf(stderr, "channel commitment: balances %llu/%llu cannot fund "
+                    "the anchor of a commitment at rate 0; refusing to build it\n",
+                    (unsigned long long)outputs[0].amount_sats,
+                    (unsigned long long)outputs[1].amount_sats);
+            goto commit_tx_done;
         }
     }
 
@@ -1100,6 +1123,11 @@ int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
 void channel_set_fee_rate(channel_t *ch, uint64_t fee_rate_sat_per_kvb) {
     if (!ch) return;
     ch->fee_rate_sat_per_kvb = fee_rate_sat_per_kvb;
+}
+
+void channel_set_commit_fee_rate(channel_t *ch, uint64_t sat_per_kvb) {
+    if (!ch) return;
+    ch->commit_fee_rate_sat_per_kvb = sat_per_kvb;
 }
 
 void channel_set_persist(channel_t *ch, void *db, uint32_t channel_id) {
@@ -1764,6 +1792,31 @@ static void channel_compact_htlcs(channel_t *ch) {
     ch->n_htlcs = write;
 }
 
+size_t channel_max_commit_htlc_outputs(void) {
+    static size_t max_outputs = 0;
+    if (max_outputs == 0) {
+        size_t n = 0;
+        while (fee_keypath_tx_vsize(1, 2 + n + 1, 1) <= CHANNEL_MAX_COMMIT_VSIZE)
+            n++;
+        max_outputs = n;
+    }
+    return max_outputs;
+}
+
+size_t channel_commit_htlc_outputs(const channel_t *ch) {
+    size_t n = 0;
+    if (!ch) return 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
+            ch->htlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
+            n++;
+    for (size_t i = 0; i < ch->n_ptlcs; i++)
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE &&
+            ch->ptlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
+            n++;
+    return n;
+}
+
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
@@ -1803,6 +1856,13 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                 " < dust limit %d\n", amount_sats, CHANNEL_DUST_LIMIT_SATS);
         return 0;
     }
+    /* One more output must keep the commitment relayable. */
+    if (channel_commit_htlc_outputs(ch) >= channel_max_commit_htlc_outputs()) {
+        fprintf(stderr, "channel_add_htlc: refused — the commitment already "
+                "carries %zu HTLC/PTLC outputs, the most that fit in %d vB\n",
+                channel_commit_htlc_outputs(ch), CHANNEL_MAX_COMMIT_VSIZE);
+        return 0;
+    }
 
     /* Check sufficient balance from offerer + reserve */
     if (direction == HTLC_OFFERED) {
@@ -1835,13 +1895,14 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
         ch->remote_amount -= amount_sats;
     }
 
-    /* Dynamic fee: each HTLC adds 43 vB to commitment tx */
-    uint64_t per_htlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    /* Dynamic fee: each HTLC adds 43 vB to commitment tx, at the
+       commitment's rate */
+    uint64_t per_htlc_fee = (ch->commit_fee_rate_sat_per_kvb * 43 + 999) / 1000;
     uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
     if (*funder_bal < per_htlc_fee) {
         fprintf(stderr, "channel_add_htlc: refused — funder_bal %" PRIu64
-                " < per_htlc_fee %" PRIu64 " (fee_rate %" PRIu64 " sat/kvB)\n",
-                *funder_bal, per_htlc_fee, ch->fee_rate_sat_per_kvb);
+                " < per_htlc_fee %" PRIu64 " (commit fee rate %" PRIu64 " sat/kvB)\n",
+                *funder_bal, per_htlc_fee, ch->commit_fee_rate_sat_per_kvb);
         /* Rollback HTLC amount deduction */
         if (direction == HTLC_OFFERED) ch->local_amount += amount_sats;
         else ch->remote_amount += amount_sats;

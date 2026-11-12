@@ -162,10 +162,10 @@ CHECKPOINTS=(
     # --test-subfactory-advance-multi drives TWO back-to-back advances; the
     # second exercises the multi-input MuSig path (#142 SF-A).  Fires after the
     # warm-up payments + first advance — budget 420s.  K participants.
-    "subfactory_multi_propose|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|propose|4|3|2|420|1"
-    "subfactory_multi_nonced|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|nonced|4|3|2|420|1"
-    "subfactory_multi_signed|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|signed|4|3|2|420|1"
-    "subfactory_multi_finalize_partial|--demo --test-subfactory-advance-multi --ps-subfactory-arity 2|finalize_partial|4|3|2|420|1"
+    "subfactory_multi_propose|--demo --test-subfactory-advance-multi --allow-anchorless-tree --ps-subfactory-arity 2|propose|4|3|2|420|1"
+    "subfactory_multi_nonced|--demo --test-subfactory-advance-multi --allow-anchorless-tree --ps-subfactory-arity 2|nonced|4|3|2|420|1"
+    "subfactory_multi_signed|--demo --test-subfactory-advance-multi --allow-anchorless-tree --ps-subfactory-arity 2|signed|4|3|2|420|1"
+    "subfactory_multi_finalize_partial|--demo --test-subfactory-advance-multi --allow-anchorless-tree --ps-subfactory-arity 2|finalize_partial|4|3|2|420|1"
 
     # Factory rotation ceremony (4 kill points: rotate_pending_nonces /
     # rotate_nonces_aggregated / rotate_pending_sigs / rotate_finalize_partial,

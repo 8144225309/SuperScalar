@@ -1,5 +1,6 @@
 #include "superscalar/version.h"
 #include "superscalar/watchtower.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/persist_wt.h"
 #include "superscalar/regtest.h"
 #include "superscalar/network.h"
@@ -172,6 +173,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: cannot connect to bitcoind\n");
         return 1;
     }
+    /* Responses are TRUC transactions with P2A anchors, broadcast as
+       packages: an older node cannot relay them. */
+    if (!cpfp_check_node_version(&rt)) return 1;
 
     /* #52: point the CPFP fee-bumper at a FUNDED wallet. Without this, regtest_exec
        runs listunspent on the node's default wallet (empty for a standalone WT) ->

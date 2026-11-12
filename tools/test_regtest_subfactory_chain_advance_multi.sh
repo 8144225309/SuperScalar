@@ -162,7 +162,7 @@ env $SS_ASAN_ENV "$LSP_BIN" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" \
     --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \

@@ -100,7 +100,7 @@ env $SS_ASAN_ENV SS_MUSIG_STATELESS="${SS_MUSIG_STATELESS:-1}" "$LSP_BIN" \
     --network regtest --port "$LSP_PORT_RUN1" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \
@@ -188,7 +188,7 @@ env $SS_ASAN_ENV SS_MUSIG_STATELESS="${SS_MUSIG_STATELESS:-1}" "$LSP_BIN" \
     --network regtest --port "$LSP_PORT_RUN2" \
     --seckey "$LSP_SECKEY" \
     --clients "$N_CLIENTS" --arity 3 \
-    --ps-subfactory-arity "$PS_SUB_ARITY" \
+    --allow-anchorless-tree --ps-subfactory-arity "$PS_SUB_ARITY" \
     --amount "$FUNDING_SATS" \
     --step-blocks 1 \
     --max-conn-rate 1000 --max-handshakes 256 \

@@ -47,7 +47,7 @@ $BCLI generatetoaddress 101 "$MINE_ADDR" >/dev/null
 
 echo "--- LSP (--enable-hashlock-poison --cheat-daemon-sub + SS_CHEAT_BAD_POISON_AGGSIG=1) ---"
 env $ASAN_ENV SS_CHEAT_BAD_POISON_AGGSIG=1 "$LSP_BIN" \
-    --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 --ps-subfactory-arity $PS_SUB_ARITY \
+    --network regtest --port $LSP_PORT --clients $N_CLIENTS --arity 3 --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY \
     --amount $AMOUNT --fee-rate 1000 --confirm-timeout 600 --step-blocks 1 \
     --seckey "$LSP_SECKEY" --rpcuser ${RPCUSER:-rpcuser} --rpcpassword ${RPCPASSWORD:-rpcpass} \
     --wallet $MINER_WALLET --db "$LSP_DB" --wt-db "$WT_DB" --cli-path "$(which bitcoin-cli)" \

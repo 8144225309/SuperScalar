@@ -79,7 +79,7 @@ echo "  funding         : $AMOUNT sats"
 # LSP needs --max-conn-rate and --max-handshakes raised for N=64.
 nohup "$LSP_BIN" \
     --network "$NETWORK" --port "$PORT" \
-    --clients "$N_CLIENTS" --arity "$ARITY" \
+    --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree \
     --static-near-root "$STATIC_NEAR_ROOT" \
     --amount "$AMOUNT" \
     --active-blocks 50 --dying-blocks 20 \
