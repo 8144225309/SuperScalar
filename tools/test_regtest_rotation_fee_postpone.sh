@@ -89,7 +89,7 @@ echo "=== rotation through a fee spike: clients=$N_CLIENTS amount=$AMOUNT spike=
 LSP_PID=$!; PIDS+=($LSP_PID)
 for i in $(seq 1 60); do sleep 1; grep -q "listening" "$LSP_LOG" 2>/dev/null && break; kill -0 $LSP_PID 2>/dev/null || fail "LSP died before listening"; done
 for i in $(seq 0 $((N_CLIENTS-1))); do
-    "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $PORT --daemon \
+    "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $PORT --daemon --enable-rotation-experimental \
         --seckey "$(sk $i)" --fee-rate 1100 --lsp-pubkey "$LSP_PUB" \
         --participant-id $((i+1)) --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
         --db "$TMPDIR/c${i}.db" > "$TMPDIR/c${i}.log" 2>&1 &
