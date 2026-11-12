@@ -79,7 +79,7 @@
    the member's partial signature over the LSP's own commitment 0
    (host_commit_psig, host_commit_nonce_index).  Later commitments carry the
    same two fields in REVOKE_AND_ACK. */
-#define MSG_HOST_COMMITMENT_SIG 0x96
+#define MSG_HOST_COMMITMENT_SIG 0x9B
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */

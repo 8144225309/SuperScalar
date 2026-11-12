@@ -104,7 +104,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4E: return "PTLC_COMPLETE";
     case 0x4F: return "CHANNEL_BASEPOINTS";
     case 0x50: return "LSP_REVOKE_AND_ACK";
-    case 0x96: return "HOST_COMMITMENT_SIG";
+    case 0x9B: return "HOST_COMMITMENT_SIG";
     case 0x51: return "JIT_OFFER";
     case 0x60: return "PATH_NONCE_BUNDLE";
     case 0x61: return "PATH_ALL_NONCES";

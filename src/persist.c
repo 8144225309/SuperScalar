@@ -1512,8 +1512,10 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
-    /* The LSP's own latest commitment signature per channel, co-signed by
-       the member: what the LSP's forced exit publishes.  Idempotent. */
+    /* v48: the LSP's own latest commitment signature per channel, co-signed
+       by the member (what the LSP's forced exit publishes), and the
+       end-date payouts a member holds (below).  CREATE TABLE IF NOT EXISTS
+       is idempotent, so no version gate. */
     sqlite3_exec(p->db,
         "CREATE TABLE IF NOT EXISTS host_commitments ("
         "  channel_id INTEGER PRIMARY KEY,"
@@ -1521,9 +1523,8 @@ int persist_open(persist_t *p, const char *path) {
         "  sig64_hex TEXT NOT NULL"
         ");", NULL, NULL, NULL);
 
-    /* End-date payouts a member holds: the signed payout of every shared
-       output on its path, keyed by the output it spends.  CREATE TABLE IF
-       NOT EXISTS is idempotent, so no version gate. */
+    /* v48: end-date payouts a member holds: the signed payout of every
+       shared output on its path, keyed by the output it spends. */
     {
         char *po_err = NULL;
         if (sqlite3_exec(p->db,
