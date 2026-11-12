@@ -448,7 +448,7 @@ class Orchestrator:
             "--host", "127.0.0.1",
             "--network", self.network,
             "--db", self._client_db(index),
-            "--daemon",
+            "--daemon", "--enable-rotation-experimental",
             "--fee-rate", "1000",
             "--cli-path", self.chain.cli_path,
             "--rpcuser", self.rpcuser,

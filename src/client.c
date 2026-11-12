@@ -1,4 +1,5 @@
 #include "superscalar/client.h"
+#include "superscalar/cli_arity.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
@@ -8,6 +9,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include "superscalar/regtest.h"  /* CL7: regtest_send_raw_tx + regtest_t */
+#include <secp256k1_schnorrsig.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -483,6 +485,436 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
     if (!ok)
         fprintf(stderr, "Client: wire_send REVOKE_AND_ACK failed (cn=%llu)\n",
                 (unsigned long long)ch->commitment_number);
+    return ok;
+}
+
+int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg) {
+    if (!ch || !msg || msg->msg_type != MSG_COMMITMENT_SIGNED) return 0;
+
+    uint32_t channel_id;
+    uint64_t commitment_number;
+    unsigned char partial_sig32[32];
+    uint32_t nonce_index;
+    if (!wire_parse_commitment_signed(msg->json, &channel_id,
+                                        &commitment_number, partial_sig32,
+                                        &nonce_index)) {
+        fprintf(stderr, "Client: malformed initial COMMITMENT_SIGNED\n");
+        return 0;
+    }
+    if (commitment_number != 0 || ch->commitment_number != 0) {
+        fprintf(stderr, "Client: initial COMMITMENT_SIGNED is for commitment %llu "
+                "(channel at %llu), expected 0\n",
+                (unsigned long long)commitment_number,
+                (unsigned long long)ch->commitment_number);
+        return 0;
+    }
+
+    unsigned char full_sig64[64];
+    if (!channel_verify_and_aggregate_commitment_sig(ch, partial_sig32,
+                                                       nonce_index, full_sig64)) {
+        fprintf(stderr, "Client: initial commitment sig verification/aggregation failed\n");
+        return 0;
+    }
+    memcpy(ch->latest_commitment_sig, full_sig64, 64);
+    ch->has_latest_commitment_sig = 1;
+    return 1;
+}
+
+static int g_rotation_new_factory_saved = 0;
+
+int client_rotation_new_factory_saved(void) {
+    return g_rotation_new_factory_saved;
+}
+
+static client_verify_funding_fn g_client_verify_funding = NULL;
+static void *g_client_verify_funding_ctx = NULL;
+static int g_client_allow_unverified_funding = 0;
+static int g_client_funding_min_confs = 1;
+static int g_client_allow_rotation = 0;
+
+void client_set_funding_min_confs(int confs) {
+    g_client_funding_min_confs = confs > 0 ? confs : 1;
+}
+
+void client_set_allow_rotation(int allow) {
+    g_client_allow_rotation = allow ? 1 : 0;
+}
+
+int client_rotation_allowed(void) {
+    return g_client_allow_rotation;
+}
+
+void client_set_funding_verifier(client_verify_funding_fn fn, void *ctx) {
+    g_client_verify_funding = fn;
+    g_client_verify_funding_ctx = ctx;
+}
+
+void client_set_allow_unverified_funding(int allow) {
+    g_client_allow_unverified_funding = allow ? 1 : 0;
+}
+
+int client_check_factory_funding(const factory_t *f, uint32_t my_index,
+                                  const secp256k1_pubkey *my_pubkey) {
+    if (!f || !my_pubkey || f->n_nodes == 0) return 0;
+
+    /* Our own key must be the one at our index: the scripts below are
+       derived from this participant set. */
+    unsigned char a[33], b[33];
+    size_t al = 33, bl = 33;
+    if (my_index == 0 || my_index >= f->n_participants ||
+        !secp256k1_ec_pubkey_serialize(f->ctx, a, &al, &f->pubkeys[my_index],
+                                       SECP256K1_EC_COMPRESSED) ||
+        !secp256k1_ec_pubkey_serialize(f->ctx, b, &bl, my_pubkey,
+                                       SECP256K1_EC_COMPRESSED) ||
+        memcmp(a, b, 33) != 0) {
+        fprintf(stderr, "Client: REFUSING factory — this client's key is not at "
+                "index %u of the participant set\n", my_index);
+        return 0;
+    }
+
+    /* The funding script is not taken from the proposal: it is the script
+       the root transaction spends, derived from the participant keys. */
+    const factory_node_t *root = &f->nodes[0];
+    if (root->spending_spk_len != 34 || f->funding_spk_len != 34 ||
+        memcmp(root->spending_spk, f->funding_spk, 34) != 0) {
+        fprintf(stderr, "Client: REFUSING factory — the proposed funding script is "
+                "not the script of this participant set\n");
+        return 0;
+    }
+
+    if (!g_client_verify_funding && g_client_allow_unverified_funding) {
+        fprintf(stderr, "Client: funding output NOT looked up on chain (regtest "
+                "without --rpcuser; harness only)\n");
+        return 1;
+    }
+    if (!g_client_verify_funding) {
+        fprintf(stderr, "Client: REFUSING factory — no chain lookup is available to "
+                "verify the funding output (no working RPC connection; the "
+                "light-client mode cannot verify a funding output)\n");
+        return 0;
+    }
+    client_funding_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.unspent = -1;
+    if (!g_client_verify_funding(f->funding_txid, f->funding_vout, &out,
+                                 g_client_verify_funding_ctx)) {
+        fprintf(stderr, "Client: REFUSING factory — funding output not found on chain\n");
+        return 0;
+    }
+    if (out.spk_len != 34 || memcmp(out.spk, root->spending_spk, 34) != 0) {
+        fprintf(stderr, "Client: REFUSING factory — the funding output on chain does "
+                "not pay to this participant set\n");
+        return 0;
+    }
+    if (out.amount_sats != f->funding_amount_sats) {
+        fprintf(stderr, "Client: REFUSING factory — funding output holds %llu sats, "
+                "proposal says %llu (must be equal)\n",
+                (unsigned long long)out.amount_sats,
+                (unsigned long long)f->funding_amount_sats);
+        return 0;
+    }
+    if (out.unspent != 1) {
+        fprintf(stderr, "Client: REFUSING factory — funding output is %s\n",
+                out.unspent == 0 ? "already spent" : "of unknown spent status");
+        return 0;
+    }
+    if (out.confirmations < g_client_funding_min_confs) {
+        fprintf(stderr, "Client: REFUSING factory — funding output has %d "
+                "confirmation(s), %d required\n", out.confirmations,
+                g_client_funding_min_confs);
+        return 0;
+    }
+    printf("Client: funding output verified: script and amount (%llu sats) match, "
+           "unspent, %d confirmation(s)\n",
+           (unsigned long long)out.amount_sats, out.confirmations);
+    return 1;
+}
+
+int client_dist_locktime_acceptable(const factory_t *f, uint32_t offered) {
+    return f && offered != 0 && offered == factory_distribution_locktime(f);
+}
+
+uint64_t client_member_channel_capacity(const factory_t *f, uint32_t my_index) {
+    if (!f || my_index == 0) return 0;
+    size_t lnode;
+    uint32_t lvout;
+    if (!factory_client_to_leaf(f, (size_t)(my_index - 1), &lnode, &lvout) ||
+        lnode >= f->n_nodes || lvout >= f->nodes[lnode].n_outputs)
+        return 0;
+    uint64_t out = f->nodes[lnode].outputs[lvout].amount_sats;
+    /* the base commitment fee every channel reserves at open (client_init_channel) */
+    fee_estimator_static_t fe;
+    fee_estimator_static_init(&fe, 1000);
+    uint64_t fee = fee_for_commitment_tx(&fe.base, 0);
+    return out > fee ? out - fee : 0;
+}
+
+int client_distribution_pays_member(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t tx_len,
+                                     const secp256k1_pubkey *member_pubkey,
+                                     uint64_t required_sats) {
+    if (!ctx || !tx || !member_pubkey || tx_len == 0) return 0;
+    return client_tx_amount_to_pubkey(ctx, tx, tx_len, member_pubkey) >= required_sats;
+}
+
+int client_factory_exit_acceptable(const secp256k1_context *ctx, const factory_t *f,
+                                    uint32_t my_index,
+                                    const secp256k1_pubkey *my_pubkey) {
+    if (!ctx || !f || !my_pubkey) return 0;
+    if (f->dist_tx_ready != 2 || f->dist_unsigned_tx.len == 0) {
+        fprintf(stderr, "Client: no fully co-signed, verified distribution "
+                "transaction for this factory\n");
+        return 0;
+    }
+    uint64_t need = client_member_channel_capacity(f, my_index);
+    if (need == 0) {
+        fprintf(stderr, "Client: this member has no channel output in the factory\n");
+        return 0;
+    }
+    if (!client_distribution_pays_member(ctx, f->dist_unsigned_tx.data,
+                                         f->dist_unsigned_tx.len, my_pubkey, need)) {
+        fprintf(stderr, "Client: the distribution transaction pays this member %llu "
+                "sats, its channel capacity is %llu\n",
+                (unsigned long long)client_tx_amount_to_pubkey(ctx,
+                    f->dist_unsigned_tx.data, f->dist_unsigned_tx.len, my_pubkey),
+                (unsigned long long)need);
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 if some output of a stored tree node of factory 0 is in the UTXO set (or
+   the mempool): this client's own tree is on chain.  0 if none is, -1 if
+   the chain source could not answer for an output it was asked about. */
+static int client_own_tree_on_chain(persist_t *db, chain_backend_t *chain) {
+    if (!chain->is_outpoint_unspent) return -1;
+    int err = 0;
+    for (uint32_t ni = 0; ni < 4096; ni++) {
+        char txid[65];
+        uint32_t n_out = 0;
+        if (!persist_load_tree_node_txid(db, 0, ni, txid, &n_out)) break;
+        for (uint32_t v = 0; v < n_out && v < 1024; v++) {
+            int r = chain->is_outpoint_unspent(chain, txid, v);
+            if (r == 1) return 1;
+            if (r < 0) err = 1;
+        }
+    }
+    return err ? -1 : 0;
+}
+
+int client_force_close_plan(persist_t *db, chain_backend_t *chain,
+                             uint32_t *dist_factory_out, FILE *out) {
+    if (!db || !chain || !dist_factory_out) return -1;
+    if (!out) out = stderr;
+    *dist_factory_out = 0;
+
+    uint64_t cn = 0;
+    size_t clen = 0;
+    int has_commitment =
+        persist_load_commitment_sig(db, 0, &cn, NULL, NULL, &clen, 0) && clen > 0;
+
+    if (!persist_has_factory(db, CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+        if (has_commitment) return 1;
+        fprintf(out, "Force-close: no signed commitment in DB; NOT publishing the "
+                     "factory tree\n");
+        return 0;
+    }
+
+    char txid[65] = {0};
+    uint32_t vout = 0;
+    int have_op = persist_load_factory_outpoint(db, 0, txid, &vout, NULL);
+    int unspent = (have_op && chain->is_outpoint_unspent)
+                  ? chain->is_outpoint_unspent(chain, txid, vout) : -1;
+    if (unspent == 1 && has_commitment) {
+        fprintf(out, "Force-close: rotation pending; the factory being left (%s:%u) "
+                     "is unspent, exiting through it\n", txid, vout);
+        return 1;
+    }
+    if (unspent == 1) {
+        fprintf(out, "Force-close: rotation pending; the factory being left (%s:%u) "
+                     "is unspent but no commitment for its channel is on disk; NOT "
+                     "publishing its tree, offering its distribution transaction\n",
+                txid, vout);
+        return 0;
+    }
+    /* Funding output spent (or unknown).  If any output of this client's own
+       tree of the factory being left is in the UTXO set, the exit through it
+       is under way (an earlier pass published it) and has to be continued.
+       gettxout-style lookups answer for outputs of any age; a confirmation
+       count for the root would need an index. */
+    int own = client_own_tree_on_chain(db, chain);
+    if (own == 1 && has_commitment) {
+        fprintf(out, "Force-close: rotation pending; this client's own tree of the "
+                     "factory being left is on chain, continuing the exit through it\n");
+        return 1;
+    }
+    if (unspent != 0 || own < 0) {
+        fprintf(out, "Force-close: rotation pending and the chain source could not "
+                     "say whether %s:%u is spent or by what; nothing published, try "
+                     "again\n", txid, vout);
+        return -1;
+    }
+    *dist_factory_out = CLIENT_ROTATION_PENDING_FACTORY_ID;
+    fprintf(out, "Force-close: rotation pending and the factory being left was spent "
+                 "by another transaction; NOT publishing the factory tree of the new "
+                 "factory (no commitment for it)\n");
+    return 0;
+}
+
+int client_verify_distribution_tx(const secp256k1_context *ctx,
+                                   const unsigned char *unsigned_tx, size_t unsigned_len,
+                                   const unsigned char *sighash32,
+                                   const unsigned char *funding_spk34,
+                                   const unsigned char *signed_tx, size_t signed_len) {
+    if (!ctx || !unsigned_tx || !sighash32 || !funding_spk34 || !signed_tx) return 0;
+    if (unsigned_len == 0 || signed_len < 4 + 64) return 0;
+    if (funding_spk34[0] != 0x51 || funding_spk34[1] != 0x20) return 0;
+
+    /* The only place a key-path signature can sit is right before nLockTime.
+       Rebuild the signed form from our own bytes and that signature: anything
+       else in the LSP's transaction that differs from ours shows up here. */
+    const unsigned char *sig = signed_tx + signed_len - 4 - 64;
+    tx_buf_t expect;
+    tx_buf_init(&expect, unsigned_len + 80);
+    int same = finalize_signed_tx(&expect, unsigned_tx, unsigned_len, sig) &&
+               expect.len == signed_len &&
+               memcmp(expect.data, signed_tx, signed_len) == 0;
+    tx_buf_free(&expect);
+    if (!same) return 0;
+
+    secp256k1_xonly_pubkey key;
+    return secp256k1_xonly_pubkey_parse(ctx, &key, funding_spk34 + 2) &&
+           secp256k1_schnorrsig_verify(ctx, sig, sighash32, 32, &key);
+}
+
+uint64_t client_tx_amount_to_pubkey(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t len,
+                                     const secp256k1_pubkey *pubkey) {
+    if (!ctx || !tx || !pubkey || len < 60) return 0;
+    unsigned char spk[34], ser[32], tweak[32];
+    secp256k1_xonly_pubkey xonly, tweaked;
+    secp256k1_pubkey full;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, pubkey) ||
+        !secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) return 0;
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &full, &xonly, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &full)) return 0;
+    build_p2tr_script_pubkey(spk, &tweaked);
+
+    size_t off = 4;
+    if (tx[4] == 0x00 && tx[5] == 0x01) off += 2;      /* segwit marker + flag */
+    if (tx[off] != 1) return 0;                         /* one input */
+    off += 1 + 36;
+    if (off >= len || tx[off] != 0) return 0;           /* empty scriptSig */
+    off += 1 + 4;
+    if (off >= len || tx[off] >= 253) return 0;
+    size_t n_out = tx[off++];
+    uint64_t total = 0;
+    for (size_t i = 0; i < n_out; i++) {
+        if (off + 9 > len) return 0;
+        uint64_t amt = 0;
+        for (int b = 7; b >= 0; b--) amt = (amt << 8) | tx[off + b];
+        size_t sl = tx[off + 8];
+        if (sl >= 253 || off + 9 + sl > len) return 0;
+        if (sl == 34 && memcmp(tx + off + 9, spk, 34) == 0) total += amt;
+        off += 9 + sl;
+    }
+    return total;
+}
+
+int client_rotation_save_pending(persist_t *db, const factory_t *f,
+                                  secp256k1_context *ctx) {
+    if (!db || !f) return 0;
+    if (!persist_begin(db)) return 0;
+    int ok = persist_delete_factory_record(db, CLIENT_ROTATION_PENDING_FACTORY_ID) &&
+             persist_save_factory(db, f, ctx, CLIENT_ROTATION_PENDING_FACTORY_ID) &&
+             persist_save_tree_nodes(db, f, CLIENT_ROTATION_PENDING_FACTORY_ID);
+    if (ok && f->dist_tx_ready == 2 && f->dist_unsigned_tx.len > 0)
+        ok = persist_save_distribution_tx(db, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                          f->dist_unsigned_tx.data,
+                                          f->dist_unsigned_tx.len);
+    if (!ok) { persist_rollback(db); return 0; }
+    return persist_commit(db);
+}
+
+/* Rotation: put the new factory, its verified tree and its verified
+   distribution transaction on disk next to the factory being left, before
+   any channel set-up.  The old factory's rows and the old channel's
+   commitment stay exactly as they are: until commitment 0 of the new channel
+   is saved the client still has the old exit (for as long as the old funding
+   output is unspent) and already has the new factory's distribution
+   transaction.  Returns 0 if a database is attached and the write failed. */
+static int client_rotation_save_factory(factory_t *f, secp256k1_context *ctx,
+                                         uint32_t my_index) {
+    persist_t *db = g_client_persist;
+    if (!db) return 1;
+    if (!client_rotation_save_pending(db, f, ctx)) return 0;
+    g_rotation_new_factory_saved = 1;
+    printf("Client %u: new factory, signed tree and distribution TX saved "
+           "before channel set-up\n", my_index);
+    return 1;
+}
+
+/* Channel open: receive the LSP's COMMITMENT_SIGNED for commitment 0, which
+   the LSP sends right after the nonce exchange. */
+int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index) {
+    wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    if (!wire_recv_skip_ping(fd, &msg)) {
+        fprintf(stderr, "Client %u: connection lost waiting for the initial "
+                "COMMITMENT_SIGNED\n", my_index);
+        return 0;
+    }
+    if (check_msg_error(&msg) || msg.msg_type != MSG_COMMITMENT_SIGNED) {
+        fprintf(stderr, "Client %u: expected initial COMMITMENT_SIGNED, got 0x%02x\n",
+                my_index, msg.msg_type);
+        if (msg.json) cJSON_Delete(msg.json);
+        return 0;
+    }
+    /* The commitment about to be signed must account for the whole funding
+       output: balances == funding - base commitment fee.  The cooperative
+       close check relies on that holding from the first state on. */
+    uint64_t accounted = 0, expected = 0;
+    if (!client_channel_conserved(ch, &accounted, &expected, NULL)) {
+        fprintf(stderr, "Client %u: opening balances account for %llu sats, "
+                "funding minus commitment fee is %llu\n", my_index,
+                (unsigned long long)accounted, (unsigned long long)expected);
+        cJSON_Delete(msg.json);
+        return 0;
+    }
+    int ok = client_handle_initial_commitment_signed(ch, &msg);
+    cJSON_Delete(msg.json);
+    if (!ok)
+        fprintf(stderr, "Client %u: initial commitment rejected, channel not usable\n",
+                my_index);
+    return ok;
+}
+
+int client_persist_latest_commitment(persist_t *db, uint32_t channel_id,
+                                       const channel_t *ch) {
+    if (!db || !ch || !ch->has_latest_commitment_sig) return 0;
+
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+    tx_buf_t signed_tx;
+    tx_buf_init(&signed_tx, 512);
+    if (!finalize_signed_tx(&signed_tx, unsigned_tx.data, unsigned_tx.len,
+                             ch->latest_commitment_sig)) {
+        tx_buf_free(&unsigned_tx);
+        tx_buf_free(&signed_tx);
+        return 0;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    int ok = persist_save_commitment_sig(db, channel_id, ch->commitment_number,
+                                          ch->latest_commitment_sig,
+                                          signed_tx.data, signed_tx.len);
+    tx_buf_free(&signed_tx);
     return ok;
 }
 
@@ -1404,10 +1836,13 @@ static int client_parse_level_arity(const cJSON *arr,
 
 /* --- Apply signed tree nodes from MSG_FACTORY_READY --- */
 
-static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
-    if (!f || !json) return 0;
+int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_index) {
+    if (!f || !json) return -1;
     cJSON *signed_txs = cJSON_GetObjectItem(json, "signed_txs");
-    if (!signed_txs || !cJSON_IsArray(signed_txs)) return 0;
+    if (!signed_txs || !cJSON_IsArray(signed_txs)) {
+        fprintf(stderr, "Client: FACTORY_READY without signed tree nodes -- REFUSING factory\n");
+        return -1;
+    }
 
     int count = 0;
     int arr_size = cJSON_GetArraySize(signed_txs);
@@ -1421,59 +1856,96 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
 
         size_t node_idx = (size_t)idx_j->valuedouble;
         if (node_idx >= f->n_nodes) continue;
+        factory_node_t *node = &f->nodes[node_idx];
 
         const char *hex = hex_j->valuestring;
         size_t hex_len = strlen(hex);
-        if (hex_len < 2 || hex_len % 2 != 0) continue;
         size_t raw_len = hex_len / 2;
-
-        /* Free existing signed_tx if any, then allocate and decode */
-        tx_buf_free(&f->nodes[node_idx].signed_tx);
-        tx_buf_init(&f->nodes[node_idx].signed_tx, raw_len);
-        f->nodes[node_idx].signed_tx.len = raw_len;
-        if (hex_decode(hex, f->nodes[node_idx].signed_tx.data, raw_len)
-                != (int)raw_len) {
-            f->nodes[node_idx].signed_tx.len = 0;
-            continue;
+        unsigned char *raw = (hex_len >= 2 && hex_len % 2 == 0) ? malloc(raw_len) : NULL;
+        tx_buf_t own;
+        tx_buf_init(&own, raw_len + 8);
+        /* The node as the LSP sent it must be our own transaction for this
+           node with one signature in the witness.  Rebuild the signed form
+           from our bytes and the trailing signature and compare: what is
+           stored (and later broadcast) is our serialization, never the
+           LSP's bytes. */
+        int ok = raw && hex_decode(hex, raw, raw_len) == (int)raw_len &&
+                 raw_len >= 4 + 64 && node->is_built && node->unsigned_tx.len > 0 &&
+                 finalize_signed_tx(&own, node->unsigned_tx.data, node->unsigned_tx.len,
+                                    raw + raw_len - 4 - 64) &&
+                 own.len == raw_len && memcmp(own.data, raw, raw_len) == 0;
+        free(raw);
+        if (!ok) {
+            tx_buf_free(&own);
+            fprintf(stderr, "Client: FACTORY_READY node %zu is not this client's "
+                            "transaction for that node -- REFUSING factory\n", node_idx);
+            return -1;
         }
-        f->nodes[node_idx].is_signed = 1;
+        tx_buf_free(&node->signed_tx);
+        node->signed_tx = own;
+        node->is_signed = 1;
         count++;
     }
 
-    if (count > 0)
-        printf("Client: applied %d signed tree nodes from FACTORY_READY\n", count);
+    /* Every node this client signs for is on its way out of the factory. */
+    for (size_t i = 0; my_index > 0 && i < f->n_nodes; i++) {
+        if (factory_find_signer_slot(f, i, my_index) >= 0 && !f->nodes[i].is_signed) {
+            fprintf(stderr, "Client: FACTORY_READY lacks signed node %zu on this "
+                            "client's exit path -- REFUSING factory\n", i);
+            return -1;
+        }
+    }
+    if (count == 0) {
+        fprintf(stderr, "Client: FACTORY_READY carries no signed tree node -- "
+                        "REFUSING factory\n");
+        return -1;
+    }
+    printf("Client: applied %d signed tree nodes from FACTORY_READY\n", count);
 
-    /* GAP-SCAN (fund-safety) FIX: verify the LSP-supplied tree aggregate signatures
-       before trusting them. The client's unilateral self-exit (factory_recovery)
-       broadcasts exactly these bytes root-down; an unverified INVALID tree would be
-       rejected on-chain, freezing the client's funds under a buggy or malicious LSP
-       (the documented "self-exit always available" invariant transitively assumes
-       tree-sig validity, which was never checked client-side). factory_verify_all is
-       secret-free -- it recomputes each node sighash and schnorr-verifies against
-       node->tweaked_pubkey (data the client already holds). Refuse on failure. */
-    if (count > 0 && !factory_verify_all(f)) {
+    /* Signatures: factory_verify_all recomputes each node's sighash and
+       verifies the signature under the node's output key. */
+    if (!factory_verify_all(f)) {
         fprintf(stderr, "Client: FACTORY_READY tree aggregate signatures INVALID "
                         "-- REFUSING factory (would be unrecoverable via self-exit)\n");
         return -1;
     }
 
-    /* Parse signed distribution TX if present */
+    /* Signed distribution TX, if present.  It is the client's exit when the
+       factory expires, so it is stored only after it has been checked against
+       the client's own construction of that transaction; one that fails the
+       check, or that cannot be checked because the client built none,
+       refuses the factory. */
     cJSON *dist_hex_j = cJSON_GetObjectItem(json, "distribution_tx_hex");
     if (dist_hex_j && cJSON_IsString(dist_hex_j)) {
         const char *dhex = dist_hex_j->valuestring;
         size_t dlen = strlen(dhex);
-        if (dlen >= 2 && dlen % 2 == 0) {
-            size_t draw = dlen / 2;
+        size_t draw = dlen / 2;
+        unsigned char *raw = (dlen >= 2 && dlen % 2 == 0) ? malloc(draw) : NULL;
+        int decoded = raw && hex_decode(dhex, raw, draw) == (int)draw;
+        if (f->dist_tx_ready == 1 && f->dist_unsigned_tx.len > 0) {
+            if (!decoded ||
+                !client_verify_distribution_tx(f->ctx, f->dist_unsigned_tx.data,
+                                               f->dist_unsigned_tx.len, f->dist_sighash,
+                                               f->funding_spk, raw, draw)) {
+                fprintf(stderr, "Client: FACTORY_READY distribution TX is not the "
+                                "transaction this client built or is not validly "
+                                "signed -- REFUSING factory\n");
+                free(raw);
+                return -1;
+            }
             tx_buf_free(&f->dist_unsigned_tx);
             tx_buf_init(&f->dist_unsigned_tx, draw);
+            memcpy(f->dist_unsigned_tx.data, raw, draw);
             f->dist_unsigned_tx.len = draw;
-            if (hex_decode(dhex, f->dist_unsigned_tx.data, draw) == (int)draw) {
-                f->dist_tx_ready = 2;  /* 2 = signed distribution TX */
-                printf("Client: stored signed distribution TX (%zu bytes)\n", draw);
-            } else {
-                f->dist_unsigned_tx.len = 0;
-            }
+            f->dist_tx_ready = 2;  /* 2 = signed and verified distribution TX */
+            printf("Client: verified and stored signed distribution TX (%zu bytes)\n", draw);
+        } else {
+            fprintf(stderr, "Client: FACTORY_READY distribution TX cannot be checked "
+                            "(this client built none) -- REFUSING factory\n");
+            free(raw);
+            return -1;
         }
+        free(raw);
     }
 
     return count;
@@ -1499,6 +1971,13 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
     wire_msg_t msg;
+    g_rotation_new_factory_saved = 0;
+    if (!g_client_allow_rotation) {
+        fprintf(stderr, "Client %u: REFUSING rotation proposal — factory rotation is "
+                "not enabled (--enable-rotation-experimental)\n", my_index);
+        client_send_error(fd, "rotation_not_enabled");
+        return 0;
+    }
 
     /* Parse FACTORY_PROPOSE from initial_propose */
     const cJSON *pj = initial_propose->json;
@@ -1537,6 +2016,18 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     cJSON *rsnr_item = cJSON_GetObjectItem(pj, "static_threshold_depth");
     uint32_t rot_static_threshold =
         (rsnr_item && cJSON_IsNumber(rsnr_item)) ? (uint32_t)rsnr_item->valuedouble : 0;
+    {
+        char cltv_err[320];
+        uint32_t exit_blocks = cli_factory_exit_blocks(
+            rot_n_level_arity > 0 ? rot_level_arities : NULL, rot_n_level_arity,
+            (factory_arity_t)rot_leaf_arity, 1, n_participants - 1,
+            rot_static_threshold, step_blocks, states_per_layer);
+        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+                                        cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "Client %u: REFUSING rotation: %s\n", my_index, cltv_err);
+            return 0;
+        }
+    }
 
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *rpm_item = cJSON_GetObjectItem(pj, "placement_mode");
@@ -1635,6 +2126,13 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     }
     printf("Client %u: rotation tree OK (%zu nodes)\n", my_index, factory_out->n_nodes);
     fflush(stdout);
+    /* Nothing is signed for, or recorded about, a factory whose funding
+       output has not been checked against the client's own derivation. */
+    if (!client_check_factory_funding(factory_out, my_index, &my_pubkey)) {
+        fprintf(stderr, "Client %u: REFUSING rotation — funding check failed\n", my_index);
+        client_send_error(fd, "funding_tx_verification_failed");
+        return 0;
+    }
     if (!factory_sessions_init(factory_out)) {
         printf("Client %u: ROTATION SESSIONS_INIT FAILED\n", my_index);
         fflush(stdout);
@@ -1868,13 +2366,29 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         free(secnonces); free(nonce_entries); return 0;
     }
     {
-        int fr_apply = client_apply_factory_ready(factory_out, msg.json);
+        int fr_apply = client_apply_factory_ready(factory_out, msg.json, my_index);
         cJSON_Delete(msg.json);
         if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse (fund-safety) */
             fprintf(stderr, "Client: refusing rotation -- LSP factory tree failed "
                             "signature verification\n");
             free(secnonces); free(nonce_entries); return 0;
         }
+    }
+
+    /* The client leaves a factory only for one it can get out of on its own:
+       the new factory must come with a verified, signed distribution
+       transaction that pays this client at least its current balance. */
+    if (!client_factory_exit_acceptable(ctx, factory_out, my_index, &my_pubkey)) {
+        fprintf(stderr, "Client %u: REFUSING rotation — no acceptable exit from the "
+                "new factory\n", my_index);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+
+    /* Durable before anything else can fail. */
+    if (!client_rotation_save_factory(factory_out, ctx, my_index)) {
+        fprintf(stderr, "Client %u: could not save the new factory; stopping the "
+                "rotation\n", my_index);
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     /* Basepoint exchange: receive LSP's basepoints */
@@ -2044,6 +2558,11 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 
         channel_set_remote_pubnonces(channel_out,
             (const unsigned char (*)[66])lsp_nonces, lsp_nonce_count);
+    }
+
+    /* Signed commitment 0 for the new channel, before it is used. */
+    if (!client_recv_initial_commitment(fd, channel_out, my_index)) {
+        free(secnonces); free(nonce_entries); return 0;
     }
 
     free(secnonces);
@@ -2244,29 +2763,6 @@ static int client_factory_creation_stateless_signing(
                     }
                 }
             }
-            /* SECURITY: this client must not co-sign a dist TX that shorts its own
-               payout.  Verify amounts[my client idx] >= its channel balance minus
-               a small fee/anchor tolerance. */
-            if (ok && n_amt > 0) {
-                size_t ci = (size_t)(my_index - 1);
-                uint64_t my_amt = (ci < n_amt) ? dist_amounts[ci] : 0;
-                uint64_t my_chan_bal = 0;
-                size_t lnode; uint32_t lvout;
-                if (factory_client_to_leaf(factory, ci, &lnode, &lvout) &&
-                    lnode < factory->n_nodes &&
-                    lvout < factory->nodes[lnode].n_outputs)
-                    my_chan_bal = factory->nodes[lnode].outputs[lvout].amount_sats;
-                const uint64_t DIST_VERIFY_TOL = 1500;  /* fee+anchor share slack */
-                if (my_amt == 0 ||
-                    (my_chan_bal > DIST_VERIFY_TOL &&
-                     my_amt + DIST_VERIFY_TOL < my_chan_bal)) {
-                    fprintf(stderr, "Client-stateless %u: dist output %llu shorts my "
-                            "channel balance %llu -- refusing to co-sign dist TX\n",
-                            my_index, (unsigned long long)my_amt,
-                            (unsigned long long)my_chan_bal);
-                    ok = 0;
-                }
-            }
             /* Rebuild the IDENTICAL unsigned dist TX from the LSP-sent amounts,
                then co-sign over our own computed sighash. */
             if (ok) {
@@ -2274,10 +2770,29 @@ static int client_factory_creation_stateless_signing(
                 size_t nd = factory_compute_distribution_outputs_balanced(
                     factory, douts, FACTORY_MAX_SIGNERS + 1, 500,
                     (n_amt > 0) ? dist_amounts : NULL, n_amt);
-                if (nd > 0 && dist_nlock > 0 &&
-                    factory_build_distribution_tx_unsigned(factory, douts, nd,
-                                                           dist_nlock) &&
-                    factory_session_init_dist(factory)) {
+                if (nd > 0 && !client_dist_locktime_acceptable(factory, dist_nlock))
+                    fprintf(stderr, "Client-stateless %u: distribution locktime %u is "
+                            "not this factory's (%u) -- refusing to co-sign dist TX\n",
+                            my_index, dist_nlock, factory_distribution_locktime(factory));
+                int built = nd > 0 && client_dist_locktime_acceptable(factory, dist_nlock) &&
+                    factory_build_distribution_tx_unsigned(factory, douts, nd, dist_nlock);
+                /* This member co-signs only a distribution TX that pays it its
+                   full channel capacity (the same rule the factory is accepted
+                   by, below). */
+                if (built) {
+                    secp256k1_pubkey me;
+                    uint64_t need = client_member_channel_capacity(factory, my_index);
+                    if (!secp256k1_keypair_pub(ctx, &me, keypair) || need == 0 ||
+                        !client_distribution_pays_member(ctx, factory->dist_unsigned_tx.data,
+                                                         factory->dist_unsigned_tx.len,
+                                                         &me, need)) {
+                        fprintf(stderr, "Client-stateless %u: distribution TX does not pay "
+                                "this member its channel capacity (%llu) -- refusing to "
+                                "co-sign dist TX\n", my_index, (unsigned long long)need);
+                        built = 0;
+                    }
+                }
+                if (built && factory_session_init_dist(factory)) {
                     int set_ok = 1;
                     secp256k1_musig_pubnonce pn0;
                     if (!musig_pubnonce_parse(ctx, &pn0, lsp_dist_pn) ||
@@ -2431,6 +2946,7 @@ int client_run_with_channels(secp256k1_context *ctx,
                               void *verify_ctx) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+    client_set_funding_verifier(verify_funding, verify_ctx);
 
     /* Connect to LSP */
     int fd = wire_connect(host, port);
@@ -2619,6 +3135,25 @@ int client_run_with_channels(secp256k1_context *ctx,
     uint32_t ps_subfactory_arity_in =
         (psa_item && cJSON_IsNumber(psa_item)) ? (uint32_t)psa_item->valuedouble : 0;
 
+    /* The timeout must leave room for this member's exit from the proposed
+       tree, computed from the proposal's shape as the builder does. */
+    {
+        char cltv_err[320];
+        uint32_t exit_blocks = cli_factory_exit_blocks(
+            n_level_arity > 0 ? level_arities : NULL, n_level_arity,
+            (factory_arity_t)leaf_arity,
+            ps_subfactory_arity_in > 1 ? ps_subfactory_arity_in : 1, n_participants - 1,
+            static_threshold_depth, step_blocks, states_per_layer);
+        if (!cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+                                        cltv_err, sizeof(cltv_err))) {
+            fprintf(stderr, "Client: REFUSING factory: %s\n", cltv_err);
+            client_send_error(fd, "factory CLTV timeout is not safely in the future");
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            return 0;
+        }
+    }
+
     /* Parse placement + economic mode (optional, backward-compatible) */
     cJSON *pm_item = cJSON_GetObjectItem(msg.json, "placement_mode");
     int placement_mode = (pm_item && cJSON_IsNumber(pm_item)) ? (int)pm_item->valuedouble : 0;
@@ -2701,37 +3236,8 @@ int client_run_with_channels(secp256k1_context *ctx,
 
     cJSON_Delete(msg.json);
 
-    /* Verify funding TX on-chain before signing anything.  If the caller
-       provided a verify_funding callback (e.g. backed by RPC or BIP 158),
-       query the chain for the actual output amount.  An adversarial LSP could
-       claim a larger funding_amount than actually exists on-chain; without
-       this check the client would sign a tree against phantom funds. */
-    if (verify_funding) {
-        if (!verify_funding(funding_txid, funding_vout, funding_amount,
-                            verify_ctx)) {
-            fprintf(stderr, "Client: funding TX verification FAILED — "
-                    "on-chain output does not match claimed %llu sats. "
-                    "Refusing to sign factory tree.\n",
-                    (unsigned long long)funding_amount);
-            client_send_error(fd, "funding_tx_verification_failed");
-            wire_close(fd);
-            return 0;
-        }
-    } else {
-        /* SF-FUND-VERIFY-REFUSE #197: library-layer warning.  Hard refusal
-           moved to the binary launch path in tools/superscalar_client.c
-           (refuses startup on non-regtest networks without --rpcuser /
-           --light-client).  Library callers that legitimately want to
-           proceed without verification (in-process tests, regtest
-           scaffolds) get this loud warning instead of an unconditional
-           refusal. */
-        fprintf(stderr, "Client: WARNING — funding TX NOT VERIFIED on-chain "
-                "(no chain backend wired). Trusting LSP-supplied "
-                "funding_amount of %llu sats. THIS IS UNSAFE ON ANY "
-                "PRODUCTION NETWORK; see audit 2026-05-17.\n",
-                (unsigned long long)funding_amount);
-    }
-
+    /* The funding output is verified below, once the tree is built and the
+       client's own derivation of the funding script exists. */
     /* Build factory locally (heap — factory_t is ~3MB).
        SF-followup #145: factory ptr is registered with g_client_active_factory
        once it's initialized below, so MSG_FUNDING_REORG can find it. */
@@ -2837,6 +3343,17 @@ int client_run_with_channels(secp256k1_context *ctx,
         return 0;
     }
 
+    /* Before signing anything: the funding output must be on chain, unspent
+       and confirmed, with exactly the script this participant set produces
+       and exactly the proposed amount. */
+    if (!client_check_factory_funding(factory, my_index, &my_pubkey)) {
+        client_send_error(fd, "funding_tx_verification_failed");
+        factory_free(factory);
+        free(factory);
+        wire_close(fd);
+        return 0;
+    }
+
     /* Initialize signing sessions */
     if (!factory_sessions_init(factory)) {
         fprintf(stderr, "Client: factory_sessions_init failed\n");
@@ -2892,7 +3409,7 @@ int client_run_with_channels(secp256k1_context *ctx,
                 goto fail;
             }
             if (msg.msg_type == MSG_FACTORY_READY) {
-                int fr_apply = client_apply_factory_ready(factory, msg.json);
+                int fr_apply = client_apply_factory_ready(factory, msg.json, my_index);
                 cJSON_Delete(msg.json);
                 if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse */
                     fprintf(stderr, "Client: refusing factory -- tree failed "
@@ -3174,7 +3691,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             goto fail;
         }
         {
-            int fr_apply = client_apply_factory_ready(factory, msg.json);
+            int fr_apply = client_apply_factory_ready(factory, msg.json, my_index);
             cJSON_Delete(msg.json);
             if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse */
                 fprintf(stderr, "Client: refusing factory -- tree failed "
@@ -3184,18 +3701,23 @@ int client_run_with_channels(secp256k1_context *ctx,
         }
     }
 
-    /* Log expected distribution amount.  The distribution TX is a fallback
-       (used only if the factory expires without cooperative rotation), so
-       this is informational.  The hard enforcement is in
-       client_do_factory_rotation where the client REFUSES to sign if
-       dist_amounts[my_index-1] < channel balance. */
-    if (factory->dist_tx_ready && n_participants > 1 && my_index >= 1) {
-        uint64_t expected_dist_sats = funding_amount / n_participants;
-        printf("Client %u: distribution TX received — expected share "
-               "~%llu sats (equal split of %llu / %zu participants)\n",
-               my_index, (unsigned long long)expected_dist_sats,
-               (unsigned long long)funding_amount, n_participants);
+    /* The factory is accepted only with a fully co-signed, verified
+       distribution transaction paying this member its channel capacity: the
+       member's exit at the factory's end must not depend on the LSP.  Same
+       rule as for a rotation. */
+    if (!client_factory_exit_acceptable(ctx, factory, my_index, &my_pubkey)) {
+        fprintf(stderr, "Client %u: REFUSING factory — no acceptable distribution "
+                "transaction\n", my_index);
+        client_send_error(fd, "distribution_tx_missing_or_invalid");
+        goto fail;
     }
+    printf("Client %u: distribution TX verified: pays this member %llu sats "
+           "(channel capacity %llu), nLockTime %u\n", my_index,
+           (unsigned long long)client_tx_amount_to_pubkey(ctx, factory->dist_unsigned_tx.data,
+                                                          factory->dist_unsigned_tx.len,
+                                                          &my_pubkey),
+           (unsigned long long)client_member_channel_capacity(factory, my_index),
+           factory_distribution_locktime(factory));
 
     printf("Client %u: factory creation complete!\n", my_index);
 
@@ -3407,6 +3929,14 @@ int client_run_with_channels(secp256k1_context *ctx,
 
         printf("Client %u: nonce exchange complete (%zu nonces)\n",
                my_index, channel.remote_nonce_count);
+
+        /* The LSP now signs the client's commitment 0.  The channel is not
+           handed to the callback (and so cannot send or receive) until the
+           client holds a fully signed commitment paying its opening balance. */
+        if (!client_recv_initial_commitment(fd, &channel, my_index))
+            goto fail;
+        printf("Client %u: initial commitment signed (local=%llu sats)\n",
+               my_index, (unsigned long long)channel.local_amount);
 
         /* Call the channel callback */
         int cb_ret = channel_cb(fd, &channel, my_index, ctx, keypair,

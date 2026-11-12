@@ -1390,6 +1390,13 @@ extern int test_cli_arity_rejects_negative(void);
 extern int test_cli_arity_rejects_non_numeric(void);
 extern int test_cli_arity_rejects_mixed_with_oversize_entry(void);
 extern int test_cli_arity_rejects_empty(void);
+extern int test_cli_factory_cltv_floor(void);
+extern int test_cli_proposed_cltv_floor(void);
+extern int test_client_dist_verify_accepts_signed(void);
+extern int test_client_dist_verify_rejects(void);
+extern int test_client_dist_step_never_early(void);
+extern int test_client_dist_step_spent_and_confirmed(void);
+extern int test_client_dist_daemon_exit_rule(void);
 extern int test_cli_static_near_root_parses_1(void);
 extern int test_cli_static_near_root_parses_zero_disabled(void);
 extern int test_cli_static_near_root_rejects_negative(void);
@@ -1417,6 +1424,21 @@ extern int test_prometheus_client_counter(void);
 extern int test_reconnect_wire(void);
 extern int test_reconnect_pubkey_match(void);
 extern int test_reconnect_nonce_reexchange(void);
+extern int test_initial_commitment_signed_at_open(void);
+extern int test_initial_commitment_rejects_invalid(void);
+extern int test_initial_commitment_persist_reload(void);
+extern int test_initial_commitment_recv_checks_conservation(void);
+extern int test_rotation_commitment_carries_balance(void);
+extern int test_distribution_tx_verification(void);
+extern int test_client_funding_check(void);
+extern int test_client_factory_ready_handler(void);
+extern int test_client_distribution_exit_checks(void);
+extern int test_client_force_close_plan(void);
+extern int test_client_funding_depth_and_order(void);
+extern int test_client_rotation_disabled(void);
+extern void client_set_allow_unverified_funding(int allow);
+extern void client_set_allow_rotation(int allow);
+extern int test_rotation_pending_record(void);
 extern int test_client_persist_reload(void);
 
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
@@ -2020,6 +2042,7 @@ extern int test_regtest_ps_old_state_response(void);
 /* Mainnet Audit: Password-Hardened KDF */
 extern int test_network_is_mainnet(void);
 extern int test_network_canonical(void);
+extern int test_network_funding_confs(void);
 extern int test_network_gate_risk_accepted(void);
 extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
@@ -3443,6 +3466,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cli_arity_rejects_non_numeric);
     RUN_TEST(test_cli_arity_rejects_mixed_with_oversize_entry);
     RUN_TEST(test_cli_arity_rejects_empty);
+    RUN_TEST(test_cli_factory_cltv_floor);
+    RUN_TEST(test_cli_proposed_cltv_floor);
+    RUN_TEST(test_client_dist_verify_accepts_signed);
+    RUN_TEST(test_client_dist_verify_rejects);
+    RUN_TEST(test_client_dist_step_never_early);
+    RUN_TEST(test_client_dist_step_spent_and_confirmed);
+    RUN_TEST(test_client_dist_daemon_exit_rule);
     RUN_TEST(test_cli_static_near_root_parses_1);
     RUN_TEST(test_cli_static_near_root_parses_zero_disabled);
     RUN_TEST(test_cli_static_near_root_rejects_negative);
@@ -3471,6 +3501,21 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_wire);
     RUN_TEST(test_reconnect_pubkey_match);
     RUN_TEST(test_reconnect_nonce_reexchange);
+    RUN_TEST(test_initial_commitment_signed_at_open);
+    RUN_TEST(test_initial_commitment_rejects_invalid);
+    RUN_TEST(test_initial_commitment_persist_reload);
+    RUN_TEST(test_initial_commitment_recv_checks_conservation);
+    RUN_TEST(test_rotation_commitment_carries_balance);
+    RUN_TEST(test_distribution_tx_verification);
+    RUN_TEST(test_client_funding_check);
+    RUN_TEST(test_client_factory_ready_handler);
+    RUN_TEST(test_client_distribution_exit_checks);
+    RUN_TEST(test_client_force_close_plan);
+    RUN_TEST(test_client_funding_depth_and_order);
+    RUN_TEST(test_client_rotation_disabled);
+    client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
+    RUN_TEST(test_rotation_pending_record);
     RUN_TEST(test_client_persist_reload);
 
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
@@ -4064,6 +4109,7 @@ static void run_unit_tests(void) {
     printf("\n=== Network Names & Mainnet Start-up Gates ===\n");
     RUN_TEST(test_network_is_mainnet);
     RUN_TEST(test_network_canonical);
+    RUN_TEST(test_network_funding_confs);
     RUN_TEST(test_network_gate_risk_accepted);
     RUN_TEST(test_network_gate_cmdline_seckey);
     RUN_TEST(test_network_gate_no_test_scaffolding);
@@ -4246,6 +4292,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_counts_ptlc_fee);
     RUN_TEST(test_client_close_honest_ceremony);
     RUN_TEST(test_client_run_with_channels_checks_close);
+    extern int test_lsp_dist_cheats_need_cheat_gate(void);
+    RUN_TEST(test_lsp_dist_cheats_need_cheat_gate);
     extern int test_client_leaf_realloc_acceptable(void);
     extern int test_client_leaf_realloc_handler_refuses_all(void);
     extern int test_client_leaf_realloc_ceremony_refused(void);
@@ -4407,6 +4455,10 @@ static void run_regtest_tests(void) {
 
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
+
+    /* In-process ceremonies have no chain to look a funding output up in. */
+    client_set_allow_unverified_funding(1);
+    client_set_allow_rotation(1);
 
     if (argc < 2)
         run_unit = 1;

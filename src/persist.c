@@ -7445,6 +7445,77 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
 }
 
 
+int persist_delete_factory_record(persist_t *p, uint32_t factory_id)
+{
+    if (!p || !p->db) return 0;
+    static const char *const sqls[] = {
+        "DELETE FROM factories WHERE id = ?;",
+        "DELETE FROM factory_participants WHERE factory_id = ?;",
+        "DELETE FROM tree_nodes WHERE factory_id = ?;",
+        "DELETE FROM distribution_txs WHERE factory_id = ?;",
+    };
+    for (size_t i = 0; i < sizeof(sqls) / sizeof(sqls[0]); i++) {
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(p->db, sqls[i], -1, &stmt, NULL) != SQLITE_OK)
+            return 0;
+        sqlite3_bind_int(stmt, 1, (int)factory_id);
+        int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+int persist_load_tree_node_txid(persist_t *p, uint32_t factory_id,
+                                 uint32_t node_index, char *txid_hex65,
+                                 uint32_t *n_outputs_out)
+{
+    if (!p || !p->db || !txid_hex65) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT txid, n_outputs FROM tree_nodes WHERE factory_id = ? AND node_index = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_index);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        if (t && strlen(t) == 64) {
+            memcpy(txid_hex65, t, 65);
+            if (n_outputs_out) *n_outputs_out = (uint32_t)sqlite3_column_int(stmt, 1);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+int persist_load_factory_outpoint(persist_t *p, uint32_t factory_id,
+                                   char *txid_hex65, uint32_t *vout_out,
+                                   uint32_t *cltv_timeout_out)
+{
+    if (!p || !p->db || !txid_hex65) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db,
+            "SELECT funding_txid, funding_vout, cltv_timeout FROM factories WHERE id = ?;",
+            -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(stmt, 0);
+        if (t && strlen(t) == 64) {
+            memcpy(txid_hex65, t, 65);
+            if (vout_out) *vout_out = (uint32_t)sqlite3_column_int(stmt, 1);
+            if (cltv_timeout_out) *cltv_timeout_out = (uint32_t)sqlite3_column_int(stmt, 2);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 /* --- Distribution TX (schema v14) --- */
 
 int persist_save_distribution_tx(persist_t *p, uint32_t factory_id,

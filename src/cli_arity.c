@@ -188,3 +188,66 @@ int cli_validate_mainnet_step_floor(const char *network, uint16_t step_blocks,
         (unsigned)CLI_ARITY_MAINNET_MIN_STEP_BLOCKS);
     return 0;
 }
+
+uint32_t cli_factory_exit_blocks(const uint8_t *level_arities, size_t n_level_arity,
+                                 factory_arity_t leaf_arity,
+                                 uint32_t ps_subfactory_arity, size_t n_clients,
+                                 uint32_t static_threshold, uint16_t step_blocks,
+                                 uint32_t states_per_layer)
+{
+    uint64_t ewt = factory_compute_ewt_for_shape(level_arities, n_level_arity,
+                                                 leaf_arity, ps_subfactory_arity,
+                                                 n_clients,
+                                                 static_threshold, step_blocks,
+                                                 states_per_layer);
+    uint32_t depth = 1;
+    while (depth < 32 && ((size_t)1 << (depth - 1)) < n_clients) depth++;
+    uint64_t total = ewt + (2u * depth + 3u) +
+                     2u * (uint64_t)depth * CLI_FACTORY_TIMEOUT_STEP;
+    return total > UINT32_MAX / 2 ? UINT32_MAX / 2 : (uint32_t)total;
+}
+
+int cli_validate_factory_cltv(uint32_t cltv_timeout, uint32_t created,
+                              uint32_t active_blocks, uint32_t dying_blocks,
+                              uint32_t exit_blocks,
+                              char *err_buf, size_t err_buf_len)
+{
+    uint64_t expired = (uint64_t)created + active_blocks + dying_blocks;
+    uint64_t exit_by = (uint64_t)created + exit_blocks + CLI_FACTORY_CLTV_MARGIN;
+    uint64_t need = expired > exit_by + 1 ? expired : exit_by + 1;
+    if ((uint64_t)cltv_timeout >= need) return 1;
+    cli_set_err(err_buf, err_buf_len,
+        "Error: factory CLTV timeout %u is too early: a factory created at "
+        "block %u with %u active and %u dying blocks expires at block %llu, "
+        "and a member's exit can take %u blocks (+%u margin); its "
+        "distribution TX and timeout paths must not be valid before then. "
+        "Use --cltv-timeout %llu or later (or leave it unset).",
+        (unsigned)cltv_timeout, (unsigned)created, (unsigned)active_blocks,
+        (unsigned)dying_blocks, (unsigned long long)expired,
+        (unsigned)exit_blocks, (unsigned)CLI_FACTORY_CLTV_MARGIN,
+        (unsigned long long)need);
+    return 0;
+}
+
+int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
+                               uint32_t exit_blocks,
+                               char *err_buf, size_t err_buf_len)
+{
+    if (tip == 0) return 1;
+    uint64_t need = (uint64_t)tip + exit_blocks + CLI_FACTORY_CLTV_MARGIN;
+    if ((uint64_t)cltv_timeout > need) return 1;
+    cli_set_err(err_buf, err_buf_len,
+        "factory CLTV timeout %u is not safely in the future: chain tip %u, "
+        "and a member's exit from this tree can take %u blocks (+%u margin); "
+        "the distribution TX and the LSP's timeout paths would be valid "
+        "before the exit could confirm",
+        (unsigned)cltv_timeout, (unsigned)tip, (unsigned)exit_blocks,
+        (unsigned)CLI_FACTORY_CLTV_MARGIN);
+    return 0;
+}
+
+uint32_t cli_factory_auto_cltv_offset(uint32_t base_offset, uint32_t exit_blocks)
+{
+    uint32_t need = exit_blocks + CLI_FACTORY_CLTV_MARGIN + CLI_FACTORY_TIP_SKEW + 1;
+    return base_offset > need ? base_offset : need;
+}

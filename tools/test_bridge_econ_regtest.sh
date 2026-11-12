@@ -127,11 +127,12 @@ echo "  (using factory arity: $SS_ARITY)"
 # lsp_validate_cltv_for_forward() rejects an inbound HTLC whose expiry is not
 # before the factory CLTV. The regtest auto-CLTV is only current+35, shorter
 # than CLN's final CLTV delta, so without a pin every bridged HTLC is rejected.
-# Pin the factory to a production-like lifetime (matching --active-blocks 500),
-# as test_bridge_regtest.sh does. The check itself is unchanged.
+# Pin the factory to a production-like lifetime, past the end of --active-blocks
+# 500 (plus the 102 blocks the LSP mines before creating it on regtest), as
+# test_bridge_regtest.sh does. The check itself is unchanged.
 CUR_HEIGHT=$($BCLI getblockcount)
 [ -n "$CUR_HEIGHT" ] || { echo "FAIL: getblockcount returned nothing"; exit 1; }
-FACTORY_CLTV=$(( CUR_HEIGHT + 500 ))
+FACTORY_CLTV=$(( CUR_HEIGHT + 700 ))
 stdbuf -oL $LSP_BIN --daemon --cli --network regtest --port "$LSP_PORT" \
     --seckey "$LSP_SECKEY" --clients 4 --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" --rpcuser rpcuser --rpcpassword rpcpass \

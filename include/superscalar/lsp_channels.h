@@ -416,6 +416,14 @@ int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 /* Send CHANNEL_READY to all clients. Returns 1 on success. */
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
+/* Rotation: carry a client's balance from its old channel into the freshly
+   initialised channel ch of the new factory.  The channel keeps the funding
+   amount of its leaf output and its fee rate, exactly as at channel open, so
+   both sides build the same commitment; the client gets client_balance and
+   the LSP the rest of the usable amount.  Returns 0 and leaves the default
+   split if client_balance does not fit in the new channel. */
+int lsp_channel_carry_client_balance(channel_t *ch, uint64_t client_balance);
+
 /* Handle an incoming channel message from a client.
    Dispatches based on msg_type. Returns 1 on success, 0 on error. */
 int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,

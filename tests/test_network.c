@@ -28,6 +28,20 @@ int test_network_is_mainnet(void) {
     return 1;
 }
 
+/* The funding depth both daemons default to, and the override. */
+int test_network_funding_confs(void) {
+    TEST_ASSERT(network_funding_confs("regtest", 0) == 1, "regtest default 1");
+    TEST_ASSERT(network_funding_confs("signet", 0) == 3, "signet default 3");
+    TEST_ASSERT(network_funding_confs("testnet", 0) == 3, "testnet default 3");
+    TEST_ASSERT(network_funding_confs("testnet4", 0) == 3, "testnet4 default 3");
+    for (size_t i = 0; i < N_MAINNET; i++)
+        TEST_ASSERT(network_funding_confs(MAINNET_NAMES[i], 0) == 6, "mainnet default 6");
+    TEST_ASSERT(network_funding_confs("mainnet", 2) == 2, "override wins");
+    TEST_ASSERT(network_funding_confs("regtest", 4) == 4, "override wins on regtest");
+    TEST_ASSERT(network_funding_confs("signet", -1) == 3, "non-positive override ignored");
+    return 1;
+}
+
 int test_network_canonical(void) {
     const char *c = network_canonical("bitcoin");
     TEST_ASSERT(c && strcmp(c, "mainnet") == 0, "bitcoin canonicalises to mainnet");
