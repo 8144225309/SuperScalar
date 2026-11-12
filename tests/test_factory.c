@@ -8694,6 +8694,7 @@ static int ready_refused(secp256k1_context *ctx, const secp256k1_keypair *kps,
     case 2:   /* transaction body differs from the client's own */
     case 3:   /* signature does not verify */
         hex = strdup(cJSON_GetObjectItem(root, "tx_hex")->valuestring);
+        if (!hex) { cJSON_Delete(json); factory_free(cf); free(cf); return -2; }
         {
             size_t at = (mutation == 2) ? 20 : strlen(hex) - 20;
             hex[at] = (hex[at] == '0') ? '1' : '0';

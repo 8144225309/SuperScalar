@@ -3560,6 +3560,7 @@ int test_distribution_tx_verification(void) {
 
     /* an output amount changed by the sender */
     unsigned char *bad = malloc(stx.len);
+    TEST_ASSERT(bad, "alloc");
     memcpy(bad, stx.data, stx.len);
     bad[49] ^= 0x01;
     TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
