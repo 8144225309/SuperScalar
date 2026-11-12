@@ -5868,3 +5868,62 @@ int test_autosettle_sends_large_commitment(void) {
     persist_close(&db);
     return 1;
 }
+
+
+/* A factory row without a tree fee rate (one written before schema v40, or
+   damaged) cannot rebuild the tree that was signed: built at the floor rate
+   instead, every tree txid would differ from the signed ones.  The loader
+   refuses it. */
+int test_persist_factory_without_tree_rate_refused(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        if (!secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i])) return 0;
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char internal_ser[32];
+    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) return 0;
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) return 0;
+    secp256k1_xonly_pubkey tweaked_xonly;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) return 0;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f, "alloc");
+    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    f->use_tree_anchor = 1;
+    f->tree_fee_rate = 3000;
+    unsigned char fake_txid[32] = {0};
+    fake_txid[0] = 0xDE;
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+
+    factory_t *f2 = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(f2, "alloc");
+    TEST_ASSERT(persist_load_factory(&db, 0, f2, ctx), "a row with its rate loads");
+    TEST_ASSERT_EQ(f2->tree_fee_rate, 3000, "rate loaded");
+    TEST_ASSERT(memcmp(f2->nodes[0].txid, f->nodes[0].txid, 32) == 0, "same tree");
+    factory_free(f2);
+
+    /* what a row migrated from schema v39 holds: the column default */
+    TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = 0 WHERE id = 0;",
+                             NULL, NULL, NULL) == SQLITE_OK, "clear the rate");
+    memset(f2, 0, sizeof(*f2));
+    TEST_ASSERT(!persist_load_factory(&db, 0, f2, ctx),
+                "a row without a tree fee rate is refused");
+    factory_free(f2);
+    free(f2);
+    factory_free(f);
+    free(f);
+    persist_close(&db);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

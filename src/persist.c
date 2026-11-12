@@ -2408,6 +2408,18 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         sqlite3_finalize(stmt);
         return 0;
     }
+    /* The tree is rebuilt at the rate it was signed at.  A row without one
+       (written before schema v40, where the column defaults to 0) would be
+       rebuilt at the floor rate: different amounts, different txids, and no
+       signature for any of them. */
+    if (tree_fee_rate < FEE_PRESIGNED_FLOOR_SAT_PER_KVB) {
+        fprintf(stderr, "persist_load_factory: ERROR: factory %u has no tree fee "
+                "rate (%llu sat/kvB; written before schema v40?): its signed tree "
+                "cannot be rebuilt from this row; refusing to load it\n",
+                factory_id, (unsigned long long)tree_fee_rate);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
 
     (void)cltv_timeout;
 
