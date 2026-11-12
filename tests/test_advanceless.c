@@ -26,6 +26,14 @@
     } \
 } while(0)
 
+/* Records a failure and goes on, so each refusal case reports on its own. */
+#define AL_CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        failed = 1; \
+    } \
+} while(0)
+
 #define AL_STEP   10
 #define AL_STATES 4
 
@@ -267,6 +275,7 @@ static int al_load_refused(persist_t *db, secp256k1_context *ctx) {
 }
 
 int test_advanceless_persist_reload(void) {
+    int failed = 0;
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
                                                       SECP256K1_CONTEXT_VERIFY);
     secp256k1_keypair *kps = al_keys(ctx, 65);
@@ -324,20 +333,20 @@ int test_advanceless_persist_reload(void) {
             TEST_ASSERT(sqlite3_exec(db.db, "UPDATE tree_nodes SET nsequence = nsequence - 1 "
                                      "WHERE node_index = 0;", NULL, NULL, NULL) == SQLITE_OK,
                         "edit root nSequence");
-            TEST_ASSERT(al_load_refused(&db, ctx), "edited nSequence refused");
+            AL_CHECK(al_load_refused(&db, ctx), "edited nSequence refused");
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             /* A leaf state's nSequence edited too. */
             char q[128];
             snprintf(q, sizeof(q), "UPDATE tree_nodes SET nsequence = 5 WHERE node_index = %zu;",
                      f->leaf_node_indices[0]);
             TEST_ASSERT(sqlite3_exec(db.db, q, NULL, NULL, NULL) == SQLITE_OK, "edit leaf");
-            TEST_ASSERT(al_load_refused(&db, ctx), "edited leaf nSequence refused");
+            AL_CHECK(al_load_refused(&db, ctx), "edited leaf nSequence refused");
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             /* Fee-rule drift: every rebuilt amount differs from the signed tree,
                from the root down. */
             TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET fee_per_tx = fee_per_tx + 1;",
                                      NULL, NULL, NULL) == SQLITE_OK, "drift fee");
-            TEST_ASSERT(al_load_refused(&db, ctx), "changed root amounts refused");
+            AL_CHECK(al_load_refused(&db, ctx), "changed root amounts refused");
             TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "re-save factory");
             TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
             /* A signed tx that is not the row's: the root row's bytes swapped
@@ -346,12 +355,12 @@ int test_advanceless_persist_reload(void) {
                                      "(SELECT signed_tx_hex FROM tree_nodes WHERE node_index = 1) "
                                      "WHERE node_index = 0;", NULL, NULL, NULL) == SQLITE_OK,
                         "swap signed tx");
-            TEST_ASSERT(al_load_refused(&db, ctx), "foreign signed tx refused");
+            AL_CHECK(al_load_refused(&db, ctx), "foreign signed tx refused");
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             /* No stored tree at all. */
             TEST_ASSERT(sqlite3_exec(db.db, "DELETE FROM tree_nodes;", NULL, NULL, NULL) == SQLITE_OK,
                         "drop the tree");
-            TEST_ASSERT(al_load_refused(&db, ctx), "factory without a tree refused");
+            AL_CHECK(al_load_refused(&db, ctx), "factory without a tree refused");
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
         }
@@ -380,5 +389,5 @@ int test_advanceless_persist_reload(void) {
     }
     free(kps);
     secp256k1_context_destroy(ctx);
-    return 1;
+    return !failed;
 }

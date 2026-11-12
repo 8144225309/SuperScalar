@@ -32,6 +32,8 @@
 #   - exit: each member's latest commitment spends a leaf of its signed tree,
 #     confirms, and pays that member exactly its balance; every transaction
 #     on the member's path from the root is the signed one and is on chain;
+#   - an LSP started on a copy of that DB with the factory's static depth
+#     lost refuses to load it and exits 1 instead of starting a new factory;
 #   - expiry: every member holds the same distribution TX; it confirms once
 #     its nLockTime is reached and pays every member at least its creation
 #     balance (the members' outputs add up to the factory funding less the
@@ -381,6 +383,25 @@ run_lifecycle(){
     for i in $(seq 0 $((N - 1))); do exit_member "$i"; done
     [ "$EXIT_OK" = "$N" ] && note_ok "all $N members exited alone: each commitment confirmed and pays its member exactly its balance" \
         || note_fail "$EXIT_OK of $N members exited with their balance"
+
+    # an LSP whose DB holds a factory it cannot load as the signed tree
+    # (here: its static depth lost) must stop, not start a new factory
+    cp "$D/lsp.db" "$D/lsp_bad.db"
+    sqlite3 "$D/lsp_bad.db" "UPDATE factories SET static_threshold_depth = 0;"
+    local bad_args=("${LSP_ARGS[@]}") k rc
+    for k in "${!bad_args[@]}"; do
+        [ "${bad_args[$k]}" = "$D/lsp.db" ] && bad_args[$k]="$D/lsp_bad.db"
+        [ "${bad_args[$k]}" = "--cli" ] && unset 'bad_args[k]'
+    done
+    timeout 60 "$LSP_BIN" "${bad_args[@]}" > "$D/lsp_bad.log" 2>&1 < /dev/null; rc=$?
+    if [ "$rc" = 1 ] && grep -aq "cannot be loaded (see above); refusing to start" "$D/lsp_bad.log" &&
+       grep -aq "is not the signed tree" "$D/lsp_bad.log" &&
+       ! grep -aq "waiting for $N clients" "$D/lsp_bad.log"; then
+        note_ok "an LSP whose factory does not reload as the signed tree stops (rc=1) instead of starting a new one"
+    else
+        tail -8 "$D/lsp_bad.log" | sed 's/^/         /'
+        note_fail "LSP with an unloadable factory: rc=$rc"
+    fi
 }
 
 run_expiry(){
