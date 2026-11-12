@@ -1295,10 +1295,17 @@ int persist_save_commitment_sig(persist_t *p, uint32_t channel_id,
                                  const unsigned char *signed_tx,
                                  size_t signed_tx_len);
 
-/* Remove the stored signed commitment of a channel (used when the factory it
-   spends from has been replaced and the transaction can no longer confirm).
-   Returns 1 on success, also when there was no row. */
-int persist_delete_commitment_sig(persist_t *p, uint32_t channel_id);
+/* Remove a factory's row, participants, tree nodes and distribution
+   transaction.  Channel-level rows are not touched.  Returns 1 on success,
+   also when nothing was stored under that id. */
+int persist_delete_factory_record(persist_t *p, uint32_t factory_id);
+
+/* Funding outpoint (txid as 64 hex characters plus NUL, display order) and
+   CLTV timeout of a stored factory.  Returns 1 if the factory is on record. */
+int persist_load_factory_outpoint(persist_t *p, uint32_t factory_id,
+                                   char *txid_hex65, uint32_t *vout_out,
+                                   uint32_t *cltv_timeout_out);
+
 
 /* Load the latest commitment TX signature. Returns 1 if found. */
 int persist_load_commitment_sig(persist_t *p, uint32_t channel_id,

@@ -3525,3 +3525,102 @@ int test_rotation_commitment_carries_balance(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Rotation: distribution transaction check ---- */
+
+/* The distribution transaction the LSP hands over is accepted only if it is
+   byte for byte the client's own transaction with a signature that verifies
+   under the funding key. */
+int test_distribution_tx_verification(void) {
+    secp256k1_context *ctx = test_ctx();
+    channel_t lsp_ch, client_ch;
+    unsigned char spk[34];
+    TEST_ASSERT(initial_commitment_pair(ctx, &lsp_ch, &client_ch, spk), "channel pair");
+
+    /* any transaction spending the 2-of-2 output will do: use the commitment,
+       whose aggregated signature we can produce */
+    wire_msg_t msg;
+    TEST_ASSERT(initial_commitment_msg(&lsp_ch, 0, 0, &msg), "sign");
+    TEST_ASSERT(client_handle_initial_commitment_signed(&client_ch, &msg), "aggregate");
+    cJSON_Delete(msg.json);
+
+    tx_buf_t utx, stx;
+    tx_buf_init(&utx, 512);
+    tx_buf_init(&stx, 512);
+    unsigned char txid[32], sighash[32];
+    TEST_ASSERT(channel_build_commitment_tx(&client_ch, &utx, txid), "unsigned tx");
+    TEST_ASSERT(compute_taproot_sighash(sighash, utx.data, utx.len, 0, spk, 34,
+                                        client_ch.funding_amount, 0xFFFFFFFE), "sighash");
+    TEST_ASSERT(finalize_signed_tx(&stx, utx.data, utx.len,
+                                   client_ch.latest_commitment_sig), "signed tx");
+
+    TEST_ASSERT(client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                              stx.data, stx.len),
+                "own transaction with a valid signature accepted");
+
+    /* an output amount changed by the sender */
+    unsigned char *bad = malloc(stx.len);
+    memcpy(bad, stx.data, stx.len);
+    bad[49] ^= 0x01;
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               bad, stx.len),
+                "different outputs rejected");
+    /* right bytes, signature that does not verify */
+    memcpy(bad, stx.data, stx.len);
+    bad[stx.len - 4 - 10] ^= 0x01;
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               bad, stx.len),
+                "invalid signature rejected");
+    /* the unsigned transaction passed off as signed */
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               utx.data, utx.len),
+                "unsigned transaction rejected");
+    TEST_ASSERT(!client_verify_distribution_tx(ctx, utx.data, utx.len, sighash, spk,
+                                               stx.data, 20),
+                "truncated transaction rejected");
+    free(bad);
+
+    /* what a transaction pays to a participant's key-path output */
+    unsigned char sk[32];
+    memset(sk, 0x41, 32);
+    secp256k1_pubkey me, other;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &me, sk), "pubkey");
+    memset(sk, 0x42, 32);
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &other, sk), "pubkey 2");
+    tx_output_t outs[2];
+    memset(outs, 0, sizeof(outs));
+    for (int i = 0; i < 2; i++) {
+        secp256k1_xonly_pubkey x, tw;
+        secp256k1_pubkey full;
+        unsigned char ser[32], twk[32];
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &x, NULL, i ? &other : &me), "xonly");
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &x);
+        sha256_tagged("TapTweak", ser, 32, twk);
+        TEST_ASSERT(secp256k1_xonly_pubkey_tweak_add(ctx, &full, &x, twk), "tweak");
+        TEST_ASSERT(secp256k1_xonly_pubkey_from_pubkey(ctx, &tw, NULL, &full), "xonly 2");
+        build_p2tr_script_pubkey(outs[i].script_pubkey, &tw);
+        outs[i].script_pubkey_len = 34;
+        outs[i].amount_sats = i ? 70000 : 29000;
+    }
+    tx_buf_t dtx, dstx;
+    tx_buf_init(&dtx, 256);
+    tx_buf_init(&dstx, 256);
+    unsigned char ftxid[32];
+    memset(ftxid, 0x5A, 32);
+    TEST_ASSERT(build_unsigned_tx_with_locktime(&dtx, NULL, ftxid, 0, 0xFFFFFFFEu, 900,
+                                                outs, 2), "distribution-shaped tx");
+    TEST_ASSERT_EQ(client_tx_amount_to_pubkey(ctx, dtx.data, dtx.len, &me), 29000,
+                   "amount paid to this client (unsigned form)");
+    unsigned char zero_sig[64] = {0};
+    TEST_ASSERT(finalize_signed_tx(&dstx, dtx.data, dtx.len, zero_sig), "signed form");
+    TEST_ASSERT_EQ(client_tx_amount_to_pubkey(ctx, dstx.data, dstx.len, &me), 29000,
+                   "amount paid to this client (signed form)");
+    TEST_ASSERT_EQ(client_tx_amount_to_pubkey(ctx, dtx.data, dtx.len, &lsp_ch.local_funding_pubkey), 0,
+                   "nothing for a key without an output");
+
+    tx_buf_free(&utx); tx_buf_free(&stx); tx_buf_free(&dtx); tx_buf_free(&dstx);
+    channel_cleanup(&lsp_ch);
+    channel_cleanup(&client_ch);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -860,20 +860,34 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
     cJSON_Delete(rev_msg.json);
 }
 
-/* A rotation ended with the new factory on disk but without a saved channel
-   and commitment 0 for it.  Say what is and is not recoverable and make the
-   process stop instead of reconnecting from a database that no longer
-   describes a usable channel. */
+/* A rotation ended with the new factory recorded as pending but without a
+   saved channel and commitment 0 for it.  Say what is and is not recoverable
+   and make the process stop instead of reconnecting. */
+static void rotation_pending_notice(persist_t *db) {
+    char old_txid[65] = {0}, new_txid[65] = {0};
+    uint32_t old_vout = 0, new_vout = 0, new_cltv = 0;
+    persist_load_factory_outpoint(db, 0, old_txid, &old_vout, NULL);
+    persist_load_factory_outpoint(db, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                  new_txid, &new_vout, &new_cltv);
+    fprintf(stderr,
+            "  A rotation was started and did not finish.  The database holds\n"
+            "    the factory being left   %s:%u  with this client's channel and commitment,\n"
+            "    the factory being entered %s:%u  with its signed tree and distribution\n"
+            "    transaction, and no commitment for a channel in it.\n"
+            "  --force-close picks the exit that still exists: while the first funding\n"
+            "  output is unspent it publishes that factory's tree and the commitment;\n"
+            "  once it is spent it publishes nothing of the new tree and offers the new\n"
+            "  factory's distribution transaction, valid from block %u.  Until then the\n"
+            "  funds in the new factory move only with the LSP's cooperation.\n"
+            "  The client does not connect while this record exists.\n",
+            old_txid, old_vout, new_txid, new_vout, new_cltv);
+}
+
 static void rotation_stopped(daemon_cb_data_t *cbd, uint32_t my_index,
                               const factory_t *factory, const char *why) {
-    fprintf(stderr,
-            "Client %u: ROTATION NOT COMPLETED: %s.\n"
-            "  The new factory, its signed tree and its distribution transaction are in the\n"
-            "  database; there is no signed commitment for a channel in it.  Do not publish\n"
-            "  the factory tree.  The distribution transaction pays this client when the\n"
-            "  factory expires (block %u) if the tree has not been published; before that,\n"
-            "  funds move only with the LSP's cooperation.  Not reconnecting.\n",
-            my_index, why, factory ? factory->cltv_timeout : 0);
+    (void)factory;
+    fprintf(stderr, "Client %u: ROTATION NOT COMPLETED: %s.\n", my_index, why);
+    if (cbd && cbd->db) rotation_pending_notice(cbd->db);
     if (cbd) cbd->rotation_not_completed = 1;
 }
 
@@ -954,8 +968,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 persist_save_basepoints(cbd->db, client_idx, ch) &&
                 persist_save_tree_nodes(cbd->db, factory, 0) &&
                 client_persist_commitment_sig(ch, cbd)) {
-                /* Save signed distribution TX if available */
-                if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                /* Save the verified signed distribution TX */
+                if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0) {
                     persist_save_distribution_tx(cbd->db, 0,
                         factory->dist_unsigned_tx.data,
                         factory->dist_unsigned_tx.len);
@@ -2160,9 +2174,11 @@ handle_message:
                         persist_save_channel(cbd->db, ch, 0, rot_client_idx) &&
                         persist_save_basepoints(cbd->db, rot_client_idx, ch) &&
                         persist_save_tree_nodes(cbd->db, factory, 0) &&
-                        client_persist_commitment_sig(ch, cbd)) {
-                        /* Save signed distribution TX if available */
-                        if (factory->dist_tx_ready && factory->dist_unsigned_tx.len > 0) {
+                        client_persist_commitment_sig(ch, cbd) &&
+                        persist_delete_factory_record(cbd->db,
+                            CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+                        /* Save the verified signed distribution TX */
+                        if (factory->dist_tx_ready == 2 && factory->dist_unsigned_tx.len > 0) {
                             persist_save_distribution_tx(cbd->db, 0,
                                 factory->dist_unsigned_tx.data,
                                 factory->dist_unsigned_tx.len);
@@ -2536,6 +2552,41 @@ static int client_db_has_commitment(persist_t *db) {
     return persist_load_commitment_sig(db, 0, &cn, NULL, NULL, &len, 0) && len > 0;
 }
 
+/* Decide what a force-close may publish.  Returns 1 if the tree of factory 0
+   and the stored commitment are to be broadcast.  *dist_factory_out is the
+   factory whose distribution transaction is offered afterwards.
+   Publishing a tree spends that factory's funding output, after which its
+   distribution transaction can never confirm; so a tree is published only
+   when a commitment for a channel in it is on disk.  With a rotation
+   pending, the factory being left is used while its funding output is still
+   unspent; once that is spent only the new factory's distribution
+   transaction is left and nothing of the new tree is published. */
+static int client_force_close_plan(persist_t *db, chain_backend_t *chain,
+                                    uint32_t *dist_factory_out, FILE *out) {
+    *dist_factory_out = 0;
+    if (!persist_has_factory(db, CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+        if (client_db_has_commitment(db)) return 1;
+        fprintf(out, "Force-close: no signed commitment in DB; NOT publishing the "
+                     "factory tree\n");
+        return 0;
+    }
+    char txid[65] = {0};
+    uint32_t vout = 0;
+    int unspent = persist_load_factory_outpoint(db, 0, txid, &vout, NULL) &&
+                  chain->is_outpoint_unspent &&
+                  chain->is_outpoint_unspent(chain, txid, vout) == 1;
+    if (unspent && client_db_has_commitment(db)) {
+        fprintf(out, "Force-close: rotation pending; the factory being left (%s:%u) "
+                     "is unspent, exiting through it\n", txid, vout);
+        return 1;
+    }
+    *dist_factory_out = CLIENT_ROTATION_PENDING_FACTORY_ID;
+    fprintf(out, "Force-close: rotation pending and the factory being left is spent; "
+                 "NOT publishing the factory tree of the new factory (no commitment "
+                 "for it)\n");
+    return 0;
+}
+
 static int client_force_close_from_db(const char *db_path, const char *network,
                                       const char *cli_path, const char *rpcuser,
                                       const char *rpcpassword, const char *datadir,
@@ -2569,9 +2620,10 @@ static int client_force_close_from_db(const char *db_path, const char *network,
         persist_close(&db);
         return 0;
     }
-    if (!client_db_has_commitment(&db)) {
-        fprintf(stderr, "Client: CLOSE policy force-close: no signed commitment in DB; "
-                "NOT publishing the factory tree\n");
+    uint32_t plan_dist = 0;
+    if (!client_force_close_plan(&db, &chain, &plan_dist, stderr)) {
+        persist_close(&db);
+        return 0;
     } else {
         char fr_status[256] = {0};
         int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
@@ -3053,17 +3105,16 @@ int main(int argc, char *argv[]) {
            commitment the client could not claim its channel output either, so
            in that case the tree is left alone and only the distribution
            transaction is tried. */
-        if (!client_db_has_commitment(&db)) {
-            printf("Force-close: no signed commitment in DB; NOT publishing the "
-                   "factory tree\n");
-        } else {
+        uint32_t dist_factory = 0;
+        int publish = client_force_close_plan(&db, &chain, &dist_factory, stdout);
+        if (publish) {
             char fr_status[256] = {0};
             int result = factory_recovery_run(&db, &chain, 0, fr_status, sizeof(fr_status));
             printf("Force-close: %s (run=%d)\n", fr_status, result);
         }
 
         /* Broadcast signed commitment TX if available */
-        {
+        if (publish) {
             unsigned char signed_tx_data[4096];
             size_t signed_tx_len = 0;
             uint64_t sig_cn = 0;
@@ -3094,7 +3145,7 @@ int main(int argc, char *argv[]) {
         {
             unsigned char dist_tx_data[8192];
             size_t dist_tx_len = 0;
-            if (persist_load_distribution_tx(&db, 0,
+            if (persist_load_distribution_tx(&db, dist_factory,
                                               dist_tx_data, &dist_tx_len,
                                               sizeof(dist_tx_data)) &&
                 dist_tx_len > 0) {
@@ -3767,6 +3818,13 @@ int main(int argc, char *argv[]) {
            consult client_ps_signed_inputs and refuse to sign a second
            TX spending the same parent UTXO. ZmnSCPxj §PS wide leaves. */
         client_set_persist(&db);
+
+        if (persist_has_factory(&db, CLIENT_ROTATION_PENDING_FACTORY_ID)) {
+            fprintf(stderr, "Client: ROTATION NOT COMPLETED (recorded in %s).\n", db_path);
+            rotation_pending_notice(&db);
+            persist_close(&db);
+            return 1;
+        }
     }
 
     signal(SIGINT, sigint_handler);

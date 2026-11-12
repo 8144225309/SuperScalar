@@ -8,6 +8,7 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/crash_inject.h"   /* #9 superscalar_cheat_allowed() */
 #include "superscalar/regtest.h"  /* CL7: regtest_send_raw_tx + regtest_t */
+#include <secp256k1_schnorrsig.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -524,30 +525,105 @@ int client_rotation_new_factory_saved(void) {
     return g_rotation_new_factory_saved;
 }
 
-/* Rotation: write the new factory, its signed tree and its distribution
-   transaction as soon as the client holds them, and drop the commitment of
-   the channel in the replaced factory, which can no longer confirm.  From
-   here until commitment 0 of the new channel is stored the database holds no
-   commitment: the client's way out of the new factory in that window is the
-   distribution transaction at the factory's expiry.  Returns 0 if a database
-   is attached and the write failed. */
+static client_verify_funding_fn g_client_verify_funding = NULL;
+static void *g_client_verify_funding_ctx = NULL;
+
+void client_set_funding_verifier(client_verify_funding_fn fn, void *ctx) {
+    g_client_verify_funding = fn;
+    g_client_verify_funding_ctx = ctx;
+}
+
+int client_verify_distribution_tx(const secp256k1_context *ctx,
+                                   const unsigned char *unsigned_tx, size_t unsigned_len,
+                                   const unsigned char *sighash32,
+                                   const unsigned char *funding_spk34,
+                                   const unsigned char *signed_tx, size_t signed_len) {
+    if (!ctx || !unsigned_tx || !sighash32 || !funding_spk34 || !signed_tx) return 0;
+    if (unsigned_len == 0 || signed_len < 4 + 64) return 0;
+    if (funding_spk34[0] != 0x51 || funding_spk34[1] != 0x20) return 0;
+
+    /* The only place a key-path signature can sit is right before nLockTime.
+       Rebuild the signed form from our own bytes and that signature: anything
+       else in the LSP's transaction that differs from ours shows up here. */
+    const unsigned char *sig = signed_tx + signed_len - 4 - 64;
+    tx_buf_t expect;
+    tx_buf_init(&expect, unsigned_len + 80);
+    int same = finalize_signed_tx(&expect, unsigned_tx, unsigned_len, sig) &&
+               expect.len == signed_len &&
+               memcmp(expect.data, signed_tx, signed_len) == 0;
+    tx_buf_free(&expect);
+    if (!same) return 0;
+
+    secp256k1_xonly_pubkey key;
+    return secp256k1_xonly_pubkey_parse(ctx, &key, funding_spk34 + 2) &&
+           secp256k1_schnorrsig_verify(ctx, sig, sighash32, 32, &key);
+}
+
+uint64_t client_tx_amount_to_pubkey(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t len,
+                                     const secp256k1_pubkey *pubkey) {
+    if (!ctx || !tx || !pubkey || len < 60) return 0;
+    unsigned char spk[34], ser[32], tweak[32];
+    secp256k1_xonly_pubkey xonly, tweaked;
+    secp256k1_pubkey full;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, pubkey) ||
+        !secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) return 0;
+    sha256_tagged("TapTweak", ser, 32, tweak);
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &full, &xonly, tweak) ||
+        !secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &full)) return 0;
+    build_p2tr_script_pubkey(spk, &tweaked);
+
+    size_t off = 4;
+    if (tx[4] == 0x00 && tx[5] == 0x01) off += 2;      /* segwit marker + flag */
+    if (tx[off] != 1) return 0;                         /* one input */
+    off += 1 + 36;
+    if (off >= len || tx[off] != 0) return 0;           /* empty scriptSig */
+    off += 1 + 4;
+    if (off >= len || tx[off] >= 253) return 0;
+    size_t n_out = tx[off++];
+    uint64_t total = 0;
+    for (size_t i = 0; i < n_out; i++) {
+        if (off + 9 > len) return 0;
+        uint64_t amt = 0;
+        for (int b = 7; b >= 0; b--) amt = (amt << 8) | tx[off + b];
+        size_t sl = tx[off + 8];
+        if (sl >= 253 || off + 9 + sl > len) return 0;
+        if (sl == 34 && memcmp(tx + off + 9, spk, 34) == 0) total += amt;
+        off += 9 + sl;
+    }
+    return total;
+}
+
+int client_rotation_save_pending(persist_t *db, const factory_t *f,
+                                  secp256k1_context *ctx) {
+    if (!db || !f) return 0;
+    if (!persist_begin(db)) return 0;
+    int ok = persist_delete_factory_record(db, CLIENT_ROTATION_PENDING_FACTORY_ID) &&
+             persist_save_factory(db, f, ctx, CLIENT_ROTATION_PENDING_FACTORY_ID) &&
+             persist_save_tree_nodes(db, f, CLIENT_ROTATION_PENDING_FACTORY_ID);
+    if (ok && f->dist_tx_ready == 2 && f->dist_unsigned_tx.len > 0)
+        ok = persist_save_distribution_tx(db, CLIENT_ROTATION_PENDING_FACTORY_ID,
+                                          f->dist_unsigned_tx.data,
+                                          f->dist_unsigned_tx.len);
+    if (!ok) { persist_rollback(db); return 0; }
+    return persist_commit(db);
+}
+
+/* Rotation: put the new factory, its verified tree and its verified
+   distribution transaction on disk next to the factory being left, before
+   any channel set-up.  The old factory's rows and the old channel's
+   commitment stay exactly as they are: until commitment 0 of the new channel
+   is saved the client still has the old exit (for as long as the old funding
+   output is unspent) and already has the new factory's distribution
+   transaction.  Returns 0 if a database is attached and the write failed. */
 static int client_rotation_save_factory(factory_t *f, secp256k1_context *ctx,
                                          uint32_t my_index) {
     persist_t *db = g_client_persist;
     if (!db) return 1;
-    if (!persist_begin(db)) return 0;
-    int ok = persist_save_factory(db, f, ctx, 0) &&
-             persist_save_tree_nodes(db, f, 0) &&
-             persist_delete_commitment_sig(db, 0);
-    if (ok && f->dist_tx_ready && f->dist_unsigned_tx.len > 0)
-        ok = persist_save_distribution_tx(db, 0, f->dist_unsigned_tx.data,
-                                          f->dist_unsigned_tx.len);
-    if (!ok) { persist_rollback(db); return 0; }
-    if (!persist_commit(db)) return 0;
+    if (!client_rotation_save_pending(db, f, ctx)) return 0;
     g_rotation_new_factory_saved = 1;
-    printf("Client %u: new factory, signed tree%s saved before channel set-up\n",
-           my_index, (f->dist_tx_ready && f->dist_unsigned_tx.len > 0)
-                     ? " and distribution TX" : "");
+    printf("Client %u: new factory, signed tree and distribution TX saved "
+           "before channel set-up\n", my_index);
     return 1;
 }
 
@@ -1564,23 +1640,40 @@ static int client_apply_factory_ready(factory_t *f, const cJSON *json) {
         return -1;
     }
 
-    /* Parse signed distribution TX if present */
+    /* Signed distribution TX, if present.  It is the client's exit when the
+       factory expires, so it is stored only after it has been checked against
+       the client's own construction of that transaction; one that fails the
+       check refuses the factory.  Without a local construction to compare
+       with, nothing is stored. */
     cJSON *dist_hex_j = cJSON_GetObjectItem(json, "distribution_tx_hex");
     if (dist_hex_j && cJSON_IsString(dist_hex_j)) {
         const char *dhex = dist_hex_j->valuestring;
         size_t dlen = strlen(dhex);
-        if (dlen >= 2 && dlen % 2 == 0) {
-            size_t draw = dlen / 2;
+        size_t draw = dlen / 2;
+        unsigned char *raw = (dlen >= 2 && dlen % 2 == 0) ? malloc(draw) : NULL;
+        int decoded = raw && hex_decode(dhex, raw, draw) == (int)draw;
+        if (f->dist_tx_ready == 1 && f->dist_unsigned_tx.len > 0) {
+            if (!decoded ||
+                !client_verify_distribution_tx(f->ctx, f->dist_unsigned_tx.data,
+                                               f->dist_unsigned_tx.len, f->dist_sighash,
+                                               f->funding_spk, raw, draw)) {
+                fprintf(stderr, "Client: FACTORY_READY distribution TX is not the "
+                                "transaction this client built or is not validly "
+                                "signed -- REFUSING factory\n");
+                free(raw);
+                return -1;
+            }
             tx_buf_free(&f->dist_unsigned_tx);
             tx_buf_init(&f->dist_unsigned_tx, draw);
+            memcpy(f->dist_unsigned_tx.data, raw, draw);
             f->dist_unsigned_tx.len = draw;
-            if (hex_decode(dhex, f->dist_unsigned_tx.data, draw) == (int)draw) {
-                f->dist_tx_ready = 2;  /* 2 = signed distribution TX */
-                printf("Client: stored signed distribution TX (%zu bytes)\n", draw);
-            } else {
-                f->dist_unsigned_tx.len = 0;
-            }
+            f->dist_tx_ready = 2;  /* 2 = signed and verified distribution TX */
+            printf("Client: verified and stored signed distribution TX (%zu bytes)\n", draw);
+        } else {
+            fprintf(stderr, "Client: distribution TX received but there is no local "
+                            "construction to verify it against; not stored\n");
         }
+        free(raw);
     }
 
     return count;
@@ -1727,6 +1820,19 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     free(rot_hashes);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
+
+    /* The new funding output must exist on chain with at least the claimed
+       amount before anything is signed for it or recorded: same check as for
+       the first factory. */
+    if (g_client_verify_funding &&
+        !g_client_verify_funding(funding_txid, funding_vout, funding_amount,
+                                 g_client_verify_funding_ctx)) {
+        fprintf(stderr, "Client %u: REFUSING rotation — the proposed funding output "
+                "is not on chain with %llu sats\n", my_index,
+                (unsigned long long)funding_amount);
+        client_send_error(fd, "funding_tx_verification_failed");
+        return 0;
+    }
 
     if (!factory_build_tree(factory_out)) {
         printf("Client %u: ROTATION BUILD_TREE FAILED spk=%zu amt=%llu\n", my_index, spk_len, (unsigned long long)funding_amount);
@@ -1973,6 +2079,27 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         if (fr_apply < 0) {   /* tree aggregate sigs invalid -- refuse (fund-safety) */
             fprintf(stderr, "Client: refusing rotation -- LSP factory tree failed "
                             "signature verification\n");
+            free(secnonces); free(nonce_entries); return 0;
+        }
+    }
+
+    /* The client leaves a factory only for one it can get out of on its own:
+       the new factory must come with a verified, signed distribution
+       transaction that pays this client at least its current balance. */
+    if (factory_out->dist_tx_ready != 2) {
+        fprintf(stderr, "Client %u: REFUSING rotation — no verified distribution "
+                "transaction for the new factory\n", my_index);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    {
+        uint64_t pays = client_tx_amount_to_pubkey(ctx, factory_out->dist_unsigned_tx.data,
+                                                   factory_out->dist_unsigned_tx.len,
+                                                   &my_pubkey);
+        if (pays < channel_out->local_amount) {
+            fprintf(stderr, "Client %u: REFUSING rotation — the distribution "
+                    "transaction pays this client %llu sats, balance is %llu\n",
+                    my_index, (unsigned long long)pays,
+                    (unsigned long long)channel_out->local_amount);
             free(secnonces); free(nonce_entries); return 0;
         }
     }
@@ -2543,6 +2670,8 @@ int client_run_with_channels(secp256k1_context *ctx,
                               void *verify_ctx) {
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+    if (verify_funding)
+        client_set_funding_verifier(verify_funding, verify_ctx);
 
     /* Connect to LSP */
     int fd = wire_connect(host, port);

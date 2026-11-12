@@ -1193,6 +1193,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
+    /* Drill checkpoint: the new factory is funded and its tree signed, the
+       clients have not yet received CHANNEL_READY or commitment 0. */
+    lsp_crash_checkpoint("rotate_channel_setup");
+
     if (!lsp_channels_send_ready(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: send_ready failed\n");
         return 0;

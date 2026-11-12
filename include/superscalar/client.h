@@ -309,12 +309,43 @@ int client_handle_initial_commitment_signed(channel_t *ch, const wire_msg_t *msg
    Returns 1 if ch now holds a signed commitment 0, 0 otherwise. */
 int client_recv_initial_commitment(int fd, channel_t *ch, uint32_t my_index);
 
-/* 1 if the last client_do_factory_rotation call wrote the new factory, its
-   signed tree and its distribution transaction to the database (it does so
-   as soon as the tree is verified, before channel set-up).  When the call
-   then fails, the database describes the new factory but holds no channel
-   state or commitment for it. */
+/* A rotation in progress keeps the factory being left under id 0, with its
+   channel and commitment, and stores the factory being entered under this
+   id until the new channel's commitment 0 is saved.  A factory on record
+   under this id therefore means "a rotation started and did not finish": it
+   is the durable marker the client checks at start-up and in --force-close. */
+#define CLIENT_ROTATION_PENDING_FACTORY_ID 1u
+
+/* Store f (verified tree, verified signed distribution transaction) as the
+   pending factory.  Nothing recorded for factory 0 is changed.  One database
+   transaction.  Returns 1 on success. */
+int client_rotation_save_pending(persist_t *db, const factory_t *f,
+                                  secp256k1_context *ctx);
+
+/* 1 if the last client_do_factory_rotation call stored a pending factory. */
 int client_rotation_new_factory_saved(void);
+
+/* Funding verifier used when a rotation proposes a new factory (the same
+   callback client_run_with_channels takes for the first factory, which also
+   installs it).  NULL disables the check. */
+void client_set_funding_verifier(client_verify_funding_fn fn, void *ctx);
+
+/* Distribution transaction check.  signed_tx is what the LSP sent;
+   unsigned_tx and sighash32 are the client's own construction of the same
+   transaction; funding_spk34 is the factory funding script.  Returns 1 only
+   if signed_tx is byte for byte the client's transaction carrying one
+   key-path signature that verifies under the funding output key. */
+int client_verify_distribution_tx(const secp256k1_context *ctx,
+                                   const unsigned char *unsigned_tx, size_t unsigned_len,
+                                   const unsigned char *sighash32,
+                                   const unsigned char *funding_spk34,
+                                   const unsigned char *signed_tx, size_t signed_len);
+
+/* Amount a (signed or unsigned, single-input) transaction pays to the
+   key-path-only taproot output of pubkey; 0 if it has no such output. */
+uint64_t client_tx_amount_to_pubkey(const secp256k1_context *ctx,
+                                     const unsigned char *tx, size_t len,
+                                     const secp256k1_pubkey *pubkey);
 
 /* Write the channel's latest fully signed commitment transaction
    (ch->latest_commitment_sig over the commitment at ch->commitment_number)
