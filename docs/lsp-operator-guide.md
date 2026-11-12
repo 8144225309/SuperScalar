@@ -148,8 +148,8 @@ Press **Ctrl+C**. The LSP will:
 | `--port` | 9735 | Listen port for client connections |
 | `--clients` | 4 | Number of clients to accept before starting ceremony |
 | `--amount` | 100000 | Factory funding amount in satoshis |
-| `--arity` | 3 | Leaf arity: `3` = Pseudo-Spilman (canonical, default). `1`/`2` = legacy DW. Comma-separated for mixed (e.g. `3,4,8`). Canonical shape selection by client count is documented at [superscalar.win](https://superscalar.win). |
-| `--static-near-root` | 0 | Number of near-root tree levels to make kickoff-only (no DW state machine). Reduces total CSV consumption (full design at [superscalar.win](https://superscalar.win)). |
+| `--arity` | advanceless | Tree shape.  Without `--arity`, `--static-near-root` and `--ps-subfactory-arity` the LSP builds the advanceless tree: every interior level kickoff-only, one member per pseudo-Spilman leaf, zero exit delay (4 clients: `4,3` static 1; 64: `8,8,3` static 2; rule in [factory-arity.md](factory-arity.md)).  Such a factory is extended only by rotation.  Explicit: `3` = Pseudo-Spilman, `1`/`2` = DW, comma list per level (e.g. `3,4,8`). |
+| `--static-near-root` | depth of the default tree | Number of near-root tree levels to make kickoff-only (no DW state machine).  With an explicit `--arity` and no `--static-near-root`, 0. |
 | `--network` | regtest | Bitcoin network: regtest / signet / testnet / mainnet |
 | `--daemon` | off | Long-lived mode (handles reconnections, Ctrl+C for close) |
 | `--demo` | off | Run scripted payment sequence then close |
