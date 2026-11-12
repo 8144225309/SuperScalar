@@ -94,6 +94,20 @@ jobs:
         if: ${{ runner.os == 'Linux' && !matrix.sanitizers && !matrix.tsan }}
         run: tools/test_startup_gates.sh build
 
+  # A pull request may raise PERSIST_SCHEMA_VERSION by one (with its
+  # migration) or leave it alone; anything else fails.
+  schema-version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: Schema version
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: PERSIST_SCHEMA_VERSION changed by at most +1
+        run: tools/check_schema_version.sh "origin/${{ github.base_ref }}"
+
   arm64-build-test:
     runs-on: ubuntu-latest
     name: Linux ARM64
