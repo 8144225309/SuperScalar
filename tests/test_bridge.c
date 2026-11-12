@@ -1365,7 +1365,10 @@ int test_regtest_bridge_payment(void) {
                         fee_commitment_tx_at(ch0->commit_fee_rate_sat_per_kvb, 0);
                     uint64_t usable = ch0->funding_amount > commit_fee ?
                                       ch0->funding_amount - commit_fee : 0;
-                    uint64_t orig_remote = usable / 2;
+                    /* The opening split of lsp_channels_init (and the client's
+                       channel): LSP local = usable * pct / 100 at the default
+                       50, the client the rest (the odd sat). */
+                    uint64_t orig_remote = usable - (usable * 50) / 100;
                     TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
                                    "payee remote balance increased");
 
@@ -2191,7 +2194,10 @@ int test_regtest_bridge_invoice_flow(void) {
                         fee_commitment_tx_at(ch0->commit_fee_rate_sat_per_kvb, 0);
                     uint64_t usable = ch0->funding_amount > commit_fee ?
                                       ch0->funding_amount - commit_fee : 0;
-                    uint64_t orig_remote = usable / 2;
+                    /* The opening split of lsp_channels_init (and the client's
+                       channel): LSP local = usable * pct / 100 at the default
+                       50, the client the rest (the odd sat). */
+                    uint64_t orig_remote = usable - (usable * 50) / 100;
                     TEST_ASSERT_EQ(ch0->remote_amount, orig_remote + 5000,
                                    "payee remote balance increased");
 
