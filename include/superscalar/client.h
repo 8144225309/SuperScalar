@@ -59,6 +59,15 @@ int client_init_channel(channel_t *ch, secp256k1_context *ctx,
    0 = accept any terms (default). */
 void client_set_min_profit_bps(uint16_t bps);
 
+/* Channel capacity terms checked before signing a factory: refuse unless the
+   member's own channel output is exactly expect_sats (0 = any) and at least
+   min_sats (0 = any).  The capacity is logged either way. */
+void client_set_capacity_terms(uint64_t expect_sats, uint64_t min_sats);
+
+/* Refuse a factory whose proposed opening split gives the LSP more than
+   pct percent of each channel (default 100 = any). */
+void client_set_max_lsp_balance_pct(uint16_t pct);
+
 /* This member's own ceiling on the factory's pre-signed tree rate (sat/kvB):
    a FACTORY_PROPOSE (creation or rotation) above it is refused, so an LSP
    cannot spend a member's channel on pre-signed fees.  Default
@@ -124,7 +133,10 @@ int client_dist_locktime_acceptable(const factory_t *f, uint32_t offered);
 /* Full capacity of member my_index's channel in f: its leaf output less the
    base commitment fee, i.e. the channel's two balances together at open.
    This is what the distribution transaction owes the member.  0 if the
-   member has no channel output in f. */
+   member has no channel output in f.  With member capacities
+   (factory_set_member_capacities) it is the member's capacity-rule payout
+   instead: its full capacity plus its share of its leaf's stock and of the
+   rest of the budget. */
 uint64_t client_member_channel_capacity(const factory_t *f, uint32_t my_index);
 
 /* Distribution payout check, shared by every place that accepts or relies on
@@ -346,7 +358,11 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
 /* Reconnect to LSP using persisted state from SQLite.
    Loads factory + channel from DB, sends MSG_RECONNECT, receives
    MSG_RECONNECT_ACK, re-exchanges nonces, then calls channel_cb.
-   Returns 1 on success. */
+   Returns 1 on success, 0 when the attempt failed or the connection was lost
+   (the caller may try again), and CLIENT_RECONNECT_REFUSED when the stored
+   factory does not load as the signed tree: every further attempt is
+   refused the same way, so the caller must stop. */
+#define CLIENT_RECONNECT_REFUSED (-1)
 int client_run_reconnect(secp256k1_context *ctx,
                            const secp256k1_keypair *keypair,
                            const char *host, int port,
@@ -543,14 +559,21 @@ int client_handle_leaf_realloc(int fd, secp256k1_context *ctx,
    Advances local leaf state, generates partial sig, sends LEAF_ADVANCE_PSIG,
    waits for LEAF_ADVANCE_DONE. Returns 1 on success.
 
-   PS double-spend defense: if client_set_persist() has been called with
-   a non-NULL handle, the PS advance path consults client_ps_signed_inputs
-   before signing and REFUSES if this client has already co-signed a TX
-   spending the same (parent_txid, parent_vout). See ZmnSCPxj §"Pseudo-
-   Spilman wide leaves" — PS has no revocation, so the client's refusal
-   is the only thing preventing an LSP double-spend. When no persist is
-   set, the defense is skipped (tests / in-process usage only — real
-   clients must call client_set_persist at startup). */
+   PS double-spend defense (record-and-refuse): if client_set_persist() has
+   been called with a non-NULL handle, the PS advance path computes the
+   sighash of the proposed spend, consults client_ps_signed_inputs BEFORE
+   any nonce exists, and REFUSES if this client has already co-signed a
+   DIFFERENT TX spending the same (parent_txid, parent_vout) -- or if that
+   lookup fails at all.  A matching sighash is an idempotent retry and is
+   re-signed.  After signing, the record is INSERTed (durable; first record
+   wins) BEFORE MSG_LEAF_ADVANCE_FINAL is sent; if the insert fails, or
+   loses to a conflicting record, the ceremony aborts and nothing is sent.
+   See ZmnSCPxj §"Pseudo-Spilman wide leaves" — PS has no revocation, so
+   the client's refusal is the only thing preventing an LSP double-spend.
+   When no persist is set, the defense is skipped (tests / in-process usage
+   only — real clients must call client_set_persist at startup).  The full
+   rule: docs/pseudo-spilman.md, "Record-and-refuse: ordering and failure
+   semantics". */
 int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
                                  const secp256k1_keypair *keypair,
                                  factory_t *factory,

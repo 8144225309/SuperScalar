@@ -7,6 +7,7 @@
 #include "persist.h"
 #include "persist_wt.h"
 #include <secp256k1.h>
+#include <signal.h>
 
 /* Default inbound-connection capacity; --max-connections overrides it and
    client_fds/client_pubkeys are heap-allocated, so this is a default, not a cap. */
@@ -57,6 +58,12 @@ typedef struct {
        0 = no timeout (block indefinitely, default). */
     int accept_timeout_sec;
 
+    /* Set by the caller's signal handler to end a wait for clients: a blocked
+       accept() or read() returns when the signal arrives (the handler is
+       installed without SA_RESTART) and lsp_accept_clients then gives up
+       instead of waiting again.  NULL = never asked to stop. */
+    volatile sig_atomic_t *stop_flag;
+
     /* Maximum connections the LSP will accept.
        Defaults to LSP_MAX_CLIENTS; --max-connections overrides. */
     int max_connections;
@@ -75,6 +82,22 @@ typedef struct {
        NULL = use equal split (initial creation). */
     const uint64_t *dist_client_amounts;
     size_t dist_n_client_amounts;
+
+    /* LSP share (percent) of each channel at opening; 0 = 50.  Sent in
+       FACTORY_PROPOSE; members refuse a CHANNEL_READY with another split, so
+       it must be the channel manager's lsp_balance_pct. */
+    uint16_t lsp_balance_pct;
+
+    /* Optional per-member channel capacities (sat, n_member_capacities ==
+       n_clients, in client order) and host stock per leaf, applied to every
+       factory lsp_run_factory_creation builds (factory_set_member_capacities).
+       NULL = the default split.  Borrowed; fund lsp_compute_funding_amount. */
+    const uint64_t *member_capacities;
+    size_t n_member_capacities;
+    uint64_t leaf_stock_sats;
+    /* Storage a partial rotation points member_capacities at: the
+       capacities of the members that rotate, in their new order. */
+    uint64_t rotated_capacities[LSP_MAX_CLIENTS];
 
     /* When set, lsp_accept_clients refuses to proceed unless every client's
        HELLO included a valid slot_hint forming a permutation of 1..n_clients.
@@ -119,6 +142,35 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
 /* Accept expected_clients connections, do HELLO handshake with each.
    Returns 1 when all clients connected. */
 int lsp_accept_clients(lsp_t *lsp);
+
+/* The funding script lsp_run_factory_creation accepts for the connected
+   participants: factory_compute_funding_spk over the LSP and the clients in
+   the order the placement mode and profiles set on lsp->factory put them.
+   Set placement and profiles first, then fund this script.  Returns 1 on
+   success. */
+int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]);
+
+/* With member_capacities set: the funding amount creation needs for them
+   (factory_capacity_funding_amount of the factory creation will build).
+   Returns 1 on success. */
+int lsp_compute_funding_amount(lsp_t *lsp, uint64_t *amount_out);
+
+/* The same for given clients (as lsp_compute_funding_spk_for). */
+int lsp_compute_funding_amount_for(lsp_t *lsp, const factory_t *order_from,
+                                   const secp256k1_pubkey *client_pubkeys,
+                                   size_t n_clients, uint64_t *amount_out);
+
+/* The opening split sent in FACTORY_PROPOSE: lsp_balance_pct, 0 -> 50,
+   capped at 100 (as lsp_channels_init applies it). */
+uint16_t lsp_opening_balance_pct(const lsp_t *lsp);
+
+/* The same for a factory not yet set up on lsp: the LSP and client_pubkeys
+   (in that order, as creation will see them in lsp->client_pubkeys), ordered
+   by the placement mode and profiles of order_from (the factory creation
+   will start from). */
+int lsp_compute_funding_spk_for(lsp_t *lsp, const factory_t *order_from,
+                                const secp256k1_pubkey *client_pubkeys,
+                                size_t n_clients, unsigned char spk_out[34]);
 
 /* Before anything is funded (a new factory, a rotation): build, without
    signing, the tree and distribution TX a factory of cfg's shape, the LSP

@@ -94,9 +94,32 @@ static int rc_profiles_match(const factory_t *f, size_t n, uint16_t client_bps) 
 #define RC_AFTER_FREE      1   /* configured, then factory_free'd (old rotation) */
 #define RC_PREALLOCATED    2   /* configured, arrays live */
 #define RC_REFUSED         3   /* clients refuse the terms: the failed attempt */
+/* Profiles that every reordering placement mode sorts to clients 4,3,2,1,
+   funded at lsp_compute_funding_spk. */
+#define RC_REORDER_INWARD  4
+#define RC_REORDER_OUTWARD 5
+#define RC_REORDER_TZ      6
+
+static int rc_reordering(int mode) { return mode >= RC_REORDER_INWARD; }
+
+static placement_mode_t rc_reorder_placement(int mode) {
+    return mode == RC_REORDER_INWARD  ? PLACEMENT_INWARD :
+           mode == RC_REORDER_OUTWARD ? PLACEMENT_OUTWARD :
+                                        PLACEMENT_TIMEZONE_CLUSTER;
+}
+
+/* Inward sorts contribution down, outward uptime up, timezone cluster the
+   bucket up: each puts the clients in reverse participant order. */
+static void rc_set_reordering_profiles(factory_t *f) {
+    for (size_t i = 1; i < 5; i++) {
+        f->profiles[i].contribution_sats = 1000 + i;
+        f->profiles[i].uptime_score = 0.9f - 0.1f * (float)i;
+        f->profiles[i].timezone_bucket = (uint8_t)(10 - i);
+    }
+}
 
 static int rc_port(int mode) {
-    return 21000 + (int)(getpid() % 2000) * 4 + mode;
+    return 21000 + (int)(getpid() % 2000) * 8 + mode;
 }
 
 /* Fork 4 clients (each running the stock client ceremony), run
@@ -121,7 +144,9 @@ static int rc_run_creation(int mode) {
         pid_t pid = fork();
         if (pid == 0) {
             alarm(90);                      /* never outlive a broken parent */
-            usleep(100000 * (c + 1));
+            usleep(100000 * (4 - c));  /* reverse key order: the hint decides */
+            /* The LSP orders members by this hint, not by connection order. */
+            client_set_slot_hint(c + 1);
             secp256k1_context *cctx = rc_ctx();
             secp256k1_keypair ckp;
             if (!secp256k1_keypair_create(cctx, &ckp, rc_seckeys[c + 1])) _exit(2);
@@ -152,11 +177,27 @@ static int rc_run_creation(int mode) {
             factory_set_static_near_root(&lsp->factory, 1);
             if (!lsp->factory.profiles) fail = "setters allocated profiles";
             else rc_set_profiles(&lsp->factory, 5, mode == RC_REFUSED ? 0 : 150);
+            if (!fail && rc_reordering(mode)) {
+                rc_set_reordering_profiles(&lsp->factory);
+                if (!factory_set_placement_mode(&lsp->factory,
+                                                rc_reorder_placement(mode)))
+                    fail = "placement";
+            }
             if (mode == RC_AFTER_FREE) {
                 factory_free(&lsp->factory);
                 if (lsp->factory.profiles) fail = "precondition: profiles freed";
             }
         }
+    }
+
+    if (!fail && rc_reordering(mode)) {
+        /* The root aggregates the clients in placement order, not in
+           participant order: fund the key creation will build. */
+        unsigned char index_order[34];
+        memcpy(index_order, spk, 34);
+        if (!lsp_compute_funding_spk(lsp, spk)) fail = "lsp_compute_funding_spk";
+        else if (memcmp(spk, index_order, 34) == 0)
+            fail = "precondition: placement must reorder the root signers";
     }
 
     int created = 0;
@@ -191,6 +232,12 @@ static int rc_run_creation(int mode) {
             fail = "participant profiles not carried across creation";
         else if (mode == RC_NEVER_ALLOCATED && f->profiles[1].profit_share_bps != 0)
             fail = "fresh profiles must start zeroed";
+        else if (rc_reordering(mode) &&
+                 (f->nodes[0].n_signers != 5 || f->nodes[0].signer_indices[1] != 4 ||
+                  f->nodes[0].signer_indices[4] != 1))
+            fail = "root signers not in placement order";
+        else if (rc_reordering(mode) && memcmp(f->funding_spk, spk, 34) != 0)
+            fail = "factory funding script";
         if (!fail) {
             /* Let the clients finish: sign (not broadcast) a cooperative close. */
             uint64_t per = (amount - 500) / 5;
@@ -251,4 +298,15 @@ int test_rotation_creation_carries_profiles(void) {
    creation retry loop, a rotation retry) neither crashes nor loses them. */
 int test_rotation_creation_failure_keeps_template(void) {
     return rc_run_creation(RC_REFUSED);
+}
+
+/* A placement mode that reorders the clients: the factory is funded at
+   lsp_compute_funding_spk (the key the daemon derives its funding address
+   from) and the whole ceremony runs over it, for every reordering mode. */
+int test_rotation_creation_placement_funding(void) {
+    static const int modes[] = { RC_REORDER_INWARD, RC_REORDER_OUTWARD,
+                                 RC_REORDER_TZ };
+    for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++)
+        if (!rc_run_creation(modes[m])) return 0;
+    return 1;
 }

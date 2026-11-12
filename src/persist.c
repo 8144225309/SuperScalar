@@ -4,6 +4,9 @@
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
+#include "superscalar/tx_builder.h"
+#include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -936,13 +939,25 @@ int persist_open(persist_t *p, const char *path) {
             NULL, NULL, NULL);
     }
 
-    /* v20 migration: client-side PS double-spend defense tracker.
-       Records every (parent_txid, parent_vout) pair a client has already
-       co-signed on a PS leaf, along with the sighash and partial sig.
-       The PROPOSE handler consults this table on every incoming PS advance:
-         - no row → fresh signing, store result
-         - row with matching sighash → idempotent retry, replay stored sig
-         - row with conflicting sighash → refuse (double-spend attempt) */
+    /* v20 migration: client-side PS double-spend defense tracker
+       (record-and-refuse).  Records every (parent_txid, parent_vout) pair a
+       client has co-signed on a PS leaf, with the BIP-341 sighash and the
+       partial sig.  client_handle_leaf_advance_stateless (src/client.c)
+       consults it on every PS advance, BEFORE any nonce exists:
+         - no row                     → sign, then INSERT the record before
+                                        the signature leaves the process
+         - row with matching sighash  → idempotent retry: re-sign the same
+                                        message with a fresh nonce
+         - row with different sighash → refuse (double-spend attempt)
+         - any lookup / insert error  → refuse (fail closed)
+       The PRIMARY KEY is the arbiter between concurrent ceremonies: plain
+       INSERT, never OR REPLACE, so the first record wins and is never
+       overwritten.
+       partial_sig is our partial sig from the FIRST signing of this parent
+       only: a same-sighash retry does not update it.  It cannot be verified
+       on its own (the session's nonces are not stored) and is never
+       replayed -- a retry re-signs under fresh nonces.  It is a record of
+       what was released, nothing more. */
     if (db_version < 20) {
         sqlite3_exec(p->db,
             "CREATE TABLE IF NOT EXISTS client_ps_signed_inputs ("
@@ -951,7 +966,7 @@ int persist_open(persist_t *p, const char *path) {
             "  parent_txid BLOB NOT NULL,"     /* 32 bytes, internal byte order */
             "  parent_vout INTEGER NOT NULL,"
             "  sighash BLOB NOT NULL,"         /* 32 bytes, BIP-341 sighash */
-            "  partial_sig BLOB NOT NULL,"     /* 36 bytes, musig partial sig */
+            "  partial_sig BLOB NOT NULL,"     /* our 32-byte MuSig2 partial sig, zero-padded to 36 bytes */
             "  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
             "  PRIMARY KEY (factory_id, parent_txid, parent_vout)"
             ");",
@@ -1425,6 +1440,22 @@ int persist_open(persist_t *p, const char *path) {
         for (size_t ci = 0; ci < 3; ci++)
             sqlite3_exec(p->db, lifecycle_cols[ci], NULL, NULL, NULL);
     }
+    /* v42: the per-member terms the tree is sized and scripted from:
+       member_capacities (comma list of sats, participants 1..N; NULL = the
+       split by tree shape), leaf_stock_sats (host stock per leaf with
+       capacities; 0 = default) and channel_scripts (comma list of
+       "participant:hex" caller channel output scripts; NULL = none).  A
+       reload rebuilds the tree from them and persist_check_rebuilt_tree
+       refuses a rebuild that is not the signed tree.  Version-gated (ALTER is
+       not idempotent). */
+    if (db_version < 42) {
+        sqlite3_exec(p->db,
+            "ALTER TABLE factories ADD COLUMN member_capacities TEXT;"
+            "ALTER TABLE factories ADD COLUMN leaf_stock_sats INTEGER NOT NULL DEFAULT 0;"
+            "ALTER TABLE factories ADD COLUMN channel_scripts TEXT;",
+            NULL, NULL, NULL);
+    }
+
     /* Client copy of the signed leaf transaction its channel is funded by,
        kept when a leaf advance replaces that leaf in tree_nodes.  The
        client's commitments keep spending this transaction's output, so a
@@ -1634,6 +1665,88 @@ int persist_in_transaction(const persist_t *p) {
 
 /* --- Factory --- */
 
+/* v42 per-member terms as stored text: member capacities as a comma list
+   (participants 1..N), NULL when none are set; channel scripts as a comma
+   list of "participant:hex", NULL when none are set.  malloc'd. */
+static char *format_member_capacities(const factory_t *f) {
+    if (!f->member_capacity || f->n_participants < 2) return NULL;
+    size_t cap = (f->n_participants - 1) * 21 + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+    buf[0] = '\0';
+    for (size_t i = 1; i < f->n_participants; i++)
+        len += (size_t)snprintf(buf + len, cap - len, "%s%llu", i > 1 ? "," : "",
+                                (unsigned long long)f->member_capacity[i]);
+    return buf;
+}
+
+static char *format_channel_scripts(const factory_t *f) {
+    if (!f->chan_spks) return NULL;
+    size_t cap = f->n_participants * (11 + 68 + 1) + 1;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+    int any = 0;
+    buf[0] = '\0';
+    for (size_t i = 1; i < f->n_participants && i < f->config.max_signers; i++) {
+        if (!f->chan_spks[i].set) continue;
+        char hex[69];
+        hex_encode(f->chan_spks[i].spk, 34, hex);
+        len += (size_t)snprintf(buf + len, cap - len, "%s%zu:%s", any ? "," : "", i, hex);
+        any = 1;
+    }
+    if (!any) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Apply stored v42 terms to f (after factory_init, before the build).
+   NULL texts leave the defaults.  Returns 0 on malformed text or terms the
+   factory refuses. */
+static int apply_stored_terms(factory_t *f, const char *caps_txt,
+                              uint64_t leaf_stock, const char *spks_txt) {
+    if (caps_txt) {
+        size_t n = f->n_participants - 1;
+        uint64_t *caps = calloc(n ? n : 1, sizeof(uint64_t));
+        if (!caps) return 0;
+        size_t k = 0;
+        const char *c = caps_txt;
+        int ok = 1;
+        while (ok && *c) {
+            char *end = NULL;
+            unsigned long long v = strtoull(c, &end, 10);
+            if (end == c || k >= n || (*end != ',' && *end != '\0')) { ok = 0; break; }
+            caps[k++] = (uint64_t)v;
+            c = (*end == ',') ? end + 1 : end;
+        }
+        ok = ok && k == n && factory_set_member_capacities(f, caps, n) &&
+             factory_set_leaf_stock(f, leaf_stock);
+        free(caps);
+        if (!ok) return 0;
+    } else if (leaf_stock != 0) {
+        return 0;   /* a stock without capacities was never written */
+    }
+    if (spks_txt) {
+        const char *c = spks_txt;
+        while (*c) {
+            char *end = NULL;
+            unsigned long idx = strtoul(c, &end, 10);
+            if (end == c || *end != ':') return 0;
+            const char *hx = end + 1;
+            if (strlen(hx) < 68 || (hx[68] != ',' && hx[68] != '\0')) return 0;
+            char one[69];
+            memcpy(one, hx, 68);
+            one[68] = '\0';
+            unsigned char spk[34];
+            if (hex_decode(one, spk, 34) != 34 ||
+                !factory_set_leaf_channel_spk(f, (uint32_t)idx, spk, 34))
+                return 0;
+            c = hx[68] == ',' ? hx + 69 : hx + 68;
+        }
+    }
+    return 1;
+}
+
 int persist_save_factory(persist_t *p, const factory_t *f,
                           secp256k1_context *ctx, uint32_t factory_id) {
     if (!p || !p->db || !f || !ctx) return 0;
@@ -1660,8 +1773,9 @@ int persist_save_factory(persist_t *p, const factory_t *f,
         " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity, "
         " use_hashlock_poison, level_arity, static_threshold_depth, "
         " ps_subfactory_arity, placement_mode, tree_fee_rate, created_block, "
-        " active_blocks, dying_blocks) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " active_blocks, dying_blocks, member_capacities, leaf_stock_sats, "
+        " channel_scripts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -1706,8 +1820,19 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 17, (int)f->created_block);
     sqlite3_bind_int(stmt, 18, (int)f->active_blocks);
     sqlite3_bind_int(stmt, 19, (int)f->dying_blocks);
+    /* v42: the per-member terms (see the migration). */
+    char *caps_txt = format_member_capacities(f);
+    char *spks_txt = format_channel_scripts(f);
+    if (caps_txt) sqlite3_bind_text(stmt, 20, caps_txt, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 20);
+    sqlite3_bind_int64(stmt, 21, (sqlite3_int64)f->leaf_stock_sats);
+    if (spks_txt) sqlite3_bind_text(stmt, 22, spks_txt, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 22);
+    int terms_oom = (f->member_capacity && !caps_txt) || (f->chan_spks && !spks_txt);
 
-    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    int ok = !terms_oom && (sqlite3_step(stmt) == SQLITE_DONE);
+    free(caps_txt);
+    free(spks_txt);
     sqlite3_finalize(stmt);
     if (!ok) {
         if (own_txn) persist_rollback(p);
@@ -2348,37 +2473,79 @@ int persist_load_ps_initial_signed_state(persist_t *p, uint32_t factory_id,
 
 /* --- Client-side PS double-spend defense (v20) --- */
 
-int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
-                                    const unsigned char parent_txid[32],
-                                    uint32_t parent_vout,
-                                    unsigned char out_sighash[32])
+/* TEST-ONLY fault-injection hook (persist.h).  NULL outside the unit tests. */
+static persist_test_ps_hook_fn g_ps_test_hook = NULL;
+static void *g_ps_test_hook_user = NULL;
+
+void persist_test_set_ps_hook(persist_test_ps_hook_fn fn, void *user) {
+    g_ps_test_hook = fn;
+    g_ps_test_hook_user = user;
+}
+
+int persist_test_ps_hook_fire(int point) {
+    if (!g_ps_test_hook) return 0;
+    return g_ps_test_hook(point, g_ps_test_hook_user) ? 1 : 0;
+}
+
+/* Shared lookup for the pre-sign check and for the save's conflict
+   re-read.  The test hook is NOT consulted here, so an injected check
+   failure never leaks into the arbiter's re-read. */
+static int ps_signed_input_lookup(persist_t *p, uint32_t factory_id,
+                                  const unsigned char parent_txid[32],
+                                  uint32_t parent_vout,
+                                  unsigned char out_sighash[32])
 {
-    if (!p || !p->db || !parent_txid) return 0;
+    if (!p || !p->db || !parent_txid) return PS_SIGNED_INPUT_ERROR;
     sqlite3_stmt *stmt;
     const char *sql =
         "SELECT sighash FROM client_ps_signed_inputs "
         "WHERE factory_id = ? AND parent_txid = ? AND parent_vout = ?;";
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "persist: client_ps_signed_inputs lookup prepare failed: %s\n",
+                sqlite3_errmsg(p->db));
+        return PS_SIGNED_INPUT_ERROR;
+    }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_blob(stmt, 2, parent_txid, 32, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 3, (int)parent_vout);
 
     int rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
+    if (rc == SQLITE_DONE) {
         sqlite3_finalize(stmt);
-        return 0;  /* not found — fresh parent, proceed to sign */
+        return PS_SIGNED_INPUT_NOT_FOUND;  /* no row: fresh parent */
     }
-
-    if (out_sighash) {
-        const void *stored_sighash_blob = sqlite3_column_blob(stmt, 0);
-        int stored_sighash_len = sqlite3_column_bytes(stmt, 0);
-        if (stored_sighash_len == 32)
-            memcpy(out_sighash, stored_sighash_blob, 32);
-        else
-            memset(out_sighash, 0, 32);
+    if (rc != SQLITE_ROW) {
+        /* Busy, I/O, corrupt, ...: we do NOT know whether we signed before,
+           and "unknown" must never be read as "not found". */
+        fprintf(stderr, "persist: client_ps_signed_inputs lookup step failed (rc=%d): %s\n",
+                rc, sqlite3_errmsg(p->db));
+        sqlite3_finalize(stmt);
+        return PS_SIGNED_INPUT_ERROR;
     }
+    const void *blob = sqlite3_column_blob(stmt, 0);
+    int len = sqlite3_column_bytes(stmt, 0);
+    if (!blob || len != 32) {
+        /* A row we cannot compare against is as bad as no answer. */
+        fprintf(stderr, "persist: client_ps_signed_inputs row has a malformed sighash (len=%d)\n",
+                len);
+        sqlite3_finalize(stmt);
+        return PS_SIGNED_INPUT_ERROR;
+    }
+    if (out_sighash)
+        memcpy(out_sighash, blob, 32);
     sqlite3_finalize(stmt);
-    return 1;  /* already signed — refuse */
+    return PS_SIGNED_INPUT_FOUND;
+}
+
+int persist_check_ps_signed_input(persist_t *p, uint32_t factory_id,
+                                    const unsigned char parent_txid[32],
+                                    uint32_t parent_vout,
+                                    unsigned char out_sighash[32])
+{
+    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_CHECK))
+        return PS_SIGNED_INPUT_ERROR;  /* injected lookup failure */
+    return ps_signed_input_lookup(p, factory_id, parent_txid, parent_vout,
+                                  out_sighash);
 }
 
 int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
@@ -2388,13 +2555,23 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
                                    const unsigned char sighash[32],
                                    const unsigned char partial_sig[36])
 {
-    if (!p || !p->db || !parent_txid || !sighash || !partial_sig) return 0;
+    if (!p || !p->db || !parent_txid || !sighash || !partial_sig)
+        return PS_SAVE_ERROR;
+    if (persist_test_ps_hook_fire(PERSIST_TEST_PS_SAVE))
+        return PS_SAVE_ERROR;  /* injected insert failure */
     sqlite3_stmt *stmt;
+    /* Plain INSERT, never OR REPLACE: the PRIMARY KEY is the arbiter
+       between two ceremonies that both passed the pre-sign check for the
+       same parent.  The first record wins and is never overwritten. */
     const char *sql =
-        "INSERT OR REPLACE INTO client_ps_signed_inputs "
+        "INSERT INTO client_ps_signed_inputs "
         "(factory_id, leaf_node_idx, parent_txid, parent_vout, "
         " sighash, partial_sig) VALUES (?, ?, ?, ?, ?, ?);";
-    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "persist_save_ps_signed_input: prepare failed: %s\n",
+                sqlite3_errmsg(p->db));
+        return PS_SAVE_ERROR;
+    }
     sqlite3_bind_int(stmt, 1, (int)factory_id);
     sqlite3_bind_int(stmt, 2, leaf_node_idx);
     sqlite3_bind_blob(stmt, 3, parent_txid, 32, SQLITE_STATIC);
@@ -2402,8 +2579,26 @@ int persist_save_ps_signed_input(persist_t *p, uint32_t factory_id,
     sqlite3_bind_blob(stmt, 5, sighash, 32, SQLITE_STATIC);
     sqlite3_bind_blob(stmt, 6, partial_sig, 36, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE && (rc & 0xff) != SQLITE_CONSTRAINT)
+        fprintf(stderr, "persist_save_ps_signed_input: insert failed (rc=%d): %s\n",
+                rc, sqlite3_errmsg(p->db));  /* read before finalize resets it */
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? 1 : 0;
+    if (rc == SQLITE_DONE)
+        return PS_SAVE_RECORDED;  /* autocommit on WAL + synchronous=FULL: fsync'd */
+    if ((rc & 0xff) != SQLITE_CONSTRAINT)
+        return PS_SAVE_ERROR;
+    /* Key conflict: a record for this parent already exists -- either a
+       concurrent ceremony won the race, or this is a retry of a ceremony
+       whose record survived a crash.  The row that is there decides. */
+    unsigned char stored[32];
+    int look = ps_signed_input_lookup(p, factory_id, parent_txid, parent_vout,
+                                      stored);
+    if (look != PS_SIGNED_INPUT_FOUND) {
+        fprintf(stderr, "persist_save_ps_signed_input: conflict re-read ambiguous (rc=%d)\n",
+                look);
+        return PS_SAVE_ERROR;
+    }
+    return memcmp(stored, sighash, 32) == 0 ? PS_SAVE_RECORDED : PS_SAVE_CONFLICT;
 }
 
 int persist_factory_is_closed(persist_t *p, uint32_t factory_id) {
@@ -2508,7 +2703,8 @@ static int node_has_l_stock(const factory_t *f, size_t idx) {
 }
 
 /* What check_rebuilt_tree needs from a signed transaction: its txid (over the
-   non-witness serialization), its first input, and its output amounts. */
+   non-witness serialization), its first input, its output amounts and
+   scripts, and where its key-path signature sits. */
 typedef struct {
     unsigned char txid[32];        /* internal byte order */
     unsigned char prev_txid[32];   /* first input, internal byte order */
@@ -2516,6 +2712,11 @@ typedef struct {
     uint32_t sequence;
     size_t n_out;
     uint64_t amounts[FACTORY_MAX_OUTPUTS];
+    unsigned char spk[FACTORY_MAX_OUTPUTS][34];
+    uint8_t spk_len[FACTORY_MAX_OUTPUTS];   /* 0 when not 34 bytes */
+    size_t body_start, body_end;   /* the non-witness body: inputs, outputs */
+    size_t sig_off;                /* the 64-byte witness item; 0 if none */
+    size_t lock_off;               /* nLockTime */
 } stored_tx_t;
 
 static int rd_varint(const unsigned char *b, size_t len, size_t *pos, uint64_t *v) {
@@ -2571,18 +2772,34 @@ static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
         for (int k = 0; k < 8; k++) a |= (uint64_t)b[pos + k] << (8 * k);
         o->amounts[i] = a;
         pos += 8;
-        if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+        if (!rd_varint(b, len, &pos, &v)) return 0;
+        o->spk_len[i] = 0;
+        if (v == 34 && len - pos >= 34) {
+            memcpy(o->spk[i], b + pos, 34);
+            o->spk_len[i] = 34;
+        }
+        if (!skip_bytes(len, &pos, v)) return 0;
     }
     size_t body_end = pos;
+    o->body_start = body_start;
+    o->body_end = body_end;
+    o->sig_off = 0;
     if (segwit) {
         for (uint64_t i = 0; i < n_in; i++) {
             uint64_t items;
             if (!rd_varint(b, len, &pos, &items)) return 0;
-            for (uint64_t k = 0; k < items; k++)
-                if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+            for (uint64_t k = 0; k < items; k++) {
+                if (!rd_varint(b, len, &pos, &v)) return 0;
+                /* the first input's only witness item, 64 bytes: the
+                   key-path Schnorr signature */
+                if (n_in == 1 && k == 0 && items == 1 && v == 64 && len - pos >= 64)
+                    o->sig_off = pos;
+                if (!skip_bytes(len, &pos, v)) return 0;
+            }
         }
     }
     if (len - pos != 4) return 0;   /* nLockTime, and nothing after it */
+    o->lock_off = pos;
     size_t nw_len = 4 + (body_end - body_start) + 4;
     unsigned char *nw = malloc(nw_len);
     if (!nw) return 0;
@@ -2592,6 +2809,40 @@ static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
     sha256_double(nw, nw_len, o->txid);
     free(nw);
     return 1;
+}
+
+/* TEST-ONLY seam (always 0 in production): lets a unit test store tree rows
+   it built by hand, without a valid signature, to exercise the other reload
+   rules. */
+int g_persist_test_skip_tree_sig_check = 0;
+
+/* 1 when the key-path signature stored in a signed tree transaction is valid
+   for the output it spends.  The sighash is BIP-341 SIGHASH_DEFAULT over the
+   stored transaction with the output's script and amount; the output key is
+   the one in the script. */
+static int stored_tx_sig_valid(secp256k1_context *ctx, const unsigned char *b,
+                               const stored_tx_t *t,
+                               const unsigned char *prev_spk, size_t prev_spk_len,
+                               uint64_t prev_amount) {
+    if (t->sig_off == 0 || prev_spk_len != 34 || prev_spk[0] != 0x51 ||
+        prev_spk[1] != 0x20)
+        return 0;
+    size_t body = t->body_end - t->body_start;
+    size_t ulen = 4 + body + 4;
+    unsigned char *utx = malloc(ulen);
+    if (!utx) return 0;
+    memcpy(utx, b, 4);
+    memcpy(utx + 4, b + t->body_start, body);
+    /* nLockTime: the last 4 bytes of the serialization */
+    memcpy(utx + 4 + body, b + t->lock_off, 4);
+    unsigned char sighash[32];
+    secp256k1_xonly_pubkey key;
+    int ok = compute_taproot_sighash(sighash, utx, ulen, 0, prev_spk, prev_spk_len,
+                                     prev_amount, t->sequence) &&
+             secp256k1_xonly_pubkey_parse(ctx, &key, prev_spk + 2) &&
+             secp256k1_schnorrsig_verify(ctx, b + t->sig_off, sighash, 32, &key);
+    free(utx);
+    return ok;
 }
 
 /* 1 when `prev` (internal order) is the txid of a state of node `idx`'s own
@@ -2779,6 +3030,55 @@ static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
                 : "does not spend its parent's stored output";
         ok = 0;
     }
+    /* Every stored signature must be valid for the output it spends: the
+       txid does not cover the witness, so the hash checks above cannot see a
+       changed signature, which would otherwise be found when the transaction
+       is broadcast.  The output is the parent's stored output (or the
+       funding output for the root, or the rebuilt parent's where the parent
+       has no stored transaction).  A leaf or sub-factory state that spends an
+       earlier state of its own chain is the only one not checked here: its
+       prevout is a chain row, not a tree row. */
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!has_tx[i]) continue;
+        const factory_node_t *nd = &f->nodes[i];
+        int par = nd->parent_index;
+        const unsigned char *pspk = NULL;
+        size_t pspk_len = 0;
+        uint64_t pamt = 0;
+        if (par < 0) {
+            pspk = f->funding_spk;
+            pspk_len = f->funding_spk_len;
+            pamt = f->funding_amount_sats;
+        } else if (spends_own_chain[i] &&
+                   !(memcmp(stx[i].prev_txid, stored_txid[par], 32) == 0 &&
+                     stx[i].prev_vout == nd->parent_vout)) {
+            continue;
+        } else if (has_tx[par]) {
+            if (nd->parent_vout >= stx[par].n_out ||
+                stx[par].spk_len[nd->parent_vout] != 34) {
+                bad = (long)i; why = "spends a parent output that is not P2TR"; ok = 0;
+                break;
+            }
+            pspk = stx[par].spk[nd->parent_vout];
+            pspk_len = 34;
+            pamt = stx[par].amounts[nd->parent_vout];
+        } else if (nd->parent_vout < f->nodes[par].n_outputs) {
+            pspk = f->nodes[par].outputs[nd->parent_vout].script_pubkey;
+            pspk_len = f->nodes[par].outputs[nd->parent_vout].script_pubkey_len;
+            pamt = f->nodes[par].outputs[nd->parent_vout].amount_sats;
+        } else {
+            bad = (long)i; why = "spends an output its parent does not have"; ok = 0;
+            break;
+        }
+        if (!g_persist_test_skip_tree_sig_check &&
+            !stored_tx_sig_valid(f->ctx, sbytes[i].data, &stx[i], pspk, pspk_len, pamt)) {
+            bad = (long)i;
+            why = stx[i].sig_off == 0
+                ? "has no key-path signature"
+                : "has a signature that is not valid for the output it spends";
+            ok = 0;
+        }
+    }
     size_t exempt = 0;
     for (size_t i = 0; ok && i < n; i++) {
         int skip = 0;
@@ -2841,7 +3141,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         "step_blocks, states_per_layer, cltv_timeout, tree_fee_rate, leaf_arity, "
         "use_hashlock_poison, level_arity, static_threshold_depth, "
         "ps_subfactory_arity, placement_mode, created_block, active_blocks, "
-        "dying_blocks "
+        "dying_blocks, member_capacities, leaf_stock_sats, channel_scripts "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -2873,6 +3173,20 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint32_t created_block = (uint32_t)sqlite3_column_int(stmt, 14);
     uint32_t active_blocks = (uint32_t)sqlite3_column_int(stmt, 15);
     uint32_t dying_blocks = (uint32_t)sqlite3_column_int(stmt, 16);
+    /* v42 per-member terms: copied, the statement is finalized before use */
+    static char caps_buf[FACTORY_MAX_SIGNERS * 21 + 1];
+    static char spks_buf[FACTORY_MAX_SIGNERS * 80 + 1];
+    const char *caps_col = (const char *)sqlite3_column_text(stmt, 17);
+    const char *spks_col = (const char *)sqlite3_column_text(stmt, 19);
+    uint64_t leaf_stock = (uint64_t)sqlite3_column_int64(stmt, 18);
+    if ((caps_col && strlen(caps_col) >= sizeof(caps_buf)) ||
+        (spks_col && strlen(spks_col) >= sizeof(spks_buf))) {
+        fprintf(stderr, "persist_load_factory: stored member terms too long\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    const char *caps_txt = caps_col ? strcpy(caps_buf, caps_col) : NULL;
+    const char *spks_txt = spks_col ? strcpy(spks_buf, spks_col) : NULL;
     /* v40 tree shape */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;
@@ -2972,29 +3286,6 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     if (pk_count != n_participants) return 0;
 
-    /* Compute funding SPK from aggregate key of all participants */
-    musig_keyagg_t ka;
-    if (!musig_aggregate_keys(ctx, &ka, pubkeys, n_participants))
-        return 0;
-
-    unsigned char internal_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
-        return 0;
-    unsigned char twk[32];
-    sha256_tagged("TapTweak", internal_ser, 32, twk);
-
-    musig_keyagg_t ka_copy = ka;
-    secp256k1_pubkey tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
-                                                   &ka_copy.cache, twk))
-        return 0;
-    secp256k1_xonly_pubkey tweaked_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk))
-        return 0;
-
-    unsigned char fund_spk[34];
-    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
-
     /* Release any prior tree state and arrays (caller may reuse f across
        loads, or pre-allocate its arrays).  factory_init_from_pubkeys memsets
        f, which would leak them.  factory_free is a no-op on a zeroed factory. */
@@ -3027,8 +3318,18 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         factory_free(f);
         return 0;
     }
+    /* v42: the per-member terms the tree was sized and scripted from. */
+    if (!apply_stored_terms(f, caps_txt, leaf_stock, spks_txt)) {
+        fprintf(stderr, "persist_load_factory: invalid stored member terms\n");
+        factory_free(f);
+        return 0;
+    }
 
-    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+    /* The funding script of the rebuilt root: the participants in the order
+       its placement mode and profiles put them. */
+    unsigned char fund_spk[34];
+    if (!factory_compute_funding_spk(f, fund_spk) ||
+        !factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                              fund_spk, 34) ||
         !factory_build_tree(f)) {
         factory_free(f);
