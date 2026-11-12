@@ -395,28 +395,48 @@ jobs:
           path: build/coverage_report/
 
   fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_wire_recv, fuzz_wire_parse_json, fuzz_tx_sighash,
+                 fuzz_persist_load, fuzz_hex_decode,
+                 fuzz_noise_handshake, fuzz_aead_decrypt]
     runs-on: ubuntu-latest
-    name: Fuzz Testing
-    timeout-minutes: 60
+    name: Fuzz (${{ matrix.target }})
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev libssl-dev clang
-      - name: Build fuzz targets
+      - name: Build fuzz target
         run: |
           CC=clang cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_FUZZING=ON \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build build --parallel --target fuzz_wire_recv fuzz_wire_parse_json \
-            fuzz_tx_sighash fuzz_persist_load fuzz_hex_decode \
-            fuzz_noise_handshake fuzz_aead_decrypt
-      - name: Run fuzz (5 min each)
+          cmake --build build --parallel --target ${{ matrix.target }}
+      # The corpus each run grows is kept for the next one (a new cache entry
+      # per run, restored from the newest earlier entry of the same target).
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: build/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # A crash, a leak, undefined behaviour or an input that runs longer
+      # than -timeout seconds fails the job; the input that caused it is
+      # uploaded below.
+      - name: Run fuzz (5 min)
         run: |
           cd build
-          for target in fuzz_wire_recv fuzz_wire_parse_json fuzz_tx_sighash \
-                        fuzz_persist_load fuzz_hex_decode \
-                        fuzz_noise_handshake fuzz_aead_decrypt; do
-              mkdir -p corpus/$target
-              timeout 300 ./$target corpus/$target/ -max_total_time=300 || true
-          done
+          mkdir -p corpus/${{ matrix.target }} artifacts
+          SEEDS=""
+          if [ -d ../fuzz/corpus/${{ matrix.target }} ]; then SEEDS=../fuzz/corpus/${{ matrix.target }}; fi
+          ./${{ matrix.target }} corpus/${{ matrix.target }}/ $SEEDS \
+            -max_total_time=300 -timeout=60 -artifact_prefix=artifacts/
+      - name: Upload reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-reproducer-${{ matrix.target }}
+          path: build/artifacts/
