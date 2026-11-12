@@ -349,6 +349,34 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                        (unsigned long long)mgr->rot_funding_sats,
                        (unsigned long long)rot_max_rate);
             }
+            /* Every channel's balance is carried into the new factory: it
+               must fit the new channel capacity at the rate the new tree is
+               sized at.  The capacity follows the fee market, so a balance
+               that does not fit postpones the rotation, nothing changed. */
+            if (planned) {
+                uint64_t rate_now = asked > rot_max_rate ? rot_max_rate : asked;
+                uint64_t carried = 0, new_cap = 0;
+                size_t worst = 0;
+                for (size_t c = 0; c < mgr->n_channels; c++) {
+                    const channel_t *och = &mgr->entries[c].channel;
+                    uint64_t tot = och->local_amount + och->remote_amount;
+                    if (tot > carried) { carried = tot; worst = c; }
+                }
+                if (carried > 0 &&
+                    lsp_plan_channel_capacity(lsp, tmpl, n_online_now,
+                                              mgr->rot_funding_sats,
+                                              mgr->rot_step_blocks,
+                                              mgr->rot_states_per_layer, rate_now,
+                                              &new_cap) &&
+                    new_cap < carried) {
+                    fprintf(stderr, "LSP rotate: postponing the rotation of factory "
+                            "%u: channel %zu carries %llu sat, more than the %llu sat "
+                            "a channel of the new factory holds at %llu sat/kvB\n",
+                            dying_id, worst, (unsigned long long)carried,
+                            (unsigned long long)new_cap, (unsigned long long)rate_now);
+                    postpone = 1;
+                }
+            }
             free(tmpl);
             if (!planned) {
                 if (rot_cer_persisted)
@@ -1346,8 +1374,16 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             ch->local_amount = saved_ch_local[c];
             ch->remote_amount = saved_ch_remote[c];
             ch->funding_amount = old_total + rot_base_commit_fee;
+        } else if (old_total > 0) {
+            /* Never hand a channel a different split than it had: the
+               pre-flight above postpones a rotation whose new channels are
+               too small, so this is a rate that rose since. */
+            fprintf(stderr, "LSP rotate: ERROR: channel %zu carries %llu sat but "
+                    "the new factory's channel holds %llu sat; its balance "
+                    "cannot be carried\n", c, (unsigned long long)old_total,
+                    (unsigned long long)new_usable);
+            return 0;
         }
-        /* else: new factory has different capacity, keep default split */
     }
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {

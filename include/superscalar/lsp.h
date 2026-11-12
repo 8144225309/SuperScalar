@@ -129,6 +129,17 @@ int lsp_accept_clients(lsp_t *lsp);
    with *max_rate_out, to be set as the factory's tree_fee_rate_max (a
    higher rate is then lowered to it); 0, with why, when even the floor rate
    fails: such a factory must not be funded. */
+/* The usable capacity (leaf channel output less the base commitment fee,
+   as lsp_channels_init computes it) of the smallest client channel in the
+   tree a factory of cfg's shape, the LSP and n_clients of its clients and
+   funding_amount would have at rate (sat/kvB).  Built without signing, like
+   lsp_plan_tree_fee_rate.  Returns 1 with *min_usable_out; 0 if that tree
+   cannot be built. */
+int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                              uint64_t funding_amount, uint16_t step_blocks,
+                              uint32_t states_per_layer, uint64_t rate,
+                              uint64_t *min_usable_out);
+
 int lsp_plan_tree_fee_rate(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
                            uint64_t funding_amount, uint16_t step_blocks,
                            uint32_t states_per_layer, uint32_t cltv_timeout,

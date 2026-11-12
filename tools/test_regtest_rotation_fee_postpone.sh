@@ -17,9 +17,14 @@
 #   3. The estimate drops back to 1 sat/vB: the next attempt runs the whole
 #      rotation (full cooperative close of the old factory, new factory).
 #
+# With MID_RATE (sat/vB) the estimate first drops from the spike to
+# MID_RATE, above the rate the factory was built at: the new channels would
+# be smaller than the balances they carry, so the rotation must be postponed
+# again, saying so, with no key turnover; then it drops to 1 sat/vB.
+#
 # Env: REGTEST_CONF (required), N_CLIENTS (default 2), SPIKE (sat/vB,
 # default 1000), POSTPONES (postponements to see before the drop, default
-# 6), AMOUNT, PORT.
+# 6), MID_RATE (default unset), AMOUNT, PORT.
 set -uo pipefail
 
 BUILD_DIR="${1:-build}"
@@ -28,6 +33,7 @@ CLIENT_BIN="$BUILD_DIR/superscalar_client"
 N_CLIENTS="${N_CLIENTS:-2}"
 SPIKE="${SPIKE:-1000}"
 POSTPONES="${POSTPONES:-6}"
+MID_RATE="${MID_RATE:-}"
 AMOUNT="${AMOUNT:-$((N_CLIENTS * 100000))}"
 PORT="${PORT:-29983}"
 API_PORT=$((PORT + 1))
@@ -116,6 +122,25 @@ grep -qa "LSP rotate: Phase A" "$LSP_LOG" && fail "key turnover (Phase A) ran du
 grep -qa "broadcasting distribution TX" "$LSP_LOG" && fail "distribution-TX fallback during the spike"
 grep -qa "retry rotation FAILED\|auto-rotation FAILED" "$LSP_LOG" && fail "a postponement was counted as a failure"
 
+if [ -n "$MID_RATE" ]; then
+    echo "--- fee estimate drops to $MID_RATE sat/vB: the carried balances must not fit ---"
+    fees "$MID_RATE"
+    NC=0
+    CARRY="LSP rotate: postponing the rotation of factory 0: channel [0-9]* carries [0-9]* sat, more than the [0-9]* sat a channel of the new factory holds at ${MID_RATE}000 sat/kvB"
+    for i in $(seq 1 120); do
+        sleep 2
+        kill -0 $LSP_PID 2>/dev/null || fail "LSP died"
+        NC=$(grep -ac "$CARRY" "$LSP_LOG")
+        [ "$NC" -ge 2 ] && break
+        grep -qaE "LSP: (auto-rotation|retry rotation) complete" "$LSP_LOG" && fail "rotation completed with balances that do not fit"
+    done
+    [ "$NC" -ge 2 ] || fail "no postponement for carried balances at $MID_RATE sat/vB"
+    grep -a "$CARRY" "$LSP_LOG" | head -1
+    grep -qa "LSP rotate: Phase A" "$LSP_LOG" && fail "key turnover ran although the balances do not fit"
+    grep -qa "cannot be carried" "$LSP_LOG" && fail "a balance was refused after the old factory closed"
+    echo "  postponed $NC times: the carried balances do not fit at $MID_RATE sat/vB"
+fi
+
 echo "--- fee estimate back to 1 sat/vB ---"
 fees 1
 OK=0
@@ -126,6 +151,7 @@ for i in $(seq 1 150); do
     grep -qa "broadcasting distribution TX" "$LSP_LOG" && fail "distribution-TX fallback"
 done
 [ "$OK" = 1 ] || fail "rotation did not complete after the spike"
+grep -qa "cannot be carried" "$LSP_LOG" && fail "a channel balance was not carried"
 CLOSE=$(grep -aoE "LSP rotate: factory 0 closed: [0-9a-f]{64}" "$LSP_LOG" | head -1 | grep -oE "[0-9a-f]{64}")
 [ -n "$CLOSE" ] || fail "no cooperative close of the old factory"
 [ "$(confs "$CLOSE")" -ge 1 ] || fail "close $CLOSE not confirmed"

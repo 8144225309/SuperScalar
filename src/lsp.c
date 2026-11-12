@@ -607,6 +607,57 @@ static int trial_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
     return ok;
 }
 
+int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                              uint64_t funding_amount, uint16_t step_blocks,
+                              uint32_t states_per_layer, uint64_t rate,
+                              uint64_t *min_usable_out) {
+    if (min_usable_out) *min_usable_out = 0;
+    if (!lsp || !cfg || n_clients == 0 || n_clients > lsp->n_clients ||
+        n_clients + 1 > FACTORY_MAX_SIGNERS)
+        return 0;
+    secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
+    pks[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n_clients; i++)
+        pks[i + 1] = lsp->client_pubkeys[i];
+    factory_t *t = calloc(1, sizeof(factory_t));
+    if (!t) return 0;
+    tree_shape_t shape;
+    tree_shape_of(cfg, &shape);
+    factory_init_from_pubkeys(t, lsp->ctx, pks, n_clients + 1, step_blocks,
+                              states_per_layer);
+    tree_shape_apply(t, &shape);
+    t->tree_fee_rate = rate;
+    t->use_tree_anchor = 1;
+    t->build_quiet = 1;
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x5a, sizeof(txid));
+    spk[0] = 0x51;
+    spk[1] = 0x20;
+    memset(spk + 2, 0x5a, 32);
+    factory_set_funding(t, txid, 0, funding_amount, spk, sizeof(spk));
+    int ok = factory_build_tree(t);
+    /* the base commitment fee lsp_channels_init reserves (1000 sat/kvB) */
+    uint64_t commit_fee = fee_commitment_tx_at(1000, 0);
+    uint64_t min_usable = UINT64_MAX;
+    for (size_t c = 0; ok && c < n_clients; c++) {
+        size_t node_idx = 0;
+        uint32_t vout = 0;
+        if (!factory_client_to_leaf(t, c, &node_idx, &vout) ||
+            vout >= t->nodes[node_idx].n_outputs) {
+            ok = 0;
+            break;
+        }
+        uint64_t amt = t->nodes[node_idx].outputs[vout].amount_sats;
+        uint64_t usable = amt > commit_fee ? amt - commit_fee : 0;
+        if (usable < min_usable) min_usable = usable;
+    }
+    factory_free(t);
+    free(t);
+    if (!ok || min_usable == UINT64_MAX) return 0;
+    if (min_usable_out) *min_usable_out = min_usable;
+    return 1;
+}
+
 int lsp_plan_tree_fee_rate(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
                            uint64_t funding_amount, uint16_t step_blocks,
                            uint32_t states_per_layer, uint32_t cltv_timeout,
