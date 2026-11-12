@@ -1851,7 +1851,7 @@ def scenario_dw_advance(orch):
     orch._log("=== SCENARIO: dw_advance ===")
     orch._log("LSP runs demo then DW advance test (advance counter, re-sign, force-close).")
 
-    orch.start_lsp(["--demo", "--test-dw-advance"])
+    orch.start_lsp(["--arity", "3", "--demo", "--test-dw-advance"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 

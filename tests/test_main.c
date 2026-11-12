@@ -1371,6 +1371,11 @@ extern int test_cli_command_parsing(void);
 
 /* Phase 4 (mixed-arity plan) — CLI arity parsing + BOLT-2016 ceiling tests */
 extern int test_tree_shape_txids_pinned(void);
+extern int test_advanceless_shape_rule(void);
+extern int test_advanceless_default_tree(void);
+extern int test_advanceless_refuses_refresh(void);
+extern int test_advanceless_persist_reload(void);
+extern int test_advanceless_reload_tree_rate(void);
 extern int test_tree_shape_dw_layers_deep(void);
 extern int test_tree_shape_static_leaf(void);
 extern int test_tree_shape_ewt_matches_tx(void);
@@ -3475,6 +3480,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tree_shape_funding_script);
     RUN_TEST(test_tree_shape_session_reinit);
     RUN_TEST(test_tree_shape_placement_setter);
+    RUN_TEST(test_advanceless_shape_rule);
+    RUN_TEST(test_advanceless_default_tree);
+    RUN_TEST(test_advanceless_refuses_refresh);
+    RUN_TEST(test_advanceless_persist_reload);
+    RUN_TEST(test_advanceless_reload_tree_rate);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);

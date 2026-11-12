@@ -2775,7 +2775,23 @@ int factory_sign_all_with_retry(factory_t *f, int max_attempts) {
     return 0;
 }
 
+int factory_has_dw_state(const factory_t *f) {
+    if (!f || !f->nodes) return 0;
+    for (size_t i = 0; i < f->n_nodes; i++)
+        if (node_dw_layer(f, &f->nodes[i]))
+            return 1;
+    return 0;
+}
+
+int factory_refuses_refresh_in_place(const factory_t *f, const char *who) {
+    if (factory_has_dw_state(f)) return 0;
+    fprintf(stderr, "%s: %s\n", who ? who : "factory", FACTORY_EXTEND_REFUSED_MSG);
+    return 1;
+}
+
 int factory_advance(factory_t *f) {
+    if (factory_refuses_refresh_in_place(f, "factory_advance"))
+        return 0;
     if (!dw_counter_advance(&f->counter))
         return 0;
 
@@ -3147,6 +3163,8 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
     /* DW leaf: advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
         /* Leaf exhausted — advance root layer, reset all leaf layers */
+        if (factory_refuses_refresh_in_place(f, "factory_advance_leaf"))
+            return 0;
         if (!leaf_rollover_moves_parent(f, node_idx)) {
             fprintf(stderr, "factory: leaf %d exhausted and no DW state above it "
                     "moves on rollover; rotate the factory\n", leaf_side);
@@ -3189,6 +3207,11 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
        feature gap surfaced by TS-TIER-B-PS testnet4 (the regtest test had
        weaker PASS criteria that masked this). */
     if (node->is_ps_leaf) {
+        /* A chain longer than states_per_layer rolls the root over: refuse
+           that before touching the leaf when no state layer would move. */
+        if ((uint32_t)node->ps_chain_len + 1 > f->states_per_layer &&
+            factory_refuses_refresh_in_place(f, "factory_advance_leaf_unsigned"))
+            return 0;
         memcpy(node->ps_prev_txid, node->txid, 32);
         node->ps_prev_chan_amount = node->outputs[0].amount_sats;
         node->ps_chain_len++;
@@ -3225,6 +3248,8 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
     /* DW leaf: advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
         /* Leaf exhausted — advance root layer, reset all leaf layers */
+        if (factory_refuses_refresh_in_place(f, "factory_advance_leaf"))
+            return 0;
         if (!leaf_rollover_moves_parent(f, node_idx)) {
             fprintf(stderr, "factory: leaf %d exhausted and no DW state above it "
                     "moves on rollover; rotate the factory\n", leaf_side);
@@ -3270,6 +3295,11 @@ int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
           to distinguish). */
 int factory_tick_root(factory_t *f) {
     if (!f) return 0;
+    /* Nothing in an advanceless tree carries a relative lock: a tick would
+       re-sign byte-identical transactions and wipe the in-memory chain
+       state.  Only rotation extends such a factory. */
+    if (factory_refuses_refresh_in_place(f, "factory_tick_root"))
+        return 0;
     /* F7: invert the trigger semantics.  A "tick" represents one step_blocks
        worth of block-height progression.  Two cases:
 
@@ -5477,6 +5507,42 @@ uint32_t factory_compute_ewt_for_shape(
                                         ps_cap, n_clients, static_threshold);
     if (timed == UINT32_MAX) return UINT32_MAX;
     return timed * dw_first_state_delay(step_blocks, states_per_layer);
+}
+
+int factory_advanceless_shape(size_t n_clients,
+                              uint8_t arities_out[FACTORY_MAX_LEVELS],
+                              size_t *n_arities_out,
+                              uint32_t *static_near_root_out) {
+    if (!arities_out || !n_arities_out || !static_near_root_out || n_clients == 0)
+        return 0;
+    const size_t max_fanout = FACTORY_MAX_OUTPUTS - 1;   /* one output is the anchor */
+    /* Depth: fewest fan-out levels whose capacity max_fanout^d holds every
+       client in its own leaf. */
+    uint32_t d = 0;
+    for (size_t cap = 1; cap < n_clients; cap *= max_fanout)
+        d++;
+    if (d + 1 > FACTORY_MAX_LEVELS) return 0;
+    /* Fan-out: the narrowest one that still fits n_clients in d levels.
+       At least 4: in an arity list 1 and 2 are DW kinds and 3 is the
+       pseudo-Spilman split, so the narrowest plain fan-out is 4. */
+    size_t a = 4;
+    for (;;) {
+        size_t cap = 1;
+        for (uint32_t i = 0; i < d && cap < n_clients; i++) cap *= a;
+        if (cap >= n_clients || a >= max_fanout) break;
+        a++;
+    }
+    size_t n = 0;
+    for (uint32_t i = 0; i < d; i++) arities_out[n++] = (uint8_t)a;
+    arities_out[n++] = FACTORY_ARITY_PS;   /* one member per PS leaf */
+    *n_arities_out = n;
+    *static_near_root_out = d;
+    /* Every interior level is static and every leaf pseudo-Spilman: no state
+       on any path carries a DW relative lock. */
+    if (shape_timed_levels(n > 1 ? arities_out : NULL, n > 1 ? n : 0,
+                           FACTORY_ARITY_PS, 1, n_clients, d) != 0)
+        return 0;
+    return 1;
 }
 
 void factory_free(factory_t *f) {

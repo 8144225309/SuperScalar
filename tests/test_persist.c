@@ -1087,8 +1087,9 @@ int test_persist_factory_round_trip(void) {
     TEST_ASSERT(factory_build_tree(f), "build tree");
     factory_set_lifecycle(f, 1234, 4320, 432);
 
-    /* Save factory */
+    /* Save factory and its tree (a factory is never stored without one) */
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
 
     /* Load factory into new struct */
     factory_t *f2 = calloc(1, sizeof(factory_t));
@@ -1533,6 +1534,7 @@ int test_lsp_recovery_round_trip(void) {
     memset(fake_txid, 0xAB, 32);
     factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    f->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels the normal way */
@@ -1568,6 +1570,7 @@ int test_lsp_recovery_round_trip(void) {
     /* Persist: factory, channels, basepoints */
     TEST_ASSERT(persist_begin(&db), "begin");
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
     for (size_t c = 0; c < 4; c++) {
         TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                            (uint32_t)c), "save channel");
@@ -2051,6 +2054,7 @@ int test_persist_crash_stress(void) {
     memset(fake_txid, 0xAB, 32);
     factory_compute_funding_spk(f, fund_spk);
     factory_set_funding(f, fake_txid, 0, 200000, fund_spk, 34);
+    f->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(f), "build tree");
 
     /* Initialize channels */
@@ -2081,6 +2085,7 @@ int test_persist_crash_stress(void) {
         TEST_ASSERT(persist_open(&db, path), "c1 open");
         TEST_ASSERT(persist_begin(&db), "c1 begin");
         TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "c1 save factory");
+        TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "c1 save tree");
         for (size_t c = 0; c < 4; c++) {
             TEST_ASSERT(persist_save_channel(&db, &mgr.entries[c].channel, 0,
                                                (uint32_t)c), "c1 save ch");
@@ -5874,7 +5879,7 @@ int test_autosettle_sends_large_commitment(void) {
 }
 
 
-/* A factory row without a tree fee rate (one written before schema v40, or
+/* A factory row without a tree fee rate (one written before schema v41, or
    damaged) cannot rebuild the tree that was signed: built at the floor rate
    instead, every tree txid would differ from the signed ones.  The loader
    refuses it. */
@@ -5901,14 +5906,19 @@ int test_persist_factory_without_tree_rate_refused(void) {
 
     factory_t *f = calloc(1, sizeof(factory_t));
     TEST_ASSERT(f, "alloc");
-    factory_init_from_pubkeys(f, ctx, pks, 5, 10, 4);
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(secp256k1_keypair_create(ctx, &kps[i], seckeys[i]), "keypair");
+    factory_init(f, ctx, kps, 5, 10, 4);
     f->use_tree_anchor = 1;
     f->tree_fee_rate = 3000;
     unsigned char fake_txid[32] = {0};
     fake_txid[0] = 0xDE;
     factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(f), "build tree");
+    TEST_ASSERT(factory_sign_all(f), "sign tree");
     TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
 
     factory_t *f2 = calloc(1, sizeof(factory_t));
     TEST_ASSERT(f2, "alloc");
@@ -5917,15 +5927,16 @@ int test_persist_factory_without_tree_rate_refused(void) {
     TEST_ASSERT(memcmp(f2->nodes[0].txid, f->nodes[0].txid, 32) == 0, "same tree");
     factory_free(f2);
 
-    /* rate 0 is a valid agreed rate */
+    /* a row holding another rate (0 is a valid one) rebuilds a tree that
+       was not signed: refused (test_advanceless_reload_tree_rate loads
+       factories signed at 100 and at 0) */
     TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = 0 WHERE id = 0;",
                              NULL, NULL, NULL) == SQLITE_OK, "rate 0");
     memset(f2, 0, sizeof(*f2));
-    TEST_ASSERT(persist_load_factory(&db, 0, f2, ctx), "a row at rate 0 loads");
-    TEST_ASSERT_EQ(f2->tree_fee_rate, 0, "rate 0 loaded");
+    TEST_ASSERT(!persist_load_factory(&db, 0, f2, ctx), "a row at another rate is refused");
     factory_free(f2);
 
-    /* what a row migrated from schema v39 holds: NULL */
+    /* what a row migrated from schema v40 holds: NULL */
     TEST_ASSERT(sqlite3_exec(db.db, "UPDATE factories SET tree_fee_rate = NULL WHERE id = 0;",
                              NULL, NULL, NULL) == SQLITE_OK, "clear the rate");
     memset(f2, 0, sizeof(*f2));

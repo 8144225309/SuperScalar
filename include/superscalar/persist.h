@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 40
+#define PERSIST_SCHEMA_VERSION 41
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -137,6 +137,10 @@ int persist_save_factory(persist_t *p, const factory_t *f,
 
 /* Check if a factory row exists in the database.  Returns 1 if present. */
 int persist_has_factory(persist_t *p, uint32_t factory_id);
+
+/* 1 if the factories row `factory_id` exists with state 'closed' (its tree is
+   fully on chain or the factory was otherwise settled). */
+int persist_factory_is_closed(persist_t *p, uint32_t factory_id);
 
 /* --- Pseudo-Spilman leaf chain persistence --- */
 

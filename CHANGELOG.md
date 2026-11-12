@@ -6,6 +6,15 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### The default tree is advanceless
+
+Operator-visible behaviour changes.
+
+- **Without `--arity`, `--static-near-root` and `--ps-subfactory-arity` the LSP builds the advanceless tree**: every interior level static (kickoff only, no Decker-Wattenhofer state), one member per pseudo-Spilman leaf, no relative lock anywhere in the tree.  Depth is the fewest levels with `15^depth >= clients`; the fan-out is the smallest `F >= 4` with `F^depth >= clients` (4 clients: `--arity 4,3 --static-near-root 1`, 9 transactions; 64: `8,8,3` static 2, 137; 255: `7,7,7,3` static 3).  The LSP logs the shape it chose.  Before, the default was the uniform pseudo-Spilman tree with DW state on every interior level.  Every other shape is still available with an explicit `--arity`; `--arity` alone keeps DW state on every level.
+- **A factory without DW state is never refreshed in place.**  The root tick, the whole-counter advance, the root rollover of a leaf advance (DW or pseudo-Spilman), a member's root-driven Tier B and `--test-tier-b-rollover` refuse it with one message pointing to rotation; such a factory's life is extended only by rotating to a new funding output.  `--demo` no longer advances the DW counter of such a factory.
+- **The tree shape is stored with the factory** (schema v40: `level_arity`, `static_threshold_depth`, `ps_subfactory_arity`, `placement_mode`).  A restarted LSP and a reconnecting member used to rebuild every factory as a uniform tree; for any other shape that tree had different transactions from the signed one, and commitments signed after the restart spent a leaf output that can never exist.  The reload now rebuilds the stored shape and ties it to the signed tree in the database: every stored transaction must hash to its txid and spend its parent's stored output (the root the funding outpoint), and every rebuilt txid must match, except below a state that an advance or re-allocation moved on (a DW state, or a leaf or sub-factory state), which is loaded from its signed transaction; a kickoff, or an interior node of a tree without DW state, never differs.  **Any mismatch, or a factory with no stored tree, refuses the load.**  A factory stored before v40 loads with the default shape columns and is refused only if that rebuild does not match its signed tree.
+- **An LSP whose DB holds a factory it cannot load stops** (exit 1, with the reason) instead of waiting for clients for a new factory.
+
 ### Factory rotation is off by default
 
 Operator-visible behaviour changes.
