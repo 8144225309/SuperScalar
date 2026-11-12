@@ -10,6 +10,9 @@
 
 #define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
 #define MAX_HTLCS 483              /* BOLT #2 maximum */
+/* Largest commitment transaction nodes relay: commitments are TRUC
+   (nVersion 3), and BIP 431 limits a TRUC transaction to 10000 vB. */
+#define CHANNEL_MAX_COMMIT_VSIZE 10000
 #define DEFAULT_HTLCS_CAP 64      /* initial allocation for dynamic htlc arrays */
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
@@ -464,6 +467,18 @@ void channel_set_remote_htlc_basepoint(channel_t *ch,
 
 /* --- HTLC operations --- */
 
+/* Most HTLC and PTLC outputs one commitment can carry within
+   CHANNEL_MAX_COMMIT_VSIZE: the largest n for which a commitment with one
+   key-path input, to_local, to_remote, n P2TR HTLC/PTLC outputs and the P2A
+   anchor fits (228).  Below MAX_HTLCS, so it is the binding limit. */
+size_t channel_max_commit_htlc_outputs(void);
+
+/* Outputs ch's commitment carries for HTLCs and PTLCs: the active ones at
+   or above the dust limit. */
+size_t channel_commit_htlc_outputs(const channel_t *ch);
+
+/* Refuses (returns 0, nothing changed) an HTLC that would take the
+   commitment past channel_max_commit_htlc_outputs(). */
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out);

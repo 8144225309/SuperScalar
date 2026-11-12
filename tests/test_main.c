@@ -1074,6 +1074,7 @@ extern int test_htlc_offered_scripts(void);
 extern int test_htlc_received_scripts(void);
 extern int test_htlc_control_block_2leaf(void);
 extern int test_htlc_add_fulfill(void);
+extern int test_htlc_count_capped_at_relay_limit(void);
 extern int test_htlc_add_fail(void);
 extern int test_htlc_commitment_tx(void);
 extern int test_htlc_success_spend(void);
@@ -3170,6 +3171,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_received_scripts);
     RUN_TEST(test_htlc_control_block_2leaf);
     RUN_TEST(test_htlc_add_fulfill);
+    RUN_TEST(test_htlc_count_capped_at_relay_limit);
     RUN_TEST(test_htlc_add_fail);
     RUN_TEST(test_htlc_commitment_tx);
     RUN_TEST(test_htlc_success_spend);

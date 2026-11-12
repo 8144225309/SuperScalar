@@ -2,6 +2,7 @@
 #include "superscalar/tapscript.h"
 #include "superscalar/fee_estimator.h"
 #include "superscalar/persist.h"
+#include "superscalar/fee.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -755,6 +756,15 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
         if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE &&
             ch->ptlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
             n_active_ptlcs++;
+    }
+
+    /* Nothing above the relay limit is built, so nothing above it is signed. */
+    if (n_active_htlcs + n_active_ptlcs > channel_max_commit_htlc_outputs()) {
+        fprintf(stderr, "channel commitment: %zu HTLC/PTLC outputs, more than "
+                "the %zu that fit in %d vB; refusing to build it\n",
+                n_active_htlcs + n_active_ptlcs, channel_max_commit_htlc_outputs(),
+                CHANNEL_MAX_COMMIT_VSIZE);
+        return 0;
     }
 
     /* +1 slot for the optional P2A CPFP anchor (appended last, see step 7c). */
@@ -1764,6 +1774,31 @@ static void channel_compact_htlcs(channel_t *ch) {
     ch->n_htlcs = write;
 }
 
+size_t channel_max_commit_htlc_outputs(void) {
+    static size_t max_outputs = 0;
+    if (max_outputs == 0) {
+        size_t n = 0;
+        while (fee_keypath_tx_vsize(1, 2 + n + 1, 1) <= CHANNEL_MAX_COMMIT_VSIZE)
+            n++;
+        max_outputs = n;
+    }
+    return max_outputs;
+}
+
+size_t channel_commit_htlc_outputs(const channel_t *ch) {
+    size_t n = 0;
+    if (!ch) return 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++)
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
+            ch->htlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
+            n++;
+    for (size_t i = 0; i < ch->n_ptlcs; i++)
+        if (ch->ptlcs[i].state == PTLC_STATE_ACTIVE &&
+            ch->ptlcs[i].amount_sats >= CHANNEL_DUST_LIMIT_SATS)
+            n++;
+    return n;
+}
+
 int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint64_t amount_sats, const unsigned char *payment_hash32,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
@@ -1801,6 +1836,13 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     if (amount_sats < CHANNEL_DUST_LIMIT_SATS) {
         fprintf(stderr, "channel_add_htlc: refused — amount %" PRIu64
                 " < dust limit %d\n", amount_sats, CHANNEL_DUST_LIMIT_SATS);
+        return 0;
+    }
+    /* One more output must keep the commitment relayable. */
+    if (channel_commit_htlc_outputs(ch) >= channel_max_commit_htlc_outputs()) {
+        fprintf(stderr, "channel_add_htlc: refused — the commitment already "
+                "carries %zu HTLC/PTLC outputs, the most that fit in %d vB\n",
+                channel_commit_htlc_outputs(ch), CHANNEL_MAX_COMMIT_VSIZE);
         return 0;
     }
 
