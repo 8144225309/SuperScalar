@@ -166,6 +166,11 @@ in `src/client.c` plus `persist_check_ps_signed_input` /
 open transaction during the ceremony (no `persist_begin` in client.c),
 so each statement is its own autocommit transaction.
 
+This path runs only where the client co-signs a leaf advance at all, which
+it does not by default (see the refusal above); it is the rule that must hold
+before advances are ever enabled for clients, and it is exercised today by the
+harness opt-in (`--test-allow-tree-advance`).
+
 **Order.** For a PS leaf with `ps_chain_len > 0` and a persist handle
 installed (`client_set_persist`):
 
