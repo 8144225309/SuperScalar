@@ -225,17 +225,17 @@ int test_client_dist_step_never_early(void) {
     int tip = 0;
 
     g_mock.tip = (int)LOCKTIME - 1;
-    T_ASSERT(client_dist_step(&c, &d, NULL, &tip) == CLIENT_DIST_NOT_YET, "not yet");
+    T_ASSERT(client_dist_step(&c, &d, NULL, &tip, NULL) == CLIENT_DIST_NOT_YET, "not yet");
     T_ASSERT(tip == (int)LOCKTIME - 1, "tip out");
     g_mock.tip = 0;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_NOT_YET, "tip 0");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_NOT_YET, "tip 0");
     g_mock.tip = -1;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_NO_CHAIN, "no tip");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_NO_CHAIN, "no tip");
     T_ASSERT(g_mock.n_sends == 0, "sent before nLockTime");
 
     /* due: tip == nLockTime, funding unspent */
     g_mock.tip = (int)LOCKTIME;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_BROADCAST, "due");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_BROADCAST, "due");
     T_ASSERT(g_mock.n_sends == 1, "one send");
     char hex[2048];
     hex_encode(fx.signed_tx.data, fx.signed_tx.len, hex);
@@ -244,12 +244,12 @@ int test_client_dist_step_never_early(void) {
 
     /* refused by the node: reported, sent again next time */
     g_mock.send_ok = 0;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_REFUSED, "refused");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_REFUSED, "refused");
     T_ASSERT(g_mock.n_sends == 2, "resent");
 
     /* caller-supplied broadcaster is used instead of send_raw_tx */
     g_mock.send_ok = 1;
-    T_ASSERT(client_dist_step(&c, &d, m_send, NULL) == CLIENT_DIST_BROADCAST, "hook");
+    T_ASSERT(client_dist_step(&c, &d, m_send, NULL, NULL) == CLIENT_DIST_BROADCAST, "hook");
     T_ASSERT(g_mock.n_sends == 3, "hook sent");
     client_dist_free(&d);
     fixture_free(&fx);
@@ -268,22 +268,46 @@ int test_client_dist_step_spent_and_confirmed(void) {
 
     /* funding spent by another tx (tree, close): nothing sent */
     g_mock.funding_unspent = 0;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_FUNDING_SPENT, "spent");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_FUNDING_SPENT, "spent");
     T_ASSERT(g_mock.n_sends == 0, "sent after funding spent");
     /* funding spent by the distribution TX itself, seen through its outputs */
     g_mock.dist_out_unspent = 1;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_CONFIRMED, "via outputs");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_CONFIRMED, "via outputs");
     /* in mempool / confirmed by txid */
     g_mock.dist_out_unspent = 0;
     g_mock.dist_confs = 0;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_IN_MEMPOOL, "mempool");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_IN_MEMPOOL, "mempool");
     g_mock.dist_confs = 3;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_CONFIRMED, "confirmed");
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, NULL) == CLIENT_DIST_CONFIRMED, "confirmed");
     T_ASSERT(g_mock.n_sends == 0, "no send when already published");
-    /* backend cannot tell whether the funding is spent: try it */
+    /* the backend cannot tell whether the funding output is spent (an
+       HTTP-RPC error, or no is_outpoint_unspent at all): the TX is sent,
+       but whether the node takes it or refuses it, nothing is settled */
     g_mock.dist_confs = -1;
+    g_mock.funding_unspent = -1;
+    int sends = g_mock.n_sends;
+    g_mock.send_ok = 0;
+    client_dist_status_t s1 = client_dist_step(&c, &d, NULL, NULL, NULL);
+    T_ASSERT(s1 == CLIENT_DIST_FUNDING_UNKNOWN, "refused, funding unknown");
+    T_ASSERT(!client_dist_settles(s1), "a refused TX with unknown funding is no exit");
+    g_mock.send_ok = 1;
     c.is_outpoint_unspent = NULL;
-    T_ASSERT(client_dist_step(&c, &d, NULL, NULL) == CLIENT_DIST_BROADCAST, "unknown spend");
+    s1 = client_dist_step(&c, &d, NULL, NULL, NULL);
+    T_ASSERT(s1 == CLIENT_DIST_FUNDING_UNKNOWN, "accepted, funding unknown");
+    T_ASSERT(!client_dist_settles(s1), "unknown funding never settles");
+    T_ASSERT(g_mock.n_sends == sends + 2, "still sent");
+    /* known unspent: refused and sent counts as the exit */
+    c.is_outpoint_unspent = m_unspent;
+    g_mock.funding_unspent = 1;
+    g_mock.send_ok = 0;
+    T_ASSERT(client_dist_settles(client_dist_step(&c, &d, NULL, NULL, NULL)),
+             "refused with the funding output there settles");
+    T_ASSERT(!client_dist_settles(CLIENT_DIST_FUNDING_SPENT) &&
+             !client_dist_settles(CLIENT_DIST_NOT_YET), "tree cases");
+    int confs = 0;
+    g_mock.dist_confs = 4;
+    T_ASSERT(client_dist_step(&c, &d, NULL, NULL, &confs) == CLIENT_DIST_CONFIRMED &&
+             confs == 4, "confirmations reported");
     client_dist_free(&d);
     fixture_free(&fx);
     return 1;

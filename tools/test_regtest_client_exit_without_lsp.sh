@@ -11,6 +11,12 @@
 #               --force-close publishes the distribution TX and none of the
 #               tree (which would make it invalid); a second client's
 #               --force-close sees it confirmed and publishes nothing.
+#   rpcroot     The root kickoff is published before the expiry (as an LSP
+#               leaving would); at the nLockTime a member's --force-close
+#               through the bitcoind HTTP-RPC backend (the one signet,
+#               testnet4 and mainnet use; selected here by --network signet
+#               against the regtest node) must take the tree path, not
+#               count the refused distribution TX as its exit.
 #   sweep       LSP --force-close publishes the tree; every client (all four
 #               slots) broadcasts its commitment and, after the CSV,
 #               --sweep-to-local sweeps its to_local output.  Commitments pay
@@ -30,7 +36,7 @@ set -uo pipefail
 BUILD_DIR="${1:-build}"
 shift || true
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(expiry forceclose cltv sweep)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(expiry forceclose rpcroot cltv sweep)
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
@@ -211,6 +217,33 @@ scenario_forceclose() {
         pass "funding spent by the distribution TX" || fail "funding not spent by the distribution TX"
 }
 
+scenario_rpcroot() {
+    local d=$T/rpcroot
+    say "=== rpcroot: root kickoff on chain before expiry; --force-close over HTTP RPC"
+    factory_up "$d" 29968 --daemon --active-blocks 20 --dying-blocks 10 || return
+    wait_grep "$d/lsp.log" "entering daemon mode" 400 mine || { fail "LSP not in daemon mode"; return; }
+    clients_ready "$d" || return
+    sleep 2
+    stop "$LSP_PID"; kill_clients; say "LSP and daemons killed"
+    local hex txid lt fund root
+    hex=$(dist_hex "$d/c1.db"); txid=$(txid_of "$hex"); lt=$(locktime_of "$hex"); fund=$(funding_of "$d/c1.db")
+    root=$(sqlite3 "$d/c1.db" "SELECT signed_tx_hex FROM tree_nodes WHERE factory_id=0 AND node_index=0;")
+    say "publish root kickoff: $($BCLI sendrawtransaction "$root" 2>&1 | cut -c1-64)"
+    mine 1
+    while [ "$(height)" -lt "$lt" ]; do mine 1; done
+    say "tip at nLockTime $lt"
+    "$CLIENT_BIN" --network signet "${RPC[@]}" --force-close --db "$d/c1.db" > "$d/fc1.log" 2>&1
+    grep -q "NOT publishing the factory tree" "$d/fc1.log" &&
+        fail "refused distribution TX taken as the exit: $(grep -m1 -E "distribution TX" "$d/fc1.log" | cut -c1-140)" ||
+        pass "the refused distribution TX is not taken as the exit"
+    grep -qE "^Force-close: factory 0 " "$d/fc1.log" && pass "the tree path ran: $(grep -m1 "^Force-close: factory 0" "$d/fc1.log")" ||
+        fail "the tree path did not run"
+    grep -q "funding output $fund is spent by another transaction" "$d/fc1.log" &&
+        pass "the spent funding output was seen over HTTP RPC" ||
+        fail "funding state not seen: $(grep -m1 "distribution TX" "$d/fc1.log" | cut -c1-140)"
+    [ "$(confs "$txid")" = -1 ] && pass "no distribution TX on chain" || fail "distribution TX on chain"
+}
+
 scenario_sweep() {
     local d=$T/sweep
     say "=== sweep: --sweep-to-local for every client slot"
@@ -317,7 +350,7 @@ echo "=========== client exits without the LSP (build: $BUILD_DIR) ==========="
 node_up
 for s in "${SCENARIOS[@]}"; do
     case $s in
-        expiry|forceclose|sweep|cltv) "scenario_$s" ;;
+        expiry|forceclose|rpcroot|sweep|cltv) "scenario_$s" ;;
         *) echo "unknown scenario $s"; exit 2 ;;
     esac
 done

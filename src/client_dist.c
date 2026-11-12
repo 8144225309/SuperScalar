@@ -216,10 +216,17 @@ int client_dist_load(persist_t *db, secp256k1_context *ctx, uint32_t factory_id,
     return ok ? 1 : -1;
 }
 
+int client_dist_settles(client_dist_status_t s) {
+    return s == CLIENT_DIST_BROADCAST || s == CLIENT_DIST_IN_MEMPOOL ||
+           s == CLIENT_DIST_CONFIRMED || s == CLIENT_DIST_REFUSED;
+}
+
 client_dist_status_t client_dist_step(chain_backend_t *chain,
                                       const client_dist_tx_t *d,
-                                      client_dist_send_fn send, int *tip_out) {
+                                      client_dist_send_fn send, int *tip_out,
+                                      int *confs_out) {
     if (tip_out) *tip_out = -1;
+    if (confs_out) *confs_out = -1;
     if (!d || !d->tx) return CLIENT_DIST_NONE;
     if (!chain || !chain->get_block_height) return CLIENT_DIST_NO_CHAIN;
     int tip = chain->get_block_height(chain);
@@ -228,6 +235,7 @@ client_dist_status_t client_dist_step(chain_backend_t *chain,
 
     int confs = chain->get_confirmations
                 ? chain->get_confirmations(chain, d->txid_hex) : -1;
+    if (confs_out) *confs_out = confs >= 0 ? confs : -1;
     if (confs >= 1) return CLIENT_DIST_CONFIRMED;
     if (confs == 0) return CLIENT_DIST_IN_MEMPOOL;
 
@@ -248,14 +256,18 @@ client_dist_status_t client_dist_step(chain_backend_t *chain,
         return CLIENT_DIST_FUNDING_SPENT;
     }
 
+    /* unspent == 1: due and the funding output is there.  unspent == -1:
+       the backend cannot say; the TX is still sent, but nothing is settled
+       by it (the funding output may already be spent by the tree). */
     char *hex = malloc(d->tx_len * 2 + 1);
-    if (!hex) return CLIENT_DIST_REFUSED;
+    if (!hex) return unspent == 1 ? CLIENT_DIST_REFUSED : CLIENT_DIST_FUNDING_UNKNOWN;
     hex_encode(d->tx, d->tx_len, hex);
     hex[d->tx_len * 2] = '\0';
     char txid[65] = {0};
     int sent = send ? send(chain, hex, txid)
                     : (chain->send_raw_tx && chain->send_raw_tx(chain, hex, txid));
     free(hex);
+    if (unspent != 1) return CLIENT_DIST_FUNDING_UNKNOWN;
     return sent ? CLIENT_DIST_BROADCAST : CLIENT_DIST_REFUSED;
 }
 
@@ -270,6 +282,7 @@ const char *client_dist_status_str(client_dist_status_t s) {
     case CLIENT_DIST_REFUSED:       return "refused";
     case CLIENT_DIST_CONFIRMED:     return "confirmed";
     case CLIENT_DIST_FUNDING_SPENT: return "funding-spent";
+    case CLIENT_DIST_FUNDING_UNKNOWN: return "funding-unknown";
     }
     return "unknown";
 }
@@ -307,6 +320,13 @@ static void report(FILE *out, const char *prefix, client_dist_status_t s,
         fprintf(out, "%sthe factory funding output %s:%u is spent by another "
                 "transaction; distribution TX %s can no longer confirm\n", prefix,
                 d->funding_txid_hex, d->funding_vout, d->txid_hex);
+        break;
+    case CLIENT_DIST_FUNDING_UNKNOWN:
+        fprintf(out, "%sdistribution TX %s is due (block %d, nLockTime %u) and was "
+                "sent, but this chain backend cannot tell whether the funding "
+                "output %s:%u is still unspent; it does not count as the exit\n",
+                prefix, d->txid_hex, tip, d->locktime, d->funding_txid_hex,
+                d->funding_vout);
         break;
     case CLIENT_DIST_NO_CHAIN:
         fprintf(out, "%schain tip unknown; distribution TX %s not checked\n",
@@ -364,7 +384,7 @@ client_dist_status_t client_dist_watch(client_dist_watch_t *w, persist_t *db,
     }
 
     int tip = -1;
-    client_dist_status_t s = client_dist_step(chain, &w->d, send, &tip);
+    client_dist_status_t s = client_dist_step(chain, &w->d, send, &tip, NULL);
     if (!w->reported || s != w->last || s == CLIENT_DIST_BROADCAST) {
         if (s != CLIENT_DIST_NOT_YET || w->reported)
             report(out, "Client: ", s, &w->d, tip);
@@ -400,15 +420,14 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
         return 0;
     }
     int tip = -1;
-    client_dist_status_t s = client_dist_step(chain, &d, send, &tip);
+    client_dist_status_t s = client_dist_step(chain, &d, send, &tip, NULL);
     report(out, "Force-close: ", s, &d, tip);
-    int settles = s == CLIENT_DIST_BROADCAST || s == CLIENT_DIST_IN_MEMPOOL ||
-                  s == CLIENT_DIST_CONFIRMED || s == CLIENT_DIST_REFUSED;
+    int settles = client_dist_settles(s);
     if (settles)
         fprintf(out, "Force-close: the distribution TX is this factory's exit; "
                 "NOT publishing the factory tree (it spends the funding output "
                 "and the distribution TX could then never confirm)\n");
-    else if (s == CLIENT_DIST_NOT_YET)
+    else if (s == CLIENT_DIST_NOT_YET || s == CLIENT_DIST_FUNDING_UNKNOWN)
         fprintf(out, "Force-close: publishing the factory tree now; once it "
                 "spends the funding output the distribution TX can never "
                 "confirm\n");

@@ -32,9 +32,11 @@ typedef enum {
     CLIENT_DIST_NOT_YET,        /* the tip is below its nLockTime */
     CLIENT_DIST_BROADCAST,      /* sent to the node now */
     CLIENT_DIST_IN_MEMPOOL,     /* already in the mempool */
-    CLIENT_DIST_REFUSED,        /* due, but the node did not accept it */
+    CLIENT_DIST_REFUSED,        /* due, funding output unspent, node refused it */
     CLIENT_DIST_CONFIRMED,      /* on chain */
-    CLIENT_DIST_FUNDING_SPENT   /* the funding output is spent by another tx */
+    CLIENT_DIST_FUNDING_SPENT,  /* the funding output is spent by another tx */
+    CLIENT_DIST_FUNDING_UNKNOWN /* due, but the backend cannot tell whether the
+                                   funding output is unspent: sent, settles nothing */
 } client_dist_status_t;
 
 /* Broadcast hook: chain->send_raw_tx when NULL. */
@@ -64,11 +66,21 @@ int client_dist_load(persist_t *db, secp256k1_context *ctx, uint32_t factory_id,
 void client_dist_free(client_dist_tx_t *d);
 
 /* One decision against the chain.  Never sends before the tip has reached
-   d->locktime, and never once the funding output is spent.  *tip_out, if
-   given, receives the tip (-1 if unknown). */
+   d->locktime, and never once the funding output is known spent.  When the
+   backend cannot tell (no is_outpoint_unspent, or an error) the TX is still
+   sent, but the result is CLIENT_DIST_FUNDING_UNKNOWN, which settles
+   nothing.  *tip_out / *confs_out, if given, receive the tip and the TX's
+   confirmation count (-1 when unknown, e.g. when it is seen confirmed only
+   through its unspent outputs). */
 client_dist_status_t client_dist_step(chain_backend_t *chain,
                                       const client_dist_tx_t *d,
-                                      client_dist_send_fn send, int *tip_out);
+                                      client_dist_send_fn send, int *tip_out,
+                                      int *confs_out);
+
+/* 1 if the status makes the distribution TX this factory's exit, so the
+   tree must not be published: in the mempool, confirmed, or due with the
+   funding output known unspent (sent, or refused and sent again later). */
+int client_dist_settles(client_dist_status_t s);
 
 const char *client_dist_status_str(client_dist_status_t s);
 
@@ -100,9 +112,10 @@ void client_dist_watch_free(client_dist_watch_t *w);
    spends the funding output, after which the distribution TX can never
    confirm; once the TX is due it is the exit (after its nLockTime the
    tree's timeout paths are open as well).  Returns 1 when the
-   distribution TX is due, in the mempool or confirmed: the caller must
-   then publish nothing of the tree.  Returns 0 when the tree is the
-   exit (TX not yet due, funding already spent, or no usable TX). */
+   distribution TX settles the factory (client_dist_settles): the caller
+   must then publish nothing of the tree.  Returns 0 when the tree is the
+   exit: TX not yet due, funding output spent or its state unknown, or no
+   usable TX. */
 int client_dist_force_close(persist_t *db, chain_backend_t *chain,
                             client_dist_send_fn send, FILE *out);
 
