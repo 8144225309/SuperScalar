@@ -127,6 +127,11 @@ Operator-visible behaviour changes. Several turn a silent, unsafe outcome into a
 - **`--sweep-to-local` for any client:** the sweep loaded the channel stored under id 0 and initialised the channel of participant 1, so only that client could sweep; it now uses the client's own channel and participant index, and its fee follows `--fee-rate` (it is signed at sweep time), not the factory's pre-signed rate.
 - **Fee results checked:** commitment, JIT close and rotation close fees that cannot be computed (`FEE_INVALID`) fail the operation instead of wrapping into balances; a fee API's rates are clamped to 10000 sat/vB.
 
+### Reconnect after a half-finished forward
+
+- **The LSP replays a pending forward to a reconnecting member in msat.**  The replayed `UPDATE_ADD_HTLC` carried the amount in sat in the msat field, so the member read 1500 sat as 1 sat, refused the HTLC and its commitment, and the channel stayed a commitment ahead of the member: every later payment to or from it failed.
+- **A replay that does not complete is undone.**  The destination channel goes back to the persisted state (amounts, HTLCs, commitment number), the replayed HTLC row is removed and the connection is dropped, so the member's next reconnect replays the forward again from a consistent point.  Before, the channel was left a commitment ahead with an HTLC the member never took.
+
 ## v0.2.0 — 2026-07-02
 
 Final v0.2.0. This section covers work merged after the rc1 candidate (2026-05-31); the `v0.2.0-rc1` section below is the bulk of the release. Schema advanced v36 → **v39**.
