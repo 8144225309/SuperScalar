@@ -5186,7 +5186,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
-    int sender_found = -1;
     for (size_t s = 0; s < mgr->n_channels; s++) {
         if (s == client_idx) continue;
         channel_t *sender_ch = &mgr->entries[s].channel;
@@ -5288,7 +5287,6 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
-            sender_found = (int)s;
             break;
         }
     }
@@ -5298,18 +5296,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     if (fulfill_txn_started && mgr->persist)
         persist_commit((persist_t *)mgr->persist);
 
-    /* Per-leaf advance: after payment settles, advance both affected leaves.
-       Arity-1 (DW) and Arity-PS both use per-leaf 2-of-2 signing, so only
-       the involved clients' leaves need to be re-signed, not the entire tree. */
-    if (lsp->factory.leaf_arity == FACTORY_ARITY_1 ||
-        lsp->factory.leaf_arity == FACTORY_ARITY_PS) {
-        /* Advance payee's leaf */
-        lsp_advance_leaf(mgr, lsp, (int)client_idx);
-        /* Advance sender's leaf (if found via intra-factory routing) */
-        if (sender_found >= 0 && sender_found != (int)client_idx)
-            lsp_advance_leaf(mgr, lsp, sender_found);
-    }
-
+    /* A settled payment moves balances inside the channels only; nothing the
+       leaf transaction commits to has changed, so the factory tree is left
+       untouched.  Advancing the leaf here would replace the transaction whose
+       output funds the channel while both sides' commitments keep spending
+       the old outpoint. */
     return 1;
 }
 
@@ -8178,8 +8169,78 @@ int lsp_channels_check_conservation(const lsp_channel_mgr_t *mgr)
 }
 
 
-/* Public wrapper: advance one PS leaf via the production wire ceremony. */
-int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
+/* --- Guard for tree advances that do not re-anchor channels ---
+
+   A channel's funding outpoint is an output of the leaf transaction that
+   existed when the channel opened.  A leaf advance replaces that transaction
+   (PS: a chain transaction spending the previous channel output; DW: a new
+   leaf txid with a lower nSequence), and a whole-tree state advance replaces
+   every state node, so every leaf of the factory.  None of these ceremonies
+   moves a channel onto the new outpoint or re-signs a commitment, so once
+   the new tree is on chain the commitments held by both sides spend an
+   output that does not exist.  That strands the channel whatever its
+   balances are: a channel whose client side is empty is stranded on its
+   next inbound payment, and the LSP's side is stranded with it.
+
+   Returns the index of the first open channel (funding amount non-zero)
+   funded by leaf node `leaf_node`, or by any leaf when `whole_factory` is
+   set; -1 if there is none. */
+static int first_open_channel(const lsp_channel_mgr_t *mgr, const factory_t *f,
+                               int whole_factory, size_t leaf_node) {
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (mgr->entries[c].channel.funding_amount == 0) continue;
+        if (!whole_factory) {
+            size_t c_node;
+            uint32_t c_vout;
+            if (!factory_client_to_leaf(f, c, &c_node, &c_vout)) continue;
+            if (c_node != leaf_node) continue;
+        }
+        return (int)c;
+    }
+    return -1;
+}
+
+/* 1 if advancing this leaf once more exhausts it, so that
+   factory_advance_leaf_unsigned advances the root and the caller re-signs the
+   whole tree (mirrors the two rollover conditions there). */
+static int leaf_advance_rolls_root(const factory_t *f, int leaf_side) {
+    const factory_node_t *node = &f->nodes[f->leaf_node_indices[leaf_side]];
+    if (node->is_ps_leaf)
+        return (uint32_t)(node->ps_chain_len + 1) > f->states_per_layer;
+    return dw_is_exhausted(&f->leaf_layers[leaf_side]);
+}
+
+/* Public entry point: advance one leaf (arity-1 DW or PS) via the wire
+   ceremony.
+
+   Refused, before any state is touched or any message is sent, while an open
+   channel is funded by this leaf -- or by any leaf of the factory when this
+   advance would exhaust the leaf and roll over into a whole-tree state
+   advance (see the guard above).
+
+   allow_live_channel != 0 skips that check.  It exists for harnesses that
+   exercise the ceremony itself; nothing that serves real client funds may
+   pass it. */
+int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side,
+                                  int allow_live_channel) {
+    if (!mgr || !lsp) return 0;
+    const factory_t *f = &lsp->factory;
+    if (!allow_live_channel && leaf_side >= 0 && leaf_side < f->n_leaf_nodes) {
+        int whole = leaf_advance_rolls_root(f, leaf_side);
+        int c = first_open_channel(mgr, f, whole, f->leaf_node_indices[leaf_side]);
+        if (c >= 0) {
+            const channel_t *ch = &mgr->entries[c].channel;
+            fprintf(stderr,
+                    "LSP: leaf %d advance refused -- open channel %d is funded "
+                    "by %s (funding %llu sats, %zu HTLC(s), %zu PTLC(s)); the "
+                    "advance would not re-anchor it\n",
+                    leaf_side, c,
+                    whole ? "the tree this advance would re-sign" : "this leaf",
+                    (unsigned long long)ch->funding_amount,
+                    ch->n_htlcs, ch->n_ptlcs);
+            return 0;
+        }
+    }
     return lsp_advance_leaf(mgr, lsp, leaf_side);
 }
 
@@ -8189,16 +8250,31 @@ int lsp_channels_advance_ps_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_si
    root counter rolls over, drives the Tier B ceremony to re-sign every
    non-PS-leaf node for the new epoch.
 
-   Caller wires this into a block-driven polling loop (e.g., every
-   step_blocks blocks, or based on observed block height progression).
+   A rollover replaces every leaf of the factory without re-anchoring any
+   channel, so the tick is refused, before the counter is touched, while any
+   channel of the factory is open (see the guard above).
+   allow_live_channel != 0 skips that check; it is for harnesses that
+   exercise the ceremony itself.
 
    Returns:
      1 = ceremony completed (epoch advanced + non-PS-leaf nodes re-signed),
      0 = nothing to do (no rollover this tick),
-    -1 = ceremony failed (caller may retry next tick). */
-int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    -1 = refused, or ceremony failed (caller may retry next tick). */
+int lsp_factory_tick_root(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                           int allow_live_channel) {
     if (!mgr || !lsp) return 0;
     factory_t *f = &lsp->factory;
+    if (!allow_live_channel) {
+        int c = first_open_channel(mgr, f, 1, 0);
+        if (c >= 0) {
+            fprintf(stderr,
+                    "LSP: root tick refused -- open channel %d is funded by "
+                    "the tree a rollover would re-sign (funding %llu sats); "
+                    "the state advance would not re-anchor it\n",
+                    c, (unsigned long long)mgr->entries[c].channel.funding_amount);
+            return -1;
+        }
+    }
     int rc = factory_tick_root(f);
     if (rc != -1) {
         return 0;

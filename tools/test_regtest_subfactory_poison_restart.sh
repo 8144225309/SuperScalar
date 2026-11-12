@@ -120,7 +120,7 @@ done
 
 # Clients — same bracket-safe pattern as k2_breach
 for i in $(seq 0 $((N_CLIENTS - 1))); do
-    env $SS_ASAN_ENV "$CLIENT_BIN" \
+    env $SS_ASAN_ENV "$CLIENT_BIN" --test-allow-tree-advance \
         --network regtest --host 127.0.0.1 --port "$LSP_PORT_RUN1" \
         --seckey "${CLIENT_SECKEYS[$i]}" \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id $((i + 1)) --daemon \

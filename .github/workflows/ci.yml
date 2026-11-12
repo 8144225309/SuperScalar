@@ -224,7 +224,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev sqlite3 python3
       - name: Cache Bitcoin Core binary
         id: btc-cache
         uses: actions/cache@v4
@@ -329,6 +329,25 @@ jobs:
         run: |
           ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
           bash tools/test_regtest_distribution.sh build
+      # A payment must leave the factory leaf untouched: real daemons, one
+      # client-initiated payment, then a unilateral exit (LSP first, clients
+      # alone, and clients alone after refusing a leaf advance the LSP
+      # proposes).  Both client commitments must confirm and pay each client
+      # its balance.  Runs for the default leaf type and --arity 1.
+      # The script starts and stops its own bitcoind (private datadir and RPC
+      # port), independent of the node configured above.  That node runs with
+      # minrelaytxfee/blockmintxfee lowered to 500 sat/kvB, because a
+      # commitment transaction pays a fixed 154 sat for 167 vB, below the
+      # default relay floor; without that the exit could not be exercised.
+      # The script needs the sqlite3 CLI and python3 (installed above).
+      - name: Payment then unilateral exit, leaf untouched (under ASan+LSan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:verify_asan_link_order=0
+          LSAN_OPTIONS: exitcode=23:suppressions=${{ github.workspace }}/test/sanitizer_suppressions/lsan.supp:print_suppressions=0
+        run: |
+          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+          bash tools/test_regtest_payment_no_leaf_advance.sh build
+          ARITY=1 bash tools/test_regtest_payment_no_leaf_advance.sh build
       - name: Stop bitcoind
         if: always()
         run: bitcoin-cli -regtest stop 2>/dev/null || true

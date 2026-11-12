@@ -2197,6 +2197,13 @@ handle_message:
             if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf advance failed\n", my_index);
+            } else if (cbd && cbd->db &&
+                       !persist_save_tree_nodes(cbd->db, factory, 0)) {
+                /* The ceremony completed (it ends with the LSP's DONE), so
+                   the tree in memory is the advanced one this client signed:
+                   persist it so a crash recovers the current leaf state. */
+                fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
+                        "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2208,14 +2215,13 @@ handle_message:
                Client's factory already has the correct unsigned tx from PROPOSE. */
             int leaf_side;
             if (wire_parse_leaf_advance_done(msg.json, &leaf_side)) {
-                printf("Client %u: leaf %d advance confirmed by LSP\n",
+                /* A DONE seen here is the LSP's broadcast for a leaf whose
+                   ceremony this client took no part in (another client's
+                   leaf, or one it refused).  Nothing was accepted, so
+                   nothing is persisted; an advance this client signed is
+                   persisted where its ceremony completes, above. */
+                printf("Client %u: LSP reports leaf %d advanced\n",
                        my_index, leaf_side);
-                /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
-                   recovers the CURRENT leaf state, not the last-rotation snapshot.
-                   The factory already holds the advanced tx from the PROPOSE ceremony. */
-                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
-                    fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
-                            "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2483,6 +2489,9 @@ static void usage(const char *prog) {
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --test-allow-tree-advance         Harness only (refused on mainnet): co-sign leaf, state and\n"
+        "                                    sub-factory advances, which are otherwise refused because\n"
+        "                                    they do not move the channel onto the new tree\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
@@ -3027,6 +3036,11 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--test-allow-tree-advance") == 0) {
+            /* Harness only (the --test- prefix is refused on mainnet):
+               co-sign leaf, state and sub-factory advances, which the client
+               otherwise refuses because they do not re-anchor its channel. */
+            client_set_allow_tree_advance(1);
         } else if (strcmp(argv[i], "--force-close") == 0) {
             force_close = 1;
         } else if (strcmp(argv[i], "--sweep-to-local") == 0) {

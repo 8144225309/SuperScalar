@@ -727,6 +727,39 @@ static int client_refuse_advance_if_close_signed(int fd,
     return 1;
 }
 
+/* --- Tree advances are refused by default ---
+
+   A leaf advance replaces the leaf transaction whose output funds this
+   client's channel; a state advance replaces every state node on the path to
+   it; a sub-factory advance replaces the sub-factory node the channel hangs
+   from.  None of these ceremonies moves the channel onto the new outpoint or
+   gives the client commitments that spend it, while the LSP ends up holding a
+   newer tree than the one the client's commitments spend.  A client is in a
+   factory only through its channel there, so co-signing any of them would
+   leave it without a unilateral exit.  Every proposal is therefore refused
+   before any local state changes and before any nonce is produced.
+
+   client_set_allow_tree_advance(1) lifts the refusal.  It exists for
+   harnesses that exercise the ceremonies with real clients
+   (--test-allow-tree-advance, refused on mainnet); nothing holding real
+   funds may set it. */
+static int g_client_allow_tree_advance = 0;
+
+void client_set_allow_tree_advance(int allow) {
+    g_client_allow_tree_advance = allow ? 1 : 0;
+}
+
+/* Returns 1 if the advance was refused (an error was sent to the LSP). */
+static int client_refuse_tree_advance(int fd, uint32_t my_index,
+                                       const char *what) {
+    if (g_client_allow_tree_advance) return 0;
+    fprintf(stderr, "Client %u: REFUSING %s — the channel cannot be moved to "
+            "an advanced tree\n", my_index, what);
+    client_send_error(fd, "tree advance refused: client does not sign "
+                          "leaf, state or sub-factory advances");
+    return 1;
+}
+
 int client_close_outputs_acceptable(const secp256k1_context *ctx,
                                      const secp256k1_pubkey *my_pubkey,
                                      const channel_t *ch,
@@ -911,10 +944,10 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         msg = *initial_msg;
         got_propose = 1;
     } else {
-        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages
-           and trailing leaf-advance traffic (per-leaf advance ceremonies
-           trigger after HTLC fulfill in lsp_channels.c:2259; their
-           PROPOSE/DONE messages may arrive just before CLOSE_PROPOSE). */
+        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages and
+           taking part in a leaf-advance or state-advance ceremony the LSP
+           starts before the close.  Payments never start one; none has to
+           arrive for the close to proceed. */
         for (;;) {
             if (!wire_recv(fd, &msg) || check_msg_error(&msg)) {
                 fprintf(stderr, "Client: expected CLOSE_PROPOSE\n");
@@ -2677,6 +2710,9 @@ int client_run_with_channels(secp256k1_context *ctx,
        SF-followup #145: factory ptr is registered with g_client_active_factory
        once it's initialized below, so MSG_FUNDING_REORG can find it. */
     factory_t *factory = calloc(1, sizeof(factory_t));
+    /* Set once the channel (declared below) is initialised; its heap arrays
+       are then released on both exit paths. */
+    int channel_ready = 0;
     if (!factory) return 0;
     factory_init_from_pubkeys(factory, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
@@ -3244,6 +3280,7 @@ int client_run_with_channels(secp256k1_context *ctx,
             goto fail;
         }
         close_ch = &channel;
+        channel_ready = 1;
         memset(bp_ps, 0, 32); memset(bp_ds, 0, 32);
         memset(bp_rs, 0, 32); memset(bp_hs, 0, 32);
 
@@ -3350,6 +3387,7 @@ int client_run_with_channels(secp256k1_context *ctx,
     printf("Client %u: cooperative close complete!\n", my_index);
 
 done:
+    if (channel_ready) channel_cleanup(&channel);
     free(nonce_entries);
     factory_free(factory);
     free(factory);
@@ -3357,6 +3395,7 @@ done:
     return 1;
 
 fail:
+    if (channel_ready) channel_cleanup(&channel);
     free(nonce_entries);
     factory_free(factory);
     free(factory);
@@ -4288,6 +4327,8 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
     if (client_refuse_advance_if_close_signed(fd, factory, my_index,
                                                "sub-factory advance"))
         return 0;
+    if (client_refuse_tree_advance(fd, my_index, "sub-factory advance"))
+        return 0;
     return client_handle_subfactory_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
@@ -4831,6 +4872,8 @@ int client_handle_leaf_advance(int fd, secp256k1_context *ctx,
     if (client_refuse_advance_if_close_signed(fd, factory, my_index,
                                                "leaf advance"))
         return 0;
+    if (client_refuse_tree_advance(fd, my_index, "leaf advance"))
+        return 0;
     return client_handle_leaf_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
 
@@ -5313,6 +5356,8 @@ int client_handle_state_advance(int fd, secp256k1_context *ctx,
                                   const wire_msg_t *propose_msg) {
     if (client_refuse_advance_if_close_signed(fd, factory, my_index,
                                                "state advance"))
+        return 0;
+    if (client_refuse_tree_advance(fd, my_index, "state advance"))
         return 0;
     return client_handle_state_advance_stateless(fd, ctx, keypair, factory, my_index, propose_msg);
 }
