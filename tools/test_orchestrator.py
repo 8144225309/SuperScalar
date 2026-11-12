@@ -1822,7 +1822,8 @@ def scenario_ps_advance(orch):
 
     orch.start_lsp(["--arity", "3", "--clients", "1", "--demo", "--test-ps-advance"])
     time.sleep(orch.timing["lsp_bind"])
-    orch.start_client(0)
+    # Clients refuse leaf advances unless this harness-only flag is given.
+    orch.start_client(0, ["--test-allow-tree-advance"])
 
     rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
     orch._log(f"LSP exited with code {rc}")
@@ -2171,7 +2172,7 @@ def scenario_lsps2_wire(orch):
     orch.n_clients = 1
 
     # --daemon keeps LSP alive so get_info response arrives before CLOSE_PROPOSE
-    orch.start_lsp(["--demo", "--daemon", "--arity", "1"])
+    orch.start_lsp(["--demo", "--daemon", "--enable-jit-experimental", "--arity", "1"])
     time.sleep(orch.timing["lsp_bind"])
     orch.start_client(0, ["--test-lsps2"])
 

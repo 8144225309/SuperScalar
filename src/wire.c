@@ -112,7 +112,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x52: return "JIT_ACCEPT";
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
-    case 0x57: return "JIT_REJECT";
+    case 0x90: return "JIT_REJECT";
     case 0x55: return "STATE_ADVANCE_PROPOSE";
     case 0x73: return "SUBFACTORY_PROPOSE";
     case 0x74: return "SUBFACTORY_NONCE";
@@ -157,10 +157,15 @@ int wire_listen(const char *host, int port) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    if (host && host[0])
-        inet_pton(AF_INET, host, &addr.sin_addr);
-    else
+    if (host && host[0]) {
+        /* An unparseable address must not fall through to all interfaces. */
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(fd);
+            return -1;
+        }
+    } else {
         addr.sin_addr.s_addr = INADDR_ANY;
+    }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
@@ -893,6 +898,17 @@ cJSON *wire_build_update_fail_htlc(uint64_t htlc_id, const char *reason) {
     cJSON_AddNumberToObject(j, "htlc_id", (double)htlc_id);
     cJSON_AddStringToObject(j, "reason", reason ? reason : "unknown");
     return j;
+}
+
+cJSON *wire_build_update_fail_htlc_uncommitted(uint64_t htlc_id, const char *reason) {
+    cJSON *j = wire_build_update_fail_htlc(htlc_id, reason);
+    cJSON_AddBoolToObject(j, "uncommitted", 1);
+    return j;
+}
+
+int wire_update_fail_htlc_is_uncommitted(const cJSON *json) {
+    cJSON *u = cJSON_GetObjectItem(json, "uncommitted");
+    return u && cJSON_IsBool(u) && cJSON_IsTrue(u);
 }
 
 cJSON *wire_build_close_request(void) {
@@ -1798,11 +1814,15 @@ cJSON *wire_build_bridge_fail_htlc(const unsigned char *payment_hash32,
 
 cJSON *wire_build_bridge_send_pay(const char *bolt11,
                                     const unsigned char *payment_hash32,
-                                    uint64_t request_id) {
+                                    uint64_t request_id,
+                                    uint64_t max_total_msat,
+                                    uint32_t max_delay) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "bolt11", bolt11);
     wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
     cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    cJSON_AddNumberToObject(j, "max_total_msat", (double)max_total_msat);
+    cJSON_AddNumberToObject(j, "max_delay", (double)max_delay);
     return j;
 }
 
@@ -1814,6 +1834,65 @@ cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
     if (preimage32)
         wire_json_add_hex(j, "preimage", preimage32, 32);
     return j;
+}
+
+cJSON *wire_build_bridge_fulfill_ack(const unsigned char *payment_hash32) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    return j;
+}
+
+int wire_parse_bridge_fulfill_ack(const cJSON *json, unsigned char *payment_hash32) {
+    return wire_json_get_hex(json, "payment_hash", payment_hash32, 32) == 32;
+}
+
+cJSON *wire_build_bridge_fulfill_unresolved(const unsigned char *payment_hash32,
+                                             const char *reason) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddStringToObject(j, "reason", reason ? reason : "");
+    return j;
+}
+
+int wire_parse_bridge_fulfill_unresolved(const cJSON *json,
+                                          unsigned char *payment_hash32,
+                                          char *reason, size_t reason_len) {
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    if (reason && reason_len > 0) {
+        cJSON *r = cJSON_GetObjectItem(json, "reason");
+        snprintf(reason, reason_len, "%s",
+                 (r && cJSON_IsString(r)) ? r->valuestring : "");
+    }
+    return 1;
+}
+
+cJSON *wire_build_bridge_pay_result_ack(uint64_t request_id,
+                                          const char *rejected_reason) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    cJSON_AddStringToObject(j, "status", rejected_reason ? "rejected" : "applied");
+    if (rejected_reason)
+        cJSON_AddStringToObject(j, "reason", rejected_reason);
+    return j;
+}
+
+int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id,
+                                       char *reason, size_t reason_len) {
+    cJSON *ri = cJSON_GetObjectItem(json, "request_id");
+    cJSON *st = cJSON_GetObjectItem(json, "status");
+    if (!wire_check_nonneg(ri) || !st || !cJSON_IsString(st)) return 0;
+    int rejected = strcmp(st->valuestring, "rejected") == 0;
+    if (!rejected && strcmp(st->valuestring, "applied") != 0) return 0;
+    *request_id = (uint64_t)ri->valuedouble;
+    if (reason && reason_len > 0) {
+        cJSON *re = cJSON_GetObjectItem(json, "reason");
+        snprintf(reason, reason_len, "%s",
+                 !rejected ? "" :
+                 (re && cJSON_IsString(re) && re->valuestring[0]) ? re->valuestring
+                                                                  : "rejected");
+    }
+    return 1;
 }
 
 cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
@@ -1938,14 +2017,22 @@ int wire_parse_bridge_fail_htlc(const cJSON *json,
 int wire_parse_bridge_send_pay(const cJSON *json,
                                  char *bolt11, size_t bolt11_len,
                                  unsigned char *payment_hash32,
-                                 uint64_t *request_id) {
+                                 uint64_t *request_id,
+                                 uint64_t *max_total_msat,
+                                 uint32_t *max_delay) {
     cJSON *b = cJSON_GetObjectItem(json, "bolt11");
     cJSON *ri = cJSON_GetObjectItem(json, "request_id");
-    if (!b || !cJSON_IsString(b) || !wire_check_nonneg(ri))
+    cJSON *mt = cJSON_GetObjectItem(json, "max_total_msat");
+    cJSON *md = cJSON_GetObjectItem(json, "max_delay");
+    if (!b || !cJSON_IsString(b) || !wire_check_nonneg(ri) ||
+        !wire_check_nonneg(mt) || !wire_check_nonneg(md) ||
+        md->valuedouble > (double)UINT32_MAX)
         return 0;
     if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
     *request_id = (uint64_t)ri->valuedouble;
+    *max_total_msat = (uint64_t)mt->valuedouble;
+    *max_delay = (uint32_t)md->valuedouble;
     if (bolt11 && bolt11_len > 0) {
         strncpy(bolt11, b->valuestring, bolt11_len - 1);
         bolt11[bolt11_len - 1] = '\0';
@@ -1962,8 +2049,10 @@ int wire_parse_bridge_pay_result(const cJSON *json,
         return 0;
     *request_id = (uint64_t)ri->valuedouble;
     *success = cJSON_IsTrue(su) ? 1 : 0;
-    if (*success && preimage32)
-        wire_json_get_hex(json, "preimage", preimage32, 32);
+    /* A success without its 32-byte preimage is not a result */
+    if (*success && preimage32 &&
+        wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+        return 0;
     return 1;
 }
 

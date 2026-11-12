@@ -158,6 +158,11 @@ cJSON *lsps_dispatch_request(const lsps_ctx_t *ctx, const cJSON *json)
                 }
             }
         }
+    } else if (strcmp(method, "lsps2.get_info") == 0 &&
+               ctx && ctx->mgr && !jit_channels_enabled(ctx->mgr)) {
+        /* No terms are offered for a purchase that would be refused. */
+        response = lsps_build_error(req_id, LSPS_ERR_METHOD_NOT_FOUND,
+                                     "lsps2 is not enabled on this LSP");
     } else if (strcmp(method, "lsps2.get_info") == 0) {
         lsps2_fee_params_t params = {
             .min_fee_msat = 1000,
@@ -241,20 +246,15 @@ int lsps_peer_request(const char *json_req, char *resp_buf, size_t resp_cap)
             info.base_fee_msat            = 1000;
             info.fee_ppm                  = 500;
             resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
-        } else if (strcmp(method, "lsps2_get_info") == 0) {
-            lsps2_fee_params_t params;
-            memset(&params, 0, sizeof(params));
-            params.min_fee_msat             = 1000;
-            params.fee_ppm                  = 500;
-            params.min_channel_balance_msat = 100000000ULL;
-            params.max_channel_balance_msat = 10000000000ULL;
-            resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
-        } else if (strcmp(method, "lsps2.buy") == 0) {
+        } else if (strcmp(method, "lsps2.buy") == 0 ||
+                   strcmp(method, "lsps2.get_info") == 0 ||
+                   strcmp(method, "lsps2_get_info") == 0) {
             /* A JIT channel is opened with a factory client over that
                client's own connection, by the channel manager's thread.  An
-               outside peer is neither, so the purchase is refused here. */
+               outside peer is neither, so the purchase is refused here, and
+               no terms are advertised for it. */
             resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND,
-                                     "lsps2.buy is not available on this connection");
+                                     "lsps2 is not available on this connection");
         } else {
             /* No channel context: nothing below can reach the channel
                manager or a factory client's connection. */

@@ -200,6 +200,12 @@ typedef struct {
        without the LSP's cooperation. */
     unsigned char latest_commitment_sig[64];
     int           has_latest_commitment_sig;
+
+    /* The HTLC this side offered last, for as long as no commitment that
+       contains it has been accepted from the peer.  Only such an HTLC can be
+       taken back by channel_rollback_htlc. */
+    int           has_unsigned_offer;
+    uint64_t      unsigned_offer_id;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
@@ -469,6 +475,13 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id);
 
 /* Fail all HTLCs whose cltv_expiry <= current_height. Returns count failed. */
 int channel_check_htlc_timeouts(channel_t *ch, uint32_t current_height);
+
+/* Undo channel_add_htlc for an HTLC the peer refused before taking it: the
+   amount and fee go back, the HTLC is removed and the commitment number and
+   HTLC id counter return to what they were, as if it had never been added.
+   Only the most recently added HTLC can be rolled back, and only while it
+   is the latest change to the channel.  Returns 1 on success. */
+int channel_rollback_htlc(channel_t *ch, uint64_t htlc_id);
 
 /* --- HTLC resolution transactions --- */
 

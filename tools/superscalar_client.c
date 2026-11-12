@@ -1563,6 +1563,44 @@ handle_message:
             break;
         }
 
+        case MSG_UPDATE_FAIL_HTLC: {
+            /* The LSP gives an HTLC back.  One it never took is simply
+               dropped.  One that was committed is failed and the commitment
+               exchange follows, exactly as after a fulfil. */
+            uint64_t pre_fail_local = ch->local_amount;
+            uint64_t pre_fail_remote = ch->remote_amount;
+            htlc_t pre_fail_htlcs[MAX_HTLCS];
+            size_t pre_fail_n_htlcs = ch->n_htlcs;
+            if (pre_fail_n_htlcs > 0)
+                memcpy(pre_fail_htlcs, ch->htlcs, pre_fail_n_htlcs * sizeof(htlc_t));
+
+            int fail_committed = 0;
+            uint64_t fail_htlc_id = 0;
+            int fail_ok = client_handle_fail_htlc(ch, &msg, &fail_committed,
+                                                   &fail_htlc_id);
+            cJSON_Delete(msg.json);
+            if (fail_ok && fail_committed) {
+                if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
+                                         ctx, keypair, my_index, &cbd->inbox) &&
+                    msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                    client_handle_commitment_signed(fd, ch, ctx, &msg);
+                    client_persist_commitment_sig(ch, cbd);
+                    if (msg.json) cJSON_Delete(msg.json);
+                    client_recv_lsp_revocation(fd, ch, cbd, ctx,
+                        pre_fail_local, pre_fail_remote,
+                        pre_fail_n_htlcs > 0 ? pre_fail_htlcs : NULL, pre_fail_n_htlcs,
+                        keypair, my_index);
+                } else {
+                    if (msg.json) cJSON_Delete(msg.json);
+                }
+            }
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+            break;
+        }
+
         case MSG_LSP_REVOKE_AND_ACK: {
             /* LSP's own revocation, arriving naturally in the daemon loop.
                This happens when a queued CS was processed from the inbox:
@@ -2160,6 +2198,13 @@ handle_message:
             if (!client_handle_leaf_advance(fd, ctx, keypair, factory,
                                               my_index, &propose_msg)) {
                 fprintf(stderr, "Client %u: leaf advance failed\n", my_index);
+            } else if (cbd && cbd->db &&
+                       !persist_save_tree_nodes(cbd->db, factory, 0)) {
+                /* The ceremony completed (it ends with the LSP's DONE), so
+                   the tree in memory is the advanced one this client signed:
+                   persist it so a crash recovers the current leaf state. */
+                fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
+                        "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2171,14 +2216,13 @@ handle_message:
                Client's factory already has the correct unsigned tx from PROPOSE. */
             int leaf_side;
             if (wire_parse_leaf_advance_done(msg.json, &leaf_side)) {
-                printf("Client %u: leaf %d advance confirmed by LSP\n",
+                /* A DONE seen here is the LSP's broadcast for a leaf whose
+                   ceremony this client took no part in (another client's
+                   leaf, or one it refused).  Nothing was accepted, so
+                   nothing is persisted; an advance this client signed is
+                   persisted where its ceremony completes, above. */
+                printf("Client %u: LSP reports leaf %d advanced\n",
                        my_index, leaf_side);
-                /* WT bundle (gap-scan LOW): re-persist the advanced tree so a crash
-                   recovers the CURRENT leaf state, not the last-rotation snapshot.
-                   The factory already holds the advanced tx from the PROPOSE ceremony. */
-                if (cbd && cbd->db && !persist_save_tree_nodes(cbd->db, factory, 0))
-                    fprintf(stderr, "Client %u: WARN — tree_nodes re-persist after "
-                            "leaf advance failed\n", my_index);
             }
             cJSON_Delete(msg.json);
             break;
@@ -2320,8 +2364,10 @@ handle_message:
                     return 2;
                 }
 
-                /* If buy test requested, send lsps2.buy using returned fee params */
-                if (ok && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
+                /* If buy test requested, send lsps2.buy using the returned fee
+                   params (none if get_info was refused: the purchase must
+                   then be refused as well, which the test observes). */
+                if (cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
                     cJSON *buy_req = cJSON_CreateObject();
                     if (buy_req) {
                         cJSON_AddStringToObject(buy_req, "jsonrpc", "2.0");
@@ -2331,7 +2377,8 @@ handle_message:
                         if (params) {
                             /* opening_fee_params: forward the params object from get_info */
                             cJSON *fee_params = cJSON_CreateObject();
-                            cJSON *min_fee = cJSON_GetObjectItem(result, "min_fee_msat");
+                            cJSON *min_fee = result
+                                ? cJSON_GetObjectItem(result, "min_fee_msat") : NULL;
                             if (fee_params && min_fee)
                                 cJSON_AddNumberToObject(fee_params, "min_fee_msat",
                                                         min_fee->valuedouble);
@@ -2443,6 +2490,9 @@ static void usage(const char *prog) {
         "  --on-lsp-forgery-ps MODE          Override the above for PS (CLTV-gated) leaves\n"
         "                                      (default: inherit --on-lsp-forgery; no auto-downgrade)\n"
         "  --sweep-to-local                  Sweep to_local output after CSV maturity\n"
+        "  --test-allow-tree-advance         Harness only (refused on mainnet): co-sign leaf, state and\n"
+        "                                    sub-factory advances, which are otherwise refused because\n"
+        "                                    they do not move the channel onto the new tree\n"
         "  --sweep-dest HEX                  Destination xonly pubkey (64 hex) or P2TR SPK (68 hex)\n"
         "  --config PATH                     Load settings from JSON config file (CLI overrides)\n"
         "  --i-accept-the-risk               Allow mainnet operation (PROTOTYPE — funds at risk!)\n"
@@ -2808,6 +2858,11 @@ int main(int argc, char *argv[]) {
             from_mnemonic = argv[++i];
         } else if (strcmp(argv[i], "--mnemonic-passphrase") == 0 && i + 1 < argc) {
             mnemonic_passphrase = argv[++i];
+        } else if (strcmp(argv[i], "--test-allow-tree-advance") == 0) {
+            /* Harness only (the --test- prefix is refused on mainnet):
+               co-sign leaf, state and sub-factory advances, which the client
+               otherwise refuses because they do not re-anchor its channel. */
+            client_set_allow_tree_advance(1);
         } else if (strcmp(argv[i], "--force-close") == 0) {
             force_close = 1;
         } else if (strcmp(argv[i], "--sweep-to-local") == 0) {

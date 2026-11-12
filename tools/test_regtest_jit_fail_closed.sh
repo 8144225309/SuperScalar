@@ -29,9 +29,10 @@
 # The other production trigger is a purchase request (lsps2.buy) from a
 # factory client:
 #
-#   buy        LSP WITHOUT the flag; client 0 sends lsps2.buy.  Asserted: the
-#              client gets an answer and it is a refusal, no JIT_OFFER is
-#              sent and no JIT channel is recorded.
+#   buy        LSP WITHOUT the flag; client 0 sends lsps2.get_info and then
+#              lsps2.buy.  Asserted: no terms are advertised, the purchase
+#              is answered with a refusal, no JIT_OFFER is sent and no JIT
+#              channel is recorded.
 #
 #   buy-opt-in Same with --enable-jit-experimental.  Asserted: the purchase
 #              is accepted and a JIT channel is opened.
@@ -283,6 +284,7 @@ CLIENT0_FLAG="--test-lsps2-buy"
 start_phase buy 29964 --demo --daemon
 wait_for_client0_log "LSPS2 BUY: (OK|FAIL)" 300
 sleep 2
+check "no JIT terms were advertised"             is_positive "$(count_in 'LSPS2 GET_INFO: FAIL' "$PHASE_DIR/client_0.log")"
 check "client 0 sent lsps2.buy"                  is_positive "$(count_in 'sent lsps2.buy request' "$PHASE_DIR/client_0.log")"
 check "the purchase was answered with a refusal" is_positive "$(count_in 'LSPS2 BUY: FAIL' "$PHASE_DIR/client_0.log")"
 check "the LSP did not start a JIT open"         is_zero "$(count_in 'opening JIT channel|LSP JIT:' "$LSP_LOG")"
@@ -295,6 +297,7 @@ stop_phase
 start_phase buy-opt-in 29965 --demo --daemon --enable-jit-experimental
 wait_for_client0_log "LSPS2 BUY: (OK|FAIL)" 300
 sleep 2
+check "JIT terms were advertised"                is_positive "$(count_in 'LSPS2 GET_INFO: OK' "$PHASE_DIR/client_0.log")"
 check "the purchase was accepted"                is_positive "$(count_in 'LSPS2 BUY: OK' "$PHASE_DIR/client_0.log")"
 check "client 0 received a JIT_OFFER"            is_positive "$(count_in 'JIT offer received' "$PHASE_DIR/client_0.log")"
 check "the LSP recorded a JIT channel"           is_positive "$(jit_rows "$LSP_DB")"

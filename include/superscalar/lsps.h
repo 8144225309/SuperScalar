@@ -78,7 +78,7 @@ cJSON *lsps_dispatch_request(const lsps_ctx_t *ctx, const cJSON *json);
  * back over the peer's encrypted transport.
  * This entry point has no channel context by construction: it never touches
  * the channel manager or a factory client's connection, and it refuses
- * lsps2.buy with a JSON-RPC error.
+ * lsps2.buy and lsps2.get_info with a JSON-RPC error.
  */
 int lsps_peer_request(const char *json_req, char *resp_buf, size_t resp_cap);
 

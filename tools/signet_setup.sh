@@ -1031,7 +1031,7 @@ cmd_demo_k2_subfactory() {
     LSP_PID=$!
     sleep 2
 
-    _start_demo_clients "$NET" "$LSP_PORT" demo_k2_subfactory "--daemon"
+    _start_demo_clients "$NET" "$LSP_PORT" demo_k2_subfactory "--daemon --test-allow-tree-advance"
 
     wait "$LSP_PID"
     LSP_EXIT=$?

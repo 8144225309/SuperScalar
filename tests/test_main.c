@@ -307,6 +307,12 @@ extern int test_bolt11_metadata_roundtrip(void);
 extern int test_bolt11_no_metadata(void);
 extern int test_bolt11_metadata_truncated(void);
 extern int test_bolt11_full_roundtrip_with_metadata(void);
+extern int test_bolt11_spec_valid_examples(void);
+extern int test_bolt11_spec_invalid_examples(void);
+extern int test_bolt11_reader_strictness(void);
+extern int test_bolt11_encode_signature_and_payee(void);
+extern int test_bolt11_long_invoice_checksum(void);
+extern int test_bolt11_amount_units_and_fields(void);
 extern int test_pathfind_two_hops(void);
 extern int test_pathfind_one_hop(void);
 extern int test_pathfind_no_route(void);
@@ -893,6 +899,7 @@ extern int test_peer_mgr_channel_scid_field(void);
 extern int test_tor_parse_proxy_arg_basic(void);
 /* PR #22 Phase 2: Invoice receivability */
 extern int test_invoice_create_decode(void);
+extern int test_invoice_feature_bits(void);
 
 /* PR #53 Phase C: stateless invoice wiring */
 extern int test_stateless_invoice_secret_derived(void);
@@ -1142,6 +1149,8 @@ extern int test_wire_path_bundle_no_poison_back_compat(void);
 extern int test_wire_subfactory_multi_input_helpers_round_trip(void);
 extern int test_wire_close_unsigned(void);
 extern int test_wire_distributed_signing(void);
+extern int test_lsp_factory_creation_from_fresh_lsp(void);
+extern int test_lsp_factory_creation_keeps_preset_profiles(void);
 extern int test_regtest_wire_factory(void);
 extern int test_regtest_wire_factory_arity1(void);
 extern int test_regtest_wire_factory_mixed_arity(void);
@@ -1281,6 +1290,51 @@ extern int test_bridge_htlc_timeout(void);
 extern int test_bridge_invoice_bolt11_round_trip(void);
 extern int test_bridge_bolt11_plugin_to_lsp(void);
 extern int test_bridge_preimage_passthrough(void);
+extern int test_bridge_outbound_budget(void);
+extern int test_bridge_outbound_invoice_check(void);
+extern int test_bridge_pay_request_carries_limits(void);
+extern int test_bridge_operator_pay(void);
+extern int test_lsp_outbound_htlc_refused(void);
+extern int test_bridge_outbound_max_delay(void);
+extern int test_bridge_plugin_secret_file(void);
+extern int test_bridge_plugin_port_loopback(void);
+extern int test_bridge_plugin_auth(void);
+extern int test_lsp_inbound_amount_below_invoice(void);
+extern int test_lsp_outbound_origin_slot_reuse(void);
+extern int test_lsp_pay_result_requires_preimage(void);
+extern int test_lsp_pay_result_failure(void);
+extern int test_lsp_outbound_one_pay_per_hash(void);
+extern int test_bridge_pending_table(void);
+extern int test_bridge_inbound_beyond_pending_limit(void);
+extern int test_lsp_inbound_replay_reattaches(void);
+extern int test_lsp_inbound_replay_restored_origin(void);
+extern int test_bridge_replay_keeps_pending_id(void);
+extern int test_lsp_pay_result_acknowledged(void);
+extern int test_lsp_outbound_pay_held_past_expiry(void);
+extern int test_bridge_forwards_pay_result_ack(void);
+extern int test_lsp_outbound_internal_invoice_refused(void);
+extern int test_lsp_same_hash_inbound_and_outbound(void);
+extern int test_persist_htlc_origin_rows(void);
+extern int test_lsp_inbound_origin_table_and_rollback(void);
+extern int test_lsp_pay_result_rejections(void);
+extern int test_lsp_outbound_htlc_returned(void);
+extern int test_lsp_fulfil_kept_until_confirmed(void);
+extern int test_bridge_queues_for_absent_plugin(void);
+extern int test_bridge_reports_lsp_key(void);
+extern int test_bridge_plugin_line_auth(void);
+extern int test_bridge_plugin_silent_connection_replaced(void);
+extern int test_lsp_recv_client_reply_skips_keepalives(void);
+extern int test_lsp_incomplete_commitment_drops_client(void);
+extern int test_channel_rollback_htlc(void);
+extern int test_client_handles_update_fail_htlc(void);
+extern int test_lsp_refuses_bad_revocation_secret(void);
+extern int test_lsp_pay_result_waits_for_busy_channel(void);
+extern int test_lsp_client_cannot_fail_its_own_htlc(void);
+extern int test_lsp_inbound_timeout_reaches_bridge_later(void);
+extern int test_lsp_unresolved_fulfil_is_kept(void);
+extern int test_lsp_unrevoked_htlc_is_failed(void);
+extern int test_lsp_bridge_msg_during_wait_is_deferred(void);
+extern int test_lsp_pending_fail_survives_restart(void);
 extern int test_wire_connect_hostname(void);
 extern int test_wire_connect_onion_no_proxy(void);
 extern int test_tor_parse_proxy_arg(void);
@@ -1341,6 +1395,7 @@ extern int test_client_persist_reload(void);
 /* Gap 2B/2C: Reconnect Commitment Reconciliation + HTLC Replay */
 extern int test_reconnect_commitment_mismatch_rollback(void);
 extern int test_reconnect_commitment_mismatch_reject(void);
+extern int test_reconnect_pending_commitment_needs_revocation(void);
 extern int test_reconnect_htlc_replay(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
@@ -1579,6 +1634,7 @@ extern int test_lsps_peer_request_refuses_buy(void);
 extern int test_jit_migrate_keeps_unspent_channel(void);
 extern int test_jit_client_migrate_keeps_factory_watch(void);
 extern int test_jit_reject_round_trip(void);
+extern int test_wire_msg_ids_unique(void);
 extern int test_jit_reject_ends_wait(void);
 extern int test_jit_wait_holds_other_messages(void);
 
@@ -1918,6 +1974,9 @@ extern int test_conservation_balanced(void);
 extern int test_conservation_violated(void);
 extern int test_conservation_with_ptlc(void);
 extern int test_conservation_with_real_htlc(void);
+extern int test_payment_leaves_leaf_untouched_arity_ps(void);
+extern int test_payment_leaves_leaf_untouched_arity1(void);
+extern int test_client_refuses_tree_advances(void);
 extern int test_client_ps_double_spend_defense_refuses(void);
 extern int test_sweep_persist_roundtrip(void);
 
@@ -2317,6 +2376,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bolt11_no_metadata);
     RUN_TEST(test_bolt11_metadata_truncated);
     RUN_TEST(test_bolt11_full_roundtrip_with_metadata);
+    RUN_TEST(test_bolt11_spec_valid_examples);
+    RUN_TEST(test_bolt11_spec_invalid_examples);
+    RUN_TEST(test_bolt11_reader_strictness);
+    RUN_TEST(test_bolt11_encode_signature_and_payee);
+    RUN_TEST(test_bolt11_long_invoice_checksum);
+    RUN_TEST(test_bolt11_amount_units_and_fields);
 
     printf("\n=== Pathfinding (Dijkstra) ===\n");
     RUN_TEST(test_pathfind_two_hops);
@@ -2997,6 +3062,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tor_parse_proxy_arg_basic);
     printf("\n=== PR #22 Phase 2: Invoice Receivability ===\n");
     RUN_TEST(test_invoice_create_decode);
+    RUN_TEST(test_invoice_feature_bits);
     /* PR #53 Phase C: stateless invoice wiring */
     RUN_TEST(test_stateless_invoice_secret_derived);
     RUN_TEST(test_stateless_invoice_secrets_differ);
@@ -3165,6 +3231,8 @@ static void run_unit_tests(void) {
     RUN_TEST(test_wire_subfactory_multi_input_helpers_round_trip);
     RUN_TEST(test_wire_close_unsigned);
     RUN_TEST(test_wire_distributed_signing);
+    RUN_TEST(test_lsp_factory_creation_from_fresh_lsp);
+    RUN_TEST(test_lsp_factory_creation_keeps_preset_profiles);
 
     printf("\n=== Channel Operations (Phase 10) ===\n");
     RUN_TEST(test_channel_msg_round_trip);
@@ -3247,6 +3315,51 @@ static void run_unit_tests(void) {
     RUN_TEST(test_bridge_bolt11_plugin_to_lsp);
     RUN_TEST(test_bridge_preimage_passthrough);
     RUN_TEST(test_bridge_keysend_inbound);
+    RUN_TEST(test_bridge_outbound_budget);
+    RUN_TEST(test_bridge_outbound_invoice_check);
+    RUN_TEST(test_bridge_pay_request_carries_limits);
+    RUN_TEST(test_bridge_operator_pay);
+    RUN_TEST(test_lsp_outbound_htlc_refused);
+    RUN_TEST(test_bridge_outbound_max_delay);
+    RUN_TEST(test_bridge_plugin_secret_file);
+    RUN_TEST(test_bridge_plugin_port_loopback);
+    RUN_TEST(test_bridge_plugin_auth);
+    RUN_TEST(test_lsp_inbound_amount_below_invoice);
+    RUN_TEST(test_lsp_outbound_origin_slot_reuse);
+    RUN_TEST(test_lsp_pay_result_requires_preimage);
+    RUN_TEST(test_lsp_pay_result_failure);
+    RUN_TEST(test_lsp_outbound_one_pay_per_hash);
+    RUN_TEST(test_bridge_pending_table);
+    RUN_TEST(test_bridge_inbound_beyond_pending_limit);
+    RUN_TEST(test_lsp_inbound_replay_reattaches);
+    RUN_TEST(test_lsp_inbound_replay_restored_origin);
+    RUN_TEST(test_bridge_replay_keeps_pending_id);
+    RUN_TEST(test_lsp_pay_result_acknowledged);
+    RUN_TEST(test_lsp_outbound_pay_held_past_expiry);
+    RUN_TEST(test_bridge_forwards_pay_result_ack);
+    RUN_TEST(test_lsp_outbound_internal_invoice_refused);
+    RUN_TEST(test_lsp_same_hash_inbound_and_outbound);
+    RUN_TEST(test_persist_htlc_origin_rows);
+    RUN_TEST(test_lsp_inbound_origin_table_and_rollback);
+    RUN_TEST(test_lsp_pay_result_rejections);
+    RUN_TEST(test_lsp_outbound_htlc_returned);
+    RUN_TEST(test_lsp_fulfil_kept_until_confirmed);
+    RUN_TEST(test_bridge_queues_for_absent_plugin);
+    RUN_TEST(test_bridge_reports_lsp_key);
+    RUN_TEST(test_bridge_plugin_line_auth);
+    RUN_TEST(test_bridge_plugin_silent_connection_replaced);
+    RUN_TEST(test_lsp_recv_client_reply_skips_keepalives);
+    RUN_TEST(test_lsp_incomplete_commitment_drops_client);
+    RUN_TEST(test_channel_rollback_htlc);
+    RUN_TEST(test_client_handles_update_fail_htlc);
+    RUN_TEST(test_lsp_refuses_bad_revocation_secret);
+    RUN_TEST(test_lsp_pay_result_waits_for_busy_channel);
+    RUN_TEST(test_lsp_client_cannot_fail_its_own_htlc);
+    RUN_TEST(test_lsp_inbound_timeout_reaches_bridge_later);
+    RUN_TEST(test_lsp_unresolved_fulfil_is_kept);
+    RUN_TEST(test_lsp_unrevoked_htlc_is_failed);
+    RUN_TEST(test_lsp_bridge_msg_during_wait_is_deferred);
+    RUN_TEST(test_lsp_pending_fail_survives_restart);
 
     printf("\n=== Wire Hostname + Tor ===\n");
     RUN_TEST(test_wire_connect_hostname);
@@ -3303,6 +3416,7 @@ static void run_unit_tests(void) {
     printf("\n=== Reconnect Commitment Reconciliation (Gap 2B/2C) ===\n");
     RUN_TEST(test_reconnect_commitment_mismatch_rollback);
     RUN_TEST(test_reconnect_commitment_mismatch_reject);
+    RUN_TEST(test_reconnect_pending_commitment_needs_revocation);
     RUN_TEST(test_reconnect_htlc_replay);
     RUN_TEST(test_client_handle_async_msg);
 
@@ -3523,6 +3637,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_migrate_keeps_unspent_channel);
     RUN_TEST(test_jit_client_migrate_keeps_factory_watch);
     RUN_TEST(test_jit_reject_round_trip);
+    RUN_TEST(test_wire_msg_ids_unique);
     RUN_TEST(test_jit_reject_ends_wait);
     RUN_TEST(test_jit_wait_holds_other_messages);
 
@@ -3870,6 +3985,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_conservation_violated);
     RUN_TEST(test_conservation_with_ptlc);
     RUN_TEST(test_conservation_with_real_htlc);
+    RUN_TEST(test_payment_leaves_leaf_untouched_arity_ps);
+    RUN_TEST(test_payment_leaves_leaf_untouched_arity1);
+    RUN_TEST(test_client_refuses_tree_advances);
     RUN_TEST(test_client_ps_double_spend_defense_refuses);
     RUN_TEST(test_sweep_persist_roundtrip);
 

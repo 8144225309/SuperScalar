@@ -1454,8 +1454,22 @@ int test_lsps2_buy_refused_when_jit_disabled(void) {
     TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
     TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
 
-    /* Enabled: the same request does start an open. */
+    /* The terms are not advertised either. */
+    const char *info_req = "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"lsps2.get_info\"}";
+    cJSON *info = cJSON_Parse(info_req);
+    cJSON *info_resp = lsps_dispatch_request(&lctx, info);
+    const cJSON *info_err = info_resp ? cJSON_GetObjectItemCaseSensitive(info_resp, "error") : NULL;
+    TEST_ASSERT(info_err && cJSON_GetObjectItemCaseSensitive(info_resp, "result") == NULL,
+                "lsps2.get_info is an error while JIT opens are disabled");
+    cJSON_Delete(info_resp);
+
+    /* Enabled: get_info gives terms, and the same purchase starts an open. */
     fx.mgr.jit_enabled = 1;
+    info_resp = lsps_dispatch_request(&lctx, info);
+    TEST_ASSERT(info_resp && cJSON_GetObjectItemCaseSensitive(info_resp, "result") != NULL,
+                "lsps2.get_info gives terms once JIT opens are enabled");
+    cJSON_Delete(info_resp);
+    cJSON_Delete(info);
     pthread_t tid;
     pthread_create(&tid, NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[0]);
     req = gate_build_lsps2_buy(42);
@@ -1506,20 +1520,33 @@ int test_lsps_peer_request_refuses_buy(void) {
                    LSPS_ERR_METHOD_NOT_FOUND, "lsps2.buy from a peer is an error");
     TEST_ASSERT_EQ(id, 77, "reply carries the request id");
     TEST_ASSERT(!has_result, "no result, no channel id");
-    TEST_ASSERT(strstr(reply, "lsps2.buy is not available") != NULL,
-                "the refusal names the method");
+    TEST_ASSERT(strstr(reply, "lsps2 is not available") != NULL,
+                "the refusal says why");
     TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200),
                 "nothing was written to factory client 0");
     TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
     TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
     TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
 
-    /* Read-only methods are still answered, through the reply buffer. */
+    /* No JIT terms are advertised to a peer that can never buy. */
     n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"lsps2.get_info\"}",
                           reply, sizeof(reply));
-    TEST_ASSERT(n > 0, "get_info is answered");
-    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result), 0, "get_info is not an error");
-    TEST_ASSERT(id == 5 && has_result, "get_info reply has a result");
+    TEST_ASSERT(n > 0, "lsps2.get_info is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result),
+                   LSPS_ERR_METHOD_NOT_FOUND, "lsps2.get_info from a peer is an error");
+    TEST_ASSERT(id == 5 && !has_result, "no terms in the reply");
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"lsps2_get_info\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0 && peer_reply_error_code(reply, &id, &has_result) ==
+                         LSPS_ERR_METHOD_NOT_FOUND && !has_result,
+                "the other spelling is refused as well");
+
+    /* Other read-only methods are still answered, through the reply buffer. */
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"lsps1.get_info\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "lsps1.get_info is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result), 0, "lsps1.get_info is not an error");
+    TEST_ASSERT(id == 9 && has_result, "lsps1.get_info reply has a result");
 
     n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"lsps9.nope\"}",
                           reply, sizeof(reply));

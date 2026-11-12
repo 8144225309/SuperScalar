@@ -326,6 +326,14 @@ int client_parse_forgery_response(const char *s);
    Returns 1 on success. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
 
+/* Apply an UPDATE_FAIL_HTLC from the LSP to the channel.
+   An HTLC the LSP never took (uncommitted) is rolled back and nothing
+   follows.  A committed one is failed, the amount returns to whoever
+   offered it, and the LSP's COMMITMENT_SIGNED follows as after a fulfil.
+   Returns 1 if the HTLC was removed; *committed_out says which case. */
+int client_handle_fail_htlc(channel_t *ch, const wire_msg_t *msg,
+                             int *committed_out, uint64_t *htlc_id_out);
+
 /* Handle async / unsolicited LSP->client notifications (MSG_FUNDING_REORG,
    MSG_CEREMONY_ABORT).  Returns 1 if handled (caller still frees msg->json), 0
    otherwise.  Shared by the ceremony recv path (wire_recv_handle_ping) and the
@@ -422,6 +430,13 @@ int client_handle_subfactory_advance(int fd, secp256k1_context *ctx,
    called before any PS advance or close happens; safe to call once at
    startup. */
 void client_set_persist(persist_t *persist);
+
+/* The client refuses every leaf, state and sub-factory advance: none of
+   them moves its channel onto the tree they produce, so co-signing one
+   would leave the channel without a unilateral exit.  allow != 0 lifts the
+   refusal for harnesses that exercise those ceremonies with real clients;
+   it must never be set for a client holding real funds.  Off by default. */
+void client_set_allow_tree_advance(int allow);
 
 /* Set the LSP's static pubkey for NK (server-authenticated) noise handshake.
    If set (non-NULL), all future connections use Noise NK instead of NN.

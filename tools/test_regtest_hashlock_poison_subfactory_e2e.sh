@@ -186,7 +186,7 @@ echo
 echo "--- Starting $N_CLIENTS clients ---"
 for i in $(seq 0 $((N_CLIENTS - 1))); do
     env $ASAN_ENV \
-    "$CLIENT_BIN" \
+    "$CLIENT_BIN" --test-allow-tree-advance \
         --network regtest \
         --host 127.0.0.1 --port $LSP_PORT \
         --seckey "${CLIENT_SECKEYS[$i]}" \
