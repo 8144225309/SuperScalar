@@ -8556,24 +8556,19 @@ int test_factory_client_to_leaf_roundtrip(void) {
 static factory_t *handler_factory(secp256k1_context *ctx, const secp256k1_keypair *kps,
                                    int with_keys) {
     unsigned char txid[32], spk[34];
+    secp256k1_xonly_pubkey tweaked;
     memset(txid, 0xAA, 32);
+    if (!compute_funding_spk(ctx, kps, spk, &tweaked)) return NULL;
     secp256k1_pubkey pks[5];
     for (int i = 0; i < 5; i++)
         if (!secp256k1_keypair_pub(ctx, &pks[i], &kps[i])) return NULL;
-    memset(spk, 0, sizeof(spk));
-    for (int pass = 0; pass < 2; pass++) {
-        factory_t *f = calloc(1, sizeof(factory_t));
-        if (!f) return NULL;
-        if (with_keys) factory_init(f, ctx, kps, 5, 2, 4);
-        else factory_init_from_pubkeys(f, ctx, pks, 5, 2, 4);
-        if (pass == 0) { spk[0] = 0x51; spk[1] = 0x20; }
-        factory_set_funding(f, txid, 0, 100000, spk, 34);
-        if (!factory_build_tree(f)) { factory_free(f); free(f); return NULL; }
-        if (pass == 1) return f;
-        memcpy(spk, f->nodes[0].spending_spk, 34);   /* learn the real script */
-        factory_free(f); free(f);
-    }
-    return NULL;
+    factory_t *f = calloc(1, sizeof(factory_t));
+    if (!f) return NULL;
+    if (with_keys) factory_init(f, ctx, kps, 5, 2, 4);
+    else factory_init_from_pubkeys(f, ctx, pks, 5, 2, 4);
+    factory_set_funding(f, txid, 0, 100000, spk, 34);
+    if (!factory_build_tree(f)) { factory_free(f); free(f); return NULL; }
+    return f;
 }
 
 static struct {
