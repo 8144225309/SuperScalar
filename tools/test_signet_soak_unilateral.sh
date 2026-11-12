@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # test_signet_soak_unilateral.sh — N=127 SIGNET soak: birth -> 24h life -> UNILATERAL-EXIT death.
 #
+# Signet only (real blocks, hours of wall clock).  The regtest scenarios for a
+# member leaving without the LSP are in test_regtest_client_exit_without_lsp.sh;
+# what this adds is the same exit after a long life at N=127 with daemons
+# respawned from their own databases.
+#
 # ONE factory, the whole lifecycle, on real signet:
 #   BIRTH : LSP --daemon (serve-forever; NO --demo auto-close; large --active-blocks
-#           so the DW tree does NOT rotate within the soak -> a clean, static exit)
-#           creates a 127-client PS factory; 127 client --daemon processes fund + hold.
+#           so the factory does not expire or rotate within the soak -> a clean,
+#           static exit)
+#           creates a 127-client factory (the default advanceless tree unless ARITY is
+#           set); 127 client --daemon processes fund + hold.
 #   LIFE  : for SOAK_SEC (default 24h) a supervisor loop runs two jobs on a wall-clock
 #           cadence:
 #             WATCHDOG (every WATCHDOG_SEC): respawn ANY dead client/LSP from its own DB
@@ -25,23 +32,23 @@
 #
 # Usage: bash tools/test_signet_soak_unilateral.sh [BUILD_DIR]
 # Env: N_CLIENTS(127) SOAK_SEC(86400) PAY_SEC(900) WATCHDOG_SEC(60) EXIT_BATCH(8)
-#      AMOUNT(N*100000) ARITY(2,4,8) STATIC_NEAR_ROOT(2) KEYSEND_MSAT(1000000)
-#      CREATE_WAIT_SEC(7200) PORT(9952) WALLET(ss_sig_n127)
+#      AMOUNT(N*100000) KEYSEND_MSAT(1000000) CREATE_WAIT_SEC(7200) PORT(9952)
+#      WALLET(ss_sig_n127) SIGNET_CONF(~/.bitcoin/bitcoin.conf)
+#      Optional: ARITY, STATIC_NEAR_ROOT (tree shape; unset = the LSP's default),
+#      FEE_RATE (--fee-rate; unset = the LSP's default), TREE_FEE_RATE
+#      (--tree-fee-rate once the LSP has it; unset = the LSP's default)
 set -uo pipefail
-: "${SIGNET_RPCPASS:=$(sed -n 's/^rpcpassword=//p' /var/lib/bitcoind-signet/bitcoin.conf 2>/dev/null)}"
+SIGNET_CONF="${SIGNET_CONF:-$HOME/.bitcoin/bitcoin.conf}"
+: "${SIGNET_RPCPASS:=$(sed -n 's/^rpcpassword=//p' "$SIGNET_CONF" 2>/dev/null)}"
 
-BUILD_DIR="${1:-/root/SuperScalar/build-release}"
+BUILD_DIR="${1:-build}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
-SIGNET_CONF="${SIGNET_CONF:-/var/lib/bitcoind-signet/bitcoin.conf}"
 BCLI="bitcoin-cli -signet -conf=$SIGNET_CONF"
 
 N_CLIENTS="${N_CLIENTS:-127}"
-ARITY="${ARITY:-2,4,8}"
-STATIC_NEAR_ROOT="${STATIC_NEAR_ROOT:-2}"
 AMOUNT="${AMOUNT:-$(( N_CLIENTS * 100000 ))}"
-FEE_RATE="${FEE_RATE:-1000}"
 PORT="${PORT:-9952}"
 WALLET="${WALLET:-ss_sig_n127}"
 
@@ -52,11 +59,18 @@ EXIT_BATCH="${EXIT_BATCH:-8}"          # clients that unilaterally exit at the e
 KEYSEND_MSAT="${KEYSEND_MSAT:-1000000}" # 1000 sat per keysend
 STAGGER="${STAGGER:-0.2}"
 CREATE_WAIT_SEC="${CREATE_WAIT_SEC:-7200}"  # up to 2h for the 127-party ceremony + funding confs
-# active window per DW state; large enough that the tree does NOT roll over within
-# the soak (24h ~= 144 signet blocks) so the exit is from a single static epoch.
+# factory active window; large enough that the factory does NOT expire or rotate
+# within the soak (24h ~= 144 signet blocks) so the exit is from a single epoch.
 # If this trips the 2016-block CLTV ceiling at launch, lower it (the LSP rejects at
 # startup, before any ceremony -> fast feedback).
 ACTIVE_BLOCKS="${ACTIVE_BLOCKS:-500}"
+
+# Optional flags, passed only when the variable is set, so no value is pinned here.
+SHAPE_ARGS=(); FEE_ARGS=(); CLIENT_FEE_ARGS=()
+[ -n "${ARITY:-}" ] && SHAPE_ARGS+=(--arity "$ARITY")
+[ -n "${STATIC_NEAR_ROOT:-}" ] && SHAPE_ARGS+=(--static-near-root "$STATIC_NEAR_ROOT")
+[ -n "${FEE_RATE:-}" ] && { FEE_ARGS+=(--fee-rate "$FEE_RATE"); CLIENT_FEE_ARGS+=(--fee-rate "$FEE_RATE"); }
+[ -n "${TREE_FEE_RATE:-}" ] && FEE_ARGS+=(--tree-fee-rate "$TREE_FEE_RATE")
 
 TAG="signet_soak_uni_$$"               # PID-suffixed: a re-run must NOT clobber a prior seed
 LSP_DB="/tmp/ss_${TAG}.db"
@@ -112,10 +126,10 @@ except Exception: print(0)" 2>/dev/null
 launch_lsp() {
     nohup "$LSP_BIN" \
         --network signet --port "$PORT" \
-        --clients "$N_CLIENTS" --arity "$ARITY" --static-near-root "$STATIC_NEAR_ROOT" \
+        --clients "$N_CLIENTS" ${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"} \
         --amount "$AMOUNT" \
-        --active-blocks "$ACTIVE_BLOCKS" --dying-blocks 20 --step-blocks 5 --states-per-layer 2 \
-        --fee-rate "$FEE_RATE" --lsp-balance-pct 50 --confirm-timeout 86400 \
+        --active-blocks "$ACTIVE_BLOCKS" --dying-blocks 20 \
+        ${FEE_ARGS[@]+"${FEE_ARGS[@]}"} --lsp-balance-pct 50 --confirm-timeout 86400 \
         --max-conn-rate 400 --max-handshakes 80 \
         --seckey "$LSP_SECKEY" \
         --rpcuser signetrpc --rpcpassword "$SIGNET_RPCPASS" --rpcport 38332 \
@@ -127,10 +141,10 @@ launch_lsp() {
 launch_client() {  # $1 = 1-based client index
     local i="$1" sk="${CSK[$1]}" db="${CDB[$1]}"
     nohup "$CLIENT_BIN" --network signet --host 127.0.0.1 --port "$PORT" \
-        --seckey "$sk" --fee-rate "$FEE_RATE" --lsp-balance-pct 50 \
+        --seckey "$sk" ${CLIENT_FEE_ARGS[@]+"${CLIENT_FEE_ARGS[@]}"} \
         --lsp-pubkey "$LSP_PUBKEY" --participant-id "$i" \
         --rpcuser signetrpc --rpcpassword "$SIGNET_RPCPASS" --rpcport 38332 \
-        --wallet "$WALLET" --db "$db" \
+        --db "$db" \
         --daemon >> "/tmp/ss_${TAG}_c${sk:0:8}.log" 2>&1 &
     CPID[$i]=$!
 }
@@ -227,13 +241,13 @@ done
 FUND_HEIGHT=$($BCLI getblockcount 2>/dev/null)
 green "$(ts) FACTORY LIVE — $N_CLIENTS-client factory funded + serving (height $FUND_HEIGHT). Beginning ${SOAK_SEC}s soak."
 
-# confirm every exiting client persisted its INITIAL commitment (self-custody prereq, #313)
+# confirm every exiting client persisted its INITIAL commitment (self-custody prereq)
 for i in $(seq 1 "$EXIT_BATCH"); do
     for w in $(seq 1 30); do
         sc=$(sqlite3 "${CDB[$i]}" "SELECT count(*) FROM signed_commitments;" 2>/dev/null || echo 0)
         [ "${sc:-0}" -ge 1 ] && break; sleep 2
     done
-    [ "${sc:-0}" -ge 1 ] || die "exit client c$i has no persisted commitment (cannot self-exit) — #313 regression"
+    [ "${sc:-0}" -ge 1 ] || die "exit client c$i has no persisted commitment (cannot self-exit)"
 done
 info "$(ts) all $EXIT_BATCH exit-batch clients have a broadcastable commitment (self-custody prereq OK)"
 
