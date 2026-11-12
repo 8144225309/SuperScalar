@@ -5,9 +5,13 @@
  *
  * One state machine, used by the host and by the member, that moves a
  * channel from commitment number n to n + 1 as docs/security/
- * channel-update-protocol.md specifies:
+ * channel-update-protocol.md specifies.  The host opens every round
+ * (protocol section "Who opens a round"): the member offers updates
+ * (cu_offer), the host either carries them in its next round or refuses
+ * them (cu_refuse), and a member message that would open a round is
+ * refused.
  *
- *   proposer X                              responder Y
+ *   proposer X (host)                       responder Y (member)
  *   SENT(n+1)  [write]  -- updates, commitment_signed(n+1) -->
  *                                           HOLDS(n+1) [write]
  *              <-- commitment_signed(n+1), revoke_and_ack(n) --
@@ -65,6 +69,7 @@ enum {
     CU_ERR_QUEUE_FULL= -8,   /* queue bound reached: fail the connection */
     CU_ERR_HALTED    = -9,   /* channel failed or data loss detected */
     CU_ERR_CRASHED   = -10,  /* test hook stopped the call (simulated crash) */
+    CU_ERR_ROLE      = -11,  /* only the host opens a round; the member offers */
 };
 
 /* Update kinds.  1.0 has the first four; the rest are refused with
@@ -83,7 +88,8 @@ typedef enum {
 
 typedef struct {
     uint8_t  kind;              /* cu_kind_t */
-    uint8_t  sender;            /* cu_side_t; set by the engine, never by a message */
+    uint8_t  sender;            /* cu_side_t: who asked for it.  The member's are its own
+                                   durable offers; a message never makes one up. */
     uint64_t id;                /* HTLC id (add: the sender's next id) */
     uint64_t amount_msat;       /* add */
     uint8_t  payment_hash[32];  /* add */
@@ -254,6 +260,7 @@ typedef enum {
     CU_CP_PROP_HOLDS_BEFORE, CU_CP_PROP_HOLDS_AFTER,
     CU_CP_PROP_DONE_BEFORE,  CU_CP_PROP_DONE_AFTER,
     CU_CP_RESP_DONE_BEFORE,  CU_CP_RESP_DONE_AFTER,
+    CU_CP_OFFER_BEFORE,      CU_CP_OFFER_AFTER,
     CU_CP_COUNT
 } cu_crash_point_t;
 
@@ -274,9 +281,9 @@ typedef struct {
 
     /* memory only (per connection) */
     uint32_t tip;
-    cu_update_t peer_updates[CU_MAX_UPDATES];   /* peer's proposal so far */
+    cu_update_t peer_updates[CU_MAX_UPDATES];   /* host: member requests; member: the round */
     size_t n_peer_updates;
-    cu_update_t offered[CU_MAX_UPDATES];        /* own updates sent, not yet signed */
+    cu_update_t offered[CU_MAX_UPDATES];        /* member: its durable offers, in order */
     size_t n_offered;
     int have_peer_cs;                            /* proposer: responder's signature verified */
     unsigned char peer_cs_sig[64];
@@ -313,16 +320,23 @@ int cu_load(cu_chan_t *c, persist_t *db, const cu_config_t *cfg,
 
 /* ---- events ---- */
 
-/* Propose updates and sign at once: SENT, then the updates and
-   commitment_signed in the outbox. */
+/* Host: open a round: SENT, then the updates and commitment_signed in the
+   outbox.  An update with sender CU_MEMBER must be one of the member's
+   pending requests (cu_requests), byte for byte; any other is the host's
+   own.  The member gets CU_ERR_ROLE. */
 int cu_propose(cu_chan_t *c, const cu_update_t *u, size_t n);
 
-/* Send updates without signing yet; the peer may refuse any of them until
-   cu_sign_offered() signs a commitment that contains them. */
+/* Member: ask the host for updates (add = pay, fulfil, fail).  The offers
+   are durable before they leave, with the success claim of any fulfil
+   (INV-30); they stay until a round carries them or the host refuses
+   them, and are offered again after a reconnect.  The host gets
+   CU_ERR_ROLE. */
 int cu_offer(cu_chan_t *c, const cu_update_t *u, size_t n);
-int cu_sign_offered(cu_chan_t *c);
 
-/* Refuse an update the peer offered and has not yet signed. */
+/* Host: the member's pending requests, oldest first. */
+const cu_update_t *cu_requests(const cu_chan_t *c, size_t *n);
+
+/* Host: refuse a pending member request, with a reason. */
 int cu_refuse(cu_chan_t *c, uint8_t kind, uint64_t id, int32_t reason);
 
 /* One inbound message.  Mid-round messages are queued, not dropped. */
@@ -400,7 +414,10 @@ int cu_queue_drain(cu_queue_t *q, cu_chan_t **chans, size_t n_chans);
 /* SHA256 over the serialized update list (protocol section 3). */
 void cu_digest(const cu_update_t *u, size_t n, unsigned char out[32]);
 
-/* Apply updates proposed by `proposer` to in; checks INV-27/28/32/33/34. */
+/* Apply updates in a round opened by `proposer` to in; each update acts for
+   its sender.  The member opens nothing, so its updates appear either in
+   its own offers (proposer CU_MEMBER) or in a host round.  Checks
+   INV-27/28/32/33/34. */
 int cu_apply(const cu_config_t *cfg, const cu_ops_t *ops, void *ops_ctx,
              uint32_t tip, cu_side_t proposer, const cu_state_t *in,
              const cu_update_t *u, size_t n, cu_state_t *out);

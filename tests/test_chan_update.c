@@ -395,20 +395,26 @@ static void disconnect(net_t *n) {
 
 /* Deliver until both pipes are empty.  Returns CU_OK, RUN_CRASHED with
    *who set, or the first other error. */
+static int deliver_one(net_t *n, int to, int *who) {
+    cu_msg_t m = n->pipe[to][0];
+    memmove(&n->pipe[to][0], &n->pipe[to][1], (n->n_pipe[to] - 1) * sizeof(cu_msg_t));
+    n->n_pipe[to]--;
+    n->delivered++;
+    int rc = cu_on_message(n->s[to].c, &m);
+    if (rc == CU_ERR_CRASHED) { if (who) *who = to; return RUN_CRASHED; }
+    collect(n, to);
+    if (rc != CU_OK && who) *who = to;
+    return rc;
+}
+
 static int run(net_t *n, int max_msgs, int *who) {
     int turn = 0;
     while (n->n_pipe[0] || n->n_pipe[1]) {
         if (max_msgs >= 0 && (int)n->delivered >= max_msgs) return CU_OK;
         int to = n->n_pipe[turn] ? turn : 1 - turn;
         turn = 1 - turn;
-        cu_msg_t m = n->pipe[to][0];
-        memmove(&n->pipe[to][0], &n->pipe[to][1], (n->n_pipe[to] - 1) * sizeof(cu_msg_t));
-        n->n_pipe[to]--;
-        n->delivered++;
-        int rc = cu_on_message(n->s[to].c, &m);
-        if (rc == CU_ERR_CRASHED) { if (who) *who = to; return RUN_CRASHED; }
-        collect(n, to);
-        if (rc != CU_OK) { if (who) *who = to; return rc; }
+        int rc = deliver_one(n, to, who);
+        if (rc != CU_OK) return rc;
     }
     return CU_OK;
 }
@@ -448,11 +454,41 @@ static void mk_fail(cu_update_t *u, uint64_t id) {
     u->reason = 0x2002;
 }
 
-static int propose(net_t *n, int i, const cu_update_t *u, size_t k) {
-    int rc = cu_propose(n->s[i].c, u, k);
+static int g_who = -1;   /* side a propose() call stopped on */
+
+/* The host opens the round with every pending member request. */
+static int host_carries_requests(net_t *n) {
+    size_t nr = 0;
+    const cu_update_t *r = cu_requests(n->s[CU_HOST].c, &nr);
+    if (nr == 0) return CU_ERR_ARG;
+    cu_update_t copy[CU_MAX_UPDATES];
+    memcpy(copy, r, nr * sizeof(cu_update_t));
+    int rc = cu_propose(n->s[CU_HOST].c, copy, nr);
+    g_who = CU_HOST;
     if (rc == CU_ERR_CRASHED) return rc;
-    collect(n, i);
+    collect(n, CU_HOST);
     return rc;
+}
+
+/* Host: open a round with u.  Member: offer u, deliver the offers, and let
+   the host carry them. */
+static int propose(net_t *n, int i, const cu_update_t *u, size_t k) {
+    g_who = i;
+    if (i == CU_HOST) {
+        int rc = cu_propose(n->s[CU_HOST].c, u, k);
+        if (rc == CU_ERR_CRASHED) return rc;
+        collect(n, CU_HOST);
+        return rc;
+    }
+    int rc = cu_offer(n->s[CU_MEMBER].c, u, k);
+    if (rc == CU_ERR_CRASHED) return rc;
+    collect(n, CU_MEMBER);
+    if (rc != CU_OK) return rc;
+    while (n->n_pipe[CU_HOST]) {
+        rc = deliver_one(n, CU_HOST, &g_who);
+        if (rc != CU_OK) return rc == RUN_CRASHED ? CU_ERR_CRASHED : rc;
+    }
+    return host_carries_requests(n);
 }
 
 static int same_state(const cu_state_t *a, const cu_state_t *b) {
@@ -487,6 +523,7 @@ static int at_rest(net_t *n, uint64_t want_held, char *why, size_t wl) {
             return 0;
         }
         if (!cu_check_invariants(&n->s[i].db, c->cfg.channel_id, CAPACITY_MSAT, why, wl)) return 0;
+        if (c->n_offered) { snprintf(why, wl, "side %d holds %zu offers", i, c->n_offered); return 0; }
         for (uint64_t k = 0; k < want_held; k++)
             if (watch_count(&n->s[i], (int64_t)k) < 1) { snprintf(why, wl, "side %d: no watch for %llu", i, (unsigned long long)k); return 0; }
     }
@@ -513,7 +550,7 @@ int test_cu_schema_v46(void) {
     TEST_ASSERT_EQ(persist_schema_version(&db), 46, "schema version");
     const char *tables[] = { "chan_update_channel", "chan_update_commitment", "chan_update_signed",
                              "chan_update_signed_void", "chan_update_secret", "chan_update_peer_point",
-                             "chan_update_peer_secret" };
+                             "chan_update_peer_secret", "chan_update_offer" };
     for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
         sqlite3_stmt *st;
         TEST_ASSERT(sqlite3_prepare_v2(db.db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?;",
@@ -544,7 +581,12 @@ int test_cu_apply_rules(void) {
     EXPECT(CU_HOST, CU_OK, "host add");
     TEST_ASSERT(out->n_htlcs == 1 && out->htlcs[0].offerer == CU_HOST, "htlc offered by host");
     u.sender = CU_MEMBER;
-    EXPECT(CU_HOST, CU_ERR_INVALID, "sender is not the proposer (INV-28)");
+    mk_add(&u, 0, 1000000, 1); u.sender = CU_MEMBER;
+    EXPECT(CU_HOST, CU_OK, "a host round carries a member request");
+    TEST_ASSERT(out->htlcs[0].offerer == CU_MEMBER && out->member_msat == in->member_msat - 1000000,
+                "the member's add debits the member (INV-28)");
+    u.sender = CU_HOST;
+    EXPECT(CU_MEMBER, CU_ERR_INVALID, "a member offer cannot act for the host");
     mk_add(&u, 1, 1000000, 1); u.sender = CU_HOST;
     EXPECT(CU_HOST, CU_ERR_INVALID, "id not the next one");
     mk_add(&u, 0, 500000000, 1); u.sender = CU_MEMBER;
@@ -868,7 +910,7 @@ static int crash_case(int proposer, int crash_side, int point, int ret) {
     n->crash_ret = ret;
     int who = -1;
     int rc = propose(n, proposer, &u, 1);
-    if (rc == CU_ERR_CRASHED || rc == CU_ERR_DB) who = proposer;
+    if (rc == CU_ERR_CRASHED || rc == CU_ERR_DB) who = g_who;
     else {
         TEST_ASSERT_EQ(rc, CU_OK, "propose");
         rc = run(n, -1, &who);
@@ -883,10 +925,15 @@ static int crash_case(int proposer, int crash_side, int point, int ret) {
     }
     rc = reconnect(n);
     if (rc != CU_OK) { printf("  FAIL: reconnect rc %d (proposer %d crash side %d point %d ret %d)\n", rc, proposer, crash_side, point, ret); return 0; }
-    if (!expected_after_round(n, proposer, 1)) {
-        /* Nothing durable happened: the proposer proposes again. */
-        TEST_ASSERT_EQ(n->s[proposer].c->rec.phase, CU_PHASE_IDLE, "idle");
-        TEST_ASSERT_EQ(propose(n, proposer, &u, 1), CU_OK, "re-propose");
+    if (!expected_after_round(n, CU_HOST, 1)) {
+        TEST_ASSERT_EQ(n->s[CU_HOST].c->rec.phase, CU_PHASE_IDLE, "idle");
+        if (n->s[CU_MEMBER].c->n_offered) {
+            /* The member's offer is durable and was offered again. */
+            TEST_ASSERT_EQ(host_carries_requests(n), CU_OK, "host carries the offer");
+        } else {
+            /* Nothing durable happened: propose again. */
+            TEST_ASSERT_EQ(propose(n, proposer, &u, 1), CU_OK, "re-propose");
+        }
         TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "round");
     }
     if (!at_rest(n, 2, why, sizeof(why))) {
@@ -953,25 +1000,24 @@ int test_cu_lost_raa_reconciles(void) {
         TEST_ASSERT(n && net_init(n), "init");
         cu_update_t u;
         mk_add(&u, 0, 1500000, 600);
-        /* The proposer's final revoke_and_ack never arrives. */
-        n->drop_type[1 - proposer] = CU_MSG_REVOKE;
-        n->drop_type[proposer] = 0;
+        /* The host opens every round; its final revoke_and_ack never arrives.
+           (proposer = who asked for the update.) */
+        n->drop_type[CU_MEMBER] = CU_MSG_REVOKE;
         TEST_ASSERT_EQ(propose(n, proposer, &u, 1), CU_OK, "propose");
-        /* The responder's revocation reaches the proposer; drop only the proposer's. */
         int rc = run(n, -1, NULL);
         TEST_ASSERT_EQ(rc, CU_OK, "round");
-        TEST_ASSERT_EQ(n->s[proposer].c->rec.phase, CU_PHASE_IDLE, "proposer done");
-        TEST_ASSERT_EQ(n->s[1 - proposer].c->rec.phase, CU_PHASE_HOLDS, "responder waits");
-        TEST_ASSERT_EQ(n->s[1 - proposer].c->rec.held, n->s[proposer].c->rec.held, "same number");
+        TEST_ASSERT_EQ(n->s[CU_HOST].c->rec.phase, CU_PHASE_IDLE, "host done");
+        TEST_ASSERT_EQ(n->s[CU_MEMBER].c->rec.phase, CU_PHASE_HOLDS, "member waits");
+        TEST_ASSERT_EQ(n->s[CU_MEMBER].c->rec.held, n->s[CU_HOST].c->rec.held, "same number");
 
-        /* The proposer starts the next round meanwhile; the responder queues it. */
+        /* The next round opens meanwhile; the member queues it. */
         mk_add(&u, 1, 1000000, 601);
         TEST_ASSERT_EQ(propose(n, proposer, &u, 1), CU_OK, "next round");
         TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "queued, not dropped");
-        TEST_ASSERT(n->s[1 - proposer].c->n_deferred == 2, "update and signature queued");
+        TEST_ASSERT(n->s[CU_MEMBER].c->n_deferred == 2, "update and signature queued");
 
-        /* Restart the responder too, for good measure, then reconnect. */
-        TEST_ASSERT(restart(n, 1 - proposer), "restart responder");
+        /* Restart the member too, for good measure, then reconnect. */
+        TEST_ASSERT(restart(n, CU_MEMBER), "restart member");
         TEST_ASSERT_EQ(reconnect(n), CU_OK, "reconnect");
         if (!at_rest(n, 2, why, sizeof(why))) { printf("  FAIL: proposer %d: %s\n", proposer, why); return 0; }
         TEST_ASSERT_EQ(n->s[0].c->st.n_htlcs, 2, "both HTLCs, once each");
@@ -1003,10 +1049,11 @@ int test_cu_mid_round_queued(void) {
     TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "host round completes");
     TEST_ASSERT_EQ(n->s[0].c->n_deferred, 0, "queue drained after the round");
     TEST_ASSERT_EQ(n->s[0].c->n_peer_updates, 1, "member's update now pending");
-    TEST_ASSERT(at_rest(n, 1, why, sizeof(why)), why);
-    TEST_ASSERT_EQ(cu_sign_offered(n->s[1].c), CU_OK, "member signs its offer");
-    collect(n, 1);
-    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "member round");
+    TEST_ASSERT(n->s[0].c->rec.phase == CU_PHASE_IDLE && n->s[1].c->rec.phase == CU_PHASE_IDLE
+                && n->s[0].c->rec.held == 1 && n->s[1].c->rec.held == 1, "host round done");
+    TEST_ASSERT_EQ(n->s[1].c->n_offered, 1, "the offer is still the member's");
+    TEST_ASSERT_EQ(host_carries_requests(n), CU_OK, "host carries the member's request");
+    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "round with the request");
     TEST_ASSERT(at_rest(n, 2, why, sizeof(why)), why);
     TEST_ASSERT_EQ(n->s[0].c->st.n_htlcs, 2, "both HTLCs");
 
@@ -1033,54 +1080,54 @@ int test_cu_mid_round_queued(void) {
     return 1;
 }
 
-/* ---- simultaneous proposals: the host's round wins ---- */
+/* ---- only the host opens a round ----
+   With either side opening rounds, simultaneous proposals need a rule
+   (protocol 6.2 row 12, still answered by cu_reconcile) and leave the member
+   with a signature over a second host commitment for one number.  The host
+   opens every round, so a member message that would open one is refused. */
 
-int test_cu_collision_host_wins(void) {
+int test_cu_member_cannot_open_round(void) {
     init_secp();
     char why[256] = "";
     net_t *n = malloc(sizeof(*n));
     TEST_ASSERT(n && net_init(n), "init");
-    cu_update_t hu, mu;
-    mk_add(&hu, 0, 4000000, 800);
+    cu_update_t mu;
     mk_add(&mu, 0, 2000000, 801);
-    TEST_ASSERT_EQ(propose(n, CU_HOST, &hu, 1), CU_OK, "host proposes");
-    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &mu, 1), CU_OK, "member proposes");
-    {
-        int who = -1;
-        int rc = run(n, -1, &who);
-        if (rc != CU_OK) {
-            printf("  collision: side %d rc %d; host phase %d held %llu, member phase %d held %llu, delivered %zu\n",
-                   who, rc, n->s[0].c->rec.phase, (unsigned long long)n->s[0].c->rec.held,
-                   n->s[1].c->rec.phase, (unsigned long long)n->s[1].c->rec.held, n->delivered);
-            return 0;
-        }
-    }
-    TEST_ASSERT(has_event(&n->s[1], CU_EV_PROPOSAL_DROPPED), "member yielded");
-    TEST_ASSERT(at_rest(n, 1, why, sizeof(why)), why);
-    TEST_ASSERT_EQ(n->s[0].c->st.n_htlcs, 1, "host round only");
-    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &mu, 1), CU_OK, "member re-proposes");
-    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "member round");
-    TEST_ASSERT(at_rest(n, 2, why, sizeof(why)), why);
-    TEST_ASSERT_EQ(n->s[0].c->st.n_htlcs, 2, "both");
-    /* The member's yielded signature for 1 is covered by the penalty for 1. */
-    TEST_ASSERT_EQ(watch_count(&n->s[1], 1), 2, "penalty for the signed and the yielded commitment");
+    TEST_ASSERT_EQ(cu_propose(n->s[CU_MEMBER].c, &mu, 1), CU_ERR_ROLE, "member cannot open a round");
+    TEST_ASSERT_EQ(cu_offer(n->s[CU_HOST].c, &mu, 1), CU_ERR_ROLE, "the host does not offer");
+    TEST_ASSERT_EQ(n->s[CU_MEMBER].c->n_out, 0, "nothing sent");
 
-    /* Simultaneous proposals across a disconnect: row 12 at reconnect. */
-    mk_add(&hu, 1, 1000000, 802);
-    mk_add(&mu, 1, 1000000, 803);
-    TEST_ASSERT_EQ(propose(n, CU_HOST, &hu, 1), CU_OK, "host proposes");
-    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &mu, 1), CU_OK, "member proposes");
+    /* A member commitment_signed that opens a round: refused, nothing stored. */
+    cu_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = CU_MSG_ADD;
+    m.channel_id = n->s[0].cfg.channel_id;
+    m.upd = mu;
+    TEST_ASSERT_EQ(cu_on_message(n->s[CU_HOST].c, &m), CU_OK, "an add is a request");
+    memset(&m, 0, sizeof(m));
+    m.type = CU_MSG_COMMIT_SIG;
+    m.channel_id = n->s[0].cfg.channel_id;
+    m.n = 1;
+    cu_digest(&mu, 1, m.digest);
+    TEST_ASSERT_EQ(cu_on_message(n->s[CU_HOST].c, &m), CU_ERR_ROLE, "member signature refused");
+    TEST_ASSERT_EQ(n->s[CU_HOST].c->rec.held, 0, "host unchanged");
+    TEST_ASSERT_EQ(n->s[CU_HOST].c->rec.phase, CU_PHASE_IDLE, "no round");
+    cu_clear_outputs(n->s[CU_HOST].c);
+
+    /* While the host's round is open, a member signature over anything else. */
+    cu_update_t hu;
+    mk_add(&hu, 0, 4000000, 800);
+    TEST_ASSERT_EQ(propose(n, CU_HOST, &hu, 1), CU_OK, "host opens");
+    m.digest[0] ^= 1;
+    TEST_ASSERT_EQ(cu_on_message(n->s[CU_HOST].c, &m), CU_ERR_ROLE, "refused mid-round too");
+    TEST_ASSERT_EQ(n->s[CU_HOST].c->rec.phase, CU_PHASE_SENT, "host round stands");
     TEST_ASSERT_EQ(reconnect(n), CU_OK, "reconnect");
-    TEST_ASSERT(at_rest(n, 3, why, sizeof(why)), why);
-    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &mu, 1), CU_OK, "member re-proposes");
-    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "member round");
-    TEST_ASSERT(at_rest(n, 4, why, sizeof(why)), why);
-    TEST_ASSERT_EQ(n->s[0].c->st.n_htlcs, 4, "all four");
+    TEST_ASSERT(at_rest(n, 1, why, sizeof(why)), why);
     net_free(n); free(n);
     return 1;
 }
 
-/* ---- refusal before signing ---- */
+/* ---- requests: refusal, and offers that survive a restart ---- */
 
 int test_cu_refuse_offer(void) {
     init_secp();
@@ -1098,20 +1145,42 @@ int test_cu_refuse_offer(void) {
     TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "refusal arrives");
     TEST_ASSERT(has_event(&n->s[1], CU_EV_REFUSED), "member told");
     TEST_ASSERT_EQ(n->s[1].c->n_offered, 0, "offer removed");
+    TEST_ASSERT(restart(n, CU_MEMBER), "restart member");
+    TEST_ASSERT_EQ(n->s[1].c->n_offered, 0, "removal is durable");
     TEST_ASSERT(at_rest(n, 0, why, sizeof(why)), why);
-    /* A signed update cannot be refused. */
-    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &mu, 1), CU_OK, "member proposes and signs");
-    n->delivered = 0;
-    TEST_ASSERT_EQ(run(n, 1, NULL), CU_OK, "update delivered");
-    TEST_ASSERT_EQ(cu_refuse(n->s[0].c, CU_UPD_ADD, 0, 17), CU_OK, "host tries");
-    collect(n, 0);
-    TEST_ASSERT_EQ(n->n_pipe[1 - CU_HOST], 1, "refusal on its way");
-    cu_msg_t ref = n->pipe[CU_MEMBER][0];
-    n->n_pipe[CU_MEMBER] = 0;
-    TEST_ASSERT_EQ(cu_on_message(n->s[1].c, &ref), CU_ERR_PROTOCOL, "refusal after signing is a protocol error");
-    TEST_ASSERT_EQ(n->s[1].c->rec.phase, CU_PHASE_SENT, "the signed round stands");
-    TEST_ASSERT_EQ(reconnect(n), CU_OK, "reconnect");
+    TEST_ASSERT_EQ(cu_refuse(n->s[1].c, CU_UPD_ADD, 0, 17), CU_ERR_ROLE, "the member refuses nothing");
+
+    /* An offer the host cannot take is refused at once. */
+    mk_add(&mu, 0, 900000000, 901);
+    TEST_ASSERT_EQ(cu_offer(n->s[1].c, &mu, 1), CU_ERR_INVALID, "member checks its own offer");
+
+    /* A carried request is no longer the host's to refuse. */
+    mk_add(&mu, 0, 2000000, 902);
+    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &mu, 1), CU_OK, "request carried");
+    TEST_ASSERT_EQ(cu_refuse(n->s[0].c, CU_UPD_ADD, 0, 17), CU_ERR_ARG, "not pending any more");
+    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "round");
     TEST_ASSERT(at_rest(n, 1, why, sizeof(why)), why);
+
+    /* An offer survives a member restart and a lost connection. */
+    mk_add(&mu, 1, 1000000, 903);
+    TEST_ASSERT_EQ(cu_offer(n->s[1].c, &mu, 1), CU_OK, "offer");
+    n->n_pipe[0] = 0;                                   /* lost on the way */
+    cu_clear_outputs(n->s[1].c);
+    TEST_ASSERT(restart(n, CU_MEMBER), "restart member");
+    TEST_ASSERT_EQ(n->s[1].c->n_offered, 1, "offer durable");
+    TEST_ASSERT_EQ(reconnect(n), CU_OK, "reconnect offers it again");
+    size_t nr = 0;
+    cu_requests(n->s[0].c, &nr);
+    TEST_ASSERT_EQ(nr, 1, "host has the request");
+    TEST_ASSERT_EQ(host_carries_requests(n), CU_OK, "carried");
+    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "round");
+    TEST_ASSERT(at_rest(n, 2, why, sizeof(why)), why);
+    TEST_ASSERT_EQ(n->s[0].c->st.n_htlcs, 2, "both, once each");
+
+    /* The host cannot make up a member update (INV-28). */
+    mk_add(&mu, 2, 1000000, 904);
+    mu.sender = CU_MEMBER;
+    TEST_ASSERT_EQ(cu_propose(n->s[0].c, &mu, 1), CU_ERR_INVALID, "not a request");
     net_free(n); free(n);
     return 1;
 }

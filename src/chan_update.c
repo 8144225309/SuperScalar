@@ -182,11 +182,15 @@ static int apply_ex(const cu_config_t *cfg, const cu_ops_t *ops, void *ops_ctx,
     *out = *in;
     for (size_t i = 0; i < n; i++) {
         const cu_update_t *x = &u[i];
-        /* INV-28: every update of a round is the proposer's own. */
-        if (x->sender != (uint8_t)proposer) return CU_ERR_INVALID;
+        /* INV-28: an update acts for its sender.  The member opens no
+           round; its updates reach a round only inside the host's. */
+        if (x->sender > CU_MEMBER) return CU_ERR_INVALID;
+        cu_side_t who = (cu_side_t)x->sender;
+        if (who != proposer && !(proposer == CU_HOST && who == CU_MEMBER))
+            return CU_ERR_INVALID;
         switch (x->kind) {
         case CU_UPD_ADD: {
-            if (x->id != out->next_htlc_id[proposer]) return CU_ERR_INVALID;
+            if (x->id != out->next_htlc_id[who]) return CU_ERR_INVALID;
             if (x->amount_msat == 0 || x->amount_msat > cfg->capacity_msat) return CU_ERR_INVALID;
             if (is_zero(x->payment_hash, 32)) return CU_ERR_INVALID;
             if (out->n_htlcs >= cfg->max_htlcs || out->n_htlcs >= CU_HTLC_CAP) return CU_ERR_INVALID;
@@ -197,39 +201,39 @@ static int apply_ex(const cu_config_t *cfg, const cu_ops_t *ops, void *ops_ctx,
                 if (x->cltv_expiry < tip || x->cltv_expiry - tip < cfg->min_cltv_headroom)
                     return CU_ERR_INVALID;
             }
-            uint64_t *b = bal_of(out, (uint8_t)proposer);
+            uint64_t *b = bal_of(out, (uint8_t)who);
             if (*b < x->amount_msat) return CU_ERR_INVALID;
             *b -= x->amount_msat;
             cu_htlc_t *h = &out->htlcs[out->n_htlcs++];
             memset(h, 0, sizeof(*h));
             h->id = x->id;
-            h->offerer = (uint8_t)proposer;
+            h->offerer = (uint8_t)who;
             h->amount_msat = x->amount_msat;
             memcpy(h->payment_hash, x->payment_hash, 32);
             h->cltv_expiry = x->cltv_expiry;
-            out->next_htlc_id[proposer]++;
+            out->next_htlc_id[who]++;
             break;
         }
         case CU_UPD_FULFILL: {
             /* Only the side the HTLC pays removes it. */
-            long k = find_htlc(out, (uint8_t)CU_OTHER(proposer), x->id);
+            long k = find_htlc(out, (uint8_t)CU_OTHER(who), x->id);
             if (k < 0) return CU_ERR_INVALID;
             unsigned char h[32];
             sha256(x->preimage, 32, h);
             if (memcmp(h, out->htlcs[k].payment_hash, 32) != 0) return CU_ERR_INVALID;
-            if (!add_ok(bal_of(out, (uint8_t)proposer), out->htlcs[k].amount_msat)) return CU_ERR_INVALID;
+            if (!add_ok(bal_of(out, (uint8_t)who), out->htlcs[k].amount_msat)) return CU_ERR_INVALID;
             remove_htlc(out, (size_t)k);
             break;
         }
         case CU_UPD_FAIL: {
-            long k = find_htlc(out, (uint8_t)CU_OTHER(proposer), x->id);
+            long k = find_htlc(out, (uint8_t)CU_OTHER(who), x->id);
             if (k < 0) return CU_ERR_INVALID;
             if (!add_ok(bal_of(out, out->htlcs[k].offerer), out->htlcs[k].amount_msat)) return CU_ERR_INVALID;
             remove_htlc(out, (size_t)k);
             break;
         }
         case CU_UPD_FEE:
-            if (proposer != CU_HOST) return CU_ERR_INVALID;
+            if (who != CU_HOST) return CU_ERR_INVALID;
             if (x->feerate_per_kvb < cfg->fee_min_per_kvb || x->feerate_per_kvb > cfg->fee_max_per_kvb)
                 return CU_ERR_INVALID;
             out->feerate_per_kvb = x->feerate_per_kvb;
@@ -578,6 +582,54 @@ static int peer_secret_put(persist_t *db, uint32_t ch, uint64_t n, const unsigne
     return step_done(st);
 }
 
+/* The member's offers, in order (the whole list is rewritten). */
+static int offers_store(persist_t *db, uint32_t ch, const cu_update_t *u, size_t n) {
+    sqlite3_stmt *st;
+    if (!prep(db, "DELETE FROM chan_update_offer WHERE channel_id=?;", &st)) return 0;
+    sqlite3_bind_int64(st, 1, ch);
+    if (!step_done(st)) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char b[UPD_SER_LEN], *p = b;
+        ser_update(&u[i], &p);
+        if (!prep(db, "INSERT INTO chan_update_offer (channel_id, seq, upd) VALUES (?,?,?);", &st))
+            return 0;
+        sqlite3_bind_int64(st, 1, ch);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)i);
+        sqlite3_bind_blob(st, 3, b, UPD_SER_LEN, SQLITE_TRANSIENT);
+        if (!step_done(st)) return 0;
+    }
+    return 1;
+}
+
+static int offers_load(persist_t *db, uint32_t ch, cu_update_t *u, size_t *n) {
+    sqlite3_stmt *st;
+    *n = 0;
+    if (!prep(db, "SELECT upd FROM chan_update_offer WHERE channel_id=? ORDER BY seq;", &st)) return 0;
+    sqlite3_bind_int64(st, 1, ch);
+    int ok = 1;
+    while (ok && sqlite3_step(st) == SQLITE_ROW) {
+        rd_t r = { sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0), 1 };
+        if (*n >= CU_MAX_UPDATES) { ok = 0; break; }
+        de_update(&r, &u[*n]);
+        ok = r.ok && r.left == 0;
+        if (ok) (*n)++;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+static int same_update(const cu_update_t *a, const cu_update_t *b) {
+    unsigned char x[UPD_SER_LEN], y[UPD_SER_LEN], *p = x, *q = y;
+    ser_update(a, &p);
+    ser_update(b, &q);
+    return memcmp(x, y, UPD_SER_LEN) == 0;
+}
+
+static long find_update(const cu_update_t *list, size_t n, const cu_update_t *u) {
+    for (size_t i = 0; i < n; i++) if (same_update(&list[i], u)) return (long)i;
+    return -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Engine internals                                                    */
 /* ------------------------------------------------------------------ */
@@ -822,15 +874,28 @@ static int halt(cu_chan_t *c, uint8_t code) {
 
 /* ---- proposer: start a round ---- */
 
-static int round_start(cu_chan_t *c, const cu_update_t *u, size_t n, int already_sent) {
+static int round_start(cu_chan_t *c, const cu_update_t *u, size_t n) {
+    if (c->cfg.side != CU_HOST) return CU_ERR_ROLE;
     if (c->rec.halted) return CU_ERR_HALTED;
     if (persist_in_transaction(c->db)) return CU_ERR_DB;
     if (c->rec.phase != CU_PHASE_IDLE) return CU_ERR_BUSY;
     if (n == 0 || n > CU_MAX_UPDATES) return CU_ERR_ARG;
 
     cu_update_t ups[CU_MAX_UPDATES];
+    long req_idx[CU_MAX_UPDATES];
     memcpy(ups, u, n * sizeof(cu_update_t));
-    for (size_t i = 0; i < n; i++) ups[i].sender = (uint8_t)c->cfg.side;
+    /* A member update is one of its requests, used once; the rest are the
+       host's own. */
+    for (size_t i = 0; i < n; i++) {
+        req_idx[i] = -1;
+        if (ups[i].sender == CU_MEMBER) {
+            req_idx[i] = find_update(c->peer_updates, c->n_peer_updates, &ups[i]);
+            if (req_idx[i] < 0) return CU_ERR_INVALID;
+            for (size_t j = 0; j < i; j++) if (req_idx[j] == req_idx[i]) return CU_ERR_INVALID;
+        } else {
+            ups[i].sender = CU_HOST;
+        }
+    }
 
     cu_state_t *next = malloc(sizeof(*next));
     unsigned char *tx = malloc(CU_TX_MAX);
@@ -864,7 +929,7 @@ static int round_start(cu_chan_t *c, const cu_update_t *u, size_t n, int already
           && secret_ensure(c->db, c->cfg.channel_id, nn + 1, s2);
     /* INV-30: the claim is armed before the preimage leaves. */
     for (size_t i = 0; ok && i < n; i++) {
-        if (ups[i].kind != CU_UPD_FULFILL) continue;
+        if (ups[i].kind != CU_UPD_FULFILL || ups[i].sender != (uint8_t)c->cfg.side) continue;
         long k = find_htlc(&c->st, (uint8_t)CU_OTHER(c->cfg.side), ups[i].id);
         ok = k >= 0 && c->ops->arm_claim(c->ops_ctx, c->db, nn, &c->st.htlcs[k], ups[i].preimage) == 1;
     }
@@ -875,11 +940,19 @@ static int round_start(cu_chan_t *c, const cu_update_t *u, size_t n, int already
     if (rc != CU_OK) goto out;
     c->rec = r;
     c->have_peer_cs = 0;
-
-    if (!already_sent) {
-        rc = push_updates(c, ups, n);
-        if (rc != CU_OK) goto out;
+    {
+        /* The requests this round carries are no longer pending. */
+        size_t k = 0;
+        for (size_t i = 0; i < c->n_peer_updates; i++) {
+            int used = 0;
+            for (size_t j = 0; j < n; j++) if (req_idx[j] == (long)i) used = 1;
+            if (!used) c->peer_updates[k++] = c->peer_updates[i];
+        }
+        c->n_peer_updates = k;
     }
+
+    rc = push_updates(c, ups, n);
+    if (rc != CU_OK) goto out;
     cu_msg_t m;
     memset(&m, 0, sizeof(m));
     m.type = CU_MSG_COMMIT_SIG;
@@ -936,12 +1009,19 @@ static int responder_cs(cu_chan_t *c, const cu_msg_t *m) {
     memcpy(r.round, ups, nu * sizeof(cu_update_t));
     memcpy(r.digest, digest, 32);
 
+    /* The member's offers this round carries are settled by it. */
+    cu_update_t left[CU_MAX_UPDATES];
+    size_t n_left = 0;
+    for (size_t i = 0; i < c->n_offered; i++)
+        if (find_update(ups, nu, &c->offered[i]) < 0) left[n_left++] = c->offered[i];
+
     rc = txn_begin(c);
     if (rc != CU_OK) goto out;
     int ok = commitment_put(c->db, &c->cfg, nn, next, mytx, mylen, sig)
           && signed_put(c->db, &c->cfg, nn, ptxid)
           && secret_ensure(c->db, c->cfg.channel_id, nn + 1, s2)
           && secret_release(c->db, c->cfg.channel_id, n)
+          && (n_left == c->n_offered || offers_store(c->db, c->cfg.channel_id, left, n_left))
           && rec_store(c->db, &c->cfg, &r);
     memset(s2, 0, 32);
     if (!ok) { rc = txn_abort(c, CU_ERR_DB); goto out; }
@@ -952,6 +1032,8 @@ static int responder_cs(cu_chan_t *c, const cu_msg_t *m) {
     if (prev) *prev = c->st;
     c->rec = r;
     c->st = *next;
+    memcpy(c->offered, left, n_left * sizeof(cu_update_t));
+    c->n_offered = n_left;
     if (prev) { events_holds(c, prev, ups, nu, nn); free(prev); }
 
     cu_msg_t cs;
@@ -1195,17 +1277,52 @@ static int drain_deferred(cu_chan_t *c) {
     return CU_OK;
 }
 
+static int refuse_msg(cu_chan_t *c, const cu_update_t *u, int32_t reason) {
+    cu_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = CU_MSG_REFUSE;
+    m.upd = *u;
+    m.code = reason;
+    return out_push(c, &m);
+}
+
 static int peer_update(cu_chan_t *c, const cu_msg_t *m) {
     if (c->n_peer_updates >= CU_MAX_UPDATES) {
         send_error(c, CU_ERR_QUEUE_FULL);
         return CU_ERR_QUEUE_FULL;
     }
     cu_update_t u = m->upd;
-    /* INV-28: the sender is who sent the message. */
-    u.sender = (uint8_t)CU_OTHER(c->cfg.side);
     if (msg_type_of(u.kind) != m->type) {
         send_error(c, CU_ERR_PROTOCOL);
         return CU_ERR_PROTOCOL;
+    }
+    if (c->cfg.side == CU_HOST) {
+        /* A member request.  INV-28: it acts for the member, whatever the
+           message says. */
+        u.sender = CU_MEMBER;
+        /* Offered again after a reconnect: once is enough. */
+        if (find_update(c->peer_updates, c->n_peer_updates, &u) >= 0) return CU_OK;
+        cu_update_t all[CU_MAX_UPDATES];
+        memcpy(all, c->peer_updates, c->n_peer_updates * sizeof(cu_update_t));
+        all[c->n_peer_updates] = u;
+        cu_state_t *chk = malloc(sizeof(*chk));
+        if (!chk) return CU_ERR_DB;
+        int rc = cu_apply(&c->cfg, c->ops, c->ops_ctx, c->tip, CU_MEMBER, &c->st,
+                          all, c->n_peer_updates + 1, chk);
+        free(chk);
+        if (rc != CU_OK) return refuse_msg(c, &u, rc);
+    } else {
+        /* An update of the host's round.  One that acts for the member must
+           be one of the member's own offers. */
+        if (u.sender == CU_MEMBER) {
+            if (find_update(c->offered, c->n_offered, &u) < 0) {
+                send_error(c, CU_ERR_PROTOCOL);
+                return CU_ERR_PROTOCOL;
+            }
+        } else if (u.sender != CU_HOST) {
+            send_error(c, CU_ERR_PROTOCOL);
+            return CU_ERR_PROTOCOL;
+        }
     }
     c->peer_updates[c->n_peer_updates++] = u;
     cu_event_t e;
@@ -1217,10 +1334,18 @@ static int peer_update(cu_chan_t *c, const cu_msg_t *m) {
 }
 
 static int on_commit_sig(cu_chan_t *c, const cu_msg_t *m) {
+    /* Only the host opens a round: a member signature that does not answer
+       the host's open round is refused. */
+    if (c->cfg.side == CU_HOST
+        && (c->rec.phase != CU_PHASE_SENT || memcmp(m->digest, c->rec.digest, 32) != 0)) {
+        send_error(c, CU_ERR_ROLE);
+        return CU_ERR_ROLE;
+    }
     if (c->rec.phase == CU_PHASE_IDLE) return responder_cs(c, m);
     /* phase SENT */
     if (memcmp(m->digest, c->rec.digest, 32) == 0) return proposer_cs(c, m);
-    /* Both proposed at once: the host's round wins. */
+    /* Both proposed at once.  Unreachable while only the host opens rounds;
+       kept so the alternative stays defined: the host's round wins. */
     if (c->cfg.side == CU_HOST) {
         size_t k = 0;
         for (size_t i = 0; i < c->n_deferred; i++)
@@ -1239,23 +1364,34 @@ static int on_commit_sig(cu_chan_t *c, const cu_msg_t *m) {
     return responder_cs(c, m);
 }
 
+/* Member: the host refused one of its offers. */
 static int on_refuse(cu_chan_t *c, const cu_msg_t *m) {
-    for (size_t i = 0; i < c->n_offered; i++) {
-        if (c->offered[i].kind == m->upd.kind && c->offered[i].id == m->upd.id) {
-            cu_event_t e;
-            memset(&e, 0, sizeof(e));
-            e.type = CU_EV_REFUSED;
-            e.upd = c->offered[i];
-            e.code = m->code;
-            memmove(&c->offered[i], &c->offered[i + 1], (c->n_offered - i - 1) * sizeof(cu_update_t));
-            c->n_offered--;
-            ev_push(c, &e);
-            return CU_OK;
-        }
+    if (c->cfg.side != CU_MEMBER) {
+        send_error(c, CU_ERR_PROTOCOL);
+        return CU_ERR_PROTOCOL;
     }
-    /* A signed update cannot be refused. */
-    send_error(c, CU_ERR_PROTOCOL);
-    return CU_ERR_PROTOCOL;
+    cu_update_t u = m->upd;
+    u.sender = CU_MEMBER;
+    long k = find_update(c->offered, c->n_offered, &u);
+    /* A refusal of an offer already settled (offered again after a
+       reconnect) changes nothing. */
+    if (k < 0) return CU_OK;
+    cu_update_t left[CU_MAX_UPDATES];
+    size_t n_left = 0;
+    for (size_t i = 0; i < c->n_offered; i++) if ((long)i != k) left[n_left++] = c->offered[i];
+    int rc = txn_begin(c);
+    if (rc != CU_OK) return rc;
+    if (!offers_store(c->db, c->cfg.channel_id, left, n_left)) return txn_abort(c, CU_ERR_DB);
+    if (!persist_commit(c->db)) return txn_abort(c, CU_ERR_DB);
+    cu_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = CU_EV_REFUSED;
+    e.upd = c->offered[k];
+    e.code = m->code;
+    memcpy(c->offered, left, n_left * sizeof(cu_update_t));
+    c->n_offered = n_left;
+    ev_push(c, &e);
+    return CU_OK;
 }
 
 static int on_reestablish(cu_chan_t *c, const cu_reestablish_t *re);
@@ -1352,60 +1488,69 @@ int cu_load(cu_chan_t *c, persist_t *db, const cu_config_t *cfg,
     if (!rec_load(db, cfg, &c->rec)) return CU_ERR_DB;
     if (!commitment_get(db, cfg, c->rec.held, &c->st, NULL, NULL, NULL)) return CU_ERR_DB;
     if (!conserves(&c->st, cfg->capacity_msat)) return CU_ERR_DB;
+    if (cfg->side == CU_MEMBER && !offers_load(db, cfg->channel_id, c->offered, &c->n_offered))
+        return CU_ERR_DB;
     return CU_OK;
 }
 
 int cu_propose(cu_chan_t *c, const cu_update_t *u, size_t n) {
     if (!c || !u) return CU_ERR_ARG;
-    if (c->n_offered) return CU_ERR_BUSY;
-    return round_start(c, u, n, 0);
+    return round_start(c, u, n);
 }
 
 int cu_offer(cu_chan_t *c, const cu_update_t *u, size_t n) {
     if (!c || !u || n == 0) return CU_ERR_ARG;
+    if (c->cfg.side != CU_MEMBER) return CU_ERR_ROLE;
     if (c->rec.halted) return CU_ERR_HALTED;
-    if (c->rec.phase == CU_PHASE_SENT) return CU_ERR_BUSY;
+    if (persist_in_transaction(c->db)) return CU_ERR_DB;
     if (c->n_offered + n > CU_MAX_UPDATES) return CU_ERR_BUSY;
     cu_update_t all[CU_MAX_UPDATES];
     memcpy(all, c->offered, c->n_offered * sizeof(cu_update_t));
     for (size_t i = 0; i < n; i++) {
         all[c->n_offered + i] = u[i];
-        all[c->n_offered + i].sender = (uint8_t)c->cfg.side;
+        all[c->n_offered + i].sender = CU_MEMBER;
     }
     cu_state_t *chk = malloc(sizeof(*chk));
     if (!chk) return CU_ERR_DB;
-    int rc = cu_apply(&c->cfg, c->ops, c->ops_ctx, c->tip, c->cfg.side, &c->st,
+    int rc = cu_apply(&c->cfg, c->ops, c->ops_ctx, c->tip, CU_MEMBER, &c->st,
                       all, c->n_offered + n, chk);
     free(chk);
     if (rc != CU_OK) return rc;
-    rc = push_updates(c, &all[c->n_offered], n);
+    rc = txn_begin(c);
     if (rc != CU_OK) return rc;
-    memcpy(c->offered, all, (c->n_offered + n) * sizeof(cu_update_t));
-    c->n_offered += n;
-    return CU_OK;
+    int ok = offers_store(c->db, c->cfg.channel_id, all, c->n_offered + n);
+    /* INV-30: a fulfil's claim is armed before its preimage leaves. */
+    for (size_t i = c->n_offered; ok && i < c->n_offered + n; i++) {
+        if (all[i].kind != CU_UPD_FULFILL) continue;
+        long k = find_htlc(&c->st, CU_HOST, all[i].id);
+        ok = k >= 0 && c->ops->arm_claim(c->ops_ctx, c->db, c->rec.held + 1,
+                                         &c->st.htlcs[k], all[i].preimage) == 1;
+    }
+    if (!ok) return txn_abort(c, CU_ERR_DB);
+    rc = txn_finish(c, CU_CP_OFFER_BEFORE, CU_CP_OFFER_AFTER, "cu_offer");
+    if (rc != CU_OK) return rc;
+    size_t first = c->n_offered;
+    memcpy(c->offered, all, (first + n) * sizeof(cu_update_t));
+    c->n_offered = first + n;
+    return push_updates(c, &c->offered[first], n);
 }
 
-int cu_sign_offered(cu_chan_t *c) {
-    if (!c) return CU_ERR_ARG;
-    if (c->n_offered == 0) return CU_ERR_ARG;
-    int rc = round_start(c, c->offered, c->n_offered, 1);
-    if (rc == CU_OK) c->n_offered = 0;
-    return rc;
+const cu_update_t *cu_requests(const cu_chan_t *c, size_t *n) {
+    if (!c || !n) return NULL;
+    *n = c->cfg.side == CU_HOST ? c->n_peer_updates : 0;
+    return c->peer_updates;
 }
 
 int cu_refuse(cu_chan_t *c, uint8_t kind, uint64_t id, int32_t reason) {
     if (!c) return CU_ERR_ARG;
+    if (c->cfg.side != CU_HOST) return CU_ERR_ROLE;
     for (size_t i = 0; i < c->n_peer_updates; i++) {
         if (c->peer_updates[i].kind == kind && c->peer_updates[i].id == id) {
-            cu_msg_t m;
-            memset(&m, 0, sizeof(m));
-            m.type = CU_MSG_REFUSE;
-            m.upd = c->peer_updates[i];
-            m.code = reason;
+            cu_update_t u = c->peer_updates[i];
             memmove(&c->peer_updates[i], &c->peer_updates[i + 1],
                     (c->n_peer_updates - i - 1) * sizeof(cu_update_t));
             c->n_peer_updates--;
-            return out_push(c, &m);
+            return refuse_msg(c, &u, reason);
         }
     }
     return CU_ERR_ARG;
@@ -1422,7 +1567,7 @@ int cu_on_message(cu_chan_t *c, const cu_msg_t *m) {
 void cu_on_disconnect(cu_chan_t *c) {
     if (!c) return;
     c->n_peer_updates = 0;
-    c->n_offered = 0;
+    if (c->cfg.side == CU_HOST) c->n_offered = 0;   /* the member's offers are durable */
     c->have_peer_cs = 0;
     c->n_deferred = 0;
     c->n_out = 0;
@@ -1612,8 +1757,13 @@ static int on_reestablish(cu_chan_t *c, const cu_reestablish_t *re) {
         rc = resend_round(c);
         if (rc != CU_OK) return rc;
     }
-    if (a & CU_ACT_MARK_DONE)
-        return finish_done(c, CU_CP_PROP_DONE_BEFORE, CU_CP_PROP_DONE_AFTER, "cu_prop_done");
+    if (a & CU_ACT_MARK_DONE) {
+        rc = finish_done(c, CU_CP_PROP_DONE_BEFORE, CU_CP_PROP_DONE_AFTER, "cu_prop_done");
+        if (rc != CU_OK) return rc;
+    }
+    /* The host keeps no requests across a connection: offer them again. */
+    if (c->cfg.side == CU_MEMBER && c->n_offered)
+        return push_updates(c, c->offered, c->n_offered);
     return CU_OK;
 }
 

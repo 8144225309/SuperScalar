@@ -25,7 +25,10 @@ serves are in [invariants.md](invariants.md); the attackers are in
   sides. A round moves both sides from n to n + 1. Both C_H(n + 1) and
   C_M(n + 1) describe the same balances and the same HTLC set.
 - A **round** carries one or more **updates**, signs both new commitments,
-  and revokes both old ones.
+  and revokes both old ones. The host opens every round (section 4.1).
+- Balances and HTLC amounts are kept in millisatoshi. A commitment pays
+  each balance and each HTLC rounded down to whole satoshis; the remainder
+  goes to the commitment fee, as in BOLT 3.
 - Each side holds a **per-commitment secret** s_X(n) for each n, and has
   sent the point P_X(n) = s_X(n)·G to the other side before C_X(n) is built.
   Revealing s_X(n) revokes C_X(n).
@@ -40,6 +43,10 @@ serves are in [invariants.md](invariants.md); the attackers are in
 | `update_fulfill_htlc` | the side the HTLC pays | removes the HTLC and credits its receiver; carries the preimage |
 | `update_fail_htlc` | the side the HTLC pays | removes the HTLC and refunds its offerer |
 | `update_fee` | the host | sets the commitment fee rate for the next commitment, within the bounds in the proposal |
+
+"Who may send" names the side the update acts for. The member does not open
+rounds: it offers its updates to the host, which carries them in its next
+round or refuses them (section 4.1).
 
 **Required:** a party accepts an update only if the sender is allowed to send
 it (table above). In particular a member accepts `update_add_htlc` from the
@@ -79,7 +86,7 @@ before use (INV-58).
 | `update_fulfill_htlc` | `id`, `preimage` | payee |
 | `update_fail_htlc` | `id`, `reason` | payee |
 | `update_fee` | `feerate_per_kvb` | host |
-| `commitment_signed` | `n` (the new number), `psig` (32 bytes, the sender's MuSig2 partial signature on the receiver's C(n)), `nonce_index`, `update_digest` | either |
+| `commitment_signed` | `n` (the new number), `psig` (32 bytes, the sender's MuSig2 partial signature on the receiver's C(n)), `nonce_index`, `update_digest` | host to open a round; member only in answer to it |
 | `revoke_and_ack` | `n_revoked`, `secret` (32 bytes), `next_point` (33 bytes, P(n_revoked + 2)) | either |
 | `nonces` | `first_index`, list of 66-byte public nonces | either |
 | `channel_reestablish` | see section 6 | either, first after connect |
@@ -116,6 +123,55 @@ A fulfil adds two rules: the payee checks the HTLC against its invoice
 success claim (INV-30), before it sends `update_fulfill_htlc`. The host forwards the
 preimage upstream only after `X.HOLDS` or `Y.HOLDS` on the downstream channel
 shows the HTLC removed.
+
+### 4.1 Who opens a round
+
+**Required:** the host opens every round. The member offers updates: it asks
+the host to add an HTLC (to pay), to fulfil or fail an HTLC the host offered
+it. An offer is durable on the member before it leaves, with the success
+claim of any fulfil, and stays until a round carries it or the host refuses
+it. The host carries an offer byte for byte, as an update that acts for the
+member, or refuses it with a reason. The member accepts a round's update
+that acts for itself only if it is one of its own offers (INV-28). A
+`commitment_signed` from the member that does not answer the host's open
+round is refused.
+
+Options considered:
+
+- **Either side opens rounds** (BOLT 2 style). Each side may send updates and
+  `commitment_signed` at any time.
+- **The host opens every round.** The member offers; the host signs first.
+
+Why the host opens rounds in SuperScalar:
+
+- A round signs one commitment per side with MuSig2. The nonce indices of the
+  two sides advance in step, one per signature, so signatures must come in
+  one order. With one side opening every round the order is given; with two,
+  simultaneous rounds need a tie-break and leave the losing side with a
+  signature over a second commitment for one number.
+- The factory is hub and spoke: every channel has the host on one side, and
+  the host routes every payment.
+- The host is always online; members may not be.
+- Refusal is simple: the host refuses an offer before anything is signed.
+- The host can carry several offers, and its own updates, in one round.
+
+What it gives up:
+
+- About half a round trip of latency on payments the member starts: the
+  offer has to reach the host before the round opens.
+- The member cannot force a round. If the host does not carry or refuse its
+  offers, the member's recourse is a unilateral exit on its latest
+  commitment. That adds no trust: a host that stops answering already leaves
+  the member that recourse and no other.
+- There is no symmetric BOLT 2 mode between host and member.
+- The host debits a member's channel only through a payment the member asked
+  for: an offered add.
+- One round at a time per channel; carrying several updates per round
+  offsets it.
+
+Revisiting it: either-side opening can be added later as a negotiated
+feature. Table 6.2 row 12 already defines what happens when both sides
+propose at once.
 
 ## 5. Persisted states and the persist-before-release rule
 
@@ -187,7 +243,7 @@ peer = (H', V') the peer's claim. At rest at n both sides are (n, n − 1).
 | 9 | any | `last_remote_secret` is a secret of mine newer than my V | I lost data: I revoked a state my database calls current | **do not broadcast anything.** Ask the peer to force-close, and alert. |
 | 10 | any | V' < the newest peer secret I hold | the peer lost data | tell the peer (its own last secret in my `last_remote_secret`). Exit unilaterally on my latest commitment if I hold one. |
 | 11 | any | H' < H − 1 or H' > H + 1 | more than one round apart | treat as 8, 9 or 10 by the secrets; otherwise error. |
-| 12 | `SENT(n+1)` | `SENT(n+1)` with a different digest | both proposed at once | the host's round wins; the member drops its `SENT` record (it signed nothing yet) and re-proposes after. |
+| 12 | `SENT(n+1)` | `SENT(n+1)` with a different digest | both proposed at once (only with either-side opening, section 4.1) | the host's round wins; the member drops its `SENT` record and re-proposes after. |
 
 **Required:** a party never adopts the peer's numbers, balances or HTLC set
 as its own. It only resends what its own `SENT` or `HOLDS` record says.
@@ -225,9 +281,8 @@ with the same number.
   while a round on that channel is open is appended to that channel's queue,
   in arrival order, and handled after the round ends. It is never dropped
   (INV-36).
-- Updates from the peer that arrive before the peer's own
-  `commitment_signed` belong to the peer's next round (section 6.2 row 12
-  decides simultaneous proposals).
+- Offers from the member that arrive while a round is open are queued and
+  become the host's pending requests when it ends.
 - Queues are bounded. A full queue fails the connection with `error`, which
   starts reconciliation. It never drops a message silently.
 - Rounds on different channels do not block each other. The host's wait for

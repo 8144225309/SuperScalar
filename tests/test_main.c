@@ -63,7 +63,7 @@ extern int test_cu_crash_every_point(void);
 extern int test_cu_disconnect_every_send(void);
 extern int test_cu_lost_raa_reconciles(void);
 extern int test_cu_mid_round_queued(void);
-extern int test_cu_collision_host_wins(void);
+extern int test_cu_member_cannot_open_round(void);
 extern int test_cu_refuse_offer(void);
 extern int test_cu_data_loss(void);
 extern int test_cu_no_txn_across_calls(void);
@@ -2266,7 +2266,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cu_disconnect_every_send);
     RUN_TEST(test_cu_lost_raa_reconciles);
     RUN_TEST(test_cu_mid_round_queued);
-    RUN_TEST(test_cu_collision_host_wins);
+    RUN_TEST(test_cu_member_cannot_open_round);
     RUN_TEST(test_cu_refuse_offer);
     RUN_TEST(test_cu_data_loss);
     RUN_TEST(test_cu_no_txn_across_calls);

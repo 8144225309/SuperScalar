@@ -1527,7 +1527,7 @@ int persist_open(persist_t *p, const char *path) {
        outpoint); signatures given for a proposal that lost to a
        simultaneous one, kept so the penalty covers them; this side's
        per-commitment secrets with their released flag; the peer's points
-       and secrets.  A failed CREATE fails the open. */
+       and secrets; the member's pending offers.  A failed CREATE fails the open. */
     if (db_version < 46) {
         const char *sql_v46 =
             "CREATE TABLE IF NOT EXISTS chan_update_channel ("
@@ -1590,6 +1590,12 @@ int persist_open(persist_t *p, const char *path) {
             "  commit_num INTEGER NOT NULL,"
             "  secret     BLOB NOT NULL,"
             "  PRIMARY KEY (channel_id, commit_num)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_offer ("   /* member: updates it asked for */
+            "  channel_id INTEGER NOT NULL,"
+            "  seq        INTEGER NOT NULL,"
+            "  upd        BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, seq)"
             ");";
         char *merr46 = NULL;
         if (sqlite3_exec(p->db, sql_v46, NULL, NULL, &merr46) != SQLITE_OK) {
