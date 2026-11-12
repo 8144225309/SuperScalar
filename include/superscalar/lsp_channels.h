@@ -155,6 +155,46 @@ typedef struct {
     int active;
 } htlc_origin_t;
 
+/* Reorg detection (R1).  See lsp_reorg_poll() below. */
+typedef enum {
+    LSP_REORG_INCONCLUSIVE      = -1, /* a read the check needed failed: the
+                                         stored tip is kept, retried next poll */
+    LSP_REORG_NONE              = 0,
+    LSP_REORG_HEIGHT_REGRESSION = 1,  /* tip went backward */
+    LSP_REORG_SAME_HEIGHT       = 2,  /* same height, different tip hash */
+    LSP_REORG_FORWARD           = 3,  /* tip advanced, the block at the stored
+                                         height is no longer the stored one */
+    LSP_REORG_UNSEEN_BLOCK      = 4,  /* stored tip still canonical, but a block
+                                         built on it after it was stored has
+                                         been disconnected */
+} lsp_reorg_kind_t;
+
+#define LSP_REORG_SEEN_MAX 32
+
+/* A detector's stored tip.  height/hash always come from one snapshot
+   (regtest_get_tip).  seen[] holds disconnected chain tips that already sat
+   above the stored tip when it was stored, so they are not reported again
+   as UNSEEN_BLOCK on a later poll (ring buffer).  Zero-initialise. */
+typedef struct {
+    int32_t height;                    /* 0 = nothing stored yet */
+    char    hash[65];
+    char    seen[LSP_REORG_SEEN_MAX][65];
+    size_t  n_seen;
+    size_t  seen_next;
+    /* Set by lsp_reorg_poll(): for a reported reorg, the highest height the
+       old and new chains still share (blocks above it were disconnected);
+       -1 when the poll reported none. */
+    int32_t fork_height;
+} lsp_reorg_state_t;
+
+/* Chain data read after the current tip, for lsp_reorg_classify().
+   NULL means "not read, or the read failed". */
+typedef struct {
+    const char *hash_at_last;          /* active chain's hash at st->height */
+    const char *hash_at_next;          /* ... at st->height + 1 */
+    const regtest_chain_tip_t *tips;   /* getchaintips */
+    size_t n_tips;
+} lsp_reorg_view_t;
 /* An inbound bridge HTLC the client has fulfilled: kept so the fulfil can
    be given again if the Lightning node offers the same HTLC once more
    (it never received, or lost, the first answer). */
@@ -286,11 +326,24 @@ typedef struct {
     time_t last_heartbeat;              /* timestamp of last heartbeat output */
     time_t daemon_start_time;           /* timestamp when daemon loop started */
 
-    /* Reorg detection (R1).  height_regress is the simplest case; the tip
-       hash catches same-height and forward reorgs that height-only checks
-       miss (mainnet pre-flight). */
-    int32_t last_known_height;          /* highest block height ever observed */
-    char    last_known_tip_hash[65];    /* best-block hash @ last_known_height */
+    /* Reorg detection (R1): the heartbeat's own stored tip. */
+    lsp_reorg_state_t hb_reorg;
+
+    /* R5: set by lsp_channels_revalidate_funding() when the funding TX it
+       checked was not confirmed (pending in the mempool, stale, or gone).
+       While set, the daemon loop re-runs revalidation on every new block. */
+    int funding_anchor_unconfirmed;
+
+    /* The block that confirmed the factory funding TX
+       (funding_anchor_txid, display hex).  Recorded from gettxout while the
+       funding output is unspent, persisted in funding_anchors (v43), and
+       used when the output has been spent (factory closed, or its tree on
+       chain): the funding TX is still confirmed as long as this block is in
+       the active chain.  Lets revalidation work without -txindex and at any
+       depth. */
+    char    funding_anchor_txid[65];
+    int32_t funding_anchor_height;
+    char    funding_anchor_block[65];
 
     /* Funding reserve tracking (Phase 6) */
     uint64_t available_balance_sats;     /* wallet balance */
@@ -553,15 +606,120 @@ int lsp_run_state_advance(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    not an error. */
 int lsp_persist_ps_chain0_all(void *persist, factory_t *f);
 
-/* R5 (mainnet pre-flight): revalidate each factory channel's funding UTXO
-   against the active chain.  Sets ch->funding_pending_reorg=1 when the
-   funding TX has been reorged out; clears it back to 0 when re-confirmed.
-   LN-aligned: channel is FROZEN (HTLCs + force-close refused), not
+/* R5 (mainnet pre-flight): revalidate each factory channel's funding
+   against the active chain.  What is checked is the factory's funding TX
+   (lsp->factory.funding_txid), not ch->funding_txid: for a factory channel
+   that is the off-chain leaf state TX, which is normally never broadcast.
+   The funding is checked through its output (gettxout) and its recorded
+   confirming block, so neither -txindex nor a scan depth limits it.
+   Sets ch->funding_pending_reorg=1 when the funding TX is neither confirmed
+   nor in the mempool, or has sat in the mempool past the network threshold;
+   clears it back to 0 when it has >= 1 confirmation again.  Sets
+   mgr->funding_anchor_unconfirmed when the funding TX was not confirmed.
+   With lsp == NULL (or no factory funding set) ch->funding_txid itself is
+   checked.
+   LN-aligned: channel is FROZEN (HTLCs + commitment builds refused), not
    abandoned — re-confirmation re-enables it.
    When `lsp` is non-NULL, sends MSG_FUNDING_REORG to lsp->client_fds[slot]
    on every flip so the client mirrors the freeze state.
    Returns the number of channels whose flag state changed. */
 int lsp_channels_revalidate_funding(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* 1 when the daemon loop should call lsp_channels_revalidate_funding() on
+   the next new block: some channel is frozen, or the last revalidation saw
+   the funding TX unconfirmed. */
+int lsp_channels_funding_recheck_due(const lsp_channel_mgr_t *mgr);
+
+/* Record the factory funding TX's confirming block (see
+   mgr->funding_anchor_*) if not known yet: from memory, then the DB, then
+   gettxout.  The daemon loop calls it on each new block until it is known.
+   Returns 1 when the anchor is known after the call. */
+int lsp_channels_note_funding_anchor(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
+/* Test hook: when set, the anchor recording calls it after the gettxout
+   read and before it looks up the block at the computed height, so a test
+   can change the chain inside that window.  NULL outside tests. */
+extern void (*lsp_channels_test_anchor_hook)(void *arg);
+extern void *lsp_channels_test_anchor_hook_arg;
+
+/* Reorg detection (R1) classification.  Pure: no I/O.
+   st is the stored tip (from the previous poll), (cur_height, cur_hash) the
+   tip now, from one regtest_get_tip() snapshot.  view carries what was read
+   after cur (see lsp_reorg_needs_hash_at_last / lsp_reorg_needs_tips).
+   - First observation (st->height == 0): NONE.
+   - cur_height < st->height: HEIGHT_REGRESSION.
+   - same height, different hash: SAME_HEIGHT.
+   - cur_height > st->height: the block at st->height must still be st->hash;
+     if it is not, and st->hash is not the active block at st->height + 1
+     either, FORWARD_REORG.  (If it is the block at +1, the stored pair was
+     read across a block arrival; nothing was replaced and the check falls
+     through.  A block hash commits to its ancestry, so one hash cannot sit
+     at two heights.)
+   - Tip changed but none of the above: a getchaintips entry with status
+     "valid-fork" or "invalid", forking at or above st->height and reaching
+     above it, that is not in st->seen, is a block built on the stored tip
+     after it was stored and since disconnected: UNSEEN_BLOCK.  This catches
+     reorgs entirely between two polls, which the hash comparison cannot see.
+     "invalid" also covers blocks that failed validation and were never
+     connected; reporting one costs a single extra run of the reorg handler.
+   - Any needed read missing from view: INCONCLUSIVE (also for a failed tip
+     read, cur_height <= 0). */
+lsp_reorg_kind_t lsp_reorg_classify(const lsp_reorg_state_t *st,
+                                    int32_t cur_height, const char *cur_hash,
+                                    const lsp_reorg_view_t *view);
+
+/* Which reads lsp_reorg_classify() needs for this transition. */
+int lsp_reorg_needs_hash_at_last(const lsp_reorg_state_t *st, int32_t cur_height);
+int lsp_reorg_needs_tips(const lsp_reorg_state_t *st, int32_t cur_height,
+                         const char *cur_hash);
+
+/* Store (cur_height, cur_hash) as the new tip, and remember the disconnected
+   tips in `tips` that already sit above it (so a later poll does not report
+   them as UNSEEN_BLOCK).  Call only after a conclusive classification. */
+void lsp_reorg_state_advance(lsp_reorg_state_t *st, int32_t cur_height,
+                             const char *cur_hash,
+                             const regtest_chain_tip_t *tips, size_t n_tips);
+
+/* Fork height of a reorg just classified as `kind` against `prev` (the
+   stored tip before the poll).  Exact when getchaintips lists the branch
+   holding prev->hash (fork = its height - branchlen) or, for UNSEEN_BLOCK,
+   the reported branch; otherwise one below the lower of the two tips.
+   That fallback assumes the reorg went at most one block below the lower
+   tip: for a deeper reorg whose old branch getchaintips no longer lists
+   (e.g. bitcoind restarted since), the result is above the real fork.
+   -1 for NONE / INCONCLUSIVE.  Pure. */
+int32_t lsp_reorg_fork_height(const lsp_reorg_state_t *prev,
+                              lsp_reorg_kind_t kind, int32_t cur_height,
+                              const lsp_reorg_view_t *view);
+
+/* Reorg handler step for PS sub-factory chains: roll back only entries
+   observed confirmed above fork_height.  Nothing records that height
+   (ps_chain_confirmed_height) today, so this resets nothing; it is the hook
+   for when force-close tracking stamps the height at which a chain entry
+   confirmed.  Chains never seen on chain (the normal, off-chain case) are
+   left as they are.  Returns the count. */
+int lsp_reorg_rollback_subfactory_chains(factory_t *f, int32_t fork_height);
+
+/* A detector's stored tip in the DB (v43 reorg_tips), so the first poll
+   after a restart compares against the tip seen before the restart and
+   reports a reorg that happened while the LSP was down.  `persist` is a
+   persist_t*.  Load fills height and hash (seen[] starts empty) and
+   returns 1 when a row exists; save returns 1 on success. */
+int lsp_reorg_state_load(void *persist, const char *detector,
+                         lsp_reorg_state_t *st);
+int lsp_reorg_state_save(void *persist, const char *detector,
+                         const lsp_reorg_state_t *st);
+
+/* One detector poll: tip snapshot, the reads above, classify, and advance
+   *st unless the result is INCONCLUSIVE.  Writes the tip read to
+   *cur_height / cur_hash (-1 / "" when the tip read failed).  Used by the
+   daemon loop and the heartbeat, each with its own state. */
+lsp_reorg_kind_t lsp_reorg_poll(regtest_t *rt, lsp_reorg_state_t *st,
+                                int32_t *cur_height, char cur_hash[65]);
+
+/* "HEIGHT_REGRESSION" / "SAME_HEIGHT" / "FORWARD_REORG" /
+   "UNSEEN_BLOCK_REORG" / "INCONCLUSIVE" / "" (NONE). */
+const char *lsp_reorg_kind_str(lsp_reorg_kind_t kind);
 
 /* PS k² sub-factory chain extension ceremony driver (Gap E followup
    Phase 2b, t/1242).  Drives the multi-party MuSig signing of a new
