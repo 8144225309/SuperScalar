@@ -29,6 +29,7 @@ typedef struct {
     uint32_t funding_vout;
     uint64_t funding_amount;
     unsigned char spk[34];
+    secp256k1_pubkey member;    /* paid by output 0 (BIP-86) */
     tx_buf_t signed_tx;
 } dist_fixture_t;
 
@@ -55,6 +56,20 @@ static int fixture_build(dist_fixture_t *fx, uint32_t nsequence, uint32_t lockti
         memcpy(outs[i].script_pubkey, fx->spk, 34);
         outs[i].script_pubkey[2] ^= (unsigned char)(i + 1);
         outs[i].script_pubkey_len = 34;
+    }
+    /* output 0 pays the member's key the way distribution outputs do */
+    {
+        unsigned char msk[32], ser[32], tw[32];
+        memset(msk, 0x33, 32);
+        secp256k1_xonly_pubkey mx, mt;
+        secp256k1_pubkey mfull;
+        if (!secp256k1_ec_pubkey_create(fx->ctx, &fx->member, msk) ||
+            !secp256k1_xonly_pubkey_from_pubkey(fx->ctx, &mx, NULL, &fx->member) ||
+            !secp256k1_xonly_pubkey_serialize(fx->ctx, ser, &mx)) return 0;
+        sha256_tagged("TapTweak", ser, 32, tw);
+        if (!secp256k1_xonly_pubkey_tweak_add(fx->ctx, &mfull, &mx, tw) ||
+            !secp256k1_xonly_pubkey_from_pubkey(fx->ctx, &mt, NULL, &mfull)) return 0;
+        build_p2tr_script_pubkey(outs[0].script_pubkey, &mt);
     }
     outs[2].amount_sats = 240;
     outs[2].script_pubkey[0] = 0x51; outs[2].script_pubkey[1] = 0x02;
@@ -84,7 +99,8 @@ static void fixture_free(dist_fixture_t *fx) {
 static int verify_fx(dist_fixture_t *fx, const unsigned char *tx, size_t len,
                      client_dist_tx_t *d, char *err) {
     return client_dist_verify(fx->ctx, tx, len, fx->funding_txid, fx->funding_vout,
-                              fx->funding_amount, fx->spk, 34, d, err, 160);
+                              fx->funding_amount, fx->spk, 34, LOCKTIME,
+                              &fx->member, 199000, d, err, 160);
 }
 
 int test_client_dist_verify_accepts_signed(void) {
@@ -128,14 +144,32 @@ int test_client_dist_verify_rejects(void) {
 
     /* another funding outpoint */
     T_ASSERT(!client_dist_verify(fx.ctx, fx.signed_tx.data, len, fx.funding_txid, 0,
-                                 fx.funding_amount, fx.spk, 34, &d, err, sizeof(err)),
+                                 fx.funding_amount, fx.spk, 34, 0, NULL, 0, &d, err, sizeof(err)),
              "wrong vout accepted");
     T_ASSERT(strstr(err, "funding output") != NULL, err);
     /* another funding amount: the BIP-341 sighash commits to it */
     T_ASSERT(!client_dist_verify(fx.ctx, fx.signed_tx.data, len, fx.funding_txid, 1,
-                                 fx.funding_amount + 1, fx.spk, 34, &d, err, sizeof(err)),
+                                 fx.funding_amount + 1, fx.spk, 34, 0, NULL, 0, &d, err, sizeof(err)),
              "wrong amount accepted");
     T_ASSERT(strstr(err, "signature") != NULL, err);
+    /* bound to the member's terms: the factory CLTV timeout and its share */
+    T_ASSERT(!client_dist_verify(fx.ctx, fx.signed_tx.data, len, fx.funding_txid, 1,
+                                 fx.funding_amount, fx.spk, 34, LOCKTIME + 1, &fx.member,
+                                 0, &d, err, sizeof(err)), "other nLockTime accepted");
+    T_ASSERT(strstr(err, "CLTV timeout") != NULL, err);
+    T_ASSERT(!client_dist_verify(fx.ctx, fx.signed_tx.data, len, fx.funding_txid, 1,
+                                 fx.funding_amount, fx.spk, 34, LOCKTIME, &fx.member,
+                                 199001, &d, err, sizeof(err)), "short share accepted");
+    T_ASSERT(strstr(err, "pays this member") != NULL, err);
+    {
+        secp256k1_pubkey other;
+        unsigned char osk[32];
+        memset(osk, 0x44, 32);
+        T_ASSERT(secp256k1_ec_pubkey_create(fx.ctx, &other, osk), "other key");
+        T_ASSERT(!client_dist_verify(fx.ctx, fx.signed_tx.data, len, fx.funding_txid, 1,
+                                     fx.funding_amount, fx.spk, 34, LOCKTIME, &other,
+                                     1, &d, err, sizeof(err)), "pays another key: accepted");
+    }
     /* an output amount changed after signing */
     memcpy(tx, fx.signed_tx.data, len);
     tx[4 + 2 + 1 + 36 + 1 + 4 + 1] ^= 0x01;

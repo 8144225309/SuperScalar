@@ -51,6 +51,9 @@ int client_dist_verify(const secp256k1_context *ctx,
                        const unsigned char *funding_txid32, uint32_t funding_vout,
                        uint64_t funding_amount,
                        const unsigned char *funding_spk, size_t funding_spk_len,
+                       uint32_t expected_locktime,
+                       const secp256k1_pubkey *member_pubkey,
+                       uint64_t member_min_sats,
                        client_dist_tx_t *out, char *err, size_t errlen) {
     if (out) memset(out, 0, sizeof(*out));
     if (!ctx || !tx || !funding_txid32 || !funding_spk || !out) {
@@ -83,6 +86,7 @@ int client_dist_verify(const secp256k1_context *ctx,
         set_err(err, errlen, "bad output count");
         return 0;
     }
+    size_t outputs_start = pos;
     for (uint64_t i = 0; i < n_out; i++) {
         uint64_t spk_len = 0;
         if (tx_len - pos < 8) { set_err(err, errlen, "truncated output"); return 0; }
@@ -118,6 +122,49 @@ int client_dist_verify(const secp256k1_context *ctx,
     if (locktime == 0 || locktime >= 500000000u) {
         set_err(err, errlen, "nLockTime is not a block height");
         return 0;
+    }
+    if (expected_locktime != 0 && locktime != expected_locktime) {
+        char m[96];
+        snprintf(m, sizeof(m), "nLockTime %u is not the factory CLTV timeout %u",
+                 (unsigned)locktime, (unsigned)expected_locktime);
+        set_err(err, errlen, m);
+        return 0;
+    }
+    if (member_pubkey) {
+        /* BIP-86: output key = P + H_TapTweak(P) G, no script tree */
+        unsigned char ser[32], tweak[32], spk[34];
+        secp256k1_xonly_pubkey xonly, tweaked;
+        secp256k1_pubkey full;
+        if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, member_pubkey) ||
+            !secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly)) {
+            set_err(err, errlen, "member key unusable");
+            return 0;
+        }
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        if (!secp256k1_xonly_pubkey_tweak_add(ctx, &full, &xonly, tweak) ||
+            !secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &full)) {
+            set_err(err, errlen, "member key unusable");
+            return 0;
+        }
+        build_p2tr_script_pubkey(spk, &tweaked);
+        uint64_t paid = 0;
+        size_t q = outputs_start;
+        for (uint64_t i = 0; i < n_out; i++) {
+            uint64_t amt = 0, sl = 0;
+            for (int b = 7; b >= 0; b--) amt = (amt << 8) | tx[q + (size_t)b];
+            q += 8;
+            rd_varint(tx, tx_len, &q, &sl);
+            if (sl == 34 && memcmp(tx + q, spk, 34) == 0) paid += amt;
+            q += (size_t)sl;
+        }
+        if (paid < member_min_sats) {
+            char m[128];
+            snprintf(m, sizeof(m), "pays this member %llu sat, less than its "
+                     "channel's %llu", (unsigned long long)paid,
+                     (unsigned long long)member_min_sats);
+            set_err(err, errlen, m);
+            return 0;
+        }
     }
     if (sequence == 0xFFFFFFFFu) {
         set_err(err, errlen, "input nSequence disables its nLockTime");
@@ -207,9 +254,25 @@ int client_dist_load(persist_t *db, secp256k1_context *ctx, uint32_t factory_id,
         set_err(err, errlen, "factory record unreadable");
         return -1;
     }
-    int ok = client_dist_verify(ctx, tx, len, f->funding_txid, f->funding_vout,
+    /* This member: the client whose channel row the DB holds. */
+    const secp256k1_pubkey *member = NULL;
+    uint64_t member_min = 0;
+    for (size_t slot = 0; slot + 1 < f->n_participants; slot++) {
+        uint64_t la = 0, ra = 0, cn = 0;
+        if (persist_load_channel_state(db, (uint32_t)slot, &la, &ra, &cn)) {
+            member = &f->pubkeys[slot + 1];
+            member_min = la + ra;
+            break;
+        }
+    }
+    int ok = 0;
+    if (!member)
+        set_err(err, errlen, "no channel record for this member");
+    else
+        ok = client_dist_verify(ctx, tx, len, f->funding_txid, f->funding_vout,
                                 f->funding_amount_sats, f->funding_spk,
-                                f->funding_spk_len, out, err, errlen);
+                                f->funding_spk_len, f->cltv_timeout, member,
+                                member_min, out, err, errlen);
     factory_free(f);
     free(f);
     free(tx);
