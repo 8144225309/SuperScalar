@@ -38,12 +38,18 @@ int watchtower_autosettle_leaf_channels(struct watchtower_s *wt,
     int n_settled = 0;
     for (size_t lc = 0; lc < e->n_leaf_channels; lc++) {
         uint32_t ch_idx = e->leaf_channel_ids[lc];
-        unsigned char commit_tx[4096];
-        size_t commit_tx_len = 0;
+        /* Sized from the stored commitment: one with many HTLC outputs is
+           larger than any fixed buffer worth putting on the stack. */
+        size_t need = 0;
         uint64_t commit_cn = 0;
+        if (!persist_load_commitment_sig(wt->db, ch_idx, &commit_cn, NULL,
+                                         NULL, &need, 0) || need == 0)
+            continue;
+        unsigned char *commit_tx = malloc(need);
+        if (!commit_tx) continue;
+        size_t commit_tx_len = 0;
         if (persist_load_commitment_sig(wt->db, ch_idx,
-                &commit_cn, NULL, commit_tx, &commit_tx_len,
-                sizeof(commit_tx)) &&
+                &commit_cn, NULL, commit_tx, &commit_tx_len, need) &&
             commit_tx_len > 0) {
             char *ctx_hex = (char *)malloc(commit_tx_len * 2 + 1);
             if (ctx_hex) {
@@ -62,6 +68,7 @@ int watchtower_autosettle_leaf_channels(struct watchtower_s *wt,
                 free(ctx_hex);
             }
         }
+        free(commit_tx);
     }
     return n_settled;
 }

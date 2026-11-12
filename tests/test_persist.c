@@ -5819,3 +5819,52 @@ int test_persist_signed_tx_loaders_never_overreport(void) {
     return 1;
 }
 
+
+/* The LSP's in-process watchtower auto-settles each channel of a confirmed
+   leaf from its DB.  A commitment with many HTLC outputs is larger than
+   4096 bytes (about 90 HTLCs); it must still be broadcast whole. */
+#include "superscalar/watchtower.h"
+#include "superscalar/chain_backend.h"
+extern int watchtower_autosettle_leaf_channels(struct watchtower_s *wt,
+                                               watchtower_entry_t *e);
+static size_t g_as_hex_len;
+static int g_as_sends;
+static int as_send(chain_backend_t *self, const char *hex, char *txid_out) {
+    (void)self;
+    g_as_hex_len = strlen(hex);
+    g_as_sends++;
+    if (txid_out) { memset(txid_out, '0', 64); txid_out[64] = '\0'; }
+    return 1;
+}
+int test_autosettle_sends_large_commitment(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open");
+    size_t big = 5000;
+    unsigned char *tx = malloc(big);
+    TEST_ASSERT(tx, "alloc");
+    for (size_t i = 0; i < big; i++) tx[i] = (unsigned char)(i * 3 + 1);
+    unsigned char sig[64];
+    memset(sig, 0x22, 64);
+    TEST_ASSERT(persist_save_commitment_sig(&db, 0, 3, sig, tx, big), "save");
+    chain_backend_t chain;
+    memset(&chain, 0, sizeof(chain));
+    chain.send_raw_tx = as_send;
+    watchtower_t *wt = calloc(1, sizeof(watchtower_t));
+    TEST_ASSERT(wt, "wt");
+    wt->db = &db;
+    wt->chain = &chain;
+    watchtower_entry_t e;
+    memset(&e, 0, sizeof(e));
+    uint32_t ids[1] = { 0 };
+    e.leaf_channel_ids = ids;
+    e.n_leaf_channels = 1;
+    g_as_hex_len = 0;
+    g_as_sends = 0;
+    TEST_ASSERT_EQ(watchtower_autosettle_leaf_channels(wt, &e), 1, "channel settled");
+    TEST_ASSERT_EQ(g_as_sends, 1, "one broadcast");
+    TEST_ASSERT_EQ(g_as_hex_len, big * 2, "the whole commitment broadcast");
+    free(wt);
+    free(tx);
+    persist_close(&db);
+    return 1;
+}
