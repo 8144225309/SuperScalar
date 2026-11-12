@@ -3021,7 +3021,24 @@ int main(int argc, char *argv[]) {
     if (use_db && daemon_mode) {
         factory_t *rec_f = calloc(1, sizeof(factory_t));
         if (!rec_f) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
-        if (persist_load_factory(&db, 0, rec_f, ctx)) {
+        int rec_loaded = persist_load_factory(&db, 0, rec_f, ctx);
+        if (!rec_loaded) {
+            free(rec_f);
+            rec_f = NULL;
+            if (persist_has_factory(&db, 0)) {
+                /* The DB holds a factory this LSP must keep serving (its
+                   members' exits, the distribution TX, the watchtower), but it
+                   cannot be loaded as the signed tree (reason above).  Never
+                   fall through to a new factory over it. */
+                fprintf(stderr, "LSP: the factory in %s cannot be loaded "
+                        "(see above); refusing to start\n", db_path);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+        if (rec_loaded) {
             if (rec_f->n_participants < 2) {
                 fprintf(stderr, "LSP recovery: corrupt factory (n_participants=%zu)\n",
                         rec_f->n_participants);
