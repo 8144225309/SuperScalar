@@ -28,7 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Cache CMake deps
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/_deps
           key: cmake-deps-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -188,7 +188,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Cache Bitcoin Core binary
         id: btc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: bitcoin-28.1
           key: bitcoin-core-28.1-x86_64
@@ -242,7 +242,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev sqlite3 python3
       - name: Cache Bitcoin Core binary
         id: btc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: bitcoin-28.1
           key: bitcoin-core-28.1-x86_64
@@ -432,7 +432,7 @@ jobs:
       # The corpus each run grows is kept for the next one (a new cache entry
       # per run, restored from the newest earlier entry of the same target).
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
