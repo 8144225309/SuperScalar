@@ -224,6 +224,16 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
 
+        /* v31: a funding freeze persisted before the restart stays in force
+           until lsp_channels_revalidate_funding() re-checks it; the daemon
+           loop does that on its first block (lsp_channels_funding_recheck_due),
+           which also clears freezes whose funding TX is confirmed. */
+        {
+            int frozen = 0;
+            if (persist_load_channel_funding_reorg(pdb, (uint32_t)c, &frozen))
+                entry->channel.funding_pending_reorg = frozen;
+        }
+
         /* A channel failed before the restart (invalid revocation, or a
            revoked commitment that could not be watched) stays failed. */
         if (persist_channel_is_failed(pdb, (uint32_t)c)) {

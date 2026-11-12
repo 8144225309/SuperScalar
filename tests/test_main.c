@@ -2385,6 +2385,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_open_cb_wires);
     RUN_TEST(test_jit_open_cb_on_cost_covered);
     RUN_TEST(test_jit_open_cb_null_guard);
+    extern int test_jit_revalidate_rpc_outage_keeps_open(void);
+    extern int test_jit_force_close_rpc_outage_keeps_open(void);
+    RUN_TEST(test_jit_revalidate_rpc_outage_keeps_open);
+    RUN_TEST(test_jit_force_close_rpc_outage_keeps_open);
+    extern int test_regtest_conf_stops_at_first_unreachable(void);
+    extern int test_regtest_conf_conflicted_wallet_tx(void);
+    RUN_TEST(test_regtest_conf_stops_at_first_unreachable);
+    RUN_TEST(test_regtest_conf_conflicted_wallet_tx);
 
     printf("\n=== Phase F: BOLT 12 / Offers ===\n");
     RUN_TEST(test_offer_encode_decode);
@@ -4412,6 +4420,29 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reorg_htlc_timeout_no_premature_fail);
     RUN_TEST(test_reorg_bip158_noop);
 
+    /* R1 reorg detector: tip read race + classification */
+    extern int test_reorg_tip_race_no_false_forward(void);
+    extern int test_reorg_classify_detects_real_reorgs(void);
+    extern int test_reorg_classify_unseen_block_reorg(void);
+    RUN_TEST(test_reorg_tip_race_no_false_forward);
+    RUN_TEST(test_reorg_classify_detects_real_reorgs);
+    RUN_TEST(test_reorg_classify_unseen_block_reorg);
+    extern int test_reorg_fork_height(void);
+    extern int test_reorg_subfactory_chain_kept_on_shallow_reorg(void);
+    RUN_TEST(test_reorg_fork_height);
+    RUN_TEST(test_reorg_subfactory_chain_kept_on_shallow_reorg);
+
+    /* R5 funding revalidation: re-check decision + restart reload */
+    extern int test_reorg_funding_recheck_due(void);
+    extern int test_reorg_funding_freeze_reloaded_on_restart(void);
+    RUN_TEST(test_reorg_funding_recheck_due);
+    RUN_TEST(test_reorg_funding_freeze_reloaded_on_restart);
+    extern int test_reorg_revalidate_rpc_outage_no_change(void);
+    RUN_TEST(test_reorg_revalidate_rpc_outage_no_change);
+    extern int test_persist_funding_anchor_reorg_tip(void);
+    RUN_TEST(test_persist_funding_anchor_reorg_tip);
+    extern int test_reorg_tip_persisted_detects_downtime_reorg(void);
+    RUN_TEST(test_reorg_tip_persisted_detects_downtime_reorg);
     printf("\n=== Client Signing Checks ===\n");
     extern int test_client_close_outputs_acceptable(void);
     extern int test_client_close_single_payout_output(void);
@@ -4602,6 +4633,24 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest JIT Trigger ===\n");
     RUN_TEST(test_regtest_jit_daemon_trigger);
 
+    printf("\n=== Regtest Reorg Detection & Funding Revalidation ===\n");
+    {
+        extern int test_regtest_reorg_revalidate_factory_funding(void);
+        extern int test_regtest_reorg_tip_snapshot_consistent(void);
+        extern int test_regtest_reorg_unseen_tip_block_detected(void);
+        RUN_TEST(test_regtest_reorg_revalidate_factory_funding);
+        extern int test_regtest_reorg_revalidate_deep_funding(void);
+        RUN_TEST(test_regtest_reorg_revalidate_deep_funding);
+        extern int test_regtest_reorg_revalidate_anchor_race(void);
+        extern int test_regtest_reorg_revalidate_spent_funding_reorged_out(void);
+        extern int test_regtest_reorg_revalidate_conflicted_funding_no_anchor(void);
+        RUN_TEST(test_regtest_reorg_revalidate_anchor_race);
+        RUN_TEST(test_regtest_reorg_revalidate_spent_funding_reorged_out);
+        RUN_TEST(test_regtest_reorg_revalidate_conflicted_funding_no_anchor);
+        RUN_TEST(test_regtest_reorg_unseen_tip_block_detected);
+        /* Mines 300 blocks: keep it last so earlier tests keep subsidy. */
+        RUN_TEST(test_regtest_reorg_tip_snapshot_consistent);
+    }
     printf("\n=== Regtest Pre-signed TRUC Broadcast ===\n");
     RUN_TEST(test_regtest_recovery_waits_for_confirmed_parent);
     RUN_TEST(test_regtest_cpfp_parent_accepted_child_rejected);

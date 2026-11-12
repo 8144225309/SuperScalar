@@ -28,6 +28,21 @@ static const char *SCHEMA_VERSION_SQL =
     "  applied_at INTEGER DEFAULT (strftime('%s','now'))"
     ");";
 
+/* v43: block that confirmed a factory funding TX (reorg revalidation
+   without -txindex), and each reorg detector's last stored tip.  Part of
+   SCHEMA_SQL and run by the v43 migration. */
+#define PERSIST_V43_TABLES_SQL                          \
+    "CREATE TABLE IF NOT EXISTS funding_anchors ("      \
+    "  funding_txid TEXT NOT NULL PRIMARY KEY,"         \
+    "  height INTEGER NOT NULL,"                        \
+    "  block_hash TEXT NOT NULL"                        \
+    ");"                                                \
+    "CREATE TABLE IF NOT EXISTS reorg_tips ("           \
+    "  detector TEXT NOT NULL PRIMARY KEY,"             \
+    "  height INTEGER NOT NULL,"                        \
+    "  block_hash TEXT NOT NULL"                        \
+    ");"
+
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS factories ("
     "  id INTEGER PRIMARY KEY,"
@@ -448,7 +463,8 @@ static const char *SCHEMA_SQL =
     "  chan_amount_sats INTEGER NOT NULL,"
     "  epoch INTEGER NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (factory_id, leaf_node_idx, chain_pos)"
-    ");";
+    ");"
+    PERSIST_V43_TABLES_SQL;
 
 /* 1 if `table` has a column named `col` (PRAGMA table_info). */
 static int persist_table_has_column(sqlite3 *db, const char *table,
@@ -1533,6 +1549,23 @@ int persist_open(persist_t *p, const char *path) {
             fprintf(stderr, "persist_open: client_close_signed table error: %s\n",
                     cs_err ? cs_err : "unknown");
             sqlite3_free(cs_err);
+        }
+    }
+
+    /* v43: funding_anchors (block that confirmed a factory funding TX, so
+       reorg revalidation does not depend on -txindex or the scan depth) and
+       reorg_tips (each reorg detector's last (height, hash), compared at
+       startup to catch a reorg while the LSP was down). */
+    if (db_version < 43) {
+        char *merr = NULL;
+        if (sqlite3_exec(p->db, PERSIST_V43_TABLES_SQL,
+                         NULL, NULL, &merr) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v43 failed: %s\n",
+                    merr ? merr : "unknown");
+            sqlite3_free(merr);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
         }
     }
 
@@ -3779,6 +3812,23 @@ int persist_update_channel_funding_reorg(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
+/* v43: (key, height, block_hash) rows in funding_anchors / reorg_tips. */
+static int persist_save_height_hash(persist_t *p, const char *sql,
+                                    const char *key, int32_t height,
+                                    const char *block_hash) {
+    if (!p || !p->db || !key || !block_hash || strlen(block_hash) != 64)
+        return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)height);
+    sqlite3_bind_text(stmt, 3, block_hash, -1, SQLITE_TRANSIENT);
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 int persist_mark_channel_failed(persist_t *p, uint32_t channel_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
@@ -3792,6 +3842,28 @@ int persist_mark_channel_failed(persist_t *p, uint32_t channel_id) {
     return ok;
 }
 
+static int persist_load_height_hash(persist_t *p, const char *sql,
+                                    const char *key, int32_t *height,
+                                    char block_hash[65]) {
+    if (!p || !p->db || !key || !height || !block_hash) return 0;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    int ok = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(stmt, 1);
+        if (h && strlen((const char *)h) == 64) {
+            *height = (int32_t)sqlite3_column_int(stmt, 0);
+            memcpy(block_hash, h, 64);
+            block_hash[64] = '\0';
+            ok = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 int persist_mark_jit_failed(persist_t *p, uint32_t jit_channel_id) {
     if (!p || !p->db) return 0;
     sqlite3_stmt *stmt;
@@ -3801,6 +3873,57 @@ int persist_mark_jit_failed(persist_t *p, uint32_t jit_channel_id) {
         return 0;
     sqlite3_bind_int(stmt, 1, (int)jit_channel_id);
     int ok = (sqlite3_step(stmt) == SQLITE_DONE) && sqlite3_changes(p->db) == 1;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_save_funding_anchor(persist_t *p, const char *funding_txid_hex,
+                                int32_t height, const char *block_hash) {
+    return persist_save_height_hash(p,
+        "INSERT OR REPLACE INTO funding_anchors (funding_txid, height, block_hash) "
+        "VALUES (?, ?, ?);", funding_txid_hex, height, block_hash);
+}
+
+int persist_load_funding_anchor(persist_t *p, const char *funding_txid_hex,
+                                int32_t *height, char block_hash[65]) {
+    return persist_load_height_hash(p,
+        "SELECT height, block_hash FROM funding_anchors WHERE funding_txid = ?;",
+        funding_txid_hex, height, block_hash);
+}
+
+int persist_save_reorg_tip(persist_t *p, const char *detector,
+                           int32_t height, const char *block_hash) {
+    return persist_save_height_hash(p,
+        "INSERT OR REPLACE INTO reorg_tips (detector, height, block_hash) "
+        "VALUES (?, ?, ?);", detector, height, block_hash);
+}
+
+int persist_load_reorg_tip(persist_t *p, const char *detector,
+                           int32_t *height, char block_hash[65]) {
+    return persist_load_height_hash(p,
+        "SELECT height, block_hash FROM reorg_tips WHERE detector = ?;",
+        detector, height, block_hash);
+}
+
+int persist_load_channel_funding_reorg(persist_t *p, uint32_t channel_id,
+                                       int *funding_pending_reorg) {
+    if (!p || !p->db || !funding_pending_reorg) return 0;
+    *funding_pending_reorg = 0;
+
+    const char *sql =
+        "SELECT funding_pending_reorg FROM channels WHERE id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+
+    int ok = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *funding_pending_reorg = sqlite3_column_int(stmt, 0) ? 1 : 0;
+        ok = 1;
+    }
     sqlite3_finalize(stmt);
     return ok;
 }
