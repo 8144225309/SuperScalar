@@ -8,18 +8,23 @@ How to connect to a SuperScalar LSP and use your payment channel.
 - The LSP's IP address (or hostname / .onion) and port
 - A 32-byte secret key for your identity
 - (Optional) `bitcoin-cli` access for watchtower functionality.  The node must
-  be Bitcoin Core 28.0 or later (the client refuses an older one): factory
-  exits are TRUC transactions with P2A anchors that need package relay.
+  be Bitcoin Core 29.1 or later (the client refuses an older one): factory
+  exits are TRUC transactions with P2A anchors that need package relay, a
+  factory at rate 0 uses 0-value (ephemeral) anchors, and 29.1 relays down to
+  0.1 sat/vB by default.
 - For your own unilateral exit (`--force-close`, or the CLOSE policy when the
   LSP misbehaves): a small confirmed on-chain coin in a bitcoind wallet, named
-  with `--wallet`.  Your commitment transaction is pre-signed with a small fee
-  (about 154 sat for 167 vB, below the default minimum relay fee), and the
-  tree transactions with the fee agreed when the factory was made; they get
-  into a block with a child transaction that pays for them.  Without a wallet
-  coin the child can only spend the 240-sat anchor, which is not enough once
-  the node's minimum fee rises.  A few thousand sats is plenty at ordinary fee
-  rates; more when fees are high.  The exit also needs bitcoind RPC: a
-  backend without package relay cannot send the child.
+  with `--wallet`.  Every pre-signed exit transaction (the tree, your
+  commitment) pays the rate agreed when the factory was made (default 0.1
+  sat/vB, 17 sat for a 167 vB commitment; the LSP may propose 0) for its exact
+  size; whatever the network asks for beyond it is paid when you exit, by a
+  child transaction on its P2A anchor.  Without a wallet coin the child can
+  only spend the 240-sat anchor, which is not enough once the node's minimum
+  fee rises, and nothing at all for a tree signed at rate 0 (its anchors are
+  worth 0): `--force-close` then exits 1 saying the exit needs an on-chain
+  coin.  A few thousand sats is plenty at ordinary fee rates; more when fees
+  are high.  The exit also needs bitcoind RPC: a backend without package
+  relay cannot send the child.
 
   When the exit cannot get that child, `--force-close` prints
   `needs a fee-paying child: no wallet coin available` (or
@@ -250,8 +255,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--fee-rate N` | 1000 | Fee rate for penalty / sweep transactions (sat/kvB) |
 | `--fee-estimator MODE` | static | `static[:N]`, `api[:URL]` or `blocks`. Its urgent rate is also the CPFP target of exit broadcasts (default there: `estimatesmartfee`) |
 | `--wallet NAME` | none | bitcoind wallet that funds CPFP children on exit; without it a bump spends the P2A anchor alone, which is not enough once the minimum relay fee rises (see What You Need) |
-| `--max-tree-fee-rate N` | 100000 | Refuse a factory whose tree fee rate (sat/kvB) is above N; must match the LSP's value |
-| `--max-signed-tree-fee-rate N` | 10000 on mainnet, none elsewhere | Your own ceiling on the tree fee rate (sat/kvB): the tree's pre-signed fees come out of the factory funding, so a factory above it is refused; 0 = only the protocol maximum |
+| `--max-tree-fee-rate N` | 10000 | Your own ceiling on the factory's pre-signed rate (sat/kvB): its fees come out of the factory funding, so a factory (or rotation) proposed above it is refused; nothing has to match the LSP; 0 = no ceiling |
 | `--light-client HOST:PORT` | — | Use a BIP-158 P2P compact-block-filter peer instead of a local bitcoind |
 | `--light-client-fallback HOST:PORT` | — | Add a fallback BIP-158 peer (can repeat, up to 7 peers total) |
 

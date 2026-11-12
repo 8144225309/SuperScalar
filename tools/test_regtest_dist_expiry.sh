@@ -5,7 +5,7 @@
 # The node runs with a raised minimum relay feerate (MINRELAY sat/kvB) and a
 # block minimum feerate (BLOCKMIN) above it, so a package at the relay floor
 # sits in the mempool without being mined.  The tree (and the distribution
-# TX) is signed at the 1.25 sat/vB floor.  The LSP's fee estimator is an HTTP
+# TX) is signed at the default 0.1 sat/vB agreed rate.  The LSP's fee estimator is an HTTP
 # API served from a local file, so the test can raise its rate mid-run.
 #
 #   1. LSP + N clients build a factory with a short lifetime; the clients
@@ -85,7 +85,7 @@ PIDS+=($!); sleep 1
 FUNDING_RATE=$((BLOCKMIN + 5000))
 LSP_ARGS=(--network regtest --port $PORT --daemon --clients $N_CLIENTS --arity 2 --amount $AMOUNT
     --fee-rate $FUNDING_RATE --confirm-timeout 600 --step-blocks 2 --states-per-layer 2
-    --active-blocks 20 --dying-blocks 10 --tree-fee-rate 1250
+    --active-blocks 20 --dying-blocks 10 --tree-fee-rate 100
     --fee-estimator "api:http://127.0.0.1:$API_PORT/fees.json"
     --seckey "$LSP_SECKEY" --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT"
     --wallet "$WALLET" --db "$TMPDIR/lsp.db")

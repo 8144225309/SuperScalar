@@ -3,11 +3,12 @@
 # spike is postponed without side effects and without using its retries,
 # then completes once the spike is over.
 #
-# The LSP's fee estimator is an HTTP API served from a local file.  Its
-# agreed maximum fee rate (--max-tree-fee-rate) is raised so that at the
-# spike rate the cooperative close of the old factory would cost more than
-# half its funding: every rotation attempt is postponed before the key
-# turnover.
+# The LSP's fee estimator is an HTTP API served from a local file.  At the
+# spike rate the cooperative close of the old factory (signed at rotation
+# time, at the current estimate) would cost more than half its funding:
+# every rotation attempt is postponed before the key turnover.  The new
+# tree's pre-signed rate is the agreed term (--tree-fee-rate), not the
+# estimate, so nothing else about the rotation follows the spike.
 #
 #   1. LSP + N clients build a factory (estimate 1 sat/vB); the estimate then
 #      rises to SPIKE sat/vB before the factory reaches DYING.
@@ -17,14 +18,9 @@
 #   3. The estimate drops back to 1 sat/vB: the next attempt runs the whole
 #      rotation (full cooperative close of the old factory, new factory).
 #
-# With MID_RATE (sat/vB) the estimate first drops from the spike to
-# MID_RATE, above the rate the factory was built at: the new channels would
-# be smaller than the balances they carry, so the rotation must be postponed
-# again, saying so, with no key turnover; then it drops to 1 sat/vB.
-#
 # Env: REGTEST_CONF (required), N_CLIENTS (default 2), SPIKE (sat/vB,
 # default 1000), POSTPONES (postponements to see before the drop, default
-# 6), MID_RATE (default unset), AMOUNT, PORT.
+# 6), AMOUNT, PORT.
 set -uo pipefail
 
 BUILD_DIR="${1:-build}"
@@ -33,7 +29,6 @@ CLIENT_BIN="$BUILD_DIR/superscalar_client"
 N_CLIENTS="${N_CLIENTS:-2}"
 SPIKE="${SPIKE:-1000}"
 POSTPONES="${POSTPONES:-6}"
-MID_RATE="${MID_RATE:-}"
 AMOUNT="${AMOUNT:-$((N_CLIENTS * 100000))}"
 PORT="${PORT:-29983}"
 API_PORT=$((PORT + 1))
@@ -87,7 +82,7 @@ PIDS+=($!); sleep 1
 echo "=== rotation through a fee spike: clients=$N_CLIENTS amount=$AMOUNT spike=${SPIKE} sat/vB ==="
 "$LSP_BIN" --network regtest --port $PORT --daemon --clients $N_CLIENTS --arity 2 --amount $AMOUNT \
     --fee-rate 1100 --confirm-timeout 600 --step-blocks 2 --states-per-layer 2 \
-    --active-blocks 10 --dying-blocks 80 --cltv-timeout $(( $($BCLI getblockcount) + 1000 )) --max-tree-fee-rate $((SPIKE * 1000)) \
+    --active-blocks 10 --dying-blocks 80 --cltv-timeout $(( $($BCLI getblockcount) + 1000 )) \
     --fee-estimator "api:http://127.0.0.1:$API_PORT/fees.json" \
     --seckey "$LSP_SECKEY" --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
     --wallet "$WALLET" --db "$TMPDIR/lsp.db" > "$LSP_LOG" 2>&1 &
@@ -121,25 +116,6 @@ echo "  rotation postponed $NP times (more than the 3 retries a failure gets)"
 grep -qa "LSP rotate: Phase A" "$LSP_LOG" && fail "key turnover (Phase A) ran during the spike"
 grep -qa "broadcasting distribution TX" "$LSP_LOG" && fail "distribution-TX fallback during the spike"
 grep -qa "retry rotation FAILED\|auto-rotation FAILED" "$LSP_LOG" && fail "a postponement was counted as a failure"
-
-if [ -n "$MID_RATE" ]; then
-    echo "--- fee estimate drops to $MID_RATE sat/vB: the carried balances must not fit ---"
-    fees "$MID_RATE"
-    NC=0
-    CARRY="LSP rotate: postponing the rotation of factory 0: channel [0-9]* carries [0-9]* sat, more than the [0-9]* sat a channel of the new factory holds at ${MID_RATE}000 sat/kvB"
-    for i in $(seq 1 120); do
-        sleep 2
-        kill -0 $LSP_PID 2>/dev/null || fail "LSP died"
-        NC=$(grep -ac "$CARRY" "$LSP_LOG")
-        [ "$NC" -ge 2 ] && break
-        grep -qaE "LSP: (auto-rotation|retry rotation) complete" "$LSP_LOG" && fail "rotation completed with balances that do not fit"
-    done
-    [ "$NC" -ge 2 ] || fail "no postponement for carried balances at $MID_RATE sat/vB"
-    grep -a "$CARRY" "$LSP_LOG" | head -1
-    grep -qa "LSP rotate: Phase A" "$LSP_LOG" && fail "key turnover ran although the balances do not fit"
-    grep -qa "cannot be carried" "$LSP_LOG" && fail "a balance was refused after the old factory closed"
-    echo "  postponed $NC times: the carried balances do not fit at $MID_RATE sat/vB"
-fi
 
 echo "--- fee estimate back to 1 sat/vB ---"
 fees 1

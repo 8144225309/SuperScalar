@@ -137,7 +137,8 @@ In a PS (Pseudo-Spilman) configuration, leaves chain advance by appending new st
 
 ## Known limitations
 
-- **Bitcoin Core 28.0 or later** is required for the node the LSP and clients talk to (both refuse an older one): factory exits are TRUC (nVersion 3) transactions with P2A anchors, relayed with package relay (`submitpackage`).
+- **Bitcoin Core 29.1 or later** is required for the node the LSP and clients talk to (both refuse an older one): factory exits are TRUC (nVersion 3) transactions with P2A anchors, relayed with package relay (`submitpackage`); CI runs 30.3.
+- **Distribution TX size:** a factory with a distribution TX has at most 230 clients (the TX must fit a 10 kvB TRUC transaction); larger factories are refused before funding.
 - **Mainnet support** requires explicit `--i-accept-the-risk`; not recommended until the external audit + pre-mainnet hardening are complete (see the v0.2.0 release notes).
 - **Factory scale:** Tested at 512 clients on one factory UTXO; creation, Lightning payments, and cooperative close proven on regtest and public signet. The practical upper limit is not yet established; current constraints are distributed coordination, memory, and N-of-N liveness rather than a fixed MuSig2 signer limit.
 - **Windows binaries** not built (POSIX-only paths in regtest + signal handling); contributions welcome.

@@ -7,10 +7,12 @@ How to deploy and run a SuperScalar LSP node. Covers regtest, signet, and testne
 ## Prerequisites
 
 - Built `superscalar_lsp` binary (see main [README](../README.md#build))
-- Bitcoin Core 28.1+ (`bitcoind` and `bitcoin-cli`).  28.0 is the minimum, and
-  the LSP refuses to start on an older node: factory exits are TRUC (nVersion 3)
+- Bitcoin Core 29.1+ (`bitcoind` and `bitcoin-cli`; CI runs 30.3), and the
+  LSP refuses to start on an older node: factory exits are TRUC (nVersion 3)
   transactions with P2A anchors, relayed through package relay (`submitpackage`)
-  when their pre-signed fee is below what the mempool needs.
+  when their pre-signed fee is below what the mempool needs; a factory at rate
+  0 uses 0-value (ephemeral) anchors (29.0), and 29.1 relays down to 0.1
+  sat/vB by default.
 - SQLite3 (system package, used for persistence)
 - A funded wallet on your target network
 
@@ -188,8 +190,7 @@ Press **Ctrl+C**. The LSP will:
 | `--active-blocks` | 20 (regtest) / 4320 (other) | Factory active period in blocks |
 | `--dying-blocks` | 10 (regtest) / 432 (other) | Factory dying period (rotation window) |
 | `--fee-rate` | 1000 | Fee rate in sat/kvB |
-| `--tree-fee-rate N` | estimator | Rate (sat/kvB) the factory tree's pre-signed txs are sized at; default the estimator's 6-block rate, never below 1250 |
-| `--max-tree-fee-rate N` | 100000 | Highest tree fee rate; an estimate above it is clamped (the exit then relies on CPFP). Must match the clients' value. On mainnet clients refuse a tree above 10 sat/vB by default (`--max-signed-tree-fee-rate`), so use 10000 or lower there |
+| `--tree-fee-rate N` | 100 | The factory's agreed pre-signed rate (sat/kvB), proposed in FACTORY_PROPOSE: every tree tx, the distribution TX and the commitments pay exactly it for their size; 0 = no fee (0-value anchors, every exit tx needs a CPFP child). Never taken from a fee estimate. Clients refuse a rate above their own `--max-tree-fee-rate` (default 10000). A factory with more than 230 clients is refused before funding: its distribution TX would not fit a TRUC transaction |
 
 **Ceremony timeouts on signet/testnet4**: MuSig2 signing ceremonies (factory creation, cooperative close, rotation) use longer message timeouts on non-regtest networks — 120s per message vs 30s on regtest. The cooperative close nonce/psig collection uses 300s per client on signet/testnet4. These are automatic based on `--network`; no flags needed.
 
