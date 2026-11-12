@@ -7,6 +7,7 @@
 #include "persist.h"
 #include "persist_wt.h"
 #include <secp256k1.h>
+#include <signal.h>
 
 /* Default inbound-connection capacity; --max-connections overrides it and
    client_fds/client_pubkeys are heap-allocated, so this is a default, not a cap. */
@@ -56,6 +57,12 @@ typedef struct {
     /* Accept timeout: max seconds to wait for each client connection.
        0 = no timeout (block indefinitely, default). */
     int accept_timeout_sec;
+
+    /* Set by the caller's signal handler to end a wait for clients: a blocked
+       accept() or read() returns when the signal arrives (the handler is
+       installed without SA_RESTART) and lsp_accept_clients then gives up
+       instead of waiting again.  NULL = never asked to stop. */
+    volatile sig_atomic_t *stop_flag;
 
     /* Maximum connections the LSP will accept.
        Defaults to LSP_MAX_CLIENTS; --max-connections overrides. */

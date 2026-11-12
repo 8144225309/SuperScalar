@@ -168,6 +168,19 @@ static void sigint_handler(int sig) {
     g_shutdown = 1;
 }
 
+/* SIGINT and SIGTERM end the LSP.  signal() restarts a blocked accept() or
+   read() after the handler ran, so an LSP waiting for its members never saw
+   the flag; sigaction without SA_RESTART makes those calls return. */
+static void install_shutdown_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
 #ifdef __linux__
 static void crash_handler(int sig) {
     void *bt[64];
@@ -3141,8 +3154,8 @@ int main(int argc, char *argv[]) {
             lsp_rp->use_nk = 1;
             memcpy(lsp_rp->nk_seckey, lsp_seckey, 32);
 
-            signal(SIGINT, sigint_handler);
-            signal(SIGTERM, sigint_handler);
+            install_shutdown_handlers();
+            lsp_rp->stop_flag = &g_shutdown;
 
             /* Open listen socket for reconnections */
             lsp_rp->listen_fd = wire_listen(bind_addr, lsp_rp->port);
@@ -3843,8 +3856,8 @@ accept_new_factory:
         }
     }
 
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
+    install_shutdown_handlers();
+    lsp_p->stop_flag = &g_shutdown;
 
     if (!lsp_accept_clients(lsp_p)) {
         fprintf(stderr, "LSP: failed to accept clients\n");
