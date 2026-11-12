@@ -10,12 +10,11 @@
 #
 #   1. LSP + N clients build a factory with a short lifetime; the clients
 #      then go away (no rotation can happen).
-#   2. The factory expires before its CLTV: the first broadcast of the
-#      distribution TX is refused (non-final).  The LSP is killed and
-#      restarted from its DB: it still knows the factory expired and has the
-#      distribution TX, and sends it again on later blocks; once final it
-#      goes in as a CPFP package at the relay floor, below BLOCKMIN: it is not
-#      mined.
+#   2. The factory expires before its CLTV: the LSP holds the distribution
+#      TX until its nLockTime.  The LSP is killed and restarted from its DB:
+#      it still knows the factory expired and has the distribution TX, and
+#      sends it at its nLockTime through the CPFP path, in as a package at
+#      the relay floor, below BLOCKMIN: it is not mined.
 #   3. The LSP is killed and restarted again, with the TX in the mempool.  The
 #      API rate rises to RAISED sat/vB: on a following block the restarted
 #      LSP re-bumps the package in the mempool and it confirms.
@@ -139,17 +138,19 @@ for p in "${CPIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
 touch "$TMPDIR/mining"
 ( while [ -f "$TMPDIR/mining" ]; do mine 1; sleep 2; done ) & MINER_PID=$!
 
-# 1. expired, distribution TX refused (not final yet): the LSP restarts
+# 1. expired, before the distribution TX's nLockTime: nothing is sent yet;
+#    the LSP restarts
 for i in $(seq 1 150); do
     sleep 1
     kill -0 $LSP_PID 2>/dev/null || fail "LSP died"
-    grep -qaE "distribution TX [0-9a-f]{64} of factory [0-9]+ (not accepted|broadcast)" "$LSP_LOG" && break
+    grep -qa "EXPIRED" "$LSP_LOG" && break
 done
-NREFUSED=$(grep -ac "distribution TX [0-9a-f]* of factory [0-9]* not accepted" "$LSP_LOG")
-grep -qaE "distribution TX [0-9a-f]{64} of factory [0-9]+ broadcast" "$LSP_LOG" && \
-    fail "distribution TX accepted before the first restart (setup: expected it refused, not final)"
-[ "$NREFUSED" -ge 1 ] || fail "the LSP never sent its distribution TX at expiry"
-echo "  factory expired at height $($BCLI getblockcount), distribution TX refused (CLTV $CLTV): restarting the LSP"
+grep -qa "EXPIRED" "$LSP_LOG" || fail "the factory never expired"
+H=$($BCLI getblockcount)
+NLOCK=$(grep -aoE "broadcast at its nLockTime \(block [0-9]+\)" "$LSP_LOG" | head -1 | grep -oE "[0-9]+")
+grep -qaE "distribution TX [0-9a-f]{64} of factory [0-9]+ (not accepted|broadcast)" "$LSP_LOG" && \
+    [ -n "$NLOCK" ] && [ "$H" -lt "$NLOCK" ] && fail "distribution TX sent before its nLockTime"
+echo "  factory expired at height $H, distribution TX held until its nLockTime (${NLOCK:-?}, CLTV $CLTV): restarting the LSP"
 restart_lsp
 
 # 2. the restarted LSP sends it again until it is final; in as a package
@@ -163,8 +164,8 @@ done
 [ -n "$DTX" ] || fail "the restarted LSP never got its distribution TX into the mempool"
 H=$($BCLI getblockcount)
 echo "  distribution TX $DTX in the mempool at height $H (CLTV $CLTV), sent by the restarted LSP"
-NREFUSED=$((NREFUSED + $(grep -ac "distribution TX [0-9a-f]* of factory [0-9]* not accepted" "$LSP_LOG")))
-echo "  broadcasts refused before it got in: $NREFUSED"
+DH=$(grep -aoE "nLockTime: distribution TX $DTX" "$LSP_LOG" | head -1)
+[ -n "$DH" ] || fail "the restarted LSP did not send it at its nLockTime"
 grep -aE "CPFP: $DTX" "$LSP_LOG" | head -2
 grep -qa "CPFP: $DTX .*sent as a package" "$LSP_LOG" || fail "distribution TX did not go in as a CPFP package under the raised relay floor"
 
@@ -190,5 +191,5 @@ grep -qa "distribution TX $DTX of factory [0-9]* re-bumped in the mempool" "$LSP
 for i in $(seq 1 30); do grep -qa "distribution TX $DTX of factory [0-9]* confirmed" "$LSP_LOG" && break; sleep 2; done
 grep -qa "distribution TX $DTX of factory [0-9]* confirmed" "$LSP_LOG" || fail "LSP did not see the confirmation"
 rm -f "$TMPDIR/mining"
-green "PASS: distribution TX at expiry: refused $NREFUSED time(s) before final, resent after an LSP restart, in as a package at the relay floor, re-bumped by the LSP restarted again when the estimate rose to $RAISED sat/vB, confirmed at height $($BCLI getblockcount)"
+green "PASS: distribution TX at expiry: held until its nLockTime across an LSP restart, sent then by the restarted LSP, in as a package at the relay floor, re-bumped by the LSP restarted again when the estimate rose to $RAISED sat/vB, confirmed at height $($BCLI getblockcount)"
 exit 0
