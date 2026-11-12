@@ -1828,6 +1828,10 @@ static int cs_fork_channel_clients(const lsp_t *lsp, int port,
             secp256k1_context *cc = cs_ctx();
             secp256k1_keypair ck;
             if (!secp256k1_keypair_create(cc, &ck, cs_seckeys[c + 1])) _exit(2);
+            /* The funding script is computed from the participants in key
+               order; the LSP orders them by these hints rather than by
+               connection order, so the factory is the one funded. */
+            client_set_slot_hint(c + 1);
             int ok = client_run_with_channels(cc, &ck, "127.0.0.1", port,
                                                cs_idle_cb, NULL, NULL, NULL);
             secp256k1_context_destroy(cc);
@@ -1879,7 +1883,7 @@ static int cs_run_inprocess_close(int honest, int *close_rc_out,
 
     if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
-                                               fund_spk, 34, 10, 4, 0))
+                                               fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */))
         setup_ok = 0;
 
     lsp_channel_mgr_t ch_mgr;
@@ -2023,7 +2027,7 @@ static int test_regtest_coop_close_refuses_lsp_payee_body(void) {
     if (setup_ok && !lsp_accept_clients(lsp)) setup_ok = 0;
     if (setup_ok && !lsp_run_factory_creation(lsp, fund_txid, fund_vout,
                                                fund_amount, fund_spk, 34,
-                                               10, 4, 0))
+                                               10, 4, 2000000 /* CLTV: a distribution TX is required */))
         setup_ok = 0;
 
     lsp_channel_mgr_t ch_mgr;

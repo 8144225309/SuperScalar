@@ -1599,7 +1599,7 @@ static int run_scale_payment_ring(int n_clients, int arity_code,
         lsp->factory.leaf_arity = (factory_arity_t)arity_code;
 
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout, funding_amount,
-                                            fund_spk, 34, 10, 4, 0)) {
+                                            fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n"); lsp_ok = 0;
     }
     if (lsp_ok)
@@ -2376,7 +2376,7 @@ int test_regtest_lsp_restart_recovery(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -2949,7 +2949,7 @@ int test_regtest_crash_double_recovery(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -3420,7 +3420,7 @@ int test_regtest_tcp_reconnect(void) {
     }
     if (lsp_ok && !lsp_run_factory_creation(lsp, funding_txid, funding_vout,
                                              funding_amount, fund_spk, 34,
-                                             10, 4, 0)) {
+                                             10, 4, 2000000 /* CLTV: a distribution TX is required */)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -4631,7 +4631,7 @@ static int run_payment_leaf_untouched(int arity_code, int port_bias) {
     LEAF_STEP(lsp_accept_clients(lsp), "accept clients");
     lsp->factory.leaf_arity = (factory_arity_t)arity_code;
     LEAF_STEP(lsp_run_factory_creation(lsp, funding_txid, funding_vout,
-                                        funding_amount, fund_spk, 34, 10, 4, 0),
+                                        funding_amount, fund_spk, 34, 10, 4, 2000000 /* CLTV: a distribution TX is required */),
               "factory creation");
     LEAF_STEP((int)lsp->factory.leaf_arity == arity_code, "requested leaf arity kept");
     LEAF_STEP(lsp->factory.n_leaf_nodes == 2, "one leaf per client");

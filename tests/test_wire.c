@@ -1013,7 +1013,7 @@ static int run_creation_until_client_error(secp256k1_context *ctx, lsp_t *lsp,
         spk[0] = 0x51; spk[1] = 0x20;
         memset(spk + 2, 0xCD, 32);
         rc = lsp_run_factory_creation(lsp, txid, 0, 100000, spk, sizeof(spk),
-                                      10, 4, 0);
+                                      10, 4, 2000000 /* CLTV: a distribution TX is required */);
     }
 
     wire_msg_t m;
