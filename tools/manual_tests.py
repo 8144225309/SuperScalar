@@ -130,6 +130,7 @@ def start_clients(n=4, port=9745, daemon=True, extra_flags=None):
                '--rpcpassword', 'rpcpass']
         if daemon:
             cmd.append('--daemon')
+            cmd.append('--enable-rotation-experimental')
         if extra_flags:
             cmd.extend(extra_flags)
         clog = open(f'/tmp/mt_client_{i}.log', 'w')

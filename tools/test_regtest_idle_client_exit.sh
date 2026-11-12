@@ -39,6 +39,11 @@
 #                      through that factory and keep doing so on later passes,
 #                      when the funding output has been spent by the client's
 #                      own root transaction.
+#   scenario "dist_omit" / "dist_locktime": the LSP leaves the distribution
+#                      transaction out of factory creation, or announces a
+#                      locktime that is not the factory's (SS_CHEAT_DIST_*
+#                      test hooks, refused on mainnet).  Every client must
+#                      refuse the factory: no channel, no commitment on disk.
 #   scenario "reconnect": client 4 is restarted right after channel open,
 #                      then pays and is paid.  Both payments must succeed and
 #                      the client must stay up (commitment 0 took nonce index
@@ -66,7 +71,8 @@
 # covers, and this test would fail on a node with the default relay floor.
 #
 # Usage: bash tools/test_regtest_idle_client_exit.sh [BUILD_DIR]
-# Env:   SCENARIOS ("idle mixed rotate rotate_stopped pending_exit reconnect")
+# Env:   SCENARIOS ("idle mixed rotate rotate_stopped pending_exit dist_omit
+#                   dist_locktime reconnect")
 #        RPCPORT (18543)
 #        PORT (29961)  KEEP (0)
 set -uo pipefail
@@ -75,7 +81,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${1:-$(dirname "$SCRIPT_DIR")/build}"
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
-SCENARIOS="${SCENARIOS:-idle mixed rotate rotate_stopped pending_exit reconnect}"
+SCENARIOS="${SCENARIOS:-idle mixed rotate rotate_stopped pending_exit dist_omit dist_locktime reconnect}"
 RPCPORT="${RPCPORT:-18543}"
 PORT="${PORT:-29961}"
 KEEP="${KEEP:-0}"
@@ -152,6 +158,7 @@ run_scenario(){
         mixed)     echo "=== scenario 'mixed': LSP + $N clients, client 1 pays client 2, clients 3 and 4 idle ===" ;;
         rotate)    echo "=== scenario 'rotate': LSP + $N clients, one payment, factory rotation, then exit from the new factory ===" ;;
         rotate_stopped) echo "=== scenario 'rotate_stopped': LSP + $N clients, the LSP dies mid-rotation before commitment 0 ===" ;;
+        dist_omit|dist_locktime) echo "=== scenario '$SC': LSP + $N clients, factory creation with a distribution TX the clients must refuse ===" ;;
         pending_exit) echo "=== scenario 'pending_exit': LSP + $N clients, no payments, exit with a rotation recorded as pending ===" ;;
         reconnect) echo "=== scenario 'reconnect': LSP + $N clients, client 4 restarted after open, then payments ===" ;;
         *)         echo "unknown scenario '$SC'"; return 1 ;;
@@ -169,6 +176,10 @@ run_scenario(){
         LSPARGS+=(--cli)
         mkfifo "$D/cli.fifo"; exec 9<>"$D/cli.fifo"
         "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 <&9 &
+    elif [ "$SC" = dist_omit ]; then
+        SS_CHEAT_DIST_OMIT=1 "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
+    elif [ "$SC" = dist_locktime ]; then
+        SS_CHEAT_DIST_LOCKTIME=1 "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
     elif [ "$SC" = rotate_stopped ]; then
         SUPERSCALAR_CRASH_AT=rotate_channel_setup "$LSP_BIN" "${LSPARGS[@]}" > "$D/lsp.log" 2>&1 </dev/null &
     else
@@ -180,7 +191,7 @@ run_scenario(){
     local i
     declare -a CPID
     start_client(){ # participant id; uses SC, P, D of the running scenario
-        local id=$1 SK EXTRA=(--daemon)
+        local id=$1 SK EXTRA=(--daemon --enable-rotation-experimental)
         SK=$(printf '%064x' $((id + 1)))
         if [ "$SC" = mixed ]; then
             [ "$id" = 1 ] && EXTRA=(--channels --send "1:$PAY_AMT:$PREIMAGE")
@@ -193,6 +204,30 @@ run_scenario(){
     }
     for i in $(seq 1 $N); do start_client "$i"; sleep 0.3; done
     ( while true; do mine 1; sleep 3; done ) & MINER_PID=$!
+
+    if [ "$SC" = dist_omit ] || [ "$SC" = dist_locktime ]; then
+        local ok=1 refused=0 n
+        for _ in $(seq 1 150); do
+            refused=0
+            for i in $(seq 1 $N); do grep -q "REFUSING factory — no acceptable distribution transaction" "$D/c$i.log" 2>/dev/null && refused=$((refused + 1)); done
+            [ "$refused" -eq $N ] && break
+            grep -q "channels ready" "$D/lsp.log" 2>/dev/null && break
+            sleep 2
+        done
+        sleep 3
+        if grep -q "channels ready" "$D/lsp.log"; then red "  CHECK FAIL the LSP reached 'channels ready'"; ok=0; fi
+        for i in $(seq 1 $N); do
+            n=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT (SELECT count(*) FROM channels) + (SELECT count(*) FROM signed_commitments);" 2>/dev/null || echo 0)
+            if grep -q "REFUSING factory — no acceptable distribution transaction" "$D/c$i.log" && [ "${n:-0}" = 0 ]; then
+                echo "  ok   client $i refused the factory ($(grep -h -oE "no fully co-signed, verified distribution transaction|distribution locktime [0-9]+ is not this factory's" "$D/c$i.log" | head -1)); nothing on disk"
+            else red "  CHECK FAIL client $i: refused=$(grep -c "REFUSING factory — no acceptable" "$D/c$i.log") channel+commitment rows=$n"; ok=0; fi
+        done
+        if [ "$SC" = dist_locktime ] && ! grep -q "distribution locktime [0-9]* is not this factory's" "$D"/c*.log; then
+            red "  CHECK FAIL no client reported the wrong locktime"; ok=0
+        fi
+        kill_ss
+        [ "$ok" = 1 ]; return $?
+    fi
 
     wait_log "channels ready" "$D/lsp.log" 400 "channels ready" || { tail -30 "$D/lsp.log"; return 1; }
     if [ "$SC" = mixed ]; then
@@ -380,7 +415,7 @@ run_scenario(){
     mine 2
     if [ "$SC" = pending_exit ]; then
         for i in $(seq 1 $N); do
-            if grep -q "is unspent, exiting through it" "$D/fc_c$i.log" && grep -q "own root transaction of the factory being left is on chain, continuing" "$D/fc_c$i.log"; then
+            if grep -q "is unspent, exiting through it" "$D/fc_c$i.log" && grep -q "own tree of the factory being left is on chain, continuing" "$D/fc_c$i.log"; then
                 echo "  ok   client $i exited through the unspent factory and continued after its own root spent the funding"
             else red "  CHECK FAIL client $i: force-close did not follow the old factory through ($(grep -c "rotation pending" "$D/fc_c$i.log") pending lines)"; restart_ok=0; fi
         done

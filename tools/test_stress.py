@@ -165,7 +165,7 @@ for i in range(4):
     cmd = [CLIENT, "--seckey", CLIENT_KEYS[i], "--port", str(PORT), "--host", "127.0.0.1",
            "--network", "regtest", "--db", f"/tmp/stress_client_{i}.db", "--fee-rate", "1000",
            "--lsp-pubkey", LSP_PUBKEY, "--rpcuser", "rpcuser", "--rpcpassword", "rpcpass",
-           "--daemon"]
+           "--daemon", "--enable-rotation-experimental"]
     c = subprocess.Popen(cmd, stdout=clog, stderr=subprocess.STDOUT, env=env)
     clients.append((c, clog))
     time.sleep(0.3)
