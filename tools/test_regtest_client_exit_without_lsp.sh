@@ -353,11 +353,22 @@ scenario_cltv() {
     [ "$tx0" = "$tx1" ] && pass "no wallet transaction" || fail "wallet transactions $tx0 -> $tx1"
     # The floor is judged at the block the factory will be created at (103
     # blocks on: 101, one more ensure_funded may mine, the funding block), and
-    # a member's exit from the default shape takes 99 blocks (+6 margin): the
-    # earliest timeout is h + 103 + 106.  One block less is refused before
-    # anything is funded; the earliest one is accepted by LSP and members.
+    # a member's exit takes the blocks the LSP stated in its first refusal
+    # (it depends on the tree shape: 39 for the default advanceless tree of
+    # 4 clients), plus its margin: the earliest timeout is
+    # h + 103 + exit + margin + 1.  One block less is refused before anything
+    # is funded; the earliest one is accepted by LSP and members.
+    local exit_b margin_b
+    exit_b=$(grep -m1 -o "a member's exit can take [0-9]* blocks (+[0-9]* margin)" "$d/past/lsp.log" |
+             sed -E 's/.*take ([0-9]+) blocks \(\+([0-9]+) margin\)/\1/')
+    margin_b=$(grep -m1 -o "a member's exit can take [0-9]* blocks (+[0-9]* margin)" "$d/past/lsp.log" |
+               sed -E 's/.*take ([0-9]+) blocks \(\+([0-9]+) margin\)/\2/')
+    if [ -z "$exit_b" ] || [ -z "$margin_b" ]; then
+        fail "no exit length in the LSP's refusal"; kill_clients; return
+    fi
+    pass "a member's exit takes $exit_b blocks (+$margin_b margin) for this shape"
     h=$(height)
-    factory_up "$d/edge" 29966 --cltv-timeout $((h + 103 + 105)) || return
+    factory_up "$d/edge" 29966 --cltv-timeout $((h + 103 + exit_b + margin_b)) || return
     for _ in $(seq 1 60); do kill -0 "$LSP_PID" 2>/dev/null || break; sleep 1; done
     if kill -0 "$LSP_PID" 2>/dev/null; then fail "LSP accepted a timeout one block below the floor"; stop "$LSP_PID"
     else
@@ -368,7 +379,7 @@ scenario_cltv() {
         pass "nothing funded"
     kill_clients
     h=$(height)
-    factory_up "$d/floor" 29967 --daemon --cltv-timeout $((h + 103 + 106)) || return
+    factory_up "$d/floor" 29967 --daemon --cltv-timeout $((h + 103 + exit_b + margin_b + 1)) || return
     if wait_grep "$d/floor/lsp.log" "entering daemon mode" 400; then  # no mining: members judge by their own tip
         pass "the earliest timeout is accepted by the LSP and every member"
     else

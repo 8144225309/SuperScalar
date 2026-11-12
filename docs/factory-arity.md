@@ -11,6 +11,57 @@ refuse to accept forwards because the worst-case exit time exceeds what
 they consider safe. This doc explains the tradeoff and recommends
 shapes.
 
+## The default tree: advanceless
+
+When the LSP is started without `--arity`, `--static-near-root` and
+`--ps-subfactory-arity`, it builds the **advanceless** tree: every interior
+level is static (kickoff only, no Decker-Wattenhofer state transaction) and
+every leaf is a pseudo-Spilman leaf holding one member.  No transaction in
+the tree carries a relative lock, so the exit delay is zero: a member's exit
+is its path of kickoffs plus its leaf state, each confirming in the next
+block.
+
+The shape for N clients:
+
+- depth `d` = the fewest fan-out levels with `15^d >= N` (a node has room
+  for 15 children next to its P2A anchor: `FACTORY_MAX_OUTPUTS` = 16);
+- fan-out `F` = the smallest `F >= 4` with `F^d >= N`, the narrowest fan-out
+  that still gives every member its own leaf at depth `d` (so no kickoff
+  carries more outputs than it needs; `1`, `2` and `3` are leaf kinds in an
+  arity list, so a plain fan-out starts at 4);
+- the LSP then runs as if given `--arity F,...,F,3` (`d` entries of `F`)
+  `--static-near-root d`, and logs the shape it chose.
+
+| Clients | Shape | Depth | Tree txs | Exit path (txs) |
+|---|---|---|---|---|
+| 1 | `3` | 0 | 2 | 2 |
+| 2-15 | `N,3` (4 for N < 4) static 1 | 1 | 1 + 2N | 3 |
+| 16 | `4,4,3` static 2 | 2 | 37 | 4 |
+| 64 | `8,8,3` static 2 | 2 | 137 | 4 |
+| 128 | `12,12,3` static 2 | 2 | 269 | 4 |
+| 226-255 | `7,7,7,3` static 3 | 3 | 567 at 255 | 5 |
+
+FACTORY_PROPOSE carries the shape (`level_arity`, `static_threshold_depth`),
+so members build the same tree; the LSP stores it with the factory (schema
+v40) and a restarted LSP or a reconnecting member rebuilds the tree from it.
+A reload whose rebuilt tree differs from the signed tree in the database
+(each stored transaction must hash to its txid and spend its parent's stored
+output, the root the funding outpoint) is refused, and so is a factory with
+no stored tree; an LSP whose factory is refused stops instead of starting a
+new one.
+
+**Life extension is rotation only.**  An advanceless tree has no state layer
+to advance, so every refresh-in-place path refuses it with one message: the
+root tick (`factory_tick_root`, `lsp_factory_tick_root`), the whole-counter
+advance (`factory_advance`), the root rollover of a DW or pseudo-Spilman leaf
+advance, a member's root-driven Tier B, and `--test-tier-b-rollover`.  A
+factory's life is extended only by rotating its members to a new factory
+(a new funding output).  Decker-Wattenhofer state layers return with
+liquidity sales; the shapes below stay available with an explicit `--arity`.
+
+Any explicit shape option turns the default off: `--arity` alone keeps DW
+state on every interior level, as before.
+
 **See also:** [docs/pseudo-spilman.md](pseudo-spilman.md) — design and
 non-revocability contract for PS leaves: why they have no revocation
 keys, and how the `client_ps_signed_inputs` persist table prevents
@@ -18,8 +69,8 @@ double-signing.
 
 ## Pseudo-Spilman is the canonical leaf
 
-For new deployments, **use `--arity 3` (Pseudo-Spilman)** at the leaf
-level. PS is the headline ZmnSCPxj design and offers strict advantages
+For an explicit shape, **use `--arity 3` (Pseudo-Spilman)** at the leaf
+level (the advanceless default above already does). PS is the headline ZmnSCPxj design and offers strict advantages
 over the older Decker-Wattenhofer leaf mechanisms:
 
 | Property | DW arity-1/-2 (legacy) | PS arity-3 (canonical) |

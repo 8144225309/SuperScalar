@@ -407,6 +407,7 @@ int test_client_persist_reload(void) {
     memset(fake_spk + 2, 0xAA, 32);
     factory_compute_funding_spk(factory, fake_spk);
     factory_set_funding(factory, fake_txid, 0, 100000, fake_spk, 34);
+    factory->use_tree_anchor = 1;  /* as persist_load_factory rebuilds it */
     TEST_ASSERT(factory_build_tree(factory), "factory_build_tree");
 
     /* Initialize a channel (client 0 = participant index 1) */
@@ -425,6 +426,7 @@ int test_client_persist_reload(void) {
 
     /* Save factory */
     TEST_ASSERT(persist_save_factory(&db, factory, ctx, 0), "persist_save_factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, factory, 0), "persist_save_tree_nodes");
 
     /* Save channel */
     TEST_ASSERT(persist_save_channel(&db, &ch, 0, 0), "persist_save_channel");

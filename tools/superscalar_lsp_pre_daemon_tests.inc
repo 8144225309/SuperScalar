@@ -1748,7 +1748,15 @@
                lsp_channels_advance_ps_leaf drives lsp_advance_leaf, which
                works for any per-client leaf arity. The gate was stale
                (predated PS arity introduction). */
-            if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
+            if (factory_refuses_refresh_in_place(&lsp_p->factory,
+                                                 "--test-tier-b-rollover")) {
+                /* An advanceless tree has nothing to roll over: the test
+                   needs a shape with DW layers (e.g. --arity 3 without
+                   --static-near-root). */
+                printf("TIER B ROLLOVER TEST: REFUSED (the tree has no DW state "
+                       "layer; run it on a shape with one)\n");
+                rollover_pass = 0;
+            } else if (lsp_p->factory.leaf_arity != FACTORY_ARITY_1 &&
                 lsp_p->factory.leaf_arity != FACTORY_ARITY_PS) {
                 printf("  SKIP: --test-tier-b-rollover requires --arity 1 (DW) or --arity 3 (PS)\n");
                 printf("TIER B ROLLOVER TEST: SKIP (gate=arity)\n");

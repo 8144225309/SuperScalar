@@ -228,18 +228,20 @@ static void usage(const char *prog) {
         "                      'rotate'). Off by default: a DYING factory keeps serving\n"
         "                      its channels until it expires. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
-        "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
-        "                       Comma-separated activates TRUE N-way mixed arity per level\n"
-        "                       (root..leaves). Each value must be 1-15. Canonical shapes:\n"
-        "                       up to 16 clients => 3 (uniform PS); 17-32 => 3,4; 33-64 =>\n"
-        "                       3,4,8 (or 2,4,8 for DW leaves); 65-128 => 2,4,8 (with\n"
-        "                       --static-near-root 1 or 2). See docs/factory-arity.md.\n"
+        "  --arity N|N,N,...   Tree shape.  Without --arity, --static-near-root and\n"
+        "                       --ps-subfactory-arity the LSP builds the ADVANCELESS tree:\n"
+        "                       every interior level static (kickoff only, no DW state),\n"
+        "                       one member per pseudo-Spilman leaf, depth = fewest levels\n"
+        "                       with 15^depth >= clients, fan-out = smallest F >= 4 with\n"
+        "                       F^depth >= clients (4 clients => 4,3 static 1; 64 => 8,8,3\n"
+        "                       static 2; 255 => 7,7,7,3 static 3).  Its life is extended\n"
+        "                       only by rotation.  Explicit shapes: 1=DW, 2=DW, 3=PS\n"
+        "                       (uniform); a comma list sets the arity per level (root..\n"
+        "                       leaves, each 1-15).  See docs/factory-arity.md.\n"
         "  --static-near-root N  Top N tree depths are kickoff-only (no paired NODE_STATE,\n"
-        "                       no DW counter, only CLTV timeout escape). Reduces total\n"
-        "                       CSV consumption from those layers to zero. Range 0..7\n"
-        "                       (FACTORY_MAX_LEVELS-1); 0 = disabled (default). Canonical\n"
-        "                       128-client deployment is --arity 2,4,8 --static-near-root 2\n"
-        "                       (ewt 432 blocks under BOLT 2016 with mainnet defaults).\n"
+        "                       no DW counter, only CLTV timeout escape). Range 0..7\n"
+        "                       (FACTORY_MAX_LEVELS-1).  With --arity and no\n"
+        "                       --static-near-root the shape keeps DW state on every level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --test-burn         After factory creation (+ demo), broadcast tree and burn L-stock via shachain\n"
         "  --enable-hashlock-poison  Build the factory with hashlock-gated L-stock\n"
@@ -1368,12 +1370,15 @@ int main(int argc, char *argv[]) {
     int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
     int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
-    int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
-                                        (1, 2 = legacy DW; 3 = PS canonical) */
+    int leaf_arity = 3;              /* with --arity: 1, 2 = DW; 3 = PS.  Without
+                                        any shape option the advanceless default
+                                        replaces it (factory_advanceless_shape) */
     uint8_t level_arities[FACTORY_MAX_LEVELS];
     size_t n_level_arity = 0;        /* 0 = uniform leaf_arity */
-    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only.
-                                        0 = disabled (default for backward compat) */
+    uint32_t static_near_root = 0;   /* Phase 3: depths < N are kickoff-only. */
+    int shape_given = 0;             /* --arity / --static-near-root /
+                                        --ps-subfactory-arity on the command
+                                        line; otherwise the advanceless shape */
     int force_close = 0;
     int test_burn = 0;
     int enable_hashlock_poison = 0;  /* #53 Phase 3: hashlock-gated L-stock poison */
@@ -1726,8 +1731,10 @@ int main(int argc, char *argv[]) {
             test_subfactory_advance = 1;
             cheat_subfactory_after_advance = 1;
         }
-        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--ps-subfactory-arity") == 0 && i + 1 < argc) {
             ps_subfactory_arity_arg = atoi(argv[++i]);
+            shape_given = 1;
+        }
         else if (strcmp(argv[i], "--test-jit") == 0)
             test_jit = 1;
         else if (strcmp(argv[i], "--test-lsps2") == 0)
@@ -1779,6 +1786,7 @@ int main(int argc, char *argv[]) {
             uint8_t parsed[FACTORY_MAX_LEVELS];
             size_t n_parsed = 0;
             int parsed_leaf = 0;
+            shape_given = 1;
             if (!cli_parse_arity_spec(arity_str, parsed, FACTORY_MAX_LEVELS,
                                        &n_parsed, &parsed_leaf,
                                        err, sizeof(err))) {
@@ -1802,6 +1810,7 @@ int main(int argc, char *argv[]) {
                Phase 4: parsing delegated to cli_parse_static_near_root(). */
             char err[256];
             uint32_t v = 0;
+            shape_given = 1;
             if (!cli_parse_static_near_root(argv[++i], &v, err, sizeof(err))) {
                 fprintf(stderr, "%s\n", err);
                 return 1;
@@ -2533,6 +2542,36 @@ int main(int argc, char *argv[]) {
                 FACTORY_MAX_SIGNERS - 1);
         return 1;
     }
+    /* Default tree: the advanceless shape for this many clients (see
+       factory_advanceless_shape and --help). */
+    if (!shape_given) {
+        uint8_t dflt[FACTORY_MAX_LEVELS];
+        size_t n_dflt = 0;
+        uint32_t dflt_static = 0;
+        if (!factory_advanceless_shape((size_t)n_clients, dflt, &n_dflt, &dflt_static)) {
+            fprintf(stderr, "Error: no advanceless tree shape for %d clients\n", n_clients);
+            return 1;
+        }
+        if (n_dflt == 1) {
+            leaf_arity = dflt[0];
+            n_level_arity = 0;
+        } else {
+            memcpy(level_arities, dflt, n_dflt);
+            n_level_arity = n_dflt;
+            leaf_arity = dflt[n_dflt - 1];
+        }
+        static_near_root = dflt_static;
+        char shape_str[FACTORY_MAX_LEVELS * 4 + 1] = "";
+        for (size_t k = 0; k < n_dflt; k++) {
+            size_t off = strlen(shape_str);
+            snprintf(shape_str + off, sizeof(shape_str) - off, "%s%u",
+                     k ? "," : "", (unsigned)dflt[k]);
+        }
+        printf("LSP: tree shape: advanceless default for %d clients "
+               "(--arity %s --static-near-root %u)\n",
+               n_clients, shape_str, (unsigned)dflt_static);
+    }
+
     /* In uniform mode (no comma list) the leaf semantics are 1, 2, or 3;
        in mixed mode the LAST entry can be any 1..15 since interior arities
        are pure fan-out (Phase 2). */
@@ -2993,7 +3032,28 @@ int main(int argc, char *argv[]) {
     if (use_db && daemon_mode) {
         factory_t *rec_f = calloc(1, sizeof(factory_t));
         if (!rec_f) { fprintf(stderr, "LSP: alloc failed\n"); return 1; }
-        if (persist_load_factory(&db, 0, rec_f, ctx)) {
+        int rec_loaded = persist_load_factory(&db, 0, rec_f, ctx);
+        if (!rec_loaded) {
+            free(rec_f);
+            rec_f = NULL;
+            if (persist_has_factory(&db, 0) && persist_factory_is_closed(&db, 0)) {
+                /* A closed factory is history: nothing is left to serve. */
+                printf("LSP: the closed factory in %s is not loaded; "
+                       "starting a new factory\n", db_path);
+            } else if (persist_has_factory(&db, 0)) {
+                /* The DB holds a factory this LSP must keep serving (its
+                   members' exits, the distribution TX, the watchtower), but it
+                   cannot be loaded as the signed tree (reason above).  Never
+                   fall through to a new factory over it. */
+                fprintf(stderr, "LSP: the factory in %s cannot be loaded "
+                        "(see above); refusing to start\n", db_path);
+                persist_close(&db);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
+        if (rec_loaded) {
             if (rec_f->n_participants < 2) {
                 fprintf(stderr, "LSP recovery: corrupt factory (n_participants=%zu)\n",
                         rec_f->n_participants);
@@ -4676,7 +4736,8 @@ accept_new_factory:
                via split-round MuSig2 with all participants.  Skip when
                --test-burn is set so the burn test can broadcast the
                correctly-signed epoch-0 tree. */
-            if (!test_burn && dw_counter_advance(&lsp_p->factory.counter)) {
+            if (!test_burn && factory_has_dw_state(&lsp_p->factory) &&
+                dw_counter_advance(&lsp_p->factory.counter)) {
                 uint32_t epoch = dw_counter_epoch(&lsp_p->factory.counter);
                 printf("LSP: DW advanced to epoch %u (delays:", epoch);
                 for (uint32_t li = 0; li < lsp_p->factory.counter.n_layers; li++) {

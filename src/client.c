@@ -5489,6 +5489,10 @@ static int client_handle_state_advance_stateless(int fd,
         int max_steps = (int)(factory->states_per_layer + 2);
         if (max_steps < 4) max_steps = 4;
         if (trigger_leaf_side < 0) {
+            if (factory_refuses_refresh_in_place(factory, "Client: root-driven Tier B")) {
+                client_send_error(fd, "root advance refused: no DW state; rotate the factory");
+                return 0;
+            }
             for (int s = 0; s < max_steps; s++) {
                 adv_rc = factory_tick_root(factory);
                 if (adv_rc == -1) break;
