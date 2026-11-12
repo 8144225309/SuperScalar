@@ -44,8 +44,11 @@ The shape for N clients:
 FACTORY_PROPOSE carries the shape (`level_arity`, `static_threshold_depth`),
 so members build the same tree; the LSP stores it with the factory (schema
 v40) and a restarted LSP or a reconnecting member rebuilds the tree from it.
-A reload whose rebuilt tree differs from the signed tree in the database is
-refused.
+A reload whose rebuilt tree differs from the signed tree in the database
+(each stored transaction must hash to its txid and spend its parent's stored
+output, the root the funding outpoint) is refused, and so is a factory with
+no stored tree; an LSP whose factory is refused stops instead of starting a
+new one.
 
 **Life extension is rotation only.**  An advanceless tree has no state layer
 to advance, so every refresh-in-place path refuses it with one message: the
