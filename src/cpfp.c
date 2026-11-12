@@ -852,6 +852,11 @@ static regtest_t *g_cpfp_rt;
 static wallet_source_t *g_cpfp_wallet;
 static fee_estimator_t *g_cpfp_urgent;
 static uint64_t g_cpfp_max_child_fee;
+static fee_target_t g_cpfp_target = FEE_TARGET_URGENT;
+
+void cpfp_set_default_target(fee_target_t target) {
+    g_cpfp_target = target;
+}
 
 void cpfp_set_default(regtest_t *rt, wallet_source_t *wallet, fee_estimator_t *urgent,
                       uint64_t max_child_fee) {
@@ -865,7 +870,7 @@ cpfp_result_t cpfp_send_default(chain_backend_t *cb, const char *tx_hex,
                                 char *txid_out) {
     if (g_cpfp_rt) {
         uint64_t target = (g_cpfp_urgent && g_cpfp_urgent->get_rate)
-            ? g_cpfp_urgent->get_rate(g_cpfp_urgent, FEE_TARGET_URGENT) : 0;
+            ? g_cpfp_urgent->get_rate(g_cpfp_urgent, g_cpfp_target) : 0;
         return cpfp_send_presigned(g_cpfp_rt, g_cpfp_wallet, target,
                                    g_cpfp_max_child_fee, tx_hex, txid_out);
     }

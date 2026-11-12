@@ -547,20 +547,31 @@ static void tree_shape_apply(factory_t *f, const tree_shape_t *s) {
     f->economic_mode = s->econ;
 }
 
-int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
-                              uint64_t funding_amount, uint16_t step_blocks,
-                              uint32_t states_per_layer, uint64_t rate,
-                              uint64_t *min_usable_out) {
+int lsp_plan_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                  uint64_t funding_amount, uint16_t step_blocks,
+                  uint32_t states_per_layer, uint64_t rate,
+                  uint64_t *min_usable_out, char *why, size_t why_len) {
+    char dummy[8];
+    if (!why || why_len == 0) { why = dummy; why_len = sizeof(dummy); }
+    why[0] = '\0';
     if (min_usable_out) *min_usable_out = 0;
     if (!lsp || !cfg || n_clients == 0 || n_clients > lsp->n_clients ||
-        n_clients + 1 > FACTORY_MAX_SIGNERS)
+        n_clients + 1 > FACTORY_MAX_SIGNERS) {
+        snprintf(why, why_len, "%zu clients", n_clients);
         return 0;
+    }
+    if (n_clients > FACTORY_MAX_DIST_CLIENTS) {
+        snprintf(why, why_len, "%zu clients: the distribution TX would not fit a "
+                 "%d vB TRUC transaction (at most %d clients)", n_clients,
+                 TRUC_MAX_VSIZE, FACTORY_MAX_DIST_CLIENTS);
+        return 0;
+    }
     secp256k1_pubkey pks[FACTORY_MAX_SIGNERS];
     pks[0] = lsp->lsp_pubkey;
     for (size_t i = 0; i < n_clients; i++)
         pks[i + 1] = lsp->client_pubkeys[i];
     factory_t *t = calloc(1, sizeof(factory_t));
-    if (!t) return 0;
+    if (!t) { snprintf(why, why_len, "out of memory"); return 0; }
     tree_shape_t shape;
     tree_shape_of(cfg, &shape);
     factory_init_from_pubkeys(t, lsp->ctx, pks, n_clients + 1, step_blocks,
@@ -569,6 +580,7 @@ int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients
     t->tree_fee_rate = rate;
     t->use_tree_anchor = 1;
     t->build_quiet = 1;
+    t->cltv_timeout = 1;   /* any CLTV: a distribution TX exists */
     unsigned char txid[32], spk[34];
     memset(txid, 0x5a, sizeof(txid));
     spk[0] = 0x51;
@@ -576,6 +588,44 @@ int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients
     memset(spk + 2, 0x5a, 32);
     factory_set_funding(t, txid, 0, funding_amount, spk, sizeof(spk));
     int ok = factory_build_tree(t);
+    if (!ok)
+        snprintf(why, why_len, "no %zu-client tree of this shape can be built from "
+                 "%llu sat at %llu sat/kvB", n_clients,
+                 (unsigned long long)funding_amount, (unsigned long long)rate);
+    /* the same distribution TX the ceremony co-signs, so the check covers it */
+    if (ok) {
+        tx_output_t *douts = calloc(n_clients + 1, sizeof(tx_output_t));
+        size_t nd = douts ? factory_compute_distribution_outputs_balanced(t, douts,
+                                n_clients + 1, factory_distribution_fee(t, n_clients),
+                                lsp->dist_client_amounts, lsp->dist_n_client_amounts) : 0;
+        if (nd == 0 || !factory_build_distribution_tx_unsigned(t, douts, nd, 1)) {
+            snprintf(why, why_len, "the distribution TX cannot be built");
+            ok = 0;
+        }
+        free(douts);
+    }
+    if (ok && !factory_check_tree_fees(t, why, why_len))
+        ok = 0;
+    /* A node without an anchor cannot be bumped: it relays only while the
+       agreed rate meets the node's floor. */
+    if (ok && !lsp->allow_anchorless_tree) {
+        for (size_t i = 0; i < t->n_nodes; i++) {
+            const factory_node_t *n = &t->nodes[i];
+            int has = 0;
+            for (size_t k = 0; k < n->n_outputs; k++)
+                if (n->outputs[k].script_pubkey_len == P2A_SPK_LEN &&
+                    memcmp(n->outputs[k].script_pubkey, P2A_SPK, P2A_SPK_LEN) == 0)
+                    has = 1;
+            if (!has) {
+                snprintf(why, why_len, "tree node %zu (%s) has no P2A anchor: it could "
+                         "not be fee-bumped (n-way leaves and sub-factories carry none "
+                         "yet; --allow-anchorless-tree accepts it for tests)", i,
+                         n->type == NODE_PS_SUBFACTORY ? "sub-factory" : "leaf");
+                ok = 0;
+                break;
+            }
+        }
+    }
     /* the base commitment fee lsp_channels_init reserves (the agreed rate) */
     uint64_t commit_fee = fee_commitment_tx_at(rate, 0);
     uint64_t min_usable = UINT64_MAX;
@@ -584,6 +634,7 @@ int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients
         uint32_t vout = 0;
         if (!factory_client_to_leaf(t, c, &node_idx, &vout) ||
             vout >= t->nodes[node_idx].n_outputs) {
+            snprintf(why, why_len, "client %zu has no channel output", c);
             ok = 0;
             break;
         }

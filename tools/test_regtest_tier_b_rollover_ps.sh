@@ -37,7 +37,7 @@ PS_SUB_ARITY="${PS_SUB_ARITY:-0}"
 # unilateral exit.
 FORCE_CLOSE="${FORCE_CLOSE:-0}"
 EXTRA_LSP_FLAGS=""
-[ "$PS_SUB_ARITY" -gt 0 ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --ps-subfactory-arity $PS_SUB_ARITY"
+[ "$PS_SUB_ARITY" -gt 0 ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --allow-anchorless-tree --ps-subfactory-arity $PS_SUB_ARITY"
 [ "$FORCE_CLOSE" = "1" ] && EXTRA_LSP_FLAGS="$EXTRA_LSP_FLAGS --force-close"
 TMPSUFFIX=""
 [ "$PS_SUB_ARITY" -gt 0 ] && TMPSUFFIX="-k${PS_SUB_ARITY}"

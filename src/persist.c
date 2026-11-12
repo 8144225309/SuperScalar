@@ -1,5 +1,6 @@
 #include "superscalar/persist.h"
 #include "superscalar/chain_backend.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
@@ -1400,12 +1401,11 @@ int persist_open(persist_t *p, const char *path) {
        tree is rebuilt from it on load, so it must match what was signed.  0
        is a valid rate, so rows written before v40 (whose trees paid a flat
        per-node fee) get NULL and are refused on load.  fee_per_tx keeps the
-       mean per-node fee, for reporting. */
-    if (db_version < 40) {
-        sqlite3_exec(p->db,
-            "ALTER TABLE factories ADD COLUMN tree_fee_rate INTEGER;",
-            NULL, NULL, NULL);
-    }
+       mean per-node fee, for reporting.  Added whenever missing (an ALTER of
+       a column that exists fails harmlessly), whatever db_version says. */
+    sqlite3_exec(p->db,
+        "ALTER TABLE factories ADD COLUMN tree_fee_rate INTEGER;",
+        NULL, NULL, NULL);
     /* v40 (cont.): the rate a channel's commitment pays (the factory's
        agreed rate), separate from the penalty/HTLC rate fee_rate_sat_per_kvb.
        Rows written before it get 1000, the rate both were then. */
@@ -4311,8 +4311,10 @@ int persist_retry_pending_broadcasts(persist_t *p, chain_backend_t *chain) {
                 continue;
         }
 
+        /* Through the CPFP path: a pre-signed tx below the node's floor (a
+           tree at a low or zero agreed rate) gets in only with a child. */
         char txid_out[65] = {0};
-        if (chain->send_raw_tx(chain, raw_hex, txid_out)) {
+        if (cpfp_send_default(chain, raw_hex, txid_out) != CPFP_FAILED) {
             fprintf(stderr, "Watchtower: retry broadcast succeeded: %s\n", txid_out);
             /* Mark as ok */
             const char *upd = "UPDATE broadcast_log SET result='ok', txid=? WHERE id=?;";

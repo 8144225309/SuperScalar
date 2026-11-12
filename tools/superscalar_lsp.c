@@ -280,6 +280,8 @@ static void usage(const char *prog) {
         "                      distribution TX, commitments): a factory term the members\n"
         "                      check (default 100 = 0.1 sat/vB; 0 = no fee, every tx goes\n"
         "                      out with a CPFP child)\n"
+        "  --allow-anchorless-tree  Tests only: fund a tree with nodes that carry no P2A\n"
+        "                      anchor (n-way leaves, sub-factories) and cannot be bumped\n"
         "  --dynamic-fees      Force dynamic fee estimation via estimatesmartfee (default: always on)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
@@ -1428,6 +1430,7 @@ int main(int argc, char *argv[]) {
     uint16_t step_blocks = 10;
     uint64_t fee_rate = 1000;  /* sat/kvB, default 1 sat/vB */
     uint64_t tree_fee_rate_arg = FACTORY_DEFAULT_TREE_FEE_RATE;  /* --tree-fee-rate */
+    int allow_anchorless_tree = 0;   /* --allow-anchorless-tree (tests) */
     int bump_budget_pct = 0;       /* --bump-budget-pct (0 = default 50%) */
     uint64_t max_bump_fee = 0;     /* --max-bump-fee (0 = default 50000 sats) */
     const char *seckey_hex = NULL;
@@ -1673,6 +1676,8 @@ int main(int argc, char *argv[]) {
             fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--tree-fee-rate") == 0 && i + 1 < argc)
             tree_fee_rate_arg = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--allow-anchorless-tree") == 0)
+            allow_anchorless_tree = 1;
         else if (strcmp(argv[i], "--backup-dir") == 0 && i + 1 < argc)
             backup_dir = argv[++i];
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
@@ -3098,6 +3103,7 @@ int main(int argc, char *argv[]) {
                 secp256k1_context_destroy(ctx);
                 return 1;
             }
+            lsp_rp->allow_anchorless_tree = allow_anchorless_tree;
             g_lsp = lsp_rp;
             /* Recovery path uses persisted state — require_slot_hints would
                only kick in for new client reconnections; honor same policy
@@ -3567,6 +3573,7 @@ accept_new_factory:
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    lsp_p->allow_anchorless_tree = allow_anchorless_tree;
     g_lsp = lsp_p;
     /* Task #205: plumb the optional persist handle so lsp_run_factory_creation
        can call the SF-CEREMONY-HELPERS API.  g_db is NULL unless --db was
@@ -3950,15 +3957,22 @@ accept_new_factory:
     lsp_p->factory.placement_mode = (placement_mode_t)placement_mode_arg;
     lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
 
-    /* A factory with a distribution TX pays every client an output of it,
-       which must fit one TRUC transaction: refused before any funding. */
-    if (lsp_p->n_clients > FACTORY_MAX_DIST_CLIENTS) {
-        fprintf(stderr, "LSP: refusing to fund the factory: %zu clients, more than the "
-                "%d whose distribution TX fits in %d vB (TRUC); nothing was funded\n",
-                lsp_p->n_clients, FACTORY_MAX_DIST_CLIENTS, TRUC_MAX_VSIZE);
-        lsp_cleanup(lsp_p);
-        secp256k1_context_destroy(ctx);
-        return 1;
+    /* Before any funding: the tree and distribution TX this factory would
+       have, built and checked as every member will check them (exact
+       agreed rate, anchors, distribution TX within TRUC limits).  A shape,
+       rate or client count that fails is refused here, nothing funded. */
+    {
+        char why[256];
+        uint64_t min_usable = 0;
+        if (!lsp_plan_tree(lsp_p, &lsp_p->factory, lsp_p->n_clients, funding_sats,
+                           step_blocks, states_per_layer, tree_fee_rate_arg,
+                           &min_usable, why, sizeof(why))) {
+            fprintf(stderr, "LSP: refusing to fund the factory: %s; nothing was funded\n",
+                    why);
+            lsp_cleanup(lsp_p);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
     }
 
     /* === Phase 3: Fund the factory === */

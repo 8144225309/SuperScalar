@@ -786,3 +786,78 @@ int test_tree_fee_overflow_fails(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- the LSP's trial build before funding ---------------------------- */
+
+static lsp_t *plan_lsp(secp256k1_context *ctx, size_t n) {
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    if (!lsp) return NULL;
+    lsp->ctx = ctx;
+    lsp->n_clients = n;
+    lsp->client_pubkeys = calloc(n, sizeof(secp256k1_pubkey));
+    if (!lsp->client_pubkeys) { free(lsp); return NULL; }
+    for (size_t i = 0; i <= n; i++) {
+        unsigned char sk[32];
+        memset(sk, 0, 32);
+        sk[30] = (unsigned char)((i + 1) >> 8);
+        sk[31] = (unsigned char)(i + 1);
+        secp256k1_keypair kp;
+        secp256k1_pubkey pk;
+        if (!secp256k1_keypair_create(ctx, &kp, sk) ||
+            !secp256k1_keypair_pub(ctx, &pk, &kp)) return NULL;
+        if (i == 0) lsp->lsp_pubkey = pk; else lsp->client_pubkeys[i - 1] = pk;
+    }
+    return lsp;
+}
+
+/* Before anything is funded the LSP builds the tree and distribution TX and
+   checks them as the members will: a shape with an anchorless node is
+   refused unless explicitly allowed (tests), rate 0 with one is refused
+   anyway, and more than 230 clients are refused. */
+int test_tree_fee_lsp_plan_before_funding(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    lsp_t *lsp = plan_lsp(ctx, 240);
+    TEST_ASSERT(lsp, "lsp");
+    char why[256];
+    uint64_t cap = 0;
+    factory_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.leaf_arity = FACTORY_ARITY_2;
+    TEST_ASSERT(lsp_plan_tree(lsp, &cfg, 4, 400000, 4, 4, 100, &cap, why, sizeof(why)), why);
+    TEST_ASSERT(cap > 0, "capacity");
+    TEST_ASSERT(lsp_plan_tree(lsp, &cfg, 4, 400000, 4, 4, 0, &cap, why, sizeof(why)), why);
+    /* the default 1.0 shapes carry an anchor on every node */
+    cfg.leaf_arity = FACTORY_ARITY_1;
+    TEST_ASSERT(lsp_plan_tree(lsp, &cfg, 8, 800000, 4, 4, 100, &cap, why, sizeof(why)), why);
+    cfg.leaf_arity = FACTORY_ARITY_PS;
+    TEST_ASSERT(lsp_plan_tree(lsp, &cfg, 8, 800000, 4, 4, 100, &cap, why, sizeof(why)), why);
+    /* n-way leaves (level arities 2,4) carry none */
+    factory_t *mixed = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(mixed, "alloc");
+    uint8_t levels[2] = { 2, 4 };
+    factory_set_level_arity(mixed, levels, 2);
+    TEST_ASSERT(!lsp_plan_tree(lsp, mixed, 8, 800000, 4, 4, 100, &cap, why, sizeof(why)),
+                "anchorless node refused before funding");
+    TEST_ASSERT(strstr(why, "no P2A anchor") != NULL, why);
+    lsp->allow_anchorless_tree = 1;
+    TEST_ASSERT(lsp_plan_tree(lsp, mixed, 8, 800000, 4, 4, 100, &cap, why, sizeof(why)), why);
+    TEST_ASSERT(!lsp_plan_tree(lsp, mixed, 8, 800000, 4, 4, 0, &cap, why, sizeof(why)),
+                "anchorless node at rate 0 refused even when allowed");
+    lsp->allow_anchorless_tree = 0;
+    factory_free(mixed);
+    free(mixed);
+    /* more than 230 clients */
+    cfg.leaf_arity = FACTORY_ARITY_2;
+    TEST_ASSERT(!lsp_plan_tree(lsp, &cfg, 231, 100000000, 4, 4, 100, &cap, why, sizeof(why)),
+                "231 clients refused");
+    TEST_ASSERT(strstr(why, "230") != NULL, why);
+    TEST_ASSERT(lsp_plan_tree(lsp, &cfg, 230, 100000000, 4, 4, 100, &cap, why, sizeof(why)), why);
+    /* a funding too small for the shape */
+    TEST_ASSERT(!lsp_plan_tree(lsp, &cfg, 4, 1500, 4, 4, 100, &cap, why, sizeof(why)),
+                "unbuildable tree refused");
+    free(lsp->client_pubkeys);
+    free(lsp);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -391,6 +391,13 @@ void watchtower_on_reorg(watchtower_t *wt, int new_tip, int old_tip);
 /* Build a CPFP child tx to bump a stuck penalty tx.
    Uses anchor output from penalty tx + wallet UTXO.
    Returns 1 on success, 0 on failure. */
+/* Broadcast a pre-signed tx: through bitcoind RPC (wt->rt) it goes alone
+   when it pays enough, else as a package with a CPFP child on its P2A
+   anchor funded from wt->wallet, at the URGENT rate; without RPC, a plain
+   send through the chain backend.  Returns 1 if it is in the mempool or a
+   block. */
+int watchtower_send_presigned(watchtower_t *wt, const char *hex, char *txid_out);
+
 int watchtower_build_cpfp_tx(watchtower_t *wt,
                                tx_buf_t *cpfp_tx_out,
                                const char *parent_txid,

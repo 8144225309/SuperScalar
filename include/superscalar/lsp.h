@@ -48,6 +48,9 @@ typedef struct {
 
     /* Listen socket */
     int listen_fd;
+    /* 1: lsp_plan_tree accepts a tree with anchorless nodes (n-way leaves,
+       sub-factories): tests only (--allow-anchorless-tree). */
+    int allow_anchorless_tree;
     int port;
 
     /* Accept timeout: max seconds to wait for each client connection.
@@ -117,16 +120,20 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
    Returns 1 when all clients connected. */
 int lsp_accept_clients(lsp_t *lsp);
 
-/* The usable capacity (leaf channel output less the base commitment fee,
-   as lsp_channels_init computes it) of the smallest client channel in the
-   tree a factory of cfg's shape, the LSP and n_clients of its clients and
-   funding_amount would have at the agreed rate (sat/kvB).  Built without
-   signing.  Returns 1 with *min_usable_out; 0 if that tree cannot be
-   built. */
-int lsp_plan_channel_capacity(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
-                              uint64_t funding_amount, uint16_t step_blocks,
-                              uint32_t states_per_layer, uint64_t rate,
-                              uint64_t *min_usable_out);
+/* Before anything is funded (a new factory, a rotation): build, without
+   signing, the tree and distribution TX a factory of cfg's shape, the LSP
+   and n_clients of its clients and funding_amount would have at the agreed
+   rate (sat/kvB), and check them as every member will
+   (factory_check_tree_fees), plus the client limit of the distribution TX
+   and, unless lsp->allow_anchorless_tree, a P2A anchor on every node.
+   Returns 1 with *min_usable_out, the usable capacity (leaf channel output
+   less the base commitment fee, as lsp_channels_init computes it) of the
+   smallest client channel; 0 with the reason in why when such a factory
+   must not be funded. */
+int lsp_plan_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
+                  uint64_t funding_amount, uint16_t step_blocks,
+                  uint32_t states_per_layer, uint64_t rate,
+                  uint64_t *min_usable_out, char *why, size_t why_len);
 
 /* Run full factory creation ceremony over the wire.
    funding_txid: internal byte order, already funded.

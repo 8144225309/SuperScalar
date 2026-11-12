@@ -21,7 +21,7 @@ extern void sha256_double(const unsigned char *data, size_t len, unsigned char *
 /* Broadcast a pre-signed response: through bitcoind RPC it goes alone when it
    pays enough, else as a package with a CPFP child on its P2A anchor (funded
    from wt->wallet); without RPC, a plain send through the chain backend. */
-static int wt_send_presigned(watchtower_t *wt, const char *hex, char *txid_out) {
+int watchtower_send_presigned(watchtower_t *wt, const char *hex, char *txid_out) {
     if (wt->rt) {
         uint64_t target = (wt->fee && wt->fee->get_rate)
             ? wt->fee->get_rate(wt->fee, FEE_TARGET_URGENT) : 0;
@@ -1144,7 +1144,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (resp_hex) {
                     hex_encode(e->response_tx, e->response_tx_len, resp_hex);
                     char resp_txid[65];
-                    if (wt_send_presigned(wt, resp_hex, resp_txid)) {
+                    if (watchtower_send_presigned(wt, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
                         memcpy(factory_resp_txid, resp_txid, 64);
                         factory_resp_txid[64] = '\0';
@@ -1202,7 +1202,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (burn_hex) {
                     hex_encode(e->burn_tx, e->burn_tx_len, burn_hex);
                     char burn_txid[65];
-                    if (wt_send_presigned(wt, burn_hex, burn_txid)) {
+                    if (watchtower_send_presigned(wt, burn_hex, burn_txid)) {
                         printf("  L-stock burn tx broadcast: %s\n", burn_txid);
                         if (wt->db && wt->db->db)
                             persist_log_broadcast(wt->db, burn_txid,
@@ -1282,7 +1282,7 @@ int watchtower_check(watchtower_t *wt) {
                 if (poison_hex) {
                     hex_encode(e->burn_tx, e->burn_tx_len, poison_hex);
                     char poison_txid[65];
-                    if (wt_send_presigned(wt, poison_hex, poison_txid)) {
+                    if (watchtower_send_presigned(wt, poison_hex, poison_txid)) {
                         printf("  Sub-factory poison tx broadcast: %s\n", poison_txid);
                         memcpy(sub_resp_txid, poison_txid, 64);
                         sub_resp_txid[64] = '\0';
@@ -1365,7 +1365,7 @@ int watchtower_check(watchtower_t *wt) {
         int penalty_sent = 0;
         if (penalty_hex) {
             hex_encode(penalty_tx.data, penalty_tx.len, penalty_hex);
-            if (wt_send_presigned(wt, penalty_hex, penalty_txid)) {
+            if (watchtower_send_presigned(wt, penalty_hex, penalty_txid)) {
                 printf("  Penalty tx broadcast: %s\n", penalty_txid);
                 fflush(stdout);
                 penalties_broadcast++;

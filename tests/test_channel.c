@@ -1,4 +1,5 @@
 #include "superscalar/channel.h"
+#include "superscalar/cpfp.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
 #include "superscalar/ptlc_commit.h"
@@ -1298,6 +1299,60 @@ int test_htlc_control_block_2leaf(void) {
     TEST_ASSERT_MEM_EQ(control_block + 33, timeout_leaf.leaf_hash, 32,
                        "sibling hash in control block");
 
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test: a commitment at rate 0 always has its anchor ---- */
+
+/* At rate 0 a commitment pays no fee: only a child on its 240-sat anchor can
+   get it mined.  It is built with the anchor whenever a balance can fund it,
+   and never built (so never signed) when neither can. */
+int test_commitment_anchor_at_rate_0(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret)) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret)) return 0;
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk), "compute funding spk");
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBD, 32);
+    channel_t ch;
+    TEST_ASSERT(setup_channel_with_htlc(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                          100000, 50000, 50000,
+                                          local_funding_secret,
+                                          &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+    ch.use_cpfp_anchor = 1;
+    channel_set_commit_fee_rate(&ch, 0);
+    tx_buf_t tx;
+    tx_buf_init(&tx, 256);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "build at rate 0");
+    /* last output: the 240-sat P2A anchor; no fee: outputs = funding */
+    cpfp_tx_info_t ti;
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti), "parse");
+    TEST_ASSERT_EQ(ti.anchor_vout, (int)ti.n_outputs - 1, "anchor last");
+    TEST_ASSERT_EQ(ti.anchor_amount, ANCHOR_OUTPUT_AMOUNT, "240-sat anchor at rate 0");
+    TEST_ASSERT_EQ(ti.out_total, ch.local_amount + ch.remote_amount, "no fee at rate 0");
+
+    /* only one side can fund it: still anchored */
+    ch.local_amount = 500;
+    ch.remote_amount = 99500;
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "one side funds it");
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti) && ti.anchor_vout >= 0, "anchored");
+
+    /* neither can: never built at rate 0 */
+    ch.local_amount = 500;
+    ch.remote_amount = 500;
+    TEST_ASSERT(!channel_build_commitment_tx(&ch, &tx, txid),
+                "an anchorless zero-fee commitment is refused");
+    /* at a non-zero rate it pays its fee and may go without the anchor */
+    channel_set_commit_fee_rate(&ch, 1000);
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "fee-paying, no anchor");
+    tx_buf_free(&tx);
+    channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);
     return 1;
 }

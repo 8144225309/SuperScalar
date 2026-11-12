@@ -132,6 +132,11 @@ int cpfp_check_node_version(regtest_t *rt);
 void cpfp_set_default(regtest_t *rt, wallet_source_t *wallet,
                       fee_estimator_t *urgent, uint64_t max_child_fee);
 
+/* Target the default broadcasts take from that estimator (default
+   FEE_TARGET_URGENT).  A member's own exit, whose deadline is the factory's
+   timeout far ahead, uses FEE_TARGET_NORMAL. */
+void cpfp_set_default_target(fee_target_t target);
+
 /* Broadcast with the defaults set by cpfp_set_default; without them, a plain
    cb->send_raw_tx (CPFP_SENT_ALONE or CPFP_FAILED; a refused tx with a P2A
    anchor records CPFP_NEED_PACKAGE_RELAY). */

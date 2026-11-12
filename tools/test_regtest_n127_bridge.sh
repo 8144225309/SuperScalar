@@ -143,7 +143,7 @@ FACTORY_CLTV=$(( $($BCLI getblockcount) + 600 ))
 info "starting LSP: $N_CLIENTS clients, cltv=$FACTORY_CLTV"
 stdbuf -oL "$LSP_BIN" \
     --daemon --cli --network regtest --port "$PORT" \
-    --seckey "$LSP_SECKEY" --clients "$N_CLIENTS" --arity "$ARITY" \
+    --seckey "$LSP_SECKEY" --clients "$N_CLIENTS" --arity "$ARITY" --allow-anchorless-tree \
     --static-near-root 1 --amount "$AMOUNT" \
     --active-blocks 500 --cltv-timeout "$FACTORY_CLTV" \
     --step-blocks 5 --states-per-layer 2 \

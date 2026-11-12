@@ -85,12 +85,16 @@ static uint64_t rpc_get_rate(fee_estimator_t *self, fee_target_t target)
         }
     }
     /* No estimate (e.g. regtest, or a node without fee history): the node's
-       own relay floor, the least it accepts; FEE_FLOOR_SAT_PER_KVB only when
-       it reports none.  (Commitment fees do not depend on this: both sides
-       use the factory's agreed rate.) */
+       own relay floor, the least it accepts (FEE_FLOOR_SAT_PER_KVB when it
+       reports none), except for URGENT, the target of deadline-bound spends:
+       at least FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB.  (Commitment fees do not
+       depend on this: both sides use the factory's agreed rate.) */
     if (fe->cached[idx] > 0) return fe->cached[idx];
     uint64_t floor = query_relayfee((regtest_t *)fe->rt);
-    return floor > 0 ? floor : FEE_FLOOR_SAT_PER_KVB;
+    if (floor == 0) floor = FEE_FLOOR_SAT_PER_KVB;
+    if (target == FEE_TARGET_URGENT && floor < FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB)
+        return FEE_URGENT_NO_ESTIMATE_SAT_PER_KVB;
+    return floor;
 }
 
 static void rpc_update(fee_estimator_t *self)

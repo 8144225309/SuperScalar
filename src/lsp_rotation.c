@@ -328,18 +328,21 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                 uint64_t tot = och->local_amount + och->remote_amount;
                 if (tot > carried) { carried = tot; worst = c; }
             }
-            int planned = lsp_plan_channel_capacity(lsp, tmpl, n_online_now,
-                                                    mgr->rot_funding_sats,
-                                                    mgr->rot_step_blocks,
-                                                    mgr->rot_states_per_layer,
-                                                    mgr->rot_tree_fee_rate, &new_cap);
+            char why[256];
+            int planned = lsp_plan_tree(lsp, tmpl, n_online_now,
+                                        mgr->rot_funding_sats,
+                                        mgr->rot_step_blocks,
+                                        mgr->rot_states_per_layer,
+                                        mgr->rot_tree_fee_rate, &new_cap,
+                                        why, sizeof(why));
             free(tmpl);
             if (!planned || new_cap < carried) {
                 if (!planned)
-                    fprintf(stderr, "LSP rotate: cannot rotate factory %u: no %zu-client "
-                            "tree can be built from %llu sat at %llu sat/kvB\n", dying_id,
-                            n_online_now, (unsigned long long)mgr->rot_funding_sats,
-                            (unsigned long long)mgr->rot_tree_fee_rate);
+                    fprintf(stderr, "LSP rotate: cannot rotate factory %u: a new "
+                            "%zu-client factory of %llu sat at %llu sat/kvB: %s\n",
+                            dying_id, n_online_now,
+                            (unsigned long long)mgr->rot_funding_sats,
+                            (unsigned long long)mgr->rot_tree_fee_rate, why);
                 else
                     fprintf(stderr, "LSP rotate: cannot rotate factory %u: channel %zu "
                             "carries %llu sat, more than the %llu sat a channel of the "

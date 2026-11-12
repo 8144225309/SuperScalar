@@ -55,7 +55,8 @@ int watchtower_autosettle_leaf_channels(struct watchtower_s *wt,
             if (ctx_hex) {
                 hex_encode(commit_tx, commit_tx_len, ctx_hex);
                 char ctx_txid[65];
-                if (wt->chain->send_raw_tx(wt->chain, ctx_hex, ctx_txid)) {
+                /* a commitment at a low or zero agreed rate needs a child */
+                if (watchtower_send_presigned(wt, ctx_hex, ctx_txid)) {
                     printf("  Auto-settle channel %u (cn=%llu): %s\n",
                            ch_idx, (unsigned long long)commit_cn,
                            ctx_txid);

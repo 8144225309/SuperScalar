@@ -957,6 +957,15 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             outputs[out_idx].script_pubkey_len = P2A_SPK_LEN;
             outputs[out_idx].amount_sats = anchor;
             out_idx++;
+        } else if (ch->commit_fee_rate_sat_per_kvb == 0) {
+            /* Neither balance can fund the anchor and the commitment pays no
+               fee: nothing could ever get it mined.  Such a state is never
+               built, so it is never signed. */
+            fprintf(stderr, "channel commitment: balances %llu/%llu cannot fund "
+                    "the anchor of a commitment at rate 0; refusing to build it\n",
+                    (unsigned long long)outputs[0].amount_sats,
+                    (unsigned long long)outputs[1].amount_sats);
+            goto commit_tx_done;
         }
     }
 

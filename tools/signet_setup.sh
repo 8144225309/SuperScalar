@@ -76,7 +76,7 @@ lsp_static_args() {
 # so default 1-client-per-PS-leaf invocations stay bit-identical.
 lsp_subfactory_args() {
     if [ "${PS_SUBFACTORY_ARITY:-1}" -gt 1 ] 2>/dev/null; then
-        printf -- "--ps-subfactory-arity %s" "$PS_SUBFACTORY_ARITY"
+        printf -- "--allow-anchorless-tree --ps-subfactory-arity %s" "$PS_SUBFACTORY_ARITY"
     fi
 }
 

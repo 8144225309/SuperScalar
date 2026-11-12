@@ -113,8 +113,10 @@ static int client_setup_cpfp(const regtest_t *rt) {
         urgent = client_exit_fee_estimator(&g_client_cpfp_rt, &mode);
     }
     cpfp_set_default(rt ? &g_client_cpfp_rt : NULL, w, urgent, 0);
+    /* the exit's deadline is the factory timeout, far ahead: no urgent rate */
+    cpfp_set_default_target(FEE_TARGET_NORMAL);
     printf("Client: pre-signed broadcasts via %s (CPFP child funding: %s, "
-           "target: urgent estimate from %s)\n",
+           "target: 6-block estimate from %s)\n",
            rt ? "bitcoind RPC, package relay" : "chain backend",
            w ? g_client_wallet_name : "anchor only", mode);
     return 1;
