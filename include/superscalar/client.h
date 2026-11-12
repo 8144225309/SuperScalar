@@ -534,7 +534,7 @@ int client_fulfill_payment(int fd, channel_t *ch,
 
 /* Blocks a received HTLC must still run after the chain tip before it pays
    an invoice (BOLT 11 default min_final_cltv_expiry). */
-#define CLIENT_MIN_FINAL_CLTV_DELTA 18
+#define CLIENT_MIN_FINAL_CLTV_DELTA 18u
 
 /* 1 if h, an active HTLC the LSP offered to us, pays an invoice of
    invoice_amount_msat (0: any amount): it carries at least that amount

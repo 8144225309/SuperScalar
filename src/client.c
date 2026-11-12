@@ -1238,7 +1238,7 @@ int client_settle_invoice_htlc(int fd, channel_t *ch, uint64_t htlc_id,
             "failing it, preimage kept\n", (unsigned long long)htlc_id,
             (unsigned long long)(h->amount_sats * 1000),
             (unsigned long long)invoice_amount_msat, h->cltv_expiry,
-            tip_height, CLIENT_MIN_FINAL_CLTV_DELTA);
+            tip_height, (unsigned)CLIENT_MIN_FINAL_CLTV_DELTA);
     if (!channel_fail_htlc(ch, htlc_id)) return -1;
     client_check_conservation(ch, "after fail_htlc");
     cJSON *fail = wire_build_update_fail_htlc(htlc_id,
