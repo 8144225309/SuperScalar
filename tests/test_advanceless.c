@@ -269,6 +269,7 @@ static int al_reload_matches(persist_t *db, secp256k1_context *ctx, const factor
     return ok;
 }
 
+extern int g_persist_test_skip_tree_sig_check;
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
@@ -453,7 +454,10 @@ int test_advanceless_persist_reload(void) {
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
 
-            /* A leaf state that moved on: what it may spend. */
+            /* A leaf state that moved on: what it may spend.  The rows are
+               built by hand and carry no valid signature; the signature rule
+               has its own test (test_persist_reload_verifies_signatures). */
+            g_persist_test_skip_tree_sig_check = 1;
             size_t leaf = f->leaf_node_indices[1];
             unsigned char crafted[32], loaded[32];
             /* its parent's output (a re-allocation): loaded from its bytes */
@@ -478,6 +482,7 @@ int test_advanceless_persist_reload(void) {
                                           f->nodes[leaf].parent_vout + 1, crafted),
                         "craft (wrong vout)");
             AL_CHECK(al_load_refused(&db, ctx), "leaf spending its parent's other output refused");
+            g_persist_test_skip_tree_sig_check = 0;
             TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
             TEST_ASSERT(al_reload_matches(&db, ctx, f), "reload after re-save");
         }
@@ -560,4 +565,94 @@ int test_advanceless_reload_tree_rate(void) {
     free(kps);
     secp256k1_context_destroy(ctx);
     return 1;
+}
+
+/* ---- a stored tree signature is checked on reload ---- */
+
+/* Change the hex digit `delta` places into the signature of node `idx`'s
+   stored signed tx (the 64 bytes before the 4-byte nLockTime). */
+static int sig_edit(persist_t *db, size_t idx, size_t delta) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db, "SELECT signed_tx_hex FROM tree_nodes "
+                           "WHERE factory_id = 0 AND node_index = ?;", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int(st, 1, (int)idx);
+    char *hex = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
+        hex = strdup((const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    if (!hex) return 0;
+    size_t hl = strlen(hex);
+    size_t pos = hl - 8 - 128 + delta;
+    hex[pos] = hex[pos] == '0' ? '1' : '0';
+    int ok = sqlite3_prepare_v2(db->db, "UPDATE tree_nodes SET signed_tx_hex = ? "
+                                "WHERE factory_id = 0 AND node_index = ?;", -1, &st, NULL) == SQLITE_OK;
+    if (ok) {
+        sqlite3_bind_text(st, 1, hex, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, (int)idx);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    free(hex);
+    return ok;
+}
+
+/* Copy node `from`'s signature bytes over node `to`'s (a valid signature, for
+   another transaction). */
+static int sig_copy(persist_t *db, size_t from, size_t to) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "UPDATE tree_nodes SET signed_tx_hex = "
+             "substr(signed_tx_hex, 1, length(signed_tx_hex) - 8 - 128) || "
+             "(SELECT substr(signed_tx_hex, length(signed_tx_hex) - 8 - 128 + 1, 128) "
+             " FROM tree_nodes WHERE factory_id = 0 AND node_index = %zu) || "
+             "substr(signed_tx_hex, length(signed_tx_hex) - 7) "
+             "WHERE factory_id = 0 AND node_index = %zu;", from, to);
+    return sqlite3_exec(db->db, sql, NULL, NULL, NULL) == SQLITE_OK;
+}
+
+int test_persist_reload_verifies_signatures(void) {
+    int failed = 0;
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                                      SECP256K1_CONTEXT_VERIFY);
+    secp256k1_keypair *kps = al_keys(ctx, 5);
+    TEST_ASSERT(kps, "keys");
+    factory_t *f = calloc(1, sizeof(*f));
+    TEST_ASSERT(f, "alloc");
+    TEST_ASSERT(al_build_default(f, ctx, kps, 4), "build default");
+    TEST_ASSERT(factory_sign_all(f), "sign the tree");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open in-memory");
+    TEST_ASSERT(persist_save_factory(&db, f, ctx, 0), "save factory");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "save tree");
+    AL_CHECK(al_reload_matches(&db, ctx, f), "control: the untouched tree loads");
+
+    size_t leaf = f->leaf_node_indices[0];
+    size_t targets[3] = { 0, 1, leaf };    /* the root, the first state, a leaf */
+    for (size_t t = 0; t < 3; t++) {
+        size_t n = targets[t];
+        /* one digit changed in the first byte of r, the middle of s, the last */
+        size_t deltas[3] = { 0, 70, 127 };
+        for (size_t d = 0; d < 3; d++) {
+            TEST_ASSERT(sig_edit(&db, n, deltas[d]), "edit the signature");
+            AL_CHECK(al_load_refused(&db, ctx), "a changed signature is refused");
+            TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+            AL_CHECK(al_reload_matches(&db, ctx, f), "the re-saved tree loads");
+        }
+    }
+    /* a valid signature, but for another transaction */
+    TEST_ASSERT(sig_copy(&db, 1, 0), "copy a signature");
+    AL_CHECK(al_load_refused(&db, ctx), "another node's signature is refused");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+    TEST_ASSERT(sig_copy(&db, 0, leaf), "copy a signature");
+    AL_CHECK(al_load_refused(&db, ctx), "the root's signature on a leaf is refused");
+    TEST_ASSERT(persist_save_tree_nodes(&db, f, 0), "re-save tree");
+    AL_CHECK(al_reload_matches(&db, ctx, f), "reload after re-save");
+
+    persist_close(&db);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return !failed;
 }

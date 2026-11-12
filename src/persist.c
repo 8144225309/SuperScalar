@@ -4,6 +4,9 @@
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
 #include "superscalar/sha256.h"
+#include "superscalar/tx_builder.h"
+#include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2508,7 +2511,8 @@ static int node_has_l_stock(const factory_t *f, size_t idx) {
 }
 
 /* What check_rebuilt_tree needs from a signed transaction: its txid (over the
-   non-witness serialization), its first input, and its output amounts. */
+   non-witness serialization), its first input, its output amounts and
+   scripts, and where its key-path signature sits. */
 typedef struct {
     unsigned char txid[32];        /* internal byte order */
     unsigned char prev_txid[32];   /* first input, internal byte order */
@@ -2516,6 +2520,11 @@ typedef struct {
     uint32_t sequence;
     size_t n_out;
     uint64_t amounts[FACTORY_MAX_OUTPUTS];
+    unsigned char spk[FACTORY_MAX_OUTPUTS][34];
+    uint8_t spk_len[FACTORY_MAX_OUTPUTS];   /* 0 when not 34 bytes */
+    size_t body_start, body_end;   /* the non-witness body: inputs, outputs */
+    size_t sig_off;                /* the 64-byte witness item; 0 if none */
+    size_t lock_off;               /* nLockTime */
 } stored_tx_t;
 
 static int rd_varint(const unsigned char *b, size_t len, size_t *pos, uint64_t *v) {
@@ -2571,18 +2580,34 @@ static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
         for (int k = 0; k < 8; k++) a |= (uint64_t)b[pos + k] << (8 * k);
         o->amounts[i] = a;
         pos += 8;
-        if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+        if (!rd_varint(b, len, &pos, &v)) return 0;
+        o->spk_len[i] = 0;
+        if (v == 34 && len - pos >= 34) {
+            memcpy(o->spk[i], b + pos, 34);
+            o->spk_len[i] = 34;
+        }
+        if (!skip_bytes(len, &pos, v)) return 0;
     }
     size_t body_end = pos;
+    o->body_start = body_start;
+    o->body_end = body_end;
+    o->sig_off = 0;
     if (segwit) {
         for (uint64_t i = 0; i < n_in; i++) {
             uint64_t items;
             if (!rd_varint(b, len, &pos, &items)) return 0;
-            for (uint64_t k = 0; k < items; k++)
-                if (!rd_varint(b, len, &pos, &v) || !skip_bytes(len, &pos, v)) return 0;
+            for (uint64_t k = 0; k < items; k++) {
+                if (!rd_varint(b, len, &pos, &v)) return 0;
+                /* the first input's only witness item, 64 bytes: the
+                   key-path Schnorr signature */
+                if (n_in == 1 && k == 0 && items == 1 && v == 64 && len - pos >= 64)
+                    o->sig_off = pos;
+                if (!skip_bytes(len, &pos, v)) return 0;
+            }
         }
     }
     if (len - pos != 4) return 0;   /* nLockTime, and nothing after it */
+    o->lock_off = pos;
     size_t nw_len = 4 + (body_end - body_start) + 4;
     unsigned char *nw = malloc(nw_len);
     if (!nw) return 0;
@@ -2592,6 +2617,40 @@ static int parse_stored_tx(const unsigned char *b, size_t len, stored_tx_t *o) {
     sha256_double(nw, nw_len, o->txid);
     free(nw);
     return 1;
+}
+
+/* TEST-ONLY seam (always 0 in production): lets a unit test store tree rows
+   it built by hand, without a valid signature, to exercise the other reload
+   rules. */
+int g_persist_test_skip_tree_sig_check = 0;
+
+/* 1 when the key-path signature stored in a signed tree transaction is valid
+   for the output it spends.  The sighash is BIP-341 SIGHASH_DEFAULT over the
+   stored transaction with the output's script and amount; the output key is
+   the one in the script. */
+static int stored_tx_sig_valid(secp256k1_context *ctx, const unsigned char *b,
+                               const stored_tx_t *t,
+                               const unsigned char *prev_spk, size_t prev_spk_len,
+                               uint64_t prev_amount) {
+    if (t->sig_off == 0 || prev_spk_len != 34 || prev_spk[0] != 0x51 ||
+        prev_spk[1] != 0x20)
+        return 0;
+    size_t body = t->body_end - t->body_start;
+    size_t ulen = 4 + body + 4;
+    unsigned char *utx = malloc(ulen);
+    if (!utx) return 0;
+    memcpy(utx, b, 4);
+    memcpy(utx + 4, b + t->body_start, body);
+    /* nLockTime: the last 4 bytes of the serialization */
+    memcpy(utx + 4 + body, b + t->lock_off, 4);
+    unsigned char sighash[32];
+    secp256k1_xonly_pubkey key;
+    int ok = compute_taproot_sighash(sighash, utx, ulen, 0, prev_spk, prev_spk_len,
+                                     prev_amount, t->sequence) &&
+             secp256k1_xonly_pubkey_parse(ctx, &key, prev_spk + 2) &&
+             secp256k1_schnorrsig_verify(ctx, b + t->sig_off, sighash, 32, &key);
+    free(utx);
+    return ok;
 }
 
 /* 1 when `prev` (internal order) is the txid of a state of node `idx`'s own
@@ -2778,6 +2837,55 @@ static int persist_check_rebuilt_tree(persist_t *p, uint32_t factory_id,
                 ? "spends neither its parent's stored output nor an earlier state of its own chain"
                 : "does not spend its parent's stored output";
         ok = 0;
+    }
+    /* Every stored signature must be valid for the output it spends: the
+       txid does not cover the witness, so the hash checks above cannot see a
+       changed signature, which would otherwise be found when the transaction
+       is broadcast.  The output is the parent's stored output (or the
+       funding output for the root, or the rebuilt parent's where the parent
+       has no stored transaction).  A leaf or sub-factory state that spends an
+       earlier state of its own chain is the only one not checked here: its
+       prevout is a chain row, not a tree row. */
+    for (size_t i = 0; ok && i < n; i++) {
+        if (!has_tx[i]) continue;
+        const factory_node_t *nd = &f->nodes[i];
+        int par = nd->parent_index;
+        const unsigned char *pspk = NULL;
+        size_t pspk_len = 0;
+        uint64_t pamt = 0;
+        if (par < 0) {
+            pspk = f->funding_spk;
+            pspk_len = f->funding_spk_len;
+            pamt = f->funding_amount_sats;
+        } else if (spends_own_chain[i] &&
+                   !(memcmp(stx[i].prev_txid, stored_txid[par], 32) == 0 &&
+                     stx[i].prev_vout == nd->parent_vout)) {
+            continue;
+        } else if (has_tx[par]) {
+            if (nd->parent_vout >= stx[par].n_out ||
+                stx[par].spk_len[nd->parent_vout] != 34) {
+                bad = (long)i; why = "spends a parent output that is not P2TR"; ok = 0;
+                break;
+            }
+            pspk = stx[par].spk[nd->parent_vout];
+            pspk_len = 34;
+            pamt = stx[par].amounts[nd->parent_vout];
+        } else if (nd->parent_vout < f->nodes[par].n_outputs) {
+            pspk = f->nodes[par].outputs[nd->parent_vout].script_pubkey;
+            pspk_len = f->nodes[par].outputs[nd->parent_vout].script_pubkey_len;
+            pamt = f->nodes[par].outputs[nd->parent_vout].amount_sats;
+        } else {
+            bad = (long)i; why = "spends an output its parent does not have"; ok = 0;
+            break;
+        }
+        if (!g_persist_test_skip_tree_sig_check &&
+            !stored_tx_sig_valid(f->ctx, sbytes[i].data, &stx[i], pspk, pspk_len, pamt)) {
+            bad = (long)i;
+            why = stx[i].sig_off == 0
+                ? "has no key-path signature"
+                : "has a signature that is not valid for the output it spends";
+            ok = 0;
+        }
     }
     size_t exempt = 0;
     for (size_t i = 0; ok && i < n; i++) {

@@ -1375,6 +1375,7 @@ extern int test_advanceless_shape_rule(void);
 extern int test_advanceless_default_tree(void);
 extern int test_advanceless_refuses_refresh(void);
 extern int test_advanceless_persist_reload(void);
+extern int test_persist_reload_verifies_signatures(void);
 extern int test_advanceless_reload_tree_rate(void);
 extern int test_tree_shape_dw_layers_deep(void);
 extern int test_tree_shape_static_leaf(void);
@@ -3484,6 +3485,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_advanceless_default_tree);
     RUN_TEST(test_advanceless_refuses_refresh);
     RUN_TEST(test_advanceless_persist_reload);
+    RUN_TEST(test_persist_reload_verifies_signatures);
     RUN_TEST(test_advanceless_reload_tree_rate);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
