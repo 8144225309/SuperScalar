@@ -1,4 +1,5 @@
 #include "superscalar/client.h"
+#include "superscalar/network.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
 #include "superscalar/fee.h"
@@ -77,8 +78,33 @@ void client_set_max_tree_fee_rate(uint64_t sat_per_kvb) {
     factory_set_max_tree_fee_rate(sat_per_kvb);
 }
 
-int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb) {
+static uint64_t g_max_signed_tree_fee_rate = 0;
+static int g_max_signed_tree_fee_rate_set = 0;
+
+void client_set_max_signed_tree_fee_rate(uint64_t sat_per_kvb) {
+    g_max_signed_tree_fee_rate = sat_per_kvb;
+    g_max_signed_tree_fee_rate_set = 1;
+}
+
+uint64_t client_max_signed_tree_fee_rate(void) {
+    return g_max_signed_tree_fee_rate;
+}
+
+void client_apply_network_defaults(const char *network) {
+    if (!g_max_signed_tree_fee_rate_set && network_is_mainnet(network))
+        g_max_signed_tree_fee_rate = CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE;
+}
+
+/* the lower of the protocol maximum and the client's own ceiling; 0 = none */
+static uint64_t client_tree_fee_rate_ceiling(void) {
     uint64_t max = factory_max_tree_fee_rate();
+    uint64_t own = g_max_signed_tree_fee_rate;
+    if (own > 0 && (max == 0 || own < max)) max = own;
+    return max;
+}
+
+int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb) {
+    uint64_t max = client_tree_fee_rate_ceiling();
     if (sat_per_kvb < FEE_PRESIGNED_FLOOR_SAT_PER_KVB) return 0;
     if (max > 0 && sat_per_kvb > max) return 0;
     return 1;
@@ -94,7 +120,7 @@ static int client_check_tree_fees(const factory_t *f, uint64_t proposed_rate,
         fprintf(stderr, "Client %u: REFUSING — tree fee rate %llu sat/kvB outside "
                 "[%d, %llu]\n", my_index, (unsigned long long)proposed_rate,
                 FEE_PRESIGNED_FLOOR_SAT_PER_KVB,
-                (unsigned long long)factory_max_tree_fee_rate());
+                (unsigned long long)client_tree_fee_rate_ceiling());
         return 0;
     }
     size_t bad = 0;

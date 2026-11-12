@@ -189,7 +189,7 @@ Press **Ctrl+C**. The LSP will:
 | `--dying-blocks` | 10 (regtest) / 432 (other) | Factory dying period (rotation window) |
 | `--fee-rate` | 1000 | Fee rate in sat/kvB |
 | `--tree-fee-rate N` | estimator | Rate (sat/kvB) the factory tree's pre-signed txs are sized at; default the estimator's 6-block rate, never below 1250 |
-| `--max-tree-fee-rate N` | 100000 | Highest tree fee rate; an estimate above it is clamped (the exit then relies on CPFP). Must match the clients' value |
+| `--max-tree-fee-rate N` | 100000 | Highest tree fee rate; an estimate above it is clamped (the exit then relies on CPFP). Must match the clients' value. On mainnet clients refuse a tree above 10 sat/vB by default (`--max-signed-tree-fee-rate`), so use 10000 or lower there |
 
 **Ceremony timeouts on signet/testnet4**: MuSig2 signing ceremonies (factory creation, cooperative close, rotation) use longer message timeouts on non-regtest networks — 120s per message vs 30s on regtest. The cooperative close nonce/psig collection uses 300s per client on signet/testnet4. These are automatic based on `--network`; no flags needed.
 

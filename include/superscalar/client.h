@@ -67,7 +67,20 @@ void client_set_min_profit_bps(uint16_t bps);
 #define CLIENT_DEFAULT_MAX_TREE_FEE_RATE FACTORY_MAX_TREE_FEE_RATE
 void client_set_max_tree_fee_rate(uint64_t sat_per_kvb);
 
-/* 1 if the client would sign a tree at sat_per_kvb (see above). */
+/* The client's own ceiling on the tree fee rate, below the protocol
+   maximum: every sat of the tree's pre-signed fees comes out of the factory
+   funding, so a client that signs whatever rate the LSP proposes lets the
+   LSP spend its channel on fees.  0 = none (only the protocol maximum).
+   --max-signed-tree-fee-rate sets it; client_apply_network_defaults gives
+   mainnet CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE when it was not set. */
+#define CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE 10000   /* 10 sat/vB */
+void client_set_max_signed_tree_fee_rate(uint64_t sat_per_kvb);
+uint64_t client_max_signed_tree_fee_rate(void);
+/* Network defaults for settings the operator did not give. */
+void client_apply_network_defaults(const char *network);
+
+/* 1 if the client would sign a tree at sat_per_kvb: at least the pre-signed
+   floor, at most the protocol maximum and the client's own ceiling. */
 int client_tree_fee_rate_acceptable(uint64_t sat_per_kvb);
 
 /* Optional callback to verify the funding TX on-chain before signing the

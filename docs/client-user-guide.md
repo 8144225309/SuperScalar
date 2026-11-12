@@ -251,6 +251,7 @@ This prevents MITM attacks — the client verifies the LSP's identity during the
 | `--fee-estimator MODE` | static | `static[:N]`, `api[:URL]` or `blocks`. Its urgent rate is also the CPFP target of exit broadcasts (default there: `estimatesmartfee`) |
 | `--wallet NAME` | none | bitcoind wallet that funds CPFP children on exit; without it a bump spends the P2A anchor alone, which is not enough once the minimum relay fee rises (see What You Need) |
 | `--max-tree-fee-rate N` | 100000 | Refuse a factory whose tree fee rate (sat/kvB) is above N; must match the LSP's value |
+| `--max-signed-tree-fee-rate N` | 10000 on mainnet, none elsewhere | Your own ceiling on the tree fee rate (sat/kvB): the tree's pre-signed fees come out of the factory funding, so a factory above it is refused; 0 = only the protocol maximum |
 | `--light-client HOST:PORT` | — | Use a BIP-158 P2P compact-block-filter peer instead of a local bitcoind |
 | `--light-client-fallback HOST:PORT` | — | Add a fallback BIP-158 peer (can repeat, up to 7 peers total) |
 

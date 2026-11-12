@@ -1370,3 +1370,35 @@ int test_distribution_above_truc_paid_high(void) {
     return 1;
 }
 
+
+/* A client signs no tree above its own ceiling: 10 sat/vB by default on
+   mainnet, none elsewhere (the protocol maximum still applies). */
+int test_client_own_tree_fee_ceiling(void) {
+    TEST_ASSERT_EQ(client_max_signed_tree_fee_rate(), 0, "no ceiling by default");
+    TEST_ASSERT(client_tree_fee_rate_acceptable(90000), "90 sat/vB: protocol maximum only");
+    client_apply_network_defaults("regtest");
+    TEST_ASSERT(client_tree_fee_rate_acceptable(90000), "regtest keeps the protocol maximum");
+    client_apply_network_defaults("signet");
+    TEST_ASSERT(client_tree_fee_rate_acceptable(90000), "signet keeps the protocol maximum");
+    client_apply_network_defaults("bitcoin");
+    TEST_ASSERT_EQ(client_max_signed_tree_fee_rate(), CLIENT_MAINNET_MAX_SIGNED_TREE_FEE_RATE,
+                   "mainnet default");
+    TEST_ASSERT(client_tree_fee_rate_acceptable(10000), "10 sat/vB signed on mainnet");
+    TEST_ASSERT(!client_tree_fee_rate_acceptable(10001), "above 10 sat/vB refused on mainnet");
+    TEST_ASSERT(!client_tree_fee_rate_acceptable(90000), "90 sat/vB refused on mainnet");
+    /* an explicit setting wins over the network default */
+    client_set_max_signed_tree_fee_rate(25000);
+    client_apply_network_defaults("mainnet");
+    TEST_ASSERT_EQ(client_max_signed_tree_fee_rate(), 25000, "explicit setting kept");
+    TEST_ASSERT(client_tree_fee_rate_acceptable(25000), "at the setting");
+    TEST_ASSERT(!client_tree_fee_rate_acceptable(25001), "above the setting");
+    /* never above the protocol maximum, never below the floor */
+    client_set_max_signed_tree_fee_rate(500000);
+    TEST_ASSERT(!client_tree_fee_rate_acceptable(FACTORY_MAX_TREE_FEE_RATE + 1),
+                "the protocol maximum still applies");
+    TEST_ASSERT(!client_tree_fee_rate_acceptable(FEE_PRESIGNED_FLOOR_SAT_PER_KVB - 1),
+                "below the floor");
+    client_set_max_signed_tree_fee_rate(0);
+    TEST_ASSERT(client_tree_fee_rate_acceptable(90000), "0 = no own ceiling");
+    return 1;
+}

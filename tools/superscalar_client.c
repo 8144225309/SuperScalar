@@ -2553,6 +2553,8 @@ static void usage(const char *prog) {
         "  --wallet NAME                     bitcoind wallet that funds CPFP children on exit\n"
         "                                      (default: none; a bump spends the P2A anchor alone)\n"
         "  --max-tree-fee-rate N             Refuse a factory whose tree fee rate exceeds N sat/kvB\n"
+        "  --max-signed-tree-fee-rate N      This client's own ceiling on the tree fee rate (sat/kvB;\n"
+        "                                    default 10000 on mainnet, none elsewhere; 0 = none)\n"
         "                                      (default 100000, the LSP default; 0 = no ceiling)\n"
         "  --on-lsp-forgery MODE             Response to a detected forged LSP revocation:\n"
         "                                      continue = refuse secret only (legacy)\n"
@@ -2840,6 +2842,8 @@ int main(int argc, char *argv[]) {
             g_client_wallet_name = argv[++i];
         else if (strcmp(argv[i], "--max-tree-fee-rate") == 0 && i + 1 < argc)
             client_set_max_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
+        else if (strcmp(argv[i], "--max-signed-tree-fee-rate") == 0 && i + 1 < argc)
+            client_set_max_signed_tree_fee_rate((uint64_t)strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--cheat-client") == 0 && i + 1 < argc) {
             /* CL7: adversarial client cheat. SIDE = 0 (left) or 1 (right).
                Sets env var read by client_handle_leaf_advance. */
@@ -3578,6 +3582,7 @@ int main(int argc, char *argv[]) {
             .argv = argv,
             .envp = environ,
         };
+        client_apply_network_defaults(network);
         if (!network_startup_gates(&startup, gate_err, sizeof(gate_err))) {
             fputs(gate_err, stderr);
             return 1;
