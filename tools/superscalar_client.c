@@ -1876,6 +1876,10 @@ handle_message:
             if (!cbd->auto_accept_jit) {
                 printf("Client %u: rejecting JIT offer "
                        "(use --auto-accept-jit to enable)\n", my_index);
+                /* Tell the LSP, so it does not wait out its timeout. */
+                cJSON *reject = wire_build_jit_reject(jit_cidx, "not accepted");
+                wire_send(fd, MSG_JIT_REJECT, reject);
+                cJSON_Delete(reject);
                 break;
             }
 
@@ -2082,8 +2086,10 @@ handle_message:
             /* LSP requests migration of JIT channel to factory */
             uint32_t mig_jit_id, mig_factory_id;
             uint64_t mig_local, mig_remote;
+            char mig_close_txid[65];
             if (!wire_parse_jit_migrate(msg.json, &mig_jit_id, &mig_factory_id,
-                                          &mig_local, &mig_remote)) {
+                                          &mig_local, &mig_remote,
+                                          mig_close_txid)) {
                 fprintf(stderr, "Client %u: bad JIT_MIGRATE\n", my_index);
                 cJSON_Delete(msg.json);
                 break;
@@ -2093,16 +2099,13 @@ handle_message:
             printf("Client %u: JIT channel %08x migrating to factory %u\n",
                    my_index, mig_jit_id, mig_factory_id);
 
-            if (cbd->jit_ch && cbd->jit_ch->jit_channel_id == mig_jit_id) {
-                cbd->jit_ch->state = JIT_STATE_CLOSED;
-                /* Remove watchtower entries for JIT channel */
-                if (cbd->wt)
-                    watchtower_remove_channel(cbd->wt, 0);
-                /* Remove from persistence */
-                if (cbd->db)
-                    persist_delete_jit_channel(cbd->db, mig_jit_id);
+            if (cbd->jit_ch &&
+                jit_client_handle_migrate(cbd->jit_ch, mig_jit_id,
+                                           mig_close_txid, cbd->wt, cbd->db))
                 printf("Client %u: JIT channel closed (migrated)\n", my_index);
-            }
+            else
+                printf("Client %u: JIT channel record kept "
+                       "(close not seen confirmed)\n", my_index);
             break;
         }
 
@@ -2371,8 +2374,10 @@ handle_message:
                     return 2;
                 }
 
-                /* If buy test requested, send lsps2.buy using returned fee params */
-                if (ok && cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
+                /* If buy test requested, send lsps2.buy using the returned fee
+                   params (none if get_info was refused: the purchase must
+                   then be refused as well, which the test observes). */
+                if (cbd->test_lsps2_buy && !cbd->test_lsps2_buy_done) {
                     cJSON *buy_req = cJSON_CreateObject();
                     if (buy_req) {
                         cJSON_AddStringToObject(buy_req, "jsonrpc", "2.0");
@@ -2382,7 +2387,8 @@ handle_message:
                         if (params) {
                             /* opening_fee_params: forward the params object from get_info */
                             cJSON *fee_params = cJSON_CreateObject();
-                            cJSON *min_fee = cJSON_GetObjectItem(result, "min_fee_msat");
+                            cJSON *min_fee = result
+                                ? cJSON_GetObjectItem(result, "min_fee_msat") : NULL;
                             if (fee_params && min_fee)
                                 cJSON_AddNumberToObject(fee_params, "min_fee_msat",
                                                         min_fee->valuedouble);

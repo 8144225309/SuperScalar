@@ -504,16 +504,6 @@ def test_profit_shared():
     return ok
 
 
-def test_no_jit():
-    """--no-jit: factory works without JIT channel fallback."""
-    print(f"\n{ts()} === TEST: --demo --no-jit ===")
-    rc, log = run_lsp(['--demo', '--no-jit'])
-    ok = rc == 0 and 'Demo Complete' in log
-    print(f"  Exit: {rc}, DemoComplete: {'Demo Complete' in log}")
-    print(f"  {ts()} RESULT: {'PASS' if ok else 'FAIL'}")
-    return ok
-
-
 def test_placement_modes():
     """All three placement strategies: sequential, inward, outward."""
     print(f"\n{ts()} === TEST: placement modes ===")
@@ -762,7 +752,6 @@ if __name__ == '__main__':
         'states_layer': test_states_per_layer,
         'step_blocks': test_step_blocks,
         'profit_shared': test_profit_shared,
-        'no_jit': test_no_jit,
         'placement': test_placement_modes,
         'mnemonic': test_generate_mnemonic,
         'backup': test_backup_restore,

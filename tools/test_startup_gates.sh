@@ -74,6 +74,10 @@ for NET in mainnet bitcoin; do
     expect_refusal "refused on mainnet" \
         env SS_KILL_AT=1 "$WT" --network "$NET" --i-accept-the-risk --wt-db "$F/wt.db"
 
+    # Experimental JIT channels: the LSP opt-in.
+    expect_refusal "--enable-jit-experimental is refused on mainnet" \
+        "$LSP" --network "$NET" --i-accept-the-risk --enable-jit-experimental
+
     # Persistent state: --db for LSP and client, --wt-db for the LSP.
     expect_refusal "mainnet requires --db" "$LSP" --network "$NET" --i-accept-the-risk
     expect_refusal "mainnet requires --db" \

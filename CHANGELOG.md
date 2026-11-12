@@ -6,6 +6,17 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### JIT channels are off by default
+
+Operator-visible behaviour changes.
+
+- **The LSP no longer opens JIT channels unless started with `--enable-jit-experimental`.** Without the flag it sends no JIT offer and funds nothing when its factories expire, and it answers `lsps2.buy` and `lsps2.get_info` from a factory client with a JSON-RPC error (`-32601`). The flag is unsafe and for testing only: an open funds a 2-of-2 output before the client has signed anything, and the channel cannot carry payments yet. It is refused on mainnet. `--test-jit` implies it.
+- **`--no-jit` is removed.** JIT opens are off by default, so the flag had nothing left to do; like any unknown option it is now ignored.
+- **`lsps2.buy` and `lsps2.get_info` from an outside peer (the BOLT #8 listener) are always refused**, and LSPS replies to outside peers are sent over the peer's encrypted transport.
+- **A client that does not accept JIT offers now says so.** New wire message `JIT_REJECT` (`0x90`); the LSP stops waiting as soon as it arrives. Messages a client sends while an offer is pending are handled afterwards instead of being dropped.
+- **A JIT channel is kept across a rotation**, by the LSP and by the client, unless the cooperative close the LSP broadcast for it has the close depth (`--close-confs`) and its funding output is spent. Before, both sides deleted their record of it, and its watch entries, whatever had happened on chain. `JIT_MIGRATE` now names that close. The client no longer removes its factory channel's watchtower entries when it is told a JIT channel was migrated.
+- JIT channels opened earlier are still loaded at start-up and closed at rotation whether or not the flag is given.
+
 ### Unilateral exit from large factories
 
 - **Force-close no longer stops at 128 tree transactions.** `superscalar_client --force-close`, the `recoverfactory` RPC and `listfactories` read at most the first 128 tree nodes of a factory. A client whose path to its leaf contained a node with index 128 or higher (factories from about 33 one-client leaves or 65 two-client leaves upwards) never published that part of its path, reported no error, and its commitment could not confirm. The tree is now loaded in full whatever its size.

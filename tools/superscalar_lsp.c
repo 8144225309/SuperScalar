@@ -104,9 +104,6 @@ static bolt11_invoice_table_t g_invoice_tbl;
 /* CLTV watchdog: pointer to the active channel manager, set after each alloc */
 static lsp_channel_mgr_t *g_channel_mgr = NULL;
 
-/* LSPS0 context for bolt8_server callback */
-static lsps_ctx_t  g_lsps_ctx;
-
 /* LSPS2 JIT pending channel intercept table */
 static lsps2_pending_table_t g_lsps2_pending;
 
@@ -125,90 +122,13 @@ static void *ln_dispatch_thread(void *arg) {
     return NULL;
 }
 
-/* Gap 3: callback from ln_dispatch when JIT cost is covered.
- * Opens a JIT channel for the client then relays the pending HTLC. */
-static void on_jit_open(void *cb_ctx, uint64_t scid,
-                         uint64_t out_amount_msat,
-                         size_t in_peer_idx, uint64_t in_htlc_id)
-{
-    (void)cb_ctx; (void)in_peer_idx; (void)in_htlc_id;
-    /* SCID encodes client_idx: (0x800000 << 40) | ((client_idx+1) << 16) | block */
-    size_t client_idx = (size_t)(((scid >> 16) & 0xFFFFFF) - 1);
-
-    /* Open the JIT channel (no-op if already open) */
-    if (!jit_channel_is_active(g_channel_mgr, client_idx))
-        jit_channel_create(g_channel_mgr, g_lsp, client_idx,
-                            out_amount_msat * 2, "lsps2-jit");
-
-    fprintf(stderr, "LSP: JIT channel opened for client %zu (scid=0x%llx)\n",
-            client_idx, (unsigned long long)scid);
-}
-
-/* LSPS0 adapter: bridges bolt8_server callback to lsps_handle_request. */
+/* LSPS0 adapter for the BOLT #8 listener.  Requests from outside peers are
+   answered without any channel context (see lsps_peer_request). */
 static int lsps0_bolt8_cb(void *userdata, int fd, bolt8_state_t *state,
                            const char *json_req, char *resp_buf, size_t resp_cap)
 {
-    (void)state;
-    if (!json_req || !resp_buf || resp_cap == 0) return 0;
-    lsps_ctx_t *ctx = (lsps_ctx_t *)userdata;
-
-    cJSON *json = cJSON_Parse(json_req);
-    if (!json) {
-        cJSON *err = lsps_build_error(0, LSPS_ERR_PARSE_ERROR, "parse error");
-        if (err) {
-            char *s = cJSON_PrintUnformatted(err);
-            if (s) {
-                size_t n = strlen(s);
-                if (n < resp_cap) { memcpy(resp_buf, s, n + 1); free(s); cJSON_Delete(err); return (int)n; }
-                free(s);
-            }
-            cJSON_Delete(err);
-        }
-        return 0;
-    }
-
-    int id = 0;
-    const char *method = lsps_parse_request(json, &id);
-    cJSON *resp = NULL;
-
-    if (!method) {
-        resp = lsps_build_error(id, LSPS_ERR_INVALID_REQUEST, "invalid request");
-    } else if (strcmp(method, "lsps1_get_info") == 0) {
-        lsps1_info_t info;
-        memset(&info, 0, sizeof(info));
-        info.min_channel_balance_msat = 100000000ULL;
-        info.max_channel_balance_msat = 10000000000ULL;
-        info.min_confirmations        = 1;
-        info.base_fee_msat            = 1000;
-        info.fee_ppm                  = 500;
-        resp = lsps_build_response(id, lsps1_build_get_info_response(&info));
-    } else if (strcmp(method, "lsps2_get_info") == 0) {
-        lsps2_fee_params_t params;
-        memset(&params, 0, sizeof(params));
-        params.min_fee_msat             = 1000;
-        params.fee_ppm                  = 500;
-        params.min_channel_balance_msat = 100000000ULL;
-        params.max_channel_balance_msat = 10000000000ULL;
-        resp = lsps_build_response(id, lsps2_build_get_info_response(&params));
-    } else if (lsps_handle_request(ctx, fd, json)) {
-        cJSON_Delete(json);
-        return 0;
-    } else {
-        resp = lsps_build_error(id, LSPS_ERR_METHOD_NOT_FOUND, "method not found");
-    }
-
-    cJSON_Delete(json);
-    int written = 0;
-    if (resp) {
-        char *s = cJSON_PrintUnformatted(resp);
-        if (s) {
-            size_t n = strlen(s);
-            if (n < resp_cap) { memcpy(resp_buf, s, n + 1); written = (int)n; }
-            free(s);
-        }
-        cJSON_Delete(resp);
-    }
-    return written;
+    (void)userdata; (void)fd; (void)state;
+    return lsps_peer_request(json_req, resp_buf, resp_cap);
 }
 
 /* Chain monitoring: called by bip158_backend after each new block is processed */
@@ -299,7 +219,9 @@ static void usage(const char *prog) {
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
-        "  --no-jit            Disable JIT channel fallback\n"
+        "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
+        "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
+        "                      an open can strand the LSP's funds. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
         "                       Comma-separated activates TRUE N-way mixed arity per level\n"
@@ -355,6 +277,7 @@ static void usage(const char *prog) {
         "  --test-splice-client-seckey HEX  Client[0] secret key for test-only MuSig2 signing\n"
         "  --test-lightclient  Run in BIP 157/158 light-client mode and verify filter sync\n"
         "  --test-jit          After demo: create JIT channels for all clients\n"
+        "                      (implies --enable-jit-experimental)\n"
         "  --test-lsps2        After demo: wait for client LSPS2 buy flow\n"
         "  --test-bolt12       After demo: BOLT12 offer codec + signature test\n"
         "  --test-buy-liquidity After demo: buy inbound liquidity from L-stock\n"
@@ -1434,7 +1357,7 @@ int main(int argc, char *argv[]) {
     int32_t active_blocks_arg = -1;  /* -1 = auto */
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
-    int no_jit = 0;
+    int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
                                         (1, 2 = legacy DW; 3 = PS canonical) */
@@ -1814,8 +1737,8 @@ int main(int argc, char *argv[]) {
             dying_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--jit-amount") == 0 && i + 1 < argc)
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--no-jit") == 0)
-            no_jit = 1;
+        else if (strcmp(argv[i], "--enable-jit-experimental") == 0)
+            enable_jit_experimental = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -2501,6 +2424,7 @@ int main(int argc, char *argv[]) {
             .seckey_on_cmdline = seckey_hex != NULL,
             .have_db = db_path != NULL,
             .have_wt_db = wt_db_path != NULL,
+            .enable_jit_experimental = enable_jit_experimental,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -2510,6 +2434,14 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+    /* The JIT test mode opens a JIT channel itself, so it carries the opt-in
+       (--test-* is refused on mainnet by the gates above). */
+    if (test_jit)
+        enable_jit_experimental = 1;
+    if (enable_jit_experimental)
+        fprintf(stderr, "WARNING: --enable-jit-experimental: JIT channel opens are "
+                "enabled. This is unsafe and for testing only.\n");
 
     /* Resolve confirmation timeout */
     int confirm_timeout_secs = (confirm_timeout_arg > 0) ? confirm_timeout_arg
@@ -3332,7 +3264,7 @@ int main(int argc, char *argv[]) {
 
             /* JIT Channel Fallback */
             jit_channels_init(mgr);
-            if (no_jit) mgr->jit_enabled = 0;
+            mgr->jit_enabled = enable_jit_experimental;
             mgr->jit_funding_sats = (jit_amount_arg > 0) ?
                 (uint64_t)jit_amount_arg :
                 (funding_sats / (uint64_t)rec_n_clients);
@@ -3627,11 +3559,8 @@ accept_new_factory:
             g_ln_dispatch.invoices = &g_invoice_tbl;
 
             /* Wire LSPS0 callback */
-            memset(&g_lsps_ctx, 0, sizeof(g_lsps_ctx));
-            g_lsps_ctx.mgr = g_channel_mgr;
-            g_lsps_ctx.lsp = g_lsp;
             g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;
-            g_bolt8_cfg.cb_userdata      = &g_lsps_ctx;
+            g_bolt8_cfg.cb_userdata      = NULL;
 
             /* Wire Tor proxy for .onion outbound peers */
             if (tor_proxy_arg) {
@@ -3663,7 +3592,7 @@ accept_new_factory:
             g_ln_dispatch.watchtower  = &g_watchtower;
             g_ln_dispatch.scb_path    = scb_path_arg; /* NULL = disabled */
     g_ln_dispatch.jit_pending = &g_lsps2_pending;
-    g_ln_dispatch.jit_open_cb = on_jit_open;
+    g_ln_dispatch.jit_open_cb = NULL;
     g_ln_dispatch.jit_cb_ctx  = NULL;
     g_ln_dispatch.network     = network;
 
@@ -4558,7 +4487,7 @@ accept_new_factory:
 
         /* JIT Channel Fallback (Gap #2) */
         jit_channels_init(mgr);
-        if (no_jit) mgr->jit_enabled = 0;
+        mgr->jit_enabled = enable_jit_experimental;
         mgr->jit_funding_sats = (jit_amount_arg > 0) ?
             (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
 

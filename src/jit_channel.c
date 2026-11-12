@@ -54,8 +54,13 @@ int jit_channels_init(void *mgr_ptr) {
         memset(mgr->jit_channels, 0, mgr->jit_channels_cap * sizeof(jit_channel_t));
     }
     mgr->n_jit_channels = 0;
-    mgr->jit_enabled = 1;
+    mgr->jit_enabled = 0;
     return 1;
+}
+
+int jit_channels_enabled(void *mgr_ptr) {
+    lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
+    return (mgr && mgr->jit_enabled) ? 1 : 0;
 }
 
 jit_channel_t *jit_channel_find(void *mgr_ptr, size_t client_idx) {
@@ -104,7 +109,13 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
                         const char *reason) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
     lsp_t *lsp = (lsp_t *)lsp_ptr;
-    if (!mgr || !lsp || !mgr->jit_channels) return 0;
+    if (!mgr || !lsp) return 0;
+    if (!jit_channels_enabled(mgr)) {
+        fprintf(stderr, "LSP JIT: not opening a JIT channel for client %zu (%s): "
+                "JIT opens are disabled\n", client_idx, reason ? reason : "");
+        return 0;
+    }
+    if (!mgr->jit_channels) return 0;
     if (client_idx >= mgr->n_channels) return 0;
     if (lsp->client_fds[client_idx] < 0) return 0;
     if (mgr->n_jit_channels >= mgr->jit_channels_cap) return 0;
@@ -150,11 +161,21 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     }
     cJSON_Delete(offer);
 
-    /* Wait for MSG_JIT_ACCEPT — drain any stale messages (e.g. REGISTER_INVOICE
-       from demo phase) that arrive before the accept.  30s total timeout. */
+    /* Wait for the client's answer: MSG_JIT_ACCEPT, or MSG_JIT_REJECT which
+       ends the wait at once.  Any other message the client sends meanwhile
+       belongs to the normal message flow: it is held for the caller's loop
+       (lsp_channels_drain_deferred), never dropped.  30s total timeout. */
     wire_msg_t accept_msg;
     int got_accept = 0;
     for (int attempt = 0; attempt < 30; attempt++) {
+        if (lsp_channels_deferred_count(mgr) >= LSP_DEFERRED_MSGS_MAX) {
+            /* No room to hold another message: stop reading and give up,
+               leaving whatever is unread on the connection. */
+            fprintf(stderr, "LSP JIT: too many messages held while waiting for "
+                    "client %zu; abandoning the offer\n", client_idx);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(lsp->client_fds[client_idx], &rfds);
@@ -170,10 +191,25 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
             got_accept = 1;
             break;
         }
-        /* Discard stale message and keep waiting */
-        fprintf(stderr, "LSP JIT: discarding stale msg 0x%02x while waiting for JIT_ACCEPT\n",
-                accept_msg.msg_type);
-        cJSON_Delete(accept_msg.json);
+        if (accept_msg.msg_type == MSG_JIT_REJECT) {
+            size_t rej_idx = 0;
+            char rej_reason[128] = "";
+            wire_parse_jit_reject(accept_msg.json, &rej_idx,
+                                    rej_reason, sizeof(rej_reason));
+            printf("LSP JIT: client %zu declined the JIT offer (%s)\n",
+                   client_idx, rej_reason);
+            cJSON_Delete(accept_msg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
+        /* Not an answer to the offer: hold it for the main loop. */
+        if (!lsp_channels_defer_msg(mgr, client_idx, &accept_msg)) {
+            fprintf(stderr, "LSP JIT: cannot hold msg 0x%02x from client %zu; "
+                    "abandoning the offer\n", accept_msg.msg_type, client_idx);
+            cJSON_Delete(accept_msg.json);
+            memset(lsp_seckey, 0, 32);
+            return 0;
+        }
     }
     if (!got_accept) {
         fprintf(stderr, "LSP JIT: timeout waiting for JIT_ACCEPT from client %zu\n",
@@ -619,6 +655,10 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
                 client_idx);
         return 0;
     }
+    /* Remembered so the channel can still be retired once this close is
+       deep enough, if the wait below gives up first. */
+    memcpy(jit->close_txid_hex, close_txid, 64);
+    jit->close_txid_hex[64] = '\0';
 
     /* Confirm */
     if (mgr->rot_is_regtest) {
@@ -669,6 +709,49 @@ int jit_channel_cooperative_close(void *mgr_ptr, size_t client_idx,
     return 1;
 }
 
+int jit_close_confirmed(void *chain_be_ptr, const jit_channel_t *jit,
+                        const char *close_txid) {
+    chain_backend_t *chain = (chain_backend_t *)chain_be_ptr;
+    if (!chain || !jit || !close_txid || close_txid[0] == '\0') return 0;
+    if (!chain->get_confirmations || !chain->is_outpoint_spent_confirmed) return 0;
+    if (jit->funding_txid_hex[0] == '\0') return 0;
+    /* The close must be as deep as any other close before state is dropped:
+       a shallower one can still be reorganised away. */
+    int confs = chain->get_confirmations(chain, close_txid);
+    if (confs < chain_close_confs(chain, chain->is_regtest)) return 0;
+    return chain->is_outpoint_spent_confirmed(chain, jit->funding_txid_hex,
+                                               jit->funding_vout) == 1;
+}
+
+int jit_client_handle_migrate(jit_channel_t *jit, uint32_t migrate_jit_id,
+                               const char *close_txid,
+                               void *wt_ptr, void *db_ptr) {
+    watchtower_t *wt = (watchtower_t *)wt_ptr;
+    persist_t *db = (persist_t *)db_ptr;
+    if (!jit || jit->jit_channel_id != migrate_jit_id) return 0;
+    if (jit->state == JIT_STATE_NONE || jit->state == JIT_STATE_CLOSED) return 0;
+
+    if (!jit_close_confirmed(wt ? wt->chain : NULL, jit, close_txid)) {
+        fprintf(stderr, "JIT channel %08x: LSP announced migration but close "
+                "%s is not confirmed deep enough, or funding output %s:%u is "
+                "not confirmed spent; keeping the channel record\n",
+                jit->jit_channel_id,
+                (close_txid && close_txid[0]) ? close_txid : "(none)",
+                jit->funding_txid_hex[0] ? jit->funding_txid_hex : "(unknown)",
+                jit->funding_vout);
+        return 0;
+    }
+
+    jit->state = JIT_STATE_CLOSED;
+    /* Entries are keyed by channel id; the factory channel has its own id
+       and its entries must stay. */
+    if (wt)
+        watchtower_remove_channel(wt, jit->jit_channel_id);
+    if (db)
+        persist_delete_jit_channel(db, jit->jit_channel_id);
+    return 1;
+}
+
 int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
                          size_t client_idx, uint32_t target_factory_id) {
     lsp_channel_mgr_t *mgr = (lsp_channel_mgr_t *)mgr_ptr;
@@ -678,6 +761,31 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
     jit_channel_t *jit = jit_channel_find(mgr, client_idx);
     if (!jit || jit->state != JIT_STATE_OPEN) return 0;
 
+    /* The record and the watch entries are what let the LSP find, close or
+       defend this output later.  They go only once the cooperative close the
+       LSP broadcast is deep enough.  An output spent any other way (a
+       commitment, which may need a penalty or a sweep) keeps them. */
+    void *chain = mgr->chain_be;
+    if (!chain && mgr->watchtower)
+        chain = mgr->watchtower->chain;
+    if (jit->close_txid_hex[0] == '\0') {
+        fprintf(stderr, "LSP JIT: channel %08x for client %zu NOT retired: "
+                "no cooperative close of it was broadcast; channel stays "
+                "open, its record and watch entries are kept\n",
+                jit->jit_channel_id, client_idx);
+        return 0;
+    }
+    if (!jit_close_confirmed(chain, jit, jit->close_txid_hex)) {
+        fprintf(stderr, "LSP JIT: channel %08x for client %zu NOT retired: "
+                "close %s is not confirmed deep enough or funding output "
+                "%s:%u is not confirmed spent; channel stays open, its "
+                "record and watch entries are kept\n",
+                jit->jit_channel_id, client_idx, jit->close_txid_hex,
+                jit->funding_txid_hex[0] ? jit->funding_txid_hex : "(unknown)",
+                jit->funding_vout);
+        return 0;
+    }
+
     jit->state = JIT_STATE_MIGRATING;
     jit->target_factory_id = target_factory_id;
 
@@ -686,16 +794,14 @@ int jit_channel_migrate(void *mgr_ptr, void *lsp_ptr,
         cJSON *mig = wire_build_jit_migrate(jit->jit_channel_id,
                                                target_factory_id,
                                                jit->channel.local_amount,
-                                               jit->channel.remote_amount);
+                                               jit->channel.remote_amount,
+                                               jit->close_txid_hex);
         if (lsp->client_fds[client_idx] >= 0)
             wire_send(lsp->client_fds[client_idx], MSG_JIT_MIGRATE, mig);
         cJSON_Delete(mig);
     }
 
-    /* JIT funds recovered via on-chain cooperative close (Phase A.5).
-       New factory funding draws from wallet which now includes JIT sats. */
-
-    /* Close the JIT channel */
+    /* Closed by our cooperative close, deep enough: drop the record. */
     jit->state = JIT_STATE_CLOSED;
 
     /* Remove watchtower entries for this JIT channel */
@@ -875,4 +981,5 @@ void jit_channels_cleanup(void *mgr_ptr) {
         mgr->jit_channels = NULL;
     }
     mgr->n_jit_channels = 0;
+    lsp_channels_free_deferred(mgr);
 }

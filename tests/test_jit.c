@@ -175,14 +175,22 @@ int test_jit_ready_round_trip(void) {
 }
 
 int test_jit_migrate_round_trip(void) {
-    cJSON *j = wire_build_jit_migrate(0x8002, 5, 30000, 20000);
+    char close_in[65], close_out[65];
+    memset(close_in, 'a', 64); close_in[64] = '\0';
+    cJSON *j = wire_build_jit_migrate(0x8002, 5, 30000, 20000, close_in);
     TEST_ASSERT(j != NULL, "build jit_migrate");
 
     uint32_t jit_ch_id, factory_id;
     uint64_t local, remote;
     TEST_ASSERT(wire_parse_jit_migrate(j, &jit_ch_id, &factory_id,
-                                         &local, &remote),
+                                         &local, &remote, close_out),
                 "parse jit_migrate");
+    TEST_ASSERT(strcmp(close_out, close_in) == 0, "close_txid mismatch");
+    cJSON *bad = wire_build_jit_migrate(0x8002, 5, 30000, 20000, "");
+    TEST_ASSERT(!wire_parse_jit_migrate(bad, &jit_ch_id, &factory_id,
+                                          &local, &remote, close_out),
+                "a migrate without a close txid is rejected");
+    cJSON_Delete(bad);
 
     TEST_ASSERT_EQ((long)jit_ch_id, 0x8002, "jit_channel_id mismatch");
     TEST_ASSERT_EQ((long)factory_id, 5, "target_factory_id mismatch");
@@ -203,7 +211,7 @@ int test_jit_channel_init_and_find(void) {
     TEST_ASSERT(jit_channels_init(&mgr), "jit_channels_init");
     TEST_ASSERT(mgr.jit_channels != NULL, "jit_channels allocated");
     TEST_ASSERT_EQ((long)mgr.n_jit_channels, 0, "n_jit should be 0");
-    TEST_ASSERT_EQ(mgr.jit_enabled, 1, "jit should be enabled");
+    TEST_ASSERT_EQ(mgr.jit_enabled, 0, "opening JIT channels is off after init");
 
     /* No channels yet */
     TEST_ASSERT(jit_channel_find(&mgr, 0) == NULL, "should find nothing");
@@ -566,6 +574,20 @@ int test_jit_cooperative_close_key_mismatch(void) {
 
 /* --- Step 7b: Migration Tests --- */
 
+/* A chain on which every queried outpoint was spent by a confirmed
+   transaction. */
+static int migrate_chain_spent(chain_backend_t *self, const char *txid_hex,
+                               uint32_t vout) {
+    (void)self; (void)txid_hex; (void)vout;
+    return 1;
+}
+
+/* ...by a close at the default close depth. */
+static int migrate_chain_close_deep(chain_backend_t *self, const char *txid_hex) {
+    (void)self; (void)txid_hex;
+    return CONF_DEFAULT_CLOSE;
+}
+
 int test_jit_migrate_lifecycle(void) {
     lsp_channel_mgr_t mgr;
     memset(&mgr, 0, sizeof(mgr));
@@ -586,12 +608,21 @@ int test_jit_migrate_lifecycle(void) {
     jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 1;
     jits[0].channel.local_amount = 5000;
     jits[0].channel.remote_amount = 3000;
+    memset(jits[0].funding_txid_hex, 'b', 64);
     mgr.n_jit_channels = 1;
+
+    /* The JIT funding output has been spent on chain. */
+    chain_backend_t spent_chain;
+    memset(&spent_chain, 0, sizeof(spent_chain));
+    spent_chain.is_outpoint_spent_confirmed = migrate_chain_spent;
+    spent_chain.get_confirmations = migrate_chain_close_deep;
+    mgr.chain_be = &spent_chain;
+    memset(jits[0].close_txid_hex, 'd', 64);   /* our cooperative close */
 
     TEST_ASSERT(jit_channel_is_active(&mgr, 1), "JIT should be active before migrate");
 
     /* Migrate (no LSP/fd needed for state transition test) */
-    jit_channel_migrate(&mgr, NULL, 1, 0);
+    TEST_ASSERT_EQ(jit_channel_migrate(&mgr, NULL, 1, 0), 1, "migrate retires the channel");
 
     /* JIT channel should be closed */
     TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "JIT should be closed");
@@ -630,9 +661,19 @@ int test_jit_migrate_no_balance_hack(void) {
     jits[0].jit_channel_id = JIT_CHANNEL_ID_BASE | 0;
     jits[0].channel.local_amount = 15000;
     jits[0].channel.remote_amount = 12000;
+    memset(jits[0].funding_txid_hex, 'c', 64);
     mgr.n_jit_channels = 1;
 
-    jit_channel_migrate(&mgr, NULL, 0, 0);
+    /* The JIT funding output has been spent on chain. */
+    chain_backend_t spent_chain;
+    memset(&spent_chain, 0, sizeof(spent_chain));
+    spent_chain.is_outpoint_spent_confirmed = migrate_chain_spent;
+    spent_chain.get_confirmations = migrate_chain_close_deep;
+    mgr.chain_be = &spent_chain;
+    memset(jits[0].close_txid_hex, 'd', 64);   /* our cooperative close */
+
+    TEST_ASSERT_EQ(jit_channel_migrate(&mgr, NULL, 0, 0), 1, "migrate retires the channel");
+    TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "JIT should be closed");
 
     TEST_ASSERT_EQ((long)mgr.entries[0].channel.local_amount, 100000,
                    "factory local unchanged");
@@ -1150,7 +1191,7 @@ int test_regtest_jit_daemon_trigger(void) {
     int h = regtest_get_block_height(mgr.watchtower->rt);
     factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
     TEST_ASSERT(fs == FACTORY_EXPIRED, "daemon should detect factory EXPIRED");
-    TEST_ASSERT(mgr.jit_enabled, "JIT should be enabled");
+    TEST_ASSERT(!mgr.jit_enabled, "JIT opens are off after init");
     TEST_ASSERT(!jit_channel_is_active(&mgr, 0), "no active JIT for client 0");
 
     /* Create socketpair for client wire protocol */
@@ -1168,9 +1209,21 @@ int test_regtest_jit_daemon_trigger(void) {
     pthread_t tid;
     pthread_create(&tid, NULL, jit_client_handler, &client_args);
 
-    /* Call jit_channel_create — same as daemon loop would at line 1891 */
-    int ok = jit_channel_create(&mgr, lsp, 0, 50000, "factory_expired");
-    TEST_ASSERT(ok, "jit_channel_create should succeed");
+    /* Without the opt-in nothing is opened and the wallet is not used. */
+    double bal_before = regtest_get_balance(&rt);
+    TEST_ASSERT(!jit_channel_create(&mgr, lsp, 0, 50000, "factory_expired"),
+                "jit_channel_create refuses while JIT opens are disabled");
+    TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&mgr, lsp), 0,
+                   "expiry trigger does nothing while JIT opens are disabled");
+    TEST_ASSERT_EQ((long)mgr.n_jit_channels, 0, "no JIT channel recorded");
+    TEST_ASSERT(regtest_get_balance(&rt) == bal_before, "wallet balance unchanged");
+
+    /* Opt in, as the experimental flag does, and open through the same
+       factory-expired trigger the daemon loop runs. */
+    mgr.jit_enabled = 1;
+    int ok = lsp_channels_jit_expiry_trigger(&mgr, lsp) == 1 &&
+             jit_channel_is_active(&mgr, 0);
+    TEST_ASSERT(ok, "expiry trigger should open the JIT channel");
 
     /* Verify JIT channel is active */
     TEST_ASSERT(jit_channel_is_active(&mgr, 0), "JIT should be active after create");
@@ -1196,5 +1249,794 @@ int test_regtest_jit_daemon_trigger(void) {
     close(sv[0]);
     close(sv[1]);
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- JIT opens are off unless explicitly enabled --- */
+
+#include "superscalar/ladder.h"
+#include "superscalar/lsps.h"
+#include "superscalar/wallet_source.h"
+#include <poll.h>
+
+static int g_gate_wallet_calls;
+static int g_gate_broadcast_calls;
+
+static int gate_wallet_get_utxo(wallet_source_t *self, uint64_t min_sats,
+                                char txid_hex[65], uint32_t *vout,
+                                uint64_t *amount, unsigned char *spk,
+                                size_t *spk_len) {
+    (void)self; (void)min_sats; (void)txid_hex; (void)vout; (void)amount;
+    (void)spk; (void)spk_len;
+    g_gate_wallet_calls++;
+    return 0;
+}
+
+static int gate_chain_send_raw_tx(chain_backend_t *self, const char *tx_hex,
+                                  char *txid_out) {
+    (void)self; (void)tx_hex; (void)txid_out;
+    g_gate_broadcast_calls++;
+    return 0;
+}
+
+/* 1 if a wire frame is waiting on fd within timeout_ms. */
+static int gate_fd_readable(int fd, int timeout_ms) {
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    return poll(&p, 1, timeout_ms) > 0 && (p.revents & POLLIN);
+}
+
+typedef struct {
+    lsp_channel_mgr_t mgr;
+    lsp_t *lsp;
+    secp256k1_context *ctx;
+    wallet_source_t wallet;
+    chain_backend_t chain;
+    int peer_fd[2];             /* the client ends of the connections */
+    ladder_t *ladder;
+} jit_gate_fixture_t;
+
+static int jit_gate_fixture_init(jit_gate_fixture_t *fx, size_t n_clients) {
+    memset(fx, 0, sizeof(*fx));
+    fx->peer_fd[0] = fx->peer_fd[1] = -1;
+    if (n_clients < 1 || n_clients > 2) return 0;
+    fx->ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    fx->mgr.ctx = fx->ctx;
+    fx->mgr.entries = calloc(n_clients, sizeof(lsp_channel_entry_t));
+    fx->mgr.entries_cap = n_clients;
+    fx->mgr.n_channels = n_clients;
+    memset(fx->mgr.rot_lsp_seckey, 0x01, 32);
+    fx->mgr.jit_funding_sats = 50000;
+    fx->wallet.get_utxo = gate_wallet_get_utxo;
+    fx->chain.send_raw_tx = gate_chain_send_raw_tx;
+    fx->mgr.wallet_src = &fx->wallet;
+    fx->mgr.chain_be = &fx->chain;
+    if (!jit_channels_init(&fx->mgr)) return 0;
+
+    fx->lsp = calloc(1, sizeof(lsp_t));
+    if (!fx->mgr.entries || !fx->lsp) return 0;
+    fx->lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
+    if (!fx->lsp->client_fds) return 0;
+    fx->lsp->clients_cap = LSP_MAX_CLIENTS;
+    fx->lsp->n_clients = n_clients;
+    for (size_t i = 0; i < LSP_MAX_CLIENTS; i++) fx->lsp->client_fds[i] = -1;
+    for (size_t i = 0; i < n_clients; i++) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;
+        fx->lsp->client_fds[i] = sv[0];
+        fx->peer_fd[i] = sv[1];
+    }
+
+    /* One factory, expired. */
+    fx->ladder = calloc(1, sizeof(ladder_t));
+    if (!fx->ladder) return 0;
+    fx->ladder->n_factories = 1;
+    fx->ladder->factories[0].cached_state = FACTORY_EXPIRED;
+    fx->mgr.ladder = fx->ladder;
+
+    g_gate_wallet_calls = 0;
+    g_gate_broadcast_calls = 0;
+    return 1;
+}
+
+static void jit_gate_fixture_free(jit_gate_fixture_t *fx) {
+    for (size_t i = 0; i < 2; i++) {
+        if (fx->peer_fd[i] >= 0) close(fx->peer_fd[i]);
+        if (fx->lsp && fx->lsp->client_fds[i] >= 0) close(fx->lsp->client_fds[i]);
+    }
+    jit_channels_cleanup(&fx->mgr);
+    free(fx->mgr.entries);
+    if (fx->lsp) free(fx->lsp->client_fds);
+    free(fx->lsp);
+    free(fx->ladder);
+    if (fx->ctx) secp256k1_context_destroy(fx->ctx);
+}
+
+/* Reads one JIT_OFFER and hangs up, so an enabled open fails fast. */
+static void *gate_peer_take_offer_and_hang_up(void *arg) {
+    int *fd = (int *)arg;
+    static int got_offer = 1;
+    wire_msg_t msg;
+    void *ret = NULL;
+    if (wire_recv(*fd, &msg)) {
+        if (msg.msg_type == MSG_JIT_OFFER) ret = &got_offer;
+        cJSON_Delete(msg.json);
+    }
+    /* Half-close: the LSP sees end-of-stream, and may still write a reply. */
+    shutdown(*fd, SHUT_WR);
+    return ret;
+}
+
+int test_jit_create_refused_when_disabled(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    TEST_ASSERT_EQ(jit_channels_enabled(&fx.mgr), 0, "JIT opens are off by default");
+
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "create refuses when JIT opens are disabled");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200), "nothing was sent to the client");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Enabled: the same call does reach the client. */
+    fx.mgr.jit_enabled = 1;
+    pthread_t tid;
+    pthread_create(&tid, NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[0]);
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "open fails when the client hangs up");
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "with JIT enabled the client receives JIT_OFFER");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+int test_jit_expiry_trigger_refused_when_disabled(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 2), "fixture");
+
+    /* Every factory expired and both clients connected: nothing happens. */
+    for (int pass = 0; pass < 3; pass++)
+        TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&fx.mgr, fx.lsp), 0,
+                       "trigger does nothing when JIT opens are disabled");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200), "client 0 got nothing");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 50), "client 1 got nothing");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Enabled: each connected client is offered a channel. */
+    fx.mgr.jit_enabled = 1;
+    pthread_t tid[2];
+    for (int i = 0; i < 2; i++)
+        pthread_create(&tid[i], NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[i]);
+    TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&fx.mgr, fx.lsp), 2,
+                   "with JIT enabled the trigger attempts an open per client");
+    for (int i = 0; i < 2; i++) {
+        void *peer_ret = NULL;
+        pthread_join(tid[i], &peer_ret);
+        TEST_ASSERT(peer_ret != NULL, "with JIT enabled the client receives JIT_OFFER");
+    }
+
+    /* A factory that has not expired never triggers, enabled or not. */
+    fx.ladder->factories[0].cached_state = FACTORY_ACTIVE;
+    TEST_ASSERT_EQ(lsp_channels_jit_expiry_trigger(&fx.mgr, fx.lsp), 0,
+                   "no trigger while a factory is active");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+static cJSON *gate_build_lsps2_buy(int id) {
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(req, "method", "lsps2.buy");
+    cJSON_AddNumberToObject(req, "id", id);
+    cJSON *params = cJSON_CreateObject();
+    cJSON *ofp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(ofp, "min_fee_msat", 1000);
+    cJSON_AddItemToObject(params, "opening_fee_params", ofp);
+    cJSON_AddNumberToObject(params, "payment_size_msat", 5000000000.0);
+    cJSON_AddItemToObject(req, "params", params);
+    return req;
+}
+
+int test_lsps2_buy_refused_when_jit_disabled(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+
+    lsps_ctx_t lctx = { .mgr = &fx.mgr, .lsp = fx.lsp, .client_idx = 0 };
+    cJSON *req = gate_build_lsps2_buy(41);
+    TEST_ASSERT_EQ(lsps_handle_request(&lctx, fx.lsp->client_fds[0], req), 1,
+                   "request is handled");
+    cJSON_Delete(req);
+
+    /* The client gets exactly one frame: a JSON-RPC error for its request. */
+    TEST_ASSERT(gate_fd_readable(fx.peer_fd[0], 1000), "client gets a reply");
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(fx.peer_fd[0], &msg), "recv reply");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_LSPS_RESPONSE, "reply is an LSPS response, not JIT_OFFER");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(msg.json, "id");
+    const cJSON *err = cJSON_GetObjectItemCaseSensitive(msg.json, "error");
+    const cJSON *code = err ? cJSON_GetObjectItemCaseSensitive(err, "code") : NULL;
+    TEST_ASSERT(id && (int)id->valuedouble == 41, "reply carries the request id");
+    TEST_ASSERT(err && code && (int)code->valuedouble == LSPS_ERR_METHOD_NOT_FOUND,
+                "reply is an error");
+    TEST_ASSERT(cJSON_GetObjectItemCaseSensitive(msg.json, "result") == NULL,
+                "no result, no channel id");
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200), "no further frame (no JIT_OFFER)");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* Without the channel manager (as in the ceremony phases), and with
+       no context at all, both are refused the same way. */
+    {
+        lsps_ctx_t no_mgr = { .mgr = NULL, .lsp = fx.lsp, .client_idx = 0 };
+        const lsps_ctx_t *ctxs[2] = { &no_mgr, NULL };
+        for (int k = 0; k < 2; k++) {
+            cJSON *b = gate_build_lsps2_buy(50 + k);
+            cJSON *g = cJSON_Parse("{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"lsps2.get_info\"}");
+            cJSON *rb = lsps_dispatch_request(ctxs[k], b);
+            cJSON *rg = lsps_dispatch_request(ctxs[k], g);
+            const cJSON *eb = rb ? cJSON_GetObjectItem(rb, "error") : NULL;
+            const cJSON *eg = rg ? cJSON_GetObjectItem(rg, "error") : NULL;
+            const cJSON *cb = eb ? cJSON_GetObjectItem(eb, "code") : NULL;
+            const cJSON *cg = eg ? cJSON_GetObjectItem(eg, "code") : NULL;
+            TEST_ASSERT(cb && (int)cb->valuedouble == LSPS_ERR_METHOD_NOT_FOUND,
+                        "lsps2.buy without the channel manager is -32601");
+            TEST_ASSERT(cg && (int)cg->valuedouble == LSPS_ERR_METHOD_NOT_FOUND &&
+                        !cJSON_GetObjectItem(rg, "result"),
+                        "lsps2.get_info without the channel manager is -32601, no terms");
+            cJSON_Delete(rb); cJSON_Delete(rg); cJSON_Delete(b); cJSON_Delete(g);
+        }
+        TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50), "nothing sent to the client");
+        TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    }
+
+    /* The terms are not advertised either. */
+    const char *info_req = "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"lsps2.get_info\"}";
+    cJSON *info = cJSON_Parse(info_req);
+    cJSON *info_resp = lsps_dispatch_request(&lctx, info);
+    const cJSON *info_err = info_resp ? cJSON_GetObjectItemCaseSensitive(info_resp, "error") : NULL;
+    TEST_ASSERT(info_err && cJSON_GetObjectItemCaseSensitive(info_resp, "result") == NULL,
+                "lsps2.get_info is an error while JIT opens are disabled");
+    cJSON_Delete(info_resp);
+
+    /* Enabled: get_info gives terms, and the same purchase starts an open. */
+    fx.mgr.jit_enabled = 1;
+    info_resp = lsps_dispatch_request(&lctx, info);
+    TEST_ASSERT(info_resp && cJSON_GetObjectItemCaseSensitive(info_resp, "result") != NULL,
+                "lsps2.get_info gives terms once JIT opens are enabled");
+    cJSON_Delete(info_resp);
+    cJSON_Delete(info);
+    pthread_t tid;
+    pthread_create(&tid, NULL, gate_peer_take_offer_and_hang_up, &fx.peer_fd[0]);
+    req = gate_build_lsps2_buy(42);
+    lsps_handle_request(&lctx, fx.lsp->client_fds[0], req);
+    cJSON_Delete(req);
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "with JIT enabled the client receives JIT_OFFER");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+/* --- LSPS requests from outside peers --- */
+
+/* Parses a JSON-RPC reply: returns the error code (0 if it is a result) and
+   the id; -1 if the reply does not parse. */
+static int peer_reply_error_code(const char *reply, int *id_out, int *has_result) {
+    cJSON *j = cJSON_Parse(reply);
+    if (!j) return -1;
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(j, "id");
+    const cJSON *err = cJSON_GetObjectItemCaseSensitive(j, "error");
+    const cJSON *code = err ? cJSON_GetObjectItemCaseSensitive(err, "code") : NULL;
+    if (id_out) *id_out = id ? (int)id->valuedouble : -1;
+    if (has_result)
+        *has_result = cJSON_GetObjectItemCaseSensitive(j, "result") != NULL;
+    int rc = code ? (int)code->valuedouble : 0;
+    cJSON_Delete(j);
+    return rc;
+}
+
+int test_lsps_peer_request_refuses_buy(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    /* Even an LSP that has opted in to JIT opens, with client 0 connected. */
+    fx.mgr.jit_enabled = 1;
+
+    char reply[2048];
+    int id = 0, has_result = 0;
+
+    cJSON *req = gate_build_lsps2_buy(77);
+    char *req_s = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    int n = lsps_peer_request(req_s, reply, sizeof(reply));
+    free(req_s);
+    TEST_ASSERT(n > 0 && (size_t)n == strlen(reply), "a reply is returned to the peer");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result),
+                   LSPS_ERR_METHOD_NOT_FOUND, "lsps2.buy from a peer is an error");
+    TEST_ASSERT_EQ(id, 77, "reply carries the request id");
+    TEST_ASSERT(!has_result, "no result, no channel id");
+    TEST_ASSERT(strstr(reply, "lsps2 is not available") != NULL,
+                "the refusal says why");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 200),
+                "nothing was written to factory client 0");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+
+    /* No JIT terms are advertised to a peer that can never buy. */
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"lsps2.get_info\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "lsps2.get_info is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result),
+                   LSPS_ERR_METHOD_NOT_FOUND, "lsps2.get_info from a peer is an error");
+    TEST_ASSERT(id == 5 && !has_result, "no terms in the reply");
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"lsps2_get_info\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0 && peer_reply_error_code(reply, &id, &has_result) ==
+                         LSPS_ERR_METHOD_NOT_FOUND && !has_result,
+                "the other spelling is refused as well");
+
+    /* Orders are not taken from, or shown to, an outside peer. */
+    for (int k = 0; k < 2; k++) {
+        const char *rq = k == 0
+            ? "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"lsps1.create_order\","
+              "\"params\":{\"channel_balance_msat\":1000000,\"confirms_within_blocks\":1}}"
+            : "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"lsps1.get_order\","
+              "\"params\":{\"order_id\":\"1\"}}";
+        n = lsps_peer_request(rq, reply, sizeof(reply));
+        TEST_ASSERT(n > 0, "the order request is answered");
+        TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result),
+                       LSPS_ERR_METHOD_NOT_FOUND, "an order request from a peer is refused");
+        TEST_ASSERT(!has_result && id == 10 + k, "no order in the reply");
+    }
+    /* The table was not touched: an order a factory client then creates
+       gets the next id the table would have given, which a local order
+       made before shows. */
+    {
+        cJSON *a = cJSON_Parse("{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"lsps1.create_order\","
+                               "\"params\":{\"channel_balance_msat\":1000000}}");
+        cJSON *r1 = lsps_dispatch_request(NULL, a);
+        for (int k = 0; k < 3; k++) {
+            n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"lsps1.create_order\","
+                                  "\"params\":{\"channel_balance_msat\":1000000}}",
+                                  reply, sizeof(reply));
+            TEST_ASSERT(n > 0, "answered");
+        }
+        cJSON *r2 = lsps_dispatch_request(NULL, a);
+        const cJSON *res1 = cJSON_GetObjectItem(r1, "result");
+        const cJSON *res2 = cJSON_GetObjectItem(r2, "result");
+        const cJSON *o1 = res1 ? cJSON_GetObjectItem(res1, "order_id") : NULL;
+        const cJSON *o2 = res2 ? cJSON_GetObjectItem(res2, "order_id") : NULL;
+        TEST_ASSERT(o1 && o2 && cJSON_IsString(o1) && cJSON_IsString(o2),
+                    "local orders are created");
+        TEST_ASSERT_EQ(atoi(o2->valuestring), atoi(o1->valuestring) + 1,
+                       "peer requests in between created no order");
+        cJSON_Delete(r1);
+        cJSON_Delete(r2);
+        cJSON_Delete(a);
+    }
+
+    /* Other read-only methods are still answered, through the reply buffer. */
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"lsps1.get_info\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "lsps1.get_info is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, &has_result), 0, "lsps1.get_info is not an error");
+    TEST_ASSERT(id == 9 && has_result, "lsps1.get_info reply has a result");
+
+    n = lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"lsps9.nope\"}",
+                          reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "unknown method is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, &id, NULL), LSPS_ERR_METHOD_NOT_FOUND,
+                   "unknown method is method-not-found");
+
+    n = lsps_peer_request("{not json", reply, sizeof(reply));
+    TEST_ASSERT(n > 0, "malformed JSON is answered");
+    TEST_ASSERT_EQ(peer_reply_error_code(reply, NULL, NULL), LSPS_ERR_PARSE_ERROR,
+                   "malformed JSON is a parse error");
+
+    char tiny[8];
+    TEST_ASSERT_EQ(lsps_peer_request("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"lsps2.buy\"}",
+                                     tiny, sizeof(tiny)), 0,
+                   "a reply that does not fit is not truncated into the buffer");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50),
+                "still nothing written to factory client 0");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+/* --- A JIT channel whose funding output is still on chain is not forgotten --- */
+
+/* What the fake chain says about the outpoint: 1 = spent by a confirmed
+   transaction, 0 = unspent, -1 = cannot tell. */
+static int g_fake_spent_answer;
+static int g_fake_spent_queries;
+
+static int fake_outpoint_spent_confirmed(chain_backend_t *self,
+                                         const char *txid_hex, uint32_t vout) {
+    (void)self; (void)txid_hex; (void)vout;
+    g_fake_spent_queries++;
+    return g_fake_spent_answer;
+}
+
+static size_t jit_rows_in_db(persist_t *p) {
+    jit_channel_t *loaded = calloc(4, sizeof(jit_channel_t));
+    size_t count = 0;
+    persist_load_jit_channels(p, loaded, 4, &count);
+    free(loaded);
+    return count;
+}
+
+static void fill_open_jit(jit_channel_t *jit, size_t client_idx) {
+    memset(jit, 0, sizeof(*jit));
+    jit->client_idx = client_idx;
+    jit->state = JIT_STATE_OPEN;
+    jit->jit_channel_id = JIT_CHANNEL_ID_BASE | (uint32_t)client_idx;
+    jit->funding_amount = 50000;
+    jit->funding_confirmed = 1;
+    memset(jit->funding_txid_hex, 'a', 64);
+    jit->funding_txid_hex[64] = '\0';
+    jit->funding_vout = 1;
+    jit->channel.local_amount = 30000;
+    jit->channel.remote_amount = 20000;
+}
+
+/* Confirmations the fake chain reports for any transaction. */
+static int g_fake_close_confs;
+
+static int fake_close_confirmations(chain_backend_t *self, const char *txid_hex) {
+    (void)self; (void)txid_hex;
+    return g_fake_close_confs;
+}
+
+#define FAKE_CLOSE_TXID "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+int test_jit_migrate_keeps_unspent_channel(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 2), "fixture");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open db");
+    fx.mgr.persist = &db;
+    fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    fx.chain.get_confirmations = fake_close_confirmations;   /* not regtest: depth 6 */
+
+    jit_channel_t *jits = (jit_channel_t *)fx.mgr.jit_channels;
+    fill_open_jit(&jits[0], 1);
+    fx.mgr.n_jit_channels = 1;
+    TEST_ASSERT(persist_save_jit_channel(&db, &jits[0]), "save jit row");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row present before");
+
+    /* Spent, deep, but not by a close of ours (a commitment the client
+       broadcast, say): kept, since a penalty or sweep may still be due. */
+    g_fake_spent_answer = 1;
+    g_fake_close_confs = 100;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "a channel spent by something other than our close is not retired");
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
+
+    /* Our cooperative close was broadcast. */
+    memcpy(jits[0].close_txid_hex, FAKE_CLOSE_TXID, 65);
+
+    /* Output unspent, then "cannot tell": kept. */
+    for (int answer = 0; answer >= -1; answer--) {
+        g_fake_spent_answer = answer;
+        g_fake_spent_queries = 0;
+        TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                       "a channel still on chain is not retired");
+        TEST_ASSERT_EQ(g_fake_spent_queries, 1, "the chain was asked");
+        TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+        TEST_ASSERT(jit_channel_is_active(&fx.mgr, 1), "channel still active");
+        TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+        TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
+    }
+
+    /* Spent, but our close is not yet at the close depth (6 off regtest). */
+    g_fake_spent_answer = 1;
+    const int shallow[] = { -1, 0, 1, CONF_DEFAULT_CLOSE - 1 };
+    for (size_t i = 0; i < sizeof(shallow) / sizeof(shallow[0]); i++) {
+        g_fake_close_confs = shallow[i];
+        TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                       "a close below the close depth does not retire the channel");
+    }
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+
+    /* A backend that cannot answer either question, and no backend at all. */
+    g_fake_close_confs = CONF_DEFAULT_CLOSE;
+    fx.chain.is_outpoint_spent_confirmed = NULL;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "kept when the backend has no chain-only spent query");
+    fx.chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    fx.chain.get_confirmations = NULL;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "kept when the backend has no confirmation query");
+    fx.chain.get_confirmations = fake_close_confirmations;
+    fx.mgr.chain_be = NULL;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 0,
+                   "kept when there is no chain backend");
+    TEST_ASSERT(jits[0].state == JIT_STATE_OPEN, "state stays OPEN");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[1], 100), "no JIT_MIGRATE sent");
+
+    /* Our close at the close depth and the output spent: retired, row
+       deleted, client told which close it was. */
+    fx.mgr.chain_be = &fx.chain;
+    TEST_ASSERT_EQ(jit_channel_migrate(&fx.mgr, fx.lsp, 1, 0), 1,
+                   "a channel closed by our close at the close depth is retired");
+    TEST_ASSERT(jits[0].state == JIT_STATE_CLOSED, "state is CLOSED");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 0, "row is deleted");
+    TEST_ASSERT(gate_fd_readable(fx.peer_fd[1], 1000), "client is told");
+    wire_msg_t msg;
+    TEST_ASSERT(wire_recv(fx.peer_fd[1], &msg), "recv");
+    TEST_ASSERT_EQ(msg.msg_type, MSG_JIT_MIGRATE, "JIT_MIGRATE");
+    const cJSON *ct = cJSON_GetObjectItem(msg.json, "close_txid");
+    TEST_ASSERT(ct && cJSON_IsString(ct) && strcmp(ct->valuestring, FAKE_CLOSE_TXID) == 0,
+                "JIT_MIGRATE names the close");
+    cJSON_Delete(msg.json);
+    TEST_ASSERT(!gate_fd_readable(fx.peer_fd[0], 50), "other client untouched");
+
+    fx.mgr.persist = NULL;
+    persist_close(&db);
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+static size_t wt_entries_for(const watchtower_t *wt, uint32_t channel_id) {
+    size_t n = 0;
+    for (size_t i = 0; i < wt->n_entries; i++)
+        if (wt->entries[i].channel_id == channel_id) n++;
+    return n;
+}
+
+int test_jit_client_migrate_keeps_factory_watch(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open db");
+
+    /* The client watchtower: its factory channel is channel id 0. */
+    watchtower_t wt;
+    watchtower_init(&wt, 1, NULL, NULL, NULL);
+    chain_backend_t chain;
+    memset(&chain, 0, sizeof(chain));
+    chain.is_outpoint_spent_confirmed = fake_outpoint_spent_confirmed;
+    chain.get_confirmations = fake_close_confirmations;     /* not regtest: depth 6 */
+    wt.chain = &chain;
+
+    jit_channel_t jit;
+    fill_open_jit(&jit, 0);
+    TEST_ASSERT(persist_save_jit_channel(&db, &jit), "save jit row");
+
+    unsigned char spk[34];
+    memset(spk, 0, sizeof(spk));
+    spk[0] = 0x51; spk[1] = 0x20;
+    unsigned char txid[32];
+    for (unsigned char cn = 0; cn < 3; cn++) {
+        memset(txid, 0x40 + cn, 32);
+        TEST_ASSERT(watchtower_watch(&wt, 0, cn, txid, 0, 10000, spk, 34),
+                    "watch a revoked factory-channel commitment");
+    }
+    memset(txid, 0x77, 32);
+    TEST_ASSERT(watchtower_watch(&wt, jit.jit_channel_id, 0, txid, 0, 9000, spk, 34),
+                "an entry under the JIT channel id");
+    TEST_ASSERT_EQ((long)wt.n_entries, 4, "4 entries");
+
+    /* Output not seen spent: nothing changes. */
+    g_fake_close_confs = 100;
+    for (int answer = 0; answer >= -1; answer--) {
+        g_fake_spent_answer = answer;
+        TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                                  FAKE_CLOSE_TXID, &wt, &db), 0,
+                       "record kept while the output is not seen spent");
+        TEST_ASSERT(jit.state == JIT_STATE_OPEN, "state stays OPEN");
+        TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+        TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
+    }
+    /* Spent, but the named close is below the close depth, or none named. */
+    g_fake_spent_answer = 1;
+    g_fake_close_confs = CONF_DEFAULT_CLOSE - 1;
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                              FAKE_CLOSE_TXID, &wt, &db), 0,
+                   "record kept while the close is shallower than the close depth");
+    g_fake_close_confs = CONF_DEFAULT_CLOSE;
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, "", &wt, &db), 0,
+                   "record kept when no close is named");
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id, NULL, &wt, &db), 0,
+                   "record kept when no close is named (NULL)");
+    /* No chain view at all. */
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                              FAKE_CLOSE_TXID, NULL, &db), 0,
+                   "record kept without a chain view");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+    TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
+
+    /* A message naming some other channel changes nothing either. */
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, 0, FAKE_CLOSE_TXID, &wt, &db), 0,
+                   "a message for channel id 0 is not for the JIT channel");
+    TEST_ASSERT_EQ((long)wt.n_entries, 4, "no watch entry removed");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 1, "row is kept");
+
+    /* The named close at the close depth and the output spent: the JIT
+       record goes, the factory channel's watch entries all stay. */
+    TEST_ASSERT_EQ(jit_client_handle_migrate(&jit, jit.jit_channel_id,
+                                              FAKE_CLOSE_TXID, &wt, &db), 1,
+                   "record closed once the close is confirmed deep enough");
+    TEST_ASSERT(jit.state == JIT_STATE_CLOSED, "state is CLOSED");
+    TEST_ASSERT_EQ((long)jit_rows_in_db(&db), 0, "row is deleted");
+    TEST_ASSERT_EQ((long)wt_entries_for(&wt, 0), 3,
+                   "every factory-channel watch entry is still there");
+    TEST_ASSERT_EQ((long)wt_entries_for(&wt, jit.jit_channel_id), 0,
+                   "only the JIT channel's entry was removed");
+
+    wt.chain = NULL;
+    watchtower_cleanup(&wt);
+    persist_close(&db);
+    return 1;
+}
+
+/* --- Declining an offer, and messages that arrive while one is pending --- */
+
+int test_jit_reject_round_trip(void) {
+    cJSON *j = wire_build_jit_reject(3, "not accepted");
+    TEST_ASSERT(j != NULL, "build");
+    size_t idx = 0;
+    char reason[32];
+    TEST_ASSERT(wire_parse_jit_reject(j, &idx, reason, sizeof(reason)), "parse");
+    TEST_ASSERT_EQ((long)idx, 3, "client_idx");
+    TEST_ASSERT(strcmp(reason, "not accepted") == 0, "reason");
+    cJSON_Delete(j);
+
+    j = cJSON_CreateObject();
+    TEST_ASSERT(!wire_parse_jit_reject(j, &idx, reason, sizeof(reason)),
+                "client_idx is required");
+    cJSON_Delete(j);
+
+    TEST_ASSERT(strcmp(wire_msg_type_name(MSG_JIT_REJECT), "JIT_REJECT") == 0,
+                "JIT_REJECT name");
+    return 1;
+}
+
+typedef struct {
+    int fd;
+    int n_other;        /* unrelated messages to send before the decline */
+} reject_peer_t;
+
+/* Takes the offer, optionally sends unrelated messages, then declines. */
+static void *peer_decline_offer(void *arg) {
+    reject_peer_t *p = (reject_peer_t *)arg;
+    static int ok = 1;
+    wire_msg_t msg;
+    if (!wire_recv(p->fd, &msg)) return NULL;
+    int is_offer = msg.msg_type == MSG_JIT_OFFER;
+    cJSON_Delete(msg.json);
+    if (!is_offer) return NULL;
+
+    for (int i = 0; i < p->n_other; i++) {
+        cJSON *pong = cJSON_CreateObject();
+        cJSON_AddNumberToObject(pong, "seq", 100 + i);
+        wire_send(p->fd, MSG_PONG, pong);
+        cJSON_Delete(pong);
+    }
+    cJSON *rej = wire_build_jit_reject(0, "not accepted");
+    wire_send(p->fd, MSG_JIT_REJECT, rej);
+    cJSON_Delete(rej);
+    return &ok;
+}
+
+int test_jit_reject_ends_wait(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    fx.mgr.jit_enabled = 1;
+
+    reject_peer_t peer = { .fd = fx.peer_fd[0], .n_other = 0 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, peer_decline_offer, &peer);
+
+    time_t t0 = time(NULL);
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "a declined offer opens nothing");
+    time_t waited = time(NULL) - t0;
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "client received the offer and declined");
+    TEST_ASSERT(waited < 10, "the LSP stops waiting when the client declines");
+    TEST_ASSERT_EQ(g_gate_wallet_calls, 0, "wallet untouched");
+    TEST_ASSERT_EQ(g_gate_broadcast_calls, 0, "nothing broadcast");
+    TEST_ASSERT_EQ((long)fx.mgr.n_jit_channels, 0, "no JIT slot taken");
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "nothing held");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+int test_jit_wait_holds_other_messages(void) {
+    jit_gate_fixture_t fx;
+    TEST_ASSERT(jit_gate_fixture_init(&fx, 1), "fixture");
+    fx.mgr.jit_enabled = 1;
+
+    reject_peer_t peer = { .fd = fx.peer_fd[0], .n_other = 2 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, peer_decline_offer, &peer);
+    TEST_ASSERT_EQ(jit_channel_create(&fx.mgr, fx.lsp, 0, 50000, "factory_expired"),
+                   0, "a declined offer opens nothing");
+    void *peer_ret = NULL;
+    pthread_join(tid, &peer_ret);
+    TEST_ASSERT(peer_ret != NULL, "client received the offer and declined");
+
+    /* Both unrelated messages were kept, in order, with their content. */
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 2,
+                   "messages sent during the wait are held, not dropped");
+    for (int i = 0; i < 2; i++) {
+        const lsp_deferred_msg_t *d = &fx.mgr.deferred_msgs[i];
+        TEST_ASSERT_EQ((long)d->client_idx, 0, "held for client 0");
+        TEST_ASSERT_EQ(d->msg.msg_type, MSG_PONG, "type preserved");
+        const cJSON *seq = cJSON_GetObjectItem(d->msg.json, "seq");
+        TEST_ASSERT(seq && (int)seq->valuedouble == 100 + i, "content and order preserved");
+    }
+
+    /* The main loop then handles them through the normal dispatcher. */
+    fx.mgr.entries[0].offline_detected = 1;
+    fx.mgr.entries[0].last_message_time = 0;
+    TEST_ASSERT_EQ(lsp_channels_drain_deferred(&fx.mgr, fx.lsp), 2, "both handled");
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "queue is empty");
+    TEST_ASSERT(fx.mgr.entries[0].last_message_time != 0 &&
+                fx.mgr.entries[0].offline_detected == 0,
+                "the dispatcher saw the held messages");
+    TEST_ASSERT_EQ(lsp_channels_drain_deferred(&fx.mgr, fx.lsp), 0, "nothing left");
+
+    /* A held message whose client has gone is dropped at drain time, and a
+       full queue refuses further messages without taking them. */
+    wire_msg_t m = { .msg_type = MSG_PONG, .json = cJSON_CreateObject() };
+    TEST_ASSERT(lsp_channels_defer_msg(&fx.mgr, 0, &m), "hold one");
+    TEST_ASSERT(m.json == NULL, "the queue owns the message");
+    close(fx.lsp->client_fds[0]);
+    fx.lsp->client_fds[0] = -1;
+    TEST_ASSERT_EQ(lsp_channels_drain_deferred(&fx.mgr, fx.lsp), 0,
+                   "not dispatched for a disconnected client");
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "queue is empty");
+
+    for (int i = 0; i < LSP_DEFERRED_MSGS_MAX; i++) {
+        wire_msg_t f = { .msg_type = MSG_PONG, .json = cJSON_CreateObject() };
+        TEST_ASSERT(lsp_channels_defer_msg(&fx.mgr, 0, &f), "fill");
+    }
+    wire_msg_t extra = { .msg_type = MSG_PONG, .json = cJSON_CreateObject() };
+    TEST_ASSERT(!lsp_channels_defer_msg(&fx.mgr, 0, &extra), "full queue refuses");
+    TEST_ASSERT(extra.json != NULL, "a refused message stays with the caller");
+    cJSON_Delete(extra.json);
+    lsp_channels_free_deferred(&fx.mgr);
+    TEST_ASSERT_EQ((long)lsp_channels_deferred_count(&fx.mgr), 0, "freed");
+
+    jit_gate_fixture_free(&fx);
+    return 1;
+}
+
+/* --- What counts as "spent" in a gettxout answer --- */
+
+int test_gettxout_answer_classified(void) {
+    /* A literal null is the only "no such unspent output". */
+    TEST_ASSERT_EQ(regtest_parse_gettxout("null"), 0, "null");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("null\n"), 0, "null with newline");
+    /* A failed call (no bitcoin-cli, HTTP error falling back to an exec that
+       fails) returns empty text or an error message: unknown, never spent. */
+    TEST_ASSERT_EQ(regtest_parse_gettxout(""), -1, "empty text is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("\n"), -1, "blank text is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout(NULL), -1, "no answer is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout(
+        "error: Could not connect to the server 127.0.0.1:18443\n"), -1,
+        "an error message is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("nullx"), -1, "trailing junk is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout("{}"), -1, "an object without an output is unknown");
+    TEST_ASSERT_EQ(regtest_parse_gettxout(
+        "{\"bestblock\":\"00\",\"confirmations\":3,\"value\":0.0005,"
+        "\"scriptPubKey\":{\"hex\":\"5120\"},\"coinbase\":false}"), 1,
+        "an output object is unspent");
     return 1;
 }
