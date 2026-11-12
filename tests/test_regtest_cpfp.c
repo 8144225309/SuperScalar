@@ -179,6 +179,7 @@ int test_regtest_recovery_waits_for_confirmed_parent(void) {
             TEST_ASSERT(cpfp_build_anchor_child(NULL, &ti, 0, 1250, &child, NULL, NULL),
                         "anchor child");
             char *hex = malloc(child.len * 2 + 1);
+            TEST_ASSERT(hex, "alloc");
             hex_encode(child.data, child.len, hex);
             char ctxid[65];
             int sent = regtest_send_raw_tx(&rt, hex, ctxid);
@@ -257,6 +258,7 @@ int test_regtest_cpfp_parent_accepted_child_rejected(void) {
 
     const factory_node_t *root = &f->nodes[0];
     char *hex = malloc(root->signed_tx.len * 2 + 1);
+    TEST_ASSERT(hex, "alloc");
     hex_encode(root->signed_tx.data, root->signed_tx.len, hex);
     char txid[65] = {0};
     /* 1250 sat/kvB pays min relay, not the 20000 target: package path */
@@ -361,6 +363,7 @@ int test_regtest_cpfp_rebump_in_mempool(void) {
     TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
     const factory_node_t *root = &f->nodes[0];
     char *hex = malloc(root->signed_tx.len * 2 + 1);
+    TEST_ASSERT(hex, "alloc");
     hex_encode(root->signed_tx.data, root->signed_tx.len, hex);
     cpfp_tx_info_t ti;
     TEST_ASSERT(cpfp_parse_tx(root->signed_tx.data, root->signed_tx.len, &ti), "parse");
@@ -370,12 +373,14 @@ int test_regtest_cpfp_rebump_in_mempool(void) {
     tx_buf_init(&g, 128);
     TEST_ASSERT(cpfp_build_anchor_child(NULL, &ti, 0, 1250, &g, NULL, NULL), "griefer child");
     char *ghex = malloc(g.len * 2 + 1);
+    TEST_ASSERT(ghex, "alloc");
     hex_encode(g.data, g.len, ghex);
     cpfp_tx_info_t gi;
     TEST_ASSERT(cpfp_parse_tx(g.data, g.len, &gi), "parse griefer");
     tx_buf_free(&g);
     size_t plen = strlen(hex) + strlen(ghex) + 16;
     char *params = malloc(plen);
+    TEST_ASSERT(params, "alloc");
     snprintf(params, plen, "[\"%s\",\"%s\"]", hex, ghex);
     char *r = regtest_exec(&rt, "submitpackage", params);
     free(params);
@@ -472,6 +477,7 @@ int test_regtest_wt_escalator_replaces_own_child(void) {
     TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
     const factory_node_t *root = &f->nodes[0];
     char *hex = malloc(root->signed_tx.len * 2 + 1);
+    TEST_ASSERT(hex, "alloc");
     hex_encode(root->signed_tx.data, root->signed_tx.len, hex);
     cpfp_tx_info_t ti;
     TEST_ASSERT(cpfp_parse_tx(root->signed_tx.data, root->signed_tx.len, &ti), "parse");
@@ -624,6 +630,7 @@ int test_regtest_cpfp_outbid_foreign_wallet_child(void) {
     TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
     const factory_node_t *root = &f->nodes[0];
     char *hex = malloc(root->signed_tx.len * 2 + 1);
+    TEST_ASSERT(hex, "alloc");
     hex_encode(root->signed_tx.data, root->signed_tx.len, hex);
     char txid[65], ca[65], cb[65], ca2[65], ina[80], inb[80], ina2[80];
 
