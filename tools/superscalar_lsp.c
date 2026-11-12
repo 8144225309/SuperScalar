@@ -216,12 +216,17 @@ static void usage(const char *prog) {
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
         "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --enable-jit-experimental  UNSAFE, testing only: allow the LSP to open JIT channels\n"
         "                      (when every factory has expired, or on lsps2.buy). Off by default;\n"
         "                      an open can strand the LSP's funds. Refused on mainnet.\n"
+        "  --enable-rotation-experimental  UNSAFE, testing only: allow factory rotation\n"
+        "                      (automatic when a factory turns DYING in daemon mode, CLI\n"
+        "                      'rotate'). Off by default: a DYING factory keeps serving\n"
+        "                      its channels until it expires. Refused on mainnet.\n"
         "  --states-per-layer N States per DW layer (default 4, range 2-256)\n"
         "  --arity N|N,N,...   Leaf arity: 1=DW(legacy), 2=DW(legacy), 3=PS(canonical, default).\n"
         "                       Comma-separated activates TRUE N-way mixed arity per level\n"
@@ -270,6 +275,7 @@ static void usage(const char *prog) {
         "  --kill-after-state-advance Clean exit immediately after first state-advance ceremony completes (post MSG_PATH_SIGN_DONE). Drives restart-harness tests verifying persistence + revocation_secrets survive. CL5.\n"
         "  --ps-subfactory-arity K  PS sub-factory arity k (canonical k² PS shape from t/1242).  k=1 (default) = 1-client-per-PS-leaf; k>1 = k clients per sub-factory, k sub-factories per leaf, k² clients per leaf.\n"
         "  --test-partial-rotation After demo: 1 client goes offline, partial rotation with 3/4, dist TX on old factory\n"
+        "                      (implies --enable-rotation-experimental)\n"
         "  --test-dual-factory After demo: create second factory, show two ACTIVE in ladder, force-close both\n"
         "  --test-dw-exhibition After demo: full DW lifecycle (multi-advance + PTLC close + cross-factory contrast)\n"
         "  --test-bridge       After demo: simulate bridge inbound HTLC, verify client fulfills\n"
@@ -327,6 +333,7 @@ static void usage(const char *prog) {
         "                          api:URL     custom HTTP/HTTPS endpoint (mempool.space-compatible JSON)\n"
         "                          static:N    fixed N sat/vByte (e.g. static:10)\n"
         "  --async-rotation    Queue rotation requests and wait for clients to reconnect (default: synchronous)\n"
+        "                      (needs --enable-rotation-experimental)\n"
         "  --notify-webhook URL  Send push notifications to webhook URL on rotation events\n"
         "  --notify-exec SCRIPT  Run script on rotation events: script <client> <event> <urgency> <json>\n"
         "  --bolt8-port N      Start BOLT #8 TCP server on port N for external LN peers\n"
@@ -1358,6 +1365,7 @@ int main(int argc, char *argv[]) {
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int enable_jit_experimental = 0; /* --enable-jit-experimental: allow JIT opens */
+    int enable_rotation_experimental = 0; /* --enable-rotation-experimental: allow rotation */
     int states_per_layer = 4;        /* DW states per layer (2-256, default 4) */
     int leaf_arity = 3;              /* default Pseudo-Spilman per docs/factory-arity.md
                                         (1, 2 = legacy DW; 3 = PS canonical) */
@@ -1739,6 +1747,8 @@ int main(int argc, char *argv[]) {
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--enable-jit-experimental") == 0)
             enable_jit_experimental = 1;
+        else if (strcmp(argv[i], "--enable-rotation-experimental") == 0)
+            enable_rotation_experimental = 1;
         else if (strcmp(argv[i], "--async-rotation") == 0)
             async_rotation = 1;
         else if (strcmp(argv[i], "--notify-webhook") == 0 && i + 1 < argc)
@@ -2425,6 +2435,7 @@ int main(int argc, char *argv[]) {
             .have_db = db_path != NULL,
             .have_wt_db = wt_db_path != NULL,
             .enable_jit_experimental = enable_jit_experimental,
+            .enable_rotation_experimental = enable_rotation_experimental,
             .argc = argc,
             .argv = argv,
             .envp = environ,
@@ -2441,6 +2452,18 @@ int main(int argc, char *argv[]) {
         enable_jit_experimental = 1;
     if (enable_jit_experimental)
         fprintf(stderr, "WARNING: --enable-jit-experimental: JIT channel opens are "
+                "enabled. This is unsafe and for testing only.\n");
+
+    /* Likewise the rotation test modes carry the rotation opt-in. */
+    if (test_rotation || test_partial_rotation)
+        enable_rotation_experimental = 1;
+    if (async_rotation && !enable_rotation_experimental) {
+        fprintf(stderr, "Error: --async-rotation needs --enable-rotation-experimental "
+                "(factory rotation is off by default).\n");
+        return 1;
+    }
+    if (enable_rotation_experimental)
+        fprintf(stderr, "WARNING: --enable-rotation-experimental: factory rotation is "
                 "enabled. This is unsafe and for testing only.\n");
 
     /* Resolve confirmation timeout */
@@ -3256,7 +3279,9 @@ int main(int argc, char *argv[]) {
             mgr->rot_leaf_arity = leaf_arity;
             mgr->rot_is_regtest = is_regtest;
             mgr->rot_funding_sats = funding_sats;
-            mgr->rot_auto_rotate = 1;
+            /* Recovery resumes the daemon loop: rotation is automatic
+               there, but only with the opt-in. */
+            lsp_channels_set_rotation(mgr, enable_rotation_experimental, 1);
             mgr->rot_attempted_mask = 0;
             mgr->cli_enabled = cli_mode;
             mgr->auto_rebalance = auto_rebalance;
@@ -4476,7 +4501,8 @@ accept_new_factory:
         mgr->rot_leaf_arity = leaf_arity;
         mgr->rot_is_regtest = is_regtest;
         mgr->rot_funding_sats = funding_sats;
-        mgr->rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
+        /* With the opt-in, rotation is automatic in daemon mode. */
+        lsp_channels_set_rotation(mgr, enable_rotation_experimental, daemon_mode);
         mgr->rot_attempted_mask = 0;
         mgr->cli_enabled = cli_mode;
         mgr->test_bad_settlement = test_bad_settlement;

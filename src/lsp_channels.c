@@ -6847,6 +6847,12 @@ int lsp_channels_handle_cli_line(lsp_channel_mgr_t *mgr, void *lsp_ptr,
         printf("---\n");
         fflush(stdout);
     } else if (strcmp(line, "rotate") == 0) {
+        if (!mgr->rot_enabled) {
+            printf("CLI: rotation is disabled (start the LSP with "
+                   "--enable-rotation-experimental)\n");
+            fflush(stdout);
+            return 1;
+        }
         printf("CLI: forcing rotation\n");
         fflush(stdout);
         if (lsp_channels_rotate_factory(mgr, lsp))
@@ -7446,7 +7452,8 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                 /* Async rotation: handle EXPIRED with partial ready set.
                                    DYING → EXPIRED means the window closed; rotate
                                    with whoever showed up (n_ready >= 2). */
-                                if (lf->cached_state == FACTORY_EXPIRED &&
+                                if (mgr->rot_auto_rotate &&
+                                    lf->cached_state == FACTORY_EXPIRED &&
                                     old_states[fi] == FACTORY_DYING &&
                                     mgr->readiness) {
                                     readiness_tracker_t *rt =
@@ -7464,6 +7471,33 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                lf->factory_id, n_ready);
                                     }
                                     readiness_reset(rt);
+                                }
+
+                                /* Rotation off (the default): nothing is
+                                   started.  The factory keeps serving its
+                                   channels until it expires; after that the
+                                   members' own exits and the distribution TX
+                                   (broadcast above at EXPIRED) apply. */
+                                if (!mgr->rot_auto_rotate &&
+                                    lf->cached_state == FACTORY_DYING) {
+                                    printf("LSP: factory %u DYING — not rotating: rotation "
+                                           "is disabled (--enable-rotation-experimental "
+                                           "not given). Channels stay in service until "
+                                           "the factory expires in %u blocks; then members "
+                                           "can exit and the distribution TX pays them\n",
+                                           lf->factory_id,
+                                           factory_blocks_until_expired(&lf->factory,
+                                                                        (uint32_t)height));
+                                    fflush(stdout);
+                                } else if (!mgr->rot_auto_rotate &&
+                                           lf->cached_state == FACTORY_EXPIRED) {
+                                    printf("LSP: factory %u EXPIRED — not rotating: rotation "
+                                           "is disabled; distribution TX %s\n",
+                                           lf->factory_id,
+                                           lf->distribution_tx.len > 0 ?
+                                               "broadcast attempted" :
+                                               "not held by this LSP process");
+                                    fflush(stdout);
                                 }
 
                                 /* Auto-rotate when factory enters DYING
@@ -7747,8 +7781,10 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 uint32_t epoch = dw_counter_epoch(&lsp->factory.counter);
                 uint32_t total = lsp->factory.counter.total_states;
                 if (total > 0 && epoch >= (total * 3) / 4) {
-                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed\n",
-                           epoch, total);
+                    printf("LSP: DW counter at %u/%u (>75%%) — rotation needed%s\n",
+                           epoch, total,
+                           mgr->rot_auto_rotate ? "" :
+                               " (rotation is disabled; not rotating)");
                     if (mgr->rot_auto_rotate) {
                         lsp_channels_rotate_factory(mgr, lsp);
                     }
