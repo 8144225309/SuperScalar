@@ -241,7 +241,13 @@ create_factory(){
     local i
     for i in $(seq 0 $((N - 1))); do start_client "$i"; sleep 0.1; done
     start_miner
-    if ! waitlog "$D/lsp1.log" "entering daemon mode" 900; then
+    local live=0
+    for _ in $(seq 1 900); do
+        grep -aq "entering daemon mode" "$D/lsp1.log" && { live=1; break; }
+        kill -0 "$LSP_PID" 2>/dev/null || break   # the LSP refused or failed
+        sleep 1
+    done
+    if [ "$live" != 1 ]; then
         tail -30 "$D/lsp1.log"; note_fail "N=$N: factory never went live"; return 1
     fi
     note_ok "N=$N: factory live with $N members"
@@ -336,8 +342,10 @@ exit_member(){
 
 run_lifecycle(){
     echo; echo "--- N=$N lifecycle (defaults, restarts, every member exits alone) ---"
+    # the CLTV must not come before the factory expires (created + active +
+    # dying); creation takes a while under the miner, hence the margin
     local h; h=$(height)
-    create_factory "$TMPD/life$N" $((PORT + 2 * N)) --cltv-timeout $((h + 3000)) \
+    create_factory "$TMPD/life$N" $((PORT + 2 * N)) --cltv-timeout $((h + 2900 + 600)) \
         --active-blocks 2500 --dying-blocks 400 || { kill_procs; return; }
     check_shape
     local last=$((N - 1)) mid=$((N / 2))
@@ -419,7 +427,7 @@ run_lifecycle(){
 run_expiry(){
     echo; echo "--- N=$N expiry (the distribution TX pays the members) ---"
     local h; h=$(height)
-    create_factory "$TMPD/exp$N" $((PORT + 2 * N + 1)) --cltv-timeout $((h + 400)) \
+    create_factory "$TMPD/exp$N" $((PORT + 2 * N + 1)) --cltv-timeout $((h + 350 + 300)) \
         --active-blocks 200 --dying-blocks 150 || { kill_procs; return; }
     check_shape
     pay lsp1.log 0 1 4000
