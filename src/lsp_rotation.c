@@ -76,6 +76,38 @@ void lsp_channels_set_rotation(lsp_channel_mgr_t *mgr, int enabled, int automati
     mgr->rot_auto_rotate = (enabled && automatic) ? 1 : 0;
 }
 
+/* The clients a rotation builds the new factory for, as indices into
+   lsp->client_pubkeys and their pubkeys: every client for a full close; for a
+   partial rotation the cooperative clients whose connection is up, in
+   participant order. */
+static size_t rotation_new_clients(const lsp_t *lsp, ladder_t *lad,
+                                   uint32_t dying_id, int partial,
+                                   size_t *idx_out, secp256k1_pubkey *pks_out) {
+    size_t n = 0;
+    if (!partial) {
+        for (size_t i = 0; i < lsp->n_clients && i < LSP_MAX_CLIENTS; i++) {
+            idx_out[n] = i;
+            pks_out[n++] = lsp->client_pubkeys[i];
+        }
+        return n;
+    }
+    uint32_t coop[FACTORY_MAX_SIGNERS];
+    size_t n_coop = ladder_get_cooperative_clients(lad, dying_id,
+                                                   coop, FACTORY_MAX_SIGNERS);
+    for (size_t i = 0; i < n_coop && n < LSP_MAX_CLIENTS; i++) {
+        if (coop[i] < 1 || coop[i] > lsp->n_clients) continue;
+        size_t ci = coop[i] - 1;
+        if (lsp->client_fds[ci] < 0) {
+            printf("LSP rotate: cooperative client %u offline, skipping\n",
+                   coop[i]);
+            continue;
+        }
+        idx_out[n] = ci;
+        pks_out[n++] = lsp->client_pubkeys[ci];
+    }
+    return n;
+}
+
 int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     if (!mgr || !lsp) return 0;
     /* Every way into a rotation (daemon lifecycle, retries, async readiness,
@@ -778,6 +810,33 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     /* --- Phase C: Create new factory --- */
     printf("LSP rotate: Phase C — creating new factory\n");
 
+    /* The new factory's clients: every client for a full close, the
+       cooperative clients still online for a partial rotation.  Creation
+       starts from the freed factory (sequential placement, no profiles), so
+       its root aggregates them in that order; fund exactly that key. */
+    size_t new_idx[LSP_MAX_CLIENTS];
+    secp256k1_pubkey new_pks[LSP_MAX_CLIENTS];
+    size_t n_new = rotation_new_clients(lsp, lad, dying_id, partial,
+                                        new_idx, new_pks);
+    if (n_new < (partial ? 2u : 1u) || (!partial && n_new != lsp->n_clients)) {
+        fprintf(stderr, "LSP rotate: only %zu clients for the new factory\n", n_new);
+        return 0;
+    }
+    {
+        factory_t fresh;
+        memset(&fresh, 0, sizeof(fresh));
+        if (!lsp_compute_funding_spk_for(lsp, &fresh, new_pks, n_new,
+                                         mgr->rot_fund_spk)) {
+            fprintf(stderr, "LSP rotate: funding script derivation failed\n");
+            return 0;
+        }
+        mgr->rot_fund_spk_len = 34;
+        char rfa[128];
+        if (rt && regtest_derive_p2tr_address(rt, mgr->rot_fund_spk + 2,
+                                              rfa, sizeof(rfa)))
+            snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr), "%s", rfa);
+    }
+
     /* Fund new factory */
     if (mgr->rot_is_regtest) {
         /* Ensure wallet has funds */
@@ -901,22 +960,21 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         memcpy(saved_client_fds, lsp->client_fds, sizeof(saved_client_fds));
         memcpy(saved_client_pks, lsp->client_pubkeys, sizeof(saved_client_pks));
 
-        uint32_t coop[FACTORY_MAX_SIGNERS];
-        n_coop = ladder_get_cooperative_clients(lad, dying_id,
-                                                 coop, FACTORY_MAX_SIGNERS);
-
-        /* Remap to contiguous indices, skipping clients whose fd went stale */
+        /* Remap to the clients the funding output was derived for; one
+           that went offline since cannot sign the new root. */
+        n_coop = n_new;
         size_t n_online = 0;
-        for (size_t i = 0; i < n_coop; i++) {
-            int fd = saved_client_fds[coop[i] - 1];
-            if (fd >= 0) {
-                lsp->client_fds[n_online] = fd;
-                lsp->client_pubkeys[n_online] = saved_client_pks[coop[i] - 1];
-                n_online++;
-            } else {
-                printf("LSP rotate: cooperative client %u went offline, skipping\n",
-                       coop[i]);
+        for (size_t i = 0; i < n_new; i++) {
+            int fd = saved_client_fds[new_idx[i]];
+            if (fd < 0) {
+                printf("LSP rotate: cooperative client %zu went offline after "
+                       "funding\n", new_idx[i] + 1);
+                n_online = 0;
+                break;
             }
+            lsp->client_fds[n_online] = fd;
+            lsp->client_pubkeys[n_online] = new_pks[i];
+            n_online++;
         }
         if (n_online < 2) {
             fprintf(stderr, "LSP rotate: only %zu online clients, need >= 2\n",

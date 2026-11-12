@@ -2464,29 +2464,6 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     if (pk_count != n_participants) return 0;
 
-    /* Compute funding SPK from aggregate key of all participants */
-    musig_keyagg_t ka;
-    if (!musig_aggregate_keys(ctx, &ka, pubkeys, n_participants))
-        return 0;
-
-    unsigned char internal_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey))
-        return 0;
-    unsigned char twk[32];
-    sha256_tagged("TapTweak", internal_ser, 32, twk);
-
-    musig_keyagg_t ka_copy = ka;
-    secp256k1_pubkey tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
-                                                   &ka_copy.cache, twk))
-        return 0;
-    secp256k1_xonly_pubkey tweaked_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk))
-        return 0;
-
-    unsigned char fund_spk[34];
-    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
-
     /* Release any prior tree state and arrays (caller may reuse f across
        loads, or pre-allocate its arrays).  factory_init_from_pubkeys memsets
        f, which would leak them.  factory_free is a no-op on a zeroed factory. */
@@ -2504,7 +2481,11 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
         factory_set_arity(f, FACTORY_ARITY_PS);
     /* FACTORY_ARITY_2 is the default from factory_init_from_pubkeys */
 
-    if (!factory_set_funding(f, funding_txid, funding_vout, funding_amount,
+    /* The funding script of the rebuilt root: the participants in the order
+       its placement mode and profiles put them. */
+    unsigned char fund_spk[34];
+    if (!factory_compute_funding_spk(f, fund_spk) ||
+        !factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                              fund_spk, 34) ||
         !factory_build_tree(f)) {
         factory_free(f);

@@ -418,6 +418,56 @@ static void creation_template_restore(factory_t *f,
     }
 }
 
+/* Apply what orders the root signers -- placement mode and participant
+   profiles -- from the template.  Returns 0 for an unknown placement mode. */
+static int creation_template_apply_order(factory_t *f,
+                                         const lsp_creation_template_t *t) {
+    if (!factory_set_placement_mode(f, t->placement)) return 0;
+    if (t->profiles && f->profiles) {
+        size_t n = t->n_profiles < f->config.max_signers ? t->n_profiles
+                                                         : f->config.max_signers;
+        memcpy(f->profiles, t->profiles, n * sizeof(participant_profile_t));
+    }
+    return 1;
+}
+
+int lsp_compute_funding_spk_for(lsp_t *lsp, const factory_t *order_from,
+                                const secp256k1_pubkey *client_pubkeys,
+                                size_t n_clients, unsigned char spk_out[34]) {
+    if (!lsp || !order_from || !client_pubkeys || !spk_out || n_clients == 0 ||
+        n_clients + 1 > FACTORY_MAX_SIGNERS)
+        return 0;
+    size_t n_total = 1 + n_clients;
+    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    all_pubkeys[0] = lsp->lsp_pubkey;
+    for (size_t i = 0; i < n_clients; i++)
+        all_pubkeys[i + 1] = client_pubkeys[i];
+
+    lsp_creation_template_t tmpl;
+    if (!creation_template_capture(&tmpl, order_from)) return 0;
+    factory_t *scratch = calloc(1, sizeof(*scratch));
+    int ok = 0;
+    if (scratch) {
+        /* The participants, placement and profiles creation builds the root
+           from (factory_setup_for_creation); the DW parameters do not enter
+           the root key. */
+        factory_init_from_pubkeys(scratch, lsp->ctx, all_pubkeys, n_total, 1, 2);
+        ok = scratch->pubkeys && scratch->profiles &&
+             creation_template_apply_order(scratch, &tmpl) &&
+             factory_compute_funding_spk(scratch, spk_out);
+        factory_free(scratch);
+        free(scratch);
+    }
+    creation_template_free(&tmpl);
+    return ok;
+}
+
+int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]) {
+    if (!lsp) return 0;
+    return lsp_compute_funding_spk_for(lsp, &lsp->factory, lsp->client_pubkeys,
+                                       lsp->n_clients, spk_out);
+}
+
 /* Build f from scratch for n_total participants (all_pubkeys[0] = LSP) over
    the given funding outpoint, apply the template, and build the tree.
    Returns 1 on success. */
@@ -459,16 +509,11 @@ static int factory_setup_for_creation(lsp_t *lsp, factory_t *f,
         f->fee_per_tx = t->fee_per_tx;
     f->cltv_timeout = cltv_timeout;
     f->use_tree_anchor = 1;  /* #56: P2A CPFP anchors on tree txs (matches client side) */
-    if (!factory_set_placement_mode(f, t->placement)) {
+    if (!creation_template_apply_order(f, t)) {
         fprintf(stderr, "%s: saved placement mode refused\n", who);
         return 0;
     }
     f->economic_mode = t->econ;
-    if (t->profiles) {
-        size_t n = t->n_profiles < f->config.max_signers ? t->n_profiles
-                                                         : f->config.max_signers;
-        memcpy(f->profiles, t->profiles, n * sizeof(participant_profile_t));
-    }
     if (t->has_shachain) {
         if (t->use_flat && t->secrets)
             factory_set_flat_secrets(f, (const unsigned char (*)[32])t->secrets,

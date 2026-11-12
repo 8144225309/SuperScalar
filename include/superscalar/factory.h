@@ -699,22 +699,12 @@ int factory_sign_l_stock_cooperative_spend(
    built tree.  Returns 1 on success, 0 if the client_idx is out of range
    or doesn't appear in any leaf's signer_indices.
 
-   Behavior is arity-aware:
-
-   - Mixed-arity factories (n_level_arity > 0): walks
-     factory->leaf_node_indices[] and matches my_index = client_idx + 1
-     against each leaf's signer_indices[].  vout = position in
-     signer_indices minus 1 (signer_indices[0] == 0 is the LSP).  This
-     is the only correct mapping when leaves can hold > 2 channels.
-
-   - Uniform ARITY_1 and ARITY_PS: each client owns its own leaf at
-     vout 0.  PS leaves are built 1-client-per-leaf (n_signers=2 = LSP +
-     1 client) with chained TXs replacing the per-state DW machine; the
-     mapping is identical to arity-1 here.
-
-   - Uniform ARITY_2: 2 clients per leaf, layout [vout 0 = client A's
-     channel, vout 1 = client B's channel, vout 2 = L-stock]; client_idx
-     i maps to (leaf i/2, vout i%2).
+   The channel is on the leaf whose signer_indices[] include participant
+   client_idx + 1 -- for PS leaves with sub-factories (k > 1), on that
+   sub-factory node -- at vout = its position in signer_indices minus 1
+   (signer_indices[0] == 0 is the LSP).  The leaf is looked up rather than
+   computed from the index because the placement mode and profiles decide
+   which leaf a member lands on.
 
    Use this from any code that previously open-coded the mapping
    (src/client.c::client_init_channel, src/lsp_channels.c::client_to_leaf,

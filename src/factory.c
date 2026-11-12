@@ -1142,76 +1142,39 @@ void factory_set_ps_subfactory_arity(factory_t *f, uint32_t k) {
 
 int factory_client_to_leaf(const factory_t *f, size_t client_idx,
                             size_t *node_idx_out, uint32_t *vout_out) {
-    if (!f || !node_idx_out || !vout_out) return 0;
+    if (!f || !node_idx_out || !vout_out || !f->nodes || !f->leaf_node_indices)
+        return 0;
 
-    if (f->n_level_arity > 0) {
-        /* Mixed-arity factories: walk leaves and match by signer_indices.
-           Leaves can hold up to 8 channels; the legacy formula below
-           computes leaves that may not exist and outputs that are wrong. */
-        uint32_t my_index = (uint32_t)(client_idx + 1);  /* signer_indices is 1-based */
-        for (int li = 0; li < f->n_leaf_nodes; li++) {
-            size_t ni = f->leaf_node_indices[li];
-            const factory_node_t *leaf = &f->nodes[ni];
-            for (size_t s = 1; s < leaf->n_signers; s++) {
-                if (leaf->signer_indices[s] == my_index) {
-                    *node_idx_out = ni;
+    /* The member's channel is on the leaf -- or, for PS leaves with
+       sub-factories, the sub-factory -- whose signers include it, at its slot
+       after the LSP (signer_indices[0]): every leaf builder puts member
+       signer_indices[s] at vout s - 1.  Which leaf that is depends on the
+       placement mode and profiles, so it is looked up, never computed from
+       the participant index. */
+    uint32_t my_index = (uint32_t)(client_idx + 1);
+    for (int li = 0; li < f->n_leaf_nodes; li++) {
+        size_t ni = f->leaf_node_indices[li];
+        if (ni >= f->n_nodes) continue;
+        const factory_node_t *leaf = &f->nodes[ni];
+        size_t n_sub = leaf->n_subfactories > 0 ? (size_t)leaf->n_subfactories : 0;
+        for (size_t si = 0; si < (n_sub ? n_sub : 1); si++) {
+            size_t node = ni;
+            if (n_sub) {
+                int sn = leaf->subfactory_node_indices[si];
+                if (sn < 0 || (size_t)sn >= f->n_nodes) continue;
+                node = (size_t)sn;
+            }
+            const factory_node_t *n = &f->nodes[node];
+            for (size_t s = 1; s < n->n_signers; s++) {
+                if (n->signer_indices[s] == my_index) {
+                    *node_idx_out = node;
                     *vout_out = (uint32_t)(s - 1);
                     return 1;
                 }
             }
         }
-        return 0;
     }
-
-    /* ARITY_PS with k>1 sub-factories (canonical t/1242 k² shape):
-       client i lives on leaf i/k² in sub-factory (i%k²)/k as the
-       (i%k)-th channel output of that sub-factory's chain[0] TX. */
-    if (f->leaf_arity == FACTORY_ARITY_PS && f->ps_subfactory_arity > 1) {
-        size_t k = (size_t)f->ps_subfactory_arity;
-        size_t cap = k * k;
-        size_t leaf_idx = client_idx / cap;
-        size_t sub_idx_in_leaf = (client_idx % cap) / k;
-        size_t channel_in_sub = client_idx % k;
-        if (leaf_idx >= (size_t)f->n_leaf_nodes) return 0;
-        const factory_node_t *leaf =
-            &f->nodes[f->leaf_node_indices[leaf_idx]];
-        if ((int)sub_idx_in_leaf >= leaf->n_subfactories) return 0;
-        int sub_node = leaf->subfactory_node_indices[sub_idx_in_leaf];
-        if (sub_node < 0) return 0;
-        *node_idx_out = (size_t)sub_node;
-        *vout_out = (uint32_t)channel_in_sub;
-        return 1;
-    }
-
-    /* ARITY_1 and ARITY_PS (k=1) both build 1-client-per-leaf: ARITY_1 has a
-       leaf output of [vout 0 = client channel, vout 1 = L-stock]; ARITY_PS
-       uses [vout 0 = factory-consensus channel for the chain, vout 1 =
-       L-stock] with 1 client per leaf via setup_ps_leaf_outputs.  Both are
-       looked up the same way: client i owns leaf i, channel at vout 0.
-
-       Earlier versions of this helper conflated PS with arity-2 (2 clients
-       per leaf via `client_idx/2`), which silently broke ON-CHAIN ops for
-       any client beyond #0 in a PS factory: the channel keyagg got built
-       against the wrong leaf's L-stock SPK (LSP-only), so commitment sigs
-       could never verify on chain.  Off-chain payments still worked because
-       both sides agreed on the wrong keyagg, masking the bug — caught here
-       during the canonical-design audit. */
-    if (f->leaf_arity == FACTORY_ARITY_1 || f->leaf_arity == FACTORY_ARITY_PS) {
-        if (client_idx >= (size_t)f->n_leaf_nodes) return 0;
-        *node_idx_out = f->leaf_node_indices[client_idx];
-        *vout_out = 0;
-        return 1;
-    }
-
-    /* ARITY_2: 2 clients per leaf, layout [vout 0 = client A's channel,
-       vout 1 = client B's channel, vout 2 = L-stock]. */
-    {
-        size_t leaf_idx = client_idx / 2;
-        if (leaf_idx >= (size_t)f->n_leaf_nodes) return 0;
-        *node_idx_out = f->leaf_node_indices[leaf_idx];
-        *vout_out = (uint32_t)(client_idx % 2);
-        return 1;
-    }
+    return 0;
 }
 
 int factory_set_placement_mode(factory_t *f, placement_mode_t mode) {

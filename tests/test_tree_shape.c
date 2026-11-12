@@ -854,3 +854,53 @@ int test_tree_shape_placement_setter(void) {
     ts_close(&t);
     return 1;
 }
+
+
+/* ---- Member to leaf under placement ---- */
+
+/* factory_client_to_leaf finds each member's channel where the placement
+   put it: the leaf (or PS sub-factory) whose signers include the member,
+   at the member's slot.  Profiles here make the timezone-cluster placement
+   reverse the members. */
+int test_tree_shape_client_to_leaf_placement(void) {
+    static const ts_shape_t shapes[] = {
+        { "N=6 arity 2", 6, {2}, 1, 0, 1, 1000, 0, 0 },
+        { "N=5 arity 2", 5, {2}, 1, 0, 0, 0, 0, 0 },
+        { "N=4 arity 1", 4, {1}, 1, 0, 1, 1000, 0, 0 },
+        { "N=4 PS", 4, {3}, 1, 0, 1, 1000, 0, 0 },
+        { "N=8 PS k=2", 8, {3}, 1, 0, 1, 1000, 2, 0 },
+        { "N=8 2,4", 8, {2, 4}, 2, 0, 1, 1000, 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const ts_shape_t *s = &shapes[i];
+        ts_tree_t t;
+        TEST_ASSERT(ts_open_b(&t, s, 0), s->name);
+        factory_t *f = t.f;
+        for (size_t p = 1; p < f->n_participants; p++)
+            f->profiles[p].timezone_bucket = (uint8_t)(20 - p);
+        unsigned char spk[34], txid[32];
+        memset(txid, 0xAA, 32);
+        TEST_ASSERT(factory_set_placement_mode(f, PLACEMENT_TIMEZONE_CLUSTER) &&
+                    factory_compute_funding_spk(f, spk) &&
+                    factory_set_funding(f, txid, 0, f->funding_amount_sats, spk, 34),
+                    "fund");
+        TEST_ASSERT(factory_build_tree(f), s->name);
+        for (size_t c = 0; c < s->n_clients; c++) {
+            size_t ni;
+            uint32_t vout;
+            if (!factory_client_to_leaf(f, c, &ni, &vout)) {
+                printf("  %s: member %zu not found\n", s->name, c + 1);
+                return 0;
+            }
+            const factory_node_t *n = &f->nodes[ni];
+            if (vout + 1 >= n->n_signers || n->signer_indices[vout + 1] != c + 1) {
+                printf("  %s: member %zu mapped to node %zu vout %u (signer %u)\n",
+                       s->name, c + 1, ni, vout,
+                       vout + 1 < n->n_signers ? n->signer_indices[vout + 1] : 0);
+                return 0;
+            }
+        }
+        ts_close(&t);
+    }
+    return 1;
+}

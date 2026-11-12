@@ -6,6 +6,10 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Tree builder
+
+- **The factory is funded at the key its root spends.** The root kickoff aggregates the participants in placement order (`factory_compute_funding_spk`), but the LSP funding address, the rotation funding address and the persisted-factory reload derived the key from the participants in index order. With a placement mode and profiles that reorder the clients, the root could not spend the funding output (since PR #486 the build refuses it). All three now use `factory_compute_funding_spk`; new `lsp_compute_funding_spk` / `lsp_compute_funding_spk_for` give the script for an LSP's participants. A partial rotation funds the key of the cooperative clients it builds the new factory for, and aborts if one of them disconnects before the ceremony. `factory_client_to_leaf` now finds a member's channel in the built tree for every shape, so channels open on the leaf the placement put the member on.
+
 ### Factory rotation is off by default
 
 Operator-visible behaviour changes.

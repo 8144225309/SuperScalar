@@ -3233,40 +3233,14 @@ int main(int argc, char *argv[]) {
                    lsp_rp->factory.funding_spk_len);
             mgr->rot_fund_spk_len = lsp_rp->factory.funding_spk_len;
 
-            /* Derive funding + mining addresses for rotation */
-            {
-                musig_keyagg_t ka;
-                secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS] = {0};
-                for (size_t i = 0; i < lsp_rp->factory.n_participants; i++)
-                    all_pks[i] = lsp_rp->factory.pubkeys[i];
-                musig_aggregate_keys(ctx, &ka, all_pks,
-                                       lsp_rp->factory.n_participants);
-                unsigned char is2[32];
-                if (!secp256k1_xonly_pubkey_serialize(ctx, is2, &ka.agg_pubkey)) {
-                    fprintf(stderr, "LSP recovery: xonly serialize failed\n");
-                    return 1;
-                }
-                unsigned char twk[32];
-                sha256_tagged("TapTweak", is2, 32, twk);
-                musig_keyagg_t kac = ka;
-                secp256k1_pubkey tpk;
-                if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tpk,
-                                                             &kac.cache, twk)) {
-                    fprintf(stderr, "LSP recovery: tweak add failed\n");
-                    return 1;
-                }
-                secp256k1_xonly_pubkey txo;
-                if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &txo, NULL, &tpk)) {
-                    fprintf(stderr, "LSP recovery: xonly from pubkey failed\n");
-                    return 1;
-                }
-                unsigned char ts2[32];
-                if (!secp256k1_xonly_pubkey_serialize(ctx, ts2, &txo)) {
-                    fprintf(stderr, "LSP recovery: xonly serialize failed\n");
-                    return 1;
-                }
+            /* Derive funding + mining addresses for rotation.  The funding
+               address is the output key of the funding script the loaded
+               root spends (persist_load_factory derived it with
+               factory_compute_funding_spk). */
+            if (mgr->rot_fund_spk_len == 34) {
                 char rfa[128];
-                if (regtest_derive_p2tr_address(&rt, ts2, rfa, sizeof(rfa)))
+                if (regtest_derive_p2tr_address(&rt, mgr->rot_fund_spk + 2,
+                                                rfa, sizeof(rfa)))
                     snprintf(mgr->rot_fund_addr, sizeof(mgr->rot_fund_addr),
                              "%s", rfa);
             }
@@ -3738,58 +3712,81 @@ accept_new_factory:
         return 1;
     }
 
+    /* The tree shape, placement and participant profiles: the root kickoff
+       aggregates the participants in placement order, so they are set
+       before the funding script is derived from them. */
+    if (n_level_arity > 0) {
+        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
+            fprintf(stderr, "Error: --arity shape refused by the factory\n");
+            return 1;
+        }
+    } else if (leaf_arity == 1)
+        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
+    else if (leaf_arity == 3)
+        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
+    /* Phase 3: optionally turn the top N depths into kickoff-only static
+       layers (CLTV-timeout-only, no DW state machine).  Must be applied
+       AFTER arity configuration so the DW counter is correctly resized. */
+    if (static_near_root > 0)
+        factory_set_static_near_root(&lsp_p->factory, static_near_root);
+    /* PS k² sub-factory arity: applied AFTER arity configuration so the
+       leaf-count + DW counter recompute correctly for k>1. */
+    if (ps_subfactory_arity_arg > 0)
+        factory_set_ps_subfactory_arity(&lsp_p->factory,
+                                          (uint32_t)ps_subfactory_arity_arg);
+    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
+        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
+        return 1;
+    }
+    lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
+
+    /* Populate default profiles from CLI config.  The shape setters above
+       allocate the factory's arrays, but not every shape calls one (a plain
+       --arity 2 without --static-near-root does not), so make sure they exist
+       before writing the profiles. */
+    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
+        fprintf(stderr, "LSP: factory array allocation failed\n");
+        return 1;
+    }
+    for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
+        lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
+        if (pi == 0) {
+            /* LSP gets remainder of profit share */
+            lsp_p->factory.profiles[pi].profit_share_bps =
+                (uint16_t)(10000 - (uint32_t)default_profit_bps * (uint32_t)n_clients);
+        } else {
+            lsp_p->factory.profiles[pi].profit_share_bps = default_profit_bps;
+        }
+        lsp_p->factory.profiles[pi].contribution_sats = funding_sats / (uint64_t)(1 + n_clients);
+        lsp_p->factory.profiles[pi].uptime_score = 1.0f;
+        lsp_p->factory.profiles[pi].timezone_bucket = 0;
+    }
+
+    /* --test-bad-terms: force profit-shared mode with 0 bps for all clients.
+       Clients running with --min-profit-bps should refuse to sign.
+       The test PASSES if factory creation fails (client rejection). */
+    if (test_bad_terms) {
+        lsp_p->factory.economic_mode = ECON_PROFIT_SHARED;
+        for (size_t pi = 1; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++)
+            lsp_p->factory.profiles[pi].profit_share_bps = 0;
+        lsp_p->factory.profiles[0].profit_share_bps = 10000; /* LSP takes 100% */
+        printf("LSP: --test-bad-terms: offering 0 bps profit to all clients\n");
+        printf("LSP: clients with --min-profit-bps > 0 should REFUSE\n");
+    }
+
     /* === Phase 2: Compute funding address === */
     size_t n_total = 1 + lsp_p->n_clients;
-    secp256k1_pubkey all_pks[FACTORY_MAX_SIGNERS];
-    all_pks[0] = lsp_p->lsp_pubkey;
-    for (size_t i = 0; i < lsp_p->n_clients; i++)
-        all_pks[i + 1] = lsp_p->client_pubkeys[i];
-
-    musig_keyagg_t ka;
-    musig_aggregate_keys(ctx, &ka, all_pks, n_total);
-
-    /* Compute tweaked xonly pubkey for P2TR */
-    unsigned char internal_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey)) {
-        fprintf(stderr, "LSP: xonly serialize failed\n");
-        lsp_cleanup(lsp_p);
-        memset(lsp_seckey, 0, 32);
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
-    unsigned char tweak[32];
-    sha256_tagged("TapTweak", internal_ser, 32, tweak);
-
-    musig_keyagg_t ka_copy = ka;
-    secp256k1_pubkey tweaked_pk;
-    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak)) {
-        fprintf(stderr, "LSP: tweak add failed\n");
-        lsp_cleanup(lsp_p);
-        memset(lsp_seckey, 0, 32);
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
-    secp256k1_xonly_pubkey tweaked_xonly;
-    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk)) {
-        fprintf(stderr, "LSP: xonly from pubkey failed\n");
-        lsp_cleanup(lsp_p);
-        memset(lsp_seckey, 0, 32);
-        secp256k1_context_destroy(ctx);
-        return 1;
-    }
-
     unsigned char fund_spk[34];
-    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
-
-    /* Derive bech32m address */
-    unsigned char tweaked_ser[32];
-    if (!secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly)) {
-        fprintf(stderr, "LSP: xonly serialize failed\n");
+    if (!lsp_compute_funding_spk(lsp_p, fund_spk)) {
+        fprintf(stderr, "LSP: funding script derivation failed\n");
         lsp_cleanup(lsp_p);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
     }
+
+    /* Derive bech32m address from the output key (OP_1 <32>) */
+    const unsigned char *tweaked_ser = fund_spk + 2;
 
     char fund_addr[128];
     if (rt_ok) {
@@ -4011,64 +4008,6 @@ accept_new_factory:
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
-    if (n_level_arity > 0) {
-        if (!factory_set_level_arity(&lsp_p->factory, level_arities, n_level_arity)) {
-            fprintf(stderr, "Error: --arity shape refused by the factory\n");
-            return 1;
-        }
-    } else if (leaf_arity == 1)
-        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_1);
-    else if (leaf_arity == 3)
-        factory_set_arity(&lsp_p->factory, FACTORY_ARITY_PS);
-    /* Phase 3: optionally turn the top N depths into kickoff-only static
-       layers (CLTV-timeout-only, no DW state machine).  Must be applied
-       AFTER arity configuration so the DW counter is correctly resized. */
-    if (static_near_root > 0)
-        factory_set_static_near_root(&lsp_p->factory, static_near_root);
-    /* PS k² sub-factory arity: applied AFTER arity configuration so the
-       leaf-count + DW counter recompute correctly for k>1. */
-    if (ps_subfactory_arity_arg > 0)
-        factory_set_ps_subfactory_arity(&lsp_p->factory,
-                                          (uint32_t)ps_subfactory_arity_arg);
-    if (!factory_set_placement_mode(&lsp_p->factory, (placement_mode_t)placement_mode_arg)) {
-        fprintf(stderr, "Error: unknown placement mode %d\n", placement_mode_arg);
-        return 1;
-    }
-    lsp_p->factory.economic_mode = (economic_mode_t)economic_mode_arg;
-
-    /* Populate default profiles from CLI config.  The shape setters above
-       allocate the factory's arrays, but not every shape calls one (a plain
-       --arity 2 without --static-near-root does not), so make sure they exist
-       before writing the profiles. */
-    if (!factory_alloc_default_arrays(&lsp_p->factory)) {
-        fprintf(stderr, "LSP: factory array allocation failed\n");
-        return 1;
-    }
-    for (size_t pi = 0; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++) {
-        lsp_p->factory.profiles[pi].participant_idx = (uint32_t)pi;
-        if (pi == 0) {
-            /* LSP gets remainder of profit share */
-            lsp_p->factory.profiles[pi].profit_share_bps =
-                (uint16_t)(10000 - (uint32_t)default_profit_bps * (uint32_t)n_clients);
-        } else {
-            lsp_p->factory.profiles[pi].profit_share_bps = default_profit_bps;
-        }
-        lsp_p->factory.profiles[pi].contribution_sats = funding_sats / (uint64_t)(1 + n_clients);
-        lsp_p->factory.profiles[pi].uptime_score = 1.0f;
-        lsp_p->factory.profiles[pi].timezone_bucket = 0;
-    }
-
-    /* --test-bad-terms: force profit-shared mode with 0 bps for all clients.
-       Clients running with --min-profit-bps should refuse to sign.
-       The test PASSES if factory creation fails (client rejection). */
-    if (test_bad_terms) {
-        lsp_p->factory.economic_mode = ECON_PROFIT_SHARED;
-        for (size_t pi = 1; pi < (size_t)(1 + n_clients) && pi < FACTORY_MAX_SIGNERS; pi++)
-            lsp_p->factory.profiles[pi].profit_share_bps = 0;
-        lsp_p->factory.profiles[0].profit_share_bps = 10000; /* LSP takes 100% */
-        printf("LSP: --test-bad-terms: offering 0 bps profit to all clients\n");
-        printf("LSP: clients with --min-profit-bps > 0 should REFUSE\n");
-    }
 
     /* If --test-burn, enable L-stock revocation before tree construction.
        Uses flat secrets (per ZmnSCPxj: no multi-party shachain method exists,

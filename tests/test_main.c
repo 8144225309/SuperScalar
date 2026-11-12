@@ -1139,6 +1139,7 @@ extern int test_rotation_creation_after_factory_free(void);
 extern int test_rotation_creation_arrays_never_allocated(void);
 extern int test_rotation_creation_carries_profiles(void);
 extern int test_rotation_creation_failure_keeps_template(void);
+extern int test_rotation_creation_placement_funding(void);
 extern int test_regtest_ladder_lifecycle(void);
 extern int test_regtest_ladder_ptlc_migration(void);
 extern int test_regtest_ladder_distribution_fallback(void);
@@ -1378,6 +1379,7 @@ extern int test_tree_shape_per_leaf_rollover(void);
 extern int test_tree_shape_funding_script(void);
 extern int test_tree_shape_session_reinit(void);
 extern int test_tree_shape_placement_setter(void);
+extern int test_tree_shape_client_to_leaf_placement(void);
 extern int test_cli_arity_uniform_3_parses(void);
 extern int test_cli_arity_mixed_248_parses(void);
 extern int test_cli_arity_rejects_16(void);
@@ -3251,6 +3253,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_rotation_creation_arrays_never_allocated);
     RUN_TEST(test_rotation_creation_carries_profiles);
     RUN_TEST(test_rotation_creation_failure_keeps_template);
+    RUN_TEST(test_rotation_creation_placement_funding);
 
     printf("\n=== Wire Protocol (Phase 9) ===\n");
     RUN_TEST(test_wire_pubkey_only_factory);
@@ -3425,6 +3428,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tree_shape_funding_script);
     RUN_TEST(test_tree_shape_session_reinit);
     RUN_TEST(test_tree_shape_placement_setter);
+    RUN_TEST(test_tree_shape_client_to_leaf_placement);
 
     printf("\n=== CLI Mixed-Arity Parsing (Phase 4) ===\n");
     RUN_TEST(test_cli_arity_uniform_3_parses);

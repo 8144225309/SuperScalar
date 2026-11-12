@@ -117,6 +117,21 @@ int lsp_init(lsp_t *lsp, secp256k1_context *ctx,
    Returns 1 when all clients connected. */
 int lsp_accept_clients(lsp_t *lsp);
 
+/* The funding script lsp_run_factory_creation accepts for the connected
+   participants: factory_compute_funding_spk over the LSP and the clients in
+   the order the placement mode and profiles set on lsp->factory put them.
+   Set placement and profiles first, then fund this script.  Returns 1 on
+   success. */
+int lsp_compute_funding_spk(lsp_t *lsp, unsigned char spk_out[34]);
+
+/* The same for a factory not yet set up on lsp: the LSP and client_pubkeys
+   (in that order, as creation will see them in lsp->client_pubkeys), ordered
+   by the placement mode and profiles of order_from (the factory creation
+   will start from). */
+int lsp_compute_funding_spk_for(lsp_t *lsp, const factory_t *order_from,
+                                const secp256k1_pubkey *client_pubkeys,
+                                size_t n_clients, unsigned char spk_out[34]);
+
 /* Run full factory creation ceremony over the wire.
    funding_txid: internal byte order, already funded.
    Returns 1 on success (factory fully signed). */
