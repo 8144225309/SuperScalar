@@ -382,6 +382,8 @@ add_executable(test_superscalar
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
+# Lets a test read the project's own headers (wire message id table).
+target_compile_definitions(test_superscalar PRIVATE SS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_superscalar PRIVATE superscalar superscalar_secrets project_warnings)
 if(ENABLE_SANITIZERS)
     target_link_libraries(test_superscalar PRIVATE project_sanitizers)

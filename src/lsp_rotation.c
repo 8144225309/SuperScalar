@@ -1091,6 +1091,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     void *saved_jit = mgr->jit_channels;
     size_t saved_n_jit = mgr->n_jit_channels;
     int saved_jit_enabled = mgr->jit_enabled;
+    struct lsp_deferred_msg *saved_deferred = mgr->deferred_msgs;
+    size_t saved_n_deferred = mgr->n_deferred_msgs;
+    size_t saved_deferred_cap = mgr->deferred_msgs_cap;
     uint64_t saved_jit_funding = mgr->jit_funding_sats;
     unsigned char saved_seckey[32];
     memcpy(saved_seckey, mgr->rot_lsp_seckey, 32);
@@ -1168,6 +1171,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->jit_channels = saved_jit;
     mgr->n_jit_channels = saved_n_jit;
     mgr->jit_enabled = saved_jit_enabled;
+    mgr->deferred_msgs = saved_deferred;
+    mgr->n_deferred_msgs = saved_n_deferred;
+    mgr->deferred_msgs_cap = saved_deferred_cap;
     mgr->jit_funding_sats = saved_jit_funding;
     mgr->cli_enabled = saved_cli_enabled;
     mgr->confirm_timeout_secs = saved_confirm_timeout;
@@ -1263,11 +1269,15 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         }
     }
 
-    /* Migrate any active JIT channels into the new factory */
+    /* Retire JIT channels whose funding output has been spent.  One that is
+       still on chain stays open with its record. */
     for (size_t c = 0; c < mgr->n_channels; c++) {
         if (jit_channel_is_active(mgr, c)) {
-            printf("LSP rotate: migrating JIT channel for client %zu\n", c);
-            jit_channel_migrate(mgr, lsp, c, 0);
+            if (jit_channel_migrate(mgr, lsp, c, 0))
+                printf("LSP rotate: retired JIT channel for client %zu\n", c);
+            else
+                fprintf(stderr, "LSP rotate: JIT channel for client %zu is "
+                        "still on chain; left open\n", c);
         }
     }
 

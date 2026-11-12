@@ -1627,6 +1627,17 @@ extern int test_jit_persist_skip_closed(void);
 extern int test_jit_multiple_channels(void);
 extern int test_jit_multiple_watchtower_indices(void);
 extern int test_jit_funding_confirmation_transition(void);
+extern int test_jit_create_refused_when_disabled(void);
+extern int test_jit_expiry_trigger_refused_when_disabled(void);
+extern int test_lsps2_buy_refused_when_jit_disabled(void);
+extern int test_lsps_peer_request_refuses_buy(void);
+extern int test_jit_migrate_keeps_unspent_channel(void);
+extern int test_jit_client_migrate_keeps_factory_watch(void);
+extern int test_jit_reject_round_trip(void);
+extern int test_wire_msg_ids_unique(void);
+extern int test_gettxout_answer_classified(void);
+extern int test_jit_reject_ends_wait(void);
+extern int test_jit_wait_holds_other_messages(void);
 
 /* Per-Leaf Advance */
 extern int test_factory_advance_leaf_left(void);
@@ -1986,6 +1997,7 @@ extern int test_network_gate_risk_accepted(void);
 extern int test_network_gate_cmdline_seckey(void);
 extern int test_network_gate_no_test_scaffolding(void);
 extern int test_network_gate_db(void);
+extern int test_network_gate_no_experimental_jit(void);
 extern int test_network_mainnet_step_floor_alias(void);
 extern int test_network_startup_gates_per_role(void);
 extern int test_keyfile_v2_roundtrip(void);
@@ -3619,6 +3631,17 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_multiple_channels);
     RUN_TEST(test_jit_multiple_watchtower_indices);
     RUN_TEST(test_jit_funding_confirmation_transition);
+    RUN_TEST(test_jit_create_refused_when_disabled);
+    RUN_TEST(test_jit_expiry_trigger_refused_when_disabled);
+    RUN_TEST(test_lsps2_buy_refused_when_jit_disabled);
+    RUN_TEST(test_lsps_peer_request_refuses_buy);
+    RUN_TEST(test_jit_migrate_keeps_unspent_channel);
+    RUN_TEST(test_jit_client_migrate_keeps_factory_watch);
+    RUN_TEST(test_jit_reject_round_trip);
+    RUN_TEST(test_wire_msg_ids_unique);
+    RUN_TEST(test_gettxout_answer_classified);
+    RUN_TEST(test_jit_reject_ends_wait);
+    RUN_TEST(test_jit_wait_holds_other_messages);
 
     printf("\n=== Per-Leaf Advance ===\n");
     RUN_TEST(test_factory_advance_leaf_left);
@@ -3986,6 +4009,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_network_gate_cmdline_seckey);
     RUN_TEST(test_network_gate_no_test_scaffolding);
     RUN_TEST(test_network_gate_db);
+    RUN_TEST(test_network_gate_no_experimental_jit);
     RUN_TEST(test_network_mainnet_step_floor_alias);
     RUN_TEST(test_network_startup_gates_per_role);
 

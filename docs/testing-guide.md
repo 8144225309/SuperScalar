@@ -463,7 +463,6 @@ python3 tools/manual_tests.py help
 | `states_layer` | --states-per-layer 4: custom DW state count |
 | `step_blocks` | --step-blocks 20: custom nSequence step |
 | `profit_shared` | --economic-mode profit-shared: fee splits |
-| `no_jit` | --no-jit: factory without JIT channel fallback |
 | `placement` | All 3 placement modes (sequential/inward/outward) |
 | `mnemonic` | --generate-mnemonic: BIP39 keyfile creation |
 | `backup` | Backup create + verify + restore cycle |
