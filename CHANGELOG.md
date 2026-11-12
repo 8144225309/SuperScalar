@@ -6,6 +6,17 @@ All notable changes to SuperScalar are documented here.
 
 ## Unreleased
 
+### Reorg handling fixes (#201, #206, #210)
+
+- **False reorgs:** the tip height and hash were read with two RPCs, so a block arriving between them produced a mismatched pair and a later `FORWARD_REORG` that never happened. Both now come from one `getblockchaininfo` call (`regtest_get_tip`), and classification is a pure function (`lsp_reorg_classify`).
+- **Missed reorgs:** a block mined and replaced between two polls was not reported. `getchaintips` is now checked (`UNSEEN_BLOCK_REORG`), each disconnected branch is reported once, and a failed RPC keeps the stored tip (`INCONCLUSIVE`) instead of skipping the window.
+- **Factory channels frozen after any reorg:** revalidation looked up each channel's off-chain leaf txid, so every factory channel stopped accepting HTLCs and building commitments after any detected reorg and never recovered. It now checks the factory funding transaction (gone = neither confirmed nor in the mempool) and re-checks on every block while a channel is frozen or the funding is unconfirmed.
+- **Persisted freeze reloaded:** the v31 `funding_pending_reorg` column was written but never read back on LSP restart. `lsp_channels_init_from_db` now reloads it, and the first block's re-check clears it when the funding transaction is confirmed.
+- **Funding check independent of `-txindex`:** the factory funding is checked through its output (`gettxout`) and the block that confirmed it (schema v43 `funding_anchors`), so a funding transaction deeper than the lookup scan depth no longer reads as gone.
+- **RPC outage is not a missing funding:** `regtest_get_confirmations` returns `-2` when bitcoind could not be reached, and revalidation then changes nothing.
+- **Sub-factory chains kept:** reorg alarms no longer reset sub-factory chains (they are off-chain until a force-close). Resetting them broke force-close of advanced sub-factories.
+- **Reorgs during downtime:** the detector's last tip is stored (schema v43 `reorg_tips`) and compared on the first poll after a restart.
+
 ### Restart and reconnect persistence
 
 - **Restored channels keep writing to the DB.** After an LSP restart, and after any client reconnect or restart, the rebuilt channel had no DB attached, so revocation secrets and per-commitment points received afterwards were not written. The LSP now attaches the DB it restores from (and refuses a manager that names another one); the client attaches its DB to the channel it rebuilds.
