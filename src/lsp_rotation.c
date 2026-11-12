@@ -1194,29 +1194,20 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->cli_enabled = saved_cli_enabled;
     mgr->confirm_timeout_secs = saved_confirm_timeout;
 
-    /* Restore channel balances from old factory (carry across rotation).
-       Only apply if the old (usable) balance fits within the new channel
-       capacity.  funding_amount is the GROSS on-chain amount; the base
-       commitment fee is reserved from it, so the conservation invariant
-       (lsp_channels.c) checks local + remote + htlc_sum == funding_amount -
-       base_commit_fee.  The carried local/remote is a usable total, so the
-       gross funding_amount must add the base commit fee back — otherwise the
-       checker sees a deficit of exactly base_commit_fee on every channel and
-       the LSP refuses all new HTLCs after a rotation.  Use the same fee rate
-       the channels are about to be set to below (and that the checker reads
-       from ch->fee_rate_sat_per_kvb). */
-    uint64_t rot_fee_rate = fe->get_rate(fe, FEE_TARGET_NORMAL);
-    uint64_t rot_base_commit_fee = (rot_fee_rate * 154 + 999) / 1000;
+    /* Carry each client's balance into its new channel.  The new channel is
+       built by lsp_channels_init exactly like a channel at first open: its
+       funding amount is the new tree's leaf output and its fee rate the fixed
+       channel default.  The client derives the same two values from its own
+       copy of the tree, so the commitment the LSP signs below is the one the
+       client verifies.  The client's balance moves over unchanged; whatever
+       else the new leaf holds is the LSP's side. */
     for (size_t c = 0; c < mgr->n_channels && c < saved_n_channels; c++) {
-        channel_t *ch = &mgr->entries[c].channel;
-        uint64_t old_total = saved_ch_local[c] + saved_ch_remote[c];
-        uint64_t new_usable = ch->local_amount + ch->remote_amount;
-        if (old_total > 0 && old_total <= new_usable) {
-            ch->local_amount = saved_ch_local[c];
-            ch->remote_amount = saved_ch_remote[c];
-            ch->funding_amount = old_total + rot_base_commit_fee;
-        }
-        /* else: new factory has different capacity, keep default split */
+        if (saved_ch_local[c] + saved_ch_remote[c] == 0) continue;
+        if (!lsp_channel_carry_client_balance(&mgr->entries[c].channel,
+                                              saved_ch_remote[c]))
+            fprintf(stderr, "LSP rotate: client %zu balance %llu does not fit the "
+                    "new channel; keeping the default split\n", c,
+                    (unsigned long long)saved_ch_remote[c]);
     }
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {
@@ -1224,11 +1215,9 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
 
-    /* Set fee rate on all new channels — the same rate used above to size
-       the restored channels' gross funding_amount, so the conservation
-       checker reads a consistent base_commit_fee. */
-    for (size_t c = 0; c < mgr->n_channels; c++)
-        mgr->entries[c].channel.fee_rate_sat_per_kvb = rot_fee_rate;
+    /* Drill checkpoint: the new factory is funded and its tree signed, the
+       clients have not yet received CHANNEL_READY or commitment 0. */
+    lsp_crash_checkpoint("rotate_channel_setup");
 
     if (!lsp_channels_send_ready(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: send_ready failed\n");

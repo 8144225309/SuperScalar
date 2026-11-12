@@ -288,7 +288,7 @@ def run_scenario(args: argparse.Namespace) -> int:
             "--seckey", CLIENT_SECKEYS[i],
             "--network", args.network,
             "--port", str(args.port),
-            "--daemon",
+            "--daemon", "--enable-rotation-experimental",
             "--db", str(client_dbs[i]),
             "--lsp-pubkey", lsp_pubkey,
             "--rpcuser", btc_cli[2].split("=", 1)[1] if "=" in btc_cli[2] else "",

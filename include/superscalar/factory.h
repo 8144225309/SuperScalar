@@ -755,6 +755,12 @@ int factory_set_placement_mode(factory_t *f, placement_mode_t mode);
 
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
+
+/* nLockTime of the factory's distribution transaction: the factory's CLTV
+   timeout.  The LSP announces this value and every client requires it. */
+static inline uint32_t factory_distribution_locktime(const factory_t *f) {
+    return f ? f->cltv_timeout : 0;
+}
 int factory_verify_all(factory_t *f);
 
 /* Bounded fresh-nonce retry (#48): max sign+verify attempts per ceremony before

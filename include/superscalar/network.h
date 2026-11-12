@@ -15,6 +15,13 @@
 /* 1 if network names Bitcoin mainnet ("mainnet" or "bitcoin"), else 0. */
 int network_is_mainnet(const char *network);
 
+/* Confirmations a factory's funding output needs before the factory is used:
+   override if it is positive, otherwise the chain's default (regtest 1,
+   mainnet 6, every other chain 3).  The LSP waits for this depth and the
+   client refuses a factory whose funding output is less deep, so with the
+   defaults both sides agree. */
+int network_funding_confs(const char *network, int override);
+
 /* The canonical name of a supported chain: "bitcoin" maps to "mainnet", the
    other supported names map to themselves.  Returns a static string, or NULL
    if network is NULL or not a supported chain.  The daemons canonicalise
