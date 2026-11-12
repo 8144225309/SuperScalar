@@ -126,7 +126,7 @@ int test_regtest_recovery_waits_for_confirmed_parent(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     secp256k1_keypair kps[RT_N];
     char fund_txid[65];
-    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
+    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 1250, fund_txid), "factory");
     printf("  tree: %zu nodes, funding %s\n", f->n_nodes, fund_txid);
 
     char db_path[] = "/tmp/ss_rt_recovery_XXXXXX";
@@ -248,7 +248,7 @@ int test_regtest_cpfp_parent_accepted_child_rejected(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     secp256k1_keypair kps[RT_N];
     char fund_txid[65];
-    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
+    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 1250, fund_txid), "factory");
 
     bad_sig_wallet_t w;
     memset(&w, 0, sizeof(w));
@@ -360,7 +360,7 @@ int test_regtest_cpfp_rebump_in_mempool(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     secp256k1_keypair kps[RT_N];
     char fund_txid[65];
-    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
+    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 1250, fund_txid), "factory");
     const factory_node_t *root = &f->nodes[0];
     char *hex = malloc(root->signed_tx.len * 2 + 1);
     TEST_ASSERT(hex, "alloc");
@@ -474,7 +474,7 @@ int test_regtest_wt_escalator_replaces_own_child(void) {
     factory_t *f = calloc(1, sizeof(factory_t));
     secp256k1_keypair kps[RT_N];
     char fund_txid[65];
-    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 0, fund_txid), "factory");
+    TEST_ASSERT(f && fund_tree(&rt, ctx, mine_addr, f, kps, 1250, fund_txid), "factory");
     const factory_node_t *root = &f->nodes[0];
     char *hex = malloc(root->signed_tx.len * 2 + 1);
     TEST_ASSERT(hex, "alloc");
