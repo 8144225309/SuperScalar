@@ -26,6 +26,21 @@ RU=$(awk -F= '/^[[:space:]]*rpcuser/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_C
 RP=$(awk -F= '/^[[:space:]]*rpcpassword/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_CONF"); RP=${RP:-rpcpass}
 RPORT=$(awk -F= '/^[[:space:]]*rpcport/{gsub(/ /,"",$2);print $2;exit}' "$REGTEST_CONF"); RPORT=${RPORT:-18443}
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"; WALLET="ss_cheat_leaf_miner"
+# A confirmed transaction is found with getrawtransaction only on a node with
+# -txindex; without it the block has to be given.  rawtx TXID prints the
+# decoded transaction, looking in the last 60 blocks when the plain call fails.
+rawtx(){
+    local t=$1 o h n i
+    o=$($BCLI getrawtransaction "$t" true 2>/dev/null) && { printf '%s
+' "$o"; return 0; }
+    n=$($BCLI getblockcount 2>/dev/null) || return 1
+    for i in $(seq 0 60); do
+        h=$($BCLI getblockhash $((n - i)) 2>/dev/null) || continue
+        o=$($BCLI getrawtransaction "$t" true "$h" 2>/dev/null) && { printf '%s
+' "$o"; return 0; }
+    done
+    return 1
+}
 . "$(dirname "$(realpath "$0")")"/regtest_test_helpers.sh   # pen_recovers_most (A-2, fee-bounded)
 TMPDIR=$(mktemp -d /tmp/ss-tl-commit-breach.XXXXXX); LSP_DB="$TMPDIR/lsp.db"; WT_DB="$TMPDIR/wt.db"; LSP_LOG="$TMPDIR/lsp.log"; WT_LOG="$TMPDIR/wt.log"
 PIDS=(); MINER_PID=""
@@ -138,9 +153,9 @@ if [ "${SS_HIFEE_BUMP:-0}" = 1 ]; then
 fi
 echo "  penalty txid: $PEN_TXID — mining to confirm + verify payout"
 PCONF=0
-for i in $(seq 1 12); do mine 1; sleep 1; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
+for i in $(seq 1 12); do mine 1; sleep 1; c=$(rawtx "$PEN_TXID" 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { PCONF=$c; break; }; done
 [ "$PCONF" -ge 1 ] || fail "penalty $PEN_TXID never confirmed on-chain (broadcast != confirmed)"
-PEN_SATS=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+PEN_SATS=$(rawtx "$PEN_TXID" 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
 PEN_SATS=$(awk "BEGIN{printf \"%d\", ($PEN_SATS+0)*100000000}")
 echo "  penalty confirmed ($PCONF conf); largest output: ${PEN_SATS:-0} sats"
 [ "${PEN_SATS:-0}" -ge 5000 ] || fail "penalty payout ${PEN_SATS} sats too small — not a real to_local recovery (dust/zero?)"
@@ -155,19 +170,19 @@ case "$RR" in LOW*) fail "penalty recovers too little of the swept to_local — 
 # must stay swept across the reorg. WT is still alive here (--poll-interval 3).
 if [ "${SS_REORG_REFIRE:-0}" = 1 ]; then
     echo "=== REORG-REFIRE: orphan the penalty block, verify the penalty re-confirms ==="
-    PBLK=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
+    PBLK=$(rawtx "$PEN_TXID" 2>/dev/null | grep -oE '"blockhash": *"[0-9a-f]{64}"' | grep -oE '[0-9a-f]{64}' | head -1)
     [ -n "$PBLK" ] || fail "reorg: could not find penalty block for $PEN_TXID"
     echo "  invalidating penalty block $PBLK (orphans penalty $PEN_TXID)"
     $BCLI invalidateblock "$PBLK" 2>/dev/null
     sleep 6   # let the standalone WT poll-loop observe the vanished penalty + re-broadcast
     # Verify the reorg ACTUALLY orphaned the penalty — else the re-confirm below is vacuous.
-    UC=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    UC=$(rawtx "$PEN_TXID" 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1)
     { [ -z "$UC" ] || [ "$UC" -eq 0 ]; } || fail "REORG-REFIRE: invalidateblock left penalty at $UC confs — reorg ineffective, test would be vacuous"
     echo "  penalty orphaned (confs now ${UC:-0}); mining new chain to verify re-confirm"
     RECONF=0
-    for i in $(seq 1 24); do mine 1; sleep 2; c=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
+    for i in $(seq 1 24); do mine 1; sleep 2; c=$(rawtx "$PEN_TXID" 2>/dev/null | grep -oE '"confirmations": *[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n "$c" ] && [ "$c" -ge 1 ] && { RECONF=$c; break; }; done
     [ "$RECONF" -ge 1 ] || fail "REORG-REFIRE: penalty $PEN_TXID did NOT re-confirm after reorg — trustless defense LOST on reorg!"
-    RSATS=$($BCLI getrawtransaction "$PEN_TXID" true 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
+    RSATS=$(rawtx "$PEN_TXID" 2>/dev/null | grep -oE '"value": *[0-9.]+' | grep -oE '[0-9.]+' | sort -rn | head -1)
     RSATS=$(awk "BEGIN{printf \"%d\", ($RSATS+0)*100000000}")
     [ "${RSATS:-0}" -ge 5000 ] || fail "REORG-REFIRE: re-confirmed penalty output ${RSATS} sats too small"
     grep -aiE "vanished.*reorg|re-watching|reorg detected" "$WT_LOG" 2>/dev/null | tail -2

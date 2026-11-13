@@ -150,6 +150,11 @@ typedef struct watchtower_s {
        (started with --wt-db only) can broadcast on breach without ever
        opening lsp.db.  Set via watchtower_set_wt_db after watchtower_init. */
     persist_wt_t *wt_db;
+    /* Where the scan floor is kept (see persist_wt_get_scan_from): wt_db, or
+       the database the tower was hydrated from.  NULL = kept in memory only. */
+    persist_wt_t *scan_db;
+    int scan_from;                 /* blocks below this are searched already; 0 = not loaded */
+    int scan_floor_loaded;
 
     /* SF-WT-TRUSTLESS Phase 2c PR-E.2 (#248): auto-settle hook.  When
        non-NULL, called from watchtower_check after a factory-node response
