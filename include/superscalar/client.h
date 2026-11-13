@@ -526,8 +526,11 @@ typedef enum {
    returns -1 on an unrecognised value. */
 int client_parse_forgery_response(const char *s);
 
-/* Handle incoming ADD_HTLC from LSP (we are the payee).
-   Returns 1 on success. */
+/* Handle incoming ADD_HTLC from LSP (we are the payee).  An add from the
+   LSP is always an HTLC the LSP offers to us: one we offer exists only
+   because we sent the add ourselves (client_send_payment books it).  An add
+   that claims to be our own payment (it carries dest_client) is refused and
+   nothing changes.  Returns 1 if the HTLC was booked. */
 int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg);
 
 /* Apply an UPDATE_FAIL_HTLC from the LSP to the channel.
@@ -549,6 +552,39 @@ int client_handle_async_msg(const wire_msg_t *msg);
 int client_fulfill_payment(int fd, channel_t *ch,
                              uint64_t htlc_id,
                              const unsigned char *preimage32);
+
+/* Blocks a received HTLC must still run after the chain tip before it pays
+   an invoice (BOLT 11 default min_final_cltv_expiry). */
+#define CLIENT_MIN_FINAL_CLTV_DELTA 18u
+
+/* 1 if h, an active HTLC the LSP offered to us, pays an invoice of
+   invoice_amount_msat (0: any amount): it carries at least that amount
+   (BOLT 4: a final node may be paid more, never less) and expires at least
+   CLIENT_MIN_FINAL_CLTV_DELTA blocks after tip_height.  0 when the tip is
+   not known (tip_height 0). */
+int client_htlc_pays_invoice(const htlc_t *h, uint64_t invoice_amount_msat,
+                             uint32_t tip_height);
+
+/* Settle received HTLC htlc_id against our invoice: if it pays the invoice
+   (client_htlc_pays_invoice), fulfil it with preimage32; otherwise fail it
+   back to the LSP and keep the preimage.  Returns 1 if fulfilled, 0 if
+   failed back, -1 if neither could be done. */
+int client_settle_invoice_htlc(int fd, channel_t *ch, uint64_t htlc_id,
+                               const unsigned char *preimage32,
+                               uint64_t invoice_amount_msat,
+                               uint32_t tip_height);
+
+/* A fresh invoice preimage and its payment hash, from the OS randomness
+   (getrandom, else /dev/urandom).  There is no fallback: if no randomness
+   can be had, both are zeroed and 0 is returned, and no invoice may be
+   made. */
+int client_new_invoice_preimage(unsigned char preimage32[32],
+                                unsigned char payment_hash32[32]);
+
+/* Tests: replace the randomness client_new_invoice_preimage draws from
+   (fn fills buf with len bytes, 1 on success).  NULL restores the OS. */
+typedef int (*client_rand_fn)(unsigned char *buf, size_t len);
+void client_set_rand_source(client_rand_fn fn);
 
 /* Amount rule for an LSP-proposed leaf reallocation.  Evaluated entirely
    against the client's own tree: the client must be a signer of the leaf,

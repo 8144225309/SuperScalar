@@ -312,6 +312,7 @@ add_executable(test_superscalar
     tests/test_bridge.c
     tests/test_daemon.c
     tests/test_reconnect.c
+    tests/test_member_htlc.c
     tests/test_client_watchtower.c
     tests/test_revocation_failclosed.c
     tests/test_watchtower_capacity.c
