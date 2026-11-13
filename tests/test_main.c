@@ -1470,6 +1470,9 @@ extern int test_reconnect_htlc_replay(void);
 extern int test_member_host_add_is_never_own_payment(void);
 extern int test_member_underpaid_htlc_gets_no_preimage(void);
 extern int test_member_invoice_preimage_needs_randomness(void);
+extern int test_member_final_hop_onion(void);
+extern int test_member_external_payment_rules(void);
+extern int test_member_signs_its_own_invoice(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
 /* Security hardening */
@@ -1894,11 +1897,9 @@ extern int test_tor_password_file(void);
 extern int test_bridge_keysend_inbound(void);
 
 /* Signet/Testnet4 Gap Stress Tests */
-extern int test_prop_keysend_wire_roundtrip(void);
 extern int test_prop_keysend_preimage_verify(void);
 extern int test_prop_rebalance_conservation(void);
 extern int test_prop_invoice_registry_exhaustion(void);
-extern int test_prop_keysend_bridge_e2e(void);
 extern int test_prop_cli_command_fuzzing(void);
 extern int test_prop_batch_rebalance_partial_fail(void);
 extern int test_prop_keysend_invoice_collision(void);
@@ -3613,6 +3614,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_member_host_add_is_never_own_payment);
     RUN_TEST(test_member_underpaid_htlc_gets_no_preimage);
     RUN_TEST(test_member_invoice_preimage_needs_randomness);
+    RUN_TEST(test_member_final_hop_onion);
+    RUN_TEST(test_member_external_payment_rules);
+    RUN_TEST(test_member_signs_its_own_invoice);
     RUN_TEST(test_client_handle_async_msg);
 
     printf("\n=== Security Hardening ===\n");
@@ -4017,11 +4021,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_prop_wire_register_roundtrip);
 
     printf("\n=== Signet/Testnet4 Gap Stress Tests ===\n");
-    RUN_TEST(test_prop_keysend_wire_roundtrip);
     RUN_TEST(test_prop_keysend_preimage_verify);
     RUN_TEST(test_prop_rebalance_conservation);
     RUN_TEST(test_prop_invoice_registry_exhaustion);
-    RUN_TEST(test_prop_keysend_bridge_e2e);
     RUN_TEST(test_prop_cli_command_fuzzing);
     RUN_TEST(test_prop_batch_rebalance_partial_fail);
     RUN_TEST(test_prop_keysend_invoice_collision);

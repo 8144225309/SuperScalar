@@ -19,7 +19,7 @@ typedef struct {
 } persist_t;
 
 /* Current schema version. Bump when adding migrations. */
-#define PERSIST_SCHEMA_VERSION 43
+#define PERSIST_SCHEMA_VERSION 44
 
 /* #185 / wallet-team CEREMONY_DESIGN.md §6.1:
    Ceremony state enum (column `ceremonies.state`).
@@ -913,15 +913,21 @@ size_t persist_load_htlc_origins(persist_t *p,
 
 /* --- Client invoices (Phase 23) --- */
 
+/* A member's own invoice: its preimage and, for a BOLT 11 invoice it
+   signed, its payment secret (NULL for an invoice paid inside the
+   factory).  Kept by the member only. */
 int persist_save_client_invoice(persist_t *p,
                                  const unsigned char *payment_hash32,
                                  const unsigned char *preimage32,
+                                 const unsigned char *payment_secret32,
                                  uint64_t amount_msat);
 int persist_deactivate_client_invoice(persist_t *p,
                                        const unsigned char *payment_hash32);
 size_t persist_load_client_invoices(persist_t *p,
                                      unsigned char (*hashes_out)[32],
                                      unsigned char (*preimages_out)[32],
+                                     unsigned char (*secrets_out)[32],
+                                     int *has_secret_out,
                                      uint64_t *amounts_out,
                                      size_t max_invoices);
 

@@ -244,7 +244,7 @@ static int build_msg(in_t *in, const uint8_t *types, size_t n_types,
         memset(pre, u8(in), 32);
         sha256(pre, 32, h32);
         if (sel & 0x40) h32[0] ^= 1;
-        m->json = wire_build_register_invoice(h32, pre, (uint64_t)u16(in) * 1000, u8(in) % 3);
+        m->json = wire_build_register_invoice(h32, (uint64_t)u16(in) * 1000, u8(in) % 3);
         break;
     }
     default:

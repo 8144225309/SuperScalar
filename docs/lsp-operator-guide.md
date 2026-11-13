@@ -420,7 +420,7 @@ Writes a JSON file with factory state, channel balances, and pending HTLCs.
 
 ## 10. CLN Bridge (Lightning Network Integration)
 
-The CLN bridge connects the SuperScalar factory to the broader Lightning Network. External Lightning nodes pay a CLN invoice; the bridge relays the HTLC into the factory and returns the preimage once the client fulfills. This makes factory clients reachable by any LN wallet without the sender knowing about SuperScalar.
+The CLN bridge connects the SuperScalar factory to the broader Lightning Network. A factory client receives with an invoice it makes and signs itself, with a route hint through the LSP's CLN node; it keeps the invoice's preimage and payment secret. An outside payer pays the client's invoice, CLN forwards the HTLC towards the hinted channel, and the plugin hands it (with the payer's onion for the client) through the bridge to the LSP, which offers it to the client. The client checks the payment and releases its preimage; only then do the LSP, the bridge and CLN learn it. Neither the LSP nor CLN can settle a client's payment: neither holds the preimage.
 
 ### Prerequisites
 
@@ -446,7 +446,9 @@ External LN Node
                          Factory Client
 ```
 
-The plugin intercepts inbound HTLCs via CLN's `htlc_accepted` hook, forwards them through the bridge daemon to the LSP, and holds the HTLC until the client fulfills with the preimage.
+The plugin intercepts inbound HTLCs via CLN's `htlc_accepted` hook, forwards them (and, for a forward, CLN's `next_onion`) through the bridge daemon to the LSP, and holds the HTLC until the client fulfills with the preimage or the LSP fails it.
+
+The LSP needs `--invoice-route-hint NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA`: `NODE_ID` is the CLN node's id and `SCID` a short channel id no real channel of that node uses (CLN forwards to it, the plugin catches the forward). Client invoices advertise this hop.
 
 ### Startup Order
 
@@ -541,8 +543,8 @@ restart it on that status.
 The plugin's state file (`superscalar-bridge-state-file`) holds what must
 survive a restart of `lightningd`: outside payments that were requested and
 whose result the LSP has not acknowledged, the HTLCs handed to the LSP and not
-yet resolved, and the factory invoices already fulfilled (with the preimage
-given). It is written atomically, mode `0600`, and records the CLN node id and
+yet resolved, and the client invoices already paid (with the preimage the
+client released). It is written atomically, mode `0600`, and records the CLN node id and
 the LSP key it belongs to.
 
 The plugin loads it before it does anything else and **stops** if the file
@@ -555,26 +557,22 @@ is refused the link.
 
 ### What the bridge checks do not cover
 
-Core Lightning holds every factory invoice together with its preimage (that
-is how it produces the BOLT11 string). The plugin therefore never lets CLN
-handle an HTLC for a factory invoice, deletes CLN's copy once the LSP has
-fulfilled it, and keeps fulfilled hashes closed across restarts. That
-protection is the plugin's, so it has limits:
+Core Lightning holds no invoice and no preimage for a factory client: the
+client signs its own invoices and the plugin is told only their payment
+hashes. A payment to a client reaches CLN as a forward to the hinted channel.
 
-- **Plugin not loaded.** If `lightningd` runs without the plugin, CLN settles
-  any HTLC for an unpaid factory invoice by itself: the payer is charged and
-  the node keeps the money, while the factory client is not paid. This was
-  seen on CLN v26.06.9 with the plugin loaded as `plugin=` and stopped.
-  `important-plugin=` is therefore required: CLN then stops when the plugin
-  does. Do not start `lightningd` without the plugin while factory invoices
-  are outstanding.
+- **Plugin not loaded.** Without the plugin CLN cannot forward to the hinted
+  channel (it does not exist) and fails the HTLC; it cannot settle it. Load
+  the plugin with `important-plugin=` so that payments to clients are not
+  failed while it is down.
 - **Outside payments are not reachable from the stock client.** The LSP pays
   an outside invoice when a client offers an HTLC that carries the invoice,
   but `superscalar_client` has no command that sends one. The path is
   exercised by tests only.
 - **Keysend is refused.** A keysend arriving at the node is failed with
   `incorrect_or_unknown_payment_details`, whether or not it was meant for a
-  factory client: nothing delivers a keysend's preimage to a factory client,
+  factory client: a keysend carries its preimage for the payee, which the
+  LSP would then hold,
   and CLN's own keysend handling would settle it for the node, including one
   whose payment hash an outside payment in flight is using. The node cannot
   receive keysends while the plugin is loaded.
@@ -736,12 +734,11 @@ deploy.
       claim the HTLC on-chain.
 
 Invoices
-- [x] `invoice` accepts `preimage`, `cltv`, `expiry` and
-      `exposeprivatechannels` together, and returns `bolt11`.
-- [x] `listinvoices` returns `label`, `payment_hash` and `status` (`unpaid`
-      until paid or expired).
-- [x] `delinvoice label=... status=unpaid` removes an invoice whose HTLC was
-      resolved through the hook.
+- [ ] The `htlc_accepted` hook is called for a forward to a short channel
+      id the node has no channel for, with `onion.short_channel_id`,
+      `onion.forward_msat`, `onion.outgoing_cltv_value` and
+      `onion.next_onion`, before CLN fails it; resolving it with the client's
+      preimage settles the incoming HTLC.
 
 Outside payments
 - [x] `decode` returns `type: "bolt11 invoice"`, `valid`, `payment_hash`,
@@ -802,23 +799,20 @@ Deployment
 | `--superscalar-bridge-port` | `9736` | Bridge daemon port |
 | `--superscalar-bridge-secret-file` | `~/.superscalar/bridge-plugin.secret` | File with the bridge's shared secret (written by the bridge); regular file, owned by the plugin's user, mode `0600` |
 | `--superscalar-bridge-state-file` | `~/.superscalar/bridge-plugin.state.json` | Where the plugin records outside payments until their result is acknowledged |
-| `--superscalar-lightning-cli` | `lightning-cli` | Path to `lightning-cli` binary (used for invoice creation) |
+| `--superscalar-lightning-cli` | `lightning-cli` | Path to `lightning-cli` binary (used for outside payments) |
 
 ### Invoice Flow
 
 When a factory client wants to receive an external Lightning payment:
 
-1. Client sends `MSG_REGISTER_INVOICE` to the LSP with payment_hash, preimage, and amount
-2. LSP registers the invoice in its local registry
-3. LSP forwards `MSG_BRIDGE_REGISTER` to the bridge daemon (includes preimage)
-4. Bridge forwards the registration to the CLN plugin (JSON over TCP)
-5. Plugin calls `lightning-cli invoice` to create a BOLT11 invoice with the matching payment_hash
-6. Plugin sends `invoice_bolt11` response back through the bridge
-7. Bridge forwards `MSG_INVOICE_BOLT11` to the LSP
-8. LSP forwards `MSG_INVOICE_BOLT11` to the client (client can now share the BOLT11 string)
-9. External payer pays the BOLT11 invoice; CLN's `htlc_accepted` hook fires
-10. Plugin sends the HTLC through the bridge → LSP → client channel
-11. Client fulfills with preimage; LSP returns `MSG_BRIDGE_FULFILL_HTLC`; plugin resolves the CLN HTLC
+1. The LSP (CLI `invoice <client> <amount_msat>`, or admin RPC `createinvoice` with `client`) sends the client `MSG_CREATE_INVOICE` with the route hint
+2. The client makes a preimage and payment secret, keeps them, and signs a BOLT11 invoice with its own key, routed through the hinted hop
+3. The client answers `MSG_INVOICE_CREATED` (hash and its BOLT11) and `MSG_REGISTER_INVOICE` (hash, amount; no preimage)
+4. The LSP registers the hash and sends `MSG_BRIDGE_REGISTER` (hash only) to the bridge, which tells the plugin
+5. The outside payer pays the client's invoice; CLN gets a forward to the hinted channel and the `htlc_accepted` hook fires
+6. The plugin sends the HTLC and CLN's `next_onion` (the payer's onion for the client) through the bridge to the LSP, which offers both to the client
+7. The client decodes the onion with its key and checks the payment secret, the amount (single part, at least the invoice amount) and the expiry; only then does it fulfil
+8. The LSP returns `MSG_BRIDGE_FULFILL_HTLC` with the client's preimage; the plugin resolves the CLN HTLC
 
 ### NK Authentication
 
@@ -864,7 +858,7 @@ lightning-cli plugin list | grep cln_plugin
 | Plugin not connecting | Verify `--superscalar-bridge-port` matches `--plugin-port` |
 | Bridge logs `plugin connection failed authentication`, or the plugin logs `Peer on the bridge port does not hold the bridge secret` | The plugin's `--superscalar-bridge-secret-file` does not hold the secret in the bridge's `--plugin-secret-file` |
 | Plugin logs `Bridge secret ... must be a regular file owned by this user with mode 0600` | Fix the owner and mode of the plugin's copy of the secret file |
-| "INVOICE_BOLT11 for unknown hash" | Client must send `MSG_REGISTER_INVOICE` before the external payment arrives |
+| "no --invoice-route-hint configured" | Start the LSP with `--invoice-route-hint` naming the CLN node and the hinted channel id |
 | Bridge heartbeat timeout | Check network connectivity between bridge and LSP; default timeout is 30 seconds |
 | "htlc_accepted hook timeout" | Increase CLN's hook timeout or check bridge ↔ LSP latency |
 

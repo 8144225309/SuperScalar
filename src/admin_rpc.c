@@ -277,9 +277,49 @@ static cJSON *method_listinvoices(admin_rpc_t *rpc)
 /* ------------------------------------------------------------------ */
 /* Method: createinvoice                                                 */
 /* ------------------------------------------------------------------ */
+/* createinvoice {amount_msat, client}: an invoice a factory member
+   receives with.  The member makes and signs it (through the LSP's
+   Lightning node, --invoice-route-hint) and keeps its preimage; the LSP
+   learns the hash only.
+   createinvoice {amount_msat} without "client": an invoice of the LSP's own
+   node, paid to the LSP itself; no member is involved. */
+static cJSON *member_createinvoice(admin_rpc_t *rpc, const cJSON *params,
+                                   char *errmsg, size_t errcap)
+{
+    const cJSON *c = cJSON_GetObjectItemCaseSensitive(params, "client");
+    const cJSON *a = cJSON_GetObjectItemCaseSensitive(params, "amount_msat");
+    if (!cJSON_IsNumber(c) || c->valuedouble < 0 ||
+        !cJSON_IsNumber(a) || a->valuedouble <= 0) {
+        snprintf(errmsg, errcap, "client and amount_msat > 0 required");
+        return NULL;
+    }
+    lsp_channel_mgr_t *mgr = rpc->channel_mgr;
+    lsp_t *lsp = (lsp_t *)rpc->lsp;
+    if (!mgr || !lsp) {
+        snprintf(errmsg, errcap, "no factory channels");
+        return NULL;
+    }
+    size_t client = (size_t)c->valuedouble;
+    uint64_t amount_msat = (uint64_t)a->valuedouble;
+    char bolt11[2048];
+    if (!lsp_channels_create_external_invoice(mgr, lsp, client, amount_msat,
+                                              bolt11, sizeof(bolt11))) {
+        snprintf(errmsg, errcap, "member could not create the invoice");
+        return NULL;
+    }
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "bolt11", bolt11);
+    cJSON_AddNumberToObject(r, "amount_msat", (double)amount_msat);
+    cJSON_AddNumberToObject(r, "client", (double)client);
+    return r;
+}
+
 static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
                                     char *errmsg, size_t errcap)
 {
+    if (cJSON_IsObject(params) &&
+        cJSON_GetObjectItemCaseSensitive(params, "client"))
+        return member_createinvoice(rpc, params, errmsg, errcap);
     if (!rpc->invoices || !rpc->ctx) {
         snprintf(errmsg, errcap, "invoices not available");
         return NULL;
@@ -352,54 +392,6 @@ static cJSON *method_createinvoice(admin_rpc_t *rpc, const cJSON *params,
             return NULL;
         }
     }
-    /* Register in bridge invoice table, deliver preimage to client, notify bridge.
-       1. Register hash so LSP can look up the HTLC when it arrives
-       2. Send preimage to client so it can fulfill
-       3. Notify bridge so CLN plugin knows about the invoice */
-    if (rpc->channel_mgr) {
-        bolt11_invoice_entry_t *found = NULL;
-        for (int i = INVOICE_TABLE_MAX - 1; i >= 0; i--) {
-            bolt11_invoice_entry_t *e = &rpc->invoices->entries[i];
-            if (e->active && !e->settled && e->amount_msat == amount_msat) {
-                found = e; break;
-            }
-        }
-        if (found) {
-            lsp_channel_mgr_t *mgr = rpc->channel_mgr;
-            lsp_t *lsp = (lsp_t *)rpc->lsp;
-            extern void hex_encode(const unsigned char *, size_t, char *);
-            char hash_hex[65];
-            hex_encode(found->payment_hash, 32, hash_hex);
-            hash_hex[64] = '\0';
-            /* 1. Register in bridge invoice table */
-            lsp_channels_register_invoice(mgr,
-                found->payment_hash, found->preimage, 0, amount_msat);
-
-            /* 2. Deliver preimage to client 0 via MSG_DELIVER_PREIMAGE */
-            if (lsp && lsp->client_fds[0] >= 0) {
-                cJSON *dp = cJSON_CreateObject();
-                wire_json_add_hex(dp, "payment_hash", found->payment_hash, 32);
-                wire_json_add_hex(dp, "preimage", found->preimage, 32);
-                cJSON_AddNumberToObject(dp, "amount_msat", (double)amount_msat);
-                wire_send(lsp->client_fds[0], MSG_DELIVER_PREIMAGE, dp);
-                cJSON_Delete(dp);
-                printf("LSP: delivered preimage to client 0 for %s\n", hash_hex);
-            }
-
-            /* 3. Notify bridge so CLN plugin creates matching CLN invoice */
-            if (mgr->bridge_fd >= 0) {
-                cJSON *reg = wire_build_bridge_register(
-                    found->payment_hash, found->preimage, amount_msat, 0);
-                wire_send(mgr->bridge_fd, MSG_BRIDGE_REGISTER, reg);
-                cJSON_Delete(reg);
-                printf("LSP: sent BRIDGE_REGISTER for %s\n", hash_hex);
-            }
-
-            printf("LSP: registered bridge invoice %s (client 0, %llu msat)\n",
-                   hash_hex, (unsigned long long)amount_msat);
-        }
-    }
-
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "bolt11", bech32);
     cJSON_AddNumberToObject(r, "amount_msat", (double)amount_msat);

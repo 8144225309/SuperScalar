@@ -80,4 +80,17 @@ int onion_last_hop_decrypt(secp256k1_context *ctx,
                             const unsigned char onion_packet[ONION_PACKET_SIZE],
                             onion_hop_payload_t *payload_out);
 
+/*
+ * BOLT #4 final hop, as a payee receives it: checks the packet HMAC
+ * (HMAC-SHA256 under the "mu" key over hops_data || associated data, the
+ * associated data being the payment hash), decrypts the hop payload, and
+ * requires the next-hop HMAC to be all zero (this node is the last hop).
+ * Returns 1 and fills payload_out on success, 0 on any failure.
+ */
+int onion_final_hop_decode(secp256k1_context *ctx,
+                           const unsigned char node_priv32[32],
+                           const unsigned char onion_packet[ONION_PACKET_SIZE],
+                           const unsigned char *assoc_data, size_t assoc_len,
+                           onion_hop_payload_t *payload_out);
+
 #endif /* SUPERSCALAR_ONION_LAST_HOP_H */

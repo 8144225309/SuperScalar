@@ -1,4 +1,5 @@
 #include "superscalar/client.h"
+#include "superscalar/onion_last_hop.h"
 #include "superscalar/cli_arity.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
@@ -1203,7 +1204,31 @@ int client_fulfill_payment(int fd, channel_t *ch,
     return ok;
 }
 
+int client_decode_final_hop(secp256k1_context *ctx,
+                            const unsigned char node_seckey32[32],
+                            const unsigned char onion[1366],
+                            const unsigned char payment_hash32[32],
+                            client_final_hop_t *out) {
+    if (!ctx || !node_seckey32 || !onion || !payment_hash32 || !out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->present = 1;   /* an onion came, whether or not it is ours */
+    onion_hop_payload_t p;
+    if (!onion_final_hop_decode(ctx, node_seckey32, onion, payment_hash32, 32,
+                                &p))
+        return 0;
+    out->amt_to_forward = p.amt_to_forward;
+    out->outgoing_cltv = p.outgoing_cltv_value;
+    out->has_payment_data = p.has_payment_data;
+    if (p.has_payment_data) {
+        memcpy(out->payment_secret, p.payment_secret, 32);
+        out->total_msat = p.total_msat;
+    }
+    return 1;
+}
+
 int client_htlc_pays_invoice(const htlc_t *h, uint64_t invoice_amount_msat,
+                             const unsigned char *invoice_secret32,
+                             const client_final_hop_t *hop,
                              uint32_t tip_height) {
     if (!h || h->direction != HTLC_RECEIVED || h->state != HTLC_STATE_ACTIVE)
         return 0;
@@ -1214,12 +1239,27 @@ int client_htlc_pays_invoice(const htlc_t *h, uint64_t invoice_amount_msat,
         (uint64_t)h->cltv_expiry <
             (uint64_t)tip_height + CLIENT_MIN_FINAL_CLTV_DELTA)
         return 0;
+    int has_onion = hop && hop->present;
+    if (!invoice_secret32)
+        return !has_onion;
+    /* BOLT 4 final-hop rules for a payment to our own BOLT 11 invoice */
+    if (!has_onion || !hop->has_payment_data) return 0;
+    unsigned char diff = 0;
+    for (int i = 0; i < 32; i++)
+        diff |= (unsigned char)(hop->payment_secret[i] ^ invoice_secret32[i]);
+    if (diff) return 0;
+    if (hop->total_msat != hop->amt_to_forward) return 0;   /* one part only */
+    if (hop->total_msat < invoice_amount_msat) return 0;
+    if (hop->amt_to_forward > h->amount_sats * 1000) return 0;
+    if (hop->outgoing_cltv > h->cltv_expiry) return 0;
     return 1;
 }
 
 int client_settle_invoice_htlc(int fd, channel_t *ch, uint64_t htlc_id,
                                const unsigned char *preimage32,
                                uint64_t invoice_amount_msat,
+                               const unsigned char *invoice_secret32,
+                               const client_final_hop_t *hop,
                                uint32_t tip_height) {
     if (!ch || !preimage32) return -1;
     const htlc_t *h = NULL;
@@ -1230,7 +1270,8 @@ int client_settle_invoice_htlc(int fd, channel_t *ch, uint64_t htlc_id,
             h = &ch->htlcs[i];
     if (!h) return -1;
 
-    if (client_htlc_pays_invoice(h, invoice_amount_msat, tip_height))
+    if (client_htlc_pays_invoice(h, invoice_amount_msat, invoice_secret32,
+                                 hop, tip_height))
         return client_fulfill_payment(fd, ch, htlc_id, preimage32) ? 1 : -1;
 
     fprintf(stderr, "Client: HTLC %llu does not pay our invoice (%llu msat "

@@ -1336,22 +1336,28 @@ int test_persist_client_invoice_round_trip(void) {
     memset(hash0, 0xD0, 32); memset(preimage0, 0xE0, 32);
     memset(hash1, 0xD1, 32); memset(preimage1, 0xE1, 32);
 
-    TEST_ASSERT(persist_save_client_invoice(&db, hash0, preimage0, 10000),
+    unsigned char secret1[32];
+    memset(secret1, 0x5E, 32);
+    TEST_ASSERT(persist_save_client_invoice(&db, hash0, preimage0, NULL, 10000),
                 "save client invoice 0");
-    TEST_ASSERT(persist_save_client_invoice(&db, hash1, preimage1, 5000),
-                "save client invoice 1");
+    TEST_ASSERT(persist_save_client_invoice(&db, hash1, preimage1, secret1, 5000),
+                "save client invoice 1 (with a payment secret)");
 
     /* Deactivate first */
     TEST_ASSERT(persist_deactivate_client_invoice(&db, hash0),
                 "deactivate client invoice 0");
 
     /* Load active */
-    unsigned char hashes[8][32], preimages[8][32];
+    unsigned char hashes[8][32], preimages[8][32], secrets[8][32];
+    int has_secret[8];
     uint64_t amounts[8];
-    size_t count = persist_load_client_invoices(&db, hashes, preimages, amounts, 8);
+    size_t count = persist_load_client_invoices(&db, hashes, preimages, secrets,
+                                                has_secret, amounts, 8);
     TEST_ASSERT_EQ(count, 1, "active client invoice count");
     TEST_ASSERT(memcmp(hashes[0], hash1, 32) == 0, "hash matches");
     TEST_ASSERT(memcmp(preimages[0], preimage1, 32) == 0, "preimage matches");
+    TEST_ASSERT(has_secret[0] && memcmp(secrets[0], secret1, 32) == 0,
+                "payment secret kept");
     TEST_ASSERT_EQ(amounts[0], 5000, "amount matches");
 
     persist_close(&db);

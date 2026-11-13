@@ -406,13 +406,11 @@ lightningd --network=regtest \
 
 ### What to Expect
 
-1. **Client registers invoice** — Client 1 sends `MSG_REGISTER_INVOICE` to the LSP
-2. **Bridge forwards** — LSP sends `MSG_BRIDGE_REGISTER` to bridge → plugin
-3. **CLN creates BOLT11** — Plugin calls `lightning-cli invoice` and returns the BOLT11 string
-4. **Client receives BOLT11** — The BOLT11 flows back: plugin → bridge → LSP → client
-5. **External payment** — Another LN node (or `lightning-cli pay`) pays the BOLT11
-6. **HTLC flows in** — CLN's `htlc_accepted` fires → plugin → bridge → LSP → client channel
-7. **Client fulfills** — Client reveals preimage → LSP → bridge → plugin resolves the CLN HTLC
+1. **Client makes its invoice** — asked by the LSP (`invoice 0 <msat>`), client 1 signs a BOLT11 invoice with its own key, routed through the CLN node (`--invoice-route-hint`), and keeps the preimage
+2. **Hash registered** — the client sends `MSG_REGISTER_INVOICE` (hash only); the LSP sends `MSG_BRIDGE_REGISTER` (hash only) to the bridge → plugin
+3. **External payment** — Another LN node (or `lightning-cli pay`) pays the client's BOLT11
+4. **HTLC flows in** — CLN's `htlc_accepted` fires for the forward → plugin → bridge → LSP → client channel, with the payer's onion for the client
+5. **Client checks and fulfills** — the client checks the payment secret, amount and expiry, then reveals its preimage → LSP → bridge → plugin resolves the CLN HTLC
 8. **Payment complete** — Client's channel balance increases by the payment amount
 
 ### Verify the Pipeline

@@ -66,7 +66,6 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x02: return "HELLO_ACK";
     case 0x70: return "PING";
     case 0x71: return "PONG";
-    case 0x72: return "DELIVER_PREIMAGE";
     case 0x10: return "FACTORY_PROPOSE";
     case 0x11: return "NONCE_BUNDLE";
     case 0x12: return "ALL_NONCES";
@@ -86,7 +85,6 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x36: return "CLOSE_REQUEST";
     case 0x37: return "CHANNEL_NONCES";
     case 0x38: return "REGISTER_INVOICE";
-    case 0x39: return "INVOICE_BOLT11";
     case 0x40: return "BRIDGE_HELLO";
     case 0x41: return "BRIDGE_HELLO_ACK";
     case 0x42: return "BRIDGE_ADD_HTLC";
@@ -1790,19 +1788,6 @@ cJSON *wire_build_bridge_add_htlc(const unsigned char *payment_hash32,
     return j;
 }
 
-cJSON *wire_build_bridge_add_htlc_keysend(const unsigned char *payment_hash32,
-                                            uint64_t amount_msat, uint32_t cltv_expiry,
-                                            uint64_t htlc_id,
-                                            const unsigned char *preimage32,
-                                            size_t dest_client) {
-    cJSON *j = wire_build_bridge_add_htlc(payment_hash32, amount_msat,
-                                            cltv_expiry, htlc_id);
-    cJSON_AddBoolToObject(j, "keysend", 1);
-    wire_json_add_hex(j, "preimage", preimage32, 32);
-    cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
-    return j;
-}
-
 cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
                                         const unsigned char *preimage32,
                                         uint64_t htlc_id) {
@@ -1906,11 +1891,9 @@ int wire_parse_bridge_pay_result_ack(const cJSON *json, uint64_t *request_id,
 }
 
 cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
-                                    const unsigned char *preimage32,
                                     uint64_t amount_msat, size_t dest_client) {
     cJSON *j = cJSON_CreateObject();
     wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
-    wire_json_add_hex(j, "preimage", preimage32, 32);
     cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
     cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
     return j;
@@ -1919,11 +1902,9 @@ cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
 /* --- Register invoice (Phase 15) --- */
 
 cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
-                                     const unsigned char *preimage32,
                                      uint64_t amount_msat, size_t dest_client) {
     cJSON *j = cJSON_CreateObject();
     wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
-    wire_json_add_hex(j, "preimage", preimage32, 32);
     cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
     cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
     return j;
@@ -1931,15 +1912,15 @@ cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
 
 int wire_parse_register_invoice(const cJSON *json,
                                   unsigned char *payment_hash32,
-                                  unsigned char *preimage32,
                                   uint64_t *amount_msat, size_t *dest_client) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
     if (!wire_check_nonneg(am) || !wire_check_nonneg(dc))
         return 0;
-    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+    /* The member keeps its preimage: one offered to the LSP is refused */
+    if (cJSON_GetObjectItem(json, "preimage"))
         return 0;
-    if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
     *amount_msat = (uint64_t)am->valuedouble;
     *dest_client = (size_t)dc->valuedouble;
@@ -1963,29 +1944,6 @@ int wire_parse_bridge_add_htlc(const cJSON *json,
     *amount_msat = (uint64_t)am->valuedouble;
     *cltv_expiry = (uint32_t)ce->valuedouble;
     *htlc_id = (uint64_t)hi->valuedouble;
-    return 1;
-}
-
-int wire_parse_bridge_add_htlc_keysend(const cJSON *json,
-                                         unsigned char *payment_hash32,
-                                         uint64_t *amount_msat, uint32_t *cltv_expiry,
-                                         uint64_t *htlc_id,
-                                         int *is_keysend_out,
-                                         unsigned char *preimage32,
-                                         size_t *dest_client_out) {
-    if (!wire_parse_bridge_add_htlc(json, payment_hash32, amount_msat,
-                                      cltv_expiry, htlc_id))
-        return 0;
-    cJSON *ks = cJSON_GetObjectItem(json, "keysend");
-    if (ks && cJSON_IsBool(ks) && cJSON_IsTrue(ks)) {
-        if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
-            return 0;
-        cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
-        *dest_client_out = wire_check_nonneg(dc) ? (size_t)dc->valuedouble : 0;
-        *is_keysend_out = 1;
-    } else {
-        *is_keysend_out = 0;
-    }
     return 1;
 }
 
@@ -2068,15 +2026,14 @@ int wire_parse_bridge_pay_result(const cJSON *json,
 
 int wire_parse_bridge_register(const cJSON *json,
                                  unsigned char *payment_hash32,
-                                 unsigned char *preimage32,
                                  uint64_t *amount_msat, size_t *dest_client) {
     cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
     cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
     if (!wire_check_nonneg(am) || !wire_check_nonneg(dc))
         return 0;
-    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+    if (cJSON_GetObjectItem(json, "preimage"))
         return 0;
-    if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
         return 0;
     *amount_msat = (uint64_t)am->valuedouble;
     *dest_client = (size_t)dc->valuedouble;
@@ -2084,30 +2041,6 @@ int wire_parse_bridge_register(const cJSON *json,
 }
 
 /* --- Invoice BOLT11 (CLN bridge integration) --- */
-
-cJSON *wire_build_invoice_bolt11(const unsigned char *payment_hash32,
-                                   const char *bolt11) {
-    cJSON *j = cJSON_CreateObject();
-    if (payment_hash32)
-        wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
-    cJSON_AddStringToObject(j, "bolt11", bolt11 ? bolt11 : "");
-    return j;
-}
-
-int wire_parse_invoice_bolt11(const cJSON *json,
-                                unsigned char *payment_hash32,
-                                char *bolt11, size_t bolt11_len) {
-    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
-        return 0;
-    cJSON *b = cJSON_GetObjectItem(json, "bolt11");
-    if (!b || !cJSON_IsString(b))
-        return 0;
-    if (bolt11 && bolt11_len > 0) {
-        strncpy(bolt11, b->valuestring, bolt11_len - 1);
-        bolt11[bolt11_len - 1] = '\0';
-    }
-    return 1;
-}
 
 /* --- Reconnection messages (Phase 16) --- */
 
@@ -2171,6 +2104,73 @@ cJSON *wire_build_create_invoice(uint64_t amount_msat) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
     return j;
+}
+
+void wire_set_onion(cJSON *json, const unsigned char onion[ONION_WIRE_SIZE]) {
+    if (json && onion) wire_json_add_hex(json, "onion", onion, ONION_WIRE_SIZE);
+}
+
+int wire_get_onion(const cJSON *json, unsigned char onion_out[ONION_WIRE_SIZE]) {
+    const cJSON *o = json ? cJSON_GetObjectItem(json, "onion") : NULL;
+    if (!o) return 0;
+    if (!cJSON_IsString(o) || strlen(o->valuestring) != 2 * ONION_WIRE_SIZE ||
+        wire_json_get_hex(json, "onion", onion_out, ONION_WIRE_SIZE) !=
+            ONION_WIRE_SIZE)
+        return -1;
+    return 1;
+}
+
+void wire_create_invoice_set_hint(cJSON *json, const wire_route_hint_t *hint) {
+    if (!json || !hint) return;
+    cJSON *h = cJSON_CreateObject();
+    if (!h) return;
+    wire_json_add_hex(h, "node_id", hint->node_id, 33);
+    char scid[24];
+    snprintf(scid, sizeof(scid), "%llu", (unsigned long long)hint->scid);
+    cJSON_AddStringToObject(h, "scid", scid);
+    cJSON_AddNumberToObject(h, "fee_base_msat", hint->fee_base_msat);
+    cJSON_AddNumberToObject(h, "fee_ppm", hint->fee_ppm);
+    cJSON_AddNumberToObject(h, "cltv_delta", hint->cltv_delta);
+    cJSON_AddItemToObject(json, "route_hint", h);
+}
+
+int wire_create_invoice_get_hint(const cJSON *json, wire_route_hint_t *hint_out) {
+    const cJSON *h = json ? cJSON_GetObjectItem(json, "route_hint") : NULL;
+    if (!h) return 0;
+    if (!cJSON_IsObject(h) || !hint_out) return -1;
+    const cJSON *scid = cJSON_GetObjectItem(h, "scid");
+    const cJSON *fb = cJSON_GetObjectItem(h, "fee_base_msat");
+    const cJSON *fp = cJSON_GetObjectItem(h, "fee_ppm");
+    const cJSON *cd = cJSON_GetObjectItem(h, "cltv_delta");
+    if (wire_json_get_hex(h, "node_id", hint_out->node_id, 33) != 33 ||
+        !scid || !cJSON_IsString(scid) || !wire_check_nonneg(fb) ||
+        !wire_check_nonneg(fp) || !wire_check_nonneg(cd) ||
+        fb->valuedouble > (double)UINT32_MAX ||
+        fp->valuedouble > (double)UINT32_MAX ||
+        cd->valuedouble > (double)UINT16_MAX)
+        return -1;
+    char *end = NULL;
+    unsigned long long v = strtoull(scid->valuestring, &end, 10);
+    if (!end || *end != '\0' || end == scid->valuestring) return -1;
+    hint_out->scid = (uint64_t)v;
+    hint_out->fee_base_msat = (uint32_t)fb->valuedouble;
+    hint_out->fee_ppm = (uint32_t)fp->valuedouble;
+    hint_out->cltv_delta = (uint16_t)cd->valuedouble;
+    return 1;
+}
+
+void wire_invoice_created_set_bolt11(cJSON *json, const char *bolt11) {
+    if (json && bolt11) cJSON_AddStringToObject(json, "bolt11", bolt11);
+}
+
+int wire_invoice_created_get_bolt11(const cJSON *json, char *bolt11_out,
+                                    size_t cap) {
+    const cJSON *b = json ? cJSON_GetObjectItem(json, "bolt11") : NULL;
+    if (!b || !cJSON_IsString(b) || !bolt11_out || cap == 0 ||
+        strlen(b->valuestring) >= cap)
+        return 0;
+    strcpy(bolt11_out, b->valuestring);
+    return 1;
 }
 
 int wire_parse_create_invoice(const cJSON *json, uint64_t *amount_msat) {

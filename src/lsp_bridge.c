@@ -211,7 +211,6 @@ int lsp_channels_operator_pay(lsp_channel_mgr_t *mgr, const char *bolt11,
 
 int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
                                     const unsigned char *payment_hash32,
-                                    const unsigned char *preimage32,
                                     size_t dest_client, uint64_t amount_msat) {
     if (dest_client >= mgr->n_channels) return 0;
     /* One use per payment hash: not while an HTLC for it is in flight, and
@@ -232,7 +231,6 @@ int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
         inv = &mgr->invoices[mgr->n_invoices++];
     }
     memcpy(inv->payment_hash, payment_hash32, 32);
-    memcpy(inv->preimage, preimage32, 32);
     inv->dest_client = dest_client;
     inv->amount_msat = amount_msat;
     inv->bridge_htlc_id = 0;
@@ -906,19 +904,32 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char payment_hash[32];
         uint64_t amount_msat, htlc_id;
         uint32_t cltv_expiry;
-        int is_keysend = 0;
-        unsigned char ks_preimage[32];
-        size_t ks_dest = 0;
-        if (!wire_parse_bridge_add_htlc_keysend(msg->json, payment_hash,
-                                                  &amount_msat, &cltv_expiry, &htlc_id,
-                                                  &is_keysend, ks_preimage, &ks_dest)) {
+        if (!wire_parse_bridge_add_htlc(msg->json, payment_hash,
+                                          &amount_msat, &cltv_expiry, &htlc_id)) {
             fprintf(stderr, "LSP: bridge ADD_HTLC parse failed\n");
             return 0;
         }
-        printf("LSP: bridge ADD_HTLC received (%llu msat, cltv=%u, htlc_id=%llu%s)\n",
+        /* The member's onion, passed on to it unopened */
+        unsigned char member_onion[ONION_WIRE_SIZE];
+        int has_onion = wire_get_onion(msg->json, member_onion);
+        printf("LSP: bridge ADD_HTLC received (%llu msat, cltv=%u, htlc_id=%llu)\n",
                (unsigned long long)amount_msat, cltv_expiry,
-               (unsigned long long)htlc_id,
-               is_keysend ? ", keysend" : "");
+               (unsigned long long)htlc_id);
+        /* A spontaneous payment carries its own preimage for the payee:
+           the LSP would hold it, so none is taken. */
+        {
+            const cJSON *ks = cJSON_GetObjectItem(msg->json, "keysend");
+            if ((ks && cJSON_IsTrue(ks)) || has_onion < 0) {
+                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                    has_onion < 0 ? "invalid_onion" : "keysend_unsupported",
+                    htlc_id);
+                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
+                printf("LSP: bridge HTLC refused (%s)\n",
+                       has_onion < 0 ? "malformed onion" : "keysend");
+                return 1;
+            }
+        }
 
         char upstream_id[BRIDGE_UPSTREAM_ID_MAX] = "";
         {
@@ -991,33 +1002,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* Look up invoice to find dest_client */
         size_t dest_idx;
         if (!lsp_channels_lookup_invoice(mgr, payment_hash, &dest_idx)) {
-            if (is_keysend) {
-                /* Keysend: register ephemeral invoice with sender's preimage */
-                if (ks_dest >= mgr->n_channels) {
-                    fprintf(stderr, "LSP: keysend dest_client %zu out of range "
-                            "(max %zu), defaulting to 0\n",
-                            ks_dest, mgr->n_channels - 1);
-                    ks_dest = 0;
-                }
-                if (!lsp_channels_register_invoice(mgr, payment_hash,
-                        ks_preimage, ks_dest, amount_msat)) {
-                    cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
-                        "keysend_register_failed", htlc_id);
-                    wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
-                    cJSON_Delete(fail);
-                    return 1;
-                }
-                dest_idx = ks_dest;
-                printf("LSP: keysend registered for client %zu\n", dest_idx);
-            } else {
-                /* Unknown payment hash — fail back to bridge */
-                cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
-                    "unknown_payment_hash", htlc_id);
-                wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
-                cJSON_Delete(fail);
-                printf("LSP: bridge HTLC unknown hash, failing back\n");
-                return 1;
-            }
+            /* Unknown payment hash — fail back to bridge */
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "unknown_payment_hash", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC unknown hash, failing back\n");
+            return 1;
         }
 
         /* The invoice amount must arrive in this one HTLC.  The client is
@@ -1177,9 +1168,10 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             lsp_channels_origin_save(mgr, org);
         }
 
-        /* Forward ADD_HTLC to destination client */
+        /* Forward ADD_HTLC to destination client, with its onion */
         cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
                                                    payment_hash, cltv_expiry);
+        if (has_onion > 0) wire_set_onion(fwd, member_onion);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
             cJSON_Delete(fwd);
             free(old_dest_htlcs);
@@ -1478,29 +1470,6 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             cJSON_Delete(ack);
         }
         return 1;
-    }
-
-    case MSG_INVOICE_BOLT11: {
-        /* BOLT11 invoice created by CLN plugin — forward to dest client */
-        unsigned char payment_hash[32];
-        char bolt11[2048];
-        if (!wire_parse_invoice_bolt11(msg->json, payment_hash, bolt11,
-                                         sizeof(bolt11)))
-            return 0;
-
-        /* Look up dest_client via invoice registry */
-        size_t dest_idx;
-        if (!lsp_channels_lookup_invoice(mgr, payment_hash, &dest_idx)) {
-            fprintf(stderr, "LSP: INVOICE_BOLT11 for unknown hash\n");
-            return 0;
-        }
-
-        /* Forward to client */
-        cJSON *fwd = wire_build_invoice_bolt11(payment_hash, bolt11);
-        int ok = wire_send(lsp->client_fds[dest_idx], MSG_INVOICE_BOLT11, fwd);
-        cJSON_Delete(fwd);
-        printf("LSP: forwarded BOLT11 to client %zu\n", dest_idx);
-        return ok;
     }
 
     case MSG_BRIDGE_HELLO:
