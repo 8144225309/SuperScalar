@@ -59,7 +59,7 @@ jobs:
         with:
           ref: ${{ env.TAG }}
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
       - name: Build in ARM64 container
