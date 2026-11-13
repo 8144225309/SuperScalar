@@ -1774,3 +1774,72 @@ int test_ln_dispatch_uf3_null_channels(void)
     ASSERT(r == 134, "UF3: NULL peer_channels returns 134, no crash");
     return 1;
 }
+
+
+/* A forward on the channel id member invoices advertise is failed back at
+   once: this node holds no member preimage, never settles a member's
+   payment, and does not leave it pending. */
+int test_ln_dispatch_member_forward_refused(void)
+{
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    ASSERT(ctx, "ctx");
+    unsigned char our_priv[32], member_priv[32];
+    memset(our_priv, 0x11, 32);
+    memset(member_priv, 0x22, 32);
+    secp256k1_pubkey our_pub, member_pub;
+    ASSERT(secp256k1_ec_pubkey_create(ctx, &our_pub, our_priv) &&
+           secp256k1_ec_pubkey_create(ctx, &member_pub, member_priv), "keys");
+    const uint64_t member_scid = (700ULL << 40) | (1ULL << 16) | 1;
+
+    onion_hop_t hops[2];
+    memset(hops, 0, sizeof(hops));
+    size_t l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, hops[0].pubkey, &l, &our_pub,
+                                   SECP256K1_EC_COMPRESSED);
+    hops[0].amount_msat = 500000;
+    hops[0].cltv_expiry = 700100;
+    hops[0].short_channel_id = member_scid;
+    l = 33;
+    secp256k1_ec_pubkey_serialize(ctx, hops[1].pubkey, &l, &member_pub,
+                                   SECP256K1_EC_COMPRESSED);
+    hops[1].amount_msat = 500000;
+    hops[1].cltv_expiry = 700060;
+    hops[1].is_final = 1;
+    memset(hops[1].payment_secret, 0xBB, 32);
+    hops[1].total_msat = 500000;
+    unsigned char session_key[32];
+    memset(session_key, 0x44, 32);
+    unsigned char onion_pkt[ONION_PACKET_SIZE];
+    ASSERT(onion_build(hops, 2, session_key, ctx, onion_pkt), "build onion");
+
+    bolt11_invoice_table_t tbl;
+    invoice_init(&tbl);
+    htlc_forward_table_t fwd;
+    htlc_forward_init(&fwd);
+    mpp_table_t mpp;
+    mpp_init(&mpp);
+    ln_dispatch_t d = make_dispatch(ctx, &fwd, &mpp);
+    d.invoices = &tbl;
+    d.member_hint_scid = member_scid;
+
+    size_t msg_len = 2 + 32 + 8 + 8 + 32 + 4 + ONION_PACKET_SIZE;
+    unsigned char *msg = (unsigned char *)calloc(1, msg_len);
+    ASSERT(msg, "alloc");
+    wr16(msg, 128);
+    wr64(msg + 34, 1);
+    wr64(msg + 42, 500000);
+    memset(msg + 50, 0x5a, 32);
+    wr32(msg + 82, 700100);
+    memcpy(msg + 86, onion_pkt, ONION_PACKET_SIZE);
+    int rc = ln_dispatch_process_msg(&d, 0, msg, msg_len);
+    free(msg);
+    ASSERT(rc == 128, "processed");
+    ASSERT(fwd.count == 1, "one forward");
+    ASSERT(fwd.entries[0].next_hop_scid == member_scid, "on the member hop");
+    ASSERT(fwd.entries[0].state == FORWARD_STATE_FAILED,
+           "failed back, not left pending and not settled");
+    ASSERT(ln_dispatch_flush_relay(&d) == 0, "nothing relayed");
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -235,6 +235,7 @@ extern int test_ln_dispatch_routes_revoke_and_ack(void);
 extern int test_ln_dispatch_routes_update_fee(void);
 extern int test_ln_dispatch_routes_channel_reestablish(void);
 extern int test_ln_dispatch_flush_relay_empty(void);
+extern int test_ln_dispatch_member_forward_refused(void);
 extern int test_ln_dispatch_routes_shutdown(void);
 extern int test_ln_dispatch_routes_closing_signed(void);
 extern int test_ln_dispatch_shutdown_state_recv(void);
@@ -2349,6 +2350,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ln_dispatch_routes_update_fee);
     RUN_TEST(test_ln_dispatch_routes_channel_reestablish);
     RUN_TEST(test_ln_dispatch_flush_relay_empty);
+    RUN_TEST(test_ln_dispatch_member_forward_refused);
 
     printf("\n=== Phase 1: Cooperative Close Dispatch ===\n");
     RUN_TEST(test_ln_dispatch_routes_shutdown);

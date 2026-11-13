@@ -3788,6 +3788,8 @@ accept_new_factory:
             g_ln_dispatch.shutdown_flag = (volatile int *)&g_shutdown;
             memcpy(g_ln_dispatch.our_privkey, lsp_p->nk_seckey, 32);
             g_ln_dispatch.invoices = &g_invoice_tbl;
+            g_ln_dispatch.member_hint_scid =
+                g_has_invoice_hint ? g_invoice_hint.scid : 0;
 
             /* Wire LSPS0 callback */
             g_bolt8_cfg.lsps0_request_cb = lsps0_bolt8_cb;

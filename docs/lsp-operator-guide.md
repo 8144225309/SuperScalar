@@ -448,7 +448,7 @@ External LN Node
 
 The plugin intercepts inbound HTLCs via CLN's `htlc_accepted` hook, forwards them (and, for a forward, CLN's `next_onion`) through the bridge daemon to the LSP, and holds the HTLC until the client fulfills with the preimage or the LSP fails it.
 
-The LSP needs `--invoice-route-hint NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA`: `NODE_ID` is the CLN node's id and `SCID` a short channel id no real channel of that node uses (CLN forwards to it, the plugin catches the forward). Client invoices advertise this hop.
+The LSP needs `--invoice-route-hint NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA`: `NODE_ID` is the CLN node's id and `SCID` a short channel id no real channel of that node uses (CLN forwards to it, the plugin catches the forward). Client invoices advertise this hop. Name the CLN node here: the LSP's own Lightning node (`ln_dispatch`) refuses a forward on this channel id, because it holds no client preimage and members are paid through the bridge.
 
 ### Startup Order
 
