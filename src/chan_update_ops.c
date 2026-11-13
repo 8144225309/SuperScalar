@@ -245,6 +245,7 @@ static int op_build(void *ctx, cu_side_t holder, uint64_t n, const cu_state_t *s
     v.n_ptlcs = 0;
     v.commitment_number = n;
     v.commit_fee_rate_sat_per_kvb = st->feerate_per_kvb;
+    v.trim_dust_outputs = 1;
     tx_buf_t b;
     tx_buf_init(&b, 1024);
     int ok = channel_build_commitment_at(&v, holder != me, holder_point, &b, txid)
@@ -295,27 +296,68 @@ static int tx_output(const unsigned char *tx, size_t len, uint32_t vout, uint64_
     return 0;
 }
 
-/* The revoked commitment's to_local output (output 0) goes to this side by
-   the revocation key; the penalty and its tower row are written inside the
-   engine's transaction.  Every write is checked: a watch is never dropped
-   silently (INV-45). */
+/* Penalty fee rates, sat/kvB: the channel's penalty rate and two higher
+   steps, so a tower without secrets can still outbid a rising fee market. */
+static size_t penalty_rates(const channel_t *ch, uint64_t out[CU_PENALTY_RATES]) {
+    uint64_t base = ch->fee_rate_sat_per_kvb ? ch->fee_rate_sat_per_kvb : 1000;
+    out[0] = base;
+    out[1] = base * 4;
+    out[2] = base * 16;
+    return CU_PENALTY_RATES;
+}
+
+static int save_penalty(persist_t *db, uint32_t ch_id, uint64_t n, uint32_t vout, uint8_t kind,
+                        uint64_t rate, const tx_buf_t *t) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db->db,
+            "INSERT OR REPLACE INTO chan_update_penalty (channel_id, commit_num, vout, kind,"
+            " feerate_per_kvb, tx) VALUES (?,?,?,?,?,?);", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_int64(st, 1, ch_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)n);
+    sqlite3_bind_int64(st, 3, vout);
+    sqlite3_bind_int(st, 4, kind);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)rate);
+    sqlite3_bind_blob(st, 6, t->data, (int)t->len, SQLITE_TRANSIENT);
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* The outputs of the peer's revoked commitment that this side takes by the
+   revocation key: its to_local (output 0, when not trimmed) and every HTLC
+   output.  Each penalty is built at every rate of the ladder and stored in
+   the engine's transaction; the to_local one at the base rate also goes in
+   the tower rows (old_commitments) the watchtower loads.  Every write is
+   checked: a watch is never dropped silently (INV-45). */
 static int op_penalty(void *ctx, persist_t *db, uint64_t n, const unsigned char secret[32],
-                      const unsigned char *tx, size_t len) {
+                      const unsigned char *tx, size_t len, const cu_state_t *rst) {
     cu_chops_t *o = ctx;
     channel_t *ch = o->ch;
-    uint64_t amount;
-    const unsigned char *spk;
-    size_t spk_len;
     unsigned char txid[32];
-    if (!tx_output(tx, len, 0, &amount, &spk, &spk_len) || spk_len > 34) return 0;
+    uint64_t rates[CU_PENALTY_RATES];
+    size_t nr = penalty_rates(ch, rates);
     {
-        /* The txid of the revoked commitment, internal byte order. */
         unsigned char h1[32];
         sha256(tx, len, h1);
         sha256(h1, 32, txid);
     }
+    /* Which balance outputs the revoked commitment carries. */
+    cu_side_t holder = CU_OTHER(o->side);
+    int to_local = 1, n_bal = 2;
+    if (rst) {
+        uint64_t hold = (holder == CU_HOST ? rst->host_msat : rst->member_msat) / 1000;
+        uint64_t oth = (holder == CU_HOST ? rst->member_msat : rst->host_msat) / 1000;
+        if (ch->use_cpfp_anchor) {
+            if (holder == CU_HOST) hold -= ANCHOR_OUTPUT_AMOUNT;
+            else oth -= ANCHOR_OUTPUT_AMOUNT;
+        }
+        to_local = hold >= CHANNEL_DUST_LIMIT_SATS;
+        n_bal = to_local + (oth >= CHANNEL_DUST_LIMIT_SATS);
+    }
+
     /* The engine verified the secret against the point it committed to
-       (INV-25); the channel_t, which builds the penalty, learns that point. */
+       (INV-25); the channel_t, which builds the penalties, learns that point. */
     secp256k1_pubkey pt;
     if (!secp256k1_ec_pubkey_create(ch->ctx, &pt, secret)) return 0;
     channel_set_remote_pcp(ch, n, &pt);
@@ -323,22 +365,93 @@ static int op_penalty(void *ctx, persist_t *db, uint64_t n, const unsigned char 
     ch->persist_db = NULL;                 /* written below, in this transaction */
     int ok = channel_receive_revocation_flat(ch, n, secret);
     ch->persist_db = saved;
+    ok = ok && persist_save_revocation(db, o->channel_id, n, secret);
     if (!ok) return 0;
-    tx_buf_t pen;
-    tx_buf_init(&pen, 512);
-    ok = channel_build_penalty_tx(ch, &pen, txid, 0, amount, spk, spk_len, n, NULL, 0) && !pen.oom;
-    ok = ok && persist_save_revocation(db, o->channel_id, n, secret)
-            && persist_save_old_commitment(db, o->channel_id, n, txid, 0, amount, spk, spk_len)
-            && persist_save_old_commitment_csv_delay(db, o->channel_id, n, ch->to_self_delay)
-            && persist_save_old_commitment_witness(db, o->channel_id, n, pen.data, pen.len);
-    if (ok && o->wt) {
-        persist_t *wdb = o->wt->db;
-        o->wt->db = NULL;                  /* rows written above */
-        ok = watchtower_watch_oracular(o->wt, o->channel_id, n, txid, 0, amount, spk, spk_len,
-                                       pen.data, pen.len);
-        o->wt->db = wdb;
+
+    channel_t v = *ch;
+    uint64_t amount;
+    const unsigned char *spk;
+    size_t spk_len;
+    if (to_local) {
+        if (!tx_output(tx, len, 0, &amount, &spk, &spk_len) || spk_len > 34) return 0;
+        for (size_t r = 0; ok && r < nr; r++) {
+            tx_buf_t pen;
+            tx_buf_init(&pen, 512);
+            v.fee_rate_sat_per_kvb = rates[r];
+            int built = channel_build_penalty_tx(&v, &pen, txid, 0, amount, spk, spk_len, n, NULL, 0)
+                     && !pen.oom;
+            /* The base rate is required; a higher one the output cannot pay
+               ends the ladder. */
+            if (!built && r > 0) { tx_buf_free(&pen); break; }
+            ok = built && save_penalty(db, o->channel_id, n, 0, 0, rates[r], &pen);
+            if (ok && r == 0) {
+                ok = persist_save_old_commitment(db, o->channel_id, n, txid, 0, amount, spk, spk_len)
+                  && persist_save_old_commitment_csv_delay(db, o->channel_id, n, ch->to_self_delay)
+                  && persist_save_old_commitment_witness(db, o->channel_id, n, pen.data, pen.len);
+                if (ok && o->wt) {
+                    persist_t *wdb = o->wt->db;
+                    o->wt->db = NULL;      /* rows written above */
+                    ok = watchtower_watch_oracular(o->wt, o->channel_id, n, txid, 0, amount,
+                                                   spk, spk_len, pen.data, pen.len);
+                    o->wt->db = wdb;
+                }
+            }
+            tx_buf_free(&pen);
+        }
     }
-    tx_buf_free(&pen);
+
+    /* HTLC outputs, in state order after the balance outputs. */
+    if (ok && rst) {
+        htlc_t *h = rst->n_htlcs ? calloc(rst->n_htlcs, sizeof(htlc_t)) : NULL;
+        if (rst->n_htlcs && !h) return 0;
+        size_t k = 0;
+        for (size_t i = 0; i < rst->n_htlcs; i++) {
+            if (rst->htlcs[i].amount_msat / 1000 < CHANNEL_DUST_LIMIT_SATS) continue;
+            h[k].direction = rst->htlcs[i].offerer == (uint8_t)o->side ? HTLC_OFFERED : HTLC_RECEIVED;
+            h[k].state = HTLC_STATE_ACTIVE;
+            h[k].amount_sats = rst->htlcs[i].amount_msat / 1000;
+            memcpy(h[k].payment_hash, rst->htlcs[i].payment_hash, 32);
+            h[k].cltv_expiry = rst->htlcs[i].cltv_expiry;
+            h[k].id = rst->htlcs[i].id;
+            k++;
+        }
+        v.htlcs = h;
+        v.n_htlcs = k;
+        v.htlcs_cap = k;
+        for (size_t j = 0; ok && j < k; j++) {
+            uint32_t vout = (uint32_t)(n_bal + j);
+            ok = tx_output(tx, len, vout, &amount, &spk, &spk_len) && spk_len == 34
+              && amount == h[j].amount_sats;
+            for (size_t r = 0; ok && r < nr; r++) {
+                tx_buf_t pen;
+                tx_buf_init(&pen, 512);
+                v.fee_rate_sat_per_kvb = rates[r];
+                /* An HTLC output too small to take back at this rate (its
+                   penalty would leave dust) gets none at this rate or above. */
+                if (!channel_build_htlc_penalty_tx(&v, &pen, txid, vout, amount, spk, spk_len,
+                                                   n, j, NULL, 0) || pen.oom) {
+                    tx_buf_free(&pen);
+                    break;
+                }
+                ok = save_penalty(db, o->channel_id, n, vout, 1, rates[r], &pen);
+                if (ok && r == 0 && to_local) {
+                    watchtower_htlc_t w;
+                    memset(&w, 0, sizeof(w));
+                    w.htlc_vout = vout;
+                    w.htlc_amount = amount;
+                    memcpy(w.htlc_spk, spk, 34);
+                    w.direction = h[j].direction;
+                    memcpy(w.payment_hash, h[j].payment_hash, 32);
+                    w.cltv_expiry = h[j].cltv_expiry;
+                    ok = persist_save_old_commitment_htlc(db, o->channel_id, n, &w)
+                      && persist_save_old_commitment_htlc_sweep(db, o->channel_id, n, vout,
+                                                                pen.data, pen.len);
+                }
+                tx_buf_free(&pen);
+            }
+        }
+        free(h);
+    }
     return ok;
 }
 

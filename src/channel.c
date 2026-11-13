@@ -940,7 +940,8 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
         size_t fo = ch->funder_is_local ? 0 : 1;
         if (outputs[fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
             outputs[fo].amount_sats -= anchor; placed = 1;
-        } else if (outputs[1 - fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
+        } else if (!ch->trim_dust_outputs
+                   && outputs[1 - fo].amount_sats > anchor + CHANNEL_DUST_LIMIT_SATS) {
             outputs[1 - fo].amount_sats -= anchor; placed = 1;   /* fallback */
         }
         if (placed) {
@@ -948,6 +949,13 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
             outputs[out_idx].script_pubkey_len = P2A_SPK_LEN;
             outputs[out_idx].amount_sats = anchor;
             out_idx++;
+        } else if (ch->trim_dust_outputs) {
+            /* The funder pays the anchor and keeps a spendable output, or the
+               state is not built (so never signed). */
+            fprintf(stderr, "channel commitment: the funder's %llu sat cannot pay the "
+                    "anchor and stay above dust; refusing to build it\n",
+                    (unsigned long long)outputs[ch->funder_is_local ? 0 : 1].amount_sats);
+            goto commit_tx_done;
         } else if (ch->commit_fee_rate_sat_per_kvb == 0) {
             /* Neither balance can fund the anchor and the commitment pays no
                fee: nothing could ever get it mined.  Such a state is never
@@ -958,6 +966,19 @@ static int channel_build_commitment_tx_impl(const channel_t *ch,
                     (unsigned long long)outputs[1].amount_sats);
             goto commit_tx_done;
         }
+    }
+
+    /* 7d. BOLT 3 trimming of the balance outputs: one below dust is left
+       out and its value goes to the fee, so no zero or dust output is ever
+       signed.  The outputs that remain keep their order. */
+    if (ch->trim_dust_outputs) {
+        size_t w = 0;
+        for (size_t r = 0; r < out_idx; r++) {
+            if (r < 2 && outputs[r].amount_sats < CHANNEL_DUST_LIMIT_SATS) continue;
+            if (w != r) outputs[w] = outputs[r];
+            w++;
+        }
+        out_idx = w;
     }
 
     /* 8. Build unsigned tx (nVersion=3/TRUC: enables V3 penalty + CPFP chain) */

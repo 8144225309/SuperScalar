@@ -1591,7 +1591,8 @@ int persist_open(persist_t *p, const char *path) {
        outpoint); signatures given for a proposal that lost to a
        simultaneous one, kept so the penalty covers them; this side's
        per-commitment secrets with their released flag; the peer's points
-       and secrets; the member's pending offers; armed success claims.  A failed CREATE fails the open. */
+       and secrets; the member's pending offers; armed success claims; penalties for each
+       revoked output at several fee rates.  A failed CREATE fails the open. */
     if (db_version < 49) {
         const char *sql_v49 =
             "CREATE TABLE IF NOT EXISTS chan_update_channel ("
@@ -1654,6 +1655,15 @@ int persist_open(persist_t *p, const char *path) {
             "  commit_num INTEGER NOT NULL,"
             "  secret     BLOB NOT NULL,"
             "  PRIMARY KEY (channel_id, commit_num)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_penalty ("  /* penalties at several fee rates */
+            "  channel_id      INTEGER NOT NULL,"
+            "  commit_num      INTEGER NOT NULL,"
+            "  vout            INTEGER NOT NULL,"
+            "  kind            INTEGER NOT NULL,"   /* 0 to_local, 1 HTLC output */
+            "  feerate_per_kvb INTEGER NOT NULL,"
+            "  tx              BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num, vout, feerate_per_kvb)"
             ");"
             "CREATE TABLE IF NOT EXISTS chan_update_claim ("   /* success claims armed before a preimage leaves */
             "  channel_id  INTEGER NOT NULL,"

@@ -159,12 +159,14 @@ typedef struct {
     int (*verify_aggregate)(void *ctx, uint64_t n, const unsigned char *tx, size_t tx_len,
                             const unsigned char psig[32], uint32_t nonce_index,
                             unsigned char sig64[64]);
-    /* Build the penalty for the peer's revoked commitment n (tx) and
-       register it with the tower.  Runs inside the engine's transaction and
-       writes through db; a failure aborts the transaction. */
+    /* Build the penalties for the peer's revoked commitment n (tx, built
+       from state st; NULL when only the transaction is known) and register
+       them with the tower.  Runs inside the engine's transaction and writes
+       through db; a failure aborts the transaction. */
     int (*arm_penalty)(void *ctx, persist_t *db, uint64_t n,
                        const unsigned char secret[32],
-                       const unsigned char *tx, size_t tx_len);
+                       const unsigned char *tx, size_t tx_len,
+                       const cu_state_t *st);
     /* Arm the on-chain success claim for h before its preimage leaves
        (INV-30).  Runs inside the engine's transaction. */
     int (*arm_claim)(void *ctx, persist_t *db, uint64_t n, const cu_htlc_t *h,
@@ -184,6 +186,7 @@ typedef enum {
     CU_HALT_FAILED    = 1,   /* peer claimed a commitment this side never signed, or a bad claim */
     CU_HALT_DATA_LOSS = 2,   /* this side is behind its own revocations: never broadcast */
     CU_HALT_PEER_LOST = 3,   /* the peer lost data: exit on this side's latest commitment */
+    CU_HALT_EXITING   = 4,   /* this side is leaving alone: no new signature or revocation */
 } cu_halt_t;
 
 /* channel_reestablish (protocol section 6.1). */
@@ -329,8 +332,9 @@ int cu_propose(cu_chan_t *c, const cu_update_t *u, size_t n);
 /* Member: ask the host for updates (add = pay, fulfil, fail).  The offers
    are durable before they leave, with the success claim of any fulfil
    (INV-30); they stay until a round carries them or the host refuses
-   them, and are offered again after a reconnect.  The host gets
-   CU_ERR_ROLE. */
+   them, and are offered again after a reconnect.  A fulfil is offered only
+   while every host commitment before the current one is revoked, with its
+   secret stored (CU_ERR_BUSY otherwise).  The host gets CU_ERR_ROLE. */
 int cu_offer(cu_chan_t *c, const cu_update_t *u, size_t n);
 
 /* Host: the member's pending requests, oldest first. */
@@ -350,6 +354,11 @@ int cu_reestablish_msg(cu_chan_t *c, cu_msg_t *out);
 
 /* Chain tip.  Reports HTLCs that must go on chain; never removes one. */
 int cu_on_block(cu_chan_t *c, uint32_t height);
+
+/* This side starts leaving alone.  Durable before it returns: from then
+   on the channel signs nothing and revokes nothing, and its in-flight HTLCs
+   are resolved on chain (cu_on_block reports them). */
+int cu_begin_exit(cu_chan_t *c);
 
 /* This side's latest commitment, for a unilateral exit.  Refused when its
    secret is released (INV-23) or the channel detected its own data loss. */

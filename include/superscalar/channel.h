@@ -131,6 +131,10 @@ typedef struct {
     uint64_t commit_fee_rate_sat_per_kvb;
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
+    int trim_dust_outputs;  /* 1 = the channel-update engine's commitments: the anchor
+                               only from the funder (a state that cannot pay it is
+                               not built), balance outputs below dust left out
+                               (BOLT 3) */
     int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
                              negotiated like option_anchors -- BOTH parties must set it
                              identically or the co-signed commitment sighash diverges.

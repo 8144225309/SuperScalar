@@ -70,9 +70,12 @@ extern int test_cu_no_txn_across_calls(void);
 extern int test_cu_deadline_goes_onchain(void);
 extern int test_cu_penalty_failure_aborts(void);
 extern int test_cu_one_commitment_per_number(void);
+extern int test_cu_exit_lock(void);
+extern int test_cu_fulfil_waits_for_host_revocation(void);
 extern int test_cu_wire_roundtrip(void);
 extern int test_cu_wire_rejects(void);
 extern int test_cu_real_rounds(void);
+extern int test_cu_real_dust_trim(void);
 extern int test_regtest_cu_breach_penalty(void);
 extern int test_regtest_cu_unilateral_exit(void);
 
@@ -2281,9 +2284,12 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cu_deadline_goes_onchain);
     RUN_TEST(test_cu_penalty_failure_aborts);
     RUN_TEST(test_cu_one_commitment_per_number);
+    RUN_TEST(test_cu_exit_lock);
+    RUN_TEST(test_cu_fulfil_waits_for_host_revocation);
     RUN_TEST(test_cu_wire_roundtrip);
     RUN_TEST(test_cu_wire_rejects);
     RUN_TEST(test_cu_real_rounds);
+    RUN_TEST(test_cu_real_dust_trim);
 
     printf("\n=== MuSig2 ===\n");
     RUN_TEST(test_musig_aggregate_keys);

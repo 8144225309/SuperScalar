@@ -116,8 +116,9 @@ static int f_verify(void *ctx, uint64_t n, const unsigned char *tx, size_t len,
 }
 
 static int f_penalty(void *ctx, persist_t *db, uint64_t n, const unsigned char secret[32],
-                     const unsigned char *tx, size_t len) {
+                     const unsigned char *tx, size_t len, const cu_state_t *rst) {
     fake_t *f = ctx;
+    (void)rst;
     unsigned char txid[32];
     sqlite3_stmt *st;
     if (f->fail_penalty) return 0;
@@ -1354,5 +1355,59 @@ int test_cu_one_commitment_per_number(void) {
         TEST_ASSERT(n->s[0].c->out[k].type != CU_MSG_COMMIT_SIG, "no signature left");
     net_free(n); free(n);
     if (g_template[0]) { unlink(g_template); unlink_aux(g_template); g_template[0] = 0; }
+    return 1;
+}
+
+/* Leaving alone: nothing is signed or revoked after the decision. */
+int test_cu_exit_lock(void) {
+    init_secp();
+    net_t *n = malloc(sizeof(*n));
+    TEST_ASSERT(n && net_init(n), "init");
+    cu_update_t u;
+    mk_add(&u, 0, 2000000, 1200);
+    TEST_ASSERT_EQ(propose(n, CU_HOST, &u, 1), CU_OK, "round 1");
+    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "run");
+    /* The host opens round 2; the member decides to leave before it lands. */
+    mk_add(&u, 1, 1000000, 1201);
+    TEST_ASSERT_EQ(propose(n, CU_HOST, &u, 1), CU_OK, "round 2");
+    TEST_ASSERT_EQ(cu_begin_exit(n->s[1].c), CU_OK, "member leaves");
+    int rc = run(n, -1, NULL);
+    TEST_ASSERT_EQ(rc, CU_ERR_HALTED, "the round is not answered");
+    TEST_ASSERT_EQ(n->n_pipe[CU_HOST], 0, "no signature, no revocation");
+    TEST_ASSERT_EQ(n->s[1].c->rec.held, 1, "member keeps commitment 1");
+    TEST_ASSERT_EQ(cu_offer(n->s[1].c, &u, 1), CU_ERR_HALTED, "no offer either");
+    TEST_ASSERT(restart(n, 1), "restart");
+    TEST_ASSERT_EQ(n->s[1].c->rec.halted, CU_HALT_EXITING, "durable");
+    unsigned char tx[256], sig[64];
+    size_t len = sizeof(tx);
+    uint64_t num = 0;
+    TEST_ASSERT_EQ(cu_latest_commitment(n->s[1].c, tx, &len, sig, &num), CU_OK, "exit transaction");
+    TEST_ASSERT_EQ(num, 1, "on its latest commitment");
+    TEST_ASSERT_EQ(cu_on_block(n->s[1].c, TIP + 95), 1, "the HTLC goes on chain");
+    net_free(n); free(n);
+    return 1;
+}
+
+/* A preimage waits for the host's revocation of its earlier commitments. */
+int test_cu_fulfil_waits_for_host_revocation(void) {
+    init_secp();
+    char why[256] = "";
+    net_t *n = malloc(sizeof(*n));
+    TEST_ASSERT(n && net_init(n), "init");
+    cu_update_t u;
+    mk_add(&u, 0, 3000000, 1300);
+    n->drop_type[CU_MEMBER] = CU_MSG_REVOKE;          /* the host's revocation is lost */
+    TEST_ASSERT_EQ(propose(n, CU_HOST, &u, 1), CU_OK, "host adds");
+    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "run");
+    TEST_ASSERT_EQ(n->s[1].c->rec.phase, CU_PHASE_HOLDS, "member still waits");
+    mk_fulfil(&u, 0, 1300);
+    TEST_ASSERT_EQ(cu_offer(n->s[1].c, &u, 1), CU_ERR_BUSY, "no preimage before the host revokes");
+    TEST_ASSERT_EQ(n->s[1].c->n_out, 0, "nothing left");
+    TEST_ASSERT_EQ(reconnect(n), CU_OK, "the revocation arrives");
+    TEST_ASSERT(at_rest(n, 1, why, sizeof(why)), why);
+    TEST_ASSERT_EQ(propose(n, CU_MEMBER, &u, 1), CU_OK, "now the member fulfils");
+    TEST_ASSERT_EQ(run(n, -1, NULL), CU_OK, "round");
+    TEST_ASSERT(at_rest(n, 2, why, sizeof(why)), why);
+    net_free(n); free(n);
     return 1;
 }

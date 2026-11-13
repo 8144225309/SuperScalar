@@ -780,7 +780,7 @@ static int store_peer_revocation(cu_chan_t *c, uint64_t n, const cu_state_t *st_
     ok = ok && signed_get(c->db, &c->cfg, n, want) && memcmp(want, txid, 32) == 0;
     ok = ok && peer_secret_put(c->db, c->cfg.channel_id, n, secret);
     ok = ok && peer_point_put(c->db, c->cfg.channel_id, n + 2, next_point);
-    ok = ok && c->ops->arm_penalty(c->ops_ctx, c->db, n, secret, tx, len) == 1;
+    ok = ok && c->ops->arm_penalty(c->ops_ctx, c->db, n, secret, tx, len, st_n) == 1;
     if (ok) {
         sqlite3_stmt *st;
         ok = prep(c->db, "SELECT tx FROM chan_update_signed_void WHERE channel_id=? AND commit_num=?"
@@ -792,7 +792,7 @@ static int store_peer_revocation(cu_chan_t *c, uint64_t n, const cu_state_t *st_
             while (ok && sqlite3_step(st) == SQLITE_ROW)
                 ok = c->ops->arm_penalty(c->ops_ctx, c->db, n, secret,
                                          sqlite3_column_blob(st, 0),
-                                         (size_t)sqlite3_column_bytes(st, 0)) == 1;
+                                         (size_t)sqlite3_column_bytes(st, 0), NULL) == 1;
             sqlite3_finalize(st);
         }
     }
@@ -1504,6 +1504,13 @@ int cu_offer(cu_chan_t *c, const cu_update_t *u, size_t n) {
     if (c->rec.halted) return CU_ERR_HALTED;
     if (persist_in_transaction(c->db)) return CU_ERR_DB;
     if (c->n_offered + n > CU_MAX_UPDATES) return CU_ERR_BUSY;
+    /* A preimage leaves only once the host's revocation of every earlier
+       commitment is stored: the host can then close only on a commitment
+       that already pays the member. */
+    for (size_t i = 0; i < n; i++)
+        if (u[i].kind == CU_UPD_FULFILL
+            && (c->rec.phase != CU_PHASE_IDLE || c->rec.peer_revoked + 1 != (int64_t)c->rec.held))
+            return CU_ERR_BUSY;
     cu_update_t all[CU_MAX_UPDATES];
     memcpy(all, c->offered, c->n_offered * sizeof(cu_update_t));
     for (size_t i = 0; i < n; i++) {
@@ -1764,6 +1771,26 @@ static int on_reestablish(cu_chan_t *c, const cu_reestablish_t *re) {
     /* The host keeps no requests across a connection: offer them again. */
     if (c->cfg.side == CU_MEMBER && c->n_offered)
         return push_updates(c, c->offered, c->n_offered);
+    return CU_OK;
+}
+
+int cu_begin_exit(cu_chan_t *c) {
+    if (!c) return CU_ERR_ARG;
+    if (persist_in_transaction(c->db)) return CU_ERR_DB;
+    if (c->rec.halted == CU_HALT_EXITING) return CU_OK;
+    cu_rec_t r = c->rec;
+    r.halted = CU_HALT_EXITING;
+    int rc = txn_begin(c);
+    if (rc != CU_OK) return rc;
+    if (!rec_store(c->db, &c->cfg, &r)) return txn_abort(c, CU_ERR_DB);
+    if (!persist_commit(c->db)) return txn_abort(c, CU_ERR_DB);
+    c->rec = r;
+    /* Nothing of this connection leaves after the decision. */
+    c->n_out = 0;
+    c->n_deferred = 0;
+    c->n_peer_updates = 0;
+    c->have_peer_cs = 0;
+    ev_simple(c, CU_EV_HALTED, c->rec.held, CU_HALT_EXITING);
     return CU_OK;
 }
 

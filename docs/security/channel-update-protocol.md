@@ -208,6 +208,71 @@ The rule is: **persist before releasing a signature or a secret.**
   (INV-29).
 
 
+### 5.3 Commitment shape
+
+**Required:**
+- A commitment is a v3 (TRUC) transaction. It pays a small pre-set fee at
+  the factory term rate (default 0.1 sat/vB), taken from the host's
+  balance, and carries a 240 sat P2A anchor paid from the host's output (the
+  host funds the channel). It is not a zero-fee commitment: Core 30 relays
+  a transaction at 0.1 sat/vB on its own, and the anchor lets either side
+  raise the fee by CPFP at exit.
+- A state that leaves the host too little to pay the anchor and keep an
+  output above dust is not built, so it is never signed.
+- Balances and HTLCs are kept in millisatoshi. A commitment pays each one
+  rounded down to whole satoshis. A balance or HTLC output below dust is left
+  out and its value goes to the fee (BOLT 3), so no commitment carries a
+  zero or dust output.
+
+**Anchor keyed to the member (studied, not adopted).** On Core 30.3:
+- a v3 commitment whose anchor is a P2TR output keyed to the member
+  (330 sat, its dust limit) relays with no fee of its own, as one parent and
+  one child;
+- the member's child through that anchor replaces any other child of the
+  commitment by paying more (TRUC sibling eviction).
+
+A keyed anchor alone does not keep the host from giving the member's
+commitment a child, because the host's output on it can be spent while the
+commitment is unconfirmed. The member then outbids that child, which TRUC
+bounds at 1000 vB. The closest arrangement that leaves the host no way in:
+on the member's commitment, the host's output gets a one-block CSV (as
+BOLT 3 `option_anchors` does for `to_remote`), and the anchor is keyed to the
+member. The host's own commitment keeps a P2A anchor. The current format
+uses P2A on both commitments and no CSV on the host's output.
+
+### 5.4 Leaving alone
+
+**Required:** once a side decides to leave alone, the decision is durable
+before anything is published. From then on the channel signs nothing and
+revokes nothing: every later message of the channel is refused. HTLCs in
+flight are resolved on chain, by success claims and timeouts.
+
+### 5.5 Preimages, penalties and claims
+
+**Required:**
+- A preimage is durable, with its HTLC, before it leaves the side that
+  holds it. The payee writes it in the same transaction as its offer (the
+  member) or its `SENT` record (the host). The host learns a preimage from
+  a round it holds and writes that round before it forwards the preimage
+  upstream.
+- The member releases a preimage only while every host commitment before
+  the current one is revoked, with its secret stored.
+- A revoked commitment's `to_local` and each of its HTLC outputs go to the
+  other side by the revocation key. HTLC outputs have no second-stage
+  transactions in this protocol: the holder's own HTLC paths (the timeout
+  of an HTLC it offered, the success of one it received) carry the CSV delay
+  in their leaf and spend the output directly. The revocation key can take
+  the output until that delay has passed.
+- Each penalty is built at several fee rates (the channel's penalty rate,
+  and four and sixteen times it) and stored with the revocation, so a tower
+  that holds no secrets can still outbid. The `to_local` penalty at the base
+  rate is required. An HTLC output too small to pay a rate without leaving
+  dust gets no penalty at that rate or above.
+- An HTLC success claim, on either commitment, is armed before the
+  preimage leaves. The claim transactions come from the shared claim
+  builder; the engine records the claim (HTLC and preimage) in the same
+  transaction as the offer or round that releases the preimage.
+
 ## 6. Reconnect reconciliation
 
 ### 6.1 The message

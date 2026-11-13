@@ -11,9 +11,13 @@
  *   connection has one signature index, shared by both sides: every
  *   partial signature, in either direction, uses both sides' nonces at the
  *   next index and moves it on by one.  Secret nonces stay in memory.
- * - A revoked peer commitment gets its penalty built from the exact
- *   transaction this side signed, and its tower row (old_commitments, with
- *   the signed penalty) written in the engine's transaction.
+ * - Commitments never carry a zero or below-dust balance output (BOLT 3
+ *   trimming), and the anchor comes from the funder's output only.
+ * - A revoked peer commitment gets a penalty for its to_local and for each
+ *   HTLC output, built from the exact transaction this side signed, at
+ *   several fee rates (chan_update_penalty), with the tower rows
+ *   (old_commitments and its HTLC rows) written in the engine's
+ *   transaction.
  * - A fulfil's claim (the preimage and the HTLC) is written in the
  *   engine's transaction before the preimage leaves.
  */
@@ -25,6 +29,7 @@
 
 #define CU_NONCE_BATCH 64     /* nonces sent at a time */
 #define CU_NONCE_LOW   16     /* top up below this many */
+#define CU_PENALTY_RATES 3    /* each penalty is pre-built at this many fee rates */
 
 typedef struct {
     uint32_t base;            /* signature index of the first nonce */

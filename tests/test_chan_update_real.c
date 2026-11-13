@@ -223,6 +223,7 @@ typedef struct {
 static const unsigned char HOST_KEY[32] = { [0 ... 31] = 0x5a };
 static const unsigned char MEMBER_KEY[32] = { [0 ... 31] = 0x6b };
 static int g_rseq = 0;
+static uint64_t g_rate = 1000;   /* commitment fee rate of the next rnet_init, sat/kvB */
 
 static int funding_spk(secp256k1_context *ctx, const secp256k1_pubkey *a, const secp256k1_pubkey *b,
                        unsigned char spk[34], secp256k1_xonly_pubkey *out_key) {
@@ -401,7 +402,7 @@ static int rnet_init(rnet_t *n, const unsigned char ftxid[32], uint32_t fvout, u
     }
     /* The opening state: the member's balance is not whole satoshis. */
     memset(&n->init, 0, sizeof(n->init));
-    n->init.feerate_per_kvb = 1000;
+    n->init.feerate_per_kvb = g_rate;
     n->init.fee_msat = cu_chops_commit_fee_msat(NULL, &n->init);
     n->init.member_msat = member_msat;
     n->init.host_msat = FUND_SATS * 1000 - member_msat - n->init.fee_msat;
@@ -448,6 +449,55 @@ static void rnet_free(rnet_t *n) {
     secp256k1_context_destroy(n->ctx);
 }
 
+static int vint(const unsigned char *p, size_t len, size_t *off, uint64_t *v) {
+    if (*off >= len) return 0;
+    unsigned char b = p[(*off)++];
+    int k = b < 0xfd ? 0 : b == 0xfd ? 2 : b == 0xfe ? 4 : 8;
+    if (k == 0) { *v = b; return 1; }
+    if (*off + (size_t)k > len) return 0;
+    *v = 0;
+    for (int i = k - 1; i >= 0; i--) *v = (*v << 8) | p[*off + (size_t)i];
+    *off += (size_t)k;
+    return 1;
+}
+
+/* Offset of the output count of an unsigned transaction. */
+static int outs_at(const unsigned char *tx, size_t len, size_t *off) {
+    uint64_t n, l;
+    *off = 4;
+    if (!vint(tx, len, off, &n)) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        *off += 36;
+        if (!vint(tx, len, off, &l)) return 0;
+        *off += (size_t)l + 4;
+    }
+    return *off <= len;
+}
+
+static int out_count(const unsigned char *tx, size_t len, size_t *n) {
+    size_t off;
+    uint64_t c;
+    if (!outs_at(tx, len, &off) || !vint(tx, len, &off, &c)) return 0;
+    *n = (size_t)c;
+    return 1;
+}
+
+static int out_amount(const unsigned char *tx, size_t len, uint32_t vout, uint64_t *amt) {
+    size_t off;
+    uint64_t c, l;
+    if (!outs_at(tx, len, &off) || !vint(tx, len, &off, &c) || vout >= c) return 0;
+    for (uint32_t i = 0; i <= vout; i++) {
+        if (off + 8 > len) return 0;
+        uint64_t a = 0;
+        for (int k = 7; k >= 0; k--) a = (a << 8) | tx[off + (size_t)k];
+        off += 8;
+        if (i == vout) { *amt = a; return 1; }
+        if (!vint(tx, len, &off, &l)) return 0;
+        off += (size_t)l;
+    }
+    return 0;
+}
+
 /* The latest commitment of side i carries a valid key-path signature for
    the funding output, and pays balances rounded down to whole satoshis. */
 static int check_latest(rnet_t *n, int i, char *why, size_t wl) {
@@ -460,15 +510,30 @@ static int check_latest(rnet_t *n, int i, char *why, size_t wl) {
         snprintf(why, wl, "side %d commitment %llu: signature does not verify", i, (unsigned long long)num);
         return 0;
     }
-    /* output 0 = holder's balance (the host's pays the anchor) */
-    size_t off = 4 + 1 + 32 + 4 + 1 + 4 + 1;
-    uint64_t amt = 0;
-    for (int k = 7; k >= 0; k--) amt = (amt << 8) | tx[off + (size_t)k];
+    /* The balance outputs, holder's first: rounded down, the anchor taken
+       from the host's (the funder), and any below dust left out. */
     const cu_state_t *st = &n->s[i].c->st;
-    uint64_t want = (i == 0 ? st->host_msat : st->member_msat) / 1000;
-    if (i == 0) want -= ANCHOR_OUTPUT_AMOUNT;
-    if (amt != want) {
-        snprintf(why, wl, "side %d to_local %llu, want %llu", i, (unsigned long long)amt, (unsigned long long)want);
+    uint64_t hold = (i == 0 ? st->host_msat : st->member_msat) / 1000;
+    uint64_t oth = (i == 0 ? st->member_msat : st->host_msat) / 1000;
+    if (i == 0) hold -= ANCHOR_OUTPUT_AMOUNT; else oth -= ANCHOR_OUTPUT_AMOUNT;
+    uint64_t want[2];
+    size_t nw = 0;
+    if (hold >= CHANNEL_DUST_LIMIT_SATS) want[nw++] = hold;
+    if (oth >= CHANNEL_DUST_LIMIT_SATS) want[nw++] = oth;
+    for (size_t k = 0; k < nw; k++) {
+        uint64_t amt = 0;
+        if (!out_amount(tx, len, (uint32_t)k, &amt) || amt != want[k]) {
+            snprintf(why, wl, "side %d output %zu: %llu, want %llu", i, k,
+                     (unsigned long long)amt, (unsigned long long)want[k]);
+            return 0;
+        }
+    }
+    size_t nout = 0;
+    if (!out_count(tx, len, &nout)) { snprintf(why, wl, "parse"); return 0; }
+    size_t nh = 0;
+    for (size_t k = 0; k < st->n_htlcs; k++) if (st->htlcs[k].amount_msat / 1000 >= CHANNEL_DUST_LIMIT_SATS) nh++;
+    if (nout != nw + nh + 1) {
+        snprintf(why, wl, "side %d: %zu outputs, want %zu", i, nout, nw + nh + 1);
         return 0;
     }
     return 1;
@@ -575,6 +640,18 @@ int test_cu_real_rounds(void) {
                                            " AND signed_penalty_tx_hex IS NOT NULL;"), 4, "host tower rows");
     TEST_ASSERT_EQ(count_rows(&n->s[1].db, "SELECT COUNT(*) FROM old_commitments WHERE channel_id=3"
                                            " AND signed_penalty_tx_hex IS NOT NULL;"), 4, "member tower rows");
+    /* Each revoked output has its penalty at every rate of the ladder: the
+       to_local of commitments 0..3, and the HTLC on commitments 1 and 3. */
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(*) FROM chan_update_penalty WHERE kind=0;"),
+                   4 * CU_PENALTY_RATES, "to_local penalties, every rate");
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(DISTINCT commit_num) FROM chan_update_penalty"
+                                           " WHERE kind=1 AND feerate_per_kvb=1000;"), 2,
+                   "an HTLC penalty at the base rate for each HTLC");
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(*) FROM chan_update_penalty WHERE kind=1"
+                                           " AND commit_num=1;"), CU_PENALTY_RATES,
+                   "the 20000 sat HTLC at every rate");
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(*) FROM old_commitment_htlcs WHERE channel_id=3"
+                                           " AND signed_sweep_tx_hex != '';"), 2, "HTLC sweep rows");
 
     /* A disconnect mid-round: new nonces, the same transactions. */
     radd(&u, 1, 1000000, 3);
@@ -679,36 +756,37 @@ int test_regtest_cu_breach_penalty(void) {
     secp256k1_context_destroy(n->ctx);
     TEST_ASSERT(rnet_init(n, ftxid, fvout, 60000000), "open on chain funding");
 
-    /* The member keeps its commitment 0. */
-    unsigned char c0[4096], sig0[64];
-    size_t c0len = sizeof(c0);
-    TEST_ASSERT_EQ(cu_latest_commitment(n->s[1].c, c0, &c0len, sig0, NULL), CU_OK, "member C(0)");
-
-    /* The host pays the member; the member fulfils: commitment 0 is revoked. */
+    /* The host pays the member; the member keeps its commitment 1, which
+       carries the HTLC; then fulfils, and commitment 1 is revoked. */
     cu_update_t u;
     radd(&u, 0, 30000000, 7);
     TEST_ASSERT_EQ(host_round(n, &u, 1), CU_OK, "add");
+    unsigned char c0[4096], sig0[64];
+    size_t c0len = sizeof(c0);
+    uint64_t bn = 0;
+    TEST_ASSERT_EQ(cu_latest_commitment(n->s[1].c, c0, &c0len, sig0, &bn), CU_OK, "member C(1)");
+    TEST_ASSERT_EQ(bn, 1, "commitment 1");
     memset(&u, 0, sizeof(u));
     u.kind = CU_UPD_FULFILL;
     memset(u.preimage, 7, 32);
     TEST_ASSERT_EQ(member_round(n, &u, 1), CU_OK, "fulfil");
     TEST_ASSERT(rest_ok(n, 2, why, sizeof(why)), why);
 
-    /* Breach: the member broadcasts its revoked commitment 0. */
+    /* Breach: the member broadcasts its revoked commitment 1. */
     tx_buf_t signed0;
     tx_buf_init(&signed0, 1024);
-    TEST_ASSERT(cu_chops_finalize(c0, c0len, sig0, &signed0), "finalize C(0)");
+    TEST_ASSERT(cu_chops_finalize(c0, c0len, sig0, &signed0), "finalize C(1)");
     char breach_txid[65], pen_txid[65];
     TEST_ASSERT(broadcast(&rt, signed0.data, signed0.len, breach_txid), "revoked commitment relays");
     tx_buf_free(&signed0);
     regtest_mine_blocks(&rt, 1, mine);
     TEST_ASSERT(regtest_get_confirmations(&rt, breach_txid) > 0, "revoked commitment confirmed");
 
-    /* The host's tower row holds the signed penalty for commitment 0. */
+    /* The host's tower row holds the signed penalty for commitment 1. */
     sqlite3_stmt *st;
     TEST_ASSERT(sqlite3_prepare_v2(n->s[0].db.db, "SELECT signed_penalty_tx_hex, txid FROM old_commitments"
-                                   " WHERE channel_id=3 AND commit_num=0;", -1, &st, NULL) == SQLITE_OK, "query");
-    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "tower row for 0");
+                                   " WHERE channel_id=3 AND commit_num=1;", -1, &st, NULL) == SQLITE_OK, "query");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "tower row for 1");
     const char *pen_hex = (const char *)sqlite3_column_text(st, 0);
     TEST_ASSERT(pen_hex != NULL, "penalty bytes");
     char *pen = strdup(pen_hex);
@@ -719,7 +797,21 @@ int test_regtest_cu_breach_penalty(void) {
     TEST_ASSERT(sent, "penalty relays");
     regtest_mine_blocks(&rt, 1, mine);
     TEST_ASSERT(regtest_get_confirmations(&rt, pen_txid) > 0, "penalty confirmed");
-    printf("  breach %s punished by %s\n", breach_txid, pen_txid);
+    printf("  breach %s: to_local taken by %s\n", breach_txid, pen_txid);
+
+    /* The HTLC output too, with the highest-rate penalty of the ladder. */
+    TEST_ASSERT(sqlite3_prepare_v2(n->s[0].db.db, "SELECT tx, feerate_per_kvb FROM chan_update_penalty"
+                                   " WHERE commit_num=1 AND kind=1 ORDER BY feerate_per_kvb DESC LIMIT 1;",
+                                   -1, &st, NULL) == SQLITE_OK, "query htlc");
+    TEST_ASSERT(sqlite3_step(st) == SQLITE_ROW, "HTLC penalty for 1");
+    char htlc_txid[65];
+    int hsent = broadcast(&rt, sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0), htlc_txid);
+    long long hrate = sqlite3_column_int64(st, 1);
+    sqlite3_finalize(st);
+    TEST_ASSERT(hsent, "HTLC penalty relays");
+    regtest_mine_blocks(&rt, 1, mine);
+    TEST_ASSERT(regtest_get_confirmations(&rt, htlc_txid) > 0, "HTLC penalty confirmed");
+    printf("  HTLC output taken by %s at %lld sat/kvB\n", htlc_txid, hrate);
     rnet_free(n);
     free(n);
     return 1;
@@ -745,7 +837,12 @@ int test_regtest_cu_unilateral_exit(void) {
     uint32_t fvout = 0;
     TEST_ASSERT(fund_channel(&rt, n->spk, &n->out_key, n->ctx, mine, ftxid, &fvout), "fund channel");
     secp256k1_context_destroy(n->ctx);
-    TEST_ASSERT(rnet_init(n, ftxid, fvout, 70000000), "open");
+    /* The commitment pays the factory term rate, 0.1 sat/vB, from the
+       host's side; Core 30 relays it alone. */
+    g_rate = 100;
+    int opened = rnet_init(n, ftxid, fvout, 70000000);
+    g_rate = 1000;
+    TEST_ASSERT(opened, "open");
     cu_update_t u;
     radd(&u, 0, 25000000, 9);
     TEST_ASSERT_EQ(member_round(n, &u, 1), CU_OK, "member pays");
@@ -780,5 +877,49 @@ int test_regtest_cu_unilateral_exit(void) {
     }
     rnet_free(n);
     free(n);
+    return 1;
+}
+
+/* A balance below dust is not an output: the member's 300 sat goes to the
+   fee, on both commitments.  A host that cannot pay the anchor and keep a
+   spendable output gets no commitment, so nothing is signed. */
+int test_cu_real_dust_trim(void) {
+    unsigned char ftxid[32];
+    char why[256] = "";
+    memset(ftxid, 0xce, 32);
+    rnet_t *n = calloc(1, sizeof(*n));
+    TEST_ASSERT(n && rnet_init(n, ftxid, 0, 300000), "open with a member balance below dust");
+    TEST_ASSERT(rest_ok(n, 0, why, sizeof(why)), why);
+    cu_update_t u;
+    radd(&u, 0, 50000000, 21);
+    TEST_ASSERT_EQ(host_round(n, &u, 1), CU_OK, "host pays");
+    memset(&u, 0, sizeof(u));
+    u.kind = CU_UPD_FULFILL;
+    memset(u.preimage, 21, 32);
+    TEST_ASSERT_EQ(member_round(n, &u, 1), CU_OK, "fulfil");
+    TEST_ASSERT(rest_ok(n, 2, why, sizeof(why)), why);
+    /* Commitment 0 had no member output: the host's tower has no to_local
+       penalty for the member's 0, only for 1. */
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(*) FROM chan_update_penalty WHERE commit_num=0 AND kind=0;"),
+                   0, "nothing to take at 0");
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(*) FROM chan_update_penalty WHERE commit_num=1 AND kind=0;"),
+                   0, "nor at 1 (the HTLC is still pending)");
+    TEST_ASSERT_EQ(count_rows(&n->s[0].db, "SELECT COUNT(*) FROM chan_update_penalty WHERE commit_num=1 AND kind=1;"),
+                   CU_PENALTY_RATES, "the HTLC on 1, every rate");
+
+    rnet_free(n);
+    free(n);
+
+    /* A host left with 500 sat cannot pay the 240 sat anchor and keep an
+       output above dust: commitment 0 is not built, so nothing is signed. */
+    cu_state_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.feerate_per_kvb = g_rate;
+    uint64_t fee = cu_chops_commit_fee_msat(NULL, &tmp);
+    rnet_t *k = calloc(1, sizeof(*k));
+    TEST_ASSERT(k != NULL, "alloc");
+    TEST_ASSERT(!rnet_init(k, ftxid, 0, FUND_SATS * 1000 - fee - 500000), "a host at 500 sat cannot open");
+    rnet_free(k);
+    free(k);
     return 1;
 }
