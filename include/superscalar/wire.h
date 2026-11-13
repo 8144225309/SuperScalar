@@ -81,6 +81,16 @@
    same two fields in REVOKE_AND_ACK. */
 #define MSG_HOST_COMMITMENT_SIG 0x9B
 
+/* Channel-update engine (chan_update_wire.c).  The host opens every round. */
+#define MSG_CU_OFFER            0x93  /* Client -> LSP: updates the client asks for */
+#define MSG_CU_ROUND            0x94  /* LSP -> Client: open a round: updates + commitment_signed */
+#define MSG_CU_REFUSE           0x95  /* LSP -> Client: an offer refused, with a reason */
+#define MSG_CU_COMMIT_SIG       0x96  /* Client -> LSP: commitment_signed answering the round */
+#define MSG_CU_REVOKE           0x97  /* Either: revoke_and_ack */
+#define MSG_CU_REESTABLISH      0x98  /* Either: channel_reestablish */
+#define MSG_CU_NONCES           0x99  /* Either: public nonces from a signature index */
+#define MSG_CU_ERROR            0x9A  /* Either: engine error; the connection ends */
+
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
 #define MSG_LEAF_ADVANCE_PSIG    0x59 /* Client -> LSP: partial sig for leaf node */

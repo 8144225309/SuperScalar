@@ -1583,6 +1583,106 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
+    /* v49: the channel-update engine (chan_update.c).  Per channel: the
+       round record (phase, held and revoked numbers, the open round's
+       updates and digest); this side's commitments, fully signed, one per
+       (channel, number, funding outpoint); the txid of every peer
+       commitment this side signed, one per (channel, number, funding
+       outpoint); signatures given for a proposal that lost to a
+       simultaneous one, kept so the penalty covers them; this side's
+       per-commitment secrets with their released flag; the peer's points
+       and secrets; the member's pending offers; armed success claims.  A failed CREATE fails the open. */
+    if (db_version < 49) {
+        const char *sql_v49 =
+            "CREATE TABLE IF NOT EXISTS chan_update_channel ("
+            "  channel_id    INTEGER PRIMARY KEY,"
+            "  side          INTEGER NOT NULL,"       /* 0 host, 1 member */
+            "  funding_txid  BLOB NOT NULL,"
+            "  funding_vout  INTEGER NOT NULL,"
+            "  capacity_msat INTEGER NOT NULL,"
+            "  phase         INTEGER NOT NULL,"       /* 0 idle, 1 sent, 2 holds */
+            "  round_role    INTEGER NOT NULL,"       /* 0 proposer, 1 responder */
+            "  halted        INTEGER NOT NULL DEFAULT 0,"
+            "  held          INTEGER NOT NULL,"
+            "  revoked       INTEGER NOT NULL,"       /* -1 none */
+            "  peer_revoked  INTEGER NOT NULL,"       /* -1 none */
+            "  round_updates BLOB NOT NULL,"
+            "  round_digest  BLOB NOT NULL"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_commitment ("
+            "  channel_id   INTEGER NOT NULL,"
+            "  commit_num   INTEGER NOT NULL,"
+            "  funding_txid BLOB NOT NULL,"
+            "  funding_vout INTEGER NOT NULL,"
+            "  state        BLOB NOT NULL,"
+            "  tx           BLOB NOT NULL,"
+            "  sig          BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num, funding_txid, funding_vout)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_signed ("
+            "  channel_id   INTEGER NOT NULL,"
+            "  commit_num   INTEGER NOT NULL,"
+            "  funding_txid BLOB NOT NULL,"
+            "  funding_vout INTEGER NOT NULL,"
+            "  txid         BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num, funding_txid, funding_vout)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_signed_void ("
+            "  channel_id   INTEGER NOT NULL,"
+            "  commit_num   INTEGER NOT NULL,"
+            "  funding_txid BLOB NOT NULL,"
+            "  funding_vout INTEGER NOT NULL,"
+            "  txid         BLOB NOT NULL,"
+            "  tx           BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num, funding_txid, funding_vout, txid)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_secret ("
+            "  channel_id INTEGER NOT NULL,"
+            "  commit_num INTEGER NOT NULL,"
+            "  secret     BLOB NOT NULL,"
+            "  released   INTEGER NOT NULL DEFAULT 0,"
+            "  PRIMARY KEY (channel_id, commit_num)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_peer_point ("
+            "  channel_id INTEGER NOT NULL,"
+            "  commit_num INTEGER NOT NULL,"
+            "  point      BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_peer_secret ("
+            "  channel_id INTEGER NOT NULL,"
+            "  commit_num INTEGER NOT NULL,"
+            "  secret     BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, commit_num)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_claim ("   /* success claims armed before a preimage leaves */
+            "  channel_id  INTEGER NOT NULL,"
+            "  offerer     INTEGER NOT NULL,"
+            "  htlc_id     INTEGER NOT NULL,"
+            "  commit_num  INTEGER NOT NULL,"
+            "  amount_msat INTEGER NOT NULL,"
+            "  payment_hash BLOB NOT NULL,"
+            "  cltv_expiry INTEGER NOT NULL,"
+            "  preimage    BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, offerer, htlc_id)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS chan_update_offer ("   /* member: updates it asked for */
+            "  channel_id INTEGER NOT NULL,"
+            "  seq        INTEGER NOT NULL,"
+            "  upd        BLOB NOT NULL,"
+            "  PRIMARY KEY (channel_id, seq)"
+            ");";
+        char *merr49 = NULL;
+        if (sqlite3_exec(p->db, sql_v49, NULL, NULL, &merr49) != SQLITE_OK) {
+            fprintf(stderr, "persist_open: migration v49 (channel-update engine) failed: %s\n",
+                    merr49 ? merr49 : "unknown");
+            sqlite3_free(merr49);
+            sqlite3_close(p->db);
+            p->db = NULL;
+            return 0;
+        }
+    }
+
     /* Record the current version if not already present */
     if (db_version < PERSIST_SCHEMA_VERSION) {
         char vsql[128];

@@ -136,6 +136,9 @@ add_library(superscalar
     src/tapscript.c
     src/shachain.c
     src/channel.c
+    src/chan_update.c
+    src/chan_update_ops.c
+    src/chan_update_wire.c
     src/adaptor.c
     src/ladder.c
     src/wire.c
@@ -294,6 +297,8 @@ add_executable(test_superscalar
     tests/test_end_date_payout.c
     tests/test_shachain.c
     tests/test_channel.c
+    tests/test_chan_update.c
+    tests/test_chan_update_real.c
     tests/test_adaptor.c
     tests/test_ladder.c
     tests/test_rotation_creation.c

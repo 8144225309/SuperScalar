@@ -334,6 +334,14 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
                                              tx_buf_t *unsigned_tx_out,
                                              unsigned char *txid_out32);
 
+/* Build ch's own commitment (for_remote = 0) or the peer's (1) from ch's
+   balances and HTLCs, keyed by the holder's per-commitment point pcp.  The
+   P2A anchor, when on, comes from the funder's output (funder_is_local,
+   which the peer's view flips). */
+int channel_build_commitment_at(const channel_t *ch, int for_remote,
+                                const secp256k1_pubkey *pcp,
+                                tx_buf_t *unsigned_tx_out, unsigned char *txid_out32);
+
 int channel_sign_commitment(const channel_t *ch,
                               tx_buf_t *signed_tx_out,
                               const tx_buf_t *unsigned_tx,
