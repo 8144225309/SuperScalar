@@ -935,9 +935,44 @@ class Checker:
                                  "balance %d means %d" % (db.name, ctx["txid"], got, local, exp),
                                  member=db.name)
                 return
+        rv = self._revoked_own_commitment(ch, ctx)
+        if rv:
+            self._revoked_outcome(db, ctx, rv, rec)
+            return
         self.violate("balances", "%s: its channel output is spent by %s, which is neither its latest "
                      "commitment nor one of the LSP's it can recognise" % (db.name, ctx["txid"]),
                      member=db.name)
+
+    def _revoked_own_commitment(self, ch, ctx):
+        """The member's own commitment that spends its channel output, if it is
+        an old one the other side holds the revocation secret of.  The member's
+        DB keeps only its latest commitment; the other side's DB derives all of
+        them (counterparty_commitments), so the match is made there."""
+        op = (ch["funding_txid"], int(ch["funding_vout"]))
+        lch = self.lsp_channel_for(op)
+        if lch is None:
+            return None
+        for c in self.counterparty_commitments(self.lsp, int(lch.get("id") or 0)):
+            idx = [i for i, o in enumerate(ctx["vout"]) if o[1] in c["to_local"]]
+            if c["revoked"] and idx and any(o[1] == c["to_remote"] for o in ctx["vout"]):
+                return {"cn": c["cn"], "to_local_vout": idx[0]}
+        return None
+
+    def _revoked_outcome(self, db, ctx, rv, rec):
+        """A revoked commitment of the member is on chain: the expected outcome
+        is that its to_local is taken by a confirmed penalty, and the balance
+        comes from the penalty.  Whether the penalty is there and is not a CSV
+        sweep is the revocation check's verdict; here the outcome is recorded."""
+        vout = rv["to_local_vout"]
+        rec["commitment"] = {"txid": ctx["txid"], "kind": "member's own, revoked",
+                             "cn": rv["cn"], "revoked": True}
+        sp = self.chain.spender.get((ctx["txid"], vout))
+        if sp and sp[1] is not None and self.chain.confirmed(sp[0]):
+            pen = self.chain.txs[sp[0]]
+            rec["final"] = {"penalty": sp[0],
+                            "received": sum(o[0] for o in pen["vout"] if o[1] != ANCHOR_SPK)}
+        else:
+            rec["final"] = {"penalty": None}
 
     def _follow_sweep(self, db, ctx, vout, value, rec):
         sp = self.chain.spender.get((ctx["txid"], vout))

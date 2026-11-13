@@ -3,8 +3,9 @@
 # daemons, checking that every pre-signed tx relays and every party ends with
 # what it is owed on chain.
 #
-# Build an N-client factory (LSP + N client daemons), let the demo move some
-# balance, then kill every SuperScalar process.  Optionally restart bitcoind
+# Build an N-client factory (LSP + N client daemons), let the members move some
+# balance (payments in this drill are member-initiated: client 2k pays client
+# 2k+1 with its own --send), then kill every SuperScalar process.  Optionally restart bitcoind
 # with a higher -minrelaytxfee so the pre-signed tree / commitment fees sit
 # BELOW what the node accepts and only CPFP (submitpackage with a child
 # spending the P2A anchor) can get them in.  Then every client runs
@@ -140,15 +141,29 @@ TFR=(--tree-fee-rate "$TREE_FEE_RATE")
 # A long factory lifetime: no rotation or expiry while the test runs.
 H0=$($BCLI getblockcount)
 LIFE=(--cltv-timeout $((H0 + 5000)) --active-blocks 4000 --dying-blocks 500)
-"$LSP_BIN" --network regtest --port $PORT --demo --daemon --lsp-balance-pct 50 \
+"$LSP_BIN" --network regtest --port $PORT --daemon --lsp-balance-pct 50 \
     --clients $N_CLIENTS --arity $ARITY --amount $AMOUNT --fee-rate $FEE --confirm-timeout 600 \
     --step-blocks 2 --states-per-layer 2 "${TFR[@]}" "${LIFE[@]}" "${FEST[@]}" \
     --seckey "$LSP_SECKEY" --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
     --wallet "$WALLET" --db "$LSP_DB" > "$LSP_LOG" 2>&1 &
 LSP_PID=$!; PIDS+=($LSP_PID)
 for i in $(seq 1 60); do sleep 1; grep -q "listening" "$LSP_LOG" 2>/dev/null && break; kill -0 $LSP_PID 2>/dev/null || { tail -25 "$LSP_LOG"; fail "LSP died before listening"; }; done
+# Member-initiated payments: client 2k pays client 2k+1 (an odd last client
+# never transacts).  Each payer starts its own payment with --send; the payee
+# holds the preimage (--recv).  A client with a payment runs the same daemon
+# loop through --channels (scripted payments are not taken with --daemon);
+# one without runs --daemon.
+pay_pre(){ printf "%064x" $((0x5a00 + $1)); }
+NPAY=0
 for i in $(seq 0 $((N_CLIENTS-1))); do
-    "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $PORT --daemon \
+    PAYARGS=(--daemon)
+    if [ $((i % 2)) = 0 ] && [ $((i + 1)) -lt $N_CLIENTS ]; then
+        PAYARGS=(--channels --send "$((i + 1)):$((1000 + 500 * i)):$(pay_pre $i)")
+        NPAY=$((NPAY + 1))
+    elif [ $((i % 2)) = 1 ]; then
+        PAYARGS=(--channels --recv "$(pay_pre $((i - 1)))")
+    fi
+    "$CLIENT_BIN" --network regtest --host 127.0.0.1 --port $PORT "${PAYARGS[@]}" \
         --keyfile "$TMPDIR/c${i}.key" --passphrase pw "${CMAX[@]}" \
         --fee-rate $FEE --lsp-balance-pct 50 --lsp-pubkey "$LSP_PUB" \
         --participant-id $((i+1)) --rpcuser "$RU" --rpcpassword "$RP" --rpcport "$RPORT" \
@@ -171,9 +186,11 @@ grep -q "channels ready" "$LSP_LOG" || { tail -40 "$LSP_LOG"; fail "factory neve
 grep -aE "tree fee rate" "$LSP_LOG" | head -1
 grep -q "LSP: tree fee rate $TREE_FEE_RATE sat/kvB" "$LSP_LOG" \
     || fail "tree not built at the agreed $TREE_FEE_RATE sat/kvB"
-# let the demo payments finish (--daemon keeps the factory open afterwards)
-for i in $(seq 1 120); do sleep 2; grep -q "Demo Complete" "$LSP_LOG" 2>/dev/null && break; done
-grep -q "Demo Complete" "$LSP_LOG" || { tail -30 "$LSP_LOG"; fail "demo never completed"; }
+# let the members' payments settle (--daemon keeps the factory open afterwards)
+nsettled(){ grep -c "LSP: HTLC fulfilled: client" "$LSP_LOG" 2>/dev/null || true; }
+for i in $(seq 1 120); do sleep 2; [ "$(nsettled)" -ge "$NPAY" ] && break; done
+[ "$(nsettled)" -ge "$NPAY" ] || { tail -30 "$LSP_LOG"; fail "only $(nsettled)/$NPAY member payments settled"; }
+echo "  member-initiated payments settled: $(nsettled)/$NPAY"
 sleep 5
 sleep 10
 declare -a HAS

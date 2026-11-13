@@ -1477,6 +1477,9 @@ extern int test_reconnect_commitment_mismatch_rollback(void);
 extern int test_reconnect_commitment_mismatch_reject(void);
 extern int test_reconnect_pending_commitment_needs_revocation(void);
 extern int test_reconnect_htlc_replay(void);
+extern int test_member_host_add_is_never_own_payment(void);
+extern int test_member_underpaid_htlc_gets_no_preimage(void);
+extern int test_member_invoice_preimage_needs_randomness(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
 /* Security hardening */
@@ -3623,6 +3626,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_commitment_mismatch_reject);
     RUN_TEST(test_reconnect_pending_commitment_needs_revocation);
     RUN_TEST(test_reconnect_htlc_replay);
+    RUN_TEST(test_member_host_add_is_never_own_payment);
+    RUN_TEST(test_member_underpaid_htlc_gets_no_preimage);
+    RUN_TEST(test_member_invoice_preimage_needs_randomness);
     RUN_TEST(test_client_handle_async_msg);
 
     printf("\n=== Security Hardening ===\n");
