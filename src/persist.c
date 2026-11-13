@@ -1557,10 +1557,10 @@ int persist_open(persist_t *p, const char *path) {
         }
     }
 
-    /* v44: a member's BOLT 11 invoices carry a payment secret, which the
+    /* v45: a member's BOLT 11 invoices carry a payment secret, which the
        member checks a payment against (NULL for an invoice paid inside the
        factory).  Version-gated (ALTER is not idempotent). */
-    if (db_version < 44) {
+    if (db_version < 45) {
         sqlite3_exec(p->db,
             "ALTER TABLE client_invoices ADD COLUMN payment_secret TEXT;",
             NULL, NULL, NULL);

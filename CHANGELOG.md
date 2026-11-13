@@ -2,13 +2,13 @@
 
 All notable changes to SuperScalar are documented here.
 
-> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **44**.
+> **Note on references:** entries anchor to real GitHub PR numbers shown as "PR #N". Some bare `#N` in the historical `v0.2.0-rc1` section below are *internal task IDs*, not GitHub PRs — do not follow them as PR links. The design maximum is **127 clients = 128 signers** (LSP + 127 clients); "N=128" is only correct when N counts signers. The persisted schema version is **45**.
 
 ## Unreleased
 
 ### A member keeps the preimages of its invoices
 
-Wire, schema (v44) and operator-visible changes.  No LSP, bridge or Lightning-node component can settle a member's payment: none of them holds its preimage.
+Wire, schema (v45) and operator-visible changes.  No LSP, bridge or Lightning-node component can settle a member's payment: none of them holds its preimage.
 
 - **The member makes and signs its invoices.** `CREATE_INVOICE` carries the route hint of the LSP's CLN node (`--invoice-route-hint NODE_ID/SCID/FEE_BASE/FEE_PPM/CLTV_DELTA`). The member creates the preimage and payment secret, keeps them (`client_invoices.payment_secret`), and signs a BOLT 11 invoice with its own key through that hop. It answers `INVOICE_CREATED` with the hash and its invoice. The CLI `invoice <client> <msat>` and admin `createinvoice` with `client` print or return the member's invoice; `createinvoice` without `client` is an invoice of the LSP's own node.
 - **The LSP and the bridge get the hash only.** `REGISTER_INVOICE` and `BRIDGE_REGISTER` carry no preimage, and one that does is refused. A member registers invoices only for itself. `DELIVER_PREIMAGE` and `INVOICE_BOLT11` are removed. The CLN plugin no longer creates CLN invoices (`--superscalar-route-hint` is gone): a payment to a member reaches CLN as a forward to the hinted channel, and the plugin passes it, with CLN's `next_onion`, to the LSP. Keysend payments are refused.
