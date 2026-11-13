@@ -524,6 +524,16 @@ static int at_rest(net_t *n, uint64_t want_held, char *why, size_t wl) {
             return 0;
         }
         if (!cu_check_invariants(&n->s[i].db, c->cfg.channel_id, CAPACITY_MSAT, why, wl)) return 0;
+        {
+            /* Only the held commitment keeps a signature. */
+            sqlite3_stmt *q;
+            int signed_rows = -1;
+            if (sqlite3_prepare_v2(n->s[i].db.db, "SELECT COUNT(*) FROM chan_update_commitment WHERE length(sig)=64;",
+                                   -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+                signed_rows = sqlite3_column_int(q, 0);
+            sqlite3_finalize(q);
+            if (signed_rows != 1) { snprintf(why, wl, "side %d: %d signed own commitments", i, signed_rows); return 0; }
+        }
         if (c->n_offered) { snprintf(why, wl, "side %d holds %zu offers", i, c->n_offered); return 0; }
         for (uint64_t k = 0; k < want_held; k++)
             if (watch_count(&n->s[i], (int64_t)k) < 1) { snprintf(why, wl, "side %d: no watch for %llu", i, (unsigned long long)k); return 0; }

@@ -382,6 +382,20 @@ static int commitment_put(persist_t *db, const cu_config_t *cfg, uint64_t n,
     return step_done(st);
 }
 
+/* A revoked own commitment keeps its state and transaction but loses its
+   signature in the transaction that releases its secret: nothing revoked
+   can be broadcast from this side's records (INV-23). */
+static int commitment_drop_sig(persist_t *db, const cu_config_t *cfg, uint64_t n) {
+    sqlite3_stmt *st;
+    if (!prep(db, "UPDATE chan_update_commitment SET sig=X'' WHERE channel_id=? AND commit_num=?"
+                  " AND funding_txid=? AND funding_vout=?;", &st))
+        return 0;
+    sqlite3_bind_int64(st, 1, cfg->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)n);
+    bind_fund(st, 3, cfg);
+    return step_done(st) && sqlite3_changes(db->db) == 1;
+}
+
 static int commitment_get(persist_t *db, const cu_config_t *cfg, uint64_t n, cu_state_t *s,
                           unsigned char *tx, size_t *len, unsigned char sig[64]) {
     sqlite3_stmt *st;
@@ -1021,6 +1035,7 @@ static int responder_cs(cu_chan_t *c, const cu_msg_t *m) {
           && signed_put(c->db, &c->cfg, nn, ptxid)
           && secret_ensure(c->db, c->cfg.channel_id, nn + 1, s2)
           && secret_release(c->db, c->cfg.channel_id, n)
+          && commitment_drop_sig(c->db, &c->cfg, n)
           && (n_left == c->n_offered || offers_store(c->db, c->cfg.channel_id, left, n_left))
           && rec_store(c->db, &c->cfg, &r);
     memset(s2, 0, 32);
@@ -1135,6 +1150,7 @@ static int proposer_raa(cu_chan_t *c, const cu_msg_t *m) {
     int ok = commitment_put(c->db, &c->cfg, nn, next, tx, len, c->peer_cs_sig)
           && store_peer_revocation(c, n, &c->st, m->secret, m->next_point)
           && secret_release(c->db, c->cfg.channel_id, n)
+          && commitment_drop_sig(c->db, &c->cfg, n)
           && rec_store(c->db, &c->cfg, &r);
     if (!ok) { rc = txn_abort(c, CU_ERR_DB); goto fail; }
     rc = txn_finish(c, CU_CP_PROP_HOLDS_BEFORE, CU_CP_PROP_HOLDS_AFTER, "cu_prop_holds");
