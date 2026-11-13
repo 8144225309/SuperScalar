@@ -618,10 +618,10 @@ int test_restart_dw_counter_restored_by_load_factory(void) {
     factory_t *f = fx.f;
     TEST_ASSERT(f->counter.n_layers > 0 && f->n_leaf_nodes >= 2, "factory shape");
 
-    uint32_t layers[DW_MAX_LAYERS];
+    uint32_t layers[DW_MAX_LAYERS] = {0};
     for (uint32_t i = 0; i < f->counter.n_layers; i++)
         layers[i] = (i + 1) % f->counter.layers[i].config.max_states;
-    uint32_t leaves[64];
+    uint32_t leaves[64] = {0};
     TEST_ASSERT(f->n_leaf_nodes <= 64, "leaf count");
     for (int i = 0; i < f->n_leaf_nodes; i++)
         leaves[i] = (uint32_t)(i * 3 + 1) % f->leaf_layers[i].config.max_states;
@@ -657,10 +657,10 @@ int test_restart_dw_counter_out_of_range_loads_exhausted(void) {
     TEST_ASSERT(rs_dw_factory(&fx), "fixture");
     factory_t *f = fx.f;
 
-    uint32_t layers[DW_MAX_LAYERS];
+    uint32_t layers[DW_MAX_LAYERS] = {0};
     for (uint32_t i = 0; i < f->counter.n_layers; i++)
         layers[i] = f->counter.layers[i].config.max_states;
-    uint32_t leaves[64];
+    uint32_t leaves[64] = {0};
     for (int i = 0; i < f->n_leaf_nodes; i++) leaves[i] = 1;
     TEST_ASSERT(persist_save_dw_counter_with_leaves(&fx.db, 0, 2,
                     f->counter.n_layers, layers, 1, leaves, f->n_leaf_nodes),
