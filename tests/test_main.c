@@ -76,6 +76,7 @@ extern int test_cu_wire_roundtrip(void);
 extern int test_cu_wire_rejects(void);
 extern int test_cu_real_rounds(void);
 extern int test_cu_real_dust_trim(void);
+extern int test_cu_session_sockets(void);
 extern int test_regtest_cu_breach_penalty(void);
 extern int test_regtest_cu_unilateral_exit(void);
 
@@ -2290,6 +2291,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cu_wire_rejects);
     RUN_TEST(test_cu_real_rounds);
     RUN_TEST(test_cu_real_dust_trim);
+    RUN_TEST(test_cu_session_sockets);
 
     printf("\n=== MuSig2 ===\n");
     RUN_TEST(test_musig_aggregate_keys);

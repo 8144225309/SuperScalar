@@ -90,6 +90,7 @@
 #define MSG_CU_REESTABLISH      0x98  /* Either: channel_reestablish */
 #define MSG_CU_NONCES           0x99  /* Either: public nonces from a signature index */
 #define MSG_CU_ERROR            0x9A  /* Either: engine error; the connection ends */
+#define MSG_CU_OPEN             0x9C  /* Either: commitment 0 at open (points, then signature) */
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
