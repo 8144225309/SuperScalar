@@ -8604,7 +8604,8 @@ static int ready_refused(secp256k1_context *ctx, const secp256k1_keypair *kps,
         break;
     default: break;
     }
-    int r = client_apply_factory_ready(cf, json, 2);
+    int r = mutation == 5 ? client_apply_factory_payouts(cf, json, 2)
+                          : client_apply_factory_ready(cf, json, 2);
     cJSON_Delete(json);
     factory_free(cf); free(cf);
     return r < 0;

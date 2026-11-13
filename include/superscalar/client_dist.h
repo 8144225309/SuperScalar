@@ -143,13 +143,20 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
 int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory_id,
                          client_dist_send_fn send, FILE *out);
 
-/* From the end date on, once the funding output is spent (the distribution
-   TX can no longer confirm): publish the next pre-signed node of this
-   member's path (participant >= 1), down to the first output on the path
-   that has an end-date payout.  Called with client_payouts_claim, it takes
-   the member to its share with no message from the LSP.  Returns 1 if a node
-   was sent or is in the mempool, 0 if there is nothing to push now, -1 on
-   error. */
+/* 1 if txid:vout exists on chain and no confirmed transaction spends it
+   (a spend in the mempool does not count), 0 if it is spent on chain or its
+   transaction is not confirmed, -1 if unknown. */
+int client_outpoint_live(chain_backend_t *chain, const char *txid_hex, uint32_t vout);
+
+/* Once the root kickoff is on chain, take this member's path (participant
+   >= 1) one pre-signed node a call.  Before the end date only the latest
+   state under a confirmed kickoff is published.  From the end date the path
+   is published down to the first output that has an end-date payout
+   (client_payouts_claim publishes that payout), walking past confirmed
+   nodes whose payout output is already spent.  The root is never published
+   by the member: with the funding output unspent the distribution TX is the
+   exit.  Returns 1 if a node was sent or is in the mempool, 0 if there is
+   nothing to push now, -1 on error. */
 int client_path_push(const factory_t *f, uint32_t participant, chain_backend_t *chain,
                      client_dist_send_fn send, FILE *out);
 

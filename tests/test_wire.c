@@ -1258,6 +1258,8 @@ int test_regtest_wire_factory(void) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
+    /* No channels in this run: the distribution TX and payouts go out now. */
+    if (lsp_ok && !lsp_send_factory_payouts(lsp)) lsp_ok = 0;
 
     /* Cooperative close — spends funding output directly (bypasses factory tree) */
     if (lsp_ok) {
@@ -1469,6 +1471,8 @@ int test_regtest_wire_factory_arity1(void) {
         fprintf(stderr, "LSP: factory creation (arity-1) failed\n");
         lsp_ok = 0;
     }
+    /* No channels in this run: the distribution TX and payouts go out now. */
+    if (lsp_ok && !lsp_send_factory_payouts(lsp)) lsp_ok = 0;
 
     /* Verify arity-1 tree: 14 nodes, 4 leaf nodes */
     if (lsp_ok) {
@@ -1692,6 +1696,8 @@ int test_regtest_wire_factory_mixed_arity(void) {
         fprintf(stderr, "LSP: factory creation (mixed-arity) failed\n");
         lsp_ok = 0;
     }
+    /* No channels in this run: the distribution TX and payouts go out now. */
+    if (lsp_ok && !lsp_send_factory_payouts(lsp)) lsp_ok = 0;
 
     /* The CI guard.  If lsp_run_factory_creation drops these, every
        non-regtest deployment using --arity X,Y,Z silently builds a
@@ -2424,6 +2430,9 @@ int test_wire_msg_ids_unique(void) {
                 "HOST_COMMITMENT_SIG is 0x9B");
     TEST_ASSERT(strcmp(wire_msg_type_name(MSG_HOST_COMMITMENT_SIG), "HOST_COMMITMENT_SIG") == 0,
                 "HOST_COMMITMENT_SIG has its name");
+    TEST_ASSERT(MSG_FACTORY_PAYOUTS == 0x9C && seen[0x9C] == 1, "FACTORY_PAYOUTS is 0x9C");
+    TEST_ASSERT(strcmp(wire_msg_type_name(MSG_FACTORY_PAYOUTS), "FACTORY_PAYOUTS") == 0,
+                "FACTORY_PAYOUTS has its name");
     return 1;
 }
 

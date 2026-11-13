@@ -120,11 +120,14 @@ void client_set_allow_unverified_funding(int allow);
 /* FACTORY_READY handler.  Every tree node the LSP sends must be the client's
    own transaction for that node carrying one signature that verifies; the
    client's own serialization is what gets stored.  Every node this client
-   signs for (its path from the root to its leaf) must be present.  A signed
-   distribution transaction, if sent, must pass
-   client_verify_distribution_tx against the client's own build.  Returns
+   signs for (its path from the root to its leaf) must be present.  Returns
    the number of nodes applied, or -1 to refuse the factory. */
 int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_index);
+/* FACTORY_PAYOUTS handler: every end-date payout on this member's path must
+   carry a signature valid for the payout the member built, and the signed
+   distribution TX must be present and pass client_verify_distribution_tx
+   against the member's own build.  Returns 1, or -1 to refuse the factory. */
+int client_apply_factory_payouts(factory_t *f, const cJSON *json, uint32_t my_index);
 
 /* 1 if offered is the distribution transaction locktime this client derives
    for f (factory_distribution_locktime). */

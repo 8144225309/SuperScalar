@@ -380,7 +380,7 @@ int test_cli_proposed_cltv_floor(void) {
              "the old regtest +35 is refused for this shape");
     T_ASSERT(!cli_validate_proposed_cltv(162, 211, exit4, err, sizeof(err)),
              "a timeout in the past is refused");
-    T_ASSERT(cli_validate_proposed_cltv(5, 0, exit4, err, sizeof(err)),
-             "unknown tip is not judged");
+    T_ASSERT(!cli_validate_proposed_cltv(5000, 0, exit4, err, sizeof(err)),
+             "with no known tip the end date cannot be checked: refused");
     return 1;
 }

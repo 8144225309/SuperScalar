@@ -188,7 +188,10 @@ int lsp_plan_tree(lsp_t *lsp, const factory_t *cfg, size_t n_clients,
                   uint64_t *min_usable_out, char *why, size_t why_len);
 
 /* Run full factory creation ceremony over the wire.
-   funding_txid: internal byte order, already funded.
+   funding_txid: internal byte order, already funded.  FACTORY_READY carries
+   the signed tree only; the distribution TX and the end-date payouts go out
+   with lsp_send_factory_payouts (lsp_channels_send_ready sends them once
+   every member co-signed the LSP's commitment 0).
    Returns 1 on success (factory fully signed). */
 int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_txid, uint32_t funding_vout,
@@ -219,6 +222,11 @@ int lsp_validate_bridge_pin(lsp_t *lsp, cJSON *hello_json);
 
 /* Send MSG_ERROR to all connected clients, then close their fds. */
 void lsp_abort_ceremony(lsp_t *lsp, const char *reason);
+/* MSG_FACTORY_PAYOUTS to every member: the signed distribution TX and every
+   end-date payout signature.  Call it only once the LSP holds what it needs
+   to close each member's channel by itself (lsp_channels_send_ready does),
+   or right after creation when no channels are opened. */
+int lsp_send_factory_payouts(lsp_t *lsp);
 
 /* Derive an 8-byte ceremony_id from (factory_instance_id, type, epoch).
    Shared with src/lsp_rotation.c (ROTATE ceremony) and any other ceremony

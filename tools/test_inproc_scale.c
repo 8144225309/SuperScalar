@@ -64,8 +64,11 @@ static int harness_channel_cb(int fd, channel_t *channel, uint32_t my_index,
     return 2;
 }
 
+static uint32_t inproc_tip(void *ctx) { (void)ctx; return 1; }
+
 int main(int argc, char **argv) {
     client_set_allow_unverified_funding(1);   /* chainless creation */
+    client_set_chain_tip_source(inproc_tip, NULL);   /* chainless: block 1 */
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);

@@ -8,6 +8,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/sha256.h"
 #include "superscalar/tx_builder.h"
+#include "superscalar/cpfp.h"
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
 #include <stdlib.h>
@@ -489,9 +490,25 @@ int client_dist_force_close(persist_t *db, chain_backend_t *chain,
    member's claim, with no message from the host.  Returns how many are in
    the mempool or were sent now. */
 #define CLIENT_PAYOUT_MAX_ROWS 64
+int client_outpoint_live(chain_backend_t *chain, const char *txid_hex, uint32_t vout) {
+    if (!chain || !txid_hex) return -1;
+    if (chain->is_outpoint_spent_confirmed && chain->get_confirmations) {
+        int c = chain->get_confirmations(chain, txid_hex);
+        if (c < 0) return c == -1 ? 0 : -1;   /* -1: not found anywhere */
+        if (c == 0) return 0;                   /* only in the mempool */
+        int s = chain->is_outpoint_spent_confirmed(chain, txid_hex, vout);
+        if (s < 0) return -1;
+        return s == 0;
+    }
+    if (chain->is_outpoint_unspent)
+        return chain->is_outpoint_unspent(chain, txid_hex, vout);
+    return -1;
+}
+
 int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory_id,
                          client_dist_send_fn send, FILE *out) {
-    if (!db || !chain || !chain->get_block_height || !chain->is_outpoint_unspent) return 0;
+    if (!db || !chain || !chain->get_block_height ||
+        (!chain->is_outpoint_unspent && !chain->is_outpoint_spent_confirmed)) return 0;
     int tip = chain->get_block_height(chain);
     if (tip <= 0) return 0;
     persist_payout_row_t rows[CLIENT_PAYOUT_MAX_ROWS];
@@ -499,7 +516,7 @@ int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory
     int sent = 0;
     for (size_t i = 0; i < n; i++) {
         if ((uint32_t)tip < rows[i].locktime) continue;   /* the next block is > tip */
-        if (chain->is_outpoint_unspent(chain, rows[i].prev_txid_hex, rows[i].prev_vout) != 1)
+        if (client_outpoint_live(chain, rows[i].prev_txid_hex, rows[i].prev_vout) != 1)
             continue;
         char *hex = malloc(rows[i].tx_len * 2 + 1);
         if (!hex) continue;
@@ -511,6 +528,12 @@ int client_payouts_claim(persist_t *db, chain_backend_t *chain, uint32_t factory
         if (out)
             fprintf(out, "Client: end-date payout of %s:%u %s%s\n", rows[i].prev_txid_hex,
                     rows[i].prev_vout, ok ? "broadcast: " : "not accepted", ok ? txid : "");
+        if (!ok && out && cpfp_need_seen() == CPFP_NEED_COIN) {
+            fprintf(out, "Client: ALERT: the end-date payout of %s:%u needs a wallet coin "
+                    "for its fee-paying child (the output is spent by an unconfirmed "
+                    "transaction or the anchor alone cannot pay); fund this member's "
+                    "wallet\n", rows[i].prev_txid_hex, rows[i].prev_vout);
+        }
         if (ok) sent++;
     }
     persist_free_payout_rows(rows, n);
@@ -542,50 +565,49 @@ static void path_wait(FILE *out, int node, const char *why) {
 int client_path_push(const factory_t *f, uint32_t participant, chain_backend_t *chain,
                      client_dist_send_fn send, FILE *out) {
     if (!f || participant == 0 || !chain || !chain->get_block_height ||
-        !chain->get_confirmations || !chain->is_outpoint_unspent)
+        !chain->get_confirmations)
         return -1;
     int tip = chain->get_block_height(chain);
-    if (tip <= 0) return -1;
-    if (f->cltv_timeout == 0 || (uint32_t)tip < f->cltv_timeout) return 0;
+    if (tip <= 0 || f->cltv_timeout == 0) return -1;
+    int at_end = (uint32_t)tip >= f->cltv_timeout;
     size_t leaf = 0;
     uint32_t leaf_vout = 0;
     int path[64];
     size_t n = factory_client_to_leaf(f, participant - 1, &leaf, &leaf_vout)
                ? factory_collect_path_to_root(f, (int)leaf, path, 64) : 0;
     if (n == 0) return -1;
-    int parent_confs = -1;
-    {
-        char fh[65];
-        txid_hex_of(f->funding_txid, fh);
-        parent_confs = chain->get_confirmations(chain, fh);
-    }
-    for (size_t k = 0; k < n; k++) {
+    /* This member never publishes the root: with the funding output unspent
+       the distribution TX is the end-date exit. */
+    char hex[65];
+    txid_hex_of(f->nodes[path[0]].txid, hex);
+    int parent_confs = chain->get_confirmations(chain, hex);
+    if (parent_confs < 1) return 0;
+    for (size_t k = 1; k < n; k++) {
         const factory_node_t *x = &f->nodes[path[k]];
-        char hex[65];
+        const factory_node_t *par = &f->nodes[path[k - 1]];
         txid_hex_of(x->txid, hex);
         int conf = chain->get_confirmations(chain, hex);
-        /* the output of this node on the member's path */
-        uint32_t ov = (k + 1 < n) ? (uint32_t)f->nodes[path[k + 1]].parent_vout : leaf_vout;
-        if (conf >= 1) {
-            if (factory_find_payout(f, (uint32_t)path[k], ov) >= 0) {
-                path_wait(out, path[k], "is on chain; its output on this member's path has a payout");
-                return 0;
-            }
-            parent_confs = conf;
-            continue;
-        }
-        if (chain->is_in_mempool && chain->is_in_mempool(chain, hex)) {
+        if (conf >= 1) { parent_confs = conf; continue; }   /* on chain: walk on */
+        if (conf == 0 || (chain->is_in_mempool && chain->is_in_mempool(chain, hex))) {
             path_wait(out, path[k], "is in the mempool");
             return 1;
         }
-        /* the output this node spends: still there? (a payout or another
-           exit may have spent it, which settles this path) */
+        /* The output of the confirmed parent this node spends. */
         char pth[65];
-        uint32_t pv;
-        if (x->parent_index < 0) { txid_hex_of(f->funding_txid, pth); pv = f->funding_vout; }
-        else { txid_hex_of(f->nodes[x->parent_index].txid, pth); pv = x->parent_vout; }
-        if (parent_confs < 1 || chain->is_outpoint_unspent(chain, pth, pv) != 1) {
-            path_wait(out, path[k], "waits: the output it spends is not on chain or is spent");
+        txid_hex_of(par->txid, pth);
+        int live = client_outpoint_live(chain, pth, x->parent_vout);
+        if (live != 1) {
+            path_wait(out, path[k], "waits: the output it spends is spent on chain");
+            return 0;
+        }
+        /* Before the end date only the latest state under a confirmed
+           kickoff is published (an older state could otherwise confirm after
+           its longer delay).  From the end date the path goes on down to the
+           first output that has a payout; that payout is the exit. */
+        int state_under_kickoff = x->type == NODE_STATE && par->type == NODE_KICKOFF;
+        if (!at_end && !state_under_kickoff) return 0;
+        if (at_end && factory_find_payout(f, (uint32_t)path[k - 1], x->parent_vout) >= 0) {
+            path_wait(out, path[k - 1], "is on chain; its output on this member's path has a payout");
             return 0;
         }
         uint32_t ns = x->nsequence;
@@ -606,8 +628,9 @@ int client_path_push(const factory_t *f, uint32_t participant, chain_backend_t *
                       : (chain->send_raw_tx && chain->send_raw_tx(chain, txh, sent));
         free(txh);
         if (out) {
-            fprintf(out, "Client: end-date exit: path node %d %s%s\n", path[k],
-                    ok ? "broadcast " : "not accepted", ok ? sent : "");
+            fprintf(out, "Client: %s: path node %d %s%s\n",
+                    at_end ? "end-date exit" : "latest state under a confirmed kickoff",
+                    path[k], ok ? "broadcast " : "not accepted", ok ? sent : "");
             fflush(out);
         }
         return ok ? 1 : 0;

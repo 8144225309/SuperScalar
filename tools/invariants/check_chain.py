@@ -923,12 +923,9 @@ class Checker:
                 if c["revoked"]:
                     return  # the revocation check covers it
                 got = next(o[0] for o in ctx["vout"] if o[1] == c["to_remote"])
-                lsp_local = remote
-                # the funder (the LSP) funds the anchor from its to_local;
-                # only when that is too small does the member's output
+                # the funder (the LSP) funds the anchor from its to_local,
+                # never from the member's output
                 exp = local
-                if has_anchor and not lsp_local > ANCHOR_VALUE + DUST:
-                    exp = local - ANCHOR_VALUE
                 rec["to_remote"] = got
                 if got != exp:
                     self.violate("balances", "%s: the LSP's commitment %s pays the member %d, its DB "
@@ -939,6 +936,17 @@ class Checker:
         if rv:
             self._revoked_outcome(db, ctx, rv, rec)
             return
+        # the member's own end-date payout of the channel output: it pays the
+        # member the whole output less fee and anchor, at least its balance
+        for t in self._payouts(db):
+            if t["txid"] == ctx["txid"]:
+                paid = sum(o[0] for o in ctx["vout"] if o[1] != ANCHOR_SPK)
+                rec["commitment"] = {"txid": ctx["txid"], "kind": "end-date payout"}
+                rec["to_member"] = paid
+                if paid < local:
+                    self.violate("balances", "%s: its end-date payout %s pays %d, below its "
+                                 "balance %d" % (db.name, ctx["txid"], paid, local), member=db.name)
+                return
         self.violate("balances", "%s: its channel output is spent by %s, which is neither its latest "
                      "commitment nor one of the LSP's it can recognise" % (db.name, ctx["txid"]),
                      member=db.name)

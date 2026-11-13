@@ -105,6 +105,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4F: return "CHANNEL_BASEPOINTS";
     case 0x50: return "LSP_REVOKE_AND_ACK";
     case 0x9B: return "HOST_COMMITMENT_SIG";
+    case 0x9C: return "FACTORY_PAYOUTS";
     case 0x51: return "JIT_OFFER";
     case 0x60: return "PATH_NONCE_BUNDLE";
     case 0x61: return "PATH_ALL_NONCES";
@@ -784,9 +785,12 @@ cJSON *wire_build_factory_ready(const factory_t *f) {
         cJSON_AddItemToArray(arr, item);
     }
     cJSON_AddItemToObject(j, "signed_txs", arr);
-    /* #54 G1b: ship the co-signed distribution TX (offline-forever recovery net)
-       when it was fully co-signed during this creation ceremony.  The client
-       applies it -> f->dist_tx_ready=2 (client.c).  Omitted otherwise (degrade). */
+    return j;
+}
+
+cJSON *wire_build_factory_payouts(const factory_t *f) {
+    cJSON *j = cJSON_CreateObject();
+    /* The co-signed distribution TX (the funding output's end-date spend). */
     if (f->dist_tx_ready == 2 && f->dist_signed_tx.len > 0) {
         wire_json_add_hex(j, "distribution_tx_hex",
                           f->dist_signed_tx.data, f->dist_signed_tx.len);

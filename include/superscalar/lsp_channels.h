@@ -108,6 +108,11 @@ typedef struct {
     channel_t channel;          /* Poon-Dryja channel (LSP=local, client=remote) */
     uint32_t channel_id;        /* channel_id sent over wire (= client index) */
     int ready;                  /* 1 after CHANNEL_READY sent */
+    /* Nonce refresh (lsp_channels_refresh_nonces): an unanswered one is
+       retried, whatever the count, from nonce_refresh_retry_at on. */
+    int nonce_refresh_pending;
+    unsigned nonce_refresh_fails;
+    time_t nonce_refresh_retry_at;
     time_t last_message_time;   /* epoch timestamp of last wire message */
     int offline_detected;        /* 1 if declared offline */
     unsigned char close_spk[34]; /* P2TR scriptPubKey for client's close output */
@@ -946,8 +951,13 @@ int lsp_force_exit_step(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
    runs a fresh nonce exchange between updates (MSG_CHANNEL_NONCES with
    "refresh"); every update uses two of each side's nonces. */
 #define CHANNEL_NONCE_REFRESH_AT 32
+/* Seconds the LSP waits for the member's fresh nonces. */
+#define CHANNEL_NONCE_REFRESH_WAIT 5
 /* Refresh channel c's nonces when below CHANNEL_NONCE_REFRESH_AT (or always,
-   with force).  Returns 1 if the channel has enough afterwards. */
+   with force), waiting at most CHANNEL_NONCE_REFRESH_WAIT seconds.  The
+   channel's pools change only when the member answers; without an answer
+   the next attempt waits for a back-off.  Returns 1 if the channel has
+   enough afterwards. */
 int lsp_channels_refresh_nonces(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c, int force);
 
 /* Take the member's signature over the LSP's own commitment from json

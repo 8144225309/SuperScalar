@@ -80,6 +80,12 @@
    (host_commit_psig, host_commit_nonce_index).  Later commitments carry the
    same two fields in REVOKE_AND_ACK. */
 #define MSG_HOST_COMMITMENT_SIG 0x9B
+/* LSP -> every member, once every member's channel is open with the LSP's
+   commitment 0 co-signed (or right after FACTORY_READY when no channels are
+   opened): the distribution TX and the end-date payout signatures
+   (distribution_tx_hex, n_payouts, payout_sigs).  FACTORY_READY carries the
+   tree only. */
+#define MSG_FACTORY_PAYOUTS 0x9C
 
 /* Per-Leaf Advance */
 #define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
@@ -384,6 +390,8 @@ size_t wire_parse_poison_bundle(const cJSON *json,
 
 /* LSP → Client: FACTORY_READY {signed_txs: [{node_idx, tx_hex}...]} */
 cJSON *wire_build_factory_ready(const factory_t *f);
+/* MSG_FACTORY_PAYOUTS: the signed distribution TX and every payout signature. */
+cJSON *wire_build_factory_payouts(const factory_t *f);
 
 /* LSP → Client: CLOSE_PROPOSE {outputs: [{amount, spk_hex}...], current_height} */
 cJSON *wire_build_close_propose(const tx_output_t *outputs, size_t n,

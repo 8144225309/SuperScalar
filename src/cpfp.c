@@ -466,6 +466,45 @@ static uint64_t input_total(regtest_t *rt, const cpfp_tx_info_t *ti) {
     return total;
 }
 
+/* Inputs of ti that are on chain and spent only by a transaction in the
+   mempool: their total value (chain only) and the fees, in sats, of the
+   mempool transactions spending them with their descendants (what a
+   replacement must beat).  UINT64_MAX when an input is not on chain. */
+static uint64_t input_total_chain(regtest_t *rt, const cpfp_tx_info_t *ti,
+                                  uint64_t *conflict_fees) {
+    uint64_t total = 0;
+    *conflict_fees = 0;
+    for (size_t i = 0; i < ti->n_inputs; i++) {
+        unsigned char d[32];
+        memcpy(d, ti->in_txid[i], 32);
+        reverse_bytes(d, 32);
+        char hex[65], params[200];
+        hex_encode(d, 32, hex);
+        snprintf(params, sizeof(params), "\"%s\" %u false", hex, ti->in_vout[i]);
+        cJSON *j = rpc_json(rt, "gettxout", params, 0);
+        cJSON *val = j ? cJSON_GetObjectItem(j, "value") : NULL;
+        if (!val || !cJSON_IsNumber(val)) { cJSON_Delete(j); return UINT64_MAX; }
+        total += btc_to_sat(val->valuedouble);
+        cJSON_Delete(j);
+        snprintf(params, sizeof(params), "[{\"txid\":\"%s\",\"vout\":%u}]", hex,
+                 ti->in_vout[i]);
+        cJSON *sp = rpc_json(rt, "gettxspendingprevout", params, 0);
+        cJSON *e0 = (sp && cJSON_IsArray(sp)) ? cJSON_GetArrayItem(sp, 0) : NULL;
+        cJSON *st = e0 ? cJSON_GetObjectItem(e0, "spendingtxid") : NULL;
+        if (st && cJSON_IsString(st)) {
+            char ep[96];
+            snprintf(ep, sizeof(ep), "\"%s\"", st->valuestring);
+            cJSON *me = rpc_json(rt, "getmempoolentry", ep, 1);
+            cJSON *fees = me ? cJSON_GetObjectItem(me, "fees") : NULL;
+            cJSON *desc = fees ? cJSON_GetObjectItem(fees, "descendant") : NULL;
+            if (desc && cJSON_IsNumber(desc)) *conflict_fees += btc_to_sat(desc->valuedouble);
+            cJSON_Delete(me);
+        }
+        cJSON_Delete(sp);
+    }
+    return total;
+}
+
 /* getmempoolentry of txid (display hex); NULL when it is not in the mempool. */
 static cJSON *mempool_entry(regtest_t *rt, const char *txid_hex) {
     char params[80];
@@ -738,14 +777,38 @@ cpfp_result_t cpfp_send_presigned(regtest_t *rt, wallet_source_t *wallet,
     }
 
     uint64_t in = input_total(rt, &ti);
+    uint64_t conflict_fees = 0;
+    int replacing = 0;
+    if (in == UINT64_MAX) {
+        /* Not spendable in the mempool view: an input may be on chain and
+           spent only by an unconfirmed transaction.  A transaction with an
+           anchor then goes as a package whose child pays enough to replace
+           that spend. */
+        uint64_t cin = ti.anchor_vout >= 0 ? input_total_chain(rt, &ti, &conflict_fees)
+                                           : UINT64_MAX;
+        if (cin != UINT64_MAX && cin >= ti.out_total && conflict_fees > 0) {
+            in = cin;
+            replacing = 1;
+        }
+    }
     if (in == UINT64_MAX || in < ti.out_total) {
         /* Inputs not available: not yet valid, already confirmed or
            conflicted.  Let the node say which. */
         return send_alone(rt, tx_hex, 0, 0);
     }
     uint64_t parent_fee = in - ti.out_total;
+    if (replacing) {
+        /* The package must pay more than the transactions it replaces plus
+           the incremental relay fee for its own size: a package rate of the
+           conflicting fees over the parent's size, plus 1 sat/vB, does. */
+        uint64_t r = conflict_fees * 1000 / (ti.vsize ? ti.vsize : 1) + 1000;
+        if (r > need) need = r;
+        printf("CPFP: %s replaces an unconfirmed spend of its input (%llu sat in "
+               "fees): package rate %llu sat/kvB\n", ti.txid_hex,
+               (unsigned long long)conflict_fees, (unsigned long long)need);
+    }
     int pays_enough = parent_fee >= fee_at_rate(need, ti.vsize);
-    if (pays_enough || ti.anchor_vout < 0) {
+    if (!replacing && (pays_enough || ti.anchor_vout < 0)) {
         cpfp_result_t r = send_alone(rt, tx_hex, ti.anchor_vout >= 0, 0);
         if (r != CPFP_FAILED || ti.anchor_vout < 0) return r;
         /* Refused despite the fee check (policy we did not model):

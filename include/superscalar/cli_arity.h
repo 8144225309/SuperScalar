@@ -115,7 +115,8 @@ int cli_validate_factory_cltv(uint32_t cltv_timeout, uint32_t created,
 /* The same floor as a member checks a proposal (creation or rotation),
    which does not carry the lifetime: cltv_timeout must be later than
    tip + exit_blocks + CLI_FACTORY_CLTV_MARGIN, exit_blocks computed by the
-   member from the proposal's shape.  tip == 0 (unknown) passes. */
+   member from the proposal's shape.  tip == 0 (unknown) is refused: the
+   end date cannot be checked. */
 int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
                                uint32_t exit_blocks,
                                char *err_buf, size_t err_buf_len);

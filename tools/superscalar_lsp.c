@@ -5019,6 +5019,16 @@ accept_new_factory:
     uint64_t close_fee = (close_est_vbytes * fee_rate) / 1000;
     if (close_fee < 500) close_fee = 500;
 
+    /* No channels were opened: nothing waits for a co-signed LSP commitment,
+       so the distribution TX and the payouts go out now. */
+    if (!channels_active && !lsp_send_factory_payouts(lsp_p)) {
+        fprintf(stderr, "LSP: could not send the distribution TX and payouts\n");
+        lsp_cleanup(lsp_p);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+
     if (channels_active) {
         /* Pass NULL for close_spk so client outputs use per-client P2TR
            addresses derived from their factory pubkeys. LSP output uses

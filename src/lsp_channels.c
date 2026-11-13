@@ -685,36 +685,63 @@ static size_t channel_nonces_left(const channel_t *ch) {
 
 int lsp_channels_refresh_nonces(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c, int force) {
     if (!mgr || !lsp || c >= mgr->n_channels || lsp->client_fds[c] < 0) return 0;
-    channel_t *ch = &mgr->entries[c].channel;
-    if (!force && channel_nonces_left(ch) >= CHANNEL_NONCE_REFRESH_AT) return 1;
-    if (!channel_init_nonce_pool(ch, MUSIG_NONCE_POOL_MAX)) return 0;
-    size_t n = ch->local_nonce_pool.count;
-    unsigned char (*pn)[66] = calloc(n ? n : 1, 66);
-    if (!pn) return 0;
-    for (size_t i = 0; i < n; i++)
-        musig_pubnonce_serialize(mgr->ctx, pn[i], &ch->local_nonce_pool.nonces[i].pubnonce);
-    cJSON *m = wire_build_channel_nonces(mgr->entries[c].channel_id,
-                                         (const unsigned char (*)[66])pn, n);
-    free(pn);
-    cJSON_AddBoolToObject(m, "refresh", 1);
-    int ok = wire_send(lsp->client_fds[c], MSG_CHANNEL_NONCES, m);
+    lsp_channel_entry_t *e = &mgr->entries[c];
+    channel_t *ch = &e->channel;
+    if (!force && !e->nonce_refresh_pending &&
+        channel_nonces_left(ch) >= CHANNEL_NONCE_REFRESH_AT)
+        return 1;
+    time_t now = time(NULL);
+    if (!force && e->nonce_refresh_retry_at > now) return 0;
+    /* A fresh pool of our own, kept aside: the channel's pools are replaced
+       only once the member has answered with its fresh nonces. */
+    musig_nonce_pool_t *fresh = calloc(1, sizeof(*fresh));
+    unsigned char (*pn)[66] = calloc(MUSIG_NONCE_POOL_MAX, 66);
+    unsigned char (*rpn)[66] = calloc(MUSIG_NONCE_POOL_MAX, 66);
+    unsigned char seckey[32];
+    secp256k1_pubkey pk;
+    memcpy(seckey, ch->local_funding_secret, 32);
+    int ok = fresh && pn && rpn && secp256k1_ec_pubkey_create(ch->ctx, &pk, seckey) &&
+             musig_nonce_pool_generate(ch->ctx, fresh, MUSIG_NONCE_POOL_MAX, seckey, &pk,
+                                       &ch->funding_keyagg.cache);
+    secure_zero(seckey, 32);
+    size_t n = ok ? fresh->count : 0;
+    for (size_t i = 0; ok && i < n; i++)
+        musig_pubnonce_serialize(mgr->ctx, pn[i], &fresh->nonces[i].pubnonce);
+    cJSON *m = ok ? wire_build_channel_nonces(e->channel_id, (const unsigned char (*)[66])pn, n)
+                  : NULL;
+    if (m) cJSON_AddBoolToObject(m, "refresh", 1);
+    ok = m && wire_send(lsp->client_fds[c], MSG_CHANNEL_NONCES, m);
     cJSON_Delete(m);
     wire_msg_t r;
     memset(&r, 0, sizeof(r));
     ok = ok && recv_expected_drain_stray(mgr, lsp, lsp->client_fds[c], &r,
-                                         MSG_CHANNEL_NONCES, 30, c);
+                                         MSG_CHANNEL_NONCES, CHANNEL_NONCE_REFRESH_WAIT, c);
     uint32_t rid = 0;
     size_t rn = 0;
-    unsigned char (*rpn)[66] = ok ? calloc(MUSIG_NONCE_POOL_MAX, 66) : NULL;
-    ok = ok && rpn && r.json &&
+    ok = ok && r.json &&
          wire_parse_channel_nonces(r.json, &rid, rpn, MUSIG_NONCE_POOL_MAX, &rn) && rn > 0;
-    if (ok) channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])rpn, rn);
-    free(rpn);
     if (r.json) cJSON_Delete(r.json);
-    if (!ok)
-        fprintf(stderr, "LSP: nonce refresh with client %zu failed\n", c);
-    else
+    if (ok) {
+        memcpy(&ch->local_nonce_pool, fresh, sizeof(*fresh));
+        channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])rpn, rn);
+        e->nonce_refresh_pending = 0;
+        e->nonce_refresh_fails = 0;
+        e->nonce_refresh_retry_at = 0;
         printf("LSP: fresh signing nonces for channel %zu (%zu each side)\n", c, rn);
+    } else {
+        /* The member may have taken a fresh pool without its answer reaching
+           us: the next attempt is made whatever the count, after a back-off
+           that doubles up to an hour. */
+        e->nonce_refresh_pending = 1;
+        unsigned f = e->nonce_refresh_fails < 7 ? e->nonce_refresh_fails : 7;
+        e->nonce_refresh_fails++;
+        e->nonce_refresh_retry_at = now + (time_t)(30u << f > 3600u ? 3600u : 30u << f);
+        fprintf(stderr, "LSP: nonce refresh with client %zu got no answer; next try in "
+                "%lld s\n", c, (long long)(e->nonce_refresh_retry_at - now));
+    }
+    if (fresh) { secure_zero(fresh, sizeof(*fresh)); free(fresh); }
+    free(pn);
+    free(rpn);
     return ok;
 }
 
@@ -1302,11 +1329,15 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                            mgr->entries[c].channel.has_latest_commitment_sig;
                 if (hs.json) cJSON_Delete(hs.json);
                 if (!took) {
-                    /* Only this channel fails: it takes no update, and the
-                       other members' channels open. */
-                    mgr->entries[c].channel.host_commit_refused = 1;
+                    /* Without it the LSP could not close this channel before
+                       the end date: the distribution TX and the payouts are
+                       not released and the factory is not opened. */
                     fprintf(stderr, "LSP: client %zu did not sign the LSP's commitment 0 "
-                            "-- its channel takes no update\n", c);
+                            "-- the factory is not opened; no distribution TX or "
+                            "payout is released\n", c);
+                    free(nonce_fds); free(nonce_ready);
+                    lsp_abort_ceremony(lsp, "a member did not co-sign the LSP's commitment 0");
+                    return 0;
                 }
             }
 
@@ -1318,7 +1349,10 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     free(nonce_fds);
     free(nonce_ready);
 
-    return 1;
+    /* Every member co-signed the LSP's commitment 0: the LSP can close any
+       channel by itself before the end date, so the distribution TX and the
+       end-date payouts go out now. */
+    return lsp_send_factory_payouts(lsp);
 }
 
 /* --- CLTV validation --- */

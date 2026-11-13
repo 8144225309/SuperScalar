@@ -2090,6 +2090,12 @@
             lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }
+        /* No channels are opened in this test: the payouts go out now. */
+        if (!lsp_send_factory_payouts(lsp_p)) {
+            tx_buf_free(&old_dist_tx);
+            lsp_cleanup(lsp_p); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
 
         factory_set_lifecycle(&lsp_p->factory, (uint32_t)cur_h2,
                               active_blocks, dying_blocks);

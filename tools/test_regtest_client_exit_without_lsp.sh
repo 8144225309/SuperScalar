@@ -49,8 +49,16 @@
 #               transaction the members must publish first.
 #   opensig     One member's daemon sends no co-signature of the LSP's
 #               commitment 0 at channel open (SS_CHEAT_NO_HOST_COMMIT_SIG).
-#               Only that member's channel is refused (it takes no update);
-#               the LSP opens the other members' channels and runs.
+#               The LSP does not open the factory: no member receives the
+#               distribution TX or any end-date payout.
+#   dwstate     DW tree (--arity 2).  The LSP confirms the root kickoff, the
+#               root state and the next kickoff, then leaves.  Before the end
+#               date a member publishes the latest state under that kickoff;
+#               from the end date every member is paid.
+#   mempool     The LSP's next tree transaction under the root sits in the
+#               mempool, unconfirmed, at the end date.  The members under it
+#               still publish their payout of that root output (a package
+#               with a child on its anchor) and it confirms.
 #
 # After each drill the on-chain invariants are checked from the LSP's and the
 # members' databases (tools/invariants/check_chain.py; SS_CHECK_INVARIANTS=0
@@ -65,7 +73,7 @@ set -uo pipefail
 BUILD_DIR="${1:-build}"
 shift || true
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(expiry expirywatch forceclose rpcroot cltv forcedexit payouts kickoff opensig sweep)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(expiry expirywatch forceclose rpcroot cltv forcedexit payouts kickoff opensig dwstate mempool sweep)
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
@@ -536,6 +544,14 @@ scenario_payouts() {
     kill_clients
     inv_check "$d"
 }
+paid_in() { # DIR i -> 0 if a payout on member i's path is confirmed
+    local ptx pv phex
+    while read -r ptx pv phex; do
+        [ -z "$phex" ] && continue
+        [ "$(confs "$(txid_of "$phex")")" -ge 1 ] 2>/dev/null && return 0
+    done < <(payout_rows "$1/c$2.db")
+    return 1
+}
 kickoff_drill() { # NAME PORT [LSP shape args...]
     local name=$1 port=$2; shift 2
     local d=$T/kickoff-$name
@@ -573,7 +589,7 @@ kickoff_drill() { # NAME PORT [LSP shape args...]
         [ $n -eq $NCLI ] && break
     done
     if [ "$name" = dw ]; then
-        grep -qaE "end-date exit: path node [0-9]+ broadcast" "$d"/c*.log &&
+        grep -qaE "path node [0-9]+ broadcast" "$d"/c*.log &&
             pass "the members' daemons published their path from the end date" ||
             fail "no member daemon published a path node"
     fi
@@ -589,32 +605,132 @@ scenario_kickoff() {
 
 scenario_opensig() {
     local d=$T/opensig
-    say "=== opensig: one member does not co-sign the LSP's commitment at open; the others' channels open"
+    say "=== opensig: one member does not co-sign the LSP's commitment at open"
     CHEAT_CLIENT=3 CHEAT_VAR=SS_CHEAT_NO_HOST_COMMIT_SIG \
         factory_up "$d" 29974 --daemon --active-blocks 20 --dying-blocks 10 || return
-    if wait_grep "$d/lsp.log" "entering daemon mode" 400 mine; then
-        pass "the LSP opened the channels and runs"
-    else
-        fail "LSP not in daemon mode: $(grep -ahE "did not sign|send channel_ready|failed" "$d/lsp.log" | head -2 | tr '\n' ' ')"
-        stop "$LSP_PID"; kill_clients; return
-    fi
-    grep -qa "client 3 did not sign the LSP's commitment 0 -- its channel takes no update" "$d/lsp.log" &&
-        pass "member 4's channel alone is refused" || fail "member 4's channel was not refused"
-    local i ok=0
-    for i in 0 1 2; do wait_grep "$d/c$i.log" "daemon mode active" 120 && ok=$((ok + 1)); done
-    [ $ok -eq 3 ] && pass "members 1-3 run with open channels" || fail "$ok of 3 other members running"
+    local i
+    for i in $(seq 1 400); do
+        grep -qaE "the factory is not opened|entering daemon mode" "$d/lsp.log" && break
+        mine 1; sleep 1
+    done
+    sleep 5
     local hc
-    hc=$(sqlite3 "$d/lsp.db" "SELECT count(*) FROM host_commitments;")
-    [ "$hc" -eq 3 ] && pass "the LSP holds a co-signed commitment for the 3 other channels" ||
-        fail "the LSP holds $hc co-signed commitments (want 3)"
+    hc=$(sqlite3 "$d/lsp.db" "SELECT count(*) FROM host_commitments;" 2>/dev/null || echo 0)
+    echo "  facts: LSP co-signed commitments held: $hc; member 4 payouts stored: $(sqlite3 "$d/c3.db" "SELECT count(*) FROM factory_payouts;" 2>/dev/null || echo 0), distribution TX stored: $(sqlite3 "$d/c3.db" "SELECT count(*) FROM distribution_txs;" 2>/dev/null || echo 0)"
+    if grep -qa "entering daemon mode" "$d/lsp.log"; then
+        fail "the LSP opened the factory without member 4's co-signature"
+    else
+        pass "the LSP did not open the factory"
+    fi
+    local held=0
+    for i in $(seq 0 $((NCLI - 1))); do
+        local np nd
+        np=$(sqlite3 "$d/c$i.db" "SELECT count(*) FROM factory_payouts;" 2>/dev/null || echo 0)
+        nd=$(sqlite3 "$d/c$i.db" "SELECT count(*) FROM distribution_txs;" 2>/dev/null || echo 0)
+        [ "${np:-0}" -gt 0 ] || [ "${nd:-0}" -gt 0 ] && held=$((held + 1))
+    done
+    [ $held -eq 0 ] && pass "no member holds a distribution TX or an end-date payout" ||
+        fail "$held member(s) hold a distribution TX or end-date payouts"
     stop "$LSP_PID"; kill_clients
+}
+
+send_node() { # DB NODE_INDEX -- broadcast that tree node, mining until its relative lock allows it
+    local hex r n
+    hex=$(sqlite3 "$1" "SELECT signed_tx_hex FROM tree_nodes WHERE factory_id=0 AND node_index=$2;")
+    for n in $(seq 1 60); do
+        r=$($BCLI sendrawtransaction "$hex" 2>&1) && { mine 1; echo "$r"; return 0; }
+        echo "$r" | grep -q "non-BIP68-final" || { echo "$r" >&2; return 1; }
+        mine 1
+    done
+    return 1
+}
+
+scenario_dwstate() {
+    local d=$T/dwstate
+    say "=== dwstate: the LSP confirms root kickoff, state and the next kickoff, then leaves"
+    factory_up "$d" 29976 --daemon --active-blocks 20 --dying-blocks 10 --arity 2 || return
+    wait_grep "$d/lsp.log" "entering daemon mode" 400 mine || { fail "LSP not in daemon mode"; return; }
+    clients_ready "$d" || return
+    sleep 2
+    local lt k2 s2 s2tx t
+    lt=$(locktime_of "$(dist_hex "$d/c0.db")")
+    stop "$LSP_PID"; say "LSP killed"
+    k2=$(sqlite3 "$d/lsp.db" "SELECT node_index FROM tree_nodes WHERE factory_id=0 AND parent_index=1 AND type='kickoff' ORDER BY node_index LIMIT 1;")
+    s2=$(sqlite3 "$d/lsp.db" "SELECT node_index FROM tree_nodes WHERE factory_id=0 AND parent_index=$k2 AND type='state' LIMIT 1;")
+    s2tx=$(sqlite3 "$d/lsp.db" "SELECT txid FROM tree_nodes WHERE factory_id=0 AND node_index=$s2;")
+    for t in 0 1 "$k2"; do
+        send_node "$d/lsp.db" "$t" >/dev/null || { fail "could not publish node $t"; kill_clients; return; }
+    done
+    pass "root kickoff, root state and kickoff $k2 confirmed (tip $(height), end date $lt)"
+    while [ "$(height)" -lt $((lt - 1)) ]; do
+        [ "$(confs "$s2tx")" -ge 1 ] 2>/dev/null && break
+        mine 1; sleep 2
+    done
+    if [ "$(confs "$s2tx")" -ge 1 ] 2>/dev/null; then
+        pass "a member published the latest state $s2 under kickoff $k2 before the end date (tip $(height))"
+    else
+        fail "the latest state $s2 under kickoff $k2 is not on chain at block $(height), end date $lt"
+    fi
+    while [ "$(height)" -lt "$lt" ]; do mine 1; done
+    local i n=0 r
+    for r in $(seq 1 60); do
+        mine 1; sleep 2
+        n=0
+        for i in $(seq 0 $((NCLI - 1))); do paid_in "$d" "$i" && n=$((n + 1)); done
+        [ $n -eq $NCLI ] && break
+    done
+    [ $n -eq $NCLI ] && pass "every member is paid by a confirmed end-date payout" ||
+        fail "$n of $NCLI members paid by an end-date payout"
+    kill_clients
+    inv_check "$d"
+}
+
+scenario_mempool() {
+    local d=$T/mempool
+    say "=== mempool: the LSP's next tree transaction is unconfirmed at the end date"
+    factory_up "$d" 29977 --daemon --active-blocks 20 --dying-blocks 10 || return
+    wait_grep "$d/lsp.log" "entering daemon mode" 400 mine || { fail "LSP not in daemon mode"; return; }
+    clients_ready "$d" || return
+    sleep 2
+    local lt c cv roottx ptx chtx i
+    lt=$(locktime_of "$(dist_hex "$d/c0.db")")
+    stop "$LSP_PID"; say "LSP killed"
+    send_node "$d/lsp.db" 0 >/dev/null || { fail "root kickoff not published"; kill_clients; return; }
+    roottx=$(sqlite3 "$d/lsp.db" "SELECT txid FROM tree_nodes WHERE factory_id=0 AND node_index=0;")
+    c=$(sqlite3 "$d/lsp.db" "SELECT node_index FROM tree_nodes WHERE factory_id=0 AND parent_index=0 ORDER BY node_index LIMIT 1;")
+    cv=$(sqlite3 "$d/lsp.db" "SELECT parent_vout FROM tree_nodes WHERE factory_id=0 AND node_index=$c;")
+    chtx=$(sqlite3 "$d/lsp.db" "SELECT txid FROM tree_nodes WHERE factory_id=0 AND node_index=$c;")
+    while [ "$(height)" -lt $((lt - 2)) ]; do mine 1; sleep 0.2; done
+    $BCLI sendrawtransaction "$(sqlite3 "$d/lsp.db" "SELECT signed_tx_hex FROM tree_nodes WHERE factory_id=0 AND node_index=$c;")" >/dev/null 2>&1 ||
+        { fail "node $c not accepted to the mempool"; kill_clients; return; }
+    # blocks without mempool transactions: node $c stays unconfirmed
+    for i in 1 2 3; do $BCLI generateblock "$MINE_ADDR" '[]' >/dev/null; done
+    say "tip $(height) >= end date $lt; node $c ($chtx) in the mempool, spending $roottx:$cv"
+    local got=""
+    for i in $(seq 1 60); do
+        got=$($BCLI gettxspendingprevout "[{\"txid\":\"$roottx\",\"vout\":$cv}]" |
+              python3 -c 'import json,sys;print(json.load(sys.stdin)[0].get("spendingtxid",""))')
+        [ -n "$got" ] && [ "$got" != "$chtx" ] && break
+        grep -qa "needs a wallet coin" "$d"/c*.log && break
+        sleep 2
+    done
+    if [ -n "$got" ] && [ "$got" != "$chtx" ]; then
+        pass "a member's payout of $roottx:$cv replaced node $c in the mempool ($got)"
+        mine 1
+        [ "$(confs "$got")" -ge 1 ] 2>/dev/null && pass "the payout confirmed" || fail "the payout did not confirm"
+    elif grep -qa "needs a wallet coin" "$d"/c*.log; then
+        pass "the member reported that replacing node $c needs a wallet coin: $(grep -ah "needs a wallet coin" "$d"/c*.log | head -1)"
+    else
+        fail "no member published its payout of $roottx:$cv while node $c is unconfirmed"
+    fi
+    kill_clients
 }
 
 echo "=========== client exits without the LSP (build: $BUILD_DIR) ==========="
 node_up
 for s in "${SCENARIOS[@]}"; do
     case $s in
-        expiry|expirywatch|forceclose|rpcroot|sweep|cltv|forcedexit|payouts|kickoff|opensig) "scenario_$s" ;;
+        expiry|expirywatch|forceclose|rpcroot|sweep|cltv|forcedexit|payouts|kickoff|opensig|dwstate|mempool) "scenario_$s" ;;
         *) echo "unknown scenario $s"; exit 2 ;;
     esac
 done

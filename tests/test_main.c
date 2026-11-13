@@ -1,3 +1,5 @@
+#include "superscalar/client.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1059,6 +1061,9 @@ extern int test_end_date_revocation_wait_survives_restart(void);
 extern int test_end_date_refuses_missing_end_date(void);
 extern int test_end_date_anchor_from_funder_only(void);
 extern int test_end_date_nonce_refresh(void);
+extern int test_end_date_claim_ignores_unconfirmed_spend(void);
+extern int test_end_date_nonce_refresh_unanswered(void);
+extern int test_end_date_revocation_needs_storage(void);
 extern int test_regtest_end_date_no_tree(void);
 extern int test_regtest_end_date_host_forced_exit(void);
 
@@ -3275,6 +3280,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_end_date_refuses_missing_end_date);
     RUN_TEST(test_end_date_anchor_from_funder_only);
     RUN_TEST(test_end_date_nonce_refresh);
+    RUN_TEST(test_end_date_claim_ignores_unconfirmed_spend);
+    RUN_TEST(test_end_date_nonce_refresh_unanswered);
+    RUN_TEST(test_end_date_revocation_needs_storage);
 
     printf("\n=== Shachain (Factory) ===\n");
     RUN_TEST(test_shachain_generation);
@@ -4647,12 +4655,20 @@ static void run_regtest_tests(void) {
     regtest_faucet_health_report();
 }
 
+/* In-process members judge a proposed end date by a chain tip; the
+   chainless harnesses give them block 1 (an end date past the exit). */
+static uint32_t test_chain_tip_default(void *ctx) { (void)ctx; return 1; }
+void test_restore_chain_tip(void) {
+    client_set_chain_tip_source(test_chain_tip_default, NULL);
+}
+
 int main(int argc, char *argv[]) {
     int run_unit = 0, run_regtest = 0;
 
     /* In-process ceremonies have no chain to look a funding output up in. */
     client_set_allow_unverified_funding(1);
     client_set_allow_rotation(1);
+    test_restore_chain_tip();
 
     if (argc < 2)
         run_unit = 1;

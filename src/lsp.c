@@ -1469,6 +1469,29 @@ fail_pre:
     return 0;
 }
 
+int lsp_send_factory_payouts(lsp_t *lsp) {
+    if (!lsp) return 0;
+    const factory_t *f = &lsp->factory;
+    if (f->dist_tx_ready != 2 || f->dist_signed_tx.len == 0 ||
+        (f->n_payouts > 0 && !factory_payouts_all_signed(f, 0))) {
+        fprintf(stderr, "LSP: no complete distribution TX and payouts to send\n");
+        return 0;
+    }
+    cJSON *m = wire_build_factory_payouts(f);
+    if (!m) return 0;
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        if (!wire_send(lsp->client_fds[i], MSG_FACTORY_PAYOUTS, m)) {
+            fprintf(stderr, "LSP: send FACTORY_PAYOUTS to client %zu failed\n", i);
+            cJSON_Delete(m);
+            return 0;
+        }
+    }
+    cJSON_Delete(m);
+    printf("LSP: distribution TX and %zu end-date payouts sent to every member\n",
+           f->n_payouts);
+    return 1;
+}
+
 int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_txid, uint32_t funding_vout,
                               uint64_t funding_amount,

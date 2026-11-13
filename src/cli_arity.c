@@ -237,7 +237,12 @@ int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
             "end-date payouts");
         return 0;
     }
-    if (tip == 0) return 1;
+    if (tip == 0) {
+        cli_set_err(err_buf, err_buf_len,
+            "the chain tip is not known, so the factory CLTV timeout %u cannot be "
+            "checked against this member's exit", (unsigned)cltv_timeout);
+        return 0;
+    }
     uint64_t need = (uint64_t)tip + exit_blocks + CLI_FACTORY_CLTV_MARGIN;
     if ((uint64_t)cltv_timeout > need) return 1;
     cli_set_err(err_buf, err_buf_len,

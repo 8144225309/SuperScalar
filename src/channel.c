@@ -623,18 +623,21 @@ int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
         return 0;
     }
     if (!channel_ensure_revocations_cap(ch, (size_t)(commitment_num + 1))) return 0;
+
+    /* Written through to disk first when a persistence target is attached:
+       a standalone watchtower hydrates a channel from the DB, and a member
+       restored after a restart checks the LSP's revocations from it.  A
+       revocation that cannot be stored is refused, so the caller fails the
+       update rather than hold it in memory only. */
+    if (ch->persist_db &&
+        !persist_save_revocation((persist_t *)ch->persist_db, ch->persist_channel_id,
+                                 commitment_num, secret32)) {
+        fprintf(stderr, "channel: could not store the revocation of commitment %llu "
+                "-- refusing it\n", (unsigned long long)commitment_num);
+        return 0;
+    }
     memcpy(ch->received_revocations[commitment_num], secret32, 32);
     ch->received_revocation_valid[commitment_num] = 1;
-
-    /* Write through to disk if a persistence target is attached.  This lets
-       a standalone watchtower process hydrate a channel_t from the DB and
-       build penalty TXes after a breach.  Failure is non-fatal: the in-memory
-       state is still updated, which keeps the embedded watchtower working. */
-    if (ch->persist_db) {
-        (void)persist_save_revocation((persist_t *)ch->persist_db,
-                                       ch->persist_channel_id,
-                                       commitment_num, secret32);
-    }
     return 1;
 }
 

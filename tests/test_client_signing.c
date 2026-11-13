@@ -7,6 +7,7 @@
  * dishonest proposals.
  */
 #include "superscalar/factory.h"
+void test_restore_chain_tip(void);   /* test_main.c */
 #include "superscalar/wire.h"
 #include "superscalar/lsp.h"
 #include "superscalar/lsp_channels.h"
@@ -959,6 +960,8 @@ static int test_client_close_after_reconnect_with_htlc_in_flight_body(void) {
 static int test_client_close_locktime_bound_body(void) {
     const uint32_t tip = 800000;
     const uint32_t margin = CLIENT_CLOSE_LOCKTIME_MARGIN;
+    /* the tip comes from each case: no default source behind it */
+    client_set_chain_tip_source(NULL, NULL);
 
     TEST_ASSERT(client_close_locktime_acceptable(0, 0), "no lock, no tip");
     TEST_ASSERT(client_close_locktime_acceptable(0, tip), "no lock");
@@ -1039,6 +1042,7 @@ static int test_client_close_locktime_bound_body(void) {
     factory_free(f);
     free(f);
     secp256k1_context_destroy(ctx);
+    test_restore_chain_tip();
     return 1;
 }
 
@@ -1139,7 +1143,7 @@ static int test_client_close_tip_retry_body(void) {
                     "nothing recorded");
     }
 
-    client_set_chain_tip_source(NULL, NULL);
+    test_restore_chain_tip();
     client_set_chain_tip_retry(CLIENT_CHAIN_TIP_ATTEMPTS,
                                CLIENT_CHAIN_TIP_RETRY_MS);
     persist_close(&db);
@@ -1986,6 +1990,7 @@ static int cs_run_inprocess_creation(int *creation_rc_out, int *dist_signed_out)
     if (setup_ok) {
         *creation_rc_out = lsp_run_factory_creation(lsp, fund_txid, 0, CS_FUNDING,
                                                     fund_spk, 34, 10, 4, 2000000);
+        if (*creation_rc_out == 1 && !lsp_send_factory_payouts(lsp)) *creation_rc_out = 0;
         *dist_signed_out = lsp->factory.dist_tx_ready == 2 &&
                            lsp->factory.dist_signed_tx.len > 0;
     }

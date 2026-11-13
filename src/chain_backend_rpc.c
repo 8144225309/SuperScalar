@@ -286,6 +286,29 @@ static int cb_rpc_is_outpoint_unspent(chain_backend_t *self,
     return unspent;
 }
 
+/* Chain-only view (mempool ignored): 1 if txid is confirmed and txid:vout is
+   spent by a confirmed transaction, 0 if unspent on chain or txid is not
+   confirmed, -1 if unknown. */
+static int cb_rpc_is_outpoint_spent_confirmed(chain_backend_t *self,
+                                              const char *txid_hex_display,
+                                              uint32_t vout)
+{
+    if (!self->get_confirmations) return -1;
+    int c = self->get_confirmations(self, txid_hex_display);
+    if (c < 0) return -1;
+    if (c == 0) return 0;
+    chain_backend_rpc_ctx_t *rpc = (chain_backend_rpc_ctx_t *)self->ctx;
+    cJSON *params = cJSON_CreateArray();
+    cJSON_AddItemToArray(params, cJSON_CreateString(txid_hex_display));
+    cJSON_AddItemToArray(params, cJSON_CreateNumber((double)vout));
+    cJSON_AddItemToArray(params, cJSON_CreateBool(0));  /* chain only */
+    cJSON *result = rpc_call(rpc, "gettxout", params);
+    if (!result) return -1;
+    int spent = cJSON_IsNull(result);
+    cJSON_Delete(result);
+    return spent;
+}
+
 static int cb_rpc_register_script(chain_backend_t *self,
                                     const unsigned char *spk, size_t spk_len)
 {
@@ -337,6 +360,7 @@ int chain_backend_rpc_init(chain_backend_t *backend,
     backend->is_in_mempool           = cb_rpc_is_in_mempool;
     backend->send_raw_tx             = cb_rpc_send_raw_tx;
     backend->is_outpoint_unspent     = cb_rpc_is_outpoint_unspent;
+    backend->is_outpoint_spent_confirmed = cb_rpc_is_outpoint_spent_confirmed;
     backend->register_script         = cb_rpc_register_script;
     backend->unregister_script       = cb_rpc_unregister_script;
     backend->ctx                     = rpc;

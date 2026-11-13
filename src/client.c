@@ -65,17 +65,13 @@ uint32_t client_chain_tip(void) {
 }
 
 /* The proposed end date must be past this member's exit from the proposed
-   tree, judged by the member's own chain tip.  A member with a chain view
-   that cannot read its tip refuses: the end date cannot be checked. */
+   tree, judged by the member's own chain tip.  A member that cannot read a
+   tip (none set with client_set_chain_tip_source, or the backend fails)
+   refuses: the end date cannot be checked. */
 static int client_check_proposed_cltv(uint32_t cltv_timeout, uint32_t exit_blocks,
                                       char *err, size_t err_len) {
-    uint32_t tip = client_chain_tip();
-    if (g_client_chain_tip_fn && tip == 0) {
-        snprintf(err, err_len, "the chain tip is not known, so the factory CLTV "
-                 "timeout %u cannot be checked", (unsigned)cltv_timeout);
-        return 0;
-    }
-    return cli_validate_proposed_cltv(cltv_timeout, tip, exit_blocks, err, err_len);
+    return cli_validate_proposed_cltv(cltv_timeout, client_chain_tip(), exit_blocks,
+                                      err, err_len);
 }
 
 static unsigned g_client_chain_tip_attempts = CLIENT_CHAIN_TIP_ATTEMPTS;
@@ -2281,6 +2277,14 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
         return -1;
     }
 
+    return count;
+}
+
+/* MSG_FACTORY_PAYOUTS: the end-date payouts on this member's path and the
+   distribution TX, each checked against the member's own build.  Returns 1,
+   or -1 to refuse the factory. */
+int client_apply_factory_payouts(factory_t *f, const cJSON *json, uint32_t my_index) {
+    if (!f || !json) return -1;
     /* End-date payouts: every payout on this member's path must carry a
        signature valid for the payout this member built itself.  Without them
        the member has no claim at the end date on an output that is on chain,
@@ -2294,7 +2298,7 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
         for (size_t pi = 0; pi < f->n_payouts; pi++) {
             if (!factory_payout_on_path(f, pi, my_index)) continue;
             if (!got || !factory_payout_attach_sig(f, pi, sigs + pi * 64)) {
-                fprintf(stderr, "Client: FACTORY_READY lacks a valid end-date payout for "
+                fprintf(stderr, "Client: FACTORY_PAYOUTS lacks a valid end-date payout for "
                         "output %u:%u on this member's path -- REFUSING factory\n",
                         f->payouts[pi].node_idx, f->payouts[pi].vout);
                 free(sigs);
@@ -2311,13 +2315,17 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
         printf("Client: verified %zu end-date payouts on this member's path\n", mine);
     }
 
-    /* Signed distribution TX, if present.  It is the client's exit when the
-       factory expires, so it is stored only after it has been checked against
-       the client's own construction of that transaction; one that fails the
-       check, or that cannot be checked because the client built none,
-       refuses the factory. */
+    /* The signed distribution TX.  It is the member's exit at the end date
+       while nothing of the tree is on chain, so it is required, and stored
+       only after it has been checked against the member's own construction
+       of that transaction. */
     cJSON *dist_hex_j = cJSON_GetObjectItem(json, "distribution_tx_hex");
-    if (dist_hex_j && cJSON_IsString(dist_hex_j)) {
+    if (!dist_hex_j || !cJSON_IsString(dist_hex_j)) {
+        fprintf(stderr, "Client: FACTORY_PAYOUTS without a distribution TX -- "
+                "REFUSING factory\n");
+        return -1;
+    }
+    {
         const char *dhex = dist_hex_j->valuestring;
         size_t dlen = strlen(dhex);
         size_t draw = dlen / 2;
@@ -2328,7 +2336,7 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
                 !client_verify_distribution_tx(f->ctx, f->dist_unsigned_tx.data,
                                                f->dist_unsigned_tx.len, f->dist_sighash,
                                                f->funding_spk, raw, draw)) {
-                fprintf(stderr, "Client: FACTORY_READY distribution TX is not the "
+                fprintf(stderr, "Client: FACTORY_PAYOUTS distribution TX is not the "
                                 "transaction this client built or is not validly "
                                 "signed -- REFUSING factory\n");
                 free(raw);
@@ -2341,7 +2349,7 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
             f->dist_tx_ready = 2;  /* 2 = signed and verified distribution TX */
             printf("Client: verified and stored signed distribution TX (%zu bytes)\n", draw);
         } else {
-            fprintf(stderr, "Client: FACTORY_READY distribution TX cannot be checked "
+            fprintf(stderr, "Client: FACTORY_PAYOUTS distribution TX cannot be checked "
                             "(this client built none) -- REFUSING factory\n");
             free(raw);
             return -1;
@@ -2349,7 +2357,37 @@ int client_apply_factory_ready(factory_t *f, const cJSON *json, uint32_t my_inde
         free(raw);
     }
 
-    return count;
+    return 1;
+}
+
+/* Receive MSG_FACTORY_PAYOUTS, apply it, and check the member's exit from
+   the factory: the distribution TX must pay it its channel capacity. */
+static int client_take_factory_payouts(int fd, secp256k1_context *ctx, factory_t *f,
+                                       uint32_t my_index, const secp256k1_pubkey *me) {
+    wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
+        msg.msg_type != MSG_FACTORY_PAYOUTS) {
+        fprintf(stderr, "Client %u: expected FACTORY_PAYOUTS\n", my_index);
+        if (msg.json) cJSON_Delete(msg.json);
+        return 0;
+    }
+    int r = client_apply_factory_payouts(f, msg.json, my_index);
+    cJSON_Delete(msg.json);
+    if (r < 0) return 0;
+    if (!client_factory_exit_acceptable(ctx, f, my_index, me)) {
+        fprintf(stderr, "Client %u: REFUSING factory — no acceptable distribution "
+                "transaction\n", my_index);
+        client_send_error(fd, "distribution_tx_missing_or_invalid");
+        return 0;
+    }
+    printf("Client %u: distribution TX verified: pays this member %llu sats "
+           "(channel capacity %llu), nLockTime %u\n", my_index,
+           (unsigned long long)client_tx_amount_to_pubkey(ctx, f->dist_unsigned_tx.data,
+                                                          f->dist_unsigned_tx.len, me),
+           (unsigned long long)client_member_channel_capacity(f, my_index),
+           factory_distribution_locktime(f));
+    return 1;
 }
 
 /* --- Factory rotation (condensed factory creation without HELLO) --- */
@@ -2797,21 +2835,6 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
         }
     }
 
-    /* The client leaves a factory only for one it can get out of on its own:
-       the new factory must come with a verified, signed distribution
-       transaction that pays this client at least its current balance. */
-    if (!client_factory_exit_acceptable(ctx, factory_out, my_index, &my_pubkey)) {
-        fprintf(stderr, "Client %u: REFUSING rotation — no acceptable exit from the "
-                "new factory\n", my_index);
-        free(secnonces); free(nonce_entries); return 0;
-    }
-
-    /* Durable before anything else can fail. */
-    if (!client_rotation_save_factory(factory_out, ctx, my_index)) {
-        fprintf(stderr, "Client %u: could not save the new factory; stopping the "
-                "rotation\n", my_index);
-        free(secnonces); free(nonce_entries); return 0;
-    }
 
     /* Basepoint exchange: receive LSP's basepoints */
     secp256k1_pubkey rot_lsp_pay_bp, rot_lsp_delay_bp, rot_lsp_revoc_bp;
@@ -2984,6 +3007,20 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 
     /* Signed commitment 0 for the new channel, before it is used. */
     if (!client_recv_initial_commitment(fd, channel_out, my_index)) {
+        free(secnonces); free(nonce_entries); return 0;
+    }
+
+    /* The client leaves a factory only for one it can get out of on its own:
+       the new factory's distribution TX and end-date payouts (sent once every
+       channel is open) must verify and pay this client its capacity. */
+    if (!client_take_factory_payouts(fd, ctx, factory_out, my_index, &my_pubkey)) {
+        fprintf(stderr, "Client %u: REFUSING rotation — no acceptable exit from the "
+                "new factory\n", my_index);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    if (!client_rotation_save_factory(factory_out, ctx, my_index)) {
+        fprintf(stderr, "Client %u: could not save the new factory; stopping the "
+                "rotation\n", my_index);
         free(secnonces); free(nonce_entries); return 0;
     }
 
@@ -4254,22 +4291,12 @@ int client_run_with_channels(secp256k1_context *ctx,
     }
 
     /* The factory is accepted only with a fully co-signed, verified
-       distribution transaction paying this member its channel capacity: the
-       member's exit at the factory's end must not depend on the LSP.  Same
-       rule as for a rotation. */
-    if (!client_factory_exit_acceptable(ctx, factory, my_index, &my_pubkey)) {
-        fprintf(stderr, "Client %u: REFUSING factory — no acceptable distribution "
-                "transaction\n", my_index);
-        client_send_error(fd, "distribution_tx_missing_or_invalid");
+       distribution transaction paying this member its channel capacity and
+       its end-date payouts (FACTORY_PAYOUTS).  The LSP sends them once every
+       member's channel is open with the LSP's commitment 0 co-signed; with
+       no channels to open, right after FACTORY_READY. */
+    if (!channel_cb && !client_take_factory_payouts(fd, ctx, factory, my_index, &my_pubkey))
         goto fail;
-    }
-    printf("Client %u: distribution TX verified: pays this member %llu sats "
-           "(channel capacity %llu), nLockTime %u\n", my_index,
-           (unsigned long long)client_tx_amount_to_pubkey(ctx, factory->dist_unsigned_tx.data,
-                                                          factory->dist_unsigned_tx.len,
-                                                          &my_pubkey),
-           (unsigned long long)client_member_channel_capacity(factory, my_index),
-           factory_distribution_locktime(factory));
 
     printf("Client %u: factory creation complete!\n", my_index);
 
@@ -4501,6 +4528,8 @@ int client_run_with_channels(secp256k1_context *ctx,
             goto fail;
         printf("Client %u: initial commitment signed (local=%llu sats)\n",
                my_index, (unsigned long long)channel.local_amount);
+        if (!client_take_factory_payouts(fd, ctx, factory, my_index, &my_pubkey))
+            goto fail;
 
         /* Call the channel callback */
         int cb_ret = channel_cb(fd, &channel, my_index, ctx, keypair,

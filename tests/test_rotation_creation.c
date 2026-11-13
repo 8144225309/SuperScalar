@@ -206,6 +206,8 @@ static int rc_run_creation(int mode) {
     if (!fail)
         created = lsp_run_factory_creation(lsp, fake_txid, 0, amount, spk, 34,
                                            10, 4, /*cltv*/ 500);
+    /* no channels: the distribution TX and payouts go out now */
+    if (created) created = lsp_send_factory_payouts(lsp);
     factory_t *f = lsp ? &lsp->factory : NULL;
     if (!fail && mode == RC_REFUSED) {
         /* The ceremony must fail (clients refuse 0 bps) and leave the

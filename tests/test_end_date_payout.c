@@ -24,6 +24,9 @@
 #include "superscalar/persist.h"
 #include "superscalar/cli_arity.h"
 #include "superscalar/lsp.h"
+#include "superscalar/client_dist.h"
+#include "superscalar/chain_backend.h"
+#include <time.h>
 #include "cJSON.h"
 
 /* BIP-341 key-only output key: internal + H_TapTweak(internal) * G. */
@@ -991,10 +994,29 @@ int test_regtest_end_date_host_forced_exit(void) {
     return 1;
 }
 
-/* A member takes a factory only with a valid end-date payout for every
-   output on its path: FACTORY_READY without the payout signatures, or with
-   one of them wrong, is refused; the complete one is taken and every payout
-   on the member's path is signed. */
+/* The distribution TX of a test factory: built from the factory's own
+   outputs and signed with every key (f->keypairs). */
+static int ep_dist(factory_t *f, int sign) {
+    tx_output_t outs[FACTORY_MAX_SIGNERS + 1];
+    size_t n = factory_compute_distribution_outputs_balanced(f, outs, FACTORY_MAX_SIGNERS + 1,
+                   factory_distribution_fee(f, f->n_participants - 1), NULL, 0);
+    if (n == 0 || !factory_build_distribution_tx_unsigned(f, outs, n, f->cltv_timeout))
+        return 0;
+    if (!sign) return 1;
+    tx_buf_free(&f->dist_signed_tx);
+    tx_buf_init(&f->dist_signed_tx, 512);
+    unsigned char t[32];
+    if (!factory_build_distribution_tx(f, &f->dist_signed_tx, t, outs, n, f->cltv_timeout))
+        return 0;
+    f->dist_tx_ready = 2;
+    return 1;
+}
+
+/* A member takes a factory only with its distribution TX and a valid
+   end-date payout for every output on its path (FACTORY_PAYOUTS, sent after
+   the channels opened): without the payout signatures, with one of them
+   wrong, or without the distribution TX, it is refused; the complete one is
+   taken and every payout on the member's path is signed. */
 int test_end_date_member_refuses_missing_payouts(void) {
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
@@ -1007,16 +1029,24 @@ int test_end_date_member_refuses_missing_payouts(void) {
     TEST_ASSERT(lsp_f && ep_init(lsp_f, ctx, kps, &shape, 5000), "init");
     TEST_ASSERT(factory_compute_funding_spk(lsp_f, spk) &&
                 factory_set_funding(lsp_f, txid, 0, 2000000, spk, 34) &&
-                factory_build_tree(lsp_f) && factory_sign_all(lsp_f), "signed factory");
+                factory_build_tree(lsp_f) && factory_sign_all(lsp_f) && ep_dist(lsp_f, 1),
+                "signed factory and distribution TX");
     cJSON *ready = wire_build_factory_ready(lsp_f);
-    TEST_ASSERT(ready && cJSON_GetObjectItem(ready, "payout_sigs"), "FACTORY_READY carries payouts");
+    TEST_ASSERT(ready && !cJSON_GetObjectItem(ready, "payout_sigs") &&
+                !cJSON_GetObjectItem(ready, "distribution_tx_hex"),
+                "FACTORY_READY carries the tree only");
+    cJSON *pay = wire_build_factory_payouts(lsp_f);
+    TEST_ASSERT(pay && cJSON_GetObjectItem(pay, "payout_sigs") &&
+                cJSON_GetObjectItem(pay, "distribution_tx_hex"),
+                "FACTORY_PAYOUTS carries the payouts and the distribution TX");
 
-    for (int variant = 0; variant < 3; variant++) {
+    for (int variant = 0; variant < 4; variant++) {
         factory_t *m = calloc(1, sizeof(factory_t));
         TEST_ASSERT(m && ep_init(m, ctx, kps, &shape, 5000), "member init");
-        TEST_ASSERT(factory_set_funding(m, txid, 0, 2000000, spk, 34) && factory_build_tree(m),
-                    "member builds the same tree");
-        cJSON *msg = cJSON_Duplicate(ready, 1);
+        TEST_ASSERT(factory_set_funding(m, txid, 0, 2000000, spk, 34) && factory_build_tree(m) &&
+                    ep_dist(m, 0), "member builds the same tree and distribution TX");
+        TEST_ASSERT(client_apply_factory_ready(m, ready, 1) > 0, "the tree is taken");
+        cJSON *msg = cJSON_Duplicate(pay, 1);
         if (variant == 1) {
             cJSON_DeleteItemFromObject(msg, "payout_sigs");
         } else if (variant == 2) {
@@ -1032,20 +1062,25 @@ int test_end_date_member_refuses_missing_payouts(void) {
             cJSON_DeleteItemFromObject(msg, "payout_sigs");
             wire_json_add_hex(msg, "payout_sigs", sigs, len);
             free(sigs);
+        } else if (variant == 3) {
+            cJSON_DeleteItemFromObject(msg, "distribution_tx_hex");
         }
-        int r = client_apply_factory_ready(m, msg, 1);
+        int r = client_apply_factory_payouts(m, msg, 1);
         cJSON_Delete(msg);
         if (variant == 0) {
-            TEST_ASSERT(r >= 0, "the complete FACTORY_READY is taken");
+            TEST_ASSERT(r > 0, "the complete FACTORY_PAYOUTS is taken");
             TEST_ASSERT(factory_payouts_all_signed(m, 1), "every payout on the path is signed");
+            TEST_ASSERT(m->dist_tx_ready == 2, "the distribution TX is stored");
         } else {
             TEST_ASSERT(r < 0, variant == 1 ? "missing payout signatures refused"
-                                            : "a wrong payout signature is refused");
+                             : variant == 2 ? "a wrong payout signature is refused"
+                                            : "no distribution TX: refused");
         }
         factory_free(m);
         free(m);
     }
     cJSON_Delete(ready);
+    cJSON_Delete(pay);
     factory_free(lsp_f);
     free(lsp_f);
     free(kps);
@@ -1361,6 +1396,8 @@ int test_end_date_refuses_missing_end_date(void) {
                 "a CLTV in the past is refused");
     TEST_ASSERT(cli_validate_proposed_cltv(600, 500, 10, err, sizeof(err)),
                 "a CLTV past the exit is taken");
+    TEST_ASSERT(!cli_validate_proposed_cltv(600, 0, 10, err, sizeof(err)),
+                "with no known tip a CLTV cannot be checked: refused");
 
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
@@ -1525,6 +1562,205 @@ int test_end_date_nonce_refresh(void) {
     free(mgr);
     free(lsp->client_fds);
     free(lsp);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+
+/* ---- a chain whose answers the test sets ---- */
+typedef struct {
+    chain_backend_t cb;
+    int tip;
+    int creator_confs;        /* confirmations of every txid asked about */
+    int unspent;              /* is_outpoint_unspent: mempool included */
+    int spent_confirmed;      /* is_outpoint_spent_confirmed */
+    int sent;
+} ep_chain_t;
+static int epc_height(chain_backend_t *s) { return ((ep_chain_t *)s)->tip; }
+static int epc_confs(chain_backend_t *s, const char *t) { (void)t; return ((ep_chain_t *)s)->creator_confs; }
+static bool epc_mempool(chain_backend_t *s, const char *t) { (void)s; (void)t; return false; }
+static int epc_unspent(chain_backend_t *s, const char *t, uint32_t v) { (void)t; (void)v; return ((ep_chain_t *)s)->unspent; }
+static int epc_spentc(chain_backend_t *s, const char *t, uint32_t v) { (void)t; (void)v; return ((ep_chain_t *)s)->spent_confirmed; }
+static int epc_send(chain_backend_t *s, const char *hex, char *txid) {
+    (void)hex; if (txid) { memset(txid, '0', 64); txid[64] = 0; }
+    ((ep_chain_t *)s)->sent++;
+    return 1;
+}
+static void epc_init(ep_chain_t *c, int tip) {
+    memset(c, 0, sizeof(*c));
+    c->cb.get_block_height = epc_height;
+    c->cb.get_confirmations = epc_confs;
+    c->cb.is_in_mempool = epc_mempool;
+    c->cb.is_outpoint_unspent = epc_unspent;
+    c->cb.is_outpoint_spent_confirmed = epc_spentc;
+    c->cb.send_raw_tx = epc_send;
+    c->tip = tip;
+    c->creator_confs = 1;
+}
+
+/* From the end date a member publishes the payout of a shared output that
+   is on chain and not spent by a confirmed transaction: a spend still in
+   the mempool (the LSP's) does not make it stand down.  A spend that is
+   confirmed does. */
+int test_end_date_claim_ignores_unconfirmed_spend(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    TEST_ASSERT(kps && f, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x73, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f) &&
+                factory_sign_all(f), "signed factory");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "db");
+    TEST_ASSERT(persist_save_payouts(&db, 0, f, 1), "member 1's payouts stored");
+    ep_chain_t ch;
+
+    epc_init(&ch, 4999);
+    ch.unspent = 1;
+    TEST_ASSERT(client_payouts_claim(&db, &ch.cb, 0, NULL, NULL) == 0 && ch.sent == 0,
+                "nothing before the end date");
+
+    epc_init(&ch, 5000);
+    ch.unspent = 0;           /* spent by a transaction in the mempool */
+    ch.spent_confirmed = 0;   /* ... that is not confirmed */
+    int n = client_payouts_claim(&db, &ch.cb, 0, NULL, NULL);
+    TEST_ASSERT(n > 0 && ch.sent == n,
+                "an unconfirmed spend does not stop the member's payout");
+
+    epc_init(&ch, 5000);
+    ch.unspent = 0;
+    ch.spent_confirmed = 1;
+    TEST_ASSERT(client_payouts_claim(&db, &ch.cb, 0, NULL, NULL) == 0 && ch.sent == 0,
+                "a confirmed spend settles the output: no payout");
+
+    persist_close(&db);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A nonce refresh that gets no answer does not hold the LSP for long,
+   leaves both of the channel's pools as they were, and is not retried at
+   once: the next attempt waits for a back-off. */
+int test_end_date_nonce_refresh_unanswered(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    lsp_channel_mgr_t *mgr = calloc(1, sizeof(lsp_channel_mgr_t));
+    lsp_t *lsp = calloc(1, sizeof(lsp_t));
+    channel_t *cli_ch = calloc(1, sizeof(channel_t));
+    TEST_ASSERT(kps && f && mgr && lsp && cli_ch, "alloc");
+    mgr->entries = calloc(1, sizeof(lsp_channel_entry_t));
+    lsp->client_fds = calloc(1, sizeof(int));
+    TEST_ASSERT(mgr->entries && lsp->client_fds, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x74, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree");
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    TEST_ASSERT(factory_client_to_leaf(f, 0, &leaf, &vout), "leaf");
+    uint64_t cap = f->nodes[leaf].outputs[vout].amount_sats;
+    channel_t *lsp_ch = &mgr->entries[0].channel;
+    TEST_ASSERT(ep_channel_pair(ctx, f, kps, lsp_ch, cli_ch, cap / 2, cap / 2 - 2000), "pair");
+    mgr->ctx = ctx;
+    mgr->n_channels = 1;
+    mgr->entries[0].ready = 1;
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    lsp->client_fds[0] = sv[0];
+    lsp_ch->remote_nonce_next = lsp_ch->remote_nonce_count - 1;   /* nearly spent */
+    size_t rc = lsp_ch->remote_nonce_count, rn = lsp_ch->remote_nonce_next;
+    size_t lc = lsp_ch->local_nonce_pool.count, ln = lsp_ch->local_nonce_pool.next_unused;
+    unsigned char pn0[66], pn1[66];
+    musig_pubnonce_serialize(ctx, pn0, &lsp_ch->local_nonce_pool.nonces[0].pubnonce);
+
+    time_t t0 = time(NULL);
+    int r = lsp_channels_refresh_nonces(mgr, lsp, 0, 0);   /* the member is silent */
+    time_t took = time(NULL) - t0;
+    TEST_ASSERT(r == 0, "no fresh nonces without an answer");
+    TEST_ASSERT(took <= 10, "an unanswered refresh does not hold the LSP for long");
+    musig_pubnonce_serialize(ctx, pn1, &lsp_ch->local_nonce_pool.nonces[0].pubnonce);
+    TEST_ASSERT(lsp_ch->remote_nonce_count == rc && lsp_ch->remote_nonce_next == rn &&
+                lsp_ch->local_nonce_pool.count == lc &&
+                lsp_ch->local_nonce_pool.next_unused == ln && memcmp(pn0, pn1, 66) == 0,
+                "the channel's pools are unchanged");
+    wire_msg_t m;
+    memset(&m, 0, sizeof(m));
+    TEST_ASSERT(wire_recv_timeout(sv[1], &m, 2) && m.msg_type == MSG_CHANNEL_NONCES,
+                "the request was sent");
+    if (m.json) cJSON_Delete(m.json);
+    t0 = time(NULL);
+    TEST_ASSERT(lsp_channels_refresh_nonces(mgr, lsp, 0, 0) == 0, "still none");
+    TEST_ASSERT(time(NULL) - t0 <= 1, "within the back-off nothing is waited for");
+    memset(&m, 0, sizeof(m));
+    TEST_ASSERT(!wire_recv_timeout(sv[1], &m, 1), "and nothing is sent");
+    if (m.json) cJSON_Delete(m.json);
+
+    close(sv[0]);
+    close(sv[1]);
+    channel_cleanup(lsp_ch);
+    channel_cleanup(cli_ch);
+    free(cli_ch);
+    free(mgr->entries);
+    free(mgr);
+    free(lsp->client_fds);
+    free(lsp);
+    factory_free(f);
+    free(f);
+    free(kps);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* A revocation is taken only once it is stored: when the channel's
+   database cannot store it, it is refused (not kept in memory alone). */
+int test_end_date_revocation_needs_storage(void) {
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    const ep_shape_t shape = { "advanceless N=4", {4, 3}, 2, 1, 0, 4 };
+    secp256k1_keypair *kps = ep_keys(ctx, 5);
+    factory_t *f = calloc(1, sizeof(factory_t));
+    channel_t *lsp_ch = calloc(1, sizeof(channel_t)), *cli_ch = calloc(1, sizeof(channel_t));
+    TEST_ASSERT(kps && f && lsp_ch && cli_ch, "alloc");
+    unsigned char txid[32], spk[34];
+    memset(txid, 0x75, 32);
+    TEST_ASSERT(ep_init(f, ctx, kps, &shape, 5000) && factory_compute_funding_spk(f, spk) &&
+                factory_set_funding(f, txid, 0, 2000000, spk, 34) && factory_build_tree(f),
+                "tree");
+    size_t leaf = 0;
+    uint32_t vout = 0;
+    TEST_ASSERT(factory_client_to_leaf(f, 0, &leaf, &vout), "leaf");
+    uint64_t cap = f->nodes[leaf].outputs[vout].amount_sats;
+    TEST_ASSERT(ep_channel_pair(ctx, f, kps, lsp_ch, cli_ch, cap / 2, cap / 2 - 2000), "pair");
+    unsigned char sec[32], out[32];
+    TEST_ASSERT(channel_get_revocation_secret(lsp_ch, 0, sec), "LSP secret 0");
+    persist_t broken;
+    memset(&broken, 0, sizeof(broken));          /* no database behind it */
+    channel_set_persist(cli_ch, &broken, 0);
+    TEST_ASSERT(!channel_receive_revocation(cli_ch, 0, sec),
+                "a revocation that cannot be stored is refused");
+    TEST_ASSERT(!channel_get_received_revocation(cli_ch, 0, out), "and not kept");
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "db");
+    channel_set_persist(cli_ch, &db, 0);
+    TEST_ASSERT(channel_receive_revocation(cli_ch, 0, sec) &&
+                channel_get_received_revocation(cli_ch, 0, out), "stored and taken");
+    persist_close(&db);
+    channel_set_persist(cli_ch, NULL, 0);
+    channel_cleanup(lsp_ch);
+    channel_cleanup(cli_ch);
+    free(lsp_ch);
+    free(cli_ch);
     factory_free(f);
     free(f);
     free(kps);

@@ -1056,14 +1056,14 @@ static client_dist_status_t client_dist_tick(persist_t *db, watchtower_t *wt,
     if (!db || !wt || !wt->chain) return CLIENT_DIST_NONE;
     client_dist_status_t s = client_dist_watch(&g_dist_watch, db, ctx, wt->chain,
                                                client_dist_send_cpfp, 10, stdout);
-    /* From the end date on with the funding output spent (the tree is partly
-       on chain, so the distribution TX cannot confirm): put this member's
-       pre-signed path on chain down to the first output with an end-date
-       payout, and publish the payout of each shared output on its path that
-       is unspent.  Checked every 10 s, so the payout goes out right at the
-       end date; no message from the LSP is needed. */
+    /* Whatever the distribution TX's state: once a kickoff on this member's
+       path is on chain, publish the latest state under it; from the end date
+       put the path on chain down to the first output with an end-date payout
+       and publish the payout of each shared output on the path that no
+       confirmed transaction spends.  Checked every 10 s, so the payout goes
+       out right at the end date; no message from the LSP is needed. */
     static time_t last_payout_check;
-    if (s == CLIENT_DIST_FUNDING_SPENT && time(NULL) - last_payout_check >= 10) {
+    if (time(NULL) - last_payout_check >= 10) {
         last_payout_check = time(NULL);
         client_exit_factory_load(db, ctx);
         if (g_exit_factory)
@@ -1566,7 +1566,11 @@ handle_message:
                 uint64_t pre_ful_local = ch->local_amount;
                 uint64_t pre_ful_remote = ch->remote_amount;
 
-                client_fulfill_payment(fd, ch, sett_htlc_id, sett_preimage);
+                if (!client_fulfill_payment(fd, ch, sett_htlc_id, sett_preimage)) {
+                    fprintf(stderr, "Client %u: settlement HTLC %llu not fulfilled; it "
+                            "stays pending\n", my_index, (unsigned long long)sett_htlc_id);
+                    break;
+                }
 
                 /* Handle COMMITMENT_SIGNED for the fulfill */
                 if (recv_or_handle_ptlc(fd, &msg, 5, MSG_COMMITMENT_SIGNED,
@@ -1643,10 +1647,6 @@ handle_message:
                         }
                     }
                     memcpy(preimage, paid_inv->preimage, 32);
-                    paid_inv->active = 0;
-                    /* Deactivate in persistence (Phase 23) */
-                    if (cbd->db)
-                        persist_deactivate_client_invoice(cbd->db, htlc_hash);
                     printf("Client %u: fulfilling HTLC %llu with real preimage\n",
                            my_index, (unsigned long long)htlc_id);
 
@@ -1658,7 +1658,15 @@ handle_message:
                     if (pre_ful_n_htlcs > 0)
                         memcpy(pre_ful_htlcs, ch->htlcs, pre_ful_n_htlcs * sizeof(htlc_t));
 
-                    client_fulfill_payment(fd, ch, htlc_id, preimage);
+                    if (!client_fulfill_payment(fd, ch, htlc_id, preimage)) {
+                        fprintf(stderr, "Client %u: HTLC %llu not fulfilled; the invoice "
+                                "stays open\n", my_index, (unsigned long long)htlc_id);
+                        memset(preimage, 0, 32);
+                        break;
+                    }
+                    paid_inv->active = 0;
+                    if (cbd->db)
+                        persist_deactivate_client_invoice(cbd->db, htlc_hash);
 
                     /* Handle COMMITMENT_SIGNED for the fulfill (5s timeout),
                        handling PTLC_PRESIG inline to prevent rotation loss */

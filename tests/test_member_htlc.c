@@ -133,6 +133,10 @@ int test_member_underpaid_htlc_gets_no_preimage(void) {
         TEST_ASSERT(client_handle_add_htlc(&ch, &m), "HTLC booked");
         cJSON_Delete(m.json);
         uint64_t local0 = ch.local_amount;
+        /* the LSP has revoked its commitments below the member's current one */
+        TEST_ASSERT(channel_ensure_revocations_cap(&ch, ch.commitment_number + 1), "cap");
+        for (uint64_t cn = 0; cn < ch.commitment_number; cn++)
+            ch.received_revocation_valid[cn] = 1;
         int sv[2];
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
         int r = client_settle_invoice_htlc(sv[0], &ch, 3, pre, invoice_msat,
