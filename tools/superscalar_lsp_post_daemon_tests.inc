@@ -41,8 +41,8 @@
 
             /* Temporarily revert to commitment #0 with no HTLCs */
             chX->commitment_number = 0;
-            chX->local_amount = init_local;
-            chX->remote_amount = init_remote;
+            chX->local_amount = init_local_ch[ci];
+            chX->remote_amount = init_remote_ch[ci];
             chX->n_htlcs = 0;
 
             /* Ensure remote PCP for commitment #0 is available.
