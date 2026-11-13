@@ -1471,6 +1471,9 @@ extern int test_reconnect_impostor_refused(void);
 extern int test_reconnect_auth_replay_refused(void);
 extern int test_client_auth_proof_binding(void);
 extern int test_client_auth_first_hello_proven(void);
+extern int test_member_host_add_is_never_own_payment(void);
+extern int test_member_underpaid_htlc_gets_no_preimage(void);
+extern int test_member_invoice_preimage_needs_randomness(void);
 extern int test_client_handle_async_msg(void);  /* fix/client-daemon-async-msg */
 
 /* Security hardening */
@@ -3615,6 +3618,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_reconnect_auth_replay_refused);
     RUN_TEST(test_client_auth_proof_binding);
     RUN_TEST(test_client_auth_first_hello_proven);
+    RUN_TEST(test_member_host_add_is_never_own_payment);
+    RUN_TEST(test_member_underpaid_htlc_gets_no_preimage);
+    RUN_TEST(test_member_invoice_preimage_needs_randomness);
     RUN_TEST(test_client_handle_async_msg);
 
     printf("\n=== Security Hardening ===\n");
