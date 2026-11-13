@@ -1380,6 +1380,9 @@ int test_end_date_refuses_missing_end_date(void) {
     TEST_ASSERT(l, "alloc");
     TEST_ASSERT(lsp_run_factory_creation(l, txid, 0, 2000000, spk, 34, 10, 4, 0) == 0,
                 "the LSP proposes no factory without an end date");
+    TEST_ASSERT(l->factory.pubkeys == NULL && l->factory.n_nodes == 0,
+                "it refuses before building anything");
+    factory_free(&l->factory);
     free(l);
     free(kps);
     secp256k1_context_destroy(ctx);
