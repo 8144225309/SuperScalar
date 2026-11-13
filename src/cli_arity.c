@@ -231,6 +231,12 @@ int cli_validate_proposed_cltv(uint32_t cltv_timeout, uint32_t tip,
                                uint32_t exit_blocks,
                                char *err_buf, size_t err_buf_len)
 {
+    if (cltv_timeout == 0) {
+        cli_set_err(err_buf, err_buf_len,
+            "factory CLTV timeout is 0: a factory without an end date has no "
+            "end-date payouts");
+        return 0;
+    }
     if (tip == 0) return 1;
     uint64_t need = (uint64_t)tip + exit_blocks + CLI_FACTORY_CLTV_MARGIN;
     if ((uint64_t)cltv_timeout > need) return 1;

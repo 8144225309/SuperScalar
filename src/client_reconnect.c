@@ -283,6 +283,13 @@ int client_run_reconnect(secp256k1_context *ctx,
         }
     }
 
+    /* 7a. The LSP's revocation secrets received before: a preimage is
+       released only once every LSP commitment below the current number is
+       revoked (client_host_old_commitments_revoked). */
+    if (db && !client_restore_host_revocations(&channel, db, client_idx))
+        fprintf(stderr, "Client reconnect: could not restore the LSP's revocations; "
+                "no preimage is released until they arrive again\n");
+
     /* 7b. Restore latest commitment TX signature for force-close capability */
     if (db) {
         uint64_t sig_cn = 0;
@@ -409,6 +416,18 @@ int client_run_reconnect(secp256k1_context *ctx,
             wire_close(fd);
             factory_free(factory); free(factory);
             return 0;
+        }
+        /* The LSP's revocation of its previous commitment, if it sent it
+           again: verified against the point it committed to, then stored. */
+        {
+            unsigned char prev[32];
+            if (channel.commitment_number > 0 &&
+                wire_json_get_hex(msg.json, "host_prev_revocation", prev, 32) == 32 &&
+                !channel_receive_revocation(&channel, channel.commitment_number - 1, prev))
+                fprintf(stderr, "Client reconnect: the LSP's revocation of commitment "
+                        "%llu does not verify; not stored\n",
+                        (unsigned long long)(channel.commitment_number - 1));
+            memset(prev, 0, 32);
         }
         cJSON_Delete(msg.json);
 

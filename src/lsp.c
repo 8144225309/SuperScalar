@@ -828,6 +828,14 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         uint32_t cltv_timeout) {
     if (!lsp) return -1;
     factory_t *f = &lsp->factory;
+    /* The end date T0 orders every exit: payouts and the distribution TX are
+       valid from it, the LSP's forced exit ends before it.  No factory is
+       proposed without one. */
+    if (cltv_timeout == 0) {
+        fprintf(stderr, "LSP: refusing to create a factory without a CLTV timeout "
+                "(end date)\n");
+        return 0;
+    }
 
     /* SF-CEREMONY-HELPERS #199 / wallet-team v34 API: journal this
        stateless factory creation in the ceremonies table.  Mirrors the
@@ -1379,14 +1387,15 @@ int lsp_run_factory_creation_stateless(lsp_t *lsp,
         goto fail_pre;
     }
 
-    /* #54 G1b: aggregate the dist partial sigs into the signed distribution TX
-       (the offline-forever recovery net), setting dist_tx_ready=2 so
-       wire_build_factory_ready ships distribution_tx_hex.  NON-FATAL: the factory
-       is already fully created; on any dist failure we simply ship no signed dist
-       TX (degrades to today's behaviour, no fund risk). */
-    if (dist_active && !factory_session_complete_dist(f))
-        fprintf(stderr, "LSP-stateless: dist co-sign incomplete -- FACTORY_READY "
-                "omits the signed distribution TX (offline-recovery degraded)\n");
+    /* Aggregate the distribution TX (dist_tx_ready=2, shipped in
+       FACTORY_READY).  It is the funding output's end-date spend, as the
+       payouts are for every other shared output, so it is mandatory: without
+       every member's signature over it the factory is not created. */
+    if (!dist_active || !factory_session_complete_dist(f)) {
+        fprintf(stderr, "LSP-stateless: the distribution TX is not co-signed by every "
+                "member -- the factory is not created\n");
+        goto fail_pre;
+    }
 
     /* Gap-scan efficacy cheat (mainnet-inert): simulate a malicious/buggy LSP shipping
        an INVALID tree.  The LSP's own Phase-B factory_verify_all (above) already passed,
@@ -1499,6 +1508,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     unsigned char lsp_seckey[32];
     if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 0;
     }
 
@@ -1508,6 +1518,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                                lsp_seckey, &lsp->lsp_pubkey, &keyagg.cache)) {
         memset(lsp_seckey, 0, 32);
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 0;
     }
     memset(lsp_seckey, 0, 32);
@@ -1771,6 +1782,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         fprintf(stderr, "LSP: cooperative-close aggregate signature INVALID -- "
                 "retryable (fresh-nonce re-run; clients kept)\n");
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 2;
     }
 
@@ -1794,12 +1806,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     }
 
     tx_buf_free(&unsigned_tx);
+    musig_session_free(&session);
     return 1;
 
 close_fail:
     if (clients_notified)
         lsp_abort_ceremony(lsp, "cooperative close failed");
     tx_buf_free(&unsigned_tx);
+    musig_session_free(&session);
     return 0;
 }
 

@@ -2783,15 +2783,18 @@ static void child_reconnect_pending_cs(int fd, int client_idx,
     _exit(acked == (expect_ack != 0) ? 0 : 6);
 }
 
-/* A commitment pending at reconnect is settled by the client's valid
-   revocation only; anything else refuses the reconnect, disconnects the
-   client and keeps the commitment pending. */
+/* A commitment pending at reconnect is settled only by the client's valid
+   revocation carrying its signature over the LSP's commitment at the same
+   number; anything else (here: a bad secret, another message, an
+   unparseable one, a valid secret without that signature) refuses the
+   reconnect, disconnects the client and keeps the commitment pending. */
 int test_reconnect_pending_commitment_needs_revocation(void) {
     unsigned char good[32], bad[32];
     memset(good, 0x41, 32);
     memset(bad, 0x42, 32);
 
-    /* mode: 0 bad secret, 1 other message, 2 unparseable, 3 valid secret */
+    /* mode: 0 bad secret, 1 other message, 2 unparseable, 3 valid secret
+       without the co-signature of the LSP's commitment */
     for (int round = 0; round < 4; round++) {
         secp256k1_context *ctx;
         unsigned char lsp_sec[32];
@@ -2851,7 +2854,7 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
         if (pid == 0) {
             close(sv[0]);
             if (round == 3)
-                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2], 0, good, 1);
+                child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2], 0, good, 0);
             else
                 child_reconnect_pending_cs(sv[1], 2, lsp_pk, client_secs[2],
                                            round, bad, 0);
@@ -2869,10 +2872,11 @@ int test_reconnect_pending_commitment_needs_revocation(void) {
         TEST_ASSERT_EQ(child_rc, 0, "client saw what it should");
 
         if (round == 3) {
-            TEST_ASSERT_EQ(ok, 1, "valid revocation: reconnect accepted");
-            TEST_ASSERT(!has_pending, "commitment no longer pending");
-            TEST_ASSERT(lsp->client_fds[2] == sv[0], "client connected");
-            TEST_ASSERT(lsp_channels_peer_revoked(ch), "revocation stored");
+            TEST_ASSERT_EQ(ok, 0, "no co-signature: reconnect refused");
+            TEST_ASSERT(has_pending, "commitment still pending");
+            TEST_ASSERT_EQ(lsp->client_fds[2], -1, "client disconnected");
+            TEST_ASSERT(!lsp_channels_peer_revoked(ch), "nothing stored");
+            TEST_ASSERT(ch->host_commit_refused, "the channel takes no further update");
         } else {
             TEST_ASSERT_EQ(ok, 0, "reconnect refused");
             TEST_ASSERT(has_pending, "commitment still pending");
@@ -2986,6 +2990,12 @@ int test_reconnect_htlc_replay(void) {
         for (int drain = 0; drain < 5; drain++) {
             wire_msg_t extra;
             if (!wire_recv_timeout(sv[1], &extra, 2)) break;
+            if (extra.msg_type == MSG_UPDATE_ADD_HTLC) {
+                /* The forwarded HTLC is 1000 sat: the wire carries msat. */
+                cJSON *am = extra.json ? cJSON_GetObjectItem(extra.json, "amount_msat") : NULL;
+                if (!am || !cJSON_IsNumber(am) || (uint64_t)am->valuedouble != 1000000)
+                    _exit(20);
+            }
             if (extra.msg_type == MSG_COMMITMENT_SIGNED) {
                 /* Send REVOKE_AND_ACK */
                 secp256k1_pubkey tmp_pk;
@@ -3007,25 +3017,27 @@ int test_reconnect_htlc_replay(void) {
     }
 
     close(sv[1]);
+    uint64_t cn_before = dest_ch->commitment_number;
+    uint64_t local_before = dest_ch->local_amount;
     int ok = lsp_channels_handle_reconnect(&mgr, lsp, sv[0]);
-    TEST_ASSERT(ok, "handle_reconnect with replay should succeed");
 
-    /* Verify HTLC was replayed to dest channel */
-    TEST_ASSERT(dest_ch->n_htlcs > 0, "dest should have replayed HTLC");
-
-    /* Check the replayed HTLC has matching payment_hash */
-    int found = 0;
-    for (size_t i = 0; i < dest_ch->n_htlcs; i++) {
-        if (memcmp(dest_ch->htlcs[i].payment_hash, payment_hash, 32) == 0) {
-            found = 1;
-            TEST_ASSERT_EQ(dest_ch->htlcs[i].direction, HTLC_OFFERED,
-                           "replayed HTLC should be OFFERED on dest");
-            TEST_ASSERT_EQ(dest_ch->htlcs[i].amount_sats, 1000,
-                           "replayed HTLC amount mismatch");
-            break;
-        }
+    /* The test client's revocation is not a valid one, so the replay does
+       not complete: the reconnect is not accepted, the destination channel is
+       back at the state the database holds with no replayed HTLC, and the
+       connection is dropped so that the client reconnects and the forward is
+       replayed again.  (Left as it was, the channel stayed a commitment
+       ahead of the client with an HTLC the client never took.) */
+    TEST_ASSERT(!ok, "a replay without a valid revocation must not be accepted");
+    TEST_ASSERT_EQ(dest_ch->n_htlcs, 0, "failed replay: no HTLC left on the dest channel");
+    TEST_ASSERT_EQ(dest_ch->commitment_number, cn_before, "failed replay: commitment number restored");
+    TEST_ASSERT_EQ(dest_ch->local_amount, local_before, "failed replay: balance restored");
+    TEST_ASSERT_EQ(lsp->client_fds[1], -1, "failed replay: connection dropped");
+    {
+        uint32_t nh = 0;
+        htlc_t rows[8];
+        nh = (uint32_t)persist_load_htlcs(&db, 1, rows, 8);
+        TEST_ASSERT_EQ(nh, 0, "failed replay: no HTLC row left in the database");
     }
-    TEST_ASSERT(found, "replayed HTLC not found on dest channel");
 
     int status;
     waitpid(pid, &status, 0);

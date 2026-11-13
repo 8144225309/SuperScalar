@@ -310,7 +310,38 @@ typedef struct {
    revocation exchange.  Nothing else is skipped: a payment triggers no
    factory-tree ceremony, so any other message is handed to the caller.
    Returns 1 on success with out populated. */
+
+/* The member's side of an update, as the daemon runs it: answer the LSP's
+   COMMITMENT_SIGNED, then take the LSP's revocation of its previous
+   commitment, which the LSP sends right after the member's REVOKE_AND_ACK
+   (client_recv_lsp_revocation in the daemon).  A member releases no
+   preimage before it.  Anything else that arrives first is kept for the
+   next receive. */
+static wire_msg_t g_chan_pushback;
+static int g_chan_has_pushback;
+
+static int chan_member_update(int fd, channel_t *ch, secp256k1_context *ctx,
+                               const wire_msg_t *cs) {
+    if (!client_handle_commitment_signed(fd, ch, ctx, cs)) return 0;
+    if (ch->commitment_number == 0) return 1;
+    wire_msg_t rv;
+    memset(&rv, 0, sizeof(rv));
+    if (!wire_recv_timeout(fd, &rv, 10)) return 0;
+    if (rv.msg_type == MSG_LSP_REVOKE_AND_ACK) {
+        int ok = client_handle_lsp_revoke_and_ack(ch, ctx, &rv);
+        if (rv.json) cJSON_Delete(rv.json);
+        return ok;
+    }
+    g_chan_pushback = rv;
+    g_chan_has_pushback = 1;
+    return 1;
+}
 static int recv_skip_revocations(int fd, wire_msg_t *out) {
+    if (g_chan_has_pushback) {
+        *out = g_chan_pushback;
+        g_chan_has_pushback = 0;
+        return 1;
+    }
     for (;;) {
         if (!wire_recv(fd, out)) return 0;
         if (out->msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
@@ -356,7 +387,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-                client_handle_commitment_signed(fd, ch, ctx, &msg);
+                chan_member_update(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
             } else {
                 fprintf(stderr, "Client %u: expected COMMIT_SIGNED, got 0x%02x\n",
@@ -393,7 +424,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-                client_handle_commitment_signed(fd, ch, ctx, &msg);
+                chan_member_update(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -424,7 +455,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-                client_handle_commitment_signed(fd, ch, ctx, &msg);
+                chan_member_update(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -456,7 +487,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-                client_handle_commitment_signed(fd, ch, ctx, &msg);
+                chan_member_update(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
             } else {
                 cJSON_Delete(msg.json);
@@ -508,7 +539,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            chan_member_update(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
         } else {
             fprintf(stderr, "Client %u: unexpected msg 0x%02x\n", my_index, msg.msg_type);
@@ -544,7 +575,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            chan_member_update(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
         } else {
             cJSON_Delete(msg.json);
@@ -575,16 +606,8 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            chan_member_update(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
-            /* The LSP's revocation of its previous commitment: a member
-               releases no preimage before it (the daemon applies it in
-               client_recv_lsp_revocation). */
-            wire_msg_t rv;
-            memset(&rv, 0, sizeof(rv));
-            if (wire_recv_timeout(fd, &rv, 10) && rv.msg_type == MSG_LSP_REVOKE_AND_ACK)
-                client_handle_lsp_revoke_and_ack(ch, ctx, &rv);
-            if (rv.json) cJSON_Delete(rv.json);
         } else {
             cJSON_Delete(msg.json);
         }
@@ -608,7 +631,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             return 0;
         }
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            chan_member_update(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
         } else {
             cJSON_Delete(msg.json);
@@ -4995,7 +5018,7 @@ static int fullfwd_client_cb(int fd, channel_t *ch, uint32_t my_index,
         wire_msg_t msg;
         if (!recv_skip_revocations(fd, &msg)) return 0;
         if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
-            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            chan_member_update(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
             if (d->got_fail) break;      /* the fail's commitment */
         } else if (msg.msg_type == MSG_UPDATE_FAIL_HTLC) {

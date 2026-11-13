@@ -1082,6 +1082,11 @@ extern int test_regtest_end_date_payout(void);
 extern int test_end_date_spend_rules_all_shapes(void);
 extern int test_end_date_member_refuses_missing_payouts(void);
 extern int test_end_date_member_waits_for_host_revocation(void);
+extern int test_end_date_update_needs_host_cosig(void);
+extern int test_end_date_revocation_wait_survives_restart(void);
+extern int test_end_date_refuses_missing_end_date(void);
+extern int test_end_date_anchor_from_funder_only(void);
+extern int test_end_date_nonce_refresh(void);
 extern int test_regtest_end_date_no_tree(void);
 extern int test_regtest_end_date_host_forced_exit(void);
 
@@ -3316,6 +3321,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_end_date_spend_rules_all_shapes);
     RUN_TEST(test_end_date_member_refuses_missing_payouts);
     RUN_TEST(test_end_date_member_waits_for_host_revocation);
+    RUN_TEST(test_end_date_update_needs_host_cosig);
+    RUN_TEST(test_end_date_revocation_wait_survives_restart);
+    RUN_TEST(test_end_date_refuses_missing_end_date);
+    RUN_TEST(test_end_date_anchor_from_funder_only);
+    RUN_TEST(test_end_date_nonce_refresh);
 
     printf("\n=== Shachain (Factory) ===\n");
     RUN_TEST(test_shachain_generation);

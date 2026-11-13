@@ -262,7 +262,7 @@ static void usage(const char *prog) {
         "                       (uniform); a comma list sets the arity per level (root..\n"
         "                       leaves, each 1-15).  See docs/factory-arity.md.\n"
         "  --static-near-root N  Top N tree depths are kickoff-only (no paired NODE_STATE,\n"
-        "                       no DW counter, only CLTV timeout escape). Range 0..7\n"
+        "                       no DW counter). Range 0..7\n"
         "                       (FACTORY_MAX_LEVELS-1).  With --arity and no\n"
         "                       --static-near-root the shape keeps DW state on every level.\n"
         "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
@@ -4298,7 +4298,11 @@ accept_new_factory:
             created_for_check = cltv_planned_created;
         }
         char cltv_err[512];
-        if (created_for_check > 0 &&
+        if (created_for_check == 0)
+            snprintf(cltv_err, sizeof(cltv_err), "Error: the chain height is not known, "
+                     "so the factory CLTV timeout %u cannot be checked against the "
+                     "factory's lifetime and exit", (unsigned)cltv_timeout);
+        if (created_for_check == 0 ||
             !cli_validate_factory_cltv(cltv_timeout, created_for_check,
                                        active_blocks, dying_blocks, factory_exit_blocks,
                                        cltv_err, sizeof(cltv_err))) {
@@ -4568,7 +4572,8 @@ accept_new_factory:
         strncpy(g_admin_rpc.network, network, sizeof(g_admin_rpc.network) - 1);
     }
     int channels_active = 0;
-    uint64_t init_local = 0, init_remote = 0;
+    /* Initial balance of every channel: the channels do not all start with the same split. */
+    uint64_t init_local_ch[LSP_MAX_CLIENTS] = {0}, init_remote_ch[LSP_MAX_CLIENTS] = {0};
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test ||
         test_distrib || test_turnover || test_rotation || test_partial_rotation ||
         force_close || test_burn ||
@@ -4856,8 +4861,10 @@ accept_new_factory:
 
         /* Capture initial balances before demo (for breach test) */
         if (breach_test && mgr->n_channels > 0) {
-            init_local = mgr->entries[0].channel.local_amount;
-            init_remote = mgr->entries[0].channel.remote_amount;
+            for (size_t q = 0; q < mgr->n_channels && q < LSP_MAX_CLIENTS; q++) {
+                init_local_ch[q] = mgr->entries[q].channel.local_amount;
+                init_remote_ch[q] = mgr->entries[q].channel.remote_amount;
+            }
         }
 
         if (demo_mode) {

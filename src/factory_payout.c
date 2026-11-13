@@ -313,6 +313,10 @@ static int payout_setup(factory_t *f, factory_payout_t *p, size_t node_idx, uint
 int factory_build_payouts(factory_t *f) {
     if (!f) return 0;
     factory_free_payouts(f);
+    /* No end date, no payouts: a factory proposed without one is refused by
+       both sides (lsp_run_factory_creation, cli_validate_proposed_cltv), and
+       a member refuses a tree whose payouts are missing. */
+    if (f->cltv_timeout == 0) return 1;
     size_t cap = 0;
     for (size_t i = 0; i < f->n_nodes; i++) cap += f->nodes[i].n_outputs;
     if (cap == 0) return 1;

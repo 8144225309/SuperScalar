@@ -1306,8 +1306,9 @@ int test_htlc_control_block_2leaf(void) {
 /* ---- Test: a commitment at rate 0 always has its anchor ---- */
 
 /* At rate 0 a commitment pays no fee: only a child on its 240-sat anchor can
-   get it mined.  It is built with the anchor whenever a balance can fund it,
-   and never built (so never signed) when neither can. */
+   get it mined.  The funder's balance funds the anchor; a state that leaves
+   the funder too little for it is never built (so never signed), at any
+   rate: the anchor is never taken from the other side. */
 int test_commitment_anchor_at_rate_0(void) {
     secp256k1_context *ctx = test_ctx();
     secp256k1_pubkey local_fund_pk, remote_fund_pk;
@@ -1337,11 +1338,18 @@ int test_commitment_anchor_at_rate_0(void) {
     TEST_ASSERT_EQ(ti.anchor_amount, ANCHOR_OUTPUT_AMOUNT, "240-sat anchor at rate 0");
     TEST_ASSERT_EQ(ti.out_total, ch.local_amount + ch.remote_amount, "no fee at rate 0");
 
-    /* only one side can fund it: still anchored */
+    /* the funder (local here) funds it, even with the other side low */
+    ch.local_amount = 99500;
+    ch.remote_amount = 500;
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "the funder funds it");
+    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti) && ti.anchor_vout >= 0, "anchored");
+    /* the funder cannot: not built, though the other side could */
     ch.local_amount = 500;
     ch.remote_amount = 99500;
-    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "one side funds it");
-    TEST_ASSERT(cpfp_parse_tx(tx.data, tx.len, &ti) && ti.anchor_vout >= 0, "anchored");
+    TEST_ASSERT(!channel_build_commitment_tx(&ch, &tx, txid),
+                "the anchor is never taken from the other side");
+    ch.local_amount = 99500;
+    ch.remote_amount = 500;
 
     /* exit target: a commitment without HTLC outputs takes the 6-block rate,
        one with an HTLC output the urgent rate */
@@ -1367,9 +1375,10 @@ int test_commitment_anchor_at_rate_0(void) {
     ch.remote_amount = 500;
     TEST_ASSERT(!channel_build_commitment_tx(&ch, &tx, txid),
                 "an anchorless zero-fee commitment is refused");
-    /* at a non-zero rate it pays its fee and may go without the anchor */
+    /* nor at a non-zero rate */
     channel_set_commit_fee_rate(&ch, 1000);
-    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx, txid), "fee-paying, no anchor");
+    TEST_ASSERT(!channel_build_commitment_tx(&ch, &tx, txid),
+                "not built at a non-zero rate either");
     tx_buf_free(&tx);
     channel_cleanup(&ch);
     secp256k1_context_destroy(ctx);

@@ -42,8 +42,10 @@
 #   scenario "dist_omit" / "dist_locktime": the LSP leaves the distribution
 #                      transaction out of factory creation, or announces a
 #                      locktime that is not the factory's (SS_CHEAT_DIST_*
-#                      test hooks, refused on mainnet).  Every client must
-#                      refuse the factory: no channel, no commitment on disk.
+#                      test hooks, refused on mainnet).  The members do not
+#                      co-sign it, so the LSP does not create the factory (a
+#                      member that gets a FACTORY_READY without it refuses
+#                      the factory): no channel, no commitment on disk.
 #   scenario "reconnect": client 4 is restarted right after channel open,
 #                      then pays and is paid.  Both payments must succeed and
 #                      the client must stay up (commitment 0 took nonce index
@@ -211,14 +213,22 @@ run_scenario(){
             refused=0
             for i in $(seq 1 $N); do grep -q "REFUSING factory — no acceptable distribution transaction" "$D/c$i.log" 2>/dev/null && refused=$((refused + 1)); done
             [ "$refused" -eq $N ] && break
+            grep -q "the factory is not created" "$D/lsp.log" 2>/dev/null && break
             grep -q "channels ready" "$D/lsp.log" 2>/dev/null && break
             sleep 2
         done
         sleep 3
         if grep -q "channels ready" "$D/lsp.log"; then red "  CHECK FAIL the LSP reached 'channels ready'"; ok=0; fi
+        local notcreated=0
+        if grep -q "the factory is not created" "$D/lsp.log"; then
+            notcreated=1
+            echo "  ok   the LSP did not create the factory (the distribution TX is not co-signed by every member)"
+        fi
         for i in $(seq 1 $N); do
             n=$(sqlite3 "file:$D/c$i.db?mode=ro" "SELECT (SELECT count(*) FROM channels) + (SELECT count(*) FROM signed_commitments);" 2>/dev/null || echo 0)
-            if grep -q "REFUSING factory — no acceptable distribution transaction" "$D/c$i.log" && [ "${n:-0}" = 0 ]; then
+            if [ "$notcreated" = 1 ] && [ "${n:-0}" = 0 ]; then
+                echo "  ok   client $i: no factory; nothing on disk"
+            elif grep -q "REFUSING factory — no acceptable distribution transaction" "$D/c$i.log" && [ "${n:-0}" = 0 ]; then
                 echo "  ok   client $i refused the factory ($(grep -h -oE "no fully co-signed, verified distribution transaction|distribution locktime [0-9]+ is not this factory's" "$D/c$i.log" | head -1)); nothing on disk"
             else red "  CHECK FAIL client $i: refused=$(grep -c "REFUSING factory — no acceptable" "$D/c$i.log") channel+commitment rows=$n"; ok=0; fi
         done
@@ -272,7 +282,7 @@ run_scenario(){
     if [ "$SC" = reconnect ]; then
         local ok=$restart_ok base b4
         [ "$have" -eq $N ] || ok=0
-        base=$(bal_of "$D/c3.db")
+        base=$(bal_of "$D/c4.db")   # its own opening balance: leaves may differ by a sat
         sleep 3
         if cli_pay "$D/lsp.log" 3 0 5000; then echo "  ok   payment of 5000 sat from the restarted client 4 to client 1 succeeded"
         else red "  CHECK FAIL payment from the restarted client 4 did not succeed"; ok=0; fi

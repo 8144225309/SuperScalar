@@ -20,6 +20,8 @@
 
 /* P2A (Pay-to-Anchor) scriptPubKey: OP_1 OP_PUSHBYTES_2 4e73 (anyone-can-spend) */
 #define P2A_SPK_LEN  4
+/* Largest LSP commitment kept signed (the HTLC output cap keeps it under). */
+#define CHANNEL_HOST_COMMIT_TX_MAX 12000
 static const unsigned char P2A_SPK[4] = {0x51, 0x02, 0x4e, 0x73};
 
 typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
@@ -131,10 +133,8 @@ typedef struct {
     uint64_t commit_fee_rate_sat_per_kvb;
     int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
     int use_revocation_leaf;  /* 1 = 2-leaf taptree with revocation checksig script-path */
-    int trim_dust_outputs;  /* 1 = the channel-update engine's commitments: the anchor
-                               only from the funder (a state that cannot pay it is
-                               not built), balance outputs below dust left out
-                               (BOLT 3) */
+    int trim_dust_outputs;  /* 1 = the channel-update engine's commitments: balance
+                               outputs below dust are left out (BOLT 3) */
     int use_cpfp_anchor;  /* 1 = append a keyless P2A CPFP anchor to commitments (#56);
                              negotiated like option_anchors -- BOTH parties must set it
                              identically or the co-signed commitment sighash diverges.
@@ -211,12 +211,19 @@ typedef struct {
        REVOKE_AND_ACK, so the LSP can close the channel without the member
        before the end date (its forced exit). */
     uint64_t      latest_commitment_sig_cn;
-    /* Member side: the LSP commitments this member has co-signed, as the
-       range [host_cosigned_lo, host_cosigned_hi) (empty when equal).  Each
-       one below the current number must be revoked before the member
-       releases a preimage. */
-    uint64_t      host_cosigned_lo;
-    uint64_t      host_cosigned_hi;
+    /* LSP side: its own latest commitment the member co-signed, fully
+       signed (the transaction its forced exit publishes), with its txid
+       (internal order).  It is replaced only by a newer co-signed one, and
+       the LSP revokes the older one only after that, so the one held is
+       never revoked. */
+    unsigned char host_commit_tx[CHANNEL_HOST_COMMIT_TX_MAX];
+    size_t        host_commit_tx_len;
+    unsigned char host_commit_txid[32];
+    /* LSP side: an update came back without a valid co-signature of the
+       LSP's commitment (or none arrived at open).  The channel takes no
+       further update; it is closed with the commitment the LSP holds in the
+       forced-exit window, or settled by the end-date payouts. */
+    int           host_commit_refused;
 
     /* The HTLC this side offered last, for as long as no commitment that
        contains it has been accepted from the peer.  Only such an HTLC can be
@@ -312,6 +319,8 @@ int channel_verify_revocation_secret(const channel_t *ch, uint64_t commitment_nu
                                      const unsigned char *secret32);
 
 /* Store a received revocation secret at flat index. */
+/* Grow the received-revocation arrays to hold n numbers. */
+int channel_ensure_revocations_cap(channel_t *ch, size_t n);
 int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
                                       const unsigned char *secret32);
 

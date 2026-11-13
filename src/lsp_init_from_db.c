@@ -215,17 +215,19 @@ int lsp_channels_init_from_db(lsp_channel_mgr_t *mgr,
         entry->channel.remote_amount = loaded_remote;
         entry->channel.commitment_number = loaded_cn;
 
-        /* The LSP's own commitment at this number, co-signed by the member:
-           kept only when it is for the current number (an older one is
-           revoked and must never be published). */
+        /* The LSP's own latest commitment the member co-signed, fully
+           signed: the LSP revokes an older one only after it holds the newer
+           one, so the stored one is never revoked. */
         {
             uint64_t hcn = 0;
             unsigned char hsig[64];
-            if (persist_load_host_commitment(pdb, (uint32_t)c, &hcn, hsig) &&
-                hcn == loaded_cn) {
-                memcpy(entry->channel.latest_commitment_sig, hsig, 64);
-                entry->channel.has_latest_commitment_sig = 1;
-                entry->channel.latest_commitment_sig_cn = hcn;
+            channel_t *hc = &entry->channel;
+            if (persist_load_host_commitment(pdb, (uint32_t)c, &hcn, hsig, hc->host_commit_txid,
+                                             hc->host_commit_tx, CHANNEL_HOST_COMMIT_TX_MAX,
+                                             &hc->host_commit_tx_len)) {
+                memcpy(hc->latest_commitment_sig, hsig, 64);
+                hc->has_latest_commitment_sig = 1;
+                hc->latest_commitment_sig_cn = hcn;
             }
         }
 

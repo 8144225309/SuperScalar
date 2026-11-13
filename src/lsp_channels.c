@@ -64,35 +64,60 @@
 /* The member's partial signature over the LSP's own commitment at ch's
    current number, carried in json (REVOKE_AND_ACK, or HOST_COMMITMENT_SIG at
    channel open): verify it, aggregate the LSP's commitment signature and keep
-   it (and persist it), so the LSP can close the channel by itself before the
-   end date.  A message without one leaves the LSP with no signed commitment
-   at this number.  Returns 0 only for a signature that does not verify. */
+   that commitment fully signed (and persisted), so the LSP can close the
+   channel by itself before the end date.  A message without one is refused
+   like one whose signature does not verify: returns 0, the update is not
+   taken (the caller sends no revocation of the LSP's previous commitment,
+   which stays the one held) and the channel is marked refused. */
 int lsp_take_host_commit_sig(channel_t *ch, const cJSON *json) {
     if (!ch || !json) return 0;
     unsigned char psig[32], sig[64];
     const cJSON *ni = cJSON_GetObjectItem(json, "host_commit_nonce_index");
     if (wire_json_get_hex(json, "host_commit_psig", psig, 32) != 32 ||
         !ni || !cJSON_IsNumber(ni)) {
-        ch->has_latest_commitment_sig = 0;
-        fprintf(stderr, "LSP: no signature over the LSP's commitment %llu; it cannot "
-                "close this channel alone until the next update\n",
-                (unsigned long long)ch->commitment_number);
-        return 1;
-    }
-    if (!channel_verify_and_aggregate_commitment_sig(ch, psig, (uint32_t)ni->valuedouble,
-                                                     sig)) {
-        ch->has_latest_commitment_sig = 0;
-        fprintf(stderr, "LSP: the member's signature over the LSP's commitment %llu "
-                "does not verify -- refusing the update\n",
+        ch->host_commit_refused = 1;
+        fprintf(stderr, "LSP: no signature over the LSP's commitment %llu -- refusing "
+                "the update; the channel takes no further update\n",
                 (unsigned long long)ch->commitment_number);
         return 0;
     }
+    tx_buf_t u, signed_tx;
+    tx_buf_init(&u, 512);
+    tx_buf_init(&signed_tx, 512);
+    unsigned char txid[32];
+    int ok = channel_verify_and_aggregate_commitment_sig(ch, psig, (uint32_t)ni->valuedouble,
+                                                         sig) &&
+             channel_build_commitment_tx(ch, &u, txid) &&
+             finalize_signed_tx(&signed_tx, u.data, u.len, sig) &&
+             signed_tx.len <= CHANNEL_HOST_COMMIT_TX_MAX;
+    if (!ok) {
+        tx_buf_free(&u);
+        tx_buf_free(&signed_tx);
+        ch->host_commit_refused = 1;
+        fprintf(stderr, "LSP: the member's signature over the LSP's commitment %llu "
+                "does not verify -- refusing the update; the channel takes no "
+                "further update\n", (unsigned long long)ch->commitment_number);
+        return 0;
+    }
+    if (ch->persist_db &&
+        !persist_save_host_commitment((persist_t *)ch->persist_db, ch->persist_channel_id,
+                                      ch->commitment_number, sig, txid,
+                                      signed_tx.data, signed_tx.len)) {
+        tx_buf_free(&u);
+        tx_buf_free(&signed_tx);
+        ch->host_commit_refused = 1;
+        fprintf(stderr, "LSP: could not store the LSP's commitment %llu -- refusing "
+                "the update\n", (unsigned long long)ch->commitment_number);
+        return 0;
+    }
+    memcpy(ch->host_commit_tx, signed_tx.data, signed_tx.len);
+    ch->host_commit_tx_len = signed_tx.len;
+    memcpy(ch->host_commit_txid, txid, 32);
     memcpy(ch->latest_commitment_sig, sig, 64);
     ch->has_latest_commitment_sig = 1;
     ch->latest_commitment_sig_cn = ch->commitment_number;
-    if (ch->persist_db)
-        persist_save_host_commitment((persist_t *)ch->persist_db, ch->persist_channel_id,
-                                     ch->commitment_number, sig);
+    tx_buf_free(&u);
+    tx_buf_free(&signed_tx);
     return 1;
 }
 
@@ -101,23 +126,17 @@ extern void reverse_bytes(unsigned char *data, size_t len);
 
 int lsp_signed_host_commitment(const channel_t *ch, tx_buf_t *out,
                                char txid_hex_out[65]) {
-    if (!ch || !out || !ch->has_latest_commitment_sig ||
-        ch->latest_commitment_sig_cn != ch->commitment_number)
-        return 0;
-    tx_buf_t u;
-    tx_buf_init(&u, 512);
-    unsigned char txid[32];
-    int ok = channel_build_commitment_tx(ch, &u, txid) &&
-             finalize_signed_tx(out, u.data, u.len, ch->latest_commitment_sig);
-    tx_buf_free(&u);
-    if (ok && txid_hex_out) {
-        /* channel_build_commitment_tx gives the txid in internal order */
+    if (!ch || !out || ch->host_commit_tx_len == 0) return 0;
+    out->len = 0;
+    tx_buf_write_bytes(out, ch->host_commit_tx, ch->host_commit_tx_len);
+    if (out->len != ch->host_commit_tx_len) return 0;
+    if (txid_hex_out) {
         unsigned char disp[32];
-        memcpy(disp, txid, 32);
+        memcpy(disp, ch->host_commit_txid, 32);
         reverse_bytes(disp, 32);
         hex_encode(disp, 32, txid_hex_out);
     }
-    return ok;
+    return 1;
 }
 
 static int fe_send(chain_backend_t *chain, const tx_buf_t *t, char txid[65]) {
@@ -217,7 +236,7 @@ int lsp_force_exit_step(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c,
     char sent[65] = "";
     int ok = parent_confs >= 1 && fe_send(chain, &commit, sent);
     printf("LSP forced exit: member %zu LSP commitment %llu %s%s\n", c + 1,
-           (unsigned long long)ch->commitment_number, ok ? "broadcast " : "not accepted",
+           (unsigned long long)ch->latest_commitment_sig_cn, ok ? "broadcast " : "not accepted",
            ok ? sent : "");
     fflush(stdout);
     tx_buf_free(&commit);
@@ -649,6 +668,56 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp, int fd,
 int lsp_accept_and_queue_connection(void *mgr_ptr, void *lsp_ptr);
 
 /* Single iteration: drain queue, poll for 1 second, return. */
+
+static int recv_expected_drain_stray(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                      int client_fd, wire_msg_t *msg,
+                                      uint8_t expected_type,
+                                      int timeout_sec, size_t client_idx);
+
+/* Nonces left for signing on ch, on the side that runs out first. */
+static size_t channel_nonces_left(const channel_t *ch) {
+    size_t l = ch->local_nonce_pool.count > ch->local_nonce_pool.next_unused
+             ? ch->local_nonce_pool.count - ch->local_nonce_pool.next_unused : 0;
+    size_t r = ch->remote_nonce_count > ch->remote_nonce_next
+             ? ch->remote_nonce_count - ch->remote_nonce_next : 0;
+    return l < r ? l : r;
+}
+
+int lsp_channels_refresh_nonces(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t c, int force) {
+    if (!mgr || !lsp || c >= mgr->n_channels || lsp->client_fds[c] < 0) return 0;
+    channel_t *ch = &mgr->entries[c].channel;
+    if (!force && channel_nonces_left(ch) >= CHANNEL_NONCE_REFRESH_AT) return 1;
+    if (!channel_init_nonce_pool(ch, MUSIG_NONCE_POOL_MAX)) return 0;
+    size_t n = ch->local_nonce_pool.count;
+    unsigned char (*pn)[66] = calloc(n ? n : 1, 66);
+    if (!pn) return 0;
+    for (size_t i = 0; i < n; i++)
+        musig_pubnonce_serialize(mgr->ctx, pn[i], &ch->local_nonce_pool.nonces[i].pubnonce);
+    cJSON *m = wire_build_channel_nonces(mgr->entries[c].channel_id,
+                                         (const unsigned char (*)[66])pn, n);
+    free(pn);
+    cJSON_AddBoolToObject(m, "refresh", 1);
+    int ok = wire_send(lsp->client_fds[c], MSG_CHANNEL_NONCES, m);
+    cJSON_Delete(m);
+    wire_msg_t r;
+    memset(&r, 0, sizeof(r));
+    ok = ok && recv_expected_drain_stray(mgr, lsp, lsp->client_fds[c], &r,
+                                         MSG_CHANNEL_NONCES, 30, c);
+    uint32_t rid = 0;
+    size_t rn = 0;
+    unsigned char (*rpn)[66] = ok ? calloc(MUSIG_NONCE_POOL_MAX, 66) : NULL;
+    ok = ok && rpn && r.json &&
+         wire_parse_channel_nonces(r.json, &rid, rpn, MUSIG_NONCE_POOL_MAX, &rn) && rn > 0;
+    if (ok) channel_set_remote_pubnonces(ch, (const unsigned char (*)[66])rpn, rn);
+    free(rpn);
+    if (r.json) cJSON_Delete(r.json);
+    if (!ok)
+        fprintf(stderr, "LSP: nonce refresh with client %zu failed\n", c);
+    else
+        printf("LSP: fresh signing nonces for channel %zu (%zu each side)\n", c, rn);
+    return ok;
+}
+
 int lsp_channels_run_daemon_loop_once(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                        volatile int *shutdown_flag)
 {
@@ -1233,10 +1302,11 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
                            mgr->entries[c].channel.has_latest_commitment_sig;
                 if (hs.json) cJSON_Delete(hs.json);
                 if (!took) {
+                    /* Only this channel fails: it takes no update, and the
+                       other members' channels open. */
+                    mgr->entries[c].channel.host_commit_refused = 1;
                     fprintf(stderr, "LSP: client %zu did not sign the LSP's commitment 0 "
-                            "-- channel not opened\n", c);
-                    free(nonce_fds); free(nonce_ready);
-                    return 0;
+                            "-- its channel takes no update\n", c);
                 }
             }
 
@@ -6573,6 +6643,38 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* --- Reconnection (Phase 16) --- */
 
+/* A replayed forward that did not complete: put the destination channel back
+   to the state the database holds (the balance is persisted only after the
+   client's revocation), take the replayed HTLC out of the database and drop
+   the connection.  The client's next reconnect starts from the persisted
+   state and the forward is replayed again; left as it is, the channel would
+   stay a commitment ahead of the client with an HTLC the client never took,
+   and every later update on it would fail. */
+static void replay_rollback(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t idx,
+                            uint64_t old_local, uint64_t old_remote,
+                            const htlc_t *old_htlcs, size_t old_n_htlcs,
+                            uint64_t old_cn, uint64_t htlc_id) {
+    channel_t *ch = &mgr->entries[idx].channel;
+    ch->local_amount = old_local;
+    ch->remote_amount = old_remote;
+    if (old_n_htlcs > 0 && old_htlcs)
+        memcpy(ch->htlcs, old_htlcs, old_n_htlcs * sizeof(htlc_t));
+    ch->n_htlcs = old_n_htlcs;
+    ch->commitment_number = old_cn;
+    if (mgr->persist)
+        persist_delete_htlc((persist_t *)mgr->persist, (uint32_t)idx, htlc_id);
+    fprintf(stderr, "LSP: replay of HTLC %llu to client %zu did not complete; "
+            "the channel is back at commitment %llu and the connection is "
+            "dropped\n", (unsigned long long)htlc_id, idx,
+            (unsigned long long)old_cn);
+    if (lsp->client_fds[idx] >= 0) {
+        wire_close(lsp->client_fds[idx]);
+        lsp->client_fds[idx] = -1;
+    }
+    if (mgr->readiness)
+        readiness_clear((readiness_tracker_t *)mgr->readiness, (uint32_t)idx);
+}
+
 /* Replay pending HTLC forwards to a reconnected client (Gap 2C).
    Scans all channels for ACTIVE RECEIVED HTLCs whose invoice destination
    matches the reconnected client. For each unforwarded HTLC, re-does the
@@ -6622,6 +6724,7 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             uint64_t old_dest_local = dest_ch->local_amount;
             uint64_t old_dest_remote = dest_ch->remote_amount;
             size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+            uint64_t old_dest_cn = dest_ch->commitment_number;
             htlc_t *old_dest_htlcs = old_dest_n_htlcs > 0
                 ? malloc(old_dest_n_htlcs * sizeof(htlc_t)) : NULL;
             if (old_dest_n_htlcs > 0 && !old_dest_htlcs) continue;
@@ -6653,12 +6756,17 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
             }
 
             /* Send ADD_HTLC to dest */
-            cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, htlc->amount_sats,
+            /* The wire carries msat. */
+            cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id,
+                                                       htlc->amount_sats * 1000,
                                                        htlc->payment_hash, htlc->cltv_expiry);
             if (!wire_send(lsp->client_fds[reconnected_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
                 cJSON_Delete(fwd);
+                replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                old_dest_cn, dest_htlc_id);
                 free(old_dest_htlcs);
-                continue;
+                return;
             }
             cJSON_Delete(fwd);
 
@@ -6669,16 +6777,22 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                 if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
                     fprintf(stderr, "LSP: replay partial sig failed for client %zu\n",
                             reconnected_idx);
+                    replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                    old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                    old_dest_cn, dest_htlc_id);
                     free(old_dest_htlcs);
-                    continue;
+                    return;
                 }
                 cJSON *cs = wire_build_commitment_signed(
                     mgr->entries[reconnected_idx].channel_id,
                     dest_ch->commitment_number, psig32, nonce_idx);
                 if (!wire_send(lsp->client_fds[reconnected_idx], MSG_COMMITMENT_SIGNED, cs)) {
                     cJSON_Delete(cs);
+                    replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                    old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                    old_dest_cn, dest_htlc_id);
                     free(old_dest_htlcs);
-                    continue;
+                    return;
                 }
                 cJSON_Delete(cs);
             }
@@ -6692,8 +6806,11 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                     if (ack_msg.json) cJSON_Delete(ack_msg.json);
                     fprintf(stderr, "LSP: replay REVOKE_AND_ACK timeout for client %zu\n",
                             reconnected_idx);
+                    replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                    old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                    old_dest_cn, dest_htlc_id);
                     free(old_dest_htlcs);
-                    continue;
+                    return;
                 }
                 uint32_t ack_chan_id;
                 unsigned char rev_secret[32], next_point[33];
@@ -6706,8 +6823,11 @@ static void replay_pending_htlcs(lsp_channel_mgr_t *mgr, lsp_t *lsp, size_t reco
                                 reconnected_idx, (unsigned long)old_cn);
                         secure_zero(rev_secret, 32);
                         cJSON_Delete(ack_msg.json);
+                        replay_rollback(mgr, lsp, reconnected_idx, old_dest_local,
+                                        old_dest_remote, old_dest_htlcs, old_dest_n_htlcs,
+                                        old_dest_cn, dest_htlc_id);
                         free(old_dest_htlcs);
-                        continue;
+                        return;
                     }
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     /* SF-W-PTLC #171: inline PTLC snapshot for revocation registration.
@@ -7064,6 +7184,18 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             ch->local_amount * 1000,   /* sats → msat */
             ch->remote_amount * 1000,
             ack_cn);
+        /* The LSP's revocation of its previous commitment, again: the member
+           releases no preimage until it holds it, and the one sent after the
+           last update may not have arrived.  Sent only while the LSP holds
+           its co-signed current commitment (it revokes the previous one only
+           then). */
+        if (ack && ch->commitment_number > 0 && ch->host_commit_tx_len > 0 &&
+            ch->latest_commitment_sig_cn == ch->commitment_number) {
+            unsigned char prev[32];
+            if (channel_get_revocation_secret(ch, ch->commitment_number - 1, prev))
+                wire_json_add_hex(ack, "host_prev_revocation", prev, 32);
+            secure_zero(prev, 32);
+        }
         if (!wire_send(new_fd, MSG_RECONNECT_ACK, ack)) {
             fprintf(stderr, "LSP reconnect: send RECONNECT_ACK failed\n");
             cJSON_Delete(ack);
@@ -7074,6 +7206,7 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* Replay any pending HTLC forwards to this client (Gap 2C) */
     replay_pending_htlcs(mgr, lsp, c);
+    if (lsp->client_fds[c] < 0) return 0;   /* a replay failed: the client reconnects again */
 
     if (mgr->readiness)
         readiness_set_connected((readiness_tracker_t *)mgr->readiness,
@@ -8031,6 +8164,12 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             poll(NULL, 0, 5000);
             continue;
         }
+
+        /* Fresh signing nonces for any channel running low, between updates:
+           an update must never find a side without nonces. */
+        for (size_t nc = 0; nc < mgr->n_channels; nc++)
+            if (lsp->client_fds[nc] >= 0 && mgr->entries[nc].ready)
+                lsp_channels_refresh_nonces(mgr, lsp, nc, 0);
 
         int ret = poll(pfds, (nfds_t)nfds, 5000);
         if (ret < 0) {
