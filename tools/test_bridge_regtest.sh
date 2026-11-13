@@ -38,7 +38,7 @@ CLIENT_SECKEYS=(
 )
 
 # Regtest config
-REGTEST_CONF="$HOME/bitcoin-regtest/bitcoin.conf"
+REGTEST_CONF="${REGTEST_CONF:-$HOME/bitcoin-regtest/bitcoin.conf}"
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 
 # Temporary directories
@@ -157,6 +157,9 @@ FIFO_HOLDER_PID=$!
 # (past the end of --active-blocks 500 below, plus the 102 blocks the LSP mines
 # before creating the factory on regtest). The CLTV safety check itself is unchanged.
 FACTORY_CLTV=$(( $($BCLI getblockcount) + 700 ))
+# A channel id CLN1 has no channel on: member invoices advertise it as their
+# last hop, CLN1 forwards to it and the plugin hands the HTLC to the bridge.
+MEMBER_HINT_SCID="1000000x1x1"
 stdbuf -oL $LSP_BIN \
     --daemon \
     --cli \
@@ -171,6 +174,7 @@ stdbuf -oL $LSP_BIN \
     --amount 100000 \
     --active-blocks 500 \
     --cltv-timeout "$FACTORY_CLTV" \
+    --invoice-route-hint "$CLN_ID/$MEMBER_HINT_SCID/0/0/40" \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
@@ -491,30 +495,30 @@ echo "invoice 0 600000" > "$LSP_FIFO"
 sleep 2
 echo "Invoice command sent to LSP"
 
-# --- Step 11: Wait for BOLT11 invoice to appear in CLN1 ---
+# The member signs its own invoice (routed through CLN1, which holds no
+# preimage for it); the LSP prints it after the CLI command.
+member_bolt11() {
+    awk '/CLI: external invoice created/{getline; print; exit}' "$TMPDIR/lsp.log"
+}
+# --- Step 11: Wait for the member's own BOLT11 invoice ---
 echo ""
-echo "--- Step 11: Waiting for BOLT11 invoice on CLN1 ---"
+echo "--- Step 11: Waiting for client 0's invoice ---"
 BOLT11=""
 for attempt in $(seq 1 30); do
-    BOLT11=$(lightning-cli --network=regtest --lightning-dir="$CLN_DIR" listinvoices | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for inv in data.get('invoices', []):
-    label = inv.get('label', '')
-    if label.startswith('superscalar-') and inv.get('status') == 'unpaid':
-        print(inv.get('bolt11', ''))
-        sys.exit(0)
-print('')
-" 2>/dev/null)
+    BOLT11=$(member_bolt11)
     if [ -n "$BOLT11" ]; then
         echo "Found BOLT11 invoice (attempt $attempt)"
         break
     fi
     sleep 1
 done
+if [ -n "$BOLT11" ] && [ "$(lightning-cli --network=regtest --lightning-dir="$CLN_DIR" listinvoices | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('invoices',[])))")" != "0" ]; then
+    echo "FAIL: CLN1 holds an invoice; a member's invoice must not be CLN's"
+    FAIL=1
+fi
 
 if [ -z "$BOLT11" ]; then
-    echo "FAIL: No superscalar-* invoice appeared on CLN1 within 30s"
+    echo "FAIL: client 0 did not produce an invoice within 30s"
     FAIL=1
 else
     echo "BOLT11: ${BOLT11:0:40}..."

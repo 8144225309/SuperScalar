@@ -30,7 +30,7 @@ CLIENT_SECKEYS=(
     "0000000000000000000000000000000000000000000000000000000000000005"
 )
 
-REGTEST_CONF="/root/bitcoin-regtest/bitcoin.conf"
+REGTEST_CONF="${REGTEST_CONF:-/root/bitcoin-regtest/bitcoin.conf}"
 BCLI="bitcoin-cli -regtest -conf=$REGTEST_CONF"
 
 LSP_PORT=19935
@@ -133,11 +133,15 @@ echo "  (using factory arity: $SS_ARITY)"
 CUR_HEIGHT=$($BCLI getblockcount)
 [ -n "$CUR_HEIGHT" ] || { echo "FAIL: getblockcount returned nothing"; exit 1; }
 FACTORY_CLTV=$(( CUR_HEIGHT + 700 ))
+# A channel id CLN1 has no channel on: member invoices advertise it as their
+# last hop (the member signs the invoice and keeps its preimage).
+MEMBER_HINT_SCID="1000000x1x1"
 stdbuf -oL $LSP_BIN --daemon --cli --network regtest --port "$LSP_PORT" \
     --seckey "$LSP_SECKEY" --clients 4 --db "$LSP_DB" \
     --cli-path "$(which bitcoin-cli)" --rpcuser rpcuser --rpcpassword rpcpass \
     --amount 100000 --active-blocks 500 --arity "$SS_ARITY" \
     --cltv-timeout "$FACTORY_CLTV" \
+    --invoice-route-hint "$CLN_ID/$MEMBER_HINT_SCID/0/0/40" \
     < "$LSP_FIFO" > "$TMPDIR/lsp.log" 2>&1 &
 LSP_PID=$!
 PIDS+=("$LSP_PID")
@@ -231,16 +235,14 @@ echo "CLN2 pre-payment spendable: $CLN2_PRE_MSAT msat"
 INVOICE_AMT_MSAT=600000
 echo "invoice 0 $INVOICE_AMT_MSAT" > "$LSP_FIFO"
 sleep 2
+# The member signs its own invoice (routed through CLN1, which holds no
+# preimage for it); the LSP prints it after the CLI command.
+member_bolt11() {
+    awk '/CLI: external invoice created/{getline; print; exit}' "$TMPDIR/lsp.log"
+}
 BOLT11=""
 for i in $(seq 1 30); do
-    BOLT11=$(lightning-cli --network=regtest --lightning-dir="$CLN_DIR" listinvoices | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-for inv in d.get('invoices',[]):
-    if inv.get('label','').startswith('superscalar-') and inv.get('status')=='unpaid':
-        print(inv.get('bolt11',''))
-        sys.exit(0)
-print('')")
+    BOLT11=$(member_bolt11)
     [ -n "$BOLT11" ] && break
     sleep 1
 done
@@ -368,7 +370,7 @@ fi
 echo "Close confirmed: $CONF confs"
 
 # 4. Decode close tx outputs.
-python3 - "$CLOSE_TXID" "$INVOICE_AMT_MSAT" "$CLIENT0_SK" <<'PYEOF'
+python3 - "$CLOSE_TXID" "$INVOICE_AMT_MSAT" "$CLIENT0_SK" "$REGTEST_CONF" <<'PYEOF'
 import json, subprocess, sys, hashlib
 
 close_txid = sys.argv[1]
@@ -378,7 +380,7 @@ invoice_amt_sats = invoice_amt_msat // 1000
 
 # Fetch close tx.
 tx = json.loads(subprocess.check_output(
-    ["bitcoin-cli", "-regtest", "-conf=/root/bitcoin-regtest/bitcoin.conf",
+    ["bitcoin-cli", "-regtest", "-conf=" + sys.argv[4],
      "getrawtransaction", close_txid, "1"]))
 print(f"Close tx: vin={len(tx['vin'])} vout={len(tx['vout'])}")
 for i, o in enumerate(tx['vout']):
