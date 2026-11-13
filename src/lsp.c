@@ -1508,6 +1508,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     unsigned char lsp_seckey[32];
     if (!secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair)) {
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 0;
     }
 
@@ -1517,6 +1518,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
                                lsp_seckey, &lsp->lsp_pubkey, &keyagg.cache)) {
         memset(lsp_seckey, 0, 32);
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 0;
     }
     memset(lsp_seckey, 0, 32);
@@ -1780,6 +1782,7 @@ int lsp_run_cooperative_close(lsp_t *lsp,
         fprintf(stderr, "LSP: cooperative-close aggregate signature INVALID -- "
                 "retryable (fresh-nonce re-run; clients kept)\n");
         tx_buf_free(&unsigned_tx);
+        musig_session_free(&session);
         return 2;
     }
 
@@ -1803,12 +1806,14 @@ int lsp_run_cooperative_close(lsp_t *lsp,
     }
 
     tx_buf_free(&unsigned_tx);
+    musig_session_free(&session);
     return 1;
 
 close_fail:
     if (clients_notified)
         lsp_abort_ceremony(lsp, "cooperative close failed");
     tx_buf_free(&unsigned_tx);
+    musig_session_free(&session);
     return 0;
 }
 
