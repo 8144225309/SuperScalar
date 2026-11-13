@@ -402,7 +402,12 @@ static lsp_t *rs_make_lsp(rs_fixture_t *fx) {
     if (!lsp) return NULL;
     lsp->client_fds = calloc(LSP_MAX_CLIENTS, sizeof(int));
     lsp->client_pubkeys = calloc(LSP_MAX_CLIENTS, sizeof(secp256k1_pubkey));
-    if (!lsp->client_fds || !lsp->client_pubkeys) return NULL;
+    if (!lsp->client_fds || !lsp->client_pubkeys) {
+        free(lsp->client_fds);
+        free(lsp->client_pubkeys);
+        free(lsp);
+        return NULL;
+    }
     lsp->clients_cap = LSP_MAX_CLIENTS;
     lsp->ctx = fx->ctx;
     lsp->lsp_pubkey = fx->pks[0];
